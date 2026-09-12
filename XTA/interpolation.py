@@ -3728,7 +3728,9 @@ class TileConsolidationResult:
     final_accumulator_mm: Optional[np.ndarray] = None
 
 def _view_uses_interpolation(view: ViewInfo, interpolate: int) -> bool:
-    return bool((view.family in ('orthogonal', 'azimuthal', 'radial', 'spherical') or is_tilted_view(view)) and int(interpolate) > 0)
+    return bool(int(getattr(view, 'augmentation_pass', 0)) == 0 and
+                (view.family in ('orthogonal', 'azimuthal', 'radial', 'spherical') or is_tilted_view(view))
+                and int(interpolate) > 0)
 
 def _drain_volume_to_mmap(
     volume: np.ndarray,

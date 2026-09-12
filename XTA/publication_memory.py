@@ -27,25 +27,37 @@ def native_fullframe_dense_reserve(tasks, *, total_dense_limit, min_conf=0.,
     parents = {}
     count = (2 if float(min_conf) > 0 else 1) + (
         (3 if nrrd_layers else 1) if dense_tiling else 0)
-    for task in tasks:
-        mode = str(task.get('result_mode', 'file'))
-        if task.get('kind') != 'fullframe' or mode not in ('file', 'direct_union', HYBRID_DEFERRED_RESULT_MODE):
-            continue
-        key = (str(task['model_name']), str(task['view'].name))
-        shape = tuple(int(v) for v in task['processing_shape'])
-        if len(shape) != 3 or min(shape) <= 0:
-            raise ValueError('Native parent memory plan requires a positive 3D processing shape')
-        entry = (mode, math.prod(shape) * count)
-        if key in parents and parents[key] != entry:
-            raise ValueError(f'Native parent memory plan has inconsistent tasks for {key}')
-        parents[key] = entry
+    has_policy_groups = False
+    for grouped_task in tasks:
+        siblings = grouped_task.get('augmentation_pass_tasks') or ()
+        has_policy_groups = has_policy_groups or bool(siblings)
+        for task in (grouped_task, *siblings):
+            mode = str(task.get('result_mode', 'file'))
+            if task.get('kind') != 'fullframe' or mode not in ('file', 'direct_union', HYBRID_DEFERRED_RESULT_MODE):
+                continue
+            key = (str(task['model_name']), str(task['view'].name))
+            shape = tuple(int(v) for v in task['processing_shape'])
+            if len(shape) != 3 or min(shape) <= 0:
+                raise ValueError('Native parent memory plan requires a positive 3D processing shape')
+            entry = (mode, math.prod(shape) * count)
+            if key in parents and parents[key] != entry:
+                raise ValueError(f'Native parent memory plan has inconsistent tasks for {key}')
+            parents[key] = entry
     unbounded = sum(size for mode, size in parents.values() if mode == 'file')
     if unbounded > int(total_dense_limit) and len(parents) > 1:
+        advice = (
+            'External-policy passes use independent file-mode canvases and cannot select '
+            'the affine-only direct-union path. Reduce --augmentation_ratio or selected '
+            'views/angles, or increase YOLO_TTA_DIRECT_UNION_TOTAL_GIB only with sufficient '
+            'real memory headroom. '
+            if has_policy_groups else
+            'Enable YOLO_TTA_GPU_WORKER_DIRECT_UNION=1 for bounded shared unions, '
+            'or reduce the requested native views. '
+        )
         raise RuntimeError(
             f'File-mode full-frame unions require {unbounded / GIB:.1f} GiB of retained '
             f'parent canvases, exceeding the {int(total_dense_limit) / GIB:.1f} GiB dense limit. '
-            'Enable YOLO_TTA_GPU_WORKER_DIRECT_UNION=1 for bounded shared unions, '
-            'or reduce the requested native views. File-mode unions have no parent admission.')
+            + advice + 'File-mode unions have no parent admission.')
     shared = [size for mode, size in parents.values() if mode != 'file']
     # One oversized shared parent may run alone, matching scheduler admission.
     admitted = min(sum(shared), max(int(total_dense_limit), max(shared, default=0)))

@@ -309,6 +309,48 @@ def project_view_volume_to_orthogonal_volume(
 
     return out
 
+def materialize_empty_policy_layer(
+    *, model_name: str, view: ViewInfo, source: str, mask_kind: str = 'yolo',
+    pass_index: int = 0, tile_config_id: str = '', tile_acceptance: str = '',
+    stage: str = '', description: str = '', temp_dir: Path,
+    submit_to_sink: bool = True,
+) -> NrrdLayerRef:
+    """Retain an editable all-zero pass without allocating/projecting a dense volume."""
+    shape = final_source_output_shape() or (
+        int(view.full_t or view.num_slices), int(view.full_h or view.src_h),
+        int(view.full_w or view.src_w),
+    )
+    key = _nrrd_layer_key(view_name=view.name, source=source, mask_kind=mask_kind,
+                          pass_index=pass_index, tile_config_id=tile_config_id,
+                          tile_acceptance=tile_acceptance, stage=stage)
+    path = Path(temp_dir) / 'nrrd_layers' / view.name / f'{key}.orthogonal.cvol'
+    _write_raw_bbox_payload_store(
+        shape=shape, store_dir=path, format_name=CVOL_FORMAT,
+        encode_slice=lambda index: RawBBoxSlicePayload(idx=index, is_empty=True),
+        desc=f'Empty policy layer {key}', workers=1,
+        extra_meta={'nrrd_layer_key': key, 'external_policy_empty_pass': True},
+    )
+    ref = NrrdLayerRef(
+        key=key, name=_nrrd_layer_name(view=view, source=source, mask_kind=mask_kind,
+            pass_index=pass_index, tile_config_id=tile_config_id,
+            tile_acceptance=tile_acceptance, stage=stage),
+        path=path, shape=shape, dtype='uint8', storage_format=CVOL_FORMAT,
+        model_name=model_name, view_name=view.name, physical_view_name=physical_view_name(view),
+        aug_id=view.tta_aug_id, angle_deg=view.tta_angle_deg, view_family=view.family,
+        source=source, mask_kind=mask_kind, pass_index=pass_index,
+        tile_config_id=tile_config_id, tile_acceptance=tile_acceptance, stage=stage,
+        description=description, segment_extent_ijk=_nrrd_empty_segment_extent(),
+        segment_extent_shape_tyx=shape, segment_extent_source='empty_policy_pass_cvol',
+    )
+    sink = nrrd_layer_sink() if submit_to_sink else None
+    if sink is not None:
+        sink.submit_layer(ref, nrrd_layer_output_suffix(
+            view_token=view_output_token(view), source=source, mask_kind=mask_kind,
+            pass_index=pass_index, tile_config_id=tile_config_id,
+            tile_acceptance=tile_acceptance, stage=stage))
+    return ref
+
+
 @runtime_telemetry_phase('projection.materialize')
 def materialize_nrrd_view_layer(
     view_volume_mm: np.ndarray,
@@ -337,6 +379,16 @@ def materialize_nrrd_view_layer(
     """Persist a view-derived layer in orthogonal processing geometry for the NRRD writer."""
     if bool(internal_packbits_store) and bool(submit_to_sink):
         raise ValueError('The internal packbits cvol format must not be submitted as NRRD output')
+    if bool(emit_empty) and bool(view.augmentation_base_view):
+        has_foreground = (bool(known_has_foreground) if known_has_foreground is not None
+                          else _volume_has_foreground(view_volume_mm))
+        if not has_foreground:
+            return materialize_empty_policy_layer(
+                model_name=model_name, view=view, source=source, mask_kind=mask_kind,
+                pass_index=pass_index, tile_config_id=tile_config_id,
+                tile_acceptance=tile_acceptance, stage=stage, description=description,
+                temp_dir=temp_dir, submit_to_sink=submit_to_sink,
+            )
     # callers that already know whether the volume has foreground (e.g. the
     # interpolation pass's added_voxels stat for bridge deltas) skip the per-slice scan.
     if known_has_foreground is not None:
@@ -1472,6 +1524,7 @@ def prepare_view_volume_after_fullframe(
     parent_bridge_support_path: Optional[Path] = None
     fused_azimuthal_components = bool(
         fuse_azimuthal_component_layers
+        and not bool(view.augmentation_base_view)
         and nrrd_layers_enabled
         and str(view.family) == 'azimuthal'
         and not bool(dense_tiling_active)
@@ -1581,6 +1634,7 @@ def prepare_view_volume_after_fullframe(
                 pass_index=0,
                 stage='pre_interpolation',
                 description='Cleaned full-frame YOLO mask before interpolation bridges.',
+                emit_empty=bool(view.augmentation_base_view),
                 temp_dir=temp_dir,
                 workers=int(slice_workers),
                 # the device union already answered the foreground question and
@@ -2864,6 +2918,18 @@ def finalize_consolidated_tile_volume_for_parent(
     )
 
     if not _volume_has_foreground(tile_accumulator_mm):
+        if bool(nrrd_layers_enabled) and bool(view.augmentation_base_view):
+            empty_ref = materialize_nrrd_view_layer(
+                tile_accumulator_mm, model_name=str(model_name), view=view,
+                source='tile', mask_kind='yolo', pass_index=0,
+                tile_config_id=config_id_norm, tile_acceptance='parent_mask',
+                stage=pre_interpolation_stage,
+                description=f'Empty {config_label} tile YOLO policy-pass mask.',
+                temp_dir=temp_dir, workers=int(slice_workers),
+                known_has_foreground=False, emit_empty=True,
+            )
+            if empty_ref is not None:
+                nrrd_layers.append(empty_ref)
         if bool(internal_final_layer_enabled):
             internal_ref = materialize_internal_final_view_layer(
                 destination_mm,
@@ -2897,6 +2963,7 @@ def finalize_consolidated_tile_volume_for_parent(
                 tile_config_id=config_id_norm,
                 tile_acceptance='parent_mask',
                 stage=pre_interpolation_stage,
+                emit_empty=bool(view.augmentation_base_view),
                 description=f'Accepted {config_label} tile YOLO masks whose components intersected parent full-frame YOLO support. Parent-mask support has priority when a component intersects both parent mask and parent bridge.',
                 temp_dir=temp_dir,
                 workers=int(slice_workers),

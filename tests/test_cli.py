@@ -159,6 +159,8 @@ class CliTests(unittest.TestCase):
     def test_tta_delegate_receives_sys_argv_without_mode(self) -> None:
         arguments = ["--input", "input.mkv", "--model", "gpu:model.engine"]
         parser = mock.Mock(spec=argparse.ArgumentParser)
+        from XTA.config import build_argparser
+        parser.parse_args.return_value = build_argparser().parse_args(arguments)
         observed: list[str] = []
 
         def delegate() -> None:

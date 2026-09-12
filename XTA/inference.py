@@ -4168,6 +4168,9 @@ def predict_source_and_accumulate(
             masks_obj: Optional[object],
             confs_arr: Optional[np.ndarray],
         ) -> Tuple[int, int]:
+            restore = getattr(source, 'restore_prediction', None)
+            if callable(restore):
+                masks_obj = restore(spec, masks_obj)
             target_union, target_conf, target_index, target_affine, count_stats = (
                 _prediction_accumulation_target(
                     spec,
@@ -5266,7 +5269,11 @@ def cleanup_view_volume_after_prediction_inplace(
     # min_radius inside the per-slice unit.
     # skipped when every slice of this view was already hole-filled on device by
     # the GPU workers (identical per-slice semantics; the CPU pass would be pure recompute).
-    if bool(skip_hole_fill):
+    if int(view.augmentation_pass) > 0:
+        # An inverse-invalid island is unknown, not an enclosed background hole.
+        # Filtering/removal remains eligible; adding unsupported foreground does not.
+        print(f'2D hole fill ({view.name}): skipped for inverse-mapped external-policy masks.')
+    elif bool(skip_hole_fill):
         print(f'2D hole fill ({view.name}): done on device during accumulation (v13.3.3 S2); CPU pass skipped.')
     else:
         fill_view_volume_holes_2d_inplace(

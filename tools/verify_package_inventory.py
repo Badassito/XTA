@@ -34,6 +34,19 @@ REVIEWED_V21_0_5_SHA256 = '9078a719026147d7af6b990634090f78a0874ba1297f49f89e062
 REVIEWED_V21_0_6_SHA256 = 'fc3c2ca5ab0af6257ee9b4fd3b4bf9f66a9c669007a87377a9d7d47cb13858c7'
 REVIEWED_V21_1_SHA256 = '534ad7dabb3bccbbf95883fa7cad678081e85f4efa1b5e851781b173da017f37'
 REVIEWED_V21_1_1_SHA256 = '84426381fa7b386607ed8e79a993cf0b51bbbe46b1cfa3db4bc71307385694a4'
+# This development appendix reviews v22 augmentation work without changing the
+# package release identity or any earlier inventory record.
+REVIEWED_V22_AUGMENTATION_SHA256 = 'b2636d119631a48b3424879eeae79c9b2ee56d43722647f3cfab22f9608857e8'
+# Exact pre-move PTA definitions, independently pinned before their shared owner
+# is introduced. PTA reexports must still resolve to the shared owner objects.
+REVIEWED_PRESERVED_AUGMENTATION_DEFINITIONS = {
+    ('pta_augmentation', 'AugmentationDefinition'):
+        '7f4a5e8fdb7a64582a6aa510c4381a2eb5853b030ebd8e3a0a4940346072c9f9',
+    ('pta_augmentation', 'inspect_augmentation_definition'):
+        '3d9f9bf614d79d46a7a09c72887db6fa7fda6006f7e2dc662aff51bf3ec86ca0',
+    ('pta_augmentation', 'assert_augmentation_definition_unchanged'):
+        '06e131ad10dbfd062a4e4b2aaca6c370340a00cf43cbf717006b7054b982aa8a',
+}
 # This method was previously covered by the immutable full Radial module and
 # class pins. Name its exact pre-v21.0.6 AST before reviewing the upload change.
 REVIEWED_PRESERVED_RADIAL_UPLOAD_SHA256 = '5f12562dafcb991f93b1702b8976e33a5117e4e01de357c3cb99c98afe52599a'
@@ -1315,6 +1328,51 @@ def reviewed_v21_1_1_contract(
     )
 
 
+def reviewed_v22_augmentation_contract(
+    manifest: dict[str, object], v21: dict[str, object],
+    *earlier_patches: dict[str, object],
+) -> dict[str, object]:
+    review = _reviewed_v21_patch_contract(
+        manifest, v21, key='v22_augmentation_review', release='22.0.0',
+        expected_digest=REVIEWED_V22_AUGMENTATION_SHA256,
+        previous_digest=REVIEWED_V21_1_1_SHA256,
+        earlier_patches=earlier_patches,
+    )
+    relocations = review.get('definition_relocations', ())
+    keys = [(item['module'], item['name']) for item in relocations]
+    if len(keys) != len(set(keys)) or set(keys) != set(REVIEWED_PRESERVED_AUGMENTATION_DEFINITIONS):
+        raise RuntimeError('v22 augmentation relocation coverage differs from the preserved PTA definitions')
+    destinations = {(item['module'], item['name']): item for item in review['definitions']}
+    for item in relocations:
+        key = (item['module'], item['name'])
+        if item.get('previous_sha256') != REVIEWED_PRESERVED_AUGMENTATION_DEFINITIONS[key]:
+            raise RuntimeError(f'v22 augmentation relocation does not match its preserved predecessor: {key[0]}.{key[1]}')
+        destination = destinations.get((item.get('destination_module'), item.get('destination_name')))
+        if not item.get('reason') or destination is None or destination['sha256'] != item.get('sha256'):
+            raise RuntimeError(f'v22 augmentation relocation has no matching reviewed destination: {key[0]}.{key[1]}')
+        if item['module'] == item['destination_module'] or item['name'] != item['destination_name']:
+            raise RuntimeError(f'v22 augmentation relocation has an unexpected owner or public name: {key[0]}.{key[1]}')
+    return review
+
+
+def verify_augmentation_relocations(review, top_level) -> None:
+    """Verify exact shared definitions and the original owner's public imports."""
+    for item in review['definition_relocations']:
+        module, name = item['module'], item['name']
+        source = top_level[module]
+        destination = top_level[item['destination_module']]
+        matches = [node for node in destination if getattr(node, 'name', None) == item['destination_name']]
+        reexports = [
+            node for node in source if isinstance(node, ast.ImportFrom)
+            and node.level == 1 and node.module == item['destination_module']
+            and any(alias.name == name and alias.asname in (None, name) for alias in node.names)
+        ]
+        if (any(getattr(node, 'name', None) == name for node in source)
+                or len(matches) != 1 or digest(matches[0]) != item['sha256']
+                or len(reexports) != 1 or digest(reexports[0]) != item['reexport_sha256']):
+            raise RuntimeError(f'v22 augmentation shared-owner relocation changed: {module}.{name}')
+
+
 def reviewed_radial_module_hashes(v21, patches):
     """Require explicit authenticated successors for preserved full modules."""
     expected = {item['module']: item['sha256'] for item in v21['preserved_radial_modules']}
@@ -1376,6 +1434,8 @@ def main() -> None:
     patches = (*patches, lta_release)
     overlap_release = reviewed_v21_1_1_contract(manifest, v21, *patches)
     patches = (*patches, overlap_release)
+    augmentation_review = reviewed_v22_augmentation_contract(manifest, v21, *patches)
+    patches = (*patches, augmentation_review)
     patch_definitions = {
         (item['module'], item['name']): item for review in patches for item in review['definitions']
     }
@@ -1415,6 +1475,7 @@ def main() -> None:
         | {item['module'] for item in v21['statements']}
         | {item['module'] for item in v21['preserved_radial_modules']}
         | {item['module'] for review in patches for item in review['definitions'] + review['statements']}
+        | {item['module'] for item in augmentation_review['definition_relocations']}
     )
     for module in audited_modules:
         module_path = PACKAGE / f"{module}.py"
@@ -1424,6 +1485,8 @@ def main() -> None:
         top_level[module] = list(tree.body)
         available[module] = Counter(digest(node) for node in tree.body)
         local_import_seams.update(reviewed_local_import_seams(module, module_source, tree))
+
+    verify_augmentation_relocations(augmentation_review, top_level)
 
     for (module, name), (expected_hash, reason) in REVIEWED_V20_ADDED_DEFINITIONS.items():
         expected_hash = reviewed_definition_hash(module, name, expected_hash)

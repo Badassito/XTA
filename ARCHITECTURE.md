@@ -14,6 +14,10 @@ repository. Accepted findings about behavior, ownership, operating controls, and
 validation are incorporated here before superseded experiment notes are removed.
 The log retains outcomes, limitations, source identities, and evidence locations.
 
+External GPU policy reuse in TTA, its pass-specific outputs, numerical inverse
+contract, support sidecars, and cluster qualification controls are documented in
+[TTA_EXTERNAL_AUGMENTATION.md](TTA_EXTERNAL_AUGMENTATION.md).
+
 ## Execution model
 
 | Mode | Input and purpose | Execution and publication |
@@ -44,6 +48,7 @@ All module names below are relative to `XTA`.
 | Spherical projection | `spherical_projection`, `spherical_projection_bounds`, `spherical_projection_cpu`, `spherical_projection_cuda`, `spherical_preflight`: admission, conservative bounds, CPU/CUDA pulls, and preflight |
 | Model execution | `inference`, `inference_backends`, `cuda_backend`: backend contracts, model execution, mask payloads, and resident CUDA rendering |
 | TTA scheduling | `pipeline`, `tta_scheduler`, `tta_prediction`, `tta_lifecycle`: preparation, process admission, source staging, and run-resource ownership |
+| TTA external policies | `augmentation_policy`, `tta_augmentation_config`, `tta_augmentation`, `tta_augmentation_cuda`, `tta_augmentation_retirement`, `tta_augmentation_runtime`: shared policy identity, seed scopes, fused conservative inverse maps, and bounded render-once policy fan-out with asynchronous support retirement |
 | TTA completion | `assembly`, `tta_terminal`, `tta_outputs`: view/tile assembly, physical-view terminal fusion, and settled-artifact teardown |
 | Sparse components | `interpolation`, `topology`, `topology_runs`, `projection_queue`: interpolation, component membership/adjacency, and bounded projection handoff |
 | CUDA component work | `cuda_interpolation`, `cuda_d1`, `cuda_finalization`: bridge painting/radius work, owner-GPU bitsets, and distributed finalization contracts |

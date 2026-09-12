@@ -467,6 +467,8 @@ class ViewInfo:
     physical_view_name: str = ''
     tta_aug_id: str = ''
     tta_angle_deg: float = 0.0
+    augmentation_pass: int = 0
+    augmentation_base_view: str = ''
 
 def physical_view_name(view: ViewInfo) -> str:
     return str(view.physical_view_name or view.name)
@@ -504,6 +506,26 @@ def expand_views_into_tta_variants(
                 tta_angle_deg=float(angle),
             ))
     return variants
+
+def expand_views_into_policy_variants(views: Sequence[ViewInfo], ratio: int) -> List[ViewInfo]:
+    """Keep the base identities and create independent save/interpolation domains."""
+    if int(ratio) < 1:
+        raise ValueError('augmentation ratio must be >= 1')
+    result: List[ViewInfo] = []
+    for base in views:
+        # Preserve names and angle identity; the marker retains empty base layers too.
+        result.append(dataclasses_replace(base, augmentation_base_view=base.name) if int(ratio) > 1 else base)
+        for pass_index in range(1, int(ratio)):
+            suffix = f'__policy_{pass_index:03d}'
+            result.append(dataclasses_replace(
+                base, name=base.name + suffix,
+                tta_aug_id=base.tta_aug_id + suffix,
+                summary_family=base.summary_family + suffix,
+                display_name=f'{base.display_name} / policy pass {pass_index}',
+                augmentation_pass=pass_index, augmentation_base_view=base.name,
+            ))
+    return result
+
 
 def is_tilted_view(view: ViewInfo) -> bool:
     """Return True for a concrete member of the Tilted view family."""
@@ -1533,6 +1555,8 @@ def build_aug_job_for_variant(
     angle = float(view.tta_angle_deg)
     aug_id = str(view.tta_aug_id)
     expected_aug_id = _format_angle_aug_id(angle)
+    if int(view.augmentation_pass) > 0:
+        expected_aug_id += f'__policy_{int(view.augmentation_pass):03d}'
     if aug_id != expected_aug_id:
         raise ValueError(
             f'TTA variant {view.name!r} has aug_id={aug_id!r}, expected {expected_aug_id!r} '
@@ -2972,6 +2996,8 @@ def maybe_wrap_source_with_gpu_input_staging(source: object, cfg: 'PredictConfig
         GpuTileRenderedYoloSource,
     )
 
+    if bool(getattr(source, '_tta_already_gpu_staged', False)):
+        return source
     if isinstance(source, GpuPrefetchingYoloSource):
         return source
     # GPU-rendered sources already produce device-resident normalized batches;
@@ -4270,7 +4296,8 @@ def build_dense_tile_raster_plan(
     return build_forward_raster_plan(
         mode='tta',
         physical_view_id=physical_view_name(view),
-        angle_deg=_angle_from_aug_id(tile_job.aug_id),
+        # Policy pass suffixes identify independent outputs, not geometry.
+        angle_deg=float(view.tta_angle_deg),
         channel_token=str(fmt.token),
         channel_kind=str(fmt.kind),
         channel_count=int(fmt.channel_count),

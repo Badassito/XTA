@@ -380,9 +380,10 @@ class TtaScheduler:
             return 0
         planes = 2 if task.get('result_conf_path') else 1
         main_bytes = int(self.operations.array_nbytes(shape, np.uint8)) * int(planes)
+        policy_factor = 1 + len(task.get('augmentation_pass_tasks', ()))
         padding_count = int(self.tile_task_azimuthal_padding_count(task))
         if padding_count <= 0:
-            return int(main_bytes)
+            return int(main_bytes) * int(policy_factor)
         view_obj = task.get('view')
         assert isinstance(view_obj, ViewInfo)
         group_count = len(self.operations.azimuthal_batch_padding_mirror_groups(
@@ -394,7 +395,7 @@ class TtaScheduler:
         plane_bytes = int(shape[1]) * int(shape[2]) * int(np.dtype(np.uint8).itemsize)
         compact_padding_bytes = int(padding_count) * int(plane_bytes) * int(planes)
         grouped_result_bytes = int(group_count) * int(main_bytes)
-        return int(main_bytes + compact_padding_bytes + grouped_result_bytes)
+        return int(main_bytes + compact_padding_bytes + grouped_result_bytes) * int(policy_factor)
 
     def tile_dense_result_task_admissible(self, task: Dict[str, object]) -> bool:
         if bool(self.inputs.keep_temp_artifacts) or str(task.get('kind', '')) != 'tile':
@@ -469,7 +470,9 @@ class TtaScheduler:
         the parent mapping until sparse retirement also prevents asynchronous D2H publication
         from outliving its backing object.
         """
-        if bool(self.inputs.keep_temp_artifacts) or str(task.get('kind', '')) != 'tile':
+        if (bool(self.inputs.keep_temp_artifacts) or str(task.get('kind', '')) != 'tile'
+                or bool(task.get('augmentation_pass_tasks'))):
+            # Policy siblings use independent file backings under one N-way byte reservation.
             return
         task_id = int(task.get('task_id', -1))
         if task_id < 0:
@@ -589,16 +592,20 @@ class TtaScheduler:
         task_obj = self.state.gpu_worker_tasks_by_id.get(task_id_i)
         cleanup_paths: set[Path] = set()
         if isinstance(task_obj, dict):
-            for field_name in (
-                'result_mask_path', 'result_conf_path',
-                'result_mask_fallback_path', 'result_conf_fallback_path',
-            ):
-                raw_path = task_obj.get(field_name)
-                if raw_path:
-                    try:
-                        cleanup_paths.add(Path(str(raw_path)))
-                    except Exception:
-                        pass
+            for owned_task in (task_obj, *task_obj.get('augmentation_pass_tasks', ())):
+                for field_name in (
+                    'result_mask_path', 'result_conf_path',
+                    'result_mask_fallback_path', 'result_conf_fallback_path',
+                ):
+                    raw_path = owned_task.get(field_name)
+                    if raw_path:
+                        try:
+                            path = Path(str(raw_path))
+                            cleanup_paths.add(path)
+                            if owned_task is not task_obj:
+                                cleanup_paths.add(path.with_name(path.name + '.seam'))
+                        except Exception:
+                            pass
         if workspaces is not None:
             for mm in workspaces:
                 if mm is None:
@@ -623,7 +630,7 @@ class TtaScheduler:
             for cleanup_path in cleanup_paths:
                 try:
                     if (
-                        cleanup_path.suffix.lower() == '.dat'
+                        (cleanup_path.suffix.lower() == '.dat' or cleanup_path.name.endswith('.dat.seam'))
                         and self.operations._path_is_relative_to(cleanup_path, self.inputs.gpu_worker_result_dir)
                     ):
                         cleanup_path.unlink(missing_ok=True)
@@ -1671,7 +1678,8 @@ class TtaScheduler:
         eligible: List[Tuple[int, int, int, int, int]] = []
         for position, task_id in enumerate(pending_ids):
             task = self.state.gpu_worker_tasks_by_id[int(task_id)]
-            if str(task.get('kind', '')) != 'fullframe' or bool(task.get('tail_adapted', False)):
+            if (str(task.get('kind', '')) != 'fullframe' or bool(task.get('tail_adapted', False))
+                    or bool(task.get('disable_runtime_split', False))):
                 continue
             midpoint = self.operations.gpu_worker_tail_split_point(
                 int(task.get('slice_start', 0)),

@@ -818,6 +818,16 @@ def _main_impl() -> None:
         else:
             cpu_model_path = resolved_path
 
+    from .tta_augmentation_config import resolve_tta_augmentation
+    try:
+        policy_settings = resolve_tta_augmentation(
+            args, gpu_devices=backend_devices.gpu_devices, cpu_enabled=backend_devices.cpu,
+        )
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
+    augmentation_support_records: List[Dict[str, object]] = []
+    augmentation_execution_records: List[Dict[str, object]] = []
+    augmentation_planned_output_groups: List[Dict[str, object]] = []
     gpu_inference_enabled = bool(backend_devices.gpu_devices)
     cpu_inference_enabled = bool(backend_devices.cpu)
     if gpu_inference_enabled and gpu_model_path is None:
@@ -1201,7 +1211,7 @@ def _main_impl() -> None:
     # write those slices into one variant-owned scheduler mapping: memfd plus descriptor
     # transfer when available, and a real pathname only as fallback.
     gpu_worker_direct_union_active = bool(
-        gpu_worker_process_active and gpu_worker_direct_union_enabled()
+        gpu_worker_process_active and gpu_worker_direct_union_enabled() and not policy_settings.enabled
     )
     # Any full-frame task that CPU workers may claim must use the common view-local union
     # boundary. GPU-only views may retain the D1 owner pipeline.
@@ -1213,6 +1223,12 @@ def _main_impl() -> None:
     # resolution complete, so geometry-dependent activation is finalized below after T/H/W
     # are assigned. Unsupported commands retain the dense compatibility paths.
     v1613_bundle_reasons: List[str] = []
+    if policy_settings.enabled:
+        v1613_bundle_reasons.append('external GPU policy copies require independent inverse-mapped task results')
+        print(f'External TTA: {policy_settings.ratio} passes (one base), '
+              f'granularity={policy_settings.granularity}, coverage={policy_settings.coverage}; '
+              'render-once GPU batches, independent file-backed masks, no augmented interpolation; '
+              'affine-only D1/ring fusion and dynamic lease splitting are bypassed for this run.')
     if not v1613_fast_bundle_requested():
         v1613_bundle_reasons.append('YOLO_TTA_V1613_FAST_BUNDLE=0')
     if not gpu_worker_process_active:
@@ -1698,7 +1714,14 @@ def _main_impl() -> None:
     # one augmentation, one full-frame accumulator, one tile gate graph, one interpolation
     # graph, and its own NRRD namespace. The physical view list drives scheduler-time terminal
     # TTA collapse/backprojection as soon as all variants of that view become immutable.
-    views = expand_views_into_tta_variants(physical_views, angles)
+    from .geometry import expand_views_into_policy_variants
+    views = expand_views_into_policy_variants(
+        expand_views_into_tta_variants(physical_views, angles), policy_settings.ratio,
+    )
+    policy_views_by_base: Dict[str, List[ViewInfo]] = {}
+    for policy_view in views:
+        if int(policy_view.augmentation_pass) > 0:
+            policy_views_by_base.setdefault(policy_view.augmentation_base_view, []).append(policy_view)
     # Reserve the second resident allocation only for runs that actually contain a
     # Azimuthal task. This keeps Cartesian/Tilted-only runs from losing GPU residency merely
     # because the variant supports a lazily-created hardware texture.
@@ -2130,6 +2153,18 @@ def _main_impl() -> None:
             if jobs_by_config:
                 tile_jobs_by_view_config[view.name] = jobs_by_config
 
+    if policy_settings.enabled:
+        for view in inference_views:
+            if int(view.augmentation_pass) != 0:
+                continue
+            augmentation_planned_output_groups.append({
+                'kind': 'fullframe', 'view': str(view.name), 'tile_config_id': '',
+            })
+            for config_id in sorted(tile_jobs_by_view_config.get(view.name, {})):
+                augmentation_planned_output_groups.append({
+                    'kind': 'tile', 'view': str(view.name), 'tile_config_id': str(config_id),
+                })
+
     tta_raster_plan_records: List[Dict[str, object]] = []
     for view in inference_views:
         for aug_job in aug_jobs_by_view.get(view.name, ()):
@@ -2502,7 +2537,8 @@ def _main_impl() -> None:
     physical_view_finalization_stop = threading.Event()
 
     pending_prediction_build_jobs: deque[Tuple[str, ViewInfo, object]] = deque()
-    for view, aug_job in iter_aug_jobs_round_robin(inference_views, aug_jobs_by_view):
+    scheduled_inference_views = [view for view in inference_views if int(view.augmentation_pass) == 0]
+    for view, aug_job in iter_aug_jobs_round_robin(scheduled_inference_views, aug_jobs_by_view):
         pending_prediction_build_jobs.append(('fullframe', view, aug_job))
         if dense_tiling_active:
             for tile_job in tile_jobs_by_aug.get((view.name, aug_job.aug_id), []):
@@ -2619,7 +2655,7 @@ def _main_impl() -> None:
         # may prefer anonymous RAM. v17.0.1 fixed hybrid D1 runs where GPU direct union was
         # disabled for GPU-only views but CPU-eligible views still write a common direct union.
         process_worker_direct_union = bool(worker_direct_union_active)
-        union_prefer_memory = not (
+        union_prefer_memory = not policy_settings.enabled and not (
             (
                 interpolation_process_backend_enabled()
                 and _view_uses_interpolation(view, int(args.interpolation_distance))
@@ -2644,7 +2680,7 @@ def _main_impl() -> None:
                     dtype=np.uint8,
                     path=confmap_path,
                     desc=f'{model_name}/{view.name} baseline confidence workspace',
-                    prefer_memory=not process_worker_direct_union,
+                    prefer_memory=not process_worker_direct_union and not policy_settings.enabled,
                     prefer_memfd=bool(process_worker_direct_union),
                 )
         except BaseException:
@@ -3408,6 +3444,15 @@ def _main_impl() -> None:
         tile_consolidation_submitted.add(set_key)
         acc = tile_accumulator_by_set.get(set_key)
         if acc is None:
+            empty_view = view_infos_by_name[str(view_name)]
+            if bool(nrrd_layers_needed) and bool(empty_view.augmentation_base_view):
+                from .assembly import materialize_empty_policy_layer
+                nrrd_layer_refs.append(materialize_empty_policy_layer(
+                    model_name=str(model_name), view=empty_view, source='tile',
+                    tile_config_id=str(config_id), tile_acceptance='parent_mask',
+                    stage=f'{config_id}_pre_tile_interpolation' if config_id else 'pre_tile_interpolation',
+                    description='Empty accepted tile YOLO policy-pass mask.', temp_dir=temp_dir,
+                ))
             # Every tile in this configuration was empty after cleanup. Other configured
             # sets still have their own consolidation and parent-terminal barrier.
             tile_consolidation_completed.add(set_key)
@@ -3550,7 +3595,7 @@ def _main_impl() -> None:
     ) -> None:
         """Re-gate only P-failed components against immutable same-angle parent bridge B."""
         parent_key = (str(result.model_name), str(result.view_name))
-        if int(args.interpolation_distance) <= 0:
+        if not _view_uses_interpolation(view_infos_by_name[str(result.view_name)], int(args.interpolation_distance)):
             # Without parent interpolation there can never be bridge support. Parent-gate
             # residuals are final rejections and should retire immediately instead of waiting
             # for the parent postprocess future to publish an empty bridge milestone.
@@ -4570,7 +4615,7 @@ def _main_impl() -> None:
         fused_preflight_specs: List[Dict[str, object]] = []
         if gpu_worker_process_active and fused_renderer_preflight_enabled():
             fused_preflight_specs = build_fused_renderer_preflight_specs(
-                inference_views,
+                scheduled_inference_views,
                 aug_jobs_by_view,
             )
             if fused_preflight_specs:
@@ -4583,6 +4628,7 @@ def _main_impl() -> None:
                 )
 
         worker_init = {
+            'augmentation_settings': policy_settings,
             'imgsz': int(args.imgsz), 'conf': float(args.conf),
             'quantize': resolve_quantize(args.gpu_quantize), 'batch': max(1, int(args.gpu_batch)),
             'channel_format': channel_format,
@@ -5095,6 +5141,52 @@ def _main_impl() -> None:
                         str(result_id) for result_id in result_ids
                     )
                 next_task_id += 1
+        if policy_settings.enabled:
+            support_dir = out_dir / 'augmentation_support'
+            support_dir.mkdir(parents=True, exist_ok=True)
+            policy_settings.assert_unchanged()
+            shutil.copyfile(policy_settings.path, support_dir / 'policy.py')
+            write_json_manifest(support_dir / 'policy.json', policy_settings.record())
+            tile_lookup = {
+                (name, job.config_id, int(job.tile_x), int(job.tile_y)): job
+                for name, configurations in tile_jobs_by_view_config.items()
+                for jobs in configurations.values() for job in jobs
+            }
+            for base_task in gpu_worker_tasks_by_id.values():
+                base_view = base_task['view']
+                base_task['augmentation_settings'] = policy_settings
+                base_task['augmentation_support_dir'] = str(support_dir)
+                base_task['disable_runtime_split'] = True
+                siblings = []
+                for copy_view in policy_views_by_base.get(base_view.name, ()):
+                    copy_task = dict(base_task)
+                    if str(base_task['kind']) == 'fullframe':
+                        copy_job = aug_jobs_by_view[copy_view.name][0]
+                        copy_job_id = str(copy_job.aug_id)
+                    else:
+                        base_job = base_task['job']
+                        copy_job = tile_lookup[(copy_view.name, base_job.config_id, int(base_job.tile_x), int(base_job.tile_y))]
+                        copy_job_id = str(copy_job.tile_id)
+                    copy_task.update(view=copy_view, job=copy_job, job_id=copy_job_id,
+                                     canonical_image_spec=None, result_mode='file')
+                    for field_name in ('result_mask_path', 'result_conf_path'):
+                        if base_task.get(field_name):
+                            original = Path(str(base_task[field_name]))
+                            copy_task[field_name] = str(original.with_name(
+                                original.stem + f'.policy{int(copy_view.augmentation_pass):03d}' + original.suffix))
+                    siblings.append(copy_task)
+                    if str(base_task['kind']) == 'tile':
+                        copy_ids = azimuthal_batch_padding_tile_result_ids(
+                            copy_job_id, copy_view, int(copy_task['slice_count']), int(args.gpu_batch),
+                            slice_offset=int(copy_task['slice_start']),
+                        )
+                        for copy_id in copy_ids:
+                            gpu_worker_tile_task_id_by_key[(str(base_task['model_name']), copy_view.name, str(copy_id))] = int(base_task['task_id'])
+                        gpu_worker_tile_pending_result_ids_by_task[int(base_task['task_id'])].update(copy_ids)
+                base_task['augmentation_pass_tasks'] = siblings
+            for (copy_model, base_name), count in list(fullframe_subtasks_per_view.items()):
+                for copy_view in policy_views_by_base.get(base_name, ()):
+                    fullframe_subtasks_per_view[(copy_model, copy_view.name)] = int(count)
         scheduler_state.gpu_worker_total_tasks = int(next_task_id)
         native_dense_reserve_bytes = native_fullframe_dense_reserve(
             gpu_worker_tasks_by_id.values(),
@@ -5485,7 +5577,27 @@ def _main_impl() -> None:
         except Exception:
             holder['valid'] = False
 
+    def _consume_policy_result_records(task: Dict[str, object], stats: Dict[str, object], callback) -> None:
+        siblings = task.get('augmentation_pass_tasks')
+        if not siblings:
+            return
+        results = stats.get('augmentation_results')
+        if not isinstance(results, list) or len(results) != len(siblings):
+            raise RuntimeError('GPU worker returned incomplete external-policy pass results')
+        augmentation_support_records.extend(stats.get('augmentation_records', []))
+        augmentation_execution_records.append({
+            'task_id': int(task['task_id']), 'view': task['view'].name,
+            'kind': str(task['kind']), 'job_id': str(task['job_id']),
+            'model_name': str(task['model_name']),
+            'tile_config_id': str(task['job'].config_id) if task['kind'] == 'tile' else '',
+            'slice_start': int(task.get('slice_start', 0)), 'slice_count': int(task['slice_count']),
+            **dict(stats.get('augmentation_execution', {})),
+        })
+        for sibling, result in zip(siblings, results):
+            callback(sibling, result)
+
     def _handle_fullframe_worker_result(task: Dict[str, object], stats: Dict[str, object]) -> None:
+        _consume_policy_result_records(task, stats, _handle_fullframe_worker_result)
         view = task['view']
         model_name_s = str(task['model_name'])
         view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(stats.get('prediction_count', 0))
@@ -5613,6 +5725,7 @@ def _main_impl() -> None:
         _finalize_fullframe_view_after_worker(model_name_s, view)
 
     def _handle_tile_worker_result(task: Dict[str, object], stats: Dict[str, object]) -> None:
+        _consume_policy_result_records(task, stats, _handle_tile_worker_result)
         view = task['view']
         assert isinstance(view, ViewInfo)
         model_name_s = str(task['model_name'])
@@ -6994,6 +7107,16 @@ def _main_impl() -> None:
         final_paths['model_input_images_dir'] = image_dir
 
     unified_launch = current_unified_launch()
+    if policy_settings.enabled:
+        policy_settings.assert_unchanged()
+        augmentation_manifest_path = write_json_manifest(
+            out_dir / 'augmentation_manifest.json',
+            {**policy_settings.record(), 'policy_snapshot': str(out_dir / 'augmentation_support' / 'policy.py'),
+             'coverage_records': augmentation_support_records,
+             'planned_output_groups': augmentation_planned_output_groups,
+             'execution_records': augmentation_execution_records},
+        )
+        final_paths['augmentation_manifest'] = augmentation_manifest_path
     run_manifest_path: Optional[Path] = None
     run_manifest: Optional[Dict[str, object]] = None
     if unified_launch is not None and str(unified_launch.mode) == 'tta':
@@ -7244,6 +7367,7 @@ def _main_impl() -> None:
         input_volume_rgb=input_volume_rgb,
     )
     def _finalize_selected_run_after_output_close() -> None:
+        policy_settings.assert_unchanged()
         if run_manifest_path is not None:
             if run_manifest is None:  # pragma: no cover - paired construction invariant
                 raise RuntimeError('v18 TTA run manifest was not constructed')

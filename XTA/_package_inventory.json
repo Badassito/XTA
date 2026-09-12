@@ -11823,5 +11823,849 @@
     "preserved_radial_definition_updates": [],
     "preserved_radial_module_updates": [],
     "complete_modules": []
+  },
+  "v22_augmentation_review": {
+    "release": "22.0.0",
+    "previous_review_sha256": "84426381fa7b386607ed8e79a993cf0b51bbbe46b1cfa3db4bc71307385694a4",
+    "definitions": [
+      {
+        "module": "assembly",
+        "name": "materialize_empty_policy_layer",
+        "previous_sha256": null,
+        "sha256": "bb838ef3068356f838a4f9115864c9d347eb2e1fff32f11723eb14f0915ac925",
+        "reason": "Publish independent augmented NRRD layers and exclude them from interpolation while retaining all contributions to the final union."
+      },
+      {
+        "module": "assembly",
+        "name": "materialize_nrrd_view_layer",
+        "previous_sha256": "b44e3117809c42726447a774946174e413effb5e6346c8d5407021f10c819188",
+        "sha256": "4ced93553288e4ec955d6ef44340c7f6d96059ecec8aec74d7632e4aeb078125",
+        "reason": "Publish independent augmented NRRD layers and exclude them from interpolation while retaining all contributions to the final union."
+      },
+      {
+        "module": "assembly",
+        "name": "prepare_view_volume_after_fullframe",
+        "previous_sha256": "d52de78c1ba5464c0fb4b0234b96c9c0cdf430e93100974defce364d55001721",
+        "sha256": "4f1c540ddaaf3688e531d54a2c6dda10489697b55d65ec311b8d0df3937a1bf9",
+        "reason": "Publish independent augmented NRRD layers and exclude them from interpolation while retaining all contributions to the final union."
+      },
+      {
+        "module": "assembly",
+        "name": "finalize_consolidated_tile_volume_for_parent",
+        "previous_sha256": "bc3ecd1d7d9f2d9e9f158a290d0e075bae85565b2b299cfe84f08b08ec7491a4",
+        "sha256": "003707a78f513aa79e7f2b58ca481eb41a0785cf442fb146fe0aacb34aeee028",
+        "reason": "Publish independent augmented NRRD layers and exclude them from interpolation while retaining all contributions to the final union."
+      },
+      {
+        "module": "augmentation_policy",
+        "name": "AugmentationDefinition",
+        "previous_sha256": null,
+        "sha256": "7f4a5e8fdb7a64582a6aa510c4381a2eb5853b030ebd8e3a0a4940346072c9f9",
+        "reason": "Share import-free policy inspection and change detection between PTA and TTA while preserving PTA reexports."
+      },
+      {
+        "module": "augmentation_policy",
+        "name": "inspect_augmentation_definition",
+        "previous_sha256": null,
+        "sha256": "3d9f9bf614d79d46a7a09c72887db6fa7fda6006f7e2dc662aff51bf3ec86ca0",
+        "reason": "Share import-free policy inspection and change detection between PTA and TTA while preserving PTA reexports."
+      },
+      {
+        "module": "augmentation_policy",
+        "name": "assert_augmentation_definition_unchanged",
+        "previous_sha256": null,
+        "sha256": "07f97e39ddf055dbab2613bfaf257f3392585ff55fe5ae0783e3fad9aecb400f",
+        "reason": "Share import-free policy inspection and change detection between PTA and TTA while preserving PTA reexports."
+      },
+      {
+        "module": "cli",
+        "name": "_run_tta",
+        "previous_sha256": "1bcc096f34a3648905a11ee82d82c882a5497dfd3f6688626cde790bca750cfd",
+        "sha256": "db3a67032f13d9a3e8b8434d3283c1b0678b202a8ab1c3f2d408a894410ec9f8",
+        "reason": "Validate GPU-only external augmentation settings before importing the TTA production pipeline."
+      },
+      {
+        "module": "config",
+        "name": "build_argparser",
+        "previous_sha256": "9bf56bf36f65dec19d3579126ab2238d0b54c253be53352dfb563a7db3a47da6",
+        "sha256": "6485e484bc870461bbc7b5df6633f85e440ae81011ab9e3c9acbf0479ee70d19",
+        "reason": "Expose the shared augmentation policy and total-copy ratio with TTA-specific reroll and coverage controls."
+      },
+      {
+        "module": "geometry",
+        "name": "ViewInfo",
+        "previous_sha256": "53d5733948a33303647027f8009987bf5aacda115a237c25cac7c831bcbb083e",
+        "sha256": "a55eaadb93251e099418749530d630ccfcffe2ece0d4e271d52d02f6cbde258b",
+        "reason": "Represent external-policy pass identity separately from physical view geometry and preserve tile planning and source metadata."
+      },
+      {
+        "module": "geometry",
+        "name": "expand_views_into_policy_variants",
+        "previous_sha256": null,
+        "sha256": "4392f392880e21d04e96cc3a47e35d108aae4b37ba5ae5036a70274c3756bba0",
+        "reason": "Represent external-policy pass identity separately from physical view geometry and preserve tile planning and source metadata."
+      },
+      {
+        "module": "geometry",
+        "name": "build_aug_job_for_variant",
+        "previous_sha256": "048608d5c07e447dfcd39e7f14371a4474f2363a9dc0949b2eab7dc4fb13b25b",
+        "sha256": "f60c9771d130c0e82d720984702b6fa3ac667918d8a97a3c2ffa8bd86cee5514",
+        "reason": "Represent external-policy pass identity separately from physical view geometry and preserve tile planning and source metadata."
+      },
+      {
+        "module": "geometry",
+        "name": "maybe_wrap_source_with_gpu_input_staging",
+        "previous_sha256": "496bf1060982040fb935f932af7624277ab7f4c8f8abe4f01f7864f1ab1f4213",
+        "sha256": "10f1f5ccfa1fa7fe2a2fd871ab54e9cbbca0863b4579e3b2843c1edd91c0cfa9",
+        "reason": "Represent external-policy pass identity separately from physical view geometry and preserve tile planning and source metadata."
+      },
+      {
+        "module": "geometry",
+        "name": "build_dense_tile_raster_plan",
+        "previous_sha256": "ab93d0470091be111c6ec1d61f2b6bfba66cef119b253d2ab39e60811d5dcd45",
+        "sha256": "e542acdfca1d4d0544b34fdb28a32857c20b06695e2a1a87856cbf0c8e014d2c",
+        "reason": "Represent external-policy pass identity separately from physical view geometry and preserve tile planning and source metadata."
+      },
+      {
+        "module": "inference",
+        "name": "predict_source_and_accumulate",
+        "previous_sha256": "99f5635dc4c4dbbfa4278e997c3fb32bc1520034a9cad7008a768ad3a4935f75",
+        "sha256": "a5bfa95491c5c522078545c0e84fce7949f2d435fb879a0501101f25ea4ebfab",
+        "reason": "Accept augmented rendered tensors and inverse-mask hooks while preserving accumulation metadata and asynchronous source lifetime."
+      },
+      {
+        "module": "inference",
+        "name": "cleanup_view_volume_after_prediction_inplace",
+        "previous_sha256": "bd2a22d0fe5a87d1453b587dca011c8434835baf65e9f21fe079eb0115a0d791",
+        "sha256": "3140201a9867b3d56a92aaec25db2c9cb13f4033b53710901ae8e4c0f183661d",
+        "reason": "Accept augmented rendered tensors and inverse-mask hooks while preserving accumulation metadata and asynchronous source lifetime."
+      },
+      {
+        "module": "interpolation",
+        "name": "_view_uses_interpolation",
+        "previous_sha256": "02d942c4943a2eaf73e0dce1cb4c9c3a55b71fb5ea9e9bcf9d29a03183107b2d",
+        "sha256": "8dbab59709d38c041377d13a08579363b39f00fd8c20704ede304571046e9d1c",
+        "reason": "Carry external-pass provenance and coverage references on independently editable NRRD layer records."
+      },
+      {
+        "module": "pipeline",
+        "name": "_main_impl",
+        "previous_sha256": "78697f072a548326fbddfd0724ab873c5f02f0ed9c88fd43fe039cb15aaa7d07",
+        "sha256": "67962587cf9093b2b42163125aff24f628da5149f4b4089fd049c2f25669f7e4",
+        "reason": "Schedule GPU external-policy passes over reused expensive views, retain independent output layers and record coverage provenance."
+      },
+      {
+        "module": "pta_config",
+        "name": "build_pta_argparser",
+        "previous_sha256": "7905b59b2c448efa9a582228f7e6c8307013d76b174061196bacc80ab8147a6c",
+        "sha256": "48b33d000cdcef831c4e9c17168ab4f70f1b086108ca5d07735fc11114578571",
+        "reason": "Reuse the common policy and ratio argument declarations while preserving existing PTA defaults and fractional ratio semantics."
+      },
+      {
+        "module": "publication_memory",
+        "name": "native_fullframe_dense_reserve",
+        "previous_sha256": "a83206ebe2cd6311f44c4554f6523a2982dd6615d58ff586a4c004d3e04640c7",
+        "sha256": "d4f66f3d985068d34c2c85e1f904bd334d9d119c5c543fd9786181a631f99be7",
+        "reason": "Account for augmentation working maps and independently pending pass publication in bounded memory admission."
+      },
+      {
+        "module": "tta_augmentation",
+        "name": "_normalized_grid",
+        "previous_sha256": null,
+        "sha256": "f1aaaeaffa1d21aeab90420a96360b1751ef885e4970759a5e3e701aeb152aa2",
+        "reason": "Replay the example GPU policies, invert spatial masks with explicit validity, and bound reusable maps without regenerating projected views."
+      },
+      {
+        "module": "tta_augmentation",
+        "name": "_bilinear_displacement",
+        "previous_sha256": null,
+        "sha256": "67115a5fe08d5541dcbff21e51eff34bbb0eb18d12c8c7657309dd04886238be",
+        "reason": "Replay the example GPU policies, invert spatial masks with explicit validity, and bound reusable maps without regenerating projected views."
+      },
+      {
+        "module": "tta_augmentation",
+        "name": "inverse_policy_grid",
+        "previous_sha256": null,
+        "sha256": "221387ec46c0ba101b5f6a633feaab38be2f2d015ca387591b8ffb914a0f7c9c",
+        "reason": "Replay the example GPU policies, invert spatial masks with explicit validity, and bound reusable maps without regenerating projected views."
+      },
+      {
+        "module": "tta_augmentation",
+        "name": "SpatialReplay",
+        "previous_sha256": null,
+        "sha256": "4f242d38685c6726b04ca4a4242bc4c442799c00b2e4eb5c442e23560a32d5bf",
+        "reason": "Replay the example GPU policies, invert spatial masks with explicit validity, and bound reusable maps without regenerating projected views."
+      },
+      {
+        "module": "tta_augmentation",
+        "name": "GpuPolicyAdapter",
+        "previous_sha256": null,
+        "sha256": "474d39cf9a1bf4ccab3f78a3380b1265a11aed4c2035cf7dc02fadfcde74e2e0",
+        "reason": "Replay the example GPU policies, invert spatial masks with explicit validity, and bound reusable maps without regenerating projected views."
+      },
+      {
+        "module": "tta_augmentation",
+        "name": "worker_policy",
+        "previous_sha256": null,
+        "sha256": "1ebc8cdf6e951cd37d8bcf683d49193547ce8922bd906456af0f991a0d4b5fd2",
+        "reason": "Replay the example GPU policies, invert spatial masks with explicit validity, and bound reusable maps without regenerating projected views."
+      },
+      {
+        "module": "tta_augmentation",
+        "name": "clear_worker_policies",
+        "previous_sha256": null,
+        "sha256": "1e036cfea8f9c824828d67009cb16497c8c6a18b3d4b4e0ff87c0cbbcb8a20da",
+        "reason": "Replay the example GPU policies, invert spatial masks with explicit validity, and bound reusable maps without regenerating projected views."
+      },
+      {
+        "module": "tta_augmentation_config",
+        "name": "add_augmentation_arguments",
+        "previous_sha256": null,
+        "sha256": "6c8670e9dfad097da038bcb540c39819153c6ab7d5fe59f8259458e0d2c4ceb9",
+        "reason": "Expose shared policy/ratio flags and validate GPU-only TTA passes, deterministic reroll granularity and coverage settings."
+      },
+      {
+        "module": "tta_augmentation_config",
+        "name": "add_tta_augmentation_arguments",
+        "previous_sha256": null,
+        "sha256": "bf5862b2be0717bf6e6708fcb2dc709cc49f2177d1d2efbd9673b6d383fdcff0",
+        "reason": "Expose shared policy/ratio flags and validate GPU-only TTA passes, deterministic reroll granularity and coverage settings."
+      },
+      {
+        "module": "tta_augmentation_config",
+        "name": "TtaAugmentationSettings",
+        "previous_sha256": null,
+        "sha256": "46d43e011239e8244a3b54811b419cb256531a9abe23e53811d01ee38ab89df2",
+        "reason": "Expose shared policy/ratio flags and validate GPU-only TTA passes, deterministic reroll granularity and coverage settings."
+      },
+      {
+        "module": "tta_augmentation_config",
+        "name": "resolve_tta_augmentation",
+        "previous_sha256": null,
+        "sha256": "c73b466306e70d2f8dac278a3437ccd2f31c70c66c3aebd8d87b024b2e689b45",
+        "reason": "Expose shared policy/ratio flags and validate GPU-only TTA passes, deterministic reroll granularity and coverage settings."
+      },
+      {
+        "module": "tta_augmentation_config",
+        "name": "policy_seed",
+        "previous_sha256": null,
+        "sha256": "0196aaa1f971bc4106a4534bd0098fac3b2c343bbea7d69209bae86b44af0775",
+        "reason": "Expose shared policy/ratio flags and validate GPU-only TTA passes, deterministic reroll granularity and coverage settings."
+      },
+      {
+        "module": "tta_augmentation_cuda",
+        "name": "_kernels",
+        "previous_sha256": null,
+        "sha256": "898e274ad040f75a119892ab86e780f401a12d47fb100d0f0ea162811eaff886",
+        "reason": "Fuse inverse-coordinate and coverage calculations on CUDA while preserving the reference transform and convergence contract."
+      },
+      {
+        "module": "tta_augmentation_cuda",
+        "name": "_borrow",
+        "previous_sha256": null,
+        "sha256": "a00039f6eef5215d2c1bd469bc44e958e0360712eae5fd59066f80b72851344d",
+        "reason": "Fuse inverse-coordinate and coverage calculations on CUDA while preserving the reference transform and convergence contract."
+      },
+      {
+        "module": "tta_augmentation_cuda",
+        "name": "require_policy_cuda",
+        "previous_sha256": null,
+        "sha256": "5373f819c52df3576b59e6b9a0235166d4e3d756b6017a94da0efc9fcf30cbd2",
+        "reason": "Fuse inverse-coordinate and coverage calculations on CUDA while preserving the reference transform and convergence contract."
+      },
+      {
+        "module": "tta_augmentation_cuda",
+        "name": "policy_grids_cuda",
+        "previous_sha256": null,
+        "sha256": "ac15006125d7fc960aa4bc93316574d40e47d4c0cdd2ad8e5624ea27ac82d71f",
+        "reason": "Fuse inverse-coordinate and coverage calculations on CUDA while preserving the reference transform and convergence contract."
+      },
+      {
+        "module": "tta_augmentation_cuda",
+        "name": "pack_validity_cuda",
+        "previous_sha256": null,
+        "sha256": "f611bab13a7b072e2ce6a485a379c0f2ac691602610dbe422f450551967d5cea",
+        "reason": "Fuse inverse-coordinate and coverage calculations on CUDA while preserving the reference transform and convergence contract."
+      },
+      {
+        "module": "tta_augmentation_cuda",
+        "name": "quantize_boundary_cuda",
+        "previous_sha256": null,
+        "sha256": "409de49c5e66d904d45398c7f501c6ad586888215830dfbba212cd7231026e8c",
+        "reason": "Fuse inverse-coordinate and coverage calculations on CUDA while preserving the reference transform and convergence contract."
+      },
+      {
+        "module": "tta_augmentation_retirement",
+        "name": "SliceMetadataAccumulator",
+        "previous_sha256": null,
+        "sha256": "1e73f6309c378a74adb4b7d23208d9e355b8953e2769547a08202ff6bc22dc6b",
+        "reason": "Copy and retire model-raster predictions through bounded background publication while preserving accumulated slice metadata and independent pass identity."
+      },
+      {
+        "module": "tta_augmentation_retirement",
+        "name": "CoverageTransfers",
+        "previous_sha256": null,
+        "sha256": "d361abdd185d92fcc4f8116d0a8f528a4672935f4188407f62c70808e61a6018",
+        "reason": "Copy and retire model-raster predictions through bounded background publication while preserving accumulated slice metadata and independent pass identity."
+      },
+      {
+        "module": "tta_augmentation_retirement",
+        "name": "_PolicyRetirementPool",
+        "previous_sha256": null,
+        "sha256": "a8818f740c4c9ca4c19418f56429e800f2147ab451c0ee38012cc5de6423b21e",
+        "reason": "Copy and retire model-raster predictions through bounded background publication while preserving accumulated slice metadata and independent pass identity."
+      },
+      {
+        "module": "tta_augmentation_retirement",
+        "name": "PolicyRetirementReservation",
+        "previous_sha256": null,
+        "sha256": "953c7da512b1f6d679df626aec34bb60354e8db939ddbb404c2dd86a1fabbc1e",
+        "reason": "Copy and retire model-raster predictions through bounded background publication while preserving accumulated slice metadata and independent pass identity."
+      },
+      {
+        "module": "tta_augmentation_retirement",
+        "name": "reserve_policy_retirement",
+        "previous_sha256": null,
+        "sha256": "f299787b47426a29093e165e9c1672e268365859dbd70bc2e10f8fe99ca88e87",
+        "reason": "Copy and retire model-raster predictions through bounded background publication while preserving accumulated slice metadata and independent pass identity."
+      },
+      {
+        "module": "tta_augmentation_retirement",
+        "name": "shutdown_policy_retirement",
+        "previous_sha256": null,
+        "sha256": "410ecf417b4783d9eee49aeaaaaf87e23b26763c166b5108617d78e5f0631f5c",
+        "reason": "Copy and retire model-raster predictions through bounded background publication while preserving accumulated slice metadata and independent pass identity."
+      },
+      {
+        "module": "tta_augmentation_runtime",
+        "name": "PolicyTensorBatchSource",
+        "previous_sha256": null,
+        "sha256": "4901764232f7b3da08e529a817608eb0aaf6fa8f90d7ebc58283421d2c8ab0f8",
+        "reason": "Sequence the base and independent augmented inference passes on each rendered batch, retain metadata, publish coverage and exclude augmented interpolation."
+      },
+      {
+        "module": "tta_augmentation_runtime",
+        "name": "_CoverageWriter",
+        "previous_sha256": null,
+        "sha256": "ab0318818bc4372ce5a3e46c3799bfccda22a9214bc3dd3daac788393c00ed29",
+        "reason": "Sequence the base and independent augmented inference passes on each rendered batch, retain metadata, publish coverage and exclude augmented interpolation."
+      },
+      {
+        "module": "tta_augmentation_runtime",
+        "name": "_padding_metadata",
+        "previous_sha256": null,
+        "sha256": "d66c4eea32f369e34a16e6b19ccf057d06cbdf29a46f745548ef433adeb2ba3d",
+        "reason": "Sequence the base and independent augmented inference passes on each rendered batch, retain metadata, publish coverage and exclude augmented interpolation."
+      },
+      {
+        "module": "tta_augmentation_runtime",
+        "name": "predict_policy_source",
+        "previous_sha256": null,
+        "sha256": "c46f430cc26f27c17b83138a0fa2e97dcb780bc2d8bcce7810786b3f07373b54",
+        "reason": "Sequence the base and independent augmented inference passes on each rendered batch, retain metadata, publish coverage and exclude augmented interpolation."
+      },
+      {
+        "module": "tta_scheduler",
+        "name": "TtaScheduler",
+        "previous_sha256": "c87c38a668ec9b0b5f11a1079ac5945c9755b6468e2e9034e98175846905564b",
+        "sha256": "8c951ec32a1de42827d8a014049fd8499cf1e3fd6a8d0745a959b74a73d6b39c",
+        "reason": "Schedule base and augmented pass results without rerendering source views, retaining per-pass identity and resource lifetimes."
+      },
+      {
+        "module": "workers",
+        "name": "run_prediction_volume_in_worker",
+        "previous_sha256": "2590e4f06e7b44a78aea53e6b8a25b7c15e621485c2efa9d383c617b1ead0a90",
+        "sha256": "8e626ec7d54d786ed18fc1ac9b12058d1e829ef9de5945adbba4666dd9c8dd61",
+        "reason": "Run external augmentation inside GPU worker ownership and transfer each pass result with its output and coverage metadata."
+      },
+      {
+        "module": "workers",
+        "name": "_release_gpu_worker_inference_assets",
+        "previous_sha256": "cc82e02acb0e19f80792e32e4b516c0063ea28b706d3e2b1562cb01456816a7d",
+        "sha256": "abbfe05899a25d4b883ecd478717d6064dee2b1eb614fbab453a457a5843d03a",
+        "reason": "Run external augmentation inside GPU worker ownership and transfer each pass result with its output and coverage metadata."
+      },
+      {
+        "module": "workers",
+        "name": "_gpu_inference_worker_main",
+        "previous_sha256": "b4172e9b25798b66ebd4219b7c716ecbe912e9443cb98f9db29e5966946f745d",
+        "sha256": "9762e4021a07ef62dffaafe204f5de8634bc3ea67043092a5bbb6f21aef241e9",
+        "reason": "Run external augmentation inside GPU worker ownership and transfer each pass result with its output and coverage metadata."
+      }
+    ],
+    "statements": [
+      {
+        "module": "augmentation_policy",
+        "label": "Expr:1",
+        "previous_sha256": null,
+        "sha256": "1f69f4ff72a6cb77a559c372bfae473dd6b6b54d646759ef4a42e356edd351fe",
+        "reason": "Share import-free policy inspection and change detection between PTA and TTA while preserving PTA reexports."
+      },
+      {
+        "module": "augmentation_policy",
+        "label": "ImportFrom:3",
+        "previous_sha256": null,
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Share import-free policy inspection and change detection between PTA and TTA while preserving PTA reexports."
+      },
+      {
+        "module": "augmentation_policy",
+        "label": "Import:5",
+        "previous_sha256": null,
+        "sha256": "bb134ca6c8f43358b0a04f3db40a8957242456961f7c0823aff7ae7a2647bf15",
+        "reason": "Share import-free policy inspection and change detection between PTA and TTA while preserving PTA reexports."
+      },
+      {
+        "module": "augmentation_policy",
+        "label": "Import:6",
+        "previous_sha256": null,
+        "sha256": "092cb77ae0770f1627b29bf41b2732722fbcc3a0e1d77a79674801800a2721d1",
+        "reason": "Share import-free policy inspection and change detection between PTA and TTA while preserving PTA reexports."
+      },
+      {
+        "module": "augmentation_policy",
+        "label": "ImportFrom:7",
+        "previous_sha256": null,
+        "sha256": "321ed2ed3afceb74be547c9905ed4c676e453b1a68fe7cb2d3e214caeac2624d",
+        "reason": "Share import-free policy inspection and change detection between PTA and TTA while preserving PTA reexports."
+      },
+      {
+        "module": "augmentation_policy",
+        "label": "ImportFrom:8",
+        "previous_sha256": null,
+        "sha256": "59051b17634cdcb5a576ceb58fdc0a4e5652ed3b60d66667e92ddefd931abeca",
+        "reason": "Share import-free policy inspection and change detection between PTA and TTA while preserving PTA reexports."
+      },
+      {
+        "module": "augmentation_policy",
+        "label": "ImportFrom:9",
+        "previous_sha256": null,
+        "sha256": "6e6ebb8547d92a660013cb963e5c4d9e1455f6713fb22a39e32a99b5e7a466e5",
+        "reason": "Share import-free policy inspection and change detection between PTA and TTA while preserving PTA reexports."
+      },
+      {
+        "module": "pta_augmentation",
+        "label": "ImportFrom:32",
+        "previous_sha256": null,
+        "sha256": "0b3d8ba04d7892ad5dad5d79217d4e93b829999eb74b8b11ec6a6842c71424e7",
+        "reason": "Reexport the shared import-free descriptor and validators from their common augmentation owner."
+      },
+      {
+        "module": "tta_augmentation",
+        "label": "Expr:1",
+        "previous_sha256": null,
+        "sha256": "e919717f70095417009ba465a7e690a8a10b645013770f657671013816870ca7",
+        "reason": "Replay the example GPU policies, invert spatial masks with explicit validity, and bound reusable maps without regenerating projected views."
+      },
+      {
+        "module": "tta_augmentation",
+        "label": "ImportFrom:8",
+        "previous_sha256": null,
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Replay the example GPU policies, invert spatial masks with explicit validity, and bound reusable maps without regenerating projected views."
+      },
+      {
+        "module": "tta_augmentation",
+        "label": "ImportFrom:10",
+        "previous_sha256": null,
+        "sha256": "c94574074fdb9b78d16dc80d7f17b8e203628f02242595f56590a1b1c4a8a3cc",
+        "reason": "Replay the example GPU policies, invert spatial masks with explicit validity, and bound reusable maps without regenerating projected views."
+      },
+      {
+        "module": "tta_augmentation",
+        "label": "ImportFrom:11",
+        "previous_sha256": null,
+        "sha256": "321ed2ed3afceb74be547c9905ed4c676e453b1a68fe7cb2d3e214caeac2624d",
+        "reason": "Replay the example GPU policies, invert spatial masks with explicit validity, and bound reusable maps without regenerating projected views."
+      },
+      {
+        "module": "tta_augmentation",
+        "label": "ImportFrom:12",
+        "previous_sha256": null,
+        "sha256": "9075bf5d79b58c2e28971b4c577c6dec5a6aeccdb5a2070fde877d64c91a00d9",
+        "reason": "Replay the example GPU policies, invert spatial masks with explicit validity, and bound reusable maps without regenerating projected views."
+      },
+      {
+        "module": "tta_augmentation",
+        "label": "Import:14",
+        "previous_sha256": null,
+        "sha256": "271fc31378e1108a9784c29c3c4768de571ce080301b4ad9721ba767fcf5842b",
+        "reason": "Replay the example GPU policies, invert spatial masks with explicit validity, and bound reusable maps without regenerating projected views."
+      },
+      {
+        "module": "tta_augmentation",
+        "label": "ImportFrom:16",
+        "previous_sha256": null,
+        "sha256": "79ab7f0eebf7c7c6877127c6293db85523f60805e5847e0baf88e0112085259b",
+        "reason": "Replay the example GPU policies, invert spatial masks with explicit validity, and bound reusable maps without regenerating projected views."
+      },
+      {
+        "module": "tta_augmentation",
+        "label": "AnnAssign:268",
+        "previous_sha256": null,
+        "sha256": "4e93b02ae526d4c697562d0efe06a422d37b09695c83e07e1bf948d360d3b2d7",
+        "reason": "Replay the example GPU policies, invert spatial masks with explicit validity, and bound reusable maps without regenerating projected views."
+      },
+      {
+        "module": "tta_augmentation_config",
+        "label": "Expr:1",
+        "previous_sha256": null,
+        "sha256": "477705aba59666c772f90dd7eaf7764b1ff98a0b0cd4e4845a1581f41fb59ec1",
+        "reason": "Expose shared policy/ratio flags and validate GPU-only TTA passes, deterministic reroll granularity and coverage settings."
+      },
+      {
+        "module": "tta_augmentation_config",
+        "label": "ImportFrom:2",
+        "previous_sha256": null,
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Expose shared policy/ratio flags and validate GPU-only TTA passes, deterministic reroll granularity and coverage settings."
+      },
+      {
+        "module": "tta_augmentation_config",
+        "label": "Import:4",
+        "previous_sha256": null,
+        "sha256": "356e6775028bc09e699d8b986887aaebc5e3e8e414a507fe911e3ba7da1264d9",
+        "reason": "Expose shared policy/ratio flags and validate GPU-only TTA passes, deterministic reroll granularity and coverage settings."
+      },
+      {
+        "module": "tta_augmentation_config",
+        "label": "Import:5",
+        "previous_sha256": null,
+        "sha256": "092cb77ae0770f1627b29bf41b2732722fbcc3a0e1d77a79674801800a2721d1",
+        "reason": "Expose shared policy/ratio flags and validate GPU-only TTA passes, deterministic reroll granularity and coverage settings."
+      },
+      {
+        "module": "tta_augmentation_config",
+        "label": "Import:6",
+        "previous_sha256": null,
+        "sha256": "211ee42757705c7e350e70e36b762987a737f5e9c268f2a343e2dbfcb8fbea75",
+        "reason": "Expose shared policy/ratio flags and validate GPU-only TTA passes, deterministic reroll granularity and coverage settings."
+      },
+      {
+        "module": "tta_augmentation_config",
+        "label": "Import:7",
+        "previous_sha256": null,
+        "sha256": "f329650e2c61a07a1bab85b32296a6d93760e313e108904819fa27d09cf3954d",
+        "reason": "Expose shared policy/ratio flags and validate GPU-only TTA passes, deterministic reroll granularity and coverage settings."
+      },
+      {
+        "module": "tta_augmentation_config",
+        "label": "ImportFrom:8",
+        "previous_sha256": null,
+        "sha256": "a65cdf5e3bd8f9ea2c7701e152d939a4d5508f7709347bd208ea60e6125cec3e",
+        "reason": "Expose shared policy/ratio flags and validate GPU-only TTA passes, deterministic reroll granularity and coverage settings."
+      },
+      {
+        "module": "tta_augmentation_config",
+        "label": "ImportFrom:9",
+        "previous_sha256": null,
+        "sha256": "68c3503c96524a291ba3f175e383b38269e898b6c29bd9965c11d7e1d2ae8ae9",
+        "reason": "Expose shared policy/ratio flags and validate GPU-only TTA passes, deterministic reroll granularity and coverage settings."
+      },
+      {
+        "module": "tta_augmentation_config",
+        "label": "ImportFrom:11",
+        "previous_sha256": null,
+        "sha256": "0b3d8ba04d7892ad5dad5d79217d4e93b829999eb74b8b11ec6a6842c71424e7",
+        "reason": "Expose shared policy/ratio flags and validate GPU-only TTA passes, deterministic reroll granularity and coverage settings."
+      },
+      {
+        "module": "tta_augmentation_cuda",
+        "label": "Expr:1",
+        "previous_sha256": null,
+        "sha256": "89c3f3ccb2eea902dd93bdd60ba43e2c7242b5c5489ab9219a6f1db05d5c003d",
+        "reason": "Fuse inverse-coordinate and coverage calculations on CUDA while preserving the reference transform and convergence contract."
+      },
+      {
+        "module": "tta_augmentation_cuda",
+        "label": "ImportFrom:7",
+        "previous_sha256": null,
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Fuse inverse-coordinate and coverage calculations on CUDA while preserving the reference transform and convergence contract."
+      },
+      {
+        "module": "tta_augmentation_cuda",
+        "label": "ImportFrom:9",
+        "previous_sha256": null,
+        "sha256": "c519b84a63035f6aaf0ea8f230b5de368c6c6984aeb373f2a1ace94ab210c265",
+        "reason": "Fuse inverse-coordinate and coverage calculations on CUDA while preserving the reference transform and convergence contract."
+      },
+      {
+        "module": "tta_augmentation_cuda",
+        "label": "ImportFrom:10",
+        "previous_sha256": null,
+        "sha256": "68c3503c96524a291ba3f175e383b38269e898b6c29bd9965c11d7e1d2ae8ae9",
+        "reason": "Fuse inverse-coordinate and coverage calculations on CUDA while preserving the reference transform and convergence contract."
+      },
+      {
+        "module": "tta_augmentation_cuda",
+        "label": "Import:12",
+        "previous_sha256": null,
+        "sha256": "271fc31378e1108a9784c29c3c4768de571ce080301b4ad9721ba767fcf5842b",
+        "reason": "Fuse inverse-coordinate and coverage calculations on CUDA while preserving the reference transform and convergence contract."
+      },
+      {
+        "module": "tta_augmentation_cuda",
+        "label": "Assign:15",
+        "previous_sha256": null,
+        "sha256": "252f417ac35a302653edf7a622fc32511badf682828adf95858f0069272132d0",
+        "reason": "Fuse inverse-coordinate and coverage calculations on CUDA while preserving the reference transform and convergence contract."
+      },
+      {
+        "module": "tta_augmentation_retirement",
+        "label": "Expr:1",
+        "previous_sha256": null,
+        "sha256": "6d95bb33c2aa31e3c4fd7e51c5191ef0cb19b6f3d33a7b7c5b816ecca47a83f5",
+        "reason": "Copy and retire model-raster predictions through bounded background publication while preserving accumulated slice metadata and independent pass identity."
+      },
+      {
+        "module": "tta_augmentation_retirement",
+        "label": "ImportFrom:2",
+        "previous_sha256": null,
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Copy and retire model-raster predictions through bounded background publication while preserving accumulated slice metadata and independent pass identity."
+      },
+      {
+        "module": "tta_augmentation_retirement",
+        "label": "ImportFrom:4",
+        "previous_sha256": null,
+        "sha256": "44606a75ef80c599dae4001b8647bf9120e9ae20e99e2647215ae67968dbeb17",
+        "reason": "Copy and retire model-raster predictions through bounded background publication while preserving accumulated slice metadata and independent pass identity."
+      },
+      {
+        "module": "tta_augmentation_retirement",
+        "label": "ImportFrom:5",
+        "previous_sha256": null,
+        "sha256": "7785747cb9647444f6bf0c7aae1df3a2a18fc2b09299d488ca78744db5dfecc7",
+        "reason": "Copy and retire model-raster predictions through bounded background publication while preserving accumulated slice metadata and independent pass identity."
+      },
+      {
+        "module": "tta_augmentation_retirement",
+        "label": "Import:6",
+        "previous_sha256": null,
+        "sha256": "80f21c52b46d18d972ae93db225486a900db10799e9bdba98d07dbcc819ff502",
+        "reason": "Copy and retire model-raster predictions through bounded background publication while preserving accumulated slice metadata and independent pass identity."
+      },
+      {
+        "module": "tta_augmentation_retirement",
+        "label": "ImportFrom:7",
+        "previous_sha256": null,
+        "sha256": "68c3503c96524a291ba3f175e383b38269e898b6c29bd9965c11d7e1d2ae8ae9",
+        "reason": "Copy and retire model-raster predictions through bounded background publication while preserving accumulated slice metadata and independent pass identity."
+      },
+      {
+        "module": "tta_augmentation_retirement",
+        "label": "Import:9",
+        "previous_sha256": null,
+        "sha256": "271fc31378e1108a9784c29c3c4768de571ce080301b4ad9721ba767fcf5842b",
+        "reason": "Copy and retire model-raster predictions through bounded background publication while preserving accumulated slice metadata and independent pass identity."
+      },
+      {
+        "module": "tta_augmentation_retirement",
+        "label": "AnnAssign:176",
+        "previous_sha256": null,
+        "sha256": "1208e1a39e8e36364c527cccc07ffdb59db4498124df21f51bef9fc9d56390c0",
+        "reason": "Copy and retire model-raster predictions through bounded background publication while preserving accumulated slice metadata and independent pass identity."
+      },
+      {
+        "module": "tta_augmentation_retirement",
+        "label": "Assign:177",
+        "previous_sha256": null,
+        "sha256": "bb1be6363a78930259c11e1dc4c64610f17b402783e563107e9eac64f8624f1e",
+        "reason": "Copy and retire model-raster predictions through bounded background publication while preserving accumulated slice metadata and independent pass identity."
+      },
+      {
+        "module": "tta_augmentation_runtime",
+        "label": "Expr:1",
+        "previous_sha256": null,
+        "sha256": "279cb7b0d70820b653c66abb4da643de3696b67d5923f353d96832c93558d60a",
+        "reason": "Sequence the base and independent augmented inference passes on each rendered batch, retain metadata, publish coverage and exclude augmented interpolation."
+      },
+      {
+        "module": "tta_augmentation_runtime",
+        "label": "ImportFrom:7",
+        "previous_sha256": null,
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Sequence the base and independent augmented inference passes on each rendered batch, retain metadata, publish coverage and exclude augmented interpolation."
+      },
+      {
+        "module": "tta_augmentation_runtime",
+        "label": "Import:9",
+        "previous_sha256": null,
+        "sha256": "356e6775028bc09e699d8b986887aaebc5e3e8e414a507fe911e3ba7da1264d9",
+        "reason": "Sequence the base and independent augmented inference passes on each rendered batch, retain metadata, publish coverage and exclude augmented interpolation."
+      },
+      {
+        "module": "tta_augmentation_runtime",
+        "label": "ImportFrom:10",
+        "previous_sha256": null,
+        "sha256": "44606a75ef80c599dae4001b8647bf9120e9ae20e99e2647215ae67968dbeb17",
+        "reason": "Sequence the base and independent augmented inference passes on each rendered batch, retain metadata, publish coverage and exclude augmented interpolation."
+      },
+      {
+        "module": "tta_augmentation_runtime",
+        "label": "ImportFrom:11",
+        "previous_sha256": null,
+        "sha256": "7785747cb9647444f6bf0c7aae1df3a2a18fc2b09299d488ca78744db5dfecc7",
+        "reason": "Sequence the base and independent augmented inference passes on each rendered batch, retain metadata, publish coverage and exclude augmented interpolation."
+      },
+      {
+        "module": "tta_augmentation_runtime",
+        "label": "ImportFrom:12",
+        "previous_sha256": null,
+        "sha256": "70bd9e0c4f1816b9f9f4b04c6c07c6303849eadd90de76e9a14084b9c76de162",
+        "reason": "Sequence the base and independent augmented inference passes on each rendered batch, retain metadata, publish coverage and exclude augmented interpolation."
+      },
+      {
+        "module": "tta_augmentation_runtime",
+        "label": "Import:13",
+        "previous_sha256": null,
+        "sha256": "092cb77ae0770f1627b29bf41b2732722fbcc3a0e1d77a79674801800a2721d1",
+        "reason": "Sequence the base and independent augmented inference passes on each rendered batch, retain metadata, publish coverage and exclude augmented interpolation."
+      },
+      {
+        "module": "tta_augmentation_runtime",
+        "label": "Import:14",
+        "previous_sha256": null,
+        "sha256": "211ee42757705c7e350e70e36b762987a737f5e9c268f2a343e2dbfcb8fbea75",
+        "reason": "Sequence the base and independent augmented inference passes on each rendered batch, retain metadata, publish coverage and exclude augmented interpolation."
+      },
+      {
+        "module": "tta_augmentation_runtime",
+        "label": "ImportFrom:15",
+        "previous_sha256": null,
+        "sha256": "59051b17634cdcb5a576ceb58fdc0a4e5652ed3b60d66667e92ddefd931abeca",
+        "reason": "Sequence the base and independent augmented inference passes on each rendered batch, retain metadata, publish coverage and exclude augmented interpolation."
+      },
+      {
+        "module": "tta_augmentation_runtime",
+        "label": "ImportFrom:16",
+        "previous_sha256": null,
+        "sha256": "68c3503c96524a291ba3f175e383b38269e898b6c29bd9965c11d7e1d2ae8ae9",
+        "reason": "Sequence the base and independent augmented inference passes on each rendered batch, retain metadata, publish coverage and exclude augmented interpolation."
+      },
+      {
+        "module": "tta_augmentation_runtime",
+        "label": "Import:18",
+        "previous_sha256": null,
+        "sha256": "271fc31378e1108a9784c29c3c4768de571ce080301b4ad9721ba767fcf5842b",
+        "reason": "Sequence the base and independent augmented inference passes on each rendered batch, retain metadata, publish coverage and exclude augmented interpolation."
+      },
+      {
+        "module": "tta_augmentation_runtime",
+        "label": "ImportFrom:20",
+        "previous_sha256": null,
+        "sha256": "f985bf8bb522f218d1addb608d4366ea1cefef7d2166c19afada657f7bdad841",
+        "reason": "Sequence the base and independent augmented inference passes on each rendered batch, retain metadata, publish coverage and exclude augmented interpolation."
+      },
+      {
+        "module": "tta_augmentation_runtime",
+        "label": "ImportFrom:25",
+        "previous_sha256": null,
+        "sha256": "41ed30f636680a990497d870b4fb910e6c4a675f7212be04e82e47ec614cf088",
+        "reason": "Sequence the base and independent augmented inference passes on each rendered batch, retain metadata, publish coverage and exclude augmented interpolation."
+      },
+      {
+        "module": "tta_augmentation_runtime",
+        "label": "ImportFrom:26",
+        "previous_sha256": null,
+        "sha256": "c583dd9564d0d69e1dfa2fc71bafb2e4aebd33bfc0dbd1586cc58d15e1259095",
+        "reason": "Sequence the base and independent augmented inference passes on each rendered batch, retain metadata, publish coverage and exclude augmented interpolation."
+      },
+      {
+        "module": "tta_augmentation_runtime",
+        "label": "ImportFrom:27",
+        "previous_sha256": null,
+        "sha256": "38b581c0f27fe09147f7884fc8d02220568cc16316e24a0a7d3fea78c3452cd0",
+        "reason": "Sequence the base and independent augmented inference passes on each rendered batch, retain metadata, publish coverage and exclude augmented interpolation."
+      },
+      {
+        "module": "unification/tta_manifest",
+        "label": "Assign:16",
+        "previous_sha256": "375bc56238fa582ea2753b2245ed95a7f3ba2acd67028285a1a9d27e7c54a258",
+        "sha256": "bb244c44dd122448169e63cb6f192479069a936aed0d398fd01c38ce293abc4f",
+        "reason": "Record external policy settings, independent pass outputs and inverse-validity sidecars in the durable TTA manifest."
+      }
+    ],
+    "local_import_seam_updates": [
+      {
+        "module": "assembly",
+        "name": "prepare_view_volume_after_fullframe",
+        "previous_definition_sha256": "d52de78c1ba5464c0fb4b0234b96c9c0cdf430e93100974defce364d55001721",
+        "previous_seam_sha256": "c9595db954da98f5df4678a2bbf2416a70dc432e38c05097ed3396e6d0c823f6",
+        "definition_sha256": "4f1c540ddaaf3688e531d54a2c6dda10489697b55d65ec311b8d0df3937a1bf9",
+        "seam_sha256": "c9595db954da98f5df4678a2bbf2416a70dc432e38c05097ed3396e6d0c823f6",
+        "reason": "Publish independent augmented NRRD layers and exclude them from interpolation while retaining all contributions to the final union."
+      },
+      {
+        "module": "assembly",
+        "name": "finalize_consolidated_tile_volume_for_parent",
+        "previous_definition_sha256": "bc3ecd1d7d9f2d9e9f158a290d0e075bae85565b2b299cfe84f08b08ec7491a4",
+        "previous_seam_sha256": "c955712cc1202c0be55b529d57026f25537c1d43e0e9c692ad6cdc85b3b913f5",
+        "definition_sha256": "003707a78f513aa79e7f2b58ca481eb41a0785cf442fb146fe0aacb34aeee028",
+        "seam_sha256": "c955712cc1202c0be55b529d57026f25537c1d43e0e9c692ad6cdc85b3b913f5",
+        "reason": "Publish independent augmented NRRD layers and exclude them from interpolation while retaining all contributions to the final union."
+      },
+      {
+        "module": "geometry",
+        "name": "maybe_wrap_source_with_gpu_input_staging",
+        "previous_definition_sha256": "496bf1060982040fb935f932af7624277ab7f4c8f8abe4f01f7864f1ab1f4213",
+        "previous_seam_sha256": "28dda3f8902c87b048214bf8d3dd28f3117785ea42503b66e20db91056c6c2e2",
+        "definition_sha256": "10f1f5ccfa1fa7fe2a2fd871ab54e9cbbca0863b4579e3b2843c1edd91c0cfa9",
+        "seam_sha256": "28dda3f8902c87b048214bf8d3dd28f3117785ea42503b66e20db91056c6c2e2",
+        "reason": "Represent external-policy pass identity separately from physical view geometry and preserve tile planning and source metadata."
+      },
+      {
+        "module": "inference",
+        "name": "predict_source_and_accumulate",
+        "previous_definition_sha256": "99f5635dc4c4dbbfa4278e997c3fb32bc1520034a9cad7008a768ad3a4935f75",
+        "previous_seam_sha256": "ccf37e9656817910658d67d9c07dd114ce6eb29a820fda1bfa904ac246d955d8",
+        "definition_sha256": "a5bfa95491c5c522078545c0e84fce7949f2d435fb879a0501101f25ea4ebfab",
+        "seam_sha256": "ccf37e9656817910658d67d9c07dd114ce6eb29a820fda1bfa904ac246d955d8",
+        "reason": "Accept augmented rendered tensors and inverse-mask hooks while preserving accumulation metadata and asynchronous source lifetime."
+      }
+    ],
+    "preserved_radial_definition_updates": [],
+    "preserved_radial_module_updates": [],
+    "complete_modules": [
+      "augmentation_policy",
+      "tta_augmentation",
+      "tta_augmentation_config",
+      "tta_augmentation_cuda",
+      "tta_augmentation_retirement",
+      "tta_augmentation_runtime"
+    ],
+    "definition_relocations": [
+      {
+        "module": "pta_augmentation",
+        "name": "AugmentationDefinition",
+        "previous_sha256": "7f4a5e8fdb7a64582a6aa510c4381a2eb5853b030ebd8e3a0a4940346072c9f9",
+        "destination_module": "augmentation_policy",
+        "destination_name": "AugmentationDefinition",
+        "sha256": "7f4a5e8fdb7a64582a6aa510c4381a2eb5853b030ebd8e3a0a4940346072c9f9",
+        "reexport_sha256": "0b3d8ba04d7892ad5dad5d79217d4e93b829999eb74b8b11ec6a6842c71424e7",
+        "reason": "Move the import-free policy descriptor and validation to the shared PTA/TTA owner; retain exact PTA public imports and generalize only the policy-change error prefix."
+      },
+      {
+        "module": "pta_augmentation",
+        "name": "inspect_augmentation_definition",
+        "previous_sha256": "3d9f9bf614d79d46a7a09c72887db6fa7fda6006f7e2dc662aff51bf3ec86ca0",
+        "destination_module": "augmentation_policy",
+        "destination_name": "inspect_augmentation_definition",
+        "sha256": "3d9f9bf614d79d46a7a09c72887db6fa7fda6006f7e2dc662aff51bf3ec86ca0",
+        "reexport_sha256": "0b3d8ba04d7892ad5dad5d79217d4e93b829999eb74b8b11ec6a6842c71424e7",
+        "reason": "Move the import-free policy descriptor and validation to the shared PTA/TTA owner; retain exact PTA public imports and generalize only the policy-change error prefix."
+      },
+      {
+        "module": "pta_augmentation",
+        "name": "assert_augmentation_definition_unchanged",
+        "previous_sha256": "06e131ad10dbfd062a4e4b2aaca6c370340a00cf43cbf717006b7054b982aa8a",
+        "destination_module": "augmentation_policy",
+        "destination_name": "assert_augmentation_definition_unchanged",
+        "sha256": "07f97e39ddf055dbab2613bfaf257f3392585ff55fe5ae0783e3fad9aecb400f",
+        "reexport_sha256": "0b3d8ba04d7892ad5dad5d79217d4e93b829999eb74b8b11ec6a6842c71424e7",
+        "reason": "Move the import-free policy descriptor and validation to the shared PTA/TTA owner; retain exact PTA public imports and generalize only the policy-change error prefix."
+      }
+    ]
   }
 }

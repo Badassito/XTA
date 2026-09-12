@@ -38,9 +38,14 @@ include = ["XTA*"]
 [tool.setuptools.data-files]
 "share/xta" = [
   "ARCHITECTURE.md",
+  "TTA_EXTERNAL_AUGMENTATION.md",
   "GPT-6-Astra-Ultra_v21.1.1_SLURM.py",
 ]
 "share/xta/tools" = [
+  "tools/tta_augmentation_smoke.py",
+  "tools/check_tta_augmentation_run.py",
+  "tools/benchmark_tta_augmentation.py",
+  "tools/qualify_tta_augmentation.py",
   "tools/replay_component_projection.py",
   "tools/hgx_selftest.py",
   "tools/d1_ipc_selftest.py",

@@ -45,6 +45,8 @@ _VIEW_FIELDS = (
     "azimuthal_request_token",
     "tta_aug_id",
     "tta_angle_deg",
+    "augmentation_pass",
+    "augmentation_base_view",
 )
 
 _RADIAL_VIEW_FIELDS = (

@@ -30,7 +30,93 @@ def inspect_seams(source: str):
     return reviewed_local_import_seams("sample", source, ast.parse(source))
 
 
+def augmentation_contract(manifest):
+    return inventory.reviewed_v22_augmentation_contract(
+        manifest, manifest['v21_review'],
+        *(manifest[f'v21_0_{i}_review'] for i in range(1, 7)),
+        manifest['v21_1_review'], manifest['v21_1_1_review'],
+    )
+
+
 class PackageInventoryTests(unittest.TestCase):
+    def test_augmentation_review_authenticates_definitions_bindings_and_relocations(self):
+        for category in ('definitions', 'statements', 'definition_relocations'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            manifest['v22_augmentation_review'][category][0]['sha256'] = '0' * 64
+            with self.subTest(category=category), self.assertRaisesRegex(
+                    RuntimeError, 'v22.0.0 review digest mismatch'):
+                augmentation_contract(manifest)
+
+    def test_augmentation_review_requires_latest_definition_predecessor(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = manifest['v22_augmentation_review']
+        record = next(item for item in review['definitions']
+                      if (item['module'], item['name']) == ('config', 'build_argparser'))
+        record['previous_sha256'] = '0' * 64
+        authenticated = hashlib.sha256(json.dumps(
+            review, sort_keys=True, separators=(',', ':'),
+        ).encode()).hexdigest()
+        with mock.patch.object(inventory, 'REVIEWED_V22_AUGMENTATION_SHA256', authenticated):
+            with self.assertRaisesRegex(RuntimeError, 'v22.0.0 supersession does not match its historical pin'):
+                augmentation_contract(manifest)
+
+    def test_augmentation_relocation_requires_independent_preserved_pta_predecessor(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = manifest['v22_augmentation_review']
+        review['definition_relocations'][0]['previous_sha256'] = '0' * 64
+        authenticated = hashlib.sha256(json.dumps(
+            review, sort_keys=True, separators=(',', ':'),
+        ).encode()).hexdigest()
+        with mock.patch.object(inventory, 'REVIEWED_V22_AUGMENTATION_SHA256', authenticated):
+            with self.assertRaisesRegex(RuntimeError, 'relocation does not match its preserved predecessor'):
+                augmentation_contract(manifest)
+
+    def test_augmentation_relocation_rejects_a_replacement_pta_wrapper(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = augmentation_contract(manifest)
+        top_level = {
+            module: ast.parse((inventory.PACKAGE / f'{module}.py').read_text(encoding='utf-8')).body
+            for module in ('pta_augmentation', 'augmentation_policy')
+        }
+        top_level['pta_augmentation'].extend(ast.parse(
+            'def inspect_augmentation_definition(path):\n    return None\n',
+        ).body)
+        with self.assertRaisesRegex(RuntimeError, 'shared-owner relocation changed: pta_augmentation.inspect_augmentation_definition'):
+            inventory.verify_augmentation_relocations(review, top_level)
+
+    def test_augmentation_new_modules_have_complete_statement_coverage(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = augmentation_contract(manifest)
+        self.assertEqual(set(review['complete_modules']), {
+            'augmentation_policy', 'tta_augmentation', 'tta_augmentation_config',
+            'tta_augmentation_cuda', 'tta_augmentation_retirement', 'tta_augmentation_runtime',
+        })
+        original_parse = inventory.ast.parse
+
+        def add_unreviewed_statement(source, filename='<unknown>', *args, **kwargs):
+            tree = original_parse(source, filename, *args, **kwargs)
+            if str(filename).replace('\\', '/').endswith('/tta_augmentation_cuda.py'):
+                tree.body.extend(original_parse('UNREVIEWED_AUGMENTATION_BINDING = 1').body)
+            return tree
+
+        with mock.patch.object(inventory.ast, 'parse', side_effect=add_unreviewed_statement):
+            with self.assertRaisesRegex(RuntimeError, 'complete-module statement coverage differs: tta_augmentation_cuda'):
+                verify_inventory()
+
+    def test_augmentation_cuda_source_has_an_independent_statement_pin(self):
+        original_digest = inventory.digest
+
+        def change_cuda_source(node):
+            if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+                    and isinstance(node.value.value, str)
+                    and 'extern "C" __global__ void policy_grids(' in node.value.value):
+                return '0' * 64
+            return original_digest(node)
+
+        with mock.patch.object(inventory, 'digest', side_effect=change_cuda_source):
+            with self.assertRaisesRegex(RuntimeError, 'reviewed statement changed or is missing: tta_augmentation_cuda'):
+                verify_inventory()
+
     def test_overlap_release_authenticates_the_explicit_concurrency_option(self):
         manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
         manifest['v21_1_1_review']['definitions'][0]['sha256'] = '0' * 64

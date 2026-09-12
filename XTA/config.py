@@ -910,6 +910,9 @@ def build_argparser() -> argparse.ArgumentParser:
         version=f"%(prog)s {SCRIPT_VERSION}",
     )
 
+    from .tta_augmentation_config import add_tta_augmentation_arguments
+    add_tta_augmentation_arguments(p)
+
     p.add_argument("--input", required=True, type=str, help="Input video path")
     p.add_argument("--output", default=None, type=str, help="Output directory (default ./{Filename}/)")
     p.add_argument(

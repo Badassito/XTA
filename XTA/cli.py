@@ -93,7 +93,14 @@ def _run_tta(arguments: Sequence[str]) -> None:
     parser = build_tta_argparser()
     if _option_argument_count(mode_arguments, "--channel_format") > 1:
         parser.error("--channel_format may be provided only once")
-    parser.parse_args(mode_arguments)
+    parsed = parser.parse_args(mode_arguments)
+    from .config import resolve_backend_devices
+    from .tta_augmentation_config import resolve_tta_augmentation
+    try:
+        devices = resolve_backend_devices(parsed.device)
+        resolve_tta_augmentation(parsed, gpu_devices=devices.gpu_devices, cpu_enabled=devices.cpu)
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
 
     # The established entry point and pipeline consume sys.argv. Remove the unified mode
     # selector for the duration of the call rather than teaching the v17 parser a new flag.
