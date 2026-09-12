@@ -42,6 +42,7 @@ def compile_physical_views(
     spherical_requests: Sequence[SphericalViewRequest] = (),
     spherical_min_radius: float | None = None,
     spherical_patch_size: int = 0,
+    sampling_policy: str = 'dense',
 ) -> CompiledPhysicalViews:
     """Compile grouped view requests through the authoritative TTA geometry.
 
@@ -80,8 +81,18 @@ def compile_physical_views(
             spherical_views=spherical_targets,
             spherical_min_radius=spherical_min_radius,
             spherical_patch_size=int(spherical_patch_size),
+            sampling_policy=sampling_policy,
+            azimuthal_auto_views=tuple(request.view for request in azimuthal_requests if request.azimuth_angle is None),
         )
     )
+    if sampling_policy == 'coverage':
+        azimuthal_angles = tuple(
+            next(((float(view.azimuths_deg[1] - view.azimuths_deg[0]) if len(view.azimuths_deg) > 1 else 180.0)
+                  for view in views if view.family == 'azimuthal'
+                  and view.azimuthal_request_token == target
+                  and view.sampling_policy == 'coverage'), spacing)
+            for target, spacing in zip(azimuthal_targets, azimuthal_angles)
+        )
     return CompiledPhysicalViews(
         views=views,
         azimuthal_targets=azimuthal_targets,

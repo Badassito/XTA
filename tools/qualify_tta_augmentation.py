@@ -93,6 +93,10 @@ def main() -> int:
     parser.add_argument('--batch', type=int, default=4)
     parser.add_argument('--augmentation_ratio', type=int, default=3)
     parser.add_argument('--augmentation_granularity', choices=('slice', 'slab', 'lease', 'view'), default='slice')
+    parser.add_argument('--projection_sampling', choices=('coverage', 'dense'), default='coverage')
+    parser.add_argument('--enable_spherical', nargs='+', default=[])
+    parser.add_argument('--enable_radial', nargs='+', default=[])
+    parser.add_argument('--enable_azimuthal', nargs='+', default=['transverse:30'])
     parser.add_argument('--no-tiles', action='store_true')
     args = parser.parse_args()
     from XTA.config import resolve_channel_format
@@ -128,13 +132,19 @@ def main() -> int:
             '--output', str(output), '--temp', str(case / 'runtime'), '--device', str(args.device),
             '--channel_format', layout.token, '--imgsz', str(args.imgsz), '--batch', str(args.batch),
             '--quantize', 'gpu:fp32', '--conf', '0.00001', '--min_conf', '0', '--min_radius', '0',
-            '--angle', '0', '--enable_cartesian', 'transverse', '--enable_azimuthal', 'transverse:30',
+            '--angle', '0', '--enable_cartesian', 'transverse',
+            '--projection_sampling', args.projection_sampling,
             '--interpolation_distance', '2', '--interpolation_walk_back', '1', '--interpolation_candidates', '1',
             '--interpolation_passes', '1', '--interpolation_min_radius', '0',
             '--augmentation', str(ROOT / 'XTA/examples/external_augmentations/GPU_light.py'),
             '--augmentation_ratio', str(args.augmentation_ratio),
             '--augmentation_granularity', args.augmentation_granularity,
             '--augmentation_coverage', 'packed', '--save', 'nrrd', 'summary', 'voxel_volume']
+    argv.extend(['--enable_azimuthal', *args.enable_azimuthal])
+    if args.enable_spherical:
+        argv.extend(['--enable_spherical', *args.enable_spherical])
+    if args.enable_radial:
+        argv.extend(['--enable_radial', *args.enable_radial])
     if not args.no_tiles:
         argv.extend(['--enable_tile', '32:32'])
     env = dict(os.environ)

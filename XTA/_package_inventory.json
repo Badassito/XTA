@@ -12667,5 +12667,400 @@
         "reason": "Move the import-free policy descriptor and validation to the shared PTA/TTA owner; retain exact PTA public imports and generalize only the policy-change error prefix."
       }
     ]
+  },
+  "v22_coverage_review": {
+    "release": "22.0.0",
+    "previous_review_sha256": "b2636d119631a48b3424879eeae79c9b2ee56d43722647f3cfab22f9608857e8",
+    "predecessor_commit": "f6557bf52822c8e8d0a752deb81fa26652b8a4e4",
+    "feature": "coverage-sampling",
+    "definitions": [
+      {
+        "module": "azimuthal_coverage",
+        "name": "requires_native_pull",
+        "previous_sha256": null,
+        "sha256": "bf279e7f94ef5ede1e90d5f3edc5c2190b3cb154f61551da77d935878700f196",
+        "reason": "Conservatively reduce eligible automatic upright Azimuthal sampling and force native pull projection, retaining explicit-angle, tilt and downsampled-raster fallbacks."
+      },
+      {
+        "module": "azimuthal_coverage",
+        "name": "optimize_azimuthal_view",
+        "previous_sha256": null,
+        "sha256": "080c0a08e42e989cf8b5b1079f59ec85ac17961f06f9d67a411a22756204449e",
+        "reason": "Conservatively reduce eligible automatic upright Azimuthal sampling and force native pull projection, retaining explicit-angle, tilt and downsampled-raster fallbacks."
+      },
+      {
+        "module": "component_replay",
+        "name": "load_component_replay",
+        "previous_sha256": "fa181bdbe4254ab7dc45b45fb463ff344dbe7da05b9fc3e1484660a5da3932ea",
+        "sha256": "7e857ee8cc92f52b80e7aaecce9564a632cdec9b1b5f968303d64f81394e6165",
+        "reason": "Reconstruct sampled native views from durable geometry metadata while retaining compatibility with older dense replay records."
+      },
+      {
+        "module": "config",
+        "name": "build_argparser",
+        "previous_sha256": "6485e484bc870461bbc7b5df6633f85e440ae81011ab9e3c9acbf0479ee70d19",
+        "sha256": "b19fab989646800f0178dd7bbda43816eeb8d67bca2e75d24b79428d69c552c2",
+        "reason": "Expose conservative sampling policy selection while retaining the published package version and augmentation settings."
+      },
+      {
+        "module": "cylindrical_geometry",
+        "name": "_validate_radius_bounds",
+        "previous_sha256": null,
+        "sha256": "6cf2e7f1179e598d61c7e753ac65f4310101b39971153ae18cd3db69a19bc78c",
+        "reason": "Reduce automatic Radial shells and globally phase ring samples while verifying the exact realized native interpolation support budget."
+      },
+      {
+        "module": "cylindrical_geometry",
+        "name": "radius_grid",
+        "previous_sha256": "0e72a7f7f04340daa209ef1a12da0393502c3c3991bdf7bfffc9fe33722cc2e1",
+        "sha256": "f85a01e8dc0b29094870896d2328dcbcf966b7a0a58808cc7a9f724560da4bf1",
+        "reason": "Reduce automatic Radial shells and globally phase ring samples while verifying the exact realized native interpolation support budget."
+      },
+      {
+        "module": "cylindrical_geometry",
+        "name": "_radial_error_bound_sq",
+        "previous_sha256": null,
+        "sha256": "cb81dc884f89bc51b0b20bf0852236ce89f02cba166767792c20a0ffedf5109b",
+        "reason": "Reduce automatic Radial shells and globally phase ring samples while verifying the exact realized native interpolation support budget."
+      },
+      {
+        "module": "cylindrical_geometry",
+        "name": "global_radii",
+        "previous_sha256": "a221e8a1098103ca987d3e6c128687c5196e5baf0d79260a7a087bda10725bbb",
+        "sha256": "31a830e0eca5378e3199a8753a03d1aa9379d3fe15eec666ef90b5f83e5b2d65",
+        "reason": "Reduce automatic Radial shells and globally phase ring samples while verifying the exact realized native interpolation support budget."
+      },
+      {
+        "module": "cylindrical_geometry",
+        "name": "certified_radial_gap",
+        "previous_sha256": null,
+        "sha256": "9c9a266121377698b8ece56e7752006b856f657bd102a486cf05944a760cfbcc",
+        "reason": "Reduce automatic Radial shells and globally phase ring samples while verifying the exact realized native interpolation support budget."
+      },
+      {
+        "module": "cylindrical_geometry",
+        "name": "build_radial_view_infos",
+        "previous_sha256": "7adb8cfe2c8a39814b50a6ce4ed3781e266f92b409cef9cbbb59b1027c79e54b",
+        "sha256": "6229026ff98cb2d1b43ddd0a3b1e2de53a6b4439592d80ee23c26e598353eccb",
+        "reason": "Reduce automatic Radial shells and globally phase ring samples while verifying the exact realized native interpolation support budget."
+      },
+      {
+        "module": "geometry",
+        "name": "ViewInfo",
+        "previous_sha256": "a55eaadb93251e099418749530d630ccfcffe2ece0d4e271d52d02f6cbde258b",
+        "sha256": "bfd37a2dcad5b85b99002e4dfba1881b57ce6c35eba2186fcec3c8282c0d53e5",
+        "reason": "Carry native sampling provenance and Radial global ring counts through the shared immutable view descriptor."
+      },
+      {
+        "module": "geometry",
+        "name": "get_view_infos",
+        "previous_sha256": "a2eb488112197d3617632bd5beefced728e943aa08dc5c28141a1a491065578c",
+        "sha256": "3b2cc0f9bc1b1c5e8d11b1a64004af90f618cc4d2b1348724bf19e8ad74254f6",
+        "reason": "Carry native sampling provenance and Radial global ring counts through the shared immutable view descriptor."
+      },
+      {
+        "module": "geometry",
+        "name": "build_fullframe_raster_plan",
+        "previous_sha256": "3bac6e08eee710ff73f4706b15133eac236539a278a28a3b24ecad1abdd33021",
+        "sha256": "3a83444ec4e76cc1fc631881a73f1056a8060e5a4961060b97c68d32c0432f92",
+        "reason": "Carry native sampling provenance and Radial global ring counts through the shared immutable view descriptor."
+      },
+      {
+        "module": "geometry",
+        "name": "build_dense_tile_raster_plan",
+        "previous_sha256": "e542acdfca1d4d0544b34fdb28a32857c20b06695e2a1a87856cbf0c8e014d2c",
+        "sha256": "ebceca9c5832f7dae80958c3368d5a74c4e0baba093c19b6cdd4e8d4d5b75646",
+        "reason": "Carry native sampling provenance and Radial global ring counts through the shared immutable view descriptor."
+      },
+      {
+        "module": "pipeline",
+        "name": "_main_impl",
+        "previous_sha256": "67962587cf9093b2b42163125aff24f628da5149f4b4089fd049c2f25669f7e4",
+        "sha256": "b7b0f68de9f8fca0ae6abe56642bc0c3b12f2a006163b9e0d5bda54055ed545d",
+        "reason": "Admit coverage planning only for qualifying native TTA rasters, persist its geometry and diagnostics, and retain dense fallbacks."
+      },
+      {
+        "module": "qsc",
+        "name": "qsc_face_intervals",
+        "previous_sha256": "3cdfaeb95ef453a2e542996f4ae31853a5a780f56a6df8d3fc0a194c758c55dc",
+        "sha256": "8a6b9f9dcfa501a818d3ceef62959ed21709abf9aae9d0aa031d2799cbda1523",
+        "reason": "Use the analytically and exact-rationally certified unit Lipschitz bound to reduce the conservative dense QSC lattice."
+      },
+      {
+        "module": "spherical_geometry",
+        "name": "build_spherical_view_infos",
+        "previous_sha256": "651129975e5461027f7e0ead91651a2beacae34c45ed3ba486a86ebf766c6307",
+        "sha256": "6cafedd20563cb166b9071a8ee502e14892fd48e1c9f648f7979013e1fa0ec60",
+        "reason": "Build and validate dense or certified joint Spherical geometry, retaining explicit native spacing and reproducible sampling metadata."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "_validate_spherical_projection",
+        "previous_sha256": "07a62d3276eda37079595051306a9512181e066877999248fffcf59301ede36e",
+        "sha256": "175f4878243f7ac9ec9584fd55496c307f4ff25915c5b63046bae00bf5615da5",
+        "reason": "Validate the actual certified shell schedule during Spherical projection without weakening dense spacing requirements."
+      },
+      {
+        "module": "spherical_sampling",
+        "name": "coverage_error_bound",
+        "previous_sha256": null,
+        "sha256": "65f19c8c8ba3ed75c9234bfd629744881c1375c479364ee5a924f70d43eb3c5a",
+        "reason": "Jointly minimize native QSC patch and endpoint-inclusive shell work subject to an outward-rounded positive interpolation support bound."
+      },
+      {
+        "module": "spherical_sampling",
+        "name": "realized_gap",
+        "previous_sha256": null,
+        "sha256": "179448ab80e5f09d1e1366d17647528ba70a63b46d435c069ae88b93a192a93c",
+        "reason": "Jointly minimize native QSC patch and endpoint-inclusive shell work subject to an outward-rounded positive interpolation support bound."
+      },
+      {
+        "module": "spherical_sampling",
+        "name": "SphericalSamplingPlan",
+        "previous_sha256": null,
+        "sha256": "d979cf0db3068893cd942c8ec62a70f2b38e001343d757cd195114d3b98c46a4",
+        "reason": "Jointly minimize native QSC patch and endpoint-inclusive shell work subject to an outward-rounded positive interpolation support bound."
+      },
+      {
+        "module": "spherical_sampling",
+        "name": "plan_spherical_sampling",
+        "previous_sha256": null,
+        "sha256": "d501da6b5ee85e92bef9f6ef427e588bdb0d83b63a45670a6439e41b6c7def26",
+        "reason": "Jointly minimize native QSC patch and endpoint-inclusive shell work subject to an outward-rounded positive interpolation support bound."
+      },
+      {
+        "module": "spherical_sampling",
+        "name": "validate_spherical_coverage",
+        "previous_sha256": null,
+        "sha256": "5705b6aa5a257031a8916da04ff4a0d65add316cc979a7ca5626b80dd158440a",
+        "reason": "Jointly minimize native QSC patch and endpoint-inclusive shell work subject to an outward-rounded positive interpolation support bound."
+      },
+      {
+        "module": "unification/runtime",
+        "name": "compile_physical_views",
+        "previous_sha256": "0a0f5d4d30ea74b402e109922d8d9e42ce034357a7ea763584be335f154f5dcd",
+        "sha256": "f670c2a2ab412c00818791131ce23f61dc81049ddb6070cc8125144596a62f82",
+        "reason": "Propagate the sampling policy into compiled TTA command arguments and preserve explicit user sampling settings."
+      },
+      {
+        "module": "unification/tta_manifest",
+        "name": "projection_sampling_record",
+        "previous_sha256": null,
+        "sha256": "45b38a7febeea6f09a31a45cd5cba396ce909f4f933c6f8a219819a90942bcb2",
+        "reason": "Record native coverage planning policy and view provenance for reproducible per-component output replay."
+      },
+      {
+        "module": "unification/tta_manifest",
+        "name": "radial_view_manifest_record",
+        "previous_sha256": "245476d4fded2f713d3ec9cf6cb224c6a82c342fea978ebd3b6868f8f6475839",
+        "sha256": "3bc0df59234bbc6c6d2b3809de4987411a9b0794751b7713c76443600850f69d",
+        "reason": "Record native coverage planning policy and view provenance for reproducible per-component output replay."
+      },
+      {
+        "module": "unification/tta_manifest",
+        "name": "spherical_view_manifest_record",
+        "previous_sha256": "07874ea7dc581f0f31e6664e0e21608fce5b81dc7f01232988aa9e2f3657b71f",
+        "sha256": "8d7d039864ae015687b0385681cb9300d2d15020b28cde2e611781e6932ac19f",
+        "reason": "Record native coverage planning policy and view provenance for reproducible per-component output replay."
+      },
+      {
+        "module": "unification/tta_manifest",
+        "name": "_view_record",
+        "previous_sha256": "09febf1798e302c96723fbca86c47382e002a6bd0665a7ea00f7228a553b181f",
+        "sha256": "05b2a6223e7d856fc64e2aedd750a470c5dd504e3179d3812cfb4b7338d6f67b",
+        "reason": "Record native coverage planning policy and view provenance for reproducible per-component output replay."
+      }
+    ],
+    "statements": [
+      {
+        "module": "azimuthal_coverage",
+        "label": "Expr:1",
+        "previous_sha256": null,
+        "sha256": "5c03b656fdc8579156dfd2ae72419e3d22357b20973c0c6d323e433f1d2e7da0",
+        "reason": "Conservatively reduce eligible automatic upright Azimuthal sampling and force native pull projection, retaining explicit-angle, tilt and downsampled-raster fallbacks."
+      },
+      {
+        "module": "azimuthal_coverage",
+        "label": "ImportFrom:8",
+        "previous_sha256": null,
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Conservatively reduce eligible automatic upright Azimuthal sampling and force native pull projection, retaining explicit-angle, tilt and downsampled-raster fallbacks."
+      },
+      {
+        "module": "azimuthal_coverage",
+        "label": "ImportFrom:10",
+        "previous_sha256": null,
+        "sha256": "70bd9e0c4f1816b9f9f4b04c6c07c6303849eadd90de76e9a14084b9c76de162",
+        "reason": "Conservatively reduce eligible automatic upright Azimuthal sampling and force native pull projection, retaining explicit-angle, tilt and downsampled-raster fallbacks."
+      },
+      {
+        "module": "azimuthal_coverage",
+        "label": "Import:11",
+        "previous_sha256": null,
+        "sha256": "f329650e2c61a07a1bab85b32296a6d93760e313e108904819fa27d09cf3954d",
+        "reason": "Conservatively reduce eligible automatic upright Azimuthal sampling and force native pull projection, retaining explicit-angle, tilt and downsampled-raster fallbacks."
+      },
+      {
+        "module": "azimuthal_coverage",
+        "label": "ImportFrom:12",
+        "previous_sha256": null,
+        "sha256": "45507282da06a387e7bcf6b568414eb8f8d2a6e42141672d0a6b8b75f7056940",
+        "reason": "Conservatively reduce eligible automatic upright Azimuthal sampling and force native pull projection, retaining explicit-angle, tilt and downsampled-raster fallbacks."
+      },
+      {
+        "module": "azimuthal_coverage",
+        "label": "If:14",
+        "previous_sha256": null,
+        "sha256": "827545ce4f0042909a8e697c1953c54a6c3b932eaa7b701c95880900b31ead95",
+        "reason": "Conservatively reduce eligible automatic upright Azimuthal sampling and force native pull projection, retaining explicit-angle, tilt and downsampled-raster fallbacks."
+      },
+      {
+        "module": "azimuthal_coverage",
+        "label": "Assign:18",
+        "previous_sha256": null,
+        "sha256": "6eb7c3449564151854b6ef36689db56387f6f5284267e9f08dce9d404bfc5938",
+        "reason": "Conservatively reduce eligible automatic upright Azimuthal sampling and force native pull projection, retaining explicit-angle, tilt and downsampled-raster fallbacks."
+      },
+      {
+        "module": "azimuthal_coverage",
+        "label": "Assign:19",
+        "previous_sha256": null,
+        "sha256": "755a054e47c6931fe0075c7f7b3e86986f837a70b28dcf8f89b99244ed6e7a3d",
+        "reason": "Conservatively reduce eligible automatic upright Azimuthal sampling and force native pull projection, retaining explicit-angle, tilt and downsampled-raster fallbacks."
+      },
+      {
+        "module": "azimuthal_coverage",
+        "label": "Assign:20",
+        "previous_sha256": null,
+        "sha256": "03814fc12b85fe2aa1a0ef5567536e76fd3b2fde78843e85e6cb5b3faecb0e49",
+        "reason": "Conservatively reduce eligible automatic upright Azimuthal sampling and force native pull projection, retaining explicit-angle, tilt and downsampled-raster fallbacks."
+      },
+      {
+        "module": "cylindrical_geometry",
+        "label": "Expr:1",
+        "previous_sha256": "4ed3608e2ae4efa6f8473742bac467338d400523516f8d2389e490a9b1c65dc6",
+        "sha256": "685fb05982530564ea57c44a5f55260be30c28a7ea446eab45e51e4566dd21dc",
+        "reason": "Reduce automatic Radial shells and globally phase ring samples while verifying the exact realized native interpolation support budget."
+      },
+      {
+        "module": "cylindrical_geometry",
+        "label": "Import:13",
+        "previous_sha256": null,
+        "sha256": "60e489325a19bee8be6a450945dd253634f01297b803d2869e489219288b5372",
+        "reason": "Reduce automatic Radial shells and globally phase ring samples while verifying the exact realized native interpolation support budget."
+      },
+      {
+        "module": "cylindrical_geometry",
+        "label": "Assign:21",
+        "previous_sha256": null,
+        "sha256": "ed2a6114a7692ce9f75406b6c5edaf5074a0f055025c87798a6429e407c62ba0",
+        "reason": "Reduce automatic Radial shells and globally phase ring samples while verifying the exact realized native interpolation support budget."
+      },
+      {
+        "module": "cylindrical_geometry",
+        "label": "Assign:22",
+        "previous_sha256": null,
+        "sha256": "70742886b628595cc8d76ff640054764515651692f0202edc32989a79d5bfd21",
+        "reason": "Reduce automatic Radial shells and globally phase ring samples while verifying the exact realized native interpolation support budget."
+      },
+      {
+        "module": "cylindrical_geometry",
+        "label": "Assign:23",
+        "previous_sha256": null,
+        "sha256": "f36407faa045a081ba7f617fe9daf086fdd120ec03f44cc8dd5163561d755410",
+        "reason": "Reduce automatic Radial shells and globally phase ring samples while verifying the exact realized native interpolation support budget."
+      },
+      {
+        "module": "qsc",
+        "label": "Expr:1",
+        "previous_sha256": "b98ef1de3c44532bc4219b62a577568eb56bef5796d50a8f36fbd94e64171b19",
+        "sha256": "ab0ac85c512ef1a6867b5c21300ba8504170a5933e3de618eb201ae19b7565a8",
+        "reason": "Use the analytically and exact-rationally certified unit Lipschitz bound to reduce the conservative dense QSC lattice."
+      },
+      {
+        "module": "qsc",
+        "label": "Assign:70",
+        "previous_sha256": "0d5b76e787c53b1cace0c660f28edc4c1eb4ece12566fb97c1d6369e4877f12d",
+        "sha256": "e8dd9a68c8decc8e16ff9fc61a5edd3abb9ecf82dff0a8857b3eb5340485d343",
+        "reason": "Use the analytically and exact-rationally certified unit Lipschitz bound to reduce the conservative dense QSC lattice."
+      },
+      {
+        "module": "spherical_sampling",
+        "label": "Expr:1",
+        "previous_sha256": null,
+        "sha256": "1d8df62ffcca31e5bc8942eac6625a12960bbc9ecb7da11384d5cc550392b1fa",
+        "reason": "Jointly minimize native QSC patch and endpoint-inclusive shell work subject to an outward-rounded positive interpolation support bound."
+      },
+      {
+        "module": "spherical_sampling",
+        "label": "ImportFrom:10",
+        "previous_sha256": null,
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Jointly minimize native QSC patch and endpoint-inclusive shell work subject to an outward-rounded positive interpolation support bound."
+      },
+      {
+        "module": "spherical_sampling",
+        "label": "ImportFrom:12",
+        "previous_sha256": null,
+        "sha256": "321ed2ed3afceb74be547c9905ed4c676e453b1a68fe7cb2d3e214caeac2624d",
+        "reason": "Jointly minimize native QSC patch and endpoint-inclusive shell work subject to an outward-rounded positive interpolation support bound."
+      },
+      {
+        "module": "spherical_sampling",
+        "label": "Import:13",
+        "previous_sha256": null,
+        "sha256": "f329650e2c61a07a1bab85b32296a6d93760e313e108904819fa27d09cf3954d",
+        "reason": "Jointly minimize native QSC patch and endpoint-inclusive shell work subject to an outward-rounded positive interpolation support bound."
+      },
+      {
+        "module": "spherical_sampling",
+        "label": "Import:15",
+        "previous_sha256": null,
+        "sha256": "271fc31378e1108a9784c29c3c4768de571ce080301b4ad9721ba767fcf5842b",
+        "reason": "Jointly minimize native QSC patch and endpoint-inclusive shell work subject to an outward-rounded positive interpolation support bound."
+      },
+      {
+        "module": "spherical_sampling",
+        "label": "ImportFrom:17",
+        "previous_sha256": null,
+        "sha256": "07555e5eee6c15de5045081f2101ec2b07245b9232fe7af4238d7e9f254caeea",
+        "reason": "Jointly minimize native QSC patch and endpoint-inclusive shell work subject to an outward-rounded positive interpolation support bound."
+      },
+      {
+        "module": "spherical_sampling",
+        "label": "Assign:19",
+        "previous_sha256": null,
+        "sha256": "3214b2f8862b67f9c62556885506a9a5673093f9d764473a6e3fad7b9a8a8b32",
+        "reason": "Jointly minimize native QSC patch and endpoint-inclusive shell work subject to an outward-rounded positive interpolation support bound."
+      },
+      {
+        "module": "spherical_sampling",
+        "label": "Assign:20",
+        "previous_sha256": null,
+        "sha256": "60458039dea4637fbc97f00e9a82fa3358d974ffc5298e4e4fcd8d75aac2eaac",
+        "reason": "Jointly minimize native QSC patch and endpoint-inclusive shell work subject to an outward-rounded positive interpolation support bound."
+      }
+    ],
+    "local_import_seam_updates": [],
+    "preserved_radial_definition_updates": [],
+    "preserved_radial_module_updates": [
+      {
+        "module": "cylindrical_geometry",
+        "previous_sha256": "f04abbcf98189450c0bb6de3e5652eb47a16af1160ea606da1fb9419b9276e54",
+        "sha256": "b7a53998a4813649c632ff321f321e253edc7540a10890ae50d671fe2c71deba",
+        "reason": "Reduce automatic Radial shells and globally phase ring samples while verifying the exact realized native interpolation support budget."
+      }
+    ],
+    "complete_modules": [
+      "azimuthal_coverage",
+      "spherical_sampling"
+    ],
+    "validation_tools": [
+      {
+        "path": "tools/certify_qsc_lipschitz.py",
+        "sha256": "dec74c34dec2f48f0cbe03e087fecd04b3af6c45d20e8cf569c2626fd53038a8",
+        "reason": "Independently pin the exact-rational full-domain QSC unit Lipschitz certificate that justifies the reduced native sampling lattice."
+      }
+    ]
   }
 }

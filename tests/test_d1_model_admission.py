@@ -13,6 +13,7 @@ from unittest import mock
 import numpy as np
 
 from XTA import backprojection, inference, pipeline
+from XTA.azimuthal_coverage import requires_native_pull
 from tests.test_spherical_runtime import _assigned, compiled_views
 
 
@@ -42,6 +43,7 @@ class LegacyD1ModelAdmissionTests(unittest.TestCase):
                                azimuthal_parent_requires_seam_union=False, radial_owner=False,
                                gpu_worker_result_dir=Path('unused'), prefix='probe', chunk_idx=0,
                                args=SimpleNamespace(min_conf=0.),
+                               requires_native_pull=requires_native_pull,
                                HYBRID_DEFERRED_RESULT_MODE=pipeline.HYBRID_DEFERRED_RESULT_MODE)
                     exec(program, env)
                     expected = ('direct_union' if cpu else 'file')

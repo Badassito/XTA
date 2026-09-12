@@ -1598,6 +1598,10 @@ def _main_impl() -> None:
             'Set YOLO_TTA_GPU_WORKER_DIRECT_UNION=0 to select per-task result files.'
         )
 
+    projection_sampling = str(getattr(args, 'projection_sampling', 'coverage'))
+    if projection_sampling == 'coverage' and not any(float(angle) % 360.0 == 0.0 for angle in angles):
+        projection_sampling = 'dense'
+        print('Projection sampling: retaining dense schedules because no unrotated base pass is selected.')
     compiled_physical_views = compile_physical_views(
         t_dim=int(T),
         height=int(H),
@@ -1612,7 +1616,34 @@ def _main_impl() -> None:
         spherical_requests=spherical_requests,
         spherical_min_radius=args.spherical_min_radius,
         spherical_patch_size=int(args.imgsz),
+        sampling_policy=projection_sampling,
     )
+    projection_sampling_records = []
+    for family in ('spherical', 'radial', 'azimuthal'):
+        selected = [view for view in compiled_physical_views.views if view.family == family]
+        if not selected:
+            continue
+        actual = sum(int(view.num_slices) for view in selected)
+        if family == 'spherical':
+            by_group = {}
+            for view in selected:
+                by_group.setdefault(view.spherical_group, []).append(view)
+            reference = sum(int(group[0].sampling_reference_frames) if group[0].sampling_certificate
+                            else sum(int(view.num_slices) for view in group) for group in by_group.values())
+        else:
+            reference = sum(int(view.sampling_reference_frames) if view.sampling_certificate
+                            else int(view.num_slices) for view in selected)
+        reasons = sorted(set(view.sampling_reason for view in selected if view.sampling_reason))
+        projection_sampling_records.append({'family': family, 'native_frames_per_angle': actual,
+                                           'dense_reference_frames_per_angle': reference,
+                                           'fallback_reasons': reasons})
+        print(f'Projection sampling [{family}]: {reference:,} dense -> {actual:,} native frames per angle '
+              f'({(1.0 - actual / reference) * 100:.2f}% fewer); policy={projection_sampling}.')
+        for reason in reasons:
+            print(f'Projection sampling [{family}] fallback: {reason}')
+    from .azimuthal_coverage import requires_native_pull
+    if any(requires_native_pull(view) for view in compiled_physical_views.views):
+        print('Coarsened Azimuthal views use native pull projection; nearest-scatter D1 is bypassed for those views.')
     spherical_groups = _spherical_workload_groups(compiled_physical_views.views)
     azimuthal_diameters = list(compiled_physical_views.azimuthal_diameters)
     resolved_azimuth_angles = list(compiled_physical_views.azimuthal_azimuth_angles)
@@ -1672,6 +1703,8 @@ def _main_impl() -> None:
             'spherical_min_radius': args.spherical_min_radius,
             'spherical_patch_size': int(args.imgsz),
             'spherical_groups': spherical_groups,
+            'projection_sampling': projection_sampling,
+            'projection_sampling_workload': projection_sampling_records,
             'azimuthal_diameters': [int(v) for v in azimuthal_diameters],
             'azimuth_angles_deg': [float(v) for v in resolved_azimuth_angles],
             'enable_azimuthal_groups': [
@@ -4991,6 +5024,7 @@ def _main_impl() -> None:
                 hybrid_deferred = bool(
                     str(kind) == 'fullframe'
                     and view.family not in ('radial', 'spherical')
+                    and not requires_native_pull(view)
                     and legacy_d1_model_eligible
                     and v1613_d1_owner_active
                     and worker_direct_union_active
@@ -5019,6 +5053,7 @@ def _main_impl() -> None:
                 elif (
                     str(kind) == 'fullframe'
                     and view.family not in ('radial', 'spherical')
+                    and not requires_native_pull(view)
                     and legacy_d1_model_eligible
                     and v1613_d1_owner_active
                     and not cpu_eligible

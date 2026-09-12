@@ -38,7 +38,110 @@ def augmentation_contract(manifest):
     )
 
 
+def coverage_contract(manifest):
+    return inventory.reviewed_v22_coverage_contract(
+        manifest, manifest['v21_review'],
+        *(manifest[f'v21_0_{i}_review'] for i in range(1, 7)),
+        manifest['v21_1_review'], manifest['v21_1_1_review'], manifest['v22_augmentation_review'],
+    )
+
+
 class PackageInventoryTests(unittest.TestCase):
+    def test_coverage_review_follows_the_complete_augmentation_predecessor(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = coverage_contract(manifest)
+        self.assertEqual(review['previous_review_sha256'], inventory.REVIEWED_V22_AUGMENTATION_SHA256)
+        self.assertEqual(review['predecessor_commit'], 'f6557bf52822c8e8d0a752deb81fa26652b8a4e4')
+        self.assertEqual(review['feature'], 'coverage-sampling')
+        self.assertEqual(manifest['v22_augmentation_review']['release'], '22.0.0')
+        self.assertEqual(manifest['v21_1_1_review']['release'], '21.1.1')
+
+    def test_coverage_review_cannot_rewrite_any_historical_record(self):
+        for key, field in (
+            ('v22_augmentation_review', 'reason'), ('v21_review', 'reason'),
+        ):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            manifest[key]['definitions'][0][field] = 'Rewritten historical review'
+            with self.subTest(review=key), self.assertRaisesRegex(RuntimeError, 'coverage predecessor inventory changed'):
+                coverage_contract(manifest)
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        manifest['statements'][0]['line'] += 1
+        with self.assertRaisesRegex(RuntimeError, 'coverage predecessor inventory changed'):
+            coverage_contract(manifest)
+
+    def test_coverage_review_authenticates_geometry_bindings_modules_and_proof(self):
+        for category in ('definitions', 'statements', 'preserved_radial_module_updates', 'validation_tools'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            manifest['v22_coverage_review'][category][0]['sha256'] = '0' * 64
+            with self.subTest(category=category), self.assertRaisesRegex(RuntimeError, 'v22.0.0 review digest mismatch'):
+                coverage_contract(manifest)
+
+    def test_coverage_review_requires_the_latest_augmentation_definition_pin(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = manifest['v22_coverage_review']
+        record = next(item for item in review['definitions']
+                      if (item['module'], item['name']) == ('config', 'build_argparser'))
+        prior = next(item for item in manifest['v22_augmentation_review']['definitions']
+                     if (item['module'], item['name']) == ('config', 'build_argparser'))
+        self.assertEqual(record['previous_sha256'], prior['sha256'])
+        record['previous_sha256'] = '0' * 64
+        authenticated = hashlib.sha256(json.dumps(review, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+        with mock.patch.object(inventory, 'REVIEWED_V22_COVERAGE_SHA256', authenticated):
+            with self.assertRaisesRegex(RuntimeError, 'supersession does not match its historical pin: config.build_argparser'):
+                coverage_contract(manifest)
+
+    def test_coverage_review_requires_exact_radial_module_predecessor(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        patches = [*(manifest[f'v21_0_{i}_review'] for i in range(1, 7)),
+                   manifest['v21_1_review'], manifest['v21_1_1_review'],
+                   manifest['v22_augmentation_review'], manifest['v22_coverage_review']]
+        record = next(item for item in patches[-1]['preserved_radial_module_updates']
+                      if item['module'] == 'cylindrical_geometry')
+        record['previous_sha256'] = '0' * 64
+        with self.assertRaisesRegex(RuntimeError, 'Radial module review does not match its preserved predecessor'):
+            inventory.reviewed_radial_module_hashes(manifest['v21_review'], patches)
+
+    def test_coverage_new_modules_have_complete_statement_coverage(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = coverage_contract(manifest)
+        self.assertEqual(set(review['complete_modules']), {'spherical_sampling', 'azimuthal_coverage'})
+        original_parse = inventory.ast.parse
+
+        for module in review['complete_modules']:
+            def add_unreviewed_statement(source, filename='<unknown>', *args, **kwargs):
+                tree = original_parse(source, filename, *args, **kwargs)
+                if str(filename).replace('\\', '/').endswith(f'/{module}.py'):
+                    tree.body.extend(original_parse('UNREVIEWED_COVERAGE_BINDING = 1').body)
+                return tree
+
+            with self.subTest(module=module), mock.patch.object(inventory.ast, 'parse', side_effect=add_unreviewed_statement):
+                with self.assertRaisesRegex(RuntimeError, f'complete-module statement coverage differs: {module}'):
+                    verify_inventory()
+
+    def test_coverage_qsc_unit_bound_has_an_independent_statement_pin(self):
+        original_digest = inventory.digest
+
+        def change_bound(node):
+            if isinstance(node, ast.Assign) and any(getattr(item, 'id', '') == 'QSC_INVERSE_LIPSCHITZ' for item in node.targets):
+                return '0' * 64
+            return original_digest(node)
+
+        with mock.patch.object(inventory, 'digest', side_effect=change_bound):
+            with self.assertRaisesRegex(RuntimeError, 'reviewed statement changed or is missing: qsc[.]'):
+                verify_inventory()
+
+    def test_coverage_rational_certificate_source_cannot_change_without_review(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = coverage_contract(manifest)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / 'tools/certify_qsc_lipschitz.py'
+            path.parent.mkdir()
+            path.write_text('raise RuntimeError("unreviewed proof replacement")\n', encoding='utf-8')
+            with mock.patch.object(inventory, 'ROOT', root):
+                with self.assertRaisesRegex(RuntimeError, 'coverage validation tool changed or is missing'):
+                    inventory.verify_coverage_validation_tools(review)
+
     def test_augmentation_review_authenticates_definitions_bindings_and_relocations(self):
         for category in ('definitions', 'statements', 'definition_relocations'):
             manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))

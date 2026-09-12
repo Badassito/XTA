@@ -189,6 +189,8 @@ def main() -> None:
         "tta_augmentation_cuda",
         "tta_augmentation_retirement",
         "tta_augmentation_runtime",
+        "spherical_sampling",
+        "azimuthal_coverage",
         "experimental_features",
         "workspace",
         "runtime",

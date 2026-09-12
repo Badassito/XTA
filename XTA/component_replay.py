@@ -213,14 +213,26 @@ def load_component_replay(path: Path) -> ComponentProjectionReplay:
     missing_fields = view_fields - supplied_fields
     spherical_defaults = {field.name: field.default for field in fields(ViewInfo)
                           if field.name.startswith('spherical_')}
-    if (supplied_fields - view_fields or missing_fields - spherical_defaults.keys()
-            or (missing_fields and value['view'].get('family') == 'spherical')):
+    sampling_defaults = {field.name: field.default for field in fields(ViewInfo)
+                         if field.name.startswith('sampling_') or field.name == 'radial_global_count'}
+    augmentation_defaults = {field.name: field.default for field in fields(ViewInfo)
+                             if field.name.startswith('augmentation_')}
+    additive_defaults = {**spherical_defaults, **sampling_defaults, **augmentation_defaults}
+    if (supplied_fields - view_fields or missing_fields - additive_defaults.keys()
+            or (missing_fields & spherical_defaults.keys() and value['view'].get('family') == 'spherical')
+            or (missing_fields & sampling_defaults.keys() and (
+                value['view'].get('sampling_policy', 'dense') != 'dense'
+                or value['view'].get('sampling_certificate', '')
+                or value['view'].get('radial_global_count', 0)
+                or value['view'].get('sampling_error_bound_sq', 0.0)
+                or value['view'].get('sampling_reference_frames', 0)))
+            or (missing_fields & augmentation_defaults.keys() and value['view'].get('augmentation_pass', 0) != 0)):
         raise ValueError('Component replay ViewInfo fields differ from this runtime')
     view_data = dict(value['view'])
     # Existing v1 captures predate the additive spherical ViewInfo fields.
     # Their geometry remains fully specified; a spherical capture must include
     # all its own fields rather than silently inventing a missing chart.
-    view_data.update({name: spherical_defaults[name] for name in missing_fields})
+    view_data.update({name: additive_defaults[name] for name in missing_fields})
     view_data['azimuths_deg'] = tuple(float(angle) for angle in view_data['azimuths_deg'])
     view_data['radial_radii'] = tuple(float(radius) for radius in view_data['radial_radii'])
     view_data['spherical_radii'] = tuple(float(radius) for radius in view_data['spherical_radii'])

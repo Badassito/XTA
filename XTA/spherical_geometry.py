@@ -69,7 +69,7 @@ def cube_rotation(direction='', angle=0.0):
 
 def build_spherical_view_infos(t: int, h: int, w: int, *, targets: Sequence[str],
                                min_radius: float | None, patch_size: int,
-                               tilted_views: Sequence['ViewInfo']) -> list['ViewInfo']:
+                               tilted_views: Sequence['ViewInfo'], sampling_policy: str = 'dense') -> list['ViewInfo']:
     from .config import SPHERICAL_VIEW_TOKENS, _resolve_unique_view_tokens
     from .geometry import ViewInfo, tilted_base_view_name
 
@@ -85,6 +85,19 @@ def build_spherical_view_infos(t: int, h: int, w: int, *, targets: Sequence[str]
     maximum = (min(t, h, w) - 1) / 2.0
     radii = radius_grid(minimum, maximum)
     intervals = qsc_face_intervals(maximum)
+    sampling_fields = {}
+    if sampling_policy not in ('dense', 'coverage'):
+        raise ValueError('Unknown Spherical sampling policy')
+    if sampling_policy == 'coverage':
+        from .spherical_sampling import CERTIFICATE, plan_spherical_sampling
+        plan = plan_spherical_sampling(minimum, maximum, patch_size)
+        if plan.optimized:
+            radii, intervals = plan.radii, plan.intervals
+            sampling_fields = dict(sampling_policy='coverage', sampling_certificate=CERTIFICATE,
+                                   sampling_error_bound_sq=plan.error_bound_squared,
+                                   sampling_reference_frames=plan.reference_frames)
+        else:
+            sampling_fields = dict(sampling_reason='dense lattice already minimizes certified native frame count')
     origins = _patch_origins(intervals + 1, patch_size)
     groups = {}
     upright = tuple(token for token in SPHERICAL_VIEW_TOKENS if token in requested and not token.startswith('tilted_'))
@@ -113,6 +126,7 @@ def build_spherical_view_infos(t: int, h: int, w: int, *, targets: Sequence[str]
                 for iu, u0 in enumerate(origins):
                     name = f'spherical_{group}_{face_name.lower()}_patch_u{iu}_v{iv}'
                     result.append(ViewInfo(
+                        **sampling_fields,
                         name=name, family='spherical', summary_family=name,
                         display_name=f'Spherical QSC {group} / {face_name} / patch {iu},{iv}',
                         num_slices=len(radii), src_h=patch_size, src_w=patch_size,

@@ -5,6 +5,11 @@ branch is based on the last committed source and intentionally leaves the
 concurrent LTA changes for a later merge. Package and launcher version numbers
 remain unchanged until release integration.
 
+The native projection schedule is chosen before policy fan-out. TTA defaults
+to certified `--projection_sampling coverage`; `dense` retains the older
+frame schedule. See [PROJECTION_SAMPLING.md](PROJECTION_SAMPLING.md) for domain
+guarantees, frame reductions and admission fallbacks.
+
 ## Run
 
 Keep the existing model, input, channel, view, angle, device and save arguments.

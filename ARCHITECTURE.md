@@ -139,8 +139,9 @@ family described above.
 `--radial_min_radius auto` resolves to `imgsz/(4*pi)` working voxels. The outer
 radius is `(min(plane_height, plane_width)-1)/2`, centered on the source
 voxel-center grid. The modeled domain is the annulus between a finite positive
-minimum and that outer radius. Shells include both endpoints with radial gaps of
-at most one voxel; arc-length and height sampling retain one-voxel spacing.
+minimum and that outer radius. Dense shells include both endpoints with radial
+gaps of at most one voxel; coverage mode uses certified wider gaps. Arc-length
+and height sampling retain one-voxel spacing.
 
 Each shell is covered by `imgsz` square intrinsic patches. Circumferential
 sampling is periodic across the seam, the final height band overlaps, and short
@@ -171,13 +172,14 @@ Spherical tilts rotate the cube charts rigidly: positive vertical tilt rotates
 about +X, and positive horizontal tilt about -Y. The center is
 `((W-1)/2, (H-1)/2, (T-1)/2)` and maximum radius is `(min(T,H,W)-1)/2` in working
 coordinates. `--spherical_min_radius auto` independently resolves to
-`imgsz/(4*pi)`. Positive finite radii cover the declared annulus, include both
-endpoints, and have gaps no larger than one voxel.
+`imgsz/(4*pi)`. Positive finite radii cover the declared annulus and include both
+endpoints. Dense mode has gaps no larger than one voxel; coverage mode jointly
+certifies its shell gaps and face lattice.
 
 The chart is the equal-area O'Neill-Laubscher Quadrilateralized Spherical Cube
 used by [PROJ](https://proj.org/en/stable/operations/projections/qsc.html).
 `qsc` implements the unit-sphere mapping; `spherical_geometry` applies the
-source-volume pose. Every face uses an endpoint-inclusive grid sized for outer
+source-volume pose. Dense mode uses an endpoint-inclusive grid sized for outer
 radius R: the interval count is the smallest even `n >= 3*sqrt(R*(R+1/2))`.
 Fixed `imgsz` patches cover its `n+1` nodes per axis, overlap at the final patch,
 and center/zero-pad smaller faces. All radii share the same face lattice and
@@ -189,11 +191,23 @@ before source-space OR. Whole-shell stitching and neighboring-face halos are not
 part of this path; model quality across patch and face boundaries is a separate
 qualification from coordinate coverage.
 
-The QSC inverse has conservative Euclidean Lipschitz bound 5/3. Combined with the
-radius spacing, the lattice places each working-voxel center in the annulus
+The original dense construction used the conservative QSC inverse Lipschitz
+bound 5/3. Combined with its radius spacing, that lattice places each working-voxel center in the annulus
 within squared distance `281/324 < 1` of a native sample. This establishes
 positive trilinear input weight; categorical sampling follows its separate
 nearest-neighbor policy.
+
+TTA now defaults to `--projection_sampling coverage`; `dense` retains the
+preceding schedules and remains the default of shared geometry APIs/PTA/LTA.
+An exact-rational certificate tightens the QSC inverse bound to 1. The planner
+jointly chooses fixed face intervals and uniform shell spacing while retaining
+the 281/324 sample-distance budget. Radial uses a certified larger shell gap;
+eligible full-native upright auto-Azimuthal sweeps use a larger angular gap and
+native pull projection, bypassing D1 nearest scatter. Both annular endpoints and
+independent trajectory outputs are retained. Native input support is distinct
+from categorical/model coverage; changed channel/interpolation physical spacing
+needs model-quality qualification. See [PROJECTION_SAMPLING.md](PROJECTION_SAMPLING.md)
+for proofs, admission constraints, manifests, and reproducible frame counts.
 
 Native CUDA rendering reuses direction/validity plans across radii in a bounded
 256 MiB cache. FP64 plans are assembled in 64-row host strips and uploaded as

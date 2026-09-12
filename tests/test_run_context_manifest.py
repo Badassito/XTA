@@ -63,6 +63,8 @@ class _View:
     azimuthal_request_token: str = "transverse"
     tta_aug_id: str = ""
     tta_angle_deg: float = 0.0
+    augmentation_pass: int = 0
+    augmentation_base_view: str = ""
 
 
 @dataclass(frozen=True)

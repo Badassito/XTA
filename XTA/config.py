@@ -914,6 +914,8 @@ def build_argparser() -> argparse.ArgumentParser:
     add_tta_augmentation_arguments(p)
 
     p.add_argument("--input", required=True, type=str, help="Input video path")
+    p.add_argument('--projection_sampling', choices=('coverage', 'dense'), default='coverage',
+                   help='Coverage reduces certified native Spherical/Radial/auto-Azimuthal frames; dense retains the legacy schedule. Requires an unrotated base pass; explicit Azimuthal spacing is preserved.')
     p.add_argument("--output", default=None, type=str, help="Output directory (default ./{Filename}/)")
     p.add_argument(
         "--temp",

@@ -37,6 +37,12 @@ REVIEWED_V21_1_1_SHA256 = '84426381fa7b386607ed8e79a993cf0b51bbbe46b1cfa3db4bc71
 # This development appendix reviews v22 augmentation work without changing the
 # package release identity or any earlier inventory record.
 REVIEWED_V22_AUGMENTATION_SHA256 = 'b2636d119631a48b3424879eeae79c9b2ee56d43722647f3cfab22f9608857e8'
+# The coverage appendix follows augmentation development without changing the
+# release identity. Authenticate the entire preceding inventory, including its
+# reasons and release records, independently of the new appendix.
+REVIEWED_V22_COVERAGE_PREDECESSOR_COMMIT = 'f6557bf52822c8e8d0a752deb81fa26652b8a4e4'
+REVIEWED_V22_COVERAGE_PREDECESSOR_SHA256 = '05d5b4b84b783450fcf8130ce8787d300484fede69fa904ae141f3d2ff4113b1'
+REVIEWED_V22_COVERAGE_SHA256 = '9bb0fa7e01d364916bde3474228b70be2d3f37daf59f198a60b3140ccea9eff4'
 # Exact pre-move PTA definitions, independently pinned before their shared owner
 # is introduced. PTA reexports must still resolve to the shared owner objects.
 REVIEWED_PRESERVED_AUGMENTATION_DEFINITIONS = {
@@ -1355,6 +1361,43 @@ def reviewed_v22_augmentation_contract(
     return review
 
 
+def reviewed_v22_coverage_contract(
+    manifest: dict[str, object], v21: dict[str, object],
+    *earlier_patches: dict[str, object],
+) -> dict[str, object]:
+    """Authenticate coverage planning while preserving the complete prior record."""
+    prior = {key: value for key, value in manifest.items() if key != 'v22_coverage_review'}
+    encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    if hashlib.sha256(encoded).hexdigest() != REVIEWED_V22_COVERAGE_PREDECESSOR_SHA256:
+        raise RuntimeError('v22 coverage predecessor inventory changed; preserve every historical record')
+    review = _reviewed_v21_patch_contract(
+        manifest, v21, key='v22_coverage_review', release='22.0.0',
+        expected_digest=REVIEWED_V22_COVERAGE_SHA256,
+        previous_digest=REVIEWED_V22_AUGMENTATION_SHA256,
+        earlier_patches=earlier_patches,
+    )
+    if (review.get('predecessor_commit') != REVIEWED_V22_COVERAGE_PREDECESSOR_COMMIT
+            or review.get('feature') != 'coverage-sampling'):
+        raise RuntimeError('v22 coverage review has an unexpected development predecessor or feature')
+    validation_tools = review.get('validation_tools', ())
+    paths = [item.get('path') for item in validation_tools]
+    if paths != ['tools/certify_qsc_lipschitz.py'] or any(not item.get('reason') for item in validation_tools):
+        raise RuntimeError('v22 coverage validation-tool review has missing, duplicate or unexplained paths')
+    for item in validation_tools:
+        value = item.get('sha256')
+        if not isinstance(value, str) or len(value) != 64 or any(char not in '0123456789abcdef' for char in value):
+            raise RuntimeError('v22 coverage validation-tool review has an invalid digest')
+    return review
+
+
+def verify_coverage_validation_tools(review) -> None:
+    """The full-domain rational certificate is independently reviewed source."""
+    for item in review['validation_tools']:
+        path = ROOT / item['path']
+        if not path.is_file() or hashlib.sha256(path.read_text(encoding='utf-8').encode('utf-8')).hexdigest() != item['sha256']:
+            raise RuntimeError(f'v22 coverage validation tool changed or is missing: {item["path"]}')
+
+
 def verify_augmentation_relocations(review, top_level) -> None:
     """Verify exact shared definitions and the original owner's public imports."""
     for item in review['definition_relocations']:
@@ -1436,6 +1479,9 @@ def main() -> None:
     patches = (*patches, overlap_release)
     augmentation_review = reviewed_v22_augmentation_contract(manifest, v21, *patches)
     patches = (*patches, augmentation_review)
+    coverage_review = reviewed_v22_coverage_contract(manifest, v21, *patches)
+    verify_coverage_validation_tools(coverage_review)
+    patches = (*patches, coverage_review)
     patch_definitions = {
         (item['module'], item['name']): item for review in patches for item in review['definitions']
     }
