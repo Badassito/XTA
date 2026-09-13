@@ -169,6 +169,11 @@ class TtaSchedulerState:
     direct_union_inference_bytes: Dict[Tuple[str, str], int]
     direct_union_postprocess_bytes: Dict[Tuple[str, str], int]
     direct_union_backing_leases: Dict[Tuple[str, str], object]
+    # Policy siblings retain separate canvases and leases, but their projection/inference
+    # task opens them together. Count that atomic group as one inference-view slot.
+    direct_union_admission_group_by_parent: Dict[Tuple[str, str], Tuple[str, str]] = field(
+        default_factory=dict
+    )
 
     cpu_task_queues: Dict[int, object] = field(default_factory=dict)
     gpu_task_queues: Dict[int, object] = field(default_factory=dict)
@@ -380,9 +385,10 @@ class TtaScheduler:
             return 0
         planes = 2 if task.get('result_conf_path') else 1
         main_bytes = int(self.operations.array_nbytes(shape, np.uint8)) * int(planes)
+        policy_factor = 1 + len(task.get('augmentation_pass_tasks', ()))
         padding_count = int(self.tile_task_azimuthal_padding_count(task))
         if padding_count <= 0:
-            return int(main_bytes)
+            return int(main_bytes) * int(policy_factor)
         view_obj = task.get('view')
         assert isinstance(view_obj, ViewInfo)
         group_count = len(self.operations.azimuthal_batch_padding_mirror_groups(
@@ -394,7 +400,7 @@ class TtaScheduler:
         plane_bytes = int(shape[1]) * int(shape[2]) * int(np.dtype(np.uint8).itemsize)
         compact_padding_bytes = int(padding_count) * int(plane_bytes) * int(planes)
         grouped_result_bytes = int(group_count) * int(main_bytes)
-        return int(main_bytes + compact_padding_bytes + grouped_result_bytes)
+        return int(main_bytes + compact_padding_bytes + grouped_result_bytes) * int(policy_factor)
 
     def tile_dense_result_task_admissible(self, task: Dict[str, object]) -> bool:
         if bool(self.inputs.keep_temp_artifacts) or str(task.get('kind', '')) != 'tile':
@@ -469,7 +475,9 @@ class TtaScheduler:
         the parent mapping until sparse retirement also prevents asynchronous D2H publication
         from outliving its backing object.
         """
-        if bool(self.inputs.keep_temp_artifacts) or str(task.get('kind', '')) != 'tile':
+        if (bool(self.inputs.keep_temp_artifacts) or str(task.get('kind', '')) != 'tile'
+                or bool(task.get('augmentation_pass_tasks'))):
+            # Policy siblings use independent file backings under one N-way byte reservation.
             return
         task_id = int(task.get('task_id', -1))
         if task_id < 0:
@@ -589,16 +597,20 @@ class TtaScheduler:
         task_obj = self.state.gpu_worker_tasks_by_id.get(task_id_i)
         cleanup_paths: set[Path] = set()
         if isinstance(task_obj, dict):
-            for field_name in (
-                'result_mask_path', 'result_conf_path',
-                'result_mask_fallback_path', 'result_conf_fallback_path',
-            ):
-                raw_path = task_obj.get(field_name)
-                if raw_path:
-                    try:
-                        cleanup_paths.add(Path(str(raw_path)))
-                    except Exception:
-                        pass
+            for owned_task in (task_obj, *task_obj.get('augmentation_pass_tasks', ())):
+                for field_name in (
+                    'result_mask_path', 'result_conf_path',
+                    'result_mask_fallback_path', 'result_conf_fallback_path',
+                ):
+                    raw_path = owned_task.get(field_name)
+                    if raw_path:
+                        try:
+                            path = Path(str(raw_path))
+                            cleanup_paths.add(path)
+                            if owned_task is not task_obj:
+                                cleanup_paths.add(path.with_name(path.name + '.seam'))
+                        except Exception:
+                            pass
         if workspaces is not None:
             for mm in workspaces:
                 if mm is None:
@@ -623,7 +635,7 @@ class TtaScheduler:
             for cleanup_path in cleanup_paths:
                 try:
                     if (
-                        cleanup_path.suffix.lower() == '.dat'
+                        (cleanup_path.suffix.lower() == '.dat' or cleanup_path.name.endswith('.dat.seam'))
                         and self.operations._path_is_relative_to(cleanup_path, self.inputs.gpu_worker_result_dir)
                     ):
                         cleanup_path.unlink(missing_ok=True)
@@ -1671,7 +1683,8 @@ class TtaScheduler:
         eligible: List[Tuple[int, int, int, int, int]] = []
         for position, task_id in enumerate(pending_ids):
             task = self.state.gpu_worker_tasks_by_id[int(task_id)]
-            if str(task.get('kind', '')) != 'fullframe' or bool(task.get('tail_adapted', False)):
+            if (str(task.get('kind', '')) != 'fullframe' or bool(task.get('tail_adapted', False))
+                    or bool(task.get('disable_runtime_split', False))):
                 continue
             midpoint = self.operations.gpu_worker_tail_split_point(
                 int(task.get('slice_start', 0)),
@@ -1739,14 +1752,38 @@ class TtaScheduler:
         return True
 
     def direct_union_task_key(self, task: Dict[str, object]) -> Optional[Tuple[str, str]]:
-        if str(task.get('kind', '')) != 'fullframe' or str(task.get('result_mode', 'file')) != 'direct_union':
+        mode = str(task.get('result_mode', 'file'))
+        if (str(task.get('kind', '')) == 'fullframe'
+                and bool(task.get('bounded_parent_admission', False))
+                and mode not in ('file', 'direct_union')):
+            raise RuntimeError(f'Policy parent admission cannot use result mode {mode}')
+        admitted_file = mode == 'file' and bool(task.get('bounded_parent_admission', False))
+        if str(task.get('kind', '')) != 'fullframe' or not (mode == 'direct_union' or admitted_file):
             return None
         view_obj = task.get('view')
         if view_obj is None:
             return None
         return (str(task.get('model_name', '')), str(getattr(view_obj, 'name', '')))
 
-    def direct_union_task_bytes(self, task: Dict[str, object]) -> int:
+    def _direct_union_admission_tasks(self, task: Dict[str, object]) -> Tuple[Dict[str, object], ...]:
+        if not bool(task.get('bounded_parent_admission', False)):
+            return (task,)
+        members = (task, *task.get('augmentation_pass_tasks', ()))
+        group_mode = str(task.get('result_mode', 'file'))
+        keys = set()
+        for member in members:
+            key = self.direct_union_task_key(member)
+            if (key is None
+                    or not bool(member.get('bounded_parent_admission', False))):
+                raise RuntimeError('Policy parent admission requires independently marked full-frame passes')
+            if str(member.get('result_mode', 'file')) != group_mode:
+                raise RuntimeError('Policy parent admission requires one result mode for every sibling')
+            if key in keys:
+                raise RuntimeError(f'Policy parent admission contains a duplicate pass {key}')
+            keys.add(key)
+        return members
+
+    def _direct_union_parent_bytes(self, task: Dict[str, object]) -> int:
         shape = tuple(int(v) for v in task.get('processing_shape', ()))
         if len(shape) != 3:
             view_obj = task['view']
@@ -1758,22 +1795,46 @@ class TtaScheduler:
                 dense_volume_count += 2
         return int(self.operations.array_nbytes(shape, np.uint8)) * int(dense_volume_count)
 
+    def direct_union_task_bytes(self, task: Dict[str, object]) -> int:
+        return sum(self._direct_union_parent_bytes(member)
+                   for member in self._direct_union_admission_tasks(task))
+
     def direct_union_task_admissible(self, task: Dict[str, object]) -> bool:
         key = self.direct_union_task_key(task)
         if key is None or not self.inputs.direct_union_sparse_retirement_active:
             return True
-        if key in self.state.direct_union_inference_views:
-            lease = self.state.direct_union_backing_leases.get(key)
-            if lease is None or lease.phase != 'inference':
-                raise RuntimeError(f'direct-union inference registry is inconsistent for {key}')
+        members = self._direct_union_admission_tasks(task)
+        active_members = 0
+        for member in members:
+            member_key = self.direct_union_task_key(member)
+            if member_key in self.state.direct_union_postprocess_views:
+                # A final chunk handed this buffer to CPU/NRRD work. A pending inference
+                # task must never reopen it, even if another policy sibling is still live.
+                raise RuntimeError(f'inference task targeted postprocess-owned direct union {member_key}')
+            if member_key in self.state.direct_union_inference_views:
+                lease = self.state.direct_union_backing_leases.get(member_key)
+                if lease is None or lease.phase != 'inference':
+                    raise RuntimeError(f'direct-union inference registry is inconsistent for {member_key}')
+                active_members += 1
+        if active_members:
+            if active_members != len(members):
+                raise RuntimeError(f'Policy parent admission is only partially inference-owned for {key}')
             return True
-        if key in self.state.direct_union_postprocess_views:
-            # A task for a view whose final chunk already handed ownership to postprocess is
-            # a scheduler lifecycle error; never write into a buffer now read by CPU/NRRD work.
-            raise RuntimeError(f'inference task targeted postprocess-owned direct union {key}')
-        if len(self.state.direct_union_inference_views) >= int(self.inputs.direct_union_inference_view_limit):
-            return False
         need = int(self.direct_union_task_bytes(task))
+        policy_group = bool(task.get('bounded_parent_admission', False))
+        if policy_group and need > int(self.inputs.direct_union_total_dense_byte_limit):
+            raise RuntimeError(
+                f'External-policy parent group {key[0]}/{key[1]} requires '
+                f'{need / self.inputs.gib:.1f} GiB, exceeding the '
+                f'{self.inputs.direct_union_total_dense_byte_limit / self.inputs.gib:.1f} GiB '
+                'bounded parent dense limit'
+            )
+        active_groups = {
+            self.state.direct_union_admission_group_by_parent.get(parent, parent)
+            for parent in self.state.direct_union_inference_views
+        }
+        if len(active_groups) >= int(self.inputs.direct_union_inference_view_limit):
+            return False
         inference_active = int(sum(self.state.direct_union_inference_bytes.values()))
         postprocess_active = int(sum(self.state.direct_union_postprocess_bytes.values()))
         total_active = int(inference_active + postprocess_active)
@@ -1782,7 +1843,7 @@ class TtaScheduler:
             or int(inference_active) + int(need) <= int(self.inputs.direct_union_inference_byte_limit)
         )
         total_ok = bool(
-            not self.state.direct_union_backing_leases
+            (not policy_group and not self.state.direct_union_backing_leases)
             or int(total_active) + int(need) <= int(self.inputs.direct_union_total_dense_byte_limit)
         )
         return bool(inference_ok and total_ok)
@@ -1790,6 +1851,29 @@ class TtaScheduler:
     def activate_direct_union_task(self, task: Dict[str, object]) -> None:
         key = self.direct_union_task_key(task)
         if key is None:
+            return
+        if bool(task.get('bounded_parent_admission', False)):
+            # Reserve all sibling canvases before queueing the first shared-projection
+            # lease. File fallback retains its per-task result paths; shared unions
+            # write disjoint slice windows directly into each pass's own parent.
+            if not self.direct_union_task_admissible(task):
+                raise RuntimeError(f'External-policy parent group {key} dispatched without capacity')
+            members = self._direct_union_admission_tasks(task)
+            for member in members:
+                member_key = self.direct_union_task_key(member)
+                previous = self.state.direct_union_admission_group_by_parent.get(member_key)
+                if previous is not None and previous != key:
+                    raise RuntimeError(f'External-policy pass {member_key} changed admission groups')
+                self.inputs.ensure_baseline_workspaces(str(member_key[0]), member['view'])
+                self.state.direct_union_admission_group_by_parent[member_key] = key
+            if str(task.get('result_mode', 'file')) == 'direct_union':
+                # Bind only after the complete group was allocated successfully. No
+                # sibling may inherit the base target or truncate another pass's map.
+                for member in members:
+                    member_key = self.direct_union_task_key(member)
+                    member['result_mask_path'] = str(self.state.baseline_union_paths[member_key])
+                    conf_path = self.state.baseline_confmap_paths.get(member_key)
+                    member['result_conf_path'] = str(conf_path) if conf_path is not None else None
             return
         view_obj = task['view']
         self.inputs.ensure_baseline_workspaces(str(key[0]), view_obj)
@@ -1800,8 +1884,7 @@ class TtaScheduler:
     def spherical_locality_parent(self, task: Dict[str, object]) -> Optional[Tuple[str, str]]:
         """Identify cacheable ordinary Spherical parents without claiming ownership."""
         view = task.get('view')
-        if (str(task.get('kind', '')) != 'fullframe'
-                or str(task.get('result_mode', 'file')) != 'direct_union'
+        if (self.direct_union_task_key(task) is None
                 or bool(task.get('hybrid_cpu_eligible_origin', False))
                 or str(getattr(view, 'family', '')) != 'spherical'):
             return None

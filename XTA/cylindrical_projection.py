@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import os
 from collections import OrderedDict, deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 import threading
@@ -33,6 +33,8 @@ _PLANE_PLAN_CACHE_BYTES = 256 * 1024 * 1024
 _PLANE_PLAN_MAX_BYTES = 384 * 1024 * 1024
 _OUTPUT_BLOCK_BYTES = 8 * 1024 * 1024
 _INFLIGHT_OUTPUT_BYTES = 512 * 1024 * 1024
+_CUDA_RECHECK_SLICES = 8
+_CUDA_RECHECK_SECONDS = 1.0
 _PLANE_PLAN_CACHE = OrderedDict()
 _PLANE_PLAN_CACHE_SIZE = 0
 _PLANE_PLAN_INFLIGHT = {}
@@ -351,18 +353,28 @@ def _radial_block_schedule(depth, plane_bytes, workers):
     return block_depth, worker_count
 
 
-def _ordered_radial_blocks(project, depth, plane_bytes, workers):
-    block_depth, worker_count = _radial_block_schedule(depth, plane_bytes, workers)
-    starts = iter(range(0, depth, block_depth))
+def _ordered_radial_blocks(project, depth, plane_bytes, workers, *, first_z=0,
+                           cancel_event=None, single_slice=False):
+    block_depth, worker_count = ((1, 1) if single_slice else
+                                _radial_block_schedule(depth, plane_bytes, workers))
+    starts = iter(range(int(first_z), depth, block_depth))
+    def run(first, count):
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError('Radial CPU projection was superseded')
+        return project(first, count)
     if worker_count == 1:
-        for first in starts:
-            yield first, project(first, min(block_depth, depth - first))
+        try:
+            for first in starts:
+                yield first, run(first, min(block_depth, depth - first))
+        finally:
+            if cancel_event is not None:
+                cancel_event.set()
         return
     pending = deque()
     with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix='radial-project') as pool:
         try:
             for first in starts:
-                pending.append((first, pool.submit(project, first, min(block_depth, depth - first))))
+                pending.append((first, pool.submit(run, first, min(block_depth, depth - first))))
                 if len(pending) >= worker_count:
                     z, future = pending.popleft()
                     yield z, future.result()
@@ -372,8 +384,12 @@ def _ordered_radial_blocks(project, depth, plane_bytes, workers):
                 yield z, future.result()
                 del future
         finally:
+            if cancel_event is not None:
+                cancel_event.set()
             for _, future in pending:
                 future.cancel()
+            # Exiting the pool joins each running bounded block before the
+            # source can be released or the first GPU block can be published.
 
 
 def radial_cuda_backproject_enabled():
@@ -427,8 +443,11 @@ def _close_radial_cuda_resources(projector, lease):
         lease.release()
 
 
-def _try_radial_cuda_stage(source, plan, metadata, view, shape, bboxes, use_bboxes):
+def _try_radial_cuda_stage(source, plan, metadata, view, shape, bboxes, use_bboxes,
+                           *, quiet=False, retry_state=None):
     """Admit before publication; unavailable/busy/undersized GPUs retain CPU progress."""
+    if retry_state is not None:
+        retry_state['retryable'] = False
     if not radial_cuda_backproject_enabled():
         return None
     try:
@@ -437,13 +456,16 @@ def _try_radial_cuda_stage(source, plan, metadata, view, shape, bboxes, use_bbox
             return None
     except Exception:
         return None
-    from .backprojection import _try_acquire_main_process_gpu_stage
+    from .backprojection import _try_acquire_main_process_gpu_stage, _cancel_main_process_spherical_retirement_request
 
-    # This purpose deliberately uses the normal inference-priority policy. The
-    # legacy non-D1 "backprojection" exception can borrow idle feeder devices.
+    # Completed native parents participate in bounded retirement admission,
+    # allowing an idle GPU to release the memory blocking subsequent inference.
     lease = _try_acquire_main_process_gpu_stage(torch, f'Radial source projection {view.name}')
     if lease is None:
-        print(f'Radial CUDA fallback {view.name}: eligible devices are busy or retiring; using CPU.', flush=True)
+        if retry_state is not None:
+            retry_state['retryable'] = True
+        if not quiet:
+            print(f'Radial CUDA fallback {view.name}: eligible devices are busy or retiring; using CPU.', flush=True)
         return None
     projector = None
     try:
@@ -457,6 +479,7 @@ def _try_radial_cuda_stage(source, plan, metadata, view, shape, bboxes, use_bbox
         exc.stage_lease = lease
         raise
     except Exception as exc:
+        _cancel_main_process_spherical_retirement_request(f'Radial source projection {view.name}', failed=True)
         _close_radial_cuda_resources(projector, lease)
         print(f'Radial CUDA fallback {view.name}: device admission/preflight failed ({exc}); using CPU.', flush=True)
         return None
@@ -465,11 +488,11 @@ def _try_radial_cuda_stage(source, plan, metadata, view, shape, bboxes, use_bbox
         raise
 
 
-def _ordered_radial_cuda_blocks(stage, depth, packed=None):
+def _ordered_radial_cuda_blocks(stage, depth, packed=None, *, first_z=0):
     """A single GPU producer overlaps the current immutable block's CPU consumer."""
     block_depth = max(1, int(stage.max_block_depth))
     project = stage.project if packed is None else lambda first, count: stage.project_encoded(first, count, packed=packed)
-    starts = iter(range(0, depth, block_depth))
+    starts = iter(range(int(first_z), depth, block_depth))
     # Each project result owns its host allocation. At most one ready block and
     # one in-flight block exist; executor shutdown precedes GPU/lease cleanup.
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix='radial-cuda-project') as pool:
@@ -643,7 +666,10 @@ def backproject_radial_volume_to_volume(
     materializes a whole-volume coordinate map or changes the borrowed input.
     """
     from .geometry import radial_global_radii
-    from .backprojection import SinkOnlyProjectionResult, _emit_projection_block_callback
+    from .backprojection import (
+        SinkOnlyProjectionResult, _emit_projection_block_callback,
+        _cancel_main_process_spherical_retirement_request,
+    )
 
     if str(radial_view.family) != 'radial':
         raise ValueError('Cylindrical shell projection requires a Radial view')
@@ -687,8 +713,24 @@ def backproject_radial_volume_to_volume(
     cuda_stage = None
     output = None
     failed = False
+    cpu_cancel = threading.Event()
+    retry_state = {'retryable': True}
+    admission_attempts = cpu_slices = cuda_slices = 0
+    cpu_reader_drain_s = 0.0
+    plan = metadata = None
+    cuda_admission_seconds = 0.0
+    def try_stage(*, quiet=False):
+        nonlocal admission_attempts, cuda_admission_seconds
+        admission_attempts += 1
+        started = time.perf_counter()
+        try:
+            return _try_radial_cuda_stage(source, plan, metadata, radial_view, shape,
+                bboxes, use_bboxes, quiet=quiet, retry_state=retry_state)
+        finally:
+            cuda_admission_seconds += time.perf_counter() - started
     try:
         project = None
+        cpu_reference = False
         plan_seconds = setup_seconds = sink_seconds = metadata_host_seconds = cuda_admission_seconds = 0.0
         plan_bytes = 0
         cache_hit = False
@@ -715,11 +757,7 @@ def backproject_radial_volume_to_volume(
                     int(radial_view.radial_height_origin), int(radial_view.src_h), plan.base_id,
                     bool(vertical), int(plan.plane_shape[1]), int(shape[1]), int(shape[2]),
                 )
-                admission_started = time.perf_counter()
-                cuda_stage = _try_radial_cuda_stage(
-                    source, plan, metadata, radial_view, shape, bboxes, use_bboxes,
-                )
-                cuda_admission_seconds = time.perf_counter() - admission_started
+                cuda_stage = try_stage()
                 if cuda_stage is not None:
                     project = cuda_stage.project
                     backend_name = 'cuda_factored'
@@ -737,12 +775,36 @@ def backproject_radial_volume_to_volume(
                 telemetry.add('projection.radial.plan_cache_hits', int(cache_hit))
                 telemetry.gauge('projection.radial.plan_bytes', int(plan.nbytes))
                 telemetry.gauge('projection.radial.backend', backend_name)
+        if (cuda_stage is None and plan is not None and retry_state['retryable']
+                and radial_cuda_backproject_enabled()):
+            # CPU setup/JIT can outlast an inference lease. Recheck once before
+            # committing to the first CPU block, without waiting for a device.
+            cuda_stage = try_stage(quiet=True)
+            if cuda_stage is not None:
+                project, backend_name = cuda_stage.project, 'cuda_factored'
         if project is None:
             runtime_telemetry().gauge('projection.radial.backend', 'cpu_numpy_reference')
+            cpu_reference = True
+            def project(first, count):
+                # Keep the numerical fallback's exact bounded pull equations.
+                # A single-slice iterator lets it retry CUDA at the same commit
+                # boundary as the compiled CPU path without retaining a volume.
+                if cpu_cancel.is_set():
+                    raise CancelledError('Radial reference projection was superseded')
+                result = np.empty((count, *shape[1:]), np.uint8)
+                for local_z in range(count):
+                    flat = result[local_z].reshape(-1)
+                    for first_pixel in range(0, flat.size, _PULL_CHUNK_VOXELS):
+                        if cpu_cancel.is_set():
+                            raise CancelledError('Radial reference projection was superseded')
+                        stop = min(flat.size, first_pixel + _PULL_CHUNK_VOXELS)
+                        flat[first_pixel:stop] = _pull_radial_chunk(
+                            source, radial_view, radii, shape, first + local_z, first_pixel, stop)
+                return result
         block_depth, actual_workers = _radial_block_schedule(shape[0], shape[1] * shape[2], int(workers))
         if cuda_stage is not None:
             block_depth, actual_workers = int(cuda_stage.max_block_depth), 1
-        elif project is None:
+        elif cpu_reference:
             block_depth, actual_workers = 1, 1
         encoded_format = getattr(projection_block_callback, 'encoded_slice_format', None)
         compact_output = bool(cuda_stage is not None and sink_only
@@ -751,7 +813,7 @@ def backproject_radial_volume_to_volume(
         packed_output = encoded_format == 'packbits_little'
         if compact_output:
             backend_name = 'cuda_factored_compact'
-            runtime_telemetry().gauge('projection.radial.backend', backend_name)
+        runtime_telemetry().gauge('projection.radial.backend', backend_name)
         setup_metrics = (f', metadata_host_seconds={metadata_host_seconds:.6f}'
                          f', cuda_admission_seconds={cuda_admission_seconds:.6f}')
         if cuda_stage is not None:
@@ -778,13 +840,25 @@ def backproject_radial_volume_to_volume(
                     prefer_memory=False, prefer_memfd=False, reserve_bytes=int(reserve_bytes),
                     initialize_zero=False,
                 )
-            if project is not None:
-                blocks = (_ordered_radial_cuda_blocks(cuda_stage, shape[0], packed_output if compact_output else None) if cuda_stage is not None
-                          else _ordered_radial_blocks(project, shape[0], shape[1] * shape[2], int(workers)))
+            next_z = 0
+            recheck_at = max(1, int(_CUDA_RECHECK_SLICES))
+            recheck_time = time.monotonic() + _CUDA_RECHECK_SECONDS
+            while next_z < shape[0]:
+                cpu_blocks = cuda_stage is None
+                blocks = (_ordered_radial_cuda_blocks(cuda_stage, shape[0], packed_output if compact_output else None,
+                                                     first_z=next_z) if cuda_stage is not None
+                          else _ordered_radial_blocks(project, shape[0], shape[1] * shape[2], int(workers),
+                                                      first_z=next_z, cancel_event=cpu_cancel,
+                                                      single_slice=cpu_reference))
                 try:
                     for z, block in blocks:
+                        if z != next_z:
+                            raise RuntimeError('Radial projection duplicated or skipped an output slice')
+                        count = len(block.records) if compact_output else len(block)
+                        if not compact_output and (count <= 0 or z + count > shape[0]):
+                            raise RuntimeError('Radial projection returned an invalid output block size')
                         if output is not None:
-                            output[z:z + len(block)] = block
+                            output[z:z + count] = block
                         sink_started = time.perf_counter()
                         if compact_output:
                             expected_count = min(int(cuda_stage.max_block_depth), shape[0] - z)
@@ -799,23 +873,39 @@ def backproject_radial_volume_to_volume(
                                 projection_block_callback, z, block, desc=desc, required=bool(sink_only),
                             )
                         sink_seconds += time.perf_counter() - sink_started
+                        next_z += count
+                        if cpu_blocks:
+                            cpu_slices += count
+                        else:
+                            cuda_slices += count
                         del block
+                        if (cpu_blocks and next_z < shape[0] and plan is not None
+                                and retry_state['retryable'] and radial_cuda_backproject_enabled()
+                                and (next_z >= recheck_at or time.monotonic() >= recheck_time)):
+                            recheck_at = next_z + max(1, int(_CUDA_RECHECK_SLICES))
+                            recheck_time = time.monotonic() + _CUDA_RECHECK_SECONDS
+                            candidate = try_stage(quiet=True)
+                            if candidate is not None:
+                                cuda_stage = candidate
+                                break
                 finally:
-                    # Generator shutdown waits/cancels outstanding work before the
-                    # borrowed input or caller's writer can be retired on failure.
+                    # Cancel unconsumed CPU work and join all borrowed-source
+                    # readers before GPU publication resumes at next_z.
+                    drain_started = time.perf_counter()
+                    if cpu_blocks:
+                        cpu_cancel.set()
                     blocks.close()
-            else:
-                for z in range(shape[0]):
-                    plane = np.empty(shape[1:], dtype=np.uint8) if output is None else output[z]
-                    flat_plane = plane.reshape(-1)
-                    for first in range(0, flat_plane.size, _PULL_CHUNK_VOXELS):
-                        stop = min(flat_plane.size, first + _PULL_CHUNK_VOXELS)
-                        flat_plane[first:stop] = _pull_radial_chunk(source, radial_view, radii, shape, z, first, stop)
-                    sink_started = time.perf_counter()
-                    _emit_projection_block_callback(
-                        projection_block_callback, z, plane[None], desc=desc, required=bool(sink_only),
-                    )
-                    sink_seconds += time.perf_counter() - sink_started
+                    if cpu_blocks:
+                        cpu_reader_drain_s += time.perf_counter() - drain_started
+                if cpu_blocks and cuda_stage is not None:
+                    compact_output = bool(sink_only and encoded_format in ('raw_u8', 'packbits_little')
+                                          and callable(getattr(projection_block_callback, 'consume_encoded_block', None)))
+                    backend_name = 'cuda_factored_compact' if compact_output else 'cuda_factored'
+                    actual_workers, block_depth = 1, int(cuda_stage.max_block_depth)
+                    runtime_telemetry().gauge('projection.radial.backend', backend_name)
+                    print(f'Radial projection promoted {radial_view.name}: CPU completed z=[0,{next_z}); '
+                          f'continuing on cuda:{cuda_stage.device_index} with backend={backend_name}; '
+                          f'cpu_reader_drain_s={cpu_reader_drain_s:.6f}', flush=True)
             if output is not None:
                 flush = getattr(output, 'flush', None)
                 if callable(flush):
@@ -831,7 +921,10 @@ def backproject_radial_volume_to_volume(
             print(f'Radial projection complete {radial_view.name}: backend={backend_name}, '
                   f'workers={actual_workers}, plan_MiB={plan_bytes / 2**20:.2f}, cache_hit={int(cache_hit)}, '
                   f'plan_s={plan_seconds:.6f}, setup_s={setup_seconds:.6f}, '
-                  f'total_s={time.perf_counter() - total_started:.6f}, sink_wall_s={sink_seconds:.6f}'
+                  f'total_s={time.perf_counter() - total_started:.6f}, sink_wall_s={sink_seconds:.6f}, '
+                  f'cpu_slices={cpu_slices}, cuda_slices={cuda_slices}, '
+                  f'admission_attempts={admission_attempts}, cpu_reader_drain_s={cpu_reader_drain_s:.6f}, '
+                  f'admission_probe_s={cuda_admission_seconds:.6f}'
                   + setup_metrics + device_metrics, flush=True)
             return output if output is not None else SinkOnlyProjectionResult(shape)
         except BaseException as exc:
@@ -841,6 +934,7 @@ def backproject_radial_volume_to_volume(
                   f'total_s={time.perf_counter() - total_started:.6f}, error={exc}', flush=True)
             raise
     finally:
+        _cancel_main_process_spherical_retirement_request(f'Radial source projection {radial_view.name}')
         if cuda_stage is not None:
             try:
                 cuda_stage.close()

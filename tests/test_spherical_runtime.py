@@ -15,6 +15,7 @@ from unittest import mock
 import numpy as np
 
 from XTA import config, cuda_backend, cuda_d1, geometry, pipeline, workers
+from XTA.azimuthal_coverage import requires_native_pull
 from XTA.spherical_geometry import render_shell_frame
 from XTA.unification.runtime import compile_physical_views
 
@@ -92,6 +93,7 @@ class SphericalSchedulerContracts(unittest.TestCase):
                        azimuthal_parent_requires_seam_union=False, radial_owner=False,
                        gpu_worker_result_dir=Path('unused'), prefix='probe', chunk_idx=0,
                        args=SimpleNamespace(min_conf=0.),
+                       requires_native_pull=requires_native_pull,
                        HYBRID_DEFERRED_RESULT_MODE=pipeline.HYBRID_DEFERRED_RESULT_MODE)
             exec(program, env)
             with self.subTest(cpu=cpu, d1=d1, direct=direct):

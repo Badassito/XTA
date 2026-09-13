@@ -29,8 +29,9 @@ class MultipleTileConfigurationTests(unittest.TestCase):
         second = np.zeros((1, 2, 2), dtype=np.uint8)
         second[0, 1, 1] = np.uint8(255)
         destination = np.zeros_like(first)
-        view = types.SimpleNamespace(
+        view = geometry.ViewInfo(
             name='transverse__tta_r000p000',
+            num_slices=1, src_h=2, src_w=2, pad_mode='clamp',
             family='orthogonal',
             tta_aug_id='r000p000',
             tta_angle_deg=0.0,

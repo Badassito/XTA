@@ -194,6 +194,8 @@ class SharedNativeWorkspaceTests(unittest.TestCase):
         self.shape = (4, 5, 6)
         self.namespace = dict(vars(pipeline))
         self.namespace.update(temp_dir=self.root, worker_direct_union_active=True,
+            policy_settings=SimpleNamespace(enabled=False),
+            bounded_policy_parent_keys=set(),
             args=SimpleNamespace(imgsz=8, min_conf=1., interpolation_distance=0), dense_tiling_active=False,
             nrrd_layers_needed=False, baseline_union_by_model_view={},
             baseline_confmap_by_model_view={}, baseline_slice_locks_by_model_view={},

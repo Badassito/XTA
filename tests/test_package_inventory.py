@@ -30,7 +30,504 @@ def inspect_seams(source: str):
     return reviewed_local_import_seams("sample", source, ast.parse(source))
 
 
+def augmentation_contract(manifest):
+    return inventory.reviewed_v22_augmentation_contract(
+        manifest, manifest['v21_review'],
+        *(manifest[f'v21_0_{i}_review'] for i in range(1, 7)),
+        manifest['v21_1_review'], manifest['v21_1_1_review'],
+    )
+
+
+def coverage_contract(manifest):
+    return inventory.reviewed_v22_coverage_contract(
+        manifest, manifest['v21_review'],
+        *(manifest[f'v21_0_{i}_review'] for i in range(1, 7)),
+        manifest['v21_1_review'], manifest['v21_1_1_review'], manifest['v22_augmentation_review'],
+    )
+
+
+def release_contract(manifest):
+    return inventory.reviewed_v22_release_contract(
+        manifest, manifest['v21_review'],
+        *(manifest[f'v21_0_{i}_review'] for i in range(1, 7)),
+        manifest['v21_1_review'], manifest['v21_1_1_review'],
+        manifest['v21_1_2_review'], manifest['v22_augmentation_review'],
+        manifest['v22_coverage_review'],
+    )
+
+
+def policy_memory_contract(manifest):
+    return inventory.reviewed_v22_policy_memory_contract(
+        manifest, manifest['v21_review'],
+        *(manifest[f'v21_0_{i}_review'] for i in range(1, 7)),
+        manifest['v21_1_review'], manifest['v21_1_1_review'],
+        manifest['v21_1_2_review'], manifest['v22_augmentation_review'],
+        manifest['v22_coverage_review'], manifest['v22_release_review'],
+    )
+
+
+def policy_throughput_contract(manifest):
+    return inventory.reviewed_v22_policy_throughput_contract(
+        manifest, manifest['v21_review'],
+        *(manifest[f'v21_0_{i}_review'] for i in range(1, 7)),
+        manifest['v21_1_review'], manifest['v21_1_1_review'],
+        manifest['v21_1_2_review'], manifest['v22_augmentation_review'],
+        manifest['v22_coverage_review'], manifest['v22_release_review'],
+        manifest['v22_policy_memory_review'],
+    )
+
+
+def radial_retirement_contract(manifest):
+    return inventory.reviewed_v22_radial_retirement_contract(
+        manifest, manifest['v21_review'],
+        *(manifest[f'v21_0_{i}_review'] for i in range(1, 7)),
+        manifest['v21_1_review'], manifest['v21_1_1_review'],
+        manifest['v21_1_2_review'], manifest['v22_augmentation_review'],
+        manifest['v22_coverage_review'], manifest['v22_release_review'],
+        manifest['v22_policy_memory_review'], manifest['v22_policy_throughput_review'],
+    )
+
+
+def policy_window_contract(manifest):
+    return inventory.reviewed_v22_policy_window_contract(
+        manifest, manifest['v21_review'],
+        *(manifest[f'v21_0_{i}_review'] for i in range(1, 7)),
+        manifest['v21_1_review'], manifest['v21_1_1_review'],
+        manifest['v21_1_2_review'], manifest['v22_augmentation_review'],
+        manifest['v22_coverage_review'], manifest['v22_release_review'],
+        manifest['v22_policy_memory_review'], manifest['v22_policy_throughput_review'],
+        manifest['v22_radial_retirement_review'],
+    )
+
+
 class PackageInventoryTests(unittest.TestCase):
+    def test_policy_window_authenticates_complete_distributed_predecessor(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = policy_window_contract(manifest)
+        prior = {key: value for key, value in manifest.items() if key != 'v22_policy_window_review'}
+        authenticated = hashlib.sha256(json.dumps(prior, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        self.assertEqual(authenticated, '39ed77ed4f861333ef9252ab559c99eeb5b519944a32d80fc7f223c2703fd94a')
+        self.assertEqual(authenticated, inventory.REVIEWED_V22_POLICY_WINDOW_PREDECESSOR_SHA256)
+        self.assertEqual(review['predecessor_bundle'], {
+            'name': 'XTA_v22.0.0_complete_source.zip',
+            'sha256': '9443efd0468c59d3b39b232339a680556eb40d02ff78566480cce6fd1e840c23',
+        })
+        self.assertNotIn('predecessor_commit', review)
+        self.assertEqual(review['previous_review_sha256'], inventory.REVIEWED_V22_RADIAL_RETIREMENT_SHA256)
+        self.assertEqual([(item['module'],item['name']) for item in review['definitions']], [('pipeline','_main_impl')])
+        self.assertFalse(review['statements'])
+
+    def test_policy_window_preserves_every_historical_inventory_record(self):
+        baseline = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        for key in baseline.keys() - {'v22_policy_window_review'}:
+            manifest = copy.deepcopy(baseline)
+            value = manifest[key]
+            if isinstance(value, dict):
+                value['rewritten_history'] = True
+            elif isinstance(value, list):
+                value[0]['line'] = -1
+            else:
+                manifest[key] = int(value) + 1
+            with self.subTest(key=key), self.assertRaisesRegex(RuntimeError, 'policy window predecessor inventory changed'):
+                policy_window_contract(manifest)
+
+    def test_historical_reviews_accept_only_authenticated_policy_window_successor(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        prior = copy.deepcopy(manifest)
+        del prior['v22_policy_window_review']
+        contracts = (release_contract, policy_memory_contract, policy_throughput_contract, radial_retirement_contract)
+        for contract in contracts:
+            self.assertEqual(contract(prior), contract(manifest))
+        manifest['v22_policy_window_review']['definitions'][0]['sha256'] = '0'*64
+        for contract in contracts:
+            with self.subTest(contract=contract.__name__), self.assertRaisesRegex(RuntimeError, 'review digest mismatch'):
+                contract(manifest)
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        del manifest['v22_radial_retirement_review']
+        with self.assertRaisesRegex(RuntimeError, 'requires the reviewed Radial retirement predecessor'):
+            policy_throughput_contract(manifest)
+
+    def test_policy_window_rejects_wrong_bundle_or_expanded_runtime_scope(self):
+        for mutation in ('bundle', 'commit', 'definition', 'statement', 'complete_module'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            review = manifest['v22_policy_window_review']
+            if mutation == 'bundle':
+                review['predecessor_bundle']['sha256'] = '0'*64
+                message = 'unexpected bundle predecessor or feature'
+            elif mutation == 'commit':
+                review['predecessor_commit'] = '0'*40
+                message = 'unexpected bundle predecessor or feature'
+            else:
+                message = 'must cover only pipeline._main_impl'
+                if mutation == 'definition':
+                    review['definitions'].append(dict(module='pipeline', name='unreviewed',
+                        previous_sha256=None, sha256='1'*64, reason='unexpected runtime addition'))
+                elif mutation == 'statement':
+                    review['statements'].append(dict(module='pipeline', label='unreviewed_import',
+                        previous_sha256=None, sha256='1'*64, reason='unexpected import'))
+                else:
+                    review['complete_modules'].append('pipeline')
+            authenticated = hashlib.sha256(json.dumps(review, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            with self.subTest(mutation=mutation), mock.patch.object(inventory,'REVIEWED_V22_POLICY_WINDOW_SHA256',authenticated):
+                with self.assertRaisesRegex(RuntimeError,message):
+                    policy_window_contract(manifest)
+
+    def test_policy_window_requires_latest_pipeline_predecessor_definition(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = manifest['v22_policy_window_review']
+        previous = next(item for item in manifest['v22_policy_throughput_review']['definitions']
+                        if (item['module'],item['name']) == ('pipeline','_main_impl'))
+        self.assertEqual(review['definitions'][0]['previous_sha256'],previous['sha256'])
+        review['definitions'][0]['previous_sha256'] = previous['previous_sha256']
+        authenticated = hashlib.sha256(json.dumps(review,sort_keys=True,separators=(',', ':')).encode()).hexdigest()
+        with mock.patch.object(inventory,'REVIEWED_V22_POLICY_WINDOW_SHA256',authenticated):
+            with self.assertRaisesRegex(RuntimeError,'supersession does not match its historical pin: pipeline._main_impl'):
+                policy_window_contract(manifest)
+
+    def test_policy_window_current_body_and_unreviewed_imports_are_both_pinned(self):
+        original_parse = inventory.ast.parse
+        for target in ('body', 'import'):
+            def changed_parse(source,filename='<unknown>',*args,**kwargs):
+                tree = original_parse(source,filename,*args,**kwargs)
+                if str(filename).replace('\\','/').endswith('/pipeline.py'):
+                    if target == 'import':
+                        tree.body.append(ast.Import(names=[ast.alias(name='unreviewed_import')]))
+                    else:
+                        node = next(node for node in tree.body if getattr(node,'name',None) == '_main_impl')
+                        node.body.append(ast.Pass())
+                return tree
+            message = ('policy window changed unreviewed pipeline statements or imports'
+                       if target == 'import' else 'reviewed (?:added )?definition changed or is missing: pipeline._main_impl')
+            with self.subTest(target=target), mock.patch.object(inventory.ast,'parse',side_effect=changed_parse):
+                with self.assertRaisesRegex(RuntimeError,message):
+                    verify_inventory()
+
+    def test_radial_retirement_authenticates_the_complete_throughput_bundle(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = radial_retirement_contract(manifest)
+        prior = {key: value for key, value in manifest.items() if key not in ('v22_radial_retirement_review', 'v22_policy_window_review')}
+        authenticated = hashlib.sha256(json.dumps(prior, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        self.assertEqual(authenticated, inventory.REVIEWED_V22_RADIAL_RETIREMENT_PREDECESSOR_SHA256)
+        self.assertEqual(review['predecessor_bundle'], {
+            'name': 'XTA_v22.0.0_complete_source.zip',
+            'sha256': 'fede9e0d4a8a3e32786cd2a62e79b540f1e7dd0cd34630bc5e0a83f9b721cf8c',
+        })
+        self.assertEqual(review['previous_review_sha256'], inventory.REVIEWED_V22_POLICY_THROUGHPUT_SHA256)
+        self.assertNotIn('predecessor_commit', review)
+        self.assertEqual(review['feature'], 'radial-gpu-retirement')
+        self.assertEqual(len(review['definitions']), 5)
+        self.assertEqual(len(review['statements']), 3)
+        self.assertEqual([item['module'] for item in review['preserved_radial_module_updates']], ['cylindrical_projection'])
+
+    def test_radial_retirement_preserves_all_predecessor_review_records(self):
+        for key in ('v22_policy_throughput_review', 'v22_policy_memory_review', 'v22_release_review', 'v21_review'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            manifest[key]['rewritten_history'] = True
+            with self.subTest(key=key), self.assertRaisesRegex(RuntimeError, 'Radial retirement predecessor inventory changed'):
+                radial_retirement_contract(manifest)
+
+    def test_historical_contracts_accept_only_authenticated_radial_successor(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        prior = copy.deepcopy(manifest)
+        del prior['v22_radial_retirement_review']
+        del prior['v22_policy_window_review']
+        for contract in (release_contract, policy_memory_contract, policy_throughput_contract):
+            with self.subTest(contract=contract.__name__):
+                self.assertEqual(contract(prior), contract(manifest))
+        manifest['v22_radial_retirement_review']['definitions'][0]['sha256'] = '0' * 64
+        for contract in (release_contract, policy_memory_contract, policy_throughput_contract):
+            with self.subTest(contract=contract.__name__), self.assertRaisesRegex(RuntimeError, 'v22.0.0 review digest mismatch'):
+                contract(manifest)
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        del manifest['v22_policy_throughput_review']
+        with self.assertRaisesRegex(RuntimeError, 'requires the reviewed throughput predecessor'):
+            policy_memory_contract(manifest)
+
+    def test_radial_retirement_requires_exact_bundle_and_projection_scope(self):
+        for category in ('bundle', 'definitions', 'statements', 'preserved_radial_module_updates'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            review = manifest['v22_radial_retirement_review']
+            if category == 'bundle':
+                review['predecessor_bundle']['sha256'] = '0' * 64
+                message = 'unexpected bundle predecessor or feature'
+            else:
+                review[category].pop()
+                message = 'exactly its scheduler, projection and retry contracts'
+            authenticated = hashlib.sha256(json.dumps(review, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            with self.subTest(category=category), mock.patch.object(inventory, 'REVIEWED_V22_RADIAL_RETIREMENT_SHA256', authenticated):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    radial_retirement_contract(manifest)
+
+    def test_radial_retry_import_requires_the_unchanged_v20_predecessor_pin(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = manifest['v22_radial_retirement_review']
+        record = next(item for item in review['statements'] if item['label'] == 'shared_future_import')
+        key = ('cylindrical_projection', 'shared_future_import')
+        self.assertEqual(record['previous_sha256'], REVIEWED_V20_ADDED_STATEMENTS[key][0])
+        effective = inventory.reviewed_v20_statement_hashes((review,))
+        self.assertEqual(effective[key], record['sha256'])
+        record['previous_sha256'] = '0' * 64
+        with self.assertRaisesRegex(RuntimeError, 'v20 statement successor does not match its historical pin'):
+            inventory.reviewed_v20_statement_hashes((review,))
+        authenticated = hashlib.sha256(json.dumps(review, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        with mock.patch.object(inventory, 'REVIEWED_V22_RADIAL_RETIREMENT_SHA256', authenticated):
+            with self.assertRaisesRegex(RuntimeError, 'supersession does not match its historical pin: cylindrical_projection.shared_future_import'):
+                radial_retirement_contract(manifest)
+
+    def test_radial_retry_import_and_interval_have_independent_statement_pins(self):
+        original_parse = inventory.ast.parse
+        for target in ('import', 'retry_interval'):
+            def changed_parse(source, filename='<unknown>', *args, **kwargs):
+                tree = original_parse(source, filename, *args, **kwargs)
+                if str(filename).replace('\\', '/').endswith('/cylindrical_projection.py'):
+                    for node in tree.body:
+                        if target == 'import' and isinstance(node, ast.ImportFrom) and node.module == 'concurrent.futures':
+                            node.names = [alias for alias in node.names if alias.name != 'CancelledError']
+                        elif (target == 'retry_interval' and isinstance(node, ast.Assign)
+                              and any(getattr(name, 'id', '') == '_CUDA_RECHECK_SECONDS' for name in node.targets)):
+                            node.value = ast.Constant(value=2.0)
+                return tree
+            message = ('reviewed added statement changed or is missing: cylindrical_projection.shared_future_import'
+                       if target == 'import' else 'reviewed statement changed or is missing: cylindrical_projection.binding__CUDA_RECHECK_SECONDS')
+            with self.subTest(target=target), mock.patch.object(inventory.ast, 'parse', side_effect=changed_parse):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    verify_inventory()
+
+    def test_policy_throughput_authenticates_distributed_bundle_without_inventing_commit(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = policy_throughput_contract(manifest)
+        prior = {key: value for key, value in manifest.items()
+                 if key not in ('v22_policy_throughput_review', 'v22_radial_retirement_review', 'v22_policy_window_review')}
+        authenticated = hashlib.sha256(json.dumps(prior, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        self.assertEqual(authenticated, inventory.REVIEWED_V22_POLICY_THROUGHPUT_PREDECESSOR_SHA256)
+        self.assertEqual(review['previous_review_sha256'], inventory.REVIEWED_V22_POLICY_MEMORY_SHA256)
+        self.assertEqual(review['predecessor_bundle'], {
+            'name': 'XTA_v22.0.0_complete_source.zip',
+            'sha256': '687421acc062cfc7c67a60d98a5cce61e74be1ad90ed609c06fac7201b76d292',
+        })
+        self.assertNotIn('predecessor_commit', review)
+        self.assertEqual(review['feature'], 'shared-policy-union-throughput')
+        self.assertEqual(len(review['definitions']), 13)
+        self.assertEqual(len(review['statements']), 1)
+        self.assertEqual(len(review['local_import_seam_updates']), 1)
+
+    def test_policy_throughput_cannot_rewrite_memory_or_earlier_inventory_records(self):
+        for key in ('v22_policy_memory_review', 'v22_release_review', 'v22_coverage_review', 'v21_1_2_review'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            manifest[key]['rewritten_history'] = True
+            with self.subTest(key=key), self.assertRaisesRegex(RuntimeError, 'throughput predecessor inventory changed'):
+                policy_throughput_contract(manifest)
+
+    def test_historical_contracts_accept_only_authenticated_throughput_successor(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        prior = copy.deepcopy(manifest)
+        del prior['v22_policy_throughput_review']
+        del prior['v22_radial_retirement_review']
+        del prior['v22_policy_window_review']
+        self.assertEqual(release_contract(prior), release_contract(manifest))
+        self.assertEqual(policy_memory_contract(prior), policy_memory_contract(manifest))
+        manifest['v22_policy_throughput_review']['definitions'][0]['sha256'] = '0' * 64
+        for contract in (release_contract, policy_memory_contract):
+            with self.subTest(contract=contract.__name__), self.assertRaisesRegex(RuntimeError, 'v22.0.0 review digest mismatch'):
+                contract(manifest)
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        del manifest['v22_policy_memory_review']
+        with self.assertRaisesRegex(RuntimeError, 'requires the reviewed memory predecessor'):
+            release_contract(manifest)
+
+    def test_policy_throughput_requires_bundle_identity_and_exact_changed_scope(self):
+        for category in ('bundle', 'commit', 'definitions', 'statements', 'local_import_seam_updates'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            review = manifest['v22_policy_throughput_review']
+            if category == 'bundle':
+                review['predecessor_bundle']['sha256'] = '0' * 64
+                message = 'unexpected bundle predecessor or feature'
+            elif category == 'commit':
+                review['predecessor_commit'] = '0' * 40
+                message = 'unexpected bundle predecessor or feature'
+            else:
+                review[category].pop()
+                message = 'exactly its shared-policy definitions, import and seam'
+            authenticated = hashlib.sha256(json.dumps(review, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            with self.subTest(category=category), mock.patch.object(inventory, 'REVIEWED_V22_POLICY_THROUGHPUT_SHA256', authenticated):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    policy_throughput_contract(manifest)
+
+    def test_policy_throughput_requires_latest_memory_definition_and_review_pins(self):
+        for category in ('definition', 'review'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            review = manifest['v22_policy_throughput_review']
+            if category == 'definition':
+                record = next(item for item in review['definitions']
+                              if (item['module'], item['name']) == ('tta_scheduler', 'TtaScheduler'))
+                memory = next(item for item in manifest['v22_policy_memory_review']['definitions']
+                              if (item['module'], item['name']) == ('tta_scheduler', 'TtaScheduler'))
+                self.assertEqual(record['previous_sha256'], memory['sha256'])
+                record['previous_sha256'] = memory['previous_sha256']
+                message = 'supersession does not match its historical pin: tta_scheduler.TtaScheduler'
+            else:
+                review['previous_review_sha256'] = inventory.REVIEWED_V22_RELEASE_SHA256
+                message = 'unexpected release or predecessor identity'
+            authenticated = hashlib.sha256(json.dumps(review, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            with self.subTest(category=category), mock.patch.object(inventory, 'REVIEWED_V22_POLICY_THROUGHPUT_SHA256', authenticated):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    policy_throughput_contract(manifest)
+
+    def test_shared_policy_outputs_and_memfd_transfers_have_independent_definition_pins(self):
+        original_digest = inventory.digest
+        for target in ('_open_policy_sibling_outputs', '_materialize_worker_task_memfd_paths', '_DeviceUnionAccumulator'):
+            def changed_digest(node):
+                return '0' * 64 if getattr(node, 'name', None) == target else original_digest(node)
+            with self.subTest(target=target), mock.patch.object(inventory, 'digest', side_effect=changed_digest):
+                with self.assertRaisesRegex(RuntimeError, 'reviewed (?:added )?definition changed or is missing:'):
+                    verify_inventory()
+
+    def test_policy_memory_review_authenticates_the_complete_reconciled_inventory(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = policy_memory_contract(manifest)
+        prior = {key: value for key, value in manifest.items()
+                 if key not in ('v22_policy_memory_review', 'v22_policy_throughput_review', 'v22_radial_retirement_review', 'v22_policy_window_review')}
+        authenticated = hashlib.sha256(json.dumps(prior, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        self.assertEqual(authenticated, inventory.REVIEWED_V22_POLICY_MEMORY_PREDECESSOR_SHA256)
+        self.assertEqual(review['previous_review_sha256'], inventory.REVIEWED_V22_RELEASE_SHA256)
+        self.assertEqual(review['predecessor_commit'], 'a328bc0c03b81ef4afcab9f9f360b16c38c4e6cc')
+        self.assertEqual(review['feature'], 'bounded-policy-parent-memory')
+        self.assertEqual(len(review['definitions']), 6)
+        self.assertEqual(len(review['statements']), 2)
+        self.assertEqual(release_contract(manifest), manifest['v22_release_review'])
+
+    def test_policy_memory_review_cannot_rewrite_any_previous_record(self):
+        for key in ('v21_1_2_review', 'v22_augmentation_review', 'v22_coverage_review', 'v22_release_review'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            manifest[key]['unreviewed_reason'] = 'rewritten history'
+            with self.subTest(key=key), self.assertRaisesRegex(RuntimeError, 'policy memory predecessor inventory changed'):
+                policy_memory_contract(manifest)
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        manifest['statements'][0]['line'] += 1
+        with self.assertRaisesRegex(RuntimeError, 'policy memory predecessor inventory changed'):
+            policy_memory_contract(manifest)
+
+    def test_release_ignores_only_an_authenticated_memory_successor(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        prior = copy.deepcopy(manifest)
+        del prior['v22_policy_memory_review']
+        del prior['v22_policy_throughput_review']
+        del prior['v22_radial_retirement_review']
+        del prior['v22_policy_window_review']
+        self.assertEqual(release_contract(prior), release_contract(manifest))
+        manifest['v22_policy_memory_review']['definitions'][0]['sha256'] = '0' * 64
+        with self.assertRaisesRegex(RuntimeError, 'v22.0.0 review digest mismatch'):
+            release_contract(manifest)
+
+    def test_policy_memory_requires_latest_definition_and_release_predecessors(self):
+        for category in ('definition', 'release'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            review = manifest['v22_policy_memory_review']
+            if category == 'definition':
+                record = next(item for item in review['definitions']
+                              if (item['module'], item['name']) == ('tta_scheduler', 'TtaScheduler'))
+                record['previous_sha256'] = '0' * 64
+                message = 'supersession does not match its historical pin: tta_scheduler.TtaScheduler'
+            else:
+                review['previous_review_sha256'] = '0' * 64
+                message = 'unexpected release or predecessor identity'
+            authenticated = hashlib.sha256(json.dumps(review, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            with self.subTest(category=category), mock.patch.object(inventory, 'REVIEWED_V22_POLICY_MEMORY_SHA256', authenticated):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    policy_memory_contract(manifest)
+
+    def test_policy_memory_requires_exact_feature_identity_and_changed_source_scope(self):
+        for category in ('feature', 'definitions', 'statements'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            review = manifest['v22_policy_memory_review']
+            if category == 'feature':
+                review['feature'] = 'unreviewed-feature'
+                message = 'unexpected predecessor or feature'
+            else:
+                review[category].pop()
+                message = 'exactly its parent-admission definitions and imports'
+            authenticated = hashlib.sha256(json.dumps(review, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            with self.subTest(category=category), mock.patch.object(inventory, 'REVIEWED_V22_POLICY_MEMORY_SHA256', authenticated):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    policy_memory_contract(manifest)
+
+    def test_policy_memory_safety_helpers_have_independent_definition_pins(self):
+        original_digest = inventory.digest
+        for target in ('policy_parent_memory_plan', 'native_fullframe_dense_reserve', 'TtaScheduler'):
+            def changed_digest(node):
+                return '0' * 64 if getattr(node, 'name', None) == target else original_digest(node)
+            with self.subTest(target=target), mock.patch.object(inventory, 'digest', side_effect=changed_digest):
+                with self.assertRaisesRegex(RuntimeError, 'reviewed (?:added )?definition changed or is missing:'):
+                    verify_inventory()
+
+    def test_v22_release_preserves_and_authenticates_both_parent_snapshots(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = release_contract(manifest)
+        self.assertEqual(review['parent_snapshots'], list(inventory.REVIEWED_V22_RELEASE_PARENTS))
+        self.assertEqual(review['previous_review_sha256'], inventory.REVIEWED_V22_COVERAGE_SHA256)
+        self.assertEqual(len(review['statements']), 5)
+        self.assertEqual(review['definitions'], [])
+
+    def test_v22_release_rejects_historical_changes_on_either_parent(self):
+        for key in ('v21_1_2_review', 'v22_augmentation_review', 'v22_coverage_review', 'v21_review'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            manifest[key]['definitions'][0]['reason'] = 'Rewritten parent record'
+            with self.subTest(key=key), self.assertRaisesRegex(RuntimeError, 'release parent inventory changed'):
+                release_contract(manifest)
+
+    def test_v22_release_rejects_missing_and_unreviewed_inventory_appendices(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        del manifest['v21_1_2_review']
+        with self.assertRaisesRegex(RuntimeError, 'release parent inventory changed'):
+            inventory.reviewed_v22_release_contract(manifest, manifest['v21_review'])
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        manifest['unreviewed_appendix'] = {}
+        with self.assertRaisesRegex(RuntimeError, 'release inventory keyset differs'):
+            release_contract(manifest)
+
+    def test_v22_coverage_uses_its_own_pre_merge_keyset(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        expected = copy.deepcopy(coverage_contract(manifest))
+        del manifest['v21_1_2_review']
+        del manifest['v22_release_review']
+        self.assertEqual(coverage_contract(manifest), expected)
+
+    def test_v22_release_authenticates_parent_identity_resolution_and_binding_digests(self):
+        for category in ('parent_snapshots', 'merge_resolution', 'statements'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            review = manifest['v22_release_review']
+            if category == 'parent_snapshots':
+                review[category][0]['commit'] = '0' * 40
+            elif category == 'merge_resolution':
+                review[category]['main_reviews'] = []
+            else:
+                review[category][0]['sha256'] = '0' * 64
+            with self.subTest(category=category), self.assertRaisesRegex(RuntimeError, 'v22.0.0 review digest mismatch'):
+                release_contract(manifest)
+
+    def test_v22_release_requires_version_successors_of_the_main_parent(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = manifest['v22_release_review']
+        record = review['statements'][0]
+        old_version = next(item for item in manifest['v21_1_1_review']['statements']
+                           if item['module'] == '__init__')
+        record['previous_sha256'] = old_version['sha256']
+        authenticated = hashlib.sha256(json.dumps(review, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        with mock.patch.object(inventory, 'REVIEWED_V22_RELEASE_SHA256', authenticated):
+            with self.assertRaisesRegex(RuntimeError, 'supersession does not match its historical pin: __init__'):
+                release_contract(manifest)
+
+    def test_v22_release_rejects_reauthenticated_parent_and_binding_omissions(self):
+        for category in ('parent_snapshots', 'statements'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            review = manifest['v22_release_review']
+            review[category].pop()
+            authenticated = hashlib.sha256(json.dumps(review, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            message = 'unexpected parent snapshots' if category == 'parent_snapshots' else 'exactly its five release identity bindings'
+            with self.subTest(category=category), mock.patch.object(inventory, 'REVIEWED_V22_RELEASE_SHA256', authenticated):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    release_contract(manifest)
+
     def test_frontier_release_authenticates_new_modules_and_prior_release(self):
         manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
         review = manifest['v21_1_2_review']
@@ -67,6 +564,180 @@ class PackageInventoryTests(unittest.TestCase):
             with self.subTest(target=target), mock.patch.object(inventory, 'digest', side_effect=changed_digest):
                 with self.assertRaisesRegex(RuntimeError, 'reviewed definition changed or is missing:'):
                     verify_inventory()
+
+
+    def test_coverage_review_follows_the_complete_augmentation_predecessor(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = coverage_contract(manifest)
+        self.assertEqual(review['previous_review_sha256'], inventory.REVIEWED_V22_AUGMENTATION_SHA256)
+        self.assertEqual(review['predecessor_commit'], 'f6557bf52822c8e8d0a752deb81fa26652b8a4e4')
+        self.assertEqual(review['feature'], 'coverage-sampling')
+        self.assertEqual(manifest['v22_augmentation_review']['release'], '22.0.0')
+        self.assertEqual(manifest['v21_1_1_review']['release'], '21.1.1')
+
+    def test_coverage_review_cannot_rewrite_any_historical_record(self):
+        for key, field in (
+            ('v22_augmentation_review', 'reason'), ('v21_review', 'reason'),
+        ):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            manifest[key]['definitions'][0][field] = 'Rewritten historical review'
+            with self.subTest(review=key), self.assertRaisesRegex(RuntimeError, 'coverage predecessor inventory changed'):
+                coverage_contract(manifest)
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        manifest['statements'][0]['line'] += 1
+        with self.assertRaisesRegex(RuntimeError, 'coverage predecessor inventory changed'):
+            coverage_contract(manifest)
+
+    def test_coverage_review_authenticates_geometry_bindings_modules_and_proof(self):
+        for category in ('definitions', 'statements', 'preserved_radial_module_updates', 'validation_tools'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            manifest['v22_coverage_review'][category][0]['sha256'] = '0' * 64
+            with self.subTest(category=category), self.assertRaisesRegex(RuntimeError, 'v22.0.0 review digest mismatch'):
+                coverage_contract(manifest)
+
+    def test_coverage_review_requires_the_latest_augmentation_definition_pin(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = manifest['v22_coverage_review']
+        record = next(item for item in review['definitions']
+                      if (item['module'], item['name']) == ('config', 'build_argparser'))
+        prior = next(item for item in manifest['v22_augmentation_review']['definitions']
+                     if (item['module'], item['name']) == ('config', 'build_argparser'))
+        self.assertEqual(record['previous_sha256'], prior['sha256'])
+        record['previous_sha256'] = '0' * 64
+        authenticated = hashlib.sha256(json.dumps(review, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+        with mock.patch.object(inventory, 'REVIEWED_V22_COVERAGE_SHA256', authenticated):
+            with self.assertRaisesRegex(RuntimeError, 'supersession does not match its historical pin: config.build_argparser'):
+                coverage_contract(manifest)
+
+    def test_coverage_review_requires_exact_radial_module_predecessor(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        patches = [*(manifest[f'v21_0_{i}_review'] for i in range(1, 7)),
+                   manifest['v21_1_review'], manifest['v21_1_1_review'],
+                   manifest['v22_augmentation_review'], manifest['v22_coverage_review']]
+        record = next(item for item in patches[-1]['preserved_radial_module_updates']
+                      if item['module'] == 'cylindrical_geometry')
+        record['previous_sha256'] = '0' * 64
+        with self.assertRaisesRegex(RuntimeError, 'Radial module review does not match its preserved predecessor'):
+            inventory.reviewed_radial_module_hashes(manifest['v21_review'], patches)
+
+    def test_coverage_new_modules_have_complete_statement_coverage(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = coverage_contract(manifest)
+        self.assertEqual(set(review['complete_modules']), {'spherical_sampling', 'azimuthal_coverage'})
+        original_parse = inventory.ast.parse
+
+        for module in review['complete_modules']:
+            def add_unreviewed_statement(source, filename='<unknown>', *args, **kwargs):
+                tree = original_parse(source, filename, *args, **kwargs)
+                if str(filename).replace('\\', '/').endswith(f'/{module}.py'):
+                    tree.body.extend(original_parse('UNREVIEWED_COVERAGE_BINDING = 1').body)
+                return tree
+
+            with self.subTest(module=module), mock.patch.object(inventory.ast, 'parse', side_effect=add_unreviewed_statement):
+                with self.assertRaisesRegex(RuntimeError, f'complete-module statement coverage differs: {module}'):
+                    verify_inventory()
+
+    def test_coverage_qsc_unit_bound_has_an_independent_statement_pin(self):
+        original_digest = inventory.digest
+
+        def change_bound(node):
+            if isinstance(node, ast.Assign) and any(getattr(item, 'id', '') == 'QSC_INVERSE_LIPSCHITZ' for item in node.targets):
+                return '0' * 64
+            return original_digest(node)
+
+        with mock.patch.object(inventory, 'digest', side_effect=change_bound):
+            with self.assertRaisesRegex(RuntimeError, 'reviewed statement changed or is missing: qsc[.]'):
+                verify_inventory()
+
+    def test_coverage_rational_certificate_source_cannot_change_without_review(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = coverage_contract(manifest)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / 'tools/certify_qsc_lipschitz.py'
+            path.parent.mkdir()
+            path.write_text('raise RuntimeError("unreviewed proof replacement")\n', encoding='utf-8')
+            with mock.patch.object(inventory, 'ROOT', root):
+                with self.assertRaisesRegex(RuntimeError, 'coverage validation tool changed or is missing'):
+                    inventory.verify_coverage_validation_tools(review)
+
+    def test_augmentation_review_authenticates_definitions_bindings_and_relocations(self):
+        for category in ('definitions', 'statements', 'definition_relocations'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            manifest['v22_augmentation_review'][category][0]['sha256'] = '0' * 64
+            with self.subTest(category=category), self.assertRaisesRegex(
+                    RuntimeError, 'v22.0.0 review digest mismatch'):
+                augmentation_contract(manifest)
+
+    def test_augmentation_review_requires_latest_definition_predecessor(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = manifest['v22_augmentation_review']
+        record = next(item for item in review['definitions']
+                      if (item['module'], item['name']) == ('config', 'build_argparser'))
+        record['previous_sha256'] = '0' * 64
+        authenticated = hashlib.sha256(json.dumps(
+            review, sort_keys=True, separators=(',', ':'),
+        ).encode()).hexdigest()
+        with mock.patch.object(inventory, 'REVIEWED_V22_AUGMENTATION_SHA256', authenticated):
+            with self.assertRaisesRegex(RuntimeError, 'v22.0.0 supersession does not match its historical pin'):
+                augmentation_contract(manifest)
+
+    def test_augmentation_relocation_requires_independent_preserved_pta_predecessor(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = manifest['v22_augmentation_review']
+        review['definition_relocations'][0]['previous_sha256'] = '0' * 64
+        authenticated = hashlib.sha256(json.dumps(
+            review, sort_keys=True, separators=(',', ':'),
+        ).encode()).hexdigest()
+        with mock.patch.object(inventory, 'REVIEWED_V22_AUGMENTATION_SHA256', authenticated):
+            with self.assertRaisesRegex(RuntimeError, 'relocation does not match its preserved predecessor'):
+                augmentation_contract(manifest)
+
+    def test_augmentation_relocation_rejects_a_replacement_pta_wrapper(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = augmentation_contract(manifest)
+        top_level = {
+            module: ast.parse((inventory.PACKAGE / f'{module}.py').read_text(encoding='utf-8')).body
+            for module in ('pta_augmentation', 'augmentation_policy')
+        }
+        top_level['pta_augmentation'].extend(ast.parse(
+            'def inspect_augmentation_definition(path):\n    return None\n',
+        ).body)
+        with self.assertRaisesRegex(RuntimeError, 'shared-owner relocation changed: pta_augmentation.inspect_augmentation_definition'):
+            inventory.verify_augmentation_relocations(review, top_level)
+
+    def test_augmentation_new_modules_have_complete_statement_coverage(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = augmentation_contract(manifest)
+        self.assertEqual(set(review['complete_modules']), {
+            'augmentation_policy', 'tta_augmentation', 'tta_augmentation_config',
+            'tta_augmentation_cuda', 'tta_augmentation_retirement', 'tta_augmentation_runtime',
+        })
+        original_parse = inventory.ast.parse
+
+        def add_unreviewed_statement(source, filename='<unknown>', *args, **kwargs):
+            tree = original_parse(source, filename, *args, **kwargs)
+            if str(filename).replace('\\', '/').endswith('/tta_augmentation_cuda.py'):
+                tree.body.extend(original_parse('UNREVIEWED_AUGMENTATION_BINDING = 1').body)
+            return tree
+
+        with mock.patch.object(inventory.ast, 'parse', side_effect=add_unreviewed_statement):
+            with self.assertRaisesRegex(RuntimeError, 'complete-module statement coverage differs: tta_augmentation_cuda'):
+                verify_inventory()
+
+    def test_augmentation_cuda_source_has_an_independent_statement_pin(self):
+        original_digest = inventory.digest
+
+        def change_cuda_source(node):
+            if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+                    and isinstance(node.value.value, str)
+                    and 'extern "C" __global__ void policy_grids(' in node.value.value):
+                return '0' * 64
+            return original_digest(node)
+
+        with mock.patch.object(inventory, 'digest', side_effect=change_cuda_source):
+            with self.assertRaisesRegex(RuntimeError, 'reviewed statement changed or is missing: tta_augmentation_cuda'):
+                verify_inventory()
 
     def test_overlap_release_authenticates_the_explicit_concurrency_option(self):
         manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))

@@ -31,7 +31,10 @@ def main():
     version = next(ast.literal_eval(node.value) for node in tree.body
                    if isinstance(node, ast.Assign) and any(getattr(target, 'id', '') == '__version__' for target in node.targets))
     launcher = f'GPT-6-Astra-Ultra_v{version}_SLURM.py'
-    paths = [ROOT / name for name in (launcher, 'ARCHITECTURE.md', 'pyproject.toml', 'setup.py', 'MANIFEST.in', '.gitignore')]
+    paths = [ROOT / name for name in (
+        launcher, 'ARCHITECTURE.md', 'pyproject.toml', 'setup.py', 'MANIFEST.in',
+        '.gitignore', '.gitattributes',
+    )]
     for directory in ('XTA', 'tools', 'native', 'tests'):
         paths.extend(path for path in (ROOT / directory).rglob('*') if path.is_file()
                      and '__pycache__' not in path.parts

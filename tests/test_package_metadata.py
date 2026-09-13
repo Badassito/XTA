@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import subprocess
+import sys
+import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 import XTA
@@ -8,9 +14,14 @@ from XTA import cli, config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRENT_VERSION = "21.1.2"
-CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v21.1.2_SLURM.py"
-PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v21.1.1_SLURM.py"
+CURRENT_VERSION = "22.0.0"
+CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v22.0.0_SLURM.py"
+PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v21.1.2_SLURM.py"
+SCRATCH_REPORTS = (
+    "TTA_EXTERNAL_AUGMENTATION.md",
+    "TTA_TEST_CLI_AUDIT.md",
+    "PROJECTION_SAMPLING.md",
+)
 
 
 def _toml_section(source: str, name: str) -> str:
@@ -25,7 +36,7 @@ class PackageMetadataTests(unittest.TestCase):
     def test_runtime_version_constants_are_aligned(self) -> None:
         self.assertEqual(XTA.__version__, CURRENT_VERSION)
         self.assertEqual(config.SCRIPT_VERSION, CURRENT_VERSION)
-        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2112")
+        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2200")
         self.assertEqual(config.SCRIPT_BASENAME, CURRENT_LAUNCHER)
         self.assertEqual(cli.SCRIPT_VERSION, CURRENT_VERSION)
         self.assertEqual(cli.SCRIPT_BASENAME, CURRENT_LAUNCHER)
@@ -45,9 +56,16 @@ class PackageMetadataTests(unittest.TestCase):
             package_data,
         )
         self.assertIn(f'"{CURRENT_LAUNCHER}"', data_files)
+        self.assertIn('"ARCHITECTURE.md"', data_files)
+        for report in SCRATCH_REPORTS:
+            self.assertNotIn(report, data_files)
         self.assertIn('"tools/hgx_selftest.py"', data_files)
         self.assertIn('"tools/replay_component_projection.py"', data_files)
+        self.assertIn('"tools/certify_qsc_lipschitz.py"', data_files)
+        self.assertIn('"tools/plan_projection_sampling.py"', data_files)
         self.assertIn('"tools/d1_ipc_selftest.py"', data_files)
+        self.assertIn('"tools/tta_augmentation_smoke.py"', data_files)
+        self.assertIn('"tools/check_tta_augmentation_run.py"', data_files)
         self.assertIn('"tools/lta_gpu_smoke.py"', data_files)
         self.assertIn('"tools/lta_point_smoke.py"', data_files)
         self.assertIn('"tools/lta_tile_smoke.py"', data_files)
@@ -73,11 +91,19 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertNotIn("include GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py", manifest_lines)
         self.assertNotIn(f"include {PREVIOUS_LAUNCHER}", manifest_lines)
         self.assertIn("include XTA/_package_inventory.json", manifest_lines)
+        self.assertIn("include ARCHITECTURE.md", manifest_lines)
+        for report in SCRATCH_REPORTS:
+            self.assertNotIn(f"include {report}", manifest_lines)
+            self.assertFalse((ROOT / report).exists())
         self.assertIn("recursive-include XTA/examples *.py *.md", manifest_lines)
         self.assertIn("recursive-include tools *.py", manifest_lines)
         self.assertTrue((ROOT / "tools" / "hgx_selftest.py").is_file())
         self.assertTrue((ROOT / "tools" / "replay_component_projection.py").is_file())
+        self.assertTrue((ROOT / "tools" / "certify_qsc_lipschitz.py").is_file())
+        self.assertTrue((ROOT / "tools" / "plan_projection_sampling.py").is_file())
         self.assertTrue((ROOT / "tools" / "d1_ipc_selftest.py").is_file())
+        self.assertTrue((ROOT / "tools" / "tta_augmentation_smoke.py").is_file())
+        self.assertTrue((ROOT / "tools" / "check_tta_augmentation_run.py").is_file())
         self.assertTrue((ROOT / "tools" / "lta_gpu_smoke.py").is_file())
         self.assertTrue((ROOT / "tools" / "lta_point_smoke.py").is_file())
         self.assertTrue((ROOT / "tools" / "lta_tile_smoke.py").is_file())
@@ -99,6 +125,39 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertFalse((ROOT / "GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py").exists())
         self.assertFalse((ROOT / "GPT-5.6-Sol-Ultra_v18.0.1_SLURM.py").exists())
         self.assertFalse((ROOT / "GPT-5.6-Sol-Ultra_v18.0.2_SLURM.py").exists())
+
+    def test_complete_source_bundle_keeps_architecture_and_excludes_scratch_reports(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="xta-release-metadata-") as directory:
+            completed = subprocess.run(
+                [sys.executable, str(ROOT / "tools" / "build_source_release.py"),
+                 "--output-dir", directory],
+                cwd=ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout)
+            archive = Path(directory) / f"XTA_v{CURRENT_VERSION}_complete_source.zip"
+            prefix = f"XTA_v{CURRENT_VERSION}/"
+            with zipfile.ZipFile(archive) as source:
+                manifest = json.loads(source.read(prefix + "RELEASE_MANIFEST.json"))
+                self.assertEqual(manifest["version"], CURRENT_VERSION)
+                self.assertEqual(manifest["launcher"], CURRENT_LAUNCHER)
+                for name in (CURRENT_LAUNCHER, "ARCHITECTURE.md", ".gitattributes",
+                             "native/README.md", "native/README_QAT.md", "native/README_QPL.md",
+                             "XTA/examples/external_augmentations/README.md"):
+                    with self.subTest(member=name):
+                        expected = (ROOT / name).read_bytes()
+                        self.assertEqual(source.read(prefix + name), expected)
+                        self.assertEqual(manifest["files"][name], hashlib.sha256(expected).hexdigest())
+                for report in SCRATCH_REPORTS:
+                    self.assertNotIn(prefix + report, source.namelist())
+                    self.assertNotIn(report, manifest["files"])
+                self.assertEqual(
+                    [name for name in source.namelist() if name.endswith("_SLURM.py")],
+                    [prefix + CURRENT_LAUNCHER],
+                )
 
     def test_tools_and_tests_do_not_use_release_or_sample_filenames(self) -> None:
         import re

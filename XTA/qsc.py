@@ -13,41 +13,40 @@ the coverage guarantee below currently applies to spherical voxel coordinates.
 Sampling bound
 --------------
 The inverse map S from one normalized face to the unit sphere is globally
-Lipschitz with conservative Euclidean constant L = 5/3. To see this, rotate
-each of the four face sectors to u=p>=|v|, set t=v/p, and write
+1-Lipschitz in Euclidean norm. A reproducible exact-rational certificate is
+in tools/certify_qsc_lipschitz.py; its acceptance uses no floating-point
+trigonometry or sampled-derivative maxima.
 
-    k=pi*t/12; theta=atan(sin(k)/(cos(k)-1/sqrt(2)))
-    D=1-cos(theta)/sqrt(1+cos(theta)**2); H=sqrt(D*(2-p*p*D))
-    cos(phi)=1-p*p*D.
+Rotate/reflect each face sector to u=p, v=p*t with 0<=p,t<=1. Put a=pi/12,
+b=1/sqrt(2), z=1-b*cos(a*t), D=2-1/(2*z), B=D'(t), H**2=D*(2-p*p*D).
+The Jacobian in an orthonormal tangent basis is
 
-Here |t|<=1, 0<=p<=1, D is between 1-1/sqrt(2) and
-1-1/sqrt(3), H**2>=1/2, and theta'(t)<0.9. Differentiating gives
-D_theta=sin(theta)/(1+cos(theta)**2)**(3/2), |D_theta|<0.385,
+    [(2*D-t*B)/H, B/H]
+    [-t*H*a/D,    H*a/D].
 
-    phi_u=(2*D-t*D_theta*theta')/H; phi_v=D_theta*theta'/H
-    sin(phi)*theta_u=-t*H*theta'; sin(phi)*theta_v=H*theta'.
+Its determinant is pi/6. Its squared Frobenius norm is Q/H**2+C*H**2,
+where Q=(2*D-t*B)**2+B**2 and C=(1+t*t)*a*a/(D*D). Convexity in H**2
+reduces the maximum over p to p=0 and p=1. The certificate encloses both
+endpoint expressions on 64 closed t intervals using rational arithmetic,
+3<pi<22/7, square-checked rational bounds on b, and alternating Taylor
+remainder bounds. Every interval has trace<5/4. Squared singular values
+therefore have sum<5/4 and product (pi/6)**2>1/4 and <1; both are <1.
+Sector continuity and integration along a face segment include boundaries
+and the center in the global bound.
 
-The subtracted term in phi_u is nonnegative and smaller than 2*D.
-Consequently phi_u**2<1.08, phi_v**2<0.241, and each of the last
-two squared derivatives is <0.685. Since the spherical metric is
-dphi**2+sin(phi)**2*dtheta**2, the Jacobian's squared Frobenius norm
-is <2.691<25/9. Sector rotations preserve this bound, continuity extends
-it to their boundaries and the center, and integrating along a face segment
-proves the stated global bound. This is an analytic bound, not a grid probe.
+An endpoint-inclusive grid of n intervals puts any direction within sqrt(2)/n
+of a sample direction. With maximum shell gap g and both annulus endpoints
+present, every point of radius rho has a shell r with |rho-r|<=g/2. Both
+r and rho are bounded by the outer radius R, hence
 
-An endpoint-inclusive grid of n intervals per face puts any direction within
-L*sqrt(2)/n of a sample direction. If consecutive shell radii have gaps <=1
-and include both annulus endpoints, any source voxel center of radius rho
-has a shell r with |rho-r|<=1/2. Choosing even n>=3*sqrt(r*(r+1/2)) yields
+    ||rho*d-r*d_sample||**2 <= g*g/4 + 2*(R/n)**2.
 
-    ||rho*d-r*d_sample||**2
-      = (rho-r)**2 + rho*r*||d-d_sample||**2
-      <= 1/4 + 50/81 = 281/324 < 1.
-
-Thus every voxel center in that annulus is strictly inside some sample's
-trilinear footprint: all three coordinate differences are <1 and its weight
-is positive. This does not claim nearest-neighbor categorical coverage, or
-coverage after downsampling the proven native input grid.
+The coverage planner in spherical_sampling retains the earlier conservative
+budget 281/324<1 while jointly selecting n and shell count. The legacy
+qsc_face_intervals and unit-gap grid remain available for dense sampling.
+Every covered voxel thus has positive trilinear input weight. This is not
+nearest-neighbor categorical coverage or coverage after arbitrary cropping
+or downsampling of the proven native grid.
 """
 from __future__ import annotations
 
@@ -67,7 +66,7 @@ QSC_FACE_BASES = (
     ((0., 0., 1.), (0., 1., 0.), (-1., 0., 0.)),
     ((0., 0., -1.), (0., 1., 0.), (1., 0., 0.)),
 )
-QSC_INVERSE_LIPSCHITZ = 5.0 / 3.0
+QSC_INVERSE_LIPSCHITZ = 1.0
 _BASES = np.asarray(QSC_FACE_BASES, dtype=np.float64)
 _BASES.flags.writeable = False
 _INV_SQRT2 = 1.0 / math.sqrt(2.0)
@@ -236,7 +235,7 @@ def qsc_inverse(face, u, v) -> np.ndarray:
 
 
 def qsc_face_intervals(radius: float) -> int:
-    """Even face-grid interval count proving annular trilinear coverage.
+    """Legacy dense even interval count proving annular trilinear coverage.
 
     Use n+1 sample centers per side, including -1 and +1. Shell gaps must
     be <=1 and both annulus endpoints must be present; see the module proof.

@@ -13,6 +13,23 @@ TTA_RUN_MANIFEST_SCHEMA = "xta.v21.run_manifest/1"
 TTA_VOXEL_COUNT_SCHEMA = "xta.v18.voxel_count/1"
 
 
+def projection_sampling_record(view: Any) -> dict[str, Any]:
+    """Omit legacy defaults so dense raster-plan identities remain stable."""
+    policy = str(getattr(view, 'sampling_policy', 'dense'))
+    reason = str(getattr(view, 'sampling_reason', ''))
+    if policy == 'dense' and not reason:
+        return {}
+    return {'projection_sampling': {
+        'policy': policy,
+        'certificate': str(getattr(view, 'sampling_certificate', '')),
+        'squared_error_bound': float(getattr(view, 'sampling_error_bound_sq', 0.0)),
+        'dense_reference_frames': int(getattr(view, 'sampling_reference_frames', 0)),
+        'reference_scope': 'spherical_cube_group' if str(view.family) == 'spherical' else 'view_trajectory',
+        'fallback_reason': reason,
+        'coverage_basis': 'positive native intensity interpolation support; not categorical predictions',
+    }}
+
+
 _VIEW_FIELDS = (
     "name",
     "physical_view_name",
@@ -45,6 +62,8 @@ _VIEW_FIELDS = (
     "azimuthal_request_token",
     "tta_aug_id",
     "tta_angle_deg",
+    "augmentation_pass",
+    "augmentation_base_view",
 )
 
 _RADIAL_VIEW_FIELDS = (
@@ -63,8 +82,11 @@ def radial_view_manifest_record(view: Any) -> dict[str, Any] | None:
     for field in _RADIAL_VIEW_FIELDS:
         value = getattr(view, field)
         record[field] = list(value) if isinstance(value, tuple) else value
+    if int(getattr(view, 'radial_global_count', 0)):
+        record['radial_global_count'] = int(view.radial_global_count)
     return {
         **record,
+        **projection_sampling_record(view),
         "source_shape_t_y_x": [int(view.full_t), int(view.full_h), int(view.full_w)],
         "center_x_y": [float(view.center_x), float(view.center_y)],
         "native_patch_shape_h_w": [int(view.src_h), int(view.src_w)],
@@ -109,6 +131,7 @@ def spherical_view_manifest_record(view: Any) -> dict[str, Any] | None:
         record[field] = list(value) if isinstance(value, tuple) else value
     return {
         **record,
+        **projection_sampling_record(view),
         "source_shape_t_y_x": [int(view.full_t), int(view.full_h), int(view.full_w)],
         "center_x_y_t": [
             (int(view.full_w) - 1) / 2.0,
@@ -310,6 +333,7 @@ def _view_record(view: Any) -> dict[str, Any]:
     spherical = spherical_view_manifest_record(view)
     if spherical is not None:
         record.update(spherical)
+    record.update(projection_sampling_record(view))
     return record
 
 

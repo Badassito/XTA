@@ -3,7 +3,7 @@
 XTA provides test-time augmentation (TTA), pretraining augmentation (PTA), and
 label-time augmentation (LTA) for volumes. The implementation lives in the
 importable `XTA` package. The versioned launcher
-`GPT-6-Astra-Ultra_v21.1.2_SLURM.py`, installed `xta` command, and `python -m XTA`
+`GPT-6-Astra-Ultra_v22.0.0_SLURM.py`, installed `xta` command, and `python -m XTA`
 all enter `XTA.cli.run()`.
 
 This document describes implemented behavior, ownership, and operating controls.
@@ -13,6 +13,34 @@ runs are kept in the local workspace's ongoing, un-versioned
 repository. Accepted findings about behavior, ownership, operating controls, and
 validation are incorporated here before superseded experiment notes are removed.
 The log retains outcomes, limitations, source identities, and evidence locations.
+
+TTA and PTA share the external GPU policy selector. In TTA,
+`--augmentation_ratio N` produces one base pass and N-1 independent policy
+passes, with separate NRRDs and inverse-validity support sidecars. Augmented
+passes contribute to the terminal union and are excluded from interpolation.
+Full-frame policy groups admit all of their independent parent canvases together.
+Workers write each pass directly into its own shared parent slice window after
+GPU inverse mapping. The coordinator receives completion metadata and skips the
+extra temporary-mask merge. Policy mask retirement computes row/column occupancy
+on CUDA and copies the uniquely owned window once; seam contributions retain OR
+semantics. The explicit GPU direct-union disable switch retains file results.
+Coverage sidecars use streaming, lossless NPZ compression at level 1 to reduce
+publication CPU time while preserving the existing arrays and metadata schema.
+Each parent retains memory credit through postprocessing and retires after its
+immutable component backing is published. Admission counts groups for the view
+limit and all passes for the byte limit; a policy group must fit the total window.
+The window is clamped to physical/cgroup RAM after accounting for outstanding
+fallback task files, seam buffers, support compression, persistent D2H staging,
+inference buffers, output and postprocessing.
+External-policy runs request a 384 GiB total dense window by default so a large
+four-pass group can overlap its predecessor's postprocessing. Explicit
+`YOLO_TTA_DIRECT_UNION_TOTAL_GIB` settings still take precedence, and the physical
+RAM clamp can lower the resolved limit. The inference byte limit is separate.
+`augmentation_support/parent_memory_plan.json` records the resolved allowances.
+This bounds active canvases; retained component stores and saved outputs consume
+additional filesystem space throughout the run. Memory-backed scratch or output
+also charges those retained files against RAM. Keeping temporary artifacts disables
+bounded retirement and preserves the aggregate file-mode memory guard.
 
 ## Execution model
 
@@ -44,6 +72,7 @@ All module names below are relative to `XTA`.
 | Spherical projection | `spherical_projection`, `spherical_projection_bounds`, `spherical_projection_cpu`, `spherical_projection_cuda`, `spherical_preflight`: admission, conservative bounds, CPU/CUDA pulls, and preflight |
 | Model execution | `inference`, `inference_backends`, `cuda_backend`: backend contracts, model execution, mask payloads, and resident CUDA rendering |
 | TTA scheduling | `pipeline`, `tta_scheduler`, `tta_prediction`, `tta_lifecycle`: preparation, process admission, source staging, and run-resource ownership |
+| TTA external policies | `augmentation_policy`, `tta_augmentation_config`, `tta_augmentation`, `tta_augmentation_cuda`, `tta_augmentation_retirement`, `tta_augmentation_runtime`: shared policy identity, seed scopes, fused conservative inverse maps, and bounded render-once policy fan-out with asynchronous support retirement |
 | TTA completion | `assembly`, `tta_terminal`, `tta_outputs`: view/tile assembly, physical-view terminal fusion, and settled-artifact teardown |
 | Sparse components | `interpolation`, `topology`, `topology_runs`, `projection_queue`: interpolation, component membership/adjacency, and bounded projection handoff |
 | CUDA component work | `cuda_interpolation`, `cuda_d1`, `cuda_finalization`: bridge painting/radius work, owner-GPU bitsets, and distributed finalization contracts |
@@ -134,8 +163,9 @@ family described above.
 `--radial_min_radius auto` resolves to `imgsz/(4*pi)` working voxels. The outer
 radius is `(min(plane_height, plane_width)-1)/2`, centered on the source
 voxel-center grid. The modeled domain is the annulus between a finite positive
-minimum and that outer radius. Shells include both endpoints with radial gaps of
-at most one voxel; arc-length and height sampling retain one-voxel spacing.
+minimum and that outer radius. Dense shells include both endpoints with radial
+gaps of at most one voxel; coverage mode uses certified wider gaps. Arc-length
+and height sampling retain one-voxel spacing.
 
 Each shell is covered by `imgsz` square intrinsic patches. Circumferential
 sampling is periodic across the seam, the final height band overlaps, and short
@@ -166,13 +196,14 @@ Spherical tilts rotate the cube charts rigidly: positive vertical tilt rotates
 about +X, and positive horizontal tilt about -Y. The center is
 `((W-1)/2, (H-1)/2, (T-1)/2)` and maximum radius is `(min(T,H,W)-1)/2` in working
 coordinates. `--spherical_min_radius auto` independently resolves to
-`imgsz/(4*pi)`. Positive finite radii cover the declared annulus, include both
-endpoints, and have gaps no larger than one voxel.
+`imgsz/(4*pi)`. Positive finite radii cover the declared annulus and include both
+endpoints. Dense mode has gaps no larger than one voxel; coverage mode jointly
+certifies its shell gaps and face lattice.
 
 The chart is the equal-area O'Neill-Laubscher Quadrilateralized Spherical Cube
 used by [PROJ](https://proj.org/en/stable/operations/projections/qsc.html).
 `qsc` implements the unit-sphere mapping; `spherical_geometry` applies the
-source-volume pose. Every face uses an endpoint-inclusive grid sized for outer
+source-volume pose. Dense mode uses an endpoint-inclusive grid sized for outer
 radius R: the interval count is the smallest even `n >= 3*sqrt(R*(R+1/2))`.
 Fixed `imgsz` patches cover its `n+1` nodes per axis, overlap at the final patch,
 and center/zero-pad smaller faces. All radii share the same face lattice and
@@ -184,11 +215,23 @@ before source-space OR. Whole-shell stitching and neighboring-face halos are not
 part of this path; model quality across patch and face boundaries is a separate
 qualification from coordinate coverage.
 
-The QSC inverse has conservative Euclidean Lipschitz bound 5/3. Combined with the
-radius spacing, the lattice places each working-voxel center in the annulus
+The original dense construction used the conservative QSC inverse Lipschitz
+bound 5/3. Combined with its radius spacing, that lattice places each working-voxel center in the annulus
 within squared distance `281/324 < 1` of a native sample. This establishes
 positive trilinear input weight; categorical sampling follows its separate
 nearest-neighbor policy.
+
+TTA now defaults to `--projection_sampling coverage`; `dense` retains the
+preceding schedules and remains the default of shared geometry APIs/PTA/LTA.
+An exact-rational certificate tightens the QSC inverse bound to 1. The planner
+jointly chooses fixed face intervals and uniform shell spacing while retaining
+the 281/324 sample-distance budget. Radial uses a certified larger shell gap;
+eligible full-native upright auto-Azimuthal sweeps use a larger angular gap and
+native pull projection, bypassing D1 nearest scatter. Both annular endpoints and
+independent trajectory outputs are retained. Native input support is distinct
+from categorical/model coverage; changed channel/interpolation physical spacing
+needs model-quality qualification. Mathematical derivations and validation
+reports are retained in the corresponding Scratch experiment directories.
 
 Native CUDA rendering reuses direction/validity plans across radii in a bounded
 256 MiB cache. FP64 plans are assembled in 64-row host strips and uploaded as
@@ -273,13 +316,13 @@ policy, affine, shape, and bbox requirements. Setup/capability refusal before da
 consumption uses the generic route. Failures after native inference starts abort
 that task without replaying model work.
 
-### Parent memory admission and Spherical retirement
+### Parent memory admission and source projection retirement
 
 Admission accounts for committed native parent capacity before dispatch, including
 shared slice-write accumulators and retained Radial publication grants. Active
 parents receive completion priority. View and byte credits bound preparation,
 inference, completed canvases, and projection independently. Explicit file-result
-mode validates aggregate canvas capacity against the dense limit.
+tasks without bounded retirement validate aggregate canvas capacity against the dense limit.
 Canvas credits bound committed canvas capacity; transient rendering/projection
 allocations and total process RSS require additional headroom.
 
@@ -287,7 +330,10 @@ Cacheable Spherical direct-union tasks prefer a worker's last queued parent or a
 distinct newly admitted parent. This placement hint is subordinate to ownership,
 memory limits, hybrid/D1 rules, and work stealing.
 
-Live Spherical projectors can request an exclusive worker-GPU retirement lease.
+Live Spherical and Radial projectors can request an exclusive worker-GPU retirement
+lease. When retained parents block all new inference, an idle GPU is eligible even
+while inference priority remains active. Existing pressure controls and telemetry
+retain their Spherical names and govern the shared retirement queue.
 Completed-canvas pressure arms at 75% of the dense window and clears at 62.5%.
 Continuously refreshed demand becomes eligible for age-based admission after
 30 seconds. Workers finish queued inference before lending the GPU; stage leases,
@@ -297,8 +343,17 @@ Eligible requests are FIFO. A drained worker serves at most two projectors befor
 returning to inference, with a two-second successor handoff window. Unrefreshed
 requests expire after 30 seconds; failed admission applies a ten-second cooldown.
 CPU projection continues while awaiting admission and rechecks after eight
-published slices or one second. Promotion cancels unpublished CPU work at bounded
-pull-chunk boundaries and joins all readers before releasing borrowed sources.
+published slices or one second. Radial also retries once after CPU setup, before
+its first block. Promotion resumes at the first unpublished source slice and
+joins all CPU readers before GPU publication. Spherical and NumPy Radial readers
+can cancel between bounded pull chunks; compiled Radial readers finish their
+already-running output block. Failed CUDA preflight retains CPU progress, while
+failures after GPU publication begins abort rather than replaying a partial output.
+
+Dense parent credits remain held while native masks are projected and immutable
+component stores are built. Final NRRD compression is submitted asynchronously
+after the component store exists; its completion is not a prerequisite for
+releasing those dense credits or dispatching the next inference group.
 
 ### Streaming terminal fusion
 

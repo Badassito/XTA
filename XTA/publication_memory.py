@@ -11,8 +11,14 @@ from .workspace import _env_flag, _env_float, _read_meminfo_bytes, available_ano
 
 def publication_ram_headroom():
     """Use physical/cgroup headroom only; spare swap is not a RAM cache budget."""
-    return max(0, min(int(_read_meminfo_bytes().get('MemAvailable', 0)),
-                      int(available_anon_work_bytes())))
+    info = _read_meminfo_bytes()
+    if 'MemAvailable' not in info and os.name == 'nt':
+        try:
+            import psutil
+            return max(0, int(psutil.virtual_memory().available))
+        except (ImportError, OSError, ValueError, AttributeError):
+            return 0
+    return max(0, min(int(info.get('MemAvailable', 0)), int(available_anon_work_bytes())))
 
 
 def native_fullframe_dense_reserve(tasks, *, total_dense_limit, min_conf=0.,
@@ -20,38 +26,182 @@ def native_fullframe_dense_reserve(tasks, *, total_dense_limit, min_conf=0.,
                                    bounded_retirement=True):
     """Charge admitted native parents separately from packed D1 publication grants.
 
-    File-mode compatibility has no lifetime admission. Refuse a workload whose
-    aggregate parent canvases exceed the dense window instead of trusting free
-    RAM sampled before lazily allocated zero pages have been touched.
+    Policy groups share the retirement window only when every parent is
+    explicitly enrolled in scheduler admission with the same storage contract.
+    Legacy file tasks still have no lifetime bound and reserve all canvases.
+    This charges file-backed canvases too: a pathname on tmpfs is still RAM,
+    and dirty pages on ordinary scratch are not immediately reclaimable.
     """
     parents = {}
+    policy_groups = {}
     count = (2 if float(min_conf) > 0 else 1) + (
         (3 if nrrd_layers else 1) if dense_tiling else 0)
-    for task in tasks:
-        mode = str(task.get('result_mode', 'file'))
-        if task.get('kind') != 'fullframe' or mode not in ('file', 'direct_union', HYBRID_DEFERRED_RESULT_MODE):
-            continue
-        key = (str(task['model_name']), str(task['view'].name))
-        shape = tuple(int(v) for v in task['processing_shape'])
-        if len(shape) != 3 or min(shape) <= 0:
-            raise ValueError('Native parent memory plan requires a positive 3D processing shape')
-        entry = (mode, math.prod(shape) * count)
-        if key in parents and parents[key] != entry:
-            raise ValueError(f'Native parent memory plan has inconsistent tasks for {key}')
-        parents[key] = entry
-    unbounded = sum(size for mode, size in parents.values() if mode == 'file')
+    has_policy_groups = False
+    for grouped_task in tasks:
+        siblings = grouped_task.get('augmentation_pass_tasks') or ()
+        has_policy_groups = has_policy_groups or bool(siblings)
+        members = (grouped_task, *siblings)
+        if bounded_retirement and any(task.get('bounded_parent_admission', False) for task in members):
+            if not all(task.get('bounded_parent_admission', False)
+                       and task.get('kind') == 'fullframe' for task in members):
+                raise ValueError('Native policy memory plan requires admission for every sibling parent')
+            if {str(task.get('result_mode', 'file')) for task in members} not in ({'file'}, {'direct_union'}):
+                raise ValueError('Native policy memory plan requires a uniform file or shared-parent contract')
+        group = {}
+        for task in members:
+            mode = str(task.get('result_mode', 'file'))
+            if task.get('kind') != 'fullframe' or mode not in ('file', 'direct_union', HYBRID_DEFERRED_RESULT_MODE):
+                continue
+            key = (str(task['model_name']), str(task['view'].name))
+            shape = tuple(int(v) for v in task['processing_shape'])
+            if len(shape) != 3 or min(shape) <= 0:
+                raise ValueError('Native parent memory plan requires a positive 3D processing shape')
+            bounded_policy = bool(mode in ('file', 'direct_union') and bounded_retirement
+                                  and task.get('bounded_parent_admission', False))
+            entry = (mode, math.prod(shape) * count, bounded_policy)
+            if bounded_policy and key in group:
+                raise ValueError(f'Native policy memory plan repeats a sibling parent: {key}')
+            if key in parents and parents[key] != entry:
+                raise ValueError(f'Native parent memory plan has inconsistent tasks for {key}')
+            parents[key] = entry
+            group[key] = entry
+        if any(entry[2] for entry in group.values()):
+            if not all(entry[2] for entry in group.values()):
+                raise ValueError('Native policy memory plan requires admission for every sibling parent')
+            group_key = frozenset(group)
+            for key in group:
+                previous = policy_groups.get(key)
+                if previous is not None and previous != group_key:
+                    raise ValueError(f'Native policy parent belongs to inconsistent admission groups: {key}')
+                policy_groups[key] = group_key
+            group_bytes = sum(entry[1] for entry in group.values())
+            if group_bytes > int(total_dense_limit):
+                raise RuntimeError(
+                    f'External-policy parent group requires {group_bytes / GIB:.1f} GiB '
+                    f'of simultaneous dense canvases, exceeding the '
+                    f'{int(total_dense_limit) / GIB:.1f} GiB dense admission limit. '
+                    'All passes of one group must fit together to reuse each rendered batch. '
+                    'Reduce --augmentation_ratio or raise YOLO_TTA_DIRECT_UNION_TOTAL_GIB '
+                    'only with sufficient physical/cgroup memory headroom.')
+    unbounded = sum(size for mode, size, bounded in parents.values() if mode == 'file' and not bounded)
     if unbounded > int(total_dense_limit) and len(parents) > 1:
+        advice = (
+            'External-policy passes require bounded parent retirement to share a memory window. '
+            'Run without retained temporary artifacts, reduce --augmentation_ratio or selected '
+            'views/angles, or increase YOLO_TTA_DIRECT_UNION_TOTAL_GIB only with sufficient '
+            'real memory headroom. '
+            if has_policy_groups else
+            'Enable YOLO_TTA_GPU_WORKER_DIRECT_UNION=1 for bounded shared unions, '
+            'or reduce the requested native views. '
+        )
         raise RuntimeError(
             f'File-mode full-frame unions require {unbounded / GIB:.1f} GiB of retained '
             f'parent canvases, exceeding the {int(total_dense_limit) / GIB:.1f} GiB dense limit. '
-            'Enable YOLO_TTA_GPU_WORKER_DIRECT_UNION=1 for bounded shared unions, '
-            'or reduce the requested native views. File-mode unions have no parent admission.')
-    shared = [size for mode, size in parents.values() if mode != 'file']
-    # One oversized shared parent may run alone, matching scheduler admission.
-    admitted = min(sum(shared), max(int(total_dense_limit), max(shared, default=0)))
+            + advice + 'File-mode unions have no parent admission.')
+    shared = [size for mode, size, bounded in parents.values() if mode != 'file' or bounded]
+    # Preserve the established emergency lane for ordinary shared parents.
+    # Policy groups require their complete set of passes to fit the hard window.
+    oversized_shared = max((size for mode, size, bounded in parents.values()
+                            if mode != 'file' and not bounded), default=0)
+    admitted = min(sum(shared), max(int(total_dense_limit), oversized_shared))
     if not bounded_retirement:
         admitted = sum(shared)
     return int(unbounded + admitted)
+
+
+def policy_parent_memory_plan(tasks, *, requested_dense_limit, available_ram_bytes,
+                              source_shape, output_reserve_bytes=0,
+                              parent_transient_reserve_bytes=0,
+                              worker_buffer_reserve_bytes=0, batch_size=1):
+    """Bound policy parents and auxiliary outputs within physical/cgroup RAM.
+
+    Policy full-frame leases partition each parent and cannot be split again.
+    Shared workers write directly into admitted parent windows; no second copy
+    is retained for normal result masks. File compatibility additionally retains
+    at most one window's worth of results until coordinator collection. Explicit
+    azimuthal seam files remain charged under both storage contracts.
+    Packed support also includes its raw and pending compressed representations;
+    its ratio uses actual model-raster versus processing-plane dimensions.
+    Caller supplies RAM headroom without swap and the independently admitted
+    transient/output/batch bounds. Persistent output on tmpfs needs a separate
+    retained-storage budget; it cannot be treated as ordinary disk spill.
+    """
+    shape = tuple(int(v) for v in source_shape)
+    if len(shape) != 3 or min(shape) <= 0:
+        raise ValueError('Policy memory plan requires a positive 3D source shape')
+    coverage_numerator, coverage_denominator = 0, 1
+    results_numerator, results_denominator = 0, 1
+    for task in tasks:
+        if task.get('kind') != 'fullframe' or not task.get('augmentation_pass_tasks'):
+            continue
+        group = (task, *task['augmentation_pass_tasks'])
+        modes = {str(parent.get('result_mode', 'file')) for parent in group}
+        if modes not in ({'file'}, {'direct_union'}):
+            raise ValueError('Policy memory plan requires a uniform file or shared-parent contract')
+        marked = [bool(parent.get('bounded_parent_admission', False)) for parent in group]
+        if ((modes == {'direct_union'} or any(marked)) and not all(marked)):
+            raise ValueError('Policy memory plan requires admission for every sibling parent')
+        if not all(parent.get('kind') == 'fullframe' for parent in group):
+            raise ValueError('Policy parent memory plan cannot combine full-frame and tile outputs')
+        parent_plane_bytes = 0
+        support_bytes = 0
+        slices = max(1, int(task.get('slice_count', task['processing_shape'][0])))
+        padding = 0
+        if str(getattr(task.get('view'), 'family', '')) == 'azimuthal':
+            from .geometry import azimuthal_batch_padding_count
+            padding = int(azimuthal_batch_padding_count(task['view'], slices,
+                max(1, int(task.get('prediction_batch', batch_size))),
+                slice_offset=int(task.get('slice_start', 0))))
+        # Shared policy parents receive D2H directly into their disjoint window.
+        # Only explicit seam slots need separate files; fallback mode also keeps
+        # the normal task-window result until coordinator collection.
+        result_slices = padding + (0 if str(task.get('result_mode', 'file')) == 'direct_union' else slices)
+        if result_slices * results_denominator > results_numerator * slices:
+            results_numerator, results_denominator = result_slices, slices
+        for index, parent in enumerate(group):
+            plane_shape = tuple(int(v) for v in parent['processing_shape'])
+            if len(plane_shape) != 3 or min(plane_shape) <= 0:
+                raise ValueError('Policy memory plan requires positive 3D processing shapes')
+            # Counting only union canvases is conservative when confidence or
+            # tile category canvases make the admitted dense set larger.
+            parent_plane_bytes += plane_shape[1] * plane_shape[2]
+            settings = parent.get('augmentation_settings', task.get('augmentation_settings'))
+            if index and str(getattr(settings, 'coverage', 'packed')) != 'none':
+                raster = max(1, int(parent.get('out_size', max(plane_shape[1:]))))
+                support_bytes += raster * ((raster + 7) // 8)
+        # npz may expand incompressible support slightly. Include both its raw
+        # and compressed files; small per-file headers fit the safety margin.
+        numerator = 201 * support_bytes * (slices + padding)
+        denominator = 100 * parent_plane_bytes * slices
+        if numerator * coverage_denominator > coverage_numerator * denominator:
+            coverage_numerator, coverage_denominator = numerator, denominator
+
+    available = max(0, int(available_ram_bytes))
+    requested = max(0, int(requested_dense_limit))
+    safety = min(32 * GIB, max(64 * 1024**2, available // 32))
+    topology = 5 * math.prod(shape)
+    output = max(0, int(output_reserve_bytes))
+    transient = max(0, int(parent_transient_reserve_bytes))
+    workers = max(0, int(worker_buffer_reserve_bytes))
+    fixed = safety + topology + output + transient + workers
+    remaining = max(0, available - fixed)
+    denominator = coverage_denominator * results_denominator
+    numerator = (denominator + results_numerator * coverage_denominator
+                 + coverage_numerator * results_denominator)
+    # Individual ceilings below may add two bytes; keep that rounding inside RAM.
+    dense = min(requested, max(0, remaining - 2) * denominator // numerator)
+    results = (dense * results_numerator + results_denominator - 1) // results_denominator
+    coverage = (dense * coverage_numerator + coverage_denominator - 1) // coverage_denominator
+    return dict(requested_dense_limit_bytes=requested, available_ram_bytes=available,
+        dense_limit_bytes=dense, file_result_reserve_bytes=results,
+        coverage_reserve_bytes=coverage, safety_reserve_bytes=safety,
+        source_topology_reserve_bytes=topology, output_reserve_bytes=output,
+        parent_transient_reserve_bytes=transient, worker_buffer_reserve_bytes=workers,
+        fixed_reserve_bytes=fixed, total_reserve_bytes=fixed + dense + results + coverage,
+        file_result_ratio_numerator=results_numerator,
+        file_result_ratio_denominator=results_denominator,
+        coverage_ratio_numerator=coverage_numerator,
+        coverage_ratio_denominator=coverage_denominator)
 
 
 def retained_payload_plan(shapes, available, worker_count, publication_pending, unpack_bytes, *, cap=0, output_reserve_bytes=0, native_dense_reserve_bytes=0):

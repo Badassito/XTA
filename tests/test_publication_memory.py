@@ -96,6 +96,329 @@ class PublicationMemoryPlanTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    @staticmethod
+    def policy_tasks(groups=1, ratio=4, shape=(3072, 3072, 3072), leases=1, mode='file'):
+        """Production-size metadata only; never allocate the canvases."""
+        tasks = []
+        for group in range(groups):
+            passes = [dict(kind='fullframe', model_name='model',
+                view=SimpleNamespace(name=f'view{group}__policy{index}'),
+                processing_shape=shape, result_mode=mode, bounded_parent_admission=True)
+                for index in range(ratio)]
+            passes[0]['augmentation_pass_tasks'] = passes[1:]
+            tasks.extend(dict(passes[0], slice_start=index) for index in range(leases))
+        return tasks
+
+    @staticmethod
+    def cluster_policy_tasks():
+        """Reproduce the 144736 geometry using descriptors, never mask canvases."""
+        from XTA.config import (AzimuthalViewRequest, RadialViewRequest,
+                                SphericalViewRequest, TiltedViewGroup)
+        from XTA.geometry import (expand_views_into_policy_variants,
+                                  expand_views_into_tta_variants, view_processing_volume_shape)
+        from XTA.unification.runtime import compile_physical_views
+        axes = ('transverse', 'sagittal', 'coronal')
+        targets = axes + tuple('tilted_' + axis for axis in axes)
+        views = compile_physical_views(t_dim=2911, height=3064, width=3022,
+            cartesian_views=axes,
+            azimuthal_requests=tuple(AzimuthalViewRequest(target) for target in targets),
+            tilted_groups=(TiltedViewGroup(axes, (30.,), ('vertical', 'horizontal')),),
+            azimuthal_native_raster=3072,
+            radial_requests=tuple(RadialViewRequest(target) for target in targets),
+            radial_patch_size=3072,
+            spherical_requests=(SphericalViewRequest('transverse'), SphericalViewRequest('tilted_transverse')),
+            spherical_patch_size=3072, sampling_policy='coverage').views
+        tasks = []
+        for view in expand_views_into_tta_variants(views, [0]):
+            passes = [dict(kind='fullframe', model_name='model', view=copy,
+                processing_shape=view_processing_volume_shape(copy, 3072),
+                slice_start=0, slice_count=copy.num_slices, out_size=3072,
+                result_mode='direct_union', bounded_parent_admission=True)
+                for copy in expand_views_into_policy_variants([view], 4)]
+            passes[0]['augmentation_pass_tasks'] = passes[1:]
+            tasks.append(passes[0])
+        return tasks
+
+    @staticmethod
+    def cluster_policy_memory_plan(tasks, available_gib):
+        source = (1931, 3064, 3022)
+        available = int(available_gib * GIB)
+        sink = SimpleNamespace(max_workers=12, output_shape=source,
+            low_quality_specs=[SimpleNamespace(output_shape_t_y_x=(388,612,604))])
+        largest_transient = int(np.prod(source)) + 4*GIB
+        transient = max(largest_transient, min(available//8, 4*largest_transient))
+        workers = 4*max(256*1024**2, 3072**2*80) + 4*2*(2*16*3072**2 + 16)
+        return memory.policy_parent_memory_plan(tasks, requested_dense_limit=384*GIB,
+            available_ram_bytes=available, source_shape=source,
+            output_reserve_bytes=memory.publication_output_reserve(sink, 512*1024**2, 16*1024**2),
+            parent_transient_reserve_bytes=transient, worker_buffer_reserve_bytes=workers,
+            batch_size=1)
+
+    def test_cluster_384_gib_window_fits_actual_groups_and_remains_ram_guarded(self):
+        tasks = self.cluster_policy_tasks()
+        self.assertEqual(len(tasks), 110)
+        self.assertEqual(sum(task['slice_count'] for task in tasks), 160593)
+        largest = max(4*int(np.prod(task['processing_shape'])) for task in tasks)
+        self.assertAlmostEqual(largest/GIB, 155.56647767871618)
+        self.assertLess(2*largest, 384*GIB)
+        high = self.cluster_policy_memory_plan(tasks, 976.78)
+        self.assertEqual(high['dense_limit_bytes'], 384*GIB)
+        self.assertEqual(high['file_result_reserve_bytes'], 0)
+        self.assertAlmostEqual(high['total_reserve_bytes']/GIB, 707.002436, places=4)
+        self.assertLess(high['total_reserve_bytes'], high['available_ram_bytes'])
+        self.assertEqual(memory.native_fullframe_dense_reserve(tasks,
+            total_dense_limit=high['dense_limit_bytes']), 384*GIB)
+        low = self.cluster_policy_memory_plan(tasks, 300)
+        self.assertLess(low['dense_limit_bytes'], largest)
+        self.assertLessEqual(low['total_reserve_bytes'], low['available_ram_bytes'])
+        with self.assertRaisesRegex(RuntimeError, 'dense admission limit'):
+            memory.native_fullframe_dense_reserve(tasks, total_dense_limit=low['dense_limit_bytes'])
+
+    def test_cluster_384_gib_allows_postprocess_overlap_without_two_large_inference_groups(self):
+        from tests.test_tta_scheduler_boundary import _scheduler, _state
+        tasks = sorted(self.cluster_policy_tasks(),
+                       key=lambda task: int(np.prod(task['processing_shape'])), reverse=True)
+        first, second = tasks[:2]
+        state = _state()
+        scheduler = _scheduler(Path('metadata-only'), state=state, input_overrides={
+            'direct_union_inference_view_limit': 4,
+            'direct_union_inference_byte_limit': 128*GIB,
+            'direct_union_total_dense_byte_limit': 384*GIB})
+        self.assertTrue(scheduler.direct_union_task_admissible(first))
+        for parent in (first, *first['augmentation_pass_tasks']):
+            key = (parent['model_name'], parent['view'].name)
+            size = int(np.prod(parent['processing_shape']))
+            state.direct_union_inference_views.add(key)
+            state.direct_union_inference_bytes[key] = size
+            state.direct_union_backing_leases[key] = interpolation._DirectUnionBackingLease(key, size)
+            state.direct_union_admission_group_by_parent[key] = (first['model_name'], first['view'].name)
+        self.assertFalse(scheduler.direct_union_task_admissible(second))
+        for key in tuple(state.direct_union_inference_views):
+            state.direct_union_backing_leases[key].transition('inference', 'postprocess')
+            state.direct_union_postprocess_views.add(key)
+            state.direct_union_postprocess_bytes[key] = state.direct_union_inference_bytes.pop(key)
+        state.direct_union_inference_views.clear()
+        self.assertTrue(scheduler.direct_union_task_admissible(second))
+        old_scheduler = _scheduler(Path('metadata-only'), state=state, input_overrides={
+            'direct_union_inference_view_limit': 4,
+            'direct_union_inference_byte_limit': 128*GIB,
+            'direct_union_total_dense_byte_limit': 256*GIB})
+        self.assertFalse(old_scheduler.direct_union_task_admissible(second))
+
+    def test_detection_confidence_and_policy_profile_do_not_resize_parent_canvases(self):
+        tasks = self.policy_tasks(shape=(4747,2911,3022), mode='direct_union')
+        sizes = []
+        for confidence, profile in ((0.5, 'superheavy'), (0.8, 'baseline')):
+            for task in (tasks[0], *tasks[0]['augmentation_pass_tasks']):
+                task['conf'] = confidence
+                task['augmentation_settings'] = SimpleNamespace(coverage='packed', profile=profile)
+            sizes.append(memory.native_fullframe_dense_reserve(tasks,
+                total_dense_limit=384*GIB, min_conf=0))
+        self.assertEqual(sizes[0], sizes[1])
+        # --min_conf is different: positive values retain a confidence canvas.
+        self.assertEqual(memory.native_fullframe_dense_reserve(tasks,
+            total_dense_limit=384*GIB, min_conf=0.1), 2*sizes[0])
+
+    def test_policy_job_reserves_live_window_instead_of_all_future_parents(self):
+        # Fifty-four 4-pass cube groups have 5,832 GiB of logical canvases;
+        # their bounded scheduler window remains 256 GiB on both disk and tmpfs.
+        tasks = self.policy_tasks(groups=54, leases=4)
+        for memory_backed in (False, True):
+            with self.subTest(memory_backed=memory_backed), mock.patch.object(
+                    memory, 'scratch_dir_is_memory_backed', return_value=memory_backed):
+                self.assertEqual(memory.native_fullframe_dense_reserve(
+                    tasks, total_dense_limit=256*GIB), 256*GIB)
+
+    def test_policy_parent_accounting_deduplicates_leases_and_includes_confidence_tiles(self):
+        tasks = self.policy_tasks(shape=(2, 3, 7), leases=7)
+        for confidence, tiles, layers, canvases in ((0, False, False, 1),
+                (0.2, False, False, 2), (0, True, False, 2),
+                (0, True, True, 4), (0.2, True, True, 5)):
+            with self.subTest(confidence=confidence, tiles=tiles, layers=layers):
+                self.assertEqual(memory.native_fullframe_dense_reserve(tasks,
+                    total_dense_limit=10000, min_conf=confidence,
+                    dense_tiling=tiles, nrrd_layers=layers), 2*3*7*4*canvases)
+
+    def test_policy_group_must_fit_the_simultaneous_dense_window(self):
+        for mode in ('file', 'direct_union'):
+            with self.subTest(mode=mode):
+                tasks = self.policy_tasks(mode=mode)
+                self.assertEqual(memory.native_fullframe_dense_reserve(tasks,
+                    total_dense_limit=108*GIB), 108*GIB)
+                with self.assertRaisesRegex(RuntimeError, 'group requires 108.0 GiB.*107.0 GiB'):
+                    memory.native_fullframe_dense_reserve(tasks, total_dense_limit=107*GIB)
+
+    def test_policy_marker_cannot_claim_a_bound_without_retirement(self):
+        with self.assertRaisesRegex(RuntimeError, 'File-mode.*5832.0 GiB'):
+            memory.native_fullframe_dense_reserve(self.policy_tasks(groups=54),
+                total_dense_limit=256*GIB, bounded_retirement=False)
+
+    def test_partial_policy_group_admission_is_rejected(self):
+        tasks = self.policy_tasks(shape=(2, 3, 7))
+        tasks[0]['augmentation_pass_tasks'][0].pop('bounded_parent_admission')
+        with self.assertRaisesRegex(ValueError, 'admission for every sibling parent'):
+            memory.native_fullframe_dense_reserve(tasks, total_dense_limit=10000)
+
+    def test_shared_policy_groups_preserve_window_with_disk_or_ram_parent_backings(self):
+        tasks = self.policy_tasks(groups=54, leases=4, mode='direct_union')
+        for memfd in (False, True):
+            with self.subTest(memfd=memfd), mock.patch.object(memory,
+                    'memfd_workspace_enabled', return_value=memfd):
+                self.assertEqual(memory.native_fullframe_dense_reserve(tasks,
+                    total_dense_limit=256*GIB), 256*GIB)
+
+    def test_policy_group_must_have_one_storage_contract_and_complete_admission(self):
+        for fault in ('mixed', 'partial', 'unmarked_shared', 'tile_sibling', 'unsupported'):
+            tasks = self.policy_tasks(shape=(2,3,7), mode='direct_union')
+            base, copy = tasks[0], tasks[0]['augmentation_pass_tasks'][0]
+            if fault == 'mixed':
+                copy['result_mode'] = 'file'
+            elif fault == 'partial':
+                copy.pop('bounded_parent_admission')
+            elif fault == 'unmarked_shared':
+                for parent in (base, *base['augmentation_pass_tasks']):
+                    parent.pop('bounded_parent_admission')
+            elif fault == 'tile_sibling':
+                copy['kind'] = 'tile'
+            else:
+                copy['result_mode'] = 'd1_owner'
+            with self.subTest(fault=fault):
+                with self.assertRaises(ValueError):
+                    memory.policy_parent_memory_plan(tasks, requested_dense_limit=10000,
+                        available_ram_bytes=8*GIB, source_shape=(2,3,7))
+                # Unmarked ordinary shared tasks retain their existing accounting
+                # contract, but never enter the policy-specific physical planner.
+                if fault != 'unmarked_shared':
+                    with self.assertRaises(ValueError):
+                        memory.native_fullframe_dense_reserve(tasks, total_dense_limit=10000)
+
+    def test_policy_group_cannot_repeat_a_sibling_canvas(self):
+        tasks = self.policy_tasks(mode='direct_union')
+        tasks[0]['augmentation_pass_tasks'].append(tasks[0]['augmentation_pass_tasks'][0])
+        with self.assertRaisesRegex(ValueError, 'repeats a sibling parent'):
+            memory.native_fullframe_dense_reserve(tasks, total_dense_limit=256*GIB)
+
+    def test_policy_and_shared_parents_reserve_one_common_window(self):
+        tasks = self.policy_tasks(groups=2)
+        tasks.append(dict(kind='fullframe', model_name='model',
+            view=SimpleNamespace(name='shared'), processing_shape=(3072,3072,3072),
+            result_mode='direct_union'))
+        self.assertEqual(memory.native_fullframe_dense_reserve(tasks,
+            total_dense_limit=200*GIB), 200*GIB)
+
+    def test_policy_parent_cannot_be_charged_under_two_different_groups(self):
+        tasks = self.policy_tasks(groups=2, shape=(2, 3, 7))
+        tasks[1]['augmentation_pass_tasks'][0] = tasks[0]['augmentation_pass_tasks'][0]
+        with self.assertRaisesRegex(ValueError, 'inconsistent admission groups'):
+            memory.native_fullframe_dense_reserve(tasks, total_dense_limit=10000)
+
+    def test_policy_leases_cannot_disagree_about_parent_geometry(self):
+        tasks = self.policy_tasks(shape=(2, 3, 7), leases=2)
+        tasks[1]['processing_shape'] = (3, 3, 7)
+        with self.assertRaisesRegex(ValueError, 'inconsistent tasks'):
+            memory.native_fullframe_dense_reserve(tasks, total_dense_limit=10000)
+
+    def test_physical_policy_plan_reserves_results_support_and_final_work(self):
+        plan = memory.policy_parent_memory_plan(self.policy_tasks(groups=54),
+            requested_dense_limit=256*GIB, available_ram_bytes=1024*GIB,
+            source_shape=(3072,3072,3072), output_reserve_bytes=32*GIB,
+            parent_transient_reserve_bytes=192*GIB, worker_buffer_reserve_bytes=4*GIB)
+        self.assertEqual(plan['dense_limit_bytes'], 256*GIB)
+        self.assertEqual(plan['file_result_reserve_bytes'], 256*GIB)
+        self.assertEqual(plan['source_topology_reserve_bytes'], 135*GIB)
+        self.assertGreater(plan['coverage_reserve_bytes'], 48*GIB)
+        self.assertLessEqual(plan['total_reserve_bytes'], 1024*GIB)
+
+    def test_shared_policy_outputs_do_not_reserve_a_second_parent_canvas(self):
+        kwargs = dict(requested_dense_limit=256*GIB, available_ram_bytes=1024*GIB,
+            source_shape=(3072,3072,3072), output_reserve_bytes=32*GIB,
+            parent_transient_reserve_bytes=192*GIB, worker_buffer_reserve_bytes=4*GIB)
+        fallback = memory.policy_parent_memory_plan(self.policy_tasks(groups=54), **kwargs)
+        shared = memory.policy_parent_memory_plan(
+            self.policy_tasks(groups=54, mode='direct_union'), **kwargs)
+        self.assertEqual(fallback['dense_limit_bytes'], shared['dense_limit_bytes'])
+        self.assertEqual(fallback['file_result_reserve_bytes'], 256*GIB)
+        self.assertEqual(shared['file_result_reserve_bytes'], 0)
+        self.assertEqual(shared['file_result_ratio_numerator'], 0)
+        self.assertEqual(fallback['coverage_reserve_bytes'], shared['coverage_reserve_bytes'])
+        self.assertEqual(fallback['fixed_reserve_bytes'], shared['fixed_reserve_bytes'])
+        self.assertEqual(fallback['total_reserve_bytes'] - shared['total_reserve_bytes'], 256*GIB)
+        self.assertLessEqual(shared['total_reserve_bytes'], kwargs['available_ram_bytes'])
+
+    def test_low_ram_shrinks_policy_window_before_any_parent_allocation(self):
+        tasks = self.policy_tasks(groups=54)
+        plan = memory.policy_parent_memory_plan(tasks, requested_dense_limit=256*GIB,
+            available_ram_bytes=300*GIB, source_shape=(3072,3072,3072),
+            output_reserve_bytes=32*GIB, parent_transient_reserve_bytes=64*GIB,
+            worker_buffer_reserve_bytes=4*GIB)
+        self.assertLess(plan['dense_limit_bytes'], 108*GIB)
+        self.assertLessEqual(plan['total_reserve_bytes'], 300*GIB)
+        with self.assertRaisesRegex(RuntimeError, 'group requires 108.0 GiB'):
+            memory.native_fullframe_dense_reserve(tasks,
+                total_dense_limit=plan['dense_limit_bytes'])
+
+    def test_tiny_policy_smoke_does_not_inherit_a_32_gib_fixed_margin(self):
+        tasks = self.policy_tasks(shape=(8,8,8))
+        plan = memory.policy_parent_memory_plan(tasks, requested_dense_limit=256*GIB,
+            available_ram_bytes=8*GIB, source_shape=(8,8,8),
+            parent_transient_reserve_bytes=2*GIB)
+        self.assertEqual(plan['safety_reserve_bytes'], GIB//4)
+        self.assertLessEqual(plan['total_reserve_bytes'], 8*GIB)
+        self.assertEqual(memory.native_fullframe_dense_reserve(tasks,
+            total_dense_limit=plan['dense_limit_bytes']), 4*8**3)
+
+    def test_policy_support_budget_uses_raster_dimensions_instead_of_parent_ratio(self):
+        tasks = self.policy_tasks(shape=(32,8,8))
+        kwargs = dict(requested_dense_limit=256*GIB, available_ram_bytes=16*GIB,
+                      source_shape=(32,8,8))
+        normal = memory.policy_parent_memory_plan(tasks, **kwargs)
+        for task in (tasks[0], *tasks[0]['augmentation_pass_tasks']):
+            task['out_size'] = 64
+        large_raster = memory.policy_parent_memory_plan(tasks, **kwargs)
+        self.assertLess(large_raster['dense_limit_bytes'], normal['dense_limit_bytes']//4)
+        self.assertGreater(large_raster['coverage_reserve_bytes'],
+                           12*large_raster['dense_limit_bytes'])
+        self.assertLessEqual(large_raster['total_reserve_bytes'], 16*GIB)
+        for task in (tasks[0], *tasks[0]['augmentation_pass_tasks']):
+            task['augmentation_settings'] = SimpleNamespace(coverage='none')
+        disabled = memory.policy_parent_memory_plan(tasks, **kwargs)
+        self.assertEqual(disabled['coverage_reserve_bytes'], 0)
+        self.assertGreater(disabled['dense_limit_bytes'], normal['dense_limit_bytes'])
+
+    def test_unknown_or_insufficient_ram_cannot_admit_a_policy_parent(self):
+        tasks = self.policy_tasks(shape=(8,8,8))
+        for available in (0, 1024):
+            with self.subTest(available=available):
+                plan = memory.policy_parent_memory_plan(tasks, requested_dense_limit=256*GIB,
+                    available_ram_bytes=available, source_shape=(8,8,8))
+                self.assertEqual(plan['dense_limit_bytes'], 0)
+                with self.assertRaisesRegex(RuntimeError, 'dense admission limit'):
+                    memory.native_fullframe_dense_reserve(tasks, total_dense_limit=0)
+
+    def test_azimuthal_tail_seam_buffers_are_included_in_physical_plan(self):
+        from XTA.geometry import ViewInfo
+        tasks = self.policy_tasks(shape=(5,8,8))
+        base = tasks[0]
+        for index, task in enumerate((base, *base['augmentation_pass_tasks'])):
+            task['view'] = ViewInfo(name=f'azimuthal_transverse__policy{index}',
+                family='azimuthal', num_slices=5, src_h=8, src_w=8, pad_mode='clamp')
+            task['slice_start'] = 4
+            task['slice_count'] = 1
+        plan = memory.policy_parent_memory_plan(tasks, requested_dense_limit=GIB,
+            available_ram_bytes=16*GIB, source_shape=(5,8,8), batch_size=4)
+        self.assertGreater(plan['file_result_reserve_bytes'], plan['dense_limit_bytes'])
+        self.assertGreater(plan['coverage_reserve_bytes'], plan['dense_limit_bytes']//2)
+        self.assertLessEqual(plan['total_reserve_bytes'], 16*GIB)
+        for task in (base, *base['augmentation_pass_tasks']):
+            task['result_mode'] = 'direct_union'
+        shared = memory.policy_parent_memory_plan(tasks, requested_dense_limit=GIB,
+            available_ram_bytes=16*GIB, source_shape=(5,8,8), batch_size=4)
+        self.assertEqual(shared['dense_limit_bytes'], GIB)
+        self.assertEqual(shared['file_result_reserve_bytes'], 3*GIB)
+        self.assertEqual(plan['file_result_reserve_bytes'], 4*GIB)
+        self.assertEqual(shared['coverage_reserve_bytes'], plan['coverage_reserve_bytes'])
+        self.assertLessEqual(shared['total_reserve_bytes'], 16*GIB)
+
     def test_same_named_memfds_cannot_share_cached_layer_bytes(self):
         # Linux /proc/<pid>/fd/N resolves different, equally named memfds to the
         # same /memfd:name (deleted) display string. Emulate only that resolution;
@@ -255,6 +578,19 @@ for task,a in zip(json.loads(sys.argv[1]), _cache_export_volumes()):
         with mock.patch.object(memory, '_read_meminfo_bytes', return_value={'MemAvailable': 1000}), \
                 mock.patch.object(memory, 'available_anon_work_bytes', return_value=20):
             self.assertEqual(memory.publication_ram_headroom(), 20)
+
+    def test_windows_headroom_uses_physical_available_without_swap(self):
+        psutil = SimpleNamespace(virtual_memory=lambda: SimpleNamespace(available=1234),
+                                 swap_memory=lambda: SimpleNamespace(free=987654321))
+        with mock.patch.object(memory, '_read_meminfo_bytes', return_value={}), \
+                mock.patch.object(memory.os, 'name', 'nt'), \
+                mock.patch.dict(sys.modules, {'psutil': psutil}), \
+                mock.patch.object(memory, 'available_anon_work_bytes', return_value=99999999):
+            self.assertEqual(memory.publication_ram_headroom(), 1234)
+        with mock.patch.object(memory, '_read_meminfo_bytes', return_value={}), \
+                mock.patch.object(memory.os, 'name', 'nt'), \
+                mock.patch.dict(sys.modules, {'psutil': None}):
+            self.assertEqual(memory.publication_ram_headroom(), 0)
 
     def test_retained_scratch_never_uses_ephemeral_parent_descriptors(self):
         with mock.patch.object(memory.os, 'memfd_create', create=True) as create:

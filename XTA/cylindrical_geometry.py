@@ -1,14 +1,16 @@
 """Periodic cylindrical shell patches with radius as their slice direction.
 
 Arc and height pixels have unit source-voxel spacing. The global radius grid
-has gaps <= one voxel and includes both annular endpoints. A patch trajectory
-keeps its arc/height origin across radii, so channels and interpolation cannot
+includes both annular endpoints. Dense sampling retains gaps <= one voxel;
+coverage sampling reduces shells using a positive-interpolation-tap certificate.
+A patch trajectory keeps its arc/height origin across radii, so channels and interpolation cannot
 cross into a different intrinsic patch. Tiling and in-plane transforms follow
 native extraction through the ordinary geometry entry points.
 """
 from __future__ import annotations
 
 import math
+import operator
 from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
@@ -16,8 +18,12 @@ import numpy as np
 if TYPE_CHECKING:
     from .geometry import ViewInfo
 
+_RADIAL_COVERAGE_CERTIFICATE = 'radial-positive-trilinear-v1'
+_RADIAL_ERROR_BUDGET_SQ = 0.99
+_RADIAL_CERTIFICATE_TOLERANCE = 1e-12
 
-def radius_grid(minimum: float, maximum: float) -> tuple[float, ...]:
+
+def _validate_radius_bounds(minimum: float, maximum: float) -> None:
     if not math.isfinite(minimum) or minimum <= 0:
         raise ValueError('--radial_min_radius must be finite and strictly positive')
     if not math.isfinite(maximum) or maximum < minimum:
@@ -25,12 +31,68 @@ def radius_grid(minimum: float, maximum: float) -> tuple[float, ...]:
             f'--radial_min_radius {minimum:g} exceeds the largest cylinder radius '
             f'{maximum:g}; reduce --radial_min_radius or --imgsz'
         )
-    count = max(1, int(math.ceil(maximum - minimum)) + 1)
+
+
+def radius_grid(minimum: float, maximum: float, *, maximum_gap: float = 1.0) -> tuple[float, ...]:
+    _validate_radius_bounds(minimum, maximum)
+    if not math.isfinite(maximum_gap) or maximum_gap <= 0:
+        raise ValueError('Radial sampling gap must be finite and strictly positive')
+    count = max(1, int(math.ceil((maximum - minimum) / maximum_gap)) + 1)
     return tuple(float(r) for r in np.linspace(minimum, maximum, count))
 
 
+def _radial_error_bound_sq(radii: Sequence[float], minimum: float) -> float:
+    # Linspace gaps can differ by an ulp; certify the largest realized gap.
+    gap = float(np.diff(np.asarray(radii, dtype=np.float64)).max(initial=0.0))
+    return (gap / 2.0) ** 2 + 0.25 + gap / (8.0 * minimum)
+
+
 def global_radii(view: 'ViewInfo') -> tuple[float, ...]:
-    return radius_grid(float(view.radial_min_radius), float(view.radial_max_radius))
+    minimum, maximum = float(view.radial_min_radius), float(view.radial_max_radius)
+    _validate_radius_bounds(minimum, maximum)
+    try:
+        count = operator.index(getattr(view, 'radial_global_count', 0))
+    except TypeError as exc:
+        raise ValueError('Radial global sample count must be an integer') from exc
+    coverage = getattr(view, 'sampling_policy', 'dense') == 'coverage'
+    if coverage:
+        if (count <= 0 or getattr(view, 'sampling_certificate', '') != _RADIAL_COVERAGE_CERTIFICATE):
+            raise ValueError('Radial coverage sampling requires its certificate and explicit global count')
+        tilt = float(view.tilt_angle_deg)
+        if not math.isfinite(tilt) or abs(tilt) > 45.0:
+            raise ValueError('Radial coverage certificate requires a finite tilt within 45 degrees')
+    if count == 0:
+        # Old captures and callers carry no explicit global-count metadata.
+        return radius_grid(minimum, maximum)
+    if count < 1 or (count == 1) != (minimum == maximum):
+        raise ValueError('Radial global sample count does not match its radius endpoints')
+    radii = tuple(float(r) for r in np.linspace(minimum, maximum, count))
+    if coverage:
+        actual = _radial_error_bound_sq(radii, minimum)
+        stored = float(view.sampling_error_bound_sq)
+        if not math.isfinite(actual) or actual > _RADIAL_ERROR_BUDGET_SQ + _RADIAL_CERTIFICATE_TOLERANCE:
+            raise ValueError('Radial radius grid exceeds its certified source-tap error budget')
+        if (not math.isfinite(stored) or
+                not math.isclose(stored, actual, rel_tol=0., abs_tol=_RADIAL_CERTIFICATE_TOLERANCE)):
+            raise ValueError('Radial stored coverage bound does not match its actual radius grid')
+    return radii
+
+
+def certified_radial_gap(minimum: float) -> float:
+    """Largest conservative shell gap for squared planar error <= 0.99.
+
+    Endpoints imply nearest-radius error d <= gap/2. Periodic integer arc
+    samples have an occurrence within half a voxel, hence planar error squared
+    <= d*d + 1/4 + d/(4*minimum). Solve this quadratic without cancellation.
+    Each source-axis error is then strictly below one, so all separable input
+    interpolation taps are positive. The same proof admits sampled-shear tilts
+    <= 45 degrees: their stack error is <= max(1/2, abs(tan(tilt))*planar_error).
+    """
+    if not math.isfinite(minimum) or minimum <= 0:
+        raise ValueError('Radial sampling minimum must be finite and strictly positive')
+    coefficient = 0.25 / minimum
+    budget = 4.0 * _RADIAL_ERROR_BUDGET_SQ - 1.0
+    return budget / (math.hypot(math.sqrt(budget), coefficient) + coefficient)
 
 
 def _height_starts(length: int, size: int) -> tuple[int, ...]:
@@ -45,11 +107,13 @@ def _height_starts(length: int, size: int) -> tuple[int, ...]:
 
 def build_radial_view_infos(
     t: int, h: int, w: int, *, targets: Sequence[str], min_radius: float | None,
-    patch_size: int, tilted_views: Sequence['ViewInfo'],
+    patch_size: int, tilted_views: Sequence['ViewInfo'], sampling_policy: str = 'dense',
 ) -> list['ViewInfo']:
     from .config import AZIMUTHAL_VIEW_TOKENS, _resolve_unique_view_tokens
     from .geometry import ViewInfo, cartesian_view_axis_spec, tilted_base_view_name
 
+    if sampling_policy not in ('dense', 'coverage'):
+        raise ValueError(f'Unsupported Radial sampling policy {sampling_policy!r}')
     selected = _resolve_unique_view_tokens(
         targets, valid=AZIMUTHAL_VIEW_TOKENS, flag_name='Radial view assembly',
     )
@@ -67,8 +131,7 @@ def build_radial_view_infos(
         height = int(spec['num_slices'])
         plane_h, plane_w = int(spec['src_h']), int(spec['src_w'])
         maximum = (min(plane_h, plane_w) - 1) / 2.0
-        radii = radius_grid(minimum, maximum)
-        step = (maximum - minimum) / (len(radii) - 1) if len(radii) > 1 else 0.0
+        dense_radii = radius_grid(minimum, maximum)
         if target.startswith('tilted_'):
             sources = [v for v in tilted_views if tilted_base_view_name(v) == base]
             if not sources:
@@ -78,11 +141,31 @@ def build_radial_view_infos(
         else:
             sources = [None]
         for source in sources:
+            radii = dense_radii
+            certificate = ''
+            error_bound = 0.0
+            reason = ''
+            if sampling_policy == 'coverage':
+                tilt = float(source.tilt_angle_deg) if source is not None else 0.0
+                if not math.isfinite(tilt) or abs(tilt) > 45.0:
+                    reason = 'Tilt exceeds the certified 45-degree sampled-shear range'
+                else:
+                    gap = certified_radial_gap(minimum)
+                    candidate = radius_grid(minimum, maximum, maximum_gap=max(1.0, gap))
+                    if len(candidate) < len(dense_radii):
+                        radii = candidate
+                        error_bound = _radial_error_bound_sq(radii, minimum)
+                        certificate = _RADIAL_COVERAGE_CERTIFICATE
+                    else:
+                        reason = 'The certified radius grid saves no native frames'
+            step = (maximum - minimum) / (len(radii) - 1) if len(radii) > 1 else 0.0
             label = str(source.display_name) if source is not None else str(spec['display_name'])
             source_name = str(source.name) if source is not None else base
             for arc_index in range(max(1, int(math.ceil(2.0 * math.pi * maximum / patch_size)))):
                 origin = arc_index * patch_size
                 first = next(i for i, r in enumerate(radii) if 2.0 * math.pi * r > origin)
+                dense_first = (first if radii is dense_radii else
+                               next(i for i, r in enumerate(dense_radii) if 2.0 * math.pi * r > origin))
                 for height_index, height_origin in enumerate(_height_starts(height, patch_size)):
                     name = f'radial_{source_name}_patch_u{arc_index}_h{height_index}'
                     result.append(ViewInfo(
@@ -102,9 +185,15 @@ def build_radial_view_infos(
                         radial_request_token=target,
                         radial_min_radius=minimum, radial_max_radius=maximum,
                         radial_step=step, radial_shell_start=first, radial_radii=radii[first:],
+                        radial_global_count=len(radii) if certificate else 0,
                         radial_arc_origin=float(origin), radial_height_origin=height_origin,
                         radial_patch_size=patch_size, radial_patch_index=arc_index,
                         radial_height_index=height_index,
+                        sampling_policy='coverage' if certificate else 'dense', sampling_certificate=certificate,
+                        sampling_error_bound_sq=error_bound,
+                        sampling_reference_frames=(len(dense_radii) - dense_first
+                                                   if certificate else 0),
+                        sampling_reason=reason,
                     ))
     return result
 

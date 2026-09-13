@@ -2294,6 +2294,7 @@ class _DeviceUnionAccumulator:
         retirement_lane: Optional[_GpuUnionRetirementLane] = None,
         synchronize_device: bool = True,
         collect_slice_metadata: bool = False,
+        owned_disjoint_output: bool = False,
     ) -> Optional[Dict[str, np.ndarray]]:
         """Commit the task union through a persistent event-driven D2H lane."""
         torch = self.torch
@@ -2307,6 +2308,7 @@ class _DeviceUnionAccumulator:
         plane = int(h) * int(w)
         written = self.written
         metadata_enabled = bool(collect_slice_metadata and not self.host_written)
+        overwrite = bool(owned_disjoint_output and not self.host_written)
         slice_any = np.zeros((n,), dtype=bool) if metadata_enabled else None
         slice_bboxes = np.zeros((n, 4), dtype=np.int64) if metadata_enabled else None
         slice_row_any = (
@@ -2314,11 +2316,12 @@ class _DeviceUnionAccumulator:
             if metadata_enabled else None
         )
 
-        def _collect_metadata(z0: int, z1: int, host: np.ndarray) -> None:
+        def _collect_metadata(z0: int, z1: int, host: np.ndarray,
+                              occupancy: Optional[np.ndarray] = None) -> None:
             if not metadata_enabled:
                 return
-            rows = np.any(host, axis=2)
-            cols = np.any(host, axis=1)
+            rows = np.any(host, axis=2) if occupancy is None else occupancy[:, :h]
+            cols = np.any(host, axis=1) if occupancy is None else occupancy[:, h:]
             wr = np.asarray(written[int(z0):int(z1)], dtype=bool)
             if not bool(wr.all()):
                 rows[~wr] = False
@@ -2350,6 +2353,14 @@ class _DeviceUnionAccumulator:
             copy_stream = torch.cuda.Stream(device=self.device)
             events = (torch.cuda.Event(), torch.cuda.Event())
         pin_np = (pin_views[0].numpy(), pin_views[1].numpy())
+        # Policy windows have one writer. Compute row/column occupancy while
+        # masks are on device instead of scanning every full host raster twice.
+        # Copy the compact metadata under the same event as the mask; the
+        # double-buffer lifetime is therefore identical to the established lane.
+        metadata_pin = (
+            torch.empty((2, chunk, h + w), dtype=torch.uint8, pin_memory=True)
+            if metadata_enabled and overwrite else None)
+        metadata_np = metadata_pin.numpy() if metadata_pin is not None else None
 
         def _drain(
             src_dev: object,
@@ -2370,6 +2381,10 @@ class _DeviceUnionAccumulator:
                 z0_i, z1_i = chunks[ci]
                 buf = ci % 2
                 with torch.cuda.stream(copy_stream):
+                    if collect_metadata and metadata_pin is not None:
+                        plane_data = src_dev[z0_i:z1_i]
+                        occupancy = torch.cat((plane_data.any(dim=2), plane_data.any(dim=1)), dim=1).to(torch.uint8)
+                        metadata_pin[buf, :z1_i - z0_i].copy_(occupancy, non_blocking=True)
                     pin_views[buf][: z1_i - z0_i].copy_(
                         src_dev[z0_i:z1_i], non_blocking=True,
                     )
@@ -2382,11 +2397,14 @@ class _DeviceUnionAccumulator:
                 events[ci % 2].synchronize()
                 host = pin_np[ci % 2][: z1 - z0]
                 if bool(collect_metadata):
-                    _collect_metadata(int(z0), int(z1), host)
+                    _collect_metadata(int(z0), int(z1), host,
+                        metadata_np[ci % 2, :z1 - z0] if metadata_np is not None else None)
                 wr = written[z0:z1]
                 if bool(wr.all()):
                     dst = np.asarray(dst_mm[z0:z1])
-                    if bool(confidence):
+                    if overwrite:
+                        np.copyto(dst, host)
+                    elif bool(confidence):
                         np.maximum(dst, host, out=dst)
                     else:
                         np.bitwise_or(dst, host, out=dst)
@@ -2394,7 +2412,9 @@ class _DeviceUnionAccumulator:
                     for zi in range(z1 - z0):
                         if wr[zi]:
                             dst = np.asarray(dst_mm[z0 + zi])
-                            if bool(confidence):
+                            if overwrite:
+                                np.copyto(dst, host[zi])
+                            elif bool(confidence):
                                 np.maximum(dst, host[zi], out=dst)
                             else:
                                 np.bitwise_or(dst, host[zi], out=dst)
@@ -3940,9 +3960,11 @@ def _direct_predict_stream(
                         'set YOLO_TTA_DIRECT_PREDICT=0 to use model.predict'
                     )
                 yield _DirectPredictResult(payload)
-    print(f'Direct compaction {source_label}: '
-          + ', '.join(f'{name}={count}' for name, count in kernel_counts.items())
-          + f', failed_probes={failed_probes}', flush=True)
+    if (getattr(source, '_tta_announce_prediction', True) or failed_probes
+            or kernel_counts['synchronized'] or kernel_counts['scalar_workspace_fallback']):
+        print(f'Direct compaction {source_label}: '
+              + ', '.join(f'{name}={count}' for name, count in kernel_counts.items())
+              + f', failed_probes={failed_probes}', flush=True)
 
 def _claim_specialized_prediction_targets(target: object, device_union: object, num_frames: int) -> None:
     """Commit the same host coverage contract as per-result generic processing.
@@ -3989,6 +4011,7 @@ def predict_source_and_accumulate(
     require_proto_hole_treatment: bool = False,
     azimuthal_padding_union_mm: Optional[np.ndarray] = None,
     azimuthal_padding_confmap_mm: Optional[np.ndarray] = None,
+    owned_disjoint_output: bool = False,
 ) -> Dict[str, object]:
     """Run YOLO predict(stream=True) on an in-memory source and accumulate native masks.
 
@@ -4118,7 +4141,7 @@ def predict_source_and_accumulate(
                 want_conf=view_confmap_mm is not None,
                 collect_slice_bboxes=device_union_consumer is not None,
             )
-            if device_union is not None:
+            if device_union is not None and getattr(source, '_tta_announce_prediction', True):
                 print(
                     f'Device union accumulation active for {source_label}: '
                     f'{int(num_frames)}x{int(native_h)}x{int(native_w)} u8 on device.'
@@ -4168,6 +4191,9 @@ def predict_source_and_accumulate(
             masks_obj: Optional[object],
             confs_arr: Optional[np.ndarray],
         ) -> Tuple[int, int]:
+            restore = getattr(source, 'restore_prediction', None)
+            if callable(restore):
+                masks_obj = restore(spec, masks_obj)
             target_union, target_conf, target_index, target_affine, count_stats = (
                 _prediction_accumulation_target(
                     spec,
@@ -4404,6 +4430,7 @@ def predict_source_and_accumulate(
                             retirement_lane=retirement_lane,
                             synchronize_device=False,
                             collect_slice_metadata=True,
+                            owned_disjoint_output=bool(owned_disjoint_output),
                         )
                         return {
                             'prediction_count': int(base_prediction_count + compacted_predictions),
@@ -4445,6 +4472,7 @@ def predict_source_and_accumulate(
                         retirement_lane=retirement_lane,
                         synchronize_device=False,
                         collect_slice_metadata=True,
+                        owned_disjoint_output=bool(owned_disjoint_output),
                     )
                 finally:
                     if retirement_manager is not None and retirement_lane is not None:
@@ -5266,7 +5294,11 @@ def cleanup_view_volume_after_prediction_inplace(
     # min_radius inside the per-slice unit.
     # skipped when every slice of this view was already hole-filled on device by
     # the GPU workers (identical per-slice semantics; the CPU pass would be pure recompute).
-    if bool(skip_hole_fill):
+    if int(view.augmentation_pass) > 0:
+        # An inverse-invalid island is unknown, not an enclosed background hole.
+        # Filtering/removal remains eligible; adding unsupported foreground does not.
+        print(f'2D hole fill ({view.name}): skipped for inverse-mapped external-policy masks.')
+    elif bool(skip_hole_fill):
         print(f'2D hole fill ({view.name}): done on device during accumulation (v13.3.3 S2); CPU pass skipped.')
     else:
         fill_view_volume_holes_2d_inplace(

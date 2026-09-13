@@ -23,6 +23,7 @@ if not all(_module_is_available(name) for name in ("cv2", "scipy", "tqdm")):
 
 from XTA import pta
 from XTA import pta_augmentation
+from XTA import augmentation_policy
 
 
 class PtaAugmentationBoundaryTests(unittest.TestCase):
@@ -46,12 +47,18 @@ class PtaAugmentationBoundaryTests(unittest.TestCase):
 
     def test_pta_reexports_the_augmentation_owner_objects(self) -> None:
         self.assertEqual(pta_augmentation.__all__, self.EXPORTED_NAMES)
+        shared_names = {
+            "AugmentationDefinition", "assert_augmentation_definition_unchanged",
+            "inspect_augmentation_definition",
+        }
         for name in self.EXPORTED_NAMES:
             with self.subTest(name=name):
                 owned = getattr(pta_augmentation, name)
                 self.assertIs(getattr(pta, name), owned)
                 if inspect.isfunction(owned) or inspect.isclass(owned):
-                    self.assertEqual(owned.__module__, "XTA.pta_augmentation")
+                    owner = augmentation_policy if name in shared_names else pta_augmentation
+                    self.assertIs(getattr(owner, name), owned)
+                    self.assertEqual(owned.__module__, owner.__name__)
 
 
 if __name__ == "__main__":

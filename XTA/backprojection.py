@@ -759,7 +759,7 @@ class _MainProcessGpuStageCoordinator:
         if self._inference_asset_retirement_pending and int(device_index) in self._worker_devices:
             return True
         purpose_l = str(purpose).strip().lower()
-        # A completed spherical parent holds native-memory credits until its
+        # Completed spherical and radial parents hold native-memory credits until
         # source projection finishes. When no central inference is admissible,
         # let that retirement use an idle GPU even in a mixed D1 run. The acquire
         # methods still fence queued/running inference and other device owners.
@@ -787,7 +787,12 @@ class _MainProcessGpuStageCoordinator:
 
     @staticmethod
     def _is_spherical_retirement(purpose: str) -> bool:
-        return str(purpose).strip().lower().startswith('spherical source projection ')
+        # This queue originally served only Spherical. Keep its existing knobs
+        # and telemetry names, but apply the same exclusive, bounded handoff to
+        # Radial parents, which retain the same scheduler memory credits.
+        return str(purpose).strip().lower().startswith((
+            'spherical source projection ', 'radial source projection ',
+        ))
 
     def set_wake_callback(self, callback: Optional[Callable[[], None]]) -> None:
         with self._lock:

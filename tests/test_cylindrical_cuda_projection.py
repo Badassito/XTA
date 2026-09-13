@@ -284,7 +284,7 @@ class RadialCudaProjectionParityTests(unittest.TestCase):
                     writer = IncrementalRawBBoxMaskStoreWriter(shape=shape, store_dir=path,
                                                                format_name=fmt, desc='Radial crop input')
                     lease = SimpleNamespace(device_index=0, release=mock.Mock())
-                    def admit(source, plan, metadata, view, shape, bboxes, use_bboxes):
+                    def admit(source, plan, metadata, view, shape, bboxes, use_bboxes, **_options):
                         projector = cuda.RadialCudaProjector(source, plan, metadata, view, shape,
                                                              bboxes, use_bboxes, 0, reserve_bytes=0)
                         self.assertEqual(projector.source_layout, 'bbox_u8')

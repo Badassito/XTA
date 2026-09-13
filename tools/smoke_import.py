@@ -183,6 +183,14 @@ def main() -> None:
     install_stubs()
     eager_graph_modules = (
         "config",
+        "augmentation_policy",
+        "tta_augmentation_config",
+        "tta_augmentation",
+        "tta_augmentation_cuda",
+        "tta_augmentation_retirement",
+        "tta_augmentation_runtime",
+        "spherical_sampling",
+        "azimuthal_coverage",
         "experimental_features",
         "workspace",
         "runtime",

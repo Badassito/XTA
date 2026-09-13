@@ -2008,7 +2008,11 @@ def _duplicate_memfd_path_for_child(path: object) -> Optional[object]:
     return mp_reduction.DupFd(int(fd))
 
 def _attach_memfd_transfers_to_task(task: Dict[str, object]) -> None:
-    """Attach descriptor handles to one dispatch copy without changing canonical paths."""
+    """Attach handles to a dispatch copy, including independent policy result parents.
+
+    Dispatchers copy only the outer task dictionary. Copy nested policy dictionaries
+    before attaching handles so canonical tasks never retain one-use transfer objects.
+    """
     for path_field, handle_field in (
         ('source_volume_path', 'source_volume_fd'),
         ('result_mask_path', 'result_mask_fd'),
@@ -2032,6 +2036,13 @@ def _attach_memfd_transfers_to_task(task: Dict[str, object]) -> None:
             native_copy['path_fd_key'] = str(native_path)
         task['native_resize'] = native_copy
 
+    siblings = task.get('augmentation_pass_tasks')
+    if siblings:
+        sibling_copies = [dict(sibling) for sibling in siblings]
+        task['augmentation_pass_tasks'] = sibling_copies
+        for sibling in sibling_copies:
+            _attach_memfd_transfers_to_task(sibling)
+
 def _detach_transferred_fd(handle: object) -> int:
     detach = getattr(handle, 'detach', None)
     if not callable(detach):
@@ -2050,6 +2061,7 @@ def _materialize_worker_task_memfd_paths(
     Source-volume descriptors are cached for the worker lifetime so the resident render
     engine sees one stable source identity. Result and canvas descriptors are task-local;
     dropping them after the task permits immediate sparse retirement in the parent.
+    All policy siblings share this transaction and its returned descriptor ownership list.
     """
     transient_fds: List[int] = []
     # The caller can only close descriptors after this function returns.  Keep enough
@@ -2087,21 +2099,27 @@ def _materialize_worker_task_memfd_paths(
             transient_fds.append(int(fd))
         holder[path_field] = str(_memfd_proc_path(int(fd), owner_pid=os.getpid()))
 
-    try:
-        _resolve(task, path_field='source_volume_path', handle_field='source_volume_fd', persistent=True)
-        _resolve(task, path_field='result_mask_path', handle_field='result_mask_fd', persistent=False)
-        _resolve(task, path_field='result_conf_path', handle_field='result_conf_fd', persistent=False)
-        _resolve(task, path_field='canvas_path', handle_field='canvas_fd', persistent=False)
-        _resolve(task, path_field='d1_bitset_path', handle_field='d1_bitset_fd', persistent=False)
+    def _resolve_task(holder: Dict[str, object]) -> None:
+        _resolve(holder, path_field='source_volume_path', handle_field='source_volume_fd', persistent=True)
+        _resolve(holder, path_field='result_mask_path', handle_field='result_mask_fd', persistent=False)
+        _resolve(holder, path_field='result_conf_path', handle_field='result_conf_fd', persistent=False)
+        _resolve(holder, path_field='canvas_path', handle_field='canvas_fd', persistent=False)
+        _resolve(holder, path_field='d1_bitset_path', handle_field='d1_bitset_fd', persistent=False)
 
-        native_resize = task.get('native_resize')
+        native_resize = holder.get('native_resize')
         if isinstance(native_resize, dict):
             native_copy = dict(native_resize)
-            # Keep the key beside the handle while reusing the generic resolver.
-            if 'path_fd_key' in native_copy:
-                native_copy['path_fd_key'] = native_copy.get('path_fd_key')
             _resolve(native_copy, path_field='path', handle_field='path_fd', persistent=True)
-            task['native_resize'] = native_copy
+            holder['native_resize'] = native_copy
+        siblings = holder.get('augmentation_pass_tasks')
+        if siblings:
+            sibling_copies = [dict(sibling) for sibling in siblings]
+            holder['augmentation_pass_tasks'] = sibling_copies
+            for sibling in sibling_copies:
+                _resolve_task(sibling)
+
+    try:
+        _resolve_task(task)
         return transient_fds
     except BaseException:
         _close_fd_list(transient_fds)

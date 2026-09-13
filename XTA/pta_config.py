@@ -310,8 +310,8 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
     )
     parser.add_argument("--background_percent", default=1.0, type=float)
 
-    parser.add_argument("--augmentation", default=None)
-    parser.add_argument("--augmentation_ratio", default=1.0, type=float)
+    from .tta_augmentation_config import add_augmentation_arguments
+    add_augmentation_arguments(parser)
     parser.add_argument(
         "--augmentation_execution",
         default="deferred",

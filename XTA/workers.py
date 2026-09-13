@@ -1656,7 +1656,12 @@ def run_prediction_volume_in_worker(
             )
 
         def _predict(active_source: object) -> Dict[str, object]:
-            return predict_source_and_accumulate(
+            prediction = predict_source_and_accumulate
+            if task.get('augmentation_pass_tasks'):
+                from .tta_augmentation_runtime import predict_policy_source
+                def prediction(model_obj, source_obj, **kwargs):
+                    return predict_policy_source(model_obj, source_obj, task=task, cfg=cfg, predict_kwargs=kwargs)
+            return prediction(
                 model,
                 active_source,
                 source_label=f"{view.name}-{task['job_id']}",
@@ -1696,6 +1701,9 @@ def run_prediction_volume_in_worker(
         except _ResidentTensorRTRingFatalError:
             raise
         except Exception as exc:
+            # A policy/inverse failure must never silently replay or become a base-only result.
+            if task.get('augmentation_pass_tasks'):
+                raise
             if bool(getattr(source, '_native_trt_data_consumed', False)):
                 raise _ResidentTensorRTRingFatalError(
                     'Native-mask TensorRT task failed after data inference began; '
@@ -1747,6 +1755,9 @@ def run_prediction_volume_in_worker(
             'slice_meta': stats.get('slice_meta'),
             'azimuthal_padding_processed': int(stats.get('azimuthal_padding_processed', 0)),
         }
+        for policy_key in ('augmentation_results', 'augmentation_records', 'augmentation_execution'):
+            if policy_key in stats:
+                public_stats[policy_key] = stats[policy_key]
         if spherical_cache_before is not None:
             spherical_cache_delta = {
                 name: value - spherical_cache_before.get(name, 0)
@@ -1987,6 +1998,10 @@ def _release_gpu_worker_inference_assets(
         stats['affine_grid_entries'] = len(inference_module._AFFINE_GRID_CACHE)
         inference_module._AFFINE_GRID_CACHE.clear()
         inference_module._AFFINE_GRID_CACHE_MIN_ENTRIES = 0
+    from .tta_augmentation import clear_worker_policies
+    from .tta_augmentation_retirement import shutdown_policy_retirement
+    shutdown_policy_retirement()
+    clear_worker_policies()
     stats['phase'] = 'release_model'
     _drop_worker_model_owners(assets.model)
     assets.model = None
@@ -2072,6 +2087,13 @@ def _gpu_inference_worker_main(
             input_channels=max(1, int(init_dict.get('input_channels', 1))),
             channel_token=str(init_dict.get('channel_token', 'gray')),
         )
+        policy_settings = init_dict.get('augmentation_settings')
+        if policy_settings is not None and policy_settings.enabled:
+            from .tta_augmentation import worker_policy
+            from .inference import gpu_retina_flatten_enabled
+            if cpu_retina_masks_enabled() or not gpu_retina_flatten_enabled():
+                raise ValueError('External TTA policies require GPU retina flattening')
+            worker_policy(policy_settings, device='cuda:0', batch_size=int(cfg.batch))
         if d1_owner_pipeline_enabled():
             _d1_backproject_kernels()
             print(
@@ -2446,6 +2468,8 @@ def _gpu_inference_worker_main(
     finally:
         try:
             _wait_for_deferred_publications()
+            from .tta_augmentation_retirement import shutdown_policy_retirement
+            shutdown_policy_retirement()
             _shutdown_d1_worker_pipeline()
             shutdown_radial_owners()
             _shutdown_resident_trt_pipeline_cache()

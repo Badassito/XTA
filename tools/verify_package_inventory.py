@@ -35,6 +35,64 @@ REVIEWED_V21_0_6_SHA256 = 'fc3c2ca5ab0af6257ee9b4fd3b4bf9f66a9c669007a87377a9d7d
 REVIEWED_V21_1_SHA256 = '534ad7dabb3bccbbf95883fa7cad678081e85f4efa1b5e851781b173da017f37'
 REVIEWED_V21_1_1_SHA256 = '84426381fa7b386607ed8e79a993cf0b51bbbe46b1cfa3db4bc71307385694a4'
 REVIEWED_V21_1_2_SHA256 = '3d6fe9fb0aaa766ee77611c3f0e13b7505cf7bbc245088cddda79969a69dbe7d'
+
+# This development appendix reviews v22 augmentation work without changing the
+# package release identity or any earlier inventory record.
+REVIEWED_V22_AUGMENTATION_SHA256 = 'b2636d119631a48b3424879eeae79c9b2ee56d43722647f3cfab22f9608857e8'
+# The coverage appendix follows augmentation development without changing the
+# release identity. Authenticate the entire preceding inventory, including its
+# reasons and release records, independently of the new appendix.
+REVIEWED_V22_COVERAGE_PREDECESSOR_COMMIT = 'f6557bf52822c8e8d0a752deb81fa26652b8a4e4'
+REVIEWED_V22_COVERAGE_PREDECESSOR_SHA256 = '05d5b4b84b783450fcf8130ce8787d300484fede69fa904ae141f3d2ff4113b1'
+REVIEWED_V22_COVERAGE_SHA256 = '9bb0fa7e01d364916bde3474228b70be2d3f37daf59f198a60b3140ccea9eff4'
+# Both release parents retain their exact historical keysets. Reconstructing
+# these snapshots lets their independent review chains survive the merge.
+REVIEWED_COMMON_INVENTORY_KEYS = (
+    'statement_count', 'statements', 'v20_azimuthal_rename', 'v21_review',
+    'v21_0_1_review', 'v21_0_2_review', 'v21_0_3_review', 'v21_0_4_review',
+    'v21_0_5_review', 'v21_0_6_review', 'v21_1_review', 'v21_1_1_review',
+)
+REVIEWED_V22_RELEASE_PARENTS = (
+    {
+        'commit': 'ea7b7b71e184185c5d3024b6351b294207256d47',
+        'inventory_keys': [*REVIEWED_COMMON_INVENTORY_KEYS, 'v21_1_2_review'],
+        'inventory_sha256': '3f05f28a2ba658b645fb6e3cd8cb5ad33a3106001b783de986c724515dd15cef',
+    },
+    {
+        'commit': 'ff6a993ee69ceab2a44932e7c0a8bbab51f9d8af',
+        'inventory_keys': [*REVIEWED_COMMON_INVENTORY_KEYS, 'v22_augmentation_review', 'v22_coverage_review'],
+        'inventory_sha256': '140c7995e84b691ab26fba64a4a4ea4669705ccd83e65b1bcbf735ae4b16574a',
+    },
+)
+REVIEWED_V22_RELEASE_SHA256 = '832bc42a33a80af2218cd090330d2c8b14c3a3a0fcb32c45ff150f723e63f3fb'
+# The memory correction succeeds the fully reconciled v22 inventory. Preserve
+# every previous record, including both merge parents and their review reasons.
+REVIEWED_V22_POLICY_MEMORY_PREDECESSOR_COMMIT = 'a328bc0c03b81ef4afcab9f9f360b16c38c4e6cc'
+REVIEWED_V22_POLICY_MEMORY_PREDECESSOR_SHA256 = '415426ec7d05504853a297697784b9652c4f590756b18fde57f8e9b7f73d0570'
+REVIEWED_V22_POLICY_MEMORY_SHA256 = 'ebe7c9912e9d6f4477a5892768f063fffb74f09bae77dece80ce0bcfeb71e38b'
+# The preceding fix was distributed as a source bundle without a Git commit.
+# Authenticate that exact artifact and its full inventory instead of inventing
+# a commit identity or replacing the already reviewed memory appendix.
+REVIEWED_V22_POLICY_THROUGHPUT_PREDECESSOR_BUNDLE_SHA256 = '687421acc062cfc7c67a60d98a5cce61e74be1ad90ed609c06fac7201b76d292'
+REVIEWED_V22_POLICY_THROUGHPUT_PREDECESSOR_SHA256 = '45117aff166b553e85e59eb66ea05aedd51a88ff1eb94d28eedb6bda8e763b71'
+REVIEWED_V22_POLICY_THROUGHPUT_SHA256 = '7f55037e16750f0742852e894ec9a6c2bfe4b4dacf95336cc638d3b6ed087916'
+REVIEWED_V22_RADIAL_RETIREMENT_PREDECESSOR_BUNDLE_SHA256 = 'fede9e0d4a8a3e32786cd2a62e79b540f1e7dd0cd34630bc5e0a83f9b721cf8c'
+REVIEWED_V22_RADIAL_RETIREMENT_PREDECESSOR_SHA256 = '9ce3e2b66e0458a08fa569af90fcce681b6e530be3ce800ec331c7489ecbfead'
+REVIEWED_V22_RADIAL_RETIREMENT_SHA256 = 'bc71770067fcb2862f441bea2e0290879318991bf9f4f6487bdc1ad3936b1701'
+REVIEWED_V22_POLICY_WINDOW_PREDECESSOR_BUNDLE_SHA256 = '9443efd0468c59d3b39b232339a680556eb40d02ff78566480cce6fd1e840c23'
+REVIEWED_V22_POLICY_WINDOW_PREDECESSOR_SHA256 = '39ed77ed4f861333ef9252ab559c99eeb5b519944a32d80fc7f223c2703fd94a'
+REVIEWED_V22_POLICY_WINDOW_SHA256 = 'd816923892fe819dbb155119525178d8bd1af4117065a92feafbce0adde86b8a'
+REVIEWED_V22_POLICY_WINDOW_PRESERVED_PIPELINE_SHA256 = '566158efcda0ca7ea2370e6a51681cd338386a708b55eb5537d304bab3f3cc95'
+# Exact pre-move PTA definitions, independently pinned before their shared owner
+# is introduced. PTA reexports must still resolve to the shared owner objects.
+REVIEWED_PRESERVED_AUGMENTATION_DEFINITIONS = {
+    ('pta_augmentation', 'AugmentationDefinition'):
+        '7f4a5e8fdb7a64582a6aa510c4381a2eb5853b030ebd8e3a0a4940346072c9f9',
+    ('pta_augmentation', 'inspect_augmentation_definition'):
+        '3d9f9bf614d79d46a7a09c72887db6fa7fda6006f7e2dc662aff51bf3ec86ca0',
+    ('pta_augmentation', 'assert_augmentation_definition_unchanged'):
+        '06e131ad10dbfd062a4e4b2aaca6c370340a00cf43cbf717006b7054b982aa8a',
+}
 # This method was previously covered by the immutable full Radial module and
 # class pins. Name its exact pre-v21.0.6 AST before reviewing the upload change.
 REVIEWED_PRESERVED_RADIAL_UPLOAD_SHA256 = '5f12562dafcb991f93b1702b8976e33a5117e4e01de357c3cb99c98afe52599a'
@@ -1200,8 +1258,11 @@ def _reviewed_v21_patch_contract(
         (item['module'], item['name']): item['sha256'] for item in v21['definitions']
     })
     historical_statements = {
-        (item['module'], item['label']): item['sha256'] for item in v21['statements']
+        key: record[0] for key, record in REVIEWED_V20_ADDED_STATEMENTS.items()
     }
+    historical_statements.update({
+        (item['module'], item['label']): item['sha256'] for item in v21['statements']
+    })
     for earlier in earlier_patches:
         historical_definitions.update({
             (item['module'], item['name']): item['sha256'] for item in earlier['definitions']
@@ -1326,6 +1387,349 @@ def reviewed_v21_1_2_contract(
         earlier_patches=earlier_patches,
     )
 
+def reviewed_v22_augmentation_contract(
+    manifest: dict[str, object], v21: dict[str, object],
+    *earlier_patches: dict[str, object],
+) -> dict[str, object]:
+    review = _reviewed_v21_patch_contract(
+        manifest, v21, key='v22_augmentation_review', release='22.0.0',
+        expected_digest=REVIEWED_V22_AUGMENTATION_SHA256,
+        previous_digest=REVIEWED_V21_1_1_SHA256,
+        earlier_patches=earlier_patches,
+    )
+    relocations = review.get('definition_relocations', ())
+    keys = [(item['module'], item['name']) for item in relocations]
+    if len(keys) != len(set(keys)) or set(keys) != set(REVIEWED_PRESERVED_AUGMENTATION_DEFINITIONS):
+        raise RuntimeError('v22 augmentation relocation coverage differs from the preserved PTA definitions')
+    destinations = {(item['module'], item['name']): item for item in review['definitions']}
+    for item in relocations:
+        key = (item['module'], item['name'])
+        if item.get('previous_sha256') != REVIEWED_PRESERVED_AUGMENTATION_DEFINITIONS[key]:
+            raise RuntimeError(f'v22 augmentation relocation does not match its preserved predecessor: {key[0]}.{key[1]}')
+        destination = destinations.get((item.get('destination_module'), item.get('destination_name')))
+        if not item.get('reason') or destination is None or destination['sha256'] != item.get('sha256'):
+            raise RuntimeError(f'v22 augmentation relocation has no matching reviewed destination: {key[0]}.{key[1]}')
+        if item['module'] == item['destination_module'] or item['name'] != item['destination_name']:
+            raise RuntimeError(f'v22 augmentation relocation has an unexpected owner or public name: {key[0]}.{key[1]}')
+    return review
+
+
+def reviewed_v22_coverage_contract(
+    manifest: dict[str, object], v21: dict[str, object],
+    *earlier_patches: dict[str, object],
+) -> dict[str, object]:
+    """Authenticate coverage planning while preserving the complete prior record."""
+    keys = (*REVIEWED_COMMON_INVENTORY_KEYS, 'v22_augmentation_review')
+    prior = {key: manifest[key] for key in keys if key in manifest}
+    encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    if hashlib.sha256(encoded).hexdigest() != REVIEWED_V22_COVERAGE_PREDECESSOR_SHA256:
+        raise RuntimeError('v22 coverage predecessor inventory changed; preserve every historical record')
+    review = _reviewed_v21_patch_contract(
+        manifest, v21, key='v22_coverage_review', release='22.0.0',
+        expected_digest=REVIEWED_V22_COVERAGE_SHA256,
+        previous_digest=REVIEWED_V22_AUGMENTATION_SHA256,
+        earlier_patches=earlier_patches,
+    )
+    if (review.get('predecessor_commit') != REVIEWED_V22_COVERAGE_PREDECESSOR_COMMIT
+            or review.get('feature') != 'coverage-sampling'):
+        raise RuntimeError('v22 coverage review has an unexpected development predecessor or feature')
+    validation_tools = review.get('validation_tools', ())
+    paths = [item.get('path') for item in validation_tools]
+    if paths != ['tools/certify_qsc_lipschitz.py'] or any(not item.get('reason') for item in validation_tools):
+        raise RuntimeError('v22 coverage validation-tool review has missing, duplicate or unexplained paths')
+    for item in validation_tools:
+        value = item.get('sha256')
+        if not isinstance(value, str) or len(value) != 64 or any(char not in '0123456789abcdef' for char in value):
+            raise RuntimeError('v22 coverage validation-tool review has an invalid digest')
+    return review
+
+
+def verify_coverage_validation_tools(review) -> None:
+    """The full-domain rational certificate is independently reviewed source."""
+    for item in review['validation_tools']:
+        path = ROOT / item['path']
+        if not path.is_file() or hashlib.sha256(path.read_text(encoding='utf-8').encode('utf-8')).hexdigest() != item['sha256']:
+            raise RuntimeError(f'v22 coverage validation tool changed or is missing: {item["path"]}')
+
+
+def reviewed_v22_release_contract(
+    manifest: dict[str, object], v21: dict[str, object],
+    *earlier_patches: dict[str, object],
+) -> dict[str, object]:
+    """Join independently authenticated parents without rewriting either chain."""
+    expected_keys = {'v22_release_review'}
+    for parent in REVIEWED_V22_RELEASE_PARENTS:
+        keys = parent['inventory_keys']
+        expected_keys.update(keys)
+        snapshot = {key: manifest[key] for key in keys if key in manifest}
+        encoded = json.dumps(snapshot, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        if hashlib.sha256(encoded).hexdigest() != parent['inventory_sha256']:
+            raise RuntimeError(f'v22 release parent inventory changed: {parent["commit"]}')
+    successor_key = 'v22_policy_memory_review'
+    throughput_key = 'v22_policy_throughput_review'
+    radial_key = 'v22_radial_retirement_review'
+    window_key = 'v22_policy_window_review'
+    if set(manifest) - {successor_key, throughput_key, radial_key, window_key} != expected_keys:
+        raise RuntimeError('v22 release inventory keyset differs from its reviewed parent union')
+    review = _reviewed_v21_patch_contract(
+        manifest, v21, key='v22_release_review', release='22.0.0',
+        expected_digest=REVIEWED_V22_RELEASE_SHA256,
+        previous_digest=REVIEWED_V22_COVERAGE_SHA256,
+        earlier_patches=earlier_patches,
+    )
+    if review.get('parent_snapshots') != list(REVIEWED_V22_RELEASE_PARENTS):
+        raise RuntimeError('v22 release has unexpected parent snapshots')
+    if review.get('merge_resolution') != {
+        'shared_predecessor': 'v21_1_1_review',
+        'main_reviews': ['v21_1_2_review'],
+        'feature_reviews': ['v22_augmentation_review', 'v22_coverage_review'],
+        'runtime_resolution': 'Preserve every independently pinned runtime definition and binding from both parents; supersede only the five release identity bindings.',
+    }:
+        raise RuntimeError('v22 release has an unexpected merge resolution')
+    bindings = {
+        ('__init__', '__version__'), ('cli', 'SCRIPT_VERSION'),
+        ('cli', 'SCRIPT_BASENAME'), ('config', 'SCRIPT_VERSION'),
+        ('config', 'SCRIPT_VERSION_COMPACT'),
+    }
+    if (review['definitions'] or review.get('complete_modules')
+            or {(item['module'], item.get('binding')) for item in review['statements']} != bindings
+            or len(review['statements']) != len(bindings)):
+        raise RuntimeError('v22 release must review exactly its five release identity bindings')
+    if successor_key in manifest:
+        # The historical release permits only an independently authenticated
+        # successor. An arbitrary new appendix must not weaken its exact keyset.
+        reviewed_v22_policy_memory_contract(manifest, v21, *earlier_patches, review)
+    elif throughput_key in manifest or radial_key in manifest or window_key in manifest:
+        raise RuntimeError('v22 policy throughput successor requires the reviewed memory predecessor')
+    return review
+
+
+def reviewed_v22_policy_memory_contract(
+    manifest: dict[str, object], v21: dict[str, object],
+    *earlier_patches: dict[str, object],
+) -> dict[str, object]:
+    """Authenticate bounded policy parents without rewriting the release merge."""
+    key = 'v22_policy_memory_review'
+    successor_key = 'v22_policy_throughput_review'
+    radial_key = 'v22_radial_retirement_review'
+    window_key = 'v22_policy_window_review'
+    prior = {name: value for name, value in manifest.items() if name not in (key, successor_key, radial_key, window_key)}
+    encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    if hashlib.sha256(encoded).hexdigest() != REVIEWED_V22_POLICY_MEMORY_PREDECESSOR_SHA256:
+        raise RuntimeError('v22 policy memory predecessor inventory changed; preserve every historical record')
+    review = _reviewed_v21_patch_contract(
+        manifest, v21, key=key, release='22.0.0',
+        expected_digest=REVIEWED_V22_POLICY_MEMORY_SHA256,
+        previous_digest=REVIEWED_V22_RELEASE_SHA256,
+        earlier_patches=earlier_patches,
+    )
+    if (review.get('predecessor_commit') != REVIEWED_V22_POLICY_MEMORY_PREDECESSOR_COMMIT
+            or review.get('predecessor_inventory_sha256') != REVIEWED_V22_POLICY_MEMORY_PREDECESSOR_SHA256
+            or review.get('feature') != 'bounded-policy-parent-memory'):
+        raise RuntimeError('v22 policy memory review has an unexpected predecessor or feature')
+    expected_definitions = {
+        ('pipeline', '_main_impl'),
+        ('publication_memory', 'publication_ram_headroom'),
+        ('publication_memory', 'native_fullframe_dense_reserve'),
+        ('publication_memory', 'policy_parent_memory_plan'),
+        ('tta_scheduler', 'TtaSchedulerState'), ('tta_scheduler', 'TtaScheduler'),
+    }
+    expected_statements = {
+        ('pipeline', 'import_dataclasses_replace'),
+        ('pipeline', 'import_.publication_memory'),
+    }
+    if ({(item['module'], item['name']) for item in review['definitions']} != expected_definitions
+            or {(item['module'], item['label']) for item in review['statements']} != expected_statements
+            or any(review.get(category) for category in (
+                'local_import_seam_updates', 'preserved_radial_definition_updates',
+                'preserved_radial_module_updates', 'complete_modules'))):
+        raise RuntimeError('v22 policy memory review must cover exactly its parent-admission definitions and imports')
+    if successor_key in manifest:
+        reviewed_v22_policy_throughput_contract(manifest, v21, *earlier_patches, review)
+    elif radial_key in manifest or window_key in manifest:
+        raise RuntimeError('v22 Radial retirement successor requires the reviewed throughput predecessor')
+    return review
+
+
+def reviewed_v22_policy_throughput_contract(
+    manifest: dict[str, object], v21: dict[str, object],
+    *earlier_patches: dict[str, object],
+) -> dict[str, object]:
+    """Authenticate the shared-policy correction against its distributed bundle."""
+    key = 'v22_policy_throughput_review'
+    successor_key = 'v22_radial_retirement_review'
+    window_key = 'v22_policy_window_review'
+    prior = {name: value for name, value in manifest.items() if name not in (key, successor_key, window_key)}
+    encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    if hashlib.sha256(encoded).hexdigest() != REVIEWED_V22_POLICY_THROUGHPUT_PREDECESSOR_SHA256:
+        raise RuntimeError('v22 policy throughput predecessor inventory changed; preserve every historical record')
+    review = _reviewed_v21_patch_contract(
+        manifest, v21, key=key, release='22.0.0',
+        expected_digest=REVIEWED_V22_POLICY_THROUGHPUT_SHA256,
+        previous_digest=REVIEWED_V22_POLICY_MEMORY_SHA256,
+        earlier_patches=earlier_patches,
+    )
+    if (review.get('predecessor_bundle') != {
+                'name': 'XTA_v22.0.0_complete_source.zip',
+                'sha256': REVIEWED_V22_POLICY_THROUGHPUT_PREDECESSOR_BUNDLE_SHA256,
+            }
+            or review.get('predecessor_inventory_sha256') != REVIEWED_V22_POLICY_THROUGHPUT_PREDECESSOR_SHA256
+            or 'predecessor_commit' in review
+            or review.get('feature') != 'shared-policy-union-throughput'):
+        raise RuntimeError('v22 policy throughput review has an unexpected bundle predecessor or feature')
+    expected_definitions = {
+        ('pipeline', '_main_impl'),
+        ('inference', '_DeviceUnionAccumulator'),
+        ('inference', '_direct_predict_stream'),
+        ('inference', 'predict_source_and_accumulate'),
+        ('runtime', '_attach_memfd_transfers_to_task'),
+        ('runtime', '_materialize_worker_task_memfd_paths'),
+        ('tta_augmentation_runtime', '_CoverageWriter'),
+        ('tta_augmentation_runtime', '_validate_policy_parent_group'),
+        ('tta_augmentation_runtime', '_open_policy_sibling_outputs'),
+        ('tta_augmentation_runtime', 'predict_policy_source'),
+        ('tta_scheduler', 'TtaScheduler'),
+        ('publication_memory', 'native_fullframe_dense_reserve'),
+        ('publication_memory', 'policy_parent_memory_plan'),
+    }
+    if ({(item['module'], item['name']) for item in review['definitions']} != expected_definitions
+            or {(item['module'], item['label']) for item in review['statements']}
+                != {('pipeline', 'import_.inference')}
+            or {(item['module'], item['name']) for item in review.get('local_import_seam_updates', ())}
+                != {('inference', 'predict_source_and_accumulate')}
+            or any(review.get(category) for category in (
+                'preserved_radial_definition_updates',
+                'preserved_radial_module_updates', 'complete_modules'))):
+        raise RuntimeError('v22 policy throughput review must cover exactly its shared-policy definitions, import and seam')
+    if successor_key in manifest:
+        reviewed_v22_radial_retirement_contract(manifest, v21, *earlier_patches, review)
+    elif window_key in manifest:
+        raise RuntimeError('v22 policy window successor requires the reviewed Radial retirement predecessor')
+    return review
+
+
+def reviewed_v22_radial_retirement_contract(
+    manifest: dict[str, object], v21: dict[str, object],
+    *earlier_patches: dict[str, object],
+) -> dict[str, object]:
+    """Authenticate Radial GPU retirement without altering its numerical history."""
+    key = 'v22_radial_retirement_review'
+    successor_key = 'v22_policy_window_review'
+    prior = {name: value for name, value in manifest.items() if name not in (key, successor_key)}
+    encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    if hashlib.sha256(encoded).hexdigest() != REVIEWED_V22_RADIAL_RETIREMENT_PREDECESSOR_SHA256:
+        raise RuntimeError('v22 Radial retirement predecessor inventory changed; preserve every historical record')
+    review = _reviewed_v21_patch_contract(
+        manifest, v21, key=key, release='22.0.0',
+        expected_digest=REVIEWED_V22_RADIAL_RETIREMENT_SHA256,
+        previous_digest=REVIEWED_V22_POLICY_THROUGHPUT_SHA256,
+        earlier_patches=earlier_patches,
+    )
+    if (review.get('predecessor_bundle') != {
+                'name': 'XTA_v22.0.0_complete_source.zip',
+                'sha256': REVIEWED_V22_RADIAL_RETIREMENT_PREDECESSOR_BUNDLE_SHA256,
+            }
+            or review.get('predecessor_inventory_sha256') != REVIEWED_V22_RADIAL_RETIREMENT_PREDECESSOR_SHA256
+            or 'predecessor_commit' in review
+            or review.get('feature') != 'radial-gpu-retirement'):
+        raise RuntimeError('v22 Radial retirement review has an unexpected bundle predecessor or feature')
+    expected_definitions = {
+        ('backprojection', '_MainProcessGpuStageCoordinator'),
+        ('cylindrical_projection', '_ordered_radial_blocks'),
+        ('cylindrical_projection', '_try_radial_cuda_stage'),
+        ('cylindrical_projection', '_ordered_radial_cuda_blocks'),
+        ('cylindrical_projection', 'backproject_radial_volume_to_volume'),
+    }
+    expected_statements = {
+        ('cylindrical_projection', 'shared_future_import'),
+        ('cylindrical_projection', 'binding__CUDA_RECHECK_SLICES'),
+        ('cylindrical_projection', 'binding__CUDA_RECHECK_SECONDS'),
+    }
+    if ({(item['module'], item['name']) for item in review['definitions']} != expected_definitions
+            or {(item['module'], item['label']) for item in review['statements']} != expected_statements
+            or [item['module'] for item in review.get('preserved_radial_module_updates', ())]
+                != ['cylindrical_projection']
+            or any(review.get(category) for category in (
+                'local_import_seam_updates', 'preserved_radial_definition_updates', 'complete_modules'))):
+        raise RuntimeError('v22 Radial retirement review must cover exactly its scheduler, projection and retry contracts')
+    if successor_key in manifest:
+        reviewed_v22_policy_window_contract(manifest, v21, *earlier_patches, review)
+    return review
+
+
+def reviewed_v22_policy_window_contract(
+    manifest: dict[str, object], v21: dict[str, object],
+    *earlier_patches: dict[str, object],
+) -> dict[str, object]:
+    """Authenticate the policy-only 384 GiB request against its released bundle."""
+    key = 'v22_policy_window_review'
+    prior = {name: value for name, value in manifest.items() if name != key}
+    encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    if hashlib.sha256(encoded).hexdigest() != REVIEWED_V22_POLICY_WINDOW_PREDECESSOR_SHA256:
+        raise RuntimeError('v22 policy window predecessor inventory changed; preserve every historical record')
+    review = _reviewed_v21_patch_contract(
+        manifest, v21, key=key, release='22.0.0',
+        expected_digest=REVIEWED_V22_POLICY_WINDOW_SHA256,
+        previous_digest=REVIEWED_V22_RADIAL_RETIREMENT_SHA256,
+        earlier_patches=earlier_patches,
+    )
+    if (review.get('predecessor_bundle') != {
+                'name': 'XTA_v22.0.0_complete_source.zip',
+                'sha256': REVIEWED_V22_POLICY_WINDOW_PREDECESSOR_BUNDLE_SHA256,
+            }
+            or review.get('predecessor_inventory_sha256') != REVIEWED_V22_POLICY_WINDOW_PREDECESSOR_SHA256
+            or review.get('preserved_pipeline_statements_sha256') != REVIEWED_V22_POLICY_WINDOW_PRESERVED_PIPELINE_SHA256
+            or 'predecessor_commit' in review
+            or review.get('feature') != 'policy-parent-window-384-gib'):
+        raise RuntimeError('v22 policy window review has an unexpected bundle predecessor or feature')
+    if ([(item['module'], item['name']) for item in review['definitions']]
+            != [('pipeline', '_main_impl')]
+            or any(review.get(category) for category in (
+                'statements', 'local_import_seam_updates', 'preserved_radial_definition_updates',
+                'preserved_radial_module_updates', 'complete_modules'))):
+        raise RuntimeError('v22 policy window review must cover only pipeline._main_impl and no imports or other runtime changes')
+    return review
+
+
+def verify_policy_window_runtime_scope(review, pipeline_statements) -> None:
+    """Only the reviewed default inside _main_impl may differ from the bundle."""
+    preserved = [digest(node) for node in pipeline_statements if getattr(node, 'name', None) != '_main_impl']
+    encoded = json.dumps(preserved, separators=(',', ':')).encode('utf-8')
+    if hashlib.sha256(encoded).hexdigest() != review['preserved_pipeline_statements_sha256']:
+        raise RuntimeError('v22 policy window changed unreviewed pipeline statements or imports')
+
+
+def reviewed_v20_statement_hashes(reviews) -> dict[tuple[str, str], str]:
+    """Resolve authenticated successors without replacing the original v20 pins."""
+    expected = {key: record[0] for key, record in REVIEWED_V20_ADDED_STATEMENTS.items()}
+    for review in reviews:
+        for item in review['statements']:
+            key = (item['module'], item['label'])
+            if key not in expected:
+                continue
+            if item.get('previous_sha256') != expected[key]:
+                raise RuntimeError(f'v20 statement successor does not match its historical pin: {key[0]}.{key[1]}')
+            expected[key] = item['sha256']
+    return expected
+
+
+def verify_augmentation_relocations(review, top_level) -> None:
+    """Verify exact shared definitions and the original owner's public imports."""
+    for item in review['definition_relocations']:
+        module, name = item['module'], item['name']
+        source = top_level[module]
+        destination = top_level[item['destination_module']]
+        matches = [node for node in destination if getattr(node, 'name', None) == item['destination_name']]
+        reexports = [
+            node for node in source if isinstance(node, ast.ImportFrom)
+            and node.level == 1 and node.module == item['destination_module']
+            and any(alias.name == name and alias.asname in (None, name) for alias in node.names)
+        ]
+        if (any(getattr(node, 'name', None) == name for node in source)
+                or len(matches) != 1 or digest(matches[0]) != item['sha256']
+                or len(reexports) != 1 or digest(reexports[0]) != item['reexport_sha256']):
+            raise RuntimeError(f'v22 augmentation shared-owner relocation changed: {module}.{name}')
+
 
 def reviewed_radial_module_hashes(v21, patches):
     """Require explicit authenticated successors for preserved full modules."""
@@ -1389,7 +1793,23 @@ def main() -> None:
     overlap_release = reviewed_v21_1_1_contract(manifest, v21, *patches)
     patches = (*patches, overlap_release)
     frontier_release = reviewed_v21_1_2_contract(manifest, v21, *patches)
-    patches = (*patches, frontier_release)
+
+    augmentation_review = reviewed_v22_augmentation_contract(manifest, v21, *patches)
+    coverage_review = reviewed_v22_coverage_contract(manifest, v21, *patches, augmentation_review)
+    verify_coverage_validation_tools(coverage_review)
+    # Validate each fork against its own predecessor, then join their disjoint
+    # runtime changes. Release identity successors follow the main parent.
+    patches = (*patches, frontier_release, augmentation_review, coverage_review)
+    release_review = reviewed_v22_release_contract(manifest, v21, *patches)
+    patches = (*patches, release_review)
+    memory_review = reviewed_v22_policy_memory_contract(manifest, v21, *patches)
+    patches = (*patches, memory_review)
+    throughput_review = reviewed_v22_policy_throughput_contract(manifest, v21, *patches)
+    patches = (*patches, throughput_review)
+    radial_retirement_review = reviewed_v22_radial_retirement_contract(manifest, v21, *patches)
+    patches = (*patches, radial_retirement_review)
+    policy_window_review = reviewed_v22_policy_window_contract(manifest, v21, *patches)
+    patches = (*patches, policy_window_review)
     patch_definitions = {
         (item['module'], item['name']): item for review in patches for item in review['definitions']
     }
@@ -1429,6 +1849,7 @@ def main() -> None:
         | {item['module'] for item in v21['statements']}
         | {item['module'] for item in v21['preserved_radial_modules']}
         | {item['module'] for review in patches for item in review['definitions'] + review['statements']}
+        | {item['module'] for item in augmentation_review['definition_relocations']}
     )
     for module in audited_modules:
         module_path = PACKAGE / f"{module}.py"
@@ -1439,12 +1860,17 @@ def main() -> None:
         available[module] = Counter(digest(node) for node in tree.body)
         local_import_seams.update(reviewed_local_import_seams(module, module_source, tree))
 
+    verify_augmentation_relocations(augmentation_review, top_level)
+    verify_policy_window_runtime_scope(policy_window_review, top_level['pipeline'])
+
     for (module, name), (expected_hash, reason) in REVIEWED_V20_ADDED_DEFINITIONS.items():
         expected_hash = reviewed_definition_hash(module, name, expected_hash)
         matches = [node for node in top_level.get(module, ()) if getattr(node, 'name', None) == name]
         if not reason or len(matches) != 1 or digest(matches[0]) != expected_hash:
             raise RuntimeError(f'v20 reviewed added definition changed or is missing: {module}.{name}')
-    for (module, label), (expected_hash, reason) in REVIEWED_V20_ADDED_STATEMENTS.items():
+    current_v20_statements = reviewed_v20_statement_hashes((v21, *patches))
+    for (module, label), (_historical_hash, reason) in REVIEWED_V20_ADDED_STATEMENTS.items():
+        expected_hash = current_v20_statements[(module, label)]
         if not reason or available.get(module, Counter())[expected_hash] != 1:
             raise RuntimeError(f'v20 reviewed added statement changed or is missing: {module}.{label}')
 

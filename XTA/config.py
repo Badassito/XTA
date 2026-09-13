@@ -19,9 +19,9 @@ GIB = 1024 ** 3
 
 NRRD_SPACE = "left-posterior-superior"
 
-SCRIPT_VERSION = '21.1.2'
+SCRIPT_VERSION = '22.0.0'
 
-SCRIPT_VERSION_COMPACT = '2112'
+SCRIPT_VERSION_COMPACT = '2200'
 
 SCRIPT_BASENAME = f'GPT-6-Astra-Ultra_v{SCRIPT_VERSION}_SLURM.py'
 
@@ -910,7 +910,12 @@ def build_argparser() -> argparse.ArgumentParser:
         version=f"%(prog)s {SCRIPT_VERSION}",
     )
 
+    from .tta_augmentation_config import add_tta_augmentation_arguments
+    add_tta_augmentation_arguments(p)
+
     p.add_argument("--input", required=True, type=str, help="Input video path")
+    p.add_argument('--projection_sampling', choices=('coverage', 'dense'), default='coverage',
+                   help='Coverage reduces certified native Spherical/Radial/auto-Azimuthal frames; dense retains the legacy schedule. Requires an unrotated base pass; explicit Azimuthal spacing is preserved.')
     p.add_argument("--output", default=None, type=str, help="Output directory (default ./{Filename}/)")
     p.add_argument(
         "--temp",

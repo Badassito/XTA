@@ -446,6 +446,7 @@ class ViewInfo:
     radial_patch_size: int = 0
     radial_patch_index: int = 0
     radial_height_index: int = 0
+    radial_global_count: int = 0
     # A spherical trajectory keeps one QSC face patch fixed across radii.
     spherical_face: int = -1
     spherical_group: str = ''
@@ -467,6 +468,13 @@ class ViewInfo:
     physical_view_name: str = ''
     tta_aug_id: str = ''
     tta_angle_deg: float = 0.0
+    augmentation_pass: int = 0
+    augmentation_base_view: str = ''
+    sampling_policy: str = 'dense'
+    sampling_certificate: str = ''
+    sampling_error_bound_sq: float = 0.0
+    sampling_reference_frames: int = 0
+    sampling_reason: str = ''
 
 def physical_view_name(view: ViewInfo) -> str:
     return str(view.physical_view_name or view.name)
@@ -504,6 +512,26 @@ def expand_views_into_tta_variants(
                 tta_angle_deg=float(angle),
             ))
     return variants
+
+def expand_views_into_policy_variants(views: Sequence[ViewInfo], ratio: int) -> List[ViewInfo]:
+    """Keep the base identities and create independent save/interpolation domains."""
+    if int(ratio) < 1:
+        raise ValueError('augmentation ratio must be >= 1')
+    result: List[ViewInfo] = []
+    for base in views:
+        # Preserve names and angle identity; the marker retains empty base layers too.
+        result.append(dataclasses_replace(base, augmentation_base_view=base.name) if int(ratio) > 1 else base)
+        for pass_index in range(1, int(ratio)):
+            suffix = f'__policy_{pass_index:03d}'
+            result.append(dataclasses_replace(
+                base, name=base.name + suffix,
+                tta_aug_id=base.tta_aug_id + suffix,
+                summary_family=base.summary_family + suffix,
+                display_name=f'{base.display_name} / policy pass {pass_index}',
+                augmentation_pass=pass_index, augmentation_base_view=base.name,
+            ))
+    return result
+
 
 def is_tilted_view(view: ViewInfo) -> bool:
     """Return True for a concrete member of the Tilted view family."""
@@ -940,6 +968,8 @@ def get_view_infos(
     spherical_views: Optional[Sequence[str]] = None,
     spherical_min_radius: Optional[float] = None,
     spherical_patch_size: int = 0,
+    sampling_policy: str = 'dense',
+    azimuthal_auto_views: Sequence[str] = (),
 ) -> List[ViewInfo]:
     """Build the complete view set without changing any view-family geometry."""
     enabled_cartesian = resolve_cartesian_views(cartesian_views)
@@ -1003,17 +1033,28 @@ def get_view_infos(
 
     # Scheduling order is unchanged: upright Cartesian, upright Azimuthal, concrete Tilted,
     # then Azimuthal transforms of concrete Tilted variants.
+    if sampling_policy not in ('dense', 'coverage'):
+        raise ValueError('Unknown projection sampling policy')
+    if sampling_policy == 'coverage':
+        from .azimuthal_coverage import optimize_azimuthal_view
+        automatic = set(azimuthal_auto_views)
+        azimuthal_cartesian = [optimize_azimuthal_view(view) if view.azimuthal_request_token in automatic else view
+                               for view in azimuthal_cartesian]
+        azimuthal_tilted = [optimize_azimuthal_view(view) if view.azimuthal_request_token in automatic else view
+                           for view in azimuthal_tilted]
     from .cylindrical_geometry import build_radial_view_infos
     shells = build_radial_view_infos(
         int(T), int(H), int(W), targets=tuple(radial_views or ()),
         min_radius=radial_min_radius, patch_size=int(radial_patch_size),
         tilted_views=tilted,
+        sampling_policy=sampling_policy,
     )
     from .spherical_geometry import build_spherical_view_infos
     spheres = build_spherical_view_infos(
         int(T), int(H), int(W), targets=tuple(spherical_views or ()),
         min_radius=spherical_min_radius, patch_size=int(spherical_patch_size),
         tilted_views=tilted,
+        sampling_policy=sampling_policy,
     )
     return orthogonal + azimuthal_cartesian + tilted + azimuthal_tilted + shells + spheres
 
@@ -1533,6 +1574,8 @@ def build_aug_job_for_variant(
     angle = float(view.tta_angle_deg)
     aug_id = str(view.tta_aug_id)
     expected_aug_id = _format_angle_aug_id(angle)
+    if int(view.augmentation_pass) > 0:
+        expected_aug_id += f'__policy_{int(view.augmentation_pass):03d}'
     if aug_id != expected_aug_id:
         raise ValueError(
             f'TTA variant {view.name!r} has aug_id={aug_id!r}, expected {expected_aug_id!r} '
@@ -2972,6 +3015,8 @@ def maybe_wrap_source_with_gpu_input_staging(source: object, cfg: 'PredictConfig
         GpuTileRenderedYoloSource,
     )
 
+    if bool(getattr(source, '_tta_already_gpu_staged', False)):
+        return source
     if isinstance(source, GpuPrefetchingYoloSource):
         return source
     # GPU-rendered sources already produce device-resident normalized batches;
@@ -4228,7 +4273,7 @@ def build_fullframe_raster_plan(
 ) -> RasterPlan:
     """Build the canonical v18 TTA plan consumed by one full-frame job."""
 
-    from .unification.tta_manifest import radial_view_plan_metadata, spherical_view_plan_metadata
+    from .unification.tta_manifest import radial_view_plan_metadata, spherical_view_plan_metadata, projection_sampling_record
     fmt = resolve_channel_format(channel_format)
     return build_forward_raster_plan(
         mode='tta',
@@ -4247,6 +4292,7 @@ def build_fullframe_raster_plan(
             'runtime_kind': 'fullframe',
             **radial_view_plan_metadata(view),
             **spherical_view_plan_metadata(view),
+            **projection_sampling_record(view),
         },
     )
 
@@ -4265,12 +4311,13 @@ def build_dense_tile_raster_plan(
 ) -> RasterPlan:
     """Build the canonical v18 TTA plan consumed by one collapsed tile job."""
 
-    from .unification.tta_manifest import radial_view_plan_metadata, spherical_view_plan_metadata
+    from .unification.tta_manifest import radial_view_plan_metadata, spherical_view_plan_metadata, projection_sampling_record
     fmt = resolve_channel_format(channel_format)
     return build_forward_raster_plan(
         mode='tta',
         physical_view_id=physical_view_name(view),
-        angle_deg=_angle_from_aug_id(tile_job.aug_id),
+        # Policy pass suffixes identify independent outputs, not geometry.
+        angle_deg=float(view.tta_angle_deg),
         channel_token=str(fmt.token),
         channel_kind=str(fmt.kind),
         channel_count=int(fmt.channel_count),
@@ -4289,6 +4336,7 @@ def build_dense_tile_raster_plan(
             'tile_y': int(tile_job.tile_y),
             **radial_view_plan_metadata(view),
             **spherical_view_plan_metadata(view),
+            **projection_sampling_record(view),
         },
     )
 

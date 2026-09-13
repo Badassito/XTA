@@ -408,9 +408,11 @@ def _validate_spherical_projection(source, view, out_shape_tyx, known_slice_bbox
             or not math.isfinite(minimum) or not math.isfinite(maximum)
             or minimum <= 0 or maximum < minimum
             or radii[0] != minimum or radii[-1] != maximum
-            or np.any(np.diff(radii) <= 0) or np.any(np.diff(radii) > 1.0 + 1e-12)
+            or np.any(np.diff(radii) <= 0)
             or maximum > (min(work) - 1) / 2.0):
         raise ValueError('Spherical trajectory does not match its bounded global radius grid')
+    from .spherical_sampling import validate_spherical_coverage
+    validate_spherical_coverage(view, radii)
     face, intervals = int(view.spherical_face), int(view.spherical_face_intervals)
     origin_u, origin_v = int(view.spherical_u_origin), int(view.spherical_v_origin)
     if (face != view.spherical_face or not 0 <= face < 6
