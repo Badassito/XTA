@@ -3,7 +3,7 @@
 XTA provides test-time augmentation (TTA), pretraining augmentation (PTA), and
 label-time augmentation (LTA) for volumes. The implementation lives in the
 importable `XTA` package. The versioned launcher
-`GPT-6-Astra-Ultra_v21.1.1_SLURM.py`, installed `xta` command, and `python -m XTA`
+`GPT-6-Astra-Ultra_v21.1.2_SLURM.py`, installed `xta` command, and `python -m XTA`
 all enter `XTA.cli.run()`.
 
 This document describes implemented behavior, ownership, and operating controls.
@@ -54,7 +54,7 @@ All module names below are relative to `XTA`.
 | PTA execution | `pta_rendering`, `pta_workers`, `pta_publication`: render plans/caches, process/shared-memory ownership, and atomic image/label publication |
 | LTA planning | `lta_inputs`, `lta_runtime`, `lta_scheduler`: annotation discovery, prompt ranking, physical-view/device ownership, and session admission |
 | LTA model boundary | `lta_sam`, `lta_experimental`: local SAM provenance, runtime-neutral result contracts, and pinned authoritative-mask tracker integration |
-| LTA propagation | `lta_propagation`, `lta_windows`, `lta_tiles`, `lta_tile_tracking`, `lta_relay_episodes`, `lta_tracklets`: temporal windows, spatial relay, lineage matching, and authoritative handoff |
+| LTA propagation | `lta_propagation`, `lta_windows`, `lta_tiles`, `lta_tile_tracking`, `lta_relay_episodes`, `lta_tracklets`, `lta_frontier`, `lta_frontier_execution`: temporal windows, shared relay frontiers, lineage matching, and authoritative handoff |
 | LTA execution/output | `lta_execution`, `lta_workers`, `lta_worker_adapter`, `lta_cpu`, `lta_telemetry`, `lta_rendering`, `lta_union_artifacts`, `lta_postprocessing`, `lta_outputs`: persistent GPU workers, allocation-aware CPU budgets, phase traces, sparse mask transport, relay convergence, one-time backprojection, and final publication |
 | Optional accelerators | `experimental_features`, `intel_compression`, `intel_dsa`, `nvtiff_backend`: feature admission and hardware-specific lifecycle boundaries |
 
@@ -488,20 +488,21 @@ one task slot for a single existing SAM window of at most 30 frames. Verified
 boundary seeds unlock the next window; a center window unlocks backward and
 forward continuations independently. A live tracker session stays on one GPU;
 the next fresh session can run on another. Blocked dependencies stay outside
-ready queues. An empty boundary cancels only its dependent branch. Generation
-counts and an ordered commit cursor avoid rescanning the entire work history.
+ready queues. An empty boundary cancels only its dependent branch. The initial
+annotation graph uses ordered commits; relay attempts use bounded wave schedulers.
 
 Workers retain at most one window's dense union and publish only nonempty,
 tightly cropped frames as little-endian row-packed bits. Omitted frames mean
 zero. Hashing and consumption scale with stored support, not the full source
 depth. The coordinator verifies the packet, ORs only its indexed crops into the
 private view, removes it, and admits more work. Compact audit records still
-commit in plan order. Cross-window relay episodes merge at the original chain
-boundary; window seams do not create additional spatial seeds. Complete relay
-generation fan-in remains necessary because seeding merged arrivals and unioning
-separately propagated arrivals are not equivalent operations.
+commit in plan order. Initial cross-window episodes merge at their original chain
+boundary. Relay observations coalesce by exact lineage and source/destination tile
+after complete temporal waves. Complete spatial-generation fan-in remains
+necessary because seeding merged arrivals and unioning separately propagated
+arrivals are not equivalent operations.
 
-The production relay policy is `same_lineage_directional_coverage/1`. Workers
+The production relay policy is `canonical_temporal_frontier/1`. Workers
 publish per-lineage cropped packed masks and directed model-visited ranges in
 verified coverage packets. The coordinator accumulates them in an ephemeral
 SQLite ledger with a bounded page cache. A relay can hand off to existing work
@@ -511,12 +512,33 @@ direction has already been observed. An axis endpoint has no next transition.
 Backward evidence does not establish a forward transition. A newly added pixel,
 an unmatched lineage, or previously unobserved re-entry remains eligible.
 
-Temporal continuation handoffs consult a read-only snapshot of the previous
-settled generation. Current-generation results populate a separate live ledger;
-completion order cannot influence handoff decisions. Partially handed-off seed
-groups retain the other lineages and their canonical object IDs. Observations
-follow actual model-visited ranges, preserving gaps and excluding policy-zero
-tails. The original authoritative tracks and positives remain independent.
+Relay arrivals advance only to their next shared temporal boundary, with boundaries
+29 frames apart and sessions of at most 30 frames. Forward and backward sweeps
+retain separate directions. Arrivals at a shared boundary combine their complete
+same-lineage masks before the next slab is scheduled. Interior prompt frames remain
+separate inputs; masks are never moved to another frame for batching. No remaining
+prompt-to-volume-edge chain is materialized for an individual relay endpoint.
+
+An ephemeral SQLite frontier stores cropped packed input masks keyed by exact
+lineage/grid/tile/prompt/direction. Source route, original chain, and spatial
+generation are absent from identity. New input foreground can dirty an existing
+mailbox; an identical subset, score change, or provenance change alone cannot.
+Historical input support joins current arrivals before hole filling and coverage
+checks, preserving complementary support that closes a hole. Complete accumulated
+masks condition SAM; pixel differences alone are never used as prompts.
+Before a novel relay is injected, its prompt also retains previously verified
+support from the same lineage, destination tile and frame. This restores object
+context outside a clipped tile overlap. It borrows no other frame or lineage,
+changes no confidence or observed-transition record, and hashes the actual
+enriched, hole-filled mask into the work identity.
+
+Each wave freezes at most 32 input revisions from one temporal sweep slab,
+independently of GPU count. Conflicting lineages retain separate sessions. All
+results, coverage packets and continuation artifacts pass validation before the
+wave can create another attempt. Coverage from earlier waves can establish a
+handoff; results arriving within a wave cannot alter its selected inputs.
+Observations follow actual model-visited ranges, preserving gaps and excluding
+policy-zero tails. Initial authoritative tracks and positives remain independent.
 
 At a generation barrier, overlap episodes coalesce across chains of the same
 lineage and source/destination tile pair. Every original endpoint candidate is
@@ -528,12 +550,14 @@ This handoff policy replaces exhaustive reinjection of already covered seed
 geometry; it does not infer biological identity between different annotation
 lineages. Cross-anchor identity matching remains a separate integration.
 
-The ledger and one prior-generation snapshot use data-dependent scratch space;
-their in-memory SQLite page caches are bounded. Generation summaries record
-raw/coalesced endpoint counts, coverage size, and spatial/temporal handoffs.
-The finite relay-generation guard is fail-closed, not an estimated runtime bound.
-Dependency registration checks only actual parent IDs, avoiding a complete
-history scan for each new node.
+The coverage ledger and frontier use data-dependent scratch space with bounded
+SQLite page caches. Attempt schedulers retain only the current wave. Compact audit
+records and accumulated masks persist across waves. Generation summaries record
+actual windows, waves, outgoing endpoints, coverage, and mailbox state. The number
+of mailbox identities is bounded by the physical frame/tile/lineage domain;
+genuinely new foreground can require multiple revisions and attempts. This is not
+a one-inference-per-cell or wall-time guarantee. The finite spatial-generation
+guard fails publication if new support remains beyond its bound.
 
 Input discovery reports its active scan, probe, and exemplar identity stages.
 Video frame counts use declared metadata when available; FFV1 inputs without a

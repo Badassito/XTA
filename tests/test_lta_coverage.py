@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
 import hashlib
 from pathlib import Path
 import tempfile
@@ -10,6 +10,7 @@ import unittest
 import numpy as np
 
 from XTA.lta_coverage import COVERAGE_SCHEMA, LtaCoverageBuilder, LtaCoverageLedger
+from XTA.lta_propagation import LtaMaskSeed, LtaSeedProvenance
 from XTA.lta_tile_tracking import LtaLineageId
 
 
@@ -49,6 +50,103 @@ def _packet(root, work, *, lineage=None, tile=0, shape=(32, 32),
 
 
 class LtaCoverageTests(unittest.TestCase):
+    def test_prompt_support_restores_context_without_losing_novel_pixels_or_metadata(self):
+        lineage = _lineage()
+        known, incoming = _mask((4, 4), (24, 25)), _mask((4, 4), (5, 5))
+        seed = LtaMaskSeed(
+            lineage, 2, 3, incoming, provenance=LtaSeedProvenance.SPATIAL_RELAY,
+            tracker_probability=0.63, relay_generation=7, visited_tile_indices=(0, 2),
+            source_receipt={"source": "verified-spatial-relay"},
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            packet = _packet(root, "context", observations=((2, 3, 2, "forward"),),
+                             predictions=((2, known),))
+            with LtaCoverageLedger(root / "coverage.sqlite", frame_count=6) as ledger:
+                _ingest(ledger, packet)
+                before = ledger.stats()
+                statements = []
+                ledger._db.set_trace_callback(statements.append)
+                merged = ledger.merge_prompt_support(seed, tile_index=0)
+                self.assertFalse(any(sql.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE")) for sql in statements))
+                self.assertEqual(ledger.stats(), before)
+                np.testing.assert_array_equal(merged.mask, incoming | known)
+                np.testing.assert_array_equal(seed.mask, incoming)
+                self.assertFalse(merged.mask.flags.writeable)
+                for field in fields(seed):
+                    if field.name != "mask":
+                        self.assertEqual(getattr(merged, field.name), getattr(seed, field.name))
+                self.assertFalse(ledger.can_handoff(merged, tile_index=0, direction="forward"))
+                self.assertEqual(ledger.stats()["covered_directional_transitions"], 0)
+
+    def test_prompt_support_never_borrows_other_lineages_frames_tiles_or_views(self):
+        lineage = _lineage()
+        known, incoming = _mask((24, 25)), _mask((4, 4))
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            packet = _packet(root, "context", predictions=((2, known),))
+            with LtaCoverageLedger(root / "coverage.sqlite", frame_count=6) as ledger:
+                _ingest(ledger, packet)
+                for identity, frame, tile in (
+                    (_lineage("other"), 2, 0), (lineage, 1, 0), (lineage, 2, 1),
+                    (_lineage(config="other-config"), 2, 0),
+                    (replace(lineage, runtime_view_id="other-view"), 2, 0),
+                    (replace(lineage, volume_id="other-volume"), 2, 0),
+                ):
+                    with self.subTest(identity=identity, frame=frame, tile=tile):
+                        seed = LtaMaskSeed(identity, frame, 0, incoming)
+                        self.assertIs(ledger.merge_prompt_support(seed, tile_index=tile), seed)
+                already_full = LtaMaskSeed(lineage, 2, 0, incoming | known)
+                self.assertIs(ledger.merge_prompt_support(already_full, tile_index=0), already_full)
+
+    def test_prompt_support_rejects_shape_and_lineage_collision(self):
+        lineage = _lineage()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            packet = _packet(root, "context", predictions=((2, _mask((1, 1))),))
+            with LtaCoverageLedger(root / "coverage.sqlite", frame_count=6) as ledger:
+                _ingest(ledger, packet)
+                with self.assertRaisesRegex(ValueError, "shape"):
+                    ledger.merge_prompt_support(
+                        LtaMaskSeed(lineage, 2, 0, _mask((1, 1), shape=(64, 64))), tile_index=0,
+                    )
+                with self.assertRaisesRegex(ValueError, "outside the run"):
+                    ledger.merge_prompt_support(LtaMaskSeed(lineage, 6, 0, _mask((1, 1))), tile_index=0)
+                ledger._db.execute("UPDATE lineages SET metadata=? WHERE token=?", ('{}', lineage.token))
+                with self.assertRaisesRegex(ValueError, "collides"):
+                    ledger.merge_prompt_support(LtaMaskSeed(lineage, 2, 0, _mask((2, 2))), tile_index=0)
+
+    def test_prompt_support_uses_frozen_snapshot_without_publishing_incoming_support(self):
+        lineage = _lineage()
+        known, later, incoming = _mask((1, 1)), _mask((2, 2)), _mask((3, 3))
+        seed = LtaMaskSeed(lineage, 2, 0, incoming)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            packet = _packet(root, "first", predictions=((2, known),))
+            additional = _packet(root, "later", predictions=((2, later),))
+            with LtaCoverageLedger(root / "main.sqlite", frame_count=6) as ledger:
+                _ingest(ledger, packet)
+                with ledger.snapshot(root / "frozen.sqlite") as snapshot:
+                    _ingest(ledger, additional)
+                    before = snapshot.stats()
+                    merged = snapshot.merge_prompt_support(seed, tile_index=0)
+                    np.testing.assert_array_equal(merged.mask, incoming | known)
+                    self.assertEqual(snapshot.stats(), before)
+                    np.testing.assert_array_equal(
+                        ledger.merge_prompt_support(seed, tile_index=0).mask, incoming | known | later,
+                    )
+
+    def test_prompt_support_rejects_changed_stored_crop(self):
+        lineage = _lineage()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            packet = _packet(root, "context", predictions=((2, _mask((1, 1))),))
+            with LtaCoverageLedger(root / "coverage.sqlite", frame_count=6) as ledger:
+                _ingest(ledger, packet)
+                ledger._db.execute("UPDATE masks SET foreground=2")
+                with self.assertRaisesRegex(RuntimeError, "foreground count"):
+                    ledger.merge_prompt_support(LtaMaskSeed(lineage, 2, 0, _mask((2, 2))), tile_index=0)
+
     def test_both_directions_split_at_prompt_and_preserve_unobserved_transitions(self):
         lineage = _lineage()
         mask = _mask((4, 5), (4, 6))

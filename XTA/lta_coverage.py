@@ -8,7 +8,7 @@ touch in frame space cannot invent a previously untraversed transition.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import json
 import operator
@@ -459,6 +459,61 @@ class LtaCoverageLedger:
                     self._db.execute("INSERT INTO edges VALUES (?,?,?,?,?,?)", (*scope, merged_start, merged_stop))
                 self._db.execute("INSERT INTO packets VALUES (?,?)", (work, digest))
         return {"duplicate": False, "mask_count": len(masks), "directed_interval_count": len(observed)}
+
+    def merge_prompt_support(self, seed: "LtaMaskSeed", *, tile_index: int) -> "LtaMaskSeed":
+        """Restore published same-object context at this exact destination frame.
+
+        This changes only the returned prompt mask. It does not publish the
+        incoming pixels, mark a transition observed, or change seed confidence.
+        Callers must freeze this input before dispatch and record its full mask
+        revision, since destination support may exceed a clipped spatial relay.
+        """
+        from .lta_propagation import LtaMaskSeed
+
+        self._ensure_open()
+        if not isinstance(seed, LtaMaskSeed):
+            raise TypeError("prompt support requires an LtaMaskSeed")
+        lineage = _lineage(seed.lineage)
+        frame = _index(seed.frame_index, "seed frame_index")
+        tile = _index(tile_index, "tile_index")
+        if frame >= self.frame_count:
+            raise ValueError("coverage seed frame is outside the run")
+        candidate = _binary(seed.mask)
+        scope = lineage.token, lineage.tile_config_id, tile
+        geometry = self._db.execute(
+            "SELECT height,width FROM tiles WHERE config=? AND tile=?", scope[1:],
+        ).fetchone()
+        if geometry is not None and tuple(candidate.shape) != tuple(geometry):
+            raise ValueError("coverage candidate shape differs from its known tile")
+        identity = self._db.execute(
+            "SELECT metadata FROM lineages WHERE token=?", (lineage.token,),
+        ).fetchone()
+        record = json.dumps(asdict(lineage), sort_keys=True, separators=(",", ":"))
+        if identity is None:
+            return seed
+        if identity[0] != record:
+            raise ValueError("coverage lineage token collides with different metadata")
+        covered = self._db.execute(
+            "SELECT y,x,height,width,packed,foreground FROM masks "
+            "WHERE token=? AND config=? AND tile=? AND frame=?", (*scope, frame),
+        ).fetchone()
+        if covered is None:
+            return seed
+        y, x, height, width, packed, foreground = covered
+        area = height * width
+        if (geometry is None or min(y, x) < 0 or min(height, width) < 1
+                or y + height > candidate.shape[0] or x + width > candidate.shape[1]
+                or len(packed) != (area + 7) // 8
+                or (area % 8 and packed[-1] >> (area % 8))):
+            raise RuntimeError("coverage stored prompt support geometry is inconsistent")
+        context = _decode(tuple(covered))
+        if foreground <= 0 or int(np.count_nonzero(context)) != foreground:
+            raise RuntimeError("coverage stored prompt support foreground count changed")
+        if not bool(np.any(context & ~candidate[y:y + height, x:x + width])):
+            return seed
+        merged = candidate.copy()
+        merged[y:y + height, x:x + width] |= context
+        return replace(seed, mask=merged)
 
     def can_handoff(self, seed, *, tile_index, direction) -> bool:
         self._ensure_open()

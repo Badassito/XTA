@@ -60,7 +60,7 @@ def execute_traced(context,kind,payload):
     return result
 
 
-def run_case(root,*,pool,cache,view,seeds,windowed,role,device):
+def run_case(root,*,pool,cache,view,seeds,windowed,role,device,canonical_frontier=False):
     root.mkdir(parents=True,exist_ok=False)
     by_frame={seeds[0].frame_index:seeds}
     with mock.patch.object(execution,'_seeds_for_tile',side_effect=lambda *args,**kwargs:by_frame if args[4]==0 else {}):
@@ -92,10 +92,12 @@ def run_case(root,*,pool,cache,view,seeds,windowed,role,device):
         return original_plan(records,**kwargs)
     try:
         with (mock.patch.object(pool,'submit',submit),mock.patch.object(execution,'_plan_relay_generation',plan_relays)):
+            frontier_options={'canonical_frontier':True} if canonical_frontier else {}
             result=execution._drive_workers_to_fixed_point(scheduler=scheduler,pool=pool,initial=tasks,
                         view_plan=view,cache_ref=cache,view_union=union,relay_mask_revisions=revisions,temp_root=root,
-                        conf=0.15,empty_frame_limit=30,worker_task_timeout=600,trace=trace)
+                        conf=0.15,empty_frame_limit=30,worker_task_timeout=600,trace=trace,**frontier_options)
         summary={'status':'complete','source_fingerprint':lta_source_fingerprint(),'logical_union_sha256':hashlib.sha256(memoryview(union)).hexdigest(),
+                 'canonical_frontier':bool(canonical_frontier),
                  'foreground_pixels':int(np.count_nonzero(union)),'generation':result[0],
                  'dispatches':result[2],'worker_audit':result[3],'relays':relay_records,
                  'final_queue_counts':scheduler.queue_counts()}

@@ -8,13 +8,15 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WRAPPER = ROOT / "GPT-6-Astra-Ultra_v21.1.1_SLURM.py"
+WRAPPER = ROOT / "GPT-6-Astra-Ultra_v21.1.2_SLURM.py"
 UNIFIED_MODULES = (
     "experimental_features",
     "gaussian",
     "lta_config",
     "lta_execution",
     "lta_experimental",
+    "lta_frontier",
+    "lta_frontier_execution",
     "lta_inputs",
     "lta_mode",
     "lta_outputs",
@@ -92,7 +94,7 @@ class ImportSurfaceTests(unittest.TestCase):
     def test_module_version(self) -> None:
         completed = self.run_python("-m", "XTA", "--version")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("21.1.1", completed.stdout)
+        self.assertIn("21.1.2", completed.stdout)
 
     def test_cycle_safe_full_import_smoke(self) -> None:
         completed = self.run_python(str(ROOT / "tools" / "smoke_import.py"), "pipeline")

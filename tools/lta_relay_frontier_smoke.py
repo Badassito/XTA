@@ -5,6 +5,8 @@ compare their native_union.npy files and per-object evidence. This is a GPU
 functional qualification, not a throughput benchmark; it makes no speed claim
 and does not heatsoak. The selected source's existing helper limits relay
 generations to 20 and keeps the normal model/seed validation intact.
+Use --canonical-frontier only for a source tree that supports canonical relay
+frontiers; omitting it preserves the retained driver's call signature.
 """
 from __future__ import annotations
 
@@ -56,6 +58,8 @@ def _parser():
     parser.add_argument("--output", type=Path, required=True, help="New or empty evidence directory")
     parser.add_argument("--device", type=int, default=0, help="One logical CUDA device")
     parser.add_argument("--profile", choices=("auto", "egpu", "h100"), default="auto")
+    parser.add_argument("--canonical-frontier", action="store_true",
+                        help="Opt into canonical relay frontiers in the selected source's fixed-point driver")
     parser.add_argument("--plan-only", action="store_true", help="Validate source and portable fixtures without starting a GPU worker")
     return parser
 
@@ -152,6 +156,7 @@ def main():
         "selected_helper_sha256": _sha256(Path(helper.__file__)),
         "command": [sys.executable, *sys.argv], "device": args.device, "profile": args.profile,
         "max_relay_generation": 20, "windowed": True,
+        "canonical_frontier": args.canonical_frontier,
         "fixtures": {name: inputs for name, _cache, _grid, _view, _seeds, inputs in prepared},
         "fixture_results": {}, "scores_root": str(root / "scores"),
         "forced_shutdown_devices": None,
@@ -218,9 +223,13 @@ def main():
                 return result
 
             with mock.patch.object(execution, "_drive_workers_to_fixed_point", save_native_union):
+                # Older retained helpers and drivers do not accept this keyword.
+                # Keep their default replay call identical unless explicitly enabled.
+                frontier_options = {"canonical_frontier": True} if args.canonical_frontier else {}
                 result = helper.run_case(
                     case_root, pool=pool, cache=cache, view=view, seeds=seeds,
                     windowed=True, role=name, device=args.device,
+                    **frontier_options,
                 )
             if not capture or capture["native_union_logical_sha256"] != result["logical_union_sha256"]:
                 raise RuntimeError("saved native union differs from the selected helper's result")
@@ -230,6 +239,7 @@ def main():
             score_files = sorted((root / "scores").glob(name + "-*.json"))
             row = {
                 **result, **capture,
+                "canonical_frontier": args.canonical_frontier,
                 "counts": {
                     "actual_dispatched_tasks": len(result["dispatches"]),
                     "actual_tracker_sessions": audit.get("tracker_session_count"),

@@ -21,6 +21,7 @@ except ModuleNotFoundError:
     install_stubs()
 
 from XTA.geometry import expand_views_into_tta_variants, get_view_infos
+from XTA.lta_coverage import LtaCoverageBuilder
 from XTA.lta_execution import (
     _accumulate_relay_seed_revision,
     _accumulate_worker_ready_audit,
@@ -29,6 +30,7 @@ from XTA.lta_execution import (
     _allocate_view_union,
     _authoritative_tile_owners,
     _consume_chain_manifest,
+    _drive_workers_to_fixed_point,
     _hard_positive_volume,
     _aligned_known_background_frames,
     _known_background_audit,
@@ -61,6 +63,7 @@ from XTA.lta_propagation import (
     write_seed_artifact,
 )
 from XTA.lta_rendering import LtaPhysicalViewCacheRef
+from XTA.lta_relay_episodes import write_relay_observations
 from XTA.lta_runtime import (
     LtaRunPlan,
     LtaRuntimeViewPlan,
@@ -121,12 +124,29 @@ class _FakeWorkerPool:
         union[:, 1, 3] = 1
         union_path = output / "union.uint8.raw"
         union.tofile(union_path)
+        source_seeds = read_seed_artifact(
+            payload["seed_artifact_path"],
+            expected_sha256=payload["seed_artifact_sha256"],
+        )
+        coverage = LtaCoverageBuilder((size, size))
+        for window in payload["windows"]:
+            coverage.mark_observed(
+                tuple(seed.lineage for seed in source_seeds),
+                frame_start=int(window["frame_start"]),
+                frame_stop=int(window["frame_stop"]),
+                prompt_frame=int(window["prompt_frame"]),
+                direction=str(window["direction"]),
+            )
+        for seed in source_seeds:
+            for frame in range(start, stop):
+                coverage.add_prediction(seed.lineage, frame, union[frame - start])
+        coverage_artifact = coverage.write(
+            output, work_id=task.work_id, tile_index=int(payload["tile_index"]),
+            tile_config_id=str(payload["tile_config_id"]),
+        )
         relays = []
         if generation == 0 and int(payload["tile_index"]) == 0:
-            source_seed = read_seed_artifact(
-                payload["seed_artifact_path"],
-                expected_sha256=payload["seed_artifact_sha256"],
-            )[0]
+            source_seed = source_seeds[0]
             relay_mask = np.zeros((size, size), dtype=bool)
             relay_mask[1, 1] = True
             # Model a crossing inside the observation interval so the relay
@@ -179,6 +199,8 @@ class _FakeWorkerPool:
                 "dtype": "uint8",
             },
             "relays": relays,
+            "lineage_coverage": coverage_artifact,
+            "task_granularity": "window" if task.kind == "propagation_window" else "chain",
             "windows": [],
             "profile": {
                 "name": "fake",
@@ -197,6 +219,10 @@ class _FakeWorkerPool:
             },
             "foreground_pixels": int(union.sum()),
         }
+        if generation > 0:
+            # The synthetic neighbor-only edge has no further spatial overlap.
+            # Generation zero retains its explicit forward-only relay fixture.
+            manifest["relay_observation_artifact"] = write_relay_observations(output, {})
         manifest_path = output / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
         return LtaWorkerResult(
@@ -914,7 +940,7 @@ class LtaProductionExecutionTests(unittest.TestCase):
             root = Path(temp_dir)
             with (
                 mock.patch("XTA.lta_execution._relay_generation_bound", return_value=0),
-                self.assertRaisesRegex(RuntimeError, "did not reach a mask fixed point"),
+                self.assertRaisesRegex(RuntimeError, "new support beyond its spatial-generation safety bound"),
             ):
                 self._run(root, (0,))
             self.assertFalse((root / "output" / "manifest.json").exists())
@@ -936,7 +962,10 @@ class LtaProductionExecutionTests(unittest.TestCase):
 
     def test_manifest_replaces_preflight_schedule_with_actual_dynamic_dispatches(self) -> None:
         _FakeWorkerPool.instances.clear()
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch(
+            "XTA.lta_execution._drive_workers_to_fixed_point",
+            wraps=_drive_workers_to_fixed_point,
+        ) as driver:
             result, pool, _bytes = self._run(Path(temp_dir), (0, 1, 2, 3))
             manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
             identity = json.loads((result.manifest_path.parent / "lta_execution_identity.json").read_text())
@@ -946,6 +975,8 @@ class LtaProductionExecutionTests(unittest.TestCase):
                 for line in path.read_text().splitlines()
             ]
 
+        driver.assert_called_once()
+        self.assertIs(driver.call_args.kwargs["canonical_frontier"], True)
         self.assertEqual(identity["contract"], "lta.window_dag/1")
         self.assertEqual(identity["requested_devices"], [0, 1, 2, 3])
         self.assertEqual(identity["scratch_root"], manifest["run_plan"]["temp_root"])
@@ -957,7 +988,7 @@ class LtaProductionExecutionTests(unittest.TestCase):
         self.assertNotIn("status", identity)
         self.assertEqual(identity["source_fingerprint"], manifest["execution"]["worker_audit"]["source_fingerprint"])
         phases = {event["phase"] for event in trace_events if event["event"] == "phase_start"}
-        self.assertTrue({"decode_source_cache", "prepare_authoritative_volume", "plan_seed_window_graph", "worker_pool_startup", "wait_for_window_result", "window_result_reduction", "relay_planning"} <= phases)
+        self.assertTrue({"decode_source_cache", "prepare_authoritative_volume", "plan_seed_window_graph", "worker_pool_startup", "wait_for_window_result", "window_result_reduction", "frontier_spatial_admission"} <= phases)
         self.assertTrue(any(event["event"] == "coordinator_complete" for event in trace_events))
 
         preflight = manifest["run_plan"]["device_schedule"]
@@ -1005,8 +1036,10 @@ class LtaProductionExecutionTests(unittest.TestCase):
                 item["owner_device_id"] != item["execution_device_id"],
             )
             self.assertLess(item["frame_start"], item["frame_stop"])
-            self.assertIn("batch-", item["work_id"])
+            self.assertIn("batch-" if item["relay_generation"] == 0 else "frontier-", item["work_id"])
         audit = manifest["execution"]["worker_audit"]
+        self.assertEqual(audit["canonical_frontier"]["policy"], "canonical_temporal_frontier/1")
+        self.assertGreater(audit["canonical_frontier"]["tasks"], 0)
         self.assertEqual(audit["chain_count"], len(work))
         self.assertEqual(audit["retained_prediction_count"], 0)
         self.assertEqual(

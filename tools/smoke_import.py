@@ -212,6 +212,8 @@ def main() -> None:
         "lta_coverage",
         "lta_cpu",
         "lta_execution",
+        "lta_frontier",
+        "lta_frontier_execution",
         "lta_experimental",
         "lta_mode",
         "lta_inputs",

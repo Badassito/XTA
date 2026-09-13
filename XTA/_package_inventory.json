@@ -11823,5 +11823,363 @@
     "preserved_radial_definition_updates": [],
     "preserved_radial_module_updates": [],
     "complete_modules": []
+  },
+  "v21_1_2_review": {
+    "release": "21.1.2",
+    "previous_review_sha256": "84426381fa7b386607ed8e79a993cf0b51bbbe46b1cfa3db4bc71307385694a4",
+    "definitions": [
+      {
+        "module": "lta_frontier",
+        "name": "_index",
+        "previous_sha256": null,
+        "sha256": "b2e52f4e2650f49eb1ec0b72162fd4417f1f09d72dc3d8d27b3cd254e2c9218f",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "name": "_json",
+        "previous_sha256": null,
+        "sha256": "beb0dd5a98d4b9ddcb52f0f21d89510dff600e08d5c52cd7c468b68eb9ed8d16",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "name": "_revision",
+        "previous_sha256": null,
+        "sha256": "3e9af51912788e2b326a57f62d166b843e71977a1b88df1cfb4f08446e2edf2b",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "name": "_canonical_window",
+        "previous_sha256": null,
+        "sha256": "fa8487a80daa0c4d96f44ba9efe413ae3f33797d7d3176a5cea05a78b6f3e3ae",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "name": "FrontierEntry",
+        "previous_sha256": null,
+        "sha256": "7e5f6bfbf0b5ef30f6ad51668cdc3d0c03d2bcdb1895641cf3606b8afbec72d8",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "name": "CanonicalFrontier",
+        "previous_sha256": null,
+        "sha256": "dec749a773707e3301f38dd245a9da21575d770ed00133e03281c287fc51365b",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier_execution",
+        "name": "_validate_frontier_observation_bindings",
+        "previous_sha256": null,
+        "sha256": "16687d67b03b6dc26b054ab8efdbe55cb486fe41d00c462908fc9d3be8a3dab2",
+        "reason": "Execute canonical relay waves with validated worker receipts, same-lineage destination context and deterministic boundary handoff."
+      },
+      {
+        "module": "lta_frontier_execution",
+        "name": "_drive_canonical_relay_frontier",
+        "previous_sha256": null,
+        "sha256": "b4ee5ad3f617a68c1c6f082e0bdb015fcd605a069df7adc405a94747ef3b3e40",
+        "reason": "Execute canonical relay waves with validated worker receipts, same-lineage destination context and deterministic boundary handoff."
+      },
+      {
+        "module": "lta_coverage",
+        "name": "LtaCoverageLedger",
+        "previous_sha256": "86f1a4950e8b302160d26ea2d3333acc4ea7e8eabe8f96b1d5ec180cb4e78024",
+        "sha256": "dbf4c80b8fa0e422fe2267cb0978708e976807f90e676c6d64bf841afa0ae4d7",
+        "reason": "Restore the exact same-lineage destination mask into relay prompts while retaining novel input support and verified geometry."
+      },
+      {
+        "module": "lta_execution",
+        "name": "_dispatch_available",
+        "previous_sha256": "824208b7ef2b6b70a7ceb7c5a50ffc297d827209f13a7e91978d95c9b4484534",
+        "sha256": "4b41b3b474e38fcd16cf7b3a6e310e2f5980fec8551e951e9161038385ae2798",
+        "reason": "Keep bounded wave task ownership while reporting the canonical controller spatial generation."
+      },
+      {
+        "module": "lta_execution",
+        "name": "_drive_workers_to_fixed_point",
+        "previous_sha256": "8a10775dd9a518025b1275eb6ffad1e6fcb664a7db88b88bdddf1a52ef9dce95",
+        "sha256": "5ab91ff27f901372c18665e3ca11ec252192f86ef4c6d0693f38f56f33d6c080",
+        "reason": "Route production relay execution through the canonical frontier policy with its coverage workspace."
+      },
+      {
+        "module": "lta_execution",
+        "name": "_drive_workers_with_coverage",
+        "previous_sha256": "a83aabc92e666a2bea755927b8d959a066dcbb9787ff8589c0fa2db5708cc6ef",
+        "sha256": "29d0cfd748aea5ec342b9e801f040815cde6bc78d606edfbd3873d9a7a281bd1",
+        "reason": "Complete authoritative window work, then advance spatial relays through shared canonical boundaries instead of independent full-view chains."
+      },
+      {
+        "module": "lta_execution",
+        "name": "execute_lta_plan",
+        "previous_sha256": "bea6c1e310d3fa49f74a74b9e3870f9a1d2ca4f1ba217a4a716bdbba310fd123",
+        "sha256": "f1903fdee877049338a0f72ef9a16a5eb8619206291bfc7d48416d879a8d4853",
+        "reason": "Record the canonical relay frontier contract in execution identity and publication audit metadata."
+      }
+    ],
+    "statements": [
+      {
+        "module": "__init__",
+        "label": "Assign:7",
+        "previous_sha256": "76922e86c08298733c9ec6aca37d29fa7135056f47040e3d6b6d04ed153a4caa",
+        "sha256": "9954c463b7f61a5947f49f9da2c3301629a43ad5bda0256dc99ff5d47f56ccdd",
+        "reason": "Align runtime, compact identifier and sole launcher with the v21.1.2 canonical relay frontier development release."
+      },
+      {
+        "module": "cli",
+        "label": "Assign:13",
+        "previous_sha256": "edab490d024df2e5d636ba966316b772a14dbcb055a9c4f7c53e67ab72595cf5",
+        "sha256": "957d37c6b6e1d8030899fcbe7254bf69fa0e680f4facb87c854718834f83c275",
+        "reason": "Align runtime, compact identifier and sole launcher with the v21.1.2 canonical relay frontier development release."
+      },
+      {
+        "module": "cli",
+        "label": "Assign:14",
+        "previous_sha256": "2794044ed4919e1c5f6d48be64217a22e1405f000c6fb9ac72109eca2518f615",
+        "sha256": "153acac512efcbc4b83038e8aee5ea17888cc6d4df46940dd2214fba9aa26b26",
+        "reason": "Align runtime, compact identifier and sole launcher with the v21.1.2 canonical relay frontier development release."
+      },
+      {
+        "module": "config",
+        "label": "Assign:22",
+        "previous_sha256": "edab490d024df2e5d636ba966316b772a14dbcb055a9c4f7c53e67ab72595cf5",
+        "sha256": "957d37c6b6e1d8030899fcbe7254bf69fa0e680f4facb87c854718834f83c275",
+        "reason": "Align runtime, compact identifier and sole launcher with the v21.1.2 canonical relay frontier development release."
+      },
+      {
+        "module": "config",
+        "label": "Assign:24",
+        "previous_sha256": "8c5c456e647c1202a2215177a8b4515ffc4bea857a4a940de812f7ef134f753d",
+        "sha256": "8bb35550b1362fa663fc682ad558b1533b7d08b1328eb189f11904ef46720d66",
+        "reason": "Align runtime, compact identifier and sole launcher with the v21.1.2 canonical relay frontier development release."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "Expr:1",
+        "previous_sha256": null,
+        "sha256": "4d04fbb9a41fa9740ee320ffd0be121a7c460688d2626232763c1d25b801dba0",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "ImportFrom:10",
+        "previous_sha256": null,
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "ImportFrom:12",
+        "previous_sha256": null,
+        "sha256": "f0f8efc58da939cb5ff4e4496324f7833df197bbf0cff9bb8f65df2f530254f9",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "ImportFrom:13",
+        "previous_sha256": null,
+        "sha256": "a65cdf5e3bd8f9ea2c7701e152d939a4d5508f7709347bd208ea60e6125cec3e",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "Import:14",
+        "previous_sha256": null,
+        "sha256": "092cb77ae0770f1627b29bf41b2732722fbcc3a0e1d77a79674801800a2721d1",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "Import:15",
+        "previous_sha256": null,
+        "sha256": "211ee42757705c7e350e70e36b762987a737f5e9c268f2a343e2dbfcb8fbea75",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "Import:16",
+        "previous_sha256": null,
+        "sha256": "f329650e2c61a07a1bab85b32296a6d93760e313e108904819fa27d09cf3954d",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "Import:17",
+        "previous_sha256": null,
+        "sha256": "60e489325a19bee8be6a450945dd253634f01297b803d2869e489219288b5372",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "ImportFrom:18",
+        "previous_sha256": null,
+        "sha256": "59051b17634cdcb5a576ceb58fdc0a4e5652ed3b60d66667e92ddefd931abeca",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "Import:19",
+        "previous_sha256": null,
+        "sha256": "f8e24ee9b1b0f58e74fe0f070306d6d3e397283e6726b126540d1c4a2e8d5c1d",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "ImportFrom:20",
+        "previous_sha256": null,
+        "sha256": "40df91c16312754769db381b92a50d223932b28beb76d17581061a55cc87ddee",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "Import:22",
+        "previous_sha256": null,
+        "sha256": "271fc31378e1108a9784c29c3c4768de571ce080301b4ad9721ba767fcf5842b",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "ImportFrom:24",
+        "previous_sha256": null,
+        "sha256": "cfc5de2b4e65e212d73b3023c2f3636f2413c532efd14c13cf0ca502a0846290",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "ImportFrom:25",
+        "previous_sha256": null,
+        "sha256": "c492e6bbb72345f6db451c50780f4d4140af119622f1bef35adf686cf87399d7",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "ImportFrom:26",
+        "previous_sha256": null,
+        "sha256": "b65551c8bcf29e30686e5ca786867349da7ec8be6a70f56e6e0ae8c09f415280",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "ImportFrom:27",
+        "previous_sha256": null,
+        "sha256": "0ab27847b0035e5cc4ccb4a8bed7b667433e0df35766a3267fc6e403b2eea1b3",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "Assign:30",
+        "previous_sha256": null,
+        "sha256": "765b8aadbec7c2e9f32d6c633624778a39f64b02ba770fc5a67805c796dc36fa",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "Assign:31",
+        "previous_sha256": null,
+        "sha256": "9189c06044b73d1177e81d0cfc010a4d39d6f4b00622bccf42afc2d12b8e4573",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "Assign:32",
+        "previous_sha256": null,
+        "sha256": "d5bbea3deca360ba24a81b8629f386338e8721fc38a9b3b236908c82a59d6aa1",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "Assign:33",
+        "previous_sha256": null,
+        "sha256": "b4e6de103b05a38872e7341ccd9c381752e34763c6419c1adfd51dcc66eb7bde",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier",
+        "label": "Assign:322",
+        "previous_sha256": null,
+        "sha256": "135b8ede29a229086e8c8741fa44b1c1a9806c1dbd4d71918a4da1bccefe06e9",
+        "reason": "Persist full-mask canonical relay mailboxes with deterministic bounded waves, revision leases and exact lineage isolation."
+      },
+      {
+        "module": "lta_frontier_execution",
+        "label": "Expr:1",
+        "previous_sha256": null,
+        "sha256": "b89a35e5e9bdf827d3f872b115ba6a10b3b8f05aab6fc70544d0709da25e5615",
+        "reason": "Execute canonical relay waves with validated worker receipts, same-lineage destination context and deterministic boundary handoff."
+      },
+      {
+        "module": "lta_frontier_execution",
+        "label": "ImportFrom:3",
+        "previous_sha256": null,
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Execute canonical relay waves with validated worker receipts, same-lineage destination context and deterministic boundary handoff."
+      },
+      {
+        "module": "lta_frontier_execution",
+        "label": "ImportFrom:5",
+        "previous_sha256": null,
+        "sha256": "faa9956a812f71638fe3d1f211b627659202baa6a9e4e5ca7b2a8fc450dc71e1",
+        "reason": "Execute canonical relay waves with validated worker receipts, same-lineage destination context and deterministic boundary handoff."
+      },
+      {
+        "module": "lta_frontier_execution",
+        "label": "ImportFrom:6",
+        "previous_sha256": null,
+        "sha256": "29b4ccf1cee0a9c97cadf1694464fdb7bd4d84e10e0d7ff9b3bc308cb10552e4",
+        "reason": "Execute canonical relay waves with validated worker receipts, same-lineage destination context and deterministic boundary handoff."
+      },
+      {
+        "module": "lta_frontier_execution",
+        "label": "ImportFrom:7",
+        "previous_sha256": null,
+        "sha256": "fc4a5b685f9262165072aad60e76126f41a88ac15ded775689201fa9fa1cf5c8",
+        "reason": "Execute canonical relay waves with validated worker receipts, same-lineage destination context and deterministic boundary handoff."
+      },
+      {
+        "module": "lta_frontier_execution",
+        "label": "Import:8",
+        "previous_sha256": null,
+        "sha256": "092cb77ae0770f1627b29bf41b2732722fbcc3a0e1d77a79674801800a2721d1",
+        "reason": "Execute canonical relay waves with validated worker receipts, same-lineage destination context and deterministic boundary handoff."
+      },
+      {
+        "module": "lta_frontier_execution",
+        "label": "ImportFrom:9",
+        "previous_sha256": null,
+        "sha256": "59051b17634cdcb5a576ceb58fdc0a4e5652ed3b60d66667e92ddefd931abeca",
+        "reason": "Execute canonical relay waves with validated worker receipts, same-lineage destination context and deterministic boundary handoff."
+      },
+      {
+        "module": "lta_frontier_execution",
+        "label": "Import:10",
+        "previous_sha256": null,
+        "sha256": "ff05bad0fd9a7212d3cd85fd2726055168be21bc8f6e0d93b29965794b0675d4",
+        "reason": "Execute canonical relay waves with validated worker receipts, same-lineage destination context and deterministic boundary handoff."
+      },
+      {
+        "module": "lta_frontier_execution",
+        "label": "Assign:13",
+        "previous_sha256": null,
+        "sha256": "d6055409ae6766128f98044ae0e73eea31a4c18dab021abd60f4c32a394bf325",
+        "reason": "Execute canonical relay waves with validated worker receipts, same-lineage destination context and deterministic boundary handoff."
+      },
+      {
+        "module": "lta_frontier_execution",
+        "label": "Assign:14",
+        "previous_sha256": null,
+        "sha256": "04058a5d4a6801ecc8e2445d55fca2f57954191c6fdab361862576f05bfde753",
+        "reason": "Execute canonical relay waves with validated worker receipts, same-lineage destination context and deterministic boundary handoff."
+      }
+    ],
+    "local_import_seam_updates": [],
+    "preserved_radial_definition_updates": [],
+    "preserved_radial_module_updates": [],
+    "complete_modules": [
+      "lta_frontier",
+      "lta_frontier_execution"
+    ]
   }
 }

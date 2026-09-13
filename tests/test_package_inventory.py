@@ -31,6 +31,43 @@ def inspect_seams(source: str):
 
 
 class PackageInventoryTests(unittest.TestCase):
+    def test_frontier_release_authenticates_new_modules_and_prior_release(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = manifest['v21_1_2_review']
+        self.assertEqual(review['complete_modules'], ['lta_frontier', 'lta_frontier_execution'])
+        self.assertEqual(review['previous_review_sha256'],
+                         '84426381fa7b386607ed8e79a993cf0b51bbbe46b1cfa3db4bc71307385694a4')
+        next(item for item in review['definitions'] if item['name'] == 'CanonicalFrontier')['sha256'] = '0' * 64
+        with self.assertRaisesRegex(RuntimeError, 'v21.1.2 review digest mismatch'):
+            inventory.reviewed_v21_1_2_contract(
+                manifest, manifest['v21_review'],
+                *(manifest[f'v21_0_{i}_review'] for i in range(1, 7)),
+                manifest['v21_1_review'], manifest['v21_1_1_review'],
+            )
+
+    def test_frontier_release_requires_latest_version_predecessor(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = manifest['v21_1_2_review']
+        next(item for item in review['statements'] if item['module'] == '__init__')['previous_sha256'] = '0' * 64
+        authenticated = hashlib.sha256(json.dumps(review, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        with mock.patch.object(inventory, 'REVIEWED_V21_1_2_SHA256', authenticated):
+            with self.assertRaisesRegex(RuntimeError, 'v21.1.2 supersession does not match its historical pin'):
+                inventory.reviewed_v21_1_2_contract(
+                    manifest, manifest['v21_review'],
+                    *(manifest[f'v21_0_{i}_review'] for i in range(1, 7)),
+                    manifest['v21_1_review'], manifest['v21_1_1_review'],
+                )
+
+    def test_frontier_controller_and_driver_have_independent_definition_pins(self):
+        original_digest = inventory.digest
+        for target in ('CanonicalFrontier', '_drive_canonical_relay_frontier'):
+            def changed_digest(node):
+                return '0' * 64 if getattr(node, 'name', None) == target else original_digest(node)
+
+            with self.subTest(target=target), mock.patch.object(inventory, 'digest', side_effect=changed_digest):
+                with self.assertRaisesRegex(RuntimeError, 'reviewed definition changed or is missing:'):
+                    verify_inventory()
+
     def test_overlap_release_authenticates_the_explicit_concurrency_option(self):
         manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
         manifest['v21_1_1_review']['definitions'][0]['sha256'] = '0' * 64
@@ -302,7 +339,8 @@ class PackageInventoryTests(unittest.TestCase):
             return tree
 
         for module in ('spherical_projection_bounds', 'spherical_preflight',
-                       'geometry_quality', 'spherical_projection_cpu', 'spherical_sampling_cuda'):
+                       'geometry_quality', 'spherical_projection_cpu', 'spherical_sampling_cuda',
+                       'lta_frontier', 'lta_frontier_execution'):
             with self.subTest(module=module), mock.patch.object(inventory.ast, 'parse', side_effect=parse_with_extra_statement):
                 with self.assertRaisesRegex(RuntimeError, f'complete-module statement coverage differs: {module}'):
                     verify_inventory()

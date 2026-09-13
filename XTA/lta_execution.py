@@ -1703,6 +1703,7 @@ def _dispatch_available(
     *,
     tasks_root: Path,
     trace: object | None = None,
+    generation_override: int | None = None,
 ) -> None:
     slots = (
         (device_id, worker_index)
@@ -1720,9 +1721,10 @@ def _dispatch_available(
         if claim is None:
             continue
         attempt = uuid.uuid4().hex
+        task_generation = claim.work.relay_generation if generation_override is None else int(generation_override)
         task_dir = (
             tasks_root
-            / f"generation-{claim.work.relay_generation:04d}"
+            / f"generation-{task_generation:04d}"
             / _safe_token(claim.work.work_id)
             / attempt
         )
@@ -1755,7 +1757,7 @@ def _dispatch_available(
                 "volume_id": claim.work.view.volume_id,
                 "physical_view_id": claim.work.view.physical_view_id,
                 "runtime_view_id": claim.work.runtime_view_id,
-                "relay_generation": claim.work.relay_generation,
+                "relay_generation": task_generation,
                 "plan_order": claim.work.plan_order,
                 "frame_start": claim.work.frame_start,
                 "frame_stop": claim.work.frame_stop,
@@ -1853,6 +1855,7 @@ def _drive_workers_to_fixed_point(
     empty_frame_limit: int | None,
     worker_task_timeout: float,
     trace: object | None = None,
+    canonical_frontier: bool = False,
 ):
     from .lta_coverage import LtaCoverageLedger
 
@@ -1868,6 +1871,7 @@ def _drive_workers_to_fixed_point(
             temp_root=temp_root, conf=conf, empty_frame_limit=empty_frame_limit,
             worker_task_timeout=worker_task_timeout, trace=trace,
             coverage=coverage, snapshots=snapshots,
+            canonical_frontier=canonical_frontier,
         )
 
 
@@ -1887,6 +1891,7 @@ def _drive_workers_with_coverage(
     trace: object | None = None,
     coverage: object,
     snapshots: ExitStack,
+    canonical_frontier: bool = False,
 ) -> tuple[
     int,
     Mapping[int, int],
@@ -1929,7 +1934,7 @@ def _drive_workers_with_coverage(
     worker_audit["skipped_window_count"] = 0
     worker_audit["workers_per_gpu"] = scheduler.workers_per_device
     admission_audit: dict[str, object] = {
-        "policy": "same_lineage_directional_coverage/1",
+        "policy": "canonical_temporal_frontier/1" if canonical_frontier else "same_lineage_directional_coverage/1",
         "spatial_seed_candidates": 0, "spatial_seed_handoffs": 0,
         "repeated_seed_revisions": 0, "temporal_seed_handoffs": 0,
         "temporal_window_handoffs": 0, "coalesced_generations": [],
@@ -2228,6 +2233,25 @@ def _drive_workers_with_coverage(
             continue
 
         emit_generation_relays()
+        if canonical_frontier:
+            if not windowed or generation != 0:
+                raise RuntimeError("canonical frontier requires the initial bounded window graph")
+            from .lta_frontier_execution import _drive_canonical_relay_frontier
+
+            snapshots.close()
+            _unlink_consumed_temp_artifacts((prior_coverage_path,), temp_root=temp_root)
+            generation = _drive_canonical_relay_frontier(
+                relay_records.get(0, ()), pool=pool, view_plan=view_plan,
+                cache_ref=cache_ref, view_union=view_union, coverage=coverage,
+                temp_root=temp_root, conf=conf, empty_frame_limit=empty_frame_limit,
+                worker_task_timeout=worker_task_timeout, trace=trace,
+                worker_audit=worker_audit, dispatched=dispatched,
+                first_plan_order=next_plan_order, max_relay_generations=scheduler.max_relay_generation,
+                device_ids=scheduler.device_ids, workers_per_device=scheduler.workers_per_device,
+            )
+            admission_audit["policy"] = "canonical_temporal_frontier/1"
+            scheduler.seal_view(view_key)
+            break
         if generation >= scheduler.max_relay_generation:
             overflow = plan_relays(
                 relay_records.get(generation, ()),
@@ -2308,11 +2332,11 @@ def _drive_workers_with_coverage(
         len(ranges) for ranges in authoritative_active_coverage.values()
     )
     worker_audit["window_graph"] = {
-        "planned_work_count": len(scheduler.work),
+        "planned_work_count": len(scheduler.work) + int(worker_audit.get("canonical_frontier", {}).get("tasks", 0)),
         "dispatched_work_count": len(dispatched),
         "skipped_work_count": int(worker_audit["skipped_window_count"]),
         "dependency_readiness": "verified_window_completion",
-        "relay_fan_in": "original_chain_then_generation",
+        "relay_fan_in": "canonical_waves_then_generation" if canonical_frontier else "original_chain_then_generation",
     }
     return (
         generation,
@@ -2488,16 +2512,16 @@ def execute_lta_plan(
             "requested_devices": list(plan.device_ids),
             "workers_per_gpu": plan.workers_per_gpu,
             "maximum_concurrent_worker_tasks": len(plan.device_ids) * plan.workers_per_gpu,
-            "relay_admission_policy": "same_lineage_directional_coverage/1",
+            "relay_admission_policy": "canonical_temporal_frontier/1",
             "scratch_root": str(plan.temp_root),
             "run_completion_marker": "manifest.json",
         })
     except BaseException:
         trace.close()
         raise
-    trace.event("run_contract", version=__version__, contract="lta.window_dag/1", source_fingerprint=fingerprint, devices=list(plan.device_ids), workers_per_gpu=plan.workers_per_gpu, scratch_root=str(plan.temp_root), relay_admission_policy="same_lineage_directional_coverage/1")
+    trace.event("run_contract", version=__version__, contract="lta.window_dag/1", source_fingerprint=fingerprint, devices=list(plan.device_ids), workers_per_gpu=plan.workers_per_gpu, scratch_root=str(plan.temp_root), relay_admission_policy="canonical_temporal_frontier/1")
     trace.flush()
-    print(f"LTA v{__version__}: contract=lta.window_dag/1 max_window_frames=30 devices={list(plan.device_ids)} workers_per_gpu={plan.workers_per_gpu} relay_admission=same_lineage_directional_coverage/1 source_sha256={fingerprint['sha256']} diagnostics={trace_dir}", flush=True)
+    print(f"LTA v{__version__}: contract=lta.window_dag/1 max_window_frames=30 devices={list(plan.device_ids)} workers_per_gpu={plan.workers_per_gpu} relay_admission=canonical_temporal_frontier/1 source_sha256={fingerprint['sha256']} diagnostics={trace_dir}", flush=True)
     from .lta_cpu import resolve_worker_cpu_budget
     parent_cpu_budget = resolve_worker_cpu_budget(len(plan.device_ids) * plan.workers_per_gpu)
     effective_cpu_count = int(parent_cpu_budget["effective_cpu_count"])
@@ -2602,6 +2626,7 @@ def execute_lta_plan(
                     empty_frame_limit=empty_frame_limit,
                     worker_task_timeout=float(worker_task_timeout),
                     trace=trace,
+                    canonical_frontier=True,
                 )
             )
             worker_audit = {
@@ -2881,7 +2906,7 @@ def execute_lta_plan(
                     "worker_task_timeout_seconds": float(worker_task_timeout),
                     "relay_generations": relay_generation,
                     "cross_tile_tracking": "eight_neighbor_fixed_point",
-                    "relay_admission_policy": "same_lineage_directional_coverage/1",
+                    "relay_admission_policy": "canonical_temporal_frontier/1",
                     "authoritative_tile_seeding": dict(authoritative_seed_audit),
                     "temporal_propagation": {
                         "policy": "full_view_per_anchor_recall_union",
