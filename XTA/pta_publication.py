@@ -12,7 +12,8 @@ import os
 import stat as statlib
 import threading
 import uuid
-from dataclasses import dataclass
+from concurrent.futures import Executor, Future
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -33,7 +34,7 @@ from .render_batch import RenderBatch as CanonicalRenderBatch, RenderBatchItem
 from .unification.contracts import DataRole, FrameAddress, RasterPlan, RenderItem
 
 
-OUTPUT_IMAGE_FORMATS = {"png", "jpg", "jpeg", "tif", "tiff"}
+OUTPUT_IMAGE_FORMATS = {"png", "jpg", "jpeg", "tif", "tiff", "nvjpeg", "nvtiff"}
 
 
 def parse_output_image_format(value: str) -> str:
@@ -42,9 +43,9 @@ def parse_output_image_format(value: str) -> str:
     if normalized not in OUTPUT_IMAGE_FORMATS:
         supported = ", ".join(sorted(OUTPUT_IMAGE_FORMATS))
         raise argparse.ArgumentTypeError(f"unsupported output image format {value!r}; choose one of: {supported}")
-    if normalized == "jpeg":
+    if normalized in {"jpeg", "nvjpeg"}:
         return "jpg"
-    if normalized == "tiff":
+    if normalized in {"tiff", "nvtiff"}:
         return "tif"
     return normalized
 
@@ -138,7 +139,37 @@ def _validate_jpeg_file(path: Path, *, context: str) -> int:
     return size
 
 
-def _write_nvjpeg_batch_atomically(
+@dataclass(frozen=True)
+class NvjpegEncodedBatch:
+    """Owned host JPEG bytes; no CUDA images, encoder objects or borrowed buffers."""
+
+    final_paths: Tuple[Path, ...]
+    payloads: Tuple[bytes, ...] = field(repr=False)
+
+    def __post_init__(self) -> None:
+        paths = tuple(Path(path) for path in self.final_paths)
+        payloads = tuple(bytes(payload) for payload in self.payloads)
+        if not paths or len(paths) != len(payloads):
+            raise ValueError("Encoded JPEG batch requires one payload per destination")
+        if len(set(paths)) != len(paths):
+            raise ValueError("Encoded JPEG batch contains duplicate destination paths")
+        object.__setattr__(self, "final_paths", paths)
+        object.__setattr__(self, "payloads", payloads)
+
+    @property
+    def nbytes(self) -> int:
+        return sum(len(payload) for payload in self.payloads)
+
+
+class NvjpegCudaFenceError(RuntimeError):
+    """CUDA completion is unproved; the owning process must stop GPU publication."""
+
+
+_NVJPEG_QUARANTINED_BATCHES: List[Tuple[object, ...]] = []
+_NVJPEG_QUARANTINE_LOCK = threading.Lock()
+
+
+def _encode_nvjpeg_batch(
     *,
     encoder: object,
     images: Sequence[object],
@@ -146,93 +177,168 @@ def _write_nvjpeg_batch_atomically(
     params: object,
     cuda_stream: object,
     synchronize_device: Optional[Callable[[], None]] = None,
-) -> None:
-    """Encode, settle, validate, then publish one nvJPEG batch.
+    input_owners: Sequence[object] = (),
+) -> NvjpegEncodedBatch:
+    """Encode and settle a batch into immutable, independently owned host bytes.
 
     nvImageCodec 0.9's native file sink can report encoder success even when a
     sink write leaves an empty file. Encode to in-memory CodeStreams, validate
     their buffers, and let Python own the checked same-directory file write.
+    Both existing CUDA fences remain here before any input or CodeStream owner
+    can retire. Filesystem publication can then overlap the following GPU batch.
     """
 
+    with _NVJPEG_QUARANTINE_LOCK:
+        if _NVJPEG_QUARANTINED_BATCHES:
+            raise NvjpegCudaFenceError("A previous nvJPEG CUDA fence failed; this process is quarantined")
     finals = tuple(Path(path) for path in final_paths)
-    if not finals or len(finals) != len(images):
+    source_images = tuple(images)
+    if not finals or len(finals) != len(source_images):
         raise ValueError(
-            f"nvJPEG atomic batch mismatch: images={len(images)}, paths={len(finals)}"
+            f"nvJPEG atomic batch mismatch: images={len(source_images)}, paths={len(finals)}"
         )
     resolved_finals = [path.resolve(strict=False) for path in finals]
     if len(set(resolved_finals)) != len(resolved_finals):
         raise ValueError("nvJPEG atomic batch contains duplicate destination paths")
-    stages = tuple(_private_image_stage_path(path, "nvjpeg") for path in finals)
-    for path in finals:
-        ensure_output_parent_once(path)
+    raw_results = None
+    encode_error: Optional[BaseException] = None
     try:
         raw_results = encoder.encode(  # type: ignore[union-attr]
-            list(images),
+            list(source_images),
             codec=".jpg",
             params=params,
             cuda_stream=int(getattr(cuda_stream, "cuda_stream")),
         )
+    except BaseException as exc:
+        # A native exception does not prove that no CUDA work was enqueued.
+        encode_error = exc
+    fence_errors: List[BaseException] = []
+    try:
         synchronize = getattr(cuda_stream, "synchronize", None)
         if callable(synchronize):
             synchronize()
+    except BaseException as exc:
+        fence_errors.append(exc)
+    try:
         if synchronize_device is not None:
             synchronize_device()
-        results = (
-            list(raw_results)
-            if isinstance(raw_results, (list, tuple))
-            else [raw_results]
+    except BaseException as exc:
+        fence_errors.append(exc)
+    if fence_errors:
+        # Do not put CUDA owners on the exception: multiprocessing must be able
+        # to transport the failure without pickling tensors or native handles.
+        with _NVJPEG_QUARANTINE_LOCK:
+            _NVJPEG_QUARANTINED_BATCHES.append(
+                (encoder, source_images, tuple(input_owners), params, cuda_stream,
+                 synchronize_device, raw_results))
+        raise NvjpegCudaFenceError(
+            "nvJPEG CUDA fence failed; image, encoder and CodeStream owners remain quarantined"
+        ) from fence_errors[0]
+    if encode_error is not None:
+        if isinstance(encode_error, Exception):
+            raise encode_error
+        raise RuntimeError("nvJPEG encoding failed after CUDA work was drained") from encode_error
+    results = list(raw_results) if isinstance(raw_results, (list, tuple)) else [raw_results]
+    if len(results) != len(finals):
+        raise RuntimeError(
+            f"nvImageCodec returned {len(results)} result(s) for {len(finals)} JPEG file(s)"
         )
-        if len(results) != len(stages):
+    payloads: List[bytes] = []
+    for index, result in enumerate(results):
+        if result is None:
+            raise RuntimeError(f"nvImageCodec failed JPEG batch index {index}")
+        try:
+            payload = memoryview(result)
+            if payload.format != "B" or payload.ndim != 1:
+                payload = payload.cast("B")
+        except (TypeError, ValueError) as exc:
             raise RuntimeError(
-                f"nvImageCodec returned {len(results)} result(s) for {len(stages)} JPEG file(s)"
+                f"nvImageCodec returned a non-buffer CodeStream at JPEG batch index {index}: "
+                f"{type(result).__name__}"
+            ) from exc
+        declared_size = int(getattr(result, "size", payload.nbytes))
+        if declared_size < 0 or declared_size > int(payload.nbytes):
+            raise RuntimeError(
+                f"nvImageCodec returned an invalid JPEG CodeStream size at batch index "
+                f"{index}: size={declared_size}, buffer={payload.nbytes}"
             )
-        payloads: List[memoryview] = []
-        for index, result in enumerate(results):
-            if result is None:
-                raise RuntimeError(f"nvImageCodec failed JPEG batch index {index}")
-            try:
-                payload = memoryview(result)
-                if payload.format != "B" or payload.ndim != 1:
-                    payload = payload.cast("B")
-            except (TypeError, ValueError) as exc:
+        payload = payload[:declared_size]
+        if int(payload.nbytes) < 4:
+            raise RuntimeError(
+                f"nvImageCodec produced an empty/truncated JPEG CodeStream at batch index "
+                f"{index}: {int(payload.nbytes)} bytes"
+            )
+        if bytes(payload[:2]) != b"\xff\xd8" or b"\xff\xd9" not in bytes(payload[-64:]):
+            raise RuntimeError(f"nvImageCodec produced invalid JPEG markers at batch index {index}")
+        # A subsequent encoder call must not mutate a queued batch through a
+        # reused CodeStream buffer. Only compressed bytes are copied here.
+        payloads.append(bytes(payload))
+    return NvjpegEncodedBatch(finals, tuple(payloads))
+
+
+def _publish_nvjpeg_batch_atomically(
+    batch: NvjpegEncodedBatch, *, executor: Optional[Executor] = None,
+) -> None:
+    """Write, verify and publish an encoded host batch, with bounded I/O concurrency.
+
+    An optional persistent file executor must be separate from the executor
+    running this function. Every submitted write settles before stage cleanup;
+    no destination is renamed until all stages have passed validation.
+    """
+    finals = batch.final_paths
+    stages = tuple(_private_image_stage_path(path, "nvjpeg") for path in finals)
+    futures: List[Future] = []
+
+    def write_stage(index: int, payload: bytes, stage: Path) -> None:
+        with stage.open("wb") as handle:
+            written = handle.write(payload)
+            if int(written) != len(payload):
                 raise RuntimeError(
-                    f"nvImageCodec returned a non-buffer CodeStream at JPEG batch index {index}: "
-                    f"{type(result).__name__}"
-                ) from exc
-            declared_size = int(getattr(result, "size", payload.nbytes))
-            if declared_size < 0 or declared_size > int(payload.nbytes):
-                raise RuntimeError(
-                    f"nvImageCodec returned an invalid JPEG CodeStream size at batch index "
-                    f"{index}: size={declared_size}, buffer={payload.nbytes}"
+                    f"Python JPEG stage write was short at batch index {index}: "
+                    f"{written}/{len(payload)} bytes"
                 )
-            payload = payload[:declared_size]
-            if int(payload.nbytes) < 4:
-                raise RuntimeError(
-                    f"nvImageCodec produced an empty/truncated JPEG CodeStream at batch index "
-                    f"{index}: {int(payload.nbytes)} bytes"
-                )
-            if bytes(payload[:2]) != b"\xff\xd8" or b"\xff\xd9" not in bytes(payload[-64:]):
-                raise RuntimeError(
-                    f"nvImageCodec produced invalid JPEG markers at batch index {index}"
-                )
-            payloads.append(payload)
-        for index, (payload, stage) in enumerate(zip(payloads, stages)):
-            with stage.open("wb") as handle:
-                written = handle.write(payload)
-                if int(written) != int(payload.nbytes):
-                    raise RuntimeError(
-                        f"Python JPEG stage write was short at batch index {index}: "
-                        f"{written}/{payload.nbytes} bytes"
-                    )
-            _validate_jpeg_file(stage, context=f"nvJPEG batch index {index}")
+        _validate_jpeg_file(stage, context=f"nvJPEG batch index {index}")
+
+    try:
+        for path in finals:
+            ensure_output_parent_once(path)
+        for index, (payload, stage) in enumerate(zip(batch.payloads, stages)):
+            if executor is None:
+                write_stage(index, payload, stage)
+            else:
+                futures.append(executor.submit(write_stage, index, payload, stage))
+        for future in futures:
+            future.result()
         for stage, final in zip(stages, finals):
             os.replace(stage, final)
     finally:
+        for future in futures:
+            future.cancel()
+        for future in futures:
+            try:
+                future.result()
+            except BaseException:
+                pass
         for stage in stages:
             try:
                 stage.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def _write_nvjpeg_batch_atomically(
+    *, encoder: object, images: Sequence[object], final_paths: Sequence[Path],
+    params: object, cuda_stream: object,
+    synchronize_device: Optional[Callable[[], None]] = None,
+    input_owners: Sequence[object] = (),
+) -> None:
+    """Compatibility boundary: encode, settle, validate, then publish synchronously."""
+    batch = _encode_nvjpeg_batch(
+        encoder=encoder, images=images, final_paths=final_paths, params=params,
+        cuda_stream=cuda_stream, synchronize_device=synchronize_device,
+        input_owners=input_owners,
+    )
+    _publish_nvjpeg_batch_atomically(batch)
 
 
 def verify_published_image_tree(

@@ -83,6 +83,108 @@ REVIEWED_V22_POLICY_WINDOW_PREDECESSOR_BUNDLE_SHA256 = '9443efd0468c59d3b39b2323
 REVIEWED_V22_POLICY_WINDOW_PREDECESSOR_SHA256 = '39ed77ed4f861333ef9252ab559c99eeb5b519944a32d80fc7f223c2703fd94a'
 REVIEWED_V22_POLICY_WINDOW_SHA256 = 'd816923892fe819dbb155119525178d8bd1af4117065a92feafbce0adde86b8a'
 REVIEWED_V22_POLICY_WINDOW_PRESERVED_PIPELINE_SHA256 = '566158efcda0ca7ea2370e6a51681cd338386a708b55eb5537d304bab3f3cc95'
+REVIEWED_V22_TILTED_AZIMUTHAL_PREDECESSOR_COMMIT = '6365f0c0a75d704d9453696e9070cafa22a26434'
+REVIEWED_V22_TILTED_AZIMUTHAL_PREDECESSOR_SHA256 = 'b3e5c9e99c29d7e96d5e6788460c1f6fd2e7ecfaaa530703f66aa116220dd6d2'
+REVIEWED_V22_TILTED_AZIMUTHAL_SHA256 = 'efb3bb2ae63be95d3faac73b6b28b28279aa8fb495f08d0cb4c8d6b1dd89ff95'
+# PTA succeeds the distributed Tilted Azimuthal source bundle; no Git commit
+# is invented for that artifact. Its entire inventory and original module ASTs
+# remain independently authenticated while publication and CLI work proceeds.
+REVIEWED_V22_PTA_THROUGHPUT_PREDECESSOR_BUNDLE_SHA256 = '44c5c5be060ade84e03e2660b1a1ef1e270bd474f68f32b7f81ed787d0db1b16'
+REVIEWED_V22_PTA_THROUGHPUT_PREDECESSOR_SHA256 = 'd2fa9727da49fcf4f577772e44d38836d4a3944093a10812936a9552877827a2'
+REVIEWED_V22_PTA_THROUGHPUT_SHA256 = 'a9f548390c5d6881bb244cf0ee7f4333323b7e1c923079eb682f4248d779c46e'
+REVIEWED_V22_1_RELEASE_PREDECESSOR_BUNDLE_SHA256 = '5c3cbcdf7310293e92c8bd7386959d0be9d529acfb9d726a77896c7f520055ef'
+REVIEWED_V22_1_RELEASE_PREDECESSOR_SHA256 = 'ba0fd46550164281ae5888477d471ea4e1890ea9f9fb6350b5792de43e574058'
+REVIEWED_V22_1_RELEASE_SHA256 = 'ff127bae6e22022e69e9d325b0c3270cfc2cb53660aaad28ffc932cb07025f6b'
+REVIEWED_V22_1_RELEASE_PRESERVED_MODULES = {
+    '__init__': 'b220d045ae75a96d4e3bc2a61dc2f36feb6f5d5b6edaf09e9513e16b7acbeec8',
+    'cli': 'd4083653fa24aedbc09f3af32c92cab108abcac977be91a5b2ca5c043d03149f',
+    'config': 'b8e594aaf6db34d1c5ca334f177ba46e80f5933bb073544a8c0178c14d256685',
+}
+REVIEWED_V22_PTA_PREDECESSOR_MODULES = {
+    'pta': '18853a78b464a41017f82d8020f4905d3d5d953d16693abad5067f192b00cfe4',
+    'pta_scheduler': '067bfa10b01e5820aa949197e5776af8ce968278b561cf57d46eff883fca5ee6',
+    'pta_config': '60d4b4ce90e15b752a225cd998827e4e925c8599d79e59de8bf5137f092d707b',
+    'pta_runtime': 'e55c20b72fb956d1a7476ec05fe4f00143bdac8f8109c5bdafffa1f0ef7126c0',
+    'pta_publication': '75a806be8a9fd460a6c01e822269d08df5a397d959355a35d3f6941a6c86fe50',
+    'pta_workers': 'f0b08380e384f14315db9f883f41c7d38bdeaec391a135150a43b0eee1c58f5c',
+    'nvtiff_backend': 'eb785f353231a46f5bfe59f8f85b1d77300c1d47f9f3d2a05bdd215ee6572f75',
+    'pta_batch_pipeline': None,
+    'pta_gpu_publication': None,
+}
+REVIEWED_V22_PTA_DEFINITION_KEYS = {
+    ('nvtiff_backend', 'NvTiffBackend'),
+    ('nvtiff_backend', '_cuda_image_device_pointer'),
+    ('nvtiff_backend', '_image_info'),
+    ('pta', '_planning_phase_affinity'),
+    ('pta', 'main'),
+    ('pta', 'write_pta_summary'),
+    ('pta_batch_pipeline', 'BatchReservation'),
+    ('pta_batch_pipeline', 'OrderedBatchPipeline'),
+    ('pta_batch_pipeline', '_PendingBatch'),
+    ('pta_config', 'build_pta_argparser'),
+    ('pta_config', 'parse_output_image_format'),
+    ('pta_config', 'parse_pta_args'),
+    ('pta_config', 'resolve_pta_config'),
+    ('pta_gpu_publication', 'GpuPublicationResources'),
+    ('pta_gpu_publication', 'GpuPublicationTask'),
+    ('pta_gpu_publication', '_GpuBatch'),
+    ('pta_gpu_publication', '_byte_limit'),
+    ('pta_gpu_publication', '_finalize_resources'),
+    ('pta_gpu_publication', 'publication_resources'),
+    ('pta_publication', 'NvjpegCudaFenceError'),
+    ('pta_publication', 'NvjpegEncodedBatch'),
+    ('pta_publication', '_encode_nvjpeg_batch'),
+    ('pta_publication', '_publish_nvjpeg_batch_atomically'),
+    ('pta_publication', '_write_nvjpeg_batch_atomically'),
+    ('pta_publication', 'parse_output_image_format'),
+    ('pta_scheduler', 'PtaCpuBudget'),
+    ('pta_scheduler', 'PtaPipelineDepth'),
+    ('pta_scheduler', '_bounded_gpu_cpu_sets'),
+    ('pta_scheduler', 'plan_pta_cpu_budget'),
+    ('pta_scheduler', 'resolve_pta_pipeline_depth'),
+    ('pta_workers', '_gpu_runtime_for_worker'),
+    ('pta_workers', '_label_payload_bytes'),
+    ('pta_workers', '_publish_gpu_policy_batch'),
+    ('pta_workers', '_publish_label_payloads'),
+    ('pta_workers', '_render_worker_initializer'),
+    ('pta_workers', '_validate_gpu_policy_batch'),
+    ('pta_workers', '_write_gpu_image_batch'),
+    ('pta_workers', 'execute_gpu_frame_batch_task'),
+}
+REVIEWED_V22_PTA_STATEMENT_KEYS = {
+    ('nvtiff_backend', 'binding__NVTIFF_PHOTOMETRIC_RGB'),
+    ('nvtiff_backend', 'module_docstring'),
+    ('pta', 'import_.pta_scheduler'),
+    ('pta', 'import_contextlib'),
+    ('pta_batch_pipeline', 'binding_PayloadT'),
+    ('pta_batch_pipeline', 'binding_ResultT'),
+    ('pta_batch_pipeline', 'import___future__'),
+    ('pta_batch_pipeline', 'import_collections'),
+    ('pta_batch_pipeline', 'import_concurrent.futures'),
+    ('pta_batch_pipeline', 'import_dataclasses'),
+    ('pta_batch_pipeline', 'import_operator'),
+    ('pta_batch_pipeline', 'import_typing'),
+    ('pta_batch_pipeline', 'module_docstring'),
+    ('pta_gpu_publication', 'binding__QUARANTINED_PUBLICATIONS'),
+    ('pta_gpu_publication', 'import_.pta_batch_pipeline'),
+    ('pta_gpu_publication', 'import___future__'),
+    ('pta_gpu_publication', 'import_concurrent.futures'),
+    ('pta_gpu_publication', 'import_contextlib'),
+    ('pta_gpu_publication', 'import_dataclasses'),
+    ('pta_gpu_publication', 'import_os'),
+    ('pta_gpu_publication', 'import_threading'),
+    ('pta_gpu_publication', 'import_time'),
+    ('pta_gpu_publication', 'module_docstring'),
+    ('pta_publication', 'binding_OUTPUT_IMAGE_FORMATS'),
+    ('pta_publication', 'binding__NVJPEG_QUARANTINED_BATCHES'),
+    ('pta_publication', 'binding__NVJPEG_QUARANTINE_LOCK'),
+    ('pta_publication', 'import_concurrent.futures'),
+    ('pta_publication', 'import_dataclasses'),
+    ('pta_scheduler', 'binding___all__'),
+    ('pta_scheduler', 'import_dataclasses'),
+    ('pta_workers', 'import_.pta_publication'),
+    ('pta_workers', 'import_contextlib'),
+}
 # Exact pre-move PTA definitions, independently pinned before their shared owner
 # is introduced. PTA reexports must still resolve to the shared owner objects.
 REVIEWED_PRESERVED_AUGMENTATION_DEFINITIONS = {
@@ -1457,6 +1559,7 @@ def reviewed_v22_release_contract(
     *earlier_patches: dict[str, object],
 ) -> dict[str, object]:
     """Join independently authenticated parents without rewriting either chain."""
+    manifest = _without_reviewed_pta_successor(manifest)
     expected_keys = {'v22_release_review'}
     for parent in REVIEWED_V22_RELEASE_PARENTS:
         keys = parent['inventory_keys']
@@ -1469,7 +1572,8 @@ def reviewed_v22_release_contract(
     throughput_key = 'v22_policy_throughput_review'
     radial_key = 'v22_radial_retirement_review'
     window_key = 'v22_policy_window_review'
-    if set(manifest) - {successor_key, throughput_key, radial_key, window_key} != expected_keys:
+    tilted_key = 'v22_tilted_azimuthal_gpu_review'
+    if set(manifest) - {successor_key, throughput_key, radial_key, window_key, tilted_key} != expected_keys:
         raise RuntimeError('v22 release inventory keyset differs from its reviewed parent union')
     review = _reviewed_v21_patch_contract(
         manifest, v21, key='v22_release_review', release='22.0.0',
@@ -1499,7 +1603,7 @@ def reviewed_v22_release_contract(
         # The historical release permits only an independently authenticated
         # successor. An arbitrary new appendix must not weaken its exact keyset.
         reviewed_v22_policy_memory_contract(manifest, v21, *earlier_patches, review)
-    elif throughput_key in manifest or radial_key in manifest or window_key in manifest:
+    elif throughput_key in manifest or radial_key in manifest or window_key in manifest or tilted_key in manifest:
         raise RuntimeError('v22 policy throughput successor requires the reviewed memory predecessor')
     return review
 
@@ -1509,11 +1613,13 @@ def reviewed_v22_policy_memory_contract(
     *earlier_patches: dict[str, object],
 ) -> dict[str, object]:
     """Authenticate bounded policy parents without rewriting the release merge."""
+    manifest = _without_reviewed_pta_successor(manifest)
     key = 'v22_policy_memory_review'
     successor_key = 'v22_policy_throughput_review'
     radial_key = 'v22_radial_retirement_review'
     window_key = 'v22_policy_window_review'
-    prior = {name: value for name, value in manifest.items() if name not in (key, successor_key, radial_key, window_key)}
+    tilted_key = 'v22_tilted_azimuthal_gpu_review'
+    prior = {name: value for name, value in manifest.items() if name not in (key, successor_key, radial_key, window_key, tilted_key)}
     encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
     if hashlib.sha256(encoded).hexdigest() != REVIEWED_V22_POLICY_MEMORY_PREDECESSOR_SHA256:
         raise RuntimeError('v22 policy memory predecessor inventory changed; preserve every historical record')
@@ -1546,7 +1652,7 @@ def reviewed_v22_policy_memory_contract(
         raise RuntimeError('v22 policy memory review must cover exactly its parent-admission definitions and imports')
     if successor_key in manifest:
         reviewed_v22_policy_throughput_contract(manifest, v21, *earlier_patches, review)
-    elif radial_key in manifest or window_key in manifest:
+    elif radial_key in manifest or window_key in manifest or tilted_key in manifest:
         raise RuntimeError('v22 Radial retirement successor requires the reviewed throughput predecessor')
     return review
 
@@ -1556,10 +1662,12 @@ def reviewed_v22_policy_throughput_contract(
     *earlier_patches: dict[str, object],
 ) -> dict[str, object]:
     """Authenticate the shared-policy correction against its distributed bundle."""
+    manifest = _without_reviewed_pta_successor(manifest)
     key = 'v22_policy_throughput_review'
     successor_key = 'v22_radial_retirement_review'
     window_key = 'v22_policy_window_review'
-    prior = {name: value for name, value in manifest.items() if name not in (key, successor_key, window_key)}
+    tilted_key = 'v22_tilted_azimuthal_gpu_review'
+    prior = {name: value for name, value in manifest.items() if name not in (key, successor_key, window_key, tilted_key)}
     encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
     if hashlib.sha256(encoded).hexdigest() != REVIEWED_V22_POLICY_THROUGHPUT_PREDECESSOR_SHA256:
         raise RuntimeError('v22 policy throughput predecessor inventory changed; preserve every historical record')
@@ -1603,7 +1711,7 @@ def reviewed_v22_policy_throughput_contract(
         raise RuntimeError('v22 policy throughput review must cover exactly its shared-policy definitions, import and seam')
     if successor_key in manifest:
         reviewed_v22_radial_retirement_contract(manifest, v21, *earlier_patches, review)
-    elif window_key in manifest:
+    elif window_key in manifest or tilted_key in manifest:
         raise RuntimeError('v22 policy window successor requires the reviewed Radial retirement predecessor')
     return review
 
@@ -1613,9 +1721,11 @@ def reviewed_v22_radial_retirement_contract(
     *earlier_patches: dict[str, object],
 ) -> dict[str, object]:
     """Authenticate Radial GPU retirement without altering its numerical history."""
+    manifest = _without_reviewed_pta_successor(manifest)
     key = 'v22_radial_retirement_review'
     successor_key = 'v22_policy_window_review'
-    prior = {name: value for name, value in manifest.items() if name not in (key, successor_key)}
+    tilted_key = 'v22_tilted_azimuthal_gpu_review'
+    prior = {name: value for name, value in manifest.items() if name not in (key, successor_key, tilted_key)}
     encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
     if hashlib.sha256(encoded).hexdigest() != REVIEWED_V22_RADIAL_RETIREMENT_PREDECESSOR_SHA256:
         raise RuntimeError('v22 Radial retirement predecessor inventory changed; preserve every historical record')
@@ -1654,6 +1764,8 @@ def reviewed_v22_radial_retirement_contract(
         raise RuntimeError('v22 Radial retirement review must cover exactly its scheduler, projection and retry contracts')
     if successor_key in manifest:
         reviewed_v22_policy_window_contract(manifest, v21, *earlier_patches, review)
+    elif tilted_key in manifest:
+        raise RuntimeError('v22 Tilted Azimuthal GPU successor requires the reviewed policy window predecessor')
     return review
 
 
@@ -1662,8 +1774,10 @@ def reviewed_v22_policy_window_contract(
     *earlier_patches: dict[str, object],
 ) -> dict[str, object]:
     """Authenticate the policy-only 384 GiB request against its released bundle."""
+    manifest = _without_reviewed_pta_successor(manifest)
     key = 'v22_policy_window_review'
-    prior = {name: value for name, value in manifest.items() if name != key}
+    successor_key = 'v22_tilted_azimuthal_gpu_review'
+    prior = {name: value for name, value in manifest.items() if name not in (key, successor_key)}
     encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
     if hashlib.sha256(encoded).hexdigest() != REVIEWED_V22_POLICY_WINDOW_PREDECESSOR_SHA256:
         raise RuntimeError('v22 policy window predecessor inventory changed; preserve every historical record')
@@ -1688,12 +1802,231 @@ def reviewed_v22_policy_window_contract(
                 'statements', 'local_import_seam_updates', 'preserved_radial_definition_updates',
                 'preserved_radial_module_updates', 'complete_modules'))):
         raise RuntimeError('v22 policy window review must cover only pipeline._main_impl and no imports or other runtime changes')
+    if successor_key in manifest:
+        reviewed_v22_tilted_azimuthal_gpu_contract(manifest, v21, *earlier_patches, review)
     return review
 
 
-def verify_policy_window_runtime_scope(review, pipeline_statements) -> None:
-    """Only the reviewed default inside _main_impl may differ from the bundle."""
-    preserved = [digest(node) for node in pipeline_statements if getattr(node, 'name', None) != '_main_impl']
+def reviewed_v22_tilted_azimuthal_gpu_contract(
+    manifest: dict[str, object], v21: dict[str, object],
+    *earlier_patches: dict[str, object],
+) -> dict[str, object]:
+    """Authenticate the bounded GPU operator against the complete prior commit."""
+    manifest = _without_reviewed_pta_successor(manifest)
+    key = 'v22_tilted_azimuthal_gpu_review'
+    prior = {name: value for name, value in manifest.items() if name != key}
+    encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    if hashlib.sha256(encoded).hexdigest() != REVIEWED_V22_TILTED_AZIMUTHAL_PREDECESSOR_SHA256:
+        raise RuntimeError('v22 Tilted Azimuthal GPU predecessor inventory changed; preserve every historical record')
+    review = _reviewed_v21_patch_contract(
+        manifest, v21, key=key, release='22.0.0',
+        expected_digest=REVIEWED_V22_TILTED_AZIMUTHAL_SHA256,
+        previous_digest=REVIEWED_V22_POLICY_WINDOW_SHA256,
+        earlier_patches=earlier_patches,
+    )
+    if (review.get('predecessor_commit') != REVIEWED_V22_TILTED_AZIMUTHAL_PREDECESSOR_COMMIT
+            or review.get('predecessor_inventory_sha256') != REVIEWED_V22_TILTED_AZIMUTHAL_PREDECESSOR_SHA256
+            or review.get('feature') != 'tilted-azimuthal-gpu-projection'):
+        raise RuntimeError('v22 Tilted Azimuthal GPU review has an unexpected predecessor or feature')
+    modules = {'tilted_azimuthal_projection', 'tilted_azimuthal_projection_cuda'}
+    definitions = {
+        ('backprojection', '_MainProcessGpuStageCoordinator'),
+        ('backprojection', '_TiltedAzimuthalCudaStage'),
+        ('backprojection', '_try_tilted_azimuthal_cuda_stage'),
+        ('backprojection', '_ordered_tilted_azimuthal_coordinates'),
+        ('backprojection', '_project_tilted_azimuthal_sink'),
+        ('backprojection', '_backproject_tilted_azimuthal_volume_to_volume'),
+        ('pipeline', '_execution_runtime_provenance'),
+        ('tilted_azimuthal_projection', 'TiltedAzimuthalPlanUnavailable'),
+        ('tilted_azimuthal_projection', 'TiltedAzimuthalProjectionPlan'),
+        ('tilted_azimuthal_projection', 'build_tilted_azimuthal_plan'),
+        ('tilted_azimuthal_projection_cuda', 'TiltedAzimuthalCudaProjectionUnavailable'),
+        ('tilted_azimuthal_projection_cuda', 'TiltedAzimuthalCudaProjectionUnsafeFailure'),
+        ('tilted_azimuthal_projection_cuda', '_TiltedAzimuthalContract'),
+        ('tilted_azimuthal_projection_cuda', '_shape'),
+        ('tilted_azimuthal_projection_cuda', '_validate_tilted_azimuthal_contract'),
+        ('tilted_azimuthal_projection_cuda', '_validate_initial_packed'),
+        ('tilted_azimuthal_projection_cuda', '_frame_row_bands'),
+        ('tilted_azimuthal_projection_cuda', '_preflight_case'),
+        ('tilted_azimuthal_projection_cuda', 'TiltedAzimuthalCudaProjector'),
+    }
+    existing_statements = {
+        ('backprojection', 'import_concurrent_futures'),
+        ('backprojection', 'binding__TILTED_AZIMUTHAL_CUDA_RECHECK_FRAMES'),
+        ('backprojection', 'binding__TILTED_AZIMUTHAL_CUDA_RECHECK_SECONDS'),
+    }
+    if ({(item['module'], item['name']) for item in review['definitions']} != definitions
+            or {(item['module'], item['label']) for item in review['statements'] if item['module'] not in modules}
+                != existing_statements
+            or sorted(review.get('complete_modules', ())) != sorted(modules)
+            or any(review.get(category) for category in (
+                'local_import_seam_updates', 'preserved_radial_definition_updates', 'preserved_radial_module_updates'))):
+        raise RuntimeError('v22 Tilted Azimuthal GPU review must cover exactly its operator, routing and provenance contracts')
+    return review
+
+
+def reviewed_v22_pta_throughput_contract(
+    manifest: dict[str, object], v21: dict[str, object],
+    *earlier_patches: dict[str, object],
+) -> dict[str, object]:
+    """Authenticate the PTA successor and its complete distributed predecessor."""
+    manifest = _without_reviewed_v22_1_release(manifest)
+    key = 'v22_pta_throughput_review'
+    prior = {name: value for name, value in manifest.items() if name != key}
+    encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    if hashlib.sha256(encoded).hexdigest() != REVIEWED_V22_PTA_THROUGHPUT_PREDECESSOR_SHA256:
+        raise RuntimeError('v22 PTA throughput predecessor inventory changed; preserve every historical record')
+    # Historical entry points may authenticate this successor before they have
+    # traversed the complete review chain. The whole prior snapshot above is
+    # pinned, so reconstruct its effective definitions in the reviewed order.
+    ordered_keys = (
+        *(f'v21_0_{index}_review' for index in range(1, 7)),
+        'v21_1_review', 'v21_1_1_review', 'v21_1_2_review',
+        'v22_augmentation_review', 'v22_coverage_review', 'v22_release_review',
+        'v22_policy_memory_review', 'v22_policy_throughput_review',
+        'v22_radial_retirement_review', 'v22_policy_window_review',
+        'v22_tilted_azimuthal_gpu_review',
+    )
+    review = _reviewed_v21_patch_contract(
+        manifest, prior['v21_review'], key=key, release='22.0.0',
+        expected_digest=REVIEWED_V22_PTA_THROUGHPUT_SHA256,
+        previous_digest=REVIEWED_V22_TILTED_AZIMUTHAL_SHA256,
+        earlier_patches=tuple(prior[name] for name in ordered_keys),
+    )
+    if (review.get('predecessor_bundle') != {
+                'name': 'XTA_v22.0.0_complete_source.zip',
+                'sha256': REVIEWED_V22_PTA_THROUGHPUT_PREDECESSOR_BUNDLE_SHA256,
+            }
+            or review.get('predecessor_inventory_sha256') != REVIEWED_V22_PTA_THROUGHPUT_PREDECESSOR_SHA256
+            or 'predecessor_commit' in review
+            or review.get('feature') != 'pta-pipelined-gpu-publication-and-output-formats'):
+        raise RuntimeError('v22 PTA throughput review has an unexpected bundle predecessor or feature')
+    modules = {'pta_batch_pipeline', 'pta_gpu_publication'}
+    if ({(item['module'], item['name']) for item in review['definitions']} != REVIEWED_V22_PTA_DEFINITION_KEYS
+            or {(item['module'], item['label']) for item in review['statements']} != REVIEWED_V22_PTA_STATEMENT_KEYS
+            or sorted(review.get('complete_modules', ())) != sorted(modules)
+            or any(review.get(category) for category in (
+                'local_import_seam_updates', 'preserved_radial_definition_updates',
+                'preserved_radial_module_updates'))):
+        raise RuntimeError('v22 PTA throughput review must cover exactly its publication, CPU budget and format contracts')
+    snapshots = review.get('module_snapshots', ())
+    identities = [item.get('module') for item in snapshots]
+    if (len(identities) != len(set(identities))
+            or set(identities) != set(REVIEWED_V22_PTA_PREDECESSOR_MODULES)):
+        raise RuntimeError('v22 PTA throughput source snapshot coverage differs')
+    for item in snapshots:
+        if item.get('previous_ast_sha256') != REVIEWED_V22_PTA_PREDECESSOR_MODULES[item['module']]:
+            raise RuntimeError(f"v22 PTA throughput source predecessor changed: {item['module']}")
+        value = item.get('ast_sha256')
+        if (not item.get('reason') or not isinstance(value, str) or len(value) != 64
+                or any(char not in '0123456789abcdef' for char in value)):
+            raise RuntimeError('v22 PTA throughput source snapshot has no reason or valid digest')
+    return review
+
+
+def _without_reviewed_pta_successor(manifest: dict[str, object]) -> dict[str, object]:
+    """Historical contracts permit only the fully authenticated new appendix."""
+    manifest = _without_reviewed_v22_1_release(manifest)
+    key = 'v22_pta_throughput_review'
+    if key not in manifest:
+        return manifest
+    reviewed_v22_pta_throughput_contract(manifest, manifest['v21_review'])
+    return {name: value for name, value in manifest.items() if name != key}
+
+
+def reviewed_v22_1_release_contract(
+    manifest: dict[str, object], v21: dict[str, object],
+    *earlier_patches: dict[str, object],
+) -> dict[str, object]:
+    """Promote the exact distributed PTA candidate through five version bindings."""
+    key = 'v22_1_release_review'
+    prior = {name: value for name, value in manifest.items() if name != key}
+    encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    if hashlib.sha256(encoded).hexdigest() != REVIEWED_V22_1_RELEASE_PREDECESSOR_SHA256:
+        raise RuntimeError('v22.1.0 release predecessor inventory changed; preserve every historical record')
+    keys = (
+        *(f'v21_0_{index}_review' for index in range(1, 7)),
+        'v21_1_review', 'v21_1_1_review', 'v21_1_2_review',
+        'v22_augmentation_review', 'v22_coverage_review', 'v22_release_review',
+        'v22_policy_memory_review', 'v22_policy_throughput_review',
+        'v22_radial_retirement_review', 'v22_policy_window_review',
+        'v22_tilted_azimuthal_gpu_review', 'v22_pta_throughput_review',
+    )
+    review = _reviewed_v21_patch_contract(
+        manifest, prior['v21_review'], key=key, release='22.1.0',
+        expected_digest=REVIEWED_V22_1_RELEASE_SHA256,
+        previous_digest=REVIEWED_V22_PTA_THROUGHPUT_SHA256,
+        earlier_patches=tuple(prior[name] for name in keys),
+    )
+    if (review.get('predecessor_bundle') != {
+                'name': 'XTA_v22.0.0_complete_source.zip',
+                'sha256': REVIEWED_V22_1_RELEASE_PREDECESSOR_BUNDLE_SHA256,
+            }
+            or review.get('predecessor_inventory_sha256') != REVIEWED_V22_1_RELEASE_PREDECESSOR_SHA256
+            or review.get('feature') != 'release-22.1.0-consolidated-pta-backends'
+            or review.get('preserved_module_statements_sha256') != REVIEWED_V22_1_RELEASE_PRESERVED_MODULES
+            or 'predecessor_commit' in review):
+        raise RuntimeError('v22.1.0 release has an unexpected bundle predecessor, source scope or feature')
+    bindings = {('__init__', '__version__'), ('cli', 'SCRIPT_VERSION'),
+                ('cli', 'SCRIPT_BASENAME'), ('config', 'SCRIPT_VERSION'),
+                ('config', 'SCRIPT_VERSION_COMPACT')}
+    if (review['definitions'] or len(review['statements']) != len(bindings)
+            or {(item['module'], item.get('binding')) for item in review['statements']} != bindings
+            or any(review.get(category) for category in (
+                'local_import_seam_updates', 'preserved_radial_definition_updates',
+                'preserved_radial_module_updates', 'complete_modules', 'module_snapshots'))):
+        raise RuntimeError('v22.1.0 release must review exactly its five release identity bindings')
+    return review
+
+
+def _without_reviewed_v22_1_release(manifest: dict[str, object]) -> dict[str, object]:
+    """Admit the version-only successor without weakening historical snapshots."""
+    key = 'v22_1_release_review'
+    if key not in manifest:
+        return manifest
+    reviewed_v22_1_release_contract(manifest, manifest['v21_review'])
+    return {name: value for name, value in manifest.items() if name != key}
+
+
+def verify_v22_1_release_scope(review, top_level) -> None:
+    """Every other AST statement in the three version-bearing modules is fixed."""
+    bindings = {}
+    for item in review['statements']:
+        bindings.setdefault(item['module'], set()).add(item['binding'])
+    for module, expected in REVIEWED_V22_1_RELEASE_PRESERVED_MODULES.items():
+        hashes = [digest(node) for node in top_level[module]
+                  if not (isinstance(node, ast.Assign) and any(
+                      isinstance(target, ast.Name) and target.id in bindings[module]
+                      for target in node.targets))]
+        actual = hashlib.sha256(json.dumps(hashes, separators=(',', ':')).encode()).hexdigest()
+        if actual != expected:
+            raise RuntimeError(f'v22.1.0 release changed non-version module statements: {module}')
+
+
+def verify_pta_source_snapshots(review, trees) -> None:
+    """Cover entire existing PTA modules in addition to changed named records."""
+    for item in review['module_snapshots']:
+        if digest(trees[item['module']]) != item['ast_sha256']:
+            raise RuntimeError(f"v22 PTA throughput complete source changed: {item['module']}")
+
+
+def verify_policy_window_runtime_scope(review, pipeline_statements, successors=()) -> None:
+    """Reconstruct the window review's source snapshot through approved successors."""
+    preserved = []
+    for node in pipeline_statements:
+        name = getattr(node, 'name', None)
+        if name == '_main_impl':
+            continue
+        current = digest(node)
+        for successor in reversed(successors):
+            record = next((item for item in successor['definitions']
+                           if (item['module'], item['name']) == ('pipeline', name)), None)
+            if record is None:
+                continue
+            if current != record['sha256'] or record.get('previous_sha256') is None:
+                raise RuntimeError(f'v21 patch reviewed definition changed or is missing: pipeline.{name}')
+            current = record['previous_sha256']
+        preserved.append(current)
     encoded = json.dumps(preserved, separators=(',', ':')).encode('utf-8')
     if hashlib.sha256(encoded).hexdigest() != review['preserved_pipeline_statements_sha256']:
         raise RuntimeError('v22 policy window changed unreviewed pipeline statements or imports')
@@ -1810,6 +2143,12 @@ def main() -> None:
     patches = (*patches, radial_retirement_review)
     policy_window_review = reviewed_v22_policy_window_contract(manifest, v21, *patches)
     patches = (*patches, policy_window_review)
+    tilted_azimuthal_review = reviewed_v22_tilted_azimuthal_gpu_contract(manifest, v21, *patches)
+    patches = (*patches, tilted_azimuthal_review)
+    pta_throughput_review = reviewed_v22_pta_throughput_contract(manifest, v21, *patches)
+    patches = (*patches, pta_throughput_review)
+    version_release_review = reviewed_v22_1_release_contract(manifest, v21, *patches)
+    patches = (*patches, version_release_review)
     patch_definitions = {
         (item['module'], item['name']): item for review in patches for item in review['definitions']
     }
@@ -1850,6 +2189,7 @@ def main() -> None:
         | {item['module'] for item in v21['preserved_radial_modules']}
         | {item['module'] for review in patches for item in review['definitions'] + review['statements']}
         | {item['module'] for item in augmentation_review['definition_relocations']}
+        | {item['module'] for item in pta_throughput_review['module_snapshots']}
     )
     for module in audited_modules:
         module_path = PACKAGE / f"{module}.py"
@@ -1861,7 +2201,7 @@ def main() -> None:
         local_import_seams.update(reviewed_local_import_seams(module, module_source, tree))
 
     verify_augmentation_relocations(augmentation_review, top_level)
-    verify_policy_window_runtime_scope(policy_window_review, top_level['pipeline'])
+    verify_policy_window_runtime_scope(policy_window_review, top_level['pipeline'], (tilted_azimuthal_review,))
 
     for (module, name), (expected_hash, reason) in REVIEWED_V20_ADDED_DEFINITIONS.items():
         expected_hash = reviewed_definition_hash(module, name, expected_hash)
@@ -1898,6 +2238,8 @@ def main() -> None:
         expected = Counter(item['sha256'] for item in list(effective_definitions.values()) + effective_statements if item['module'] == module)
         if available[module] != expected:
             raise RuntimeError(f'v21 complete-module statement coverage differs: {module}')
+    verify_pta_source_snapshots(pta_throughput_review, trees)
+    verify_v22_1_release_scope(version_release_review, top_level)
     for module, expected_hash in reviewed_radial_module_hashes(v21, patches).items():
         source = (PACKAGE / f'{module}.py').read_text(encoding='utf-8')
         if hashlib.sha256(source.encode('utf-8')).hexdigest() != expected_hash:

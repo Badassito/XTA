@@ -1,4 +1,4 @@
-"""Optional ctypes binding for lossless GPU multi-page TIFF publication.
+"""Optional ctypes binding for lossless GPU image and multi-page TIFF output.
 
 The NVIDIA nvTIFF wheel contains native binaries rather than a direct Python
 API.  nvImageCodec exposes single-image TIFF encoding, but does not expose the
@@ -42,6 +42,7 @@ _NVTIFF_STATUS_SUCCESS = 0
 _NVTIFF_IMAGETYPE_PAGE = 0x2
 _NVTIFF_COMPRESSION_LZW = 5
 _NVTIFF_PHOTOMETRIC_MINISBLACK = 1
+_NVTIFF_PHOTOMETRIC_RGB = 2
 _NVTIFF_PLANARCONFIG_CONTIG = 1
 _NVTIFF_SAMPLEFORMAT_UINT = 1
 _NVTIFF_BIG_TIFF = 1
@@ -479,18 +480,24 @@ def _coerce_cuda_major(value: object | None) -> int | None:
     return cuda_major
 
 
-def _image_info(*, page_count: int, height: int, width: int) -> _NvTiffImageInfo:
+def _image_info(
+    *, page_count: int, height: int, width: int, samples_per_pixel: int = 1,
+) -> _NvTiffImageInfo:
     info = _NvTiffImageInfo()
     info.image_type = _NVTIFF_IMAGETYPE_PAGE if page_count > 1 else 0
     info.image_width = width
     info.image_height = height
     info.compression = _NVTIFF_COMPRESSION_LZW
-    info.photometric_int = _NVTIFF_PHOTOMETRIC_MINISBLACK
+    info.photometric_int = (
+        _NVTIFF_PHOTOMETRIC_RGB
+        if samples_per_pixel == 3 else _NVTIFF_PHOTOMETRIC_MINISBLACK
+    )
     info.planar_config = _NVTIFF_PLANARCONFIG_CONTIG
-    info.samples_per_pixel = 1
-    info.bits_per_pixel = 8
-    info.bits_per_sample[0] = 8
-    info.sample_format[0] = _NVTIFF_SAMPLEFORMAT_UINT
+    info.samples_per_pixel = samples_per_pixel
+    info.bits_per_pixel = 8 * samples_per_pixel
+    for channel in range(samples_per_pixel):
+        info.bits_per_sample[channel] = 8
+        info.sample_format[channel] = _NVTIFF_SAMPLEFORMAT_UINT
     return info
 
 
@@ -658,6 +665,24 @@ class NvTiffBackend:
         Prefer :meth:`write_multipage_lzw` when a tensor object is available.
         """
 
+        return self._write_lzw_from_device_pointers(
+            path, device_pointers, height=height, width=width,
+            samples_per_pixel=1, cuda_stream=cuda_stream,
+        )
+
+    def _write_lzw_from_device_pointers(
+        self,
+        path: os.PathLike[str] | str,
+        device_pointers: Sequence[object],
+        *,
+        height: int,
+        width: int,
+        samples_per_pixel: int,
+        cuda_stream: object,
+    ) -> Path:
+        if samples_per_pixel not in {1, 3}:
+            raise ValueError("nvTIFF images require one grayscale or three RGB samples")
+
         pointers = tuple(
             _coerce_pointer(value, name=f"device_pointers[{index}]", allow_zero=False)
             for index, value in enumerate(device_pointers)
@@ -684,6 +709,7 @@ class NvTiffBackend:
                 pointers,
                 height=image_height,
                 width=image_width,
+                samples_per_pixel=samples_per_pixel,
                 cuda_stream=stream_value,
             )
             try:
@@ -718,6 +744,7 @@ class NvTiffBackend:
         height: int,
         width: int,
         cuda_stream: int,
+        samples_per_pixel: int = 1,
     ) -> None:
         with self._lock:
             self._bind_stream(cuda_stream)
@@ -733,7 +760,10 @@ class NvTiffBackend:
                     for pointer in pointers
                 )
             )
-            info = _image_info(page_count=len(pointers), height=height, width=width)
+            info = _image_info(
+                page_count=len(pointers), height=height, width=width,
+                samples_per_pixel=samples_per_pixel,
+            )
 
             try:
                 self._ensure_encoder(stream)
@@ -743,7 +773,7 @@ class NvTiffBackend:
                         "nvtiffEncodeParamsCreate succeeded without returning a handle"
                     )
 
-                raw_input_bytes = len(pointers) * height * width
+                raw_input_bytes = len(pointers) * height * width * samples_per_pixel
                 if raw_input_bytes >= _BIGTIFF_RAW_INPUT_THRESHOLD:
                     api.checked(
                         "nvtiffEncodeParamsSetTiffVariant",
@@ -849,6 +879,57 @@ class NvTiffBackend:
             height=height,
             width=width,
             cuda_stream=resolved_stream,
+        )
+
+    def write_image_lzw(
+        self,
+        path: os.PathLike[str] | str,
+        image_hwc: object,
+        *,
+        cuda_stream: object | None = None,
+    ) -> Path:
+        """Write one lossless gray or RGB TIFF page from CUDA uint8 ``HWC``.
+
+        The input must be tightly packed, with exactly one grayscale channel or
+        three channels in RGB order. This method never copies or reorders input.
+        Convert CHW input on its producer stream before calling, for example
+        ``image_chw.permute(1, 2, 0).contiguous()``. For arbitrary channel stacks,
+        keep using :meth:`write_multipage_lzw` and its separate-page semantics.
+
+        The caller owns the input until this method returns and must retain the
+        backend's CUDA device/context and stream through ``close()``.
+        """
+        detected_device = _cuda_pages_device_id(image_hwc)
+        if detected_device is not None and detected_device != self.device_id:
+            raise ValueError(
+                f"image_hwc is on CUDA device {detected_device}, but this "
+                f"NvTiffBackend is bound to device {self.device_id}"
+            )
+        producer_known, producer_stream = _cuda_pages_producer_stream(image_hwc)
+        if cuda_stream is None:
+            if not producer_known:
+                raise ValueError(
+                    "cuda_stream is required when image_hwc does not expose CUDA "
+                    "Array Interface v3 producer-stream metadata"
+                )
+            resolved_stream = 0 if producer_stream is None else producer_stream
+        else:
+            resolved_stream = _coerce_pointer(
+                cuda_stream, name="cuda_stream", allow_zero=True,
+            )
+            if (
+                producer_known and producer_stream is not None
+                and resolved_stream != producer_stream
+            ):
+                raise ValueError(
+                    "cuda_stream does not match the CUDA Array Interface v3 "
+                    f"producer stream ({resolved_stream} != {producer_stream}); "
+                    "encode on the producer stream so writes are ordered"
+                )
+        pointer, height, width, channels = _cuda_image_device_pointer(image_hwc)
+        return self._write_lzw_from_device_pointers(
+            path, (pointer,), height=height, width=width,
+            samples_per_pixel=channels, cuda_stream=resolved_stream,
         )
 
 
@@ -1020,6 +1101,66 @@ def _cuda_pages_device_pointers(
         height,
         width,
     )
+
+
+def _cuda_image_device_pointer(image: object) -> tuple[int, int, int, int]:
+    """Validate a borrowed interleaved image without loading CUDA or copying."""
+    shape = _shape_tuple(image)
+    if len(shape) != 3:
+        raise ValueError(f"CUDA TIFF image must have shape (H,W,C), got {shape}")
+    height = _coerce_dimension(shape[0], name="height")
+    width = _coerce_dimension(shape[1], name="width")
+    channels = shape[2]
+    if channels not in {1, 3}:
+        raise ValueError("CUDA TIFF image requires one grayscale or three RGB channels")
+    interface = _cuda_array_interface(image)
+    if interface is not None and "shape" in interface:
+        if tuple(int(value) for value in interface["shape"]) != shape:
+            raise ValueError("image_hwc shape disagrees with CUDA Array Interface shape")
+    dtype = getattr(image, "dtype", None)
+    interface_dtype = interface.get("typestr") if interface else None
+    known_dtypes = [value for value in (dtype, interface_dtype) if value is not None]
+    if not known_dtypes or not all(_dtype_is_uint8(value) for value in known_dtypes):
+        raise TypeError("CUDA TIFF image must use uint8 in both tensor and interface metadata")
+    device = getattr(image, "device", None)
+    if not (
+        bool(getattr(image, "is_cuda", False))
+        or str(getattr(device, "type", device)).lower().startswith("cuda")
+        or interface is not None
+    ):
+        raise ValueError("image_hwc must reside in CUDA device memory")
+    contiguous = getattr(image, "is_contiguous", None)
+    if callable(contiguous) and not bool(contiguous()):
+        raise ValueError("image_hwc must be C-contiguous")
+    stride_method = getattr(image, "stride", None)
+    if callable(stride_method):
+        strides = tuple(int(value) for value in stride_method())
+    elif interface is not None:
+        raw_strides = interface.get("strides")
+        strides = None if raw_strides is None else tuple(int(value) for value in raw_strides)
+    elif callable(contiguous):
+        strides = None
+    else:
+        raise TypeError("image_hwc must expose contiguous tensor or CUDA interface strides")
+    expected = (width * channels, channels, 1)
+    if strides is not None and (
+        len(strides) != 3
+        or any(actual != wanted and size != 1 for actual, wanted, size in zip(strides, expected, shape))
+    ):
+        raise ValueError(f"image_hwc must have contiguous strides {expected}, got {strides}")
+    pointer_method = getattr(image, "data_ptr", None)
+    if callable(pointer_method):
+        pointer = _coerce_pointer(pointer_method(), name="image_hwc.data_ptr()", allow_zero=False)
+    elif interface is not None:
+        data = interface.get("data")
+        if not isinstance(data, (tuple, list)) or not data:
+            raise TypeError("CUDA Array Interface data must contain an image pointer")
+        pointer = _coerce_pointer(data[0], name="image_hwc CUDA pointer", allow_zero=False)
+    else:
+        raise TypeError("image_hwc must expose data_ptr() or __cuda_array_interface__")
+    if pointer + height * width * channels - 1 > _POINTER_MAX:
+        raise ValueError("CUDA image span overflows the native pointer range")
+    return pointer, height, width, channels
 
 
 def probe_nvtiff(

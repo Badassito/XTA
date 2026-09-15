@@ -14,9 +14,9 @@ from XTA import cli, config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRENT_VERSION = "22.0.0"
-CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v22.0.0_SLURM.py"
-PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v21.1.2_SLURM.py"
+CURRENT_VERSION = "22.1.0"
+CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v22.1.0_SLURM.py"
+PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v22.0.0_SLURM.py"
 SCRATCH_REPORTS = (
     "TTA_EXTERNAL_AUGMENTATION.md",
     "TTA_TEST_CLI_AUDIT.md",
@@ -36,7 +36,7 @@ class PackageMetadataTests(unittest.TestCase):
     def test_runtime_version_constants_are_aligned(self) -> None:
         self.assertEqual(XTA.__version__, CURRENT_VERSION)
         self.assertEqual(config.SCRIPT_VERSION, CURRENT_VERSION)
-        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2200")
+        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2210")
         self.assertEqual(config.SCRIPT_BASENAME, CURRENT_LAUNCHER)
         self.assertEqual(cli.SCRIPT_VERSION, CURRENT_VERSION)
         self.assertEqual(cli.SCRIPT_BASENAME, CURRENT_LAUNCHER)
@@ -63,6 +63,8 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertIn('"tools/replay_component_projection.py"', data_files)
         self.assertIn('"tools/certify_qsc_lipschitz.py"', data_files)
         self.assertIn('"tools/plan_projection_sampling.py"', data_files)
+        self.assertIn('"tools/qualify_pta_gpu_publication.py"', data_files)
+        self.assertIn('"tools/benchmark_tilted_azimuthal_projection.py"', data_files)
         self.assertIn('"tools/d1_ipc_selftest.py"', data_files)
         self.assertIn('"tools/tta_augmentation_smoke.py"', data_files)
         self.assertIn('"tools/check_tta_augmentation_run.py"', data_files)

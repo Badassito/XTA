@@ -13,6 +13,7 @@ from collections import (
     deque,
 )
 from concurrent.futures import (
+    CancelledError,
     Future,
     ThreadPoolExecutor,
 )
@@ -792,6 +793,7 @@ class _MainProcessGpuStageCoordinator:
         # Radial parents, which retain the same scheduler memory credits.
         return str(purpose).strip().lower().startswith((
             'spherical source projection ', 'radial source projection ',
+            'tilted azimuthal source projection ',
         ))
 
     def set_wake_callback(self, callback: Optional[Callable[[], None]]) -> None:
@@ -4123,6 +4125,310 @@ def _or_tilted_azimuthal_coordinates_into_packed(
     ).astype(np.uint8, copy=False)
     np.bitwise_or.at(destination_flat, packed_indices, bit_masks)
 
+_TILTED_AZIMUTHAL_CUDA_RECHECK_FRAMES = 8
+_TILTED_AZIMUTHAL_CUDA_RECHECK_SECONDS = 1.0
+
+
+class _TiltedAzimuthalCudaStage:
+    """An exclusive device lease outlives every projector copy and publication."""
+
+    def __init__(self, projector, lease):
+        self.projector, self.lease = projector, lease
+        self.device_index = int(lease.device_index)
+        self.max_block_depth = int(projector.max_block_depth)
+
+    def accumulate(self, first, stop):
+        return self.projector.accumulate(first, stop)
+
+    def project(self, first, count):
+        return self.projector.project(first, count)
+
+    def project_encoded(self, first, count, packed=False):
+        return self.projector.project_encoded(first, count, packed=packed)
+
+    def close(self):
+        from .cylindrical_cuda_projection import RadialCudaProjectionUnsafeFailure
+        if self.projector is None:
+            return
+        try:
+            self.projector.close()
+        except RadialCudaProjectionUnsafeFailure as exc:
+            exc.stage_lease = self.lease
+            raise
+        except BaseException:
+            self.projector = None
+            self.lease.release()
+            raise
+        else:
+            self.projector = None
+            self.lease.release()
+
+
+def _try_tilted_azimuthal_cuda_stage(source, view, shape, known_row_occupancy=None,
+                                    known_slice_bboxes=None, *, initial_packed=None,
+                                    first_frame=0, quiet=False, retry_state=None,
+                                    plan_holder=None):
+    """Decline before consumption, or acquire a bounded source-retirement stage."""
+    if retry_state is not None:
+        retry_state['retryable'] = False
+    if (not gpu_backproject_enabled()
+            or not _env_flag('YOLO_TTA_GPU_TILTED_AZIMUTHAL_BACKPROJECT', True)
+            or not isinstance(source, np.ndarray) or source.dtype != np.uint8
+            or not source.flags.c_contiguous):
+        return None
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+    except Exception:
+        return None
+    purpose = f'Tilted Azimuthal source projection {view.name}'
+    lease = _try_acquire_main_process_gpu_stage(torch, purpose)
+    if lease is None:
+        if retry_state is not None:
+            retry_state['retryable'] = True
+        if not quiet:
+            print(f'Tilted Azimuthal CUDA deferred {view.name}: devices busy; continuing on CPU.', flush=True)
+        return None
+    from .cylindrical_cuda_projection import RadialCudaProjectionUnsafeFailure
+    projector = None
+    try:
+        from .tilted_azimuthal_projection import build_tilted_azimuthal_plan
+        from .tilted_azimuthal_projection_cuda import TiltedAzimuthalCudaProjector
+        holder = plan_holder if plan_holder is not None else {}
+        if 'plan' not in holder:
+            holder['plan'] = build_tilted_azimuthal_plan(
+                source, view, shape, known_row_occupancy, known_slice_bboxes)
+        projector = TiltedAzimuthalCudaProjector(
+            source, holder['plan'], device_index=lease.device_index,
+            initial_packed=initial_packed, first_frame=first_frame)
+        return _TiltedAzimuthalCudaStage(projector, lease)
+    except RadialCudaProjectionUnsafeFailure as exc:
+        exc.stage_lease = lease
+        raise
+    except Exception as exc:
+        _cancel_main_process_spherical_retirement_request(purpose, failed=True)
+        if projector is not None:
+            _TiltedAzimuthalCudaStage(projector, lease).close()
+        else:
+            lease.release()
+        print(f'Tilted Azimuthal CUDA unavailable {view.name}: {exc}; continuing on CPU.', flush=True)
+        return None
+    except BaseException:
+        if projector is not None:
+            _TiltedAzimuthalCudaStage(projector, lease).close()
+        else:
+            lease.release()
+        raise
+
+
+def _ordered_tilted_azimuthal_coordinates(compose, count, workers, cancel_event):
+    """Prefetch bounded read-only CPU work, committing it in input-frame order."""
+    def run(frame):
+        if cancel_event.is_set():
+            raise CancelledError('Tilted Azimuthal CPU reader was superseded')
+        return compose(frame)
+    workers = max(1, min(int(workers), int(count)))
+    pending = deque()
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='tilted-az-project') as pool:
+        frames = iter(range(int(count)))
+        try:
+            for _ in range(workers):
+                frame = next(frames, None)
+                if frame is not None:
+                    pending.append((frame, pool.submit(run, frame)))
+            while pending:
+                frame, future = pending.popleft()
+                yield frame, future.result()
+                # Do not start a replacement until the consumer decides whether
+                # to keep the CPU iterator or hand its committed prefix to CUDA.
+                following = next(frames, None)
+                if following is not None:
+                    pending.append((following, pool.submit(run, following)))
+        finally:
+            cancel_event.set()
+            for _, future in pending:
+                future.cancel()
+            # Executor exit joins running readers before source ownership moves.
+
+
+def _project_tilted_azimuthal_sink(source, view, shape, compose, frame_count, out_path,
+                                  desc, *, workers, prefer_memory, reserve_bytes,
+                                  known_row_occupancy, known_slice_bboxes, callback):
+    """Build one complete source union, then publish independent output blocks."""
+    t_dim, out_h, out_w = map(int, shape)
+    packed_w = (out_w + 7) // 8
+    packed_path = Path(out_path).with_name(Path(out_path).name + '.tilted_azimuthal.bits.dat')
+    packed_destination = cuda_stage = None
+    failed = callback_aborted = False
+    next_frame = cpu_frames = admission_attempts = 0
+    admission_seconds = reader_drain_seconds = 0.0
+    started = time.perf_counter()
+    retry_state, plan_holder = {'retryable': True}, {}
+    purpose = f'Tilted Azimuthal source projection {view.name}'
+
+    def try_stage():
+        nonlocal admission_attempts, admission_seconds
+        admission_attempts += 1
+        before = time.perf_counter()
+        try:
+            return _try_tilted_azimuthal_cuda_stage(source, view, shape,
+                known_row_occupancy, known_slice_bboxes, initial_packed=packed_destination,
+                first_frame=next_frame, quiet=admission_attempts > 1,
+                retry_state=retry_state, plan_holder=plan_holder)
+        finally:
+            admission_seconds += time.perf_counter() - before
+
+    try:
+        cuda_stage = try_stage()
+        if cuda_stage is None:
+            packed_destination = allocate_workspace_array(
+                shape=(t_dim, out_h, packed_w), dtype=np.uint8, path=packed_path,
+                desc=f'{desc} direct composed packed sink', prefer_memory=bool(prefer_memory),
+                prefer_memfd=bool(prefer_memory), reserve_bytes=int(reserve_bytes))
+            print(f'Tilted Azimuthal projection start {view.name}: backend=cpu_composed, '
+                  f'packed_source_gib={t_dim * out_h * packed_w / GIB:.3f}', flush=True)
+            flat = np.asarray(packed_destination).reshape(-1)
+            sink_workers = max(1, min(int(workers),
+                _env_int('YOLO_TTA_TILTED_AZIMUTHAL_SINK_WORKERS', int(workers))))
+            cancel = threading.Event()
+            frames = _ordered_tilted_azimuthal_coordinates(compose, frame_count, sink_workers, cancel)
+            recheck_frame = max(1, _TILTED_AZIMUTHAL_CUDA_RECHECK_FRAMES)
+            recheck_time = time.monotonic() + _TILTED_AZIMUTHAL_CUDA_RECHECK_SECONDS
+            try:
+                for frame, coordinates in frames:
+                    if frame != next_frame:
+                        raise RuntimeError('Tilted Azimuthal CPU projection skipped or duplicated a frame')
+                    if coordinates is not None:
+                        _or_tilted_azimuthal_coordinates_into_packed(
+                            flat, *coordinates, out_h=out_h, packed_w=packed_w)
+                    next_frame += 1
+                    cpu_frames += 1
+                    if (next_frame < frame_count and retry_state['retryable']
+                            and (next_frame >= recheck_frame or time.monotonic() >= recheck_time)):
+                        recheck_frame = next_frame + max(1, _TILTED_AZIMUTHAL_CUDA_RECHECK_FRAMES)
+                        recheck_time = time.monotonic() + _TILTED_AZIMUTHAL_CUDA_RECHECK_SECONDS
+                        # Only this consumer mutates the prefix. It stays frozen
+                        # during upload while CPU futures read the immutable input.
+                        # Failed admission leaves the current CPU iterator alive.
+                        cuda_stage = try_stage()
+                        if cuda_stage is not None:
+                            break
+            finally:
+                before = time.perf_counter()
+                cancel.set()
+                frames.close()
+                reader_drain_seconds += time.perf_counter() - before
+        if cuda_stage is not None:
+            if cpu_frames:
+                print(f'Tilted Azimuthal projection promoted {view.name}: CPU completed '
+                      f'frames=[0,{next_frame}); continuing on cuda:{cuda_stage.device_index}; '
+                      f'cpu_reader_drain_s={reader_drain_seconds:.6f}', flush=True)
+            else:
+                print(f'Tilted Azimuthal projection start {view.name}: '
+                      f'backend=cuda_composed, device=cuda:{cuda_stage.device_index}', flush=True)
+            cuda_stage.accumulate(next_frame, frame_count)
+            next_frame = frame_count
+        if next_frame != frame_count:
+            raise RuntimeError('Tilted Azimuthal projection has an incomplete input-frame union')
+        # Later input planes can modify earlier source-z slices. Do not publish
+        # any output until all input frames have contributed to the bitset.
+        encoding = getattr(callback, 'encoded_slice_format', None)
+        compact = bool(cuda_stage is not None and encoding in ('raw_u8', 'packbits_little')
+                       and callable(getattr(callback, 'consume_encoded_block', None)))
+        block_bytes = max(16 * 1024**2, int(max(16., _env_float(
+            'YOLO_TTA_TILTED_AZIMUTHAL_SINK_BLOCK_MIB', 256.)) * 1024**2))
+        block_slices = max(1, min(max(1, _env_int('YOLO_TTA_PROJECTION_CALLBACK_BLOCK', 64)),
+                                 block_bytes // (out_h * out_w)))
+        if cuda_stage is not None:
+            block_slices = min(block_slices, int(cuda_stage.max_block_depth))
+        for first in range(0, t_dim, block_slices):
+            count = min(block_slices, t_dim - first)
+            if compact:
+                block = cuda_stage.project_encoded(first, count, packed=encoding == 'packbits_little')
+                if (block.first_z != first or len(block.records) != count
+                        or bool(block.packed) != (encoding == 'packbits_little')):
+                    raise RuntimeError('Tilted Azimuthal encoded block identity/count/format mismatch')
+                callback.consume_encoded_block(first, block.records, block.payload, packed=block.packed)
+                continue
+            if cuda_stage is not None:
+                block = cuda_stage.project(first, count)
+                if tuple(block.shape) != (count, out_h, out_w) or block.dtype != np.uint8:
+                    raise RuntimeError('Tilted Azimuthal device block shape/dtype mismatch')
+            else:
+                packed = np.asarray(packed_destination[first:first + count], dtype=np.uint8)
+                if not np.any(packed):
+                    try:
+                        _emit_projection_empty_range(callback, first, count, (out_h, out_w), desc=desc, required=True)
+                    except BaseException:
+                        callback_aborted = True
+                        raise
+                    continue
+                block = np.unpackbits(packed, axis=2, count=out_w, bitorder='big').astype(np.uint8, copy=False)
+            try:
+                _emit_projection_block_callback(callback, first, block, desc=desc, required=True)
+            except BaseException:
+                callback_aborted = True
+                raise
+        backend = 'cuda_composed_compact' if compact else ('cuda_composed' if cuda_stage is not None else 'cpu_composed')
+        metrics = dict(backend=backend, cpu_frames=cpu_frames, cuda_frames=frame_count - cpu_frames,
+                       admission_attempts=admission_attempts, admission_seconds=admission_seconds,
+                       cpu_reader_drain_seconds=reader_drain_seconds, total_seconds=time.perf_counter() - started)
+        if cuda_stage is not None:
+            for name in ('source_h2d_bytes', 'geometry_bytes', 'packed_bytes', 'source_upload_seconds',
+                         'kernel_seconds', 'metadata_seconds', 'pack_seconds', 'd2h_seconds',
+                         'accumulation_kernel_seconds', 'accumulate_wall_seconds', 'prefix_h2d_bytes',
+                         'geometry_upload_seconds', 'prefix_upload_seconds', 'constructor_seconds',
+                         'preflight_seconds', 'source_band_uploads', 'source_band_hits'):
+                metrics[name] = getattr(cuda_stage.projector, name, None)
+        runtime_telemetry().gauge('projection.tilted_azimuthal', metrics)
+        device_metrics = ''
+        if cuda_stage is not None:
+            device_metrics = ''.join(f', {name}={float(getattr(cuda_stage.projector, name, 0.0)):.6f}'
+                for name in ('source_upload_seconds', 'accumulation_kernel_seconds', 'accumulate_wall_seconds',
+                             'constructor_seconds', 'prefix_upload_seconds', 'geometry_upload_seconds'))
+            device_metrics += ''.join(f', {name}={int(getattr(cuda_stage.projector, name, 0))}'
+                for name in ('source_h2d_bytes', 'prefix_h2d_bytes', 'source_band_uploads', 'source_band_hits'))
+        print(f'Tilted Azimuthal projection complete {view.name}: backend={backend}, '
+              f'cpu_frames={cpu_frames}, cuda_frames={frame_count - cpu_frames}, '
+              f'admission_attempts={admission_attempts}, admission_probe_s={admission_seconds:.6f}, '
+              f'cpu_reader_drain_s={reader_drain_seconds:.6f}, total_s={metrics["total_seconds"]:.6f}'
+              + device_metrics, flush=True)
+        return SinkOnlyProjectionResult(tuple(shape))
+    except BaseException as exc:
+        failed = True
+        if not callback_aborted:
+            try:
+                _abort_projection_block_callback(callback, exc)
+            except BaseException as cleanup_error:
+                if callable(getattr(exc, 'add_note', None)):
+                    exc.add_note(f'Tilted Azimuthal sink abort failed: {cleanup_error}')
+        raise
+    finally:
+        _cancel_main_process_spherical_retirement_request(purpose)
+        try:
+            if cuda_stage is not None:
+                from .cylindrical_cuda_projection import RadialCudaProjectionUnsafeFailure
+                try:
+                    cuda_stage.close()
+                except RadialCudaProjectionUnsafeFailure:
+                    raise
+                except BaseException:
+                    if not failed:
+                        raise
+        finally:
+            active_error = sys.exc_info()[1]
+            for cleanup in (lambda: close_memmap_array_without_flush(packed_destination),
+                            lambda: packed_path.unlink(missing_ok=True)):
+                try:
+                    cleanup()
+                except BaseException as cleanup_error:
+                    if active_error is None:
+                        raise
+                    if callable(getattr(active_error, 'add_note', None)):
+                        active_error.add_note(f'Tilted Azimuthal packed scratch cleanup failed: {cleanup_error}')
+
+
 def _backproject_tilted_azimuthal_volume_to_volume(
     azimuthal_mask_mm: np.ndarray,
     azimuthal_view: ViewInfo,
@@ -4354,86 +4660,13 @@ def _backproject_tilted_azimuthal_volume_to_volume(
     # Sink-only mode commits through a packed source-space accumulator.  This preserves
     # exact union semantics while reducing the live destination from one byte to one bit per
     # voxel and lets the cvol writer receive final t-major blocks without a dense uint8 file.
-    packed_w = int((int(out_w) + 7) // 8)
-    packed_path = Path(out_path).with_name(Path(out_path).name + '.tilted_azimuthal.bits.dat')
-    packed_destination: Optional[np.ndarray] = None
-    try:
-        packed_destination = allocate_workspace_array(
-            shape=(int(t_dim), int(out_h), int(packed_w)),
-            dtype=np.uint8,
-            path=packed_path,
-            desc=f'{desc} direct composed packed sink',
-            prefer_memory=bool(prefer_memory),
-            prefer_memfd=bool(prefer_memory),
-            reserve_bytes=int(reserve_bytes),
-        )
-        print(
-            f'{desc}: v16.1.3 direct tilted-Azimuthal packed sink active; no '
-            f'{avoided_base_bytes / GIB:.2f} GiB tilted base stack and no '
-            f'{array_nbytes(target_shape, np.uint8) / GIB:.2f} GiB uint8 source destination. '
-            f'Packed source union={array_nbytes((t_dim, out_h, packed_w), np.uint8) / GIB:.2f} GiB.'
-        )
-        packed_flat = np.asarray(packed_destination).reshape(-1)
-        sink_workers = max(
-            1,
-            min(
-                int(worker_count),
-                _env_int('YOLO_TTA_TILTED_AZIMUTHAL_SINK_WORKERS', int(worker_count)),
-            ),
-        )
-        for coordinates in parallel_map_unordered(
-            _compose_frame_indices,
-            range(int(stack_len)),
-            max_workers=int(sink_workers),
-            max_pending=max(2, int(sink_workers)),
-        ):
-            if coordinates is None:
-                continue
-            ti, yi, xi = coordinates
-            _or_tilted_azimuthal_coordinates_into_packed(
-                packed_flat, ti, yi, xi,
-                out_h=int(out_h), packed_w=int(packed_w),
-            )
-
-        target_block_bytes = max(
-            16 * 1024 * 1024,
-            int(max(16.0, _env_float('YOLO_TTA_TILTED_AZIMUTHAL_SINK_BLOCK_MIB', 256.0)) * 1024 * 1024),
-        )
-        callback_cap = max(1, _env_int('YOLO_TTA_PROJECTION_CALLBACK_BLOCK', 64))
-        block_slices = max(
-            1,
-            min(
-                int(callback_cap),
-                int(target_block_bytes // max(1, int(out_h) * int(out_w))),
-            ),
-        )
-        for t0 in range(0, int(t_dim), int(block_slices)):
-            t1 = min(int(t_dim), int(t0) + int(block_slices))
-            packed_block = np.asarray(packed_destination[int(t0):int(t1)], dtype=np.uint8)
-            if not bool(np.any(packed_block)):
-                _emit_projection_empty_range(
-                    projection_block_callback, int(t0), int(t1 - t0),
-                    (int(out_h), int(out_w)), desc=desc, required=True,
-                )
-                continue
-            block_view = np.unpackbits(
-                packed_block,
-                axis=2,
-                count=int(out_w),
-                bitorder='big',
-            ).astype(np.uint8, copy=False)
-            _emit_projection_block_callback(
-                projection_block_callback, int(t0), block_view,
-                desc=desc, required=True,
-            )
-        return SinkOnlyProjectionResult(tuple(int(v) for v in target_shape))
-    finally:
-        if packed_destination is not None:
-            close_memmap_array_without_flush(packed_destination)
-        try:
-            packed_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+    return _project_tilted_azimuthal_sink(
+        azimuthal_mask_mm, azimuthal_view, target_shape, _compose_frame_indices,
+        int(stack_len), out_path, desc, workers=int(worker_count),
+        prefer_memory=bool(prefer_memory), reserve_bytes=int(reserve_bytes),
+        known_row_occupancy=known_row_occupancy, known_slice_bboxes=known_slice_bboxes,
+        callback=projection_block_callback,
+    )
 
 def backproject_azimuthal_volume_to_volume(
     azimuthal_mask_mm: np.ndarray,

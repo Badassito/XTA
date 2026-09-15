@@ -55,6 +55,7 @@ System:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import hashlib
 import importlib
@@ -277,7 +278,9 @@ from .pta_scheduler import (
     gpu_memory_candidate_limit as _gpu_memory_candidate_limit,
     is_cuda_out_of_memory as _is_cuda_out_of_memory,
     iter_compatible_work_batches as _gpu_multi_source_work_batches,
+    plan_pta_cpu_budget,
     resolve_gpu_worker_layout,
+    resolve_pta_pipeline_depth,
     should_flush_ready_gpu_work as _should_flush_ready_gpu_work,
     split_work_batch as _split_gpu_work_batch,
 )
@@ -589,6 +592,18 @@ def discover_topology(
         worker_cpu_order=tuple(worker_order),
         discovery="topology-aware" if enabled else "topology discovery disabled",
     )
+
+
+@contextlib.contextmanager
+def _planning_phase_affinity(cpus: Sequence[int]):
+    """Use a phase's CPU mask without permanently narrowing the scheduler thread."""
+    previous = _allowed_cpu_tuple() if cpus else ()
+    changed = bool(cpus) and bind_current_thread_to_cpus(cpus)
+    try:
+        yield
+    finally:
+        if changed:
+            bind_current_thread_to_cpus(previous)
 
 
 def available_memory_budget_bytes() -> Optional[int]:
@@ -4303,7 +4318,7 @@ def write_pta_summary(
         f"JPEG output encoder request: {jpeg_encode_backend}; quality={int(jpeg_quality)}; "
         f"GPU augmentation batch_size={int(gpu_batch_size)}"
     )
-    lines.append(f"Requested output image format: {parse_output_image_format(requested_output_format)}")
+    lines.append(f"Requested output image format: {str(requested_output_format)}")
     lines.append(f"Output image format: {normalized_image_format}")
     lines.append(f"Multipage TIFF output encoder request: {tiff_encode_backend}")
     if normalized_image_format == "png":
@@ -4734,33 +4749,14 @@ def main(
         else None
     )
     gpu_offline_active = isinstance(augmentation, LoadedGpuAugmentation)
-    requested_offline_backend = str(args.offline_augmentation_backend)
-    if requested_offline_backend != "auto" and augmentation is None:
-        raise ValueError(
-            "--offline_augmentation_backend cpu/gpu requires --augmentation PATH "
-            "and --augmentation_execution offline"
-        )
-    if requested_offline_backend == "gpu" and augmentation is not None and not gpu_offline_active:
-        raise ValueError(
-            "--offline_augmentation_backend gpu requires an external build_gpu_augmentation export"
-        )
-    if requested_offline_backend == "cpu" and gpu_offline_active:
-        raise ValueError(
-            "--offline_augmentation_backend cpu cannot execute build_gpu_augmentation; "
-            "use auto/gpu or a CPU Albumentations policy"
-        )
-    if requested_offline_backend != "auto" and str(args.augmentation_execution) != "offline":
-        raise ValueError("--offline_augmentation_backend applies only with --augmentation_execution offline")
-    if str(args.jpeg_encode_backend) == "nvjpeg" and str(args.output_format) != "jpg":
-        raise ValueError("--jpeg_encode_backend nvjpeg requires --output_format jpg/jpeg")
-    tiff_encode_backend = str(getattr(args, "tiff_encode_backend", "auto"))
-    custom_channel_output = any(
-        str(variant.kind) == "custom" for variant in channel_variants
+    args.offline_augmentation_backend = (
+        "gpu" if gpu_offline_active else ("cpu" if augmentation is not None else "auto")
     )
-    if tiff_encode_backend == "nvtiff" and not custom_channel_output:
-        raise ValueError(
-            "--tiff_encode_backend nvtiff currently applies to custom C...S... multipage TIFF output"
-        )
+    if str(args.jpeg_encode_backend) == "nvjpeg" and str(args.output_format) != "jpg":
+        raise ValueError("--output_format nvjpeg requires JPEG output")
+    tiff_encode_backend = str(getattr(args, "tiff_encode_backend", "auto"))
+    if tiff_encode_backend == "nvtiff" and str(args.output_format) != "tif":
+        raise ValueError("--output_format nvtiff requires TIFF output")
     gpu_runtime_probe = ""
     if gpu_offline_active:
         if not topology.cuda_device_ids:
@@ -4780,7 +4776,7 @@ def main(
             require_nvjpeg=str(args.jpeg_encode_backend) == "nvjpeg",
             selected_device_ids=topology.cuda_device_ids,
         )
-        if custom_channel_output and tiff_encode_backend in {"auto", "nvtiff"}:
+        if tiff_encode_backend == "nvtiff":
             nvtiff_module = importlib.import_module(".nvtiff_backend", package=__package__)
             cuda_version_match = re.search(r"torch_cuda=(\d+)", gpu_runtime_probe)
             capability = nvtiff_module.probe_nvtiff(
@@ -4792,7 +4788,7 @@ def main(
             )
             if not bool(capability.available) and tiff_encode_backend == "nvtiff":
                 raise RuntimeError(
-                    "--tiff_encode_backend nvtiff requires nvTIFF 0.8 or newer; "
+                    "--output_format nvtiff requires nvTIFF 0.8 or newer; "
                     "install nvidia-nvtiff-cu13 for CUDA 13 or nvidia-nvtiff-cu12 for CUDA 12; "
                     f"probe={capability.diagnostic}"
                 )
@@ -4801,48 +4797,51 @@ def main(
                 gpu_runtime_probe += f"; nvtiff={version}"
             else:
                 gpu_runtime_probe += "; nvtiff=unavailable(auto->opencv)"
-        gpu_count = len(topology.cuda_device_ids)
-        frame_workers, gpu_render_threads = resolve_gpu_worker_layout(
-            worker_budget=int(workers),
-            requested_frame_workers=int(args.frame_workers),
-            gpu_count=gpu_count,
-        )
     elif str(args.jpeg_encode_backend) == "nvjpeg":
         raise ValueError(
-            "nvJPEG output encoding is integrated with build_gpu_augmentation; "
-            "select the GPU policy or use --jpeg_encode_backend opencv"
+            "--output_format nvjpeg requires a build_gpu_augmentation policy and "
+            "--augmentation_execution offline; use jpeg for CPU encoding"
         )
     elif tiff_encode_backend == "nvtiff":
         raise ValueError(
-            "nvTIFF multipage encoding is integrated with build_gpu_augmentation; "
-            "select the GPU offline policy or use --tiff_encode_backend opencv"
+            "--output_format nvtiff requires a build_gpu_augmentation policy and "
+            "--augmentation_execution offline; use tiff for CPU encoding"
         )
     if augmentation_definition is not None and float(args.augmentation_ratio) == 1.0:
         warnings.add(
             "augmentation_configured_without_copies",
             "--augmentation_ratio=1.0 retains only originals; use a value >1.0 to emit augmented copies",
         )
-    if int(args.pipeline_depth) >= 2:
-        if int(args.frame_workers) <= 0 and not gpu_offline_active:
-            frame_workers = max(1, min(workers, int(math.ceil(float(workers) * 0.75))))
-        render_cpu_budget = int(frame_workers) * (
-            int(gpu_render_threads) if gpu_offline_active else 1
+    specs = discover_volume_specs(args.input, force=bool(args.force), warnings=warnings)
+    available_bytes = available_memory_budget_bytes() if int(args.pipeline_depth) >= 2 and len(specs) > 1 else None
+    estimates = [estimate_spec_resident_bytes(spec) for spec in specs] if available_bytes is not None else []
+    depth_plan = resolve_pta_pipeline_depth(requested_depth=int(args.pipeline_depth),
+        volume_count=len(specs), resident_estimates=estimates, available_bytes=available_bytes)
+    effective_pipeline_depth = depth_plan.effective_depth
+    if depth_plan.memory_limited:
+        message = (
+            f"requested depth=2 estimated adjacent resident/scratch={depth_plan.worst_pair_bytes / GIB:.1f} GiB "
+            f"exceeds 70% of currently available/cgroup memory={available_bytes / GIB:.1f} GiB; using depth=1"
         )
-        planning_workers = max(1, int(workers) - min(int(workers), render_cpu_budget))
-    else:
-        planning_workers = int(workers)
-        render_cpu_budget = int(frame_workers) * (
-            int(gpu_render_threads) if gpu_offline_active else 1
-        )
-    render_cpu_order = tuple(topology.worker_cpu_order) if bool(args.topology_aware) else tuple()
-    render_cpu_set = {
-        int(render_cpu_order[index % len(render_cpu_order)])
-        for index in range(int(render_cpu_budget))
-    } if render_cpu_order else set()
-    planning_cpu_order = tuple(
-        cpu for cpu in topology.allowed_cpus if int(cpu) not in render_cpu_set
-    ) or tuple(topology.allowed_cpus)
-    io_workers = max(1, min(16, visible_cpu_count(), planning_workers))
+        warnings.add("pipeline_depth_reduced_for_memory", message)
+        print(f"WARNING: {message}", file=sys.stderr)
+    cpu_budget = plan_pta_cpu_budget(worker_budget=workers,
+        requested_frame_workers=int(args.frame_workers), allowed_cpus=topology.allowed_cpus,
+        worker_cpu_order=topology.worker_cpu_order,
+        gpu_count=len(topology.cuda_device_ids) if gpu_offline_active else 0,
+        gpu_cpu_sets=topology.gpu_cpu_sets if gpu_offline_active else (),
+        topology_aware=bool(args.topology_aware), overlapping=depth_plan.overlapping)
+    if depth_plan.overlapping and not cpu_budget.overlapping:
+        effective_pipeline_depth = 1
+        warnings.add("pipeline_depth_reduced_for_cpu_budget", "No separate CPU capacity remains for overlapping planning; using depth=1")
+    workers = cpu_budget.worker_budget
+    frame_workers, gpu_render_threads = cpu_budget.frame_workers, cpu_budget.gpu_render_threads
+    render_cpu_order = cpu_budget.render_cpu_order
+    planning_workers, planning_cpu_order = cpu_budget.planning_workers, cpu_budget.planning_cpu_order
+    io_workers = cpu_budget.io_workers
+    if gpu_offline_active:
+        topology = replace(topology, gpu_cpu_sets=cpu_budget.gpu_cpu_sets,
+                           worker_cpu_order=cpu_budget.render_cpu_order or topology.worker_cpu_order)
     runtime_label = (
         "gpu"
         if gpu_offline_active
@@ -4850,8 +4849,9 @@ def main(
     )
     print(
         f"Visible/allocated CPUs: {visible_cpu_count()}; worker budget: {workers}; frame workers: {frame_workers}; "
-        f"GPU CPU-render threads/owner: {gpu_render_threads if gpu_offline_active else 'N/A'}; "
+        f"GPU CPU-render threads/owner: {list(cpu_budget.gpu_render_threads_by_owner) if gpu_offline_active else 'N/A'}; "
         f"planning workers: {planning_workers}; "
+        f"bootstrap planning workers: {cpu_budget.bootstrap_workers}; "
         f"raw prefetch I/O workers: {io_workers}; render backend: {render_backend}; "
         f"offline augmentation backend={runtime_label}"
     )
@@ -4865,7 +4865,6 @@ def main(
         )
         + f"; output_format={args.output_format}"
     )
-    specs = discover_volume_specs(args.input, force=bool(args.force), warnings=warnings)
     input_dir = Path(args.input).expanduser().resolve()
     default_output = Path.cwd() / input_dir.name
     out_dir = Path(args.output).expanduser().resolve() if args.output else default_output
@@ -4906,24 +4905,6 @@ def main(
         )
 
     pending_specs = specs
-    effective_pipeline_depth = int(args.pipeline_depth)
-    if effective_pipeline_depth >= 2 and len(pending_specs) > 1:
-        available_bytes = available_memory_budget_bytes()
-        estimates = [estimate_spec_resident_bytes(spec) for spec in pending_specs]
-        adjacent_pairs = [
-            int(estimates[i]) + int(estimates[i + 1])
-            for i in range(len(estimates) - 1)
-            if estimates[i] is not None and estimates[i + 1] is not None
-        ]
-        worst_pair = max(adjacent_pairs) if adjacent_pairs else None
-        if available_bytes is not None and worst_pair is not None and int(worst_pair) > int(0.70 * available_bytes):
-            effective_pipeline_depth = 1
-            message = (
-                f"requested depth=2 estimated adjacent resident/scratch={worst_pair / GIB:.1f} GiB "
-                f"exceeds 70% of currently available/cgroup memory={available_bytes / GIB:.1f} GiB; using depth=1"
-            )
-            warnings.add("pipeline_depth_reduced_for_memory", message)
-            print(f"WARNING: {message}", file=sys.stderr)
 
     print(f"Discovered {len(specs)} volume(s): " + ", ".join(f"{s.stem}:{s.volume_class}/{s.kind}/{s.label_source}" for s in specs))
     print(
@@ -5011,8 +4992,7 @@ def main(
         volume_allocator: Optional[ArrayAllocator] = make_volume_allocator(True) if use_shared_volumes else None
         pipeline_enabled = int(effective_pipeline_depth) >= 2 and len(pending_specs) > 1
         if pipeline_enabled and bool(args.topology_aware) and planning_cpu_order:
-            if bind_current_thread_to_cpus(planning_cpu_order):
-                print(f"Topology plan: parent planning/prefetch threads restricted to CPUs {list(planning_cpu_order)}")
+            print(f"Topology plan: overlapping planning uses CPUs {list(planning_cpu_order)}; bootstrap planning may use all allocated CPUs")
         print(
             f"Persistent render pool: backend={render_backend}, "
             f"start_method={render_pool.start_method}, "
@@ -5084,21 +5064,23 @@ def main(
         def _submit_load(spec_index: int) -> None:
             if 0 <= spec_index < len(pending_specs) and spec_index not in pending_loads:
                 load_warnings = WarningLog()
+                load_workers = cpu_budget.bootstrap_io_workers if spec_index == 0 else io_workers
+                load_cpus = cpu_budget.bootstrap_cpu_order if spec_index == 0 else planning_cpu_order
                 future = load_executor.submit(
                     load_source_volume_from_spec,
                     pending_specs[spec_index],
                     warnings=load_warnings,
-                    workers=io_workers,
+                    workers=load_workers,
                     allocator=volume_allocator,
                     jpeg_decode_backend=str(args.jpeg_decode_backend),
                     jpeg_batch_size=int(args.jpeg_batch_size),
                     jpeg_device_ids=topology.cuda_device_ids,
                     jpeg_cpu_sets=topology.gpu_cpu_sets,
-                    load_cpu_order=planning_cpu_order if bool(args.topology_aware) else (),
+                    load_cpu_order=load_cpus if bool(args.topology_aware) else (),
                 )
                 pending_loads[spec_index] = (future, load_warnings)
 
-        def _plan_volume(spec_index: int) -> Dict[str, object]:
+        def _plan_volume_with_budget(spec_index: int, phase_workers: int) -> Dict[str, object]:
             """Load-join + classify + budget + plan one volume (parent side).
 
             The pipeline can run this for volume k+1 while volume k renders on
@@ -5114,7 +5096,7 @@ def main(
                 current_src,
                 args=args,
                 warnings=vol_warnings,
-                workers=planning_workers,
+                workers=phase_workers,
                 out_dir=out_dir,
                 tile_configs=tile_configs,
                 channel_variants=channel_variants,
@@ -5138,7 +5120,7 @@ def main(
                 ):
                     foregrounds = classify_original_foregrounds_for_volume(
                         prep,
-                        workers=planning_workers,
+                        workers=phase_workers,
                         warnings=vol_warnings,
                     )
                 cands = enumerate_candidates_for_volume(prep, foregrounds)
@@ -5245,6 +5227,13 @@ def main(
                 "handles": [],
                 "progress": None,
             }
+
+        def _plan_volume(spec_index: int) -> Dict[str, object]:
+            rendering_active = any(progress.pending_a or progress.pending_b for progress in progress_by_gen.values())
+            phase_workers = planning_workers if rendering_active else cpu_budget.bootstrap_workers
+            phase_cpus = planning_cpu_order if rendering_active else cpu_budget.bootstrap_cpu_order
+            with _planning_phase_affinity(phase_cpus if bool(args.topology_aware) else ()):
+                return _plan_volume_with_budget(spec_index, phase_workers)
 
         def _submit_phase_a(state: Dict[str, object]) -> None:
             """Enqueue all retained candidates in one source-frame-grouped phase."""

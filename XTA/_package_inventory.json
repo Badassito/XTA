@@ -13826,5 +13826,911 @@
     "preserved_radial_module_updates": [],
     "complete_modules": [],
     "preserved_pipeline_statements_sha256": "566158efcda0ca7ea2370e6a51681cd338386a708b55eb5537d304bab3f3cc95"
+  },
+  "v22_tilted_azimuthal_gpu_review": {
+    "release": "22.0.0",
+    "feature": "tilted-azimuthal-gpu-projection",
+    "previous_review_sha256": "d816923892fe819dbb155119525178d8bd1af4117065a92feafbce0adde86b8a",
+    "predecessor_commit": "6365f0c0a75d704d9453696e9070cafa22a26434",
+    "predecessor_inventory_sha256": "b3e5c9e99c29d7e96d5e6788460c1f6fd2e7ecfaaa530703f66aa116220dd6d2",
+    "definitions": [
+      {
+        "module": "backprojection",
+        "name": "_MainProcessGpuStageCoordinator",
+        "previous_sha256": "05732a7f1be5c2abf77f9a73e2e870c339452beb67cf8309d845dc24746de72e",
+        "sha256": "7e1db2acd735d8e0008cebe3ea3df9c1127ad3f3498142c997e868fff16ca086",
+        "reason": "Recognize the exact Tilted Azimuthal source-projection purpose in the existing exclusive retirement queue, preserving worker fences, FIFO aging and the shared two-turn burst limit."
+      },
+      {
+        "module": "backprojection",
+        "name": "_TiltedAzimuthalCudaStage",
+        "previous_sha256": null,
+        "sha256": "101fa8a8c69e0347d61411bd7ed096725e0dd71c5c04922c0b8c04b6c03bec04",
+        "reason": "Retain the exclusive stage lease through projection and publication; quarantine unsafe stream-fence failures without releasing a GPU still owned by an unfenced operation."
+      },
+      {
+        "module": "backprojection",
+        "name": "_try_tilted_azimuthal_cuda_stage",
+        "previous_sha256": null,
+        "sha256": "40b5ab495c2fab7cf7f521e23d5177335129775c63cf761ff49c3ff69a24b796",
+        "reason": "Admit the bounded optional GPU projector with immutable host lookup tables and an exact CPU packed prefix while preserving safe fallback and retry behavior."
+      },
+      {
+        "module": "backprojection",
+        "name": "_ordered_tilted_azimuthal_coordinates",
+        "previous_sha256": null,
+        "sha256": "270a7124559b4a557730edf527e1111a7e827ffc7d7070f21f16bef86a3568d2",
+        "reason": "Bound and cancel CPU coordinate producers, joining active readers before their source or partial packed destination transfers to CUDA."
+      },
+      {
+        "module": "backprojection",
+        "name": "_project_tilted_azimuthal_sink",
+        "previous_sha256": null,
+        "sha256": "fa71cd99c5c7a039c8118150b48c2fc3b562af710c326d63bf4c2e8d2c0a1f93",
+        "reason": "Accumulate source frames exactly once across CPU-to-GPU promotion, preserve row-padded big-bit prefix bytes, and publish ordered raw or packed blocks only after the complete source union is ready."
+      },
+      {
+        "module": "backprojection",
+        "name": "_backproject_tilted_azimuthal_volume_to_volume",
+        "previous_sha256": "a1cbb9099aad491631951ce711579639d0186304650e85478012bae55c3eb1bc",
+        "sha256": "c9b85f6cbf5a22140053347659cd5d80f9e1f9eb8ab0e73d9992c45f616e9002",
+        "reason": "Route sink-only Tilted Azimuthal output through the bounded GPU-capable owner while retaining the existing CPU coordinate operator and dense-path semantics."
+      },
+      {
+        "module": "pipeline",
+        "name": "_execution_runtime_provenance",
+        "previous_sha256": "49634d9448997e2d9d07bfaef5c0b2abad77cb2424c3679c2c2c651424cb8007",
+        "sha256": "b2c9f4ad5381eca7b63f47086245ba37d75d569a60080baf89257bba920f21bc",
+        "reason": "Record the Tilted Azimuthal plan/backend source hashes and requested GPU switch without initializing CUDA or altering the approved parent-memory window."
+      },
+      {
+        "module": "tilted_azimuthal_projection",
+        "name": "TiltedAzimuthalPlanUnavailable",
+        "previous_sha256": null,
+        "sha256": "20fa94e55844c58079a8ad8e766b94c8ec3dd40095254524b35716429074ed6c",
+        "reason": "Compile immutable CPU-equivalent integer gather/shear/rescale tables under a bounded host budget, preserving round-to-even and processing-row OR semantics."
+      },
+      {
+        "module": "tilted_azimuthal_projection",
+        "name": "TiltedAzimuthalProjectionPlan",
+        "previous_sha256": null,
+        "sha256": "e8efc597e07262745f5638b0859ded8ce38f2457788c588613868ef91ed2fa36",
+        "reason": "Compile immutable CPU-equivalent integer gather/shear/rescale tables under a bounded host budget, preserving round-to-even and processing-row OR semantics."
+      },
+      {
+        "module": "tilted_azimuthal_projection",
+        "name": "build_tilted_azimuthal_plan",
+        "previous_sha256": null,
+        "sha256": "a6cae2c06c061cdba6b23ee6dc77573fb6f397ab9c4216d99f3bf8a779b1f3df",
+        "reason": "Compile immutable CPU-equivalent integer gather/shear/rescale tables under a bounded host budget, preserving round-to-even and processing-row OR semantics."
+      },
+      {
+        "module": "tilted_azimuthal_projection_cuda",
+        "name": "TiltedAzimuthalCudaProjectionUnavailable",
+        "previous_sha256": null,
+        "sha256": "96ae406749349e4d321013b8729fef5a8a3181602772772c56771e0ab2a12cce",
+        "reason": "Validate bounded CUDA source bands, exact row-padded bitset addressing, synchronous frame watermarks, encoded output and safe stream-owned cleanup."
+      },
+      {
+        "module": "tilted_azimuthal_projection_cuda",
+        "name": "TiltedAzimuthalCudaProjectionUnsafeFailure",
+        "previous_sha256": null,
+        "sha256": "89143308d7dbd703bba39c94b7a0a058f7183869d5a0c0a58e5e84a033313bee",
+        "reason": "Validate bounded CUDA source bands, exact row-padded bitset addressing, synchronous frame watermarks, encoded output and safe stream-owned cleanup."
+      },
+      {
+        "module": "tilted_azimuthal_projection_cuda",
+        "name": "_TiltedAzimuthalContract",
+        "previous_sha256": null,
+        "sha256": "33bdb1b88a93c56a1b92f53f318671d7be61f459cb5bc33373cdd87041563a4c",
+        "reason": "Validate bounded CUDA source bands, exact row-padded bitset addressing, synchronous frame watermarks, encoded output and safe stream-owned cleanup."
+      },
+      {
+        "module": "tilted_azimuthal_projection_cuda",
+        "name": "_shape",
+        "previous_sha256": null,
+        "sha256": "6cf631c5427653bf15c69592f3d840943833672ee0e01ca40156bc2c3bd53c27",
+        "reason": "Validate bounded CUDA source bands, exact row-padded bitset addressing, synchronous frame watermarks, encoded output and safe stream-owned cleanup."
+      },
+      {
+        "module": "tilted_azimuthal_projection_cuda",
+        "name": "_validate_tilted_azimuthal_contract",
+        "previous_sha256": null,
+        "sha256": "bbdc78f3d2c5d5c8b403aaa5c1c4b6fb579d6fea339ae45108f924274d9c4fcc",
+        "reason": "Validate bounded CUDA source bands, exact row-padded bitset addressing, synchronous frame watermarks, encoded output and safe stream-owned cleanup."
+      },
+      {
+        "module": "tilted_azimuthal_projection_cuda",
+        "name": "_validate_initial_packed",
+        "previous_sha256": null,
+        "sha256": "0c8a0d26aff9b04c6a9f1ded752e8dd94059dcfb14b59eb643310895ba831484",
+        "reason": "Validate bounded CUDA source bands, exact row-padded bitset addressing, synchronous frame watermarks, encoded output and safe stream-owned cleanup."
+      },
+      {
+        "module": "tilted_azimuthal_projection_cuda",
+        "name": "_frame_row_bands",
+        "previous_sha256": null,
+        "sha256": "75035b32997d317d5bd98f38126b9a563b0f4a852bd25170cd3e246028a212ce",
+        "reason": "Validate bounded CUDA source bands, exact row-padded bitset addressing, synchronous frame watermarks, encoded output and safe stream-owned cleanup."
+      },
+      {
+        "module": "tilted_azimuthal_projection_cuda",
+        "name": "_preflight_case",
+        "previous_sha256": null,
+        "sha256": "b47e9d6d880ca8b8074751266ca3dc3e91d8a2f472b06fa281c2e29b8c90e9b1",
+        "reason": "Validate bounded CUDA source bands, exact row-padded bitset addressing, synchronous frame watermarks, encoded output and safe stream-owned cleanup."
+      },
+      {
+        "module": "tilted_azimuthal_projection_cuda",
+        "name": "TiltedAzimuthalCudaProjector",
+        "previous_sha256": null,
+        "sha256": "f85d66697ef1043cef6b8b5441d37de3e49d5bd264aaf4ebda176499f3c3bcfe",
+        "reason": "Validate bounded CUDA source bands, exact row-padded bitset addressing, synchronous frame watermarks, encoded output and safe stream-owned cleanup."
+      }
+    ],
+    "statements": [
+      {
+        "module": "backprojection",
+        "label": "import_concurrent_futures",
+        "previous_sha256": "7785747cb9647444f6bf0c7aae1df3a2a18fc2b09299d488ca78744db5dfecc7",
+        "sha256": "980e1f3bedcf5311218357beb1e569892b545e7fe01b1b98a91bd9a400a18f83",
+        "reason": "Handle cancellation of bounded CPU coordinate futures before projection backend handoff."
+      },
+      {
+        "module": "backprojection",
+        "label": "binding__TILTED_AZIMUTHAL_CUDA_RECHECK_FRAMES",
+        "previous_sha256": null,
+        "sha256": "3c888a949855455a27fb043294e65cfbcffa015d4fd4115bea90a301af7a36c0",
+        "reason": "Bound CPU fallback work between GPU-retirement admission retries by frame progress and elapsed time."
+      },
+      {
+        "module": "backprojection",
+        "label": "binding__TILTED_AZIMUTHAL_CUDA_RECHECK_SECONDS",
+        "previous_sha256": null,
+        "sha256": "6b5bf3da324a754cd7d02030ab4c37f900a1f416de93d1ee05960c1e5dbae929",
+        "reason": "Bound CPU fallback work between GPU-retirement admission retries by frame progress and elapsed time."
+      },
+      {
+        "module": "tilted_azimuthal_projection",
+        "label": "module_docstring",
+        "previous_sha256": null,
+        "sha256": "afcbbeeb3772d677f80e9e387bb884c5cf433377758551eebfd65809666e88cd",
+        "reason": "Compile immutable CPU-equivalent integer gather/shear/rescale tables under a bounded host budget, preserving round-to-even and processing-row OR semantics."
+      },
+      {
+        "module": "tilted_azimuthal_projection",
+        "label": "ImportFrom:7",
+        "previous_sha256": null,
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Compile immutable CPU-equivalent integer gather/shear/rescale tables under a bounded host budget, preserving round-to-even and processing-row OR semantics."
+      },
+      {
+        "module": "tilted_azimuthal_projection",
+        "label": "ImportFrom:9",
+        "previous_sha256": null,
+        "sha256": "321ed2ed3afceb74be547c9905ed4c676e453b1a68fe7cb2d3e214caeac2624d",
+        "reason": "Compile immutable CPU-equivalent integer gather/shear/rescale tables under a bounded host budget, preserving round-to-even and processing-row OR semantics."
+      },
+      {
+        "module": "tilted_azimuthal_projection",
+        "label": "Import:10",
+        "previous_sha256": null,
+        "sha256": "f329650e2c61a07a1bab85b32296a6d93760e313e108904819fa27d09cf3954d",
+        "reason": "Compile immutable CPU-equivalent integer gather/shear/rescale tables under a bounded host budget, preserving round-to-even and processing-row OR semantics."
+      },
+      {
+        "module": "tilted_azimuthal_projection",
+        "label": "Import:12",
+        "previous_sha256": null,
+        "sha256": "271fc31378e1108a9784c29c3c4768de571ce080301b4ad9721ba767fcf5842b",
+        "reason": "Compile immutable CPU-equivalent integer gather/shear/rescale tables under a bounded host budget, preserving round-to-even and processing-row OR semantics."
+      },
+      {
+        "module": "tilted_azimuthal_projection_cuda",
+        "label": "module_docstring",
+        "previous_sha256": null,
+        "sha256": "565aab4db291165065854fdb476fc74f5c27bdf20ad3975861319ba7226371e8",
+        "reason": "Validate bounded CUDA source bands, exact row-padded bitset addressing, synchronous frame watermarks, encoded output and safe stream-owned cleanup."
+      },
+      {
+        "module": "tilted_azimuthal_projection_cuda",
+        "label": "ImportFrom:8",
+        "previous_sha256": null,
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Validate bounded CUDA source bands, exact row-padded bitset addressing, synchronous frame watermarks, encoded output and safe stream-owned cleanup."
+      },
+      {
+        "module": "tilted_azimuthal_projection_cuda",
+        "label": "ImportFrom:10",
+        "previous_sha256": null,
+        "sha256": "321ed2ed3afceb74be547c9905ed4c676e453b1a68fe7cb2d3e214caeac2624d",
+        "reason": "Validate bounded CUDA source bands, exact row-padded bitset addressing, synchronous frame watermarks, encoded output and safe stream-owned cleanup."
+      },
+      {
+        "module": "tilted_azimuthal_projection_cuda",
+        "label": "Import:11",
+        "previous_sha256": null,
+        "sha256": "f329650e2c61a07a1bab85b32296a6d93760e313e108904819fa27d09cf3954d",
+        "reason": "Validate bounded CUDA source bands, exact row-padded bitset addressing, synchronous frame watermarks, encoded output and safe stream-owned cleanup."
+      },
+      {
+        "module": "tilted_azimuthal_projection_cuda",
+        "label": "Import:12",
+        "previous_sha256": null,
+        "sha256": "60e489325a19bee8be6a450945dd253634f01297b803d2869e489219288b5372",
+        "reason": "Validate bounded CUDA source bands, exact row-padded bitset addressing, synchronous frame watermarks, encoded output and safe stream-owned cleanup."
+      },
+      {
+        "module": "tilted_azimuthal_projection_cuda",
+        "label": "Import:13",
+        "previous_sha256": null,
+        "sha256": "80f21c52b46d18d972ae93db225486a900db10799e9bdba98d07dbcc819ff502",
+        "reason": "Validate bounded CUDA source bands, exact row-padded bitset addressing, synchronous frame watermarks, encoded output and safe stream-owned cleanup."
+      },
+      {
+        "module": "tilted_azimuthal_projection_cuda",
+        "label": "Import:14",
+        "previous_sha256": null,
+        "sha256": "ff05bad0fd9a7212d3cd85fd2726055168be21bc8f6e0d93b29965794b0675d4",
+        "reason": "Validate bounded CUDA source bands, exact row-padded bitset addressing, synchronous frame watermarks, encoded output and safe stream-owned cleanup."
+      },
+      {
+        "module": "tilted_azimuthal_projection_cuda",
+        "label": "Import:16",
+        "previous_sha256": null,
+        "sha256": "271fc31378e1108a9784c29c3c4768de571ce080301b4ad9721ba767fcf5842b",
+        "reason": "Validate bounded CUDA source bands, exact row-padded bitset addressing, synchronous frame watermarks, encoded output and safe stream-owned cleanup."
+      },
+      {
+        "module": "tilted_azimuthal_projection_cuda",
+        "label": "ImportFrom:18",
+        "previous_sha256": null,
+        "sha256": "06d19ce80d11c361ba5abce6a586318fec07e47603b7091d1fc63bf50b5fecb9",
+        "reason": "Validate bounded CUDA source bands, exact row-padded bitset addressing, synchronous frame watermarks, encoded output and safe stream-owned cleanup."
+      },
+      {
+        "module": "tilted_azimuthal_projection_cuda",
+        "label": "binding__KERNEL_SOURCE",
+        "previous_sha256": null,
+        "sha256": "dc27154807beb54857d2b2486710264cb8c2a829e671c1fdc167dd211e062fdc",
+        "reason": "Pin the integer CUDA scatter/unpack kernel, including 64-bit byte addressing, atomic OR and CPU-compatible row/bit padding."
+      }
+    ],
+    "local_import_seam_updates": [],
+    "preserved_radial_definition_updates": [],
+    "preserved_radial_module_updates": [],
+    "complete_modules": [
+      "tilted_azimuthal_projection",
+      "tilted_azimuthal_projection_cuda"
+    ]
+  },
+  "v22_pta_throughput_review": {
+    "release": "22.0.0",
+    "feature": "pta-pipelined-gpu-publication-and-output-formats",
+    "predecessor_bundle": {
+      "name": "XTA_v22.0.0_complete_source.zip",
+      "sha256": "44c5c5be060ade84e03e2660b1a1ef1e270bd474f68f32b7f81ed787d0db1b16"
+    },
+    "predecessor_inventory_sha256": "d2fa9727da49fcf4f577772e44d38836d4a3944093a10812936a9552877827a2",
+    "previous_review_sha256": "efb3bb2ae63be95d3faac73b6b28b28279aa8fb495f08d0cb4c8d6b1dd89ff95",
+    "definitions": [
+      {
+        "module": "pta",
+        "name": "_planning_phase_affinity",
+        "previous_sha256": null,
+        "sha256": "c84048e2f134ac5e21482eb56ad78d3d98a3f087ea6ac370673e279517cd9d06",
+        "reason": "Apply phase-aware CPU affinity and worker budgets; derive offline policy placement and strict GPU codecs from resolved output formats."
+      },
+      {
+        "module": "pta",
+        "name": "write_pta_summary",
+        "previous_sha256": "a6e60f9541aa97d45cb3403805601879107fc8cd0d7f1deb69ef49d7491e9cdc",
+        "sha256": "af2c8574a12ec8fccdb4ca11954b8465eb82d0308e5be04e0e47a0605e9878e9",
+        "reason": "Apply phase-aware CPU affinity and worker budgets; derive offline policy placement and strict GPU codecs from resolved output formats."
+      },
+      {
+        "module": "pta",
+        "name": "main",
+        "previous_sha256": "400b5f1160721af48334ce06fa0cbb230aa6469b270e0ddeba2a882f0900bb49",
+        "sha256": "3ff2f455aa1bd11542e23bcbfde255ff89d16b72df915fd21b8a362ba55f905a",
+        "reason": "Apply phase-aware CPU affinity and worker budgets; derive offline policy placement and strict GPU codecs from resolved output formats."
+      },
+      {
+        "module": "pta_scheduler",
+        "name": "PtaPipelineDepth",
+        "previous_sha256": null,
+        "sha256": "f074a27380c57a048233f3c53a27a09db1a57c936a5d1cde851dba5064664d97",
+        "reason": "Bound concurrent planning, I/O, rendering and publication against the effective pipeline depth and assigned CPU sets."
+      },
+      {
+        "module": "pta_scheduler",
+        "name": "resolve_pta_pipeline_depth",
+        "previous_sha256": null,
+        "sha256": "250e698f816a07fef907db1ebb833091ae7b1e2e199a0a599fbfde012503c0c4",
+        "reason": "Bound concurrent planning, I/O, rendering and publication against the effective pipeline depth and assigned CPU sets."
+      },
+      {
+        "module": "pta_scheduler",
+        "name": "PtaCpuBudget",
+        "previous_sha256": null,
+        "sha256": "10bf942e85b9829b4ba39aad21725dab8d5718a3a44223fc947bb0cdcafa02e0",
+        "reason": "Bound concurrent planning, I/O, rendering and publication against the effective pipeline depth and assigned CPU sets."
+      },
+      {
+        "module": "pta_scheduler",
+        "name": "_bounded_gpu_cpu_sets",
+        "previous_sha256": null,
+        "sha256": "4402e1f928574c6157321953799dd9db769f5f59146abff4fa58b3b5047bb07f",
+        "reason": "Bound concurrent planning, I/O, rendering and publication against the effective pipeline depth and assigned CPU sets."
+      },
+      {
+        "module": "pta_scheduler",
+        "name": "plan_pta_cpu_budget",
+        "previous_sha256": null,
+        "sha256": "022669b3cf0ee21420c7014f57ed5ac7a8d08d0286645d05eff012ce879a889c",
+        "reason": "Bound concurrent planning, I/O, rendering and publication against the effective pipeline depth and assigned CPU sets."
+      },
+      {
+        "module": "pta_config",
+        "name": "parse_output_image_format",
+        "previous_sha256": "1920cfd8eb351bdf332690c8a67530c072eab1f90e0774d760d4eb71773b83a7",
+        "sha256": "666fd627d81d97a2dccb6e189b07ea13466891fa4ec798675b1e2da1de8a6dfb",
+        "reason": "Select GPU JPEG/TIFF through case-insensitive output formats, infer policy placement without executing it and reject removed public backend overrides."
+      },
+      {
+        "module": "pta_config",
+        "name": "build_pta_argparser",
+        "previous_sha256": "48b33d000cdcef831c4e9c17168ab4f70f1b086108ca5d07735fc11114578571",
+        "sha256": "70d98713259f9fcc8b9073434bf52cf1764b7e68568a74503a6eb5dd363f1229",
+        "reason": "Select GPU JPEG/TIFF through case-insensitive output formats, infer policy placement without executing it and reject removed public backend overrides."
+      },
+      {
+        "module": "pta_config",
+        "name": "resolve_pta_config",
+        "previous_sha256": "893f2bc8b37aa78d24e3ccfaaa6b1614ea8dadea88fde7fa797a425cb9303136",
+        "sha256": "f2372db8ae8220c74279abfcd110405e2d61a54266ad5dd0515da34870780c55",
+        "reason": "Select GPU JPEG/TIFF through case-insensitive output formats, infer policy placement without executing it and reject removed public backend overrides."
+      },
+      {
+        "module": "pta_config",
+        "name": "parse_pta_args",
+        "previous_sha256": "0457a7bedfe8931e2c8887c1910c60b2c9b19748b223c9d92540e2b9a881d9a9",
+        "sha256": "2dd79d8b3c4e3e784b8ea69ac023fc931df5c3a7a50494cb7b097ec22cdb7ac1",
+        "reason": "Select GPU JPEG/TIFF through case-insensitive output formats, infer policy placement without executing it and reject removed public backend overrides."
+      },
+      {
+        "module": "pta_publication",
+        "name": "parse_output_image_format",
+        "previous_sha256": "c12a1d00f43a7d8e96809ef37597299a0660b6b9f184e22a23543c223dd44a33",
+        "sha256": "e7a2a87c91f6b31575b9c5e6141bddea7cd5625e77b92e61116caeb710a08ef2",
+        "reason": "Fence native JPEG encoding into immutable owned host bytes, quarantine unproved CUDA ownership and publish checked files independently."
+      },
+      {
+        "module": "pta_publication",
+        "name": "NvjpegEncodedBatch",
+        "previous_sha256": null,
+        "sha256": "c431e8b29a37c899da15305fb50bf404acd172cee7a368ee15d800be014993c1",
+        "reason": "Fence native JPEG encoding into immutable owned host bytes, quarantine unproved CUDA ownership and publish checked files independently."
+      },
+      {
+        "module": "pta_publication",
+        "name": "NvjpegCudaFenceError",
+        "previous_sha256": null,
+        "sha256": "5c55e8986612bebb7da3645bca927e8e760bbbe9e88e2bac73b9fb517d4876bb",
+        "reason": "Fence native JPEG encoding into immutable owned host bytes, quarantine unproved CUDA ownership and publish checked files independently."
+      },
+      {
+        "module": "pta_publication",
+        "name": "_encode_nvjpeg_batch",
+        "previous_sha256": null,
+        "sha256": "999c499c4870cba4cfe3c736ec08672191c2a34b6e2307f6a7908491476f03b9",
+        "reason": "Fence native JPEG encoding into immutable owned host bytes, quarantine unproved CUDA ownership and publish checked files independently."
+      },
+      {
+        "module": "pta_publication",
+        "name": "_publish_nvjpeg_batch_atomically",
+        "previous_sha256": null,
+        "sha256": "48ccf4e73cc780e39147c44d5e0342fbf0c43bc014be4258afc6becf68f6f1ad",
+        "reason": "Fence native JPEG encoding into immutable owned host bytes, quarantine unproved CUDA ownership and publish checked files independently."
+      },
+      {
+        "module": "pta_publication",
+        "name": "_write_nvjpeg_batch_atomically",
+        "previous_sha256": "1e08d6c3713c5d562c1f5061016a57d425494ee3ea41d2619f080a6fa99700b2",
+        "sha256": "dc75970dd0ac9c254b65e623330c02f839e7ccfbd9c0080b82efb8ae5e751295",
+        "reason": "Fence native JPEG encoding into immutable owned host bytes, quarantine unproved CUDA ownership and publish checked files independently."
+      },
+      {
+        "module": "pta_workers",
+        "name": "_render_worker_initializer",
+        "previous_sha256": "c466d28f14932bc3ada8200856636979d58e360f081a3924e05437559e502796",
+        "sha256": "26ea00021d364865c9d781fb373fea6956d225bde8fdc71870562621587fa895",
+        "reason": "Overlap bounded GPU policy batches with label/JPEG retirement and checked host publication while preserving drop, warning and completion semantics."
+      },
+      {
+        "module": "pta_workers",
+        "name": "_gpu_runtime_for_worker",
+        "previous_sha256": "2d14a6f42ef54291f0aa85c776521ebeecbb09ed9823a87aa0a4a14058fb9e12",
+        "sha256": "1ca6bcc30fd774fe5275092017d5b5d00dab9f9dab38959a80260ca2b144c493",
+        "reason": "Overlap bounded GPU policy batches with label/JPEG retirement and checked host publication while preserving drop, warning and completion semantics."
+      },
+      {
+        "module": "pta_workers",
+        "name": "_write_gpu_image_batch",
+        "previous_sha256": "71a45028cbd035a700f688bbe39ed0fbcd73d26bf177aed0be194c09d60bbaf6",
+        "sha256": "899c1965fdbf7939b41f05988ea58add20b3a2895021ecf3a89a4adfdeabd063",
+        "reason": "Overlap bounded GPU policy batches with label/JPEG retirement and checked host publication while preserving drop, warning and completion semantics."
+      },
+      {
+        "module": "pta_workers",
+        "name": "_label_payload_bytes",
+        "previous_sha256": null,
+        "sha256": "3c41763a4dae41f232acdacb843292ca497b3f6ed0daa56382ae5f17a1458bbc",
+        "reason": "Overlap bounded GPU policy batches with label/JPEG retirement and checked host publication while preserving drop, warning and completion semantics."
+      },
+      {
+        "module": "pta_workers",
+        "name": "_publish_label_payloads",
+        "previous_sha256": null,
+        "sha256": "42e727118c0850ed9979c6ebeceba042fc3e56ae488181ec5648d06fcd07dfec",
+        "reason": "Overlap bounded GPU policy batches with label/JPEG retirement and checked host publication while preserving drop, warning and completion semantics."
+      },
+      {
+        "module": "pta_workers",
+        "name": "_validate_gpu_policy_batch",
+        "previous_sha256": null,
+        "sha256": "a1487f59a5ccf7f6f80331d5ac16de9ffc0cd886164f43b4b149400d776a233d",
+        "reason": "Overlap bounded GPU policy batches with label/JPEG retirement and checked host publication while preserving drop, warning and completion semantics."
+      },
+      {
+        "module": "pta_workers",
+        "name": "_publish_gpu_policy_batch",
+        "previous_sha256": "c2c6e32ae757a8c2237768fcea6fb75a9c5b010328c37a66065c8369614be499",
+        "sha256": "34075c1bbea2c19d20bf18fd2073498ec62829c818e2713d9122a0bc1cb5d490",
+        "reason": "Overlap bounded GPU policy batches with label/JPEG retirement and checked host publication while preserving drop, warning and completion semantics."
+      },
+      {
+        "module": "pta_workers",
+        "name": "execute_gpu_frame_batch_task",
+        "previous_sha256": "a932ab1af3196d9506aa0e236584a6e07fafc664aa4a5f4ec0b341775402ff2c",
+        "sha256": "0bbb3f38adc87088f3653c3a9826b052a75ba99ba0a7fa75da6b11ade86e3c60",
+        "reason": "Overlap bounded GPU policy batches with label/JPEG retirement and checked host publication while preserving drop, warning and completion semantics."
+      },
+      {
+        "module": "nvtiff_backend",
+        "name": "_image_info",
+        "previous_sha256": "750eaaa298cebfaaa0a4b0d657a86973d1c21838001ab38a72853b71a9e0effd",
+        "sha256": "28e3edb12f1aa34328bf5e5ca62a62df62f28f2ccad90f0c82bbd305a5b49f46",
+        "reason": "Encode gray and interleaved RGB images as one lossless TIFF page while preserving custom-channel multipage ownership and validation."
+      },
+      {
+        "module": "nvtiff_backend",
+        "name": "NvTiffBackend",
+        "previous_sha256": "139ab8554df6c66b855b33ecddf780241265bf31f678a630d00ec5a520b3a8e1",
+        "sha256": "aea29871cf95ceec9cc2e1c566e8d6d6cfebc2fa363331d8936b1d7ee57e2a60",
+        "reason": "Encode gray and interleaved RGB images as one lossless TIFF page while preserving custom-channel multipage ownership and validation."
+      },
+      {
+        "module": "nvtiff_backend",
+        "name": "_cuda_image_device_pointer",
+        "previous_sha256": null,
+        "sha256": "fc697b56c07fa1848f4a04637bcdd586ec8b7d24e09907d677e1826f938bad16",
+        "reason": "Encode gray and interleaved RGB images as one lossless TIFF page while preserving custom-channel multipage ownership and validation."
+      },
+      {
+        "module": "pta_batch_pipeline",
+        "name": "_PendingBatch",
+        "previous_sha256": null,
+        "sha256": "658c6753fadbefa3d8bb7889af85f7da7c858b4815e0d3258eb5121c378aab33",
+        "reason": "Reserve count and byte capacity before allocation; publish and collect in order, drain admitted owners on failure and bound both pipeline stages."
+      },
+      {
+        "module": "pta_batch_pipeline",
+        "name": "BatchReservation",
+        "previous_sha256": null,
+        "sha256": "ad137598e8be45a5b9aac1caf15beab62ddde7e0c02c844cd7ba7aa7899d4b34",
+        "reason": "Reserve count and byte capacity before allocation; publish and collect in order, drain admitted owners on failure and bound both pipeline stages."
+      },
+      {
+        "module": "pta_batch_pipeline",
+        "name": "OrderedBatchPipeline",
+        "previous_sha256": null,
+        "sha256": "0d74cb13c09f052c88d4ea234815f2392edeb101542d6a43ff1535635cdd558a",
+        "reason": "Reserve count and byte capacity before allocation; publish and collect in order, drain admitted owners on failure and bound both pipeline stages."
+      },
+      {
+        "module": "pta_gpu_publication",
+        "name": "_byte_limit",
+        "previous_sha256": null,
+        "sha256": "490297b9aaa05418bf71c1ab833403de140be82d6c09c365b9559df724a077b3",
+        "reason": "Own cloned policy results through event-fenced CPU label retirement, native encoding and bounded immutable host-file handoff."
+      },
+      {
+        "module": "pta_gpu_publication",
+        "name": "_GpuBatch",
+        "previous_sha256": null,
+        "sha256": "ecbb1ffeeb484d93397ab793c077c47db2e822f6d564aa5f0ca3ce25b3cdf645",
+        "reason": "Own cloned policy results through event-fenced CPU label retirement, native encoding and bounded immutable host-file handoff."
+      },
+      {
+        "module": "pta_gpu_publication",
+        "name": "GpuPublicationResources",
+        "previous_sha256": null,
+        "sha256": "e3106a008e1adb599c37506769744e101f6feed4c71cdef4222535bab71dce61",
+        "reason": "Own cloned policy results through event-fenced CPU label retirement, native encoding and bounded immutable host-file handoff."
+      },
+      {
+        "module": "pta_gpu_publication",
+        "name": "_finalize_resources",
+        "previous_sha256": null,
+        "sha256": "a7279956da25a07d59b279c328cf626b51cf0024c6c3fc0c37149bccc9d0b63c",
+        "reason": "Own cloned policy results through event-fenced CPU label retirement, native encoding and bounded immutable host-file handoff."
+      },
+      {
+        "module": "pta_gpu_publication",
+        "name": "GpuPublicationTask",
+        "previous_sha256": null,
+        "sha256": "045ba46cc380294e7f11a3fa7507e5939ab91cf604a646b4539fec119c01cc0f",
+        "reason": "Own cloned policy results through event-fenced CPU label retirement, native encoding and bounded immutable host-file handoff."
+      },
+      {
+        "module": "pta_gpu_publication",
+        "name": "publication_resources",
+        "previous_sha256": null,
+        "sha256": "596a39fc6148d9dae337c859e73ae07b6f4131b898ebf926000126c7232ad564",
+        "reason": "Own cloned policy results through event-fenced CPU label retirement, native encoding and bounded immutable host-file handoff."
+      }
+    ],
+    "statements": [
+      {
+        "module": "pta",
+        "label": "import_contextlib",
+        "previous_sha256": null,
+        "sha256": "dc298a564522c0894fe46a3cdb7c31e40f8408b4dbf1dd28469c587a6f0a7b5f",
+        "reason": "Apply phase-aware CPU affinity and worker budgets; derive offline policy placement and strict GPU codecs from resolved output formats."
+      },
+      {
+        "module": "pta",
+        "label": "import_.pta_scheduler",
+        "previous_sha256": "4b0deca9ba06b9b75f0555ee154ea6ac29a5012c3bd3598fc772e690f4b9030d",
+        "sha256": "36177d58511b0bbd4a31f1f136cffbf71d2274d1d21766c6ac7764b84f514b06",
+        "reason": "Apply phase-aware CPU affinity and worker budgets; derive offline policy placement and strict GPU codecs from resolved output formats."
+      },
+      {
+        "module": "pta_scheduler",
+        "label": "import_dataclasses",
+        "previous_sha256": "70bd9e0c4f1816b9f9f4b04c6c07c6303849eadd90de76e9a14084b9c76de162",
+        "sha256": "09d7cc71a51241798e49ab497a2e95c79b0a14b0301ab2620887f0e74d159a06",
+        "reason": "Bound concurrent planning, I/O, rendering and publication against the effective pipeline depth and assigned CPU sets."
+      },
+      {
+        "module": "pta_scheduler",
+        "label": "binding___all__",
+        "previous_sha256": "0be47bb40b8ebe19d711bb011ae9088b53e0abfe0a577b8e97bba76327ed655a",
+        "sha256": "ff58c1b01ddae09bb87a1597654d7a3fb7878ae2c299bc85d6fc41735cbe2252",
+        "reason": "Bound concurrent planning, I/O, rendering and publication against the effective pipeline depth and assigned CPU sets."
+      },
+      {
+        "module": "pta_publication",
+        "label": "import_concurrent.futures",
+        "previous_sha256": null,
+        "sha256": "032fe6333c980561a01fbc5b5032ab13a99be0d312bcea171e76048a2bbd2dce",
+        "reason": "Fence native JPEG encoding into immutable owned host bytes, quarantine unproved CUDA ownership and publish checked files independently."
+      },
+      {
+        "module": "pta_publication",
+        "label": "import_dataclasses",
+        "previous_sha256": "321ed2ed3afceb74be547c9905ed4c676e453b1a68fe7cb2d3e214caeac2624d",
+        "sha256": "5a46818000a4ba65186172bb0cb9a4b5dbc848a8a97f892692ffc6df7d8c6953",
+        "reason": "Fence native JPEG encoding into immutable owned host bytes, quarantine unproved CUDA ownership and publish checked files independently."
+      },
+      {
+        "module": "pta_publication",
+        "label": "binding_OUTPUT_IMAGE_FORMATS",
+        "previous_sha256": "0b932b66fa29145da1e249f09edb32f19ec5befd6a3f7d30901f323d0bc0e422",
+        "sha256": "b28dc4ef9bfc92532aa67b9b47788a5dd8cfd785de131fab875352cc950a9291",
+        "reason": "Fence native JPEG encoding into immutable owned host bytes, quarantine unproved CUDA ownership and publish checked files independently."
+      },
+      {
+        "module": "pta_publication",
+        "label": "binding__NVJPEG_QUARANTINED_BATCHES",
+        "previous_sha256": null,
+        "sha256": "47c44f2ea791e8ffcd3d8ad42638b7356dcca30d98ea02cb0e13518df0c61781",
+        "reason": "Fence native JPEG encoding into immutable owned host bytes, quarantine unproved CUDA ownership and publish checked files independently."
+      },
+      {
+        "module": "pta_publication",
+        "label": "binding__NVJPEG_QUARANTINE_LOCK",
+        "previous_sha256": null,
+        "sha256": "1a093632f969112ebf42c7f457b90c24f703963c4f67bf3870f8c2422fbe6bd4",
+        "reason": "Fence native JPEG encoding into immutable owned host bytes, quarantine unproved CUDA ownership and publish checked files independently."
+      },
+      {
+        "module": "pta_workers",
+        "label": "import_contextlib",
+        "previous_sha256": null,
+        "sha256": "29b4ccf1cee0a9c97cadf1694464fdb7bd4d84e10e0d7ff9b3bc308cb10552e4",
+        "reason": "Overlap bounded GPU policy batches with label/JPEG retirement and checked host publication while preserving drop, warning and completion semantics."
+      },
+      {
+        "module": "pta_workers",
+        "label": "import_.pta_publication",
+        "previous_sha256": "d0d9e5002911f97a2f25cc37ecd221c7379047971e2342bd60aabd18de3b7a41",
+        "sha256": "ac3c7649a4fd527c368bb01ade6b498bb724a1c6c4d15733f80c9adf8bc31754",
+        "reason": "Overlap bounded GPU policy batches with label/JPEG retirement and checked host publication while preserving drop, warning and completion semantics."
+      },
+      {
+        "module": "nvtiff_backend",
+        "label": "module_docstring",
+        "previous_sha256": "ca9c823c1f11c3edeec002b5356e2bfa6b27ba0896fe8465ff7dfa82f0827081",
+        "sha256": "9d0f2ca17f455fca64ad4339ce21ecb2f8c798d092a699fbdbd075f78136e9a9",
+        "reason": "Encode gray and interleaved RGB images as one lossless TIFF page while preserving custom-channel multipage ownership and validation."
+      },
+      {
+        "module": "nvtiff_backend",
+        "label": "binding__NVTIFF_PHOTOMETRIC_RGB",
+        "previous_sha256": null,
+        "sha256": "89a81db3a08e48e33b07a10c1971796fa87b60923c4d8348141500c24bbf5c57",
+        "reason": "Encode gray and interleaved RGB images as one lossless TIFF page while preserving custom-channel multipage ownership and validation."
+      },
+      {
+        "module": "pta_batch_pipeline",
+        "label": "module_docstring",
+        "previous_sha256": null,
+        "sha256": "8cb36e345b51816ea86b8b4fce66dd9324a4c9f4b0a0500f2b00b18458c5ebca",
+        "reason": "Reserve count and byte capacity before allocation; publish and collect in order, drain admitted owners on failure and bound both pipeline stages."
+      },
+      {
+        "module": "pta_batch_pipeline",
+        "label": "import___future__",
+        "previous_sha256": null,
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Reserve count and byte capacity before allocation; publish and collect in order, drain admitted owners on failure and bound both pipeline stages."
+      },
+      {
+        "module": "pta_batch_pipeline",
+        "label": "import_operator",
+        "previous_sha256": null,
+        "sha256": "60e489325a19bee8be6a450945dd253634f01297b803d2869e489219288b5372",
+        "reason": "Reserve count and byte capacity before allocation; publish and collect in order, drain admitted owners on failure and bound both pipeline stages."
+      },
+      {
+        "module": "pta_batch_pipeline",
+        "label": "import_collections",
+        "previous_sha256": null,
+        "sha256": "44606a75ef80c599dae4001b8647bf9120e9ae20e99e2647215ae67968dbeb17",
+        "reason": "Reserve count and byte capacity before allocation; publish and collect in order, drain admitted owners on failure and bound both pipeline stages."
+      },
+      {
+        "module": "pta_batch_pipeline",
+        "label": "import_concurrent.futures",
+        "previous_sha256": null,
+        "sha256": "cac7ed9a1d55cafd788d7a4d99c9d23d3b48bcac8edf3e1ea27eb8494b82a21d",
+        "reason": "Reserve count and byte capacity before allocation; publish and collect in order, drain admitted owners on failure and bound both pipeline stages."
+      },
+      {
+        "module": "pta_batch_pipeline",
+        "label": "import_dataclasses",
+        "previous_sha256": null,
+        "sha256": "321ed2ed3afceb74be547c9905ed4c676e453b1a68fe7cb2d3e214caeac2624d",
+        "reason": "Reserve count and byte capacity before allocation; publish and collect in order, drain admitted owners on failure and bound both pipeline stages."
+      },
+      {
+        "module": "pta_batch_pipeline",
+        "label": "import_typing",
+        "previous_sha256": null,
+        "sha256": "aac8c4a8416ffd61965931187ce3c6a06d35f2738be8ebb7423dea7cd4618a19",
+        "reason": "Reserve count and byte capacity before allocation; publish and collect in order, drain admitted owners on failure and bound both pipeline stages."
+      },
+      {
+        "module": "pta_batch_pipeline",
+        "label": "binding_PayloadT",
+        "previous_sha256": null,
+        "sha256": "5104792bfae3599dffa6519397228058344d1f07b7b91982bef8225e9935f8d4",
+        "reason": "Reserve count and byte capacity before allocation; publish and collect in order, drain admitted owners on failure and bound both pipeline stages."
+      },
+      {
+        "module": "pta_batch_pipeline",
+        "label": "binding_ResultT",
+        "previous_sha256": null,
+        "sha256": "ae1d14a8d09c3dc5558360a87853bbc2fcc96facf2a6fc05cbd78122b58c5362",
+        "reason": "Reserve count and byte capacity before allocation; publish and collect in order, drain admitted owners on failure and bound both pipeline stages."
+      },
+      {
+        "module": "pta_gpu_publication",
+        "label": "module_docstring",
+        "previous_sha256": null,
+        "sha256": "a0da1ddee94d414ea7b00aa15849785fabae3f2110863c45b82cb6bd8292428a",
+        "reason": "Own cloned policy results through event-fenced CPU label retirement, native encoding and bounded immutable host-file handoff."
+      },
+      {
+        "module": "pta_gpu_publication",
+        "label": "import___future__",
+        "previous_sha256": null,
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Own cloned policy results through event-fenced CPU label retirement, native encoding and bounded immutable host-file handoff."
+      },
+      {
+        "module": "pta_gpu_publication",
+        "label": "import_concurrent.futures",
+        "previous_sha256": null,
+        "sha256": "f58f2ea673fa2a5627654ed695deb2cb35329421a039e6485db604bafb90b572",
+        "reason": "Own cloned policy results through event-fenced CPU label retirement, native encoding and bounded immutable host-file handoff."
+      },
+      {
+        "module": "pta_gpu_publication",
+        "label": "import_contextlib",
+        "previous_sha256": null,
+        "sha256": "a510406c1fa6f159ec004f4ead0d836747696bf4154e0a5daee8abdfbd9829f0",
+        "reason": "Own cloned policy results through event-fenced CPU label retirement, native encoding and bounded immutable host-file handoff."
+      },
+      {
+        "module": "pta_gpu_publication",
+        "label": "import_dataclasses",
+        "previous_sha256": null,
+        "sha256": "321ed2ed3afceb74be547c9905ed4c676e453b1a68fe7cb2d3e214caeac2624d",
+        "reason": "Own cloned policy results through event-fenced CPU label retirement, native encoding and bounded immutable host-file handoff."
+      },
+      {
+        "module": "pta_gpu_publication",
+        "label": "import_os",
+        "previous_sha256": null,
+        "sha256": "ac3a74d6dd975a8e8fe4b7f85fce794793a9355595b850e3926964913948d386",
+        "reason": "Own cloned policy results through event-fenced CPU label retirement, native encoding and bounded immutable host-file handoff."
+      },
+      {
+        "module": "pta_gpu_publication",
+        "label": "import_threading",
+        "previous_sha256": null,
+        "sha256": "80f21c52b46d18d972ae93db225486a900db10799e9bdba98d07dbcc819ff502",
+        "reason": "Own cloned policy results through event-fenced CPU label retirement, native encoding and bounded immutable host-file handoff."
+      },
+      {
+        "module": "pta_gpu_publication",
+        "label": "import_time",
+        "previous_sha256": null,
+        "sha256": "ff05bad0fd9a7212d3cd85fd2726055168be21bc8f6e0d93b29965794b0675d4",
+        "reason": "Own cloned policy results through event-fenced CPU label retirement, native encoding and bounded immutable host-file handoff."
+      },
+      {
+        "module": "pta_gpu_publication",
+        "label": "import_.pta_batch_pipeline",
+        "previous_sha256": null,
+        "sha256": "8a3443ca894007c1498c1283507d1f1cacf882830ea69dd733049b122eb5ee49",
+        "reason": "Own cloned policy results through event-fenced CPU label retirement, native encoding and bounded immutable host-file handoff."
+      },
+      {
+        "module": "pta_gpu_publication",
+        "label": "binding__QUARANTINED_PUBLICATIONS",
+        "previous_sha256": null,
+        "sha256": "6ba50d7d89c1a5df3f20749401739d5e7a7db783ae6dcd87462fbfa91be581bd",
+        "reason": "Own cloned policy results through event-fenced CPU label retirement, native encoding and bounded immutable host-file handoff."
+      }
+    ],
+    "local_import_seam_updates": [],
+    "preserved_radial_definition_updates": [],
+    "preserved_radial_module_updates": [],
+    "complete_modules": [
+      "pta_batch_pipeline",
+      "pta_gpu_publication"
+    ],
+    "module_snapshots": [
+      {
+        "module": "pta",
+        "previous_ast_sha256": "18853a78b464a41017f82d8020f4905d3d5d953d16693abad5067f192b00cfe4",
+        "ast_sha256": "306870f75e2fbb04ba4ec3ffe24cd6e349384f995c209b2934cfc2207c59dbbd",
+        "reason": "Apply phase-aware CPU affinity and worker budgets; derive offline policy placement and strict GPU codecs from resolved output formats."
+      },
+      {
+        "module": "pta_scheduler",
+        "previous_ast_sha256": "067bfa10b01e5820aa949197e5776af8ce968278b561cf57d46eff883fca5ee6",
+        "ast_sha256": "640dbb354b94fc64e9a899533a78c0fdb7a1889eab06230451d6a7c477063dbf",
+        "reason": "Bound concurrent planning, I/O, rendering and publication against the effective pipeline depth and assigned CPU sets."
+      },
+      {
+        "module": "pta_config",
+        "previous_ast_sha256": "60d4b4ce90e15b752a225cd998827e4e925c8599d79e59de8bf5137f092d707b",
+        "ast_sha256": "780c3d3c7197ce596f3f37c5d93929a4db2708cfc1ce6d7189a93f85a879ab3a",
+        "reason": "Select GPU JPEG/TIFF through case-insensitive output formats, infer policy placement without executing it and reject removed public backend overrides."
+      },
+      {
+        "module": "pta_runtime",
+        "previous_ast_sha256": "e55c20b72fb956d1a7476ec05fe4f00143bdac8f8109c5bdafffa1f0ef7126c0",
+        "ast_sha256": "e55c20b72fb956d1a7476ec05fe4f00143bdac8f8109c5bdafffa1f0ef7126c0",
+        "reason": "Preserve the resolved native runtime namespace and canonical emitted output formats."
+      },
+      {
+        "module": "pta_publication",
+        "previous_ast_sha256": "75a806be8a9fd460a6c01e822269d08df5a397d959355a35d3f6941a6c86fe50",
+        "ast_sha256": "56d4265a22ef60319aca1b11a298e3cbcf3941729163012861cbf757e61c9f89",
+        "reason": "Fence native JPEG encoding into immutable owned host bytes, quarantine unproved CUDA ownership and publish checked files independently."
+      },
+      {
+        "module": "pta_workers",
+        "previous_ast_sha256": "f0b08380e384f14315db9f883f41c7d38bdeaec391a135150a43b0eee1c58f5c",
+        "ast_sha256": "4098ce667b09e72d299226262852a1cb2e60cfb5abf987b466e7fafe9dccaf44",
+        "reason": "Overlap bounded GPU policy batches with label/JPEG retirement and checked host publication while preserving drop, warning and completion semantics."
+      },
+      {
+        "module": "nvtiff_backend",
+        "previous_ast_sha256": "eb785f353231a46f5bfe59f8f85b1d77300c1d47f9f3d2a05bdd215ee6572f75",
+        "ast_sha256": "9fa413b679b46aaa1db1162753a20420b5751c026218a0357cd6981ba6b133b7",
+        "reason": "Encode gray and interleaved RGB images as one lossless TIFF page while preserving custom-channel multipage ownership and validation."
+      },
+      {
+        "module": "pta_batch_pipeline",
+        "previous_ast_sha256": null,
+        "ast_sha256": "fc364e7c623a11fe95f2c4202730377518afe344f6081c9054c9beff8683324a",
+        "reason": "Reserve count and byte capacity before allocation; publish and collect in order, drain admitted owners on failure and bound both pipeline stages."
+      },
+      {
+        "module": "pta_gpu_publication",
+        "previous_ast_sha256": null,
+        "ast_sha256": "af1fed979738c1dbb597141d252236abfd5dd9da5311a1ed00ef0894a0cec7d5",
+        "reason": "Own cloned policy results through event-fenced CPU label retirement, native encoding and bounded immutable host-file handoff."
+      }
+    ]
+  },
+  "v22_1_release_review": {
+    "release": "22.1.0",
+    "feature": "release-22.1.0-consolidated-pta-backends",
+    "previous_review_sha256": "a9f548390c5d6881bb244cf0ee7f4333323b7e1c923079eb682f4248d779c46e",
+    "predecessor_bundle": {
+      "name": "XTA_v22.0.0_complete_source.zip",
+      "sha256": "5c3cbcdf7310293e92c8bd7386959d0be9d529acfb9d726a77896c7f520055ef"
+    },
+    "predecessor_inventory_sha256": "ba0fd46550164281ae5888477d471ea4e1890ea9f9fb6350b5792de43e574058",
+    "preserved_module_statements_sha256": {
+      "__init__": "b220d045ae75a96d4e3bc2a61dc2f36feb6f5d5b6edaf09e9513e16b7acbeec8",
+      "cli": "d4083653fa24aedbc09f3af32c92cab108abcac977be91a5b2ca5c043d03149f",
+      "config": "b8e594aaf6db34d1c5ca334f177ba46e80f5933bb073544a8c0178c14d256685"
+    },
+    "definitions": [],
+    "statements": [
+      {
+        "module": "__init__",
+        "label": "Assign:7",
+        "binding": "__version__",
+        "previous_sha256": "5c3c7e3cffcf94b2617dff98fe1a491fcad8b2d1cd10e3670acb1b37d3c1a446",
+        "sha256": "6bf4ff49268c89404d8a51d5204d513826dc8443e29cd37ec4da6357822bfdd9",
+        "reason": "Promote the reviewed consolidated PTA backends to v22.1.0 and its sole compatibility launcher without functional runtime changes."
+      },
+      {
+        "module": "cli",
+        "label": "Assign:13",
+        "binding": "SCRIPT_VERSION",
+        "previous_sha256": "d94f5ca4739666e49e2d9efa1b86da744bc7b215dfb05f7f9cd54bec29d44709",
+        "sha256": "598ef9644c3c08bb0f696037b443ec6cabbf723953c91612f4a2b6a166660a21",
+        "reason": "Promote the reviewed consolidated PTA backends to v22.1.0 and its sole compatibility launcher without functional runtime changes."
+      },
+      {
+        "module": "cli",
+        "label": "Assign:14",
+        "binding": "SCRIPT_BASENAME",
+        "previous_sha256": "a31eb9476d5d0889bb968b9093c51f2edffd639b2190040697ac3e63f53cbdb9",
+        "sha256": "bd229db126a6250b7c8dace27bd5699cc2842d4a86036f58c62c5709ccf1e062",
+        "reason": "Promote the reviewed consolidated PTA backends to v22.1.0 and its sole compatibility launcher without functional runtime changes."
+      },
+      {
+        "module": "config",
+        "label": "Assign:22",
+        "binding": "SCRIPT_VERSION",
+        "previous_sha256": "d94f5ca4739666e49e2d9efa1b86da744bc7b215dfb05f7f9cd54bec29d44709",
+        "sha256": "598ef9644c3c08bb0f696037b443ec6cabbf723953c91612f4a2b6a166660a21",
+        "reason": "Promote the reviewed consolidated PTA backends to v22.1.0 and its sole compatibility launcher without functional runtime changes."
+      },
+      {
+        "module": "config",
+        "label": "Assign:24",
+        "binding": "SCRIPT_VERSION_COMPACT",
+        "previous_sha256": "65f94e2f88ca74c9e1df497c39ef826a730620aae0c7f3ae1743f04e7a777299",
+        "sha256": "1b342361be1733ccaaa5553a5f73d1993ddd2942ee3c9fbacc71228dd8f0c8b1",
+        "reason": "Promote the reviewed consolidated PTA backends to v22.1.0 and its sole compatibility launcher without functional runtime changes."
+      }
+    ],
+    "local_import_seam_updates": [],
+    "preserved_radial_definition_updates": [],
+    "preserved_radial_module_updates": [],
+    "complete_modules": []
   }
 }

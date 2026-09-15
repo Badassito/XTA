@@ -17,6 +17,7 @@ import queue
 import threading
 from collections import Counter, defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
@@ -43,6 +44,9 @@ from .pta_augmentation import (
 )
 from .pta_dataset import OutputCandidate
 from .pta_publication import (
+    NvjpegCudaFenceError,
+    _encode_nvjpeg_batch,
+    _publish_nvjpeg_batch_atomically,
     _write_nvjpeg_batch_atomically,
     candidate_output_paths,
     ensure_output_parent_once,
@@ -314,6 +318,8 @@ def _render_worker_initializer(
         local_cpus = tuple(int(x) for x in gpu_cpu_sets[rank]) if rank < len(gpu_cpu_sets) else tuple()
         if local_cpus:
             bind_current_thread_to_cpus(local_cpus)
+            _WORKER_STATIC['gpu_render_threads'] = max(
+                1, min(int(_WORKER_STATIC.get('gpu_render_threads', 1)), len(local_cpus)))
         elif worker_cpu_order:
             bind_current_thread_to_cpus((int(worker_cpu_order[rank % len(worker_cpu_order)]),))
     elif worker_cpu_order:
@@ -723,7 +729,7 @@ def _gpu_runtime_for_worker() -> Dict[str, object]:
         except Exception as exc:
             if codec_request == "nvjpeg":
                 raise RuntimeError(
-                    "--jpeg_encode_backend nvjpeg requires a working "
+                    "--output_format nvjpeg requires a working "
                     "nvidia-nvimgcodec-cu12 or nvidia-nvimgcodec-cu13 installation "
                     "matching the active CUDA major version"
                 ) from exc
@@ -744,7 +750,7 @@ def _gpu_runtime_for_worker() -> Dict[str, object]:
         except Exception as exc:
             if tiff_codec_request == "nvtiff":
                 raise RuntimeError(
-                    "--tiff_encode_backend nvtiff requires nvTIFF 0.8 or newer; install "
+                    "--output_format nvtiff requires nvTIFF 0.8 or newer; install "
                     "nvidia-nvtiff-cu13 for CUDA 13 or nvidia-nvtiff-cu12 for CUDA 12"
                 ) from exc
             nvtiff_error = f"{type(exc).__name__}: {exc}"
@@ -855,6 +861,8 @@ def _write_gpu_image_batch(
     image_format: str,
     png_compression: int,
     jpeg_quality: int,
+    publication: Optional[object] = None,
+    deferred_label_payloads: Sequence[Tuple[Path, List[str]]] = (),
 ) -> Optional[str]:
     """Encode CUDA images with nvJPEG/nvTIFF, or return an auto-fallback note."""
     if not indices:
@@ -873,17 +881,22 @@ def _write_gpu_image_batch(
     tiff_codec_request = str(_WORKER_STATIC.get("tiff_encode_backend", "auto"))
     fallback_note: Optional[str] = None
     parsed_format = parse_output_image_format(image_format)
-    if parsed_format == "tif" and str(channel_kind) == "custom":
+    if parsed_format == "tif" and (
+        str(channel_kind) == "custom" or tiff_codec_request == "nvtiff"
+    ):
         nvtiff_encoder = runtime.get("nvtiff_encoder")
         if nvtiff_encoder is not None:
             try:
                 stream = torch.cuda.current_stream(device=int(runtime["device_id"]))  # type: ignore[attr-defined]
                 for sample_index, path in enumerate(paths):
-                    nvtiff_encoder.write_multipage_lzw(  # type: ignore[union-attr]
-                        path,
-                        selected[int(sample_index)].contiguous(),
-                        cuda_stream=int(stream.cuda_stream),
-                    )
+                    sample = selected[int(sample_index)]
+                    if str(channel_kind) == 'custom':
+                        nvtiff_encoder.write_multipage_lzw(
+                            path, sample.contiguous(), cuda_stream=int(stream.cuda_stream))
+                    else:
+                        nvtiff_encoder.write_image_lzw(
+                            path, sample.permute(1, 2, 0).contiguous(),
+                            cuda_stream=int(stream.cuda_stream))
                 return None
             except Exception as exc:
                 if tiff_codec_request == "nvtiff":
@@ -914,7 +927,7 @@ def _write_gpu_image_batch(
                 channel_kind=str(channel_kind),
                 cuda_stream=int(stream.cuda_stream),
             )
-            _write_nvjpeg_batch_atomically(
+            encode_kwargs = dict(
                 encoder=encoder,
                 images=wrapped,
                 final_paths=paths,
@@ -927,8 +940,28 @@ def _write_gpu_image_batch(
                 synchronize_device=(
                     lambda: torch.cuda.synchronize(int(runtime["device_id"]))
                 ),
+                input_owners=(images_nchw, selected, samples_tensor),
             )
+            if publication is None:
+                _write_nvjpeg_batch_atomically(**encode_kwargs)
+            else:
+                # Claim the host batch slot before allocating CodeStreams. Once
+                # the encoded size is known, charge its bytes before submission.
+                with publication.reserve_host() as host_slot:
+                    with publication.measure('jpeg_encode_and_fence'):
+                        encoded = _encode_nvjpeg_batch(**encode_kwargs)
+                    label_bytes = _label_payload_bytes(deferred_label_payloads)
+                    with publication.measure('host_queue_wait'):
+                        host_slot.resize(encoded.nbytes + label_bytes)
+                    def publish_encoded_and_labels():
+                        _publish_nvjpeg_batch_atomically(encoded, executor=publication.file_executor)
+                        _publish_label_payloads(deferred_label_payloads, publication.file_executor)
+                    host_slot.submit(publish_encoded_and_labels)
             return None
+        except NvjpegCudaFenceError:
+            # A failed device fence must never start an OpenCV fallback or a
+            # second encoder against buffers whose ownership is unresolved.
+            raise
         except Exception as exc:
             if codec_request == "nvjpeg":
                 raise RuntimeError("nvJPEG batch encoding failed") from exc
@@ -957,6 +990,35 @@ def _write_gpu_image_batch(
             jpeg_quality=int(jpeg_quality),
         )
     return fallback_note
+
+
+def _label_payload_bytes(payloads: Sequence[Tuple[Path, Sequence[str]]]) -> int:
+    return sum(sum(len(line.encode('utf-8')) + 1 for line in lines)
+               for _, lines in payloads)
+
+
+def _publish_label_payloads(payloads, executor=None) -> None:
+    """Join every admitted file operation before propagating its first error."""
+    if executor is None:
+        for path, lines in payloads:
+            write_yolo_lines(lines, path)
+        return
+    futures = []
+    error = None
+    for path, lines in payloads:
+        try:
+            futures.append(executor.submit(write_yolo_lines, lines, path))
+        except BaseException as exc:
+            error = exc
+            break
+    for future in futures:
+        try:
+            future.result()
+        except BaseException as exc:
+            if error is None:
+                error = exc
+    if error is not None:
+        raise error
 
 
 @dataclass(frozen=True)
@@ -1634,22 +1696,12 @@ def _render_gpu_item_group(
     return tuple(rendered)
 
 
-def _publish_gpu_policy_batch(
-    *,
-    runtime: Mapping[str, object],
-    batch_images: object,
-    batch_masks: object,
-    candidates: Sequence[OutputCandidate],
-    output_size: Tuple[int, int],
-    channel_kind: str,
-    local_warnings: WarningLog,
-    channel_count: Optional[int] = None,
-) -> Tuple[int, Dict[str, int]]:
-    """Validate and publish one flat CUDA policy result batch."""
-
-    global _WORKER_GPU_CODEC_WARNING_EMITTED
+def _validate_gpu_policy_batch(
+    *, runtime, batch_images, batch_masks, candidates, output_size,
+    channel_kind, channel_count=None,
+):
+    """Validate cheap shape/ownership metadata before asynchronous snapshots."""
     torch = runtime["torch"]
-    static = _WORKER_STATIC
     expected = len(candidates)
     if not bool(getattr(batch_images, "is_cuda", False)) or not bool(getattr(batch_masks, "is_cuda", False)):
         raise TypeError("GPU policy outputs must remain CUDA tensors")
@@ -1694,46 +1746,88 @@ def _publish_gpu_policy_batch(
             f"expected {expected_mask_shape}, got {tuple(batch_masks.shape)}"
         )
 
+    return batch_masks
+
+
+def _publish_gpu_policy_batch(
+    *,
+    runtime: Mapping[str, object],
+    batch_images: object,
+    batch_masks: object,
+    candidates: Sequence[OutputCandidate],
+    output_size: Tuple[int, int],
+    channel_kind: str,
+    local_warnings: WarningLog,
+    channel_count: Optional[int] = None,
+    publication: Optional[object] = None,
+) -> Tuple[int, Dict[str, int]]:
+    """Validate and publish one flat CUDA policy result batch."""
+
+    global _WORKER_GPU_CODEC_WARNING_EMITTED
+    static = _WORKER_STATIC
+    torch = runtime["torch"]
+    expected = len(candidates)
+    batch_masks = _validate_gpu_policy_batch(
+        runtime=runtime, batch_images=batch_images, batch_masks=batch_masks,
+        candidates=candidates, output_size=output_size, channel_kind=channel_kind,
+        channel_count=channel_count)
+
     out_dir: Path = static["out_dir"]  # type: ignore[assignment]
     split_active = bool(static["split_active"])
     image_format = str(static["image_format"])
     save_images = bool(static.get("save_images", True))
     save_labels = bool(static.get("save_labels", True))
-    # A device-side reduction is enough for background/flip decisions. Full
-    # masks cross PCIe only when labels were explicitly requested.
-    mask_semantics_required = any(
-        bool(candidate.label_enabled) or not bool(candidate.foreground)
-        for candidate in candidates
-    )
-    if mask_semantics_required:
-        mask_nonempty = (
-            batch_masks.reshape(expected, -1)
-            .any(dim=1)
-            .detach()
-            .to("cpu")
-            .tolist()
+    with (publication.measure('mask_download') if publication is not None else nullcontext()):
+        # A device-side reduction is enough for background/flip decisions. Full
+        # masks cross PCIe only when labels were explicitly requested.
+        mask_semantics_required = any(
+            bool(candidate.label_enabled) or not bool(candidate.foreground)
+            for candidate in candidates
         )
-    else:
-        # Unlabeled candidates carry no mask-dependent keep/drop semantics.
-        # Avoid launching a reduction over the expanded zero-mask view.
-        mask_nonempty = [False] * expected
-    label_indices = [
-        index
-        for index, candidate in enumerate(candidates)
-        if save_labels and bool(candidate.label_enabled)
-    ]
-    host_label_masks: Dict[int, np.ndarray] = {}
-    if label_indices:
-        device_indices = torch.as_tensor(
-            label_indices,
-            device=batch_masks.device,
-            dtype=torch.int64,
-        )
-        selected_masks = batch_masks.index_select(0, device_indices).detach().to("cpu").numpy()
-        host_label_masks = {
-            int(candidate_index): np.ascontiguousarray((selected_masks[offset] > 0).astype(np.uint8))
-            for offset, candidate_index in enumerate(label_indices)
-        }
+        if mask_semantics_required:
+            mask_nonempty = (
+                batch_masks.reshape(expected, -1)
+                .any(dim=1)
+                .detach()
+                .to("cpu")
+                .tolist()
+            )
+        else:
+            # Unlabeled candidates carry no mask-dependent keep/drop semantics.
+            # Avoid launching a reduction over the expanded zero-mask view.
+            mask_nonempty = [False] * expected
+        label_indices = [
+            index
+            for index, candidate in enumerate(candidates)
+            if save_labels and bool(candidate.label_enabled)
+        ]
+        host_label_masks: Dict[int, np.ndarray] = {}
+        if label_indices:
+            device_indices = torch.as_tensor(
+                label_indices,
+                device=batch_masks.device,
+                dtype=torch.int64,
+            )
+            selected_masks = batch_masks.index_select(0, device_indices).detach().to("cpu").numpy()
+            host_label_masks = {
+                int(candidate_index): np.ascontiguousarray(selected_masks[offset])
+                for offset, candidate_index in enumerate(label_indices)
+            }
+    def labels_for(index):
+        candidate = candidates[index]
+        return mask_to_yolo_lines(
+            host_label_masks[index], warnings=local_warnings,
+            context=f'{candidate.volume_name} {candidate.output_tag} frame {int(candidate.frame_idx) + 1:04d}',
+            known_empty=not bool(candidate.foreground))
+
+    label_lines_by_index = None
+    if publication is not None and label_indices:
+        with publication.measure('polygon_labels'):
+            # Every item owns a distinct host plane; warning aggregation already
+            # uses a lock and deterministic bounded examples. Preserve order.
+            label_lines_by_index = dict(zip(label_indices,
+                publication.label_executor.map(labels_for, label_indices)))
+
     keep_indices: List[int] = []
     image_paths: List[Path] = []
     label_payloads: List[Tuple[Path, List[str]]] = []
@@ -1752,17 +1846,8 @@ def _publish_gpu_policy_batch(
         )
         label_lines: Optional[List[str]] = None
         if save_labels and cand.label_enabled and lbl_path is not None:
-            mask_out = host_label_masks[int(local_index)]
-            label_context = (
-                f"{cand.volume_name} {cand.output_tag} "
-                f"frame {int(cand.frame_idx) + 1:04d}"
-            )
-            label_lines = mask_to_yolo_lines(
-                mask_out,
-                warnings=local_warnings,
-                context=label_context,
-                known_empty=not bool(cand.foreground),
-            )
+            label_lines = (label_lines_by_index[local_index] if label_lines_by_index is not None
+                           else labels_for(local_index))
             if int(cand.augmentation_index) > 0 and bool(cand.foreground) and not label_lines:
                 local_warnings.add(
                     "augmented_foreground_flip_dropped",
@@ -1791,6 +1876,10 @@ def _publish_gpu_policy_batch(
             label_payloads.append((lbl_path, label_lines))
 
     fallback_note = None
+    labels_with_images = bool(publication is not None and save_images and keep_indices
+        and parse_output_image_format(image_format) == 'jpg'
+        and str(static['jpeg_encode_backend']) == 'nvjpeg'
+        and runtime.get('encoder') is not None and runtime.get('nvimgcodec') is not None)
     if save_images and keep_indices:
         fallback_note = _write_gpu_image_batch(
             runtime=runtime,
@@ -1801,6 +1890,8 @@ def _publish_gpu_policy_batch(
             image_format=image_format,
             png_compression=int(static["png_compression"]),
             jpeg_quality=int(static["jpeg_quality"]),
+            publication=publication,
+            deferred_label_payloads=label_payloads if labels_with_images else (),
         )
     if fallback_note and not _WORKER_GPU_CODEC_WARNING_EMITTED:
         local_warnings.add(
@@ -1813,8 +1904,11 @@ def _publish_gpu_policy_batch(
             fallback_note,
         )
         _WORKER_GPU_CODEC_WARNING_EMITTED = True
-    for lbl_path, label_lines in label_payloads:
-        write_yolo_lines(label_lines, lbl_path)
+    if publication is None:
+        _publish_label_payloads(label_payloads)
+    elif label_payloads and not labels_with_images:
+        publication.submit_host(_label_payload_bytes(label_payloads),
+            lambda: _publish_label_payloads(label_payloads, publication.file_executor))
     return len(keep_indices), flips_by_subset
 
 
@@ -1870,6 +1964,18 @@ def execute_gpu_frame_batch_task(
     total_flips: Dict[str, int] = {}
     requested_batch_size = max(1, int(_WORKER_STATIC["gpu_batch_size"]))
 
+    from .pta_gpu_publication import publication_resources
+    resources = publication_resources(runtime,
+        cpu_threads=int(_WORKER_STATIC.get('gpu_render_threads', 1)))
+    publication = None
+
+    def merge_published(result):
+        nonlocal total_written
+        batch_written, batch_flips = result
+        total_written += int(batch_written)
+        for subset, count in batch_flips.items():
+            total_flips[subset] = int(total_flips.get(subset, 0)) + int(count)
+
     def _consume_rendered_work(work: Sequence[_GpuItemWork]) -> None:
         global _WORKER_GPU_BATCH_CAP_WARNING_EMITTED
         nonlocal total_written
@@ -1915,148 +2021,158 @@ def execute_gpu_frame_batch_task(
                     )
                     for item in batch
                 )
-                try:
-                    _wait_for_gpu_work_ready(runtime, batch)
-                    if _gpu_identity_fast_path_eligible(batch, seeds):
-                        result = _apply_gpu_identity_batch_many(runtime, batch)
-                    else:
-                        policy_images, zero_copy_cuda_sources = _gpu_policy_source_images(
-                            policy,
-                            batch,
-                        )
-                        if (
-                            any(bool(getattr(item.image, "is_cuda", False)) for item in batch)
-                            and not zero_copy_cuda_sources
-                            and not bool(runtime.get("cuda_source_policy_fallback_announced"))
-                        ):
+                batch_bytes = (2 * len(flat_candidates) * int(batch[0].output_size[0])
+                    * int(batch[0].output_size[1]) * (int(batch[0].channel_count) + 1))
+                admission = publication.reserve(batch_bytes) if publication is not None else nullcontext()
+                with admission as reservation:
+                    try:
+                        with (resources.measure('policy_call_wall') if resources is not None else nullcontext()):
+                            _wait_for_gpu_work_ready(runtime, batch)
+                            if _gpu_identity_fast_path_eligible(batch, seeds):
+                                result = _apply_gpu_identity_batch_many(runtime, batch)
+                            else:
+                                policy_images, zero_copy_cuda_sources = _gpu_policy_source_images(
+                                    policy,
+                                    batch,
+                                )
+                                if (
+                                    any(bool(getattr(item.image, "is_cuda", False)) for item in batch)
+                                    and not zero_copy_cuda_sources
+                                    and not bool(runtime.get("cuda_source_policy_fallback_announced"))
+                                ):
+                                    local_warnings.add(
+                                        "gpu_policy_cuda_source_fallback",
+                                        "external policy lacks supports_cuda_sources; projected images cross CUDA->CPU->CUDA",
+                                    )
+                                    if isinstance(runtime, dict):
+                                        runtime["cuda_source_policy_fallback_announced"] = True
+                                result = apply_batch_many(
+                                    images=policy_images,
+                                    # API-v2 policies historically receive writable,
+                                    # contiguous masks.  Preserve that contract here;
+                                    # the internal originals-only fast path can safely
+                                    # retain zero-strided blank views end to end.
+                                    masks=tuple(
+                                        np.ascontiguousarray(item.mask, dtype=np.uint8)
+                                        for item in batch
+                                    ),
+                                    seeds=seeds,
+                                    output_size=batch[0].output_size,
+                                )
+                    except Exception as exc:
+                        if _is_cuda_out_of_memory(exc) and len(flat_candidates) > 1:
+                            try:
+                                runtime["torch"].cuda.empty_cache()
+                            except Exception:
+                                pass
+                            left, right = _split_gpu_work_batch(batch)
+                            pending_batches[0:0] = [left, right]
                             local_warnings.add(
-                                "gpu_policy_cuda_source_fallback",
-                                "external policy lacks supports_cuda_sources; projected images cross CUDA->CPU->CUDA",
+                                "gpu_batch_oom_reduced",
+                                f"failed_candidates={len(flat_candidates)}, retry_candidates="
+                                f"{sum(len(item.candidates) for item in left)}/"
+                                f"{sum(len(item.candidates) for item in right)}",
                             )
-                            if isinstance(runtime, dict):
-                                runtime["cuda_source_policy_fallback_announced"] = True
-                        result = apply_batch_many(
-                            images=policy_images,
-                            # API-v2 policies historically receive writable,
-                            # contiguous masks.  Preserve that contract here;
-                            # the internal originals-only fast path can safely
-                            # retain zero-strided blank views end to end.
-                            masks=tuple(
-                                np.ascontiguousarray(item.mask, dtype=np.uint8)
-                                for item in batch
-                            ),
-                            seeds=seeds,
-                            output_size=batch[0].output_size,
-                        )
-                except Exception as exc:
-                    if _is_cuda_out_of_memory(exc) and len(flat_candidates) > 1:
-                        try:
-                            runtime["torch"].cuda.empty_cache()
-                        except Exception:
-                            pass
-                        left, right = _split_gpu_work_batch(batch)
-                        pending_batches[0:0] = [left, right]
-                        local_warnings.add(
-                            "gpu_batch_oom_reduced",
-                            f"failed_candidates={len(flat_candidates)}, retry_candidates="
-                            f"{sum(len(item.candidates) for item in left)}/"
-                            f"{sum(len(item.candidates) for item in right)}",
-                        )
-                        continue
-                    contexts = ", ".join(item.context for item in batch[:3])
-                    raise RuntimeError(
-                        f"GPU multi-source policy failed for {len(batch)} item(s) "
-                        f"({contexts}): {type(exc).__name__}: {exc}"
-                    ) from exc
-                if not isinstance(result, (tuple, list)) or len(result) != 2:
-                    raise TypeError("GPU policy apply_batch_many() must return (images_nchw, masks_nhw)")
-                batch_written, batch_flips = _publish_gpu_policy_batch(
-                    runtime=runtime,
-                    batch_images=result[0],
-                    batch_masks=result[1],
-                    candidates=flat_candidates,
-                    output_size=batch[0].output_size,
-                    channel_kind=batch[0].channel_kind,
-                    channel_count=int(batch[0].channel_count),
-                    local_warnings=local_warnings,
-                )
-                total_written += int(batch_written)
-                for subset, count in batch_flips.items():
-                    total_flips[subset] = int(total_flips.get(subset, 0)) + int(count)
+                            continue
+                        contexts = ", ".join(item.context for item in batch[:3])
+                        raise RuntimeError(
+                            f"GPU multi-source policy failed for {len(batch)} item(s) "
+                            f"({contexts}): {type(exc).__name__}: {exc}"
+                        ) from exc
+                    if not isinstance(result, (tuple, list)) or len(result) != 2:
+                        raise TypeError("GPU policy apply_batch_many() must return (images_nchw, masks_nhw)")
+                    publish_kwargs = dict(
+                        runtime=runtime, batch_images=result[0], batch_masks=result[1],
+                        candidates=flat_candidates, output_size=batch[0].output_size,
+                        channel_kind=batch[0].channel_kind,
+                        channel_count=int(batch[0].channel_count), local_warnings=local_warnings)
+                    if publication is None:
+                        merge_published(_publish_gpu_policy_batch(**publish_kwargs))
+                    else:
+                        publish_kwargs['batch_masks'] = _validate_gpu_policy_batch(
+                            **{key: value for key, value in publish_kwargs.items() if key != 'local_warnings'})
+                        publication.submit(reservation, publish_kwargs)
+                    # Do not retain a previous policy result while allocating the
+                    # next one. Asynchronous publication owns its snapshots/inputs.
+                    del result
+                    del publish_kwargs
 
-    render_jobs: List[
-        Tuple[RenderPlan, int, Tuple[Tuple[str, Tuple[OutputCandidate, ...]], ...]]
-    ] = []
-    for frame_task in task.frames:
-        plan = plans[int(frame_task.plan_idx)]
-        tile_by_tag = {str(tile.tile_tag): tile for tile in plan.tile_layout}
-        canvas_group: List[Tuple[str, Tuple[OutputCandidate, ...]]] = []
-        for item_key, candidates in frame_task.items:
-            if str(item_key) == "full":
-                canvas_group.append((str(item_key), tuple(candidates)))
-                continue
-            tile = tile_by_tag[str(item_key)]
-            if tile.shared_job is None:
-                canvas_group.append((str(item_key), tuple(candidates)))
-            else:
-                render_jobs.append(
-                    (plan, int(frame_task.frame_idx), ((str(item_key), tuple(candidates)),))
-                )
-        if canvas_group:
-            render_jobs.append((plan, int(frame_task.frame_idx), tuple(canvas_group)))
+    publication_context = (resources.task(_publish_gpu_policy_batch, merge_published)
+                           if resources is not None else nullcontext())
+    with publication_context as publication:
+        render_jobs: List[
+            Tuple[RenderPlan, int, Tuple[Tuple[str, Tuple[OutputCandidate, ...]], ...]]
+        ] = []
+        for frame_task in task.frames:
+            plan = plans[int(frame_task.plan_idx)]
+            tile_by_tag = {str(tile.tile_tag): tile for tile in plan.tile_layout}
+            canvas_group: List[Tuple[str, Tuple[OutputCandidate, ...]]] = []
+            for item_key, candidates in frame_task.items:
+                if str(item_key) == "full":
+                    canvas_group.append((str(item_key), tuple(candidates)))
+                    continue
+                tile = tile_by_tag[str(item_key)]
+                if tile.shared_job is None:
+                    canvas_group.append((str(item_key), tuple(candidates)))
+                else:
+                    render_jobs.append(
+                        (plan, int(frame_task.frame_idx), ((str(item_key), tuple(candidates)),))
+                    )
+            if canvas_group:
+                render_jobs.append((plan, int(frame_task.frame_idx), tuple(canvas_group)))
 
-    render_threads = min(
-        len(render_jobs),
-        max(1, int(_WORKER_STATIC.get("gpu_render_threads", 1))),
-    )
-    # Keep at most two CPU jobs per thread live. Completed results remain in
-    # this bounded window while CUDA is busy, providing overlap without an
-    # unbounded host-memory queue.
-    max_in_flight = max(1, render_threads * 2)
-    next_job = 0
-    ready: List[_GpuItemWork] = []
-    with ThreadPoolExecutor(
-        max_workers=max(1, render_threads),
-        thread_name_prefix="pta-gpu-render",
-    ) as executor:
-        pending: Dict[Future, int] = {}
+        render_threads = min(
+            len(render_jobs),
+            max(1, int(_WORKER_STATIC.get("gpu_render_threads", 1))),
+        )
+        # Keep at most two CPU jobs per thread live. Completed results remain in
+        # this bounded window while CUDA is busy, providing overlap without an
+        # unbounded host-memory queue.
+        max_in_flight = max(1, render_threads * 2)
+        next_job = 0
+        ready: List[_GpuItemWork] = []
+        with ThreadPoolExecutor(
+            max_workers=max(1, render_threads),
+            thread_name_prefix="pta-gpu-render",
+        ) as executor:
+            pending: Dict[Future, int] = {}
 
-        def _fill_render_window() -> None:
-            nonlocal next_job
-            while next_job < len(render_jobs) and len(pending) < max_in_flight:
-                plan, frame_idx, items = render_jobs[next_job]
-                future = executor.submit(
-                    _render_gpu_item_group,
-                    volume,
-                    mask,
-                    plan,
-                    frame_idx,
-                    items,
-                    runtime,
-                )
-                pending[future] = int(next_job)
-                next_job += 1
+            def _fill_render_window() -> None:
+                nonlocal next_job
+                while next_job < len(render_jobs) and len(pending) < max_in_flight:
+                    plan, frame_idx, items = render_jobs[next_job]
+                    future = executor.submit(
+                        _render_gpu_item_group,
+                        volume,
+                        mask,
+                        plan,
+                        frame_idx,
+                        items,
+                        runtime,
+                    )
+                    pending[future] = int(next_job)
+                    next_job += 1
 
-        _fill_render_window()
-        while pending:
-            done, _not_done = wait(tuple(pending), return_when=FIRST_COMPLETED)
-            for future in sorted(done, key=lambda item: pending[item]):
-                pending.pop(future)
-                ready.extend(future.result())
             _fill_render_window()
-            effective = _gpu_memory_candidate_limit(
-                runtime,
-                ready,
-                requested_limit=requested_batch_size,
-            )
-            ready_candidates = sum(len(item.candidates) for item in ready)
-            if _should_flush_ready_gpu_work(
-                ready_candidates=ready_candidates,
-                effective_candidate_limit=effective,
-                producer_drained=(next_job >= len(render_jobs) and not pending),
-            ):
-                _consume_rendered_work(tuple(ready))
-                ready.clear()
+            while pending:
+                done, _not_done = wait(tuple(pending), return_when=FIRST_COMPLETED)
+                for future in sorted(done, key=lambda item: pending[item]):
+                    pending.pop(future)
+                    ready.extend(future.result())
+                _fill_render_window()
+                effective = _gpu_memory_candidate_limit(
+                    runtime,
+                    ready,
+                    requested_limit=requested_batch_size,
+                )
+                ready_candidates = sum(len(item.candidates) for item in ready)
+                if _should_flush_ready_gpu_work(
+                    ready_candidates=ready_candidates,
+                    effective_candidate_limit=effective,
+                    producer_drained=(next_job >= len(render_jobs) and not pending),
+                ):
+                    _consume_rendered_work(tuple(ready))
+                    ready.clear()
 
     if (
         bool(runtime.get("cartesian_renderer_announced"))

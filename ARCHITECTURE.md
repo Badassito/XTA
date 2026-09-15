@@ -3,7 +3,7 @@
 XTA provides test-time augmentation (TTA), pretraining augmentation (PTA), and
 label-time augmentation (LTA) for volumes. The implementation lives in the
 importable `XTA` package. The versioned launcher
-`GPT-6-Astra-Ultra_v22.0.0_SLURM.py`, installed `xta` command, and `python -m XTA`
+`GPT-6-Astra-Ultra_v22.1.0_SLURM.py`, installed `xta` command, and `python -m XTA`
 all enter `XTA.cli.run()`.
 
 This document describes implemented behavior, ownership, and operating controls.
@@ -70,6 +70,7 @@ All module names below are relative to `XTA`.
 | Radial geometry | `cylindrical_geometry`, `cylindrical_projection`, `cylindrical_cuda_projection`, `cylindrical_owner`: cylindrical shells, bounded pull plans, CUDA source upload/publication, and native shell ownership |
 | Spherical geometry | `qsc`, `spherical_geometry`, `spherical_cuda`, `spherical_sampling_cuda`: QSC coordinates, shell plans, cached directions, and native rendering |
 | Spherical projection | `spherical_projection`, `spherical_projection_bounds`, `spherical_projection_cpu`, `spherical_projection_cuda`, `spherical_preflight`: admission, conservative bounds, CPU/CUDA pulls, and preflight |
+| Tilted Azimuthal projection | `tilted_azimuthal_projection`, `tilted_azimuthal_projection_cuda`: reference integer maps, bounded mask uploads, CUDA source union, and compact publication |
 | Model execution | `inference`, `inference_backends`, `cuda_backend`: backend contracts, model execution, mask payloads, and resident CUDA rendering |
 | TTA scheduling | `pipeline`, `tta_scheduler`, `tta_prediction`, `tta_lifecycle`: preparation, process admission, source staging, and run-resource ownership |
 | TTA external policies | `augmentation_policy`, `tta_augmentation_config`, `tta_augmentation`, `tta_augmentation_cuda`, `tta_augmentation_retirement`, `tta_augmentation_runtime`: shared policy identity, seed scopes, fused conservative inverse maps, and bounded render-once policy fan-out with asynchronous support retirement |
@@ -80,7 +81,7 @@ All module names below are relative to `XTA`.
 | Compact publication | `packed_publication`, `publication_memory`, `nrrd_spans`: row-packed payloads, retained-RAM grants/spill, and native crop-row streams |
 | Replay | `component_replay`: bounded immutable component captures, geometry descriptors, checksums, and replay loading |
 | PTA orchestration | `pta`, `pta_runtime`, `pta_dataset`, `pta_augmentation`, `pta_scheduler`: source planning, dataset identity, policy loading, GPU admission, and work packing |
-| PTA execution | `pta_rendering`, `pta_workers`, `pta_publication`: render plans/caches, process/shared-memory ownership, and atomic image/label publication |
+| PTA execution | `pta_rendering`, `pta_workers`, `pta_batch_pipeline`, `pta_gpu_publication`, `pta_publication`: render plans/caches, process/shared-memory ownership, bounded GPU/host publication queues, and atomic image/label publication |
 | LTA planning | `lta_inputs`, `lta_runtime`, `lta_scheduler`: annotation discovery, prompt ranking, physical-view/device ownership, and session admission |
 | LTA model boundary | `lta_sam`, `lta_experimental`: local SAM provenance, runtime-neutral result contracts, and pinned authoritative-mask tracker integration |
 | LTA propagation | `lta_propagation`, `lta_windows`, `lta_tiles`, `lta_tile_tracking`, `lta_relay_episodes`, `lta_tracklets`, `lta_frontier`, `lta_frontier_execution`: temporal windows, shared relay frontiers, lineage matching, and authoritative handoff |
@@ -524,6 +525,45 @@ full-frame/tile items while earlier GPU work runs. VRAM admission and determinis
 OOM splitting bound policy batches. GPU example policies implement separable
 Gaussian filtering for blur and elastic-field smoothing.
 
+The offline augmentation backend follows the selected policy's export:
+`build_gpu_augmentation` uses CUDA; supported CPU exports such as
+`build_augmentation` use CPU.
+`--output_format nvjpeg` selects the GPU JPEG encoder; `--output_format nvtiff`
+selects the GPU TIFF encoder. These choices require offline execution and a GPU
+policy. Plain `jpeg`/`jpg` and `tiff`/`tif` select CPU encoding, independently of
+whether the policy uses CUDA. GPU JPEG supports grayscale and RGB images. GPU
+TIFF writes grayscale or interleaved RGB as a single page; custom channel stacks
+retain one grayscale page per channel. TIFF encoding preserves the pixels
+losslessly. Encoder failures are reported for an explicitly requested GPU format.
+
+GPU policy output and publication use two bounded stages. The first reserves a
+slot before policy allocation, snapshots returned tensors to protect policies
+that reuse output buffers, and hands them to one publication consumer on its own
+CUDA stream. It retains at most two batches, with a default 2048 MiB admission
+window for original outputs plus snapshots. The next policy batch can run while
+the previous batch converts labels, encodes images, and publishes files. nvJPEG's
+completion fence can still serialize concurrent device work; CPU and file work
+can overlap subsequent augmentation after that fence.
+
+The host writer queue admits at most two jobs and 512 MiB of encoded bytes and
+label text. JPEG encoding reserves a job slot before constructing CodeStreams;
+their actual byte count is admitted before submission. The newly encoded batch
+can temporarily add producer-owned memory while that byte admission waits.
+Both queues allow one oversized batch exclusively. These windows bound retained
+publication work; policy/publication intermediates, encoder workspaces, and CPU mask
+processing have separate memory costs. Polygon conversion and file publication
+each use up to four CPU workers per CUDA owner. Results and warnings merge in
+submission order, and every admitted consumer drains before a task reports
+completion or failure. Unfenced CUDA owners are retained and the worker is stopped.
+
+`PTA_GPU_PUBLICATION_PIPELINE=1` enables this overlap by default; setting it to
+`0` restores synchronous publication. `PTA_GPU_PUBLICATION_GPU_MIB` and
+`PTA_GPU_PUBLICATION_HOST_MIB` set the corresponding retained-byte windows.
+CPU budgets reflect actual phase overlap: initial planning and runs without
+volume prefetch use the full planning budget, while overlapping preparation
+reserves CPU capacity alongside active render workers. GPU owners retain their
+allowed local CPU sets and bounded render-thread counts.
+
 PTA partial-label and encoded-gap input paths use Cartesian labeling. Fully
 labeled data binds the shared supported forward geometry, including native shell
 families. External policies carry identity and deterministic selection metadata;
@@ -824,7 +864,7 @@ settings. Actual execution is recorded separately from requested policy.
 | `YOLO_TTA_CPU_SPHERICAL_COMPILED` | Bundle value | Numba scalar FP64 pull with `fastmath=False` |
 | `YOLO_TTA_GPU_RADIAL_COLUMN_GEOMETRY` | Bundle value | Compute FP64 column geometry once and reuse it across rows |
 | `YOLO_TTA_GPU_SPHERICAL_NATIVE_KERNEL`, `YOLO_TTA_GPU_RADIAL_NATIVE_KERNEL` | On | Native CUDA input samplers with resident Torch fallback |
-| `YOLO_TTA_GPU_SPHERICAL_BACKPROJECT`, `YOLO_TTA_GPU_RADIAL_BACKPROJECT` | On | Completed-view CUDA projection admission |
+| `YOLO_TTA_GPU_SPHERICAL_BACKPROJECT`, `YOLO_TTA_GPU_RADIAL_BACKPROJECT`, `YOLO_TTA_GPU_TILTED_AZIMUTHAL_BACKPROJECT` | On | Completed-view CUDA projection admission |
 | `YOLO_TTA_CPU_SPHERICAL_COMPACT` | On | Encoded crop publication from sink-only CPU projection |
 | `YOLO_TTA_CROPPED_UPLOAD_PIPELINE` | On | Two-lane staging for eligible large compiled crop uploads |
 | `YOLO_TTA_RADIAL_OWNER` | On | Eligible native Radial cleanup/source-bitset ownership |
@@ -845,6 +885,23 @@ The fast-geometry bundle selects Radial column reuse at at least 256 active rows
 256 columns, and 262,144 active pixels. Explicit component selection also admits
 small cases. Optional geometry-allocation or compiler setup refusal uses the
 reference route before publication starts.
+
+Tilted Azimuthal sink publication uses CUDA when an exclusive retirement lease
+and bounded workspace are available. Integer tables retain the CPU reference's
+float32 shear rounding, processing-row aggregation, and output-index mapping.
+The GPU accumulates into the same row-packed source union with 64-bit addresses;
+input masks are staged in bands rather than uploaded as a whole parent volume.
+Raw or packed CVOL crops are returned only after every input frame has contributed,
+because a later tilted frame can modify an earlier source slice.
+
+When GPU admission is busy, ordered CPU work continues and periodically retries.
+A successful handoff copies the completed packed prefix, drains outstanding CPU
+readers, and continues from the next input frame. Spherical, Radial, and Tilted
+Azimuthal share the retirement queue and its pressure/age admission rules. Layouts
+or workspaces outside the CUDA contract retain CPU projection; non-sink calls
+also retain their CPU path. Unsafe CUDA fence failures retain their device owners
+and lease. Each policy pass still publishes its own component; this acceleration
+does not change inference sampling or combine independently editable NRRDs.
 
 ### Sparse publication and interpolation
 

@@ -97,7 +97,7 @@ class PtaConfig:
 
 
 def parse_output_image_format(value: str) -> str:
-    """Canonicalize output-family aliases accepted by PTA."""
+    """Normalize ordinary formats and explicit GPU encoder selectors."""
 
     token = str(value).strip().lower().lstrip(".")
     aliases = {
@@ -106,12 +106,14 @@ def parse_output_image_format(value: str) -> str:
         "jpeg": "jpg",
         "tif": "tif",
         "tiff": "tif",
+        "nvjpeg": "nvjpeg",
+        "nvtiff": "nvtiff",
     }
     try:
         return aliases[token]
     except KeyError as exc:
         raise argparse.ArgumentTypeError(
-            "--output_format must be one of png, jpg/jpeg, or tif/tiff"
+            "--output_format must be one of png, jpg/jpeg, tif/tiff, nvjpeg, or nvtiff"
         ) from exc
 
 
@@ -265,7 +267,11 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         "--output_format",
         default="png",
         type=parse_output_image_format,
-        metavar="{png,jpg,jpeg,tif,tiff}",
+        metavar="{png,jpg,jpeg,tif,tiff,nvjpeg,nvtiff}",
+        help=(
+            "JPEG/TIFF use CPU encoding; nvJPEG/nvTIFF select strict GPU encoding "
+            "with a GPU augmentation policy and --augmentation_execution offline"
+        ),
     )
     parser.add_argument(
         "--channel_format",
@@ -316,11 +322,6 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         "--augmentation_execution",
         default="deferred",
         choices=("deferred", "offline"),
-    )
-    parser.add_argument(
-        "--offline_augmentation_backend",
-        default="auto",
-        choices=("auto", "cpu", "gpu"),
     )
     parser.add_argument(
         "--gpu_batch_size",
@@ -410,20 +411,6 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         choices=("auto", "nvjpeg", "opencv"),
     )
     parser.add_argument("--jpeg_batch_size", default=64, type=int)
-    parser.add_argument(
-        "--jpeg_encode_backend",
-        default="auto",
-        choices=("auto", "nvjpeg", "opencv"),
-    )
-    parser.add_argument(
-        "--tiff_encode_backend",
-        default="auto",
-        choices=("auto", "nvtiff", "opencv"),
-        help=(
-            "Multipage custom-channel TIFF encoder. nvTIFF requires the GPU offline "
-            "path and nvidia-nvtiff matching the active CUDA major version"
-        ),
-    )
     parser.add_argument("--jpeg_quality", default=95, type=int)
     parser.add_argument(
         "--topology_aware",
@@ -465,8 +452,37 @@ def resolve_pta_config(args: argparse.Namespace) -> PtaConfig:
 
     channel_format = resolve_channel_format(args.channel_format)
     requested_output_format = parse_output_image_format(args.output_format)
+    gpu_format = requested_output_format in {"nvjpeg", "nvtiff"}
+    if gpu_format and str(args.augmentation_execution) != "offline":
+        raise ValueError(
+            f"--output_format {requested_output_format} requires --augmentation_execution offline"
+        )
+    # Keep execution fields private to the resolved namespace. The policy's
+    # export selects augmentation placement; the output token selects encoding.
+    args.offline_augmentation_backend = "auto"
+    if args.augmentation and str(args.augmentation_execution) == "offline":
+        from .augmentation_policy import inspect_augmentation_definition
+        definition = inspect_augmentation_definition(str(args.augmentation))
+        args.offline_augmentation_backend = (
+            "gpu" if definition.export_name == "build_gpu_augmentation" else "cpu"
+        )
+    if gpu_format and args.offline_augmentation_backend != "gpu":
+        raise ValueError(
+            f"--output_format {requested_output_format} requires --augmentation GPU_POLICY.py "
+            "exporting build_gpu_augmentation"
+        )
+    if requested_output_format == "nvjpeg" and str(channel_format.kind) == "custom":
+        raise ValueError(
+            "--output_format nvjpeg supports gray or RGB channels; use nvtiff for custom channel stacks"
+        )
+    args.jpeg_encode_backend = "nvjpeg" if requested_output_format == "nvjpeg" else "opencv"
+    args.tiff_encode_backend = "nvtiff" if requested_output_format == "nvtiff" else "opencv"
+    canonical_output_format = {"nvjpeg": "jpg", "nvtiff": "tif"}.get(
+        requested_output_format, requested_output_format
+    )
+    args.output_format = canonical_output_format
     effective_output_format = (
-        "tif" if str(channel_format.kind) == "custom" else requested_output_format
+        "tif" if str(channel_format.kind) == "custom" else canonical_output_format
     )
     if not 0 <= int(args.png_compression) <= 9:
         raise ValueError("--png_compression must be between 0 and 9")
@@ -496,7 +512,7 @@ def parse_pta_args(
     args = parser.parse_args(None if argv is None else list(argv))
     try:
         return resolve_pta_config(args)
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         parser.error(str(exc))
         raise AssertionError("argparse.error must terminate") from exc
 

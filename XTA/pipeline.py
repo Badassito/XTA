@@ -454,7 +454,9 @@ def _execution_runtime_provenance() -> Dict[str, object]:
                  'cuda_backend', 'runtime', 'spherical_projection',
                  'spherical_projection_bounds', 'spherical_projection_cuda',
                  'spherical_preflight', 'spherical_projection_cpu', 'geometry_quality',
-                 'unification.sampling', 'cylindrical_cuda_projection', 'tta_scheduler', 'backprojection'):
+                 'unification.sampling', 'cylindrical_cuda_projection',
+                 'tilted_azimuthal_projection', 'tilted_azimuthal_projection_cuda',
+                 'tta_scheduler', 'backprojection'):
         path = package.joinpath(*name.split('.')).with_suffix('.py')
         entry = {'path': str(path), 'loaded_in_parent': 'XTA.' + name in sys.modules}
         try:
@@ -468,6 +470,8 @@ def _execution_runtime_provenance() -> Dict[str, object]:
     result['task_trace_requested'] = _env_flag('YOLO_TTA_TASK_TRACE', False)
     result['cropped_upload_pipeline_requested'] = _env_flag('YOLO_TTA_CROPPED_UPLOAD_PIPELINE', True)
     result['spherical_cpu_compact_requested'] = _env_flag('YOLO_TTA_CPU_SPHERICAL_COMPACT', True)
+    result['tilted_azimuthal_cuda_projection_requested'] = _env_flag(
+        'YOLO_TTA_GPU_TILTED_AZIMUTHAL_BACKPROJECT', True)
     result['spherical_retirement_requests'] = {
         'enabled': _env_flag('YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT', True),
         'age_enabled': _env_flag('YOLO_TTA_GPU_SPHERICAL_AGE_RETIREMENT', True),

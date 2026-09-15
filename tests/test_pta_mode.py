@@ -3,6 +3,8 @@ from __future__ import annotations
 import contextlib
 import importlib
 import io
+from pathlib import Path
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -29,16 +31,20 @@ class PtaModeBoundaryTests(unittest.TestCase):
             import_module.assert_not_called()
 
     def test_resolved_configuration_is_forwarded_to_native_runtime(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="pta-mode-policy-")
+        self.addCleanup(temporary.cleanup)
+        policy = Path(temporary.name) / "policy.py"
+        policy.write_text("def build_gpu_augmentation(**kwargs):\n    raise AssertionError('must not execute')\n")
         arguments = [
             "--input", "dataset", "--output", "published", "--imgsz", "640",
             "--device", "2,0",
-            "--output_format", "jpeg", "--channel_format", "C5S2", "--force",
+            "--output_format", "nvTIFF", "--channel_format", "C5S2", "--force",
             "--preprocessing", "gaussian_smoothing:1.5:2",
             "--save", "images", "labels", "nrrd", "overlay", "voxel_volume", "summary",
             "--train_split", "0.7", "--split_method", "slice",
-            "--background_percent", "0.25", "--augmentation", "policy.py",
+            "--background_percent", "0.25", "--augmentation", str(policy),
             "--augmentation_ratio", "2.5", "--augmentation_execution", "offline",
-            "--offline_augmentation_backend", "gpu", "--gpu_batch_size", "7",
+            "--gpu_batch_size", "7",
             "--enable_cartesian", "sagittal,transverse",
             "--enable_azimuthal", "transverse:2.5", "tilted_coronal:auto",
             "--enable_tilted", "coronal:15:horizontal",
@@ -47,8 +53,7 @@ class PtaModeBoundaryTests(unittest.TestCase):
             "--overlay_tile_writer_limit", "9", "--overlay_workers", "2",
             "--overlay_pending_frames", "8", "--worker_backend", "thread",
             "--pipeline_depth", "1", "--jpeg_decode_backend", "opencv",
-            "--jpeg_batch_size", "17", "--jpeg_encode_backend", "opencv",
-            "--tiff_encode_backend", "nvtiff",
+            "--jpeg_batch_size", "17",
             "--jpeg_quality", "88", "--no-topology_aware",
         ]
         runtime = types.SimpleNamespace(run=mock.Mock())
@@ -65,7 +70,7 @@ class PtaModeBoundaryTests(unittest.TestCase):
             "device": ["2,0"], "device_ids": (2, 0),
             "output_format": "tif", "force": True, "train_split": 0.7,
             "split_method": "slice", "background_percent": 0.25,
-            "augmentation": "policy.py", "augmentation_ratio": 2.5,
+            "augmentation": str(policy), "augmentation_ratio": 2.5,
             "augmentation_execution": "offline", "offline_augmentation_backend": "gpu",
             "gpu_batch_size": 7, "workers": 4, "frame_workers": 3,
             "png_compression": 5, "overlay_tile_writer_limit": 9,

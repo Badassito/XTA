@@ -45,7 +45,7 @@ graph; floating-point rounding can differ from a square convolution.
 For example:
 
 ```text
-python -m XTA --mode pta --input INPUT_DIRECTORY --output OUTPUT_DIRECTORY --augmentation XTA/examples/external_augmentations/GPU_baseline.py --augmentation_ratio 4 --augmentation_execution offline --offline_augmentation_backend gpu
+python -m XTA --mode pta --input INPUT_DIRECTORY --output OUTPUT_DIRECTORY --augmentation XTA/examples/external_augmentations/GPU_baseline.py --augmentation_ratio 4 --augmentation_execution offline --output_format nvjpeg
 ```
 
 Set `PTA_GPU_TORCH_COMPILE=0` to disable optional compilation of the fused
@@ -61,5 +61,5 @@ their GPU counterparts because OpenCV/NumPy and CUDA use different resamplers
 and random-number streams. Select one with, for example:
 
 ```text
-python -m XTA --mode pta --input INPUT_DIRECTORY --output OUTPUT_DIRECTORY --augmentation XTA/examples/external_augmentations/CPU_baseline.py --augmentation_ratio 4 --augmentation_execution offline --offline_augmentation_backend cpu
+python -m XTA --mode pta --input INPUT_DIRECTORY --output OUTPUT_DIRECTORY --augmentation XTA/examples/external_augmentations/CPU_baseline.py --augmentation_ratio 4 --augmentation_execution offline
 ```

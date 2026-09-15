@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xta"
-version = "22.0.0"
+version = "22.1.0"
 description = "Volume test-time, pretraining, and label-time augmentation"
 requires-python = ">=3.10"
 dependencies = [
@@ -38,13 +38,15 @@ include = ["XTA*"]
 [tool.setuptools.data-files]
 "share/xta" = [
   "ARCHITECTURE.md",
-  "GPT-6-Astra-Ultra_v22.0.0_SLURM.py",
+  "GPT-6-Astra-Ultra_v22.1.0_SLURM.py",
 ]
 "share/xta/tools" = [
   "tools/tta_augmentation_smoke.py",
   "tools/check_tta_augmentation_run.py",
   "tools/benchmark_tta_augmentation.py",
   "tools/qualify_tta_augmentation.py",
+  "tools/qualify_pta_gpu_publication.py",
+  "tools/benchmark_tilted_azimuthal_projection.py",
   "tools/certify_qsc_lipschitz.py",
   "tools/plan_projection_sampling.py",
   "tools/replay_component_projection.py",
