@@ -21,6 +21,45 @@ def publication_ram_headroom():
     return max(0, min(int(info.get('MemAvailable', 0)), int(available_anon_work_bytes())))
 
 
+def policy_cpu_worker_buffer_plan(*, worker_count, cache_mib, batch_size, out_size,
+                                  channels, prefetch_frames=0, strip_rows=128):
+    """Reserve the CPU policy adapter's host buffers before admitting parents.
+
+    The LRU can remain full while a new replay is constructed. Returned replay
+    lists keep their maps alive after eviction, and assignment of the next pass
+    overlaps the old and new batch. Image processing is sample-local, while
+    rendered/output images and OpenVINO input buffers are batch-sized. Newton's
+    float64 work arrays are bounded by strips, independently of raster height.
+    These are CPU policy buffers only; callers add their existing CUDA reserve.
+    """
+    workers = max(0, int(worker_count))
+    batch, raster, channel_count = (max(1, int(value)) for value in (batch_size, out_size, channels))
+    rows = min(raster, max(1, int(strip_rows)))
+    prefetch = max(batch, int(prefetch_frames))
+    pixels = raster * raster
+    cache = max(0, int(cache_mib)) * 1024**2
+    # Forward/inverse float32 xy plus bool support is 17 bytes per pixel.
+    # Charge the two live batch lists in addition to the persistent cache.
+    replay = 2 * batch * pixels * 17
+    # Retain render/augmented byte batches and normalized inference storage;
+    # reserve additional single-sample photometry (noise/quantization/CLAHE).
+    images = pixels * channel_count * (16 * batch + 64)
+    rendering = pixels * channel_count * prefetch
+    # Elastic field, mgrid intermediates, and affine/source map construction.
+    maps = pixels * 64
+    # Bilinear gathers, exact derivatives, residuals, Jacobians and Newton
+    # updates overlap with prior-iteration values in NumPy expressions.
+    inverse = rows * raster * 512
+    per_worker = cache + replay + images + rendering + maps + inverse
+    return dict(worker_count=workers, batch_size=batch, out_size=raster,
+                channels=channel_count, prefetch_frames=prefetch, inverse_strip_rows=rows,
+                cache_bytes_per_worker=cache, replay_bytes_per_worker=replay,
+                image_bytes_per_worker=images, map_bytes_per_worker=maps,
+                render_prefetch_bytes_per_worker=rendering,
+                inverse_bytes_per_worker=inverse,
+                bytes_per_worker=per_worker, total_bytes=workers * per_worker)
+
+
 def native_fullframe_dense_reserve(tasks, *, total_dense_limit, min_conf=0.,
                                    dense_tiling=False, nrrd_layers=False,
                                    bounded_retirement=True):

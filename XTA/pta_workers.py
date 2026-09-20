@@ -43,6 +43,7 @@ from .pta_augmentation import (
     load_augmentation_definition,
 )
 from .pta_dataset import OutputCandidate
+from .pta_binary import candidate_binary_output_path, publish_binary_mask_payloads
 from .pta_publication import (
     NvjpegCudaFenceError,
     _encode_nvjpeg_batch,
@@ -354,6 +355,7 @@ def set_worker_static_context(
     augmentation: Optional[OfflineAugmentation],
     save_images: bool = True,
     save_labels: bool = True,
+    save_binary: bool = False,
     tiff_encode_backend: str = "auto",
 ) -> None:
     """Install run-constant worker state.  Must run before the pool is created."""
@@ -372,6 +374,7 @@ def set_worker_static_context(
         "augmentation": augmentation,
         "save_images": bool(save_images),
         "save_labels": bool(save_labels),
+        "save_binary": bool(save_binary),
     })
 
 
@@ -421,6 +424,7 @@ def _spawn_worker_static_payload() -> Dict[str, object]:
         "augmentation_definition": augmentation_definition,
         "save_images": bool(_WORKER_STATIC.get("save_images", True)),
         "save_labels": bool(_WORKER_STATIC.get("save_labels", True)),
+        "save_binary": bool(_WORKER_STATIC.get("save_binary", False)),
     }
 
 
@@ -473,6 +477,7 @@ def _initialize_spawned_worker_static_context(payload: Mapping[str, object]) -> 
         "augmentation": augmentation,
         "save_images": bool(payload.get("save_images", True)),
         "save_labels": bool(payload.get("save_labels", True)),
+        "save_binary": bool(payload.get("save_binary", False)),
     })
 
 
@@ -1777,9 +1782,10 @@ def _publish_gpu_policy_batch(
     image_format = str(static["image_format"])
     save_images = bool(static.get("save_images", True))
     save_labels = bool(static.get("save_labels", True))
+    save_binary = bool(static.get("save_binary", False))
     with (publication.measure('mask_download') if publication is not None else nullcontext()):
         # A device-side reduction is enough for background/flip decisions. Full
-        # masks cross PCIe only when labels were explicitly requested.
+        # masks cross PCIe only when labels or binary masks were requested.
         mask_semantics_required = any(
             bool(candidate.label_enabled) or not bool(candidate.foreground)
             for candidate in candidates
@@ -1801,17 +1807,21 @@ def _publish_gpu_policy_batch(
             for index, candidate in enumerate(candidates)
             if save_labels and bool(candidate.label_enabled)
         ]
+        mask_indices = [
+            index for index, candidate in enumerate(candidates)
+            if (save_labels or save_binary) and bool(candidate.label_enabled)
+        ]
         host_label_masks: Dict[int, np.ndarray] = {}
-        if label_indices:
+        if mask_indices:
             device_indices = torch.as_tensor(
-                label_indices,
+                mask_indices,
                 device=batch_masks.device,
                 dtype=torch.int64,
             )
             selected_masks = batch_masks.index_select(0, device_indices).detach().to("cpu").numpy()
             host_label_masks = {
                 int(candidate_index): np.ascontiguousarray(selected_masks[offset])
-                for offset, candidate_index in enumerate(label_indices)
+                for offset, candidate_index in enumerate(mask_indices)
             }
     def labels_for(index):
         candidate = candidates[index]
@@ -1831,6 +1841,7 @@ def _publish_gpu_policy_batch(
     keep_indices: List[int] = []
     image_paths: List[Path] = []
     label_payloads: List[Tuple[Path, List[str]]] = []
+    binary_payloads: List[Tuple[Path, np.ndarray]] = []
     flips_by_subset: Dict[str, int] = {}
     for local_index, cand in enumerate(candidates):
         is_nonempty = bool(mask_nonempty[local_index])
@@ -1874,6 +1885,11 @@ def _publish_gpu_policy_batch(
             image_paths.append(img_path)
         if save_labels and label_lines is not None and lbl_path is not None:
             label_payloads.append((lbl_path, label_lines))
+        if save_binary and cand.label_enabled:
+            binary_payloads.append((
+                candidate_binary_output_path(out_dir, cand, split_active=split_active),
+                host_label_masks[local_index],
+            ))
 
     fallback_note = None
     labels_with_images = bool(publication is not None and save_images and keep_indices
@@ -1909,6 +1925,12 @@ def _publish_gpu_policy_batch(
     elif label_payloads and not labels_with_images:
         publication.submit_host(_label_payload_bytes(label_payloads),
             lambda: _publish_label_payloads(label_payloads, publication.file_executor))
+    if binary_payloads:
+        if publication is None:
+            publish_binary_mask_payloads(binary_payloads)
+        else:
+            publication.submit_host(sum(mask.nbytes for _path, mask in binary_payloads),
+                lambda: publish_binary_mask_payloads(binary_payloads))
     return len(keep_indices), flips_by_subset
 
 
@@ -2255,6 +2277,7 @@ def execute_gpu_render_task(
     jpeg_quality = int(static["jpeg_quality"])
     save_images = bool(static.get("save_images", True))
     save_labels = bool(static.get("save_labels", True))
+    save_binary = bool(static.get("save_binary", False))
     gpu_batch_size = max(1, int(static["gpu_batch_size"]))
     local_warnings = WarningLog()
     codec_error = str(runtime.get("codec_error") or "")
@@ -2325,6 +2348,7 @@ def execute_gpu_render_task(
             keep_indices: List[int] = []
             image_paths: List[Path] = []
             label_payloads: List[Tuple[Path, List[str]]] = []
+            binary_payloads: List[Tuple[Path, np.ndarray]] = []
             for local_index, cand in enumerate(chunk):
                 mask_out = np.ascontiguousarray((host_masks[local_index] > 0).astype(np.uint8))
                 if not bool(cand.foreground) and np.any(mask_out):
@@ -2338,7 +2362,7 @@ def execute_gpu_render_task(
                     image_format=image_format,
                 )
                 label_lines: Optional[List[str]] = None
-                if cand.label_enabled and lbl_path is not None:
+                if cand.label_enabled and lbl_path is not None and (save_labels or not save_binary):
                     label_context = f"{cand.volume_name} {cand.output_tag} frame {int(cand.frame_idx)+1:04d}"
                     label_lines = mask_to_yolo_lines(
                         mask_out,
@@ -2354,11 +2378,24 @@ def execute_gpu_render_task(
                         subset_key = cand.split_subset or "all"
                         flips_by_subset[subset_key] = int(flips_by_subset.get(subset_key, 0)) + 1
                         continue
+                elif (save_binary and cand.label_enabled and int(cand.augmentation_index) > 0
+                      and bool(cand.foreground) and not np.any(mask_out)):
+                    local_warnings.add(
+                        "augmented_foreground_flip_dropped",
+                        f"{cand.volume_name}/{cand.output_tag}/frame={int(cand.frame_idx)+1:04d}/tag={cand.augmentation_tag}",
+                    )
+                    subset_key = cand.split_subset or "all"
+                    flips_by_subset[subset_key] = int(flips_by_subset.get(subset_key, 0)) + 1
+                    continue
                 keep_indices.append(int(local_index))
                 if save_images:
                     image_paths.append(img_path)
                 if save_labels and label_lines is not None and lbl_path is not None:
                     label_payloads.append((lbl_path, label_lines))
+                if save_binary and cand.label_enabled:
+                    binary_payloads.append((
+                        candidate_binary_output_path(out_dir, cand, split_active=split_active), mask_out,
+                    ))
 
             fallback_note = None
             if save_images:
@@ -2385,6 +2422,7 @@ def execute_gpu_render_task(
                 _WORKER_GPU_CODEC_WARNING_EMITTED = True
             for lbl_path, label_lines in label_payloads:
                 write_yolo_lines(label_lines, lbl_path)
+            publish_binary_mask_payloads(binary_payloads)
             written += len(keep_indices)
 
     warn_counts = {str(key): int(count) for key, count in local_warnings.counts.items()}
@@ -2438,6 +2476,7 @@ def execute_render_task(volume: np.ndarray, mask: np.ndarray, plans: Sequence[Re
                 inputs_are_private=True,
                 save_images=bool(static.get("save_images", True)),
                 save_labels=bool(static.get("save_labels", True)),
+                save_binary=bool(static.get("save_binary", False)),
                 canonical_plan=canonical_plan,
             )
             if outcome == "written":

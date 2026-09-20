@@ -33,6 +33,7 @@ from .unification.tiles import ResolvedTileGroup, resolve_tile_groups
 PTA_SAVE_OPTION_TOKENS: Tuple[str, ...] = (
     "images",
     "labels",
+    "binary",
     "nrrd",
     "overlay",
     "voxel_volume",
@@ -304,7 +305,8 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         default=None,
         metavar="OUTPUT",
         help=(
-            "PTA outputs: images, labels, nrrd, overlay, voxel_volume, summary. "
+            "PTA outputs: images, labels, binary (mask TIFFs and lossless MKVs), "
+            "nrrd, overlay, voxel_volume, summary. "
             "The normal dataset publication is --save images labels"
         ),
     )
@@ -460,15 +462,18 @@ def resolve_pta_config(args: argparse.Namespace) -> PtaConfig:
     # Keep execution fields private to the resolved namespace. The policy's
     # export selects augmentation placement; the output token selects encoding.
     args.offline_augmentation_backend = "auto"
-    if args.augmentation and str(args.augmentation_execution) == "offline":
-        from .augmentation_policy import inspect_augmentation_definition
-        definition = inspect_augmentation_definition(str(args.augmentation))
-        args.offline_augmentation_backend = (
-            "gpu" if definition.export_name == "build_gpu_augmentation" else "cpu"
-        )
+    if args.augmentation:
+        from .augmentation_policy import resolve_augmentation_definitions
+        definitions = resolve_augmentation_definitions(args.augmentation)
+        definition = definitions.get('gpu', definitions.get('cpu'))
+        args.augmentation = str(definition.path)
+        if str(args.augmentation_execution) == "offline":
+            args.offline_augmentation_backend = (
+                "gpu" if definition.export_name == "build_gpu_augmentation" else "cpu"
+            )
     if gpu_format and args.offline_augmentation_backend != "gpu":
         raise ValueError(
-            f"--output_format {requested_output_format} requires --augmentation GPU_POLICY.py "
+            f"--output_format {requested_output_format} requires --augmentation gpu:GPU_POLICY.py "
             "exporting build_gpu_augmentation"
         )
     if requested_output_format == "nvjpeg" and str(channel_format.kind) == "custom":

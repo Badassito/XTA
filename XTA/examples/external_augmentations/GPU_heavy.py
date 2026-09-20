@@ -1,20 +1,9 @@
-"""Heavy GPU augmentation policy for XTA PTA offline generation.
+"""Heavy GPU augmentation policy for PTA/TTA.
 
-This file is intentionally the complete augmentation policy.  PTA imports only
-``build_gpu_augmentation`` and treats the returned object's ``apply_batch``
-methods as the single-file GPU contract. This profile preserves the supplied
-policy's transform choices while increasing their sampled magnitudes.
-
-The port is distribution-compatible rather than pixel-identical:
-
-* D4 and affine are composed into one destination-to-source grid.
-* Optional elastic displacement is added to that grid, so image and mask each
-  incur one geometric resampling pass.
-* Brightness and the selected noise family are applied on CUDA tensors.
-* Gaussian blur is executed only for selected samples; blur and elastic
-  smoothing use separable Gaussian passes.
-* ``None`` seeds identify unaugmented originals; integer seeds are deterministic
-  across GPU count and batch size.
+Self-contained: copy this one file to use it. Constants below control the intensity and elastic stages.
+Order: spatial resampling -> CLAHE -> blur/brightness/noise -> clamp ->
+adaptive bit depth -> existing output conversion. Shared context-channel
+mappings preserve channel addressing. See README.md beside the policies.
 """
 
 from __future__ import annotations
@@ -32,6 +21,14 @@ import torch.nn.functional as F
 PTA_GPU_POLICY_API = 2
 PTA_GPU_RUNTIME = "torch-cuda-fused-grid-v1"
 AUGMENTATION_PROFILE = "heavy"
+
+BIT_DEPTH_PROBABILITY = 0.4
+BIT_DEPTHS = (2, 4, 8)
+CLAHE_PROBABILITY = 0.01
+CLAHE_CLIP_RANGE = (2.0, 6.0)
+CLAHE_TILE_GRID = (8, 8)
+ELASTIC_RMS_FRACTION = 0.015
+
 
 
 def _subseed(seed: int, salt: int) -> int:
@@ -89,6 +86,175 @@ def _fused_pointwise(
     noisy = torch.where(pepper, torch.zeros_like(noisy), noisy)
     noisy = torch.where(salt, torch.ones_like(noisy), noisy)
     return torch.clamp(noisy, 0.0, 1.0)
+
+
+def _sample_bit_depth(
+    seed: int,
+    depths: Sequence[int],
+    probability: float = BIT_DEPTH_PROBABILITY,
+) -> Optional[int]:
+    """Independent seeded stream: one activation draw and one uniform choice.
+
+    Inline this function beside the preset's existing ``_subseed`` helper;
+    call it with the explicit sample seed, not a shared RNG's next draw.
+    """
+    rng = random.Random(_subseed(seed, 307))
+    if rng.random() >= probability:
+        return None
+    return int(rng.choice(depths))
+
+
+def _adaptive_bit_depth_torch(image, eligible, bits: int):
+    """Device-resident Torch equivalent; import torch when inlining in presets.
+
+    Uses only fixed-size tensors for histogram/mapping construction: no
+    ``.item()``, ``.cpu()``, data-dependent Python branches, boolean-indexed
+    histogram inputs, or threshold-search loops. This works on CPU/CUDA and
+    can be captured by ``torch.compile(..., fullgraph=True)``. Gradients are
+    not required by the augmentation policy.
+    """
+    import torch
+
+    if bits not in (1, 2, 4, 8):
+        raise ValueError("adaptive bit depth must be one of 1, 2, 4, 8")
+    if image.shape != eligible.shape:
+        raise ValueError("eligibility must have exactly the sample's shape")
+    sample = image.to(dtype=torch.float32).clamp(0.0, 1.0)
+    eligibility = eligible.to(dtype=torch.bool)
+    base = torch.where(eligibility, sample, 0.0)
+    bins = (sample * 255.0).round().to(dtype=torch.int64)
+    active = eligibility & (bins > 0)
+    hist = torch.zeros(256, dtype=torch.int64, device=image.device)
+    hist.scatter_add_(0, bins.reshape(-1), active.reshape(-1).to(dtype=torch.int64))
+    grid = torch.arange(256, dtype=torch.int64, device=image.device)
+    low = torch.where(hist > 0, grid, 256).amin()
+    high = torch.where(hist > 0, grid, -1).amax()
+    nonconstant = high > low
+    if bits == 8:
+        lut = (((grid - low) * 255).float() / (high - low).clamp_min(1).float())
+        lut = lut.round().clamp(0.0, 255.0)
+    else:
+        levels = 1 << bits
+        cdf = hist.cumsum(0)
+        targets = torch.arange(1, levels, dtype=torch.int64, device=image.device) * cdf[-1]
+        thresholds = torch.searchsorted(cdf * levels, targets, right=False)
+        thresholds = torch.minimum(thresholds, high - 1)
+        lut = torch.searchsorted(thresholds, grid, right=False) * (255 // (levels - 1))
+    output = torch.where(active, lut[bins].float() / 255.0, 0.0)
+    return torch.where(nonconstant, output, base).to(dtype=image.dtype)
+
+
+def _sample_clahe(seed, probability, clip_range):
+    """Select activation and clip limit from an independent seed stream 401."""
+    if seed is None:
+        return None
+    probability = float(probability)
+    low, high = (float(value) for value in clip_range)
+    if not 0.0 <= probability <= 1.0 or not 1.0 <= low <= high:
+        raise ValueError("CLAHE requires probability in [0,1] and 1 <= low <= high")
+    stream_seed = (int(seed) ^ (401 * 0x9E3779B97F4A7C15)) & ((1 << 63) - 1)
+    rng = random.Random(stream_seed or 1)
+    return rng.uniform(low, high) if rng.random() < probability else None
+
+
+def _clahe_geometry(height, width, tile_grid_size):
+    """Return OpenCV (columns, rows) tile dimensions and reflected canvas size."""
+    columns, rows = (int(value) for value in tile_grid_size)
+    if height < 1 or width < 1 or columns < 1 or rows < 1:
+        raise ValueError("CLAHE needs a nonempty image and positive tile counts")
+    if height % rows == 0 and width % columns == 0:
+        padded_height, padded_width = height, width
+    else:
+        # OpenCV extends BOTH axes in this branch, even an already divisible axis.
+        padded_height = height + rows - height % rows
+        padded_width = width + columns - width % columns
+    return columns, rows, padded_height // rows, padded_width // columns
+
+
+def _clahe_torch(sample, clip_limit, tile_grid_size=(8, 8)):
+    """Device-resident CLAHE on normalized CHW/NCHW tensors, returning float32."""
+    if sample.ndim not in (3, 4) or not sample.is_floating_point():
+        raise ValueError("Torch CLAHE expects a normalized floating CHW or NCHW tensor")
+    if float(clip_limit) < 1.0:
+        raise ValueError("CLAHE clip_limit must be >= 1")
+    squeeze = sample.ndim == 3
+    source = sample.unsqueeze(0) if squeeze else sample
+    count, channels, height, width = source.shape
+    if channels < 1 or count < 1:
+        raise ValueError("CLAHE needs at least one sample and one channel")
+    columns, rows, tile_height, tile_width = _clahe_geometry(height, width, tile_grid_size)
+    area = tile_height * tile_width
+    device = source.device
+    bins = torch.round(source.float().clamp(0.0, 1.0) * 255.0).to(torch.int64)
+
+    def reflected_indexes(length, target):
+        if length == 1:
+            return torch.zeros(target, dtype=torch.int64, device=device)
+        phase = torch.arange(target, dtype=torch.int64, device=device) % (2 * (length - 1))
+        return torch.minimum(phase, 2 * (length - 1) - phase)
+
+    extended = bins.index_select(-2, reflected_indexes(height, rows * tile_height))
+    extended = extended.index_select(-1, reflected_indexes(width, columns * tile_width))
+    tile_values = extended.reshape(count, channels, rows, tile_height, columns, tile_width)
+    tile_values = tile_values.permute(0, 2, 4, 1, 3, 5).reshape(count * rows * columns, -1)
+    hist = torch.zeros((count * rows * columns, 256), dtype=torch.int64, device=device)
+    hist.scatter_add_(1, tile_values, torch.ones_like(tile_values))
+    limit = max(int(float(clip_limit) * area / 256), 1) * channels
+    clipped = hist.clamp(max=limit)
+    excess = (hist - clipped).sum(dim=1, keepdim=True)
+    batch = torch.div(excess, 256 * channels, rounding_mode="floor")
+    residue = excess % (256 * channels)
+    whole_residue = torch.div(residue, channels, rounding_mode="floor")
+    fraction = residue % channels
+    step = torch.div(256, whole_residue.clamp(min=1), rounding_mode="floor").clamp(min=1)
+    histogram_bins = torch.arange(256, dtype=torch.int64, device=device)[None, :]
+    residual_slots = ((histogram_bins % step == 0)
+                      & (torch.div(histogram_bins, step, rounding_mode="floor") < whole_residue))
+    redistributed = clipped + batch * channels + residual_slots.to(torch.int64) * channels
+    redistributed[:, -1:] += fraction
+    cumulative = redistributed.cumsum(dim=1).float() / float(channels)
+    lut = torch.round(cumulative * (255.0 / area)).clamp(0.0, 255.0)
+
+    x = torch.arange(width, dtype=torch.float32, device=device) * (1.0 / tile_width) - 0.5
+    y = torch.arange(height, dtype=torch.float32, device=device) * (1.0 / tile_height) - 0.5
+    left, top = x.floor().to(torch.int64), y.floor().to(torch.int64)
+    wx = (x - left.float())[None, None, None, :]
+    wy = (y - top.float())[None, None, :, None]
+    right, bottom = (left + 1).clamp(max=columns - 1), (top + 1).clamp(max=rows - 1)
+    left, top = left.clamp(min=0), top.clamp(min=0)
+    sample_offsets = torch.arange(count, dtype=torch.int64, device=device)[:, None, None, None] * (rows * columns)
+
+    def mapped(tile_y, tile_x):
+        tile = sample_offsets + tile_y[None, None, :, None] * columns + tile_x[None, None, None, :]
+        return lut[tile, bins]
+
+    output = ((mapped(top, left) * (1.0 - wx) + mapped(top, right) * wx) * (1.0 - wy)
+              + (mapped(bottom, left) * (1.0 - wx) + mapped(bottom, right) * wx) * wy)
+    output = output.round().clamp(0.0, 255.0) / 255.0
+    return output[0] if squeeze else output
+
+
+def _normalized_elastic_displacement_torch(seed, height, width, rms_fraction, device):
+    height, width = int(height), int(width)
+    if height < 1 or width < 1:
+        raise ValueError("Elastic field dimensions must be positive")
+    if min(height, width) < 2:
+        return torch.zeros((2, height, width), device=device, dtype=torch.float32)
+    scale = max(1.0, min(height, width) / 128.0)
+    coarse_h = max(2, int(round(height / scale)))
+    coarse_w = max(2, int(round(width / scale)))
+    generator = torch.Generator(device=device)
+    generator.manual_seed(_subseed(seed, 101))
+    noise = torch.rand((1, 2, coarse_h, coarse_w), generator=generator,
+                       device=device, dtype=torch.float32) * 2.0 - 1.0
+    sigma = max(0.5, 0.08 * min(height, width) / scale)
+    field = _separable_gaussian(noise, sigma)
+    if (coarse_h, coarse_w) != (height, width):
+        field = F.interpolate(field, size=(height, width), mode="bilinear", align_corners=False)
+    field = field - field.mean(dim=(-2, -1), keepdim=True)
+    rms = field.square().mean(dim=(-2, -1), keepdim=True).sqrt().clamp_min(1e-8)
+    field = field * ((float(rms_fraction) * min(height, width)) / rms)
+    return field[0].contiguous()
 
 
 class GPUAugmentation:
@@ -160,6 +326,8 @@ class GPUAugmentation:
         )
         salt_pepper_amount = float(rng.uniform(0.0, 0.065)) if rng.random() < 0.25 else 0.0
         return {
+            "bit_depth": _sample_bit_depth(seed, BIT_DEPTHS, BIT_DEPTH_PROBABILITY),
+            "clahe_clip_limit": _sample_clahe(seed, CLAHE_PROBABILITY, CLAHE_CLIP_RANGE),
             "d4": d4,
             "rotation": rotation,
             "scale": scale,
@@ -205,15 +373,7 @@ class GPUAugmentation:
         return [[l00, l01, tx], [l10, l11, ty], [0.0, 0.0, 1.0]]
 
     def _elastic_displacement(self, seed: int, height: int, width: int) -> torch.Tensor:
-        generator = torch.Generator(device=self.device)
-        generator.manual_seed(_subseed(seed, 101))
-        noise = torch.rand(
-            (1, 2, height, width),
-            device=self.device,
-            dtype=torch.float32,
-            generator=generator,
-        ) * 2.0 - 1.0
-        return _separable_gaussian(noise, 5.0)[0] * 27.5
+        return _normalized_elastic_displacement_torch(seed, height, width, ELASTIC_RMS_FRACTION, self.device)
 
     def _apply_intensity_noise(
         self,
@@ -221,6 +381,8 @@ class GPUAugmentation:
         seeds: Sequence[Optional[int]],
         params_by_sample: Sequence[Optional[Dict[str, object]]],
     ) -> torch.Tensor:
+        # Called by BOTH PTA and the existing TTA adapter, before photometry.
+        eligible = (images * 255.0).round() > 0
         output = images.clone()
         count = int(output.shape[0])
         brightness = torch.ones((count, 1, 1, 1), device=self.device, dtype=output.dtype)
@@ -233,6 +395,9 @@ class GPUAugmentation:
         for index, (seed, params) in enumerate(zip(seeds, params_by_sample)):
             if seed is None or params is None:
                 continue
+            clip_limit = params.get("clahe_clip_limit")
+            if clip_limit is not None:
+                output[index:index + 1] = _clahe_torch(output[index:index + 1], float(clip_limit), CLAHE_TILE_GRID)
             sample = _blur_sample(output[index:index + 1], float(params["blur_sigma"]))
             output[index:index + 1] = sample
             brightness[index] = float(params["brightness"])
@@ -282,13 +447,21 @@ class GPUAugmentation:
             salt,
         )
         try:
-            return self._pointwise_kernel(*arguments)
+            result = self._pointwise_kernel(*arguments)
         except Exception:
             if not self._pointwise_compiled:
                 raise
             self._pointwise_kernel = _fused_pointwise
             self._pointwise_compiled = False
-            return _fused_pointwise(*arguments)
+            result = _fused_pointwise(*arguments)
+        for index, (seed, params) in enumerate(zip(seeds, params_by_sample)):
+            if seed is None or params is None:
+                continue
+            result[index] = torch.where(eligible[index], result[index], 0.0)
+            depth = params.get("bit_depth")
+            if depth is not None:
+                result[index] = _adaptive_bit_depth_torch(result[index], eligible[index], int(depth))
+        return result
 
     @torch.inference_mode()
     def apply_batch_many(
@@ -415,9 +588,9 @@ class GPUAugmentation:
                 forward_matrices.append(self._forward_matrix(params, out_h, out_w))
 
         forward = torch.tensor(forward_matrices, device=self.device, dtype=torch.float32)
-        inverse = torch.linalg.inv(forward)
+        inverse = torch.stack([torch.linalg.inv(matrix) for matrix in forward])
         pixel_grid = self._pixel_grid(out_h, out_w)
-        source = torch.einsum("nij,hwj->nhwi", inverse, pixel_grid)
+        source = torch.stack([torch.einsum("ij,hwj->hwi", matrix, pixel_grid) for matrix in inverse])
         for index, (seed, params) in enumerate(zip(flat_seeds, params_by_sample)):
             if seed is not None and params is not None and bool(params["elastic"]):
                 displacement = self._elastic_displacement(int(seed), out_h, out_w)

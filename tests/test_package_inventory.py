@@ -25,9 +25,15 @@ from tools.verify_package_inventory import (
 )
 
 
+def _release_22_1_inventory():
+    manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+    manifest.pop('v22_2_release_review', None)
+    return manifest
+
+
 def _pta_inventory():
     # PTA contract tests retain the exact pre-promotion inventory snapshot.
-    manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+    manifest = _release_22_1_inventory()
     manifest.pop('v22_1_release_review', None)
     return manifest
 
@@ -128,8 +134,96 @@ def tilted_azimuthal_gpu_contract(manifest):
 
 
 class PackageInventoryTests(unittest.TestCase):
-    def test_v22_1_release_authenticates_exact_pta_candidate_bundle(self):
+    def test_v22_2_release_authenticates_the_complete_released_predecessor(self):
         manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = inventory.reviewed_v22_2_release_contract(manifest, manifest['v21_review'])
+        prior = _release_22_1_inventory()
+        authenticated = hashlib.sha256(json.dumps(prior, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        self.assertEqual(authenticated, inventory.REVIEWED_V22_2_RELEASE_PREDECESSOR_SHA256)
+        self.assertEqual(review['release'], '22.2.0')
+        self.assertEqual(review['predecessor_commit'], 'd99f15a4f9dcedf008324f510227518afdfabb98')
+        self.assertEqual(review['previous_review_sha256'], inventory.REVIEWED_V22_1_RELEASE_SHA256)
+        self.assertEqual({item['module'] for item in review['module_snapshots']},
+                         set(inventory.REVIEWED_V22_2_RELEASE_PREDECESSOR_MODULES))
+        for module in ('pta_binary', 'tta_augmentation_cpu', 'tta_augmentation_cpu_runtime'):
+            self.assertIn(module, review['complete_modules'])
+        for backend in ('CPU', 'GPU'):
+            for profile in ('light', 'baseline', 'heavy', 'superheavy'):
+                self.assertIn(f'examples/external_augmentations/{backend}_{profile}', review['complete_modules'])
+
+    def test_v22_2_release_rejects_rewritten_history_and_unauthenticated_additions(self):
+        baseline = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        for key in baseline.keys() - {'v22_2_release_review'}:
+            manifest = copy.deepcopy(baseline)
+            if isinstance(manifest[key], dict):
+                manifest[key]['rewritten_history'] = True
+            elif isinstance(manifest[key], list):
+                manifest[key][0]['line'] = -1
+            else:
+                manifest[key] += 1
+            with self.subTest(key=key), self.assertRaisesRegex(RuntimeError, 'v22.2.0 predecessor inventory changed'):
+                inventory.reviewed_v22_2_release_contract(manifest, manifest['v21_review'])
+        baseline['v22_2_release_review']['definitions'][0]['sha256'] = '0' * 64
+        with self.assertRaisesRegex(RuntimeError, 'v22.2.0 review digest mismatch'):
+            inventory.reviewed_v22_2_release_contract(baseline, baseline['v21_review'])
+
+    def test_historical_contracts_admit_only_the_authenticated_v22_2_successor(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        prior = _release_22_1_inventory()
+        contracts = (release_contract, policy_memory_contract, policy_throughput_contract,
+                     radial_retirement_contract, policy_window_contract, tilted_azimuthal_gpu_contract,
+                     lambda value: inventory.reviewed_v22_pta_throughput_contract(value, value['v21_review']),
+                     lambda value: inventory.reviewed_v22_1_release_contract(value, value['v21_review']))
+        for contract in contracts:
+            self.assertEqual(contract(manifest), contract(prior))
+        manifest['v22_2_release_review']['statements'][0]['reason'] = 'unreviewed replacement'
+        for contract in contracts:
+            with self.subTest(contract=contract.__name__), self.assertRaisesRegex(RuntimeError, 'review digest mismatch'):
+                contract(manifest)
+
+    def test_v22_2_release_checks_independent_source_anchors_and_statement_positions(self):
+        for mutation, expected in (
+            ('commit', 'unexpected predecessor or source scope'),
+            ('source_anchor', 'source predecessor changed'),
+            ('historical_statements', 'source predecessor changed'),
+            ('position', 'statement position differs'),
+            ('previous_position', 'statement predecessor changed'),
+        ):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            review = manifest['v22_2_release_review']
+            snapshot = next(item for item in review['module_snapshots'] if item['previous_top_level'])
+            record = next(item for item in review['definitions'] + review['statements'] if item['previous_index'] is not None)
+            if mutation == 'commit':
+                review['predecessor_commit'] = '0' * 40
+            elif mutation == 'source_anchor':
+                snapshot['previous_ast_sha256'] = '0' * 64
+            elif mutation == 'historical_statements':
+                snapshot['previous_top_level'][0] = '0' * 64
+            elif mutation == 'position':
+                record['current_index'] = -1
+            else:
+                record['previous_index'] = -1
+            authenticated = hashlib.sha256(json.dumps(review, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            with self.subTest(mutation=mutation), mock.patch.object(inventory, 'REVIEWED_V22_2_RELEASE_SHA256', authenticated):
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    inventory.reviewed_v22_2_release_contract(manifest, manifest['v21_review'])
+
+    def test_v22_2_full_source_snapshots_reject_unreviewed_code_and_policy_changes(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = inventory.reviewed_v22_2_release_contract(manifest, manifest['v21_review'])
+        trees = {item['module']: ast.parse((inventory.PACKAGE / (item['module'] + '.py')).read_text(encoding='utf-8'))
+                 for item in review['module_snapshots']}
+        inventory.verify_v22_2_source_snapshots(review, trees)
+        for module in ('pipeline', 'pta_binary', 'tta_augmentation_cpu', 'examples/external_augmentations/CPU_baseline'):
+            changed = dict(trees)
+            changed[module] = copy.deepcopy(trees[module])
+            changed[module].body.append(ast.Assign(targets=[ast.Name(id='UNREVIEWED_BINDING', ctx=ast.Store())],
+                                                   value=ast.Constant(1)))
+            with self.subTest(module=module), self.assertRaisesRegex(RuntimeError, 'v22.2.0 reviewed source changed: ' + module):
+                inventory.verify_v22_2_source_snapshots(review, changed)
+
+    def test_v22_1_release_authenticates_exact_pta_candidate_bundle(self):
+        manifest = _release_22_1_inventory()
         review = inventory.reviewed_v22_1_release_contract(manifest, manifest['v21_review'])
         prior = {key: value for key, value in manifest.items() if key != 'v22_1_release_review'}
         authenticated = hashlib.sha256(json.dumps(prior, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
@@ -146,7 +240,7 @@ class PackageInventoryTests(unittest.TestCase):
         self.assertNotIn('predecessor_commit', review)
 
     def test_v22_1_release_preserves_all_historical_records(self):
-        baseline = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        baseline = _release_22_1_inventory()
         for key in baseline.keys() - {'v22_1_release_review'}:
             manifest = copy.deepcopy(baseline)
             if isinstance(manifest[key], dict):
@@ -159,7 +253,7 @@ class PackageInventoryTests(unittest.TestCase):
                 inventory.reviewed_v22_1_release_contract(manifest, manifest['v21_review'])
 
     def test_historical_contracts_accept_only_authenticated_v22_1_release(self):
-        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        manifest = _release_22_1_inventory()
         prior = copy.deepcopy(manifest)
         del prior['v22_1_release_review']
         contracts = (release_contract, policy_memory_contract, policy_throughput_contract,
@@ -178,7 +272,7 @@ class PackageInventoryTests(unittest.TestCase):
                 ('previous_hash', 'supersession does not match its historical pin'),
                 ('binding', 'exactly its five release identity bindings'),
                 ('module_scope', 'unexpected bundle predecessor')):
-            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            manifest = _release_22_1_inventory()
             review = manifest['v22_1_release_review']
             if mutation == 'bundle':
                 review['predecessor_bundle']['sha256'] = '0' * 64
@@ -194,17 +288,18 @@ class PackageInventoryTests(unittest.TestCase):
                     inventory.reviewed_v22_1_release_contract(manifest, manifest['v21_review'])
 
     def test_v22_1_release_keeps_nonversion_runtime_statements_unchanged(self):
-        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        manifest = _release_22_1_inventory()
         review = inventory.reviewed_v22_1_release_contract(manifest, manifest['v21_review'])
+        successor = json.loads(MANIFEST.read_text(encoding='utf-8'))['v22_2_release_review']
         top_level = {module: ast.parse((inventory.PACKAGE / f'{module}.py').read_text()).body
                      for module in ('__init__', 'cli', 'config')}
-        inventory.verify_v22_1_release_scope(review, top_level)
+        inventory.verify_v22_1_release_scope(review, top_level, (successor,))
         for module in top_level:
             changed = copy.deepcopy(top_level)
             changed[module].append(ast.Assign(targets=[ast.Name(id='UNREVIEWED_RELEASE_BEHAVIOR', ctx=ast.Store())],
                                               value=ast.Constant(1)))
             with self.subTest(module=module), self.assertRaisesRegex(RuntimeError, 'changed non-version module statements: ' + module):
-                inventory.verify_v22_1_release_scope(review, changed)
+                inventory.verify_v22_1_release_scope(review, changed, (successor,))
 
     def test_pta_successor_authenticates_complete_distributed_inventory_and_sources(self):
         manifest = _pta_inventory()
@@ -312,7 +407,9 @@ class PackageInventoryTests(unittest.TestCase):
                                                 value=ast.Constant(1)))
                 return tree
             with self.subTest(module=module), mock.patch.object(inventory.ast, 'parse', side_effect=add_statement):
-                with self.assertRaisesRegex(RuntimeError, 'PTA throughput complete source changed: ' + module):
+                expected = ('complete-module statement coverage differs: ' if module == 'pta_runtime'
+                            else 'PTA throughput complete source changed: ') + module
+                with self.assertRaisesRegex(RuntimeError, expected):
                     verify_inventory()
 
     def test_tilted_gpu_review_authenticates_complete_committed_predecessor(self):
@@ -420,14 +517,15 @@ class PackageInventoryTests(unittest.TestCase):
         review = tilted_azimuthal_gpu_contract(manifest)
         statements = ast.parse((inventory.PACKAGE / 'pipeline.py').read_text(encoding='utf-8')).body
         window = manifest['v22_policy_window_review']
-        inventory.verify_policy_window_runtime_scope(window, statements, (review,))
+        successor = json.loads(MANIFEST.read_text(encoding='utf-8'))['v22_2_release_review']
+        inventory.verify_policy_window_runtime_scope(window, statements, (review, successor))
         with self.assertRaisesRegex(RuntimeError, 'policy window changed unreviewed pipeline statements or imports'):
             inventory.verify_policy_window_runtime_scope(window, statements)
         altered = copy.deepcopy(statements)
         node = next(node for node in altered if getattr(node, 'name', None) == '_execution_runtime_provenance')
         node.body.append(ast.Pass())
-        with self.assertRaisesRegex(RuntimeError, 'reviewed definition changed or is missing: pipeline._execution_runtime_provenance'):
-            inventory.verify_policy_window_runtime_scope(window, altered, (review,))
+        with self.assertRaisesRegex(RuntimeError, 'policy window changed unreviewed pipeline statements or imports'):
+            inventory.verify_policy_window_runtime_scope(window, altered, (review, successor))
 
     def test_policy_window_authenticates_complete_distributed_predecessor(self):
         manifest = _historical_inventory()

@@ -41,6 +41,7 @@ def build_runtime_options(config: PtaConfig) -> argparse.Namespace:
         ),
         save_images=save.enabled("images"),
         save_labels=save.enabled("labels"),
+        save_binary=save.enabled("binary"),
         save_nrrd=save.enabled("nrrd"),
         save_overlay=save.enabled("overlay"),
         voxel_volume=save.enabled("voxel_volume"),

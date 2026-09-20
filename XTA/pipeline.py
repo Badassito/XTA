@@ -41,7 +41,7 @@ from ._deps import _numba, cv2
 from .cylindrical_owner import RADIAL_OWNER_CONTRACT, radial_owner_eligible, radial_runtime_provenance
 from .publication_memory import (
     native_fullframe_dense_reserve, plan_native_publication_memory, publication_output_reserve,
-    policy_parent_memory_plan, publication_ram_headroom,
+    policy_parent_memory_plan, policy_cpu_worker_buffer_plan, publication_ram_headroom,
 )
 
 # Explicit lower-layer dependencies keep imports one-way.
@@ -1233,10 +1233,10 @@ def _main_impl() -> None:
     # are assigned. Unsupported commands retain the dense compatibility paths.
     v1613_bundle_reasons: List[str] = []
     if policy_settings.enabled:
-        v1613_bundle_reasons.append('external GPU policy copies require inverse mapping before native accumulation')
+        v1613_bundle_reasons.append('external policy copies require inverse mapping before native accumulation')
         print(f'External TTA: {policy_settings.ratio} passes (one base), '
               f'granularity={policy_settings.granularity}, coverage={policy_settings.coverage}; '
-              'render-once GPU batches, independent parent masks, no augmented interpolation; '
+              'render-once batches, independent parent masks, no augmented interpolation; '
               'affine-only D1/ring fusion and dynamic lease splitting are bypassed for this run.')
     if not v1613_fast_bundle_requested():
         v1613_bundle_reasons.append('YOLO_TTA_V1613_FAST_BUNDLE=0')
@@ -1607,9 +1607,9 @@ def _main_impl() -> None:
             'Set YOLO_TTA_GPU_WORKER_DIRECT_UNION=0 to select per-task result files.'
         )
 
-    projection_sampling = str(getattr(args, 'projection_sampling', 'coverage'))
-    if projection_sampling == 'coverage' and not any(float(angle) % 360.0 == 0.0 for angle in angles):
-        projection_sampling = 'dense'
+    sampling_policy = 'coverage'
+    if not any(float(angle) % 360.0 == 0.0 for angle in angles):
+        sampling_policy = 'dense'
         print('Projection sampling: retaining dense schedules because no unrotated base pass is selected.')
     compiled_physical_views = compile_physical_views(
         t_dim=int(T),
@@ -1625,7 +1625,7 @@ def _main_impl() -> None:
         spherical_requests=spherical_requests,
         spherical_min_radius=args.spherical_min_radius,
         spherical_patch_size=int(args.imgsz),
-        sampling_policy=projection_sampling,
+        sampling_policy=sampling_policy,
     )
     projection_sampling_records = []
     for family in ('spherical', 'radial', 'azimuthal'):
@@ -1647,7 +1647,7 @@ def _main_impl() -> None:
                                            'dense_reference_frames_per_angle': reference,
                                            'fallback_reasons': reasons})
         print(f'Projection sampling [{family}]: {reference:,} dense -> {actual:,} native frames per angle '
-              f'({(1.0 - actual / reference) * 100:.2f}% fewer); policy={projection_sampling}.')
+              f'({(1.0 - actual / reference) * 100:.2f}% fewer).')
         for reason in reasons:
             print(f'Projection sampling [{family}] fallback: {reason}')
     from .azimuthal_coverage import requires_native_pull
@@ -1712,7 +1712,6 @@ def _main_impl() -> None:
             'spherical_min_radius': args.spherical_min_radius,
             'spherical_patch_size': int(args.imgsz),
             'spherical_groups': spherical_groups,
-            'projection_sampling': projection_sampling,
             'projection_sampling_workload': projection_sampling_records,
             'azimuthal_diameters': [int(v) for v in azimuthal_diameters],
             'azimuth_angles_deg': [float(v) for v in resolved_azimuth_angles],
@@ -4804,6 +4803,7 @@ def _main_impl() -> None:
                 cpu_worker_dispatched_by_id[instance_id] = 0
                 cpu_worker_results_by_id[instance_id] = 0
                 cpu_init = {
+                    'augmentation_settings': policy_settings,
                     'imgsz': int(args.imgsz),
                     'conf': float(args.conf),
                     'batch': max(1, int(args.cpu_batch)),
@@ -5198,7 +5198,8 @@ def _main_impl() -> None:
             support_dir = out_dir / 'augmentation_support'
             support_dir.mkdir(parents=True, exist_ok=True)
             policy_settings.assert_unchanged()
-            shutil.copyfile(policy_settings.path, support_dir / 'policy.py')
+            for policy_backend, policy_definition in policy_settings.definitions().items():
+                shutil.copyfile(policy_definition.path, support_dir / f'policy_{policy_backend}.py')
             write_json_manifest(support_dir / 'policy.json', policy_settings.record())
             tile_lookup = {
                 (name, job.config_id, int(job.tile_x), int(job.tile_y)): job
@@ -5211,7 +5212,8 @@ def _main_impl() -> None:
                 base_task['augmentation_support_dir'] = str(support_dir)
                 base_task['disable_runtime_split'] = True
                 if (str(base_task['kind']) == 'fullframe'
-                        and direct_union_sparse_retirement_active):
+                        and (direct_union_sparse_retirement_active
+                             or str(base_task.get('result_mode')) == 'direct_union')):
                     base_task['bounded_parent_admission'] = True
                     bounded_policy_parent_keys.add((str(base_task['model_name']), base_view.name))
                 siblings = []
@@ -5276,6 +5278,16 @@ def _main_impl() -> None:
             if gpu_union_flush_overlap_enabled():
                 worker_buffers += int(gpu_device_count) * gpu_union_retirement_lane_count() * (
                     2 * gpu_union_retirement_chunk_slices() * int(args.imgsz)**2 + 16)
+            gpu_worker_buffers = worker_buffers
+            cpu_buffer_plan = policy_cpu_worker_buffer_plan(
+                worker_count=len(cpu_instance_plans), cache_mib=policy_settings.cache_mib,
+                batch_size=int(args.cpu_batch), channels=int(channel_format.channel_count),
+                prefetch_frames=max((int(task.get('prefetch_frames', args.cpu_batch))
+                                     for task in gpu_worker_tasks_by_id.values()
+                                     if task.get('cpu_eligible', False)), default=int(args.cpu_batch)),
+                out_size=max((int(task['out_size']) for task in gpu_worker_tasks_by_id.values()
+                              if task.get('cpu_eligible', False)), default=int(args.imgsz)))
+            worker_buffers += int(cpu_buffer_plan['total_bytes'])
             tile_sizes = []
             tile_support_numerator, tile_support_denominator = 0, 1
             for task in gpu_worker_tasks_by_id.values():
@@ -5308,6 +5320,9 @@ def _main_impl() -> None:
                 worker_buffer_reserve_bytes=worker_buffers + tile_reserve,
                 batch_size=int(args.gpu_batch),
             )
+            policy_memory_plan.update(cpu_worker_buffer_plan=cpu_buffer_plan,
+                                      gpu_worker_buffer_reserve_bytes=gpu_worker_buffers,
+                                      tile_buffer_reserve_bytes=tile_reserve)
             direct_union_total_dense_byte_limit = int(policy_memory_plan['dense_limit_bytes'])
             direct_union_inference_byte_limit = min(
                 direct_union_inference_byte_limit, direct_union_total_dense_byte_limit)
@@ -5719,7 +5734,7 @@ def _main_impl() -> None:
             return
         results = stats.get('augmentation_results')
         if not isinstance(results, list) or len(results) != len(siblings):
-            raise RuntimeError('GPU worker returned incomplete external-policy pass results')
+            raise RuntimeError('Inference worker returned incomplete external-policy pass results')
         augmentation_support_records.extend(stats.get('augmentation_records', []))
         augmentation_execution_records.append({
             'task_id': int(task['task_id']), 'view': task['view'].name,
@@ -7247,7 +7262,9 @@ def _main_impl() -> None:
         policy_settings.assert_unchanged()
         augmentation_manifest_path = write_json_manifest(
             out_dir / 'augmentation_manifest.json',
-            {**policy_settings.record(), 'policy_snapshot': str(out_dir / 'augmentation_support' / 'policy.py'),
+            {**policy_settings.record(),
+             'policy_snapshots': {backend: str(out_dir / 'augmentation_support' / f'policy_{backend}.py')
+                                  for backend in policy_settings.definitions()},
              'coverage_records': augmentation_support_records,
              'planned_output_groups': augmentation_planned_output_groups,
              'execution_records': augmentation_execution_records},

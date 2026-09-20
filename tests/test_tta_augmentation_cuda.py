@@ -138,8 +138,8 @@ def test_worker_requires_fast_backend_only_for_shipped_policy(monkeypatch):
     monkeypatch.setenv('PTA_GPU_TORCH_COMPILE','0')
     path=Path(__file__).resolve().parents[1]/'XTA/examples/external_augmentations/GPU_light.py'
     loaded=load_gpu_augmentation_definition(str(path))
-    settings=SimpleNamespace(path=str(path),content_sha256=loaded.content_sha256,cache_mib=1,
-                             assert_unchanged=lambda:None)
+    from XTA.tta_augmentation_config import TtaAugmentationSettings
+    settings=TtaAugmentationSettings(path=str(path),content_sha256=loaded.content_sha256,cache_mib=1)
     clear_worker_policies()
     with patch('XTA.tta_augmentation_cuda._kernels',return_value=None):
         with pytest.raises(RuntimeError,match='requires CuPy'):

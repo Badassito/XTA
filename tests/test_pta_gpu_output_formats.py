@@ -84,7 +84,7 @@ class PtaGpuOutputFormatTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assert_error(["--output_format", token], "requires --augmentation_execution offline")
                 self.assert_error(["--output_format", token, "--augmentation_execution", "offline"],
-                                  "requires --augmentation GPU_POLICY.py")
+                                  "requires --augmentation gpu:GPU_POLICY.py")
                 self.assert_error(["--output_format", token, "--augmentation_execution", "offline",
                                    "--augmentation", str(self.cpu)], "exporting build_gpu_augmentation")
 

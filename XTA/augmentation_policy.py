@@ -6,7 +6,7 @@ import ast
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 @dataclass(frozen=True)
 class AugmentationDefinition:
@@ -91,3 +91,33 @@ def assert_augmentation_definition_unchanged(
             "Augmentation policy changed during execution; refusing a complete "
             f"manifest: path={definition.path}, fields={changed}"
         )
+
+
+def resolve_augmentation_definitions(
+    values: Sequence[str] | str | None,
+) -> dict[str, AugmentationDefinition]:
+    """Inspect backend-tagged policy files without importing their runtimes."""
+    if values is None:
+        return {}
+    tokens = [values] if isinstance(values, str) else list(values)
+    resolved: dict[str, AugmentationDefinition] = {}
+    for value in tokens:
+        raw = str(value).strip()
+        backend, separator, payload = raw.partition(':')
+        backend = backend.lower()
+        if backend in {'cpu', 'gpu'} and separator:
+            if not payload.strip():
+                raise ValueError(f'--augmentation {backend}: requires a Python policy path')
+            definition = inspect_augmentation_definition(payload.strip())
+            actual = 'gpu' if definition.export_name == 'build_gpu_augmentation' else 'cpu'
+            if actual != backend:
+                raise ValueError(f'--augmentation {backend}: requires a {backend.upper()} policy export')
+        elif len(tokens) == 1:
+            definition = inspect_augmentation_definition(raw)
+            backend = 'gpu' if definition.export_name == 'build_gpu_augmentation' else 'cpu'
+        else:
+            raise ValueError('--augmentation requires cpu:POLICY.py and/or gpu:POLICY.py entries')
+        if backend in resolved:
+            raise ValueError(f'--augmentation contains duplicate {backend}: entries')
+        resolved[backend] = definition
+    return resolved

@@ -94,7 +94,6 @@ def main() -> int:
     parser.add_argument('--augmentation_ratio', type=int, default=3)
     parser.add_argument('--augmentation_profile', choices=('light', 'baseline', 'heavy', 'superheavy'), default='light')
     parser.add_argument('--augmentation_granularity', choices=('slice', 'slab', 'lease', 'view'), default='slice')
-    parser.add_argument('--projection_sampling', choices=('coverage', 'dense'), default='coverage')
     parser.add_argument('--enable_spherical', nargs='+', default=[])
     parser.add_argument('--enable_tilted', nargs='+', default=[])
     parser.add_argument('--enable_radial', nargs='+', default=[])
@@ -135,7 +134,6 @@ def main() -> int:
             '--channel_format', layout.token, '--imgsz', str(args.imgsz), '--batch', str(args.batch),
             '--quantize', 'gpu:fp32', '--conf', '0.00001', '--min_conf', '0', '--min_radius', '0',
             '--angle', '0', '--enable_cartesian', 'transverse',
-            '--projection_sampling', args.projection_sampling,
             '--interpolation_distance', '2', '--interpolation_walk_back', '1', '--interpolation_candidates', '1',
             '--interpolation_passes', '1', '--interpolation_min_radius', '0',
             '--augmentation', str(ROOT / 'XTA/examples/external_augmentations' / f'GPU_{args.augmentation_profile}.py'),

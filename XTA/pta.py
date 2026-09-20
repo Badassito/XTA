@@ -168,6 +168,7 @@ from .pta_publication import (
     write_selected_candidate_version,
     write_yolo_lines,
 )
+from .pta_binary import candidate_binary_output_path, write_candidate_binary_videos
 from .pta_rendering import (
     DEFAULT_CHANNEL_VARIANT,
     AZIMUTHAL_LANCZOS_A,
@@ -2491,6 +2492,7 @@ def write_v18_pta_manifest(
     voxel_report_path: Optional[Path] = None,
     dataset_yaml_path: Optional[Path] = None,
     publication_integrity: Optional[Mapping[str, object]] = None,
+    binary_publication: Sequence[Mapping[str, object]] = (),
 ) -> Path:
     """Write the mandatory v18 reproducibility and geometry manifest."""
 
@@ -2675,6 +2677,7 @@ def write_v18_pta_manifest(
             },
             "dataset_candidates_processed": int(total_written),
             "image_publication_integrity": dict(publication_integrity or {}),
+            "binary_sequences": [dict(record) for record in binary_publication],
             "zero_view_success": not any(record.views for record in records),
         },
     }
@@ -3208,6 +3211,8 @@ def prepare_loaded_source(
         warnings.add("voxel_volume_disabled_for_unlabeled_volume", f"{src.stem}: --save voxel_volume requires labels or an NRRD segmentation")
     if bool(args.save_nrrd) and not label_enabled:
         warnings.add("save_nrrd_disabled_for_unlabeled_volume", f"{src.stem}: --save nrrd requires labels or an NRRD segmentation")
+    if bool(getattr(args, "save_binary", False)) and not label_enabled:
+        warnings.add("binary_disabled_for_unlabeled_volume", f"{src.stem}: --save binary requires labels or an NRRD segmentation")
 
     mask_block: Optional[SharedBlock] = None
     if src.label_source == "yolo":
@@ -3917,6 +3922,7 @@ def trim_background_overage_after_flips(
     warnings: WarningLog,
     images_selected: bool = True,
     labels_selected: bool = True,
+    binary_selected: bool = False,
 ) -> int:
     """Re-tighten the per-subset background cap after render-time flips.
 
@@ -3980,6 +3986,10 @@ def trim_background_overage_after_flips(
                         f"background-overage trim expected label is missing: {lbl_path}"
                     )
                 lbl_path.unlink()
+            if bool(binary_selected) and cand.label_enabled:
+                binary_path = candidate_binary_output_path(out_dir, cand, split_active=split_active)
+                _validate_nonempty_regular_file(binary_path, context="background-overage trim expected binary mask")
+                binary_path.unlink()
             cand.keep = False
             if int(cand.augmentation_index) == 0:
                 deleted_original += 1
@@ -4005,6 +4015,8 @@ def trim_background_overage_after_flips(
 _GENERATED_OUTPUT_DIR_NAMES = (
     "images",
     "labels",
+    "binary_masks",
+    "binary_videos",
     "overlays",
     "nrrds",
     "augmentation",
@@ -4920,6 +4932,7 @@ def main(
     background_filter_requested = float(args.background_percent) < 1.0
     dataset_publication_selected = bool(
         getattr(args, "save_images", True) or getattr(args, "save_labels", True)
+        or getattr(args, "save_binary", False)
     )
     total_background_stats = BackgroundFilterStats(
         active=background_filter_requested,
@@ -4928,7 +4941,7 @@ def main(
         ),
     )
     if background_filter_requested and not dataset_publication_selected:
-        total_background_stats.skipped_reason = "image/label publication is not selected"
+        total_background_stats.skipped_reason = "image/label/binary publication is not selected"
     elif background_filter_requested and not labels_available:
         total_background_stats.skipped_reason = "label operations are disabled for unlabeled volumes"
     total_split_stats = SplitStats(active=bool(split_active), train_split=train_split, split_method=split_method)
@@ -4955,6 +4968,7 @@ def main(
         foreground_classification_performed=False,
     )
     volume_records: List[VolumeSummaryRecord] = []
+    binary_publication: List[Dict[str, object]] = []
     used_augmentation_tags: set[str] = set()
     order_counter = 0
     total_written = 0
@@ -4980,6 +4994,7 @@ def main(
             augmentation=augmentation,
             save_images=bool(getattr(args, "save_images", True)),
             save_labels=bool(getattr(args, "save_labels", True)),
+            save_binary=bool(getattr(args, "save_binary", False)),
         )
         render_pool = PersistentRenderPool(
             backend=render_backend,
@@ -5246,14 +5261,14 @@ def main(
             volume_publication_selected = bool(
                 bool(getattr(args, "save_images", True))
                 or (
-                    bool(getattr(args, "save_labels", True))
+                    (bool(getattr(args, "save_labels", True)) or bool(getattr(args, "save_binary", False)))
                     and bool(prep.label_enabled)
                 )
             )
             if not volume_publication_selected:
                 print(
                     f"{prep.src.stem}: skipping dataset render because neither "
-                    "images nor available labels was selected"
+                    "images nor available labels/binary masks was selected"
                 )
                 return
             retained = [c for c in physical if c.keep]
@@ -5299,6 +5314,8 @@ def main(
                 publication_kinds.append("images")
             if bool(getattr(args, "save_labels", True)) and bool(prep.label_enabled):
                 publication_kinds.append("labels")
+            if bool(getattr(args, "save_binary", False)) and bool(prep.label_enabled):
+                publication_kinds.append("binary")
             progress.pbar = tqdm(
                 total=len(retained),
                 desc=f"Rendering retained {'/'.join(publication_kinds)} {prep.src.stem}",
@@ -5344,6 +5361,7 @@ def main(
                 warnings=vol_warnings,
                 images_selected=bool(getattr(args, "save_images", True)),
                 labels_selected=bool(getattr(args, "save_labels", True)),
+                binary_selected=bool(getattr(args, "save_binary", False)),
             )
             if trimmed:
                 print(f"{spec.stem}: trimmed {trimmed} written background(s) to honor the realized --background_percent cap after flips")
@@ -5366,6 +5384,12 @@ def main(
             total_written += int(written_effective)
             total_flip_dropped += int(flip_dropped)
             total_background_withheld += int(withheld)
+
+            if bool(getattr(args, "save_binary", False)) and bool(prep.label_enabled):
+                binary_publication.extend(write_candidate_binary_videos(
+                    out_dir, physical, split_active=bool(split_active),
+                    fps=float(prep.src.fps), expected_count=int(written_effective),
+                ))
 
             if prep.save_overlay:
                 write_overlays_global(
@@ -5606,6 +5630,7 @@ def main(
         voxel_report_path=voxel_report_path,
         dataset_yaml_path=dataset_yaml_path,
         publication_integrity=publication_integrity,
+        binary_publication=binary_publication,
     )
 
     print("\nDone.")

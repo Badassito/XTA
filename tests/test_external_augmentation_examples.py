@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import ast
+from collections import Counter
 import copy
 import importlib
 import io
 import math
 import os
+import random
 import re
 import sys
 import tokenize
@@ -54,6 +56,13 @@ def _isolated_sample_function(
     )
     function.name = "sample_parameters"
     function.decorator_list = []
+    policy_tree = _tree(path)
+    helpers = [copy.deepcopy(node) for node in policy_tree.body
+               if (isinstance(node, ast.FunctionDef)
+                   and node.name in {'_subseed', '_sample_bit_depth', '_sample_clahe'})
+               or (isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id.startswith(('BIT_DEPTH', 'CLAHE_'))
+                           for target in node.targets))]
     module = ast.Module(
         body=[
             ast.ImportFrom(
@@ -62,6 +71,7 @@ def _isolated_sample_function(
                 level=0,
             ),
             ast.Import(names=[ast.alias(name="random")]),
+            *helpers,
             function,
         ],
         type_ignores=[],
@@ -70,47 +80,6 @@ def _isolated_sample_function(
     namespace: dict[str, object] = {}
     exec(compile(module, str(path), "exec"), namespace)
     return namespace["sample_parameters"]
-
-
-def _elastic_amplitude(path: Path, *, class_name: str) -> float:
-    function = _class_method(path, class_name, "_elastic_displacement")
-    returns = [node for node in ast.walk(function) if isinstance(node, ast.Return)]
-    if len(returns) != 1:
-        raise AssertionError(f"{path}: expected one elastic-displacement return")
-    multipliers = [
-        node
-        for node in ast.walk(returns[0].value)
-        if isinstance(node, ast.BinOp)
-        and isinstance(node.op, ast.Mult)
-        and isinstance(node.right, ast.Constant)
-        and isinstance(node.right.value, (int, float))
-    ]
-    if len(multipliers) != 1:
-        raise AssertionError(f"{path}: elastic amplitude is not an explicit multiplier")
-    return float(multipliers[0].right.value)  # type: ignore[union-attr]
-
-
-def _multiplicative_noise_range(path: Path, *, class_name: str) -> tuple[float, float]:
-    function = _class_method(path, class_name, "_apply_intensity_noise")
-    method_name = "uniform_" if class_name == "GPUAugmentation" else "uniform"
-    calls = [
-        node
-        for node in ast.walk(function)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == method_name
-        and len(node.args) >= 2
-        and all(
-            isinstance(argument, ast.Constant)
-            and isinstance(argument.value, (int, float))
-            for argument in node.args[:2]
-        )
-    ]
-    if len(calls) != 1:
-        raise AssertionError(
-            f"{path}: expected one explicit multiplicative-noise {method_name} range"
-        )
-    return tuple(float(argument.value) for argument in calls[0].args[:2])  # type: ignore[return-value,union-attr]
 
 
 def _selectors(sample: dict[str, object]) -> tuple[object, ...]:
@@ -188,28 +157,6 @@ class ExternalAugmentationExampleTests(unittest.TestCase):
             _isolated_sample_function(path, class_name="GPUAugmentation")
             for _profile, path in GPU_PROFILES
         ]
-        self.assertEqual(
-            [
-                _elastic_amplitude(path, class_name="GPUAugmentation")
-                for _profile, path in GPU_PROFILES
-            ],
-            [15.0, 20.0, 27.5, 35.0],
-        )
-        self.assertEqual(
-            [
-                _multiplicative_noise_range(path, class_name="GPUAugmentation")
-                for _profile, path in GPU_PROFILES
-            ],
-            [(0.65, 1.35), (0.5, 1.5), (0.35, 1.65), (0.15, 1.85)],
-        )
-        self.assertEqual(
-            _multiplicative_noise_range(
-                EXAMPLES / "CPU_baseline.py",
-                class_name="CPUAugmentation",
-            ),
-            (0.5, 1.5),
-        )
-
         for seed in range(2048):
             samples = [
                 sampler(seed, height, width)  # type: ignore[operator]
@@ -227,21 +174,6 @@ class ExternalAugmentationExampleTests(unittest.TestCase):
                 )
 
     def test_cpu_profiles_match_their_gpu_parameter_graphs(self) -> None:
-        self.assertEqual(
-            [
-                _elastic_amplitude(path, class_name="CPUAugmentation")
-                for _profile, path in CPU_PROFILES
-            ],
-            [15.0, 20.0, 27.5, 35.0],
-        )
-        self.assertEqual(
-            [
-                _multiplicative_noise_range(path, class_name="CPUAugmentation")
-                for _profile, path in CPU_PROFILES
-            ],
-            [(0.65, 1.35), (0.5, 1.5), (0.35, 1.65), (0.15, 1.85)],
-        )
-
         for (profile, gpu_path), (_cpu_profile, cpu_path) in zip(
             GPU_PROFILES,
             CPU_PROFILES,
@@ -261,6 +193,27 @@ class ExternalAugmentationExampleTests(unittest.TestCase):
                         cpu_sample(seed, 257, 383),  # type: ignore[operator]
                         gpu_sample(seed, 257, 383),  # type: ignore[operator]
                     )
+
+    def test_profile_bit_depth_frequencies_and_clahe_defaults(self) -> None:
+        for (profile, path), probability, depths, clips in zip(
+            CPU_PROFILES, (.2, .3, .4, .5), ((8,), (4, 8), (2, 4, 8), (1, 2, 4, 8)),
+            ((1., 2.), (1., 4.), (2., 6.), (3., 8.)),
+        ):
+            sampler = _isolated_sample_function(path, class_name="CPUAugmentation")
+            random.seed(1337)
+            state = random.getstate()
+            samples = [sampler(seed, 96, 112) for seed in range(20000)]
+            self.assertEqual(random.getstate(), state)
+            counts = Counter(sample['bit_depth'] for sample in samples)
+            with self.subTest(profile=profile):
+                self.assertEqual(set(counts), set(depths) | {None})
+                self.assertAlmostEqual(counts[None] / len(samples), 1 - probability, delta=.012)
+                for depth in depths:
+                    self.assertAlmostEqual(counts[depth] / len(samples), probability / len(depths), delta=.012)
+                active = [sample['clahe_clip_limit'] for sample in samples if sample['clahe_clip_limit'] is not None]
+                self.assertAlmostEqual(len(active) / len(samples), .01, delta=.003)
+                self.assertTrue(all(clips[0] <= value <= clips[1] for value in active))
+                self.assertAlmostEqual(sum(sample['elastic'] for sample in samples) / len(samples), .3, delta=.012)
 
     def test_cpu_profiles_are_seeded_deterministic_and_preserve_empty_masks(self) -> None:
         loaded_cv2 = sys.modules.get("cv2")
@@ -433,34 +386,189 @@ class GPUAugmentationGaussianMathTests(unittest.TestCase):
                 with self.subTest(profile=profile, sigma=sigma):
                     self.assertIs(module._blur_sample(sample, sigma), sample)
 
-    def test_elastic_field_preserves_seed_and_profile_amplitude(self) -> None:
+    def test_elastic_field_preserves_seed_and_normalizes_per_axis_rms(self) -> None:
         seed = 31891
-        for (profile, module), amplitude in zip(
-            self.modules, (15.0, 20.0, 27.5, 35.0)
+        for (profile, module), fraction in zip(
+            self.modules, (.005, .01, .015, .02)
         ):
-            # Only the pure tensor helper is executed; no CUDA constructor,
-            # device probe, pinned staging, or optional compilation is needed.
             policy = module.GPUAugmentation.__new__(module.GPUAugmentation)
             policy.device = self.torch.device("cpu")
-            for height, width in ((27, 31), (7, 31), (31, 7), (1, 2)):
+            for height, width in ((27, 31), (7, 31), (31, 7), (1, 2), (512, 768)):
                 with self.subTest(profile=profile, shape=(height, width)):
-                    generator = self.torch.Generator(device="cpu")
-                    generator.manual_seed(module._subseed(seed, 101))
-                    noise = self.torch.rand(
-                        (1, 2, height, width),
-                        generator=generator,
-                        dtype=self.torch.float32,
-                    ) * 2.0 - 1.0
-                    expected = self._square_reference(noise, 5.0)[0] * amplitude
                     actual = policy._elastic_displacement(seed, height, width)
-                    self.torch.testing.assert_close(
-                        actual, expected, rtol=4e-6, atol=2e-5
-                    )
+                    if min(height, width) < 2:
+                        self.assertFalse(bool(actual.any()))
+                    else:
+                        rms = actual.double().square().mean((-2, -1)).sqrt()
+                        self.torch.testing.assert_close(rms, self.torch.full_like(rms, fraction * min(height, width)),
+                                                        rtol=2e-4, atol=1e-6)
+                        self.torch.testing.assert_close(actual.mean((-2, -1)), self.torch.zeros(2),
+                                                        rtol=0, atol=3e-4)
                     self.assertTrue(
                         self.torch.equal(
                             actual, policy._elastic_displacement(seed, height, width)
                         )
                     )
+
+
+class ExternalAugmentationIntensityMathTests(unittest.TestCase):
+    """Execute the standalone policy math against independent intensity fixtures."""
+
+    @classmethod
+    def setUpClass(cls):
+        for dependency in ('cv2', 'torch'):
+            loaded = sys.modules.get(dependency)
+            if loaded is not None and type(loaded).__name__ == '_StubModule':
+                raise unittest.SkipTest(f'Intensity math requires real {dependency}')
+        try:
+            import cv2
+            import torch
+        except ModuleNotFoundError as exc:
+            raise unittest.SkipTest(f'Intensity math dependencies are unavailable: {exc}') from exc
+        cls.cv2, cls.torch = cv2, torch
+        previous_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        cls.addClassCleanup(torch.set_num_threads, previous_threads)
+        cls.modules = [(profile,
+                        importlib.import_module(f'XTA.examples.external_augmentations.CPU_{profile}'),
+                        importlib.import_module(f'XTA.examples.external_augmentations.GPU_{profile}'))
+                       for profile, _ in CPU_PROFILES]
+
+    @staticmethod
+    def u8(image):
+        return np.rint(np.clip(image, 0, 1) * 255).astype(np.uint8)
+
+    def quantize_pair(self, cpu, gpu, source, eligible, bits):
+        before = source.copy()
+        expected = cpu._adaptive_bit_depth_numpy(source, eligible, bits)
+        actual = gpu._adaptive_bit_depth_torch(self.torch.from_numpy(source.copy()),
+                                              self.torch.from_numpy(eligible.copy()), bits).numpy()
+        np.testing.assert_array_equal(self.u8(actual), self.u8(expected))
+        np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-7)
+        np.testing.assert_array_equal(actual[~eligible], 0)
+        np.testing.assert_array_equal(source, before)
+        return actual
+
+    def test_eight_bit_range_stretch_excludes_protected_background(self):
+        for profile, cpu, gpu in self.modules:
+            with self.subTest(profile=profile):
+                source = np.array([0, 10, 20, 30, 40], np.float32) / 255
+                result = self.quantize_pair(cpu, gpu, source, source > 0, 8)
+                np.testing.assert_array_equal(self.u8(result), [0, 0, 85, 170, 255])
+                source[0] = .98
+                result = self.quantize_pair(cpu, gpu, source, np.array([False, True, True, True, True]), 8)
+                np.testing.assert_array_equal(self.u8(result), [0, 0, 85, 170, 255])
+                source = np.array([0, 80, 98, 125], np.float32) / 255
+                result = self.quantize_pair(cpu, gpu, source, source > 0, 8)
+                np.testing.assert_array_equal(self.u8(result), [0, 0, 102, 255])
+
+    def test_quantile_palettes_monotonicity_and_indivisible_histogram_ties(self):
+        fixtures = (np.arange(256, dtype=np.float32),
+                    np.array([0] + [17] * 900 + [18] * 2 + [19], dtype=np.float32),
+                    np.array([0, 40] + [255] * 999, dtype=np.float32))
+        for profile, cpu, gpu in self.modules:
+            for bins in fixtures:
+                source = bins / 255
+                for bits in (1, 2, 4):
+                    with self.subTest(profile=profile, bits=bits, values=len(source)):
+                        output = self.u8(self.quantize_pair(cpu, gpu, source, source > 0, bits))
+                        palette = np.arange(1 << bits) * (255 // ((1 << bits) - 1))
+                        self.assertTrue(set(output) <= set(palette))
+                        self.assertEqual((int(output.min()), int(output.max())), (0, 255))
+                        self.assertTrue(np.all(np.diff(output.astype(int)) >= 0))
+                        for value in np.unique(bins):
+                            self.assertEqual(len(np.unique(output[bins == value])), 1)
+                        if len(source) == 256:
+                            np.testing.assert_array_equal(np.unique(output), palette)
+
+    def test_empty_constant_and_channel_shared_quantization(self):
+        for profile, cpu, gpu in self.modules:
+            for bits in (1, 2, 4, 8):
+                with self.subTest(profile=profile, bits=bits):
+                    for value in (0., .333):
+                        source = np.full((3, 7, 9), value, np.float32)
+                        eligible = source > 0
+                        eligible[:, :2] = False
+                        result = self.quantize_pair(cpu, gpu, source, eligible, bits)
+                        np.testing.assert_array_equal(result, np.where(eligible, source, 0))
+                    source = np.arange(1, 121, dtype=np.float32).reshape(5, 8, 3) / 255
+                    normal = self.quantize_pair(cpu, gpu, source, source > 0, bits)
+                    reverse = self.quantize_pair(cpu, gpu, source[..., ::-1].copy(),
+                                                 (source[..., ::-1] > 0).copy(), bits)
+                    np.testing.assert_array_equal(normal, reverse[..., ::-1])
+                    batch = np.array([[0, 10, 20, 30, 40], [0, 100, 120, 140, 160]], np.float32) / 255
+                    independent = [self.quantize_pair(cpu, gpu, sample, sample > 0, bits) for sample in batch]
+                    np.testing.assert_array_equal(independent[0], independent[1])
+
+    def test_clahe_matches_opencv_for_gray_and_small_uneven_tiles(self):
+        rng = np.random.default_rng(31267)
+        for shape in ((128, 176), (91, 117), (80, 83), (3, 5), (1, 19), (1, 1)):
+            source = rng.integers(0, 256, shape, dtype=np.uint8)
+            sample = source.astype(np.float32) / 255
+            for profile, cpu, gpu in self.modules:
+                for clip in (1., 2.37, 4., 8.):
+                    with self.subTest(shape=shape, profile=profile, clip=clip):
+                        expected = self.cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8)).apply(source)
+                        actual = self.u8(cpu._clahe_numpy(sample, clip))
+                        tensor = self.torch.from_numpy(sample[None].copy())
+                        torch_result = self.u8(gpu._clahe_torch(tensor, clip).numpy()[0])
+                        np.testing.assert_array_equal(torch_result, actual)
+                        difference = np.abs(actual.astype(int) - expected.astype(int))
+                        self.assertLessEqual(difference.max(), 1)
+                        self.assertLess(difference.mean(), .02)
+
+    def test_clahe_pools_context_channels_and_keeps_samples_independent(self):
+        rng = np.random.default_rng(91)
+        source = rng.random((17, 19, 3), dtype=np.float32)
+        before = source.copy()
+        for profile, cpu, gpu in self.modules:
+            with self.subTest(profile=profile):
+                normal = cpu._clahe_numpy(source, 3.25)
+                reverse = cpu._clahe_numpy(source[..., ::-1], 3.25)
+                np.testing.assert_array_equal(normal, reverse[..., ::-1])
+                single = cpu._clahe_numpy(source[..., 0], 3.25)
+                repeated = cpu._clahe_numpy(np.repeat(source[..., :1], 3, axis=2), 3.25)
+                np.testing.assert_array_equal(repeated, np.repeat(single[..., None], 3, axis=2))
+                batch = self.torch.from_numpy(np.stack((source.transpose(2, 0, 1), source[::-1].transpose(2, 0, 1))).copy())
+                together = gpu._clahe_torch(batch, 3.25)
+                for index in range(2):
+                    self.torch.testing.assert_close(together[index], gpu._clahe_torch(batch[index], 3.25), rtol=0, atol=0)
+                np.testing.assert_array_equal(self.u8(together[0].numpy().transpose(1, 2, 0)), self.u8(normal))
+                np.testing.assert_array_equal(source, before)
+
+    def test_cpu_elastic_has_expected_rms_and_replay_contract(self):
+        for (profile, cpu, _), fraction in zip(self.modules, (.005, .01, .015, .02)):
+            self.assertEqual(cpu.CPUAugmentation.tta_replay_contract, 'opencv-affine-elastic-v1')
+            for height, width in ((1, 19), (27, 31), (128, 192), (512, 768)):
+                with self.subTest(profile=profile, shape=(height, width)):
+                    field = cpu.CPUAugmentation._elastic_displacement(2718, height, width)
+                    np.testing.assert_array_equal(field, cpu.CPUAugmentation._elastic_displacement(2718, height, width))
+                    if min(height, width) < 2:
+                        self.assertFalse(np.any(field))
+                    else:
+                        rms = np.sqrt(np.mean(field.astype(np.float64) ** 2, axis=(0, 1)))
+                        np.testing.assert_allclose(rms, fraction * min(height, width), rtol=2e-4)
+                        np.testing.assert_allclose(field.mean(axis=(0, 1)), 0, atol=3e-4)
+
+    def test_photometry_preserves_original_zeros_and_never_changes_labels(self):
+        for profile, cpu, _ in self.modules:
+            image = (np.arange(32 * 48).reshape(32, 48) % 255 + 1).astype(np.uint8)
+            image[:4] = 0
+            mask = np.zeros(image.shape, np.uint8)
+            mask[9:25, 13:32] = 1
+            policy = cpu.build_augmentation()
+            params = policy._sample_parameters(18, *image.shape)
+            params.update(noise_family=0, noise_strength=.5, salt_pepper_amount=.2,
+                          clahe_clip_limit=4., bit_depth=2)
+            out = policy._apply_intensity_noise(image.astype(np.float32) / 255, seed=18, params=params)
+            with self.subTest(profile=profile):
+                self.assertTrue(np.all(out[image == 0] == 0))
+                self.assertTrue(set(self.u8(out).ravel()) <= {0, 85, 170, 255})
+                with mock.patch.object(policy, '_sample_parameters', return_value=params):
+                    augmented = policy(image=image, mask=mask)
+                    with mock.patch.object(policy, '_apply_intensity_noise', side_effect=lambda image, **kwargs: image):
+                        spatial = policy(image=image, mask=mask)
+                np.testing.assert_array_equal(augmented['mask'], spatial['mask'])
 
 
 if __name__ == "__main__":

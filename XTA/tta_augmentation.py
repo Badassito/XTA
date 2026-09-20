@@ -270,6 +270,7 @@ _ADAPTERS: dict[tuple[str, str, int], GpuPolicyAdapter] = {}
 
 def worker_policy(settings: TtaAugmentationSettings, *, device: str, batch_size: int) -> GpuPolicyAdapter:
     from .pta_augmentation import load_gpu_augmentation_definition
+    settings = settings.for_backend('gpu')
     key = (settings.content_sha256, str(device), int(batch_size))
     if key not in _ADAPTERS:
         settings.assert_unchanged()

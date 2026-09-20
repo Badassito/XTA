@@ -46,7 +46,10 @@ def cpu_policy(profile: str, batch_size: int = 8):
 
 
 def settings(**kwargs):
-    return TtaAugmentationSettings(ratio=3, content_sha256='test-policy-sha', **kwargs)
+    definition = inspect_augmentation_definition(str(POLICIES / 'GPU_light.py'))
+    values = dict(ratio=3, path=str(definition.path), content_sha256=definition.content_sha256)
+    values.update(kwargs)
+    return TtaAugmentationSettings(**values)
 
 
 def resolve(**kwargs):
@@ -78,15 +81,15 @@ def test_invalid_ratios(ratio):
         resolve(augmentation_ratio=ratio)
 
 
-def test_ratio_and_gpu_guards():
+def test_ratio_and_backend_requirements():
     assert resolve(augmentation_ratio=1).enabled is False
     assert resolve().ratio == 3
     with pytest.raises(ValueError, match='requires --augmentation'):
         resolve(augmentation=None)
-    with pytest.raises(ValueError, match='GPU-only'):
+    with pytest.raises(ValueError, match='requires a gpu:'):
         resolve(augmentation=str(POLICIES / 'CPU_light.py'))
     for devices, cpu in [((), True), (('0',), True), ((), False)]:
-        with pytest.raises(ValueError, match='GPU-only'):
+        with pytest.raises(ValueError, match='requires'):
             resolve_tta_augmentation(SimpleNamespace(augmentation=str(POLICIES / 'GPU_light.py'), augmentation_ratio=2),
                                      gpu_devices=devices, cpu_enabled=cpu)
 

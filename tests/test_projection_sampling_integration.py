@@ -123,25 +123,33 @@ class ProjectionSamplingIntegrationTests(unittest.TestCase):
                         self.assertTrue(after.sampling_reason)
                         self.assertFalse(requires_native_pull(after))
 
-    def test_tta_default_and_actual_zero_angle_admission(self):
+    def test_tta_sampling_requires_an_unrotated_base_and_rejects_unknown_options(self):
         parser = config.build_argparser()
         arguments = ['--input', 'source.mkv', '--model', 'cpu:model.xml']
-        self.assertEqual(parser.parse_args(arguments).projection_sampling, 'coverage')
-        self.assertEqual(parser.parse_args(arguments + ['--projection_sampling', 'dense']).projection_sampling, 'dense')
+        self.assertFalse(hasattr(parser.parse_args(arguments), 'projection_sampling'))
+        for option in ('--projection_sampling', '--red_robin_burgers'):
+            with self.subTest(option=option), contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as rejected:
+                    parser.parse_args(arguments + [option, 'coverage'])
+                self.assertEqual(rejected.exception.code, 2)
+                self.assertIn(f'unrecognized arguments: {option} coverage', stderr.getvalue())
         tree = ast.parse(inspect.getsource(pipeline._main_impl))
-        assignment = next(node for node in ast.walk(tree) if _assigned(node, 'projection_sampling'))
+        default = next(node for node in ast.walk(tree) if _assigned(node, 'sampling_policy', 'coverage'))
         admission = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
-                         and {'projection_sampling', 'angles'} <= {
-                             child.id for child in ast.walk(node.test) if isinstance(child, ast.Name)})
-        program = compile(ast.fix_missing_locations(ast.Module(body=[assignment, admission], type_ignores=[])),
-                          '<projection-sampling-admission>', 'exec')
-        for requested in ('dense', 'coverage'):
-            for angles in ((0.0,), (360.0,), (-360.0,), (45.0,), (0.0, 45.0)):
-                env = {'args': SimpleNamespace(projection_sampling=requested), 'angles': angles}
-                with contextlib.redirect_stdout(io.StringIO()):
-                    exec(program, env)
-                expected = requested if any(angle % 360.0 == 0 for angle in angles) else 'dense'
-                self.assertEqual(env['projection_sampling'], expected)
+                         and any(_assigned(statement, 'sampling_policy', 'dense') for statement in node.body))
+        assignment = next(node for node in ast.walk(tree) if _assigned(node, 'compiled_physical_views'))
+        program = compile(ast.fix_missing_locations(ast.Module(body=[default, admission, assignment], type_ignores=[])),
+                          '<physical-view-compilation>', 'exec')
+        for angles in ((0.0,), (360.0,), (-360.0,), (45.0,), (90.0, 180.0), (0.0, 45.0), (45.0, 360.0)):
+            compiler = mock.Mock()
+            env = dict(compile_physical_views=compiler, angles=angles, T=17, H=19, W=21,
+                       enabled_cartesian_views=(), azimuthal_requests=(), tilt_groups=(),
+                       radial_requests=(), spherical_requests=(),
+                       args=SimpleNamespace(imgsz=32, radial_min_radius=None, spherical_min_radius=None))
+            with contextlib.redirect_stdout(io.StringIO()):
+                exec(program, env)
+            expected = 'coverage' if any(angle % 360.0 == 0.0 for angle in angles) else 'dense'
+            self.assertEqual(compiler.call_args.kwargs['sampling_policy'], expected)
 
     def test_d1_and_hybrid_production_routes_bypass_only_coarsened_azimuthal(self):
         tree = ast.parse(inspect.getsource(pipeline._main_impl))

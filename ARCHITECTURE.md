@@ -3,7 +3,7 @@
 XTA provides test-time augmentation (TTA), pretraining augmentation (PTA), and
 label-time augmentation (LTA) for volumes. The implementation lives in the
 importable `XTA` package. The versioned launcher
-`GPT-6-Astra-Ultra_v22.1.0_SLURM.py`, installed `xta` command, and `python -m XTA`
+`GPT-6-Astra-Ultra_v22.2.0_SLURM.py`, installed `xta` command, and `python -m XTA`
 all enter `XTA.cli.run()`.
 
 This document describes implemented behavior, ownership, and operating controls.
@@ -14,16 +14,23 @@ repository. Accepted findings about behavior, ownership, operating controls, and
 validation are incorporated here before superseded experiment notes are removed.
 The log retains outcomes, limitations, source identities, and evidence locations.
 
-TTA and PTA share the external GPU policy selector. In TTA,
+TTA and PTA share backend-grouped external policy selection:
+`--augmentation cpu:CPU_POLICY.py gpu:GPU_POLICY.py`. TTA selects the CPU policy
+for OpenVINO workers and the GPU policy for CUDA workers; hybrid execution
+requires both entries. In TTA,
 `--augmentation_ratio N` produces one base pass and N-1 independent policy
 passes, with separate NRRDs and inverse-validity support sidecars. Augmented
 passes contribute to the terminal union and are excluded from interpolation.
 Full-frame policy groups admit all of their independent parent canvases together.
 Workers write each pass directly into its own shared parent slice window after
-GPU inverse mapping. The coordinator receives completion metadata and skips the
-extra temporary-mask merge. Policy mask retirement computes row/column occupancy
-on CUDA and copies the uniquely owned window once; seam contributions retain OR
-semantics. The explicit GPU direct-union disable switch retains file results.
+backend-local inverse mapping. The coordinator receives completion metadata and
+skips the extra temporary-mask merge. CUDA policy retirement computes row/column
+occupancy on-device and copies the uniquely owned window once. CPU workers use
+NumPy/OpenCV replay and restore thresholded OpenVINO masks and confidence planes
+before the processing affine and cleanup; seam contributions retain OR semantics.
+The explicit GPU direct-union disable switch retains file results. Each backend's
+policy snapshot and hash are recorded in the augmentation manifest, with the
+executing backend also recorded in task receipts and packed support sidecars.
 Coverage sidecars use streaming, lossless NPZ compression at level 1 to reduce
 publication CPU time while preserving the existing arrays and metadata schema.
 Each parent retains memory credit through postprocessing and retires after its
@@ -31,7 +38,8 @@ immutable component backing is published. Admission counts groups for the view
 limit and all passes for the byte limit; a policy group must fit the total window.
 The window is clamped to physical/cgroup RAM after accounting for outstanding
 fallback task files, seam buffers, support compression, persistent D2H staging,
-inference buffers, output and postprocessing.
+inference buffers, output and postprocessing. CPU policy caches and active-batch
+inverse-map/transient storage are reserved per CPU worker before parent admission.
 External-policy runs request a 384 GiB total dense window by default so a large
 four-pass group can overlap its predecessor's postprocessing. Explicit
 `YOLO_TTA_DIRECT_UNION_TOTAL_GIB` settings still take precedence, and the physical
@@ -222,8 +230,9 @@ within squared distance `281/324 < 1` of a native sample. This establishes
 positive trilinear input weight; categorical sampling follows its separate
 nearest-neighbor policy.
 
-TTA now defaults to `--projection_sampling coverage`; `dense` retains the
-preceding schedules and remains the default of shared geometry APIs/PTA/LTA.
+TTA uses certified coverage schedules when an unrotated base pass is selected.
+Runs containing only rotated passes retain dense schedules because the native
+support certificate requires an unrotated model raster.
 An exact-rational certificate tightens the QSC inverse bound to 1. The planner
 jointly chooses fixed face intervals and uniform shell spacing while retaining
 the 281/324 sample-distance budget. Radial uses a certified larger shell gap;
@@ -511,6 +520,19 @@ PTA accepts one resolved configuration for discovery, preprocessing, geometry,
 augmentation, dataset planning, and publication. The parent owns candidate
 membership, augmentation versions, train/validation splitting, and output
 identity, so asynchronous completion cannot change the dataset definition.
+
+`--save binary` publishes the exact retained original and augmented masks as
+one-bit DEFLATE TIFFs under `binary_masks`, preserving image/label stems and
+train/validation subdirectories. These masks preserve holes and thin objects.
+After foreground-flip drops and background-cap trimming, PTA reads those TIFFs
+to produce lossless grayscale FFV1 MKVs under `binary_videos`, one sequence per
+volume, view/tile, split, and augmentation copy. Each video has a JSON companion
+mapping its frames to mask files and zero-based view-frame indices, including
+filtering gaps. The run manifest lists every sequence. Binary output can be
+selected independently of images and polygon labels; unlabeled volumes emit no
+binary masks. It uses the same CPU/spawn and bounded GPU publication paths as
+the dataset, so offline augmented masks are captured before policy buffers can
+be reused.
 
 CPU process rendering uses one persistent spawn pool with module-level targets
 and a picklable static contract. Children reload and verify external CPU policy

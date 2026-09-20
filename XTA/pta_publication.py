@@ -30,6 +30,7 @@ from .pta_augmentation import (
     assert_augmentation_did_not_synthesize_mask,
 )
 from .pta_dataset import AUGMENTATION_TAG_LENGTH, OutputCandidate, WarningSink
+from .pta_binary import candidate_binary_output_path, write_binary_mask
 from .render_batch import RenderBatch as CanonicalRenderBatch, RenderBatchItem
 from .unification.contracts import DataRole, FrameAddress, RasterPlan, RenderItem
 
@@ -611,6 +612,7 @@ def write_selected_candidate_version(
     inputs_are_private: bool = False,
     save_images: bool = True,
     save_labels: bool = True,
+    save_binary: bool = False,
     canonical_plan: Optional[RasterPlan] = None,
 ) -> str:
     """Render and write one retained candidate version.
@@ -650,7 +652,7 @@ def write_selected_candidate_version(
 
     img_path, lbl_path = candidate_output_paths(out_dir, cand, split_active=split_active, image_format=image_format)
     label_lines: Optional[List[str]] = None
-    if cand.label_enabled and lbl_path is not None:
+    if cand.label_enabled and lbl_path is not None and (save_labels or not save_binary):
         label_context = f"{cand.volume_name} {cand.output_tag} frame {int(cand.frame_idx)+1:04d}"
         label_lines = mask_to_yolo_lines(
             mask_out,
@@ -664,6 +666,13 @@ def write_selected_candidate_version(
                 f"{cand.volume_name}/{cand.output_tag}/frame={int(cand.frame_idx)+1:04d}/tag={cand.augmentation_tag}",
             )
             return "flip_dropped"
+    elif (save_binary and cand.label_enabled and int(cand.augmentation_index) > 0
+          and bool(cand.foreground) and not np.any(mask_out)):
+        warnings.add(
+            "augmented_foreground_flip_dropped",
+            f"{cand.volume_name}/{cand.output_tag}/frame={int(cand.frame_idx)+1:04d}/tag={cand.augmentation_tag}",
+        )
+        return "flip_dropped"
     if bool(save_images):
         if canonical_plan is None:
             write_image(
@@ -684,6 +693,10 @@ def write_selected_candidate_version(
             )
     if bool(save_labels) and label_lines is not None and lbl_path is not None:
         write_yolo_lines(label_lines, lbl_path)
+    if bool(save_binary) and cand.label_enabled:
+        write_binary_mask(
+            candidate_binary_output_path(out_dir, cand, split_active=split_active), mask_out,
+        )
     return "written"
 
 __all__ = [

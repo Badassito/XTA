@@ -105,8 +105,10 @@ class PolicyTensorBatchSource(InMemoryYoloVolumeSource):
 
 class _CoverageWriter:
     """A task-sized packed mmap, compressed atomically without a task-sized RAM copy."""
-    def __init__(self, root: Path, task: dict[str, Any], out_size: int, total_slots: int) -> None:
+    def __init__(self, root: Path, task: dict[str, Any], out_size: int, total_slots: int,
+                 *, backend: str = '', policy_sha256: str = '') -> None:
         self.task = task
+        self.backend, self.policy_sha256 = backend, policy_sha256
         token = hashlib.sha256(f'{task["view"].name}/{task["job_id"]}/{task["task_id"]}'.encode()).hexdigest()[:20]
         root.mkdir(parents=True, exist_ok=True)
         self.path = root / f'task{int(task["task_id"]):06d}_p{int(task["view"].augmentation_pass):03d}_{token}.npz'
@@ -147,6 +149,8 @@ class _CoverageWriter:
             'coordinates': 'unaugmented model raster; compose with recorded processing affine and view projection',
             'source_acquisition_coverage_included': False,
         }
+        if self.backend:
+            metadata.update(backend=self.backend, policy_sha256=self.policy_sha256)
         pending = self.path.with_suffix('.npz.partial')
         try:
             import zipfile
@@ -304,7 +308,7 @@ def predict_policy_source(model: Any, source: Any, *, task: dict[str, Any], cfg:
     import torch
     from .inference import predict_source_and_accumulate, canonical_single_device
     from .config import quantize_uses_fp16
-    settings = task['augmentation_settings']
+    settings = task['augmentation_settings'].for_backend('gpu')
     settings.assert_unchanged()
     adapter = worker_policy(settings, device=canonical_single_device(str(cfg.device)), batch_size=int(cfg.batch))
     pass_tasks = [task, *task['augmentation_pass_tasks']]
@@ -379,6 +383,7 @@ def predict_policy_source(model: Any, source: Any, *, task: dict[str, Any], cfg:
             result['augmentation_results'] = stats[1:]
             result['augmentation_records'] = records
             result['augmentation_execution'] = {
+                'backend': 'gpu', 'policy_sha256': settings.content_sha256,
                 'rendered_batches': rendered_batches, 'model_batches': rendered_batches * settings.ratio,
                 'pass_count': settings.ratio, 'source_render_replays': 0,
             }
@@ -398,7 +403,8 @@ def predict_policy_source(model: Any, source: Any, *, task: dict[str, Any], cfg:
             targets.append(buffers)
             stats[i].update(_padding_metadata(sibling, *pad_paths, pad_shape, int(cfg.batch)))
             writers.append(_CoverageWriter(Path(task['augmentation_support_dir']), sibling,
-                                           int(predict_kwargs['out_size']), total + padding_count)
+                                           int(predict_kwargs['out_size']), total + padding_count,
+                                           backend='gpu', policy_sha256=settings.content_sha256)
                            if settings.coverage == 'packed' else None)
         batch_start = 0
         for paths, original_batch, info in iter(source):

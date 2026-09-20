@@ -1701,12 +1701,15 @@ def _process_cpu_retina_prediction_frame(
     native_h: int,
     native_w: int,
     slice_lock: Optional[threading.Lock] = None,
+    restore_planes: Optional[Callable] = None,
 ) -> Tuple[int, int]:
     """CPU equivalent of retina_masks=True accumulation without allocating GPU HxW masks."""
     frame_union, frame_confmap, kept_instances = _accumulate_cpu_retina_payload_to_prediction_frame(
         payload,
         int(out_size),
     )
+    if restore_planes is not None:
+        frame_union, frame_confmap = restore_planes([frame_union, frame_confmap])
     if int(kept_instances) <= 0 or not np.any(frame_union):
         return int(kept_instances), 0
 

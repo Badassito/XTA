@@ -49,6 +49,24 @@ def test_complete_planned_groups_pass(tmp_path):
     assert report['total_nrrds'] == 9
 
 
+def test_backend_policy_snapshots_are_all_verified(tmp_path):
+    manifest, layers = _fixture(tmp_path)
+    support = tmp_path / 'augmentation_support'
+    policies, snapshots = {}, {}
+    for backend in ('cpu', 'gpu'):
+        content = f'# {backend} fixture\n'.encode()
+        path = support / f'policy_{backend}.py'
+        path.write_bytes(content)
+        policies[backend] = {'sha256': hashlib.sha256(content).hexdigest()}
+        snapshots[backend] = str(path)
+    manifest.update(policies=policies, policy_snapshots=snapshots)
+    _write(tmp_path, manifest, layers)
+    assert check(tmp_path)['total_nrrds'] == 9
+    (support / 'policy_cpu.py').write_text('# changed\n')
+    with pytest.raises(AssertionError, match='snapshot hash mismatch'):
+        check(tmp_path)
+
+
 @pytest.mark.parametrize('missing', ['fullframe', 'cfg1', 'cfg2'])
 def test_wholly_missing_published_group_fails(tmp_path, missing):
     manifest, layers = _fixture(tmp_path)

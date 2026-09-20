@@ -886,6 +886,7 @@ class _OpenVinoCpuSegmenter:
                         # seam-padding results may target a slice already touched by an
                         # ordinary result, so reconstruction and cleanup share one lock.
                         target_lock = _target_slice_lock(target_union, int(frame_index))
+                        restore = getattr(source, 'restore_prediction_planes', None)
                         with target_lock:
                             instance_count, frame_count = _process_cpu_retina_prediction_frame(
                                 frame_index,
@@ -897,6 +898,8 @@ class _OpenVinoCpuSegmenter:
                                 int(native_h),
                                 int(native_w),
                                 slice_lock=None,
+                                **({'restore_planes': lambda planes, active_spec=spec: restore(active_spec, planes)}
+                                   if callable(restore) else {}),
                             )
                             has_foreground = _cleanup_prediction_slice_inplace(
                                 target_union,
@@ -1136,19 +1139,18 @@ def run_prediction_volume_in_openvino_worker(
             ),
             dtype=np.float32,
         )
-        return runner.infer_source_to_union(
-            source,
-            num_frames=int(slice_count),
-            out_size=int(out_size),
-            conf_threshold=float(cfg.conf),
-            view_union_mm=result_mask,
-            view_confmap_mm=result_conf,
-            M_out_to_native=task_affine,
-            native_h=int(processing_h),
-            native_w=int(processing_w),
+        prediction_kwargs = dict(
+            num_frames=int(slice_count), out_size=int(out_size), conf_threshold=float(cfg.conf),
+            view_union_mm=result_mask, view_confmap_mm=result_conf, M_out_to_native=task_affine,
+            native_h=int(processing_h), native_w=int(processing_w),
             min_conf=float(task.get('streaming_cleanup_min_conf', 0.0)),
             min_radius=float(task.get('streaming_cleanup_min_radius', 0.0)),
         )
+        if task.get('augmentation_pass_tasks'):
+            from .tta_augmentation_cpu_runtime import predict_cpu_policy_source
+            return predict_cpu_policy_source(runner, source, task=task, cfg=cfg,
+                                             predict_kwargs=prediction_kwargs)
+        return runner.infer_source_to_union(source, **prediction_kwargs)
     finally:
         if source is not None:
             try:
@@ -1208,6 +1210,10 @@ def _cpu_inference_worker_main(
                 if init_dict.get('infer_requests') is not None else None
             ),
         )
+        policy_settings = init_dict.get('augmentation_settings')
+        if policy_settings is not None and policy_settings.enabled:
+            from .tta_augmentation_cpu import worker_cpu_policy
+            worker_cpu_policy(policy_settings)
         result_queue.put({
             'type': 'ready', 'worker_kind': 'cpu', 'cpu_index': int(instance_id),
             'pid': int(os.getpid()), 'precision': str(runner.resolved_precision),

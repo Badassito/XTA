@@ -31,8 +31,16 @@ def check(root: Path, *, require_nrrd: bool = True) -> dict:
     manifest=json.loads((root/'augmentation_manifest.json').read_text())
     ratio=int(manifest['ratio'])
     assert ratio>=2, 'not an augmented run'
-    snapshot=root/'augmentation_support'/'policy.py'
-    assert hashlib.sha256(snapshot.read_bytes()).hexdigest()==manifest['content_sha256'], 'policy snapshot hash mismatch'
+    policies = manifest.get('policies')
+    if policies:
+        snapshots = manifest.get('policy_snapshots', {})
+        assert set(snapshots) == set(policies), 'policy snapshot backend mismatch'
+        for backend, policy in policies.items():
+            snapshot = root / 'augmentation_support' / Path(snapshots[backend]).name
+            assert hashlib.sha256(snapshot.read_bytes()).hexdigest() == policy['sha256'], 'policy snapshot hash mismatch'
+    else:
+        snapshot=root/'augmentation_support'/'policy.py'
+        assert hashlib.sha256(snapshot.read_bytes()).hexdigest()==manifest['content_sha256'], 'policy snapshot hash mismatch'
     execution=manifest['execution_records']
     assert execution, 'no completed policy inference tasks'
     planned_rows = manifest.get('planned_output_groups')
