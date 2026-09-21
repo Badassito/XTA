@@ -603,12 +603,21 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
                         "YOLO_TTA_GPU_WORKER_DISPATCH_WINDOW_PER_GPU": 1,
                     }.get(name, int(default))
 
+                expected_confidence, received_confidence, completion_flags = {}, {}, {}
+
                 def complete_fullframe(
                     task: dict[str, object], _stats: dict[str, object]
                 ) -> None:
                     task_parent = scheduler.gpu_worker_fullframe_parent_key(task)
                     assert task_parent is not None
                     self.assertGreater(state.fullframe_remaining[task_parent], 0)
+                    task_id = int(task['task_id'])
+                    self.assertNotIn(task_id, received_confidence)
+                    received_confidence[task_id] = dict(_stats['d1_confidence_shard'])
+                    self.assertEqual(received_confidence[task_id], expected_confidence[task_id])
+                    completion_flags[task_id] = bool(_stats.get('d1_view_complete', False))
+                    if completion_flags[task_id]:
+                        self.assertNotIn(task_parent, state.d1_groups_by_parent)
                     state.fullframe_remaining[task_parent] -= 1
 
                 with tempfile.TemporaryDirectory() as temp_dir:
@@ -697,7 +706,18 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
                             )
                             stats: dict[str, object] = {
                                 "worker_compute_seconds": 0.01,
+                                "d1_view_complete": False,
                             }
+                            expected_confidence[task_id] = {
+                                'protocol': 'xta.d1.native-confidence.v1',
+                                'path': f'scores/group{group_size}/task{task_id}',
+                                'slice_start': int(dispatch['slice_start']),
+                                'slice_count': int(dispatch['slice_count']),
+                                'view_name': str(dispatch['view'].name),
+                                'model_name': str(dispatch['model_name']),
+                                'layer_key': 'same-owner-prediction-layer',
+                            }
+                            stats['d1_confidence_shard'] = dict(expected_confidence[task_id])
                             if task_id == worker_task_ids[-1]:
                                 stats["d1_group_partial_artifact"] = {
                                     "group_id": live_group.group_id,
@@ -740,6 +760,8 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
                     group_summary = scheduler.d1_group_summary()
 
                 self.assertEqual(ordinary_task_ids, set(range(len(tasks))))
+                self.assertEqual(received_confidence, expected_confidence)
+                self.assertEqual(sum(completion_flags.values()), 1)
                 self.assertEqual(reduction_count, 1)
                 self.assertEqual(
                     release_tokens,

@@ -1299,6 +1299,10 @@ class _ResidentTensorRTRingExecutor:
  API, or fixed shapes cannot be proved safe, construction fails before source
  consumption and the caller retains the ordinary direct-predict path."""
 
+    @property
+    def compute_confidence(self) -> bool:
+        return bool(self.track_conf or getattr(self, 'retain_confidence', False))
+
     @runtime_telemetry_phase('trt_ring.init')
     def __init__(
         self,
@@ -1315,6 +1319,7 @@ class _ResidentTensorRTRingExecutor:
         collect_slice_bboxes: bool = False,
         dynamic_unit_descriptors: bool = False,
         post_policy: str = 'legacy_proto',
+        retain_confidence: bool = False,
     ) -> None:
         import torch  # type: ignore
         self.torch = torch
@@ -1362,11 +1367,12 @@ class _ResidentTensorRTRingExecutor:
             self.default_descriptor,
         )
         self.track_conf = bool(track_conf)
+        self.retain_confidence = bool(retain_confidence)
         self.collect_slice_bboxes = bool(collect_slice_bboxes)
         self.confidence_threshold = float(confidence_threshold)
         self.post_policy = str(post_policy)
-        # Confidence-based component cleanup expects an untouched confidence/mask relation;
-        # the prioritized D1 command does not allocate a confidence map.
+        # Cleanup can change the morphology contract; retaining independent
+        # prediction evidence does not change the existing binary-mask path.
         self.proto_hole_treatment, self.proto_hole_radius = _resident_trt_proto_policy(
             self.post_policy, self.track_conf,
         )
@@ -1617,7 +1623,7 @@ class _ResidentTensorRTRingExecutor:
             if self.proto_hole_treatment_active else None
         )
         slot.conf_proto = (
-            torch.empty((ph, pw), dtype=torch.float32, device=device) if self.track_conf else None
+            torch.empty((ph, pw), dtype=torch.float32, device=device) if self.compute_confidence else None
         )
         self._allocate_native_output_buffers(slot)
         cp = self.kernels.cp
@@ -1650,7 +1656,7 @@ class _ResidentTensorRTRingExecutor:
         )
         slot.native_conf = (
             torch.empty((int(self.native_h), int(self.native_w)), dtype=torch.uint8, device=device)
-            if self.track_conf else None
+            if self.compute_confidence else None
         )
         # Four stable int32 values per ring slot.  Collection is enabled only for D1,
         # but keeping this tiny allocation resident lets cached TensorRT contexts serve
@@ -1688,6 +1694,7 @@ class _ResidentTensorRTRingExecutor:
         self, *, post_policy: str, track_conf: bool, confidence_threshold: float,
         collect_slice_bboxes: bool, native_h: int, native_w: int,
         M_out_to_native: np.ndarray, dynamic_unit_descriptors: bool,
+        retain_confidence: bool = False,
     ) -> None:
         """Replace only drained postprocessing state, retaining both TRT contexts.
 
@@ -1705,6 +1712,7 @@ class _ResidentTensorRTRingExecutor:
             slot.post_stream.synchronize()
         self.post_policy = str(post_policy)
         self.track_conf = bool(track_conf)
+        self.retain_confidence = bool(retain_confidence)
         self.confidence_threshold = float(confidence_threshold)
         self.collect_slice_bboxes = bool(collect_slice_bboxes)
         self.proto_hole_treatment, self.proto_hole_radius = mode, radius
@@ -1985,7 +1993,7 @@ class _ResidentTensorRTRingExecutor:
             size=(int(self.out_size), int(self.out_size)), mode='bilinear', align_corners=False,
         ).reshape(int(self.out_size), int(self.out_size)) > 0.0).to(torch.float32)
         planes = [network_union]
-        if self.track_conf:
+        if self.compute_confidence:
             planes.append(F.interpolate(
                 slot.conf_proto.reshape(1, 1, ph, pw),
                 size=(int(self.out_size), int(self.out_size)), mode='nearest',
@@ -2002,7 +2010,7 @@ class _ResidentTensorRTRingExecutor:
         native_refs = [cp.asarray(plane) for plane in planes]
         self.kernels.upsample_quantize(
             ((int(self.native_w) + 31) // 32, (int(self.native_h) + 7) // 8), (32, 8),
-            (native_refs[0], native_refs[1] if self.track_conf else np.uintp(0),
+            (native_refs[0], native_refs[1] if self.compute_confidence else np.uintp(0),
              np.int32(self.native_h), np.int32(self.native_w),
              np.int32(self.native_h), np.int32(self.native_w), refs['native_union'],
              refs.get('native_conf', np.uintp(0)), bbox_arg), stream=external,
@@ -2379,6 +2387,7 @@ def _resident_trt_pipeline_signature(
     confidence_threshold: float,
     dynamic_unit_descriptors: bool,
     post_policy: str = 'legacy_proto',
+    retain_confidence: bool = False,
 ) -> Tuple[object, ...]:
     engine = _trt_engine_from_autobackend(backend)
     # TensorRT bindings depend on engine/profile/input shape, not on the destination
@@ -2390,7 +2399,7 @@ def _resident_trt_pipeline_signature(
         id(engine), str(input_dtype), int(input_channels), int(out_size),
         bool(track_conf), float(confidence_threshold),
         str(proto_hole_treatment_mode()), int(proto_hole_treatment_radius()),
-        str(post_policy),
+        str(post_policy), bool(retain_confidence),
     )
 
 def _resident_trt_pipeline_invalidate(backend: object, reason: Optional[BaseException] = None) -> None:
@@ -2462,6 +2471,7 @@ def _resident_trt_pipeline_acquire(
     collect_slice_bboxes: bool,
     dynamic_unit_descriptors: bool,
     post_policy: str = 'legacy_proto',
+    retain_confidence: bool = False,
 ) -> Tuple['_ResidentTensorRTRingExecutor', bool]:
     """Acquire the actual executor, not merely its two render slots."""
     persist = bool(resident_trt_pipeline_persistence_enabled())
@@ -2475,6 +2485,7 @@ def _resident_trt_pipeline_acquire(
         confidence_threshold=float(confidence_threshold),
         dynamic_unit_descriptors=bool(dynamic_unit_descriptors),
         post_policy=str(post_policy),
+        retain_confidence=bool(retain_confidence),
     )
     stale: Optional[Dict[str, object]] = None
     with _RESIDENT_TRT_PIPELINE_CACHE_LOCK:
@@ -2510,6 +2521,7 @@ def _resident_trt_pipeline_acquire(
                     native_h=int(native_h), native_w=int(native_w),
                     M_out_to_native=np.asarray(M_out_to_native, dtype=np.float32),
                     dynamic_unit_descriptors=bool(dynamic_unit_descriptors),
+                    retain_confidence=bool(retain_confidence),
                 )
             else:
                 executor.configure_slice_bbox_collection(bool(collect_slice_bboxes))
@@ -2547,6 +2559,7 @@ def _resident_trt_pipeline_acquire(
         dynamic_unit_descriptors=(bool(dynamic_unit_descriptors)
                                   if post_policy == 'native_mask' else True),
         post_policy=str(post_policy),
+        retain_confidence=bool(retain_confidence),
     )
     if persist:
         with _RESIDENT_TRT_PIPELINE_CACHE_LOCK:
@@ -2769,7 +2782,8 @@ def _try_resident_trt_ring_accumulate(
             native_h=int(native_h),
             native_w=int(native_w),
             M_out_to_native=matrix,
-            track_conf=device_union.conf_dev is not None,
+            track_conf=bool(getattr(device_union, 'track_conf', device_union.conf_dev is not None)),
+            retain_confidence=bool(getattr(device_union, 'retain_confidence', False)),
             confidence_threshold=float(threshold),
             collect_slice_bboxes=getattr(device_union, 'slice_bboxes_dev', None) is not None,
             dynamic_unit_descriptors=bool(dynamic_descriptors),
@@ -4956,6 +4970,7 @@ def backproject_tilted_volume_to_volume(
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
     out_shape_tyx: Optional[Tuple[int, int, int]] = None,
+    scalar_max: bool = False,
 ) -> np.ndarray:
     """Backproject a Tilted volume into the requested source geometry.
     
@@ -5005,6 +5020,7 @@ def backproject_tilted_volume_to_volume(
                 reserve_bytes=int(reserve_bytes),
                 workers=int(workers),
                 out_shape_tyx=None,
+                scalar_max=bool(scalar_max),
             )
             target_shape = tuple(int(v) for v in out_shape_tyx)
             restored_mm = allocate_workspace_array(
@@ -5020,9 +5036,14 @@ def backproject_tilted_volume_to_volume(
                 # Local import keeps the package dependency graph acyclic.
                 from .outputs import _read_layer_slice_in_output_shape
 
-                restored_mm[int(z_idx), :, :] = _read_layer_slice_in_output_shape(
-                    reduced_mm, target_shape, int(z_idx),
-                )
+                if scalar_max:
+                    from .confidence_projection import read_score_slice_in_output_shape
+                    restored_mm[int(z_idx), :, :] = read_score_slice_in_output_shape(
+                        reduced_mm, target_shape, int(z_idx))
+                else:
+                    restored_mm[int(z_idx), :, :] = _read_layer_slice_in_output_shape(
+                        reduced_mm, target_shape, int(z_idx),
+                    )
 
             parallel_for_indices_chunked(
                 int(target_shape[0]),
@@ -5084,6 +5105,10 @@ def backproject_tilted_volume_to_volume(
     stack_len = tilted_stack_axis_length(tilted_view)
 
     worker_count = choose_slice_parallel_workers(int(workers), int(tilted_view.num_slices))
+    if scalar_max:
+        # Several frames may hit the same destination. Numeric max must serialize
+        # those writes; the ordinary binary scatter keeps its existing schedule.
+        worker_count = 1
 
     def _map_axis_to_out(idx_arr: np.ndarray, in_len: int, out_len: int) -> np.ndarray:
         # union-biased floor scaling from working-grid indices to source indices
@@ -5176,7 +5201,10 @@ def backproject_tilted_volume_to_volume(
         flat = ti.astype(np.int64, copy=False) * plane_stride
         flat += yi.astype(np.int64, copy=False) * np.int64(out_w)
         flat += xi.astype(np.int64, copy=False)
-        vol_flat_scatter[flat] = np.uint8(1)
+        if scalar_max:
+            np.maximum.at(vol_flat_scatter, flat, frame_arr[vv_v, uu_v])
+        else:
+            vol_flat_scatter[flat] = np.uint8(1)
 
     parallel_for_indices_chunked(
         int(tilted_view.num_slices),

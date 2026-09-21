@@ -705,6 +705,8 @@ def main() -> None:
             pass
         _ACTIVE_PIPELINE_RUN_RESOURCES = None
         configure_component_replay_capture(None)
+        from .confidence_evidence import configure_confidence_evidence
+        configure_confidence_evidence(None, enabled=False)
         configure_pipeline_modes(fast_bundle_active=False, d1_pipeline_active=False)
         _PIPELINE_RUN_LOCK.release()
 
@@ -828,10 +830,15 @@ def _main_impl() -> None:
             cpu_model_path = resolved_path
 
     from .tta_augmentation_config import resolve_tta_augmentation
+    from .reconciliation_policy import resolve_reconciliation, load_reconciliation_policy
     try:
         policy_settings = resolve_tta_augmentation(
             args, gpu_devices=backend_devices.gpu_devices, cpu_enabled=backend_devices.cpu,
         )
+        reconciliation_settings = resolve_reconciliation(args)
+        reconciliation_policy = (load_reconciliation_policy(reconciliation_settings)
+                                 if reconciliation_settings.enabled else None)
+        args.reconciliation_retain_confidence = reconciliation_settings.enabled
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
     augmentation_support_records: List[Dict[str, object]] = []
@@ -1294,12 +1301,16 @@ def _main_impl() -> None:
     # expensive per-view decomposition and projected-layer behavior. audit-only
     # runs need a sink but must not broaden any of those paths.
     nrrd_layers_needed = bool(save_nrrd_enabled)
+    component_layers_needed = bool(nrrd_layers_needed or reconciliation_settings.enabled)
     centerline_audit_nrrd_needed = bool(centerline_filter_enabled)
     nrrd_sink_needed = bool(nrrd_layers_needed or centerline_audit_nrrd_needed)
     keep_temp_artifacts = False
 
     out_dir = Path(args.output).expanduser().resolve() if args.output else (Path.cwd() / input_path.stem)
     out_dir.mkdir(parents=True, exist_ok=True)
+    from .confidence_evidence import configure_confidence_evidence
+    configure_confidence_evidence(out_dir, enabled=args.reconciliation_retain_confidence,
+                                  min_conf=float(args.min_conf))
 
     unified_launch_at_start = current_unified_launch()
     tta_artifact_identities: Optional[Dict[str, object]] = None
@@ -1772,6 +1783,13 @@ def _main_impl() -> None:
     )
     cartesian_views = orthogonal_views_only(physical_views)
     inference_views = list(views)
+    if reconciliation_settings.enabled:
+        from .reconciliation_runtime import preflight_reconciliation
+        reconciliation_preflight = preflight_reconciliation(
+            inference_views, source_shape_tyx=(int(input_T), int(input_H), int(input_W)),
+            processing_shape_tyx=(int(T), int(H), int(W)), settings=reconciliation_settings,
+            policy=reconciliation_policy)
+        write_json_manifest(out_dir / 'reconciliation' / 'preflight.json', reconciliation_preflight)
     interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolation_distance))]
 
     # A tilted_* Azimuthal token expands to every concrete signed/directional Tilted variant.
@@ -1927,7 +1945,7 @@ def _main_impl() -> None:
     ) = resolve_parent_postprocess_worker_allocation(
         worker_budget=int(worker_budget),
         views=inference_views,
-        nrrd_layers_enabled=bool(nrrd_layers_needed),
+        nrrd_layers_enabled=bool(component_layers_needed),
         interpolation_enabled=bool(len(interpolating_views) > 0),
     )
     (
@@ -2724,13 +2742,14 @@ def _main_impl() -> None:
                 prefer_memory=bool(union_prefer_memory),
                 prefer_memfd=bool(process_worker_direct_union),
             )
-            if float(args.min_conf) > 0.0:
+            if float(args.min_conf) > 0.0 or bool(getattr(args, 'reconciliation_retain_confidence', False)):
                 conf_mm = allocate_workspace_array(
                     shape=processing_shape,
                     dtype=np.uint8,
                     path=confmap_path,
                     desc=f'{model_name}/{view.name} baseline confidence workspace',
-                    prefer_memory=not process_worker_direct_union and not policy_settings.enabled,
+                    prefer_memory=(not process_worker_direct_union and not policy_settings.enabled
+                                   and not bool(getattr(args, 'reconciliation_retain_confidence', False))),
                     prefer_memfd=bool(process_worker_direct_union),
                 )
         except BaseException:
@@ -2786,7 +2805,7 @@ def _main_impl() -> None:
             dense_volume_count = (2 if conf_mm is not None else 1)
             if bool(dense_tiling_active):
                 dense_volume_count += 1
-                if bool(nrrd_layers_needed):
+                if bool(component_layers_needed):
                     dense_volume_count += 2
             backing_bytes = int(dense_volume_bytes) * int(dense_volume_count)
             direct_union_backing_leases[key] = _DirectUnionBackingLease(
@@ -2922,7 +2941,7 @@ def _main_impl() -> None:
                         keep_temp=bool(keep_temp_artifacts),
                         slice_workers=int(parent_slice_postprocess_workers),
                         interpolation_task_workers=int(parent_interpolation_task_workers),
-                        nrrd_layers_enabled=bool(nrrd_layers_needed),
+                        nrrd_layers_enabled=bool(component_layers_needed),
                         precleaned_slice_cleanup=bool(angle_variant_streaming_cleanup_active),
                         hole_fill_done_on_device=bool(hole_fill_done_on_device),
                         slice_meta=slice_meta_holder,
@@ -2935,7 +2954,7 @@ def _main_impl() -> None:
                         ),
                         internal_final_layer_enabled=bool(
                             component_ref_dense_retirement_active
-                            and not nrrd_layers_needed
+                            and not component_layers_needed
                         ),
                         retire_dense_after_prepare=bool(
                             component_ref_dense_retirement_active
@@ -3449,7 +3468,7 @@ def _main_impl() -> None:
         if not bool(component_ref_dense_retirement_active):
             _mark_view_variant_terminal(str(model_name), str(view_name))
             return
-        if bool(nrrd_layers_needed):
+        if bool(component_layers_needed):
             _retire_parent_dense_view(
                 str(model_name),
                 str(view_name),
@@ -3495,7 +3514,7 @@ def _main_impl() -> None:
         acc = tile_accumulator_by_set.get(set_key)
         if acc is None:
             empty_view = view_infos_by_name[str(view_name)]
-            if bool(nrrd_layers_needed) and bool(empty_view.augmentation_base_view):
+            if bool(component_layers_needed) and bool(empty_view.augmentation_base_view):
                 from .assembly import materialize_empty_policy_layer
                 nrrd_layer_refs.append(materialize_empty_policy_layer(
                     model_name=str(model_name), view=empty_view, source='tile',
@@ -3527,7 +3546,7 @@ def _main_impl() -> None:
             keep_temp=bool(keep_temp_artifacts),
             slice_workers=int(tile_slice_postprocess_workers),
             interpolation_task_workers=int(tile_interpolation_task_workers),
-            nrrd_layers_enabled=bool(nrrd_layers_needed),
+            nrrd_layers_enabled=bool(component_layers_needed),
             tile_parent_mask_accumulator_mm=tile_parent_mask_accumulator_by_set.get(set_key),
             tile_parent_bridge_accumulator_mm=tile_parent_bridge_accumulator_by_set.get(set_key),
             # A parent-level terminal task materializes this only after every configured
@@ -3611,7 +3630,7 @@ def _main_impl() -> None:
             str(result.model_name), str(result.view_name), str(result.config_id),
         )
         tile_parent_mask_accumulator_mm = None
-        if bool(nrrd_layers_needed):
+        if bool(component_layers_needed):
             tile_parent_mask_accumulator_mm = _get_tile_category_accumulator(
                 str(result.model_name), str(result.view_name),
                 str(result.config_id), 'parent_mask',
@@ -3696,7 +3715,7 @@ def _main_impl() -> None:
             str(result.model_name), str(result.view_name), str(result.config_id),
         )
         tile_parent_bridge_accumulator_mm = None
-        if bool(nrrd_layers_needed):
+        if bool(component_layers_needed):
             tile_parent_bridge_accumulator_mm = _get_tile_category_accumulator(
                 str(result.model_name), str(result.view_name),
                 str(result.config_id), 'parent_bridge',
@@ -4495,7 +4514,7 @@ def _main_impl() -> None:
             min_radius=float(args.min_radius),
             keep_temp_artifacts=bool(keep_temp_artifacts),
             dense_tiling_active=bool(dense_tiling_active),
-            nrrd_layers_needed=bool(nrrd_layers_needed),
+            nrrd_layers_needed=bool(component_layers_needed),
             direct_union_sparse_retirement_active=bool(
                 direct_union_sparse_retirement_active
             ),
@@ -4679,6 +4698,8 @@ def _main_impl() -> None:
 
         worker_init = {
             'augmentation_settings': policy_settings,
+            'reconciliation_retain_confidence': bool(getattr(args, 'reconciliation_retain_confidence', False)),
+            'reconciliation_min_conf': float(args.min_conf),
             'imgsz': int(args.imgsz), 'conf': float(args.conf),
             'quantize': resolve_quantize(args.gpu_quantize), 'batch': max(1, int(args.gpu_batch)),
             'channel_format': channel_format,
@@ -5090,7 +5111,8 @@ def _main_impl() -> None:
                     result_mode = 'direct_union'
                 else:
                     rmask = gpu_worker_result_dir / f'{prefix}__c{chunk_idx}.mask.u8.dat'
-                    rconf = (gpu_worker_result_dir / f'{prefix}__c{chunk_idx}.conf.u8.dat') if float(args.min_conf) > 0.0 else None
+                    rconf = (gpu_worker_result_dir / f'{prefix}__c{chunk_idx}.conf.u8.dat') if (
+                        float(args.min_conf) > 0.0 or bool(getattr(args, 'reconciliation_retain_confidence', False))) else None
                     result_mode = 'file'
                 task = {
                     'task_id': int(next_task_id), 'kind': str(kind), 'model_name': str(model_name),
@@ -5343,8 +5365,9 @@ def _main_impl() -> None:
             gpu_worker_tasks_by_id.values(),
             total_dense_limit=int(direct_union_total_dense_byte_limit),
             min_conf=float(args.min_conf), dense_tiling=bool(dense_tiling_active),
-            nrrd_layers=bool(nrrd_layers_needed),
+            nrrd_layers=bool(component_layers_needed),
             bounded_retirement=bool(direct_union_sparse_retirement_active),
+            retain_confidence=bool(getattr(args, 'reconciliation_retain_confidence', False)),
         )
         plan_native_publication_memory(
             gpu_worker_tasks_by_id.values(), keep_temp=bool(keep_temp_artifacts),
@@ -5596,6 +5619,11 @@ def _main_impl() -> None:
     pending_azimuthal_padding_by_parent: Dict[
         Tuple[str, str], List[Tuple[Dict[str, object], Dict[str, object]]]
     ] = {}
+    pending_d1_confidence_by_parent: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
+    d1_confidence_futures: List[Future] = []
+    d1_confidence_executor = (
+        _create_tracked_thread_pool(max_workers=1, thread_name_prefix='confidence-evidence')
+        if bool(getattr(args, 'reconciliation_retain_confidence', False)) else None)
 
     def _merge_pending_azimuthal_padding_for_parent(model_name_s: str, view: ViewInfo) -> None:
         parent_key = (str(model_name_s), str(view.name))
@@ -5785,6 +5813,11 @@ def _main_impl() -> None:
             pending_azimuthal_padding_by_parent.setdefault(meta_key, []).append((task, stats))
         _accumulate_fullframe_slice_metadata(task, stats, view)
         if str(task.get('result_mode', 'file')) == 'd1_owner':
+            if bool(getattr(args, 'reconciliation_retain_confidence', False)):
+                shard = stats.get('d1_confidence_shard')
+                if not isinstance(shard, dict):
+                    raise RuntimeError(f'D1 task {meta_key} did not return retained confidence')
+                pending_d1_confidence_by_parent.setdefault(meta_key, []).append(dict(shard))
             complete = bool(stats.get('d1_view_complete', False))
             layer_ref = stats.get('d1_layer_ref')
             if layer_ref is not None:
@@ -5823,6 +5856,12 @@ def _main_impl() -> None:
                     raise RuntimeError(
                         f'D1 view {meta_key} exhausted its tasks without a finalized source-space cvol'
                     )
+                if d1_confidence_executor is not None:
+                    from .confidence_evidence import publish_confidence_shards
+                    shards = pending_d1_confidence_by_parent.pop(meta_key)
+                    d1_confidence_futures.append(d1_confidence_executor.submit(
+                        publish_confidence_shards, shards, view=view, model_name=model_name_s,
+                        temp_dir=temp_dir, output_shape=(int(input_T), int(input_H), int(input_W))))
                 shadow_required = bool(task.get('d1_view_shadow_required', False))
                 if shadow_required:
                     if meta_key not in d1_view_shadow_path_by_parent:
@@ -6308,13 +6347,13 @@ def _main_impl() -> None:
                     desc=f'{model_name}/{view.name}/{tile_job.tile_id} raw tile volume',
                     prefer_memory=True,
                 )
-                if float(args.min_conf) > 0.0:
+                if float(args.min_conf) > 0.0 or bool(getattr(args, 'reconciliation_retain_confidence', False)):
                     tile_conf_mm = allocate_workspace_array(
                         shape=tile_shape,
                         dtype=np.uint8,
                         path=tile_conf_path,
                         desc=f'{model_name}/{view.name}/{tile_job.tile_id} raw tile confidence workspace',
-                        prefer_memory=True,
+                        prefer_memory=not bool(getattr(args, 'reconciliation_retain_confidence', False)),
                     )
                     tile_conf_store_path: Optional[Path] = tile_conf_path
                 else:
@@ -6743,6 +6782,13 @@ def _main_impl() -> None:
     _drain_completed_prediction_accumulation_futures()
     _drain_completed_background_futures()
 
+    for confidence_future in d1_confidence_futures:
+        confidence_future.result()
+    if pending_d1_confidence_by_parent:
+        raise RuntimeError('D1 confidence evidence contains unfinished view leases')
+    if d1_confidence_executor is not None:
+        d1_confidence_executor.shutdown(wait=True)
+
     scheduler_result = scheduler.result()
     if scheduler.d1_owner_groups_requested():
         d1_summary = scheduler.d1_group_summary()
@@ -6975,7 +7021,7 @@ def _main_impl() -> None:
             out_path=temp_dir / 'final_union_volume.u8.dat',
             temp_dir=temp_dir,
             out_shape_tyx=source_output_shape_tyx,
-            enable_3d_void_fill=bool(args.enable_3d_void_fill),
+            enable_3d_void_fill=bool(args.enable_3d_void_fill and not reconciliation_settings.enabled),
             keep_temp=bool(keep_temp_artifacts),
             prefer_memory=True,
             workers=tail_slice_workers,
@@ -6986,23 +7032,34 @@ def _main_impl() -> None:
         print(
             '\n=== Final view union was assembled incrementally while inference was active ==='
         )
-        if bool(args.enable_3d_void_fill):
-            print('\n=== Optional 3D void fill after final global union ===')
-            discard_binary_volume_slice_metadata(final_union_mm)
-            final_void_dir = temp_dir / 'final_global_void_fill'
-            final_void_dir.mkdir(parents=True, exist_ok=True)
-            fill_3d_voids_inplace_streaming(
-                final_union_mm,
-                final_void_dir / 'final_union',
-                keep_temp=bool(keep_temp_artifacts),
-                prefer_memory=True,
-                reserve_bytes=16 * GIB,
-            )
-        else:
-            print(
-                '\n=== Optional 3D void fill disabled '
-                '(--postprocessing 3d_void_fill not selected) ==='
-            )
+
+    reconciliation_report = None
+    if reconciliation_settings.enabled:
+        print('\n=== Reconciling independent source-space evidence layers ===')
+        layer_sink = nrrd_layer_sink()
+        if layer_sink is not None:
+            layer_sink.wait()
+        from .reconciliation_runtime import reconcile_tta_layers
+        original_union = final_union_mm
+        final_union_mm, reconciliation_report = reconcile_tta_layers(
+            nrrd_layer_refs, views=inference_views,
+            source_shape_tyx=source_output_shape_tyx, processing_shape_tyx=(int(T), int(H), int(W)),
+            settings=reconciliation_settings, policy=reconciliation_policy,
+            output_dir=out_dir / 'reconciliation', workspace=temp_dir / 'reconciliation')
+        if streaming_final_union_holder.get(str(model_name)) is original_union:
+            streaming_final_union_holder[str(model_name)] = final_union_mm
+        close_memmap_array(original_union)
+
+    if bool(args.enable_3d_void_fill) and (streamed_final_union_mm is not None or reconciliation_settings.enabled):
+        print('\n=== Optional 3D void fill after final global union ===')
+        discard_binary_volume_slice_metadata(final_union_mm)
+        final_void_dir = temp_dir / 'final_global_void_fill'
+        final_void_dir.mkdir(parents=True, exist_ok=True)
+        fill_3d_voids_inplace_streaming(
+            final_union_mm, final_void_dir / 'final_union', keep_temp=bool(keep_temp_artifacts),
+            prefer_memory=True, reserve_bytes=16 * GIB)
+    elif not bool(args.enable_3d_void_fill):
+        print('\n=== Optional 3D void fill disabled (--postprocessing 3d_void_fill not selected) ===')
 
     if int(args.centerline_filter_passes) > 0:
         discard_binary_volume_slice_metadata(final_union_mm)
@@ -7147,6 +7204,11 @@ def _main_impl() -> None:
 
     final_output_volume_for_low_quality = output_volume_rgb
     final_paths: Dict[str, Path] = {}
+    if reconciliation_report is not None:
+        final_paths['reconciliation_manifest'] = out_dir / 'reconciliation' / 'manifest.json'
+        confidence_manifest = out_dir / 'reconciliation_evidence' / 'manifest.json'
+        if confidence_manifest.is_file():
+            final_paths['confidence_evidence_manifest'] = confidence_manifest
 
 
     native_final_outputs_requested = bool(
@@ -7454,6 +7516,12 @@ def _main_impl() -> None:
             },
             prediction_processing={
                 'owner': 'tta_only',
+                'reconciliation': (
+                    {'policy_path': reconciliation_settings.path, 'policy_sha256': reconciliation_settings.sha256,
+                     'name': reconciliation_report['policy']['name'],
+                     'stage': 'source_grid_before_global_postprocessing',
+                     'source_layers_preserved': True, 'retained_confidence': True}
+                    if reconciliation_report is not None else None),
                 'interpolation': {
                     'distance': int(args.interpolation_distance),
                     'walk_back': int(args.interpolation_walk_back),
@@ -7521,6 +7589,7 @@ def _main_impl() -> None:
     )
     def _finalize_selected_run_after_output_close() -> None:
         policy_settings.assert_unchanged()
+        reconciliation_settings.assert_unchanged()
         if run_manifest_path is not None:
             if run_manifest is None:  # pragma: no cover - paired construction invariant
                 raise RuntimeError('v18 TTA run manifest was not constructed')

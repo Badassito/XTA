@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, TimeoutError
 import json
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import PropertyMock, patch
@@ -119,11 +120,18 @@ def test_metadata_fallback_never_retains_partial_skip_information(problem):
 
 def _run_fixture(tmp_path, *, defer_task, defer_batches, blocked_tail=None):
     count, batch, size = 3, 2, 8
+    policy_path = tmp_path / 'retirement_policy.py'
+    policy_path.write_text(
+        "def build_gpu_augmentation():\n"
+        "    raise AssertionError('This fixture supplies a mocked worker policy')\n",
+        encoding='utf-8')
+    settings = TtaAugmentationSettings(ratio=2, coverage='none', gpu_path=str(policy_path),
+        gpu_sha256=hashlib.sha256(policy_path.read_bytes()).hexdigest())
     variants = expand_views_into_policy_variants(expand_views_into_tta_variants([
         ViewInfo('transverse', count, size, size, 'clamp', family='orthogonal')], [0]), 2)
     task = dict(task_id=1, view=variants[0], job_id='a0', kind='fullframe',
                 slice_count=count, slice_start=0,
-                augmentation_settings=TtaAugmentationSettings(ratio=2, coverage='none'),
+                augmentation_settings=settings,
                 augmentation_support_dir=str(tmp_path / 'support'))
     task['augmentation_pass_tasks'] = [dict(task, view=variants[1],
         result_mask_path=str(tmp_path / 'augmented.dat'), result_conf_path=None)]

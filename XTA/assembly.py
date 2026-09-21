@@ -377,6 +377,10 @@ def materialize_nrrd_view_layer(
     emit_empty: bool = False,
 ) -> Optional[NrrdLayerRef]:
     """Persist a view-derived layer in orthogonal processing geometry for the NRRD writer."""
+    if str(source) == 'tile' and str(mask_kind) == 'yolo':
+        from .confidence_tiles import capture_consolidated_tile_confidence
+        capture_consolidated_tile_confidence(view_volume_mm, view=view, model_name=model_name,
+            config_id=tile_config_id, category=tile_acceptance, stage=stage, temp_dir=temp_dir)
     if bool(internal_packbits_store) and bool(submit_to_sink):
         raise ValueError('The internal packbits cvol format must not be submitted as NRRD output')
     if bool(emit_empty) and bool(view.augmentation_base_view):
@@ -1522,8 +1526,10 @@ def prepare_view_volume_after_fullframe(
     parent_bridge_support_mm: Optional[object] = None
     parent_mask_support_path: Optional[Path] = None
     parent_bridge_support_path: Optional[Path] = None
+    from .confidence_evidence import confidence_evidence_enabled
     fused_azimuthal_components = bool(
         fuse_azimuthal_component_layers
+        and not confidence_evidence_enabled()
         and not bool(view.augmentation_base_view)
         and nrrd_layers_enabled
         and str(view.family) == 'azimuthal'
@@ -1599,12 +1605,18 @@ def prepare_view_volume_after_fullframe(
         known_slice_bboxes=(meta_slice_bboxes if hole_metadata_valid else None),
     )
 
-    close_memmap_array(confmap_mm)
-    if confmap_path is not None and not keep_temp:
-        try:
-            confmap_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+    try:
+        from .confidence_evidence import capture_prediction_confidence
+        if not preinterpolation_layer_already_published:
+            capture_prediction_confidence(
+                baseline_native_volume, confmap_mm, view=view, model_name=model_name, temp_dir=temp_dir)
+    finally:
+        close_memmap_array(confmap_mm)
+        if confmap_path is not None and not keep_temp:
+            try:
+                confmap_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     if bool(d1_delta_only) and not bool(d1_component_refs_only):
         d1_additions_path = (
@@ -2268,6 +2280,8 @@ def gate_raw_bbox_tile_store_against_parent_mask(
     store = result.tile_mask_store
     if store is None:
         raise ValueError('Sparse parent tile gate requires tile_mask_store')
+    from .confidence_tiles import record_tile_confidence_gate
+    record_tile_confidence_gate(result, parent_mask_support_mm, 'parent_mask')
     py0, py1, px0, px1 = (int(v) for v in result.parent_crop)
     support_shape = _volume_shape_tuple(parent_mask_support_mm)
     if tuple(int(v) for v in tile_accumulator_mm.shape) != support_shape:
@@ -2414,6 +2428,8 @@ def gate_raw_bbox_tile_store_against_parent_bridge(
     store = result.tile_mask_store
     if store is None:
         raise ValueError('Sparse bridge tile gate requires tile_mask_store')
+    from .confidence_tiles import record_tile_confidence_gate
+    record_tile_confidence_gate(result, parent_bridge_support_mm, 'parent_bridge')
     py0, py1, px0, px1 = (int(v) for v in result.parent_crop)
     support_shape = _volume_shape_tuple(parent_bridge_support_mm)
     if tuple(int(v) for v in tile_accumulator_mm.shape) != support_shape:
@@ -2537,12 +2553,17 @@ def postprocess_tile_volume_after_inference(
         threshold_plane_shape=task.threshold_plane_shape,
     )
 
-    close_memmap_array(task.tile_confmap_mm)
-    if task.tile_confmap_path is not None and not keep_temp:
-        try:
-            task.tile_confmap_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+    try:
+        from .confidence_tiles import capture_tile_confidence
+        capture_tile_confidence(task, view=view,
+            work_dir=Path(sparse_retire_dir) if sparse_retire_dir is not None else Path(task.tile_mask_path).parent)
+    finally:
+        close_memmap_array(task.tile_confmap_mm)
+        if task.tile_confmap_path is not None and not keep_temp:
+            try:
+                task.tile_confmap_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     if not _volume_has_foreground(task.tile_mask_mm):
         close_memmap_array(task.tile_mask_mm)
@@ -2753,6 +2774,8 @@ def gate_tile_result_against_parent_mask(
             tile_parent_mask_accumulator_locks=tile_parent_mask_accumulator_locks,
         )
 
+    from .confidence_tiles import record_tile_confidence_gate
+    record_tile_confidence_gate(result, parent_mask_support_mm, 'parent_mask')
     gate_stats = gate_tile_components_against_support_inplace(
         dense_tile,
         parent_mask_support_mm,
@@ -2835,6 +2858,8 @@ def gate_tile_residual_against_parent_bridge(
         )
 
     try:
+        from .confidence_tiles import record_tile_confidence_gate
+        record_tile_confidence_gate(result, parent_bridge_support_mm, 'parent_bridge')
         gate_stats = gate_tile_components_against_support_inplace(
             dense_tile,
             parent_bridge_support_mm,

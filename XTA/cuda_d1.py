@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import os
 import re
@@ -17,6 +18,7 @@ from concurrent.futures import (
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
+    Callable,
     Dict,
     Iterable,
     List,
@@ -1499,6 +1501,89 @@ def _d1_prepare_bbox_launch_plan(
         launch_groups.append((bucket_blocks, int(first), int(stop - first)))
         first = int(stop)
     return specs, launch_groups, int(scanned_bbox_pixels)
+
+
+def _d1_write_task_confidence(task: Mapping[str, object], accumulator: object) -> Dict[str, object]:
+    """Retire one native-view score shard without allocating a source score volume."""
+    from .confidence_evidence import write_confidence_evidence
+
+    scores = getattr(accumulator, 'conf_dev', None)
+    masks = getattr(accumulator, 'union_dev', None)
+    if scores is None or masks is None:
+        raise RuntimeError('D1 confidence retention requires live task score and mask tensors')
+    shape = tuple(int(value) for value in scores.shape)
+    if len(shape) != 3 or shape != tuple(int(value) for value in masks.shape):
+        raise ValueError('D1 confidence score and mask task geometry differ')
+    view = task.get('view')
+    if not isinstance(view, ViewInfo):
+        raise TypeError('D1 confidence task is missing ViewInfo metadata')
+    first = int(task.get('slice_start', 0))
+    count = int(task.get('slice_count', shape[0]))
+    if min(shape) <= 0 or count != shape[0] or first < 0 or first + count > int(view.num_slices):
+        raise ValueError('D1 confidence shard is outside its native view slice range')
+    written = getattr(accumulator, 'written', None)
+    if written is None or np.asarray(written).shape != (count,) or not bool(np.all(written)):
+        raise RuntimeError('D1 confidence retention received incomplete task score slices')
+    store_path = str(task.get('d1_store_dir', '') or '').strip()
+    if not store_path:
+        raise ValueError('D1 confidence task has no publication workspace')
+    store = Path(store_path)
+    model_name = str(task.get('model_name', ''))
+    model_token = hashlib.sha256(model_name.encode('utf-8')).hexdigest()[:16]
+    shard_path = (store.parent / (store.name + '_confidence_tasks') / model_token
+                  / f'{first:09d}_{first + count:09d}')
+    key = _nrrd_layer_key(
+        view_name=view.name, source='fullframe', mask_kind='yolo',
+        pass_index=0, stage='pre_interpolation',
+    )
+
+    def read_plane(index: int) -> np.ndarray:
+        # All producer streams were synchronized by predict_source_and_accumulate
+        # before its consumer callback. Transfer just one score/mask plane, with
+        # owned host storage; the caller's tensors and binary masks are immutable.
+        score_plane = scores[index].detach().cpu().numpy()
+        mask_plane = masks[index].detach().cpu().numpy()
+        if score_plane.dtype != np.uint8 or mask_plane.dtype != np.uint8:
+            raise TypeError('D1 confidence retirement requires uint8 score and mask tensors')
+        result = np.array(score_plane, dtype=np.uint8, copy=True)
+        result[mask_plane == 0] = np.uint8(0)
+        return result
+
+    started = time.perf_counter()
+    reference = write_confidence_evidence(
+        shard_path, shape, read_plane, layer_key=key, model_name=model_name,
+        provenance={
+            'coordinate_space': 'native_view_processing',
+            'slice_start': first, 'slice_count': count,
+            'view_name': str(view.name),
+            'view_shape_tyx': [int(view.num_slices), shape[1], shape[2]],
+            'task_id': task.get('task_id'),
+        },
+    )
+    return {
+        'protocol': 'xta.d1.native-confidence.v1',
+        'path': str(reference.path),
+        'shape_tyx': list(shape),
+        'slice_start': first, 'slice_count': count,
+        'view_shape_tyx': [int(view.num_slices), shape[1], shape[2]],
+        'view_name': str(view.name), 'model_name': model_name, 'layer_key': key,
+        'output_shape_tyx': list(task.get('d1_output_shape') or
+                                 (int(view.full_t), int(view.full_h), int(view.full_w))),
+        'known_voxels': int(reference.metadata['known_voxels']),
+        'publication_seconds': max(0.0, time.perf_counter() - started),
+    }
+
+
+def _consume_device_union_with_confidence(task: Mapping[str, object], accumulator: object,
+                                        consumer: Callable[[object], Optional[Dict[str, object]]]) -> Dict[str, object]:
+    """Preserve native scores before a legacy or radial owner releases its task."""
+    shard = None
+    if bool(getattr(accumulator, 'retain_confidence', False)):
+        shard = _d1_write_task_confidence(task, accumulator)
+    result = dict(consumer(accumulator) or {})
+    if shard is not None:
+        result['d1_confidence_shard'] = shard
+    return result
 
 
 def _d1_consume_device_union(

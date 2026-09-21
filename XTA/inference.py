@@ -1990,15 +1990,18 @@ class _DeviceUnionAccumulator:
         native_w: int,
         want_conf: bool,
         collect_slice_bboxes: bool = False,
+        retain_confidence: bool = False,
     ) -> None:
         self.torch = torch_mod
         self.device = device
+        self.track_conf = bool(want_conf)
+        self.retain_confidence = bool(retain_confidence)
         self.union_dev = torch_mod.zeros(
             (int(num_frames), int(native_h), int(native_w)), dtype=torch_mod.uint8, device=device,
         )
         self.conf_dev = (
             torch_mod.zeros((int(num_frames), int(native_h), int(native_w)), dtype=torch_mod.uint8, device=device)
-            if bool(want_conf) else None
+            if bool(want_conf or retain_confidence) else None
         )
         # device-compacted generic payloads write one scalar per slice. Static/legacy
         # payloads leave zero here and continue returning their host-known stats normally.
@@ -2448,6 +2451,7 @@ def _try_create_device_union_accumulator(
     *,
     want_conf: bool,
     collect_slice_bboxes: bool = False,
+    retain_confidence: bool = False,
 ) -> Optional[_DeviceUnionAccumulator]:
     """Build the per-task device union when VRAM allows; None -> per-frame D2H."""
     if not gpu_device_union_enabled():
@@ -2458,7 +2462,7 @@ def _try_create_device_union_accumulator(
             return None
         device = torch.device(str(device_str))
         need = (
-            int(num_frames) * int(native_h) * int(native_w) * (2 if bool(want_conf) else 1)
+            int(num_frames) * int(native_h) * int(native_w) * (2 if bool(want_conf or retain_confidence) else 1)
             + (int(num_frames) * 4 * 4 if bool(collect_slice_bboxes) else 0)
         )
         free_bytes, _total = torch.cuda.mem_get_info(device)
@@ -2472,6 +2476,7 @@ def _try_create_device_union_accumulator(
             int(native_w),
             bool(want_conf),
             collect_slice_bboxes=bool(collect_slice_bboxes),
+            retain_confidence=bool(retain_confidence),
         )
     except Exception:
         return None
@@ -2496,7 +2501,7 @@ def _process_gpu_flattened_prediction_frame(
     if union_gpu is None:
         return int(instance_count), 0
 
-    track_conf = view_confmap_mm is not None
+    track_conf = view_confmap_mm is not None or bool(getattr(device_union, 'retain_confidence', False))
     native_union_np: Optional[np.ndarray] = None
     native_conf_np: Optional[np.ndarray] = None
     cleaned_on_gpu = False
@@ -4015,6 +4020,7 @@ def predict_source_and_accumulate(
     azimuthal_padding_union_mm: Optional[np.ndarray] = None,
     azimuthal_padding_confmap_mm: Optional[np.ndarray] = None,
     owned_disjoint_output: bool = False,
+    retain_confidence: bool = False,
 ) -> Dict[str, object]:
     """Run YOLO predict(stream=True) on an in-memory source and accumulate native masks.
 
@@ -4034,7 +4040,9 @@ def predict_source_and_accumulate(
     )
     from .backprojection import _try_resident_trt_ring_accumulate
 
-    set_gpu_flatten_conf_tracking(view_confmap_mm is not None)
+    from .confidence_evidence import confidence_evidence_enabled
+    retain_confidence = bool(retain_confidence or confidence_evidence_enabled())
+    set_gpu_flatten_conf_tracking(view_confmap_mm is not None or retain_confidence)
     ensure_yolo_ready_for_predict(model, cfg)
     source_channels = _source_prediction_channel_count(source, cfg)
     if int(source_channels) != int(cfg.input_channels):
@@ -4141,8 +4149,9 @@ def predict_source_and_accumulate(
             device_union = _try_create_device_union_accumulator(
                 canonical_single_device(str(cfg.device)),
                 int(num_frames), int(native_h), int(native_w),
-                want_conf=view_confmap_mm is not None,
+                want_conf=(view_confmap_mm is not None and (not retain_confidence or stream_min_conf > 0.0)),
                 collect_slice_bboxes=device_union_consumer is not None,
+                retain_confidence=bool(retain_confidence),
             )
             if device_union is not None and getattr(source, '_tta_announce_prediction', True):
                 print(

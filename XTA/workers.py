@@ -118,6 +118,7 @@ from .cuda_d1 import (
     D1GroupReductionFallbackRequired,
     _d1_backproject_kernels,
     _d1_consume_device_union,
+    _consume_device_union_with_confidence,
     _d1_materialize_group_partial_host,
     _d1_reduce_group_partials,
     _d1_release_group_partial,
@@ -1687,9 +1688,13 @@ def run_prediction_volume_in_worker(
                 device_hole_fill=bool(task.get('device_hole_fill', False)),
                 defer_device_union_flush=bool(gpu_union_flush_overlap_enabled()),
                 device_union_consumer=(
-                    (lambda accumulator: (
-                        consume_radial_device_union(task, accumulator, target=result_mask) if is_radial_owner_task(task)
-                        else _d1_consume_device_union(task, accumulator)))
+                    (lambda accumulator: _consume_device_union_with_confidence(
+                        task, accumulator,
+                        lambda retained: (
+                            consume_radial_device_union(task, retained, target=result_mask)
+                            if is_radial_owner_task(task) else _d1_consume_device_union(task, retained)
+                        ),
+                    ))
                     if str(task.get('result_mode', 'file')) == 'd1_owner' else None
                 ),
                 require_device_union=bool(str(task.get('result_mode', 'file')) == 'd1_owner'),
@@ -1830,6 +1835,7 @@ def run_prediction_volume_in_worker(
             'd1_group_id', 'd1_group_rank', 'd1_group_size',
             'd1_group_worker_id', 'd1_group_participant_complete',
             'd1_group_partial_artifact', 'd1_group_ipc_export_error',
+            'd1_confidence_shard',
         ):
             if d1_key in stats:
                 public_stats[d1_key] = stats[d1_key]
@@ -2053,6 +2059,11 @@ def _gpu_inference_worker_main(
         configure_pipeline_modes(
             fast_bundle_active=bool(init_dict.get('fast_bundle_active', False)),
             d1_pipeline_active=bool(init_dict.get('d1_pipeline_active', False)),
+        )
+        from .confidence_evidence import configure_confidence_evidence_worker
+        configure_confidence_evidence_worker(
+            enabled=bool(init_dict.get('reconciliation_retain_confidence', False)),
+            min_conf=float(init_dict.get('reconciliation_min_conf', 0.0)),
         )
         initialize_runtime_observability()
         # pin every thread of this worker to its GPU's NUMA node BEFORE any

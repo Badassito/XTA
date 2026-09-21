@@ -10,8 +10,8 @@ from collections.abc import Iterator, Sequence
 from .unification.context import activate_unified_launch
 
 
-SCRIPT_VERSION = "22.2.0"
-SCRIPT_BASENAME = "GPT-6-Astra-Ultra_v22.2.0_SLURM.py"
+SCRIPT_VERSION = "22.3.0"
+SCRIPT_BASENAME = "GPT-6-Astra-Ultra_v22.3.0_SLURM.py"
 MODE_CHOICES = ("tta", "pta", "lta")
 
 
@@ -96,9 +96,11 @@ def _run_tta(arguments: Sequence[str]) -> None:
     parsed = parser.parse_args(mode_arguments)
     from .config import resolve_backend_devices
     from .tta_augmentation_config import resolve_tta_augmentation
+    from .reconciliation_policy import resolve_reconciliation
     try:
         devices = resolve_backend_devices(parsed.device)
         resolve_tta_augmentation(parsed, gpu_devices=devices.gpu_devices, cpu_enabled=devices.cpu)
+        resolve_reconciliation(parsed)
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
 

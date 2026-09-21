@@ -179,7 +179,8 @@ def _processing_index(native: np.ndarray, native_count: int, processing_count: i
                       processing_count - 1)
 
 
-def _pull_spherical_chunk(source, view, radii, rotation, output_shape, z, first, stop, bboxes=None):
+def _pull_spherical_chunk(source, view, radii, rotation, output_shape, z, first, stop, bboxes=None,
+                          *, scalar_max=False):
     """Evaluate one flattened source XY strip without any retained 3D map."""
     out_t, out_h, out_w = output_shape
     work_t, work_h, work_w = int(view.full_t), int(view.full_h), int(view.full_w)
@@ -216,7 +217,8 @@ def _pull_spherical_chunk(source, view, radii, rotation, output_shape, z, first,
         inside = ((pr >= boxes[:, 0]) & (pr < boxes[:, 1])
                   & (pc >= boxes[:, 2]) & (pc < boxes[:, 3]))
         positions, shell, pr, pc = (a[inside] for a in (positions, shell, pr, pc))
-    result[positions] = np.asarray(source[shell, pr, pc] != 0, dtype=np.uint8)
+    values = np.asarray(source[shell, pr, pc])
+    result[positions] = values if scalar_max else np.asarray(values != 0, dtype=np.uint8)
     return result
 
 

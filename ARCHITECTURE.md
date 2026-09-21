@@ -3,7 +3,7 @@
 XTA provides test-time augmentation (TTA), pretraining augmentation (PTA), and
 label-time augmentation (LTA) for volumes. The implementation lives in the
 importable `XTA` package. The versioned launcher
-`GPT-6-Astra-Ultra_v22.2.0_SLURM.py`, installed `xta` command, and `python -m XTA`
+`GPT-6-Astra-Ultra_v22.3.0_SLURM.py`, installed `xta` command, and `python -m XTA`
 all enter `XTA.cli.run()`.
 
 This document describes implemented behavior, ownership, and operating controls.
@@ -50,6 +50,33 @@ additional filesystem space throughout the run. Memory-backed scratch or output
 also charges those retained files against RAM. Keeping temporary artifacts disables
 bounded retirement and preserves the aggregate file-mode memory guard.
 
+`--reconciliation POLICY.py` applies an external evidence policy to independent
+source-space component layers before global postprocessing. The additive source
+layers remain available; only the derived final mask changes. The reference
+policies live in `XTA/examples/external_reconciliation`. They combine positive
+support with provenance weights, geometry-based correlation caps, bounded island
+weights and retained prediction confidence. The ordinary union policy reproduces
+additive recomposition. A policy snapshot, source hash, group/weight decisions and
+retained/rejected counts are written to `reconciliation/manifest.json`.
+
+Reconciliation runs retain source-aligned confidence sidecars under
+`reconciliation_evidence`. Values are uint8 maxima of observed detector instance
+scores; zero is unknown. They are separate from binary masks and are not voxel
+probabilities. Collection is independent of cleanup thresholds and preserves the
+existing CPU/GPU, resident D1 and tile mask paths. D1 workers retire bounded native
+score shards, and numeric source projection uses max reduction over the existing
+categorical address mappings. Prediction scores are captured before interpolation;
+bridges retain explicit provenance instead of acquiring fabricated confidence.
+The NRRD manifests record stable layer and model identities for later joins.
+
+The numerical reconciliation engine has no inference or Slicer dependency.
+It reads bounded TYX slabs. Exact six-connected island statistics retain only
+the active slab frontier; correlation groups combine repeated files before
+weight normalization. Section orientation bins and shared sphere/cylinder
+groups cap correlated support rather than treating each patch as a separate
+vote. These grouping heuristics and retained/rejected counts do not establish
+false-positive accuracy. Global checkpoints and audit deltas are excluded.
+
 ## Execution model
 
 | Mode | Input and purpose | Execution and publication |
@@ -82,6 +109,8 @@ All module names below are relative to `XTA`.
 | Model execution | `inference`, `inference_backends`, `cuda_backend`: backend contracts, model execution, mask payloads, and resident CUDA rendering |
 | TTA scheduling | `pipeline`, `tta_scheduler`, `tta_prediction`, `tta_lifecycle`: preparation, process admission, source staging, and run-resource ownership |
 | TTA external policies | `augmentation_policy`, `tta_augmentation_config`, `tta_augmentation`, `tta_augmentation_cuda`, `tta_augmentation_retirement`, `tta_augmentation_runtime`: shared policy identity, seed scopes, fused conservative inverse maps, and bounded render-once policy fan-out with asynchronous support retirement |
+| TTA reconciliation | `reconciliation_policy`, `reconciliation`, `reconciliation_components`, `reconciliation_geometry`, `reconciliation_io`, `reconciliation_runtime`: external policy identity, bounded voting and grouped island statistics, immutable layer readers and source-grid integration |
+| Confidence evidence | `confidence_evidence`, `confidence_projection`, `confidence_tiles`: sparse score sidecars, categorical-address max projection, and score provenance through accepted tile gates |
 | TTA completion | `assembly`, `tta_terminal`, `tta_outputs`: view/tile assembly, physical-view terminal fusion, and settled-artifact teardown |
 | Sparse components | `interpolation`, `topology`, `topology_runs`, `projection_queue`: interpolation, component membership/adjacency, and bounded projection handoff |
 | CUDA component work | `cuda_interpolation`, `cuda_d1`, `cuda_finalization`: bridge painting/radius work, owner-GPU bitsets, and distributed finalization contracts |

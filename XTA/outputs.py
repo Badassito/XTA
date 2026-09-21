@@ -3356,6 +3356,8 @@ class NrrdLayerSink:
             segment_color = self._segment_color_for_suffix(unique_suffix)
             manifest_entry: Dict[str, object] = {
                 'filename': out_path.name,
+                'layer_key': getattr(ref, 'key', ''),
+                'model_name': getattr(ref, 'model_name', ''),
                 'suffix': unique_suffix,
                 'view_name': getattr(ref, 'view_name', ''),
                 'physical_view_name': getattr(ref, 'physical_view_name', ''),
@@ -3406,6 +3408,8 @@ class NrrdLayerSink:
                 lq_mirror_args.append((lq_shape, lq_path))
                 lq_manifest_entry: Dict[str, object] = {
                     'filename': lq_path.name,
+                    'layer_key': getattr(ref, 'key', ''),
+                    'model_name': getattr(ref, 'model_name', ''),
                     'suffix': unique_suffix,
                     'view_name': getattr(ref, 'view_name', ''),
                     'physical_view_name': getattr(ref, 'physical_view_name', ''),

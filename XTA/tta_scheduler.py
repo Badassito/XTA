@@ -1788,7 +1788,8 @@ class TtaScheduler:
         if len(shape) != 3:
             view_obj = task['view']
             shape = self.operations.view_processing_volume_shape(view_obj, int(task.get('out_size', self.inputs.imgsz)))
-        dense_volume_count = 2 if float(self.inputs.min_conf) > 0.0 else 1
+        from .confidence_evidence import confidence_evidence_enabled
+        dense_volume_count = 2 if float(self.inputs.min_conf) > 0.0 or confidence_evidence_enabled() else 1
         if bool(self.inputs.dense_tiling_active):
             dense_volume_count += 1
             if bool(self.inputs.nrrd_layers_needed):

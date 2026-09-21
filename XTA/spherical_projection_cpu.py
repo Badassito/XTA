@@ -25,7 +25,7 @@ def _pull_spherical_f64(source, radii, rotation, boxes, use_boxes,
                         out_t, out_h, out_w, work_t, work_h, work_w,
                         face, intervals, origin_u, origin_v, native_h, native_w,
                         minimum, maximum, z, first, stop,
-                        rectangle_width=0, rectangle_x=0, rectangle_y=0):
+                        rectangle_width=0, rectangle_x=0, rectangle_y=0, scalar_max=False):
     result = np.zeros(stop - first, dtype=np.uint8)
     dz = ((float(z) + .5) * work_t / out_t - .5) - (work_t - 1) / 2.0
     source_h, source_w = source.shape[1], source.shape[2]
@@ -110,7 +110,7 @@ def _pull_spherical_f64(source, radii, rotation, boxes, use_boxes,
         if use_boxes and (pr < boxes[shell, 0] or pr >= boxes[shell, 1]
                           or pc < boxes[shell, 2] or pc >= boxes[shell, 3]):
             continue
-        result[offset] = np.uint8(source[shell, pr, pc] != 0)
+        result[offset] = np.uint8(source[shell, pr, pc]) if scalar_max else np.uint8(source[shell, pr, pc] != 0)
     return result
 
 
@@ -147,7 +147,7 @@ def _spherical_cpu_kernel_arguments(source, view, radii, rotation, output_shape,
         out_t, out_h, out_w, int(view.full_t), int(view.full_h), int(view.full_w),
         int(view.spherical_face), int(view.spherical_face_intervals),
         int(view.spherical_u_origin), int(view.spherical_v_origin), int(view.src_h), int(view.src_w),
-        float(view.spherical_min_radius), float(view.spherical_max_radius), z, first, stop, 0, 0, 0,
+        float(view.spherical_min_radius), float(view.spherical_max_radius), z, first, stop, 0, 0, 0, False,
     )
 
 
@@ -168,7 +168,8 @@ def prepare_spherical_chunk_numba(source, view, radii, rotation, output_shape, b
     return pull_spherical_chunk_numba
 
 
-def pull_spherical_chunk_numba(source, view, radii, rotation, output_shape, z, first, stop, bboxes=None):
+def pull_spherical_chunk_numba(source, view, radii, rotation, output_shape, z, first, stop, bboxes=None,
+                               *, scalar_max=False):
     """Evaluate one validated projection strip; never copy the borrowed mask.
 
     The projection owner validates the complete view/radius/bbox contract before
@@ -178,11 +179,11 @@ def pull_spherical_chunk_numba(source, view, radii, rotation, output_shape, z, f
     if _compiled_pull_spherical_f64 is None:
         raise SphericalCpuProjectionUnavailable(_dispatcher_unavailable_reason)
     arguments = _spherical_cpu_kernel_arguments(source, view, radii, rotation, output_shape, z, first, stop, bboxes)
-    return _compiled_pull_spherical_f64(*arguments)
+    return _compiled_pull_spherical_f64(*arguments[:-1], bool(scalar_max))
 
 
 def pull_spherical_rectangle_numba(source, view, radii, rotation, output_shape, z, first, stop,
-                                  bboxes=None, *, bounds_yx):
+                                  bboxes=None, *, bounds_yx, scalar_max=False):
     """Pull a flattened rectangle while retaining global output voxel centers."""
     if _compiled_pull_spherical_f64 is None:
         raise SphericalCpuProjectionUnavailable(_dispatcher_unavailable_reason)
@@ -194,7 +195,7 @@ def pull_spherical_rectangle_numba(source, view, radii, rotation, output_shape, 
         raise ValueError('Compiled Spherical rectangle is outside its source grid')
     # The same fully explicit signature was compiled at admission. Geometry and
     # scalar floating-point arithmetic are shared with the original flat path.
-    return _compiled_pull_spherical_f64(*arguments[:-5], first, stop, x1 - x0, x0, y0)
+    return _compiled_pull_spherical_f64(*arguments[:-6], first, stop, x1 - x0, x0, y0, bool(scalar_max))
 
 
 pull_spherical_chunk_numba.rectangle = pull_spherical_rectangle_numba

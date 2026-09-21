@@ -62,7 +62,7 @@ def policy_cpu_worker_buffer_plan(*, worker_count, cache_mib, batch_size, out_si
 
 def native_fullframe_dense_reserve(tasks, *, total_dense_limit, min_conf=0.,
                                    dense_tiling=False, nrrd_layers=False,
-                                   bounded_retirement=True):
+                                   bounded_retirement=True, retain_confidence=False):
     """Charge admitted native parents separately from packed D1 publication grants.
 
     Policy groups share the retirement window only when every parent is
@@ -73,7 +73,7 @@ def native_fullframe_dense_reserve(tasks, *, total_dense_limit, min_conf=0.,
     """
     parents = {}
     policy_groups = {}
-    count = (2 if float(min_conf) > 0 else 1) + (
+    count = (2 if float(min_conf) > 0 or retain_confidence else 1) + (
         (3 if nrrd_layers else 1) if dense_tiling else 0)
     has_policy_groups = False
     for grouped_task in tasks:

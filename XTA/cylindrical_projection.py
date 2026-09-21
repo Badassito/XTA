@@ -292,7 +292,7 @@ def _radial_projection_metadata(view, source_shape, output_shape, plan):
 
 def _gather_radial_pixel(source, shells, offsets, columns, sampled, row_map, column_map,
                          p, stack, ideal_shear, stack_length, height_origin, native_height,
-                         bboxes, use_bboxes):
+                         bboxes, use_bboxes, scalar_max=False):
     shell = shells[p]
     if shell < 0:
         return np.uint8(0)
@@ -301,6 +301,7 @@ def _gather_radial_pixel(source, shells, offsets, columns, sampled, row_map, col
     ideal_height = stack - ideal_shear
     if ideal_height < 0.0 or ideal_height > stack_length - 1:
         return np.uint8(0)
+    best_score = np.uint8(0)
     for at in range(offsets[p], offsets[p + 1]):
         column = columns[at]
         height = stack - sampled[shell, column]
@@ -313,14 +314,16 @@ def _gather_radial_pixel(source, shells, offsets, columns, sampled, row_map, col
                            or pc < bboxes[shell, 2] or pc >= bboxes[shell, 3]):
             continue
         if source[shell, pr, pc] != 0:
-            return np.uint8(1)
-    return np.uint8(0)
+            if not scalar_max:
+                return np.uint8(1)
+            best_score = max(best_score, np.uint8(source[shell, pr, pc]))
+    return best_score
 
 
 def _project_radial_block(source, shells, offsets, columns, sampled, row_map, column_map,
                           stack_centers, ideal_axis, stack_length, height_origin, native_height,
                           base_id, vertical, plane_width, out_h, out_w, first_z, count,
-                          bboxes, use_bboxes):
+                          bboxes, use_bboxes, scalar_max=False):
     result = np.zeros((count, out_h, out_w), np.uint8)
     for dz in range(count):
         z = first_z + dz
@@ -335,7 +338,7 @@ def _project_radial_block(source, shells, offsets, columns, sampled, row_map, co
                 result[dz, y, x] = _gather_radial_pixel(
                     source, shells, offsets, columns, sampled, row_map, column_map,
                     p, stack_centers[stack_index], ideal_axis[v if vertical else u],
-                    stack_length, height_origin, native_height, bboxes, use_bboxes,
+                    stack_length, height_origin, native_height, bboxes, use_bboxes, scalar_max,
                 )
     return result
 
@@ -556,6 +559,8 @@ def _pull_radial_chunk(
     z: int,
     first: int,
     stop: int,
+    *,
+    scalar_max: bool = False,
 ) -> np.ndarray:
     """Project one bounded, flattened source-coordinate XY strip."""
     out_t, out_h, out_w = output_shape
@@ -614,9 +619,12 @@ def _pull_radial_chunk(
             if np.any(inside):
                 proc_row = _processing_index(rows[inside], int(view.src_h), int(source.shape[1]))
                 proc_col = int(_processing_index(np.asarray(column), width, int(source.shape[2])))
-                result[tiny_positions[inside]] |= np.asarray(
-                    source[local_shell[tiny][inside], proc_row, proc_col] != 0, dtype=np.uint8,
-                )
+                values = np.asarray(source[local_shell[tiny][inside], proc_row, proc_col])
+                if scalar_max:
+                    selected = tiny_positions[inside]
+                    result[selected] = np.maximum(result[selected], values)
+                else:
+                    result[tiny_positions[inside]] |= np.asarray(values != 0, dtype=np.uint8)
     ordinary = ~tiny
     if not np.any(ordinary):
         return result
@@ -637,10 +645,12 @@ def _pull_radial_chunk(
         if np.any(active):
             proc_row = _processing_index(rows[active], int(view.src_h), int(source.shape[1]))
             proc_column = _processing_index(column[active], width, int(source.shape[2]))
-            result[positions[active]] |= np.asarray(
-                source[local_shell[active], proc_row, proc_column] != 0,
-                dtype=np.uint8,
-            )
+            values = np.asarray(source[local_shell[active], proc_row, proc_column])
+            if scalar_max:
+                selected = positions[active]
+                result[selected] = np.maximum(result[selected], values)
+            else:
+                result[positions[active]] |= np.asarray(values != 0, dtype=np.uint8)
         column_float += period
     return result
 
