@@ -109,7 +109,8 @@ class D1ConfidenceRetentionTests(unittest.TestCase):
                     self.assertIs(value, accumulator)
                     paths = list(Path(directory).rglob('metadata.json'))
                     self.assertEqual(len(paths), 1)
-                    actual, known = ConfidenceEvidenceRef.open(paths[0].parent).read(0, 3)
+                    with ConfidenceEvidenceRef.open(paths[0].parent).native_reader() as reader:
+                        actual, known = reader(0, 3)
                     expected = np.where(masks != 0, scores, 0)
                     np.testing.assert_array_equal(actual, expected)
                     np.testing.assert_array_equal(known, expected > 0)
@@ -156,7 +157,7 @@ class D1ConfidenceRetentionTests(unittest.TestCase):
                 with self.subTest(invalid=invalid), self.assertRaises((ValueError, TypeError)):
                     cuda_d1._d1_write_task_confidence({**task, **invalid}, accumulator)
             consumer = mock.Mock()
-            with mock.patch('XTA.confidence_evidence.write_confidence_evidence', side_effect=OSError('disk failure')):
+            with mock.patch('XTA.confidence_evidence.write_block_confidence_evidence', side_effect=OSError('disk failure')):
                 with self.assertRaisesRegex(OSError, 'disk failure'):
                     cuda_d1._consume_device_union_with_confidence(task, accumulator, consumer)
             consumer.assert_not_called()

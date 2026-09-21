@@ -14,9 +14,9 @@ from XTA import cli, config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRENT_VERSION = "22.3.0"
-CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v22.3.0_SLURM.py"
-PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v22.2.0_SLURM.py"
+CURRENT_VERSION = "22.3.1"
+CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v22.3.1_SLURM.py"
+PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v22.3.0_SLURM.py"
 SCRATCH_REPORTS = (
     "TTA_EXTERNAL_AUGMENTATION.md",
     "TTA_TEST_CLI_AUDIT.md",
@@ -36,7 +36,7 @@ class PackageMetadataTests(unittest.TestCase):
     def test_runtime_version_constants_are_aligned(self) -> None:
         self.assertEqual(XTA.__version__, CURRENT_VERSION)
         self.assertEqual(config.SCRIPT_VERSION, CURRENT_VERSION)
-        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2230")
+        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2231")
         self.assertEqual(config.SCRIPT_BASENAME, CURRENT_LAUNCHER)
         self.assertEqual(cli.SCRIPT_VERSION, CURRENT_VERSION)
         self.assertEqual(cli.SCRIPT_BASENAME, CURRENT_LAUNCHER)
@@ -62,6 +62,7 @@ class PackageMetadataTests(unittest.TestCase):
             self.assertNotIn(report, data_files)
         self.assertIn('"tools/hgx_selftest.py"', data_files)
         self.assertIn('"tools/compare_reconciliation.py"', data_files)
+        self.assertIn('"tools/export_reconciliation_evidence.py"', data_files)
         self.assertIn('"tools/qualify_tta_reconciliation.py"', data_files)
         self.assertIn('"tools/replay_component_projection.py"', data_files)
         self.assertIn('"tools/certify_qsc_lipschitz.py"', data_files)
@@ -157,7 +158,8 @@ class PackageMetadataTests(unittest.TestCase):
                              "native/README.md", "native/README_QAT.md", "native/README_QPL.md",
                              "XTA/examples/external_augmentations/README.md",
                              "XTA/examples/external_reconciliation/README.md",
-                             "tools/compare_reconciliation.py", "tools/qualify_tta_reconciliation.py"):
+                             "tools/compare_reconciliation.py", "tools/qualify_tta_reconciliation.py",
+                             "tools/export_reconciliation_evidence.py"):
                     with self.subTest(member=name):
                         expected = (ROOT / name).read_bytes()
                         self.assertEqual(source.read(prefix + name), expected)

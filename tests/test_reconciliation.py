@@ -160,7 +160,7 @@ class ReconciliationTests(unittest.TestCase):
     def test_policy_files_load_and_hash_guard(self):
         root = Path(__file__).resolve().parents[1] / 'XTA/examples/external_reconciliation'
         for path in root.glob('*.py'):
-            if path.name == '__init__.py':
+            if path.name.startswith('_'):
                 continue
             settings = resolve_reconciliation(SimpleNamespace(reconciliation=path, reconciliation_memory_mib=8))
             policy = load_reconciliation_policy(settings)

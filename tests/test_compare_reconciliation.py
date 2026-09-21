@@ -90,12 +90,12 @@ def test_real_core_comparison_excludes_checkpoint_and_preserves_inputs(tmp_path)
     manifest, a, b, root = saved_run(tmp_path)
     before = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob("*") if p.is_file()}
     output = tmp_path / "comparison"
-    report = compare([manifest], [POLICIES / "union.py", POLICIES / "cross_sections.py", POLICIES / "largest_island.py"],
+    report = compare([manifest], [POLICIES / "union.py", POLICIES / "quorum3.py", POLICIES / "largest_island.py"],
                      output, memory_mib=8, previews=False, progress=lambda _: None)
     dataset = report["datasets"][0]
     methods = {method["policy_name"]: method for method in dataset["methods"]}
     np.testing.assert_array_equal(decoded(methods["union"]["output"]), a | b)
-    np.testing.assert_array_equal(decoded(methods["cross_sections"]["output"]), a & b)
+    np.testing.assert_array_equal(decoded(methods["quorum3"]["output"]), np.zeros_like(a))
     np.testing.assert_array_equal(decoded(methods["largest_island"]["output"]), a & b)
     assert methods["union"]["candidate_voxels"] == int(np.count_nonzero(a | b))
     assert dataset["additive_layer_count"] == 2
@@ -110,7 +110,7 @@ def test_real_core_comparison_excludes_checkpoint_and_preserves_inputs(tmp_path)
 
 def test_confidence_unavailable_is_explicit_and_union_reference_is_added(tmp_path):
     manifest, a, b, _ = saved_run(tmp_path)
-    report = compare([manifest], [POLICIES / "confidence_voxel.py"], tmp_path / "comparison", memory_mib=8,
+    report = compare([manifest], [POLICIES / "confidence_anchored.py"], tmp_path / "comparison", memory_mib=8,
                      previews=False, progress=lambda _: None)
     methods = report["datasets"][0]["methods"]
     assert len(methods) == 2 and methods[0]["is_union_reference"]
@@ -124,7 +124,7 @@ def test_comparison_creates_readable_slice_and_roi_previews(tmp_path):
     pytest.importorskip("matplotlib")
     from PIL import Image
     manifest, _, _, _ = saved_run(tmp_path)
-    report = compare([manifest], [POLICIES / "cross_sections.py"], tmp_path / "comparison", memory_mib=8, progress=lambda _: None)
+    report = compare([manifest], [POLICIES / "quorum3.py"], tmp_path / "comparison", memory_mib=8, progress=lambda _: None)
     previews = report["datasets"][0]["previews"]
     assert len(previews["paths"]) == 2
     assert previews["slices"][0]["z"] == 2
@@ -170,9 +170,9 @@ def test_persisted_confidence_replays_after_registry_reset(tmp_path):
     evidence_root = saved_confidence(manifest, root, a, b)
     assert not _REGISTRY
     before = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in evidence_root.rglob("*") if p.is_file()}
-    report = compare([manifest], [POLICIES / "confidence_voxel.py"], tmp_path / "comparison", memory_mib=8,
+    report = compare([manifest], [POLICIES / "confidence_anchored.py"], tmp_path / "comparison", memory_mib=8,
                      previews=False, progress=lambda _: None)
-    method = next(m for m in report["datasets"][0]["methods"] if m["policy_name"] == "confidence_voxel")
+    method = next(m for m in report["datasets"][0]["methods"] if m["policy_name"] == "confidence_anchored")
     assert method["status"] == "complete"
     assert report["confidence_available"] is True
     assert report["datasets"][0]["confidence_evidence"]["matched_prediction_layers"] == 2
@@ -183,10 +183,10 @@ def test_persisted_confidence_replays_after_registry_reset(tmp_path):
 def test_confidence_grid_mismatch_is_reported_without_resizing(tmp_path):
     manifest, a, b, root = saved_run(tmp_path)
     saved_confidence(manifest, root, a, b, different_shape=True)
-    report = compare([manifest], [POLICIES / "confidence_voxel.py"], tmp_path / "comparison", memory_mib=8,
+    report = compare([manifest], [POLICIES / "confidence_anchored.py"], tmp_path / "comparison", memory_mib=8,
                      previews=False, progress=lambda _: None)
     dataset = report["datasets"][0]
-    method = next(m for m in dataset["methods"] if m["policy_name"] == "confidence_voxel")
+    method = next(m for m in dataset["methods"] if m["policy_name"] == "confidence_anchored")
     assert method["status"] == "unsupported_confidence_grid"
     assert "does not resize scores" in method["reason"]
     assert len(dataset["confidence_evidence"]["unsupported_grids"]) == 2
@@ -196,10 +196,78 @@ def test_confidence_grid_mismatch_is_reported_without_resizing(tmp_path):
 def test_confidence_requires_exact_model_and_layer_identity(tmp_path):
     manifest, a, b, root = saved_run(tmp_path)
     saved_confidence(manifest, root, a, b, different_model=True)
-    report = compare([manifest], [POLICIES / "confidence_voxel.py"], tmp_path / "comparison", memory_mib=8,
+    report = compare([manifest], [POLICIES / "confidence_anchored.py"], tmp_path / "comparison", memory_mib=8,
                      previews=False, progress=lambda _: None)
     dataset = report["datasets"][0]
-    method = next(m for m in dataset["methods"] if m["policy_name"] == "confidence_voxel")
+    method = next(m for m in dataset["methods"] if m["policy_name"] == "confidence_anchored")
     assert method["status"] == "unavailable"
     assert dataset["confidence_evidence"]["matched_prediction_layers"] == 0
     assert len(dataset["confidence_evidence"]["missing_prediction_layers"]) == 2
+
+
+def test_raw_output_is_retired_before_next_policy_and_previews_use_only_planes(tmp_path, monkeypatch):
+    import tools.compare_reconciliation as tool
+    manifest, a, b, _ = saved_run(tmp_path)
+    output = tmp_path / "comparison"
+    original_reconcile = tool.reconcile
+    original_previews = tool.write_previews
+    starts = []
+    def checked_reconcile(*args, **kwargs):
+        raw = list(output.rglob("*.uint8"))
+        assert len(raw) == 1
+        starts.append(raw[0].name)
+        return original_reconcile(*args, **kwargs)
+    def checked_previews(*args, **kwargs):
+        assert not list(output.rglob("*.uint8"))
+        planes = kwargs["preview_planes"]
+        assert len(planes) == 3
+        for selected in planes.values():
+            assert set(selected) == {1, 2}
+            for plane in selected.values():
+                assert plane.shape == a.shape[1:] and type(plane) is np.ndarray and plane.base is None
+        return original_previews(*args, **kwargs)
+    monkeypatch.setattr(tool, "reconcile", checked_reconcile)
+    monkeypatch.setattr(tool, "write_previews", checked_previews)
+    report = tool.compare([manifest], [POLICIES / "quorum3.py", POLICIES / "largest_island.py"],
+                          output, memory_mib=8, progress=lambda _: None)
+    assert len(starts) == 3
+    assert report["datasets"][0]["preview_retained_bytes"] == 3 * 2 * a[0].nbytes
+    assert "_raw_path" not in (output / "comparison.json").read_text()
+
+
+def test_policy_failure_removes_its_raw_output_map(tmp_path, monkeypatch):
+    import tools.compare_reconciliation as tool
+    manifest, _, _, _ = saved_run(tmp_path)
+    output = tmp_path / "comparison"
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected policy failure")
+    monkeypatch.setattr(tool, "reconcile", fail)
+    with pytest.raises(RuntimeError, match="injected policy failure"):
+        tool.compare([manifest], [POLICIES / "union.py"], output, memory_mib=8, previews=False)
+    assert not list(output.rglob("*.uint8"))
+
+
+def test_deferred_native_confidence_is_reported_without_implicit_projection(tmp_path, monkeypatch):
+    from XTA.confidence_evidence import ConfidenceEvidenceRef, write_block_confidence_evidence
+    manifest,a,b,root = saved_run(tmp_path)
+    data=json.loads(manifest.read_text())
+    entries=[]
+    for i,mask in enumerate((a,b)):
+        metadata=data["layers"][i]
+        metadata.update(model_name="model",layer_key=f"native_{i}")
+        directory=root/"reconciliation_evidence"/f"blocks_{i}"
+        ref=write_block_confidence_evidence(directory,mask.shape,lambda z,m=mask:m[z]*200,
+            model_name="model",layer_key=metadata["layer_key"],coordinate_space="native_view_processing",
+            source_shape_tyx=(8,10,12))
+        entries.append(dict(directory=directory.name,model_name=ref.model_name,layer_key=ref.layer_key,
+                            output_shape_tyx=list(ref.shape)))
+    manifest.write_text(json.dumps(data))
+    (root/"reconciliation_evidence/manifest.json").write_text(json.dumps(dict(schema="xta.confidence_evidence/1",layers=entries)))
+    def fail(*args,**kwargs):raise AssertionError("Comparison must not project native confidence implicitly")
+    monkeypatch.setattr(ConfidenceEvidenceRef,"source_reader",fail)
+    report=compare([manifest],[POLICIES/"confidence_anchored.py"],tmp_path/"comparison",memory_mib=8,
+                   previews=False,progress=lambda _:None)
+    methods=report["datasets"][0]["methods"]
+    assert methods[0]["status"]=="complete"
+    assert methods[1]["status"]=="native_confidence_requires_export"
+    assert len(report["datasets"][0]["confidence_evidence"]["deferred_native_layers"])==2

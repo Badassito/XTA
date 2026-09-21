@@ -55,7 +55,7 @@ class ConfidenceRetirementFailureTests(unittest.TestCase):
                 root, mask_path, score_path, mask, scores = self.buffers(f'fullframe{keep_temp}')
                 original = np.array(mask, copy=True)
                 failure = OSError('injected fullframe score publication failure')
-                with mock.patch('XTA.confidence_evidence.write_confidence_evidence', side_effect=failure):
+                with mock.patch('XTA.confidence_evidence.write_block_confidence_evidence', side_effect=failure):
                     with self.assertRaises(OSError) as caught:
                         assembly.prepare_view_volume_after_fullframe(
                             model_name='model', view=self.view, union_mm=mask, confmap_mm=scores,
@@ -78,7 +78,7 @@ class ConfidenceRetirementFailureTests(unittest.TestCase):
                     tile_mask_mm=mask, tile_confmap_mm=scores, tile_mask_path=mask_path,
                     tile_confmap_path=score_path, threshold_plane_shape=(6, 8))
                 failure = OSError('injected tile score publication failure')
-                with mock.patch('XTA.confidence_tiles.write_confidence_evidence', side_effect=failure):
+                with mock.patch('XTA.confidence_tiles.write_block_confidence_evidence', side_effect=failure):
                     with self.assertRaises(OSError) as caught:
                         assembly.postprocess_tile_volume_after_inference(task, view=self.view,
                             min_conf=0, min_radius=0, keep_temp=keep_temp, slice_workers=1,

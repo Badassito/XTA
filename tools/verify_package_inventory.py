@@ -104,6 +104,60 @@ REVIEWED_V22_1_RELEASE_PRESERVED_MODULES = {
 # before admitting the next release's explicit definition and statement changes.
 # Reconciliation succeeds the committed v22.2.0 release. The current-source
 # appendix is finalized only after runtime integration and qualification.
+REVIEWED_V22_3_1_RELEASE_PREDECESSOR_COMMIT = '300cda53b477bdc2263a80d53bb354dc2ea8df46'
+REVIEWED_V22_3_1_RELEASE_PREDECESSOR_SHA256 = 'bf3febad0753470694fa64f88990b72f24c7b45449ae41dca2beea43f49d82d0'
+REVIEWED_V22_3_1_RELEASE_SHA256 = 'eec49c4e92779677ecd87e9c129e0953fd90b5af75c408c216ba356f31544517'
+REVIEWED_V22_3_1_REMOVED_MODULES = frozenset(
+    'examples/external_reconciliation/' + name
+    for name in ('baseline', 'confidence_voxel', 'cross_sections', 'provenance')
+)
+REVIEWED_V22_3_1_RELEASE_PREDECESSOR_MODULES = {'__init__': {'ast_sha256': 'de03eb2ecb027167e9dfd9d7deeb9ccc8b601207feb50019294605dad11f9e7c',
+              'statements_sha256': '0fc64a281e52163c853bf62eb8d767d9babcd1e2eaa9c580e813d9e0a6d8fd31'},
+ 'cli': {'ast_sha256': '86c31c683fd688cd2259e2f062503e940d1f12867aaef155f23dead8ad88ea14',
+         'statements_sha256': 'c6545c14e3606d1b6fb08300b079088c5c9319fa288de3379e43dedc3535eef1'},
+ 'confidence_evidence': {'ast_sha256': '62d5b21eda07b3e0f8336c0b89eb5fba30ade52dfd8c51560287b567206c5669',
+                         'statements_sha256': 'e94647697f14d68d29a6a8514e1e9f560125d6a3de11bb1e779005f2ea854267'},
+ 'confidence_export': {'ast_sha256': None,
+                       'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'confidence_native': {'ast_sha256': None,
+                       'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'confidence_projection': {'ast_sha256': '19eeb18873384fe02688f88c338f682be6bea2b9e3478a89e7851ea2765d411b',
+                           'statements_sha256': 'bf0c5170a9341db9cb6be7eb21280083955c402106c3f2f5f6f38cd40374157e'},
+ 'confidence_storage': {'ast_sha256': None,
+                        'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'confidence_tiles': {'ast_sha256': '4af149e2c0f4d38a7c40d2a75ceea48b9bbd67b0d307f846af51fb407ddb37d2',
+                      'statements_sha256': 'ca0dfdd7a703687256089be0c8fcc367d6398858f63db266654001f64dae9107'},
+ 'config': {'ast_sha256': '499e31f052868c7830ae01e076a1af2f386b8a9a7535f1a61ca5a92a638bf0f1',
+            'statements_sha256': 'a717a9337c3778a87d67ef909bc29d17d2902325fdbae52b61277bfe6acf2440'},
+ 'cuda_backend': {'ast_sha256': '160b1ae6cc74fc3ed4cbfced2d28abe305af220e30766b3f52ad0a271710198c',
+                  'statements_sha256': '77b8f31a4a185035b5e9bc28bc462ffdb2743722451dbcba1fc531c3d121855c'},
+ 'cuda_d1': {'ast_sha256': '35c03de6d5939061d3c11fd0434306c39bf0c210fb088d2f07a7d7a153c28d6d',
+             'statements_sha256': 'a693251016163187b14911f473e6b0a7ade3090f4d00e129928f79f9bf49bca3'},
+ 'examples/external_reconciliation/_confidence_core': {'ast_sha256': None,
+                                                       'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'examples/external_reconciliation/_hybrid': {'ast_sha256': None,
+                                              'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'examples/external_reconciliation/baseline': {'ast_sha256': 'd0777f6975b4b026908d1126ca48edbba5a05dec629bd570e1d0753334de8ce5',
+                                               'statements_sha256': '07c73f1f43fa99220f314f33ae8afce8012507829f50b98909f068c1d14ff281'},
+ 'examples/external_reconciliation/confidence_core_rescue': {'ast_sha256': None,
+                                                             'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'examples/external_reconciliation/confidence_voxel': {'ast_sha256': '35db2625b59a6edc22b7c0f952409ed5187d6a8005408d154fa1a3e83deb6c41',
+                                                       'statements_sha256': 'e149a268eb90fc02ba16e60c50aa0f9e68560f3b505b076f4bf264f52ea29c03'},
+ 'examples/external_reconciliation/cross_sections': {'ast_sha256': '794269169c537ed32053d22fe8c00d40f4e26ad699502a2a562649b730f2a004',
+                                                     'statements_sha256': '18f1ef61f63fca226076671e2c5c98ed12b7a646bda66f1bd0d9a9d743f3eb34'},
+ 'examples/external_reconciliation/hybrid_with_fill': {'ast_sha256': None,
+                                                       'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'examples/external_reconciliation/provenance': {'ast_sha256': '4f9124ea026670b44b65549248af050e9e9b1ff85980e969d065861a7b864101',
+                                                 'statements_sha256': '570628c57aa8debde9ededc8beb982916156cb44f1d481256ee3dbd6384c394a'},
+ 'examples/external_reconciliation/quorum3': {'ast_sha256': None,
+                                              'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'packed_publication': {'ast_sha256': '753a5e91c5c20a37ee042449e204702f45f1d6dd051f4a597060ea2ad799f297',
+                        'statements_sha256': '724c3d46ff4ca4fe2562bc108cab0c17435eeb93ba8371d823d0a62f4d5e4457'},
+ 'pipeline': {'ast_sha256': 'd30f353ccab1960e8f6720fa337aedd86228164859db95d292dd6079510cf905',
+              'statements_sha256': '53bc9bcb1c158b09f34a823684d133a5e6d753cbeb549f925da430653c4f124b'},
+ 'reconciliation_runtime': {'ast_sha256': '0d1e014432ed7199c1252dba5acf74e1ca8d2e26460645c7fd029fe4ee53846c',
+                            'statements_sha256': '61f8c8f6301afd2071b63b85bdfe304e80a22eadc0fac530a8a51151b59153d7'}}
+
 REVIEWED_V22_3_RELEASE_PREDECESSOR_COMMIT = 'd336a66d75d7811a2c07d007ed40c46a2cfcfcb2'
 REVIEWED_V22_3_RELEASE_PREDECESSOR_SHA256 = '0ff675bc92f9d13147c0218ac87220bc67462ef690bcd986d609e827d1dcd3cc'
 REVIEWED_V22_3_RELEASE_SHA256 = '4941424abe38b58144d10692c2706dbd5785669c5183258ac817c0b5d9625ff1'
@@ -2119,8 +2173,116 @@ def _without_reviewed_v22_1_release(manifest: dict[str, object]) -> dict[str, ob
     return {name: value for name, value in manifest.items() if name != key}
 
 
+def reviewed_v22_3_1_release_contract(manifest, v21, *earlier_patches):
+    """Authenticate additions against the complete released inventory and sources."""
+    key = 'v22_3_1_release_review'
+    prior = {name: value for name, value in manifest.items() if name != key}
+    encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    if hashlib.sha256(encoded).hexdigest() != REVIEWED_V22_3_1_RELEASE_PREDECESSOR_SHA256:
+        raise RuntimeError('v22.3.1 predecessor inventory changed; preserve every historical record')
+    ordered_keys = (
+        *(f'v21_0_{index}_review' for index in range(1, 7)),
+        'v21_1_review', 'v21_1_1_review', 'v21_1_2_review',
+        'v22_augmentation_review', 'v22_coverage_review', 'v22_release_review',
+        'v22_policy_memory_review', 'v22_policy_throughput_review',
+        'v22_radial_retirement_review', 'v22_policy_window_review',
+        'v22_tilted_azimuthal_gpu_review', 'v22_pta_throughput_review', 'v22_1_release_review',
+        'v22_2_release_review', 'v22_3_release_review',
+    )
+    review = _reviewed_v21_patch_contract(
+        manifest, prior['v21_review'], key=key, release='22.3.1',
+        expected_digest=REVIEWED_V22_3_1_RELEASE_SHA256,
+        previous_digest=REVIEWED_V22_3_RELEASE_SHA256,
+        earlier_patches=tuple(prior[name] for name in ordered_keys),
+    )
+    if (review.get('predecessor_commit') != REVIEWED_V22_3_1_RELEASE_PREDECESSOR_COMMIT
+            or review.get('predecessor_inventory_sha256') != REVIEWED_V22_3_1_RELEASE_PREDECESSOR_SHA256
+            or review.get('feature') != 'efficient-union-and-native-confidence'):
+        raise RuntimeError('v22.3.1 review has an unexpected predecessor or source scope')
+    snapshots = review.get('module_snapshots', ())
+    modules = [item.get('module') for item in snapshots]
+    if len(modules) != len(set(modules)) or set(modules) != set(REVIEWED_V22_3_1_RELEASE_PREDECESSOR_MODULES):
+        raise RuntimeError('v22.3.1 source snapshot coverage differs')
+    removed = {item['module'] for item in snapshots if item.get('removed') is True}
+    if removed != REVIEWED_V22_3_1_REMOVED_MODULES:
+        raise RuntimeError('v22.3.1 reviewed module removals differ')
+    for item in snapshots:
+        module = item['module']
+        previous = REVIEWED_V22_3_1_RELEASE_PREDECESSOR_MODULES[module]
+        historical = item.get('previous_top_level', ())
+        historical_digest = hashlib.sha256(json.dumps(historical, separators=(',', ':')).encode()).hexdigest()
+        if (item.get('previous_ast_sha256') != previous['ast_sha256']
+                or historical_digest != previous['statements_sha256']):
+            raise RuntimeError(f'v22.3.1 source predecessor changed: {module}')
+        if module in removed:
+            if (item.get('ast_sha256') is not None or item.get('top_level') != []
+                    or previous['ast_sha256'] is None
+                    or module in review.get('complete_modules', ())
+                    or any(record['module'] == module for category in (
+                        'definitions', 'statements', 'local_import_seam_updates')
+                        for record in review.get(category, ()))):
+                raise RuntimeError(f'v22.3.1 removed module retains current source records: {module}')
+            digests = historical
+        else:
+            if 'removed' in item:
+                raise RuntimeError(f'v22.3.1 source snapshot has an invalid removal marker: {module}')
+            digests = (item.get('ast_sha256'), *historical, *item.get('top_level', ()))
+        for value in digests:
+            if not isinstance(value, str) or len(value) != 64 or any(char not in '0123456789abcdef' for char in value):
+                raise RuntimeError(f'v22.3.1 source snapshot has an invalid digest: {module}')
+        if not item.get('reason'):
+            raise RuntimeError(f'v22.3.1 source snapshot has no review reason: {module}')
+        positions = []
+        for record in review['definitions'] + review['statements']:
+            if record['module'] != module:
+                continue
+            current_index = record.get('current_index')
+            previous_index = record.get('previous_index')
+            if (type(current_index) is not int or not 0 <= current_index < len(item['top_level'])
+                    or item['top_level'][current_index] != record['sha256']):
+                raise RuntimeError(f'v22.3.1 statement position differs: {module}')
+            if previous_index is None:
+                if record['previous_sha256'] is not None:
+                    raise RuntimeError(f'v22.3.1 new statement has an unexpected predecessor: {module}')
+            elif (type(previous_index) is not int or not 0 <= previous_index < len(historical)
+                    or historical[previous_index] != record['previous_sha256']):
+                raise RuntimeError(f'v22.3.1 statement predecessor changed: {module}')
+            positions.append(current_index)
+        if len(positions) != len(set(positions)):
+            raise RuntimeError(f'v22.3.1 source has duplicate reviewed positions: {module}')
+    if any(record['module'] not in set(modules) for record in review['definitions'] + review['statements']):
+        raise RuntimeError('v22.3.1 statement has no complete source snapshot')
+    reviewed_radial_module_hashes(prior['v21_review'], (*tuple(prior[name] for name in ordered_keys), review))
+    reviewed_radial_definition_hashes(prior['v21_review'], (*tuple(prior[name] for name in ordered_keys), review))
+    validation_tools = review.get('validation_tools', ())
+    if [item.get('path') for item in validation_tools] != [
+            'tools/compare_reconciliation.py', 'tools/qualify_tta_reconciliation.py',
+            'tools/export_reconciliation_evidence.py']:
+        raise RuntimeError('v22.3.1 validation-tool review has missing or duplicate paths')
+    prior_tools = {item['path']: item['sha256'] for item in prior['v22_3_release_review']['validation_tools']}
+    for item in validation_tools:
+        if item.get('previous_sha256') != prior_tools.get(item['path']):
+            raise RuntimeError('v22.3.1 validation-tool predecessor changed')
+        value = item.get('sha256')
+        if (not item.get('reason') or not isinstance(value, str) or len(value) != 64
+                or any(char not in '0123456789abcdef' for char in value)):
+            raise RuntimeError('v22.3.1 validation-tool review has an invalid digest or reason')
+    return review
+
+
+def _without_reviewed_v22_3_1_release(manifest):
+    """Admit the authenticated performance successor before older keyset checks."""
+    key = 'v22_3_1_release_review'
+    if key not in manifest:
+        return manifest
+    reviewed_v22_3_1_release_contract(manifest, manifest['v21_review'])
+    return {name: value for name, value in manifest.items() if name != key}
+
+
+
 def reviewed_v22_3_release_contract(manifest, v21, *earlier_patches):
     """Authenticate additions against the complete released inventory and sources."""
+    manifest = _without_reviewed_v22_3_1_release(manifest)
     key = 'v22_3_release_review'
     prior = {name: value for name, value in manifest.items() if name != key}
     encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
@@ -2198,6 +2360,7 @@ def reviewed_v22_3_release_contract(manifest, v21, *earlier_patches):
 
 def _without_reviewed_v22_3_release(manifest):
     """Admit only the independently authenticated reconciliation successor."""
+    manifest = _without_reviewed_v22_3_1_release(manifest)
     key = 'v22_3_release_review'
     if key not in manifest:
         return manifest
@@ -2205,23 +2368,39 @@ def _without_reviewed_v22_3_release(manifest):
     return {name: value for name, value in manifest.items() if name != key}
 
 
-def verify_v22_3_source_snapshots(review, trees):
-    """Check all current source statements and their complete predecessor accounting."""
+def verify_v22_3_source_snapshots(review, trees, successors=()):
+    """Rewind authenticated successors before checking the release source snapshot."""
     for item in review['module_snapshots']:
         module = item['module']
-        if digest(trees[module]) != item['ast_sha256']:
-            raise RuntimeError(f'v22.3.0 reviewed source changed: {module}')
-        rewind_reviewed_statements(module, trees[module].body, (review,))
+        tree = trees.get(module)
+        actual = digest(tree) if tree is not None else None
+        for successor in reversed(successors):
+            update = next((record for record in successor.get('module_snapshots', ())
+                           if record['module'] == module), None)
+            if update is not None:
+                if actual != update['ast_sha256']:
+                    raise RuntimeError(f'v{review["release"]} reviewed source changed: {module}')
+                actual = update['previous_ast_sha256']
+        if actual != item['ast_sha256']:
+            raise RuntimeError(f'v{review["release"]} reviewed source changed: {module}')
+        rewind_reviewed_statements(module, tree.body if tree is not None else (), (review, *successors))
 
 
-def verify_v22_3_validation_tools(review):
-    """Authenticate the policy comparison and TTA qualification entry points."""
+def verify_v22_3_validation_tools(review, successors=()):
+    """Authenticate tool sources through explicit successor hash links."""
     for item in review['validation_tools']:
         path = ROOT / item['path']
+        expected = item['sha256']
+        for successor in successors:
+            update = next((record for record in successor.get('validation_tools', ())
+                           if record['path'] == item['path']), None)
+            if update is not None:
+                if update.get('previous_sha256') != expected:
+                    raise RuntimeError(f'v{review["release"]} validation tool changed: predecessor for {item["path"]}')
+                expected = update['sha256']
         if (not path.is_file()
-                or hashlib.sha256(path.read_text(encoding='utf-8').encode('utf-8')).hexdigest() != item['sha256']):
-            raise RuntimeError(f'v22.3.0 validation tool changed or is missing: {item["path"]}')
-
+                or hashlib.sha256(path.read_text(encoding='utf-8').encode('utf-8')).hexdigest() != expected):
+            raise RuntimeError(f'v{review["release"]} validation tool changed or is missing: {item["path"]}')
 
 
 def reviewed_v22_2_release_contract(manifest, v21, *earlier_patches):
@@ -2313,6 +2492,11 @@ def rewind_reviewed_statements(module, statements, successors):
         if snapshot is not None and 'top_level' in snapshot:
             if [value for _, value in current] != snapshot['top_level']:
                 raise RuntimeError(f'reviewed source statements changed: {module}')
+        if snapshot is not None and snapshot.get('removed') is True:
+            if current or records or snapshot.get('ast_sha256') is not None:
+                raise RuntimeError(f'reviewed removed module has current source: {module}')
+            current = [(None, value) for value in snapshot['previous_top_level']]
+            continue
         restored = []
         for node, value in current:
             record = by_hash.get(value)
@@ -2511,8 +2695,14 @@ def main() -> None:
     patches = (*patches, backend_release_review)
     reconciliation_release_review = (reviewed_v22_3_release_contract(manifest, v21, *patches)
                                      if 'v22_3_release_review' in manifest else None)
-    reconciliation_successors = ((reconciliation_release_review,) if reconciliation_release_review is not None else ())
+    performance_release_review = (reviewed_v22_3_1_release_contract(manifest, v21)
+                                  if 'v22_3_1_release_review' in manifest else None)
+    performance_successors = ((performance_release_review,) if performance_release_review is not None else ())
+    reconciliation_successors = (((reconciliation_release_review,) if reconciliation_release_review is not None else ())
+                                 + performance_successors)
     patches = (*patches, *reconciliation_successors)
+    removed_modules = {item['module'] for review in patches for item in review.get('module_snapshots', ())
+                       if item.get('removed') is True}
     patch_definitions = {
         (item['module'], item['name']): item for review in patches for item in review['definitions']
     }
@@ -2557,6 +2747,10 @@ def main() -> None:
     )
     for module in audited_modules:
         module_path = PACKAGE / f"{module}.py"
+        if module in removed_modules:
+            if module_path.exists():
+                raise RuntimeError(f'Reviewed removed module is still present: {module}')
+            continue
         module_source = module_path.read_text(encoding="utf-8")
         tree = ast.parse(module_source, filename=str(module_path))
         trees[module] = tree
@@ -2582,6 +2776,8 @@ def main() -> None:
         if len(matches) != 1 or digest(matches[0]) != patched_definition_hash(module, name, record['sha256']):
             raise RuntimeError(f'v21 reviewed definition changed or is missing: {module}.{name}')
     for (module, name), record in patch_definitions.items():
+        if module in removed_modules:
+            continue
         matches = [node for node in top_level[module] if getattr(node, 'name', None) == name]
         if len(matches) != 1 or digest(matches[0]) != record['sha256']:
             raise RuntimeError(f'v21 patch reviewed definition changed or is missing: {module}.{name}')
@@ -2594,12 +2790,14 @@ def main() -> None:
             item for item in effective_statements if (item['module'], item['sha256']) not in replaced_statements
         ] + review['statements']
     for item in effective_statements:
+        if item['module'] in removed_modules:
+            continue
         if available[item['module']][item['sha256']] != 1:
             raise RuntimeError(f'v21 reviewed statement changed or is missing: {item["module"]}.{item["label"]}')
     effective_definitions = {**v21_definitions, **patch_definitions}
     complete_modules = set(v21['complete_modules'])
     complete_modules.update(module for review in patches for module in review.get('complete_modules', ()))
-    for module in complete_modules:
+    for module in complete_modules - removed_modules:
         expected = Counter(item['sha256'] for item in list(effective_definitions.values()) + effective_statements if item['module'] == module)
         if available[module] != expected:
             raise RuntimeError(f'v21 complete-module statement coverage differs: {module}')
@@ -2607,8 +2805,11 @@ def main() -> None:
     verify_v22_1_release_scope(version_release_review, top_level, (backend_release_review, *reconciliation_successors))
     verify_v22_2_source_snapshots(backend_release_review, trees, reconciliation_successors)
     if reconciliation_release_review is not None:
-        verify_v22_3_source_snapshots(reconciliation_release_review, trees)
-        verify_v22_3_validation_tools(reconciliation_release_review)
+        verify_v22_3_source_snapshots(reconciliation_release_review, trees, performance_successors)
+        verify_v22_3_validation_tools(reconciliation_release_review, performance_successors)
+    if performance_release_review is not None:
+        verify_v22_3_source_snapshots(performance_release_review, trees)
+        verify_v22_3_validation_tools(performance_release_review)
     for module, expected_hash in reviewed_radial_module_hashes(v21, patches).items():
         source = (PACKAGE / f'{module}.py').read_text(encoding='utf-8')
         if hashlib.sha256(source.encode('utf-8')).hexdigest() != expected_hash:

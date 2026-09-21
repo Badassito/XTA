@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
+import time
 import numpy as np
 
 
@@ -108,11 +109,19 @@ def _project_tilted_azimuthal_scores(source, view, shape, path):
     flat = result.reshape(-1)
     points = plan.points
     angles, columns, shear_axis, fixed_a, fixed_b = points.T
+    started = time.perf_counter()
+    next_progress = started + 30.0
     for frame in range(plan.frame_count):
         rows = plan.rows[plan.row_offsets[frame]:plan.row_offsets[frame + 1]]
         if not len(rows):
             continue
         for first in range(0, len(points), 128 * 1024):
+            now = time.perf_counter()
+            if now >= next_progress:
+                print(f'Confidence tilted-Azimuthal projection progress {view.name}: '
+                      f'completed_frames={frame}/{plan.frame_count}, '
+                      f'frame_points={first}/{len(points)}, elapsed_s={now-started:.1f}.', flush=True)
+                next_progress = now + 30.0
             last = min(len(points), first + 128 * 1024)
             selected = slice(first, last)
             stacking = plan.stack_map[frame, shear_axis[selected]]

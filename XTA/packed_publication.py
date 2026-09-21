@@ -19,6 +19,51 @@ class PackedOwnerCrop:
 
 
 if _numba is not None:
+    from numba.extending import intrinsic as _intrinsic
+    from llvmlite import ir as _llvm_ir
+
+    @_intrinsic
+    def _packed_popcount32(typingctx, value):
+        signature = _numba.types.uint32(_numba.types.uint32)
+
+        def codegen(context, builder, signature, args):
+            function = builder.module.declare_intrinsic('llvm.ctpop', [_llvm_ir.IntType(32)])
+            return builder.call(function, args)
+
+        return signature, codegen
+
+    @_intrinsic
+    def _packed_trailing_zeros32(typingctx, value):
+        signature = _numba.types.uint32(_numba.types.uint32)
+
+        def codegen(context, builder, signature, args):
+            function = builder.module.globals.get('llvm.cttz.i32')
+            if function is None:
+                function = _llvm_ir.Function(
+                    builder.module,
+                    _llvm_ir.FunctionType(_llvm_ir.IntType(32), [_llvm_ir.IntType(32), _llvm_ir.IntType(1)]),
+                    name='llvm.cttz.i32',
+                )
+            return builder.call(function, [args[0], _llvm_ir.Constant(_llvm_ir.IntType(1), 0)])
+
+        return signature, codegen
+
+    @_intrinsic
+    def _packed_leading_zeros32(typingctx, value):
+        signature = _numba.types.uint32(_numba.types.uint32)
+
+        def codegen(context, builder, signature, args):
+            function = builder.module.globals.get('llvm.ctlz.i32')
+            if function is None:
+                function = _llvm_ir.Function(
+                    builder.module,
+                    _llvm_ir.FunctionType(_llvm_ir.IntType(32), [_llvm_ir.IntType(32), _llvm_ir.IntType(1)]),
+                    name='llvm.ctlz.i32',
+                )
+            return builder.call(function, [args[0], _llvm_ir.Constant(_llvm_ir.IntType(1), 0)])
+
+        return signature, codegen
+
     @_numba.njit(cache=True, nogil=True)
     def _packed_owner_metadata(words, height, width, first, count):
         meta = np.zeros((count, 5), np.int64)
@@ -27,26 +72,50 @@ if _numba is not None:
             for y in range(height):
                 start = ((first + zi) * height + y) * width
                 stop = start + width
-                at = start
-                while at < stop:
-                    shift = at % 32
-                    bits = min(32 - shift, stop - at)
-                    value = (np.uint64(words[at // 32]) >> np.uint64(shift)) & ((np.uint64(1) << np.uint64(bits)) - np.uint64(1))
+                a, b = (start + 31) // 32, stop // 32
+                row_count = np.int64(0)
+                row_x0, row_x1 = width, 0
+                # The source bitset is contiguous across rows, without row padding.
+                if start // 32 == (stop - 1) // 32:
+                    value = np.uint32(
+                        (np.uint64(words[start // 32]) >> np.uint64(start % 32))
+                        & ((np.uint64(1) << np.uint64(width)) - np.uint64(1))
+                    )
                     if value:
-                        # SWAR popcount: exact count without decoding 32 byte pixels.
-                        v = value - ((value >> np.uint64(1)) & np.uint64(0x55555555))
-                        v = (v & np.uint64(0x33333333)) + ((v >> np.uint64(2)) & np.uint64(0x33333333))
-                        v = (v + (v >> np.uint64(4))) & np.uint64(0x0f0f0f0f)
-                        foreground += np.int64(((v * np.uint64(0x01010101)) >> np.uint64(24)) & np.uint64(0xff))
-                        lo, hi = 0, bits - 1
-                        while not (value & (np.uint64(1) << np.uint64(lo))):
-                            lo += 1
-                        while not (value & (np.uint64(1) << np.uint64(hi))):
-                            hi -= 1
-                        x0 = min(x0, at - start + lo)
-                        x1 = max(x1, at - start + hi + 1)
-                        y0, y1 = min(y0, y), y + 1
-                    at += bits
+                        row_count = np.int64(_packed_popcount32(value))
+                        row_x0 = np.int64(_packed_trailing_zeros32(value))
+                        row_x1 = 32 - np.int64(_packed_leading_zeros32(value))
+                else:
+                    if start % 32:
+                        value = np.uint32(words[start // 32] >> np.uint32(start % 32))
+                        if value:
+                            row_count += np.int64(_packed_popcount32(value))
+                            row_x0 = np.int64(_packed_trailing_zeros32(value))
+                            row_x1 = 32 - np.int64(_packed_leading_zeros32(value))
+                    # LLVM selects scalar or vector counting for the available CPU.
+                    interior_count = np.int64(0)
+                    for wi in range(a, b):
+                        interior_count += np.int64(_packed_popcount32(words[wi]))
+                    row_count += interior_count
+                    if interior_count:
+                        left = a
+                        while not words[left]:
+                            left += 1
+                        right = b - 1
+                        while not words[right]:
+                            right -= 1
+                        row_x0 = min(row_x0, left * 32 - start + np.int64(_packed_trailing_zeros32(words[left])))
+                        row_x1 = max(row_x1, right * 32 - start + 32 - np.int64(_packed_leading_zeros32(words[right])))
+                    if stop % 32:
+                        value = np.uint32(np.uint64(words[b]) & ((np.uint64(1) << np.uint64(stop % 32)) - np.uint64(1)))
+                        if value:
+                            row_count += np.int64(_packed_popcount32(value))
+                            row_x0 = min(row_x0, b * 32 - start + np.int64(_packed_trailing_zeros32(value)))
+                            row_x1 = max(row_x1, b * 32 - start + 32 - np.int64(_packed_leading_zeros32(value)))
+                if row_count:
+                    foreground += row_count
+                    x0, x1 = min(x0, row_x0), max(x1, row_x1)
+                    y0, y1 = min(y0, y), y + 1
             if foreground:
                 meta[zi, 0], meta[zi, 1] = y0, y1
                 meta[zi, 2], meta[zi, 3] = x0, x1

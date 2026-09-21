@@ -18,6 +18,9 @@ def canonical(value):
 class ReconciliationInventoryTests(unittest.TestCase):
     def setUp(self):
         self.manifest = json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
+        self.successors = ((self.manifest['v22_3_1_release_review'],)
+                           if 'v22_3_1_release_review' in self.manifest else ())
+        self.manifest = inventory._without_reviewed_v22_3_1_release(self.manifest)
         if 'v22_3_release_review' not in self.manifest:
             self.skipTest('Reconciliation release source review is awaiting final qualification')
 
@@ -35,7 +38,7 @@ class ReconciliationInventoryTests(unittest.TestCase):
                        'reconciliation_geometry', 'reconciliation_io', 'reconciliation_runtime',
                        'confidence_evidence', 'confidence_projection', 'confidence_tiles'):
             self.assertIn(module, review['complete_modules'])
-        inventory.verify_v22_3_validation_tools(review)
+        inventory.verify_v22_3_validation_tools(review, self.successors)
 
     def test_every_predecessor_record_remains_immutable(self):
         for key in self.manifest.keys() - {'v22_3_release_review'}:
@@ -68,15 +71,21 @@ class ReconciliationInventoryTests(unittest.TestCase):
     def test_current_code_and_external_policies_match_complete_source_snapshots(self):
         review = self.manifest['v22_3_release_review']
         trees = {item['module']: ast.parse((inventory.PACKAGE / (item['module'] + '.py')).read_text(encoding='utf-8'))
-                 for item in review['module_snapshots']}
-        inventory.verify_v22_3_source_snapshots(review, trees)
+                 for item in review['module_snapshots']
+                 if (inventory.PACKAGE / (item['module'] + '.py')).is_file()}
+        inventory.verify_v22_3_source_snapshots(review, trees, self.successors)
         for module in ('reconciliation', 'confidence_evidence', 'cuda_d1', 'pipeline',
-                       'examples/external_reconciliation/baseline'):
+                       'examples/external_reconciliation/union'):
             modified = dict(trees)
             modified[module] = copy.deepcopy(trees[module])
             modified[module].body.append(ast.Pass())
             with self.subTest(module=module), self.assertRaisesRegex(RuntimeError, 'v22.3.0 reviewed source changed'):
-                inventory.verify_v22_3_source_snapshots(review, modified)
+                inventory.verify_v22_3_source_snapshots(review, modified, self.successors)
+
+        for module in inventory.REVIEWED_V22_3_1_REMOVED_MODULES:
+            modified = {**trees, module: ast.parse('')}
+            with self.subTest(module=module), self.assertRaisesRegex(RuntimeError, 'v22.3.0 reviewed source changed'):
+                inventory.verify_v22_3_source_snapshots(review, modified, self.successors)
 
     def test_comparison_and_qualification_tool_sources_are_pinned(self):
         review = self.manifest['v22_3_release_review']
@@ -84,7 +93,7 @@ class ReconciliationInventoryTests(unittest.TestCase):
             changed = copy.deepcopy(review)
             changed['validation_tools'][index]['sha256'] = '0' * 64
             with self.subTest(index=index), self.assertRaisesRegex(RuntimeError, 'v22.3.0 validation tool changed'):
-                inventory.verify_v22_3_validation_tools(changed)
+                inventory.verify_v22_3_validation_tools(changed, self.successors)
 
 
 if __name__ == '__main__':

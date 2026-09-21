@@ -11,6 +11,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -187,6 +188,27 @@ def png_data(array):
     return 'data:image/png;base64,' + base64.b64encode(buffer.getvalue()).decode('ascii')
 
 
+def comparison_methods(dataset):
+    """Keep completed report labels, with one raw-union reference."""
+    methods = {}
+    for record in dataset['methods']:
+        if record['status'] != 'complete':
+            continue
+        name = record['policy_name']
+        if name in methods:
+            raise ValueError(f'Duplicate completed comparison method: {name}')
+        methods[name] = record
+    reference = next((name for name, record in methods.items()
+                      if record.get('is_union_reference')), None)
+    if reference is None and 'union' in methods:
+        reference = 'union'
+    if reference is None:
+        raise ValueError('Source overlays require a completed raw-union reference')
+    derived = [name for name, record in methods.items()
+               if name != reference and not record.get('is_union_reference')]
+    return reference, derived, methods
+
+
 def render_dataset(output_dir, dataset, gray, envelopes):
     import matplotlib
     matplotlib.use('Agg')
@@ -198,10 +220,18 @@ def render_dataset(output_dir, dataset, gray, envelopes):
     directory.mkdir()
     slices = dataset['previews']['slices']
     selected = [item['z'] for item in slices]
-    methods = {m['policy_name']: m for m in dataset['methods'] if m['status'] == 'complete'}
+    reference, method_names, methods = comparison_methods(dataset)
+    labels = {method: method.replace('_', ' ') for method in method_names}
+    labels = {method: label[:1].upper() + label[1:] for method, label in labels.items()}
+    filename_tokens = {}
+    for method in method_names:
+        token = re.sub(r'[^A-Za-z0-9_.-]+', '_', method).strip('_.') or 'policy'
+        if token in filename_tokens.values():
+            token += '_' + hashlib.sha256(method.encode()).hexdigest()[:12]
+        filename_tokens[method] = token
     masks = {method: selected_masks(Path(record['output']), tuple(gray.shape), selected,
                                    dataset['reference_geometry']) for method, record in methods.items()}
-    candidate = masks['union']
+    candidate = masks[reference]
     records = []
     for item in slices:
         z = item['z']
@@ -209,29 +239,35 @@ def render_dataset(output_dir, dataset, gray, envelopes):
         if np.count_nonzero(candidate[z]) != expected:
             raise ValueError('Comparison report and union slice counts differ')
         record = dict(dataset=name, z=z, roi=item['roi_y0_y1_x0_x1'],
-                      source=png_data(gray[z]), slab=png_data(envelopes[z]), layers={})
-        for method in ('cross_sections', 'largest_island'):
+                      source=png_data(gray[z]), slab=png_data(envelopes[z]), layers={},
+                      method_labels=labels, overview_methods=method_names[:5], union_reference=reference)
+        for method in method_names:
             retained = masks[method][z]
             rendered = overlay(gray[z], candidate[z], retained)
-            Image.fromarray(rendered).save(directory / f'z{z}_{method}_full.png')
+            Image.fromarray(rendered).save(directory / f'z{z}_{filename_tokens[method]}_full.png')
             rgba = np.zeros((*retained.shape, 4), np.uint8)
             rgba[retained != 0] = (*COLORS['retained'], 255)
             rgba[(candidate[z] != 0) & (retained == 0)] = (*COLORS['rejected'], 255)
             record['layers'][method] = png_data(rgba)
         records.append(record)
         y0, y1, x0, x1 = item['roi_y0_y1_x0_x1']
-        fig, axes = plt.subplots(1, 3, figsize=(16, 6), facecolor='#151920')
         panels = [('Source', np.repeat(gray[z, ..., None], 3, axis=2))]
-        panels += [(method, overlay(gray[z], candidate[z], masks[method][z]))
-                   for method in ('cross_sections', 'largest_island')]
-        for axis, (title, image) in zip(axes, panels):
+        panels += [(labels[method], overlay(gray[z], candidate[z], masks[method][z]))
+                   for method in record['overview_methods']]
+        columns = min(3, len(panels))
+        rows = math.ceil(len(panels) / columns)
+        fig, axes = plt.subplots(rows, columns, figsize=(16 * columns / 3, 5.4 * rows + .6),
+                                 squeeze=False, facecolor='#151920')
+        for axis in axes.flat:
+            axis.set_axis_off()
+        for axis, (title, image) in zip(axes.flat, panels):
             axis.imshow(image[y0:y1, x0:x1], origin='upper', interpolation='nearest')
             axis.set_axis_off()
-            axis.set_title(title.replace('_', ' '), color='white', fontsize=14)
+            axis.set_title(title, color='white', fontsize=14)
         fig.suptitle(f'{name} | z={z} | source with reconciliation overlay', color='white', fontsize=15)
         fig.legend(handles=[Patch(color=np.array(COLORS[key])/255, label=key.title())
                             for key in COLORS], loc='lower center', ncol=2, facecolor='#151920', labelcolor='white')
-        fig.tight_layout(rect=(0, .055, 1, .93))
+        fig.tight_layout(rect=(0, .055, 1, .93), h_pad=2.5)
         fig.savefig(directory / f'z{z}_comparison.png', dpi=150, facecolor=fig.get_facecolor())
         plt.close(fig)
     return records
@@ -248,7 +284,9 @@ def write_viewer(path, records):
 <label><input id="retained" type="checkbox" checked><span class="kept">Retained</span></label>
 <label><input id="rejected" type="checkbox" checked><span class="rejected">Rejected</span></label>
 <label>Source <select id="background"><option value="source">Pipeline grayscale slice</option><option value="slab">Maximum over mask's source-frame footprint</option></select></label>
-<div class="grid"><section><h2>Source</h2><canvas id="original"></canvas></section><section><h2>Cross sections</h2><canvas id="cross_sections"></canvas></section><section><h2>Largest island</h2><canvas id="largest_island"></canvas></section></div>
+<label id="method_a_control">Left policy <select id="method_a"></select></label>
+<label id="method_b_control">Right policy <select id="method_b"></select></label>
+<div class="grid" id="panels"><section><h2>Source</h2><canvas id="original"></canvas></section><section id="panel_a"><h2 id="title_a"></h2><canvas id="comparison_a"></canvas></section><section id="panel_b"><h2 id="title_b"></h2><canvas id="comparison_b"></canvas></section></div>
 <p class="note" id="position"></p>
 <p class="note">The grayscale background follows the pipeline's area resize and endpoint-aligned temporal interpolation. Compact masks pool several source frames. The optional footprint maximum shows that broader source support. No policy decisions or source masks were changed. Opacity 0 shows the source alone.</p>
 <script>const records=PAYLOAD, byId=id=>document.getElementById(id), cache=new Map();
@@ -256,12 +294,18 @@ function picture(url){if(!cache.has(url)){let im=new Image();im.src=url;cache.se
 records.forEach((r,i)=>{let o=document.createElement('option');o.value=i;o.textContent=r.dataset.slice(-6)+' · z='+r.z;byId('sample').append(o);});
 let sequence=0;
 async function render(){let token=++sequence,r=records[+byId('sample').value],a=+byId('alpha').value/100;byId('amount').textContent=Math.round(a*100)+'%';
-let bg=await picture(r[byId('background').value]), images={};for(let method of ['cross_sections','largest_island'])images[method]=await picture(r.layers[method]);if(token!==sequence)return;
+let available=Object.keys(r.layers), label=method=>{let title=(r.method_labels||{})[method]||method.replaceAll('_',' ');return title.charAt(0).toUpperCase()+title.slice(1);}, slots=[];
+for(let [index,suffix] of ['a','b'].entries()){let control=byId('method_'+suffix),previous=control.value;control.replaceChildren();
+for(let method of available){let option=document.createElement('option');option.value=method;option.textContent=label(method);control.append(option);}
+let visible=available.length>index;byId('method_'+suffix+'_control').hidden=!visible;byId('panel_'+suffix).hidden=!visible;
+if(visible){control.value=available.includes(previous)?previous:available[index];byId('title_'+suffix).textContent=label(control.value);slots.push({canvas:'comparison_'+suffix,method:control.value});}}
+byId('panels').style.gridTemplateColumns='repeat('+(slots.length+1)+',minmax(0,1fr))';
+let bg=await picture(r[byId('background').value]), images={};for(let slot of slots)images[slot.method]=await picture(r.layers[slot.method]);if(token!==sequence)return;
 let [y0,y1,x0,x1]=byId('crop').checked?r.roi:[0,bg.height,0,bg.width];
-for(let method of ['original','cross_sections','largest_island']){let c=byId(method);c.width=x1-x0;c.height=y1-y0;let ctx=c.getContext('2d');ctx.drawImage(bg,x0,y0,c.width,c.height,0,0,c.width,c.height);
-if(method!=='original'){let layer=document.createElement('canvas');layer.width=bg.width;layer.height=bg.height;let lc=layer.getContext('2d');lc.drawImage(images[method],0,0);let d=lc.getImageData(0,0,layer.width,layer.height);for(let p=0;p<d.data.length;p+=4){if((d.data[p]===45&&!byId('retained').checked)||(d.data[p]===240&&!byId('rejected').checked))d.data[p+3]=0;}lc.putImageData(d,0,0);ctx.globalAlpha=a;ctx.drawImage(layer,x0,y0,c.width,c.height,0,0,c.width,c.height);ctx.globalAlpha=1;}}
+for(let slot of [{canvas:'original'},...slots]){let c=byId(slot.canvas);c.width=x1-x0;c.height=y1-y0;let ctx=c.getContext('2d');ctx.drawImage(bg,x0,y0,c.width,c.height,0,0,c.width,c.height);
+if(slot.method!==undefined){let layer=document.createElement('canvas');layer.width=bg.width;layer.height=bg.height;let lc=layer.getContext('2d');lc.drawImage(images[slot.method],0,0);let d=lc.getImageData(0,0,layer.width,layer.height);for(let p=0;p<d.data.length;p+=4){if((d.data[p]===45&&!byId('retained').checked)||(d.data[p]===240&&!byId('rejected').checked))d.data[p+3]=0;}lc.putImageData(d,0,0);ctx.globalAlpha=a;ctx.drawImage(layer,x0,y0,c.width,c.height,0,0,c.width,c.height);ctx.globalAlpha=1;}}
 byId('position').textContent=r.dataset+' | zero-based z='+r.z+' | source '+r.source_position.toFixed(6)+' ('+r.source_seconds.toFixed(3)+' s) | mask source frames '+r.mask_frames[0]+'–'+r.mask_frames[1]+' inclusive';}
-for(let id of ['sample','alpha','crop','retained','rejected','background'])byId(id).addEventListener('input',render);render();</script></html>'''
+for(let id of ['sample','alpha','crop','retained','rejected','background','method_a','method_b'])byId(id).addEventListener('input',render);render();</script></html>'''
     path.write_text(html.replace('PAYLOAD', payload), encoding='utf-8')
 
 

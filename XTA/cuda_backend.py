@@ -20,7 +20,7 @@ from typing import (
     Tuple,
 )
 import numpy as np
-from ._deps import cv2
+from ._deps import cv2, _numba
 from .geometry_quality import radial_columns_requested, spherical_fp32_requested, spherical_fp32_shape_eligible
 
 from .config import (
@@ -102,6 +102,55 @@ if TYPE_CHECKING:
 def open_existing_gray_memmap(path: object, shape: Sequence[int], dtype: object = np.uint8, mode: str = 'r') -> np.memmap:
     return np.memmap(Path(path), dtype=np.dtype(dtype), mode=str(mode), shape=tuple(int(x) for x in shape))
 
+if _numba is not None:
+    @_numba.njit(cache=True, nogil=True)
+    def _union_conf_slice_inplace(dst_mask, dst_conf, src_mask, src_conf):
+        for y in range(dst_mask.shape[0]):
+            for x in range(dst_mask.shape[1]):
+                mask = src_mask[y, x]
+                confidence = src_conf[y, x]
+                if mask != 0 and (dst_mask[y, x] == 0 or confidence > dst_conf[y, x]):
+                    dst_mask[y, x] = mask
+                    dst_conf[y, x] = confidence
+else:
+    _union_conf_slice_inplace = None
+
+
+def _union_conf_fused_eligible(arrays) -> bool:
+    """Use direct writes only for disjoint contiguous byte volumes."""
+    if _union_conf_slice_inplace is None:
+        return False
+    if any(not isinstance(array, np.ndarray) or array.dtype != np.uint8
+           or array.ndim != 3 or not array.flags.c_contiguous for array in arrays):
+        return False
+    if any(array.shape != arrays[0].shape for array in arrays[1:]):
+        return False
+    if not all(array.flags.writeable for array in arrays[:2]):
+        return False
+    files = []
+    for array in arrays:
+        owner = array
+        identity = None
+        while isinstance(owner, np.ndarray):
+            if isinstance(owner, np.memmap):
+                # Independent mappings of the same file can alias at different addresses.
+                try:
+                    stat = os.stat(owner.filename)
+                except (OSError, TypeError, ValueError):
+                    return False
+                identity = (stat.st_dev, stat.st_ino)
+                break
+            owner = owner.base
+        if owner is not None and identity is None:
+            return False
+        files.append(identity)
+    for i, array in enumerate(arrays):
+        for j in range(i):
+            if np.may_share_memory(array, arrays[j]) or (files[i] is not None and files[i] == files[j]):
+                return False
+    return True
+
+
 def union_conf_volume_into_volume_inplace(
     dst_mask_mm: np.ndarray,
     dst_conf_mm: Optional[np.ndarray],
@@ -120,6 +169,16 @@ def union_conf_volume_into_volume_inplace(
     if num_slices <= 0:
         return
     use_conf = bool(dst_conf_mm is not None and src_conf_mm is not None)
+    use_fused = use_conf and _union_conf_fused_eligible(
+        (dst_mask_mm, dst_conf_mm, src_mask_mm, src_conf_mm)
+    )
+    if use_fused:
+        try:
+            # Compile the exact writable/readonly signatures before any destination writes.
+            _union_conf_slice_inplace(*(np.asarray(array[0, :0]) for array in
+                                       (dst_mask_mm, dst_conf_mm, src_mask_mm, src_conf_mm)))
+        except Exception:
+            use_fused = False
 
     def _merge_slice(idx: int) -> None:
         i = int(idx)
@@ -130,6 +189,9 @@ def union_conf_volume_into_volume_inplace(
         dst_mask = np.asarray(dst_mask_mm[i], dtype=np.uint8)
         dst_conf = np.asarray(dst_conf_mm[i], dtype=np.uint8)
         src_conf = np.asarray(src_conf_mm[i], dtype=np.uint8)
+        if use_fused:
+            _union_conf_slice_inplace(dst_mask, dst_conf, src_mask, src_conf)
+            return
         # A source pixel wins where it is foreground and strictly more confident than the
         # current destination (ties keep the existing pixel, matching first-writer-wins).
         take = (src_mask > 0) & (src_conf > dst_conf)

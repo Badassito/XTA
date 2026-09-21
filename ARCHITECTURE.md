@@ -3,7 +3,7 @@
 XTA provides test-time augmentation (TTA), pretraining augmentation (PTA), and
 label-time augmentation (LTA) for volumes. The implementation lives in the
 importable `XTA` package. The versioned launcher
-`GPT-6-Astra-Ultra_v22.3.0_SLURM.py`, installed `xta` command, and `python -m XTA`
+`GPT-6-Astra-Ultra_v22.3.1_SLURM.py`, installed `xta` command, and `python -m XTA`
 all enter `XTA.cli.run()`.
 
 This document describes implemented behavior, ownership, and operating controls.
@@ -55,19 +55,38 @@ source-space component layers before global postprocessing. The additive source
 layers remain available; only the derived final mask changes. The reference
 policies live in `XTA/examples/external_reconciliation`. They combine positive
 support with provenance weights, geometry-based correlation caps, bounded island
-weights and retained prediction confidence. The ordinary union policy reproduces
-additive recomposition. A policy snapshot, source hash, group/weight decisions and
-retained/rejected counts are written to `reconciliation/manifest.json`.
+weights and retained prediction confidence. A plain union policy reuses the
+already assembled additive union, with a bounded count/validation pass and no
+component-payload reads or second source-volume allocation. Weighted, confidence,
+and custom decisions still consume independent evidence. A policy snapshot,
+source hash, execution strategy and measured counts are written to
+`reconciliation/manifest.json`; counts intentionally not rescanned are null.
 
-Reconciliation runs retain source-aligned confidence sidecars under
-`reconciliation_evidence`. Values are uint8 maxima of observed detector instance
+Reconciliation runs retain confidence sidecars under `reconciliation_evidence`.
+Values are uint8 maxima of observed detector instance
 scores; zero is unknown. They are separate from binary masks and are not voxel
 probabilities. Collection is independent of cleanup thresholds and preserves the
-existing CPU/GPU, resident D1 and tile mask paths. D1 workers retire bounded native
-score shards, and numeric source projection uses max reduction over the existing
-categorical address mappings. Prediction scores are captured before interpolation;
+existing CPU/GPU, resident D1 and tile mask paths. Non-confidence policies retain
+native score blocks or piece manifests with explicit payload coordinates and
+source geometry. D1 shards and accepted tile pieces are preserved without
+immediate dense merging or source projection. Confidence-mode policies project
+when their decision requires source-space scores. Numeric projection uses max
+reduction over the existing categorical address mappings. Schema-one source
+sidecars remain readable; schema-two blocks avoid compressing a whole large
+bounding rectangle because of a few separated pixels. Prediction scores are captured before interpolation;
 bridges retain explicit provenance instead of acquiring fabricated confidence.
 The NRRD manifests record stable layer and model identities for later joins.
+Confidence publication announces source projection and native retention stages.
+Long block writes and the final D1 evidence drain report progress every 30 seconds.
+
+Native evidence conversion is explicit through a bounded one-layer source-reader
+context, with temporary-disk admission and cleanup. Compact export joins scores
+to existing low-quality mask identities, takes numeric maxima over the matching
+source footprints, intersects with each compact mask, and writes a portable
+matched-grid bundle. It does not load native NRRD masks. Legacy source-aligned
+evidence needs no native staging; deferred-native conversion requires opt-in.
+Saved-layer policy comparisons retain only selected preview planes and retire
+each raw output map after publication, before evaluating the next policy.
 
 The numerical reconciliation engine has no inference or Slicer dependency.
 It reads bounded TYX slabs. Exact six-connected island statistics retain only
@@ -110,7 +129,7 @@ All module names below are relative to `XTA`.
 | TTA scheduling | `pipeline`, `tta_scheduler`, `tta_prediction`, `tta_lifecycle`: preparation, process admission, source staging, and run-resource ownership |
 | TTA external policies | `augmentation_policy`, `tta_augmentation_config`, `tta_augmentation`, `tta_augmentation_cuda`, `tta_augmentation_retirement`, `tta_augmentation_runtime`: shared policy identity, seed scopes, fused conservative inverse maps, and bounded render-once policy fan-out with asynchronous support retirement |
 | TTA reconciliation | `reconciliation_policy`, `reconciliation`, `reconciliation_components`, `reconciliation_geometry`, `reconciliation_io`, `reconciliation_runtime`: external policy identity, bounded voting and grouped island statistics, immutable layer readers and source-grid integration |
-| Confidence evidence | `confidence_evidence`, `confidence_projection`, `confidence_tiles`: sparse score sidecars, categorical-address max projection, and score provenance through accepted tile gates |
+| Confidence evidence | `confidence_evidence`, `confidence_storage`, `confidence_native`, `confidence_projection`, `confidence_tiles`, `confidence_export`: versioned numeric blocks and native pieces, explicit bounded projection, tile provenance, and matched compact export |
 | TTA completion | `assembly`, `tta_terminal`, `tta_outputs`: view/tile assembly, physical-view terminal fusion, and settled-artifact teardown |
 | Sparse components | `interpolation`, `topology`, `topology_runs`, `projection_queue`: interpolation, component membership/adjacency, and bounded projection handoff |
 | CUDA component work | `cuda_interpolation`, `cuda_d1`, `cuda_finalization`: bridge painting/radius work, owner-GPU bitsets, and distributed finalization contracts |
@@ -488,7 +507,18 @@ exhaustive mathematical check in bounded CPU chunks.
 
 `packed_publication` scans source bitset words for exact slice bounds and counts,
 then emits cropped row-packed bytes. Compiled and bounded NumPy implementations
-share the same payload contract. Windows file descriptors use binary mode.
+share the same payload contract. The compiled metadata scan uses LLVM population
+count and bit-scan operations, with full row interiors available for automatic
+vectorization. LLVM selects instructions for the running CPU; no specific ISA is
+required. Partial words preserve contiguous source-bit addressing and exclude
+terminal padding. Windows file descriptors use binary mode.
+
+File-result and azimuthal seam confidence composition use one compiled loop over
+disjoint contiguous uint8 planes. Source foreground replaces an empty destination
+or a strictly lower confidence; ties retain existing mask bytes. The existing
+slice-worker pool provides concurrency. Noncontiguous or overlapping arrays and
+unavailable compilation retain the NumPy implementation, and missing confidence
+maps retain plain bitwise union.
 
 ## Sparse components and interpolation
 

@@ -1505,7 +1505,7 @@ def _d1_prepare_bbox_launch_plan(
 
 def _d1_write_task_confidence(task: Mapping[str, object], accumulator: object) -> Dict[str, object]:
     """Retire one native-view score shard without allocating a source score volume."""
-    from .confidence_evidence import write_confidence_evidence
+    from .confidence_evidence import write_block_confidence_evidence
 
     scores = getattr(accumulator, 'conf_dev', None)
     masks = getattr(accumulator, 'union_dev', None)
@@ -1550,8 +1550,10 @@ def _d1_write_task_confidence(task: Mapping[str, object], accumulator: object) -
         return result
 
     started = time.perf_counter()
-    reference = write_confidence_evidence(
+    reference = write_block_confidence_evidence(
         shard_path, shape, read_plane, layer_key=key, model_name=model_name,
+        coordinate_space='native_view_processing',
+        source_shape_tyx=tuple(task.get('d1_output_shape') or (view.full_t,view.full_h,view.full_w)),
         provenance={
             'coordinate_space': 'native_view_processing',
             'slice_start': first, 'slice_count': count,

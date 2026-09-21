@@ -20,7 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 POLICIES = ROOT / 'XTA/examples/external_reconciliation'
 CASES = ('cpu_off', 'cpu_union', 'gpu_off', 'gpu_union', 'cpu_confidence',
-         'gpu_confidence', 'hybrid_augmented_tiles', 'gpu_native_views')
+         'gpu_confidence', 'hybrid_augmented_tiles', 'hybrid_augmented_tiles_union',
+         'gpu_native_views', 'gpu_native_views_confidence')
 BRIDGE_CASES = ('cpu_bridges_off', 'cpu_bridges_union', 'cpu_bridges_provenance')
 
 
@@ -74,7 +75,7 @@ def runtime_environment(root):
 
 
 def invocation(root, output, name):
-    hybrid = name == 'hybrid_augmented_tiles'
+    hybrid = name in ('hybrid_augmented_tiles', 'hybrid_augmented_tiles_union')
     cpu = name.startswith('cpu_')
     mode = 'cpu' if cpu else 'gpu'
     models = [f'{mode}:{root / ("model.xml" if cpu else "model.engine")}']
@@ -91,15 +92,16 @@ def invocation(root, output, name):
         '--output', str(output / 'outputs'), '--temp', str(output / 'runtime'),
         '--save', 'nrrd', 'summary']
     if not name.endswith('_off'):
-        policy = ('baseline' if hybrid else 'provenance' if name.endswith('_provenance')
-                  else 'confidence_voxel' if name.endswith('_confidence') else 'union')
+        policy = ('confidence_core_rescue' if hybrid and not name.endswith('_union')
+                  else 'hybrid_with_fill' if name.endswith('_provenance')
+                  else 'confidence_core_rescue' if name.endswith('_confidence') else 'union')
         argv.extend(['--reconciliation', str(POLICIES / f'{policy}.py'), '--reconciliation_memory_mib', '64'])
     if hybrid:
         argv.extend(['--enable_tile', '32:32', '--augmentation_ratio', '3', '--augmentation',
             f'gpu:{ROOT / "XTA/examples/external_augmentations/GPU_light.py"}',
             f'cpu:{ROOT / "XTA/examples/external_augmentations/CPU_light.py"}',
             '--augmentation_coverage', 'packed'])
-    if name == 'gpu_native_views':
+    if name.startswith('gpu_native_views'):
         argv.extend(['--enable_azimuthal', 'transverse:30', '--enable_radial', 'transverse',
                      '--enable_spherical', 'transverse'])
     if name in BRIDGE_CASES:
@@ -177,13 +179,14 @@ def inspect_case(output, name):
                 raise AssertionError('Retained confidence has the wrong source grid')
             if Path(metadata['confidence_evidence']).resolve() != ref.path.resolve():
                 raise AssertionError('Runtime layer confidence descriptor does not match saved sidecar')
-            reader = ref.reader()
-            for z in range(final.shape[0]):
-                scores, known = reader(z, z+1)
-                if not np.array_equal(known, scores > 0):
-                    raise AssertionError('Score known-support semantics changed')
-                known_total += int(known.sum())
-                values_present.update(map(int, np.unique(scores[known])))
+            work = output.parent / 'score_verification' / entry['directory']
+            with ref.source_reader(work) as reader:
+                for z in range(final.shape[0]):
+                    scores, known = reader(z, z+1)
+                    if not np.array_equal(known, scores > 0):
+                        raise AssertionError('Score known-support semantics changed')
+                    known_total += int(known.sum())
+                    values_present.update(map(int, np.unique(scores[known])))
         # The actual fixture score is float32 .9; backend arithmetic may round
         # its u8 tie to 229 or 230. Neither the .1 selection threshold nor a
         # fabricated binary score of 255 can satisfy this assertion.
@@ -195,9 +198,17 @@ def inspect_case(output, name):
             raise AssertionError('Confidence reconciliation consumed no actual scores')
         if report['policy']['mode'] == 'union' and not np.array_equal(union, final):
             raise AssertionError('Union reconciliation changed the exact additive union')
+        if report['policy']['mode'] == 'union':
+            execution = report.get('execution', {})
+            if (execution.get('strategy') != 'reuse_assembled_union'
+                    or execution.get('component_payload_reads') != 0
+                    or execution.get('confidence_payload_reads') != 0
+                    or execution.get('new_source_volume_bytes') != 0):
+                raise AssertionError('Union policy did not reuse the already assembled source output')
+            receipt['union_reused_without_payload_reads'] = True
     elif (output / 'reconciliation_evidence').exists():
         raise AssertionError('Retention-off run unexpectedly wrote score sidecars')
-    if name == 'hybrid_augmented_tiles':
+    if name in ('hybrid_augmented_tiles', 'hybrid_augmented_tiles_union'):
         augmentation = json.loads((output / 'augmentation_manifest.json').read_text())
         backends = sorted({entry['backend'] for entry in augmentation['execution_records']})
         if backends != ['cpu', 'gpu'] or not all(entry['pass_count'] == 3 for entry in augmentation['execution_records']):
@@ -252,15 +263,16 @@ def verify_bridge_evidence(output):
             elif metadata['mask_kind'] == 'yolo':
                 prediction_count += 1
                 ref = ConfidenceEvidenceRef.open(metadata['confidence_evidence'])
-                reader = ref.reader()
-                for z in range(ref.shape[0]):
-                    scores, known = reader(z, z+1)
-                    known_any[z] |= known[0]
+                work = output.parent / 'bridge_score_verification' / ref.path.name
+                with ref.source_reader(work) as reader:
+                    for z in range(ref.shape[0]):
+                        scores, known = reader(z, z+1)
+                        known_any[z] |= known[0]
         if not bridge_roles or not prediction_count or np.any(known_any & bridge_only):
             raise AssertionError('Bridge-only voxels received invented observed confidence')
         result.update(bridge_roles=bridge_roles, prediction_roles=prediction_count,
                       bridge_only_confidence_unknown=True)
-        if report['policy']['name'] == 'provenance':
+        if report['policy']['name'] == 'hybrid_with_fill':
             weights = report['policy']['provenance_weights']
             if not weights['bridge'] < weights['prediction']:
                 raise AssertionError('Provenance policy did not retain lower bridge weight')
@@ -324,7 +336,7 @@ def main():
     while lock is not None:
         try:
             with lock.open('x') as stream:
-                json.dump(dict(task='v22.3.0 reconciliation pipeline qualification', pid=os.getpid(),
+                json.dump(dict(task='reconciliation pipeline qualification', pid=os.getpid(),
                     start_time=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())), stream)
             break
         except FileExistsError:

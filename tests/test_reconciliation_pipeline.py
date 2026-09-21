@@ -56,6 +56,33 @@ def test_real_cpu_reconciliation_preserves_inputs_and_consumes_retained_scores(t
     assert (output / 'reconciliation_evidence/manifest.json').is_file()
     assert not list(output.rglob('*.seg.nrrd'))
 
+    # The collection-only route must also survive retirement when no masks are saved.
+    unionless = tmp_path / 'cpu_union_without_nrrd'
+    unionless.mkdir()
+    argv = invocation(tmp_path, unionless, 'cpu_union')
+    argv.remove('nrrd')
+    with (unionless / 'pipeline.log').open('w', encoding='utf-8') as log:
+        subprocess.run(argv, cwd=ROOT, env=runtime_environment(tmp_path), stdout=log,
+                       stderr=subprocess.STDOUT, check=True)
+    output = unionless / 'outputs'
+    assert json.loads((output / 'manifest.json').read_text())['status'] == 'complete'
+    report = json.loads((output / 'reconciliation/manifest.json').read_text())
+    assert report['counts'] == union['reconciliation_counts']
+    assert report['execution']['strategy'] == 'reuse_assembled_union'
+    assert report['execution']['new_source_volume_bytes'] == 0
+    assert not list(output.rglob('*.seg.nrrd'))
+    from XTA.confidence_evidence import ConfidenceEvidenceRef
+    entries = json.loads((output / 'reconciliation_evidence/manifest.json').read_text())['layers']
+    known = 0
+    for entry in entries:
+        ref = ConfidenceEvidenceRef.open(output / 'reconciliation_evidence' / entry['directory'])
+        with ref.source_reader(unionless / 'verify_native') as reader:
+            for z in range(ref.shape[0]):
+                scores, observed = reader(z, z+1)
+                known += int(observed.sum())
+    assert known > 0
+    assert not list((unionless / 'verify_native').rglob('native.u8.dat'))
+
 
 @pytest.mark.skipif(not all(_available(name) for name in ('openvino', 'cv2', 'nrrd')),
                     reason='Real CLI qualification requires OpenVINO, OpenCV and pynrrd')

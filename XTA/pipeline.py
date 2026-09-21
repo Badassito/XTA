@@ -1310,7 +1310,9 @@ def _main_impl() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     from .confidence_evidence import configure_confidence_evidence
     configure_confidence_evidence(out_dir, enabled=args.reconciliation_retain_confidence,
-                                  min_conf=float(args.min_conf))
+                                  min_conf=float(args.min_conf),
+                                  defer_projection=bool(reconciliation_settings.enabled
+                                      and reconciliation_policy['mode'] != 'confidence'))
 
     unified_launch_at_start = current_unified_launch()
     tta_artifact_identities: Optional[Dict[str, object]] = None
@@ -6782,8 +6784,28 @@ def _main_impl() -> None:
     _drain_completed_prediction_accumulation_futures()
     _drain_completed_background_futures()
 
-    for confidence_future in d1_confidence_futures:
-        confidence_future.result()
+    if d1_confidence_futures:
+        confidence_pending = set(d1_confidence_futures)
+        for confidence_future in tuple(confidence_pending):
+            if confidence_future.done():
+                confidence_future.result()
+                confidence_pending.remove(confidence_future)
+        confidence_started = time.perf_counter()
+        confidence_next_progress = confidence_started
+        while confidence_pending:
+            confidence_now = time.perf_counter()
+            if confidence_now >= confidence_next_progress:
+                print(f'Retained confidence publication drain: '
+                      f'completed={len(d1_confidence_futures)-len(confidence_pending)}/'
+                      f'{len(d1_confidence_futures)}, pending={len(confidence_pending)}, '
+                      f'elapsed_s={confidence_now-confidence_started:.1f}.', flush=True)
+                confidence_next_progress = confidence_now + 30.0
+            confidence_done, confidence_pending = wait(
+                confidence_pending, timeout=30.0, return_when=FIRST_COMPLETED)
+            for confidence_future in confidence_done:
+                confidence_future.result()
+        print(f'Retained confidence publication complete: views={len(d1_confidence_futures)}, '
+              f'elapsed_s={time.perf_counter()-confidence_started:.3f}.', flush=True)
     if pending_d1_confidence_by_parent:
         raise RuntimeError('D1 confidence evidence contains unfinished view leases')
     if d1_confidence_executor is not None:
@@ -7045,10 +7067,15 @@ def _main_impl() -> None:
             nrrd_layer_refs, views=inference_views,
             source_shape_tyx=source_output_shape_tyx, processing_shape_tyx=(int(T), int(H), int(W)),
             settings=reconciliation_settings, policy=reconciliation_policy,
-            output_dir=out_dir / 'reconciliation', workspace=temp_dir / 'reconciliation')
-        if streaming_final_union_holder.get(str(model_name)) is original_union:
-            streaming_final_union_holder[str(model_name)] = final_union_mm
-        close_memmap_array(original_union)
+            output_dir=out_dir / 'reconciliation', workspace=temp_dir / 'reconciliation',
+            assembled_union=original_union)
+        if final_union_mm is not original_union:
+            if streaming_final_union_holder.get(str(model_name)) is original_union:
+                streaming_final_union_holder[str(model_name)] = final_union_mm
+            if streamed_final_union_mm is original_union:
+                streamed_final_union_mm = final_union_mm
+            close_memmap_array(original_union)
+        original_union = None
 
     if bool(args.enable_3d_void_fill) and (streamed_final_union_mm is not None or reconciliation_settings.enabled):
         print('\n=== Optional 3D void fill after final global union ===')
