@@ -16,8 +16,6 @@ from unittest import mock
 
 import numpy as np
 
-from tools.smoke_import import install_stubs
-
 
 def _module_is_available(name: str) -> bool:
     loaded = sys.modules.get(name)
@@ -32,8 +30,6 @@ def _module_is_available(name: str) -> bool:
 HAS_NUMERICAL_RUNTIME = all(
     _module_is_available(name) for name in ("cv2", "scipy", "tqdm")
 )
-if not HAS_NUMERICAL_RUNTIME:
-    install_stubs()
 
 from XTA import pta
 from XTA import pta_scheduler

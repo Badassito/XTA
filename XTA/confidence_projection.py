@@ -7,9 +7,328 @@ They do not participate in prediction-mask processing.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
+import math
 from pathlib import Path
 import time
 import numpy as np
+
+
+@dataclass(frozen=True)
+class ScoreProjectionWorkspace:
+    """Admission for owned numeric arrays; source and staging mmaps are borrowed.
+
+    Each backend reserves its persistent one-dimensional geometry and output
+    plane separately from its strip temporaries. The control allowance covers
+    ndarray headers, iterator objects and small fixed-size affine operations.
+    Neither compiled plans nor shared dense geometry caches are used here.
+    """
+    backend: str
+    fixed_bytes: int
+    bytes_per_point: int
+    chunk_points: int
+
+
+def score_projection_workspace(native_shape, view, output_shape, memory_bytes):
+    """Reject an insufficient budget before creating any geometry-sized array."""
+    from .geometry import is_tilted_view, is_tilted_azimuthal_view
+    native, shape = tuple(map(int, native_shape)), tuple(map(int, output_shape))
+    fixed = math.prod(shape[1:]) + 256 * 1024
+    # Strip bounds include coordinate/index arithmetic, masked gathers and the
+    # reduction destination. QSC additionally owns nested float64 trig arrays.
+    if str(view.family) == 'azimuthal':
+        backend = 'tilted_azimuthal' if is_tilted_azimuthal_view(view) else 'azimuthal'
+        # The densified angular plan has at most ceil(pi*diameter/2)+1
+        # entries unless the supplied trajectory is already denser. Account
+        # for its Python records as well as the float/int angular arrays.
+        angles = max(len(view.azimuths_deg), math.ceil(math.pi * int(view.diameter) / 2) + 1)
+        fixed += 512 * angles + 64 * (int(view.src_h) + int(view.src_w) + sum(native[1:]))
+        per_point = 256 if backend == 'tilted_azimuthal' else 160
+    elif is_tilted_view(view):
+        backend, per_point = 'tilted', 256
+    elif str(view.family) == 'radial':
+        backend, per_point = 'radial', 512
+        global_count = int(getattr(view, 'radial_global_count', 0)) or (
+            math.ceil(float(view.radial_max_radius)-float(view.radial_min_radius))+1)
+        fixed += 64 * (global_count + len(view.radial_radii) + int(view.num_slices))
+    elif str(view.family) == 'spherical':
+        backend, per_point = 'spherical', 1024
+        fixed += 64 * int(view.num_slices)
+    else:
+        backend, per_point = 'cartesian', 128
+    available = int(memory_bytes) - fixed
+    if available < per_point:
+        raise MemoryError(f'Confidence {backend} projection needs at least {fixed + per_point} '
+                          f'workspace bytes; limit is {int(memory_bytes)}')
+    return ScoreProjectionWorkspace(backend, fixed, per_point,
+                                    min(128 * 1024, available // per_point))
+
+
+def _bounded_restore_slice(source, shape, z, chunk):
+    """Categorical source restoration without a horizontal plane or axis cache."""
+    from .media import _linear_source_index
+    result = np.zeros(shape[1:], np.uint8)
+    flat = result.reshape(-1)
+    ih, iw = source.shape[1:]
+    oh, ow = shape[1:]
+    area = ih >= oh and iw >= ow
+    # Consume the Z footprint a single index at a time. The legacy helper's
+    # upsampling nearest rule is retained; a shrinking footprint is a range.
+    if source.shape[0] >= shape[0]:
+        first = max(0, min(source.shape[0]-1, math.floor(float(z) * float(source.shape[0]) / float(shape[0]))))
+        stop = min(source.shape[0], max(first+1, math.ceil(float(z+1) * float(source.shape[0]) / float(shape[0]))))
+        indices = range(first, stop)
+    else:
+        nearest = int(round(_linear_source_index(z, shape[0], source.shape[0])))
+        indices = (max(0, min(source.shape[0]-1, nearest)),)
+    for first in range(0, flat.size, chunk):
+        stop = min(flat.size, first + chunk)
+        positions = np.arange(first, stop, dtype=np.int64)
+        yy, xx = positions // ow, positions % ow
+        ys, xs = yy * ih // oh, xx * iw // ow
+        ye = ((yy+1) * ih + oh-1) // oh if area else ys+1
+        xe = ((xx+1) * iw + ow-1) // ow if area else xs+1
+        target = flat[first:stop]
+        for index in indices:
+            for dy in range(int(np.max(ye-ys))):
+                y = ys + dy
+                for dx in range(int(np.max(xe-xs))):
+                    x = xs + dx
+                    valid = (y < ye) & (x < xe)
+                    target[valid] = np.maximum(target[valid], source[index, y[valid], x[valid]])
+    return result
+
+
+def _bounded_azimuthal_map(view, plan, grid, plane_shape, first, stop):
+    """The dense projector's float32 expressions, evaluated only for one strip."""
+    from .geometry import azimuthal_plane_shape
+    angles, sources, reverses, step = plan
+    oh, ow = plane_shape
+    wh, ww = azimuthal_plane_shape(view)
+    positions = np.arange(first, stop, dtype=np.int64)
+    yy, xx = (positions // ow).astype(np.float32), (positions % ow).astype(np.float32)
+    if (oh, ow) != (wh, ww):
+        xx = (xx + np.float32(.5)) * np.float32(float(ww)/ow) - np.float32(.5)
+        yy = (yy + np.float32(.5)) * np.float32(float(wh)/oh) - np.float32(.5)
+    dx, dy = xx - float(view.center_x), yy - float(view.center_y)
+    radius = float(view.roi_radius)
+    if radius <= 0:
+        radius = max(1., float(view.diameter-1)/2.)
+    valid = np.sqrt(dx*dx + dy*dy).astype(np.float32, copy=False) <= radius+.5
+    theta = np.mod(np.degrees(np.arctan2(dy, dx)).astype(np.float32, copy=False), 180.).astype(np.float32, copy=False)
+    nearest = np.mod(np.rint(theta / float(step)).astype(np.int32, copy=False), len(angles))
+    target = angles[nearest]
+    signed = dx * np.cos(np.deg2rad(target)).astype(np.float32, copy=False)
+    signed += dy * np.sin(np.deg2rad(target)).astype(np.float32, copy=False)
+    signed[reverses[nearest]] *= -1.
+    width = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
+    u = ((signed + radius) / max(1e-6, 2.*radius)) * float(width-1)
+    columns = np.clip(np.rint(u).astype(np.int32, copy=False), 0, width-1)
+    return valid, sources[nearest], grid.native_u_to_processing[columns]
+
+
+def _bounded_azimuthal_geometry(source, view):
+    from .backprojection import build_azimuthal_backprojection_plan, resolve_azimuthal_processing_grid
+    samples, _ = build_azimuthal_backprojection_plan(view)
+    if not samples:
+        raise ValueError('Confidence Azimuthal projection requires angular samples')
+    angles = np.asarray([float(s.angle_deg) % 180. for s in samples], dtype=np.float32)
+    sources = np.asarray([int(s.source_index) for s in samples], dtype=np.int32)
+    reverses = np.asarray([bool(s.reverse_u) for s in samples], dtype=bool)
+    positive = np.diff(angles.astype(np.float64))
+    positive = positive[positive > 1e-9]
+    step = float(np.median(positive)) if positive.size else 180. / len(angles)
+    return (angles, sources, reverses, max(step, 1e-9)), resolve_azimuthal_processing_grid(source, view)
+
+
+def _bounded_upright_reader(source, view, shape, chunk):
+    from .backprojection import _azimuthal_processing_rows_for_output
+    from .geometry import azimuthal_base_view_name
+    plan, grid = _bounded_azimuthal_geometry(source, view)
+    base = azimuthal_base_view_name(view)
+    axis = {'transverse': 0, 'sagittal': 1, 'coronal': 2}[base]
+    plane = tuple(n for a, n in enumerate(shape) if a != axis)
+
+    def read(z):
+        result = np.zeros(shape[1:], np.uint8)
+        start, stop = (0, math.prod(plane)) if axis == 0 else (z*plane[1], (z+1)*plane[1])
+        for first in range(start, stop, chunk):
+            end = min(stop, first+chunk)
+            valid, angles, columns = _bounded_azimuthal_map(view, plan, grid, plane, first, end)
+            angles, columns = angles[valid], columns[valid]
+            for index in ((z,) if axis == 0 else range(shape[axis])):
+                values = np.zeros(len(angles), np.uint8)
+                for row in _azimuthal_processing_rows_for_output(grid, shape[axis], index):
+                    np.maximum(values, source[angles, int(row), columns], out=values)
+                if axis == 0:
+                    result.reshape(-1)[first:end][valid] = values
+                elif axis == 1:
+                    result[index, first-start:end-start][valid] = values
+                else:
+                    result[first-start:end-start, index][valid] = values
+        return result
+    return read
+
+
+def _scatter_score_strip(destination, values, ss, vv, uu, view, *, reduced=False):
+    from .geometry import tilted_base_view_name, tilted_stack_axis_length
+    valid = (ss >= 0) & (ss < int(tilted_stack_axis_length(view))) & (values > 0)
+    if not np.any(valid):
+        return
+    ss, vv, uu = ss[valid], vv[valid], uu[valid]
+    base = tilted_base_view_name(view)
+    coordinates = (ss, vv, uu) if base == 'transverse' else (
+        (vv, ss, uu) if base == 'sagittal' else (vv, uu, ss))
+    if not reduced:
+        work = (int(view.full_t), int(view.full_h), int(view.full_w))
+        coordinates = tuple(np.minimum(a.astype(np.int64) * out // inside, out-1).astype(np.int32)
+                            if inside != out else a
+                            for a, inside, out in zip(coordinates, work, destination.shape))
+    t, y, x = coordinates
+    flat = (t.astype(np.int64) * destination.shape[1] + y) * destination.shape[2] + x
+    np.maximum.at(destination.reshape(-1), flat, values[valid])
+
+
+def score_projection_staging_shape(native_shape, view, shape):
+    """Exact additional mmap shape for explicit projection, or no extra map."""
+    from .geometry import (delayed_native_expansion_enabled, is_tilted_view,
+                           is_tilted_azimuthal_view, tilted_base_view_name)
+    if is_tilted_azimuthal_view(view):
+        return tuple(shape)
+    if not is_tilted_view(view):
+        return None
+    reduced = delayed_native_expansion_enabled() and tuple(native_shape[1:]) != (view.src_h, view.src_w)
+    if not reduced:
+        return tuple(shape)
+    ph, pw = native_shape[1:]
+    if ph != pw:
+        raise ValueError('Delayed Tilted confidence processing requires a square inference raster')
+    base = tilted_base_view_name(view)
+    if base == 'transverse':
+        return int(view.full_t), ph, pw
+    if base == 'sagittal':
+        return ph, int(view.full_h), pw
+    if base == 'coronal':
+        return ph, pw, int(view.full_w)
+    raise ValueError(f'Unsupported Tilted confidence base {base!r}')
+
+
+def _bounded_tilted_projection(source, view, shape, temporary, chunk):
+    from .geometry import build_affine, delayed_native_expansion_enabled, tilted_frame_center
+    reduced = delayed_native_expansion_enabled() and source.shape[1:] != (view.src_h, view.src_w)
+    ph, pw = source.shape[1:]
+    projected_shape = score_projection_staging_shape(source.shape, view, shape)
+    if reduced:
+        affine = build_affine(str(view.name), int(view.src_w), int(view.src_h), pw, 0., str(view.pad_mode))
+        matrix = np.asarray(affine.M_out_to_src, dtype=np.float32)
+    else:
+        matrix = None
+    if str(view.tilt_direction) not in ('vertical', 'horizontal'):
+        raise ValueError(f'Unsupported tilt direction {view.tilt_direction!r}')
+    vertical = str(view.tilt_direction) == 'vertical'
+    center = (int(view.src_h if vertical else view.src_w)-1)/2.
+    tangent = float(math.tan(math.radians(float(view.tilt_angle_deg))))
+    result = np.memmap(temporary, mode='w+', dtype=np.uint8, shape=projected_shape)
+    try:
+        for frame in range(source.shape[0]):
+            for first in range(0, ph*pw, chunk):
+                stop = min(ph*pw, first+chunk)
+                # Preserve int64 vv/uu in the affine expression: changing the
+                # promotion here moves rounded shear-boundary ties.
+                positions = np.arange(first, stop, dtype=np.int64)
+                vv, uu = positions//pw, positions%pw
+                axis = vv if vertical else uu
+                if matrix is not None:
+                    row = 1 if vertical else 0
+                    axis = matrix[row, 0]*uu.astype(np.float32) + matrix[row, 1]*vv + matrix[row, 2]
+                stack = float(tilted_frame_center(view, frame)) + tangent*(axis.astype(np.float32)-center)
+                ss = np.rint(stack).astype(np.int32)
+                _scatter_score_strip(result, source[frame].reshape(-1)[first:stop], ss, vv, uu, view, reduced=reduced)
+        return result
+    except BaseException:
+        from .runtime import close_memmap_array_without_flush
+        close_memmap_array_without_flush(result)
+        raise
+
+
+def _bounded_tilted_azimuthal_projection(source, view, shape, temporary, chunk):
+    from .backprojection import _azimuthal_processing_rows_for_output
+    from .geometry import azimuthal_source_tilted_view, tilted_frame_center
+    tilted = azimuthal_source_tilted_view(view)
+    plan, grid = _bounded_azimuthal_geometry(source, view)
+    ph, pw = int(tilted.src_h), int(tilted.src_w)
+    if str(tilted.tilt_direction) not in ('vertical', 'horizontal'):
+        raise ValueError(f'Unsupported tilt direction {tilted.tilt_direction!r}')
+    vertical = str(tilted.tilt_direction) == 'vertical'
+    center = ((ph if vertical else pw)-1)/2.
+    tangent = float(math.tan(math.radians(float(tilted.tilt_angle_deg))))
+    result = np.memmap(temporary, mode='w+', dtype=np.uint8, shape=shape)
+    try:
+        # Geometry is local to this strip and discarded before advancing. The
+        # dense map and frame-by-axis shear table are never constructed.
+        for first in range(0, ph*pw, chunk):
+            stop = min(ph*pw, first+chunk)
+            valid, angles, columns = _bounded_azimuthal_map(view, plan, grid, (ph, pw), first, stop)
+            positions = np.arange(first, stop, dtype=np.int64)[valid]
+            vv, uu = (positions//pw).astype(np.int32), (positions%pw).astype(np.int32)
+            angles, columns = angles[valid], columns[valid]
+            axis = (vv if vertical else uu).astype(np.float32)
+            for frame in range(int(tilted.num_slices)):
+                values = np.zeros(len(positions), np.uint8)
+                for row in _azimuthal_processing_rows_for_output(grid, int(tilted.num_slices), frame):
+                    np.maximum(values, source[angles, int(row), columns], out=values)
+                stack = float(tilted_frame_center(tilted, frame)) + tangent*(axis-center)
+                _scatter_score_strip(result, values, np.rint(stack).astype(np.int32), vv, uu, tilted)
+        return result
+    except BaseException:
+        from .runtime import close_memmap_array_without_flush
+        close_memmap_array_without_flush(result)
+        raise
+
+
+@contextmanager
+def _bounded_score_projection_reader(source, view, shape, temporary, workspace):
+    from .geometry import physical_view_name
+    from .runtime import close_memmap_array_without_flush
+    backend, chunk = workspace.backend, workspace.chunk_points
+    projected = None
+    try:
+        if backend == 'azimuthal':
+            yield _bounded_upright_reader(source, view, shape, chunk)
+        elif backend in ('tilted', 'tilted_azimuthal'):
+            function = _bounded_tilted_projection if backend == 'tilted' else _bounded_tilted_azimuthal_projection
+            projected = function(source, view, shape, temporary, chunk)
+            yield lambda z: _bounded_restore_slice(projected, shape, z, chunk)
+        elif backend in ('radial', 'spherical'):
+            if backend == 'radial':
+                from .cylindrical_geometry import global_radii
+                from .cylindrical_projection import _pull_radial_chunk
+                radii = np.asarray(global_radii(view), dtype=np.float64)
+                def pull(z, first, stop):
+                    return _pull_radial_chunk(source, view, radii, shape, z, first, stop, scalar_max=True)
+            else:
+                from .spherical_projection import _pull_spherical_chunk, _validate_spherical_projection
+                radii, rotation, _, _ = _validate_spherical_projection(source, view, shape, None)
+                def pull(z, first, stop):
+                    return _pull_spherical_chunk(source, view, radii, rotation, shape, z, first, stop, scalar_max=True)
+            def read(z):
+                result = np.zeros(shape[1:], np.uint8)
+                flat = result.reshape(-1)
+                for first in range(0, flat.size, chunk):
+                    stop = min(flat.size, first+chunk)
+                    flat[first:stop] = pull(z, first, stop)
+                return result
+            yield read
+        else:
+            base = physical_view_name(view)
+            if base not in ('transverse', 'sagittal', 'coronal'):
+                raise ValueError(f'Confidence projection does not support view {view.name!r}')
+            axes = {'transverse': (0, 1, 2), 'sagittal': (1, 0, 2), 'coronal': (1, 2, 0)}[base]
+            yield lambda z: _bounded_restore_slice(source.transpose(axes), shape, z, chunk)
+    finally:
+        if projected is not None:
+            close_memmap_array_without_flush(projected)
+        temporary.unlink(missing_ok=True)
 
 
 def resize_score_plane_max(plane, output_hw):
@@ -147,8 +466,8 @@ def _project_tilted_azimuthal_scores(source, view, shape, path):
 
 
 @contextmanager
-def score_projection_reader(source, view, output_shape, work_dir):
-    """Yield a source-aligned slice reader, retiring any one-layer disk staging."""
+def score_projection_reader(source, view, output_shape, work_dir, *, memory_bytes=None):
+    """Yield source-aligned scores, with optional explicit strip-workspace admission."""
     from .geometry import is_tilted_view, is_tilted_azimuthal_view, physical_view_name
     from .runtime import close_memmap_array_without_flush
     source = np.asarray(source)
@@ -157,9 +476,14 @@ def score_projection_reader(source, view, output_shape, work_dir):
     shape = tuple(map(int, output_shape))
     if len(shape) != 3 or min(shape) <= 0:
         raise ValueError('Confidence output grid must have three positive dimensions')
+    workspace = None if memory_bytes is None else score_projection_workspace(source.shape, view, shape, memory_bytes)
     work = Path(work_dir)
     work.mkdir(parents=True, exist_ok=True)
     temporary = work / 'confidence_projection.u8.dat'
+    if workspace is not None:
+        with _bounded_score_projection_reader(source, view, shape, temporary, workspace) as read:
+            yield read
+        return
     projected = None
     try:
         if is_tilted_view(view):

@@ -8,7 +8,7 @@ contribute independently to the caller's ordinary OR union.
 from __future__ import annotations
 
 from collections import deque
-from concurrent.futures import CancelledError, ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
 import math
 import operator
@@ -196,6 +196,17 @@ def _pull_spherical_chunk(source, view, radii, rotation, output_shape, z, first,
     positions = np.flatnonzero(valid)
     if not positions.size:
         return result
+    shell = None
+    if bboxes is not None:
+        # Known-empty shells need no rotation, QSC trigonometry or source read.
+        # Select with the same global radius grid and inward midpoint ties as
+        # the final pull; keep the pixel-level bbox test after face projection.
+        shell = _nearest_global_shell(radius[positions], radii)
+        boxes = bboxes[shell]
+        occupied = ((boxes[:, 1] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 2]))
+        positions, shell = positions[occupied], shell[occupied]
+        if not positions.size:
+            return result
     # Row-vector inverse of the cube's local-to-world orthogonal rotation.
     dx, dy = dx[positions], dy[positions]
     local = np.stack(tuple(dx * rotation[0, a] + dy * rotation[1, a] + dz * rotation[2, a]
@@ -209,7 +220,7 @@ def _pull_spherical_chunk(source, view, radii, rotation, output_shape, z, first,
     if not np.any(member):
         return result
     positions = positions[member]
-    shell = _nearest_global_shell(radius[positions], radii)
+    shell = (_nearest_global_shell(radius[positions], radii) if shell is None else shell[member])
     pr = _processing_index(rows[member], int(view.src_h), int(source.shape[1]))
     pc = _processing_index(columns[member], int(view.src_w), int(source.shape[2]))
     if bboxes is not None:
@@ -361,30 +372,63 @@ def _spherical_block_schedule(depth, plane_bytes, workers, *, compact=False, com
 
 
 def _ordered_spherical_blocks(project, depth, plane_bytes, workers, *, cancel_event=None,
-                               compact=False, compiled=False):
+                               compact=False, compiled=False, while_waiting=None):
+    """Yield ordered results, or a None block when the caller acquired CUDA.
+
+    The promotion notification leaves the generator open so the owner can time
+    its close/join and retain the borrowed source until every CPU reader stops.
+    """
     block_depth, worker_count = _spherical_block_schedule(
         depth, plane_bytes, workers, compact=compact, compiled=compiled)
     starts = iter(range(0, depth, block_depth))
-    if worker_count == 1:
+    if worker_count == 1 and while_waiting is None:
         for first in starts:
             yield first, project(first, min(block_depth, depth - first))
         return
     pending = deque()
+
+    def wait_for_block(future):
+        if while_waiting is None:
+            return True, future.result()
+        while True:
+            try:
+                return True, future.result(timeout=_CUDA_RECHECK_SECONDS)
+            except TimeoutError:
+                # A worker's own TimeoutError is a projection failure, not a
+                # signal to retry admission or silently abandon its result.
+                if future.done():
+                    return True, future.result()
+                if while_waiting():
+                    return False, None
+
     with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix='spherical-project') as pool:
+        future = None
         try:
             for first in starts:
                 pending.append((first, pool.submit(project, first, min(block_depth, depth - first))))
                 if len(pending) >= worker_count:
                     z, future = pending.popleft()
-                    yield z, future.result()
-                    del future
+                    ready, block = wait_for_block(future)
+                    if not ready:
+                        yield z, None
+                        return
+                    yield z, block
+                    del block
+                    future = None
             while pending:
                 z, future = pending.popleft()
-                yield z, future.result()
-                del future
+                ready, block = wait_for_block(future)
+                if not ready:
+                    yield z, None
+                    return
+                yield z, block
+                del block
+                future = None
         finally:
             if cancel_event is not None:
                 cancel_event.set()
+            if future is not None:
+                future.cancel()
             for _, future in pending:
                 future.cancel()
             # Executor shutdown joins running readers before the caller may
@@ -564,23 +608,56 @@ def backproject_spherical_volume_to_volume(
         next_z = cpu_slices = cuda_slices = 0
         recheck_at = max(1, int(_CUDA_RECHECK_SLICES))
         recheck_time = time.monotonic() + _CUDA_RECHECK_SECONDS
+
+        def promote_cpu():
+            nonlocal stage, compact, backend, recheck_at, recheck_time
+            if (next_z >= shape[0] or stage is not None
+                    or (next_z < recheck_at and time.monotonic() < recheck_time)
+                    or not spherical_cuda_backproject_enabled()):
+                return False
+            recheck_at = next_z + max(1, int(_CUDA_RECHECK_SLICES))
+            recheck_time = time.monotonic() + _CUDA_RECHECK_SECONDS
+            candidate = try_stage(quiet=True)
+            if candidate is None:
+                return False
+            stage = candidate
+            compact = compact_supported
+            backend = 'cuda_direct_qsc_compact' if compact else 'cuda_direct_qsc'
+            runtime_telemetry().gauge('projection.spherical.backend', backend)
+            runtime_telemetry().gauge('projection.spherical.workers', 1)
+            runtime_telemetry().gauge('projection.spherical.block_depth', stage.max_block_depth)
+            print(f'Spherical projection promoted {spherical_view.name}: '
+                  f'CPU completed z=[0,{next_z}); continuing on cuda:{stage.device_index} '
+                  f'with backend={backend}', flush=True)
+            return True
+
         while next_z < shape[0]:
             cpu_blocks = stage is None
             blocks = (_ordered_spherical_cuda_blocks(stage, shape[0], packed if compact else None, first_z=next_z)
                       if stage is not None else _ordered_spherical_blocks(
                           project, shape[0], shape[1] * shape[2], workers,
-                          cancel_event=cpu_cancel, compact=cpu_compact, compiled=cpu_rectangular))
+                          cancel_event=cpu_cancel, compact=cpu_compact, compiled=cpu_rectangular,
+                          while_waiting=promote_cpu if spherical_cuda_backproject_enabled() else None))
             try:
                 while True:
                     wait_started = time.perf_counter()
+                    probe_before_wait = admission_probe_s
                     try:
                         z, block = next(blocks)
                     except StopIteration:
+                        if cpu_blocks:
+                            cpu_result_wait_s += max(0., time.perf_counter() - wait_started
+                                                     - (admission_probe_s - probe_before_wait))
                         break
                     if cpu_blocks:
-                        cpu_result_wait_s += time.perf_counter() - wait_started
+                        cpu_result_wait_s += max(0., time.perf_counter() - wait_started
+                                                 - (admission_probe_s - probe_before_wait))
                     else:
                         gpu_result_wait_s += time.perf_counter() - wait_started
+                    if cpu_blocks and stage is not None:
+                        # The pending CPU block was never published. Closing
+                        # below cancels and joins it before CUDA resumes at z.
+                        break
                     if z != next_z:
                         raise RuntimeError('Spherical projection duplicated or skipped an output slice')
                     count = len(block.records) if compact else len(block)
@@ -635,23 +712,8 @@ def backproject_spherical_volume_to_volume(
                     else:
                         cuda_slices += count
                     del block
-                    if (stage is None and next_z < shape[0]
-                            and (next_z >= recheck_at or time.monotonic() >= recheck_time)
-                            and spherical_cuda_backproject_enabled()):
-                        recheck_at = next_z + max(1, int(_CUDA_RECHECK_SLICES))
-                        recheck_time = time.monotonic() + _CUDA_RECHECK_SECONDS
-                        candidate = try_stage(quiet=True)
-                        if candidate is not None:
-                            stage = candidate
-                            compact = compact_supported
-                            backend = 'cuda_direct_qsc_compact' if compact else 'cuda_direct_qsc'
-                            runtime_telemetry().gauge('projection.spherical.backend', backend)
-                            runtime_telemetry().gauge('projection.spherical.workers', 1)
-                            runtime_telemetry().gauge('projection.spherical.block_depth', stage.max_block_depth)
-                            print(f'Spherical projection promoted {spherical_view.name}: '
-                                  f'CPU completed z=[0,{next_z}); continuing on cuda:{stage.device_index} '
-                                  f'with backend={backend}', flush=True)
-                            break
+                    if cpu_blocks and promote_cpu():
+                        break
             finally:
                 # Before switching backends, settle all unconsumed CPU futures.
                 # Their output was never published; GPU resumes at next_z only.

@@ -13,12 +13,6 @@ from unittest import mock
 
 import numpy as np
 
-from tools.smoke_import import install_stubs
-
-try:
-    import cv2  # noqa: F401
-except ModuleNotFoundError:
-    install_stubs()
 
 from XTA.geometry import expand_views_into_tta_variants, get_view_infos
 from XTA.lta_coverage import LtaCoverageBuilder

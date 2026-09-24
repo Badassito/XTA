@@ -113,6 +113,7 @@ class RuntimeTaskTraceTests(unittest.TestCase):
                     mock.patch('builtins.print'):
                 for index in range(20):
                     telemetry.trace_event('worker_dequeue', task_id=index)
+                telemetry.flush()
             self.assertFalse(telemetry.enabled)
             self.assertEqual(len(telemetry.snapshot()['events']), 2)
 
@@ -161,8 +162,8 @@ class RuntimeTaskTraceTests(unittest.TestCase):
             state.gpu_result_queue.put(dict(type='result', task_id=3, gpu_index=1, ok=True, stats={}))
             scheduler.drain_process_inference_results()
         self.assertEqual([event for event, _ in events],
-            ['scheduler_dispatch', 'scheduler_compute_released', 'scheduler_message_handled',
-             'scheduler_result_received', 'scheduler_result_handled'])
+            ['scheduler_dispatch', 'scheduler_compute_released', 'scheduler_result_received',
+             'scheduler_message_handled', 'scheduler_result_handled'])
         self.assertTrue(all(fields['device'] == 'cuda:1' for _, fields in events))
         self.assertEqual(state.gpu_worker_results_collected, 1)
 

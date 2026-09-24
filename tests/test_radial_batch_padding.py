@@ -6,9 +6,6 @@ import types
 
 import numpy as np
 
-from tools.smoke_import import install_stubs
-
-install_stubs()
 
 from XTA import cuda_backend, geometry, inference
 

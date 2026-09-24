@@ -12,9 +12,6 @@ import numpy as np
 
 os.environ['YOLO_TTA_TELEMETRY'] = '0'
 
-from tools.smoke_import import install_stubs
-
-install_stubs()
 
 from XTA import intel_dsa, runtime
 

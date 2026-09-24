@@ -7,10 +7,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tools.smoke_import import install_stubs
-
-
-install_stubs()
 
 from XTA.geometry import ViewInfo
 from XTA.tta_scheduler import (
@@ -93,7 +89,7 @@ def _inputs(temp_dir: Path, **overrides: object) -> TtaSchedulerInputs:
 def _operations(**overrides: object) -> TtaSchedulerOperations:
     telemetry = _Telemetry()
     values = dict(
-        _attach_memfd_transfers_to_task=lambda _task: None,
+        _attach_memfd_transfers_to_task=lambda _task, **_kwargs: None,
         _env_float=lambda _name, default: float(default),
         _env_int=lambda _name, default: int(default),
         _main_process_gpu_stage_begin_inference=lambda _worker: True,

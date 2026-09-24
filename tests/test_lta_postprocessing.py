@@ -11,12 +11,6 @@ from unittest import mock
 
 import numpy as np
 
-from tools.smoke_import import install_stubs
-
-try:
-    import cv2  # noqa: F401
-except ModuleNotFoundError:
-    install_stubs()
 
 from XTA.lta_outputs import LtaLayerRecord, compose_terminal_union
 from XTA import lta_postprocessing as subject

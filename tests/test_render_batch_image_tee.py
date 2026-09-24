@@ -7,9 +7,6 @@ from unittest import mock
 
 import numpy as np
 
-from tools.smoke_import import install_stubs
-
-install_stubs()
 
 from XTA import geometry, outputs
 from XTA.render_batch import RenderBatch

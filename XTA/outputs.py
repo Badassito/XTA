@@ -6,6 +6,8 @@ import atexit
 import colorsys
 import contextlib
 import gc
+import importlib
+from importlib import metadata as importlib_metadata
 import io
 import json
 import math
@@ -14,6 +16,7 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -66,6 +69,7 @@ from .runtime import (
     parallel_for_indices_chunked,
     runtime_telemetry,
     runtime_telemetry_phase,
+    _madvise_mmap_traced,
 )
 
 # Explicit lower-layer dependencies keep imports one-way.
@@ -208,17 +212,23 @@ def _publish_staged_file_atomically(stage_path: Path, out_path: Path) -> None:
     final_path = Path(out_path)
     if not stage.is_file() or int(stage.stat().st_size) <= 0:
         raise RuntimeError(f'Atomic publication stage is missing or empty: {stage}')
+    telemetry = runtime_telemetry() if final_path.suffix.lower() == '.nrrd' else None
+    def phase(name):
+        return telemetry.span('nrrd.publication.' + name) if telemetry is not None else contextlib.nullcontext()
     # Windows rejects FlushFileBuffers (os.fsync) on a read-only handle with EBADF.
     # Open update-capable without modifying the completed payload.
-    with open(stage, 'rb+') as stage_fh:
-        os.fsync(stage_fh.fileno())
-    os.replace(stage, final_path)
+    with phase('file_durability'):
+        with open(stage, 'rb+') as stage_fh:
+            os.fsync(stage_fh.fileno())
+    with phase('rename'):
+        os.replace(stage, final_path)
     try:
-        parent_fd = os.open(str(final_path.parent), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
+        with phase('directory_durability'):
+            parent_fd = os.open(str(final_path.parent), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
     except OSError:
         pass
 
@@ -1517,6 +1527,51 @@ def _nrrd_iaa_level(capabilities: Dict[str, object]) -> int:
         )
     return int(level)
 
+class _OldNrrdLibdeflateBindingError(RuntimeError):
+    """A known python-deflate release holds the GIL during compression."""
+
+
+def _known_nrrd_libdeflate_version(module: object) -> Optional[str]:
+    """Use the imported binding's version, never unrelated site metadata."""
+    raw = getattr(module, '__version__', None)
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    module_file = getattr(module, '__file__', None)
+    if not module_file:
+        return None
+    try:
+        selected_path = Path(str(module_file)).resolve()
+    except (OSError, ValueError):
+        return None
+    for distribution_name in ('deflate', 'python-deflate'):
+        try:
+            distribution = importlib_metadata.distribution(distribution_name)
+            files = distribution.files
+            if files is None:
+                continue
+            if any(Path(distribution.locate_file(file)).resolve() == selected_path
+                   for file in files):
+                return str(distribution.version)
+        except Exception:
+            continue
+    return None
+
+
+def _old_nrrd_libdeflate_binding_version(module: object) -> Optional[str]:
+    """Recognize pre-0.9 releases; unknown/custom bindings need separate GIL proof.
+
+    This is a version compatibility check, not an automatic throughput benchmark.
+    Unparseable or unassociated package metadata never proves an old binding.
+    """
+    version = _known_nrrd_libdeflate_version(module)
+    if version is None:
+        return None
+    match = re.match(r'^(\d+)\.(\d+)(?:\.\d+)?(?:$|[.+])', version)
+    if match is None:
+        return None
+    return version if (int(match.group(1)), int(match.group(2))) < (0, 9) else None
+
+
 def _nrrd_member_codec_spec(
     codec_name: str,
 ) -> NrrdMemberCodecSpec:
@@ -1540,6 +1595,13 @@ def _nrrd_member_codec_spec(
     if name == 'libdeflate':
         import deflate  # type: ignore
 
+        old_version = _old_nrrd_libdeflate_binding_version(deflate)
+        if old_version is not None:
+            raise _OldNrrdLibdeflateBindingError(
+                f'python-deflate {old_version} holds the Python GIL during compression; '
+                'install deflate>=0.9.0 for parallel NRRD compression or select '
+                'YOLO_TTA_NRRD_MEMBER_CODEC=isal/zlib'
+            )
         level = int(nrrd_libdeflate_level())
         gzip_compress = getattr(deflate, 'gzip_compress')
 
@@ -1580,6 +1642,15 @@ def nrrd_member_gzip_window_bytes() -> int:
     """Uncompressed bytes one layer writer may hold in flight (copied chunks awaiting deflate)."""
     return max(64, _env_int('YOLO_TTA_NRRD_MEMBER_GZIP_WINDOW_MIB', 512)) * 1024 * 1024
 
+
+@dataclass(frozen=True)
+class _RepeatedGzipMembers:
+    """An encoded member repeated without retaining its logical zero raster."""
+
+    member: bytes
+    count: int
+
+
 class _MemberParallelGzipPayloadWriter:
     """Pipelined encoder emitting one complete gzip member sequence per chunk.
 
@@ -1612,11 +1683,21 @@ class _MemberParallelGzipPayloadWriter:
         self._next_sequence = 0
         self._next_write_sequence = 0
         self._pending: Dict[Future, Tuple[int, int]] = {}
-        self._completed: Dict[int, Tuple[bytes, int]] = {}
+        self._completed: Dict[int, Tuple[bytes | _RepeatedGzipMembers, int]] = {}
         self._inflight_bytes = 0
         self._small_pending = bytearray()
         self._hardware_lookbehind: Optional[object] = None
         self._hardware_lookbehind_is_zero = False
+        self._encoded_batch_bytes = 1024 * 1024
+        self._writer_stats: Dict[str, int | float] = {
+            'writers': 1, 'failed_writers': 0,
+            'canonical_zero_logical_bytes': 0, 'canonical_zero_members': 0,
+            'canonical_zero_descriptors': 0, 'output_write_calls': 0,
+            'canonical_zero_write_calls': 0, 'output_write_bytes': 0,
+            'raw_write_seconds': 0.0, 'pending_wait_seconds': 0.0,
+            'ordered_prefix_wait_seconds': 0.0,
+        }
+        self._writer_stats_published = False
 
     def _compress_member(self, payload: object) -> Tuple[bytes, int]:
         """Encode in one native gzip pass; CRC is produced by ISA-L/zlib itself.
@@ -1653,6 +1734,15 @@ class _MemberParallelGzipPayloadWriter:
         seq = int(self._next_sequence)
         self._next_sequence += 1
         self._completed[seq] = (member, 0)
+
+    def _enqueue_repeated_zeros(self, member: bytes, count: int, *, members_per_repeat: int = 1) -> None:
+        if not member or int(count) <= 0:
+            raise ValueError('Repeated gzip members require nonempty bytes and a positive count')
+        seq = int(self._next_sequence)
+        self._next_sequence += 1
+        self._completed[seq] = (_RepeatedGzipMembers(member, int(count)), 0)
+        self._writer_stats['canonical_zero_members'] += int(count) * int(members_per_repeat)
+        self._writer_stats['canonical_zero_descriptors'] += 1
 
     def _enqueue_chunk(self, chunk_mv: memoryview) -> None:
         seq = int(self._next_sequence)
@@ -1720,7 +1810,15 @@ class _MemberParallelGzipPayloadWriter:
         if not self._pending:
             return 0
         if bool(block):
-            done, _not_done = wait(set(self._pending), return_when=FIRST_COMPLETED)
+            prefix_missing = self._next_write_sequence not in self._completed
+            started = time.perf_counter()
+            try:
+                done, _not_done = wait(set(self._pending), return_when=FIRST_COMPLETED)
+            finally:
+                elapsed = time.perf_counter() - started
+                self._writer_stats['pending_wait_seconds'] += elapsed
+                if prefix_missing:
+                    self._writer_stats['ordered_prefix_wait_seconds'] += elapsed
         else:
             done = {fut for fut in self._pending if fut.done()}
         for fut in done:
@@ -1732,14 +1830,84 @@ class _MemberParallelGzipPayloadWriter:
         return int(len(done))
 
     def _write_ready_prefix(self) -> int:
+        if self._next_write_sequence not in self._completed:
+            return 0
         written = 0
+        buffer = bytearray()
+        contains_zero = False
+        limit = self._encoded_batch_bytes
+
+        def flush_buffer() -> None:
+            nonlocal contains_zero
+            if buffer:
+                self._write_encoded_bytes(buffer, contains_zero=contains_zero)
+                buffer.clear()
+                contains_zero = False
+
+        def append(data: bytes, *, zeros: bool) -> None:
+            nonlocal contains_zero
+            view = memoryview(data)
+            offset = 0
+            while offset < len(view):
+                count = min(limit - len(buffer), len(view) - offset)
+                if not buffer and count == limit:
+                    self._write_encoded_bytes(view[offset:offset + count], contains_zero=zeros)
+                else:
+                    buffer.extend(view[offset:offset + count])
+                    contains_zero = contains_zero or zeros
+                    if len(buffer) == limit:
+                        flush_buffer()
+                offset += count
+
         while int(self._next_write_sequence) in self._completed:
             member, charged = self._completed.pop(int(self._next_write_sequence))
-            self.fh.write(member)
+            if isinstance(member, _RepeatedGzipMembers):
+                per_batch = max(1, limit // len(member.member))
+                remaining = member.count
+                bundle_count = min(remaining, per_batch)
+                bundle = member.member * bundle_count
+                while remaining >= bundle_count:
+                    append(bundle, zeros=True)
+                    remaining -= bundle_count
+                if remaining:
+                    append(member.member * remaining, zeros=True)
+            else:
+                append(member, zeros=False)
             self._inflight_bytes -= int(charged)
             self._next_write_sequence += 1
             written += 1
+        flush_buffer()
         return int(written)
+
+    def _write_encoded_bytes(self, data: object, *, contains_zero: bool) -> None:
+        """Finish one bounded raw write, including sinks which accept only a prefix."""
+        view = memoryview(data).cast('B')
+        offset = 0
+        while offset < len(view):
+            started = time.perf_counter()
+            self._writer_stats['output_write_calls'] += 1
+            if contains_zero:
+                self._writer_stats['canonical_zero_write_calls'] += 1
+            try:
+                count = self.fh.write(view[offset:])
+            finally:
+                self._writer_stats['raw_write_seconds'] += time.perf_counter() - started
+            count = len(view) - offset if count is None else int(count)
+            if count <= 0 or count > len(view) - offset:
+                raise OSError('NRRD encoded write made invalid forward progress')
+            offset += count
+            self._writer_stats['output_write_bytes'] += count
+
+    def _publish_writer_stats(self) -> None:
+        if self._writer_stats_published:
+            return
+        self._writer_stats_published = True
+        try:
+            telemetry = runtime_telemetry()
+            for name, value in self._writer_stats.items():
+                telemetry.add(f'nrrd.member_stream.{name}', value)
+        except Exception:
+            pass
 
     def _drain(self, *, block: bool) -> None:
         self._collect_completions(block=False)
@@ -1825,14 +1993,26 @@ class _MemberParallelGzipPayloadWriter:
         remaining = int(nbytes)
         if remaining < 0:
             raise ValueError('A zero run cannot have negative length')
+        if remaining == 0:
+            return 0
         if self.minimum_input_bytes > 1:
             return self.write_zeros(remaining)
         try:
+            self._writer_stats['canonical_zero_logical_bytes'] += remaining
+            full_members, remaining = divmod(remaining, 1024 * 1024)
+            if full_members:
+                self._enqueue_repeated_zeros(canonical_zero_member(1024 * 1024), full_members)
+            tail_members = []
             while remaining:
-                size = 1 << min(20, remaining.bit_length() - 1)
-                self._enqueue_completed(canonical_zero_member(size))
+                size = 1 << (remaining.bit_length() - 1)
+                tail_members.append(canonical_zero_member(size))
                 remaining -= size
-                self._drain(block=len(self._completed) >= 128)
+            if tail_members:
+                self._enqueue_repeated_zeros(b''.join(tail_members), 1,
+                                             members_per_repeat=len(tail_members))
+            # A whole run owns at most two tiny descriptors, independent of its logical
+            # size. One drain preserves ordering without scanning futures per member.
+            self._drain(block=len(self._completed) >= 128)
         except BaseException:
             self.closed = True
             self._abandon_and_settle()
@@ -1932,38 +2112,40 @@ class _MemberParallelGzipPayloadWriter:
     def close(self) -> None:
         if self.closed:
             return
-        if self._small_pending:
-            if self._hardware_lookbehind is not None:
-                combined = bytes(memoryview(self._hardware_lookbehind).cast('B')) + bytes(
-                    self._small_pending
-                )
-                self._hardware_lookbehind = None
-                self._hardware_lookbehind_is_zero = False
-                self._small_pending.clear()
-                self._queue_data_chunk(memoryview(combined), owned=True)
-            elif len(self._small_pending) < int(self.minimum_input_bytes):
-                pending_bytes = int(len(self._small_pending))
-                self.closed = True
-                self._abandon_and_settle()
-                raise RuntimeError(
-                    f'{self.backend} cannot encode the final {pending_bytes}-byte '
-                    f'payload entirely in hardware (minimum {self.minimum_input_bytes})'
-                )
-            else:
-                self._queue_data_chunk(memoryview(bytes(self._small_pending)))
-                self._small_pending.clear()
-        self._submit_hardware_lookbehind()
-        self.closed = True
         try:
+            if self._small_pending:
+                if self._hardware_lookbehind is not None:
+                    combined = bytes(memoryview(self._hardware_lookbehind).cast('B')) + bytes(
+                        self._small_pending
+                    )
+                    self._hardware_lookbehind = None
+                    self._hardware_lookbehind_is_zero = False
+                    self._small_pending.clear()
+                    self._queue_data_chunk(memoryview(combined), owned=True)
+                elif len(self._small_pending) < int(self.minimum_input_bytes):
+                    pending_bytes = int(len(self._small_pending))
+                    raise RuntimeError(
+                        f'{self.backend} cannot encode the final {pending_bytes}-byte '
+                        f'payload entirely in hardware (minimum {self.minimum_input_bytes})'
+                    )
+                else:
+                    self._queue_data_chunk(memoryview(bytes(self._small_pending)))
+                    self._small_pending.clear()
+            self._submit_hardware_lookbehind()
+            self.closed = True
             self._drain(block=True)
+            if self._pending or self._completed or int(self._next_write_sequence) != int(self._next_sequence):
+                raise RuntimeError('NRRD member completion map did not drain completely')
         except BaseException:
+            self.closed = True
             self._abandon_and_settle()
             raise
-        if self._pending or self._completed or int(self._next_write_sequence) != int(self._next_sequence):
-            raise RuntimeError('NRRD member completion map did not drain completely')
+        finally:
+            self._publish_writer_stats()
 
     def _abandon_and_settle(self) -> None:
         """Retain inputs and wait until no failed native/DMA request can still run."""
+        self._writer_stats['failed_writers'] = 1
         pending = list(self._pending)
         for fut in pending:
             fut.cancel()
@@ -1978,6 +2160,7 @@ class _MemberParallelGzipPayloadWriter:
         self._hardware_lookbehind = None
         self._hardware_lookbehind_is_zero = False
         self._inflight_bytes = 0
+        self._publish_writer_stats()
 
     def __enter__(self) -> '_MemberParallelGzipPayloadWriter':
         return self
@@ -2036,6 +2219,58 @@ def _after_nrrd_compression_fork_child() -> None:
 if hasattr(os, 'register_at_fork'):
     os.register_at_fork(after_in_child=_after_nrrd_compression_fork_child)
 
+def _nrrd_codec_runtime_provenance(backend: str) -> Dict[str, object]:
+    """Best-effort interpreter and selected CPU codec identity for diagnostics."""
+    name = str(backend)
+    module_name = {'libdeflate': 'deflate', 'isal': 'isal', 'zlib': 'zlib'}.get(name)
+    distribution_names = {
+        'libdeflate': ('deflate', 'python-deflate'),
+        'isal': ('isal', 'python-isal'),
+    }.get(name, ())
+    provenance: Dict[str, object] = {
+        'python_version': sys.version.split()[0],
+        'python_executable': sys.executable,
+        'codec_backend': name,
+        'codec_module': module_name,
+        'codec_module_path': None,
+        'codec_distribution': None,
+        'codec_distribution_version': None,
+        'codec_runtime_version': None,
+    }
+    if module_name is None:
+        return provenance
+    try:
+        module = importlib.import_module(module_name)
+    except Exception:
+        module = None
+    if module is not None:
+        module_path = getattr(module, '__file__', None)
+        provenance['codec_module_path'] = str(module_path) if module_path else None
+        runtime_version = (
+            getattr(module, 'ZLIB_RUNTIME_VERSION', None) if name == 'zlib'
+            else getattr(module, '__version__', None)
+        )
+        provenance['codec_runtime_version'] = (
+            str(runtime_version) if runtime_version is not None else None
+        )
+    if name == 'libdeflate':
+        known_version = _known_nrrd_libdeflate_version(module) if module is not None else None
+        provenance['gil_release_qualification'] = (
+            'binding version unavailable; qualify GIL release independently'
+            if known_version is None else
+            'version compatibility checked; custom builds require independent qualification'
+        )
+    for distribution_name in distribution_names:
+        try:
+            version = importlib_metadata.version(distribution_name)
+        except Exception:
+            continue
+        provenance['codec_distribution'] = distribution_name
+        provenance['codec_distribution_version'] = str(version)
+        break
+    return provenance
+
+
 def _announce_nrrd_cpu_deflate_backend(
     tier: str,
     *,
@@ -2065,6 +2300,9 @@ def _announce_nrrd_cpu_deflate_backend(
         telemetry.gauge('nrrd.compression.requested_backend', requested)
         telemetry.gauge('nrrd.compression.selected_backend', str(backend))
         telemetry.gauge('nrrd.compression.effective_level', int(level))
+        provenance = _nrrd_codec_runtime_provenance(str(backend))
+        print('NRRD DEFLATE runtime provenance: ' + json.dumps(provenance, sort_keys=True))
+        telemetry.gauge('nrrd.compression.runtime_provenance', provenance)
         capabilities = getattr(_compress, 'capabilities', None)
         if isinstance(capabilities, dict):
             telemetry.gauge(f'nrrd.compression.{backend}.capabilities', capabilities)
@@ -2160,6 +2398,7 @@ def _select_nrrd_member_codec(
     for name in _nrrd_member_codec_candidates():
         codec_loaded = False
         module_missing = False
+        old_libdeflate_binding = False
         try:
             spec = _nrrd_member_codec_spec(str(name))
             codec_loaded = True
@@ -2182,6 +2421,13 @@ def _select_nrrd_member_codec(
                 'known-answer/round-trip self-test failed',
             )
         except Exception as exc:
+            old_libdeflate_binding = isinstance(exc, _OldNrrdLibdeflateBindingError)
+            if isinstance(exc, _OldNrrdLibdeflateBindingError) and requested == 'libdeflate':
+                runtime_telemetry().fallback('nrrd.compression.libdeflate', exc)
+                raise RuntimeError(
+                    'Explicit YOLO_TTA_NRRD_MEMBER_CODEC=libdeflate is incompatible: '
+                    f'{exc}'
+                ) from exc
             reason = str(exc) or type(exc).__name__
             module_missing = bool(getattr(exc, 'module_missing', False))
         # Missing optional codecs are expected in auto mode. Forced selection and actual
@@ -2190,6 +2436,7 @@ def _select_nrrd_member_codec(
         announce = bool(
             not policy_chain
             or codec_loaded
+            or old_libdeflate_binding
             or str(name) == 'zlib'
             or (str(name) in {'qat', 'iaa'} and not module_missing)
         )
@@ -2259,7 +2506,7 @@ def _madvise_array_mmap(arr: object, advice_name: str) -> None:
             mmap_obj = getattr(base, '_mmap', None)
         madvise_fn = getattr(mmap_obj, 'madvise', None)
         if callable(madvise_fn):
-            madvise_fn(advice)
+            _madvise_mmap_traced(mmap_obj, advice, source='nrrd.write')
     except Exception:
         pass
 
@@ -3287,6 +3534,7 @@ class NrrdLayerSink:
         self.max_workers = max(1, int(max_workers))
         self._lock = threading.Lock()
         self._futures: List[Future] = []
+        self._source_refs: Dict[Future, NrrdLayerRef] = {}
         self._manifest: List[Dict[str, object]] = []
         self._suffix_counts: Dict[str, int] = {}
         # Slicer segment colors already assigned in this run, so two layers whose
@@ -3482,7 +3730,24 @@ class NrrdLayerSink:
 
             fut = self.executor.submit(_execute_layer_write)
             self._futures.append(fut)
+            self._source_refs[fut] = ref
+        # add_done_callback runs immediately when the task already finished.
+        # Register outside the source-map lock; the callback captures no layer.
+        fut.add_done_callback(self._release_completed_source)
         return out_path
+
+    def _release_completed_source(self, future: Future) -> None:
+        with self._lock:
+            self._source_refs.pop(future, None)
+
+    def pending_layer_refs(self) -> Tuple[NrrdLayerRef, ...]:
+        """Snapshot every unfinished export's source without opening its payload."""
+        with self._lock:
+            self._source_refs = {
+                future: ref for future, ref in self._source_refs.items()
+                if not future.done()
+            }
+            return tuple(self._source_refs.values())
 
     def layer_count(self) -> int:
         with self._lock:
@@ -3565,6 +3830,8 @@ class NrrdLayerSink:
 
     def shutdown(self) -> None:
         self.executor.shutdown(wait=True)
+        with self._lock:
+            self._source_refs.clear()
 
     def write_manifest(self) -> Optional[Path]:
         with self._lock:
@@ -4098,6 +4365,7 @@ def _resize_sparse_binary_crop_to_output_region(
                 * fy[:, None] * fx[None, :]
             )
             return value
+
 
         # Bound float64 temporaries while leaving each batch as a few large native gathers.
         cols = max(1, int(restored.shape[1]))
@@ -5115,11 +5383,16 @@ class BackgroundOutputManager:
         self.pending.append(submission)
         return submission.result_paths
 
-    def reap_completed(self) -> None:
+    def reap_completed(self, *, max_completed: Optional[int] = None) -> None:
+        if max_completed is not None and int(max_completed) < 1:
+            raise ValueError('Output completion limit must be positive')
         remaining: List[BackgroundOutputSubmission] = []
+        reaped = 0
         for submission in self.pending:
-            if all(fut.done() for fut in submission.futures):
+            if ((max_completed is None or reaped < int(max_completed))
+                    and all(fut.done() for fut in submission.futures)):
                 submission.wait()
+                reaped += 1
             else:
                 remaining.append(submission)
         self.pending = remaining

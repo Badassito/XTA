@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import importlib.util
 import os
-import sys
 import tempfile
 import threading
 import types
@@ -11,18 +9,7 @@ from unittest import mock
 
 import numpy as np
 
-from tools.smoke_import import install_stubs
-
-
-def _available(name: str) -> bool:
-    try:
-        return importlib.util.find_spec(name) is not None
-    except (ImportError, ModuleNotFoundError, ValueError):
-        return False
-
-
-if not all(_available(name) for name in ("cv2", "scipy", "tifffile", "tqdm")):
-    install_stubs()
+from tests._module_patches import patch_module_entries
 
 from XTA import cuda_finalization, experimental_features, topology
 
@@ -340,7 +327,7 @@ class CudaFinalizationContractTests(unittest.TestCase):
                 },
                 clear=False,
             ),
-            mock.patch.dict(sys.modules, runtime.modules(), clear=False),
+            patch_module_entries(runtime.modules()),
             mock.patch.object(
                 cuda_finalization, "_configured_tail_devices", return_value=devices,
             ),

@@ -565,7 +565,23 @@ _D1_PUBLICATION_EXECUTOR: Optional[ThreadPoolExecutor] = None
 
 _D1_PUBLICATION_SEMAPHORE: Optional[threading.BoundedSemaphore] = None
 
+_D1_CONFIDENCE_POOL = None
+
 _D1_PIPELINE_ANNOUNCED = False
+
+def d1_confidence_retirement_host_bytes() -> int:
+    """Per-worker host reserve for captured scores and compression temporaries."""
+    return max(16, min(4096, _env_int('YOLO_TTA_D1_CONFIDENCE_HOST_MIB', 512))) * 1024**2
+
+
+def _d1_confidence_pool():
+    global _D1_CONFIDENCE_POOL
+    from .d1_confidence_retirement import HostPublicationPool
+    if _D1_CONFIDENCE_POOL is None:
+        _D1_CONFIDENCE_POOL = HostPublicationPool(
+            byte_limit=d1_confidence_retirement_host_bytes(), workers=2,
+            task_limit=d1_publication_max_pending_per_worker())
+    return _D1_CONFIDENCE_POOL
 
 def _d1_publication_executor() -> ThreadPoolExecutor:
     global _D1_PUBLICATION_EXECUTOR, _D1_PUBLICATION_SEMAPHORE
@@ -581,7 +597,11 @@ def _d1_publication_executor() -> ThreadPoolExecutor:
     return _D1_PUBLICATION_EXECUTOR
 
 def _shutdown_d1_worker_pipeline() -> None:
-    global _D1_PUBLICATION_EXECUTOR, _D1_PUBLICATION_SEMAPHORE
+    global _D1_PUBLICATION_EXECUTOR, _D1_PUBLICATION_SEMAPHORE, _D1_CONFIDENCE_POOL
+    confidence_pool = _D1_CONFIDENCE_POOL
+    _D1_CONFIDENCE_POOL = None
+    if confidence_pool is not None:
+        confidence_pool.shutdown()
     with _D1_WORKER_VIEW_LOCK:
         states = list(_D1_WORKER_VIEW_STATES.values())
         _D1_WORKER_VIEW_STATES.clear()
@@ -1503,10 +1523,56 @@ def _d1_prepare_bbox_launch_plan(
     return specs, launch_groups, int(scanned_bbox_pixels)
 
 
-def _d1_write_task_confidence(task: Mapping[str, object], accumulator: object) -> Dict[str, object]:
-    """Retire one native-view score shard without allocating a source score volume."""
-    from .confidence_evidence import write_block_confidence_evidence
+def _d1_confidence_support_metadata(accumulator, shape):
+    """Prefer producer bounds; derive missing bounds from the fenced mask on device."""
+    metrics = dict(support_emitted_tasks=0, support_derived_tasks=0,
+                   support_full_plane_tasks=0, support_derivation_seconds=0.,
+                   support_metadata_d2h_bytes=0)
 
+    def valid(metadata):
+        if not isinstance(metadata, dict):
+            return False
+        flags = np.asarray(metadata.get('slice_any'))
+        boxes = np.asarray(metadata.get('slice_bboxes'))
+        if (flags.shape != (shape[0],) or boxes.shape != (shape[0], 4)
+                or flags.dtype.kind not in 'biu' or boxes.dtype.kind not in 'iu'
+                or np.any((flags != 0) & (flags != 1))):
+            return False
+        active = flags != 0
+        y0, y1, x0, x1 = boxes.T
+        return not bool(np.any(active & (
+            (y0 < 0) | (y0 >= y1) | (y1 > shape[1])
+            | (x0 < 0) | (x0 >= x1) | (x1 > shape[2])
+        )) or np.any(boxes[~active] != 0))
+
+    metadata = None
+    if not bool(getattr(accumulator, 'host_written', False)):
+        emitted_reader = getattr(accumulator, 'compute_d1_slice_metadata', None)
+        try:
+            metadata = emitted_reader(synchronize_device=False) if callable(emitted_reader) else None
+            if valid(metadata):
+                metrics.update(support_emitted_tasks=1, support_metadata_d2h_bytes=16*shape[0])
+                return metadata, metrics
+        except Exception:
+            pass
+        derived_reader = getattr(accumulator, 'compute_slice_metadata', None)
+        if callable(derived_reader):
+            started = time.perf_counter()
+            try:
+                metadata = derived_reader(synchronize_device=False, include_row_occupancy=False)
+                if valid(metadata):
+                    metrics.update(support_derived_tasks=1, support_metadata_d2h_bytes=33*shape[0])
+                    return metadata, metrics
+            except Exception:
+                pass
+            finally:
+                metrics['support_derivation_seconds'] = time.perf_counter() - started
+    metrics['support_full_plane_tasks'] = 1
+    return None, metrics
+
+
+def _d1_confidence_task_spec(task: Mapping[str, object], accumulator: object):
+    """Validate immutable task identity and capture support from producer metadata."""
     scores = getattr(accumulator, 'conf_dev', None)
     masks = getattr(accumulator, 'union_dev', None)
     if scores is None or masks is None:
@@ -1537,21 +1603,17 @@ def _d1_write_task_confidence(task: Mapping[str, object], accumulator: object) -
         pass_index=0, stage='pre_interpolation',
     )
 
-    def read_plane(index: int) -> np.ndarray:
-        # All producer streams were synchronized by predict_source_and_accumulate
-        # before its consumer callback. Transfer just one score/mask plane, with
-        # owned host storage; the caller's tensors and binary masks are immutable.
-        score_plane = scores[index].detach().cpu().numpy()
-        mask_plane = masks[index].detach().cpu().numpy()
-        if score_plane.dtype != np.uint8 or mask_plane.dtype != np.uint8:
-            raise TypeError('D1 confidence retirement requires uint8 score and mask tensors')
-        result = np.array(score_plane, dtype=np.uint8, copy=True)
-        result[mask_plane == 0] = np.uint8(0)
-        return result
-
-    started = time.perf_counter()
-    reference = write_block_confidence_evidence(
-        shard_path, shape, read_plane, layer_key=key, model_name=model_name,
+    metadata, support_metrics = _d1_confidence_support_metadata(accumulator, shape)
+    if isinstance(metadata, dict):
+        # Reuse the same small readback for binary backprojection later in this callback.
+        specs, _, _ = _d1_prepare_bbox_launch_plan(metadata['slice_any'], metadata['slice_bboxes'], shape)
+        accumulator._d1_confidence_slice_metadata = metadata
+        boxes = {int(z): (int(y), int(y+h), int(x), int(x+w)) for z,y,x,h,w in specs}
+    else:
+        # Failed or unavailable support metadata must retain every byte.
+        boxes = {z: (0, shape[1], 0, shape[2]) for z in range(count)}
+    return scores, masks, boxes, dict(
+        path=shard_path, shape=shape, layer_key=key, model_name=model_name,
         coordinate_space='native_view_processing',
         source_shape_tyx=tuple(task.get('d1_output_shape') or (view.full_t,view.full_h,view.full_w)),
         provenance={
@@ -1560,30 +1622,161 @@ def _d1_write_task_confidence(task: Mapping[str, object], accumulator: object) -
             'view_name': str(view.name),
             'view_shape_tyx': [int(view.num_slices), shape[1], shape[2]],
             'task_id': task.get('task_id'),
-        },
-    )
-    return {
+        }), {
         'protocol': 'xta.d1.native-confidence.v1',
-        'path': str(reference.path),
+        'path': str(shard_path),
         'shape_tyx': list(shape),
         'slice_start': first, 'slice_count': count,
         'view_shape_tyx': [int(view.num_slices), shape[1], shape[2]],
         'view_name': str(view.name), 'model_name': model_name, 'layer_key': key,
         'output_shape_tyx': list(task.get('d1_output_shape') or
                                  (int(view.full_t), int(view.full_h), int(view.full_w))),
-        'known_voxels': int(reference.metadata['known_voxels']),
-        'publication_seconds': max(0.0, time.perf_counter() - started),
-    }
+    }, support_metrics
+
+
+class _D1ConfidenceCropReader:
+    """Sparse, owned host crops; no device references escape into a writer job."""
+
+    def __init__(self, crops):
+        self.crops = crops
+        self.known_z_bounds = ((min(crops), max(crops) + 1) if crops else (0, 0))
+
+    def iter_crops(self, index):
+        crop = self.crops.get(index)
+        if crop is not None:
+            yield crop
+
+
+def _d1_copy_confidence_crop(scores, masks, index, box, metrics):
+    y0,y1,x0,x1 = box
+    started = time.perf_counter()
+    score = scores[index, y0:y1, x0:x1].detach().cpu().numpy()
+    mask = masks[index, y0:y1, x0:x1].detach().cpu().numpy()
+    metrics['transfer_seconds'] += time.perf_counter() - started
+    if score.dtype != np.uint8 or mask.dtype != np.uint8:
+        raise TypeError('D1 confidence retirement requires uint8 score and mask tensors')
+    values = np.array(score, dtype=np.uint8, copy=True)
+    values[mask == 0] = np.uint8(0)
+    metrics['d2h_bytes'] += int(score.nbytes + mask.nbytes)
+    metrics['d2h_calls'] += 2
+    metrics['capture_seconds'] += time.perf_counter() - started
+    return y0,y1,x0,x1,values
+
+
+def _d1_confidence_metrics(shape, boxes):
+    return dict(d2h_bytes=0, d2h_calls=0, dense_equivalent_bytes=2*math.prod(shape),
+                empty_slices_skipped=shape[0]-len(boxes), capture_seconds=0., transfer_seconds=0.,
+                host_wait_seconds=0., host_reserved_bytes=0)
+
+
+def _d1_publish_confidence_capture(spec, descriptor, reader, metrics):
+    from .confidence_evidence import write_block_confidence_evidence
+    started = time.perf_counter()
+    storage_metrics = {}
+    reference = write_block_confidence_evidence(**spec, slice_reader=reader, metrics=storage_metrics)
+    metrics = {**metrics, **storage_metrics}
+    for name, value in metrics.items():
+        runtime_telemetry().add('d1.confidence_' + name, value)
+    return {**descriptor, 'known_voxels': int(reference.metadata['known_voxels']),
+            'publication_seconds': time.perf_counter() - started,
+            'capture_metrics': metrics}
+
+
+def _d1_write_task_confidence(task: Mapping[str, object], accumulator: object,
+                            *, capture_spec=None) -> Dict[str, object]:
+    """Bounded synchronous compatibility path, transferring only supported crops."""
+    scores, masks, boxes, spec, descriptor, support_metrics = (
+        capture_spec if capture_spec is not None else _d1_confidence_task_spec(task, accumulator))
+    metrics = _d1_confidence_metrics(spec['shape'], boxes)
+    metrics.update(support_metrics)
+    # Split only on the writer's global 128-pixel block boundaries, so both
+    # compressed block bytes and index coordinates match the unsplit reader.
+    max_pixels = max(128**2, (d1_confidence_retirement_host_bytes() - 1024**2)//5)
+    band_width = max(128, max_pixels//(128**2)*128)
+
+    class Reader:
+        known_z_bounds = ((min(boxes), max(boxes)+1) if boxes else (0, 0))
+
+        def iter_crops(self, index):
+            if index in boxes:
+                y0,y1,x0,x1 = boxes[index]
+                if (y1-y0)*(x1-x0) <= max_pixels:
+                    yield _d1_copy_confidence_crop(scores, masks, index, boxes[index], metrics)
+                else:
+                    for y in range(y0//128*128, y1, 128):
+                        for x in range(x0//band_width*band_width, x1, band_width):
+                            box = (max(y,y0), min(y+128,y1), max(x,x0), min(x+band_width,x1))
+                            yield _d1_copy_confidence_crop(scores, masks, index, box, metrics)
+
+    return _d1_publish_confidence_capture(spec, descriptor, Reader(), metrics)
+
+
+def _d1_submit_task_confidence(task, accumulator):
+    capture_spec = _d1_confidence_task_spec(task, accumulator)
+    scores, masks, boxes, spec, descriptor, support_metrics = capture_spec
+    pixels = [(y1-y0)*(x1-x0) for y0,y1,x0,x1 in boxes.values()]
+    # Live copied score/mask/selection temporaries, owned scores, crop metadata,
+    # and one encoder's block/compressed buffers all fit inside the reservation.
+    reserved = sum(pixels) + 3*max(pixels, default=0) + 256*len(boxes) + 1024**2
+    pool = _d1_confidence_pool()
+    if reserved > pool.byte_limit:
+        pool.drain()
+        return _d1_write_task_confidence(task, accumulator, capture_spec=capture_spec)
+    reservation = pool.reserve(reserved)
+    metrics = _d1_confidence_metrics(spec['shape'], boxes)
+    metrics.update(support_metrics)
+    metrics.update(host_wait_seconds=reservation.wait_seconds, host_reserved_bytes=reserved)
+    started = time.perf_counter()
+    try:
+        crops = {index: _d1_copy_confidence_crop(scores, masks, index, box, metrics)
+                 for index, box in sorted(boxes.items())}
+        reader = _D1ConfidenceCropReader(crops)
+        metrics['capture_wall_seconds'] = time.perf_counter() - started
+        # Only this host reader, immutable identity, and numeric counters are closed over.
+        def publish_owned():
+            try:
+                return _d1_publish_confidence_capture(spec, descriptor, reader, metrics)
+            except BaseException as exc:
+                # Failed futures keep tracebacks; clear inactive encoder frames
+                # so their last numeric crop cannot outlive the byte credit.
+                import traceback
+                traceback.clear_frames(exc.__traceback__)
+                raise
+            finally:
+                # Executor future callbacks may outlive the encoder. Drop captured
+                # bytes before its credit is returned, including the failure path.
+                reader.crops.clear()
+        return reservation.submit(publish_owned)
+    except BaseException:
+        reservation.release()
+        raise
 
 
 def _consume_device_union_with_confidence(task: Mapping[str, object], accumulator: object,
                                         consumer: Callable[[object], Optional[Dict[str, object]]]) -> Dict[str, object]:
-    """Preserve native scores before a legacy or radial owner releases its task."""
+    """Capture native scores before device release; join both publications afterward."""
     shard = None
     if bool(getattr(accumulator, 'retain_confidence', False)):
-        shard = _d1_write_task_confidence(task, accumulator)
-    result = dict(consumer(accumulator) or {})
-    if shard is not None:
+        shard = _d1_submit_task_confidence(task, accumulator)
+    try:
+        result = dict(consumer(accumulator) or {})
+    except BaseException as exc:
+        if isinstance(shard, Future):
+            # The task failed before handing its future to the worker protocol.
+            # Drain host ownership and observe its failure before unwinding.
+            try:
+                shard.result()
+            except BaseException as publication_error:
+                note = f'D1 confidence publication also failed: {publication_error!r}'
+                if hasattr(exc, 'add_note'):
+                    exc.add_note(note)
+                else:
+                    print(note, flush=True)
+        raise
+    if isinstance(shard, Future):
+        from .d1_confidence_retirement import join_publications
+        result['_publication_future'] = join_publications(shard, result.pop('_publication_future', None))
+    elif shard is not None:
         result['d1_confidence_shard'] = shard
     return result
 
@@ -1634,7 +1827,9 @@ def _d1_consume_device_union(
     # The resident quantizer emitted these four-int bboxes while writing the final mask.
     # The caller already sealed/synchronized every producer, so this reads only the tiny
     # metadata array instead of reducing the complete task union over rows and columns.
-    slice_meta = accumulator.compute_d1_slice_metadata(synchronize_device=False)
+    slice_meta = getattr(accumulator, '_d1_confidence_slice_metadata', None)
+    if slice_meta is None:
+        slice_meta = accumulator.compute_d1_slice_metadata(synchronize_device=False)
     if not isinstance(slice_meta, dict):
         raise RuntimeError('D1 requires valid device slice metadata for bbox-limited backprojection')
     slice_any = np.asarray(slice_meta.get('slice_any'), dtype=bool)

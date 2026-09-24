@@ -40,6 +40,22 @@ def _pull_spherical_f64(source, radii, rotation, boxes, use_boxes,
         radius = math.sqrt((dx * dx + dy * dy) + dz * dz)
         if radius < minimum or radius > maximum:
             continue
+        # Empty shell metadata proves that no face pixel can contribute. This
+        # uses the identical global nearest-shell search and midpoint rule.
+        shell = -1
+        if use_boxes:
+            lo, hi = 0, len(radii)
+            while lo < hi:
+                middle = lo + (hi - lo) // 2
+                if radii[middle] < radius:
+                    lo = middle + 1
+                else:
+                    hi = middle
+            outer = min(lo, len(radii) - 1)
+            inner = max(outer - 1, 0)
+            shell = inner if radius - radii[inner] <= radii[outer] - radius else outer
+            if boxes[shell, 1] <= boxes[shell, 0] or boxes[shell, 3] <= boxes[shell, 2]:
+                continue
         lx = (dx * rotation[0, 0] + dy * rotation[1, 0]) + dz * rotation[2, 0]
         ly = (dx * rotation[0, 1] + dy * rotation[1, 1]) + dz * rotation[2, 1]
         lz = (dx * rotation[0, 2] + dy * rotation[1, 2]) + dz * rotation[2, 2]
@@ -97,16 +113,17 @@ def _pull_spherical_f64(source, radii, rotation, boxes, use_boxes,
             continue
         pr = row if native_h == source_h else min(np.int64((float(row) + .5) * source_h / native_h), source_h - 1)
         pc = column if native_w == source_w else min(np.int64((float(column) + .5) * source_w / native_w), source_w - 1)
-        lo, hi = 0, len(radii)
-        while lo < hi:
-            middle = lo + (hi - lo) // 2
-            if radii[middle] < radius:
-                lo = middle + 1
-            else:
-                hi = middle
-        outer = min(lo, len(radii) - 1)
-        inner = max(outer - 1, 0)
-        shell = inner if radius - radii[inner] <= radii[outer] - radius else outer
+        if not use_boxes:
+            lo, hi = 0, len(radii)
+            while lo < hi:
+                middle = lo + (hi - lo) // 2
+                if radii[middle] < radius:
+                    lo = middle + 1
+                else:
+                    hi = middle
+            outer = min(lo, len(radii) - 1)
+            inner = max(outer - 1, 0)
+            shell = inner if radius - radii[inner] <= radii[outer] - radius else outer
         if use_boxes and (pr < boxes[shell, 0] or pr >= boxes[shell, 1]
                           or pc < boxes[shell, 2] or pc >= boxes[shell, 3]):
             continue

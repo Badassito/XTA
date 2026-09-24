@@ -36,6 +36,9 @@ class HostTensor:
 
 
 class D1ConfidenceRetentionTests(unittest.TestCase):
+    def tearDown(self):
+        cuda_d1._shutdown_d1_worker_pipeline()
+
     def test_resident_admission_keeps_retention_separate_from_cleanup(self):
         from tests.test_trt_preflight_admission import TensorRTPreflightAdmissionTests
         fixture = TensorRTPreflightAdmissionTests()
@@ -99,7 +102,7 @@ class D1ConfidenceRetentionTests(unittest.TestCase):
                     task_id=13)
         return task, accumulator, scores, masks, copies
 
-    def test_shard_is_complete_and_mask_immutable_before_consumer_retires_device_data(self):
+    def test_shard_is_complete_before_result_and_mask_is_immutable(self):
         for family in ('orthogonal', 'radial'):
             with tempfile.TemporaryDirectory() as directory, self.subTest(family=family):
                 task, accumulator, scores, masks, copies = self.fixture(directory, family=family)
@@ -107,18 +110,17 @@ class D1ConfidenceRetentionTests(unittest.TestCase):
 
                 def consume(value):
                     self.assertIs(value, accumulator)
-                    paths = list(Path(directory).rglob('metadata.json'))
-                    self.assertEqual(len(paths), 1)
-                    with ConfidenceEvidenceRef.open(paths[0].parent).native_reader() as reader:
-                        actual, known = reader(0, 3)
-                    expected = np.where(masks != 0, scores, 0)
-                    np.testing.assert_array_equal(actual, expected)
-                    np.testing.assert_array_equal(known, expected > 0)
                     accumulator.conf_dev = accumulator.union_dev = None
                     return {'d1_view_complete': False}
 
                 result = cuda_d1._consume_device_union_with_confidence(task, accumulator, consume)
+                result.update(result.pop('_publication_future').result(timeout=10))
                 shard = result['d1_confidence_shard']
+                with ConfidenceEvidenceRef.open(shard['path']).native_reader() as reader:
+                    actual, known = reader(0, 3)
+                expected = np.where(masks != 0, scores, 0)
+                np.testing.assert_array_equal(actual, expected)
+                np.testing.assert_array_equal(known, expected > 0)
                 self.assertEqual(shard['protocol'], 'xta.d1.native-confidence.v1')
                 self.assertEqual(shard['slice_start'], 4)
                 self.assertEqual(shard['slice_count'], 3)
@@ -131,7 +133,7 @@ class D1ConfidenceRetentionTests(unittest.TestCase):
 
     def test_disabled_retention_does_not_touch_confidence_or_change_result(self):
         consumer = mock.Mock(return_value={'normal': 17})
-        with mock.patch.object(cuda_d1, '_d1_write_task_confidence', side_effect=AssertionError('retained disabled')):
+        with mock.patch.object(cuda_d1, '_d1_submit_task_confidence', side_effect=AssertionError('retained disabled')):
             result = cuda_d1._consume_device_union_with_confidence({}, SimpleNamespace(retain_confidence=False), consumer)
         self.assertEqual(result, {'normal': 17})
         consumer.assert_called_once()
@@ -150,7 +152,7 @@ class D1ConfidenceRetentionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'incomplete'):
                 cuda_d1._d1_write_task_confidence(task, accumulator)
 
-    def test_shard_validation_and_write_errors_propagate_without_retirement(self):
+    def test_shard_validation_and_deferred_write_errors_propagate(self):
         with tempfile.TemporaryDirectory() as directory:
             task, accumulator, *_ = self.fixture(directory)
             for invalid in ({'slice_start': 8}, {'slice_count': 1}, {'view': None}, {'d1_store_dir': ''}):
@@ -158,9 +160,11 @@ class D1ConfidenceRetentionTests(unittest.TestCase):
                     cuda_d1._d1_write_task_confidence({**task, **invalid}, accumulator)
             consumer = mock.Mock()
             with mock.patch('XTA.confidence_evidence.write_block_confidence_evidence', side_effect=OSError('disk failure')):
+                consumer.return_value = {}
+                result = cuda_d1._consume_device_union_with_confidence(task, accumulator, consumer)
                 with self.assertRaisesRegex(OSError, 'disk failure'):
-                    cuda_d1._consume_device_union_with_confidence(task, accumulator, consumer)
-            consumer.assert_not_called()
+                    result['_publication_future'].result(timeout=10)
+            consumer.assert_called_once()
             self.assertIsNotNone(accumulator.union_dev)
 
 

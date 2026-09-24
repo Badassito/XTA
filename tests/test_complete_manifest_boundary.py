@@ -5,10 +5,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tools.smoke_import import install_stubs
-
-
-install_stubs()
 
 from XTA import pipeline
 from XTA import pta

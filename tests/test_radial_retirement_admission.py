@@ -202,7 +202,9 @@ class RadialSchedulerRetirementAdmissionTests(unittest.TestCase):
         self.assertIsNone(self.acquire(0))
         self.coordinator.set_inference_asset_retirement_pending(False)
         with mock.patch.object(bp, 'gpu_worker_aux_interpolation_pool',
-                               return_value=SimpleNamespace(revoke_worker=lambda _device: False)):
+                               return_value=SimpleNamespace(
+                                   claim_worker_for_stage=lambda _device: None,
+                                   release_stage_claim=lambda _device, _token: None)):
             self.assertIsNone(self.acquire(0))
         self.assertIsNotNone(self.acquire(0))
 

@@ -243,7 +243,8 @@ def policy_parent_memory_plan(tasks, *, requested_dense_limit, available_ram_byt
         coverage_ratio_denominator=coverage_denominator)
 
 
-def retained_payload_plan(shapes, available, worker_count, publication_pending, unpack_bytes, *, cap=0, output_reserve_bytes=0, native_dense_reserve_bytes=0):
+def retained_payload_plan(shapes, available, worker_count, publication_pending, unpack_bytes, *, cap=0,
+                          output_reserve_bytes=0, native_dense_reserve_bytes=0, worker_buffer_reserve_bytes=0):
     """Reserve future topology/union and all admitted host publication bitsets.
 
     Each selected layer is charged its *worst-case* packed payload for its whole
@@ -263,6 +264,7 @@ def retained_payload_plan(shapes, available, worker_count, publication_pending, 
         + 2 * max(1, int(publication_pending)) * max(0, int(unpack_bytes)))
     reserve += max(0, int(output_reserve_bytes))
     reserve += max(0, int(native_dense_reserve_bytes))
+    reserve += max(0, int(worker_buffer_reserve_bytes))
     budget = max(0, int(available) - reserve) // 2
     if int(cap) > 0:
         budget = min(budget, int(cap))
@@ -274,6 +276,7 @@ def retained_payload_plan(shapes, available, worker_count, publication_pending, 
         grants.append(grant)
         remaining -= grant
     return dict(reserve_bytes=reserve, budget_bytes=budget,
+                worker_buffer_reserve_bytes=max(0, int(worker_buffer_reserve_bytes)),
                 reserved_bytes=budget - remaining, grants=grants)
 
 
@@ -291,7 +294,8 @@ def publication_output_reserve(sink, window_bytes, member_bytes):
     return int(sink.max_workers) * (canvases + windows) + dense + dense // 100 + 1024**2
 
 
-def plan_native_publication_memory(tasks, *, keep_temp, worker_count, publication_pending, unpack_bytes, output_reserve_bytes=0, native_dense_reserve_bytes=0):
+def plan_native_publication_memory(tasks, *, keep_temp, worker_count, publication_pending, unpack_bytes,
+                                   output_reserve_bytes=0, native_dense_reserve_bytes=0, worker_buffer_reserve_bytes=0):
     """Create parent-owned empty memfds; immutable task grants bound their growth."""
     if (keep_temp or not memfd_workspace_enabled() or scratch_dir_is_memory_backed()
             or not _env_flag('YOLO_TTA_PUBLICATION_RAM', True)
@@ -319,7 +323,8 @@ def plan_native_publication_memory(tasks, *, keep_temp, worker_count, publicatio
     headroom = publication_ram_headroom()
     plan = retained_payload_plan(shapes, headroom, worker_count, publication_pending, unpack_bytes,
                                  cap=cap, output_reserve_bytes=output_reserve_bytes,
-                                 native_dense_reserve_bytes=native_dense_reserve_bytes)
+                                 native_dense_reserve_bytes=native_dense_reserve_bytes,
+                                 worker_buffer_reserve_bytes=worker_buffer_reserve_bytes)
     # Small volumes can admit many more layers than a process can hold open.
     # Leave descriptors for inference IPC, readers, codecs and final output.
     try:

@@ -19,6 +19,10 @@ BLOCK_DTYPE = np.dtype([('z','<u4'), ('y','<u4'), ('x','<u4'), ('h','<u2'),
 _RECORD = struct.Struct('<IIIHHQI')
 
 
+class ConfidenceStageLimit(RuntimeError):
+    """A local compressed stage would exceed its reserved numeric bytes."""
+
+
 def checked_shape(shape):
     values = tuple(shape)
     if (len(values) != 3 or any(isinstance(v, bool) or int(v) != v or not 0 < int(v) < 2**31
@@ -50,8 +54,41 @@ def plane_blocks(plane, block_size=128):
             yield y+y0,y+y1,x+x0,x+x1,np.ascontiguousarray(tile[y0:y1,x0:x1])
 
 
+def crop_blocks(crops, shape, block_size=128):
+    """Partition owned crops on the same global grid as a full-plane scan."""
+    height, width = shape
+    block = int(block_size)
+    previous = (-1, -1)
+    for y0, y1, x0, x1, crop in crops:
+        values = np.asarray(crop)
+        y0, y1, x0, x1 = map(int, (y0, y1, x0, x1))
+        if (values.dtype != np.uint8 or values.shape != (y1-y0, x1-x0)
+                or not 0 <= y0 < y1 <= height or not 0 <= x0 < x1 <= width):
+            raise ValueError('Confidence reader returned an invalid crop')
+        columns = np.arange(x0//block*block, x1, block, dtype=np.int64)
+        starts = np.maximum(columns-x0, 0)
+        for y in range(y0//block*block, y1, block):
+            a, b = max(y, y0), min(y+block, y1)
+            occupied = np.any(values[a-y0:b-y0], axis=0)
+            active = np.logical_or.reduceat(occupied, starts)
+            for column in np.flatnonzero(active):
+                x = int(columns[column])
+                a, b, c, d = max(y, y0), min(y+block, y1), max(x, x0), min(x+block, x1)
+                tile = values[a-y0:b-y0, c-x0:d-x0]
+                ys = np.flatnonzero(np.any(tile, axis=1))
+                if not ys.size:
+                    continue
+                xs = np.flatnonzero(np.any(tile, axis=0))
+                if (y, x) <= previous:
+                    raise ValueError('Confidence reader crops must have disjoint, ordered block cells')
+                previous = (y, x)
+                top, bottom, left, right = int(ys[0]), int(ys[-1])+1, int(xs[0]), int(xs[-1])+1
+                yield a+top, a+bottom, c+left, c+right, np.ascontiguousarray(tile[top:bottom, left:right])
+
+
 def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, provenance,
-                 coordinate_space='source', source_shape=None, block_size=128):
+                 coordinate_space='source', source_shape=None, block_size=128,
+                 metrics=None, max_numeric_bytes=None):
     """Stream block index and payload; metadata is the atomic completion marker."""
     from .confidence_evidence import SCORE_SEMANTICS, _write_json_atomic, _json_value
     directory = Path(directory)
@@ -65,6 +102,8 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
     block_size = int(block_size)
     if not 1 <= block_size <= 65535:
         raise ValueError('Invalid confidence block size')
+    if max_numeric_bytes is not None and int(max_numeric_bytes) <= 0:
+        raise ValueError('Confidence numeric staging limit must be positive')
     first,stop = map(int,getattr(slice_reader,'known_z_bounds',(0,shape[0])))
     if not 0 <= first <= stop <= shape[0]:
         raise ValueError('Confidence known-support bounds are outside their payload grid')
@@ -74,6 +113,7 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
     payload_tmp,index_tmp = directory/'scores.u8.zlib.partial',directory/'index.bin.partial'
     digest,index_digest = hashlib.sha256(),hashlib.sha256()
     blocks,known = 0,0
+    read_seconds = scan_seconds = compression_seconds = storage_seconds = 0.0
     started = time.perf_counter()
     next_progress = started + 30.0
     try:
@@ -86,20 +126,44 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
                           f'blocks={blocks}, payload_bytes={payload.tell()}, elapsed_s={now-started:.1f}.',
                           flush=True)
                     next_progress = now + 30.0
-                plane = slice_reader(z)
-                if plane is None:
-                    continue
-                values = np.asarray(plane)
-                if values.dtype != np.uint8 or values.shape != shape[1:]:
-                    raise ValueError('Confidence slice reader returned an invalid shape or dtype')
-                for y0,y1,x0,x1,crop in plane_blocks(values,block_size):
+                phase_started = time.perf_counter()
+                if hasattr(slice_reader, 'iter_crops'):
+                    iterator = iter(crop_blocks(slice_reader.iter_crops(z), shape[1:], block_size))
+                else:
+                    plane = slice_reader(z)
+                    if plane is None:
+                        read_seconds += time.perf_counter() - phase_started
+                        continue
+                    values = np.asarray(plane)
+                    if values.dtype != np.uint8 or values.shape != shape[1:]:
+                        raise ValueError('Confidence slice reader returned an invalid shape or dtype')
+                    iterator = iter(plane_blocks(values,block_size))
+                read_seconds += time.perf_counter() - phase_started
+                while True:
+                    phase_started = time.perf_counter()
+                    item = next(iterator, None)
+                    scan_seconds += time.perf_counter() - phase_started
+                    if item is None:
+                        break
+                    y0,y1,x0,x1,crop = item
+                    phase_started = time.perf_counter()
                     encoded = zlib.compress(crop.tobytes(),level=3)
+                    compression_seconds += time.perf_counter() - phase_started
+                    if (max_numeric_bytes is not None
+                            and payload.tell()+len(encoded)+(blocks+1)*_RECORD.size > int(max_numeric_bytes)):
+                        raise ConfidenceStageLimit('Compressed confidence exceeds its local staging reservation')
+                    phase_started = time.perf_counter()
                     record = _RECORD.pack(z,y0,x0,y1-y0,x1-x0,payload.tell(),len(encoded))
                     index.write(record); index_digest.update(record)
                     payload.write(encoded); digest.update(encoded)
+                    storage_seconds += time.perf_counter() - phase_started
                     blocks += 1
                     known += int(np.count_nonzero(crop))
             payload_bytes = payload.tell()
+            phase_started = time.perf_counter()
+            payload.flush(); index.flush()
+            storage_seconds += time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
         payload_tmp.replace(directory/'scores.u8.zlib')
         index_tmp.replace(directory/'index.bin')
         metadata = dict(schema=BLOCK_SCHEMA,layout=BLOCK_LAYOUT,coordinate_space=coordinate_space,
@@ -116,6 +180,12 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
             exported_axes='(X,Y,t)' if coordinate_space=='source' else None,
             provenance=_json_value(provenance or {}))
         _write_json_atomic(directory/'metadata.json',metadata)
+        storage_seconds += time.perf_counter() - phase_started
+        if metrics is not None:
+            metrics.update(read_seconds=read_seconds, scan_seconds=scan_seconds,
+                compression_seconds=compression_seconds, storage_seconds=storage_seconds,
+                elapsed_seconds=time.perf_counter()-started, payload_bytes=payload_bytes,
+                index_bytes=blocks*_RECORD.size, block_count=blocks)
         return metadata
     finally:
         payload_tmp.unlink(missing_ok=True)

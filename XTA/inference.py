@@ -2180,7 +2180,9 @@ class _DeviceUnionAccumulator:
                 pass
         return int(filled)
 
-    def compute_slice_metadata(self) -> Optional[Dict[str, np.ndarray]]:
+    def compute_slice_metadata(
+        self, *, synchronize_device: bool = True, include_row_occupancy: bool = True,
+    ) -> Optional[Dict[str, np.ndarray]]:
         """Return compact per-slice foreground metadata from the device union.
 
         Host-written fallback frames return ``None`` because their device rows are
@@ -2190,7 +2192,8 @@ class _DeviceUnionAccumulator:
         if self.union_dev is None or bool(self.host_written):
             return None
         try:
-            torch.cuda.synchronize(self.device)
+            if bool(synchronize_device):
+                torch.cuda.synchronize(self.device)
             u = self.union_dev
             n, h, w = (int(x) for x in u.shape)
             rows = u.amax(dim=2) > 0   # (n, h)
@@ -2205,15 +2208,19 @@ class _DeviceUnionAccumulator:
             bbox_t = torch.stack([y0, y1, x0, x1], dim=1).to(torch.int64)
             any_np = any_t.cpu().numpy()
             bbox_np = bbox_t.cpu().numpy()
-            rows_np = rows.cpu().numpy()
             bbox_np[~any_np] = 0  # argmax on all-zero rows would report a full-extent bbox
-            return {
+            metadata = {
                 'slice_any': np.ascontiguousarray(any_np),
                 'slice_bboxes': np.ascontiguousarray(bbox_np),
-                # Bit-packed (n, ceil(h/8)) row-occupancy — small enough for the mp result queue.
-                'slice_row_any': np.packbits(np.ascontiguousarray(rows_np), axis=1),
-                'slice_row_count': np.asarray([int(h)], dtype=np.int64),
             }
+            if bool(include_row_occupancy):
+                # Bit-packed (n, ceil(h/8)) row-occupancy for mask publication.
+                rows_np = rows.cpu().numpy()
+                metadata.update(
+                    slice_row_any=np.packbits(np.ascontiguousarray(rows_np), axis=1),
+                    slice_row_count=np.asarray([int(h)], dtype=np.int64),
+                )
+            return metadata
         except Exception:
             return None
 

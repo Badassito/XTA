@@ -5,6 +5,7 @@ from dataclasses import fields
 from contextlib import ExitStack
 import json
 import math
+import os
 from pathlib import Path
 import time
 
@@ -12,6 +13,73 @@ import numpy as np
 
 from .reconciliation import EvidenceLayer, evidence_role, reconcile
 from .reconciliation_policy import load_reconciliation_policy, validate_policy
+
+
+def union_nrrd_exports_can_overlap(layer_sink, assembled_union, *, policy, source_shape_tyx):
+    """Allow union postprocessing beside completed, independent component stores.
+
+    Called only after scheduler producers have joined. The final sink wait still
+    precedes output-manifest publication and scratch cleanup. Unknown backings,
+    live arrays and ordinary raw maps retain the earlier export barrier.
+    """
+    from .interpolation import CTILE_INDEX_DTYPE, MASK_STORE_FORMATS
+
+    policy = validate_policy(policy)
+    if (policy['mode'] != 'union' or policy['decide'] is not None
+            or not isinstance(assembled_union, np.ndarray)
+            or tuple(assembled_union.shape) != tuple(source_shape_tyx)
+            or assembled_union.dtype not in (np.dtype(np.uint8), np.dtype(np.bool_))):
+        return False
+    snapshot = getattr(layer_sink, 'pending_layer_refs', None)
+    if not callable(snapshot):
+        return False
+
+    # np.asarray(memmap) and its views retain the memmap in their base chain.
+    # An unidentifiable external buffer cannot prove file-backed non-aliasing.
+    union_files = set()
+    owner = assembled_union
+    seen = set()
+    while isinstance(owner, np.ndarray) and id(owner) not in seen:
+        seen.add(id(owner))
+        if isinstance(owner, np.memmap):
+            try:
+                identity = os.stat(owner.filename)
+            except (OSError, TypeError, ValueError):
+                return False
+            if not identity.st_ino:
+                return False
+            union_files.add((identity.st_dev, identity.st_ino))
+            break
+        if owner.base is None and owner.flags.owndata:
+            break
+        owner = owner.base
+    else:
+        return False
+
+    for ref in snapshot():
+        if (getattr(ref, 'live_array', None) is not None
+                or getattr(ref, 'storage_format', '') not in MASK_STORE_FORMATS):
+            return False
+        try:
+            root = Path(ref.path)
+            metadata = json.loads((root / 'meta.json').read_text(encoding='utf-8'))
+            shape = tuple(int(value) for value in metadata['shape'])
+            paths = [root / name for name in ('meta.json', 'index.bin', 'chunks.bin')]
+            identities = [path.stat() for path in paths]
+            # Raw-bbox writers publish meta.json after closing the payload and
+            # writing the final index. Their immutable files remain owned by the
+            # run until the final sink join; check that this is a complete store.
+            if (metadata['format'] != ref.storage_format or shape != tuple(ref.shape)
+                    or len(shape) != 3 or min(shape) <= 0
+                    or metadata['index_record_bytes'] != CTILE_INDEX_DTYPE.itemsize
+                    or identities[1].st_size != shape[0] * CTILE_INDEX_DTYPE.itemsize
+                    or metadata['stats']['raw_payload_bytes'] != identities[2].st_size
+                    or any(not item.st_ino or (item.st_dev, item.st_ino) in union_files
+                           for item in identities)):
+                return False
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+    return True
 
 
 def preflight_reconciliation(views, *, source_shape_tyx, processing_shape_tyx, settings, policy):

@@ -17,6 +17,10 @@ In TTA, a plain union policy reuses the already assembled source union. It
 counts and validates that buffer without reopening component masks or allocating
 a second source-sized output. Its manifest marks unmeasured per-layer and
 confidence counts as null. Custom decision callbacks still run normally.
+When pending component exports read completed immutable stores independent of
+that union, global postprocessing overlaps those exports. Other source backings
+and policies retain the export barrier. Every export must still succeed before
+the final run manifest is published.
 
 `reconciliation/manifest.json` records the policy and source hash, evidence
 groups, per-layer contributions, component statistics and weights, retained and
@@ -98,16 +102,35 @@ augmentation, resident D1, and accepted tile paths keep their existing binary
 mask processing and morphology. Policies whose mode is not `confidence` retain
 native-view evidence without immediately expanding it into source space.
 Compressed numeric blocks and native-piece manifests explicitly distinguish
-their storage coordinates from the source grid. D1 retires bounded score shards
-before device-buffer release; collection preserves those shards without a
-decompress/merge/project/recompress cycle. Accepted tile pieces retain their
-parent offsets and max-overlap semantics.
+their storage coordinates from the source grid. D1 captures only supported
+score/mask crops before releasing device buffers. Bounded host compression can
+overlap inference, and task completion joins mask and confidence publication.
+Generic producers without emitted bounds derive them on the GPU after the
+existing completion fence, enabling cropped Radial confidence collection without
+changing the inference route. Unavailable bounds retain the full-plane fallback.
+The final D1 layer has three files: compressed payload, block index and metadata.
+Consolidation copies the compressed bytes without decoding or source projection.
+Accepted tile pieces retain their parent offsets and max-overlap semantics.
+
+Deferred full-frame collection compresses scores in local scratch and publishes
+those immutable blocks in the background. Trusted support metadata skips empty
+slices and bounds score/mask reads while preserving the same global block grid.
+Numeric staging is bounded to 256 MiB;
+a layer exceeding its 64 MiB slot uses direct streaming. The run waits for all
+publications and propagates failures before reporting success. Logs separate
+compression, storage and registry delays and report D1 transfer counts. These
+changes preserve policy decisions and the observed score bytes.
 
 Confidence-mode policies still project scores for their source-grid decision.
 New source and native payloads use schema-two blocks; schema-one source sidecars
 remain readable. Explicit `reference.source_reader(workspace, ...)` conversion
 stages at most one native layer, checks buffer and temporary-disk budgets, and
-removes staging afterward. Reading native storage never silently starts that
+removes staging afterward. The buffer budget reaches backend-specific geometry
+and gather strips, returned score slabs and known-value masks. Conversion creates
+no persistent dense Azimuthal map cache. Insufficient workspace fails before
+staging. Failed overlapping-piece publication removes its own attempt and supports
+a same-path retry while preserving committed evidence and input pieces.
+Reading native storage never silently starts that
 conversion. Conversion can remain expensive on large views; collection no
 longer pays that cost when confidence is not part of the decision.
 

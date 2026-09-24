@@ -1609,7 +1609,9 @@ def prepare_view_volume_after_fullframe(
         from .confidence_evidence import capture_prediction_confidence
         if not preinterpolation_layer_already_published:
             capture_prediction_confidence(
-                baseline_native_volume, confmap_mm, view=view, model_name=model_name, temp_dir=temp_dir)
+                baseline_native_volume, confmap_mm, view=view, model_name=model_name, temp_dir=temp_dir,
+                known_slice_any=(meta_slice_any if hole_metadata_valid else None),
+                known_slice_bboxes=(meta_slice_bboxes if hole_metadata_valid else None))
     finally:
         close_memmap_array(confmap_mm)
         if confmap_path is not None and not keep_temp:

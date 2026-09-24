@@ -9,10 +9,6 @@ from unittest import mock
 
 import numpy as np
 
-from tools.smoke_import import install_stubs
-
-
-install_stubs()
 
 from XTA.geometry import DenseTileJob, PredictionVolumeRef, ViewInfo
 from XTA.tta_prediction import (

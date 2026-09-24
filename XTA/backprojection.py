@@ -476,10 +476,12 @@ def main_process_gpu_stage_inference_priority_enabled() -> bool:
 class _MainProcessGpuStageLease:
     """Exclusive main-process lease for one logical CUDA device."""
 
-    def __init__(self, coordinator: '_MainProcessGpuStageCoordinator', device_index: int, purpose: str) -> None:
+    def __init__(self, coordinator: '_MainProcessGpuStageCoordinator', device_index: int,
+                 purpose: str, token: object) -> None:
         self._coordinator = coordinator
         self.device_index = int(device_index)
         self.purpose = str(purpose)
+        self._token = token
         self._released = False
         runtime_trace_event('gpu_stage_acquired', device=f'cuda:{self.device_index}',
                             purpose=self.purpose)
@@ -491,7 +493,7 @@ class _MainProcessGpuStageLease:
         if self._released:
             return
         self._released = True
-        self._coordinator.release_stage(self.device_index, self.purpose)
+        self._coordinator.release_stage(self.device_index, self.purpose, token=self._token)
         runtime_trace_event('gpu_stage_released', device=f'cuda:{self.device_index}',
                             purpose=self.purpose)
 
@@ -520,6 +522,10 @@ class _MainProcessGpuStageCoordinator:
         self._worker_devices: set[int] = set()
         self._inference_inflight: Counter[int] = Counter()
         self._stage_leases: Dict[int, str] = {}
+        self._stage_tokens: Dict[int, object] = {}
+        self._stage_claims: Dict[int, Tuple[object, object]] = {}
+        self._provisional_stages: Dict[int, object] = {}
+        self._epoch = 0
         self._inference_priority_active = False
         self._inference_asset_retirement_pending = False
         self._pending_inference_backlog = False
@@ -539,7 +545,14 @@ class _MainProcessGpuStageCoordinator:
         self._wake_callback: Optional[Callable[[], None]] = None
 
     def configure_workers(self, worker_devices: Sequence[int]) -> None:
+        claims: List[Tuple[int, object, object]] = []
         with self._lock:
+            self._epoch += 1
+            claims = [(device, pool, claim) for device, (pool, claim)
+                      in self._stage_claims.items()]
+            self._stage_claims.clear()
+            self._stage_tokens.clear()
+            self._provisional_stages.clear()
             self._worker_devices = {int(v) for v in worker_devices}
             self._inference_inflight.clear()
             self._stage_leases.clear()
@@ -560,6 +573,8 @@ class _MainProcessGpuStageCoordinator:
             self._inference_priority_active = bool(
                 self._worker_devices and main_process_gpu_stage_inference_priority_enabled()
             )
+        for device, pool, claim in claims:
+            pool.release_stage_claim(device, claim)
 
     def set_pending_inference_backlog(self, active: bool) -> None:
         """Publish whether at least one central inference lease is dispatch-admissible."""
@@ -801,7 +816,14 @@ class _MainProcessGpuStageCoordinator:
             self._wake_callback = callback
 
     def reset(self) -> None:
+        claims: List[Tuple[int, object, object]] = []
         with self._lock:
+            self._epoch += 1
+            claims = [(device, pool, claim) for device, (pool, claim)
+                      in self._stage_claims.items()]
+            self._stage_claims.clear()
+            self._stage_tokens.clear()
+            self._provisional_stages.clear()
             self._worker_devices.clear()
             self._inference_inflight.clear()
             self._stage_leases.clear()
@@ -821,9 +843,13 @@ class _MainProcessGpuStageCoordinator:
             self._spherical_retirement_retry_after = 0.0
             self._spherical_retirement_cursor = 0
             self._wake_callback = None
+        for device, pool, claim in claims:
+            pool.release_stage_claim(device, claim)
 
     def can_dispatch_inference(self, device_index: int) -> bool:
         with self._lock:
+            if int(device_index) in self._provisional_stages:
+                return False
             if self._reserved_spherical_device_locked() == int(device_index):
                 return False
             owner = self._stage_leases.get(int(device_index))
@@ -835,6 +861,8 @@ class _MainProcessGpuStageCoordinator:
     def begin_inference(self, device_index: int) -> bool:
         device = int(device_index)
         with self._lock:
+            if device in self._provisional_stages:
+                return False
             if self._reserved_spherical_device_locked() == device:
                 return False
             owner = self._stage_leases.get(device)
@@ -858,6 +886,91 @@ class _MainProcessGpuStageCoordinator:
             else:
                 self._inference_inflight.pop(device, None)
 
+    def _stage_eligible_locked(self, device: int, purpose: str,
+                               provisional: Optional[object] = None) -> bool:
+        if (device in self._stage_leases
+                or (device in self._provisional_stages
+                    and self._provisional_stages[device] is not provisional)
+                or self._priority_blocks_stage_locked(device, purpose)):
+            return False
+        overlap = bool(main_process_gpu_stage_inference_overlap_enabled())
+        return bool((overlap and not self._is_spherical_retirement(purpose))
+                    or int(self._inference_inflight.get(device, 0)) == 0)
+
+    def _claim_stage_device(self, device: int, purpose: str, epoch: int,
+                            torch_mod: Optional[object] = None) -> Optional[_MainProcessGpuStageLease]:
+        """Reserve one device, then release the global lock for auxiliary revocation."""
+        reservation = object()
+        with self._lock:
+            if (self._epoch != epoch
+                    or not self._stage_eligible_locked(device, purpose)):
+                return None
+            self._provisional_stages[device] = reservation
+        aux_pool: Optional[object] = None
+        claim: Optional[object] = None
+        try:
+            aux_pool = gpu_worker_aux_interpolation_pool()
+            if aux_pool is not None:
+                acquire_claim = getattr(aux_pool, 'claim_worker_for_stage', None)
+                release_claim = getattr(aux_pool, 'release_stage_claim', None)
+                if not callable(acquire_claim) or not callable(release_claim):
+                    # A one-time revoke cannot fence enable_worker/try_submit races.
+                    return None
+                claim = acquire_claim(device)
+                if claim is None:
+                    return None
+            if torch_mod is not None:
+                try:
+                    torch_mod.cuda.mem_get_info(torch_mod.device(f'cuda:{device}'))
+                except Exception:
+                    if self._is_spherical_retirement(purpose):
+                        with self._lock:
+                            if self._epoch == epoch:
+                                self._clear_failed_spherical_probe_locked()
+                    return None
+            with self._lock:
+                if (self._epoch != epoch
+                        or self._provisional_stages.get(device) is not reservation
+                        or not self._stage_eligible_locked(device, purpose, reservation)):
+                    return None
+                token = object()
+                self._stage_leases[device] = str(purpose)
+                self._stage_tokens[device] = token
+                if claim is not None:
+                    self._stage_claims[device] = (aux_pool, claim)
+                    claim = None  # ownership passes to release_stage
+                self._provisional_stages.pop(device, None)
+                if self._is_spherical_retirement(purpose):
+                    self._record_spherical_acquisition_locked(device, purpose)
+            try:
+                return _MainProcessGpuStageLease(self, device, str(purpose), token)
+            except BaseException:
+                self.release_stage(device, str(purpose), token=token)
+                raise
+        finally:
+            try:
+                if claim is not None:
+                    aux_pool.release_stage_claim(device, claim)
+            finally:
+                with self._lock:
+                    if self._provisional_stages.get(device) is reservation:
+                        self._provisional_stages.pop(device, None)
+                        callback = self._wake_callback
+                    else:
+                        callback = None
+                if callback is not None:
+                    try:
+                        callback()
+                    except Exception:
+                        pass
+
+    def _clear_failed_spherical_probe_locked(self) -> None:
+        self._spherical_retirement_requests.clear()
+        self._spherical_retirement_device = None
+        self._spherical_retirement_handoff_device = None
+        self._spherical_retirement_handoff_deadline = 0.0
+        self._spherical_retirement_retry_after = time.monotonic() + 10.0
+
     def try_acquire_specific_stage(
         self,
         torch_mod: object,
@@ -873,20 +986,10 @@ class _MainProcessGpuStageCoordinator:
             return None
         self._request_spherical_retirement_turn([device], purpose)
         with self._lock:
-            overlap = bool(main_process_gpu_stage_inference_overlap_enabled())
-            if device in self._stage_leases:
+            if not self._stage_eligible_locked(device, purpose):
                 return None
-            if self._priority_blocks_stage_locked(device, purpose):
-                return None
-            if (not overlap or self._is_spherical_retirement(purpose)) and int(self._inference_inflight.get(device, 0)) > 0:
-                return None
-            aux_pool = gpu_worker_aux_interpolation_pool()
-            if aux_pool is not None and not bool(aux_pool.revoke_worker(device)):
-                return None
-            self._stage_leases[device] = str(purpose)
-            if self._is_spherical_retirement(purpose):
-                self._record_spherical_acquisition_locked(device, purpose)
-            return _MainProcessGpuStageLease(self, device, str(purpose))
+            epoch = self._epoch
+        return self._claim_stage_device(device, purpose, epoch)
 
     def try_acquire_stage(self, torch_mod: object, purpose: str) -> Optional[_MainProcessGpuStageLease]:
         try:
@@ -897,6 +1000,7 @@ class _MainProcessGpuStageCoordinator:
             return None
         self._request_spherical_retirement_turn(range(count), purpose)
         with self._lock:
+            epoch = self._epoch
             configured = sorted(
                 int(idx) for idx in self._worker_devices
                 if 0 <= int(idx) < int(count)
@@ -905,58 +1009,44 @@ class _MainProcessGpuStageCoordinator:
             if not candidates:
                 return None
 
-            overlap = bool(main_process_gpu_stage_inference_overlap_enabled())
             available = [
                 idx for idx in candidates
-                if idx not in self._stage_leases
-                and not self._priority_blocks_stage_locked(idx, purpose)
-                and ((overlap and not self._is_spherical_retirement(purpose))
-                     or int(self._inference_inflight.get(idx, 0)) == 0)
+                if self._stage_eligible_locked(idx, purpose)
             ]
             if not available:
                 return None
-            # An idle worker may have been offered to the auxiliary interpolation pool.
-            # Revoke that offer before assigning its physical GPU to a main-process stage;
-            # a running auxiliary pass remains authoritative and makes the device ineligible.
-            aux_pool = gpu_worker_aux_interpolation_pool()
-            if aux_pool is not None:
-                available = [
-                    idx for idx in available
-                    if bool(aux_pool.revoke_worker(int(idx)))
-                ]
-            if not available:
-                return None
-            best_index: Optional[int] = None
-            best_free = -1
-            for idx in available:
-                try:
-                    free_bytes, _total = torch_mod.cuda.mem_get_info(
-                        torch_mod.device(f'cuda:{int(idx)}')
-                    )
-                except Exception:
-                    continue
-                if int(free_bytes) > int(best_free):
-                    best_free = int(free_bytes)
-                    best_index = int(idx)
-            if best_index is None:
-                if self._is_spherical_retirement(purpose):
-                    self._spherical_retirement_requests.clear()
-                    self._spherical_retirement_device = None
-                    self._spherical_retirement_handoff_device = None
-                    self._spherical_retirement_handoff_deadline = 0.0
-                    self._spherical_retirement_retry_after = time.monotonic() + 10.0
-                return None
-            self._stage_leases[int(best_index)] = str(purpose)
-            if self._is_spherical_retirement(purpose):
-                self._record_spherical_acquisition_locked(int(best_index), purpose)
-            return _MainProcessGpuStageLease(self, int(best_index), str(purpose))
+        if len(available) == 1:
+            return self._claim_stage_device(available[0], purpose, epoch, torch_mod)
+        # CUDA may wait on a device/context. It must not hold the coordinator lock,
+        # which guards dispatch commits on every other GPU.
+        estimates: List[Tuple[int, int]] = []
+        for idx in available:
+            try:
+                free_bytes, _total = torch_mod.cuda.mem_get_info(
+                    torch_mod.device(f'cuda:{int(idx)}')
+                )
+                estimates.append((int(free_bytes), int(idx)))
+            except Exception:
+                continue
+        for _free_bytes, idx in sorted(estimates, key=lambda item: (-item[0], item[1])):
+            lease = self._claim_stage_device(idx, purpose, epoch)
+            if lease is not None:
+                return lease
+        if not estimates and self._is_spherical_retirement(purpose):
+            with self._lock:
+                if self._epoch == epoch:
+                    self._clear_failed_spherical_probe_locked()
+        return None
 
-    def release_stage(self, device_index: int, purpose: str) -> None:
+    def release_stage(self, device_index: int, purpose: str, *, token: object) -> None:
         callback: Optional[Callable[[], None]] = None
+        claim: Optional[Tuple[object, object]] = None
         with self._lock:
             current = self._stage_leases.get(int(device_index))
-            if current == str(purpose):
+            if current == str(purpose) and self._stage_tokens.get(int(device_index)) is token:
                 self._stage_leases.pop(int(device_index), None)
+                self._stage_tokens.pop(int(device_index), None)
+                claim = self._stage_claims.pop(int(device_index), None)
                 reserved = self._reserved_spherical_device_locked()
                 if (self._is_spherical_retirement(current)
                         and reserved is None
@@ -972,7 +1062,10 @@ class _MainProcessGpuStageCoordinator:
                     self._spherical_retirement_device = int(device_index)
                     self._spherical_retirement_handoff_device = int(device_index)
                     self._spherical_retirement_handoff_deadline = time.monotonic() + 2.0
-            callback = self._wake_callback
+                callback = self._wake_callback
+        if claim is not None:
+            pool, aux_token = claim
+            pool.release_stage_claim(int(device_index), aux_token)
         if callback is not None:
             try:
                 callback()
@@ -985,6 +1078,7 @@ class _MainProcessGpuStageCoordinator:
                 'worker_devices': sorted(self._worker_devices),
                 'inference_inflight': dict(self._inference_inflight),
                 'stage_leases': dict(self._stage_leases),
+                'provisional_stage_devices': sorted(self._provisional_stages),
                 'inference_priority_active': bool(self._inference_priority_active),
                 'inference_asset_retirement_pending': bool(self._inference_asset_retirement_pending),
                 'pending_inference_backlog': bool(self._pending_inference_backlog),

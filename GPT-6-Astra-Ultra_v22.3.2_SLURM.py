@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPT-6 Astra v22.3.1 launcher for the unified TTA/PTA/LTA pipeline."""
+"""GPT-6 Astra v22.3.2 launcher for the unified TTA/PTA/LTA pipeline."""
 
 from XTA.cli import run
 

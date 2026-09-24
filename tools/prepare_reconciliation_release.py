@@ -27,6 +27,15 @@ RELEASES = {
                       'tools/compare_reconciliation.py',
                       'tools/qualify_tta_reconciliation.py',
                       'tools/export_reconciliation_evidence.py')),
+    '22.3.2': dict(token='22_3_2', previous_token='22_3_1',
+                  feature='bounded-confidence-publication-throughput',
+                  validation_tools=(
+                      'tools/compare_reconciliation.py',
+                      'tools/qualify_tta_reconciliation.py',
+                      'tools/export_reconciliation_evidence.py',
+                      'tools/qualify_confidence_consolidation.py',
+                      'tools/qualify_d1_confidence_bounds.py',
+                      'tools/analyze_pipeline_trace.py')),
 }
 REASONS = {
     '__init__': 'Publish the package release identity as {release}.',
@@ -55,6 +64,30 @@ REASONS = {
     'examples/external_reconciliation/confidence_core_rescue': 'Publish the confidence core rescue preset selected through visual review.',
     'examples/external_reconciliation/quorum3': 'Publish the independent section quorum preset as a compact voting alternative.',
     'examples/external_reconciliation/hybrid_with_fill': 'Publish the hybrid consensus and limited enclosed-hole filling preset.',
+    'confidence_consolidation': 'Consolidate native confidence pieces into a bounded shared payload without changing scores or known support.',
+    'confidence_publication': 'Bound pending confidence publications and preserve owner lifetimes, completion progress and failures.',
+    'd1_confidence_retirement': 'Retire immutable D1 confidence shards with bounded deferred publication and explicit cleanup ownership.',
+    'spherical_projection': 'Avoid redundant empty spherical CPU work while preserving mixed CPU and CUDA projection semantics.',
+    'spherical_projection_cpu': 'Skip provably empty spherical ranges and retain exact projection values for occupied regions.',
+}
+THROUGHPUT_REASONS = {
+    'pipeline': 'Bound confidence publication and retirement queues, preserve completion acknowledgements independently of lease retirement order, overlap assembled-union reconciliation with independent pending exports while retaining their backing owners, cooperatively drain background work around worker-result credits, service GPU stage admission changes on the scheduler thread, and report bounded wait-state memory and stage ownership diagnostics.',
+    'confidence_evidence': 'Publish consolidated native confidence with bounded ownership and restrict observed-score capture to trusted pre-interpolation support bounds.',
+    'confidence_storage': 'Support bounded consolidation of compressed confidence blocks without decoding or altering retained scores.',
+    'confidence_native': 'Publish copied confidence pieces transactionally and admit source conversion workspaces against explicit memory budgets while preserving scores, known support and geometry.',
+    'confidence_projection': 'Bound numeric confidence projection strips and output-plane workspaces before allocation while preserving projection arithmetic and explicit progress.',
+    'assembly': 'Forward trusted pre-interpolation slice support metadata into native confidence capture while preserving score ownership and cleanup.',
+    'cuda_d1': 'Defer native confidence shard retirement through bounded publication and derive missing device-mask support bounds for exact cropped capture, preserving immutable scores and conservative metadata fallbacks.',
+    'inference': 'Preserve confidence transport and derive compact device-mask support metadata after the existing producer fence without changing inference masks or morphology.',
+    'runtime': 'Reuse acknowledged persistent source descriptors, preserve atomic GPU sample identity, exclude auxiliary interpolation during a claimed main-process CUDA stage, and measure memory-map advice. Coalesce scheduler timings, counters and gauges under independent short locks, preserve numeric and mixed ordinary-gauge ordering, bound trace capture, notify the background writer without blocking compute or credit paths, and preserve complete explicit and final telemetry flushes.',
+    'tta_scheduler': 'Track acknowledged worker source ownership, memoize repeated selector evaluations, prioritize bounded compute-credit draining ahead of final-result callbacks while preserving failure fences and admission semantics, time refill selection, admission, workspace and transport steps, coalesce GPU stage wakeups into owner-thread admission retries with a bounded timer when an idle worker remains reserved, and route scheduler counters and gauges through the isolated telemetry channel with compatible fallback.',
+    'backprojection': 'Reserve main-process GPU stages with epoch and lease tokens, performing CUDA memory probes and auxiliary claims outside the global admission lock while fencing stale releases and provisional devices.',
+    'tta_background': 'Bound and rotate main-thread background completion categories, yielding after atomic callbacks to process worker credits promptly.',
+    'scheduler_diagnostics': 'Measure scheduler operations and nested refill steps with wall and calling-thread CPU durations, coalescing timings without taking the diagnostic writer lock and emitting bounded slow-operation events without storage access on the measured path.',
+    'mmap_advice': 'Call memory-map advice without holding the Python GIL while a zero-copy view pins the mapping, preserving the native error and portable fallback behavior.',
+    'publication_memory': 'Account for bounded pending confidence publication and retirement buffers in admission.',
+    'outputs': 'Batch repeated cached-zero gzip members without changing their byte sequence, preserve bounded ordered writes and pending export reference lifetimes, bound completed-output reaping, and report writer waits, atomic publication durability, and memory-map advice timings. Report the selected NRRD codec and imported-module provenance once, reject known pre-0.9 python-deflate bindings that hold the GIL with an actionable explicit-selection error, and allow automatic CPU selection to continue to compatible ISA-L or zlib without misclassifying unknown custom bindings.',
+    'reconciliation_runtime': 'Reuse an assembled union while guarding export overlap against shared writable storage and preserve evidence ownership, metadata and cleanup.',
 }
 REMOVAL_REASONS = {
     'examples/external_reconciliation/' + name:
@@ -65,6 +98,9 @@ TOOL_REASONS = {
     'tools/compare_reconciliation.py': 'Compare persisted evidence with explicit native conversion, bounded readers and unchanged source artifacts.',
     'tools/qualify_tta_reconciliation.py': 'Qualify unchanged masks and complete source or native confidence across CPU, GPU and hybrid inference.',
     'tools/export_reconciliation_evidence.py': 'Explicitly export retained native confidence into a checked source-grid companion.',
+    'tools/qualify_confidence_consolidation.py': 'Qualify consolidated native confidence against original pieces with exact score and known-support parity.',
+    'tools/qualify_d1_confidence_bounds.py': 'Qualify cropped and dense confidence capture from the same real generic Radial prediction, preserving exact encoded score/index bytes and device source tensors.',
+    'tools/analyze_pipeline_trace.py': 'Interpret bounded task traces with incomplete-capture warnings and GPU compute-credit timing that distinguishes prefetch and result-first ambiguity.',
 }
 
 
@@ -193,11 +229,12 @@ def _update_verifier_pins(source, prefix, digest, pins):
     return ''.join(lines)
 
 
-def prepare(*, output_dir, release='22.3.1', write=False):
+def prepare(*, output_dir, release='22.3.2', write=False):
     root, output_dir = ROOT, Path(output_dir).resolve()
     if output_dir.is_relative_to(root):
         raise ValueError('Generated release-review evidence belongs outside the repository')
     spec = RELEASES[release]
+    reasons = {**REASONS, **(THROUGHPUT_REASONS if release == '22.3.2' else {})}
     prefix = 'REVIEWED_V' + spec['token'] + '_RELEASE'
     key = 'v' + spec['token'] + '_release_review'
     predecessor_commit = getattr(inventory, prefix + '_PREDECESSOR_COMMIT')
@@ -240,7 +277,7 @@ def prepare(*, output_dir, release='22.3.1', write=False):
             new_source = path.read_text(encoding='utf-8')
             if old_source is not None and inventory.digest(ast.parse(old_source)) == inventory.digest(ast.parse(new_source)):
                 continue
-            reason = REASONS[module].format(release=release)
+            reason = reasons[module].format(release=release)
             complete = module not in audited
             pin, snapshot, records = review_module(module, old_source, new_source,
                 complete=complete, labels_by_hash=labels_by_hash, reason=reason)
@@ -259,7 +296,7 @@ def prepare(*, output_dir, release='22.3.1', write=False):
             if hashlib.sha256(git_file(root, predecessor_commit, f'XTA/{module}.py').encode()).hexdigest() != previous_hash:
                 raise ValueError(f'Preserved module predecessor differs: {module}')
             review['preserved_radial_module_updates'].append(dict(module=module,
-                previous_sha256=previous_hash, sha256=new_hash, reason=REASONS[module].format(release=release)))
+                previous_sha256=previous_hash, sha256=new_hash, reason=reasons[module].format(release=release)))
     for (module, name), previous_hash in inventory.reviewed_radial_definition_hashes(predecessor['v21_review'], patches).items():
         text = (root / 'XTA' / f'{module}.py').read_text(encoding='utf-8')
         new_hash = inventory.digest(_qualified_definition(text, name))
@@ -268,7 +305,7 @@ def prepare(*, output_dir, release='22.3.1', write=False):
             if inventory.digest(_qualified_definition(old_text, name)) != previous_hash:
                 raise ValueError(f'Preserved definition predecessor differs: {module}.{name}')
             review['preserved_radial_definition_updates'].append(dict(module=module, qualified_name=name,
-                previous_sha256=previous_hash, sha256=new_hash, reason=REASONS[module].format(release=release)))
+                previous_sha256=previous_hash, sha256=new_hash, reason=reasons[module].format(release=release)))
     previous_review = predecessor['v' + spec['previous_token'] + '_release_review']
     previous_tools = {item['path']: item['sha256'] for item in previous_review.get('validation_tools', ())}
     review['validation_tools'] = [dict(path=path, previous_sha256=previous_tools.get(path),
@@ -307,7 +344,7 @@ def prepare(*, output_dir, release='22.3.1', write=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--release', choices=tuple(RELEASES), default='22.3.1')
+    parser.add_argument('--release', choices=tuple(RELEASES), default='22.3.2')
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--write', action='store_true')
     args = parser.parse_args(argv)

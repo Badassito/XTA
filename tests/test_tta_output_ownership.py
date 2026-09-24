@@ -3,10 +3,6 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from tools.smoke_import import install_stubs
-
-
-install_stubs()
 
 from XTA import pipeline
 from XTA.tta_outputs import (

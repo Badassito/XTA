@@ -571,6 +571,16 @@ for task,a in zip(json.loads(sys.argv[1]), _cache_export_volumes()):
         self.assertTrue(any(bounded['grants']))
         self.assertTrue(any(v == 0 for v in bounded['grants']))
 
+    def test_confidence_host_pool_and_local_stage_reduce_publication_budget(self):
+        shape = (1931,3064,3022)
+        original = memory.retained_payload_plan([shape]*50,950*GIB,4,12,256*1024**2)
+        host, stage = 4*512*1024**2, 260*1024**2
+        actual = memory.retained_payload_plan([shape]*50,950*GIB,4,12,256*1024**2,
+            worker_buffer_reserve_bytes=host,output_reserve_bytes=stage)
+        self.assertEqual(actual['reserve_bytes']-original['reserve_bytes'],host+stage)
+        self.assertEqual(original['budget_bytes']-actual['budget_bytes'],(host+stage)//2)
+        self.assertEqual(actual['worker_buffer_reserve_bytes'],host)
+
     def test_swap_is_never_counted_as_ram_headroom(self):
         with mock.patch.object(memory, '_read_meminfo_bytes', return_value={'MemAvailable': 10, 'SwapFree': 1000}), \
                 mock.patch.object(memory, 'available_anon_work_bytes', return_value=1010):
@@ -609,9 +619,9 @@ for task,a in zip(json.loads(sys.argv[1]), _cache_export_volumes()):
             def link(path, target, **kwargs):
                 os.link(target, path)
             original_open = os.open
-            def share_delete_open(path, flags, mode=0o666):
+            def share_delete_open(path, flags, mode=0o666, **kwargs):
                 if os.name != 'nt':
-                    return original_open(path, flags, mode)
+                    return original_open(path, flags, mode, **kwargs)
                 # Linux permits replacing open files. Give the Windows fixture
                 # that same sharing behavior; production RAM backings are Linux.
                 import _winapi

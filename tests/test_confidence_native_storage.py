@@ -98,8 +98,8 @@ class ConfidenceNativeStorageTests(unittest.TestCase):
         with mock.patch('numpy.memmap',side_effect=only_index_maps),mock.patch(
                 'XTA.confidence_projection.score_projection_reader',side_effect=AssertionError('projected')):
             ref=publish_confidence_shards(shards,view=view,model_name='m',temp_dir=self.root)
-        self.assertEqual(ref.metadata['layout'],'native_pieces')
-        self.assertTrue(ref.metadata['pieces_disjoint'])
+        self.assertEqual(ref.metadata['layout'],'uint8_zlib_blocks')
+        self.assertEqual({p.name for p in ref.path.iterdir()}, {'metadata.json','index.bin','scores.u8.zlib'})
         self.assertEqual(ref.metadata['known_voxels'],int(np.count_nonzero(expected)))
         shutil.rmtree(self.root/'shards')
         with ref.native_reader() as reader:
@@ -109,9 +109,9 @@ class ConfidenceNativeStorageTests(unittest.TestCase):
             actual,_=reader(0,5)
             np.testing.assert_array_equal(actual,expected)
         metadata=json.loads((ref.path/'metadata.json').read_text())
-        metadata['pieces'][1]['offset_tyx'][0]=0
+        metadata['block_count'] += 1
         (ref.path/'metadata.json').write_text(json.dumps(metadata))
-        with self.assertRaisesRegex(ValueError,'leases'):
+        with self.assertRaisesRegex(ValueError,'index size'):
             ConfidenceEvidenceRef.open(ref.path).native_reader()
 
     def test_overlapping_tile_pieces_use_numeric_max_and_do_not_claim_unique_count(self):

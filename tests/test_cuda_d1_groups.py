@@ -4,10 +4,6 @@ import unittest
 
 import numpy as np
 
-from tools.smoke_import import install_stubs
-
-
-install_stubs()
 
 from XTA.cuda_d1 import (  # noqa: E402
     D1PartialBitsetArtifact,

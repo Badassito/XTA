@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import inspect
 import os
 import subprocess
@@ -9,24 +8,9 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from tools.smoke_import import install_stubs
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
-
-def _module_is_available(name: str) -> bool:
-    loaded = sys.modules.get(name)
-    if loaded is not None:
-        return getattr(loaded, "__spec__", None) is not None
-    try:
-        return importlib.util.find_spec(name) is not None
-    except (ImportError, ValueError):
-        return False
-
-
-if not all(_module_is_available(name) for name in ("cv2", "scipy", "tqdm")):
-    install_stubs()
 
 from XTA import pta_dataset
 from XTA import pta

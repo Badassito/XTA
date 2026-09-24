@@ -9,12 +9,6 @@ from unittest import mock
 
 import numpy as np
 
-from tools.smoke_import import install_stubs
-
-try:
-    import cv2  # noqa: F401
-except ModuleNotFoundError:
-    install_stubs()
 
 from XTA.lta_propagation import (
     LtaMaskSeed,

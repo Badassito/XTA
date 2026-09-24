@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import gc
-import importlib.util
 import math
 import os
 import sys
@@ -15,21 +14,6 @@ from unittest import mock
 
 import numpy as np
 
-from tools.smoke_import import install_stubs
-
-# Preserve real numerical modules on CI/developer hosts.  The repository's smoke
-# stubs are only needed by stripped-down environments such as the bundled test
-# interpreter used here; installing them unconditionally would make later tests
-# mistake a capable host for one without OpenCV/SciPy.
-def _module_is_available(name: str) -> bool:
-    try:
-        return importlib.util.find_spec(name) is not None
-    except (ImportError, ModuleNotFoundError, ValueError):
-        return False
-
-
-if not all(_module_is_available(name) for name in ('cv2', 'scipy', 'tifffile', 'tqdm')):
-    install_stubs()
 
 from XTA import cuda_interpolation, interpolation, runtime as runtime_helpers, topology
 from XTA.cuda_interpolation import (

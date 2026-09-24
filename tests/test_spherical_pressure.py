@@ -217,7 +217,8 @@ class SphericalPressureTests(unittest.TestCase):
         self.assertIsNone(self.coordinator.try_acquire_stage(self.torch, waiting))
         first.release()
         self.torch.cuda.mem_get_info.reset_mock()
-        auxiliary = SimpleNamespace(revoke_worker=mock.Mock(return_value=False))
+        auxiliary = SimpleNamespace(claim_worker_for_stage=mock.Mock(return_value=None),
+                                    release_stage_claim=mock.Mock())
         with mock.patch.object(bp, 'gpu_worker_aux_interpolation_pool', return_value=auxiliary):
             self.assertIsNone(self.coordinator.try_acquire_stage(self.torch, waiting))
         self.torch.cuda.mem_get_info.assert_not_called()
@@ -485,7 +486,8 @@ class SphericalPressureTests(unittest.TestCase):
             self.assertIsNone(self.request())
             self.assertIsNone(self.coordinator.snapshot()['spherical_retirement_reserved_device'])
             self.coordinator.set_inference_asset_retirement_pending(False)
-            auxiliary = SimpleNamespace(revoke_worker=mock.Mock(return_value=False))
+            auxiliary = SimpleNamespace(claim_worker_for_stage=mock.Mock(return_value=None),
+                                        release_stage_claim=mock.Mock())
             with mock.patch.object(bp, 'gpu_worker_aux_interpolation_pool', return_value=auxiliary):
                 self.assertIsNone(self.request())
             self.torch.cuda.mem_get_info.assert_not_called()

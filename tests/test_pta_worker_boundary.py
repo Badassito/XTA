@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import multiprocessing
 import os
 import pickle
@@ -14,11 +13,8 @@ from unittest import mock
 
 import numpy as np
 
-from tools.smoke_import import install_stubs
-
 
 ROOT = Path(__file__).resolve().parents[1]
-install_stubs()
 
 from XTA import pta_publication, pta_rendering, pta_workers
 from XTA.pta_dataset import OutputCandidate
@@ -29,6 +25,8 @@ def _spawn_unpickle_worker_payload(
     result_queue: multiprocessing.Queue,
 ) -> None:
     """Spawn-safe target that proves payload loading never imports XTA.pta."""
+
+    from tools.smoke_import import install_stubs
 
     install_stubs()
     payload = pickle.loads(payload_blob)

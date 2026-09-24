@@ -3,7 +3,7 @@
 XTA provides test-time augmentation (TTA), pretraining augmentation (PTA), and
 label-time augmentation (LTA) for volumes. The implementation lives in the
 importable `XTA` package. The versioned launcher
-`GPT-6-Astra-Ultra_v22.3.1_SLURM.py`, installed `xta` command, and `python -m XTA`
+`GPT-6-Astra-Ultra_v22.3.2_SLURM.py`, installed `xta` command, and `python -m XTA`
 all enter `XTA.cli.run()`.
 
 This document describes implemented behavior, ownership, and operating controls.
@@ -79,8 +79,41 @@ The NRRD manifests record stable layer and model identities for later joins.
 Confidence publication announces source projection and native retention stages.
 Long block writes and the final D1 evidence drain report progress every 30 seconds.
 
+D1 confidence capture uses existing support bounds to skip empty frames and
+transfer score/mask crops. When a generic producer supplies no bounds, GPU
+row/column reductions derive them after the existing producer fence. Only flags
+and four coordinates per slice are read back; failed or unavailable metadata
+uses complete planes. Logs distinguish emitted, derived and fallback bounds.
+A per-worker host pool owns copied scores while CPU
+compression overlaps later inference; binary and confidence publication futures
+join before task completion. Its default 512 MiB host limit is charged to memory
+planning and is configurable with `YOLO_TTA_D1_CONFIDENCE_HOST_MIB` (16–4096).
+Oversized captures drain the pool and stream bounded crop bands synchronously.
+Disjoint D1 leases consolidate directly into one payload, index and metadata
+file, copying compressed bytes unchanged; overlapping tile pieces retain their
+maximum-reduction semantics.
+
+Deferred full-frame confidence is compressed locally before its dense inputs
+retire. Trusted pre-interpolation support metadata skips empty slices and limits
+score/mask reads to their bounds; absent metadata uses the full-plane reader.
+Global block alignment and score-zero semantics are identical on both paths.
+Two background publishers copy immutable stages to final output and
+register them, using a 256 MiB numeric staging budget in 64 MiB slots. Larger
+stages fall back to direct streaming. Completion joins every publication and
+propagates failures before reconciliation or the successful run manifest.
+Logs separate compression, storage, registry wait/write, and D1 transfer work;
+overlapping task times are not end-to-end wall time. Spherical CPU fallback
+skips provably empty shells before QSC geometry and probes GPU admission while
+waiting for a CPU block, joining abandoned readers before CUDA publication.
+
 Native evidence conversion is explicit through a bounded one-layer source-reader
-context, with temporary-disk admission and cleanup. Compact export joins scores
+context, with temporary-disk admission and cleanup. Its numeric workspace budget
+is passed to backend-specific projection strips, including geometry, gathers,
+returned scores and known masks. Explicit conversions do not populate the shared
+dense Azimuthal geometry cache; insufficient minimum workspace fails before staging.
+Overlapping native-piece publication owns a private staging attempt and removes
+that attempt on failure, allowing retry while preserving existing evidence.
+Compact export joins scores
 to existing low-quality mask identities, takes numeric maxima over the matching
 source footprints, intersects with each compact mask, and writes a portable
 matched-grid bundle. It does not load native NRRD masks. Legacy source-aligned
@@ -129,7 +162,7 @@ All module names below are relative to `XTA`.
 | TTA scheduling | `pipeline`, `tta_scheduler`, `tta_prediction`, `tta_lifecycle`: preparation, process admission, source staging, and run-resource ownership |
 | TTA external policies | `augmentation_policy`, `tta_augmentation_config`, `tta_augmentation`, `tta_augmentation_cuda`, `tta_augmentation_retirement`, `tta_augmentation_runtime`: shared policy identity, seed scopes, fused conservative inverse maps, and bounded render-once policy fan-out with asynchronous support retirement |
 | TTA reconciliation | `reconciliation_policy`, `reconciliation`, `reconciliation_components`, `reconciliation_geometry`, `reconciliation_io`, `reconciliation_runtime`: external policy identity, bounded voting and grouped island statistics, immutable layer readers and source-grid integration |
-| Confidence evidence | `confidence_evidence`, `confidence_storage`, `confidence_native`, `confidence_projection`, `confidence_tiles`, `confidence_export`: versioned numeric blocks and native pieces, explicit bounded projection, tile provenance, and matched compact export |
+| Confidence evidence | `confidence_evidence`, `confidence_storage`, `confidence_native`, `confidence_consolidation`, `confidence_publication`, `d1_confidence_retirement`, `confidence_projection`, `confidence_tiles`, `confidence_export`: versioned numeric blocks and native pieces, bounded asynchronous publication, compressed lease consolidation, explicit projection, tile provenance, and matched compact export |
 | TTA completion | `assembly`, `tta_terminal`, `tta_outputs`: view/tile assembly, physical-view terminal fusion, and settled-artifact teardown |
 | Sparse components | `interpolation`, `topology`, `topology_runs`, `projection_queue`: interpolation, component membership/adjacency, and bounded projection handoff |
 | CUDA component work | `cuda_interpolation`, `cuda_d1`, `cuda_finalization`: bridge painting/radius work, owner-GPU bitsets, and distributed finalization contracts |
@@ -384,9 +417,39 @@ tasks without bounded retirement validate aggregate canvas capacity against the 
 Canvas credits bound committed canvas capacity; transient rendering/projection
 allocations and total process RSS require additional headroom.
 
+Source memfd transfers are reused only after successful compute/result handling
+acknowledges that the specific worker materialized them. Identities use device,
+inode and size, permitting streaming writes while detecting recycled descriptor
+numbers. Parent acknowledgement metadata is bounded; child source descriptors
+remain alive until worker shutdown so resident source paths stay stable. Result,
+canvas and bitset transfers retain their per-task ownership. Failed dispatches
+drain registered transfer handles. Materialization counters separate descriptor
+detach time, cache hits and total setup work; these are host timings.
+
 Cacheable Spherical direct-union tasks prefer a worker's last queued parent or a
 distinct newly admitted parent. This placement hint is subordinate to ownership,
 memory limits, hybrid/D1 rules, and work stealing.
+
+Scheduler selection evaluates compatible parent contracts and task costs once per
+selection call. Cached decisions expire at that call's boundary, so subsequent
+ownership, memory admission and measured-cost changes are reevaluated. Policy
+groups, heterogeneous contracts and assigned D1 groups retain the checks that
+depend on individual tasks. Ordering, tie breaks and floating-point accumulation
+order follow the same selection rules.
+
+The scheduler services independent arrived GPU compute credits before successful
+final-result callbacks. Credits release windows exactly once and a batch produces
+one refill; successful final callbacks retain FIFO order. CPU results and group
+control messages fence reordering, and a received worker failure prevents further
+dispatch. Bounded message drains and credit checkpoints remain on the single
+scheduler state owner; transport threads only receive and enqueue messages.
+
+Worker results are drained before and after background completion work. While
+inference is outstanding, background completion categories rotate after at most
+eight completed items or 10 ms of cooperative work. A callback finishes its
+ownership transition before yielding; it is not preempted mid-update. Queued
+messages and deferred background work bypass the scheduler's heartbeat wait.
+After inference drain, background work resumes its complete terminal drain.
 
 Live Spherical and Radial projectors can request an exclusive worker-GPU retirement
 lease. When retained parents block all new inference, an idle GPU is eligible even
@@ -407,6 +470,14 @@ joins all CPU readers before GPU publication. Spherical and NumPy Radial readers
 can cancel between bounded pull chunks; compiled Radial readers finish their
 already-running output block. Failed CUDA preflight retains CPU progress, while
 failures after GPU publication begins abort rather than replaying a partial output.
+
+Main-process GPU admission samples CUDA memory outside the shared dispatch lock.
+It provisionally reserves only a selected device before claiming its auxiliary
+exclusion, then rechecks eligibility before committing. Auxiliary enable/submit
+cannot reopen a claimed device until its stage ends. Epoch and lease tokens reject
+stale attempts/releases after reset or reconfiguration; failed attempts release
+reservations without consuming successful retirement counters. Other devices can
+continue inference while a CUDA query or auxiliary claim is delayed.
 
 Dense parent credits remain held while native masks are projected and immutable
 component stores are built. Final NRRD compression is submitted asynchronously
@@ -906,9 +977,31 @@ keep distinct mappings through retirement.
 
 Native CVOL NRRDs using software member codecs stream nonempty crop row bands
 through the configured codec. Empty rows/slices use reusable gzip zero members
-at bounded power-of-two sizes through 1 MiB. Completion queues are bounded, and
+at bounded power-of-two sizes through 1 MiB. Repeated zero members use at most two
+compact descriptors per gap and batch encoded writes into buffers no larger than
+1 MiB, preserving the existing member bytes and ordering. Completion queues are bounded, and
 sparse mirror observers receive complete crops. Restored geometry and dense
 observers use their corresponding assembly paths.
+
+After scheduler producers join, plain union reconciliation can overlap global
+postprocessing with component exports whose completed immutable CVOL stores are
+independent of the final union. File identity checks reject aliases; live arrays,
+ordinary raw maps, unknown ownership and custom policies retain the export
+barrier. Completed export futures promptly release their source references. The
+final sink join still precedes manifest publication and scratch cleanup.
+
+Member-stream telemetry aggregates encoded write counts and bytes, raw write
+time, compressor wait time and ordered-prefix wait time. NRRD publication records
+file durability, rename and directory durability separately, allowing storage
+waits to be distinguished from compression work.
+
+Threaded libdeflate compression requires the `deflate` Python binding version
+0.9.0 or newer. Known older bindings hold the GIL inside native compression;
+`auto` and `cpu` selection skip them and continue through the validated ISA-L and
+zlib fallbacks. An explicit `libdeflate` request reports the incompatible version
+and the required upgrade. Unknown or custom binding versions require independent
+parallelism qualification. The one-time backend announcement records the selected
+module path, distribution version and Python runtime.
 
 Optional Intel QAT/QATzip and IAA/QPL extensions provide hardware gzip with
 explicit admission, framing, and failure checks. DSA provides opt-in Linux idxd
@@ -1019,6 +1112,9 @@ then explicitly acknowledge release. Nonparticipants continue view-level work;
 one-owner execution is the admission fallback.
 Participant release acknowledgments gate both worker reuse and scheduler
 quiescence.
+Groups must be admitted before a parent's first dispatch; the current protocol
+does not promote an already active single owner. Native Radial shell owners and
+parents requiring a native-view shadow remain outside this group path.
 
 `YOLO_TTA_GPU_RESIDENT_TAIL=1` uploads a settled host union into contiguous
 job-visible Z shards. Bounded device CCL blocks retain exact 26-connected labels;
@@ -1044,9 +1140,98 @@ final-union ingestion or multi-GPU interpolation; those remain separate designs.
 `YOLO_TTA_TELEMETRY_DIR` selects per-run persistent telemetry and takes precedence
 over the single-path setting. Trace records identify dispatch, dequeue, compute,
 publication, transport, receipts, and exclusive stage leases.
+Task and phase callbacks update process-local state and signal a single background
+writer. Snapshot requests coalesce; diagnostic serialization and file writes run
+outside the locks used to record task boundaries. Explicit flushes drain pending
+records, and final shutdown joins the writer. The persistent destination remains
+the selected telemetry directory.
+
+Scheduler timing counters and ordinary scheduler counters/gauges coalesce under
+separate short locks. This includes the pressure gauge published on both sides
+of every GPU refill. The scheduler facade uses these APIs consistently; it does
+not acquire the general telemetry lock for metric updates. Trace producers
+append to the bounded sequence buffer under their own short lock, then only try
+the general telemetry lock without waiting when a writer notification is due.
+They do not wait behind NRRD compression metrics or snapshot preparation. The
+writer merges timing deltas and copies trace batches using a fixed lock order;
+final flush fences accepted events before choosing its terminal sequence.
+This keeps diagnostics from delaying the work they measure while retaining the
+same counter names, event identities and explicit overflow accounting.
+Ordinary and scheduler gauge writes preserve the latest accepted value when
+they share a key. The CPU NRRD contention replay enables pressure publication so
+its dispatch path exercises these metric writes along with timing and tracing.
+
+GPU stage availability changes request an admission retry on the scheduler's
+owning thread. A released stage must make pending inference and eligible warm
+interpolation workers usable without waiting for another worker result.
+Requests coalesce separately from ordinary result and future notifications;
+stage callbacks never mutate inference ownership directly. Scheduler wait logs
+include physical finalization and union queues alongside the transient-memory
+reservation so a GPU admission wait can be distinguished from output backpressure.
+
+Trace buffering is finite. If storage cannot keep up and the event buffer fills,
+capture stops, queued records are preserved, and telemetry records the first
+dropped sequence and dropped-event count. The trace reader reports that capture
+as incomplete even when its saved event prefix is contiguous. Diagnostic overflow
+does not block inference dispatch or worker completion credits.
 `tools/analyze_pipeline_trace.py` joins process streams and reports missing or
 ambiguous boundaries. Host intervals and concurrent stage sums are interpreted
 separately from CUDA-event kernel measurements and end-to-end walltime.
+GPU gauges publish an atomic acquisition interval and physical NVML device
+identity when available. Repeated trace flushes retain the same sample timestamp;
+they do not constitute new utilization observations. CUDA-visible device tokens
+remain recorded separately from NVML indices.
+
+`scheduler.operation.*` counters distinguish wall time from CPU time consumed by
+the calling thread in selection, GPU refilling, result handling, background
+retirement and workspace admission. Nested totals overlap. Operations taking at
+least 250 ms emit a `scheduler_slow_operation` trace with both durations. Wall
+time minus thread CPU includes scheduling, GIL/resource waits and work delegated
+to other threads; it does not identify one particular wait or total process CPU.
+
+`scheduler.step.*` diagnostics also measure individual admission, backlog, ownership,
+descriptor-transfer, serialization and queue-submission steps. These timings
+overlap the enclosing refill and result counters and must not be summed with
+them. They distinguish where a delay occurs without asserting that a long wall
+interval identifies a lock or GPU wait. Steps taking at least 250 ms emit a
+`scheduler_slow_step` event with available worker and task identities.
+
+On supported POSIX hosts, mapping advice uses the libc `madvise` call through
+`ctypes.CDLL`, which releases the Python interpreter lock during the syscall.
+The complete mapping stays exported until the call returns, including read-only
+maps, so another thread cannot close or resize its storage while the address is
+in use. This preserves the existing advice and full-mapping range. Unsupported
+hosts retain the native mapping method and existing best-effort cleanup rules.
+Advice telemetry measures the remaining host cost; this change does not promise
+a particular workload speedup.
+
+Local performance qualification tools separate diagnosis from cluster runtime:
+`tools/profile_tta_dispatch.py` replays recorded task descriptors through the
+production scheduler with logical workspaces; `tools/profile_tta_nrrd_contention.py`
+adds real raster-sized NRRD writers and verifies decoded hashes. The latter is
+plan-only unless `--execute` is supplied. `tools/profile_tta_local_feed.py` replays
+a saved single-GPU invocation, reserves the sibling Scratch GPU lock and heatsoaks
+the device. `tools/profile_tta_scheduler_lines.py` uses Python 3.12 per-code
+monitoring for bounded scheduler line-gap evidence. It never retains another
+thread's frame or buffer exports, and a profiling window stops measurement, not
+the wrapped pipeline. These fixtures do not establish four-H100 throughput.
+
+`tools/nrrd_output_fixture.py` reconstructs a packed CVOL from a saved binary NRRD
+one plane at a time, preserving source geometry and verifying decoded hashes.
+`tools/profile_nrrd_output.py` uses synthetic or saved fixtures to compare output
+with and without telemetry, including optional low-quality mirrors. It records
+codec, member, executor queue and optional lock timings; hash verification is
+outside the timed interval. `tools/probe_nrrd_codec_parallelism.py` needs only
+Python and the optional compression binding and checks CPU compression parallelism
+without importing XTA, a model runtime or GPU libraries.
+
+`tools/qualify_nvcomp_nrrd.py` is an experimental codec qualification tool, not a
+pipeline backend selector. It compares CPU deflate with nvCOMP standard Gzip RAW
+and standard Deflate RAW plus zlib CRC32/ISIZE framing, including host transfers
+and mixed-member decoding. nvCOMP's proprietary native bitstream and GDeflate
+are not substitutes for NRRD gzip. Any future GPU compression lanes must retain
+the existing ordered member and byte-window contracts and activate only after
+inference asset release, under the shared GPU stage coordinator.
 
 `--capture_component_replay PERSISTENT_DIR` records bounded immutable view-native
 Azimuthal components, geometry, and checksums. Defaults select one component from
@@ -1064,8 +1249,9 @@ python tools/smoke_import.py
 python tools/verify_package_inventory.py
 ```
 
-Run numerical corpora separately because aggregate dependency-light tests can
-substitute optional dependencies with stubs:
+Ordinary tests use the installed numerical dependencies. Dependency-free smoke
+programs run in separate processes so their stubs cannot contaminate numerical
+tests. Individual corpora can also be selected directly:
 
 ```text
 python -m unittest discover -s tests -p test_interpolation_geometry.py -v

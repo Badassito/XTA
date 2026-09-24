@@ -59,7 +59,9 @@ class TiltedAzimuthalRetirementAdmissionTests(unittest.TestCase):
             self.assertIsNone(self.acquire(coordinator, purpose, 0))
             coordinator.set_inference_asset_retirement_pending(False)
             with mock.patch.object(bp, 'gpu_worker_aux_interpolation_pool',
-                                   return_value=SimpleNamespace(revoke_worker=lambda _device: False)):
+                                   return_value=SimpleNamespace(
+                                       claim_worker_for_stage=lambda _device: None,
+                                       release_stage_claim=lambda _device, _token: None)):
                 self.assertIsNone(self.acquire(coordinator, purpose, 0))
 
     def test_all_three_families_share_fifo_and_one_two_turn_burst(self):

@@ -54,6 +54,7 @@ from .config import (
     SCRIPT_VERSION_COMPACT,
 )
 from .experimental_features import experimental_features_snapshot
+from .mmap_advice import madvise_mmap
 
 # Explicit lower-layer dependencies keep imports one-way.
 from .workspace import (
@@ -123,12 +124,43 @@ class RuntimeTelemetry:
         self.trace_enabled = _env_flag('YOLO_TTA_TASK_TRACE', False)
         self.enabled = _env_flag('YOLO_TTA_TELEMETRY', True) or self.trace_enabled
         self.lock = threading.RLock()
-        self._flush_lock = threading.RLock()
+        # Scheduler timing is recorded on dispatch and credit paths. Keep its
+        # short aggregation lock independent of the diagnostic writer lock.
+        self._timing_lock = threading.Lock()
+        self._timing_pending: Counter[str] = Counter()
+        self._timing_dirty = 0
+        # Ordinary scheduler counters and gauges share a similarly short lock.
+        # The scheduler never waits for JSON serialization or file I/O locks.
+        self._scheduler_metrics_lock = threading.Lock()
+        self._scheduler_counter_pending: Counter[str] = Counter()
+        self._scheduler_gauge_pending: Dict[str, object] = {}
+        self._scheduler_metrics_dirty = 0
+        self._writer_condition = threading.Condition(self.lock)
+        self._writer_thread: Optional[threading.Thread] = None
+        self._writer_idle_seconds = 5.0
+        self._request_generation = 0
+        self._completed_generation = 0
+        self._request_sequence = 0
+        self._written_sequence = 0
+        self._final_requested = False
+        self._final_done = False
+        self._accepting = True
+        self._writer_error: Optional[str] = None
+        self._writer_error_reported = False
         self.started_ns = time.monotonic_ns()
         self.hostname = socket.gethostname()
         self._trace_events: List[Dict[str, object]] = []
+        self._trace_lock = threading.Lock()
         self._trace_sequence = 0
         self._trace_batch_limit = 256
+        self._trace_buffer_limit = 4096
+        self._trace_capture_disabled = False
+        self._trace_overflow_reported = False
+        self._trace_dropped = 0
+        self._trace_first_dropped_sequence = 0
+        self._trace_buffer_peak = 0
+        self._trace_dirty = 0
+        self._trace_snapshot_dirty = 0
         self.phase_ns: Counter[str] = Counter()
         self.phase_calls: Counter[str] = Counter()
         self.counters: Counter[str] = Counter()
@@ -166,14 +198,15 @@ class RuntimeTelemetry:
         finally:
             elapsed = time.monotonic_ns() - start
             with self.lock:
-                self.phase_ns[str(name)] += int(elapsed)
-                self.phase_calls[str(name)] += 1
-                if failed:
-                    self.counters[f'{name}.errors'] += 1
-                for key, value in fields.items():
-                    if isinstance(value, (int, float)):
-                        self.counters[f'{name}.{key}'] += value
-                self._dirty += 1
+                if self.enabled and self._accepting:
+                    self.phase_ns[str(name)] += int(elapsed)
+                    self.phase_calls[str(name)] += 1
+                    if failed:
+                        self.counters[f'{name}.errors'] += 1
+                    for key, value in fields.items():
+                        if isinstance(value, (int, float)):
+                            self.counters[f'{name}.{key}'] += value
+                    self._dirty += 1
             self.maybe_flush()
 
     def add(self, name: str, value: object = 1) -> None:
@@ -191,6 +224,8 @@ class RuntimeTelemetry:
             if not math.isfinite(amount):
                 return
         with self.lock:
+            if not self.enabled or not self._accepting:
+                return
             try:
                 total = self.counters[str(name)] + amount
             except OverflowError:
@@ -200,57 +235,126 @@ class RuntimeTelemetry:
             self.counters[str(name)] = total
             self._dirty += 1
 
-    def trace_event(self, event: str, **fields: object) -> None:
-        """Buffer bounded host task boundaries, never tensor/frame samples.
+    def add_scheduler_timing(self, prefix: str, wall_seconds: float,
+                             thread_cpu_seconds: float, failed: bool) -> None:
+        """Coalesce scheduler timings without waiting for the telemetry writer lock."""
+        if not self.enabled:
+            return
+        with self._timing_lock:
+            if not self.enabled or not self._accepting:
+                return
+            self._timing_pending[f'{prefix}.calls'] += 1
+            self._timing_pending[f'{prefix}.wall_seconds'] += wall_seconds
+            self._timing_pending[f'{prefix}.thread_cpu_seconds'] += thread_cpu_seconds
+            if failed:
+                self._timing_pending[f'{prefix}.failures'] += 1
+            self._timing_dirty += 1
 
-        Serialized batch emission applies bounded backpressure on the optional
-        trace path. No events can append while their batch is being written.
-        """
+    def add_scheduler_counter(self, name: str, value: object = 1) -> None:
+        """Coalesce a numeric scheduler counter without taking the writer lock."""
+        if not self.enabled:
+            return
+        try:
+            amount = int(value) if isinstance(value, str) else operator.index(value)
+        except Exception:
+            try:
+                amount = float(value)  # type: ignore[arg-type]
+            except Exception:
+                return
+            if not math.isfinite(amount):
+                return
+        with self._scheduler_metrics_lock:
+            if not self.enabled or not self._accepting:
+                return
+            key = str(name)
+            try:
+                total = self._scheduler_counter_pending[key] + amount
+            except OverflowError:
+                return
+            if isinstance(total, float) and not math.isfinite(total):
+                return
+            self._scheduler_counter_pending[key] = total
+            self._scheduler_metrics_dirty += 1
+
+    def set_scheduler_gauge(self, name: str, value: object) -> None:
+        """Record the latest scheduler gauge without taking the writer lock."""
+        if not self.enabled:
+            return
+        key, serialized = str(name), _runtime_jsonable(value)
+        with self._scheduler_metrics_lock:
+            if not self.enabled or not self._accepting:
+                return
+            self._scheduler_gauge_pending[key] = serialized
+            self._scheduler_metrics_dirty += 1
+
+    def trace_event(self, event: str, **fields: object) -> None:
+        """Queue bounded scalar boundaries without waiting on diagnostic file I/O."""
         if not self.enabled or not self.trace_enabled:
             return
-        with self._flush_lock:
-            if not self.enabled:
+        wall_ns, monotonic_ns = time.time_ns(), time.monotonic_ns()
+        record = {}
+        for key, value in list(fields.items())[:32]:
+            if isinstance(value, np.generic):
+                value = value.item()
+            if isinstance(value, Path):
+                value = str(value)
+            if value is not None and not isinstance(value, (str, int, float, bool)):
+                continue
+            if isinstance(value, float) and not math.isfinite(value):
+                continue
+            record[str(key)[:128]] = value[:512] if isinstance(value, str) else value
+        record.update(event=str(event)[:128], pid=os.getpid(),
+            thread_id=threading.get_ident(), thread=threading.current_thread().name[:128],
+            wall_time_ns=wall_ns, monotonic_ns=monotonic_ns,
+            trace_session=f'{os.getpid()}-{self.started_ns}',
+            hostname=self.hostname,
+            run_id=os.environ.get('YOLO_TTA_TRACE_RUN_ID') or os.environ.get('SLURM_JOB_ID', ''),
+            cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES', ''))
+        with self._trace_lock:
+            if not self.enabled or not self._accepting:
                 return
-            with self.lock:
-                self._trace_sequence += 1
-                record = {}
-                for key, value in list(fields.items())[:32]:
-                    if isinstance(value, np.generic):
-                        value = value.item()
-                    if isinstance(value, Path):
-                        value = str(value)
-                    # Events carry scalar identity/counters only: accidentally
-                    # passing a tensor, array or container must not retain or
-                    # serialize source pixels or an unbounded object graph.
-                    if value is not None and not isinstance(value, (str, int, float, bool)):
-                        continue
-                    if isinstance(value, float) and not math.isfinite(value):
-                        continue
-                    record[str(key)[:128]] = value[:512] if isinstance(value, str) else value
-                record.update(event=str(event)[:128], pid=os.getpid(),
-                    thread_id=threading.get_ident(), thread=threading.current_thread().name[:128],
-                    wall_time_ns=time.time_ns(), monotonic_ns=time.monotonic_ns(),
-                    trace_session=f'{os.getpid()}-{self.started_ns}', sequence=self._trace_sequence,
-                    hostname=self.hostname,
-                    run_id=os.environ.get('YOLO_TTA_TRACE_RUN_ID') or os.environ.get('SLURM_JOB_ID', ''),
-                    cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES', ''))
+            self._trace_sequence += 1
+            if self._trace_capture_disabled or len(self._trace_events) >= self._trace_buffer_limit:
+                self._trace_capture_disabled = True
+                self._trace_dropped += 1
+                if not self._trace_first_dropped_sequence:
+                    self._trace_first_dropped_sequence = self._trace_sequence
+                due = True
+            else:
+                record['sequence'] = self._trace_sequence
                 self._trace_events.append(record)
-                self._dirty += 1
-                full = len(self._trace_events) >= self._trace_batch_limit
-            if full:
-                self.flush()
+                self._trace_buffer_peak = max(self._trace_buffer_peak, len(self._trace_events))
+                due = len(self._trace_events) >= max(1, self._trace_batch_limit)
+            self._trace_dirty += 1
+        # Never wait for the writer's global lock on a compute or credit path.
+        # Other diagnostics and the periodic sampler also check write-due state.
+        if due and self.lock.acquire(blocking=False):
+            try:
+                if self._write_due_locked():
+                    self._request_writer_locked()
+            finally:
+                self.lock.release()
 
     def gauge(self, name: str, value: object) -> None:
         if not self.enabled:
             return
+        key, serialized = str(name), _runtime_jsonable(value)
         with self.lock:
-            self.gauges[str(name)] = _runtime_jsonable(value)
+            if not self.enabled or not self._accepting:
+                return
+            # A newer ordinary update supersedes an earlier pending scheduler
+            # update for the same gauge. A later scheduler update wins normally.
+            with self._scheduler_metrics_lock:
+                self._scheduler_gauge_pending.pop(key, None)
+            self.gauges[key] = serialized
             self._dirty += 1
 
     def fallback(self, name: str, exc: Optional[BaseException] = None) -> None:
         if not self.enabled:
             return
         with self.lock:
+            if not self.enabled or not self._accepting:
+                return
             self.fallbacks[str(name)] += 1
             if exc is not None:
                 self.gauges[f'fallback.{name}.last_error'] = f'{type(exc).__name__}: {exc}'[:512]
@@ -259,6 +363,41 @@ class RuntimeTelemetry:
     def snapshot(self, *, final: bool = False) -> Dict[str, object]:
         now_ns = time.monotonic_ns()
         with self.lock:
+            # Lock order is always telemetry then timing. Producers take only
+            # the timing lock, so the snapshot can swap quickly and aggregate
+            # outside that short critical section.
+            with self._timing_lock:
+                timing_pending = self._timing_pending
+                timing_dirty = self._timing_dirty
+                self._timing_pending = Counter()
+                self._timing_dirty = 0
+            for name, amount in timing_pending.items():
+                self.counters[name] += amount
+            self._dirty += timing_dirty
+            with self._scheduler_metrics_lock:
+                scheduler_counters = self._scheduler_counter_pending
+                scheduler_gauges = self._scheduler_gauge_pending
+                scheduler_dirty = self._scheduler_metrics_dirty
+                self._scheduler_counter_pending = Counter()
+                self._scheduler_gauge_pending = {}
+                self._scheduler_metrics_dirty = 0
+            for name, amount in scheduler_counters.items():
+                try:
+                    total = self.counters[name] + amount
+                except OverflowError:
+                    continue
+                if isinstance(total, float) and not math.isfinite(total):
+                    continue
+                self.counters[name] = total
+            self.gauges.update(scheduler_gauges)
+            self._dirty += scheduler_dirty
+            with self._trace_lock:
+                trace_events = list(self._trace_events[:max(1, self._trace_batch_limit)])
+                trace_dirty = self._trace_dirty
+                trace_dropped = self._trace_dropped
+                trace_first_dropped = self._trace_first_dropped_sequence
+                trace_buffer_peak = self._trace_buffer_peak
+                self._trace_snapshot_dirty = trace_dirty
             phases: Dict[str, object] = {}
             for name, total_ns in self.phase_ns.items():
                 calls = int(self.phase_calls.get(name, 0))
@@ -268,6 +407,20 @@ class RuntimeTelemetry:
                     'seconds': seconds,
                     'mean_ms': (seconds * 1000.0 / calls) if calls else 0.0,
                 }
+            counters = dict(self.counters)
+            if trace_buffer_peak:
+                counters['telemetry.trace_buffer_peak_events'] = max(
+                    int(counters.get('telemetry.trace_buffer_peak_events', 0)), trace_buffer_peak)
+            if trace_dropped:
+                counters['telemetry.trace_dropped_events'] = (
+                    int(counters.get('telemetry.trace_dropped_events', 0)) + trace_dropped)
+            gauges = dict(self.gauges)
+            if trace_dropped:
+                gauges['telemetry.trace_overflow'] = {
+                    'capture_disabled': True, 'buffer_limit': self._trace_buffer_limit,
+                    'first_dropped_sequence': trace_first_dropped,
+                    'dropped_events': trace_dropped,
+                }
             payload: Dict[str, object] = {
                 'schema': f'gpt-6-astra-ultra-v{SCRIPT_VERSION}.telemetry.v1',
                 'pid': os.getpid(),
@@ -275,10 +428,10 @@ class RuntimeTelemetry:
                 'wall_time': time.time(),
                 'final': bool(final),
                 'phases': phases,
-                'counters': dict(self.counters),
-                'gauges': dict(self.gauges),
+                'counters': counters,
+                'gauges': gauges,
                 'fallbacks': dict(self.fallbacks),
-                'events': list(self._trace_events),
+                'events': trace_events,
                 'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES', ''),
             }
         return payload
@@ -286,34 +439,166 @@ class RuntimeTelemetry:
     def maybe_flush(self) -> None:
         if not self.enabled:
             return
-        now = time.monotonic()
         with self.lock:
-            due = bool(self._dirty >= 256 or (self._dirty and now - self._last_flush >= self.flush_seconds))
-        if due:
-            self.flush()
+            if self._write_due_locked():
+                self._request_writer_locked()
 
-    def flush(self, *, final: bool = False) -> None:
-        with self._flush_lock:
-            if not self.enabled:
-                return
-            with self.lock:
-                payload = self.snapshot(final=bool(final))
-                dirty = self._dirty
+    def _write_due_locked(self) -> bool:
+        with self._timing_lock:
+            timing_dirty = self._timing_dirty
+        with self._scheduler_metrics_lock:
+            scheduler_metrics_dirty = self._scheduler_metrics_dirty
+        with self._trace_lock:
+            trace_dirty = self._trace_dirty
+            trace_length = len(self._trace_events)
+        dirty = self._dirty + timing_dirty + scheduler_metrics_dirty + trace_dirty
+        return bool(self.enabled and (
+            self._final_requested or self._request_generation > self._completed_generation
+            or trace_length >= max(1, self._trace_batch_limit)
+            or dirty >= 256
+            or (dirty and time.monotonic() - self._last_flush >= self.flush_seconds)
+        ))
+
+    def _request_writer_locked(self) -> None:
+        if not self.enabled:
+            return
+        if self._writer_thread is None:
+            writer = threading.Thread(target=self._writer_main,
+                name='runtime-telemetry-writer', daemon=True)
+            self._writer_thread = writer
             try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                with self.path.open('a', encoding='utf-8') as handle:
-                    handle.write(json.dumps(payload, sort_keys=True, separators=(',', ':')) + '\n')
-                with self.lock:
-                    del self._trace_events[:len(payload['events'])]
+                writer.start()
+            except Exception as exc:
+                self._writer_thread = None
+                self._disable_writer_locked(exc)
+                return
+        self._writer_condition.notify_all()
+
+    def _disable_writer_locked(self, exc: BaseException) -> None:
+        with self._trace_lock:
+            self.enabled = False
+            self._accepting = False
+        self._writer_error = f'{type(exc).__name__}: {exc}'
+        self.gauges['telemetry.write_error'] = self._writer_error
+        self._writer_condition.notify_all()
+
+    def _report_writer_error(self) -> None:
+        with self.lock:
+            if self._writer_error is None or self._writer_error_reported:
+                return
+            self._writer_error_reported = True
+            message = self._writer_error
+        try:
+            print(f'[runtime telemetry disabled] {message}', file=sys.stderr)
+        except Exception:
+            pass
+
+    def _writer_main(self) -> None:
+        """The sole owner of serialization and persistent telemetry file operations."""
+        handle = None
+        try:
+            while True:
+                with self._writer_condition:
+                    while not self._write_due_locked():
+                        if not self.enabled or self._final_done:
+                            return
+                        notified = self._writer_condition.wait(timeout=self._writer_idle_seconds)
+                        if not notified and not self._write_due_locked():
+                            return
+                    # Recheck due state only here: hot-path requests never queue snapshots.
+                    with self._trace_lock:
+                        final = (self._final_requested and
+                                 len(self._trace_events) <= max(1, self._trace_batch_limit))
+                    payload = self.snapshot(final=final)
+                    dirty = self._dirty
+                    trace_dirty = self._trace_snapshot_dirty
+                    generation, target_sequence = self._request_generation, self._request_sequence
+                serialization_started = time.perf_counter()
+                encoded = json.dumps(payload, sort_keys=True, separators=(',', ':')) + '\n'
+                serialization_seconds = time.perf_counter() - serialization_started
+                io_started = time.perf_counter()
+                if handle is None:
+                    self.path.parent.mkdir(parents=True, exist_ok=True)
+                    handle = self.path.open('a', encoding='utf-8')
+                handle.write(encoded)
+                handle.flush()
+                io_seconds = time.perf_counter() - io_started
+                with self._writer_condition:
+                    # Writer-owned metrics do not dirty the state or request another write.
+                    # Each record necessarily excludes its own not-yet-completed I/O.
+                    self.counters['telemetry.writer.serialization_seconds'] += serialization_seconds
+                    self.counters['telemetry.writer.file_io_seconds'] += io_seconds
+                    self.counters['telemetry.writer.write_calls'] += 1
+                    saved_events = payload['events']
+                    with self._trace_lock:
+                        del self._trace_events[:len(saved_events)]
+                        self._trace_dirty = max(0, self._trace_dirty - trace_dirty)
+                        if saved_events:
+                            self._written_sequence = int(saved_events[-1]['sequence'])
                     self._dirty = max(0, self._dirty - dirty)
                     self._last_flush = time.monotonic()
-            except Exception as exc:
-                with self.lock:
-                    self.enabled = False
+                    if self._written_sequence >= target_sequence:
+                        self._completed_generation = max(self._completed_generation, generation)
+                    if final:
+                        self._final_done = True
+                        self.enabled = False
+                    overflow = payload['gauges'].get('telemetry.trace_overflow')
+                    report_overflow = bool(overflow and not self._trace_overflow_reported)
+                    if report_overflow:
+                        self._trace_overflow_reported = True
+                    self._writer_condition.notify_all()
+                if report_overflow:
+                    try:
+                        print('[runtime telemetry trace truncated] capture disabled after '
+                              f'buffer limit {self._trace_buffer_limit}; dropped counts are recorded in telemetry.',
+                              file=sys.stderr)
+                    except Exception:
+                        pass
+        except Exception as exc:
+            with self._writer_condition:
+                self._disable_writer_locked(exc)
+        finally:
+            if handle is not None:
                 try:
-                    print(f'[runtime telemetry disabled] {exc}', file=sys.stderr)
-                except Exception:
-                    pass
+                    handle.close()
+                except Exception as exc:
+                    with self._writer_condition:
+                        self._disable_writer_locked(exc)
+            with self._writer_condition:
+                self._writer_thread = None
+                # A request can arrive while an idle writer is closing its file.
+                if self._write_due_locked():
+                    self._request_writer_locked()
+                self._writer_condition.notify_all()
+            self._report_writer_error()
+
+    def flush(self, *, final: bool = False) -> None:
+        """Explicit drain; ordinary event/counter paths only signal the writer."""
+        thread = None
+        with self._writer_condition:
+            if self.enabled and not self._final_done:
+                with self._trace_lock:
+                    if final:
+                        # Fence accepted events before choosing the last sequence.
+                        self._accepting = False
+                        self._final_requested = True
+                    target_sequence = (int(self._trace_events[-1]['sequence'])
+                                       if self._trace_events else self._written_sequence)
+                self._request_generation += 1
+                generation = self._request_generation
+                self._request_sequence = target_sequence
+                self._request_writer_locked()
+                thread = self._writer_thread
+                if thread is not threading.current_thread():
+                    while self.enabled and self._completed_generation < generation:
+                        self._writer_condition.wait()
+                if final:
+                    thread = self._writer_thread or thread
+            elif final:
+                thread = self._writer_thread
+        if final and thread is not None and thread is not threading.current_thread():
+            thread.join()
+        self._report_writer_error()
 
 class RuntimeSystemSampler:
     def __init__(self, telemetry: RuntimeTelemetry) -> None:
@@ -366,20 +651,47 @@ class RuntimeSystemSampler:
 
     def _sample_gpu(self) -> None:
         try:
+            sample_started_ns = time.monotonic_ns()
             nvml = _load_nvidia_ml_py()
             if not self._nvml_ready:
                 nvml.nvmlInit()
                 self._nvml_ready = True
             util = []
             memory = []
+            devices = []
             for index in range(int(nvml.nvmlDeviceGetCount())):
                 handle = nvml.nvmlDeviceGetHandleByIndex(index)
                 usage = nvml.nvmlDeviceGetUtilizationRates(handle)
                 mem = nvml.nvmlDeviceGetMemoryInfo(handle)
                 util.append({'gpu': int(usage.gpu), 'memory': int(usage.memory)})
                 memory.append({'used': int(mem.used), 'total': int(mem.total)})
-            self.telemetry.gauge('system.gpu_utilization', util)
-            self.telemetry.gauge('system.gpu_memory', memory)
+                identity = {'nvml_index': index}
+                try:
+                    uuid = nvml.nvmlDeviceGetUUID(handle)
+                    identity['uuid'] = uuid.decode('ascii') if isinstance(uuid, bytes) else str(uuid)
+                except Exception:
+                    pass
+                try:
+                    bus = nvml.nvmlDeviceGetPciInfo(handle).busId
+                    identity['pci_bus_id'] = bus.decode('ascii') if isinstance(bus, bytes) else str(bus)
+                except Exception:
+                    pass
+                devices.append(identity)
+            sample_finished_ns = time.monotonic_ns()
+            # A trace flush can repeat the latest gauges many times. Publish
+            # the values and acquisition interval together so readers can
+            # identify real samples without guessing from changed values.
+            with self.telemetry.lock:
+                if not self.telemetry.enabled or not self.telemetry._accepting:
+                    return
+                self.telemetry.gauges.update({
+                    'system.gpu_utilization': util,
+                    'system.gpu_memory': memory,
+                    'system.gpu_devices': devices,
+                    'system.gpu_sample_started_ns': sample_started_ns,
+                    'system.gpu_sample_monotonic_ns': sample_finished_ns,
+                })
+                self.telemetry._dirty += 1
         except Exception:
             pass
 
@@ -2007,41 +2319,101 @@ def _duplicate_memfd_path_for_child(path: object) -> Optional[object]:
         return None
     return mp_reduction.DupFd(int(fd))
 
-def _attach_memfd_transfers_to_task(task: Dict[str, object]) -> None:
+def _memfd_source_identity(fd: int) -> str:
+    """Identify storage independently of reusable parent fd numbers and mutable pixels."""
+    stat = os.fstat(int(fd))
+    return f'memfd-source-v1:{int(stat.st_dev)}:{int(stat.st_ino)}:{int(stat.st_size)}'
+
+
+@dataclass
+class _MemfdTransferBatch:
+    """Parent dispatch transaction; registered handles belong to the receiver after put."""
+
+    handles: List[object]
+    source_keys: Tuple[str, ...] = ()
+
+    def rollback(self) -> None:
+        # Detaching unregisters DupFd from multiprocessing.resource_sharer. Dropping
+        # its Python wrapper alone would leave the sharer's duplicate open.
+        handles, self.handles = self.handles, []
+        for handle in handles:
+            try:
+                _close_fd_list((_detach_transferred_fd(handle),))
+            except Exception:
+                # A broken transport must not hide the original dispatch exception.
+                pass
+
+
+def _attach_memfd_transfers_to_task(
+    task: Dict[str, object], *, known_sources: Optional[Iterable[str]] = None,
+) -> _MemfdTransferBatch:
     """Attach handles to a dispatch copy, including independent policy result parents.
 
     Dispatchers copy only the outer task dictionary. Copy nested policy dictionaries
     before attaching handles so canonical tasks never retain one-use transfer objects.
+
+    ``known_sources`` contains identities acknowledged by this specific worker after
+    successful materialization/compute. Without it, the one-argument transfer protocol
+    is unchanged. Within a dispatch, preorder traversal also permits reuse after the
+    first real transfer, since the receiver materializes that same order atomically.
     """
-    for path_field, handle_field in (
-        ('source_volume_path', 'source_volume_fd'),
-        ('result_mask_path', 'result_mask_fd'),
-        ('result_conf_path', 'result_conf_fd'),
-        ('canvas_path', 'canvas_fd'),
-        ('d1_bitset_path', 'd1_bitset_fd'),
-    ):
-        raw_path = task.get(path_field)
-        handle = _duplicate_memfd_path_for_child(raw_path)
-        if handle is not None:
-            task[handle_field] = handle
-            task[f'{handle_field}_key'] = str(raw_path)
+    batch = _MemfdTransferBatch([])
+    known = None if known_sources is None else set(known_sources)
+    source_keys: Dict[str, None] = {}
 
-    native_resize = task.get('native_resize')
-    if isinstance(native_resize, dict):
-        native_copy = dict(native_resize)
-        native_path = native_copy.get('path')
-        handle = _duplicate_memfd_path_for_child(native_path)
+    def attach(holder: Dict[str, object], path_field: str, handle_field: str,
+               *, persistent: bool = False) -> None:
+        raw_path = holder.get(path_field)
+        key = str(raw_path)
+        if persistent and known is not None:
+            # Keep the owner registry stable through identity lookup and DupFd's dup.
+            # The owner lock is reentrant; the path helper uses this same registry.
+            with _MEMFD_OWNER_LOCK:
+                fd = _memfd_owner_fd_for_path(raw_path)
+                if fd is None:
+                    return
+                key = _memfd_source_identity(fd)
+                source_keys[key] = None
+                if key in known:
+                    holder[f'{handle_field}_ref'] = key
+                    return
+                handle = mp_reduction.DupFd(int(fd))
+            known.add(key)
+        else:
+            handle = _duplicate_memfd_path_for_child(raw_path)
         if handle is not None:
-            native_copy['path_fd'] = handle
-            native_copy['path_fd_key'] = str(native_path)
-        task['native_resize'] = native_copy
+            batch.handles.append(handle)
+            holder[handle_field] = handle
+            holder[f'{handle_field}_key'] = key
 
-    siblings = task.get('augmentation_pass_tasks')
-    if siblings:
-        sibling_copies = [dict(sibling) for sibling in siblings]
-        task['augmentation_pass_tasks'] = sibling_copies
-        for sibling in sibling_copies:
-            _attach_memfd_transfers_to_task(sibling)
+    def attach_task(holder: Dict[str, object]) -> None:
+        for path_field, handle_field in (
+            ('source_volume_path', 'source_volume_fd'),
+            ('result_mask_path', 'result_mask_fd'),
+            ('result_conf_path', 'result_conf_fd'),
+            ('canvas_path', 'canvas_fd'),
+            ('d1_bitset_path', 'd1_bitset_fd'),
+        ):
+            attach(holder, path_field, handle_field, persistent=path_field == 'source_volume_path')
+        native_resize = holder.get('native_resize')
+        if isinstance(native_resize, dict):
+            native_copy = dict(native_resize)
+            holder['native_resize'] = native_copy
+            attach(native_copy, 'path', 'path_fd', persistent=True)
+        siblings = holder.get('augmentation_pass_tasks')
+        if siblings:
+            sibling_copies = [dict(sibling) for sibling in siblings]
+            holder['augmentation_pass_tasks'] = sibling_copies
+            for sibling in sibling_copies:
+                attach_task(sibling)
+
+    try:
+        attach_task(task)
+        batch.source_keys = tuple(source_keys)
+        return batch
+    except BaseException:
+        batch.rollback()
+        raise
 
 def _detach_transferred_fd(handle: object) -> int:
     detach = getattr(handle, 'detach', None)
@@ -2064,6 +2436,12 @@ def _materialize_worker_task_memfd_paths(
     All policy siblings share this transaction and its returned descriptor ownership list.
     """
     transient_fds: List[int] = []
+    started_ns = time.perf_counter_ns()
+    detach_ns = 0
+    detach_calls = 0
+    source_reference_hits = 0
+    duplicate_sources_closed = 0
+    failed = False
     # The caller can only close descriptors after this function returns.  Keep enough
     # transaction state here to roll back descriptors detached before a later handle
     # fails to materialize; otherwise the assignment at the call site never happens and
@@ -2077,12 +2455,37 @@ def _materialize_worker_task_memfd_paths(
         handle_field: str,
         persistent: bool,
     ) -> None:
+        nonlocal detach_ns, detach_calls, source_reference_hits, duplicate_sources_closed
+        reference = holder.pop(f'{handle_field}_ref', None)
+        if reference is not None:
+            if not persistent or holder.get(handle_field) is not None:
+                raise ValueError(f'Invalid cached memfd reference for {handle_field}')
+            key = str(reference)
+            fd = persistent_sources.get(key)
+            if (not key.startswith('memfd-source-v1:') or fd is None
+                    or _memfd_source_identity(fd) != key):
+                raise RuntimeError(f'Worker has no matching persistent memfd source: {key}')
+            source_reference_hits += 1
+            holder[path_field] = str(_memfd_proc_path(int(fd), owner_pid=os.getpid()))
+            return
         handle = holder.pop(handle_field, None)
         key_raw = holder.pop(f'{handle_field}_key', None)
         if handle is None:
             return
         key = str(key_raw or holder.get(path_field) or handle_field)
-        received_fd = _detach_transferred_fd(handle)
+        before_detach = time.perf_counter_ns()
+        detach_calls += 1
+        try:
+            received_fd = _detach_transferred_fd(handle)
+        finally:
+            detach_ns += time.perf_counter_ns() - before_detach
+        if persistent and key.startswith('memfd-source-v1:'):
+            try:
+                if _memfd_source_identity(received_fd) != key:
+                    raise RuntimeError(f'Transferred memfd source identity changed: {key}')
+            except BaseException:
+                _close_fd_list((received_fd,))
+                raise
         if persistent:
             cached = persistent_sources.get(key)
             if cached is None:
@@ -2093,7 +2496,10 @@ def _materialize_worker_task_memfd_paths(
                     os.close(int(received_fd))
                 except OSError:
                     pass
+                duplicate_sources_closed += 1
                 fd = int(cached)
+                if key.startswith('memfd-source-v1:') and _memfd_source_identity(fd) != key:
+                    raise RuntimeError(f'Cached memfd source identity changed: {key}')
         else:
             fd = int(received_fd)
             transient_fds.append(int(fd))
@@ -2109,8 +2515,8 @@ def _materialize_worker_task_memfd_paths(
         native_resize = holder.get('native_resize')
         if isinstance(native_resize, dict):
             native_copy = dict(native_resize)
-            _resolve(native_copy, path_field='path', handle_field='path_fd', persistent=True)
             holder['native_resize'] = native_copy
+            _resolve(native_copy, path_field='path', handle_field='path_fd', persistent=True)
         siblings = holder.get('augmentation_pass_tasks')
         if siblings:
             sibling_copies = [dict(sibling) for sibling in siblings]
@@ -2122,12 +2528,40 @@ def _materialize_worker_task_memfd_paths(
         _resolve_task(task)
         return transient_fds
     except BaseException:
+        failed = True
         _close_fd_list(transient_fds)
         for key in list(set(persistent_sources) - persistent_keys_before):
             fd = persistent_sources.pop(key, None)
             if fd is not None:
                 _close_fd_list((int(fd),))
+        # Later fields may still own registered transfers after an early failure.
+        # Read, rather than mutate, nested dictionaries not yet copied by traversal.
+        remaining: List[object] = []
+
+        def collect(holder: Dict[str, object]) -> None:
+            for field in ('source_volume_fd', 'result_mask_fd', 'result_conf_fd',
+                          'canvas_fd', 'd1_bitset_fd'):
+                if holder.get(field) is not None:
+                    remaining.append(holder[field])
+            native = holder.get('native_resize')
+            if isinstance(native, dict) and native.get('path_fd') is not None:
+                remaining.append(native['path_fd'])
+            for sibling in holder.get('augmentation_pass_tasks') or ():
+                collect(sibling)
+
+        collect(task)
+        _MemfdTransferBatch(remaining).rollback()
         raise
+    finally:
+        telemetry = _RUNTIME_TELEMETRY
+        if telemetry is not None:
+            for name, value in (
+                ('calls', 1), ('seconds', (time.perf_counter_ns() - started_ns) / 1e9),
+                ('detach_calls', detach_calls), ('detach_seconds', detach_ns / 1e9),
+                ('source_reference_hits', source_reference_hits),
+                ('duplicate_sources_closed', duplicate_sources_closed), ('failures', int(failed)),
+            ):
+                telemetry.add(f'worker.memfd_materialize.{name}', value)
 
 def _close_fd_list(fds: Iterable[int]) -> None:
     for fd in list(fds):
@@ -2163,11 +2597,34 @@ def _madvise_dontneed_array(arr: object) -> None:
         mmap_obj = getattr(current, '_mmap', None)
         if mmap_obj is not None:
             try:
-                mmap_obj.madvise(advice)
+                _madvise_mmap_traced(mmap_obj, advice, source='workspace.close')
             except (AttributeError, OSError, ValueError, BufferError):
                 pass
             return
         current = getattr(current, 'base', None)
+
+
+def _madvise_mmap_traced(mmap_obj: mmap.mmap, advice: int, *, source: str) -> None:
+    """Measure advice stalls so they can be compared with scheduler gaps."""
+    try:
+        size = len(mmap_obj)
+    except (TypeError, ValueError):
+        size = 0
+    start = time.perf_counter_ns()
+    backend = 'error'
+    try:
+        backend = madvise_mmap(mmap_obj, advice)
+    finally:
+        elapsed = max(0, time.perf_counter_ns() - start) / 1e9
+        telemetry = runtime_telemetry()
+        prefix = f'memory.madvise.{source}'
+        telemetry.add(f'{prefix}.calls', 1)
+        telemetry.add(f'{prefix}.seconds', elapsed)
+        telemetry.add(f'{prefix}.bytes', size)
+        if elapsed >= .25:
+            runtime_trace_event('mmap_madvise_slow', source=source,
+                                advice=int(advice), bytes=int(size),
+                                backend=backend, wall_seconds=elapsed)
 
 
 @contextlib.contextmanager
@@ -3254,6 +3711,9 @@ class _GpuWorkerAuxInterpolationPool:
         self._pending: Dict[int, Dict[str, object]] = {}
         self._leased: Dict[int, bool] = {}
         self._busy_workers: set[int] = set()
+        # A main-process CUDA stage excludes new auxiliary work until its lease ends.
+        # The opaque claim also makes a delayed release unable to reopen a newer claim.
+        self._stage_exclusions: Dict[int, object] = {}
         self._next_task_id = 2_000_000_000
         self._cursor = 0
         self._failed_reason: Optional[str] = None
@@ -3266,7 +3726,8 @@ class _GpuWorkerAuxInterpolationPool:
     def enable_worker(self, worker_id: int, *, allow_full_cpu_affinity: bool = False) -> bool:
         worker = int(worker_id)
         with self._lock:
-            if self._failed_reason is not None or worker not in self._task_queues:
+            if (self._failed_reason is not None or worker not in self._task_queues
+                    or worker in self._stage_exclusions):
                 return False
             changed = worker not in self._leased or bool(self._leased[worker]) != bool(allow_full_cpu_affinity)
             self._leased[worker] = bool(allow_full_cpu_affinity)
@@ -3285,7 +3746,26 @@ class _GpuWorkerAuxInterpolationPool:
         worker = int(worker_id)
         with self._lock:
             self._leased.pop(worker, None)
+            # The stage exclusion blocks auxiliary enable/submit, but ordinary
+            # stages may explicitly overlap inference in the coordinator.
             return worker not in self._busy_workers
+
+    def claim_worker_for_stage(self, worker_id: int) -> Optional[object]:
+        """Atomically revoke an idle offer and exclude auxiliary reuse for a CUDA stage."""
+        worker = int(worker_id)
+        with self._lock:
+            if worker in self._busy_workers or worker in self._stage_exclusions:
+                return None
+            self._leased.pop(worker, None)
+            claim = object()
+            self._stage_exclusions[worker] = claim
+            return claim
+
+    def release_stage_claim(self, worker_id: int, claim: object) -> None:
+        worker = int(worker_id)
+        with self._lock:
+            if self._stage_exclusions.get(worker) is claim:
+                self._stage_exclusions.pop(worker, None)
 
     def outstanding(self) -> int:
         with self._lock:
@@ -3310,7 +3790,8 @@ class _GpuWorkerAuxInterpolationPool:
                 return None
             candidates = [
                 worker_id for worker_id in self._worker_ids
-                if worker_id in self._leased and worker_id not in self._busy_workers
+                if (worker_id in self._leased and worker_id not in self._busy_workers
+                    and worker_id not in self._stage_exclusions)
             ]
             if not candidates:
                 return None

@@ -28,7 +28,30 @@ from .experimental_features import (
 )
 from .geometry import ViewInfo
 from .cylindrical_owner import is_radial_owner_task
-from .runtime import runtime_trace_event
+from .runtime import _MemfdTransferBatch, runtime_trace_event
+from .scheduler_diagnostics import scheduler_operation, scheduler_step
+
+
+@dataclass
+class _WorkerMemfdSourceCache:
+    """Bounded acknowledged identities for one queue/process, without fd ownership."""
+
+    queue: object
+    pid: Optional[int] = None
+    known: Dict[str, None] = field(default_factory=dict)
+    pending: Dict[int, Tuple[str, ...]] = field(default_factory=dict)
+
+    def completed(self, task_id: int, *, ok: bool) -> None:
+        keys = self.pending.pop(int(task_id), ())
+        if not ok:
+            return
+        for key in keys:
+            self.known.pop(key, None)
+            self.known[key] = None
+        # Eviction changes only the next dispatch to a real transfer. Child owners
+        # remain alive, preserving resident renderer identities until worker exit.
+        while len(self.known) > 64:
+            self.known.pop(next(iter(self.known)))
 
 
 @dataclass(frozen=True)
@@ -39,7 +62,7 @@ class TtaSchedulerOperations:
     independently testable without importing or initializing accelerator frameworks.
     """
 
-    _attach_memfd_transfers_to_task: Callable[[Dict[str, object]], object]
+    _attach_memfd_transfers_to_task: Callable[..., object]
     _env_float: Callable[[str, float], float]
     _env_int: Callable[[str, int], int]
     _main_process_gpu_stage_begin_inference: Callable[[int], bool]
@@ -177,6 +200,7 @@ class TtaSchedulerState:
 
     cpu_task_queues: Dict[int, object] = field(default_factory=dict)
     gpu_task_queues: Dict[int, object] = field(default_factory=dict)
+    worker_memfd_sources: Dict[Tuple[str, int], _WorkerMemfdSourceCache] = field(default_factory=dict)
     cpu_worker_processes: List[object] = field(default_factory=list)
     gpu_worker_processes: List[object] = field(default_factory=list)
     cpu_worker_dispatched_by_id: Dict[int, int] = field(default_factory=dict)
@@ -298,6 +322,9 @@ class TtaSchedulerState:
     result_transport_configured: bool = False
     push_drain_active: bool = False
     scheduler_wake: threading.Event = field(default_factory=threading.Event)
+    gpu_stage_admission_dirty: threading.Event = field(default_factory=threading.Event)
+    gpu_stage_admission_signal_lock: threading.Lock = field(default_factory=threading.Lock)
+    gpu_stage_admission_retry_at: float = 0.0
     push_drain_stop: threading.Event = field(default_factory=threading.Event)
     pushed_worker_results: deque[Dict[str, object]] = field(default_factory=deque)
     wake_hooked_futures: weakref.WeakSet[Future] = field(default_factory=weakref.WeakSet)
@@ -348,6 +375,78 @@ class TtaScheduler:
         self.state = state
         self.operations = operations
         self._callbacks: Optional[TtaSchedulerCallbacks] = None
+        self._state_owner_thread: Optional[int] = None
+        self._state_owner_bind_lock = threading.Lock()
+        self._result_processing_depth = 0
+        self._credit_checkpoint_active = False
+
+    def _telemetry_add(self, name: str, value: object = 1) -> None:
+        telemetry = self.operations.runtime_telemetry()
+        add = getattr(telemetry, 'add_scheduler_counter', None)
+        (add if callable(add) else telemetry.add)(name, value)
+
+    def _telemetry_gauge(self, name: str, value: object) -> None:
+        telemetry = self.operations.runtime_telemetry()
+        gauge = getattr(telemetry, 'set_scheduler_gauge', None)
+        (gauge if callable(gauge) else telemetry.gauge)(name, value)
+
+    def _worker_memfd_source_cache(self, worker_kind: str, worker_id: int) -> _WorkerMemfdSourceCache:
+        queues = self.state.cpu_task_queues if worker_kind == 'cpu' else self.state.gpu_task_queues
+        queue_obj = queues[int(worker_id)]
+        key = (str(worker_kind), int(worker_id))
+        cache = self.state.worker_memfd_sources.get(key)
+        if cache is None or cache.queue is not queue_obj:
+            cache = _WorkerMemfdSourceCache(queue_obj)
+            self.state.worker_memfd_sources[key] = cache
+        return cache
+
+    def _put_worker_inference_task(
+        self, dispatch_task: Dict[str, object], worker_kind: str, worker_id: int,
+    ) -> None:
+        cache = self._worker_memfd_source_cache(worker_kind, worker_id)
+        batch = None
+        try:
+            with scheduler_step('memfd_attach', worker_id=worker_id,
+                                task_id=int(dispatch_task['task_id'])):
+                batch = self.operations._attach_memfd_transfers_to_task(
+                    dispatch_task, known_sources=tuple(cache.known),
+                )
+            with scheduler_step('payload_serialize', worker_id=worker_id,
+                                task_id=int(dispatch_task['task_id'])):
+                self.operations.preflight_multiprocessing_payload(dispatch_task)
+            runtime_trace_event('scheduler_dispatch', task=dispatch_task,
+                                device=f'{"cpu" if worker_kind == "cpu" else "cuda"}:{worker_id}')
+            with scheduler_step('queue_put', worker_id=worker_id,
+                                task_id=int(dispatch_task['task_id'])):
+                cache.queue.put(dispatch_task)
+        except BaseException:
+            if isinstance(batch, _MemfdTransferBatch):
+                batch.rollback()
+            raise
+        # Queue.put alone never acknowledges installation. Only successful compute or
+        # final-result handling may make these identities available to later dispatch.
+        if isinstance(batch, _MemfdTransferBatch) and batch.source_keys:
+            cache.pending[int(dispatch_task['task_id'])] = batch.source_keys[-64:]
+
+    def _record_worker_memfd_completion(self, msg: Dict[str, object]) -> None:
+        worker_kind = 'cpu' if str(msg.get('worker_kind', 'gpu')).lower() == 'cpu' else 'gpu'
+        worker_id = int(msg.get('cpu_index' if worker_kind == 'cpu' else 'gpu_index', -1))
+        queues = self.state.cpu_task_queues if worker_kind == 'cpu' else self.state.gpu_task_queues
+        if worker_id not in queues:
+            return
+        cache = self._worker_memfd_source_cache(worker_kind, worker_id)
+        mtype = str(msg.get('type'))
+        if mtype == 'ready':
+            pid = msg.get('pid')
+            if pid is not None:
+                if cache.pid is not None and cache.pid != int(pid):
+                    cache.known.clear()
+                    cache.pending.clear()
+                cache.pid = int(pid)
+        elif mtype in {'compute_released', 'result'}:
+            # The result's worker identity must match the queue which received this
+            # task. A different worker has no pending entry and cannot authorize it.
+            cache.completed(int(msg.get('task_id', -1)), ok=bool(msg.get('ok')))
 
     def bind_result_callbacks(self, callbacks: TtaSchedulerCallbacks) -> None:
         """Bind the main-thread completion callbacks exactly once before result drain."""
@@ -455,11 +554,11 @@ class TtaScheduler:
         self.state.gpu_worker_tile_dense_result_reservations[task_id] = int(need)
         self.state.gpu_worker_tile_dense_result_reserved_at[task_id] = float(time.monotonic())
         self.state.gpu_worker_tile_dense_result_bytes_reserved += int(need)
-        self.operations.runtime_telemetry().gauge(
+        self._telemetry_gauge(
             'tile.dense_worker_result_bytes_reserved',
             int(self.state.gpu_worker_tile_dense_result_bytes_reserved),
         )
-        self.operations.runtime_telemetry().gauge(
+        self._telemetry_gauge(
             'tile.dense_worker_result_tasks_reserved',
             int(len(self.state.gpu_worker_tile_dense_result_reservations)),
         )
@@ -548,16 +647,16 @@ class TtaScheduler:
             if int(actual_memfd_bytes) > 0:
                 self.state.gpu_worker_tile_dense_result_memfd_reservations[task_id] = int(actual_memfd_bytes)
                 self.state.gpu_worker_tile_dense_result_memfd_bytes_reserved += int(actual_memfd_bytes)
-                self.operations.runtime_telemetry().add(
+                self._telemetry_add(
                     'tile.dense_worker_result_memfd_bytes', int(actual_memfd_bytes),
                 )
-                self.operations.runtime_telemetry().gauge(
+                self._telemetry_gauge(
                     'tile.dense_worker_result_memfd_bytes_reserved',
                     int(self.state.gpu_worker_tile_dense_result_memfd_bytes_reserved),
                 )
             path_bytes = max(0, int(total_need) - int(actual_memfd_bytes))
             if int(path_bytes) > 0:
-                self.operations.runtime_telemetry().add(
+                self._telemetry_add(
                     'tile.dense_worker_result_path_fallback_bytes', int(path_bytes),
                 )
         except BaseException:
@@ -651,7 +750,7 @@ class TtaScheduler:
                 0,
                 int(self.state.gpu_worker_tile_dense_result_memfd_bytes_reserved) - int(released_memfd),
             )
-            self.operations.runtime_telemetry().gauge(
+            self._telemetry_gauge(
                 'tile.dense_worker_result_memfd_bytes_reserved',
                 int(self.state.gpu_worker_tile_dense_result_memfd_bytes_reserved),
             )
@@ -668,21 +767,21 @@ class TtaScheduler:
                 float(self.state.gpu_worker_tile_dense_result_max_retention_seconds),
                 float(retention_seconds),
             )
-            self.operations.runtime_telemetry().add(
+            self._telemetry_add(
                 'tile.dense_worker_result_retention_seconds_total',
                 float(retention_seconds),
             )
-            self.operations.runtime_telemetry().add('tile.dense_worker_result_retirements', 1)
-            self.operations.runtime_telemetry().gauge(
+            self._telemetry_add('tile.dense_worker_result_retirements', 1)
+            self._telemetry_gauge(
                 'tile.dense_worker_result_last_retention_seconds',
                 float(retention_seconds),
             )
-            self.operations.runtime_telemetry().gauge(
+            self._telemetry_gauge(
                 'tile.dense_worker_result_max_retention_seconds',
                 float(self.state.gpu_worker_tile_dense_result_max_retention_seconds),
             )
             if reason:
-                self.operations.runtime_telemetry().add(
+                self._telemetry_add(
                     f'tile.dense_worker_result_retired_reason.'
                     f'{self.operations._sanitize_filesystem_token(reason)}',
                     1,
@@ -699,12 +798,12 @@ class TtaScheduler:
             self.state.gpu_worker_tile_dense_result_bytes_reserved = max(
                 0, int(self.state.gpu_worker_tile_dense_result_bytes_reserved) - int(released),
             )
-            self.operations.runtime_telemetry().add('tile.dense_worker_result_bytes_retired', int(released))
-            self.operations.runtime_telemetry().gauge(
+            self._telemetry_add('tile.dense_worker_result_bytes_retired', int(released))
+            self._telemetry_gauge(
                 'tile.dense_worker_result_bytes_reserved',
                 int(self.state.gpu_worker_tile_dense_result_bytes_reserved),
             )
-            self.operations.runtime_telemetry().gauge(
+            self._telemetry_gauge(
                 'tile.dense_worker_result_tasks_reserved',
                 int(len(self.state.gpu_worker_tile_dense_result_reservations)),
             )
@@ -812,7 +911,7 @@ class TtaScheduler:
             if parent_key is not None:
                 self.state.fullframe_remaining[parent_key] = int(self.state.fullframe_remaining.get(parent_key, 0)) + 1
                 self.state.fullframe_task_ids_by_parent.setdefault(parent_key, []).append(int(child_id))
-            self.operations.runtime_telemetry().add('scheduler.runtime_lease_splits', 1)
+            self._telemetry_add('scheduler.runtime_lease_splits', 1)
             # The selected front lease is now target-sized; leave the remainder central so
             # C3 can place it on the least-loaded eligible worker/owner.
             break
@@ -903,7 +1002,7 @@ class TtaScheduler:
         if not normalized:
             if self.state.hybrid_cpu_idle_active:
                 elapsed = max(0.0, now - float(self.state.hybrid_cpu_idle_since or now))
-                self.operations.runtime_telemetry().add('hybrid.cpu_idle_seconds', float(elapsed))
+                self._telemetry_add('hybrid.cpu_idle_seconds', float(elapsed))
             self.state.hybrid_cpu_idle_active = False
             self.state.hybrid_cpu_idle_since = None
             return
@@ -911,13 +1010,13 @@ class TtaScheduler:
             return
         if self.state.hybrid_cpu_idle_active:
             elapsed = max(0.0, now - float(self.state.hybrid_cpu_idle_since or now))
-            self.operations.runtime_telemetry().add('hybrid.cpu_idle_seconds', float(elapsed))
+            self._telemetry_add('hybrid.cpu_idle_seconds', float(elapsed))
         self.state.hybrid_cpu_idle_active = True
         self.state.hybrid_cpu_idle_since = now
         if normalized != self.state.hybrid_cpu_idle_reason_last:
             self.state.hybrid_cpu_idle_reason_last = normalized
             self.state.hybrid_cpu_idle_reason_counts[normalized] += 1
-            self.operations.runtime_telemetry().add(
+            self._telemetry_add(
                 f'hybrid.cpu_idle_reason.{self.operations._sanitize_filesystem_token(normalized)}', 1,
             )
             print(f'[hybrid] OpenVINO idle: {normalized}.')
@@ -1049,7 +1148,7 @@ class TtaScheduler:
                     f'hybrid view {parent} contains mixed result contracts: '
                     f'{candidate_mode} vs {requested}'
                 )
-        self.operations.runtime_telemetry().add(f'hybrid.view_commits.{requested}', 1)
+        self._telemetry_add(f'hybrid.view_commits.{requested}', 1)
         reservation_note = (
             f', CPU reservation #{self.state.hybrid_cpu_reservation_rank_by_parent[parent] + 1}'
             if parent in self.state.hybrid_cpu_reservation_rank_by_parent else
@@ -1084,6 +1183,7 @@ class TtaScheduler:
     def hybrid_gpu_stealback_quota(self,
         mandatory_gpu_pairs: Sequence[Tuple[int, int]],
         active_cpu_pairs: Sequence[Tuple[int, int]],
+        *, task_seconds: Optional[Callable[[Dict[str, object]], float]] = None,
     ) -> int:
         """Return a proportional concurrent-task quota for the active CPU-owned view.
 
@@ -1094,6 +1194,7 @@ class TtaScheduler:
         overlap depth.
         """
         active_parent = self.active_cpu_shared_parent()
+        gpu_seconds = self.gpu_worker_task_seconds if task_seconds is None else task_seconds
         if (
             not self.operations.hybrid_gpu_stealback_enabled()
             or active_parent is None
@@ -1134,7 +1235,7 @@ class TtaScheduler:
             if self.hybrid_task_is_gpu_mandatory(self.state.gpu_worker_tasks_by_id.get(int(task_id), {}))
         ))
         gpu_pending = float(sum(
-            self.gpu_worker_task_seconds(self.state.gpu_worker_tasks_by_id[int(task_id)])
+            gpu_seconds(self.state.gpu_worker_tasks_by_id[int(task_id)])
             for task_id in list(self.state.gpu_worker_pending_task_ids)
             if bool(self.state.gpu_worker_tasks_by_id[int(task_id)].get('gpu_eligible', self.inputs.gpu_worker_process_active))
             and self.hybrid_task_is_gpu_mandatory(self.state.gpu_worker_tasks_by_id[int(task_id)])
@@ -1147,7 +1248,7 @@ class TtaScheduler:
         )
         minimum_samples = int(self.operations.hybrid_gpu_stealback_min_cpu_samples())
         if gpu_mandatory_work > 0.0 and completed_cpu_samples < minimum_samples:
-            self.operations.runtime_telemetry().gauge(
+            self._telemetry_gauge(
                 'hybrid.gpu_assist_waiting_for_cpu_samples',
                 {
                     'parent': f'{active_parent[0]}/{active_parent[1]}',
@@ -1162,13 +1263,13 @@ class TtaScheduler:
             float(gpu_horizon) * float(ratio)
             + float(self.operations.hybrid_gpu_stealback_min_lead_seconds())
         )
-        self.operations.runtime_telemetry().gauge('hybrid.active_cpu_eta_seconds', float(cpu_eta))
-        self.operations.runtime_telemetry().gauge('hybrid.mandatory_gpu_eta_seconds', float(gpu_horizon))
-        self.operations.runtime_telemetry().gauge('hybrid.active_cpu_pending_seconds', float(cpu_pending))
-        self.operations.runtime_telemetry().gauge('hybrid.active_cpu_committed_seconds', float(cpu_committed))
-        self.operations.runtime_telemetry().gauge('hybrid.active_cpu_samples', int(completed_cpu_samples))
+        self._telemetry_gauge('hybrid.active_cpu_eta_seconds', float(cpu_eta))
+        self._telemetry_gauge('hybrid.mandatory_gpu_eta_seconds', float(gpu_horizon))
+        self._telemetry_gauge('hybrid.active_cpu_pending_seconds', float(cpu_pending))
+        self._telemetry_gauge('hybrid.active_cpu_committed_seconds', float(cpu_committed))
+        self._telemetry_gauge('hybrid.active_cpu_samples', int(completed_cpu_samples))
         if cpu_eta <= threshold or cpu_pending <= 0.0:
-            self.operations.runtime_telemetry().gauge('hybrid.gpu_assist_task_quota', 0)
+            self._telemetry_gauge('hybrid.gpu_assist_task_quota', 0)
             return 0
 
         # Transfer only the still-central CPU seconds needed to make the active view finish
@@ -1181,7 +1282,7 @@ class TtaScheduler:
         if excess_cpu_seconds <= 0.0:
             return 0
         active_gpu_seconds = float(sum(
-            self.gpu_worker_task_seconds(self.state.gpu_worker_tasks_by_id[int(task_id)])
+            gpu_seconds(self.state.gpu_worker_tasks_by_id[int(task_id)])
             for _position, task_id in active_pairs
         ))
         gpu_per_cpu_second = (
@@ -1215,8 +1316,8 @@ class TtaScheduler:
             int(math.ceil(float(gpu_seconds_needed) / float(capacity_per_gpu))),
         )
         quota = max(1, min(int(max_assist_tasks), int(required_gpu_workers)))
-        self.operations.runtime_telemetry().gauge('hybrid.gpu_assist_task_quota', int(quota))
-        self.operations.runtime_telemetry().gauge('hybrid.gpu_assist_seconds_needed', float(gpu_seconds_needed))
+        self._telemetry_gauge('hybrid.gpu_assist_task_quota', int(quota))
+        self._telemetry_gauge('hybrid.gpu_assist_seconds_needed', float(gpu_seconds_needed))
         if active_parent not in self.state.hybrid_stealback_announced_parents:
             self.state.hybrid_stealback_announced_parents.add(active_parent)
             print(
@@ -1283,7 +1384,7 @@ class TtaScheduler:
         if parent in self.state.d1_group_fallback_parents:
             return
         self.state.d1_group_fallback_parents.add(parent)
-        self.operations.runtime_telemetry().add('d1.group.admission_fallbacks', 1)
+        self._telemetry_add('d1.group.admission_fallbacks', 1)
         print(
             f'D1 owner group not admitted for {parent[0]}/{parent[1]} '
             f'({reason}); preserving the one-owner path.'
@@ -1466,8 +1567,8 @@ class TtaScheduler:
         self.state.d1_owner_by_parent[parent] = int(group.leader_worker_id)
         for worker in participants:
             self.state.d1_active_parent_by_worker[int(worker)] = parent
-        self.operations.runtime_telemetry().add('d1.group.parents_admitted', 1)
-        self.operations.runtime_telemetry().gauge(
+        self._telemetry_add('d1.group.parents_admitted', 1)
+        self._telemetry_gauge(
             'd1.group.last_participant_count', int(len(participants)),
         )
         print(
@@ -1506,7 +1607,7 @@ class TtaScheduler:
             )
         )
         if min(int(self.d1_owner_group_size_limit()), len(idle_workers)) < 2:
-            self.operations.runtime_telemetry().gauge(
+            self._telemetry_gauge(
                 'd1.group.waiting_idle_workers', int(len(idle_workers)),
             )
             return None
@@ -1536,7 +1637,7 @@ class TtaScheduler:
         for _negative_work, _model, _view, _parent, first in sorted(ranked):
             group = self.ensure_d1_parent_group(first, idle_workers)
             if group is not None:
-                self.operations.runtime_telemetry().gauge(
+                self._telemetry_gauge(
                     'd1.group.active_planned_parents', 1,
                 )
                 return group
@@ -1597,7 +1698,7 @@ class TtaScheduler:
             newly_claimed = worker not in group.claimed_workers
             group.claimed_workers.add(worker)
             if newly_claimed:
-                self.operations.runtime_telemetry().add('d1.group.participant_claims', 1)
+                self._telemetry_add('d1.group.participant_claims', 1)
             return bool(newly_claimed)
         owner = self.state.d1_owner_by_parent.get(parent)
         active = self.state.d1_active_parent_by_worker.get(worker)
@@ -1614,7 +1715,7 @@ class TtaScheduler:
             )
         self.state.d1_owner_by_parent[parent] = worker
         self.state.d1_active_parent_by_worker[worker] = parent
-        self.operations.runtime_telemetry().add('d1.owner_claims', 1)
+        self._telemetry_add('d1.owner_claims', 1)
         return True
 
     def rollback_d1_owner_claim(
@@ -1659,7 +1760,7 @@ class TtaScheduler:
             )
         self.state.d1_owner_by_parent.pop(parent, None)
         self.state.d1_active_parent_by_worker.pop(worker, None)
-        self.operations.runtime_telemetry().add('d1.owner_releases', 1)
+        self._telemetry_add('d1.owner_releases', 1)
 
     def split_one_gpu_worker_dispatch_tail(self,
         issue_slots: int,
@@ -1896,7 +1997,8 @@ class TtaScheduler:
             return None
         return self.gpu_worker_fullframe_parent_key(task)
 
-    def prefer_spherical_locality(self, selected_pool, feasible_by_id, preferred_parent=None):
+    def prefer_spherical_locality(self, selected_pool, feasible_by_id, preferred_parent=None,
+                                  *, locality_parents=None):
         """Prefer warm parents or distinct new parents, retaining a stealing fallback.
 
         The caller has already applied storage, D1, hybrid, and device admission.
@@ -1910,10 +2012,11 @@ class TtaScheduler:
         """
         if not self.operations._env_int('YOLO_TTA_GPU_SPHERICAL_LOCALITY', 1):
             return selected_pool, feasible_by_id
-        parents = {
+        parents = ((locality_parents() if callable(locality_parents) else locality_parents)
+                   if locality_parents is not None else {
             int(task_id): self.spherical_locality_parent(self.state.gpu_worker_tasks_by_id[int(task_id)])
             for _position, task_id in selected_pool
-        }
+        })
         preferred_ids = [task_id for task_id, parent in parents.items()
                          if preferred_parent is not None and parent == preferred_parent]
         protected_id = preferred_ids[0] if len(preferred_ids) == 1 else None
@@ -1941,6 +2044,7 @@ class TtaScheduler:
         feasible.update(preferred_workers)
         return pool, feasible
 
+    @scheduler_operation('selection')
     def pop_gpu_worker_pending_task_id(self,
         preferred_parent: Optional[Tuple[str, str]] = None,
         candidate_workers: Optional[Sequence[int]] = None,
@@ -1953,19 +2057,89 @@ class TtaScheduler:
         """
         pending_ids = [int(v) for v in self.state.gpu_worker_pending_task_ids]
         candidates = [int(v) for v in (candidate_workers or tuple(self.state.gpu_task_queues))]
+        tasks = self.state.gpu_worker_tasks_by_id
+        parents: Dict[int, Optional[Tuple[str, str]]] = {}
+        d1_parents: Dict[int, Optional[Tuple[str, str]]] = {}
+        direct_parents: Dict[int, Optional[Tuple[str, str]]] = {}
+        classification_keys: Dict[int, Tuple[object, ...]] = {}
+        direct_admission: Dict[Tuple[object, ...], bool] = {}
+        d1_feasibility: Dict[Optional[Tuple[str, str]], List[int]] = {}
+        classifications: Dict[Tuple[object, ...], Tuple[bool, bool]] = {}
+        selection_ranks: Dict[Tuple[object, ...], int] = {}
+        locality_by_contract: Dict[Tuple[object, ...], Optional[Tuple[str, str]]] = {}
+        seconds_by_id: Dict[int, float] = {}
+        prior_by_view: Dict[int, float] = {}
+
+        def seconds(task: Dict[str, object]) -> float:
+            # No EWMA/ownership survives this call. Keep one exact duration per task,
+            # including the original multiplication and each parent's summation order.
+            identity = id(task)
+            if identity not in seconds_by_id:
+                # The injected key still sees every task: it may classify on more
+                # than parent/view fields. Only the immutable ViewInfo cold prior
+                # is shared, never a task's frame count or measured cost-key state.
+                key = self.operations.gpu_worker_task_cost_key(task)
+                per_frame = self.state.gpu_worker_seconds_per_frame_ewma.get(key)
+                if per_frame is None:
+                    view = task.get('view')
+                    if isinstance(view, ViewInfo):
+                        if id(view) not in prior_by_view:
+                            prior_by_view[id(view)] = self.operations.gpu_worker_default_seconds_per_frame(view)
+                        per_frame = prior_by_view[id(view)]
+                    else:
+                        per_frame = 0.05
+                seconds_by_id[identity] = max(1e-4, float(per_frame) * float(max(1, int(task.get('slice_count', 1)))))
+            return seconds_by_id[identity]
+
+        def rank(task_id: int) -> int:
+            key = classification_keys[task_id]
+            if key not in selection_ranks:
+                selection_ranks[key] = self.hybrid_gpu_selection_rank(tasks[task_id])
+            return selection_ranks[key]
+
         feasible_by_id: Dict[int, List[int]] = {}
         eligible: List[Tuple[int, int]] = []
         for position, task_id in enumerate(pending_ids):
-            task = self.state.gpu_worker_tasks_by_id[int(task_id)]
+            task = tasks[task_id]
             if not bool(task.get('gpu_eligible', self.inputs.gpu_worker_process_active)):
                 continue
-            if not self.direct_union_task_admissible(task):
+            direct_parent = self.direct_union_task_key(task)
+            direct_parents[task_id] = direct_parent
+            shape = task.get('processing_shape', ())
+            # An ordinary parent's explicit dense shape completely determines its
+            # memory request. Heterogeneous/fallback shapes and policy groups retain
+            # their full per-task validation, including sibling consistency errors.
+            shared_admission = bool(direct_parent is not None
+                and not task.get('bounded_parent_admission', False)
+                and isinstance(shape, (tuple, list)) and len(shape) == 3
+                and all(isinstance(value, (int, np.integer)) for value in shape))
+            if shared_admission:
+                admission_key = (direct_parent, str(task.get('result_mode', 'file')),
+                                 tuple(shape))
+                if admission_key not in direct_admission:
+                    direct_admission[admission_key] = self.direct_union_task_admissible(task)
+                admissible = direct_admission[admission_key]
+            else:
+                admissible = self.direct_union_task_admissible(task)
+            if not admissible:
                 continue
             if not self.tile_dense_result_task_admissible(task):
                 continue
-            feasible = self.d1_feasible_workers(task, candidates)
+            parent = self.gpu_worker_fullframe_parent_key(task)
+            parents[task_id] = parent
+            d1_parent = self.d1_task_parent_key(task)
+            d1_parents[task_id] = d1_parent
+            if d1_parent in self.state.d1_groups_by_parent:
+                # Existing groups bind individual task IDs to different workers.
+                feasible = self.d1_feasible_workers(task, candidates)
+            else:
+                if d1_parent not in d1_feasibility:
+                    d1_feasibility[d1_parent] = self.d1_feasible_workers(task, candidates)
+                feasible = d1_feasibility[d1_parent]
             if not feasible:
                 continue
+            classification_keys[task_id] = (parent, d1_parent,
+                str(task.get('result_mode', 'file')), bool(task.get('hybrid_cpu_eligible_origin', False)))
             feasible_by_id[int(task_id)] = feasible
             eligible.append((int(position), int(task_id)))
         if not eligible:
@@ -1975,14 +2149,20 @@ class TtaScheduler:
         mandatory_gpu: List[Tuple[int, int]] = []
         active_cpu_assist: List[Tuple[int, int]] = []
         for pair in eligible:
-            task = self.state.gpu_worker_tasks_by_id[int(pair[1])]
-            if self.hybrid_task_is_active_cpu_assist(task, active_parent):
+            task_id = int(pair[1])
+            task = tasks[task_id]
+            key = classification_keys[task_id]
+            if key not in classifications:
+                assist = self.hybrid_task_is_active_cpu_assist(task, active_parent)
+                classifications[key] = (assist, False if assist else self.hybrid_task_is_gpu_mandatory(task))
+            assist, mandatory = classifications[key]
+            if assist:
                 active_cpu_assist.append(pair)
-            elif self.hybrid_task_is_gpu_mandatory(task):
+            elif mandatory:
                 mandatory_gpu.append(pair)
 
         assist_ids: set[int] = set()
-        quota = self.hybrid_gpu_stealback_quota(mandatory_gpu, active_cpu_assist)
+        quota = self.hybrid_gpu_stealback_quota(mandatory_gpu, active_cpu_assist, task_seconds=seconds)
         assist_slots_open = max(
             0,
             int(quota) - int(len(self.state.gpu_worker_cpu_assist_inflight_task_ids)),
@@ -1995,22 +2175,32 @@ class TtaScheduler:
         else:
             return None
 
+        def locality_parents():
+            result = {}
+            for _position, task_id in selected_pool:
+                task = tasks[task_id]
+                key = (classification_keys[task_id], id(task.get('view')),
+                       direct_parents[task_id])
+                if key not in locality_by_contract:
+                    locality_by_contract[key] = self.spherical_locality_parent(task)
+                result[task_id] = locality_by_contract[key]
+            return result
         selected_pool, feasible_by_id = self.prefer_spherical_locality(
-            selected_pool, feasible_by_id, preferred_parent,
+            selected_pool, feasible_by_id, preferred_parent, locality_parents=locality_parents,
         )
         parent_pending_counts: Dict[Tuple[str, str], int] = {}
         for _position, task_id in selected_pool:
-            parent_key = self.gpu_worker_fullframe_parent_key(self.state.gpu_worker_tasks_by_id[int(task_id)])
+            parent_key = parents[task_id]
             if parent_key is not None:
                 parent_pending_counts[parent_key] = int(parent_pending_counts.get(parent_key, 0)) + 1
         unlock_candidates: List[Tuple[int, int, int, int, int]] = []
         for position, task_id in selected_pool:
-            task = self.state.gpu_worker_tasks_by_id[int(task_id)]
-            parent_key = self.gpu_worker_fullframe_parent_key(task)
+            task = tasks[task_id]
+            parent_key = parents[task_id]
             if parent_key is None or int(parent_pending_counts.get(parent_key, 0)) != 1:
                 continue
             unlock_candidates.append((
-                self.hybrid_gpu_selection_rank(task),
+                rank(task_id),
                 0 if parent_key == preferred_parent else 1,
                 int(self.state.fullframe_remaining.get(parent_key, 2 ** 31 - 1)),
                 int(position),
@@ -2021,22 +2211,22 @@ class TtaScheduler:
         else:
             parent_seconds: Dict[Optional[Tuple[str, str]], float] = {}
             for _position_i, task_id_i in selected_pool:
-                task_i = self.state.gpu_worker_tasks_by_id[int(task_id_i)]
-                parent_i = self.gpu_worker_fullframe_parent_key(task_i)
-                parent_seconds[parent_i] = float(parent_seconds.get(parent_i, 0.0)) + self.gpu_worker_task_seconds(task_i)
+                task_i = tasks[task_id_i]
+                parent_i = parents[task_id_i]
+                parent_seconds[parent_i] = float(parent_seconds.get(parent_i, 0.0)) + seconds(task_i)
             selected_id = min(
                 selected_pool,
                 key=lambda pair: (
-                    self.hybrid_gpu_selection_rank(self.state.gpu_worker_tasks_by_id[int(pair[1])]),
-                    0 if self.d1_task_parent_key(self.state.gpu_worker_tasks_by_id[int(pair[1])]) in self.state.d1_owner_by_parent else 1,
-                    0 if (self.direct_union_task_key(self.state.gpu_worker_tasks_by_id[int(pair[1])]) in self.state.direct_union_inference_views) else 1,
-                    self.inference_storage_priority_rank(self.state.gpu_worker_tasks_by_id[int(pair[1])]),
-                    -float(parent_seconds.get(self.gpu_worker_fullframe_parent_key(self.state.gpu_worker_tasks_by_id[int(pair[1])]), 0.0)),
-                    -float(self.gpu_worker_task_seconds(self.state.gpu_worker_tasks_by_id[int(pair[1])])),
+                    rank(int(pair[1])),
+                    0 if d1_parents[int(pair[1])] in self.state.d1_owner_by_parent else 1,
+                    0 if direct_parents[int(pair[1])] in self.state.direct_union_inference_views else 1,
+                    self.inference_storage_priority_rank(tasks[int(pair[1])]),
+                    -float(parent_seconds.get(parents[int(pair[1])], 0.0)),
+                    -float(seconds(tasks[int(pair[1])])),
                     int(pair[0]),
                 ),
             )[1]
-        selected_task = self.state.gpu_worker_tasks_by_id[int(selected_id)]
+        selected_task = tasks[int(selected_id)]
         selected_task['hybrid_gpu_assist_dispatch'] = bool(int(selected_id) in assist_ids)
         self.state.gpu_worker_pending_task_ids.remove(int(selected_id))
         return int(selected_id), list(feasible_by_id[int(selected_id)])
@@ -2070,7 +2260,7 @@ class TtaScheduler:
                                else retained * 4 >= limit * 3))
             self.state.spherical_retirement_pressure_active = active
             publish_pressure(active)
-            self.operations.runtime_telemetry().gauge('inference.spherical_retirement_pressure', active)
+            self._telemetry_gauge('inference.spherical_retirement_pressure', active)
 
     def gpu_worker_inflight(self, worker_id: int) -> int:
         worker = int(worker_id)
@@ -2172,7 +2362,7 @@ class TtaScheduler:
             self.operations.preflight_multiprocessing_payload(command)
             runtime_trace_event('scheduler_control_dispatch', task=command, device=f'cuda:{worker}')
             state.gpu_task_queues[worker].put(command)
-        self.operations.runtime_telemetry().gauge('inference.asset_release.pending_workers', worker_ids)
+        self._telemetry_gauge('inference.asset_release.pending_workers', worker_ids)
         return False
 
     def _process_inference_asset_release_result(self, msg: Dict[str, object]) -> None:
@@ -2208,17 +2398,17 @@ class TtaScheduler:
         record = {'task_id': task_id, 'ok': ok, 'stats': stats, 'error': str(msg.get('error') or '')}
         state.gpu_inference_asset_release_results_by_worker[worker] = record
         del state.gpu_inference_asset_release_pending_by_worker[worker]
-        telemetry = self.operations.runtime_telemetry()
-        telemetry.add('inference.asset_release.acknowledgements', 1)
-        telemetry.gauge(f'inference.asset_release.worker.{worker}', record)
-        telemetry.gauge('inference.asset_release.pending_workers', sorted(state.gpu_inference_asset_release_pending_by_worker))
+        self._telemetry_add('inference.asset_release.acknowledgements', 1)
+        self._telemetry_gauge(f'inference.asset_release.worker.{worker}', record)
+        self._telemetry_gauge('inference.asset_release.pending_workers', sorted(state.gpu_inference_asset_release_pending_by_worker))
         if not ok:
-            telemetry.add('inference.asset_release.safe_refusals', 1)
+            self._telemetry_add('inference.asset_release.safe_refusals', 1)
             print(f'GPU worker {worker} retained inference assets: {record["error"]}; continuing with existing memory admission.')
         if self.gpu_inference_asset_release_complete():
             self._result_callbacks().announce_process_inference_drain_if_complete()
         self.refresh_gpu_aux_interpolation_leases()
 
+    @scheduler_operation('gpu_refill')
     def dispatch_gpu_worker_inference_window(self,
         preferred_parent: Optional[Tuple[str, str]] = None,
     ) -> None:
@@ -2236,7 +2426,8 @@ class TtaScheduler:
             if self.operations._set_main_process_gpu_spherical_retirement_pressure is not None:
                 self.operations._set_main_process_gpu_spherical_retirement_pressure(False)
             return
-        self.publish_gpu_worker_admissible_backlog()
+        with scheduler_step('backlog_initial'):
+            self.publish_gpu_worker_admissible_backlog()
         per_gpu = (
             max(1, min(4, self.operations._env_int('YOLO_TTA_GPU_WORKER_DISPATCH_WINDOW_PER_GPU', 2)))
             if bool(self.inputs.v1613_d1_owner_active) else max(
@@ -2246,14 +2437,15 @@ class TtaScheduler:
         aux_pool = self.operations.gpu_worker_aux_interpolation_pool()
         while self.state.gpu_worker_pending_task_ids:
             candidates: List[int] = []
-            for worker_id in worker_ids:
-                if self.gpu_worker_inflight(worker_id) >= int(per_gpu):
-                    continue
-                if not self.operations._main_process_gpu_stage_can_dispatch_inference(worker_id):
-                    continue
-                if aux_pool is not None and not aux_pool.revoke_worker(worker_id):
-                    continue
-                candidates.append(int(worker_id))
+            with scheduler_step('candidate_admission'):
+                for worker_id in worker_ids:
+                    if self.gpu_worker_inflight(worker_id) >= int(per_gpu):
+                        continue
+                    if not self.operations._main_process_gpu_stage_can_dispatch_inference(worker_id):
+                        continue
+                    if aux_pool is not None and not aux_pool.revoke_worker(worker_id):
+                        continue
+                    candidates.append(int(worker_id))
             if not candidates:
                 break
             # Group admission must precede the pending-task feasibility scan and the first
@@ -2307,23 +2499,25 @@ class TtaScheduler:
                 ),
             )
             self.state.gpu_worker_dispatch_cursor = (worker_ids.index(worker_id) + 1) % len(worker_ids)
-            if not self.operations._main_process_gpu_stage_begin_inference(worker_id):
+            with scheduler_step('inference_commit', worker_id=worker_id,
+                                task_id=int(task_id)):
+                admitted = self.operations._main_process_gpu_stage_begin_inference(worker_id)
+            if not admitted:
                 self.state.gpu_worker_pending_task_ids.appendleft(int(task_id))
                 continue
             owner_claimed = False
             tile_storage_reserved = False
             try:
-                owner_claimed = self.claim_d1_owner(task_to_dispatch, int(worker_id))
-                self.activate_direct_union_task(task_to_dispatch)
-                tile_storage_reserved = self.reserve_tile_dense_result_task(task_to_dispatch)
-                if tile_storage_reserved:
-                    self.prepare_tile_dense_result_workspaces(task_to_dispatch)
+                with scheduler_step('ownership_workspace_commit', worker_id=worker_id,
+                                    task_id=int(task_id)):
+                    owner_claimed = self.claim_d1_owner(task_to_dispatch, int(worker_id))
+                    self.activate_direct_union_task(task_to_dispatch)
+                    tile_storage_reserved = self.reserve_tile_dense_result_task(task_to_dispatch)
+                    if tile_storage_reserved:
+                        self.prepare_tile_dense_result_workspaces(task_to_dispatch)
                 dispatch_task = dict(task_to_dispatch)
                 dispatch_task.pop('hybrid_gpu_assist_dispatch', None)
-                self.operations._attach_memfd_transfers_to_task(dispatch_task)
-                self.operations.preflight_multiprocessing_payload(dispatch_task)
-                runtime_trace_event('scheduler_dispatch', task=dispatch_task, device=f'cuda:{worker_id}')
-                self.state.gpu_task_queues[int(worker_id)].put(dispatch_task)
+                self._put_worker_inference_task(dispatch_task, 'gpu', int(worker_id))
             except BaseException as exc:
                 runtime_trace_event('scheduler_dispatch_error', task=task_to_dispatch,
                                     device=f'cuda:{worker_id}', error=repr(exc))
@@ -2345,8 +2539,8 @@ class TtaScheduler:
             if cpu_assist_dispatch:
                 task_to_dispatch['hybrid_gpu_assist_dispatched'] = True
                 self.state.gpu_worker_cpu_assist_inflight_task_ids.add(int(task_id))
-                self.operations.runtime_telemetry().add('hybrid.gpu_assist_tasks_dispatched', 1)
-                self.operations.runtime_telemetry().add(
+                self._telemetry_add('hybrid.gpu_assist_tasks_dispatched', 1)
+                self._telemetry_add(
                     'hybrid.gpu_assist_frames_dispatched',
                     int(task_to_dispatch.get('slice_count', 0)),
                 )
@@ -2358,8 +2552,10 @@ class TtaScheduler:
             self.state.gpu_worker_predicted_load_by_id[int(worker_id)] = float(
                 self.state.gpu_worker_predicted_load_by_id.get(int(worker_id), 0.0)
             ) + float(predicted_seconds)
-        self.publish_gpu_worker_admissible_backlog()
-        self.refresh_gpu_aux_interpolation_leases()
+        with scheduler_step('backlog_final'):
+            self.publish_gpu_worker_admissible_backlog()
+        with scheduler_step('aux_refresh'):
+            self.refresh_gpu_aux_interpolation_leases()
 
     def cpu_worker_task_seconds(self, task: Dict[str, object]) -> float:
         view_obj = task.get('view')
@@ -2453,7 +2649,7 @@ class TtaScheduler:
         if parent_key is not None:
             self.state.fullframe_remaining[parent_key] = int(self.state.fullframe_remaining.get(parent_key, 0)) + 1
             self.state.fullframe_task_ids_by_parent.setdefault(parent_key, []).append(int(child_id))
-        self.operations.runtime_telemetry().add('scheduler.cpu_claim_lease_splits', 1)
+        self._telemetry_add('scheduler.cpu_claim_lease_splits', 1)
         return current_id
 
     def cpu_worker_inflight(self, worker_id: int) -> int:
@@ -2585,10 +2781,7 @@ class TtaScheduler:
                 if tile_storage_reserved:
                     self.prepare_tile_dense_result_workspaces(task)
                 dispatch_task = dict(task)
-                self.operations._attach_memfd_transfers_to_task(dispatch_task)
-                self.operations.preflight_multiprocessing_payload(dispatch_task)
-                runtime_trace_event('scheduler_dispatch', task=dispatch_task, device=f'cpu:{worker_id}')
-                self.state.cpu_task_queues[int(worker_id)].put(dispatch_task)
+                self._put_worker_inference_task(dispatch_task, 'cpu', int(worker_id))
             except BaseException as exc:
                 runtime_trace_event('scheduler_dispatch_error', task=task,
                                     device=f'cpu:{worker_id}', error=repr(exc))
@@ -2674,7 +2867,7 @@ class TtaScheduler:
             )
         group.partial_artifacts_by_worker[worker] = dict(payload)
         group.completed_workers.add(worker)
-        self.operations.runtime_telemetry().add('d1.group.partials_ready', 1)
+        self._telemetry_add('d1.group.partials_ready', 1)
 
     def _dispatch_d1_group_reduction(
         self, group: D1ParentGroup, *, force_host: bool,
@@ -2711,7 +2904,7 @@ class TtaScheduler:
             group.reduction_dispatched = False
             group.reduction_started_at = None
             raise
-        self.operations.runtime_telemetry().add('d1.group.reductions_dispatched', 1)
+        self._telemetry_add('d1.group.reductions_dispatched', 1)
 
     def _request_d1_group_host_fallback(
         self, group: D1ParentGroup, error: str,
@@ -2724,7 +2917,7 @@ class TtaScheduler:
         group.reduction_dispatched = False
         group.reduction_started_at = None
         self.state.d1_group_host_fallbacks_total += 1
-        self.operations.runtime_telemetry().add('d1.group.host_fallbacks', 1)
+        self._telemetry_add('d1.group.host_fallbacks', 1)
         print(
             f'Warning: D1 group {group.group_id} NVLink reduction failed ({error}); '
             'materializing retained participant bitsets for deterministic D2H reduction.'
@@ -2816,11 +3009,11 @@ class TtaScheduler:
         self.state.d1_group_parent_by_id.pop(str(group.group_id), None)
         self.state.d1_group_parents_released_total += 1
         self.state.d1_group_release_seconds_total += float(release_seconds)
-        self.operations.runtime_telemetry().add('d1.group.parents_released', 1)
-        self.operations.runtime_telemetry().add(
+        self._telemetry_add('d1.group.parents_released', 1)
+        self._telemetry_add(
             'd1.group.partial_release_acks', int(len(group.release_ack_workers)),
         )
-        self.operations.runtime_telemetry().gauge('d1.group.active_planned_parents', 0)
+        self._telemetry_gauge('d1.group.active_planned_parents', 0)
         print(
             f'D1 owner group released for '
             f'{group.parent[0]}/{group.parent[1]}: '
@@ -2962,10 +3155,10 @@ class TtaScheduler:
             f'peer_or={peer_or_seconds:.3f}s, d2h={d2h_seconds:.3f}s, '
             f'transaction={transaction_seconds:.3f}s, to_reduced={lifetime_seconds:.3f}s.'
         )
-        self.operations.runtime_telemetry().add('d1.group.transaction_seconds', transaction_seconds)
-        self.operations.runtime_telemetry().add('d1.group.peer_or_seconds', peer_or_seconds)
-        self.operations.runtime_telemetry().add('d1.group.d2h_seconds', d2h_seconds)
-        self.operations.runtime_telemetry().add('d1.group.lifetime_seconds', lifetime_seconds)
+        self._telemetry_add('d1.group.transaction_seconds', transaction_seconds)
+        self._telemetry_add('d1.group.peer_or_seconds', peer_or_seconds)
+        self._telemetry_add('d1.group.d2h_seconds', d2h_seconds)
+        self._telemetry_add('d1.group.lifetime_seconds', lifetime_seconds)
         group.held_result = held
         # The ordinary result stays held until all release controls are acknowledged.
         # Compute credit was already released and remains idempotent when it re-enters.
@@ -2997,9 +3190,27 @@ class TtaScheduler:
         runtime_trace_event(trace_name, task=trace_task, device=trace_device,
                             task_id=msg.get('task_id'), message_type=mtype, ok=msg.get('ok'))
 
-    def process_one_worker_result(self, msg: Dict[str, object], *, replayed: bool = False) -> None:
+    @scheduler_operation('result_handling')
+    def process_one_worker_result(
+        self, msg: Dict[str, object], *, replayed: bool = False,
+        defer_refill: bool = False,
+    ) -> None:
+        self._assert_result_state_owner()
+        self._result_processing_depth += 1
+        try:
+            self._process_one_worker_result_impl(
+                msg, replayed=replayed, defer_refill=defer_refill,
+            )
+        finally:
+            self._result_processing_depth -= 1
+
+    def _process_one_worker_result_impl(
+        self, msg: Dict[str, object], *, replayed: bool = False,
+        defer_refill: bool = False,
+    ) -> None:
         mtype = str(msg.get('type'))
         worker_kind = str(msg.get('worker_kind', 'gpu')).strip().lower()
+        self._record_worker_memfd_completion(msg)
         runtime_trace_event('scheduler_result_handled' if mtype == 'result' else 'scheduler_message_handled',
             task=self.state.gpu_worker_tasks_by_id.get(msg.get('task_id', -1), {}),
             device=(f'cpu:{msg.get("cpu_index", -1)}' if worker_kind == 'cpu'
@@ -3023,7 +3234,7 @@ class TtaScheduler:
                         'model_xml': str(msg.get('model_xml')),
                     }
                     self.state.cpu_worker_ready_details_by_id[ready_cpu_index] = ready_details
-                    self.operations.runtime_telemetry().gauge(
+                    self._telemetry_gauge(
                         f'inference.cpu_instance.{ready_cpu_index}.ready', ready_details,
                     )
                 print(
@@ -3077,8 +3288,8 @@ class TtaScheduler:
             stats = dict(msg.get('stats') or {})
             self.update_cpu_worker_cost(task, stats)
             self.record_backend_frame_completion(task, 'cpu')
-            self.operations.runtime_telemetry().add('inference.cpu_tasks_completed', 1)
-            self.operations.runtime_telemetry().add(
+            self._telemetry_add('inference.cpu_tasks_completed', 1)
+            self._telemetry_add(
                 'inference.cpu_frames_completed', int(task.get('slice_count', 0)),
             )
             # Apply the result first so the final lease can close this reservation and make
@@ -3114,8 +3325,9 @@ class TtaScheduler:
             # GiB over PCIe or committing metadata on a retirement lane.
             task = self.state.gpu_worker_tasks_by_id.get(task_id)
             preferred = self.gpu_worker_fullframe_parent_key(task) if isinstance(task, dict) else None
-            self.dispatch_inference_windows(preferred)
-            self.refresh_gpu_aux_interpolation_leases()
+            if not defer_refill:
+                self.dispatch_inference_windows(preferred)
+                self.refresh_gpu_aux_interpolation_leases()
             return
         if mtype == 'aux_result':
             # Route the targeted worker result to its waiting interpolation caller.  Once the
@@ -3198,8 +3410,8 @@ class TtaScheduler:
         self.record_backend_frame_completion(task, 'gpu')
         if bool(task.get('hybrid_gpu_assist_dispatched', False)):
             self.state.gpu_worker_cpu_assist_completed_task_ids.add(int(task_id))
-            self.operations.runtime_telemetry().add('hybrid.gpu_assist_tasks_completed', 1)
-            self.operations.runtime_telemetry().add(
+            self._telemetry_add('hybrid.gpu_assist_tasks_completed', 1)
+            self._telemetry_add(
                 'hybrid.gpu_assist_frames_completed', int(task.get('slice_count', 0)),
             )
         self.release_d1_owner_if_complete(task, worker_id, stats)
@@ -3231,7 +3443,7 @@ class TtaScheduler:
         state.result_transport_configured = True
         state.push_drain_active = bool(push_drain_active)
         self.operations._set_main_process_gpu_stage_wake_callback(
-            state.scheduler_wake.set
+            self.notify_gpu_stage_admission_change
         )
         if not state.push_drain_active:
             return
@@ -3246,6 +3458,48 @@ class TtaScheduler:
             "Scheduler push drain active: arriving results wake the scheduler, "
             "which owns result handling; YOLO_TTA_SCHEDULER_PUSH_DRAIN=0 selects polling."
         )
+
+    def notify_gpu_stage_admission_change(self) -> None:
+        """Thread-safe coordinator callback; ownership remains on the scheduler thread."""
+        state = self.state
+        with state.gpu_stage_admission_signal_lock:
+            state.gpu_stage_admission_dirty.set()
+        state.scheduler_wake.set()
+
+    def service_gpu_stage_admission_retry(self) -> bool:
+        """Retry admission after a stage wake or an idle-worker reservation expiry.
+
+        The dirty signal is consumed before dispatch. A concurrent release during
+        dispatch leaves another signal for the next owner-thread pass. A pending
+        task with an idle GPU gets a bounded heartbeat retry because spherical
+        handoff reservations can expire without emitting another callback.
+        """
+        self._assert_result_state_owner()
+        if self._result_processing_depth or self._credit_checkpoint_active:
+            raise RuntimeError('GPU stage admission retry cannot run inside a result callback')
+        state = self.state
+        now = time.monotonic()
+        with state.gpu_stage_admission_signal_lock:
+            dirty = state.gpu_stage_admission_dirty.is_set()
+            if dirty:
+                state.gpu_stage_admission_dirty.clear()
+        timed = bool(state.gpu_stage_admission_retry_at
+                     and now >= state.gpu_stage_admission_retry_at)
+        if not dirty and not timed:
+            return False
+        state.gpu_stage_admission_retry_at = 0.0
+        if state.gpu_worker_pending_task_ids and not state.gpu_inference_asset_release_requested:
+            self.dispatch_inference_windows()
+        self.refresh_gpu_aux_interpolation_leases()
+        if (state.gpu_worker_pending_task_ids
+                and not state.gpu_inference_asset_release_requested
+                and any(
+                    self.gpu_worker_inflight(worker) == 0
+                    and not self.operations._main_process_gpu_stage_can_dispatch_inference(worker)
+                    for worker in state.gpu_task_queues
+                )):
+            state.gpu_stage_admission_retry_at = time.monotonic() + 0.5
+        return True
 
     def wake_scheduler(self, _future: object = None) -> None:
         self.state.scheduler_wake.set()
@@ -3273,21 +3527,142 @@ class TtaScheduler:
             state.pushed_worker_results.append(message)
             state.scheduler_wake.set()
 
-    def drain_process_inference_results(self) -> None:
+    def _stage_polled_worker_results(self, limit: int) -> None:
+        """Move only a bounded number of polled messages into the common FIFO."""
         state = self.state
-        if state.gpu_result_queue is None:
+        if state.push_drain_active or state.gpu_result_queue is None:
             return
-        if state.push_drain_active:
-            while state.pushed_worker_results:
-                self.process_one_worker_result(state.pushed_worker_results.popleft())
-            return
-        while True:
+        while len(state.pushed_worker_results) < max(1, int(limit)):
             try:
                 message = state.gpu_result_queue.get_nowait()  # type: ignore[attr-defined]
             except queue.Empty:
                 break
             self._trace_worker_receipt(message)
+            state.pushed_worker_results.append(message)
+
+    def _assert_result_state_owner(self) -> None:
+        current = threading.get_ident()
+        with self._state_owner_bind_lock:
+            if self._state_owner_thread is None:
+                # The caller that first services results is the scheduler state owner.
+                # Tests may construct the object on a setup thread before starting it.
+                self._state_owner_thread = current
+            elif current != self._state_owner_thread:
+                raise RuntimeError('Only the scheduler state owner may service worker results')
+
+    def has_pending_process_results(self) -> bool:
+        """Avoid a heartbeat sleep when the bounded drain left messages behind."""
+        self._assert_result_state_owner()
+        self._stage_polled_worker_results(1)
+        return bool(self.state.pushed_worker_results)
+
+    def service_pending_compute_credits(
+        self, *, max_scan: int = 64, max_credits: int = 16,
+    ) -> int:
+        """Release arrived GPU compute credits before slow successful final callbacks.
+
+        Only the scheduler thread changes ownership. Successful final payloads keep
+        their FIFO order; a fatal or failed result in the inspected prefix aborts
+        before any further task is dispatched. Control messages fence reordering.
+        """
+        state = self.state
+        if state.gpu_result_queue is None:
+            return 0
+        self._assert_result_state_owner()
+        if self._result_processing_depth or self._credit_checkpoint_active:
+            raise RuntimeError('Compute credits cannot be serviced inside a result callback')
+        scan_limit = max(1, int(max_scan))
+        credit_limit = max(1, int(max_credits))
+        self._credit_checkpoint_active = True
+        try:
+            self._stage_polled_worker_results(scan_limit)
+            staged = [
+                state.pushed_worker_results.popleft()
+                for _ in range(min(scan_limit, len(state.pushed_worker_results)))
+            ]
+            failure_index = next((
+                index for index, message in enumerate(staged)
+                if str(message.get('type')) == 'fatal'
+                or (str(message.get('type')) == 'result' and not bool(message.get('ok')))
+            ), None)
+            if failure_index is not None:
+                failure = staged.pop(failure_index)
+                for message in reversed(staged):
+                    state.pushed_worker_results.appendleft(message)
+                # A worker failure must not wait behind successful payload callbacks,
+                # and no successful credit in this batch may dispatch past it.
+                self.process_one_worker_result(failure)
+                raise RuntimeError('Worker failure result did not raise')
+
+            credits: List[Dict[str, object]] = []
+            deferred: List[Dict[str, object]] = []
+            control_fence = False
+            for message in staged:
+                mtype = str(message.get('type'))
+                stats = message.get('stats')
+                if (
+                    mtype not in {'result', 'compute_released'}
+                    or (mtype == 'result' and str(message.get('worker_kind', 'gpu')).lower() == 'cpu')
+                    or (mtype == 'result' and isinstance(stats, Mapping)
+                        and stats.get('d1_group_partial_artifact') is not None)
+                ):
+                    control_fence = True
+                if (
+                    not control_fence and mtype == 'compute_released'
+                    and len(credits) < credit_limit
+                ):
+                    credits.append(message)
+                else:
+                    deferred.append(message)
+            for message in reversed(deferred):
+                state.pushed_worker_results.appendleft(message)
+
+            preferred_parent = None
+            refill_needed = False
+            for message in credits:
+                task_id = int(message.get('task_id', -1))
+                was_released = task_id in state.gpu_worker_compute_released_task_ids
+                self.process_one_worker_result(message, defer_refill=True)
+                if not was_released:
+                    refill_needed = True
+                if preferred_parent is None and not was_released:
+                    task = state.gpu_worker_tasks_by_id.get(task_id)
+                    if isinstance(task, dict):
+                        preferred_parent = self.gpu_worker_fullframe_parent_key(task)
+            if refill_needed:
+                self.dispatch_inference_windows(preferred_parent)
+                self.refresh_gpu_aux_interpolation_leases()
+            if state.pushed_worker_results or len(staged) >= scan_limit:
+                state.scheduler_wake.set()
+            return len(credits)
+        finally:
+            self._credit_checkpoint_active = False
+
+    def drain_process_inference_results(self, *, max_messages: int = 32) -> int:
+        state = self.state
+        if state.gpu_result_queue is None:
+            return 0
+        self._assert_result_state_owner()
+        if self._result_processing_depth or self._credit_checkpoint_active:
+            raise RuntimeError('Worker results cannot be drained inside a result callback')
+        budget = max(1, int(max_messages))
+        handled = 0
+        while handled < budget:
+            credits = self.service_pending_compute_credits(
+                max_credits=min(16, budget - handled),
+            )
+            handled += credits
+            if handled >= budget:
+                break
+            self._stage_polled_worker_results(1)
+            if not state.pushed_worker_results:
+                break
+            message = state.pushed_worker_results.popleft()
             self.process_one_worker_result(message)
+            handled += 1
+        if state.pushed_worker_results or handled >= budget:
+            state.scheduler_wake.set()
+        return handled
 
     def wait_for_one_process_result(self, timeout: float) -> None:
         state = self.state
@@ -3304,7 +3679,8 @@ class TtaScheduler:
         except queue.Empty:
             return
         self._trace_worker_receipt(message)
-        self.process_one_worker_result(message)
+        state.pushed_worker_results.append(message)
+        self.drain_process_inference_results()
 
     def process_inference_outstanding(self) -> bool:
         return bool(
@@ -3385,6 +3761,7 @@ class TtaScheduler:
 
     def shutdown_inference_worker_processes(self) -> None:
         state = self.state
+        state.worker_memfd_sources.clear()
         processes = list(state.gpu_worker_processes) + list(state.cpu_worker_processes)
         if not processes:
             return

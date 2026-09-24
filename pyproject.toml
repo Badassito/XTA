@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xta"
-version = "22.3.1"
+version = "22.3.2"
 description = "Volume test-time, pretraining, and label-time augmentation"
 requires-python = ">=3.10"
 dependencies = [
@@ -22,7 +22,7 @@ cuda12 = ["cupy-cuda12x>=13.0", "nvidia-ml-py"]
 cuda13 = ["cupy-cuda13x>=13.0", "nvidia-ml-py"]
 nvtiff12 = ["nvidia-nvtiff-cu12>=0.8"]
 nvtiff13 = ["nvidia-nvtiff-cu13>=0.8"]
-acceleration = ["numba", "deflate", "isal"]
+acceleration = ["numba", "deflate>=0.9.0", "isal"]
 pta = ["pynrrd", "albumentations"]
 lta = ["pynrrd"]
 
@@ -39,12 +39,13 @@ include = ["XTA*"]
 [tool.setuptools.data-files]
 "share/xta" = [
   "ARCHITECTURE.md",
-  "GPT-6-Astra-Ultra_v22.3.1_SLURM.py",
+  "GPT-6-Astra-Ultra_v22.3.2_SLURM.py",
 ]
 "share/xta/tools" = [
   "tools/compare_reconciliation.py",
   "tools/export_reconciliation_evidence.py",
   "tools/qualify_tta_reconciliation.py",
+  "tools/qualify_confidence_consolidation.py",
   "tools/tta_augmentation_smoke.py",
   "tools/check_tta_augmentation_run.py",
   "tools/benchmark_tta_augmentation.py",

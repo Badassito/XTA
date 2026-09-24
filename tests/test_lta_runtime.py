@@ -6,12 +6,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tools.smoke_import import install_stubs
-
-try:
-    import cv2  # noqa: F401
-except ModuleNotFoundError:
-    install_stubs()
 
 from XTA.lta_config import parse_lta_args
 from XTA.lta_inputs import (

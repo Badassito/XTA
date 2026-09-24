@@ -1,25 +1,8 @@
 from __future__ import annotations
 
-import importlib.util
 import inspect
-import sys
 import unittest
 
-from tools.smoke_import import install_stubs
-
-
-def _module_is_available(name: str) -> bool:
-    loaded = sys.modules.get(name)
-    if loaded is not None:
-        return getattr(loaded, "__spec__", None) is not None
-    try:
-        return importlib.util.find_spec(name) is not None
-    except (ImportError, ValueError):
-        return False
-
-
-if not all(_module_is_available(name) for name in ("cv2", "scipy", "tqdm")):
-    install_stubs()
 
 from XTA import pta
 from XTA import pta_augmentation

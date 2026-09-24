@@ -57,7 +57,8 @@ class SphericalRetirementAdmissionTests(unittest.TestCase):
         self.coordinator.set_inference_asset_retirement_pending(True)
         self.assertIsNone(self.coordinator.try_acquire_stage(self.torch,self.purpose))
         self.coordinator.set_inference_asset_retirement_pending(False)
-        aux=SimpleNamespace(revoke_worker=lambda index:False)
+        aux=SimpleNamespace(claim_worker_for_stage=lambda index:None,
+                            release_stage_claim=lambda index, token:None)
         with mock.patch.object(bp,'gpu_worker_aux_interpolation_pool',return_value=aux):
             self.assertIsNone(self.coordinator.try_acquire_stage(self.torch,self.purpose))
 
@@ -199,8 +200,9 @@ class SphericalProjectionPromotionTests(unittest.TestCase):
 
                 class JoinSignallingExecutor(executor_type):
                     def __exit__(self, *args):
-                        events.append('join')
-                        release_producer.set()
+                        if self._thread_name_prefix == 'spherical-cuda-project':
+                            events.append('join')
+                            release_producer.set()
                         return super().__exit__(*args)
 
                 def project(z, count):

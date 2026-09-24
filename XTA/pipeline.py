@@ -393,6 +393,8 @@ from .tta_prediction import (
     PredictionSourceOperations,
     ViewFrameCache,
 )
+from .scheduler_diagnostics import scheduler_operation
+from .tta_background import BackgroundDrainBudget
 from .tta_scheduler import (
     TtaScheduler,
     TtaSchedulerCallbacks,
@@ -705,7 +707,8 @@ def main() -> None:
             pass
         _ACTIVE_PIPELINE_RUN_RESOURCES = None
         configure_component_replay_capture(None)
-        from .confidence_evidence import configure_confidence_evidence
+        from .confidence_evidence import configure_confidence_evidence, shutdown_confidence_publication
+        shutdown_confidence_publication(raise_errors=False)
         configure_confidence_evidence(None, enabled=False)
         configure_pipeline_modes(fast_bundle_active=False, d1_pipeline_active=False)
         _PIPELINE_RUN_LOCK.release()
@@ -1311,6 +1314,7 @@ def _main_impl() -> None:
     from .confidence_evidence import configure_confidence_evidence
     configure_confidence_evidence(out_dir, enabled=args.reconciliation_retain_confidence,
                                   min_conf=float(args.min_conf),
+                                  background_publication=True,
                                   defer_projection=bool(reconciliation_settings.enabled
                                       and reconciliation_policy['mode'] != 'confidence'))
 
@@ -2711,6 +2715,7 @@ def _main_impl() -> None:
         prediction_sources.drain_completed_prediction_volume_futures
     )
 
+    @scheduler_operation('workspace_admission')
     def _ensure_baseline_workspaces(model_name: str, view: ViewInfo) -> None:
         key = (str(model_name), str(view.name))
         if key in baseline_union_by_model_view:
@@ -3783,7 +3788,10 @@ def _main_impl() -> None:
 
     def _drain_parent_mask_ready_events() -> None:
         published = False
-        while True:
+        active_inference = bool(
+            inference_worker_process_active and scheduler.process_inference_outstanding())
+        consumed = 0
+        while not active_inference or consumed < 32:
             try:
                 model_name, view_name, support_mm = parent_mask_ready_events.get_nowait()
             except queue.Empty:
@@ -3795,6 +3803,11 @@ def _main_impl() -> None:
                 )
             parent_mask_support_by_model[str(model_name)][str(view_name)] = support_mm
             published = True
+            consumed += 1
+            if active_inference and consumed % 8 == 0:
+                scheduler.service_pending_compute_credits()
+        if active_inference and not parent_mask_ready_events.empty():
+            scheduler.wake_scheduler()
         if published:
             _flush_ready_postprocessed_tiles()
             # Parent-ready publication changes tile dispatch priority immediately. Refill
@@ -4175,10 +4188,17 @@ def _main_impl() -> None:
 
             raise RuntimeError(f'Unknown prediction accumulation kind: {kind!r}')
 
+    background_drain_budget = BackgroundDrainBudget(
+        lambda: scheduler.service_pending_compute_credits(),
+    )
+
+    @scheduler_operation('background_drain')
     def _drain_completed_background_futures() -> None:
         direct_union_capacity_released = False
+        background_drain_budget.begin(enabled=bool(
+            inference_worker_process_active and scheduler.process_inference_outstanding()))
         _drain_parent_mask_ready_events()
-        for fut in list(view_processing_futures.keys()):
+        for fut in background_drain_budget.items(0, view_processing_futures):
             if not fut.done():
                 continue
             result = fut.result()
@@ -4244,8 +4264,9 @@ def _main_impl() -> None:
             _maybe_submit_tile_consolidations_for_parent(
                 str(result.model_name), str(result.view_name),
             )
+            background_drain_budget.completed(0)
 
-        for fut in list(tile_cleanup_futures.keys()):
+        for fut in background_drain_budget.items(1, tile_cleanup_futures):
             if not fut.done():
                 continue
             ready_key = tile_cleanup_futures.pop(fut)
@@ -4259,6 +4280,7 @@ def _main_impl() -> None:
                     str(ready_key[0]), str(ready_key[1]),
                     str(ready_key[2]), str(ready_key[3]),
                 )
+                background_drain_budget.completed(1)
                 continue
             if isinstance(result, DeferredTilePostprocessResult):
                 # v16.4.3: CTILE publication is the array-backed-result retirement boundary.
@@ -4269,10 +4291,11 @@ def _main_impl() -> None:
                     reason='immediate CTILE retirement after tile cleanup',
                 )
             _submit_tile_parent_gate(result)
+            background_drain_budget.completed(1)
 
         _flush_ready_postprocessed_tiles()
 
-        for fut in list(tile_parent_gate_futures.keys()):
+        for fut in background_drain_budget.items(2, tile_parent_gate_futures):
             if not fut.done():
                 continue
             model_name, view_name, config_id, tile_id = tile_parent_gate_futures.pop(fut)
@@ -4287,10 +4310,11 @@ def _main_impl() -> None:
                 )
             else:
                 _submit_tile_bridge_gate(parent_gate_result.residual_result)
+            background_drain_budget.completed(2)
 
         _flush_ready_residual_tiles()
 
-        for fut in list(tile_bridge_gate_futures.keys()):
+        for fut in background_drain_budget.items(3, tile_bridge_gate_futures):
             if not fut.done():
                 continue
             model_name, view_name, config_id, tile_id = tile_bridge_gate_futures.pop(fut)
@@ -4302,8 +4326,9 @@ def _main_impl() -> None:
             _mark_tile_complete(
                 str(model_name), str(view_name), str(config_id), str(tile_id),
             )
+            background_drain_budget.completed(3)
 
-        for fut in list(tile_consolidation_futures.keys()):
+        for fut in background_drain_budget.items(4, tile_consolidation_futures):
             if not fut.done():
                 continue
             set_key = tile_consolidation_futures.pop(fut)
@@ -4355,8 +4380,9 @@ def _main_impl() -> None:
 
             tile_consolidation_completed.add(set_key)
             _maybe_finalize_tile_parent(str(parent_key[0]), str(parent_key[1]))
+            background_drain_budget.completed(4)
 
-        for fut in list(tile_parent_finalization_futures.keys()):
+        for fut in background_drain_budget.items(5, tile_parent_finalization_futures):
             if not fut.done():
                 continue
             parent_key = tile_parent_finalization_futures.pop(fut)
@@ -4368,8 +4394,9 @@ def _main_impl() -> None:
                 str(parent_key[1]),
                 reason='full-frame and all configured tile-set terminal refs are complete',
             )
+            background_drain_budget.completed(5)
 
-        for fut in list(physical_view_finalization_futures.keys()):
+        for fut in background_drain_budget.items(6, physical_view_finalization_futures):
             if not fut.done():
                 continue
             expected_key = physical_view_finalization_futures.pop(fut)
@@ -4393,8 +4420,9 @@ def _main_impl() -> None:
                 f'Streaming physical-view finalization completed '
                 f'{result_model}/{result_view}; terminal global fusion is queued.'
             )
+            background_drain_budget.completed(6)
 
-        for fut in list(physical_view_union_futures.keys()):
+        for fut in background_drain_budget.items(7, physical_view_union_futures):
             if not fut.done():
                 continue
             expected_key = physical_view_union_futures.pop(fut)
@@ -4408,8 +4436,11 @@ def _main_impl() -> None:
             print(
                 f'Streaming final union committed {expected_key[0]}/{expected_key[1]}.'
             )
+            background_drain_budget.completed(7)
 
-        output_manager.reap_completed()
+        background_drain_budget.finish()
+        output_manager.reap_completed(
+            max_completed=1 if background_drain_budget.enabled else None)
         # Allocation admission can block every otherwise-idle worker while the active
         # view window is full. Completing cvol materialization releases that slot, so
         # immediately refill the worker queues instead of waiting for an unrelated event.
@@ -4428,10 +4459,14 @@ def _main_impl() -> None:
         waiting_parent_tiles = sum(len(v) for v in postprocessed_tiles_waiting_by_parent.values())
         waiting_bridge_tiles = sum(len(v) for v in residual_tiles_waiting_by_parent.values())
         gpu_stage_state = _MAIN_PROCESS_GPU_STAGE_COORDINATOR.snapshot()
+        with parent_transient_admission.condition:
+            parent_transient_in_use = int(parent_transient_admission.in_use)
+            parent_transient_capacity = int(parent_transient_admission.capacity)
         print(
             'Scheduler wait: no inference-ready in-memory volume; '
             f'gpu_inference_inflight={gpu_stage_state.get("inference_inflight", {})}, '
             f'gpu_stage_leases={gpu_stage_state.get("stage_leases", {})}, '
+            f'gpu_stage_admission_pending={gpu_stage_state.get("provisional_stage_devices", [])}, '
             f'spherical_pressure={gpu_stage_state.get("spherical_retirement_pressure", False)}, '
             f'spherical_reserved_device={gpu_stage_state.get("spherical_retirement_reserved_device")}, '
             f'spherical_requests={gpu_stage_state.get("spherical_retirement_request_count", 0)}, '
@@ -4444,6 +4479,10 @@ def _main_impl() -> None:
             f'queued_build_jobs={len(pending_prediction_build_jobs)}, '
             f'prediction_accumulation={len(prediction_accumulation_futures)}, '
             f'parent_postprocess={len(view_processing_futures)}, '
+            f'physical_finalization={len(physical_view_finalization_futures)}, '
+            f'physical_union={len(physical_view_union_futures)}, '
+            f'parent_transient={parent_transient_in_use / GIB:.1f}/'
+            f'{parent_transient_capacity / GIB:.1f}GiB, '
             f'direct_union_inference={len(direct_union_inference_views)}/'
             f'{sum(direct_union_inference_bytes.values()) / GIB:.1f}GiB, '
             f'direct_union_postprocess={len(direct_union_postprocess_views)}/'
@@ -5273,6 +5312,13 @@ def _main_impl() -> None:
                 for copy_view in policy_views_by_base.get(base_name, ()):
                     fullframe_subtasks_per_view[(copy_model, copy_view.name)] = int(count)
         scheduler_state.gpu_worker_total_tasks = int(next_task_id)
+        from .cuda_d1 import d1_confidence_retirement_host_bytes
+        from .confidence_evidence import confidence_publication_reserve_bytes
+        confidence_worker_reserve = (
+            int(gpu_device_count) * d1_confidence_retirement_host_bytes()
+            if bool(getattr(args, 'reconciliation_retain_confidence', False)) and any(
+                'd1_output_shape' in task for task in gpu_worker_tasks_by_id.values()) else 0)
+        confidence_stage_reserve = confidence_publication_reserve_bytes()
         if bounded_policy_parent_keys:
             # File results and packed coverage coexist with the admitted parents.
             # Charge those commitments before dispatch, even on disk-backed scratch.
@@ -5295,7 +5341,7 @@ def _main_impl() -> None:
             parent_reserve = max(parent_working, min(
                 parent_transient_admission.capacity,
                 int(parent_postprocess_workers) * parent_working))
-            worker_buffers = int(gpu_device_count) * max(
+            worker_buffers = confidence_worker_reserve + int(gpu_device_count) * max(
                 256 * 1024**2,
                 int(args.gpu_batch) * int(args.imgsz)**2
                 * (16 * int(channel_format.channel_count) + 64))
@@ -5339,12 +5385,14 @@ def _main_impl() -> None:
                 available_ram_bytes=policy_headroom,
                 source_shape=(int(input_T), int(input_H), int(input_W)),
                 output_reserve_bytes=publication_output_reserve(
-                    nrrd_layer_sink(), nrrd_member_gzip_window_bytes(), nrrd_gzip_chunk_bytes()),
+                    nrrd_layer_sink(), nrrd_member_gzip_window_bytes(), nrrd_gzip_chunk_bytes()) + confidence_stage_reserve,
                 parent_transient_reserve_bytes=parent_reserve,
                 worker_buffer_reserve_bytes=worker_buffers + tile_reserve,
                 batch_size=int(args.gpu_batch),
             )
             policy_memory_plan.update(cpu_worker_buffer_plan=cpu_buffer_plan,
+                                      confidence_host_reserve_bytes=confidence_worker_reserve,
+                                      confidence_stage_reserve_bytes=confidence_stage_reserve,
                                       gpu_worker_buffer_reserve_bytes=gpu_worker_buffers,
                                       tile_buffer_reserve_bytes=tile_reserve)
             direct_union_total_dense_byte_limit = int(policy_memory_plan['dense_limit_bytes'])
@@ -5377,8 +5425,9 @@ def _main_impl() -> None:
             publication_pending=d1_publication_max_pending_per_worker(),
             unpack_bytes=d1_unpack_target_mib() * 1024 * 1024,
             native_dense_reserve_bytes=int(native_dense_reserve_bytes),
+            worker_buffer_reserve_bytes=confidence_worker_reserve,
             output_reserve_bytes=publication_output_reserve(
-                nrrd_layer_sink(), nrrd_member_gzip_window_bytes(), nrrd_gzip_chunk_bytes()),
+                nrrd_layer_sink(), nrrd_member_gzip_window_bytes(), nrrd_gzip_chunk_bytes()) + confidence_stage_reserve,
         )
         print('Execution provenance: ' + json.dumps(_execution_runtime_provenance(), sort_keys=True), flush=True)
         radial_owner_tasks = [task for task in gpu_worker_tasks_by_id.values()
@@ -5777,6 +5826,7 @@ def _main_impl() -> None:
         for sibling, result in zip(siblings, results):
             callback(sibling, result)
 
+    @scheduler_operation('fullframe_result')
     def _handle_fullframe_worker_result(task: Dict[str, object], stats: Dict[str, object]) -> None:
         _consume_policy_result_records(task, stats, _handle_fullframe_worker_result)
         view = task['view']
@@ -5827,6 +5877,8 @@ def _main_impl() -> None:
                     raise TypeError(
                         f'D1 result {meta_key} returned {type(layer_ref)!r}, expected NrrdLayerRef'
                     )
+                if not complete:
+                    raise RuntimeError(f'D1 result {meta_key} returned a layer without a completion acknowledgement')
                 if meta_key in d1_layer_ref_by_parent:
                     raise RuntimeError(f'D1 layer {meta_key} was published more than once')
                 d1_layer_ref_by_parent[meta_key] = layer_ref
@@ -5854,7 +5906,10 @@ def _main_impl() -> None:
             if remaining < 0:
                 raise RuntimeError(f'D1 view {meta_key} completed too many inference tasks')
             if remaining == 0:
-                if not complete or meta_key not in d1_layer_ref_by_parent:
+                # Confidence and mask publication can retire in a different
+                # order from inference. A prior receipt may own the completed
+                # layer while this last receipt finishes an earlier lease.
+                if meta_key not in d1_layer_ref_by_parent:
                     raise RuntimeError(
                         f'D1 view {meta_key} exhausted its tasks without a finalized source-space cvol'
                     )
@@ -6208,6 +6263,10 @@ def _main_impl() -> None:
     try:
         _pump_prediction_volume_build_queue()
         while True:
+            if inference_worker_process_active:
+                _drain_process_inference_results()
+                _check_inference_workers_alive()
+                scheduler.service_gpu_stage_admission_retry()
             _drain_completed_prediction_volume_futures()
             _drain_completed_prediction_accumulation_futures()
             _drain_completed_background_futures()
@@ -6215,10 +6274,10 @@ def _main_impl() -> None:
             _warmup_ready_prediction_sources()
 
             if inference_worker_process_active:
-                # Both backends publish one common result contract. Drain it before CPU-side
-                # postprocessing and fail fast if either a CUDA or OpenVINO process disappeared.
+                # Recheck arrivals after the cooperative background pass as well.
                 _drain_process_inference_results()
                 _check_inference_workers_alive()
+                scheduler.service_gpu_stage_admission_retry()
 
             if (not inference_worker_process_active) and ready_fullframe:
                 view, job, prediction_ref = ready_fullframe.popleft()
@@ -6582,6 +6641,10 @@ def _main_impl() -> None:
                     _pump_prediction_volume_build_queue()
                 continue
 
+            if (background_drain_budget.deferred
+                    or (inference_worker_process_active
+                        and scheduler.has_pending_process_results())):
+                continue
             waitables: List[Future] = list(pending_prediction_volume_futures)
             waitables.extend(list(prediction_accumulation_futures.keys()))
             waitables.extend(prepared_view_waitables(view_processing_futures))
@@ -6810,6 +6873,8 @@ def _main_impl() -> None:
         raise RuntimeError('D1 confidence evidence contains unfinished view leases')
     if d1_confidence_executor is not None:
         d1_confidence_executor.shutdown(wait=True)
+    from .confidence_evidence import drain_confidence_publication
+    runtime_telemetry().gauge('confidence.publication', drain_confidence_publication())
 
     scheduler_result = scheduler.result()
     if scheduler.d1_owner_groups_requested():
@@ -7059,9 +7124,16 @@ def _main_impl() -> None:
     if reconciliation_settings.enabled:
         print('\n=== Reconciling independent source-space evidence layers ===')
         layer_sink = nrrd_layer_sink()
+        from .reconciliation_runtime import reconcile_tta_layers, union_nrrd_exports_can_overlap
         if layer_sink is not None:
-            layer_sink.wait()
-        from .reconciliation_runtime import reconcile_tta_layers
+            overlap_exports = union_nrrd_exports_can_overlap(
+                layer_sink, final_union_mm, policy=reconciliation_policy,
+                source_shape_tyx=source_output_shape_tyx)
+            runtime_telemetry().gauge('reconciliation.overlap_component_exports', overlap_exports)
+            if overlap_exports:
+                print('Union finalization continues alongside independent component NRRD exports.')
+            else:
+                layer_sink.wait()
         original_union = final_union_mm
         final_union_mm, reconciliation_report = reconcile_tta_layers(
             nrrd_layer_refs, views=inference_views,

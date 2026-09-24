@@ -18,7 +18,13 @@ def manifest():
     value=json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
     if 'v22_3_1_release_review' not in value:
         pytest.skip('Final performance release review has not been written')
-    return value
+    return inventory._without_reviewed_v22_3_2_release(value)
+
+
+@pytest.fixture
+def successors():
+    value=json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
+    return tuple(value[key] for key in ('v22_3_2_release_review',) if key in value)
 
 
 def test_commit_and_entire_predecessor_are_preserved(manifest):
@@ -50,21 +56,21 @@ def test_reauthenticating_review_cannot_change_independent_predecessor_pin(manif
             inventory.reviewed_v22_3_1_release_contract(manifest,manifest['v21_review'])
 
 
-def test_current_complete_sources_and_tools_match_review(manifest):
+def test_current_complete_sources_and_tools_match_review(manifest,successors):
     review=inventory.reviewed_v22_3_1_release_contract(manifest,manifest['v21_review'])
     trees={item['module']:ast.parse((inventory.PACKAGE/(item['module']+'.py')).read_text(encoding='utf-8'))
            for item in review['module_snapshots'] if not item.get('removed')}
-    inventory.verify_v22_3_source_snapshots(review,trees)
-    inventory.verify_v22_3_validation_tools(review)
+    inventory.verify_v22_3_source_snapshots(review,trees,successors)
+    inventory.verify_v22_3_validation_tools(review,successors)
     for module in ('confidence_evidence','pipeline','reconciliation_runtime'):
         changed=dict(trees)
         changed[module]=copy.deepcopy(trees[module])
         changed[module].body.append(ast.Pass())
         with pytest.raises(RuntimeError,match='v22.3.1 reviewed source changed'):
-            inventory.verify_v22_3_source_snapshots(review,changed)
+            inventory.verify_v22_3_source_snapshots(review,changed,successors)
 
 
-def test_retired_examples_preserve_history_and_reject_reintroduced_source(manifest):
+def test_retired_examples_preserve_history_and_reject_reintroduced_source(manifest,successors):
     review=inventory.reviewed_v22_3_1_release_contract(manifest,manifest['v21_review'])
     prior=manifest['v22_3_release_review']
     trees={item['module']:ast.parse((inventory.PACKAGE/(item['module']+'.py')).read_text(encoding='utf-8'))
@@ -79,7 +85,7 @@ def test_retired_examples_preserve_history_and_reject_reintroduced_source(manife
         assert not (inventory.PACKAGE/(module+'.py')).exists()
         changed={**trees,module:ast.parse('')}
         with pytest.raises(RuntimeError,match='v22.3.1 reviewed source changed'):
-            inventory.verify_v22_3_source_snapshots(review,changed)
+            inventory.verify_v22_3_source_snapshots(review,changed,successors)
 
 
 @pytest.mark.parametrize('mutation', ['extra', 'missing', 'source', 'statements'])
@@ -114,12 +120,12 @@ def test_validation_tool_links_cannot_be_rewritten_even_if_review_is_reauthentic
             inventory.reviewed_v22_3_1_release_contract(manifest,manifest['v21_review'])
 
 
-def test_previous_release_tool_verification_follows_only_authenticated_links(manifest):
+def test_previous_release_tool_verification_follows_only_authenticated_links(manifest,successors):
     prior=inventory._without_reviewed_v22_3_1_release(manifest)
     review=manifest['v22_3_1_release_review']
     old=prior['v22_3_release_review']
-    inventory.verify_v22_3_validation_tools(old,(review,))
+    inventory.verify_v22_3_validation_tools(old,(review,*successors))
     altered=copy.deepcopy(review)
     altered['validation_tools'][0]['previous_sha256']='0'*64
     with pytest.raises(RuntimeError,match='validation tool changed: predecessor'):
-        inventory.verify_v22_3_validation_tools(old,(altered,))
+        inventory.verify_v22_3_validation_tools(old,(altered,*successors))
