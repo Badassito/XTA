@@ -261,6 +261,9 @@ class GPUAugmentation:
     """Torch-CUDA implementation of the baseline probability graph."""
 
     supports_cuda_sources = True
+    # Spatial samples depend on seed and image shape, never mask contents.
+    mask_independent_geometry = True
+    supports_cuda_masks = True
 
     def __init__(self, *, device: str, batch_size: int = 32) -> None:
         self.device = torch.device(str(device))
@@ -467,8 +470,8 @@ class GPUAugmentation:
     def apply_batch_many(
         self,
         *,
-        images: Sequence[np.ndarray],
-        masks: Sequence[np.ndarray],
+        images: Sequence[np.ndarray | torch.Tensor],
+        masks: Sequence[np.ndarray | torch.Tensor],
         seeds: Sequence[Sequence[Optional[int]]],
         output_size: Tuple[int, int],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -498,19 +501,28 @@ class GPUAugmentation:
         ]
         if any(cuda_image_inputs) and not all(cuda_image_inputs):
             raise ValueError("apply_batch_many cannot mix NumPy and CUDA source images")
+        cuda_mask_inputs = [
+            bool(torch.is_tensor(mask) and bool(getattr(mask, "is_cuda", False)))
+            for mask in masks
+        ]
+        if any(cuda_mask_inputs) and not all(cuda_mask_inputs):
+            raise ValueError("apply_batch_many cannot mix NumPy and CUDA source masks")
+        if all(cuda_image_inputs) != all(cuda_mask_inputs):
+            raise ValueError("apply_batch_many requires images and masks on the same source device")
         image_arrays = (
             []
             if all(cuda_image_inputs)
             else [np.ascontiguousarray(np.asarray(image), dtype=np.uint8) for image in images]
         )
-        mask_arrays = [
-            np.ascontiguousarray((np.asarray(mask) > 0).astype(np.uint8))
-            for mask in masks
-        ]
+        mask_arrays = (
+            []
+            if all(cuda_mask_inputs)
+            else [np.ascontiguousarray((np.asarray(mask) > 0).astype(np.uint8)) for mask in masks]
+        )
         image_shape = tuple(images[0].shape) if all(cuda_image_inputs) else tuple(image_arrays[0].shape)
         if any(tuple(image.shape) != image_shape for image in images):
             raise ValueError("apply_batch_many source images must share one shape")
-        if any(mask.ndim != 2 or tuple(mask.shape) != image_shape[:2] for mask in mask_arrays):
+        if any(mask.ndim != 2 or tuple(mask.shape) != image_shape[:2] for mask in masks):
             raise ValueError(
                 f"apply_batch_many image/mask shape mismatch for source shape={image_shape}"
             )
@@ -545,9 +557,20 @@ class GPUAugmentation:
             raise ValueError(
                 f"GPU policy supports HxW gray or HxWxC images with C>=1, got {image_shape}"
             )
-        mask_nhw = np.stack(mask_arrays, axis=0)
-        mask_host = torch.from_numpy(np.ascontiguousarray(mask_nhw)).pin_memory()
-        mask_tensor = mask_host.to(self.device, non_blocking=True).unsqueeze(1)
+        if all(cuda_mask_inputs):
+            for mask in masks:
+                if mask.dtype != torch.uint8 or mask.device != self.device:
+                    raise ValueError(
+                        "CUDA policy source masks must be uint8 tensors on "
+                        f"{self.device}; got dtype={mask.dtype}, device={mask.device}"
+                    )
+            # Nearest sampling preserves uint8 values; the final >= 0.5
+            # threshold normalizes both 0/1 and 0/255 masks on CUDA.
+            mask_tensor = torch.stack(masks, dim=0).unsqueeze(1)
+        else:
+            mask_nhw = np.stack(mask_arrays, axis=0)
+            mask_host = torch.from_numpy(np.ascontiguousarray(mask_nhw)).pin_memory()
+            mask_tensor = mask_host.to(self.device, non_blocking=True).unsqueeze(1)
 
         image_float = image_tensor.to(torch.float32) / 255.0
         mask_float = mask_tensor.to(torch.float32)
@@ -630,8 +653,8 @@ class GPUAugmentation:
     def apply_batch(
         self,
         *,
-        image: np.ndarray,
-        mask: np.ndarray,
+        image: np.ndarray | torch.Tensor,
+        mask: np.ndarray | torch.Tensor,
         seeds: Sequence[Optional[int]],
         output_size: Tuple[int, int],
     ) -> Tuple[torch.Tensor, torch.Tensor]:

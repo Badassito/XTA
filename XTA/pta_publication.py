@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import os
 import stat as statlib
+import struct
 import threading
 import uuid
+import zlib
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +29,7 @@ except Exception as exc:  # pragma: no cover
 from .pta_augmentation import (
     LoadedAugmentation,
     apply_augmentation_pair,
+    apply_augmentation_pair_with_coverage,
     assert_augmentation_did_not_synthesize_mask,
 )
 from .pta_dataset import AUGMENTATION_TAG_LENGTH, OutputCandidate, WarningSink
@@ -524,6 +527,127 @@ def candidate_output_paths(out_dir: Path, cand: OutputCandidate, *, split_active
     return img_path, lbl_path
 
 
+def candidate_semantic_output_path(out_dir: Path, cand: OutputCandidate, *, split_active: bool) -> Path:
+    """Ultralytics pairs ``images/<split>/<stem>`` with ``masks/<split>/<stem>``."""
+    image_path, _ = candidate_output_paths(out_dir, cand, split_active=split_active, image_format="png")
+    return out_dir / "masks" / image_path.relative_to(out_dir / "images")
+
+
+def write_semantic_mask(path: Path, mask: np.ndarray, coverage: Optional[np.ndarray] = None) -> None:
+    """Write class-index PNG: background 0, foreground 1, unannotated 255."""
+    semantic = np.ascontiguousarray((np.asarray(mask) > 0).astype(np.uint8))
+    if coverage is not None:
+        known = np.asarray(coverage) > 0
+        if known.shape != semantic.shape:
+            raise ValueError(f"Semantic coverage shape {known.shape} != mask shape {semantic.shape}")
+        semantic[~known] = 255
+    write_semantic_index_mask(path, semantic)
+
+
+def _semantic_png_chunk(tag: bytes, payload: bytes) -> bytes:
+    crc = zlib.crc32(payload, zlib.crc32(tag)) & 0xffffffff
+    return struct.pack('>I', len(payload)) + tag + payload + struct.pack('>I', crc)
+
+
+def _encode_semantic_png_rle(mask: np.ndarray) -> bytes:
+    """PNG grayscale/8-bit with filter None, for OpenCV builds lacking filter control."""
+    height, width = mask.shape
+    scanlines = np.empty((height, width + 1), dtype=np.uint8)
+    scanlines[:, 0] = 0  # PNG filter type None on every row.
+    scanlines[:, 1:] = mask
+    compressor = zlib.compressobj(level=1, strategy=zlib.Z_RLE)
+    compressed = compressor.compress(memoryview(scanlines)) + compressor.flush()
+    header = struct.pack('>IIBBBBB', width, height, 8, 0, 0, 0, 0)
+    return (b'\x89PNG\r\n\x1a\n' + _semantic_png_chunk(b'IHDR', header)
+            + _semantic_png_chunk(b'IDAT', compressed)
+            + _semantic_png_chunk(b'IEND', b''))
+
+
+def semantic_png_backend() -> str:
+    """Select a lossless encoder from actual OpenCV capabilities, not its version.
+
+    OpenCV 4.13+ exposes the filter-none flag. Older builds cannot request that
+    filter, so use the equivalent small PNG writer above. ``legacy`` is an A/B
+    qualification and rollback gate for the original OpenCV compression=1 path.
+    """
+    requested = os.environ.get('PTA_SEMANTIC_PNG_CODEC', 'fast').strip().lower()
+    if requested == 'legacy':
+        return 'legacy'
+    if requested != 'fast':
+        raise ValueError('PTA_SEMANTIC_PNG_CODEC must be fast or legacy')
+    if hasattr(cv2, 'IMWRITE_PNG_FILTER') and hasattr(cv2, 'IMWRITE_PNG_FILTER_NONE'):
+        return 'opencv-rle-none'
+    return 'builtin-rle-none'
+
+
+def write_semantic_index_mask(path: Path, semantic: np.ndarray) -> None:
+    """Write a precombined 0/1/255 class plane with fast lossless PNG settings."""
+    arr = np.asarray(semantic)
+    if arr.dtype != np.uint8 or arr.ndim != 2 or not arr.size:
+        raise ValueError(f"Semantic class plane must be a nonempty uint8 HxW array, got {arr.shape}/{arr.dtype}")
+    arr = np.ascontiguousarray(arr)
+    ensure_output_parent_once(path)
+    backend = semantic_png_backend()
+    if backend == 'legacy':
+        write_image(path, arr, 1, channel_kind='gray')
+        return
+    if backend == 'opencv-rle-none':
+        okay = cv2.imwrite(str(path), arr, [
+            cv2.IMWRITE_PNG_COMPRESSION, 1,
+            cv2.IMWRITE_PNG_STRATEGY, cv2.IMWRITE_PNG_STRATEGY_RLE,
+            cv2.IMWRITE_PNG_FILTER, cv2.IMWRITE_PNG_FILTER_NONE,
+        ])
+        if not okay:
+            raise RuntimeError(f"Failed to write semantic PNG: {path}")
+    else:
+        payload = _encode_semantic_png_rle(arr)
+        with path.open('wb') as output:
+            if output.write(payload) != len(payload):
+                raise RuntimeError(f"Short semantic PNG write: {path}")
+    _validate_nonempty_regular_file(path, context="semantic PNG encoder")
+
+
+def publish_semantic_mask_payloads(
+    payloads: Sequence[Tuple[Path, np.ndarray, Optional[np.ndarray]]],
+    *,
+    executor: Optional[Executor] = None,
+    class_indices_ready: bool = False,
+) -> None:
+    """Publish one bounded batch of class-index masks using available file lanes.
+
+    ``class_indices_ready`` means the GPU already produced 0/1/255 planes.
+    Every submitted file task must settle before its host arrays can be released,
+    including when an earlier task raises.
+    """
+    def write_one(path: Path, mask: np.ndarray, coverage: Optional[np.ndarray]) -> None:
+        if class_indices_ready:
+            if coverage is not None:
+                raise ValueError("Precombined semantic masks must not carry separate coverage")
+            write_semantic_index_mask(path, mask)
+        else:
+            write_semantic_mask(path, mask, coverage)
+
+    if executor is None:
+        for path, mask, coverage in payloads:
+            write_one(path, mask, coverage)
+        return
+    futures: List[Future] = []
+    first_error: Optional[BaseException] = None
+    try:
+        for path, mask, coverage in payloads:
+            futures.append(executor.submit(write_one, path, mask, coverage))
+    except BaseException as exc:
+        first_error = exc
+    for future in futures:
+        try:
+            future.result()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
+
+
 @dataclass(frozen=True)
 class PtaDatasetImageSink:
     """PTA image publication consumer for the canonical frame-carrying batch."""
@@ -613,6 +737,8 @@ def write_selected_candidate_version(
     save_images: bool = True,
     save_labels: bool = True,
     save_binary: bool = False,
+    save_semantic: bool = False,
+    semantic_coverage: Optional[np.ndarray] = None,
     canonical_plan: Optional[RasterPlan] = None,
 ) -> str:
     """Render and write one retained candidate version.
@@ -624,6 +750,7 @@ def write_selected_candidate_version(
     """
     image_out = image
     mask_out = mask
+    coverage_out = semantic_coverage
     if int(cand.augmentation_index) > 0:
         if augmentation is None or cand.augmentation_seed is None or not cand.augmentation_tag:
             raise RuntimeError(f"Internal error: augmented candidate is missing its pipeline, seed, or tag: {cand}")
@@ -632,42 +759,58 @@ def write_selected_candidate_version(
             f"frame={int(cand.frame_idx)+1:04d}/augmentation_copy={int(cand.augmentation_index)}/"
             f"tag={cand.augmentation_tag}"
         )
-        image_out, mask_out = apply_augmentation_pair(
-            augmentation,
-            image,
-            mask,
-            seed=int(cand.augmentation_seed),
-            context=replay_context,
-            copy_inputs=not bool(inputs_are_private),
-        )
+        if semantic_coverage is None:
+            image_out, mask_out = apply_augmentation_pair(
+                augmentation, image, mask, seed=int(cand.augmentation_seed),
+                context=replay_context, copy_inputs=not bool(inputs_are_private),
+            )
+        else:
+            image_out, mask_out, coverage_out = apply_augmentation_pair_with_coverage(
+                augmentation, image, mask, semantic_coverage,
+                seed=int(cand.augmentation_seed), context=replay_context,
+                copy_inputs=not bool(inputs_are_private),
+            )
         # This is unconditional: background classification is skipped when
         # --background_percent=1, but label-preserving augmentations must still
         # never create a mask from a truly empty source.
+        original_known_mask = (
+            mask if semantic_coverage is None
+            else np.where(np.asarray(semantic_coverage) > 0, mask, 0)
+        )
+        augmented_known_mask = (
+            mask_out if coverage_out is None
+            else np.where(np.asarray(coverage_out) > 0, mask_out, 0)
+        )
         assert_augmentation_did_not_synthesize_mask(
-            mask,
-            mask_out,
+            original_known_mask,
+            augmented_known_mask,
             context=replay_context,
             original_known_empty=not bool(cand.foreground),
         )
 
+    known_mask_out = (
+        mask_out if coverage_out is None
+        else np.where(np.asarray(coverage_out) > 0, mask_out, 0)
+    )
     img_path, lbl_path = candidate_output_paths(out_dir, cand, split_active=split_active, image_format=image_format)
     label_lines: Optional[List[str]] = None
-    if cand.label_enabled and lbl_path is not None and (save_labels or not save_binary):
+    if cand.label_enabled and lbl_path is not None and (save_labels or not (save_binary or save_semantic)):
         label_context = f"{cand.volume_name} {cand.output_tag} frame {int(cand.frame_idx)+1:04d}"
         label_lines = mask_to_yolo_lines(
-            mask_out,
+            known_mask_out,
             warnings=warnings,
             context=label_context,
             known_empty=not bool(cand.foreground),
         )
-        if int(cand.augmentation_index) > 0 and bool(cand.foreground) and not label_lines:
+        if (int(cand.augmentation_index) > 0 and bool(cand.foreground)
+                and not label_lines and not (save_semantic and np.any(known_mask_out))):
             warnings.add(
                 "augmented_foreground_flip_dropped",
                 f"{cand.volume_name}/{cand.output_tag}/frame={int(cand.frame_idx)+1:04d}/tag={cand.augmentation_tag}",
             )
             return "flip_dropped"
-    elif (save_binary and cand.label_enabled and int(cand.augmentation_index) > 0
-          and bool(cand.foreground) and not np.any(mask_out)):
+    elif ((save_binary or save_semantic) and cand.label_enabled and int(cand.augmentation_index) > 0
+          and bool(cand.foreground) and not np.any(known_mask_out)):
         warnings.add(
             "augmented_foreground_flip_dropped",
             f"{cand.volume_name}/{cand.output_tag}/frame={int(cand.frame_idx)+1:04d}/tag={cand.augmentation_tag}",
@@ -697,22 +840,32 @@ def write_selected_candidate_version(
         write_binary_mask(
             candidate_binary_output_path(out_dir, cand, split_active=split_active), mask_out,
         )
+    if bool(save_semantic) and cand.label_enabled:
+        write_semantic_mask(
+            candidate_semantic_output_path(out_dir, cand, split_active=split_active),
+            mask_out, coverage_out,
+        )
     return "written"
 
 __all__ = [
     "OUTPUT_IMAGE_FORMATS",
     "PtaDatasetImageSink",
     "candidate_output_paths",
+    "candidate_semantic_output_path",
     "ensure_output_parent_once",
     "ensure_tiff_output_available",
     "mask_to_yolo_lines",
     "output_image_suffix",
     "parse_output_image_format",
     "publish_pta_candidate_image_batch",
+    "publish_semantic_mask_payloads",
+    "semantic_png_backend",
     "verify_published_image_tree",
     "write_image",
     "write_image_gray",
     "write_label_from_mask",
     "write_selected_candidate_version",
+    "write_semantic_index_mask",
+    "write_semantic_mask",
     "write_yolo_lines",
 ]

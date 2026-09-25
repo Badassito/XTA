@@ -19,7 +19,7 @@ from XTA.unification.sampling import (
 
 _FLAGS = ('YOLO_TTA_FAST_GEOMETRY', 'YOLO_TTA_CPU_SPHERICAL_COMPILED',
           'YOLO_TTA_GPU_RADIAL_COLUMN_GEOMETRY', 'YOLO_TTA_GPU_SPHERICAL_FP32')
-_STRICT_DIGEST = 'f6aaea4226a3f2862b89e073034014bf4bad4d8f54a102ffef996f88363e44ec'
+_STRICT_DIGEST = 'fc75c645eb72d2ef0e609f5b342a52f20adfa7be0b7e3aa64d34ad87d818ee14'
 
 
 class FastGeometryPolicyTests(unittest.TestCase):
@@ -42,14 +42,14 @@ class FastGeometryPolicyTests(unittest.TestCase):
     def test_default_strict_policy_digest_and_object_identity_survive_mode_changes(self):
         strict = forward_sampling_policy()
         self.assertEqual(strict.digest, _STRICT_DIGEST)
-        self.assertEqual(strict.policy_version, 21)
+        self.assertEqual(strict.policy_version, 23)
         self.assertFalse(quality.fast_geometry_enabled())
         self.assertFalse(quality.spherical_fp32_requested())
         self.assertFalse(quality.spherical_cpu_compiled_requested())
         self.assertFalse(quality.radial_columns_requested())
         os.environ['YOLO_TTA_FAST_GEOMETRY'] = '1'
         fast = forward_sampling_policy()
-        self.assertEqual(fast.policy_version, 22)
+        self.assertEqual(fast.policy_version, 24)
         self.assertIs(fast, forward_sampling_policy())
         self.assertNotEqual(strict.digest, fast.digest)
         os.environ['YOLO_TTA_GPU_SPHERICAL_FP32'] = '0'
@@ -82,7 +82,7 @@ class FastGeometryPolicyTests(unittest.TestCase):
         for shape in ((), (4097, 2, 2), (0, 2, 2), (-1, 2, 2), (4.5, 2, 2), None):
             self.assertFalse(quality.spherical_fp32_shape_eligible(shape))
 
-    def test_fast_backend_tolerance_is_spherical_only_and_categorical_stays_exact(self):
+    def test_fast_backend_tolerance_is_spherical_only_and_cpu_categorical_stays_exact(self):
         strict = forward_sampling_policy()
         categorical = require_forward_sampling('cpu', DataRole.CATEGORICAL_GROUND_TRUTH)
         with self.assertRaises(KeyError):
@@ -95,10 +95,12 @@ class FastGeometryPolicyTests(unittest.TestCase):
         self.assertEqual(strict.role_kernels, fast.role_kernels)
         self.assertEqual(strict.role_boundaries, fast.role_boundaries)
         self.assertEqual(require_forward_sampling('cuda', 'intensity').absolute_tolerance, 1.)
+        cuda_categorical = require_forward_sampling('cuda', 'categorical_ground_truth')
+        self.assertFalse(cuda_categorical.exact)
+        self.assertEqual(cuda_categorical.absolute_tolerance, 1.)
         self.assertEqual(require_forward_sampling(quality.SPHERICAL_FP32_BACKEND, 'intensity').absolute_tolerance, 2.)
-        for backend in ('cuda', quality.SPHERICAL_FP32_BACKEND):
-            with self.assertRaises(KeyError):
-                require_forward_sampling(backend, 'categorical_ground_truth')
+        with self.assertRaises(KeyError):
+            require_forward_sampling(quality.SPHERICAL_FP32_BACKEND, 'categorical_ground_truth')
 
     def test_requested_mode_changes_plan_identity_and_spawn_drift_fails_closed(self):
         strict = self.plan()

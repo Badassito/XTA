@@ -434,6 +434,7 @@ class GpuPublicationTests(unittest.TestCase):
             _wait_for_gpu_work_ready=lambda *args: None,
             _gpu_identity_fast_path_eligible=lambda *args: False,
             _gpu_policy_source_images=lambda policy, batch: (tuple(item.image for item in batch), False),
+            _gpu_policy_source_masks=lambda policy, batch, **kwargs: tuple(item.mask for item in batch),
             _is_cuda_out_of_memory=lambda exc: False,
             _render_gpu_item_group=lambda *args: work,
             candidate_output_paths=lambda out_dir, candidate, **kwargs:
@@ -490,7 +491,7 @@ class GpuPublicationTests(unittest.TestCase):
             finally:
                 label_release.set()
                 file_release.set()
-        self.assertEqual(result, (2, {}, {}, {}))
+        self.assertEqual(result, (2, {}, {'pta_cpu_categorical_items': 2}, {}))
         self.assertEqual(fixture.calls, [((1,),), ((2,),)])
         self.assertEqual(fixture.labels_written, [('frame0.txt', ['11']), ('frame1.txt', ['22'])])
         self.assertEqual(fixture.charges, [24, 24])

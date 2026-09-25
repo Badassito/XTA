@@ -275,6 +275,42 @@ class GpuAssetRetirementTests(unittest.TestCase):
         self.assertNotIn('device_fence', events)
         self.assertNotIn('torch_trim', events)
 
+    def test_semantic_fatal_error_stops_worker_before_next_task(self):
+        from XTA.semantic_trt import SemanticTrtRingConsumedError
+        _assets, engine, model, _references, _events, _cuda = self._worker_context(initialized=False)
+        incoming, outgoing = queue.Queue(), queue.Queue()
+        incoming.put({'task_id': 1, 'slice_count': 1})
+        incoming.put({'task_id': 2, 'slice_count': 1})
+        incoming.put(None)
+        init = {'imgsz': 16, 'conf': 0.5, 'batch': 1, 'quantize': 16,
+                'cpu_workers': 1, 'task': 'semantic'}
+        replacements = {
+            'configure_pipeline_modes': None, 'initialize_runtime_observability': None,
+            'set_retina_mask_processor': None, 'set_gpu_worker_fused_preflight_specs': None,
+            'set_angle_variant_gpu_fastpath': None, 'ensure_yolo_ready_for_predict': None,
+            'validate_yolo_model_input_channels': None, 'require_channel_aware_yolo_preprocess_patch': None,
+            '_init_gpu_union_retirement_manager': None,
+            '_init_worker_gpu_render_engine': engine, 'load_ultralytics_model': model,
+            'cpu_retina_masks_enabled': True, 'd1_owner_pipeline_enabled': False,
+        }
+        with contextlib.ExitStack() as stack, contextlib.redirect_stdout(io.StringIO()):
+            stack.enter_context(mock.patch.dict(os.environ, {'CUDA_VISIBLE_DEVICES': '0'}))
+            for name, result in replacements.items():
+                stack.enter_context(mock.patch.object(workers, name, return_value=result))
+            prediction = stack.enter_context(mock.patch.object(
+                workers, 'run_prediction_volume_in_worker',
+                side_effect=SemanticTrtRingConsumedError('renderer stream could not be fenced'),
+            ))
+            workers._gpu_inference_worker_main(0, 'model.engine', init, incoming, outgoing)
+            self.assertEqual(prediction.call_count, 1)
+        self.assertEqual(incoming.get_nowait()['task_id'], 2)
+        messages = []
+        while not outgoing.empty():
+            messages.append(outgoing.get_nowait())
+        failures = [message for message in messages if message['type'] == 'fatal']
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]['task_id'], 1)
+
     def test_worker_protocol_uses_logical_gpu_ack_and_keeps_auxiliary_service_alive(self):
         assets, engine, model, references, events, cuda = self._worker_context(initialized=False)
         incoming, outgoing = queue.Queue(), queue.Queue()

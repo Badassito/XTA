@@ -20,6 +20,15 @@ class LtaConfigTests(unittest.TestCase):
         "--enable_cartesian", "transverse",
     ]
 
+    def test_yolo_task_and_semantic_export_are_not_lta_options(self) -> None:
+        parser = build_lta_argparser()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+            parser.parse_args([*self.REQUIRED, "--task", "semantic"])
+        self.assertIn("unrecognized arguments: --task semantic", stderr.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parse_lta_args([*self.REQUIRED, "--save", "semantic"])
+
     def test_per_gpu_worker_count_is_bounded_and_opt_in(self):
         self.assertEqual(parse_lta_args(self.REQUIRED).args.lta_workers_per_gpu, 1)
         self.assertEqual(parse_lta_args(self.REQUIRED + ["--lta_workers_per_gpu", "2"]).args.lta_workers_per_gpu, 2)

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "kind": "reconstructed_development_checkpoint",
+  "version": "23.0.0",
+  "original_archive_version": "24.0.0",
+  "restored_at": "2026-10-05T23:18:34-04:00",
+  "source_archive_name": "XTA_v24.0.0_complete_source.zip",
+  "source_archive_sha256": "732f8c5217a8b822d97d40eec28fff8a7fd5f134445d65b28f852a5cc0d22ac4",
+  "source_archive_relative_to_history": "2026-09-27-experiment-cleanup/evidence/v24-pta-throughput/release/XTA_v24.0.0_complete_source.zip",
+  "source_files": 541,
+  "parent_commit": "9414dde87dc7391df5b37d15b669ba7be859efea",
+  "historical_commit_existed": false,
+  "date_policy": "New author and committer dates record restoration, not a fabricated historical commit.",
+  "scope": "Restore authenticated archived source with release identities and inventory pins aligned to v23.0.0; no scientific implementation changes.",
+  "subsequent_review_policy": "Existing later source reviews retain their original audited predecessor baselines; this reconstruction does not invent a historical release qualification."
+}

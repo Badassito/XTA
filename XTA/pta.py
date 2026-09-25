@@ -110,6 +110,7 @@ from .pta_augmentation import (
     _augmented_mask_to_binary,
     _load_external_python_module,
     apply_augmentation_pair,
+    apply_augmentation_pair_with_coverage,
     assert_augmentation_definition_unchanged,
     assert_augmentation_did_not_synthesize_mask,
     inspect_augmentation_definition,
@@ -155,6 +156,7 @@ from .pta_publication import (
     _validate_nonempty_regular_file,
     _write_nvjpeg_batch_atomically,
     candidate_output_paths,
+    candidate_semantic_output_path,
     ensure_output_parent_once,
     ensure_tiff_output_available,
     mask_to_yolo_lines,
@@ -169,6 +171,7 @@ from .pta_publication import (
     write_yolo_lines,
 )
 from .pta_binary import candidate_binary_output_path, write_candidate_binary_videos
+from .pta_classification import classify_semantic_plan_frame
 from .pta_rendering import (
     DEFAULT_CHANNEL_VARIANT,
     AZIMUTHAL_LANCZOS_A,
@@ -2303,10 +2306,13 @@ class PreparedVolume:
     voxel_initial: Optional[int]
     voxel_final: Optional[int]
     foreground_preservation_stats: Dict[str, int]
+    semantic_foreground: bool = False
+    semantic_coverage_for_render: Optional[np.ndarray] = None
     # Blocks backing volume_for_render/mask_for_render for the
     # process pool, plus every block this volume owns (released at finalize).
     volume_render_block: Optional[SharedBlock] = None
     mask_render_block: Optional[SharedBlock] = None
+    semantic_coverage_render_block: Optional[SharedBlock] = None
     shm_blocks: List[SharedBlock] = field(default_factory=list)
 
 
@@ -2493,6 +2499,7 @@ def write_v18_pta_manifest(
     dataset_yaml_path: Optional[Path] = None,
     publication_integrity: Optional[Mapping[str, object]] = None,
     binary_publication: Sequence[Mapping[str, object]] = (),
+    categorical_dispatch_counts: Optional[Mapping[str, int]] = None,
 ) -> Path:
     """Write the mandatory v18 reproducibility and geometry manifest."""
 
@@ -2524,13 +2531,25 @@ def write_v18_pta_manifest(
     cuda_intensity_selected = "cuda" in str(
         augmentation_stats.runtime_backend
     ).lower()
+    dispatch_counts = categorical_dispatch_counts or {}
+    cuda_categorical_items = int(dispatch_counts.get("pta_cuda_categorical_items", 0))
+    cpu_categorical_items = int(dispatch_counts.get("pta_cpu_categorical_items", 0))
+    if cuda_categorical_items < 0 or cpu_categorical_items < 0:
+        raise ValueError("PTA categorical dispatch counts must be nonnegative")
+    categorical_backends = (
+        (("cuda", "categorical_ground_truth"),)
+        if cuda_categorical_items else ()
+    ) + (
+        (("cpu", "categorical_ground_truth"),)
+        if cpu_categorical_items or not cuda_categorical_items else ()
+    )
     sampling_bindings: Tuple[Tuple[str, str], ...] = (
         (
             (("cuda", "intensity"), ("cpu", "intensity"))
             if cuda_intensity_selected
             else (("cpu", "intensity"),)
         )
-        + (("cpu", "categorical_ground_truth"),)
+        + categorical_backends
     )
     manifest = {
         "schema": "pta-tta.v21.manifest.1",
@@ -2619,10 +2638,24 @@ def write_v18_pta_manifest(
             ),
             "geometry_module": "XTA.geometry",
             "backend": (
-                "cuda_intensity_with_cpu_fallback;cpu_categorical"
+                "cuda_intensity_with_cpu_fallback;" + (
+                    "cuda_categorical_with_cpu_fallback"
+                    if cuda_categorical_items and cpu_categorical_items else
+                    "cuda_categorical"
+                    if cuda_categorical_items else "cpu_categorical"
+                )
                 if cuda_intensity_selected
-                else "cpu"
+                else (
+                    "cuda_categorical_with_cpu_fallback"
+                    if cuda_categorical_items and cpu_categorical_items else
+                    "cuda_categorical"
+                    if cuda_categorical_items else "cpu"
+                )
             ),
+            "categorical_dispatch_items": {
+                "cuda": cuda_categorical_items,
+                "cpu": cpu_categorical_items,
+            },
             "intensity_azimuthal_filter": str(shared_geometry.AZIMUTHAL_FILTER_MODE),
             "intensity_affine_filter": (
                 "cuda_grid_sample_bilinear_or_opencv_inter_linear_fallback"
@@ -3234,6 +3267,19 @@ def prepare_loaded_source(
         raise ValueError(f"Image and mask volumes must match before preprocessing for {src.stem}: image={source_shape}, mask={mask.shape}")
 
     annotation_states = derive_annotation_states(src, mask)
+    semantic_coverage: Optional[np.ndarray] = None
+    if (
+        bool(getattr(args, "save_semantic", False))
+        and src.label_source == "yolo"
+        and src.volume_class == "partially_labeled"
+        and bool(args.force)
+    ):
+        # Missing YOLO files carry unknown labels. Keep this separate from the
+        # binary foreground mask through smoothing, resize, and view geometry.
+        semantic_coverage = np.zeros(source_shape, dtype=np.uint8)
+        for frame_index, state in enumerate(annotation_states):
+            if int(state) != ANNOTATION_UNANNOTATED:
+                semantic_coverage[frame_index] = 1
     state_counts = annotation_state_counts(annotation_states)
     unannotated_count = int(state_counts["unannotated"])
     if (
@@ -3256,7 +3302,10 @@ def prepare_loaded_source(
     ):
         warnings.add(
             "unannotated_state_overridden_by_force",
-            f"{src.stem}: --force treats {unannotated_count} unannotated slice(s) as mask-empty during full-volume transforms",
+            f"{src.stem}: --force permits {unannotated_count} unannotated slice(s) in full-volume transforms; "
+            + ("semantic masks retain their unknown pixels as 255"
+               if bool(getattr(args, "save_semantic", False))
+               else "binary foreground transforms treat them as mask-empty"),
         )
 
     foreground_anchors, source_anchor_seeds = collect_foreground_slice_anchors(
@@ -3324,6 +3373,15 @@ def prepare_loaded_source(
             work_dir=out_dir / ".v18_work" / src.stem,
             workers=max(1, int(workers)),
         )
+        if semantic_coverage is not None and tuple(processing_shape) != tuple(source_shape):
+            semantic_coverage = shared_media.resize_categorical_volume_to_processing_cube_uint8(
+                semantic_coverage,
+                processing_shape,
+                out_dir / ".v18_work" / src.stem / "annotation_coverage_cube.uint8",
+                workers=max(1, int(workers)),
+                prefer_memory=True,
+                reserve_bytes=0,
+            )
     else:
         volume_for_render = src.volume
         mask_for_render = mask
@@ -3374,8 +3432,12 @@ def prepare_loaded_source(
         volume_for_render, src.volume_block if volume_for_render is src.volume else None, allocator)
     mask_for_render, mask_render_block = ensure_shared_uint8(
         mask_for_render, mask_block if mask_for_render is mask else None, allocator)
+    semantic_coverage_render_block: Optional[SharedBlock] = None
+    if semantic_coverage is not None:
+        semantic_coverage, semantic_coverage_render_block = ensure_shared_uint8(
+            semantic_coverage, None, allocator)
     owned_blocks: List[SharedBlock] = []
-    for candidate_block in (src.volume_block, mask_block, volume_render_block, mask_render_block):
+    for candidate_block in (src.volume_block, mask_block, volume_render_block, mask_render_block, semantic_coverage_render_block):
         if candidate_block is not None and all(candidate_block is not existing for existing in owned_blocks):
             owned_blocks.append(candidate_block)
 
@@ -3492,6 +3554,7 @@ def prepare_loaded_source(
         save_overlay=bool(save_overlay),
         volume_for_render=volume_for_render,
         mask_for_render=mask_for_render,
+        semantic_coverage_for_render=semantic_coverage,
         views=list(views),
         plans=list(plans),
         smoothing_stats=smoothing_stats,
@@ -3499,8 +3562,10 @@ def prepare_loaded_source(
         voxel_initial=voxel_initial,
         voxel_final=voxel_final,
         foreground_preservation_stats=foreground_preservation_stats,
+        semantic_foreground=bool(getattr(args, "task", "segment") == "semantic"),
         volume_render_block=volume_render_block,
         mask_render_block=mask_render_block,
+        semantic_coverage_render_block=semantic_coverage_render_block,
         shm_blocks=owned_blocks,
     )
 
@@ -3656,6 +3721,38 @@ def _polygon_intersects_canvas_tile(
     return False
 
 
+def classify_semantic_full_transverse_for_preservation(
+    prep: PreparedVolume,
+) -> Dict[Tuple[str, int, str, int], bool]:
+    """Check only full Transverse centers when unrestricted publication skips F/B planning."""
+    foregrounds: Dict[Tuple[str, int, str, int], bool] = {}
+    if int(prep.foreground_preservation_stats.get("input_foreground_transverse_slices", 0)) <= 0:
+        return foregrounds
+    for plan in prep.plans:
+        if plan.view.family != "transverse":
+            continue
+        for idx in render_plan_frame_indices(plan):
+            fast = classify_semantic_plan_frame(
+                prep.mask_for_render, prep.semantic_coverage_for_render,
+                plan, int(idx), include_tiles=False,
+            )
+            if fast is None:
+                full, _ = render_plan_frame_mask_source(
+                    mask=prep.mask_for_render, plan=plan, idx=int(idx), need_canvas=False,
+                )
+                if prep.semantic_coverage_for_render is not None:
+                    coverage, _ = render_plan_frame_mask_source(
+                        mask=prep.semantic_coverage_for_render,
+                        plan=plan, idx=int(idx), need_canvas=False,
+                    )
+                    full = np.logical_and(full, coverage)
+                value = bool(np.any(full))
+            else:
+                value = bool(fast["full"])
+            foregrounds[(plan.tag, int(idx), "full", 0)] = value
+    return foregrounds
+
+
 def classify_original_foregrounds_for_volume(
     prep: PreparedVolume,
     *,
@@ -3673,10 +3770,43 @@ def classify_original_foregrounds_for_volume(
     foregrounds: Dict[Tuple[str, int, str, int], bool] = {}
     if not prep.label_enabled:
         return foregrounds
+    # The source can be annotated but entirely background. Check the resident
+    # mask once before scheduling potentially hundreds of thousands of view
+    # projections. Foreground and coverage are checked independently: their
+    # source-space intersection can be empty even when tilted categorical
+    # projections overlap after each plane is rendered separately.
+    coverage_volume = prep.semantic_coverage_for_render if prep.semantic_foreground else None
+    all_empty = not bool(np.any(prep.mask_for_render))
+    if not all_empty and coverage_volume is not None:
+        all_empty = not bool(np.any(coverage_volume))
     jobs = list(iter_render_source_frame_jobs_round_robin(prep.plans))
     if not jobs:
         return foregrounds
+    if all_empty:
+        for plan_index, idx in jobs:
+            plan = prep.plans[int(plan_index)]
+            foregrounds[(plan.tag, int(idx), "full", 0)] = False
+            for tile in plan.tile_layout:
+                foregrounds[(plan.tag, int(idx), tile.tile_tag, 0)] = False
+        if warnings is not None:
+            warnings.add(
+                "all_empty_mask_classification",
+                f"{prep.src.stem}: {len(jobs)} source-frame job(s) classified background "
+                "without view projection",
+            )
+        print(
+            f"{prep.src.stem}: semantic classification all-empty shortcut: "
+            f"source_frame_jobs={len(jobs)}, native_planes=0, sample_queries=0",
+            flush=True,
+        )
+        return foregrounds
     merge_lock = threading.Lock()
+    execution_counts: Dict[str, Counter[str]] = defaultdict(Counter)
+    semantic_fast_enabled = bool(
+        prep.semantic_foreground
+        and os.environ.get("YOLO_TTA_PTA_SEMANTIC_CLASSIFICATION", "1").strip().lower()
+        not in {"0", "false", "no", "off", "disabled"}
+    )
 
     geometry_jobs: List[Tuple[int, int]] = []
     dense_jobs: List[Tuple[int, int]] = []
@@ -3687,6 +3817,7 @@ def classify_original_foregrounds_for_volume(
         prep.src.label_source == "yolo"
         and bool(prep.src.yolo_polygons_by_frame or prep.src.labels_by_frame)
         and not prep.smoothing_stats
+        and not prep.semantic_foreground
     )
     if prep.src.label_source == "yolo" and prep.smoothing_stats and warnings is not None:
         warnings.add(
@@ -3699,6 +3830,32 @@ def classify_original_foregrounds_for_volume(
             geometry_jobs.append((int(plan_idx), int(idx)))
         else:
             dense_jobs.append((int(plan_idx), int(idx)))
+
+    # Foreground decisions are keyed by plan/frame, so classification has no
+    # ordering dependency. Group consecutive frames from one plan to reuse
+    # its native-view geometry and bounded coordinate caches.
+    dense_jobs.sort(key=lambda job: (int(job[0]), int(job[1])))
+    planned_counts: Dict[str, Counter[str]] = defaultdict(Counter)
+    for plan_idx, _idx in dense_jobs:
+        plan = prep.plans[int(plan_idx)]
+        counts = planned_counts[str(plan.view.family)]
+        counts["jobs"] += 1
+        counts["queries"] += 1 + len(plan.tile_layout)
+    if prep.semantic_foreground:
+        print(
+            f"{prep.src.stem}: semantic foreground classification plan: "
+            f"{len(dense_jobs)} plan/frame job(s), "
+            f"{sum(counts['queries'] for counts in planned_counts.values())} "
+            "full/tile query decision(s), plan-major scheduling",
+            flush=True,
+        )
+        for family in sorted(planned_counts):
+            counts = planned_counts[family]
+            print(
+                f"  {family}: planned_jobs={counts['jobs']}, "
+                f"planned_queries={counts['queries']}",
+                flush=True,
+            )
 
     xy_halo = sum(
         float(math.ceil(4.0 * max(0.0, float(stats.get("sigma", 0.0)))))
@@ -3725,15 +3882,63 @@ def classify_original_foregrounds_for_volume(
     def _classify_frame(job_idx: int) -> None:
         plan_idx, idx = dense_jobs[int(job_idx)]
         plan = prep.plans[int(plan_idx)]
+        family = str(plan.view.family)
+        if semantic_fast_enabled:
+            native_metrics: Dict[str, int] = {}
+            fast = classify_semantic_plan_frame(
+                prep.mask_for_render,
+                prep.semantic_coverage_for_render,
+                plan,
+                int(idx),
+                metrics=native_metrics,
+            )
+            if fast is not None:
+                expected_keys = {"full", *(str(tile.tile_tag) for tile in plan.tile_layout)}
+                if set(fast) != expected_keys:
+                    raise RuntimeError(
+                        f"Semantic classifier returned {sorted(fast)} for {plan.tag}; "
+                        f"expected {sorted(expected_keys)}"
+                    )
+                local_fast = {
+                    (plan.tag, int(idx), str(item_key), 0): bool(value)
+                    for item_key, value in fast.items()
+                }
+                with merge_lock:
+                    foregrounds.update(local_fast)
+                    counts = execution_counts[family]
+                    counts["fast_jobs"] += 1
+                    counts["native_planes"] += int(native_metrics.get("native_planes", 0))
+                    counts["sample_queries"] += len(fast)
+                return
         canvas_tiles = tuple(tile for tile in plan.tile_layout if tile.shared_job is None)
-        mask_full, mask_canvas = render_plan_frame_mask_source(
-            mask=prep.mask_for_render,
-            plan=plan,
-            idx=int(idx),
-            need_canvas=bool(canvas_tiles),
+        canvas_same_as_full = bool(
+            canvas_tiles
+            and int(plan.aff.out_w) == int(plan.aff.canvas_w)
+            and int(plan.aff.out_h) == int(plan.aff.canvas_h)
+            and np.array_equal(plan.aff.M_out_to_src, plan.aff.M_canvas_to_src)
         )
+        mask_full, mask_canvas = render_plan_frame_mask_source(
+            mask=prep.mask_for_render, plan=plan, idx=int(idx),
+            need_canvas=bool(canvas_tiles) and not canvas_same_as_full,
+        )
+        if canvas_same_as_full:
+            mask_canvas = mask_full
+        coverage_full: Optional[np.ndarray] = None
+        coverage_canvas: Optional[np.ndarray] = None
+        if prep.semantic_foreground and prep.semantic_coverage_for_render is not None:
+            coverage_full, coverage_canvas = render_plan_frame_mask_source(
+                mask=prep.semantic_coverage_for_render,
+                plan=plan,
+                idx=int(idx),
+                need_canvas=bool(canvas_tiles) and not canvas_same_as_full,
+            )
+            if canvas_same_as_full:
+                coverage_canvas = coverage_full
         local: Dict[Tuple[str, int, str, int], bool] = {
-            (plan.tag, int(idx), "full", 0): bool(mask_has_yolo_polygon(mask_full)),
+            (plan.tag, int(idx), "full", 0): bool(
+                np.any(mask_full if coverage_full is None else np.logical_and(mask_full, coverage_full))
+                if prep.semantic_foreground else mask_has_yolo_polygon(mask_full)
+            ),
         }
         if plan.tile_layout:
             for tile in plan.tile_layout:
@@ -3751,9 +3956,28 @@ def classify_original_foregrounds_for_volume(
                         )
                     tile_mask = extract_padded_tile(mask_canvas, tile.x, tile.y, tile.cfg.tile_size)
                     tile_mask_out = resize_centered(tile_mask, tile.out_w, tile.out_h, cv2.INTER_NEAREST)
-                local[(plan.tag, int(idx), tile.tile_tag, 0)] = bool(mask_has_yolo_polygon(tile_mask_out))
+                if prep.semantic_foreground and prep.semantic_coverage_for_render is not None:
+                    if tile.shared_job is not None and plan.view.shared_view is not None:
+                        tile_coverage = shared_geometry.render_categorical_dense_tile_for_job(
+                            prep.semantic_coverage_for_render, plan.view.shared_view,
+                            tile.shared_job, int(idx),
+                        )
+                    else:
+                        if coverage_canvas is None:
+                            raise RuntimeError(f"Tile coverage requested without canvas for {plan.tag}")
+                        tile_coverage = resize_centered(
+                            extract_padded_tile(coverage_canvas, tile.x, tile.y, tile.cfg.tile_size),
+                            tile.out_w, tile.out_h, cv2.INTER_NEAREST,
+                        )
+                    tile_mask_out = np.logical_and(tile_mask_out, tile_coverage)
+                local[(plan.tag, int(idx), tile.tile_tag, 0)] = bool(
+                    np.any(tile_mask_out) if prep.semantic_foreground else mask_has_yolo_polygon(tile_mask_out)
+                )
         with merge_lock:
             foregrounds.update(local)
+            counts = execution_counts[family]
+            counts["fallback_jobs"] += 1
+            counts["fallback_queries"] += len(local)
 
     parallel_for_indices(
         len(dense_jobs),
@@ -3761,6 +3985,18 @@ def classify_original_foregrounds_for_volume(
         workers=max(1, int(workers)),
         desc=f"Classifying original frames/tiles {prep.src.stem}",
     )
+    if prep.semantic_foreground:
+        for family in sorted(execution_counts):
+            counts = execution_counts[family]
+            message = (
+                f"{prep.src.stem}: family={family}, fast_jobs={counts['fast_jobs']}, "
+                f"fallback_jobs={counts['fallback_jobs']}, native_planes={counts['native_planes']}, "
+                f"sample_queries={counts['sample_queries']}, "
+                f"fallback_queries={counts['fallback_queries']}"
+            )
+            print("PTA semantic classification: " + message, flush=True)
+            if warnings is not None:
+                warnings.add("semantic_classification_execution", message)
     return foregrounds
 
 
@@ -3923,6 +4159,7 @@ def trim_background_overage_after_flips(
     images_selected: bool = True,
     labels_selected: bool = True,
     binary_selected: bool = False,
+    semantic_selected: bool = False,
 ) -> int:
     """Re-tighten the per-subset background cap after render-time flips.
 
@@ -3990,6 +4227,10 @@ def trim_background_overage_after_flips(
                 binary_path = candidate_binary_output_path(out_dir, cand, split_active=split_active)
                 _validate_nonempty_regular_file(binary_path, context="background-overage trim expected binary mask")
                 binary_path.unlink()
+            if bool(semantic_selected) and cand.label_enabled:
+                semantic_path = candidate_semantic_output_path(out_dir, cand, split_active=split_active)
+                _validate_nonempty_regular_file(semantic_path, context="background-overage trim expected semantic mask")
+                semantic_path.unlink()
             cand.keep = False
             if int(cand.augmentation_index) == 0:
                 deleted_original += 1
@@ -4015,6 +4256,7 @@ def trim_background_overage_after_flips(
 _GENERATED_OUTPUT_DIR_NAMES = (
     "images",
     "labels",
+    "masks",
     "binary_masks",
     "binary_videos",
     "overlays",
@@ -4227,25 +4469,35 @@ def create_output_dirs(
     labels_available: bool,
     publish_images: bool = True,
     publish_labels: bool = True,
+    publish_semantic: bool = False,
 ) -> None:
     if split_active:
         if publish_images:
             (out_dir / "images" / "train").mkdir(parents=True, exist_ok=True)
         if labels_available and publish_labels:
             (out_dir / "labels" / "train").mkdir(parents=True, exist_ok=True)
+        if labels_available and publish_semantic:
+            (out_dir / "masks" / "train").mkdir(parents=True, exist_ok=True)
         if train_split is None or float(train_split) < 1.0:
             if publish_images:
                 (out_dir / "images" / "val").mkdir(parents=True, exist_ok=True)
             if labels_available and publish_labels:
                 (out_dir / "labels" / "val").mkdir(parents=True, exist_ok=True)
+            if labels_available and publish_semantic:
+                (out_dir / "masks" / "val").mkdir(parents=True, exist_ok=True)
     else:
         if publish_images:
             (out_dir / "images").mkdir(parents=True, exist_ok=True)
         if labels_available and publish_labels:
             (out_dir / "labels").mkdir(parents=True, exist_ok=True)
+        if labels_available and publish_semantic:
+            (out_dir / "masks").mkdir(parents=True, exist_ok=True)
 
 
-def write_dataset_yaml(out_dir: Path, *, train_split: float, channels: int) -> Path:
+def write_dataset_yaml(
+    out_dir: Path, *, train_split: float, channels: int,
+    task: str = "segment", semantic_masks: bool = False,
+) -> Path:
     channel_count = int(channels)
     if channel_count < 1:
         raise ValueError(f"Dataset channel count must be positive, got {channels}")
@@ -4261,11 +4513,13 @@ def write_dataset_yaml(out_dir: Path, *, train_split: float, channels: int) -> P
         # 100%-train smoke-test case rather than referencing a nonexistent or
         # empty validation directory.
         lines.append("val: images/train")
+    if task == "semantic" and semantic_masks:
+        lines.append("masks_dir: masks")
     lines.extend([
         f"channels: {channel_count}",
         "nc: 1",
         "names:",
-        "  0: object",
+        "  0: '0'" if task == "semantic" else "  0: object",
     ])
     path = out_dir / "dataset.yaml"
     path.write_text("\n".join(lines) + "\n")
@@ -4380,7 +4634,7 @@ def write_pta_summary(
     lines.append("  - Within each subset, every unique-source (original) background is admitted up to the full B_max before any augmented duplicate; remaining capacity is filled breadth-first across source identities.")
     lines.append("  - --background_percent is enforced per volume as a maximum; no dataset-wide classification barrier exists and outputs stream from the first volume onward.")
     lines.append("  - Complete labeled volumes preserve at least the input count of foreground transverse slices through smoothing/cubic resize; --background_percent continues to govern background retention without a C1 override.")
-    lines.append("  - Foreground classification runs on copy-0 originals only. Transverse YOLO candidates use predecoded polygon/ROI geometry; NRRD and general resliced views retain mask-only rendering. Offline augmented copies inherit their source class for budgeting.")
+    lines.append("  - When required for filtering or offline copies, foreground classification runs on copy-0 originals only. Semantic publication with unrestricted background retention and no offline copies skips that classification. Transverse YOLO candidates otherwise use predecoded polygon/ROI geometry; NRRD and general resliced views retain mask-only rendering.")
     lines.append("  - Source-frame scheduling is grouped and deterministic, while built-in view, affine, tile, and categorical rendering are delegated to the shared TTA geometry module.")
     lines.append("  - CPU policies use the persistent CPU pool. A build_gpu_augmentation policy uses one persistent process per selected CUDA GPU; tile resize and deterministic replay batches execute on that GPU, while fused geometry/pointwise behavior is owned by the external policy.")
     lines.append("  - JPEG GPU-policy outputs are batch encoded directly from CUDA tensors through nvImageCodec/nvJPEG when requested and available; explicit nvjpeg is fail-fast while auto records any OpenCV fallback.")
@@ -4419,8 +4673,24 @@ def write_pta_summary(
         lines.append("    foreground_transverse_preservation:")
         lines.append(f"      input_foreground_slices: {int(rec.foreground_preservation_stats.get('input_foreground_transverse_slices', 0))}")
         lines.append(f"      guaranteed_after_preprocessing: {int(rec.foreground_preservation_stats.get('guaranteed_output_foreground_transverse_slices', 0))}")
-        lines.append(f"      classified_output_slices: {int(rec.foreground_preservation_stats.get('classified_output_foreground_transverse_slices', 0))}")
-        lines.append(f"      retained_output_slices: {int(rec.foreground_preservation_stats.get('retained_output_foreground_transverse_slices', 0))}")
+        if int(rec.foreground_preservation_stats.get("classification_skipped", 0)):
+            if int(rec.foreground_preservation_stats.get("full_transverse_verified", 0)):
+                lines.append(
+                    "      classified_output_slices: "
+                    f"{int(rec.foreground_preservation_stats.get('classified_output_foreground_transverse_slices', 0))} "
+                    "(full Transverse only)"
+                )
+                lines.append(
+                    "      retained_output_slices: "
+                    f"{int(rec.foreground_preservation_stats.get('retained_output_foreground_transverse_slices', 0))} "
+                    "(full Transverse only)"
+                )
+            else:
+                lines.append("      classified_output_slices: not measured (all candidates retained)")
+                lines.append("      retained_output_slices: not measured (all candidates retained)")
+        else:
+            lines.append(f"      classified_output_slices: {int(rec.foreground_preservation_stats.get('classified_output_foreground_transverse_slices', 0))}")
+            lines.append(f"      retained_output_slices: {int(rec.foreground_preservation_stats.get('retained_output_foreground_transverse_slices', 0))}")
         lines.append(f"      source_polygon_anchor_seeds: {int(rec.foreground_preservation_stats.get('source_polygon_anchor_seeds', 0))}")
         lines.append(f"      smoothing_anchor_repairs: {int(rec.foreground_preservation_stats.get('smoothing_anchor_repairs', 0))}")
         lines.append(f"      processed_anchor_repairs: {int(rec.foreground_preservation_stats.get('processed_anchor_repairs', 0))}")
@@ -4902,6 +5172,7 @@ def main(
         labels_available=bool(labels_available),
         publish_images=bool(getattr(args, "save_images", True)),
         publish_labels=bool(getattr(args, "save_labels", True)),
+        publish_semantic=bool(getattr(args, "save_semantic", False)),
     )
     deferred_policy_path: Optional[Path] = None
     if augmentation_definition is not None and str(args.augmentation_execution) == "deferred":
@@ -4933,6 +5204,7 @@ def main(
     dataset_publication_selected = bool(
         getattr(args, "save_images", True) or getattr(args, "save_labels", True)
         or getattr(args, "save_binary", False)
+        or getattr(args, "save_semantic", False)
     )
     total_background_stats = BackgroundFilterStats(
         active=background_filter_requested,
@@ -4995,6 +5267,7 @@ def main(
             save_images=bool(getattr(args, "save_images", True)),
             save_labels=bool(getattr(args, "save_labels", True)),
             save_binary=bool(getattr(args, "save_binary", False)),
+            save_semantic=bool(getattr(args, "save_semantic", False)),
         )
         render_pool = PersistentRenderPool(
             backend=render_backend,
@@ -5061,6 +5334,7 @@ def main(
                 prep_obj.src.volume_block = None
                 prep_obj.volume_for_render = np.empty((0,), dtype=np.uint8)
                 prep_obj.mask_for_render = np.empty((0,), dtype=np.uint8)
+                prep_obj.semantic_coverage_for_render = None
                 prep_obj.shm_blocks = []
 
             gen = state.get("gen")
@@ -5120,12 +5394,34 @@ def main(
             )
 
             foregrounds: Optional[Dict[Tuple[str, int, str, int], bool]] = None
+            semantic_classification_skipped = bool(
+                prep.label_enabled
+                and str(getattr(args, "task", "segment")) == "semantic"
+                and bool(getattr(args, "save_semantic", False))
+                and not background_filter_requested
+                and not (
+                    str(args.augmentation_execution) == "offline"
+                    and float(args.augmentation_ratio) > 1.0
+                )
+            )
+            semantic_transverse_verified = False
             if dataset_publication_selected:
                 # Partial volumes are always classified on their eligible
                 # annotated centers so annotated foreground/background remains
                 # distinct even when --background_percent=1.0. Offline copies
                 # also need source truth when the background cap is unrestricted.
-                if prep.label_enabled and (
+                if semantic_classification_skipped:
+                    prep.foreground_preservation_stats["classification_skipped"] = 1
+                    foregrounds = classify_semantic_full_transverse_for_preservation(prep)
+                    semantic_transverse_verified = bool(foregrounds)
+                    if semantic_transverse_verified:
+                        prep.foreground_preservation_stats["full_transverse_verified"] = 1
+                    vol_warnings.add(
+                        "semantic_foreground_classification_skipped",
+                        f"{prep.src.stem}: --background_percent=1 and no offline copies; "
+                        "foreground/background candidate counts are not measured",
+                    )
+                elif prep.label_enabled and (
                     background_filter_requested
                     or prep.src.volume_class == "partially_labeled"
                     or (
@@ -5139,11 +5435,12 @@ def main(
                         warnings=vol_warnings,
                     )
                 cands = enumerate_candidates_for_volume(prep, foregrounds)
-                validate_foreground_transverse_candidate_invariant(
-                    prep,
-                    cands,
-                    retained_only=False,
-                )
+                if not semantic_classification_skipped or semantic_transverse_verified:
+                    validate_foreground_transverse_candidate_invariant(
+                        prep,
+                        cands,
+                        retained_only=False,
+                    )
             else:
                 # Diagnostics/manifests do not require dataset candidate
                 # classification or augmentation planning work.
@@ -5200,11 +5497,23 @@ def main(
                 labels_available=bool(labels_available),
                 warnings=vol_warnings,
             )
+            if semantic_classification_skipped:
+                # Candidate foreground defaults are placeholders when no
+                # filter/replay needs their class. Do not report those defaults
+                # as measured foreground/background counts.
+                vol_background_stats.foreground_before = 0
+                vol_background_stats.background_before = 0
+                vol_background_stats.background_retained = 0
+                vol_background_stats.skipped_reason = (
+                    "--background_percent is 1.0; semantic candidate classes were not measured"
+                )
             # Diagnostics-only runs intentionally skip dataset candidate
             # enumeration, leaving ``physical`` empty even when the source has
             # foreground.  The retained-candidate invariant applies only when
             # images or labels were selected for publication.
-            if dataset_publication_selected:
+            if dataset_publication_selected and (
+                not semantic_classification_skipped or semantic_transverse_verified
+            ):
                 validate_foreground_transverse_candidate_invariant(
                     prep,
                     physical,
@@ -5261,7 +5570,8 @@ def main(
             volume_publication_selected = bool(
                 bool(getattr(args, "save_images", True))
                 or (
-                    (bool(getattr(args, "save_labels", True)) or bool(getattr(args, "save_binary", False)))
+                    (bool(getattr(args, "save_labels", True)) or bool(getattr(args, "save_binary", False))
+                     or bool(getattr(args, "save_semantic", False)))
                     and bool(prep.label_enabled)
                 )
             )
@@ -5316,6 +5626,8 @@ def main(
                 publication_kinds.append("labels")
             if bool(getattr(args, "save_binary", False)) and bool(prep.label_enabled):
                 publication_kinds.append("binary")
+            if bool(getattr(args, "save_semantic", False)) and bool(prep.label_enabled):
+                publication_kinds.append("semantic")
             progress.pbar = tqdm(
                 total=len(retained),
                 desc=f"Rendering retained {'/'.join(publication_kinds)} {prep.src.stem}",
@@ -5362,6 +5674,7 @@ def main(
                 images_selected=bool(getattr(args, "save_images", True)),
                 labels_selected=bool(getattr(args, "save_labels", True)),
                 binary_selected=bool(getattr(args, "save_binary", False)),
+                semantic_selected=bool(getattr(args, "save_semantic", False)),
             )
             if trimmed:
                 print(f"{spec.stem}: trimmed {trimmed} written background(s) to honor the realized --background_percent cap after flips")
@@ -5531,13 +5844,19 @@ def main(
     if (
         split_active
         and bool(getattr(args, "save_images", True))
-        and bool(getattr(args, "save_labels", True))
+        and bool(
+            (getattr(args, "save_semantic", False) or getattr(args, "save_labels", True))
+            if getattr(args, "task", "segment") == "semantic"
+            else getattr(args, "save_labels", True)
+        )
     ):
         assert train_split is not None and dataset_channels is not None
         dataset_yaml_path = write_dataset_yaml(
             out_dir,
             train_split=float(train_split),
             channels=int(dataset_channels),
+            task=str(getattr(args, "task", "segment")),
+            semantic_masks=bool(getattr(args, "save_semantic", False)),
         )
 
     publication_integrity: Dict[str, object] = {
@@ -5631,6 +5950,7 @@ def main(
         dataset_yaml_path=dataset_yaml_path,
         publication_integrity=publication_integrity,
         binary_publication=binary_publication,
+        categorical_dispatch_counts=warnings.counts,
     )
 
     print("\nDone.")

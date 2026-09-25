@@ -372,6 +372,57 @@ def apply_augmentation_pair(
     return out_image, out_mask
 
 
+def apply_augmentation_pair_with_coverage(
+    augmentation: LoadedAugmentation,
+    image: np.ndarray,
+    mask: np.ndarray,
+    coverage: np.ndarray,
+    *,
+    seed: int,
+    context: str,
+    copy_inputs: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Apply one sampled transform to foreground and annotation coverage.
+
+    Albumentations' ``masks`` target follows the same sampled geometry as
+    ``mask``. A second seeded call is insufficient for mask-dependent crops.
+    """
+    pipeline = augmentation.pipeline_for_current_thread()
+    image_in = np.ascontiguousarray(np.asarray(image).copy()) if copy_inputs else np.asarray(image)
+    mask_in = np.ascontiguousarray(np.asarray(mask).copy()) if copy_inputs else np.asarray(mask)
+    coverage_in = np.ascontiguousarray(np.asarray(coverage).copy()) if copy_inputs else np.asarray(coverage)
+    try:
+        pipeline.set_random_seed(int(seed))
+        result = pipeline(image=image_in, mask=mask_in, masks=[coverage_in])
+    except Exception as exc:
+        raise RuntimeError(
+            f"{context}: augmentation failed using {augmentation.path} with seed={int(seed)}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(result, Mapping) or "image" not in result or "mask" not in result or "masks" not in result:
+        raise ValueError(f"{context}: augmented image, mask, and masks coverage outputs are required")
+    output_masks = result["masks"]
+    if len(output_masks) != 1:
+        raise ValueError(f"{context}: expected one augmented coverage mask, got {len(output_masks)}")
+    out_image = _augmented_image_to_uint8(result["image"], context=context)
+    out_mask = _augmented_mask_to_binary(result["mask"], context=context)
+    out_coverage = _augmented_mask_to_binary(output_masks[0], context=context + "/coverage")
+    input_channels = 1 if image_in.ndim == 2 else int(image_in.shape[2])
+    output_channels = 1 if out_image.ndim == 2 else int(out_image.shape[2])
+    if input_channels != output_channels:
+        raise ValueError(f"{context}: augmentation changed image channel count from {input_channels} to {output_channels}")
+    if image_in.ndim == 2 and out_image.ndim == 3 and int(out_image.shape[2]) == 1:
+        out_image = np.ascontiguousarray(out_image[:, :, 0])
+    elif image_in.ndim == 3 and int(image_in.shape[2]) == 1 and out_image.ndim == 2:
+        out_image = np.ascontiguousarray(out_image[:, :, None])
+    if out_mask.shape != out_coverage.shape or out_image.shape[:2] != out_mask.shape:
+        raise ValueError(
+            f"{context}: augmented image/mask/coverage dimensions differ: "
+            f"{out_image.shape}, {out_mask.shape}, {out_coverage.shape}"
+        )
+    return out_image, out_mask, out_coverage
+
+
 def assert_augmentation_did_not_synthesize_mask(
     original_mask: np.ndarray,
     augmented_mask: np.ndarray,
@@ -402,6 +453,7 @@ __all__ = (
     "_augmented_mask_to_binary",
     "_load_external_python_module",
     "apply_augmentation_pair",
+    "apply_augmentation_pair_with_coverage",
     "assert_augmentation_definition_unchanged",
     "assert_augmentation_did_not_synthesize_mask",
     "inspect_augmentation_definition",

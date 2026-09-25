@@ -33,6 +33,7 @@ from typing import (
 )
 import numpy as np
 from ._deps import cv2, ndi
+from .semantic_inference import semantic_foreground_probability
 
 # Explicit lower-layer dependencies keep imports one-way.
 from .config import (
@@ -482,6 +483,7 @@ class PredictConfig:
     batch: int = 1
     input_channels: int = 1
     channel_token: str = 'gray'
+    task: str = 'segment'
 
 def async_predict_postprocess_enabled() -> bool:
     """Return True when angle-variant prediction CPU tails may run behind the GPU."""
@@ -598,6 +600,7 @@ class GpuFlattenedRetinaPayload:
     min_conf_applied: bool = False
     run_gpu_cleanup: bool = False
     gpu_min_radius: float = 0.0
+    semantic_min_conf_u8: int = 0
     cleanup_done_on_gpu: bool = False
     # CUDA event recorded on the producing stream after union/conf were computed,
     # so the postprocess side stream can order against the producer without a host sync.
@@ -2567,6 +2570,18 @@ def _process_gpu_flattened_prediction_frame(
                     torch.zeros((), dtype=native_conf_f.dtype, device=native_conf_f.device),
                 ).clamp(0.0, 255.0).to(torch.uint8)
 
+            if int(payload.semantic_min_conf_u8) > 0:
+                from .semantic_cuda import filter_semantic_components_cuda
+                if native_conf_t is None:
+                    raise RuntimeError('Semantic component filtering requires a confidence plane')
+                native_mask_t, native_conf_t = filter_semantic_components_cuda(
+                    native_union_bool_t.to(torch.uint8), native_conf_t,
+                    int(payload.semantic_min_conf_u8), stream=side_stream,
+                )
+                native_union_bool_t = native_mask_t > 0
+                payload.instance_count_device = native_union_bool_t.any().to(torch.int32).reshape(1)
+                cleaned_on_gpu = True
+
             # with a per-task device union, the warped plane stays ON DEVICE —
             # no per-frame D2H, no host |=; the task-end flush does one chunked transfer.
             # Frames that still need the cupy --min_radius cleanup (which lands on host) fall
@@ -2580,7 +2595,7 @@ def _process_gpu_flattened_prediction_frame(
                     producer_stream=side_stream,
                 )
                 payload.accumulated_on_device = True
-                payload.cleanup_done_on_gpu = False
+                payload.cleanup_done_on_gpu = bool(cleaned_on_gpu)
                 # frames_with_predictions: reported from the pre-warp instance count (checking
                 # post-warp emptiness would force a device sync per frame; the stat is
                 # informational only).
@@ -3543,6 +3558,63 @@ class _DirectPredictResult:
     def __init__(self, payload: GpuFlattenedRetinaPayload) -> None:
         self._tta_gpu_flattened_payload = payload
 
+
+def _semantic_predict_stream(
+    predictor: object, source: object, cfg: 'PredictConfig', source_label: str,
+) -> Iterator[_DirectPredictResult]:
+    """Run the semantic backend before Ultralytics converts logits to class IDs."""
+    import torch  # type: ignore
+
+    backend = getattr(predictor, 'model', None)
+    if backend is None:
+        raise RuntimeError(f'{source_label}: semantic predictor has no backend')
+    start = getattr(source, 'start', None)
+    if callable(start):
+        start()
+    with torch.inference_mode():
+        for _paths, images, _info in iter(source):
+            model_input = predictor.preprocess(images)
+            probability = semantic_foreground_probability(
+                backend(model_input), output_size=int(model_input.shape[-1]),
+            )
+            if int(probability.shape[0]) != len(images):
+                raise RuntimeError(
+                    f'{source_label}: semantic output batch {int(probability.shape[0])} '
+                    f'does not match input batch {len(images)}'
+                )
+            threshold = float(cfg.conf)
+            for frame_probability in probability:
+                foreground = (frame_probability >= threshold).to(torch.float32)
+                # Keep empty-frame accounting on the device. The existing device
+                # union retirement sums these scalars once per task; host fallback
+                # reads one only when it already transfers that frame's mask.
+                foreground_count = foreground.any().to(torch.int32).reshape(1)
+                ready_event = None
+                if foreground.is_cuda:
+                    ready_event = torch.cuda.Event()
+                    ready_event.record(torch.cuda.current_stream(foreground.device))
+                yield _DirectPredictResult(GpuFlattenedRetinaPayload(
+                    union_gpu=foreground,
+                    conf_gpu=frame_probability,
+                    instance_count=0,
+                    instance_count_device=foreground_count,
+                    ready_event=ready_event,
+                ))
+
+
+def _semantic_gpu_path_available(cfg: 'PredictConfig', source: object, min_radius: float) -> bool:
+    """Admit exact native GPU filtering before a task chooses device accumulation."""
+    if (
+        str(cfg.task) != 'semantic'
+        or not _env_flag('YOLO_TTA_SEMANTIC_GPU_CLEANUP', True)
+        or float(min_radius) > 0.0
+        or int(getattr(source, 'azimuthal_padding_count', 0) or 0) > 0
+        or not canonical_single_device(str(cfg.device)).startswith('cuda')
+    ):
+        return False
+    from .semantic_cuda import semantic_cuda_available
+    return bool(semantic_cuda_available(canonical_single_device(str(cfg.device))))
+
 def _direct_predict_applicable(cfg: 'PredictConfig') -> bool:
     """Direct loop preconditions: proto-union consume path + a CUDA device."""
     if not direct_predict_enabled():
@@ -3572,7 +3644,7 @@ def _ensure_predictor_for_direct_predict(model: object, cfg: 'PredictConfig') ->
         if predictor is None or getattr(predictor, 'model', None) is None:
             _ = model.predict(
                 source=np.zeros((32, 32, max(1, int(cfg.input_channels))), dtype=np.uint8),
-                task='segment',
+                task=str(cfg.task),
                 imgsz=cfg.imgsz,
                 conf=cfg.conf,
                 iou=1.0,
@@ -4083,7 +4155,12 @@ def predict_source_and_accumulate(
         )):
             require_channel_aware_yolo_preprocess_patch(str(cfg.channel_token))
         use_custom_cpu_retina = False
-        if cpu_retina_masks_enabled():
+        semantic_task = str(cfg.task) == 'semantic'
+        if semantic_task:
+            # The stock semantic Results object contains an argmax class map. Keep
+            # the backend logits so --conf and component --min_conf remain meaningful.
+            pass
+        elif cpu_retina_masks_enabled():
             use_custom_cpu_retina = bool(ensure_cpu_retina_mask_predictor_patch())
             if not use_custom_cpu_retina:
                 print('Warning: CPU retina predictor patch unavailable; using Ultralytics native retina_masks=True for this source.')
@@ -4099,14 +4176,19 @@ def predict_source_and_accumulate(
         # to Ultralytics stream_inference when the direct loop's preconditions do not hold.
         results = None
         predictor_direct = None
-        if not use_custom_cpu_retina and _direct_predict_applicable(cfg):
+        if semantic_task:
+            predictor = _ensure_predictor_for_direct_predict(model, cfg)
+            if predictor is None:
+                raise RuntimeError(f'{source_label}: could not initialize semantic backend')
+            results = _semantic_predict_stream(predictor, source, cfg, source_label)
+        elif not use_custom_cpu_retina and _direct_predict_applicable(cfg):
             predictor_direct = _ensure_predictor_for_direct_predict(model, cfg)
             if predictor_direct is not None:
                 results = _direct_predict_stream(predictor_direct, source, cfg, source_label)
         if results is None:
             results = model.predict(
                 source=source,
-                task='segment',
+                task=str(cfg.task),
                 imgsz=cfg.imgsz,
                 conf=cfg.conf,
                 iou=1.0,
@@ -4134,6 +4216,8 @@ def predict_source_and_accumulate(
         stream_min_radius = float(streaming_cleanup_min_radius)
         stream_min_conf_u8 = int(min_conf_to_u8_threshold(stream_min_conf)) if stream_min_conf > 0.0 else 0
 
+        semantic_gpu_path = _semantic_gpu_path_available(cfg, source, stream_min_radius)
+
         # Admit raw device-union accumulation whenever no host-only cleanup must run before
         # union. Every angle-variant task therefore retains its masks on device; only
         # positive per-slice radius cleanup, unsupported confidence cleanup, CPU retina masks,
@@ -4142,13 +4226,13 @@ def predict_source_and_accumulate(
         fastpath = angle_variant_gpu_fastpath()
         preunion_min_conf = (
             float(stream_min_conf)
-            if stream_cleanup and fastpath is not None and stream_min_conf > 0.0
+            if not semantic_task and stream_cleanup and fastpath is not None and stream_min_conf > 0.0
             else None
         )
         host_cleanup_required = bool(
             stream_cleanup
             and (
-                (stream_min_conf > 0.0 and preunion_min_conf is None)
+                (stream_min_conf > 0.0 and preunion_min_conf is None and not semantic_gpu_path)
                 or stream_min_radius > 0.0
             )
         )
@@ -4175,6 +4259,64 @@ def predict_source_and_accumulate(
         # compaction, proto union, and destination warping as one device pipeline. Every
         # full-frame or tile task owns one immutable output-to-destination affine.
         specialized_stats: Optional[Dict[str, int]] = None
+        semantic_ring_stats: Optional[Dict[str, object]] = None
+        if (semantic_task and semantic_gpu_path and device_union is not None
+                and not callable(getattr(source, 'restore_prediction', None))):
+            import torch
+            from .semantic_cuda import semantic_native_cuda
+            from .semantic_trt import SemanticTrtRingConsumedError, try_semantic_trt_ring
+
+            # The accumulator was zeroed on the caller's stream. Private ring
+            # streams must wait before overwriting any of its destination planes.
+            semantic_union_ready = torch.cuda.Event(blocking=False)
+            semantic_union_ready.record(torch.cuda.current_stream(device_union.device))
+            semantic_post_streams_ready: set[int] = set()
+
+            def _decode_semantic_frame(frame_logits, post_stream, **destinations):
+                return semantic_native_cuda(
+                    frame_logits, output_size=int(out_size),
+                    M_out_to_native=M_out_to_native,
+                    native_h=int(native_h), native_w=int(native_w),
+                    conf_threshold=float(cfg.conf),
+                    min_conf_u8=int(stream_min_conf_u8) if stream_cleanup else 0,
+                    stream=post_stream,
+                    **destinations,
+                )
+
+            def _consume_semantic_batch(logits, specs, post_stream):
+                stream_id = int(post_stream.cuda_stream)
+                if stream_id not in semantic_post_streams_ready:
+                    post_stream.wait_event(semantic_union_ready)
+                    semantic_post_streams_ready.add(stream_id)
+                for frame_logits, spec in zip(logits, specs):
+                    if spec is None:
+                        continue
+                    index = int(spec.task_index)
+                    device_union.register_producer_stream(post_stream)
+                    _decode_semantic_frame(
+                        frame_logits, post_stream,
+                        out_mask=device_union.union_dev[index],
+                        out_conf=(device_union.conf_dev[index] if device_union.conf_dev is not None else None),
+                        foreground_count=device_union.prediction_counts_dev[index:index + 1],
+                    )
+                    device_union.written[index] = True
+
+            try:
+                semantic_ring_stats = try_semantic_trt_ring(
+                    predictor, source, cfg, num_frames=int(num_frames), out_size=int(out_size),
+                    consume_batch=_consume_semantic_batch,
+                    preflight_batch=lambda logits, stream: _decode_semantic_frame(logits[0], stream),
+                    preflight_key=(
+                        int(out_size), int(native_h), int(native_w), float(cfg.conf),
+                        int(stream_min_conf_u8) if stream_cleanup else 0,
+                        tuple(float(value) for value in np.asarray(M_out_to_native).reshape(-1)),
+                    ),
+                )
+            except BaseException as exc:
+                if (isinstance(exc, SemanticTrtRingConsumedError)
+                        or bool(getattr(source, '_native_trt_data_consumed', False))):
+                    unwrapped_source._native_trt_data_consumed = True
+                raise
         if predictor_direct is not None:
             specialized_stats = _try_resident_trt_ring_accumulate(
                 predictor_direct, source, cfg,
@@ -4235,6 +4377,9 @@ def predict_source_and_accumulate(
                 # The payload builder sees only the process-global/native radius. Override it
                 # with this source's scaled processing-grid radius before GPU cleanup.
                 masks_obj.gpu_min_radius = float(stream_min_radius)
+                masks_obj.semantic_min_conf_u8 = (
+                    int(stream_min_conf_u8) if semantic_gpu_path and stream_cleanup else 0
+                )
                 masks_obj.run_gpu_cleanup = bool(
                     angle_variant_gpu_fastpath() is not None
                     and gpu_retina_cleanup_enabled()
@@ -4306,7 +4451,7 @@ def predict_source_and_accumulate(
             effective_pending_limit = max(1, min(int(pending_limit), gpu_retina_flatten_pending_limit(worker_count)))
 
         azimuthal_padding_processed = 0
-        if specialized_stats is not None:
+        if specialized_stats is not None or semantic_ring_stats is not None:
             # The resident ring wrote the device union and task metadata directly.
             _claim_specialized_prediction_targets(view_union_mm, device_union, num_frames)
         elif worker_count <= 1:
@@ -4401,6 +4546,7 @@ def predict_source_and_accumulate(
             consumed = dict(device_union_consumer(device_union) or {})
             publication_future = consumed.pop('_publication_future', None)
             return {
+                **(semantic_ring_stats or {}),
                 'prediction_count': int(prediction_count),
                 'frames_with_predictions': int(frames_with_predictions),
                 'device_hole_filled_frames': int(device_hole_filled_frames),
@@ -4452,6 +4598,7 @@ def predict_source_and_accumulate(
                             owned_disjoint_output=bool(owned_disjoint_output),
                         )
                         return {
+                            **(semantic_ring_stats or {}),
                             'prediction_count': int(base_prediction_count + compacted_predictions),
                             'frames_with_predictions': int(base_frames_with_predictions + compacted_frames),
                             'device_hole_filled_frames': int(filled_frames_for_result),
@@ -4498,6 +4645,7 @@ def predict_source_and_accumulate(
                         retirement_manager.release(retirement_lane)
 
         return {
+            **(semantic_ring_stats or {}),
             'prediction_count': int(prediction_count),
             'frames_with_predictions': int(frames_with_predictions),
             'device_hole_filled_frames': int(device_hole_filled_frames),
@@ -4577,7 +4725,10 @@ def predict_source_and_submit_accumulation(
         )):
             require_channel_aware_yolo_preprocess_patch(str(cfg.channel_token))
         use_custom_cpu_retina = False
-        if cpu_retina_masks_enabled():
+        semantic_task = str(cfg.task) == 'semantic'
+        if semantic_task:
+            pass
+        elif cpu_retina_masks_enabled():
             use_custom_cpu_retina = bool(ensure_cpu_retina_mask_predictor_patch())
             if not use_custom_cpu_retina:
                 print('Warning: CPU retina predictor patch unavailable; using Ultralytics native retina_masks=True for this source.')
@@ -4588,14 +4739,19 @@ def predict_source_and_submit_accumulation(
 
         # same direct-loop preference as predict_source_and_accumulate.
         results = None
-        if not use_custom_cpu_retina and _direct_predict_applicable(cfg):
+        if semantic_task:
+            predictor = _ensure_predictor_for_direct_predict(model, cfg)
+            if predictor is None:
+                raise RuntimeError(f'{source_label}: could not initialize semantic backend')
+            results = _semantic_predict_stream(predictor, source, cfg, source_label)
+        elif not use_custom_cpu_retina and _direct_predict_applicable(cfg):
             predictor_direct = _ensure_predictor_for_direct_predict(model, cfg)
             if predictor_direct is not None:
                 results = _direct_predict_stream(predictor_direct, source, cfg, source_label)
         if results is None:
             results = model.predict(
                 source=source,
-                task='segment',
+                task=str(cfg.task),
                 imgsz=cfg.imgsz,
                 conf=cfg.conf,
                 iou=1.0,
@@ -4620,6 +4776,7 @@ def predict_source_and_submit_accumulation(
         stream_min_conf = float(streaming_cleanup_min_conf)
         stream_min_radius = float(streaming_cleanup_min_radius)
         stream_min_conf_u8 = int(min_conf_to_u8_threshold(stream_min_conf)) if stream_min_conf > 0.0 else 0
+        semantic_gpu_path = _semantic_gpu_path_available(cfg, source, stream_min_radius)
 
         source_padding_count = max(0, int(getattr(source, 'azimuthal_padding_count', 0) or 0))
         effective_slice_locks = slice_locks
@@ -4653,6 +4810,9 @@ def predict_source_and_submit_accumulation(
                 slice_lock = effective_slice_locks[lock_index % len(effective_slice_locks)]
             if isinstance(masks_obj, GpuFlattenedRetinaPayload):
                 masks_obj.gpu_min_radius = float(stream_min_radius)
+                masks_obj.semantic_min_conf_u8 = (
+                    int(stream_min_conf_u8) if semantic_gpu_path and stream_cleanup else 0
+                )
                 masks_obj.run_gpu_cleanup = bool(
                     angle_variant_gpu_fastpath() is not None
                     and gpu_retina_cleanup_enabled()

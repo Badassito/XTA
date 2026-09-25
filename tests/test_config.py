@@ -20,6 +20,16 @@ from XTA.config import (
 class ConfigTests(unittest.TestCase):
     REQUIRED = ["--input", "input.mkv", "--model", "gpu:model.engine"]
 
+    def test_semantic_task_and_output_are_independent(self) -> None:
+        parser = build_argparser()
+        self.assertEqual(parser.parse_args(self.REQUIRED).task, "segment")
+        for task in ("segment", "semantic"):
+            args = parser.parse_args([*self.REQUIRED, "--task", task, "--save", "semantic,binary"])
+            self.assertEqual(args.task, task)
+            self.assertEqual(resolve_save_request(args.save).options, ("semantic", "binary"))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args([*self.REQUIRED, "--task", "detect"])
+
     def test_numeric_options_reject_nonfinite_values(self) -> None:
         parser = build_argparser()
         for option in (

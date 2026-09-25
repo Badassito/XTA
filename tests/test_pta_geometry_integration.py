@@ -1037,13 +1037,42 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
                 total_written=2,
             )
             manifest = json.loads(manifest_path.read_text())
+            cuda_manifest_path = pta.write_v18_pta_manifest(
+                Path(temp_dir) / "cuda_manifest.json",
+                args=runtime_options,
+                cli_argv=arguments,
+                specs=(spec,),
+                records=(record,),
+                channel_variants=channel_variants,
+                tile_configs=(pta.TileConfig(4, 2, "s4_st2"),),
+                augmentation_stats=augmentation,
+                total_written=2,
+                categorical_dispatch_counts={"pta_cuda_categorical_items": 2},
+            )
+            cuda_manifest = json.loads(cuda_manifest_path.read_text())
+            mixed_manifest_path = pta.write_v18_pta_manifest(
+                Path(temp_dir) / "mixed_manifest.json",
+                args=runtime_options,
+                cli_argv=arguments,
+                specs=(spec,),
+                records=(record,),
+                channel_variants=channel_variants,
+                tile_configs=(pta.TileConfig(4, 2, "s4_st2"),),
+                augmentation_stats=augmentation,
+                total_written=2,
+                categorical_dispatch_counts={
+                    "pta_cuda_categorical_items": 1,
+                    "pta_cpu_categorical_items": 1,
+                },
+            )
+            mixed_manifest = json.loads(mixed_manifest_path.read_text())
             voxel_path = pta.write_v18_voxel_volume_report(
                 Path(temp_dir) / "voxel_volume.json",
                 (record,),
             )
             voxel = json.loads(voxel_path.read_text())
 
-        self.assertEqual(manifest["pipeline_version"], "22.3.2")
+        self.assertEqual(manifest["pipeline_version"], "23.0.0")
         self.assertEqual(manifest["mode"], "pta")
         self.assertEqual(
             manifest["determinism_contract"],
@@ -1062,6 +1091,25 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             [0.0, 60.0, 120.0],
         )
         self.assertEqual(manifest["forward_sampling"]["geometry_module"], "XTA.geometry")
+        self.assertEqual(
+            [item["backend"] for item in manifest["forward_sampling"]["selected_implementations"]
+             if item["data_role"] == "categorical_ground_truth"],
+            ["cpu"],
+        )
+        self.assertEqual(
+            [item["backend"] for item in cuda_manifest["forward_sampling"]["selected_implementations"]
+             if item["data_role"] == "categorical_ground_truth"],
+            ["cuda"],
+        )
+        self.assertEqual(
+            [item["backend"] for item in mixed_manifest["forward_sampling"]["selected_implementations"]
+             if item["data_role"] == "categorical_ground_truth"],
+            ["cuda", "cpu"],
+        )
+        self.assertEqual(
+            mixed_manifest["forward_sampling"]["categorical_dispatch_items"],
+            {"cuda": 1, "cpu": 1},
+        )
         self.assertEqual(manifest["external_augmentation"]["sha256"], "abc123")
         self.assertTrue(
             manifest["external_augmentation"]["outside_shared_builtin_geometry_guarantee"]
