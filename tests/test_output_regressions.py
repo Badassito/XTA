@@ -228,6 +228,51 @@ class NrrdSinkConstructionTests(unittest.TestCase):
 
 
 class SequencePublicationTests(unittest.TestCase):
+    def test_semantic_png_sequence_writes_class_ids_and_removes_stale_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pattern = root / 'semantic_masks' / 'sample_%04d.png'
+            pattern.parent.mkdir()
+            (pattern.parent / 'sample_0003.png').write_bytes(b'stale')
+            (pattern.parent / 'other_0003.png').write_bytes(b'other')
+            written: dict[str, np.ndarray] = {}
+
+            def imwrite(path: str, frame: np.ndarray) -> bool:
+                written[Path(path).name] = frame.copy()
+                Path(path).write_bytes(b'png')
+                return True
+
+            masks = np.array([[[0, 255], [1, 0]], [[1, 0], [0, 1]]], dtype=np.uint8)
+            with mock.patch.object(outputs, 'parallel_for_indices', side_effect=_serial_indices), mock.patch.object(
+                outputs.cv2, 'imwrite', side_effect=imwrite, create=True,
+            ):
+                outputs.write_semantic_png_sequence_from_pattern(masks, pattern, show_progress=False)
+
+            self.assertEqual(sorted(written), ['sample_0001.png', 'sample_0002.png'])
+            np.testing.assert_array_equal(
+                written['sample_0001.png'], np.array([[0, 1], [1, 0]], dtype=np.uint8),
+            )
+            np.testing.assert_array_equal(written['sample_0002.png'], masks[1])
+            self.assertEqual(written['sample_0001.png'].dtype, np.uint8)
+            self.assertFalse((pattern.parent / 'sample_0003.png').exists())
+            self.assertTrue((pattern.parent / 'other_0003.png').exists())
+
+    def test_semantic_png_failure_preserves_previous_sequence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pattern = root / 'sample_%04d.png'
+            previous = root / 'sample_0001.png'
+            previous.write_bytes(b'previous')
+            with mock.patch.object(outputs, 'parallel_for_indices', side_effect=_serial_indices), mock.patch.object(
+                outputs.cv2, 'imwrite', return_value=False, create=True,
+            ):
+                with self.assertRaisesRegex(RuntimeError, 'Failed to write semantic mask'):
+                    outputs.write_semantic_png_sequence_from_pattern(
+                        np.ones((1, 2, 2), dtype=np.uint8), pattern, show_progress=False,
+                    )
+            self.assertEqual(previous.read_bytes(), b'previous')
+            self.assertEqual(list(root.glob('.sample.frame-generation-*')), [])
+
     @unittest.skipIf(sys.platform.startswith('win'), 'POSIX filenames are case-sensitive')
     def test_cleanup_matches_uppercase_pattern_extension_on_posix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

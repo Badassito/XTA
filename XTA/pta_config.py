@@ -34,6 +34,7 @@ PTA_SAVE_OPTION_TOKENS: Tuple[str, ...] = (
     "images",
     "labels",
     "binary",
+    "semantic",
     "nrrd",
     "overlay",
     "voxel_volume",
@@ -290,6 +291,10 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         help="Apply PTA full-volume eligibility rules to partial inputs",
     )
     parser.add_argument(
+        "--task", default="segment", choices=("segment", "semantic"),
+        help="YOLO segmentation task used for dataset publication",
+    )
+    parser.add_argument(
         "--preprocessing",
         nargs="+",
         default=None,
@@ -305,7 +310,8 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         default=None,
         metavar="OUTPUT",
         help=(
-            "PTA outputs: images, labels, binary (mask TIFFs and lossless MKVs), "
+            "PTA outputs: images, labels, semantic (class-index PNG masks), "
+            "binary (mask TIFFs and lossless MKVs), "
             "nrrd, overlay, voxel_volume, summary. "
             "The normal dataset publication is --save images labels"
         ),

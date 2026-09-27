@@ -15,10 +15,11 @@ import os
 import pickle
 import queue
 import threading
+import time
 from collections import Counter, defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
 
@@ -50,11 +51,15 @@ from .pta_publication import (
     _publish_nvjpeg_batch_atomically,
     _write_nvjpeg_batch_atomically,
     candidate_output_paths,
+    candidate_semantic_output_path,
     ensure_output_parent_once,
     mask_to_yolo_lines,
     parse_output_image_format,
+    publish_semantic_mask_payloads,
     write_image,
     write_selected_candidate_version,
+    write_semantic_index_mask,
+    write_semantic_mask,
     write_yolo_lines,
 )
 from .pta_rendering import (
@@ -91,8 +96,10 @@ class PreparedRenderVolume(Protocol):
     plans: Sequence[RenderPlan]
     volume_for_render: np.ndarray
     mask_for_render: np.ndarray
+    semantic_coverage_for_render: Optional[np.ndarray]
     volume_render_block: Optional["SharedBlock"]
     mask_render_block: Optional["SharedBlock"]
+    semantic_coverage_render_block: Optional["SharedBlock"]
 
 
 _WARNING_EXAMPLE_LIMIT = 12
@@ -290,6 +297,10 @@ def _render_worker_initializer(
     global _WORKER_GPU_CODEC_WARNING_EMITTED, _WORKER_GPU_BATCH_CAP_WARNING_EMITTED
     if worker_static_payload is not None:
         _initialize_spawned_worker_static_context(worker_static_payload)
+    if _WORKER_GPU_RUNTIME is not None and _WORKER_GPU_RUNTIME.get("categorical_volume_owner") is not None:
+        from .pta_cuda_masks import retire_gpu_categorical_volume
+
+        retire_gpu_categorical_volume(_WORKER_GPU_RUNTIME)
     _WORKER_GPU_DEVICE_ID = None
     _WORKER_GPU_RUNTIME = None
     _WORKER_GPU_CODEC_WARNING_EMITTED = False
@@ -356,6 +367,7 @@ def set_worker_static_context(
     save_images: bool = True,
     save_labels: bool = True,
     save_binary: bool = False,
+    save_semantic: bool = False,
     tiff_encode_backend: str = "auto",
 ) -> None:
     """Install run-constant worker state.  Must run before the pool is created."""
@@ -375,6 +387,7 @@ def set_worker_static_context(
         "save_images": bool(save_images),
         "save_labels": bool(save_labels),
         "save_binary": bool(save_binary),
+        "save_semantic": bool(save_semantic),
     })
 
 
@@ -425,6 +438,7 @@ def _spawn_worker_static_payload() -> Dict[str, object]:
         "save_images": bool(_WORKER_STATIC.get("save_images", True)),
         "save_labels": bool(_WORKER_STATIC.get("save_labels", True)),
         "save_binary": bool(_WORKER_STATIC.get("save_binary", False)),
+        "save_semantic": bool(_WORKER_STATIC.get("save_semantic", False)),
     }
 
 
@@ -478,6 +492,7 @@ def _initialize_spawned_worker_static_context(payload: Mapping[str, object]) -> 
         "save_images": bool(payload.get("save_images", True)),
         "save_labels": bool(payload.get("save_labels", True)),
         "save_binary": bool(payload.get("save_binary", False)),
+        "save_semantic": bool(payload.get("save_semantic", False)),
     })
 
 
@@ -634,6 +649,41 @@ def _derive_item_arrays(source: RenderFrameSource, plan: RenderPlan, item_key: s
             tile_mask_out = resize_centered(tile_mask, tile.out_w, tile.out_h, cv2.INTER_NEAREST)
             return tile_img_out, tile_mask_out
     raise RuntimeError(f"Unknown tile item {item_key!r} for plan {plan.tag}")
+
+
+def _render_semantic_coverage_item(
+    coverage: Optional[np.ndarray], plan: RenderPlan, frame_idx: int, item_key: str,
+    *, gpu_source: bool = False,
+) -> Optional[np.ndarray]:
+    if coverage is None:
+        return None
+    tile = next((item for item in plan.tile_layout if item.tile_tag == item_key), None)
+    if tile is not None and tile.shared_job is not None:
+        assert plan.view.shared_view is not None
+        return np.ascontiguousarray((shared_geometry.render_categorical_dense_tile_for_job(
+            coverage, plan.view.shared_view, tile.shared_job, int(frame_idx),
+        ) > 0).astype(np.uint8))
+    full, canvas = render_plan_frame_mask_source(
+        mask=coverage, plan=plan, idx=int(frame_idx), need_canvas=tile is not None,
+    )
+    if tile is None:
+        return full
+    if canvas is None:
+        raise RuntimeError(f"Semantic coverage tile {plan.tag}/{item_key} has no canvas")
+    cropped = extract_padded_tile(canvas, tile.x, tile.y, tile.cfg.tile_size)
+    if gpu_source:
+        return cropped
+    return resize_centered(cropped, tile.out_w, tile.out_h, cv2.INTER_NEAREST)
+
+
+def _require_gpu_semantic_coverage_contract(policy: object, coverage: Optional[np.ndarray]) -> None:
+    if coverage is not None and getattr(policy, "mask_independent_geometry", False) is not True:
+        raise RuntimeError(
+            "Forced partial semantic masks with GPU augmentation require a policy that "
+            "declares mask_independent_geometry = True. The GPU policy API accepts one "
+            "mask per call, so annotation coverage can be replayed safely only when "
+            "spatial transforms do not depend on mask contents."
+        )
 
 
 def _derive_gpu_item_source(
@@ -868,6 +918,8 @@ def _write_gpu_image_batch(
     jpeg_quality: int,
     publication: Optional[object] = None,
     deferred_label_payloads: Sequence[Tuple[Path, List[str]]] = (),
+    deferred_semantic_payloads: Sequence[Tuple[Path, np.ndarray, Optional[np.ndarray]]] = (),
+    semantic_indices_ready: bool = False,
 ) -> Optional[str]:
     """Encode CUDA images with nvJPEG/nvTIFF, or return an auto-fallback note."""
     if not indices:
@@ -956,12 +1008,68 @@ def _write_gpu_image_batch(
                     with publication.measure('jpeg_encode_and_fence'):
                         encoded = _encode_nvjpeg_batch(**encode_kwargs)
                     label_bytes = _label_payload_bytes(deferred_label_payloads)
+                    semantic_bytes = sum(
+                        mask.nbytes + (0 if coverage is None else coverage.nbytes)
+                        for _path, mask, coverage in deferred_semantic_payloads
+                    )
                     with publication.measure('host_queue_wait'):
-                        host_slot.resize(encoded.nbytes + label_bytes)
-                    def publish_encoded_and_labels():
-                        _publish_nvjpeg_batch_atomically(encoded, executor=publication.file_executor)
-                        _publish_label_payloads(deferred_label_payloads, publication.file_executor)
-                    host_slot.submit(publish_encoded_and_labels)
+                        host_slot.resize(encoded.nbytes + label_bytes + semantic_bytes)
+                    def publish_encoded_and_metadata():
+                        overlap = bool(
+                            semantic_indices_ready and deferred_semantic_payloads
+                            and os.environ.get('PTA_SEMANTIC_PNG_OVERLAP', '1').strip().lower()
+                            not in {'0', 'false', 'off', 'no'}
+                        )
+                        semantic_futures = []
+                        semantic_completed: List[Optional[float]] = []
+                        semantic_started = time.perf_counter()
+                        first_error: Optional[BaseException] = None
+                        if overlap:
+                            semantic_completed = [None] * len(deferred_semantic_payloads)
+                            def write_one_semantic(index, path, mask, coverage):
+                                try:
+                                    if coverage is not None:
+                                        raise ValueError('Precombined semantic masks must not carry coverage')
+                                    write_semantic_index_mask(path, mask)
+                                finally:
+                                    semantic_completed[index] = time.perf_counter()
+                            try:
+                                for index, (path, mask, coverage) in enumerate(deferred_semantic_payloads):
+                                    semantic_futures.append(publication.label_executor.submit(
+                                        write_one_semantic, index, path, mask, coverage))
+                            except BaseException as exc:
+                                first_error = exc
+                        if first_error is None:
+                            try:
+                                _publish_nvjpeg_batch_atomically(encoded, executor=publication.file_executor)
+                                _publish_label_payloads(deferred_label_payloads, publication.file_executor)
+                            except BaseException as exc:
+                                first_error = exc
+                        if overlap:
+                            for future in semantic_futures:
+                                try:
+                                    future.result()
+                                except BaseException as exc:
+                                    if first_error is None:
+                                        first_error = exc
+                                    elif hasattr(first_error, 'add_note'):
+                                        first_error.add_note(f'Additional semantic PNG failure: {exc}')
+                            finished = [value for value in semantic_completed if value is not None]
+                            if finished and hasattr(publication, 'add_time'):
+                                publication.add_time('semantic_png_write', max(finished) - semantic_started)
+                        elif deferred_semantic_payloads and first_error is None:
+                            try:
+                                with publication.measure('semantic_png_write'):
+                                    publish_semantic_mask_payloads(
+                                        deferred_semantic_payloads,
+                                        executor=publication.file_executor,
+                                        class_indices_ready=semantic_indices_ready,
+                                    )
+                            except BaseException as exc:
+                                first_error = exc
+                        if first_error is not None:
+                            raise first_error
+                    host_slot.submit(publish_encoded_and_metadata)
             return None
         except NvjpegCudaFenceError:
             # A failed device fence must never start an OpenCV fallback or a
@@ -1032,12 +1140,14 @@ class _GpuItemWork:
 
     candidates: Tuple[OutputCandidate, ...]
     image: object
-    mask: np.ndarray
+    mask: object
     output_size: Tuple[int, int]
     channel_kind: str
     context: str
     channel_count: int = 1
     ready_event: Optional[object] = None
+    semantic_coverage: Optional[object] = None
+    categorical_ready_event: Optional[object] = None
 
 
 def _gpu_identity_fast_path_eligible(
@@ -1129,13 +1239,32 @@ def _apply_gpu_identity_batch_many(
     )
     total_candidates = sum(len(item.candidates) for item in work)
     if source_mask_required:
-        mask_arrays = [
-            np.ascontiguousarray((np.asarray(item.mask) > 0).astype(np.uint8))
-            for item in work
-        ]
-        mask_nhw = np.stack(mask_arrays, axis=0)
-        mask_host = torch.from_numpy(np.ascontiguousarray(mask_nhw)).pin_memory()
-        mask_sources = mask_host.to(device, non_blocking=True)
+        cuda_masks = [bool(getattr(item.mask, "is_cuda", False)) for item in work]
+        if all(cuda_masks):
+            expected_device = torch.device(device)
+            for item in work:
+                if getattr(item.mask, "dtype", None) != torch.uint8:
+                    raise TypeError("GPU-rendered categorical masks must be torch.uint8")
+                if torch.device(getattr(item.mask, "device", None)) != expected_device:
+                    raise ValueError("GPU-rendered categorical mask is on the wrong device")
+            mask_sources = torch.stack([item.mask for item in work], dim=0).contiguous()
+        else:
+            # A mixed batch is possible when one source fails GPU admission.
+            # Upload only its host mask; keep admitted CUDA masks on device.
+            mask_planes = []
+            for item in work:
+                if bool(getattr(item.mask, "is_cuda", False)):
+                    mask_planes.append(item.mask)
+                else:
+                    mask_array = np.ascontiguousarray(
+                        (np.asarray(item.mask) > 0).astype(np.uint8)
+                    )
+                    mask_planes.append(
+                        torch.from_numpy(mask_array).pin_memory().to(
+                            device, non_blocking=True
+                        )
+                    )
+            mask_sources = torch.stack(mask_planes, dim=0).contiguous()
     else:
         # The publisher does not inspect mask pixels for an unlabeled batch.
         # Retain the NHW contract as a zero-strided device view without
@@ -1195,9 +1324,39 @@ def _gpu_policy_source_images(
     cuda_sources = bool(batch) and all(
         bool(getattr(item.image, "is_cuda", False)) for item in batch
     )
-    if cuda_sources and bool(getattr(policy, "supports_cuda_sources", False)):
+    cuda_masks = all(bool(getattr(item.mask, "is_cuda", False)) for item in batch)
+    # Bundled policies with CUDA mask support require image and mask sources to
+    # share one memory domain. A rejected categorical-volume admission can
+    # leave a CUDA intensity image with a CPU fallback mask.
+    if (
+        cuda_sources
+        and bool(getattr(policy, "supports_cuda_sources", False))
+        and (not bool(getattr(policy, "supports_cuda_masks", False)) or cuda_masks)
+    ):
         return tuple(item.image for item in batch), True
     return tuple(_gpu_policy_host_image(item.image) for item in batch), False
+
+
+def _gpu_policy_source_masks(
+    policy: object,
+    batch: Sequence[_GpuItemWork],
+    *,
+    cuda_images: bool,
+) -> Tuple[object, ...]:
+    """Keep categorical sources on CUDA for a policy that accepts them."""
+
+    if cuda_images and batch and all(bool(getattr(item.mask, "is_cuda", False)) for item in batch):
+        if bool(getattr(policy, "supports_cuda_masks", False)):
+            return tuple(item.mask for item in batch)
+    return tuple(
+        np.ascontiguousarray(
+            item.mask.detach().to("cpu").numpy()
+            if bool(getattr(item.mask, "is_cuda", False))
+            else item.mask,
+            dtype=np.uint8,
+        )
+        for item in batch
+    )
 
 
 def _wait_for_gpu_work_ready(
@@ -1209,11 +1368,11 @@ def _wait_for_gpu_work_ready(
     events: List[object] = []
     seen: set[int] = set()
     for item in batch:
-        event = item.ready_event
-        if event is None or id(event) in seen:
-            continue
-        seen.add(id(event))
-        events.append(event)
+        for event in (item.ready_event, item.categorical_ready_event):
+            if event is None or id(event) in seen:
+                continue
+            seen.add(id(event))
+            events.append(event)
     if not events:
         return
     torch = runtime["torch"]
@@ -1221,10 +1380,10 @@ def _wait_for_gpu_work_ready(
     for event in events:
         consumer_stream.wait_event(event)
     for item in batch:
-        image = item.image
-        record_stream = getattr(image, "record_stream", None)
-        if bool(getattr(image, "is_cuda", False)) and callable(record_stream):
-            record_stream(consumer_stream)
+        for tensor in (item.image, item.mask, item.semantic_coverage):
+            record_stream = getattr(tensor, "record_stream", None)
+            if bool(getattr(tensor, "is_cuda", False)) and callable(record_stream):
+                record_stream(consumer_stream)
 
 
 def _gpu_projected_item_image(
@@ -1486,6 +1645,7 @@ def _render_gpu_frame_items(
     mask: np.ndarray,
     plans: Sequence[RenderPlan],
     frame_task: FrameRenderTask,
+    semantic_coverage: Optional[np.ndarray] = None,
 ) -> Tuple[_GpuItemWork, ...]:
     """Render one frame's source items without touching CUDA state."""
 
@@ -1513,6 +1673,9 @@ def _render_gpu_frame_items(
                 channel_kind=str(candidates[0].channel_kind),
                 context=f"{plan.tag}/{item_key}/frame={int(frame_task.frame_idx) + 1:04d}",
                 channel_count=int(plan.channel_variant.channel_count),
+                semantic_coverage=_render_semantic_coverage_item(
+                    semantic_coverage, plan, int(frame_task.frame_idx), str(item_key), gpu_source=True,
+                ),
             )
         )
     return tuple(rendered)
@@ -1525,6 +1688,7 @@ def _render_gpu_item_group(
     frame_idx: int,
     items: Sequence[Tuple[str, Tuple[OutputCandidate, ...]]],
     runtime: Optional[Mapping[str, object]] = None,
+    semantic_coverage: Optional[np.ndarray] = None,
 ) -> Tuple[_GpuItemWork, ...]:
     """Render an independently schedulable full/tile item group on the CPU."""
 
@@ -1550,18 +1714,6 @@ def _render_gpu_item_group(
         if gpu_projection is not None:
             gpu_image, gpu_ready_event = gpu_projection
             if str(item_key) == "full":
-                if source_mask_required:
-                    item_mask, _mask_canvas = render_plan_frame_mask_source(
-                        mask=mask,
-                        plan=plan,
-                        idx=int(frame_idx),
-                        need_canvas=False,
-                    )
-                else:
-                    item_mask = _zero_mask_view(
-                        int(gpu_image.shape[0]),
-                        int(gpu_image.shape[1]),
-                    )
                 output_size = (
                     int(gpu_image.shape[0]),
                     int(gpu_image.shape[1]),
@@ -1579,31 +1731,65 @@ def _render_gpu_item_group(
                     raise RuntimeError(
                         f"CUDA-rendered PTA tile {plan.tag}/{item_key} has no canonical tile job"
                     )
-                item_mask = (
-                    shared_geometry.render_categorical_dense_tile_for_job(
-                        mask,
-                        plan.view.shared_view,
-                        tile.shared_job,
-                        int(frame_idx),
-                    )
-                    if source_mask_required
-                    else _zero_mask_view(int(tile.out_h), int(tile.out_w))
-                )
                 output_size = (int(tile.out_h), int(tile.out_w))
+            categorical_projection = None
+            if bool(getattr(gpu_image, "is_cuda", False)) and (
+                source_mask_required or semantic_coverage is not None
+            ):
+                from .pta_cuda_masks import render_gpu_categorical_item
+
+                volume_identity = _WORKER_VOLUME_IDENTITY_BY_POINTER.get(
+                    int(volume.__array_interface__["data"][0]),
+                    f"array:{int(volume.__array_interface__['data'][0])}",
+                )
+                categorical_projection = render_gpu_categorical_item(
+                    runtime,
+                    mask,
+                    semantic_coverage,
+                    plan,
+                    int(frame_idx),
+                    str(item_key),
+                    identity=f"{volume_identity}:mask:{int(mask.__array_interface__['data'][0])}",
+                )
+            if categorical_projection is not None:
+                item_mask, item_coverage, categorical_ready_event = categorical_projection
+            else:
+                categorical_ready_event = None
+                if source_mask_required:
+                    if str(item_key) == "full":
+                        item_mask, _mask_canvas = render_plan_frame_mask_source(
+                            mask=mask,
+                            plan=plan,
+                            idx=int(frame_idx),
+                            need_canvas=False,
+                        )
+                    else:
+                        item_mask = shared_geometry.render_categorical_dense_tile_for_job(
+                            mask,
+                            plan.view.shared_view,
+                            tile.shared_job,
+                            int(frame_idx),
+                        )
+                    item_mask = np.ascontiguousarray(
+                        (np.asarray(item_mask) > 0).astype(np.uint8)
+                    )
+                else:
+                    item_mask = _zero_mask_view(*output_size)
+                item_coverage = _render_semantic_coverage_item(
+                    semantic_coverage, plan, int(frame_idx), str(item_key), gpu_source=True,
+                )
             return (
                 _GpuItemWork(
                     candidates=tuple(candidates),
                     image=gpu_image,
-                    mask=(
-                        np.ascontiguousarray((np.asarray(item_mask) > 0).astype(np.uint8))
-                        if source_mask_required
-                        else item_mask
-                    ),
+                    mask=item_mask,
                     output_size=output_size,
                     channel_kind=str(candidates[0].channel_kind),
                     context=f"{plan.tag}/{item_key}/frame={int(frame_idx) + 1:04d}",
                     channel_count=plan_channel_count,
                     ready_event=gpu_ready_event,
+                    semantic_coverage=item_coverage,
+                    categorical_ready_event=categorical_ready_event,
                 ),
             )
     if len(items) == 1 and str(items[0][0]) != "full":
@@ -1640,6 +1826,9 @@ def _render_gpu_item_group(
                     channel_kind=str(candidates[0].channel_kind),
                     context=f"{plan.tag}/{item_key}/frame={int(frame_idx) + 1:04d}",
                     channel_count=plan_channel_count,
+                    semantic_coverage=_render_semantic_coverage_item(
+                        semantic_coverage, plan, int(frame_idx), str(item_key), gpu_source=True,
+                    ),
                 ),
             )
 
@@ -1696,6 +1885,9 @@ def _render_gpu_item_group(
                 channel_kind=str(candidates[0].channel_kind),
                 context=f"{plan.tag}/{item_key}/frame={int(frame_idx) + 1:04d}",
                 channel_count=plan_channel_count,
+                semantic_coverage=_render_semantic_coverage_item(
+                    semantic_coverage, plan, int(frame_idx), str(item_key), gpu_source=True,
+                ),
             )
         )
     return tuple(rendered)
@@ -1765,6 +1957,7 @@ def _publish_gpu_policy_batch(
     local_warnings: WarningLog,
     channel_count: Optional[int] = None,
     publication: Optional[object] = None,
+    semantic_coverage_masks: Optional[object] = None,
 ) -> Tuple[int, Dict[str, int]]:
     """Validate and publish one flat CUDA policy result batch."""
 
@@ -1783,6 +1976,14 @@ def _publish_gpu_policy_batch(
     save_images = bool(static.get("save_images", True))
     save_labels = bool(static.get("save_labels", True))
     save_binary = bool(static.get("save_binary", False))
+    save_semantic = bool(static.get("save_semantic", False))
+    # The usual semantic export requests images and masks only. Combine class
+    # and ignore ids before download so each plane crosses the bus once, and
+    # avoid a full CPU mask conversion in every PNG writer.
+    semantic_indices_ready = bool(
+        save_semantic and not (save_labels or save_binary)
+        and isinstance(batch_masks, getattr(torch, "Tensor", ()))
+    )
     with (publication.measure('mask_download') if publication is not None else nullcontext()):
         # A device-side reduction is enough for background/flip decisions. Full
         # masks cross PCIe only when labels or binary masks were requested.
@@ -1791,8 +1992,14 @@ def _publish_gpu_policy_batch(
             for candidate in candidates
         )
         if mask_semantics_required:
+            decision_masks = batch_masks
+            if semantic_coverage_masks is not None:
+                coverage_for_decision = semantic_coverage_masks
+                if int(coverage_for_decision.ndim) == 4 and int(coverage_for_decision.shape[1]) == 1:
+                    coverage_for_decision = coverage_for_decision[:, 0]
+                decision_masks = batch_masks * (coverage_for_decision > 0)
             mask_nonempty = (
-                batch_masks.reshape(expected, -1)
+                decision_masks.reshape(expected, -1)
                 .any(dim=1)
                 .detach()
                 .to("cpu")
@@ -1809,24 +2016,57 @@ def _publish_gpu_policy_batch(
         ]
         mask_indices = [
             index for index, candidate in enumerate(candidates)
-            if (save_labels or save_binary) and bool(candidate.label_enabled)
+            if (save_labels or save_binary or save_semantic) and bool(candidate.label_enabled)
         ]
         host_label_masks: Dict[int, np.ndarray] = {}
+        host_semantic_masks: Dict[int, np.ndarray] = {}
         if mask_indices:
             device_indices = torch.as_tensor(
                 mask_indices,
                 device=batch_masks.device,
                 dtype=torch.int64,
             )
-            selected_masks = batch_masks.index_select(0, device_indices).detach().to("cpu").numpy()
-            host_label_masks = {
-                int(candidate_index): np.ascontiguousarray(selected_masks[offset])
+            selected_masks = batch_masks.index_select(0, device_indices).detach()
+            if not semantic_indices_ready:
+                downloaded_masks = selected_masks.to("cpu").numpy()
+                host_label_masks = {
+                    int(candidate_index): np.ascontiguousarray(downloaded_masks[offset])
+                    for offset, candidate_index in enumerate(mask_indices)
+                }
+            if semantic_indices_ready:
+                semantic_device = (selected_masks > 0).to(torch.uint8)
+                if semantic_coverage_masks is not None:
+                    coverage_masks = semantic_coverage_masks
+                    if int(coverage_masks.ndim) == 4 and int(coverage_masks.shape[1]) == 1:
+                        coverage_masks = coverage_masks[:, 0]
+                    if tuple(int(x) for x in coverage_masks.shape) != tuple(int(x) for x in batch_masks.shape):
+                        raise ValueError("GPU semantic coverage batch shape differs from foreground masks")
+                    selected_coverage = coverage_masks.index_select(0, device_indices)
+                    semantic_device.masked_fill_(selected_coverage == 0, 255)
+                downloaded_semantics = semantic_device.to("cpu").numpy()
+                host_semantic_masks = {
+                    int(candidate_index): np.ascontiguousarray(downloaded_semantics[offset])
+                    for offset, candidate_index in enumerate(mask_indices)
+                }
+        host_coverage_masks: Dict[int, np.ndarray] = {}
+        if save_semantic and not semantic_indices_ready and semantic_coverage_masks is not None and mask_indices:
+            coverage_masks = semantic_coverage_masks
+            if int(coverage_masks.ndim) == 4 and int(coverage_masks.shape[1]) == 1:
+                coverage_masks = coverage_masks[:, 0]
+            if tuple(int(x) for x in coverage_masks.shape) != tuple(int(x) for x in batch_masks.shape):
+                raise ValueError("GPU semantic coverage batch shape differs from foreground masks")
+            selected_coverage = coverage_masks.index_select(0, device_indices).detach().to("cpu").numpy()
+            host_coverage_masks = {
+                int(candidate_index): np.ascontiguousarray(selected_coverage[offset])
                 for offset, candidate_index in enumerate(mask_indices)
             }
     def labels_for(index):
         candidate = candidates[index]
+        mask_for_label = host_label_masks[index]
+        if index in host_coverage_masks:
+            mask_for_label = np.where(host_coverage_masks[index] > 0, mask_for_label, 0)
         return mask_to_yolo_lines(
-            host_label_masks[index], warnings=local_warnings,
+            mask_for_label, warnings=local_warnings,
             context=f'{candidate.volume_name} {candidate.output_tag} frame {int(candidate.frame_idx) + 1:04d}',
             known_empty=not bool(candidate.foreground))
 
@@ -1842,6 +2082,7 @@ def _publish_gpu_policy_batch(
     image_paths: List[Path] = []
     label_payloads: List[Tuple[Path, List[str]]] = []
     binary_payloads: List[Tuple[Path, np.ndarray]] = []
+    semantic_payloads: List[Tuple[Path, np.ndarray, Optional[np.ndarray]]] = []
     flips_by_subset: Dict[str, int] = {}
     for local_index, cand in enumerate(candidates):
         is_nonempty = bool(mask_nonempty[local_index])
@@ -1859,7 +2100,8 @@ def _publish_gpu_policy_batch(
         if save_labels and cand.label_enabled and lbl_path is not None:
             label_lines = (label_lines_by_index[local_index] if label_lines_by_index is not None
                            else labels_for(local_index))
-            if int(cand.augmentation_index) > 0 and bool(cand.foreground) and not label_lines:
+            if (int(cand.augmentation_index) > 0 and bool(cand.foreground)
+                    and not label_lines and not (save_semantic and is_nonempty)):
                 local_warnings.add(
                     "augmented_foreground_flip_dropped",
                     f"{cand.volume_name}/{cand.output_tag}/frame={int(cand.frame_idx) + 1:04d}/tag={cand.augmentation_tag}",
@@ -1890,9 +2132,15 @@ def _publish_gpu_policy_batch(
                 candidate_binary_output_path(out_dir, cand, split_active=split_active),
                 host_label_masks[local_index],
             ))
+        if save_semantic and cand.label_enabled:
+            semantic_payloads.append((
+                candidate_semantic_output_path(out_dir, cand, split_active=split_active),
+                (host_semantic_masks if semantic_indices_ready else host_label_masks)[local_index],
+                None if semantic_indices_ready else host_coverage_masks.get(local_index),
+            ))
 
     fallback_note = None
-    labels_with_images = bool(publication is not None and save_images and keep_indices
+    metadata_with_images = bool(publication is not None and save_images and keep_indices
         and parse_output_image_format(image_format) == 'jpg'
         and str(static['jpeg_encode_backend']) == 'nvjpeg'
         and runtime.get('encoder') is not None and runtime.get('nvimgcodec') is not None)
@@ -1907,7 +2155,9 @@ def _publish_gpu_policy_batch(
             png_compression=int(static["png_compression"]),
             jpeg_quality=int(static["jpeg_quality"]),
             publication=publication,
-            deferred_label_payloads=label_payloads if labels_with_images else (),
+            deferred_label_payloads=label_payloads if metadata_with_images else (),
+            deferred_semantic_payloads=semantic_payloads if metadata_with_images else (),
+            semantic_indices_ready=semantic_indices_ready,
         )
     if fallback_note and not _WORKER_GPU_CODEC_WARNING_EMITTED:
         local_warnings.add(
@@ -1922,7 +2172,7 @@ def _publish_gpu_policy_batch(
         _WORKER_GPU_CODEC_WARNING_EMITTED = True
     if publication is None:
         _publish_label_payloads(label_payloads)
-    elif label_payloads and not labels_with_images:
+    elif label_payloads and not metadata_with_images:
         publication.submit_host(_label_payload_bytes(label_payloads),
             lambda: _publish_label_payloads(label_payloads, publication.file_executor))
     if binary_payloads:
@@ -1931,6 +2181,22 @@ def _publish_gpu_policy_batch(
         else:
             publication.submit_host(sum(mask.nbytes for _path, mask in binary_payloads),
                 lambda: publish_binary_mask_payloads(binary_payloads))
+    if semantic_payloads and not metadata_with_images:
+        def publish_semantics() -> None:
+            with (publication.measure('semantic_png_write') if publication is not None else nullcontext()):
+                publish_semantic_mask_payloads(
+                    semantic_payloads,
+                    executor=(publication.file_executor if publication is not None else None),
+                    class_indices_ready=semantic_indices_ready,
+                )
+        if publication is None:
+            publish_semantics()
+        else:
+            publication.submit_host(
+                sum(mask.nbytes + (0 if known is None else known.nbytes)
+                    for _path, mask, known in semantic_payloads),
+                publish_semantics,
+            )
     return len(keep_indices), flips_by_subset
 
 
@@ -1939,6 +2205,7 @@ def execute_gpu_frame_batch_task(
     mask: np.ndarray,
     plans: Sequence[RenderPlan],
     task: GpuFrameBatchTask,
+    semantic_coverage: Optional[np.ndarray] = None,
 ) -> Tuple[int, Dict[str, int], Dict[str, int], Dict[str, List[str]]]:
     """Overlap bounded CPU frame rendering with memory-safe GPU policy calls."""
 
@@ -1951,6 +2218,8 @@ def execute_gpu_frame_batch_task(
             for plan in plans
         )
     policy = runtime["policy"]
+    if semantic_coverage is not None:
+        _require_gpu_semantic_coverage_contract(policy, semantic_coverage)
     apply_batch_many = getattr(policy, "apply_batch_many", None)
     if not callable(apply_batch_many):
         written = 0
@@ -1966,6 +2235,7 @@ def execute_gpu_frame_batch_task(
                 mask,
                 plans,
                 frame_task,
+                semantic_coverage,
             )
             written += int(part_written)
             for subset, count in part_flips.items():
@@ -2045,6 +2315,9 @@ def execute_gpu_frame_batch_task(
                 )
                 batch_bytes = (2 * len(flat_candidates) * int(batch[0].output_size[0])
                     * int(batch[0].output_size[1]) * (int(batch[0].channel_count) + 1))
+                if any(getattr(item, "semantic_coverage", None) is not None for item in batch):
+                    batch_bytes += (2 * len(flat_candidates) * int(batch[0].output_size[0])
+                                    * int(batch[0].output_size[1]))
                 admission = publication.reserve(batch_bytes) if publication is not None else nullcontext()
                 with admission as reservation:
                     try:
@@ -2070,17 +2343,45 @@ def execute_gpu_frame_batch_task(
                                         runtime["cuda_source_policy_fallback_announced"] = True
                                 result = apply_batch_many(
                                     images=policy_images,
-                                    # API-v2 policies historically receive writable,
-                                    # contiguous masks.  Preserve that contract here;
-                                    # the internal originals-only fast path can safely
-                                    # retain zero-strided blank views end to end.
-                                    masks=tuple(
-                                        np.ascontiguousarray(item.mask, dtype=np.uint8)
-                                        for item in batch
+                                    masks=_gpu_policy_source_masks(
+                                        policy, batch, cuda_images=zero_copy_cuda_sources,
                                     ),
                                     seeds=seeds,
                                     output_size=batch[0].output_size,
                                 )
+                            semantic_coverage_masks = None
+                            if bool(_WORKER_STATIC.get("save_semantic", False)) and any(
+                                item.semantic_coverage is not None for item in batch
+                            ):
+                                coverage_batch = tuple(replace(
+                                    item,
+                                    mask=(item.semantic_coverage if item.semantic_coverage is not None
+                                          else (
+                                              runtime["torch"].ones_like(item.mask)
+                                              if bool(getattr(item.mask, "is_cuda", False))
+                                              else np.ones_like(item.mask, dtype=np.uint8)
+                                          )),
+                                ) for item in batch)
+                                if _gpu_identity_fast_path_eligible(batch, seeds):
+                                    _coverage_images, semantic_coverage_masks = _apply_gpu_identity_batch_many(
+                                        runtime, coverage_batch,
+                                    )
+                                else:
+                                    _coverage_images, semantic_coverage_masks = apply_batch_many(
+                                        images=policy_images,
+                                        masks=_gpu_policy_source_masks(
+                                            policy, coverage_batch,
+                                            cuda_images=zero_copy_cuda_sources,
+                                        ),
+                                        seeds=seeds,
+                                        output_size=batch[0].output_size,
+                                    )
+                                if not bool(runtime["torch"].equal(result[0], _coverage_images)):
+                                    raise RuntimeError(
+                                        "GPU policy changed image geometry when semantic coverage replaced "
+                                        "the foreground mask. Forced partial semantic export requires "
+                                        "mask-independent GPU geometry."
+                                    )
                     except Exception as exc:
                         if _is_cuda_out_of_memory(exc) and len(flat_candidates) > 1:
                             try:
@@ -2107,12 +2408,14 @@ def execute_gpu_frame_batch_task(
                         runtime=runtime, batch_images=result[0], batch_masks=result[1],
                         candidates=flat_candidates, output_size=batch[0].output_size,
                         channel_kind=batch[0].channel_kind,
-                        channel_count=int(batch[0].channel_count), local_warnings=local_warnings)
+                        channel_count=int(batch[0].channel_count), local_warnings=local_warnings,
+                        semantic_coverage_masks=semantic_coverage_masks)
                     if publication is None:
                         merge_published(_publish_gpu_policy_batch(**publish_kwargs))
                     else:
                         publish_kwargs['batch_masks'] = _validate_gpu_policy_batch(
-                            **{key: value for key, value in publish_kwargs.items() if key != 'local_warnings'})
+                            **{key: value for key, value in publish_kwargs.items()
+                               if key not in {'local_warnings', 'semantic_coverage_masks'}})
                         publication.submit(reservation, publish_kwargs)
                     # Do not retain a previous policy result while allocating the
                     # next one. Asynchronous publication owns its snapshots/inputs.
@@ -2171,6 +2474,7 @@ def execute_gpu_frame_batch_task(
                         frame_idx,
                         items,
                         runtime,
+                        semantic_coverage,
                     )
                     pending[future] = int(next_job)
                     next_job += 1
@@ -2180,7 +2484,15 @@ def execute_gpu_frame_batch_task(
                 done, _not_done = wait(tuple(pending), return_when=FIRST_COMPLETED)
                 for future in sorted(done, key=lambda item: pending[item]):
                     pending.pop(future)
-                    ready.extend(future.result())
+                    completed_items = tuple(future.result())
+                    for item in completed_items:
+                        if any(bool(candidate.label_enabled) for candidate in item.candidates):
+                            local_warnings.add(
+                                "pta_cuda_categorical_items"
+                                if bool(getattr(item.mask, "is_cuda", False))
+                                else "pta_cpu_categorical_items"
+                            )
+                    ready.extend(completed_items)
                 _fill_render_window()
                 effective = _gpu_memory_candidate_limit(
                     runtime,
@@ -2202,7 +2514,7 @@ def execute_gpu_frame_batch_task(
     ):
         local_warnings.add(
             "pta_cuda_cartesian_projection_active",
-            "TTA resident Cartesian intensity projector; categorical masks retain CPU nearest sampling",
+            "TTA resident Cartesian intensity projector active",
         )
         if isinstance(runtime, dict):
             runtime["cartesian_renderer_manifest_announced"] = True
@@ -2212,7 +2524,7 @@ def execute_gpu_frame_batch_task(
     ):
         local_warnings.add(
             'pta_cuda_spherical_projection_active',
-            'TTA resident Spherical QSC intensity projector; categorical masks retain CPU nearest sampling',
+            'TTA resident Spherical QSC intensity projector active',
         )
         if isinstance(runtime, dict):
             runtime['spherical_renderer_manifest_announced'] = True
@@ -2222,7 +2534,7 @@ def execute_gpu_frame_batch_task(
     ):
         local_warnings.add(
             'pta_cuda_radial_projection_active',
-            'TTA resident Radial shell intensity projector; categorical masks retain CPU nearest sampling',
+            'TTA resident Radial shell intensity projector active',
         )
         if isinstance(runtime, dict):
             runtime['radial_renderer_manifest_announced'] = True
@@ -2232,7 +2544,7 @@ def execute_gpu_frame_batch_task(
     ):
         local_warnings.add(
             "pta_cuda_azimuthal_projection_active",
-            "TTA resident CUDA intensity projector; categorical masks retain CPU nearest sampling",
+            "TTA resident CUDA intensity projector active",
         )
         if isinstance(runtime, dict):
             runtime["azimuthal_renderer_manifest_announced"] = True
@@ -2242,7 +2554,7 @@ def execute_gpu_frame_batch_task(
     ):
         local_warnings.add(
             "pta_cuda_tilted_projection_active",
-            "TTA fused Tilted Cartesian intensity projector; categorical masks retain CPU nearest sampling",
+            "TTA fused Tilted Cartesian intensity projector active",
         )
         if isinstance(runtime, dict):
             runtime["tilted_renderer_manifest_announced"] = True
@@ -2259,16 +2571,19 @@ def execute_gpu_render_task(
     mask: np.ndarray,
     plans: Sequence[RenderPlan],
     task: object,
+    semantic_coverage: Optional[np.ndarray] = None,
 ) -> Tuple[int, Dict[str, int], Dict[str, int], Dict[str, List[str]]]:
     """Execute one grouped source-frame task on a persistent GPU rank."""
     global _WORKER_GPU_CODEC_WARNING_EMITTED
     if isinstance(task, GpuFrameBatchTask):
-        return execute_gpu_frame_batch_task(volume, mask, plans, task)
+        return execute_gpu_frame_batch_task(volume, mask, plans, task, semantic_coverage)
     if not isinstance(task, FrameRenderTask):
         raise RuntimeError(f"Unsupported GPU render task type: {type(task).__name__}")
     runtime = _gpu_runtime_for_worker()
     torch = runtime["torch"]
     policy = runtime["policy"]
+    if semantic_coverage is not None:
+        _require_gpu_semantic_coverage_contract(policy, semantic_coverage)
     static = _WORKER_STATIC
     out_dir: Path = static["out_dir"]  # type: ignore[assignment]
     split_active = bool(static["split_active"])
@@ -2278,6 +2593,7 @@ def execute_gpu_render_task(
     save_images = bool(static.get("save_images", True))
     save_labels = bool(static.get("save_labels", True))
     save_binary = bool(static.get("save_binary", False))
+    save_semantic = bool(static.get("save_semantic", False))
     gpu_batch_size = max(1, int(static["gpu_batch_size"]))
     local_warnings = WarningLog()
     codec_error = str(runtime.get("codec_error") or "")
@@ -2300,6 +2616,9 @@ def execute_gpu_render_task(
     )
     for item_key, candidates in task.items:
         item_image, item_mask, output_size = _derive_gpu_item_source(source, plan, str(item_key))
+        item_coverage = _render_semantic_coverage_item(
+            semantic_coverage, plan, int(task.frame_idx), str(item_key), gpu_source=True,
+        ) if save_semantic else None
         for chunk_start in range(0, len(candidates), gpu_batch_size):
             chunk = list(candidates[chunk_start:chunk_start + gpu_batch_size])
             seeds: List[Optional[int]] = []
@@ -2317,6 +2636,20 @@ def execute_gpu_render_task(
                     seeds=seeds,
                     output_size=tuple(int(x) for x in output_size),
                 )
+                coverage_result = None
+                if item_coverage is not None:
+                    _coverage_images, coverage_result = policy.apply_batch(
+                        image=item_image,
+                        mask=item_coverage,
+                        seeds=seeds,
+                        output_size=tuple(int(x) for x in output_size),
+                    )
+                    if not bool(torch.equal(batch_result[0], _coverage_images)):
+                        raise RuntimeError(
+                            "GPU policy changed image geometry when semantic coverage replaced "
+                            "the foreground mask. Forced partial semantic export requires "
+                            "mask-independent GPU geometry."
+                        )
             except Exception as exc:
                 raise RuntimeError(
                     f"GPU policy failed for {plan.tag}/{item_key}/frame={int(task.frame_idx)+1:04d}: "
@@ -2345,13 +2678,21 @@ def execute_gpu_render_task(
                 )
 
             host_masks = batch_masks.detach().to("cpu").numpy()
+            host_coverage = coverage_result.detach().to("cpu").numpy() if coverage_result is not None else None
+            if host_coverage is not None and host_coverage.ndim == 4 and int(host_coverage.shape[1]) == 1:
+                host_coverage = host_coverage[:, 0]
             keep_indices: List[int] = []
             image_paths: List[Path] = []
             label_payloads: List[Tuple[Path, List[str]]] = []
             binary_payloads: List[Tuple[Path, np.ndarray]] = []
+            semantic_payloads: List[Tuple[Path, np.ndarray, Optional[np.ndarray]]] = []
             for local_index, cand in enumerate(chunk):
                 mask_out = np.ascontiguousarray((host_masks[local_index] > 0).astype(np.uint8))
-                if not bool(cand.foreground) and np.any(mask_out):
+                known_mask_out = (
+                    mask_out if host_coverage is None
+                    else np.where(host_coverage[local_index] > 0, mask_out, 0)
+                )
+                if not bool(cand.foreground) and np.any(known_mask_out):
                     raise RuntimeError(
                         f"GPU augmentation synthesized a mask for known-background candidate {cand}"
                     )
@@ -2362,15 +2703,16 @@ def execute_gpu_render_task(
                     image_format=image_format,
                 )
                 label_lines: Optional[List[str]] = None
-                if cand.label_enabled and lbl_path is not None and (save_labels or not save_binary):
+                if cand.label_enabled and lbl_path is not None and (save_labels or not (save_binary or save_semantic)):
                     label_context = f"{cand.volume_name} {cand.output_tag} frame {int(cand.frame_idx)+1:04d}"
                     label_lines = mask_to_yolo_lines(
-                        mask_out,
+                        known_mask_out,
                         warnings=local_warnings,
                         context=label_context,
                         known_empty=not bool(cand.foreground),
                     )
-                    if int(cand.augmentation_index) > 0 and bool(cand.foreground) and not label_lines:
+                    if (int(cand.augmentation_index) > 0 and bool(cand.foreground)
+                            and not label_lines and not (save_semantic and np.any(known_mask_out))):
                         local_warnings.add(
                             "augmented_foreground_flip_dropped",
                             f"{cand.volume_name}/{cand.output_tag}/frame={int(cand.frame_idx)+1:04d}/tag={cand.augmentation_tag}",
@@ -2378,8 +2720,8 @@ def execute_gpu_render_task(
                         subset_key = cand.split_subset or "all"
                         flips_by_subset[subset_key] = int(flips_by_subset.get(subset_key, 0)) + 1
                         continue
-                elif (save_binary and cand.label_enabled and int(cand.augmentation_index) > 0
-                      and bool(cand.foreground) and not np.any(mask_out)):
+                elif ((save_binary or save_semantic) and cand.label_enabled and int(cand.augmentation_index) > 0
+                      and bool(cand.foreground) and not np.any(known_mask_out)):
                     local_warnings.add(
                         "augmented_foreground_flip_dropped",
                         f"{cand.volume_name}/{cand.output_tag}/frame={int(cand.frame_idx)+1:04d}/tag={cand.augmentation_tag}",
@@ -2395,6 +2737,11 @@ def execute_gpu_render_task(
                 if save_binary and cand.label_enabled:
                     binary_payloads.append((
                         candidate_binary_output_path(out_dir, cand, split_active=split_active), mask_out,
+                    ))
+                if save_semantic and cand.label_enabled:
+                    semantic_payloads.append((
+                        candidate_semantic_output_path(out_dir, cand, split_active=split_active),
+                        mask_out, None if host_coverage is None else host_coverage[local_index],
                     ))
 
             fallback_note = None
@@ -2423,6 +2770,8 @@ def execute_gpu_render_task(
             for lbl_path, label_lines in label_payloads:
                 write_yolo_lines(label_lines, lbl_path)
             publish_binary_mask_payloads(binary_payloads)
+            for semantic_path, foreground, known in semantic_payloads:
+                write_semantic_mask(semantic_path, foreground, known)
             written += len(keep_indices)
 
     warn_counts = {str(key): int(count) for key, count in local_warnings.counts.items()}
@@ -2430,7 +2779,7 @@ def execute_gpu_render_task(
     return written, flips_by_subset, warn_counts, warn_examples
 
 
-def execute_render_task(volume: np.ndarray, mask: np.ndarray, plans: Sequence[RenderPlan], task: object) -> Tuple[int, Dict[str, int], Dict[str, int], Dict[str, List[str]]]:
+def execute_render_task(volume: np.ndarray, mask: np.ndarray, plans: Sequence[RenderPlan], task: object, semantic_coverage: Optional[np.ndarray] = None) -> Tuple[int, Dict[str, int], Dict[str, int], Dict[str, List[str]]]:
     """Execute one source-frame task.
 
     Runs inside a persistent spawned process worker (normal), the explicit
@@ -2441,7 +2790,7 @@ def execute_render_task(volume: np.ndarray, mask: np.ndarray, plans: Sequence[Re
     """
     static = _WORKER_STATIC
     if isinstance(static.get("augmentation"), LoadedGpuAugmentation):
-        return execute_gpu_render_task(volume, mask, plans, task)
+        return execute_gpu_render_task(volume, mask, plans, task, semantic_coverage)
     augmentation: Optional[OfflineAugmentation] = static["augmentation"]  # type: ignore[assignment]
     out_dir: Path = static["out_dir"]  # type: ignore[assignment]
     split_active = bool(static["split_active"])
@@ -2457,6 +2806,7 @@ def execute_render_task(volume: np.ndarray, mask: np.ndarray, plans: Sequence[Re
         item_image: np.ndarray,
         item_mask: np.ndarray,
         canonical_plan: Optional[RasterPlan],
+        item_coverage: Optional[np.ndarray],
     ) -> None:
         nonlocal written
         # Item arrays are task-local (warp/resize outputs), so replays reuse
@@ -2477,6 +2827,8 @@ def execute_render_task(volume: np.ndarray, mask: np.ndarray, plans: Sequence[Re
                 save_images=bool(static.get("save_images", True)),
                 save_labels=bool(static.get("save_labels", True)),
                 save_binary=bool(static.get("save_binary", False)),
+                save_semantic=bool(static.get("save_semantic", False)),
+                semantic_coverage=item_coverage,
                 canonical_plan=canonical_plan,
             )
             if outcome == "written":
@@ -2508,7 +2860,10 @@ def execute_render_task(volume: np.ndarray, mask: np.ndarray, plans: Sequence[Re
                 raise RuntimeError(
                     f"shared PTA item {plan.tag}/{item_key} has no canonical RasterPlan"
                 )
-            _write_versions(candidates, item_image, item_mask, item_plan)
+            item_coverage = _render_semantic_coverage_item(
+                semantic_coverage, plan, int(task.frame_idx), str(item_key),
+            ) if bool(static.get("save_semantic", False)) else None
+            _write_versions(candidates, item_image, item_mask, item_plan, item_coverage)
     else:
         raise RuntimeError(f"Unknown render task type: {type(task).__name__}")
 
@@ -2545,7 +2900,7 @@ def _worker_load_payload(payload_name: str, payload_nbytes: int) -> Dict[str, ob
     return payload
 
 
-def _worker_volume_arrays(payload: Mapping[str, object]) -> Tuple[np.ndarray, np.ndarray]:
+def _worker_volume_arrays(payload: Mapping[str, object]) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
     gen = int(payload["gen"])  # type: ignore[arg-type]
     state = _WORKER_GEN_CACHE.get(gen)
     if state is None:
@@ -2553,7 +2908,16 @@ def _worker_volume_arrays(payload: Mapping[str, object]) -> Tuple[np.ndarray, np
         mask_shm = _attach_shm_untracked(str(payload["mask_shm"]))
         volume = np.ndarray(tuple(int(x) for x in payload["volume_shape"]), dtype=np.uint8, buffer=volume_shm.buf)  # type: ignore[arg-type]
         mask = np.ndarray(tuple(int(x) for x in payload["mask_shape"]), dtype=np.uint8, buffer=mask_shm.buf)  # type: ignore[arg-type]
-        state = {"volume": volume, "mask": mask, "shms": [volume_shm, mask_shm]}
+        coverage_shm = (
+            _attach_shm_untracked(str(payload["semantic_coverage_shm"]))
+            if payload.get("semantic_coverage_shm") is not None else None
+        )
+        coverage = (
+            np.ndarray(tuple(int(x) for x in payload["semantic_coverage_shape"]), dtype=np.uint8, buffer=coverage_shm.buf)
+            if coverage_shm is not None else None
+        )
+        state = {"volume": volume, "mask": mask, "semantic_coverage": coverage,
+                 "shms": [volume_shm, mask_shm] + ([coverage_shm] if coverage_shm is not None else [])}
         _WORKER_VOLUME_IDENTITY_BY_POINTER[
             int(volume.__array_interface__["data"][0])
         ] = f"shm:{payload['volume_shm']}"
@@ -2568,29 +2932,30 @@ def _worker_volume_arrays(payload: Mapping[str, object]) -> Tuple[np.ndarray, np
                 )
             stale["volume"] = None
             stale["mask"] = None
+            stale["semantic_coverage"] = None
             for stale_shm in stale["shms"]:  # type: ignore[union-attr]
                 try:
                     stale_shm.close()
                 except Exception:
                     pass
-    return state["volume"], state["mask"]  # type: ignore[return-value]
+    return state["volume"], state["mask"], state["semantic_coverage"]  # type: ignore[return-value]
 
 
 def _render_task_entry(job: Tuple[str, int, int]) -> Tuple[int, Dict[str, int], Dict[str, int], Dict[str, List[str]]]:
     """Process-pool entry: resolve shared-memory payload + volume, run the task."""
     payload_name, payload_nbytes, task_idx = (str(job[0]), int(job[1]), int(job[2]))
     payload = _worker_load_payload(payload_name, payload_nbytes)
-    volume, mask = _worker_volume_arrays(payload)
+    volume, mask, semantic_coverage = _worker_volume_arrays(payload)
     tasks: List[object] = payload["tasks"]  # type: ignore[assignment]
     plans: List[RenderPlan] = payload["plans"]  # type: ignore[assignment]
-    return execute_render_task(volume, mask, plans, tasks[task_idx])
+    return execute_render_task(volume, mask, plans, tasks[task_idx], semantic_coverage)
 
 
 def _render_task_entry_thread(payload: Mapping[str, object], task_idx: int) -> Tuple[int, Dict[str, int], Dict[str, int], Dict[str, List[str]]]:
     """Thread-backend entry: the payload holds direct array references."""
     tasks: List[object] = payload["tasks"]  # type: ignore[assignment]
     plans: List[RenderPlan] = payload["plans"]  # type: ignore[assignment]
-    return execute_render_task(payload["volume"], payload["mask"], plans, tasks[int(task_idx)])  # type: ignore[arg-type]
+    return execute_render_task(payload["volume"], payload["mask"], plans, tasks[int(task_idx)], payload.get("semantic_coverage"))  # type: ignore[arg-type]
 
 
 def _merge_worker_warning_payload(target: WarningLog, counts: Mapping[str, int], examples: Mapping[str, Sequence[str]]) -> None:
@@ -2726,6 +3091,7 @@ class PersistentRenderPool:
                 "tasks": list(tasks),
                 "volume": prep.volume_for_render,
                 "mask": prep.mask_for_render,
+                "semantic_coverage": prep.semantic_coverage_for_render,
             }
             return RenderPhaseHandle("", 0, None, list(tasks), payload)
         if prep.volume_render_block is None or prep.mask_render_block is None:
@@ -2736,6 +3102,14 @@ class PersistentRenderPool:
             "volume_shape": tuple(int(x) for x in prep.volume_for_render.shape),
             "mask_shm": prep.mask_render_block.name,
             "mask_shape": tuple(int(x) for x in prep.mask_for_render.shape),
+            "semantic_coverage_shm": (
+                prep.semantic_coverage_render_block.name
+                if prep.semantic_coverage_render_block is not None else None
+            ),
+            "semantic_coverage_shape": (
+                tuple(int(x) for x in prep.semantic_coverage_for_render.shape)
+                if prep.semantic_coverage_for_render is not None else None
+            ),
             "plans": list(prep.plans),
             "tasks": list(tasks),
         }

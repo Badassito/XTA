@@ -36,6 +36,20 @@ RELEASES = {
                       'tools/qualify_confidence_consolidation.py',
                       'tools/qualify_d1_confidence_bounds.py',
                       'tools/analyze_pipeline_trace.py')),
+    '24.0.1': dict(token='24', previous_token='22_3_2',
+                   feature='yolo-semantic-segmentation',
+                   validation_tools=(
+                       'tools/compare_reconciliation.py',
+                       'tools/qualify_tta_reconciliation.py',
+                       'tools/export_reconciliation_evidence.py',
+                       'tools/qualify_confidence_consolidation.py',
+                       'tools/qualify_d1_confidence_bounds.py',
+                       'tools/analyze_pipeline_trace.py',
+                       'tools/export_semantic_logits.py',
+                       'tools/qualify_semantic_trt.py',
+                       'tools/qualify_pta_classification.py',
+                       'tools/qualify_pta_gpu_masks.py',
+                       'tools/qualify_pta_gpu_render.py')),
 }
 REASONS = {
     '__init__': 'Publish the package release identity as {release}.',
@@ -89,6 +103,41 @@ THROUGHPUT_REASONS = {
     'outputs': 'Batch repeated cached-zero gzip members without changing their byte sequence, preserve bounded ordered writes and pending export reference lifetimes, bound completed-output reaping, and report writer waits, atomic publication durability, and memory-map advice timings. Report the selected NRRD codec and imported-module provenance once, reject known pre-0.9 python-deflate bindings that hold the GIL with an actionable explicit-selection error, and allow automatic CPU selection to continue to compatible ISA-L or zlib without misclassifying unknown custom bindings.',
     'reconciliation_runtime': 'Reuse an assembled union while guarding export overlap against shared writable storage and preserve evidence ownership, metadata and cleanup.',
 }
+SEMANTIC_REASONS = {
+    '__init__': 'Publish the 24.0.1 package release identity.',
+    'cli': 'Use the sole 24.0.1 launcher and current release identity.',
+    'config': 'Expose semantic task and output choices for TTA and PTA with the 24.0.1 identity.',
+    'inference': 'Consume semantic model logits and confidence without requiring instance masks, using the CUDA TensorRT ring when eligible.',
+    'semantic_inference': 'Decode raw semantic logits into foreground probability and preserve confidence for thresholding and reconciliation.',
+    'semantic_cuda': 'Run semantic probability, filtering and mask publication on CUDA while preserving CPU reference behavior.',
+    'semantic_trt': 'Reuse fixed-shape TensorRT bindings and captured CUDA work across semantic inference batches.',
+    'outputs': 'Publish semantic class-index masks with a reserved ignore value.',
+    'confidence_evidence': 'Record task-neutral prediction scores in retained confidence evidence.',
+    'confidence_storage': 'Store task-neutral prediction scores with their quantization metadata.',
+    'pta': 'Preserve partial semantic coverage and route eligible categorical rendering and publication through resident CUDA work, recording actual CPU and CUDA dispatch counts.',
+    'pta_classification': 'Reuse exact native-plane semantic occupancy and affine metadata to classify only requested PTA outputs.',
+    'pta_config': 'Validate semantic task and save choices for pretraining.',
+    'pta_gpu_publication': 'Assemble semantic labels and ignore regions on CUDA, then publish bounded image batches and report the selected concurrent host PNG encoder.',
+    'pta_augmentation': 'Preserve semantic label and ignore values through pretraining augmentation.',
+    'pta_publication': 'Write semantic labels with the unknown-region ignore value using a qualified PNG filter and run-length configuration with compatible fallback.',
+    'pta_runtime': 'Keep semantic candidate confidence available for pretraining publication.',
+    'pta_workers': 'Carry semantic task and coverage settings through pretraining workers and keep the CUDA rendering path resident across grouped work.',
+    'pta_cuda_masks': 'Render categorical foreground and annotation coverage on CUDA with nearest sampling and checked CPU fallback.',
+    'pta_cuda_cartesian': 'Render Cartesian and tilted Cartesian categorical planes on CUDA while preserving bounded geometric parity.',
+    'pta_cuda_azimuthal': 'Render upright and tilted azimuthal categorical planes on CUDA with wrap and mirror geometry.',
+    'pta_cuda_shells': 'Render radial and spherical categorical planes on CUDA using resident source volumes.',
+    'unification/sampling': 'Version the forward sampling policy and record qualified resident CUDA categorical sampling with bounded parity tolerance.',
+    'pipeline': 'Route semantic predictions through TTA confidence and reconciliation.',
+    'tta_mode': 'Accept semantic task and save modes for test-time augmentation.',
+    'tta_outputs': 'Publish semantic masks from test-time augmentation.',
+    'tta_prediction': 'Apply semantic confidence handling to test-time predictions.',
+    'runtime': 'Record semantic task identity and preserve prediction confidence.',
+    'workers': 'Carry semantic task settings through test-time workers and retire TensorRT ring resources safely.',
+    'examples/external_augmentations/GPU_baseline': 'Declare that baseline geometric augmentation does not require an instance mask.',
+    'examples/external_augmentations/GPU_light': 'Declare that light geometric augmentation does not require an instance mask.',
+    'examples/external_augmentations/GPU_heavy': 'Declare that heavy geometric augmentation does not require an instance mask.',
+    'examples/external_augmentations/GPU_superheavy': 'Declare that superheavy geometric augmentation does not require an instance mask.',
+}
 REMOVAL_REASONS = {
     'examples/external_reconciliation/' + name:
         'Retire this preset from the curated package selection while preserving its authenticated release history.'
@@ -101,6 +150,11 @@ TOOL_REASONS = {
     'tools/qualify_confidence_consolidation.py': 'Qualify consolidated native confidence against original pieces with exact score and known-support parity.',
     'tools/qualify_d1_confidence_bounds.py': 'Qualify cropped and dense confidence capture from the same real generic Radial prediction, preserving exact encoded score/index bytes and device source tensors.',
     'tools/analyze_pipeline_trace.py': 'Interpret bounded task traces with incomplete-capture warnings and GPU compute-credit timing that distinguishes prefetch and result-first ambiguity.',
+    'tools/export_semantic_logits.py': 'Export semantic model logits for confidence-aware OpenVINO, ONNX and TensorRT inference.',
+    'tools/qualify_semantic_trt.py': 'Compare the semantic TensorRT CUDA ring with the direct reference path and record performance.',
+    'tools/qualify_pta_classification.py': 'Qualify semantic PTA classification bypass and exact native-plane occupancy on representative plans.',
+    'tools/qualify_pta_gpu_masks.py': 'Qualify resident CUDA categorical geometry and publication against CPU references, including boundary and ignored-region cases.',
+    'tools/qualify_pta_gpu_render.py': 'Measure the integrated PTA CUDA render, augmentation, nvJPEG and semantic PNG path against a CPU categorical fallback with identical inputs.',
 }
 
 
@@ -229,12 +283,13 @@ def _update_verifier_pins(source, prefix, digest, pins):
     return ''.join(lines)
 
 
-def prepare(*, output_dir, release='22.3.2', write=False):
+def prepare(*, output_dir, release='24.0.1', write=False):
     root, output_dir = ROOT, Path(output_dir).resolve()
     if output_dir.is_relative_to(root):
         raise ValueError('Generated release-review evidence belongs outside the repository')
     spec = RELEASES[release]
-    reasons = {**REASONS, **(THROUGHPUT_REASONS if release == '22.3.2' else {})}
+    reasons = {**REASONS, **(THROUGHPUT_REASONS if release == '22.3.2' else {}),
+               **(SEMANTIC_REASONS if release == '24.0.1' else {})}
     prefix = 'REVIEWED_V' + spec['token'] + '_RELEASE'
     key = 'v' + spec['token'] + '_release_review'
     predecessor_commit = getattr(inventory, prefix + '_PREDECESSOR_COMMIT')
@@ -277,7 +332,7 @@ def prepare(*, output_dir, release='22.3.2', write=False):
             new_source = path.read_text(encoding='utf-8')
             if old_source is not None and inventory.digest(ast.parse(old_source)) == inventory.digest(ast.parse(new_source)):
                 continue
-            reason = reasons[module].format(release=release)
+            reason = reasons.get(module, 'Implement the {release} semantic segmentation contract in this source module.').format(release=release)
             complete = module not in audited
             pin, snapshot, records = review_module(module, old_source, new_source,
                 complete=complete, labels_by_hash=labels_by_hash, reason=reason)
@@ -344,7 +399,7 @@ def prepare(*, output_dir, release='22.3.2', write=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--release', choices=tuple(RELEASES), default='22.3.2')
+    parser.add_argument('--release', choices=tuple(RELEASES), default='24.0.1')
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--write', action='store_true')
     args = parser.parse_args(argv)

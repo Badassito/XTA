@@ -19,6 +19,7 @@ class PtaAugmentationBoundaryTests(unittest.TestCase):
         "_augmented_mask_to_binary",
         "_load_external_python_module",
         "apply_augmentation_pair",
+        "apply_augmentation_pair_with_coverage",
         "assert_augmentation_definition_unchanged",
         "assert_augmentation_did_not_synthesize_mask",
         "inspect_augmentation_definition",

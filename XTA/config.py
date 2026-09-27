@@ -19,9 +19,9 @@ GIB = 1024 ** 3
 
 NRRD_SPACE = "left-posterior-superior"
 
-SCRIPT_VERSION = '22.3.2'
+SCRIPT_VERSION = '24.0.1'
 
-SCRIPT_VERSION_COMPACT = '2232'
+SCRIPT_VERSION_COMPACT = '2401'
 
 SCRIPT_BASENAME = f'GPT-6-Astra-Ultra_v{SCRIPT_VERSION}_SLURM.py'
 
@@ -80,6 +80,7 @@ SAVE_OPTION_TOKENS: Tuple[str, ...] = (
     'images',
     'labels',
     'binary',
+    'semantic',
     'low_quality',
     'nrrd',
     'voxel_volume',
@@ -916,6 +917,10 @@ def build_argparser() -> argparse.ArgumentParser:
     add_reconciliation_arguments(p)
 
     p.add_argument("--input", required=True, type=str, help="Input video path")
+    p.add_argument(
+        "--task", choices=("segment", "semantic"), default="segment",
+        help="YOLO task: instance segmentation or binary semantic segmentation from raw logits",
+    )
     p.add_argument("--output", default=None, type=str, help="Output directory (default ./{Filename}/)")
     p.add_argument(
         "--temp",
@@ -974,9 +979,9 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--conf", default=0.15, type=_bounded_number(float, minimum=0, maximum=1),
-                   help="Prediction confidence threshold in [0,1]")
+                   help="Prediction confidence threshold in [0,1]; semantic uses foreground pixel probabilities")
     p.add_argument("--min_conf", default=0.30, type=_bounded_number(float, minimum=0, maximum=1),
-                   help="Remove prediction-set objects whose combined confidence is below this threshold. 0 disables the check")
+                   help="Remove prediction-set objects whose combined confidence is below this threshold. Semantic uses the same component check with foreground pixel probabilities. 0 disables the check")
     p.add_argument(
         "--quantize", nargs="+", default=None, type=str, metavar="[{gpu,cpu}:]PRECISION",
         help=(
@@ -1124,6 +1129,7 @@ def build_argparser() -> argparse.ArgumentParser:
             "Save one or more output groups: images (active-view image sequences; channel "
             "formats with at least five channels use one grayscale page per channel in multi-page TIFF), labels "
             "(final YOLO segmentation labels), binary (final TIFF sequence plus FFV1 MKV), "
+            "semantic (final source-frame PNG masks, 0 background and 1 foreground), "
             "low_quality[:LOW_QUALITY_DOWNBIN] (one or more isotropic presentation resolutions; "
             "for example low_quality:0.5,1024), nrrd "
             "(single-layer Slicer decomposition plus manifest), voxel_volume (native-space "

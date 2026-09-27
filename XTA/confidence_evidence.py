@@ -1,6 +1,6 @@
-"""Persistent, source-aligned instance-confidence evidence for reconciliation.
+"""Persistent, source-aligned prediction-confidence evidence for reconciliation.
 
-Scores are uint8 maxima of surviving instance scores. Zero explicitly means
+Scores are uint8 maxima of instance scores or semantic foreground probabilities. Zero explicitly means
 unknown: background, unobserved support, and scores quantized to zero are not
 negative evidence. These sidecars never modify the prediction or bridge masks.
 """
@@ -328,7 +328,7 @@ def write_confidence_evidence(path, shape, slice_reader: Callable, *, layer_key,
             schema=SCHEMA, layer_key=str(layer_key), model_name=str(model_name),
             output_shape_tyx=list(shape), exported_axes='(X, Y, t)', dtype='uint8',
             score_semantics=SCORE_SEMANTICS, unknown='score_zero',
-            quantization='round-half-even(clip(instance_score,0,1)*255); quantized zero is unknown',
+            quantization='round-half-even(clip(prediction_score,0,1)*255); quantized zero is unknown',
             projection='maximum over categorical source-address support',
             payload='scores.u8.zlib', index='index.json', payload_sha256=digest.hexdigest(),
             known_voxels=known_count, provenance=_json_value(provenance or {}))

@@ -19,7 +19,7 @@ def manifest():
     value = json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
     if 'v22_3_2_release_review' not in value:
         pytest.skip('Final publication throughput review has not been written')
-    return value
+    return inventory._without_reviewed_v24_release(value)
 
 
 def test_committed_predecessor_and_all_of_its_records_remain_authenticated(manifest):
@@ -70,10 +70,12 @@ def test_reauthenticated_review_cannot_rewrite_independent_pins(manifest, mutati
 
 def test_current_sources_and_qualification_tools_match_the_review(manifest):
     review = inventory.reviewed_v22_3_2_release_contract(manifest, manifest['v21_review'])
+    current = json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
+    successors = tuple(current[key] for key in ('v24_release_review',) if key in current)
     trees = {item['module']: ast.parse((inventory.PACKAGE / (item['module'] + '.py')).read_text(encoding='utf-8'))
              for item in review['module_snapshots']}
-    inventory.verify_v22_3_source_snapshots(review, trees)
-    inventory.verify_v22_3_validation_tools(review)
+    inventory.verify_v22_3_source_snapshots(review, trees, successors)
+    inventory.verify_v22_3_validation_tools(review, successors)
     for module in ('pipeline', 'confidence_consolidation', 'confidence_publication',
                    'd1_confidence_retirement', 'cuda_d1', 'inference', 'runtime', 'tta_scheduler',
                    'outputs', 'reconciliation_runtime', 'scheduler_diagnostics',
@@ -82,7 +84,7 @@ def test_current_sources_and_qualification_tools_match_the_review(manifest):
         altered[module] = copy.deepcopy(trees[module])
         altered[module].body.append(ast.Pass())
         with pytest.raises(RuntimeError, match='v22.3.2 reviewed source changed'):
-            inventory.verify_v22_3_source_snapshots(review, altered)
+            inventory.verify_v22_3_source_snapshots(review, altered, successors)
 
 
 @pytest.mark.parametrize('path', [

@@ -133,7 +133,7 @@ class CylindricalConfigTests(unittest.TestCase):
         self.assertEqual(trajectories[0]["channel_boundary"], "clamp_radius_within_patch_trajectory")
         self.assertIn("central_core_excluded", trajectories[0]["coverage_domain"])
         self.assertIsNone(radial_view_manifest_record(_View()))
-        self.assertEqual(forward_sampling_policy().policy_version, 21)
+        self.assertEqual(forward_sampling_policy().policy_version, 23)
 
     def test_shell_plan_metadata_retains_source_center_even_when_radius_range_matches(self):
         original = radial_view_plan_metadata(_radial_view())

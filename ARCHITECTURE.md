@@ -3,7 +3,7 @@
 XTA provides test-time augmentation (TTA), pretraining augmentation (PTA), and
 label-time augmentation (LTA) for volumes. The implementation lives in the
 importable `XTA` package. The versioned launcher
-`GPT-6-Astra-Ultra_v22.3.2_SLURM.py`, installed `xta` command, and `python -m XTA`
+`GPT-6-Astra-Ultra_v24.0.1_SLURM.py`, installed `xta` command, and `python -m XTA`
 all enter `XTA.cli.run()`.
 
 This document describes implemented behavior, ownership, and operating controls.
@@ -63,9 +63,10 @@ source hash, execution strategy and measured counts are written to
 `reconciliation/manifest.json`; counts intentionally not rescanned are null.
 
 Reconciliation runs retain confidence sidecars under `reconciliation_evidence`.
-Values are uint8 maxima of observed detector instance
-scores; zero is unknown. They are separate from binary masks and are not voxel
-probabilities. Collection is independent of cleanup thresholds and preserves the
+Values are uint8 maxima of observed detector instance scores for `--task segment`,
+or foreground pixel probabilities for `--task semantic`; zero is unknown.
+They are separate from binary masks and are not calibrated source-voxel probabilities.
+Collection is independent of cleanup thresholds and preserves the
 existing CPU/GPU, resident D1 and tile mask paths. Non-confidence policies retain
 native score blocks or piece manifests with explicit payload coordinates and
 source geometry. D1 shards and accepted tile pieces are preserved without
@@ -340,6 +341,83 @@ radius ties, and restored voxel centers. CPU and CUDA paths skip proven empty
 ranges while retaining categorical selection arithmetic.
 
 ## TTA inference, scheduling, and completion
+
+### YOLO task and semantic outputs
+
+TTA and PTA accept `--task segment|semantic`, defaulting to `segment`. LTA does
+not expose this flag. The semantic path supports a single foreground class:
+one output channel uses sigmoid, while two channels use softmax with background
+at index 0 and foreground at index 1. Models with other class counts fail with
+an explanatory error. Semantic decoding lives in `semantic_inference`; instance
+mask composition stays in `inference`, with shared native accumulation and cleanup.
+
+Semantic TTA reads floating-point `[B,C,H,W]` logits before Ultralytics' final
+threshold or argmax. It resizes logits to the model raster, calculates foreground
+probabilities, and applies `--conf` directly, including values below 0.5.
+`--min_conf` retains the existing per-slice connected-component rule: a component
+must contain a confidence value at or above the threshold, using the established
+uint8 quantization. Zero disables this check. Radius cleanup, interpolation,
+projection and reconciliation use the same binary support and retained confidence
+contracts as instance inference. Reconciliation evidence takes maxima of observed
+foreground probabilities through the existing categorical coordinate mappings.
+
+CUDA supports semantic `.pt` models and raw-logit exported backends; OpenVINO
+supports a single raw-logit output. `semantic_trt` provides a separate TensorRT
+ring for fixed-shape semantic engines. Two private persistent contexts and static input
+and logit buffers overlap preparation, inference and native postprocessing.
+Eligible batch-one resident sources render directly into the input bindings;
+other fixed batches consume the existing CUDA input staging. CUDA inference
+graphs are used when capture succeeds and remain reusable across tasks. The private
+contexts leave AutoBackend's own context and binding addresses untouched, at the
+cost of one additional context compared with the instance ring's borrowing scheme.
+Both contexts and postprocessing kernels
+are validated before source consumption. After consumption, failures stop the
+task instead of replaying a partially written output. Worker retirement drains
+the ring before releasing its contexts and persistent buffers.
+
+`semantic_cuda` fuses logit interpolation, foreground probability, threshold,
+nearest native affine sampling and uint8 confidence encoding. An eight-connected
+union-find filter retains components whose maximum confidence meets `--min_conf`,
+without per-frame host reads. The fused path writes directly into native union,
+confidence and count buffers, avoiding intermediate plane copies and host counts.
+Device flags skip component work for empty frames and frames whose foreground is
+already above the confidence threshold. Its bounded per-thread/stream workspace is reused
+and released during inference retirement. Native masks and confidence accumulate
+on the GPU until the existing bounded retirement copies publish them. This path
+also accelerates semantic `.pt` inference's confidence cleanup.
+
+`YOLO_TTA_SEMANTIC_TRT_RING=0` disables the ring; setting
+`YOLO_TTA_SEMANTIC_GPU_CLEANUP=0` also restores the earlier host component path.
+`YOLO_TTA_SEMANTIC_TRT_GRAPHS=0` disables inference graph capture. Positive
+`--min_radius`, wrapped Azimuthal padding, unavailable CUDA kernels, or memory
+admission failure retain supported generic paths. External policy inverse mapping
+uses the generic semantic path. The instance D1/prototype ring remains separate.
+`tools/qualify_semantic_trt.py` compares the earlier path, GPU cleanup alone, and
+the semantic ring using the same engine/input, with GPU heatsoak and explicit
+dispatch checks. It records throughput, memory and numerical differences.
+
+Exports containing an in-graph argmax
+are rejected because their class IDs cannot recover confidence. Current Ultralytics
+ONNX, OpenVINO and TensorRT exports can bake in this operation. The maintained
+`tools/export_semantic_logits.py` helper exports the checkpoint's ordinary
+evaluation path to ONNX or OpenVINO without that reduction:
+
+```bash
+python tools/export_semantic_logits.py --model yolo26n-sem.pt --output semantic.xml --imgsz 2048 --batch 1
+python tools/export_semantic_logits.py --model yolo26n-sem.pt --output semantic.onnx --imgsz 2048 --batch 1
+```
+
+The OpenVINO XML can be passed as `--model cpu:semantic.xml`. A TensorRT engine
+built from the ONNX graph preserves its raw `[B,1,H/8,W/8]` or `[B,2,H/8,W/8]`
+logits. Input channels are read from the checkpoint; use matching `--imgsz`,
+`--batch`, and `--channel_format` during inference. The default export preserves
+FP32 weights; `--compress-fp16` opts into OpenVINO weight compression.
+
+`--save semantic` is independent of task selection. In TTA it writes the final
+source-volume mask as lossless grayscale PNGs in
+`semantic_masks/{input_stem}_0001.png`, with `0` background and `1` foreground.
+These source-frame outputs differ from `--save images`, which saves each rendered
+model-input view and augmentation. Existing binary exports keep their encoding.
 
 ### Scheduler and process boundaries
 
@@ -651,6 +729,59 @@ augmentation, dataset planning, and publication. The parent owns candidate
 membership, augmentation versions, train/validation splitting, and output
 identity, so asynchronous completion cannot change the dataset definition.
 
+Semantic mask publication skips the all-view foreground-classification pass when
+`--background_percent 1` retains all candidates and no offline copies are requested
+(for example `--augmentation_ratio 1`). Missing-label eligibility and ignored-pixel
+coverage still apply. A small full-Transverse-only check retains the foreground
+preservation invariant. Unmeasured class totals are identified as such in the
+summary and manifest. This planning decision does not disable the GPU policy or
+nvJPEG publication backend; those begin after planning completes.
+
+When classification is required, `pta_classification` extracts each native mask
+plane once and tests full/tile occupancy on the publisher's exact categorical
+sampling lattice. Cached one-dimensional OpenCV index maps avoid constructing
+large upsampled output masks for axis-aligned transforms; quarter turns are handled
+by transposing axes. Other in-plane affines retain an exact raster fallback using
+the cached native plane. Tilted Cartesian stack blending uses the canonical
+renderer. Globally empty foreground or coverage volumes bypass projection, but
+an empty source-space intersection alone is not sufficient for that shortcut.
+Jobs run plan-major to keep geometry caches warm without changing dataset order.
+Progress logs report jobs and full/tile queries by family, then native-plane and
+fast/fallback counts. `YOLO_TTA_PTA_SEMANTIC_CLASSIFICATION=0` selects the canonical
+reference classifier for comparison. `tools/qualify_pta_classification.py` checks
+decision parity and local CPU timings after heatsoak.
+
+`--save semantic` writes lossless single-channel PNG labels under `masks/`, with
+the same stems and train/validation layout as dataset images. Pixel values are
+`0` background, `1` foreground, and `255` ignored. The binary semantic dataset
+keeps `nc: 1` and `names: ['0']`; `masks_dir: masks` selects the dense-mask loader.
+This follows the [Ultralytics semantic dataset convention](https://docs.ultralytics.com/datasets/semantic/).
+For the user's original split layout, the corresponding configuration is:
+
+```yaml
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+channels: 1
+nc: 1
+names: ['0']
+masks_dir: masks
+```
+
+With forced partial labels, a missing YOLO label file means unknown coverage;
+an existing empty file is known background. Semantic export carries that coverage
+separately from foreground through geometry and paired augmentation, then writes
+unknown regions as `255`. It never treats the ignore value as a foreground class.
+PNG labels retain their integer values regardless of the selected image format.
+CPU augmentation samples one transform for foreground and coverage together,
+including crops whose placement depends on the foreground mask. The current GPU
+policy API accepts one mask per call, so forced partial semantic export requires
+`mask_independent_geometry = True` on the policy before replaying coverage with
+the same seed. The four bundled GPU policies declare this property. A custom
+policy must guarantee it; policies without that declaration fail explicitly.
+`--task semantic --save images labels` can also publish a polygon-backed dataset;
+its YAML omits `masks_dir`. Use semantic PNG output to retain ignored regions.
+
 `--save binary` publishes the exact retained original and augmented masks as
 one-bit DEFLATE TIFFs under `binary_masks`, preserving image/label stems and
 train/validation subdirectories. These masks preserve holes and thin objects.
@@ -676,6 +807,26 @@ process owns each visible CUDA device; bounded CPU producers prepare compatible
 full-frame/tile items while earlier GPU work runs. VRAM admission and deterministic
 OOM splitting bound policy batches. GPU example policies implement separable
 Gaussian filtering for blur and elastic-field smoothing.
+
+GPU workers also keep foreground and annotation coverage volumes resident when
+VRAM admission succeeds. `pta_cuda_masks` owns each shared-volume generation;
+the Cartesian, azimuthal, and shell modules project directly into the final
+full-frame or tile raster. Nearest categorical sampling and tilted stack blending
+remain separate from intensity interpolation. Spherical patch direction maps
+are prepared once per patch and retained in a bounded GPU cache. Source upload,
+projection events, policy reads, and retirement use explicit stream ordering.
+The four bundled GPU policies accept CUDA masks, so originals and augmented
+versions avoid per-item CPU mask projection and host-to-device mask copies.
+
+`PTA_GPU_CATEGORICAL_RESERVE_MIB` leaves 2048 MiB of default admission headroom
+in addition to projection temporaries. Insufficient VRAM or unsupported geometry
+selects the CPU categorical path before kernel execution and prints the reason;
+device failures after launch propagate. Manifest counters identify the backend
+actually used. `YOLO_TTA_PTA_GPU_CATEGORICAL=0` selects the CPU reference path.
+`tools/qualify_pta_gpu_masks.py` checks family and tile parity;
+`tools/qualify_pta_gpu_render.py` measures the complete native nvJPEG and semantic
+PNG worker path with the same publisher in both arms. Local GPU checks establish
+correctness and bottlenecks; they do not predict multi-GPU cluster throughput.
 
 The offline augmentation backend follows the selected policy's export:
 `build_gpu_augmentation` uses CUDA; supported CPU exports such as
@@ -703,14 +854,30 @@ their actual byte count is admitted before submission. The newly encoded batch
 can temporarily add producer-owned memory while that byte admission waits.
 Both queues allow one oversized batch exclusively. These windows bound retained
 publication work; policy/publication intermediates, encoder workspaces, and CPU mask
-processing have separate memory costs. Polygon conversion and file publication
-each use up to four CPU workers per CUDA owner. Results and warnings merge in
+processing have separate memory costs. Polygon conversion uses up to four CPU
+workers per CUDA owner, and file publication uses up to eight, bounded by the
+owner's CPU budget (`PTA_GPU_PUBLICATION_FILE_THREADS` overrides the latter).
+Semantic-only publication combines foreground and coverage into one 0/1/255
+plane on CUDA before download. JPEG and semantic files share one queue slot per
+batch. PNG compression and filesystem writes still run on the host, with bounded
+parallelism. Class-index PNGs use lossless RLE compression without adaptive row
+filtering, which avoids scanning candidate filters for low-cardinality masks.
+OpenCV builds exposing filter control use that encoder; older builds use the
+same PNG grayscale layout with Python's native zlib compressor. Startup logs
+identify the selected encoder. `PTA_SEMANTIC_PNG_CODEC=legacy` restores the former
+OpenCV compression settings for comparison. Within an admitted host batch,
+semantic PNG work borrows the polygon executor while JPEG files use the file
+executor. Both groups finish before the shared host reservation releases, even
+after a write fails. `PTA_SEMANTIC_PNG_OVERLAP=0` selects sequential publication
+for comparison. Results and warnings merge in
 submission order, and every admitted consumer drains before a task reports
 completion or failure. Unfenced CUDA owners are retained and the worker is stopped.
 
 `PTA_GPU_PUBLICATION_PIPELINE=1` enables this overlap by default; setting it to
 `0` restores synchronous publication. `PTA_GPU_PUBLICATION_GPU_MIB` and
 `PTA_GPU_PUBLICATION_HOST_MIB` set the corresponding retained-byte windows.
+Publication stage timings are printed every 60 seconds by default;
+`PTA_GPU_PUBLICATION_REPORT_SEC` changes that interval, with zero disabling it.
 CPU budgets reflect actual phase overlap: initial planning and runs without
 volume prefetch use the full planning budget, while overlapping preparation
 reserves CPU capacity alongside active render workers. GPU owners retain their

@@ -534,6 +534,8 @@ DEFAULT_LABEL_PATTERN = "labels/{Filename}_%04d.txt"
 
 DEFAULT_BINARY_PATTERN = "binary_masks/{Filename}_Binary_%04d.tiff"
 
+DEFAULT_SEMANTIC_PATTERN = "semantic_masks/{Filename}_%04d.png"
+
 def _resolve_output_pattern(pattern_value: Optional[str], default_pattern: str, out_dir: Path, stem: str) -> Optional[Path]:
     if pattern_value is None:
         return None
@@ -705,6 +707,13 @@ def _write_binary_tiff_frame(mask2d: np.ndarray, out_path: Path) -> None:
         compression='deflate',
     )
 
+def _write_semantic_png_frame(mask2d: np.ndarray, out_path: Path) -> None:
+    """Write class IDs 0 (background) and 1 (foreground) as grayscale PNG."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    class_ids = np.ascontiguousarray(np.asarray(mask2d) != 0, dtype=np.uint8)
+    if not cv2.imwrite(str(out_path), class_ids):
+        raise RuntimeError(f'Failed to write semantic mask: {out_path}')
+
 def write_yolo_labels_from_pattern(
     mask_u8: np.ndarray,
     pattern_path: Path,
@@ -758,6 +767,34 @@ def write_binary_tiff_sequence_from_pattern(
             pattern_path,
             total,
             stale_extensions=(pattern_path.suffix, '.tif', '.tiff'),
+        )
+    return pattern_path.parent
+
+def write_semantic_png_sequence_from_pattern(
+    mask_u8: np.ndarray,
+    pattern_path: Path,
+    workers: int = 1,
+    show_progress: bool = True,
+) -> Path:
+    pattern_path.parent.mkdir(parents=True, exist_ok=True)
+    total = int(mask_u8.shape[0])
+    with _staged_frame_sequence(pattern_path) as stage_pattern:
+        def _write_frame(t: int) -> None:
+            fp = _format_frame_path(stage_pattern, int(t) + 1)
+            _write_semantic_png_frame(np.asarray(mask_u8[int(t)]), fp)
+
+        parallel_for_indices(
+            total,
+            _write_frame,
+            max_workers=choose_slice_parallel_workers(int(workers), total),
+            desc=f"Writing semantic PNG sequence ({pattern_path.parent.name})",
+            show_progress=show_progress,
+        )
+        _publish_staged_frame_sequence(
+            stage_pattern,
+            pattern_path,
+            total,
+            stale_extensions=(pattern_path.suffix, '.png'),
         )
     return pattern_path.parent
 
@@ -5423,6 +5460,7 @@ def collect_pipeline_output_futures(
     save_high_quality: bool,
     save_binary_pattern_value: Optional[str],
     save_labels_pattern_value: Optional[str],
+    save_semantic_pattern_value: Optional[str] = None,
     tag: Optional[str] = None,
     frame_workers: int = 1,
     show_progress: bool = False,
@@ -5470,6 +5508,21 @@ def collect_pipeline_output_futures(
         ))
         result_paths["binary_tiff_dir"] = binary_pattern.parent
         result_paths["binary_video"] = binary_video_path
+
+    semantic_pattern = _resolve_output_pattern(
+        save_semantic_pattern_value, DEFAULT_SEMANTIC_PATTERN, out_dir, stem,
+    )
+    if semantic_pattern is not None:
+        if tag is not None:
+            semantic_pattern = _tag_frame_pattern(semantic_pattern, tag)
+        futures.append(executor.submit(
+            write_semantic_png_sequence_from_pattern,
+            mask_u8,
+            semantic_pattern,
+            int(frame_workers),
+            show_progress,
+        ))
+        result_paths['semantic_png_dir'] = semantic_pattern.parent
 
 
     return result_paths, futures
