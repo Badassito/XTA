@@ -36,7 +36,7 @@ RELEASES = {
                       'tools/qualify_confidence_consolidation.py',
                       'tools/qualify_d1_confidence_bounds.py',
                       'tools/analyze_pipeline_trace.py')),
-    '23.0.0': dict(token='23', previous_token='22_3_2',
+    '23.0.1': dict(token='23', previous_token='22_3_2',
                    feature='yolo-semantic-segmentation',
                    validation_tools=(
                        'tools/compare_reconciliation.py',
@@ -104,9 +104,9 @@ THROUGHPUT_REASONS = {
     'reconciliation_runtime': 'Reuse an assembled union while guarding export overlap against shared writable storage and preserve evidence ownership, metadata and cleanup.',
 }
 SEMANTIC_REASONS = {
-    '__init__': 'Publish the 23.0.0 package release identity.',
-    'cli': 'Use the sole 23.0.0 launcher and current release identity.',
-    'config': 'Expose semantic task and output choices for TTA and PTA with the 23.0.0 identity.',
+    '__init__': 'Publish the 23.0.1 package release identity.',
+    'cli': 'Use the sole 23.0.1 launcher and current release identity.',
+    'config': 'Expose semantic task and output choices for TTA and PTA with the 23.0.1 identity.',
     'inference': 'Consume semantic model logits and confidence without requiring instance masks, using the CUDA TensorRT ring when eligible.',
     'semantic_inference': 'Decode raw semantic logits into foreground probability and preserve confidence for thresholding and reconciliation.',
     'semantic_cuda': 'Run semantic probability, filtering and mask publication on CUDA while preserving CPU reference behavior.',
@@ -283,13 +283,13 @@ def _update_verifier_pins(source, prefix, digest, pins):
     return ''.join(lines)
 
 
-def prepare(*, output_dir, release='23.0.0', write=False):
+def prepare(*, output_dir, release='23.0.1', write=False):
     root, output_dir = ROOT, Path(output_dir).resolve()
     if output_dir.is_relative_to(root):
         raise ValueError('Generated release-review evidence belongs outside the repository')
     spec = RELEASES[release]
     reasons = {**REASONS, **(THROUGHPUT_REASONS if release == '22.3.2' else {}),
-               **(SEMANTIC_REASONS if release == '23.0.0' else {})}
+               **(SEMANTIC_REASONS if release == '23.0.1' else {})}
     prefix = 'REVIEWED_V' + spec['token'] + '_RELEASE'
     key = 'v' + spec['token'] + '_release_review'
     predecessor_commit = getattr(inventory, prefix + '_PREDECESSOR_COMMIT')
@@ -399,7 +399,7 @@ def prepare(*, output_dir, release='23.0.0', write=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--release', choices=tuple(RELEASES), default='23.0.0')
+    parser.add_argument('--release', choices=tuple(RELEASES), default='23.0.1')
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--write', action='store_true')
     args = parser.parse_args(argv)

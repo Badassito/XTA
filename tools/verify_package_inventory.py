@@ -106,7 +106,7 @@ REVIEWED_V22_1_RELEASE_PRESERVED_MODULES = {
 # appendix is finalized only after runtime integration and qualification.
 REVIEWED_V23_RELEASE_PREDECESSOR_COMMIT = '9414dde87dc7391df5b37d15b669ba7be859efea'
 REVIEWED_V23_RELEASE_PREDECESSOR_SHA256 = '9f28ffd003255ddb48a4b6f6aed658f62eed7673a798c9fec3c3db8389a7ef62'
-REVIEWED_V23_RELEASE_SHA256 = 'eda6e793f8576e9f643b967ce8579522c79bc6a709246db8da3721706b499d15'
+REVIEWED_V23_RELEASE_SHA256 = 'a7567a5f70c91b6e34763834aba59a7f3a010e8f789ca65cbe149d1396a18ea8'
 REVIEWED_V23_RELEASE_PREDECESSOR_MODULES = {'__init__': {'ast_sha256': 'dcde1466868161785feb9d9a4cdd945d657e659acf3254fd1c098acdea90f855',
               'statements_sha256': '78f5dcfdf216ef6cae28880ce30eac9e5cb9895f9ad66a5318c341649c758e13'},
  'cli': {'ast_sha256': '78e224a912de718f7d5e43647ac20823d15594e54924acc89efe08208179b3f5',
@@ -2293,7 +2293,7 @@ def reviewed_v23_release_contract(manifest, v21, *earlier_patches):
     prior = {name: value for name, value in manifest.items() if name != key}
     encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
     if hashlib.sha256(encoded).hexdigest() != REVIEWED_V23_RELEASE_PREDECESSOR_SHA256:
-        raise RuntimeError('v23.0.0 predecessor inventory changed; preserve every historical record')
+        raise RuntimeError('v23.0.1 predecessor inventory changed; preserve every historical record')
     ordered_keys = (
         *(f'v21_0_{index}_review' for index in range(1, 7)),
         'v21_1_review', 'v21_1_1_review', 'v21_1_2_review',
@@ -2305,7 +2305,7 @@ def reviewed_v23_release_contract(manifest, v21, *earlier_patches):
         'v22_3_1_release_review', 'v22_3_2_release_review',
     )
     review = _reviewed_v21_patch_contract(
-        manifest, prior['v21_review'], key=key, release='23.0.0',
+        manifest, prior['v21_review'], key=key, release='23.0.1',
         expected_digest=REVIEWED_V23_RELEASE_SHA256,
         previous_digest=REVIEWED_V22_3_2_RELEASE_SHA256,
         earlier_patches=tuple(prior[name] for name in ordered_keys),
@@ -2313,11 +2313,11 @@ def reviewed_v23_release_contract(manifest, v21, *earlier_patches):
     if (review.get('predecessor_commit') != REVIEWED_V23_RELEASE_PREDECESSOR_COMMIT
             or review.get('predecessor_inventory_sha256') != REVIEWED_V23_RELEASE_PREDECESSOR_SHA256
             or review.get('feature') != 'yolo-semantic-segmentation'):
-        raise RuntimeError('v23.0.0 review has an unexpected predecessor or feature')
+        raise RuntimeError('v23.0.1 review has an unexpected predecessor or feature')
     snapshots = review.get('module_snapshots', ())
     modules = [item.get('module') for item in snapshots]
     if len(modules) != len(set(modules)) or set(modules) != set(REVIEWED_V23_RELEASE_PREDECESSOR_MODULES):
-        raise RuntimeError('v23.0.0 source snapshot coverage differs')
+        raise RuntimeError('v23.0.1 source snapshot coverage differs')
     for item in snapshots:
         module = item['module']
         previous = REVIEWED_V23_RELEASE_PREDECESSOR_MODULES[module]
@@ -2325,14 +2325,14 @@ def reviewed_v23_release_contract(manifest, v21, *earlier_patches):
         historical_digest = hashlib.sha256(json.dumps(historical, separators=(',', ':')).encode()).hexdigest()
         if (item.get('previous_ast_sha256') != previous['ast_sha256']
                 or historical_digest != previous['statements_sha256']):
-            raise RuntimeError(f'v23.0.0 source predecessor changed: {module}')
+            raise RuntimeError(f'v23.0.1 source predecessor changed: {module}')
         if 'removed' in item:
-            raise RuntimeError(f'v23.0.0 has an unreviewed module removal: {module}')
+            raise RuntimeError(f'v23.0.1 has an unreviewed module removal: {module}')
         for value in (item.get('ast_sha256'), *historical, *item.get('top_level', ())):
             if not isinstance(value, str) or len(value) != 64 or any(char not in '0123456789abcdef' for char in value):
-                raise RuntimeError(f'v23.0.0 source snapshot has an invalid digest: {module}')
+                raise RuntimeError(f'v23.0.1 source snapshot has an invalid digest: {module}')
         if not item.get('reason'):
-            raise RuntimeError(f'v23.0.0 source snapshot has no review reason: {module}')
+            raise RuntimeError(f'v23.0.1 source snapshot has no review reason: {module}')
         positions = []
         for record in review['definitions'] + review['statements']:
             if record['module'] != module:
@@ -2341,18 +2341,18 @@ def reviewed_v23_release_contract(manifest, v21, *earlier_patches):
             previous_index = record.get('previous_index')
             if (type(current_index) is not int or not 0 <= current_index < len(item['top_level'])
                     or item['top_level'][current_index] != record['sha256']):
-                raise RuntimeError(f'v23.0.0 statement position differs: {module}')
+                raise RuntimeError(f'v23.0.1 statement position differs: {module}')
             if previous_index is None:
                 if record['previous_sha256'] is not None:
-                    raise RuntimeError(f'v23.0.0 new statement has an unexpected predecessor: {module}')
+                    raise RuntimeError(f'v23.0.1 new statement has an unexpected predecessor: {module}')
             elif (type(previous_index) is not int or not 0 <= previous_index < len(historical)
                     or historical[previous_index] != record['previous_sha256']):
-                raise RuntimeError(f'v23.0.0 statement predecessor changed: {module}')
+                raise RuntimeError(f'v23.0.1 statement predecessor changed: {module}')
             positions.append(current_index)
         if len(positions) != len(set(positions)):
-            raise RuntimeError(f'v23.0.0 source has duplicate reviewed positions: {module}')
+            raise RuntimeError(f'v23.0.1 source has duplicate reviewed positions: {module}')
     if any(record['module'] not in set(modules) for record in review['definitions'] + review['statements']):
-        raise RuntimeError('v23.0.0 statement has no complete source snapshot')
+        raise RuntimeError('v23.0.1 statement has no complete source snapshot')
     reviewed_radial_module_hashes(prior['v21_review'], (*tuple(prior[name] for name in ordered_keys), review))
     reviewed_radial_definition_hashes(prior['v21_review'], (*tuple(prior[name] for name in ordered_keys), review))
     validation_tools = review.get('validation_tools', ())
@@ -2361,14 +2361,14 @@ def reviewed_v23_release_contract(manifest, v21, *earlier_patches):
             *prior_tools, 'tools/export_semantic_logits.py', 'tools/qualify_semantic_trt.py',
             'tools/qualify_pta_classification.py', 'tools/qualify_pta_gpu_masks.py',
             'tools/qualify_pta_gpu_render.py']:
-        raise RuntimeError('v23.0.0 validation-tool review has missing or duplicate paths')
+        raise RuntimeError('v23.0.1 validation-tool review has missing or duplicate paths')
     for item in validation_tools:
         if item.get('previous_sha256') != prior_tools.get(item['path']):
-            raise RuntimeError('v23.0.0 validation-tool predecessor changed')
+            raise RuntimeError('v23.0.1 validation-tool predecessor changed')
         value = item.get('sha256')
         if (not item.get('reason') or not isinstance(value, str) or len(value) != 64
                 or any(char not in '0123456789abcdef' for char in value)):
-            raise RuntimeError('v23.0.0 validation-tool review has an invalid digest or reason')
+            raise RuntimeError('v23.0.1 validation-tool review has an invalid digest or reason')
     return review
 
 

@@ -31608,7 +31608,7 @@
     ]
   },
   "v23_release_review": {
-    "release": "23.0.0",
+    "release": "23.0.1",
     "feature": "yolo-semantic-segmentation",
     "previous_review_sha256": "dcf330049b7d26f219cf96b723d6b4c8368cb9eacad4ca715b867ee1528864a5",
     "predecessor_commit": "9414dde87dc7391df5b37d15b669ba7be859efea",
@@ -31638,7 +31638,7 @@
         "sha256": "21d1013b0faeb5497bd7df2bd295dfad8ddd11d2c7e5ec25fc80462fbe3f171b",
         "previous_index": 68,
         "current_index": 68,
-        "reason": "Expose semantic task and output choices for TTA and PTA with the 23.0.0 identity.",
+        "reason": "Expose semantic task and output choices for TTA and PTA with the 23.0.1 identity.",
         "name": "build_argparser"
       },
       {
@@ -32825,30 +32825,30 @@
       {
         "module": "__init__",
         "previous_sha256": "0d2a66a4871e930f7f256fbf274dbd427306b8a6ec354e109a688d608f769374",
-        "sha256": "658d82428dbdf17242215836aa31ef520e59f17ae27942b272f763e4ce63bf24",
+        "sha256": "72bf03cd46a770253d23b6d1c1ebde2bcbbd449f98c438b629b3796ab07db104",
         "previous_index": 1,
         "current_index": 1,
-        "reason": "Publish the 23.0.0 package release identity.",
+        "reason": "Publish the 23.0.1 package release identity.",
         "label": "Assign:7",
         "binding": "__version__"
       },
       {
         "module": "cli",
         "previous_sha256": "36d4c7c6e25358bb933f7e0c11335b1b14b8842b5021e0a96850452a4bcb21a3",
-        "sha256": "26152cf4ef6d7a8567cdc0a1d8cb09a21d439c26b55064d2c80eaa0a0bde5f49",
+        "sha256": "cd3eaa1e76414a159e517ec85e2fa266f64d970de8f9a4c1c4d315fab15e1bbf",
         "previous_index": 7,
         "current_index": 7,
-        "reason": "Use the sole 23.0.0 launcher and current release identity.",
+        "reason": "Use the sole 23.0.1 launcher and current release identity.",
         "label": "Assign:13",
         "binding": "SCRIPT_VERSION"
       },
       {
         "module": "cli",
         "previous_sha256": "0855355ec85c03cbf1e388ce33bfeecbb83f2237c7014c40ea930a9790f120fb",
-        "sha256": "5d3590bf8e7cdbf86ce638149ff8ba34fc1445f2faedad9f710e5cd300a7331e",
+        "sha256": "5c5a8a19a926667a8822cc09652a89cac49fd3475d8798fed3d9d0b2bcf8f0ca",
         "previous_index": 8,
         "current_index": 8,
-        "reason": "Use the sole 23.0.0 launcher and current release identity.",
+        "reason": "Use the sole 23.0.1 launcher and current release identity.",
         "label": "Assign:14",
         "binding": "SCRIPT_BASENAME"
       },
@@ -32864,20 +32864,20 @@
       {
         "module": "config",
         "previous_sha256": "36d4c7c6e25358bb933f7e0c11335b1b14b8842b5021e0a96850452a4bcb21a3",
-        "sha256": "26152cf4ef6d7a8567cdc0a1d8cb09a21d439c26b55064d2c80eaa0a0bde5f49",
+        "sha256": "cd3eaa1e76414a159e517ec85e2fa266f64d970de8f9a4c1c4d315fab15e1bbf",
         "previous_index": 10,
         "current_index": 10,
-        "reason": "Expose semantic task and output choices for TTA and PTA with the 23.0.0 identity.",
+        "reason": "Expose semantic task and output choices for TTA and PTA with the 23.0.1 identity.",
         "label": "Assign:22",
         "binding": "SCRIPT_VERSION"
       },
       {
         "module": "config",
         "previous_sha256": "7ea57202fecb4df44b160288b307f38f1511f1fea996f126ee6f724b1086a218",
-        "sha256": "861da12247225fefb3a4c816698c2dd2e8236d94963d0b47d76a39ebcf6fc6a8",
+        "sha256": "ec842f161872e0227cf89462773ef51a0b832e3bfb4b843c1e0397ede0a97370",
         "previous_index": 11,
         "current_index": 11,
-        "reason": "Expose semantic task and output choices for TTA and PTA with the 23.0.0 identity.",
+        "reason": "Expose semantic task and output choices for TTA and PTA with the 23.0.1 identity.",
         "label": "Assign:24",
         "binding": "SCRIPT_VERSION_COMPACT"
       },
@@ -32887,7 +32887,7 @@
         "sha256": "d5eb5a6bb9cb23ec75a1851a9b10e3a25c1432d745901274774758f574b69e79",
         "previous_index": 16,
         "current_index": 16,
-        "reason": "Expose semantic task and output choices for TTA and PTA with the 23.0.0 identity.",
+        "reason": "Expose semantic task and output choices for TTA and PTA with the 23.0.1 identity.",
         "label": "binding_SAVE_OPTION_TOKENS"
       },
       {
@@ -33785,7 +33785,7 @@
       {
         "module": "__init__",
         "previous_ast_sha256": "dcde1466868161785feb9d9a4cdd945d657e659acf3254fd1c098acdea90f855",
-        "ast_sha256": "562eab78dced808fc19de74490221a2d61deb357870611a9e1b1d7f134abce6a",
+        "ast_sha256": "21d2104eabf5668c6e85e50add4116771aea4a9c2aac28c9061bfcedc5c2a0dc",
         "previous_top_level": [
           "0c1575026580fa0a5e9717e86abe1232abb9928df16bd19a739c0aee71e2d77d",
           "0d2a66a4871e930f7f256fbf274dbd427306b8a6ec354e109a688d608f769374",
@@ -33793,15 +33793,15 @@
         ],
         "top_level": [
           "0c1575026580fa0a5e9717e86abe1232abb9928df16bd19a739c0aee71e2d77d",
-          "658d82428dbdf17242215836aa31ef520e59f17ae27942b272f763e4ce63bf24",
+          "72bf03cd46a770253d23b6d1c1ebde2bcbbd449f98c438b629b3796ab07db104",
           "1c7acf86f12ad2e1df879ddb7ea146e7f7dd8d752eb31d218e53d726638d8f78"
         ],
-        "reason": "Publish the 23.0.0 package release identity."
+        "reason": "Publish the 23.0.1 package release identity."
       },
       {
         "module": "cli",
         "previous_ast_sha256": "78e224a912de718f7d5e43647ac20823d15594e54924acc89efe08208179b3f5",
-        "ast_sha256": "d610d42c93846831cda307ff93ead26a179584f57a5d6f1cc87fee06ee5aa326",
+        "ast_sha256": "bd802845b81ba25c92a58540b63b17f470640e59af941a0f990c10c869547cc0",
         "previous_top_level": [
           "98db0637533a97786874acfe467deb746378bead6f56bda80452bd27950e004f",
           "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
@@ -33832,8 +33832,8 @@
           "f7252e3c1dbe1d5edf1f34c020a58a05b55f706b2c1d9479eae91f9a9d4be275",
           "8368df2bb36167e4fa571870123a9242a3b50b9568c9da0f314f336b405e1ba2",
           "7a134fcc1ebd6d5989fb02de4d82df38366e1a65bdaf32d206e4a8978594c4bb",
-          "26152cf4ef6d7a8567cdc0a1d8cb09a21d439c26b55064d2c80eaa0a0bde5f49",
-          "5d3590bf8e7cdbf86ce638149ff8ba34fc1445f2faedad9f710e5cd300a7331e",
+          "cd3eaa1e76414a159e517ec85e2fa266f64d970de8f9a4c1c4d315fab15e1bbf",
+          "5c5a8a19a926667a8822cc09652a89cac49fd3475d8798fed3d9d0b2bcf8f0ca",
           "2571780f4ffe9736919f77312bad6a7aede14d3bc30bd9d42b2750f082b7c53d",
           "336666d58786b689db1c5c1e75ab724856bfd5087404ece32f9b4f80e91f8aaa",
           "c839ba2f74ee6d18a623cc51cfa4bca82c2eea77c93668377f8bff10f5fe4f96",
@@ -33846,7 +33846,7 @@
           "15695959aeeaa5a962da9c9f47600bbc223c2c5cfc1bc46f58f79106e76977f4",
           "831d734fa663a9276594e94e3995cde98caabb4824e3d0632d204a387fff1a26"
         ],
-        "reason": "Use the sole 23.0.0 launcher and current release identity."
+        "reason": "Use the sole 23.0.1 launcher and current release identity."
       },
       {
         "module": "confidence_evidence",
@@ -33997,7 +33997,7 @@
       {
         "module": "config",
         "previous_ast_sha256": "db46529eee5ff196f946d535d7c72ae98e2331d44f37450c24b0615741b81fff",
-        "ast_sha256": "795a053407c3d3f3c3a2a160690a7ed8b11786a75675dc8b1f213581c34ded4a",
+        "ast_sha256": "04cf0f4bc38abb3458360b5eb84660d92be57ca4e1f3c1190b6fb149533da955",
         "previous_top_level": [
           "eaf2245aaeb40a97018c1afdd472d30afae25ea35036acf7f7a215dabee476e0",
           "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
@@ -34080,8 +34080,8 @@
           "f0b5a189e06d8ef72fe8f7e2e59172707f082ea0870264171efb1b493963304d",
           "806ed4e0fdc9a164426901774be23a8c0bb8e5eebbf1a0c5fccc5b93d1a52f55",
           "94501b10b2a2ca18a7cfb0f53a7dc0ea5bb7748ea59cc19af63795a05b535a1d",
-          "26152cf4ef6d7a8567cdc0a1d8cb09a21d439c26b55064d2c80eaa0a0bde5f49",
-          "861da12247225fefb3a4c816698c2dd2e8236d94963d0b47d76a39ebcf6fc6a8",
+          "cd3eaa1e76414a159e517ec85e2fa266f64d970de8f9a4c1c4d315fab15e1bbf",
+          "ec842f161872e0227cf89462773ef51a0b832e3bfb4b843c1e0397ede0a97370",
           "bf8f9338d781288e73bb92367a1e334ba776adce5195b51cfc239c3dc0e23998",
           "7d0aa0dc07bdae91d688712f1ab7903d46a02b703d1d680946db8c2958b30c3f",
           "50f6875222fd0b485ea533261464754d261890368aaa636e3ec22766e72611bc",
@@ -34140,7 +34140,7 @@
           "aeb8a6c2b6a89d9887b9b05b48048e74f85b21c3e08b967b629689b9bf996bf3",
           "21d1013b0faeb5497bd7df2bd295dfad8ddd11d2c7e5ec25fc80462fbe3f171b"
         ],
-        "reason": "Expose semantic task and output choices for TTA and PTA with the 23.0.0 identity."
+        "reason": "Expose semantic task and output choices for TTA and PTA with the 23.0.1 identity."
       },
       {
         "module": "examples/external_augmentations/GPU_baseline",
