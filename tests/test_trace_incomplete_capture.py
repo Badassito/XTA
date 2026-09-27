@@ -40,7 +40,7 @@ def test_normal_capture_and_zero_drop_count_do_not_warn(tmp_path):
 
 def test_runtime_session_warns_for_missing_prefix_and_interior_events(tmp_path):
     path = tmp_path / 'telemetry-incomplete.jsonl'
-    schema = 'gpt-6-astra-ultra-v24.0.0.telemetry.v1'
+    schema = 'gpt-6-astra-ultra-v24.0.1.telemetry.v1'
     events = [dict(trace_session='17-42', sequence=number, event='worker_dequeue')
               for number in (2, 3, 6)]
     path.write_text(json.dumps(dict(schema=schema, events=events, final=True)) + '\n')
@@ -52,7 +52,7 @@ def test_runtime_session_warns_for_missing_prefix_and_interior_events(tmp_path):
 
 
 def test_runtime_session_parts_are_joined_before_gap_check(tmp_path):
-    schema = 'gpt-6-astra-ultra-v24.0.0.telemetry.v1'
+    schema = 'gpt-6-astra-ultra-v24.0.1.telemetry.v1'
     first = tmp_path / 'telemetry-part-a.jsonl'
     second = tmp_path / 'telemetry-part-b.jsonl'
     event1 = dict(trace_session='17-42', sequence=1, event='worker_dequeue')
@@ -65,6 +65,6 @@ def test_runtime_session_parts_are_joined_before_gap_check(tmp_path):
 def test_unfinalized_live_runtime_prefix_is_not_reported_as_missing_suffix(tmp_path):
     path = tmp_path / 'telemetry-live.jsonl'
     event = dict(trace_session='17-42', sequence=1, event='worker_dequeue')
-    path.write_text(json.dumps(dict(schema='gpt-6-astra-ultra-v24.0.0.telemetry.v1',
+    path.write_text(json.dumps(dict(schema='gpt-6-astra-ultra-v24.0.1.telemetry.v1',
                                     events=[event], final=False)) + '\n')
     assert read_events([path]) == ([event], [])

@@ -28,7 +28,7 @@ def test_historical_inventory_is_unchanged(manifest):
     assert canonical(prior) == inventory.REVIEWED_V23_RELEASE_PREDECESSOR_SHA256
     assert review['predecessor_commit'] == inventory.REVIEWED_V23_RELEASE_PREDECESSOR_COMMIT
     assert review['previous_review_sha256'] == inventory.REVIEWED_V22_3_2_RELEASE_SHA256
-    assert review['release'] == '23.0.0'
+    assert review['release'] == '23.0.1'
     assert review['feature'] == 'yolo-semantic-segmentation'
     assert {'semantic_cuda', 'semantic_trt'} <= {
         item['module'] for item in review['module_snapshots']}
@@ -58,7 +58,7 @@ def test_earlier_records_cannot_be_rewritten(manifest):
             changed[key][0]['line'] = -1
         else:
             changed[key] += 1
-        with pytest.raises(RuntimeError, match='v23.0.0 predecessor inventory changed'):
+        with pytest.raises(RuntimeError, match='v23.0.1 predecessor inventory changed'):
             inventory.reviewed_v23_release_contract(changed, changed['v21_review'])
 
 
@@ -67,7 +67,7 @@ def test_independent_source_predecessor_pin_rejects_reauthenticated_review(manif
     snapshot = next(item for item in review['module_snapshots'] if item['previous_top_level'])
     snapshot['previous_ast_sha256'] = '0' * 64
     with mock.patch.object(inventory, 'REVIEWED_V23_RELEASE_SHA256', canonical(review)):
-        with pytest.raises(RuntimeError, match='v23.0.0 source predecessor changed'):
+        with pytest.raises(RuntimeError, match='v23.0.1 source predecessor changed'):
             inventory.reviewed_v23_release_contract(manifest, manifest['v21_review'])
 
 
@@ -81,7 +81,7 @@ def test_current_sources_and_tools_match_review(manifest):
     module = review['module_snapshots'][0]['module']
     changed[module] = copy.deepcopy(trees[module])
     changed[module].body.append(ast.Pass())
-    with pytest.raises(RuntimeError, match='v23.0.0 reviewed source changed'):
+    with pytest.raises(RuntimeError, match='v23.0.1 reviewed source changed'):
         inventory.verify_v22_3_source_snapshots(review, changed)
 
 
@@ -89,5 +89,5 @@ def test_historical_contracts_admit_only_authenticated_successor(manifest):
     prior = inventory._without_reviewed_v23_release(manifest)
     assert inventory.reviewed_v22_3_2_release_contract(manifest, manifest['v21_review']) == prior['v22_3_2_release_review']
     manifest['v23_release_review']['definitions'][0]['reason'] = 'Unreviewed replacement'
-    with pytest.raises(RuntimeError, match='v23.0.0 review digest mismatch'):
+    with pytest.raises(RuntimeError, match='v23.0.1 review digest mismatch'):
         inventory.reviewed_v22_3_2_release_contract(manifest, manifest['v21_review'])
