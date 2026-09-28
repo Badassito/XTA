@@ -17,6 +17,9 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRATCH = ROOT.parent / 'Scratch'
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from XTA import __version__
 
 
 def replace_option(argv, option, value):
@@ -100,6 +103,7 @@ def main():
         for number in range(1, args.runs + 1):
             case = output / f'run-{number:02d}'
             case.mkdir()
+            (case / 'ultralytics-config').mkdir()
             command = list(argv)
             replace_option(command, '--output', case / 'outputs')
             replace_option(command, '--temp', case / 'runtime')
@@ -110,7 +114,7 @@ def main():
                 module_index = command.index('-m')
                 command = [*command[:module_index], '-m', 'tools.profile_tta_scheduler_lines',
                            '--output', str(case / 'scheduler-lines.json'),
-                           '--script', str(ROOT / 'GPT-6-Astra-Ultra_v24.0.1_SLURM.py'),
+                           '--script', str(ROOT / f'GPT-6-Astra-Ultra_v{__version__}_SLURM.py'),
                            '--', *command[module_index + 2:]]
             child_env = dict(environment)
             child_env.update(YOLO_TTA_TELEMETRY_DIR=str(case / 'telemetry'),

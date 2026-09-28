@@ -17,9 +17,8 @@ from itertools import islice
 from typing import Deque, Iterable, Mapping, Sequence
 
 
-# A concrete tile graph should pass ``tile_count - 1`` to the scheduler.  The
-# conservative default remains finite so a malformed coordinator cannot admit
-# an unbounded relay wave before concrete topology is connected.
+# Production supplies a frame-and-tile-dependent bound from lta_execution.
+# This fallback stays finite for callers that do not have a runtime view plan.
 DEFAULT_MAX_RELAY_GENERATION = 1024
 
 

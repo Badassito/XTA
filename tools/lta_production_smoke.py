@@ -57,6 +57,8 @@ def _gpu_snapshot(stage: str) -> dict[str, object]:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=True,
             timeout=10,
         )

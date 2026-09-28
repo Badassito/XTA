@@ -20,6 +20,7 @@ import numpy as np
 from ._deps import _numba
 from .geometry import ViewInfo, is_azimuthal_view, is_tilted_azimuthal_view, azimuthal_base_view_name, azimuthal_plane_shape, azimuthal_source_tilted_view, tilted_frame_center, tilted_stack_axis_length
 from .interpolation import INTERNAL_PACKED_CVOL_FORMAT, RawBBoxMaskStore, RawBBoxSlicePayload, _write_raw_bbox_payload_store
+from .runtime import close_memmap_array_without_flush, defer_retired_memmap_directory_cleanup
 
 _MAP_CACHE_MAX_BYTES = 256 * 1024 * 1024
 _MAP_STRIP_PIXELS = 262144
@@ -364,6 +365,8 @@ def project_azimuthal_sparse_store(
     own_input = not isinstance(source, RawBBoxMaskStore)
     store = RawBBoxMaskStore.open(Path(source), mmap_payload=True) if own_input else source
     packed = None
+    temporary_path = None
+    staging = None
     try:
         if not all(int(value) > 0 for value in store.shape):
             raise ValueError('Sparse Azimuthal input requires three positive dimensions')
@@ -375,8 +378,10 @@ def project_azimuthal_sparse_store(
         if np.any((store.index['kind'] != 0) & (store.index['kind'] != 1)):
             raise ValueError('Invalid mask chunk marker')
         target.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=f'.{target.name}.projection-', dir=target.parent) as temporary:
+        with tempfile.TemporaryDirectory(prefix=f'.{target.name}.projection-', dir=target.parent,
+                                         ignore_cleanup_errors=True) as temporary:
             temporary = Path(temporary)
+            temporary_path = temporary
             staging = temporary/'projected.cvol'
             try:
                 map_seconds = scatter_seconds = 0.0
@@ -441,8 +446,13 @@ def project_azimuthal_sparse_store(
                         'encode_seconds': encode_seconds, 'seconds': time.perf_counter()-started}
             finally:
                 if packed is not None:
-                    packed._mmap.close()
+                    close_memmap_array_without_flush(packed, unlink_path=temporary/'source.bits')
                     packed = None
+                flat = None
     finally:
+        if staging is not None and staging.exists():
+            defer_retired_memmap_directory_cleanup(staging)
+        if temporary_path is not None and temporary_path.exists():
+            defer_retired_memmap_directory_cleanup(temporary_path)
         if own_input:
             store.close()

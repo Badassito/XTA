@@ -569,7 +569,7 @@ def collapse_tta_variant_volumes_to_physical_views(
 ) -> Dict[str, Dict[str, np.ndarray]]:
     """Union completed angle variants only at physical-view finalization.
 
-    Every runtime ``ViewInfo.name`` is angle-specific in v16.4.0. Cartesian working stacks
+    Every runtime ``ViewInfo.name`` is angle-specific. Cartesian working stacks
     must therefore recover their physical names before the terminal axis-aware assembler;
     otherwise a Sagittal/Coronal variant can be mistaken for an already-source-native volume.
     The first completed variant becomes the in-place physical accumulator. Later variants of
@@ -920,7 +920,7 @@ def assemble_view_volumes_and_projected_layers_fused(
                 for geometry, group in restore_groups.items()
             ) or 'none'
             print(
-                f'v13.3.17 (C1): G5 grouped {int(grouped_layers)} reduced projected '
+                f'G5 grouped {int(grouped_layers)} reduced projected '
                 f'layer(s) into {len(restore_groups)} restore geometry group(s) '
                 f'[{group_text}] ({int(grouped_layers)} -> {len(restore_groups)} '
                 f'restores/output-z); {len(native_projected)} native layer(s) remain direct.'
@@ -1034,7 +1034,7 @@ def assemble_view_volumes_and_projected_layers_fused(
             logical_bytes = int(out_t) * int(out_h) * int(out_w)
             dense_pretouch = bool(fused_final_native_sparse_dense_pretouch_enabled())
             print(
-                'v16.1.7 native sparse final union selected: '
+                'Native sparse final union selected: '
                 f'{len(direct_projected)} source-space layer(s) '
                 f'({len(raw_sources)} raw-bbox, {len(generic_sources)} generic), '
                 f'{len(native_views)} dense native view(s), workers={int(worker_count)}, '
@@ -1102,7 +1102,7 @@ def assemble_view_volumes_and_projected_layers_fused(
             ):
                 with tqdm(
                     total=int(out_t),
-                    desc='v16.1.7 native sparse final union',
+                    desc='Native sparse final union',
                 ) as pbar:
                     for band0 in range(0, int(out_t), int(band_slices)):
                         band1 = min(int(out_t), int(band0) + int(band_slices))
@@ -1115,7 +1115,7 @@ def assemble_view_volumes_and_projected_layers_fused(
                             int(band_count),
                             _merge_band_z,
                             max_workers=min(int(worker_count), int(band_count)),
-                            desc='v16.1.7 native sparse final union band',
+                            desc='Native sparse final union band',
                             show_progress=False,
                             target_chunks_per_worker=2,
                         )
@@ -1126,9 +1126,9 @@ def assemble_view_volumes_and_projected_layers_fused(
                 union_slice_any,
                 union_slice_bboxes,
                 source=(
-                    'v16.1.7 native sparse final union exact destination scan'
+                    'Native sparse final union exact destination scan'
                     if bool(metadata_requires_exact_scan)
-                    else 'v16.1.7 native sparse cvol index union'
+                    else 'Native sparse cvol index union'
                 ),
                 exact=bool(metadata_requires_exact_scan),
             )
@@ -1138,7 +1138,7 @@ def assemble_view_volumes_and_projected_layers_fused(
                 metadata.slice_bboxes,
             )
             print(
-                'v16.1.7 native sparse final union completed in '
+                'Native sparse final union completed in '
                 f'{elapsed:.3f}s; sparse payload={int(payload_bytes) / GIB:.2f} GiB, '
                 f'logical destination={int(logical_bytes) / GIB:.2f} GiB, '
                 f'payload throughput={int(payload_bytes) / GIB / elapsed:.2f} GiB/s, '
@@ -1272,13 +1272,13 @@ def assemble_view_volumes_and_projected_layers_fused(
                     continue
             if not admitted:
                 print(
-                    'v16.0.2 GPU final fusion skipped: no selected device satisfied the '
+                    'GPU final fusion skipped: no selected device satisfied the '
                     f'{estimate / GIB:.2f} GiB lane estimate + {reserve / GIB:.2f} GiB reserve.'
                 )
                 return False
 
             print(
-                f'v16.0.2 GPU final fusion admitted {len(admitted)} device(s) '
+                f'GPU final fusion admitted {len(admitted)} device(s) '
                 f'{[f"cuda:{d}" for d in admitted]}; batch={batch_slices}, '
                 f'pipeline_slots={pipeline_slots}, GPU_restore_groups={len(gpu_restore_groups)}, '
                 f'CPU_tiny_groups={len(cpu_restore_groups)}, lane_estimate={estimate / GIB:.2f} GiB.'
@@ -1574,12 +1574,12 @@ def assemble_view_volumes_and_projected_layers_fused(
             if first_error is not None:
                 error_text = f'{type(first_error).__name__}: {first_error}'
                 print(
-                    f'Warning: v16.0.2 GPU final fusion failed ({error_text}); '
+                    f'Warning: GPU final fusion failed ({error_text}); '
                     'rewriting the complete result with the CPU G5 path.'
                 )
                 return False
             print(
-                f'v16.0.2: final grouped restore/OR completed on {len(admitted)} GPU lane(s) '
+                f'Final grouped restore/OR completed on {len(admitted)} GPU lane(s) '
                 f'with pinned {pipeline_slots}-slot streaming.'
             )
             return True
@@ -1706,10 +1706,10 @@ def assemble_view_volumes_and_projected_layers_fused(
             _env_int('YOLO_TTA_FUSED_FINAL_VIEW_UNION_BAND_SLICES', 256),
         )
         print(
-            f'v13.3.16 (G9): G5 locality scheduler uses {int(g5_workers)} worker(s) '
+            f'G5 locality scheduler uses {int(g5_workers)} worker(s) '
             f'and sequential {int(g5_band)}-slice z bands.'
         )
-        with tqdm(total=int(out_t), desc='v13.3.16 G9 fused final view/layer union') as pbar:
+        with tqdm(total=int(out_t), desc='Fused final view/layer union') as pbar:
             for band0 in range(0, int(out_t), int(g5_band)):
                 band1 = min(int(out_t), int(band0) + int(g5_band))
                 band_count = int(band1 - band0)
@@ -1721,7 +1721,7 @@ def assemble_view_volumes_and_projected_layers_fused(
                     band_count,
                     _merge_band_slice,
                     max_workers=min(int(g5_workers), int(band_count)),
-                    desc='v13.3.16 G9 fused final view/layer union band',
+                    desc='Fused final view/layer union band',
                     show_progress=False,
                     target_chunks_per_worker=4,
                 )
@@ -1772,7 +1772,7 @@ def assemble_current_view_union_volume(
     working_equals_out = tuple(int(v) for v in union_shape) == (int(T), int(H), int(W))
     if direct_refs and fused_final_view_union_enabled() and not working_equals_out:
         print(
-            f'v13.3.9 (G5): fusing Cartesian restore, native fallback views, and '
+            f'Fusing Cartesian restore, native fallback views, and '
             f'{len(direct_refs)} projected component layer(s) into one output-z pass '
             '(YOLO_TTA_FUSED_FINAL_VIEW_UNION=0 restores per-view assembly).'
         )
@@ -1921,17 +1921,15 @@ def apply_keep_largest_objects_inplace(
             dtype=np.int64,
         ))
         print(
-            f'v16.0.2 keep_objects phases: no removal required; '
+            f'keep_objects phases: no removal required; '
             f'topology={float(topology_times.get("topology_total", 0.0)):.3f}s, '
             f'kept_voxels={kept_voxels}, total={total_seconds:.3f}s.'
         )
-        close_memmap_array(labels_mm)
-        if not bool(keep_temp):
-            for lp in label_paths:
-                try:
-                    lp.unlink(missing_ok=True)
-                except Exception:
-                    pass
+        close_memmap_array(
+            labels_mm,
+            unlink_path=label_paths[0] if label_paths and not bool(keep_temp) else None,
+        )
+        labels_mm = None
         return {
             'enabled': 1,
             'num_objects': int(num_objects),
@@ -2054,18 +2052,16 @@ def apply_keep_largest_objects_inplace(
         )
     apply_seconds = float(time.perf_counter() - apply_started)
 
-    close_memmap_array(labels_mm)
-    if not bool(keep_temp):
-        for lp in label_paths:
-            try:
-                lp.unlink(missing_ok=True)
-            except Exception:
-                pass
+    close_memmap_array(
+        labels_mm,
+        unlink_path=label_paths[0] if label_paths and not bool(keep_temp) else None,
+    )
+    labels_mm = None
 
     topology_times = dict(comp_stats.get('topology_phase_seconds', {}))
     total_seconds = float(time.perf_counter() - keep_started)
     print(
-        'v16.0.2 keep_objects phases: '
+        'keep_objects phases: '
         f'label={float(topology_times.get("slice_label", 0.0)):.3f}s, '
         f'pairs={float(topology_times.get("internal_pair_extraction", 0.0)):.3f}s, '
         f'local_union={float(topology_times.get("local_slab_union", 0.0)):.3f}s, '
@@ -2458,7 +2454,7 @@ def _v1401_embedded_centerline_arrays(
     del labels
     del component_sizes
     print(
-        f'v14.0.1 embedded centerline: exact 3D EDT on {tuple(int(v) for v in coarse.shape)} '
+        f'Embedded centerline: exact 3D EDT on {tuple(int(v) for v in coarse.shape)} '
         f'with source-voxel sampling {tuple(float(v) for v in spacing_tyx)}; '
         f'largest coarse object {int(largest_foreground)}/{int(total_foreground)} voxels '
         f'across {int(component_count)} component(s).'

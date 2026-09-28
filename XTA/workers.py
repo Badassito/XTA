@@ -456,7 +456,7 @@ def _normalize_openvino_segmentation_outputs(
             f'expected_class_count={expected_class_count}, output shapes='
             f'{[tuple(int(v) for v in value.shape) for value in arrays]}. '
             'Ultralytics end-to-end/NMS-embedded OpenVINO exports are not supported by the '
-            'v17 raw-head adapter; export the ordinary segmentation IR.'
+            'raw-head adapter; export the ordinary segmentation IR.'
         )
     _score, head, proto, class_count = min(combinations, key=lambda item: item[0])
     return (
@@ -703,7 +703,7 @@ class _OpenVinoCpuSegmenter:
             for actual, expected in zip(original_shape, target_shape):
                 if int(actual) != int(expected):
                     raise RuntimeError(
-                        f'OpenVINO CPU model has static input shape {original_shape}, but v17 requested '
+                        f'OpenVINO CPU model has static input shape {original_shape}, but the run requested '
                         f'batch={self.batch}, C={self.input_channels}, imgsz={self.imgsz} ({target_shape}).'
                     )
         elif reshape_needed:
@@ -1348,7 +1348,7 @@ def run_prediction_volume_in_worker(
 ) -> Dict[str, object] | _DeferredGpuWorkerTaskResult:
     """Run one independent full-frame or tile task and write its result window.
 
-    v16.4.0 has no grouped-tile/configuration-canvas worker path. Each tile keeps one
+    The worker has no grouped-tile/configuration-canvas path. Each tile keeps one
     immutable affine and one result volume from resident rendering through inference,
     postprocessing, and the later two-stage parent/bridge gate.
     """
@@ -1364,9 +1364,9 @@ def run_prediction_volume_in_worker(
         raise ValueError('Radial shell tasks require native union results for parent projection; D1 is unsupported')
     if (str(task.get('result_mode', 'file')) == 'd1_owner'
             and not is_radial_owner_task(task) and active_radial_owners()):
-        raise RuntimeError('Worker cannot start legacy D1 while a Radial owner is incomplete')
+        raise RuntimeError('Worker cannot start non-Radial D1 while a Radial owner is incomplete')
     if kind not in {'fullframe', 'tile'}:
-        raise ValueError(f'Unsupported v16.4.0 worker task kind: {kind!r}')
+        raise ValueError(f'Unsupported worker task kind: {kind!r}')
     if kind == 'fullframe' and not isinstance(job, AugJob):
         raise TypeError(f'Full-frame worker task requires AugJob, got {type(job)!r}')
     if kind == 'tile' and not isinstance(job, DenseTileJob):
@@ -1407,6 +1407,8 @@ def run_prediction_volume_in_worker(
     azimuthal_padding_conf: Optional[np.memmap] = None
     azimuthal_padding_mask_path: Optional[Path] = None
     azimuthal_padding_conf_path: Optional[Path] = None
+    azimuthal_padding_mask_owned = False
+    azimuthal_padding_conf_owned = False
     source: Optional[object] = None
     deferred_result: Optional[_DeferredGpuWorkerTaskResult] = None
     raster_plan = _canonical_raster_plan_for_task(task)
@@ -1430,35 +1432,39 @@ def run_prediction_volume_in_worker(
             int(azimuthal_padding_count), int(processing_h), int(processing_w)
         )
         try:
+            if azimuthal_padding_mask_path.exists():
+                raise FileExistsError(azimuthal_padding_mask_path)
             azimuthal_padding_mask = np.memmap(
                 azimuthal_padding_mask_path,
                 dtype=np.uint8,
                 mode='w+',
                 shape=azimuthal_padding_shape,
             )
+            azimuthal_padding_mask_owned = True
             azimuthal_padding_mask[...] = np.uint8(0)
             if task.get('result_conf_path'):
                 azimuthal_padding_conf_path = padding_dir / f'{padding_token}.conf.u8.dat'
+                if azimuthal_padding_conf_path.exists():
+                    raise FileExistsError(azimuthal_padding_conf_path)
                 azimuthal_padding_conf = np.memmap(
                     azimuthal_padding_conf_path,
                     dtype=np.uint8,
                     mode='w+',
                     shape=azimuthal_padding_shape,
                 )
+                azimuthal_padding_conf_owned = True
                 azimuthal_padding_conf[...] = np.uint8(0)
         except BaseException:
-            for mm in (azimuthal_padding_conf, azimuthal_padding_mask):
+            for mm, owned_path in (
+                (azimuthal_padding_conf, azimuthal_padding_conf_path if azimuthal_padding_conf_owned else None),
+                (azimuthal_padding_mask, azimuthal_padding_mask_path if azimuthal_padding_mask_owned else None),
+            ):
                 if mm is not None:
                     try:
-                        close_memmap_array(mm)
+                        close_memmap_array(mm, unlink_path=owned_path)
                     except Exception:
                         pass
-            for failed_path in (azimuthal_padding_conf_path, azimuthal_padding_mask_path):
-                if failed_path is not None:
-                    try:
-                        Path(failed_path).unlink(missing_ok=True)
-                    except Exception:
-                        pass
+            mm = None
             azimuthal_padding_conf = None
             azimuthal_padding_mask = None
             raise
@@ -2152,7 +2158,7 @@ def _gpu_inference_worker_main(
         if d1_owner_pipeline_enabled():
             _d1_backproject_kernels()
             print(
-                f'v16.1.7 D1 backprojection NVRTC preflight passed on cuda:{int(gpu_index)}: '
+                f'D1 backprojection NVRTC preflight passed on cuda:{int(gpu_index)}: '
                 'header-free source-geometry atomic-OR kernel compiled before TensorRT load.'
             )
         if bool(init_dict.get('radial_owner_preflight', False)):
@@ -2169,16 +2175,12 @@ def _gpu_inference_worker_main(
         if str(cfg.task) == 'semantic':
             pass  # semantic backend logits bypass instance retina prediction
         elif cpu_retina_masks_enabled():
-            try:
-                ensure_cpu_retina_mask_predictor_patch()
-            except Exception:
-                pass
+            if not ensure_cpu_retina_mask_predictor_patch():
+                raise RuntimeError('CPU retina-mask predictor patch was not installed')
         else:
             # GPU retina mode — reduce per-frame unions at proto resolution.
-            try:
-                ensure_gpu_retina_proto_union_predictor_patch()
-            except Exception:
-                pass
+            if not ensure_gpu_retina_proto_union_predictor_patch():
+                raise RuntimeError('GPU proto-union predictor patch was not installed')
         # per-worker GPU render engine (volume residency resolves lazily on
         # the first task, once the shared source volume exists and VRAM headroom is known).
         try:
@@ -2488,7 +2490,7 @@ def _gpu_inference_worker_main(
                     manager = _gpu_union_retirement_manager()
                     lane_count = int(manager.capacity) if manager is not None else 2
                     print(
-                        f'v16.1.3 compute/retirement credits active: {lane_count} independent '
+                        f'Compute/retirement credits active: {lane_count} independent '
                         'event-fenced D2H/publication record(s) per worker; compute completion '
                         'releases the next dispatch credit before result publication. '
                         'YOLO_TTA_GPU_UNION_FLUSH_OVERLAP=0 restores synchronous retirement.'

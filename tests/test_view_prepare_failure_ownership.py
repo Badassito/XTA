@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 from concurrent.futures import Future
+import gc
 import io
 import json
 import tempfile
@@ -13,11 +14,15 @@ from unittest import mock
 
 import numpy as np
 
-from XTA import assembly, pipeline
+from XTA import assembly
+from XTA.config import GIB
 from XTA.geometry import ViewInfo
 from XTA.interpolation import CVOL_FORMAT, RawBBoxMaskStore, write_raw_bbox_mask_store
+from XTA.interpolation import _DirectUnionBackingLease
 from XTA.runtime import close_memmap_array_without_flush
-from tests.test_terminal_component_refs import _function
+from XTA.view_prepare import (
+    AdmittedViewPrepare, ComponentProjectionSubmitter, ViewPrepareLeaseState,
+)
 
 
 class ViewPrepareFailureOwnershipTests(unittest.TestCase):
@@ -26,6 +31,7 @@ class ViewPrepareFailureOwnershipTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
+        self.addCleanup(gc.collect)
         self.root = Path(temporary.name)
         self.view = ViewInfo(name='transverse__tta_0', num_slices=4, src_h=5, src_w=6,
                              pad_mode='clamp', physical_view_name='transverse', tta_aug_id='0')
@@ -34,7 +40,7 @@ class ViewPrepareFailureOwnershipTests(unittest.TestCase):
         value = np.memmap(self.root / name, mode='w+', dtype=np.uint8, shape=self.shape)
         value[:] = 0
         value[0, 1, 1] = 1
-        self.addCleanup(close_memmap_array_without_flush, value)
+        self.addCleanup(close_memmap_array_without_flush, value, unlink_path=Path(value.filename))
         return value
 
     def arguments(self, original):
@@ -59,7 +65,7 @@ class ViewPrepareFailureOwnershipTests(unittest.TestCase):
                                 added_voxels=int(data.sum())))
         return dict(added_voxels=int(data.sum()), bridge_component_deltas=entries), data
 
-    def test_rebound_canvas_closes_on_coverage_submit_publication_or_later_pass_failure(self):
+    def test_rebound_canvas_remains_readable_with_failure_traceback(self):
         for failure in ('coverage', 'submit', 'publication', 'later_pass'):
             with self.subTest(failure=failure):
                 original = self.mapping(f'{failure}-original.dat')
@@ -108,7 +114,8 @@ class ViewPrepareFailureOwnershipTests(unittest.TestCase):
                         caught.append(exc)  # Keep its frames alive while checking the mappings.
                 self.assertEqual(len(caught), 1)
                 self.assertIsNotNone(caught[0].__traceback__)
-                self.assertTrue(rebound._mmap.closed)
+                self.assertFalse(rebound._mmap.closed)
+                self.assertEqual(int(rebound.sum()), 1)
                 # The admission wrapper, not assembly, owns this original mapping.
                 self.assertFalse(original._mmap.closed)
                 for path, data in completed_inputs:
@@ -161,43 +168,45 @@ class ViewPrepareFailureOwnershipTests(unittest.TestCase):
         prepare = mock.Mock(return_value=result)
         if fail:
             prepare.side_effect = RuntimeError('component queue refused submission')
-        namespace = dict(vars(pipeline))
-        namespace.update(
-            parent_transient_admission=SimpleNamespace(reserve=reserve), transient_bytes=local.nbytes,
+        materialize_workspace = mock.Mock(return_value=local)
+        task = AdmittedViewPrepare(
+            admission=SimpleNamespace(reserve=reserve), transient_bytes=local.nbytes,
             model_name='model', view=self.view, union_mm=None if materialized else local,
-            d1_shadow_path=self.root / 'input.cvol', union_path=Path(local.filename),
-            parent_slice_postprocess_workers=1, parent_interpolation_task_workers=1,
-            keep_temp_artifacts=True, confmap_mm=None, confmap_path=None, temp_dir=self.root,
-            dense_tiling_active=False, nrrd_layers_needed=True, angle_variant_streaming_cleanup_active=True,
-            hole_fill_done_on_device=True, slice_meta_holder=None, angle_variant_gpu_fastpath_active=False,
-            component_ref_dense_retirement_active=True, preinterpolation_layer_already_published=True,
-            _submit_component_projection=mock.Mock(),
-            args=SimpleNamespace(min_conf=0, min_radius=0, interpolation_distance=3,
-                interpolation_walk_back=1, interpolation_candidates=2, interpolation_passes=1,
-                interpolation_min_radius=0, interpolation_search_angle=0),
-            materialize_raw_bbox_mask_store_workspace=mock.Mock(return_value=local),
-            prepare_view_volume_after_fullframe=prepare,
+            confmap_mm=None, d1_shadow_path=self.root / 'input.cvol',
+            union_path=Path(local.filename), confmap_path=None, temp_dir=self.root,
+            dense_tiling_active=False, min_conf=0, min_radius=0,
+            interpolation_distance=3, interpolation_walk_back=1,
+            interpolation_candidates=2, interpolation_passes=1,
+            interpolation_min_radius=0, interpolation_search_angle=0,
+            keep_temp_artifacts=True, slice_workers=1, interpolation_task_workers=1,
+            component_layers_needed=True, precleaned_slice_cleanup=True,
+            hole_fill_done_on_device=True, slice_meta=None,
+            fuse_azimuthal_component_layers=lambda: False,
+            component_ref_dense_retirement_active=True,
+            preinterpolation_layer_already_published=True,
+            parent_mask_ready_callback=None,
+            submit_component_projection=mock.Mock(),
+            materialize_workspace=materialize_workspace, prepare=prepare,
         )
-        run = _function(Path(pipeline.__file__).read_text(encoding='utf-8'),
-                        '_run_admitted_view_prepare', namespace)
         if fail:
             caught = None
             try:
-                run()
+                task()
             except RuntimeError as exc:
                 caught = exc
             self.assertIsNotNone(caught)
             self.assertIsNotNone(caught.__traceback__)
-            self.assertTrue(local._mmap.closed)
+            self.assertFalse(local._mmap.closed)
+            self.assertEqual(int(local.sum()), 1)
         else:
-            self.assertIs(run(), result)
+            self.assertIs(task(), result)
             self.assertFalse(local._mmap.closed)
             self.assertEqual(int(result.live_array.sum()), 1)
-        self.assertEqual(exit_closed, [fail])
-        self.assertEqual(namespace['materialize_raw_bbox_mask_store_workspace'].call_count,
-                         int(materialized))
+        self.assertEqual(exit_closed, [False])
+        self.assertEqual(materialize_workspace.call_count, int(materialized))
+        self.assertTrue(prepare.call_args.kwargs['nrrd_layers_enabled'])
 
-    def test_admission_closes_existing_or_materialized_canvas_before_failure_returns_credit(self):
+    def test_admission_keeps_failed_canvas_safe_while_traceback_retains_it(self):
         for materialized in (False, True):
             with self.subTest(materialized=materialized):
                 self.run_admitted(materialized=materialized, fail=True)
@@ -214,19 +223,40 @@ class ProjectionReservationTests(unittest.TestCase):
             path = Path(temporary)
             (path / 'meta.json').write_text(json.dumps({'shape': [6, 3, 4]}), encoding='utf-8')
             queue = mock.Mock()
-            namespace = dict(vars(pipeline))
-            namespace.update(input_T=30, input_H=40, input_W=50, _numba=object(),
-                             GIB=1024, component_projection_queue=queue)
-            submit = _function(Path(pipeline.__file__).read_text(encoding='utf-8'),
-                               '_submit_component_projection', namespace)
+            submit = ComponentProjectionSubmitter(
+                queue=queue, source_shape=(30, 40, 50), numba_available=True,
+                materialize=mock.Mock(),
+            )
             view = SimpleNamespace(family='azimuthal', full_t=3, full_h=4, full_w=5,
                                    num_slices=6, tta_angle_deg=15, physical_view_name='azimuthal_transverse')
             submit(path, view=view, added_voxels=3, source='fullframe')
-            expected = 30 * 40 * ((50 + 7) // 8) + 16 * (40 * 50) + 1024
+            expected = 30 * 40 * ((50 + 7) // 8) + 16 * (40 * 50) + GIB
             self.assertEqual(queue.submit.call_args.kwargs['working_bytes'], expected)
             submit(path, view=view, added_voxels=3, source='tile')
-            expected = 2 * (6 * 3 * 4) + 2 * (30 * 40 * 50) + 4 * 1024
+            expected = 2 * (6 * 3 * 4) + 2 * (30 * 40 * 50) + 4 * GIB
             self.assertEqual(queue.submit.call_args.kwargs['working_bytes'], expected)
+
+
+class ViewPrepareLeaseStateTests(unittest.TestCase):
+    def test_handoff_rollback_and_completion_preserve_single_owner(self):
+        key = ('model', 'view')
+        lease = _DirectUnionBackingLease(key=key, nbytes=120, phase='inference', owner_count=1)
+        state = ViewPrepareLeaseState(
+            leases={key: lease}, inference_views={key}, inference_bytes={key: 120},
+            postprocess_views=set(), postprocess_bytes={},
+        )
+        self.assertTrue(state.handoff(key))
+        self.assertEqual(lease.phase, 'postprocess')
+        self.assertEqual(state.postprocess_bytes, {key: 120})
+        state.rollback_handoff(key)
+        self.assertEqual(lease.phase, 'inference')
+        self.assertEqual(state.inference_bytes, {key: 120})
+        self.assertTrue(state.handoff(key))
+        self.assertFalse(state.complete(key, retain_for_dense_retirement=True))
+        self.assertIn(key, state.leases)
+        self.assertTrue(state.complete(key, retain_for_dense_retirement=False))
+        self.assertFalse(state.leases)
+        self.assertFalse(state.postprocess_views)
 
 
 if __name__ == '__main__':

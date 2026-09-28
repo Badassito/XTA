@@ -17,6 +17,8 @@ import zlib
 
 import numpy as np
 
+from .json_publication import write_json_atomic
+
 
 SCHEMA = 'xta.confidence_evidence/1'
 SCORE_SEMANTICS = 'maximum_surviving_instance_confidence_u8'
@@ -98,10 +100,7 @@ def _json_value(value):
 
 
 def _write_json_atomic(path, value):
-    path = Path(path)
-    temporary = path.with_name(path.name + '.partial')
-    temporary.write_text(json.dumps(_json_value(value), sort_keys=True, indent=2) + '\n', encoding='utf-8')
-    temporary.replace(path)
+    write_json_atomic(path, _json_value(value), sort_keys=True, trailing_newline=True)
 
 
 @dataclass(frozen=True)
@@ -611,8 +610,11 @@ def publish_confidence_shards(shards, *, view, model_name, temp_dir, output_shap
         return publish_confidence_scores(merged, view=view, model_name=model_name,
             temp_dir=temp_dir, output_shape=output_shape, layer_key=layer_key)
     finally:
-        close_memmap_array_without_flush(merged)
-        path.unlink(missing_ok=True)
+        close_memmap_array_without_flush(merged, unlink_path=path)
+        try:
+            path.unlink(missing_ok=True)
+        except PermissionError:
+            pass  # The last mapping consumer completes deferred deletion.
 
 
 __all__ = [

@@ -51,6 +51,7 @@ def main():
     receipt = dict(stage=args.stage, lock=token, commands=[], status='running')
     record = out / (args.stage + '-receipt.json')
     try:
+        (SCRATCH / 'ultralytics-config').mkdir(parents=True, exist_ok=True)
         env = os.environ
         env.update(PYTHONPATH=str(ROOT), PYTHONDONTWRITEBYTECODE='1',
                    PYTHONIOENCODING='utf-8', OMP_NUM_THREADS='2', MKL_NUM_THREADS='2',
@@ -81,10 +82,13 @@ def main():
                        driver=cp.cuda.runtime.driverGetVersion(), nvrtc=cp.cuda.nvrtc.getVersion(),
                        environment={k: v for k, v in env.items()
                                     if k.startswith(('YOLO_', 'XTA_', 'CUPY_', 'CUDA_'))},
-                       source_commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
-                       source_status=subprocess.check_output(['git', 'status', '--short'], cwd=ROOT, text=True))
+                       source_commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT,
+                           text=True, encoding='utf-8', errors='replace').strip(),
+                       source_status=subprocess.check_output(['git', 'status', '--short'], cwd=ROOT,
+                           text=True, encoding='utf-8', errors='replace'))
         def telemetry():
-            return subprocess.check_output(['nvidia-smi', '--query-gpu=name,driver_version,temperature.gpu,power.draw,clocks.sm,clocks.mem,memory.used,utilization.gpu', '--format=csv'], text=True).strip()
+            return subprocess.check_output(['nvidia-smi', '--query-gpu=name,driver_version,temperature.gpu,power.draw,clocks.sm,clocks.mem,memory.used,utilization.gpu', '--format=csv'],
+                text=True, encoding='utf-8', errors='replace').strip()
         receipt['telemetry_before'] = telemetry()
         from tools.benchmark_tilted_azimuthal_projection import heatsoak
         receipt['heatsoak'] = heatsoak(torch, 'cuda:0', args.heat_seconds)

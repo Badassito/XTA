@@ -6,6 +6,7 @@ import hashlib
 import tempfile
 import types
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest import mock
 
@@ -347,6 +348,128 @@ class LtaSamBoundaryTests(unittest.TestCase):
                         sys.modules.pop(name, None)
                 sys.modules.update(previous)
 
+    def test_builder_import_restores_both_tf32_flags(self) -> None:
+        from XTA import lta_sam
+
+        for initial in ((False, True), (True, False)):
+            with self.subTest(initial=initial):
+                matmul = types.SimpleNamespace(allow_tf32=initial[0])
+                cudnn = types.SimpleNamespace(allow_tf32=initial[1])
+                fake_torch = types.SimpleNamespace(
+                    backends=types.SimpleNamespace(
+                        cuda=types.SimpleNamespace(matmul=matmul), cudnn=cudnn
+                    )
+                )
+                builder_module = types.ModuleType("sam3.model_builder")
+
+                def import_builder(_name):
+                    matmul.allow_tf32 = not initial[0]
+                    cudnn.allow_tf32 = not initial[1]
+                    return builder_module
+
+                with (
+                    mock.patch.dict(
+                        sys.modules,
+                        {"torch": fake_torch, "sam3.model_builder": None},
+                    ),
+                    mock.patch.object(
+                        lta_sam,
+                        "_sam_pkg_resources_import_compatibility",
+                        return_value=nullcontext(),
+                    ),
+                    mock.patch.object(
+                        lta_sam.importlib, "import_module", side_effect=import_builder
+                    ),
+                ):
+                    self.assertIs(lta_sam._import_sam_model_builder(), builder_module)
+                    self.assertEqual((matmul.allow_tf32, cudnn.allow_tf32), initial)
+
+                def failing_import(_name):
+                    matmul.allow_tf32 = not initial[0]
+                    cudnn.allow_tf32 = not initial[1]
+                    raise RuntimeError("injected SAM import failure")
+
+                with (
+                    mock.patch.dict(
+                        sys.modules,
+                        {"torch": fake_torch, "sam3.model_builder": None},
+                    ),
+                    mock.patch.object(
+                        lta_sam,
+                        "_sam_pkg_resources_import_compatibility",
+                        return_value=nullcontext(),
+                    ),
+                    mock.patch.object(
+                        lta_sam.importlib, "import_module", side_effect=failing_import
+                    ),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "injected SAM import failure"):
+                        lta_sam._import_sam_model_builder()
+                    self.assertEqual((matmul.allow_tf32, cudnn.allow_tf32), initial)
+
+                with (
+                    mock.patch.dict(sys.modules, {"sam3.model_builder": builder_module}),
+                    mock.patch.object(lta_sam.importlib, "import_module") as import_module,
+                ):
+                    self.assertIs(lta_sam._import_sam_model_builder(), builder_module)
+                    import_module.assert_not_called()
+                    self.assertEqual((matmul.allow_tf32, cudnn.allow_tf32), initial)
+
+    def test_sam31_build_restores_both_tf32_flags(self) -> None:
+        from XTA import lta_sam
+
+        for initial in ((False, True), (True, False)):
+            with self.subTest(initial=initial):
+                matmul = types.SimpleNamespace(allow_tf32=initial[0])
+                cudnn = types.SimpleNamespace(allow_tf32=initial[1])
+                fake_torch = types.SimpleNamespace(
+                    backends=types.SimpleNamespace(
+                        cuda=types.SimpleNamespace(matmul=matmul), cudnn=cudnn
+                    ),
+                    cuda=types.SimpleNamespace(empty_cache=lambda: None),
+                )
+
+                def build(**_kwargs):
+                    matmul.allow_tf32 = not initial[0]
+                    cudnn.allow_tf32 = not initial[1]
+                    return object()
+
+                with mock.patch.object(
+                    lta_sam,
+                    "_build_real_sam31_predictor_single_load_unlocked",
+                    side_effect=build,
+                ):
+                    lta_sam._build_real_sam31_predictor_single_load(
+                        builder=build,
+                        kwargs={},
+                        bundle=mock.sentinel.bundle,
+                        runtime_torch=fake_torch,
+                        weight_storage="float32",
+                        construction_device="cpu",
+                    )
+                self.assertEqual((matmul.allow_tf32, cudnn.allow_tf32), initial)
+
+                def failing_build(**_kwargs):
+                    matmul.allow_tf32 = not initial[0]
+                    cudnn.allow_tf32 = not initial[1]
+                    raise RuntimeError("injected SAM build failure")
+
+                with mock.patch.object(
+                    lta_sam,
+                    "_build_real_sam31_predictor_single_load_unlocked",
+                    side_effect=failing_build,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "injected SAM build failure"):
+                        lta_sam._build_real_sam31_predictor_single_load(
+                            builder=failing_build,
+                            kwargs={},
+                            bundle=mock.sentinel.bundle,
+                            runtime_torch=fake_torch,
+                            weight_storage="float32",
+                            construction_device="cpu",
+                        )
+                self.assertEqual((matmul.allow_tf32, cudnn.allow_tf32), initial)
+
     def test_pkg_resources_compatibility_preserves_existing_module(self) -> None:
         import types
 
@@ -461,6 +584,21 @@ class LtaSamBoundaryTests(unittest.TestCase):
     def test_real_sam31_patch_transaction_loads_once_and_restores_globals(self) -> None:
         try:
             import torch
+        except Exception as exc:
+            self.skipTest(f"pinned PyTorch runtime is unavailable: {exc}")
+        self.addCleanup(
+            setattr,
+            torch.backends.cuda.matmul,
+            "allow_tf32",
+            bool(torch.backends.cuda.matmul.allow_tf32),
+        )
+        self.addCleanup(
+            setattr,
+            torch.backends.cudnn,
+            "allow_tf32",
+            bool(torch.backends.cudnn.allow_tf32),
+        )
+        try:
             import sam3.model_builder as sam_model_builder
             from sam3.model.sam3_multiplex_tracking import (
                 Sam3MultiplexTrackingWithInteractivity,

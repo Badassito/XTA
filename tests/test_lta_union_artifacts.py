@@ -5,6 +5,7 @@ import hashlib
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -134,6 +135,45 @@ class UnionArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "frame stop"):
                 reduce_union_artifact_into_view(receipt, view_union=target,
                                                tile_xyxy=(4, 2, 9, 6), frame_start=3, frame_stop=6)
+
+    def test_legacy_reduction_failure_keeps_retained_source_readable(self):
+        retained = []
+
+        def retain_then_fail(_destination, source, **_kwargs):
+            retained.append(np.asarray(source))
+            raise RuntimeError("intentional reduction failure")
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "legacy.raw"
+            masks = np.zeros((1, 2, 2), dtype=np.uint8)
+            masks[0, 1, 1] = 1
+            masks.tofile(path)
+            receipt = {"path": str(path), "shape": list(masks.shape),
+                       "sha256": hashlib.sha256(masks.tobytes()).hexdigest(), "dtype": "uint8"}
+            target = np.zeros((1, 2, 2), dtype=np.uint8)
+
+            with mock.patch("XTA.lta_rendering.union_tile_chunk_into_view", new=retain_then_fail):
+                with self.assertRaisesRegex(RuntimeError, "intentional reduction failure"):
+                    reduce_union_artifact_into_view(receipt, view_union=target,
+                                                   tile_xyxy=(0, 0, 2, 2), frame_start=0)
+            self.assertEqual(int(retained[0][0, 1, 1]), 1)
+            retained.clear()
+
+    def test_legacy_generator_close_keeps_retained_frame_readable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "legacy.raw"
+            masks = np.zeros((1, 2, 2), dtype=np.uint8)
+            masks[0, 1, 1] = 1
+            masks.tofile(path)
+            receipt = {"path": str(path), "shape": list(masks.shape),
+                       "sha256": hashlib.sha256(masks.tobytes()).hexdigest(), "dtype": "uint8"}
+
+            crops = iter_union_crops(receipt)
+            next(crops)
+            retained_frame = crops.gi_frame.f_locals["frame"]
+            crops.close()
+            self.assertEqual(int(retained_frame[1, 1]), 1)
+            del retained_frame, crops
 
     def test_writer_rejects_overlap_oversized_chunks_and_nonbinary_values(self):
         with tempfile.TemporaryDirectory() as temp:

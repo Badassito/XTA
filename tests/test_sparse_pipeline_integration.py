@@ -16,6 +16,8 @@ import unittest
 
 
 def _run_real_pipeline(output_path: Path) -> None:
+    import gc
+    import weakref
     required = ('numpy', 'cv2', 'scipy', 'tifffile', 'tqdm')
     missing = [name for name in required if importlib.util.find_spec(name) is None]
     if missing:
@@ -25,6 +27,7 @@ def _run_real_pipeline(output_path: Path) -> None:
     import numpy as np
     from XTA import assembly, finalization, interpolation, outputs
     from XTA.geometry import ViewInfo
+    from XTA.runtime import wait_for_retired_memmap_unlinks
 
     def read_ref(ref, shape):
         source = outputs._open_nrrd_layer_ref(ref)
@@ -60,7 +63,7 @@ def _run_real_pipeline(output_path: Path) -> None:
                     shadow_path = root / 'view_shadow.u8.dat'
                     shadow = interpolation.materialize_raw_bbox_mask_store_workspace(
                         shadow_store, shadow_path, desc='Pipeline-test shadow materialization', workers=1)
-                    shadow_mapping = shadow._mmap
+                    shadow_mapping = weakref.ref(shadow._mmap)
                     present = np.any(initial, axis=(1, 2))
                     boxes = np.zeros((num, 4), dtype=np.int64)
                     for z in np.flatnonzero(present):
@@ -93,7 +96,12 @@ def _run_real_pipeline(output_path: Path) -> None:
                         nrrd_layers_enabled=True, precleaned_slice_cleanup=True,
                         hole_fill_done_on_device=True, slice_meta=slice_meta,
                         preinterpolation_layer_already_published=True)
-                    assert shadow_mapping.closed, 'Original shadow mapping remains live'
+                    assert shadow_mapping() is not None and not shadow_mapping().closed
+                    assert tuple(shadow.shape) == tuple(initial.shape)
+                    shadow = None
+                    gc.collect()
+                    wait_for_retired_memmap_unlinks(path=shadow_path)
+                    assert shadow_mapping() is None, 'Retired shadow mapping remains live'
                     assert not shadow_path.exists(), 'Retired shadow path survives'
                     assert result.final_view_volume_mm is None, 'A redundant dense additions canvas survived'
                     assert result.native_support_mm is None
@@ -161,7 +169,7 @@ class SparsePipelineIntegrationTests(unittest.TestCase):
                 'NUMBA_CACHE_DIR': str(root / 'numba-cache'),
             })
             completed = subprocess.run(
-                [sys.executable, str(Path(__file__).resolve()), '--worker', str(result_path)],
+                [sys.executable, '-X', 'utf8', str(Path(__file__).resolve()), '--worker', str(result_path)],
                 cwd=repo, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding='utf-8', errors='replace', timeout=240)
             self.assertEqual(completed.returncode, 0, completed.stdout[-20000:])

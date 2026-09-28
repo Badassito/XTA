@@ -93,7 +93,8 @@ parse_args(['--device', '0', '--channel_format', 'C5S2', '--imgsz', '128'])
 assert not {'torch', 'numpy', 'cv2', 'ultralytics'}.intersection(set(sys.modules) - initial_modules)
 """
     result = subprocess.run(
-        [sys.executable, '-c', code], cwd=ROOT, capture_output=True, text=True,
+        [sys.executable, '-X', 'utf8', '-c', code], cwd=ROOT,
+        capture_output=True, text=True, encoding='utf-8', errors='replace',
         check=True, timeout=30,
     )
     assert '--channel_format' in result.stdout

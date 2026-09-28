@@ -62,10 +62,13 @@ class PtaGpuOutputFormatTests(unittest.TestCase):
                 self.assertEqual(output_image_suffix(token), "." + canonical)
 
     def test_ordinary_formats_select_cpu_encoder_even_with_gpu_policy(self):
-        for token, canonical in (("JPEG", "jpg"), ("jpg", "jpg"),
-                                 ("TIFF", "tif"), ("tif", "tif"), ("png", "png")):
+        for token, canonical in (("JPEG", "jpg"), ("jpg", "jpg"), (".jPeG", "jpg"),
+                                 ("TIFF", "tif"), ("tif", "tif"), (".TiFf", "tif"),
+                                 ("PNG", "png"), (".pNg", "png")):
             with self.subTest(token=token):
-                runtime = build_runtime_options(self.parse(token, policy=self.gpu))
+                config = self.parse(token, policy=self.gpu)
+                runtime = build_runtime_options(config)
+                self.assertEqual(config.args.output_format, canonical)
                 self.assertEqual(runtime.output_format, canonical)
                 self.assertEqual(runtime.offline_augmentation_backend, "gpu")
                 self.assertEqual(runtime.jpeg_encode_backend, "opencv")

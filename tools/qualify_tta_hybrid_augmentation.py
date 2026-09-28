@@ -83,6 +83,7 @@ def run_case(case: Path, hybrid: bool):
         *([f'cpu:{ROOT / "XTA/examples/external_augmentations/CPU_light.py"}'] if hybrid else []),
         '--augmentation_coverage', 'packed', '--output', str(output), '--temp', str(case / f'{mode}_runtime'),
         '--save', 'nrrd', 'summary']
+    (case / 'ultralytics-config').mkdir(exist_ok=True)
     env = dict(os.environ)
     env.update(PYTHONPATH=str(ROOT), PYTHONIOENCODING='utf-8', PYTHONDONTWRITEBYTECODE='1',
         OMP_NUM_THREADS='2', MKL_NUM_THREADS='2', OPENBLAS_NUM_THREADS='2', SLURM_CPUS_PER_TASK='8',

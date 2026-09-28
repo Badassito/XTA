@@ -486,6 +486,7 @@ class CudaFinalizationContractTests(unittest.TestCase):
             self.assertEqual(runtime.direct_peer_copies, [(1, 0)])
             self.assertEqual(sorted(runtime.pool_frees), [0, 1])
             cuda_finalization._close_array(result.volume)
+            result = None
 
     def test_pre_registered_metadata_bypasses_fallback_scan(self) -> None:
         source, expected = self._physical_fixture()
@@ -498,6 +499,7 @@ class CudaFinalizationContractTests(unittest.TestCase):
             self.assertEqual(self._last_metadata_scan_call_count, 0)
             np.testing.assert_array_equal(np.asarray(result.volume), expected)
             cuda_finalization._close_array(result.volume)
+            result = None
 
     def test_numpy_cuda_fake_host_bounce_preserves_cross_shard_connectivity(self) -> None:
         source, expected = self._physical_fixture()
@@ -511,6 +513,7 @@ class CudaFinalizationContractTests(unittest.TestCase):
             self.assertEqual(int(result.stats["peer_bytes"]), 0)
             self.assertEqual(runtime.direct_peer_copies, [])
             cuda_finalization._close_array(result.volume)
+            result = None
 
     def test_blockwise_3d_ccl_matches_independent_reference_across_layouts(self) -> None:
         source = self._blockwise_matrix_fixture()
@@ -560,6 +563,7 @@ class CudaFinalizationContractTests(unittest.TestCase):
                         int(np.count_nonzero(source) - kept_voxels),
                     )
                     cuda_finalization._close_array(result.volume)
+                    result = None
 
     def test_numpy_cuda_fake_failure_leaves_authority_untouched(self) -> None:
         source, _expected = self._physical_fixture()

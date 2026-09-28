@@ -2213,6 +2213,23 @@ def tile_dense_worker_result_warn_seconds() -> float:
     """Retention age that emits a diagnostic warning; zero disables the warning."""
     return max(0.0, _env_float('YOLO_TTA_TILE_DENSE_RESULT_WARN_SECONDS', 120.0))
 
+def _retire_temporary_binary_volume(volume: object, raw_path: Optional[Path], *, delete_raw: bool) -> None:
+    """Delete a raw scratch backing only after its last mapped view is released."""
+    memfd_backed = _memfd_backing_path_from_array(volume) is not None
+    deferred_path = (
+        raw_path if delete_raw and not memfd_backed
+        and isinstance(volume, np.ndarray)
+        and not bool(getattr(volume, '_is_lazy_processing_cube', False))
+        else None
+    )
+    close_memmap_array(volume, unlink_path=deferred_path)
+    if delete_raw and raw_path is not None and deferred_path is None and not memfd_backed:
+        # A lazy backing owns its own close; it is not an exposed NumPy mmap.
+        try:
+            raw_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
 def archive_or_delete_binary_volume_storage(
     volume: Optional[np.ndarray],
     *,
@@ -2237,21 +2254,13 @@ def archive_or_delete_binary_volume_storage(
                 workers=int(workers),
                 extra_meta={'archived_from_raw_path': str(raw_path)},
             )
-            close_memmap_array(volume)
-            try:
-                raw_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return
         except Exception as exc:
             print(f'Warning: failed to archive {desc} as raw bbox cvol ({exc}); keeping raw volume {raw_path}')
+        else:
+            _retire_temporary_binary_volume(volume, raw_path, delete_raw=True)
+            return
 
-    close_memmap_array(volume)
-    if not bool(keep_temp) and raw_path is not None:
-        try:
-            raw_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+    _retire_temporary_binary_volume(volume, raw_path, delete_raw=not bool(keep_temp))
 
 def close_raw_store_or_memmap_volume(volume: object, *, keep_temp: bool = True) -> None:
     if volume is None:

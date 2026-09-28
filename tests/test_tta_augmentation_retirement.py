@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, TimeoutError
+import gc
 import json
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import PropertyMock, patch
+import weakref
 
 import numpy as np
 import pytest
@@ -18,6 +20,7 @@ from XTA.geometry import (
 from XTA.tta_augmentation_config import TtaAugmentationSettings
 from XTA.tta_augmentation_retirement import SliceMetadataAccumulator, shutdown_policy_retirement
 from XTA.tta_augmentation_runtime import _CoverageWriter, predict_policy_source
+from XTA.runtime import wait_for_retired_memmap_unlinks
 
 
 def _coverage_writer_fixture(root):
@@ -36,10 +39,11 @@ def _coverage_writer_fixture(root):
 def test_coverage_npz_preserves_every_array_dtype_and_metadata_atomically(tmp_path):
     writer, bits = _coverage_writer_fixture(tmp_path)
     backing = writer.array
+    mapping = weakref.ref(backing._mmap)
     result = writer.finish()
     assert writer.array is None
-    assert backing._mmap.closed
-    assert not writer.raw_path.exists()
+    assert not backing._mmap.closed
+    np.testing.assert_array_equal(backing, bits)
     assert not writer.path.with_suffix('.npz.partial').exists()
     with np.load(writer.path, allow_pickle=False) as archive:
         assert archive.files == ['validity_bits', 'seeds', 'global_destinations', 'mirror_azimuthal_u', 'metadata']
@@ -56,12 +60,18 @@ def test_coverage_npz_preserves_every_array_dtype_and_metadata_atomically(tmp_pa
         assert metadata['logical_slices'] == 3
         assert metadata['raster_shape'] == [17, 17]
     writer.close()  # Cleanup remains safe after successful publication.
+    backing = None
+    gc.collect()
+    wait_for_retired_memmap_unlinks(path=writer.raw_path)
+    assert not writer.raw_path.exists()
+    assert mapping() is None or mapping().closed
 
 
 @pytest.mark.parametrize('failure', ['write_member', 'replace'])
 def test_coverage_npz_failure_removes_partial_storage_and_preserves_previous_output(tmp_path, failure):
     writer, _bits = _coverage_writer_fixture(tmp_path)
     backing = writer.array
+    mapping = weakref.ref(backing._mmap)
     previous = b'previous completed output'
     writer.path.write_bytes(previous)
     if failure == 'write_member':
@@ -76,11 +86,16 @@ def test_coverage_npz_failure_removes_partial_storage_and_preserves_previous_out
     with injection, pytest.raises(OSError, match='injected support'):
         writer.finish()
     assert writer.array is None
-    assert backing._mmap.closed
-    assert not writer.raw_path.exists()
+    assert not backing._mmap.closed
+    np.testing.assert_array_equal(backing, _bits)
     assert not writer.path.with_suffix('.npz.partial').exists()
     assert writer.path.read_bytes() == previous
     writer.close()
+    backing = None
+    gc.collect()
+    wait_for_retired_memmap_unlinks(path=writer.raw_path)
+    assert not writer.raw_path.exists()
+    assert mapping() is None or mapping().closed
 
 
 def _metadata(start, count):
@@ -151,7 +166,7 @@ def _run_fixture(tmp_path, *, defer_task, defer_batches, blocked_tail=None):
         target = kwargs['view_union_mm']
         target[:, 1:6, 2:7] = 1
         if isinstance(target, np.memmap):
-            buffers.append(target)
+            buffers.append(weakref.ref(target._mmap))
         stats = dict(prediction_count=n, frames_with_predictions=n,
                      azimuthal_padding_processed=0, device_hole_filled_frames=0,
                      slice_meta=_metadata(start, n))
@@ -177,6 +192,17 @@ def _run_fixture(tmp_path, *, defer_task, defer_batches, blocked_tail=None):
     return result, buffers, tail_stats
 
 
+def _mappings_are_open(references):
+    return all((mapping := reference()) is not None and not mapping.closed
+               for reference in references)
+
+
+def _mappings_are_retired(references):
+    gc.collect()
+    return all((mapping := reference()) is None or mapping.closed
+               for reference in references)
+
+
 @pytest.mark.parametrize('defer_batches', [False, True])
 @pytest.mark.parametrize('defer_task', [False, True])
 def test_runtime_preserves_metadata_from_immediate_and_deferred_batches(tmp_path, defer_batches, defer_task):
@@ -188,7 +214,7 @@ def test_runtime_preserves_metadata_from_immediate_and_deferred_batches(tmp_path
             assert stats['prediction_count'] == 3
             np.testing.assert_array_equal(stats['slice_meta']['slice_any'], [True, False, True])
             np.testing.assert_array_equal(stats['slice_meta']['slice_row_any'][:, 0], [0, 1, 2])
-        assert all(buffer._mmap.closed for buffer in buffers)
+        assert _mappings_are_retired(buffers)
     finally:
         shutdown_policy_retirement()
 
@@ -201,7 +227,7 @@ def test_deferred_task_keeps_masks_open_until_tail_retirement_and_propagates_fai
         publication = result['_device_union_flush_future']
         with pytest.raises(TimeoutError):
             publication.result(timeout=0.02)
-        assert all(not buffer._mmap.closed for buffer in buffers)
+        assert _mappings_are_open(buffers)
         if fail:
             tail.set_exception(RuntimeError('injected policy tail failure'))
             with pytest.raises(RuntimeError, match='injected policy tail failure'):
@@ -209,7 +235,7 @@ def test_deferred_task_keeps_masks_open_until_tail_retirement_and_propagates_fai
         else:
             tail.set_result(stats[0])
             assert publication.result(timeout=5)['augmentation_results'][0]['prediction_count'] == 3
-        assert all(buffer._mmap.closed for buffer in buffers)
+        assert _mappings_are_retired(buffers)
     finally:
         if not tail.done():
             tail.set_exception(RuntimeError('test teardown'))

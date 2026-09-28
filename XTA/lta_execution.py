@@ -19,6 +19,7 @@ import time
 import uuid
 from contextlib import ExitStack, nullcontext
 from dataclasses import asdict, dataclass, replace
+from types import SimpleNamespace
 from pathlib import Path, PurePath, PureWindowsPath
 from typing import Any, Mapping, Sequence
 
@@ -692,9 +693,8 @@ def _materialize_source_volume(source: object, *, path: Path):
         volume.flush()
         return volume
     except BaseException:
-        mmap_obj = getattr(volume, "_mmap", None)
-        if mmap_obj is not None:
-            mmap_obj.close()
+        from .runtime import close_memmap_array_without_flush
+        close_memmap_array_without_flush(volume)
         raise
 
 
@@ -2463,9 +2463,8 @@ def _publish_selected_transverse_outputs(
                 )
             )
     finally:
-        mmap_obj = getattr(cache, "_mmap", None)
-        if mmap_obj is not None:
-            mmap_obj.close()
+        from .runtime import close_memmap_array_without_flush
+        close_memmap_array_without_flush(cache)
     return receipts
 
 
@@ -2555,9 +2554,8 @@ def execute_lta_plan(
             hard_positive = _hard_positive_volume(
                 source, aligned_annotations, path=plan.temp_root / "hard_positive.uint8.raw",
             )
-        source_mmap = getattr(source_volume, "_mmap", None)
-        if source_mmap is not None:
-            source_mmap.close()
+        from .runtime import close_memmap_array_without_flush
+        close_memmap_array_without_flush(source_volume)
         source_volume = None
         cache_ref = reference_existing_physical_view_cache(
             source_cache_path,
@@ -2877,8 +2875,23 @@ def execute_lta_plan(
         # cannot leave a successful-looking run behind.
         from .runtime import close_memmap_array
 
+        # Layer records are needed for the manifest after scratch deletion, but
+        # their volume fields would otherwise keep Windows mappings open. The
+        # shape is the only volume property used by manifest_record().
+        def manifest_only_layer(layer: LtaLayerRecord) -> LtaLayerRecord:
+            shape = getattr(layer.volume, 'shape', None)
+            return replace(layer, volume=SimpleNamespace(shape=shape))
+
+        contributor_layers = tuple(manifest_only_layer(layer) for layer in contributor_layers)
+        final_nrrd = replace(final_nrrd, layer=manifest_only_layer(final_nrrd.layer))
+        prediction_layer = None
+        hard_positive_layer = None
+        terminal_foreground = finalization.terminal_union_foreground_voxels
+        terminal_postprocessing = dict(finalization.postprocessing)
+
         if not finalization.closed:
             finalization.close()
+        finalization = None
         for volume in (native_prediction, view_union, hard_positive, source_volume):
             if volume is not None:
                 close_memmap_array(volume)
@@ -2921,7 +2934,7 @@ def execute_lta_plan(
                     "worker_audit": dict(worker_audit),
                     "view_cache": _view_cache_manifest_record(cache_ref),
                     "completed_view_hole_fill": view_fill.manifest_record(),
-                    "postprocessing": dict(finalization.postprocessing),
+                    "postprocessing": terminal_postprocessing,
                     "device_schedule": {
                         "status": "settled",
                         "policy": "physical_view_affinity_with_bounded_head_assist",
@@ -2949,9 +2962,7 @@ def execute_lta_plan(
             plan=plan,
             manifest_path=manifest_path,
             final_nrrd_path=final_nrrd.receipt.path,
-            terminal_union_foreground_voxels=(
-                finalization.terminal_union_foreground_voxels
-            ),
+            terminal_union_foreground_voxels=terminal_foreground,
             worker_pids=dict(worker_pids),
             relay_generations=relay_generation,
         )
@@ -2974,6 +2985,16 @@ def execute_lta_plan(
                 except Exception:
                     if completed:
                         raise
+        volume = None
+        native_prediction = None
+        view_union = None
+        hard_positive = None
+        source_volume = None
+        prediction_layer = None
+        hard_positive_layer = None
+        contributor_layers = ()
+        final_nrrd = None
+        finalization = None
         if completed and not scratch_cleaned:
             shutil.rmtree(plan.temp_root, ignore_errors=False)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -64,6 +65,38 @@ class LtaRenderingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "changed"):
                 cache.revalidate()
 
+    def test_render_failure_keeps_retained_cache_view_readable(self) -> None:
+        retained = []
+
+        def retain_then_fail(frame):
+            retained.append(frame)
+            raise RuntimeError("intentional renderer failure")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "cache.gray8.dat"
+            source = np.memmap(path, dtype=np.uint8, mode="w+", shape=(1, 3, 4))
+            source[:] = np.arange(12, dtype=np.uint8).reshape(source.shape)
+            source.flush()
+            stat = path.stat()
+            del source
+            cache = LtaPhysicalViewCacheRef(
+                path=path,
+                shape=(1, 3, 4),
+                dtype="uint8",
+                physical_view_id="transverse",
+                identity_sha256="a" * 64,
+                size_bytes=12,
+                mtime_ns=stat.st_mtime_ns,
+            )
+
+            with mock.patch("XTA.lta_rendering.implicit_rgb", new=retain_then_fail):
+                with self.assertRaisesRegex(RuntimeError, "intentional renderer failure"):
+                    render_native_tile_window(
+                        cache, frame_start=0, frame_stop=1, tile_xyxy=(0, 0, 4, 3)
+                    )
+            self.assertEqual(int(retained[0][2, 3]), 11)
+            retained.clear()
+
     def test_tile_chunk_union_uses_global_frame_and_xy_offsets(self) -> None:
         destination = np.zeros((4, 6, 7), dtype=np.uint8)
         chunk = np.zeros((2, 3, 4), dtype=np.uint8)
@@ -112,6 +145,7 @@ class LtaRenderingTests(unittest.TestCase):
             )
             native_copy = np.array(native, copy=True)
             close_memmap_array(native)
+            del native
 
         self.assertEqual(rendered.raster_plan.mode.value, "lta")
         self.assertEqual(frame.shape, (4, 4, 3))

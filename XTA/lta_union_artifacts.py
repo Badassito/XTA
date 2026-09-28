@@ -293,18 +293,15 @@ def iter_union_crops(descriptor, *, frame_start=None):
     artifact = validate_union_artifact(descriptor, frame_start=frame_start)
     if artifact.encoding == "raw-uint8":
         source = np.memmap(artifact.path, dtype=np.uint8, mode="r", shape=artifact.shape)
-        try:
-            for index in range(artifact.shape[0]):
-                frame = source[index]
-                if bool(np.any(frame > 1)):
-                    raise ValueError("legacy union contains nonbinary values")
-                if not bool(np.any(frame)):
-                    continue
-                ys = np.flatnonzero(np.any(frame, axis=1)); xs = np.flatnonzero(np.any(frame, axis=0))
-                top, left = int(ys[0]), int(xs[0])
-                yield artifact.frame_start + index, (top, left), np.asarray(frame[top:int(ys[-1])+1,left:int(xs[-1])+1]).copy()
-        finally:
-            source._mmap.close()
+        for index in range(artifact.shape[0]):
+            frame = source[index]
+            if bool(np.any(frame > 1)):
+                raise ValueError("legacy union contains nonbinary values")
+            if not bool(np.any(frame)):
+                continue
+            ys = np.flatnonzero(np.any(frame, axis=1)); xs = np.flatnonzero(np.any(frame, axis=0))
+            top, left = int(ys[0]), int(xs[0])
+            yield artifact.frame_start + index, (top, left), np.asarray(frame[top:int(ys[-1])+1,left:int(xs[-1])+1]).copy()
     else:
         with artifact.path.open("rb") as stream:
             for frame in artifact.frames:
@@ -361,10 +358,8 @@ def reduce_union_artifact_into_view(descriptor, *, view_union, tile_xyxy, frame_
     if artifact.encoding == "raw-uint8":
         from .lta_rendering import union_tile_chunk_into_view
         source = np.memmap(artifact.path,dtype=np.uint8,mode="r",shape=artifact.shape)
-        try:
-            union_tile_chunk_into_view(view_union,source,frame_start=artifact.frame_start,tile_xyxy=tile)
-        finally:
-            source._mmap.close()
+        union_tile_chunk_into_view(view_union,source,frame_start=artifact.frame_start,tile_xyxy=tile)
+        del source
     else:
         for frame,(top,left),crop in iter_union_crops(artifact):
             target=view_union[frame,y0+top:y0+top+crop.shape[0],x0+left:x0+left+crop.shape[1]]

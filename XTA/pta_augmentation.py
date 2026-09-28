@@ -114,6 +114,11 @@ def validate_seedable_augmentation_pipeline(pipeline: object, *, path: Path) -> 
 
 
 def _load_external_python_module(path: Path, content_sha256: str) -> object:
+    # Execute the bytes that were verified.  SourceFileLoader.exec_module() can
+    # re-read a replaced file, or use a timestamp-valid but stale .pyc.
+    source = path.read_bytes()
+    if hashlib.sha256(source).hexdigest() != content_sha256:
+        raise RuntimeError(f"Augmentation policy changed while loading: {path}")
     module_name = f"_pta_v4_augmentation_{content_sha256[:24]}"
     spec = importlib.util.spec_from_file_location(module_name, str(path))
     if spec is None or spec.loader is None:
@@ -123,7 +128,7 @@ def _load_external_python_module(path: Path, content_sha256: str) -> object:
     parent_text = str(path.parent)
     sys.path.insert(0, parent_text)
     try:
-        spec.loader.exec_module(module)
+        exec(compile(source, str(path), "exec"), module.__dict__)
     except Exception as exc:
         sys.modules.pop(module_name, None)
         raise RuntimeError(

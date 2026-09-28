@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 from concurrent.futures import Future
+import gc
 from types import SimpleNamespace
 from unittest.mock import PropertyMock, patch
+import weakref
 
 import numpy as np
 import pytest
 import torch
 
+from XTA.augmentation_policy import inspect_augmentation_definition
 from XTA.geometry import GpuPrefetchedYoloBatch, ViewInfo, expand_views_into_policy_variants
 from XTA.tta_augmentation_config import TtaAugmentationSettings
 from XTA.tta_augmentation_retirement import shutdown_policy_retirement
@@ -115,8 +118,13 @@ def test_shared_partial_open_failure_closes_worker_mapping_and_preserves_parent(
         with pytest.raises(OSError, match='confidence'):
             _open_policy_sibling_outputs(tasks[1], shape=shape,
                 padding_count=0, shared_parent=True, owned=owned)
-    assert opened[0]._mmap.closed and not owned
+    mapping = weakref.ref(opened[0]._mmap)
+    assert not opened[0]._mmap.closed and int(opened[0][0, 0, 0]) == 8
+    assert not owned
     assert (tmp_path / 'p1.mask').read_bytes() == before
+    opened.clear()
+    gc.collect()
+    assert mapping() is None
 
 
 def test_seam_paths_are_separate_and_unique_across_passes_and_leases(tmp_path):
@@ -158,7 +166,12 @@ def test_file_compatibility_still_creates_zeroed_private_outputs(tmp_path):
 def test_runtime_holds_shared_roots_until_deferred_mask_retirement(tmp_path, fail):
     tasks, shape = _tasks(tmp_path, confidence=False)
     base = tasks[0]
-    base.update(augmentation_settings=TtaAugmentationSettings(ratio=2, coverage='none'),
+    policy = tmp_path / 'policy.py'
+    policy.write_text('def build_gpu_augmentation():\n    return None\n', encoding='utf-8')
+    definition = inspect_augmentation_definition(str(policy))
+    base.update(augmentation_settings=TtaAugmentationSettings(
+                    ratio=2, coverage='none', gpu_path=str(definition.path),
+                    gpu_sha256=definition.content_sha256),
                 augmentation_support_dir=str(tmp_path / 'support'),
                 augmentation_pass_tasks=[tasks[1]])
     parent = np.memmap(base['result_mask_path'], mode='r+', dtype=np.uint8, shape=(5,4,6))
@@ -194,11 +207,19 @@ def test_runtime_holds_shared_roots_until_deferred_mask_retirement(tmp_path, fai
         else:
             blocked.set_result(stats)
             result['_device_union_flush_future'].result(timeout=5)
-        assert all(value._mmap.closed for value in maps)
+        assert all(not value._mmap.closed for value in maps)
+        for value in maps:
+            np.testing.assert_array_equal(value, 1)
         assert not parent._mmap.closed
         actual = np.frombuffer((tmp_path / 'p1.mask').read_bytes(), np.uint8).reshape(5,4,6)
         np.testing.assert_array_equal(actual[[0,3,4]], 8)
         np.testing.assert_array_equal(actual[1:3], 1)
+        sibling_mapping = weakref.ref(maps[0]._mmap)
+        del value
+        maps.clear()
+        shutdown_policy_retirement()
+        gc.collect()
+        assert sibling_mapping() is None
     finally:
         if not blocked.done():
             blocked.set_result(stats)

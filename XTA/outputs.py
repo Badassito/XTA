@@ -45,6 +45,7 @@ from typing import (
     Tuple,
 )
 import numpy as np
+from .json_publication import write_json_atomic
 from .nrrd_spans import canonical_zero_member, stream_native_crop_spans
 from ._deps import _numba, cv2, tifffile, tqdm
 
@@ -259,10 +260,7 @@ def _same_directory_atomic_output(out_path: Path) -> Iterator[Path]:
 
 def _write_json_atomically(out_path: Path, payload: object) -> Path:
     """Serialize JSON completely before atomically replacing its public sidecar."""
-    final_path = Path(out_path)
-    with _same_directory_atomic_output(final_path) as stage_path:
-        stage_path.write_text(json.dumps(payload, indent=2))
-    return final_path
+    return write_json_atomic(out_path, payload)
 
 def _run_sharded_ffv1_encode(
     *,
@@ -2930,7 +2928,7 @@ def write_single_layer_nrrd_from_ref(
             f'{max(band_weights) / (1024 ** 2):.1f} MiB/shard'
         )
     print(
-        f'v16.0.2: {out_path.name} -> {shard_count} in-memory compressed z chunks '
+        f'{out_path.name} -> {shard_count} in-memory compressed z chunks '
         f'(min_slices={nrrd_layer_zshard_min_slices()}, z_chunk={shard_z_chunk}'
         f'{weight_note}; one global permit per active band).'
     )
@@ -3050,7 +3048,7 @@ def write_single_layer_nrrd_from_ref(
                 f'{float(slowest[0]):.2f}s/{int(slowest[1]) / (1024 ** 2):.1f} MiB'
             )
         print(
-            f'v16.0.2: {out_path.name} completed in '
+            f'{out_path.name} completed in '
             f'{time.perf_counter() - n19_started:.2f}s; compressed='
             f'{compressed_total / GIB:.2f} GiB{slowest_note}.'
         )
@@ -3345,7 +3343,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
         if not _NRRD_GPU_MIRROR_TEE_ANNOUNCED:
             _NRRD_GPU_MIRROR_TEE_ANNOUNCED = True
             print(
-                f'GPU low-quality mirror tee active on {gpu_tee.device} (v13.3.6 D2; '
+                f'GPU low-quality mirror tee active on {gpu_tee.device} ('
                 'YOLO_TTA_NRRD_GPU_MIRROR_TEE=0 disables).'
             )
     else:
@@ -3357,7 +3355,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
             if not _NRRD_SPARSE_MIRROR_TEE_ANNOUNCED:
                 _NRRD_SPARSE_MIRROR_TEE_ANNOUNCED = True
                 print(
-                    'v13.3.17 (N22): crop-aware low-quality NRRD mirror tee active; '
+                    'Crop-aware low-quality NRRD mirror tee active; '
                     'native/restored cvol layers no longer make a second dense store pass.'
                 )
 
@@ -4348,7 +4346,7 @@ def _resize_sparse_binary_crop_to_output_region(
                 if not _NRRD_SPARSE_AREA_NUMBA_ANNOUNCED:
                     _NRRD_SPARSE_AREA_NUMBA_ANNOUNCED = True
                     print(
-                        'v13.3.17 (N24): NRRD sparse INTER_AREA member assembly uses '
+                        'NRRD sparse INTER_AREA member assembly uses '
                         'the compiled no-GIL crop kernel.'
                     )
             except Exception as exc:

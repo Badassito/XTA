@@ -27,6 +27,7 @@ from .tta_augmentation_config import policy_seed
 from .tta_augmentation_retirement import (
     CoverageTransfers, SliceMetadataAccumulator, reserve_policy_retirement,
 )
+from .runtime import close_memmap_array_without_flush
 
 
 class PolicyTensorBatchSource(InMemoryYoloVolumeSource):
@@ -152,6 +153,7 @@ class _CoverageWriter:
         if self.backend:
             metadata.update(backend=self.backend, policy_sha256=self.policy_sha256)
         pending = self.path.with_suffix('.npz.partial')
+        arrays = None
         try:
             import zipfile
 
@@ -170,14 +172,19 @@ class _CoverageWriter:
             pending.replace(self.path)
             return {**metadata, 'path': str(self.path)}
         finally:
+            arrays = None
             self.close()
             pending.unlink(missing_ok=True)
 
     def close(self) -> None:
         array, self.array = self.array, None
         if array is not None:
-            array._mmap.close()
-        self.raw_path.unlink(missing_ok=True)
+            close_memmap_array_without_flush(array, unlink_path=self.raw_path)
+        array = None
+        try:
+            self.raw_path.unlink(missing_ok=True)
+        except PermissionError:
+            pass  # A retained write traceback defers deletion to the last view.
 
 
 def _padding_metadata(task: dict[str, Any], mask_path: Path | None, conf_path: Path | None,
@@ -297,7 +304,7 @@ def _open_policy_sibling_outputs(task: dict[str, Any], *, shape: tuple[int, ...]
         return tuple(buffers), (padding_paths[0], padding_paths[1])
     except BaseException:
         for root in owned[owned_start:]:
-            root._mmap.close()
+            close_memmap_array_without_flush(root)
         del owned[owned_start:]
         raise
 
@@ -361,7 +368,7 @@ def predict_policy_source(model: Any, source: Any, *, task: dict[str, Any], cfg:
                         error = exc
         for mm in owned:
             try:
-                mm._mmap.close()
+                close_memmap_array_without_flush(mm)
             except BaseException as exc:
                 if error is None:
                     error = exc

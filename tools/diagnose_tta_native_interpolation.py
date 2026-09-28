@@ -55,6 +55,7 @@ def main():
     case.mkdir(parents=True)
     captures = case / 'captures'
     captures.mkdir()
+    (case / 'ultralytics-config').mkdir()
     # Reproduce qualify_tta_augmentation's runtime environment, including its
     # four-core worker allocation and disabled optional policy compilation.
     os.environ.update(PYTHONPATH=os.pathsep.join([str(source_root), os.environ.get('PYTHONPATH', '')]),

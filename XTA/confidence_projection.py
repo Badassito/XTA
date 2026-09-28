@@ -247,7 +247,7 @@ def _bounded_tilted_projection(source, view, shape, temporary, chunk):
         return result
     except BaseException:
         from .runtime import close_memmap_array_without_flush
-        close_memmap_array_without_flush(result)
+        close_memmap_array_without_flush(result, unlink_path=temporary)
         raise
 
 
@@ -282,7 +282,7 @@ def _bounded_tilted_azimuthal_projection(source, view, shape, temporary, chunk):
         return result
     except BaseException:
         from .runtime import close_memmap_array_without_flush
-        close_memmap_array_without_flush(result)
+        close_memmap_array_without_flush(result, unlink_path=temporary)
         raise
 
 
@@ -327,8 +327,12 @@ def _bounded_score_projection_reader(source, view, shape, temporary, workspace):
             yield lambda z: _bounded_restore_slice(source.transpose(axes), shape, z, chunk)
     finally:
         if projected is not None:
-            close_memmap_array_without_flush(projected)
-        temporary.unlink(missing_ok=True)
+            close_memmap_array_without_flush(projected, unlink_path=temporary)
+        projected = None  # A yielded lambda may retain this closure cell.
+        try:
+            temporary.unlink(missing_ok=True)
+        except PermissionError:
+            pass
 
 
 def resize_score_plane_max(plane, output_hw):
@@ -586,8 +590,12 @@ def score_projection_reader(source, view, output_shape, work_dir, *, memory_byte
             yield lambda z: read_score_slice_in_output_shape(projected, shape, z)
     finally:
         if projected is not None and not np.shares_memory(projected, source):
-            close_memmap_array_without_flush(projected)
-        temporary.unlink(missing_ok=True)
+            close_memmap_array_without_flush(projected, unlink_path=temporary)
+        projected = None  # Do not let a retained reader pin scratch after exit.
+        try:
+            temporary.unlink(missing_ok=True)
+        except PermissionError:
+            pass
 
 
 __all__ = ['score_projection_reader', 'read_score_slice_in_output_shape', 'resize_score_plane_max']

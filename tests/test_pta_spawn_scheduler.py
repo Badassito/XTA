@@ -405,7 +405,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
 
     def test_gpu_runtime_probe_validates_selected_ids_not_selected_count(self) -> None:
         def run_probe(command: list[str], **_kwargs: object) -> object:
-            program = str(command[2])
+            program = str(command[command.index("-c") + 1])
             compile(program, "<pta-gpu-probe>", "exec")
             self.assertIn("selected = (1, 3)", program)
             self.assertIn("idx >= count", program)

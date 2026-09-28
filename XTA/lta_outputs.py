@@ -8,14 +8,13 @@ actually requested so CLI/help imports remain lightweight.
 
 from __future__ import annotations
 
-import json
 import hashlib
-import os
-import tempfile
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
+
+from .json_publication import write_json_atomic
 
 
 LTA_MANIFEST_SCHEMA = "xta.lta.manifest/1"
@@ -299,34 +298,7 @@ def compose_terminal_union(layers: Sequence[LtaLayerRecord]) -> object:
 def write_json_atomically(path: str | Path, payload: object) -> Path:
     """Write one JSON artifact completely before its public replacement."""
 
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, stage_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.",
-        suffix=".assembling",
-        dir=str(destination.parent),
-    )
-    stage_path = Path(stage_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(
-                payload,
-                handle,
-                indent=2,
-                sort_keys=True,
-                ensure_ascii=True,
-                allow_nan=False,
-            )
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(stage_path, destination)
-    except BaseException:
-        try:
-            stage_path.unlink(missing_ok=True)
-        finally:
-            raise
-    return destination
+    return write_json_atomic(path, payload, sort_keys=True, trailing_newline=True)
 
 
 def write_complete_lta_manifest(

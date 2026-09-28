@@ -181,9 +181,10 @@ class PtaSemanticTests(unittest.TestCase):
                         *(["--force"] if forced else []),
                     ]
                     process = subprocess.run(
-                        [sys.executable, "-c", runner, *arguments],
+                        [sys.executable, "-X", "utf8", "-c", runner, *arguments],
                         cwd=Path(__file__).resolve().parents[1],
-                        capture_output=True, text=True, timeout=90, env=os.environ.copy(),
+                        capture_output=True, text=True, encoding="utf-8",
+                        errors="replace", timeout=90, env=os.environ.copy(),
                     )
                     self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
                     self.assertNotIn("Classifying original frames/tiles", process.stderr)
@@ -363,8 +364,9 @@ class PtaSemanticTests(unittest.TestCase):
                 "--pipeline_depth", "1", "--no-topology_aware",
             ]
             process = subprocess.run(
-                [sys.executable, "-c", "import sys; from XTA.pta_mode import run; run(sys.argv[1:])", *arguments],
-                cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=120,
+                [sys.executable, "-X", "utf8", "-c", "import sys; from XTA.pta_mode import run; run(sys.argv[1:])", *arguments],
+                cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=120,
                 env=os.environ.copy(),
             )
             self.assertEqual(process.returncode, 0, process.stdout + process.stderr)

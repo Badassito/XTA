@@ -2,18 +2,20 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+import gc
 import io
 from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
+import weakref
 
 import numpy as np
 
 from XTA import assembly, geometry
 from XTA.confidence_evidence import configure_confidence_evidence
 from XTA.interpolation import TilePostprocessTask
-from XTA.runtime import close_memmap_array_without_flush
+from XTA.runtime import close_memmap_array_without_flush, wait_for_retired_memmap_unlinks
 
 
 class ConfidenceRetirementFailureTests(unittest.TestCase):
@@ -38,13 +40,13 @@ class ConfidenceRetirementFailureTests(unittest.TestCase):
         mask[:, 1:5, 2:6] = 1
         scores[:] = mask * np.uint8(173)
         self.addCleanup(close_memmap_array_without_flush, mask)
-        self.addCleanup(close_memmap_array_without_flush, scores)
         return root, mask_path, score_path, mask, scores
 
     def assert_retired(self, failure, caught, scores, score_path, mask, original, keep_temp):
         self.assertIs(caught.exception, failure)
-        self.assertTrue(scores._mmap.closed)
-        self.assertEqual(score_path.exists(), keep_temp)
+        self.assertFalse(scores._mmap.closed)
+        self.assertGreater(int(scores.sum()), 0)
+        self.assertTrue(score_path.exists())
         # The caller still owns the prediction mask after this phase fails.
         self.assertFalse(mask._mmap.closed)
         np.testing.assert_array_equal(mask, original)
@@ -66,6 +68,16 @@ class ConfidenceRetirementFailureTests(unittest.TestCase):
                             keep_temp=keep_temp, slice_workers=1, interpolation_task_workers=1,
                             nrrd_layers_enabled=True)
                 self.assert_retired(failure, caught, scores, score_path, mask, original, keep_temp)
+                mapping = weakref.ref(scores._mmap)
+                failure.__traceback__ = None
+                caught = scores = None
+                gc.collect()
+                if not keep_temp:
+                    wait_for_retired_memmap_unlinks(path=score_path)
+                    self.assertFalse(score_path.exists())
+                else:
+                    self.assertTrue(score_path.exists())
+                self.assertIsNone(mapping())
 
     def test_tile_publication_failure_closes_scores_and_respects_temp_retention(self):
         for keep_temp in (False, True):
@@ -84,6 +96,16 @@ class ConfidenceRetirementFailureTests(unittest.TestCase):
                             min_conf=0, min_radius=0, keep_temp=keep_temp, slice_workers=1,
                             sparse_retire_dir=root)
                 self.assert_retired(failure, caught, scores, score_path, mask, original, keep_temp)
+                mapping = weakref.ref(scores._mmap)
+                failure.__traceback__ = None
+                caught = scores = task = None
+                gc.collect()
+                if not keep_temp:
+                    wait_for_retired_memmap_unlinks(path=score_path)
+                    self.assertFalse(score_path.exists())
+                else:
+                    self.assertTrue(score_path.exists())
+                self.assertIsNone(mapping())
 
 
 if __name__ == '__main__':

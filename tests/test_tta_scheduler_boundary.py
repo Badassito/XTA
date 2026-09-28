@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import queue
 import tempfile
 import threading
@@ -7,8 +8,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
 
 from XTA.geometry import ViewInfo
+from XTA.media import _path_is_relative_to
+from XTA.runtime import close_memmap_array_without_flush, wait_for_retired_memmap_unlinks
 from XTA.tta_scheduler import (
     TtaScheduler,
     TtaSchedulerCallbacks,
@@ -105,7 +109,7 @@ def _operations(**overrides: object) -> TtaSchedulerOperations:
         allocate_workspace_array=lambda **_kwargs: None,
         array_nbytes=lambda shape, _dtype: int(__import__("math").prod(shape)),
         available_anon_work_bytes=lambda: 1 << 40,
-        close_memmap_array_without_flush=lambda _array: None,
+        close_memmap_array_without_flush=lambda _array, **_kwargs: None,
         cpu_inference_task_priority=lambda _task: 0,
         cpu_worker_default_seconds_per_frame=lambda _view: 0.25,
         cpu_worker_max_lease_slices=lambda: 64,
@@ -899,6 +903,73 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
         self.assertEqual(result.gpu_dispatched_by_worker, {0: 2})
         self.assertEqual(result.quiescence_issues["remaining_results"], 1)
         self.assertEqual(result.quiescence_issues["tile_ownership_task_ids"], [17])
+
+    def test_dense_result_release_waits_for_retained_view_before_unlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            result_dir = root / "gpu_worker_results"
+            result_dir.mkdir()
+            path = result_dir / "tile.dat"
+            mapping = np.memmap(path, dtype=np.uint8, mode="w+", shape=(1, 2, 2))
+            mapping[:] = 7
+            retained_view = mapping[0]
+            state = _state()
+            state.gpu_worker_tile_dense_result_workspaces[17] = (mapping, None)
+            state.gpu_worker_tasks_by_id[17] = {
+                "task_id": 17, "result_mask_path": str(path),
+                "result_mask_fallback_path": str(path),
+            }
+            scheduler = _scheduler(root, state=state, operation_overrides={
+                "_memmap_backing_path": lambda value: Path(value.filename),
+                "_path_is_relative_to": _path_is_relative_to,
+                "close_memmap_array_without_flush": close_memmap_array_without_flush,
+            })
+
+            self.assertTrue(scheduler.release_tile_dense_result_task_id(17, refill=False))
+            self.assertTrue(path.exists())
+            self.assertEqual(int(retained_view[0, 0]), 7)
+            del mapping
+            self.assertTrue(path.exists())
+            del retained_view
+            gc.collect()
+            wait_for_retired_memmap_unlinks(path=path)
+            self.assertFalse(path.exists())
+
+    def test_dense_result_prepare_failure_retires_only_owned_backing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            result_dir = root / "gpu_worker_results"
+            result_dir.mkdir()
+            mask_path = result_dir / "mask.dat"
+            conf_path = result_dir / "conf.dat"
+            opened = []
+
+            def allocate(**kwargs):
+                if opened:
+                    raise OSError("intentional confidence allocation failure")
+                mapping = np.memmap(kwargs["path"], dtype=np.uint8, mode="w+", shape=kwargs["shape"])
+                opened.append(mapping)
+                return mapping
+
+            state = _state()
+            scheduler = _scheduler(root, state=state, operation_overrides={
+                "allocate_workspace_array": allocate,
+                "_memmap_backing_path": lambda value: Path(value.filename),
+                "_path_is_relative_to": _path_is_relative_to,
+                "close_memmap_array_without_flush": close_memmap_array_without_flush,
+            })
+            task = {"task_id": 18, "kind": "tile", "processing_shape": (1, 2, 2),
+                    "result_mask_path": str(mask_path), "result_conf_path": str(conf_path)}
+
+            with self.assertRaisesRegex(OSError, "intentional confidence allocation failure"):
+                scheduler.prepare_tile_dense_result_workspaces(task)
+            self.assertTrue(mask_path.exists())
+            self.assertFalse(conf_path.exists())
+            self.assertNotIn(18, state.gpu_worker_tile_dense_result_workspaces)
+            opened.clear()
+            gc.collect()
+            wait_for_retired_memmap_unlinks(path=mask_path)
+            self.assertFalse(mask_path.exists())
 
     def test_bind_callbacks_and_result_transport_are_one_shot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

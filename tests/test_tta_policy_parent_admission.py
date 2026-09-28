@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import ast
+import gc
 import io
 import queue
 import tempfile
@@ -253,8 +254,12 @@ class PolicyParentWorkspaceIntegrationTests(unittest.TestCase):
             namespace = dict(vars(pipeline))
             namespace.update(temp_dir=root, worker_direct_union_active=False,
                 policy_settings=SimpleNamespace(enabled=True), bounded_policy_parent_keys=keys,
-                args=SimpleNamespace(imgsz=8, min_conf=1., interpolation_distance=0),
-                dense_tiling_active=False, nrrd_layers_needed=True,
+                args=SimpleNamespace(imgsz=8, min_conf=1., min_radius=0.,
+                    interpolation_distance=0, interpolation_walk_back=1,
+                    interpolation_candidates=1, interpolation_passes=1,
+                    interpolation_min_radius=0., interpolation_search_angle=0.),
+                dense_tiling_active=False, component_layers_needed=True,
+                nrrd_layers_needed=True,
                 baseline_union_by_model_view={}, baseline_confmap_by_model_view={},
                 baseline_slice_locks_by_model_view={},
                 baseline_union_paths=state.baseline_union_paths,
@@ -272,7 +277,23 @@ class PolicyParentWorkspaceIntegrationTests(unittest.TestCase):
                 input_T=4, input_H=5, input_W=6,
                 parent_postprocess_executor=SimpleNamespace(submit=submit),
                 view_processing_futures={}, gpu_worker_pending_task_ids=[],
-                slice_postprocess_workers=1, keep_temp_artifacts=False)
+                slice_postprocess_workers=1, parent_slice_postprocess_workers=1,
+                parent_interpolation_task_workers=1,
+                parent_transient_admission=SimpleNamespace(reserve=mock.Mock()),
+                angle_variant_streaming_cleanup_active=False,
+                angle_variant_gpu_fastpath_active=False,
+                component_ref_dense_retirement_active=True,
+                _publish_parent_mask_ready=mock.Mock(),
+                _submit_component_projection=mock.Mock(),
+                _dispatch_inference_windows=mock.Mock(),
+                keep_temp_artifacts=False)
+            namespace['view_prepare_leases'] = pipeline.ViewPrepareLeaseState(
+                leases=state.direct_union_backing_leases,
+                inference_views=state.direct_union_inference_views,
+                inference_bytes=state.direct_union_inference_bytes,
+                postprocess_views=state.direct_union_postprocess_views,
+                postprocess_bytes=state.direct_union_postprocess_bytes,
+            )
             source = Path(pipeline.__file__).read_text(encoding='utf-8')
             ensure = _function(source, '_ensure_baseline_workspaces', namespace)
             _function(source, '_merge_pending_azimuthal_padding_for_parent', namespace)
@@ -324,6 +345,18 @@ class PolicyParentWorkspaceIntegrationTests(unittest.TestCase):
                         expected_conf[key][start_slice:start_slice + 2] = conf
                         namespace.update(task=member, view=member['view'], model_name_s='model')
                         exec(consume, namespace)
+                        # The extracted handler runs at module scope in this fixture,
+                        # so its temporary result mappings remain in ``namespace``.
+                        # Release those roots before checking deferred Windows unlink.
+                        namespace.pop('res_mask', None)
+                        namespace.pop('res_conf', None)
+                        gc.collect()
+                        runtime.wait_for_retired_memmap_unlinks(
+                            path=Path(member['result_mask_path']),
+                        )
+                        runtime.wait_for_retired_memmap_unlinks(
+                            path=Path(member['result_conf_path']),
+                        )
                         self.assertFalse(Path(member['result_mask_path']).exists())
                         self.assertFalse(Path(member['result_conf_path']).exists())
                         self.assertTrue(parent_paths[key].exists())
@@ -346,7 +379,17 @@ class PolicyParentWorkspaceIntegrationTests(unittest.TestCase):
             finally:
                 for mapping in (parent_masks, parent_confmaps):
                     for value in (mapping or {}).values():
-                        runtime.close_memmap_array_without_flush(value)
+                        runtime.close_memmap_array_without_flush(
+                            value, unlink_path=Path(value.filename),
+                        )
+                value = None
+                if parent_masks is not None:
+                    parent_masks.clear()
+                if parent_confmaps is not None:
+                    parent_confmaps.clear()
+                submitted.clear()
+                namespace.clear()
+                gc.collect()
 
 
 if __name__ == '__main__':

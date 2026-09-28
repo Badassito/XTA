@@ -14,6 +14,19 @@ from XTA.confidence_evidence import write_block_confidence_evidence
 from XTA.confidence_projection import score_projection_reader, score_projection_workspace
 
 
+@pytest.fixture
+def gc_disabled():
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+        else:
+            gc.disable()
+
+
 def _evidence(root, view, source_shape, values):
     return write_block_confidence_evidence(
         root, values.shape, lambda z: values[z], model_name='m', layer_key=view.name,
@@ -109,7 +122,8 @@ def test_projection_minimum_rejection_precedes_native_staging(tmp_path):
     assert not (tmp_path/'work').exists()
 
 
-def test_projection_exception_retires_temporary_maps(tmp_path, monkeypatch):
+def test_projection_exception_retires_temporary_maps(tmp_path, monkeypatch, gc_disabled):
+    assert not gc.isenabled()
     from XTA import confidence_projection
     shape = (5, 7, 9)
     view = geometry.get_view_infos(*shape, cartesian_views=(),
@@ -122,6 +136,11 @@ def test_projection_exception_retires_temporary_maps(tmp_path, monkeypatch):
     with pytest.raises(OSError, match='injected strip failure'):
         with reference.source_reader(tmp_path/'work', memory_mib=4, max_staging_mib=5):
             pass
+    # Projector traceback frames retain the source map until this cycle is collected.
+    gc.collect()
+    from XTA.runtime import wait_for_retired_memmap_directory_cleanup
+    for pending in (tmp_path/'work').glob('confidence-source-*'):
+        wait_for_retired_memmap_directory_cleanup(pending)
     assert not list((tmp_path/'work').iterdir())
 
 

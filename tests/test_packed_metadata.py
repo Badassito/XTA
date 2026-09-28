@@ -84,9 +84,10 @@ print('generic target: 56 exact metadata cases')
             environment = dict(os.environ, NUMBA_CPU_NAME='generic', NUMBA_CACHE_DIR=directory,
                                CUDA_VISIBLE_DEVICES='')
             environment.pop('NUMBA_CPU_FEATURES', None)
-            result = subprocess.run([sys.executable, '-B', '-c', script],
+            result = subprocess.run([sys.executable, '-X', 'utf8', '-B', '-c', script],
                                     cwd=Path(__file__).resolve().parents[1], env=environment,
-                                    capture_output=True, text=True, timeout=90)
+                                    capture_output=True, text=True, encoding='utf-8',
+                                    errors='replace', timeout=90)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('generic target: 56 exact metadata cases', result.stdout)
 

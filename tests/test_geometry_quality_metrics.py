@@ -30,9 +30,9 @@ def isolated_numerical_case(function):
         for name in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS'):
             environment[name] = '2'
         test = f'tests.test_geometry_quality_metrics.GeometryQualityMetricsTests.{function.__name__}'
-        result = subprocess.run([sys.executable, '-B', '-m', 'unittest', '-v', test],
+        result = subprocess.run([sys.executable, '-X', 'utf8', '-B', '-m', 'unittest', '-v', test],
             cwd=Path(__file__).resolve().parents[1], env=environment,
-            capture_output=True, text=True, timeout=60)
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
     return run
 

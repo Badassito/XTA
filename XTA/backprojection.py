@@ -2748,7 +2748,7 @@ def _try_resident_trt_ring_accumulate(
 ) -> Optional[Dict[str, int]]:
     """Run a batch-1 resident source through the persistent two-context TensorRT ring.
 
-    Every v16.4.0 source owns one task-wide post affine. Full-frame and tile tasks
+    Every source owns one task-wide post affine. Full-frame and tile tasks
     therefore share the same static destination geometry across all ring slots.
     """
     global _RESIDENT_TRT_RING_ANNOUNCED, _RESIDENT_TRT_RING_FALLBACK_WARNED
@@ -4368,6 +4368,7 @@ def _project_tilted_azimuthal_sink(source, view, shape, compose, frame_count, ou
     packed_w = (out_w + 7) // 8
     packed_path = Path(out_path).with_name(Path(out_path).name + '.tilted_azimuthal.bits.dat')
     packed_destination = cuda_stage = None
+    flat = packed = None
     failed = callback_aborted = False
     next_frame = cpu_frames = admission_attempts = 0
     admission_seconds = reader_drain_seconds = 0.0
@@ -4526,15 +4527,21 @@ def _project_tilted_azimuthal_sink(source, view, shape, compose, frame_count, ou
                         raise
         finally:
             active_error = sys.exc_info()[1]
-            for cleanup in (lambda: close_memmap_array_without_flush(packed_destination),
-                            lambda: packed_path.unlink(missing_ok=True)):
-                try:
-                    cleanup()
-                except BaseException as cleanup_error:
-                    if active_error is None:
-                        raise
-                    if callable(getattr(active_error, 'add_note', None)):
-                        active_error.add_note(f'Tilted Azimuthal packed scratch cleanup failed: {cleanup_error}')
+            try:
+                if isinstance(packed_destination, np.memmap):
+                    close_memmap_array_without_flush(packed_destination, unlink_path=packed_path)
+                else:
+                    close_memmap_array_without_flush(packed_destination)
+                    packed_path.unlink(missing_ok=True)
+            except BaseException as cleanup_error:
+                if active_error is None:
+                    raise
+                if callable(getattr(active_error, 'add_note', None)):
+                    active_error.add_note(f'Tilted Azimuthal packed scratch cleanup failed: {cleanup_error}')
+            finally:
+                # Readers have joined and CUDA retirement has settled. Drop our
+                # own aliases; any exception-held consumer must remain readable.
+                flat = packed = packed_destination = None
 
 
 def _backproject_tilted_azimuthal_volume_to_volume(
@@ -4722,7 +4729,7 @@ def _backproject_tilted_azimuthal_volume_to_volume(
             reserve_bytes=int(reserve_bytes),
         )
         print(
-            f'{desc}: v16.1.3 direct tilted-Azimuthal composition active; no '
+            f'{desc}: direct tilted-Azimuthal composition active; no '
             f'{avoided_base_bytes / GIB:.2f} GiB tilted base-stack intermediate is allocated.'
         )
         destination_flat = np.asarray(destination).reshape(-1)
@@ -4847,7 +4854,7 @@ def backproject_azimuthal_volume_to_volume(
         )
     else:
         print(
-            f'{desc}: v13.3.17 C2 sink-only azimuthal projection active; '
+            f'{desc}: sink-only azimuthal projection active; '
             f'skipping {array_nbytes((t_dim, out_h, out_w), np.uint8) / GIB:.2f} GiB dense workspace.'
         )
 
@@ -5151,9 +5158,11 @@ def backproject_tilted_volume_to_volume(
             return restored_mm
         finally:
             if reduced_mm is not None:
-                close_memmap_array(reduced_mm)
+                close_memmap_array(reduced_mm, unlink_path=reduced_path)
+                reduced_mm = None
             if restored_mm is not None and not bool(restore_succeeded):
                 close_memmap_array(restored_mm)
+                restored_mm = None
             try:
                 reduced_path.unlink(missing_ok=True)
             except Exception:

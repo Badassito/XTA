@@ -1,7 +1,8 @@
 """Concrete persistent-worker adapter for production LTA propagation chains.
 
-The module is imported only inside an LTA worker after that process narrows
-``CUDA_VISIBLE_DEVICES``.  Dense masks never cross multiprocessing queues: each
+Predictors are constructed inside an LTA worker after it narrows
+``CUDA_VISIBLE_DEVICES``; parent-side code also imports artifact helpers here.
+Dense masks never cross multiprocessing queues: each
 task reads an immutable seed/cache artifact and atomically publishes a compact
 JSON manifest plus file-backed union and relay-seed artifacts.
 """

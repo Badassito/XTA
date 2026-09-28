@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import tempfile
 import types
 import unittest
@@ -9,7 +10,15 @@ from unittest import mock
 import numpy as np
 
 
-from XTA import assembly, interpolation, outputs, topology
+from XTA import assembly, interpolation, outputs, runtime, topology
+
+
+def _wait_for_membership_retirement(component_dir: Path) -> None:
+    """Observe deferred scratch retirement before asserting directory cleanup."""
+    gc.collect()
+    for path in (component_dir / '_membership').glob('word*.dat'):
+        runtime.wait_for_retired_memmap_unlinks(path=path)
+    runtime.wait_for_retired_memmap_directory_cleanup(component_dir / '_membership')
 
 
 class InterpolationComponentDecompositionTests(unittest.TestCase):
@@ -389,7 +398,9 @@ class InterpolationComponentDecompositionTests(unittest.TestCase):
                 )
                 np.testing.assert_array_equal(post_pass_mask, pre_pass_mask | component_union)
                 self.assertEqual(int(stats['added_voxels']), int(np.count_nonzero(expected_delta)))
-                self.assertFalse((root / f'components{pass_index}' / '_membership').exists())
+                component_dir = root / f'components{pass_index}'
+                _wait_for_membership_retirement(component_dir)
+                self.assertFalse((component_dir / '_membership').exists())
 
     def test_labeling_failure_retires_all_component_outputs(self) -> None:
         mask = np.zeros((3, 5, 5), dtype=np.uint8)
@@ -514,6 +525,8 @@ class InterpolationComponentDecompositionTests(unittest.TestCase):
                     )
 
             self.assertEqual(memmap_proxy.membership_calls, 2)
+            _wait_for_membership_retirement(component_dir)
+            runtime.wait_for_retired_memmap_directory_cleanup(component_dir)
             self.assertFalse(component_dir.exists())
             self.assertEqual(list(root.rglob('word*.dat')), [])
             self.assertEqual(list(root.rglob('*.cvol')), [])

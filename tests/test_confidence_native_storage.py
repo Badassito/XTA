@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+import gc
 import io
 import json
 from pathlib import Path
@@ -18,6 +19,7 @@ from XTA.confidence_evidence import (ConfidenceEvidenceRef,ConfidenceEvidenceRea
     publish_native_confidence_pieces,write_confidence_evidence,write_block_confidence_evidence)
 from XTA.confidence_projection import score_projection_reader
 from XTA.config import TiltedViewGroup
+from XTA.runtime import wait_for_retired_memmap_directory_cleanup
 
 
 class ConfidenceNativeStorageTests(unittest.TestCase):
@@ -136,6 +138,10 @@ class ConfidenceNativeStorageTests(unittest.TestCase):
             self.assertEqual(int(actual[0,2,2]),128)
 
     def test_native_conversion_budget_and_failure_cleanup_are_explicit(self):
+        gc_was_enabled=gc.isenabled()
+        gc.disable()
+        self.addCleanup(gc.enable if gc_was_enabled else gc.disable)
+        self.assertFalse(gc.isenabled())
         self.configure()
         view=geometry.get_view_infos(5,7,9,cartesian_views=('transverse',))[0]
         values=np.ones((5,7,9),np.uint8)*173
@@ -149,6 +155,10 @@ class ConfidenceNativeStorageTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError,'injected projection'):
                 with ref.source_reader(work,memory_mib=4,max_staging_mib=4):
                     pass
+        # The caught traceback contains source-reader frames and their mapped inputs.
+        gc.collect()
+        for pending in work.glob('confidence-source-*'):
+            wait_for_retired_memmap_directory_cleanup(pending)
         self.assertEqual(list(work.iterdir()),[])
 
     def test_empty_native_view_needs_no_staging_but_still_validates_payload(self):

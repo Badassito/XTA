@@ -665,20 +665,32 @@ class TtaScheduler:
                 str(original_conf_path) if original_conf_path is not None else None
             )
             task.pop('result_workspace_preallocated', None)
+            self.state.gpu_worker_tile_dense_result_workspaces.pop(task_id, None)
+            failed_memfd_reservation = self.state.gpu_worker_tile_dense_result_memfd_reservations.pop(task_id, None)
+            if failed_memfd_reservation is not None:
+                self.state.gpu_worker_tile_dense_result_memfd_bytes_reserved = max(
+                    0, int(self.state.gpu_worker_tile_dense_result_memfd_bytes_reserved)
+                    - int(failed_memfd_reservation)
+                )
             for mm in (conf_mm, mask_mm):
                 if mm is None:
                     continue
                 backing = self.operations._memmap_backing_path(mm)
                 is_memfd = self.operations._memfd_owner_key_from_array(mm) is not None
+                unlink_path = (
+                    Path(backing) if not is_memfd and backing is not None
+                    and Path(backing).suffix.lower() == '.dat'
+                    and self.operations._path_is_relative_to(Path(backing), self.inputs.gpu_worker_result_dir)
+                    else None
+                )
                 try:
-                    self.operations.close_memmap_array_without_flush(mm)
+                    if unlink_path is None:
+                        self.operations.close_memmap_array_without_flush(mm)
+                    else:
+                        self.operations.close_memmap_array_without_flush(mm, unlink_path=unlink_path)
                 except Exception:
                     pass
-                if not is_memfd and backing is not None:
-                    try:
-                        Path(backing).unlink(missing_ok=True)
-                    except Exception:
-                        pass
+            mm = mask_mm = conf_mm = None
             raise
 
     def release_tile_dense_result_task_id(self,
@@ -693,8 +705,10 @@ class TtaScheduler:
         released_memfd = self.state.gpu_worker_tile_dense_result_memfd_reservations.pop(task_id_i, None)
         reserved_at = self.state.gpu_worker_tile_dense_result_reserved_at.pop(task_id_i, None)
         workspaces = self.state.gpu_worker_tile_dense_result_workspaces.pop(task_id_i, None)
+        had_workspaces = workspaces is not None
         task_obj = self.state.gpu_worker_tasks_by_id.get(task_id_i)
         cleanup_paths: set[Path] = set()
+        retired_backings: set[Path] = set()
         if isinstance(task_obj, dict):
             for owned_task in (task_obj, *task_obj.get('augmentation_pass_tasks', ())):
                 for field_name in (
@@ -718,21 +732,31 @@ class TtaScheduler:
                 if backing is not None:
                     cleanup_paths.add(Path(backing))
                 is_memfd = self.operations._memfd_owner_key_from_array(mm) is not None
+                unlink_path = (
+                    Path(backing) if not is_memfd and not bool(self.inputs.keep_temp_artifacts)
+                    and backing is not None and Path(backing).suffix.lower() == '.dat'
+                    and self.operations._path_is_relative_to(Path(backing), self.inputs.gpu_worker_result_dir)
+                    else None
+                )
+                if unlink_path is not None:
+                    retired_backings.add(unlink_path.resolve(strict=False))
                 try:
-                    self.operations.close_memmap_array_without_flush(mm)
+                    if unlink_path is None:
+                        self.operations.close_memmap_array_without_flush(mm)
+                    else:
+                        self.operations.close_memmap_array_without_flush(mm, unlink_path=unlink_path)
                 except Exception:
                     pass
-                if not is_memfd and not bool(self.inputs.keep_temp_artifacts) and backing is not None:
-                    try:
-                        Path(backing).unlink(missing_ok=True)
-                    except Exception:
-                        pass
+            mm = None
+            workspaces = None
         if not bool(self.inputs.keep_temp_artifacts):
             # Also remove a fallback pathname that may have been created before a memfd
             # handoff or survived a worker-side error. The guard keeps cleanup confined to
             # this run's non-resumable GPU result directory.
             for cleanup_path in cleanup_paths:
                 try:
+                    if cleanup_path.resolve(strict=False) in retired_backings:
+                        continue
                     if (
                         (cleanup_path.suffix.lower() == '.dat' or cleanup_path.name.endswith('.dat.seam'))
                         and self.operations._path_is_relative_to(cleanup_path, self.inputs.gpu_worker_result_dir)
@@ -758,7 +782,7 @@ class TtaScheduler:
             released is None
             and released_memfd is None
             and reserved_at is None
-            and workspaces is None
+            and not had_workspaces
         ):
             return False
         if reserved_at is not None:
@@ -791,7 +815,7 @@ class TtaScheduler:
                 print(
                     f'Warning: array-backed tile worker result task {task_id_i} remained live for '
                     f'{retention_seconds:.1f}s before {reason or "retirement"}; '
-                    'the backing has now been closed and deleted. '
+                    'the backing has now been retired for cleanup. '
                     'YOLO_TTA_TILE_DENSE_RESULT_WARN_SECONDS adjusts this diagnostic.'
                 )
         if released is not None:

@@ -79,9 +79,10 @@ def display(path,*args,**kwargs):
 with mock.patch.object(Path,'resolve',display):
     _verify_concurrent_cached_exports(Path(sys.argv[1]),_cache_export_volumes())
 '''
-    result = subprocess.run([sys.executable, '-c', program, str(root),
+    result = subprocess.run([sys.executable, '-X', 'utf8', '-c', program, str(root),
                              '1' if emulate_memfd_resolution else '0'],
-                            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+                            text=True, encoding='utf-8', errors='replace',
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
     if result.returncode:
         raise AssertionError(result.stdout)
 

@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-import json
 import math
-import os
-import threading
 from pathlib import Path
 from typing import Any, Mapping
+
+from ..json_publication import write_json_atomic
 
 
 def json_compatible(value: Any, *, path: str = "payload") -> Any:
@@ -65,28 +64,8 @@ def write_json_manifest(path: Path, payload: Mapping[str, Any]) -> Path:
 
     if not isinstance(payload, Mapping):
         raise TypeError("manifest payload must be a mapping")
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
     normalized = json_compatible(payload)
-    serialized = json.dumps(
-        normalized,
-        indent=2,
-        sort_keys=True,
-        ensure_ascii=True,
-        allow_nan=False,
-    ) + "\n"
-    temporary = destination.with_name(
-        f".{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-    )
-    try:
-        temporary.write_text(serialized, encoding="utf-8", newline="\n")
-        os.replace(temporary, destination)
-    finally:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
-    return destination
+    return write_json_atomic(path, normalized, sort_keys=True, trailing_newline=True, suffix=".tmp")
 
 
 __all__ = ("json_compatible", "write_json_manifest")

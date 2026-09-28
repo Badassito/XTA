@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import contextlib
 from concurrent.futures import Future
+import gc
 import io
 import tempfile
+import symtable
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,12 +22,29 @@ from XTA.interpolation import NrrdLayerRef
 from XTA.projection_queue import settle_prepared_view_components
 
 
-def _function(source: str, name: str, namespace: dict) -> object:
+def _function(source: str, name: str, namespace: dict,
+              *, unreachable_globals: frozenset[str] = frozenset()) -> object:
     node = next(node for node in ast.walk(ast.parse(source))
                 if isinstance(node, ast.FunctionDef) and node.name == name)
     node.decorator_list = []
     module = ast.Module(body=[ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0), node], type_ignores=[])
     ast.fix_missing_locations(module)
+    symbols = symtable.symtable(ast.unparse(module), '<terminal-ref-contract>', 'exec')
+    function_symbols = symbols.lookup(name).get_namespace()
+
+    def required_globals(table):
+        names = {symbol.get_name() for symbol in table.get_symbols()
+                 if symbol.is_global() and symbol.is_referenced()}
+        for child in table.get_children():
+            names.update(required_globals(child))
+        return names
+
+    missing = (required_globals(function_symbols) - namespace.keys()
+               - vars(builtins).keys() - unreachable_globals)
+    if missing:
+        raise AssertionError(
+            f'{name} extracted test namespace lacks global dependencies: {sorted(missing)}'
+        )
     exec(compile(module, '<terminal-ref-contract>', 'exec'), namespace)
     return namespace[name]
 
@@ -114,7 +134,9 @@ class TerminalReferenceTests(unittest.TestCase):
             'allocate_workspace_array': allocate,
             'cleanup_view_volume_after_prediction_inplace': lambda *a, **kw: None,
             'close_memmap_array': assembly.close_memmap_array,
-            'close_memmap_array_without_flush': captures.closed.append,
+            'close_memmap_array_without_flush': (
+                lambda value, **_kwargs: captures.closed.append(value)
+            ),
             'interpolate_view_volume_pass_maybe_process': fake_interpolate,
             'materialize_interpolation_component_nrrd_view_layer': materialize_component,
             'materialize_nrrd_view_layer': lambda *a, **kw: None,
@@ -122,10 +144,13 @@ class TerminalReferenceTests(unittest.TestCase):
             'runtime_telemetry': lambda: telemetry,
         })
         prepare = _function(self.source, 'prepare_view_volume_after_fullframe', ns)
-        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.addCleanup(gc.collect)
+        with mock.patch.object(
             finalization, 'union_volume_into_volume', side_effect=lambda dst, src, **kw: np.bitwise_or(dst, src, out=dst),
         ), contextlib.redirect_stdout(io.StringIO()):
-            root = Path(temporary)
+            root = Path(temporary.name)
             union_path = root / 'shadow.dat'
             union_path.touch()
             args = dict(model_name='model', view=view, union_mm=volume, confmap_mm=None,

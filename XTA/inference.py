@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import gc
+import inspect
 import math
 import os
 import queue
@@ -688,6 +689,22 @@ def cpu_mask_postprocess_pending_limit(worker_count: int, num_frames: int) -> in
 
 _ULTRALYTICS_CHANNEL_AWARE_PREPROCESS_PATCHED = False
 
+def _require_ultralytics_method_signature(method: object, expected: tuple[str, ...], name: str) -> None:
+    """Reject an upstream private API change before installing an inference patch."""
+    try:
+        parameters = tuple(inspect.signature(method).parameters.values())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f'Unsupported Ultralytics {name} signature: {exc}') from exc
+    positional = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    if len(parameters) != len(expected) or any(
+        parameter.name != name or parameter.kind not in positional
+        for parameter, name in zip(parameters, expected)
+    ):
+        raise RuntimeError(
+            f'Unsupported Ultralytics {name} signature: expected {expected}, '
+            f'found {inspect.signature(method)}'
+        )
+
 def ensure_channel_aware_yolo_preprocess_patch() -> bool:
     """Preserve H×W×C in-memory input order when constructing BCHW tensors.
 
@@ -705,10 +722,15 @@ def ensure_channel_aware_yolo_preprocess_patch() -> bool:
         import torch  # type: ignore
         from ultralytics.engine.predictor import BasePredictor  # type: ignore
     except Exception as exc:  # pragma: no cover - ultralytics is imported lazily on SLURM
-        print(f'Warning: channel-aware YOLO preprocess patch could not be installed ({exc})')
-        return False
+        raise RuntimeError(f'Cannot install channel-aware YOLO preprocess patch: {exc}') from exc
 
-    original_preprocess = BasePredictor.preprocess
+    try:
+        original_preprocess = BasePredictor.preprocess
+    except AttributeError as exc:
+        raise RuntimeError('Ultralytics BasePredictor.preprocess is unavailable') from exc
+    _require_ultralytics_method_signature(
+        original_preprocess, ('self', 'im'), 'BasePredictor.preprocess'
+    )
 
     def _tta_channel_aware_preprocess(self, im):  # type: ignore[no-untyped-def]
         gpu_tensor = getattr(im, '_tta_gpu_tensor', None)
@@ -796,7 +818,7 @@ def ensure_channel_aware_yolo_preprocess_patch() -> bool:
     BasePredictor.preprocess = _tta_channel_aware_preprocess
     _ULTRALYTICS_CHANNEL_AWARE_PREPROCESS_PATCHED = True
     print(
-        'Channel-aware YOLO preprocess enabled: v15 in-memory H×W×C inputs are '
+        'Channel-aware YOLO preprocess enabled: in-memory H×W×C inputs are '
         'passed as BCHW tensors without BGR/RGB channel reversal.'
     )
     return True
@@ -807,12 +829,12 @@ def require_channel_aware_yolo_preprocess_patch(channel_token: str) -> None:
         installed = bool(ensure_channel_aware_yolo_preprocess_patch())
     except Exception as exc:
         raise RuntimeError(
-            f'--channel_format {channel_token} requires the v15 channel-aware '
+            f'--channel_format {channel_token} requires the channel-aware '
             f'Ultralytics preprocessing patch, but installation failed: {exc}'
         ) from exc
     if not installed:
         raise RuntimeError(
-            f'--channel_format {channel_token} requires the v15 channel-aware '
+            f'--channel_format {channel_token} requires the channel-aware '
             'Ultralytics preprocessing patch. Verify the installed Ultralytics '
             'version exposes ultralytics.engine.predictor.BasePredictor.preprocess.'
         )
@@ -1079,10 +1101,17 @@ def ensure_cpu_retina_mask_predictor_patch() -> bool:
         from ultralytics.engine.results import Results  # type: ignore
         from ultralytics.models.yolo.segment.predict import SegmentationPredictor  # type: ignore
     except Exception as exc:
-        print(f'Warning: CPU retina-mask predictor patch could not be installed; falling back to Ultralytics masks ({exc})')
-        return False
+        raise RuntimeError(f'Cannot install CPU retina-mask predictor patch: {exc}') from exc
 
-    original_construct_result = SegmentationPredictor.construct_result
+    try:
+        original_construct_result = SegmentationPredictor.construct_result
+    except AttributeError as exc:
+        raise RuntimeError('Ultralytics SegmentationPredictor.construct_result is unavailable') from exc
+    _require_ultralytics_method_signature(
+        original_construct_result,
+        ('self', 'pred', 'img', 'orig_img', 'img_path', 'proto'),
+        'SegmentationPredictor.construct_result',
+    )
 
     def _tta_cpu_retina_construct_result(self, pred, img, orig_img, img_path, proto):  # type: ignore[no-untyped-def]
         if not cpu_retina_masks_enabled():
@@ -1289,10 +1318,17 @@ def ensure_gpu_retina_proto_union_predictor_patch() -> bool:
         from ultralytics.engine.results import Results  # type: ignore
         from ultralytics.models.yolo.segment.predict import SegmentationPredictor  # type: ignore
     except Exception as exc:
-        print(f'Warning: GPU proto-union predictor patch could not be installed; keeping Ultralytics retina masks ({exc})')
-        return False
+        raise RuntimeError(f'Cannot install GPU proto-union predictor patch: {exc}') from exc
 
-    original_construct_result = SegmentationPredictor.construct_result
+    try:
+        original_construct_result = SegmentationPredictor.construct_result
+    except AttributeError as exc:
+        raise RuntimeError('Ultralytics SegmentationPredictor.construct_result is unavailable') from exc
+    _require_ultralytics_method_signature(
+        original_construct_result,
+        ('self', 'pred', 'img', 'orig_img', 'img_path', 'proto'),
+        'SegmentationPredictor.construct_result',
+    )
 
     def _tta_gpu_proto_union_construct_result(self, pred, img, orig_img, img_path, proto):  # type: ignore[no-untyped-def]
         if cpu_retina_masks_enabled() or not gpu_retina_proto_union_enabled():
@@ -1307,7 +1343,7 @@ def ensure_gpu_retina_proto_union_predictor_patch() -> bool:
     SegmentationPredictor.construct_result = _tta_gpu_proto_union_construct_result
     _ULTRALYTICS_GPU_PROTO_UNION_PATCHED = True
     print(
-        'GPU proto-resolution retina union enabled (v13.3.0 R9): per-frame unions are reduced at '
+        'GPU proto-resolution retina union enabled: per-frame unions are reduced at '
         'proto scale and one plane is upsampled, bypassing the (n, imgsz, imgsz) retina stack.'
     )
     return True
@@ -1945,7 +1981,7 @@ def _init_gpu_union_retirement_manager(device_str: str, max_plane_side: int) -> 
         )
         _GPU_UNION_RETIREMENT_MANAGER = manager
         print(
-            f'v16.1.3 event-driven GPU union retirement initialized: '
+            f'Event-driven GPU union retirement initialized: '
             f'{manager.capacity} persistent lane(s), '
             f'{gpu_union_retirement_chunk_slices()} slice(s)/D2H chunk, '
             f'{gpu_union_retirement_event_capacity()} producer event(s)/lane.'
@@ -3936,7 +3972,7 @@ def _direct_predict_stream(
     if not _DIRECT_PREDICT_ANNOUNCED:
         _DIRECT_PREDICT_ANNOUNCED = True
         print(
-            'Direct backend predict loop active (v13.3.6 C2): stream_inference, NMS and '
+            'Direct backend predict loop active: stream_inference, NMS and '
             'per-frame Results are bypassed; confidence-gated instances feed the '
             'proto-resolution union directly (YOLO_TTA_DIRECT_PREDICT=0 restores model.predict).'
         )
@@ -3988,7 +4024,7 @@ def _direct_predict_stream(
                     if not _DIRECT_DEVICE_COMPACTION_ANNOUNCED:
                         _DIRECT_DEVICE_COMPACTION_ANNOUNCED = True
                         print(
-                            'Direct device compaction active (v13.3.12 C3): confidence filtering, '
+                            'Direct device compaction active: confidence filtering, '
                             'proto dot/crop union, and instance counts remain on device; '
                             'YOLO_TTA_DIRECT_DEVICE_COMPACTION=0 restores the synchronized fallback.'
                         )
@@ -4219,7 +4255,7 @@ def predict_source_and_accumulate(
         semantic_gpu_path = _semantic_gpu_path_available(cfg, source, stream_min_radius)
 
         # Admit raw device-union accumulation whenever no host-only cleanup must run before
-        # union. Every angle-variant task therefore retains its masks on device; only
+        # union. Eligible angle-variant tasks retain their masks on device; only
         # positive per-slice radius cleanup, unsupported confidence cleanup, CPU retina masks,
         # or insufficient VRAM force the per-frame host path.
         device_union: Optional[_DeviceUnionAccumulator] = None
@@ -5478,7 +5514,7 @@ def cleanup_view_volume_after_prediction_inplace(
         # Filtering/removal remains eligible; adding unsupported foreground does not.
         print(f'2D hole fill ({view.name}): skipped for inverse-mapped external-policy masks.')
     elif bool(skip_hole_fill):
-        print(f'2D hole fill ({view.name}): done on device during accumulation (v13.3.3 S2); CPU pass skipped.')
+        print(f'2D hole fill ({view.name}): done on device during accumulation; CPU pass skipped.')
     else:
         fill_view_volume_holes_2d_inplace(
             mask_mm,

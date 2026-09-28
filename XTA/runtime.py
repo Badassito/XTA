@@ -16,10 +16,12 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import sys
 import tempfile
 import threading
 import time
+import weakref
 import importlib.metadata as importlib_metadata
 import multiprocessing as mp
 from multiprocessing import reduction as mp_reduction
@@ -46,6 +48,7 @@ from typing import (
     Tuple,
 )
 import numpy as np
+_NUMPY_MEMMAP_TYPE = np.memmap
 from ._deps import cv2, tqdm
 
 from .config import (
@@ -2732,14 +2735,17 @@ def _discard_failed_workspace_copy(dst: object, path: Optional[Path]) -> None:
     owner_key = _memfd_owner_key_from_array(dst)
     root = _root_memmap_for_array(dst)
     filename = getattr(root, 'filename', None) if root is not None else None
-    close_memmap_array_without_flush(dst)
-    if owner_key is not None or path is None or not filename:
-        return
-    try:
+    unlink_path = None
+    if owner_key is None and path is not None and filename:
         requested = Path(path).absolute()
         actual = Path(str(filename)).absolute()
         if actual == requested and requested.exists():
-            requested.unlink()
+            unlink_path = requested
+    close_memmap_array_without_flush(dst, unlink_path=unlink_path)
+    if unlink_path is None:
+        return
+    try:
+        unlink_path.unlink(missing_ok=True)
     except OSError:
         pass
 
@@ -3460,58 +3466,236 @@ def _root_memmap_for_array(arr: object) -> Optional[np.memmap]:
     """Return the root memmap backing ``arr`` without materializing a copy."""
     current = arr
     seen: set[int] = set()
+    root: Optional[np.memmap] = None
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, np.memmap):
-            return current
+        if isinstance(current, _NUMPY_MEMMAP_TYPE):
+            root = current
         current = getattr(current, 'base', None)
-    return None
+    return root
 
-def close_memmap_array(arr: object) -> None:
-    if arr is None:
-        return
-    owner_key = _memfd_owner_key_from_array(arr)
-    try:
-        lazy_close = getattr(arr, 'close', None)
-        if bool(getattr(arr, '_is_lazy_processing_cube', False)) and callable(lazy_close):
+
+_MEMMAP_RETIREMENT_LOCK = threading.RLock()
+_MEMMAP_RETIREMENTS: Dict[int, tuple[weakref.ReferenceType[mmap.mmap], object, dict[str, object]]] = {}
+_MEMMAP_UNLINK_LOCK = threading.Lock()
+_MEMMAP_UNLINK_EVENT = threading.Event()
+_MEMMAP_PENDING_UNLINKS: dict[tuple[Path, int, int], tuple[float, bool]] = {}
+_MEMMAP_PENDING_DIRECTORIES: dict[tuple[Path, int, int], tuple[float, bool]] = {}
+_MEMMAP_UNLINK_WORKER: Optional[threading.Thread] = None
+
+
+def _reset_memmap_retirement_after_fork() -> None:
+    """A child cannot retire its parent's mappings or inherit its worker locks."""
+    global _MEMMAP_RETIREMENT_LOCK, _MEMMAP_RETIREMENTS
+    global _MEMMAP_UNLINK_LOCK, _MEMMAP_UNLINK_EVENT, _MEMMAP_PENDING_UNLINKS
+    global _MEMMAP_PENDING_DIRECTORIES
+    global _MEMMAP_UNLINK_WORKER, _MEMFD_OWNER_LOCK
+    _MEMMAP_RETIREMENT_LOCK = threading.RLock()
+    _MEMMAP_RETIREMENTS = {}
+    _MEMMAP_UNLINK_LOCK = threading.Lock()
+    _MEMMAP_UNLINK_EVENT = threading.Event()
+    _MEMMAP_PENDING_UNLINKS = {}
+    _MEMMAP_PENDING_DIRECTORIES = {}
+    _MEMMAP_UNLINK_WORKER = None
+    _MEMFD_OWNER_LOCK = threading.RLock()
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_reset_memmap_retirement_after_fork)
+
+
+def _retired_memmap_unlink_worker() -> None:
+    """Retry deletion after Windows has finished destroying the last mmap handle."""
+    while True:
+        with _MEMMAP_UNLINK_LOCK:
+            pending = bool(_MEMMAP_PENDING_UNLINKS or _MEMMAP_PENDING_DIRECTORIES)
+        _MEMMAP_UNLINK_EVENT.wait(timeout=0.25 if pending else None)
+        _MEMMAP_UNLINK_EVENT.clear()
+        with _MEMMAP_UNLINK_LOCK:
+            pending = tuple(_MEMMAP_PENDING_UNLINKS.items())
+        for entry, (started, warned) in pending:
+            path, device, inode = entry
+            complete = False
             try:
-                lazy_close()
-            except Exception:
-                pass
-            return
-        if owner_key is not None:
-            _madvise_dontneed_array(arr)
-        root = _root_memmap_for_array(arr)
-        if root is not None:
-            mmap_obj = getattr(root, '_mmap', None)
-            if mmap_obj is not None:
-                try:
-                    mmap_obj.close()
-                except (BufferError, OSError, ValueError):
-                    pass
-    finally:
-        if owner_key is not None:
-            _release_memfd_owner_key(owner_key)
+                current = path.lstat()
+                if (int(current.st_dev), int(current.st_ino)) != (device, inode):
+                    complete = True  # Another run replaced this path.
+                else:
+                    path.unlink()
+                    complete = True
+            except FileNotFoundError:
+                complete = True
+            except OSError as exc:
+                if not warned and time.monotonic() - started >= 30.0:
+                    print(f'Deferred scratch memmap deletion still blocked: {path}: {exc}',
+                          file=sys.stderr)
+                    with _MEMMAP_UNLINK_LOCK:
+                        if entry in _MEMMAP_PENDING_UNLINKS:
+                            _MEMMAP_PENDING_UNLINKS[entry] = (started, True)
+            if complete:
+                with _MEMMAP_UNLINK_LOCK:
+                    _MEMMAP_PENDING_UNLINKS.pop(entry, None)
+        with _MEMMAP_UNLINK_LOCK:
+            directories = tuple(_MEMMAP_PENDING_DIRECTORIES.items())
+        for entry, (started, warned) in directories:
+            path, device, inode = entry
+            complete = False
+            try:
+                current = path.lstat()
+                if ((int(current.st_dev), int(current.st_ino)) != (device, inode)
+                        or not stat.S_ISDIR(current.st_mode)):
+                    complete = True
+                else:
+                    path.rmdir()  # Only the explicitly owned empty directory.
+                    complete = True
+            except FileNotFoundError:
+                complete = True
+            except OSError as exc:
+                if not warned and time.monotonic() - started >= 30.0:
+                    print(f'Deferred scratch directory deletion still blocked: {path}: {exc}',
+                          file=sys.stderr)
+                    with _MEMMAP_UNLINK_LOCK:
+                        if entry in _MEMMAP_PENDING_DIRECTORIES:
+                            _MEMMAP_PENDING_DIRECTORIES[entry] = (started, True)
+            if complete:
+                with _MEMMAP_UNLINK_LOCK:
+                    _MEMMAP_PENDING_DIRECTORIES.pop(entry, None)
 
-def close_memmap_array_without_flush(arr: object) -> None:
-    """Close a scratch mapping without forcing dirty pages to storage."""
+
+def _start_memmap_unlink_worker_locked() -> None:
+    """Start the single deletion worker while _MEMMAP_UNLINK_LOCK is held."""
+    global _MEMMAP_UNLINK_WORKER
+    if _MEMMAP_UNLINK_WORKER is None or not _MEMMAP_UNLINK_WORKER.is_alive():
+        _MEMMAP_UNLINK_WORKER = threading.Thread(
+            target=_retired_memmap_unlink_worker,
+            name='xta-memmap-unlink', daemon=True,
+        )
+        _MEMMAP_UNLINK_WORKER.start()
+    _MEMMAP_UNLINK_EVENT.set()
+
+
+def defer_retired_memmap_directory_cleanup(path: Path) -> None:
+    """Remove an explicitly owned scratch directory once it is empty."""
+    directory = Path(path).absolute()
+    try:
+        identity = directory.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(identity.st_mode):
+        raise NotADirectoryError(str(directory))
+    entry = (directory, int(identity.st_dev), int(identity.st_ino))
+    with _MEMMAP_UNLINK_LOCK:
+        _MEMMAP_PENDING_DIRECTORIES.setdefault(entry, (time.monotonic(), False))
+        _start_memmap_unlink_worker_locked()
+
+
+def wait_for_retired_memmap_directory_cleanup(path: Path, *, timeout_s: float = 5.0) -> None:
+    """Wait for deferred deletion of one scratch directory."""
+    target = Path(path).absolute()
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while True:
+        with _MEMMAP_UNLINK_LOCK:
+            pending = any(entry[0] == target for entry in _MEMMAP_PENDING_DIRECTORIES)
+        if not pending:
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f'deferred scratch directory deletion remains blocked: {target}')
+        _MEMMAP_UNLINK_EVENT.set()
+        time.sleep(0.02)
+
+
+def _finish_memmap_retirement(mapping_id: int, state: dict[str, object]) -> None:
+    """Run only after the shared mmap has lost every NumPy and buffer consumer."""
+    if int(state['owner_pid']) != os.getpid():
+        return  # An inherited finalizer must never delete parent-owned scratch.
+    owner_key = state['owner_key']
+    if owner_key is not None:
+        _release_memfd_owner_key(owner_key)
+    paths = state['unlink_paths']
+    with _MEMMAP_RETIREMENT_LOCK:
+        if paths:
+            with _MEMMAP_UNLINK_LOCK:
+                for entry in paths:
+                    _MEMMAP_PENDING_UNLINKS.setdefault(entry, (time.monotonic(), False))
+                _start_memmap_unlink_worker_locked()
+        _MEMMAP_RETIREMENTS.pop(mapping_id, None)
+
+
+def wait_for_retired_memmap_unlinks(*, path: Optional[Path] = None, timeout_s: float = 5.0) -> None:
+    """Wait for scheduled scratch deletion, raising if another handle still blocks it."""
+    target = Path(path).absolute() if path is not None else None
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while True:
+        with _MEMMAP_RETIREMENT_LOCK:
+            active = tuple(entry[0] for _reference, _finalizer, state in _MEMMAP_RETIREMENTS.values()
+                           for entry in state['unlink_paths']
+                           if target is None or entry[0] == target)
+            with _MEMMAP_UNLINK_LOCK:
+                pending = active + tuple(entry[0] for entry in _MEMMAP_PENDING_UNLINKS
+                                         if target is None or entry[0] == target)
+        if not pending:
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f'deferred scratch memmap deletion remains blocked: {pending}')
+        _MEMMAP_UNLINK_EVENT.set()
+        time.sleep(0.02)
+
+
+def _retire_memmap_array(arr: object, *, unlink_path: Optional[Path] = None) -> None:
+    """Defer unmapping until the root and every derived NumPy view are dead."""
+    root = _root_memmap_for_array(arr)
+    if root is None:
+        return
+    mmap_obj = getattr(root, '_mmap', None)
+    if mmap_obj is None:
+        return
+    mapping_id = id(mmap_obj)
+    with _MEMMAP_RETIREMENT_LOCK:
+        retirement = _MEMMAP_RETIREMENTS.get(mapping_id)
+        if retirement is None or retirement[0]() is not mmap_obj:
+            state: dict[str, object] = {
+                'owner_key': _memfd_owner_key_from_array(root), 'unlink_paths': [],
+                'owner_pid': os.getpid(),
+            }
+            finalizer = weakref.finalize(mmap_obj, _finish_memmap_retirement, mapping_id, state)
+            finalizer.atexit = False
+            _MEMMAP_RETIREMENTS[mapping_id] = (weakref.ref(mmap_obj), finalizer, state)
+        else:
+            state = retirement[2]
+            if state['owner_key'] is None:
+                state['owner_key'] = _memfd_owner_key_from_array(root)
+    if unlink_path is not None:
+        path = Path(unlink_path).absolute()
+        filename = getattr(root, 'filename', None)
+        try:
+            if filename is None or not path.samefile(Path(str(filename))):
+                raise ValueError(f'scratch retirement path does not back memmap: {path}')
+            identity = path.lstat()
+        except FileNotFoundError:
+            return  # An earlier retirement already removed this pathname.
+        entry = (path, int(identity.st_dev), int(identity.st_ino))
+        with _MEMMAP_RETIREMENT_LOCK:
+            unlink_paths = state['unlink_paths']
+            if entry not in unlink_paths:
+                unlink_paths.append(entry)
+
+def close_memmap_array(arr: object, *, unlink_path: Optional[Path] = None) -> None:
     if arr is None:
         return
-    owner_key = _memfd_owner_key_from_array(arr)
-    try:
-        if owner_key is not None:
-            _madvise_dontneed_array(arr)
-        root = _root_memmap_for_array(arr)
-        if root is not None:
-            mmap_obj = getattr(root, '_mmap', None)
-            if mmap_obj is not None:
-                try:
-                    mmap_obj.close()
-                except (BufferError, OSError, ValueError):
-                    pass
-    finally:
-        if owner_key is not None:
-            _release_memfd_owner_key(owner_key)
+    lazy_close = getattr(arr, 'close', None)
+    if bool(getattr(arr, '_is_lazy_processing_cube', False)) and callable(lazy_close):
+        try:
+            lazy_close()
+        except Exception:
+            pass
+        return
+    _retire_memmap_array(arr, unlink_path=unlink_path)
+
+def close_memmap_array_without_flush(arr: object, *, unlink_path: Optional[Path] = None) -> None:
+    """Retire a scratch mapping without invalidating its live NumPy views."""
+    if arr is None:
+        return
+    _retire_memmap_array(arr, unlink_path=unlink_path)
 
 _INTERPOLATION_PROCESS_EXECUTOR: Optional[ProcessPoolExecutor] = None
 
@@ -4166,7 +4350,14 @@ def interpolate_view_volume_pass_maybe_process(
     def _discard_speculative_worker_storage() -> None:
         if worker_mm is process_mm:
             return
-        close_memmap_array(worker_mm)
+        worker_backing = Path(worker_path)
+        retire_path = (
+            worker_backing if not bool(keep_temp) and worker_backing.exists()
+            and _root_memmap_for_array(worker_mm) is not None
+            and _memfd_owner_key_from_array(worker_mm) is None
+            else None
+        )
+        close_memmap_array(worker_mm, unlink_path=retire_path)
         if not bool(keep_temp):
             try:
                 Path(worker_path).unlink(missing_ok=True)

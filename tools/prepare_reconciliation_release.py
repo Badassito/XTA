@@ -50,6 +50,20 @@ RELEASES = {
                        'tools/qualify_pta_classification.py',
                        'tools/qualify_pta_gpu_masks.py',
                        'tools/qualify_pta_gpu_render.py')),
+    '23.0.2': dict(token='23_0_2', previous_token='23',
+                   feature='repository-review-corrections',
+                   validation_tools=(
+                       'tools/compare_reconciliation.py',
+                       'tools/qualify_tta_reconciliation.py',
+                       'tools/export_reconciliation_evidence.py',
+                       'tools/qualify_confidence_consolidation.py',
+                       'tools/qualify_d1_confidence_bounds.py',
+                       'tools/analyze_pipeline_trace.py',
+                       'tools/export_semantic_logits.py',
+                       'tools/qualify_semantic_trt.py',
+                       'tools/qualify_pta_classification.py',
+                       'tools/qualify_pta_gpu_masks.py',
+                       'tools/qualify_pta_gpu_render.py')),
 }
 REASONS = {
     '__init__': 'Publish the package release identity as {release}.',
@@ -105,9 +119,11 @@ THROUGHPUT_REASONS = {
 }
 SEMANTIC_REASONS = {
     '__init__': 'Publish the 23.0.1 package release identity.',
-    'cli': 'Use the sole 23.0.1 launcher and current release identity.',
-    'config': 'Expose semantic task and output choices for TTA and PTA with the 23.0.1 identity.',
-    'inference': 'Consume semantic model logits and confidence without requiring instance masks, using the CUDA TensorRT ring when eligible.',
+    'cli': 'Use the sole 23.0.1 launcher and current release identity, clarifying mode and dependency-light dispatch comments.',
+    'config': 'Expose semantic task and output choices for TTA and PTA with the 23.0.1 identity and clarify angle-variant documentation.',
+    'geometry': 'Clarify current TTA geometry documentation and explicitly retire the unused private augmentation-angle parser.',
+    'lta_worker_adapter': 'Clarify that parent-side LTA code imports artifact helpers while predictor construction remains inside isolated workers.',
+    'inference': 'Consume semantic model logits and confidence without requiring instance masks, using the CUDA TensorRT ring when eligible, and clarify device-union admission.',
     'semantic_inference': 'Decode raw semantic logits into foreground probability and preserve confidence for thresholding and reconciliation.',
     'semantic_cuda': 'Run semantic probability, filtering and mask publication on CUDA while preserving CPU reference behavior.',
     'semantic_trt': 'Reuse fixed-shape TensorRT bindings and captured CUDA work across semantic inference batches.',
@@ -121,7 +137,7 @@ SEMANTIC_REASONS = {
     'pta_augmentation': 'Preserve semantic label and ignore values through pretraining augmentation.',
     'pta_publication': 'Write semantic labels with the unknown-region ignore value using a qualified PNG filter and run-length configuration with compatible fallback.',
     'pta_runtime': 'Keep semantic candidate confidence available for pretraining publication.',
-    'pta_workers': 'Carry semantic task and coverage settings through pretraining workers and keep the CUDA rendering path resident across grouped work.',
+    'pta_workers': 'Carry semantic task and coverage settings through pretraining workers, keeping eligible categorical rendering resident on CUDA while clarifying fallback and publication ownership.',
     'pta_cuda_masks': 'Render categorical foreground and annotation coverage on CUDA with nearest sampling and checked CPU fallback.',
     'pta_cuda_cartesian': 'Render Cartesian and tilted Cartesian categorical planes on CUDA while preserving bounded geometric parity.',
     'pta_cuda_azimuthal': 'Render upright and tilted azimuthal categorical planes on CUDA with wrap and mirror geometry.',
@@ -132,20 +148,75 @@ SEMANTIC_REASONS = {
     'tta_outputs': 'Publish semantic masks from test-time augmentation.',
     'tta_prediction': 'Apply semantic confidence handling to test-time predictions.',
     'runtime': 'Record semantic task identity and preserve prediction confidence.',
-    'workers': 'Carry semantic task settings through test-time workers and retire TensorRT ring resources safely.',
+    'workers': 'Carry semantic task settings through test-time workers, retire TensorRT ring resources safely, and clarify current task errors and documentation.',
     'examples/external_augmentations/GPU_baseline': 'Declare that baseline geometric augmentation does not require an instance mask.',
     'examples/external_augmentations/GPU_light': 'Declare that light geometric augmentation does not require an instance mask.',
     'examples/external_augmentations/GPU_heavy': 'Declare that heavy geometric augmentation does not require an instance mask.',
     'examples/external_augmentations/GPU_superheavy': 'Declare that superheavy geometric augmentation does not require an instance mask.',
+}
+PATCH_REASONS = {
+    '__init__': 'Bump package identity after the tagged 23.0.1 release.',
+    'cli': 'Read the release identity from the inert package initializer and derive the launcher name.',
+    'config': 'Read the release identity from the inert package initializer and derive compact and launcher names.',
+    'geometry': 'Guard the supported Ultralytics loader signature, clarify current geometry behavior, and retire the unused private angle parser.',
+    'inference': 'Fail clearly when Ultralytics predictor signatures differ from the supported family and clarify current inference behavior.',
+    'workers': 'Propagate predictor patch-installation failures instead of continuing with unpatched inference.',
+    'pta_augmentation': 'Compile the exact augmentation policy bytes that were hashed before execution.',
+    'pta': 'Decode child-process output predictably on Windows and clarify current PTA diagnostics.',
+    'media': 'Clarify current media diagnostics while preserving payload handling.',
+    'lta_inputs': 'Decode input-probe subprocess output as UTF-8 with replacement for invalid bytes.',
+    'finalization': 'Retire owned temporary binary volumes after borrowed views release and clarify current diagnostics without changing output arithmetic.',
+    'backprojection': 'Retire tilted-azimuthal backing paths after borrowed views release and clarify current diagnostics without changing projection arithmetic.',
+    'assembly': 'Preserve mapped volume owners until all assembled views retire.',
+    'lta_rendering': 'Preserve mapped LTA render owners until borrowed views retire.',
+    'lta_scheduler': 'Clarify the current scheduler admission and relay bounds.',
+    'lta_worker_adapter': 'Clarify that predictor construction remains isolated in workers.',
+    'pta_workers': 'Clarify categorical CUDA fallback and publication ownership.',
+    'runtime': 'Guard scratch memmap unmapping against live views while retaining explicit ownership cleanup.',
+    'reconciliation_runtime': 'Preserve mapped evidence ownership until all borrowed views retire.',
+    'pipeline': 'Extract admitted-view preparation from the TTA orchestrator and retain existing stage admission behavior.',
+    'tta_augmentation_runtime': 'Keep mapped augmentation roots owned while shared views are live.',
+    'tta_augmentation_cpu_runtime': 'Keep mapped CPU augmentation roots owned while shared views are live.',
+    'outputs': 'Publish JSON manifests with durable atomic replacement.',
+    'lta_outputs': 'Use the shared durable JSON publication helper for LTA manifests.',
+    'confidence_evidence': 'Use the shared durable JSON publication helper and guard borrowed memmap lifetimes in confidence evidence.',
+    'confidence_native': 'Preserve mapped native confidence owners while borrowed score views remain live.',
+    'confidence_projection': 'Release borrowed memmap ownership only after all confidence projection views retire.',
+    'confidence_tiles': 'Preserve parent memmap ownership while derived confidence tile views remain live.',
+    'lta_execution': 'Keep LTA memmap owners alive through asynchronous view use and release them at terminal completion.',
+    'lta_sam': 'Restore process CUDA precision flags after SAM imports and model construction.',
+    'json_publication': 'Consolidate atomic JSON writers with unique temporary names, strict finite encoding and durable file and directory sync.',
+    'view_prepare': 'Move admitted-view preparation into an explicit run-state object with preserved scheduler ownership.',
+    'cuda_finalization': 'Retire unsafe direct memmap-close fallback while preserving CUDA finalization ownership.',
+    'cuda_d1': 'Retire owned D1 archive and delete backings after borrowed mappings release.',
+    'sparse_projection': 'Retain mapped sparse-projection inputs until dependent views retire.',
+    'union_artifacts': 'Retain mapped union-artifact inputs until dependent views retire.',
+    'lta_union_artifacts': 'Retain mapped LTA union-artifact inputs until dependent views retire.',
+    'interpolation': 'Retire exact owned scratch paths only after borrowed views and readers release their mappings.',
+    'tta_outputs': 'Drop completed output artifact aliases before owned scratch cleanup and manifest publication.',
+    'tta_scheduler': 'Defer exact owned tile-result backing cleanup until outstanding mapped views retire.',
+    'unification/manifest': 'Publish complete run manifests through a durable atomic JSON writer.',
 }
 REMOVAL_REASONS = {
     'examples/external_reconciliation/' + name:
         'Retire this preset from the curated package selection while preserving its authenticated release history.'
     for name in ('baseline', 'confidence_voxel', 'cross_sections', 'provenance')
 }
+REMOVED_DEFINITION_REASONS = {
+    ('geometry', '_angle_from_aug_id'):
+        'Retire the unused private augmentation-angle parser while retaining its authenticated v22.3.2 source hash.',
+}
+REMOVED_STATEMENT_REASONS = {
+    ('lta_outputs', 'import json'): 'The shared JSON writer now owns encoding.',
+    ('lta_outputs', 'import os'): 'The shared JSON writer now owns fsync and replacement.',
+    ('lta_outputs', 'import tempfile'): 'The shared JSON writer now owns unique temporary files.',
+    ('unification/manifest', 'import json'): 'The shared JSON writer now owns encoding.',
+    ('unification/manifest', 'import os'): 'The shared JSON writer now owns fsync and replacement.',
+    ('unification/manifest', 'import threading'): 'The shared JSON writer now owns temporary names.',
+}
 TOOL_REASONS = {
     'tools/compare_reconciliation.py': 'Compare persisted evidence with explicit native conversion, bounded readers and unchanged source artifacts.',
-    'tools/qualify_tta_reconciliation.py': 'Qualify unchanged masks and complete source or native confidence across CPU, GPU and hybrid inference.',
+    'tools/qualify_tta_reconciliation.py': 'Qualify unchanged masks and complete source or native confidence across CPU, GPU and hybrid inference while isolating Ultralytics settings outside the repository.',
     'tools/export_reconciliation_evidence.py': 'Explicitly export retained native confidence into a checked source-grid companion.',
     'tools/qualify_confidence_consolidation.py': 'Qualify consolidated native confidence against original pieces with exact score and known-support parity.',
     'tools/qualify_d1_confidence_bounds.py': 'Qualify cropped and dense confidence capture from the same real generic Radial prediction, preserving exact encoded score/index bytes and device source tensors.',
@@ -206,7 +277,8 @@ def review_module(module, old_source, new_source, *, complete, labels_by_hash, r
                statements_sha256=hashlib.sha256(json.dumps(old_hashes, separators=(',', ':')).encode()).hexdigest())
     snapshot = dict(module=module, previous_ast_sha256=pin['ast_sha256'], ast_sha256=inventory.digest(new),
                     previous_top_level=old_hashes, top_level=new_hashes, reason=reason)
-    records = dict(definitions=[], statements=[], local_import_seam_updates=[])
+    records = dict(definitions=[], statements=[], local_import_seam_updates=[],
+                   removed_definitions=[], removed_statements=[])
     unmatched, used_labels = set(range(len(old_hashes))), set()
     for index, node in enumerate(new.body):
         previous = None
@@ -233,9 +305,24 @@ def review_module(module, old_source, new_source, *, complete, labels_by_hash, r
             if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
                 item['binding'] = node.targets[0].id
             records['statements'].append(item)
-    if unmatched:
-        raise ValueError(f'{module}: unaccounted predecessor statements: '
-                         f'{[(i, identity(old.body[i])) for i in sorted(unmatched)]}')
+    for index in sorted(unmatched):
+        node = old.body[index]
+        key = (module, getattr(node, 'name', None))
+        retirement_reason = REMOVED_DEFINITION_REASONS.get(key)
+        if retirement_reason and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            records['removed_definitions'].append(dict(
+                module=module, name=node.name, previous_index=index,
+                previous_sha256=old_hashes[index], reason=retirement_reason,
+            ))
+            continue
+        retirement_reason = REMOVED_STATEMENT_REASONS.get((module, ast.unparse(node)))
+        if not retirement_reason or not isinstance(node, (ast.Import, ast.ImportFrom)):
+            raise ValueError(f'{module}: unaccounted predecessor statements: '
+                             f'{[(i, identity(old.body[i])) for i in sorted(unmatched)]}')
+        records['removed_statements'].append(dict(
+            module=module, previous_index=index,
+            previous_sha256=old_hashes[index], reason=retirement_reason,
+        ))
     old_seams = inventory.reviewed_local_import_seams(module, old_source, old) if old is not None else {}
     new_seams = inventory.reviewed_local_import_seams(module, new_source, new)
     if set(new_seams) != set(old_seams):
@@ -283,17 +370,19 @@ def _update_verifier_pins(source, prefix, digest, pins):
     return ''.join(lines)
 
 
-def prepare(*, output_dir, release='23.0.1', write=False):
+def prepare(*, output_dir, release='23.0.2', write=False):
     root, output_dir = ROOT, Path(output_dir).resolve()
     if output_dir.is_relative_to(root):
         raise ValueError('Generated release-review evidence belongs outside the repository')
     spec = RELEASES[release]
     reasons = {**REASONS, **(THROUGHPUT_REASONS if release == '22.3.2' else {}),
-               **(SEMANTIC_REASONS if release == '23.0.1' else {})}
+               **(SEMANTIC_REASONS if release == '23.0.1' else {}),
+               **(PATCH_REASONS if release == '23.0.2' else {})}
     prefix = 'REVIEWED_V' + spec['token'] + '_RELEASE'
     key = 'v' + spec['token'] + '_release_review'
     predecessor_commit = getattr(inventory, prefix + '_PREDECESSOR_COMMIT')
-    predecessor = json.loads(git_file(root, predecessor_commit, 'XTA/_package_inventory.json'))
+    predecessor_path = spec.get('predecessor_inventory_path', 'XTA/_package_inventory.json')
+    predecessor = json.loads(git_file(root, predecessor_commit, predecessor_path))
     if canonical(predecessor) != getattr(inventory, prefix + '_PREDECESSOR_SHA256'):
         raise ValueError('Git predecessor differs from the independently authenticated inventory')
     current = json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
@@ -315,7 +404,8 @@ def prepare(*, output_dir, release='23.0.1', write=False):
     review = dict(release=release, feature=spec['feature'],
         previous_review_sha256=getattr(inventory, 'REVIEWED_V' + spec['previous_token'] + '_RELEASE_SHA256'),
         predecessor_commit=predecessor_commit, predecessor_inventory_sha256=canonical(predecessor),
-        definitions=[], statements=[], local_import_seam_updates=[], preserved_radial_definition_updates=[],
+        definitions=[], statements=[], removed_definitions=[], removed_statements=[],
+        local_import_seam_updates=[], preserved_radial_definition_updates=[],
         preserved_radial_module_updates=[], complete_modules=[], module_snapshots=[])
     source_pins = {}
     for relative in sorted(set(paths)):
@@ -379,6 +469,8 @@ def prepare(*, output_dir, release='23.0.1', write=False):
         setattr(inventory, prefix + '_SHA256', original_digest)
         setattr(inventory, prefix + '_PREDECESSOR_MODULES', original_pins)
     if write:
+        if subprocess.check_output(['git', 'tag', '--list', f'v{release}'], cwd=root).strip():
+            raise ValueError(f'v{release} is already tagged; its authenticated review cannot be rewritten')
         trees = {item['module']: ast.parse((root / 'XTA' / (item['module'] + '.py')).read_text(encoding='utf-8'))
                  for item in review['module_snapshots'] if not item.get('removed')}
         inventory.verify_v22_3_source_snapshots(review, trees)
@@ -399,7 +491,7 @@ def prepare(*, output_dir, release='23.0.1', write=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--release', choices=tuple(RELEASES), default='23.0.1')
+    parser.add_argument('--release', choices=tuple(RELEASES), default='23.0.2')
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--write', action='store_true')
     args = parser.parse_args(argv)

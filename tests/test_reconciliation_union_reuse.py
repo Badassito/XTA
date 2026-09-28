@@ -16,6 +16,7 @@ import pytest
 from XTA.interpolation import NrrdLayerRef
 from XTA.reconciliation_policy import resolve_reconciliation
 from XTA import reconciliation_runtime as runtime
+from XTA.runtime import wait_for_retired_memmap_unlinks
 
 
 def settings(tmp_path, mode='union'):
@@ -174,7 +175,10 @@ def test_confidence_reader_owners_close_on_success_and_vote_failure(tmp_path, fa
             with mock.patch.object(runtime, 'reconcile', side_effect=RuntimeError('vote failure')):
                 with pytest.raises(RuntimeError, match='vote failure'):
                     run(refs, mask, cfg, tmp_path)
-            assert not (tmp_path / 'work/reconciled_union.u8.dat').exists()
+            failed_path = tmp_path / 'work/reconciled_union.u8.dat'
+            gc.collect()  # The traceback may briefly retain the failed output array.
+            wait_for_retired_memmap_unlinks(path=failed_path)
+            assert not failed_path.exists()
         else:
             result, _ = run(refs, mask, cfg, tmp_path)
             np.testing.assert_array_equal(result, mask)

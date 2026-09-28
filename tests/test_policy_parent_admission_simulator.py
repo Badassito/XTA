@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import random
+import sys
 import unittest
 
 from tools.simulate_policy_parent_admission import GIB, Group, cluster_workload, simulate
@@ -9,7 +10,13 @@ from tools.simulate_policy_parent_admission import GIB, Group, cluster_workload,
 
 class PolicyParentAdmissionSimulatorTests(unittest.TestCase):
     def test_real_geometry_matches_cluster_group_and_frame_inventory(self):
+        watched_modules = ('cv2', 'scipy', 'scipy.ndimage', 'tifffile', 'tqdm', 'numba',
+                           'XTA._deps', 'XTA.geometry', 'XTA.unification.runtime')
+        before = {name: sys.modules.get(name) for name in watched_modules}
         groups, metadata = cluster_workload()
+        for name, module in before.items():
+            with self.subTest(module=name):
+                self.assertIs(sys.modules.get(name), module)
         self.assertEqual(len(groups), 110)
         self.assertEqual(metadata['rendered_frames'], 160593)
         self.assertEqual(metadata['group_counts_by_family']['tilted_azimuthal'], 12)

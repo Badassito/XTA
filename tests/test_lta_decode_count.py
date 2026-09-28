@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+import gc
 import io
 from pathlib import Path
 import shutil
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+import weakref
 
 import numpy as np
 
@@ -90,7 +92,7 @@ class StrictDecodeCountTests(unittest.TestCase):
                     process.kill()
                     process.wait(timeout=10)
 
-    def test_count_and_process_failures_close_mapping_while_exception_is_retained(self):
+    def test_count_and_process_failures_retire_mapping_after_exception_is_released(self):
         for name, byte_count, exit_code, message in (
             ("extra", 18, 0, "Frame count mismatch"),
             ("short", 5, 0, "Unexpected EOF"),
@@ -101,33 +103,42 @@ class StrictDecodeCountTests(unittest.TestCase):
                 _result, failure, mapping, path = self._decode_mapped_pipe(
                     root, byte_count=byte_count, exit_code=exit_code,
                 )
+                mapping_ref = weakref.ref(mapping._mmap)
                 try:
                     self.assertIsInstance(failure, RuntimeError)
                     self.assertIn(message, str(failure))
-                    self.assertTrue(mapping._mmap.closed)
+                    # The retained exception and mapping still own readable memory.
+                    self.assertFalse(mapping._mmap.closed)
+                    self.assertEqual(int(mapping[0, 0, 0]), 3)
                     if name == "nonzero":
                         self.assertIn("last-decoder-diagnostic", str(failure))
-                    # A retained error traceback must not keep the failed file
-                    # mapped and prevent rename/removal on Windows.
-                    moved = root / "discarded.raw"
-                    path.replace(moved)
-                    moved.unlink()
                 finally:
-                    if not mapping._mmap.closed:
-                        mapping._mmap.close()
+                    failure = None
+                    mapping = None
+                    gc.collect()
+                self.assertIsNone(mapping_ref())
+                moved = root / "discarded.raw"
+                path.replace(moved)
+                moved.unlink()
 
     def test_exact_count_returns_an_open_mapping_with_unmodified_pixels(self):
         with tempfile.TemporaryDirectory() as folder:
             result, failure, mapping, _path = self._decode_mapped_pipe(
                 Path(folder), byte_count=12, exit_code=0,
             )
+            mapping_ref = weakref.ref(mapping._mmap)
             try:
                 self.assertIsNone(failure)
                 self.assertIs(result, mapping)
                 self.assertFalse(mapping._mmap.closed)
                 np.testing.assert_array_equal(result, np.full((2, 2, 3), 3, dtype=np.uint8))
             finally:
-                mapping._mmap.close()
+                media.close_memmap_array(mapping)
+                self.assertFalse(mapping._mmap.closed)
+                result = None
+                mapping = None
+                gc.collect()
+            self.assertIsNone(mapping_ref())
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is required for the multi-stream fixture")
     def test_strict_decode_selects_first_video_stream_even_when_second_is_larger(self):
@@ -156,7 +167,12 @@ class StrictDecodeCountTests(unittest.TestCase):
                 self.assertTrue(bool(np.all(mapping >= 230)))
             finally:
                 if mapping is not None:
+                    mapping_ref = weakref.ref(mapping._mmap)
                     media.close_memmap_array(mapping)
+                    self.assertFalse(mapping._mmap.closed)
+                    mapping = None
+                    gc.collect()
+                    self.assertIsNone(mapping_ref())
 
 
 if __name__ == "__main__":

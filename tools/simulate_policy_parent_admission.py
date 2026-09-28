@@ -17,6 +17,7 @@ import json
 import math
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,7 +36,22 @@ class Group:
 
 
 def cluster_workload(log: Path | None = None) -> tuple[list[Group], dict]:
-    """Compile the exact recorded geometry, without models or native canvases."""
+    """Compile the recorded geometry in a process that owns its dependency stubs."""
+    command = [sys.executable, '-B', str(Path(__file__).resolve()), '--_cluster-workload-child']
+    if log is not None:
+        command.append(str(log))
+    result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8',
+                            errors='replace', check=True, timeout=120)
+    payload = json.loads(result.stdout)
+    groups = [Group(**{**record, 'processing_shape': tuple(record['processing_shape'])})
+              for record in payload['groups']]
+    metadata = payload['metadata']
+    metadata['shape_tyx'] = tuple(metadata['shape_tyx'])
+    return groups, metadata
+
+
+def _cluster_workload_child(log: Path | None = None) -> tuple[list[Group], dict]:
+    """Use lightweight imports only inside the short-lived geometry worker."""
     from tools.smoke_import import install_stubs
     install_stubs()  # The geometry compiler needs none of the stubbed image kernels.
     from XTA.config import AzimuthalViewRequest, RadialViewRequest, SphericalViewRequest, TiltedViewGroup
@@ -318,4 +334,13 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    main()
+    if len(sys.argv) >= 2 and sys.argv[1] == '--_cluster-workload-child':
+        if len(sys.argv) > 3:
+            raise SystemExit('geometry worker accepts at most one log path')
+        child_log = Path(sys.argv[2]) if len(sys.argv) == 3 else None
+        with contextlib.redirect_stdout(io.StringIO()):
+            child_groups, child_metadata = _cluster_workload_child(child_log)
+        print(json.dumps(dict(groups=[asdict(group) for group in child_groups],
+                              metadata=child_metadata)))
+    else:
+        main()

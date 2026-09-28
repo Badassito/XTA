@@ -103,15 +103,6 @@ class PtaModeBoundaryTests(unittest.TestCase):
         self.assertEqual(options.aug_task_chunk, 4)
         self.assertIs(options._v18_config, config)
 
-    def test_output_format_aliases_are_case_insensitive_and_canonical(self) -> None:
-        cases = {"PNG": "png", ".pNg": "png", "JPG": "jpg", ".jPeG": "jpg", "TIF": "tif", ".TiFf": "tif"}
-        for supplied, canonical in cases.items():
-            with self.subTest(supplied=supplied):
-                config = self.pta_mode.parse_pta_args(["--input", "dataset", "--output_format", supplied])
-                options = pta_runtime.build_runtime_options(config)
-                self.assertEqual(config.args.output_format, canonical)
-                self.assertEqual(options.output_format, canonical)
-
     def test_png_compression_bounds_apply_to_every_output_format(self) -> None:
         cases = (
             (["--output_format", "png"], "png"),

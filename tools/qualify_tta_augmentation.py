@@ -149,6 +149,7 @@ def main() -> int:
         argv.extend(['--enable_radial', *args.enable_radial])
     if not args.no_tiles:
         argv.extend(['--enable_tile', '32:32'])
+    (case / 'ultralytics-config').mkdir(exist_ok=True)
     env = dict(os.environ)
     env.update(PYTHONPATH=os.pathsep.join([str(ROOT), env.get('PYTHONPATH', '')]),
                PYTHONIOENCODING='utf-8', PYTHONDONTWRITEBYTECODE='1',

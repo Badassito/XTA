@@ -50,6 +50,7 @@ from .runtime import (
     choose_slice_parallel_workers,
     close_memmap_array,
     close_memmap_array_without_flush,
+    defer_retired_memmap_directory_cleanup,
     copy_workspace_array,
     estimate_interpolation_workspace_bytes,
     interpolation_process_worker_active,
@@ -2281,14 +2282,15 @@ def interpolate_view_volume_pass_inplace(
             try:
                 component_membership_paths[0].parent.rmdir()
             except OSError:
-                pass
+                defer_retired_memmap_directory_cleanup(component_membership_paths[0].parent)
         for _walk_back_index, _candidate_index, component_path in component_specs:
             shutil.rmtree(component_path, ignore_errors=True)
         if bridge_component_dir is not None:
             try:
                 Path(bridge_component_dir).rmdir()
             except OSError:
-                pass
+                if not any(component_path.exists() for _, _, component_path in component_specs):
+                    defer_retired_memmap_directory_cleanup(Path(bridge_component_dir))
 
     component_bit_layout: Dict[Tuple[int, int], Tuple[int, int]] = {}
     for flat_index, (walk_back_index, candidate_index, _component_path) in enumerate(component_specs):
@@ -2487,10 +2489,19 @@ def interpolate_view_volume_pass_inplace(
             component_membership_mms.append(pending_membership_mm)
             pending_membership_mm = None
     except BaseException:
-        close_memmap_array(pending_membership_mm)
+        close_memmap_array(
+            pending_membership_mm,
+            unlink_path=(membership_path if pending_membership_mm is not None
+                         and not keep_temp else None),
+        )
         pending_membership_mm = None
-        for membership_mm in component_membership_mms:
-            close_memmap_array(membership_mm)
+        for membership_mm, membership_path in zip(
+            component_membership_mms, component_membership_paths,
+        ):
+            close_memmap_array(
+                membership_mm,
+                unlink_path=(membership_path if not keep_temp else None),
+            )
         component_membership_mms.clear()
         close_memmap_array(bridge_mm)
         bridge_mm = None
@@ -3101,8 +3112,15 @@ def interpolate_view_volume_pass_inplace(
             except Exception:
                 pass
         del bridge_mm
-        for membership_mm in component_membership_mms:
-            close_memmap_array(membership_mm)
+        for membership_mm, membership_path in zip(
+            component_membership_mms, component_membership_paths,
+        ):
+            # Export reopens these words after a successful render, so defer
+            # pathname deletion to the reader close below.
+            close_memmap_array(
+                membership_mm,
+                unlink_path=(membership_path if pass_failed and not keep_temp else None),
+            )
         component_membership_mms.clear()
         try:
             del component_cache
@@ -3126,6 +3144,8 @@ def interpolate_view_volume_pass_inplace(
                         membership_path.unlink(missing_ok=True)
                     except Exception:
                         pass
+                if component_membership_paths:
+                    defer_retired_memmap_directory_cleanup(component_membership_paths[0].parent)
                 for _walk_back_index, _candidate_index, component_path in component_specs:
                     shutil.rmtree(component_path, ignore_errors=True)
 
@@ -3135,15 +3155,13 @@ def interpolate_view_volume_pass_inplace(
     }
     membership_readers: List[np.memmap] = []
     try:
-        membership_readers = [
-            np.memmap(
+        for membership_path in component_membership_paths:
+            membership_readers.append(np.memmap(
                 membership_path,
                 dtype=component_word_dtype,
                 mode='r',
                 shape=tuple(int(v) for v in np.asarray(mask_mm).shape),
-            )
-            for membership_path in component_membership_paths
-        ]
+            ))
         # Merge finalized these counts and conservative render bounds. Export reads
         # only nonempty component crops; untouched slices/pages need no scan.
         # Empty combinations retain their already-published no-scan cvol.
@@ -3190,8 +3208,13 @@ def interpolate_view_volume_pass_inplace(
                 shutil.rmtree(component_path, ignore_errors=True)
         raise
     finally:
-        for membership_reader in membership_readers:
-            close_memmap_array(membership_reader)
+        for membership_reader, membership_path in zip(
+            membership_readers, component_membership_paths,
+        ):
+            close_memmap_array(
+                membership_reader,
+                unlink_path=(membership_path if not keep_temp else None),
+            )
         if not bool(keep_temp):
             for membership_path in component_membership_paths:
                 try:
@@ -3202,7 +3225,7 @@ def interpolate_view_volume_pass_inplace(
                 try:
                     component_membership_paths[0].parent.rmdir()
                 except OSError:
-                    pass
+                    defer_retired_memmap_directory_cleanup(component_membership_paths[0].parent)
 
     gpu_radius_active = bool(
         int(gpu_renderer_telemetry.get('estimated_plans', 0)) > 0

@@ -62,6 +62,26 @@ def _build_plan(tmp_path: Path, options: list[str], *, angle: float = 0.0,
     return view, plan
 
 
+def _canonical_occupancy(view, plan, mask, coverage, idx):
+    full_mask, _ = pta_rendering.render_plan_frame_mask_source(
+        mask=mask, plan=plan, idx=idx, need_canvas=False,
+    )
+    full_coverage, _ = pta_rendering.render_plan_frame_mask_source(
+        mask=coverage, plan=plan, idx=idx, need_canvas=False,
+    )
+    expected = {'full': bool(np.any(full_mask & full_coverage))}
+    for tile in plan.tile_layout:
+        assert tile.shared_job is not None
+        tile_mask = shared_geometry.render_categorical_dense_tile_for_job(
+            mask, view.shared_view, tile.shared_job, idx,
+        )
+        tile_coverage = shared_geometry.render_categorical_dense_tile_for_job(
+            coverage, view.shared_view, tile.shared_job, idx,
+        )
+        expected[tile.tile_tag] = bool(np.any(tile_mask & tile_coverage))
+    return expected
+
+
 @pytest.mark.parametrize('options', [
     ['--enable_cartesian', 'transverse'],
     ['--enable_cartesian', 'sagittal'],
@@ -79,24 +99,8 @@ def test_semantic_plan_classification_matches_canonical_rasters(tmp_path, option
     mask[0, 0, 0] = mask[4, 5, 6] = mask[2, 3, 4] = 1
     coverage[2, 3, 4] = 0
     idx = min(1, int(view.num_slices) - 1)
-    expected_mask, _canvas = pta_rendering.render_plan_frame_mask_source(
-        mask=mask, plan=plan, idx=idx, need_canvas=False,
-    )
-    expected_coverage, _ = pta_rendering.render_plan_frame_mask_source(
-        mask=coverage, plan=plan, idx=idx, need_canvas=False,
-    )
-    expected = {'full': bool(np.any(expected_mask & expected_coverage))}
-    for tile in plan.tile_layout:
-        assert tile.shared_job is not None
-        tile_mask = shared_geometry.render_categorical_dense_tile_for_job(
-            mask, view.shared_view, tile.shared_job, idx,
-        )
-        tile_coverage = shared_geometry.render_categorical_dense_tile_for_job(
-            coverage, view.shared_view, tile.shared_job, idx,
-        )
-        expected[tile.tile_tag] = bool(np.any(tile_mask & tile_coverage))
     actual = classify_semantic_plan_frame(mask, coverage, plan, idx)
-    assert actual == expected
+    assert actual == _canonical_occupancy(view, plan, mask, coverage, idx)
 
 
 def test_classification_extracts_each_native_plane_once_across_tiles(tmp_path):
@@ -131,22 +135,7 @@ def test_tilted_source_shell_families_match_canonical(tmp_path, options, family)
     coverage[2, 3, 4] = 0
     idx = min(1, int(view.num_slices) - 1)
     actual = classify_semantic_plan_frame(mask, coverage, plan, idx)
-    full_mask, _ = pta_rendering.render_plan_frame_mask_source(
-        mask=mask, plan=plan, idx=idx, need_canvas=False,
-    )
-    full_coverage, _ = pta_rendering.render_plan_frame_mask_source(
-        mask=coverage, plan=plan, idx=idx, need_canvas=False,
-    )
-    expected = {'full': bool(np.any(full_mask & full_coverage))}
-    for tile in plan.tile_layout:
-        tile_mask = shared_geometry.render_categorical_dense_tile_for_job(
-            mask, view.shared_view, tile.shared_job, idx,
-        )
-        tile_coverage = shared_geometry.render_categorical_dense_tile_for_job(
-            coverage, view.shared_view, tile.shared_job, idx,
-        )
-        expected[tile.tile_tag] = bool(np.any(tile_mask & tile_coverage))
-    assert actual == expected
+    assert actual == _canonical_occupancy(view, plan, mask, coverage, idx)
 
 
 @pytest.mark.parametrize('options,family', [
@@ -169,21 +158,7 @@ def test_tilted_source_shell_positive_native_samples(tmp_path, options, family):
     with mock.patch.object(shared_geometry, 'get_categorical_view_frame_by_index',
                            side_effect=native_reader):
         actual = classify_semantic_plan_frame(mask, coverage, plan, 0)
-        full_mask, _ = pta_rendering.render_plan_frame_mask_source(
-            mask=mask, plan=plan, idx=0, need_canvas=False,
-        )
-        full_coverage, _ = pta_rendering.render_plan_frame_mask_source(
-            mask=coverage, plan=plan, idx=0, need_canvas=False,
-        )
-        expected = {'full': bool(np.any(full_mask & full_coverage))}
-        for tile in plan.tile_layout:
-            tile_mask = shared_geometry.render_categorical_dense_tile_for_job(
-                mask, view.shared_view, tile.shared_job, 0,
-            )
-            tile_cov = shared_geometry.render_categorical_dense_tile_for_job(
-                coverage, view.shared_view, tile.shared_job, 0,
-            )
-            expected[tile.tile_tag] = bool(np.any(tile_mask & tile_cov))
+        expected = _canonical_occupancy(view, plan, mask, coverage, 0)
     assert expected['full']
     assert actual == expected
 
@@ -286,19 +261,4 @@ def test_random_sparse_native_support_matches_canonical_tiles(tmp_path, options)
         coverage = (rng.random((5, 6, 7)) < 0.8).astype(np.uint8)
         idx = min(1, int(view.num_slices) - 1)
         actual = classify_semantic_plan_frame(mask, coverage, plan, idx)
-        full_mask, _ = pta_rendering.render_plan_frame_mask_source(
-            mask=mask, plan=plan, idx=idx, need_canvas=False,
-        )
-        full_coverage, _ = pta_rendering.render_plan_frame_mask_source(
-            mask=coverage, plan=plan, idx=idx, need_canvas=False,
-        )
-        expected = {'full': bool(np.any(full_mask & full_coverage))}
-        for tile in plan.tile_layout:
-            tile_mask = shared_geometry.render_categorical_dense_tile_for_job(
-                mask, view.shared_view, tile.shared_job, idx,
-            )
-            tile_coverage = shared_geometry.render_categorical_dense_tile_for_job(
-                coverage, view.shared_view, tile.shared_job, idx,
-            )
-            expected[tile.tile_tag] = bool(np.any(tile_mask & tile_coverage))
-        assert actual == expected
+        assert actual == _canonical_occupancy(view, plan, mask, coverage, idx)

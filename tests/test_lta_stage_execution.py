@@ -9,7 +9,7 @@ import unittest
 
 import numpy as np
 
-import test_lta_execution as fixtures
+from tests import test_lta_execution as fixtures
 from XTA.lta_postprocessing import LtaFinalizationOperations
 
 
