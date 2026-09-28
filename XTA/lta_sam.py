@@ -56,6 +56,21 @@ _SAM_PKG_RESOURCES_COMPAT_LOCK = threading.RLock()
 _SAM_BPE_RESOURCE = "assets/bpe_simple_vocab_16e6.txt.gz"
 
 
+@contextmanager
+def _preserve_torch_tf32(runtime_torch: object) -> Iterator[None]:
+    """Undo SAM's process-wide TF32 changes after an import or construction."""
+
+    matmul = runtime_torch.backends.cuda.matmul
+    cudnn = runtime_torch.backends.cudnn
+    original_matmul = bool(matmul.allow_tf32)
+    original_cudnn = bool(cudnn.allow_tf32)
+    try:
+        yield
+    finally:
+        matmul.allow_tf32 = original_matmul
+        cudnn.allow_tf32 = original_cudnn
+
+
 def _canonical_sam_package_fingerprint(distribution: object) -> tuple[str, int, Path]:
     """Fingerprint pinned runtime files independently of wheel metadata."""
 
@@ -632,13 +647,15 @@ def _sam_pkg_resources_import_compatibility() -> Iterator[bool]:
 
 
 def _import_sam_model_builder() -> object:
-    """Import the pinned builder with a scoped Setuptools 82+ compatibility seam."""
+    """Import the pinned builder without retaining its global TF32 changes."""
 
     with _SAM31_BUILD_PATCH_LOCK:
         cached = sys.modules.get("sam3.model_builder")
         if cached is not None:
             return cached
-        with _sam_pkg_resources_import_compatibility():
+        import torch as runtime_torch  # type: ignore
+
+        with _preserve_torch_tf32(runtime_torch), _sam_pkg_resources_import_compatibility():
             return importlib.import_module("sam3.model_builder")
 
 
@@ -1072,7 +1089,7 @@ def _build_real_sam31_predictor_single_load(
 ) -> object:
     """Serialize the process-global pinned SAM builder patch transaction."""
 
-    with _SAM31_BUILD_PATCH_LOCK:
+    with _SAM31_BUILD_PATCH_LOCK, _preserve_torch_tf32(runtime_torch):
         try:
             return _build_real_sam31_predictor_single_load_unlocked(
                 builder=builder,
@@ -1235,6 +1252,9 @@ def build_local_sam_predictor(
             weight_storage=resolved_weight_storage,
             construction_device=resolved_construction_device,
         )
+    elif runtime_torch is not None:
+        with _SAM31_BUILD_PATCH_LOCK, _preserve_torch_tf32(runtime_torch):
+            predictor = builder(**kwargs)
     else:
         predictor = builder(**kwargs)
     if runtime_torch is not None:

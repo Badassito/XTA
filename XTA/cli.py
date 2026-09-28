@@ -8,10 +8,11 @@ import sys
 from collections.abc import Iterator, Sequence
 
 from .unification.context import activate_unified_launch
+from . import __version__
 
 
-SCRIPT_VERSION = "24.0.1"
-SCRIPT_BASENAME = "GPT-6-Astra-Ultra_v24.0.1_SLURM.py"
+SCRIPT_VERSION = __version__
+SCRIPT_BASENAME = f"GPT-6-Astra-Ultra_v{SCRIPT_VERSION}_SLURM.py"
 MODE_CHOICES = ("tta", "pta", "lta")
 
 
@@ -86,7 +87,7 @@ def _run_tta(arguments: Sequence[str]) -> None:
 
     mode_arguments = [str(value) for value in arguments]
     # Validate before importing the production pipeline. This preserves argparse's
-    # unavailable/foreign-flag errors on dependency-light hosts and keeps all v17 TTA
+    # unavailable/foreign-flag errors on dependency-light hosts and keeps the TTA
     # defaults and accepted flags authoritative.
     from .config import build_argparser as build_tta_argparser
 
@@ -105,7 +106,7 @@ def _run_tta(arguments: Sequence[str]) -> None:
         parser.error(str(exc))
 
     # The established entry point and pipeline consume sys.argv. Remove the unified mode
-    # selector for the duration of the call rather than teaching the v17 parser a new flag.
+    # selector for the duration of the call rather than teaching the TTA parser a new flag.
     from .tta_mode import run as run_tta
 
     with activate_unified_launch(
@@ -157,7 +158,7 @@ def run(argv: Sequence[str] | None = None) -> None:
 
     arguments = [str(value) for value in (sys.argv[1:] if argv is None else argv)]
 
-    # Top-level discovery must not import OpenCV, SciPy, model runtimes, or either
+    # Top-level discovery must not import OpenCV, SciPy, model runtimes, or any
     # mode implementation. Once a mode is present, its own --help remains authoritative.
     if not arguments or (
         not _has_mode_argument(arguments)

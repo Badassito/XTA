@@ -11,13 +11,15 @@ import unittest
 
 
 def run_worker(result_path: Path) -> None:
+    import gc
+    import weakref
     from threading import Event
     from unittest.mock import patch
     import numpy as np
     from XTA import assembly, finalization, geometry, interpolation, outputs
     from XTA.config import TiltedViewGroup
     from XTA.projection_queue import ComponentProjectionQueue, settle_prepared_view_components
-    from XTA.runtime import close_memmap_array
+    from XTA.runtime import close_memmap_array, wait_for_retired_memmap_unlinks
 
     shape = (13, 17, 19)
     target = (15, 21, 23)
@@ -40,7 +42,7 @@ def run_worker(result_path: Path) -> None:
                 shadow_path = root / 'shadow.dat'
                 shadow = np.memmap(shadow_path, mode='w+', dtype=np.uint8, shape=data.shape)
                 shadow[:] = data
-                mapping = shadow._mmap
+                mapping = weakref.ref(shadow._mmap)
                 release = Event()
                 queue = ComponentProjectionQueue(workers=2, max_pending=8,
                     max_source_bytes=1024**3, max_working_bytes=1024**3)
@@ -81,7 +83,12 @@ def run_worker(result_path: Path) -> None:
                             nrrd_layers_enabled=True, precleaned_slice_cleanup=True,
                             hole_fill_done_on_device=True, preinterpolation_layer_already_published=True,
                             submit_component_projection=submit)
-                        assert mapping.closed and not shadow_path.exists()
+                        assert mapping() is not None and not mapping().closed
+                        assert int(shadow[0, 0, 0]) in (0, 1)
+                        shadow = None
+                        gc.collect()
+                        wait_for_retired_memmap_unlinks(path=shadow_path)
+                        assert mapping() is None and not shadow_path.exists()
                         assert prepared.final_view_volume_mm is None
                         assert prepared.pending_component_layers
                         assert not settle_prepared_view_components(prepared)
@@ -135,7 +142,7 @@ class AsyncComponentPipelineTests(unittest.TestCase):
                 YOLO_TTA_GPU_BACKPROJECT='0', YOLO_TTA_GPU_FINAL_FUSION='0',
                 YOLO_TTA_INTERPOLATION_PROCESS_BACKEND='0', YOLO_TTA_DELAY_NATIVE_EXPANSION='1',
                 YOLO_TTA_TELEMETRY='0', PYTHONPATH=str(repo))
-            completed = subprocess.run([sys.executable, str(Path(__file__).resolve()), '--worker', str(result_path)],
+            completed = subprocess.run([sys.executable, '-X', 'utf8', str(Path(__file__).resolve()), '--worker', str(result_path)],
                 cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding='utf-8', errors='replace', timeout=240)
             self.assertEqual(completed.returncode, 0, completed.stdout[-18000:])

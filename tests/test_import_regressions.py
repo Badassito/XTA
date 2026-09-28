@@ -13,9 +13,11 @@ ROOT = Path(__file__).resolve().parents[1]
 class ImportRegressionTests(unittest.TestCase):
     def run_python(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, *arguments],
+            [sys.executable, "-X", "utf8", *arguments],
             cwd=ROOT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             check=False,

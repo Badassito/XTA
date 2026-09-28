@@ -162,7 +162,8 @@ class DeviceSampler:
             try:
                 output = subprocess.run(["nvidia-smi", "--query-gpu=" + fields,
                                          "--format=csv,noheader,nounits"],
-                                        capture_output=True, text=True, check=True, timeout=5)
+                                        capture_output=True, text=True, encoding='utf-8',
+                                        errors='replace', check=True, timeout=5)
                 row["devices"] = [[value.strip() for value in values] for values in csv.reader(output.stdout.splitlines())]
             except (OSError, subprocess.SubprocessError) as error:
                 row["error"] = str(error)

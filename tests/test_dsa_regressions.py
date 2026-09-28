@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import gc
 import tempfile
 import threading
 import time
@@ -268,6 +269,8 @@ class DsaWorkspaceCopyTests(unittest.TestCase):
                 with self.assertRaisesRegex(intel_dsa.IntelDsaIneligible, 'regular_memmap'):
                     runtime.copy_workspace_array(src, None, 'regular memmap')
             runtime.close_memmap_array_without_flush(src)
+            src = None
+            gc.collect()
 
     def test_overlap_is_rejected_before_native_probe(self) -> None:
         fake = _FakeDsaModule()
@@ -323,6 +326,9 @@ class DsaWorkspaceCopyTests(unittest.TestCase):
             # A later runtime boundary proves drain, then executes the deferred
             # close/unlink while the quarantined mapping is still alive.
             intel_dsa.close_manager()
+            caught = None
+            gc.collect()
+            runtime.wait_for_retired_memmap_unlinks(path=dst_path)
             self.assertFalse(dst_path.exists())
 
     def test_explicit_dsa_failure_never_recovers_on_cpu(self) -> None:
@@ -343,6 +349,9 @@ class DsaWorkspaceCopyTests(unittest.TestCase):
                     runtime.copy_workspace_array(src, dst_path, 'explicit')
             self.assertTrue(caught.exception.drained)
             cpu_copy.assert_not_called()
+            caught = None
+            gc.collect()
+            runtime.wait_for_retired_memmap_unlinks(path=dst_path)
             self.assertFalse(dst_path.exists())
 
     def test_manager_serializes_native_requests_and_runtime_reset_closes_it(self) -> None:

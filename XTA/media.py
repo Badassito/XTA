@@ -307,7 +307,10 @@ def ffprobe_info(video_path: Path) -> Dict[str, object]:
         str(video_path),
     ]
     p = _spawn_subprocess_with_retry(
-        lambda: subprocess.run(cmd, capture_output=True, text=True, check=True),
+        lambda: subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", check=True,
+        ),
         'ffprobe stream metadata probe',
     )
     info = json.loads(p.stdout)
@@ -344,7 +347,10 @@ def ffprobe_info(video_path: Path) -> Dict[str, object]:
             str(video_path),
         ]
         p2 = _spawn_subprocess_with_retry(
-            lambda: subprocess.run(fallback_cmd, capture_output=True, text=True, check=True),
+            lambda: subprocess.run(
+                fallback_cmd, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", check=True,
+            ),
             'ffprobe packet-count probe',
         )
         info2 = json.loads(p2.stdout)
@@ -475,7 +481,7 @@ def decode_video_to_memmap_gray8(
                 if stderr_errors and decode_error is None:
                     raise RuntimeError('Could not read ffmpeg decode diagnostics') from stderr_errors[0]
             if proc.returncode not in (0, None) and decode_error is None:
-                msg = err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
+                msg = err.decode("utf-8", errors="replace") if isinstance(err, (bytes, bytearray)) else str(err)
                 raise RuntimeError(f"ffmpeg decode failed: {msg}")
             process_verified = True
         finally:
@@ -587,7 +593,7 @@ def decode_video_to_memmap_gray8_streaming(
                         proc.stdout = None
                     _out, err = proc.communicate()
                     if proc.returncode not in (0, None):
-                        msg = err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
+                        msg = err.decode("utf-8", errors="replace") if isinstance(err, (bytes, bytearray)) else str(err)
                         readiness.mark_failed(RuntimeError(f"ffmpeg decode failed: {msg}"))
                 finally:
                     _unregister_streaming_subprocess(proc)
@@ -715,7 +721,7 @@ def resize_volume_t_axis_only_gray8_slab(
         shape=(out_t_i, in_h, in_w),
         dtype=np.uint8,
         path=out_path,
-        desc='v12.2.0 cubic processing volume (parallel T-axis slab resize)',
+        desc='cubic processing volume (parallel T-axis slab resize)',
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
         initialize_zero=False,
@@ -759,7 +765,7 @@ def resize_volume_t_axis_only_gray8_slab(
             len(ranges),
             _resize_slab,
             max_workers=worker_count,
-            desc='Resizing orthogonal volume to v12.2.0 cube (T-axis slabs)',
+            desc='Resizing orthogonal volume to cubic shape (T-axis slabs)',
             show_progress=True,
             chunk_size=1,
         )
@@ -801,7 +807,7 @@ def resize_volume_to_processing_cube_gray8(
         shape=(out_t, out_h, out_w),
         dtype=np.uint8,
         path=out_path,
-        desc='v12.2.0 cubic processing volume',
+        desc='cubic processing volume',
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
         initialize_zero=False,
@@ -834,7 +840,7 @@ def resize_volume_to_processing_cube_gray8(
         int(out_t),
         _render_target_slice,
         max_workers=worker_count,
-        desc='Resizing orthogonal volume to v12.2.0 cube',
+        desc='Resizing orthogonal volume to cubic shape',
         chunk_size=chunk_size,
     )
     return out_mm
@@ -948,7 +954,7 @@ def resize_volume_to_processing_cube_gray8_streaming(
 
     out_mm = allocate_workspace_array(
         shape=(out_t, out_h, out_w), dtype=np.uint8, path=out_path,
-        desc='v12.2.0 cubic processing volume [streaming producer]',
+        desc='cubic processing volume [streaming producer]',
         prefer_memory=bool(prefer_memory), reserve_bytes=int(reserve_bytes), initialize_zero=False,
     )
     readiness = VolumeReadiness(int(out_t), desc='streaming cubic processing volume')
@@ -983,7 +989,7 @@ def resize_volume_to_processing_cube_gray8_streaming(
             )
             parallel_for_indices_chunked(
                 int(out_t), _render_target_slice, max_workers=worker_count,
-                desc='Streaming resize orthogonal volume to v12.2.0 cube', chunk_size=chunk_size,
+                desc='Streaming resize orthogonal volume to cubic shape', chunk_size=chunk_size,
             )
             readiness.mark_all_ready()
         except BaseException as exc:
@@ -1094,7 +1100,7 @@ class LazyProcessingCube:
             built: Optional[np.ndarray] = None
             try:
                 print(
-                    'v13.3.17 C10: materializing deferred processing cube for '
+                    'Materializing deferred processing cube for '
                     f'{reason}; shape={self.shape}, bytes={self.nbytes / GIB:.2f} GiB.'
                 )
                 # Deferring the cube also defers its dependency on decode completion. The
@@ -1153,7 +1159,7 @@ class LazyProcessingCube:
                 # Logging is deliberately outside the construction/publication transaction:
                 # a closed stdout must not turn an already-published cube into failed state.
                 try:
-                    print('v13.3.17 C10: deferred processing cube complete; fallback sentinel published.')
+                    print('Deferred processing cube complete; fallback sentinel published.')
                 except Exception:
                     pass
         else:
@@ -1437,7 +1443,7 @@ def close_ffmpeg_writer(proc: subprocess.Popen) -> None:
 
     _, err = proc.communicate()
     if proc.returncode not in (0, None):
-        msg = err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
+        msg = err.decode("utf-8", errors="replace") if isinstance(err, (bytes, bytearray)) else str(err)
         raise RuntimeError(f"ffmpeg write failed: {msg}")
 
 def _path_is_relative_to(path: Path, root: Path) -> bool:

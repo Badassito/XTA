@@ -131,8 +131,12 @@ class TtaOutputOwnershipTests(unittest.TestCase):
         self.assertFalse(artifacts.tile_accumulator_by_set)
         self.assertFalse(artifacts.tile_parent_mask_accumulator_by_set)
         self.assertFalse(artifacts.tile_parent_bridge_accumulator_by_set)
-        self.assertTrue(artifacts.baseline_union_by_model_view)
-        self.assertTrue(artifacts.baseline_confmap_by_model_view)
+        self.assertFalse(artifacts.baseline_union_by_model_view)
+        self.assertFalse(artifacts.baseline_confmap_by_model_view)
+        self.assertIsNone(artifacts.final_output_mask_mm)
+        self.assertIsNone(artifacts.final_union_mm)
+        self.assertIsNone(artifacts.volume_rgb)
+        self.assertIsNone(artifacts.input_volume_rgb)
 
     def test_identical_final_and_source_arrays_close_once_per_owned_handle(self) -> None:
         events: list[str] = []

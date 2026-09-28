@@ -131,8 +131,11 @@ def capture_consolidated_tile_confidence(mask, *, view, model_name, config_id,
             temp_dir=temp_dir, source='tile', tile_config_id=config_id,
             tile_acceptance=category, stage=stage)
     finally:
-        close_memmap_array_without_flush(merged)
-        path.unlink(missing_ok=True)
+        close_memmap_array_without_flush(merged, unlink_path=path)
+        try:
+            path.unlink(missing_ok=True)
+        except PermissionError:
+            pass
     return reference
 
 

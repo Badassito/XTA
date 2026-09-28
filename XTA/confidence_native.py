@@ -10,6 +10,7 @@ import json
 from numbers import Integral
 from pathlib import Path
 import shutil
+import sys
 import tempfile
 
 import numpy as np
@@ -320,7 +321,9 @@ def source_reader(reference,workspace=None,*,memory_mib=512,max_staging_mib=3276
     from .geometry import ViewInfo
     from .confidence_projection import (score_projection_reader, score_projection_workspace,
                                        score_projection_staging_shape)
-    from .runtime import close_memmap_array_without_flush
+    from .runtime import (close_memmap_array_without_flush,
+                          defer_retired_memmap_directory_cleanup,
+                          wait_for_retired_memmap_unlinks)
     fields_available={field.name for field in fields(ViewInfo)}
     view=ViewInfo(**{k:v for k,v in view_record.items() if k in fields_available})
     if native[0]!=int(view.num_slices):
@@ -354,34 +357,58 @@ def source_reader(reference,workspace=None,*,memory_mib=512,max_staging_mib=3276
     work.mkdir(parents=True,exist_ok=True)
     if shutil.disk_usage(work).free < need + 64*1024**2:
         raise OSError(f'Native confidence conversion needs {need} staging bytes plus 64 MiB free-disk reserve')
-    with tempfile.TemporaryDirectory(prefix='confidence-source-',dir=work) as temporary:
-        directory=Path(temporary).resolve()
+    temporary_context=tempfile.TemporaryDirectory(prefix='confidence-source-',dir=work)
+    directory=Path(temporary_context.name).resolve()
+    path=directory/'native.u8.dat'
+    projection_path=directory/'projection'/'confidence_projection.u8.dat'
+    values=read_slice=projected=target=crop=reader=None
+    try:
         if not directory.is_relative_to(work):
             raise RuntimeError('Confidence staging escaped its explicit workspace')
-        path=directory/'native.u8.dat'
         values=np.memmap(path,mode='w+',dtype=np.uint8,shape=native)
+        with reference.native_reader() as reader:
+            for z in range(native[0]):
+                for y0,y1,x0,x1,crop in reader.iter_crops(z):
+                    target=values[z,y0:y1,x0:x1]
+                    np.maximum(target,crop,out=target)
+                if (z+1)%16==0:
+                    values.flush()
+        values.flush()
+        crop=target=reader=None
+        with score_projection_reader(values,view,source,directory/'projection',
+                                     memory_bytes=memory_bytes//2) as read_slice:
+            projected=ProjectedScoreReader(source,read_slice,memory_bytes)
+            try:
+                yield projected
+            finally:
+                projected.close()
+    finally:
+        active_error=sys.exc_info()[1]
+        if projected is not None:
+            projected.close()
+        projected=read_slice=target=crop=reader=None
+        if values is not None:
+            close_memmap_array_without_flush(values,unlink_path=path)
+        values=None
+        cleanup_error=None
         try:
-            with reference.native_reader() as reader:
-                for z in range(native[0]):
-                    for y0,y1,x0,x1,crop in reader.iter_crops(z):
-                        target=values[z,y0:y1,x0:x1]
-                        np.maximum(target,crop,out=target)
-                    if (z+1)%16==0:
-                        values.flush()
-            values.flush()
-            # The last decoded crop is owned bytes, not mmap storage. Retire
-            # it before lending the same workspace budget to the projector.
-            crop=target=None
-            del reader
-            with score_projection_reader(values,view,source,directory/'projection',
-                                         memory_bytes=memory_bytes//2) as read_slice:
-                projected=ProjectedScoreReader(source,read_slice,memory_bytes)
-                try:
-                    yield projected
-                finally:
-                    projected.close()
-        finally:
-            close_memmap_array_without_flush(values)
+            wait_for_retired_memmap_unlinks(path=projection_path,
+                                             timeout_s=.2 if active_error is not None else 5)
+            wait_for_retired_memmap_unlinks(path=path,
+                                             timeout_s=.2 if active_error is not None else 5)
+        except TimeoutError as exc:
+            cleanup_error=exc
+        try:
+            temporary_context.cleanup()
+        except OSError as exc:
+            cleanup_error=cleanup_error or exc
+        if directory.exists():
+            projection_dir=directory/'projection'
+            if projection_dir.exists():
+                defer_retired_memmap_directory_cleanup(projection_dir)
+            defer_retired_memmap_directory_cleanup(directory)
+        if cleanup_error is not None and active_error is None:
+            raise cleanup_error
 
 
 __all__=['write_native_pieces','write_native_disjoint_leases','NativePieceReader','ProjectedScoreReader','source_reader']

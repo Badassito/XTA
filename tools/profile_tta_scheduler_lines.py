@@ -29,6 +29,11 @@ import time
 from types import CodeType
 from typing import Callable, Iterable
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from XTA import __version__
+
 
 @dataclass
 class _Call:
@@ -399,7 +404,7 @@ def main() -> None:
     parser.add_argument('--output', type=Path, required=True,
                         help='JSON evidence path (set under Scratch)')
     parser.add_argument('--script', type=Path,
-                        default=Path('GPT-6-Astra-Ultra_v24.0.1_SLURM.py'))
+                        default=ROOT / f'GPT-6-Astra-Ultra_v{__version__}_SLURM.py')
     parser.add_argument('--threshold-ms', type=float, default=50.0)
     parser.add_argument('--max-samples', type=int, default=64)
     parser.add_argument('--stack-depth', type=int, default=12)

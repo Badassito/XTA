@@ -14,14 +14,15 @@ from typing import (
     Sequence,
     Tuple,
 )
+from . import __version__
 
 GIB = 1024 ** 3
 
 NRRD_SPACE = "left-posterior-superior"
 
-SCRIPT_VERSION = '24.0.1'
+SCRIPT_VERSION = __version__
 
-SCRIPT_VERSION_COMPACT = '2401'
+SCRIPT_VERSION_COMPACT = ''.join(SCRIPT_VERSION.split('.'))
 
 SCRIPT_BASENAME = f'GPT-6-Astra-Ultra_v{SCRIPT_VERSION}_SLURM.py'
 
@@ -36,7 +37,7 @@ def resolve_tta_angles(
 ) -> List[float]:
     """Return finite, modulo-360, unique TTA angles in request order.
 
-    v16.4.0 treats each returned value as a separate view variant. Equivalent rotations
+    Each returned value is a separate view variant. Equivalent rotations
     such as 0, 360, and -360 are rejected instead of scheduling duplicate work whose
     binary union cannot carry weighting semantics.
     """

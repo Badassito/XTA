@@ -118,9 +118,9 @@ def materialize_physical_view_cache(
     if callable(flush):
         flush()
     stat = destination.stat()
-    mmap_obj = getattr(cache, "_mmap", None)
-    if mmap_obj is not None:
-        mmap_obj.close()
+    # Release our private references; retained worker views or tracebacks must
+    # keep their mapping valid until they, too, are gone.
+    del flush, cache
     identity_payload = {
         "source_identity": str(source_identity),
         "physical_view_id": physical_view_name(view),
@@ -204,18 +204,13 @@ def render_native_tile_window(
     if not 0 <= x0 < x1 <= cache_ref.shape[2] or not 0 <= y0 < y1 <= cache_ref.shape[1]:
         raise ValueError("tile_xyxy is outside the physical-view cache")
     cache = cache_ref.open(mode="r")
-    try:
-        return [
-            Image.fromarray(
-                implicit_rgb(np.ascontiguousarray(cache[index, y0:y1, x0:x1])),
-                mode="RGB",
-            )
-            for index in range(start, stop)
-        ]
-    finally:
-        mmap_obj = getattr(cache, "_mmap", None)
-        if mmap_obj is not None:
-            mmap_obj.close()
+    return [
+        Image.fromarray(
+            implicit_rgb(np.ascontiguousarray(cache[index, y0:y1, x0:x1])),
+            mode="RGB",
+        )
+        for index in range(start, stop)
+    ]
 
 
 def union_tile_chunk_into_view(

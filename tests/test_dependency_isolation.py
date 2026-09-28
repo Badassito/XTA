@@ -78,8 +78,9 @@ def test_test_imports_preserve_numerical_dependencies(numerical_first):
         print('real SciPy/OpenCV operations and dependency identities preserved')
     """)
     completed = subprocess.run(
-        [sys.executable, "-B", "-c", program, json.dumps(MODULES), str(numerical_first)],
-        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        [sys.executable, "-X", "utf8", "-B", "-c", program, json.dumps(MODULES), str(numerical_first)],
+        cwd=ROOT, text=True, encoding="utf-8", errors="replace",
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         timeout=60, check=False,
     )
     assert completed.returncode == 0, completed.stdout
@@ -111,7 +112,8 @@ def test_mock_gpu_finalization_preserves_lazy_numba_registrations():
         print('Numba compilation succeeds after mocked GPU finalization')
     """)
     completed = subprocess.run(
-        [sys.executable, "-B", "-c", program], cwd=ROOT, text=True,
+        [sys.executable, "-X", "utf8", "-B", "-c", program], cwd=ROOT,
+        text=True, encoding="utf-8", errors="replace",
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, check=False,
     )
     assert completed.returncode == 0, completed.stdout

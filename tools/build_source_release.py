@@ -1,4 +1,8 @@
-"""Build and verify a complete source bundle outside the source repository."""
+"""Build a reproducible source bundle from a clean Git commit.
+
+Use --snapshot only to inspect an uncommitted development tree. Snapshot bundles
+are labelled as such and must not be treated as release artifacts.
+"""
 from __future__ import annotations
 
 import argparse
@@ -7,62 +11,133 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SOURCE_DIRECTORIES = ('XTA/', 'tools/', 'native/', 'tests/', 'release/')
+SOURCE_SUFFIXES = {'.py', '.json', '.md', '.c', '.h', '.sh', '.ps1'}
+ROOT_FILES = {'ARCHITECTURE.md', 'pyproject.toml', 'setup.py', 'MANIFEST.in',
+              '.gitignore', '.gitattributes'}
 
 
-def digest(data):
+def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output-dir', type=Path, required=True)
-    parser.add_argument('--readme', type=Path)
-    parser.add_argument('--wheel', type=Path)
-    args = parser.parse_args()
-    output = args.output_dir.resolve()
-    if output.is_relative_to(ROOT):
-        parser.error('Generated releases belong in task Scratch, outside the repository')
-    tree = ast.parse((ROOT / 'XTA/__init__.py').read_text(encoding='utf-8'))
-    version = next(ast.literal_eval(node.value) for node in tree.body
-                   if isinstance(node, ast.Assign) and any(getattr(target, 'id', '') == '__version__' for target in node.targets))
-    launcher = f'GPT-6-Astra-Ultra_v{version}_SLURM.py'
-    paths = [ROOT / name for name in (
-        launcher, 'ARCHITECTURE.md', 'pyproject.toml', 'setup.py', 'MANIFEST.in',
-        '.gitignore', '.gitattributes',
-    )]
-    for directory in ('XTA', 'tools', 'native', 'tests'):
-        paths.extend(path for path in (ROOT / directory).rglob('*') if path.is_file()
-                     and '__pycache__' not in path.parts
-                     and path.suffix in {'.py', '.json', '.md', '.c', '.h', '.sh', '.ps1'})
+def _git(root: Path, *args: str) -> bytes:
+    return subprocess.check_output(('git', *args), cwd=root)
+
+
+def _selected(name: str) -> bool:
+    if name in ROOT_FILES or (name.startswith('GPT-') and name.endswith('_SLURM.py')
+                              and '/' not in name):
+        return True
+    return name.startswith(SOURCE_DIRECTORIES) and Path(name).suffix in SOURCE_SUFFIXES
+
+
+def source_payloads(root: Path, *, snapshot: bool = False) -> tuple[dict[str, bytes], str]:
+    """Read tracked commit bytes, or explicitly requested development bytes."""
+    root = root.resolve()
+    git_root = Path(os.fsdecode(_git(root, 'rev-parse', '--show-toplevel')).strip()).resolve()
+    if git_root != root:
+        raise ValueError(f'{root} is not the Git repository root')
+    commit = _git(root, 'rev-parse', 'HEAD').decode('ascii').strip()
+    if snapshot:
+        names = (_git(root, 'ls-files', '--cached', '--others', '--exclude-standard', '-z')
+                 .decode('utf-8', errors='surrogateescape').split('\0'))
+        payloads = {}
+        for name in sorted(set(names)):
+            if not name or not _selected(name):
+                continue
+            path = root / name
+            if not path.resolve().is_relative_to(root):
+                raise ValueError(f'Source path resolves outside the repository: {name}')
+            if path.is_file():
+                payloads[name] = path.read_bytes()
+        return payloads, 'working-tree-snapshot'
+    if _git(root, 'status', '--porcelain=v1', '-z', '--untracked-files=all'):
+        raise ValueError('Release bundles require a clean Git tree; use --snapshot for development validation')
+    entries = []
+    for raw in _git(root, 'ls-tree', '-rz', '--full-tree', commit).split(b'\0'):
+        if not raw:
+            continue
+        metadata, raw_name = raw.split(b'\t', 1)
+        mode, kind, object_id = metadata.split(b' ')
+        name = raw_name.decode('utf-8', errors='surrogateescape')
+        if not _selected(name):
+            continue
+        if kind != b'blob' or mode == b'120000':
+            raise ValueError(f'Source member is not a regular Git blob: {name}')
+        entries.append((name, object_id))
+    requested = b''.join(object_id + b'\n' for _name, object_id in entries)
+    batch = subprocess.check_output(('git', 'cat-file', '--batch'), input=requested, cwd=root)
     payloads = {}
-    for path in sorted(paths):
-        if not path.resolve().is_relative_to(ROOT):
-            raise ValueError(f'Source path resolves outside the repository: {path}')
-        payloads[path.relative_to(ROOT).as_posix()] = path.read_bytes()
-    if args.readme:
-        payloads['READ_ME_FIRST.txt'] = args.readme.read_bytes()
-    manifest = {'version': version, 'launcher': launcher,
+    offset = 0
+    for name, object_id in entries:
+        line_end = batch.find(b'\n', offset)
+        if line_end < 0:
+            raise ValueError(f'Git blob response ended before {name}')
+        returned_id, kind, raw_size = batch[offset:line_end].split(b' ')
+        if returned_id != object_id or kind != b'blob':
+            raise ValueError(f'Git blob identity differs for {name}')
+        size = int(raw_size)
+        start, end = line_end + 1, line_end + 1 + size
+        if batch[end:end + 1] != b'\n':
+            raise ValueError(f'Git blob response is truncated for {name}')
+        payloads[name] = batch[start:end]
+        offset = end + 1
+    if offset != len(batch):
+        raise ValueError('Unexpected bytes after Git blob batch')
+    return payloads, commit
+
+
+def build(*, root: Path, output: Path, readme: Path | None = None,
+          wheel: Path | None = None, snapshot: bool = False) -> Path:
+    root, output = root.resolve(), output.resolve()
+    if output.is_relative_to(root):
+        raise ValueError('Generated releases belong in task Scratch, outside the repository')
+    payloads, source = source_payloads(root, snapshot=snapshot)
+    tree = ast.parse(payloads['XTA/__init__.py'].decode('utf-8'))
+    version = next(ast.literal_eval(node.value) for node in tree.body
+                   if isinstance(node, ast.Assign) and any(
+                       getattr(target, 'id', '') == '__version__' for target in node.targets))
+    launcher = f'GPT-6-Astra-Ultra_v{version}_SLURM.py'
+    if launcher not in payloads:
+        raise ValueError(f'Expected versioned launcher is absent: {launcher}')
+    launchers = [name for name in payloads if name.endswith('_SLURM.py')]
+    if launchers != [launcher]:
+        raise ValueError(f'Expected exactly one versioned launcher: {launchers}')
+    if readme:
+        payloads['READ_ME_FIRST.txt'] = readme.read_bytes()
+    manifest = {'version': version, 'launcher': launcher, 'source': source,
                 'files': {name: digest(data) for name, data in sorted(payloads.items())}}
     payloads['RELEASE_MANIFEST.json'] = (json.dumps(manifest, indent=2) + '\n').encode()
-    if args.wheel:
-        with zipfile.ZipFile(args.wheel) as wheel:
-            assert wheel.testzip() is None
-            package = {name for name in wheel.namelist() if name.startswith('XTA/') and name.endswith(('.py', '.json', '.md'))}
+    if wheel:
+        with zipfile.ZipFile(wheel) as archive:
+            bad_member = archive.testzip()
+            if bad_member is not None:
+                raise ValueError(f'Wheel has a corrupt member: {bad_member}')
+            package = {name for name in archive.namelist() if name.startswith('XTA/')
+                       and name.endswith(('.py', '.json', '.md'))}
             expected = {name for name in payloads if name.startswith('XTA/')}
-            assert package == expected, (package - expected, expected - package)
+            if package != expected:
+                raise ValueError(f'Wheel package files differ: extra={package - expected}, missing={expected - package}')
             for name in expected:
-                assert wheel.read(name) == payloads[name], name
-            launchers = [name for name in wheel.namelist() if name.endswith('_SLURM.py')]
-            assert len(launchers) == 1 and launchers[0].endswith('/' + launcher), launchers
-            assert wheel.read(launchers[0]) == payloads[launcher]
-            metadata = wheel.read(f'xta-{version}.dist-info/METADATA').decode()
-            assert f'Version: {version}' in metadata.splitlines()
-            assert not any(name.endswith(('.pyc', '.nbc', '.nbi')) for name in wheel.namelist())
+                if archive.read(name) != payloads[name]:
+                    raise ValueError(f'Wheel package bytes differ: {name}')
+            wheel_launchers = [name for name in archive.namelist() if name.endswith('_SLURM.py')]
+            if len(wheel_launchers) != 1 or not wheel_launchers[0].endswith('/' + launcher):
+                raise ValueError(f'Wheel launcher differs: {wheel_launchers}')
+            if archive.read(wheel_launchers[0]) != payloads[launcher]:
+                raise ValueError('Wheel launcher bytes differ')
+            metadata = archive.read(f'xta-{version}.dist-info/METADATA').decode()
+            if f'Version: {version}' not in metadata.splitlines():
+                raise ValueError('Wheel metadata version differs')
+            if any(name.endswith(('.pyc', '.nbc', '.nbi')) for name in archive.namelist()):
+                raise ValueError('Wheel contains generated bytecode or native caches')
         print(f'Wheel verified against {len(expected)} current package files.')
     output.mkdir(parents=True, exist_ok=True)
     archive = output / f'XTA_v{version}_complete_source.zip'
@@ -74,19 +149,40 @@ def main():
             for name, data in sorted(payloads.items()):
                 info = zipfile.ZipInfo(prefix + name, date_time=(1980, 1, 1, 0, 0, 0))
                 target.writestr(info, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
-        with zipfile.ZipFile(temporary) as source:
-            assert source.testzip() is None
-            assert set(source.namelist()) == {prefix + name for name in payloads}
+        with zipfile.ZipFile(temporary) as built:
+            bad_member = built.testzip()
+            if bad_member is not None:
+                raise ValueError(f'Source archive has a corrupt member: {bad_member}')
+            if set(built.namelist()) != {prefix + name for name in payloads}:
+                raise ValueError('Source archive member list differs from its manifest')
             for name, data in payloads.items():
-                assert source.read(prefix + name) == data, name
+                if built.read(prefix + name) != data:
+                    raise ValueError(f'Source archive bytes differ: {name}')
         os.replace(temporary, archive)
     finally:
         temporary.unlink(missing_ok=True)
-    for artifact in (archive, *((args.wheel,) if args.wheel else ())):
+    for artifact in (archive, *((wheel,) if wheel else ())):
         checksum = digest(artifact.read_bytes())
-        artifact.with_suffix(artifact.suffix + '.sha256').write_text(f'{checksum}  {artifact.name}\n', encoding='ascii')
+        artifact.with_suffix(artifact.suffix + '.sha256').write_text(
+            f'{checksum}  {artifact.name}\n', encoding='ascii')
         print(f'{artifact.name}: {artifact.stat().st_size:,} bytes; SHA256 {checksum}')
-    print(f'Verified {len(payloads)} source members.')
+    print(f'Verified {len(payloads)} source members from {source}.')
+    return archive
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output-dir', type=Path, required=True)
+    parser.add_argument('--readme', type=Path)
+    parser.add_argument('--wheel', type=Path)
+    parser.add_argument('--snapshot', action='store_true',
+                        help='validate the uncommitted working tree as a labelled development snapshot')
+    args = parser.parse_args()
+    try:
+        build(root=ROOT, output=args.output_dir, readme=args.readme,
+              wheel=args.wheel, snapshot=args.snapshot)
+    except ValueError as exc:
+        parser.error(str(exc))
 
 
 if __name__ == '__main__':

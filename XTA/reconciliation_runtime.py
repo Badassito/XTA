@@ -13,6 +13,7 @@ import numpy as np
 
 from .reconciliation import EvidenceLayer, evidence_role, reconcile
 from .reconciliation_policy import load_reconciliation_policy, validate_policy
+from .runtime import close_memmap_array_without_flush
 
 
 def union_nrrd_exports_can_overlap(layer_sink, assembled_union, *, policy, source_shape_tyx):
@@ -291,8 +292,11 @@ def reconcile_tta_layers(refs, *, views, source_shape_tyx, processing_shape_tyx,
         return output, report
     except BaseException:
         if output is not None:
-            output._mmap.close()
-        path.unlink(missing_ok=True)
+            close_memmap_array_without_flush(output, unlink_path=path if path.exists() else None)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass  # The last array consumer triggers deferred scratch deletion.
         raise
     finally:
         try:
@@ -305,6 +309,9 @@ def reconcile_tta_layers(refs, *, views, source_shape_tyx, processing_shape_tyx,
                         cleanup.callback(close)
         except BaseException:
             if output is not None:
-                output._mmap.close()
-            path.unlink(missing_ok=True)
+                close_memmap_array_without_flush(output, unlink_path=path if path.exists() else None)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
             raise

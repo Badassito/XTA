@@ -45,17 +45,9 @@ def _flush_array(array: object) -> None:
 
 
 def _close_array(array: object) -> None:
-    try:
-        from .runtime import close_memmap_array
+    from .runtime import close_memmap_array
 
-        close_memmap_array(array)
-    except Exception:
-        mmap_obj = getattr(array, "_mmap", None)
-        if mmap_obj is not None:
-            try:
-                mmap_obj.close()
-            except Exception:
-                pass
+    close_memmap_array(array)
 
 
 def row_word_count(width: int) -> int:

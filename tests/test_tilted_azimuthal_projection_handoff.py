@@ -4,6 +4,7 @@ from __future__ import annotations
 from concurrent.futures import CancelledError
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 import io
+import gc
 import os
 from pathlib import Path
 import sys
@@ -128,6 +129,30 @@ class TiltedAzimuthalProjectionHandoffTests(unittest.TestCase):
             list(bp._ordered_tilted_azimuthal_coordinates(compose, 1, 1, cancel))
         compose.assert_not_called()
 
+    def test_reduced_tilted_projection_retires_only_its_intermediate(self):
+        view = next(view for view in geometry.get_view_infos(
+            5, 7, 9, cartesian_views=(),
+            tilt_groups=(TiltedViewGroup(('transverse',), (23.,), ('vertical',)),),
+        ) if view.family == 'tilted')
+        path = self.root / 'reduced-output.dat'
+        intermediate = path.with_name(path.stem + '.d6_reduced_orthogonal.u8.dat')
+        with mock.patch.object(bp, 'delayed_native_expansion_enabled', return_value=True), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            result = bp.backproject_tilted_volume_to_volume(
+                np.ones((view.num_slices, 3, 3), dtype=np.uint8), view, path,
+                'reduced scratch ownership', prefer_memory=False, workers=1,
+                out_shape_tyx=(4, 6, 8),
+            )
+        try:
+            runtime.wait_for_retired_memmap_unlinks(path=intermediate)
+            self.assertFalse(intermediate.exists())
+            self.assertEqual(result.shape, (4, 6, 8))
+            self.assertTrue(np.any(result))
+            self.assertFalse(result._mmap.closed)
+        finally:
+            runtime.close_memmap_array(result)
+            result = None
+
     def test_cpu_fallback_matches_nonsink_oracle_for_noncontiguous_input(self):
         source = self.source[:, :, ::-1]
         original = source.copy()
@@ -139,12 +164,13 @@ class TiltedAzimuthalProjectionHandoffTests(unittest.TestCase):
                 expected = np.asarray(dense).copy()
             finally:
                 runtime.close_memmap_array_without_flush(dense)
+                dense = None
         actual = np.zeros(self.shape, np.uint8)
         def decline(*args, **kwargs):
             kwargs['retry_state']['retryable'] = False
             return None
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), \
-             mock.patch.object(bp, '_try_tilted_azimuthal_cuda_stage', side_effect=decline):
+             mock.patch.object(bp, '_try_tilted_azimuthal_cuda_stage', new=decline):
             self.call(lambda z, block: actual.__setitem__(slice(z, z + len(block)), block), source=source)
         np.testing.assert_array_equal(actual, expected)
         np.testing.assert_array_equal(source, original)
@@ -200,7 +226,7 @@ class TiltedAzimuthalProjectionHandoffTests(unittest.TestCase):
                     stack.enter_context(redirect_stdout(io.StringIO()))
                     stack.enter_context(redirect_stderr(io.StringIO()))
                     stack.enter_context(mock.patch.object(bp, '_ordered_tilted_azimuthal_coordinates', side_effect=ordered))
-                    stack.enter_context(mock.patch.object(bp, '_try_tilted_azimuthal_cuda_stage', side_effect=admit))
+                    stack.enter_context(mock.patch.object(bp, '_try_tilted_azimuthal_cuda_stage', new=admit))
                     stack.enter_context(mock.patch.object(bp, '_TILTED_AZIMUTHAL_CUDA_RECHECK_FRAMES', 1))
                     self.call(consume)
                 expected = np.zeros(self.packed_shape, np.uint8)
@@ -231,7 +257,7 @@ class TiltedAzimuthalProjectionHandoffTests(unittest.TestCase):
             return None
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), \
              mock.patch.object(bp, '_ordered_tilted_azimuthal_coordinates', side_effect=ordered), \
-             mock.patch.object(bp, '_try_tilted_azimuthal_cuda_stage', side_effect=decline), \
+             mock.patch.object(bp, '_try_tilted_azimuthal_cuda_stage', new=decline), \
              mock.patch.object(bp, '_TILTED_AZIMUTHAL_CUDA_RECHECK_FRAMES', 1):
             self.call(lambda z, block: actual.__setitem__(slice(z, z + len(block)), block))
         expected = np.zeros(self.packed_shape, np.uint8)
@@ -309,6 +335,15 @@ class TiltedAzimuthalProjectionHandoffTests(unittest.TestCase):
             sink.assert_not_called()
         finally:
             runtime.close_memmap_array_without_flush(source)
+            # The mocked unsafe stream deliberately retains the input until
+            # the assertions above. End that synthetic ownership before the
+            # temporary directory is removed; do not force-unmap live views.
+            stage.projector.source = None
+            stage.accumulate.side_effect = None
+            stage.close.side_effect = None
+            failure.__traceback__ = None
+            source = stage = failure = caught = None
+            gc.collect()
 
     def test_factory_distinguishes_busy_recoverable_and_unsafe_admission(self):
         from XTA import tilted_azimuthal_projection as plan_module

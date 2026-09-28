@@ -345,13 +345,22 @@ def probe_video_with_ffprobe(path: Path) -> VideoMetadata:
         started = time.monotonic()
         print(f"LTA video probe: method={method} path={path}", flush=True)
         try:
-            result = subprocess.run(command, capture_output=True, text=True, check=True)
+            result = subprocess.run(
+                command, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", check=True,
+            )
             payload = json.loads(result.stdout)
             streams = payload.get("streams", ()) if isinstance(payload, Mapping) else ()
             if not isinstance(streams, (list, tuple)) or not streams or not isinstance(streams[0], Mapping):
                 raise ValueError("no video stream")
         except (OSError, subprocess.CalledProcessError, ValueError, TypeError) as exc:
-            raise LtaInputError(f"Could not probe video {path} with {method}: {exc}") from exc
+            detail = ""
+            if isinstance(exc, subprocess.CalledProcessError):
+                detail = str(exc.stderr or "").strip()
+            suffix = f"; stderr: {detail}" if detail else ""
+            raise LtaInputError(
+                f"Could not probe video {path} with {method}: {exc}{suffix}"
+            ) from exc
         print(f"LTA video probe complete: method={method} seconds={time.monotonic() - started:.3f} path={path}", flush=True)
         return streams[0]
 

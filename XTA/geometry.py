@@ -463,7 +463,7 @@ class ViewInfo:
     spherical_patch_u: int = 0
     spherical_patch_v: int = 0
     spherical_rotation_xyz: Tuple[float, ...] = (1., 0., 0., 0., 1., 0., 0., 0., 1.)
-    # v16.4.0 TTA identity. ``name`` is the unique runtime variant name;
+    # ``name`` is the unique runtime TTA variant name;
     # ``physical_view_name`` retains the underlying projection geometry name.
     physical_view_name: str = ''
     tta_aug_id: str = ''
@@ -1566,10 +1566,10 @@ def build_aug_job_for_variant(
     out_size: int,
     temp_dir: Path,
 ) -> AugJob:
-    """Build the sole augmentation owned by one v16.4.0 TTA view variant."""
+    """Build the augmentation job owned by one TTA view variant."""
     if not is_tta_view_variant(view):
         raise ValueError(
-            f'v16.4.0 augmentation construction requires a TTA view variant; got {view.name!r}'
+            f'Augmentation construction requires a TTA view variant; got {view.name!r}'
         )
     angle = float(view.tta_angle_deg)
     aug_id = str(view.tta_aug_id)
@@ -2040,6 +2040,7 @@ class PredictionVolumeRef:
     view: Optional[ViewInfo] = None
     render_batch_sink: Optional[RenderBatchSink] = None
     raster_plan: Optional[RasterPlan] = None
+    owns_materialized_path: bool = False
 
 def close_prediction_volume_ref(ref: Optional[PredictionVolumeRef], *, keep_temp: bool = False) -> None:
     """Release one prediction source and remove any fallback backing file."""
@@ -2052,19 +2053,16 @@ def close_prediction_volume_ref(ref: Optional[PredictionVolumeRef], *, keep_temp
             close_fn()
         except Exception as exc:
             print(f'Warning: failed to close streaming prediction source {ref.name} ({exc})')
+    ref.source = None
 
     arr = getattr(ref, 'array', None)
     path = getattr(ref, 'path', None)
     if arr is not None:
-        if bool(keep_temp):
+        if bool(keep_temp) or not bool(ref.owns_materialized_path) or path is None:
             close_memmap_array(arr)
         else:
-            close_memmap_array_without_flush(arr)
-    if not bool(keep_temp) and path is not None:
-        try:
-            Path(path).unlink(missing_ok=True)
-        except Exception:
-            pass
+            close_memmap_array_without_flush(arr, unlink_path=Path(path))
+        ref.array = None
 
 class ChannelFormattedYoloBatch(list):
     """Image-list marker that preserves the requested H×W×C channel order."""
@@ -3183,11 +3181,16 @@ def ensure_ultralytics_accepts_in_memory_volume_source() -> None:
     except Exception as exc:  # pragma: no cover - ultralytics is imported lazily on SLURM
         raise RuntimeError(f'Unable to import ultralytics.data.build for in-memory prediction source registration: {exc}') from exc
 
-    loaders = getattr(ultralytics_build, 'LOADERS', ())
-    try:
-        loaders_tuple = tuple(loaders)
-    except Exception:
-        loaders_tuple = ()
+    loaders = getattr(ultralytics_build, 'LOADERS', None)
+    check_source = getattr(ultralytics_build, 'check_source', None)
+    if (not isinstance(loaders, tuple) or not callable(check_source)
+            or 'LOADERS' not in getattr(getattr(check_source, '__code__', None), 'co_names', ())
+            or getattr(check_source, '__globals__', {}).get('LOADERS') is not loaders):
+        raise RuntimeError(
+            'Unsupported Ultralytics in-memory source API: '
+            'ultralytics.data.build.check_source must use its LOADERS tuple'
+        )
+    loaders_tuple = loaders
     additions: List[object] = []
     for loader_cls in (
         InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource,
@@ -3347,7 +3350,7 @@ def build_dense_tile_jobs_for_aug(
         for i, (tile_id, tile_x, tile_y) in enumerate(tile_specs)
     ]
 
-    # v16.4.0 gates every tile independently, so each tile keeps only its own minimal
+    # Each tile is admitted independently and retains only its own minimal
     # parent-grid footprint.
     if jobs:
         resolved: List[DenseTileJob] = []
@@ -4119,14 +4122,12 @@ def render_dense_tile_frame_for_job(
     *,
     mirror_azimuthal_u: bool = False,
 ) -> np.ndarray:
-    """Render one tile inference range directly from the native view volume.
+    """Render one tile directly from the native view volume.
 
- This replaces the legacy canvas-video -> crop -> scale FFmpeg path with the
- same transform collapsed into one in-memory reslice. ``tile_job.M_src_to_out``
- maps native view coordinates directly to the tile's ``--imgsz`` inference
- raster; for Tilted Views the inverse grid-to-native transform is passed into
- the tilted sampler so the stacking-axis shear, in-plane augmentation, crop,
- and scale are sampled in one pass."""
+    ``tile_job.M_src_to_out`` maps native coordinates to the tile's ``--imgsz``
+    raster. Tilted views pass the inverse transform to the sampler, combining
+    stacking-axis shear, in-plane augmentation, crop, and scale in one reslice.
+    """
     return render_intensity_frame_on_grid(
         volume_rgb,
         view,
@@ -4271,7 +4272,7 @@ def build_fullframe_raster_plan(
     job: AugJob,
     channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
 ) -> RasterPlan:
-    """Build the canonical v18 TTA plan consumed by one full-frame job."""
+    """Build the canonical TTA plan consumed by one full-frame job."""
 
     from .unification.tta_manifest import radial_view_plan_metadata, spherical_view_plan_metadata, projection_sampling_record
     fmt = resolve_channel_format(channel_format)
@@ -4297,19 +4298,12 @@ def build_fullframe_raster_plan(
     )
 
 
-def _angle_from_aug_id(aug_id: str) -> float:
-    token = str(aug_id)
-    if not token.startswith('a'):
-        raise ValueError(f'augmentation id does not encode an angle: {aug_id!r}')
-    return float(token[1:].replace('m', '-').replace('p', '.'))
-
-
 def build_dense_tile_raster_plan(
     view: ViewInfo,
     tile_job: DenseTileJob,
     channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
 ) -> RasterPlan:
-    """Build the canonical v18 TTA plan consumed by one collapsed tile job."""
+    """Build the canonical TTA plan consumed by one collapsed tile job."""
 
     from .unification.tta_manifest import radial_view_plan_metadata, spherical_view_plan_metadata, projection_sampling_record
     fmt = resolve_channel_format(channel_format)
@@ -4449,6 +4443,7 @@ def _materialize_prediction_volume_from_renderer(
         view=view,
         render_batch_sink=render_batch_sink,
         raster_plan=raster_plan,
+        owns_materialized_path=isinstance(pred_volume, np.memmap),
     )
 
 def materialize_fullframe_prediction_volume_for_job(

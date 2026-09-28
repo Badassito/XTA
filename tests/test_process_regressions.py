@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 import tempfile
 import threading
@@ -7,6 +8,7 @@ import types
 import unittest
 from pathlib import Path
 from unittest import mock
+import weakref
 
 import numpy as np
 
@@ -78,6 +80,11 @@ class ProcessRuntimeRegressionTests(unittest.TestCase):
         media.abort_streaming_producers('test teardown')
         media.wait_for_streaming_producers(timeout=5.0)
         media.reset_streaming_state_for_new_run()
+
+    def assert_speculative_stage_retired(self, work_dir: Path) -> None:
+        for path in work_dir.glob('*fallback-stage*'):
+            runtime.wait_for_retired_memmap_unlinks(path=path, timeout_s=5.0)
+        self.assertEqual(list(work_dir.glob('*fallback-stage*')), [])
 
     def test_fork_start_method_is_rejected(self) -> None:
         with mock.patch.dict(
@@ -340,9 +347,14 @@ class ProcessRuntimeRegressionTests(unittest.TestCase):
             np.testing.assert_array_equal(np.asarray(result), np.full((2, 2, 2), 7, dtype=np.uint8))
             self.assertTrue(stats['fallback_saw_clean_input'])
             self.assertEqual(stats['process_backend'], 'fallback_in_process_after_worker_failure')
-            self.assertEqual(list(work_dir.glob('*fallback-stage*')), [])
+            self.assert_speculative_stage_retired(work_dir)
         finally:
+            mapping_ref = weakref.ref(original._mmap)
             runtime.close_memmap_array(original)
+            self.assertFalse(original._mmap.closed)
+            result = original = None
+            gc.collect()
+            self.assertIsNone(mapping_ref())
 
     def test_successful_transaction_commits_back_to_original_mapping(self) -> None:
         temp_context = tempfile.TemporaryDirectory()
@@ -386,9 +398,14 @@ class ProcessRuntimeRegressionTests(unittest.TestCase):
             self.assertIs(result, original)
             np.testing.assert_array_equal(np.asarray(original), np.full((2, 2, 2), 9, dtype=np.uint8))
             self.assertTrue(stats['worker_completed'])
-            self.assertEqual(list(work_dir.glob('*fallback-stage*')), [])
+            self.assert_speculative_stage_retired(work_dir)
         finally:
+            mapping_ref = weakref.ref(original._mmap)
             runtime.close_memmap_array(original)
+            self.assertFalse(original._mmap.closed)
+            result = original = None
+            gc.collect()
+            self.assertIsNone(mapping_ref())
 
     def test_aux_failure_fallback_retains_fallback_backend_telemetry(self) -> None:
         runtime.set_gpu_worker_aux_interpolation_pool(_FailingAuxPool())  # type: ignore[arg-type]
@@ -404,8 +421,14 @@ class ProcessRuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(
                 stats['process_backend'], 'fallback_in_process_after_aux_failure',
             )
+            self.assert_speculative_stage_retired(_work_dir)
         finally:
+            mapping_ref = weakref.ref(original._mmap)
             runtime.close_memmap_array(original)
+            self.assertFalse(original._mmap.closed)
+            result = original = None
+            gc.collect()
+            self.assertIsNone(mapping_ref())
 
     def test_aux_queue_pickle_failure_rolls_back_pending_lease(self) -> None:
         class _Queue:

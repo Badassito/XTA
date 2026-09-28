@@ -259,11 +259,12 @@ class ComponentReplayTests(unittest.TestCase):
         self.configure()
         captured = self.capture(self.source(fmt=INTERNAL_PACKED_CVOL_FORMAT))
         output, scratch = self.root/'cli-results', self.root/'cli-scratch'
-        command = [sys.executable, '-B', str(Path(replay_component_projection.__file__).resolve()),
+        command = [sys.executable, '-X', 'utf8', '-B', str(Path(replay_component_projection.__file__).resolve()),
                    str(captured), '--output', str(output), '--scratch', str(scratch), '--workers', '1']
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1', YOLO_TTA_GPU_BACKPROJECT='0',
                    YOLO_TTA_GPU_INTERPOLATION='0', YOLO_TTA_TELEMETRY='0')
-        completed = subprocess.run(command, capture_output=True, text=True, env=env, timeout=90)
+        completed = subprocess.run(command, capture_output=True, text=True,
+                                   encoding='utf-8', errors='replace', env=env, timeout=90)
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         report = json.loads((output/'replay.json').read_text(encoding='utf-8'))
         self.assertTrue(report['all_exact'])

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import io
 import tempfile
 import unittest
@@ -10,7 +11,7 @@ from unittest import mock
 
 import numpy as np
 
-from XTA import interpolation, topology
+from XTA import interpolation, runtime, topology
 
 
 class _RecordingMembership:
@@ -208,6 +209,10 @@ class InterpolationSparseExportTests(unittest.TestCase):
                     united |= decoded
                 np.testing.assert_array_equal(mask, before | united)
                 self.assertEqual(stats['added_voxels'], int(united.sum()))
+                gc.collect()
+                for path in (root/'components'/'_membership').glob('word*.dat'):
+                    runtime.wait_for_retired_memmap_unlinks(path=path)
+                runtime.wait_for_retired_memmap_directory_cleanup(root/'components'/'_membership')
                 self.assertFalse((root/'components'/'_membership').exists())
 
 

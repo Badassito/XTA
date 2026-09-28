@@ -62,12 +62,14 @@ def create_cpu_fixtures(root, *, size=64, frames=16, missing_indices=()):
 
 
 def runtime_environment(root):
+    config_dir = Path(root) / 'ultralytics-config'
+    config_dir.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env.update(PYTHONPATH=str(ROOT), PYTHONIOENCODING='utf-8', PYTHONDONTWRITEBYTECODE='1',
         OMP_NUM_THREADS='2', MKL_NUM_THREADS='2', OPENBLAS_NUM_THREADS='2', NUMBA_NUM_THREADS='2',
         SLURM_CPUS_PER_TASK='8', YOLO_TTA_CPU_SOCKET_RESERVE_CORES='0',
         YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND='0', YOLO_TTA_TELEMETRY='0',
-        YOLO_CONFIG_DIR=str(root / 'ultralytics-config'), NUMBA_CACHE_DIR=str(root / 'numba-cache'),
+        YOLO_CONFIG_DIR=str(config_dir), NUMBA_CACHE_DIR=str(root / 'numba-cache'),
         CUPY_CACHE_DIR=str(root / 'cupy-cache'), TORCHINDUCTOR_CACHE_DIR=str(root / 'torchinductor-cache'),
         TRITON_CACHE_DIR=str(root / 'triton-cache'), NO_ALBUMENTATIONS_UPDATE='1',
         PTA_GPU_TORCH_COMPILE='0', YOLO_AUTOINSTALL='false')

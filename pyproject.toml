@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xta"
-version = "24.0.1"
+dynamic = ["version"]
 description = "Volume test-time, pretraining, and label-time augmentation"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,7 +13,7 @@ dependencies = [
   "scipy",
   "tifffile",
   "tqdm",
-  "ultralytics>=8.4.128",
+  "ultralytics>=8.4.128,<8.5",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +32,9 @@ xta = "XTA.cli:run"
 [tool.setuptools.packages.find]
 include = ["XTA*"]
 
+[tool.setuptools.dynamic]
+version = {attr = "XTA.__version__"}
+
 [tool.setuptools.package-data]
 "XTA.examples.external_augmentations" = ["README.md"]
 "XTA.examples.external_reconciliation" = ["README.md"]
@@ -39,7 +42,7 @@ include = ["XTA*"]
 [tool.setuptools.data-files]
 "share/xta" = [
   "ARCHITECTURE.md",
-  "GPT-6-Astra-Ultra_v24.0.1_SLURM.py",
+  "GPT-6-Astra-Ultra_v24.0.2_SLURM.py",
 ]
 "share/xta/tools" = [
   "tools/compare_reconciliation.py",

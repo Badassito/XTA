@@ -47,6 +47,19 @@ def test_predecessor_definition_deletion_cannot_disappear_from_the_review():
         review('def required():\n    return 1\n', 'VALUE = 2\n')
 
 
+def test_explicit_import_retirement_restores_the_predecessor_position(monkeypatch):
+    monkeypatch.setitem(prepare.REMOVED_STATEMENT_REASONS,
+                        ('sample', 'import json'), 'Shared writer owns JSON encoding.')
+    old = 'import json\nVALUE = 1\n'
+    new = 'VALUE = 1\n'
+    _pin, snapshot, records = review(old, new)
+    assert [(item['module'], item['previous_index']) for item in records['removed_statements']] == [
+        ('sample', 0)]
+    restored = inventory.rewind_reviewed_statements(
+        'sample', ast.parse(new).body, ({**records, 'module_snapshots': [snapshot]},))
+    assert [value for _node, value in restored] == snapshot['previous_top_level']
+
+
 def test_explicit_example_module_removal_keeps_the_exact_historical_snapshot():
     module = 'examples/external_reconciliation/baseline'
     source = '"""A retired example."""\ndef build_reconciliation():\n    return {"mode": "confidence"}\n'

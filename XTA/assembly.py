@@ -36,6 +36,7 @@ from .runtime import (
     close_memmap_array,
     close_memmap_array_without_flush,
     copy_workspace_array,
+    defer_retired_memmap_directory_cleanup,
     interpolate_view_volume_pass_maybe_process,
     parallel_for_indices_chunked,
     parallel_map_in_order,
@@ -617,7 +618,7 @@ def materialize_nrrd_view_layer(
         segment_extent_source = 'raw_bbox_cvol_index'
         storage_format = bbox_store_format
         if not projected_is_source and not projected_sink_only:
-            close_memmap_array(projected)
+            close_memmap_array(projected, unlink_path=raw_path)
             try:
                 raw_path.unlink(missing_ok=True)
             except Exception:
@@ -869,7 +870,7 @@ def _transpose_sparse_component_store(
                     del crop
             # Close mapping before rename (including on Windows). No durability
             # barrier is necessary for this disposable same-node intermediate.
-            payload._mmap.close()
+            close_memmap_array_without_flush(payload)
             payload = None
         index.tofile(staging / 'index.bin')
         extent = (
@@ -904,8 +905,11 @@ def _transpose_sparse_component_store(
         return stats
     except BaseException:
         if payload is not None:
-            payload._mmap.close()
+            close_memmap_array_without_flush(payload, unlink_path=chunks)
+            payload = None
         shutil.rmtree(staging, ignore_errors=True)
+        if staging.exists():
+            defer_retired_memmap_directory_cleanup(staging)
         raise
 
 def _materialize_sparse_cartesian_component(
@@ -1247,7 +1251,7 @@ def materialize_interpolation_component_nrrd_view_layer(
         return layer_ref
     finally:
         store.close()
-        close_memmap_array(decoded_mm)
+        close_memmap_array(decoded_mm, unlink_path=decode_path if not bool(keep_temp) else None)
         if not bool(keep_temp):
             try:
                 decode_path.unlink(missing_ok=True)
@@ -1613,7 +1617,10 @@ def prepare_view_volume_after_fullframe(
                 known_slice_any=(meta_slice_any if hole_metadata_valid else None),
                 known_slice_bboxes=(meta_slice_bboxes if hole_metadata_valid else None))
     finally:
-        close_memmap_array(confmap_mm)
+        close_memmap_array(
+            confmap_mm,
+            unlink_path=confmap_path if confmap_path is not None and not keep_temp else None,
+        )
         if confmap_path is not None and not keep_temp:
             try:
                 confmap_path.unlink(missing_ok=True)
@@ -1778,7 +1785,12 @@ def prepare_view_volume_after_fullframe(
                                     f'{model_name}/{view.name}'
                                 ),
                             )
-                        close_memmap_array(bridge_delta_mm)
+                        close_memmap_array(
+                            bridge_delta_mm,
+                            unlink_path=(pass_delta_path if not bool(keep_temp)
+                                         and Path(delta_reported).absolute() == pass_delta_path.absolute()
+                                         else None),
+                        )
                     if not bool(keep_temp):
                         try:
                             pass_delta_path.unlink(missing_ok=True)
@@ -1901,7 +1913,14 @@ def prepare_view_volume_after_fullframe(
                     workers=int(slice_workers),
                 )
                 if old_volume is not baseline_native_volume:
-                    close_memmap_array(old_volume)
+                    old_backing = _interpolation_array_backing_path(old_volume)
+                    close_memmap_array(
+                        old_volume,
+                        unlink_path=(union_path if not keep_temp and union_path is not None
+                                     and old_backing is not None
+                                     and Path(old_backing).absolute() == Path(union_path).absolute()
+                                     else None),
+                    )
                     if not keep_temp:
                         try:
                             union_path.unlink(missing_ok=True)
@@ -1991,8 +2010,17 @@ def prepare_view_volume_after_fullframe(
         if bool(d1_component_refs_only):
             base_bytes = int(np.asarray(baseline_native_volume).nbytes)
             base_backing_path = _interpolation_array_backing_path(baseline_native_volume)
-            close_memmap_array_without_flush(baseline_native_volume)
+            close_memmap_array_without_flush(
+                baseline_native_volume,
+                unlink_path=(Path(base_backing_path) if base_backing_path is not None
+                             and not str(base_backing_path).startswith('/proc/') else None),
+            )
             baseline_native_volume = None
+            original_backing_path = _interpolation_array_backing_path(union_mm)
+            if (union_path is not None and original_backing_path is not None
+                    and not str(original_backing_path).startswith('/proc/')
+                    and Path(original_backing_path).absolute() == Path(union_path).absolute()):
+                close_memmap_array_without_flush(union_mm, unlink_path=Path(union_path))
             # The interpolation process can return a different final-pass backing. Retire
             # both that mapping and the original shadow, preserving immutable cvol stores.
             for retired_path in {base_backing_path, union_path}:
@@ -2017,7 +2045,19 @@ def prepare_view_volume_after_fullframe(
                     f'{model_name}/{view.name}: D1 continuation did not allocate its additions volume'
                 )
             base_bytes = int(np.asarray(baseline_native_volume).nbytes)
-            close_memmap_array_without_flush(baseline_native_volume)
+            base_backing_path = _interpolation_array_backing_path(baseline_native_volume)
+            close_memmap_array_without_flush(
+                baseline_native_volume,
+                unlink_path=(Path(union_path) if not bool(keep_temp) and union_path is not None
+                             and base_backing_path is not None
+                             and Path(base_backing_path).absolute() == Path(union_path).absolute()
+                             else None),
+            )
+            original_backing_path = _interpolation_array_backing_path(union_mm)
+            if (not bool(keep_temp) and union_path is not None and original_backing_path is not None
+                    and not str(original_backing_path).startswith('/proc/')
+                    and Path(original_backing_path).absolute() == Path(union_path).absolute()):
+                close_memmap_array_without_flush(union_mm, unlink_path=Path(union_path))
             if (
                 not bool(keep_temp)
                 and union_path is not None
@@ -2560,7 +2600,11 @@ def postprocess_tile_volume_after_inference(
         capture_tile_confidence(task, view=view,
             work_dir=Path(sparse_retire_dir) if sparse_retire_dir is not None else Path(task.tile_mask_path).parent)
     finally:
-        close_memmap_array(task.tile_confmap_mm)
+        close_memmap_array(
+            task.tile_confmap_mm,
+            unlink_path=(task.tile_confmap_path if task.tile_confmap_path is not None
+                         and not keep_temp else None),
+        )
         if task.tile_confmap_path is not None and not keep_temp:
             try:
                 task.tile_confmap_path.unlink(missing_ok=True)
@@ -2568,7 +2612,10 @@ def postprocess_tile_volume_after_inference(
                 pass
 
     if not _volume_has_foreground(task.tile_mask_mm):
-        close_memmap_array(task.tile_mask_mm)
+        close_memmap_array(
+            task.tile_mask_mm,
+            unlink_path=task.tile_mask_path if not keep_temp else None,
+        )
         if not keep_temp:
             try:
                 task.tile_mask_path.unlink(missing_ok=True)
@@ -2649,7 +2696,11 @@ def spill_waiting_tile_result_to_raw_store(
     )
 
     tile_shape = tuple(int(x) for x in tile_arr.shape)
-    close_memmap_array(result.tile_mask_mm)
+    close_memmap_array(
+        result.tile_mask_mm,
+        unlink_path=(Path(result.tile_mask_path) if not bool(keep_original)
+                     and result.tile_mask_path is not None else None),
+    )
     if not bool(keep_original) and result.tile_mask_path is not None:
         try:
             Path(result.tile_mask_path).unlink(missing_ok=True)
@@ -2806,7 +2857,11 @@ def gate_tile_result_against_parent_mask(
             tile_mask_store=None,
         )
     else:
-        close_memmap_array(dense_tile)
+        close_memmap_array(
+            dense_tile,
+            unlink_path=(Path(result.tile_mask_path) if result.tile_mask_path is not None
+                         and not bool(keep_temp) else None),
+        )
         if result.tile_mask_path is not None and not bool(keep_temp):
             try:
                 Path(result.tile_mask_path).unlink(missing_ok=True)
@@ -2884,7 +2939,11 @@ def gate_tile_residual_against_parent_bridge(
             gate_stats={k: int(v) for k, v in gate_stats.items()},
         )
     finally:
-        close_memmap_array(dense_tile)
+        close_memmap_array(
+            dense_tile,
+            unlink_path=(Path(result.tile_mask_path) if result.tile_mask_path is not None
+                         and not bool(keep_temp) else None),
+        )
         if result.tile_mask_path is not None and not bool(keep_temp):
             try:
                 Path(result.tile_mask_path).unlink(missing_ok=True)
@@ -3311,7 +3370,7 @@ def _try_apply_gaussian_smoothing_gpu_chunked_inplace(
                 except Exception:
                     pass
         finally:
-            close_memmap_array(source_mm)
+            close_memmap_array(source_mm, unlink_path=source_path if not bool(keep_temp) else None)
             if not bool(keep_temp):
                 try:
                     source_path.unlink(missing_ok=True)
@@ -3465,7 +3524,7 @@ def apply_gaussian_smoothing_inplace(
             stats['total_removed_voxels'] = int(stats.get('total_removed_voxels', 0)) + int(removed)
             stats['passes_completed'] = int(pass_idx)
     finally:
-        close_memmap_array(work_mm)
+        close_memmap_array(work_mm, unlink_path=work_path if not bool(keep_temp) else None)
         if not bool(keep_temp):
             try:
                 work_path.unlink(missing_ok=True)

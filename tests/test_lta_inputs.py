@@ -3,6 +3,8 @@ from __future__ import annotations
 import tempfile
 import unittest
 import json
+import subprocess
+import sys
 from pathlib import Path
 from unittest import mock
 
@@ -138,6 +140,27 @@ class LtaInputDiscoveryTests(unittest.TestCase):
             self.assertRaisesRegex(lta_inputs.LtaInputError, "no positive decoded-frame count"),
         ):
             lta_inputs.probe_video_with_ffprobe(Path("sample.mkv"))
+
+    def test_failed_probe_reports_unicode_and_invalid_stderr(self) -> None:
+        real_run = subprocess.run
+        program = (
+            "import os, sys; "
+            "os.write(2, 'bad media: ▏'.encode('utf-8') + bytes([255])); "
+            "sys.exit(3)"
+        )
+
+        def run_probe(_command, **kwargs):
+            return real_run([sys.executable, "-X", "utf8", "-c", program], **kwargs)
+
+        with (
+            mock.patch.object(lta_inputs.shutil, "which", return_value="ffprobe"),
+            mock.patch.object(lta_inputs.subprocess, "run", side_effect=run_probe),
+            self.assertRaises(lta_inputs.LtaInputError) as raised,
+        ):
+            lta_inputs.probe_video_with_ffprobe(Path("sample.mkv"))
+
+        self.assertIn("exit status 3", str(raised.exception))
+        self.assertIn("bad media: ▏�", str(raised.exception))
 
     def test_direct_image_input_builds_positive_and_warns_when_fully_labeled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

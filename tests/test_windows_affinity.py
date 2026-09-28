@@ -181,9 +181,9 @@ print(json.dumps({'original_cpus': original, 'restricted_cpus': target,
                   'restored': True}))
 '''
         completed = subprocess.run(
-            [sys.executable, '-B', '-c', code], cwd=Path(__file__).resolve().parents[1],
+            [sys.executable, '-X', 'utf8', '-B', '-c', code], cwd=Path(__file__).resolve().parents[1],
             env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60,
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         result = json.loads(completed.stdout.strip().splitlines()[-1])

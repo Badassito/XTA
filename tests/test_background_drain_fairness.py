@@ -151,7 +151,28 @@ def test_real_pipeline_background_checkpoint_refills_four_workers_before_next_ou
         physical_view_union_futures=unions, physical_view_union_completed=completed,
         output_manager=SimpleNamespace(reap_completed=lambda **kwargs: reaped.append(kwargs)))
     function = _function(Path(pipeline.__file__).read_text(encoding='utf-8'),
-                         '_drain_completed_background_futures', namespace)
+                         '_drain_completed_background_futures', namespace,
+                         # This fixture exercises only the completed union-future
+                         # branch. Keep an explicit inventory of globals used by
+                         # other drain branches so a newly captured name fails here.
+                         unreachable_globals=frozenset('''
+                             _dispatch_inference_windows _mark_tile_complete
+                             _mark_view_variant_terminal _maybe_finalize_tile_parent
+                             _maybe_submit_tile_consolidations_for_parent
+                             _release_tile_dense_result_for_key _retire_parent_dense_view
+                             _submit_physical_view_union_reduction _submit_tile_bridge_gate
+                             _submit_tile_parent_gate azimuthal_native_output_by_model
+                             component_ref_dense_retirement_active gpu_worker_pending_task_ids
+                             interpolation_stats keep_temp_artifacts native_view_support_by_model
+                             nrrd_layer_refs parent_bridge_ready parent_bridge_support_by_model
+                             parent_mask_support_by_model physical_view_dense_handoff_credit
+                             physical_view_finalization_refs tile_accumulator_by_set
+                             tile_accumulator_paths tile_consolidation_completed
+                             tile_expected_by_parent tile_parent_bridge_accumulator_by_set
+                             tile_parent_mask_accumulator_by_set tile_slice_postprocess_workers
+                             tilted_native_output_by_model view_infos_by_name view_prepare_leases
+                             view_volumes_by_model
+                         '''.split()))
     function()
     assert visited == [0] and completed == {('model', '0')}
     assert len(unions) == 9 and budget.deferred
