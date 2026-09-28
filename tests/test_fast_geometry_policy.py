@@ -45,7 +45,7 @@ class FastGeometryPolicyTests(unittest.TestCase):
         self.assertEqual(strict.policy_version, 23)
         self.assertFalse(quality.fast_geometry_enabled())
         self.assertFalse(quality.spherical_fp32_requested())
-        self.assertFalse(quality.spherical_cpu_compiled_requested())
+        self.assertTrue(quality.spherical_cpu_compiled_requested())
         self.assertFalse(quality.radial_columns_requested())
         os.environ['YOLO_TTA_FAST_GEOMETRY'] = '1'
         fast = forward_sampling_policy()
@@ -74,6 +74,22 @@ class FastGeometryPolicyTests(unittest.TestCase):
         self.assertTrue(quality.spherical_fp32_requested())
         self.assertFalse(quality.spherical_cpu_compiled_requested())
         self.assertFalse(quality.radial_columns_requested())
+
+    def test_exact_cpu_default_and_opt_out_preserve_strict_forward_policy(self):
+        strict = forward_sampling_policy()
+        self.assertTrue(quality.spherical_cpu_compiled_requested())
+        self.assertEqual(strict.digest, _STRICT_DIGEST)
+        os.environ['YOLO_TTA_CPU_SPHERICAL_COMPILED'] = '0'
+        self.assertFalse(quality.spherical_cpu_compiled_requested())
+        self.assertIs(forward_sampling_policy(), strict)
+        os.environ.pop('YOLO_TTA_CPU_SPHERICAL_COMPILED')
+        os.environ['YOLO_TTA_FAST_GEOMETRY'] = '0'
+        self.assertFalse(quality.spherical_cpu_compiled_requested())
+        os.environ['YOLO_TTA_CPU_SPHERICAL_COMPILED'] = '1'
+        self.assertTrue(quality.spherical_cpu_compiled_requested())
+        self.assertFalse(quality.spherical_fp32_requested())
+        self.assertFalse(quality.radial_columns_requested())
+        self.assertIs(forward_sampling_policy(), strict)
 
     def test_shape_guard_keeps_native_and_logical_axes_inside_qualified_range(self):
         self.assertEqual(quality.SPHERICAL_FP32_MAX_AXIS, 4096)

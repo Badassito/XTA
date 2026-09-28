@@ -64,6 +64,24 @@ RELEASES = {
                        'tools/qualify_pta_classification.py',
                        'tools/qualify_pta_gpu_masks.py',
                        'tools/qualify_pta_gpu_render.py')),
+    '23.0.3': dict(token='23_0_3', previous_token='23_0_2',
+                   feature='tta-throughput-restoration',
+                   predecessor_inventory_path='release/_package_inventory.json',
+                   validation_tools=(
+                       'tools/compare_reconciliation.py',
+                       'tools/qualify_tta_reconciliation.py',
+                       'tools/export_reconciliation_evidence.py',
+                       'tools/qualify_confidence_consolidation.py',
+                       'tools/qualify_d1_confidence_bounds.py',
+                       'tools/analyze_pipeline_trace.py',
+                       'tools/export_semantic_logits.py',
+                       'tools/qualify_semantic_trt.py',
+                       'tools/qualify_pta_classification.py',
+                       'tools/qualify_pta_gpu_masks.py',
+                       'tools/qualify_pta_gpu_render.py',
+                       'tools/qualify_radial_bitset_compaction.py',
+                       'tools/qualify_d1_confidence_masked_transfer.py',
+                       'tools/qualify_release.py')),
 }
 REASONS = {
     '__init__': 'Publish the package release identity as {release}.',
@@ -197,6 +215,17 @@ PATCH_REASONS = {
     'tta_scheduler': 'Defer exact owned tile-result backing cleanup until outstanding mapped views retire.',
     'unification/manifest': 'Publish complete run manifests through a durable atomic JSON writer.',
 }
+TTA_THROUGHPUT_REASONS = {
+    '__init__': 'Advance the package identity after the tagged 23.0.2 release.',
+    'geometry_quality': 'Restore the qualified compiled Spherical CPU policy without enabling unrelated fast geometry.',
+    'spherical_projection': 'Let compiled Spherical readers use the compact-memory worker admission policy.',
+    'cylindrical_bitset_compaction': 'Publish Radial bitsets through bounded GPU packing with exact slice encoding.',
+    'cylindrical_owner': 'Export packed Radial slices and elide proven-empty owner downloads.',
+    'cuda_d1': 'Carry encoded Radial publication, empty-owner completion, and exact masked confidence crops through D1.',
+    'workers': 'Report the restored Radial and Spherical worker paths.',
+    'outputs': 'Drain completed zero-descriptor gzip members without blocking unrelated publication.',
+    'tta_scheduler': 'Avoid repeated immutable task calculations while preserving dynamic admission decisions.',
+}
 REMOVAL_REASONS = {
     'examples/external_reconciliation/' + name:
         'Retire this preset from the curated package selection while preserving its authenticated release history.'
@@ -226,6 +255,9 @@ TOOL_REASONS = {
     'tools/qualify_pta_classification.py': 'Qualify semantic PTA classification bypass and exact native-plane occupancy on representative plans.',
     'tools/qualify_pta_gpu_masks.py': 'Qualify resident CUDA categorical geometry and publication against CPU references, including boundary and ignored-region cases.',
     'tools/qualify_pta_gpu_render.py': 'Measure the integrated PTA CUDA render, augmentation, nvJPEG and semantic PNG path against a CPU categorical fallback with identical inputs.',
+    'tools/qualify_radial_bitset_compaction.py': 'Qualify exact packed Radial output and bounded device-to-host traffic against the original path.',
+    'tools/qualify_d1_confidence_masked_transfer.py': 'Qualify exact cropped confidence payloads and reduced device-to-host calls for masked transfer.',
+    'tools/qualify_release.py': 'Route qualification temporary files and GPU compiler caches into task Scratch while preserving the source and test gates.',
 }
 
 
@@ -377,7 +409,8 @@ def prepare(*, output_dir, release='23.0.2', write=False):
     spec = RELEASES[release]
     reasons = {**REASONS, **(THROUGHPUT_REASONS if release == '22.3.2' else {}),
                **(SEMANTIC_REASONS if release == '23.0.1' else {}),
-               **(PATCH_REASONS if release == '23.0.2' else {})}
+               **(PATCH_REASONS if release == '23.0.2' else {}),
+               **(TTA_THROUGHPUT_REASONS if release == '23.0.3' else {})}
     prefix = 'REVIEWED_V' + spec['token'] + '_RELEASE'
     key = 'v' + spec['token'] + '_release_review'
     predecessor_commit = getattr(inventory, prefix + '_PREDECESSOR_COMMIT')
@@ -422,7 +455,7 @@ def prepare(*, output_dir, release='23.0.2', write=False):
             new_source = path.read_text(encoding='utf-8')
             if old_source is not None and inventory.digest(ast.parse(old_source)) == inventory.digest(ast.parse(new_source)):
                 continue
-            reason = reasons.get(module, 'Implement the {release} semantic segmentation contract in this source module.').format(release=release)
+            reason = reasons.get(module, 'Implement the reviewed {release} TTA throughput contract in this source module.').format(release=release)
             complete = module not in audited
             pin, snapshot, records = review_module(module, old_source, new_source,
                 complete=complete, labels_by_hash=labels_by_hash, reason=reason)
@@ -491,7 +524,7 @@ def prepare(*, output_dir, release='23.0.2', write=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--release', choices=tuple(RELEASES), default='23.0.2')
+    parser.add_argument('--release', choices=tuple(RELEASES), default='23.0.3')
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--write', action='store_true')
     args = parser.parse_args(argv)

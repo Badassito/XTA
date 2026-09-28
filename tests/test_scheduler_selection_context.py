@@ -1,12 +1,14 @@
 """Differential policy coverage for bounded, per-selection evaluation reuse."""
 from collections import Counter
 from dataclasses import replace
+import gc
 from pathlib import Path
 import queue
 import random
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+import weakref
 
 from XTA.tta_scheduler import D1ParentGroup
 from tests._scheduler_selection_reference import reference_select
@@ -96,6 +98,115 @@ def random_scheduler(seed):
 
 
 class SchedulerSelectionContextTests(unittest.TestCase):
+    def test_descriptor_rebuilds_after_contract_edits_and_task_replacement(self):
+        scheduler = random_scheduler(4)
+        task_id = 0
+        view = _view()
+        task = dict(task_id=task_id, kind='fullframe', model_name='model',
+                    view=view, result_mode='file', gpu_eligible=True,
+                    hybrid_cpu_eligible_origin=False)
+        scheduler.state.gpu_worker_tasks_by_id[task_id] = task
+        descriptor = scheduler._selection_task_descriptor(task_id, task)
+        self.assertEqual(descriptor.parent, ('model', view.name))
+        self.assertIsNone(descriptor.direct_parent)
+        self.assertIsNone(descriptor.d1_parent)
+
+        task['result_mode'] = 'direct_union'
+        direct = scheduler._selection_task_descriptor(task_id, task)
+        self.assertIsNot(direct, descriptor)
+        self.assertEqual(direct.direct_parent, ('model', view.name))
+        task['hybrid_cpu_eligible_origin'] = True
+        hybrid = scheduler._selection_task_descriptor(task_id, task)
+        self.assertEqual(hybrid.hybrid_parent, ('model', view.name))
+        task['result_mode'] = 'd1_owner'
+        owner = scheduler._selection_task_descriptor(task_id, task)
+        self.assertEqual(owner.d1_parent, ('model', view.name))
+        self.assertIsNone(owner.direct_parent)
+        task['result_mode'] = 'file'
+        task['bounded_parent_admission'] = True
+        bounded = scheduler._selection_task_descriptor(task_id, task)
+        self.assertEqual(bounded.direct_parent, ('model', view.name))
+
+        task['model_name'] = 'other'
+        task['view'] = replace(view, name='replacement')
+        changed_parent = scheduler._selection_task_descriptor(task_id, task)
+        self.assertEqual(changed_parent.parent, ('other', 'replacement'))
+        task['kind'] = 'tile'
+        self.assertIsNone(scheduler._selection_task_descriptor(task_id, task).parent)
+        replacement = dict(task, kind='fullframe', model_name='third')
+        scheduler.state.gpu_worker_tasks_by_id[task_id] = replacement
+        self.assertEqual(scheduler._selection_task_descriptor(task_id, replacement).parent,
+                         ('third', 'replacement'))
+        class Payload:
+            pass
+        payload = Payload()
+        payload_ref = weakref.ref(payload)
+        replacement['payload'] = payload
+        scheduler.state.gpu_worker_tasks_by_id.pop(task_id)
+        del replacement, payload
+        gc.collect()
+        self.assertIsNone(payload_ref(), 'selection descriptors must not retain task payloads')
+
+    def test_reference_selection_after_split_and_admission_transition(self):
+        def build():
+            state = _state()
+            state.gpu_task_queues.update({0: queue.Queue(), 1: queue.Queue()})
+            state.gpu_worker_next_dynamic_task_id = 4
+            for parent_index in range(2):
+                view = replace(_view(), name=f'parent_{parent_index}')
+                parent = ('model', view.name)
+                state.fullframe_remaining[parent] = 2
+                state.fullframe_task_ids_by_parent[parent] = [2 * parent_index, 2 * parent_index + 1]
+                for offset in range(2):
+                    task_id = 2 * parent_index + offset
+                    state.gpu_worker_tasks_by_id[task_id] = dict(
+                        task_id=task_id, kind='fullframe', model_name='model', view=view,
+                        result_mode='direct_union', processing_shape=(16, 8, 8),
+                        slice_start=40 * offset, slice_count=40, gpu_eligible=True,
+                    )
+                    state.gpu_worker_pending_task_ids.append(task_id)
+            return _scheduler(Path('.'), state=state, input_overrides=dict(
+                gpu_device_count=2, direct_union_inference_view_limit=1,
+            ))
+
+        old, current = build(), build()
+
+        def compare():
+            expected = reference_select(old, candidate_workers=[1, 0])
+            actual = current.pop_gpu_worker_pending_task_id(candidate_workers=[1, 0])
+            self.assertEqual(actual, expected)
+            self.assertEqual(list(current.state.gpu_worker_pending_task_ids),
+                             list(old.state.gpu_worker_pending_task_ids))
+            self.assertEqual(current.state.fullframe_remaining, old.state.fullframe_remaining)
+            self.assertEqual({task_id: (task['slice_start'], task['slice_count'], task['result_mode'])
+                              for task_id, task in current.state.gpu_worker_tasks_by_id.items()},
+                             {task_id: (task['slice_start'], task['slice_count'], task['result_mode'])
+                              for task_id, task in old.state.gpu_worker_tasks_by_id.items()})
+            return actual
+
+        first = compare()
+        self.assertIsNotNone(first)
+        first_task = old.state.gpu_worker_tasks_by_id[first[0]]
+        active_parent = ('model', first_task['view'].name)
+        for scheduler in (old, current):
+            state = scheduler.state
+            state.direct_union_inference_views.add(active_parent)
+            state.direct_union_inference_bytes[active_parent] = 1024
+            state.direct_union_backing_leases[active_parent] = SimpleNamespace(phase='inference')
+            remaining = next(task_id for task_id in state.gpu_worker_pending_task_ids
+                             if state.gpu_worker_tasks_by_id[task_id]['view'].name == active_parent[1])
+            scheduler.split_gpu_worker_task_to_runtime_target(remaining)
+        second = compare()
+        self.assertIsNotNone(second)
+        self.assertEqual(old.state.gpu_worker_tasks_by_id[second[0]]['view'].name, active_parent[1])
+
+        for scheduler in (old, current):
+            for task_id in scheduler.state.gpu_worker_pending_task_ids:
+                task = scheduler.state.gpu_worker_tasks_by_id[task_id]
+                if task['view'].name != active_parent[1]:
+                    task['result_mode'] = 'file'
+        compare()
+
     def test_randomized_reference_ids_worker_order_mutations_and_dynamic_state(self):
         with mock.patch('XTA.confidence_evidence.confidence_evidence_enabled',return_value=False), \
              mock.patch('builtins.print'):

@@ -1,4 +1,4 @@
-"""Dependency-light opt-in geometry controls shared by parent and workers.
+"""Dependency-light geometry controls shared by parent and workers.
 
 Local controls override the global bundle. These are requests, not evidence of
 backend availability or successful dispatch; each backend keeps its own guards.
@@ -27,7 +27,10 @@ def spherical_fp32_requested():
 
 
 def spherical_cpu_compiled_requested():
-    return _flag('YOLO_TTA_CPU_SPHERICAL_COMPILED', fast_geometry_enabled())
+    # The compiled CPU pull is exact FP64; enable it independently of the
+    # approximate GPU geometry modes. A local CPU flag overrides the global
+    # bundle, including an explicit global opt-out.
+    return _flag('YOLO_TTA_CPU_SPHERICAL_COMPILED', _flag('YOLO_TTA_FAST_GEOMETRY', True))
 
 
 def radial_columns_requested():

@@ -148,17 +148,20 @@ class SphericalCpuCompactTests(unittest.TestCase):
         with mock.patch.object(sp, '_INFLIGHT_WORK_BYTES', 1024):
             self.assertEqual(sp._spherical_block_schedule(10_000_000, 1, 32, compact=True)[1], 1)
 
-    def test_compiled_schedule_preserves_legacy_concurrency_and_caps_large_workspaces(self):
+    def test_compiled_schedule_uses_its_own_workspace_and_caps_large_workspaces(self):
         with mock.patch.object(sp, '_cpu_count', return_value=64):
             self.assertEqual(sp._spherical_block_schedule(1931, 3064 * 3022, 64), (1, 4))
             self.assertEqual(sp._spherical_block_schedule(1931, 3064 * 3022, 64,
-                                                         compact=True, compiled=True), (1, 4))
+                                                         compact=True, compiled=True), (1, 9))
+            self.assertEqual(sp._spherical_block_schedule(1931, 3064 * 3022, 64,
+                                                         compact=True), (1, 3))
             for plane_bytes in (1, 1000, 3072**2, 25_000_000, 70_000_000, 300_000_000):
                 for compiled_mode in (False, True):
                     depth, workers = sp._spherical_block_schedule(10_000, plane_bytes, 64,
                         compact=True, compiled=compiled_mode)
                     legacy_workers = sp._spherical_block_schedule(10_000, plane_bytes, 64)[1]
-                    self.assertLessEqual(workers, legacy_workers)
+                    if not compiled_mode:
+                        self.assertLessEqual(workers, legacy_workers)
                     scratch = min(plane_bytes, sp._PULL_CHUNK_VOXELS) * (
                         sp._COMPILED_CHUNK_BYTES_PER_VOXEL if compiled_mode else sp._CHUNK_BYTES_PER_VOXEL)
                     memory = plane_bytes * (2 * depth + 1) + scratch + depth * sp._CPU_ENCODED_SLICE_BYTES
@@ -166,6 +169,82 @@ class SphericalCpuCompactTests(unittest.TestCase):
                     # may be admitted beyond the configured in-flight budget.
                     if workers > 1:
                         self.assertLessEqual(memory * workers, sp._INFLIGHT_WORK_BYTES)
+
+    def test_compiled_schedule_respects_caller_cpu_and_available_block_limits(self):
+        with mock.patch.object(sp, '_cpu_count', return_value=204):
+            for requested in (1, 2, 5, 9, 32, 204):
+                self.assertEqual(sp._spherical_block_schedule(1931, 3064 * 3022,
+                    requested, compact=True, compiled=True), (1, min(requested, 9)))
+            self.assertEqual(sp._spherical_block_schedule(128, 512 * 512, 32,
+                compact=True, compiled=True), (32, 4))
+        with mock.patch.object(sp, '_cpu_count', return_value=2):
+            self.assertEqual(sp._spherical_block_schedule(1931, 3064 * 3022, 32,
+                compact=True, compiled=True), (1, 2))
+
+    def test_compiled_reader_promotion_joins_source_borrowers_at_both_fanouts(self):
+        for workers in (4, 9):
+            with self.subTest(workers=workers):
+                cancel = threading.Event()
+                source = np.arange(128, dtype=np.uint8)
+                source.flags.writeable = False
+                lock = threading.Lock()
+                active = started = completed = 0
+
+                def project(first, count):
+                    nonlocal active, started, completed
+                    with lock:
+                        active += 1
+                        started += 1
+                    try:
+                        if first == 0:
+                            return int(source[0])
+                        while not cancel.wait(.01):
+                            _ = int(source[first % len(source)])
+                        raise CancelledError('Reader stopped after promotion')
+                    finally:
+                        with lock:
+                            active -= 1
+                            completed += 1
+
+                with mock.patch.object(sp, '_spherical_block_schedule', return_value=(1, workers)), \
+                     mock.patch.object(sp, '_CUDA_RECHECK_SECONDS', .02):
+                    blocks = sp._ordered_spherical_blocks(
+                        project, workers + 1, 1, workers, cancel_event=cancel,
+                        compact=True, compiled=True, while_waiting=lambda: True)
+                    try:
+                        self.assertEqual(next(blocks), (0, 0))
+                        self.assertEqual(next(blocks), (1, None))
+                    finally:
+                        blocks.close()
+                self.assertTrue(cancel.is_set())
+                self.assertFalse(source.flags.writeable)
+                self.assertEqual(active, 0)
+                self.assertEqual(started, completed)
+                self.assertGreaterEqual(started, 2)
+
+    @unittest.skipUnless(hasattr(compiled._compiled_pull_spherical_f64, 'signatures'), 'Numba is optional')
+    def test_four_and_nine_compiled_readers_publish_identical_ordered_blocks(self):
+        source = self.source.copy()
+        source.flags.writeable = False
+        compiled.prepare_spherical_chunk_numba(
+            source, self.view, self.radii, self.rotation, self.shape)
+
+        def project(first, count):
+            return sp._project_spherical_encoded_block(
+                source, self.view, self.radii, self.rotation, self.shape,
+                first, count, cpu_pull=compiled.pull_spherical_chunk_numba, packed=True)
+
+        results = []
+        for workers in (4, 9):
+            with mock.patch.object(sp, '_spherical_block_schedule', return_value=(1, workers)):
+                blocks = list(sp._ordered_spherical_blocks(
+                    project, self.shape[0], self.shape[1] * self.shape[2], workers,
+                    compact=True, compiled=True))
+            self.assertEqual([first for first, _ in blocks], list(range(self.shape[0])))
+            results.append(tuple((block.first_z, block.records, block.payload.tobytes())
+                                 for _, block in blocks))
+        self.assertEqual(results[0], results[1])
+        self.assertFalse(source.flags.writeable)
 
     def test_raw_crops_normalize_bool_and_255_source_to_binary(self):
         for source in (self.source.astype(bool), self.source * np.uint8(255)):

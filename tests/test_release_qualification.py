@@ -61,8 +61,15 @@ def test_success_runs_whole_suite_then_inventory_then_snapshot(qualification_wor
     def succeed(command, **kwargs):
         commands.append(command)
         assert kwargs['cwd'] == gate.ROOT
-        assert kwargs['env']['PYTHONIOENCODING'] == 'utf-8'
-        assert 'PYTHONOPTIMIZE' not in kwargs['env']
+        env = kwargs['env']
+        assert env['PYTHONIOENCODING'] == 'utf-8'
+        assert 'PYTHONOPTIMIZE' not in env
+        for name, dirname in (
+                ('TEMP', 'runtime-temp'), ('TMP', 'runtime-temp'),
+                ('TMPDIR', 'runtime-temp'), ('CUPY_CACHE_DIR', 'cupy-cache'),
+                ('NUMBA_CACHE_DIR', 'numba-cache'), ('CUDA_CACHE_PATH', 'cuda-cache')):
+            assert Path(env[name]) == output / dirname
+            assert Path(env[name]).is_dir()
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(gate.subprocess, 'run', succeed)

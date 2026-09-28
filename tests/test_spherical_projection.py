@@ -187,6 +187,7 @@ class SphericalProjectionTests(unittest.TestCase):
             return original(*args, **kwargs)
 
         with mock.patch.object(sp, '_PULL_CHUNK_VOXELS', 3), \
+                mock.patch.object(sp, 'spherical_cpu_compiled_requested', return_value=False), \
                 mock.patch.object(sp, '_OUTPUT_BLOCK_BYTES', 99), \
                 mock.patch.object(sp, '_cpu_count', return_value=3), \
                 mock.patch.object(sp, '_pull_spherical_chunk', side_effect=pull), \
