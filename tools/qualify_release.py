@@ -116,9 +116,21 @@ def qualify(output: Path, *, snapshot: bool, gpu_lock_timeout: float,
         raise FileExistsError(f'Use a new output directory; qualification already exists: {receipt_path}')
     env = os.environ.copy()
     env.pop('PYTHONOPTIMIZE', None)
+    generated_dirs = {
+        'runtime-temp': output / 'runtime-temp',
+        'cupy-cache': output / 'cupy-cache',
+        'numba-cache': output / 'numba-cache',
+        'cuda-cache': output / 'cuda-cache',
+    }
+    for directory in generated_dirs.values():
+        directory.mkdir(parents=True, exist_ok=True)
+    runtime_temp = str(generated_dirs['runtime-temp'])
     env.update(PYTHONDONTWRITEBYTECODE='1', PYTHONUTF8='1', PYTHONIOENCODING='utf-8',
                PYTHONPATH=str(ROOT), YOLO_CONFIG_DIR=str(output / 'ultralytics-config'),
-               XTA_TEST_REPO=str(ROOT))
+               XTA_TEST_REPO=str(ROOT), TEMP=runtime_temp, TMP=runtime_temp,
+               TMPDIR=runtime_temp, CUPY_CACHE_DIR=str(generated_dirs['cupy-cache']),
+               NUMBA_CACHE_DIR=str(generated_dirs['numba-cache']),
+               CUDA_CACHE_PATH=str(generated_dirs['cuda-cache']))
     Path(env['YOLO_CONFIG_DIR']).mkdir(parents=True, exist_ok=True)
     if cpu_only:
         env['CUDA_VISIBLE_DEVICES'] = ''

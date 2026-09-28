@@ -1,6 +1,7 @@
 """Release checks may share work only within one immutable verification pass."""
 from __future__ import annotations
 
+import copy
 import json
 from unittest import mock
 
@@ -11,13 +12,36 @@ from tools import verify_package_inventory as inventory
 
 def test_real_successor_contract_is_checked_once_per_context():
     manifest = json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
-    original = inventory.reviewed_v23_0_2_release_contract
+    predecessor = inventory.reviewed_v23_0_2_release_contract
+    latest = inventory.reviewed_v23_0_3_release_contract
     token = inventory._ACTIVE_REVIEW_AUTH_CACHE.set(set())
     try:
-        with mock.patch.object(inventory, 'reviewed_v23_0_2_release_contract', wraps=original) as check:
+        with mock.patch.object(inventory, 'reviewed_v23_0_2_release_contract', wraps=predecessor) as prior_check, \
+             mock.patch.object(inventory, 'reviewed_v23_0_3_release_contract', wraps=latest) as latest_check:
             inventory._without_reviewed_v23_0_2_release(manifest)
             inventory._without_reviewed_v23_0_2_release(manifest)
-            assert check.call_count == 1
+            assert prior_check.call_count == 1
+            assert latest_check.call_count == 1
+    finally:
+        inventory._ACTIVE_REVIEW_AUTH_CACHE.reset(token)
+
+
+def test_latest_successor_tampering_is_rechecked_in_a_new_pass():
+    manifest = json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
+    token = inventory._ACTIVE_REVIEW_AUTH_CACHE.set(set())
+    try:
+        inventory._without_reviewed_v23_0_3_release(manifest)
+    finally:
+        inventory._ACTIVE_REVIEW_AUTH_CACHE.reset(token)
+
+    altered = copy.deepcopy(manifest)
+    altered['v23_0_3_release_review']['feature'] = 'tampered'
+    token = inventory._ACTIVE_REVIEW_AUTH_CACHE.set(set())
+    try:
+        with pytest.raises(RuntimeError, match='review digest mismatch'):
+            inventory._without_reviewed_v23_0_3_release(altered)
+        with pytest.raises(RuntimeError, match='review digest mismatch'):
+            inventory._without_reviewed_v23_0_3_release(altered)
     finally:
         inventory._ACTIVE_REVIEW_AUTH_CACHE.reset(token)
 

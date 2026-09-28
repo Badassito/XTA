@@ -18,7 +18,7 @@ from collections import Counter, deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
 
@@ -30,6 +30,22 @@ from .geometry import ViewInfo
 from .cylindrical_owner import is_radial_owner_task
 from .runtime import _MemfdTransferBatch, runtime_trace_event
 from .scheduler_diagnostics import scheduler_operation, scheduler_step
+
+
+_SELECTION_KEY_UNSET = object()
+
+
+@dataclass(frozen=True)
+class _SelectionTaskDescriptor:
+    """Only value-derived task keys; no task or workspace objects are retained."""
+
+    fingerprint: Tuple[object, ...]
+    parent: Optional[Tuple[str, str]]
+    direct_parent: Optional[Tuple[str, str]]
+    d1_parent: Optional[Tuple[str, str]]
+    hybrid_parent: Optional[Tuple[str, str]]
+    mode: str
+    hybrid_origin: bool
 
 
 @dataclass
@@ -379,6 +395,7 @@ class TtaScheduler:
         self._state_owner_bind_lock = threading.Lock()
         self._result_processing_depth = 0
         self._credit_checkpoint_active = False
+        self._selection_task_descriptors: Dict[int, _SelectionTaskDescriptor] = {}
 
     def _telemetry_add(self, name: str, value: object = 1) -> None:
         telemetry = self.operations.runtime_telemetry()
@@ -949,6 +966,46 @@ class TtaScheduler:
         if view_name is None:
             return None
         return (str(task.get('model_name', '')), str(view_name))
+
+    def _selection_task_descriptor(
+        self, task_id: int, task: Dict[str, object],
+    ) -> _SelectionTaskDescriptor:
+        """Reuse static identities while observing every mutable task contract.
+
+        Runtime/CPU/tail splitting changes counts and adds new task IDs; hybrid first
+        claims change result mode. Neither duration nor admission is retained here.
+        The view name is compared by value, so replacing or editing a view cannot
+        leave a stale parent key. No task, view, or buffer is kept alive by the cache.
+        """
+        view = task.get('view')
+        view_name = getattr(view, 'name', _SELECTION_KEY_UNSET) if view is not None else _SELECTION_KEY_UNSET
+        mode = str(task.get('result_mode', 'file'))
+        fingerprint = (
+            str(task.get('kind', '')), str(task.get('model_name', '')),
+            view is not None, view_name is not _SELECTION_KEY_UNSET,
+            str(view_name) if view_name is not _SELECTION_KEY_UNSET else '', mode,
+            bool(task.get('bounded_parent_admission', False)),
+            bool(task.get('hybrid_cpu_eligible_origin', False)),
+            bool(self.inputs.v1613_d1_owner_active),
+        )
+        cached = self._selection_task_descriptors.get(int(task_id))
+        if cached is not None and cached.fingerprint == fingerprint:
+            return cached
+        # Keep the direct-union policy validation in its original position before
+        # any admission check. The other keys have no mutable capacity component.
+        direct_parent = self.direct_union_task_key(task)
+        parent = self.gpu_worker_fullframe_parent_key(task)
+        descriptor = _SelectionTaskDescriptor(
+            fingerprint=fingerprint,
+            parent=parent,
+            direct_parent=direct_parent,
+            d1_parent=parent if self.inputs.v1613_d1_owner_active and mode == 'd1_owner' else None,
+            hybrid_parent=parent if bool(task.get('hybrid_cpu_eligible_origin', False)) else None,
+            mode=mode,
+            hybrid_origin=bool(task.get('hybrid_cpu_eligible_origin', False)),
+        )
+        self._selection_task_descriptors[int(task_id)] = descriptor
+        return descriptor
 
     def hybrid_task_parent_key(self,
         task: Dict[str, object],
@@ -1925,14 +1982,21 @@ class TtaScheduler:
         return sum(self._direct_union_parent_bytes(member)
                    for member in self._direct_union_admission_tasks(task))
 
-    def direct_union_task_admissible(self, task: Dict[str, object]) -> bool:
-        key = self.direct_union_task_key(task)
+    def direct_union_task_admissible(
+        self, task: Dict[str, object], *,
+        precomputed_key: object = _SELECTION_KEY_UNSET,
+        admission_totals: Optional[Tuple[int, int, int]] = None,
+    ) -> bool:
+        key: Optional[Tuple[str, str]] = (
+            self.direct_union_task_key(task) if precomputed_key is _SELECTION_KEY_UNSET
+            else cast(Optional[Tuple[str, str]], precomputed_key)
+        )
         if key is None or not self.inputs.direct_union_sparse_retirement_active:
             return True
         members = self._direct_union_admission_tasks(task)
         active_members = 0
         for member in members:
-            member_key = self.direct_union_task_key(member)
+            member_key = key if member is task else self.direct_union_task_key(member)
             if member_key in self.state.direct_union_postprocess_views:
                 # A final chunk handed this buffer to CPU/NRRD work. A pending inference
                 # task must never reopen it, even if another policy sibling is still live.
@@ -1955,14 +2019,21 @@ class TtaScheduler:
                 f'{self.inputs.direct_union_total_dense_byte_limit / self.inputs.gib:.1f} GiB '
                 'bounded parent dense limit'
             )
-        active_groups = {
-            self.state.direct_union_admission_group_by_parent.get(parent, parent)
-            for parent in self.state.direct_union_inference_views
-        }
-        if len(active_groups) >= int(self.inputs.direct_union_inference_view_limit):
+        if admission_totals is None:
+            active_groups = {
+                self.state.direct_union_admission_group_by_parent.get(parent, parent)
+                for parent in self.state.direct_union_inference_views
+            }
+            if len(active_groups) >= int(self.inputs.direct_union_inference_view_limit):
+                return False
+            admission_totals = (
+                len(active_groups),
+                int(sum(self.state.direct_union_inference_bytes.values())),
+                int(sum(self.state.direct_union_postprocess_bytes.values())),
+            )
+        active_group_count, inference_active, postprocess_active = admission_totals
+        if int(active_group_count) >= int(self.inputs.direct_union_inference_view_limit):
             return False
-        inference_active = int(sum(self.state.direct_union_inference_bytes.values()))
-        postprocess_active = int(sum(self.state.direct_union_postprocess_bytes.values()))
         total_active = int(inference_active + postprocess_active)
         inference_ok = bool(
             not self.state.direct_union_inference_views
@@ -2087,6 +2158,7 @@ class TtaScheduler:
         direct_parents: Dict[int, Optional[Tuple[str, str]]] = {}
         classification_keys: Dict[int, Tuple[object, ...]] = {}
         direct_admission: Dict[Tuple[object, ...], bool] = {}
+        admission_totals: Optional[Tuple[int, int, int]] = None
         d1_feasibility: Dict[Optional[Tuple[str, str]], List[int]] = {}
         classifications: Dict[Tuple[object, ...], Tuple[bool, bool]] = {}
         selection_ranks: Dict[Tuple[object, ...], int] = {}
@@ -2127,8 +2199,18 @@ class TtaScheduler:
             task = tasks[task_id]
             if not bool(task.get('gpu_eligible', self.inputs.gpu_worker_process_active)):
                 continue
-            direct_parent = self.direct_union_task_key(task)
+            descriptor = self._selection_task_descriptor(task_id, task)
+            direct_parent = descriptor.direct_parent
             direct_parents[task_id] = direct_parent
+            if direct_parent is not None and admission_totals is None:
+                admission_totals = (
+                    len({
+                        self.state.direct_union_admission_group_by_parent.get(parent, parent)
+                        for parent in self.state.direct_union_inference_views
+                    }),
+                    int(sum(self.state.direct_union_inference_bytes.values())),
+                    int(sum(self.state.direct_union_postprocess_bytes.values())),
+                )
             shape = task.get('processing_shape', ())
             # An ordinary parent's explicit dense shape completely determines its
             # memory request. Heterogeneous/fallback shapes and policy groups retain
@@ -2138,20 +2220,24 @@ class TtaScheduler:
                 and isinstance(shape, (tuple, list)) and len(shape) == 3
                 and all(isinstance(value, (int, np.integer)) for value in shape))
             if shared_admission:
-                admission_key = (direct_parent, str(task.get('result_mode', 'file')),
+                admission_key = (direct_parent, descriptor.mode,
                                  tuple(shape))
                 if admission_key not in direct_admission:
-                    direct_admission[admission_key] = self.direct_union_task_admissible(task)
+                    direct_admission[admission_key] = self.direct_union_task_admissible(
+                        task, precomputed_key=direct_parent, admission_totals=admission_totals,
+                    )
                 admissible = direct_admission[admission_key]
             else:
-                admissible = self.direct_union_task_admissible(task)
+                admissible = self.direct_union_task_admissible(
+                    task, precomputed_key=direct_parent, admission_totals=admission_totals,
+                )
             if not admissible:
                 continue
             if not self.tile_dense_result_task_admissible(task):
                 continue
-            parent = self.gpu_worker_fullframe_parent_key(task)
+            parent = descriptor.parent
             parents[task_id] = parent
-            d1_parent = self.d1_task_parent_key(task)
+            d1_parent = descriptor.d1_parent
             d1_parents[task_id] = d1_parent
             if d1_parent in self.state.d1_groups_by_parent:
                 # Existing groups bind individual task IDs to different workers.
@@ -2163,7 +2249,7 @@ class TtaScheduler:
             if not feasible:
                 continue
             classification_keys[task_id] = (parent, d1_parent,
-                str(task.get('result_mode', 'file')), bool(task.get('hybrid_cpu_eligible_origin', False)))
+                descriptor.mode, descriptor.hybrid_origin)
             feasible_by_id[int(task_id)] = feasible
             eligible.append((int(position), int(task_id)))
         if not eligible:

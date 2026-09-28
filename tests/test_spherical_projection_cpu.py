@@ -137,7 +137,14 @@ class SphericalCompiledAdmissionTests(unittest.TestCase):
         self.rotation = np.asarray(self.view.spherical_rotation_xyz).reshape(3, 3)
         self.arguments = (self.source, self.view, self.radii, self.rotation, self.shape, None)
 
-    def test_default_does_not_import_optional_compiler(self):
+    def test_default_selects_exact_compiled_cpu_when_available(self):
+        pull = object()
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(candidate, 'prepare_spherical_chunk_numba', return_value=pull) as prepare:
+            self.assertIs(reference._select_spherical_cpu_pull(*self.arguments), pull)
+        prepare.assert_called_once()
+
+    def test_explicit_opt_out_does_not_import_optional_compiler(self):
         with mock.patch.dict(os.environ, {'YOLO_TTA_CPU_SPHERICAL_COMPILED': '0'}), \
                 mock.patch.dict(sys.modules, {'XTA.spherical_projection_cpu': None}):
             self.assertIsNone(reference._select_spherical_cpu_pull(*self.arguments))

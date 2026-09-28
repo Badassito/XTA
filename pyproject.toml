@@ -42,7 +42,7 @@ version = {attr = "XTA.__version__"}
 [tool.setuptools.data-files]
 "share/xta" = [
   "ARCHITECTURE.md",
-  "GPT-6-Astra-Ultra_v23.0.2_SLURM.py",
+  "GPT-6-Astra-Ultra_v23.0.3_SLURM.py",
 ]
 "share/xta/tools" = [
   "tools/compare_reconciliation.py",
@@ -54,6 +54,8 @@ version = {attr = "XTA.__version__"}
   "tools/export_reconciliation_evidence.py",
   "tools/qualify_tta_reconciliation.py",
   "tools/qualify_confidence_consolidation.py",
+  "tools/qualify_radial_bitset_compaction.py",
+  "tools/qualify_d1_confidence_masked_transfer.py",
   "tools/tta_augmentation_smoke.py",
   "tools/check_tta_augmentation_run.py",
   "tools/benchmark_tta_augmentation.py",

@@ -17,12 +17,17 @@ import numpy as np
 
 from ._deps import _numba
 from .cylindrical_cuda_projection import RadialCudaProjectionUnsafeFailure, _CROP_METADATA_DTYPE
+from .cylindrical_bitset_compaction import (
+    RadialBitsetCompactionUnavailable,
+    export_owner_bitset_blocks,
+)
 
 RADIAL_OWNER_CONTRACT = 'radial_native_pull_v1'
 _WORK_ITEMS = 64 * 1024 * 1024
 _RESERVE_BYTES = 2 * 1024**3
 _RADIAL_OWNER_STATES = {}
 _RADIAL_OWNER_LOCK = threading.RLock()
+_RADIAL_COMPACTION_PREFLIGHT_ERROR = None
 
 
 class DeviceOnlyRadialTarget:
@@ -60,10 +65,22 @@ def radial_owner_enabled():
     return os.environ.get('YOLO_TTA_RADIAL_OWNER', '1').strip().lower() not in ('', '0', 'false', 'off', 'no')
 
 
+def radial_gpu_bitset_compaction_enabled():
+    """Return exact packed crops from the native owner before host publication."""
+    return all(os.environ.get(name, '1').strip().lower() not in ('', '0', 'false', 'off', 'no')
+               for name in ('YOLO_TTA_RADIAL_GPU_BITSET_COMPACTION',
+                            'YOLO_TTA_PACKED_OWNER_PUBLICATION'))
+
+
 def radial_runtime_provenance():
     from . import outputs
+    from .cuda_d1 import (
+        d1_confidence_gpu_mask_enabled,
+        d1_confidence_gpu_mask_min_pixels,
+    )
     modules = {}
-    for name in ('pipeline', 'workers', 'inference', 'cuda_d1', 'cylindrical_owner', 'outputs',
+    for name in ('pipeline', 'workers', 'inference', 'cuda_d1', 'cylindrical_owner',
+                 'cylindrical_bitset_compaction', 'outputs',
                  'packed_publication', 'publication_memory', 'nrrd_spans', 'topology_runs', 'topology'):
         module = sys.modules.get('XTA.' + name)
         raw_path = getattr(module, '__file__', None)
@@ -75,6 +92,9 @@ def radial_runtime_provenance():
                 modules[name] = {'path': str(path), 'sha256': None, 'read_error': type(exc).__name__}
     sink = outputs.nrrd_layer_sink()
     return {'radial_owner_requested': radial_owner_enabled(),
+        'radial_gpu_bitset_compaction_requested': radial_gpu_bitset_compaction_enabled(),
+        'd1_confidence_gpu_mask_requested': d1_confidence_gpu_mask_enabled(),
+        'd1_confidence_gpu_mask_min_pixels': d1_confidence_gpu_mask_min_pixels(),
         'nrrd_sink_workers_effective': outputs.nrrd_layer_sink_workers(),
         'nrrd_sink_workers_constructed': getattr(sink, 'max_workers', None),
         'nrrd_gzip_workers_effective': outputs.nrrd_gzip_workers(),
@@ -224,6 +244,7 @@ class RadialOwner:
             raise ValueError('Radial owner dimensions exceed int32 kernel addressing')
         self.coverage = np.zeros(view.num_slices, bool)
         self.cp, self.device_index = cp, int(device_index)
+        self._reserve_bytes = int(reserve_bytes)
         self._stream = self._pool = None
         self._arrays = {}
         self.words = self._parents = self._exterior = self._borrowed = self._borrowed_boxes = None
@@ -391,6 +412,25 @@ class RadialOwner:
         with self.cp.cuda.Device(self.device_index), self._stream:
             return self.words.get(stream=self._stream)
 
+    def proven_empty_output(self):
+        """All native chunks were empty, so the initialized output bitset is zero."""
+        return bool(not self._closed and not self._failed
+                    and self.coverage.all() and not self.native_any)
+
+    def host_packed_blocks(self):
+        """Borrow the settled bitset until all packed crops own their host bytes."""
+        if self._closed or self._failed or not self.coverage.all():
+            raise RuntimeError('Cannot compact incomplete/failed/closed Radial coverage')
+        # consume() marks coverage only after fencing every gather. The export
+        # stream therefore reads immutable words, and fences before returning.
+        # Charge its bounded scratch against current free memory and preserve
+        # the same reserve used for owner admission. Setup refusal keeps the
+        # original host-bitset route available.
+        with self.cp.cuda.Device(self.device_index), self.cp.cuda.using_allocator(self._pool.malloc):
+            return export_owner_bitset_blocks(
+                self.words, self.output_shape, self.device_index,
+                reserve_bytes=self._reserve_bytes)
+
     def close(self):
         if self._closed:
             return
@@ -433,7 +473,9 @@ def consume_radial_device_union(task, accumulator, *, target=None):
             from . import cuda_d1
             if _RADIAL_OWNER_STATES or cuda_d1._D1_WORKER_VIEW_STATES:
                 raise RuntimeError('This worker already retains a native Radial owner')
+            setup_started = time.perf_counter()
             owner = RadialOwner(view, shape[1:], output_shape)
+            setup_seconds = time.perf_counter() - setup_started
             owner.key, owner.store_dir = key, Path(task['d1_store_dir'])
             owner.memory_payload_path = task.get('d1_memory_payload_path')
             owner.memory_payload_limit = int(task.get('d1_memory_payload_limit', 0))
@@ -441,6 +483,7 @@ def consume_radial_device_union(task, accumulator, *, target=None):
             owner.projection_kind = RADIAL_OWNER_CONTRACT
             _RADIAL_OWNER_STATES[key] = owner
             print(f'Radial owner admitted {key}: bitset_MiB={owner.words.nbytes / 2**20:.2f}, '
+                  f'setup_s={setup_seconds:.6f}, '
                   f'contract={RADIAL_OWNER_CONTRACT}; native task files and host view union bypassed.', flush=True)
         elif (owner.view != view or owner.mask_shape != shape[1:] or owner.output_shape != output_shape
               or owner.store_dir != Path(task['d1_store_dir'])):
@@ -456,17 +499,56 @@ def consume_radial_device_union(task, accumulator, *, target=None):
         device_hole_filled_frames=count, proto_hole_treated_frames=0)
     if not complete:
         return result
-    words = owner.host_words()
+    proven_empty = owner.proven_empty_output()
+    words = packed_export = None
+    gpu_pack_seconds = host_download_seconds = 0.0
+    if not proven_empty:
+        if (radial_gpu_bitset_compaction_enabled()
+                and _RADIAL_COMPACTION_PREFLIGHT_ERROR is None):
+            pack_started = time.perf_counter()
+            try:
+                packed_export = owner.host_packed_blocks()
+            except RadialBitsetCompactionUnavailable as exc:
+                print(f'Radial GPU bitset compaction unavailable {key}: {exc}; '
+                      'using host-bitset publication.', flush=True)
+            gpu_pack_seconds = time.perf_counter() - pack_started
+        if packed_export is None:
+            download_started = time.perf_counter()
+            words = owner.host_words()
+            host_download_seconds = time.perf_counter() - download_started
+    # Capture sizes before the asynchronous publisher may release its inputs.
+    host_bitset_bytes = 0 if words is None else int(words.nbytes)
+    packed_payload_bytes = 0 if packed_export is None else int(packed_export.payload_bytes)
+    host_transfer_bytes = (host_bitset_bytes if packed_export is None else
+                           packed_payload_bytes + int(packed_export.metadata_d2h_bytes))
+    export_kind = ('empty' if proven_empty else
+                   'gpu_packed' if packed_export is not None else 'host_bitset')
+    release_started = time.perf_counter()
     owner.close()
+    gpu_release_seconds = time.perf_counter() - release_started
     with _RADIAL_OWNER_LOCK:
         if _RADIAL_OWNER_STATES.pop(key) is not owner:
             raise RuntimeError('Radial ownership changed during completion')
     from .cuda_d1 import _d1_submit_publication
-    result['d1_bitset_words'] = len(words)
-    result['_publication_future'] = _d1_submit_publication(words=words, state=owner)
+    result['d1_bitset_words'] = (math.prod(output_shape) + 31) // 32
+    result['d1_bitset_export_kind'] = export_kind
+    result['d1_bitset_host_transfer_bytes'] = host_transfer_bytes
+    submit_started = time.perf_counter()
+    if packed_export is None:
+        result['_publication_future'] = _d1_submit_publication(
+            words=words, state=owner, proven_empty=proven_empty)
+    else:
+        result['_publication_future'] = _d1_submit_publication(
+            words=None, state=owner, encoded_blocks=packed_export.blocks)
+    publication_submit_seconds = time.perf_counter() - submit_started
     result['d1_view_compute_seconds'] = time.perf_counter() - owner.created_at
     print(f'Radial owner complete {key}: coverage={covered}/{view.num_slices}, '
           f'native_cleanup_s={owner.cleanup_seconds:.6f}, gather_s={owner.projection_seconds:.6f}; '
+          f'host_download_s={host_download_seconds:.6f}, gpu_release_s={gpu_release_seconds:.6f}, '
+          f'publication_submit_s={publication_submit_seconds:.6f}, '
+          f'gpu_pack_s={gpu_pack_seconds:.6f}, export_kind={export_kind}, '
+          f'host_bitset_bytes={host_bitset_bytes}, packed_payload_bytes={packed_payload_bytes}, '
+          f'host_transfer_bytes={host_transfer_bytes}, empty_shortcut={int(proven_empty)}; '
           'source-space publication queued without parent radial projection.', flush=True)
     return result
 
@@ -478,6 +560,8 @@ def active_radial_owners():
 
 def preflight_radial_owner():
     """Compile and execute native cleanup/gather before a worker accepts tasks."""
+    global _RADIAL_COMPACTION_PREFLIGHT_ERROR
+    _RADIAL_COMPACTION_PREFLIGHT_ERROR = None
     from . import geometry, cylindrical_projection as reference
     import cupy as cp
     view = geometry.get_view_infos(7, 9, 11, cartesian_views=(), radial_views=('transverse',),
@@ -499,6 +583,32 @@ def preflight_radial_owner():
         decoded = ((words[flat // 32] >> (flat % 32).astype(np.uint32)) & 1).astype(np.uint8)
         if not np.array_equal(decoded, expected.reshape(-1)) or not np.array_equal(device.get(), expected_native):
             raise RuntimeError('Native Radial owner preflight disagreed with its CPU reference')
+        if radial_gpu_bitset_compaction_enabled():
+            try:
+                exported = active.host_packed_blocks()
+            except RadialBitsetCompactionUnavailable as exc:
+                # Warm optional kernels before inference. A setup-only refusal
+                # selects the existing host path without retrying failed compiler
+                # setup at every view completion. Runtime/parity failures abort.
+                _RADIAL_COMPACTION_PREFLIGHT_ERROR = str(exc)
+                print(f'Radial GPU bitset compaction preflight unavailable: {exc}; '
+                      'using host-bitset publication.', flush=True)
+            else:
+                compact = np.zeros_like(expected)
+                for block in exported.blocks:
+                    for record in block.records:
+                        if not record.foreground:
+                            continue
+                        height, width = record.y1 - record.y0, record.x1 - record.x0
+                        payload = block.payload[record.offset:record.offset + record.size]
+                        unpacked = np.unpackbits(payload.reshape(height, (width + 7) // 8),
+                                                 axis=1, bitorder='little')
+                        if unpacked[:, width:].any():
+                            raise RuntimeError('Radial packed preflight has nonzero padding bits')
+                        compact[record.z, record.y0:record.y1, record.x0:record.x1] = unpacked[:, :width]
+                if not np.array_equal(compact, expected):
+                    raise RuntimeError('Radial packed preflight disagreed with its CPU reference')
+                print('Radial GPU bitset compaction preflight passed: exact packed source crops.', flush=True)
     finally:
         active.close()
     print('Native Radial owner preflight passed: exact native cleanup and shell-bucketed CUDA gather.', flush=True)

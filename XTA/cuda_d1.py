@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import math
+import operator
 import os
 import re
 import sys
@@ -28,6 +29,7 @@ from typing import (
     Tuple,
 )
 import numpy as np
+from .cylindrical_cuda_projection import RadialEncodedBlock, RadialEncodedSlice
 from .packed_publication import encode_owner_packed_block, _packed_owner_metadata
 from .publication_memory import publication_ram_headroom
 
@@ -574,6 +576,16 @@ def d1_confidence_retirement_host_bytes() -> int:
     return max(16, min(4096, _env_int('YOLO_TTA_D1_CONFIDENCE_HOST_MIB', 512))) * 1024**2
 
 
+def d1_confidence_gpu_mask_enabled() -> bool:
+    """Apply the mask on CUDA before downloading supported score crops."""
+    return _env_flag('YOLO_TTA_D1_GPU_MASK_CONFIDENCE', True)
+
+
+def d1_confidence_gpu_mask_min_pixels() -> int:
+    """Avoid an extra CUDA launch for tiny score crops by default."""
+    return max(0, _env_int('YOLO_TTA_D1_GPU_MASK_MIN_PIXELS', 128**2))
+
+
 def _d1_confidence_pool():
     global _D1_CONFIDENCE_POOL
     from .d1_confidence_retirement import HostPublicationPool
@@ -902,9 +914,63 @@ def _d1_unpack_bitset_z_block(
         dtype=np.uint8,
     )
 
+def _validate_encoded_publication_blocks(
+    blocks: Tuple[RadialEncodedBlock, ...],
+    output_shape: Tuple[int, int, int],
+    *,
+    packed: bool,
+) -> None:
+    """Prove that detached host crops own one exact, ordered output volume."""
+    if not isinstance(blocks, tuple) or not blocks:
+        raise ValueError('Encoded publication requires a nonempty tuple of blocks')
+    depth, height, width = (int(value) for value in output_shape)
+    if min(depth, height, width) <= 0:
+        raise ValueError('Encoded publication requires positive output dimensions')
+    next_z = 0
+    for block in blocks:
+        if not isinstance(block, RadialEncodedBlock):
+            raise TypeError('Encoded publication requires RadialEncodedBlock values')
+        if not isinstance(block.records, tuple) or not block.records:
+            raise ValueError('Encoded publication blocks require nonempty record tuples')
+        if type(block.packed) is not bool or block.packed != bool(packed):
+            raise ValueError('Encoded publication packed mode differs from the writer')
+        payload = block.payload
+        if (not isinstance(payload, np.ndarray) or payload.dtype != np.uint8
+                or payload.ndim != 1 or not payload.flags.c_contiguous
+                or not payload.flags.owndata or payload.flags.writeable):
+            raise ValueError('Encoded publication payload must own readonly contiguous CPU uint8 bytes')
+        first_z = operator.index(block.first_z)
+        if first_z != next_z or first_z + len(block.records) > depth:
+            raise ValueError('Encoded publication blocks do not cover consecutive output slices')
+        offset = 0
+        for local, record in enumerate(block.records):
+            if not isinstance(record, RadialEncodedSlice):
+                raise TypeError('Encoded publication requires immutable RadialEncodedSlice records')
+            z, y0, y1, x0, x1, foreground, at, size = (
+                operator.index(getattr(record, name)) for name in
+                ('z', 'y0', 'y1', 'x0', 'x1', 'foreground', 'offset', 'size')
+            )
+            if (z != first_z + local or not (0 <= y0 <= y1 <= height)
+                    or not (0 <= x0 <= x1 <= width)):
+                raise ValueError('Encoded publication record has invalid coordinates')
+            area = (y1 - y0) * (x1 - x0)
+            expected_size = (y1 - y0) * (((x1 - x0 + 7) // 8) if packed else (x1 - x0))
+            if (foreground < 0 or foreground > area or at != offset
+                    or size != expected_size or (foreground == 0 and area != 0)
+                    or (foreground > 0 and area == 0)
+                    or (foreground == 0 and (y0, y1, x0, x1) != (0, 0, 0, 0))):
+                raise ValueError('Encoded publication record has invalid count, size or offset')
+            offset += size
+        if offset != int(payload.size):
+            raise ValueError('Encoded publication payload size differs from its records')
+        next_z += len(block.records)
+    if next_z != depth:
+        raise ValueError('Encoded publication does not cover every output slice')
+
+
 def _d1_finalize_bitset_layer(
     *,
-    words: np.ndarray,
+    words: Optional[np.ndarray],
     output_shape: Tuple[int, int, int],
     store_dir: Path,
     model_name: str,
@@ -913,13 +979,23 @@ def _d1_finalize_bitset_layer(
     memory_payload_path: Optional[str] = None,
     memory_payload_limit: int = 0,
     memory_payload_reserve: int = 0,
+    proven_empty: bool = False,
+    encoded_blocks: Optional[Tuple[RadialEncodedBlock, ...]] = None,
+    encoded_packed: Optional[bool] = None,
 ) -> Dict[str, object]:
     """Stream the completed owner bitset into a path-backed cvol and return its layer ref."""
+    if sum((words is not None, bool(proven_empty), encoded_blocks is not None)) != 1:
+        raise ValueError('Publication requires exactly one of words, proven-empty, or encoded blocks')
+    if encoded_blocks is None and encoded_packed is not None:
+        raise ValueError('Packed-mode override requires encoded blocks')
     key = _nrrd_layer_key(
         view_name=str(view.name), source='fullframe', mask_kind='yolo',
         pass_index=0, stage='pre_interpolation',
     )
-    packed = _env_flag('YOLO_TTA_PACKED_OWNER_PUBLICATION', True)
+    packed = (_env_flag('YOLO_TTA_PACKED_OWNER_PUBLICATION', True)
+              if encoded_packed is None else bool(encoded_packed))
+    if encoded_blocks is not None:
+        _validate_encoded_publication_blocks(encoded_blocks, output_shape, packed=packed)
     store_format = INTERNAL_PACKED_CVOL_FORMAT if packed else CVOL_FORMAT
     direct_packed = bool(packed and _packed_owner_metadata is not None)
     writer = IncrementalRawBBoxMaskStoreWriter(
@@ -940,6 +1016,7 @@ def _d1_finalize_bitset_layer(
     plane_bytes = max(1, int(output_shape[1]) * int(output_shape[2]))
     target_bytes = int(d1_unpack_target_mib()) * 1024 * 1024
     block_z = max(1, min(int(output_shape[0]), int(target_bytes // plane_bytes)))
+    encoded_block_index = 0
     try:
         for z0 in range(0, int(output_shape[0]), int(block_z)):
             z1 = min(int(output_shape[0]), int(z0) + int(block_z))
@@ -948,6 +1025,35 @@ def _d1_finalize_bitset_layer(
                 if (writer._next_offset + growth > int(memory_payload_limit)
                         or publication_ram_headroom() < int(memory_payload_reserve) + growth):
                     writer.spill_payload_to_disk()
+            if proven_empty:
+                writer.consume_empty_range(int(z0), int(z1 - z0))
+                continue
+            if encoded_blocks is not None:
+                # Keep the established Z-band admission/spill boundaries even when
+                # device blocks have a different depth. Rebase record offsets into
+                # each owned block's contiguous host payload view.
+                z = int(z0)
+                while z < int(z1):
+                    block = encoded_blocks[encoded_block_index]
+                    local = int(z - block.first_z)
+                    take = min(int(z1 - z), int(len(block.records) - local))
+                    selected = block.records[local:local + take]
+                    first_byte = int(selected[0].offset)
+                    last_byte = int(selected[-1].offset + selected[-1].size)
+                    if all(int(record.foreground) == 0 for record in selected):
+                        writer.consume_empty_range(int(z), int(take))
+                    else:
+                        rebased = tuple(RadialEncodedSlice(
+                            record.z, record.y0, record.y1, record.x0, record.x1,
+                            record.foreground, int(record.offset) - first_byte, record.size,
+                        ) for record in selected)
+                        writer.consume_encoded_block(
+                            int(z), rebased, block.payload[first_byte:last_byte], packed=packed,
+                        )
+                    z += int(take)
+                    if local + take == len(block.records):
+                        encoded_block_index += 1
+                continue
             start = int(z0) * int(plane_bytes)
             stop = int(z1) * int(plane_bytes)
             w0 = int(start // 32)
@@ -978,7 +1084,8 @@ def _d1_finalize_bitset_layer(
     finally:
         # Permit the 2+ GiB host word copy to be reclaimed before NRRD compression starts.
         try:
-            words.resize((0,), refcheck=False)
+            if words is not None:
+                words.resize((0,), refcheck=False)
         except Exception:
             pass
 
@@ -1020,9 +1127,19 @@ def _d1_finalize_bitset_layer(
 
 def _d1_submit_publication(
     *,
-    words: np.ndarray,
+    words: Optional[np.ndarray],
     state: _D1WorkerViewState,
+    proven_empty: bool = False,
+    encoded_blocks: Optional[Tuple[RadialEncodedBlock, ...]] = None,
 ) -> Future:
+    if sum((words is not None, bool(proven_empty), encoded_blocks is not None)) != 1:
+        raise ValueError('Publication requires exactly one of words, proven-empty, or encoded blocks')
+    encoded_packed = None
+    if encoded_blocks is not None:
+        encoded_packed = _env_flag('YOLO_TTA_PACKED_OWNER_PUBLICATION', True)
+        _validate_encoded_publication_blocks(
+            encoded_blocks, state.output_shape, packed=encoded_packed,
+        )
     executor = _d1_publication_executor()
     semaphore = _D1_PUBLICATION_SEMAPHORE
     if semaphore is None:
@@ -1030,6 +1147,7 @@ def _d1_submit_publication(
     semaphore.acquire()
 
     def _publish() -> Dict[str, object]:
+        nonlocal words, encoded_blocks
         started = time.perf_counter()
         try:
             result = _d1_finalize_bitset_layer(
@@ -1042,10 +1160,21 @@ def _d1_submit_publication(
                 memory_payload_path=getattr(state, 'memory_payload_path', None),
                 memory_payload_limit=getattr(state, 'memory_payload_limit', 0),
                 memory_payload_reserve=getattr(state, 'memory_payload_reserve', 0),
+                proven_empty=proven_empty,
+                encoded_blocks=encoded_blocks,
+                encoded_packed=encoded_packed,
             )
             result['d1_publication_seconds'] = max(0.0, time.perf_counter() - started)
             return result
+        except BaseException as exc:
+            # Failed futures retain their traceback. Release inactive writer
+            # frames before returning the credit, so a failed encoded block
+            # cannot pin its detached host payload for the worker's lifetime.
+            import traceback
+            traceback.clear_frames(exc.__traceback__)
+            raise
         finally:
+            words = encoded_blocks = None
             semaphore.release()
 
     try:
@@ -1650,15 +1779,56 @@ class _D1ConfidenceCropReader:
 def _d1_copy_confidence_crop(scores, masks, index, box, metrics):
     y0,y1,x0,x1 = box
     started = time.perf_counter()
-    score = scores[index, y0:y1, x0:x1].detach().cpu().numpy()
-    mask = masks[index, y0:y1, x0:x1].detach().cpu().numpy()
-    metrics['transfer_seconds'] += time.perf_counter() - started
-    if score.dtype != np.uint8 or mask.dtype != np.uint8:
-        raise TypeError('D1 confidence retirement requires uint8 score and mask tensors')
-    values = np.array(score, dtype=np.uint8, copy=True)
-    values[mask == 0] = np.uint8(0)
-    metrics['d2h_bytes'] += int(score.nbytes + mask.nbytes)
-    metrics['d2h_calls'] += 2
+    score_crop = scores[index, y0:y1, x0:x1]
+    mask_crop = masks[index, y0:y1, x0:x1]
+    gpu_masked = False
+    cuda_pair = (bool(getattr(score_crop, 'is_cuda', False))
+                 and bool(getattr(mask_crop, 'is_cuda', False))
+                 and getattr(score_crop, 'device', None) == getattr(mask_crop, 'device', None))
+    requested = d1_confidence_gpu_mask_enabled()
+    min_pixels = d1_confidence_gpu_mask_min_pixels()
+    pixels = (y1-y0) * (x1-x0)
+    if requested and cuda_pair and pixels < min_pixels:
+        metrics['gpu_mask_small_crops'] += 1
+    if requested and cuda_pair and pixels >= min_pixels:
+        import torch
+        if torch.is_tensor(score_crop) and torch.is_tensor(mask_crop):
+            if score_crop.dtype != torch.uint8 or mask_crop.dtype != torch.uint8:
+                raise TypeError('D1 confidence retirement requires uint8 score and mask tensors')
+            # The D1 callback runs after the accumulator's producer-stream fence.
+            # The masked crop and its synchronous D2H share this thread's CUDA
+            # stream; neither a device view nor its temporary escapes retirement.
+            masked = None
+            try:
+                masked = torch.where(mask_crop != 0, score_crop, 0)
+                score = masked.detach().cpu().numpy()
+                del masked
+            except torch.cuda.OutOfMemoryError:
+                # A bounded crop can still meet a transient device-memory peak.
+                # Recover only allocation failures; other CUDA errors remain fatal.
+                masked = None
+                metrics['gpu_mask_oom_fallbacks'] += 1
+            else:
+                gpu_masked = True
+                transfer_ended = time.perf_counter()
+    if gpu_masked:
+        if score.dtype != np.uint8:
+            raise TypeError('D1 confidence retirement requires uint8 score and mask tensors')
+        values = np.array(score, dtype=np.uint8, copy=True)
+        metrics['d2h_bytes'] += int(score.nbytes)
+        metrics['d2h_calls'] += 1
+        metrics['gpu_masked_crops'] += 1
+    else:
+        score = score_crop.detach().cpu().numpy()
+        mask = mask_crop.detach().cpu().numpy()
+        transfer_ended = time.perf_counter()
+        if score.dtype != np.uint8 or mask.dtype != np.uint8:
+            raise TypeError('D1 confidence retirement requires uint8 score and mask tensors')
+        values = np.array(score, dtype=np.uint8, copy=True)
+        values[mask == 0] = np.uint8(0)
+        metrics['d2h_bytes'] += int(score.nbytes + mask.nbytes)
+        metrics['d2h_calls'] += 2
+    metrics['transfer_seconds'] += transfer_ended - started
     metrics['capture_seconds'] += time.perf_counter() - started
     return y0,y1,x0,x1,values
 
@@ -1666,7 +1836,9 @@ def _d1_copy_confidence_crop(scores, masks, index, box, metrics):
 def _d1_confidence_metrics(shape, boxes):
     return dict(d2h_bytes=0, d2h_calls=0, dense_equivalent_bytes=2*math.prod(shape),
                 empty_slices_skipped=shape[0]-len(boxes), capture_seconds=0., transfer_seconds=0.,
-                host_wait_seconds=0., host_reserved_bytes=0)
+                host_wait_seconds=0., host_reserved_bytes=0,
+                gpu_masked_crops=0, gpu_mask_small_crops=0,
+                gpu_mask_oom_fallbacks=0)
 
 
 def _d1_publish_confidence_capture(spec, descriptor, reader, metrics):

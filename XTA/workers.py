@@ -1863,6 +1863,7 @@ def run_prediction_volume_in_worker(
             'radial_owner', 'radial_owner_empty',
             'd1_view_complete', 'd1_covered_slices', 'd1_total_slices',
             'd1_backprojected_task_slices', 'd1_bitset_words',
+            'd1_bitset_export_kind', 'd1_bitset_host_transfer_bytes',
             'd1_view_compute_seconds', 'd1_layer_ref', 'd1_cvol_stats',
             'd1_publication_seconds', 'd1_nonempty_task_slices',
             'd1_scanned_bbox_pixels', 'd1_view_shadow_path',
