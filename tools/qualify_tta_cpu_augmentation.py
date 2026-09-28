@@ -60,6 +60,7 @@ def main() -> int:
             '--temp', str(case / 'runtime'), '--save', 'nrrd', 'summary']
     if args.tiles:
         argv.extend(['--enable_tile', '16:16'])
+    (case / 'ultralytics-config').mkdir(exist_ok=True)
     env = dict(os.environ)
     env.update(PYTHONPATH=str(ROOT), PYTHONIOENCODING='utf-8', PYTHONDONTWRITEBYTECODE='1',
                OMP_NUM_THREADS='2', MKL_NUM_THREADS='2', OPENBLAS_NUM_THREADS='2',

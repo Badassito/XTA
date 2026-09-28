@@ -388,9 +388,11 @@ def probe_gpu_offline_runtime(
     )
     try:
         proc = subprocess.run(
-            [sys.executable, "-c", "; ".join(statements)],
+            [sys.executable, "-X", "utf8", "-c", "; ".join(statements)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=True,
             timeout=60,
         )
@@ -461,6 +463,8 @@ def _gpu_records_from_nvidia_smi() -> List[Dict[str, str]]:
             ["nvidia-smi", "--query-gpu=index,uuid,pci.bus_id", "--format=csv,noheader,nounits"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=True,
             timeout=10,
         )
@@ -647,6 +651,8 @@ def probe_image_dimensions(path: Path) -> Tuple[int, int]:
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=True,
                 timeout=10,
             )
@@ -884,7 +890,10 @@ def ffprobe_info(video_path: Path) -> Dict[str, object]:
         "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames",
         "-of", "json", str(video_path),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", check=True,
+    )
     info = json.loads(proc.stdout)
     if not info.get("streams"):
         raise RuntimeError(f"No video stream found in {video_path}")
@@ -905,7 +914,10 @@ def ffprobe_info(video_path: Path) -> Dict[str, object]:
             "ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
             "-show_entries", "stream=nb_read_packets", "-of", "json", str(video_path),
         ]
-        proc2 = subprocess.run(cmd2, capture_output=True, text=True, check=True)
+        proc2 = subprocess.run(
+            cmd2, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", check=True,
+        )
         info2 = json.loads(proc2.stdout)
         nf = info2["streams"][0].get("nb_read_packets")
     if nf is None or str(nf) in {"", "N/A"}:
@@ -950,7 +962,7 @@ def decode_video_gray8_to_memory(video_path: Path, *, warnings: WarningLog, allo
             proc.stdout.close()
         _, err = proc.communicate()
     if proc.returncode not in (0, None):
-        msg = err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
+        msg = err.decode("utf-8", errors="replace") if isinstance(err, (bytes, bytearray)) else str(err)
         raise RuntimeError(f"ffmpeg decode failed: {msg}")
     warnings.add("input_volume_loaded_in_memory", f"{arr.shape}, {arr.nbytes / GIB:.2f} GiB")
     return arr, fps, block
@@ -1552,7 +1564,7 @@ def close_ffmpeg_writer(proc: subprocess.Popen) -> None:
     proc.stdin = None  # type: ignore[attr-defined]
     _, err = proc.communicate()
     if proc.returncode not in (0, None):
-        msg = err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
+        msg = err.decode("utf-8", errors="replace") if isinstance(err, (bytes, bytearray)) else str(err)
         raise RuntimeError(f"ffmpeg writer failed: {msg}")
 
 
@@ -2505,7 +2517,7 @@ def write_v18_pta_manifest(
 
     config = getattr(args, "_v18_config", None)
     if config is None:
-        raise ValueError("v18 PTA manifest requires a resolved PtaConfig")
+        raise ValueError("PTA manifest requires a resolved PtaConfig")
 
     source_records = (
         [dict(record) for record in input_identities]
@@ -4323,21 +4335,21 @@ def validate_fresh_output_safety(
         existing_children = tuple(output.iterdir())
         if existing_children and not sentinel.is_file():
             raise ValueError(
-                "PTA refuses to clean a nonempty output directory that is not owned by "
-                f"v18 (missing {sentinel.name}): {output}"
+                f"PTA refuses to clean a nonempty output directory without its "
+                f"ownership sentinel ({sentinel.name}): {output}"
             )
         if sentinel.is_file():
             try:
                 sentinel_payload = json.loads(sentinel.read_text(encoding="utf-8"))
             except Exception as exc:
-                raise ValueError(f"Invalid PTA v18 output sentinel: {sentinel}") from exc
+                raise ValueError(f"Invalid PTA output sentinel: {sentinel}") from exc
             if (
                 sentinel_payload.get("schema") != "pta.v18.output-directory/1"
                 or Path(str(sentinel_payload.get("output", ""))).resolve(strict=False)
                 != output
             ):
                 raise ValueError(
-                    f"PTA v18 output sentinel does not own this exact directory: {sentinel}"
+                    f"PTA output sentinel does not own this exact directory: {sentinel}"
                 )
 
     protected: List[Path] = [source_root]
@@ -4616,7 +4628,7 @@ def write_pta_summary(
     lines.append("Built-in PTA in-plane variant: fixed internally at 0 degrees; --angle is not a PTA flag")
     lines.append("Implementation notes/conflicts:")
     lines.append("  - --force resolves Partially Labeled volumes to Fully Labeled for uniform type checking; without --force, mixed raw volume classes are rejected before processing.")
-    lines.append("  - For unlabeled volumes, --background_percent is disabled because v3 defines background by the YOLO label export while label operations are excluded for unlabeled annotation outputs.")
+    lines.append("  - For unlabeled volumes, --background_percent is disabled because background is defined by the YOLO label export while label operations are excluded for unlabeled annotation outputs.")
     lines.append("  - The pipeline emits frame index %04d as the one-based source-view frame index; filtered-out frames are omitted rather than compact-renumbered.")
     lines.append("  - --channel_format gray/grey emits one channel; RGB triplicates slice N; C{odd}S{stride} maps neighboring view slices into channels and adds a reverse-order output set.")
     lines.append("  - Labels and foreground/background classification always use the center slice N, independent of C, S, or forward/reverse image-channel order.")

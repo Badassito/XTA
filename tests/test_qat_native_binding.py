@@ -136,10 +136,12 @@ class QatNativeBindingFakeProviderTests(unittest.TestCase):
         environment['XTA_FAKE_QAT_MODE'] = str(mode)
         source = textwrap.dedent(bootstrap) + '\n' + textwrap.dedent(body)
         completed = subprocess.run(
-            [sys.executable, '-c', source],
+            [sys.executable, '-X', 'utf8', '-c', source],
             cwd=str(ROOT),
             env=environment,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=30,

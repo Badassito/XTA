@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import gc
 import io
 import os
 import queue
@@ -42,10 +43,11 @@ def native_tasks(count=120, mode='direct_union'):
 class SphericalHostAdmissionTests(unittest.TestCase):
     def test_d1_activation_preserves_explicit_shared_union_capability(self):
         tree = ast.parse(Path(pipeline.__file__).read_text(encoding='utf-8'))
-        block = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
-                     and isinstance(node.test, ast.Name) and node.test.id == 'v1613_d1_owner_active'
-                     and any(isinstance(child, ast.Constant) and isinstance(child.value, str)
-                             and 'fast bundle active:' in child.value for child in ast.walk(node)))
+        main = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == '_main_impl')
+        block = next(node for node in main.body if isinstance(node, ast.If)
+                     and isinstance(node.test, ast.Name)
+                     and node.test.id == 'v1613_d1_owner_active')
         code = compile(ast.fix_missing_locations(ast.Module(body=[block], type_ignores=[])),
                        '<D1 activation>', 'exec')
         for enabled in (False, True):
@@ -197,7 +199,8 @@ class SharedNativeWorkspaceTests(unittest.TestCase):
             policy_settings=SimpleNamespace(enabled=False),
             bounded_policy_parent_keys=set(),
             args=SimpleNamespace(imgsz=8, min_conf=1., interpolation_distance=0), dense_tiling_active=False,
-            nrrd_layers_needed=False, baseline_union_by_model_view={},
+            nrrd_layers_needed=False, component_layers_needed=False,
+            baseline_union_by_model_view={},
             baseline_confmap_by_model_view={}, baseline_slice_locks_by_model_view={},
             baseline_union_paths=self.state.baseline_union_paths,
             baseline_confmap_paths=self.state.baseline_confmap_paths,
@@ -224,8 +227,15 @@ class SharedNativeWorkspaceTests(unittest.TestCase):
 
     def close_parent(self):
         for name in ('baseline_union_by_model_view', 'baseline_confmap_by_model_view'):
-            for value in self.namespace[name].values():
-                runtime.close_memmap_array_without_flush(value)
+            mapping = self.namespace[name]
+            for value in mapping.values():
+                path = Path(str(value.filename)) if isinstance(value, np.memmap) else None
+                if path is not None and str(path).startswith('/proc/'):
+                    path = None
+                runtime.close_memmap_array_without_flush(value, unlink_path=path)
+            mapping.clear()
+        value = None
+        gc.collect()
 
     def run_shared_worker_windows(self, memfd):
         self.addCleanup(self.close_parent)
@@ -253,8 +263,9 @@ class SharedNativeWorkspaceTests(unittest.TestCase):
                     self.assertEqual(str(error), 'inference failed after native write')
                 finally:
                     exec(self.worker_close, env)
-                self.assertTrue(env['result_mask_full']._mmap.closed)
-                self.assertTrue(env['result_conf_full']._mmap.closed)
+                self.assertFalse(env['result_mask_full']._mmap.closed)
+                self.assertFalse(env['result_conf_full']._mmap.closed)
+                self.assertEqual(int(env['result_mask_full'][start, 0, 0]), start + 1)
                 key = ('model', self.view.name)
                 parent = self.namespace['baseline_union_by_model_view'][key]
                 self.assertFalse(parent._mmap.closed)
@@ -290,9 +301,15 @@ class SharedNativeWorkspaceTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()), \
                 self.assertRaisesRegex(RuntimeError, 'confidence allocation failed'):
             self.ensure('model', self.view)
-        self.assertTrue(allocations[0]._mmap.closed)
+        self.assertFalse(allocations[0]._mmap.closed)
+        self.assertEqual(int(allocations[0].sum()), 0)
         self.assertFalse(self.state.direct_union_backing_leases)
         self.assertFalse(self.state.baseline_union_paths)
+        failed_path = Path(str(allocations[0].filename))
+        self.namespace.pop('allocate_workspace_array')
+        allocations.clear()
+        gc.collect()
+        runtime.wait_for_retired_memmap_unlinks(path=failed_path)
         self.assertFalse(list(self.root.rglob('*.dat')))
 
 

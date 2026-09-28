@@ -582,8 +582,8 @@ def build_phase_render_tasks(
         return list(
             batch_gpu_frame_tasks(
                 ordered,
-                # Keep two device batches of source frames available so CPU
-                # geometry can run ahead while the GPU consumes the first.
+                # Keep two device batches of source frames available so
+                # rendering can run ahead of policy execution and publication.
                 candidate_limit=max(1, int(gpu_batch_size)) * 2,
             )
         )
@@ -2450,9 +2450,9 @@ def execute_gpu_frame_batch_task(
             len(render_jobs),
             max(1, int(_WORKER_STATIC.get("gpu_render_threads", 1))),
         )
-        # Keep at most two CPU jobs per thread live. Completed results remain in
-        # this bounded window while CUDA is busy, providing overlap without an
-        # unbounded host-memory queue.
+        # Keep at most two render jobs per thread live. A job can produce host
+        # or CUDA tensors; completed results stay in this bounded window while
+        # policy execution and publication consume earlier work.
         max_in_flight = max(1, render_threads * 2)
         next_job = 0
         ready: List[_GpuItemWork] = []
@@ -3021,7 +3021,7 @@ class VolumeRenderProgress:
 
 
 class PersistentRenderPool:
-    """v18: one render pool for the entire run.
+    """One render pool for the entire run.
 
     Normal process rendering uses module-importable ``spawn`` workers, matching
     TTA's process-safety convention and avoiding inherited runtime/thread state.

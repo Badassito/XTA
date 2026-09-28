@@ -286,7 +286,7 @@ class WorkerRasterPlanProvenanceTests(unittest.TestCase):
                     return_value=capture,
                 ),
                 mock.patch.object(
-                    workers, "predict_source_and_accumulate", side_effect=predict
+                    workers, "predict_source_and_accumulate", new=predict
                 ),
                 mock.patch.object(
                     workers, "gpu_union_flush_overlap_enabled", return_value=False

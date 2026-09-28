@@ -49,8 +49,8 @@ class TtaOutputResult:
 class TtaOutputArtifacts:
     """Identity-preserving owner of every artifact live at final output teardown."""
 
-    final_output_mask_mm: np.ndarray
-    final_union_mm: np.ndarray
+    final_output_mask_mm: Optional[np.ndarray]
+    final_union_mm: Optional[np.ndarray]
     native_view_support_by_model: Dict[str, Dict[str, np.ndarray]]
     azimuthal_native_output_by_model: Dict[str, Dict[str, np.ndarray]]
     tilted_native_output_by_model: Dict[str, Dict[str, np.ndarray]]
@@ -179,6 +179,20 @@ class TtaOutputArtifacts:
         operations.close_memmap_array(self.input_volume_rgb)
         close_memmap_calls += 1
         operations.trim_cuda_memory()
+        # A safe retirement request does not unmap while this owner still holds
+        # an array. Drop the completed references before selected-run scratch
+        # cleanup (and the complete-manifest publication callback) can begin.
+        self.final_output_mask_mm = None
+        self.final_union_mm = None
+        if isinstance(self.baseline_union_by_model_view, dict):
+            self.baseline_union_by_model_view.clear()
+        if isinstance(self.baseline_confmap_by_model_view, dict):
+            self.baseline_confmap_by_model_view.clear()
+        self.baseline_union_by_model_view = {}
+        self.baseline_confmap_by_model_view = {}
+        self.yolo_models = ()
+        self.volume_rgb = None
+        self.input_volume_rgb = None
         operations.collect_garbage()
 
         self._closed = True

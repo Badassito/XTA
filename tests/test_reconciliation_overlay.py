@@ -183,7 +183,8 @@ def test_viewer_selects_report_methods_and_switches_to_historical_and_union_only
     script = re.search(r'<script>(.*)</script>', viewer.read_text(), re.S).group(1)
     script_path = tmp_path / 'viewer.js'
     script_path.write_text(script, encoding='utf-8')
-    subprocess.run([node, '--check', str(script_path)], check=True, capture_output=True, text=True)
+    subprocess.run([node, '--check', str(script_path)], check=True, capture_output=True,
+                   text=True, encoding='utf-8', errors='replace')
     harness = tmp_path / 'viewer_test.cjs'
     harness.write_text(r'''
 const fs=require('fs'),vm=require('vm'),assert=require('assert');
@@ -219,5 +220,6 @@ vm.createContext(context);vm.runInContext(fs.readFileSync(process.argv[2],'utf8'
 })().catch(error=>{console.error(error);process.exitCode=1;});
 ''', encoding='utf-8')
     result = subprocess.run([node, str(harness), str(script_path), json.dumps(CURATED)],
-                            check=True, capture_output=True, text=True)
+                            check=True, capture_output=True, text=True,
+                            encoding='utf-8', errors='replace')
     assert json.loads(result.stdout) == dict(curated=True, historical=True, union_only=True)

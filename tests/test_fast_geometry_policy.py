@@ -141,9 +141,9 @@ class FastGeometryPolicyTests(unittest.TestCase):
             'from XTA.unification.sampling import forward_sampling_policy; '
             'print(json.dumps([geometry_quality_request_record(), forward_sampling_policy().digest]))'
         )
-        result = subprocess.run([sys.executable, '-B', '-c', script],
+        result = subprocess.run([sys.executable, '-X', 'utf8', '-B', '-c', script],
             cwd=Path(__file__).resolve().parents[1], env=dict(os.environ),
-            capture_output=True, text=True, check=True)
+            capture_output=True, text=True, encoding='utf-8', errors='replace', check=True)
         requests, digest = json.loads(result.stdout)
         self.assertEqual(requests, quality.geometry_quality_request_record())
         self.assertFalse(requests['cpu_spherical_compiled_requested'])

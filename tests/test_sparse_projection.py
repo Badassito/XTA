@@ -16,7 +16,7 @@ import numpy as np
 from XTA import backprojection, geometry, sparse_projection
 from XTA.config import TiltedViewGroup
 from XTA.interpolation import CVOL_FORMAT, INTERNAL_PACKED_CVOL_FORMAT, RawBBoxMaskStore, write_raw_bbox_mask_store
-from XTA.runtime import close_memmap_array
+from XTA.runtime import close_memmap_array, wait_for_retired_memmap_directory_cleanup
 
 
 HAS_NATIVE = bool(getattr(geometry.cv2, '__file__', None))
@@ -211,6 +211,8 @@ class SparseAzimuthalProjectionTests(unittest.TestCase):
         # Mock's recorded call tuple can keep its borrowed mmap crop alive until
         # its cycle is collected; that external owner is not the projector's leak.
         gc.collect()
+        for pending in self.root.glob('.*.projection-*'):
+            wait_for_retired_memmap_directory_cleanup(pending)
         self.assertFalse((self.root/'failed').exists())
         self.assertTrue(source.exists())
         self.assertFalse(list(self.root.glob('.*.projection-*')))

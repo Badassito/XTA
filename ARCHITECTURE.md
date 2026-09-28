@@ -1,1457 +1,306 @@
 # XTA architecture
 
-XTA provides test-time augmentation (TTA), pretraining augmentation (PTA), and
-label-time augmentation (LTA) for volumes. The implementation lives in the
-importable `XTA` package. The versioned launcher
-`GPT-6-Astra-Ultra_v23.0.1_SLURM.py`, installed `xta` command, and `python -m XTA`
-all enter `XTA.cli.run()`.
+XTA has three production modes: test-time augmentation (TTA), pretraining
+augmentation (PTA), and label-time augmentation (LTA). This document describes
+the current data flow and ownership boundaries. Detailed measurements, rejected
+experiments, and release history live outside this repository in the workspace's
+`Scratch/Data/XTA/History/Experiment_Log.md`. Those local experiment files are not
+part of an installed package or source bundle. The complete pre-trim architecture
+document is available in Git with `git show 597fc45:ARCHITECTURE.md`.
 
-This document describes implemented behavior, ownership, and operating controls.
-Release narratives, benchmark results, validation receipts, and individual SLURM
-runs are kept in the local workspace's ongoing, un-versioned
-[experiment log](../Scratch/Data/XTA/History/Experiment_Log.md), outside the
-repository. Accepted findings about behavior, ownership, operating controls, and
-validation are incorporated here before superseded experiment notes are removed.
-The log retains outcomes, limitations, source identities, and evidence locations.
+## Entry points and shared contracts
 
-TTA and PTA share backend-grouped external policy selection:
-`--augmentation cpu:CPU_POLICY.py gpu:GPU_POLICY.py`. TTA selects the CPU policy
-for OpenVINO workers and the GPU policy for CUDA workers; hybrid execution
-requires both entries. In TTA,
-`--augmentation_ratio N` produces one base pass and N-1 independent policy
-passes, with separate NRRDs and inverse-validity support sidecars. Augmented
-passes contribute to the terminal union and are excluded from interpolation.
-Full-frame policy groups admit all of their independent parent canvases together.
-Workers write each pass directly into its own shared parent slice window after
-backend-local inverse mapping. The coordinator receives completion metadata and
-skips the extra temporary-mask merge. CUDA policy retirement computes row/column
-occupancy on-device and copies the uniquely owned window once. CPU workers use
-NumPy/OpenCV replay and restore thresholded OpenVINO masks and confidence planes
-before the processing affine and cleanup; seam contributions retain OR semantics.
-The explicit GPU direct-union disable switch retains file results. Each backend's
-policy snapshot and hash are recorded in the augmentation manifest, with the
-executing backend also recorded in task receipts and packed support sidecars.
-Coverage sidecars use streaming, lossless NPZ compression at level 1 to reduce
-publication CPU time while preserving the existing arrays and metadata schema.
-Each parent retains memory credit through postprocessing and retires after its
-immutable component backing is published. Admission counts groups for the view
-limit and all passes for the byte limit; a policy group must fit the total window.
-The window is clamped to physical/cgroup RAM after accounting for outstanding
-fallback task files, seam buffers, support compression, persistent D2H staging,
-inference buffers, output and postprocessing. CPU policy caches and active-batch
-inverse-map/transient storage are reserved per CPU worker before parent admission.
-External-policy runs request a 384 GiB total dense window by default so a large
-four-pass group can overlap its predecessor's postprocessing. Explicit
-`YOLO_TTA_DIRECT_UNION_TOTAL_GIB` settings still take precedence, and the physical
-RAM clamp can lower the resolved limit. The inference byte limit is separate.
-`augmentation_support/parent_memory_plan.json` records the resolved allowances.
-This bounds active canvases; retained component stores and saved outputs consume
-additional filesystem space throughout the run. Memory-backed scratch or output
-also charges those retained files against RAM. Keeping temporary artifacts disables
-bounded retirement and preserves the aggregate file-mode memory guard.
+`GPT-6-Astra-Ultra_v23.0.2_SLURM.py`, the installed `xta` command, and
+`python -m XTA` enter `XTA.cli.run()`. The CLI selects exactly one mode and
+validates that mode's grammar before importing its heavy runtime. `tta_mode`
+enters `pipeline.main`, `pta_mode` resolves `PtaConfig` before `pta_runtime`
+enters `pta.main`, and `lta_mode` resolves `LtaConfig` before `lta_runtime`
+plans and executes propagation. Dependency-heavy runtimes initialize only
+after their mode has been selected.
 
-`--reconciliation POLICY.py` applies an external evidence policy to independent
-source-space component layers before global postprocessing. The additive source
-layers remain available; only the derived final mask changes. The reference
-policies live in `XTA/examples/external_reconciliation`. They combine positive
-support with provenance weights, geometry-based correlation caps, bounded island
-weights and retained prediction confidence. A plain union policy reuses the
-already assembled additive union, with a bounded count/validation pass and no
-component-payload reads or second source-volume allocation. Weighted, confidence,
-and custom decisions still consume independent evidence. A policy snapshot,
-source hash, execution strategy and measured counts are written to
-`reconciliation/manifest.json`; counts intentionally not rescanned are null.
-
-Reconciliation runs retain confidence sidecars under `reconciliation_evidence`.
-Values are uint8 maxima of observed detector instance scores for `--task segment`,
-or foreground pixel probabilities for `--task semantic`; zero is unknown.
-They are separate from binary masks and are not calibrated source-voxel probabilities.
-Collection is independent of cleanup thresholds and preserves the
-existing CPU/GPU, resident D1 and tile mask paths. Non-confidence policies retain
-native score blocks or piece manifests with explicit payload coordinates and
-source geometry. D1 shards and accepted tile pieces are preserved without
-immediate dense merging or source projection. Confidence-mode policies project
-when their decision requires source-space scores. Numeric projection uses max
-reduction over the existing categorical address mappings. Schema-one source
-sidecars remain readable; schema-two blocks avoid compressing a whole large
-bounding rectangle because of a few separated pixels. Prediction scores are captured before interpolation;
-bridges retain explicit provenance instead of acquiring fabricated confidence.
-The NRRD manifests record stable layer and model identities for later joins.
-Confidence publication announces source projection and native retention stages.
-Long block writes and the final D1 evidence drain report progress every 30 seconds.
-
-D1 confidence capture uses existing support bounds to skip empty frames and
-transfer score/mask crops. When a generic producer supplies no bounds, GPU
-row/column reductions derive them after the existing producer fence. Only flags
-and four coordinates per slice are read back; failed or unavailable metadata
-uses complete planes. Logs distinguish emitted, derived and fallback bounds.
-A per-worker host pool owns copied scores while CPU
-compression overlaps later inference; binary and confidence publication futures
-join before task completion. Its default 512 MiB host limit is charged to memory
-planning and is configurable with `YOLO_TTA_D1_CONFIDENCE_HOST_MIB` (16–4096).
-Oversized captures drain the pool and stream bounded crop bands synchronously.
-Disjoint D1 leases consolidate directly into one payload, index and metadata
-file, copying compressed bytes unchanged; overlapping tile pieces retain their
-maximum-reduction semantics.
-
-Deferred full-frame confidence is compressed locally before its dense inputs
-retire. Trusted pre-interpolation support metadata skips empty slices and limits
-score/mask reads to their bounds; absent metadata uses the full-plane reader.
-Global block alignment and score-zero semantics are identical on both paths.
-Two background publishers copy immutable stages to final output and
-register them, using a 256 MiB numeric staging budget in 64 MiB slots. Larger
-stages fall back to direct streaming. Completion joins every publication and
-propagates failures before reconciliation or the successful run manifest.
-Logs separate compression, storage, registry wait/write, and D1 transfer work;
-overlapping task times are not end-to-end wall time. Spherical CPU fallback
-skips provably empty shells before QSC geometry and probes GPU admission while
-waiting for a CPU block, joining abandoned readers before CUDA publication.
-
-Native evidence conversion is explicit through a bounded one-layer source-reader
-context, with temporary-disk admission and cleanup. Its numeric workspace budget
-is passed to backend-specific projection strips, including geometry, gathers,
-returned scores and known masks. Explicit conversions do not populate the shared
-dense Azimuthal geometry cache; insufficient minimum workspace fails before staging.
-Overlapping native-piece publication owns a private staging attempt and removes
-that attempt on failure, allowing retry while preserving existing evidence.
-Compact export joins scores
-to existing low-quality mask identities, takes numeric maxima over the matching
-source footprints, intersects with each compact mask, and writes a portable
-matched-grid bundle. It does not load native NRRD masks. Legacy source-aligned
-evidence needs no native staging; deferred-native conversion requires opt-in.
-Saved-layer policy comparisons retain only selected preview planes and retire
-each raw output map after publication, before evaluating the next policy.
-
-The numerical reconciliation engine has no inference or Slicer dependency.
-It reads bounded TYX slabs. Exact six-connected island statistics retain only
-the active slab frontier; correlation groups combine repeated files before
-weight normalization. Section orientation bins and shared sphere/cylinder
-groups cap correlated support rather than treating each patch as a separate
-vote. These grouping heuristics and retained/rejected counts do not establish
-false-positive accuracy. Global checkpoints and audit deltas are excluded.
-
-## Execution model
-
-| Mode | Input and purpose | Execution and publication |
-| --- | --- | --- |
-| TTA | A source volume and segmentation model | Render physical views and variants, infer masks, assemble completed views, project to source coordinates, fuse and postprocess the union, publish selected layers and derivatives |
-| PTA | Source volumes and labels | Apply shared geometry and paired augmentation, select deterministic dataset candidates and splits, publish images, labels, and a complete dataset manifest |
-| LTA | A target volume, aligned exemplar annotations, and a local SAM bundle | Propagate authoritative masks through temporal sessions and overlapping tiles, settle spatial relays, project each physical view once, publish the final native union and manifest |
-
-Configuration is validated before mode-specific runtime dependencies load.
-`XTA.__init__` is inert, and the eager package import graph is acyclic. Lower-level
-modules expose explicit contracts; callbacks into higher-level owners use local
-imports. Spawned functions and data types resolve through canonical module paths.
-
-## Module ownership
-
-All module names below are relative to `XTA`.
-
-| Boundary | Modules and responsibilities |
+| Shared boundary | Owner |
 | --- | --- |
-| Configuration and entry points | `cli`, `config`, `tta_mode`, `pta_config`, `pta_mode`, `lta_config`, `lta_mode`: mode grammar, validated options, and deferred dispatch |
-| Workspace and processes | `workspace`, `runtime`, `media`, `workers`: backing policy, telemetry, NUMA, process setup, source decoding/readiness, and TTA worker entry points |
-| Forward-render contracts | `unification.contracts`, `unification.sampling`, `render_batch`: immutable requests/plans, executable sampling policies, and actual frame ownership |
-| Shared planning | `unification.channels`, `unification.tiles`, `unification.views`, `unification.runtime`: channel/tile grammar and physical-view compilation |
-| Run identity | `unification.context`, `unification.manifest`, `unification.tta_manifest`: launch context, artifact identity, and atomic manifests |
-| Cartesian and Azimuthal geometry | `geometry`, `backprojection`, `sparse_projection`: forward raster plans, affine/seam geometry, and dense or crop-driven inverse projection |
-| Radial geometry | `cylindrical_geometry`, `cylindrical_projection`, `cylindrical_cuda_projection`, `cylindrical_owner`: cylindrical shells, bounded pull plans, CUDA source upload/publication, and native shell ownership |
-| Spherical geometry | `qsc`, `spherical_geometry`, `spherical_cuda`, `spherical_sampling_cuda`: QSC coordinates, shell plans, cached directions, and native rendering |
-| Spherical projection | `spherical_projection`, `spherical_projection_bounds`, `spherical_projection_cpu`, `spherical_projection_cuda`, `spherical_preflight`: admission, conservative bounds, CPU/CUDA pulls, and preflight |
-| Tilted Azimuthal projection | `tilted_azimuthal_projection`, `tilted_azimuthal_projection_cuda`: reference integer maps, bounded mask uploads, CUDA source union, and compact publication |
-| Model execution | `inference`, `inference_backends`, `cuda_backend`: backend contracts, model execution, mask payloads, and resident CUDA rendering |
-| TTA scheduling | `pipeline`, `tta_scheduler`, `tta_prediction`, `tta_lifecycle`: preparation, process admission, source staging, and run-resource ownership |
-| TTA external policies | `augmentation_policy`, `tta_augmentation_config`, `tta_augmentation`, `tta_augmentation_cuda`, `tta_augmentation_retirement`, `tta_augmentation_runtime`: shared policy identity, seed scopes, fused conservative inverse maps, and bounded render-once policy fan-out with asynchronous support retirement |
-| TTA reconciliation | `reconciliation_policy`, `reconciliation`, `reconciliation_components`, `reconciliation_geometry`, `reconciliation_io`, `reconciliation_runtime`: external policy identity, bounded voting and grouped island statistics, immutable layer readers and source-grid integration |
-| Confidence evidence | `confidence_evidence`, `confidence_storage`, `confidence_native`, `confidence_consolidation`, `confidence_publication`, `d1_confidence_retirement`, `confidence_projection`, `confidence_tiles`, `confidence_export`: versioned numeric blocks and native pieces, bounded asynchronous publication, compressed lease consolidation, explicit projection, tile provenance, and matched compact export |
-| TTA completion | `assembly`, `tta_terminal`, `tta_outputs`: view/tile assembly, physical-view terminal fusion, and settled-artifact teardown |
-| Sparse components | `interpolation`, `topology`, `topology_runs`, `projection_queue`: interpolation, component membership/adjacency, and bounded projection handoff |
-| CUDA component work | `cuda_interpolation`, `cuda_d1`, `cuda_finalization`: bridge painting/radius work, owner-GPU bitsets, and distributed finalization contracts |
-| Shared filters and output | `gaussian`, `finalization`, `outputs`: binary Gaussian semantics, global filtering, NRRD/media output, summaries, and derivatives |
-| Compact publication | `packed_publication`, `publication_memory`, `nrrd_spans`: row-packed payloads, retained-RAM grants/spill, and native crop-row streams |
-| Replay | `component_replay`: bounded immutable component captures, geometry descriptors, checksums, and replay loading |
-| PTA orchestration | `pta`, `pta_runtime`, `pta_dataset`, `pta_augmentation`, `pta_scheduler`: source planning, dataset identity, policy loading, GPU admission, and work packing |
-| PTA execution | `pta_rendering`, `pta_workers`, `pta_batch_pipeline`, `pta_gpu_publication`, `pta_publication`: render plans/caches, process/shared-memory ownership, bounded GPU/host publication queues, and atomic image/label publication |
-| LTA planning | `lta_inputs`, `lta_runtime`, `lta_scheduler`: annotation discovery, prompt ranking, physical-view/device ownership, and session admission |
-| LTA model boundary | `lta_sam`, `lta_experimental`: local SAM provenance, runtime-neutral result contracts, and pinned authoritative-mask tracker integration |
-| LTA propagation | `lta_propagation`, `lta_windows`, `lta_tiles`, `lta_tile_tracking`, `lta_relay_episodes`, `lta_tracklets`, `lta_frontier`, `lta_frontier_execution`: temporal windows, shared relay frontiers, lineage matching, and authoritative handoff |
-| LTA execution/output | `lta_execution`, `lta_workers`, `lta_worker_adapter`, `lta_cpu`, `lta_telemetry`, `lta_rendering`, `lta_union_artifacts`, `lta_postprocessing`, `lta_outputs`: persistent GPU workers, allocation-aware CPU budgets, phase traces, sparse mask transport, relay convergence, one-time backprojection, and final publication |
-| Optional accelerators | `experimental_features`, `intel_compression`, `intel_dsa`, `nvtiff_backend`: feature admission and hardware-specific lifecycle boundaries |
+| Immutable geometry and sampling identity | [sampling](XTA/unification/sampling.py), [contracts](XTA/unification/contracts.py), [views](XTA/unification/views.py), [tiles](XTA/unification/tiles.py), [geometry](XTA/geometry.py), [render batches](XTA/render_batch.py) |
+| Source and worker resources | [workspace](XTA/workspace.py), [media](XTA/media.py), [runtime](XTA/runtime.py), [TTA workers](XTA/workers.py) |
+| Input/output identity and manifests | [launch context](XTA/unification/context.py), [manifest helpers](XTA/unification/manifest.py), [TTA manifest](XTA/unification/tta_manifest.py) |
+| Image-space and source-space projection | [backprojection](XTA/backprojection.py), [sparse projection](XTA/sparse_projection.py), the `cylindrical_*`, `spherical_*`, and `tilted_azimuthal_projection*` modules |
+| Common filtering and output | [Gaussian](XTA/gaussian.py), [finalization](XTA/finalization.py), [outputs](XTA/outputs.py), [packed publication](XTA/packed_publication.py), [memory grants](XTA/publication_memory.py) |
 
-## Shared geometry and rendering
+A `RasterPlan` fixes a concrete view, output raster, optional tile, and sampling
+policy. Its digest identifies the request and is recorded with output provenance.
+`ForwardSamplingPolicy` specifies the order of coordinate transforms, sampling
+kernels, and boundary rules. A runtime binds a data role and implementation
+through `require_forward_sampling()`; missing bindings fail rather than silently
+selecting another kernel. Image intensity and categorical labels use distinct
+sampling rules. Categorical rendering uses nearest spatial taps. Tilted
+Cartesian and Azimuthal label planes blend adjacent stack planes and threshold
+binary foreground and coverage at 0.5; shell views use nearest voxel sampling.
 
-### Sampling and plan identity
+`RenderRequestBatch` describes logical frame addresses and plan identities;
+`render_batch.RenderBatch` owns the actual rendered frames consumed by a model
+or image sink. Full frames and tiles share geometry. Cartesian, tilted
+Cartesian, Azimuthal, Radial cylindrical, and Spherical QSC views use their
+own physical coordinates. Radial and Spherical patches retain their shell,
+radius, and patch origin so backprojection can reconstruct source support.
+A view is projected to source coordinates only after its own frame and variant
+ownership has settled. Source-volume restoration to native shape is distinct
+from the working cube.
 
-`ForwardSamplingPolicy` declares coordinate/stage order, role-specific kernels,
-boundaries, and registered CPU/CUDA implementations. Runtime code binds a backend
-and data role through `require_forward_sampling()`. An absent binding is an error.
-Manifests record resolved implementations through
-`forward_sampling_execution_record()`.
+External policies own transforms *after* shared rendering. TTA and PTA accept
+CPU and GPU policy paths through `--augmentation`. Policy identity and selected
+backend are recorded in manifests. A policy must preserve its paired image and
+label contract; unsupported combinations fail during validation. PTA executes the
+same source bytes whose SHA-256 it verifies, rather than reloading a policy or
+accepting cached bytecode after the identity check. Ultralytics adapters check
+the private APIs they replace and fail worker startup if a required patch cannot
+be installed.
 
-Every built-in full-frame or tile job carries an immutable `RasterPlan`. Its
-canonical record contains mode, physical-view identity, in-plane and channel
-variants, output shape, optional tile layout, frozen metadata, and sampling policy.
-SHA-256 digests address both the policy and plan. Mode-owned metadata participates
-in identity; equivalent PTA/TTA geometry resolves to the same implementation
-without requiring identical plan digests.
+## TTA: inference to source union
 
-`RenderRequestBatch` contains logical frame addresses and plan identities.
-`render_batch.RenderBatch` contains actual frames, and each item references the
-same object supplied to the model. Tail repeats and seam-extension slots are
-marked explicitly. After this boundary, backends perform layout, dtype, and
-normalization conversion; image sinks consume the same geometry result.
-The implemented image/model fan-out covers CPU-backed main-process and worker
-slab sources. Device-resident execution owns its tensors through the CUDA source
-and TensorRT slot contracts.
-Device-resident CUDA and direct TensorRT-ring execution still lack a qualified
-canonical image-artifact capture boundary.
+The TTA pipeline is coordinated by `pipeline`, `tta_scheduler`, `tta_prediction`,
+`tta_lifecycle`, `tta_terminal`, and `tta_outputs`. `view_prepare` owns admitted
+parent preparation, component-projection reservations, and inference-to-postprocess
+lease handoffs through explicit state objects. The scheduler owns mutable
+task identities, backend claims, worker liveness, parent memory credits, and
+result transport. An execution target is a local CUDA GPU or a socket-local
+OpenVINO process. Worker processes receive picklable contracts; bulk source and
+result data use shared descriptors or artifact paths. CUDA, TensorRT, and
+OpenVINO are initialized inside their respective runtime owners.
 
-Intensity and categorical roles bind their own sampling rules. Categorical
-sampling selects nearest source voxels and preserves label values. Built-in
-geometry is shared across modes; external augmentation policies own their
-additional transforms and paired image/mask behavior.
+Each physical view renders frames and optional tiles/augmentations, performs
+model inference, assembles the accepted masks, and settles its image-space
+result. Completed physical views can project to source space while other views
+continue inference. `assembly` and `tta_terminal` reduce these independent
+layers into a single source union. `interpolation` can add bridges between
+eligible frames; those bridges retain their own provenance. `finalization`
+applies requested global postprocessing after the full union exists.
 
-Channel expansion uses TTA ascending or PTA ascending/reversed variants, with
-contextual addressing and seam parity supplied by shared geometry. Tile groups
-use strict `TILE_SIZE:TILE_STRIDE` parsing and collapsed direct-to-output affine
-plans. Repeated concrete tilted views are deduplicated. Duplicate tile groups,
-Cartesian tokens, and ambiguous Azimuthal assignments are rejected.
+`--task segment` (default) composes YOLO instance masks from detections and
+prototypes in `inference`. `--task semantic` decodes raw one- or two-channel
+logits in `semantic_inference`: sigmoid for one foreground channel, or softmax
+for background/foreground channels. `--conf` thresholds foreground probability
+before binary cleanup, including thresholds below 0.5. `--min_conf` retains a
+connected component only if its maximum encoded confidence reaches the
+threshold. Models with unsupported class counts or baked argmax output fail
+rather than inventing missing probabilities. `tools/export_semantic_logits.py`
+exports a raw-logit ONNX/OpenVINO graph when the ordinary export path bakes an
+argmax. `semantic_cuda` and `semantic_trt` provide eligible CUDA cleanup and a
+private two-context TensorRT ring; the instance pipeline retains its separate
+inference path. GPU failures after a partially consumed task abort it rather
+than replaying writes.
 
-`gaussian.binary_gaussian_pass` supplies constant-zero padding, truncate-4
-filtering, and a threshold at 0.5. PTA applies it before geometry;
-TTA applies it after prediction fusion.
+TTA augmentation runs each policy pass independently and records the policy
+snapshot. Each pass owns its result and inverse-validity support; passes
+contribute to the terminal union while interpolation uses the base pass.
+Supported CUDA paths map accepted masks directly to owned parent windows.
+Parent admission charges all passes in a policy group against the dense
+memory window; file-backed results and retained outputs remain separate
+storage consumers. Inference, completed canvases, source projection, and
+publication have separate credits so one backlog cannot grow without bound.
 
-### View families
+`--reconciliation POLICY.py` evaluates completed source-space component layers
+before global postprocessing. The additive layers remain available; the policy
+changes the derived final mask. `reconciliation_policy` resolves external
+policy identity; `reconciliation_components`, `reconciliation_geometry`,
+`reconciliation_io`, and `reconciliation_runtime` consume bounded source slabs
+and write its manifest. A plain union can reuse the assembled union. Weighted
+and confidence policies read independent evidence. `confidence_*` modules
+capture native pieces or source-aligned uint8 maxima of detector scores
+(segment) or foreground probabilities (semantic); zero means unknown.
+Interpolation does not fabricate confidence. Native evidence conversion is
+explicit and bounded. `confidence_export` can match numeric evidence to
+selected compact masks without loading the NRRD masks.
 
-| Family | Native raster and contextual direction |
-| --- | --- |
-| Cartesian | Transverse, Sagittal, or Coronal planes; context follows the selected stack axis |
-| Tilted Cartesian | Tilted planes using the shared source/affine coordinate convention |
-| Azimuthal | Diameter/height slices indexed by azimuth, with half-turn symmetry and a mirrored seam |
-| Radial | Circumferential arc length by axial height; context follows neighboring cylindrical radii |
-| Spherical | Fixed QSC face patches; context follows neighboring spherical radii |
+TTA can save the final source-volume semantic mask as grayscale PNGs with
+`0` background and `1` foreground. This differs from `--save images`, which
+saves rendered model inputs. NRRD layers and their manifests preserve view,
+model, geometry, and policy identities. `tta_outputs` publishes a complete
+run manifest only after model workers, projection, finalization, and all output
+futures settle.
 
-Coordinates use X for source columns, Y for source rows, and Z for source stack.
-The working source grid and final native-shape restoration are distinct, including
-virtual reconstruction of a deferred T axis. Native shell patches have their own
-physical origins. Optional Tiles select samples inside those patches.
-Native shell sampling rounds each reconstructed logical-T voxel to gray8 before
-shell interpolation, then rounds the native plane before subsequent affines.
+### TTA resource and failure boundaries
 
-Tilted Azimuthal images shear the stacking coordinate within each azimuthal
-plane, changing sampling and clipping without introducing a new plane normal.
-The D1 route splats at the inferred angles; it does not inherit the pull
-projector's angular densification. Coarser angle policies require coverage
-qualification.
+A parent canvas holds its dense memory credit through assembly and projection
+until its immutable component backing is published. File-mode results and
+support sidecars have separate accounting. The scheduler can lend an idle
+worker GPU to eligible Radial or Spherical projection after queued inference
+drains; CPU projection can proceed while admission waits. A projection may
+switch at the first unpublished source slice. A failed preflight leaves CPU
+progress intact. A failure after CUDA publication starts aborts that layer
+rather than replaying partial output.
 
-### Radial cylindrical shells
+Completed view layers are reduced by a single source-union writer. A dense
+handoff credit bounds waiting source-sized volumes. Final sink joins precede
+the complete manifest. TTA first writes an `in_progress` manifest and replaces
+it only after successful completion. Reconciliation cannot consume unfinished
+confidence publication.
 
-`--enable_radial VIEWS` selects concentric shells around the Transverse, Sagittal,
-or Coronal axis. Corresponding `tilted_*` tokens compose with configured tilt
-variants. `--enable_azimuthal VIEWS[:AZIMUTH_ANGLE]` selects the diameter/height
-family described above.
+## PTA: deterministic dataset construction
 
-`--radial_min_radius auto` resolves to `imgsz/(4*pi)` working voxels. The outer
-radius is `(min(plane_height, plane_width)-1)/2`, centered on the source
-voxel-center grid. The modeled domain is the annulus between a finite positive
-minimum and that outer radius. Dense shells include both endpoints with radial
-gaps of at most one voxel; coverage mode uses certified wider gaps. Arc-length
-and height sampling retain one-voxel spacing.
+`pta` owns candidate membership, augmentation versions, split assignment, and
+output identities before asynchronous rendering begins. `pta_classification`
+tests foreground occupancy for background sampling, using native categorical
+planes and cached full/tile index maps where possible. If semantic output keeps
+every candidate (`--background_percent 1`) and has no offline copies, it skips
+the costly all-view classification while retaining missing-label eligibility
+and a foreground-preservation check. The summary marks unavailable class totals
+as unmeasured. `pta_scheduler` packs retained candidates into source-frame work
+so one decoded or resident volume serves many neighboring outputs.
 
-Each shell is covered by `imgsz` square intrinsic patches. Circumferential
-sampling is periodic across the seam, the final height band overlaps, and short
-source heights receive zero padding. A patch trajectory keeps its arc/height
-origin as radius changes and starts when that origin first lies on a shell.
-Context and interpolation clamp at radius boundaries. Repeated periodic pixels
-carry trajectory provenance and contribute through ordinary mask OR.
+`--task segment|semantic` selects YOLO task semantics for PTA. `--save labels`
+continues the polygon-backed path. `--save semantic` writes class-index PNGs
+under split-local `masks/` directories, paired by stem with images:
+`0` background, `1` foreground, `255` ignore. The generated dataset YAML uses
+`nc: 1`, `names: ['0']`, and `masks_dir: masks`. A missing YOLO label file is
+unknown coverage in forced partial-label mode; an existing empty file is known
+background. Foreground and coverage travel as separate categorical volumes
+through geometry and paired augmentation; only publication combines them into
+the 0/1/255 plane. A custom GPU policy used for partial semantic labels must
+declare `mask_independent_geometry = True` before the same sampled transform
+can be replayed for coverage. The bundled GPU policies declare this contract.
+`--save binary` writes retained exact binary masks and grouped lossless videos
+through `pta_binary`.
 
-Dense intensity coverage is defined by nonzero source interpolation taps over the
-annulus. Terminal projection selects the nearest global shell before applying
-trajectory offsets and visits every periodic patch occurrence. Tilted projection
-uses the ideal-height validity test, sampled shear, clamping, and ties-to-even
-selection. The plane plan contains immutable CSR occurrence tables constructed
-in bounded source strips; plan caching has a 256 MiB budget. Concurrent requests
-for one plan key share a build future. Sampled-shear metadata uses bounded batches.
+CPU rendering uses persistent workers and shared volume memory. Offline GPU
+augmentation uses one persistent process per selected GPU. `pta_rendering`
+prepares view plans; `pta_workers` renders and applies policies. GPU owners keep
+foreground and coverage volumes resident when VRAM admission succeeds.
+`pta_cuda_masks` coordinates their lifetime; `pta_cuda_cartesian`,
+`pta_cuda_azimuthal`, and `pta_cuda_shells` project categorical values directly
+to the final full or tile raster. Intensity and categorical sampling remain
+separate. GPU projection events fence policy reads and source retirement.
+Unsupported geometry or insufficient prelaunch VRAM selects the CPU categorical
+reference path; a launched CUDA failure propagates. The manifest records which
+backend actually rendered categorical items.
 
-PTA shell rendering requires positive `imgsz`. LTA's production view selection is
-defined in its execution contract below.
+`pta_batch_pipeline` and `pta_gpu_publication` overlap bounded GPU policy
+batches with encoding and host publication. Output tensors are snapshotted
+before a policy can reuse buffers. `pta_publication` writes and verifies
+image and label files; the nvJPEG batch uses staged files and atomic renames,
+while ordinary image, text-label, and semantic PNG writers write their final
+paths directly. `nvjpeg` and `nvtiff` select explicit GPU image encoders;
+CPU formats use their requested encoders. When semantic output is requested
+without polygon or binary output, foreground and coverage combine on GPU
+before one class-index download. With those other outputs, publication also
+downloads the separate planes and combines semantic IDs on the host. PNG
+compression and filesystem writes use bounded host workers. A batch holds its
+queue reservations until all image, semantic-mask, and label writes settle;
+failures join admitted work before the worker reports failure.
 
-### Spherical QSC shells
+PTA validates output ownership before cleaning an existing generated dataset.
+Requested and effective image formats are recorded independently. Its complete
+manifest is written last, after every file and worker closes. Unforced partial
+volumes and sequences with encoded-frame gaps retain native depth and restrict
+labels to Transverse full frames or tiles. Forced partial volumes without
+encoded-frame gaps can use 3-D views, including supported shells, with unknown
+semantic coverage preserved through projection. Fully labeled contiguous data
+can use all supported views.
 
-`--enable_spherical VIEWS` selects concentric spherical shells for TTA and fully
-labeled PTA. Upright base aliases compile to one canonical QSC cube, while their
-requested identities remain in the manifest. Tilted aliases share one cube per
-direction and signed angle. Distinct tilt groups retain distinct identities.
+## LTA: authoritative seeds and bounded propagation
 
-Spherical tilts rotate the cube charts rigidly: positive vertical tilt rotates
-about +X, and positive horizontal tilt about -Y. The center is
-`((W-1)/2, (H-1)/2, (T-1)/2)` and maximum radius is `(min(T,H,W)-1)/2` in working
-coordinates. `--spherical_min_radius auto` independently resolves to
-`imgsz/(4*pi)`. Positive finite radii cover the declared annulus and include both
-endpoints. Dense mode has gaps no larger than one voxel; coverage mode jointly
-certifies its shell gaps and face lattice.
+LTA takes a target volume, aligned exemplar masks, and a verified local SAM
+bundle. Production uses native Transverse, angle-zero overlapping tiles.
+`lta_inputs` discovers and validates the target and exemplar identities.
+`lta_runtime` plans views and tile grids. `lta_scheduler` assigns one physical
+view owner for its render cache and backprojection; idle devices may help with
+unopened SAM sessions. `lta_workers` owns persistent GPU processes and each
+process's model/tracker state. A live session stays on one worker. Results
+commit in plan order even when execution completes out of order.
 
-The chart is the equal-area O'Neill-Laubscher Quadrilateralized Spherical Cube
-used by [PROJ](https://proj.org/en/stable/operations/projections/qsc.html).
-`qsc` implements the unit-sphere mapping; `spherical_geometry` applies the
-source-volume pose. Dense mode uses an endpoint-inclusive grid sized for outer
-radius R: the interval count is the smallest even `n >= 3*sqrt(R*(R+1/2))`.
-Fixed `imgsz` patches cover its `n+1` nodes per axis, overlap at the final patch,
-and center/zero-pad smaller faces. All radii share the same face lattice and
-patch origins. Incident closed faces, edges, corners, and overlapping patches
-contribute through mask OR.
+`lta_propagation` and `lta_windows` advance authoritative anchors through
+bounded temporal windows, with independent backward and forward branches.
+Sessions admit at most 30 frames and 128 objects. Authoritative foreground
+is never replaced by a tracker prediction. `lta_tiles` and
+`lta_tile_tracking` plan overlaps and spatial relays; `lta_relay_episodes`,
+`lta_frontier`, and `lta_frontier_execution` settle new support over bounded
+temporal waves. Relay identity includes lineage, tile, prompt frame, and
+direction. Complete same-event masks merge before coverage checks. A subset
+already visited in the same lineage and direction can hand off; new support
+remains eligible. The finite growth guard fails publication if relays have not
+settled.
 
-Spherical cleanup and interpolation operate within each fixed patch trajectory
-before source-space OR. Whole-shell stitching and neighboring-face halos are not
-part of this path; model quality across patch and face boundaries is a separate
-qualification from coordinate coverage.
+Workers return sparse cropped, row-packed foreground and coverage artifacts.
+The coordinator verifies each packet, ORs its indexed crops into the private
+view, and releases it before admitting more work. `lta_coverage` stores the
+ephemeral visited-transition ledger; `lta_union_artifacts` owns the sparse
+view union. Once a physical view is complete, it receives final two-dimensional
+hole fill and one backprojection into the native union. `lta_postprocessing`
+writes requested filter checkpoints; exact authoritative foreground is
+restored in the final output after destructive filters. `lta_outputs` publishes
+the mandatory final NRRD and complete manifest after checkpoint and identity
+checks. A checkpoint can remain after a later failure; only a complete manifest
+marks run success.
 
-The original dense construction used the conservative QSC inverse Lipschitz
-bound 5/3. Combined with its radius spacing, that lattice places each working-voxel center in the annulus
-within squared distance `281/324 < 1` of a native sample. This establishes
-positive trilinear input weight; categorical sampling follows its separate
-nearest-neighbor policy.
+`lta_sam` resolves and audits the local SAM 3.1 assets; `lta_worker_adapter`
+owns model construction and tracker calls. The production feature path in
+`lta_tracker_features` skips unused grounding detection while retaining the
+tracker's expected visual features. GPU workers divide the visible CPU
+allocation and record their process/device identities. Increasing
+`--lta_workers_per_gpu` creates independent model contexts, so model memory and
+CUDA scheduling scale with that count. LTA does not use YOLO's `--task` flag.
+Cross-anchor identity matching remains a diagnostic facility in
+`lta_tracklets`; production merges independent anchor chains by recall union.
 
-TTA uses certified coverage schedules when an unrotated base pass is selected.
-Runs containing only rotated passes retain dense schedules because the native
-support certificate requires an unrotated model raster.
-An exact-rational certificate tightens the QSC inverse bound to 1. The planner
-jointly chooses fixed face intervals and uniform shell spacing while retaining
-the 281/324 sample-distance budget. Radial uses a certified larger shell gap;
-eligible full-native upright auto-Azimuthal sweeps use a larger angular gap and
-native pull projection, bypassing D1 nearest scatter. Both annular endpoints and
-independent trajectory outputs are retained. Native input support is distinct
-from categorical/model coverage; changed channel/interpolation physical spacing
-needs model-quality qualification. Mathematical derivations and validation
-reports are retained in the corresponding Scratch experiment directories.
+SAM import and construction run in the isolated model worker. XTA restores the
+caller's CUDA-matmul and cuDNN TF32 settings after those operations, including
+failure paths. SAM's model-process BF16 autocast behavior remains confined to
+that worker; a predictor is not constructed inside a shared TTA/PTA process.
 
-Native CUDA rendering reuses direction/validity plans across radii in a bounded
-256 MiB cache. FP64 plans are assembled in 64-row host strips and uploaded as
-complete direction/validity arrays when they fit. Oversized entries use bounded
-strips. Cache identities include geometry and precision; stream ownership keeps
-entries alive until their CUDA readers finish.
+## Publication, diagnostics, and validation
 
-Source projection evaluates FP64 QSC coordinates, global nearest-shell/QSC-pixel
-selection, and closed-face membership before applying patch offsets. Shell
-midpoint ties choose the inward shell; pixel ties use global round-to-even.
-Incident faces contribute independently by OR. Conservative bounds come from the
-rotated closed face cone and contributing radius interval; nonempty-shell
-metadata can tighten that interval. Outward rounding preserves face boundaries,
-radius ties, and restored voxel centers. CPU and CUDA paths skip proven empty
-ranges while retaining categorical selection arithmetic.
+Large source and mask arrays use explicit ownership: shared mappings, worker
+descriptors, bounded RAM credits, or path-backed artifacts. Native shell
+payloads can use parent-owned Linux memfds with spill to disk under pressure.
+Immutable component stores may outlive a dense canvas, but each retained layer
+still consumes filesystem capacity. Scratch placement can therefore affect
+RAM usage when its filesystem is memory backed.
 
-## TTA inference, scheduling, and completion
+Retiring a shared NumPy mapping does not invalidate live views or independent
+arrays backed by the same mmap. The mapping's last reference governs unmapping
+and memfd-owner release. Named scratch deletion follows that lifetime and checks
+file identity before unlinking and skips an observed replacement. Callers retain
+ownership of their unique scratch names until retirement completes; borrowed input
+paths and keep-temp artifacts are not deletion targets. Windows
+deletion may briefly wait for the mapping destructor. Owners must release their
+references explicitly; the retirement wait helper can verify cleanup and reports
+consumers that still retain the mapping. Forked workers reset inherited
+retirement queues and cannot delete their parent's pending scratch files.
 
-### YOLO task and semantic outputs
+`outputs` and `nrrd_spans` stream native NRRD rows and crops; publication
+records durability and releases source references after completion. Optional
+native codecs and hardware copy/compression helpers live in `native/`,
+`intel_compression`, and `intel_dsa`. Encoder/backend admission is explicit:
+a requested unavailable accelerator fails or uses the documented supported
+fallback before an output starts. Partial artifacts and worker failures never
+produce a complete run manifest.
 
-TTA and PTA accept `--task segment|semantic`, defaulting to `segment`. LTA does
-not expose this flag. The semantic path supports a single foreground class:
-one output channel uses sigmoid, while two channels use softmax with background
-at index 0 and foreground at index 1. Models with other class counts fail with
-an explanatory error. Semantic decoding lives in `semantic_inference`; instance
-mask composition stays in `inference`, with shared native accumulation and cleanup.
+Run, LTA, NRRD-sidecar and confidence JSON writers share `json_publication`.
+They reject non-finite values, sync a unique sibling stage, replace the destination,
+and sync its directory where supported. Failures are not acknowledged as successful
+publication. Same-destination writes serialize; independent destinations can sync
+concurrently. Forked workers reset inherited publication locks.
 
-Semantic TTA reads floating-point `[B,C,H,W]` logits before Ultralytics' final
-threshold or argmax. It resizes logits to the model raster, calculates foreground
-probabilities, and applies `--conf` directly, including values below 0.5.
-`--min_conf` retains the existing per-slice connected-component rule: a component
-must contain a confidence value at or above the threshold, using the established
-uint8 quantization. Zero disables this check. Radius cleanup, interpolation,
-projection and reconciliation use the same binary support and retained confidence
-contracts as instance inference. Reconciliation evidence takes maxima of observed
-foreground probabilities through the existing categorical coordinate mappings.
+Runtime diagnostics separate queue waits, rendering, inference, projection,
+encoding, publication, and worker retirement. These are overlapping stage
+timings, so summing them does not recover wall time. Validation tools under
+`tools/` check geometry, model backends, semantic decoding, PTA categorical
+projection, and LTA propagation. Tests live under `tests/`. Benchmark receipts
+and full workload evidence belong outside the repository in
+`Scratch/Data/XTA/History` and task-specific Scratch directories.
 
-CUDA supports semantic `.pt` models and raw-logit exported backends; OpenVINO
-supports a single raw-logit output. `semantic_trt` provides a separate TensorRT
-ring for fixed-shape semantic engines. Two private persistent contexts and static input
-and logit buffers overlap preparation, inference and native postprocessing.
-Eligible batch-one resident sources render directly into the input bindings;
-other fixed batches consume the existing CUDA input staging. CUDA inference
-graphs are used when capture succeeds and remain reusable across tasks. The private
-contexts leave AutoBackend's own context and binding addresses untouched, at the
-cost of one additional context compared with the instance ring's borrowing scheme.
-Both contexts and postprocessing kernels
-are validated before source consumption. After consumption, failures stop the
-task instead of replaying a partially written output. Worker retirement drains
-the ring before releasing its contexts and persistent buffers.
+Release qualification runs the full suite from the repository root before
+inventory verification and source-bundle construction:
 
-`semantic_cuda` fuses logit interpolation, foreground probability, threshold,
-nearest native affine sampling and uint8 confidence encoding. An eight-connected
-union-find filter retains components whose maximum confidence meets `--min_conf`,
-without per-frame host reads. The fused path writes directly into native union,
-confidence and count buffers, avoiding intermediate plane copies and host counts.
-Device flags skip component work for empty frames and frames whose foreground is
-already above the confidence threshold. Its bounded per-thread/stream workspace is reused
-and released during inference retirement. Native masks and confidence accumulate
-on the GPU until the existing bounded retirement copies publish them. This path
-also accelerates semantic `.pt` inference's confidence cleanup.
-
-`YOLO_TTA_SEMANTIC_TRT_RING=0` disables the ring; setting
-`YOLO_TTA_SEMANTIC_GPU_CLEANUP=0` also restores the earlier host component path.
-`YOLO_TTA_SEMANTIC_TRT_GRAPHS=0` disables inference graph capture. Positive
-`--min_radius`, wrapped Azimuthal padding, unavailable CUDA kernels, or memory
-admission failure retain supported generic paths. External policy inverse mapping
-uses the generic semantic path. The instance D1/prototype ring remains separate.
-`tools/qualify_semantic_trt.py` compares the earlier path, GPU cleanup alone, and
-the semantic ring using the same engine/input, with GPU heatsoak and explicit
-dispatch checks. It records throughput, memory and numerical differences.
-
-Exports containing an in-graph argmax
-are rejected because their class IDs cannot recover confidence. Current Ultralytics
-ONNX, OpenVINO and TensorRT exports can bake in this operation. The maintained
-`tools/export_semantic_logits.py` helper exports the checkpoint's ordinary
-evaluation path to ONNX or OpenVINO without that reduction:
-
-```bash
-python tools/export_semantic_logits.py --model yolo26n-sem.pt --output semantic.xml --imgsz 2048 --batch 1
-python tools/export_semantic_logits.py --model yolo26n-sem.pt --output semantic.onnx --imgsz 2048 --batch 1
+```powershell
+python -B tools/qualify_release.py --output-dir ../Scratch/Releases/v23.0.2-validation
 ```
 
-The OpenVINO XML can be passed as `--model cpu:semantic.xml`. A TensorRT engine
-built from the ONNX graph preserves its raw `[B,1,H/8,W/8]` or `[B,2,H/8,W/8]`
-logits. Input channels are read from the checkpoint; use matching `--imgsz`,
-`--batch`, and `--channel_format` during inference. The default export preserves
-FP32 weights; `--compress-fp16` opts into OpenVINO weight compression.
-
-`--save semantic` is independent of task selection. In TTA it writes the final
-source-volume mask as lossless grayscale PNGs in
-`semantic_masks/{input_stem}_0001.png`, with `0` background and `1` foreground.
-These source-frame outputs differ from `--save images`, which saves each rendered
-model-input view and augmentation. Existing binary exports keep their encoding.
-
-### Scheduler and process boundaries
-
-`TtaScheduler` owns mutable process-inference queues, task identities and totals,
-reservations, hybrid/D1 claims, backend estimates, result transport, worker
-accounting, and liveness checks. Synchronous callbacks return completed leases
-to the assembly owner. Output metadata consumes an immutable scheduler snapshot.
-
-An `ExecutionTarget` is one scheduler-visible execution unit: a local CUDA GPU or
-a socket-local OpenVINO process. `DispatchLease` separates logical and executed
-slice counts. `ArtifactRef` carries a location rather than array contents.
-`BackendRegistry` requires an explicit registered backend for every lookup.
-
-Worker entry points are module-level functions in their owning worker modules.
-Spawn children receive explicit initialization and picklable contracts. Bulk data
-travels through shared-memory descriptors and artifact paths. Torch, CuPy,
-TensorRT, OpenVINO, Ultralytics, and SAM initialize inside their runtime owners.
-
-OpenVINO request callbacks enqueue indexed completions. A bounded consumer pool,
-sized to useful request concurrency, decodes outputs and writes destinations.
-Destination slices and aggregate statistics have separate locks. Failure drains
-callbacks and requests unconditionally; submission order determines which
-competing failure is reported.
-
-### Mask composition and precision
-
-Backend execution precision and output-binding dtype are separate contracts.
-TensorRT buffers use the engine's declared FP16/FP32 bindings. Generic direct
-inference compacts accepted detections on device and selects scalar or tiled
-mask-union kernels by layout and dtype.
-
-The FP32 C32 tiled kernel keeps a covered pixel's prototype vector in registers,
-checks bounding boxes before dot products, and reuses that vector across
-detections. FP16 tiled kernels load half operands and preserve FP32 accumulation
-order. Boxes, confidence, and maximum-logit planes use FP32. Union reduction
-avoids a dense detection-by-image mask stack. Output sampling applies bilinear
-upsampling, thresholding, native warp, and cleanup in the selected policy order.
-`YOLO_TTA_DIRECT_TILED_PROTO_UNION=0` selects scalar composition.
-
-Optional tiled-workspace allocation failure disables further tiled allocation
-probes for that task. Receipts report actual shapes, dtypes, selected kernels,
-and fallbacks.
-
-FP32 bindings can contain FP16-representable values. An exact FP16 operand
-round-trip on saved tensors does not qualify a different binding dtype, CUDA
-accumulation order, rebuilt engine, or end-to-end output policy.
-
-### Native TensorRT pipeline
-
-`YOLO_TTA_NATIVE_TRT_RING=1` enables the resident batch-one Radial/Spherical
-pipeline. Two persistent slots own input/head/prototype tensors, TensorRT
-contexts, inference graphs, and inference/post streams. The rendering engine
-fills static input slots on its render stream with the generic normalization and
-requested FP16 rounding sequence before conversion to the actual input dtype.
-
-Native postprocessing composes logits in FP32, performs network-grid bilinear
-upsampling and thresholding, and applies nearest native warp. Radial owner cleanup
-and Spherical parent cleanup own morphology for these views. Completed rows,
-including empty masks, fulfill radius-coverage accounting.
-
-Inference compatibility depends on engine/input geometry. A drained policy
-transition retains compatible TensorRT contexts, binding tensors, and inference
-graphs while rebuilding postprocessing state. Post graphs are keyed by destination,
-policy, affine, shape, and bbox requirements. Setup/capability refusal before data
-consumption uses the generic route. Failures after native inference starts abort
-that task without replaying model work.
-
-### Parent memory admission and source projection retirement
-
-Admission accounts for committed native parent capacity before dispatch, including
-shared slice-write accumulators and retained Radial publication grants. Active
-parents receive completion priority. View and byte credits bound preparation,
-inference, completed canvases, and projection independently. Explicit file-result
-tasks without bounded retirement validate aggregate canvas capacity against the dense limit.
-Canvas credits bound committed canvas capacity; transient rendering/projection
-allocations and total process RSS require additional headroom.
-
-Source memfd transfers are reused only after successful compute/result handling
-acknowledges that the specific worker materialized them. Identities use device,
-inode and size, permitting streaming writes while detecting recycled descriptor
-numbers. Parent acknowledgement metadata is bounded; child source descriptors
-remain alive until worker shutdown so resident source paths stay stable. Result,
-canvas and bitset transfers retain their per-task ownership. Failed dispatches
-drain registered transfer handles. Materialization counters separate descriptor
-detach time, cache hits and total setup work; these are host timings.
-
-Cacheable Spherical direct-union tasks prefer a worker's last queued parent or a
-distinct newly admitted parent. This placement hint is subordinate to ownership,
-memory limits, hybrid/D1 rules, and work stealing.
-
-Scheduler selection evaluates compatible parent contracts and task costs once per
-selection call. Cached decisions expire at that call's boundary, so subsequent
-ownership, memory admission and measured-cost changes are reevaluated. Policy
-groups, heterogeneous contracts and assigned D1 groups retain the checks that
-depend on individual tasks. Ordering, tie breaks and floating-point accumulation
-order follow the same selection rules.
-
-The scheduler services independent arrived GPU compute credits before successful
-final-result callbacks. Credits release windows exactly once and a batch produces
-one refill; successful final callbacks retain FIFO order. CPU results and group
-control messages fence reordering, and a received worker failure prevents further
-dispatch. Bounded message drains and credit checkpoints remain on the single
-scheduler state owner; transport threads only receive and enqueue messages.
-
-Worker results are drained before and after background completion work. While
-inference is outstanding, background completion categories rotate after at most
-eight completed items or 10 ms of cooperative work. A callback finishes its
-ownership transition before yielding; it is not preempted mid-update. Queued
-messages and deferred background work bypass the scheduler's heartbeat wait.
-After inference drain, background work resumes its complete terminal drain.
-
-Live Spherical and Radial projectors can request an exclusive worker-GPU retirement
-lease. When retained parents block all new inference, an idle GPU is eligible even
-while inference priority remains active. Existing pressure controls and telemetry
-retain their Spherical names and govern the shared retirement queue.
-Completed-canvas pressure arms at 75% of the dense window and clears at 62.5%.
-Continuously refreshed demand becomes eligible for age-based admission after
-30 seconds. Workers finish queued inference before lending the GPU; stage leases,
-auxiliary owners, memory admission, and failure fences remain authoritative.
-
-Eligible requests are FIFO. A drained worker serves at most two projectors before
-returning to inference, with a two-second successor handoff window. Unrefreshed
-requests expire after 30 seconds; failed admission applies a ten-second cooldown.
-CPU projection continues while awaiting admission and rechecks after eight
-published slices or one second. Radial also retries once after CPU setup, before
-its first block. Promotion resumes at the first unpublished source slice and
-joins all CPU readers before GPU publication. Spherical and NumPy Radial readers
-can cancel between bounded pull chunks; compiled Radial readers finish their
-already-running output block. Failed CUDA preflight retains CPU progress, while
-failures after GPU publication begins abort rather than replaying a partial output.
-
-Main-process GPU admission samples CUDA memory outside the shared dispatch lock.
-It provisionally reserves only a selected device before claiming its auxiliary
-exclusion, then rechecks eligibility before committing. Auxiliary enable/submit
-cannot reopen a claimed device until its stage ends. Epoch and lease tokens reject
-stale attempts/releases after reset or reconfiguration; failed attempts release
-reservations without consuming successful retirement counters. Other devices can
-continue inference while a CUDA query or auxiliary claim is delayed.
-
-Dense parent credits remain held while native masks are projected and immutable
-component stores are built. Final NRRD compression is submitted asynchronously
-after the component store exists; its completion is not a prerequisite for
-releasing those dense credits or dispatching the next inference group.
-
-### Streaming terminal fusion
-
-A runtime view becomes terminal after its full-frame/tile continuation retires.
-When all variants of a physical view are terminal, ownership leaves the inference
-registries, variants are OR-collapsed, and terminal projection can overlap
-inference on other views. Completed physical views feed a path-backed,
-single-writer source-space union reducer.
-
-Equal-geometry sparse component layers are ORed before one restoration per output
-slice. A single dense handoff credit bounds waiting source-sized volumes.
-Finalization/reducer futures participate in scheduler liveness and terminal
-coverage checks. Global centerline and smoothing stages consume the complete
-union.
-
-After inference and D1 ownership drain, CUDA workers fence and release their
-rendering source, textures, model, graphs, and allocator assets. An acknowledged
-barrier precedes post-inference GPU admission. Validation refusal retains those
-assets; failure after release begins is fatal. Successful retirement closes
-further inference admission while permitting auxiliary mask work.
-
-## Source projection and compact publication
-
-### Native Radial owners
-
-Eligible GPU-only, angle-zero, batch-one gray Radial runs use one native owner per
-view inside the active D1 scheduling/publication envelope when confidence/radius
-thresholds are zero and interpolation, Tiles, and native debug exports are absent.
-Other configurations use completed-view parent projection.
-`YOLO_TTA_RADIAL_OWNER` controls this admission.
-
-The inference owner consumes complete native radius chunks, cleans each complete
-radius union, and gathers its owned source positions into a persistent uint32
-bitset. Native cleanup fills four-connected background components that do not
-reach the foreground crop boundary. The gather uses the cylindrical pull plan,
-including periodic occurrences, ideal-height validity, FP64 sampled shear,
-clamping, and ties-to-even rounding.
-
-Cleanup and projection are preflighted before model loading. Admission reserves
-bitset, geometry, reusable label buffers, and VRAM headroom. Coverage accounting
-checks both task results and consumed radii. Active owners block worker
-retirement, and failed fences retain device ownership through the fatal path.
-Completed bitsets enter bounded asynchronous CVOL publication with native-shell
-provenance.
-
-### CUDA source upload
-
-Radial and Spherical completed-view CUDA projectors share cropped source storage
-and upload machinery. Valid foreground boxes select uint8 rectangles from strided
-native masks, with per-shell uint64 offsets. Empty shells contribute no payload;
-source layouts without useful crop bounds use dense upload. Geometry continues to
-use global coordinates and the same bbox guards.
-
-Cropped packing writes directly into a bounded pinned stage, capped at 64 MiB.
-The compiled packer uses validated uint64 byte indices. When the payload exceeds
-the stage and compiled packing is available, the default cropped-upload pipeline
-splits that stage into two lanes. CPU packing can overlap the previous lane's
-asynchronous upload; an event fences each lane before reuse, and a final stream
-fence settles the transaction. Both lanes share the original staging budget and
-one device source allocation. Smaller transfers and the NumPy packer use the
-serial path. `YOLO_TTA_CROPPED_UPLOAD_PIPELINE=0` selects serial staging.
-
-Source setup reports logical bytes, actual H2D bytes, storage layout, packing,
-upload, geometry, and preflight separately. A failure after upload begins fences
-owned resources before propagating.
-
-### Encoded projection output
-
-An exclusive CUDA stage lease covers upload, computation, callbacks, and cleanup.
-Admission checks actual free VRAM for source, geometry, bounded buffers, and
-reserve. Capacity refusal or settled setup failure selects CPU before publication.
-A late failure aborts the sink; an un-fenceable stream retains its owners through
-the fatal path.
-
-CPU/CUDA projection publishes ordered bounded blocks of tight slice crops,
-foreground counts, and raw uint8 or little-endian row-packed payloads.
-Analytically empty ranges produce validated empty records. CUDA computes crop
-metadata and packs payloads on device; sink-only Spherical CPU workers compute
-those records before handing them to the publication thread. Generic dense
-callbacks use their dense interface.
-
-The writer validates order, bounds, counts, layout, and padding before appending
-encoded records without repeating full-plane bbox scans or packing. Encoded work
-has bounded metadata/payload reservations and a 4,096-slice block limit.
-Publication is ordered and exactly once across CPU-to-GPU promotion.
-A sink failure aborts the writer; completed output is not replayed.
-
-Spherical mathematical preflight checks complete planes through 65,536 pixels.
-Larger probes use deterministic windows totaling at most 32,768 pixels, including
-image, ROI, and foreground edges and interior samples. Full GPU codec checks
-validate payload handling. `YOLO_TTA_SPHERICAL_FULL_MATH_PREFLIGHT=1` requests the
-exhaustive mathematical check in bounded CPU chunks.
-
-`packed_publication` scans source bitset words for exact slice bounds and counts,
-then emits cropped row-packed bytes. Compiled and bounded NumPy implementations
-share the same payload contract. The compiled metadata scan uses LLVM population
-count and bit-scan operations, with full row interiors available for automatic
-vectorization. LLVM selects instructions for the running CPU; no specific ISA is
-required. Partial words preserve contiguous source-bit addressing and exclude
-terminal padding. Windows file descriptors use binary mode.
-
-File-result and azimuthal seam confidence composition use one compiled loop over
-disjoint contiguous uint8 planes. Source foreground replaces an empty destination
-or a strictly lower confidence; ties retain existing mask bytes. The existing
-slice-worker pool provides concurrency. Noncontiguous or overlapping arrays and
-unavailable compilation retain the NumPy implementation, and missing confidence
-maps retain plain bitwise union.
-
-## Sparse components and interpolation
-
-Full-frame, zero-angle Cartesian interpolation components preserve sparse storage.
-Transverse components reuse immutable stores; Sagittal and Coronal components
-transpose into packed orthogonal stores. Azimuthal and tilted-Azimuthal projection
-visits foreground crops through the discrete inverse ownership map. Ordinary
-tilted Cartesian components use the dense projection backend.
-
-Eligible D1 continuations publish complete component references alongside their
-independently published source-space base. Membership export uses validated paste
-bounds and counts, with full-slice export when the same payload cannot be
-established from a crop. Tiles, retained workspaces, and incomplete component
-coverage use ordinary continuation.
-
-`projection_queue` accepts immutable components independently of preparation.
-Pending input bytes and estimated active scratch have separate limits, and one
-oversized job can run alone. Parent dependencies remain live until every future
-settles. Failure wakes blocked producers before executor teardown.
-
-Sparse labeling uses foreground bounds to select cropped CPU work at low
-coverage. Topology adjacency intersects equal-label row runs where useful and
-uses bounded pair deduplication. Small or highly fragmented windows use pixel
-adjacency. Final fusion ORs sparse crops directly when only temporal restoration
-is required.
-
-Interpolation endpoints use odd, centered rectangular canvases with background
-margins. Endpoint travel is applied by the world-coordinate painter. The CPU
-min-radius evaluator can certify acceptance for a positive threshold from a
-common foreground disk, guarded by a floating-point margin; other plans receive
-the full section-radius scan.
-The certificate is an acceptance lower bound; requests without a positive rejection
-threshold still compute the full radius. Shape-dependent floating-point EDT rounding
-can change boundary voxels, so the rectangular implementation does not promise
-bit-identical output.
-
-Bridge membership excludes the immutable pre-pass foreground before source
-projection. Every combination in one pass uses that same pre-pass domain, and
-accepted changes become input to later passes. Source-space subtraction is not
-equivalent because projection can map several view pixels onto one source voxel.
-
-CUDA bridge painting borrows an already-warm worker. Its first nonempty bounded
-batch runs on CPU and CUDA; CUDA is retained when at least 5% faster. Painting is
-OR-idempotent, enabling failed-batch CPU replay. A lease owns a bounded pool of
-non-default streams, four by default, and retains touched cache entries until
-stream completion. Pinned nonblocking result copies complete before host crops
-are committed. Renderer locks protect cache metadata and enqueue order.
-
-The CUDA radius evaluator is separately opt-in. Radius failure can return radius
-work to CPU while a healthy painter continues. Required-CUDA mode makes admission
-or execution failure fatal. Dedicated interpolation processes use explicit
-initialization; context creation in those processes or the main process is
-separately controlled.
-
-## PTA dataset execution
-
-PTA accepts one resolved configuration for discovery, preprocessing, geometry,
-augmentation, dataset planning, and publication. The parent owns candidate
-membership, augmentation versions, train/validation splitting, and output
-identity, so asynchronous completion cannot change the dataset definition.
-
-Semantic mask publication skips the all-view foreground-classification pass when
-`--background_percent 1` retains all candidates and no offline copies are requested
-(for example `--augmentation_ratio 1`). Missing-label eligibility and ignored-pixel
-coverage still apply. A small full-Transverse-only check retains the foreground
-preservation invariant. Unmeasured class totals are identified as such in the
-summary and manifest. This planning decision does not disable the GPU policy or
-nvJPEG publication backend; those begin after planning completes.
-
-When classification is required, `pta_classification` extracts each native mask
-plane once and tests full/tile occupancy on the publisher's exact categorical
-sampling lattice. Cached one-dimensional OpenCV index maps avoid constructing
-large upsampled output masks for axis-aligned transforms; quarter turns are handled
-by transposing axes. Other in-plane affines retain an exact raster fallback using
-the cached native plane. Tilted Cartesian stack blending uses the canonical
-renderer. Globally empty foreground or coverage volumes bypass projection, but
-an empty source-space intersection alone is not sufficient for that shortcut.
-Jobs run plan-major to keep geometry caches warm without changing dataset order.
-Progress logs report jobs and full/tile queries by family, then native-plane and
-fast/fallback counts. `YOLO_TTA_PTA_SEMANTIC_CLASSIFICATION=0` selects the canonical
-reference classifier for comparison. `tools/qualify_pta_classification.py` checks
-decision parity and local CPU timings after heatsoak.
-
-`--save semantic` writes lossless single-channel PNG labels under `masks/`, with
-the same stems and train/validation layout as dataset images. Pixel values are
-`0` background, `1` foreground, and `255` ignored. The binary semantic dataset
-keeps `nc: 1` and `names: ['0']`; `masks_dir: masks` selects the dense-mask loader.
-This follows the [Ultralytics semantic dataset convention](https://docs.ultralytics.com/datasets/semantic/).
-For the user's original split layout, the corresponding configuration is:
-
-```yaml
-train: ../train/images
-val: ../valid/images
-test: ../test/images
-channels: 1
-nc: 1
-names: ['0']
-masks_dir: masks
-```
-
-With forced partial labels, a missing YOLO label file means unknown coverage;
-an existing empty file is known background. Semantic export carries that coverage
-separately from foreground through geometry and paired augmentation, then writes
-unknown regions as `255`. It never treats the ignore value as a foreground class.
-PNG labels retain their integer values regardless of the selected image format.
-CPU augmentation samples one transform for foreground and coverage together,
-including crops whose placement depends on the foreground mask. The current GPU
-policy API accepts one mask per call, so forced partial semantic export requires
-`mask_independent_geometry = True` on the policy before replaying coverage with
-the same seed. The four bundled GPU policies declare this property. A custom
-policy must guarantee it; policies without that declaration fail explicitly.
-`--task semantic --save images labels` can also publish a polygon-backed dataset;
-its YAML omits `masks_dir`. Use semantic PNG output to retain ignored regions.
-
-`--save binary` publishes the exact retained original and augmented masks as
-one-bit DEFLATE TIFFs under `binary_masks`, preserving image/label stems and
-train/validation subdirectories. These masks preserve holes and thin objects.
-After foreground-flip drops and background-cap trimming, PTA reads those TIFFs
-to produce lossless grayscale FFV1 MKVs under `binary_videos`, one sequence per
-volume, view/tile, split, and augmentation copy. Each video has a JSON companion
-mapping its frames to mask files and zero-based view-frame indices, including
-filtering gaps. The run manifest lists every sequence. Binary output can be
-selected independently of images and polygon labels; unlabeled volumes emit no
-binary masks. It uses the same CPU/spawn and bounded GPU publication paths as
-the dataset, so offline augmented masks are captured before policy buffers can
-be reused.
-
-CPU process rendering uses one persistent spawn pool with module-level targets
-and a picklable static contract. Children reload and verify external CPU policy
-identity. Per-volume arrays and phase payloads use named shared memory. An
-explicit thread backend shares parent arrays and is the automatic fallback when
-a spawn context cannot be created.
-
-Active offline external GPU augmentation uses a fork pool created before source
-decode or CUDA initialization. It requires a fork-capable host. One persistent
-process owns each visible CUDA device; bounded CPU producers prepare compatible
-full-frame/tile items while earlier GPU work runs. VRAM admission and deterministic
-OOM splitting bound policy batches. GPU example policies implement separable
-Gaussian filtering for blur and elastic-field smoothing.
-
-GPU workers also keep foreground and annotation coverage volumes resident when
-VRAM admission succeeds. `pta_cuda_masks` owns each shared-volume generation;
-the Cartesian, azimuthal, and shell modules project directly into the final
-full-frame or tile raster. Nearest categorical sampling and tilted stack blending
-remain separate from intensity interpolation. Spherical patch direction maps
-are prepared once per patch and retained in a bounded GPU cache. Source upload,
-projection events, policy reads, and retirement use explicit stream ordering.
-The four bundled GPU policies accept CUDA masks, so originals and augmented
-versions avoid per-item CPU mask projection and host-to-device mask copies.
-
-`PTA_GPU_CATEGORICAL_RESERVE_MIB` leaves 2048 MiB of default admission headroom
-in addition to projection temporaries. Insufficient VRAM or unsupported geometry
-selects the CPU categorical path before kernel execution and prints the reason;
-device failures after launch propagate. Manifest counters identify the backend
-actually used. `YOLO_TTA_PTA_GPU_CATEGORICAL=0` selects the CPU reference path.
-`tools/qualify_pta_gpu_masks.py` checks family and tile parity;
-`tools/qualify_pta_gpu_render.py` measures the complete native nvJPEG and semantic
-PNG worker path with the same publisher in both arms. Local GPU checks establish
-correctness and bottlenecks; they do not predict multi-GPU cluster throughput.
-
-The offline augmentation backend follows the selected policy's export:
-`build_gpu_augmentation` uses CUDA; supported CPU exports such as
-`build_augmentation` use CPU.
-`--output_format nvjpeg` selects the GPU JPEG encoder; `--output_format nvtiff`
-selects the GPU TIFF encoder. These choices require offline execution and a GPU
-policy. Plain `jpeg`/`jpg` and `tiff`/`tif` select CPU encoding, independently of
-whether the policy uses CUDA. GPU JPEG supports grayscale and RGB images. GPU
-TIFF writes grayscale or interleaved RGB as a single page; custom channel stacks
-retain one grayscale page per channel. TIFF encoding preserves the pixels
-losslessly. Encoder failures are reported for an explicitly requested GPU format.
-
-GPU policy output and publication use two bounded stages. The first reserves a
-slot before policy allocation, snapshots returned tensors to protect policies
-that reuse output buffers, and hands them to one publication consumer on its own
-CUDA stream. It retains at most two batches, with a default 2048 MiB admission
-window for original outputs plus snapshots. The next policy batch can run while
-the previous batch converts labels, encodes images, and publishes files. nvJPEG's
-completion fence can still serialize concurrent device work; CPU and file work
-can overlap subsequent augmentation after that fence.
-
-The host writer queue admits at most two jobs and 512 MiB of encoded bytes and
-label text. JPEG encoding reserves a job slot before constructing CodeStreams;
-their actual byte count is admitted before submission. The newly encoded batch
-can temporarily add producer-owned memory while that byte admission waits.
-Both queues allow one oversized batch exclusively. These windows bound retained
-publication work; policy/publication intermediates, encoder workspaces, and CPU mask
-processing have separate memory costs. Polygon conversion uses up to four CPU
-workers per CUDA owner, and file publication uses up to eight, bounded by the
-owner's CPU budget (`PTA_GPU_PUBLICATION_FILE_THREADS` overrides the latter).
-Semantic-only publication combines foreground and coverage into one 0/1/255
-plane on CUDA before download. JPEG and semantic files share one queue slot per
-batch. PNG compression and filesystem writes still run on the host, with bounded
-parallelism. Class-index PNGs use lossless RLE compression without adaptive row
-filtering, which avoids scanning candidate filters for low-cardinality masks.
-OpenCV builds exposing filter control use that encoder; older builds use the
-same PNG grayscale layout with Python's native zlib compressor. Startup logs
-identify the selected encoder. `PTA_SEMANTIC_PNG_CODEC=legacy` restores the former
-OpenCV compression settings for comparison. Within an admitted host batch,
-semantic PNG work borrows the polygon executor while JPEG files use the file
-executor. Both groups finish before the shared host reservation releases, even
-after a write fails. `PTA_SEMANTIC_PNG_OVERLAP=0` selects sequential publication
-for comparison. Results and warnings merge in
-submission order, and every admitted consumer drains before a task reports
-completion or failure. Unfenced CUDA owners are retained and the worker is stopped.
-
-`PTA_GPU_PUBLICATION_PIPELINE=1` enables this overlap by default; setting it to
-`0` restores synchronous publication. `PTA_GPU_PUBLICATION_GPU_MIB` and
-`PTA_GPU_PUBLICATION_HOST_MIB` set the corresponding retained-byte windows.
-Publication stage timings are printed every 60 seconds by default;
-`PTA_GPU_PUBLICATION_REPORT_SEC` changes that interval, with zero disabling it.
-CPU budgets reflect actual phase overlap: initial planning and runs without
-volume prefetch use the full planning budget, while overlapping preparation
-reserves CPU capacity alongside active render workers. GPU owners retain their
-allowed local CPU sets and bounded render-thread counts.
-
-PTA partial-label and encoded-gap input paths use Cartesian labeling. Fully
-labeled data binds the shared supported forward geometry, including native shell
-families. External policies carry identity and deterministic selection metadata;
-deferred replay bundles are published as explicit dataset artifacts.
-
-## LTA propagation and SAM ownership
-
-Production LTA executes native Transverse, angle-zero, overlapping 1008-pixel
-tiles. Aligned exemplar indexes address decoded target frames. Each persistent
-spawned worker owns its model on a selected GPU. A physical-view owner retains its
-immutable rendered cache and sole backprojection ownership. Idle devices can
-assist unopened sessions using that cache; a live session stays on its original
-device. Results commit in plan order.
-
-Production helpers take the earliest ready windows. Each worker keeps
-one task slot for a single existing SAM window of at most 30 frames. Verified
-boundary seeds unlock the next window; a center window unlocks backward and
-forward continuations independently. A live tracker session stays on one GPU;
-the next fresh session can run on another. Blocked dependencies stay outside
-ready queues. An empty boundary cancels only its dependent branch. The initial
-annotation graph uses ordered commits; relay attempts use bounded wave schedulers.
-
-Workers retain at most one window's dense union and publish only nonempty,
-tightly cropped frames as little-endian row-packed bits. Omitted frames mean
-zero. Hashing and consumption scale with stored support, not the full source
-depth. The coordinator verifies the packet, ORs only its indexed crops into the
-private view, removes it, and admits more work. Compact audit records still
-commit in plan order. Initial cross-window episodes merge at their original chain
-boundary. Relay observations coalesce by exact lineage and source/destination tile
-after complete temporal waves. Complete spatial-generation fan-in remains
-necessary because seeding merged arrivals and unioning separately propagated
-arrivals are not equivalent operations.
-
-The production relay policy is `canonical_temporal_frontier/1`. Workers
-publish per-lineage cropped packed masks and directed model-visited ranges in
-verified coverage packets. The coordinator accumulates them in an ephemeral
-SQLite ledger with a bounded page cache. A relay can hand off to existing work
-only when its full, merged, hole-filled seed mask is contained in coverage for
-the exact lineage/grid/tile/frame and the next transition in its propagation
-direction has already been observed. An axis endpoint has no next transition.
-Backward evidence does not establish a forward transition. A newly added pixel,
-an unmatched lineage, or previously unobserved re-entry remains eligible.
-
-Relay arrivals advance only to their next shared temporal boundary, with boundaries
-29 frames apart and sessions of at most 30 frames. Forward and backward sweeps
-retain separate directions. Arrivals at a shared boundary combine their complete
-same-lineage masks before the next slab is scheduled. Interior prompt frames remain
-separate inputs; masks are never moved to another frame for batching. No remaining
-prompt-to-volume-edge chain is materialized for an individual relay endpoint.
-
-An ephemeral SQLite frontier stores cropped packed input masks keyed by exact
-lineage/grid/tile/prompt/direction. Source route, original chain, and spatial
-generation are absent from identity. New input foreground can dirty an existing
-mailbox; an identical subset, score change, or provenance change alone cannot.
-Historical input support joins current arrivals before hole filling and coverage
-checks, preserving complementary support that closes a hole. Complete accumulated
-masks condition SAM; pixel differences alone are never used as prompts.
-Before a novel relay is injected, its prompt also retains previously verified
-support from the same lineage, destination tile and frame. This restores object
-context outside a clipped tile overlap. It borrows no other frame or lineage,
-changes no confidence or observed-transition record, and hashes the actual
-enriched, hole-filled mask into the work identity.
-
-Each wave freezes at most 32 input revisions from one temporal sweep slab,
-independently of GPU count. Conflicting lineages retain separate sessions. All
-results, coverage packets and continuation artifacts pass validation before the
-wave can create another attempt. Coverage from earlier waves can establish a
-handoff; results arriving within a wave cannot alter its selected inputs.
-Observations follow actual model-visited ranges, preserving gaps and excluding
-policy-zero tails. Initial authoritative tracks and positives remain independent.
-
-At a generation barrier, overlap episodes coalesce across chains of the same
-lineage and source/destination tile pair. Every original endpoint candidate is
-retained at its original frame until admission, including novel endpoints inside
-a larger episode. Only exact direction/frame candidates combine masks. This
-avoids dropping complementary interior support or moving masks through time.
-All same-event arrivals are merged and hole-filled before checking coverage.
-This handoff policy replaces exhaustive reinjection of already covered seed
-geometry; it does not infer biological identity between different annotation
-lineages. Cross-anchor identity matching remains a separate integration.
-
-The coverage ledger and frontier use data-dependent scratch space with bounded
-SQLite page caches. Attempt schedulers retain only the current wave. Compact audit
-records and accumulated masks persist across waves. Generation summaries record
-actual windows, waves, outgoing endpoints, coverage, and mailbox state. The number
-of mailbox identities is bounded by the physical frame/tile/lineage domain;
-genuinely new foreground can require multiple revisions and attempts. This is not
-a one-inference-per-cell or wall-time guarantee. The finite spatial-generation
-guard fails publication if new support remains beyond its bound.
-
-Input discovery reports its active scan, probe, and exemplar identity stages.
-Video frame counts use declared metadata when available; FFV1 inputs without a
-declared count use a packet scan, while other codecs retain a decoded-frame
-fallback. Frame counts are never estimated from duration and rate. LTA verifies
-the count against EOF during source-cache decoding, rejecting both missing and
-extra frames, with concurrent stderr draining to prevent pipe deadlocks.
-
-Preflight checks scratch and output filesystem capacity,
-combining reservations when they share a filesystem, and includes the unfiltered,
-requested filter-stage, and final NRRDs. Relay growth and optional media remain
-additional storage consumers.
-
-CPU budgets intersect process affinity with Slurm CPU limits and divide native
-threads across selected GPU workers, capped at four per worker while respecting
-an inherited lower limit. Child environment limits apply before adapter imports;
-Torch and OpenCV limits are set before model construction. Parent native pools
-are scoped to one thread while explicit LTA CPU parallelism uses the effective
-allocation. Original parent settings are restored on exit. An explicitly empty
-`--temp` value is rejected so an unset scratch variable cannot select output
-storage unintentionally.
-
-`--lta_workers_per_gpu` admits one to four independent persistent processes per
-selected GPU, defaulting to one. Two workers can overlap one session's CPU
-preparation or finalization with another session's GPU work. Each process owns
-its predictor and mutable tracker state. Claims, ready events, results and
-failures identify both the physical execution device and a zero-based worker
-index; projection ownership and relay generation barriers remain physical-view
-contracts. The coordinator never leases two tasks to one worker slot. CPU
-budgets and bounded scratch reservations scale with the total process count.
-Runtime identity, dispatch records and the final worker registry report the
-configured concurrency. Legacy `worker_pids` lists worker zero on each GPU;
-`worker_slots` records every process.
-
-Extra workers duplicate model and session allocations, so concurrency is an
-explicit VRAM/throughput tradeoff. Separate CUDA contexts can fill CPU gaps;
-simultaneous kernels across processes require a compatible NVIDIA MPS setup.
-The runtime inherits an existing MPS environment. Session initialization,
-cleanup and CUDA context scheduling are included in measured throughput;
-host-phase overlap alone does not prove concurrent CUDA kernels.
-
-The unique `lta_<run-id>` scratch directory is created after discovery, planning,
-and capacity preflight; its creation and resolved path are printed immediately.
-
-`lta_execution_identity.json` records the actual source fingerprint and execution
-contract, including the resolved scratch directory. Per-process JSONL traces under `lta_diagnostics` identify decode,
-planning, startup, queue waits, rendering, SAM sessions, sparse reduction, and
-relay work. The coordinator reports ready, blocked, and active window counts;
-an impossible blocked graph fails with diagnostics instead of spinning.
-`tools/lta_trace_summary.py` summarizes these host phases, including unfinished
-phases in an ongoing or interrupted run. Host phase time is not CUDA kernel time.
-
-Sessions span at most 30 frames and admit at most 128 objects. Seed groups are
-partitioned deterministically. Authoritative masks, temporal dogfood, and lineage
-identity travel through explicit session contracts. Tracker confidence uses the
-sigmoid framewise score; removal sentinels represent bookkeeping. Filled
-predictions stream into bounded window unions and bit-packed relay reducers, while
-boundary dogfood and compact audit state remain resident.
-
-The pinned single-rank SAM 3.1 mask tracker prepares visual features without
-running unused grounding detection. `lta_tracker_features` preserves both tracker
-necks, all six FPN levels, positional encodings, the original BF16 conversion
-before decoder projections, and the inherited autocast context. Unsupported
-custom or distributed model layouts retain their original preparation path;
-failures inside the supported path propagate. Per-session receipts and the final
-worker audit count direct feature preparations and fallbacks. Installed SAM source
-remains unchanged. Mask batches and score/sentinel/finite-check vectors cross to
-the CPU together, while masks retain independent ownership. LTA uses TTA's exact
-foreground-bbox plus halo hole fill to reduce per-instance CPU work.
-
-Every authoritative anchor starts a separate chain across the full physical-view
-frame range. Fixed-size center, backward, and forward windows preserve lineages
-across later partially annotated anchors; another annotation does not terminate
-an existing object. Initial chains combine by recall union. A temporal branch
-stops when its shared boundary has no eligible seed, so recovery through an empty
-dogfood boundary remains unsupported. Predictions must match their originating
-sequence, session, and seed raster dimensions before entering any reducer.
-
-Initial, relay, and temporal-dogfood seed groups use deterministic first-fit
-partitioning over their aggregate shared-pixel domain. Every mask must retain at
-least 95% exclusive support within the 128-object session limit; the worker repeats
-admission at each window boundary. Conflicting lineages remain distinct and retain
-complete seeds in separate sessions. Mask overlap alone does not establish object
-identity.
-
-Adjacent-anchor identity matching and confidence-based handoff are available in
-`lta_tracklets` and the `tools/lta_tracklet_pair.py` diagnostic. Conservative
-one-to-one assignment preserves unmatched tracklets; split/merge hypotheses are
-audit evidence. The diagnostic restores annotated foreground by OR so partially
-labeled anchor slices retain unmatched objects. Production currently uses recall
-union and records that cross-anchor identity reconciliation is not applied.
-Connecting handoff to production requires retaining per-instance masks and
-probabilities before union and planning spatial relays from the reconciled masks.
-
-SAM seed previews exclude pixels shared by simultaneously injected masks.
-Production validates each representable exclusive mask and its union exactly;
-non-shared erosion, expansion, identity changes, and insufficient exclusive support
-fail. Later tracked prompt-frame IoU is diagnostic: production replaces that
-preview with the exact filled seed and restores authoritative foreground after
-terminal filters.
-
-Edge-pinned tile grids use actual eight-neighbor overlap. Each contiguous overlap
-episode generates forward and backward relays. Masks are rebased in global view
-coordinates. Event identity includes lineage, destination, frame, and temporal
-direction: repeated events suppress duplicate work, while new foreground advances
-mask revisions. A complete polygon uses its strongest complete-mask tile; larger
-polygons keep all required authoritative fragments.
-
-A bounded breadth-first fixed point settles cross-tile growth. A safety-cap hit
-with pending growth fails publication. Completed predictions collapse in
-physical-view space, receive final 2-D hole filling, backproject once, and enter
-ordered native-union postprocessing. Immutable hard-positive foreground is
-restored after destructive filters. LTA always saves `Global_union_before_postprocessing`,
-one `Global_after_<filter>` checkpoint for each requested postprocessing operation,
-and `Global_final_output` as NRRDs, even without `--save nrrd`. Full independent
-checkpoints use TTA's `checkpoint`/`select` metadata. The `after_keep_objects`
-checkpoint shows the exact filtered result; final output additionally restores
-original hard-positive annotations, which can reintroduce disconnected components.
-Checkpoint writes are atomic and durable after each stage. Their sidecar preserves
-filter settings and hashes if a later operation fails. Source/model identities are
-validated before the first checkpoint and again before final publication; only the
-complete run manifest marks overall success. Explicit empty annotations are
-audited as known background.
-
-SAM checkpoints and BPE assets are local. Workers verify the pinned distribution,
-commit/source tree, and BPE identity before model construction. The SAM 3.1
-adapter loads one memory-mapped assembled state, audits keys/device/dtype
-placement, and chunks large host-to-device copies. Scoped attention fallbacks and
-constructor adapters restore upstream functions when their scopes close.
-
-The reusable builder defaults to CPU construction and FP32 storage. Production
-profiles use meta construction with compilation and warmup disabled:
-
-| Profile | Admission | Storage and batching |
-| --- | --- | --- |
-| `h100` | Hopper or newer compute capability | FP32 weights and ordinary batches |
-| `egpu` | RTX 4090-class device | `bfloat16_egpu` weights, FP32 decoder FFN linear layers, and constrained batches |
-
-Automatic selection chooses the appropriate profile and applies its device
-validation. The BF16 profile's decoder FFN exceptions are explicit audited dtype
-boundaries. Diagnostics for box, composite, and point prompting remain separate
-from authoritative-mask production propagation.
-
-## Storage, output, and completion transactions
-
-### Workspace and memory backing
-
-Ephemeral scratch uses shared mappings without synchronous writeback. Raw CVOL
-payloads are pathname-backed; source/result shared buffers have explicit
-allocator ownership and release accounting. Linux mount classification uses the
-kernel mount ID of an opened path, or its nearest existing ancestor. Storage
-medium and persistence are separate properties: job-local temporary paths are
-released with the allocation.
-
-Linux native shell payloads can use parent-owned memfds under a run-wide RAM
-plan. Every selected future layer is charged its worst-case packed size before
-dispatch. Admission considers physical/cgroup headroom without swap, final union,
-topology labels, publication credits, codec windows, mirrors, and spools, and
-leaves half the remaining headroom unused. Configured retained-payload and
-anonymous-workspace caps apply.
-
-Parent descriptors survive worker exit until consumer retirement. Between
-producer callbacks, headroom pressure or grant exhaustion spills unfinished
-payloads to disk and releases RAM pages. A failed spill preserves the original
-payload and propagates. Shared-mapping cache identity uses the absolute logical
-layer path without resolving its payload symlink, so distinct memfd-backed layers
-keep distinct mappings through retirement.
-
-### Output encoding and ownership
-
-Native CVOL NRRDs using software member codecs stream nonempty crop row bands
-through the configured codec. Empty rows/slices use reusable gzip zero members
-at bounded power-of-two sizes through 1 MiB. Repeated zero members use at most two
-compact descriptors per gap and batch encoded writes into buffers no larger than
-1 MiB, preserving the existing member bytes and ordering. Completion queues are bounded, and
-sparse mirror observers receive complete crops. Restored geometry and dense
-observers use their corresponding assembly paths.
-
-After scheduler producers join, plain union reconciliation can overlap global
-postprocessing with component exports whose completed immutable CVOL stores are
-independent of the final union. File identity checks reject aliases; live arrays,
-ordinary raw maps, unknown ownership and custom policies retain the export
-barrier. Completed export futures promptly release their source references. The
-final sink join still precedes manifest publication and scratch cleanup.
-
-Member-stream telemetry aggregates encoded write counts and bytes, raw write
-time, compressor wait time and ordered-prefix wait time. NRRD publication records
-file durability, rename and directory durability separately, allowing storage
-waits to be distinguished from compression work.
-
-Threaded libdeflate compression requires the `deflate` Python binding version
-0.9.0 or newer. Known older bindings hold the GIL inside native compression;
-`auto` and `cpu` selection skip them and continue through the validated ISA-L and
-zlib fallbacks. An explicit `libdeflate` request reports the incompatible version
-and the required upgrade. Unknown or custom binding versions require independent
-parallelism qualification. The one-time backend announcement records the selected
-module path, distribution version and Python runtime.
-
-Optional Intel QAT/QATzip and IAA/QPL extensions provide hardware gzip with
-explicit admission, framing, and failure checks. DSA provides opt-in Linux idxd
-workspace copy. Build/provisioning and codec-specific contracts are documented in
-[native/README.md](native/README.md), [QAT notes](native/README_QAT.md), and
-[QPL notes](native/README_QPL.md).
-
-PTA validates input/output containment, generated-target ownership, and link
-safety before fresh-publication cleanup. A nonempty output directory requires
-its matching `.pta_v18_output.json` ownership sentinel. Cleanup touches enumerated
-generated artifacts. Requested `png`, `jpg`, or `tif` remains distinct from the
-effective format: custom channel layouts publish multipage TIFF, and both values
-are recorded in the manifest.
-
-A complete manifest is the final publication commit marker after selected
-outputs, input/model identity checks, resource closure, and scratch cleanup.
-TTA first atomically publishes `status: in_progress` and replaces it with
-`status: complete` after success. PTA removes the prior generated manifest when
-safe cleanup begins. LTA releases temporary ownership before complete publication.
-Failure therefore cannot present an incomplete attempt as a completed run.
-
-## Runtime controls
-
-Controls below request a path; shape, backend, resource, and ownership guards
-still decide admission. Local component overrides take precedence over bundle
-settings. Actual execution is recorded separately from requested policy.
-
-### Geometry and projection
-
-| Control | Default | Effect |
-| --- | --- | --- |
-| `YOLO_TTA_FAST_GEOMETRY` | Off | Requests Spherical FP32 sampling, compiled Spherical CPU pull, and Radial column reuse |
-| `YOLO_TTA_GPU_SPHERICAL_FP32` | Bundle value | FP32/FMA native intensity sampling when every native/logical source axis is at most 4,096 |
-| `YOLO_TTA_CPU_SPHERICAL_COMPILED` | Bundle value | Numba scalar FP64 pull with `fastmath=False` |
-| `YOLO_TTA_GPU_RADIAL_COLUMN_GEOMETRY` | Bundle value | Compute FP64 column geometry once and reuse it across rows |
-| `YOLO_TTA_GPU_SPHERICAL_NATIVE_KERNEL`, `YOLO_TTA_GPU_RADIAL_NATIVE_KERNEL` | On | Native CUDA input samplers with resident Torch fallback |
-| `YOLO_TTA_GPU_SPHERICAL_BACKPROJECT`, `YOLO_TTA_GPU_RADIAL_BACKPROJECT`, `YOLO_TTA_GPU_TILTED_AZIMUTHAL_BACKPROJECT` | On | Completed-view CUDA projection admission |
-| `YOLO_TTA_CPU_SPHERICAL_COMPACT` | On | Encoded crop publication from sink-only CPU projection |
-| `YOLO_TTA_CROPPED_UPLOAD_PIPELINE` | On | Two-lane staging for eligible large compiled crop uploads |
-| `YOLO_TTA_RADIAL_OWNER` | On | Eligible native Radial cleanup/source-bitset ownership |
-| `YOLO_TTA_GPU_SPHERICAL_LOCALITY` | On | Parent-local placement for cacheable Spherical tasks |
-| `YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT` | On | Pressure/age retirement lease lane |
-| `YOLO_TTA_GPU_SPHERICAL_AGE_RETIREMENT` | On | Age admission within that lane |
-| `YOLO_TTA_SPHERICAL_FULL_MATH_PREFLIGHT` | Off | Expanded Spherical mathematical preflight |
-| `YOLO_TTA_DIRECT_TILED_PROTO_UNION` | On | Layout-eligible tiled mask composition |
-| `YOLO_TTA_NATIVE_TRT_RING` | Off | Resident Radial/Spherical TensorRT slots and postprocessing |
-
-The Spherical FP32 policy permits an absolute gray8 qualification tolerance of
-two; generic CUDA keeps its tolerance of one. Categorical sampling and 64-bit
-source addressing preserve their own contracts. Requested precision participates
-in policy/plan identity. This tolerance is a validation policy, not a runtime
-pixel comparison or a universal input-error bound.
-
-The fast-geometry bundle selects Radial column reuse at at least 256 active rows,
-256 columns, and 262,144 active pixels. Explicit component selection also admits
-small cases. Optional geometry-allocation or compiler setup refusal uses the
-reference route before publication starts.
-
-Tilted Azimuthal sink publication uses CUDA when an exclusive retirement lease
-and bounded workspace are available. Integer tables retain the CPU reference's
-float32 shear rounding, processing-row aggregation, and output-index mapping.
-The GPU accumulates into the same row-packed source union with 64-bit addresses;
-input masks are staged in bands rather than uploaded as a whole parent volume.
-Raw or packed CVOL crops are returned only after every input frame has contributed,
-because a later tilted frame can modify an earlier source slice.
-
-When GPU admission is busy, ordered CPU work continues and periodically retries.
-A successful handoff copies the completed packed prefix, drains outstanding CPU
-readers, and continues from the next input frame. Spherical, Radial, and Tilted
-Azimuthal share the retirement queue and its pressure/age admission rules. Layouts
-or workspaces outside the CUDA contract retain CPU projection; non-sink calls
-also retain their CPU path. Unsafe CUDA fence failures retain their device owners
-and lease. Each policy pass still publishes its own component; this acceleration
-does not change inference sampling or combine independently editable NRRDs.
-
-### Sparse publication and interpolation
-
-| Control | Default | Effect |
-| --- | --- | --- |
-| `YOLO_TTA_PACKED_OWNER_PUBLICATION` | On | Row-packed source-bitset CVOL publication |
-| `YOLO_TTA_NRRD_CROP_ROW_SPANS` | On | Native software-codec crop-row streaming |
-| `YOLO_TTA_PUBLICATION_RAM` | On | Eligible Linux planned retained-payload RAM tier |
-| `YOLO_TTA_PUBLICATION_RAM_GIB` | No additional positive cap | Caps retained payloads when set above zero |
-| `YOLO_TTA_TOPOLOGY_RUN_ADJACENCY` | On | Bounded equal-label run intersection |
-| `YOLO_TTA_GPU_INTERPOLATION` | On | Warm-worker CUDA bridge-painting admission |
-| `YOLO_TTA_GPU_INTERPOLATION_RENDER_AUTOTUNE` | On | CPU/CUDA first-batch comparison |
-| `YOLO_TTA_GPU_INTERPOLATION_RADIUS` | Off | CUDA radius evaluator |
-| `YOLO_TTA_GPU_INTERPOLATION_REQUIRED` | Off | Require CUDA and make admission/execution failure fatal |
-| `YOLO_TTA_GPU_INTERPOLATION_STREAMS` | 4 | Non-default streams per lease |
-| `YOLO_TTA_GPU_INTERPOLATION_RESERVE_MIB` | 1024 | Free-VRAM reserve withheld from cache sizing |
-| `YOLO_TTA_GPU_INTERPOLATION_CACHE_MIB` | 1024 | Retained SDF/section payload cap |
-| `YOLO_TTA_GPU_INTERPOLATION_CREATE_CONTEXT` | Off | Permit a dedicated interpolation process to create CUDA context |
-| `YOLO_TTA_GPU_INTERPOLATION_MAIN_PROCESS` | Off | Permit main-process context creation together with the preceding control |
-
-Interpolation's logical cache excludes transient library workspaces and allocator
-pool blocks, which are released at lease closure. The global interpolation-pass
-limit is one by default. Radius, painting, transfer, lock wait, cache eviction,
-and fallback are reported separately.
-
-### Optional multi-GPU transactions
-
-`YOLO_TTA_D1_OWNER_GROUPS=1` admits deterministic slice coverage for one eligible
-D1 parent across idle CUDA workers. The scheduler atomically reserves the group
-before dispatch and uses `YOLO_TTA_D1_OWNER_GROUP_SIZE` to cap participants at the
-visible device count. Participants retain dedicated IPC-exportable partial
-bitsets until CUDA-IPC/NVLink reduction or bounded host recovery is acknowledged,
-then explicitly acknowledge release. Nonparticipants continue view-level work;
-one-owner execution is the admission fallback.
-Participant release acknowledgments gate both worker reuse and scheduler
-quiescence.
-Groups must be admitted before a parent's first dispatch; the current protocol
-does not promote an already active single owner. Native Radial shell owners and
-parents requiring a native-view shadow remain outside this group path.
-
-`YOLO_TTA_GPU_RESIDENT_TAIL=1` uploads a settled host union into contiguous
-job-visible Z shards. Bounded device CCL blocks retain exact 26-connected labels;
-compact equivalence pairs cross block/shard boundaries. CPU union-find resolves
-area/boundary metadata, and the filtered candidate commits only after every GPU
-succeeds. Ordinary failure leaves the host union available for CPU `keep_objects`;
-`YOLO_TTA_GPU_RESIDENT_TAIL_REQUIRED=1` makes failure fatal.
-Global top-N selection follows cross-shard component merging. An equal-area tie
-across the keep/drop cutoff falls back to CPU to preserve its ordering; required
-GPU mode raises instead. Optional-mode resident topology failure restarts from
-the intact host authority; it does not continue a partial graph on fewer devices.
-
-Both controls default off. `DistributedBinaryArtifact` defines the common
-host-volume, source-bitset, and resident-shard contract. Each transaction uses
-only selected job-visible devices and has explicit ownership through reduction,
-commit, and retirement.
-The common artifact interface does not itself implement contributor-to-resident
-final-union ingestion or multi-GPU interpolation; those remain separate designs.
-
-## Diagnostics and validation
-
-`YOLO_TTA_TASK_TRACE=1` records bounded host task boundaries.
-`YOLO_TTA_TELEMETRY_DIR` selects per-run persistent telemetry and takes precedence
-over the single-path setting. Trace records identify dispatch, dequeue, compute,
-publication, transport, receipts, and exclusive stage leases.
-Task and phase callbacks update process-local state and signal a single background
-writer. Snapshot requests coalesce; diagnostic serialization and file writes run
-outside the locks used to record task boundaries. Explicit flushes drain pending
-records, and final shutdown joins the writer. The persistent destination remains
-the selected telemetry directory.
-
-Scheduler timing counters and ordinary scheduler counters/gauges coalesce under
-separate short locks. This includes the pressure gauge published on both sides
-of every GPU refill. The scheduler facade uses these APIs consistently; it does
-not acquire the general telemetry lock for metric updates. Trace producers
-append to the bounded sequence buffer under their own short lock, then only try
-the general telemetry lock without waiting when a writer notification is due.
-They do not wait behind NRRD compression metrics or snapshot preparation. The
-writer merges timing deltas and copies trace batches using a fixed lock order;
-final flush fences accepted events before choosing its terminal sequence.
-This keeps diagnostics from delaying the work they measure while retaining the
-same counter names, event identities and explicit overflow accounting.
-Ordinary and scheduler gauge writes preserve the latest accepted value when
-they share a key. The CPU NRRD contention replay enables pressure publication so
-its dispatch path exercises these metric writes along with timing and tracing.
-
-GPU stage availability changes request an admission retry on the scheduler's
-owning thread. A released stage must make pending inference and eligible warm
-interpolation workers usable without waiting for another worker result.
-Requests coalesce separately from ordinary result and future notifications;
-stage callbacks never mutate inference ownership directly. Scheduler wait logs
-include physical finalization and union queues alongside the transient-memory
-reservation so a GPU admission wait can be distinguished from output backpressure.
-
-Trace buffering is finite. If storage cannot keep up and the event buffer fills,
-capture stops, queued records are preserved, and telemetry records the first
-dropped sequence and dropped-event count. The trace reader reports that capture
-as incomplete even when its saved event prefix is contiguous. Diagnostic overflow
-does not block inference dispatch or worker completion credits.
-`tools/analyze_pipeline_trace.py` joins process streams and reports missing or
-ambiguous boundaries. Host intervals and concurrent stage sums are interpreted
-separately from CUDA-event kernel measurements and end-to-end walltime.
-GPU gauges publish an atomic acquisition interval and physical NVML device
-identity when available. Repeated trace flushes retain the same sample timestamp;
-they do not constitute new utilization observations. CUDA-visible device tokens
-remain recorded separately from NVML indices.
-
-`scheduler.operation.*` counters distinguish wall time from CPU time consumed by
-the calling thread in selection, GPU refilling, result handling, background
-retirement and workspace admission. Nested totals overlap. Operations taking at
-least 250 ms emit a `scheduler_slow_operation` trace with both durations. Wall
-time minus thread CPU includes scheduling, GIL/resource waits and work delegated
-to other threads; it does not identify one particular wait or total process CPU.
-
-`scheduler.step.*` diagnostics also measure individual admission, backlog, ownership,
-descriptor-transfer, serialization and queue-submission steps. These timings
-overlap the enclosing refill and result counters and must not be summed with
-them. They distinguish where a delay occurs without asserting that a long wall
-interval identifies a lock or GPU wait. Steps taking at least 250 ms emit a
-`scheduler_slow_step` event with available worker and task identities.
-
-On supported POSIX hosts, mapping advice uses the libc `madvise` call through
-`ctypes.CDLL`, which releases the Python interpreter lock during the syscall.
-The complete mapping stays exported until the call returns, including read-only
-maps, so another thread cannot close or resize its storage while the address is
-in use. This preserves the existing advice and full-mapping range. Unsupported
-hosts retain the native mapping method and existing best-effort cleanup rules.
-Advice telemetry measures the remaining host cost; this change does not promise
-a particular workload speedup.
-
-Local performance qualification tools separate diagnosis from cluster runtime:
-`tools/profile_tta_dispatch.py` replays recorded task descriptors through the
-production scheduler with logical workspaces; `tools/profile_tta_nrrd_contention.py`
-adds real raster-sized NRRD writers and verifies decoded hashes. The latter is
-plan-only unless `--execute` is supplied. `tools/profile_tta_local_feed.py` replays
-a saved single-GPU invocation, reserves the sibling Scratch GPU lock and heatsoaks
-the device. `tools/profile_tta_scheduler_lines.py` uses Python 3.12 per-code
-monitoring for bounded scheduler line-gap evidence. It never retains another
-thread's frame or buffer exports, and a profiling window stops measurement, not
-the wrapped pipeline. These fixtures do not establish four-H100 throughput.
-
-`tools/nrrd_output_fixture.py` reconstructs a packed CVOL from a saved binary NRRD
-one plane at a time, preserving source geometry and verifying decoded hashes.
-`tools/profile_nrrd_output.py` uses synthetic or saved fixtures to compare output
-with and without telemetry, including optional low-quality mirrors. It records
-codec, member, executor queue and optional lock timings; hash verification is
-outside the timed interval. `tools/probe_nrrd_codec_parallelism.py` needs only
-Python and the optional compression binding and checks CPU compression parallelism
-without importing XTA, a model runtime or GPU libraries.
-
-`tools/qualify_nvcomp_nrrd.py` is an experimental codec qualification tool, not a
-pipeline backend selector. It compares CPU deflate with nvCOMP standard Gzip RAW
-and standard Deflate RAW plus zlib CRC32/ISIZE framing, including host transfers
-and mixed-member decoding. nvCOMP's proprietary native bitstream and GDeflate
-are not substitutes for NRRD gzip. Any future GPU compression lanes must retain
-the existing ordered member and byte-window contracts and activate only after
-inference asset release, under the shared GPU stage coordinator.
-
-`--capture_component_replay PERSISTENT_DIR` records bounded immutable view-native
-Azimuthal components, geometry, and checksums. Defaults select one component from
-each of three vertical +30-degree tilted views within a 4 GiB input budget.
-`--capture_component_views` and `--capture_component_limit` control selection.
-`tools/replay_component_projection.py` compares decoded reference/sparse output
-in fresh CPU processes without rerunning inference. `--cuda-reference` requests
-a CUDA reference and records actual admission.
-
-Run the source checks with the applicable dependencies installed:
-
-```text
-python -m unittest discover -s tests -v
-python tools/smoke_import.py
-python tools/verify_package_inventory.py
-```
-
-Ordinary tests use the installed numerical dependencies. Dependency-free smoke
-programs run in separate processes so their stubs cannot contaminate numerical
-tests. Individual corpora can also be selected directly:
-
-```text
-python -m unittest discover -s tests -p test_interpolation_geometry.py -v
-python -m unittest discover -s tests -p test_external_augmentation_examples.py -v
-```
-
-| Validation boundary | Entry points |
-| --- | --- |
-| Native shell sampling/projection | Cylindrical/Spherical CUDA tests and `tools/qualify_spherical_sampling.py`, `tools/qualify_spherical_large_address.py` |
-| Cropped source upload | `tools/qualify_cropped_upload_pipeline.py` and crop-upload tests |
-| TensorRT ownership and masks | `tools/qualify_native_trt_lease.py`, `tools/qualify_native_trt_pipeline.py`, and native TensorRT tests |
-| Sparse projection replay | `python tools/replay_component_projection.py CAPTURE_DIR --output RESULT_DIR` |
-| Intel accelerators | `python tools/intel_accelerator_selftest.py --backend all` |
-| Multi-GPU finalization and IPC | `tools/hgx_selftest.py`, `tools/d1_ipc_selftest.py` |
-| Bounded SAM sessions | `tools/lta_gpu_smoke.py`, `tools/lta_mask_seed_smoke.py`, `tools/lta_tracklet_pair.py` |
-| LTA production execution | `tools/lta_production_smoke.py` and LTA worker/execution tests; `tools/lta_full_volume.py` is a separate diagnostic |
-| LTA worker profiling | `tools/lta_worker_profile.py`: heated GPU, repeated fixed cached fixtures, cProfile, utilization samples, phase times, and exact output hashes |
-| LTA tracker feature parity | `tools/lta_tracker_feature_smoke.py`: compares the original and direct visual-feature paths on the same real frames, requiring exact cached tensors and no fallback |
-| LTA full-depth transport and task graph | `tools/lta_host_io_profile.py`, `tools/lta_host_pipeline_smoke.py`, and `tools/lta_window_gpu_smoke.py`: full logical dimensions, spawned worker/relay protocols, and real single-GPU chain/window parity |
-
-Hardware-backed tests require the target runtime and representative data/models.
-Functional parity, numerical tolerances, and performance are separate checks.
-Net voxel counts and high aggregate IoU do not establish spatial or small-component
-identity; precision changes need decoded masks and topology checks. Performance
-comparisons preserve the workload and requested outputs, use repeated controls,
-and distinguish isolated component timing from whole-command walltime.
-Keep tracing settings and telemetry storage comparable, or record their changes
-as confounders in the performance comparison.
-GPU benchmarks heatsoak the device before timing. Generated caches, captures,
-logs, reports, builds, and release archives belong in task-specific Scratch
-locations. Build intermediates created in the repository are cleaned after
-validation; source, tests, tools, packaging, and this architecture remain tracked.
-
-The package statement inventory authenticates preserved definitions and reviewed
-implementation boundaries. Wheels include this document and the sole versioned
-launcher, with selected replay/hardware/LTA tools under `share/xta/tools`.
+The default requires a clean Git checkout and bundles committed Git bytes.
+`--snapshot` explicitly validates an uncommitted development tree and labels its
+bundle accordingly. Each step must pass without changing the source tree;
+the receipt and logs stay in the requested Scratch directory. Tests establish
+Ultralytics settings outside the checkout and check for leaked dependency stubs
+and TF32 settings. CUDA tests share the workspace's atomic `Scratch/Temp/GPU_LOCK`.
+The gate requires an available CUDA device and successful execution of the
+CUDA geometry/policy cases that exposed the TF32 leak. `--snapshot --cpu-only`
+records explicitly reduced coverage and does not qualify a release.

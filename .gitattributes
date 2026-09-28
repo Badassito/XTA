@@ -1,5 +1,8 @@
 * text=auto
+.gitattributes text eol=lf
+.gitignore text eol=lf
 *.py text eol=lf
 *.toml text eol=lf
 *.md text eol=lf
 *.json text eol=lf
+*.in text eol=lf

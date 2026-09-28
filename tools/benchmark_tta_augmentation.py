@@ -28,7 +28,8 @@ def gpu_state(logical_index):
     physical_id=visible[logical_index].strip() if visible[0].strip() else str(logical_index)
     raw=subprocess.check_output(['nvidia-smi','--id='+physical_id,
                                  '--query-gpu=temperature.gpu,power.draw,utilization.gpu,clocks.sm',
-                                 '--format=csv,noheader,nounits'],text=True).strip().splitlines()[0].split(',')
+                                 '--format=csv,noheader,nounits'],text=True,
+                                encoding='utf-8',errors='replace').strip().splitlines()[0].split(',')
     return dict(zip(('temperature_c','power_w','utilization_pct','clock_sm_mhz'),map(lambda v:float(v.strip()),raw)))
 
 

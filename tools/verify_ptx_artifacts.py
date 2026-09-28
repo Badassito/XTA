@@ -57,7 +57,8 @@ def main():
             raise RuntimeError('Unexpected truncated ELF: ' + str(source))
         exported = target / (digest[:24] + '.cubin')
         exported.write_bytes(binary)
-        result = subprocess.run([command, '--dump-sass', str(exported)], capture_output=True, text=True)
+        result = subprocess.run([command, '--dump-sass', str(exported)], capture_output=True,
+                                text=True, encoding='utf-8', errors='replace')
         listing = result.stdout + result.stderr
         sass = exported.with_suffix('.sass.txt')
         sass.write_text(listing, encoding='utf-8')

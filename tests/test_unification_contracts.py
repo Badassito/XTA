@@ -74,10 +74,12 @@ class UnificationContractTests(unittest.TestCase):
             "assert not (forbidden & loaded), forbidden & loaded"
         )
         completed = subprocess.run(
-            [sys.executable, "-c", program],
+            [sys.executable, "-X", "utf8", "-c", program],
             cwd=ROOT,
             env={**os.environ, "YOLO_TTA_TELEMETRY": "0"},
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             check=False,

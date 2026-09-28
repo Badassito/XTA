@@ -14,8 +14,8 @@ from XTA import cli, config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRENT_VERSION = "23.0.1"
-CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v23.0.1_SLURM.py"
+CURRENT_VERSION = "23.0.2"
+CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v23.0.2_SLURM.py"
 PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v22.3.2_SLURM.py"
 SCRATCH_REPORTS = (
     "TTA_EXTERNAL_AUGMENTATION.md",
@@ -36,7 +36,7 @@ class PackageMetadataTests(unittest.TestCase):
     def test_runtime_version_constants_are_aligned(self) -> None:
         self.assertEqual(XTA.__version__, CURRENT_VERSION)
         self.assertEqual(config.SCRIPT_VERSION, CURRENT_VERSION)
-        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2401")
+        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2402")
         self.assertEqual(config.SCRIPT_BASENAME, CURRENT_LAUNCHER)
         self.assertEqual(cli.SCRIPT_VERSION, CURRENT_VERSION)
         self.assertEqual(cli.SCRIPT_BASENAME, CURRENT_LAUNCHER)
@@ -47,10 +47,12 @@ class PackageMetadataTests(unittest.TestCase):
         scripts = _toml_section(source, "project.scripts")
         package_data = _toml_section(source, "tool.setuptools.package-data")
         data_files = _toml_section(source, "tool.setuptools.data-files")
+        dynamic = _toml_section(source, "tool.setuptools.dynamic")
 
         self.assertIn('name = "xta"', project)
-        self.assertIn(f'version = "{CURRENT_VERSION}"', project)
-        self.assertIn('"ultralytics>=8.4.128"', project)
+        self.assertIn('dynamic = ["version"]', project)
+        self.assertIn('version = {attr = "XTA.__version__"}', dynamic)
+        self.assertIn('"ultralytics>=8.4.128,<8.5"', project)
         self.assertIn('xta = "XTA.cli:run"', scripts)
         self.assertIn(
             '"XTA.examples.external_augmentations" = ["README.md"]',
@@ -105,7 +107,8 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertNotIn("include GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py", manifest_lines)
         self.assertNotIn("include GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py", manifest_lines)
         self.assertNotIn(f"include {PREVIOUS_LAUNCHER}", manifest_lines)
-        self.assertIn("include XTA/_package_inventory.json", manifest_lines)
+        self.assertIn("include release/_package_inventory.json", manifest_lines)
+        self.assertIn("include release/README.md", manifest_lines)
         self.assertIn("include ARCHITECTURE.md", manifest_lines)
         for report in SCRATCH_REPORTS:
             self.assertNotIn(f"include {report}", manifest_lines)
@@ -151,10 +154,12 @@ class PackageMetadataTests(unittest.TestCase):
     def test_complete_source_bundle_keeps_architecture_and_excludes_scratch_reports(self) -> None:
         with tempfile.TemporaryDirectory(prefix="xta-release-metadata-") as directory:
             completed = subprocess.run(
-                [sys.executable, str(ROOT / "tools" / "build_source_release.py"),
-                 "--output-dir", directory],
+                [sys.executable, "-X", "utf8", str(ROOT / "tools" / "build_source_release.py"),
+                 "--output-dir", directory, "--snapshot"],
                 cwd=ROOT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 check=False,
@@ -166,6 +171,9 @@ class PackageMetadataTests(unittest.TestCase):
                 manifest = json.loads(source.read(prefix + "RELEASE_MANIFEST.json"))
                 self.assertEqual(manifest["version"], CURRENT_VERSION)
                 self.assertEqual(manifest["launcher"], CURRENT_LAUNCHER)
+                self.assertEqual(manifest["source"], "working-tree-snapshot")
+                self.assertIn("release/_package_inventory.json", manifest["files"])
+                self.assertIn("release/README.md", manifest["files"])
                 for name in (CURRENT_LAUNCHER, "ARCHITECTURE.md", ".gitattributes",
                              "native/README.md", "native/README_QAT.md", "native/README_QPL.md",
                              "XTA/examples/external_augmentations/README.md",

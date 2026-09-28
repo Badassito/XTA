@@ -788,14 +788,15 @@ class LtaProductionExecutionTests(unittest.TestCase):
         with (
             mock.patch("XTA.lta_execution.PRODUCTION_LTA_TILE_SIZE", 4),
             mock.patch("XTA.lta_execution.LtaWorkerPool", side_effect=pool_factory),
-            mock.patch("XTA.lta_execution._materialize_source_volume", side_effect=source_loader),
+            mock.patch("XTA.lta_execution._materialize_source_volume", new=source_loader),
             mock.patch(
                 "XTA.lta_execution.fill_completed_view_holes_2d_inplace",
-                return_value=types.SimpleNamespace(manifest_record=lambda: {"added_pixels": 0}),
+                new=lambda *_args, **_kwargs: types.SimpleNamespace(
+                    manifest_record=lambda: {"added_pixels": 0}),
             ),
             mock.patch(
                 "XTA.lta_execution.fill_merged_seed_mask_holes_2d",
-                side_effect=lambda mask, **_kwargs: types.SimpleNamespace(
+                new=lambda mask, **_kwargs: types.SimpleNamespace(
                     mask=np.asarray(mask, dtype=bool).copy(),
                     receipt=types.SimpleNamespace(
                         manifest_record=lambda: {"added_pixels": 0}
@@ -804,10 +805,10 @@ class LtaProductionExecutionTests(unittest.TestCase):
             ),
             mock.patch(
                 "XTA.assembly.project_view_volume_to_orthogonal_volume",
-                side_effect=backproject,
+                new=backproject,
             ),
-            mock.patch("XTA.lta_execution.finalize_lta_native_union", side_effect=finalizer),
-            mock.patch("XTA.lta_execution.write_global_final_output_nrrd", side_effect=nrrd_writer),
+            mock.patch("XTA.lta_execution.finalize_lta_native_union", new=finalizer),
+            mock.patch("XTA.lta_execution.write_global_final_output_nrrd", new=nrrd_writer),
             mock.patch("XTA.lta_execution.revalidate_local_sam_bundle"),
             input_revalidation_context,
             cleanup_context,
@@ -956,10 +957,16 @@ class LtaProductionExecutionTests(unittest.TestCase):
 
     def test_manifest_replaces_preflight_schedule_with_actual_dynamic_dispatches(self) -> None:
         _FakeWorkerPool.instances.clear()
+        driver_calls = []
+
+        def drive_and_record(*args, **kwargs):
+            driver_calls.append(kwargs['canonical_frontier'])
+            return _drive_workers_to_fixed_point(*args, **kwargs)
+
         with tempfile.TemporaryDirectory() as temp_dir, mock.patch(
             "XTA.lta_execution._drive_workers_to_fixed_point",
-            wraps=_drive_workers_to_fixed_point,
-        ) as driver:
+            new=drive_and_record,
+        ):
             result, pool, _bytes = self._run(Path(temp_dir), (0, 1, 2, 3))
             manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
             identity = json.loads((result.manifest_path.parent / "lta_execution_identity.json").read_text())
@@ -969,8 +976,7 @@ class LtaProductionExecutionTests(unittest.TestCase):
                 for line in path.read_text().splitlines()
             ]
 
-        driver.assert_called_once()
-        self.assertIs(driver.call_args.kwargs["canonical_frontier"], True)
+        self.assertEqual(driver_calls, [True])
         self.assertEqual(identity["contract"], "lta.window_dag/1")
         self.assertEqual(identity["requested_devices"], [0, 1, 2, 3])
         self.assertEqual(identity["scratch_root"], manifest["run_plan"]["temp_root"])
@@ -1129,11 +1135,14 @@ class LtaProductionExecutionTests(unittest.TestCase):
         self.assertEqual(manifest["execution"]["device_schedule"]["status"], "settled")
 
     def test_dense_reduction_failure_prevents_publication(self) -> None:
+        def fail_reduction(*_args, **_kwargs):
+            raise RuntimeError("injected dense reduction failure")
+
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             with mock.patch(
                 "XTA.lta_execution._consume_chain_manifest",
-                side_effect=RuntimeError("injected dense reduction failure"),
+                new=fail_reduction,
             ):
                 with self.assertRaisesRegex(RuntimeError, "injected dense reduction failure"):
                     self._run(root, (0, 1))

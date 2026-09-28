@@ -327,7 +327,7 @@ class GpuAssetRetirementTests(unittest.TestCase):
             'set_retina_mask_processor': None, 'set_gpu_worker_fused_preflight_specs': None,
             'set_angle_variant_gpu_fastpath': None, 'ensure_yolo_ready_for_predict': None,
             'validate_yolo_model_input_channels': None, 'require_channel_aware_yolo_preprocess_patch': None,
-            'ensure_cpu_retina_mask_predictor_patch': None, '_init_gpu_union_retirement_manager': None,
+            'ensure_cpu_retina_mask_predictor_patch': True, '_init_gpu_union_retirement_manager': None,
             '_init_worker_gpu_render_engine': engine, 'load_ultralytics_model': model,
             'cpu_retina_masks_enabled': True, 'd1_owner_pipeline_enabled': False,
             '_interpolation_process_entry': {'auxiliary_ok': True},

@@ -1,7 +1,8 @@
 include ARCHITECTURE.md
-include GPT-6-Astra-Ultra_v23.0.1_SLURM.py
+include GPT-6-Astra-Ultra_v23.0.2_SLURM.py
 include setup.py
-include XTA/_package_inventory.json
+include release/_package_inventory.json
+include release/README.md
 recursive-include XTA/examples *.py *.md
 recursive-include tools *.py
 recursive-include native *.c *.h *.md

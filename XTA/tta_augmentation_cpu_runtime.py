@@ -9,6 +9,7 @@ from .geometry import prediction_result_frame_spec
 from .tta_augmentation_config import policy_seed
 from .tta_augmentation_cpu import worker_cpu_policy
 from .tta_augmentation_retirement import SliceMetadataAccumulator
+from .runtime import close_memmap_array_without_flush
 from .tta_augmentation_runtime import (
     _CoverageWriter, _open_policy_sibling_outputs, _padding_metadata, _validate_policy_parent_group,
 )
@@ -122,4 +123,4 @@ def predict_cpu_policy_source(runner: Any, source: Any, *, task: dict[str, Any],
             if writer is not None:
                 writer.close()
         for mm in owned:
-            mm._mmap.close()
+            close_memmap_array_without_flush(mm)
