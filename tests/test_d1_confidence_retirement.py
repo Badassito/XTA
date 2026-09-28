@@ -342,12 +342,16 @@ class DeviceCaptureTests(unittest.TestCase):
                 acc.union_dev.zero_()
                 acc.conf_dev = acc.union_dev = None
                 return {}
-            result = cuda_d1._consume_device_union_with_confidence(task, accumulator, consume)
+            with mock.patch.dict(os.environ, {'YOLO_TTA_D1_GPU_MASK_CONFIDENCE': '1'}):
+                result = cuda_d1._consume_device_union_with_confidence(task, accumulator, consume)
             shard = result['_publication_future'].result(timeout=20)['d1_confidence_shard']
             with ConfidenceEvidenceRef.open(shard['path']).native_reader() as reader:
                 actual, _ = reader(0,4)
             np.testing.assert_array_equal(actual, expected)
-            self.assertEqual(shard['capture_metrics']['d2h_bytes'], 2*(136**2+10))
+            self.assertEqual(shard['capture_metrics']['d2h_bytes'], 136**2+2*10)
+            self.assertEqual(shard['capture_metrics']['d2h_calls'], 3)
+            self.assertEqual(shard['capture_metrics']['gpu_masked_crops'], 1)
+            self.assertEqual(shard['capture_metrics']['gpu_mask_small_crops'], 1)
 
     def test_generic_radial_device_bounds_include_empty_borders_and_unknown_foreground(self):
         import torch

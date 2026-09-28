@@ -266,7 +266,7 @@ def _project_spherical_block(source, view, radii, rotation, shape, first_z, coun
 
 
 def _select_spherical_cpu_pull(source, view, radii, rotation, shape, bboxes):
-    """Opt into compiled bounded CPU pulls without changing the NumPy oracle."""
+    """Select exact compiled CPU pulls, retaining NumPy as a fallback."""
     if not spherical_cpu_compiled_requested() or source.dtype not in (np.uint8, np.bool_):
         return None
     try:
@@ -364,9 +364,11 @@ def _spherical_block_schedule(depth, plane_bytes, workers, *, compact=False, com
         # A block can transiently retain individual crops, their concatenation,
         # one bounded projection plane, and its small Python wire records.
         worker_bytes += plane_bytes * (block_depth + 1) + block_depth * _CPU_ENCODED_SLICE_BYTES
-    # Compiled scalar pulls retain no coordinate arrays. Use their actual bounded
-    # strip workspace without increasing concurrency beyond the legacy schedule.
-    worker_count = max(1, min(legacy_worker_count, math.ceil(depth / block_depth),
+    # Compiled compact pulls retain no coordinate arrays. Bound their readers
+    # by the caller's CPU allocation and their own workspace. Dense and NumPy
+    # compact paths keep the existing concurrency ceiling.
+    worker_limit = min(int(workers), _cpu_count()) if compact and compiled else legacy_worker_count
+    worker_count = max(1, min(worker_limit, math.ceil(depth / block_depth),
                               max(1, _INFLIGHT_WORK_BYTES // max(1, worker_bytes))))
     return block_depth, worker_count
 

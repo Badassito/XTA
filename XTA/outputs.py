@@ -1731,6 +1731,10 @@ class _MemberParallelGzipPayloadWriter:
             'canonical_zero_write_calls': 0, 'output_write_bytes': 0,
             'raw_write_seconds': 0.0, 'pending_wait_seconds': 0.0,
             'ordered_prefix_wait_seconds': 0.0,
+            'later_ready_prefix_wait_seconds': 0.0,
+            'window_wait_seconds': 0.0,
+            'zero_descriptor_wait_seconds': 0.0,
+            'close_wait_seconds': 0.0,
         }
         self._writer_stats_published = False
 
@@ -1841,11 +1845,19 @@ class _MemberParallelGzipPayloadWriter:
         self._hardware_lookbehind = mv if owned else bytes(mv)
         self._hardware_lookbehind_is_zero = False
 
-    def _collect_completions(self, *, block: bool) -> int:
+    def _collect_completions(self, *, block: bool,
+                             wait_cause: Optional[str] = None) -> int:
         if not self._pending:
             return 0
         if bool(block):
+            # Preserve the historical counter for comparisons with older runs.
+            # It is usually equal to pending_wait_seconds after a ready-prefix
+            # drain and must not be interpreted as proof of head-of-line blocking.
             prefix_missing = self._next_write_sequence not in self._completed
+            # This separate counter requires a later member already ready when
+            # the wait starts; it is not comparable with the historical key.
+            later_ready = any(seq > self._next_write_sequence
+                              for seq in self._completed)
             started = time.perf_counter()
             try:
                 done, _not_done = wait(set(self._pending), return_when=FIRST_COMPLETED)
@@ -1854,6 +1866,10 @@ class _MemberParallelGzipPayloadWriter:
                 self._writer_stats['pending_wait_seconds'] += elapsed
                 if prefix_missing:
                     self._writer_stats['ordered_prefix_wait_seconds'] += elapsed
+                if later_ready:
+                    self._writer_stats['later_ready_prefix_wait_seconds'] += elapsed
+                if wait_cause is not None:
+                    self._writer_stats[f'{wait_cause}_wait_seconds'] += elapsed
         else:
             done = {fut for fut in self._pending if fut.done()}
         for fut in done:
@@ -1948,9 +1964,17 @@ class _MemberParallelGzipPayloadWriter:
         self._collect_completions(block=False)
         self._write_ready_prefix()
         while self._pending and (bool(block) or self._inflight_bytes > self.window_bytes):
-            self._collect_completions(block=True)
+            self._collect_completions(block=True,
+                wait_cause='close' if block else 'window')
             self._write_ready_prefix()
         if bool(block):
+            self._write_ready_prefix()
+
+    def _drain_zero_descriptor_pressure(self) -> None:
+        """Bound ready zero descriptors without waiting for unrelated later jobs."""
+        self._drain(block=False)
+        while self._pending and len(self._completed) >= 128:
+            self._collect_completions(block=True, wait_cause='zero_descriptor')
             self._write_ready_prefix()
 
     def _write_impl(self, data: bytes | bytearray | memoryview) -> int:
@@ -2045,9 +2069,13 @@ class _MemberParallelGzipPayloadWriter:
             if tail_members:
                 self._enqueue_repeated_zeros(b''.join(tail_members), 1,
                                              members_per_repeat=len(tail_members))
-            # A whole run owns at most two tiny descriptors, independent of its logical
-            # size. One drain preserves ordering without scanning futures per member.
-            self._drain(block=len(self._completed) >= 128)
+            # A whole run owns at most two tiny descriptors, independent of its
+            # logical size. Wait only until the ready map is bounded; close()
+            # remains the only unconditional full drain.
+            if len(self._completed) >= 128:
+                self._drain_zero_descriptor_pressure()
+            else:
+                self._drain(block=False)
         except BaseException:
             self.closed = True
             self._abandon_and_settle()

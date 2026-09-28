@@ -56,6 +56,11 @@ RELEASES = (
             inventory.REVIEWED_V24_0_2_RELEASE_PREDECESSOR_SHA256,
             inventory.REVIEWED_V24_RELEASE_SHA256,
             inventory.REVIEWED_V24_0_2_RELEASE_PREDECESSOR_COMMIT),
+    Release('v24_0_3_release_review', '24.0.3', inventory.reviewed_v24_0_3_release_contract,
+            inventory.reviewed_v24_0_2_release_contract,
+            inventory.REVIEWED_V24_0_3_RELEASE_PREDECESSOR_SHA256,
+            inventory.REVIEWED_V24_0_2_RELEASE_SHA256,
+            inventory.REVIEWED_V24_0_3_RELEASE_PREDECESSOR_COMMIT),
 )
 
 
@@ -128,6 +133,7 @@ def test_reauthenticated_review_cannot_change_independent_source_pin(complete_ma
         '22.3.2': 'REVIEWED_V22_3_2_RELEASE_SHA256',
         '24.0.1': 'REVIEWED_V24_RELEASE_SHA256',
         '24.0.2': 'REVIEWED_V24_0_2_RELEASE_SHA256',
+        '24.0.3': 'REVIEWED_V24_0_3_RELEASE_SHA256',
     }[release.number]
     with mock.patch.object(inventory, digest_name, _digest(review)):
         with pytest.raises(RuntimeError, match='source predecessor changed'):
@@ -247,6 +253,7 @@ def test_semantic_release_identifies_new_model_and_qualification_tools(complete_
 ])
 def test_retired_geometry_helper_keeps_authenticated_predecessor(complete_manifest, mutation, message):
     altered = copy.deepcopy(complete_manifest)
+    altered.pop('v24_0_3_release_review', None)
     review = altered['v24_0_2_release_review']
     retired = review['removed_definitions']
     assert [(item['module'], item['name']) for item in retired] == [

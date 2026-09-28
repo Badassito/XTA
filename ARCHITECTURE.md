@@ -10,7 +10,7 @@ document is available in Git with `git show 597fc45:ARCHITECTURE.md`.
 
 ## Entry points and shared contracts
 
-`GPT-6-Astra-Ultra_v24.0.2_SLURM.py`, the installed `xta` command, and
+`GPT-6-Astra-Ultra_v24.0.3_SLURM.py`, the installed `xta` command, and
 `python -m XTA` enter `XTA.cli.run()`. The CLI selects exactly one mode and
 validates that mode's grammar before importing its heavy runtime. `tta_mode`
 enters `pipeline.main`, `pta_mode` resolves `PtaConfig` before `pta_runtime`
@@ -66,6 +66,9 @@ result transport. An execution target is a local CUDA GPU or a socket-local
 OpenVINO process. Worker processes receive picklable contracts; bulk source and
 result data use shared descriptors or artifact paths. CUDA, TensorRT, and
 OpenVINO are initialized inside their respective runtime owners.
+Immutable task descriptors keep the scheduler's shape and byte accounting
+stable across refill passes; mutable owner, credit, and readiness decisions
+are evaluated at selection time.
 
 Each physical view renders frames and optional tiles/augmentations, performs
 model inference, assembles the accepted masks, and settles its image-space
@@ -128,6 +131,16 @@ drains; CPU projection can proceed while admission waits. A projection may
 switch at the first unpublished source slice. A failed preflight leaves CPU
 progress intact. A failure after CUDA publication starts aborts that layer
 rather than replaying partial output.
+The exact compiled Spherical CPU pull is requested by default and can be
+disabled with `YOLO_TTA_CPU_SPHERICAL_COMPILED=0`. The Radial CUDA owner packs
+eligible bitsets on the device before transferring their bounded slice payloads;
+it skips the full-bitset download for a proven-empty output. Both Radial packing
+flags, `YOLO_TTA_RADIAL_GPU_BITSET_COMPACTION` and
+`YOLO_TTA_PACKED_OWNER_PUBLICATION`, allow the legacy host export path for
+diagnosis. D1 confidence retirement can mask a uint8 score crop on the device
+before one host transfer when the crop has at least 16,384 pixels. Set
+`YOLO_TTA_D1_GPU_MASK_MIN_PIXELS=0` to request that path for every CUDA crop,
+or `YOLO_TTA_D1_GPU_MASK_CONFIDENCE=0` to select the two-crop host path.
 
 Completed view layers are reduced by a single source-union writer. A dense
 handoff credit bounds waiting source-sized volumes. Final sink joins precede
@@ -292,7 +305,7 @@ Release qualification runs the full suite from the repository root before
 inventory verification and source-bundle construction:
 
 ```powershell
-python -B tools/qualify_release.py --output-dir ../Scratch/Releases/v24.0.2-validation
+python -B tools/qualify_release.py --output-dir ../Scratch/Releases/v24.0.3-validation
 ```
 
 The default requires a clean Git checkout and bundles committed Git bytes.
