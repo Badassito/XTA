@@ -12,6 +12,8 @@ from unittest import mock
 
 import numpy as np
 
+from tests.reference_backends.radial import pull_radial_chunk
+
 from XTA import backprojection, cylindrical_projection as cp, geometry
 from XTA.config import TiltedViewGroup
 
@@ -25,7 +27,7 @@ class RadialProjectionHandoffTests(unittest.TestCase):
         self.source = np.random.default_rng(42).integers(0, 2,
             (self.view.num_slices, self.view.src_h, self.view.src_w), dtype=np.uint8)
         radii = np.asarray(geometry.radial_global_radii(self.view), np.float64)
-        self.expected = np.stack([cp._pull_radial_chunk(self.source, self.view, radii,
+        self.expected = np.stack([pull_radial_chunk(self.source, self.view, radii,
             self.shape, z, 0, 99).reshape(9,11) for z in range(7)])
 
     def call(self, sink):
@@ -58,7 +60,7 @@ class RadialProjectionHandoffTests(unittest.TestCase):
         self.assertEqual(admission.call_count, 2)
         stage.close.assert_called_once()
 
-    def test_numpy_reference_prefix_can_promote_without_numba(self):
+    def test_compiled_cpu_prefix_can_promote(self):
         stage = SimpleNamespace(device_index=0, max_block_depth=2, projector=SimpleNamespace(),
             project=mock.Mock(side_effect=lambda z,n: self.expected[z:z+n].copy()), close=mock.Mock())
         seen, actual = [], np.zeros(self.shape, np.uint8)
@@ -67,10 +69,11 @@ class RadialProjectionHandoffTests(unittest.TestCase):
             actual[z:z+len(block)] = block
         with redirect_stdout(io.StringIO()), \
              mock.patch.object(cp, '_try_radial_cuda_stage', side_effect=[None,None,stage]), \
-             mock.patch.object(cp, '_numba', None), \
              mock.patch.object(cp, 'radial_cuda_backproject_enabled', return_value=True), \
+             mock.patch.object(cp, '_radial_block_schedule', return_value=(1,1)), \
              mock.patch.object(cp, '_CUDA_RECHECK_SLICES', 1), \
-             mock.patch.object(cp, '_project_radial_block', side_effect=AssertionError('compiled path entered')):
+             mock.patch.object(cp, '_project_radial_block',
+                               side_effect=lambda *args: self.expected[args[-4]:args[-4]+args[-3]].copy()):
             self.call(consume)
         self.assertEqual(seen,list(range(7)))
         np.testing.assert_array_equal(actual,self.expected)

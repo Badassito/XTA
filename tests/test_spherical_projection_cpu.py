@@ -7,7 +7,6 @@ import io
 import importlib.util
 import os
 from pathlib import Path
-import sys
 import threading
 from types import SimpleNamespace
 import unittest
@@ -19,6 +18,7 @@ from XTA import spherical_projection as reference
 from XTA import spherical_projection_cpu as candidate
 from XTA.spherical_geometry import build_spherical_view_infos, cube_rotation
 from XTA.spherical_projection_bounds import spherical_output_bounds
+from tests.reference_backends import spherical as oracle
 
 
 def project_with_pull(source, view, shape, pull, boxes=None):
@@ -46,20 +46,18 @@ def thin_source(view, size):
 
 
 class SphericalCompilerAvailabilityTests(unittest.TestCase):
-    def test_dispatcher_cache_initialization_failure_remains_optional(self):
+    def test_dispatcher_cache_initialization_failure_is_reported(self):
         from XTA import _deps
         decorator = mock.Mock(side_effect=RuntimeError('no locator available'))
         fake_numba = SimpleNamespace(njit=mock.Mock(return_value=decorator))
         spec = importlib.util.spec_from_file_location('XTA._spherical_cpu_missing_locator', candidate.__file__)
         module = importlib.util.module_from_spec(spec)
         with mock.patch.object(_deps, '_numba', fake_numba):
-            spec.loader.exec_module(module)
-        self.assertIsNone(module._compiled_pull_spherical_f64)
-        with self.assertRaisesRegex(module.SphericalCpuProjectionUnavailable, 'initialization failed.*no locator'):
-            module.prepare_spherical_chunk_numba(None, None, None, None, None)
+            with self.assertRaisesRegex(RuntimeError, 'Numba initialization failed.*no locator'):
+                spec.loader.exec_module(module)
+        self.assertEqual(fake_numba.njit.call_count, 2)  # cached, then uncached
 
 
-@unittest.skipUnless(hasattr(candidate._compiled_pull_spherical_f64, 'signatures'), 'Numba is optional')
 class SphericalCompiledPullTests(unittest.TestCase):
     def test_faces_rotations_padding_and_restoration_match_numpy_labels(self):
         views = build_spherical_view_infos(33, 35, 37, targets=('transverse',),
@@ -74,7 +72,7 @@ class SphericalCompiledPullTests(unittest.TestCase):
                 for shape, metadata in (((33, 35, 37), None), ((23, 39, 31), boxes)):
                     with self.subTest(face=view.spherical_face, origin=(view.spherical_u_origin,
                             view.spherical_v_origin), rotation=rotation, shape=shape):
-                        expected = project_with_pull(source, view, shape, reference._pull_spherical_chunk, metadata)
+                        expected = project_with_pull(source, view, shape, oracle.pull_spherical_chunk, metadata)
                         actual = project_with_pull(source, view, shape, candidate.pull_spherical_chunk_numba, metadata)
                         np.testing.assert_array_equal(actual, expected)
 
@@ -86,7 +84,7 @@ class SphericalCompiledPullTests(unittest.TestCase):
             if rotation:
                 view = replace(view, spherical_rotation_xyz=rotation)
             source = thin_source(view, 55)
-            expected = project_with_pull(source, view, shape, reference._pull_spherical_chunk)
+            expected = project_with_pull(source, view, shape, oracle.pull_spherical_chunk)
             actual = project_with_pull(source, view, shape, candidate.pull_spherical_chunk_numba)
             with self.subTest(face=view.spherical_face, rotation=rotation):
                 self.assertGreater(np.count_nonzero(expected), 0)
@@ -100,7 +98,7 @@ class SphericalCompiledPullTests(unittest.TestCase):
                        spherical_min_radius=1.5, spherical_max_radius=2.5)
         source = np.zeros((2, 17, 17), np.uint8)
         source[0] = 1
-        expected = project_with_pull(source, view, (9, 9, 9), reference._pull_spherical_chunk)
+        expected = project_with_pull(source, view, (9, 9, 9), oracle.pull_spherical_chunk)
         actual = project_with_pull(source, view, (9, 9, 9), candidate.pull_spherical_chunk_numba)
         self.assertEqual(actual[4, 4, 6], 1)
         np.testing.assert_array_equal(actual, expected)
@@ -114,7 +112,7 @@ class SphericalCompiledPullTests(unittest.TestCase):
         self.assertGreater(first, 2**31)
         args = (source, view, np.asarray(view.spherical_radii), np.eye(3), shape, 1, first, first + 1)
         np.testing.assert_array_equal(candidate.pull_spherical_chunk_numba(*args), np.ones(1, np.uint8))
-        np.testing.assert_array_equal(candidate.pull_spherical_chunk_numba(*args), reference._pull_spherical_chunk(*args))
+        np.testing.assert_array_equal(candidate.pull_spherical_chunk_numba(*args), oracle.pull_spherical_chunk(*args))
 
     def test_borrowed_strided_readonly_masks_and_empty_strips(self):
         view = build_spherical_view_infos(15, 17, 19, targets=('transverse',),
@@ -122,7 +120,7 @@ class SphericalCompiledPullTests(unittest.TestCase):
         source = np.ones((view.num_slices, 11, 13), np.uint8)[:, ::2, ::2]
         source.flags.writeable = False
         args = (source, view, np.asarray(view.spherical_radii), np.eye(3), (15, 17, 19), 7, 0, 17 * 19)
-        np.testing.assert_array_equal(candidate.pull_spherical_chunk_numba(*args), reference._pull_spherical_chunk(*args))
+        np.testing.assert_array_equal(candidate.pull_spherical_chunk_numba(*args), oracle.pull_spherical_chunk(*args))
         self.assertFalse(source.flags.writeable)
         self.assertEqual(candidate.pull_spherical_chunk_numba(*args[:-2], 0, 0).size, 0)
 
@@ -144,57 +142,60 @@ class SphericalCompiledAdmissionTests(unittest.TestCase):
             self.assertIs(reference._select_spherical_cpu_pull(*self.arguments), pull)
         prepare.assert_called_once()
 
-    def test_explicit_opt_out_does_not_import_optional_compiler(self):
-        with mock.patch.dict(os.environ, {'YOLO_TTA_CPU_SPHERICAL_COMPILED': '0'}), \
-                mock.patch.dict(sys.modules, {'XTA.spherical_projection_cpu': None}):
-            self.assertIsNone(reference._select_spherical_cpu_pull(*self.arguments))
+    def test_fast_geometry_opt_out_cannot_disable_required_compiler(self):
+        with mock.patch.dict(os.environ, {'YOLO_TTA_FAST_GEOMETRY': '0'}), \
+                mock.patch.object(candidate, 'prepare_spherical_chunk_numba', return_value=object()) as prepare:
+            reference._select_spherical_cpu_pull(*self.arguments)
+        prepare.assert_called_once()
 
-    def test_missing_numba_or_optional_module_safely_selects_numpy(self):
-        with mock.patch.dict(os.environ, {'YOLO_TTA_CPU_SPHERICAL_COMPILED': '1'}), \
-                contextlib.redirect_stdout(io.StringIO()) as output:
-            with mock.patch.object(candidate, '_compiled_pull_spherical_f64', None):
-                self.assertIsNone(reference._select_spherical_cpu_pull(*self.arguments))
-            with mock.patch.dict(sys.modules, {'XTA.spherical_projection_cpu': None}):
-                self.assertIsNone(reference._select_spherical_cpu_pull(*self.arguments))
-        self.assertIn('using NumPy', output.getvalue())
+    def test_missing_compiled_dispatcher_fails_before_publication(self):
+        with mock.patch.object(candidate, '_compiled_pull_spherical_f64', None):
+            with self.assertRaisesRegex(candidate.SphericalCpuProjectionUnavailable, 'Numba compilation failed'):
+                reference._select_spherical_cpu_pull(*self.arguments)
 
-    @unittest.skipUnless(hasattr(candidate._compiled_pull_spherical_f64, 'signatures'), 'Numba is optional')
-    def test_compilation_failure_falls_back_before_evaluating_or_publishing(self):
+    def test_compilation_failure_raises_before_evaluating_or_publishing(self):
         failed = SimpleNamespace(compile=mock.Mock(side_effect=RuntimeError('compiler unavailable')))
-        with mock.patch.dict(os.environ, {'YOLO_TTA_CPU_SPHERICAL_COMPILED': '1'}), \
-                mock.patch.object(candidate, '_compiled_pull_spherical_f64', failed), \
-                contextlib.redirect_stdout(io.StringIO()) as output:
-            self.assertIsNone(reference._select_spherical_cpu_pull(*self.arguments))
+        with mock.patch.object(candidate, '_compiled_pull_spherical_f64', failed):
+            with self.assertRaisesRegex(candidate.SphericalCpuProjectionUnavailable, 'Numba compilation failed'):
+                reference._select_spherical_cpu_pull(*self.arguments)
         failed.compile.assert_called_once()
-        self.assertIn('Numba compilation failed', output.getvalue())
 
-    @unittest.skipUnless(hasattr(candidate._compiled_pull_spherical_f64, 'signatures'), 'Numba is optional')
+    def test_pipeline_compile_failure_precedes_sink_publication(self):
+        sink = mock.Mock()
+        failure = candidate.SphericalCpuProjectionUnavailable('compiler unavailable')
+        with mock.patch.object(reference, '_try_spherical_cuda_stage', return_value=None), \
+                mock.patch.object(candidate, 'prepare_spherical_chunk_numba', side_effect=failure), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(candidate.SphericalCpuProjectionUnavailable, 'compiler unavailable'):
+                reference.backproject_spherical_volume_to_volume(
+                    self.source, self.view, Path('unused'), 'compile failure',
+                    sink_only=True, projection_block_callback=sink)
+        sink.assert_not_called()
+
     def test_metadata_errors_are_not_reclassified_as_compiler_fallback(self):
-        with mock.patch.dict(os.environ, {'YOLO_TTA_CPU_SPHERICAL_COMPILED': '1'}):
-            with self.assertRaisesRegex(ValueError, 'inconsistent shapes'):
-                reference._select_spherical_cpu_pull(self.source, self.view, self.radii[:-1],
-                                                     self.rotation, self.shape, None)
+        with self.assertRaisesRegex(ValueError, 'inconsistent shapes'):
+            reference._select_spherical_cpu_pull(self.source, self.view, self.radii[:-1],
+                                                 self.rotation, self.shape, None)
 
-    def test_unbounded_qualification_always_uses_unchanged_numpy_oracle(self):
-        forbidden = mock.Mock(side_effect=AssertionError('compiled oracle'))
-        with mock.patch.object(reference, '_pull_spherical_chunk', wraps=reference._pull_spherical_chunk) as oracle:
+    def test_unbounded_public_helper_uses_required_compiled_pull(self):
+        compiled_pull = mock.Mock(wraps=candidate.pull_spherical_chunk_numba)
+        with mock.patch.object(reference, '_select_spherical_cpu_pull', return_value=compiled_pull) as select:
             actual = reference._project_spherical_block(self.source, self.view, self.radii,
-                self.rotation, self.shape, 7, 1, cpu_pull=forbidden)
-        self.assertTrue(oracle.called)
-        forbidden.assert_not_called()
+                self.rotation, self.shape, 7, 1)
+        select.assert_called_once()
+        self.assertTrue(compiled_pull.called)
+        np.testing.assert_array_equal(actual, oracle.project_spherical_block(
+            self.source, self.view, self.radii, self.rotation, self.shape, 7, 1))
         self.assertGreater(np.count_nonzero(actual), 0)
 
-    @unittest.skipUnless(hasattr(candidate._compiled_pull_spherical_f64, 'signatures'), 'Numba is optional')
     def test_enabled_bounded_projection_preserves_readonly_strided_source_and_order(self):
         source = self.source[:, ::2, ::2]
         source.flags.writeable = False
-        expected = project_with_pull(source, self.view, self.shape, reference._pull_spherical_chunk)
+        expected = project_with_pull(source, self.view, self.shape, oracle.pull_spherical_chunk)
         blocks = []
-        with mock.patch.dict(os.environ, {'YOLO_TTA_CPU_SPHERICAL_COMPILED': '1'}), \
-                mock.patch.object(reference, '_try_spherical_cuda_stage', return_value=None), \
+        with mock.patch.object(reference, '_try_spherical_cuda_stage', return_value=None), \
                 mock.patch.object(reference, 'spherical_cuda_backproject_enabled', return_value=False), \
                 mock.patch.object(reference, '_OUTPUT_BLOCK_BYTES', self.shape[1] * self.shape[2] * 2), \
-                mock.patch.object(reference, '_pull_spherical_chunk', side_effect=AssertionError('unexpected NumPy')), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
             reference.backproject_spherical_volume_to_volume(source, self.view, Path('unused'), 'compiled test',
                 workers=2, sink_only=True, projection_block_callback=lambda first, block: blocks.append((first, block.copy())))
@@ -204,7 +205,6 @@ class SphericalCompiledAdmissionTests(unittest.TestCase):
         self.assertIn('backend=cpu_numba_f64_bounded', output.getvalue())
         self.assertIn('cpu_setup_seconds=', output.getvalue())
 
-    @unittest.skipUnless(hasattr(candidate._compiled_pull_spherical_f64, 'signatures'), 'Numba is optional')
     def test_cancellation_still_stops_at_the_next_bounded_chunk(self):
         cancel = threading.Event()
         calls = []
@@ -229,7 +229,6 @@ class SphericalCompiledAdmissionTests(unittest.TestCase):
         with mock.patch.object(reference, '_select_spherical_cpu_pull', return_value=pull), \
                 mock.patch.object(reference, '_try_spherical_cuda_stage', return_value=None), \
                 mock.patch.object(reference, 'spherical_cuda_backproject_enabled', return_value=False), \
-                mock.patch.object(reference, '_pull_spherical_chunk', side_effect=AssertionError('silent fallback')), \
                 contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(ValueError, 'numerical failure'):
                 reference.backproject_spherical_volume_to_volume(self.source, self.view, Path('unused'), 'failure',

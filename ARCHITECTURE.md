@@ -10,7 +10,7 @@ document is available in Git with `git show 597fc45:ARCHITECTURE.md`.
 
 ## Entry points and shared contracts
 
-`GPT-6-Astra-Ultra_v24.0.3_SLURM.py`, the installed `xta` command, and
+`GPT-6-Astra-Ultra_v24.0.4_SLURM.py`, the installed `xta` command, and
 `python -m XTA` enter `XTA.cli.run()`. The CLI selects exactly one mode and
 validates that mode's grammar before importing its heavy runtime. `tta_mode`
 enters `pipeline.main`, `pta_mode` resolves `PtaConfig` before `pta_runtime`
@@ -54,6 +54,52 @@ same source bytes whose SHA-256 it verifies, rather than reloading a policy or
 accepting cached bytecode after the identity check. Ultralytics adapters check
 the private APIs they replace and fail worker startup if a required patch cannot
 be installed.
+
+## Environment controls after v24.0.4 cleanup
+
+The supported defaults now directly select ROI-only CPU mask resizing, GPU
+proto union, retina flattening and eligible GPU warping, tiled proto composition, bilinear
+Tilted intensity sampling, slice-local interpolation labels, bounded bridge
+merges, and run-based topology adjacency. Their old comparison switches no
+longer select alternate behavior. Categorical sampling, generic compact label
+IDs, and automatic eligibility and failure fallbacks retain their separate
+contracts.
+
+Output publication uses cropped CVOL stores, eligible compact Spherical CPU
+publication, crop-row NRRD streaming, extent skipping, and live immutable global
+layers. Final fusion uses grouped restore and the eligible native sparse CPU
+path. Grouping unions before resampling can preserve subpixel support that
+separate integer AREA restores would round away; old-path voxel equality is
+not the acceptance criterion.
+
+Worker GPUs retain inference-first ownership, full-frame workers write bounded
+direct unions, and result queues wake the scheduler through the result pump.
+Split-view hole filling runs after view completion; single-lease eligibility
+still permits device filling. Resource controls remain available where they
+change concurrency or peak storage. Two redundant booleans were consolidated:
+use `YOLO_TTA_GPU_INPUT_STAGING_BATCHES=0` to disable input staging and its eager
+source warmup, and `YOLO_TTA_HYBRID_GPU_STEALBACK_MAX_FRACTION=0` to disable hybrid
+GPU assistance. These replace `YOLO_TTA_GPU_INPUT_STAGING=0` and
+`YOLO_TTA_HYBRID_GPU_STEALBACK=0`, respectively.
+
+## Required compiled CPU backends
+
+Numerical runtimes require Numba alongside NumPy, OpenCV and SciPy. Missing or
+broken Numba imports raise a diagnostic instead of selecting interpreted bulk
+work. Compiled topology, interpolation, Spherical/Radial CPU projection, sparse
+scatter and packed publication propagate kernel failures. Configuration and CLI
+help/version discovery keep their lightweight import boundary.
+
+Independent slow implementations live in `tests/reference_backends` for
+qualification. Interpolation grows its compiled workspace for valid fragmented
+windows; Radial uses a bounded compiled direct pull when a factored ownership
+plan cannot fit. Native-array operations that preserve aliasing/conversion
+semantics and explicit OpenVINO CPU inference remain supported. GPU eligibility
+and safe fallback to compiled CPU remain separate from compiler availability.
+
+H100 is the primary deployment target and A100 is the fallback target; Volta/V100
+is outside the supported deployment scope. See [production backend policy](docs/PRODUCTION_BACKENDS.md)
+for the test-reference boundary and development benchmark commands.
 
 ## TTA: inference to source union
 
@@ -131,8 +177,8 @@ drains; CPU projection can proceed while admission waits. A projection may
 switch at the first unpublished source slice. A failed preflight leaves CPU
 progress intact. A failure after CUDA publication starts aborts that layer
 rather than replaying partial output.
-The exact compiled Spherical CPU pull is requested by default and can be
-disabled with `YOLO_TTA_CPU_SPHERICAL_COMPILED=0`. The Radial CUDA owner packs
+The exact compiled Spherical CPU pull is required for CPU projection and is
+independent of approximate GPU geometry controls. The Radial CUDA owner packs
 eligible bitsets on the device before transferring their bounded slice payloads;
 it skips the full-bitset download for a proven-empty output. Both Radial packing
 flags, `YOLO_TTA_RADIAL_GPU_BITSET_COMPACTION` and
@@ -305,7 +351,7 @@ Release qualification runs the full suite from the repository root before
 inventory verification and source-bundle construction:
 
 ```powershell
-python -B tools/qualify_release.py --output-dir ../Scratch/Releases/v24.0.3-validation
+python -B tools/qualify_release.py --output-dir ../Scratch/Releases/v24.0.4-validation
 ```
 
 The default requires a clean Git checkout and bundles committed Git bytes.

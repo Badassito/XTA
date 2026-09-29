@@ -33,9 +33,9 @@ def trial(view, source, shape, cooperative, pause_fraction):
     cancel = threading.Event() if cooperative else None
     lock = threading.Lock()
     readers = chunks = cancelled = entered = 0
-    original = sp._pull_spherical_chunk
     radii = np.asarray(view.spherical_radii)
     rotation = np.asarray(view.spherical_rotation_xyz).reshape(3, 3)
+    original = sp._select_spherical_cpu_pull(source, view, radii, rotation, shape, None)
     chunk_count = (shape[1] * shape[2] + sp._PULL_CHUNK_VOXELS - 1) // sp._PULL_CHUNK_VOXELS
     pause_index = min(chunk_count - 2, int(chunk_count * pause_fraction))
     pause_at = pause_index * sp._PULL_CHUNK_VOXELS
@@ -61,7 +61,7 @@ def trial(view, source, shape, cooperative, pause_fraction):
             readers += 1
         try:
             return sp._project_spherical_block(source, view, radii, rotation, shape,
-                shape[0] // 2 + first, count, cancel_event=cancel)
+                shape[0] // 2 + first, count, cancel_event=cancel, cpu_pull=pull)
         except CancelledError:
             with lock:
                 cancelled += 1
@@ -70,8 +70,7 @@ def trial(view, source, shape, cooperative, pause_fraction):
             with lock:
                 readers -= 1
 
-    with (mock.patch.object(sp, '_pull_spherical_chunk', side_effect=pull),
-          mock.patch.object(sp, '_spherical_block_schedule', return_value=(1, 4))):
+    with mock.patch.object(sp, '_spherical_block_schedule', return_value=(1, 4)):
         blocks = sp._ordered_spherical_blocks(project, 4, shape[1] * shape[2], 4,
                                              cancel_event=cancel)
         try:

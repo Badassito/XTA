@@ -27,6 +27,7 @@ from tools.verify_package_inventory import (
 
 def _release_22_2_inventory():
     manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+    manifest.pop('v24_0_4_release_review', None)
     manifest.pop('v24_0_3_release_review', None)
     manifest.pop('v24_0_2_release_review', None)
     manifest.pop('v24_release_review', None)
@@ -40,7 +41,8 @@ def _reconciliation_successors():
     manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
     return tuple(manifest[key] for key in ('v22_3_release_review','v22_3_1_release_review',
                                          'v22_3_2_release_review', 'v24_release_review',
-                                         'v24_0_2_release_review', 'v24_0_3_release_review') if key in manifest)
+                                         'v24_0_2_release_review', 'v24_0_3_release_review',
+                                         'v24_0_4_release_review') if key in manifest)
 
 
 def _release_22_1_inventory():

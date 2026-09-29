@@ -19,7 +19,7 @@ from XTA.interpolation import IncrementalRawBBoxMaskStoreWriter
 
 
 class FatalProjectionCleanupTests(unittest.TestCase):
-    def exercise(self, *, cleanup_failure=None, bbox_store=True, recoverable_first=False):
+    def exercise(self, *, cleanup_failure=None, writer_init_failure=False, recoverable_first=False):
         with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
             root = Path(directory)
             view = ViewInfo(
@@ -34,6 +34,8 @@ class FatalProjectionCleanupTests(unittest.TestCase):
             state = {}
 
             def writer_factory(**kwargs):
+                if writer_init_failure:
+                    raise RuntimeError('incremental writer unavailable')
                 writer = IncrementalRawBBoxMaskStoreWriter(**kwargs)
                 state['writer'] = writer
                 state['fd'] = writer._fd
@@ -70,8 +72,7 @@ class FatalProjectionCleanupTests(unittest.TestCase):
                     raise RuntimeError('recoverable sink error')
                 raise fatal
 
-            with mock.patch.object(assembly, 'raw_bbox_nrrd_layers_enabled', return_value=bbox_store), \
-                    mock.patch.object(assembly, 'delayed_native_expansion_enabled', return_value=False), \
+            with mock.patch.object(assembly, 'delayed_native_expansion_enabled', return_value=False), \
                     mock.patch.object(assembly, 'final_source_output_shape', return_value=(3, 4, 5)), \
                     mock.patch.object(assembly, 'IncrementalRawBBoxMaskStoreWriter', side_effect=writer_factory), \
                     mock.patch.object(assembly, 'project_view_volume_to_orthogonal_volume', side_effect=fail_after_partial_output) as project, \
@@ -90,7 +91,7 @@ class FatalProjectionCleanupTests(unittest.TestCase):
             lease.release.assert_not_called()
             np.testing.assert_array_equal(source, 1)
             self.assertFalse(state['raw_path'].exists())
-            if bbox_store:
+            if not writer_init_failure:
                 writer = state['writer']
                 self.assertIsNone(writer._fd)
                 self.assertFalse(writer.store_dir.exists())
@@ -110,7 +111,7 @@ class FatalProjectionCleanupTests(unittest.TestCase):
                 self.exercise(cleanup_failure=operation)
 
     def test_dense_partial_scratch_is_removed_without_retry(self):
-        self.exercise(bbox_store=False)
+        self.exercise(writer_init_failure=True)
 
     def test_fatal_during_transaction_retry_is_cleaned_and_never_retried_again(self):
         self.exercise(recoverable_first=True)

@@ -32,7 +32,7 @@ from typing import (
     Tuple,
 )
 import numpy as np
-from ._deps import _NUMBA_IMPORT_ERROR, _numba, cv2, ndi, tqdm
+from ._deps import _numba, cv2, ndi, tqdm
 from .cuda_interpolation import (
     CudaInterpolationRenderer,
     create_cuda_interpolation_renderer,
@@ -75,11 +75,6 @@ from .geometry import (
     ViewInfo,
     is_tilted_view,
 )
-from .inference import (
-    _cv2_connected_components,
-    _fill_holes_2d_opencv,
-)
-
 
 if TYPE_CHECKING:
     from .topology import (
@@ -87,7 +82,6 @@ if TYPE_CHECKING:
         SparseSliceLabelStore,
         _local_label_store_dtype,
         build_slice_endpoint_seeds_from_label_volume,
-        interpolation_skip_compact_relabel_enabled,
         label_foreground_volume_streaming,
     )
     from .outputs import (
@@ -101,33 +95,8 @@ def _keep_center_component_2d(mask2d: np.ndarray) -> np.ndarray:
     mask2d = np.asarray(mask2d, dtype=bool)
     if not mask2d.any():
         return mask2d
-
-    if _planning_kernels_active():
-        try:
-            # fused keep-center + hole fill in one nogil kernel (two flood
-            # fills on the small canvas) instead of cv2 label + per-edge uniques + fill.
-            return _numba_keep_center_fill_kernel(np.ascontiguousarray(mask2d))
-        except Exception as exc:
-            _disable_planning_kernels(exc)
-
-    mask_u8 = np.ascontiguousarray(mask2d.astype(np.uint8, copy=False))
-    num_labels, labels2d = _cv2_connected_components(mask_u8, connectivity=8)
-    if int(num_labels) <= 2:  # background label 0 + at most one component
-        return _fill_holes_2d_opencv(mask2d)
-
-    cy = mask2d.shape[0] // 2
-    cx = mask2d.shape[1] // 2
-    keep = int(labels2d[cy, cx])
-    if keep == 0:
-        pts = np.argwhere(labels2d > 0)
-        if pts.size == 0:
-            return np.zeros_like(mask2d, dtype=bool)
-        d2 = (pts[:, 0] - cy) ** 2 + (pts[:, 1] - cx) ** 2
-        py, px = pts[int(np.argmin(d2))]
-        keep = int(labels2d[py, px])
-
-    kept = (labels2d == keep)
-    return _fill_holes_2d_opencv(kept)
+    # Fused keep-center + hole fill in one nogil kernel on the small canvas.
+    return _numba_keep_center_fill_kernel(np.ascontiguousarray(mask2d))
 
 def _signed_distance_2d(mask2d: np.ndarray) -> np.ndarray:
     # Float32 Euclidean distances are positive inside the mask and negative outside.
@@ -502,24 +471,12 @@ class SliceComponentTableCache:
 
 def _nearest_point_in_component_record(record: SliceComponentRecord, ref_yx: Tuple[int, int]) -> Optional[Tuple[int, int]]:
     y0, x0, _y1, _x1 = record.bbox
-    if _planning_kernels_active():
-        try:
-            by, bx, found = _numba_nearest_true_pixel_kernel(
-                record.mask_crop, int(ref_yx[0]) - int(y0), int(ref_yx[1]) - int(x0),
-            )
-            if int(found) == 0:
-                return None
-            return int(by) + int(y0), int(bx) + int(x0)
-        except Exception as exc:
-            _disable_planning_kernels(exc)
-    ys, xs = np.nonzero(record.mask_crop)
-    if ys.size == 0:
+    by, bx, found = _numba_nearest_true_pixel_kernel(
+        record.mask_crop, int(ref_yx[0]) - int(y0), int(ref_yx[1]) - int(x0),
+    )
+    if int(found) == 0:
         return None
-    gy = ys.astype(np.int64, copy=False) + int(y0)
-    gx = xs.astype(np.int64, copy=False) + int(x0)
-    d2 = (gy - int(ref_yx[0])) ** 2 + (gx - int(ref_yx[1])) ** 2
-    idx = int(np.argmin(d2))
-    return int(gy[idx]), int(gx[idx])
+    return int(by) + int(y0), int(bx) + int(x0)
 
 def _component_record_dilated_overlap_count(prev_record: SliceComponentRecord, candidate_record: SliceComponentRecord) -> int:
     py0, px0, py1, px1 = prev_record.bbox
@@ -533,24 +490,12 @@ def _component_record_dilated_overlap_count(prev_record: SliceComponentRecord, c
     if iy0 >= iy1 or ix0 >= ix1:
         return 0
 
-    if _planning_kernels_active():
-        try:
-            # direct 3x3 neighborhood test — no pad, no cv2.dilate materialization.
-            return int(_numba_dilated_overlap_count_kernel(
-                prev_record.mask_crop, int(py0), int(px0),
-                candidate_record.mask_crop, int(cy0), int(cx0),
-                int(iy0), int(ix0), int(iy1), int(ix1),
-            ))
-        except Exception as exc:
-            _disable_planning_kernels(exc)
-
-    padded_prev = np.pad(np.asarray(prev_record.mask_crop, dtype=np.uint8), 1, mode='constant', constant_values=0)
-    dilated_prev = cv2.dilate(padded_prev, np.ones((3, 3), dtype=np.uint8), iterations=1).astype(bool, copy=False)
-    prev_origin_y = int(py0) - 1
-    prev_origin_x = int(px0) - 1
-    prev_block = dilated_prev[iy0 - prev_origin_y:iy1 - prev_origin_y, ix0 - prev_origin_x:ix1 - prev_origin_x]
-    cand_block = candidate_record.mask_crop[iy0 - int(cy0):iy1 - int(cy0), ix0 - int(cx0):ix1 - int(cx0)]
-    return int(np.count_nonzero(prev_block & cand_block))
+    # Direct 3x3 neighborhood test, without a dilated allocation.
+    return int(_numba_dilated_overlap_count_kernel(
+        prev_record.mask_crop, int(py0), int(px0),
+        candidate_record.mask_crop, int(cy0), int(cx0),
+        int(iy0), int(ix0), int(iy1), int(ix1),
+    ))
 
 def _component_record_mirrored_u(record: SliceComponentRecord, width: int) -> SliceComponentRecord:
     """Mirror a component record along the u (x) axis of its full slice.
@@ -718,22 +663,12 @@ class SliceProjectionCandidate:
     slice_distance: int
 
 def _nearest_point_in_mask(mask2d: np.ndarray, ref_yx: Tuple[int, int]) -> Optional[Tuple[int, int]]:
-    if _planning_kernels_active():
-        try:
-            by, bx, found = _numba_nearest_true_pixel_kernel(
-                np.asarray(mask2d, dtype=bool), int(ref_yx[0]), int(ref_yx[1]),
-            )
-            if int(found) == 0:
-                return None
-            return int(by), int(bx)
-        except Exception as exc:
-            _disable_planning_kernels(exc)
-    ys, xs = np.nonzero(mask2d)
-    if ys.size == 0:
+    by, bx, found = _numba_nearest_true_pixel_kernel(
+        np.asarray(mask2d, dtype=bool), int(ref_yx[0]), int(ref_yx[1]),
+    )
+    if int(found) == 0:
         return None
-    d2 = (ys.astype(np.int64) - int(ref_yx[0])) ** 2 + (xs.astype(np.int64) - int(ref_yx[1])) ** 2
-    idx = int(np.argmin(d2))
-    return int(ys[idx]), int(xs[idx])
+    return int(by), int(bx)
 
 def _component_mask_and_anchor(mask2d: np.ndarray, point_yx: Tuple[int, int]) -> Tuple[np.ndarray, Optional[Tuple[int, int]]]:
     mask2d = np.asarray(mask2d, dtype=bool)
@@ -871,26 +806,24 @@ def _paste_local_mask_onto_slice(
         dst_bbox_union[3] = max(int(dst_bbox_union[3]), int(dst_x1))
 
     dest_dtype = np.asarray(dest_slice).dtype
-    if _planning_kernels_active() and dest_dtype.isnative and dest_dtype.kind in ('b', 'u'):
-        try:
-            if bool(binary_destination) and int(paint_value) == 1:
-                # Binary slices need only a zero test and a conditional store.
-                return int(_numba_paste_masked_or_kernel(
-                    np.asarray(dest_slice), np.asarray(local_mask, dtype=bool),
-                    int(dst_y0), int(dst_x0),
-                    int(src_y0), int(src_y1), int(src_x0), int(src_x1),
-                ))
-            # Keep unsigned values unsigned, including uint64's top membership bit.
-            value = np.asarray(int(paint_value), dtype=dest_dtype)[()]
-            return int(_numba_paste_packed_or_kernel(
+    if dest_dtype.isnative and dest_dtype.kind in ('b', 'u'):
+        if bool(binary_destination) and int(paint_value) == 1:
+            # Binary slices need only a zero test and a conditional store.
+            return int(_numba_paste_masked_or_kernel(
                 np.asarray(dest_slice), np.asarray(local_mask, dtype=bool),
                 int(dst_y0), int(dst_x0),
                 int(src_y0), int(src_y1), int(src_x0), int(src_x1),
-                value,
             ))
-        except Exception as exc:
-            _disable_planning_kernels(exc)
+        # Keep unsigned values unsigned, including uint64's top membership bit.
+        value = np.asarray(int(paint_value), dtype=dest_dtype)[()]
+        return int(_numba_paste_packed_or_kernel(
+            np.asarray(dest_slice), np.asarray(local_mask, dtype=bool),
+            int(dst_y0), int(dst_x0),
+            int(src_y0), int(src_y1), int(src_x0), int(src_x1),
+            value,
+        ))
 
+    # Native NumPy handles unsupported signed or non-native-endian destination dtypes.
     patch = np.asarray(local_mask[src_y0:src_y1, src_x0:src_x1], dtype=bool)
     current = np.asarray(dest_slice[dst_y0:dst_y1, dst_x0:dst_x1])
     value = np.asarray(int(paint_value), dtype=current.dtype)
@@ -899,433 +832,387 @@ def _paste_local_mask_onto_slice(
     return added
 
 
-_NUMBA_PROJECTION_KERNEL_RUNTIME_DISABLED = False
-
-_NUMBA_PLANNING_KERNELS_RUNTIME_DISABLED = False
-
-def compiled_topology_kernels_enabled() -> bool:
-    """Generic 3D topology/keep_objects kernels, independent of interpolation settings."""
-    return bool(_numba is not None and _env_flag('YOLO_TTA_TOPOLOGY_COMPILED_KERNELS', True))
-
-def compiled_interpolation_kernels_enabled() -> bool:
-    return bool(_numba is not None and _env_flag('YOLO_TTA_INTERPOLATION_COMPILED_KERNELS', True))
-
-if _numba is not None:
-    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-    def _numba_nearest_true_pixel_kernel(mask: np.ndarray, ref_y: int, ref_x: int) -> Tuple[int, int, int]:
-        best_y = -1
-        best_x = -1
-        best_d2 = np.int64(0)
-        found = 0
-        for y in range(mask.shape[0]):
-            for x in range(mask.shape[1]):
-                if not mask[y, x]:
-                    continue
-                dy = np.int64(y - ref_y)
-                dx = np.int64(x - ref_x)
-                d2 = dy * dy + dx * dx
-                if found == 0 or d2 < best_d2:
-                    best_d2 = d2
-                    best_y = y
-                    best_x = x
-                    found = 1
-        return best_y, best_x, found
+@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+def _numba_nearest_true_pixel_kernel(mask: np.ndarray, ref_y: int, ref_x: int) -> Tuple[int, int, int]:
+    best_y = -1
+    best_x = -1
+    best_d2 = np.int64(0)
+    found = 0
+    for y in range(mask.shape[0]):
+        for x in range(mask.shape[1]):
+            if not mask[y, x]:
+                continue
+            dy = np.int64(y - ref_y)
+            dx = np.int64(x - ref_x)
+            d2 = dy * dy + dx * dx
+            if found == 0 or d2 < best_d2:
+                best_d2 = d2
+                best_y = y
+                best_x = x
+                found = 1
+    return best_y, best_x, found
 
 
-    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-    def _numba_dilated_overlap_count_kernel(
-        prev_mask: np.ndarray, prev_oy: int, prev_ox: int,
-        cand_mask: np.ndarray, cand_oy: int, cand_ox: int,
-        iy0: int, ix0: int, iy1: int, ix1: int,
-    ) -> int:
-        # Count candidate pixels with any prev pixel in their 3x3 neighborhood — the
-        # dilate(prev, 3x3) & cand overlap without materializing the dilation.
-        ph = prev_mask.shape[0]
-        pw = prev_mask.shape[1]
-        count = 0
-        for gy in range(iy0, iy1):
-            cy = gy - cand_oy
-            for gx in range(ix0, ix1):
-                if not cand_mask[cy, gx - cand_ox]:
-                    continue
-                hit = False
-                for dy in range(-1, 2):
-                    py = gy + dy - prev_oy
-                    if py < 0 or py >= ph:
-                        continue
-                    for dx in range(-1, 2):
-                        px = gx + dx - prev_ox
-                        if 0 <= px < pw and prev_mask[py, px]:
-                            hit = True
-                            break
-                    if hit:
-                        break
-                if hit:
-                    count += 1
-        return count
-
-    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-    def _numba_keep_center_fill_kernel(mask: np.ndarray) -> np.ndarray:
-        # keep-center-component (8-connected) + enclosed-hole fill (4-connected background),
-        # fused: result = NOT(border-4-connected component of NOT kept). Matches
-        # _keep_center_component_2d + _fill_holes_2d_opencv semantics exactly.
-        h = mask.shape[0]
-        w = mask.shape[1]
-        out = np.zeros((h, w), dtype=np.bool_)
-        if h <= 0 or w <= 0:
-            return out
-
-        cy = h // 2
-        cx = w // 2
-        seed_y = -1
-        seed_x = -1
-        if mask[cy, cx]:
-            seed_y = cy
-            seed_x = cx
-        else:
-            best_d2 = np.int64(-1)
-            for y in range(h):
-                for x in range(w):
-                    if not mask[y, x]:
-                        continue
-                    dy = np.int64(y - cy)
-                    dx = np.int64(x - cx)
-                    d2 = dy * dy + dx * dx
-                    if best_d2 < 0 or d2 < best_d2:
-                        best_d2 = d2
-                        seed_y = y
-                        seed_x = x
-        if seed_y < 0:
-            return out
-
-        # state: 0 unknown, 1 kept (center component), 2 outside background
-        state = np.zeros((h, w), dtype=np.uint8)
-        stack = np.empty((h * w, 2), dtype=np.int32)
-        sp = 0
-        state[seed_y, seed_x] = 1
-        stack[sp, 0] = seed_y
-        stack[sp, 1] = seed_x
-        sp += 1
-        while sp > 0:
-            sp -= 1
-            y = int(stack[sp, 0])
-            x = int(stack[sp, 1])
+@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+def _numba_dilated_overlap_count_kernel(
+    prev_mask: np.ndarray, prev_oy: int, prev_ox: int,
+    cand_mask: np.ndarray, cand_oy: int, cand_ox: int,
+    iy0: int, ix0: int, iy1: int, ix1: int,
+) -> int:
+    # Count candidate pixels with any prev pixel in their 3x3 neighborhood — the
+    # dilate(prev, 3x3) & cand overlap without materializing the dilation.
+    ph = prev_mask.shape[0]
+    pw = prev_mask.shape[1]
+    count = 0
+    for gy in range(iy0, iy1):
+        cy = gy - cand_oy
+        for gx in range(ix0, ix1):
+            if not cand_mask[cy, gx - cand_ox]:
+                continue
+            hit = False
             for dy in range(-1, 2):
-                ny = y + dy
-                if ny < 0 or ny >= h:
+                py = gy + dy - prev_oy
+                if py < 0 or py >= ph:
                     continue
                 for dx in range(-1, 2):
-                    if dy == 0 and dx == 0:
-                        continue
-                    nx = x + dx
-                    if nx < 0 or nx >= w:
-                        continue
-                    if state[ny, nx] == 0 and mask[ny, nx]:
-                        state[ny, nx] = 1
-                        stack[sp, 0] = ny
-                        stack[sp, 1] = nx
-                        sp += 1
+                    px = gx + dx - prev_ox
+                    if 0 <= px < pw and prev_mask[py, px]:
+                        hit = True
+                        break
+                if hit:
+                    break
+            if hit:
+                count += 1
+    return count
 
-        # 4-connected flood of NOT-kept from every border pixel -> outside background.
-        sp = 0
-        for x in range(w):
-            if state[0, x] == 0:
-                state[0, x] = 2
-                stack[sp, 0] = 0
-                stack[sp, 1] = x
-                sp += 1
-            if state[h - 1, x] == 0:
-                state[h - 1, x] = 2
-                stack[sp, 0] = h - 1
-                stack[sp, 1] = x
-                sp += 1
-        for y in range(h):
-            if state[y, 0] == 0:
-                state[y, 0] = 2
-                stack[sp, 0] = y
-                stack[sp, 1] = 0
-                sp += 1
-            if state[y, w - 1] == 0:
-                state[y, w - 1] = 2
-                stack[sp, 0] = y
-                stack[sp, 1] = w - 1
-                sp += 1
-        while sp > 0:
-            sp -= 1
-            y = int(stack[sp, 0])
-            x = int(stack[sp, 1])
-            if y > 0 and state[y - 1, x] == 0:
-                state[y - 1, x] = 2
-                stack[sp, 0] = y - 1
-                stack[sp, 1] = x
-                sp += 1
-            if y + 1 < h and state[y + 1, x] == 0:
-                state[y + 1, x] = 2
-                stack[sp, 0] = y + 1
-                stack[sp, 1] = x
-                sp += 1
-            if x > 0 and state[y, x - 1] == 0:
-                state[y, x - 1] = 2
-                stack[sp, 0] = y
-                stack[sp, 1] = x - 1
-                sp += 1
-            if x + 1 < w and state[y, x + 1] == 0:
-                state[y, x + 1] = 2
-                stack[sp, 0] = y
-                stack[sp, 1] = x + 1
-                sp += 1
-
-        for y in range(h):
-            for x in range(w):
-                out[y, x] = state[y, x] != 2
+@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+def _numba_keep_center_fill_kernel(mask: np.ndarray) -> np.ndarray:
+    # keep-center-component (8-connected) + enclosed-hole fill (4-connected background),
+    # fused: result = NOT(border-4-connected component of NOT kept). Matches
+    # _keep_center_component_2d + _fill_holes_2d_opencv semantics exactly.
+    h = mask.shape[0]
+    w = mask.shape[1]
+    out = np.zeros((h, w), dtype=np.bool_)
+    if h <= 0 or w <= 0:
         return out
 
-    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-    def _numba_paste_masked_or_kernel(
-        dest: np.ndarray, local_mask: np.ndarray,
-        dst_y0: int, dst_x0: int,
-        src_y0: int, src_y1: int, src_x0: int, src_x1: int,
-    ) -> int:
-        added = 0
-        for sy in range(src_y0, src_y1):
-            dy = dst_y0 + (sy - src_y0)
-            for sx in range(src_x0, src_x1):
-                if not local_mask[sy, sx]:
+    cy = h // 2
+    cx = w // 2
+    seed_y = -1
+    seed_x = -1
+    if mask[cy, cx]:
+        seed_y = cy
+        seed_x = cx
+    else:
+        best_d2 = np.int64(-1)
+        for y in range(h):
+            for x in range(w):
+                if not mask[y, x]:
                     continue
-                dx = dst_x0 + (sx - src_x0)
-                if dest[dy, dx] == 0:
-                    dest[dy, dx] = 1
+                dy = np.int64(y - cy)
+                dx = np.int64(x - cx)
+                d2 = dy * dy + dx * dx
+                if best_d2 < 0 or d2 < best_d2:
+                    best_d2 = d2
+                    seed_y = y
+                    seed_x = x
+    if seed_y < 0:
+        return out
+
+    # state: 0 unknown, 1 kept (center component), 2 outside background
+    state = np.zeros((h, w), dtype=np.uint8)
+    stack = np.empty((h * w, 2), dtype=np.int32)
+    sp = 0
+    state[seed_y, seed_x] = 1
+    stack[sp, 0] = seed_y
+    stack[sp, 1] = seed_x
+    sp += 1
+    while sp > 0:
+        sp -= 1
+        y = int(stack[sp, 0])
+        x = int(stack[sp, 1])
+        for dy in range(-1, 2):
+            ny = y + dy
+            if ny < 0 or ny >= h:
+                continue
+            for dx in range(-1, 2):
+                if dy == 0 and dx == 0:
+                    continue
+                nx = x + dx
+                if nx < 0 or nx >= w:
+                    continue
+                if state[ny, nx] == 0 and mask[ny, nx]:
+                    state[ny, nx] = 1
+                    stack[sp, 0] = ny
+                    stack[sp, 1] = nx
+                    sp += 1
+
+    # 4-connected flood of NOT-kept from every border pixel -> outside background.
+    sp = 0
+    for x in range(w):
+        if state[0, x] == 0:
+            state[0, x] = 2
+            stack[sp, 0] = 0
+            stack[sp, 1] = x
+            sp += 1
+        if state[h - 1, x] == 0:
+            state[h - 1, x] = 2
+            stack[sp, 0] = h - 1
+            stack[sp, 1] = x
+            sp += 1
+    for y in range(h):
+        if state[y, 0] == 0:
+            state[y, 0] = 2
+            stack[sp, 0] = y
+            stack[sp, 1] = 0
+            sp += 1
+        if state[y, w - 1] == 0:
+            state[y, w - 1] = 2
+            stack[sp, 0] = y
+            stack[sp, 1] = w - 1
+            sp += 1
+    while sp > 0:
+        sp -= 1
+        y = int(stack[sp, 0])
+        x = int(stack[sp, 1])
+        if y > 0 and state[y - 1, x] == 0:
+            state[y - 1, x] = 2
+            stack[sp, 0] = y - 1
+            stack[sp, 1] = x
+            sp += 1
+        if y + 1 < h and state[y + 1, x] == 0:
+            state[y + 1, x] = 2
+            stack[sp, 0] = y + 1
+            stack[sp, 1] = x
+            sp += 1
+        if x > 0 and state[y, x - 1] == 0:
+            state[y, x - 1] = 2
+            stack[sp, 0] = y
+            stack[sp, 1] = x - 1
+            sp += 1
+        if x + 1 < w and state[y, x + 1] == 0:
+            state[y, x + 1] = 2
+            stack[sp, 0] = y
+            stack[sp, 1] = x + 1
+            sp += 1
+
+    for y in range(h):
+        for x in range(w):
+            out[y, x] = state[y, x] != 2
+    return out
+
+@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+def _numba_paste_masked_or_kernel(
+    dest: np.ndarray, local_mask: np.ndarray,
+    dst_y0: int, dst_x0: int,
+    src_y0: int, src_y1: int, src_x0: int, src_x1: int,
+) -> int:
+    added = 0
+    for sy in range(src_y0, src_y1):
+        dy = dst_y0 + (sy - src_y0)
+        for sx in range(src_x0, src_x1):
+            if not local_mask[sy, sx]:
+                continue
+            dx = dst_x0 + (sx - src_x0)
+            if dest[dy, dx] == 0:
+                dest[dy, dx] = 1
+                added += 1
+    return added
+
+@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+def _numba_paste_packed_or_kernel(
+    dest: np.ndarray, local_mask: np.ndarray,
+    dst_y0: int, dst_x0: int,
+    src_y0: int, src_y1: int, src_x0: int, src_x1: int,
+    value,
+) -> int:
+    added = 0
+    for sy in range(src_y0, src_y1):
+        dy = dst_y0 + sy - src_y0
+        for sx in range(src_x0, src_x1):
+            if local_mask[sy, sx]:
+                dx = dst_x0 + sx - src_x0
+                previous = dest[dy, dx]
+                if (previous & value) == 0:
                     added += 1
-        return added
-
-    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-    def _numba_paste_packed_or_kernel(
-        dest: np.ndarray, local_mask: np.ndarray,
-        dst_y0: int, dst_x0: int,
-        src_y0: int, src_y1: int, src_x0: int, src_x1: int,
-        value,
-    ) -> int:
-        added = 0
-        for sy in range(src_y0, src_y1):
-            dy = dst_y0 + sy - src_y0
-            for sx in range(src_x0, src_x1):
-                if local_mask[sy, sx]:
-                    dx = dst_x0 + sx - src_x0
-                    previous = dest[dy, dx]
-                    if (previous & value) == 0:
-                        added += 1
-                    # Composite values can partly overlap: old=1,value=3 counts
-                    # zero additions but must still set the second membership bit.
-                    dest[dy, dx] = previous | value
-        return added
-else:
-    _numba_nearest_true_pixel_kernel = None
-    _numba_dilated_overlap_count_kernel = None
-    _numba_keep_center_fill_kernel = None
-    _numba_paste_masked_or_kernel = None
-    _numba_paste_packed_or_kernel = None
-
-def _planning_kernels_active() -> bool:
-    return bool(
-        _numba_nearest_true_pixel_kernel is not None
-        and compiled_interpolation_kernels_enabled()
-        and not _NUMBA_PLANNING_KERNELS_RUNTIME_DISABLED
-    )
-
-def _disable_planning_kernels(exc: BaseException) -> None:
-    global _NUMBA_PLANNING_KERNELS_RUNTIME_DISABLED
-    if not _NUMBA_PLANNING_KERNELS_RUNTIME_DISABLED:
-        _NUMBA_PLANNING_KERNELS_RUNTIME_DISABLED = True
-        print(f'Warning: numba planning kernels failed ({exc}); using python planning helpers for remaining calls in this process.')
-
+                # Composite values can partly overlap: old=1,value=3 counts
+                # zero additions but must still set the second membership bit.
+                dest[dy, dx] = previous | value
+    return added
 def interpolation_projection_numba_max_tracked() -> int:
     # Tiled masks can place hundreds of distinct canonical labels inside one local
     # projection window.  The former 64-entry scratch array silently discarded the compiled
     # result and reran the entire seed in Python whenever that happened.  A 1024-entry
     # workspace is only ~80 KiB across the ten int64 arrays and keeps the common fragmented
-    # case on the no-GIL kernel; the overflow path remains exact for unusually dense windows.
+    # case on the no-GIL kernel. Larger windows grow this workspace and retry in compiled code.
     return max(8, _env_int('YOLO_TTA_INTERPOLATION_NUMBA_MAX_TRACKED_CANDIDATES', 1024))
 
 def interpolation_compiled_kernels_status() -> str:
-    if _numba is None:
-        return f'unavailable ({_NUMBA_IMPORT_ERROR})'
-    if not _env_flag('YOLO_TTA_INTERPOLATION_COMPILED_KERNELS', True):
-        return 'disabled by YOLO_TTA_INTERPOLATION_COMPILED_KERNELS=0'
-    if _NUMBA_PROJECTION_KERNEL_RUNTIME_DISABLED:
-        return 'disabled after runtime compilation/execution failure'
     return 'enabled: numba no-GIL projection-candidate kernel'
 
 def interpolation_planning_backend_name() -> str:
-    base = 'cached_per_slice_component_tables_local_sdf_unordered'
-    if compiled_interpolation_kernels_enabled() and not _NUMBA_PROJECTION_KERNEL_RUNTIME_DISABLED:
-        base += '+numba_nogil_projection_candidates'
-    else:
-        base += '+python_projection_candidates'
+    base = 'cached_per_slice_component_tables_local_sdf_unordered+numba_nogil_projection_candidates'
     if interpolation_process_worker_active():
         base += '+process_isolated_pass'
     return base
 
-if _numba is not None:
-    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-    def _numba_find_projection_candidates_kernel(
-        labels_real: np.ndarray,
-        sparse_flat: np.ndarray,
-        sparse_offsets: np.ndarray,
-        sparse_bboxes: np.ndarray,
-        sparse_mode: bool,
-        num_slices_arg: int,
-        full_w_arg: int,
-        lut_flat: np.ndarray,
-        lut_offsets: np.ndarray,
-        sdf: np.ndarray,
-        crop_y0: int,
-        crop_x0: int,
-        s0: int,
-        source_anchor_y: int,
-        source_anchor_x: int,
-        seed_label: int,
-        direction_sign: int,
-        max_steps: int,
-        slope: float,
-        max_candidates: int,
-        wrap_axis: bool,
-        search_angle_negative: bool,
-        max_tracked: int,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int]:
-        out_labels = np.zeros((max_tracked,), dtype=np.int64)
-        out_slices = np.zeros((max_tracked,), dtype=np.int64)
-        out_ys = np.zeros((max_tracked,), dtype=np.int64)
-        out_xs = np.zeros((max_tracked,), dtype=np.int64)
-        out_steps = np.zeros((max_tracked,), dtype=np.int64)
-        out_d2 = np.zeros((max_tracked,), dtype=np.int64)
+@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+def _numba_find_projection_candidates_kernel(
+    labels_real: np.ndarray,
+    sparse_flat: np.ndarray,
+    sparse_offsets: np.ndarray,
+    sparse_bboxes: np.ndarray,
+    sparse_mode: bool,
+    num_slices_arg: int,
+    full_w_arg: int,
+    lut_flat: np.ndarray,
+    lut_offsets: np.ndarray,
+    sdf: np.ndarray,
+    crop_y0: int,
+    crop_x0: int,
+    s0: int,
+    source_anchor_y: int,
+    source_anchor_x: int,
+    seed_label: int,
+    direction_sign: int,
+    max_steps: int,
+    slope: float,
+    max_candidates: int,
+    wrap_axis: bool,
+    search_angle_negative: bool,
+    max_tracked: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int]:
+    out_labels = np.zeros((max_tracked,), dtype=np.int64)
+    out_slices = np.zeros((max_tracked,), dtype=np.int64)
+    out_ys = np.zeros((max_tracked,), dtype=np.int64)
+    out_xs = np.zeros((max_tracked,), dtype=np.int64)
+    out_steps = np.zeros((max_tracked,), dtype=np.int64)
+    out_d2 = np.zeros((max_tracked,), dtype=np.int64)
 
-        step_labels = np.zeros((max_tracked,), dtype=np.int64)
-        step_ys = np.zeros((max_tracked,), dtype=np.int64)
-        step_xs = np.zeros((max_tracked,), dtype=np.int64)
-        step_d2 = np.zeros((max_tracked,), dtype=np.int64)
+    step_labels = np.zeros((max_tracked,), dtype=np.int64)
+    step_ys = np.zeros((max_tracked,), dtype=np.int64)
+    step_xs = np.zeros((max_tracked,), dtype=np.int64)
+    step_d2 = np.zeros((max_tracked,), dtype=np.int64)
 
-        found_count = 0
-        num_slices = num_slices_arg
-        full_w = full_w_arg
-        sdf_h = sdf.shape[0]
-        sdf_w = sdf.shape[1]
-        overflow = 0
-        # when the label volume holds per-slice LOCAL ids (compact relabel
-        # skipped), lut_offsets has one entry per slice and reads canonicalize through the
-        # concatenated local->canonical table; a shorter array means canonical ids in-raster.
-        use_lut = lut_offsets.shape[0] == num_slices
+    found_count = 0
+    num_slices = num_slices_arg
+    full_w = full_w_arg
+    sdf_h = sdf.shape[0]
+    sdf_w = sdf.shape[1]
+    overflow = 0
+    # when the label volume holds per-slice LOCAL ids (compact relabel
+    # skipped), lut_offsets has one entry per slice and reads canonicalize through the
+    # concatenated local->canonical table; a shorter array means canonical ids in-raster.
+    use_lut = lut_offsets.shape[0] == num_slices
 
-        for step in range(1, max_steps + 1):
-            s = s0 + direction_sign * step
-            # a projection step that crosses the azimuthal 0°/180° wrap lands
-            # in a frame whose u axis is REVERSED relative to the projection cone, so read
-            # (and report) the mirrored column there. max_steps <= num_slices-1 caps the
-            # walk at a single crossing.
-            mirrored = False
-            if wrap_axis:
-                if s < 0 or s >= num_slices:
-                    mirrored = True
-                s = s % num_slices
-            else:
-                if s < 0 or s >= num_slices:
-                    break
-
-            threshold = -slope * float(step)
-            any_projection = False
-            step_count = 0
-
-            for yy in range(sdf_h):
-                gy = crop_y0 + yy
-                for xx in range(sdf_w):
-                    if sdf[yy, xx] < threshold:
-                        continue
-                    any_projection = True
-                    gx = crop_x0 + xx
-                    if mirrored:
-                        gx_read = full_w - 1 - gx
-                    else:
-                        gx_read = gx
-                    if sparse_mode:
-                        sy0 = int(sparse_bboxes[s, 0])
-                        sy1 = int(sparse_bboxes[s, 1])
-                        sx0 = int(sparse_bboxes[s, 2])
-                        sx1 = int(sparse_bboxes[s, 3])
-                        if gy < sy0 or gy >= sy1 or gx_read < sx0 or gx_read >= sx1:
-                            raw_label = 0
-                        else:
-                            sparse_index = int(sparse_offsets[s]) + (
-                                (gy - sy0) * (sx1 - sx0) + (gx_read - sx0)
-                            )
-                            raw_label = int(sparse_flat[sparse_index])
-                    else:
-                        raw_label = int(labels_real[s, gy, gx_read])
-                    if raw_label <= 0:
-                        continue
-                    if use_lut:
-                        target_label = int(lut_flat[lut_offsets[s] + raw_label])
-                    else:
-                        target_label = raw_label
-                    if target_label <= 0 or target_label == seed_label:
-                        continue
-
-                    already_found = False
-                    for prev_idx in range(found_count):
-                        if out_labels[prev_idx] == target_label:
-                            already_found = True
-                            break
-                    if already_found:
-                        continue
-
-                    step_idx = -1
-                    for local_idx in range(step_count):
-                        if step_labels[local_idx] == target_label:
-                            step_idx = local_idx
-                            break
-
-                    dy = gy - source_anchor_y
-                    dx = gx - source_anchor_x
-                    d2 = dy * dy + dx * dx
-                    if step_idx < 0:
-                        if step_count >= max_tracked:
-                            overflow = 1
-                            return out_labels, out_slices, out_ys, out_xs, out_steps, out_d2, found_count, overflow
-                        step_labels[step_count] = target_label
-                        step_ys[step_count] = gy
-                        # Candidate points are reported in the target slice's own (actual)
-                        # coordinates; d2 stays in unrolled projection coordinates.
-                        step_xs[step_count] = gx_read
-                        step_d2[step_count] = d2
-                        step_count += 1
-                    else:
-                        if d2 < step_d2[step_idx]:
-                            step_ys[step_idx] = gy
-                            step_xs[step_idx] = gx_read
-                            step_d2[step_idx] = d2
-
-            if not any_projection:
-                if search_angle_negative:
-                    break
-                continue
-
-            for local_idx in range(step_count):
-                if found_count >= max_tracked:
-                    overflow = 1
-                    return out_labels, out_slices, out_ys, out_xs, out_steps, out_d2, found_count, overflow
-                out_labels[found_count] = step_labels[local_idx]
-                out_slices[found_count] = s
-                out_ys[found_count] = step_ys[local_idx]
-                out_xs[found_count] = step_xs[local_idx]
-                out_steps[found_count] = step
-                out_d2[found_count] = step_d2[local_idx]
-                found_count += 1
-
-            if found_count >= max_candidates:
+    for step in range(1, max_steps + 1):
+        s = s0 + direction_sign * step
+        # a projection step that crosses the azimuthal 0°/180° wrap lands
+        # in a frame whose u axis is REVERSED relative to the projection cone, so read
+        # (and report) the mirrored column there. max_steps <= num_slices-1 caps the
+        # walk at a single crossing.
+        mirrored = False
+        if wrap_axis:
+            if s < 0 or s >= num_slices:
+                mirrored = True
+            s = s % num_slices
+        else:
+            if s < 0 or s >= num_slices:
                 break
 
-        return out_labels, out_slices, out_ys, out_xs, out_steps, out_d2, found_count, overflow
-else:
-    _numba_find_projection_candidates_kernel = None
+        threshold = -slope * float(step)
+        any_projection = False
+        step_count = 0
 
+        for yy in range(sdf_h):
+            gy = crop_y0 + yy
+            for xx in range(sdf_w):
+                if sdf[yy, xx] < threshold:
+                    continue
+                any_projection = True
+                gx = crop_x0 + xx
+                if mirrored:
+                    gx_read = full_w - 1 - gx
+                else:
+                    gx_read = gx
+                if sparse_mode:
+                    sy0 = int(sparse_bboxes[s, 0])
+                    sy1 = int(sparse_bboxes[s, 1])
+                    sx0 = int(sparse_bboxes[s, 2])
+                    sx1 = int(sparse_bboxes[s, 3])
+                    if gy < sy0 or gy >= sy1 or gx_read < sx0 or gx_read >= sx1:
+                        raw_label = 0
+                    else:
+                        sparse_index = int(sparse_offsets[s]) + (
+                            (gy - sy0) * (sx1 - sx0) + (gx_read - sx0)
+                        )
+                        raw_label = int(sparse_flat[sparse_index])
+                else:
+                    raw_label = int(labels_real[s, gy, gx_read])
+                if raw_label <= 0:
+                    continue
+                if use_lut:
+                    target_label = int(lut_flat[lut_offsets[s] + raw_label])
+                else:
+                    target_label = raw_label
+                if target_label <= 0 or target_label == seed_label:
+                    continue
+
+                already_found = False
+                for prev_idx in range(found_count):
+                    if out_labels[prev_idx] == target_label:
+                        already_found = True
+                        break
+                if already_found:
+                    continue
+
+                step_idx = -1
+                for local_idx in range(step_count):
+                    if step_labels[local_idx] == target_label:
+                        step_idx = local_idx
+                        break
+
+                dy = gy - source_anchor_y
+                dx = gx - source_anchor_x
+                d2 = dy * dy + dx * dx
+                if step_idx < 0:
+                    if step_count >= max_tracked:
+                        overflow = 1
+                        return out_labels, out_slices, out_ys, out_xs, out_steps, out_d2, found_count, overflow
+                    step_labels[step_count] = target_label
+                    step_ys[step_count] = gy
+                    # Candidate points are reported in the target slice's own (actual)
+                    # coordinates; d2 stays in unrolled projection coordinates.
+                    step_xs[step_count] = gx_read
+                    step_d2[step_count] = d2
+                    step_count += 1
+                else:
+                    if d2 < step_d2[step_idx]:
+                        step_ys[step_idx] = gy
+                        step_xs[step_idx] = gx_read
+                        step_d2[step_idx] = d2
+
+        if not any_projection:
+            if search_angle_negative:
+                break
+            continue
+
+        for local_idx in range(step_count):
+            if found_count >= max_tracked:
+                overflow = 1
+                return out_labels, out_slices, out_ys, out_xs, out_steps, out_d2, found_count, overflow
+            out_labels[found_count] = step_labels[local_idx]
+            out_slices[found_count] = s
+            out_ys[found_count] = step_ys[local_idx]
+            out_xs[found_count] = step_xs[local_idx]
+            out_steps[found_count] = step
+            out_d2[found_count] = step_d2[local_idx]
+            found_count += 1
+
+        if found_count >= max_candidates:
+            break
+
+    return out_labels, out_slices, out_ys, out_xs, out_steps, out_d2, found_count, overflow
 def _find_slice_projection_candidates_numba(
     labels_real: object,
     seed: SliceEndpointSeed,
@@ -1335,17 +1222,10 @@ def _find_slice_projection_candidates_numba(
     wrap_axis: bool = False,
     component_cache: Optional[SliceComponentTableCache] = None,
     slice_luts: Optional['SliceLocalLabelLUTs'] = None,
-) -> Optional[List[SliceProjectionCandidate]]:
+) -> List[SliceProjectionCandidate]:
     # Local import keeps the package dependency graph acyclic.
     from .topology import SparseSliceLabelStore
 
-    global _NUMBA_PROJECTION_KERNEL_RUNTIME_DISABLED
-    if (
-        _numba_find_projection_candidates_kernel is None
-        or not compiled_interpolation_kernels_enabled()
-        or _NUMBA_PROJECTION_KERNEL_RUNTIME_DISABLED
-    ):
-        return None
     if int(max_slice_distance) <= 0 or int(max_candidates) <= 0:
         return []
 
@@ -1376,7 +1256,11 @@ def _find_slice_projection_candidates_numba(
     crop_y0 = int(cropped_sdf.origin_y)
     crop_x0 = int(cropped_sdf.origin_x)
     slope = math.tan(math.radians(float(search_angle_deg)))
-    max_tracked = max(int(max_candidates), int(interpolation_projection_numba_max_tracked()))
+    # At most one new label can arise from each scanned pixel in each reachable
+    # slice. Start with the usual small workspace and grow only when the compiled
+    # scan proves it insufficient; even heavily fragmented valid windows remain exact.
+    max_unique = max(1, int(sdf.size) * min(int(max_steps), int(num_slices) - 1))
+    max_tracked = min(int(max_unique), int(interpolation_projection_numba_max_tracked()))
 
     # pass the per-slice local->canonical LUTs when the label volume holds
     # local ids; a 1-entry offsets sentinel tells the kernel the raster is already canonical.
@@ -1401,7 +1285,7 @@ def _find_slice_projection_candidates_numba(
         sparse_offsets_arg = np.empty((0,), dtype=np.int64)
         sparse_bboxes_arg = np.empty((0, 4), dtype=np.int64)
         sparse_mode_arg = False
-    try:
+    while True:
         labels_out, slices_out, ys_out, xs_out, steps_out, d2_out, count, overflow = _numba_find_projection_candidates_kernel(
             dense_arg,
             sparse_flat_arg,
@@ -1427,15 +1311,12 @@ def _find_slice_projection_candidates_numba(
             bool(float(search_angle_deg) < 0.0),
             int(max_tracked),
         )
-    except Exception as exc:
-        _NUMBA_PROJECTION_KERNEL_RUNTIME_DISABLED = True
-        print(f'Warning: Numba interpolation projection kernel failed ({exc}); using Python candidate search for remaining calls in this process.')
-        return None
-
-    if int(overflow) != 0:
-        # Preserve exact semantics by falling back to the Python implementation when a single
-        # projection step contains more distinct labels than the fixed-size compiled workspace.
-        return None
+        if int(overflow) == 0:
+            break
+        del labels_out, slices_out, ys_out, xs_out, steps_out, d2_out
+        if int(max_tracked) >= int(max_unique):
+            raise RuntimeError('Compiled projection-candidate workspace overflowed its window bound')
+        max_tracked = min(int(max_unique), max(int(max_tracked) + 1, 2 * int(max_tracked)))
     if int(count) <= 0:
         return []
 
@@ -1461,139 +1342,6 @@ def _find_slice_projection_candidates_numba(
         ))
     return out
 
-def _find_slice_projection_candidates_python(
-    labels_real: object,
-    seed: SliceEndpointSeed,
-    max_slice_distance: int,
-    search_angle_deg: float,
-    max_candidates: int,
-    wrap_axis: bool = False,
-    component_cache: Optional[SliceComponentTableCache] = None,
-    slice_luts: Optional['SliceLocalLabelLUTs'] = None,
-) -> List[SliceProjectionCandidate]:
-    # Local import keeps the package dependency graph acyclic.
-    from .topology import SparseSliceLabelStore
-
-    if int(max_slice_distance) <= 0 or int(max_candidates) <= 0:
-        return []
-
-    s0, y0, x0 = seed.point
-    num_slices = int(labels_real.shape[0])
-    if num_slices <= 0:
-        return []
-
-    local_cache = (
-        component_cache
-        if component_cache is not None
-        else SliceComponentTableCache(labels_real, slice_luts=slice_luts)
-    )
-    source_record, source_anchor = local_cache.find_record_for_point(int(s0), int(seed.label), (int(y0), int(x0)))
-    if source_record is None or source_anchor is None or int(source_record.area) <= 0:
-        return []
-
-    max_steps = min(int(max_slice_distance), max(0, int(num_slices) - 1)) if bool(wrap_axis) else int(max_slice_distance)
-    if int(max_steps) <= 0:
-        return []
-
-    cropped_sdf = local_cache.get_projection_sdf(
-        source_record,
-        max_slice_distance=int(max_steps),
-        search_angle_deg=float(search_angle_deg),
-    )
-    sdf = np.asarray(cropped_sdf.sdf, dtype=np.float32)
-    crop_y0 = int(cropped_sdf.origin_y)
-    crop_x0 = int(cropped_sdf.origin_x)
-    crop_y1 = int(crop_y0 + int(sdf.shape[0]))
-    crop_x1 = int(crop_x0 + int(sdf.shape[1]))
-
-    slope = math.tan(math.radians(float(search_angle_deg)))
-    full_w = int(labels_real.shape[2])
-    # target_label -> (step, unrolled d2, candidate); d2 is kept separately because the
-    # candidate's target_point is in the target slice's own (actual) coordinates, which
-    # differ from unrolled projection coordinates for wrap-crossing steps.
-    found: Dict[int, Tuple[int, int, SliceProjectionCandidate]] = {}
-
-    for step in range(1, int(max_steps) + 1):
-        s_raw = int(s0 + int(seed.direction_sign) * step)
-        mirrored = False
-        if bool(wrap_axis):
-            s = int(s_raw % int(num_slices))
-            # a step across the azimuthal 0°/180° wrap lands in a frame whose
-            # u axis is REVERSED relative to the projection cone. max_steps <= num_slices-1
-            # caps the walk at a single crossing.
-            mirrored = bool(s_raw < 0 or s_raw >= int(num_slices))
-        elif s_raw < 0 or s_raw >= num_slices:
-            break
-        else:
-            s = s_raw
-
-        threshold = -float(slope) * float(step)
-        projection = sdf >= threshold
-        if not np.any(projection):
-            if float(search_angle_deg) < 0.0:
-                break
-            continue
-
-        if isinstance(labels_real, SparseSliceLabelStore):
-            # materialize only the SDF window. A wrap-crossing projection requests
-            # the corresponding actual-u window and reverses that small crop back into
-            # unrolled projection coordinates.
-            if mirrored:
-                actual_x0 = int(full_w - crop_x1)
-                actual_x1 = int(full_w - crop_x0)
-                labels_crop = labels_real.read_window(
-                    int(s), crop_y0, crop_y1, actual_x0, actual_x1,
-                )[:, ::-1]
-            else:
-                labels_crop = labels_real.read_window(
-                    int(s), crop_y0, crop_y1, crop_x0, crop_x1,
-                )
-        else:
-            slice_view = np.asarray(labels_real[int(s)])
-            if mirrored:
-                slice_view = slice_view[:, ::-1]
-            labels_crop = slice_view[crop_y0:crop_y1, crop_x0:crop_x1]
-        if slice_luts is not None:
-            # local-id raster — canonicalize just the SDF crop (small gather)
-            # instead of relying on a full-volume compact relabel pass.
-            labels_crop = slice_luts.lut_for(int(s))[labels_crop]
-        overlap = projection & (labels_crop > 0) & (labels_crop != int(seed.label))
-        if not np.any(overlap):
-            continue
-
-        ys_local, xs_local = np.nonzero(overlap)
-        lbls = labels_crop[ys_local, xs_local].astype(np.int64, copy=False)
-        for target_label in np.unique(lbls):
-            target_label_i = int(target_label)
-            if target_label_i <= 0 or target_label_i == int(seed.label) or target_label_i in found:
-                continue
-            use = lbls == target_label_i
-            ys_t = ys_local[use]
-            xs_t = xs_local[use]
-            if ys_t.size == 0:
-                continue
-            ys_global = ys_t.astype(np.int64, copy=False) + int(crop_y0)
-            xs_global = xs_t.astype(np.int64, copy=False) + int(crop_x0)
-            d2 = (ys_global - int(source_anchor[0])) ** 2 + (xs_global - int(source_anchor[1])) ** 2
-            idx = int(np.argmin(d2))
-            x_actual = int(full_w - 1 - int(xs_global[idx])) if mirrored else int(xs_global[idx])
-            found[target_label_i] = (int(step), int(d2[idx]), SliceProjectionCandidate(
-                source_label=int(seed.label),
-                target_label=target_label_i,
-                source_point=(int(s0), int(y0), int(x0)),
-                target_point=(int(s), int(ys_global[idx]), x_actual),
-                slice_distance=int(step),
-            ))
-
-        if len(found) >= int(max_candidates):
-            break
-
-    ordered = sorted(
-        found.items(),
-        key=lambda item: (int(item[1][0]), int(item[1][1]), int(item[0])),
-    )
-    return [candidate for _label, (_step, _d2, candidate) in ordered[: int(max_candidates)]]
-
 def _find_slice_projection_candidates(
     labels_real: np.ndarray,
     seed: SliceEndpointSeed,
@@ -1604,19 +1352,7 @@ def _find_slice_projection_candidates(
     component_cache: Optional[SliceComponentTableCache] = None,
     slice_luts: Optional['SliceLocalLabelLUTs'] = None,
 ) -> List[SliceProjectionCandidate]:
-    fast_candidates = _find_slice_projection_candidates_numba(
-        labels_real=labels_real,
-        seed=seed,
-        max_slice_distance=int(max_slice_distance),
-        search_angle_deg=float(search_angle_deg),
-        max_candidates=int(max_candidates),
-        wrap_axis=bool(wrap_axis),
-        component_cache=component_cache,
-        slice_luts=slice_luts,
-    )
-    if fast_candidates is not None:
-        return fast_candidates
-    return _find_slice_projection_candidates_python(
+    return _find_slice_projection_candidates_numba(
         labels_real=labels_real,
         seed=seed,
         max_slice_distance=int(max_slice_distance),
@@ -1735,12 +1471,6 @@ def interpolation_cache_bridge_sections_enabled() -> bool:
 
  ``YOLO_TTA_INTERPOLATION_CACHE_BRIDGE_SECTIONS=0`` restores recomputation."""
     return _env_flag('YOLO_TTA_INTERPOLATION_CACHE_BRIDGE_SECTIONS', True)
-
-def interpolation_fused_bridge_merge_enabled() -> bool:
-    """Restrict bridge merge/delta capture to rendered paste bboxes.
-
- ``YOLO_TTA_INTERPOLATION_FUSED_BRIDGE_MERGE=0`` restores full-slice sweeps."""
-    return _env_flag('YOLO_TTA_INTERPOLATION_FUSED_BRIDGE_MERGE', True)
 
 def interpolation_plan_batch_budget_bytes() -> int:
     """Maximum charged bytes retained in the accepted-plan render batch.
@@ -2220,7 +1950,6 @@ def interpolate_view_volume_pass_inplace(
     # Local import keeps the package dependency graph acyclic.
     from .topology import (
         _local_label_store_dtype,
-        interpolation_skip_compact_relabel_enabled,
         label_foreground_volume_streaming,
     )
 
@@ -2338,8 +2067,7 @@ def interpolate_view_volume_pass_inplace(
         ]
     # Keep per-slice local ids in the label store and consume them through exported LUTs.
     # Size admission with the actual local dtype so a uint16-capable pass is not forced to disk.
-    skip_relabel = interpolation_skip_compact_relabel_enabled()
-    estimated_label_dtype = _local_label_store_dtype(compact_relabel=not skip_relabel)
+    estimated_label_dtype = _local_label_store_dtype(compact_relabel=False)
     estimated_bytes = estimate_interpolation_workspace_bytes(
         tuple(int(x) for x in mask_mm.shape), label_dtype=estimated_label_dtype,
     )
@@ -2361,11 +2089,11 @@ def interpolate_view_volume_pass_inplace(
             reserve_bytes=reserve_bytes,
             wrap_axis=bool(wrap_axis),
             workers=int(workers),
-            compact_relabel=not skip_relabel,
-            component_stats_out=label_stats if skip_relabel else None,
+            compact_relabel=False,
+            component_stats_out=label_stats,
             known_slice_any=known_slice_any,
             known_slice_bboxes=known_slice_bboxes,
-            sparse_local_labels=bool(skip_relabel),
+            sparse_local_labels=True,
         )
     except BaseException:
         if not bool(keep_temp):
@@ -2376,9 +2104,7 @@ def interpolate_view_volume_pass_inplace(
                     pass
         _discard_failed_component_outputs()
         raise
-    slice_luts: Optional[SliceLocalLabelLUTs] = (
-        label_stats.get('slice_local_luts') if skip_relabel else None  # type: ignore[assignment]
-    )
+    slice_luts: Optional[SliceLocalLabelLUTs] = label_stats.get('slice_local_luts')  # type: ignore[assignment]
 
     if int(num_objects) <= 1:
         del labels_mm
@@ -2404,7 +2130,7 @@ def interpolate_view_volume_pass_inplace(
             'bridge_component_deltas': _bridge_component_stats(),
         }
 
-    if skip_relabel and slice_luts is None:
+    if slice_luts is None:
         # Defensive: a local-id raster without LUTs would be misread downstream. This can
         # only happen through an unexpected labeler edit; fail loudly rather than corrupt.
         close_memmap_array(labels_mm)
@@ -2574,11 +2300,7 @@ def interpolate_view_volume_pass_inplace(
     cpu_render_wall_seconds = 0.0
     planner_wall_seconds = 0.0
     render_workers = choose_slice_parallel_workers(int(workers), int(mask_mm.shape[0]))
-    fused_bridge_merge = bool(interpolation_fused_bridge_merge_enabled())
-    rendered_paste_bboxes = (
-        np.zeros((int(mask_mm.shape[0]), 4), dtype=np.int64)
-        if fused_bridge_merge else None
-    )
+    rendered_paste_bboxes = np.zeros((int(mask_mm.shape[0]), 4), dtype=np.int64)
     scheduled_slice_flags = np.zeros((int(mask_mm.shape[0]),), dtype=bool)
 
     try:
@@ -2668,9 +2390,7 @@ def interpolate_view_volume_pass_inplace(
                 scheduled_slice_flags[np.asarray(batch_slices, dtype=np.int64)] = True
             batch_added_counts = np.zeros((len(batch_slices),), dtype=np.int64)
 
-            def _initial_bbox_union(z: int) -> Optional[List[int]]:
-                if rendered_paste_bboxes is None:
-                    return None
+            def _initial_bbox_union(z: int) -> List[int]:
                 old_y0, old_x0, old_y1, old_x1 = (
                     int(v) for v in rendered_paste_bboxes[int(z)]
                 )
@@ -2720,7 +2440,7 @@ def interpolate_view_volume_pass_inplace(
                 # the whole batch is safe because painting is OR-idempotent.  Preserve the
                 # already-counted additions and add only the bits CPU replay newly sets.
                 batch_added_counts[int(list_idx)] += np.int64(local_added)
-                if rendered_paste_bboxes is not None and bbox_union is not None:
+                if bbox_union is not None:
                     rendered_paste_bboxes[int(z)] = np.asarray(bbox_union, dtype=np.int64)
 
             def _render_batch_cpu() -> float:
@@ -2800,7 +2520,7 @@ def interpolate_view_volume_pass_inplace(
                         # never double-account a numerically divergent extra bit here.
                         if not bool(cpu_probe_complete):
                             batch_added_counts[int(list_idx)] += np.int64(local_added)
-                        if rendered_paste_bboxes is not None and bbox_union is not None:
+                        if bbox_union is not None:
                             rendered_paste_bboxes[int(z)] = np.asarray(
                                 bbox_union, dtype=np.int64,
                             )
@@ -3032,12 +2752,9 @@ def interpolate_view_volume_pass_inplace(
 
             def _merge_slice(list_idx: int) -> None:
                 z = int(scheduled_slices[int(list_idx)])
-                if rendered_paste_bboxes is not None:
-                    y0, x0, y1, x1 = (int(v) for v in rendered_paste_bboxes[z])
-                    if y0 >= y1 or x0 >= x1:
-                        return
-                else:
-                    y0, x0, y1, x1 = 0, 0, int(mask_mm.shape[1]), int(mask_mm.shape[2])
+                y0, x0, y1, x1 = (int(v) for v in rendered_paste_bboxes[z])
+                if y0 >= y1 or x0 >= x1:
+                    return
 
                 if component_membership_mms:
                     bridge_region = np.asarray(
@@ -3266,7 +2983,7 @@ def interpolate_view_volume_pass_inplace(
         'wrap_axis': bool(wrap_axis),
         'endpoint_method': 'slice_component_scan',
         'planning_backend': interpolation_planning_backend_name(),
-        'compact_relabel_skipped': bool(skip_relabel),  #
+        'compact_relabel_skipped': True,
         'planner_plan_count': int(planned_plan_count),
         'planner_plan_batches': int(plan_batches_rendered),
         'planner_plan_batch_budget_bytes': int(plan_batch_budget_bytes),

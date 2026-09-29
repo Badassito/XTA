@@ -82,40 +82,56 @@ class SparseTemporalFusionTests(unittest.TestCase):
         cases = 0
         for source_t, target_t in ((19, 11), (7, 17), (1, 9), (21, 1)):
             for fmt in (CVOL_FORMAT, INTERNAL_PACKED_CVOL_FORMAT):
-                for grouped in (False, True):
-                    for empty in (False, True):
-                        with (
-                            self.subTest(source_t=source_t, target_t=target_t, format=fmt, grouped=grouped, empty=empty),
-                            tempfile.TemporaryDirectory() as folder,
-                            contextlib.redirect_stdout(io.StringIO()),
-                            mock.patch.object(finalization, 'fused_final_restore_geometry_groups_enabled', return_value=grouped),
+                for empty in (False, True):
+                    with (
+                        self.subTest(source_t=source_t, target_t=target_t, format=fmt, empty=empty),
+                        tempfile.TemporaryDirectory() as folder,
+                        contextlib.redirect_stdout(io.StringIO()),
+                    ):
+                        arrays = [
+                            _random_mask((source_t, 24, 30), 31, empty=empty),
+                            _random_mask((source_t, 24, 30), 51, empty=empty),
+                            _random_mask((max(2, source_t + 4), 24, 30), 73, empty=empty),
+                            _random_mask((target_t, 24, 30), 41, empty=empty),
+                        ]
+                        refs = [_write_ref(Path(folder), str(i), array, fmt) for i, array in enumerate(arrays)]
+                        seed = _random_mask((target_t, 24, 30), 101)
+                        expected = _reference(refs, seed, workers=2)
+                        actual = seed.copy()
+                        with mock.patch.object(
+                            finalization, '_resize_union_plane_to_out_xy',
+                            side_effect=AssertionError('selected sparse path normalized a full plane'),
                         ):
-                            arrays = [
-                                _random_mask((source_t, 24, 30), 31, empty=empty),
-                                _random_mask((source_t, 24, 30), 51, empty=empty),
-                                _random_mask((max(2, source_t + 4), 24, 30), 73, empty=empty),
-                                _random_mask((target_t, 24, 30), 41, empty=empty),
-                            ]
-                            refs = [_write_ref(Path(folder), str(i), array, fmt) for i, array in enumerate(arrays)]
-                            seed = _random_mask((target_t, 24, 30), 101)
-                            expected = _reference(refs, seed, workers=2)
-                            actual = seed.copy()
-                            with mock.patch.object(
-                                finalization, '_resize_union_plane_to_out_xy',
-                                side_effect=AssertionError('selected sparse path normalized a full plane'),
-                            ):
-                                finalization._union_projected_layer_refs_grouped_into_volume(refs, actual, workers=2)
-                            np.testing.assert_array_equal(actual, expected)
-                            for ref, array in zip(refs, arrays):
-                                store = RawBBoxMaskStore.open(ref.path)
-                                try:
-                                    np.testing.assert_array_equal(
-                                        np.stack([store.decode_slice(z) for z in range(array.shape[0])]), array,
-                                    )
-                                finally:
-                                    store.close()
-                            cases += 1
-        self.assertEqual(cases, 32)
+                            finalization._union_projected_layer_refs_grouped_into_volume(refs, actual, workers=2)
+                        np.testing.assert_array_equal(actual, expected)
+                        for ref, array in zip(refs, arrays):
+                            store = RawBBoxMaskStore.open(ref.path)
+                            try:
+                                np.testing.assert_array_equal(
+                                    np.stack([store.decode_slice(z) for z in range(array.shape[0])]), array,
+                                )
+                            finally:
+                                store.close()
+                        cases += 1
+        self.assertEqual(cases, 16)
+
+    def test_grouped_area_restore_retains_combined_sparse_support(self) -> None:
+        # Each component falls below uint8 INTER_AREA's positive threshold when
+        # resized alone; their union should keep the output voxel occupied.
+        first = np.zeros((1, 32, 32), dtype=np.uint8)
+        second = np.zeros_like(first)
+        first[0, 0, :2] = 1
+        second[0, -1, -2:] = 1
+        with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):
+            refs = [
+                _write_ref(Path(folder), 'first', first),
+                _write_ref(Path(folder), 'second', second),
+            ]
+            restored = np.zeros((1, 1, 1), dtype=np.uint8)
+            finalization._union_projected_layer_refs_with_dense_restore_into_volume(
+                refs, restored,
+            )
+        self.assertEqual(int(restored[0, 0, 0]), 1)
 
     def test_xy_resize_generic_sources_and_nonunion_roles_use_general_restore(self) -> None:
         with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):

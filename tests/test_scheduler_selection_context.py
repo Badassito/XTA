@@ -91,7 +91,7 @@ def random_scheduler(seed):
         direct_union_total_dense_byte_limit=4096,gpu_worker_tile_dense_result_limit=2048),
         operation_overrides=dict(gpu_worker_task_cost_key=cost_key,
             gpu_worker_default_seconds_per_frame=lambda view:.04 if view.family=='spherical' else .06,
-            hybrid_gpu_stealback_enabled=lambda:True,hybrid_gpu_stealback_min_cpu_samples=lambda:1,
+            hybrid_gpu_stealback_min_cpu_samples=lambda:1,
             hybrid_gpu_stealback_max_fraction=lambda:.5,
             _env_int=lambda name,default: int(seed%2) if name=='YOLO_TTA_GPU_SPHERICAL_LOCALITY' else default))
     return scheduler

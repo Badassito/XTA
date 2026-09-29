@@ -14,6 +14,8 @@ import time
 
 import numpy as np
 
+from tests.reference_backends.radial import pull_radial_chunk
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from XTA import cylindrical_projection as projection, cylindrical_cuda_projection as cuda, geometry, interpolation
 from tools.benchmark_radial_cuda_projection import WORKING_SHAPE, OUTPUT_SHAPE
@@ -112,7 +114,7 @@ def main():
                 flat = plane.reshape(-1)
                 for first in range(0, flat.size, projection._PULL_CHUNK_VOXELS):
                     stop = min(flat.size, first + projection._PULL_CHUNK_VOXELS)
-                    flat[first:stop] = projection._pull_radial_chunk(source, view, radii, OUTPUT_SHAPE, z, first, stop)
+                    flat[first:stop] = pull_radial_chunk(source, view, radii, OUTPUT_SHAPE, z, first, stop)
                 reference[z] = digest(plane)
             with cuda.RadialCudaProjector(source, plan, metadata, view, OUTPUT_SHAPE, boxes, True,
                                            args.device, use_graphs=True) as warm:

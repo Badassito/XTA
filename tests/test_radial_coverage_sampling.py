@@ -8,6 +8,8 @@ import unittest
 
 import numpy as np
 
+from tests.reference_backends.radial import pull_radial_chunk
+
 from XTA import cylindrical_geometry as cg, cylindrical_projection as cp, geometry
 from XTA.config import resolve_tilted_view_groups
 
@@ -123,7 +125,7 @@ class RadialCoverageSamplingTests(unittest.TestCase):
                 native[index] = (index + view.radial_shell_start) % 2 == 0
             radii = np.asarray(cg.global_radii(view))
             for z in range(shape[0]):
-                combined[z] |= cp._pull_radial_chunk(native, view, radii, shape,
+                combined[z] |= pull_radial_chunk(native, view, radii, shape,
                                                      z, 0, shape[1]*shape[2]).reshape(shape[1:])
         wanted, radius = source_domain(views[0])
         # Scalar argmin independently assigns exact midpoints to the inner shell.

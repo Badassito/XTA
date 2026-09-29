@@ -360,22 +360,21 @@ class SphericalPressureTests(unittest.TestCase):
             self.assertIsNone(self.request())  # Refresh liveness, preserve age.
             self.assertTrue(all(self.coordinator.can_dispatch_inference(i) for i in range(4)))
             clock.return_value = 40.
-            with mock.patch.object(bp, 'main_process_gpu_stage_inference_overlap_enabled', return_value=True):
-                self.assertIsNone(self.request())
-                self.assertFalse(self.coordinator.can_dispatch_inference(0))
-                self.assertTrue(all(self.coordinator.can_dispatch_inference(i) for i in (1, 2, 3)))
-                self.torch.cuda.mem_get_info.assert_not_called()
-                self.coordinator.finish_inference(0)
-                self.assertIsNone(self.request())  # Queued inference remains exclusive.
-                self.coordinator.finish_inference(0)
-                lease = self.request()
-                self.assertEqual(lease.device_index, 0)
-                self.assertFalse(self.coordinator.snapshot()['spherical_retirement_pressure'])
-                self.assertEqual(self.coordinator.snapshot()['spherical_retirement_aged_acquisitions'], 1)
-                self.assertEqual(self.coordinator.snapshot()['spherical_retirement_pressure_acquisitions'], 0)
-                self.assertFalse(self.coordinator.begin_inference(0))
-                lease.release()
-                self.assertTrue(self.coordinator.begin_inference(0))
+            self.assertIsNone(self.request())
+            self.assertFalse(self.coordinator.can_dispatch_inference(0))
+            self.assertTrue(all(self.coordinator.can_dispatch_inference(i) for i in (1, 2, 3)))
+            self.torch.cuda.mem_get_info.assert_not_called()
+            self.coordinator.finish_inference(0)
+            self.assertIsNone(self.request())  # Queued inference remains exclusive.
+            self.coordinator.finish_inference(0)
+            lease = self.request()
+            self.assertEqual(lease.device_index, 0)
+            self.assertFalse(self.coordinator.snapshot()['spherical_retirement_pressure'])
+            self.assertEqual(self.coordinator.snapshot()['spherical_retirement_aged_acquisitions'], 1)
+            self.assertEqual(self.coordinator.snapshot()['spherical_retirement_pressure_acquisitions'], 0)
+            self.assertFalse(self.coordinator.begin_inference(0))
+            lease.release()
+            self.assertTrue(self.coordinator.begin_inference(0))
 
     def test_aged_fifo_handoff_keeps_two_turn_cap_and_inference_fairness(self):
         names = [self.purpose + name for name in (' oldest', ' middle', ' newest')]

@@ -96,7 +96,6 @@ from .cuda_d1 import (
     _volume_has_foreground,
     _volume_shape_tuple,
     close_raw_store_or_memmap_volume,
-    raw_bbox_nrrd_layers_enabled,
     subtract_volume_to_raw_bbox_store,
 )
 from .backprojection import (
@@ -110,7 +109,6 @@ from .outputs import (
     compute_segment_extent_zyx,
     nrrd_layer_output_suffix,
     nrrd_layer_sink,
-    nrrd_live_global_layer_enabled,
 )
 
 
@@ -412,23 +410,14 @@ def materialize_nrrd_view_layer(
         stage=str(stage),
     )
     layer_dir = temp_dir / 'nrrd_layers' / str(view.name)
-    storage_format = 'raw_u8'
-    bbox_store_enabled = bool(raw_bbox_nrrd_layers_enabled() or internal_packbits_store)
     bbox_store_format = (
         INTERNAL_PACKED_CVOL_FORMAT
         if bool(internal_packbits_store)
         else CVOL_FORMAT
     )
-    if bbox_store_enabled:
-        raw_path = temp_dir / 'nrrd_work' / 'projected_layers' / str(view.name) / f'{key}.orthogonal.u8.dat'
-        out_path = layer_dir / f'{key}.orthogonal.cvol'
-    else:
-        raw_path = layer_dir / f'{key}.orthogonal.u8.dat'
-        out_path = raw_path
-
-    transient_projection_in_memory = bool(
-        bbox_store_enabled and not force_path_backed_store
-    )
+    raw_path = temp_dir / 'nrrd_work' / 'projected_layers' / str(view.name) / f'{key}.orthogonal.u8.dat'
+    out_path = layer_dir / f'{key}.orthogonal.cvol'
+    transient_projection_in_memory = not force_path_backed_store
     # projected azimuthal/tilted layers directly into source geometry. keeps
     # non-azimuthal layers reduced: Cartesian layers are reduced axis permutations and Tilted
     # layers are reduced sheared orthogonal grids. Their sparse stores are therefore built at
@@ -458,7 +447,7 @@ def materialize_nrrd_view_layer(
             if azimuthal_sink_only_projection_supported(view) else 'dense_projection'
         )),
     }
-    if bool(bbox_store_enabled) and (view.family in ('radial', 'spherical') or azimuthal_sink_only_projection_supported(view)):
+    if view.family in ('radial', 'spherical') or azimuthal_sink_only_projection_supported(view):
         expected_shape = (
             tuple(int(v) for v in projection_out_shape)
             if projection_out_shape is not None
@@ -498,7 +487,7 @@ def materialize_nrrd_view_layer(
                 out_shape_tyx=projection_out_shape,
                 # transverse layers headed for a raw-bbox store are encoded straight
                 # from the source volume (identity projection, synchronous encode) — no copy.
-                allow_transverse_passthrough=bool(bbox_store_enabled),
+                allow_transverse_passthrough=True,
                 # device-union row occupancy (azimuthal views only; valid for the
                 # pre-interpolation layer, which is the only caller that supplies it).
                 known_row_occupancy=known_row_occupancy,
@@ -566,69 +555,62 @@ def materialize_nrrd_view_layer(
         if projected_sink_only
         else tuple(int(x) for x in np.asarray(projected).shape)
     )
-    if bbox_store_enabled:
-        layer_stats: Optional[Dict[str, object]] = None
-        if incremental_writer is not None:
-            try:
-                if tuple(int(v) for v in incremental_writer.shape) != tuple(int(v) for v in shape):
-                    raise ValueError(
-                        f'incremental shape {incremental_writer.shape} != projected shape {shape}'
-                    )
-                layer_stats = incremental_writer.finalize()
-            except Exception as exc:
-                incremental_writer.abort(exc)
-                incremental_writer.warn_failed_once(
-                    f'NRRD layer {key}: incremental cvol finalization failed ({exc})'
+    layer_stats: Optional[Dict[str, object]] = None
+    if incremental_writer is not None:
+        try:
+            if tuple(int(v) for v in incremental_writer.shape) != tuple(int(v) for v in shape):
+                raise ValueError(
+                    f'incremental shape {incremental_writer.shape} != projected shape {shape}'
                 )
-                incremental_writer.discard()
-                incremental_writer = None
-                layer_stats = None
-                if projected_sink_only:
-                    # Finalization (coverage/index/close) is part of the sink transaction.
-                    # If it fails, rebuild once through the authoritative dense path rather
-                    # than attempting to encode a SinkOnlyProjectionResult descriptor.
-                    print(
-                        f'NRRD layer {key}: retrying dense projection after '
-                        'sink-only finalization failure.'
-                    )
-                    projected = _project_layer(None, sink_only_mode=False)
-                    projected_sink_only = False
-                    projected_is_source = bool(
-                        np.may_share_memory(np.asarray(projected), np.asarray(view_volume_mm))
-                    )
-                    shape = tuple(int(x) for x in np.asarray(projected).shape)
-        if layer_stats is None:
-            if projected_sink_only:
-                raise RuntimeError(
-                    f'NRRD layer {key}: sink-only projection completed without a finalized store'
-                )
-            layer_stats = write_raw_bbox_mask_store(
-                projected,
-                out_path,
-                format_name=bbox_store_format,
-                desc=f'NRRD layer {key}',
-                workers=int(workers),
-                extra_meta={
-                    'nrrd_layer_key': key,
-                    'source_raw_path': 'encoded_direct_from_view_volume' if projected_is_source else str(raw_path),
-                    'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',
-                },
+            layer_stats = incremental_writer.finalize()
+        except Exception as exc:
+            incremental_writer.abort(exc)
+            incremental_writer.warn_failed_once(
+                f'NRRD layer {key}: incremental cvol finalization failed ({exc})'
             )
-        segment_extent = _coerce_segment_extent(layer_stats.get('segment_extent_ijk')) or _nrrd_empty_segment_extent()
-        segment_extent_source = 'raw_bbox_cvol_index'
-        storage_format = bbox_store_format
-        if not projected_is_source and not projected_sink_only:
-            close_memmap_array(projected, unlink_path=raw_path)
-            try:
-                raw_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-    else:
+            incremental_writer.discard()
+            incremental_writer = None
+            layer_stats = None
+            if projected_sink_only:
+                # Finalization (coverage/index/close) is part of the sink transaction.
+                # If it fails, rebuild once through the authoritative dense path rather
+                # than attempting to encode a SinkOnlyProjectionResult descriptor.
+                print(
+                    f'NRRD layer {key}: retrying dense projection after '
+                    'sink-only finalization failure.'
+                )
+                projected = _project_layer(None, sink_only_mode=False)
+                projected_sink_only = False
+                projected_is_source = bool(
+                    np.may_share_memory(np.asarray(projected), np.asarray(view_volume_mm))
+                )
+                shape = tuple(int(x) for x in np.asarray(projected).shape)
+    if layer_stats is None:
         if projected_sink_only:
-            raise RuntimeError(f'NRRD layer {key}: sink-only result requires raw-bbox storage')
-        segment_extent = compute_segment_extent_zyx(projected, workers=int(workers))
-        segment_extent_source = 'raw_layer_materialization_scan'
-        close_memmap_array(projected)
+            raise RuntimeError(
+                f'NRRD layer {key}: sink-only projection completed without a finalized store'
+            )
+        layer_stats = write_raw_bbox_mask_store(
+            projected,
+            out_path,
+            format_name=bbox_store_format,
+            desc=f'NRRD layer {key}',
+            workers=int(workers),
+            extra_meta={
+                'nrrd_layer_key': key,
+                'source_raw_path': 'encoded_direct_from_view_volume' if projected_is_source else str(raw_path),
+                'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',
+            },
+        )
+    segment_extent = _coerce_segment_extent(layer_stats.get('segment_extent_ijk')) or _nrrd_empty_segment_extent()
+    segment_extent_source = 'raw_bbox_cvol_index'
+    storage_format = bbox_store_format
+    if not projected_is_source and not projected_sink_only:
+        close_memmap_array(projected, unlink_path=raw_path)
+        try:
+            raw_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     layer_ref = NrrdLayerRef(
         key=key,
@@ -683,73 +665,49 @@ def materialize_nrrd_view_layer(
     return layer_ref
 
 
-if _numba is not None:
-    @_numba.njit(cache=True, nogil=True)
-    def _numba_sparse_component_accumulate_bounds(crop, source_slice, first_t, first_x, coronal, bounds):
-        count = 0
-        for row in range(crop.shape[0]):
-            left = crop.shape[1]
-            right = -1
-            for col in range(crop.shape[1]):
-                if crop[row, col] != 0:
-                    left = min(left, col)
-                    right = col
-                    count += 1
-            if right < 0:
+@_numba.njit(cache=True, nogil=True)
+def _numba_sparse_component_accumulate_bounds(crop, source_slice, first_t, first_x, coronal, bounds):
+    count = 0
+    for row in range(crop.shape[0]):
+        left = crop.shape[1]
+        right = -1
+        for col in range(crop.shape[1]):
+            if crop[row, col] != 0:
+                left = min(left, col)
+                right = col
+                count += 1
+        if right < 0:
+            continue
+        t = first_t + row
+        if coronal:
+            y0, y1 = first_x + left, first_x + right + 1
+            x0, x1 = source_slice, source_slice + 1
+        else:
+            y0, y1 = source_slice, source_slice + 1
+            x0, x1 = first_x + left, first_x + right + 1
+        bounds[t, 0] = min(bounds[t, 0], y0)
+        bounds[t, 1] = min(bounds[t, 1], x0)
+        bounds[t, 2] = max(bounds[t, 2], y1)
+        bounds[t, 3] = max(bounds[t, 3], x1)
+    return count
+
+@_numba.njit(cache=True, nogil=True)
+def _numba_sparse_component_scatter_crop(crop, source_slice, first_t, first_x, coronal, bounds, offsets, payload):
+    for row in range(crop.shape[0]):
+        t = first_t + row
+        out_width = bounds[t, 3] - bounds[t, 1]
+        for col in range(crop.shape[1]):
+            if crop[row, col] == 0:
                 continue
-            t = first_t + row
             if coronal:
-                y0, y1 = first_x + left, first_x + right + 1
-                x0, x1 = source_slice, source_slice + 1
+                y = first_x + col
+                x = source_slice
             else:
-                y0, y1 = source_slice, source_slice + 1
-                x0, x1 = first_x + left, first_x + right + 1
-            bounds[t, 0] = min(bounds[t, 0], y0)
-            bounds[t, 1] = min(bounds[t, 1], x0)
-            bounds[t, 2] = max(bounds[t, 2], y1)
-            bounds[t, 3] = max(bounds[t, 3], x1)
-        return count
-
-    @_numba.njit(cache=True, nogil=True)
-    def _numba_sparse_component_scatter_crop(crop, source_slice, first_t, first_x, coronal, bounds, offsets, payload):
-        for row in range(crop.shape[0]):
-            t = first_t + row
-            out_width = bounds[t, 3] - bounds[t, 1]
-            for col in range(crop.shape[1]):
-                if crop[row, col] == 0:
-                    continue
-                if coronal:
-                    y = first_x + col
-                    x = source_slice
-                else:
-                    y = source_slice
-                    x = first_x + col
-                local_x = x - bounds[t, 1]
-                at = offsets[t] + (y - bounds[t, 0]) * ((out_width + 7) // 8) + local_x // 8
-                payload[at] |= np.uint8(1 << (local_x % 8))
-else:
-    _numba_sparse_component_accumulate_bounds = None
-    _numba_sparse_component_scatter_crop = None
-
-
-_SPARSE_COMPONENT_NUMBA_DISABLED = False
-
-
-class _SparseComponentKernelUnavailable(RuntimeError):
-    """A compiled sparse transpose failed before its backing store was published."""
-
-
-def _run_sparse_component_kernel(kernel: Callable[..., object], *args: object) -> object:
-    global _SPARSE_COMPONENT_NUMBA_DISABLED
-    try:
-        return kernel(*args)
-    except Exception as exc:
-        if not _SPARSE_COMPONENT_NUMBA_DISABLED:
-            print(f'Warning: sparse component kernel failed ({exc}); using dense component projection for remaining calls in this process.')
-        _SPARSE_COMPONENT_NUMBA_DISABLED = True
-        raise _SparseComponentKernelUnavailable(str(exc)) from exc
-
-
+                y = source_slice
+                x = first_x + col
+            local_x = x - bounds[t, 1]
+            at = offsets[t] + (y - bounds[t, 0]) * ((out_width + 7) // 8) + local_x // 8
+            payload[at] |= np.uint8(1 << (local_x % 8))
 def _iter_sparse_component_decoded_slabs(
     store: RawBBoxMaskStore, source_slice: int, maximum_bytes: int = 8 * 1024 * 1024,
 ) -> Iterator[Tuple[int, int, np.ndarray]]:
@@ -832,7 +790,7 @@ def _transpose_sparse_component_store(
     for source_slice in active:
         for y0, x0, crop in _iter_sparse_component_decoded_slabs(store, int(source_slice)):
             max_crop_bytes = max(max_crop_bytes, int(crop.nbytes))
-            foreground += int(_run_sparse_component_kernel(_numba_sparse_component_accumulate_bounds, crop, int(source_slice), y0, x0, coronal, bounds))
+            foreground += int(_numba_sparse_component_accumulate_bounds(crop, int(source_slice), y0, x0, coronal, bounds))
             del crop
 
     index = np.zeros(out_t, dtype=CTILE_INDEX_DTYPE)
@@ -866,7 +824,7 @@ def _transpose_sparse_component_store(
             payload = np.memmap(chunks, mode='r+', dtype=np.uint8, shape=(payload_bytes,))
             for source_slice in active:
                 for y0, x0, crop in _iter_sparse_component_decoded_slabs(store, int(source_slice)):
-                    _run_sparse_component_kernel(_numba_sparse_component_scatter_crop, crop, int(source_slice), y0, x0, coronal, bounds, offsets, payload)
+                    _numba_sparse_component_scatter_crop(crop, int(source_slice), y0, x0, coronal, bounds, offsets, payload)
                     del crop
             # Close mapping before rename (including on Windows). No durability
             # barrier is necessary for this disposable same-node intermediate.
@@ -1067,8 +1025,8 @@ def materialize_interpolation_component_nrrd_view_layer(
     """Project one sparse interpolation component and submit its deterministic NRRD.
 
     Cartesian and Azimuthal components retain sparse backing through publication.
-    Other geometries, or unavailable compiled kernels, use a reusable dense
-    workspace; empty combinations bypass that fallback decode.
+    Other geometries use a reusable dense workspace; empty combinations bypass
+    that decode.
     """
     if str(view.family) == 'azimuthal':
         from .component_replay import capture_component_projection
@@ -1088,33 +1046,21 @@ def materialize_interpolation_component_nrrd_view_layer(
         and physical_view_name(view) in ('transverse', 'sagittal', 'coronal')
         and float(view.tta_angle_deg) == 0.0
         and str(source) == 'fullframe'
-        and (
-            physical_view_name(view) == 'transverse'
-            or (
-                _numba_sparse_component_accumulate_bounds is not None
-                and _numba_sparse_component_scatter_crop is not None
-                and not _SPARSE_COMPONENT_NUMBA_DISABLED
-            )
-        )
     )
     if sparse_cartesian:
-        try:
-            with runtime_telemetry().span('projection.sparse_component.materialize'):
-                return _materialize_sparse_cartesian_component(
-                    component_store_path, added_voxels=int(added_voxels),
-                    model_name=str(model_name), view=view, source=str(source),
-                    pass_index=int(pass_index),
-                    interpolation_walk_back_index=int(interpolation_walk_back_index),
-                    interpolation_candidate_index=int(interpolation_candidate_index),
-                    tile_config_id=str(tile_config_id), tile_acceptance=str(tile_acceptance),
-                    stage=str(stage), description=str(description), temp_dir=Path(temp_dir),
-                    keep_temp=bool(keep_temp),
-                )
-        except _SparseComponentKernelUnavailable:
-            # Failed transpose staging was discarded; the input store is intact.
-            pass
+        with runtime_telemetry().span('projection.sparse_component.materialize'):
+            return _materialize_sparse_cartesian_component(
+                component_store_path, added_voxels=int(added_voxels),
+                model_name=str(model_name), view=view, source=str(source),
+                pass_index=int(pass_index),
+                interpolation_walk_back_index=int(interpolation_walk_back_index),
+                interpolation_candidate_index=int(interpolation_candidate_index),
+                tile_config_id=str(tile_config_id), tile_acceptance=str(tile_acceptance),
+                stage=str(stage), description=str(description), temp_dir=Path(temp_dir),
+                keep_temp=bool(keep_temp),
+            )
 
-    if str(view.family) == 'azimuthal' and str(source) == 'fullframe' and _numba is not None:
+    if str(view.family) == 'azimuthal' and str(source) == 'fullframe':
         return _materialize_sparse_azimuthal_component(
             Path(component_store_path), added_voxels=int(added_voxels),
             model_name=str(model_name), view=view, source=str(source), pass_index=int(pass_index),
@@ -1329,13 +1275,7 @@ def materialize_nrrd_global_layer(
         stage=str(stage),
     )
     layer_dir = temp_dir / 'nrrd_layers' / view_name
-    storage_format = 'raw_u8'
-    if raw_bbox_nrrd_layers_enabled():
-        raw_path = temp_dir / 'nrrd_work' / 'global_layers' / f'{key}.orthogonal.u8.dat'
-        out_path = layer_dir / f'{key}.orthogonal.cvol'
-    else:
-        raw_path = layer_dir / f'{key}.orthogonal.u8.dat'
-        out_path = raw_path
+    out_path = layer_dir / f'{key}.orthogonal.cvol'
 
     # IMMUTABLE global layers (the final output — nothing mutates the volume
     # after it) skip the store entirely: the sink streams the live in-RAM volume in ONE
@@ -1346,7 +1286,6 @@ def materialize_nrrd_global_layer(
     if (
         bool(volume_is_immutable)
         and not bool(keep_temp)
-        and nrrd_live_global_layer_enabled()
         and sink is not None
     ):
         source_arr = np.asarray(volume_mm, dtype=np.uint8)
@@ -1397,41 +1336,25 @@ def materialize_nrrd_global_layer(
         )
         return layer_ref
 
-    if raw_bbox_nrrd_layers_enabled():
-        # encode the raw-bbox store straight from the source volume. The old
-        # copy_workspace_array staged a full copy (~36 GB of traffic per global layer on the
-        # serial tail) purely as encoder input; write_raw_bbox_mask_store completes before this
-        # function returns, and no caller mutates the volume during the synchronous call.
-        source_arr = np.asarray(volume_mm, dtype=np.uint8)
-        shape = tuple(int(x) for x in source_arr.shape)
-        layer_stats = write_raw_bbox_mask_store(
-            source_arr,
-            out_path,
-            format_name=CVOL_FORMAT,
-            desc=f'NRRD layer {key}',
-            workers=int(workers),
-            extra_meta={
-                'nrrd_layer_key': key,
-                'source_raw_path': 'encoded_direct_from_source_volume',
-                'source_raw_workspace': 'source_volume',
-            },
-        )
-        segment_extent = _coerce_segment_extent(layer_stats.get('segment_extent_ijk')) or _nrrd_empty_segment_extent()
-        segment_extent_source = 'raw_bbox_cvol_index'
-        storage_format = CVOL_FORMAT
-    else:
-        copied = copy_workspace_array(
-            np.asarray(volume_mm, dtype=np.uint8),
-            raw_path,
-            desc=f'NRRD layer {key}',
-            prefer_memory=False,
-            reserve_bytes=32 * GIB,
-            workers=int(workers),
-        )
-        shape = tuple(int(x) for x in np.asarray(copied).shape)
-        segment_extent = compute_segment_extent_zyx(copied, workers=int(workers))
-        segment_extent_source = 'raw_layer_materialization_scan'
-        close_memmap_array(copied)
+    # The encoder completes synchronously, so it can read the immutable source
+    # without staging a full-size raw layer copy.
+    source_arr = np.asarray(volume_mm, dtype=np.uint8)
+    shape = tuple(int(x) for x in source_arr.shape)
+    layer_stats = write_raw_bbox_mask_store(
+        source_arr,
+        out_path,
+        format_name=CVOL_FORMAT,
+        desc=f'NRRD layer {key}',
+        workers=int(workers),
+        extra_meta={
+            'nrrd_layer_key': key,
+            'source_raw_path': 'encoded_direct_from_source_volume',
+            'source_raw_workspace': 'source_volume',
+        },
+    )
+    segment_extent = _coerce_segment_extent(layer_stats.get('segment_extent_ijk')) or _nrrd_empty_segment_extent()
+    segment_extent_source = 'raw_bbox_cvol_index'
+    storage_format = CVOL_FORMAT
 
     layer_ref = NrrdLayerRef(
         key=key,

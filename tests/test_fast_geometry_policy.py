@@ -17,8 +17,8 @@ from XTA.unification.sampling import (
 )
 
 
-_FLAGS = ('YOLO_TTA_FAST_GEOMETRY', 'YOLO_TTA_CPU_SPHERICAL_COMPILED',
-          'YOLO_TTA_GPU_RADIAL_COLUMN_GEOMETRY', 'YOLO_TTA_GPU_SPHERICAL_FP32')
+_FLAGS = ('YOLO_TTA_FAST_GEOMETRY', 'YOLO_TTA_GPU_RADIAL_COLUMN_GEOMETRY',
+          'YOLO_TTA_GPU_SPHERICAL_FP32')
 _STRICT_DIGEST = 'fc75c645eb72d2ef0e609f5b342a52f20adfa7be0b7e3aa64d34ad87d818ee14'
 
 
@@ -45,7 +45,7 @@ class FastGeometryPolicyTests(unittest.TestCase):
         self.assertEqual(strict.policy_version, 23)
         self.assertFalse(quality.fast_geometry_enabled())
         self.assertFalse(quality.spherical_fp32_requested())
-        self.assertTrue(quality.spherical_cpu_compiled_requested())
+        self.assertTrue(quality.geometry_quality_request_record()['cpu_spherical_compiled_requested'])
         self.assertFalse(quality.radial_columns_requested())
         os.environ['YOLO_TTA_FAST_GEOMETRY'] = '1'
         fast = forward_sampling_policy()
@@ -54,16 +54,15 @@ class FastGeometryPolicyTests(unittest.TestCase):
         self.assertNotEqual(strict.digest, fast.digest)
         os.environ['YOLO_TTA_GPU_SPHERICAL_FP32'] = '0'
         self.assertIs(strict, forward_sampling_policy())
-        self.assertTrue(quality.spherical_cpu_compiled_requested())
+        self.assertTrue(quality.geometry_quality_request_record()['cpu_spherical_compiled_requested'])
         self.assertTrue(quality.radial_columns_requested())
 
     def test_local_flags_override_global_without_changing_other_requests(self):
         os.environ['YOLO_TTA_FAST_GEOMETRY'] = 'yes'
         self.assertTrue(quality.spherical_fp32_requested())
-        self.assertTrue(quality.spherical_cpu_compiled_requested())
+        self.assertTrue(quality.geometry_quality_request_record()['cpu_spherical_compiled_requested'])
         self.assertTrue(quality.radial_columns_requested())
-        for local, request in zip(_FLAGS[1:], (quality.spherical_cpu_compiled_requested,
-                                               quality.radial_columns_requested,
+        for local, request in zip(_FLAGS[1:], (quality.radial_columns_requested,
                                                quality.spherical_fp32_requested)):
             for value in ('0', 'false', 'OFF', ''):
                 os.environ[local] = value
@@ -72,21 +71,15 @@ class FastGeometryPolicyTests(unittest.TestCase):
         os.environ['YOLO_TTA_FAST_GEOMETRY'] = '0'
         os.environ['YOLO_TTA_GPU_SPHERICAL_FP32'] = 'true'
         self.assertTrue(quality.spherical_fp32_requested())
-        self.assertFalse(quality.spherical_cpu_compiled_requested())
+        self.assertTrue(quality.geometry_quality_request_record()['cpu_spherical_compiled_requested'])
         self.assertFalse(quality.radial_columns_requested())
 
-    def test_exact_cpu_default_and_opt_out_preserve_strict_forward_policy(self):
+    def test_exact_cpu_requirement_is_independent_of_gpu_geometry_flags(self):
         strict = forward_sampling_policy()
-        self.assertTrue(quality.spherical_cpu_compiled_requested())
+        self.assertTrue(quality.geometry_quality_request_record()['cpu_spherical_compiled_requested'])
         self.assertEqual(strict.digest, _STRICT_DIGEST)
-        os.environ['YOLO_TTA_CPU_SPHERICAL_COMPILED'] = '0'
-        self.assertFalse(quality.spherical_cpu_compiled_requested())
-        self.assertIs(forward_sampling_policy(), strict)
-        os.environ.pop('YOLO_TTA_CPU_SPHERICAL_COMPILED')
         os.environ['YOLO_TTA_FAST_GEOMETRY'] = '0'
-        self.assertFalse(quality.spherical_cpu_compiled_requested())
-        os.environ['YOLO_TTA_CPU_SPHERICAL_COMPILED'] = '1'
-        self.assertTrue(quality.spherical_cpu_compiled_requested())
+        self.assertTrue(quality.geometry_quality_request_record()['cpu_spherical_compiled_requested'])
         self.assertFalse(quality.spherical_fp32_requested())
         self.assertFalse(quality.radial_columns_requested())
         self.assertIs(forward_sampling_policy(), strict)
@@ -151,7 +144,6 @@ class FastGeometryPolicyTests(unittest.TestCase):
 
     def test_fresh_spawn_process_observes_resolved_flags_and_same_policy_digest(self):
         os.environ['YOLO_TTA_FAST_GEOMETRY'] = '1'
-        os.environ['YOLO_TTA_CPU_SPHERICAL_COMPILED'] = '0'
         script = (
             'import json; from XTA.geometry_quality import geometry_quality_request_record; '
             'from XTA.unification.sampling import forward_sampling_policy; '
@@ -162,7 +154,7 @@ class FastGeometryPolicyTests(unittest.TestCase):
             capture_output=True, text=True, encoding='utf-8', errors='replace', check=True)
         requests, digest = json.loads(result.stdout)
         self.assertEqual(requests, quality.geometry_quality_request_record())
-        self.assertFalse(requests['cpu_spherical_compiled_requested'])
+        self.assertTrue(requests['cpu_spherical_compiled_requested'])
         self.assertTrue(requests['gpu_radial_column_geometry_requested'])
         self.assertTrue(requests['gpu_spherical_fp32_requested'])
         self.assertEqual(digest, forward_sampling_policy().digest)

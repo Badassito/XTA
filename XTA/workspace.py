@@ -216,19 +216,6 @@ def azimuthal_source_mode() -> str:
     }
     return aliases.get(raw, default)
 
-def tilted_inplane_linear_enabled() -> bool:
-    """Bilinear in-plane sampling for Tilted FORWARD-pass inputs (v16.1.8 default).
-
-    Every model-input Tilted renderer (fused CUDA kernel, resident Torch fallback, CPU
-    grid renderer) samples the native tilted raster bilinearly when the composed output
-    affine is not the identity, exactly as if the native frame were rendered and then
-    warped with the Cartesian views' align_corners=False zero-padded bilinear warp. Each
-    integer tap keeps its own sheared stack coordinate, so the native raster definition
-    is unchanged. Mask backprojection keeps the exact nearest shear scatter, preserving
-    the bit-for-bit layer-OR reconstruction contract. Set
-    YOLO_TTA_TILTED_INPLANE_LINEAR=0 to restore v16.1.7 nearest-XY forward sampling."""
-    return _env_flag('YOLO_TTA_TILTED_INPLANE_LINEAR', True)
-
 _TILTED_IDENTITY_M = np.asarray([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
 
 def _tilted_grid_is_identity(M_grid_to_src: np.ndarray, grid_h: int, grid_w: int, view: object) -> bool:

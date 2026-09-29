@@ -12,11 +12,9 @@ from XTA import backprojection, pipeline
 
 class GpuStageRetirementBarrierTests(unittest.TestCase):
     def setUp(self):
-        self.priority = mock.patch.object(backprojection, 'main_process_gpu_stage_inference_priority_enabled', return_value=True)
-        self.overlap = mock.patch.object(backprojection, 'main_process_gpu_stage_inference_overlap_enabled', return_value=False)
         self.fallback = mock.patch.object(backprojection, 'v1613_d1_backprojection_overlap_enabled', return_value=True)
         self.aux = mock.patch.object(backprojection, 'gpu_worker_aux_interpolation_pool', return_value=None)
-        for patch in (self.priority, self.overlap, self.fallback, self.aux):
+        for patch in (self.fallback, self.aux):
             patch.start()
             self.addCleanup(patch.stop)
         self.torch = types.SimpleNamespace(
@@ -33,18 +31,12 @@ class GpuStageRetirementBarrierTests(unittest.TestCase):
         self.assertIsNotNone(lease)
         lease.release()
 
-    def test_pending_retirement_blocks_selected_devices_under_every_overlap_policy(self):
-        for priority in (False, True):
-            for overlap in (False, True):
-                with self.subTest(priority=priority, overlap=overlap), \
-                        mock.patch.object(backprojection, 'main_process_gpu_stage_inference_priority_enabled', return_value=priority), \
-                        mock.patch.object(backprojection, 'main_process_gpu_stage_inference_overlap_enabled', return_value=overlap):
-                    self.coordinator.configure_workers([0, 2])
-                    self.coordinator.set_inference_asset_retirement_pending(True)
-                    for purpose in ('Azimuthal backprojection', 'NRRD mirror downbin', 'other output'):
-                        for device in (0, 2):
-                            self.assertIsNone(self.coordinator.try_acquire_specific_stage(self.torch, device, purpose))
-                        self.assertIsNone(self.coordinator.try_acquire_stage(self.torch, purpose))
+    def test_pending_retirement_blocks_selected_devices(self):
+        self.coordinator.set_inference_asset_retirement_pending(True)
+        for purpose in ('Azimuthal backprojection', 'NRRD mirror downbin', 'other output'):
+            for device in (0, 2):
+                self.assertIsNone(self.coordinator.try_acquire_specific_stage(self.torch, device, purpose))
+            self.assertIsNone(self.coordinator.try_acquire_stage(self.torch, purpose))
         # In particular, a blocked generic selection must not measure free HBM
         # and commit to a fallback based on the workers' old allocation footprint.
         self.torch.cuda.mem_get_info.assert_not_called()

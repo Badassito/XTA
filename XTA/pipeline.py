@@ -37,7 +37,7 @@ from typing import (
     Tuple,
 )
 import numpy as np
-from ._deps import _numba, cv2
+from ._deps import cv2
 from .cylindrical_owner import RADIAL_OWNER_CONTRACT, radial_owner_eligible, radial_runtime_provenance
 from .publication_memory import (
     native_fullframe_dense_reserve, plan_native_publication_memory, publication_output_reserve,
@@ -113,7 +113,6 @@ from .runtime import (
     gpu_worker_aux_interpolation_pool,
     gpu_worker_cpu_share,
     gpu_worker_default_seconds_per_frame,
-    gpu_worker_direct_union_enabled,
     gpu_worker_fullframe_task_ranges,
     gpu_worker_initial_lease_slices,
     gpu_worker_max_lease_slices,
@@ -123,7 +122,6 @@ from .runtime import (
     gpu_worker_task_cost_key,
     hybrid_cpu_affinity_overlap_enabled,
     hybrid_cpu_reserved_view_count,
-    hybrid_gpu_stealback_enabled,
     hybrid_gpu_stealback_eta_ratio,
     hybrid_gpu_stealback_max_fraction,
     hybrid_gpu_stealback_min_cpu_samples,
@@ -237,7 +235,6 @@ from .inference import (
     gpu_union_flush_overlap_enabled,
     gpu_union_retirement_chunk_slices,
     gpu_union_retirement_lane_count,
-    gpu_worker_chunk_hole_fill_enabled,
     offload_between_jobs_enabled,
     offload_yolo_from_gpu,
     predict_in_memory_volume_and_accumulate,
@@ -252,7 +249,6 @@ from .inference import (
 from .cuda_backend import (
     build_fused_renderer_preflight_specs,
     fused_renderer_preflight_enabled,
-    gpu_cube_resize_enabled,
     open_existing_gray_memmap,
     union_conf_volume_into_volume_inplace,
 )
@@ -275,7 +271,6 @@ from .cuda_d1 import (
     _nrrd_layer_key,
     archive_or_delete_binary_volume_storage,
     close_raw_store_or_memmap_volume,
-    raw_bbox_nrrd_layers_enabled,
     tile_dense_worker_result_limit_bytes,
     tile_dense_worker_result_limit_tasks,
     tile_dense_worker_result_warn_seconds,
@@ -304,7 +299,6 @@ from .backprojection import (
     _set_main_process_gpu_spherical_retirement_pressure,
     _set_main_process_gpu_stage_wake_callback,
     fused_angle_variant_azimuthal_component_layer_enabled,
-    main_process_gpu_stage_inference_priority_enabled,
 )
 from .outputs import (
     BackgroundOutputManager,
@@ -360,7 +354,6 @@ from .finalization import (
     assemble_final_union_after_view_union,
     collapse_tta_variant_volumes_to_physical_views,
     release_unretained_volume_maps,
-    scheduler_push_drain_enabled,
     scheduler_push_drain_heartbeat_seconds,
 )
 from .finalization import (
@@ -476,8 +469,8 @@ def _execution_runtime_provenance() -> Dict[str, object]:
     result['geometry_quality_requests'] = geometry_quality_request_record()
     result['native_trt_ring_requested'] = native_trt_ring_enabled()
     result['task_trace_requested'] = _env_flag('YOLO_TTA_TASK_TRACE', False)
-    result['cropped_upload_pipeline_requested'] = _env_flag('YOLO_TTA_CROPPED_UPLOAD_PIPELINE', True)
-    result['spherical_cpu_compact_requested'] = _env_flag('YOLO_TTA_CPU_SPHERICAL_COMPACT', True)
+    result['cropped_upload_pipeline_requested'] = True
+    result['spherical_cpu_compact_requested'] = True
     result['tilted_azimuthal_cuda_projection_requested'] = _env_flag(
         'YOLO_TTA_GPU_TILTED_AZIMUTHAL_BACKPROJECT', True)
     result['spherical_retirement_requests'] = {
@@ -1240,9 +1233,7 @@ def _main_impl() -> None:
     # device as cuda:0. Worker slice windows are disjoint within each angle variant. Workers
     # write those slices into one variant-owned scheduler mapping: memfd plus descriptor
     # transfer when available, and a real pathname only as fallback.
-    gpu_worker_direct_union_active = bool(
-        gpu_worker_process_active and gpu_worker_direct_union_enabled()
-    )
+    gpu_worker_direct_union_active = bool(gpu_worker_process_active)
     # Any full-frame task that CPU workers may claim must use the common view-local union
     # boundary. GPU-only views may retain the D1 owner pipeline.
     worker_direct_union_active = bool(
@@ -1281,8 +1272,6 @@ def _main_impl() -> None:
         v1613_bundle_reasons.append('requires one-channel gray input')
     if not bool(save_nrrd_enabled):
         v1613_bundle_reasons.append('requires --save nrrd for per-view source-space layers')
-    if not raw_bbox_nrrd_layers_enabled():
-        v1613_bundle_reasons.append('requires raw-bbox/cvol NRRD layers')
     if not gpu_device_union_enabled():
         v1613_bundle_reasons.append('requires task-local GPU device unions')
 
@@ -1517,7 +1506,6 @@ def _main_impl() -> None:
         # unless residency/CPU/tile rendering actually falls back.
         lazy_cube_eligible = bool(
             gpu_worker_process_active
-            and gpu_cube_resize_enabled()
             and tuple(int(v) for v in processing_shape[1:])
             == tuple(int(v) for v in input_processing_shape[1:])
             and _cube_t_axis_resize_backend() == 'slab'
@@ -1633,8 +1621,7 @@ def _main_impl() -> None:
         print(
             'GPU-worker direct union writes active: angle-variant worker tasks write '
             'their disjoint slice windows straight into a bounded variant-owned union '
-            '(memfd preferred; no per-task result files or scheduler-side OR pass). '
-            'Set YOLO_TTA_GPU_WORKER_DIRECT_UNION=0 to select per-task result files.'
+            '(memfd preferred; no per-task result files or scheduler-side OR pass).'
         )
 
     sampling_policy = 'coverage'
@@ -2863,7 +2850,6 @@ def _main_impl() -> None:
     _submit_component_projection = ComponentProjectionSubmitter(
         queue=component_projection_queue,
         source_shape=(int(input_T), int(input_H), int(input_W)),
-        numba_available=_numba is not None,
         materialize=materialize_interpolation_component_nrrd_view_layer,
     )
 
@@ -4604,7 +4590,6 @@ def _main_impl() -> None:
             gpu_worker_tail_split_point=gpu_worker_tail_split_point,
             gpu_worker_target_lease_seconds=gpu_worker_target_lease_seconds,
             gpu_worker_task_cost_key=gpu_worker_task_cost_key,
-            hybrid_gpu_stealback_enabled=hybrid_gpu_stealback_enabled,
             hybrid_gpu_stealback_eta_ratio=hybrid_gpu_stealback_eta_ratio,
             hybrid_gpu_stealback_max_fraction=hybrid_gpu_stealback_max_fraction,
             hybrid_gpu_stealback_min_cpu_samples=hybrid_gpu_stealback_min_cpu_samples,
@@ -4751,7 +4736,7 @@ def _main_impl() -> None:
         # Torch logical indices and their physical CUDA_VISIBLE_DEVICES tokens were resolved
         # before OpenVINO planning so dedicated feeder cores could be excluded job-wide.
         _configure_main_process_gpu_stage_workers(gpu_logical_indices)
-        if gpu_worker_process_active and main_process_gpu_stage_inference_priority_enabled():
+        if gpu_worker_process_active:
             if v1613_d1_owner_active:
                 print(
                     'D1 owner pipeline active inside the persistent CUDA workers: '
@@ -4768,8 +4753,7 @@ def _main_impl() -> None:
                 print(
                     'Inference-first GPU ownership active: main-process NRRD, '
                     'backprojection, downbin, and topology stages cannot seize worker GPUs until '
-                    'the global inference queue is permanently drained. '
-                    'YOLO_TTA_MAIN_GPU_STAGE_INFERENCE_PRIORITY=0 restores opportunistic leasing.'
+                    'the global inference queue is permanently drained.'
                 )
         pinned_tokens = list(pinned_gpu_tokens)
         # discovery-driven GPU-worker -> NUMA-node CPU pin plan (None entries
@@ -4910,7 +4894,6 @@ def _main_impl() -> None:
         )
         if (
             gpu_worker_process_active
-            and gpu_cube_resize_enabled()
             and bool(cube_resize_will_apply)
             and (volume_rgb is not input_volume_rgb)
             and native_t_only_resize
@@ -4966,10 +4949,9 @@ def _main_impl() -> None:
                 print(
                     'Task enqueue gated on decode only — GPU workers retain the '
                     'NATIVE-t decoded volume and fold t scaling into device renderers '
-                    f'({"host cube is demand-only; " if lazy_cube is not None else ""}'
-                    'YOLO_TTA_GPU_CUBE_RESIZE=0 restores cube-gated enqueue).'
+                    f'({"host cube is demand-only" if lazy_cube is not None else "host cube is streaming"}).'
                 )
-        elif gpu_worker_process_active and gpu_cube_resize_enabled() and bool(cube_resize_will_apply) and (volume_rgb is not input_volume_rgb):
+        elif gpu_worker_process_active and bool(cube_resize_will_apply) and (volume_rgb is not input_volume_rgb):
             print(
                 'Native-t residency bypassed because the cube resize changes X/Y; waiting for the exact cube '
                 'volume before worker rendering.'
@@ -4997,13 +4979,11 @@ def _main_impl() -> None:
             and float(args.min_conf) <= 0.0
             and float(args.min_radius) <= 0.0
         )
-        chunk_hole_fill_enabled = bool(gpu_worker_chunk_hole_fill_enabled())
-        if gpu_worker_device_hole_fill and not chunk_hole_fill_enabled:
+        if gpu_worker_device_hole_fill:
             print(
                 'Split-view hole fill moved off the inference handoff: multi-chunk '
                 'full-frame views run one completed-view CPU pass instead of a CuPy label/fill '
-                'barrier after every GPU lease. YOLO_TTA_GPU_WORKER_CHUNK_HOLE_FILL=1 restores '
-                'the per-chunk device pass.'
+                'barrier after every GPU lease.'
             )
         fullframe_subtasks_per_view: Dict[Tuple[str, str], int] = {}
         next_task_id = 0
@@ -5197,7 +5177,7 @@ def _main_impl() -> None:
                         gpu_worker_device_hole_fill
                         and str(kind) == 'fullframe'
                         and str(result_mode) == 'direct_union'
-                        and (len(ranges) <= 1 or chunk_hole_fill_enabled)
+                        and len(ranges) <= 1
                     ),
                 }
                 if str(result_mode) in {'d1_owner', HYBRID_DEFERRED_RESULT_MODE}:
@@ -6247,7 +6227,6 @@ def _main_impl() -> None:
         push_drain_active=bool(
             inference_worker_process_active
             and scheduler_state.gpu_result_queue is not None
-            and scheduler_push_drain_enabled()
         ),
         track_thread=_run_resources().track_thread,
     )

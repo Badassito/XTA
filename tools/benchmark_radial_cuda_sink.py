@@ -266,7 +266,7 @@ def main():
             if selected is None:
                 with (mock.patch.object(cp, '_try_radial_cuda_stage', side_effect=require_cuda),
                       mock.patch.object(cp, '_project_radial_block', side_effect=AssertionError('CPU fallback entered')),
-                      mock.patch.object(cp, '_pull_radial_chunk', side_effect=AssertionError('CPU fallback entered'))):
+                      mock.patch.object(cp, '_pull_radial_range_into', side_effect=AssertionError('CPU fallback entered'))):
                     cp.backproject_radial_volume_to_volume(
                         source, view, workspace / 'must-not-exist.dat', f'{mode} CUDA sink benchmark',
                         out_shape_tyx=OUTPUT_SHAPE, known_slice_bboxes=bounds, workers=1,

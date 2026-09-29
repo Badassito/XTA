@@ -15,6 +15,8 @@ from unittest import mock
 
 import numpy as np
 
+from tests.reference_backends.radial import pull_radial_chunk
+
 from XTA import geometry
 from XTA.config import resolve_tilted_view_groups
 
@@ -57,7 +59,7 @@ def _domain(view):
 def _project_pair(data, view, shape):
     """Actual CPU reference and CUDA projector, with three-slice output blocks."""
     if view.family == 'spherical':
-        from XTA.spherical_projection import _project_spherical_block
+        from tests.reference_backends.spherical import project_spherical_block as _project_spherical_block
         from XTA.spherical_projection_cuda import SphericalCudaProjector
         expected = _project_spherical_block(data, view, np.asarray(view.spherical_radii),
             np.asarray(view.spherical_rotation_xyz).reshape(3, 3), shape, 0, shape[0], None)
@@ -67,7 +69,7 @@ def _project_pair(data, view, shape):
         from XTA import cylindrical_projection as reference
         from XTA.cylindrical_cuda_projection import RadialCudaProjector
         radii = np.asarray(geometry.radial_global_radii(view))
-        expected = np.stack([reference._pull_radial_chunk(data, view, radii, shape, z,
+        expected = np.stack([pull_radial_chunk(data, view, radii, shape, z,
             0, shape[1]*shape[2]).reshape(shape[1:]) for z in range(shape[0])])
         plan = reference._build_radial_plane_plan(view, radii, shape)
         metadata = reference._radial_projection_metadata(view, data.shape, shape, plan)

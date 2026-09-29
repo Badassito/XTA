@@ -14,6 +14,8 @@ from unittest import mock
 
 import numpy as np
 
+from tests.reference_backends.radial import pull_radial_chunk
+
 from XTA import assembly, backprojection, geometry, tta_terminal, cylindrical_projection as cp
 from XTA.config import TiltedViewGroup, resolve_tilted_view_groups
 from XTA.cylindrical_projection import backproject_radial_volume_to_volume
@@ -295,7 +297,7 @@ class CylindricalProjectionTests(unittest.TestCase):
                     data = (rng.random((view.num_slices, processing_size, processing_size)) < .17).astype(np.uint8)
                     for output_shape in ((7, 9, 11), (5, 7, 8), (9, 11, 13)):
                         radii = np.asarray(geometry.radial_global_radii(view))
-                        expected = np.stack([cp._pull_radial_chunk(
+                        expected = np.stack([pull_radial_chunk(
                             data, view, radii, output_shape, z, 0, output_shape[1] * output_shape[2],
                         ).reshape(output_shape[1:]) for z in range(output_shape[0])])
                         with self.subTest(view=view.name, processing_size=processing_size, output_shape=output_shape):

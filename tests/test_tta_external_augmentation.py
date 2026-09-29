@@ -626,4 +626,4 @@ def test_fullframe_memory_guard_does_not_suggest_incompatible_direct_union():
     base['augmentation_pass_tasks']=[dict(base,view=v) for v in variants[1:]]
     with pytest.raises(RuntimeError,match='External-policy passes') as raised:
         native_fullframe_dense_reserve([base],total_dense_limit=200)
-    assert 'Enable YOLO_TTA_GPU_WORKER_DIRECT_UNION=1' not in str(raised.value)
+    assert 'reduce --augmentation_ratio' in str(raised.value)

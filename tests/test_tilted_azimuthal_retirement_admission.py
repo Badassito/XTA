@@ -12,8 +12,6 @@ from XTA import backprojection as bp
 class TiltedAzimuthalRetirementAdmissionTests(unittest.TestCase):
     def setUp(self):
         for patch in (
-            mock.patch.object(bp, 'main_process_gpu_stage_inference_priority_enabled', return_value=True),
-            mock.patch.object(bp, 'main_process_gpu_stage_inference_overlap_enabled', return_value=False),
             mock.patch.object(bp, 'gpu_worker_aux_interpolation_pool', return_value=None),
             mock.patch.dict('os.environ', {'YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT': '1',
                                            'YOLO_TTA_GPU_SPHERICAL_AGE_RETIREMENT': '1'}),
@@ -41,28 +39,27 @@ class TiltedAzimuthalRetirementAdmissionTests(unittest.TestCase):
             self.addCleanup(lease.release)
         return lease
 
-    def test_idle_tilted_projection_never_steals_busy_worker_even_with_overlap_override(self):
+    def test_idle_tilted_projection_never_steals_busy_worker(self):
         coordinator = self.coordinator(backlog=False, pressure=True, queued=2)
         purpose = 'Tilted Azimuthal source projection parent'
-        with mock.patch.object(bp, 'main_process_gpu_stage_inference_overlap_enabled', return_value=True):
-            self.assertIsNone(self.acquire(coordinator, purpose))
-            coordinator.finish_inference(0)
+        self.assertIsNone(self.acquire(coordinator, purpose))
+        coordinator.finish_inference(0)
+        self.assertIsNone(self.acquire(coordinator, purpose, 0))
+        coordinator.finish_inference(0)
+        lease = self.acquire(coordinator, purpose, 0)
+        self.assertIsNotNone(lease)
+        self.assertFalse(coordinator.can_dispatch_inference(0))
+        self.assertFalse(coordinator.begin_inference(0))
+        self.assertIsNone(self.acquire(coordinator, purpose, 1))
+        lease.release()
+        coordinator.set_inference_asset_retirement_pending(True)
+        self.assertIsNone(self.acquire(coordinator, purpose, 0))
+        coordinator.set_inference_asset_retirement_pending(False)
+        with mock.patch.object(bp, 'gpu_worker_aux_interpolation_pool',
+                               return_value=SimpleNamespace(
+                                   claim_worker_for_stage=lambda _device: None,
+                                   release_stage_claim=lambda _device, _token: None)):
             self.assertIsNone(self.acquire(coordinator, purpose, 0))
-            coordinator.finish_inference(0)
-            lease = self.acquire(coordinator, purpose, 0)
-            self.assertIsNotNone(lease)
-            self.assertFalse(coordinator.can_dispatch_inference(0))
-            self.assertFalse(coordinator.begin_inference(0))
-            self.assertIsNone(self.acquire(coordinator, purpose, 1))
-            lease.release()
-            coordinator.set_inference_asset_retirement_pending(True)
-            self.assertIsNone(self.acquire(coordinator, purpose, 0))
-            coordinator.set_inference_asset_retirement_pending(False)
-            with mock.patch.object(bp, 'gpu_worker_aux_interpolation_pool',
-                                   return_value=SimpleNamespace(
-                                       claim_worker_for_stage=lambda _device: None,
-                                       release_stage_claim=lambda _device, _token: None)):
-                self.assertIsNone(self.acquire(coordinator, purpose, 0))
 
     def test_all_three_families_share_fifo_and_one_two_turn_burst(self):
         for families in permutations(('Tilted Azimuthal', 'Radial', 'Spherical')):

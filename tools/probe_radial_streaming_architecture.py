@@ -17,6 +17,8 @@ import sys
 
 import numpy as np
 
+from tests.reference_backends.radial import pull_radial_chunk
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from XTA import cylindrical_projection as projection, geometry
 
@@ -102,7 +104,7 @@ def decode_words(words, shape):
 
 def oracle(source, view, shape):
     radii = np.asarray(geometry.radial_global_radii(view))
-    return np.stack([projection._pull_radial_chunk(source, view, radii, shape, z, 0,
+    return np.stack([pull_radial_chunk(source, view, radii, shape, z, 0,
         shape[1] * shape[2]).reshape(shape[1:]) for z in range(shape[0])])
 
 

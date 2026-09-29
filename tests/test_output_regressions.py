@@ -11,42 +11,9 @@ from unittest import mock
 import numpy as np
 
 
-def _native_dependency_stubs() -> dict[str, types.ModuleType]:
-    """Return the minimal import surface used by these output-control tests."""
-    cv2 = types.ModuleType('cv2')
-    for name, value in {
-        'INTER_AREA': 1,
-        'INTER_LINEAR': 2,
-        'INTER_NEAREST': 3,
-        'COLOR_GRAY2RGB': 4,
-        'RETR_EXTERNAL': 5,
-        'CHAIN_APPROX_SIMPLE': 6,
-        'CV_32S': 7,
-    }.items():
-        setattr(cv2, name, value)
-    scipy = types.ModuleType('scipy')
-    ndimage = types.ModuleType('scipy.ndimage')
-    scipy.ndimage = ndimage
-    tifffile = types.ModuleType('tifffile')
-    tqdm_module = types.ModuleType('tqdm')
-    tqdm_module.tqdm = lambda iterable=None, *args, **kwargs: iterable
-    return {
-        'cv2': cv2,
-        'scipy': scipy,
-        'scipy.ndimage': ndimage,
-        'tifffile': tifffile,
-        'tqdm': tqdm_module,
-    }
-
-
-if 'XTA.outputs' in sys.modules:
-    outputs = sys.modules['XTA.outputs']
-else:
-    # Deliberately use stubs even when native wheels happen to be installed. This keeps
-    # the regression suite honest: none of its control-flow assertions depends on cv2,
-    # SciPy, tifffile, CUDA, or their platform loaders.
-    with mock.patch.dict(sys.modules, _native_dependency_stubs(), clear=False):
-        from XTA import outputs
+# Control-flow mocks belong to individual tests. Replacing required packages
+# during collection can break Numba initialization and poison later modules.
+from XTA import outputs
 
 
 def _serial_indices(total: int, function: object, **_kwargs: object) -> None:

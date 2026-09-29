@@ -57,9 +57,7 @@ class RadialOwnerContractTests(unittest.TestCase):
 
     def test_bucket_partition_preserves_every_owned_plane_position(self):
         shells = np.array([-1,2,0,1,0,-1,2,2],np.int32)
-        for build in (owner._bucket_shell_pixels, owner._bucket_shell_pixels_compiled, owner._bucket_shell_pixels_numpy):
-            if build is None:
-                continue
+        for build in (owner._bucket_shell_pixels, owner._bucket_shell_pixels_compiled):
             offsets, pixels = build(shells,4)
             self.assertEqual(offsets.tolist(), [0,2,3,6,6])
             self.assertEqual(pixels.tolist(), [2,4,3,1,6,7])
@@ -67,17 +65,12 @@ class RadialOwnerContractTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('XTA_RUN_CUDA_RADIAL_OWNER') == '1', 'explicit native owner CUDA qualification')
 class RadialOwnerCudaTests(unittest.TestCase):
-    def test_optional_bucket_compilation_failure_keeps_exact_cuda_projection(self):
-        import cupy as cp
+    def test_bucket_compilation_failure_stops_native_owner(self):
         view=geometry.get_view_infos(5,7,9,cartesian_views=(),radial_views=('transverse',),
                                     radial_min_radius=.1,radial_patch_size=8)[0]
-        source=np.ones((view.num_slices,8,8),np.uint8)
         with mock.patch.object(owner,'_bucket_shell_pixels_compiled',side_effect=RuntimeError('compiler unavailable')):
-            active=owner.RadialOwner(view,(8,8),(5,7,9),reserve_bytes=0)
-        try:
-            active.consume(0,cp.asarray(source))
-            np.testing.assert_array_equal(decode_words(active.host_words(),(5,7,9)),oracle(source,view,(5,7,9)))
-        finally:active.close()
+            with self.assertRaisesRegex(RuntimeError, 'compiler unavailable'):
+                owner.RadialOwner(view,(8,8),(5,7,9),reserve_bytes=0)
 
     def test_worker_consumer_seals_once_and_publishes_real_source_store(self):
         import cupy as cp

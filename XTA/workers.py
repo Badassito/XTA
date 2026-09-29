@@ -2152,8 +2152,7 @@ def _gpu_inference_worker_main(
         policy_settings = init_dict.get('augmentation_settings')
         if policy_settings is not None and policy_settings.enabled:
             from .tta_augmentation import worker_policy
-            from .inference import gpu_retina_flatten_enabled
-            if cpu_retina_masks_enabled() or not gpu_retina_flatten_enabled():
+            if cpu_retina_masks_enabled():
                 raise ValueError('External TTA policies require GPU retina flattening')
             worker_policy(policy_settings, device='cuda:0', batch_size=int(cfg.batch))
         if d1_owner_pipeline_enabled():

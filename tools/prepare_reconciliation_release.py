@@ -82,6 +82,24 @@ RELEASES = {
                        'tools/qualify_radial_bitset_compaction.py',
                        'tools/qualify_d1_confidence_masked_transfer.py',
                        'tools/qualify_release.py')),
+    '24.0.4': dict(token='24_0_4', previous_token='24_0_3',
+                   feature='legacy-configuration-and-compiled-cpu-policy',
+                   predecessor_inventory_path='release/_package_inventory.json',
+                   validation_tools=(
+                       'tools/compare_reconciliation.py',
+                       'tools/qualify_tta_reconciliation.py',
+                       'tools/export_reconciliation_evidence.py',
+                       'tools/qualify_confidence_consolidation.py',
+                       'tools/qualify_d1_confidence_bounds.py',
+                       'tools/analyze_pipeline_trace.py',
+                       'tools/export_semantic_logits.py',
+                       'tools/qualify_semantic_trt.py',
+                       'tools/qualify_pta_classification.py',
+                       'tools/qualify_pta_gpu_masks.py',
+                       'tools/qualify_pta_gpu_render.py',
+                       'tools/qualify_radial_bitset_compaction.py',
+                       'tools/qualify_d1_confidence_masked_transfer.py',
+                       'tools/qualify_release.py')),
 }
 REASONS = {
     '__init__': 'Publish the package release identity as {release}.',
@@ -234,14 +252,127 @@ REMOVAL_REASONS = {
 REMOVED_DEFINITION_REASONS = {
     ('geometry', '_angle_from_aug_id'):
         'Retire the unused private augmentation-angle parser while retaining its authenticated v22.3.2 source hash.',
+    ('assembly', '_SparseComponentKernelUnavailable'):
+        'Remove the private signal used to silently switch sparse-component work to Python.',
+    ('assembly', '_run_sparse_component_kernel'):
+        'Call the mandatory compiled sparse-component kernel directly and report faults explicitly.',
+    ('cylindrical_owner', '_bucket_shell_pixels_numpy'):
+        'Remove the slow NumPy Radial bucket fallback from production.',
+    ('cylindrical_projection', '_occurrence_rows'):
+        'Keep inverse-shear sampling arithmetic in the independent Radial test oracle.',
+    ('cylindrical_projection', '_pull_radial_chunk'):
+        'Retire the bounded NumPy Radial pull from production after admitting the compiled plan-free path.',
+    ('geometry_quality', 'spherical_cpu_compiled_requested'):
+        'Require the exact compiled Spherical CPU path instead of a process-wide reference opt-out.',
+    ('interpolation', '_disable_planning_kernels'):
+        'Fail explicitly on compiled planner faults instead of disabling Numba for the rest of the process.',
+    ('interpolation', '_planning_kernels_active'):
+        'Use the mandatory compiled planner without a Python fallback activation switch.',
+    ('interpolation', 'compiled_interpolation_kernels_enabled'):
+        'Require Numba interpolation kernels instead of exposing a Python fallback selector.',
+    ('interpolation', 'compiled_topology_kernels_enabled'):
+        'Require Numba topology kernels instead of exposing a Python fallback selector.',
+    ('interpolation', '_find_slice_projection_candidates_python'):
+        'Keep the independent Python projection planner as a test reference, outside production XTA.',
+    **{
+        ('spherical_projection', name):
+            'Move the independent vectorized Spherical CPU reference into tests while retaining compiled production geometry.'
+        for name in ('_nearest_global_shell', '_processing_index', '_pull_spherical_chunk')
+    },
+    **{
+        (module, name): 'Retire this compatibility accessor after preserving its current default behavior and fallback admission.'
+        for module, names in {
+            'backprojection': (
+                'main_process_gpu_stage_inference_overlap_enabled',
+                'main_process_gpu_stage_inference_priority_enabled',
+            ),
+            'cuda_backend': ('gpu_cube_resize_enabled',),
+            'cuda_d1': ('raw_bbox_nrrd_layers_enabled',),
+            'finalization': (
+                'fused_final_native_sparse_cpu_enabled',
+                'fused_final_restore_geometry_groups_enabled',
+                'fused_final_view_union_enabled',
+                'scheduler_push_drain_enabled',
+            ),
+            'inference': (
+                'cpu_retina_roi_only_enabled',
+                'gpu_retina_flatten_enabled',
+                'gpu_retina_proto_union_enabled',
+                'gpu_retina_warp_enabled',
+                'gpu_worker_chunk_hole_fill_enabled',
+            ),
+            'interpolation': ('interpolation_fused_bridge_merge_enabled',),
+            'outputs': ('nrrd_extent_zero_skip_enabled', 'nrrd_live_global_layer_enabled'),
+            'runtime': ('gpu_worker_direct_union_enabled', 'hybrid_gpu_stealback_enabled'),
+            'spherical_projection': ('spherical_cpu_compact_enabled',),
+            'topology': ('interpolation_skip_compact_relabel_enabled', 'interpolation_sparse_labels_enabled'),
+            'workspace': ('tilted_inplane_linear_enabled',),
+        }.items()
+        for name in names
+    },
 }
 REMOVED_STATEMENT_REASONS = {
+    ('_deps', 'from typing import Optional'): 'Remove unused Optional type import after requiring the Numba dependency.',
+    ('interpolation', 'from .inference import _cv2_connected_components, _fill_holes_2d_opencv'):
+        'Remove image helpers used only by the Python interpolation reference moved into tests.',
+    ('spherical_projection', 'from .qsc import qsc_forward_face'):
+        'Move the vectorized Spherical reference and its QSC import into tests.',
+    ('spherical_projection', 'from .geometry_quality import spherical_cpu_compiled_requested'):
+        'Remove the compiled CPU opt-out after requiring its exact kernel.',
     ('lta_outputs', 'import json'): 'The shared JSON writer now owns encoding.',
     ('lta_outputs', 'import os'): 'The shared JSON writer now owns fsync and replacement.',
     ('lta_outputs', 'import tempfile'): 'The shared JSON writer now owns unique temporary files.',
     ('unification/manifest', 'import json'): 'The shared JSON writer now owns encoding.',
     ('unification/manifest', 'import os'): 'The shared JSON writer now owns fsync and replacement.',
     ('unification/manifest', 'import threading'): 'The shared JSON writer now owns temporary names.',
+}
+REMOVED_STATEMENT_HASH_REASONS = {
+    ('assembly', '8b8e9eb230fe2b63c9496772d6bb7ad340050d700bd52aa82f5ebe5fb999d5e7'):
+        'Bind the required Numba sparse-component kernels without optional import branching.',
+    ('assembly', '14726e24984d9df4f8db59388a57016387e1e658052a8f551afa8af37648ce67'):
+        'Remove the process-wide sparse-component kernel failure latch.',
+    ('backprojection', '138fa3acc84bf3ba73c42ed3853ad547e780d51cf25c6107fef73e51a9266351'):
+        'Bind the required packed-bit coordinate kernel without optional import branching.',
+    ('cuda_backend', '2de8f9f12f3d1012fbdc7e18f12ddc8b636d37e529b8a10de20d6367202565d4'):
+        'Bind the required compiled union-confidence kernel unconditionally.',
+    ('cylindrical_projection', 'a00fd59c3a0ef57a76f093e34ec03927219de47f7f0ad44fe7c22b21bc713347'):
+        'Compile the exact Radial CPU gather and projection kernels unconditionally.',
+    ('spherical_projection_cpu', '62dfc204b213a46d14451a67a59b2d9ac8d1625a929df9f22a601b16be349147'):
+        'Remove the optional compiled-dispatcher placeholder after requiring Numba.',
+    ('spherical_projection_cpu', 'c2ac2fee3ddb3649c691ab29da24c51cca922f57e65586eeacb81b759994965b'):
+        'Remove the fallback reason for a missing Numba installation.',
+    ('spherical_projection_cpu', '63020afc675eee8a36e437c13a59a4b57c6a23a77655ef87114867bd4a20ada3'):
+        'Bind the required exact compiled Spherical CPU kernel unconditionally.',
+    ('interpolation', 'd24f27cb632054fb67662096b8c4070083fc9c3b985370cccd7d26337306a9a9'):
+        'Remove the process-wide projection-kernel failure latch.',
+    ('interpolation', '3ab30c336abd35d22525a428c7d84454e0105acfd26b72e24434d8616cc10208'):
+        'Remove the process-wide planning-kernel failure latch.',
+    ('interpolation', '4e01060dae0bb88826bf2b113bcb0f5e9d10f2ade407861176dd712774bb430e'):
+        'Bind the required compiled nearest-pixel planner without optional import branching.',
+    ('interpolation', '42b6144e5eaac69f1d042276d509eb9d9e470d16f848cee29f0c01a51a8b2253'):
+        'Bind the required compiled candidate-search planner without optional import branching.',
+    ('outputs', 'e7dff3fea3e8f03b78266fb443ee7ff6a55559fcefce4003e4ea192bfe2bf6d9'):
+        'Remove the process-wide sparse-area Numba failure latch.',
+    ('outputs', '29265bc1808725d5378e1c5865e0bc9e926d57d3ba33f0cee556ee002570c45e'):
+        'Remove the sparse-area fallback announcement latch.',
+    ('outputs', 'e2c64bae2e96424a93052b292875c466a1a6c500d60a1e7bd51c4342098f31dc'):
+        'Bind the required compiled sparse-area integration kernels unconditionally.',
+    ('packed_publication', 'db93f1d46cb61813da7a6de5c765048e75a2feafc0c52bb16feff796e25e999c'):
+        'Bind the required Numba packed-publication intrinsics without optional import branching.',
+    ('sparse_projection', '1d8caaec63bd240e132cc12a2f9a591faa7f6974047c46ef91d7d76a91e3dc33'):
+        'Compile the required sparse-projection kernels unconditionally.',
+    ('topology', '34e3971f0db977a8caac8cdee85f257d108adb8fe05c301f0f5ac657a0ce2238'):
+        'Remove the process-wide union-find Numba failure latch.',
+    ('topology', '550c6f6ee03b1d2ed4339c862cd934c6650182ba4eb44a2d3a27792df064d4f3'):
+        'Remove the process-wide adjacency Numba failure latch.',
+    ('topology', 'e7fffed290409ac21b8ea3f3619a087ce96d51576973e806684dbcda5e43ca8b'):
+        'Bind the required compiled union-find kernel without optional import branching.',
+    ('topology', 'e788bfa27be8f551f0df192472371bcb65e128ed9921e5f6f11e93655941e274'):
+        'Bind the required compiled topology kernels without optional import branching.',
+    ('topology', 'eaffedf3ccea2cc63cf7173a998341012d7c8f78b44f57a3c871a1e7ad3edd2e'):
+        'Bind the required compiled adjacency kernel without optional import branching.',
+    ('topology_runs', '6824f9609888b53198dac49de1d9ce860e0894d8c36a2d16c926c7a75a872ddc'):
+        'Bind the required compiled run-adjacency kernels without optional import branching.',
 }
 TOOL_REASONS = {
     'tools/compare_reconciliation.py': 'Compare persisted evidence with explicit native conversion, bounded readers and unchanged source artifacts.',
@@ -347,8 +478,9 @@ def review_module(module, old_source, new_source, *, complete, labels_by_hash, r
                 previous_sha256=old_hashes[index], reason=retirement_reason,
             ))
             continue
-        retirement_reason = REMOVED_STATEMENT_REASONS.get((module, ast.unparse(node)))
-        if not retirement_reason or not isinstance(node, (ast.Import, ast.ImportFrom)):
+        retirement_reason = (REMOVED_STATEMENT_REASONS.get((module, ast.unparse(node)))
+                             or REMOVED_STATEMENT_HASH_REASONS.get((module, old_hashes[index])))
+        if not retirement_reason:
             raise ValueError(f'{module}: unaccounted predecessor statements: '
                              f'{[(i, identity(old.body[i])) for i in sorted(unmatched)]}')
         records['removed_statements'].append(dict(
@@ -357,7 +489,8 @@ def review_module(module, old_source, new_source, *, complete, labels_by_hash, r
         ))
     old_seams = inventory.reviewed_local_import_seams(module, old_source, old) if old is not None else {}
     new_seams = inventory.reviewed_local_import_seams(module, new_source, new)
-    if set(new_seams) != set(old_seams):
+    retired_seams = {(module, item['name']) for item in records['removed_definitions']}
+    if set(new_seams) - set(old_seams) or set(old_seams) - set(new_seams) - retired_seams:
         raise ValueError(f'{module}: local-import seam ownership changed')
     for key, current in new_seams.items():
         previous = old_seams[key]
@@ -389,9 +522,11 @@ def _qualified_definition(source, name):
     return node
 
 
-def _update_verifier_pins(source, prefix, digest, pins):
+def _update_verifier_pins(source, prefix, digest, pins, removals=None):
     updates = {prefix + '_SHA256': repr(digest),
                prefix + '_PREDECESSOR_MODULES': pprint.pformat(pins, width=110, sort_dicts=True)}
+    if removals is not None:
+        updates[prefix + '_REMOVALS'] = pprint.pformat(removals, width=110, sort_dicts=True)
     lines = source.splitlines(keepends=True)
     changes = [(node, target.id) for node in ast.parse(source).body if isinstance(node, ast.Assign)
                for target in node.targets if isinstance(target, ast.Name) and target.id in updates]
@@ -402,15 +537,19 @@ def _update_verifier_pins(source, prefix, digest, pins):
     return ''.join(lines)
 
 
-def prepare(*, output_dir, release='24.0.2', write=False):
+def prepare(*, output_dir, release='24.0.4', write=False):
     root, output_dir = ROOT, Path(output_dir).resolve()
     if output_dir.is_relative_to(root):
         raise ValueError('Generated release-review evidence belongs outside the repository')
     spec = RELEASES[release]
-    reasons = {**REASONS, **(THROUGHPUT_REASONS if release == '22.3.2' else {}),
-               **(SEMANTIC_REASONS if release == '24.0.1' else {}),
-               **(PATCH_REASONS if release == '24.0.2' else {}),
-               **(TTA_THROUGHPUT_REASONS if release == '24.0.3' else {})}
+    reasons = ({} if release == '24.0.4' else
+               {**REASONS, **(THROUGHPUT_REASONS if release == '22.3.2' else {}),
+                **(SEMANTIC_REASONS if release == '24.0.1' else {}),
+                **(PATCH_REASONS if release == '24.0.2' else {}),
+                **(TTA_THROUGHPUT_REASONS if release == '24.0.3' else {})})
+    fallback_reason = ('Record the reviewed v24.0.4 cleanup and compiled CPU backend changes in this module.'
+                       if release == '24.0.4' else
+                       'Implement the reviewed {release} TTA throughput contract in this source module.')
     prefix = 'REVIEWED_V' + spec['token'] + '_RELEASE'
     key = 'v' + spec['token'] + '_release_review'
     predecessor_commit = getattr(inventory, prefix + '_PREDECESSOR_COMMIT')
@@ -455,7 +594,7 @@ def prepare(*, output_dir, release='24.0.2', write=False):
             new_source = path.read_text(encoding='utf-8')
             if old_source is not None and inventory.digest(ast.parse(old_source)) == inventory.digest(ast.parse(new_source)):
                 continue
-            reason = reasons.get(module, 'Implement the reviewed {release} TTA throughput contract in this source module.').format(release=release)
+            reason = reasons.get(module, fallback_reason).format(release=release)
             complete = module not in audited
             pin, snapshot, records = review_module(module, old_source, new_source,
                 complete=complete, labels_by_hash=labels_by_hash, reason=reason)
@@ -474,7 +613,8 @@ def prepare(*, output_dir, release='24.0.2', write=False):
             if hashlib.sha256(git_file(root, predecessor_commit, f'XTA/{module}.py').encode()).hexdigest() != previous_hash:
                 raise ValueError(f'Preserved module predecessor differs: {module}')
             review['preserved_radial_module_updates'].append(dict(module=module,
-                previous_sha256=previous_hash, sha256=new_hash, reason=reasons[module].format(release=release)))
+                previous_sha256=previous_hash, sha256=new_hash,
+                reason=reasons.get(module, fallback_reason).format(release=release)))
     for (module, name), previous_hash in inventory.reviewed_radial_definition_hashes(predecessor['v21_review'], patches).items():
         text = (root / 'XTA' / f'{module}.py').read_text(encoding='utf-8')
         new_hash = inventory.digest(_qualified_definition(text, name))
@@ -483,7 +623,8 @@ def prepare(*, output_dir, release='24.0.2', write=False):
             if inventory.digest(_qualified_definition(old_text, name)) != previous_hash:
                 raise ValueError(f'Preserved definition predecessor differs: {module}.{name}')
             review['preserved_radial_definition_updates'].append(dict(module=module, qualified_name=name,
-                previous_sha256=previous_hash, sha256=new_hash, reason=reasons[module].format(release=release)))
+                previous_sha256=previous_hash, sha256=new_hash,
+                reason=reasons.get(module, fallback_reason).format(release=release)))
     previous_review = predecessor['v' + spec['previous_token'] + '_release_review']
     previous_tools = {item['path']: item['sha256'] for item in previous_review.get('validation_tools', ())}
     review['validation_tools'] = [dict(path=path, previous_sha256=previous_tools.get(path),
@@ -492,15 +633,26 @@ def prepare(*, output_dir, release='24.0.2', write=False):
     payload = {**predecessor, key: review}
     digest = canonical(review)
     # Validate draft structure using its proposed pins without publishing them.
+    removals = {
+        'definitions': tuple(sorted((item['module'], item['name'], item['previous_index'],
+                                     item['previous_sha256']) for item in review['removed_definitions'])),
+        'statements': tuple(sorted((item['module'], item['previous_index'], item['previous_sha256'])
+                                   for item in review['removed_statements'])),
+    }
     original_digest = getattr(inventory, prefix + '_SHA256')
     original_pins = getattr(inventory, prefix + '_PREDECESSOR_MODULES')
+    original_removals = getattr(inventory, prefix + '_REMOVALS') if release == '24.0.4' else None
     try:
         setattr(inventory, prefix + '_SHA256', digest)
         setattr(inventory, prefix + '_PREDECESSOR_MODULES', source_pins)
+        if release == '24.0.4':
+            setattr(inventory, prefix + '_REMOVALS', removals)
         getattr(inventory, 'reviewed_v' + spec['token'] + '_release_contract')(payload, predecessor['v21_review'])
     finally:
         setattr(inventory, prefix + '_SHA256', original_digest)
         setattr(inventory, prefix + '_PREDECESSOR_MODULES', original_pins)
+        if release == '24.0.4':
+            setattr(inventory, prefix + '_REMOVALS', original_removals)
     if write:
         if subprocess.check_output(['git', 'tag', '--list', f'v{release}'], cwd=root).strip():
             raise ValueError(f'v{release} is already tagged; its authenticated review cannot be rewritten')
@@ -509,7 +661,8 @@ def prepare(*, output_dir, release='24.0.2', write=False):
         inventory.verify_v22_3_source_snapshots(review, trees)
         inventory.verify_v22_3_validation_tools(review)
         verifier = root / 'tools/verify_package_inventory.py'
-        verifier_source = _update_verifier_pins(verifier.read_text(encoding='utf-8'), prefix, digest, source_pins)
+        verifier_source = _update_verifier_pins(verifier.read_text(encoding='utf-8'), prefix, digest, source_pins,
+                                                removals if release == '24.0.4' else None)
         inventory.MANIFEST.write_text(json.dumps(payload, indent=2) + '\n', encoding='utf-8', newline='\n')
         verifier.write_text(verifier_source, encoding='utf-8', newline='\n')
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -524,7 +677,7 @@ def prepare(*, output_dir, release='24.0.2', write=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--release', choices=tuple(RELEASES), default='24.0.3')
+    parser.add_argument('--release', choices=tuple(RELEASES), default='24.0.4')
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--write', action='store_true')
     args = parser.parse_args(argv)

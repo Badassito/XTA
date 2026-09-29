@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -14,9 +16,9 @@ from XTA import cli, config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRENT_VERSION = "24.0.3"
-CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v24.0.3_SLURM.py"
-PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v24.0.2_SLURM.py"
+CURRENT_VERSION = "24.0.4"
+CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v24.0.4_SLURM.py"
+PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v24.0.3_SLURM.py"
 SCRATCH_REPORTS = (
     "TTA_EXTERNAL_AUGMENTATION.md",
     "TTA_TEST_CLI_AUDIT.md",
@@ -33,10 +35,26 @@ def _toml_section(source: str, name: str) -> str:
 
 
 class PackageMetadataTests(unittest.TestCase):
+    def test_installed_validation_tools_are_independent_of_test_oracles(self) -> None:
+        project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        data_files = _toml_section(project, "tool.setuptools.data-files")
+        installed_tools = re.findall(r'"(tools/[^"\n]+\.py)"', data_files)
+        self.assertTrue(installed_tools)
+        dependent = []
+        for relative in installed_tools:
+            tree = ast.parse((ROOT / relative).read_text(encoding="utf-8"))
+            if any(
+                isinstance(node, ast.ImportFrom) and node.module and node.module.split(".")[0] == "tests"
+                or isinstance(node, ast.Import) and any(alias.name.split(".")[0] == "tests" for alias in node.names)
+                for node in ast.walk(tree)
+            ):
+                dependent.append(relative)
+        self.assertEqual(dependent, [])
+
     def test_runtime_version_constants_are_aligned(self) -> None:
         self.assertEqual(XTA.__version__, CURRENT_VERSION)
         self.assertEqual(config.SCRIPT_VERSION, CURRENT_VERSION)
-        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2403")
+        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2404")
         self.assertEqual(config.SCRIPT_BASENAME, CURRENT_LAUNCHER)
         self.assertEqual(cli.SCRIPT_VERSION, CURRENT_VERSION)
         self.assertEqual(cli.SCRIPT_BASENAME, CURRENT_LAUNCHER)
@@ -53,6 +71,10 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertIn('dynamic = ["version"]', project)
         self.assertIn('version = {attr = "XTA.__version__"}', dynamic)
         self.assertIn('"ultralytics>=8.4.128,<8.5"', project)
+        self.assertIn('"numba>=0.61.2"', project)
+        optional = _toml_section(source, "project.optional-dependencies")
+        self.assertNotIn('numba', optional)
+        self.assertIn('"deflate>=0.9.0"', optional)
         self.assertIn('xta = "XTA.cli:run"', scripts)
         self.assertIn(
             '"XTA.examples.external_augmentations" = ["README.md"]',
@@ -117,6 +139,9 @@ class PackageMetadataTests(unittest.TestCase):
             self.assertFalse((ROOT / report).exists())
         self.assertIn("recursive-include XTA/examples *.py *.md", manifest_lines)
         self.assertIn("recursive-include tools *.py", manifest_lines)
+        self.assertIn("recursive-include docs *.md", manifest_lines)
+        self.assertIn("include tests/__init__.py", manifest_lines)
+        self.assertIn("recursive-include tests/reference_backends *.py", manifest_lines)
         self.assertTrue((ROOT / "tools" / "hgx_selftest.py").is_file())
         self.assertTrue((ROOT / "tools" / "compare_reconciliation.py").is_file())
         self.assertTrue((ROOT / "tools" / "export_semantic_logits.py").is_file())
@@ -176,7 +201,10 @@ class PackageMetadataTests(unittest.TestCase):
                 self.assertEqual(manifest["source"], "working-tree-snapshot")
                 self.assertIn("release/_package_inventory.json", manifest["files"])
                 self.assertIn("release/README.md", manifest["files"])
-                for name in (CURRENT_LAUNCHER, "ARCHITECTURE.md", ".gitattributes",
+                for name in (CURRENT_LAUNCHER, "ARCHITECTURE.md", "docs/PRODUCTION_BACKENDS.md", ".gitattributes",
+                             "tests/__init__.py", "tests/reference_backends/__init__.py",
+                             "tests/reference_backends/spherical.py", "tests/reference_backends/interpolation.py",
+                             "tests/reference_backends/radial.py", "tests/reference_backends/topology.py",
                              "native/README.md", "native/README_QAT.md", "native/README_QPL.md",
                              "XTA/examples/external_augmentations/README.md",
                              "XTA/examples/external_reconciliation/README.md",

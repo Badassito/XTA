@@ -55,13 +55,10 @@ def _paint_cases():
 
 
 class MembershipPainterTests(unittest.TestCase):
-    @unittest.skipUnless(hasattr(interpolation._numba_paste_packed_or_kernel, 'signatures'), 'requires Numba')
     def test_unsigned_top_bit_reaches_compiled_painter(self):
         top = 1 << 63
         dest = np.array([[1, top]], dtype=np.uint64)
         with (
-            mock.patch.object(interpolation, '_NUMBA_PLANNING_KERNELS_RUNTIME_DISABLED', False),
-            mock.patch.object(interpolation, 'compiled_interpolation_kernels_enabled', return_value=True),
             mock.patch.object(interpolation, '_numba_paste_packed_or_kernel',
                               wraps=interpolation._numba_paste_packed_or_kernel) as kernel,
         ):
@@ -69,7 +66,6 @@ class MembershipPainterTests(unittest.TestCase):
                 dest, np.ones((1, 2), bool), (0, 1), paint_value=top, binary_destination=False,
             )
             kernel.assert_called_once()
-            self.assertFalse(interpolation._NUMBA_PLANNING_KERNELS_RUNTIME_DISABLED)
         self.assertEqual(added, 1)
         np.testing.assert_array_equal(dest, np.array([[top | 1, top]], dtype=np.uint64))
 
@@ -108,14 +104,13 @@ class MembershipPainterTests(unittest.TestCase):
                 else:
                     self.assertEqual(bounds, [10000, 10000, 0, 0])
 
-    def test_numpy_fallback_sets_partly_overlapping_composite_values(self):
-        for dtype in (np.uint8, np.uint16, np.uint32, np.uint64):
+    def test_numpy_path_for_signed_values_sets_partly_overlapping_composites(self):
+        for dtype in (np.int8, np.int16, np.int32, np.int64):
             dest = np.array([[1, 0], [3, 2]], dtype=dtype)
-            with mock.patch.object(interpolation, '_planning_kernels_active', return_value=False):
-                added = interpolation._paste_local_mask_onto_slice(
-                    dest, np.ones((2, 2), bool), (1, 1),
-                    paint_value=3, binary_destination=False,
-                )
+            added = interpolation._paste_local_mask_onto_slice(
+                dest, np.ones((2, 2), bool), (1, 1),
+                paint_value=3, binary_destination=False,
+            )
             self.assertEqual(added, 1)
             np.testing.assert_array_equal(dest, 3)
 

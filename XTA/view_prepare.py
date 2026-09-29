@@ -42,7 +42,6 @@ class ComponentProjectionSubmitter:
 
     queue: object
     source_shape: tuple[int, int, int]
-    numba_available: bool
     materialize: Callable[..., NrrdLayerRef]
 
     def __call__(self, component_path: Path, **kwargs):
@@ -55,8 +54,7 @@ class ComponentProjectionSubmitter:
         source_volume_bytes = math.prod(source_shape)
         if int(kwargs.get('added_voxels', 0)) <= 0 and view.family not in ('radial', 'spherical'):
             working_bytes = 64 * 1024 * 1024
-        elif (str(view.family) == 'azimuthal' and str(kwargs.get('source')) == 'fullframe'
-              and self.numba_available):
+        elif str(view.family) == 'azimuthal' and str(kwargs.get('source')) == 'fullframe':
             packed_source_bytes = source_shape[0] * source_shape[1] * ((source_shape[2] + 7) // 8)
             map_bound = 16 * max(
                 int(view.full_t) * int(view.full_h), int(view.full_t) * int(view.full_w),

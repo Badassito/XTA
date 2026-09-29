@@ -1,20 +1,16 @@
 from __future__ import annotations
 
-import importlib.util
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
-import types
 import unittest
-from unittest import mock
 
 import numpy as np
 from XTA import packed_publication as packed
 
 
-@unittest.skipIf(packed._packed_owner_metadata is None, 'Numba unavailable')
 class PackedMetadataTests(unittest.TestCase):
     def test_metadata_matches_dense_oracle_with_dirty_padding_and_partial_slabs(self):
         rng = np.random.default_rng(240123)
@@ -90,19 +86,6 @@ print('generic target: 56 exact metadata cases')
                                     errors='replace', timeout=90)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('generic target: 56 exact metadata cases', result.stdout)
-
-
-class PackedOptionalCompilerTests(unittest.TestCase):
-    def test_numba_unavailable_keeps_explicit_publication_fallback(self):
-        name = 'XTA._packed_publication_without_numba'
-        spec = importlib.util.spec_from_file_location(name, packed.__file__)
-        module = importlib.util.module_from_spec(spec)
-        with mock.patch.dict(sys.modules, {'XTA._deps': types.SimpleNamespace(_numba=None), name: module}):
-            spec.loader.exec_module(module)
-            self.assertIsNone(module._packed_owner_metadata)
-            self.assertIsNone(module._packed_owner_encode)
-            with self.assertRaisesRegex(NotImplementedError, 'Numba'):
-                module.encode_owner_packed_block(np.zeros(1, np.uint32), (1, 1, 1), 0, 1)
 
 
 if __name__ == '__main__':

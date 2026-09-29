@@ -441,9 +441,7 @@ class TiltedAzimuthalProjectionHandoffTests(unittest.TestCase):
             device_count=lambda: 4, mem_get_info=lambda _device: (1000, 2000)), device=lambda value: value)
         with ExitStack() as stack:
             for name, value in (
-                    ('main_process_gpu_stage_inference_priority_enabled', True),
-                    ('main_process_gpu_stage_inference_overlap_enabled', False),
-                    ('gpu_worker_aux_interpolation_pool', None)):
+                    ('gpu_worker_aux_interpolation_pool', None),):
                 stack.enter_context(mock.patch.object(bp, name, return_value=value))
             stack.enter_context(mock.patch.dict(os.environ, {
                 'YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT': '1', 'YOLO_TTA_GPU_SPHERICAL_AGE_RETIREMENT': '1'}))
