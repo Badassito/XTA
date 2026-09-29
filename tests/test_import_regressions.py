@@ -30,6 +30,28 @@ class ImportRegressionTests(unittest.TestCase):
         self.assertIn("eager package import graph is acyclic", completed.stdout)
         self.assertIn("all function globals resolved", completed.stdout)
 
+    def test_output_test_collection_keeps_real_compiler_dependencies(self) -> None:
+        program = textwrap.dedent(
+            """
+            from tests import test_output_regressions
+            from XTA import _deps
+            import numba
+            import scipy
+            import scipy.ndimage
+
+            assert _deps._numba is numba
+            assert _deps.ndi is scipy.ndimage
+            assert isinstance(scipy.__version__, str)
+            @numba.njit
+            def compiled(value):
+                return value + 1
+            assert compiled(41) == 42
+            assert compiled.nopython_signatures
+            """
+        )
+        completed = self.run_python("-c", program)
+        self.assertEqual(completed.returncode, 0, completed.stdout)
+
     def test_interpolation_can_be_the_first_subsystem_imported(self) -> None:
         completed = self.run_python(
             str(ROOT / "tools" / "smoke_import.py"), "interpolation"

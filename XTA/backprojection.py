@@ -460,19 +460,6 @@ def build_dense_azimuthal_backprojection_map(
     _DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE[key] = dense_map
     return dense_map
 
-def main_process_gpu_stage_inference_overlap_enabled() -> bool:
-    """Allow main-process GPU output stages to overlap worker inference on one device."""
-    return _env_flag('YOLO_TTA_MAIN_GPU_STAGE_INFERENCE_OVERLAP', False)
-
-def main_process_gpu_stage_inference_priority_enabled() -> bool:
-    """Reserve worker GPUs for inference until the global inference queue is permanently drained.
-
-    The old coordinator blocked an output stage only while a task was already queued or running
-    on that exact device. A long NRRD mirror/backprojection stage could therefore win the small
-    result-publication/refill race and strand that GPU while inference work still existed.
-    """
-    return _env_flag('YOLO_TTA_MAIN_GPU_STAGE_INFERENCE_PRIORITY', True)
-
 class _MainProcessGpuStageLease:
     """Exclusive main-process lease for one logical CUDA device."""
 
@@ -570,9 +557,7 @@ class _MainProcessGpuStageCoordinator:
             self._spherical_retirement_cursor = 0
             self._spherical_retirement_retry_after = 0.0
             self._inference_asset_retirement_pending = False
-            self._inference_priority_active = bool(
-                self._worker_devices and main_process_gpu_stage_inference_priority_enabled()
-            )
+            self._inference_priority_active = bool(self._worker_devices)
         for device, pool, claim in claims:
             pool.release_stage_claim(device, claim)
 
@@ -743,9 +728,7 @@ class _MainProcessGpuStageCoordinator:
     def set_inference_priority_active(self, active: bool) -> None:
         callback: Optional[Callable[[], None]] = None
         with self._lock:
-            self._inference_priority_active = bool(
-                active and self._worker_devices and main_process_gpu_stage_inference_priority_enabled()
-            )
+            self._inference_priority_active = bool(active and self._worker_devices)
             callback = self._wake_callback
         if callback is not None:
             try:
@@ -797,7 +780,6 @@ class _MainProcessGpuStageCoordinator:
             return False
         return bool(
             self._inference_priority_active
-            and not main_process_gpu_stage_inference_overlap_enabled()
             and int(device_index) in self._worker_devices
         )
 
@@ -853,10 +835,7 @@ class _MainProcessGpuStageCoordinator:
             if self._reserved_spherical_device_locked() == int(device_index):
                 return False
             owner = self._stage_leases.get(int(device_index))
-            return owner is None or bool(
-                main_process_gpu_stage_inference_overlap_enabled()
-                and not self._is_spherical_retirement(owner)
-            )
+            return owner is None
 
     def begin_inference(self, device_index: int) -> bool:
         device = int(device_index)
@@ -866,10 +845,7 @@ class _MainProcessGpuStageCoordinator:
             if self._reserved_spherical_device_locked() == device:
                 return False
             owner = self._stage_leases.get(device)
-            if owner is not None and (
-                not main_process_gpu_stage_inference_overlap_enabled()
-                or self._is_spherical_retirement(owner)
-            ):
+            if owner is not None:
                 return False
             self._inference_inflight[device] += 1
             # A successful inference dispatch ends this worker's retirement
@@ -893,9 +869,7 @@ class _MainProcessGpuStageCoordinator:
                     and self._provisional_stages[device] is not provisional)
                 or self._priority_blocks_stage_locked(device, purpose)):
             return False
-        overlap = bool(main_process_gpu_stage_inference_overlap_enabled())
-        return bool((overlap and not self._is_spherical_retirement(purpose))
-                    or int(self._inference_inflight.get(device, 0)) == 0)
+        return int(self._inference_inflight.get(device, 0)) == 0
 
     def _claim_stage_device(self, device: int, purpose: str, epoch: int,
                             torch_mod: Optional[object] = None) -> Optional[_MainProcessGpuStageLease]:
@@ -4177,31 +4151,26 @@ def _backproject_cartesian_azimuthal_generic(
         )
     return SinkOnlyProjectionResult((t_dim, out_h, out_w))
 
-if _numba is not None:
-    # This tiny kernel intentionally avoids Numba's disk cache: the pipeline is often copied
-    # to a new versioned filename/module, and a cached environment from the prior filename can
-    # fail to import before the first projection.
-    @_numba.njit(cache=False, nogil=True)  # type: ignore[misc]
-    def _numba_or_tilted_azimuthal_coordinates_into_packed(
-        destination_flat: np.ndarray,
-        ti: np.ndarray,
-        yi: np.ndarray,
-        xi: np.ndarray,
-        out_h: int,
-        packed_w: int,
-    ) -> None:
-        """Serial packed-bit OR in compiled code; repeated coordinates are intentional."""
-        plane_stride = int(out_h) * int(packed_w)
-        for index in range(int(ti.shape[0])):
-            x = int(xi[index])
-            destination_index = (
-                int(ti[index]) * int(plane_stride)
-                + int(yi[index]) * int(packed_w)
-                + (x >> 3)
-            )
-            destination_flat[destination_index] |= np.uint8(1 << (7 - (x & 7)))
-else:
-    _numba_or_tilted_azimuthal_coordinates_into_packed = None
+# This tiny kernel avoids cached environments tied to an older versioned module.
+@_numba.njit(cache=False, nogil=True)  # type: ignore[misc]
+def _numba_or_tilted_azimuthal_coordinates_into_packed(
+    destination_flat: np.ndarray,
+    ti: np.ndarray,
+    yi: np.ndarray,
+    xi: np.ndarray,
+    out_h: int,
+    packed_w: int,
+) -> None:
+    """Serial packed-bit OR in compiled code; repeated coordinates are intentional."""
+    plane_stride = int(out_h) * int(packed_w)
+    for index in range(int(ti.shape[0])):
+        x = int(xi[index])
+        destination_index = (
+            int(ti[index]) * int(plane_stride)
+            + int(yi[index]) * int(packed_w)
+            + (x >> 3)
+        )
+        destination_flat[destination_index] |= np.uint8(1 << (7 - (x & 7)))
 
 def _or_tilted_azimuthal_coordinates_into_packed(
     destination_flat: np.ndarray,
@@ -4213,25 +4182,14 @@ def _or_tilted_azimuthal_coordinates_into_packed(
     packed_w: int,
 ) -> None:
     """OR final source coordinates into a C-order packed destination."""
-    if _numba_or_tilted_azimuthal_coordinates_into_packed is not None:
-        _numba_or_tilted_azimuthal_coordinates_into_packed(
-            destination_flat,
-            np.asarray(ti, dtype=np.int32),
-            np.asarray(yi, dtype=np.int32),
-            np.asarray(xi, dtype=np.int32),
-            int(out_h),
-            int(packed_w),
-        )
-        return
-    packed_plane_stride = np.int64(int(out_h) * int(packed_w))
-    packed_indices = ti.astype(np.int64, copy=False) * packed_plane_stride
-    packed_indices += yi.astype(np.int64, copy=False) * np.int64(packed_w)
-    packed_indices += (xi.astype(np.int64, copy=False) >> np.int64(3))
-    bit_masks = np.left_shift(
-        np.uint8(1),
-        (np.int32(7) - (xi.astype(np.int32, copy=False) & np.int32(7))).astype(np.uint8),
-    ).astype(np.uint8, copy=False)
-    np.bitwise_or.at(destination_flat, packed_indices, bit_masks)
+    _numba_or_tilted_azimuthal_coordinates_into_packed(
+        destination_flat,
+        np.asarray(ti, dtype=np.int32),
+        np.asarray(yi, dtype=np.int32),
+        np.asarray(xi, dtype=np.int32),
+        int(out_h),
+        int(packed_w),
+    )
 
 _TILTED_AZIMUTHAL_CUDA_RECHECK_FRAMES = 8
 _TILTED_AZIMUTHAL_CUDA_RECHECK_SECONDS = 1.0

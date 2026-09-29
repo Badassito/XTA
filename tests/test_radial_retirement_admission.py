@@ -19,8 +19,6 @@ class RadialSchedulerRetirementAdmissionTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         for patch in (
-            mock.patch.object(bp, 'main_process_gpu_stage_inference_priority_enabled', return_value=True),
-            mock.patch.object(bp, 'main_process_gpu_stage_inference_overlap_enabled', return_value=False),
             mock.patch.object(bp, 'v1613_d1_backprojection_overlap_enabled', return_value=True),
             mock.patch.object(bp, 'gpu_worker_aux_interpolation_pool', return_value=None),
         ):
@@ -182,19 +180,18 @@ class RadialSchedulerRetirementAdmissionTests(unittest.TestCase):
         self.assertEqual(self.state.gpu_worker_results_collected, 3)
         self.assertIsNotNone(self.acquire(1))
 
-    def test_radial_stage_stays_exclusive_under_overlap_override(self):
+    def test_radial_stage_stays_exclusive_during_inference(self):
         self.begin_task(10, 0)
         self.scheduler.publish_gpu_worker_admissible_backlog()
-        with mock.patch.object(bp, 'main_process_gpu_stage_inference_overlap_enabled', return_value=True):
-            self.assertIsNone(self.acquire(0))
-            self.release_compute(10, 0)
-            lease = self.acquire(0)
-            self.assertIsNotNone(lease)
-            self.assertFalse(self.coordinator.can_dispatch_inference(0))
-            self.assertFalse(self.coordinator.begin_inference(0))
-            lease.release()
-            self.assertTrue(self.coordinator.begin_inference(0))
-            self.coordinator.finish_inference(0)
+        self.assertIsNone(self.acquire(0))
+        self.release_compute(10, 0)
+        lease = self.acquire(0)
+        self.assertIsNotNone(lease)
+        self.assertFalse(self.coordinator.can_dispatch_inference(0))
+        self.assertFalse(self.coordinator.begin_inference(0))
+        lease.release()
+        self.assertTrue(self.coordinator.begin_inference(0))
+        self.coordinator.finish_inference(0)
 
     def test_terminal_asset_ack_and_active_auxiliary_work_remain_authoritative(self):
         self.scheduler.publish_gpu_worker_admissible_backlog()
@@ -223,8 +220,6 @@ class RadialSchedulerRetirementAdmissionTests(unittest.TestCase):
 class MixedNativeRetirementQueueTests(unittest.TestCase):
     def setUp(self):
         for patch in (
-            mock.patch.object(bp, 'main_process_gpu_stage_inference_priority_enabled', return_value=True),
-            mock.patch.object(bp, 'main_process_gpu_stage_inference_overlap_enabled', return_value=False),
             mock.patch.object(bp, 'gpu_worker_aux_interpolation_pool', return_value=None),
             mock.patch.dict('os.environ', {'YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT': '1',
                                            'YOLO_TTA_GPU_SPHERICAL_AGE_RETIREMENT': '1'}),

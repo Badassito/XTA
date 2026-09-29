@@ -134,7 +134,8 @@ class SphericalCudaProjector:
 
     def __init__(self, source, view, output_shape, bboxes=None, device_index=0, *,
                  block_bytes=_BLOCK_BYTES, upload_bytes=_UPLOAD_BYTES, reserve_bytes=_RESERVE_BYTES):
-        from .spherical_projection import _validate_spherical_projection, _pull_spherical_chunk
+        from .spherical_projection import _validate_spherical_projection
+        from .spherical_projection_cpu import prepare_spherical_chunk_numba
 
         started = time.perf_counter()
         source = np.asarray(source)
@@ -160,6 +161,10 @@ class SphericalCudaProjector:
         if budget <= 0 or plane_bytes > budget or (shape[1] + 7) // 8 > 65535:
             raise SphericalCudaProjectionUnavailable('One Spherical output plane exceeds the bounded CUDA grid')
         self.max_block_depth = min(shape[0], budget // plane_bytes, _MAX_ENCODED_SLICES)
+        # Preflight must have an exact CPU oracle before owning device memory.
+        compiled_pull = prepare_spherical_chunk_numba(
+            source, view, radii, rotation, shape, boxes if self.use_bboxes else None,
+        )
         self.device_index = operator.index(device_index)
         self.view = view
         self.source_bytes = source.nbytes
@@ -260,7 +265,7 @@ class SphericalCudaProjector:
                                 foreground_bounds = tuple(int(foreground[key]) for key in ('y0', 'y1', 'x0', 'x1'))
                         mode, pixels = validate_spherical_preflight_plane(
                             checked[0],
-                            lambda first, stop: _pull_spherical_chunk(
+                            lambda first, stop: compiled_pull(
                                 source, view, radii, rotation, shape, checked_z, first, stop,
                                 boxes if self.use_bboxes else None),
                             self.output_bounds, foreground_bounds, z=checked_z, full=full_math_preflight,

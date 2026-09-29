@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WRAPPER = ROOT / "GPT-6-Astra-Ultra_v23.0.3_SLURM.py"
+WRAPPER = ROOT / "GPT-6-Astra-Ultra_v23.0.4_SLURM.py"
 UNIFIED_MODULES = (
     "experimental_features",
     "gaussian",
@@ -81,7 +81,7 @@ class ImportSurfaceTests(unittest.TestCase):
     def test_config_import_does_not_load_native_or_accelerator_runtimes(self) -> None:
         program = (
             "import sys; import XTA.config; "
-            "forbidden={'cv2','scipy','torch','cupy','openvino','ultralytics','jax'}; "
+            "forbidden={'cv2','scipy','numba','torch','cupy','openvino','ultralytics','jax'}; "
             "loaded={name.split('.')[0] for name in sys.modules}; "
             "assert not (forbidden & loaded), forbidden & loaded"
         )
@@ -96,7 +96,7 @@ class ImportSurfaceTests(unittest.TestCase):
     def test_module_version(self) -> None:
         completed = self.run_python("-m", "XTA", "--version")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("23.0.3", completed.stdout)
+        self.assertIn("23.0.4", completed.stdout)
 
     def test_cycle_safe_full_import_smoke(self) -> None:
         completed = self.run_python(str(ROOT / "tools" / "smoke_import.py"), "pipeline")

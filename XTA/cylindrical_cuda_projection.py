@@ -59,9 +59,7 @@ def _pack_radial_source_block(source, bboxes, offsets, first, destination):
         position += count
 
 
-_pack_radial_source_block_compiled = (
-    _numba.njit(cache=True, nogil=True)(_pack_radial_source_block) if _numba is not None else None
-)
+_pack_radial_source_block_compiled = _numba.njit(cache=True, nogil=True)(_pack_radial_source_block)
 
 
 @dataclass(frozen=True)
@@ -566,115 +564,59 @@ class RadialCudaProjector:
         self.source_upload_lane_wait_seconds = 0.0
         pack = _pack_radial_source_block_compiled
         boxes, offsets = self.contract.arrays['bboxes'], self.contract.arrays['source_offsets']
-        if pack is not None:
-            # Compile before any source copy. Optional compilation failures can
-            # still select the original NumPy uploader without partial delivery.
+        # Compile before source copy so failures cannot publish a partial upload.
+        pack(source, boxes, offsets, 0, self._upload_stage[:0])
+        self.source_pack_backend = 'numba_nogil'
+        events = None
+        if capacity >= 2 and self.source_h2d_bytes > capacity:
             try:
-                pack(source, boxes, offsets, 0, self._upload_stage[:0])
+                events = (cp.cuda.Event(disable_timing=True), cp.cuda.Event(disable_timing=True))
             except Exception:
-                pack = None
-        if pack is not None:
-            self.source_pack_backend = 'numba_nogil'
-            pipeline = os.environ.get('YOLO_TTA_CROPPED_UPLOAD_PIPELINE', '1').strip().lower() not in (
-                '', '0', 'false', 'no', 'off',
-            )
-            events = None
-            if pipeline and capacity >= 2 and self.source_h2d_bytes > capacity:
-                try:
-                    events = (cp.cuda.Event(disable_timing=True), cp.cuda.Event(disable_timing=True))
-                except Exception:
-                    # No source copy has been enqueued; serial upload remains safe.
-                    events = None
-            if events is not None:
-                self.source_upload_pipeline = True
-                self.source_pack_backend = 'numba_nogil_pipelined'
-                half = capacity // 2
-                pending = [False, False]
-                # Constructor cleanup already retains this dictionary, the pinned
-                # owner and the device allocation until its stream fence succeeds.
-                # Leave these event owners attached on every exceptional path.
-                self._events['source_upload_lane_0'], self._events['source_upload_lane_1'] = events
-                for index, first in enumerate(range(0, self.source_h2d_bytes, half)):
-                    lane = index & 1
-                    if pending[lane]:
-                        waited = time.perf_counter()
-                        events[lane].synchronize()
-                        self.source_upload_lane_wait_seconds += time.perf_counter() - waited
-                        self.source_upload_lane_waits += 1
-                    count = min(half, self.source_h2d_bytes - first)
-                    stage_offset = lane * half
-                    pack_started = time.perf_counter()
-                    pack(source, boxes, offsets, first, self._upload_stage[stage_offset:stage_offset + count])
-                    self.source_pack_seconds += time.perf_counter() - pack_started
-                    cp.cuda.runtime.memcpyAsync(int(self._source_gpu.data.ptr) + first,
-                        int(self._upload_pin.ptr) + stage_offset, count,
-                        cp.cuda.runtime.memcpyHostToDevice, int(self._stream.ptr))
-                    self.source_upload_copy_count += 1
-                    events[lane].record(self._stream)
-                    pending[lane] = True
-                self._stream.synchronize()
-                self.source_upload_stream_fences += 1
-                self._events.pop('source_upload_lane_0')
-                self._events.pop('source_upload_lane_1')
-                return
-            for first in range(0, self.source_h2d_bytes, capacity):
-                count = min(capacity, self.source_h2d_bytes - first)
+                # No source copy has been enqueued; serial upload remains safe.
+                events = None
+        if events is not None:
+            self.source_upload_pipeline = True
+            self.source_pack_backend = 'numba_nogil_pipelined'
+            half = capacity // 2
+            pending = [False, False]
+            # Constructor cleanup already retains this dictionary, the pinned
+            # owner and the device allocation until its stream fence succeeds.
+            # Leave these event owners attached on every exceptional path.
+            self._events['source_upload_lane_0'], self._events['source_upload_lane_1'] = events
+            for index, first in enumerate(range(0, self.source_h2d_bytes, half)):
+                lane = index & 1
+                if pending[lane]:
+                    waited = time.perf_counter()
+                    events[lane].synchronize()
+                    self.source_upload_lane_wait_seconds += time.perf_counter() - waited
+                    self.source_upload_lane_waits += 1
+                count = min(half, self.source_h2d_bytes - first)
+                stage_offset = lane * half
                 pack_started = time.perf_counter()
-                pack(source, boxes, offsets, first, self._upload_stage[:count])
+                pack(source, boxes, offsets, first, self._upload_stage[stage_offset:stage_offset + count])
                 self.source_pack_seconds += time.perf_counter() - pack_started
                 cp.cuda.runtime.memcpyAsync(int(self._source_gpu.data.ptr) + first,
-                    int(self._upload_pin.ptr), count, cp.cuda.runtime.memcpyHostToDevice, int(self._stream.ptr))
+                    int(self._upload_pin.ptr) + stage_offset, count,
+                    cp.cuda.runtime.memcpyHostToDevice, int(self._stream.ptr))
                 self.source_upload_copy_count += 1
-                self._stream.synchronize()
-                self.source_upload_stream_fences += 1
+                events[lane].record(self._stream)
+                pending[lane] = True
+            self._stream.synchronize()
+            self.source_upload_stream_fences += 1
+            self._events.pop('source_upload_lane_0')
+            self._events.pop('source_upload_lane_1')
             return
-        self.source_pack_backend = 'numpy'
-        filled = uploaded = 0
-
-        def flush(count):
-            cp.cuda.runtime.memcpyAsync(int(self._source_gpu.data.ptr) + uploaded,
+        for first in range(0, self.source_h2d_bytes, capacity):
+            count = min(capacity, self.source_h2d_bytes - first)
+            pack_started = time.perf_counter()
+            pack(source, boxes, offsets, first, self._upload_stage[:count])
+            self.source_pack_seconds += time.perf_counter() - pack_started
+            cp.cuda.runtime.memcpyAsync(int(self._source_gpu.data.ptr) + first,
                 int(self._upload_pin.ptr), count, cp.cuda.runtime.memcpyHostToDevice, int(self._stream.ptr))
             self.source_upload_copy_count += 1
             self._stream.synchronize()
             self.source_upload_stream_fences += 1
-
-        for shell, (y0, y1, x0, x1) in enumerate(self.contract.arrays['bboxes']):
-            y0, y1, x0, x1 = map(int, (y0, y1, x0, x1))
-            width = x1 - x0
-            if not width or y1 == y0:
-                continue
-            for first_row in range(y0, y1, max(1, capacity // width)):
-                rows = min(y1 - first_row, max(1, capacity // width))
-                if width <= capacity:
-                    count = rows * width
-                    if filled + count > capacity:
-                        flush(filled)
-                        uploaded += filled
-                        filled = 0
-                    pack_started = time.perf_counter()
-                    np.copyto(self._upload_stage[filled:filled + count].reshape(rows, width),
-                              source[shell, first_row:first_row + rows, x0:x1])
-                    self.source_pack_seconds += time.perf_counter() - pack_started
-                    filled += count
-                else:
-                    # Small explicit test budgets or unusually wide masks can
-                    # split a row; concatenated bytes still follow C row order.
-                    for first_col in range(x0, x1, capacity):
-                        if filled:
-                            flush(filled)
-                            uploaded += filled
-                            filled = 0
-                        count = min(capacity, x1 - first_col)
-                        pack_started = time.perf_counter()
-                        np.copyto(self._upload_stage[:count],
-                                  source[shell, first_row, first_col:first_col + count])
-                        self.source_pack_seconds += time.perf_counter() - pack_started
-                        filled = count
-        if filled:
-            flush(filled)
-            uploaded += filled
-        if uploaded != self.source_h2d_bytes:
-            raise RuntimeError('Radial CUDA source crop upload did not match its admitted payload')
+        return
 
     def _reset_projection_stats(self):
         self.kernel_seconds = self.metadata_seconds = self.pack_seconds = self.d2h_seconds = 0.0

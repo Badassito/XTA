@@ -130,8 +130,7 @@ def native_fullframe_dense_reserve(tasks, *, total_dense_limit, min_conf=0.,
             'views/angles, or increase YOLO_TTA_DIRECT_UNION_TOTAL_GIB only with sufficient '
             'real memory headroom. '
             if has_policy_groups else
-            'Enable YOLO_TTA_GPU_WORKER_DIRECT_UNION=1 for bounded shared unions, '
-            'or reduce the requested native views. '
+            'Reduce the requested native views or use process workers for bounded shared unions. '
         )
         raise RuntimeError(
             f'File-mode full-frame unions require {unbounded / GIB:.1f} GiB of retained '

@@ -1819,10 +1819,6 @@ def tail_worker_budget_expansion_enabled() -> bool:
  worker budget during strictly tail-only stages."""
     return _env_flag('YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND', True)
 
-def gpu_worker_direct_union_enabled() -> bool:
-    """Allow disjoint angle-variant worker leases to write directly into that variant union."""
-    return _env_flag('YOLO_TTA_GPU_WORKER_DIRECT_UNION', True)
-
 def gpu_worker_fullframe_task_ranges(
     n_slices: int,
     slice_chunk: int,
@@ -1998,10 +1994,6 @@ def hybrid_gpu_stealback_min_cpu_samples() -> int:
     CUDA may assist immediately rather than idle, even if the sample floor was not reached.
     """
     return max(0, min(32, _env_int('YOLO_TTA_HYBRID_GPU_STEALBACK_MIN_CPU_SAMPLES', 2)))
-
-def hybrid_gpu_stealback_enabled() -> bool:
-    """Allow CUDA to assist the active CPU-owned view before mandatory GPU work drains."""
-    return _env_flag('YOLO_TTA_HYBRID_GPU_STEALBACK', True)
 
 def hybrid_gpu_stealback_eta_ratio() -> float:
     """Active CPU-view ETA must exceed this multiple of mandatory-GPU ETA."""

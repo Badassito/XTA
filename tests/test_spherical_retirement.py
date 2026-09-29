@@ -38,20 +38,19 @@ class SphericalRetirementAdmissionTests(unittest.TestCase):
         self.assertTrue(self.coordinator.snapshot()['inference_priority_active'])
         lease.release()
 
-    def test_spherical_remains_exclusive_under_overlap_override(self):
-        with mock.patch.object(bp,'main_process_gpu_stage_inference_overlap_enabled',return_value=True):
-            self.coordinator.set_pending_inference_backlog(False)
-            self.coordinator.begin_inference(0)
-            self.assertIsNone(self.coordinator.try_acquire_specific_stage(self.torch,0,self.purpose))
-            self.coordinator.finish_inference(0)
-            lease=self.coordinator.try_acquire_specific_stage(self.torch,0,self.purpose)
-            self.assertIsNotNone(lease)
-            self.assertFalse(self.coordinator.can_dispatch_inference(0))
-            self.assertFalse(self.coordinator.begin_inference(0))
-            self.coordinator.set_pending_inference_backlog(True)
-            self.assertIsNone(self.coordinator.try_acquire_stage(self.torch,self.purpose))
-            lease.release()
-            self.assertTrue(self.coordinator.begin_inference(0))
+    def test_spherical_remains_exclusive_with_stage_lease(self):
+        self.coordinator.set_pending_inference_backlog(False)
+        self.coordinator.begin_inference(0)
+        self.assertIsNone(self.coordinator.try_acquire_specific_stage(self.torch,0,self.purpose))
+        self.coordinator.finish_inference(0)
+        lease=self.coordinator.try_acquire_specific_stage(self.torch,0,self.purpose)
+        self.assertIsNotNone(lease)
+        self.assertFalse(self.coordinator.can_dispatch_inference(0))
+        self.assertFalse(self.coordinator.begin_inference(0))
+        self.coordinator.set_pending_inference_backlog(True)
+        self.assertIsNone(self.coordinator.try_acquire_stage(self.torch,self.purpose))
+        lease.release()
+        self.assertTrue(self.coordinator.begin_inference(0))
 
     def test_asset_retirement_and_aux_owner_are_authoritative(self):
         self.coordinator.set_inference_asset_retirement_pending(True)

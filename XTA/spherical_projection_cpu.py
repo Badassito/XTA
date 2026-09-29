@@ -1,9 +1,9 @@
-"""Optional compiled Spherical pull prototype, independent of the NumPy oracle.
+"""Required compiled Spherical CPU pull with float64 categorical geometry.
 
 One scalar float64 loop replaces temporary coordinate/tap arrays. The existing
 source-grid, shell midpoint, closed-face, global-pixel and padding decisions are
-retained. Production selection requires an explicit opt-in flag. It owns only the
-requested uint8 output strip, borrows the source, and uses no parallel Numba pool.
+retained. It owns only the requested uint8 output strip, borrows the source,
+and uses no parallel Numba pool.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ _EMPTY_BOXES = np.empty((0, 4), dtype=np.int64)
 
 
 class SphericalCpuProjectionUnavailable(RuntimeError):
-    """Optional compilation failed before any source samples were evaluated."""
+    """The required compiled kernel could not be prepared before publication."""
 
 
 def _pull_spherical_f64(source, radii, rotation, boxes, use_boxes,
@@ -131,17 +131,19 @@ def _pull_spherical_f64(source, radii, rotation, boxes, use_boxes,
     return result
 
 
-_compiled_pull_spherical_f64 = None
-_dispatcher_unavailable_reason = 'Numba is unavailable'
-if _numba is not None:
+try:
+    _compiled_pull_spherical_f64 = _numba.njit(
+        cache=True, nogil=True, fastmath=False)(_pull_spherical_f64)
+except Exception:
+    # A read-only installation may lack a Numba cache locator. The compiled
+    # kernel is still required; only disk caching is optional.
     try:
         _compiled_pull_spherical_f64 = _numba.njit(
-            cache=True, nogil=True, fastmath=False)(_pull_spherical_f64)
+            cache=False, nogil=True, fastmath=False)(_pull_spherical_f64)
     except Exception as exc:
-        # Enabling Numba's disk cache can fail before compilation starts (for
-        # example an installed module without a cache locator). No input has
-        # been evaluated; preserve the optional-backend fallback boundary.
-        _dispatcher_unavailable_reason = f'Numba initialization failed: {type(exc).__name__}: {exc}'
+        raise SphericalCpuProjectionUnavailable(
+            f'Numba initialization failed: {type(exc).__name__}: {exc}'
+        ) from exc
 
 
 def _spherical_cpu_kernel_arguments(source, view, radii, rotation, output_shape, z, first, stop, bboxes):
@@ -171,11 +173,9 @@ def _spherical_cpu_kernel_arguments(source, view, radii, rotation, output_shape,
 def prepare_spherical_chunk_numba(source, view, radii, rotation, output_shape, bboxes=None):
     """Compile the precise buffer signature before any worker can publish output.
 
-    Buffer/metadata errors remain ordinary errors. Only optional availability or
-    compiler failures become a safe fallback signal; compilation samples no data.
+    Buffer/metadata errors remain ordinary errors. Compiler failures raise a
+    clear admission error; compilation samples no source data.
     """
-    if _compiled_pull_spherical_f64 is None:
-        raise SphericalCpuProjectionUnavailable(_dispatcher_unavailable_reason)
     arguments = _spherical_cpu_kernel_arguments(source, view, radii, rotation, output_shape, 0, 0, 0, bboxes)
     try:
         signature = tuple(_numba.typeof(value) for value in arguments)
@@ -193,8 +193,6 @@ def pull_spherical_chunk_numba(source, view, radii, rotation, output_shape, z, f
     dispatch. This helper additionally checks buffer types and strip bounds.
     Runtime numerical/data errors propagate and cannot silently select an oracle.
     """
-    if _compiled_pull_spherical_f64 is None:
-        raise SphericalCpuProjectionUnavailable(_dispatcher_unavailable_reason)
     arguments = _spherical_cpu_kernel_arguments(source, view, radii, rotation, output_shape, z, first, stop, bboxes)
     return _compiled_pull_spherical_f64(*arguments[:-1], bool(scalar_max))
 
@@ -202,8 +200,6 @@ def pull_spherical_chunk_numba(source, view, radii, rotation, output_shape, z, f
 def pull_spherical_rectangle_numba(source, view, radii, rotation, output_shape, z, first, stop,
                                   bboxes=None, *, bounds_yx, scalar_max=False):
     """Pull a flattened rectangle while retaining global output voxel centers."""
-    if _compiled_pull_spherical_f64 is None:
-        raise SphericalCpuProjectionUnavailable(_dispatcher_unavailable_reason)
     arguments = _spherical_cpu_kernel_arguments(source, view, radii, rotation, output_shape, z, 0, 0, bboxes)
     y0, y1, x0, x1 = map(int, bounds_yx)
     first, stop = int(first), int(stop)

@@ -60,6 +60,19 @@ def test_explicit_import_retirement_restores_the_predecessor_position(monkeypatc
     assert [value for _node, value in restored] == snapshot['previous_top_level']
 
 
+def test_retired_definition_may_retire_its_reviewed_local_import_seam(monkeypatch):
+    monkeypatch.setitem(prepare.REMOVED_DEFINITION_REASONS, ('sample', 'reference'),
+                        'Move the reference into tests.')
+    old = (f'def reference():\n    {inventory.LOCAL_IMPORT_SEAM_MARKER}\n'
+           '    from .topology import SparseSliceLabelStore\n'
+           '    return SparseSliceLabelStore\n')
+    _pin, snapshot, records = review(old, '')
+    assert [(item['module'], item['name']) for item in records['removed_definitions']] == [('sample', 'reference')]
+    payload = {**records, 'module_snapshots': [snapshot]}
+    assert [value for _node, value in inventory.rewind_reviewed_statements(
+        'sample', (), (payload,))] == snapshot['previous_top_level']
+
+
 def test_explicit_example_module_removal_keeps_the_exact_historical_snapshot():
     module = 'examples/external_reconciliation/baseline'
     source = '"""A retired example."""\ndef build_reconciliation():\n    return {"mode": "confidence"}\n'

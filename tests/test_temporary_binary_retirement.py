@@ -9,29 +9,36 @@ from unittest import mock
 import numpy as np
 import pytest
 
-from XTA import cuda_d1, finalization, runtime, topology
+from XTA import cuda_d1, finalization, runtime
 
 
 @pytest.mark.parametrize('keep_n', (1, 2))
 @pytest.mark.parametrize('keep_temp', (False, True))
-def test_keep_objects_retires_only_unkept_disk_labels_after_both_decision_paths(
+def test_keep_objects_uses_sparse_labels_after_both_decision_paths(
     tmp_path: Path, keep_n: int, keep_temp: bool,
 ) -> None:
     mask = np.zeros((2, 7, 7), dtype=np.uint8)
     mask[0, 1:3, 1:3] = 1
     mask[1, 4:6, 4:6] = 1
-    with mock.patch.object(topology, 'interpolation_sparse_labels_enabled', return_value=False):
-        stats = finalization.apply_keep_largest_objects_inplace(
-            mask, keep_n, tmp_path, keep_temp=keep_temp, prefer_memory=False, workers=1,
-        )
-    label_path = tmp_path / 'keep_objects' / 'final_keep_objects.fg_labels.u16.dat'
-    if keep_temp:
-        assert label_path.exists()
-    else:
-        runtime.wait_for_retired_memmap_unlinks(path=label_path)
-        assert not label_path.exists()
+    stats = finalization.apply_keep_largest_objects_inplace(
+        mask, keep_n, tmp_path, keep_temp=keep_temp, prefer_memory=False, workers=1,
+    )
+    assert not list((tmp_path / 'keep_objects').glob('final_keep_objects.fg_labels.*.dat'))
     assert stats['num_objects'] == 2
     assert int(mask.sum()) == (4 if keep_n == 1 else 8)
+
+
+def test_keep_objects_compiled_apply_failure_is_visible(tmp_path: Path) -> None:
+    mask = np.zeros((2, 7, 7), dtype=np.uint8)
+    mask[0, 1:3, 1:3] = 1
+    mask[1, 4:6, 4:6] = 1
+    with mock.patch.object(
+        finalization, '_numba_sparse_keep_lut_apply_kernel',
+        side_effect=RuntimeError('compiled apply failed'),
+    ), pytest.raises(RuntimeError, match='compiled apply failed'):
+        finalization.apply_keep_largest_objects_inplace(
+            mask, 1, tmp_path, prefer_memory=False, workers=1,
+        )
 
 
 @pytest.mark.parametrize('archive', (False, True))

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import math
-import os
 import contextlib
 import threading
 from types import SimpleNamespace
@@ -114,26 +113,24 @@ def _fixture(capacity, *, failure=None, empty=False):
 class CroppedUploadPipelineTests(unittest.TestCase):
     def test_exact_crops_empty_shells_and_split_rows_with_fixed_pinned_budget(self):
         for capacity in (1, 2, 3, 7, 37, 100, 101, 4096):
-            for enabled in ('0', '1'):
-                with self.subTest(capacity=capacity, enabled=enabled):
-                    p, transfer, source, expected = _fixture(capacity)
-                    pin, stage = p._upload_pin, p._upload_stage
-                    with mock.patch.object(cuda, '_pack_radial_source_block_compiled', transfer.pack), \
-                            mock.patch.dict(os.environ, {'YOLO_TTA_CROPPED_UPLOAD_PIPELINE': enabled}):
-                        p._upload_cropped_source(source)
-                    np.testing.assert_array_equal(transfer.device[:expected.size], expected)
-                    self.assertIs(p._upload_pin, pin)
-                    self.assertIs(p._upload_stage, stage)
-                    self.assertEqual(p.source_upload_stage_bytes, capacity)
-                    pipelined = enabled == '1' and capacity >= 2 and expected.size > capacity
-                    self.assertEqual(p.source_upload_pipeline, pipelined)
-                    self.assertEqual(p.source_upload_copy_count, math.ceil(expected.size / (capacity // 2 if pipelined else capacity)))
-                    self.assertEqual(p.source_upload_stream_fences, 1 if pipelined else p.source_upload_copy_count)
-                    self.assertEqual(p.source_upload_lane_waits, max(0, p.source_upload_copy_count - 2) if pipelined else 0)
-                    self.assertEqual(list(p._events), ['existing_kernel_event'])
-                    if pipelined:
-                        first_wait = next(i for i, event in enumerate(transfer.log) if event[0] == 'lane_wait')
-                        self.assertEqual(sum(event[0] == 'copy' for event in transfer.log[:first_wait]), 2)
+            with self.subTest(capacity=capacity):
+                p, transfer, source, expected = _fixture(capacity)
+                pin, stage = p._upload_pin, p._upload_stage
+                with mock.patch.object(cuda, '_pack_radial_source_block_compiled', transfer.pack):
+                    p._upload_cropped_source(source)
+                np.testing.assert_array_equal(transfer.device[:expected.size], expected)
+                self.assertIs(p._upload_pin, pin)
+                self.assertIs(p._upload_stage, stage)
+                self.assertEqual(p.source_upload_stage_bytes, capacity)
+                pipelined = capacity >= 2 and expected.size > capacity
+                self.assertEqual(p.source_upload_pipeline, pipelined)
+                self.assertEqual(p.source_upload_copy_count, math.ceil(expected.size / (capacity // 2 if pipelined else capacity)))
+                self.assertEqual(p.source_upload_stream_fences, 1 if pipelined else p.source_upload_copy_count)
+                self.assertEqual(p.source_upload_lane_waits, max(0, p.source_upload_copy_count - 2) if pipelined else 0)
+                self.assertEqual(list(p._events), ['existing_kernel_event'])
+                if pipelined:
+                    first_wait = next(i for i, event in enumerate(transfer.log) if event[0] == 'lane_wait')
+                    self.assertEqual(sum(event[0] == 'copy' for event in transfer.log[:first_wait]), 2)
 
     def test_failures_keep_event_pinned_and_device_owners_for_constructor_cleanup(self):
         for failure in ('pack', 'enqueue', 'event_record', 'event_wait', 'stream'):
@@ -141,7 +138,6 @@ class CroppedUploadPipelineTests(unittest.TestCase):
             pin, stage = p._upload_pin, p._upload_stage
             with self.subTest(failure=failure), \
                     mock.patch.object(cuda, '_pack_radial_source_block_compiled', transfer.pack), \
-                    mock.patch.dict(os.environ, {'YOLO_TTA_CROPPED_UPLOAD_PIPELINE': '1'}), \
                     self.assertRaises(RuntimeError):
                 p._upload_cropped_source(source)
             self.assertIs(p._upload_pin, pin)
@@ -153,7 +149,6 @@ class CroppedUploadPipelineTests(unittest.TestCase):
     def test_missing_event_fence_negative_control_overwrites_pending_dma(self):
         p, transfer, source, _ = _fixture(7, failure='unsafe_event_wait')
         with mock.patch.object(cuda, '_pack_radial_source_block_compiled', transfer.pack), \
-                mock.patch.dict(os.environ, {'YOLO_TTA_CROPPED_UPLOAD_PIPELINE': '1'}), \
                 self.assertRaisesRegex(AssertionError, 'overwritten before its DMA'):
             p._upload_cropped_source(source)
 
@@ -170,8 +165,7 @@ class CroppedUploadPipelineTests(unittest.TestCase):
         expected = np.concatenate([expanded[z, y0:y1, x0:x1].ravel()
                                    for z, (y0, y1, x0, x1) in enumerate(boxes)])
         p.source_h2d_bytes = expected.size
-        with mock.patch.object(cuda, '_pack_radial_source_block_compiled', transfer.pack), \
-                mock.patch.dict(os.environ, {'YOLO_TTA_CROPPED_UPLOAD_PIPELINE': '1'}):
+        with mock.patch.object(cuda, '_pack_radial_source_block_compiled', transfer.pack):
             p._upload_cropped_source(expanded)
         np.testing.assert_array_equal(transfer.device, expected)
 
@@ -179,8 +173,7 @@ class CroppedUploadPipelineTests(unittest.TestCase):
         for failure in ('event_create', 'event_second_create'):
             p, transfer, source, expected = _fixture(7, failure=failure)
             with self.subTest(failure=failure), \
-                    mock.patch.object(cuda, '_pack_radial_source_block_compiled', transfer.pack), \
-                    mock.patch.dict(os.environ, {'YOLO_TTA_CROPPED_UPLOAD_PIPELINE': '1'}):
+                    mock.patch.object(cuda, '_pack_radial_source_block_compiled', transfer.pack):
                 p._upload_cropped_source(source)
             self.assertFalse(p.source_upload_pipeline)
             self.assertEqual(p.source_upload_copy_count, math.ceil(expected.size / 7))
@@ -194,8 +187,7 @@ class CroppedUploadPipelineTests(unittest.TestCase):
             p._lock, p._closed, p.device_index = threading.RLock(), False, 0
             p._cp.cuda.Device = lambda _: contextlib.nullcontext()
             with self.subTest(projector=cls.__name__), \
-                    mock.patch.object(cuda, '_pack_radial_source_block_compiled', transfer.pack), \
-                    mock.patch.dict(os.environ, {'YOLO_TTA_CROPPED_UPLOAD_PIPELINE': '1'}):
+                    mock.patch.object(cuda, '_pack_radial_source_block_compiled', transfer.pack):
                 with self.assertRaisesRegex(RuntimeError, 'failed stream fence'):
                     p._upload_cropped_source(source)
                 owners = (p._upload_pin, p._upload_stage, p._source_gpu, dict(p._events))
@@ -208,14 +200,13 @@ class CroppedUploadPipelineTests(unittest.TestCase):
                 self.assertIs(p._source_gpu, owners[2])
                 self.assertEqual(p._events, owners[3])
 
-    def test_optional_packer_fallback_and_empty_payload_preserve_existing_routes(self):
-        for packer in (None, mock.Mock(side_effect=RuntimeError('compiler unavailable'))):
-            p, transfer, source, expected = _fixture(7)
-            with mock.patch.object(cuda, '_pack_radial_source_block_compiled', packer):
+    def test_packer_failure_stops_before_upload_and_empty_payload_needs_no_copy(self):
+        p, transfer, source, _ = _fixture(7)
+        with mock.patch.object(cuda, '_pack_radial_source_block_compiled', side_effect=RuntimeError('compiler unavailable')):
+            with self.assertRaisesRegex(RuntimeError, 'compiler unavailable'):
                 p._upload_cropped_source(source)
-            self.assertFalse(p.source_upload_pipeline)
-            self.assertEqual(p.source_pack_backend, 'numpy')
-            np.testing.assert_array_equal(transfer.device, expected)
+        self.assertEqual(transfer.jobs, [])
+        self.assertIs(p._source_gpu.storage, transfer.device)
         p, transfer, source, expected = _fixture(7, empty=True)
         with mock.patch.object(cuda, '_pack_radial_source_block_compiled', transfer.pack):
             p._upload_cropped_source(source)

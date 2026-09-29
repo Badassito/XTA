@@ -15,6 +15,7 @@ import numpy as np
 
 from XTA.backprojection import SinkOnlyProjectionResult
 from XTA import spherical_projection as sp
+from tests.reference_backends import spherical as oracle
 from XTA.qsc import QSC_FACE_BASES
 from XTA.spherical_geometry import build_spherical_view_infos, cube_rotation
 
@@ -151,7 +152,7 @@ class SphericalProjectionTests(unittest.TestCase):
         np.testing.assert_array_equal(union, expected)
 
     def test_radius_midpoints_choose_inner_and_endpoints_are_closed(self):
-        np.testing.assert_array_equal(sp._nearest_global_shell(np.array([.5, 1., 1.5, 2., 2.5, 3.]),
+        np.testing.assert_array_equal(oracle.nearest_global_shell(np.array([.5, 1., 1.5, 2., 2.5, 3.]),
                                                                np.array([.5, 1.5, 2.5, 3.])),
                                       [0, 0, 1, 1, 2, 3])
         view = shells(shape=(7, 7, 7), size=11, minimum=.5)[0]
@@ -180,17 +181,18 @@ class SphericalProjectionTests(unittest.TestCase):
         data = np.ones((view.num_slices, 15, 15), np.uint8)
         expected = self.project(data, view)
         sizes = []
-        original = sp._pull_spherical_chunk
+        radii = np.asarray(view.spherical_radii)
+        rotation = np.asarray(view.spherical_rotation_xyz).reshape(3, 3)
+        original = sp._select_spherical_cpu_pull(data, view, radii, rotation, (7, 9, 11), None)
 
         def pull(*args, **kwargs):
             sizes.append(args[7] - args[6])
             return original(*args, **kwargs)
 
         with mock.patch.object(sp, '_PULL_CHUNK_VOXELS', 3), \
-                mock.patch.object(sp, 'spherical_cpu_compiled_requested', return_value=False), \
                 mock.patch.object(sp, '_OUTPUT_BLOCK_BYTES', 99), \
                 mock.patch.object(sp, '_cpu_count', return_value=3), \
-                mock.patch.object(sp, '_pull_spherical_chunk', side_effect=pull), \
+                mock.patch.object(sp, '_select_spherical_cpu_pull', return_value=pull), \
                 mock.patch.object(sp, 'allocate_workspace_array', side_effect=AssertionError('sink allocated dense output')):
             actual = self.project(data, view, workers=3)
         np.testing.assert_array_equal(actual, expected)

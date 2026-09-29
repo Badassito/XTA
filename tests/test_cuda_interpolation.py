@@ -22,6 +22,20 @@ from XTA.cuda_interpolation import (
 )
 
 
+def _local_label_fixture(labels: np.ndarray):
+    counts = np.max(labels, axis=(1, 2)).astype(np.uint32)
+    offsets = np.zeros(len(counts), dtype=np.int64)
+    if len(counts) > 1:
+        offsets[1:] = np.cumsum(counts.astype(np.int64) + 1)[:-1]
+    flat = np.concatenate([np.arange(int(count) + 1, dtype=np.uint32) for count in counts])
+
+    def _label(*_args: object, component_stats_out: dict[str, object], **_kwargs: object):
+        component_stats_out['slice_local_luts'] = topology.SliceLocalLabelLUTs(flat, offsets, counts)
+        return labels, 2, []
+
+    return _label
+
+
 class _NumpyNdimage:
     """Small CPU implementation of the CuPyX primitives used by unit fixtures."""
 
@@ -1122,9 +1136,6 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
             'YOLO_TTA_GPU_INTERPOLATION': '1',
             'YOLO_TTA_GPU_INTERPOLATION_REQUIRED': '1' if required else '0',
             'YOLO_TTA_INTERPOLATION_CACHE_BRIDGE_SECTIONS': '1',
-            # CUDA routing tests should not depend on an optional Numba installation
-            # or pay a first-call JIT cost inside the CPU side of the autotune probe.
-            'YOLO_TTA_INTERPOLATION_COMPILED_KERNELS': '0',
         }
         if radius_enabled is not None:
             env['YOLO_TTA_GPU_INTERPOLATION_RADIUS'] = (
@@ -1147,11 +1158,8 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
         self.addCleanup(temp_context.cleanup)
         with (
             mock.patch.object(
-                topology, 'interpolation_skip_compact_relabel_enabled', return_value=False,
-            ),
-            mock.patch.object(
                 topology, 'label_foreground_volume_streaming',
-                return_value=(labels, 2, []),
+                side_effect=_local_label_fixture(labels),
             ),
             mock.patch.object(
                 interpolation, '_build_slice_endpoint_seeds', return_value=(seeds, 1),

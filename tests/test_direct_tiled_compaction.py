@@ -15,31 +15,30 @@ class DirectTiledDispatchTests(unittest.TestCase):
     def test_layout_diagnostic_names_precise_guards_once_and_retains_no_tensors(self):
         torch_mod = SimpleNamespace(float16='float16', float32='float32')
         cases = (
-            ('float16', 'float16', (32, 5, 66), True, True, 'tiled_f16', 'eligible'),
-            ('float32', 'float32', (32, 5, 66), True, True, 'tiled_f32', 'eligible'),
-            ('float32', 'float16', (32, 5, 66), True, True, 'scalar', 'head_proto_dtypes_not_matching_float16_or_float32'),
-            ('float16', 'float32', (32, 5, 66), True, True, 'scalar', 'head_proto_dtypes_not_matching_float16_or_float32'),
-            ('float16', 'float16', (16, 5, 66), True, True, 'scalar', 'prototype_channels_not_32'),
-            ('float16', 'float16', (32, 5, 65), True, True, 'scalar', 'prototype_width_not_even'),
-            ('float32', 'float32', (32, 5, 65), True, True, 'scalar', 'prototype_width_not_even'),
-            ('float16', 'float16', (32, 5, 66), False, True, 'scalar', 'tiled_option_disabled'),
-            ('float16', 'float16', (32, 5, 66), True, False, 'scalar', 'tiled_disabled_after_workspace_failure'),
-            ('float16', 'float16', (32, 5, 66), True, True, 'scalar_workspace_fallback', 'tiled_workspace_allocation_failed'),
+            ('float16', 'float16', (32, 5, 66), True, 'tiled_f16', 'eligible'),
+            ('float32', 'float32', (32, 5, 66), True, 'tiled_f32', 'eligible'),
+            ('float32', 'float16', (32, 5, 66), True, 'scalar', 'head_proto_dtypes_not_matching_float16_or_float32'),
+            ('float16', 'float32', (32, 5, 66), True, 'scalar', 'head_proto_dtypes_not_matching_float16_or_float32'),
+            ('float16', 'float16', (16, 5, 66), True, 'scalar', 'prototype_channels_not_32'),
+            ('float16', 'float16', (32, 5, 65), True, 'scalar', 'prototype_width_not_even'),
+            ('float32', 'float32', (32, 5, 65), True, 'scalar', 'prototype_width_not_even'),
+            ('float16', 'float16', (32, 5, 66), False, 'scalar', 'tiled_disabled_after_workspace_failure'),
+            ('float16', 'float16', (32, 5, 66), True, 'scalar_workspace_fallback', 'tiled_workspace_allocation_failed'),
         )
         with mock.patch.object(inference, '_DIRECT_COMPACTION_LAYOUTS', set()):
-            for hd, pd, shape, enabled, allowed, kernel, reason in cases:
+            for hd, pd, shape, allowed, kernel, reason in cases:
                 output = io.StringIO()
                 head = SimpleNamespace(shape=(5 + shape[0], 257), dtype=hd)
                 proto = SimpleNamespace(shape=shape, dtype=pd)
                 with self.subTest(reason=reason), redirect_stdout(output):
                     for _ in range(3):
                         inference._announce_direct_compaction_layout(torch_mod, head, proto,
-                            enabled=enabled, allow_tiled=allowed, kernel_name=kernel)
+                            allow_tiled=allowed, kernel_name=kernel)
                 lines = output.getvalue().splitlines()
                 self.assertEqual(len(lines), 1)
                 self.assertIn(f'head_shape={head.shape}, head_dtype={hd}', lines[0])
                 self.assertIn(f'proto_shape={shape}, proto_dtype={pd}', lines[0])
-                self.assertIn(f'tiled_option={enabled}, selected={kernel}, reason={reason}', lines[0])
+                self.assertIn(f'selected={kernel}, reason={reason}', lines[0])
             self.assertEqual(len(inference._DIRECT_COMPACTION_LAYOUTS), len(cases))
             self.assertTrue(all(isinstance(key[1], str) and isinstance(key[3], str)
                                 for key in inference._DIRECT_COMPACTION_LAYOUTS))
@@ -51,25 +50,23 @@ class DirectTiledDispatchTests(unittest.TestCase):
                 inference._announce_direct_compaction_layout(SimpleNamespace(float16='float16'),
                     SimpleNamespace(shape=(37, anchors), dtype='float16'),
                     SimpleNamespace(shape=(32, 3, 4), dtype='float16'),
-                    enabled=True, allow_tiled=True, kernel_name='tiled_f16')
+                    allow_tiled=True, kernel_name='tiled_f16')
             self.assertEqual(len(inference._DIRECT_COMPACTION_LAYOUTS), 64)
         self.assertEqual(len(output.getvalue().splitlines()), 64)
 
     def test_layout_selection_owner_retention_and_bounded_allocation_fallback(self):
         import torch
-        for dtype, channels, width, enabled, oom, expected in (
-            (torch.float16, 32, 66, True, False, 'tiled_f16'),
-            (torch.float16, 32, 65, True, False, 'scalar'),
-            (torch.float16, 16, 66, True, False, 'scalar'),
-            (torch.float32, 32, 66, True, False, 'tiled_f32'),
-            (torch.float32, 32, 65, True, False, 'scalar'),
-            (torch.float32, 16, 66, True, False, 'scalar'),
-            (torch.float16, 32, 66, False, False, 'scalar'),
-            (torch.float32, 32, 66, False, False, 'scalar'),
-            (torch.float16, 32, 66, True, True, 'scalar_workspace_fallback'),
-            (torch.float32, 32, 66, True, True, 'scalar_workspace_fallback'),
+        for dtype, channels, width, oom, expected in (
+            (torch.float16, 32, 66, False, 'tiled_f16'),
+            (torch.float16, 32, 65, False, 'scalar'),
+            (torch.float16, 16, 66, False, 'scalar'),
+            (torch.float32, 32, 66, False, 'tiled_f32'),
+            (torch.float32, 32, 65, False, 'scalar'),
+            (torch.float32, 16, 66, False, 'scalar'),
+            (torch.float16, 32, 66, True, 'scalar_workspace_fallback'),
+            (torch.float32, 32, 66, True, 'scalar_workspace_fallback'),
         ):
-            with self.subTest(dtype=dtype, channels=channels, width=width, enabled=enabled, oom=oom):
+            with self.subTest(dtype=dtype, channels=channels, width=width, oom=oom):
                 head = torch.zeros((5 + channels, 5), dtype=dtype)
                 head[4] = .75
                 proto = torch.ones((channels, 5, width), dtype=dtype)
@@ -90,7 +87,6 @@ class DirectTiledDispatchTests(unittest.TestCase):
                     return original_empty(shape, **kwargs)
 
                 with ExitStack() as stack:
-                    stack.enter_context(mock.patch.dict(os.environ, {'YOLO_TTA_DIRECT_TILED_PROTO_UNION': str(int(enabled))}))
                     stack.enter_context(mock.patch.object(inference, '_resident_mask_kernels', return_value=kernels))
                     stack.enter_context(mock.patch.object(inference, '_cupy_external_stream', return_value=None))
                     stack.enter_context(mock.patch.object(inference, 'gpu_flatten_conf_tracking_enabled', return_value=False))
@@ -183,10 +179,9 @@ class DirectTiledCudaParityTests(unittest.TestCase):
         image = torch.empty((1, 1, *image_shape), device='cuda', dtype=head.dtype)
         payloads = []
         for enabled in (False, True):
-            with mock.patch.dict(os.environ, {'YOLO_TTA_DIRECT_TILED_PROTO_UNION': str(int(enabled))}), \
-                    mock.patch.object(inference, 'gpu_flatten_conf_tracking_enabled', return_value=want_conf), \
+            with mock.patch.object(inference, 'gpu_flatten_conf_tracking_enabled', return_value=want_conf), \
                     mock.patch.object(inference, 'angle_variant_gpu_fastpath', return_value=None):
-                payload = inference._build_direct_device_compacted_payload(head, proto, image, .5)
+                payload = inference._build_direct_device_compacted_payload(head, proto, image, .5, allow_tiled=enabled)
             self.assertIsNotNone(payload)
             payloads.append(payload)
         torch.cuda.synchronize()

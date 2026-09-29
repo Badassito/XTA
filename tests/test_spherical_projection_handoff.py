@@ -27,7 +27,7 @@ class SphericalProjectionHandoffTests(unittest.TestCase):
         cancelled = threading.Event()
         cancelled.set()
         with (mock.patch.object(sp.np, 'empty', side_effect=AssertionError('allocated')),
-              mock.patch.object(sp, '_pull_spherical_chunk', side_effect=AssertionError('read'))):
+              mock.patch.object(sp, '_select_spherical_cpu_pull', side_effect=AssertionError('prepared'))):
             with self.assertRaises(CancelledError):
                 sp._project_spherical_block(self.source, self.view, self.radii,
                     self.rotation, self.shape, 0, 1, cancel_event=cancelled)
@@ -35,7 +35,9 @@ class SphericalProjectionHandoffTests(unittest.TestCase):
     def test_prefetch_stops_before_second_chunk_and_joins_on_promotion_or_sink_error(self):
         expected = sp._project_spherical_block(self.source, self.view, self.radii,
             self.rotation, self.shape, 0, self.shape[0])
-        original_block, original_pull = sp._project_spherical_block, sp._pull_spherical_chunk
+        original_block = sp._project_spherical_block
+        original_pull = sp._select_spherical_cpu_pull(
+            self.source, self.view, self.radii, self.rotation, self.shape, None)
         for fail_sink in (False, True):
             with self.subTest(fail_sink=fail_sink):
                 lock = threading.Lock()
@@ -96,7 +98,7 @@ class SphericalProjectionHandoffTests(unittest.TestCase):
                     stack.enter_context(mock.patch.object(sp, '_PULL_CHUNK_VOXELS', 11))
                     stack.enter_context(mock.patch.object(sp, '_CUDA_RECHECK_SLICES', 1))
                     stack.enter_context(mock.patch.object(sp, '_project_spherical_block', side_effect=block))
-                    stack.enter_context(mock.patch.object(sp, '_pull_spherical_chunk', side_effect=pull))
+                    stack.enter_context(mock.patch.object(sp, '_select_spherical_cpu_pull', return_value=pull))
                     if fail_sink:
                         with self.assertRaises(ValueError) as caught:
                             sp.backproject_spherical_volume_to_volume(self.source, self.view,

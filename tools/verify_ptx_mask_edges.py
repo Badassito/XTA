@@ -94,11 +94,11 @@ def main():
                     image = torch.empty((1, 1, ih, iw), device='cuda', dtype=dtype)
                     payloads = []
                     for enabled in (False, True):
-                        with (mock.patch.dict(os.environ, {'YOLO_TTA_DIRECT_DEVICE_COMPACTION': '1',
-                                                          'YOLO_TTA_DIRECT_TILED_PROTO_UNION': str(int(enabled))}),
+                        with (mock.patch.dict(os.environ, {'YOLO_TTA_DIRECT_DEVICE_COMPACTION': '1'}),
                               mock.patch.object(inference, 'gpu_flatten_conf_tracking_enabled', return_value=True),
                               mock.patch.object(inference, 'angle_variant_gpu_fastpath', return_value=None)):
-                            payload = inference._build_direct_device_compacted_payload(head, proto, image, .5)
+                            payload = inference._build_direct_device_compacted_payload(head, proto, image, .5,
+                                                                                       allow_tiled=enabled)
                         if payload is None:
                             raise RuntimeError(f'Direct payload returned None, tiled={enabled}')
                         payloads.append(payload)

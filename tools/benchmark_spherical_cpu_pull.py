@@ -25,8 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 from scipy import ndimage
 
-from XTA import spherical_projection as reference
 from XTA import spherical_projection_cpu as candidate
+from tests.reference_backends.spherical import pull_spherical_chunk as reference_pull_spherical_chunk
 from XTA.spherical_geometry import build_spherical_view_infos, cube_rotation
 from XTA.spherical_projection_bounds import spherical_output_bounds
 
@@ -84,7 +84,7 @@ def main():
             if face >= 3:
                 boxes = np.zeros((view.num_slices, 4), np.int64)
                 boxes[len(boxes) // 5:4 * len(boxes) // 5] = (1, size - 1, 2, size - 2)
-            calls = {'numpy': reference._pull_spherical_chunk, 'numba_f64': candidate.pull_spherical_chunk_numba}
+            calls = {'numpy': reference_pull_spherical_chunk, 'numba_f64': candidate.pull_spherical_chunk_numba}
             outputs, timings = {}, {'numpy': [], 'numba_f64': []}
             for repeat in range(args.repeats):
                 for name in (('numpy', 'numba_f64') if repeat % 2 == 0 else ('numba_f64', 'numpy')):

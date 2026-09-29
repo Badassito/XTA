@@ -58,7 +58,6 @@ from .interpolation import (
     SliceComponentRecord,
     SliceEndpointSeed,
     _component_centroid_anchor,
-    compiled_topology_kernels_enabled,
 )
 
 
@@ -70,39 +69,33 @@ if TYPE_CHECKING:
         _try_acquire_specific_main_process_gpu_stage,
     )
 
-if _numba is not None:
-    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-    def _numba_union_find_batch_kernel(
-        parent: np.ndarray,   # int64, mutated in place
-        rank: np.ndarray,     # int32, mutated in place
-        touches: np.ndarray,  # bool, mutated in place
-        a_ids: np.ndarray,    # int64
-        b_ids: np.ndarray,    # int64
-    ) -> None:
-        # Identical algorithm to _UnionFind.find/union (path halving + union by rank), applied
-        # to a whole batch of pairs in one nogil call.
-        for i in range(a_ids.shape[0]):
-            ra = a_ids[i]
-            while parent[ra] != ra:
-                parent[ra] = parent[parent[ra]]
-                ra = parent[ra]
-            rb = b_ids[i]
-            while parent[rb] != rb:
-                parent[rb] = parent[parent[rb]]
-                rb = parent[rb]
-            if ra == rb:
-                continue
-            if rank[ra] < rank[rb]:
-                ra, rb = rb, ra
-            parent[rb] = ra
-            if touches[rb]:
-                touches[ra] = True
-            if rank[ra] == rank[rb]:
-                rank[ra] += 1
-else:
-    _numba_union_find_batch_kernel = None
-
-_NUMBA_UNION_FIND_KERNEL_RUNTIME_DISABLED = False
+@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+def _numba_union_find_batch_kernel(
+    parent: np.ndarray,   # int64, mutated in place
+    rank: np.ndarray,     # int32, mutated in place
+    touches: np.ndarray,  # bool, mutated in place
+    a_ids: np.ndarray,    # int64
+    b_ids: np.ndarray,    # int64
+) -> None:
+    # Path halving and union by rank, applied to a whole batch in one nogil call.
+    for i in range(a_ids.shape[0]):
+        ra = a_ids[i]
+        while parent[ra] != ra:
+            parent[ra] = parent[parent[ra]]
+            ra = parent[ra]
+        rb = b_ids[i]
+        while parent[rb] != rb:
+            parent[rb] = parent[parent[rb]]
+            rb = parent[rb]
+        if ra == rb:
+            continue
+        if rank[ra] < rank[rb]:
+            ra, rb = rb, ra
+        parent[rb] = ra
+        if touches[rb]:
+            touches[ra] = True
+        if rank[ra] == rank[rb]:
+            rank[ra] += 1
 
 class _UnionFind:
     """Array-backed disjoint-set structure with batched pair merges and path compression."""
@@ -148,45 +141,26 @@ class _UnionFind:
             x = parent[x]
         return int(x)
 
-    def union(self, a: int, b: int) -> int:
-        ra = self.find(int(a))
-        rb = self.find(int(b))
-        if ra == rb:
-            return ra
-
-        if self.rank[ra] < self.rank[rb]:
-            ra, rb = rb, ra
-
-        self.parent[rb] = ra
-        self.touches_boundary[ra] = bool(self.touches_boundary[ra] or self.touches_boundary[rb])
-        if self.rank[ra] == self.rank[rb]:
-            self.rank[ra] += 1
-        return int(ra)
-
     def union_pair_codes(self, codes: np.ndarray) -> None:
-        """Merge a batch of uint64 pair codes ((a << 32) | b) in one call."""
-        global _NUMBA_UNION_FIND_KERNEL_RUNTIME_DISABLED
+        """Merge encoded pairs with the required compiled kernel.
+
+        A kernel may have changed parent links before raising. Do not replay a
+        partially applied batch through a second implementation.
+        """
         codes_arr = np.asarray(codes, dtype=np.uint64)
         if codes_arr.size <= 0:
             return
         a_ids = (codes_arr >> np.uint64(32)).astype(np.int64, copy=False)
         b_ids = (codes_arr & np.uint64(0xFFFFFFFF)).astype(np.int64, copy=False)
-        if (
-            _numba_union_find_batch_kernel is not None
-            and compiled_topology_kernels_enabled()
-            and not _NUMBA_UNION_FIND_KERNEL_RUNTIME_DISABLED
-        ):
-            try:
-                _numba_union_find_batch_kernel(
-                    self.parent, self.rank, self.touches_boundary,
-                    np.ascontiguousarray(a_ids), np.ascontiguousarray(b_ids),
-                )
-                return
-            except Exception as exc:
-                _NUMBA_UNION_FIND_KERNEL_RUNTIME_DISABLED = True
-                print(f'Warning: numba union-find batch kernel failed ({exc}); using the python loop.')
-        for i in range(int(a_ids.shape[0])):
-            self.union(int(a_ids[i]), int(b_ids[i]))
+        if _numba_union_find_batch_kernel is None:  # pragma: no cover - mandatory Numba import
+            raise RuntimeError('Compiled topology union-find kernel is unavailable')
+        try:
+            _numba_union_find_batch_kernel(
+                self.parent, self.rank, self.touches_boundary,
+                np.ascontiguousarray(a_ids), np.ascontiguousarray(b_ids),
+            )
+        except Exception as exc:
+            raise RuntimeError('Compiled topology union-find failed; batch state is partial') from exc
 
     def mark_boundary(self, x: int) -> None:
         self.touches_boundary[self.find(int(x))] = True
@@ -286,128 +260,120 @@ def _adjacent_gid_pair_codes_numpy(
 
 _ADJACENCY_INITIAL_CAPACITY = 1024
 _ADJACENCY_MAX_CAPACITY = 262144
-_NUMBA_ADJACENCY_RUNTIME_DISABLED = False
 
-if _numba is not None:
-    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-    def _numba_adjacency_hash_slot(code, mask):
-        value = code
-        value = (value ^ (value >> np.uint64(30))) * np.uint64(0xbf58476d1ce4e5b9)
-        value = (value ^ (value >> np.uint64(27))) * np.uint64(0x94d049bb133111eb)
-        value = value ^ (value >> np.uint64(31))
-        return np.int64(value & np.uint64(mask))
+@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+def _numba_adjacency_hash_slot(code, mask):
+    value = code
+    value = (value ^ (value >> np.uint64(30))) * np.uint64(0xbf58476d1ce4e5b9)
+    value = (value ^ (value >> np.uint64(27))) * np.uint64(0x94d049bb133111eb)
+    value = value ^ (value >> np.uint64(31))
+    return np.int64(value & np.uint64(mask))
 
-    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-    def _numba_adjacency_scan_kernel(
-        prev, curr, offsets, prev_offset, curr_offset,
-        table, used, position, neighbor, last_code,
-    ):
-        height, width = prev.shape
-        total = height * width
-        capacity_mask = len(table) - 1
-        threshold = len(table) // 2
-        y, x = position // width, position % width
-        while y < height:
-            while x < width:
-                value = prev[y, x]
-                if value > 0:
-                    left = np.uint64(value) + prev_offset
-                    while neighbor < len(offsets):
-                        dy, dx = offsets[neighbor, 0], offsets[neighbor, 1]
-                        cy, cx = y + dy, x + dx
-                        neighbor += 1
-                        if cy < 0 or cy >= height or cx < 0 or cx >= width:
-                            continue
-                        other = curr[cy, cx]
-                        if other <= 0:
-                            continue
-                        code = (left << np.uint64(32)) | (np.uint64(other) + curr_offset)
-                        if code == last_code:
-                            continue
-                        last_code = code
-                        slot = _numba_adjacency_hash_slot(code, capacity_mask)
-                        while table[slot] != 0 and table[slot] != code:
-                            slot = (slot + 1) & capacity_mask
-                        if table[slot] == code:
-                            continue
-                        table[slot] = code
-                        used += 1
-                        if used >= threshold:
-                            return used, y * width + x, neighbor, last_code
-                x += 1
-                neighbor = 0
-            y += 1
-            x = 0
-        return used, total, 0, last_code
+@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+def _numba_adjacency_scan_kernel(
+    prev, curr, offsets, prev_offset, curr_offset,
+    table, used, position, neighbor, last_code,
+):
+    height, width = prev.shape
+    total = height * width
+    capacity_mask = len(table) - 1
+    threshold = len(table) // 2
+    y, x = position // width, position % width
+    while y < height:
+        while x < width:
+            value = prev[y, x]
+            if value > 0:
+                left = np.uint64(value) + prev_offset
+                while neighbor < len(offsets):
+                    dy, dx = offsets[neighbor, 0], offsets[neighbor, 1]
+                    cy, cx = y + dy, x + dx
+                    neighbor += 1
+                    if cy < 0 or cy >= height or cx < 0 or cx >= width:
+                        continue
+                    other = curr[cy, cx]
+                    if other <= 0:
+                        continue
+                    code = (left << np.uint64(32)) | (np.uint64(other) + curr_offset)
+                    if code == last_code:
+                        continue
+                    last_code = code
+                    slot = _numba_adjacency_hash_slot(code, capacity_mask)
+                    while table[slot] != 0 and table[slot] != code:
+                        slot = (slot + 1) & capacity_mask
+                    if table[slot] == code:
+                        continue
+                    table[slot] = code
+                    used += 1
+                    if used >= threshold:
+                        return used, y * width + x, neighbor, last_code
+            x += 1
+            neighbor = 0
+        y += 1
+        x = 0
+    return used, total, 0, last_code
 
-    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-    def _numba_adjacency_rehash_kernel(source, destination):
-        mask = len(destination) - 1
-        for code in source:
-            if code == 0:
-                continue
-            slot = _numba_adjacency_hash_slot(code, mask)
-            while destination[slot] != 0:
-                slot = (slot + 1) & mask
-            destination[slot] = code
+@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+def _numba_adjacency_rehash_kernel(source, destination):
+    mask = len(destination) - 1
+    for code in source:
+        if code == 0:
+            continue
+        slot = _numba_adjacency_hash_slot(code, mask)
+        while destination[slot] != 0:
+            slot = (slot + 1) & mask
+        destination[slot] = code
 
-    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-    def _numba_adjacency_extract_kernel(table, count):
-        result = np.empty(count, dtype=np.uint64)
-        index = 0
-        for code in table:
-            if code != 0:
-                result[index] = code
-                index += 1
-        return result
+@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+def _numba_adjacency_extract_kernel(table, count):
+    result = np.empty(count, dtype=np.uint64)
+    index = 0
+    for code in table:
+        if code != 0:
+            result[index] = code
+            index += 1
+    return result
 
-    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-    def _numba_merge_sorted_pair_codes_kernel(a, b):
-        """Merge sorted unique batches, allocating exactly their union cardinality."""
-        if len(a) == 0:
-            return b
-        if len(b) == 0:
-            return a
-        i, j, count = 0, 0, 0
-        while i < len(a) and j < len(b):
-            if a[i] < b[j]:
-                i += 1
-            elif a[i] > b[j]:
-                j += 1
-            else:
-                i += 1
-                j += 1
-            count += 1
-        count += len(a) - i + len(b) - j
-        result = np.empty(count, dtype=np.uint64)
-        i, j, at = 0, 0, 0
-        while i < len(a) and j < len(b):
-            if a[i] < b[j]:
-                result[at] = a[i]
-                i += 1
-            elif a[i] > b[j]:
-                result[at] = b[j]
-                j += 1
-            else:
-                result[at] = a[i]
-                i += 1
-                j += 1
-            at += 1
-        while i < len(a):
+@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+def _numba_merge_sorted_pair_codes_kernel(a, b):
+    """Merge sorted unique batches, allocating exactly their union cardinality."""
+    if len(a) == 0:
+        return b
+    if len(b) == 0:
+        return a
+    i, j, count = 0, 0, 0
+    while i < len(a) and j < len(b):
+        if a[i] < b[j]:
+            i += 1
+        elif a[i] > b[j]:
+            j += 1
+        else:
+            i += 1
+            j += 1
+        count += 1
+    count += len(a) - i + len(b) - j
+    result = np.empty(count, dtype=np.uint64)
+    i, j, at = 0, 0, 0
+    while i < len(a) and j < len(b):
+        if a[i] < b[j]:
             result[at] = a[i]
             i += 1
-            at += 1
-        while j < len(b):
+        elif a[i] > b[j]:
             result[at] = b[j]
             j += 1
-            at += 1
-        return result
-else:
-    _numba_adjacency_hash_slot = None
-    _numba_adjacency_scan_kernel = None
-    _numba_adjacency_rehash_kernel = None
-    _numba_adjacency_extract_kernel = None
-    _numba_merge_sorted_pair_codes_kernel = None
+        else:
+            result[at] = a[i]
+            i += 1
+            j += 1
+        at += 1
+    while i < len(a):
+        result[at] = a[i]
+        i += 1
+        at += 1
+    while j < len(b):
+        result[at] = b[j]
+        j += 1
+        at += 1
+    return result
 
 
 def _normalized_adjacency_offsets(
@@ -471,7 +437,7 @@ def _compiled_adjacent_gid_pair_codes(
     offsets = _normalized_adjacency_offsets(xy_offsets, prev_gid.shape)
     if not prev_gid.size or not len(offsets):
         return np.empty(0, dtype=np.uint64)
-    if prev_gid.size >= 262144 and _env_flag('YOLO_TTA_TOPOLOGY_RUN_ADJACENCY', True):
+    if prev_gid.size >= 262144:
         run_codes = run_adjacent_pair_codes(prev_gid, curr_gid, offsets, prev_offset, curr_offset)
         if run_codes is not None:
             return run_codes
@@ -518,30 +484,22 @@ def _adjacent_gid_pair_codes(
     """Return sorted unique touching pairs, previous gid high/current gid low.
 
     The normal local-label types use one compiled scan and bounded deduplication.
-    Unsupported types and unavailable/disabled Numba retain the NumPy reference.
-    Inputs are read-only, so a compilation/execution failure can safely retry.
+    Legacy numeric layouts retain NumPy extraction for compatibility. A failure in
+    the compiled path is reported rather than silently selecting a slower bulk path.
     """
-    global _NUMBA_ADJACENCY_RUNTIME_DISABLED
-    if (
-        _numba_adjacency_scan_kernel is not None
-        and compiled_topology_kernels_enabled()
-        and not _NUMBA_ADJACENCY_RUNTIME_DISABLED
-        and _compiled_adjacency_inputs_supported(prev_gid, curr_gid, prev_offset, curr_offset)
-    ):
-        # Preserve iterable offsets if a native failure requires NumPy replay.
-        xy_offsets = None if xy_offsets is None else tuple(xy_offsets)
-        try:
-            return _compiled_adjacent_gid_pair_codes(
-                prev_gid, curr_gid, xy_offsets, prev_offset, curr_offset,
-            )
-        except Exception as exc:
-            if not _NUMBA_ADJACENCY_RUNTIME_DISABLED:
-                _NUMBA_ADJACENCY_RUNTIME_DISABLED = True
-                runtime_telemetry().fallback('topology.adjacency.compiled', exc)
-                print(f'Warning: compiled adjacency failed ({exc}); using NumPy pair extraction.')
-    return _adjacent_gid_pair_codes_numpy(
-        prev_gid, curr_gid, xy_offsets, prev_offset, curr_offset,
-    )
+    if not _compiled_adjacency_inputs_supported(prev_gid, curr_gid, prev_offset, curr_offset):
+        return _adjacent_gid_pair_codes_numpy(
+            prev_gid, curr_gid, xy_offsets, prev_offset, curr_offset,
+        )
+    if _numba_adjacency_scan_kernel is None:  # pragma: no cover - mandatory Numba import
+        raise RuntimeError('Compiled topology adjacency kernel is unavailable')
+    try:
+        return _compiled_adjacent_gid_pair_codes(
+            prev_gid, curr_gid, xy_offsets, prev_offset, curr_offset,
+        )
+    except Exception as exc:
+        runtime_telemetry().fallback('topology.adjacency.compiled', exc)
+        raise RuntimeError('Compiled topology adjacency failed') from exc
 
 def _mark_boundary_components_from_local_labels(
     uf: _UnionFind,
@@ -650,67 +608,62 @@ def fill_3d_voids_inplace_streaming(
         except Exception:
             pass
 
-if _numba is not None:
-    @_numba.njit(cache=True, nogil=True, parallel=True)  # type: ignore[misc]
-    def _numba_compact_relabel_kernel(labels, lut_flat, lut_offsets, bboxes, counts):  # pragma: no cover - jit
-        z_dim = labels.shape[0]
-        for z in _numba.prange(z_dim):
-            if counts[z] == 0:
-                continue
-            off = lut_offsets[z]
-            y0 = bboxes[z, 0]
-            y1 = bboxes[z, 1]
-            x0 = bboxes[z, 2]
-            x1 = bboxes[z, 3]
-            for y in range(y0, y1):
-                row = labels[z, y]
-                for x in range(x0, x1):
-                    v = row[x]
-                    if v != 0:
-                        row[x] = lut_flat[off + v]
+@_numba.njit(cache=True, nogil=True, parallel=True)  # type: ignore[misc]
+def _numba_compact_relabel_kernel(labels, lut_flat, lut_offsets, bboxes, counts):  # pragma: no cover - jit
+    z_dim = labels.shape[0]
+    for z in _numba.prange(z_dim):
+        if counts[z] == 0:
+            continue
+        off = lut_offsets[z]
+        y0 = bboxes[z, 0]
+        y1 = bboxes[z, 1]
+        x0 = bboxes[z, 2]
+        x1 = bboxes[z, 3]
+        for y in range(y0, y1):
+            row = labels[z, y]
+            for x in range(x0, x1):
+                v = row[x]
+                if v != 0:
+                    row[x] = lut_flat[off + v]
 
-    @_numba.njit(cache=True, nogil=True, parallel=True)  # type: ignore[misc]
-    def _numba_keep_lut_apply_kernel(labels, keep_flat, lut_offsets, bboxes, apply_slice, mask_out):  # pragma: no cover - jit
-        z_dim = labels.shape[0]
-        for z in _numba.prange(z_dim):
-            if apply_slice[z] == 0:
-                continue
-            off = lut_offsets[z]
-            y0 = bboxes[z, 0]
-            y1 = bboxes[z, 1]
-            x0 = bboxes[z, 2]
-            x1 = bboxes[z, 3]
-            for y in range(y0, y1):
-                lrow = labels[z, y]
-                mrow = mask_out[z, y]
-                for x in range(x0, x1):
-                    mrow[x] = keep_flat[off + lrow[x]]
+@_numba.njit(cache=True, nogil=True, parallel=True)  # type: ignore[misc]
+def _numba_keep_lut_apply_kernel(labels, keep_flat, lut_offsets, bboxes, apply_slice, mask_out):  # pragma: no cover - jit
+    z_dim = labels.shape[0]
+    for z in _numba.prange(z_dim):
+        if apply_slice[z] == 0:
+            continue
+        off = lut_offsets[z]
+        y0 = bboxes[z, 0]
+        y1 = bboxes[z, 1]
+        x0 = bboxes[z, 2]
+        x1 = bboxes[z, 3]
+        for y in range(y0, y1):
+            lrow = labels[z, y]
+            mrow = mask_out[z, y]
+            for x in range(x0, x1):
+                mrow[x] = keep_flat[off + lrow[x]]
 
-    @_numba.njit(cache=True, nogil=True, parallel=True)  # type: ignore[misc]
-    def _numba_sparse_keep_lut_apply_kernel(  # pragma: no cover - jit
-        labels_flat, label_offsets, keep_flat, lut_offsets, bboxes, apply_slice, mask_out,
-    ):
-        """Keep-largest apply directly from the packed per-slice label arena."""
-        z_dim = apply_slice.shape[0]
-        for z in _numba.prange(z_dim):
-            if apply_slice[z] == 0:
-                continue
-            keep_off = lut_offsets[z]
-            label_off = label_offsets[z]
-            y0 = bboxes[z, 0]
-            y1 = bboxes[z, 1]
-            x0 = bboxes[z, 2]
-            x1 = bboxes[z, 3]
-            crop_w = x1 - x0
-            for y in range(y0, y1):
-                row_off = label_off + (y - y0) * crop_w
-                mrow = mask_out[z, y]
-                for x in range(x0, x1):
-                    mrow[x] = keep_flat[keep_off + labels_flat[row_off + x - x0]]
-else:
-    _numba_compact_relabel_kernel = None
-    _numba_keep_lut_apply_kernel = None
-    _numba_sparse_keep_lut_apply_kernel = None
+@_numba.njit(cache=True, nogil=True, parallel=True)  # type: ignore[misc]
+def _numba_sparse_keep_lut_apply_kernel(  # pragma: no cover - jit
+    labels_flat, label_offsets, keep_flat, lut_offsets, bboxes, apply_slice, mask_out,
+):
+    """Keep-largest apply directly from the packed per-slice label arena."""
+    z_dim = apply_slice.shape[0]
+    for z in _numba.prange(z_dim):
+        if apply_slice[z] == 0:
+            continue
+        keep_off = lut_offsets[z]
+        label_off = label_offsets[z]
+        y0 = bboxes[z, 0]
+        y1 = bboxes[z, 1]
+        x0 = bboxes[z, 2]
+        x1 = bboxes[z, 3]
+        crop_w = x1 - x0
+        for y in range(y0, y1):
+            row_off = label_off + (y - y0) * crop_w
+            mrow = mask_out[z, y]
+            for x in range(x0, x1):
+                mrow[x] = keep_flat[keep_off + labels_flat[row_off + x - x0]]
 
 @dataclass(frozen=True)
 class SliceLocalLabelLUTs:
@@ -729,15 +682,6 @@ class SliceLocalLabelLUTs:
     def lut_for(self, z: int) -> np.ndarray:
         lo = int(self.lut_offsets[int(z)])
         return self.lut_flat[lo:lo + int(self.component_counts[int(z)]) + 1]
-
-def interpolation_sparse_labels_enabled() -> bool:
-    """Retain only each slice's local-label bbox crop.
-
- The dense uint16 local-id raster was 22.7--37.1 GiB for the prioritized
- views even though every consumer already knew the per-slice foreground
- bbox. Sparse labels are default-on whenever compact relabel is skipped;
- YOLO_TTA_INTERPOLATION_SPARSE_LABELS=0 restores the dense store."""
-    return _env_flag('YOLO_TTA_INTERPOLATION_SPARSE_LABELS', True)
 
 class SparseSliceLabelStore:
     """Sparse slice-local label storage with one bbox crop per nonempty slice.
@@ -938,15 +882,6 @@ class SparseSliceLabelStore:
         if copy:
             dense = dense.copy()
         return dense
-
-def interpolation_skip_compact_relabel_enabled() -> bool:
-    """Interpolation consumes per-slice local ids through LUTs by default.
-
- The compact relabel was a full read+write pass over the label store whose only product
- was canonical ids in the raster; component tables and
- the candidate kernels now canonicalize at read time. Set
- YOLO_TTA_INTERPOLATION_SKIP_COMPACT_RELABEL=0 to restore the relabel pass."""
-    return _env_flag('YOLO_TTA_INTERPOLATION_SKIP_COMPACT_RELABEL', True)
 
 def interpolation_local_label_uint16_enabled() -> bool:
     """Use uint16 for stores that contain only slice-local ids.
@@ -1192,9 +1127,6 @@ def topology_slab_workers(requested_workers: int, slab_count: int) -> int:
         max(1, int(slab_count)),
     )
     resolved = max(1, _env_int('YOLO_TTA_TOPOLOGY_SLAB_WORKERS', int(default_workers)))
-    if _numba_union_find_batch_kernel is None or not compiled_topology_kernels_enabled():
-        # Python union-find is GIL-bound; several slab threads would only add memory pressure.
-        return 1
     return max(1, min(int(resolved), max(1, int(slab_count))))
 
 def _round_robin_topology_gpu_blocks(
@@ -1892,11 +1824,7 @@ def label_foreground_volume_streaming(
     )
     label_paths: List[Path] = []
 
-    sparse_enabled = bool(
-        sparse_local_labels
-        and not bool(compact_relabel)
-        and interpolation_sparse_labels_enabled()
-    )
+    sparse_enabled = bool(sparse_local_labels and not bool(compact_relabel))
     if bool(sparse_local_labels) and bool(compact_relabel):
         raise ValueError('sparse_local_labels requires compact_relabel=False')
 
@@ -1927,10 +1855,6 @@ def label_foreground_volume_streaming(
     worker_count = choose_slice_parallel_workers(int(workers), int(z_dim))
     label_workers = choose_slice_parallel_workers(
         _env_int('YOLO_TTA_INTERPOLATION_LABEL_WORKERS', worker_count),
-        int(z_dim),
-    )
-    compact_workers = choose_slice_parallel_workers(
-        _env_int('YOLO_TTA_INTERPOLATION_COMPACT_WORKERS', worker_count),
         int(z_dim),
     )
     pair_workers = choose_slice_parallel_workers(
@@ -2180,7 +2104,7 @@ def label_foreground_volume_streaming(
         '3D topology local-union plan (v16.1.3): '
         f'{len(slab_ranges)} slab(s) x {int(topology_slab_slices())} slices, '
         f'{int(slab_worker_count)} concurrent worker(s), '
-        f'compiled_nogil={bool(_numba_union_find_batch_kernel is not None and compiled_topology_kernels_enabled())}.'
+        'compiled_nogil=True.'
     )
     runtime_telemetry().gauge('pipeline.phase', '3d_topology_local_union')
     runtime_telemetry().gauge('topology.slab_workers', int(slab_worker_count))
@@ -2495,59 +2419,19 @@ def label_foreground_volume_streaming(
         # full-volume relabel write pass entirely.
         return labels_store, int(unique_roots.size), label_paths
 
-    kernel_done = False
-    if compiled_topology_kernels_enabled() and _numba_compact_relabel_kernel is not None:
-        try:
-            print('3D topology: compact relabel via numba nogil kernel')
-            _numba_compact_relabel_kernel(
-                np.asarray(labels_store),
-                lut_flat,
-                lut_offsets,
-                np.ascontiguousarray(slice_bboxes),
-                component_counts,
-            )
-            kernel_done = True
-        except Exception as exc:
-            print(f'3D topology: numba compact relabel unavailable ({exc}); using the thread pool.')
-
-    if not kernel_done:
-        compact_tasks: List[Tuple[int, int, int, int, int]] = []
-        row_block = max(1, _env_int('YOLO_TTA_INTERPOLATION_COMPACT_RELABEL_ROWS', 256))
-        for z in range(int(z_dim)):
-            if int(component_counts[int(z)]) <= 0:
-                continue
-            by0, by1, bx0, bx1 = (int(v) for v in slice_bboxes[int(z)])
-            for y0 in range(by0, by1, int(row_block)):
-                compact_tasks.append((int(z), int(y0), int(min(by1, y0 + int(row_block))), bx0, bx1))
-
-        def _compact_block(task_idx: int) -> int:
-            z, y0, y1, x0, x1 = compact_tasks[int(task_idx)]
-            lo = int(lut_offsets[int(z)])
-            local_to_compact = lut_flat[lo:lo + int(component_counts[int(z)]) + 1]
-            block = np.asarray(labels_store[int(z), int(y0):int(y1), int(x0):int(x1)])
-            if np.any(block):
-                labels_store[int(z), int(y0):int(y1), int(x0):int(x1)] = local_to_compact[block]
-            # an all-zero block is already zero in the store; the old
-            # else-branch fill(0) rewrote it needlessly (dirtying pages on memmap-backed stores).
-            return int(y1) - int(y0)
-
-        if compact_tasks:
-            pending = max(compact_workers, compact_workers * 8)
-            if compact_workers <= 1:
-                for task_idx in tqdm(range(len(compact_tasks)), desc='3D topology: compact relabel'):
-                    _compact_block(int(task_idx))
-            else:
-                for _rows_done in tqdm(
-                    parallel_map_unordered(
-                        _compact_block,
-                        range(len(compact_tasks)),
-                        max_workers=compact_workers,
-                        max_pending=pending,
-                    ),
-                    total=len(compact_tasks),
-                    desc='3D topology: compact relabel',
-                ):
-                    pass
+    if _numba_compact_relabel_kernel is None:  # pragma: no cover - mandatory Numba import
+        raise RuntimeError('Compiled topology compact relabel kernel is unavailable')
+    print('3D topology: compact relabel via numba nogil kernel')
+    try:
+        _numba_compact_relabel_kernel(
+            np.asarray(labels_store),
+            lut_flat,
+            lut_offsets,
+            np.ascontiguousarray(slice_bboxes),
+            component_counts,
+        )
+    except Exception as exc:
+        raise RuntimeError('Compiled topology compact relabel failed') from exc
 
     return labels_store, int(unique_roots.size), label_paths
 

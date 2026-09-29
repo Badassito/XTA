@@ -15,6 +15,8 @@ from unittest import mock
 
 import numpy as np
 
+from tests.reference_backends.radial import pull_radial_chunk
+
 from XTA import cuda_d1, cylindrical_owner as owner_module
 from XTA.cylindrical_bitset_compaction import RadialBitsetCompactionUnavailable
 from XTA.cylindrical_cuda_projection import (
@@ -304,7 +306,7 @@ class RadialOwnerGpuExportFunctionalTests(unittest.TestCase):
                     cleaned[:, 2:6, 2:6] = 1
                     radii = np.asarray(geometry.radial_global_radii(view))
                     expected = np.stack([
-                        reference._pull_radial_chunk(cleaned, view, radii, shape,
+                        pull_radial_chunk(cleaned, view, radii, shape,
                                                      z, 0, shape[1] * shape[2]).reshape(shape[1:])
                         for z in range(shape[0])])
                 self.assertTrue(np.array_equal(actual, expected))

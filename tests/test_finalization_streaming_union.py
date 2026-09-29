@@ -124,14 +124,8 @@ class StreamingFinalUnionTests(unittest.TestCase):
                 del mm
                 refs.append(_raw_ref(path, source_shape, key))
 
-            with (
-                mock.patch.object(
-                    finalization, '_resize_union_plane_to_out_xy', side_effect=_resize,
-                ),
-                mock.patch.object(
-                    finalization, 'fused_final_restore_geometry_groups_enabled',
-                    return_value=True,
-                ),
+            with mock.patch.object(
+                finalization, '_resize_union_plane_to_out_xy', side_effect=_resize,
             ):
                 finalization._union_projected_layer_refs_grouped_into_volume(
                     refs,

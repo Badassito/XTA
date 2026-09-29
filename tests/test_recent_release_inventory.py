@@ -61,6 +61,11 @@ RELEASES = (
             inventory.REVIEWED_V23_0_3_RELEASE_PREDECESSOR_SHA256,
             inventory.REVIEWED_V23_0_2_RELEASE_SHA256,
             inventory.REVIEWED_V23_0_3_RELEASE_PREDECESSOR_COMMIT),
+    Release('v23_0_4_release_review', '23.0.4', inventory.reviewed_v23_0_4_release_contract,
+            inventory.reviewed_v23_0_3_release_contract,
+            inventory.REVIEWED_V23_0_4_RELEASE_PREDECESSOR_SHA256,
+            inventory.REVIEWED_V23_0_3_RELEASE_SHA256,
+            inventory.REVIEWED_V23_0_4_RELEASE_PREDECESSOR_COMMIT),
 )
 
 
@@ -134,6 +139,7 @@ def test_reauthenticated_review_cannot_change_independent_source_pin(complete_ma
         '23.0.1': 'REVIEWED_V23_RELEASE_SHA256',
         '23.0.2': 'REVIEWED_V23_0_2_RELEASE_SHA256',
         '23.0.3': 'REVIEWED_V23_0_3_RELEASE_SHA256',
+        '23.0.4': 'REVIEWED_V23_0_4_RELEASE_SHA256',
     }[release.number]
     with mock.patch.object(inventory, digest_name, _digest(review)):
         with pytest.raises(RuntimeError, match='source predecessor changed'):
@@ -253,6 +259,7 @@ def test_semantic_release_identifies_new_model_and_qualification_tools(complete_
 ])
 def test_retired_geometry_helper_keeps_authenticated_predecessor(complete_manifest, mutation, message):
     altered = copy.deepcopy(complete_manifest)
+    altered.pop('v23_0_4_release_review', None)
     altered.pop('v23_0_3_release_review', None)
     review = altered['v23_0_2_release_review']
     retired = review['removed_definitions']
@@ -267,3 +274,21 @@ def test_retired_geometry_helper_keeps_authenticated_predecessor(complete_manife
     with mock.patch.object(inventory, 'REVIEWED_V23_0_2_RELEASE_SHA256', _digest(review)):
         with pytest.raises(RuntimeError, match=message):
             inventory.reviewed_v23_0_2_release_contract(altered, altered['v21_review'])
+
+
+def test_cleanup_retirements_require_independent_scope_and_exact_predecessor(complete_manifest):
+    altered = copy.deepcopy(complete_manifest)
+    review = altered['v23_0_4_release_review']
+    retired = review['removed_definitions'][0]
+    retired['previous_index'] += 1
+    with mock.patch.object(inventory, 'REVIEWED_V23_0_4_RELEASE_SHA256', _digest(review)):
+        with pytest.raises(RuntimeError, match='reviewed removal scope differs'):
+            inventory.reviewed_v23_0_4_release_contract(altered, altered['v21_review'])
+
+        pinned = dict(inventory.REVIEWED_V23_0_4_RELEASE_REMOVALS)
+        pinned['definitions'] = tuple(sorted(
+            (item['module'], item['name'], item['previous_index'], item['previous_sha256'])
+            for item in review['removed_definitions']))
+        with mock.patch.object(inventory, 'REVIEWED_V23_0_4_RELEASE_REMOVALS', pinned):
+            with pytest.raises(RuntimeError, match='retired predecessor changed'):
+                inventory.reviewed_v23_0_4_release_contract(altered, altered['v21_review'])

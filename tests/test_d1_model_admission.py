@@ -76,7 +76,6 @@ class LegacyD1ModelAdmissionTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(inference, '_ensure_predictor_for_direct_predict', return_value=object()))
             stack.enter_context(mock.patch.object(inference, '_direct_predict_stream', return_value=results))
             stack.enter_context(mock.patch.object(inference, '_try_create_device_union_accumulator', return_value=accumulator))
-            stack.enter_context(mock.patch.object(inference, 'gpu_retina_flatten_enabled', return_value=False))
             stack.enter_context(mock.patch.object(backprojection, '_try_resident_trt_ring_accumulate', return_value=ring_stats))
             stack.enter_context(mock.patch('builtins.print'))
             stats = inference.predict_source_and_accumulate(

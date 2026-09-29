@@ -308,8 +308,7 @@ class NativeRingCudaPostTests(unittest.TestCase):
         )
         dtypes = ((torch.float32, torch.float32), (torch.float16, torch.float16),
                   (torch.float32, torch.float16), (torch.float16, torch.float32))
-        with mock.patch.dict(os.environ, {'YOLO_TTA_DIRECT_TILED_PROTO_UNION': '1'}), \
-                mock.patch.object(inference, 'gpu_flatten_conf_tracking_enabled', return_value=True):
+        with mock.patch.object(inference, 'gpu_flatten_conf_tracking_enabled', return_value=True):
             for head_dtype, proto_dtype in dtypes:
                 for retained in (0, 1, 17):
                     for matrix, out_size, native_shape in matrices:

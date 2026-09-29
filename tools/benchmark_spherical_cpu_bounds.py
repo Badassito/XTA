@@ -1,4 +1,4 @@
-"""Bounded CPU-only A/B: analytic Z/Y scheduling against the full pull oracle.
+"""Bounded CPU-only A/B: analytic Z/Y scheduling against the full compiled pull.
 
 Uses a small processing mask and sampled output slabs, never a full native
 canvas. Timings are isolated synthetic CPU evidence, not end-to-end speedups.
@@ -103,7 +103,7 @@ def main():
     report = {'working_shape': args.working_shape, 'output_shape': shape,
         'patch_size': args.patch_size, 'sampled_z_starts': starts, 'slab_depth': args.slab_depth,
         'repeats': args.repeats, 'projection_sha256': hashlib.sha256(Path(sp.__file__).read_bytes()).hexdigest(),
-        'limits': 'CPU-only synthetic sampled slabs; reduced processing masks; no inference, GPU, or end-to-end timing.',
+        'limits': 'CPU-only synthetic sampled slabs using the required compiled pull in both modes; reduced processing masks; no inference, GPU, or end-to-end timing.',
         'cases': rows, 'total_full_seconds': sum(r['median_full_seconds'] for r in rows),
         'total_bounded_seconds': sum(r['median_bounded_seconds'] for r in rows)}
     report['aggregate_speedup'] = report['total_full_seconds'] / report['total_bounded_seconds']

@@ -20,7 +20,7 @@ from scipy import ndimage as ndi
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from XTA import spherical_projection as sp
+from tests.reference_backends.spherical import project_spherical_block
 from XTA.spherical_geometry import build_spherical_view_infos, cube_rotation
 from tools.benchmark_spherical_sampling import kernels, render, directions_for
 from tools.geometry_quality_metrics import compare_binary_masks, phantom_labels
@@ -85,7 +85,7 @@ def main():
                     frames = np.stack(images[mode])
                     for threshold in masks[mode]:
                         categorical = (frames >= threshold).astype(np.uint8)
-                        masks[mode][threshold] |= sp._project_spherical_block(categorical, view,
+                        masks[mode][threshold] |= project_spherical_block(categorical, view,
                             np.asarray(view.spherical_radii), np.asarray(view.spherical_rotation_xyz).reshape(3, 3),
                             native, 0, native[0])
             assert len(set(count.values())) == 1

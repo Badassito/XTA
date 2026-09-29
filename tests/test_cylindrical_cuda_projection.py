@@ -13,6 +13,8 @@ from unittest import mock
 
 import numpy as np
 
+from tests.reference_backends.radial import pull_radial_chunk
+
 from XTA import cylindrical_projection as reference
 from XTA import cylindrical_cuda_projection as cuda
 from XTA.cylindrical_geometry import build_radial_view_infos
@@ -43,7 +45,7 @@ def contract(source, view, shape):
 
 def numpy_oracle(source, view, shape):
     radii = np.asarray(radial_global_radii(view), dtype=np.float64)
-    return np.stack([reference._pull_radial_chunk(source, view, radii, shape, z, 0,
+    return np.stack([pull_radial_chunk(source, view, radii, shape, z, 0,
         shape[1] * shape[2]).reshape(shape[1:]) for z in range(shape[0])])
 
 
@@ -254,19 +256,16 @@ class RadialCudaProjectionParityTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'closed or failed'):
                 projector.project_encoded(0, 5)
 
-    def test_cropped_upload_without_optional_packer_or_with_compilation_failure(self):
+    def test_cropped_upload_compilation_failure_surfaces_before_projection(self):
         source, view = case(shape=(9, 11, 13), size=16)
         source[:] = 0
         source[:, 1:6, 3:12] = 255
         shape = (7, 10, 12)
         plan, metadata, boxes = contract(source, view, shape)
-        expected = numpy_oracle(source, view, shape)
-        for packer in (None, mock.Mock(side_effect=RuntimeError('optional compiler unavailable'))):
-            with mock.patch.object(cuda, '_pack_radial_source_block_compiled', packer), \
-                    cuda.RadialCudaProjector(source, plan, metadata, view, shape,
-                                             boxes, True, 0, reserve_bytes=0) as projector:
-                self.assertEqual(projector.source_pack_backend, 'numpy')
-                np.testing.assert_array_equal(projector.project(0, shape[0]), expected)
+        with mock.patch.object(cuda, '_pack_radial_source_block_compiled', side_effect=RuntimeError('compiler failed')):
+            with self.assertRaisesRegex(cuda.RadialCudaProjectionUnavailable, 'compiler failed'):
+                cuda.RadialCudaProjector(source, plan, metadata, view, shape,
+                                         boxes, True, 0, reserve_bytes=0)
 
     def test_cropped_input_public_dispatch_through_real_raw_and_packed_stores(self):
         from XTA.interpolation import (IncrementalRawBBoxMaskStoreWriter, RawBBoxMaskStore,
