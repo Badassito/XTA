@@ -158,7 +158,7 @@ def run_case(source, output, args, *, fast_geometry=None):
     env['SLURM_CPUS_PER_TASK'] = str(args.workers)
     if fast_geometry is not None:
         env['YOLO_TTA_FAST_GEOMETRY'] = str(int(fast_geometry))
-        for name in ('YOLO_TTA_GPU_SPHERICAL_FP32', 'YOLO_TTA_CPU_SPHERICAL_COMPILED',
+        for name in ('YOLO_TTA_GPU_SPHERICAL_FP32',
                      'YOLO_TTA_GPU_RADIAL_COLUMN_GEOMETRY'):
             env.pop(name, None)
     write_json(output / 'invocation.json', {'source': str(source), 'argv': command,

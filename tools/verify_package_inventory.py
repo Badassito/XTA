@@ -114,6 +114,252 @@ REVIEWED_V23_0_2_RELEASE_SHA256 = '24a312d8f0555c5f75451a1390dcb5c7b004058acd470
 REVIEWED_V23_0_3_RELEASE_PREDECESSOR_COMMIT = 'c6179386aea458943a8b9dbcf8ae5c1e36b6fddf'
 REVIEWED_V23_0_3_RELEASE_PREDECESSOR_SHA256 = '482787e907250a75abf679dff9461809f2460452259fbd214d5c373ba86b0b5a'
 REVIEWED_V23_0_3_RELEASE_SHA256 = 'c9c492ebdd92cc7f54ac78fdf28bd3a867afc30f7f5fe74721a80d9ac822b3b6'
+REVIEWED_V23_0_4_RELEASE_PREDECESSOR_COMMIT = '90965158292c78c8e6d58c77746196e939ee5a6b'
+REVIEWED_V23_0_4_RELEASE_PREDECESSOR_SHA256 = '69351dee05f954fba0506a341bffe97661d33f4e8b70606a7ce2ad6a710ae4d7'
+REVIEWED_V23_0_4_RELEASE_SHA256 = 'd116b314d54fe2ed12d3f2fd102fbc2c3cd3dd74f8c8c648214336ec609d3741'
+REVIEWED_V23_0_4_RELEASE_PREDECESSOR_MODULES = {'__init__': {'ast_sha256': '06cab8fb84fe1b0d128e79914bf7b85d06e19e1d7ea60632cabb45d61b803372',
+              'statements_sha256': 'a846fd38a2701ec3b095f34b403e143b74e695dec8c579b2379a58db2fd71e56'},
+ '_deps': {'ast_sha256': '5c5900b0274d8b4a1f0ded960929b803257beba5454dcc1b56bcdbede73c35c6',
+           'statements_sha256': '5c6613c70a88ac8a3b53c4f0067ba2c601f9f7ab47519f757d65c392aa95690b'},
+ 'assembly': {'ast_sha256': '0392f93447fd38679e3e16ac57c8f293a8e122bda29e0c2d468a67f11b9a84e6',
+              'statements_sha256': 'f9737ca61f41fa20bf50250869796b0028a73bbce0c0566666c9d5dd03c32adb'},
+ 'backprojection': {'ast_sha256': 'cbcd4a58738517cc9b930d0765c3ba75559567a20bebe8c5ee1170e56cc0eff7',
+                    'statements_sha256': '16882f59002fbe658795090416b3d9f1da4d9e6803e988a612b0c4d4ba95a04a'},
+ 'confidence_projection': {'ast_sha256': '98e2e80ba8bfa16bc6e97267431c385a64ce95680e94fd9025700d0eef660f48',
+                           'statements_sha256': '6561014e470fc3a0dc457b76edf7644398625bb1bae3206d8450fdb702e91957'},
+ 'cuda_backend': {'ast_sha256': 'aec2784b69a34847f20b789db0dc11ce634342551d9433b8d4e480ccdb16cef4',
+                  'statements_sha256': 'a59755f5fb269802608c40e777d0e18dd1fc7b00ca9c89e12ca5d7aca9fe0dd2'},
+ 'cuda_d1': {'ast_sha256': 'b56504a72ca3c41096ace5d12de47d851b6af27f5357ac7edf721b86248edc33',
+             'statements_sha256': '0376a2ebc7b96d2e66cd4417568a50e7155bcc9efb1f3242c163fe9dff72ad6e'},
+ 'cylindrical_cuda_projection': {'ast_sha256': 'a5597beacdf389905439c01b34b6669be355ae941d9d251ca6898183938b5400',
+                                 'statements_sha256': '26308c39a0a8f8ee1ea5b11c0f85d29b8579cc79b31572d0e145877f31671ed4'},
+ 'cylindrical_owner': {'ast_sha256': '79fa61afed2d3d35c49a0422f1b03e279101363ebd7b7a5e3ee920163c9e2f7b',
+                       'statements_sha256': '4b87cc23a414c9a98b5d96c1470941a9dcb60c3358a0860840d1169187589c8c'},
+ 'cylindrical_projection': {'ast_sha256': '7fd8b8c3a616d9fa51af6bcd17071c10d97f5905097c700d28cfab791070d19c',
+                            'statements_sha256': '4275b80811594c587edfd50ccfdbd27e96941fcb88ae79890aeebece1516834a'},
+ 'finalization': {'ast_sha256': '4748b913d6dcc1f220be7fd407cb86f0cc6684a11c98af103bbe01df447add6d',
+                  'statements_sha256': 'f91143b4b7eb8d448a8092488c9f62cc06aab6ed543dae888ce59e4dc6e6590b'},
+ 'geometry': {'ast_sha256': 'cc7d6c1265a632e04990fcff9a28b56aaea4d9ecc49a5f84924038179c54436a',
+              'statements_sha256': '74ad545e755d1a9be58ce7398f4e88440644797502a75a54fc19ca241064c538'},
+ 'geometry_quality': {'ast_sha256': '323fa3284b32c45b638e7ca115f2d353a5e7c01d31f1b1d06e9eef6325d7575f',
+                      'statements_sha256': '26e55569a85a3cbec880545762273d834f8be1ea96b78cbc5de10366a3618b9c'},
+ 'inference': {'ast_sha256': '761aad88a7bb5213a2a9b0933bdfb9cb2a74ff868445223dbaa8905757530517',
+               'statements_sha256': 'b09a76c8c181f2f460716fe26191bbff31c7f41a5f85541bb8dbfc5063b4d9ca'},
+ 'interpolation': {'ast_sha256': '8eeee449aa93d8fb336329875fda4466cbbd8d3d35b08fc790568f0de0906a50',
+                   'statements_sha256': '8480559611f49f2991dc6e91afefe76b09e27a3e1baf502d13490ae41c683a47'},
+ 'outputs': {'ast_sha256': 'f3970fee1e63ad227eea9891be321e77001b76e4adbb7d06a6e66107c82e0f0d',
+             'statements_sha256': '0a5f4768153ed66c4525b543153fa6ec490a2f36dd8c4b8580d3d2e9530e422b'},
+ 'packed_publication': {'ast_sha256': '9b53ded3ae9b6d06c076a41afb97cce746fe2a241f4b7b9330e6b6254ffa78ec',
+                        'statements_sha256': 'b872c097c8c33b587ca1459d0c4e9062604bb974d626cf62369955049c5e073e'},
+ 'pipeline': {'ast_sha256': '2b1105a5955fbe455742036d95c81d1e530ed64f52170c59f36a0461bda2426f',
+              'statements_sha256': 'e4004808809d3f350716e555865acfdd35ec8cdff78bbfc72d87df1272c43661'},
+ 'publication_memory': {'ast_sha256': '411fb45ad28a9d0f9ab047d39a827ff76b83b4ca1f763ce5dcb02c8ec6392884',
+                        'statements_sha256': '5dda8872d8df4122423a08397fa39fab99deebccb2757077c0cf824ee4b9a1f9'},
+ 'runtime': {'ast_sha256': '99881ee0f79d307a9d78a99aa4ee23023efc67de1faad1bb0e27c43144c5ed83',
+             'statements_sha256': '740d0174f5cc63905efafddeb7302bd213cf525f37b417d3e356b400b834a83e'},
+ 'sparse_projection': {'ast_sha256': '293eea2cfbd358c4cd3e4abaa9b99011cd0dfb5722ebeb5f461a104b1132873a',
+                       'statements_sha256': 'b51bb9aa3e648b6a830aa5fc6971ada9fa672c5faaf7e32c0b952a4238fd8285'},
+ 'spherical_projection': {'ast_sha256': '4f495f4da5d8d3083406e06f62a4cfb5ecab87aa9472cfb2f9b7f8a0b8878578',
+                          'statements_sha256': '511900b81b66a0eaedb717f780b5c7dcabef20291d1d191576ebefefd7ecde9b'},
+ 'spherical_projection_cpu': {'ast_sha256': '816ff2baad8c9042d75d4a6048204d84bd982cafba58346d7d676e9dab6b53af',
+                              'statements_sha256': '45a49858efabcc2cf09bb19611c46499f1bc8c6155a6e219fc3b629526538a77'},
+ 'spherical_projection_cuda': {'ast_sha256': '6ebb3b9c6dae32bada80c4aed3c4a2987dd81387f7d4ef698f2a47f7fac578fd',
+                               'statements_sha256': '24ff7d8678ea9ffa75a648ff0f908273e04d08e4a860c817ef5431198df71df1'},
+ 'topology': {'ast_sha256': 'e78349c8f3def16f6ef44c66eff7cc61101a259203a6b5db7046e80a140af091',
+              'statements_sha256': 'f9fc3fe8107900dfae6cfceed07125c23da4e5daee5939c11b19e2223b39c81e'},
+ 'topology_runs': {'ast_sha256': '2f7d46e6ff4b04c272de76e05787ec20347395a7fc4e85ebb91740cb6757512a',
+                   'statements_sha256': 'e5155b5f6cebb7c722f6b6ffc1cdcd301eee990472cbe0cdc24a45524bb5e3ed'},
+ 'tta_scheduler': {'ast_sha256': '5080bfaf843d2aa3b900cfd49a9e904403f9607e51c1e164b30fba69de8e4ffa',
+                   'statements_sha256': '90eb153729e9de672cec3525f76867561c2f839e4651085bc09866e6fbefcd25'},
+ 'view_prepare': {'ast_sha256': '11d2f0b0cb8534dd480503f6c58f30d0da3770cdd51ee22251115c57276ef7ca',
+                  'statements_sha256': '8aabda96ce90c7f3ce4fb9392e223d81302a4ac3d80afd5e9e76b83376600abc'},
+ 'workers': {'ast_sha256': 'f82986774d22b50cef4d7b1effcfa0b8c806f56672b171f0c946ae8327517922',
+             'statements_sha256': '695d4126aaab9c770c216141d2a423a2dbab2c9a9fa5fef71a94c1664af08b0b'},
+ 'workspace': {'ast_sha256': 'b11e4b5d91b7fa3a009db6536e5a70e25cb5455ee67e59a22076cd2868ab0196',
+               'statements_sha256': 'ff8415543d6ce584190138ea0badc483c1301268216f07bc382fabe4c2d22c7b'}}
+REVIEWED_V23_0_4_RELEASE_REMOVALS = {'definitions': (('assembly',
+                  '_SparseComponentKernelUnavailable',
+                  34,
+                  'e111e9defedb96cc19e0b2a9cd9f25f682a031d955bd9399edfd3dc53e34499d'),
+                 ('assembly',
+                  '_run_sparse_component_kernel',
+                  35,
+                  '19d5deeabff143086177fdbc7647220589ee4b002077930ec8f67b1d887a11c5'),
+                 ('backprojection',
+                  'main_process_gpu_stage_inference_overlap_enabled',
+                  40,
+                  '9fc3219820cf9ac003eecdd9c28fafe224c7ec35241f6c7928d1ccf73b946648'),
+                 ('backprojection',
+                  'main_process_gpu_stage_inference_priority_enabled',
+                  41,
+                  'a2518d42f5309f20de5f63a51b447f64b0f9ef4d899bf6d92299db60feb2cb38'),
+                 ('cuda_backend',
+                  'gpu_cube_resize_enabled',
+                  32,
+                  '85f46a419041e64d6818c25686a69debb1ce42eab00f1f1a3537136e4dfe590a'),
+                 ('cuda_d1',
+                  'raw_bbox_nrrd_layers_enabled',
+                  92,
+                  'af5318ffedcf9a7cd04a720b8373f480308d43b379db96aecdae3b1b195c6dab'),
+                 ('cylindrical_owner',
+                  '_bucket_shell_pixels_numpy',
+                  27,
+                  'f247ed177d854a52dad612649a85d5ee3f19d81f427e8eb19b2acb9edb586f68'),
+                 ('cylindrical_projection',
+                  '_occurrence_rows',
+                  52,
+                  'a30e06657361bc2dfd8686b405ca0810177a9565bf6628833c3e95226f964ea8'),
+                 ('cylindrical_projection',
+                  '_pull_radial_chunk',
+                  53,
+                  '8a83c029f4e00029ac4e46a939aaeb414152751c474c14b6c009f0b9bef46892'),
+                 ('finalization',
+                  'fused_final_native_sparse_cpu_enabled',
+                  37,
+                  '1f75304eea8609f17205b3ace1c1c3245a5e4a8ca696230a4768ad24a6432af3'),
+                 ('finalization',
+                  'fused_final_restore_geometry_groups_enabled',
+                  33,
+                  '1261fab2d8c1e0300731b8e25acbee77e374c17c7b1f8be1dabe7894ce978bed'),
+                 ('finalization',
+                  'fused_final_view_union_enabled',
+                  32,
+                  '98dd60e362abd44a56e912ee5f31da3cb0a24bb79ab468cbf3cd28439fb57145'),
+                 ('finalization',
+                  'scheduler_push_drain_enabled',
+                  30,
+                  '327e1e86508b9bb4f4ca3163ea257b7a8fc2eb55e5828467c1638298c32683c4'),
+                 ('geometry_quality',
+                  'spherical_cpu_compiled_requested',
+                  9,
+                  'ed49d8dd0ff2a2fb68abaa0be6013938e1e475f0499aa3171b065b1578d23c45'),
+                 ('inference',
+                  'cpu_retina_roi_only_enabled',
+                  64,
+                  '4e614daa55c1bae2b42cba583b4ab987693eb3f63aaa91d3f1ca1fa894e9a61c'),
+                 ('inference',
+                  'gpu_retina_flatten_enabled',
+                  27,
+                  '0213ea156b70211d6a87ce12a391c0ca7ebf39aafa2b1fdffadfb6caa71965a2'),
+                 ('inference',
+                  'gpu_retina_proto_union_enabled',
+                  32,
+                  'f93aad94733968277b44cbde9834ecfd6a386273c3d2d059e765450e98376839'),
+                 ('inference',
+                  'gpu_retina_warp_enabled',
+                  28,
+                  '7942c5b620aae4ad140394d84de934a0c16dc018abcdd903c067c940719ac8eb'),
+                 ('inference',
+                  'gpu_worker_chunk_hole_fill_enabled',
+                  105,
+                  '681958a8a28246c1be2787bbc1df67b5c227cf48203c59c7e1ce3792e9259a6c'),
+                 ('interpolation',
+                  '_disable_planning_kernels',
+                  53,
+                  'a35ffa4c28d8f648336453bbfe85d21ba01d3e83554838cb3e14184bf3c731e8'),
+                 ('interpolation',
+                  '_find_slice_projection_candidates_python',
+                  59,
+                  '2964a4a06f74b43fbdca643ab9663fd3332fa8f854a2ae69f3fae162a7775dc0'),
+                 ('interpolation',
+                  '_planning_kernels_active',
+                  52,
+                  '7491461cd2145b63c672cd7ee691553615fa1a59a8055304c96d1c265f0f78ba'),
+                 ('interpolation',
+                  'compiled_interpolation_kernels_enabled',
+                  50,
+                  '30c0f53d9d39495eb1438937cbd78e328c70101fd45fa49959cda7f3969a16b0'),
+                 ('interpolation',
+                  'compiled_topology_kernels_enabled',
+                  49,
+                  '249f4dd61db7f15e380d00554d7a4d46704ea7fa3acc85300f4519649af159a7'),
+                 ('interpolation',
+                  'interpolation_fused_bridge_merge_enabled',
+                  63,
+                  '1f3e7f920b8f332e09fa274a4ede2f928206d787d0ca974c0c5a622def710fe9'),
+                 ('outputs',
+                  'nrrd_extent_zero_skip_enabled',
+                  190,
+                  '6faddf850a6ad2ef9b06ee2a8a278c6b6df64f914bf0dafbb991f3078c664e17'),
+                 ('outputs',
+                  'nrrd_live_global_layer_enabled',
+                  174,
+                  '4129c3a04054c438da6ad1a90ae1ef3bdb7370bddbfbb919c05c0f2a0b16ae76'),
+                 ('runtime',
+                  'gpu_worker_direct_union_enabled',
+                  88,
+                  '076e77d722c0fdd7511d09611ca93a4b83ee0fd02bd4992f45779fc8dffd21a7'),
+                 ('runtime',
+                  'hybrid_gpu_stealback_enabled',
+                  107,
+                  'ef59a415eec65371504f7c4539382839cf9f56149f8501c4dec974822214cb5b'),
+                 ('spherical_projection',
+                  '_nearest_global_shell',
+                  36,
+                  '1991691dadd4deed0d14403caa2f784348b0fa6a0376c8a564d803e864be9461'),
+                 ('spherical_projection',
+                  '_processing_index',
+                  37,
+                  '81a698cea7313e8069b2e4238c485379dcaf365490a402b12f3f22a169a70191'),
+                 ('spherical_projection',
+                  '_pull_spherical_chunk',
+                  38,
+                  '95a0a2ddfb7bfb44b73df1e9da283e7ae844d59a6c2c008af32ca4d1f195c38a'),
+                 ('spherical_projection',
+                  'spherical_cpu_compact_enabled',
+                  29,
+                  '4754d1b5eaa22c75e2e6225c781806dc8666172e3f71c240006f2dd25f4a607c'),
+                 ('topology',
+                  'interpolation_skip_compact_relabel_enabled',
+                  41,
+                  '599c922aa6dea6b8d3951542a0a7b750b05c40e7864bac4e377443b7d949beee'),
+                 ('topology',
+                  'interpolation_sparse_labels_enabled',
+                  39,
+                  'a24964b4546a08355976a241f5c317fd7e24a8598777fce0395afae0d0e03869'),
+                 ('workspace',
+                  'tilted_inplane_linear_enabled',
+                  26,
+                  '974e196d9fbf2d0128b3ebc8728c9992a4c02a54f21a5d1f880d7877ec8f3993')),
+ 'statements': (('_deps', 2, '14fb4ac0c90c87c6b4c672e2bf3de36cf41f934438645a7cc37129c0e1bc80f8'),
+                ('assembly', 32, '8b8e9eb230fe2b63c9496772d6bb7ad340050d700bd52aa82f5ebe5fb999d5e7'),
+                ('assembly', 33, '14726e24984d9df4f8db59388a57016387e1e658052a8f551afa8af37648ce67'),
+                ('backprojection', 105, '138fa3acc84bf3ba73c42ed3853ad547e780d51cf25c6107fef73e51a9266351'),
+                ('cuda_backend', 24, '2de8f9f12f3d1012fbdc7e18f12ddc8b636d37e529b8a10de20d6367202565d4'),
+                ('cylindrical_projection',
+                 42,
+                 'a00fd59c3a0ef57a76f093e34ec03927219de47f7f0ad44fe7c22b21bc713347'),
+                ('interpolation', 24, 'c073e3df6f536331f044435d5b85b818d00c09ddaf5e7c78497d7f43fea6ec6b'),
+                ('interpolation', 47, 'd24f27cb632054fb67662096b8c4070083fc9c3b985370cccd7d26337306a9a9'),
+                ('interpolation', 48, '3ab30c336abd35d22525a428c7d84454e0105acfd26b72e24434d8616cc10208'),
+                ('interpolation', 51, '4e01060dae0bb88826bf2b113bcb0f5e9d10f2ade407861176dd712774bb430e'),
+                ('interpolation', 57, '42b6144e5eaac69f1d042276d509eb9d9e470d16f848cee29f0c01a51a8b2253'),
+                ('outputs', 185, 'e7dff3fea3e8f03b78266fb443ee7ff6a55559fcefce4003e4ea192bfe2bf6d9'),
+                ('outputs', 186, '29265bc1808725d5378e1c5865e0bc9e926d57d3ba33f0cee556ee002570c45e'),
+                ('outputs', 187, 'e2c64bae2e96424a93052b292875c466a1a6c500d60a1e7bd51c4342098f31dc'),
+                ('packed_publication', 6, 'db93f1d46cb61813da7a6de5c765048e75a2feafc0c52bb16feff796e25e999c'),
+                ('sparse_projection', 28, '1d8caaec63bd240e132cc12a2f9a591faa7f6974047c46ef91d7d76a91e3dc33'),
+                ('spherical_projection',
+                 13,
+                 'c886e8eacee2cc9f88f09bc14036d0a53628632deda64d9a24c334cdcbb355e5'),
+                ('spherical_projection',
+                 14,
+                 '8cae185e0005fc2a9d67faecdcc4873d23efe59b5981e58895b612fdd853ae4e'),
+                ('spherical_projection_cpu',
+                 8,
+                 '62dfc204b213a46d14451a67a59b2d9ac8d1625a929df9f22a601b16be349147'),
+                ('spherical_projection_cpu',
+                 9,
+                 'c2ac2fee3ddb3649c691ab29da24c51cca922f57e65586eeacb81b759994965b'),
+                ('spherical_projection_cpu',
+                 10,
+                 '63020afc675eee8a36e437c13a59a4b57c6a23a77655ef87114867bd4a20ada3'),
+                ('topology', 21, 'e7fffed290409ac21b8ea3f3619a087ce96d51576973e806684dbcda5e43ca8b'),
+                ('topology', 22, '34e3971f0db977a8caac8cdee85f257d108adb8fe05c301f0f5ac657a0ce2238'),
+                ('topology', 29, '550c6f6ee03b1d2ed4339c862cd934c6650182ba4eb44a2d3a27792df064d4f3'),
+                ('topology', 30, 'e788bfa27be8f551f0df192472371bcb65e128ed9921e5f6f11e93655941e274'),
+                ('topology', 37, 'eaffedf3ccea2cc63cf7173a998341012d7c8f78b44f57a3c871a1e7ad3edd2e'),
+                ('topology_runs', 5, '6824f9609888b53198dac49de1d9ce860e0894d8c36a2d16c926c7a75a872ddc'))}
 REVIEWED_V23_0_3_RELEASE_PREDECESSOR_MODULES = {'__init__': {'ast_sha256': '4b4da7db5146c6f1a16128c0fa38999c6bf34b0bce3f18ddf8bacf90a185dfcb',
               'statements_sha256': '3b32e6a30800d305bf9de6f99a6dede7472b267adedbbf8da6c2367bbbc6afef'},
  'cuda_d1': {'ast_sha256': '2ca87f7f12a5524f1ddbaebe9e5ff92e2928199461823fb94d3edf64e19b6ecb',
@@ -2605,6 +2851,7 @@ def reviewed_v23_0_2_release_contract(manifest, v21, *earlier_patches):
 
 def reviewed_v23_0_3_release_contract(manifest, v21, *earlier_patches):
     """Authenticate TTA optimization against the tagged 23.0.2 receipt."""
+    manifest = _without_reviewed_v23_0_4_release(manifest)
     key = 'v23_0_3_release_review'
     prior = {name: value for name, value in manifest.items() if name != key}
     encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
@@ -2680,7 +2927,116 @@ def reviewed_v23_0_3_release_contract(manifest, v21, *earlier_patches):
     return review
 
 
+def reviewed_v23_0_4_release_contract(manifest, v21, *earlier_patches):
+    """Authenticate the cleanup appendix against the complete tagged 23.0.3 receipt."""
+    key = 'v23_0_4_release_review'
+    prior = {name: value for name, value in manifest.items() if name != key}
+    encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    if hashlib.sha256(encoded).hexdigest() != REVIEWED_V23_0_4_RELEASE_PREDECESSOR_SHA256:
+        raise RuntimeError('v23.0.4 predecessor inventory changed; preserve every historical record')
+    _authenticate_successor_once(prior, 'v23_0_3_release_review', reviewed_v23_0_3_release_contract)
+    earlier = tuple(value for name, value in prior.items()
+                    if name != 'v21_review' and isinstance(value, dict)
+                    and 'release' in value and 'definitions' in value)
+    review = _reviewed_v21_patch_contract(
+        manifest, prior['v21_review'], key=key, release='23.0.4',
+        expected_digest=REVIEWED_V23_0_4_RELEASE_SHA256,
+        previous_digest=REVIEWED_V23_0_3_RELEASE_SHA256,
+        earlier_patches=earlier)
+    if (review.get('predecessor_commit') != REVIEWED_V23_0_4_RELEASE_PREDECESSOR_COMMIT
+            or review.get('predecessor_inventory_sha256') != REVIEWED_V23_0_4_RELEASE_PREDECESSOR_SHA256
+            or review.get('feature') != 'legacy-configuration-and-compiled-cpu-policy'):
+        raise RuntimeError('v23.0.4 review has an unexpected predecessor or feature')
+
+    snapshots = review.get('module_snapshots', ())
+    modules = [item.get('module') for item in snapshots]
+    if (len(modules) != len(set(modules))
+            or set(modules) != set(REVIEWED_V23_0_4_RELEASE_PREDECESSOR_MODULES)):
+        raise RuntimeError('v23.0.4 source snapshot coverage differs')
+    if set(review.get('complete_modules', ())) - set(modules):
+        raise RuntimeError('v23.0.4 complete source snapshot has no module')
+    records = review['definitions'] + review['statements']
+    for item in snapshots:
+        module = item['module']
+        previous = REVIEWED_V23_0_4_RELEASE_PREDECESSOR_MODULES[module]
+        historical = item.get('previous_top_level', ())
+        historical_digest = hashlib.sha256(json.dumps(historical, separators=(',', ':')).encode()).hexdigest()
+        if (item.get('previous_ast_sha256') != previous['ast_sha256']
+                or historical_digest != previous['statements_sha256']):
+            raise RuntimeError(f'v23.0.4 source predecessor changed: {module}')
+        if item.get('removed'):
+            raise RuntimeError(f'v23.0.4 has an unreviewed module removal: {module}')
+        for value in (item.get('ast_sha256'), *historical, *item.get('top_level', ())):
+            if (not isinstance(value, str) or len(value) != 64
+                    or any(char not in '0123456789abcdef' for char in value)):
+                raise RuntimeError(f'v23.0.4 source snapshot has an invalid digest: {module}')
+        if not item.get('reason'):
+            raise RuntimeError(f'v23.0.4 source snapshot has no review reason: {module}')
+        positions = []
+        for record in records:
+            if record['module'] != module:
+                continue
+            current_index, previous_index = record.get('current_index'), record.get('previous_index')
+            if (type(current_index) is not int or not 0 <= current_index < len(item['top_level'])
+                    or item['top_level'][current_index] != record['sha256']):
+                raise RuntimeError(f'v23.0.4 statement position differs: {module}')
+            if previous_index is None:
+                if record['previous_sha256'] is not None:
+                    raise RuntimeError(f'v23.0.4 new statement has an unexpected predecessor: {module}')
+            elif (type(previous_index) is not int or not 0 <= previous_index < len(historical)
+                    or historical[previous_index] != record['previous_sha256']):
+                raise RuntimeError(f'v23.0.4 statement predecessor changed: {module}')
+            positions.append(current_index)
+        if len(positions) != len(set(positions)):
+            raise RuntimeError(f'v23.0.4 source has duplicate reviewed positions: {module}')
+    if any(record['module'] not in set(modules) for record in records):
+        raise RuntimeError('v23.0.4 statement has no complete source snapshot')
+
+    removals = {
+        'definitions': tuple(sorted((item['module'], item['name'], item['previous_index'],
+                                     item['previous_sha256']) for item in review.get('removed_definitions', ()))),
+        'statements': tuple(sorted((item['module'], item['previous_index'], item['previous_sha256'])
+                                   for item in review.get('removed_statements', ()))),
+    }
+    if removals != REVIEWED_V23_0_4_RELEASE_REMOVALS:
+        raise RuntimeError('v23.0.4 reviewed removal scope differs')
+    removed_positions = set()
+    for category in ('removed_definitions', 'removed_statements'):
+        for record in review.get(category, ()):
+            module, index = record['module'], record['previous_index']
+            snapshot = next((item for item in snapshots if item['module'] == module), None)
+            if (snapshot is None or type(index) is not int
+                    or not 0 <= index < len(snapshot['previous_top_level'])
+                    or snapshot['previous_top_level'][index] != record['previous_sha256']
+                    or not record.get('reason') or (module, index) in removed_positions):
+                raise RuntimeError(f'v23.0.4 retired predecessor changed: {module}')
+            removed_positions.add((module, index))
+    reviewed_radial_module_hashes(prior['v21_review'], (*earlier, review))
+    reviewed_radial_definition_hashes(prior['v21_review'], (*earlier, review))
+
+    prior_tools = {item['path']: item['sha256'] for item in prior['v23_0_3_release_review']['validation_tools']}
+    tools = review.get('validation_tools', ())
+    if [item.get('path') for item in tools] != list(prior_tools):
+        raise RuntimeError('v23.0.4 validation-tool review has missing or duplicate paths')
+    for item in tools:
+        value = item.get('sha256')
+        if (item.get('previous_sha256') != prior_tools.get(item['path']) or not item.get('reason')
+                or not isinstance(value, str) or len(value) != 64
+                or any(char not in '0123456789abcdef' for char in value)):
+            raise RuntimeError('v23.0.4 validation-tool review has invalid predecessor, digest or reason')
+    return review
+
+
+def _without_reviewed_v23_0_4_release(manifest):
+    key = 'v23_0_4_release_review'
+    if key not in manifest:
+        return manifest
+    _authenticate_successor_once(manifest, key, reviewed_v23_0_4_release_contract)
+    return {name: value for name, value in manifest.items() if name != key}
+
+
 def _without_reviewed_v23_0_3_release(manifest):
+    manifest = _without_reviewed_v23_0_4_release(manifest)
     key = 'v23_0_3_release_review'
     if key not in manifest:
         return manifest
@@ -3335,10 +3691,14 @@ def _verify_main() -> None:
                                   if 'v22_3_1_release_review' in manifest else None)
     publication_release_review = (reviewed_v22_3_2_release_contract(manifest, v21)
                                   if 'v22_3_2_release_review' in manifest else None)
+    cleanup_release_review = (_authenticate_successor_once(
+                              manifest, 'v23_0_4_release_review', reviewed_v23_0_4_release_contract)
+                              if 'v23_0_4_release_review' in manifest else None)
+    cleanup_manifest = _without_reviewed_v23_0_4_release(manifest)
     tta_release_review = (_authenticate_successor_once(
-                          manifest, 'v23_0_3_release_review', reviewed_v23_0_3_release_contract)
+                          cleanup_manifest, 'v23_0_3_release_review', reviewed_v23_0_3_release_contract)
                           if 'v23_0_3_release_review' in manifest else None)
-    patch_manifest = _without_reviewed_v23_0_3_release(manifest)
+    patch_manifest = _without_reviewed_v23_0_3_release(cleanup_manifest)
     patch_release_review = (_authenticate_successor_once(
                             patch_manifest, 'v23_0_2_release_review', reviewed_v23_0_2_release_contract)
                             if 'v23_0_2_release_review' in manifest else None)
@@ -3346,7 +3706,9 @@ def _verify_main() -> None:
     semantic_release_review = (_authenticate_successor_once(
                                semantic_manifest, 'v23_release_review', reviewed_v23_release_contract)
                                if 'v23_release_review' in manifest else None)
-    tta_successors = ((tta_release_review,) if tta_release_review is not None else ())
+    cleanup_successors = ((cleanup_release_review,) if cleanup_release_review is not None else ())
+    tta_successors = (((tta_release_review,) if tta_release_review is not None else ())
+                      + cleanup_successors)
     patch_successors = (((patch_release_review,) if patch_release_review is not None else ())
                         + tta_successors)
     semantic_successors = (((semantic_release_review,) if semantic_release_review is not None else ())
@@ -3363,6 +3725,13 @@ def _verify_main() -> None:
     patch_definitions = {
         (item['module'], item['name']): item for review in patches for item in review['definitions']
     }
+    retired_definitions = {
+        (item['module'], item['name']): item for review in patches
+        for item in review.get('removed_definitions', ())
+    }
+    retired_statements = Counter((item['module'], item['previous_sha256']) for review in patches
+                                 for item in review.get('removed_statements', ()))
+    retired_statement_hashes = set(retired_statements)
     v21_definitions = {(item['module'], item['name']): item for item in v21['definitions']}
     v21_seams = {
         (item['module'], item['name']): (item['definition_sha256'], item['seam_sha256'])
@@ -3419,21 +3788,36 @@ def _verify_main() -> None:
 
     for (module, name), (expected_hash, reason) in REVIEWED_V20_ADDED_DEFINITIONS.items():
         expected_hash = reviewed_definition_hash(module, name, expected_hash)
+        if (module, name) in retired_definitions:
+            if retired_definitions[module, name]['previous_sha256'] != expected_hash:
+                raise RuntimeError(f'retired v20 definition predecessor changed: {module}.{name}')
+            continue
         matches = [node for node in top_level.get(module, ()) if getattr(node, 'name', None) == name]
         if not reason or len(matches) != 1 or digest(matches[0]) != expected_hash:
             raise RuntimeError(f'v20 reviewed added definition changed or is missing: {module}.{name}')
     current_v20_statements = reviewed_v20_statement_hashes((v21, *patches))
     for (module, label), (_historical_hash, reason) in REVIEWED_V20_ADDED_STATEMENTS.items():
         expected_hash = current_v20_statements[(module, label)]
+        if (module, expected_hash) in retired_statement_hashes:
+            continue
         if not reason or available.get(module, Counter())[expected_hash] != 1:
             raise RuntimeError(f'v20 reviewed added statement changed or is missing: {module}.{label}')
 
     for (module, name), record in v21_definitions.items():
+        if (module, name) in retired_definitions:
+            if retired_definitions[module, name]['previous_sha256'] != patched_definition_hash(
+                    module, name, record['sha256']):
+                raise RuntimeError(f'retired v21 definition predecessor changed: {module}.{name}')
+            continue
         matches = [node for node in top_level[module] if getattr(node, 'name', None) == name]
         if len(matches) != 1 or digest(matches[0]) != patched_definition_hash(module, name, record['sha256']):
             raise RuntimeError(f'v21 reviewed definition changed or is missing: {module}.{name}')
     for (module, name), record in patch_definitions.items():
         if module in removed_modules:
+            continue
+        if (module, name) in retired_definitions:
+            if retired_definitions[module, name]['previous_sha256'] != record['sha256']:
+                raise RuntimeError(f'retired patch definition predecessor changed: {module}.{name}')
             continue
         matches = [node for node in top_level[module] if getattr(node, 'name', None) == name]
         if len(matches) != 1 or digest(matches[0]) != record['sha256']:
@@ -3446,12 +3830,18 @@ def _verify_main() -> None:
         effective_statements = [
             item for item in effective_statements if (item['module'], item['sha256']) not in replaced_statements
         ] + review['statements']
+    for item in effective_statements[:]:
+        key = (item['module'], item['sha256'])
+        if retired_statements[key]:
+            effective_statements.remove(item)
+            retired_statements[key] -= 1
     for item in effective_statements:
         if item['module'] in removed_modules:
             continue
         if available[item['module']][item['sha256']] != 1:
             raise RuntimeError(f'v21 reviewed statement changed or is missing: {item["module"]}.{item["label"]}')
-    effective_definitions = {**v21_definitions, **patch_definitions}
+    effective_definitions = {key: item for key, item in {**v21_definitions, **patch_definitions}.items()
+                             if key not in retired_definitions}
     complete_modules = set(v21['complete_modules'])
     complete_modules.update(module for review in patches for module in review.get('complete_modules', ()))
     for module in complete_modules - removed_modules:
@@ -3477,8 +3867,11 @@ def _verify_main() -> None:
         verify_v22_3_source_snapshots(patch_release_review, trees, tta_successors)
         verify_v22_3_validation_tools(patch_release_review, tta_successors)
     if tta_release_review is not None:
-        verify_v22_3_source_snapshots(tta_release_review, trees)
-        verify_v22_3_validation_tools(tta_release_review)
+        verify_v22_3_source_snapshots(tta_release_review, trees, cleanup_successors)
+        verify_v22_3_validation_tools(tta_release_review, cleanup_successors)
+    if cleanup_release_review is not None:
+        verify_v22_3_source_snapshots(cleanup_release_review, trees)
+        verify_v22_3_validation_tools(cleanup_release_review)
     for module, expected_hash in reviewed_radial_module_hashes(v21, patches).items():
         source = (PACKAGE / f'{module}.py').read_text(encoding='utf-8')
         if hashlib.sha256(source.encode('utf-8')).hexdigest() != expected_hash:
@@ -3510,6 +3903,12 @@ def _verify_main() -> None:
                    any(char not in '0123456789abcdef' for char in value) for value in current):
                 raise RuntimeError('local-import seam update has an invalid digest')
             expected_local_import_seams[key] = current
+        for item in review.get('removed_definitions', ()):
+            key = (item['module'], item['name'])
+            if key in expected_local_import_seams:
+                if expected_local_import_seams[key][0] != item['previous_sha256']:
+                    raise RuntimeError(f'retired local-import seam predecessor changed: {key}')
+                del expected_local_import_seams[key]
     for key, (previous_hash, _previous_seam) in REVIEWED_LOCAL_IMPORT_SEAMS.items():
         if key in v21_seams:
             reviewed_definition_hash(*key, previous_hash)
@@ -3533,7 +3932,7 @@ def _verify_main() -> None:
             f"changed={changed_local_import_seams!r}"
         )
 
-    effective_changed = INTENTIONALLY_CHANGED | set(REVIEWED_LOCAL_IMPORT_SEAMS)
+    effective_changed = (INTENTIONALLY_CHANGED | set(REVIEWED_LOCAL_IMPORT_SEAMS)) - set(retired_definitions)
 
     inventory_keys = {
         (str(item["module"]), str(item["sha256"]))
@@ -3596,7 +3995,8 @@ def _verify_main() -> None:
         (module, replacement_hash)
         for (module, _baseline_hash), (replacement_hash, _name)
         in INTENTIONALLY_PRUNED_REPLACEMENTS.items()
-        if available[module][replacement_hash] != 1
+        if (module, replacement_hash) not in retired_statement_hashes
+        and available[module][replacement_hash] != 1
     ]
     if missing_pruned_replacements:
         raise RuntimeError(
@@ -3672,14 +4072,32 @@ def _verify_main() -> None:
             continue
         if inventory_key in INTENTIONALLY_PRUNED_REPLACEMENTS:
             replacement_hash, _removed_name = INTENTIONALLY_PRUNED_REPLACEMENTS[inventory_key]
+            if (module, replacement_hash) in retired_statement_hashes:
+                removed += 1
+                continue
             available[module][replacement_hash] -= 1
             changed += 1
             continue
         if inventory_key in REVIEWED_V20_STATEMENT_REPLACEMENTS:
             _name, replacement_hash, _reason = REVIEWED_V20_STATEMENT_REPLACEMENTS[inventory_key]
             replacement_hash = reviewed_definition_hash(module, _name, replacement_hash)
+            if (module, _name) in retired_definitions:
+                if retired_definitions[module, _name]['previous_sha256'] != replacement_hash:
+                    raise RuntimeError(f'retired baseline predecessor changed: {module}.{_name}')
+                removed += 1
+                continue
             available[module][replacement_hash] -= 1
             changed += 1
+            continue
+        destination = INTENTIONALLY_RELOCATED.get((module, statement_hash), module)
+        expected_hash = rename_replacements.get(inventory_key, statement_hash)
+        if (destination, name) in retired_definitions:
+            if (destination, name) not in REVIEWED_LOCAL_IMPORT_SEAMS:
+                retired_hash = reviewed_definition_hash(destination, name, expected_hash)
+                if retired_definitions[destination, name]['previous_sha256'] != retired_hash:
+                    raise RuntimeError(f'retired baseline predecessor changed: {destination}.{name}')
+            # Reviewed seam pins authenticate their own definition lineage above.
+            removed += 1
             continue
         if (
             (module, name) in effective_changed
@@ -3688,8 +4106,6 @@ def _verify_main() -> None:
         ):
             changed += 1
             continue
-        destination = INTENTIONALLY_RELOCATED.get((module, statement_hash), module)
-        expected_hash = rename_replacements.get(inventory_key, statement_hash)
         if (destination, name) in patch_definitions:
             expected_hash = reviewed_definition_hash(destination, name, expected_hash)
             if available[destination][expected_hash] < 1:
@@ -3705,6 +4121,9 @@ def _verify_main() -> None:
             if current_statement is not None:
                 expected_hash = current_statement['sha256']
                 statement_changed = True
+        if (destination, expected_hash) in retired_statement_hashes:
+            removed += 1
+            continue
         if statement_changed:
             if available[destination][expected_hash] < 1:
                 missing.append(item)

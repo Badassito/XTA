@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -95,6 +97,18 @@ class EnvironmentCleanupTests(unittest.TestCase):
             self.assertEqual(geometry.queued_streaming_source_cpu_warmup_slots(20), 8)
             self.assertEqual(geometry.streaming_prediction_source_prefetch_frames(64), 2048)
             self.assertEqual(geometry.streaming_prediction_source_workers(4, 100), 16)
+
+    def test_zero_staging_batches_disables_eager_cuda_staging(self) -> None:
+        cfg = SimpleNamespace(device='cuda:0')
+        fake_torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True))
+        with (
+            mock.patch.object(inference, 'canonical_single_device', return_value='cuda:0'),
+            mock.patch.dict(sys.modules, {'torch': fake_torch}),
+            mock.patch.dict(os.environ, {'YOLO_TTA_GPU_INPUT_STAGING_BATCHES': '0'}),
+        ):
+            self.assertFalse(geometry.gpu_input_staging_enabled(cfg))
+            os.environ['YOLO_TTA_GPU_INPUT_STAGING_BATCHES'] = '2'
+            self.assertTrue(geometry.gpu_input_staging_enabled(cfg))
 
     def test_retired_runtime_toggles_preserve_default_behavior(self) -> None:
         with (

@@ -9,6 +9,7 @@ description = "Volume test-time, pretraining, and label-time augmentation"
 requires-python = ">=3.10"
 dependencies = [
   "numpy",
+  "numba>=0.61.2",
   "opencv-python",
   "scipy",
   "tifffile",
@@ -22,7 +23,7 @@ cuda12 = ["cupy-cuda12x>=13.0", "nvidia-ml-py"]
 cuda13 = ["cupy-cuda13x>=13.0", "nvidia-ml-py"]
 nvtiff12 = ["nvidia-nvtiff-cu12>=0.8"]
 nvtiff13 = ["nvidia-nvtiff-cu13>=0.8"]
-acceleration = ["numba", "deflate>=0.9.0", "isal"]
+acceleration = ["deflate>=0.9.0", "isal"]
 pta = ["pynrrd", "albumentations"]
 lta = ["pynrrd"]
 
@@ -42,7 +43,7 @@ version = {attr = "XTA.__version__"}
 [tool.setuptools.data-files]
 "share/xta" = [
   "ARCHITECTURE.md",
-  "GPT-6-Astra-Ultra_v23.0.3_SLURM.py",
+  "GPT-6-Astra-Ultra_v23.0.4_SLURM.py",
 ]
 "share/xta/tools" = [
   "tools/compare_reconciliation.py",

@@ -26,6 +26,8 @@ from unittest import mock
 
 import numpy as np
 
+from tests.reference_backends.radial import pull_radial_chunk
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from XTA import cylindrical_projection as cp, geometry, backprojection
 
@@ -211,7 +213,7 @@ def main():
             flat = plane.reshape(-1)
             for first in range(0, flat.size, cp._PULL_CHUNK_VOXELS):
                 stop = min(flat.size, first + cp._PULL_CHUNK_VOXELS)
-                flat[first:stop] = cp._pull_radial_chunk(source, view, radii, OUTPUT_SHAPE, z, first, stop)
+                flat[first:stop] = pull_radial_chunk(source, view, radii, OUTPUT_SHAPE, z, first, stop)
             return plane
         t0 = time.perf_counter()
         for z in indices:
@@ -298,7 +300,7 @@ def main():
             t0 = time.perf_counter()
             with (mock.patch.object(cp, '_try_radial_cuda_stage', side_effect=require_cuda),
                   mock.patch.object(cp, '_project_radial_block', side_effect=AssertionError('CPU compiled fallback entered')),
-                  mock.patch.object(cp, '_pull_radial_chunk', side_effect=AssertionError('CPU reference fallback entered'))):
+                  mock.patch.object(cp, '_pull_radial_range_into', side_effect=AssertionError('CPU reference fallback entered'))):
                 cp.backproject_radial_volume_to_volume(
                     source, view, workspace / 'must-not-exist-output.dat', 'CUDA full-stream qualification',
                     workers=1, out_shape_tyx=OUTPUT_SHAPE, known_slice_bboxes=bounds,

@@ -26,13 +26,6 @@ def spherical_fp32_requested():
     return _flag('YOLO_TTA_GPU_SPHERICAL_FP32', fast_geometry_enabled())
 
 
-def spherical_cpu_compiled_requested():
-    # The compiled CPU pull is exact FP64; enable it independently of the
-    # approximate GPU geometry modes. A local CPU flag overrides the global
-    # bundle, including an explicit global opt-out.
-    return _flag('YOLO_TTA_CPU_SPHERICAL_COMPILED', _flag('YOLO_TTA_FAST_GEOMETRY', True))
-
-
 def radial_columns_requested():
     return _flag('YOLO_TTA_GPU_RADIAL_COLUMN_GEOMETRY', fast_geometry_enabled())
 
@@ -50,7 +43,7 @@ def geometry_quality_request_record():
     spherical = spherical_fp32_requested()
     return {
         'fast_geometry_requested': fast_geometry_enabled(),
-        'cpu_spherical_compiled_requested': spherical_cpu_compiled_requested(),
+        'cpu_spherical_compiled_requested': True,
         'gpu_radial_column_geometry_requested': radial_columns_requested(),
         'gpu_spherical_fp32_requested': spherical,
         'spherical_sampler_requested': 'fp32_fma_virtual_gray8' if spherical else 'reference_fp64',

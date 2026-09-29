@@ -1,4 +1,4 @@
-"""Required and optional third-party runtime dependencies.
+"""Required third-party runtime dependencies.
 
 Only numerical/runtime modules import this module. Configuration and backend-control
 contracts remain dependency-light so CLI discovery and orchestration do not initialize
@@ -6,8 +6,6 @@ native image-processing or accelerator libraries.
 """
 
 from __future__ import annotations
-
-from typing import Optional
 
 try:
     import cv2  # type: ignore
@@ -31,11 +29,15 @@ except Exception as exc:  # pragma: no cover
 
 try:
     import numba as _numba  # type: ignore
-except Exception as exc:  # pragma: no cover - optional acceleration
-    _numba = None  # type: ignore[assignment]
-    _NUMBA_IMPORT_ERROR: Optional[BaseException] = exc
-else:
-    _NUMBA_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover
+    raise RuntimeError(
+        "Numba is required for compiled CPU kernels: pip install 'numba>=0.61.2'"
+    ) from exc
+
+if bool(_numba.config.DISABLE_JIT):
+    raise RuntimeError(
+        "Numba JIT compilation is disabled; unset NUMBA_DISABLE_JIT to run compiled CPU kernels"
+    )
 
 
 __all__ = (
@@ -44,5 +46,4 @@ __all__ = (
     "tifffile",
     "tqdm",
     "_numba",
-    "_NUMBA_IMPORT_ERROR",
 )

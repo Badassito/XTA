@@ -142,11 +142,10 @@ def _scatter_crop(
     return foreground, contributions, unique
 
 
-if _numba is not None:
-    _count_keys = _numba.njit(cache=True, nogil=True)(_count_keys)
-    _prefix_counts = _numba.njit(cache=True, nogil=True)(_prefix_counts)
-    _fill_owners = _numba.njit(cache=True, nogil=True)(_fill_owners)
-    _scatter_crop = _numba.njit(cache=True, nogil=True)(_scatter_crop)
+_count_keys = _numba.njit(cache=True, nogil=True)(_count_keys)
+_prefix_counts = _numba.njit(cache=True, nogil=True)(_prefix_counts)
+_fill_owners = _numba.njit(cache=True, nogil=True)(_fill_owners)
+_scatter_crop = _numba.njit(cache=True, nogil=True)(_scatter_crop)
 
 
 def _map_key_strips(view, plan, grid, plane_shape) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
@@ -438,7 +437,7 @@ def project_azimuthal_sparse_store(
                     raise FileExistsError(f'Projected store appeared during publication: {target}')
                 staging.rename(target)
                 return {**stats, 'path': str(target), 'storage_format': INTERNAL_PACKED_CVOL_FORMAT,
-                        'shape': output_shape, 'backend': 'cpu_numba' if hasattr(_scatter_crop, 'signatures') else 'cpu_python',
+                        'shape': output_shape, 'backend': 'cpu_numba',
                         'map_cache_hit': cache_hit, 'map_bytes': map_bytes,
                         'input_payload_bytes': input_bytes, 'input_foreground_samples': foreground,
                         'projected_contributions': contributions, 'max_decoded_input_slab_bytes': max_slab,

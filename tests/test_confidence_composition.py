@@ -30,7 +30,6 @@ def numpy_reference(dm, dc, sm, sc):
 
 
 class ConfidenceCompositionTests(unittest.TestCase):
-    @unittest.skipIf(backend._union_conf_slice_inplace is None, 'Numba unavailable')
     def test_all_score_pairs_preserve_mask_bytes_strict_ties_and_empty_destinations(self):
         shape = (9, 256, 256)
         dm = np.empty(shape, np.uint8)
@@ -49,7 +48,6 @@ class ConfidenceCompositionTests(unittest.TestCase):
         np.testing.assert_array_equal(dm, expected_mask)
         np.testing.assert_array_equal(dc, expected_conf)
 
-    @unittest.skipIf(backend._union_conf_slice_inplace is None, 'Numba unavailable')
     def test_readonly_source_memmaps_and_single_slice_windows(self):
         rng = np.random.default_rng(22412)
         shape = (5, 33, 65)
@@ -135,9 +133,9 @@ class ConfidenceCompositionTests(unittest.TestCase):
                 dm._mmap.close()
                 sm._mmap.close()
 
-    def test_optional_compiler_and_missing_confidence_preserve_existing_fallbacks(self):
+    def test_missing_confidence_uses_binary_union_without_compilation(self):
         rng = np.random.default_rng(22416)
-        for missing in ('compiler', 'destination', 'source', 'both'):
+        for missing in ('destination', 'source', 'both'):
             with self.subTest(missing=missing):
                 dm, dc, sm, sc = [rng.integers(0, 256, (2, 7, 9), dtype=np.uint8) for _ in range(4)]
                 if missing in ('destination', 'both'):
@@ -146,24 +144,24 @@ class ConfidenceCompositionTests(unittest.TestCase):
                     sc = None
                 expected_mask, expected_conf = dm.copy(), None if dc is None else dc.copy()
                 numpy_reference(expected_mask, expected_conf, sm, sc)
-                with mock.patch.object(backend, '_union_conf_slice_inplace', None):
+                with mock.patch.object(backend, '_union_conf_slice_inplace', side_effect=AssertionError('binary union needs no confidence kernel')):
                     backend.union_conf_volume_into_volume_inplace(dm, dc, sm, sc, workers=2)
                 np.testing.assert_array_equal(dm, expected_mask)
                 if dc is not None:
                     np.testing.assert_array_equal(dc, expected_conf)
 
-    def test_compiler_failure_falls_back_before_mutating_destinations(self):
+    def test_required_compiler_failure_propagates_before_mutating_destinations(self):
         rng = np.random.default_rng(22417)
         arrays = [rng.integers(0, 256, (2, 7, 9), dtype=np.uint8) for _ in range(4)]
         expected_mask, expected_conf = arrays[0].copy(), arrays[1].copy()
-        numpy_reference(expected_mask, expected_conf, *arrays[2:])
 
         def unavailable(*planes):
             self.assertTrue(all(plane.shape == (0, 9) for plane in planes))
-            raise RuntimeError('optional compiler unavailable')
+            raise RuntimeError('required compiler unavailable')
 
         with mock.patch.object(backend, '_union_conf_slice_inplace', side_effect=unavailable) as compiled:
-            backend.union_conf_volume_into_volume_inplace(*arrays, workers=2)
+            with self.assertRaisesRegex(RuntimeError, 'required compiler unavailable'):
+                backend.union_conf_volume_into_volume_inplace(*arrays, workers=2)
         self.assertEqual(compiled.call_count, 1)
         np.testing.assert_array_equal(arrays[0], expected_mask)
         np.testing.assert_array_equal(arrays[1], expected_conf)

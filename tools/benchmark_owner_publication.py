@@ -71,7 +71,6 @@ def main():
                 work = Path(directory)
                 copied = words.copy()  # producer fixture, excluded from publication timing
                 with mock.patch.dict(os.environ, {'YOLO_TTA_PACKED_OWNER_PUBLICATION': '1' if mode=='packed' else '0',
-                                                   'YOLO_TTA_NRRD_CROP_ROW_SPANS': '1' if mode=='packed' else '0',
                                                    'YOLO_TTA_NRRD_GPU_MIRROR_TEE': '0'}):
                     started = time.perf_counter()
                     result = cuda_d1._d1_finalize_bitset_layer(words=copied, output_shape=shape,

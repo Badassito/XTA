@@ -122,9 +122,8 @@ def _operations(**overrides: object) -> TtaSchedulerOperations:
         gpu_worker_tail_split_point=lambda *_args: None,
         gpu_worker_target_lease_seconds=lambda: 1.0,
         gpu_worker_task_cost_key=lambda task: (str(task.get("kind")),),
-        hybrid_gpu_stealback_enabled=lambda: False,
         hybrid_gpu_stealback_eta_ratio=lambda: 1.0,
-        hybrid_gpu_stealback_max_fraction=lambda: 0.5,
+        hybrid_gpu_stealback_max_fraction=lambda: 0.0,
         hybrid_gpu_stealback_min_cpu_samples=lambda: 1,
         hybrid_gpu_stealback_min_lead_seconds=lambda: 0.0,
         memfd_workspace_enabled=lambda: False,
@@ -1145,8 +1144,20 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
         self.assertEqual(fullframe.call_count, 2)
         self.assertEqual(announce.call_count, 2)
 
-    def test_poll_and_push_transport_each_have_one_consumer(self) -> None:
+    def test_queue_push_transport_and_non_queue_polling(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
+            no_queue_state = _state()
+            no_queue_state.gpu_result_queue = None
+            no_queue_scheduler = _scheduler(Path(temp_dir), state=no_queue_state)
+            no_queue_track = mock.Mock()
+            no_queue_scheduler.configure_result_transport(
+                push_drain_active=False,
+                track_thread=no_queue_track,
+            )
+            no_queue_scheduler.wait_for_one_process_result(timeout=0.01)
+            no_queue_track.assert_not_called()
+            self.assertFalse(no_queue_state.push_drain_active)
+
             poll_state = _state()
             poll_state.gpu_result_queue = queue.Queue()
             poll_scheduler = _scheduler(Path(temp_dir), state=poll_state)

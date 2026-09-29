@@ -537,27 +537,28 @@ class FusedRendererOptimizationTests(unittest.TestCase):
             view, self.identity, 3, 8, 8,
         )
 
-    def test_tilted_nearest_fallback_keeps_final_grid_sampling(self) -> None:
+    def test_tilted_fallback_keeps_bilinear_grid_sampling(self) -> None:
         expected = object()
         engine = object.__new__(cuda_backend._GpuWorkerRenderEngine)
         engine._fused_disabled_families = {"tilted"}
-        engine._render_tilted_frame = mock.Mock(return_value=expected)
-        engine.warp_native_uint8_frame = mock.Mock(
-            side_effect=AssertionError("nearest Tilted fallback used a bilinear warp")
-        )
-        view = SimpleNamespace(name="tilted_coronal")
+        native = mock.MagicMock()
+        engine._render_tilted_frame = mock.Mock(return_value=native)
+        engine.warp_native_uint8_frame = mock.Mock(return_value=expected)
+        engine.torch = SimpleNamespace(uint8=object())
+        view = SimpleNamespace(name="tilted_coronal", src_h=8, src_w=8)
 
-        with (
-            mock.patch.object(cuda_backend, "fused_tilted_render_enabled", return_value=True),
-            mock.patch.object(cuda_backend, "tilted_inplane_linear_enabled", return_value=False),
-        ):
+        with mock.patch.object(cuda_backend, "fused_tilted_render_enabled", return_value=True):
             actual = engine.render_tilted_grid_resident(
                 view, self.identity, frame_index=4, out_h=8, out_w=8,
             )
 
         self.assertIs(actual, expected)
         engine._render_tilted_frame.assert_called_once_with(
-            view, self.identity, 8, 8, 4,
+            view, cuda_backend._TILTED_IDENTITY_M, 8, 8, 4,
+        )
+        engine.warp_native_uint8_frame.assert_called_once_with(
+            native.round.return_value.clamp_.return_value.to.return_value,
+            self.identity, 8, 8,
         )
 
 

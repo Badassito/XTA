@@ -24,9 +24,6 @@ class StageAdmissionConcurrencyTests(unittest.TestCase):
         patch = mock.patch.object(bp, 'gpu_worker_aux_interpolation_pool', return_value=self.pool)
         patch.start()
         self.addCleanup(patch.stop)
-        patch = mock.patch.object(bp, 'main_process_gpu_stage_inference_priority_enabled', return_value=False)
-        patch.start()
-        self.addCleanup(patch.stop)
         self.coordinator.set_inference_priority_active(False)
 
     def _start(self, target):
@@ -107,19 +104,18 @@ class StageAdmissionConcurrencyTests(unittest.TestCase):
         lease.release()
         self.assertTrue(self.pool.enable_worker(0))
 
-    def test_opt_in_stage_overlap_allows_inference_but_not_auxiliary_reuse(self) -> None:
-        with mock.patch.object(bp, 'main_process_gpu_stage_inference_overlap_enabled', return_value=True):
-            stage = self.coordinator.try_acquire_specific_stage(self.torch, 0, 'output')
-            self.assertIsNotNone(stage)
-            self.assertTrue(self.coordinator.can_dispatch_inference(0))
-            self.assertTrue(self.pool.revoke_worker(0))
-            self.assertTrue(self.coordinator.begin_inference(0))
-            self.assertFalse(self.pool.enable_worker(0))
-            self.assertIsNone(self.pool.try_submit({'input': 'unused'}))
-            self.coordinator.finish_inference(0)
-            stage.release()
+    def test_stage_lease_excludes_inference_and_auxiliary_reuse(self) -> None:
+        stage = self.coordinator.try_acquire_specific_stage(self.torch, 0, 'output')
+        self.assertIsNotNone(stage)
+        self.assertFalse(self.coordinator.can_dispatch_inference(0))
+        self.assertTrue(self.pool.revoke_worker(0))
+        self.assertFalse(self.coordinator.begin_inference(0))
+        self.assertFalse(self.pool.enable_worker(0))
+        self.assertIsNone(self.pool.try_submit({'input': 'unused'}))
+        stage.release()
+        self.assertTrue(self.coordinator.can_dispatch_inference(0))
 
-    def test_opt_in_overlap_still_fences_provisional_and_retirement_stages(self) -> None:
+    def test_provisional_and_retirement_stages_fence_inference(self) -> None:
         entered = threading.Event()
         resume = threading.Event()
         original_claim = self.pool.claim_worker_for_stage
@@ -129,23 +125,22 @@ class StageAdmissionConcurrencyTests(unittest.TestCase):
             self.assertTrue(resume.wait(5))
             return original_claim(device)
 
-        with mock.patch.object(bp, 'main_process_gpu_stage_inference_overlap_enabled', return_value=True):
-            with mock.patch.object(self.pool, 'claim_worker_for_stage', side_effect=slow_claim):
-                thread, result, errors = self._start(
-                    lambda: self.coordinator.try_acquire_specific_stage(self.torch, 0, 'output'))
-                self.assertTrue(entered.wait(2))
-                self.assertFalse(self.coordinator.can_dispatch_inference(0))
-                self.assertFalse(self.coordinator.begin_inference(0))
-                resume.set()
-                thread.join(3)
-            self.assertFalse(errors)
-            result[0].release()
-            retirement = self.coordinator.try_acquire_specific_stage(
-                self.torch, 0, 'Spherical source projection sample')
-            self.assertIsNotNone(retirement)
+        with mock.patch.object(self.pool, 'claim_worker_for_stage', side_effect=slow_claim):
+            thread, result, errors = self._start(
+                lambda: self.coordinator.try_acquire_specific_stage(self.torch, 0, 'output'))
+            self.assertTrue(entered.wait(2))
             self.assertFalse(self.coordinator.can_dispatch_inference(0))
             self.assertFalse(self.coordinator.begin_inference(0))
-            retirement.release()
+            resume.set()
+            thread.join(3)
+        self.assertFalse(errors)
+        result[0].release()
+        retirement = self.coordinator.try_acquire_specific_stage(
+            self.torch, 0, 'Spherical source projection sample')
+        self.assertIsNotNone(retirement)
+        self.assertFalse(self.coordinator.can_dispatch_inference(0))
+        self.assertFalse(self.coordinator.begin_inference(0))
+        retirement.release()
 
     def test_reset_during_external_claim_discards_old_attempt(self) -> None:
         entered = threading.Event()
@@ -174,6 +169,7 @@ class StageAdmissionConcurrencyTests(unittest.TestCase):
     def test_stale_release_cannot_remove_new_owner_with_same_purpose(self) -> None:
         old = self.coordinator.try_acquire_specific_stage(self.torch, 0, 'output')
         self.coordinator.configure_workers([0, 1])
+        self.coordinator.set_inference_priority_active(False)
         new = self.coordinator.try_acquire_specific_stage(self.torch, 0, 'output')
         self.assertIsNotNone(new)
         old.release()

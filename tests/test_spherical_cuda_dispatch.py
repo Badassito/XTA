@@ -134,9 +134,7 @@ class SphericalCudaDispatchTests(unittest.TestCase):
         lease.release.assert_not_called()
 
     def test_normal_stage_inference_priority_applies(self):
-        with mock.patch.object(backprojection, 'main_process_gpu_stage_inference_priority_enabled', return_value=True), \
-                mock.patch.object(backprojection, 'main_process_gpu_stage_inference_overlap_enabled', return_value=False), \
-                mock.patch.object(backprojection, 'v1613_d1_backprojection_overlap_enabled', return_value=True):
+        with mock.patch.object(backprojection, 'v1613_d1_backprojection_overlap_enabled', return_value=True):
             coordinator = backprojection._MainProcessGpuStageCoordinator()
             coordinator.configure_workers([0, 1])
             coordinator.set_pending_inference_backlog(True)

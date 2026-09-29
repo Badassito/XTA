@@ -130,15 +130,7 @@ def _bucket_shell_pixels(shells, count):
     return offsets, pixels
 
 
-_bucket_shell_pixels_compiled = _numba.njit(cache=True, nogil=True)(_bucket_shell_pixels) if _numba else None
-
-
-def _bucket_shell_pixels_numpy(shells, count):
-    valid = np.flatnonzero(shells >= 0)
-    values = shells[valid]
-    offsets = np.zeros(count + 1, np.int64)
-    np.cumsum(np.bincount(values, minlength=count), out=offsets[1:])
-    return offsets, valid[np.argsort(values, kind='stable')].astype(np.int32)
+_bucket_shell_pixels_compiled = _numba.njit(cache=True, nogil=True)(_bucket_shell_pixels)
 
 
 _OWNER_KERNEL_SOURCE = r'''
@@ -264,13 +256,7 @@ class RadialOwner:
         self.plan, _ = reference._radial_plane_plan(view, radii, self.output_shape)
         self.metadata = reference._radial_projection_metadata(view,
             (view.num_slices, *self.mask_shape), self.output_shape, self.plan)
-        if _bucket_shell_pixels_compiled is not None:
-            try:
-                self.bucket_offsets, pixels = _bucket_shell_pixels_compiled(self.plan.shell_index, view.num_slices)
-            except Exception:
-                self.bucket_offsets, pixels = _bucket_shell_pixels_numpy(self.plan.shell_index, view.num_slices)
-        else:
-            self.bucket_offsets, pixels = _bucket_shell_pixels_numpy(self.plan.shell_index, view.num_slices)
+        self.bucket_offsets, pixels = _bucket_shell_pixels_compiled(self.plan.shell_index, view.num_slices)
         centers, ideal, sampled, rows, mapped_columns, self.stack_length, self.vertical = self.metadata
         arrays = dict(pixels=pixels, shells=self.plan.shell_index, offsets=self.plan.column_offsets,
             columns=self.plan.native_columns, sampled=sampled, rows=rows, mapped_columns=mapped_columns,
@@ -572,7 +558,7 @@ def preflight_radial_owner():
     expected_native = data.copy()
     expected_native[:, 2:6, 2:6] = 1
     radii = np.asarray(geometry.radial_global_radii(view))
-    expected = np.stack([reference._pull_radial_chunk(expected_native, view, radii,
+    expected = np.stack([reference._pull_radial_chunk_compiled(expected_native, view, radii,
         (7, 9, 11), z, 0, 99).reshape(9, 11) for z in range(7)])
     active = RadialOwner(view, (8, 8), (7, 9, 11), reserve_bytes=0)
     try:
@@ -582,7 +568,7 @@ def preflight_radial_owner():
         flat = np.arange(expected.size)
         decoded = ((words[flat // 32] >> (flat % 32).astype(np.uint32)) & 1).astype(np.uint8)
         if not np.array_equal(decoded, expected.reshape(-1)) or not np.array_equal(device.get(), expected_native):
-            raise RuntimeError('Native Radial owner preflight disagreed with its CPU reference')
+            raise RuntimeError('Native Radial owner preflight disagreed with compiled CPU projection')
         if radial_gpu_bitset_compaction_enabled():
             try:
                 exported = active.host_packed_blocks()

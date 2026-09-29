@@ -343,9 +343,127 @@ def _project_radial_block(source, shells, offsets, columns, sampled, row_map, co
     return result
 
 
-if _numba is not None:
-    _gather_radial_pixel = _numba.njit(cache=True, nogil=True, inline='always', fastmath=False)(_gather_radial_pixel)
-    _project_radial_block = _numba.njit(cache=True, nogil=True, fastmath=False)(_project_radial_block)
+_gather_radial_pixel = _numba.njit(cache=True, nogil=True, inline='always', fastmath=False)(_gather_radial_pixel)
+_project_radial_block = _numba.njit(cache=True, nogil=True, fastmath=False)(_project_radial_block)
+
+
+@_numba.njit(cache=True, nogil=True, fastmath=False)
+def _pull_radial_range_into(
+        result, source, radii, z, first, out_t, out_h, out_w,
+        work_t, work_h, work_w, base_id, center_x, center_y,
+        min_radius, max_radius, shell_start, arc_origin, native_width,
+        native_height, height_origin, tilted, tangent, vertical,
+        bboxes, use_bboxes, scalar_max):
+    """Evaluate exact shell/wrap coordinates into one caller-owned flat strip."""
+    stack_length = work_t if base_id == 0 else (work_h if base_id == 1 else work_w)
+    two_pi = 2.0 * math.pi
+    wt = (float(z) + 0.5) * work_t / out_t - 0.5
+    for offset in range(result.size):
+        pixel = first + offset
+        y, x = pixel // out_w, pixel % out_w
+        wy = (float(y) + 0.5) * work_h / out_h - 0.5
+        wx = (float(x) + 0.5) * work_w / out_w - 0.5
+        if base_id == 0:
+            stack, py, px = wt, wy, wx
+        elif base_id == 1:
+            stack, py, px = wy, wt, wx
+        else:
+            stack, py, px = wx, wt, wy
+        dx, dy = px - center_x, py - center_y
+        radius = math.hypot(dx, dy)
+        if radius < min_radius or radius > max_radius:
+            continue
+        ideal_height = stack - tangent * (dy if vertical else dx) if tilted else stack
+        if ideal_height < 0.0 or ideal_height > stack_length - 1:
+            continue
+        # searchsorted(left): an exact midpoint belongs to the inner shell.
+        lo, hi = 0, len(radii)
+        while lo < hi:
+            middle = (lo + hi) // 2
+            if radii[middle] < radius:
+                lo = middle + 1
+            else:
+                hi = middle
+        right = min(lo, len(radii) - 1)
+        left = max(0, right - 1)
+        global_shell = (left if radius - radii[left] <= radii[right] - radius else right)
+        shell = global_shell - shell_start
+        if shell < 0 or shell >= source.shape[0]:
+            continue
+        if use_bboxes and (bboxes[shell, 1] <= bboxes[shell, 0] or
+                           bboxes[shell, 3] <= bboxes[shell, 2]):
+            continue
+        selected_radius = radii[global_shell]
+        period = two_pi * selected_radius
+        if period <= 1.0:
+            column_float = 0.0
+        else:
+            theta = math.atan2(dy, dx) % two_pi
+            column_float = ((theta * selected_radius - arc_origin + 0.5) % period) - 0.5
+        if tilted and selected_radius == 0.0:
+            continue
+        for candidate in range(native_width):
+            if period <= 1.0:
+                column = candidate
+            else:
+                column = int(np.rint(column_float))
+                if column >= native_width:
+                    break
+                column_float += period
+            if column < 0 or column >= native_width:
+                continue
+            height = stack
+            if tilted:
+                angle = ((arc_origin + column) / selected_radius) % two_pi
+                sample_axis = selected_radius * (math.sin(angle) if vertical else math.cos(angle))
+                height -= tangent * sample_axis
+            height = min(max(height, 0.0), float(stack_length - 1))
+            row = int(np.rint(height)) - height_origin
+            if row < 0 or row >= native_height:
+                continue
+            pr = min(int((row + 0.5) * source.shape[1] / native_height), source.shape[1] - 1)
+            pc = min(int((column + 0.5) * source.shape[2] / native_width), source.shape[2] - 1)
+            if use_bboxes and (pr < bboxes[shell, 0] or pr >= bboxes[shell, 1] or
+                               pc < bboxes[shell, 2] or pc >= bboxes[shell, 3]):
+                continue
+            value = source[shell, pr, pc]
+            if scalar_max:
+                if value > result[offset]:
+                    result[offset] = value
+            elif value != 0:
+                result[offset] = 1
+                break
+
+
+def _radial_planfree_arguments(source, view, radii, output_shape, bboxes=None):
+    base_id, _, _ = _plane_geometry(view, output_shape)
+    source = np.asarray(source)
+    boxes = (np.zeros((source.shape[0], 4), np.int64)
+             if bboxes is None else np.asarray(bboxes, np.int64))
+    return (
+        source, np.asarray(radii, np.float64),
+        int(output_shape[0]), int(output_shape[1]), int(output_shape[2]),
+        int(view.full_t), int(view.full_h), int(view.full_w), int(base_id),
+        float(view.center_x), float(view.center_y),
+        float(view.radial_min_radius), float(view.radial_max_radius),
+        int(view.radial_shell_start), float(view.radial_arc_origin),
+        int(view.src_w), int(view.src_h), int(view.radial_height_origin),
+        bool(view.radial_tilted_source),
+        math.tan(math.radians(float(view.tilt_angle_deg))),
+        str(view.tilt_direction) == 'vertical', boxes, bboxes is not None,
+    )
+
+
+def _pull_radial_chunk_compiled(source, view, radii, output_shape, z, first, stop,
+                                *, scalar_max=False):
+    """Project a bounded flat strip without a global Radial occurrence plan."""
+    if stop < first or first < 0 or stop > int(output_shape[1]) * int(output_shape[2]):
+        raise ValueError('Radial projection strip lies outside the output plane')
+    args = _radial_planfree_arguments(source, view, radii, output_shape)
+    dtype = np.asarray(source).dtype if scalar_max else np.uint8
+    result = np.zeros(int(stop - first), dtype=dtype)
+    _pull_radial_range_into(result, args[0], args[1], int(z), int(first), *args[2:], bool(scalar_max))
+    return result
 
 
 def _radial_block_schedule(depth, plane_bytes, workers):
@@ -534,125 +652,8 @@ def _processing_index(native: np.ndarray, native_count: int, processing_count: i
     )
 
 
-def _occurrence_rows(view, source_stack, radii, columns, stack_length):
-    """Invert shear at the actual discrete shell sample, independently per wrap.
-
-    Radius/arc quantization changes the in-plane point. Reusing the ideal source
-    voxel's inverse-shear height can select zero padding across a source face.
-    Height selection is global before patch offsets, so overlapping bands agree
-    even at nearest-neighbor ties.
-    """
-    height = np.asarray(source_stack, dtype=np.float64)
-    if bool(view.radial_tilted_source):
-        theta = np.remainder((float(view.radial_arc_origin) + columns) / radii, 2.0 * math.pi)
-        offset = radii * (np.sin(theta) if view.tilt_direction == 'vertical' else np.cos(theta))
-        height = height - math.tan(math.radians(float(view.tilt_angle_deg))) * offset
-    global_height = np.rint(np.clip(height, 0.0, float(stack_length - 1))).astype(np.int64)
-    return global_height - int(view.radial_height_origin)
 
 
-def _pull_radial_chunk(
-    source: np.ndarray,
-    view: ViewInfo,
-    radii: np.ndarray,
-    output_shape: Tuple[int, int, int],
-    z: int,
-    first: int,
-    stop: int,
-    *,
-    scalar_max: bool = False,
-) -> np.ndarray:
-    """Project one bounded, flattened source-coordinate XY strip."""
-    out_t, out_h, out_w = output_shape
-    work_t, work_h, work_w = int(view.full_t), int(view.full_h), int(view.full_w)
-    flat = np.arange(first, stop, dtype=np.int64)
-    wt = (float(z) + 0.5) * work_t / out_t - 0.5
-    wy = (flat // out_w + 0.5) * work_h / out_h - 0.5
-    wx = (flat % out_w + 0.5) * work_w / out_w - 0.5
-    base = str(view.radial_base_view)
-    if base == 'transverse':
-        stack, py, px, stack_len = wt, wy, wx, work_t
-    elif base == 'sagittal':
-        stack, py, px, stack_len = wy, np.full(flat.shape, wt), wx, work_h
-    elif base == 'coronal':
-        stack, py, px, stack_len = wx, np.full(flat.shape, wt), wy, work_w
-    else:
-        raise ValueError(f'Unsupported Radial base {base!r}')
-    dx, dy = px - float(view.center_x), py - float(view.center_y)
-    radius = np.hypot(dx, dy)
-    source_stack = np.broadcast_to(np.asarray(stack, dtype=np.float64), flat.shape)
-    height = source_stack.copy()
-    if bool(view.radial_tilted_source):
-        direction = str(view.tilt_direction)
-        if direction not in ('vertical', 'horizontal'):
-            raise ValueError(f'Unsupported Radial tilt direction {direction!r}')
-        axis = dy if direction == 'vertical' else dx
-        height -= math.tan(math.radians(float(view.tilt_angle_deg))) * axis
-    global_shell = _nearest_global_shell(radius, radii)
-    shell = global_shell - int(view.radial_shell_start)
-    valid = (
-        (radius >= float(view.radial_min_radius))
-        & (radius <= float(view.radial_max_radius))
-        & (height >= 0.0) & (height <= float(stack_len - 1))
-        & (shell >= 0) & (shell < source.shape[0])
-    )
-    result = np.zeros(flat.shape, dtype=np.uint8)
-    positions = np.flatnonzero(valid)
-    if not positions.size:
-        return result
-    local_shell = shell[positions]
-    selected_radius = radii[global_shell[positions]]
-    circumference = 2.0 * math.pi * selected_radius
-    theta = np.mod(np.arctan2(dy[positions], dx[positions]), 2.0 * math.pi)
-    width = int(view.src_w)
-
-    # When a circumference is <= one native pixel, every native column contains
-    # a nearest periodic occurrence. Radius zero similarly represents the axis.
-    tiny = circumference <= 1.0
-    if np.any(tiny):
-        tiny_positions = positions[tiny]
-        for column in range(width):
-            rows = _occurrence_rows(
-                view, source_stack[tiny_positions], selected_radius[tiny], column, stack_len,
-            )
-            inside = (rows >= 0) & (rows < int(view.src_h))
-            if np.any(inside):
-                proc_row = _processing_index(rows[inside], int(view.src_h), int(source.shape[1]))
-                proc_col = int(_processing_index(np.asarray(column), width, int(source.shape[2])))
-                values = np.asarray(source[local_shell[tiny][inside], proc_row, proc_col])
-                if scalar_max:
-                    selected = tiny_positions[inside]
-                    result[selected] = np.maximum(result[selected], values)
-                else:
-                    result[tiny_positions[inside]] |= np.asarray(values != 0, dtype=np.uint8)
-    ordinary = ~tiny
-    if not np.any(ordinary):
-        return result
-    positions = positions[ordinary]
-    local_shell = local_shell[ordinary]
-    selected_radius = selected_radius[ordinary]
-    period = circumference[ordinary]
-    arc = theta[ordinary] * selected_radius
-    # Include an occurrence just below zero when it rounds onto column zero.
-    column_float = np.mod(arc - float(view.radial_arc_origin) + 0.5, period) - 0.5
-    while True:
-        column = np.rint(column_float).astype(np.int64)
-        active = (column >= 0) & (column < width)
-        if not np.any(active):
-            break
-        rows = _occurrence_rows(view, source_stack[positions], selected_radius, column, stack_len)
-        active &= (rows >= 0) & (rows < int(view.src_h))
-        if np.any(active):
-            proc_row = _processing_index(rows[active], int(view.src_h), int(source.shape[1]))
-            proc_column = _processing_index(column[active], width, int(source.shape[2]))
-            values = np.asarray(source[local_shell[active], proc_row, proc_column])
-            if scalar_max:
-                selected = positions[active]
-                result[selected] = np.maximum(result[selected], values)
-            else:
-                result[positions[active]] |= np.asarray(values != 0, dtype=np.uint8)
-        column_float += period
-    return result
 
 
 def backproject_radial_volume_to_volume(
@@ -740,51 +741,66 @@ def backproject_radial_volume_to_volume(
             cuda_admission_seconds += time.perf_counter() - started
     try:
         project = None
-        cpu_reference = False
         plan_seconds = setup_seconds = sink_seconds = metadata_host_seconds = cuda_admission_seconds = 0.0
         plan_bytes = 0
         cache_hit = False
-        backend_name = 'cpu_numpy_reference'
-        if _numba is not None or radial_cuda_backproject_enabled():
-            started = time.perf_counter()
-            try:
-                plan, cache_hit = _radial_plane_plan(radial_view, radii, shape)
-            except _RadialPlanePlanTooLarge:
-                # Retain the bounded numerical reference for unusual geometry whose
-                # explicit occurrence map cannot fit the plan budget.
-                plan = None
-            plan_seconds = time.perf_counter() - started
-            if plan is not None:
-                metadata_started = time.perf_counter()
-                metadata = _radial_projection_metadata(
-                    radial_view, source.shape, shape, plan,
-                )
-                metadata_host_seconds = time.perf_counter() - metadata_started
-                centers, ideal, sampled, row_map, column_map, stack_length, vertical = metadata
-                arguments = (
-                    source, plan.shell_index, plan.column_offsets, plan.native_columns,
-                    sampled, row_map, column_map, centers, ideal, int(stack_length),
-                    int(radial_view.radial_height_origin), int(radial_view.src_h), plan.base_id,
-                    bool(vertical), int(plan.plane_shape[1]), int(shape[1]), int(shape[2]),
-                )
-                cuda_stage = try_stage()
-                if cuda_stage is not None:
-                    project = cuda_stage.project
-                    backend_name = 'cuda_factored'
-                elif _numba is not None:
-                    def project(first, count):
-                        return _project_radial_block(*arguments, int(first), int(count), bboxes, bool(use_bboxes))
-                    # Compile before starting output or executor threads. A genuine
-                    # kernel failure must not silently fall back after partial delivery.
-                    project(0, 0)
-                    backend_name = 'cpu_numba_factored'
-                setup_seconds = time.perf_counter() - started
-                plan_bytes = int(plan.nbytes)
-                telemetry = runtime_telemetry()
-                telemetry.gauge('projection.radial.plan_seconds', plan_seconds)
-                telemetry.add('projection.radial.plan_cache_hits', int(cache_hit))
-                telemetry.gauge('projection.radial.plan_bytes', int(plan.nbytes))
-                telemetry.gauge('projection.radial.backend', backend_name)
+        backend_name = 'cpu_numba_factored'
+        started = time.perf_counter()
+        try:
+            plan, cache_hit = _radial_plane_plan(radial_view, radii, shape)
+        except _RadialPlanePlanTooLarge:
+            # A rejected global CSR changes memory strategy, not geometry validity.
+            plan = None
+        plan_seconds = time.perf_counter() - started
+        if plan is not None:
+            metadata_started = time.perf_counter()
+            metadata = _radial_projection_metadata(radial_view, source.shape, shape, plan)
+            metadata_host_seconds = time.perf_counter() - metadata_started
+            centers, ideal, sampled, row_map, column_map, stack_length, vertical = metadata
+            arguments = (
+                source, plan.shell_index, plan.column_offsets, plan.native_columns,
+                sampled, row_map, column_map, centers, ideal, int(stack_length),
+                int(radial_view.radial_height_origin), int(radial_view.src_h), plan.base_id,
+                bool(vertical), int(plan.plane_shape[1]), int(shape[1]), int(shape[2]),
+            )
+            cuda_stage = try_stage()
+            if cuda_stage is not None:
+                project = cuda_stage.project
+                backend_name = 'cuda_factored'
+            else:
+                def project(first, count):
+                    return _project_radial_block(*arguments, int(first), int(count), bboxes, bool(use_bboxes))
+                project(0, 0)
+            plan_bytes = int(plan.nbytes)
+        else:
+            arguments = _radial_planfree_arguments(
+                source, radial_view, radii, shape, bboxes if use_bboxes else None)
+            def project(first, count):
+                if cpu_cancel.is_set():
+                    raise CancelledError('Radial plan-free projection was superseded')
+                result = np.zeros((int(count), int(shape[1]), int(shape[2])), np.uint8)
+                for dz in range(int(count)):
+                    flat = result[dz].reshape(-1)
+                    for pixel in range(0, flat.size, _PULL_CHUNK_VOXELS):
+                        if cpu_cancel.is_set():
+                            raise CancelledError('Radial plan-free projection was superseded')
+                        stop = min(flat.size, pixel + _PULL_CHUNK_VOXELS)
+                        _pull_radial_range_into(flat[pixel:stop], arguments[0], arguments[1],
+                            int(first) + dz, pixel, *arguments[2:], False)
+                return result
+            # A zero-slice wrapper would skip the kernel entirely. Compile the
+            # exact mask signature now, before allocating or publishing output.
+            _pull_radial_range_into(np.empty(0, np.uint8), arguments[0], arguments[1],
+                                    0, 0, *arguments[2:], False)
+            backend_name = 'cpu_numba_planfree'
+        # Compile before output allocation or executor threads. A kernel error
+        # must never follow partial delivery and silently select another path.
+        setup_seconds = time.perf_counter() - started
+        telemetry = runtime_telemetry()
+        telemetry.gauge('projection.radial.plan_seconds', plan_seconds)
+        telemetry.add('projection.radial.plan_cache_hits', int(cache_hit))
+        telemetry.gauge('projection.radial.plan_bytes', plan_bytes)
+        telemetry.gauge('projection.radial.backend', backend_name)
         if (cuda_stage is None and plan is not None and retry_state['retryable']
                 and radial_cuda_backproject_enabled()):
             # CPU setup/JIT can outlast an inference lease. Recheck once before
@@ -792,30 +808,9 @@ def backproject_radial_volume_to_volume(
             cuda_stage = try_stage(quiet=True)
             if cuda_stage is not None:
                 project, backend_name = cuda_stage.project, 'cuda_factored'
-        if project is None:
-            runtime_telemetry().gauge('projection.radial.backend', 'cpu_numpy_reference')
-            cpu_reference = True
-            def project(first, count):
-                # Keep the numerical fallback's exact bounded pull equations.
-                # A single-slice iterator lets it retry CUDA at the same commit
-                # boundary as the compiled CPU path without retaining a volume.
-                if cpu_cancel.is_set():
-                    raise CancelledError('Radial reference projection was superseded')
-                result = np.empty((count, *shape[1:]), np.uint8)
-                for local_z in range(count):
-                    flat = result[local_z].reshape(-1)
-                    for first_pixel in range(0, flat.size, _PULL_CHUNK_VOXELS):
-                        if cpu_cancel.is_set():
-                            raise CancelledError('Radial reference projection was superseded')
-                        stop = min(flat.size, first_pixel + _PULL_CHUNK_VOXELS)
-                        flat[first_pixel:stop] = _pull_radial_chunk(
-                            source, radial_view, radii, shape, first + local_z, first_pixel, stop)
-                return result
         block_depth, actual_workers = _radial_block_schedule(shape[0], shape[1] * shape[2], int(workers))
         if cuda_stage is not None:
             block_depth, actual_workers = int(cuda_stage.max_block_depth), 1
-        elif cpu_reference:
-            block_depth, actual_workers = 1, 1
         encoded_format = getattr(projection_block_callback, 'encoded_slice_format', None)
         compact_output = bool(cuda_stage is not None and sink_only
                               and encoded_format in ('raw_u8', 'packbits_little')
@@ -859,7 +854,7 @@ def backproject_radial_volume_to_volume(
                                                      first_z=next_z) if cuda_stage is not None
                           else _ordered_radial_blocks(project, shape[0], shape[1] * shape[2], int(workers),
                                                       first_z=next_z, cancel_event=cpu_cancel,
-                                                      single_slice=cpu_reference))
+                                                      single_slice=False))
                 try:
                     for z, block in blocks:
                         if z != next_z:

@@ -22,6 +22,8 @@ import time
 
 import numpy as np
 
+from tests.reference_backends.radial import pull_radial_chunk
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from XTA import cylindrical_projection as cp, geometry
 
@@ -106,7 +108,7 @@ def main():
             flat = plane.reshape(-1)
             for first in range(0, flat.size, cp._PULL_CHUNK_VOXELS):
                 stop = min(flat.size, first + cp._PULL_CHUNK_VOXELS)
-                flat[first:stop] = cp._pull_radial_chunk(source, view, radii, output_shape, z, first, stop)
+                flat[first:stop] = pull_radial_chunk(source, view, radii, output_shape, z, first, stop)
             return plane
 
         expected = {}

@@ -107,7 +107,6 @@ class TtaSchedulerOperations:
     gpu_worker_tail_split_point: Callable[..., object]
     gpu_worker_target_lease_seconds: Callable[[], float]
     gpu_worker_task_cost_key: Callable[[Dict[str, object]], Tuple[object, ...]]
-    hybrid_gpu_stealback_enabled: Callable[[], bool]
     hybrid_gpu_stealback_eta_ratio: Callable[[], float]
     hybrid_gpu_stealback_max_fraction: Callable[[], float]
     hybrid_gpu_stealback_min_cpu_samples: Callable[[], int]
@@ -1277,8 +1276,7 @@ class TtaScheduler:
         active_parent = self.active_cpu_shared_parent()
         gpu_seconds = self.gpu_worker_task_seconds if task_seconds is None else task_seconds
         if (
-            not self.operations.hybrid_gpu_stealback_enabled()
-            or active_parent is None
+            active_parent is None
             or not active_cpu_pairs
             or not self.state.cpu_task_queues
             or not self.state.gpu_task_queues
@@ -3566,7 +3564,7 @@ class TtaScheduler:
         push_drain_thread.start()
         print(
             "Scheduler push drain active: arriving results wake the scheduler, "
-            "which owns result handling; YOLO_TTA_SCHEDULER_PUSH_DRAIN=0 selects polling."
+            "which owns result handling."
         )
 
     def notify_gpu_stage_admission_change(self) -> None:

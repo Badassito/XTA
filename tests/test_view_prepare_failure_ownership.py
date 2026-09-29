@@ -224,7 +224,7 @@ class ProjectionReservationTests(unittest.TestCase):
             (path / 'meta.json').write_text(json.dumps({'shape': [6, 3, 4]}), encoding='utf-8')
             queue = mock.Mock()
             submit = ComponentProjectionSubmitter(
-                queue=queue, source_shape=(30, 40, 50), numba_available=True,
+                queue=queue, source_shape=(30, 40, 50),
                 materialize=mock.Mock(),
             )
             view = SimpleNamespace(family='azimuthal', full_t=3, full_h=4, full_w=5,

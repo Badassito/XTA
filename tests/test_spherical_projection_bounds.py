@@ -11,7 +11,7 @@ from unittest import mock
 import numpy as np
 
 from XTA.spherical_geometry import build_spherical_view_infos, cube_rotation
-from XTA.spherical_projection import _project_spherical_block
+from tests.reference_backends.spherical import project_spherical_block as _project_spherical_block
 from XTA.spherical_projection_bounds import _face_direction_bounds, spherical_output_bounds
 from XTA.spherical_projection_cuda import SphericalCudaProjector
 

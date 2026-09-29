@@ -88,21 +88,25 @@ class SphericalMathPreflightTests(unittest.TestCase):
 @unittest.skipUnless(os.environ.get('XTA_TEST_SPHERICAL_CUDA') == '1', 'requires explicit available-GPU qualification')
 class SphericalMathPreflightCudaTests(unittest.TestCase):
     def test_production_plane_bounded_checks_preserve_full_offline_oracle_and_codecs(self):
-        from XTA import spherical_projection as sp
+        from XTA import spherical_projection_cpu as cpu
         from XTA.spherical_geometry import build_spherical_view_infos
         from XTA.spherical_projection_cuda import SphericalCudaProjector
+        from tests.reference_backends.spherical import project_spherical_block
         work = (2911, 3064, 3022)
         shape = (7, 3064, 3022)
         view = build_spherical_view_infos(*work, targets=('transverse',), min_radius=243.,
                                           patch_size=3072, tilted_views=())[0]
         data = np.random.default_rng(142765).integers(0, 2, (view.num_slices, 9, 9), dtype=np.uint8)
-        pull = sp._pull_spherical_chunk
+        prepare = cpu.prepare_spherical_chunk_numba
         visits = []
-        def recorded(*args):
-            visits.append(int(args[7]) - int(args[6]))
-            return pull(*args)
+        def recorded_prepare(*args):
+            pull = prepare(*args)
+            def recorded(*pull_args):
+                visits.append(int(pull_args[7]) - int(pull_args[6]))
+                return pull(*pull_args)
+            return recorded
         with mock.patch.dict(os.environ, {'YOLO_TTA_SPHERICAL_FULL_MATH_PREFLIGHT': '0'}), \
-                mock.patch.object(sp, '_pull_spherical_chunk', side_effect=recorded):
+                mock.patch.object(cpu, 'prepare_spherical_chunk_numba', side_effect=recorded_prepare):
             projector = SphericalCudaProjector(data, view, shape, reserve_bytes=0)
         try:
             self.assertEqual(projector.preflight_mode, 'bounded_windows')
@@ -110,7 +114,7 @@ class SphericalMathPreflightCudaTests(unittest.TestCase):
             self.assertLessEqual(sum(visits), len(projector.preflight_planes) * 32768)
             self.assertLessEqual(max(visits), 32768)
             for first in (0, shape[0] // 2, shape[0] - 1):
-                expected = sp._project_spherical_block(data, view, np.asarray(view.spherical_radii),
+                expected = project_spherical_block(data, view, np.asarray(view.spherical_radii),
                     np.asarray(view.spherical_rotation_xyz).reshape(3, 3), shape, first, 1)
                 np.testing.assert_array_equal(projector.project(first, 1), expected)
                 for packed in (False, True):
@@ -120,7 +124,7 @@ class SphericalMathPreflightCudaTests(unittest.TestCase):
 
     def test_runtime_bounded_and_full_modes_preserve_full_output_parity(self):
         from XTA.spherical_geometry import build_spherical_view_infos
-        from XTA.spherical_projection import _project_spherical_block
+        from tests.reference_backends.spherical import project_spherical_block as _project_spherical_block
         from XTA.spherical_projection_cuda import SphericalCudaProjector
         shape = (7, 257, 263)
         view = build_spherical_view_infos(*shape, targets=('transverse',), min_radius=.5,

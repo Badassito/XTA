@@ -16,8 +16,11 @@ import statistics
 import sys
 import time
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
+
+from tests.reference_backends.radial import pull_radial_chunk
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from XTA import cylindrical_cuda_projection as cuda, cylindrical_projection as radial
@@ -25,22 +28,18 @@ from XTA.geometry import radial_global_radii
 from XTA.cylindrical_geometry import build_radial_view_infos
 from XTA.spherical_geometry import build_spherical_view_infos
 from XTA.spherical_projection_cuda import SphericalCudaProjector
-from XTA.spherical_projection import _project_spherical_block
+from tests.reference_backends.spherical import project_spherical_block
 from tools.benchmark_radial_setup import heatsoak
 
 
 @contextmanager
-def pipeline_mode(enabled):
-    key = 'YOLO_TTA_CROPPED_UPLOAD_PIPELINE'
-    old = os.environ.get(key)
-    os.environ[key] = '1' if enabled else '0'
-    try:
+def event_mode(cp, available):
+    """Compare the default pipeline with its automatic no-event serial fallback."""
+    if available:
         yield
-    finally:
-        if old is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = old
+    else:
+        with mock.patch.object(cp.cuda, 'Event', side_effect=RuntimeError('qualification serial fallback')):
+            yield
 
 
 def slice_boxes(source):
@@ -82,22 +81,21 @@ def qualify_projectors(device):
             radii = np.asarray(radial_global_radii(view), np.float64)
             plan = radial._build_radial_plane_plan(view, radii, shape)
             metadata = radial._radial_projection_metadata(view, source.shape, shape, plan)
-            expected = np.stack([radial._pull_radial_chunk(source, view, radii, shape, z, 0,
+            expected = np.stack([pull_radial_chunk(source, view, radii, shape, z, 0,
                 shape[1] * shape[2]).reshape(shape[1:]) for z in range(shape[0])])
             make = lambda: cuda.RadialCudaProjector(source, plan, metadata, view, shape,
                 boxes, True, device, upload_bytes=37, reserve_bytes=0)
         else:
-            expected = _project_spherical_block(source, view, np.asarray(view.spherical_radii),
+            expected = project_spherical_block(source, view, np.asarray(view.spherical_radii),
                 np.asarray(view.spherical_rotation_xyz).reshape(3, 3), shape, 0, shape[0], boxes)
             make = lambda: SphericalCudaProjector(source, view, shape, boxes,
                 device_index=device, upload_bytes=37, reserve_bytes=0)
-        for enabled in (False, True):
-            with pipeline_mode(enabled), make() as projector:
-                np.testing.assert_array_equal(projector._source_gpu.get()[:packed.size], packed)
-                np.testing.assert_array_equal(projector.project(0, shape[0]), expected)
-                assert bool(projector.source_upload_pipeline) == enabled
-                records.append({'family': view.family, 'requested': enabled,
-                                'exact_source_and_projection': True, **upload_metrics(projector)})
+        with make() as projector:
+            np.testing.assert_array_equal(projector._source_gpu.get()[:packed.size], packed)
+            np.testing.assert_array_equal(projector.project(0, shape[0]), expected)
+            assert bool(projector.source_upload_pipeline)
+            records.append({'family': view.family, 'exact_source_and_projection': True,
+                            **upload_metrics(projector)})
     return records
 
 
@@ -115,7 +113,7 @@ def run_upload(cp, source, boxes, offsets, stage_bytes, device, enabled, expecte
             projector._upload_pin = pin_pool.malloc(stage_bytes)
             projector._upload_stage = np.frombuffer(projector._upload_pin, np.uint8, count=stage_bytes)
             try:
-                with pipeline_mode(enabled):
+                with event_mode(cp, enabled):
                     started = time.perf_counter()
                     projector._upload_cropped_source(source)
                     elapsed = time.perf_counter() - started
@@ -125,7 +123,7 @@ def run_upload(cp, source, boxes, offsets, stage_bytes, device, enabled, expecte
                     digest.update(projector._source_gpu[first:first + stage_bytes].get().tobytes())
                 assert digest.hexdigest() == expected_sha
                 assert bool(projector.source_upload_pipeline) == enabled
-                return {'requested': enabled, 'upload_seconds': elapsed, 'packed_sha256': digest.hexdigest(),
+                return {'events_available': enabled, 'upload_seconds': elapsed, 'packed_sha256': digest.hexdigest(),
                         'source_h2d_bytes': projector.source_h2d_bytes, **upload_metrics(projector)}
             finally:
                 # If this fence fails, none of the following owner release occurs.
@@ -183,7 +181,7 @@ def main():
         if args.heat_seconds:
             heatsoak(args.heat_seconds, args.device)
         report['projector_parity'] = qualify_projectors(args.device)
-        # Warm both upload variants and page mappings before the timed ABBA rounds.
+        # Warm the pipeline and automatic no-event fallback before timed ABBA rounds.
         for enabled in (False, True):
             run_upload(cp, np.asarray(source), boxes, offsets, report['pinned_stage_bytes'],
                        args.device, enabled, expected_sha)
@@ -195,7 +193,7 @@ def main():
                 print(json.dumps(result), flush=True)
                 (root / 'qualification.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf8')
         report['median_seconds'] = {str(enabled): statistics.median(
-            r['upload_seconds'] for r in report['runs'] if r['requested'] == enabled) for enabled in (False, True)}
+            r['upload_seconds'] for r in report['runs'] if r['events_available'] == enabled) for enabled in (False, True)}
         report['speedup'] = report['median_seconds']['False'] / report['median_seconds']['True']
         (root / 'qualification.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf8')
         print(json.dumps({'median_seconds': report['median_seconds'], 'speedup': report['speedup']}), flush=True)

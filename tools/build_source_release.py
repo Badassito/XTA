@@ -17,7 +17,7 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE_DIRECTORIES = ('XTA/', 'tools/', 'native/', 'tests/', 'release/')
+SOURCE_DIRECTORIES = ('XTA/', 'tools/', 'native/', 'tests/', 'release/', 'docs/')
 SOURCE_SUFFIXES = {'.py', '.json', '.md', '.c', '.h', '.sh', '.ps1'}
 ROOT_FILES = {'ARCHITECTURE.md', 'pyproject.toml', 'setup.py', 'MANIFEST.in',
               '.gitignore', '.gitattributes'}

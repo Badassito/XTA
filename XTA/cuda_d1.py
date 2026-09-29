@@ -30,7 +30,7 @@ from typing import (
 )
 import numpy as np
 from .cylindrical_cuda_projection import RadialEncodedBlock, RadialEncodedSlice
-from .packed_publication import encode_owner_packed_block, _packed_owner_metadata
+from .packed_publication import encode_owner_packed_block
 from .publication_memory import publication_ram_headroom
 
 from .geometry import (
@@ -997,7 +997,6 @@ def _d1_finalize_bitset_layer(
     if encoded_blocks is not None:
         _validate_encoded_publication_blocks(encoded_blocks, output_shape, packed=packed)
     store_format = INTERNAL_PACKED_CVOL_FORMAT if packed else CVOL_FORMAT
-    direct_packed = bool(packed and _packed_owner_metadata is not None)
     writer = IncrementalRawBBoxMaskStoreWriter(
         shape=tuple(int(v) for v in output_shape),
         store_dir=Path(store_dir),
@@ -1061,17 +1060,10 @@ def _d1_finalize_bitset_layer(
             if not bool(np.any(words[w0:w1])):
                 writer.consume_empty_range(int(z0), int(z1 - z0))
                 continue
-            encoded = None
-            if direct_packed:
-                try:
-                    encoded = encode_owner_packed_block(words, output_shape, z0, z1 - z0)
-                except Exception as exc:
-                    direct_packed = False
-                    print(f'Direct packed publication unavailable; using bounded NumPy packing: {exc}', flush=True)
-            if encoded is not None:
-                records, payload = encoded
+            if packed:
+                records, payload = encode_owner_packed_block(words, output_shape, z0, z1 - z0)
                 writer.consume_encoded_block(z0, records, payload, packed=True)
-                del records, payload, encoded
+                del records, payload
                 continue
             block = _d1_unpack_bitset_z_block(words, output_shape, int(z0), int(z1))
             writer.consume(int(z0), block)
@@ -2349,9 +2341,6 @@ def _memmap_backing_path(arr: object) -> Optional[Path]:
 
 def temp_binary_archive_enabled() -> bool:
     return _env_flag('YOLO_TTA_ARCHIVE_TEMP_BINARY_VOLUMES', True)
-
-def raw_bbox_nrrd_layers_enabled() -> bool:
-    return _env_flag('YOLO_TTA_RAW_BBOX_NRRD_LAYERS', True)
 
 def tile_intermediate_accumulators_prefer_memory() -> bool:
     """Keep tile staging/consolidation canvases in process-reopenable RAM by default."""

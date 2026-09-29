@@ -14,6 +14,20 @@ import numpy as np
 from XTA import interpolation, runtime, topology
 
 
+def _local_label_fixture(labels: np.ndarray):
+    counts = np.max(labels, axis=(1, 2)).astype(np.uint32)
+    offsets = np.zeros(len(counts), dtype=np.int64)
+    if len(counts) > 1:
+        offsets[1:] = np.cumsum(counts.astype(np.int64) + 1)[:-1]
+    flat = np.concatenate([np.arange(int(count) + 1, dtype=np.uint32) for count in counts])
+
+    def _label(*_args: object, component_stats_out: dict[str, object], **_kwargs: object):
+        component_stats_out['slice_local_luts'] = topology.SliceLocalLabelLUTs(flat, offsets, counts)
+        return labels, 2, []
+
+    return _label
+
+
 class _RecordingMembership:
     def __init__(self, words: np.ndarray):
         self.words = words
@@ -182,8 +196,7 @@ class InterpolationSparseExportTests(unittest.TestCase):
                 seed = interpolation.SliceEndpointSeed(label=1, point=(0,4,5), direction_sign=1)
                 root = Path(tmp)
                 with (
-                    mock.patch.object(topology, 'interpolation_skip_compact_relabel_enabled', return_value=False),
-                    mock.patch.object(topology, 'label_foreground_volume_streaming', return_value=(labels, 2, [])),
+                    mock.patch.object(topology, 'label_foreground_volume_streaming', side_effect=_local_label_fixture(labels)),
                     mock.patch.object(interpolation, '_build_slice_endpoint_seeds', return_value=([seed], 1)),
                     mock.patch.object(interpolation, '_plan_slice_seed_bridges', return_value=result),
                     mock.patch.object(interpolation, 'should_use_in_memory_workspace', return_value=True),

@@ -118,23 +118,6 @@ def set_retina_mask_processor(processor: str) -> None:
 
 _ANGLE_VARIANT_GPU_FASTPATH: Optional[Tuple[float, float]] = None
 
-def gpu_retina_flatten_enabled() -> bool:
-    """Flatten GPU retina masks (n,H,W) -> union + max-conf planes before PCIe copy.
-
- Active only when retina masks are resolved on the GPU (not cpu_retina_masks_enabled). The env
- flag YOLO_TTA_GPU_RETINA_FLATTEN (default on) allows forcing the legacy whole-stack copy for
- regression comparison."""
-    return _env_flag('YOLO_TTA_GPU_RETINA_FLATTEN', True)
-
-def gpu_retina_warp_enabled() -> bool:
-    """Perform the flattened-plane affine warp to view-native space on the GPU.
-
- When enabled, the union and max-confidence planes are warped to view-native space on the GPU
- (torch grid_sample) before the host copy, so neither affine warp runs on the CPU and only the
- view-native planes cross PCIe. YOLO_TTA_GPU_RETINA_WARP=0 keeps the warps on the CPU (the
- flattened out-size planes are copied down and cv2.warpAffine'd) for regression comparison."""
-    return _env_flag('YOLO_TTA_GPU_RETINA_WARP', True)
-
 def gpu_retina_eager_flatten_enabled() -> bool:
     """Run the cheap GPU union/max-conf reduction on the model-stream thread.
 
@@ -160,18 +143,6 @@ def gpu_retina_cleanup_enabled() -> bool:
     
     Hole filling remains a completed-view or task-end operation so cleanup order is preserved."""
     return _env_flag('YOLO_TTA_GPU_RETINA_CLEANUP', True)
-
-def gpu_retina_proto_union_enabled() -> bool:
-    """Compute the GPU retina union at PROTO resolution inside construct_result.
-
- Active only in GPU retina mask mode. Instead of Ultralytics materializing an
- (n, imgsz, imgsz) float retina stack per image (a batch-scaled VRAM transient of
- batch x n x 16 MB that this pipeline immediately reduces to one plane), the patched
- construct_result box-crops the per-instance mask logits at proto scale, reduces them to a
- single max-logit plane, and bilinearly upsamples ONE plane to the network raster. Box-edge
- differences are sub-voxel scale. YOLO_TTA_GPU_PROTO_UNION=0 restores the native retina
- stack + flatten path."""
-    return _env_flag('YOLO_TTA_GPU_PROTO_UNION', True)
 
 def gpu_postprocess_side_stream_enabled() -> bool:
     """Run the GPU postprocess tail on a per-thread side CUDA stream."""
@@ -661,10 +632,6 @@ def cpu_retina_masks_enabled() -> bool:
         return bool(_RETINA_MASK_PROCESSOR_IS_CPU)
     return True
 
-def cpu_retina_roi_only_enabled() -> bool:
-    """Use bbox-ROI-only CPU upsampling instead of reconstructing every full-size instance mask."""
-    return _env_flag('YOLO_TTA_CPU_RETINA_ROI_ONLY', True)
-
 def cpu_retina_block_detections() -> int:
     """Number of mask logits to reconstruct per CPU matrix-multiply block."""
     return max(1, _env_int('YOLO_TTA_CPU_RETINA_BLOCK_DETECTIONS', 8))
@@ -955,10 +922,6 @@ def _resize_lowres_logits_roi(
 
     if low_h == target_h and low_w == target_w:
         return np.ascontiguousarray(low[y1:y2, x1:x2], dtype=np.float32)
-
-    if not cpu_retina_roi_only_enabled():
-        full = cv2.resize(low, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-        return np.ascontiguousarray(full[y1:y2, x1:x2], dtype=np.float32)
 
     # Destination pixel-center to source-coordinate mapping for bilinear resize with
     # align_corners=False. Coordinates outside the low-resolution raster are edge-clamped,
@@ -1309,7 +1272,7 @@ def ensure_gpu_retina_proto_union_predictor_patch() -> bool:
  original Ultralytics construct_result."""
     global _ULTRALYTICS_GPU_PROTO_UNION_PATCHED
 
-    if cpu_retina_masks_enabled() or not gpu_retina_proto_union_enabled():
+    if cpu_retina_masks_enabled():
         return False
     if _ULTRALYTICS_GPU_PROTO_UNION_PATCHED:
         return True
@@ -1331,7 +1294,7 @@ def ensure_gpu_retina_proto_union_predictor_patch() -> bool:
     )
 
     def _tta_gpu_proto_union_construct_result(self, pred, img, orig_img, img_path, proto):  # type: ignore[no-untyped-def]
-        if cpu_retina_masks_enabled() or not gpu_retina_proto_union_enabled():
+        if cpu_retina_masks_enabled():
             return original_construct_result(self, pred, img, orig_img, img_path, proto)
         payload = _build_gpu_flattened_payload_from_proto(pred, img, proto)
         if payload is None:
@@ -1695,7 +1658,7 @@ def _extract_result_masks_and_confs(r) -> Tuple[Optional[object], Optional[np.nd
     # in GPU retina mode, flatten (n,H,W) -> union + max-conf on the GPU and copy
     # only those 2 planes. The flattened payload carries its own confidence plane, so the second
     # return value is None. Falls back to the legacy whole-stack copy below on any failure.
-    if gpu_retina_flatten_enabled() and not cpu_retina_masks_enabled():
+    if not cpu_retina_masks_enabled():
         flattened = _try_flatten_gpu_retina_result(r, masks_data)
         if flattened is not None:
             return flattened, None
@@ -1795,16 +1758,6 @@ def gpu_device_union_enabled() -> bool:
 def gpu_device_hole_fill_enabled() -> bool:
     """2D-hole-fill eligible device unions before they are committed."""
     return _env_flag('YOLO_TTA_GPU_HOLE_FILL', True)
-
-def gpu_worker_chunk_hole_fill_enabled() -> bool:
-    """Allow split full-frame leases to run a whole-chunk GPU hole fill before handoff.
-
-    Disabled by default because the CuPy connected-component pass and allocator trim are
-    task-boundary barriers. Split views instead receive one parallel CPU hole-fill pass after
-    their last inference lease, preserving the same per-slice result while keeping workers hot.
-    Single-lease views and independent tile tasks retain their existing device-fill behavior.
-    """
-    return _env_flag('YOLO_TTA_GPU_WORKER_CHUNK_HOLE_FILL', False)
 
 def gpu_union_flush_overlap_enabled() -> bool:
     """Retire CUDA-worker task unions on persistent event-driven D2H lanes.
@@ -2554,9 +2507,6 @@ def _process_gpu_flattened_prediction_frame(
 
     try:
         import torch  # type: ignore
-        if not gpu_retina_warp_enabled():
-            raise RuntimeError('gpu retina warp disabled')
-
         # the whole postprocess tail runs on this thread's side CUDA stream,
         # ordered against the producer via the payload's recorded event, so warp/quantize/D2H
         # no longer serialize with TensorRT kernel issue on the default stream.
@@ -3655,7 +3605,7 @@ def _direct_predict_applicable(cfg: 'PredictConfig') -> bool:
     """Direct loop preconditions: proto-union consume path + a CUDA device."""
     if not direct_predict_enabled():
         return False
-    if cpu_retina_masks_enabled() or not gpu_retina_proto_union_enabled():
+    if cpu_retina_masks_enabled():
         return False
     try:
         import torch  # type: ignore
@@ -3746,18 +3696,16 @@ _DIRECT_COMPACTION_LAYOUTS: set[Tuple[object, ...]] = set()
 _DIRECT_COMPACTION_LAYOUT_LOCK = threading.Lock()
 
 
-def _announce_direct_compaction_layout(torch_mod, head, proto, *, enabled, allow_tiled, kernel_name):
+def _announce_direct_compaction_layout(torch_mod, head, proto, *, allow_tiled, kernel_name):
     """Explain at most 64 distinct layout/policy decisions without reading device data."""
     head_shape, proto_shape = tuple(map(int, head.shape)), tuple(map(int, proto.shape))
     key = (head_shape, str(head.dtype), proto_shape, str(proto.dtype),
-           bool(enabled), bool(allow_tiled), str(kernel_name))
+           bool(allow_tiled), str(kernel_name))
     with _DIRECT_COMPACTION_LAYOUT_LOCK:
         if key in _DIRECT_COMPACTION_LAYOUTS or len(_DIRECT_COMPACTION_LAYOUTS) >= 64:
             return
         _DIRECT_COMPACTION_LAYOUTS.add(key)
     reasons = []
-    if not enabled:
-        reasons.append('tiled_option_disabled')
     if not allow_tiled:
         reasons.append('tiled_disabled_after_workspace_failure')
     supported_dtypes = (torch_mod.float16, getattr(torch_mod, 'float32', None))
@@ -3774,7 +3722,7 @@ def _announce_direct_compaction_layout(torch_mod, head, proto, *, enabled, allow
     print(f'Direct compaction layout [pid={os.getpid()}]: '
           f'head_shape={head_shape}, head_dtype={head.dtype}, '
           f'proto_shape={proto_shape}, proto_dtype={proto.dtype}, '
-          f'tiled_option={bool(enabled)}, selected={kernel_name}, '
+          f'selected={kernel_name}, '
           f'reason={";".join(reasons) if reasons else "eligible"}', flush=True)
 
 def direct_device_compaction_enabled() -> bool:
@@ -3842,15 +3790,12 @@ def _build_direct_device_compacted_payload(
         cp_conf_proto = cp.asarray(conf_proto) if conf_proto is not None else None
         packed_refs = ()
         kernel_name = 'scalar'
-        tiled_enabled = _env_flag('YOLO_TTA_DIRECT_TILED_PROTO_UNION', True)
         tiled_tag = (
             'f16' if _tiled_f16_proto_union_applicable(torch, head, proto)
             else 'f32' if _tiled_f32_proto_union_applicable(torch, head, proto)
             else None
         )
-        use_tiled = bool(
-            allow_tiled and tiled_enabled and tiled_tag is not None
-        )
+        use_tiled = bool(allow_tiled and tiled_tag is not None)
         if use_tiled:
             # Preserve every accepted detection: capacity is the bounded backend
             # anchor count, exactly as in the resident ring. Keep these owners with
@@ -3870,7 +3815,7 @@ def _build_direct_device_compacted_payload(
         if use_tiled:
             kernel_name = f'tiled_{tiled_tag}'
         _announce_direct_compaction_layout(
-            torch, head, proto, enabled=tiled_enabled, allow_tiled=allow_tiled, kernel_name=kernel_name,
+            torch, head, proto, allow_tiled=allow_tiled, kernel_name=kernel_name,
         )
         if use_tiled:
             tile_width = 64 if tiled_tag == 'f16' else 32
@@ -4480,7 +4425,7 @@ def predict_source_and_accumulate(
         # planes on this (stream) thread so the full stack is released immediately, and bound the queue so
         # only a capped number of GPU-resident flattened frames stay alive (avoids device OOM).
         gpu_flatten_eager = bool(
-            gpu_retina_flatten_enabled() and not cpu_retina_masks_enabled() and gpu_retina_eager_flatten_enabled()
+            not cpu_retina_masks_enabled() and gpu_retina_eager_flatten_enabled()
         )
         effective_pending_limit = int(pending_limit)
         if gpu_flatten_eager:
@@ -4903,7 +4848,7 @@ def predict_source_and_submit_accumulation(
         # eagerly reduce GPU stacks to 2 small planes on this thread and bound the queue
         # so GPU-resident flattened frames stay capped (see predict_source_and_accumulate).
         gpu_flatten_eager = bool(
-            gpu_retina_flatten_enabled() and not cpu_retina_masks_enabled() and gpu_retina_eager_flatten_enabled()
+            not cpu_retina_masks_enabled() and gpu_retina_eager_flatten_enabled()
         )
         if gpu_flatten_eager:
             gpu_cap = gpu_retina_flatten_pending_limit(max(1, int(getattr(postprocess_executor, '_max_workers', 1) or 1)))

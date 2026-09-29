@@ -13,6 +13,21 @@ import numpy as np
 from XTA import assembly, interpolation, outputs, runtime, topology
 
 
+def _local_label_fixture(labels: np.ndarray, num_objects: int):
+    """Supply canonical identity LUTs when a test stubs the topology stage."""
+    counts = np.max(labels, axis=(1, 2)).astype(np.uint32)
+    offsets = np.zeros(len(counts), dtype=np.int64)
+    if len(counts) > 1:
+        offsets[1:] = np.cumsum(counts.astype(np.int64) + 1)[:-1]
+    flat = np.concatenate([np.arange(int(count) + 1, dtype=np.uint32) for count in counts])
+
+    def _label(*_args: object, component_stats_out: dict[str, object], **_kwargs: object):
+        component_stats_out['slice_local_luts'] = topology.SliceLocalLabelLUTs(flat, offsets, counts)
+        return labels.copy(), num_objects, []
+
+    return _label
+
+
 def _wait_for_membership_retirement(component_dir: Path) -> None:
     """Observe deferred scratch retirement before asserting directory cleanup."""
     gc.collect()
@@ -269,9 +284,11 @@ class InterpolationComponentDecompositionTests(unittest.TestCase):
         ]
         observed_label_inputs: list[np.ndarray] = []
 
-        def _label_current_union(mask_arg: np.ndarray, *_args: object, **_kwargs: object):
+        local_labeler = _local_label_fixture(labels, 2)
+
+        def _label_current_union(mask_arg: np.ndarray, *_args: object, **kwargs: object):
             observed_label_inputs.append(np.array(mask_arg, copy=True))
-            return labels.copy(), 2, []
+            return local_labeler(mask_arg, **kwargs)
 
         seed1 = interpolation.SliceEndpointSeed(label=1, point=(0, 2, 2), direction_sign=1)
         seed2 = interpolation.SliceEndpointSeed(label=1, point=(1, 2, 2), direction_sign=1)
@@ -295,11 +312,6 @@ class InterpolationComponentDecompositionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with (
-                mock.patch.object(
-                    topology,
-                    'interpolation_skip_compact_relabel_enabled',
-                    return_value=False,
-                ),
                 mock.patch.object(
                     topology,
                     'label_foreground_volume_streaming',
@@ -410,11 +422,6 @@ class InterpolationComponentDecompositionTests(unittest.TestCase):
             with (
                 mock.patch.object(
                     topology,
-                    'interpolation_skip_compact_relabel_enabled',
-                    return_value=False,
-                ),
-                mock.patch.object(
-                    topology,
                     'label_foreground_volume_streaming',
                     side_effect=RuntimeError('injected labeling failure'),
                 ),
@@ -479,13 +486,8 @@ class InterpolationComponentDecompositionTests(unittest.TestCase):
             with (
                 mock.patch.object(
                     topology,
-                    'interpolation_skip_compact_relabel_enabled',
-                    return_value=False,
-                ),
-                mock.patch.object(
-                    topology,
                     'label_foreground_volume_streaming',
-                    return_value=(labels, 2, []),
+                    side_effect=_local_label_fixture(labels, 2),
                 ),
                 mock.patch.object(
                     interpolation,

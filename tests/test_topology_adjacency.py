@@ -1,9 +1,7 @@
 """Adjacent-slice pair contracts, independent oracle, spills, and ownership."""
 from __future__ import annotations
 
-import contextlib
 from concurrent.futures import ThreadPoolExecutor
-import io
 import unittest
 from unittest import mock
 
@@ -173,37 +171,28 @@ class TopologyAdjacencyTests(unittest.TestCase):
         for index in range(1, len(returned)):
             np.testing.assert_array_equal(returned[index], expected[index % len(expected)])
 
-    def test_disabled_or_unavailable_numba_uses_reference_without_native_attempt(self):
+    def test_missing_compiled_kernel_does_not_enter_reference_path(self):
         previous = np.array([[0, 1], [2, 0]], dtype=np.uint16)
         current = np.array([[3, 0], [0, 4]], dtype=np.uint16)
-        expected = oracle(previous, current)
-        for unavailable in (False, True):
-            with self.subTest(unavailable=unavailable), mock.patch.object(
-                topology, '_compiled_adjacent_gid_pair_codes', side_effect=AssertionError('native attempt'),
-            ), mock.patch.object(
-                topology, '_numba_adjacency_scan_kernel', None if unavailable else object(),
-            ), mock.patch.object(topology, 'compiled_topology_kernels_enabled', return_value=unavailable):
-                np.testing.assert_array_equal(topology._adjacent_gid_pair_codes(previous, current), expected)
+        with mock.patch.object(topology, '_numba_adjacency_scan_kernel', None), \
+                mock.patch.object(topology, '_adjacent_gid_pair_codes_numpy', side_effect=AssertionError('reference attempt')):
+            with self.assertRaisesRegex(RuntimeError, 'kernel is unavailable'):
+                topology._adjacent_gid_pair_codes(previous, current)
 
-    def test_native_failure_replays_reference_once_and_preserves_iterable_offsets(self):
+    def test_native_failure_is_reported_without_reference_replay(self):
         previous = np.array([[1, 0, 2], [0, 3, 0]], dtype=np.uint16)
         current = np.array([[0, 4, 0], [5, 0, 6]], dtype=np.uint16)
         offsets = ((0, 1), (1, -1), (-1, 0))
-        expected = oracle(previous, current, offsets, 41, 77)
         telemetry = mock.Mock()
-        with mock.patch.object(topology, '_NUMBA_ADJACENCY_RUNTIME_DISABLED', False), \
-                mock.patch.object(topology, '_numba_adjacency_scan_kernel', object()), \
-                mock.patch.object(topology, 'compiled_topology_kernels_enabled', return_value=True), \
+        with mock.patch.object(topology, '_numba_adjacency_scan_kernel', object()), \
                 mock.patch.object(topology, 'runtime_telemetry', return_value=telemetry), \
                 mock.patch.object(topology, '_compiled_adjacent_gid_pair_codes', side_effect=RuntimeError('native unavailable')) as native, \
-                contextlib.redirect_stdout(io.StringIO()) as output:
+                mock.patch.object(topology, '_adjacent_gid_pair_codes_numpy', side_effect=AssertionError('reference attempt')):
             for _ in range(2):
-                actual = topology._adjacent_gid_pair_codes(previous, current, iter(offsets), 41, 77)
-                np.testing.assert_array_equal(actual, expected)
-            self.assertTrue(topology._NUMBA_ADJACENCY_RUNTIME_DISABLED)
-        self.assertEqual(native.call_count, 1)
-        self.assertEqual(output.getvalue().count('compiled adjacency failed'), 1)
-        telemetry.fallback.assert_called_once()
+                with self.assertRaisesRegex(RuntimeError, 'Compiled topology adjacency failed'):
+                    topology._adjacent_gid_pair_codes(previous, current, iter(offsets), 41, 77)
+        self.assertEqual(native.call_count, 2)
+        self.assertEqual(telemetry.fallback.call_count, 2)
 
 
 if __name__ == '__main__':

@@ -48,10 +48,10 @@ class CylindricalCudaDispatchTests(unittest.TestCase):
             close=close or mock.Mock(),
         )
 
-    def test_busy_gpu_falls_back_to_reference_without_changing_source(self):
+    def test_busy_gpu_uses_compiled_cpu_without_changing_source(self):
         delivered = []
         with mock.patch.object(cp, '_try_radial_cuda_stage', return_value=None), \
-                mock.patch.object(cp, '_numba', None):
+                mock.patch.object(cp, '_radial_block_schedule', return_value=(1, 1)):
             self.call(lambda z, block: delivered.append((z, block.copy())))
         self.assertEqual([z for z, _ in delivered], list(range(self.shape[0])))
         self.assertEqual(np.concatenate([b for _, b in delivered]).shape, self.shape)
@@ -231,9 +231,7 @@ class CylindricalCudaDispatchTests(unittest.TestCase):
         torch.cuda.mem_get_info.assert_not_called()
 
     def test_radial_uses_inference_priority_even_with_legacy_backprojection_overlap(self):
-        with mock.patch.object(backprojection, 'main_process_gpu_stage_inference_priority_enabled', return_value=True), \
-                mock.patch.object(backprojection, 'main_process_gpu_stage_inference_overlap_enabled', return_value=False), \
-                mock.patch.object(backprojection, 'v1613_d1_backprojection_overlap_enabled', return_value=True):
+        with mock.patch.object(backprojection, 'v1613_d1_backprojection_overlap_enabled', return_value=True):
             coordinator = backprojection._MainProcessGpuStageCoordinator()
             coordinator.configure_workers([0, 1])
             torch = types.SimpleNamespace(

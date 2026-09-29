@@ -157,8 +157,7 @@ class FrozenTiltedAzimuthalCpuTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()), \
                 mock.patch.dict(os.environ, {'YOLO_TTA_GPU_TILTED_AZIMUTHAL_BACKPROJECT': '0'}), \
-                mock.patch.object(bp, 'allocate_workspace_array', side_effect=lambda **kw: np.zeros(kw['shape'], kw['dtype'])), \
-                mock.patch.object(bp, '_numba_or_tilted_azimuthal_coordinates_into_packed', None):
+                mock.patch.object(bp, 'allocate_workspace_array', side_effect=lambda **kw: np.zeros(kw['shape'], kw['dtype'])):
             for index, view in enumerate(tilted_views() + tilted_views((45.,), shape=(6, 8, 10))):
                 for shape in ((5, 7, 9), (3, 4, 5), (7, 9, 13)):
                     source = source_for(view, seed=index)

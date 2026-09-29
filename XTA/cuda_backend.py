@@ -38,7 +38,6 @@ from .workspace import (
     _env_int,
     _tilted_grid_is_identity,
     azimuthal_source_mode,
-    tilted_inplane_linear_enabled,
 )
 from .runtime import (
     choose_slice_parallel_workers,
@@ -102,24 +101,19 @@ if TYPE_CHECKING:
 def open_existing_gray_memmap(path: object, shape: Sequence[int], dtype: object = np.uint8, mode: str = 'r') -> np.memmap:
     return np.memmap(Path(path), dtype=np.dtype(dtype), mode=str(mode), shape=tuple(int(x) for x in shape))
 
-if _numba is not None:
-    @_numba.njit(cache=True, nogil=True)
-    def _union_conf_slice_inplace(dst_mask, dst_conf, src_mask, src_conf):
-        for y in range(dst_mask.shape[0]):
-            for x in range(dst_mask.shape[1]):
-                mask = src_mask[y, x]
-                confidence = src_conf[y, x]
-                if mask != 0 and (dst_mask[y, x] == 0 or confidence > dst_conf[y, x]):
-                    dst_mask[y, x] = mask
-                    dst_conf[y, x] = confidence
-else:
-    _union_conf_slice_inplace = None
+@_numba.njit(cache=True, nogil=True)
+def _union_conf_slice_inplace(dst_mask, dst_conf, src_mask, src_conf):
+    for y in range(dst_mask.shape[0]):
+        for x in range(dst_mask.shape[1]):
+            mask = src_mask[y, x]
+            confidence = src_conf[y, x]
+            if mask != 0 and (dst_mask[y, x] == 0 or confidence > dst_conf[y, x]):
+                dst_mask[y, x] = mask
+                dst_conf[y, x] = confidence
 
 
 def _union_conf_fused_eligible(arrays) -> bool:
     """Use direct writes only for disjoint contiguous byte volumes."""
-    if _union_conf_slice_inplace is None:
-        return False
     if any(not isinstance(array, np.ndarray) or array.dtype != np.uint8
            or array.ndim != 3 or not array.flags.c_contiguous for array in arrays):
         return False
@@ -173,12 +167,11 @@ def union_conf_volume_into_volume_inplace(
         (dst_mask_mm, dst_conf_mm, src_mask_mm, src_conf_mm)
     )
     if use_fused:
-        try:
-            # Compile the exact writable/readonly signatures before any destination writes.
-            _union_conf_slice_inplace(*(np.asarray(array[0, :0]) for array in
-                                       (dst_mask_mm, dst_conf_mm, src_mask_mm, src_conf_mm)))
-        except Exception:
-            use_fused = False
+        # Validate the required compiled signature before any destination writes.
+        # Aliased, strided and conversion-dependent layouts retain the native-array
+        # implementation below; compiler failure is not a layout fallback.
+        _union_conf_slice_inplace(*(np.asarray(array[0, :0]) for array in
+                                   (dst_mask_mm, dst_conf_mm, src_mask_mm, src_conf_mm)))
 
     def _merge_slice(idx: int) -> None:
         i = int(idx)
@@ -237,13 +230,6 @@ def gpu_render_reserve_bytes() -> int:
 def gpu_render_tblock_slices() -> int:
     """Transient source t-block size for streaming-mode GPU azimuthal prerendering."""
     return max(16, _env_int('YOLO_TTA_GPU_RENDER_TBLOCK_SLICES', 256))
-
-def gpu_cube_resize_enabled() -> bool:
-    """Fold eligible T-axis cube scaling into resident GPU renderers.
-
-    The host cube stays deferred until a CPU, tile, or nonresident fallback requests it.
-    """
-    return _env_flag('YOLO_TTA_GPU_CUBE_RESIZE', True)
 
 def fused_direct_render_enabled() -> bool:
     """Allow resident-ring renderers to write normalized pixels straight to TRT bindings."""
@@ -1004,19 +990,12 @@ def _fused_direct_render_kernels() -> Optional[object]:
     __device__ __forceinline__ float tilted_direct_value(
         const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
         int src_h, int src_w, int stack_len, int base_id, int direction_id,
-        const int* render_meta, float tan_tilt, int inplane_linear,
+        const int* render_meta, float tan_tilt,
         int quantize_native_taps, int oy, int ox,
         float m00, float m01, float m02, float m10, float m11, float m12) {
       int frame_center = render_meta[0];
       float sx = __fadd_rn(__fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
       float sy = __fadd_rn(__fadd_rn(__fmul_rn(m10, (float)ox), __fmul_rn(m11, (float)oy)), m12);
-      if (!inplane_linear) {
-        int x = __float2int_rn(sx);
-        int y = __float2int_rn(sy);
-        return tilted_native_value(volume, native_t, full_h, full_w, logical_t,
-            src_h, src_w, stack_len, base_id, direction_id, frame_center, tan_tilt,
-            x, y, direction_id == 0 ? sy : sx);
-      }
       // v16.1.8 forward-pass bilinear: match align_corners=False zero-padded warp
       // semantics on the native tilted raster (the same contract the Cartesian
       // grid_sample warp and the azimuthal kernels' edge handling use).
@@ -1057,7 +1036,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
     extern "C" __global__ void tilted_direct_f32(
         const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
         int src_h, int src_w, int stack_len, int base_id, int direction_id,
-        const int* render_meta, float tan_tilt, int inplane_linear,
+        const int* render_meta, float tan_tilt,
         int quantize_native_taps, int oh, int ow,
         float m00, float m01, float m02, float m10, float m11, float m12, float* out) {
       int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
@@ -1066,14 +1045,14 @@ def _fused_direct_render_kernels() -> Optional[object]:
       int q = oy * ow + ox;
       out[q] = norm_u8(tilted_direct_value(volume, native_t, full_h, full_w, logical_t,
           src_h, src_w, stack_len, base_id, direction_id, render_meta, tan_tilt,
-          inplane_linear, quantize_native_taps, oy, ox,
+          quantize_native_taps, oy, ox,
           m00, m01, m02, m10, m11, m12));
     }
 
     extern "C" __global__ void tilted_direct_f16(
         const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
         int src_h, int src_w, int stack_len, int base_id, int direction_id,
-        const int* render_meta, float tan_tilt, int inplane_linear,
+        const int* render_meta, float tan_tilt,
         int quantize_native_taps, int oh, int ow,
         float m00, float m01, float m02, float m10, float m11, float m12, __half* out) {
       int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
@@ -1082,7 +1061,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
       int q = oy * ow + ox;
       float value = norm_u8(tilted_direct_value(volume, native_t, full_h, full_w, logical_t,
           src_h, src_w, stack_len, base_id, direction_id, render_meta, tan_tilt,
-          inplane_linear, quantize_native_taps, oy, ox,
+          quantize_native_taps, oy, ox,
           m00, m01, m02, m10, m11, m12));
       out[q] = __float2half_rn(value);
     }
@@ -2155,7 +2134,6 @@ class _GpuWorkerRenderEngine:
                         slot, kernels, int(center) if bool(stage_metadata) else None,
                     ),
                     np.float32(math.tan(math.radians(float(view.tilt_angle_deg)))),
-                    np.int32(1 if tilted_inplane_linear_enabled() else 0),
                     np.int32(0),  # TTA ring retains its established float-native taps.
                     np.int32(out_size), np.int32(out_size),
                     *(np.float32(v) for v in matrix.reshape(-1)),
@@ -2165,10 +2143,9 @@ class _GpuWorkerRenderEngine:
             )
             if 'tilted' not in self._fused_announced_families:
                 self._fused_announced_families.add('tilted')
-                inplane_label = 'bilinear' if tilted_inplane_linear_enabled() else 'nearest'
                 print(
                     'P4 fused Tilted renderer active: affine/shear/gathers/lerps -> '
-                    f'TensorRT binding (in-plane={inplane_label}).'
+                    'TensorRT binding (in-plane=bilinear).'
                 )
             return True
         except Exception as exc:
@@ -2258,7 +2235,6 @@ class _GpuWorkerRenderEngine:
                 np.int32(0 if direction == 'vertical' else 1),
                 self._standalone_render_meta_ref,
                 np.float32(math.tan(math.radians(float(view.tilt_angle_deg)))),
-                np.int32(1 if tilted_inplane_linear_enabled() else 0),
                 np.int32(1),  # PTA quantizes native tilted taps before the affine.
                 np.int32(height), np.int32(width),
                 *(np.float32(value) for value in matrix.reshape(-1)),
@@ -2292,27 +2268,19 @@ class _GpuWorkerRenderEngine:
                 )
             except Exception as exc:
                 self._fused_render_fallback('tilted', exc)
-        if tilted_inplane_linear_enabled():
-            native = self._render_tilted_frame(
-                view,
-                _TILTED_IDENTITY_M,
-                int(view.src_h),
-                int(view.src_w),
-                int(frame_index),
-            )
-            native_u8 = native.round().clamp_(0.0, 255.0).to(self.torch.uint8)
-            return self.warp_native_uint8_frame(
-                native_u8,
-                np.asarray(M_out_to_src, dtype=np.float32),
-                int(out_h),
-                int(out_w),
-            )
-        return self._render_tilted_frame(
+        native = self._render_tilted_frame(
             view,
+            _TILTED_IDENTITY_M,
+            int(view.src_h),
+            int(view.src_w),
+            int(frame_index),
+        )
+        native_u8 = native.round().clamp_(0.0, 255.0).to(self.torch.uint8)
+        return self.warp_native_uint8_frame(
+            native_u8,
             np.asarray(M_out_to_src, dtype=np.float32),
             int(out_h),
             int(out_w),
-            int(frame_index),
         )
 
     def _try_fused_render_into_ring_slot(
@@ -3334,10 +3302,7 @@ class _GpuWorkerRenderEngine:
 
     def _render_tilted_frame(self, view: ViewInfo, M_grid_to_src: np.ndarray, grid_h: int, grid_w: int, frame_idx: int) -> object:
         torch = self.torch
-        if (
-            tilted_inplane_linear_enabled()
-            and not _tilted_grid_is_identity(M_grid_to_src, int(grid_h), int(grid_w), view)
-        ):
+        if not _tilted_grid_is_identity(M_grid_to_src, int(grid_h), int(grid_w), view):
             # v16.1.8 forward-pass in-plane interpolation: build the exact integer-grid
             # native frame (the identity branch below), then warp it with the same
             # align_corners=False zero-padded bilinear grid_sample the Cartesian views

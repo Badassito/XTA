@@ -42,7 +42,7 @@ def main():
     import numpy as np
     from XTA.qsc import qsc_inverse
     from XTA.spherical_geometry import build_spherical_view_infos
-    from XTA.spherical_projection import _project_spherical_block
+    from tests.reference_backends.spherical import project_spherical_block
     from XTA.spherical_projection_cuda import SphericalCudaProjector, SphericalCudaProjectionUnsafeFailure
 
     token = uuid.uuid4().hex[:12]
@@ -111,7 +111,7 @@ def main():
             name = properties['name']
             record['device_name'] = name.decode() if isinstance(name, bytes) else str(name)
             for z in planes:
-                expected = _project_spherical_block(source, view, radii, rotation, shape, z, 1)
+                expected = project_spherical_block(source, view, radii, rotation, shape, z, 1)
                 actual = projector.project(z, 1)
                 mismatches = int(np.count_nonzero(actual != expected))
                 foreground = int(np.count_nonzero(actual))

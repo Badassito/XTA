@@ -13,6 +13,7 @@ import numpy as np
 
 from XTA import spherical_projection as sp
 from XTA import spherical_projection_cpu as compiled
+from tests.reference_backends import spherical as oracle
 from XTA.spherical_geometry import build_spherical_view_infos, cube_rotation
 
 
@@ -26,8 +27,8 @@ class SparseShellSkipsTests(unittest.TestCase):
         rotation = np.asarray(view.spherical_rotation_xyz).reshape(3, 3)
         boxes = np.zeros((len(radii), 4), np.int64)
         args = (source, view, radii, rotation, shape, shape[0] // 2, 0, shape[1] * shape[2])
-        with mock.patch.object(sp, 'qsc_forward_face', side_effect=AssertionError('QSC of empty shell')):
-            self.assertFalse(sp._pull_spherical_chunk(*args, boxes).any())
+        with mock.patch.object(oracle, 'qsc_forward_face', side_effect=AssertionError('QSC of empty shell')):
+            self.assertFalse(oracle.pull_spherical_chunk(*args, boxes).any())
         kernel_args = compiled._spherical_cpu_kernel_arguments(*args, boxes)
         with mock.patch.object(compiled.math, 'atan2', side_effect=AssertionError('QSC of empty shell')):
             self.assertFalse(compiled._pull_spherical_f64(*kernel_args).any())
@@ -38,7 +39,7 @@ class SparseShellSkipsTests(unittest.TestCase):
         views = build_spherical_view_infos(*shape, targets=('transverse',),
             min_radius=.5, patch_size=19, tilted_views=())
         qsc_points = [0, 0]
-        original = sp.qsc_forward_face
+        original = oracle.qsc_forward_face
         for initial in views:
             view = replace(initial, spherical_rotation_xyz=cube_rotation('horizontal', -23))
             source = rng.integers(1, 256, (view.num_slices, 7, 11), dtype=np.uint8)
@@ -58,10 +59,10 @@ class SparseShellSkipsTests(unittest.TestCase):
                             qsc_points[which] += len(points)
                             return original(points, face)
                         return project
-                    with mock.patch.object(sp, 'qsc_forward_face', side_effect=count_qsc(0)):
-                        expected = sp._pull_spherical_chunk(*args, scalar_max=scalar_max)
-                    with mock.patch.object(sp, 'qsc_forward_face', side_effect=count_qsc(1)):
-                        actual = sp._pull_spherical_chunk(*args, boxes, scalar_max=scalar_max)
+                    with mock.patch.object(oracle, 'qsc_forward_face', side_effect=count_qsc(0)):
+                        expected = oracle.pull_spherical_chunk(*args, scalar_max=scalar_max)
+                    with mock.patch.object(oracle, 'qsc_forward_face', side_effect=count_qsc(1)):
+                        actual = oracle.pull_spherical_chunk(*args, boxes, scalar_max=scalar_max)
                     np.testing.assert_array_equal(actual, expected)
                     kernel_args = compiled._spherical_cpu_kernel_arguments(*args, boxes)
                     np.testing.assert_array_equal(
@@ -78,7 +79,7 @@ class SparseShellSkipsTests(unittest.TestCase):
         source[0] = 203
         boxes = np.array(((0, 17, 0, 17), (0, 0, 0, 0)), np.int64)
         args = (source, view, np.asarray(view.spherical_radii), np.eye(3), (9, 9, 9), 4, 4 * 9 + 6, 4 * 9 + 7)
-        self.assertEqual(sp._pull_spherical_chunk(*args, boxes, scalar_max=True)[0], 203)
+        self.assertEqual(oracle.pull_spherical_chunk(*args, boxes, scalar_max=True)[0], 203)
         kernel_args = compiled._spherical_cpu_kernel_arguments(*args, boxes)
         self.assertEqual(compiled._pull_spherical_f64(*kernel_args[:-1], True)[0], 203)
 
@@ -107,7 +108,7 @@ class PendingCpuAdmissionTests(unittest.TestCase):
         radii, rotation, _, _ = sp._validate_spherical_projection(
             self.source, self.view, self.shape, None)
         original_encoded = sp._project_spherical_encoded_block
-        for cpu_compact in (False, True):
+        for cpu_compact in (True,):
             for packed in (False, True):
                 with self.subTest(cpu_compact=cpu_compact, packed=packed):
                     joined = threading.Event()
@@ -135,9 +136,9 @@ class PendingCpuAdmissionTests(unittest.TestCase):
                     with ExitStack() as stack:
                         stack.enter_context(redirect_stdout(io.StringIO()))
                         stack.enter_context(mock.patch.object(sp, '_try_spherical_cuda_stage', side_effect=admit))
-                        stack.enter_context(mock.patch.object(sp, '_select_spherical_cpu_pull', return_value=None))
+                        stack.enter_context(mock.patch.object(sp, '_select_spherical_cpu_pull',
+                            return_value=compiled.pull_spherical_chunk_numba))
                         stack.enter_context(mock.patch.object(sp, 'spherical_cuda_backproject_enabled', return_value=True))
-                        stack.enter_context(mock.patch.object(sp, 'spherical_cpu_compact_enabled', return_value=cpu_compact))
                         stack.enter_context(mock.patch.object(sp, '_spherical_block_schedule', return_value=(1, 1)))
                         stack.enter_context(mock.patch.object(sp, '_project_spherical_block', side_effect=pending))
                         stack.enter_context(mock.patch.object(sp, '_project_spherical_encoded_block', side_effect=pending))
@@ -208,7 +209,8 @@ class PendingCpuAdmissionTests(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(redirect_stdout(output))
             stack.enter_context(mock.patch.object(sp, '_try_spherical_cuda_stage', side_effect=admit))
-            stack.enter_context(mock.patch.object(sp, '_select_spherical_cpu_pull', return_value=None))
+            stack.enter_context(mock.patch.object(sp, '_select_spherical_cpu_pull',
+                return_value=compiled.pull_spherical_chunk_numba))
             stack.enter_context(mock.patch.object(sp, 'spherical_cuda_backproject_enabled', return_value=True))
             stack.enter_context(mock.patch.object(sp, '_spherical_block_schedule', return_value=(1, workers)))
             stack.enter_context(mock.patch.object(sp, '_project_spherical_block', side_effect=project))

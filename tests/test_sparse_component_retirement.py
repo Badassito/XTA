@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import replace
+import gc
 import gzip
 import io
 from pathlib import Path
@@ -15,6 +16,7 @@ import numpy as np
 from XTA import assembly, finalization, outputs
 from XTA.geometry import ViewInfo
 from XTA.interpolation import CVOL_FORMAT, INTERNAL_PACKED_CVOL_FORMAT, RawBBoxMaskStore, write_raw_bbox_mask_store
+from XTA.runtime import wait_for_retired_memmap_directory_cleanup
 
 
 def _view(orientation: str) -> ViewInfo:
@@ -65,11 +67,7 @@ class SparseComponentRetirementTests(unittest.TestCase):
         })
         self.configuration.start()
         self.addCleanup(self.configuration.stop)
-        self.disabled = mock.patch.object(assembly, '_SPARSE_COMPONENT_NUMBA_DISABLED', False)
-        self.disabled.start()
-        self.addCleanup(self.disabled.stop)
 
-    @unittest.skipUnless(assembly._numba is not None, 'optional compiled sparse transpose')
     def test_permutation_restore_and_union_match_dense_reference_without_volume_decode(self):
         rng = np.random.default_rng(2007)
         for orientation in ('transverse', 'sagittal', 'coronal'):
@@ -105,7 +103,6 @@ class SparseComponentRetirementTests(unittest.TestCase):
                             self.assertTrue(actual.path.exists())
                             self.assertEqual(actual.storage_format, fmt if orientation == 'transverse' else INTERNAL_PACKED_CVOL_FORMAT)
 
-    @unittest.skipUnless(assembly._numba is not None, 'optional compiled sparse transpose')
     def test_actual_gzip_nrrd_and_low_quality_mirror_match_dense_reference(self):
         for orientation in ('transverse', 'sagittal', 'coronal'):
             for fmt in (CVOL_FORMAT, INTERNAL_PACKED_CVOL_FORMAT):
@@ -127,7 +124,6 @@ class SparseComponentRetirementTests(unittest.TestCase):
                     np.testing.assert_array_equal(_read_nrrd(root / 'actual.nrrd'), _read_nrrd(root / 'reference.nrrd'))
                     np.testing.assert_array_equal(_read_nrrd(root / 'actual-lq.nrrd'), _read_nrrd(root / 'reference-lq.nrrd'))
 
-    @unittest.skipUnless(assembly._numba is not None, 'optional compiled sparse transpose')
     def test_keep_temp_false_preserves_returned_backing_and_retires_transposed_source(self):
         for orientation in ('transverse', 'sagittal', 'coronal'):
             with self.subTest(orientation=orientation), tempfile.TemporaryDirectory() as directory, \
@@ -162,8 +158,8 @@ class SparseComponentRetirementTests(unittest.TestCase):
             finally:
                 source.close()
 
-    def test_missing_numba_and_unqualified_geometry_keep_dense_projection(self):
-        for overrides in ({'numba_missing': True}, {'angle': 15.0}, {'source': 'tile'}):
+    def test_unqualified_geometry_keeps_dense_projection(self):
+        for overrides in ({'angle': 15.0}, {'source': 'tile'}):
             with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as directory, \
                     contextlib.redirect_stdout(io.StringIO()):
                 root = Path(directory)
@@ -173,15 +169,12 @@ class SparseComponentRetirementTests(unittest.TestCase):
                 write_raw_bbox_mask_store(data, path, format_name=CVOL_FORMAT, desc='input')
                 kwargs = _parameters(root, view, int(data.sum()))
                 kwargs['source'] = overrides.get('source', 'fullframe')
-                with mock.patch.object(assembly, '_numba_sparse_component_accumulate_bounds',
-                                       None if overrides.get('numba_missing') else assembly._numba_sparse_component_accumulate_bounds), \
-                        mock.patch.object(assembly, 'allocate_workspace_array', wraps=assembly.allocate_workspace_array) as allocate:
+                with mock.patch.object(assembly, 'allocate_workspace_array', wraps=assembly.allocate_workspace_array) as allocate:
                     result = assembly.materialize_interpolation_component_nrrd_view_layer(path, **kwargs)
                 self.assertGreaterEqual(allocate.call_count, 1)
                 np.testing.assert_array_equal(_read_ref(result, result.shape), data.transpose(1, 0, 2))
 
-    @unittest.skipUnless(assembly._numba is not None, 'optional compiled sparse transpose')
-    def test_failed_scatter_discards_partial_store_and_uses_dense_fallback_once(self):
+    def test_failed_scatter_discards_partial_store_and_preserves_input(self):
         with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
             root = Path(directory)
             view = _view('coronal')
@@ -197,11 +190,25 @@ class SparseComponentRetirementTests(unittest.TestCase):
                 raise RuntimeError('JIT failed')
 
             with mock.patch.object(assembly, '_numba_sparse_component_scatter_crop', new=fail_scatter):
-                result = assembly.materialize_interpolation_component_nrrd_view_layer(path, **_parameters(root, view, int(data.sum())))
+                with self.assertRaisesRegex(RuntimeError, 'JIT failed'):
+                    assembly.materialize_interpolation_component_nrrd_view_layer(path, **_parameters(root, view, int(data.sum())))
             self.assertEqual(len(failures), 1)
-            self.assertTrue(assembly._SPARSE_COMPONENT_NUMBA_DISABLED)
-            np.testing.assert_array_equal(_read_ref(result, result.shape), data.transpose(1, 2, 0))
+            self.assertTrue(path.exists())
+            gc.collect()
+            for child in (root / 'nrrd_layers' / view.name).iterdir():
+                if child.name.startswith('.'):
+                    wait_for_retired_memmap_directory_cleanup(child)
             self.assertFalse(any(child.name.startswith('.') for child in (root / 'nrrd_layers' / view.name).iterdir()))
+
+    def test_sparse_area_kernel_failure_is_visible(self):
+        crop = np.ones((3, 3), dtype=np.uint8)
+        with mock.patch.object(outputs, '_numba_nrrd_area_crop_resize_kernel',
+                               side_effect=RuntimeError('area compiler failed')):
+            with self.assertRaisesRegex(RuntimeError, 'area compiler failed'):
+                outputs._resize_sparse_binary_crop_to_output_region(
+                    crop, source_shape=(12, 12), source_bbox=(1, 1, 4, 4),
+                    output_shape=(6, 6),
+                )
 
 
 if __name__ == '__main__':

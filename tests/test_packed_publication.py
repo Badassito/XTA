@@ -15,7 +15,6 @@ def source_words(volume):
     return np.pad(values, (0, (-len(values)) % 4)).view(np.uint32)
 
 
-@unittest.skipIf(packed._packed_owner_metadata is None, 'Numba unavailable')
 class PackedPublicationTests(unittest.TestCase):
     def test_crop_bits_counts_extents_and_padding_match_dense_reference(self):
         rng = np.random.default_rng(1512)
@@ -45,16 +44,14 @@ class PackedPublicationTests(unittest.TestCase):
                 np.testing.assert_array_equal(result, volume)
                 np.testing.assert_array_equal(words, saved)
 
-    def test_publication_numpy_fallback_and_raw_optout_match(self):
+    def test_compiled_packed_publication_and_raw_optout_match(self):
         rng = np.random.default_rng(1513)
         volume = (rng.random((13, 37, 43)) < .12).astype(np.uint8)
         volume[[0, 12]] = 0
         view = geometry.get_view_infos(*volume.shape, cartesian_views=('transverse',))[0]
         with tempfile.TemporaryDirectory() as directory:
-            for mode in ('packed', 'fallback', 'raw'):
-                with mock.patch.dict(os.environ, {'YOLO_TTA_PACKED_OWNER_PUBLICATION': '0' if mode == 'raw' else '1'}), \
-                        mock.patch.object(cuda_d1, 'encode_owner_packed_block',
-                                          side_effect=RuntimeError('optional compiler unavailable') if mode == 'fallback' else packed.encode_owner_packed_block):
+            for mode in ('packed', 'raw'):
+                with mock.patch.dict(os.environ, {'YOLO_TTA_PACKED_OWNER_PUBLICATION': '0' if mode == 'raw' else '1'}):
                     result = cuda_d1._d1_finalize_bitset_layer(words=source_words(volume), output_shape=volume.shape,
                               store_dir=Path(directory)/mode, model_name='model', view=view)
                 ref = result['d1_layer_ref']
@@ -66,6 +63,19 @@ class PackedPublicationTests(unittest.TestCase):
                     self.assertEqual(result['d1_cvol_stats']['foreground_voxels'], int(volume.sum()))
                 finally:
                     store.close()
+
+    def test_required_packed_encoder_failure_discards_partial_store(self):
+        volume = np.ones((3, 7, 9), np.uint8)
+        view = geometry.get_view_infos(*volume.shape, cartesian_views=('transverse',))[0]
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'failed.cvol'
+            with mock.patch.dict(os.environ, {'YOLO_TTA_PACKED_OWNER_PUBLICATION': '1'}), \
+                    mock.patch.object(cuda_d1, 'encode_owner_packed_block', side_effect=RuntimeError('compiler failed')), \
+                    mock.patch.object(cuda_d1, '_d1_unpack_bitset_z_block', side_effect=AssertionError('no slow replay')):
+                with self.assertRaisesRegex(RuntimeError, 'compiler failed'):
+                    cuda_d1._d1_finalize_bitset_layer(words=source_words(volume), output_shape=volume.shape,
+                                                    store_dir=target, model_name='model', view=view)
+            self.assertFalse(target.exists())
 
     def test_invalid_shape_or_bitset_cannot_publish(self):
         for words, shape, first, count in [(np.zeros(1, np.uint8), (1, 2, 3), 0, 1),

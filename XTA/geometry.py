@@ -59,7 +59,6 @@ from .workspace import (
     _env_float,
     _env_int,
     _tilted_grid_is_identity,
-    tilted_inplane_linear_enabled,
 )
 from .runtime import (
     _sanitize_filesystem_token,
@@ -2883,7 +2882,7 @@ def gpu_input_staging_enabled(cfg: 'PredictConfig') -> bool:
     # Local import keeps the package dependency graph acyclic.
     from .inference import canonical_single_device
 
-    if not _env_flag('YOLO_TTA_GPU_INPUT_STAGING', True):
+    if gpu_input_staging_queue_batches() <= 0:
         return False
     target = canonical_single_device(str(cfg.device))
     if not str(target).startswith('cuda'):
@@ -3678,7 +3677,6 @@ def _render_tilted_array_on_grid(
 
     if (
         not bool(mask_mode)
-        and tilted_inplane_linear_enabled()
         and not _tilted_grid_is_identity(M_grid_to_src, int(grid_h), int(grid_w), view)
     ):
         # v16.1.8 forward-pass in-plane interpolation: render the exact integer-grid

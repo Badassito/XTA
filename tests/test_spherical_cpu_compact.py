@@ -3,7 +3,6 @@ from concurrent.futures import CancelledError
 from contextlib import ExitStack, redirect_stdout
 from dataclasses import replace
 import io
-import os
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -16,6 +15,7 @@ from XTA import spherical_projection as sp
 from XTA import spherical_projection_cpu as compiled
 from XTA.spherical_geometry import build_spherical_view_infos, cube_rotation
 from XTA.spherical_projection_bounds import SphericalOutputBounds
+from tests.reference_backends import spherical as oracle
 
 
 def decode(block, shape):
@@ -84,10 +84,9 @@ class SphericalCpuCompactTests(unittest.TestCase):
         self.radii, self.rotation, _, _ = sp._validate_spherical_projection(
             self.source, self.view, self.shape, None)
 
-    def test_numpy_raw_and_packbits_match_unbounded_oracle_across_geometry(self):
+    def test_default_compiled_raw_and_packbits_match_unbounded_oracle_across_geometry(self):
         self._check_geometry(None)
 
-    @unittest.skipUnless(hasattr(compiled._compiled_pull_spherical_f64, 'signatures'), 'Numba is optional')
     def test_rectangular_compiled_raw_and_packbits_match_unbounded_oracle(self):
         compiled.prepare_spherical_chunk_numba(self.source, self.view, self.radii, self.rotation, self.shape)
         self._check_geometry(compiled.pull_spherical_chunk_numba)
@@ -107,7 +106,7 @@ class SphericalCpuCompactTests(unittest.TestCase):
                 for shape in (self.shape, (13, 23, 17)):
                     args = (source, view, np.asarray(view.spherical_radii),
                             np.asarray(view.spherical_rotation_xyz).reshape(3, 3), shape)
-                    expected = sp._project_spherical_block(*args, 0, shape[0], boxes)
+                    expected = oracle.project_spherical_block(*args, 0, shape[0], boxes)
                     for packed in (False, True):
                         actual = sp._project_spherical_encoded_block(*args, 0, shape[0], boxes,
                                                                     cpu_pull=pull, packed=packed)
@@ -120,14 +119,15 @@ class SphericalCpuCompactTests(unittest.TestCase):
 
     def test_empty_bounds_never_allocate_dense_or_read_and_preserve_all_z_records(self):
         boxes = np.zeros((self.view.num_slices, 4), np.int64)
+        compiled.prepare_spherical_chunk_numba(self.source, self.view, self.radii, self.rotation, self.shape, boxes)
         original_empty = np.empty
         def bounded_empty(shape, *args, **kwargs):
             self.assertEqual(shape, 0)
             return original_empty(shape, *args, **kwargs)
-        with (mock.patch.object(sp.np, 'empty', side_effect=bounded_empty),
-              mock.patch.object(sp, '_pull_spherical_chunk', side_effect=AssertionError('read'))):
+        with mock.patch.object(sp.np, 'empty', side_effect=bounded_empty):
             block = sp._project_spherical_encoded_block(self.source, self.view, self.radii,
-                self.rotation, self.shape, 3, 9, boxes)
+                self.rotation, self.shape, 3, 9, boxes,
+                cpu_pull=mock.Mock(side_effect=AssertionError('read')))
         self.assertEqual([record.z for record in block.records], list(range(3, 12)))
         self.assertEqual((block.payload.size, block.pull_voxels, block.scan_voxels), (0, 0, 0))
         self.assertFalse(decode(block, self.shape).any())
@@ -136,7 +136,7 @@ class SphericalCpuCompactTests(unittest.TestCase):
         cancel = threading.Event()
         cancel.set()
         with (mock.patch.object(sp.np, 'empty', side_effect=AssertionError('allocated')),
-              mock.patch.object(sp, '_pull_spherical_chunk', side_effect=AssertionError('read')),
+              mock.patch.object(sp, '_select_spherical_cpu_pull', side_effect=AssertionError('prepared')),
               self.assertRaises(CancelledError)):
             sp._project_spherical_encoded_block(self.source, self.view, self.radii,
                 self.rotation, self.shape, 0, 1, cancel_event=cancel)
@@ -222,7 +222,6 @@ class SphericalCpuCompactTests(unittest.TestCase):
                 self.assertEqual(started, completed)
                 self.assertGreaterEqual(started, 2)
 
-    @unittest.skipUnless(hasattr(compiled._compiled_pull_spherical_f64, 'signatures'), 'Numba is optional')
     def test_four_and_nine_compiled_readers_publish_identical_ordered_blocks(self):
         source = self.source.copy()
         source.flags.writeable = False
@@ -252,8 +251,8 @@ class SphericalCpuCompactTests(unittest.TestCase):
                 self.rotation, self.shape, 0, self.shape[0])
             self.assertTrue(block.payload.size)
             self.assertEqual(set(np.unique(block.payload)), {0, 1})
-            expected = sp._project_spherical_block(source, self.view, self.radii, self.rotation,
-                                                  self.shape, 0, self.shape[0])
+            expected = oracle.project_spherical_block(source, self.view, self.radii, self.rotation,
+                                                      self.shape, 0, self.shape[0])
             np.testing.assert_array_equal(decode(block, self.shape), expected)
 
     def test_malformed_empty_metadata_aborts_before_empty_publication(self):
@@ -265,7 +264,7 @@ class SphericalCpuCompactTests(unittest.TestCase):
             block = sp.SphericalCpuEncodedBlock(0, tuple(records), np.empty(0, np.uint8))
             with (self.subTest(field=field),
                   mock.patch.object(sp, '_try_spherical_cuda_stage', return_value=None),
-                  mock.patch.object(sp, '_select_spherical_cpu_pull', return_value=None),
+                  mock.patch.object(sp, '_select_spherical_cpu_pull', return_value=compiled.pull_spherical_chunk_numba),
                   mock.patch.object(sp, '_project_spherical_encoded_block', return_value=block),
                   redirect_stdout(io.StringIO()),
                   self.assertRaisesRegex(RuntimeError, 'empty block metadata')):
@@ -284,7 +283,7 @@ class SphericalCpuCompactTests(unittest.TestCase):
         sink = EncodedSink(self.shape)
         with (mock.patch.object(sp, '_try_spherical_cuda_stage', return_value=None),
               mock.patch.object(sp, 'spherical_cuda_backproject_enabled', return_value=False),
-              mock.patch.object(sp, '_select_spherical_cpu_pull', return_value=None),
+              mock.patch.object(sp, '_select_spherical_cpu_pull', return_value=compiled.pull_spherical_chunk_numba),
               mock.patch.object(sp, '_spherical_block_schedule', return_value=(1, 1)),
               mock.patch.object(sp, '_project_spherical_encoded_block', side_effect=project),
               redirect_stdout(io.StringIO()), self.assertRaises(ValueError) as caught):
@@ -294,7 +293,6 @@ class SphericalCpuCompactTests(unittest.TestCase):
         sink.abort.assert_called_once_with(failure)
         self.assertEqual(sink.seen, [0])
 
-    @unittest.skipUnless(hasattr(compiled._compiled_pull_spherical_f64, 'signatures'), 'Numba is optional')
     def test_rectangle_global_origins_row_boundaries_and_invalid_indices(self):
         view = self.views[-1]
         radii = np.asarray(view.spherical_radii)
@@ -303,7 +301,7 @@ class SphericalCpuCompactTests(unittest.TestCase):
         source[:, 2:5, 5] = 1
         source[:, 3, 3:9] = 1
         shape, z, bounds = (19, 23, 29), 5, (2, 18, 4, 25)
-        expected = sp._project_spherical_block(source, view, radii, rotation, shape, z, 1)[0, 2:18, 4:25].ravel()
+        expected = oracle.project_spherical_block(source, view, radii, rotation, shape, z, 1)[0, 2:18, 4:25].ravel()
         args = (source, view, radii, rotation, shape, z)
         pieces = [compiled.pull_spherical_rectangle_numba(*args, first, min(first + 37, len(expected)),
                   bounds_yx=bounds) for first in range(0, len(expected), 37)]
@@ -330,14 +328,14 @@ class SphericalCpuCompactTests(unittest.TestCase):
                 self.shape, 4, 1, output_bounds=bounds, cpu_pull=forbidden, cancel_event=cancel)
         self.assertEqual(visits, [(0, 17, (3, 13, 7, 11))])
 
-    def test_real_dispatch_empty_protocol_off_switch_and_generic_compatibility(self):
-        expected = sp._project_spherical_block(self.source, self.view, self.radii, self.rotation,
-                                                self.shape, 0, self.shape[0])
-        for compact in ('0', '1'):
+    def test_real_dispatch_empty_protocol_and_generic_compatibility(self):
+        expected = oracle.project_spherical_block(self.source, self.view, self.radii, self.rotation,
+                                                   self.shape, 0, self.shape[0])
+        for supported in (False, True):
             sink = EncodedSink(self.shape, packed=True)
-            with (mock.patch.dict(os.environ, {'YOLO_TTA_CPU_SPHERICAL_COMPACT': compact,
-                                               'YOLO_TTA_CPU_SPHERICAL_COMPILED': '0'}),
-                  mock.patch.object(sp, '_try_spherical_cuda_stage', return_value=None),
+            if not supported:
+                sink.encoded_slice_format = 'unsupported'
+            with (mock.patch.object(sp, '_try_spherical_cuda_stage', return_value=None),
                   mock.patch.object(sp, 'spherical_cuda_backproject_enabled', return_value=False),
                   mock.patch.object(sp, '_spherical_block_schedule', return_value=(2, 2)),
                   redirect_stdout(io.StringIO())):
@@ -345,7 +343,7 @@ class SphericalCpuCompactTests(unittest.TestCase):
                     workers=2, sink_only=True, projection_block_callback=sink)
             np.testing.assert_array_equal(sink.result, expected)
             self.assertEqual(sink.seen, list(range(self.shape[0])))
-            if compact == '1':
+            if supported:
                 self.assertNotIn('dense', sink.kinds)
                 self.assertIn('encoded', sink.kinds)
             else:
@@ -353,7 +351,7 @@ class SphericalCpuCompactTests(unittest.TestCase):
         empty = EncodedSink(self.shape)
         with (mock.patch.object(sp, '_try_spherical_cuda_stage', return_value=None),
               mock.patch.object(sp, 'spherical_cuda_backproject_enabled', return_value=False),
-              mock.patch.object(sp, '_select_spherical_cpu_pull', return_value=None),
+              mock.patch.object(sp, '_select_spherical_cpu_pull', return_value=compiled.pull_spherical_chunk_numba),
               redirect_stdout(io.StringIO())):
             sp.backproject_spherical_volume_to_volume(self.source, self.view, Path('unused'), 'empty',
                 sink_only=True, projection_block_callback=empty,
@@ -370,10 +368,11 @@ class SphericalCpuCompactTests(unittest.TestCase):
     def _check_handoff(self, fail_sink):
         shape = self.shape
         original = sp._project_spherical_encoded_block
-        original_pull = sp._pull_spherical_chunk
+        original_pull = sp._select_spherical_cpu_pull(
+            self.source, self.view, self.radii, self.rotation, shape, None)
         bounds = SphericalOutputBounds(0, shape[0], 0, shape[1], 0, shape[2])
-        expected = sp._project_spherical_block(self.source, self.view, self.radii, self.rotation,
-                                              shape, 0, shape[0])
+        expected = oracle.project_spherical_block(self.source, self.view, self.radii, self.rotation,
+                                                  shape, 0, shape[0])
         lock, ready = threading.Lock(), threading.Event()
         started, events, calls = set(), [], {1: [], 2: []}
         live = 0
@@ -416,13 +415,12 @@ class SphericalCpuCompactTests(unittest.TestCase):
             stack.enter_context(redirect_stdout(io.StringIO()))
             stack.enter_context(mock.patch.object(sp, '_try_spherical_cuda_stage', side_effect=[None, stage]))
             stack.enter_context(mock.patch.object(sp, 'spherical_cuda_backproject_enabled', return_value=True))
-            stack.enter_context(mock.patch.object(sp, '_select_spherical_cpu_pull', return_value=None))
+            stack.enter_context(mock.patch.object(sp, '_select_spherical_cpu_pull', return_value=pull))
             stack.enter_context(mock.patch.object(sp, 'spherical_output_bounds', return_value=bounds))
             stack.enter_context(mock.patch.object(sp, '_spherical_block_schedule', return_value=(1, 3)))
             stack.enter_context(mock.patch.object(sp, '_PULL_CHUNK_VOXELS', 11))
             stack.enter_context(mock.patch.object(sp, '_CUDA_RECHECK_SLICES', 1))
             stack.enter_context(mock.patch.object(sp, '_project_spherical_encoded_block', side_effect=project))
-            stack.enter_context(mock.patch.object(sp, '_pull_spherical_chunk', side_effect=pull))
             if fail_sink:
                 with self.assertRaises(ValueError) as caught:
                     sp.backproject_spherical_volume_to_volume(self.source, self.view, Path('unused'),

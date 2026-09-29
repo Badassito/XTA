@@ -66,7 +66,6 @@ from .interpolation import (
     RawBBoxMaskStore,
     _coerce_segment_extent,
     _nrrd_empty_segment_extent,
-    compiled_topology_kernels_enabled,
 )
 from .cuda_d1 import (
     _nrrd_layer_key,
@@ -356,10 +355,8 @@ def _union_projected_layer_refs_with_dense_restore_into_volume(
             geometry = tuple(int(value) for value in _volume_shape_tuple(src))
             if geometry == (out_t, out_h, out_w):
                 native_sources.append((ref, src))
-            elif fused_final_restore_geometry_groups_enabled():
-                grouped_by_geometry.setdefault(geometry, []).append((ref, src))
             else:
-                restore_groups.append((geometry, [(ref, src)]))
+                grouped_by_geometry.setdefault(geometry, []).append((ref, src))
         restore_groups.extend(grouped_by_geometry.items())
 
         grouped_layer_count = sum(len(group) for _geometry, group in restore_groups)
@@ -440,33 +437,9 @@ def _union_projected_layer_refs_with_dense_restore_into_volume(
             finally:
                 _drop_nrrd_raw_store_chunks_ram_cache(src)
 
-def scheduler_push_drain_enabled() -> bool:
-    """Push-drain the GPU-worker result queue instead of timeout polling.
-
- A transport-only daemon thread blocks on the process result queue and hands messages
- to the main thread through a local deque + wake event; completed scheduler futures set
- the same event through one-time done-callbacks. Results are processed the instant they
- arrive instead of after the 0.1 s futures-poll / 0.5 s queue-poll, and handlers still
- run ONLY on the main thread. YOLO_TTA_SCHEDULER_PUSH_DRAIN=0 restores polling."""
-    return _env_flag('YOLO_TTA_SCHEDULER_PUSH_DRAIN', True)
-
 def scheduler_push_drain_heartbeat_seconds() -> float:
     """Upper bound on one push-drain sleep (worker-liveness re-check cadence)."""
     return max(0.05, _env_float('YOLO_TTA_SCHEDULER_PUSH_DRAIN_HEARTBEAT', 1.0))
-
-def fused_final_view_union_enabled() -> bool:
-    """Return whether Cartesian and projected-layer restoration may share one output-z pass."""
-    return _env_flag('YOLO_TTA_FUSED_FINAL_VIEW_UNION', True)
-
-def fused_final_restore_geometry_groups_enabled() -> bool:
-    """Union equal-geometry projected layers before one restore.
-
- Reduced Tilted component layers share an orthogonal backing geometry. Binary
- union commutes with the positive-support INTER_AREA/NEAREST restore, so can
- decode/OR every layer in one geometry group on its reduced grid and resize the
- group once. The escape hatch retains the per-layer restore for direct
- regression comparisons."""
-    return _env_flag('YOLO_TTA_FUSED_FINAL_RESTORE_GEOMETRY_GROUPS', True)
 
 def fused_final_gpu_enabled() -> bool:
     """Move grouped final restore/OR work onto idle inference GPUs by default.
@@ -481,17 +454,6 @@ def fused_final_gpu_batch_slices() -> int:
 def fused_final_gpu_pipeline_slots() -> int:
     """Reusable pinned-host/device batches per GPU lane (2 overlaps decode with CUDA work)."""
     return max(1, min(3, _env_int('YOLO_TTA_FUSED_FINAL_GPU_PIPELINE_SLOTS', 2)))
-
-def fused_final_native_sparse_cpu_enabled() -> bool:
-    """Bypass GPU staging when every final contributor is already in output geometry.
-
-    D1 source-space cvols require no resampling. Sending their host-assembled union through
-    one lane thread per GPU only adds H2D/D2H traffic and caps sparse decode concurrency at
-    the GPU count. The source-z-parallel CPU path is byte-identical and keeps the sparse
-    crops in host memory. Set YOLO_TTA_FUSED_FINAL_NATIVE_SPARSE_CPU=0 to restore the
-    v16.1.5 GPU-lane behavior for comparison.
-    """
-    return _env_flag('YOLO_TTA_FUSED_FINAL_NATIVE_SPARSE_CPU', True)
 
 def fused_final_native_sparse_dense_pretouch_enabled() -> bool:
     """Materialize every dense destination page while the sparse final union is built.
@@ -904,27 +866,25 @@ def assemble_view_volumes_and_projected_layers_fused(
         # projected layer is already in canonical orthogonal (t,Y,X) coordinates.
         # Grouping is intentionally limited to non-native layers. Native Azimuthal stores
         # continue to contribute bbox crops directly to the output accumulator.
-        group_restores = bool(fused_final_restore_geometry_groups_enabled())
         native_projected: List[Tuple['NrrdLayerRef', object]] = []
         restore_groups: 'OrderedDict[Tuple[int, int, int], List[Tuple[NrrdLayerRef, object]]]' = OrderedDict()
-        if group_restores:
-            for ref, src in opened:
-                geometry = tuple(int(v) for v in _volume_shape_tuple(src))
-                if geometry == (out_t, out_h, out_w):
-                    native_projected.append((ref, src))
-                else:
-                    restore_groups.setdefault(geometry, []).append((ref, src))
-            grouped_layers = sum(len(group) for group in restore_groups.values())
-            group_text = ', '.join(
-                f'{len(group)}x{tuple(int(v) for v in geometry)}'
-                for geometry, group in restore_groups.items()
-            ) or 'none'
-            print(
-                f'G5 grouped {int(grouped_layers)} reduced projected '
-                f'layer(s) into {len(restore_groups)} restore geometry group(s) '
-                f'[{group_text}] ({int(grouped_layers)} -> {len(restore_groups)} '
-                f'restores/output-z); {len(native_projected)} native layer(s) remain direct.'
-            )
+        for ref, src in opened:
+            geometry = tuple(int(v) for v in _volume_shape_tuple(src))
+            if geometry == (out_t, out_h, out_w):
+                native_projected.append((ref, src))
+            else:
+                restore_groups.setdefault(geometry, []).append((ref, src))
+        grouped_layers = sum(len(group) for group in restore_groups.values())
+        group_text = ', '.join(
+            f'{len(group)}x{tuple(int(v) for v in geometry)}'
+            for geometry, group in restore_groups.items()
+        ) or 'none'
+        print(
+            f'G5 grouped {int(grouped_layers)} reduced projected '
+            f'layer(s) into {len(restore_groups)} restore geometry group(s) '
+            f'[{group_text}] ({int(grouped_layers)} -> {len(restore_groups)} '
+            f'restores/output-z); {len(native_projected)} native layer(s) remain direct.'
+        )
 
         scratch_tls = threading.local()
 
@@ -958,8 +918,6 @@ def assemble_view_volumes_and_projected_layers_fused(
             writes only the foreground bbox crops. The dense first-touch prevents the next
             CUDA consumer from inheriting millions of anonymous zero-page faults.
             """
-            if not fused_final_native_sparse_cpu_enabled():
-                return False
             if transverse is not None or sagittal is not None or coronal is not None:
                 return False
             if not native_views and not opened:
@@ -1165,7 +1123,7 @@ def assemble_view_volumes_and_projected_layers_fused(
  CUDA streams; a merge stream waits on their events before the single final D2H.
  Source-native sparse stores and very small reduced groups remain on the CPU and are
  folded into one pinned native contributor, where H2D setup would dominate."""
-            if not bool(group_restores) or not fused_final_gpu_enabled():
+            if not fused_final_gpu_enabled():
                 return False
             try:
                 import torch  # type: ignore
@@ -1640,53 +1598,35 @@ def assemble_view_volumes_and_projected_layers_fused(
             for _view_name, vol in native_views:
                 np.bitwise_or(acc, np.asarray(vol[int(out_z)], dtype=np.uint8), out=acc)
 
-            if group_restores:
-                # Native projected layers (the two Azimuthal refs in the reference run)
-                # retain the exact -independent sparse direct path.
-                for _ref, src in native_projected:
-                    _or_native_source_slice(acc, src, int(out_z))
+            # Native projected layers remain direct, without a restore pass.
+            for _ref, src in native_projected:
+                _or_native_source_slice(acc, src, int(out_z))
 
-                # One thread-private reduced plane is reused by groups with equal XY.
-                # Union all t-coverage slices and component layers before the single
-                # positive-support resize. For binary masks this is exactly equivalent
-                # to OR(resize(layer_i)) while eliminating repeated cv2 calls/allocations.
-                for geometry, group in restore_groups.items():
-                    in_t, in_h, in_w = (int(v) for v in geometry)
-                    reduced_key = ('c1_restore', int(in_h), int(in_w))
-                    reduced = buffers.get(reduced_key)
-                    if reduced is None:
-                        reduced = np.zeros((int(in_h), int(in_w)), dtype=np.uint8)
-                        buffers[reduced_key] = reduced
-                    else:
-                        reduced.fill(np.uint8(0))
-                    source_zs = _restore_source_indices_for_output_z(
-                        int(in_t), int(out_t), int(out_z),
-                    )
-                    # Keep adjacent source-z reads together to preserve sequential
-                    # mmap/readahead locality during the group-wide restore.
-                    for _ref, src in group:
-                        for src_z in source_zs:
-                            _or_native_source_slice(reduced, src, int(src_z))
-                    np.bitwise_or(
-                        acc,
-                        _resize_union_plane_to_out_xy(reduced, int(out_h), int(out_w)),
-                        out=acc,
-                    )
-            else:
-                # Exact fallback: restore every reduced component layer
-                # independently. Useful for byte-equivalence/performance A/B checks.
-                for _ref, src in opened:
-                    ref_native = tuple(int(v) for v in _ref.shape) == (out_t, out_h, out_w)
-                    if ref_native:
-                        _or_native_source_slice(acc, src, int(out_z))
-                    else:
-                        np.bitwise_or(
-                            acc,
-                            _read_layer_slice_in_output_shape(
-                                src, (int(out_t), int(out_h), int(out_w)), int(out_z),
-                            ),
-                            out=acc,
-                        )
+            # Union equal-geometry layers before one positive-support resize. Nearest
+            # restores are identical to per-layer OR; under strong AREA downsampling,
+            # union-first can retain sparse contributions lost to 8-bit rounding when
+            # each layer is resized separately.
+            for geometry, group in restore_groups.items():
+                in_t, in_h, in_w = (int(v) for v in geometry)
+                reduced_key = ('c1_restore', int(in_h), int(in_w))
+                reduced = buffers.get(reduced_key)
+                if reduced is None:
+                    reduced = np.zeros((int(in_h), int(in_w)), dtype=np.uint8)
+                    buffers[reduced_key] = reduced
+                else:
+                    reduced.fill(np.uint8(0))
+                source_zs = _restore_source_indices_for_output_z(
+                    int(in_t), int(out_t), int(out_z),
+                )
+                # Keep adjacent source-z reads together for mmap readahead.
+                for _ref, src in group:
+                    for src_z in source_zs:
+                        _or_native_source_slice(reduced, src, int(src_z))
+                np.bitwise_or(
+                    acc,
+                    _resize_union_plane_to_out_xy(reduced, int(out_h), int(out_w)),
+                    out=acc,
+                )
 
             # final_union is freshly allocated, but assignment is stronger than RMW and
             # guarantees exactly one full-plane destination write for this z.
@@ -1770,11 +1710,10 @@ def assemble_current_view_union_volume(
     print(f"\n=== Assembling final view union for model: {model_name} ===")
     direct_refs = list(projected_layer_refs or [])
     working_equals_out = tuple(int(v) for v in union_shape) == (int(T), int(H), int(W))
-    if direct_refs and fused_final_view_union_enabled() and not working_equals_out:
+    if direct_refs and not working_equals_out:
         print(
             f'Fusing Cartesian restore, native fallback views, and '
-            f'{len(direct_refs)} projected component layer(s) into one output-z pass '
-            '(YOLO_TTA_FUSED_FINAL_VIEW_UNION=0 restores per-view assembly).'
+            f'{len(direct_refs)} projected component layer(s) into one output-z pass.'
         )
         assemble_view_volumes_and_projected_layers_fused(
             final_union_mm,
@@ -1997,13 +1936,8 @@ def apply_keep_largest_objects_inplace(
     keep_lut_seconds = float(time.perf_counter() - keep_lut_started)
 
     apply_started = time.perf_counter()
-    kernel_done = False
-    if (
-        isinstance(labels_mm, SparseSliceLabelStore)
-        and compiled_topology_kernels_enabled()
-        and _numba_sparse_keep_lut_apply_kernel is not None
-    ):
-        try:
+    try:
+        if isinstance(labels_mm, SparseSliceLabelStore):
             print(f'keep_objects: applying keep-largest-{keep_n} from sparse labels via numba nogil kernel')
             _numba_sparse_keep_lut_apply_kernel(
                 labels_mm.flat,
@@ -2014,11 +1948,7 @@ def apply_keep_largest_objects_inplace(
                 apply_slice,
                 np.asarray(mask_mm),
             )
-            kernel_done = True
-        except Exception as exc:
-            print(f'keep_objects: sparse numba apply unavailable ({exc}); using the thread pool.')
-    elif compiled_topology_kernels_enabled() and _numba_keep_lut_apply_kernel is not None:
-        try:
+        else:
             print(f'keep_objects: applying keep-largest-{keep_n} via numba nogil kernel')
             _numba_keep_lut_apply_kernel(
                 np.asarray(labels_mm),
@@ -2028,35 +1958,13 @@ def apply_keep_largest_objects_inplace(
                 apply_slice,
                 np.asarray(mask_mm),
             )
-            kernel_done = True
-        except Exception as exc:
-            print(f'keep_objects: numba apply unavailable ({exc}); using the thread pool.')
-
-    if not kernel_done:
-        apply_zs = np.flatnonzero(apply_slice)
-
-        def _apply_slice_fn(i: int) -> None:
-            z = int(apply_zs[int(i)])
-            y0, y1, x0, x1 = (int(v) for v in slice_bboxes[z])
-            lo = int(lut_offsets[z])
-            lut_u8 = keep_flat[lo:lo + int(component_counts[z]) + 1]
-            labels_window = np.asarray(labels_mm[z, y0:y1, x0:x1])
-            mask_mm[z, y0:y1, x0:x1] = lut_u8[labels_window]
-
-        parallel_for_indices(
-            int(apply_zs.size),
-            _apply_slice_fn,
-            max_workers=choose_slice_parallel_workers(int(workers), max(1, int(apply_zs.size))),
-            desc=f'keep_objects: keep largest {keep_n}',
-            show_progress=True,
+    finally:
+        apply_seconds = float(time.perf_counter() - apply_started)
+        close_memmap_array(
+            labels_mm,
+            unlink_path=label_paths[0] if label_paths and not bool(keep_temp) else None,
         )
-    apply_seconds = float(time.perf_counter() - apply_started)
-
-    close_memmap_array(
-        labels_mm,
-        unlink_path=label_paths[0] if label_paths and not bool(keep_temp) else None,
-    )
-    labels_mm = None
+        labels_mm = None
 
     topology_times = dict(comp_stats.get('topology_phase_seconds', {}))
     total_seconds = float(time.perf_counter() - keep_started)

@@ -6,13 +6,13 @@ from pathlib import Path
 import statistics
 import sys
 import time
-import os
 import gzip
 from unittest import mock
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from XTA.topology import _compiled_adjacent_gid_pair_codes, _adjacent_gid_pair_codes_numpy
+from XTA import topology
+from XTA.topology import _compiled_adjacent_gid_pair_codes
 from XTA.topology_runs import run_adjacent_pair_codes
 
 
@@ -71,7 +71,7 @@ def main():
     report = []
     for name, a, b in cases:
         # Compile/cache each signature before component timing.
-        with mock.patch.dict(os.environ, {'YOLO_TTA_TOPOLOGY_RUN_ADJACENCY': '0'}):
+        with mock.patch.object(topology, 'run_adjacent_pair_codes', return_value=None):
             expected = _compiled_adjacent_gid_pair_codes(a, b, offsets)
         candidate = run_adjacent_pair_codes(a, b, offsets) if a.size >= 262144 else None
         if candidate is not None:
@@ -79,7 +79,11 @@ def main():
         times = {'pixel_hash': [], 'runs_with_fallback': []}
         for trial in range(4):
             for key in (list(times) if trial % 2 == 0 else list(reversed(times))):
-                with mock.patch.dict(os.environ, {'YOLO_TTA_TOPOLOGY_RUN_ADJACENCY': '0' if key == 'pixel_hash' else '1'}):
+                forced_hash = (
+                    mock.patch.object(topology, 'run_adjacent_pair_codes', return_value=None)
+                    if key == 'pixel_hash' else mock.patch.object(topology, 'run_adjacent_pair_codes', wraps=run_adjacent_pair_codes)
+                )
+                with forced_hash:
                     started = time.perf_counter()
                     result = _compiled_adjacent_gid_pair_codes(a, b, offsets)
                     elapsed = time.perf_counter() - started

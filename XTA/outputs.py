@@ -3988,15 +3988,6 @@ class _LiveArrayLayerSource:
     def __getitem__(self, item: object) -> np.ndarray:
         return self.array[item]
 
-def nrrd_live_global_layer_enabled() -> bool:
-    """Stream IMMUTABLE global layers straight from the live volume.
-
- The store-encode pass + store read-back that the final/global layers paid purely to
- hand the sink a path are skipped; the sink reads the caller's in-RAM volume directly
- (one streaming pass) and the segment extent is computed on the sink worker thread.
- YOLO_TTA_NRRD_LIVE_GLOBAL_LAYERS=0 restores the raw-bbox store path."""
-    return _env_flag('YOLO_TTA_NRRD_LIVE_GLOBAL_LAYERS', True)
-
 def _resolve_live_ref_extent(ref: NrrdLayerRef) -> NrrdLayerRef:
     """Compute a live-volume layer's deferred segment extent (idempotent).
 
@@ -4202,91 +4193,84 @@ def _nrrd_sparse_resize_axis_map(
     stops.setflags(write=False)
     return starts, stops
 
-_NRRD_SPARSE_AREA_NUMBA_FAILED = False
+@_numba.njit(cache=True, nogil=True, inline='always')  # type: ignore[misc]
+def _numba_nrrd_continuous_integral_at(
+    integral: np.ndarray,
+    crop: np.ndarray,
+    y_coord: float,
+    x_coord: float,
+) -> float:  # pragma: no cover - compiled implementation
+    crop_h = int(crop.shape[0])
+    crop_w = int(crop.shape[1])
+    yy = min(float(crop_h), max(0.0, float(y_coord)))
+    xx = min(float(crop_w), max(0.0, float(x_coord)))
+    yy_round = round(yy)
+    xx_round = round(xx)
+    if abs(yy - yy_round) < 1e-12:
+        yy = float(yy_round)
+    if abs(xx - xx_round) < 1e-12:
+        xx = float(xx_round)
+    iy = int(math.floor(yy))
+    ix = int(math.floor(xx))
+    fy = float(yy - iy)
+    fx = float(xx - ix)
+    iy_cell = min(int(iy), int(crop_h - 1))
+    ix_cell = min(int(ix), int(crop_w - 1))
+    value = float(integral[int(iy), int(ix)])
+    value += float(
+        integral[int(iy), int(ix_cell + 1)]
+        - integral[int(iy), int(ix_cell)]
+    ) * fx
+    value += float(
+        integral[int(iy_cell + 1), int(ix)]
+        - integral[int(iy_cell), int(ix)]
+    ) * fy
+    value += float(crop[int(iy_cell), int(ix_cell)]) * fy * fx
+    return float(value)
 
-_NRRD_SPARSE_AREA_NUMBA_ANNOUNCED = False
+@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+def _numba_nrrd_area_crop_resize_kernel(
+    integral: np.ndarray,
+    crop: np.ndarray,
+    in_h: int,
+    in_w: int,
+    out_h: int,
+    out_w: int,
+    source_y0: int,
+    source_x0: int,
+    source_y1: int,
+    source_x1: int,
+    out_y0: int,
+    out_x0: int,
+    restored: np.ndarray,
+) -> None:  # pragma: no cover - compiled implementation
+    threshold = (
+        (float(in_h) / float(out_h)) * (float(in_w) / float(out_w)) / 510.0
+    )
+    for local_y in range(int(restored.shape[0])):
+        out_y = int(out_y0 + local_y)
+        sy0 = max(
+            float(out_y) * float(in_h) / float(out_h), float(source_y0),
+        ) - float(source_y0)
+        sy1 = min(
+            float(out_y + 1) * float(in_h) / float(out_h), float(source_y1),
+        ) - float(source_y0)
+        for local_x in range(int(restored.shape[1])):
+            out_x = int(out_x0 + local_x)
+            sx0 = max(
+                float(out_x) * float(in_w) / float(out_w), float(source_x0),
+            ) - float(source_x0)
+            sx1 = min(
+                float(out_x + 1) * float(in_w) / float(out_w), float(source_x1),
+            ) - float(source_x0)
+            weighted = _numba_nrrd_continuous_integral_at(integral, crop, sy1, sx1)
+            weighted -= _numba_nrrd_continuous_integral_at(integral, crop, sy0, sx1)
+            weighted -= _numba_nrrd_continuous_integral_at(integral, crop, sy1, sx0)
+            weighted += _numba_nrrd_continuous_integral_at(integral, crop, sy0, sx0)
+            restored[int(local_y), int(local_x)] = np.uint8(
+                1 if float(weighted) >= float(threshold) else 0
+            )
 
-if _numba is not None:
-    @_numba.njit(cache=True, nogil=True, inline='always')  # type: ignore[misc]
-    def _numba_nrrd_continuous_integral_at(
-        integral: np.ndarray,
-        crop: np.ndarray,
-        y_coord: float,
-        x_coord: float,
-    ) -> float:  # pragma: no cover - compiled implementation
-        crop_h = int(crop.shape[0])
-        crop_w = int(crop.shape[1])
-        yy = min(float(crop_h), max(0.0, float(y_coord)))
-        xx = min(float(crop_w), max(0.0, float(x_coord)))
-        yy_round = round(yy)
-        xx_round = round(xx)
-        if abs(yy - yy_round) < 1e-12:
-            yy = float(yy_round)
-        if abs(xx - xx_round) < 1e-12:
-            xx = float(xx_round)
-        iy = int(math.floor(yy))
-        ix = int(math.floor(xx))
-        fy = float(yy - iy)
-        fx = float(xx - ix)
-        iy_cell = min(int(iy), int(crop_h - 1))
-        ix_cell = min(int(ix), int(crop_w - 1))
-        value = float(integral[int(iy), int(ix)])
-        value += float(
-            integral[int(iy), int(ix_cell + 1)]
-            - integral[int(iy), int(ix_cell)]
-        ) * fx
-        value += float(
-            integral[int(iy_cell + 1), int(ix)]
-            - integral[int(iy_cell), int(ix)]
-        ) * fy
-        value += float(crop[int(iy_cell), int(ix_cell)]) * fy * fx
-        return float(value)
-
-    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-    def _numba_nrrd_area_crop_resize_kernel(
-        integral: np.ndarray,
-        crop: np.ndarray,
-        in_h: int,
-        in_w: int,
-        out_h: int,
-        out_w: int,
-        source_y0: int,
-        source_x0: int,
-        source_y1: int,
-        source_x1: int,
-        out_y0: int,
-        out_x0: int,
-        restored: np.ndarray,
-    ) -> None:  # pragma: no cover - compiled implementation
-        threshold = (
-            (float(in_h) / float(out_h)) * (float(in_w) / float(out_w)) / 510.0
-        )
-        for local_y in range(int(restored.shape[0])):
-            out_y = int(out_y0 + local_y)
-            sy0 = max(
-                float(out_y) * float(in_h) / float(out_h), float(source_y0),
-            ) - float(source_y0)
-            sy1 = min(
-                float(out_y + 1) * float(in_h) / float(out_h), float(source_y1),
-            ) - float(source_y0)
-            for local_x in range(int(restored.shape[1])):
-                out_x = int(out_x0 + local_x)
-                sx0 = max(
-                    float(out_x) * float(in_w) / float(out_w), float(source_x0),
-                ) - float(source_x0)
-                sx1 = min(
-                    float(out_x + 1) * float(in_w) / float(out_w), float(source_x1),
-                ) - float(source_x0)
-                weighted = _numba_nrrd_continuous_integral_at(integral, crop, sy1, sx1)
-                weighted -= _numba_nrrd_continuous_integral_at(integral, crop, sy0, sx1)
-                weighted -= _numba_nrrd_continuous_integral_at(integral, crop, sy1, sx0)
-                weighted += _numba_nrrd_continuous_integral_at(integral, crop, sy0, sx0)
-                restored[int(local_y), int(local_x)] = np.uint8(
-                    1 if float(weighted) >= float(threshold) else 0
-                )
-else:
-    _numba_nrrd_continuous_integral_at = None
-    _numba_nrrd_area_crop_resize_kernel = None
 
 def _resize_sparse_binary_crop_to_output_region(
     crop: np.ndarray,
@@ -4300,9 +4284,8 @@ def _resize_sparse_binary_crop_to_output_region(
  Returns ``(out_y0, out_x0, out_y1, out_x1, crop)``. The output region includes every
  output pixel whose global sampling footprint can see the source bbox, including the
  one-pixel influence halo that an area downscale can create. Work is proportional to
- the affected region: OpenCV's C integral-image kernel plus vectorized native gathers
- replace a full zero-plane resize and all Python row loops."""
-    global _NRRD_SPARSE_AREA_NUMBA_FAILED, _NRRD_SPARSE_AREA_NUMBA_ANNOUNCED
+ the affected region: OpenCV's integral-image kernel and the compiled area sampler
+ avoid a full zero-plane resize."""
     in_h, in_w = (max(1, int(v)) for v in source_shape)
     out_h, out_w = (max(1, int(v)) for v in output_shape)
     y0, x0, y1, x1 = (int(v) for v in source_bbox)
@@ -4354,100 +4337,15 @@ def _resize_sparse_binary_crop_to_output_region(
         # the bbox; evaluating its continuous piecewise-constant integral accounts for
         # fractional first/last source pixels (a plain any would over-include tiny slivers).
         integral = cv2.integral(crop_u8, sdepth=cv2.CV_32S)
-        crop_h, crop_w = (int(v) for v in crop_u8.shape)
         restored = np.empty(
             (int(out_y1 - out_y0), int(out_x1 - out_x0)), dtype=np.uint8,
         )
-        compiled_ok = bool(
-            _numba_nrrd_area_crop_resize_kernel is not None
-            and not _NRRD_SPARSE_AREA_NUMBA_FAILED
+        _numba_nrrd_area_crop_resize_kernel(
+            integral, crop_u8,
+            int(in_h), int(in_w), int(out_h), int(out_w),
+            int(y0), int(x0), int(y1), int(x1),
+            int(out_y0), int(out_x0), restored,
         )
-        if compiled_ok:
-            try:
-                _numba_nrrd_area_crop_resize_kernel(
-                    integral,
-                    crop_u8,
-                    int(in_h), int(in_w), int(out_h), int(out_w),
-                    int(y0), int(x0), int(y1), int(x1),
-                    int(out_y0), int(out_x0), restored,
-                )
-                if not _NRRD_SPARSE_AREA_NUMBA_ANNOUNCED:
-                    _NRRD_SPARSE_AREA_NUMBA_ANNOUNCED = True
-                    print(
-                        'NRRD sparse INTER_AREA member assembly uses '
-                        'the compiled no-GIL crop kernel.'
-                    )
-            except Exception as exc:
-                _NRRD_SPARSE_AREA_NUMBA_FAILED = True
-                compiled_ok = False
-                print(
-                    f'Warning: compiled NRRD sparse area resize unavailable ({exc}); '
-                    'using vectorized OpenCV/NumPy assembly.'
-                )
-        if bool(compiled_ok):
-            if not np.any(restored):
-                return None
-            return (
-                int(out_y0), int(out_x0), int(out_y1), int(out_x1),
-                np.ascontiguousarray(restored, dtype=np.uint8),
-            )
-
-        out_ys = np.arange(int(out_y0), int(out_y1), dtype=np.float64)
-        out_xs = np.arange(int(out_x0), int(out_x1), dtype=np.float64)
-        src_y0 = np.maximum(out_ys * float(in_h) / float(out_h), float(y0)) - float(y0)
-        src_y1 = np.minimum((out_ys + 1.0) * float(in_h) / float(out_h), float(y1)) - float(y0)
-        src_x0 = np.maximum(out_xs * float(in_w) / float(out_w), float(x0)) - float(x0)
-        src_x1 = np.minimum((out_xs + 1.0) * float(in_w) / float(out_w), float(x1)) - float(x0)
-
-        def _continuous_integral(y_coords: np.ndarray, x_coords: np.ndarray) -> np.ndarray:
-            yy = np.clip(np.asarray(y_coords, dtype=np.float64), 0.0, float(crop_h))
-            xx = np.clip(np.asarray(x_coords, dtype=np.float64), 0.0, float(crop_w))
-            # Snap rational coordinates which should be integers; this avoids selecting
-            # the preceding cell because of a 1-ulp division artifact.
-            yy_round = np.rint(yy)
-            xx_round = np.rint(xx)
-            yy = np.where(np.abs(yy - yy_round) < 1e-12, yy_round, yy)
-            xx = np.where(np.abs(xx - xx_round) < 1e-12, xx_round, xx)
-            iy = np.floor(yy).astype(np.int64)
-            ix = np.floor(xx).astype(np.int64)
-            fy = yy - iy
-            fx = xx - ix
-            iy_cell = np.minimum(iy, int(crop_h - 1))
-            ix_cell = np.minimum(ix, int(crop_w - 1))
-            value = integral[iy[:, None], ix[None, :]].astype(np.float64)
-            value += (
-                integral[iy[:, None], (ix_cell + 1)[None, :]]
-                - integral[iy[:, None], ix_cell[None, :]]
-            ) * fx[None, :]
-            value += (
-                integral[(iy_cell + 1)[:, None], ix[None, :]]
-                - integral[iy_cell[:, None], ix[None, :]]
-            ) * fy[:, None]
-            value += (
-                crop_u8[iy_cell[:, None], ix_cell[None, :]]
-                * fy[:, None] * fx[None, :]
-            )
-            return value
-
-
-        # Bound float64 temporaries while leaving each batch as a few large native gathers.
-        cols = max(1, int(restored.shape[1]))
-        rows_per_batch = max(1, min(
-            int(restored.shape[0]),
-            (24 * 1024 * 1024) // max(1, int(cols) * 8 * 3),
-        ))
-        positive_threshold = (
-            (float(in_h) / float(out_h)) * (float(in_w) / float(out_w)) / 510.0
-        )
-        for row0 in range(0, int(restored.shape[0]), int(rows_per_batch)):
-            row1 = min(int(restored.shape[0]), int(row0) + int(rows_per_batch))
-            weighted = _continuous_integral(src_y1[row0:row1], src_x1)
-            weighted -= _continuous_integral(src_y0[row0:row1], src_x1)
-            weighted -= _continuous_integral(src_y1[row0:row1], src_x0)
-            weighted += _continuous_integral(src_y0[row0:row1], src_x0)
-            restored[row0:row1] = (weighted >= float(positive_threshold)).astype(
-                np.uint8, copy=False,
-            )
     if not np.any(restored):
         return None
     return (
@@ -4483,12 +4381,6 @@ def _read_layer_slice_in_output_shape(
         restored |= _resize_binary_mask_frame_to_output_shape(_read_binary_volume_slice_u8(src, int(src_idx)), out_h, out_w)
     return restored
 
-def nrrd_extent_zero_skip_enabled() -> bool:
-    """Payload z-ranges outside the layer's recorded segment extent are
- emitted as cached zero members/chunks without reading (or even faulting in) the source
- pages. YOLO_TTA_NRRD_EXTENT_ZERO_SKIP=0 restores full-volume streaming."""
-    return _env_flag('YOLO_TTA_NRRD_EXTENT_ZERO_SKIP', True)
-
 def _nrrd_layer_zero_skip_window(
     ref: NrrdLayerRef,
     output_shape: Tuple[int, int, int],
@@ -4510,8 +4402,6 @@ def _nrrd_layer_zero_skip_window(
  it), so the window inverts that line at t0-0.5 / t1+0.5. One slice of padding per side
  absorbs any residual rounding-rule differences; skipping must never reclassify a
  foreground slice as zero."""
-    if not nrrd_extent_zero_skip_enabled():
-        return None
     extent = _coerce_segment_extent(getattr(ref, 'segment_extent_ijk', None))
     if extent is None:
         return None
@@ -4579,7 +4469,6 @@ def _write_one_decomposed_nrrd_layer_payload(
             and (int(in_t), int(in_h), int(in_w)) == (int(out_t), int(out_h), int(out_w))
         )
         if (raw_store_native_stream and block_consumer is None
-                and _env_flag('YOLO_TTA_NRRD_CROP_ROW_SPANS', True)
                 and callable(getattr(payload_writer, 'write_canonical_zeros', None))
                 and int(getattr(payload_writer, 'minimum_input_bytes', 0)) == 1):
             encoded = stream_native_crop_spans(

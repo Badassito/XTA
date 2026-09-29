@@ -1,4 +1,4 @@
-"""CPU broad-phase scheduling keeps the unchanged categorical pull oracle."""
+"""CPU broad-phase scheduling agrees with the independent categorical oracle."""
 from dataclasses import replace
 import unittest
 from unittest import mock
@@ -8,14 +8,15 @@ import numpy as np
 from XTA import spherical_projection as sp
 from XTA.spherical_geometry import build_spherical_view_infos, cube_rotation
 from XTA.spherical_projection_bounds import spherical_output_bounds
+from tests.reference_backends import spherical as oracle
 
 
 def project(data, view, shape, boxes=None, *, bounded=True):
-    return sp._project_spherical_block(
-        data, view, np.asarray(view.spherical_radii),
-        np.asarray(view.spherical_rotation_xyz).reshape(3, 3), shape, 0, shape[0], boxes,
-        spherical_output_bounds(view, shape, boxes) if bounded else None,
-    )
+    args = (data, view, np.asarray(view.spherical_radii),
+            np.asarray(view.spherical_rotation_xyz).reshape(3, 3), shape, 0, shape[0], boxes)
+    if not bounded:
+        return oracle.project_spherical_block(*args)
+    return sp._project_spherical_block(*args, spherical_output_bounds(view, shape, boxes))
 
 
 class SphericalCpuBoundsTests(unittest.TestCase):
@@ -47,7 +48,8 @@ class SphericalCpuBoundsTests(unittest.TestCase):
             min_radius=.5, patch_size=257, tilted_views=())[4]
         data = np.ones((view.num_slices, 5, 7), np.uint8)
         boxes = np.zeros((view.num_slices, 4), np.int64)
-        with mock.patch.object(sp, '_pull_spherical_chunk', side_effect=AssertionError('empty pull')):
+        with mock.patch.object(sp, '_select_spherical_cpu_pull',
+                               return_value=mock.Mock(side_effect=AssertionError('empty pull'))):
             self.assertFalse(project(data, view, shape, boxes).any())
             bounds = spherical_output_bounds(view, shape)
             self.assertGreater(bounds.z0, 0)
@@ -67,14 +69,16 @@ class SphericalCpuBoundsTests(unittest.TestCase):
             data[::2, 1:-1, 2:-1] = 1
             expected = project(data, view, shape, bounded=False)
             visits = []
-            original = sp._pull_spherical_chunk
+            original = sp._select_spherical_cpu_pull(
+                data, view, np.asarray(view.spherical_radii),
+                np.asarray(view.spherical_rotation_xyz).reshape(3, 3), shape, None)
 
             def pull(*args, **kwargs):
                 visits.append((args[5], args[6], args[7]))
                 return original(*args, **kwargs)
 
             with mock.patch.object(sp, '_PULL_CHUNK_VOXELS', 257), \
-                    mock.patch.object(sp, '_pull_spherical_chunk', side_effect=pull):
+                    mock.patch.object(sp, '_select_spherical_cpu_pull', return_value=pull):
                 actual = project(data, view, shape)
             np.testing.assert_array_equal(actual, expected)
             bounds = spherical_output_bounds(view, shape)

@@ -58,8 +58,7 @@ def test_retina_patch_rejects_changed_construct_result_signature(processor: str)
     with (mock.patch.dict(sys.modules, modules),
           mock.patch.object(inference, '_ULTRALYTICS_CPU_RETINA_PATCHED', False),
           mock.patch.object(inference, '_ULTRALYTICS_GPU_PROTO_UNION_PATCHED', False),
-          mock.patch.object(inference, 'cpu_retina_masks_enabled', return_value=processor == 'cpu'),
-          mock.patch.object(inference, 'gpu_retina_proto_union_enabled', return_value=True)):
+          mock.patch.object(inference, 'cpu_retina_masks_enabled', return_value=processor == 'cpu')):
         install = (inference.ensure_cpu_retina_mask_predictor_patch if processor == 'cpu'
                    else inference.ensure_gpu_retina_proto_union_predictor_patch)
         with pytest.raises(RuntimeError, match='SegmentationPredictor.construct_result signature'):

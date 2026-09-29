@@ -302,15 +302,17 @@ def _bounded_score_projection_reader(source, view, shape, temporary, workspace):
         elif backend in ('radial', 'spherical'):
             if backend == 'radial':
                 from .cylindrical_geometry import global_radii
-                from .cylindrical_projection import _pull_radial_chunk
+                from .cylindrical_projection import _pull_radial_chunk_compiled
                 radii = np.asarray(global_radii(view), dtype=np.float64)
                 def pull(z, first, stop):
-                    return _pull_radial_chunk(source, view, radii, shape, z, first, stop, scalar_max=True)
+                    return _pull_radial_chunk_compiled(source, view, radii, shape, z, first, stop, scalar_max=True)
             else:
-                from .spherical_projection import _pull_spherical_chunk, _validate_spherical_projection
+                from .spherical_projection import _validate_spherical_projection
+                from .spherical_projection_cpu import prepare_spherical_chunk_numba
                 radii, rotation, _, _ = _validate_spherical_projection(source, view, shape, None)
+                compiled_pull = prepare_spherical_chunk_numba(source, view, radii, rotation, shape)
                 def pull(z, first, stop):
-                    return _pull_spherical_chunk(source, view, radii, rotation, shape, z, first, stop, scalar_max=True)
+                    return compiled_pull(source, view, radii, rotation, shape, z, first, stop, scalar_max=True)
             def read(z):
                 result = np.zeros(shape[1:], np.uint8)
                 flat = result.reshape(-1)
@@ -511,49 +513,43 @@ def score_projection_reader(source, view, output_shape, work_dir, *, memory_byte
             rectangular_pull = None
             if str(view.family) == 'radial':
                 from .cylindrical_geometry import global_radii
-                from .cylindrical_projection import _pull_radial_chunk
+                from .cylindrical_projection import _pull_radial_chunk_compiled
                 radii = np.asarray(global_radii(view), dtype=np.float64)
                 def pull(z, first, stop):
-                    return _pull_radial_chunk(source, view, radii, shape, z, first, stop, scalar_max=True)
+                    return _pull_radial_chunk_compiled(source, view, radii, shape, z, first, stop, scalar_max=True)
                 from . import cylindrical_projection as radial
-                if radial._numba is not None:
-                    try:
-                        plan, _ = radial._radial_plane_plan(view, radii, shape)
-                    except radial._RadialPlanePlanTooLarge:
-                        plan = None
-                    if plan is not None:
-                        centers, ideal, sampled, rows, columns, length, vertical = radial._radial_projection_metadata(
-                            view, source.shape, shape, plan)
-                        arguments = (source, plan.shell_index, plan.column_offsets, plan.native_columns,
-                            sampled, rows, columns, centers, ideal, int(length), int(view.radial_height_origin),
-                            int(view.src_h), plan.base_id, bool(vertical), int(plan.plane_shape[1]),
-                            int(shape[1]), int(shape[2]))
-                        radial._project_radial_block(*arguments, 0, 0, boxes, True, True)
-                        def compiled_read(z):
-                            return radial._project_radial_block(*arguments, int(z), 1, boxes, True, True)[0]
+                try:
+                    plan, _ = radial._radial_plane_plan(view, radii, shape)
+                except radial._RadialPlanePlanTooLarge:
+                    plan = None
+                if plan is not None:
+                    centers, ideal, sampled, rows, columns, length, vertical = radial._radial_projection_metadata(
+                        view, source.shape, shape, plan)
+                    arguments = (source, plan.shell_index, plan.column_offsets, plan.native_columns,
+                        sampled, rows, columns, centers, ideal, int(length), int(view.radial_height_origin),
+                        int(view.src_h), plan.base_id, bool(vertical), int(plan.plane_shape[1]),
+                        int(shape[1]), int(shape[2]))
+                    radial._project_radial_block(*arguments, 0, 0, boxes, True, True)
+                    def compiled_read(z):
+                        return radial._project_radial_block(*arguments, int(z), 1, boxes, True, True)[0]
             else:
-                from .spherical_projection import _pull_spherical_chunk, _validate_spherical_projection
+                from .spherical_projection import _validate_spherical_projection
                 from .spherical_projection_bounds import spherical_output_bounds
+                from .spherical_projection_cpu import (
+                    prepare_spherical_chunk_numba, pull_spherical_rectangle_numba,
+                )
                 radii, rotation, resolved_shape, boxes = _validate_spherical_projection(source, view, shape, boxes)
                 if tuple(resolved_shape) != shape:
                     raise ValueError('Spherical confidence projection changed the output grid')
                 bounds = spherical_output_bounds(view, shape, boxes)
+                compiled_pull = prepare_spherical_chunk_numba(source, view, radii, rotation, shape, boxes)
                 def pull(z, first, stop):
-                    return _pull_spherical_chunk(source, view, radii, rotation, shape, z, first, stop,
-                                                 boxes, scalar_max=True)
-                from .spherical_projection_cpu import (
-                    prepare_spherical_chunk_numba, SphericalCpuProjectionUnavailable,
-                    pull_spherical_rectangle_numba,
-                )
-                try:
-                    prepare_spherical_chunk_numba(source, view, radii, rotation, shape, boxes)
-                except SphericalCpuProjectionUnavailable:
-                    pass
-                else:
-                    def rectangular_pull(z, first, stop):
-                        return pull_spherical_rectangle_numba(source, view, radii, rotation, shape,
-                            z, first, stop, boxes, bounds_yx=(bounds.y0, bounds.y1, bounds.x0, bounds.x1),
-                            scalar_max=True)
+                    return compiled_pull(source, view, radii, rotation, shape, z, first, stop,
+                                         boxes, scalar_max=True)
+                def rectangular_pull(z, first, stop):
+                    return pull_spherical_rectangle_numba(source, view, radii, rotation, shape,
+                        z, first, stop, boxes, bounds_yx=(bounds.y0, bounds.y1, bounds.x0, bounds.x1),
+                        scalar_max=True)
             def read(z):
                 if compiled_read is not None:
                     return compiled_read(z)

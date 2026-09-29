@@ -20,8 +20,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 import numpy as np
 
-from .qsc import qsc_forward_face
-from .geometry_quality import spherical_cpu_compiled_requested
 from .spherical_projection_bounds import spherical_output_bounds
 from .spherical_projection_cuda import SphericalCudaProjectionUnsafeFailure
 from .cylindrical_cuda_projection import RadialEncodedBlock, RadialEncodedSlice, _MAX_ENCODED_SLICES
@@ -40,12 +38,6 @@ _COMPILED_CHUNK_BYTES_PER_VOXEL = 8
 _CPU_ENCODED_SLICE_BYTES = 1024
 _CUDA_RECHECK_SLICES = 8
 _CUDA_RECHECK_SECONDS = 1.0
-
-
-def spherical_cpu_compact_enabled():
-    return os.environ.get('YOLO_TTA_CPU_SPHERICAL_COMPACT', '1').strip().lower() not in (
-        '', '0', 'false', 'no', 'off',
-    )
 
 
 @dataclass(frozen=True)
@@ -165,93 +157,22 @@ def _ordered_spherical_cuda_blocks(stage, depth, packed=None, *, first_z=0):
                 future.cancel()
 
 
-def _nearest_global_shell(radius: np.ndarray, radii: np.ndarray) -> np.ndarray:
-    right = np.clip(np.searchsorted(radii, radius, side='left'), 0, len(radii) - 1)
-    left = np.maximum(right - 1, 0)
-    return np.where(radius - radii[left] <= radii[right] - radius, left, right)
-
-
-def _processing_index(native: np.ndarray, native_count: int, processing_count: int) -> np.ndarray:
-    """Select the processing pixel containing the native pixel center."""
-    if native_count == processing_count:
-        return native
-    return np.minimum(((native.astype(np.float64) + .5) * processing_count / native_count).astype(np.int64),
-                      processing_count - 1)
-
-
-def _pull_spherical_chunk(source, view, radii, rotation, output_shape, z, first, stop, bboxes=None,
-                          *, scalar_max=False):
-    """Evaluate one flattened source XY strip without any retained 3D map."""
-    out_t, out_h, out_w = output_shape
-    work_t, work_h, work_w = int(view.full_t), int(view.full_h), int(view.full_w)
-    flat = np.arange(first, stop, dtype=np.int64)
-    # Output coordinates are voxel centers mapped into the working grid.
-    dx = ((flat % out_w + .5) * work_w / out_w - .5) - (work_w - 1) / 2.0
-    dy = ((flat // out_w + .5) * work_h / out_h - .5) - (work_h - 1) / 2.0
-    dz = ((float(z) + .5) * work_t / out_t - .5) - (work_t - 1) / 2.0
-    radius = np.sqrt(dx * dx + dy * dy + dz * dz)
-    valid = ((radius >= float(view.spherical_min_radius))
-             & (radius <= float(view.spherical_max_radius)))
-    result = np.zeros(flat.shape, dtype=np.uint8)
-    positions = np.flatnonzero(valid)
-    if not positions.size:
-        return result
-    shell = None
-    if bboxes is not None:
-        # Known-empty shells need no rotation, QSC trigonometry or source read.
-        # Select with the same global radius grid and inward midpoint ties as
-        # the final pull; keep the pixel-level bbox test after face projection.
-        shell = _nearest_global_shell(radius[positions], radii)
-        boxes = bboxes[shell]
-        occupied = ((boxes[:, 1] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 2]))
-        positions, shell = positions[occupied], shell[occupied]
-        if not positions.size:
-            return result
-    # Row-vector inverse of the cube's local-to-world orthogonal rotation.
-    dx, dy = dx[positions], dy[positions]
-    local = np.stack(tuple(dx * rotation[0, a] + dy * rotation[1, a] + dz * rotation[2, a]
-                           for a in range(3)), axis=-1)
-    u, v, member = qsc_forward_face(local, int(view.spherical_face))
-    count = int(view.spherical_face_intervals)
-    columns = np.rint((u + 1.0) * count / 2.0).astype(np.int64) - int(view.spherical_u_origin)
-    rows = np.rint((1.0 - v) * count / 2.0).astype(np.int64) - int(view.spherical_v_origin)
-    member &= ((columns >= 0) & (columns < int(view.src_w))
-               & (rows >= 0) & (rows < int(view.src_h)))
-    if not np.any(member):
-        return result
-    positions = positions[member]
-    shell = (_nearest_global_shell(radius[positions], radii) if shell is None else shell[member])
-    pr = _processing_index(rows[member], int(view.src_h), int(source.shape[1]))
-    pc = _processing_index(columns[member], int(view.src_w), int(source.shape[2]))
-    if bboxes is not None:
-        boxes = bboxes[shell]
-        inside = ((pr >= boxes[:, 0]) & (pr < boxes[:, 1])
-                  & (pc >= boxes[:, 2]) & (pc < boxes[:, 3]))
-        positions, shell, pr, pc = (a[inside] for a in (positions, shell, pr, pc))
-    values = np.asarray(source[shell, pr, pc])
-    result[positions] = values if scalar_max else np.asarray(values != 0, dtype=np.uint8)
-    return result
-
-
 def _project_spherical_block(source, view, radii, rotation, shape, first_z, count, bboxes=None,
                              output_bounds=None, cancel_event=None, cpu_pull=None):
-    # Keep the unbounded path as the independent full-plane reference used by
-    # CUDA qualification. Production CPU work can skip analytic Z/Y bands, but
-    # retains contiguous full-width strips: one NumPy call per cropped row
-    # would replace bounded vector work with thousands of tiny QSC calls.
+    """Project one CPU block with the required compiled float64 pull."""
     if cancel_event is not None and cancel_event.is_set():
         raise CancelledError('Spherical CPU block retired before publication')
+    if cpu_pull is None:
+        cpu_pull = _select_spherical_cpu_pull(source, view, radii, rotation, shape, bboxes)
     if output_bounds is None:
         block = np.empty((count, shape[1], shape[2]), dtype=np.uint8)
         z0, z1, first_pixel, stop_pixel = first_z, first_z + count, 0, shape[1] * shape[2]
-        pull = _pull_spherical_chunk
     else:
         block = np.zeros((count, shape[1], shape[2]), dtype=np.uint8)
         z0, z1, y0, y1, x0, x1 = output_bounds.block(first_z, count)
         if z0 == z1 or y0 == y1 or x0 == x1:
             return block
         first_pixel, stop_pixel = y0 * shape[2], y1 * shape[2]
-        pull = _pull_spherical_chunk if cpu_pull is None else cpu_pull
     for z in range(z0, z1):
         local_z = z - first_z
         plane = block[local_z].reshape(-1)
@@ -259,26 +180,21 @@ def _project_spherical_block(source, view, radii, rotation, shape, first_z, coun
             if cancel_event is not None and cancel_event.is_set():
                 raise CancelledError('Spherical CPU block retired before publication')
             stop = min(stop_pixel, first + _PULL_CHUNK_VOXELS)
-            plane[first:stop] = pull(
+            plane[first:stop] = cpu_pull(
                 source, view, radii, rotation, shape, z, first, stop, bboxes,
             )
     return block
 
 
 def _select_spherical_cpu_pull(source, view, radii, rotation, shape, bboxes):
-    """Select exact compiled CPU pulls, retaining NumPy as a fallback."""
-    if not spherical_cpu_compiled_requested() or source.dtype not in (np.uint8, np.bool_):
-        return None
-    try:
-        from .spherical_projection_cpu import prepare_spherical_chunk_numba, SphericalCpuProjectionUnavailable
-    except (ImportError, OSError) as exc:
-        print(f'Spherical compiled CPU unavailable {view.name}: {exc}; using NumPy.', flush=True)
-        return None
+    """Admit the required compiled CPU pull before any output is published."""
+    from .spherical_projection_cpu import prepare_spherical_chunk_numba, SphericalCpuProjectionUnavailable
     try:
         return prepare_spherical_chunk_numba(source, view, radii, rotation, shape, bboxes)
     except SphericalCpuProjectionUnavailable as exc:
-        print(f'Spherical compiled CPU unavailable {view.name}: {exc}; using NumPy.', flush=True)
-        return None
+        raise SphericalCpuProjectionUnavailable(
+            f'Spherical compiled CPU projection unavailable for {view.name}: {exc}'
+        ) from exc
 
 
 def _project_spherical_encoded_block(source, view, radii, rotation, shape, first_z, count,
@@ -287,20 +203,21 @@ def _project_spherical_encoded_block(source, view, radii, rotation, shape, first
     """Produce exact tight crops on the bounded CPU worker, before publication.
 
     The conservative bounds never replace the categorical pull's final tests.
-    NumPy keeps large contiguous full-width strips; the compiled pull also skips
-    X outside the bounds. Only the bounded X/Y crop is scanned by the encoder.
+    The compiled pull skips X outside the bounds. Only the bounded X/Y crop is
+    scanned by the encoder.
     """
     def check_cancelled():
         if cancel_event is not None and cancel_event.is_set():
             raise CancelledError('Spherical CPU block retired before publication')
 
     check_cancelled()
+    if cpu_pull is None:
+        cpu_pull = _select_spherical_cpu_pull(source, view, radii, rotation, shape, bboxes)
     if output_bounds is None:
         output_bounds = spherical_output_bounds(view, shape, bboxes)
     z0, z1, y0, y1, x0, x1 = output_bounds.block(first_z, count)
     records, payloads = [], []
     offset = pull_voxels = scan_voxels = 0
-    pull = _pull_spherical_chunk if cpu_pull is None else cpu_pull
     rectangle_pull = getattr(cpu_pull, 'rectangle', None)
     for z in range(first_z, first_z + count):
         check_cancelled()
@@ -319,7 +236,7 @@ def _project_spherical_encoded_block(source, view, radii, rotation, shape, first
                     source, view, radii, rotation, shape, z, first, stop, bboxes,
                     bounds_yx=(y0, y1, x0, x1))
             else:
-                flat[first - base:stop - base] = pull(
+                flat[first - base:stop - base] = cpu_pull(
                     source, view, radii, rotation, shape, z, first, stop, bboxes)
         pull_voxels += end - base
         region = plane if rectangular else plane[:, x0:x1]
@@ -364,9 +281,9 @@ def _spherical_block_schedule(depth, plane_bytes, workers, *, compact=False, com
         # A block can transiently retain individual crops, their concatenation,
         # one bounded projection plane, and its small Python wire records.
         worker_bytes += plane_bytes * (block_depth + 1) + block_depth * _CPU_ENCODED_SLICE_BYTES
-    # Compiled compact pulls retain no coordinate arrays. Bound their readers
-    # by the caller's CPU allocation and their own workspace. Dense and NumPy
-    # compact paths keep the existing concurrency ceiling.
+    # Rectangular compiled compact pulls retain no coordinate arrays. Bound
+    # their readers by the caller's CPU allocation and their own workspace.
+    # Dense and nonrectangular paths keep the conservative ceiling.
     worker_limit = min(int(workers), _cpu_count()) if compact and compiled else legacy_worker_count
     worker_count = max(1, min(worker_limit, math.ceil(depth / block_depth),
                               max(1, _INFLIGHT_WORK_BYTES // max(1, worker_bytes))))
@@ -557,12 +474,11 @@ def backproject_spherical_volume_to_volume(
         cpu_pull = (_select_spherical_cpu_pull(source, spherical_view, radii, rotation, shape, bboxes)
                     if stage is None else None)
         cpu_setup_seconds = time.perf_counter() - cpu_setup_started
-        cpu_backend = ('unused' if stage is not None else
-                       ('numba_f64_bounded' if cpu_pull is not None else 'numpy_bounded'))
+        cpu_backend = 'unused' if stage is not None else 'numba_f64_bounded'
         encoded_format = getattr(projection_block_callback, 'encoded_slice_format', None)
         compact_supported = bool(sink_only and encoded_format in ('raw_u8', 'packbits_little')
                                  and callable(getattr(projection_block_callback, 'consume_encoded_block', None)))
-        cpu_compact = bool(compact_supported and spherical_cpu_compact_enabled())
+        cpu_compact = bool(compact_supported)
         cpu_rectangular = bool(cpu_compact and callable(getattr(cpu_pull, 'rectangle', None)))
         compact = bool(compact_supported and (stage is not None or cpu_compact))
         packed = encoded_format == 'packbits_little'
