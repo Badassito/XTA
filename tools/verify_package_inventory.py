@@ -117,6 +117,29 @@ REVIEWED_V24_0_3_RELEASE_SHA256 = 'cfc4da9cf67d78f7140cd64f372d3dc3e4244dd16f32c
 REVIEWED_V24_0_4_RELEASE_PREDECESSOR_COMMIT = '71928e1e4e6cf71aab1374d920e6d2bfa48cb447'
 REVIEWED_V24_0_4_RELEASE_PREDECESSOR_SHA256 = '140e2cf2c8b0c8afa3d994ae95ce7c2ce721c7fd420072c3830c6a4832fd03be'
 REVIEWED_V24_0_4_RELEASE_SHA256 = '139c26f4f6dccd13262422c0a040eab1d303d60b4467b94df28710496701dfc4'
+# The tagged v24.0.4 inventory is immutable. The successor digest, changed-module
+# predecessor pins, and retirement scope are filled only after v24.0.5 source freezes.
+REVIEWED_V24_0_5_RELEASE_PREDECESSOR_COMMIT = 'f5cfdba7e2c87666a7f72683cbbd907fbd522c09'
+REVIEWED_V24_0_5_RELEASE_PREDECESSOR_SHA256 = 'ed6d3c9e7c6297ab6174a6a17eee9f75a35473f5cc6e461a50022cdfe7725c24'
+REVIEWED_V24_0_5_RELEASE_SHA256 = '70590059ed98ed38d78ff65125bd1a6a5d171e660e44815b8cb65b9602da3c53'
+REVIEWED_V24_0_5_RELEASE_PREDECESSOR_MODULES = {'__init__': {'ast_sha256': '2e3b629f3b305010cdc2a68cbe5adf0918423d2be5657f5256663c0d20c34f04',
+              'statements_sha256': '064dc2e52bd60f0a1f45da47b7b2a915bb7011cd76bf5161d0956ff3ea99bc91'},
+ 'confidence_storage': {'ast_sha256': '7f2181c39f69ad73ff32d7162bf4452e4b4c7c3a75aaeb640b9de660d99b6155',
+                        'statements_sha256': '79d972e69028801f945448e20ad6128a4dd4aaa82520a8a08d60022c05590dfe'},
+ 'cuda_backend': {'ast_sha256': '7235ad6b2d0a96a044ac5dcc36a29b7912881f8a817fa6cf4e837db38425cc2a',
+                  'statements_sha256': '431ee31bb4446b830437137615105b87fe06191403755f46641825eacab5992b'},
+ 'outputs': {'ast_sha256': 'e7130d311e134fd715279036b683ea877b774f3e640ef69509aea84d13144232',
+             'statements_sha256': 'e1723e5a005ef38563954d4ed315b854bab60875010d2e94848d384702a75db5'},
+ 'pipeline': {'ast_sha256': '15fbf2ea64a8fa64f0838dc4d92cfacd77353123766c11491c437de0994360e0',
+              'statements_sha256': '1be7cc2c4568b6ff80e0d51e4babe2c406f015a79a4d2a5270f497953fbc73b7'},
+ 'pta_publication': {'ast_sha256': '8592a7bafb725597497c2f043fc7585f2ac064a427affc947953a43cafcb2ac6',
+                     'statements_sha256': 'cd07828602fc1580b8ec5e8f97eec0daca0297d03b5e84f3bb0c443bf1970d95'},
+ 'runtime': {'ast_sha256': 'cf3dbd78f7af80a58c04286534e118d0590005125b4204d72652715966f3286f',
+             'statements_sha256': '74fd0b7b7e278c3c1b24065cc7e10c9ed5a1e68e0a791ecad99d8d2b35694b8b'}}
+REVIEWED_V24_0_5_RELEASE_REMOVALS = {'definitions': (), 'statements': ()}
+REVIEWED_V24_0_5_ADDED_VALIDATION_TOOLS = {
+    'tools/qualify_native_trt_lease.py': '79bd26df350c97294383251716968ae05707ff43ac0538a4872726a83529307b',
+}
 REVIEWED_V24_0_4_RELEASE_PREDECESSOR_MODULES = {'__init__': {'ast_sha256': '26245b27428c1ad9fb210262f4ecafde78b1cf8c5709bbab7a6023049acd07c6',
               'statements_sha256': '058794d962e9f2ea9bd414d19f3f6971bd906608b06ed823fbe90be6849c2996'},
  '_deps': {'ast_sha256': '5c5900b0274d8b4a1f0ded960929b803257beba5454dcc1b56bcdbede73c35c6',
@@ -2929,6 +2952,7 @@ def reviewed_v24_0_3_release_contract(manifest, v21, *earlier_patches):
 
 def reviewed_v24_0_4_release_contract(manifest, v21, *earlier_patches):
     """Authenticate the cleanup appendix against the complete tagged 24.0.3 receipt."""
+    manifest = _without_reviewed_v24_0_5_release(manifest)
     key = 'v24_0_4_release_review'
     prior = {name: value for name, value in manifest.items() if name != key}
     encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
@@ -3027,7 +3051,118 @@ def reviewed_v24_0_4_release_contract(manifest, v21, *earlier_patches):
     return review
 
 
+def reviewed_v24_0_5_release_contract(manifest, v21, *earlier_patches):
+    """Authenticate the throughput appendix against the complete tagged 24.0.4 receipt."""
+    key = 'v24_0_5_release_review'
+    prior = {name: value for name, value in manifest.items() if name != key}
+    encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    if hashlib.sha256(encoded).hexdigest() != REVIEWED_V24_0_5_RELEASE_PREDECESSOR_SHA256:
+        raise RuntimeError('v24.0.5 predecessor inventory changed; preserve every historical record')
+    _authenticate_successor_once(prior, 'v24_0_4_release_review', reviewed_v24_0_4_release_contract)
+    earlier = tuple(value for name, value in prior.items()
+                    if name != 'v21_review' and isinstance(value, dict)
+                    and 'release' in value and 'definitions' in value)
+    review = _reviewed_v21_patch_contract(
+        manifest, prior['v21_review'], key=key, release='24.0.5',
+        expected_digest=REVIEWED_V24_0_5_RELEASE_SHA256,
+        previous_digest=REVIEWED_V24_0_4_RELEASE_SHA256,
+        earlier_patches=earlier)
+    if (review.get('predecessor_commit') != REVIEWED_V24_0_5_RELEASE_PREDECESSOR_COMMIT
+            or review.get('predecessor_inventory_sha256') != REVIEWED_V24_0_5_RELEASE_PREDECESSOR_SHA256
+            or review.get('feature') != 'tta-pta-throughput'):
+        raise RuntimeError('v24.0.5 review has an unexpected predecessor or feature')
+
+    snapshots = review.get('module_snapshots', ())
+    modules = [item.get('module') for item in snapshots]
+    if (len(modules) != len(set(modules))
+            or set(modules) != set(REVIEWED_V24_0_5_RELEASE_PREDECESSOR_MODULES)):
+        raise RuntimeError('v24.0.5 source snapshot coverage differs')
+    if set(review.get('complete_modules', ())) - set(modules):
+        raise RuntimeError('v24.0.5 complete source snapshot has no module')
+    records = review['definitions'] + review['statements']
+    for item in snapshots:
+        module = item['module']
+        previous = REVIEWED_V24_0_5_RELEASE_PREDECESSOR_MODULES[module]
+        historical = item.get('previous_top_level', ())
+        historical_digest = hashlib.sha256(json.dumps(historical, separators=(',', ':')).encode()).hexdigest()
+        if (item.get('previous_ast_sha256') != previous['ast_sha256']
+                or historical_digest != previous['statements_sha256']):
+            raise RuntimeError(f'v24.0.5 source predecessor changed: {module}')
+        if item.get('removed'):
+            raise RuntimeError(f'v24.0.5 has an unreviewed module removal: {module}')
+        for value in (item.get('ast_sha256'), *historical, *item.get('top_level', ())):
+            if (not isinstance(value, str) or len(value) != 64
+                    or any(char not in '0123456789abcdef' for char in value)):
+                raise RuntimeError(f'v24.0.5 source snapshot has an invalid digest: {module}')
+        if not item.get('reason'):
+            raise RuntimeError(f'v24.0.5 source snapshot has no review reason: {module}')
+        positions = []
+        for record in records:
+            if record['module'] != module:
+                continue
+            current_index, previous_index = record.get('current_index'), record.get('previous_index')
+            if (type(current_index) is not int or not 0 <= current_index < len(item['top_level'])
+                    or item['top_level'][current_index] != record['sha256']):
+                raise RuntimeError(f'v24.0.5 statement position differs: {module}')
+            if previous_index is None:
+                if record['previous_sha256'] is not None:
+                    raise RuntimeError(f'v24.0.5 new statement has an unexpected predecessor: {module}')
+            elif (type(previous_index) is not int or not 0 <= previous_index < len(historical)
+                    or historical[previous_index] != record['previous_sha256']):
+                raise RuntimeError(f'v24.0.5 statement predecessor changed: {module}')
+            positions.append(current_index)
+        if len(positions) != len(set(positions)):
+            raise RuntimeError(f'v24.0.5 source has duplicate reviewed positions: {module}')
+    if any(record['module'] not in set(modules) for record in records):
+        raise RuntimeError('v24.0.5 statement has no complete source snapshot')
+
+    removals = {
+        'definitions': tuple(sorted((item['module'], item['name'], item['previous_index'],
+                                     item['previous_sha256']) for item in review.get('removed_definitions', ()))),
+        'statements': tuple(sorted((item['module'], item['previous_index'], item['previous_sha256'])
+                                   for item in review.get('removed_statements', ()))),
+    }
+    if removals != REVIEWED_V24_0_5_RELEASE_REMOVALS:
+        raise RuntimeError('v24.0.5 reviewed removal scope differs')
+    removed_positions = set()
+    for category in ('removed_definitions', 'removed_statements'):
+        for record in review.get(category, ()):
+            module, index = record['module'], record['previous_index']
+            snapshot = next((item for item in snapshots if item['module'] == module), None)
+            if (snapshot is None or type(index) is not int
+                    or not 0 <= index < len(snapshot['previous_top_level'])
+                    or snapshot['previous_top_level'][index] != record['previous_sha256']
+                    or not record.get('reason') or (module, index) in removed_positions):
+                raise RuntimeError(f'v24.0.5 retired predecessor changed: {module}')
+            removed_positions.add((module, index))
+    reviewed_radial_module_hashes(prior['v21_review'], (*earlier, review))
+    reviewed_radial_definition_hashes(prior['v21_review'], (*earlier, review))
+
+    prior_tools = {item['path']: item['sha256'] for item in prior['v24_0_4_release_review']['validation_tools']}
+    tools = review.get('validation_tools', ())
+    expected_paths = [*prior_tools, *REVIEWED_V24_0_5_ADDED_VALIDATION_TOOLS]
+    if [item.get('path') for item in tools] != expected_paths:
+        raise RuntimeError('v24.0.5 validation-tool review has missing or duplicate paths')
+    for item in tools:
+        value = item.get('sha256')
+        previous = prior_tools.get(item['path'], REVIEWED_V24_0_5_ADDED_VALIDATION_TOOLS.get(item['path']))
+        if (item.get('previous_sha256') != previous or not item.get('reason')
+                or not isinstance(value, str) or len(value) != 64
+                or any(char not in '0123456789abcdef' for char in value)):
+            raise RuntimeError('v24.0.5 validation-tool review has invalid predecessor, digest or reason')
+    return review
+
+
+def _without_reviewed_v24_0_5_release(manifest):
+    key = 'v24_0_5_release_review'
+    if key not in manifest:
+        return manifest
+    _authenticate_successor_once(manifest, key, reviewed_v24_0_5_release_contract)
+    return {name: value for name, value in manifest.items() if name != key}
+
+
 def _without_reviewed_v24_0_4_release(manifest):
+    manifest = _without_reviewed_v24_0_5_release(manifest)
     key = 'v24_0_4_release_review'
     if key not in manifest:
         return manifest
@@ -3691,10 +3826,14 @@ def _verify_main() -> None:
                                   if 'v22_3_1_release_review' in manifest else None)
     publication_release_review = (reviewed_v22_3_2_release_contract(manifest, v21)
                                   if 'v22_3_2_release_review' in manifest else None)
+    throughput_release_review = (_authenticate_successor_once(
+                                 manifest, 'v24_0_5_release_review', reviewed_v24_0_5_release_contract)
+                                 if 'v24_0_5_release_review' in manifest else None)
+    throughput_manifest = _without_reviewed_v24_0_5_release(manifest)
     cleanup_release_review = (_authenticate_successor_once(
-                              manifest, 'v24_0_4_release_review', reviewed_v24_0_4_release_contract)
+                              throughput_manifest, 'v24_0_4_release_review', reviewed_v24_0_4_release_contract)
                               if 'v24_0_4_release_review' in manifest else None)
-    cleanup_manifest = _without_reviewed_v24_0_4_release(manifest)
+    cleanup_manifest = _without_reviewed_v24_0_4_release(throughput_manifest)
     tta_release_review = (_authenticate_successor_once(
                           cleanup_manifest, 'v24_0_3_release_review', reviewed_v24_0_3_release_contract)
                           if 'v24_0_3_release_review' in manifest else None)
@@ -3706,7 +3845,9 @@ def _verify_main() -> None:
     semantic_release_review = (_authenticate_successor_once(
                                semantic_manifest, 'v24_release_review', reviewed_v24_release_contract)
                                if 'v24_release_review' in manifest else None)
-    cleanup_successors = ((cleanup_release_review,) if cleanup_release_review is not None else ())
+    throughput_successors = ((throughput_release_review,) if throughput_release_review is not None else ())
+    cleanup_successors = (((cleanup_release_review,) if cleanup_release_review is not None else ())
+                          + throughput_successors)
     tta_successors = (((tta_release_review,) if tta_release_review is not None else ())
                       + cleanup_successors)
     patch_successors = (((patch_release_review,) if patch_release_review is not None else ())
@@ -3870,8 +4011,11 @@ def _verify_main() -> None:
         verify_v22_3_source_snapshots(tta_release_review, trees, cleanup_successors)
         verify_v22_3_validation_tools(tta_release_review, cleanup_successors)
     if cleanup_release_review is not None:
-        verify_v22_3_source_snapshots(cleanup_release_review, trees)
-        verify_v22_3_validation_tools(cleanup_release_review)
+        verify_v22_3_source_snapshots(cleanup_release_review, trees, throughput_successors)
+        verify_v22_3_validation_tools(cleanup_release_review, throughput_successors)
+    if throughput_release_review is not None:
+        verify_v22_3_source_snapshots(throughput_release_review, trees)
+        verify_v22_3_validation_tools(throughput_release_review)
     for module, expected_hash in reviewed_radial_module_hashes(v21, patches).items():
         source = (PACKAGE / f'{module}.py').read_text(encoding='utf-8')
         if hashlib.sha256(source.encode('utf-8')).hexdigest() != expected_hash:

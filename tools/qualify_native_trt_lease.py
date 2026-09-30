@@ -59,8 +59,15 @@ def main():
     parser.add_argument('--source-frames', type=int, default=24)
     parser.add_argument('--lease-frames', type=int, default=8)
     parser.add_argument('--conf', type=float, default=.5)
-    parser.add_argument('--heat-seconds', type=float, default=60.)
+    parser.add_argument('--native-ring-mode', choices=('all', 'radial'), default='all',
+                        help='Native family selection for the candidate lease; generic leases remain off')
+    parser.add_argument('--functional-only', action='store_true',
+                        help='Check routes and exact outputs without reporting timing comparisons')
+    parser.add_argument('--heat-seconds', type=float,
+                        help='Defaults to 0 for functional-only, 60 otherwise')
     args = parser.parse_args()
+    if args.heat_seconds is None:
+        args.heat_seconds = 0. if args.functional_only else 60.
     args.input = args.input.resolve(strict=True)
     args.engine = args.engine.resolve(strict=True)
     args.output_dir = args.output_dir.resolve()
@@ -72,7 +79,7 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=False)
     config_dir = args.output_dir / 'ultralytics-config'
     config_dir.mkdir()
-    os.environ.update(YOLO_TTA_FAST_GEOMETRY='1', YOLO_TTA_NATIVE_TRT_RING='0',
+    os.environ.update(YOLO_TTA_FAST_GEOMETRY='1', YOLO_TTA_NATIVE_TRT_RING='off',
                       YOLO_AUTOINSTALL='false', YOLO_CONFIG_DIR=str(config_dir))
 
     import torch
@@ -125,6 +132,8 @@ def main():
         raise RuntimeError(f'Wrong engine input shape: {binding_shapes[input_name]}')
 
     report = {'scope': __doc__, 'source': str(args.input), 'engine': str(args.engine),
+              'native_ring_mode_requested': args.native_ring_mode,
+              'functional_only': bool(args.functional_only),
               'source_sha256': digest_file(args.input), 'engine_sha256': digest_file(args.engine),
               'source_start_frame': args.start_frame, 'source_shape': list(volume.shape),
               'logical_shape': logical_shape, 'torch': torch.__version__, 'tensorrt': trt.__version__,
@@ -169,7 +178,8 @@ def main():
                                                'retired_context_groups': retired,
                                                'seconds': time.perf_counter() - started})
             previous_mode = mode
-            os.environ['YOLO_TTA_NATIVE_TRT_RING'] = str(int(mode == 'native'))
+            os.environ['YOLO_TTA_NATIVE_TRT_RING'] = (
+                args.native_ring_mode if mode == 'native' else 'off')
             label = f'{len(report["runs"]):02d}-{physical.family}-{mode}'
             print(f'BEGIN COMPLETE LEASE {label}: {physical.name} [{offset},{offset + args.lease_frames})', flush=True)
             torch.cuda.synchronize()
@@ -192,20 +202,24 @@ def main():
             source.close()
             torch.cuda.synchronize()
             elapsed = time.perf_counter() - started
-            consumed = int(source._direct_count if mode == 'native' else source.count)
             native_active = bool(getattr(source, '_native_trt_data_consumed', False))
-            if consumed != args.lease_frames or native_active != (mode == 'native'):
+            expected_native = bool(mode == 'native' and (
+                args.native_ring_mode == 'all' or physical.family == 'radial'))
+            consumed = int(source._direct_count if native_active else source.count)
+            if consumed != args.lease_frames or native_active != expected_native:
                 raise AssertionError(f'{label}: source frame count/route mismatch ({consumed}, {native_active})')
             if int(stats.get('device_hole_filled_frames', 0)):
                 raise AssertionError('This native-mask lease must not add morphology')
-            if mode == 'generic' and source._direct_count:
-                raise AssertionError('Generic mode unexpectedly consumed ring slots')
+            if not expected_native and source._direct_count:
+                raise AssertionError('Generic family/mode unexpectedly consumed ring slots')
             mask_sha = array_digest(target)
             counts = (int(stats['prediction_count']), int(stats['frames_with_predictions']))
             baseline = baselines.setdefault(physical.family, (mask_sha, counts))
             row = {'mode': mode, 'label': label, 'view': physical.name, 'family': physical.family,
                    'slice_offset': offset, 'source_frames_consumed': consumed,
-                   'native_ring_active': native_active, 'lease_seconds': elapsed,
+                   'native_ring_active': native_active, 'expected_native_ring_active': expected_native,
+                   'native_ring_mode_requested': os.environ['YOLO_TTA_NATIVE_TRT_RING'],
+                   'lease_seconds': elapsed,
                    'mask_shape': list(target.shape), 'foreground_voxels': int(np.count_nonzero(target)),
                    'mask_sha256': mask_sha, 'exact_mask_match': mask_sha == baseline[0],
                    'exact_count_match': counts == baseline[1], 'stats': serializable_stats(stats),
@@ -225,17 +239,23 @@ def main():
                                              'seconds': time.perf_counter() - started}
     report['all_masks_exact'] = all(row['exact_mask_match'] for row in report['runs'])
     report['all_counts_exact'] = all(row['exact_count_match'] for row in report['runs'])
+    report['nonempty_families'] = {
+        family: any(row['foreground_voxels'] > 0 for row in report['runs'] if row['family'] == family)
+        for family in ('radial', 'spherical')}
     report['actual_source_frames_per_mode'] = {
         mode: sum(row['source_frames_consumed'] for row in report['runs'] if row['mode'] == mode)
         for mode in ('generic', 'native')}
-    report['median_lease_seconds'] = {
-        family: {mode: statistics.median(row['lease_seconds'] for row in report['runs']
-                                         if row['family'] == family and row['mode'] == mode)
-                 for mode in ('generic', 'native')}
-        for family in ('radial', 'spherical')}
+    if not args.functional_only:
+        report['median_lease_seconds'] = {
+            family: {mode: statistics.median(row['lease_seconds'] for row in report['runs']
+                                             if row['family'] == family and row['mode'] == mode)
+                     for mode in ('generic', 'native')}
+            for family in ('radial', 'spherical')}
     save_json(output, report)
     if not report['all_masks_exact'] or not report['all_counts_exact']:
         raise AssertionError('Native ring changed a mask or prediction count in the identical lease')
+    if args.functional_only and not all(report['nonempty_families'].values()):
+        raise AssertionError('Functional lease parity is vacuous for a family with no foreground output')
     print(f'Complete lease qualification passed: {output}', flush=True)
 
 

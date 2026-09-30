@@ -16,9 +16,9 @@ from XTA import cli, config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRENT_VERSION = "24.0.4"
-CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v24.0.4_SLURM.py"
-PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v24.0.3_SLURM.py"
+CURRENT_VERSION = "24.0.5"
+CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v24.0.5_SLURM.py"
+PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v24.0.4_SLURM.py"
 SCRATCH_REPORTS = (
     "TTA_EXTERNAL_AUGMENTATION.md",
     "TTA_TEST_CLI_AUDIT.md",
@@ -54,7 +54,7 @@ class PackageMetadataTests(unittest.TestCase):
     def test_runtime_version_constants_are_aligned(self) -> None:
         self.assertEqual(XTA.__version__, CURRENT_VERSION)
         self.assertEqual(config.SCRIPT_VERSION, CURRENT_VERSION)
-        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2404")
+        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2405")
         self.assertEqual(config.SCRIPT_BASENAME, CURRENT_LAUNCHER)
         self.assertEqual(cli.SCRIPT_VERSION, CURRENT_VERSION)
         self.assertEqual(cli.SCRIPT_BASENAME, CURRENT_LAUNCHER)

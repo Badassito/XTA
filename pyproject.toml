@@ -43,7 +43,7 @@ version = {attr = "XTA.__version__"}
 [tool.setuptools.data-files]
 "share/xta" = [
   "ARCHITECTURE.md",
-  "GPT-6-Astra-Ultra_v24.0.4_SLURM.py",
+  "GPT-6-Astra-Ultra_v24.0.5_SLURM.py",
 ]
 "share/xta/tools" = [
   "tools/compare_reconciliation.py",

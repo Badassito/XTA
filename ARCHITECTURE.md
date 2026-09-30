@@ -10,7 +10,7 @@ document is available in Git with `git show 597fc45:ARCHITECTURE.md`.
 
 ## Entry points and shared contracts
 
-`GPT-6-Astra-Ultra_v24.0.4_SLURM.py`, the installed `xta` command, and
+`GPT-6-Astra-Ultra_v24.0.5_SLURM.py`, the installed `xta` command, and
 `python -m XTA` enter `XTA.cli.run()`. The CLI selects exactly one mode and
 validates that mode's grammar before importing its heavy runtime. `tta_mode`
 enters `pipeline.main`, `pta_mode` resolves `PtaConfig` before `pta_runtime`
@@ -351,7 +351,7 @@ Release qualification runs the full suite from the repository root before
 inventory verification and source-bundle construction:
 
 ```powershell
-python -B tools/qualify_release.py --output-dir ../Scratch/Releases/v24.0.4-validation
+python -B tools/qualify_release.py --output-dir ../Scratch/Releases/v24.0.5-validation
 ```
 
 The default requires a clean Git checkout and bundles committed Git bytes.

@@ -132,6 +132,15 @@ def test_pin_update_changes_only_the_requested_release_bindings():
         prepare._update_verifier_pins("NEW_SHA256 = ''\n", 'NEW', 'a' * 64, {})
 
 
+def test_v24_0_5_review_is_append_only_and_tracks_new_native_lease_qualifier():
+    spec = prepare.RELEASES['24.0.5']
+    assert spec['previous_token'] == '24_0_4'
+    assert spec['predecessor_inventory_path'] == 'release/_package_inventory.json'
+    assert spec['validation_tools'][:-1] == prepare.RELEASES['24.0.4']['validation_tools']
+    assert spec['validation_tools'][-1] == 'tools/qualify_native_trt_lease.py'
+    assert inventory.REVIEWED_V24_0_5_RELEASE_PREDECESSOR_COMMIT == 'f5cfdba7e2c87666a7f72683cbbd907fbd522c09'
+
+
 def test_generated_review_evidence_cannot_be_written_inside_the_repository():
     with pytest.raises(ValueError, match='outside the repository'):
         prepare.prepare(output_dir=prepare.ROOT / 'generated_review')

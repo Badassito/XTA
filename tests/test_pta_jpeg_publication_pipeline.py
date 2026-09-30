@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 import pickle
 from pathlib import Path
+import stat
 import tempfile
 import threading
 from types import SimpleNamespace
@@ -169,6 +170,36 @@ class JpegPublicationPipelineTests(unittest.TestCase):
         finally:
             release.set()
 
+    def test_success_validates_open_stage_and_skips_successful_stage_unlink(self):
+        batch = self.encode([jpeg(b"one"), jpeg(b"two")])
+        original_validate = publication._validate_jpeg_file
+        validated = []
+
+        def validate_stage(path, *, context, handle=None):
+            self.assertIsNotNone(handle)
+            self.assertFalse(handle.closed)
+            validated.append(path)
+            return original_validate(path, context=context, handle=handle)
+
+        with mock.patch.object(publication, "_validate_jpeg_file", side_effect=validate_stage), \
+             mock.patch.object(Path, "unlink", side_effect=AssertionError("successful stage unlink")):
+            publication._publish_nvjpeg_batch_atomically(batch)
+        self.assertEqual(len(validated), 2)
+        self.assertEqual(tuple(path.read_bytes() for path in batch.final_paths), batch.payloads)
+        self.assert_no_stages()
+
+    def test_nonregular_staged_descriptor_never_replaces_existing_final(self):
+        batch = self.encode([jpeg()])
+        final = batch.final_paths[0]
+        final.parent.mkdir(parents=True)
+        final.write_bytes(b"previous")
+        with mock.patch.object(publication.os, "fstat", return_value=SimpleNamespace(
+                st_mode=stat.S_IFIFO, st_size=len(batch.payloads[0]))):
+            with self.assertRaisesRegex(RuntimeError, "not a regular file"):
+                publication._publish_nvjpeg_batch_atomically(batch)
+        self.assertEqual(final.read_bytes(), b"previous")
+        self.assert_no_stages()
+
     def test_short_write_preserves_existing_final_and_removes_private_stage(self):
         batch = self.encode([jpeg()])
         final = batch.final_paths[0]
@@ -186,9 +217,42 @@ class JpegPublicationPipelineTests(unittest.TestCase):
                 return self.handle.write(payload[:-1])
         def open_file(path, mode="r", *args, **kwargs):
             handle = original_open(path, mode, *args, **kwargs)
-            return ShortWriter(handle) if mode == "wb" and ".nvjpeg." in path.name else handle
+            return ShortWriter(handle) if mode == "wb+" and ".nvjpeg." in path.name else handle
         with mock.patch.object(Path, "open", side_effect=open_file, autospec=True):
             with self.assertRaisesRegex(RuntimeError, "write was short"):
+                publication._publish_nvjpeg_batch_atomically(batch)
+        self.assertEqual(final.read_bytes(), b"previous")
+        self.assert_no_stages()
+
+    def test_flush_failure_preserves_existing_final_and_removes_private_stage(self):
+        batch = self.encode([jpeg()])
+        final = batch.final_paths[0]
+        final.parent.mkdir(parents=True)
+        final.write_bytes(b"previous")
+        original_open = Path.open
+
+        class FlushFailure:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.handle.close()
+
+            def write(self, payload):
+                return self.handle.write(payload)
+
+            def flush(self):
+                raise OSError("injected stage flush failure")
+
+        def open_file(path, mode="r", *args, **kwargs):
+            handle = original_open(path, mode, *args, **kwargs)
+            return FlushFailure(handle) if mode == "wb+" and ".nvjpeg." in path.name else handle
+
+        with mock.patch.object(Path, "open", side_effect=open_file, autospec=True):
+            with self.assertRaisesRegex(OSError, "stage flush failure"):
                 publication._publish_nvjpeg_batch_atomically(batch)
         self.assertEqual(final.read_bytes(), b"previous")
         self.assert_no_stages()
