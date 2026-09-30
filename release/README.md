@@ -4,9 +4,9 @@
 source distribution and complete source bundle, but is not needed by the
 installed `XTA` package or wheel.
 
-Each released appendix is immutable. The `v24.0.3` tag authenticates its own
-review; the legacy configuration cleanup and compiled CPU backend policy are
-recorded in the `24.0.4` successor.
+Each released appendix is immutable. The `v24.0.4` tag authenticates the
+legacy configuration cleanup and compiled CPU backend policy. The `24.0.5`
+successor records the TTA/PTA throughput changes against that tagged receipt.
 `tools/prepare_reconciliation_release.py` creates a draft under Scratch and
 requires an explicit `--write` to append it after source and validation tools
 are frozen. The new appendix independently pins predecessor module snapshots

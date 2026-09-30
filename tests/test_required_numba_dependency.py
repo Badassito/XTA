@@ -60,4 +60,4 @@ def test_disabled_jit_fails_runtime_import_but_keeps_cli_version_light() -> None
         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
     )
     assert version.returncode == 0, version.stdout
-    assert "24.0.4" in version.stdout
+    assert "24.0.5" in version.stdout

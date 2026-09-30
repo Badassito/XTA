@@ -138,6 +138,11 @@ class RuntimeTelemetry:
         self._scheduler_counter_pending: Counter[str] = Counter()
         self._scheduler_gauge_pending: Dict[str, object] = {}
         self._scheduler_metrics_dirty = 0
+        # Lower layers may register bounded diagnostic snapshots without making
+        # the system sampler import those layers or starting another timer thread.
+        self._sample_provider_lock = threading.Lock()
+        self._sample_execution_lock = threading.Lock()
+        self._sample_providers: Dict[str, Callable[[], object]] = {}
         self._writer_condition = threading.Condition(self.lock)
         self._writer_thread: Optional[threading.Thread] = None
         self._writer_idle_seconds = 5.0
@@ -351,6 +356,33 @@ class RuntimeTelemetry:
                 self._scheduler_gauge_pending.pop(key, None)
             self.gauges[key] = serialized
             self._dirty += 1
+
+    def register_sample_provider(self, name: str, provider: Callable[[], object]) -> None:
+        """Sample a lower-layer diagnostic on the existing system-sampler cadence."""
+        if not self.enabled:
+            return
+        with self._sample_provider_lock:
+            self._sample_providers[str(name)] = provider
+
+    def sample_registered_providers(self) -> None:
+        if not self.enabled:
+            return
+        # Serialize acquisition and gauge publication. A final shutdown sample
+        # cannot be overwritten by a slower periodic sample that started earlier.
+        with self._sample_execution_lock:
+            with self._sample_provider_lock:
+                providers = tuple(self._sample_providers.items())
+            for name, provider in providers:
+                try:
+                    sample = provider()
+                    if sample is not None:
+                        self.gauge(name, sample)
+                except BaseException as exc:
+                    # Diagnostics must never stop the sampler or output pipeline.
+                    try:
+                        self.fallback(f'telemetry.sample_provider.{name}', exc)
+                    except BaseException:
+                        pass
 
     def fallback(self, name: str, exc: Optional[BaseException] = None) -> None:
         if not self.enabled:
@@ -731,6 +763,9 @@ class RuntimeSystemSampler:
                     if key in now and key in prior:
                         self.telemetry.gauge(metric, max(0, int(now[key]) - int(prior[key])) / dt)
             self._sample_gpu()
+            if self.stop_event.is_set():
+                break
+            self.telemetry.sample_registered_providers()
             self.telemetry.maybe_flush()
 
     def start(self) -> None:
@@ -860,6 +895,7 @@ def shutdown_runtime_observability() -> None:
             pass
     if telemetry is not None:
         try:
+            telemetry.sample_registered_providers()
             telemetry.flush(final=True)
         except Exception:
             pass

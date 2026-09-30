@@ -1,12 +1,97 @@
 """Sparse zero descriptors must not turn one missing prefix into a full-pool barrier."""
 from concurrent.futures import Future
+from contextlib import nullcontext
 import gzip
 import io
+import os
 import threading
 import time
+from unittest import mock
 
 from XTA import outputs
 from XTA.nrrd_spans import canonical_zero_member
+
+
+class _ProviderTelemetry:
+    def __init__(self, *, enabled=True):
+        self.enabled = enabled
+        self.providers = {}
+
+    def register_sample_provider(self, name, provider):
+        self.providers[name] = provider
+
+    def add(self, _name, _value):
+        pass
+
+    def span(self, _name):
+        return nullcontext()
+
+
+def test_live_wait_sample_reports_head_age_stage_and_clears_after_close():
+    telemetry = _ProviderTelemetry()
+    sink = io.BytesIO()
+    with mock.patch.dict(os.environ, {'YOLO_TTA_TELEMETRY_SYSTEM_SAMPLER': '1'}), \
+         mock.patch.object(outputs, 'runtime_telemetry', return_value=telemetry):
+        writer = outputs._MemberParallelGzipPayloadWriter(
+            sink, codec_spec=('zlib', 1, lambda data: gzip.compress(bytes(data), mtime=0)),
+        )
+        head = Future()
+        writer._pending[head] = (0, 1)
+        writer._diag_pending[0] = (head, time.monotonic_ns() - 2_000_000_000)
+        writer._inflight_bytes = 1
+        writer._next_sequence = 1
+        entered = threading.Event()
+        original_wait = outputs.wait
+
+        def observed_wait(*args, **kwargs):
+            entered.set()
+            return original_wait(*args, **kwargs)
+
+        with mock.patch.object(outputs, 'wait', side_effect=observed_wait):
+            thread = threading.Thread(
+                target=writer._collect_completions,
+                kwargs={'block': True, 'wait_cause': 'zero_descriptor'},
+            )
+            thread.start()
+            try:
+                assert entered.wait(timeout=1)
+                probe = telemetry.providers['nrrd.member_stream.live']
+                first = probe()
+                assert first['waiting_writers'] >= 1
+                assert first['waiting_by_cause']['zero_descriptor'] >= 1
+                assert first['oldest_head']['sequence'] == 0
+                assert first['oldest_head']['future_stage'] == 'queued'
+                assert first['oldest_head_age_seconds'] >= 2
+                assert head.set_running_or_notify_cancel()
+                second = probe()
+                assert second['oldest_head']['future_stage'] == 'running'
+                assert second['oldest_head_age_seconds'] >= first['oldest_head_age_seconds']
+                head.set_result((gzip.compress(b'A', mtime=0), 1))
+            finally:
+                if not head.done():
+                    head.set_result((gzip.compress(b'A', mtime=0), 1))
+                thread.join(timeout=2)
+            assert not thread.is_alive()
+        writer.close()
+        final = probe()
+        assert final['waiting_writers'] == 0
+        assert final['completed_wait_seconds_process_lifetime'] > 0
+        assert gzip.decompress(sink.getvalue()) == b'A'
+
+
+def test_disabled_telemetry_does_not_track_per_wait_state():
+    telemetry = _ProviderTelemetry(enabled=False)
+    with mock.patch.object(outputs, 'runtime_telemetry', return_value=telemetry):
+        writer = outputs._MemberParallelGzipPayloadWriter(
+            io.BytesIO(), codec_spec=('zlib', 1, lambda data: gzip.compress(bytes(data), mtime=0)),
+        )
+        assert not writer._diag_enabled
+        assert not writer._diag_pending
+        assert writer._diag_wait is None
+        writer.write(b'abc')
+        writer.close()
+        assert not telemetry.providers
+        assert writer._diag_wait is None
 
 
 def test_zero_descriptor_pressure_releases_after_prefix_advances():
@@ -159,4 +244,7 @@ def test_zero_pressure_failure_settles_other_running_request_before_return():
     assert len(errors) == 1 and str(errors[0]) == 'codec failed'
     assert writer.closed and writer._writer_stats['failed_writers'] == 1
     assert not writer._pending and not writer._completed
+    assert not writer._diag_pending and writer._diag_wait is None
+    assert writer not in outputs._NRRD_LIVE_WRITERS
+    assert outputs._nrrd_live_writer_sample()['waiting_writers'] == 0
     assert sink.getvalue() == b''

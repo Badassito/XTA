@@ -17,6 +17,7 @@ PIECE_LAYOUT = 'native_pieces'
 BLOCK_DTYPE = np.dtype([('z','<u4'), ('y','<u4'), ('x','<u4'), ('h','<u2'),
                        ('w','<u2'), ('offset','<u8'), ('length','<u4')])
 _RECORD = struct.Struct('<IIIHHQI')
+_CROP_OCCUPANCY_BAND_BYTES = 8 * 1024 * 1024
 
 
 class ConfidenceStageLimit(RuntimeError):
@@ -69,21 +70,39 @@ def crop_blocks(crops, shape, block_size=128):
         starts = np.maximum(columns-x0, 0)
         for y in range(y0//block*block, y1, block):
             a, b = max(y, y0), min(y+block, y1)
-            occupied = np.any(values[a-y0:b-y0], axis=0)
-            active = np.logical_or.reduceat(occupied, starts)
-            for column in np.flatnonzero(active):
+            band = values[a-y0:b-y0]
+            if band.size <= _CROP_OCCUPANCY_BAND_BYTES:
+                # Reuse one bounded occupancy scan for every global-grid cell in this
+                # row band. Avoid a padded copy of the whole crop and per-cell scans.
+                occupied = band != 0
+                row_cells = np.logical_or.reduceat(occupied, starts, axis=1)
+                column_any = occupied.any(axis=0)
+                active = np.flatnonzero(row_cells.any(axis=0))
+            else:
+                # Very wide crops or unusually large block sizes must not turn a
+                # scanner optimization into an unadmitted full-band allocation.
+                row_cells = None
+                column_any = np.any(band, axis=0)
+                active = np.flatnonzero(np.logical_or.reduceat(column_any, starts))
+            for column in active:
                 x = int(columns[column])
-                a, b, c, d = max(y, y0), min(y+block, y1), max(x, x0), min(x+block, x1)
-                tile = values[a-y0:b-y0, c-x0:d-x0]
-                ys = np.flatnonzero(np.any(tile, axis=1))
+                c, d = max(x, x0), min(x+block, x1)
+                local_c, local_d = c-x0, d-x0
+                if row_cells is None:
+                    tile = band[:, local_c:local_d]
+                    ys = np.flatnonzero(np.any(tile, axis=1))
+                    xs = np.flatnonzero(np.any(tile, axis=0))
+                else:
+                    ys = np.flatnonzero(row_cells[:, column])
+                    xs = np.flatnonzero(column_any[local_c:local_d])
                 if not ys.size:
                     continue
-                xs = np.flatnonzero(np.any(tile, axis=0))
                 if (y, x) <= previous:
                     raise ValueError('Confidence reader crops must have disjoint, ordered block cells')
                 previous = (y, x)
                 top, bottom, left, right = int(ys[0]), int(ys[-1])+1, int(xs[0]), int(xs[-1])+1
-                yield a+top, a+bottom, c+left, c+right, np.ascontiguousarray(tile[top:bottom, left:right])
+                yield a+top, a+bottom, c+left, c+right, np.ascontiguousarray(
+                    band[top:bottom, local_c+left:local_c+right])
 
 
 def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, provenance,

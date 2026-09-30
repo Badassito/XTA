@@ -17,7 +17,7 @@ import zlib
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import BinaryIO, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -118,9 +118,9 @@ def _private_image_stage_path(path: Path, family: str) -> Path:
     )
 
 
-def _validate_nonempty_regular_file(path: Path, *, context: str) -> int:
+def _validate_nonempty_regular_file(path: Path, *, context: str, handle: Optional[BinaryIO] = None) -> int:
     try:
-        stat = path.stat()
+        stat = os.fstat(handle.fileno()) if handle is not None else path.stat()
     except OSError as exc:
         raise RuntimeError(f"{context} did not create a readable file: {path}") from exc
     if not statlib.S_ISREG(stat.st_mode):
@@ -130,11 +130,17 @@ def _validate_nonempty_regular_file(path: Path, *, context: str) -> int:
     return int(stat.st_size)
 
 
-def _validate_jpeg_file(path: Path, *, context: str) -> int:
-    size = _validate_nonempty_regular_file(path, context=context)
+def _validate_jpeg_file(path: Path, *, context: str, handle: Optional[BinaryIO] = None) -> int:
+    size = _validate_nonempty_regular_file(path, context=context, handle=handle)
     if size < 4:
         raise RuntimeError(f"{context} produced a truncated JPEG ({size} bytes): {path}")
-    with path.open("rb") as handle:
+    if handle is None:
+        with path.open("rb") as reader:
+            start = reader.read(2)
+            reader.seek(max(0, size - 64))
+            tail = reader.read()
+    else:
+        handle.seek(0)
         start = handle.read(2)
         handle.seek(max(0, size - 64))
         tail = handle.read()
@@ -291,17 +297,19 @@ def _publish_nvjpeg_batch_atomically(
     """
     finals = batch.final_paths
     stages = tuple(_private_image_stage_path(path, "nvjpeg") for path in finals)
+    pending_stages = set(stages)
     futures: List[Future] = []
 
     def write_stage(index: int, payload: bytes, stage: Path) -> None:
-        with stage.open("wb") as handle:
+        with stage.open("wb+") as handle:
             written = handle.write(payload)
             if int(written) != len(payload):
                 raise RuntimeError(
                     f"Python JPEG stage write was short at batch index {index}: "
                     f"{written}/{len(payload)} bytes"
                 )
-        _validate_jpeg_file(stage, context=f"nvJPEG batch index {index}")
+            handle.flush()
+            _validate_jpeg_file(stage, context=f"nvJPEG batch index {index}", handle=handle)
 
     try:
         for path in finals:
@@ -315,6 +323,7 @@ def _publish_nvjpeg_batch_atomically(
             future.result()
         for stage, final in zip(stages, finals):
             os.replace(stage, final)
+            pending_stages.discard(stage)
     finally:
         for future in futures:
             future.cancel()
@@ -323,7 +332,7 @@ def _publish_nvjpeg_batch_atomically(
                 future.result()
             except BaseException:
                 pass
-        for stage in stages:
+        for stage in pending_stages:
             try:
                 stage.unlink(missing_ok=True)
             except OSError:
@@ -371,29 +380,39 @@ def verify_published_image_tree(
     count = 0
     total_bytes = 0
     problems: List[str] = []
-    for path in image_root.rglob("*"):
-        if path.is_symlink():
-            if len(problems) < 12:
-                problems.append(f"unexpected_symlink={path}")
-            continue
-        if path.is_dir():
-            continue
-        if path.suffix.lower() != expected_suffix:
-            if len(problems) < 12:
-                problems.append(f"unexpected={path}")
-            continue
+    pending_directories = [image_root]
+    while pending_directories:
+        directory = pending_directories.pop()
         try:
-            stat = path.stat()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    try:
+                        if entry.is_symlink():
+                            if len(problems) < 12:
+                                problems.append(f"unexpected_symlink={path}")
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            pending_directories.append(path)
+                            continue
+                        if path.suffix.lower() != expected_suffix:
+                            if len(problems) < 12:
+                                problems.append(f"unexpected={path}")
+                            continue
+                        stat = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        if len(problems) < 12:
+                            problems.append(f"unreadable={path} ({type(exc).__name__}: {exc})")
+                        continue
+                    if not statlib.S_ISREG(stat.st_mode) or int(stat.st_size) <= 0:
+                        if len(problems) < 12:
+                            problems.append(f"empty_or_irregular={path} size={int(stat.st_size)}")
+                        continue
+                    count += 1
+                    total_bytes += int(stat.st_size)
         except OSError as exc:
             if len(problems) < 12:
-                problems.append(f"unreadable={path} ({type(exc).__name__}: {exc})")
-            continue
-        if not statlib.S_ISREG(stat.st_mode) or int(stat.st_size) <= 0:
-            if len(problems) < 12:
-                problems.append(f"empty_or_irregular={path} size={int(stat.st_size)}")
-            continue
-        count += 1
-        total_bytes += int(stat.st_size)
+                problems.append(f"unreadable={directory} ({type(exc).__name__}: {exc})")
     if problems or count != expected:
         detail = "; ".join(problems) if problems else "none"
         raise RuntimeError(
