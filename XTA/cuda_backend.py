@@ -215,13 +215,32 @@ def gpu_worker_render_resident_enabled() -> bool:
     """Allow a full source-volume upload when VRAM admission succeeds."""
     return _env_flag('YOLO_TTA_GPU_RENDER_RESIDENT', True)
 
-def native_trt_ring_enabled() -> bool:
-    """Opt native Radial/Spherical tasks into static TensorRT input slots.
+def native_trt_ring_mode() -> str:
+    """Resolve the native TensorRT ring's off/all/per-family opt-in."""
+    raw = os.environ.get('YOLO_TTA_NATIVE_TRT_RING', '').strip().lower()
+    if raw in ('', '0', 'false', 'no', 'off'):
+        return 'off'
+    if raw in ('1', 'true', 'yes', 'on', 'all'):
+        return 'all'
+    if raw in ('radial', 'spherical'):
+        return raw
+    raise ValueError(
+        'YOLO_TTA_NATIVE_TRT_RING must be off, all, radial, or spherical '
+        '(legacy boolean values 0/1, false/true, no/yes, off/on are accepted)'
+    )
 
-    This controls source delivery only. Their existing native renderers and the
-    executor's separate native-mask policy retain geometry and mask semantics.
+
+def native_trt_ring_enabled(family: Optional[str] = None) -> bool:
+    """Return whether native Radial/Spherical source delivery uses the ring.
+
+    Omitted family retains the historical any-native boolean result for callers
+    recording overall opt-in. Renderers and native-mask post policy are unchanged.
     """
-    return _env_flag('YOLO_TTA_NATIVE_TRT_RING', False)
+    mode = native_trt_ring_mode()
+    if family is None:
+        return mode != 'off'
+    family = str(family).lower()
+    return family in ('radial', 'spherical') and mode in ('all', family)
 
 def gpu_render_reserve_bytes() -> int:
     """VRAM headroom that must remain free AFTER a resident source-volume upload."""
@@ -4115,7 +4134,7 @@ class GpuRenderedYoloSource:
         self.bs = max(1, int(batch_size))
         self.resident_ring_supported = bool(
             not (is_radial_view(view) or is_spherical_view(view))
-            or (native_trt_ring_enabled() and self.bs == 1 and self.nf > 0
+            or (native_trt_ring_enabled(str(view.family)) and self.bs == 1 and self.nf > 0
                 and str(getattr(engine, '_mode', '')) == 'resident')
         )
         self.yield_nf = int(math.ceil(float(self.nf) / float(self.bs)) * self.bs) if self.nf > 0 else 0
@@ -4367,7 +4386,7 @@ class GpuTileRenderedYoloSource:
         self.bs = max(1, int(batch_size))
         self.resident_ring_supported = bool(
             not (is_radial_view(view) or is_spherical_view(view))
-            or (native_trt_ring_enabled() and self.bs == 1 and self.nf > 0
+            or (native_trt_ring_enabled(str(view.family)) and self.bs == 1 and self.nf > 0
                 and str(getattr(engine, '_mode', '')) == 'resident')
         )
         self.yield_nf = int(math.ceil(float(self.nf) / float(self.bs)) * self.bs) if self.nf > 0 else 0

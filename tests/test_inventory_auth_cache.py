@@ -28,20 +28,25 @@ def test_real_successor_contract_is_checked_once_per_context():
 
 def test_latest_successor_tampering_is_rechecked_in_a_new_pass():
     manifest = json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
+    latest = ('v23_0_5_release_review' if 'v23_0_5_release_review' in manifest
+              else 'v23_0_4_release_review')
+    without_latest = (inventory._without_reviewed_v23_0_5_release
+                      if latest == 'v23_0_5_release_review'
+                      else inventory._without_reviewed_v23_0_4_release)
     token = inventory._ACTIVE_REVIEW_AUTH_CACHE.set(set())
     try:
-        inventory._without_reviewed_v23_0_4_release(manifest)
+        without_latest(manifest)
     finally:
         inventory._ACTIVE_REVIEW_AUTH_CACHE.reset(token)
 
     altered = copy.deepcopy(manifest)
-    altered['v23_0_4_release_review']['feature'] = 'tampered'
+    altered[latest]['feature'] = 'tampered'
     token = inventory._ACTIVE_REVIEW_AUTH_CACHE.set(set())
     try:
         with pytest.raises(RuntimeError, match='review digest mismatch'):
-            inventory._without_reviewed_v23_0_4_release(altered)
+            without_latest(altered)
         with pytest.raises(RuntimeError, match='review digest mismatch'):
-            inventory._without_reviewed_v23_0_4_release(altered)
+            without_latest(altered)
     finally:
         inventory._ACTIVE_REVIEW_AUTH_CACHE.reset(token)
 

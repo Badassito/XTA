@@ -1,5 +1,6 @@
 """GPU sample identity survives repeated telemetry flushes and sampling errors."""
 import json
+import threading
 from types import SimpleNamespace
 from unittest import mock
 
@@ -69,3 +70,47 @@ def test_optional_identity_errors_preserve_utilization_sample(tmp_path):
     assert gauges['system.gpu_devices']==[{'nvml_index':0},{'nvml_index':1}]
     assert gauges['system.gpu_utilization'][1]['gpu']==41
     assert gauges['system.gpu_sample_monotonic_ns']>=gauges['system.gpu_sample_started_ns']
+
+
+def test_final_provider_sample_cannot_be_overwritten_by_older_sample(tmp_path):
+    sink = telemetry(tmp_path)
+    entered, release, final_done = threading.Event(), threading.Event(), threading.Event()
+    calls = 0
+
+    def provider():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            assert release.wait(timeout=2)
+        return {'waiting_writers': 1 if calls == 1 else 0}
+
+    sink.register_sample_provider('nrrd.member_stream.live', provider)
+    periodic = threading.Thread(target=sink.sample_registered_providers)
+    periodic.start()
+    assert entered.wait(timeout=1)
+    final = threading.Thread(target=lambda: (
+        sink.sample_registered_providers(), final_done.set(),
+    ))
+    final.start()
+    try:
+        assert not final_done.wait(timeout=.05)
+    finally:
+        release.set()
+        periodic.join(timeout=2)
+        final.join(timeout=2)
+    assert final_done.is_set()
+    assert sink.snapshot()['gauges']['nrrd.member_stream.live']['waiting_writers'] == 0
+
+
+def test_sample_provider_failure_and_fallback_failure_do_not_stop_other_samples(tmp_path):
+    sink = telemetry(tmp_path)
+
+    def broken():
+        raise RuntimeError('diagnostic failed')
+
+    sink.register_sample_provider('broken', broken)
+    sink.register_sample_provider('healthy', lambda: {'sample_monotonic_ns': 123})
+    with mock.patch.object(sink, 'fallback', side_effect=RuntimeError('fallback failed')):
+        sink.sample_registered_providers()
+    assert sink.snapshot()['gauges']['healthy'] == {'sample_monotonic_ns': 123}

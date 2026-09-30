@@ -445,7 +445,7 @@ def _execution_runtime_provenance() -> Dict[str, object]:
     """Include nonlinear geometry and scheduling sources in the run receipt."""
     import hashlib
     from .geometry_quality import geometry_quality_request_record
-    from .cuda_backend import native_trt_ring_enabled
+    from .cuda_backend import native_trt_ring_enabled, native_trt_ring_mode
     from .workspace import _env_flag
 
     result = radial_runtime_provenance()
@@ -468,6 +468,7 @@ def _execution_runtime_provenance() -> Dict[str, object]:
     result['spherical_sources'] = sources
     result['geometry_quality_requests'] = geometry_quality_request_record()
     result['native_trt_ring_requested'] = native_trt_ring_enabled()
+    result['native_trt_ring_mode'] = native_trt_ring_mode()
     result['task_trace_requested'] = _env_flag('YOLO_TTA_TASK_TRACE', False)
     result['cropped_upload_pipeline_requested'] = True
     result['spherical_cpu_compact_requested'] = True

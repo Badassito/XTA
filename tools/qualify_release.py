@@ -41,11 +41,11 @@ def source_identity() -> dict[str, object]:
 
 
 @contextmanager
-def gpu_reservation(path: Path, timeout: float):
+def gpu_reservation(path: Path, timeout: float, *, task_name: str = 'full repository release qualification'):
     """Reserve this workspace's GPU without replacing another task's lock."""
     path.parent.mkdir(parents=True, exist_ok=True)
     token = uuid.uuid4().hex
-    record = {'task': 'full repository release qualification', 'pid': os.getpid(),
+    record = {'task': str(task_name), 'pid': os.getpid(),
               'start_time': datetime.now(timezone.utc).isoformat(), 'token': token}
     deadline = time.monotonic() + timeout
     announced = False

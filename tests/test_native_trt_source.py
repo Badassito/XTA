@@ -45,6 +45,53 @@ def make_source(engine, physical, *, tiled=False, channels='gray', fp16=False,
 
 
 class NativeTrtSourceContracts(unittest.TestCase):
+    def test_family_modes_preserve_legacy_boolean_values(self):
+        cases = (
+            ('', 'off', ()), ('0', 'off', ()), ('false', 'off', ()),
+            ('no', 'off', ()), ('off', 'off', ()),
+            ('1', 'all', ('radial', 'spherical')),
+            ('true', 'all', ('radial', 'spherical')),
+            ('yes', 'all', ('radial', 'spherical')),
+            ('on', 'all', ('radial', 'spherical')),
+            ('all', 'all', ('radial', 'spherical')),
+            ('radial', 'radial', ('radial',)),
+            ('spherical', 'spherical', ('spherical',)),
+        )
+        views = {view.family: view for view in native_views()
+                 if view.family in ('radial', 'spherical')}
+        for raw, mode, selected in cases:
+            with mock.patch.dict(os.environ, {'YOLO_TTA_NATIVE_TRT_RING': f' {raw.upper()} '}):
+                with self.subTest(raw=raw):
+                    self.assertEqual(cb.native_trt_ring_mode(), mode)
+                    self.assertEqual(cb.native_trt_ring_enabled(), bool(selected))
+                    self.assertFalse(cb.native_trt_ring_enabled('azimuthal'))
+                    for family in ('radial', 'spherical'):
+                        self.assertEqual(cb.native_trt_ring_enabled(family), family in selected)
+                        for tiled in (False, True):
+                            engine = SimpleNamespace(_mode='resident')
+                            with mock.patch.object(geometry, 'build_aug_job_for_variant',
+                                                   return_value=SimpleNamespace(aff=None)):
+                                source = make_source(engine, views[family], tiled=tiled,
+                                                     batch_size=1, num_frames=3)
+                            self.assertEqual(source.resident_ring_supported,
+                                             family in selected)
+
+    def test_invalid_family_mode_is_rejected(self):
+        for raw in ('radail', 'radial,spherical', '2'):
+            with self.subTest(raw=raw), mock.patch.dict(
+                    os.environ, {'YOLO_TTA_NATIVE_TRT_RING': raw}):
+                with self.assertRaisesRegex(ValueError, 'off, all, radial, or spherical'):
+                    cb.native_trt_ring_mode()
+                with self.assertRaisesRegex(ValueError, 'off, all, radial, or spherical'):
+                    cb.native_trt_ring_enabled('radial')
+
+    def test_runtime_provenance_records_mode_and_keeps_boolean(self):
+        from XTA import pipeline
+        with mock.patch.dict(os.environ, {'YOLO_TTA_NATIVE_TRT_RING': 'radial'}):
+            receipt = pipeline._execution_runtime_provenance()
+        self.assertIs(receipt['native_trt_ring_requested'], True)
+        self.assertEqual(receipt['native_trt_ring_mode'], 'radial')
+
     def test_optin_is_independent_of_geometry_and_requires_resident_batch_one(self):
         views = native_views()
         for family in ('radial', 'spherical'):

@@ -101,6 +101,14 @@ RELEASES = {
                        'tools/qualify_d1_confidence_masked_transfer.py',
                        'tools/qualify_release.py')),
 }
+RELEASES['23.0.5'] = dict(
+    token='23_0_5', previous_token='23_0_4',
+    feature='tta-pta-throughput',
+    predecessor_inventory_path='release/_package_inventory.json',
+    validation_tools=RELEASES['23.0.4']['validation_tools'] + (
+        'tools/qualify_native_trt_lease.py',
+    ),
+)
 REASONS = {
     '__init__': 'Publish the package release identity as {release}.',
     'cli': 'Use the sole {release} launcher and current release identity.',
@@ -243,6 +251,16 @@ TTA_THROUGHPUT_REASONS = {
     'workers': 'Report the restored Radial and Spherical worker paths.',
     'outputs': 'Drain completed zero-descriptor gzip members without blocking unrelated publication.',
     'tta_scheduler': 'Avoid repeated immutable task calculations while preserving dynamic admission decisions.',
+}
+TTA_PTA_THROUGHPUT_REASONS = {
+    '__init__': 'Advance the package identity after the tagged 23.0.4 release.',
+    'cuda_backend': 'Make the native TensorRT ring admission family-specific while preserving generic rendering for ineligible tasks.',
+    'pipeline': 'Carry the reviewed native-ring policy through TTA task execution and reporting.',
+    'confidence_storage': 'Reduce confidence evidence publication overhead while preserving encoded score and index bytes.',
+    'outputs': 'Improve bounded NRRD publication diagnostics without changing layer contents.',
+    'pta_publication': 'Reduce PTA image publication filesystem work while retaining checked publication semantics.',
+    'pta_workers': 'Use the reviewed PTA publication and image-tree verification paths.',
+    'runtime': 'Sample bounded NRRD publication diagnostics on the existing telemetry cadence and at shutdown.',
 }
 REMOVAL_REASONS = {
     'examples/external_reconciliation/' + name:
@@ -389,6 +407,7 @@ TOOL_REASONS = {
     'tools/qualify_radial_bitset_compaction.py': 'Qualify exact packed Radial output and bounded device-to-host traffic against the original path.',
     'tools/qualify_d1_confidence_masked_transfer.py': 'Qualify exact cropped confidence payloads and reduced device-to-host calls for masked transfer.',
     'tools/qualify_release.py': 'Route qualification temporary files and GPU compiler caches into task Scratch while preserving the source and test gates.',
+    'tools/qualify_native_trt_lease.py': 'Qualify explicit native TensorRT lease modes, execution and output parity.',
 }
 
 
@@ -537,17 +556,20 @@ def _update_verifier_pins(source, prefix, digest, pins, removals=None):
     return ''.join(lines)
 
 
-def prepare(*, output_dir, release='23.0.4', write=False):
+def prepare(*, output_dir, release='23.0.5', write=False):
     root, output_dir = ROOT, Path(output_dir).resolve()
     if output_dir.is_relative_to(root):
         raise ValueError('Generated release-review evidence belongs outside the repository')
     spec = RELEASES[release]
-    reasons = ({} if release == '23.0.4' else
+    reasons = (TTA_PTA_THROUGHPUT_REASONS if release == '23.0.5' else
+               {} if release == '23.0.4' else
                {**REASONS, **(THROUGHPUT_REASONS if release == '22.3.2' else {}),
                 **(SEMANTIC_REASONS if release == '23.0.1' else {}),
                 **(PATCH_REASONS if release == '23.0.2' else {}),
                 **(TTA_THROUGHPUT_REASONS if release == '23.0.3' else {})})
-    fallback_reason = ('Record the reviewed v23.0.4 cleanup and compiled CPU backend changes in this module.'
+    fallback_reason = ('Record the reviewed v23.0.5 TTA/PTA throughput changes in this module.'
+                       if release == '23.0.5' else
+                       'Record the reviewed v23.0.4 cleanup and compiled CPU backend changes in this module.'
                        if release == '23.0.4' else
                        'Implement the reviewed {release} TTA throughput contract in this source module.')
     prefix = 'REVIEWED_V' + spec['token'] + '_RELEASE'
@@ -627,9 +649,19 @@ def prepare(*, output_dir, release='23.0.4', write=False):
                 reason=reasons.get(module, fallback_reason).format(release=release)))
     previous_review = predecessor['v' + spec['previous_token'] + '_release_review']
     previous_tools = {item['path']: item['sha256'] for item in previous_review.get('validation_tools', ())}
-    review['validation_tools'] = [dict(path=path, previous_sha256=previous_tools.get(path),
+
+    def previous_tool_sha(path):
+        if path in previous_tools:
+            return previous_tools[path]
+        source = git_file(root, predecessor_commit, path)
+        return hashlib.sha256(source.encode()).hexdigest() if source is not None else None
+
+    review['validation_tools'] = [dict(
+        path=path,
+        previous_sha256=previous_tool_sha(path),
         sha256=hashlib.sha256((root / path).read_text(encoding='utf-8').encode()).hexdigest(),
-        reason=TOOL_REASONS[path]) for path in spec['validation_tools']]
+        reason=TOOL_REASONS[path],
+    ) for path in spec['validation_tools']]
     payload = {**predecessor, key: review}
     digest = canonical(review)
     # Validate draft structure using its proposed pins without publishing them.
@@ -641,17 +673,18 @@ def prepare(*, output_dir, release='23.0.4', write=False):
     }
     original_digest = getattr(inventory, prefix + '_SHA256')
     original_pins = getattr(inventory, prefix + '_PREDECESSOR_MODULES')
-    original_removals = getattr(inventory, prefix + '_REMOVALS') if release == '23.0.4' else None
+    pins_removals = release in ('23.0.4', '23.0.5')
+    original_removals = getattr(inventory, prefix + '_REMOVALS') if pins_removals else None
     try:
         setattr(inventory, prefix + '_SHA256', digest)
         setattr(inventory, prefix + '_PREDECESSOR_MODULES', source_pins)
-        if release == '23.0.4':
+        if pins_removals:
             setattr(inventory, prefix + '_REMOVALS', removals)
         getattr(inventory, 'reviewed_v' + spec['token'] + '_release_contract')(payload, predecessor['v21_review'])
     finally:
         setattr(inventory, prefix + '_SHA256', original_digest)
         setattr(inventory, prefix + '_PREDECESSOR_MODULES', original_pins)
-        if release == '23.0.4':
+        if pins_removals:
             setattr(inventory, prefix + '_REMOVALS', original_removals)
     if write:
         if subprocess.check_output(['git', 'tag', '--list', f'v{release}'], cwd=root).strip():
@@ -662,7 +695,7 @@ def prepare(*, output_dir, release='23.0.4', write=False):
         inventory.verify_v22_3_validation_tools(review)
         verifier = root / 'tools/verify_package_inventory.py'
         verifier_source = _update_verifier_pins(verifier.read_text(encoding='utf-8'), prefix, digest, source_pins,
-                                                removals if release == '23.0.4' else None)
+                                                removals if pins_removals else None)
         inventory.MANIFEST.write_text(json.dumps(payload, indent=2) + '\n', encoding='utf-8', newline='\n')
         verifier.write_text(verifier_source, encoding='utf-8', newline='\n')
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -677,7 +710,7 @@ def prepare(*, output_dir, release='23.0.4', write=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--release', choices=tuple(RELEASES), default='23.0.4')
+    parser.add_argument('--release', choices=tuple(RELEASES), default='23.0.5')
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--write', action='store_true')
     args = parser.parse_args(argv)

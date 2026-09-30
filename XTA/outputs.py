@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+import weakref
 import zlib
 from concurrent.futures import (
     FIRST_COMPLETED,
@@ -1686,6 +1687,100 @@ class _RepeatedGzipMembers:
     count: int
 
 
+_NRRD_LIVE_WRITERS_LOCK = threading.Lock()
+_NRRD_LIVE_WRITERS: weakref.WeakSet['_MemberParallelGzipPayloadWriter'] = weakref.WeakSet()
+_NRRD_LIVE_RETIRED_WAIT_SECONDS = 0.0
+
+
+def _nrrd_live_writer_sample() -> Dict[str, object]:
+    """Bounded snapshot of waits still in progress, sampled by RuntimeSystemSampler."""
+    now_ns = time.monotonic_ns()
+    with _NRRD_LIVE_WRITERS_LOCK:
+        writers = tuple(_NRRD_LIVE_WRITERS)
+        completed_wait_seconds = float(_NRRD_LIVE_RETIRED_WAIT_SECONDS)
+        waits = tuple((writer, writer._diag_wait) for writer in writers)
+        completed_wait_seconds += sum(writer._diag_completed_wait_seconds for writer in writers)
+    causes = {'zero_descriptor': 0, 'close': 0, 'window': 0}
+    head_stages = {'queued': 0, 'running': 0, 'done': 0, 'unknown': 0}
+    oldest_head: Optional[Dict[str, object]] = None
+    oldest_head_age = 0.0
+    oldest_wait_age = 0.0
+    waiting = 0
+    for writer, state in waits:
+        if state is None:
+            continue
+        waiting += 1
+        (started_ns, cause, head_sequence, submitted_ns, head_future,
+         pending_count, ready_count, inflight_bytes) = state
+        causes[str(cause)] = causes.get(str(cause), 0) + 1
+        wait_age = max(0.0, (now_ns - int(started_ns)) / 1e9)
+        head_age = (
+            max(0.0, (now_ns - int(submitted_ns)) / 1e9)
+            if submitted_ns is not None else None
+        )
+        oldest_wait_age = max(oldest_wait_age, wait_age)
+        stage = 'unknown'
+        if head_future is not None:
+            stage = ('done' if head_future.done() else
+                     'running' if head_future.running() else 'queued')
+        head_stages[stage] += 1
+        if head_age is not None and head_age >= oldest_head_age:
+            oldest_head_age = head_age
+            oldest_head = {
+                'layer': writer._diag_layer_name,
+                'sequence': int(head_sequence),
+                'future_stage': stage,
+                'wait_cause': str(cause),
+                'head_age_seconds': head_age,
+                'wait_age_seconds': wait_age,
+                'pending_members': int(pending_count),
+                'ready_descriptors': int(ready_count),
+                'inflight_bytes': int(inflight_bytes),
+            }
+    return {
+        'sample_monotonic_ns': now_ns,
+        'active_writers': len(writers),
+        'waiting_writers': waiting,
+        'waiting_by_cause': causes,
+        'head_future_stages': head_stages,
+        'oldest_wait_seconds': oldest_wait_age,
+        'oldest_head_age_seconds': oldest_head_age if oldest_head is not None else None,
+        'oldest_head': oldest_head,
+        'completed_wait_seconds_process_lifetime': completed_wait_seconds,
+    }
+
+
+def _register_nrrd_live_writer(writer: '_MemberParallelGzipPayloadWriter') -> None:
+    try:
+        telemetry = runtime_telemetry()
+        if not (bool(getattr(telemetry, 'enabled', False))
+                and _env_flag('YOLO_TTA_TELEMETRY_SYSTEM_SAMPLER', True)):
+            return
+        with _NRRD_LIVE_WRITERS_LOCK:
+            _NRRD_LIVE_WRITERS.add(writer)
+            writer._diag_enabled = True
+        # A module function keeps no writer alive. Re-registration replaces the
+        # same named provider if observability is reinitialized in this process.
+        telemetry.register_sample_provider('nrrd.member_stream.live', _nrrd_live_writer_sample)
+    except BaseException:
+        # Telemetry must never change output success or failure.
+        with _NRRD_LIVE_WRITERS_LOCK:
+            _NRRD_LIVE_WRITERS.discard(writer)
+            writer._diag_enabled = False
+
+
+def _unregister_nrrd_live_writer(writer: '_MemberParallelGzipPayloadWriter') -> None:
+    global _NRRD_LIVE_RETIRED_WAIT_SECONDS
+    if not writer._diag_enabled:
+        return
+    with _NRRD_LIVE_WRITERS_LOCK:
+        if not writer._diag_enabled:
+            return
+        _NRRD_LIVE_RETIRED_WAIT_SECONDS += writer._diag_completed_wait_seconds
+        _NRRD_LIVE_WRITERS.discard(writer)
+        writer._diag_enabled = False
+
+
 class _MemberParallelGzipPayloadWriter:
     """Pipelined encoder emitting one complete gzip member sequence per chunk.
 
@@ -1737,6 +1832,13 @@ class _MemberParallelGzipPayloadWriter:
             'close_wait_seconds': 0.0,
         }
         self._writer_stats_published = False
+        self._diag_enabled = False
+        self._diag_wait: Optional[Tuple[object, ...]] = None
+        self._diag_pending: Dict[int, Tuple[Future, int]] = {}
+        self._diag_completed_wait_seconds = 0.0
+        name = getattr(fh, 'name', '<memory>')
+        self._diag_layer_name = Path(str(name)).name[:160]
+        _register_nrrd_live_writer(self)
 
     def _compress_member(self, payload: object) -> Tuple[bytes, int]:
         """Encode in one native gzip pass; CRC is produced by ISA-L/zlib itself.
@@ -1793,6 +1895,8 @@ class _MemberParallelGzipPayloadWriter:
         )
         self._pending[fut] = (int(seq), int(ln))
         self._inflight_bytes += int(ln)
+        if self._diag_enabled:
+            self._diag_pending[int(seq)] = (fut, time.monotonic_ns())
 
     def _enqueue_owned_chunk(self, owner: object) -> None:
         """Transfer one caller-owned contiguous allocation to a compressor worker.
@@ -1810,6 +1914,8 @@ class _MemberParallelGzipPayloadWriter:
         )
         self._pending[fut] = (int(seq), int(ln))
         self._inflight_bytes += int(ln)
+        if self._diag_enabled:
+            self._diag_pending[int(seq)] = (fut, time.monotonic_ns())
 
     def _hardware_lookbehind_enabled(self) -> bool:
         return bool(
@@ -1859,11 +1965,34 @@ class _MemberParallelGzipPayloadWriter:
             later_ready = any(seq > self._next_write_sequence
                               for seq in self._completed)
             started = time.perf_counter()
+            if self._diag_enabled:
+                head_sequence = int(self._next_write_sequence)
+                head = self._diag_pending.get(head_sequence)
+                head_future: Optional[Future]
+                submitted_ns: Optional[int]
+                if head is None:
+                    # Tests and unusual callers can insert a Future directly.
+                    head_future = next(
+                        (fut for fut, (seq, _charged) in self._pending.items()
+                         if int(seq) == head_sequence), None,
+                    )
+                    submitted_ns = None
+                else:
+                    head_future, submitted_ns = head
+                self._diag_wait = (
+                    time.monotonic_ns(), str(wait_cause or 'other'), head_sequence,
+                    submitted_ns, head_future, len(self._pending),
+                    len(self._completed), int(self._inflight_bytes),
+                )
             try:
                 done, _not_done = wait(set(self._pending), return_when=FIRST_COMPLETED)
             finally:
                 elapsed = time.perf_counter() - started
                 self._writer_stats['pending_wait_seconds'] += elapsed
+                if self._diag_enabled:
+                    with _NRRD_LIVE_WRITERS_LOCK:
+                        self._diag_completed_wait_seconds += elapsed
+                        self._diag_wait = None
                 if prefix_missing:
                     self._writer_stats['ordered_prefix_wait_seconds'] += elapsed
                 if later_ready:
@@ -1874,6 +2003,8 @@ class _MemberParallelGzipPayloadWriter:
             done = {fut for fut in self._pending if fut.done()}
         for fut in done:
             seq, charged = self._pending.pop(fut)
+            if self._diag_enabled:
+                self._diag_pending.pop(int(seq), None)
             member, ln = fut.result()
             if int(ln) != int(charged):
                 raise RuntimeError(f'NRRD member length mismatch: {ln} != {charged}')
@@ -2205,6 +2336,7 @@ class _MemberParallelGzipPayloadWriter:
             raise
         finally:
             self._publish_writer_stats()
+            _unregister_nrrd_live_writer(self)
 
     def _abandon_and_settle(self) -> None:
         """Retain inputs and wait until no failed native/DMA request can still run."""
@@ -2223,7 +2355,9 @@ class _MemberParallelGzipPayloadWriter:
         self._hardware_lookbehind = None
         self._hardware_lookbehind_is_zero = False
         self._inflight_bytes = 0
+        self._diag_pending.clear()
         self._publish_writer_stats()
+        _unregister_nrrd_live_writer(self)
 
     def __enter__(self) -> '_MemberParallelGzipPayloadWriter':
         return self
@@ -2260,6 +2394,8 @@ def _after_nrrd_compression_fork_child() -> None:
     global _NRRD_MEMBER_CODEC_FAILURES_ANNOUNCED
     global _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED
     global _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCE_LOCK
+    global _NRRD_LIVE_WRITERS_LOCK, _NRRD_LIVE_WRITERS
+    global _NRRD_LIVE_RETIRED_WAIT_SECONDS
 
     # No ThreadPoolExecutor worker survives fork(), and any inherited lock may have
     # been held by a vanished parent thread. Never call shutdown() or acquire one of
@@ -2276,6 +2412,9 @@ def _after_nrrd_compression_fork_child() -> None:
     _NRRD_MEMBER_CODEC_FAILURES_ANNOUNCED = set()
     _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED = False
     _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCE_LOCK = threading.Lock()
+    _NRRD_LIVE_WRITERS_LOCK = threading.Lock()
+    _NRRD_LIVE_WRITERS = weakref.WeakSet()
+    _NRRD_LIVE_RETIRED_WAIT_SECONDS = 0.0
     # _NRRD_GZIP_EXECUTOR_ATEXIT_REGISTERED intentionally remains unchanged:
     # Python's atexit registry is inherited, so the child already owns that callback.
 
