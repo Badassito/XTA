@@ -54,6 +54,7 @@ from .config import (
     resolve_backend_batches,
     resolve_backend_devices,
     resolve_backend_models,
+    resolve_interpolation_settings,
     resolve_backend_precisions,
     resolve_cartesian_views,
     resolve_channel_format,
@@ -185,6 +186,7 @@ from .geometry import (
     build_fullframe_raster_plan,
     build_view_frame_cache,
     close_prediction_volume_ref,
+    delayed_native_expansion_enabled,
     expand_views_into_tta_variants,
     gpu_input_staging_ahead_sources,
     gpu_input_staging_enabled,
@@ -637,6 +639,14 @@ def _close_tta_output_artifacts(
     return result
 
 
+def _reset_gpu_stage_coordinator_if_sam_settled() -> bool:
+    from .sam_integration import sam_workers_unsettled
+    if sam_workers_unsettled():
+        return False
+    _reset_main_process_gpu_stage_coordinator()
+    return True
+
+
 def main() -> None:
     """Execute one pipeline run with a lifecycle boundary spanning the full function."""
     global _ACTIVE_PIPELINE_RUN_RESOURCES
@@ -646,6 +656,8 @@ def main() -> None:
     _ACTIVE_PIPELINE_RUN_RESOURCES = resources
     failed = True
     try:
+        from .sam_integration import retry_unsettled_sam_workers
+        retry_unsettled_sam_workers()
         configure_pipeline_modes(fast_bundle_active=False, d1_pipeline_active=False)
         reset_streaming_state_for_new_run()
         reset_runtime_state_for_new_run()
@@ -702,7 +714,7 @@ def main() -> None:
             _set_main_process_gpu_pending_inference(False)
             _set_main_process_gpu_inference_priority_active(False)
             _set_main_process_gpu_asset_retirement_pending(False)
-            _reset_main_process_gpu_stage_coordinator()
+            _reset_gpu_stage_coordinator_if_sam_settled()
         except Exception:
             pass
         _ACTIVE_PIPELINE_RUN_RESOURCES = None
@@ -801,6 +813,8 @@ def _main_impl() -> None:
     try:
         backend_models = resolve_backend_models(args.model)
         backend_devices = resolve_backend_devices(args.device)
+        interpolation_settings = resolve_interpolation_settings(args, backend_models, backend_devices)
+        delayed_native_expansion_at_launch = bool(delayed_native_expansion_enabled())
         backend_precisions = resolve_backend_precisions(args.quantize, backend_devices)
         backend_batches = resolve_backend_batches(args.batch, backend_devices)
         cpu_instances_requested = resolve_auto_positive_int(
@@ -820,6 +834,13 @@ def _main_impl() -> None:
 
     gpu_model_path: Optional[str] = None
     cpu_model_path: Optional[str] = None
+    sam_bundle = None
+    if interpolation_settings.enabled and interpolation_settings.backend == 'sam':
+        from .lta_sam import resolve_local_sam_bundle
+        try:
+            sam_bundle = resolve_local_sam_bundle(interpolation_settings.sam_model)
+        except (ValueError, OSError) as exc:
+            parser.error(str(exc))
     for backend_name, requested_path in (
         ('gpu', backend_models.gpu), ('cpu', backend_models.cpu),
     ):
@@ -842,6 +863,10 @@ def _main_impl() -> None:
         reconciliation_settings = resolve_reconciliation(args)
         reconciliation_policy = (load_reconciliation_policy(reconciliation_settings)
                                  if reconciliation_settings.enabled else None)
+        if interpolation_settings.enabled and interpolation_settings.backend == 'sam':
+            from .sam_policy import resolve_sam_bridge_policy
+            resolve_sam_bridge_policy(reconciliation_policy,
+                generation_mode=interpolation_settings.sam_crop_mode)
         args.reconciliation_retain_confidence = reconciliation_settings.enabled
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
@@ -1790,6 +1815,12 @@ def _main_impl() -> None:
     )
     cartesian_views = orthogonal_views_only(physical_views)
     inference_views = list(views)
+    if interpolation_settings.enabled and interpolation_settings.backend == 'sam':
+        from .sam_integration import validate_sam_interpolation_geometry
+        try:
+            validate_sam_interpolation_geometry(inference_views)
+        except ValueError as exc:
+            parser.error(str(exc))
     if reconciliation_settings.enabled:
         from .reconciliation_runtime import preflight_reconciliation
         reconciliation_preflight = preflight_reconciliation(
@@ -1937,7 +1968,8 @@ def _main_impl() -> None:
     )
 
     interpolation_process_backend_active = bool(
-        interpolation_process_backend_enabled() and len(interpolating_views) > 0
+        interpolation_settings.backend == 'sdf'
+        and interpolation_process_backend_enabled() and len(interpolating_views) > 0
     )
     interpolation_global_pass_limit = max(
         1,
@@ -2171,6 +2203,7 @@ def _main_impl() -> None:
     native_view_support_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
     parent_mask_support_by_model: Dict[str, Dict[str, object]] = {model_name: {} for model_name, _ in yolo_models}
     parent_bridge_support_by_model: Dict[str, Dict[str, object]] = {model_name: {} for model_name, _ in yolo_models}
+    sam_gate_lineage_by_parent: Dict[Tuple[str, str], Dict[str, object]] = {}
     azimuthal_native_output_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
     tilted_native_output_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
     nrrd_layer_refs: List[NrrdLayerRef] = []
@@ -2191,6 +2224,30 @@ def _main_impl() -> None:
         view_prediction_stats.setdefault(key, 0)
         view_prediction_labels[key] = pretty_view_name(_view_for_stats)
     interpolation_stats: List[Dict[str, object]] = []
+    sam_context = None
+    if interpolation_settings.enabled and interpolation_settings.backend == 'sam':
+        from .sam_integration import SamInterpolationContext
+        source_stat = input_path.stat()
+        sam_context = SamInterpolationContext(
+            model_path=str(interpolation_settings.sam_model),
+            device_ids=interpolation_settings.sam_devices, temp_dir=temp_dir,
+            evidence_root=out_dir / 'sam_interpolation', source_volume=volume_rgb,
+            source_identity=f'{input_path}:{source_stat.st_size}:{source_stat.st_mtime_ns}',
+            policy=reconciliation_policy,
+            bundle_identity=str(sam_bundle.checkpoint_identity_sha256),
+            detector_identity=str(gpu_model_path or cpu_model_path or 'detector'),
+            source_grid_shape=(int(input_T), int(input_H), int(input_W)),
+            detector_device_ids=backend_devices.gpu_devices,
+            feature_cache_mib=interpolation_settings.sam_feature_cache_mib,
+            crop_mode=interpolation_settings.sam_crop_mode,
+            delayed_native_expansion=delayed_native_expansion_at_launch,
+            source_resize_semantics=('native' if not cube_resize_will_apply else
+                'endpoint_aligned_linear_xy_and_t' if preprocess_streaming_active else
+                'opencv_half_pixel_t_slab' if (int(input_H), int(input_W)) == tuple(volume_rgb.shape[-2:]) else
+                'endpoint_aligned_t_with_opencv_xy_resize'))
+        _run_resources().track_closeable(sam_context)
+        if not gpu_worker_process_active:
+            sam_context.detector_assets_retired()
 
     inference_view_names = {v.name for v in inference_views}
     for view in views:
@@ -2913,6 +2970,8 @@ def _main_impl() -> None:
             interpolation_passes=int(args.interpolation_passes),
             interpolation_min_radius=float(args.interpolation_min_radius),
             interpolation_search_angle=float(args.interpolation_search_angle),
+            interpolation_backend=interpolation_settings.backend,
+            sam_context=sam_context,
             keep_temp_artifacts=bool(keep_temp_artifacts),
             slice_workers=int(parent_slice_postprocess_workers),
             interpolation_task_workers=int(parent_interpolation_task_workers),
@@ -3501,6 +3560,9 @@ def _main_impl() -> None:
             # set has entered the destination, avoiding an incomplete private final ref.
             internal_final_layer_enabled=False,
             config_id=str(config_id),
+            interpolation_backend=interpolation_settings.backend,
+            sam_context=sam_context,
+            sam_upstream_lineage=dict(sam_gate_lineage_by_parent.get((str(model_name), str(view_name)), {})),
         )
         tile_consolidation_futures[fut] = set_key
 
@@ -4195,6 +4257,20 @@ def _main_impl() -> None:
                     )
             if result.parent_bridge_support_mm is not None:
                 parent_bridge_support_by_model[result.model_name][result.view_name] = result.parent_bridge_support_mm
+            if sam_context is not None:
+                support_meta = dict(getattr(result.parent_bridge_support_mm, 'meta', {}))
+                parent_stats = result.interpolation_stats[-1] if result.interpolation_stats else {}
+                sam_gate_lineage_by_parent[(str(result.model_name), str(result.view_name))] = {
+                    'gate_support_identity': str(support_meta.get('gate_support_identity',
+                        parent_stats.get('parent_gate_support_identity', ''))),
+                    'interpolation_policy_identity': str(support_meta.get('interpolation_policy_identity',
+                        parent_stats.get('sam_policy_hash', ''))),
+                    'proposal_evidence_path': str(support_meta.get('proposal_evidence_path',
+                        parent_stats.get('sam_evidence_path', ''))),
+                    'parent_scope': f'{result.model_name}/{result.view_name}/fullframe',
+                    'gate_kind': 'whole_component_gated_or',
+                    'accepted_bridge_observations_are_detector_produced': True,
+                }
             parent_bridge_ready.add((str(result.model_name), str(result.view_name)))
             _flush_ready_residual_tiles()
             interpolation_stats.extend(result.interpolation_stats)
@@ -4476,7 +4552,7 @@ def _main_impl() -> None:
     # Process-per-GPU scheduler. This path is active for every CUDA run, including one GPU.
     gpu_worker_processes = scheduler_state.gpu_worker_processes
     cpu_worker_processes = scheduler_state.cpu_worker_processes
-    _reset_main_process_gpu_stage_coordinator()
+    _reset_gpu_stage_coordinator_if_sam_settled()
     gpu_worker_result_dir = temp_dir / 'gpu_worker_results'
     if not bool(keep_temp_artifacts) and gpu_worker_result_dir.exists():
         # Worker-result files are never resumable inputs. Remove leftovers from an interrupted
@@ -4736,7 +4812,13 @@ def _main_impl() -> None:
         }
         # Torch logical indices and their physical CUDA_VISIBLE_DEVICES tokens were resolved
         # before OpenVINO planning so dedicated feeder cores could be excluded job-wide.
+        # Only actual detector workers inherit inference priority. Explicit
+        # stage leases also cover SAM-only CUDA devices outside this pool.
         _configure_main_process_gpu_stage_workers(gpu_logical_indices)
+        if not gpu_worker_process_active:
+            # SAM-only CUDA devices are stage owners, not detector workers.
+            _set_main_process_gpu_inference_priority_active(False)
+            _set_main_process_gpu_asset_retirement_pending(False)
         if gpu_worker_process_active:
             if v1613_d1_owner_active:
                 print(
@@ -6091,6 +6173,18 @@ def _main_impl() -> None:
                 # the worker has merely promised to release.
                 _set_main_process_gpu_inference_priority_active(False)
                 _set_main_process_gpu_asset_retirement_pending(False)
+        if sam_context is not None and inference_assets_ready:
+            failed_retirement = {
+                worker: record for worker, record in
+                scheduler_state.gpu_inference_asset_release_results_by_worker.items()
+                if not bool(record.get('ok')) or not bool(dict(record.get('stats') or {}).get('released'))
+            }
+            if failed_retirement:
+                sam_context.cancel('SAM requires actual detector GPU asset retirement')
+                raise RuntimeError(
+                    'SAM GPU admission failed: detector GPU assets remain resident after retirement '
+                    f'handshake: {failed_retirement}')
+            sam_context.detector_assets_retired()
         _restore_parent_post_inference_affinity()
         if bool(scheduler_state.gpu_inference_drain_announced):
             return
@@ -6760,6 +6854,8 @@ def _main_impl() -> None:
     finally:
         physical_view_finalization_stop.set()
         if sys.exc_info()[0] is not None:
+            if sam_context is not None:
+                sam_context.cancel('TTA scheduler failed before SAM completion')
             component_projection_queue.abort()
             # (completion): the wait=True shutdowns below block on render
             # tasks parked in wait_for_volume_ready for still-running streaming
@@ -6791,6 +6887,24 @@ def _main_impl() -> None:
         runtime_telemetry().gauge('projection.component_replay_capture', component_replay_capture_status())
         tile_dense_retirement_executor.shutdown(wait=True)
         tile_postprocess_executor.shutdown(wait=True)
+        if sam_context is not None:
+            sam_context.close()
+            runtime_telemetry().gauge('sam_interpolation.runtime', {
+                'detector_retirement_wait_seconds': sam_context.wait_seconds,
+                'predictor_start_seconds': sam_context.start_seconds,
+                'image_render_seconds': sam_context.render_seconds,
+                'planned_pass_seconds': sam_context.planning_seconds,
+                'no_job_passes': sam_context.no_job_passes,
+                'rendered_frames': sam_context.rendered_frames,
+                'rendered_pixels': sam_context.rendered_pixels,
+                'image_cache_payload_bytes': sam_context.cache_logical_bytes,
+                'exact_backing_reuses': sam_context.exact_backing_reuses,
+                'shared_detector_devices': list(sam_context.shared_detector_devices),
+                'gpu_scope_concurrency': 'serialized result consumer; work-conserving endpoint jobs per admitted device',
+                'tracker_dispatch': dict(sam_context.dispatch_summary),
+                'feature_cache_mib_per_worker': sam_context.feature_cache_mib,
+                'crop_mode': sam_context.crop_mode,
+                'device_ids': list(sam_context.device_ids)})
         view_finalization_executor.shutdown(wait=True)
         if sys.exc_info()[0] is not None:
             # A scheduler error can bypass the normal future-drain handoff. Successful
@@ -6851,7 +6965,7 @@ def _main_impl() -> None:
 
         _set_main_process_gpu_pending_inference(False)
         _set_main_process_gpu_stage_wake_callback(None)
-        _reset_main_process_gpu_stage_coordinator()
+        _reset_gpu_stage_coordinator_if_sam_settled()
 
     _drain_completed_prediction_volume_futures()
     _drain_completed_prediction_accumulation_futures()
@@ -7420,6 +7534,10 @@ def _main_impl() -> None:
         runtime_telemetry().gauge('pipeline.phase', 'post_nrrd_wait')
         print('\n=== Finishing single-layer NRRD writes ===')
         layer_sink.wait()
+        if sam_context is not None:
+            from .tta_outputs import measure_bridge_output_survival
+            layer_sink.record_final_bridge_survival(measure_bridge_output_survival(
+                nrrd_layer_refs, final_output_mask_mm))
         nrrd_manifest_path = layer_sink.write_manifest()
         layer_sink.shutdown()
         set_nrrd_layer_sink(None)
@@ -7641,6 +7759,20 @@ def _main_impl() -> None:
                      'source_layers_preserved': True, 'retained_confidence': True}
                     if reconciliation_report is not None else None),
                 'interpolation': {
+                    'backend': interpolation_settings.backend,
+                    'enabled': interpolation_settings.enabled,
+                    'sam_model': str(interpolation_settings.sam_model or ''),
+                    'sam_devices': list(interpolation_settings.sam_devices),
+                    'sam_feature_cache_mib': interpolation_settings.sam_feature_cache_mib,
+                    'sam_crop_mode': interpolation_settings.sam_crop_mode,
+                    'sam_crop_tile_side': (1008 if interpolation_settings.sam_crop_mode is not None else None),
+                    'sam_crop_halo': (128 if interpolation_settings.sam_crop_mode is not None else None),
+                    'sam_crop_canvas_contract': 'current_interpolation_working_canvas',
+                    'delayed_native_expansion_at_launch': delayed_native_expansion_at_launch,
+                    'sam_oversized_group_count': sum(int(item.get('sam_oversized_group_count', 0)) for item in interpolation_stats),
+                    'sam_multi_tile_group_count': sum(int(item.get('sam_multi_tile_group_count', 0)) for item in interpolation_stats),
+                    'sam_tiled_child_job_count': sum(int(item.get('sam_tiled_child_jobs', 0)) for item in interpolation_stats),
+                    'sam_tiled_skipped_empty_seed_tile_count': sum(int(item.get('sam_tiled_skipped_empty_seed_tiles', 0)) for item in interpolation_stats),
                     'distance': int(args.interpolation_distance),
                     'walk_back': int(args.interpolation_walk_back),
                     'candidates': int(args.interpolation_candidates),

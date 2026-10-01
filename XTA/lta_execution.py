@@ -134,6 +134,10 @@ def _preflight_lta_storage(
         ),
         default=0,
     )
+    if plan.crop_backend == "dynamic":
+        dynamic_side = min(int(1008 * float(plan.dynamic_crop_settings.get("max_scale", 3.0))),
+                           int(view_plan.frame_height), int(view_plan.frame_width))
+        largest_worker_union = min(int(view_plan.frame_count), LTA_SESSION_FRAMES) * dynamic_side ** 2
     # Each completed dense union is reduced and removed before its worker slot is
     # reused; only compact manifests wait for ordered logical commits.
     worker_union_reserve = len(plan.device_ids) * plan.workers_per_gpu * largest_worker_union
@@ -500,6 +504,14 @@ def _require_supported_runtime(plan: LtaRunPlan) -> tuple[object, object, LtaRun
         )
     if view_plan.runtime_view is None:
         raise RuntimeError("LTA planning did not retain its runtime ViewInfo")
+    if plan.crop_backend not in {"tiled", "dynamic"}:
+        raise ValueError("LTA crop_backend must be tiled or dynamic")
+    if plan.crop_backend == "dynamic":
+        if view_plan.tile_grids:
+            raise ValueError("dynamic LTA places its own crops; omit --enable_tile")
+        if min(view_plan.frame_height, view_plan.frame_width) < 1008:
+            raise ValueError("dynamic LTA requires native frame height and width >=1008")
+        return source, volume_plan, view_plan
     if not view_plan.tile_grids:
         raise ValueError(
             "full-resolution production LTA requires --enable_tile 1008:STRIDE"
@@ -2484,6 +2496,14 @@ def execute_lta_plan(
     if not isinstance(plan, LtaRunPlan):
         raise TypeError("plan must be an LtaRunPlan")
     source, volume_plan, view_plan = _require_supported_runtime(plan)
+    dynamic_crops = plan.crop_backend == "dynamic"
+    if dynamic_crops:
+        from .lta_dynamic_crops import DYNAMIC_CROP_POLICY, DynamicCropSettings
+        from .lta_dynamic_execution import (DynamicViewCompletion, drive_dynamic_workers,
+                                           plan_initial_dynamic_tasks)
+        crop_settings = DynamicCropSettings(**plan.dynamic_crop_settings)
+    execution_contract = "lta.dynamic-crops/1" if dynamic_crops else "lta.window_dag/1"
+    relay_policy = "not_applicable_dynamic_crops" if dynamic_crops else "canonical_temporal_frontier/1"
     if not math.isfinite(float(worker_startup_timeout)) or float(worker_startup_timeout) <= 0.0:
         raise ValueError("worker_startup_timeout must be finite and positive")
     if not math.isfinite(float(worker_task_timeout)) or float(worker_task_timeout) <= 0.0:
@@ -2504,23 +2524,24 @@ def execute_lta_plan(
         fingerprint = lta_source_fingerprint()
         write_json_atomically(plan.output_root / "lta_execution_identity.json", {
             "schema": "lta.execution-identity/1",
-            "contract": "lta.window_dag/1",
+            "contract": execution_contract,
             "pipeline_version": __version__,
             "source_fingerprint": fingerprint,
             "run_id": plan.run_id,
             "requested_devices": list(plan.device_ids),
             "workers_per_gpu": plan.workers_per_gpu,
             "maximum_concurrent_worker_tasks": len(plan.device_ids) * plan.workers_per_gpu,
-            "relay_admission_policy": "canonical_temporal_frontier/1",
+            "relay_admission_policy": relay_policy,
+            "crop_backend": plan.crop_backend,
             "scratch_root": str(plan.temp_root),
             "run_completion_marker": "manifest.json",
         })
     except BaseException:
         trace.close()
         raise
-    trace.event("run_contract", version=__version__, contract="lta.window_dag/1", source_fingerprint=fingerprint, devices=list(plan.device_ids), workers_per_gpu=plan.workers_per_gpu, scratch_root=str(plan.temp_root), relay_admission_policy="canonical_temporal_frontier/1")
+    trace.event("run_contract", version=__version__, contract=execution_contract, source_fingerprint=fingerprint, devices=list(plan.device_ids), workers_per_gpu=plan.workers_per_gpu, scratch_root=str(plan.temp_root), relay_admission_policy=relay_policy)
     trace.flush()
-    print(f"LTA v{__version__}: contract=lta.window_dag/1 max_window_frames=30 devices={list(plan.device_ids)} workers_per_gpu={plan.workers_per_gpu} relay_admission=canonical_temporal_frontier/1 source_sha256={fingerprint['sha256']} diagnostics={trace_dir}", flush=True)
+    print(f"LTA v{__version__}: contract={execution_contract} max_window_frames=30 devices={list(plan.device_ids)} workers_per_gpu={plan.workers_per_gpu} relay_admission={relay_policy} source_sha256={fingerprint['sha256']} diagnostics={trace_dir}", flush=True)
     from .lta_cpu import resolve_worker_cpu_budget
     parent_cpu_budget = resolve_worker_cpu_budget(len(plan.device_ids) * plan.workers_per_gpu)
     effective_cpu_count = int(parent_cpu_budget["effective_cpu_count"])
@@ -2565,29 +2586,34 @@ def execute_lta_plan(
         )
 
         with trace.phase("plan_seed_window_graph") as planning:
-            initial, seed_inventory = _plan_initial_chains(
-                source, aligned_annotations, view_plan, cache_ref,
-                temp_root=plan.temp_root, conf=plan.conf, empty_frame_limit=empty_frame_limit,
-            )
+            if dynamic_crops:
+                initial, seed_inventory = plan_initial_dynamic_tasks(
+                    source, aligned_annotations, view_plan, cache_ref, temp_root=plan.temp_root,
+                    conf=plan.conf, empty_frame_limit=empty_frame_limit, settings=crop_settings)
+            else:
+                initial, seed_inventory = _plan_initial_chains(
+                    source, aligned_annotations, view_plan, cache_ref,
+                    temp_root=plan.temp_root, conf=plan.conf, empty_frame_limit=empty_frame_limit,
+                )
             planning["chain_count"] = len(initial)
-            initial = _plan_window_tasks(initial)
-            initial = tuple(_PlannedChain(task.work, {**task.payload, "worker_trace_root": str(trace_dir)}) for task in initial)
+            if not dynamic_crops:
+                initial = _plan_window_tasks(initial)
+                initial = tuple(_PlannedChain(task.work, {**task.payload, "worker_trace_root": str(trace_dir)}) for task in initial)
             planning["window_count"] = len(initial)
         authoritative_seed_audit = _authoritative_seed_audit(seed_inventory)
-        scheduler = LtaViewAffinityScheduler(
-            (chain.work for chain in initial),
-            plan.device_ids,
-            helper_queue_order="head",
-            max_relay_generation=_relay_generation_bound(view_plan),
-            workers_per_device=plan.workers_per_gpu,
-        )
+        if dynamic_crops:
+            scheduler = DynamicViewCompletion(initial[0].work.view, plan.device_ids)
+            authoritative_seed_audit = {**authoritative_seed_audit,
+                "policy": "complete native masks in deterministic object-following crops"}
+        else:
+            scheduler = LtaViewAffinityScheduler(
+                (chain.work for chain in initial), plan.device_ids, helper_queue_order="head",
+                max_relay_generation=_relay_generation_bound(view_plan),
+                workers_per_device=plan.workers_per_gpu)
         relay_mask_revisions: dict[LtaSpatialRelayKey, _RelayMaskRevision] = {}
-        _prime_authoritative_relay_destinations(
-            scheduler,
-            initial[0].work.view,
-            seed_inventory,
-            relay_mask_revisions,
-        )
+        if not dynamic_crops:
+            _prime_authoritative_relay_destinations(
+                scheduler, initial[0].work.view, seed_inventory, relay_mask_revisions)
         view_union = _allocate_view_union(
             view_plan,
             plan.temp_root / "views" / "transverse_union.uint8.raw",
@@ -2610,8 +2636,14 @@ def execute_lta_plan(
             )
         worker_error: BaseException | None = None
         try:
-            relay_generation, worker_pids, execution_schedule, worker_audit = (
-                _drive_workers_to_fixed_point(
+            if dynamic_crops:
+                relay_generation, worker_pids, execution_schedule, worker_audit = drive_dynamic_workers(
+                    scheduler=scheduler, pool=pool, initial=initial, view_plan=view_plan,
+                    cache_ref=cache_ref, view_union=view_union, temp_root=plan.temp_root,
+                    conf=plan.conf, empty_frame_limit=empty_frame_limit,
+                    worker_task_timeout=float(worker_task_timeout), trace=trace, settings=crop_settings)
+            else:
+                relay_generation, worker_pids, execution_schedule, worker_audit = _drive_workers_to_fixed_point(
                     scheduler=scheduler,
                     pool=pool,
                     initial=initial,
@@ -2626,10 +2658,9 @@ def execute_lta_plan(
                     trace=trace,
                     canonical_frontier=True,
                 )
-            )
             worker_audit = {
                 **worker_audit,
-                "execution_contract": "lta.window_dag/1",
+                "execution_contract": execution_contract,
                 "source_fingerprint": fingerprint,
                 "diagnostics_root": str(trace_dir),
                 "diagnostic_write_errors_before_postprocessing": trace.write_errors,
@@ -2703,7 +2734,8 @@ def execute_lta_plan(
             tta_angle_deg=view_plan.tta_angle_deg,
             metadata={
                 "conditioning": "authoritative_mask_injection",
-                "cross_tile_relay": True,
+                "cross_tile_relay": not dynamic_crops,
+                "crop_backend": plan.crop_backend,
                 "relay_generations": relay_generation,
                 "completed_view_hole_fill": view_fill.manifest_record(),
             },
@@ -2918,8 +2950,9 @@ def execute_lta_plan(
                     "worker_pids": {str(key): value for key, value in worker_pids.items()},
                     "worker_task_timeout_seconds": float(worker_task_timeout),
                     "relay_generations": relay_generation,
-                    "cross_tile_tracking": "eight_neighbor_fixed_point",
-                    "relay_admission_policy": "canonical_temporal_frontier/1",
+                    "crop_backend": plan.crop_backend,
+                    "cross_tile_tracking": "object_following_native_crops" if dynamic_crops else "eight_neighbor_fixed_point",
+                    "relay_admission_policy": relay_policy,
                     "authoritative_tile_seeding": dict(authoritative_seed_audit),
                     "temporal_propagation": {
                         "policy": "full_view_per_anchor_recall_union",
@@ -2937,12 +2970,12 @@ def execute_lta_plan(
                     "postprocessing": terminal_postprocessing,
                     "device_schedule": {
                         "status": "settled",
-                        "policy": "physical_view_affinity_with_bounded_head_assist",
+                        "policy": "sealed_predecessor_critical_path" if dynamic_crops else "physical_view_affinity_with_bounded_head_assist",
                         "helper_queue_order": scheduler.helper_queue_order,
                         "maximum_uncommitted_worker_unions": len(plan.device_ids) * plan.workers_per_gpu,
                         "workers_per_gpu": plan.workers_per_gpu,
                         "dense_union_reduction_order": "completion",
-                        "logical_commit_order": "plan",
+                        "logical_commit_order": "canonical_work_identity" if dynamic_crops else "plan",
                         "coordinator_selected": True,
                         "view_owner_device_id": scheduler.owner_for_view(
                             initial[0].work.view

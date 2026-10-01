@@ -28,9 +28,12 @@ def test_real_successor_contract_is_checked_once_per_context():
 
 def test_latest_successor_tampering_is_rechecked_in_a_new_pass():
     manifest = json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
-    latest = ('v24_0_5_release_review' if 'v24_0_5_release_review' in manifest
+    latest = ('v25_0_0_release_review' if 'v25_0_0_release_review' in manifest
+              else 'v24_0_5_release_review' if 'v24_0_5_release_review' in manifest
               else 'v24_0_4_release_review')
-    without_latest = (inventory._without_reviewed_v24_0_5_release
+    without_latest = (inventory._without_reviewed_v25_0_0_release
+                      if latest == 'v25_0_0_release_review'
+                      else inventory._without_reviewed_v24_0_5_release
                       if latest == 'v24_0_5_release_review'
                       else inventory._without_reviewed_v24_0_4_release)
     token = inventory._ACTIVE_REVIEW_AUTH_CACHE.set(set())

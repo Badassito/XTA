@@ -253,6 +253,8 @@ class PolicyParentWorkspaceIntegrationTests(unittest.TestCase):
             root = Path(td)
             namespace = dict(vars(pipeline))
             namespace.update(temp_dir=root, worker_direct_union_active=False,
+                interpolation_settings=SimpleNamespace(backend='sdf', enabled=False),
+                sam_context=None,
                 policy_settings=SimpleNamespace(enabled=True), bounded_policy_parent_keys=keys,
                 args=SimpleNamespace(imgsz=8, min_conf=1., min_radius=0.,
                     interpolation_distance=0, interpolation_walk_back=1,

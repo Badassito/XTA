@@ -111,6 +111,8 @@ class AdmittedViewPrepare:
     materialize_workspace: Callable[..., np.ndarray]
     prepare: Callable[..., PreparedViewResult]
     close_dense: Callable[..., object] = close_memmap_array_without_flush
+    interpolation_backend: str = 'sdf'
+    sam_context: object | None = None
 
     def __call__(self) -> PreparedViewResult:
         with self.admission.reserve(
@@ -152,6 +154,8 @@ class AdmittedViewPrepare:
                     interpolate_passes=int(self.interpolation_passes),
                     interpolate_min_radius=float(self.interpolation_min_radius),
                     interpolation_search_angle=float(self.interpolation_search_angle),
+                    interpolation_backend=str(self.interpolation_backend),
+                    sam_context=self.sam_context,
                     keep_temp=bool(self.keep_temp_artifacts),
                     slice_workers=int(self.slice_workers),
                     interpolation_task_workers=int(self.interpolation_task_workers),

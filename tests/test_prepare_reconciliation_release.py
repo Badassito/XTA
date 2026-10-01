@@ -144,3 +144,34 @@ def test_v24_0_5_review_is_append_only_and_tracks_new_native_lease_qualifier():
 def test_generated_review_evidence_cannot_be_written_inside_the_repository():
     with pytest.raises(ValueError, match='outside the repository'):
         prepare.prepare(output_dir=prepare.ROOT / 'generated_review')
+
+
+def test_sam_release_preserves_the_tagged_predecessor_and_all_existing_tool_checks():
+    spec = prepare.RELEASES['25.0.0']
+    assert spec['previous_token'] == '24_0_5'
+    assert spec['feature'] == 'single-backend-sam-interpolation'
+    assert spec['validation_tools'][:-19] == prepare.RELEASES['24.0.5']['validation_tools']
+    assert spec['validation_tools'][-19:] == ('tools/diagnose_sam_interpolation.py',
+                                          'tools/lta_dynamic_crop_diagnostic.py',
+                                          'tools/analyze_lta_dynamic_crop_diagnostic.py',
+                                          'tools/study_sam_fusion.py',
+                                          'tools/qualify_sdf_alignment.py',
+                                          'tools/prepare_sam_holdout.py',
+                                          'tools/heatsoak_sam_benchmark.py',
+                                          'tools/qualify_sam_feature_cache.py',
+                                          'tools/evaluate_sam_holdout.py',
+                                          'tools/audit_sam_context.py',
+                                          'tools/compare_sam_crop_strategies.py',
+                                          'tools/sam_crop_strategy_geometry.py',
+                                          'tools/report_sam_crop_strategies.py',
+                                          'tools/sam_crop_seed_diagnostics.py',
+                                          'tools/analyze_sam_crop_strategies.py',
+                                          'tools/sam_crop_quality.py',
+                                          'tools/prepare_sam_crop_two_tile.py',
+                                          'tools/compare_sam_crop_zoom.py',
+                                          'tools/qualify_sam_tiled_integration.py')
+    assert inventory.REVIEWED_V25_0_0_RELEASE_PREDECESSOR_COMMIT == '1945cbe85a61691c848d197cbaa7baf8104ea64a'
+    predecessor = json.loads(prepare.git_file(
+        prepare.ROOT, inventory.REVIEWED_V25_0_0_RELEASE_PREDECESSOR_COMMIT,
+        'release/_package_inventory.json'))
+    assert prepare.canonical(predecessor) == inventory.REVIEWED_V25_0_0_RELEASE_PREDECESSOR_SHA256

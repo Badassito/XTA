@@ -37,6 +37,9 @@ the executed policy snapshot. These are distinct from final postprocessing.
 | `largest_island.py` | Add bounded island weighting, using two average votes as its threshold |
 | `confidence_anchored.py` | Give a bounded local bonus when a strong prediction corroborates another prediction |
 | `hybrid_with_fill.py` | Combine component agreement, selective quorum, bounded rescue and local candidate-only fill without confidence scores |
+| `sam_conservative.py` | Stock conservative SAM proposal selection followed by source union |
+| `sam_strict.py` | Conservative SAM proposals with strict independent family agreement, followed by source union |
+| `sam_raw_candidates.py` | Explicit permissive raw-candidate SAM ablation followed by source union |
 
 Core rescue is the selected starting point for confidence-based decisions. The
 other examples retain distinct approaches for different evidence and tradeoffs;
@@ -87,6 +90,56 @@ A vote block exposes `candidate`, `score`, `support`, `prediction_support`,
 foreground outside the additive candidate union. Input layers are never
 modified. Source bytes are compiled directly after hash verification, avoiding
 stale bytecode when policy files are edited.
+
+## SAM proposal selection
+
+TTA `--interpolation_backend sam` selects complete retained proposals before
+forward/backward bridge unions and source voting. Existing source policies
+inherit the conservative SAM bridge policy; their `decide(block)` callback
+still runs after this stage. A source plain-union optimization cannot bypass
+proposal selection. See [SAM interpolation](../../../docs/sam_interpolation.md)
+for supported views, models, devices, and replay boundaries.
+
+Optional `build_reconciliation()` fields:
+
+| Field | Meaning |
+| --- | --- |
+| `sam_bridge_policy` | `stock`/`conservative`, explicitly permissive raw-candidate ablation, or a dictionary of SAM quality settings |
+| `proposal_api_version` | `1` when supplying a proposal callback |
+| `select_proposals` | Callable receiving a bounded read-only group context and choosing stable run IDs |
+
+The stock policy removes full raw 2D components at or below the configured
+minimum radius before checking containment, held-out endpoint recall and excess,
+local topology, and unintended observed attachment. Removed dots outside the
+write/acceptance region do not reject an otherwise valid run. Raw evidence and
+raw violations remain recorded separately from the effective filtered support. Strict
+independent family agreement is optional. For example:
+
+```python
+def build_reconciliation():
+    return {
+        "name": "sam_strict_family_union",
+        "mode": "union",
+        "sam_bridge_policy": {"strict_family_agreement": True},
+    }
+```
+
+A proposal callback sees `api_version`, `scope`, `group`, `runs`,
+`measurements`, `resolved_policy`, and lazy mask readers. Use
+`raw_mask(run_id, frame)`, `candidate_mask(run_id, frame)`, and
+`group_mask(group_id, mask_key)` to inspect retained crop-space masks.
+Return a collection of run ID strings, or a dictionary containing
+`selected_run_ids` with optional `reasons` and `name` fields. Selection must be
+deterministic and stay within the current group. Incomplete evidence, invalid
+shape/coverage, write-domain violations, and reinjected held-out endpoints
+cannot be accepted by a permissive callback.
+
+Retained bundles preserve each overlapping run independently. Fixed-evidence
+replay rebuilds unions from selected contributors without inference. A changed
+upstream parent-support fingerprint can invalidate tile admission and require
+new downstream generation; a frozen-evidence diagnostic does not claim fresh
+pipeline equivalence. SAM tracker scores and overlap measurements never become
+detector confidence or additional independent detector votes.
 
 ## Confidence and provenance
 

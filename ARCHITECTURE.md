@@ -10,7 +10,7 @@ document is available in Git with `git show 597fc45:ARCHITECTURE.md`.
 
 ## Entry points and shared contracts
 
-`GPT-6-Astra-Ultra_v24.0.5_SLURM.py`, the installed `xta` command, and
+`GPT-6-Astra-Ultra_v25.0.0_SLURM.py`, the installed `xta` command, and
 `python -m XTA` enter `XTA.cli.run()`. The CLI selects exactly one mode and
 validates that mode's grammar before importing its heavy runtime. `tta_mode`
 enters `pipeline.main`, `pta_mode` resolves `PtaConfig` before `pta_runtime`
@@ -160,6 +160,97 @@ Interpolation does not fabricate confidence. Native evidence conversion is
 explicit and bounded. `confidence_export` can match numeric evidence to
 selected compact masks without loading the NRRD masks.
 
+### Single-backend interpolation
+
+TTA selects `--interpolation_backend sdf|sam`, default `sdf`. The selector
+applies to both full-frame and consolidated tile interpolation. Distance zero
+disables generation. Active SAM uses a separate `sam:` bundle and CUDA pool
+resolved by `--sam_device`; CPU detector execution does not require a GPU
+detector artifact. SAM never falls back to SDF, and unsupported SAM view
+geometry fails preflight. The initial rollout is native Transverse at angle
+zero. See [SAM interpolation controls and replay](docs/sam_interpolation.md).
+Native addresses are on the existing detector/processing-volume canvas;
+canonical preparation may resample stack depth, so they do not imply raw source
+slice identity. SAM intensity rendering preserves that detector canvas and
+records its transform back to source coordinates.
+
+`YOLO_TTA_SAM_CROP_MODE=whole|tiled` is an experimental SAM tracking selector,
+default `whole`, validated and pinned for one launch. It preserves the existing
+working canvas and family context. Whole rectangles use SDK resizing; tiled
+contexts use independent original-seeded working-canvas footprints with a
+1008-side cap, 128 halo, and fixed midpoint ownership. Full raw halos retain
+their parent/tile lineage and frame coverage. No cross-tile state or predicted
+seed handoff is introduced. This setting changes generation geometry and is
+separate from detector tiling, quality policy, and future outer-crop work.
+SDF or disabled interpolation ignores this unused setting and records a null
+mode. The retained canvas contract distinguishes working and native shapes;
+disabling delayed native mask expansion does not bypass processing-cube
+resampling.
+
+Legacy whole evidence keeps its v2 quality interpretation. Experimental tiled
+evidence uses a versioned v3 contract with the same thresholds and central
+component filter: selected additions use native owned-core assembly, while
+retained full halo unions provide an additional containment veto. Complete raw
+halo, seed, frame, score, and availability records live in the existing indexed
+bundle. Unknown unseeded cores are not successful empty predictions. Fixed
+replay reads the saved mode and cannot turn whole generation into tiled evidence.
+
+`sam_bridge_planning` retains original detector slice-component identities and
+plans bounded observed families. Each plan fixes context, acceptance, and write
+geometry. Context can cross detector tile seams; write geometry protects
+observed support per branch. `sam_tracker_runtime` reuses isolated persistent
+LTA tracker workers with independent endpoint-seeded sessions. Raw observations
+precede tracker confidence filtering and publication cleanup. `sam_evidence`
+keeps overlapping masks attributable in an indexed compressed scope bundle.
+
+`sam_policy` resolves proposal quality and selects contributors before their
+forward/backward directional unions are published by `sam_interpolation`.
+Source-slab reconciliation runs later and its union-reuse optimization consumes
+already selected support. Tracker scores remain separate from detector
+confidence. A selected bridge and its eventual survival after source voting
+and global filtering are distinct receipt facts.
+
+`sam_integration` plans before image rendering, model construction, and GPU
+admission. Empty/exhausted passes create no image cache or predictor. Exact
+canonical backing can be aliased; other scopes render only their demanded
+frame/rectangle inventory into compact immutable caches. Lazy processing cubes
+serve exact targeted slabs without a full unused materialization. Image-cache
+and rendering budgets remain separate from model memory.
+
+Shared detector/SAM devices require successful detector asset retirement;
+entirely separate SAM devices and CPU detector routes acquire independently.
+One persistent isolated predictor per admitted device runs one endpoint job at
+a time, with at most 30 frames including seed and terminal. A planner group may
+describe a larger inventory; it does not waive that runtime limit. Freed
+workers take the next bounded request. GPU/result iterators
+serialize within their owner while CPU scope preparation and reconciliation can
+overlap. Run IDs, lineage, selection, and directional support remain stable;
+packed evidence offsets and hashes can reflect execution completion order.
+`lta_feature_cache` reuses exact immutable frame features across sessions under
+model/source/transform/precision identity and headroom admission. It accounts
+shared tensor storage and never reuses tracker state. `sam_mask_reader` retains
+bounded immutable mask/measurement products within one verified evidence
+transaction. Owners close on success, cancellation, or infrastructure failure.
+The main component
+gate retains its direct-parent and residual-parent-bridge whole-component OR.
+It receives completed selected parent support. Admitted tile observations are
+then consolidated in parent coordinates before SAM plans the tiled scope.
+Gate-support fingerprints preserve dependency lineage for later replay.
+
+Fixed-proposal replay requires no inference, but an upstream parent selection
+change may invalidate downstream tile admission and planning. Changed inputs
+require explicit regeneration or a labelled frozen-evidence comparison. The
+append-only release inventory authenticates source changes; it is separate
+from workload qualification and measured quality.
+
+The paired crop-strategy tools under `tools/` compare whole-native-crop resizing
+with independently seeded overlapping tiles. They preserve matched source and
+observation inputs and disable cross-tile propagation in the tile experiment.
+Geometry and seed-survival diagnostics precede held-out scoring. This research
+follow-up introduces no production crop backend or new default; its tool-tree
+inventory and targeted checks are distinct from the existing full production
+qualification.
+
 TTA can save the final source-volume semantic mask as grayscale PNGs with
 `0` background and `1` foreground. This differs from `--save images`, which
 saves rendered model inputs. NRRD layers and their manifests preserve view,
@@ -300,6 +391,16 @@ CUDA scheduling scale with that count. LTA does not use YOLO's `--task` flag.
 Cross-anchor identity matching remains a diagnostic facility in
 `lta_tracklets`; production merges independent anchor chains by recall union.
 
+LTA can opt into `--lta_crop_backend dynamic` for native Transverse at angle
+zero. `lta_dynamic_crops` plans full-seed native rectangles and explicit 1008
+model transforms. `lta_dynamic_execution` advances sealed predecessor batches
+through fixed per-window contexts, with bounded split/interior-edge patches.
+Crops follow objects across the earlier tile grid, while deterministic batch
+membership preserves arrival-order independence. The default tiled path keeps
+its existing relays. Dynamic crops require native dimensions of at least 1008,
+reject an oversized seed instead of clipping it, and record exhausted patch
+and split bounds. See [dynamic LTA controls](docs/lta_dynamic_crops.md).
+
 SAM import and construction run in the isolated model worker. XTA restores the
 caller's CUDA-matmul and cuDNN TF32 settings after those operations, including
 failure paths. SAM's model-process BF16 autocast behavior remains confined to
@@ -351,7 +452,7 @@ Release qualification runs the full suite from the repository root before
 inventory verification and source-bundle construction:
 
 ```powershell
-python -B tools/qualify_release.py --output-dir ../Scratch/Releases/v24.0.5-validation
+python -B tools/qualify_release.py --output-dir ../Scratch/Releases/v25.0.0-validation
 ```
 
 The default requires a clean Git checkout and bundles committed Git bytes.

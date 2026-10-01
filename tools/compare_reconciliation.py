@@ -404,18 +404,107 @@ def compare(inputs, policy_paths, output, *, memory_mib=2048, previews=True, pro
     return report
 
 
+def compare_sam_bundles(inputs, output, *, policy_paths=None, policies=None,
+                        memory_mib=256, gate_snapshot=None, frozen_evidence=False):
+    """Replay fixed SAM scopes without loading a detector or SAM runtime."""
+    from XTA.sam_evidence import SamEvidenceBundle
+    from XTA.sam_policy import SamRegenerationRequired
+    from XTA.sam_replay import replay_sam_directional_nrrds
+
+    output = Path(output).resolve()
+    if output.exists():
+        raise FileExistsError('SAM comparison output must be fresh')
+    choices = []
+    if policy_paths:
+        for path in policy_paths:
+            settings = resolve_reconciliation(SimpleNamespace(
+                reconciliation=str(path), reconciliation_memory_mib=memory_mib))
+            policy = load_reconciliation_policy(settings)
+            policy['proposal_policy_sha256'] = settings.sha256
+            choices.append((str(policy['name']), policy, settings))
+    else:
+        for name in policies or ('stock', 'strict'):
+            if name not in {'stock', 'strict', 'permissive'}:
+                raise ValueError(f'Unknown SAM comparison policy: {name!r}')
+            settings = ({'strict_family_agreement': True} if name == 'strict' else
+                        'permissive' if name == 'permissive' else 'stock')
+            choices.append((name, {'sam_bridge_policy': settings}, None))
+    current = None
+    if gate_snapshot is not None:
+        current = json.loads(Path(gate_snapshot).read_text(encoding='utf-8'))
+        if not isinstance(current, dict) or any(not isinstance(k, str) or not isinstance(v, str)
+                                                for k, v in current.items()):
+            raise ValueError('SAM gate_snapshot must be a JSON object of fingerprint strings')
+    output.mkdir(parents=True)
+    report = {'schema': 'xta.sam_proposal_comparison/1', 'complete': False,
+              'coordinate_space': 'view_native', 'model_inference': False,
+              'frozen_evidence_diagnostic': bool(frozen_evidence), 'datasets': []}
+    _atomic_json(output / 'comparison.json', report)
+    for index, source in enumerate(inputs, start=1):
+        bundle = SamEvidenceBundle.open(source)
+        dataset = {'bundle': str(bundle.directory), 'evidence_fingerprint': bundle.evidence_fingerprint,
+                   'scope': json.loads(json.dumps(dict(bundle.scope), default=dict)), 'methods': []}
+        report['datasets'].append(dataset)
+        for number, (name, policy, settings) in enumerate(choices, start=1):
+            target = output / f'{index:02d}_scope' / f'{number:02d}_{_name(name)}'
+            started = time.monotonic()
+            try:
+                replay = replay_sam_directional_nrrds(bundle, target, policy=policy,
+                    upstream_fingerprints=current, frozen_evidence=frozen_evidence,
+                    memory_mib=memory_mib)
+                if settings is not None:
+                    settings.assert_unchanged()
+                method = {'policy': name, 'status': 'complete', 'output': str(target),
+                          'policy_hash': replay['selection']['policy_hash'],
+                          'selected_run_ids': replay['selection']['selected_run_ids'],
+                          'dependencies': replay['selection']['dependencies'],
+                          'layers': replay['layers']}
+            except SamRegenerationRequired as error:
+                method = {'policy': name, 'status': 'regeneration_required', 'reason': str(error)}
+            method['elapsed_seconds'] = time.monotonic() - started
+            dataset['methods'].append(method)
+            _atomic_json(output / 'comparison.json', report)
+        # Verify immutable input after every policy transaction, including exports.
+        if SamEvidenceBundle.open(source).evidence_fingerprint != bundle.evidence_fingerprint:
+            raise RuntimeError('SAM evidence changed during policy comparison')
+        dataset['inputs_unchanged'] = True
+    report['complete'] = all(method['status'] == 'complete'
+        for dataset in report['datasets'] for method in dataset['methods'])
+    _atomic_json(output / 'comparison.json', report)
+    return report
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", nargs="+", required=True, metavar="NRRD_MANIFEST.json")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--input", nargs="+", metavar="NRRD_MANIFEST.json")
+    source.add_argument('--sam_bundle', nargs='+', metavar='PROPOSAL_DIRECTORY',
+                        help='Replay fixed SAM proposals as view-native directional NRRDs without inference')
     parser.add_argument("--policy", nargs="+", metavar="POLICY.py", default=None,
                         help="Defaults: union, quorum3, largest_island, hybrid_with_fill, confidence_anchored, confidence_core_rescue. A raw-union reference is always included.")
     parser.add_argument("--output", required=True, metavar="FRESH_DIRECTORY")
     parser.add_argument("--memory_mib", type=int, default=2048)
+    parser.add_argument('--sam_policy', nargs='+', choices=('stock', 'strict', 'permissive'),
+                        help='SAM defaults: stock and strict. Permissive raw-candidate ablation is opt-in')
+    parser.add_argument('--gate_snapshot', type=Path,
+                        help='JSON current input/upstream fingerprint map; changed SAM tile dependencies require regeneration')
+    parser.add_argument('--frozen_evidence', action='store_true',
+                        help='Explicit frozen-proposal SAM diagnostic; never a fresh pipeline rerun')
     return parser
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.sam_bundle:
+        if args.policy and args.sam_policy:
+            parser.error('--policy and --sam_policy are alternative SAM policy sources')
+        report = compare_sam_bundles(args.sam_bundle, args.output, policy_paths=args.policy,
+            policies=args.sam_policy, memory_mib=args.memory_mib,
+            gate_snapshot=args.gate_snapshot, frozen_evidence=args.frozen_evidence)
+        return 0 if report['complete'] else 2
+    if args.sam_policy or args.gate_snapshot or args.frozen_evidence:
+        parser.error('--sam_policy, --gate_snapshot and --frozen_evidence require --sam_bundle')
     paths = args.policy or [_POLICIES / f"{name}.py" for name in _DEFAULT_POLICIES]
     compare(args.input, paths, args.output, memory_mib=args.memory_mib)
     return 0
