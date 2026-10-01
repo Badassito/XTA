@@ -43,8 +43,9 @@ version = {attr = "XTA.__version__"}
 [tool.setuptools.data-files]
 "share/xta" = [
   "ARCHITECTURE.md",
-  "GPT-6-Astra-Ultra_v23.0.5_SLURM.py",
+  "GPT-6-Astra-Ultra_v24.0.0_SLURM.py",
 ]
+"share/xta/docs" = ["docs/sam_interpolation.md", "docs/lta_dynamic_crops.md"]
 "share/xta/tools" = [
   "tools/compare_reconciliation.py",
   "tools/export_semantic_logits.py",
@@ -85,4 +86,23 @@ version = {attr = "XTA.__version__"}
   "tools/lta_window_gpu_smoke.py",
   "tools/lta_overlap_profile.py",
   "tools/lta_relay_frontier_smoke.py",
+  "tools/diagnose_sam_interpolation.py",
+  "tools/lta_dynamic_crop_diagnostic.py",
+  "tools/analyze_lta_dynamic_crop_diagnostic.py",
+  "tools/study_sam_fusion.py",
+  "tools/qualify_sdf_alignment.py",
+  "tools/prepare_sam_holdout.py",
+  "tools/heatsoak_sam_benchmark.py",
+  "tools/qualify_sam_feature_cache.py",
+  "tools/evaluate_sam_holdout.py",
+  "tools/audit_sam_context.py",
+  "tools/compare_sam_crop_strategies.py",
+  "tools/sam_crop_strategy_geometry.py",
+  "tools/report_sam_crop_strategies.py",
+  "tools/sam_crop_seed_diagnostics.py",
+  "tools/analyze_sam_crop_strategies.py",
+  "tools/sam_crop_quality.py",
+  "tools/prepare_sam_crop_two_tile.py",
+  "tools/compare_sam_crop_zoom.py",
+  "tools/qualify_sam_tiled_integration.py",
 ]

@@ -189,6 +189,28 @@ class FileLayer:
     _position: int = field(default=0, init=False, repr=False)
     _eof_validated: bool = field(default=False, init=False, repr=False)
 
+    def proposal_bundle(self):
+        """Open this SAM layer's exact overlapping ownership evidence lazily.
+
+        Binary NRRD reading remains unchanged. Proposal replay uses this separate
+        indexed schema and never infers run ownership from a directional union.
+        """
+        if self.metadata.get('interpolation_backend') != 'sam':
+            return None
+        reference = self.metadata.get('proposal_evidence_path')
+        if not isinstance(reference, str) or not reference:
+            raise ValueError('SAM layer has no retained proposal evidence reference')
+        directory = Path(reference)
+        if not directory.is_absolute():
+            if self._owner is None or self._owner.manifest_directory is None:
+                raise ValueError('Relative SAM evidence requires its layer manifest directory')
+            directory = self._owner.manifest_directory / directory
+        if directory.name == 'manifest.json':
+            directory = directory.parent
+        from .sam_evidence import SamEvidenceBundle
+        return SamEvidenceBundle.open(directory, max_mask_bytes=self._owner._budget_bytes
+                                      if self._owner is not None else 64 * _MIB)
+
     def _open(self) -> None:
         if self._payload is not None:
             return
@@ -289,12 +311,13 @@ class FileLayer:
 
 class LayerCollection(Sequence[FileLayer]):
     def __init__(self, manifest: dict[str, Any], layers: list[FileLayer], geometry: ReferenceGeometry,
-                 workspace: Path, budget_bytes: int, max_open: int) -> None:
+                 workspace: Path, budget_bytes: int, max_open: int, *, manifest_path: Path | None = None) -> None:
         self.manifest = manifest
         self.layers = tuple(layers)
         self.geometry = geometry
         self.shape_tyx = geometry.shape_tyx
         self.workspace = workspace
+        self.manifest_directory = Path(manifest_path).parent if manifest_path is not None else None
         self._budget_bytes = budget_bytes
         self._chunk_bytes = min(_MIB, max(1024, budget_bytes // 4))
         self.max_open = max_open
@@ -356,6 +379,11 @@ def read_layer_manifest(path: str | Path, *, workspace: str | Path, memory_mib: 
         filenames.add(filename)
         if metadata.get("layer_role") != "additive_component" or metadata.get("recomposition_op") != "union":
             continue
+        if metadata.get('interpolation_backend') == 'sam' and metadata.get('mask_kind') == 'bridge':
+            if metadata.get('interpolation_direction') not in {'forward', 'backward'}:
+                raise ValueError('SAM directional layer requires explicit forward/backward direction')
+            if metadata.get('proposal_selection_status') != 'policy_selected':
+                raise ValueError('SAM directional layer requires completed proposal-quality selection')
         layer_path = (path.parent / filename).resolve()
         if not layer_path.is_relative_to(path.parent):
             raise ValueError(f"Layer path escapes its manifest directory: {filename}")
@@ -378,7 +406,7 @@ def read_layer_manifest(path: str | Path, *, workspace: str | Path, memory_mib: 
         layers.append(layer)
     if common_geometry is None:
         raise ValueError("No additive layer has a readable spatial reference")
-    return LayerCollection(manifest, layers, common_geometry, Path(workspace), budget, max_open)
+    return LayerCollection(manifest, layers, common_geometry, Path(workspace), budget, max_open, manifest_path=path)
 
 
 def write_seg_nrrd(path: str | Path, *, shape_tyx: tuple[int, int, int],

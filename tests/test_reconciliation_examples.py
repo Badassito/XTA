@@ -12,7 +12,8 @@ from XTA.examples.external_reconciliation._hybrid import decide_slice as hybrid_
 
 EXAMPLES = Path(__file__).resolve().parents[1] / 'XTA/examples/external_reconciliation'
 EXPECTED = {'union', 'confidence_core_rescue', 'confidence_anchored', 'quorum3',
-            'largest_island', 'hybrid_with_fill'}
+            'largest_island', 'hybrid_with_fill', 'sam_conservative', 'sam_strict',
+            'sam_raw_candidates'}
 
 
 def load(path):
@@ -31,6 +32,19 @@ def test_curated_preset_roster_and_public_identity():
     assert set(paths) == EXPECTED
     for name, path in paths.items():
         assert load(path)['name'] == name
+
+
+def test_sam_presets_declare_quality_ablation_without_changing_source_union():
+    from XTA.sam_policy import resolve_sam_bridge_policy
+    for name in ('sam_conservative', 'sam_strict', 'sam_raw_candidates'):
+        policy = load(EXAMPLES / (name + '.py'))
+        assert policy['mode'] == 'union'
+        assert policy['proposal_api_version'] == 1
+        assert policy['select_proposals'] is None
+        bridge = resolve_sam_bridge_policy(policy)
+        assert bridge['strict_family_agreement'] == (name == 'sam_strict')
+        assert bridge['kind'] == ('permissive' if name == 'sam_raw_candidates' else 'conservative')
+        assert bridge['strict_containment'] == (name != 'sam_raw_candidates')
 
 
 def test_snapshotted_custom_presets_load_outside_the_example_directory(tmp_path):

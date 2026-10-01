@@ -140,6 +140,112 @@ REVIEWED_V23_0_5_RELEASE_REMOVALS = {'definitions': (), 'statements': ()}
 REVIEWED_V23_0_5_ADDED_VALIDATION_TOOLS = {
     'tools/qualify_native_trt_lease.py': '79bd26df350c97294383251716968ae05707ff43ac0538a4872726a83529307b',
 }
+# The v25 appendix authenticates the unchanged tagged v23.0.5 inventory.
+# Its current-source pins are populated only after implementation is frozen.
+REVIEWED_V24_0_0_RELEASE_PREDECESSOR_COMMIT = '929aa52d1335be47faec885f245daa8eba298b0c'
+REVIEWED_V24_0_0_RELEASE_PREDECESSOR_SHA256 = 'd6313a79d53153f83c8542d7649e7ba0efb8b8a191f41bdf136c7f937e965605'
+REVIEWED_V24_0_0_RELEASE_SHA256 = 'bbb0ee9f97d6f59dc36235cfd68db51a1aa8137d173b9eff6888474104449475'
+REVIEWED_V24_0_0_RELEASE_PREDECESSOR_MODULES = {'__init__': {'ast_sha256': '0216f11fd0339baeb4e44da9328d6e3b320d99fe2e71d2a79329dfbdb8e43242',
+              'statements_sha256': '15979679e69834925465401fc69000d76142241fc6872bb7404bc3cccd5d5714'},
+ 'assembly': {'ast_sha256': '141aa9c5f0429aff4e9fc8c78e5108ba8490064aad12235331372794399c2f80',
+              'statements_sha256': 'bbf54fe60fcf15b6917340c8a02f72d310a79ad072aed45fa0d88a7362240abb'},
+ 'cli': {'ast_sha256': 'f683c3d0100d0ebc2e683747e96265e668fad01fb76a6c96296b9d6db4435b25',
+         'statements_sha256': '8a62717b75ec2c318fa6b27e264b99071ff7f26e68466cffa20f4957ab8c7567'},
+ 'config': {'ast_sha256': 'a4161b8d72b4d9c49703e1db47cbf21853a38a88c582350c7518bc8a9d935f09',
+            'statements_sha256': '04ff297dda89478b7e3fea78ed6aabb871cf1f7c30aef50ba524a661803bc2b8'},
+ 'examples/external_reconciliation/sam_conservative': {'ast_sha256': None,
+                                                       'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'examples/external_reconciliation/sam_raw_candidates': {'ast_sha256': None,
+                                                         'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'examples/external_reconciliation/sam_strict': {'ast_sha256': None,
+                                                 'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'interpolation': {'ast_sha256': 'e0dfc2a220ed07b1605ee957c25c66a388282f84f7da28a42b0a8d17aa412425',
+                   'statements_sha256': '94bd3a8e4762eee0dd78c016c60992894a18ba4a1f13882bec580b874f3adccf'},
+ 'lta_config': {'ast_sha256': '28d7b78bfd9f84fb814aa4d69e75c6f24b8f463167ce003e5ba1be1a98a777bb',
+                'statements_sha256': '4134e374bda927f8ac378b38ed1efffcc9e4fe9eb00834a4b5ec81859eab9963'},
+ 'lta_dynamic_crops': {'ast_sha256': None,
+                       'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'lta_dynamic_execution': {'ast_sha256': None,
+                           'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'lta_execution': {'ast_sha256': '155f71892b0a0bc20c4d81383babf1c47c0b35e86fa393ca9e1080183e86c780',
+                   'statements_sha256': '25c5dab8b188b5734e0d15bd360aeb1fe71eecdc86731851c27f0035ddcbfcf6'},
+ 'lta_experimental': {'ast_sha256': '8a586c9ff1efe86c2c77c39bb333793e7fc20d6a7339ecdd3d97afcaf187cf9c',
+                      'statements_sha256': 'ede96f0714a177c4aa6681412b4a31f3e9dbbbeab2bada21b2a4f2693594776a'},
+ 'lta_feature_cache': {'ast_sha256': None,
+                       'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'lta_rendering': {'ast_sha256': 'b61becf382357cbe81a79246c90741b352b1519c7149a21e098fa954363bb468',
+                   'statements_sha256': 'f1ec698632cbc96673a349021011afa5f38c75aaeb6d2ff19bf8b70703e64ac3'},
+ 'lta_runtime': {'ast_sha256': '2d40f551b78733a287cf2602ccc358e509f538c66e79766cb42e47b37a3e7d9c',
+                 'statements_sha256': '5c590c91c3c440c956c2ac7f5e7798e4745bc5bf16193b93844da072023a6edf'},
+ 'lta_tracker_features': {'ast_sha256': 'b940f91da56f85618d090c8ebd287f6c6416deb439b11171060773567cc5fb28',
+                          'statements_sha256': 'ec4489575916009bce23e9b6db87b8a163ee408da5d6a09c02034cde4d57cb11'},
+ 'lta_worker_adapter': {'ast_sha256': 'fe59c9133d22d545d806c1c6a3101e3dcf5ee713167ee255cc87b0adbd4ee04e',
+                        'statements_sha256': '53d70819e1d78ec002f90e58b8ba3c2cdb8daa641b607e930976977222f6b426'},
+ 'lta_workers': {'ast_sha256': '6beedcc274a7cb832ad5c44ebe5b2faaecf25f310ed54639ec5c766d8c224ade',
+                 'statements_sha256': '4717feb6ebd589cdea45df72233662aabf74d0fd4fc7e19d4b58a348a0fdb448'},
+ 'media': {'ast_sha256': '5ddaef30d65927ce5ce98c45d9699938885c7c130aa46489605ee785f3df8d2b',
+           'statements_sha256': '82caf11c4e94390fefa5f36648c50e86b6303e0108ea3f9f994bedc174af5d38'},
+ 'outputs': {'ast_sha256': '30bb4f9f1326c9fa38f4f06a533764dfcdcc5382bf4beb9dd1280b2762c6c4c8',
+             'statements_sha256': '929e235dc592430b8690cc27aafcfc2d294c2d59a0e6f7f80508d09a8e26fa95'},
+ 'pipeline': {'ast_sha256': '414fdbcbc89f0bf8840bbfa7dedad9ab62984a14609f3d8493375b5d48b71ade',
+              'statements_sha256': '500ff48aa4441aa657da07968563011a9824fe947ac5b0e91c6918762a5a2142'},
+ 'reconciliation': {'ast_sha256': 'fe6f5e5d571613bb1c061fe125c9ec41cb7d0fe0f339b117320800526ff5fc39',
+                    'statements_sha256': 'bdfbb27beb84de3e327a7809ef49ccb5d9e0c25330be6b4f5462c7ca6ad30775'},
+ 'reconciliation_io': {'ast_sha256': '55adfbcb1e08ca885ba4bff0efa0074b84a8f3c42d28ad2d0badb9c06d372165',
+                       'statements_sha256': 'a907a4bad0d9d932977e9e7cfef4fcbe48d814b088f9338554723b0bee8b22ec'},
+ 'reconciliation_policy': {'ast_sha256': '8bcd6008081d6669386a1c50a39838d2382d57090f8b14086a45102bbd468ed6',
+                           'statements_sha256': 'b65c7b992b44add5d5643f94bc1c03837ea950f5e4616ac9d089e2fb800933dc'},
+ 'reconciliation_runtime': {'ast_sha256': 'a1c12d1e75982a33a2468a5c712eb83cbf46f5a8a9a9bb3df3b2416644373889',
+                            'statements_sha256': 'bb9b3fbfce3916679fe333100bd9d66337862659b8bd867a4cc7224da075f3b9'},
+ 'sam_bridge_planning': {'ast_sha256': None,
+                         'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'sam_crop_tiling': {'ast_sha256': None,
+                     'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'sam_evidence': {'ast_sha256': None,
+                  'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'sam_filtering': {'ast_sha256': None,
+                   'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'sam_integration': {'ast_sha256': None,
+                     'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'sam_interpolation': {'ast_sha256': None,
+                       'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'sam_mask_reader': {'ast_sha256': None,
+                     'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'sam_policy': {'ast_sha256': None,
+                'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'sam_replay': {'ast_sha256': None,
+                'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'sam_tracker_runtime': {'ast_sha256': None,
+                         'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'tta_lifecycle': {'ast_sha256': '6c7b465e99326d6f68490cf1ba47c20f8b2f4af289d3fc9291457e87835a2995',
+                   'statements_sha256': 'cbdb72a5635d267a1d8a15850be585c045da29d942d4cb17dc50ce5b9c6e26ab'},
+ 'tta_outputs': {'ast_sha256': '5d335b916cb0338d5ba8a361a917c4e65445642c422e0e7365d77df444705588',
+                 'statements_sha256': '2ba9f720828aa33a8298054abd91f0ff4f0593227337ea1bac66a7f25d2ed1b8'},
+ 'view_prepare': {'ast_sha256': '5c2953a5e0518c7f78f733378059aeb3bddd6fd91cd34c55c162e8d47974df95',
+                  'statements_sha256': '2723c3295a1e502dfce234c36000de4fdee3c6216548c86a188d861bceed0d45'}}
+REVIEWED_V24_0_0_RELEASE_REMOVALS = {'definitions': (), 'statements': ()}
+REVIEWED_V24_0_0_ADDED_VALIDATION_TOOLS = {
+    'tools/diagnose_sam_interpolation.py': None,
+    'tools/lta_dynamic_crop_diagnostic.py': None,
+    'tools/analyze_lta_dynamic_crop_diagnostic.py': None,
+    'tools/study_sam_fusion.py': None,
+    'tools/qualify_sdf_alignment.py': None,
+    'tools/prepare_sam_holdout.py': None,
+    'tools/heatsoak_sam_benchmark.py': None,
+    'tools/qualify_sam_feature_cache.py': None,
+    'tools/evaluate_sam_holdout.py': None,
+    'tools/audit_sam_context.py': None,
+    'tools/compare_sam_crop_strategies.py': None,
+    'tools/sam_crop_strategy_geometry.py': None,
+    'tools/report_sam_crop_strategies.py': None,
+    'tools/sam_crop_seed_diagnostics.py': None,
+    'tools/analyze_sam_crop_strategies.py': None,
+    'tools/sam_crop_quality.py': None,
+    'tools/prepare_sam_crop_two_tile.py': None,
+    'tools/compare_sam_crop_zoom.py': None,
+    'tools/qualify_sam_tiled_integration.py': None,
+}
+
 REVIEWED_V23_0_4_RELEASE_PREDECESSOR_MODULES = {'__init__': {'ast_sha256': '06cab8fb84fe1b0d128e79914bf7b85d06e19e1d7ea60632cabb45d61b803372',
               'statements_sha256': 'a846fd38a2701ec3b095f34b403e143b74e695dec8c579b2379a58db2fd71e56'},
  '_deps': {'ast_sha256': '5c5900b0274d8b4a1f0ded960929b803257beba5454dcc1b56bcdbede73c35c6',
@@ -3053,6 +3159,7 @@ def reviewed_v23_0_4_release_contract(manifest, v21, *earlier_patches):
 
 def reviewed_v23_0_5_release_contract(manifest, v21, *earlier_patches):
     """Authenticate the throughput appendix against the complete tagged 23.0.4 receipt."""
+    manifest = _without_reviewed_v24_0_0_release(manifest)
     key = 'v23_0_5_release_review'
     prior = {name: value for name, value in manifest.items() if name != key}
     encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
@@ -3153,7 +3260,118 @@ def reviewed_v23_0_5_release_contract(manifest, v21, *earlier_patches):
     return review
 
 
+def reviewed_v24_0_0_release_contract(manifest, v21, *earlier_patches):
+    """Authenticate the SAM interpolation appendix against the complete tagged 23.0.5 receipt."""
+    key = 'v24_0_0_release_review'
+    prior = {name: value for name, value in manifest.items() if name != key}
+    encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    if hashlib.sha256(encoded).hexdigest() != REVIEWED_V24_0_0_RELEASE_PREDECESSOR_SHA256:
+        raise RuntimeError('v24.0.0 predecessor inventory changed; preserve every historical record')
+    _authenticate_successor_once(prior, 'v23_0_5_release_review', reviewed_v23_0_5_release_contract)
+    earlier = tuple(value for name, value in prior.items()
+                    if name != 'v21_review' and isinstance(value, dict)
+                    and 'release' in value and 'definitions' in value)
+    review = _reviewed_v21_patch_contract(
+        manifest, prior['v21_review'], key=key, release='24.0.0',
+        expected_digest=REVIEWED_V24_0_0_RELEASE_SHA256,
+        previous_digest=REVIEWED_V23_0_5_RELEASE_SHA256,
+        earlier_patches=earlier)
+    if (review.get('predecessor_commit') != REVIEWED_V24_0_0_RELEASE_PREDECESSOR_COMMIT
+            or review.get('predecessor_inventory_sha256') != REVIEWED_V24_0_0_RELEASE_PREDECESSOR_SHA256
+            or review.get('feature') != 'single-backend-sam-interpolation'):
+        raise RuntimeError('v24.0.0 review has an unexpected predecessor or feature')
+
+    snapshots = review.get('module_snapshots', ())
+    modules = [item.get('module') for item in snapshots]
+    if (len(modules) != len(set(modules))
+            or set(modules) != set(REVIEWED_V24_0_0_RELEASE_PREDECESSOR_MODULES)):
+        raise RuntimeError('v24.0.0 source snapshot coverage differs')
+    if set(review.get('complete_modules', ())) - set(modules):
+        raise RuntimeError('v24.0.0 complete source snapshot has no module')
+    records = review['definitions'] + review['statements']
+    for item in snapshots:
+        module = item['module']
+        previous = REVIEWED_V24_0_0_RELEASE_PREDECESSOR_MODULES[module]
+        historical = item.get('previous_top_level', ())
+        historical_digest = hashlib.sha256(json.dumps(historical, separators=(',', ':')).encode()).hexdigest()
+        if (item.get('previous_ast_sha256') != previous['ast_sha256']
+                or historical_digest != previous['statements_sha256']):
+            raise RuntimeError(f'v24.0.0 source predecessor changed: {module}')
+        if item.get('removed'):
+            raise RuntimeError(f'v24.0.0 has an unreviewed module removal: {module}')
+        for value in (item.get('ast_sha256'), *historical, *item.get('top_level', ())):
+            if (not isinstance(value, str) or len(value) != 64
+                    or any(char not in '0123456789abcdef' for char in value)):
+                raise RuntimeError(f'v24.0.0 source snapshot has an invalid digest: {module}')
+        if not item.get('reason'):
+            raise RuntimeError(f'v24.0.0 source snapshot has no review reason: {module}')
+        positions = []
+        for record in records:
+            if record['module'] != module:
+                continue
+            current_index, previous_index = record.get('current_index'), record.get('previous_index')
+            if (type(current_index) is not int or not 0 <= current_index < len(item['top_level'])
+                    or item['top_level'][current_index] != record['sha256']):
+                raise RuntimeError(f'v24.0.0 statement position differs: {module}')
+            if previous_index is None:
+                if record['previous_sha256'] is not None:
+                    raise RuntimeError(f'v24.0.0 new statement has an unexpected predecessor: {module}')
+            elif (type(previous_index) is not int or not 0 <= previous_index < len(historical)
+                    or historical[previous_index] != record['previous_sha256']):
+                raise RuntimeError(f'v24.0.0 statement predecessor changed: {module}')
+            positions.append(current_index)
+        if len(positions) != len(set(positions)):
+            raise RuntimeError(f'v24.0.0 source has duplicate reviewed positions: {module}')
+    if any(record['module'] not in set(modules) for record in records):
+        raise RuntimeError('v24.0.0 statement has no complete source snapshot')
+
+    removals = {
+        'definitions': tuple(sorted((item['module'], item['name'], item['previous_index'],
+                                     item['previous_sha256']) for item in review.get('removed_definitions', ()))),
+        'statements': tuple(sorted((item['module'], item['previous_index'], item['previous_sha256'])
+                                   for item in review.get('removed_statements', ()))),
+    }
+    if removals != REVIEWED_V24_0_0_RELEASE_REMOVALS:
+        raise RuntimeError('v24.0.0 reviewed removal scope differs')
+    removed_positions = set()
+    for category in ('removed_definitions', 'removed_statements'):
+        for record in review.get(category, ()):
+            module, index = record['module'], record['previous_index']
+            snapshot = next((item for item in snapshots if item['module'] == module), None)
+            if (snapshot is None or type(index) is not int
+                    or not 0 <= index < len(snapshot['previous_top_level'])
+                    or snapshot['previous_top_level'][index] != record['previous_sha256']
+                    or not record.get('reason') or (module, index) in removed_positions):
+                raise RuntimeError(f'v24.0.0 retired predecessor changed: {module}')
+            removed_positions.add((module, index))
+    reviewed_radial_module_hashes(prior['v21_review'], (*earlier, review))
+    reviewed_radial_definition_hashes(prior['v21_review'], (*earlier, review))
+
+    prior_tools = {item['path']: item['sha256'] for item in prior['v23_0_5_release_review']['validation_tools']}
+    tools = review.get('validation_tools', ())
+    expected_paths = [*prior_tools, *REVIEWED_V24_0_0_ADDED_VALIDATION_TOOLS]
+    if [item.get('path') for item in tools] != expected_paths:
+        raise RuntimeError('v24.0.0 validation-tool review has missing or duplicate paths')
+    for item in tools:
+        value = item.get('sha256')
+        previous = prior_tools.get(item['path'], REVIEWED_V24_0_0_ADDED_VALIDATION_TOOLS.get(item['path']))
+        if (item.get('previous_sha256') != previous or not item.get('reason')
+                or not isinstance(value, str) or len(value) != 64
+                or any(char not in '0123456789abcdef' for char in value)):
+            raise RuntimeError('v24.0.0 validation-tool review has invalid predecessor, digest or reason')
+    return review
+
+
+def _without_reviewed_v24_0_0_release(manifest):
+    key = 'v24_0_0_release_review'
+    if key not in manifest:
+        return manifest
+    _authenticate_successor_once(manifest, key, reviewed_v24_0_0_release_contract)
+    return {name: value for name, value in manifest.items() if name != key}
+
+
 def _without_reviewed_v23_0_5_release(manifest):
+    manifest = _without_reviewed_v24_0_0_release(manifest)
     key = 'v23_0_5_release_review'
     if key not in manifest:
         return manifest
@@ -3826,10 +4044,14 @@ def _verify_main() -> None:
                                   if 'v22_3_1_release_review' in manifest else None)
     publication_release_review = (reviewed_v22_3_2_release_contract(manifest, v21)
                                   if 'v22_3_2_release_review' in manifest else None)
+    sam_release_review = (_authenticate_successor_once(
+                          manifest, 'v24_0_0_release_review', reviewed_v24_0_0_release_contract)
+                          if 'v24_0_0_release_review' in manifest else None)
+    sam_manifest = _without_reviewed_v24_0_0_release(manifest)
     throughput_release_review = (_authenticate_successor_once(
-                                 manifest, 'v23_0_5_release_review', reviewed_v23_0_5_release_contract)
+                                 sam_manifest, 'v23_0_5_release_review', reviewed_v23_0_5_release_contract)
                                  if 'v23_0_5_release_review' in manifest else None)
-    throughput_manifest = _without_reviewed_v23_0_5_release(manifest)
+    throughput_manifest = _without_reviewed_v23_0_5_release(sam_manifest)
     cleanup_release_review = (_authenticate_successor_once(
                               throughput_manifest, 'v23_0_4_release_review', reviewed_v23_0_4_release_contract)
                               if 'v23_0_4_release_review' in manifest else None)
@@ -3845,7 +4067,9 @@ def _verify_main() -> None:
     semantic_release_review = (_authenticate_successor_once(
                                semantic_manifest, 'v23_release_review', reviewed_v23_release_contract)
                                if 'v23_release_review' in manifest else None)
-    throughput_successors = ((throughput_release_review,) if throughput_release_review is not None else ())
+    sam_successors = ((sam_release_review,) if sam_release_review is not None else ())
+    throughput_successors = (((throughput_release_review,) if throughput_release_review is not None else ())
+                             + sam_successors)
     cleanup_successors = (((cleanup_release_review,) if cleanup_release_review is not None else ())
                           + throughput_successors)
     tta_successors = (((tta_release_review,) if tta_release_review is not None else ())
@@ -4014,8 +4238,11 @@ def _verify_main() -> None:
         verify_v22_3_source_snapshots(cleanup_release_review, trees, throughput_successors)
         verify_v22_3_validation_tools(cleanup_release_review, throughput_successors)
     if throughput_release_review is not None:
-        verify_v22_3_source_snapshots(throughput_release_review, trees)
-        verify_v22_3_validation_tools(throughput_release_review)
+        verify_v22_3_source_snapshots(throughput_release_review, trees, sam_successors)
+        verify_v22_3_validation_tools(throughput_release_review, sam_successors)
+    if sam_release_review is not None:
+        verify_v22_3_source_snapshots(sam_release_review, trees)
+        verify_v22_3_validation_tools(sam_release_review)
     for module, expected_hash in reviewed_radial_module_hashes(v21, patches).items():
         source = (PACKAGE / f'{module}.py').read_text(encoding='utf-8')
         if hashlib.sha256(source.encode('utf-8')).hexdigest() != expected_hash:

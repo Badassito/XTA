@@ -136,7 +136,7 @@ def _union_only(layers, shape, policy, write_slab, memory_mib, progress):
         write_slab(z0, z1, candidate.astype(np.uint8))
         if progress:
             progress('voting', z1, shape[0])
-    return dict(schema='xta.reconciliation/1', policy={k: v for k, v in policy.items() if k != 'decide'},
+    return dict(schema='xta.reconciliation/1', policy={k: v for k, v in policy.items() if k not in {'decide', 'select_proposals'}},
         shape_tyx=list(shape), memory_mib=memory_mib, slab_depth=depth,
         planned_working_bytes=plan['planned_working_bytes'], layer_count=len(layers), group_count=int(bool(layers)),
         groups=['union'] if layers else [], layers=records, components={},
@@ -280,7 +280,7 @@ def reconcile(layers: Sequence[EvidenceLayer], *, shape_tyx, policy, write_slab,
         write_slab(z0, z1, keep.astype(np.uint8))
         if progress:
             progress('voting', z1, shape[0])
-    return dict(schema='xta.reconciliation/1', policy={k: v for k, v in policy.items() if k != 'decide'},
+    return dict(schema='xta.reconciliation/1', policy={k: v for k, v in policy.items() if k not in {'decide', 'select_proposals'}},
         shape_tyx=list(shape), memory_mib=memory_mib, slab_depth=slab_depth,
         planned_working_bytes=plan['planned_working_bytes'], layer_count=len(layers), group_count=group_count,
         groups=list(groups), counts=counts, layers=source_records, components=component_records,

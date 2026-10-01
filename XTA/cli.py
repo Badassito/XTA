@@ -95,11 +95,18 @@ def _run_tta(arguments: Sequence[str]) -> None:
     if _option_argument_count(mode_arguments, "--channel_format") > 1:
         parser.error("--channel_format may be provided only once")
     parsed = parser.parse_args(mode_arguments)
-    from .config import resolve_backend_devices
+    from .config import (
+        resolve_backend_devices,
+        resolve_backend_models,
+        resolve_interpolation_settings,
+        activate_sam_crop_mode,
+    )
     from .tta_augmentation_config import resolve_tta_augmentation
     from .reconciliation_policy import resolve_reconciliation
     try:
         devices = resolve_backend_devices(parsed.device)
+        models = resolve_backend_models(parsed.model)
+        interpolation = resolve_interpolation_settings(parsed, models, devices)
         resolve_tta_augmentation(parsed, gpu_devices=devices.gpu_devices, cpu_enabled=devices.cpu)
         resolve_reconciliation(parsed)
     except (ValueError, OSError) as exc:
@@ -115,8 +122,9 @@ def _run_tta(arguments: Sequence[str]) -> None:
         mode="tta",
         mode_arguments=mode_arguments,
     ):
-        with _mode_sys_argv(mode_arguments):
-            run_tta()
+        with activate_sam_crop_mode(interpolation.sam_crop_mode):
+            with _mode_sys_argv(mode_arguments):
+                run_tta()
 
 
 def _run_pta(arguments: Sequence[str]) -> None:

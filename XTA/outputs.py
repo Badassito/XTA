@@ -2821,6 +2821,11 @@ def nrrd_layer_output_suffix(
     pass_index: int = 0,
     interpolation_walk_back_index: int = 0,
     interpolation_candidate_index: int = 0,
+    interpolation_backend: str = '',
+    interpolation_direction: str = '',
+    seed_detector_identity: str = '',
+    sam_bundle_identity: str = '',
+    interpolation_policy_identity: str = '',
     tile_config_id: str = '',
     tile_acceptance: str = '',
     stage: str = '',
@@ -2839,6 +2844,26 @@ def nrrd_layer_output_suffix(
             return f'Global_smoothing_pass{int(pass_index):02d}'
         return 'Global_union_presmoothing'
     vt = _sanitize_nrrd_layer_token(view_token) or 'view'
+    if mask_kind_l == 'bridge' and str(interpolation_backend).lower() == 'sam':
+        direction = str(interpolation_direction).strip().lower()
+        if direction not in {'forward', 'backward'}:
+            raise ValueError('SAM bridge output direction must be forward or backward')
+        if source_l not in {'fullframe', 'tile'}:
+            raise ValueError('SAM bridge output requires fullframe or tile provenance')
+        config = _sanitize_nrrd_layer_token(tile_config_id) if tile_config_id else ''
+        scope = source_l + (f'_{config}' if config else '')
+        # Human-readable native scope plus short stable identities, with full
+        # values in the manifest. Directions/passes still share the same vote cap.
+        import hashlib
+        identities = []
+        for label, identity in (('detector', seed_detector_identity),
+                                ('bundle', sam_bundle_identity),
+                                ('policy', interpolation_policy_identity)):
+            if identity:
+                token = hashlib.sha256(str(identity).encode('utf-8')).hexdigest()[:12]
+                identities.append(f'{label}{token}')
+        provenance = ('_' + '_'.join(identities)) if identities else ''
+        return f'{vt}_{scope}_sam_bridge_pass{int(pass_index):02d}_{direction}{provenance}'
     if source_l == 'fullframe':
         if mask_kind_l == 'bridge':
             suffix = f'{vt}_fullframe_bridge_pass{int(pass_index):02d}'
@@ -3716,6 +3741,35 @@ def write_layer_nrrd_with_low_quality_mirrors(
             _encode_mirror(job)
     return result
 
+_INTERPOLATION_PROVENANCE_FIELDS = (
+    'interpolation_backend', 'interpolation_direction', 'seed_detector_identity',
+    'sam_bundle_identity', 'interpolation_policy_identity', 'interpolation_connectivity', 'proposal_evidence_path',
+    'proposal_selection_status', 'sam_group_ids', 'sam_run_ids', 'observation_roots',
+    'gate_support_identity', 'upstream_interpolation_policy_identity', 'native_transform',
+    'selected_bridge_connection_status', 'final_connection_survival',
+)
+
+
+def interpolation_layer_provenance(ref: NrrdLayerRef, *, relative_to: Optional[Path] = None) -> Dict[str, object]:
+    """Return explicit SAM/gate lineage without changing legacy SDF metadata."""
+    if (str(getattr(ref, 'interpolation_backend', '')).lower() != 'sam'
+            and not getattr(ref, 'gate_support_identity', '')
+            and not getattr(ref, 'upstream_interpolation_policy_identity', '')):
+        return {}
+    result = {name: getattr(ref, name, '') for name in _INTERPOLATION_PROVENANCE_FIELDS}
+    # JSON lists are portable and keep direction/run identity separate from the
+    # detector-confidence channels and geometric source voting groups.
+    for name in ('sam_group_ids', 'sam_run_ids', 'observation_roots'):
+        result[name] = list(result[name])
+    if relative_to is not None and result.get('proposal_evidence_path'):
+        result['proposal_evidence_path'] = Path(os.path.relpath(
+            str(Path(str(result['proposal_evidence_path'])).resolve()),
+            str(Path(relative_to).resolve()),
+        )).as_posix()
+        result['proposal_evidence_path_base'] = 'manifest_directory'
+    return result
+
+
 class NrrdLayerSink:
     """Write each component layer as its own NRRD as soon as the layer becomes available."""
 
@@ -3739,6 +3793,7 @@ class NrrdLayerSink:
         self._source_refs: Dict[Future, NrrdLayerRef] = {}
         self._manifest: List[Dict[str, object]] = []
         self._suffix_counts: Dict[str, int] = {}
+        self._sam_output_slots: set = set()
         # Slicer segment colors already assigned in this run, so two layers whose
         # suffix hashes collide still render distinctly (deterministic forward probing).
         self._segment_colors_in_use: set = set()
@@ -3789,6 +3844,24 @@ class NrrdLayerSink:
     def submit_layer(self, ref: Optional['NrrdLayerRef'], suffix: str) -> Optional[Path]:
         if ref is None:
             return None
+        provenance = interpolation_layer_provenance(ref, relative_to=self.nrrd_dir)
+        if str(getattr(ref, 'interpolation_backend', '')).lower() == 'sam':
+            if ref.mask_kind == 'bridge' and ref.proposal_selection_status != 'policy_selected':
+                raise ValueError('SAM directional output requires completed proposal-quality selection')
+            if ref.mask_kind == 'bridge' and ref.interpolation_direction not in {'forward', 'backward'}:
+                raise ValueError('SAM directional output requires an explicit view-native direction')
+            if ref.mask_kind == 'bridge' and '_sam_bridge_' not in str(suffix):
+                # Guard older sink call sites: provenance lives on the reference
+                # and must survive projection even when a legacy suffix is supplied.
+                suffix = nrrd_layer_output_suffix(
+                    view_token=ref.view_name, source=ref.source, mask_kind=ref.mask_kind,
+                    pass_index=ref.pass_index, tile_config_id=ref.tile_config_id,
+                    interpolation_backend=ref.interpolation_backend,
+                    interpolation_direction=ref.interpolation_direction,
+                    seed_detector_identity=ref.seed_detector_identity,
+                    sam_bundle_identity=ref.sam_bundle_identity,
+                    interpolation_policy_identity=ref.interpolation_policy_identity,
+                )
         layer_role = str(getattr(ref, 'layer_role', 'additive_component'))
         recomposition_op = str(getattr(ref, 'recomposition_op', 'union'))
         low_quality_recomposition_op = str(
@@ -3796,6 +3869,13 @@ class NrrdLayerSink:
         )
         mirror_low_quality = bool(getattr(ref, 'mirror_low_quality', True))
         with self._lock:
+            if ref.mask_kind == 'bridge' and ref.interpolation_backend == 'sam':
+                slot = (ref.model_name, ref.view_name, ref.aug_id, ref.angle_deg, ref.source,
+                        ref.tile_config_id, ref.pass_index, ref.interpolation_direction,
+                        ref.sam_bundle_identity, ref.interpolation_policy_identity)
+                if slot in self._sam_output_slots:
+                    raise ValueError('Duplicate SAM directional output slot for the same interpolation scope/pass')
+                self._sam_output_slots.add(slot)
             seen = int(self._suffix_counts.get(str(suffix), 0))
             self._suffix_counts[str(suffix)] = seen + 1
             unique_suffix = str(suffix) if seen == 0 else f'{suffix}_{seen + 1:02d}'
@@ -3837,6 +3917,7 @@ class NrrdLayerSink:
                 'z_shards': None,
                 'z_shards_policy': 'execution_time',
             }
+            manifest_entry.update(provenance)
             self._manifest.append(manifest_entry)
             # mirror this component layer into each low-quality downbin decomposition,
             # scheduled now (as the view completes) exactly like the full-quality layer and sharing
@@ -3889,6 +3970,7 @@ class NrrdLayerSink:
                     'segment_name': segment_name,
                     'segment_color_rgb': [round(float(c), 6) for c in segment_color],
                 }
+                lq_manifest_entry.update(interpolation_layer_provenance(ref, relative_to=self._lq_nrrd_dir(spec)))
                 self._lq_manifests.setdefault(str(spec.token), []).append(lq_manifest_entry)
                 lq_manifest_entries.append((lq_shape, lq_manifest_entry))
             def _execute_layer_write() -> Path:
@@ -4034,6 +4116,25 @@ class NrrdLayerSink:
         self.executor.shutdown(wait=True)
         with self._lock:
             self._source_refs.clear()
+
+    def record_final_bridge_survival(self, receipts: Sequence[Dict[str, object]]) -> None:
+        """Attach the final output transaction without reusing native topology claims."""
+        keyed = {(str(item.get('model_name', '')), str(item.get('layer_key', ''))): dict(item)
+                 for item in receipts}
+        with self._lock:
+            for entry in self._manifest:
+                receipt = keyed.get((str(entry.get('model_name', '')), str(entry.get('layer_key', ''))))
+                if receipt is not None:
+                    entry['final_output_survival'] = receipt
+                    entry['final_connection_survival'] = receipt.get('connection_survival', 'not_assessed')
+            # Downbin resampling changes topology. Keep the source receipt as a
+            # labelled reference and leave downbin connection survival unverified.
+            for entries in self._lq_manifests.values():
+                for entry in entries:
+                    receipt = keyed.get((str(entry.get('model_name', '')), str(entry.get('layer_key', ''))))
+                    if receipt is not None:
+                        entry['full_quality_final_output_survival'] = receipt
+                        entry['final_connection_survival'] = 'not_assessed_after_downbin'
 
     def write_manifest(self) -> Optional[Path]:
         with self._lock:
@@ -5848,6 +5949,10 @@ def write_summary_file(
 
     if interpolation_stats:
         lines.append('')
+        sam_stats = [item for item in interpolation_stats if item.get('interpolation_backend') == 'sam']
+        if sam_stats:
+            lines.append('Interpolation backend: sam; directions are increasing/decreasing view-native frame index.')
+            lines.append('SAM bridges are policy-selected additions; final connection survival is reported separately in the NRRD manifest.')
         lines.append('Interpolation statistics (per pass):')
         pass_indices = sorted({int(s.get('pass_index', 0)) for s in interpolation_stats})
         for pass_idx in pass_indices:
@@ -5879,6 +5984,16 @@ def write_summary_file(
                     f"added_voxels={int(s.get('added_voxels', 0))}, "
                     f"skipped={bool(s.get('skipped', False))}"
                 )
+                if s.get('interpolation_backend') == 'sam':
+                    lines.append(
+                        f"      SAM generated_runs={int(s.get('sam_generated_runs', 0))}, "
+                        f"selected_runs={int(s.get('sam_selected_runs', 0))}, "
+                        f"incomplete_runs={int(s.get('sam_incomplete_runs', 0))}, "
+                        f"passes_requested={int(s.get('requested_passes', 0))}, "
+                        f"passes_completed={int(s.get('completed_passes', 0))}, "
+                        f"passes_skipped={int(s.get('skipped_passes', 0))}, "
+                        f"policy={s.get('sam_policy_hash', '')}, evidence={s.get('sam_evidence_path', '')}"
+                    )
 
     lines.append('')
     if gaussian_smoothing_stats is not None and int(gaussian_smoothing_stats.get('enabled', 0)) > 0:

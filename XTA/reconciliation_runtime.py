@@ -165,6 +165,12 @@ def _reconciliation_refs(refs, shape, *, needs_confidence):
         metadata = {field.name: getattr(ref, field.name) for field in fields(ref)
                     if field.name not in {'live_array', 'path'}}
         metadata.update(layer_key=ref.key, empty_segment=_nrrd_layer_zero_skip_window(ref, shape) == (0, 0))
+        if (str(metadata.get('interpolation_backend', '')).lower() == 'sam'
+                and metadata.get('mask_kind') == 'bridge'):
+            if metadata.get('proposal_selection_status') != 'policy_selected':
+                raise ValueError('SAM source reconciliation requires completed proposal-quality selection')
+            if metadata.get('interpolation_direction') not in {'forward', 'backward'}:
+                raise ValueError('SAM source reconciliation requires explicit view-native direction')
         evidence_role(metadata)
         confidence = lookup_confidence_evidence(ref)
         if confidence is not None:
@@ -190,6 +196,10 @@ def _publish_reconciliation_report(report, records, settings, output_dir):
                 'physical_view_name', 'view_family', 'source', 'mask_kind', 'tile_config_id',
                 'tile_acceptance', 'stage', 'confidence_evidence', 'confidence_coordinate_space',
                 'confidence_storage_shape_tyx')}
+        from .outputs import interpolation_layer_provenance
+        report['layers'][identity]['metadata'].update(interpolation_layer_provenance(_ref, relative_to=Path(output_dir)))
+        if metadata.get('interpolation_backend') == 'sam' and metadata.get('mask_kind') == 'bridge':
+            report['layers'][identity]['final_connection_survival'] = 'not_assessed_after_global_postprocessing'
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     snapshot = output_dir / 'policy.py'
@@ -223,7 +233,8 @@ def _reuse_assembled_union(assembled_union, records, *, shape, settings, policy,
         foreground_voxels=0 if metadata['empty_segment'] else None,
         foreground_count_source='empty_segment_metadata' if metadata['empty_segment'] else 'not_rescanned')
         for identity, _ref, metadata, _confidence in records}
-    report = dict(schema='xta.reconciliation/1', policy={key: value for key, value in policy.items() if key != 'decide'},
+    report = dict(schema='xta.reconciliation/1', policy={key: value for key, value in policy.items()
+                                                       if key not in {'decide', 'select_proposals'}},
         shape_tyx=list(shape), memory_mib=settings.memory_mib,
         slab_depth=plan['slab_depth'], planned_working_bytes=plan['planned_working_bytes'],
         layer_count=len(records), group_count=int(bool(records)), groups=['union'] if records else [],
@@ -241,6 +252,7 @@ def _reuse_assembled_union(assembled_union, records, *, shape, settings, policy,
                            'confidence_known_voxels', 'confidence_unknown_prediction_voxels',
                            'duplicate_group_support_removed', 'anchored_voxels'],
         evidence_interpretation='reuse of the pipeline-assembled additive union before global postprocessing')
+    _record_source_bridge_survival(report, records, assembled_union, settings)
     _publish_reconciliation_report(report, records, settings, output_dir)
     return assembled_union, report
 
@@ -288,6 +300,7 @@ def reconcile_tta_layers(refs, *, views, source_shape_tyx, processing_shape_tyx,
                            memory_mib=settings.memory_mib, geometry_context=context, progress=progress)
         settings.assert_unchanged()
         output.flush()
+        _record_source_bridge_survival(report, records, output, settings)
         _publish_reconciliation_report(report, records, settings, output_dir)
         return output, report
     except BaseException:
@@ -315,3 +328,32 @@ def reconcile_tta_layers(refs, *, views, source_shape_tyx, processing_shape_tyx,
             except OSError:
                 pass
             raise
+
+
+def _record_source_bridge_survival(report, records, output, settings):
+    """Record source filtering separately from native selection and final cleanup."""
+    from .tta_outputs import measure_bridge_output_survival
+    receipts = measure_bridge_output_survival(
+        [ref for _identity, ref, _metadata, _confidence in records], output,
+        memory_mib=settings.memory_mib, stage='source_grid_before_global_postprocessing',
+    )
+    for receipt in receipts:
+        identity = f"{receipt['model_name']}/{receipt['layer_key']}"
+        report['layers'][identity]['source_reconciliation_survival'] = receipt
+        report['layers'][identity]['foreground_voxels'] = receipt['selected_voxels']
+        report['layers'][identity]['foreground_count_source'] = 'selected_sam_source_survival_audit'
+    if receipts:
+        execution = report.setdefault('execution', {})
+        audits = sum(receipt['component_payload_reads'] for receipt in receipts)
+        execution['sam_survival_component_payload_reads'] = audits
+        if execution.get('strategy') == 'reuse_assembled_union':
+            execution['component_payload_reads'] = audits
+        report['sam_connection_survival'] = dict(
+            selected_bridge_selection='completed_before_source_reconciliation',
+            source_grid_support='measured_per_directional_layer',
+            source_grid_local_connectivity=('measured' if all(
+                receipt['connection_survival'] in {'survived', 'connection_lost'} for receipt in receipts)
+                else 'partially_assessed' if any(receipt['connection_survival'] in {'survived', 'connection_lost'}
+                for receipt in receipts) else 'not_assessed'),
+            final_output_after_global_postprocessing='not_assessed',
+        )

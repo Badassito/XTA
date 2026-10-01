@@ -157,6 +157,8 @@ class LtaRunPlan:
     session_work: Tuple[LtaSessionWork, ...] = ()
     view_assignments: Tuple[LtaViewAssignment, ...] = ()
     workers_per_gpu: int = 1
+    crop_backend: str = "tiled"
+    dynamic_crop_settings: Mapping[str, object] = field(default_factory=dict)
 
     def manifest_record(self) -> dict[str, object]:
         input_records = []
@@ -239,6 +241,8 @@ class LtaRunPlan:
             },
             "sam_execution": self.sam_execution,
             "workers_per_gpu": self.workers_per_gpu,
+            "crop_backend": self.crop_backend,
+            "dynamic_crop_settings": dict(self.dynamic_crop_settings),
             "conf": float(self.conf),
             "channel_policy": LTA_CHANNEL_POLICY,
             "object_multiplex": {
@@ -552,6 +556,10 @@ def build_lta_run_plan(
         session_work=tuple(session_work),
         view_assignments=view_assignments,
         workers_per_gpu=int(getattr(config.args, "lta_workers_per_gpu", 1)),
+        crop_backend=str(getattr(config.args, "lta_crop_backend", "tiled")),
+        dynamic_crop_settings={"margin": int(getattr(config.args, "lta_crop_margin", 96)),
+                               "guard": int(getattr(config.args, "lta_crop_guard", 24)),
+                               "max_scale": float(getattr(config.args, "lta_crop_max_scale", 3.0))},
     )
 
 
