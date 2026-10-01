@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import contextvars
 import math
+import os
 import re
 import shlex
 from dataclasses import dataclass
@@ -664,10 +667,11 @@ def quantize_display(value: object) -> str:
 
 @dataclass(frozen=True)
 class BackendModelSelection:
-    """Tagged GPU/CPU model artifacts supplied through ``--model``."""
+    """Detector artifacts and a separate mask-conditioned SAM bundle."""
 
     gpu: Optional[str] = None
     cpu: Optional[str] = None
+    sam: Optional[str] = None
 
 @dataclass(frozen=True)
 class BackendDeviceSelection:
@@ -675,6 +679,49 @@ class BackendDeviceSelection:
 
     gpu_devices: Tuple[str, ...] = ()
     cpu: bool = False
+
+@dataclass(frozen=True)
+class InterpolationSettings:
+    """Selected bridge generator and its independently owned SAM resources.
+
+    Disabled interpolation retains the configured backend while exposing no SAM
+    resources to initialize. Detector devices, batches, channels and precision
+    remain separate from this selection.
+    """
+
+    backend: str = 'sdf'
+    enabled: bool = True
+    sam_model: Optional[str] = None
+    sam_devices: Tuple[str, ...] = ()
+    sam_feature_cache_mib: int = 512
+    sam_crop_mode: Optional[str] = None
+
+
+_SAM_CROP_MODE_SNAPSHOT = contextvars.ContextVar('tta_sam_crop_mode_snapshot', default=None)
+
+
+def resolve_sam_crop_mode(environ=None) -> str:
+    """Read the opt-in SAM crop strategy without changing the working canvas."""
+    snapshot = _SAM_CROP_MODE_SNAPSHOT.get()
+    if snapshot is not None and environ is None:
+        return snapshot
+    environment = os.environ if environ is None else environ
+    mode = str(environment.get('YOLO_TTA_SAM_CROP_MODE', 'whole')).strip().lower()
+    if mode not in {'whole', 'tiled'}:
+        raise ValueError('YOLO_TTA_SAM_CROP_MODE must be whole or tiled')
+    return mode
+
+
+@contextlib.contextmanager
+def activate_sam_crop_mode(mode: Optional[str]):
+    """Pin one CLI launch's already validated environment selection."""
+    resolved = (None if mode is None else
+                resolve_sam_crop_mode({'YOLO_TTA_SAM_CROP_MODE': mode}))
+    token = _SAM_CROP_MODE_SNAPSHOT.set(resolved)
+    try:
+        yield resolved
+    finally:
+        _SAM_CROP_MODE_SNAPSHOT.reset(token)
 
 @dataclass(frozen=True)
 class BackendPrecisionSelection:
@@ -702,27 +749,31 @@ def _cli_value_tokens(values: Sequence[str] | str | None) -> List[str]:
     return [str(value).strip() for value in values if str(value).strip()]
 
 def resolve_backend_models(values: Sequence[str] | str | None) -> BackendModelSelection:
-    """Resolve order-independent ``gpu:PATH`` and ``cpu:PATH`` model entries."""
+    """Resolve detector ``gpu:PATH``/``cpu:PATH`` and optional ``sam:PATH`` roles."""
     resolved: Dict[str, str] = {}
     for raw in _cli_value_tokens(values):
         backend, sep, payload = str(raw).partition(':')
         backend = backend.strip().lower()
-        if not sep or backend not in {'gpu', 'cpu'} or not payload.strip():
+        if not sep or backend not in {'gpu', 'cpu', 'sam'} or not payload.strip():
             raise ValueError(
-                '--model requires one or both tagged entries: gpu:/path/to/model '
-                'cpu:/path/to/openvino'
+                '--model requires tagged gpu:PATH or cpu:PATH detector entries, '
+                'with an optional sam:PATH mask-conditioned bundle'
             )
         if backend in resolved:
             raise ValueError(f'--model contains duplicate {backend}: entries')
         resolved[backend] = payload.strip()
-    if not resolved:
+    if not any(role in resolved for role in ('gpu', 'cpu')):
         raise ValueError(
-            '--model requires one or both tagged entries: gpu:/path/to/model '
-            'cpu:/path/to/openvino'
+            '--model requires at least one gpu:PATH or cpu:PATH detector entry; '
+            'a sam:PATH bundle cannot produce the starting TTA detections'
         )
-    return BackendModelSelection(gpu=resolved.get('gpu'), cpu=resolved.get('cpu'))
+    return BackendModelSelection(
+        gpu=resolved.get('gpu'), cpu=resolved.get('cpu'), sam=resolved.get('sam'),
+    )
 
-def _append_gpu_device_tokens(raw: str, output: List[str]) -> None:
+def _append_gpu_device_tokens(
+    raw: str, output: List[str], *, flag_name: str = '--device',
+) -> None:
     for token in re.split(r'[,\s]+', str(raw).strip().strip(',')):
         token = token.strip().strip(',')
         if not token:
@@ -737,7 +788,7 @@ def _append_gpu_device_tokens(raw: str, output: List[str]) -> None:
             index = low
         if not index.isdigit():
             raise ValueError(
-                f'--device GPU indexes must be non-negative integers; got {token!r}'
+                f'{flag_name} GPU indexes must be non-negative integers; got {token!r}'
             )
         canonical = f'cuda:{int(index)}'
         if canonical not in output:
@@ -765,6 +816,61 @@ def resolve_backend_devices(values: Sequence[str] | str | None) -> BackendDevice
             'cpu, or a hybrid value such as 0,1,2,3:cpu'
         )
     return BackendDeviceSelection(gpu_devices=tuple(gpu_devices), cpu=bool(cpu_enabled))
+
+def resolve_sam_devices(values: Sequence[str] | str | None) -> Tuple[str, ...]:
+    """Resolve an explicit SAM CUDA pool without enabling detector inference."""
+    devices: List[str] = []
+    for token in _cli_value_tokens(values):
+        _append_gpu_device_tokens(token, devices, flag_name='--sam_device')
+    if not devices:
+        raise ValueError('--sam_device requires at least one non-negative CUDA GPU index')
+    return tuple(devices)
+
+def resolve_interpolation_settings(
+    args: argparse.Namespace,
+    models: BackendModelSelection,
+    devices: BackendDeviceSelection,
+) -> InterpolationSettings:
+    """Validate bridge selection before model startup, without loading a bundle.
+
+    Active SAM inherits the selected detector CUDA pool only when no explicit
+    ``--sam_device`` is given. A CPU-only detector therefore needs an explicit
+    SAM pool. A disabled or SDF interpolation selection owns no SAM resources.
+    """
+    backend = str(getattr(args, 'interpolation_backend', 'sdf')).strip().lower()
+    if backend not in {'sdf', 'sam'}:
+        raise ValueError(
+            f'--interpolation_backend must select sdf or sam; {backend!r} is unsupported'
+        )
+    distance = int(getattr(args, 'interpolation_distance', 15))
+    if distance < 0:
+        raise ValueError('--interpolation_distance must be >= 0')
+    sam_feature_cache_mib = getattr(args, 'sam_feature_cache_mib', 512)
+    if (isinstance(sam_feature_cache_mib, bool)
+            or not isinstance(sam_feature_cache_mib, int) or sam_feature_cache_mib < 0):
+        raise ValueError('--sam_feature_cache_mib must be a nonnegative integer')
+    requested_sam_devices = getattr(args, 'sam_device', None)
+    explicit_sam_devices = (
+        resolve_sam_devices(requested_sam_devices)
+        if requested_sam_devices is not None else None
+    )
+    if distance == 0 or backend == 'sdf':
+        return InterpolationSettings(backend=backend, enabled=distance > 0,
+                                     sam_feature_cache_mib=sam_feature_cache_mib)
+    if not models.sam:
+        raise ValueError('--interpolation_backend sam requires a sam:PATH bundle in --model')
+    sam_devices = devices.gpu_devices if explicit_sam_devices is None else explicit_sam_devices
+    if not sam_devices:
+        raise ValueError(
+            '--interpolation_backend sam with a CPU-only detector requires '
+            '--sam_device GPU_INDEXES'
+        )
+    sam_crop_mode = resolve_sam_crop_mode()
+    return InterpolationSettings(
+        backend=backend, enabled=True, sam_model=models.sam, sam_devices=tuple(sam_devices),
+        sam_feature_cache_mib=sam_feature_cache_mib,
+        sam_crop_mode=sam_crop_mode,
+    )
 
 _CPU_PRECISION_ALIASES: Dict[str, str] = {
     'auto': 'auto', 'default': 'auto',
@@ -942,10 +1048,26 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--model", required=True, nargs="+", type=str, metavar="{gpu,cpu}:PATH",
+        "--sam_device", nargs="+", default=None, type=str, metavar="GPU_INDEXES",
+        help=(
+            "Separate logical CUDA indexes for SAM interpolation. Defaults to the "
+            "selected detector CUDA pool; CPU-only detectors require this flag for "
+            "active SAM interpolation. This does not enable a GPU detector"
+        ),
+    )
+    p.add_argument(
+        '--sam_feature_cache_mib', default=512, type=_bounded_number(int, minimum=0), metavar='MiB',
+        help=('Upper limit per SAM worker for exact cross-session frame-feature LRU reuse. '
+              'Actual admission is bounded by free GPU memory and reserved session headroom; '
+              '0 disables the worker LRU. This does not change interpolation quality policy'),
+    )
+    p.add_argument(
+        "--model", required=True, nargs="+", type=str, metavar="{gpu,cpu,sam}:PATH",
         help=(
             "Tagged model artifacts. Supply gpu:/path/to/engine, cpu:/path/to/openvino, "
-            "or both. The CPU artifact must be an ordinary raw-head OpenVINO segmentation "
+            "or both detector entries, plus sam:/path/to/bundle for SAM interpolation. "
+            "The SAM bundle is separate from detector scheduling, precision and channels. "
+            "The CPU artifact must be an ordinary raw-head OpenVINO segmentation "
             "IR, not an end-to-end/NMS-embedded export. Hybrid inference requires both "
             "entries"
         ),
@@ -1171,16 +1293,18 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--centerline_timeout", default=900.0,
                    type=_bounded_number(float, minimum=0, exclusive=True),
                    help="Seconds allowed for each isolated embedded-centerline attempt before preserving the current union and using safe pass-through behavior")
+    p.add_argument("--interpolation_backend", default="sdf", choices=("sdf", "sam"),
+                   help="Single interpolation generator: sdf preserves geometric bridging; sam uses image-guided mask tracking with no SDF fallback. Distance 0 disables the configured backend")
     p.add_argument("--interpolation_distance", default=15, type=_bounded_number(int, minimum=0),
                    help="Maximum view-native slice/frame distance used to search for interpolation candidates. Azimuthal interpolation wraps around frame order. 0 disables interpolation")
     p.add_argument("--interpolation_walk_back", default=1, type=_bounded_number(int, minimum=0),
-                   help="Additional source slices to bridge before the endpoint slice. The endpoint and first walked-back origin share output layer 1, preserving exactly N x --interpolation_candidates component NRRDs. 0 disables walk-back bridges but retains endpoint bridges")
+                   help="Additional source slices to bridge before the endpoint slice. SAM uses detector-observed walk-back seeds. SDF shares the endpoint and first walked-back origin in layer 1, preserving its component NRRD layout. 0 disables walk-back bridges but retains endpoint bridges")
     p.add_argument("--interpolation_candidates", default=1, type=_bounded_number(int, minimum=1),
-                   help="Accept up to the Nth nearest interpolation candidate per endpoint projection")
+                   help="Consider up to the Nth nearest candidate connection per endpoint projection for the selected interpolation backend")
     p.add_argument("--interpolation_passes", default=1, type=_bounded_number(int, minimum=1),
-                   help="Run the interpolation process this many passes, treating the previous pass as real")
+                   help="Maximum interpolation passes. SDF treats the previous pass as real; SAM plans distinct detector-observed anchor hypotheses and stops when exhausted")
     p.add_argument("--interpolation_min_radius", default=3, type=_bounded_number(float, minimum=0),
-                   help="Reject a candidate connection if the bridge radius is equal to, or smaller than, this value. 0 disables the check")
+                   help="Minimum bridge radius. SDF rejects candidate connections at or below this value. SAM removes undersized slice components before quality checks and publication, including detached dots outside the write region; it does not reject a whole run solely for those removed components. 0 disables the radius check/filter")
     p.add_argument("--interpolation_search_angle", default=15.0,
                    type=_bounded_number(float, minimum=-90, maximum=90, exclusive=True),
                    help="Projection growth angle in degrees. Must be greater than -90 and less than 90")

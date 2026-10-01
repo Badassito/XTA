@@ -645,6 +645,7 @@ class LtaWorkerPool:
         *,
         startup_timeout: Optional[float] = 120.0,
         workers_per_device: int = 1,
+        cancel_event: object | None = None,
     ) -> None:
         if not isinstance(init, LtaWorkerInit):
             raise TypeError("init must be an LtaWorkerInit")
@@ -657,6 +658,12 @@ class LtaWorkerPool:
         if not 1 <= count <= 4:
             raise ValueError("workers_per_device must be between one and four")
         self.device_ids = devices
+        if cancel_event is not None and not callable(getattr(cancel_event, "is_set", None)):
+            raise TypeError("cancel_event must expose is_set or be None")
+        # This event is parent-local and never crosses the spawn boundary.
+        # It lets an owner abort readiness/result waits without shutting down
+        # multiprocessing queues concurrently with their active consumer.
+        self._cancel_event = cancel_event
         self.workers_per_device = count
         self.worker_slots = tuple((device, index) for device in devices for index in range(count))
         self.cpu_budget = resolve_worker_cpu_budget(len(self.worker_slots))
@@ -713,13 +720,22 @@ class LtaWorkerPool:
                     # forced cleanup own termination instead of daemon rules.
                     daemon=False,
                 )
-                process.start()
                 self._processes[(device, index)] = process
+                process.start()
             self.ready_events = self._await_ready(startup_timeout)
             atexit.register(self._atexit_shutdown)
             self._atexit_registered = True
-        except BaseException:
-            self.shutdown(timeout=1.0, force=True)
+        except BaseException as error:
+            try:
+                self.shutdown(timeout=1.0, force=True)
+            except BaseException as cleanup_error:
+                add_note = getattr(error, "add_note", None)
+                if callable(add_note):
+                    add_note(f"LTA startup cleanup also failed: {type(cleanup_error).__name__}: {cleanup_error}")
+            if not self.workers_settled:
+                # The owning runtime must retain admission until these exact
+                # child processes are confirmed dead, even if startup failed.
+                setattr(error, "unsettled_worker_pool", self)
             raise
 
     @property
@@ -741,6 +757,14 @@ class LtaWorkerPool:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def workers_settled(self) -> bool:
+        """Prove process exit independently of queue/coordinator close state."""
+        try:
+            return all(not process.is_alive() for process in self._processes.values())
+        except Exception:
+            return False
 
     def _ensure_open(self) -> None:
         if self._closed or self._closing:
@@ -786,6 +810,8 @@ class LtaWorkerPool:
     def _get_event(self, timeout: Optional[float]) -> LtaWorkerEvent:
         deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
         while True:
+            if self._cancel_event is not None and self._cancel_event.is_set():
+                raise RuntimeError("LTA worker operation cancelled before completed evidence")
             if deadline is None:
                 slice_timeout = _EVENT_POLL_SECONDS
             else:
@@ -949,6 +975,10 @@ class LtaWorkerPool:
         """
 
         if self._closed:
+            if not self.workers_settled and force:
+                return self.force_close(timeout=min(2.0, max(0.0, float(timeout))))
+            if not self.workers_settled:
+                raise LtaWorkerShutdownError("closed LTA queues still have live worker processes")
             return ()
         self._closing = True
         for slot, process in self._processes.items():
@@ -960,6 +990,8 @@ class LtaWorkerPool:
 
         deadline = time.monotonic() + max(0.0, float(timeout))
         for process in self._processes.values():
+            if process.pid is None:
+                continue
             remaining = max(0.0, deadline - time.monotonic())
             process.join(timeout=remaining)
 
@@ -1022,6 +1054,38 @@ class LtaWorkerPool:
                 for event in shutdown_errors
             )
             raise LtaWorkerShutdownError(f"LTA worker adapter shutdown failed: {detail}")
+        return tuple(device for device in self.device_ids if any(slot[0] == device for slot in forced))
+
+    def force_close(self, *, timeout: float = 2.0) -> tuple[int, ...]:
+        """Retry process termination even after a failed queue shutdown.
+
+        No task queue is touched here. This proves that model residency ended
+        before a caller releases its device lease on exceptional teardown.
+        """
+        forced = []
+        for slot, process in self._processes.items():
+            if process.is_alive():
+                forced.append(slot)
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+        for slot in forced:
+            process = self._processes[slot]
+            try:
+                process.join(timeout=max(0.0, float(timeout)))
+            except Exception:
+                pass
+            if process.is_alive():
+                kill = getattr(process, "kill", None)
+                if callable(kill):
+                    try:
+                        kill()
+                        process.join(timeout=max(0.0, float(timeout)))
+                    except Exception:
+                        pass
+        if not self.workers_settled:
+            raise LtaWorkerShutdownError("LTA forced cleanup could not prove every worker process exited")
         return tuple(device for device in self.device_ids if any(slot[0] == device for slot in forced))
 
     def close(self) -> None:

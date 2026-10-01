@@ -22,6 +22,7 @@ class PipelineRunResources:
         self.sinks: List[object] = []
         self.processes: List[object] = []
         self.queues: List[object] = []
+        self.closeables: List[object] = []
         self.threads: List[Tuple[threading.Thread, Optional[threading.Event]]] = []
         self._seen: set[int] = set()
 
@@ -46,6 +47,9 @@ class PipelineRunResources:
     def track_queue(self, resource: object) -> object:
         return self._add(self.queues, resource)
 
+    def track_closeable(self, resource: object) -> object:
+        return self._add(self.closeables, resource)
+
     def track_thread(
         self,
         thread: threading.Thread,
@@ -57,6 +61,14 @@ class PipelineRunResources:
         return thread
 
     def close(self, *, failed: bool) -> None:
+        if failed:
+            for resource in self.closeables:
+                cancel = getattr(resource, 'cancel', None)
+                if callable(cancel):
+                    try:
+                        cancel('TTA run failed during resource teardown')
+                    except Exception:
+                        pass
         for _thread, stop_event in self.threads:
             if stop_event is not None:
                 stop_event.set()
@@ -103,6 +115,11 @@ class PipelineRunResources:
             try:
                 if thread is not threading.current_thread():
                     thread.join(timeout=5.0)
+            except Exception:
+                pass
+        for resource in reversed(self.closeables):
+            try:
+                resource.close()  # type: ignore[attr-defined]
             except Exception:
                 pass
         for process_queue in reversed(self.queues):

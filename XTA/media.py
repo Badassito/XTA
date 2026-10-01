@@ -1191,6 +1191,11 @@ class LazyProcessingCube:
         with self._lock:
             arr = self._array
             self._array = None
+            # Completed rendering owners can retain the closed proxy in their
+            # scheduler/configuration records. It must not keep the decoded
+            # source mapped while Windows selected-run cleanup deletes it.
+            if not self._started or self._ready.is_set():
+                self.source = None
         if arr is not None:
             close_memmap_array(arr)
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 import operator
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Any, Callable, Mapping
 
 from .lta_sam import (
@@ -24,6 +24,25 @@ MASK_SEED_ANCHOR_IOU = 0.99
 MASK_SEED_EXACT_IOU = 0.999999
 MASK_SEED_MIN_EXCLUSIVE_FRACTION = 0.95
 _REMOVED_OBJECT_SCORE_LOGIT = -1e4
+
+
+@dataclass(frozen=True)
+class SamRawFrameObservation:
+    """A tracker observation before score filtering or publication cleanup.
+
+    A removal sentinel remains explicit bookkeeping rather than becoming a
+    probability or an invented empty mask. Detector confidence is deliberately
+    absent: injecting a mask does not make it a confidence-one annotation.
+    """
+
+    sequence_id: str
+    session_index: int
+    frame_index: int
+    object_id: int
+    binary_mask: Any
+    frame_tracker_score: float | None
+    status: str
+    detector_confidence: float | None = None
 
 
 def mask_metrics(expected: Any, actual: Any) -> dict[str, Any]:
@@ -227,6 +246,10 @@ def run_mask_seed_session(
     prediction_callback: Callable[[SamFramePrediction], None] | None = None,
     retain_predictions: bool = True,
     seed_roundtrip_policy: str = "exact",
+    raw_observation_callback: Callable[[SamRawFrameObservation], None] | None = None,
+    retain_raw_observations: bool = False,
+    feature_cache: Any | None = None,
+    cache_frame_identity: Callable[[int], object] | None = None,
 ) -> dict[str, Any]:
     resolved_empty_frame_limit = _resolve_empty_frame_limit(empty_frame_limit)
     direction = str(propagation_direction).strip().lower()
@@ -242,6 +265,18 @@ def run_mask_seed_session(
         raise TypeError("prediction_callback must be callable or None")
     if not isinstance(retain_predictions, bool):
         raise TypeError("retain_predictions must be a bool")
+    if raw_observation_callback is not None and not callable(raw_observation_callback):
+        raise TypeError("raw_observation_callback must be callable or None")
+    if not isinstance(retain_raw_observations, bool):
+        raise TypeError("retain_raw_observations must be a bool")
+    raw_requested = raw_observation_callback is not None or retain_raw_observations
+    if raw_requested and propagation_mode != "tracker-only":
+        raise ValueError("raw observations require tracker-only propagation")
+    if feature_cache is not None and (propagation_mode != 'tracker-only' or not callable(cache_frame_identity)):
+        raise ValueError('Shared feature reuse requires tracker-only propagation and exact frame identity')
+    feature_options = ({} if feature_cache is None else {
+        'feature_cache': feature_cache, 'cache_frame_identity': cache_frame_identity,
+    })
     confidence_threshold = float(conf)
     if not math.isfinite(confidence_threshold) or not 0.0 <= confidence_threshold <= 1.0:
         raise ValueError("conf must be finite and in [0,1]")
@@ -254,6 +289,24 @@ def run_mask_seed_session(
         TRACKER_FEATURE_AUDIT_KEY,
         prepare_tracker_frame_features,
     )
+
+    raw_shape = None
+    if raw_requested:
+        if not isinstance(resource, list) or len(resource) != int(session.frame_count):
+            raise ValueError("raw observation resource must contain every fixed session frame")
+        if not 0 <= int(prompt_frame) - int(session.frame_start) < int(session.frame_count):
+            raise ValueError("raw observation prompt lies outside the fixed session")
+        raw_shape = tuple(int(value) for value in np.asarray(ground_truth).shape)
+        if len(raw_shape) != 2 or any(value < 1 for value in raw_shape):
+            raise ValueError("raw observation seed must have nonempty HxW geometry")
+        for frame in resource:
+            frame_array = np.asarray(frame)
+            if frame_array.dtype != np.uint8 or tuple(frame_array.shape) != (*raw_shape, 3):
+                raise ValueError("raw observation RGB resource geometry differs from its seed")
+        if object_masks is not None and any(
+            tuple(np.asarray(mask).shape) != raw_shape for mask in object_masks
+        ):
+            raise ValueError("raw observation object masks differ from resource geometry")
 
     local_prompt = int(prompt_frame) - int(session.frame_start)
     started = measured.handle_request(
@@ -269,6 +322,9 @@ def run_mask_seed_session(
     stream = None
     predictions: list[SamFramePrediction] = []
     prediction_count = 0
+    raw_observations: list[SamRawFrameObservation] = []
+    raw_observation_count = 0
+    raw_callback_count = 0
     callback_prediction_count = 0
     active_frame_values: set[int] = set()
     anchor_masks_by_object: dict[int, Any] = {}
@@ -355,7 +411,8 @@ def run_mask_seed_session(
             if not callable(prepare_anchor):
                 raise RuntimeError("pinned SAM model exposes no shared anchor feature bridge")
             with torch.inference_mode():
-                prepare_tracker_frame_features(model, inference_state, local_prompt, reverse=False)
+                prepare_tracker_frame_features(model, inference_state, local_prompt, reverse=False,
+                                               **feature_options)
             expected_ids = tuple(range(len(object_masks)))
             mask_tensor = torch.from_numpy(
                 np.stack([np.asarray(mask, dtype=np.float32) for mask in object_masks])
@@ -551,6 +608,7 @@ def run_mask_seed_session(
                     with torch.inference_mode():
                         prepare_tracker_frame_features(
                             model, inference_state, requested_frame, reverse=reverse,
+                            **feature_options,
                         )
                         feature = inference_state["feature_cache"].get(requested_frame)
                         if feature is None:
@@ -613,6 +671,30 @@ def run_mask_seed_session(
                     for object_id, binary, tracker_score in zip(
                         expected_ids, frame_masks, tracker_scores
                     ):
+                        if raw_requested:
+                            if tuple(binary.shape) != raw_shape:
+                                raise RuntimeError(
+                                    f"raw tracker mask geometry {binary.shape} != {raw_shape}"
+                                )
+                            # The published LTA path owns a separate array so a
+                            # consumer cannot alter its integrity diagnostics.
+                            raw_binary = binary.copy()
+                            raw_binary.setflags(write=False)
+                            observation = SamRawFrameObservation(
+                                sequence_id=str(session.sequence_id),
+                                session_index=int(session.session_index),
+                                frame_index=int(session.frame_start) + local_frame,
+                                object_id=int(object_id),
+                                binary_mask=raw_binary,
+                                frame_tracker_score=tracker_score,
+                                status=("removed" if tracker_score is None else "observed"),
+                            )
+                            raw_observation_count += 1
+                            if retain_raw_observations:
+                                raw_observations.append(observation)
+                            if raw_observation_callback is not None:
+                                raw_observation_callback(observation)
+                                raw_callback_count += 1
                         if tracker_score is None:
                             continue
                         if tracker_score < confidence_threshold:
@@ -715,6 +797,7 @@ def run_mask_seed_session(
     except BaseException as exc:
         active_error = exc
         predictions.clear()
+        raw_observations.clear()
         anchor_masks_by_object.clear()
         raise
     finally:
@@ -863,6 +946,20 @@ def run_mask_seed_session(
         "propagation_prediction_count": prediction_count,
         "propagation_predictions_retained": retain_predictions,
         "propagation_callback_prediction_count": callback_prediction_count,
+        "raw_observations": tuple(sorted(
+            raw_observations, key=lambda item: (item.frame_index, item.object_id)
+        )),
+        "raw_observation_count": raw_observation_count,
+        "raw_observation_callback_count": raw_callback_count,
+        "raw_observations_retained": retain_raw_observations,
+        "raw_observation_boundary": (
+            "tracker video mask-logit > 0 before score filtering, clipping, or cleanup"
+            if raw_requested else None
+        ),
+        "raw_observation_complete": (
+            bool(not policy_zero_frames and raw_observation_count == len(expected) * len(expected_ids))
+            if raw_requested else None
+        ),
         "propagation_response_count": len(seen),
         "model_visited_frame_ranges": _global_half_open_ranges(
             seen, frame_start=int(session.frame_start)

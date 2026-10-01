@@ -74,7 +74,9 @@ def load_reconciliation_policy(settings: ReconciliationSettings) -> dict[str, An
             pass
     result = module.build_reconciliation()
     settings.assert_unchanged()
-    return validate_policy(result)
+    validated = validate_policy(result)
+    validated['proposal_policy_sha256'] = settings.sha256
+    return validated
 
 
 def validate_policy(value) -> dict[str, Any]:
@@ -85,7 +87,8 @@ def validate_policy(value) -> dict[str, Any]:
                     island_weight_min=.75, island_weight_max=1.25,
                     angular_tolerance_deg=1., anchor_confidence=.8, anchor_bonus=0.,
                     provenance_weights={'prediction': 1., 'bridge': .35, 'mixed': .5},
-                    decide=None)
+                    decide=None, select_proposals=None, proposal_api_version=1,
+                    sam_bridge_policy=None, proposal_policy_sha256='')
     unknown = set(value) - set(defaults)
     if unknown:
         raise ValueError(f'Unknown reconciliation policy fields: {sorted(unknown)}')
@@ -121,4 +124,13 @@ def validate_policy(value) -> dict[str, Any]:
     result['provenance_weights'] = weights
     if result['decide'] is not None and not callable(result['decide']):
         raise ValueError('decide must be callable or None')
+    if result['select_proposals'] is not None and not callable(result['select_proposals']):
+        raise ValueError('select_proposals must be callable or None')
+    if result['proposal_api_version'] != 1:
+        raise ValueError('proposal_api_version must be 1')
+    if result['sam_bridge_policy'] is not None:
+        from .sam_policy import resolve_sam_bridge_policy
+        resolve_sam_bridge_policy(result)
+    if not isinstance(result['proposal_policy_sha256'], str):
+        raise ValueError('proposal_policy_sha256 must be a string')
     return result

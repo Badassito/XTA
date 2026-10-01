@@ -109,6 +109,59 @@ RELEASES['23.0.5'] = dict(
         'tools/qualify_native_trt_lease.py',
     ),
 )
+RELEASES['24.0.0'] = dict(
+    token='24_0_0', previous_token='23_0_5',
+    feature='single-backend-sam-interpolation',
+    predecessor_inventory_path='release/_package_inventory.json',
+    validation_tools=RELEASES['23.0.5']['validation_tools'] + (
+        'tools/diagnose_sam_interpolation.py',
+        'tools/lta_dynamic_crop_diagnostic.py',
+        'tools/analyze_lta_dynamic_crop_diagnostic.py',
+        'tools/study_sam_fusion.py',
+        'tools/qualify_sdf_alignment.py',
+        'tools/prepare_sam_holdout.py',
+        'tools/heatsoak_sam_benchmark.py',
+        'tools/qualify_sam_feature_cache.py',
+        'tools/evaluate_sam_holdout.py',
+        'tools/audit_sam_context.py',
+        'tools/compare_sam_crop_strategies.py',
+        'tools/sam_crop_strategy_geometry.py',
+        'tools/report_sam_crop_strategies.py',
+        'tools/sam_crop_seed_diagnostics.py',
+        'tools/analyze_sam_crop_strategies.py',
+        'tools/sam_crop_quality.py',
+        'tools/prepare_sam_crop_two_tile.py',
+        'tools/compare_sam_crop_zoom.py',
+        'tools/qualify_sam_tiled_integration.py',
+    ),
+)
+SAM_INTERPOLATION_REASONS = {
+    '__init__': 'Publish the package release identity as {release}.',
+    'cli': 'Validate the selected TTA interpolation contract before importing detector runtimes.',
+    'config': 'Resolve separate detector/SAM model roles and devices, a single interpolation backend, and unchanged interpolation controls.',
+    'assembly': 'Route full-frame and consolidated tile interpolation through the selected generator while preserving the existing component gate.',
+    'pipeline': 'Own the selected SAM image/provider runtime and preserve resource admission and failure publication.',
+    'lta_worker_adapter': 'Expose raw masks before publication filtering for SAM proposal evidence.',
+    'lta_experimental': 'Retain raw independent endpoint-seeded tracker observations for SAM interpolation.',
+    'sam_bridge_planning': 'Plan bounded original-observation families with fixed context, acceptance, branch write domains, and explicit unresolved limits.',
+    'sam_tracker_runtime': 'Dispatch bounded independent endpoint jobs across admitted persistent SAM workers, retain exact cross-session features, and transfer attributable raw artifacts without dense queues.',
+    'sam_interpolation': 'Generate complete original-seeded whole or experimental tiled SAM proposals, retain halo/core ownership, select quality, and publish directional slots without SDF fallback.',
+    'sam_integration': 'Plan before image/model/GPU work, retain exact compact demanded canvas images, and admit SAM through role-aware GPU leases with verified residency retirement.',
+    'sam_evidence': 'Store and verify indexed raw/candidate masks, optional full tile halos and child identities/scores, and unknown core availability while preserving legacy whole evidence.',
+    'sam_policy': 'Preserve historical whole v2 and resolve explicit tiled v3 core/halo/availability quality with unchanged thresholds, bounded replay, and upstream dependency checks.',
+    'sam_filtering': 'Remove undersized full-raw SAM slice components before quality decisions and reproduce filtered selected masks from an immutable versioned receipt.',
+    'sam_replay': 'Export selected fixed proposals as bounded view-native directional NRRDs without loading model runtimes or claiming source-grid pipeline equivalence.',
+    'lta_config': 'Expose opt-in bounded dynamic LTA crop controls while retaining default tiled behavior.',
+    'lta_dynamic_crops': 'Plan deterministic full-seed native crops and explicit model transforms with bounded split and interior-guard geometry.',
+    'lta_dynamic_execution': 'Advance sealed predecessor crop batches with finite independent directional tracking and nonrecursive window patches.',
+    'lta_execution': 'Route opt-in dynamic LTA through the existing worker/publication ownership with explicit bounded crop receipts.',
+    'lta_runtime': 'Retain selected LTA crop identity and settings in immutable execution plans.',
+    'lta_feature_cache': 'Retain bounded exact frame features across independent tracker sessions with model/source/transform identity, shared tensor-storage accounting, and headroom admission.',
+    'sam_mask_reader': 'Reuse bounded immutable raw, filtered, and candidate masks within one verified proposal transaction without changing measurements or policy decisions.',
+    'sam_crop_tiling': 'Plan independent original-seeded 1008-side tracking tiles with 128 halos, fixed ownership, and explicit unavailable seed coverage on the existing working canvas.',
+    'reconciliation_policy': 'Add versioned proposal selection alongside existing source-slab policies.',
+    'reconciliation_runtime': 'Select SAM proposals before source-union reuse and retain separate voting provenance.',
+}
 REASONS = {
     '__init__': 'Publish the package release identity as {release}.',
     'cli': 'Use the sole {release} launcher and current release identity.',
@@ -393,9 +446,28 @@ REMOVED_STATEMENT_HASH_REASONS = {
         'Bind the required compiled run-adjacency kernels without optional import branching.',
 }
 TOOL_REASONS = {
-    'tools/compare_reconciliation.py': 'Compare persisted evidence with explicit native conversion, bounded readers and unchanged source artifacts.',
+    'tools/study_sam_fusion.py': 'Compare frozen fusion variants over retained selected SAM proposals without inference, separating development diagnostics from independently withheld labels.',
+    'tools/qualify_sdf_alignment.py': 'Evaluate predeclared SDF anchor/transport/area experiments without changing the production SDF generator or using labels before predictions are frozen.',
+    'tools/prepare_sam_holdout.py': 'Pre-register bounded detector-only interpolation cases and input identities before held-out annotations are opened.',
+    'tools/heatsoak_sam_benchmark.py': 'Reserve the local GPU and heatsoak CPU/GPU before scheduling sanity benchmarks, retaining thermal receipts without claiming target-system performance.',
+    'tools/qualify_sam_feature_cache.py': 'Run real-model cache/dispatch equivalence against fixed complete raw masks and scores with bounded warm local timing and explicit source identity.',
+    'tools/evaluate_sam_holdout.py': 'Freeze pre-registered retained-proposal fusion outputs before reading held-out labels and score matched no-interpolation, SAM, and SDF variants in the declared source coordinates.',
+    'tools/audit_sam_context.py': 'Audit original observation masks without labels to identify cases censored by artificial diagnostic ROI boundaries, preserving frozen candidate methods and production policy.',
+    'tools/compare_sam_crop_strategies.py': 'Run paired whole-native-crop resize and independent overlapping-tile SAM experiments on matched observed anchors without cross-tile propagation or production backend changes.',
+    'tools/sam_crop_strategy_geometry.py': 'Define deterministic research crop, model-canvas, and inverse-stitch geometry for paired resize and independent-tile strategies without using evaluation labels.',
+    'tools/report_sam_crop_strategies.py': 'Report matched paired crop-strategy outputs, held-out measurements, limitations, and reviewable overlays without presenting an experimental strategy as a production default.',
+    'tools/sam_crop_seed_diagnostics.py': 'Measure original native seed coverage and model-canvas seed survival for paired crop strategies without introducing missing seed support or changing model predictions.',
+    'tools/analyze_sam_crop_strategies.py': 'Analyze frozen paired crop-strategy outputs offline with matched geometry and explicit research limitations while preserving immutable observations and predictions.',
+    'tools/sam_crop_quality.py': 'Compute diagnostic eligibility for paired crop-strategy evidence without changing or claiming stock production v2 proposal acceptance.',
+    'tools/prepare_sam_crop_two_tile.py': 'Freeze the requested two 1260-by-659 native footprints from the existing family plan and original seeds without altering previous plans or production geometry.',
+    'tools/compare_sam_crop_zoom.py': 'Compare retained whole-crop, three-tile, and requested two-tile research evidence with overlap-safe recomposition and matched source/seed/context identities without new inference.',
+    'tools/qualify_sam_tiled_integration.py': 'Qualify the actual SAM assembly/runtime seam on a bounded native-source fixture under explicit GPU reservation while distinguishing it from ordinary CLI processing-cube behavior.',
+    'tools/analyze_lta_dynamic_crop_diagnostic.py': 'Verify completed native/scaled dynamic LTA output manifests and authoritative seed preservation, and render measured comparison overlays without model loading or independent quality claims.',
+    'tools/lta_dynamic_crop_diagnostic.py': 'Prepare bounded lossless real-data LTA fixtures and reproducible native/scaled dynamic crop commands; the caller owns GPU reservation and execution.',
+    'tools/diagnose_sam_interpolation.py': 'Run bounded detector-derived SDF/SAM comparisons, publish reviewable overlays, and retain exact evaluation commands without claiming independent label truth.',
+    'tools/compare_reconciliation.py': 'Compare persisted source evidence and fixed SAM proposals with bounded readers, dependency invalidation, and unchanged input artifacts.',
     'tools/qualify_tta_reconciliation.py': 'Qualify unchanged masks and complete source or native confidence across CPU, GPU and hybrid inference while isolating Ultralytics settings outside the repository.',
-    'tools/export_reconciliation_evidence.py': 'Explicitly export retained native confidence into a checked source-grid companion.',
+    'tools/export_reconciliation_evidence.py': 'Export retained confidence into a checked source-grid companion or copy a verified portable SAM proposal bundle without inference.',
     'tools/qualify_confidence_consolidation.py': 'Qualify consolidated native confidence against original pieces with exact score and known-support parity.',
     'tools/qualify_d1_confidence_bounds.py': 'Qualify cropped and dense confidence capture from the same real generic Radial prediction, preserving exact encoded score/index bytes and device source tensors.',
     'tools/analyze_pipeline_trace.py': 'Interpret bounded task traces with incomplete-capture warnings and GPU compute-credit timing that distinguishes prefetch and result-first ambiguity.',
@@ -556,18 +628,21 @@ def _update_verifier_pins(source, prefix, digest, pins, removals=None):
     return ''.join(lines)
 
 
-def prepare(*, output_dir, release='23.0.5', write=False):
+def prepare(*, output_dir, release='24.0.0', write=False):
     root, output_dir = ROOT, Path(output_dir).resolve()
     if output_dir.is_relative_to(root):
         raise ValueError('Generated release-review evidence belongs outside the repository')
     spec = RELEASES[release]
-    reasons = (TTA_PTA_THROUGHPUT_REASONS if release == '23.0.5' else
+    reasons = (SAM_INTERPOLATION_REASONS if release == '24.0.0' else
+               TTA_PTA_THROUGHPUT_REASONS if release == '23.0.5' else
                {} if release == '23.0.4' else
                {**REASONS, **(THROUGHPUT_REASONS if release == '22.3.2' else {}),
                 **(SEMANTIC_REASONS if release == '23.0.1' else {}),
                 **(PATCH_REASONS if release == '23.0.2' else {}),
                 **(TTA_THROUGHPUT_REASONS if release == '23.0.3' else {})})
-    fallback_reason = ('Record the reviewed v23.0.5 TTA/PTA throughput changes in this module.'
+    fallback_reason = ('Integrate bounded SAM interpolation, retained proposal evidence, or dynamic LTA crop support in this source module.'
+                       if release == '24.0.0' else
+                       'Record the reviewed v23.0.5 TTA/PTA throughput changes in this module.'
                        if release == '23.0.5' else
                        'Record the reviewed v23.0.4 cleanup and compiled CPU backend changes in this module.'
                        if release == '23.0.4' else
@@ -673,7 +748,7 @@ def prepare(*, output_dir, release='23.0.5', write=False):
     }
     original_digest = getattr(inventory, prefix + '_SHA256')
     original_pins = getattr(inventory, prefix + '_PREDECESSOR_MODULES')
-    pins_removals = release in ('23.0.4', '23.0.5')
+    pins_removals = release in ('23.0.4', '23.0.5', '24.0.0')
     original_removals = getattr(inventory, prefix + '_REMOVALS') if pins_removals else None
     try:
         setattr(inventory, prefix + '_SHA256', digest)
@@ -710,7 +785,7 @@ def prepare(*, output_dir, release='23.0.5', write=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--release', choices=tuple(RELEASES), default='23.0.5')
+    parser.add_argument('--release', choices=tuple(RELEASES), default='24.0.0')
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--write', action='store_true')
     args = parser.parse_args(argv)

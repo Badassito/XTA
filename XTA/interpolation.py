@@ -3422,6 +3422,27 @@ class NrrdLayerRef:
     # encode, no read-back). Only valid within the producing process; ``path`` is then a
     # never-created placeholder. compare=False keeps the frozen dataclass hashless-safe.
     live_array: Optional[np.ndarray] = field(default=None, compare=False, repr=False)
+    # Append additive fields to preserve the positional layout of legacy refs.
+    # SAM directions are increasing/decreasing VIEW-NATIVE frame index, separate
+    # from the historical SDF walk-back/candidate decomposition.
+    interpolation_backend: str = ''
+    interpolation_direction: str = ''
+    seed_detector_identity: str = ''
+    sam_bundle_identity: str = ''
+    interpolation_policy_identity: str = ''
+    interpolation_connectivity: int = 6
+    proposal_evidence_path: str = ''
+    proposal_selection_status: str = ''
+    sam_group_ids: Tuple[str, ...] = ()
+    sam_run_ids: Tuple[str, ...] = ()
+    observation_roots: Tuple[str, ...] = ()
+    gate_support_identity: str = ''
+    upstream_interpolation_policy_identity: str = ''
+    native_transform: Dict[str, object] = field(default_factory=dict, compare=False)
+    selected_bridge_connection_status: str = ''
+    # Source reconciliation and global cleanup are later transactions. Their
+    # result must never inherit the selected native proposal's topology claim.
+    final_connection_survival: str = 'not_assessed'
 
 @dataclass(frozen=True)
 class NrrdRasterPlan:

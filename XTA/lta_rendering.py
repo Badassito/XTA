@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import operator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional, Tuple
@@ -43,6 +44,10 @@ class LtaPhysicalViewCacheRef:
     identity_sha256: str
     size_bytes: int
     mtime_ns: int
+    # Optional compact SAM demand payload. Records are native frame index,
+    # Y0/X0/Y1/X1, then the byte offset of that frame's cropped uint8 raster.
+    # Ordinary LTA caches retain their full TYX storage and empty records.
+    frame_crops: Tuple[Tuple[int, int, int, int, int, int], ...] = ()
 
     def __post_init__(self) -> None:
         path = Path(self.path).resolve(strict=True)
@@ -53,8 +58,28 @@ class LtaPhysicalViewCacheRef:
             raise ValueError("physical-view caches must use uint8")
         if path.stat().st_size != int(self.size_bytes):
             raise ValueError("physical-view cache size changed before publication")
+        try:
+            records = tuple(tuple(operator.index(value) for value in record) for record in self.frame_crops)
+        except TypeError as error:
+            raise ValueError('compact frame cache coordinates must be integers') from error
+        if any(isinstance(value, (bool, np.bool_)) for record in self.frame_crops for value in record):
+            raise ValueError('compact frame cache coordinates must not be booleans')
+        expected_offset = 0
+        previous_frame = -1
+        for record in records:
+            if len(record) != 6:
+                raise ValueError('compact frame cache record must contain frame/bbox/offset')
+            frame, y0, x0, y1, x1, offset = record
+            if not (previous_frame < frame < shape[0] and 0 <= y0 < y1 <= shape[1]
+                    and 0 <= x0 < x1 <= shape[2] and offset == expected_offset):
+                raise ValueError('compact frame cache record is outside geometry or corrupt')
+            expected_offset += (y1-y0) * (x1-x0)
+            previous_frame = frame
+        if records and expected_offset != int(self.size_bytes):
+            raise ValueError('compact frame cache payload byte count differs from records')
         object.__setattr__(self, "path", path)
         object.__setattr__(self, "shape", shape)
+        object.__setattr__(self, 'frame_crops', records)
 
     def revalidate(self) -> None:
         stat = self.path.stat()
@@ -67,11 +92,11 @@ class LtaPhysicalViewCacheRef:
             self.path,
             dtype=np.uint8,
             mode=str(mode),
-            shape=self.shape,
+            shape=(self.size_bytes,) if self.frame_crops else self.shape,
         )
 
     def payload(self) -> dict[str, object]:
-        return {
+        payload = {
             "path": str(self.path),
             "shape": list(self.shape),
             "dtype": self.dtype,
@@ -80,6 +105,9 @@ class LtaPhysicalViewCacheRef:
             "size_bytes": self.size_bytes,
             "mtime_ns": self.mtime_ns,
         }
+        if self.frame_crops:
+            payload['frame_crops'] = [list(record) for record in self.frame_crops]
+        return payload
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "LtaPhysicalViewCacheRef":
@@ -91,6 +119,8 @@ class LtaPhysicalViewCacheRef:
             identity_sha256=str(payload["identity_sha256"]),
             size_bytes=int(payload["size_bytes"]),
             mtime_ns=int(payload["mtime_ns"]),
+            frame_crops=tuple(tuple(value for value in record)
+                for record in payload.get('frame_crops', ())),
         )
 
 
@@ -204,13 +234,21 @@ def render_native_tile_window(
     if not 0 <= x0 < x1 <= cache_ref.shape[2] or not 0 <= y0 < y1 <= cache_ref.shape[1]:
         raise ValueError("tile_xyxy is outside the physical-view cache")
     cache = cache_ref.open(mode="r")
-    return [
-        Image.fromarray(
-            implicit_rgb(np.ascontiguousarray(cache[index, y0:y1, x0:x1])),
-            mode="RGB",
-        )
-        for index in range(start, stop)
-    ]
+    records = {record[0]: record for record in cache_ref.frame_crops}
+    images = []
+    for index in range(start, stop):
+        if records:
+            if index not in records:
+                raise ValueError('SAM image cache does not contain a requested tracking frame')
+            _, cy0, cx0, cy1, cx1, offset = records[index]
+            if not (cx0 <= x0 < x1 <= cx1 and cy0 <= y0 < y1 <= cy1):
+                raise ValueError('SAM tracker crop exceeds its immutable image demand')
+            frame = cache[offset:offset+(cy1-cy0)*(cx1-cx0)].reshape(cy1-cy0, cx1-cx0)
+            crop = frame[y0-cy0:y1-cy0, x0-cx0:x1-cx0]
+        else:
+            crop = cache[index, y0:y1, x0:x1]
+        images.append(Image.fromarray(implicit_rgb(np.ascontiguousarray(crop)), mode='RGB'))
+    return images
 
 
 def union_tile_chunk_into_view(

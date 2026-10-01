@@ -230,6 +230,19 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         help="Planned structured Tilted view groups; production execution is not yet connected",
     )
     parser.add_argument(
+        "--lta_crop_backend", "--crop_backend", dest="lta_crop_backend",
+        choices=("tiled", "dynamic"), default="tiled",
+        help=("Crop geometry for native Transverse tracking. Dynamic follows sealed object batches "
+              "between windows and repairs interior-edge/split events with bounded patches; "
+              "it changes tracker context and output."),
+    )
+    parser.add_argument("--lta_crop_margin", type=int, default=96,
+                        help="Native pixel context margin used by dynamic crop planning")
+    parser.add_argument("--lta_crop_guard", type=int, default=24,
+                        help="Model-pixel interior-edge distance triggering a dynamic patch")
+    parser.add_argument("--lta_crop_max_scale", type=float, default=3.0,
+                        help="Maximum native dynamic crop side divided by 1008, in [1,3]")
+    parser.add_argument(
         "--enable_tile",
         nargs="+",
         default=None,
@@ -290,6 +303,12 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
 
 
 def resolve_lta_config(args: argparse.Namespace) -> LtaConfig:
+    from .lta_dynamic_crops import DynamicCropSettings
+    if getattr(args, "lta_crop_backend", "tiled") not in {"tiled", "dynamic"}:
+        raise ValueError("--lta_crop_backend must be tiled or dynamic")
+    DynamicCropSettings(margin=getattr(args, "lta_crop_margin", 96),
+                        guard=getattr(args, "lta_crop_guard", 24),
+                        max_scale=getattr(args, "lta_crop_max_scale", 3.0))
     workers_per_gpu = getattr(args, "lta_workers_per_gpu", 1)
     if type(workers_per_gpu) is not int or not 1 <= workers_per_gpu <= 4:
         raise ValueError("--lta_workers_per_gpu must be an integer in [1,4]")

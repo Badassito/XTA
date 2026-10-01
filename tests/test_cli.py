@@ -16,7 +16,7 @@ from XTA.unification.context import current_unified_launch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LAUNCHER = ROOT / "GPT-6-Astra-Ultra_v23.0.5_SLURM.py"
+LAUNCHER = ROOT / "GPT-6-Astra-Ultra_v24.0.0_SLURM.py"
 
 
 class CliTests(unittest.TestCase):
@@ -42,7 +42,7 @@ class CliTests(unittest.TestCase):
 
         completed = self.run_python(str(LAUNCHER), "--version")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("23.0.5", completed.stdout)
+        self.assertIn("24.0.0", completed.stdout)
 
         for mode in ("tta", "pta", "lta"):
             with self.subTest(mode_version=mode):
@@ -50,7 +50,7 @@ class CliTests(unittest.TestCase):
                     str(LAUNCHER), "--mode", mode, "--version"
                 )
                 self.assertEqual(completed.returncode, 0, completed.stdout)
-                self.assertIn("23.0.5", completed.stdout)
+                self.assertIn("24.0.0", completed.stdout)
 
         program = (
             "import sys; import XTA.cli; "
@@ -159,7 +159,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("--channel_format may be provided only once", stderr.getvalue())
 
     def test_tta_delegate_receives_sys_argv_without_mode(self) -> None:
-        arguments = ["--input", "input.mkv", "--model", "gpu:model.engine"]
+        arguments = ["--input", "input.mkv", "--model", "gpu:model.engine", "--device", "0"]
         parser = mock.Mock(spec=argparse.ArgumentParser)
         from XTA.config import build_argparser
         parser.parse_args.return_value = build_argparser().parse_args(arguments)

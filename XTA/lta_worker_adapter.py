@@ -15,7 +15,7 @@ import json
 import os
 import operator
 import time
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -107,7 +107,7 @@ def build_worker_predictor(config: Mapping[str, object]) -> LtaSamWorkerContext:
         async_loading_frames=bool(profile["async_loading_frames"]),
         conf=float(config.get("conf", 0.15)),
         weight_storage=str(profile["weight_storage"]),
-        max_num_objects=LTA_MAX_NUM_OBJECTS,
+        max_num_objects=int(config.get("max_num_objects", LTA_MAX_NUM_OBJECTS)),
         construction_device=str(profile["construction_device"]),
     )
     constrained = (
@@ -563,6 +563,12 @@ def _execute_worker_task_impl(
     output_dir.mkdir(parents=True, exist_ok=False)
     cache_ref = LtaPhysicalViewCacheRef.from_payload(payload["cache_ref"])  # type: ignore[arg-type]
     source_tile = _tile_from_payload(payload["tile"])  # type: ignore[arg-type]
+    crop_model_side = payload.get("crop_model_side")
+    if crop_model_side is not None:
+        if type(crop_model_side) is not int or crop_model_side != 1008:
+            raise ValueError("crop_model_side must be the qualified 1008-pixel SAM side")
+        from .lta_dynamic_crops import resize_crop_frame, resize_crop_mask
+    scaled_crop = crop_model_side is not None and source_tile.size != crop_model_side
     tile_index = int(payload["tile_index"])
     generation = int(payload.get("relay_generation", 0))
     relay_min_pixels = int(payload.get("relay_min_pixels", 16))
@@ -619,6 +625,7 @@ def _execute_worker_task_impl(
         outbound_dogfood: dict[int, list[object]] = {}
         observations: dict[tuple[str, int], dict[str, object]] = {}
         active_frames_by_lineage: dict[str, set[int]] = {}
+        crop_observation_scores: dict[str, float | None] = {}
         receipts: list[dict[str, object]] = []
         halted_branches: set[str] = set()
         tracker_session_index = 0
@@ -643,8 +650,12 @@ def _execute_worker_task_impl(
             # Partition on that same geometry so filling cannot introduce an
             # overlap conflict after the planning-time check.
             with trace.phase("seed_partition", work_id=str(payload["work_id"]), window_index=window_index):
+                model_seeds = tuple(
+                    replace(seed, mask=resize_crop_mask(seed.mask, side=crop_model_side))
+                    for seed in seeds
+                ) if scaled_crop else seeds
                 seed_partitions = partition_mask_seed_sessions(
-                    seeds,
+                    model_seeds,
                     mask_transform=fill_binary_mask_holes_2d,
                 )
             with trace.phase("render_window", work_id=str(payload["work_id"]), window_index=window_index):
@@ -654,6 +665,10 @@ def _execute_worker_task_impl(
                     frame_stop=window.frame_stop,
                     tile_xyxy=source_tile.xyxy,
                 )
+                if scaled_crop:
+                    from PIL import Image
+                    resource = [Image.fromarray(resize_crop_frame(frame, side=crop_model_side))
+                                for frame in resource]
             seed_by_lineage.update({seed.lineage: seed for seed in seeds})
             reduced_prediction_keys: set[tuple[str, int, int]] = set()
             owned_start, owned_stop = owned_frame_range(window)
@@ -664,6 +679,10 @@ def _execute_worker_task_impl(
 
             def reduce_prediction(item: Any) -> None:
                 prediction = item.prediction
+                if scaled_crop:
+                    prediction = replace(prediction, binary_mask=resize_crop_mask(
+                        prediction.binary_mask, side=source_tile.size, restore=True))
+                    item = replace(item, prediction=prediction)
                 key = (
                     str(item.lineage.token),
                     int(prediction.frame_index),
@@ -672,6 +691,8 @@ def _execute_worker_task_impl(
                 if key in reduced_prediction_keys:
                     raise RuntimeError(f"worker received duplicate streamed prediction {key}")
                 reduced_prediction_keys.add(key)
+                if crop_model_side is not None:
+                    crop_observation_scores[f"{item.lineage.token}|{prediction.frame_index}"] = prediction.frame_tracker_score
                 coverage.add_prediction(item.lineage, key[1], prediction.binary_mask)
                 if bool(np.asarray(prediction.binary_mask, dtype=np.bool_).any()):
                     active_frames_by_lineage.setdefault(key[0], set()).add(key[1])
@@ -773,6 +794,14 @@ def _execute_worker_task_impl(
                 # in this task has completed successfully.
                 _mark_completed_coverage(coverage, request=request, adapter_receipt=result.adapter_receipt)
                 for seed in result.dogfood_seeds:
+                    if scaled_crop:
+                        seed = replace(seed, mask=resize_crop_mask(
+                            seed.mask, side=source_tile.size, restore=True),
+                            source_receipt={**seed.source_receipt, "crop_transform": {
+                                "native_crop_xyxy": list(source_tile.xyxy),
+                                "model_shape_hw": [crop_model_side, crop_model_side],
+                                "mask_restore": "linear_threshold_128",
+                            }})
                     boundary_seeds.setdefault(seed.frame_index, tuple())
                     boundary_seeds[seed.frame_index] = (
                         *boundary_seeds[seed.frame_index],
@@ -880,6 +909,17 @@ def _execute_worker_task_impl(
         "cpu_budget": _jsonable(getattr(context, "cpu_budget", None)),
         "foreground_pixels": foreground_pixels,
     }
+    if crop_model_side is not None:
+        manifest["crop_observation_scores"] = crop_observation_scores
+        manifest["crop_transform"] = {
+            "native_crop_xyxy": list(source_tile.xyxy),
+            "model_shape_hw": [crop_model_side, crop_model_side],
+            "native_mask_shape_hw": [source_tile.size, source_tile.size],
+            "frame_resize": "area", "seed_resize": "area_threshold_128",
+            "prediction_restore": "linear_threshold_128",
+            "hole_fill_count_coordinates": "model",
+            "prediction_and_dogfood_coordinates": "native_crop",
+        }
     if window_task:
         manifest["window"] = _jsonable(asdict(windows[0]))
     from .lta_outputs import write_json_atomically

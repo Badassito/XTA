@@ -80,6 +80,7 @@ class GpuStageRetirementBarrierTests(unittest.TestCase):
             'scheduler_state': types.SimpleNamespace(gpu_worker_results_collected=collected,
                 gpu_worker_total_tasks=2, gpu_inference_drain_announced=True),
             'gpu_worker_process_active': True,
+            'sam_context': None,
             'scheduler': types.SimpleNamespace(request_gpu_inference_asset_release=request),
             '_restore_parent_post_inference_affinity': lambda: None,
             '_set_main_process_gpu_asset_retirement_pending': self.coordinator.set_inference_asset_retirement_pending,

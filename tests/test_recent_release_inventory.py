@@ -76,6 +76,15 @@ PENDING_V23_0_5 = Release(
 )
 if 'v23_0_5_release_review' in json.loads(inventory.MANIFEST.read_text(encoding='utf-8')):
     RELEASES += (PENDING_V23_0_5,)
+PENDING_V24_0_0 = Release(
+    'v24_0_0_release_review', '24.0.0', inventory.reviewed_v24_0_0_release_contract,
+    inventory.reviewed_v23_0_5_release_contract,
+    inventory.REVIEWED_V24_0_0_RELEASE_PREDECESSOR_SHA256,
+    inventory.REVIEWED_V23_0_5_RELEASE_SHA256,
+    inventory.REVIEWED_V24_0_0_RELEASE_PREDECESSOR_COMMIT,
+)
+if 'v24_0_0_release_review' in json.loads(inventory.MANIFEST.read_text(encoding='utf-8')):
+    RELEASES += (PENDING_V24_0_0,)
 
 
 def _digest(value):
@@ -89,7 +98,7 @@ def complete_manifest():
 
 def test_v23_0_5_predecessor_pin_is_the_tagged_v23_0_4_inventory(complete_manifest):
     predecessor = {key: value for key, value in complete_manifest.items()
-                   if key != 'v23_0_5_release_review'}
+                   if key not in ('v23_0_5_release_review', 'v24_0_0_release_review')}
     assert _digest(predecessor) == inventory.REVIEWED_V23_0_5_RELEASE_PREDECESSOR_SHA256
     assert PENDING_V23_0_5.predecessor_commit == '654e7c8572d925e00a1a597b780e34e224cd31c1'
 
@@ -157,6 +166,7 @@ def test_reauthenticated_review_cannot_change_independent_source_pin(complete_ma
         '23.0.3': 'REVIEWED_V23_0_3_RELEASE_SHA256',
         '23.0.4': 'REVIEWED_V23_0_4_RELEASE_SHA256',
         '23.0.5': 'REVIEWED_V23_0_5_RELEASE_SHA256',
+        '24.0.0': 'REVIEWED_V24_0_0_RELEASE_SHA256',
     }[release.number]
     with mock.patch.object(inventory, digest_name, _digest(review)):
         with pytest.raises(RuntimeError, match='source predecessor changed'):
@@ -276,6 +286,7 @@ def test_semantic_release_identifies_new_model_and_qualification_tools(complete_
 ])
 def test_retired_geometry_helper_keeps_authenticated_predecessor(complete_manifest, mutation, message):
     altered = copy.deepcopy(complete_manifest)
+    altered.pop('v24_0_0_release_review', None)
     altered.pop('v23_0_5_release_review', None)
     altered.pop('v23_0_4_release_review', None)
     altered.pop('v23_0_3_release_review', None)
@@ -296,6 +307,7 @@ def test_retired_geometry_helper_keeps_authenticated_predecessor(complete_manife
 
 def test_cleanup_retirements_require_independent_scope_and_exact_predecessor(complete_manifest):
     altered = copy.deepcopy(complete_manifest)
+    altered.pop('v24_0_0_release_review', None)
     altered.pop('v23_0_5_release_review', None)
     review = altered['v23_0_4_release_review']
     retired = review['removed_definitions'][0]

@@ -16,9 +16,9 @@ from XTA import cli, config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRENT_VERSION = "23.0.5"
-CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v23.0.5_SLURM.py"
-PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v23.0.4_SLURM.py"
+CURRENT_VERSION = "24.0.0"
+CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v24.0.0_SLURM.py"
+PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v23.0.5_SLURM.py"
 SCRATCH_REPORTS = (
     "TTA_EXTERNAL_AUGMENTATION.md",
     "TTA_TEST_CLI_AUDIT.md",
@@ -54,7 +54,7 @@ class PackageMetadataTests(unittest.TestCase):
     def test_runtime_version_constants_are_aligned(self) -> None:
         self.assertEqual(XTA.__version__, CURRENT_VERSION)
         self.assertEqual(config.SCRIPT_VERSION, CURRENT_VERSION)
-        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2405")
+        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2500")
         self.assertEqual(config.SCRIPT_BASENAME, CURRENT_LAUNCHER)
         self.assertEqual(cli.SCRIPT_VERSION, CURRENT_VERSION)
         self.assertEqual(cli.SCRIPT_BASENAME, CURRENT_LAUNCHER)
@@ -83,6 +83,10 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertIn('"XTA.examples.external_reconciliation" = ["README.md"]', package_data)
         self.assertIn(f'"{CURRENT_LAUNCHER}"', data_files)
         self.assertIn('"ARCHITECTURE.md"', data_files)
+        self.assertIn('"docs/sam_interpolation.md"', data_files)
+        self.assertIn('"docs/lta_dynamic_crops.md"', data_files)
+        self.assertIn('"tools/diagnose_sam_interpolation.py"', data_files)
+        self.assertIn('"tools/lta_dynamic_crop_diagnostic.py"', data_files)
         for report in SCRATCH_REPORTS:
             self.assertNotIn(report, data_files)
         self.assertIn('"tools/hgx_selftest.py"', data_files)
@@ -201,7 +205,7 @@ class PackageMetadataTests(unittest.TestCase):
                 self.assertEqual(manifest["source"], "working-tree-snapshot")
                 self.assertIn("release/_package_inventory.json", manifest["files"])
                 self.assertIn("release/README.md", manifest["files"])
-                for name in (CURRENT_LAUNCHER, "ARCHITECTURE.md", "docs/PRODUCTION_BACKENDS.md", ".gitattributes",
+                for name in (CURRENT_LAUNCHER, "ARCHITECTURE.md", "docs/PRODUCTION_BACKENDS.md", "docs/sam_interpolation.md", "docs/lta_dynamic_crops.md", ".gitattributes",
                              "tests/__init__.py", "tests/reference_backends/__init__.py",
                              "tests/reference_backends/spherical.py", "tests/reference_backends/interpolation.py",
                              "tests/reference_backends/radial.py", "tests/reference_backends/topology.py",
@@ -214,7 +218,8 @@ class PackageMetadataTests(unittest.TestCase):
                              "tools/qualify_pta_gpu_masks.py",
                              "tools/qualify_pta_gpu_render.py",
                              "tools/qualify_tta_reconciliation.py",
-                             "tools/export_reconciliation_evidence.py", "tools/qualify_d1_confidence_bounds.py"):
+                             "tools/export_reconciliation_evidence.py", "tools/qualify_d1_confidence_bounds.py",
+                             "tools/diagnose_sam_interpolation.py", "tools/lta_dynamic_crop_diagnostic.py"):
                     with self.subTest(member=name):
                         expected = (ROOT / name).read_bytes()
                         self.assertEqual(source.read(prefix + name), expected)

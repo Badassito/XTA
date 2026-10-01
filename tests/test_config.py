@@ -12,6 +12,8 @@ from XTA.config import (
     resolve_backend_models,
     resolve_backend_precisions,
     resolve_channel_format,
+    resolve_interpolation_settings,
+    resolve_sam_devices,
     resolve_save_request,
     resolve_tta_angles,
 )
@@ -60,6 +62,7 @@ class ConfigTests(unittest.TestCase):
             "--centerline_surface_points": ("0", "999"),
             "--centerline_timeout": ("0", "-0.01"),
             "--interpolation_distance": ("-1",),
+            "--sam_feature_cache_mib": ("-1", "1.5", "nan"),
             "--interpolation_walk_back": ("-1",),
             "--interpolation_candidates": ("-1", "0"),
             "--interpolation_passes": ("-1", "0"),
@@ -183,6 +186,150 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(precisions.cpu, "bf16")
         batches = resolve_backend_batches(["gpu:4", "cpu:2"], devices)
         self.assertEqual((batches.gpu, batches.cpu), (4, 2))
+
+    def test_model_roles_preserve_spaced_windows_paths_and_colons(self) -> None:
+        models = resolve_backend_models([
+            r'sam:C:\Model Bundles\sam:3.1',
+            r'cpu:C:\Detector Models\openvino',
+            r'gpu:C:\Detector Models\model.engine',
+        ])
+        self.assertEqual(models.sam, r'C:\Model Bundles\sam:3.1')
+        self.assertEqual(models.cpu, r'C:\Detector Models\openvino')
+        self.assertEqual(models.gpu, r'C:\Detector Models\model.engine')
+        self.assertEqual(
+            resolve_backend_models('gpu:"/models/detector with spaces.engine" sam:"/models/sam bundle"').sam,
+            '/models/sam bundle',
+        )
+
+    def test_malformed_duplicate_and_sam_only_model_roles_fail(self) -> None:
+        for entries in (
+            ['gpu:model.engine', 'sam:'],
+            ['gpu:model.engine', 'sam:a', 'sam:b'],
+            ['gpu:model.engine', 'tracker:a'],
+            ['gpu:model.engine', 'sam'],
+            ['sam:bundle'],
+        ):
+            with self.subTest(entries=entries), self.assertRaises(ValueError):
+                resolve_backend_models(entries)
+
+    def test_interpolation_backend_rejects_both_before_resolution(self) -> None:
+        parser = build_argparser()
+        self.assertEqual(parser.parse_args(self.REQUIRED).interpolation_backend, 'sdf')
+        for backend in ('both', 'auto', 'SAM'):
+            with self.subTest(backend=backend):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    parser.parse_args([*self.REQUIRED, '--interpolation_backend', backend])
+
+    def test_cpu_detector_can_select_gpu_sam_without_gpu_detector_artifact(self) -> None:
+        args = build_argparser().parse_args([
+            '--input', 'input.mkv', '--model', 'cpu:openvino', 'sam:bundle',
+            '--device', 'cpu', '--sam_device', '2,0', '--interpolation_backend', 'sam',
+        ])
+        models = resolve_backend_models(args.model)
+        devices = resolve_backend_devices(args.device)
+        settings = resolve_interpolation_settings(args, models, devices)
+        self.assertEqual(settings.backend, 'sam')
+        self.assertTrue(settings.enabled)
+        self.assertEqual(settings.sam_model, 'bundle')
+        self.assertEqual(settings.sam_devices, ('cuda:2', 'cuda:0'))
+        self.assertIsNone(models.gpu)
+        self.assertFalse(devices.gpu_devices)
+        self.assertTrue(devices.cpu)
+
+    def test_active_sam_requires_bundle_and_cuda_pool(self) -> None:
+        parser = build_argparser()
+        args = parser.parse_args([
+            *self.REQUIRED, '--interpolation_backend', 'sam', '--device', '0',
+        ])
+        with self.assertRaisesRegex(ValueError, 'requires a sam:PATH'):
+            resolve_interpolation_settings(
+                args, resolve_backend_models(args.model), resolve_backend_devices(args.device),
+            )
+        args = parser.parse_args([
+            '--input', 'input.mkv', '--model', 'cpu:openvino', 'sam:bundle',
+            '--device', 'cpu', '--interpolation_backend', 'sam',
+        ])
+        with self.assertRaisesRegex(ValueError, 'CPU-only detector requires --sam_device'):
+            resolve_interpolation_settings(
+                args, resolve_backend_models(args.model), resolve_backend_devices(args.device),
+            )
+
+    def test_sam_default_inherits_detector_cuda_and_override_stays_separate(self) -> None:
+        parser = build_argparser()
+        common = [
+            *self.REQUIRED, 'sam:bundle', '--device', '3,1', '--interpolation_backend', 'sam',
+        ]
+        for extra, expected in (([], ('cuda:3', 'cuda:1')), (['--sam_device', '0'], ('cuda:0',))):
+            args = parser.parse_args([*common, *extra])
+            devices = resolve_backend_devices(args.device)
+            settings = resolve_interpolation_settings(args, resolve_backend_models(args.model), devices)
+            self.assertEqual(settings.sam_devices, expected)
+            self.assertEqual(devices.gpu_devices, ('cuda:3', 'cuda:1'))
+
+    def test_disabled_sam_and_sdf_expose_no_sam_resources(self) -> None:
+        parser = build_argparser()
+        for extra, backend, enabled in (
+            (['--interpolation_backend', 'sam', '--interpolation_distance', '0'], 'sam', False),
+            ([], 'sdf', True),
+        ):
+            args = parser.parse_args([
+                '--input', 'input.mkv', '--model', 'cpu:openvino', '--device', 'cpu', *extra,
+            ])
+            settings = resolve_interpolation_settings(
+                args, resolve_backend_models(args.model), resolve_backend_devices(args.device),
+            )
+            self.assertEqual(settings.backend, backend)
+            self.assertEqual(settings.enabled, enabled)
+            self.assertIsNone(settings.sam_model)
+            self.assertFalse(settings.sam_devices)
+
+        args = parser.parse_args([
+            *self.REQUIRED, 'sam:nonexistent-unused-bundle', '--device', '0',
+            '--interpolation_backend', 'sam', '--interpolation_distance', '0',
+        ])
+        settings = resolve_interpolation_settings(
+            args, resolve_backend_models(args.model), resolve_backend_devices(args.device),
+        )
+        self.assertIsNone(settings.sam_model)
+
+    def test_sam_devices_reject_cpu_and_malformed_indexes(self) -> None:
+        self.assertEqual(resolve_sam_devices(['0,2', 'cuda:2', 'gpu:1']), ('cuda:0', 'cuda:2', 'cuda:1'))
+        for values in (None, [], ['cpu'], ['0:cpu'], ['-1'], ['1.5'], ['cuda:']):
+            with self.subTest(values=values), self.assertRaisesRegex(ValueError, '--sam_device'):
+                resolve_sam_devices(values)
+
+    def test_sam_feature_cache_limit_defaults_and_overrides_are_operational_only(self) -> None:
+        parser = build_argparser()
+        self.assertEqual(parser.parse_args(self.REQUIRED).sam_feature_cache_mib, 512)
+        for budget in (0, 192, 512, 2048):
+            args = parser.parse_args([
+                *self.REQUIRED, 'sam:bundle', '--device', '0', '--interpolation_backend', 'sam',
+                '--sam_feature_cache_mib', str(budget),
+            ])
+            settings = resolve_interpolation_settings(
+                args, resolve_backend_models(args.model), resolve_backend_devices(args.device),
+            )
+            self.assertEqual(settings.sam_feature_cache_mib, budget)
+            self.assertEqual((settings.backend, settings.enabled, settings.sam_model, settings.sam_devices),
+                             ('sam', True, 'bundle', ('cuda:0',)))
+            self.assertEqual((args.interpolation_distance, args.interpolation_candidates,
+                              args.interpolation_walk_back, args.interpolation_passes,
+                              args.interpolation_min_radius, args.interpolation_search_angle),
+                             (15, 1, 1, 1, 3, 15.0))
+
+    def test_inactive_sam_retains_cache_configuration_without_resources(self) -> None:
+        args = build_argparser().parse_args([
+            '--input', 'input.mkv', '--model', 'cpu:detector', '--device', 'cpu',
+            '--interpolation_backend', 'sam', '--interpolation_distance', '0',
+            '--sam_feature_cache_mib', '2048',
+        ])
+        settings = resolve_interpolation_settings(
+            args, resolve_backend_models(args.model), resolve_backend_devices(args.device),
+        )
+        self.assertEqual(settings.sam_feature_cache_mib, 2048)
+        self.assertFalse(settings.enabled)
+        self.assertIsNone(settings.sam_model)
+        self.assertEqual(settings.sam_devices, ())
 
     def test_unselected_backend_settings_fail_instead_of_being_discarded(self) -> None:
         cpu_only = resolve_backend_devices(["cpu"])

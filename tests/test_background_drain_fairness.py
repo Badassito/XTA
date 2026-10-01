@@ -166,6 +166,7 @@ def test_real_pipeline_background_checkpoint_refills_four_workers_before_next_ou
                              interpolation_stats keep_temp_artifacts native_view_support_by_model
                              nrrd_layer_refs parent_bridge_ready parent_bridge_support_by_model
                              parent_mask_support_by_model physical_view_dense_handoff_credit
+                             sam_context sam_gate_lineage_by_parent
                              physical_view_finalization_refs tile_accumulator_by_set
                              tile_accumulator_paths tile_consolidation_completed
                              tile_expected_by_parent tile_parent_bridge_accumulator_by_set
