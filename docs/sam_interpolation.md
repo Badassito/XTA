@@ -5,18 +5,36 @@ Choose one backend for a run. `sam` uses the local mask-conditioned LTA tracker
 to propose image-guided additions between detector observations. A rejected SAM
 proposal receives no SDF fallback. `both` is rejected during argument parsing.
 
-The initial SAM scope is native Transverse at angle zero, for full-frame and
-consolidated tile observations. Unsupported requested views, tilts, or wrapping
-are errors. SDF retains its existing view support, iterative passes, and layer
+The tagged v25.0.0 release is immutable. The post-tag notes below describe the
+uncommitted development tree, whose package/launcher version still reads
+25.0.0. Its source review and snapshot qualification are separate from the
+released receipt; see [the development audit workflow](../release/README.md).
+
+The current development SAM path supports all existing TTA view families:
+Transverse, Sagittal and Coronal, their tilted variants, Azimuthal views,
+Radial shells, and Spherical patches. This applies to full-frame and consolidated
+tile observations. Detector angle augmentation is inverted before accumulation,
+so SAM uses the canonical angle-zero canvas and retains the original detector
+angle as provenance. LTA remains Transverse-only; sharing its tracker does not
+extend LTA's supported views. SDF retains its existing iterative passes and layer
 decomposition. `--interpolation_distance 0` disables either configured backend
 and avoids initializing unused SAM assets.
 
-Here, native Transverse means the active detector/working-view canvas. It
+Here, a native view means the active detector/working-view canvas. It
 includes TTA's existing processing-volume transform, including any stack
 resampling performed during canonical volume preparation. Its frame index need
 not equal a raw input-video slice index. SAM renders and tracks that exact
 detector canvas, as SDF bridges do; scope metadata preserves native processing
 frame addresses and the `native_transform` back to the source grid.
+
+Only Azimuthal frame order wraps. At the half-turn seam, aliased frames reflect
+the column coordinate. The compact `xta.sam_cyclic_view_frames/1` recipe retains
+unfolded addresses for generation and local selection; directional publication
+folds them back to native frame addresses before the existing TTA categorical
+source projector runs. Cartesian and tilted-Cartesian stacks, and Radial or
+Spherical radius-frame order, remain clamped. There is no new fusion across
+radial arcs or spherical patches. These routes have focused CPU geometry tests;
+they do not constitute full GPU or cluster qualification for every orientation.
 
 ## Experimental SAM tracking crop mode
 
@@ -61,13 +79,13 @@ The assembled parent run contains fixed owned-core support. Its aggregate
 tracker probability is undefined; retain and inspect the individual child
 scores instead of inventing one probability or detector confidence.
 
-Whole tracking and historical bundles without a mode use conservative v2.
-Tiled tracking uses the explicit conservative v3 contract with the same numeric
-thresholds and component-radius filter. Endpoint, family, and topology decisions
-use filtered owned-core support. A separately filtered full native union of that
-original seed's tile halos supplies an additional containment veto. That halo
-union is quality evidence and never output support, so a discarded halo cannot
-hide a leak. Explicit v2 settings cannot select tiled evidence.
+The current development defaults are whole-policy v4 and tiled-policy v5,
+which run the ordinary conservative checks first and then the guarded selection
+stage described below. Explicit whole v2 and tiled v3 retain strict legacy
+behavior. Endpoint, family, and topology decisions use filtered owned-core
+support. A separately filtered full union of that original seed's tile halos
+remains quality evidence, never output support; discarded halos cannot hide
+spill from either stage. Whole-policy versions cannot select tiled evidence.
 
 Changing this mode changes the generation attempt. Fixed-evidence policy replay
 does not generate the other mode's predictions. The mode adds no different
@@ -123,6 +141,26 @@ asset-retirement acknowledgement. A CPU detector route or an entirely separate
 SAM device pool can acquire its devices independently. Failed retirement or
 unreleased model residency must not advertise a shared device as available.
 
+For shared detector/SAM devices, completed full-frame parents can be checkpointed
+before preparation waits on that retirement signal. The scheduler closes their
+original dense mappings and returns their backing credit, allowing the remaining
+detector views to finish. It then resumes preparation under the resolved dense
+limit and the existing transient admission rules. Tile detector cleanup can
+publish compact results while its parent support is deferred. A checkpoint is
+not a completed parent, a published bridge, or permission to start SAM early.
+
+Suitable owned regular disk mappings are reused without a full copy. Anonymous
+or memory-backed masks and confidence arrays are copied with bounded streaming
+I/O, preserving their shape, dtype and exact values. Deferred D1 shadows remain
+compact. Checkpoints use disk-backed run scratch, or the run output directory
+when scratch is memory-backed; shared-device staging requires at least one of
+those locations to be disk-backed. With retained temporary artifacts, the disk
+checkpoint takes ownership of the debug copy when a memory-backed input retires.
+The `sam_interpolation.parent_staging` telemetry records parent counts, actual
+copied bytes, reused disk bytes and I/O time. Cluster runs should inspect these
+costs alongside inference time; local CPU qualification does not establish their
+production throughput.
+
 Each admitted SAM device owns one isolated persistent predictor and at most one
 endpoint job at a time. A free worker takes the next bounded job. GPU/result
 consumption for different scopes is serialized by its owner, while their CPU
@@ -131,18 +169,43 @@ stable run IDs, lineage, selection, and directional pixels despite out-of-order
 worker completion. Packed bundle offsets, checksums, and timings can differ
 between fresh generation attempts.
 
-Multiple devices interleave distinct crop queues and prefer a crop's previous
-worker while lending idle workers to other crops. Completed masks are packed
-and released promptly. Single-device requests retain grouped order. These
-scheduler limits add no CLI or environment switch. No-op or reject-all scopes
-retain the original volume and empty directional slots without allocating a
-dense merged workspace.
+Automatic whole-crop generation prefers family FIFO when the runtime supports
+its family API, subject to the balance guard below. One family stays on one device through independently seeded runs,
+allowing exact feature reuse; a ready worker takes the next family immediately.
+The final family tail can leave other workers idle. Capacity follows the actual
+admitted devices and CPU wave, with no artificial four-device cap. Each endpoint
+still starts its own tracker session; cache/model/quality settings are unchanged.
+
+Automatic selection compares flat-job and FIFO-family frame-work spans using a
+greedy minimum-heap assignment to the actual admitted slots. It falls back to
+flat when `family_span * 4 > flat_span * 5`; this is a load-balance proxy, not a
+runtime prediction. Explicit selectors bypass this guard. A small job count
+alone is not an automatic fallback criterion.
+
+`YOLO_TTA_SAM_FAMILY_SCHEDULE=flat` restores the prior crop-queue order. Values
+`flat` and `fifo` are stripped and lowercased; empty/unknown values fail. An unset
+selector automatically falls back to flat for older/custom runtimes lacking
+callable family dispatch, recording `runtime_without_family_dispatch`. Explicit
+FIFO for whole-crop tracker work requires that API and fails clearly if absent.
+Tiled generation remains flat, recording `tiled_generation_uses_flat_dispatch`.
+Flat dispatch continues crop affinity and lending idle workers between crops.
+
+Receipts retain original input indices, requested/effective/explicit scheduling,
+fallback reason, device/worker identities, effective in-flight count and execution/
+family completion order. Changed completion order does not change run IDs or
+selection. Completed masks are packed and released promptly. No-op or reject-all
+scopes retain the original volume and empty directional slots without allocating
+a dense merged workspace. There is no new command-line flag.
 
 The image provider pins the exact detector canvas. It aliases verified canonical
-native backing when available; otherwise it materializes only the requested
-frame/crop rectangles in a compact immutable cache. An unused lazy processing
-cube is not built merely to supply SAM frames. Reduced square canvases retain
-their existing affine and stack-resampling semantics.
+Transverse backing when available; otherwise the established TTA grayscale
+sampler renders the requested frame/crop rectangles into an immutable compact
+cache. Generic views can require one shared processing-volume memmap
+materialization, reused across their demands. The decoded-slice shortcut remains
+limited to Transverse. Identical demands or covered subsets reuse saved pixels;
+overlapping demands render only missing pixels. Empty plans still cause no
+materialization. Reduced square canvases retain their existing affine and
+stack-resampling semantics.
 
 ## Bounded reuse and resource controls
 
@@ -154,6 +217,7 @@ state between independent endpoint sessions or relax proposal quality.
 | `YOLO_TTA_SAM_IMAGE_CACHE_MAX_BYTES` | 1 GiB | Each immutable image-demand cache; not a total process budget. Aliased canonical backing adds no cache storage |
 | `YOLO_TTA_SAM_RENDER_MAX_BYTES` | 256 MiB | Exact native rendering intermediates |
 | `--sam_feature_cache_mib` | `512` MiB | Requested retained feature budget per admitted predictor; zero disables retention |
+| `YOLO_TTA_SAM_FAMILY_SCHEDULE` | Automatic whole-crop scheduling | Balanced supported FIFO, otherwise recorded flat fallback; explicit `flat` backout or `fifo`; tiled stays flat |
 | Proposal reader `max_cache_bytes` Python argument | 32 MiB | One evidence-reader transaction; zero disables retention |
 
 Feature-cache admission reserves CUDA headroom: by default the larger of 2 GiB
@@ -181,8 +245,60 @@ integrity checks preserve source/payload identity. Cache statistics distinguish
 hits, decoding, filtering, evictions, peak bytes, and completed transactions;
 retention is released when the owner closes.
 
+The existing interpolation worker hint also reaches stock proposal measurement.
+Parallel intrinsic measurements require authenticated live extra parent credit;
+without that credit, or with a custom proposal hook, evaluation remains serial.
+Within the current family, each lane owns its cache/cursor over shared immutable
+metadata and one outer integrity transaction. Conservative charges include plane,
+diagnostic, cache and control buffers, and pending work is bounded by the worker
+hint. All lanes join and retire their caches before the unchanged ordered stock,
+topology, joint, rescue or custom-hook decisions. Operational receipts under
+`selection_resources.intrinsic_measurements` record admitted credit, pending work,
+serial reasons, task/reader counters and measurement time. This concurrency does
+not change quality thresholds or deterministic selection order.
+
+Empty supporting regions skip mask reads. Group dilation evaluates foreground
+plus a one-voxel halo, and edge connected-component work crops only known zero
+margins before translating coordinates back. Component IDs remain identical for
+the supported 6/18/26 connectivity choices. These shortcuts preserve the original
+full-shape admission and caps; a smaller numerical crop does not admit an
+otherwise refused family or change its declared geometry.
+
 Performance receipts measure these paths separately. Local machine results are
 sanity checks for the exercised workload, not target-system throughput claims.
+For a cluster check, inspect runtime telemetry under `sam_interpolation.runtime`:
+`image_cache_hits`, `image_cache_superset_hits`, and `image_cache_reused_pixels`
+distinguish demand/pixel reuse; `source_materializations` and
+`source_materialization_seconds` record shared processing-volume construction.
+Read these alongside `rendered_frames`, `rendered_pixels`,
+`image_cache_payload_bytes`, `image_render_seconds`, predictor startup, and
+detector-retirement wait time. `rendered_frames` counts missing-rectangle sampler
+calls, so an expanded frame with several uncovered strips can count more than
+once; `rendered_pixels` counts newly rendered pixels and
+`image_cache_reused_pixels` counts copied cache intersections. Counters absent
+from older or injected contexts are null, not measured zero.
+`native_sampling_calls` and `native_sampling_pixels` expose native-plane
+derivation separately from returned crop pixels. Missing strips share the
+transaction's native plane. `canonical_sampling_pixels` includes the bounded
+alignment columns required to reproduce the installed OpenCV backend's global
+interpolation phase. Crops use the original canonical grid, rather than a
+rebased float32 affine, so cache contents do not depend on demand order.
+The provider runs a small synthetic phase check once per rendering helper and
+active OpenCV backend before a transformed cache is published or SAM is admitted.
+Its largest synthetic canvas is 1535 by 73 pixels; it does not use real images
+or render a full real canonical view. Unsupported numerical behavior fails
+closed with a compatibility error. Exact source-backing reuse needs no check.
+The receipt is exposed as `sam_canonical_phase_self_check` in pass statistics
+and `canonical_phase_self_check` in runtime telemetry. OpenCV 4 and other builds
+still need their own cluster validation; local OpenCV 5 tests do not establish
+their behavior. A quick CPU precheck on each cluster environment is:
+
+```sh
+python -c "from XTA.sam_canvas_rendering import ensure_canonical_phase_supported; print(ensure_canonical_phase_supported()['status'])"
+```
+
+Model feature-cache/dispatch counters are separate
+from image rendering reuse.
 
 ## Existing interpolation controls
 
@@ -214,15 +330,40 @@ A bounded family group can contain multiple observed daughter endpoints and
 relevant continuations, including siblings that need no repair.
 
 The planner bounds each group to 64 endpoints, 512 observations, 128 edges,
-128 frames, and 4,194,304 crop pixels. Declared mask contracts are limited to
-256 MiB per group and 512 MiB across a plan. Reaching a limit records an
-incomplete or unresolved family instead of silently omitting a sibling.
+and 4,194,304 crop pixels. Production planning retains immutable family recipes
+and materializes one family's contracts at a time. The resident-memory limit
+therefore controls simultaneous storage, rather than permanently excluding
+later families after earlier families consume a cumulative allowance. Explicit
+eager/research calls retain their declared memory limits; baseline limits are
+256 MiB per group and 512 MiB for retained contracts. A genuine per-family or
+structural refusal remains explicit instead of silently omitting a sibling.
 Physical spacing participates in geometric search; crop coordinates remain
 view-native pixels.
-The planner's group frame cap is not a tracker-session allowance. Each actual
-SAM run must fit the runtime's 30-frame maximum, including its seed and terminal
-observations. Structural validation enforces that limit before expensive work;
-a larger planning inventory does not authorize longer tracking.
+
+TTA interpolation has no fixed 30-frame session ceiling or default 128-frame
+family ceiling. A distance of 30 can require 31 endpoint-inclusive frames, and
+walk-back can require more. `SamInterpolationSessionPlan` preserves every
+requested frame and the original-seeded history; it does not split, reseed or
+silently truncate a long session. LTA's separate `SamSessionPlan` still admits
+at most 30 frames. An explicitly supplied planner frame bound remains enforced.
+Known CPU input/output buffers are checked before staging and again in the
+worker against its admitted byte budget. GPU model and tracker history memory
+are separate; a backend memory failure remains an explicit failure.
+
+Production can admit larger families through a live memory profile. Additional
+SAM credit, up to 16 GiB, is reserved atomically with the parent's existing
+transient work and constrained by physical/cgroup/SLURM headroom and the current
+pool capacity. Pool capacity or swap alone cannot authorize the increase.
+Insufficient credit retains the lower declared bounds. Contract construction
+and policy topology use the credit in separate phases, and the resolved limits
+are recorded with the plan and selection. Serialized profile metadata does not
+authorize a replay allocation: replay must obtain its own live credit.
+The host input/output allowance also limits simultaneous tracker jobs. Dispatch
+uses the planned session sizes and transfer overhead; it can reduce concurrency
+or wait for the previous result to be consumed before refilling a worker. It
+does not shorten the requested session. Summaries report planned/refused family
+counts and reasons, endpoint-inclusive session lengths, assigned and effective
+planning budgets, and the resulting in-flight limit.
 
 Each group fixes a context rectangle for its whole tracking interval, a tighter
 acceptance region for measurements, and a branch-specific write region for
@@ -287,7 +428,8 @@ endpoint agreement, and family agreement are separate measurements. Later
 source reconciliation and global cleanup may remove selected bridge support;
 selected-bridge connectivity and final connection survival are separate facts.
 The final connection audit currently certifies only a verified identity
-Transverse mapping. Resampled scopes report connectivity as unassessed while
+Transverse mapping. Resampled and other transformed scopes report final
+connectivity as `not_assessed` while
 still measuring retained/removed bridge voxels; voxel survival alone does not
 establish a connected final repair.
 
@@ -310,12 +452,20 @@ All three use source union. They differ in conservative SAM quality,
 strict independent family agreement, or the explicit permissive raw-candidate
 ablation. Omitting `--reconciliation` still uses stock conservative SAM quality.
 
-For whole mode, the stock `sam_conservative_v2` policy first applies `--interpolation_min_radius` to each full
+The ordinary conservative stage first applies `--interpolation_min_radius` to each full
 crop-space prediction. It labels 8-connected 2D foreground components and
 removes an entire component when its maximum inscribed radius is at or below
 the threshold. It does not erode a healthy component's outline, remove its thin
 extensions, fill holes, or select only the largest component. A value of zero
 disables this filter.
+
+Radius computation preserves the same 8-connected component IDs and full-canvas
+EDT maxima while restricting work to exact component bounding regions and using
+exact rectangle maxima where applicable. If the summed component bounding areas
+would exceed the full plane, it uses one full-plane EDT with a compiled linear
+maximum reduction. Original canvas boundaries and foreground values remain part
+of the radius contract; the optimization does not insert artificial background,
+change the threshold comparison, or alter the filtered mask.
 
 Filtering precedes acceptance-region and write-region clipping. A removed dot
 outside either region remains visible in the raw diagnostics but cannot reject
@@ -367,11 +517,11 @@ retaining structural validity. Label such
 results as permissive candidates; they do not become stock-selected repairs.
 The unchanged parent bridge tile gate still applies to their resulting support.
 
-Quality policy version 2 records the exact component filter in each selection
+Quality policy versions 2 through 5 record the exact component filter in each selection
 receipt. Online output, directional replay, previews and connection-survival
 checks reconstruct the same filtered contributors. Older selection receipts
 without a `mask_filter` retain their original unfiltered interpretation;
-reselecting their immutable raw evidence with version 2 creates a new receipt.
+reselecting their immutable raw evidence creates a new versioned receipt.
 The proposal callback interface remains `proposal_api_version=1`. Explicit
 version-1 quality settings are rejected rather than silently reinterpreted.
 
@@ -383,6 +533,116 @@ bundle or add a second command-line radius control. Setting
 `enforce_interpolation_min_radius=False` disables filtering, as used by the
 raw-candidate ablation.
 
+### Guarded rescue in the current development tree
+
+Active SAM now resolves stock whole mode to
+`sam_conservative_guarded_rescue_v4` and stock tiled mode to
+`sam_conservative_tiled_guarded_rescue_v5`. Deploy the audited guarded-rescue
+development tree/archive on the cluster; the existing SAM command and crop-mode
+setting then activate the matching default. There is no new public
+`--interpolation_*` flag. Package version `25.0.0` alone does not identify this
+post-tag patch; verify the source audit and resolved policy identity.
+
+This is a second **selection** stage over existing complete raw evidence, not
+another interpolation pass or a new model run. Ordinary stock selections are
+kept first and cannot be displaced. Only previously unselected, complete
+families with containment-only candidate rejection can enter rescue. Missing
+observations, unavailable required tile cores, invalid transfers, incomplete
+family inventories, and other safety rejections remain ineligible.
+
+This initial rescue implementation supports **exactly one requested edge per
+group**. Multi-edge groups are excluded with
+`rescue_multibranch_attribution_not_supported`; the exclusion cannot be
+overridden by policy thresholds. Ordinary stock decisions for multi-edge groups
+remain unchanged. Rescue does not salvage individual branches or partition
+branch ownership.
+
+Both directions of the single requested edge need independently original-seeded
+support over every interior slice of its declared write domain. Empty or unknown
+coverage is not agreement. The stronger rescue gates are:
+
+| Rescue measurement | Default requirement |
+| --- | --- |
+| Held-out endpoint recall | At least 0.90 |
+| Endpoint excess in its evaluation region | At most 0.10 |
+| Endpoint excess over the full context against original known family support | At most 0.10; also checked on full halos for tiled runs |
+| Independent forward/backward agreement for the single edge | Aggregate IoU at least 0.95 and every compatible interior-slice IoU at least 0.90 |
+| Independent connection support | Each direction must separately connect the original endpoints through the fixed local contract and attachments; agreement of large masks alone is insufficient |
+| Each anchored component's outside/inside acceptance ratio | At most 0.05; detached components fail except for the bounded nonwriting allowance below |
+| Maximum distance outside acceptance | At most 64 working-canvas pixels |
+| Relevant local acceptance-boundary occupancy | At most 0.25 of the predeclared relevant acceptance-component boundary within the owned branch/original-family acceptance-margin neighborhood; the prediction's bounding box does not set this denominator |
+| Allowed outer-context contact | Observed-family long-axis sides only, with original endpoint, evaluation, and write domains clear of every crop edge by 16 pixels |
+
+Short-axis or ambiguous-axis crop contact fails. A working-canvas edge does not
+prove a physical camera boundary. Crop-edge allowance never widens acceptance
+or the write domain. Rescue still requires the requested local connection,
+rejects unintended observed attachments, and rejects conflicts with previously
+selected groups. Tiled runs check both owned cores and the separately filtered
+full raw-halo union. Their raw halos are never published as additions.
+
+A wholly outside, unanchored component can receive a bounded **nonwriting**
+allowance. Each plane permits at most eight such fragments, each at most
+512 pixels, with a combined area at most 1024 pixels **and** 0.2% of the
+anchored foreground inside acceptance. Every fragment must stay within
+64 working-canvas pixels of acceptance, avoid all crop edges, and have no
+one-pixel contact with the write domain, endpoint evaluation regions,
+or original observed references on the same frame. A larger, distant, crop-censored, protected,
+or partly inside-acceptance detached component still fails. These fragments
+cannot contribute published additions because they lie outside the protected
+write domain. Their raw masks and full halos remain inspectable; this quality
+allowance does not lower or replace the component-radius filter.
+
+The original component-radius filter, write region, coverage rules and topology
+checks are unchanged. Without additional live resource credit, each rescue
+plane retains its 128 MiB workspace bound. An admitted production profile can
+provide a larger workspace, recorded separately from the quality thresholds.
+Planes are conservatively charged at 64 bytes per plane pixel within that
+budget, with at most 256 support
+or acceptance components; further scan limits can refuse evaluation. A group
+refused before generation has no complete raw evidence to rescue. The patch
+therefore does not promise to recover memory-refused groups or qualify a full
+cluster workload.
+
+For a strict comparator using the current policy identity, an external source
+policy can disable only the additional stage:
+
+```python
+def build_reconciliation():
+    return {
+        "name": "stock_without_guarded_rescue",
+        "mode": "union",
+        "sam_bridge_policy": {"guarded_rescue": False},
+    }
+```
+
+Explicit `sam_bridge_policy={"version": 2}` selects legacy strict whole policy;
+`{"version": 3}` selects legacy strict tiled policy. Automatic rescue does not
+run for a custom `select_proposals` hook or a permissive raw-candidate policy.
+
+Inspect `selection.json` under the scope output. Its `guarded_rescue` entry uses
+`xta.sam_guarded_rescue/1` and records `quality_version`, `enabled`,
+`attempted_group_count`, `rescued_group_ids`, `rescued_run_ids`,
+`rejected_group_count`, `stock_selected_group_ids`, and
+`stock_selected_run_ids`. Per-group and per-run entries preserve `stock_status`
+and `stock_reasons`; a successful addition uses `guarded_rescue_selected`.
+Endpoint, edge-agreement, spill, protected-domain, topology, and conflict reasons
+remain inspectable. `generation.json` records `sam_policy_name`,
+`sam_policy_version`, and the complete `sam_guarded_rescue` summary. The SAM
+console line exposes `rescue_enabled`, `rescued_groups`, `rescued_runs`, and
+`policy_version`, allowing the active cluster policy to be checked directly.
+Spill-plane receipts include `nonwriting_satellites`, their counts/area and
+anchored-inside denominator. Allowed fragments use
+`bounded_nonwriting_satellite_allowed`; aggregate budget failure reports
+`rescue_nonwriting_satellite_plane_budget`.
+`independent_direction_topology` records the separate directional connection
+checks; a failure reports `rescue_independent_direction_local_connection`.
+
+Previously saved selection receipts keep their recorded versions and selected
+contributors. Applying current stock selection to their immutable raw bundle
+creates a new v4/v5 receipt; it does not rewrite the historical decision. A
+changed parent selection can change ordinary tile admission, so dependent
+consolidated evidence still needs its upstream fingerprint checked or regenerated.
+
 ## Replay and validation boundaries
 
 Fixed-evidence replay changes proposal selection without loading the detector
@@ -391,9 +651,10 @@ planning inputs, and gate snapshot. Changes to crop geometry, model,
 preprocessing, group inventory, missing frame coverage, or admitted detector
 observations require generation again.
 Replay resolves crop mode from saved evidence, rather than the current
-environment. Legacy bundles without tiled evidence keep whole/v2 interpretation.
-Historical whole receipts are not silently reinterpreted as tiled/v3 receipts;
-changing crop mode requires generation.
+environment. Legacy bundles without tiled evidence keep whole generation
+geometry. Historical v2/v3 selection receipts keep their recorded decisions;
+an explicit new selection uses its resolved v4/v5 or requested legacy policy
+identity. Changing crop mode requires generation.
 
 Changing parent bridge selection can change tile admission and therefore the
 downstream proposal inventory. A changed upstream gate-support fingerprint
@@ -492,7 +753,7 @@ a successful empty prediction.
 | `sam_crop_seed_diagnostics.py` | Distinguish native seed coverage from survival after model-canvas resizing |
 | `report_sam_crop_strategies.py` | Measure matched outputs and publish reviewable comparisons |
 | `analyze_sam_crop_strategies.py` | Analyze frozen paired outputs offline with their declared geometry |
-| `sam_crop_quality.py` | Compute research diagnostic eligibility; this is separate from stock production v2 acceptance |
+| `sam_crop_quality.py` | Compute research diagnostic eligibility; this is separate from versioned stock production acceptance |
 
 Keep crop planning and seed diagnostics independent of withheld annotations.
 Native coverage and model-space seed survival are separate measurements:
@@ -502,11 +763,12 @@ tile predictions. Report raw and selected support and failures as well as
 accepted repairs. Results are paired experimental evidence; these tools do
 not add a production interpolation backend or change production crop defaults.
 Raw tracker-strategy outputs must be labelled as such. They do not establish
-production v2 proposal acceptance, tile admission, or a new independent accuracy
+production proposal acceptance, tile admission, or a new independent accuracy
 holdout when scoring reuses an annotation from an earlier experiment.
 The quality helper reports its own frozen diagnostic contract, including a
 default 16-pixel margin and 512 MiB topology allowance. These differ from the
-production contract and its 256 MiB group budget; diagnostic eligibility is
+baseline planner contract and its 256 MiB group budget; production live resource
+profiles are accounted separately. Diagnostic eligibility is
 not a production policy receipt.
 The seed diagnostic uses a CPU raster proxy for the pinned mask-conditioning
 resampling chain. It can report changed pixels and components without asserting
@@ -584,3 +846,75 @@ are separate changes to the declared rollout.
 LTA's opt-in [dynamic crop backend](lta_dynamic_crops.md) has its own execution
 contract. The TTA generator shares a fixed family context across independently
 seeded sessions and does not inherit LTA's between-window crop updates.
+
+## Post-tag development notes
+
+The safe planner correction bounds the complete endpoint silhouettes swept
+between their original observed anchors. Bounding only the observed endpoint
+boxes could clip the intermediate translated shapes. The corrected context is
+fixed before tracking, includes observed continuations and the existing margins,
+and remains limited by the actual working canvas and resource caps. Raster
+rounding stays tied to the legacy origin, preserving existing contract pixels
+where they were already covered. The planning receipt records
+`xta.sam_fixed_family_swept_context/2`, observed/swept/unclipped/clamped boxes,
+canvas-clamped sides, margins, and charged memory. This changes generation
+geometry; fixed-evidence selection cannot reproduce an omitted context.
+The unchanged resource caps can now refuse a larger corrected family. In the
+independent default-cap audit, development admission changed from 15/16 to
+14/16; the two later source windows stayed at 12/12 and 25/25. The lost
+merge/bifurcation family's crop grew from 912 by 799 (207.09 MiB charge) to
+944 by 1136 (304.766 MiB), exceeding the 256 MiB group cap. This was a group-cap
+refusal, not total-cap loss. Re-clipping the corrected sweep would hide intended
+acceptance/write space. Resource accounting was not changed.
+
+The explicit 512 MiB research setup has a different admission comparison:
+B0 admits 15 families and B1 13 because of its aggregate budget. Those refusals
+must remain in denominators; admitted-only scores do not represent coverage of
+the full inventory. Extra context and acceptance-only diagnostics produced no
+strict-selection gain in the development experiment, so no wider-context or
+acceptance policy is promoted to a default.
+
+Tiled execution on one worker now finishes each exact crop queue within the
+existing bounded parent cohort before switching crops. Independent endpoint
+sessions reuse immutable visual features, not tracker state. Multi-worker crop
+waves, job inventory, seeds, ownership, and quality thresholds retain their
+existing contracts. Explicit diagnostics distinguish current working canvas,
+native-view dimensions, context clamping, and actual tile/crop counts.
+`xta.sam_crop_contacts/1` counts raw and filtered contacts with crop and declared
+working-canvas edges separately, deduplicating shared corner pixels. Inconsistent
+canvas metadata stays unknown. A working-canvas edge is not proof of a physical
+source-image boundary, and no contact category waives containment or changes
+selection.
+
+The local GPU ABBA check preserved every raw mask and object score. It reduced
+encoder preparations from 66 to 33. Median worker tracking was 12.558 to
+8.731 seconds (30.5% lower); the complete bounded assembly seam was 43.566 to
+38.829 seconds (10.9% lower), including predictor startup with startup also
+reported separately. These timings exclude video decoding and detector work.
+They describe the exercised local fixture, not target H100 throughput or a
+general accuracy improvement.
+
+The maintained development tools separate protocol, inference, scoring, and
+reporting:
+
+| Tool | Development role |
+| --- | --- |
+| `sam_outer_crop_geometry.py` | Build declared context/acceptance research variants by integer embedding of fixed contracts |
+| `prepare_sam_outer_crop_experiment.py` | Extract exact native input windows without reading annotations |
+| `prepare_sam_outer_crop_protocol.py` | Lock data-only recipes and seal geometry before inference/label scoring |
+| `run_sam_outer_crop_experiment.py` | Run sealed tagged/revised/context variants with attributable raw evidence |
+| `run_sam_outer_crop_stress.py` | Run separate single-family context stress controls and reuse retained controls |
+| `analyze_sam_outer_crop.py` | Score raw, radius-filtered, write-limited, and selected support separately, keeping refusal/unknown outcomes explicit |
+| `derive_sam_acceptance_evidence.py` | Derive an acceptance-only fixed-raw diagnostic with preserved source masks/scores and explicit changed-geometry attribution |
+| `qualify_sam_tiled_schedule.py` | Check exact-mask/score ABBA scheduling equivalence and separate startup/work timings |
+| `report_sam_outer_crop.py` | Present already scored artifacts and provenance without selecting masks or computing new accuracy |
+| `generate_sam_outer_crop_sdf.py` | Generate unchanged CPU SDF references from sealed observations, without reading images/labels or replacing prior references |
+
+The wider-context and acceptance-only variants remain experiments. The latter
+remeasures retained complete raw support under a changed declared acceptance
+region; it is not a fresh pipeline-equivalent replay. Preserve the tagged
+baseline, original recipe seals, source/frame/seed identities, and raw reuse
+attribution. Those research geometry variants do not alter central component
+filtering or the ordinary tile gate. The separately audited guarded-rescue patch
+changes current stock selection defaults as described above. Final experiment
+scoring, source pins, and full snapshot qualification wait for a frozen tree.

@@ -203,6 +203,15 @@ def _read_log(path: Path) -> list[dict[str, object]]:
 
 
 class LtaWorkerContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # These workers load the CPU-only fake adapter above. Their simulated
+        # device indexes must not depend on the real test host's visibility
+        # (including CUDA_VISIBLE_DEVICES=-1 for CPU qualification). Individual
+        # mapping tests install their own explicit token lists inside this scope.
+        visibility = mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": ""})
+        visibility.start()
+        self.addCleanup(visibility.stop)
+
     def test_two_slots_share_physical_gpu_but_overlap_in_distinct_persistent_processes(self) -> None:
         with _fake_adapter() as (module_name, root, log_path), mock.patch.dict(os.environ, {
             "CUDA_VISIBLE_DEVICES": "GPU-unused,GPU-shared",

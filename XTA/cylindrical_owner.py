@@ -200,7 +200,7 @@ extern "C" __global__ void gather_shell_chunk(
     int v = p / plane_w, u = p % plane_w;
     double stack = centers[stack_index];
     double h = __dsub_rn(stack, ideal[vertical ? v : u]);
-    if (h < 0.0 || h > (double)(stack_length - 1)) return;
+    if (h < -0.5 || h >= (double)stack_length - 0.5) return;
     for (unsigned long long at = offsets[p]; at < (unsigned long long)offsets[p + 1]; ++at) {
         int col = columns[at];
         h = __dsub_rn(stack, sampled[(unsigned long long)shell * native_w + col]);

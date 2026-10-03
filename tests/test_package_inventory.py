@@ -27,6 +27,13 @@ from tools.verify_package_inventory import (
 
 def _release_22_2_inventory():
     manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+    manifest.pop('v25_job150790_150798_throughput_development_review', None)
+    manifest.pop('v25_job150772_performance_development_review', None)
+    manifest.pop('v25_0_1_release_review', None)
+    manifest.pop('v25_job150615_headroom_development_review', None)
+    manifest.pop('v25_job150615_development_review', None)
+    manifest.pop('v25_guarded_rescue_development_review', None)
+    manifest.pop('v25_outer_crop_development_review', None)
     manifest.pop('v25_0_0_release_review', None)
     manifest.pop('v24_0_5_release_review', None)
     manifest.pop('v24_0_4_release_review', None)
@@ -45,7 +52,13 @@ def _reconciliation_successors():
                                          'v22_3_2_release_review', 'v24_release_review',
                                          'v24_0_2_release_review', 'v24_0_3_release_review',
                                          'v24_0_4_release_review', 'v24_0_5_release_review',
-                                         'v25_0_0_release_review') if key in manifest)
+                                         'v25_0_0_release_review', 'v25_outer_crop_development_review',
+                                         'v25_guarded_rescue_development_review',
+                                         'v25_job150615_development_review',
+                                         'v25_job150615_headroom_development_review',
+                                         'v25_0_1_release_review',
+                                         'v25_job150772_performance_development_review',
+                                         'v25_job150790_150798_throughput_development_review') if key in manifest)
 
 
 def _release_22_1_inventory():

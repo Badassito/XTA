@@ -13,6 +13,7 @@ from pathlib import Path
 import pprint
 import subprocess
 import sys
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -135,6 +136,83 @@ RELEASES['25.0.0'] = dict(
         'tools/qualify_sam_tiled_integration.py',
     ),
 )
+OUTER_CROP_DEVELOPMENT_TOOLS = (
+    'tools/sam_outer_crop_geometry.py',
+    'tools/prepare_sam_outer_crop_experiment.py',
+    'tools/prepare_sam_outer_crop_protocol.py',
+    'tools/run_sam_outer_crop_experiment.py',
+    'tools/run_sam_outer_crop_stress.py',
+    'tools/analyze_sam_outer_crop.py',
+    'tools/derive_sam_acceptance_evidence.py',
+    'tools/qualify_sam_tiled_schedule.py',
+    'tools/report_sam_outer_crop.py',
+    'tools/generate_sam_outer_crop_sdf.py',
+)
+DEVELOPMENTS = {
+    'outer-crop': dict(
+        token='25_outer_crop_development', prefix='REVIEWED_V25_OUTER_CROP_DEVELOPMENT',
+        key='v25_outer_crop_development_review', contract='reviewed_v25_outer_crop_development_contract',
+        previous_token='25_0_0', feature='sam-outer-crop-development',
+        predecessor_inventory_path='release/_package_inventory.json',
+        validation_tools=RELEASES['25.0.0']['validation_tools'] + ('tools/prepare_reconciliation_release.py',) + OUTER_CROP_DEVELOPMENT_TOOLS,
+    ),
+    'guarded-rescue': dict(
+        token='25_guarded_rescue_development', prefix='REVIEWED_V25_GUARDED_RESCUE_DEVELOPMENT',
+        key='v25_guarded_rescue_development_review', contract='reviewed_v25_guarded_rescue_development_contract',
+        previous_review_key='v25_outer_crop_development_review',
+        previous_review_prefix='REVIEWED_V25_OUTER_CROP_DEVELOPMENT',
+        feature='sam-guarded-rescue-development', predecessor_inventory_path='release/_package_inventory.json',
+        validation_tools=RELEASES['25.0.0']['validation_tools'] + ('tools/prepare_reconciliation_release.py',) + OUTER_CROP_DEVELOPMENT_TOOLS,
+    ),
+    'job150615': dict(
+        token='25_job150615_development', prefix='REVIEWED_V25_JOB150615_DEVELOPMENT',
+        key='v25_job150615_development_review', contract='reviewed_v25_job150615_development_contract',
+        previous_review_key='v25_guarded_rescue_development_review',
+        previous_review_prefix='REVIEWED_V25_GUARDED_RESCUE_DEVELOPMENT',
+        feature='sam-job150615-development', predecessor_inventory_path='release/_package_inventory.json',
+        validation_tools=RELEASES['25.0.0']['validation_tools'] + ('tools/prepare_reconciliation_release.py',) + OUTER_CROP_DEVELOPMENT_TOOLS
+                         + ('tools/qualify_sam_interpolation_long_session.py',),
+    ),
+    'job150615-headroom': dict(
+        token='25_job150615_headroom_development', prefix='REVIEWED_V25_JOB150615_HEADROOM_DEVELOPMENT',
+        key='v25_job150615_headroom_development_review', contract='reviewed_v25_job150615_headroom_development_contract',
+        previous_review_key='v25_job150615_development_review',
+        previous_review_prefix='REVIEWED_V25_JOB150615_DEVELOPMENT',
+        feature='sam-job150615-headroom-development', predecessor_inventory_path='release/_package_inventory.json',
+        validation_tools=RELEASES['25.0.0']['validation_tools'] + ('tools/prepare_reconciliation_release.py',) + OUTER_CROP_DEVELOPMENT_TOOLS
+                         + ('tools/qualify_sam_interpolation_long_session.py',),
+    ),
+}
+RELEASES['25.0.1'] = dict(
+    token='25_0_1', prefix='REVIEWED_V25_0_1_RELEASE', key='v25_0_1_release_review',
+    contract='reviewed_v25_0_1_release_contract', previous_review_key='v25_job150615_headroom_development_review',
+    previous_review_prefix='REVIEWED_V25_JOB150615_HEADROOM_DEVELOPMENT',
+    feature='all-view-projection-coverage', predecessor_inventory_path='release/_package_inventory.json',
+    validation_tools=DEVELOPMENTS['job150615-headroom']['validation_tools'] + ('tools/qualify_projection_coverage.py',),
+)
+DEVELOPMENTS['job150772-performance'] = dict(
+    token='25_job150772_performance_development', prefix='REVIEWED_V25_JOB150772_PERFORMANCE_DEVELOPMENT',
+    key='v25_job150772_performance_development_review', contract='reviewed_v25_job150772_performance_development_contract',
+    previous_review_key='v25_0_1_release_review', previous_review_prefix='REVIEWED_V25_0_1_RELEASE',
+    feature='sam-job150772-performance-development', predecessor_inventory_path='release/_package_inventory.json',
+    validation_tools=RELEASES['25.0.1']['validation_tools'] + ('tools/benchmark_native_pull_projection.py',),
+)
+DEVELOPMENTS['job150790-150798-throughput'] = dict(
+    token='25_job150790_150798_throughput_development', prefix='REVIEWED_V25_JOB150790_150798_THROUGHPUT_DEVELOPMENT',
+    key='v25_job150790_150798_throughput_development_review', contract='reviewed_v25_job150790_150798_throughput_development_contract',
+    previous_review_key='v25_job150772_performance_development_review',
+    previous_review_prefix='REVIEWED_V25_JOB150772_PERFORMANCE_DEVELOPMENT',
+    feature='sam-job150790-150798-throughput-development', predecessor_inventory_path='release/_package_inventory.json',
+    validation_tools=DEVELOPMENTS['job150772-performance']['validation_tools'] + (
+        'tools/benchmark_confidence_capture.py', 'tools/qualify_sam_policy_throughput.py',
+        'tools/qualify_sam_family_dispatch.py'),
+)
+OUTER_CROP_DEVELOPMENT_REASONS = {
+    'sam_bridge_planning': 'Bound the complete translated endpoint-silhouette sweep and preserve legacy raster rounding while declaring context/canvas clamp and contract memory diagnostics.',
+    'sam_interpolation': 'Drain single-worker tiled jobs by exact crop inside bounded parent cohorts, retaining every original hypothesis and unchanged mask/quality semantics.',
+    'sam_integration': 'Own development outer-crop image/source lifetime and resource admission.',
+    'sam_policy': 'Record development quality/geometry contracts while preserving immutable released receipts.',
+}
 SAM_INTERPOLATION_REASONS = {
     '__init__': 'Publish the package release identity as {release}.',
     'cli': 'Validate the selected TTA interpolation contract before importing detector runtimes.',
@@ -321,6 +399,14 @@ REMOVAL_REASONS = {
     for name in ('baseline', 'confidence_voxel', 'cross_sections', 'provenance')
 }
 REMOVED_DEFINITION_REASONS = {
+    **{('confidence_projection', name):
+       'Retire obsolete reduced-grid confidence scatter/restore geometry after the qualified canonical native destination pull replaces it.'
+       for name in ('_bounded_azimuthal_map', '_bounded_azimuthal_geometry', '_bounded_upright_reader',
+                    '_scatter_score_strip', '_bounded_tilted_projection', '_bounded_tilted_azimuthal_projection',
+                    '_upright_azimuthal_reader', '_project_tilted_azimuthal_scores')},
+    **{('sparse_projection', name):
+       'Retire sparse source-center inverse/scatter helpers replaced by source-owned destination cell coverage.'
+       for name in ('_InverseMap', '_scatter_crop', '_make_inverse_map', '_inverse_map')},
     ('geometry', '_angle_from_aug_id'):
         'Retire the unused private augmentation-angle parser while retaining its authenticated v22.3.2 source hash.',
     ('assembly', '_SparseComponentKernelUnavailable'):
@@ -383,6 +469,10 @@ REMOVED_DEFINITION_REASONS = {
     },
 }
 REMOVED_STATEMENT_REASONS = {
+    ('sparse_projection', '_scatter_crop = _numba.njit(cache=True, nogil=True)(_scatter_crop)'):
+        'Retire the compiled wrapper with its obsolete sparse source-center scatter helper.',
+    ('confidence_projection', 'import time'):
+        'Remove timing import used only by the retired confidence scatter helpers.',
     ('_deps', 'from typing import Optional'): 'Remove unused Optional type import after requiring the Numba dependency.',
     ('interpolation', 'from .inference import _cv2_connected_components, _fill_holes_2d_opencv'):
         'Remove image helpers used only by the Python interpolation reference moved into tests.',
@@ -446,6 +536,23 @@ REMOVED_STATEMENT_HASH_REASONS = {
         'Bind the required compiled run-adjacency kernels without optional import branching.',
 }
 TOOL_REASONS = {
+    'tools/qualify_sam_family_dispatch.py': 'Qualify experimental family dispatch with bounded real-model mask/score equivalence, cache/resource counters, explicit GPU reservation and source identities.',
+    'tools/qualify_sam_policy_throughput.py': 'Qualify bounded serial/parallel saved-evidence policy replay, selected directional bridge bytes and CPU performance without loading tracker models or modifying raw evidence.',
+    'tools/benchmark_confidence_capture.py': 'Compare bounded qualified-source and current confidence capture with exact payload/summary parity, source identity, resource checks and declared CPU measurement conditions.',
+    'tools/benchmark_native_pull_projection.py': 'Compare bounded native destination projection throughput with recorded worker/cache budgets, numerical equivalence and hardware/source provenance.',
+    'tools/qualify_projection_coverage.py': 'Require selected projection coverage numerical cases to execute without skips and retain actual hardware, source identity, JUnit and GPU-reservation evidence.',
+    'tools/qualify_sam_interpolation_long_session.py': 'Check long independent SAM endpoint sessions on a declared repetition of one retained real frame and prescribed original seed, without claiming interpolation accuracy or production throughput.',
+    'tools/prepare_reconciliation_release.py': 'Prepare a clearly labelled development audit against exact tagged source without rewriting a release or changing package identity.',
+    'tools/sam_outer_crop_geometry.py': 'Define frozen research-only C/A outer-context variants by integer embedding of complete swept-corrected contracts without relabeling tagged geometry.',
+    'tools/prepare_sam_outer_crop_experiment.py': 'Prepare exact native source windows and input hashes without reading annotations or modifying intensity pixels.',
+    'tools/prepare_sam_outer_crop_protocol.py': 'Lock data-only outer-crop recipes and seal geometry before model work and label scoring, distinguishing literal tagged baseline from revised planning.',
+    'tools/run_sam_outer_crop_experiment.py': 'Execute sealed outer-crop research plans through a common tracker/evaluator with attributable raw evidence and explicit non-production baseline recipes.',
+    'tools/run_sam_outer_crop_stress.py': 'Run separately declared single-family outer-context stress controls while reusing retained controls and preserving production defaults.',
+    'tools/analyze_sam_outer_crop.py': 'Score sealed raw, radius-filtered, candidate, and selected research layers separately, preserving refusal/unknown outcomes and fixed native contour domains.',
+    'tools/derive_sam_acceptance_evidence.py': 'Derive A-only fixed-raw diagnostic evidence with byte-identical C2 masks/scores and explicit changed-acceptance attribution, never fresh pipeline equivalence.',
+    'tools/qualify_sam_tiled_schedule.py': 'Run exact-mask/score ABBA qualification of crop-contiguous single-worker scheduling with model startup separated and no geometry or quality changes.',
+    'tools/report_sam_outer_crop.py': 'Report already scored outer-crop research with validated provenance and explicit limits without selecting masks or inventing accuracy metrics.',
+    'tools/generate_sam_outer_crop_sdf.py': 'Generate unchanged production SDF references from exact sealed observations without reading images/labels, CUDA execution, or overwriting existing references.',
     'tools/study_sam_fusion.py': 'Compare frozen fusion variants over retained selected SAM proposals without inference, separating development diagnostics from independently withheld labels.',
     'tools/qualify_sdf_alignment.py': 'Evaluate predeclared SDF anchor/transport/area experiments without changing the production SDF generator or using labels before predictions are frozen.',
     'tools/prepare_sam_holdout.py': 'Pre-register bounded detector-only interpolation cases and input identities before held-out annotations are opened.',
@@ -492,6 +599,70 @@ def git_file(root, predecessor, relative):
     return None if result.returncode else result.stdout.decode('utf-8')
 
 
+def qualified_development_archive(path, *, development='guarded-rescue'):
+    """Read an independently pinned, fully qualified predecessor ZIP."""
+    if development not in ('guarded-rescue', 'job150615', 'job150772-performance', 'job150790-150798-throughput'):
+        raise ValueError('This development audit has no qualified archive predecessor')
+    return _development_source_archive(path, development=development)
+
+
+def reviewed_development_archive(path):
+    """Read the reviewed job150615 snapshot without implying qualification."""
+    return _development_source_archive(path, development='job150615-headroom')
+
+
+def reviewed_release_predecessor_archive(path):
+    """Authenticate the reviewed v25 tree without upgrading its strict gate."""
+    return _development_source_archive(path, development='25.0.1')
+
+
+def _development_source_archive(path, *, development):
+    """Verify every identity in the independently pinned ZIP, without extraction."""
+    spec = RELEASES[development] if development == '25.0.1' else DEVELOPMENTS[development]
+    prefix_pin = spec['prefix']
+    reviewed_only = development in ('job150615-headroom', '25.0.1')
+    performance = development in ('job150772-performance', 'job150790-150798-throughput')
+    archive_label = 'Reviewed' if reviewed_only else 'Qualified'
+    if path is None:
+        if performance:
+            raise ValueError(f'{development} requires --predecessor-archive from qualified v25.0.1 source')
+        if development == '25.0.1':
+            raise ValueError('25.0.1 requires --predecessor-archive from the reviewed v25 development tree')
+        previous = 'job150615' if reviewed_only else 'guarded-rescue' if development == 'job150615' else 'outer-crop'
+        raise ValueError(f'{development} requires --predecessor-archive from {archive_label.lower()} {previous} development')
+    path = Path(path).resolve(strict=True)
+    payload = path.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest != getattr(inventory, prefix_pin + '_PREDECESSOR_ARCHIVE_SHA256'):
+        raise ValueError(f'{archive_label} predecessor archive differs from its independent SHA256 pin')
+    with zipfile.ZipFile(path) as archive:
+        names = archive.namelist()
+        if len(names) != len(set(names)):
+            raise ValueError(f'{archive_label} predecessor archive has duplicate source identities')
+        archive_version = '25.0.1' if performance else '25.0.0'
+        prefix = f'XTA_v{archive_version}/'
+        release_manifest = json.loads(archive.read(prefix + 'RELEASE_MANIFEST.json'))
+        identities = release_manifest.get('files', {})
+        if (release_manifest.get('version') != archive_version
+                or len(identities) != getattr(inventory, prefix_pin + '_PREDECESSOR_SOURCE_COUNT')
+                or set(names) != {prefix+'RELEASE_MANIFEST.json', *(prefix+name for name in identities)}):
+            raise ValueError(f'{archive_label} predecessor source identity coverage differs')
+        sources = {}
+        for relative, identity_record in identities.items():
+            data = archive.read(prefix + relative)
+            if hashlib.sha256(data).hexdigest() != identity_record:
+                raise ValueError(f'{archive_label} predecessor payload differs: {relative}')
+            sources[relative] = data
+    metadata = dict(kind='reviewed_development_source_zip' if reviewed_only else 'qualified_development_source_zip',
+                    sha256=digest, source_identity_count=len(identities), filename=path.name)
+    if reviewed_only:
+        metadata.update(qualification_status='strict_gate_failed_followup_audited' if development == '25.0.1' else 'incomplete',
+                        full_qualification=False)
+    elif performance:
+        metadata.update(qualification_status='passed', full_qualification=True, package_version='25.0.1')
+    return sources, metadata
+
+
 def identity(node):
     if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
         return ('definition', node.name)
@@ -521,7 +692,7 @@ def statement_label(node):
     return f'{type(node).__name__}:{node.lineno}'
 
 
-def review_module(module, old_source, new_source, *, complete, labels_by_hash, reason):
+def review_module(module, old_source, new_source, *, complete, labels_by_hash, reason, seam_retirements=None):
     """Account for every predecessor statement without silently dropping one."""
     old = ast.parse(old_source) if old_source is not None else None
     new = ast.parse(new_source)
@@ -581,8 +752,17 @@ def review_module(module, old_source, new_source, *, complete, labels_by_hash, r
     old_seams = inventory.reviewed_local_import_seams(module, old_source, old) if old is not None else {}
     new_seams = inventory.reviewed_local_import_seams(module, new_source, new)
     retired_seams = {(module, item['name']) for item in records['removed_definitions']}
-    if set(new_seams) - set(old_seams) or set(old_seams) - set(new_seams) - retired_seams:
+    replaced_seams = set(old_seams) - set(new_seams) - retired_seams
+    if set(new_seams) - set(old_seams) or replaced_seams - set(seam_retirements or ()):
         raise ValueError(f'{module}: local-import seam ownership changed')
+    for key in sorted(replaced_seams):
+        replacement = next((node for node in new.body if getattr(node, 'name', None) == key[1]), None)
+        current_hash = inventory.digest(replacement) if replacement is not None else None
+        if (*old_seams[key], current_hash) != seam_retirements[key]:
+            raise ValueError(f'{module}: retired local-import seam differs from its independent review')
+        records.setdefault('retired_local_import_seams', []).append(dict(
+            module=module, name=key[1], previous_definition_sha256=old_seams[key][0],
+            previous_seam_sha256=old_seams[key][1], definition_sha256=current_hash, reason=reason))
     for key, current in new_seams.items():
         previous = old_seams[key]
         if current != previous:
@@ -628,33 +808,119 @@ def _update_verifier_pins(source, prefix, digest, pins, removals=None):
     return ''.join(lines)
 
 
-def prepare(*, output_dir, release='25.0.0', write=False):
+def validate_unqualified_candidate_amendment(current, development, expected_digest, failed_qualification):
+    """Authorize only the documented, failed 92fad prequalification candidate."""
+    key = 'v25_job150790_150798_throughput_development_review'
+    if (development != 'job150790-150798-throughput'
+            or expected_digest != inventory.UNQUALIFIED_THROUGHPUT_CANDIDATE_SHA256
+            or key not in current or canonical(current[key]) != expected_digest
+            or current[key].get('kind') != 'development' or current[key].get('released') is not False):
+        raise ValueError('Only the exact current unqualified throughput candidate may be amended')
+    if failed_qualification is None:
+        raise ValueError('Candidate amendment requires its preserved failed qualification receipt')
+    raw = Path(failed_qualification).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != inventory.UNQUALIFIED_THROUGHPUT_FAILED_GATE_SHA256:
+        raise ValueError('Candidate amendment failed qualification proof differs from its independent pin')
+    proof = json.loads(raw)
+    if (proof.get('success') is not False or proof.get('kind') != 'development-snapshot'
+            or not any(step.get('name') == 'full-tests' and step.get('returncode') == 1
+                       for step in proof.get('steps', ()))
+            or proof.get('source_before', {}).get('files', {}).get('release/_package_inventory.json')
+               != hashlib.sha256(inventory.MANIFEST.read_bytes()).hexdigest()
+            or proof.get('source_before', {}).get('files', {}).get('tools/verify_package_inventory.py')
+               != 'beb2024e9fd3113860cd4373fbf46489328c71ecb5233216a1410551b13fe971'):
+        raise ValueError('Candidate amendment proof is successful, unbound or lacks the failed whole test gate')
+    return dict(superseded_candidate_sha256=expected_digest,
+                failed_qualification_sha256=inventory.UNQUALIFIED_THROUGHPUT_FAILED_GATE_SHA256,
+                qualification_result='failed')
+
+
+def prepare(*, output_dir, release='25.0.0', development=None, write=False, predecessor_archive=None,
+            amend_unqualified_candidate=None, failed_qualification=None):
     root, output_dir = ROOT, Path(output_dir).resolve()
     if output_dir.is_relative_to(root):
         raise ValueError('Generated release-review evidence belongs outside the repository')
-    spec = RELEASES[release]
-    reasons = (SAM_INTERPOLATION_REASONS if release == '25.0.0' else
+    if development is not None and release != '25.0.0':
+        raise ValueError('Select a release or an outer-crop development audit, not both')
+    if development is not None and development not in DEVELOPMENTS:
+        raise ValueError('Unknown development audit')
+    if write and development is None and subprocess.check_output(
+            ['git', 'tag', '--list', f'v{release}'], cwd=root).strip():
+        raise ValueError(f'v{release} is already tagged; its authenticated review cannot be rewritten')
+    spec = DEVELOPMENTS[development] if development is not None else RELEASES[release]
+    if development is not None:
+        actual_tag = subprocess.check_output(['git', 'rev-parse', 'v25.0.0^{commit}'], cwd=root, text=True).strip()
+        if actual_tag != inventory.REVIEWED_V25_OUTER_CROP_DEVELOPMENT_PREDECESSOR_COMMIT:
+            raise ValueError('Development predecessor differs from the independently pinned v25.0.0 tag')
+    release_patch = release == '25.0.1' and development is None
+    if release_patch:
+        actual_tag = subprocess.check_output(['git', 'rev-parse', 'v25.0.0^{commit}'], cwd=root, text=True).strip()
+        if actual_tag != inventory.REVIEWED_V25_0_1_RELEASE_PREDECESSOR_COMMIT:
+            raise ValueError('Released predecessor tag differs from the independently pinned v25.0.0 commit')
+    archived_development = development in ('guarded-rescue', 'job150615', 'job150615-headroom', 'job150772-performance', 'job150790-150798-throughput')
+    archived_source = archived_development or release_patch
+    reasons = ({} if archived_source else OUTER_CROP_DEVELOPMENT_REASONS if development is not None else
+               SAM_INTERPOLATION_REASONS if release == '25.0.0' else
                TTA_PTA_THROUGHPUT_REASONS if release == '24.0.5' else
                {} if release == '24.0.4' else
                {**REASONS, **(THROUGHPUT_REASONS if release == '22.3.2' else {}),
                 **(SEMANTIC_REASONS if release == '24.0.1' else {}),
                 **(PATCH_REASONS if release == '24.0.2' else {}),
                 **(TTA_THROUGHPUT_REASONS if release == '24.0.3' else {})})
-    fallback_reason = ('Integrate bounded SAM interpolation, retained proposal evidence, or dynamic LTA crop support in this source module.'
+    fallback_reason = ('Reduce confidence-evidence and SAM publication work while preserving required mask, radius and reader contracts.'
+                       if development == 'job150790-150798-throughput' else
+                       'Accelerate qualified native projection and retain performance diagnostics without changing package identity.'
+                       if development == 'job150772-performance' else
+                       'Publish accepted SAM development and complete projection coverage for all TTA view orientations.'
+                       if release_patch else
+                       'Clamp the reviewed SAM CPU wave to physical memory headroom without changing mask or quality contracts.'
+                       if development == 'job150615-headroom' else
+                       'Correct the reviewed job150615 runtime and qualification contracts without changing package release identity.'
+                       if development == 'job150615' else
+                       'Develop reviewed guarded SAM rescue and verified view/runtime contracts without changing package release identity.'
+                       if archived_development else
+                       'Develop the reviewed bounded outer-crop source/tool contract without claiming a new package release.'
+                       if development is not None else
+                       'Integrate bounded SAM interpolation, retained proposal evidence, or dynamic LTA crop support in this source module.'
                        if release == '25.0.0' else
                        'Record the reviewed v24.0.5 TTA/PTA throughput changes in this module.'
                        if release == '24.0.5' else
                        'Record the reviewed v24.0.4 cleanup and compiled CPU backend changes in this module.'
                        if release == '24.0.4' else
                        'Implement the reviewed {release} TTA throughput contract in this source module.')
-    prefix = 'REVIEWED_V' + spec['token'] + '_RELEASE'
-    key = 'v' + spec['token'] + '_release_review'
+    prefix = spec.get('prefix', 'REVIEWED_V' + spec['token'] + '_RELEASE')
+    key = spec.get('key', 'v' + spec['token'] + '_release_review')
     predecessor_commit = getattr(inventory, prefix + '_PREDECESSOR_COMMIT')
     predecessor_path = spec.get('predecessor_inventory_path', 'XTA/_package_inventory.json')
-    predecessor = json.loads(git_file(root, predecessor_commit, predecessor_path))
+    archive_metadata = None
+    if archived_source:
+        archived, archive_metadata = (reviewed_release_predecessor_archive(predecessor_archive) if release_patch else
+            reviewed_development_archive(predecessor_archive)
+            if development == 'job150615-headroom' else
+            qualified_development_archive(predecessor_archive, development=development))
+        def predecessor_file(relative):
+            value = archived.get(relative)
+            return None if value is None else value.decode('utf-8').replace('\r\n', '\n').replace('\r', '\n')
+    else:
+        if predecessor_archive is not None:
+            raise ValueError('--predecessor-archive applies only to an archive-backed development successor')
+        def predecessor_file(relative):
+            return git_file(root, predecessor_commit, relative)
+    predecessor = json.loads(predecessor_file(predecessor_path))
     if canonical(predecessor) != getattr(inventory, prefix + '_PREDECESSOR_SHA256'):
         raise ValueError('Git predecessor differs from the independently authenticated inventory')
     current = json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
+    amendment = None
+    if amend_unqualified_candidate is not None:
+        if not write:
+            raise ValueError('Explicit candidate amendment requires --write')
+        amendment = validate_unqualified_candidate_amendment(
+            current, development, amend_unqualified_candidate, failed_qualification)
+    elif failed_qualification is not None:
+        raise ValueError('Failed qualification proof requires explicit candidate amendment')
+    if write and development is not None and key in current:
+        if amendment is None:
+            raise ValueError('Published development reviews are immutable; prepare a new successor instead')
     if {k: v for k, v in current.items() if k != key} != predecessor:
         raise ValueError('Preserve every predecessor inventory record before adding this review')
     audited = {item['module'] for item in predecessor['statements']}
@@ -668,21 +934,38 @@ def prepare(*, output_dir, release='25.0.0', write=False):
                         labels_by_hash[item['module'], item['sha256']] = item['label']
     for (module, label), (value, _reason) in inventory.REVIEWED_V20_ADDED_STATEMENTS.items():
         labels_by_hash.setdefault((module, value), label)
-    paths = subprocess.check_output(['git', 'diff', '--name-only', predecessor_commit, '--', 'XTA'], cwd=root, text=True).splitlines()
-    paths += subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard', '--', 'XTA'], cwd=root, text=True).splitlines()
-    review = dict(release=release, feature=spec['feature'],
-        previous_review_sha256=getattr(inventory, 'REVIEWED_V' + spec['previous_token'] + '_RELEASE_SHA256'),
+    if archived_source:
+        paths = sorted({name for name in archived if name.startswith('XTA/') and name.endswith('.py')}
+                       | {path.relative_to(root).as_posix() for path in (root/'XTA').rglob('*.py')})
+    else:
+        paths = subprocess.check_output(['git', 'diff', '--name-only', predecessor_commit, '--', 'XTA'], cwd=root, text=True).splitlines()
+        paths += subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard', '--', 'XTA'], cwd=root, text=True).splitlines()
+    patch_development = development in ('job150772-performance', 'job150790-150798-throughput')
+    review = dict(release='25.0.1' if patch_development else release, feature=spec['feature'],
+        previous_review_sha256=getattr(inventory, spec['previous_review_prefix'] + '_SHA256') if archived_source else
+            getattr(inventory, 'REVIEWED_V' + spec['previous_token'] + '_RELEASE_SHA256'),
         predecessor_commit=predecessor_commit, predecessor_inventory_sha256=canonical(predecessor),
         definitions=[], statements=[], removed_definitions=[], removed_statements=[],
         local_import_seam_updates=[], preserved_radial_definition_updates=[],
         preserved_radial_module_updates=[], complete_modules=[], module_snapshots=[])
+    if development is not None:
+        review.update(kind='development', development=development,
+                      package_version='25.0.1' if patch_development else '25.0.0',
+                      released=False, predecessor_tag='v25.0.0')
+    if archived_source:
+        review['predecessor_source_archive'] = archive_metadata
+    if amendment is not None:
+        review['prequalification_amendment'] = amendment
+    if release_patch:
+        review.update(kind='release', package_version='25.0.1', predecessor_tag='v25.0.0',
+                      released_predecessor_version='25.0.0')
     source_pins = {}
     for relative in sorted(set(paths)):
         if not relative.endswith('.py'):
             continue
         path = root / relative
         module = relative.removeprefix('XTA/').removesuffix('.py')
-        old_source = git_file(root, predecessor_commit, relative)
+        old_source = predecessor_file(relative)
         if not path.is_file():
             pin, snapshot, records = review_removed_module(module, old_source,
                 reason=REMOVAL_REASONS.get(module, ''))
@@ -694,20 +977,21 @@ def prepare(*, output_dir, release='25.0.0', write=False):
             reason = reasons.get(module, fallback_reason).format(release=release)
             complete = module not in audited
             pin, snapshot, records = review_module(module, old_source, new_source,
-                complete=complete, labels_by_hash=labels_by_hash, reason=reason)
+                complete=complete, labels_by_hash=labels_by_hash, reason=reason,
+                seam_retirements=inventory.REVIEWED_V25_0_1_RELEASE_RETIRED_LOCAL_IMPORT_SEAMS if release_patch else None)
         source_pins[module] = pin
         review['module_snapshots'].append(snapshot)
         if complete:
             review['complete_modules'].append(module)
         for category, values in records.items():
-            review[category].extend(values)
+            review.setdefault(category, []).extend(values)
     patches = [value for name, value in predecessor.items() if name != 'v21_review'
                and isinstance(value, dict) and 'release' in value and 'definitions' in value]
     for module, previous_hash in inventory.reviewed_radial_module_hashes(predecessor['v21_review'], patches).items():
         text = (root / 'XTA' / f'{module}.py').read_text(encoding='utf-8')
         new_hash = hashlib.sha256(text.encode()).hexdigest()
         if new_hash != previous_hash:
-            if hashlib.sha256(git_file(root, predecessor_commit, f'XTA/{module}.py').encode()).hexdigest() != previous_hash:
+            if hashlib.sha256(predecessor_file(f'XTA/{module}.py').encode()).hexdigest() != previous_hash:
                 raise ValueError(f'Preserved module predecessor differs: {module}')
             review['preserved_radial_module_updates'].append(dict(module=module,
                 previous_sha256=previous_hash, sha256=new_hash,
@@ -716,19 +1000,19 @@ def prepare(*, output_dir, release='25.0.0', write=False):
         text = (root / 'XTA' / f'{module}.py').read_text(encoding='utf-8')
         new_hash = inventory.digest(_qualified_definition(text, name))
         if new_hash != previous_hash:
-            old_text = git_file(root, predecessor_commit, f'XTA/{module}.py')
+            old_text = predecessor_file(f'XTA/{module}.py')
             if inventory.digest(_qualified_definition(old_text, name)) != previous_hash:
                 raise ValueError(f'Preserved definition predecessor differs: {module}.{name}')
             review['preserved_radial_definition_updates'].append(dict(module=module, qualified_name=name,
                 previous_sha256=previous_hash, sha256=new_hash,
                 reason=reasons.get(module, fallback_reason).format(release=release)))
-    previous_review = predecessor['v' + spec['previous_token'] + '_release_review']
+    previous_review = predecessor[spec['previous_review_key']] if archived_source else predecessor['v' + spec['previous_token'] + '_release_review']
     previous_tools = {item['path']: item['sha256'] for item in previous_review.get('validation_tools', ())}
 
     def previous_tool_sha(path):
         if path in previous_tools:
             return previous_tools[path]
-        source = git_file(root, predecessor_commit, path)
+        source = predecessor_file(path)
         return hashlib.sha256(source.encode()).hexdigest() if source is not None else None
 
     review['validation_tools'] = [dict(
@@ -748,48 +1032,66 @@ def prepare(*, output_dir, release='25.0.0', write=False):
     }
     original_digest = getattr(inventory, prefix + '_SHA256')
     original_pins = getattr(inventory, prefix + '_PREDECESSOR_MODULES')
-    pins_removals = release in ('24.0.4', '24.0.5', '25.0.0')
+    pins_removals = development is not None or release in ('24.0.4', '24.0.5', '25.0.0', '25.0.1')
     original_removals = getattr(inventory, prefix + '_REMOVALS') if pins_removals else None
     try:
         setattr(inventory, prefix + '_SHA256', digest)
         setattr(inventory, prefix + '_PREDECESSOR_MODULES', source_pins)
         if pins_removals:
             setattr(inventory, prefix + '_REMOVALS', removals)
-        getattr(inventory, 'reviewed_v' + spec['token'] + '_release_contract')(payload, predecessor['v21_review'])
+        getattr(inventory, spec.get('contract', 'reviewed_v' + spec['token'] + '_release_contract'))(payload, predecessor['v21_review'])
     finally:
         setattr(inventory, prefix + '_SHA256', original_digest)
         setattr(inventory, prefix + '_PREDECESSOR_MODULES', original_pins)
         if pins_removals:
             setattr(inventory, prefix + '_REMOVALS', original_removals)
     if write:
-        if subprocess.check_output(['git', 'tag', '--list', f'v{release}'], cwd=root).strip():
+        if development is None and subprocess.check_output(['git', 'tag', '--list', f'v{release}'], cwd=root).strip():
             raise ValueError(f'v{release} is already tagged; its authenticated review cannot be rewritten')
         trees = {item['module']: ast.parse((root / 'XTA' / (item['module'] + '.py')).read_text(encoding='utf-8'))
                  for item in review['module_snapshots'] if not item.get('removed')}
         inventory.verify_v22_3_source_snapshots(review, trees)
         inventory.verify_v22_3_validation_tools(review)
         verifier = root / 'tools/verify_package_inventory.py'
+        if amendment is not None:
+            backup = output_dir / 'superseded_unqualified_candidate'
+            backup.mkdir(parents=True, exist_ok=False)
+            (backup / '_package_inventory.json').write_bytes(inventory.MANIFEST.read_bytes())
+            (backup / 'verify_package_inventory.py').write_bytes(verifier.read_bytes())
+            (backup / 'failed_qualification.json').write_bytes(Path(failed_qualification).read_bytes())
+            (backup / 'review.json').write_text(json.dumps(current[key], indent=2)+'\n', encoding='utf-8', newline='\n')
         verifier_source = _update_verifier_pins(verifier.read_text(encoding='utf-8'), prefix, digest, source_pins,
                                                 removals if pins_removals else None)
         inventory.MANIFEST.write_text(json.dumps(payload, indent=2) + '\n', encoding='utf-8', newline='\n')
         verifier.write_text(verifier_source, encoding='utf-8', newline='\n')
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / 'release_review_draft.json').write_text(json.dumps(review, indent=2) + '\n', encoding='utf-8')
-    (output_dir / 'release_predecessor_source_pins.json').write_text(json.dumps(source_pins, indent=2) + '\n', encoding='utf-8')
-    summary = dict(written=write, release=release, modules=len(source_pins), definitions=len(review['definitions']),
+    artifact_prefix = 'development' if development is not None else 'release'
+    (output_dir / (artifact_prefix + '_review_draft.json')).write_text(json.dumps(review, indent=2) + '\n', encoding='utf-8')
+    (output_dir / (artifact_prefix + '_predecessor_source_pins.json')).write_text(json.dumps(source_pins, indent=2) + '\n', encoding='utf-8')
+    summary = dict(written=write, release=review['release'], kind='development' if development is not None else 'release',
+                   development=development, review_key=key, modules=len(source_pins), definitions=len(review['definitions']),
                    statements=len(review['statements']), seams=len(review['local_import_seam_updates']),
                    removed_modules=sum(item.get('removed') is True for item in review['module_snapshots']), sha256=digest)
-    (output_dir / 'release_review_summary.json').write_text(json.dumps(summary, indent=2) + '\n', encoding='utf-8')
+    (output_dir / (artifact_prefix + '_review_summary.json')).write_text(json.dumps(summary, indent=2) + '\n', encoding='utf-8')
     return summary
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--release', choices=tuple(RELEASES), default='25.0.0')
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument('--release', choices=tuple(RELEASES))
+    selection.add_argument('--development', choices=tuple(DEVELOPMENTS), help='Prepare an uncommitted development audit; preserve package version and tagged release records')
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--write', action='store_true')
+    parser.add_argument('--predecessor-archive', type=Path,
+                        help='Archive-backed development successor: independently pinned reviewed or qualified predecessor source ZIP')
+    parser.add_argument('--amend-unqualified-candidate', help='Explicit expected digest of the sole documented failed prequalification candidate')
+    parser.add_argument('--failed-qualification', type=Path, help='Preserved independently pinned failed whole-source gate receipt')
     args = parser.parse_args(argv)
-    print(json.dumps(prepare(output_dir=args.output_dir, release=args.release, write=args.write)))
+    print(json.dumps(prepare(output_dir=args.output_dir, release=args.release or '25.0.0', development=args.development,
+                             write=args.write, predecessor_archive=args.predecessor_archive,
+                             amend_unqualified_candidate=args.amend_unqualified_candidate,
+                             failed_qualification=args.failed_qualification)))
 
 
 if __name__ == '__main__':

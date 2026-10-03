@@ -7,6 +7,8 @@ from pathlib import Path
 import struct
 import time
 import zlib
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -22,6 +24,32 @@ _CROP_OCCUPANCY_BAND_BYTES = 8 * 1024 * 1024
 
 class ConfidenceStageLimit(RuntimeError):
     """A local compressed stage would exceed its reserved numeric bytes."""
+
+
+def _ordered_encoded_frames(reader, first, stop, block_size, workers):
+    """Retain at most workers completed frames plus the caller's current frame."""
+    if workers <= 1:
+        for z in range(first, stop):
+            yield z, reader.encode_frame(z, block_size)
+        return
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='confidence-capture')
+    pending = deque()
+    try:
+        indices = iter(range(first, stop))
+        for _ in range(workers):
+            z = next(indices, None)
+            if z is not None:
+                pending.append((z, pool.submit(reader.encode_frame, z, block_size)))
+        while pending:
+            z, future = pending.popleft()
+            yield z, future.result()
+            following = next(indices, None)
+            if following is not None:
+                pending.append((following, pool.submit(reader.encode_frame, following, block_size)))
+    finally:
+        for _, future in pending:
+            future.cancel()
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def checked_shape(shape):
@@ -109,7 +137,7 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
                  coordinate_space='source', source_shape=None, block_size=128,
                  metrics=None, max_numeric_bytes=None):
     """Stream block index and payload; metadata is the atomic completion marker."""
-    from .confidence_evidence import SCORE_SEMANTICS, _write_json_atomic, _json_value
+    from .confidence_evidence import SCORE_SEMANTICS, _write_json_atomic, _json_value, _MaskedNativeScoreReader
     directory = Path(directory)
     shape = checked_shape(shape)
     if coordinate_space not in ('source','native_view_processing'):
@@ -135,9 +163,22 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
     read_seconds = scan_seconds = compression_seconds = storage_seconds = 0.0
     started = time.perf_counter()
     next_progress = started + 30.0
+    encoded_frames = None
+    typed_capture = (isinstance(slice_reader, _MaskedNativeScoreReader)
+                     and slice_reader.compiled_capture_capable)
+    capture_plan = slice_reader.capture_plan if typed_capture else None
+    if capture_plan is not None and (capture_plan.shape != shape or capture_plan.block_size != block_size):
+        raise ValueError('Confidence capture writer geometry/grid differs from its admitted task plan')
+    if capture_plan is None and typed_capture:
+        from .confidence_capture import plan_confidence_capture
+        capture_plan = plan_confidence_capture(shape, 1, block_size=block_size)
+    if capture_plan is not None:
+        encoded_frames = _ordered_encoded_frames(slice_reader, first, stop, block_size,
+                                                  capture_plan.workers)
     try:
         with payload_tmp.open('wb') as payload,index_tmp.open('wb') as index:
-            for z in range(first,stop):
+            frames = ((z, None) for z in range(first, stop)) if encoded_frames is None else encoded_frames
+            for z, encoded_result in frames:
                 now = time.perf_counter()
                 if now >= next_progress:
                     print(f'Confidence write progress {model_name}/{layer_key}: '
@@ -145,29 +186,40 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
                           f'blocks={blocks}, payload_bytes={payload.tell()}, elapsed_s={now-started:.1f}.',
                           flush=True)
                     next_progress = now + 30.0
-                phase_started = time.perf_counter()
-                if hasattr(slice_reader, 'iter_crops'):
-                    iterator = iter(crop_blocks(slice_reader.iter_crops(z), shape[1:], block_size))
+                if encoded_result is not None:
+                    encoded_rows, phase_metrics = encoded_result
+                    scan_seconds += phase_metrics['scan_seconds']
+                    compression_seconds += phase_metrics['compression_seconds']
+                    iterator = iter(encoded_rows)
                 else:
-                    plane = slice_reader(z)
-                    if plane is None:
-                        read_seconds += time.perf_counter() - phase_started
-                        continue
-                    values = np.asarray(plane)
-                    if values.dtype != np.uint8 or values.shape != shape[1:]:
-                        raise ValueError('Confidence slice reader returned an invalid shape or dtype')
-                    iterator = iter(plane_blocks(values,block_size))
-                read_seconds += time.perf_counter() - phase_started
+                    phase_started = time.perf_counter()
+                    if hasattr(slice_reader, 'iter_crops'):
+                        iterator = iter(crop_blocks(slice_reader.iter_crops(z), shape[1:], block_size))
+                    else:
+                        plane = slice_reader(z)
+                        if plane is None:
+                            read_seconds += time.perf_counter() - phase_started
+                            continue
+                        values = np.asarray(plane)
+                        if values.dtype != np.uint8 or values.shape != shape[1:]:
+                            raise ValueError('Confidence slice reader returned an invalid shape or dtype')
+                        iterator = iter(plane_blocks(values,block_size))
+                    read_seconds += time.perf_counter() - phase_started
                 while True:
                     phase_started = time.perf_counter()
                     item = next(iterator, None)
-                    scan_seconds += time.perf_counter() - phase_started
+                    if encoded_result is None:
+                        scan_seconds += time.perf_counter() - phase_started
                     if item is None:
                         break
-                    y0,y1,x0,x1,crop = item
-                    phase_started = time.perf_counter()
-                    encoded = zlib.compress(crop.tobytes(),level=3)
-                    compression_seconds += time.perf_counter() - phase_started
+                    if encoded_result is None:
+                        y0,y1,x0,x1,crop = item
+                        phase_started = time.perf_counter()
+                        encoded = zlib.compress(crop.tobytes(),level=3)
+                        compression_seconds += time.perf_counter() - phase_started
+                        known_in_block = int(np.count_nonzero(crop))
+                    else:
+                        y0,y1,x0,x1,known_in_block,encoded = item
                     if (max_numeric_bytes is not None
                             and payload.tell()+len(encoded)+(blocks+1)*_RECORD.size > int(max_numeric_bytes)):
                         raise ConfidenceStageLimit('Compressed confidence exceeds its local staging reservation')
@@ -177,7 +229,7 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
                     payload.write(encoded); digest.update(encoded)
                     storage_seconds += time.perf_counter() - phase_started
                     blocks += 1
-                    known += int(np.count_nonzero(crop))
+                    known += known_in_block
             payload_bytes = payload.tell()
             phase_started = time.perf_counter()
             payload.flush(); index.flush()
@@ -205,8 +257,17 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
                 compression_seconds=compression_seconds, storage_seconds=storage_seconds,
                 elapsed_seconds=time.perf_counter()-started, payload_bytes=payload_bytes,
                 index_bytes=blocks*_RECORD.size, block_count=blocks)
+            if capture_plan is not None:
+                metrics.update(capture_backend='compiled_masked_cells_ordered_frames',
+                    capture_workers=capture_plan.workers,
+                    capture_requested_workers=capture_plan.requested_workers,
+                    capture_workspace_bytes=capture_plan.workspace_bytes,
+                    capture_workspace_limit_bytes=capture_plan.workspace_limit_bytes,
+                    capture_max_pending_frames=capture_plan.max_pending_frames)
         return metadata
     finally:
+        if encoded_frames is not None:
+            encoded_frames.close()
         payload_tmp.unlink(missing_ok=True)
         index_tmp.unlink(missing_ok=True)
 

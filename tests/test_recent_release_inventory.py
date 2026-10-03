@@ -98,7 +98,11 @@ def complete_manifest():
 
 def test_v24_0_5_predecessor_pin_is_the_tagged_v24_0_4_inventory(complete_manifest):
     predecessor = {key: value for key, value in complete_manifest.items()
-                   if key not in ('v24_0_5_release_review', 'v25_0_0_release_review')}
+                   if key not in ('v24_0_5_release_review', 'v25_0_0_release_review',
+                                  'v25_outer_crop_development_review', 'v25_guarded_rescue_development_review',
+                                  'v25_job150615_development_review', 'v25_job150615_headroom_development_review',
+                                  'v25_0_1_release_review', 'v25_job150772_performance_development_review',
+                                  'v25_job150790_150798_throughput_development_review')}
     assert _digest(predecessor) == inventory.REVIEWED_V24_0_5_RELEASE_PREDECESSOR_SHA256
     assert PENDING_V24_0_5.predecessor_commit == 'f5cfdba7e2c87666a7f72683cbbd907fbd522c09'
 
@@ -110,6 +114,20 @@ def current_trees(complete_manifest):
         for release in RELEASES
         for item in complete_manifest[release.key]['module_snapshots']
     }
+    modules.update(item['module'] for item in complete_manifest.get(
+        'v25_outer_crop_development_review', {}).get('module_snapshots', ()))
+    modules.update(item['module'] for item in complete_manifest.get(
+        'v25_guarded_rescue_development_review', {}).get('module_snapshots', ()))
+    modules.update(item['module'] for item in complete_manifest.get(
+        'v25_job150615_development_review', {}).get('module_snapshots', ()))
+    modules.update(item['module'] for item in complete_manifest.get(
+        'v25_job150615_headroom_development_review', {}).get('module_snapshots', ()))
+    modules.update(item['module'] for item in complete_manifest.get(
+        'v25_0_1_release_review', {}).get('module_snapshots', ()))
+    modules.update(item['module'] for item in complete_manifest.get(
+        'v25_job150772_performance_development_review', {}).get('module_snapshots', ()))
+    modules.update(item['module'] for item in complete_manifest.get(
+        'v25_job150790_150798_throughput_development_review', {}).get('module_snapshots', ()))
     return {
         module: ast.parse(path.read_text(encoding='utf-8'))
         for module in modules
@@ -119,9 +137,24 @@ def current_trees(complete_manifest):
 
 def _at_release(complete_manifest, release):
     manifest = copy.deepcopy(complete_manifest)
+    manifest.pop('v25_job150790_150798_throughput_development_review', None)
+    manifest.pop('v25_job150772_performance_development_review', None)
+    manifest.pop('v25_0_1_release_review', None)
+    manifest.pop('v25_job150615_headroom_development_review', None)
+    manifest.pop('v25_job150615_development_review', None)
+    manifest.pop('v25_guarded_rescue_development_review', None)
+    manifest.pop('v25_outer_crop_development_review', None)
     for later in RELEASES[RELEASES.index(release) + 1:]:
         manifest.pop(later.key, None)
     return manifest
+
+
+def _development_successors(complete_manifest):
+    return tuple(complete_manifest[key] for key in ('v25_outer_crop_development_review',
+        'v25_guarded_rescue_development_review', 'v25_job150615_development_review',
+        'v25_job150615_headroom_development_review', 'v25_0_1_release_review',
+        'v25_job150772_performance_development_review',
+        'v25_job150790_150798_throughput_development_review') if key in complete_manifest)
 
 
 @pytest.mark.parametrize('release', RELEASES, ids=lambda item: item.number)
@@ -176,7 +209,7 @@ def test_reauthenticated_review_cannot_change_independent_source_pin(complete_ma
 @pytest.mark.parametrize('release', RELEASES, ids=lambda item: item.number)
 def test_current_sources_and_tools_follow_authenticated_successors(complete_manifest, current_trees, release):
     review = complete_manifest[release.key]
-    successors = tuple(complete_manifest[item.key] for item in RELEASES[RELEASES.index(release) + 1:])
+    successors = tuple(complete_manifest[item.key] for item in RELEASES[RELEASES.index(release) + 1:]) + _development_successors(complete_manifest)
     trees = {item['module']: current_trees[item['module']] for item in review['module_snapshots']
              if item['module'] in current_trees}
     inventory.verify_v22_3_source_snapshots(review, trees, successors)
@@ -194,7 +227,7 @@ def test_removed_examples_retain_their_last_source_pins(complete_manifest, curre
     manifest = _at_release(complete_manifest, RELEASES[1])
     review = manifest['v22_3_1_release_review']
     prior = manifest['v22_3_release_review']
-    successors = tuple(complete_manifest[item.key] for item in RELEASES[2:])
+    successors = tuple(complete_manifest[item.key] for item in RELEASES[2:]) + _development_successors(complete_manifest)
     trees = {item['module']: current_trees[item['module']] for item in review['module_snapshots']
              if item['module'] in current_trees}
     for snapshot in review['module_snapshots']:
@@ -252,7 +285,7 @@ def test_validation_tool_predecessor_links_are_independent(complete_manifest, re
 @pytest.mark.parametrize('release', RELEASES, ids=lambda item: item.number)
 def test_validation_tool_source_changes_are_rejected(complete_manifest, release):
     review = copy.deepcopy(complete_manifest[release.key])
-    successors = tuple(complete_manifest[item.key] for item in RELEASES[RELEASES.index(release) + 1:])
+    successors = tuple(complete_manifest[item.key] for item in RELEASES[RELEASES.index(release) + 1:]) + _development_successors(complete_manifest)
     review['validation_tools'][0]['sha256'] = '0' * 64
     with pytest.raises(RuntimeError, match='validation tool changed'):
         inventory.verify_v22_3_validation_tools(review, successors)
@@ -260,7 +293,7 @@ def test_validation_tool_source_changes_are_rejected(complete_manifest, release)
 
 def test_prior_validation_tools_require_authenticated_successor_links(complete_manifest):
     prior = complete_manifest['v22_3_release_review']
-    successors = tuple(complete_manifest[item.key] for item in RELEASES[1:])
+    successors = tuple(complete_manifest[item.key] for item in RELEASES[1:]) + _development_successors(complete_manifest)
     inventory.verify_v22_3_validation_tools(prior, successors)
     altered = list(copy.deepcopy(successors))
     inherited_path = prior['validation_tools'][0]['path']
@@ -286,6 +319,13 @@ def test_semantic_release_identifies_new_model_and_qualification_tools(complete_
 ])
 def test_retired_geometry_helper_keeps_authenticated_predecessor(complete_manifest, mutation, message):
     altered = copy.deepcopy(complete_manifest)
+    altered.pop('v25_job150790_150798_throughput_development_review', None)
+    altered.pop('v25_job150772_performance_development_review', None)
+    altered.pop('v25_0_1_release_review', None)
+    altered.pop('v25_job150615_headroom_development_review', None)
+    altered.pop('v25_job150615_development_review', None)
+    altered.pop('v25_guarded_rescue_development_review', None)
+    altered.pop('v25_outer_crop_development_review', None)
     altered.pop('v25_0_0_release_review', None)
     altered.pop('v24_0_5_release_review', None)
     altered.pop('v24_0_4_release_review', None)
@@ -307,6 +347,13 @@ def test_retired_geometry_helper_keeps_authenticated_predecessor(complete_manife
 
 def test_cleanup_retirements_require_independent_scope_and_exact_predecessor(complete_manifest):
     altered = copy.deepcopy(complete_manifest)
+    altered.pop('v25_job150790_150798_throughput_development_review', None)
+    altered.pop('v25_job150772_performance_development_review', None)
+    altered.pop('v25_0_1_release_review', None)
+    altered.pop('v25_job150615_headroom_development_review', None)
+    altered.pop('v25_job150615_development_review', None)
+    altered.pop('v25_guarded_rescue_development_review', None)
+    altered.pop('v25_outer_crop_development_review', None)
     altered.pop('v25_0_0_release_review', None)
     altered.pop('v24_0_5_release_review', None)
     review = altered['v24_0_4_release_review']

@@ -27,6 +27,12 @@ from .qsc import QSC_FACE_BASES
 
 _ROUNDING_MARGIN = 4096 * np.finfo(np.float64).eps
 
+# Closed mathematical radius endpoints must survive the rounding in a centered
+# coordinate multiply/divide, three squared components, two sums and sqrt.
+# Eight epsilons exceed that forward-error bound. This is relative to each
+# compared limit, not a voxel-sized pad or an outer-radius-derived inner pad.
+SPHERICAL_RADIUS_ROUNDOFF_RELATIVE = 8 * np.finfo(np.float64).eps
+
 
 @dataclass(frozen=True)
 class SphericalOutputBounds:

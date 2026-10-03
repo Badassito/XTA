@@ -38,14 +38,8 @@ from .geometry import (
     is_azimuthal_view,
     is_radial_view,
     is_spherical_view,
-    is_tilted_azimuthal_view,
-    is_tilted_view,
     physical_view_name,
     pretty_view_name,
-    azimuthal_base_view_name,
-    azimuthal_stack_length,
-    tilted_base_view_name,
-    tilted_stack_axis_length,
 )
 
 # Explicit lower-layer dependencies keep imports one-way.
@@ -470,13 +464,50 @@ def _d1_backproject_kernels() -> object:
       unsigned int bit = 1u << (unsigned int)(linear & 31ull);
       d1_warp_aggregated_atomic_or(output_bits, word, bit, warp_bits);
     }
+
+    extern "C" __global__ void d1_orthogonal_coverage_to_bits(
+        const unsigned char* mask, int proc_h, int proc_w,
+        const int* bbox_specs, int bbox_count, int out_t, int out_h, int out_w,
+        int stack_axis, int row_axis, int column_axis,
+        const int* z_start, const int* z_stop,
+        const int* y_start, const int* y_stop,
+        const int* x_start, const int* x_stop,
+        unsigned int* output_bits) {
+      __shared__ unsigned int warp_bits[256];
+      int index = (int)blockIdx.y;
+      if (index >= bbox_count) return;
+      const int* bbox = bbox_specs + 8 * index;
+      int local_slice = bbox[0], frame = bbox[1];
+      unsigned long long depth = (unsigned long long)(bbox[3] - bbox[2]);
+      unsigned long long height = (unsigned long long)(bbox[5] - bbox[4]);
+      unsigned long long width = (unsigned long long)(bbox[7] - bbox[6]);
+      unsigned long long q = (unsigned long long)blockDim.x * blockIdx.x + threadIdx.x;
+      if (q >= depth * height * width) return;
+      int oz = bbox[2] + (int)(q / (height * width));
+      q %= height * width;
+      int oy = bbox[4] + (int)(q / width), ox = bbox[6] + (int)(q % width);
+      int starts[3] = {z_start[oz], y_start[oy], x_start[ox]};
+      int stops[3] = {z_stop[oz], y_stop[oy], x_stop[ox]};
+      if (frame < starts[stack_axis] || frame >= stops[stack_axis]) return;
+      bool foreground = false;
+      for (int row = starts[row_axis]; row < stops[row_axis] && !foreground; ++row) {
+        for (int column = starts[column_axis]; column < stops[column_axis]; ++column) {
+          unsigned long long at = ((unsigned long long)local_slice * proc_h + row) * proc_w + column;
+          if (mask[at]) { foreground = true; break; }
+        }
+      }
+      if (!foreground) return;
+      unsigned long long linear = ((unsigned long long)oz * out_h + oy) * out_w + ox;
+      d1_warp_aggregated_atomic_or(output_bits, linear >> 5,
+          1u << (unsigned int)(linear & 31ull), warp_bits);
+    }
     '''
     try:
         import cupy as cp  # type: ignore
         module = cp.RawModule(
             code=source,
             options=('--std=c++14',),
-            name_expressions=('d1_backproject_bboxes_to_bits',),
+            name_expressions=('d1_backproject_bboxes_to_bits', 'd1_orthogonal_coverage_to_bits'),
         )
         compile_fn = getattr(module, 'compile', None)
         if callable(compile_fn):
@@ -485,6 +516,7 @@ def _d1_backproject_kernels() -> object:
             cp=cp,
             module=module,
             d1_backproject_bboxes_to_bits=module.get_function('d1_backproject_bboxes_to_bits'),
+            d1_orthogonal_coverage_to_bits=module.get_function('d1_orthogonal_coverage_to_bits'),
         )
         _D1_BACKPROJECT_KERNELS_ERROR = None
         return _D1_BACKPROJECT_KERNELS
@@ -558,6 +590,8 @@ class _D1WorkerViewState:
     exported_lease_token: str = ''
     host_fallback_path: str = ''
     bitset_owner: Optional[_D1RawCudaAllocation] = None
+    orthogonal_coverage_cache: Optional[object] = None
+    projection_kind: str = 'legacy'
 
 _D1_WORKER_VIEW_STATES: Dict[Tuple[str, str], _D1WorkerViewState] = {}
 
@@ -652,48 +686,28 @@ def _shutdown_d1_worker_pipeline() -> None:
         except TypeError:
             executor.shutdown(wait=True)
 
-def _d1_view_family_ids(view: ViewInfo) -> Tuple[int, int, int, float, int, float, float]:
-    """Return family/base/direction/shear/stack/center metadata for the CUDA kernel."""
+def _d1_require_cartesian_native_coverage(view: ViewInfo) -> None:
+    """Reject foreign/stale point-scatter tasks before any device operation."""
     if is_spherical_view(view):
         raise ValueError('D1 source-space kernels do not support Spherical QSC shells; use native union projection')
     if is_radial_view(view):
         raise ValueError('D1 source-space kernels do not support Radial shells; use native union projection')
-    if is_azimuthal_view(view):
-        family_id = 2
-        base = azimuthal_base_view_name(view)
-        tilted = bool(is_tilted_azimuthal_view(view))
-        direction = str(view.tilt_direction or 'vertical')
-        tan_tilt = (
-            math.tan(math.radians(float(view.tilt_angle_deg))) if tilted else 0.0
-        )
-        stack_len = int(azimuthal_stack_length(view))
-        center_x = float(view.center_x)
-        center_y = float(view.center_y)
-    elif is_tilted_view(view):
-        family_id = 1
-        base = tilted_base_view_name(view)
-        direction = str(view.tilt_direction or 'vertical')
-        tan_tilt = math.tan(math.radians(float(view.tilt_angle_deg)))
-        stack_len = int(tilted_stack_axis_length(view))
-        center_x = float((int(view.src_w) - 1) * 0.5)
-        center_y = float((int(view.src_h) - 1) * 0.5)
-    else:
-        family_id = 0
-        base = physical_view_name(view)
-        direction = 'vertical'
-        tan_tilt = 0.0
-        stack_len = int(view.num_slices)
-        center_x = float((int(view.src_w) - 1) * 0.5)
-        center_y = float((int(view.src_h) - 1) * 0.5)
+    if str(view.family) != 'orthogonal':
+        raise ValueError('D1 native coverage requires a Cartesian view; Tilted and Azimuthal masks must use their canonical native pull projectors')
+    if physical_view_name(view) not in ('transverse', 'sagittal', 'coronal'):
+        raise ValueError(f'D1 does not support base view {physical_view_name(view)!r}')
+
+
+def _d1_view_family_ids(view: ViewInfo) -> Tuple[int, int, int, float, int, float, float]:
+    """Return Cartesian metadata; oblique point-scatter dispatch is forbidden."""
+    _d1_require_cartesian_native_coverage(view)
+    base = physical_view_name(view)
     base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
     if str(base) not in base_ids:
         raise ValueError(f'D1 does not support base view {base!r}')
-    if direction not in ('vertical', 'horizontal'):
-        raise ValueError(f'D1 does not support tilt direction {direction!r}')
     return (
-        int(family_id), int(base_ids[str(base)]),
-        int(0 if direction == 'vertical' else 1),
-        float(tan_tilt), int(stack_len), float(center_x), float(center_y),
+        0, int(base_ids[str(base)]), 0, 0.0, int(view.num_slices),
+        float((int(view.src_w) - 1) * 0.5), float((int(view.src_h) - 1) * 0.5),
     )
 
 def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionAccumulator') -> _D1WorkerViewState:
@@ -701,10 +715,7 @@ def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionA
     view = task.get('view')
     if not isinstance(view, ViewInfo):
         raise TypeError('D1 task is missing ViewInfo metadata')
-    if is_spherical_view(view):
-        raise ValueError('D1 source-space kernels do not support Spherical QSC shells; use native union projection')
-    if is_radial_view(view):
-        raise ValueError('D1 source-space kernels do not support Radial shells; use native union projection')
+    _d1_require_cartesian_native_coverage(view)
     key = (str(task.get('model_name', '')), str(view.name))
     output_shape = tuple(int(v) for v in task.get('d1_output_shape', ()))
     if len(output_shape) != 3 or any(int(v) <= 0 for v in output_shape):
@@ -1960,6 +1971,7 @@ def _d1_consume_device_union(
     view = task.get('view')
     if not isinstance(view, ViewInfo):
         raise TypeError('D1 task has no ViewInfo')
+    _d1_require_cartesian_native_coverage(view)
     state = _d1_get_or_create_state(task, accumulator)
     s0 = int(task.get('slice_start', 0))
     count = int(task.get('slice_count', 0))
@@ -2012,35 +2024,50 @@ def _d1_consume_device_union(
         _d1_prepare_bbox_launch_plan(slice_any, slice_bboxes, mask_shape)
     )
     nonempty_slices = int(bbox_specs_host.shape[0])
-    bbox_specs_cp = cp.asarray(bbox_specs_host)
-    for grid_x_blocks, first_spec, spec_count in bbox_launch_groups:
-        group_specs_cp = bbox_specs_cp[
-            int(first_spec):int(first_spec) + int(spec_count)
-        ]
-        kernels.d1_backproject_bboxes_to_bits(
-            (int(grid_x_blocks), int(spec_count)), (_D1_BACKPROJECT_THREADS,),
-            (
-                mask_cp,
-                np.int32(mask_shape[1]), np.int32(mask_shape[2]),
-                np.int32(s0), group_specs_cp, np.int32(spec_count),
-                np.int32(view.num_slices), np.int32(view.src_h), np.int32(view.src_w),
-                np.int32(view.full_t), np.int32(view.full_h), np.int32(view.full_w),
-                np.int32(state.output_shape[0]), np.int32(state.output_shape[1]),
-                np.int32(state.output_shape[2]),
-                np.int32(family_id), np.int32(base_id), np.int32(direction_id),
-                np.float32(tan_tilt), np.int32(stack_len),
-                np.float32(center_x), np.float32(center_y), np.float32(view.roi_radius),
-                state.angle_cos, state.angle_sin,
-                bitset_cp,
-            ),
-            stream=stream,
-        )
+    if family_id == 0:
+        from .d1_orthogonal_coverage import build_orthogonal_coverage_plan, coverage_launch_groups, ORTHOGONAL_COVERAGE_CONTRACT
+        state.projection_kind = ORTHOGONAL_COVERAGE_CONTRACT
+        cache = getattr(state, 'orthogonal_coverage_cache', None)
+        full_shape = (int(view.num_slices), *mask_shape[1:])
+        if cache is None:
+            plan = build_orthogonal_coverage_plan(view, full_shape, state.output_shape)
+            device_ranges = tuple(cp.asarray(value) for pair in plan.source_ranges_tyx for value in pair)
+            cache = (plan, device_ranges)
+            state.orthogonal_coverage_cache = cache
+        plan, device_ranges = cache
+        if plan.processing_shape_tyx != full_shape or plan.source_shape_tyx != tuple(state.output_shape):
+            raise RuntimeError('D1 orthogonal categorical projection geometry changed within a view')
+        groups = coverage_launch_groups(plan, bbox_specs_host, s0)
+        for cells, specs in groups:
+            kernels.d1_orthogonal_coverage_to_bits(
+                ((int(cells) + _D1_BACKPROJECT_THREADS - 1) // _D1_BACKPROJECT_THREADS, len(specs)),
+                (_D1_BACKPROJECT_THREADS,),
+                (mask_cp, np.int32(mask_shape[1]), np.int32(mask_shape[2]), cp.asarray(specs),
+                 np.int32(len(specs)), *tuple(np.int32(value) for value in state.output_shape),
+                 np.int32(plan.input_axes_tyx.index(0)), np.int32(plan.input_axes_tyx.index(1)),
+                 np.int32(plan.input_axes_tyx.index(2)), *device_ranges, bitset_cp), stream=stream)
+        launch_count = len(groups)
+        runtime_telemetry().add('d1.orthogonal_categorical_coverage_launches', launch_count)
+    else:
+        bbox_specs_cp = cp.asarray(bbox_specs_host)
+        for grid_x_blocks, first_spec, spec_count in bbox_launch_groups:
+            group_specs_cp = bbox_specs_cp[int(first_spec):int(first_spec) + int(spec_count)]
+            kernels.d1_backproject_bboxes_to_bits(
+                (int(grid_x_blocks), int(spec_count)), (_D1_BACKPROJECT_THREADS,),
+                (mask_cp, np.int32(mask_shape[1]), np.int32(mask_shape[2]), np.int32(s0),
+                 group_specs_cp, np.int32(spec_count), np.int32(view.num_slices),
+                 np.int32(view.src_h), np.int32(view.src_w), np.int32(view.full_t),
+                 np.int32(view.full_h), np.int32(view.full_w), *tuple(np.int32(value) for value in state.output_shape),
+                 np.int32(family_id), np.int32(base_id), np.int32(direction_id), np.float32(tan_tilt),
+                 np.int32(stack_len), np.float32(center_x), np.float32(center_y), np.float32(view.roi_radius),
+                 state.angle_cos, state.angle_sin, bitset_cp), stream=stream)
+        launch_count = len(bbox_launch_groups)
     # The Torch-owned task mask is retired below and completion may copy the bitset through a
     # Torch stream. Keep this cross-framework lifetime/order barrier until those operations are
     # joined by explicit CUDA events and allocator record-stream ownership.
     stream.synchronize()
     runtime_telemetry().add(
-        'd1.backprojection_kernel_launches', int(len(bbox_launch_groups)),
+        'd1.backprojection_kernel_launches', int(launch_count),
     )
     shadow_writer = state.view_shadow_writer
     if shadow_writer is not None:

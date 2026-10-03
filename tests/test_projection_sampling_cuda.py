@@ -34,7 +34,12 @@ def _views(shape, size, *, expanded=False):
 
 
 def _domain(view):
-    """Independent source-voxel center membership, without sampled shell indices."""
+    """Independent physical ROI and rectilinear height-cell membership.
+
+    Height samples cover [-.5,N-.5), including tilted first/last half cells.
+    Radius remains the declared closed physical annulus, without dilation or
+    dependence on the sampled shell grid or production projection helpers.
+    """
     t, y, x = np.indices((view.full_t, view.full_h, view.full_w))
     if view.family == 'spherical':
         radius = np.sqrt((t-(view.full_t-1)/2.)**2 + (y-(view.full_h-1)/2.)**2
@@ -53,7 +58,7 @@ def _domain(view):
         height -= math.tan(math.radians(view.tilt_angle_deg)) * (
             dy if view.tilt_direction == 'vertical' else dx)
     return ((radius >= view.radial_min_radius) & (radius <= view.radial_max_radius)
-            & (height >= 0.) & (height <= length-1))
+            & (height >= -.5) & (height < length-.5))
 
 
 def _project_pair(data, view, shape):

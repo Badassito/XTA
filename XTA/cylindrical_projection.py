@@ -40,6 +40,7 @@ _PLANE_PLAN_CACHE_SIZE = 0
 _PLANE_PLAN_INFLIGHT = {}
 _PLANE_PLAN_CACHE_GENERATION = 0
 _PLANE_PLAN_LOCK = threading.Lock()
+_RADIAL_CLOSED_BOUND_EPS = 8.0 * np.finfo(np.float64).eps
 
 
 class _RadialPlanePlanTooLarge(RuntimeError):
@@ -84,6 +85,19 @@ def _plane_geometry(view, output_shape):
     return base, tuple(work[a] for a in axes), tuple(output_shape[a] for a in axes)
 
 
+def _centered_output_coordinates(indices, work_count, output_count, center):
+    """Map output centers without subtracting two separately rounded origins."""
+    return (((2.0 * np.asarray(indices, np.float64) + 1.0 - output_count) * work_count)
+            / (2.0 * output_count) + ((work_count - 1.0) * .5 - center))
+
+
+def _inside_closed_radial_limits(radius, minimum, maximum):
+    """Admit only float64 roundoff at each independently scaled closed bound."""
+    lower = _RADIAL_CLOSED_BOUND_EPS * np.maximum(np.abs(radius), abs(minimum))
+    upper = _RADIAL_CLOSED_BOUND_EPS * np.maximum(np.abs(radius), abs(maximum))
+    return (radius >= minimum - lower) & (radius <= maximum + upper)
+
+
 def _plane_occurrence_strips(view, radii, output_shape, *, first_pixel=0, stop_pixel=None,
                              chunk_pixels=_PULL_CHUNK_VOXELS):
     """Evaluate the original pull equations once per bounded 2D strip."""
@@ -94,13 +108,12 @@ def _plane_occurrence_strips(view, radii, output_shape, *, first_pixel=0, stop_p
     for first in range(first_pixel, stop_pixel, chunk_pixels):
         flat = np.arange(first, min(stop_pixel, first + chunk_pixels), dtype=np.int64)
         yy, xx = flat // width, flat % width
-        xx = (xx + .5) * work_plane[1] / width - .5
-        yy = (yy + .5) * work_plane[0] / height - .5
-        dx, dy = xx - float(view.center_x), yy - float(view.center_y)
+        dx = _centered_output_coordinates(xx, work_plane[1], width, float(view.center_x))
+        dy = _centered_output_coordinates(yy, work_plane[0], height, float(view.center_y))
         radius = np.hypot(dx, dy)
         global_shell = _nearest_global_shell(radius, radii)
         shell = global_shell - int(view.radial_shell_start)
-        valid = ((radius >= float(view.radial_min_radius)) & (radius <= float(view.radial_max_radius))
+        valid = (_inside_closed_radial_limits(radius, float(view.radial_min_radius), float(view.radial_max_radius))
                  & (shell >= 0) & (shell < int(view.num_slices)))
         local = np.flatnonzero(valid.reshape(-1))
         if not local.size:
@@ -262,12 +275,13 @@ def _radial_projection_metadata(view, source_shape, output_shape, plan):
     stack_axis = (0, 1, 2)[plan.base_id]
     work = (int(view.full_t), int(view.full_h), int(view.full_w))
     stack_length = work[stack_axis]
-    stack_centers = (np.arange(output_shape[stack_axis], dtype=np.float64) + .5) * stack_length / output_shape[stack_axis] - .5
+    stack_centers = _centered_output_coordinates(np.arange(output_shape[stack_axis]),
+                                                stack_length, output_shape[stack_axis], 0.)
     _, work_plane, plane = _plane_geometry(view, output_shape)
     vertical = str(view.tilt_direction) == 'vertical'
     axis = 0 if vertical else 1
     center = float(view.center_y if vertical else view.center_x)
-    ideal = (np.arange(plane[axis], dtype=np.float64) + .5) * work_plane[axis] / plane[axis] - .5 - center
+    ideal = _centered_output_coordinates(np.arange(plane[axis]), work_plane[axis], plane[axis], center)
     sampled = np.zeros((int(view.num_slices), int(view.src_w)), np.float64)
     if bool(view.radial_tilted_source):
         tangent = math.tan(math.radians(float(view.tilt_angle_deg)))
@@ -299,7 +313,10 @@ def _gather_radial_pixel(source, shells, offsets, columns, sampled, row_map, col
     if use_bboxes and (bboxes[shell, 1] <= bboxes[shell, 0] or bboxes[shell, 3] <= bboxes[shell, 2]):
         return np.uint8(0)
     ideal_height = stack - ideal_shear
-    if ideal_height < 0.0 or ideal_height > stack_length - 1:
+    # Rectilinear samples own half-open voxel cells, including the first/last
+    # half cell during source-grid upscaling. The physical annulus check stays
+    # in the plane plan; this is height coverage, not radius dilation.
+    if ideal_height < -0.5 or ideal_height >= stack_length - 0.5:
         return np.uint8(0)
     best_score = np.uint8(0)
     for at in range(offsets[p], offsets[p + 1]):
@@ -357,24 +374,36 @@ def _pull_radial_range_into(
     """Evaluate exact shell/wrap coordinates into one caller-owned flat strip."""
     stack_length = work_t if base_id == 0 else (work_h if base_id == 1 else work_w)
     two_pi = 2.0 * math.pi
-    wt = (float(z) + 0.5) * work_t / out_t - 0.5
+    wt = ((2.0*z + 1.0 - out_t)*work_t)/(2.0*out_t) + (work_t-1.0)*.5
     for offset in range(result.size):
         pixel = first + offset
         y, x = pixel // out_w, pixel % out_w
-        wy = (float(y) + 0.5) * work_h / out_h - 0.5
-        wx = (float(x) + 0.5) * work_w / out_w - 0.5
+        wy = ((2.0*y + 1.0 - out_h)*work_h)/(2.0*out_h) + (work_h-1.0)*.5
+        wx = ((2.0*x + 1.0 - out_w)*work_w)/(2.0*out_w) + (work_w-1.0)*.5
         if base_id == 0:
             stack, py, px = wt, wy, wx
         elif base_id == 1:
             stack, py, px = wy, wt, wx
         else:
             stack, py, px = wx, wt, wy
-        dx, dy = px - center_x, py - center_y
+        # The direct fallback must use the same centered coordinate order as
+        # the shared plane plan, including rational source-grid restoration.
+        if base_id == 0:
+            dx = ((2.0*x + 1.0 - out_w)*work_w)/(2.0*out_w) + ((work_w-1.0)*.5-center_x)
+            dy = ((2.0*y + 1.0 - out_h)*work_h)/(2.0*out_h) + ((work_h-1.0)*.5-center_y)
+        elif base_id == 1:
+            dx = ((2.0*x + 1.0 - out_w)*work_w)/(2.0*out_w) + ((work_w-1.0)*.5-center_x)
+            dy = ((2.0*z + 1.0 - out_t)*work_t)/(2.0*out_t) + ((work_t-1.0)*.5-center_y)
+        else:
+            dx = ((2.0*y + 1.0 - out_h)*work_h)/(2.0*out_h) + ((work_h-1.0)*.5-center_x)
+            dy = ((2.0*z + 1.0 - out_t)*work_t)/(2.0*out_t) + ((work_t-1.0)*.5-center_y)
         radius = math.hypot(dx, dy)
-        if radius < min_radius or radius > max_radius:
+        lower_tolerance = _RADIAL_CLOSED_BOUND_EPS * max(abs(radius), abs(min_radius))
+        upper_tolerance = _RADIAL_CLOSED_BOUND_EPS * max(abs(radius), abs(max_radius))
+        if radius < min_radius - lower_tolerance or radius > max_radius + upper_tolerance:
             continue
         ideal_height = stack - tangent * (dy if vertical else dx) if tilted else stack
-        if ideal_height < 0.0 or ideal_height > stack_length - 1:
+        if ideal_height < -0.5 or ideal_height >= stack_length - 0.5:
             continue
         # searchsorted(left): an exact midpoint belongs to the inner shell.
         lo, hi = 0, len(radii)

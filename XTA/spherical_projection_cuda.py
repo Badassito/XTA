@@ -15,7 +15,7 @@ import time
 import numpy as np
 
 from .qsc import QSC_FACE_BASES
-from .spherical_projection_bounds import spherical_output_bounds
+from .spherical_projection_bounds import spherical_output_bounds, SPHERICAL_RADIUS_ROUNDOFF_RELATIVE
 from .spherical_preflight import validate_spherical_preflight_plane
 
 from .cylindrical_cuda_projection import (
@@ -58,11 +58,12 @@ extern "C" __global__ void project_spherical_qsc(
     unsigned long long rem = q % plane;
     int y = roi_y0 + (int)(rem / roi_width), x = roi_x0 + (int)(rem % roi_width);
     unsigned long long output_at = ((unsigned long long)(z - first_z) * out_h + y) * out_w + x;
-    double dx = (((x + .5) * work_w / out_w) - .5) - ((work_w - 1) / 2.0);
-    double dy = (((y + .5) * work_h / out_h) - .5) - ((work_h - 1) / 2.0);
-    double dz = (((z + .5) * work_t / out_t) - .5) - ((work_t - 1) / 2.0);
+    double dx = ((x + .5) - out_w / 2.0) * work_w / out_w;
+    double dy = ((y + .5) - out_h / 2.0) * work_h / out_h;
+    double dz = ((z + .5) - out_t / 2.0) * work_t / out_t;
     double radius = sqrt((dx * dx + dy * dy) + dz * dz);
-    if (radius < minimum || radius > maximum) return;
+    if ((radius < minimum && minimum - radius > SPHERICAL_RADIUS_ROUNDOFF_RELATIVE * fmax(radius, minimum)) ||
+        (radius > maximum && radius - maximum > SPHERICAL_RADIUS_ROUNDOFF_RELATIVE * fmax(radius, maximum))) return;
     double lx = (dx * rotation[0] + dy * rotation[3]) + dz * rotation[6];
     double ly = (dx * rotation[1] + dy * rotation[4]) + dz * rotation[7];
     double lz = (dx * rotation[2] + dy * rotation[5]) + dz * rotation[8];
@@ -116,7 +117,7 @@ extern "C" __global__ void project_spherical_qsc(
     if (cropped) source_at = offsets[shell] + (unsigned long long)(pr - boxes[box]) * (boxes[box + 3] - boxes[box + 2]) + (pc - boxes[box + 2]);
     out[output_at] = source[source_at] != 0;
 }
-'''
+'''.replace('SPHERICAL_RADIUS_ROUNDOFF_RELATIVE', format(SPHERICAL_RADIUS_ROUNDOFF_RELATIVE, '.17g'))
 
 
 class SphericalCudaProjector:

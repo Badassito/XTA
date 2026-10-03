@@ -10,7 +10,7 @@ from unittest import mock
 import numpy as np
 
 
-from XTA import pta
+from XTA import __version__, pta
 from XTA import pta_publication
 from XTA import pta_rendering
 from XTA.pta_config import parse_pta_args
@@ -1072,7 +1072,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             )
             voxel = json.loads(voxel_path.read_text())
 
-        self.assertEqual(manifest["pipeline_version"], "25.0.0")
+        self.assertEqual(manifest["pipeline_version"], __version__)
         self.assertEqual(manifest["mode"], "pta")
         self.assertEqual(
             manifest["determinism_contract"],
