@@ -20,7 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
 
@@ -40,6 +40,91 @@ def _integer(value: object, name: str) -> int:
         return int(operator.index(value))
     except TypeError as exc:
         raise TypeError(f"{name} must be an integer") from exc
+
+
+@dataclass(frozen=True)
+class SamTrackerFamily:
+    """Sealed job identities and one parent-only lazy seed factory.
+
+    No masks or tracker state are retained by this descriptor. The factory is
+    called only after one worker is available for its next original input index.
+    """
+
+    family_id: str
+    input_indices: tuple[int, ...]
+    run_ids: tuple[str, ...]
+    request_factory: Callable[[int], Mapping[str, object]]
+    frame_work_proxy: int = 0
+
+    def __post_init__(self):
+        if not isinstance(self.family_id, str) or not self.family_id:
+            raise ValueError("SAM family identity must be a nonempty string")
+        identity = self.family_id
+        indices = tuple(_integer(index, "family input_index") for index in self.input_indices)
+        runs = tuple(self.run_ids)
+        if not identity or not indices or len(indices) != len(runs):
+            raise ValueError("SAM family needs an identity and matching nonempty index/run inventories")
+        if min(indices) < 0 or len(set(indices)) != len(indices) or any(not isinstance(value,str) or not value for value in runs):
+            raise ValueError("SAM family input indices/run identities must be valid and unique")
+        if len(set(runs)) != len(runs) or not callable(self.request_factory):
+            raise ValueError("SAM family requires unique run IDs and a callable lazy request factory")
+        work = _integer(self.frame_work_proxy, "family frame_work_proxy")
+        if work < 0:
+            raise ValueError("SAM family work proxy cannot be negative")
+        object.__setattr__(self, "family_id", identity)
+        object.__setattr__(self, "input_indices", indices)
+        object.__setattr__(self, "run_ids", runs)
+        object.__setattr__(self, "frame_work_proxy", work)
+
+
+class _FamilyDispatch:
+    """At most one family cursor per worker; pending descriptors hold no seeds."""
+
+    def __init__(self, families, schedule):
+        sealed = tuple(families)
+        if any(not isinstance(family, SamTrackerFamily) for family in sealed):
+            raise TypeError("Family scheduling requires sealed SamTrackerFamily descriptors")
+        identities = [family.family_id for family in sealed]
+        indices = [index for family in sealed for index in family.input_indices]
+        runs = [run_id for family in sealed for run_id in family.run_ids]
+        if len(set(identities)) != len(identities) or len(set(indices)) != len(indices) or len(set(runs)) != len(runs):
+            raise ValueError("SAM family schedule contains duplicate family/index/run ownership")
+        if schedule not in {"fifo", "lpt"}:
+            raise ValueError("Experimental SAM family schedule must be fifo or lpt")
+        if schedule == "lpt":
+            sealed = tuple(sorted(sealed, key=lambda value: (-value.frame_work_proxy, value.input_indices[0])))
+        self.waiting = iter(sealed)
+        self.waiting_exhausted = False
+        self.active = {}
+        self.total_jobs = len(indices)
+        self.assigned_families = self.completed_families = self.peak_active = 0
+
+    def next_for(self, free_devices):
+        for device in sorted(free_devices):
+            current = self.active.get(device)
+            if current is not None and current[1] == len(current[0].input_indices):
+                self.completed_families += 1
+                del self.active[device]
+                current = None
+            if current is None and not self.waiting_exhausted:
+                family = next(self.waiting, None)
+                if family is None:
+                    self.waiting_exhausted = True
+                else:
+                    current = (family, 0)
+                    self.active[device] = current
+                    self.assigned_families += 1
+                    self.peak_active = max(self.peak_active, len(self.active))
+            if current is None:
+                continue
+            family, position = current
+            index = family.input_indices[position]
+            self.active[device] = (family, position + 1)
+            request = family.request_factory(index)
+            if not isinstance(request, Mapping) or str(request.get("run_id")) != family.run_ids[position]:
+                raise RuntimeError("SAM family factory changed its immutable original run identity")
+            return device, index, family.family_id, request
+        return None
 
 
 def _atomic_npz(path: Path, **arrays: object) -> None:
@@ -129,6 +214,7 @@ class _SubmittedRun:
     task: Any
     output_directory: Path
     affinity_key: tuple[object, ...]
+    family_id: str | None = None
 
 
 def execute_interpolation_tracker_task(
@@ -139,7 +225,7 @@ def execute_interpolation_tracker_task(
     from .lta_experimental import run_mask_seed_session
     from .lta_outputs import write_json_atomically
     from .lta_rendering import LtaPhysicalViewCacheRef, render_native_tile_window
-    from .lta_sam import SamSessionPlan
+    from .lta_sam import SamInterpolationSessionPlan
     from .lta_worker_adapter import _jsonable
 
     worker_started = time.monotonic()
@@ -167,10 +253,18 @@ def execute_interpolation_tracker_task(
         raise ValueError("SAM endpoint sessions require forward or backward propagation")
     if not start <= prompt < stop:
         raise ValueError("SAM seed frame lies outside the bounded interval")
-    session = SamSessionPlan(
+    session = SamInterpolationSessionPlan(
         sequence_id=str(payload["run_id"]), session_index=0,
         frame_start=start, frame_stop=stop,
     )
+    from .sam_resources import cpu_session_bytes
+    image_side = int(getattr(getattr(context.predictor, "model", None), "image_size", 1008))
+    cpu_admission = cpu_session_bytes(session.frame_count, shape[0] * shape[1], image_side=image_side)
+    cpu_budget = _integer(payload.get("session_cpu_budget_bytes", 2 * 1024**3), "session_cpu_budget_bytes")
+    if cpu_budget <= 0 or cpu_admission["estimated_peak_bytes"] > cpu_budget:
+        raise MemoryError(f"SAM interpolation known CPU session buffers require {cpu_admission['estimated_peak_bytes']} "
+                          f"bytes; admitted budget is {cpu_budget}; full interval was not started or truncated")
+    cpu_admission["budget_bytes"] = cpu_budget
     render_started = time.perf_counter()
     resource = render_native_tile_window(
         cache_ref, frame_start=start, frame_stop=stop, tile_xyxy=crop,
@@ -242,6 +336,7 @@ def execute_interpolation_tracker_task(
     manifest = {
         "schema": "xta.sam-raw-tracker-run/1", "run_id": str(payload["run_id"]),
         "status": "invalid_removed_object" if bool(removed.any()) else "complete",
+        "session_cpu_admission": cpu_admission,
         "prediction_valid": not bool(removed.any()),
         "coverage_complete": True, "crop_xyxy": list(crop), "seed_frame": prompt,
         "seed_artifact_sha256": str(payload["seed_sha256"]),
@@ -352,6 +447,7 @@ class SamInterpolationTracker:
         profile: str = "auto", startup_timeout: float = 300.0,
         feature_cache_bytes: int = 512 * 1024 * 1024,
         feature_cache_headroom_bytes: int | None = None,
+        session_cpu_budget_bytes: int = 2 * 1024**3,
     ) -> None:
         self.model_path = str(model_path)
         self.device_ids = tuple(_integer(value, "device_id") for value in device_ids)
@@ -360,6 +456,9 @@ class SamInterpolationTracker:
         self.artifact_root = Path(artifact_root).resolve(strict=False)
         self.profile = str(profile)
         self.startup_timeout = float(startup_timeout)
+        self.session_cpu_budget_bytes = _integer(session_cpu_budget_bytes, "session_cpu_budget_bytes")
+        if self.session_cpu_budget_bytes <= 0:
+            raise ValueError("SAM session CPU byte budget must be positive")
         self.feature_cache_bytes = _integer(feature_cache_bytes, "feature_cache_bytes")
         self.feature_cache_headroom_bytes = (
             None if feature_cache_headroom_bytes is None
@@ -466,7 +565,7 @@ class SamInterpolationTracker:
         self, request: Mapping[str, object], *, cache_ref: object,
         input_index: int, staging_directories: set[Path],
     ) -> _SubmittedRun:
-        from .lta_sam import SamSessionPlan
+        from .lta_sam import SamInterpolationSessionPlan
         from .lta_workers import LtaWorkerTask
 
         if not isinstance(request, Mapping):
@@ -479,7 +578,7 @@ class SamInterpolationTracker:
         stop = _integer(request["frame_stop"], "frame_stop")
         prompt = _integer(request["seed_frame"], "seed_frame")
         direction = str(request["direction"])
-        SamSessionPlan(sequence_id=str(run_id), session_index=0, frame_start=start, frame_stop=stop)
+        SamInterpolationSessionPlan(sequence_id=str(run_id), session_index=0, frame_start=start, frame_stop=stop)
         if not start <= prompt < stop or direction not in {"forward", "backward"}:
             raise ValueError("SAM endpoint seed/direction does not fit its bounded session")
         crop = tuple(_integer(value, "crop coordinate") for value in request["crop_xyxy"])
@@ -493,6 +592,17 @@ class SamInterpolationTracker:
         seed = np.asarray(request["seed_mask"])
         if seed.dtype != np.bool_ or seed.shape != (y1 - y0, x1 - x0) or not bool(seed.any()):
             raise ValueError("SAM original endpoint seed must be boolean nonempty crop-space HxW")
+        from .sam_resources import cpu_session_bytes
+        cpu_budget = self.session_cpu_budget_bytes
+        resource_profile = request.get("resource_profile")
+        if resource_profile is not None:
+            from .sam_resources import validate_live_sam_resource_profile
+            assigned = validate_live_sam_resource_profile(resource_profile)
+            cpu_budget = int(assigned["assigned_session_cpu_bytes"])
+        cpu_admission = cpu_session_bytes(stop - start, (y1 - y0) * (x1 - x0))
+        if cpu_admission["estimated_peak_bytes"] > cpu_budget:
+            raise MemoryError(f"SAM interpolation known CPU session buffers require {cpu_admission['estimated_peak_bytes']} "
+                              f"bytes; admitted budget is {cpu_budget}; full interval was not staged or truncated")
         metadata = _request_metadata(request.get("metadata"))
         token = uuid.uuid4().hex
         output_dir = self.artifact_root / f"run-{self._run_index:06d}-{token}"
@@ -506,6 +616,7 @@ class SamInterpolationTracker:
                      "seed_sha256": _sha256(seed_path), "image_cache": cache_ref.payload(),
                      "crop_xyxy": list(crop), "seed_frame": prompt, "frame_start": start,
                      "frame_stop": stop, "direction": direction, "output_dir": str(output_dir),
+                     "session_cpu_budget_bytes": cpu_budget,
                      "request_metadata": metadata,
                      "input_index": int(input_index), "prepared_monotonic": time.monotonic()},
         )
@@ -534,6 +645,8 @@ class SamInterpolationTracker:
     def iter_results(
         self, requests: Iterable[Mapping[str, object]], *,
         source_cache_ref: object | None = None, max_in_flight: int | None = None,
+        defer_refill_until_consumed: bool = False,
+        _family_dispatch: _FamilyDispatch | None = None,
     ) -> Iterator[tuple[int, SamTrackerRunResult]]:
         """Yield attributable completions with bounded, work-conserving dispatch.
 
@@ -552,6 +665,8 @@ class SamInterpolationTracker:
         from .lta_rendering import LtaPhysicalViewCacheRef
 
         capacity = len(self.device_ids) if max_in_flight is None else _integer(max_in_flight, "max_in_flight")
+        if not isinstance(defer_refill_until_consumed, bool):
+            raise TypeError("SAM refill deferral must be boolean")
         if not 1 <= capacity <= len(self.device_ids):
             raise ValueError("max_in_flight must be between one and the admitted worker count")
         while not self._dispatch_lock.acquire(timeout=0.05):
@@ -563,6 +678,8 @@ class SamInterpolationTracker:
         try:
             if self._closed or self._cancel.is_set():
                 raise RuntimeError(self._cancel_reason if self._cancel.is_set() else "SAM tracker has been closed")
+            if _family_dispatch is not None:
+                self.dispatch_stats['family_execution_order'] = []
             cache_ref = source_cache_ref if source_cache_ref is not None else self._source_cache_ref
             if not isinstance(cache_ref, LtaPhysicalViewCacheRef):
                 raise RuntimeError("SAM tracker requires an immutable image cache for this iterator")
@@ -580,15 +697,25 @@ class SamInterpolationTracker:
                     return False
                 if self._cancel.is_set():
                     raise RuntimeError(self._cancel_reason)
-                try:
-                    request = next(iterator)
-                except StopIteration:
-                    source_exhausted = True
-                    return False
+                family_id = None
+                chosen_device = None
+                if _family_dispatch is None:
+                    try:
+                        request = next(iterator)
+                    except StopIteration:
+                        source_exhausted = True
+                        return False
+                    input_index = next_index
+                else:
+                    chosen = _family_dispatch.next_for(free_devices)
+                    if chosen is None:
+                        return False
+                    chosen_device, input_index, family_id, request = chosen
                 prepared = self._prepare_task(
-                    request, cache_ref=cache_ref, input_index=next_index,
+                    request, cache_ref=cache_ref, input_index=input_index,
                     staging_directories=staging_directories,
                 )
+                del request
                 if prepared.task.work_id in seen_run_ids:
                     raise ValueError(f"duplicate SAM run_id in one iterator: {prepared.task.work_id}")
                 seen_run_ids.add(prepared.task.work_id)
@@ -604,9 +731,11 @@ class SamInterpolationTracker:
                     kind=prepared.task.kind, payload=payload,
                 )
                 prepared = _SubmittedRun(prepared.input_index, queued_task,
-                                         prepared.output_directory, prepared.affinity_key)
+                                         prepared.output_directory, prepared.affinity_key, family_id)
                 owner = self._crop_affinity.get(prepared.affinity_key)
-                if owner in free_devices:
+                if chosen_device is not None:
+                    device = chosen_device
+                elif owner in free_devices:
                     device = owner
                     self.dispatch_stats["affinity_hits"] += 1
                 else:
@@ -623,6 +752,10 @@ class SamInterpolationTracker:
                 pending[(prepared.task.work_id, prepared.task.attempt_token)] = (prepared, device)
                 self.dispatch_stats["submitted"] += 1
                 self.dispatch_stats["peak_in_flight"] = max(self.dispatch_stats["peak_in_flight"], len(pending))
+                if _family_dispatch is not None:
+                    self.dispatch_stats["family_active_peak"] = _family_dispatch.peak_active
+                    self.dispatch_stats["family_assigned"] = _family_dispatch.assigned_families
+                    self.dispatch_stats['family_execution_order'].append(prepared.input_index)
                 return True
 
             while len(pending) < capacity and submit_next():
@@ -640,8 +773,9 @@ class SamInterpolationTracker:
                 free_devices.add(device)
                 # Start the next GPU session before CPU transfer verification and
                 # evidence packing; completed and active runs never share masks.
-                while len(pending) < capacity and submit_next():
-                    pass
+                if not defer_refill_until_consumed:
+                    while len(pending) < capacity and submit_next():
+                        pass
                 artifact_path = Path(event.artifact_path).resolve(strict=True)
                 if artifact_path != prepared.output_directory.resolve(strict=True) / "manifest.json":
                     raise RuntimeError("SAM worker manifest escaped its assigned run staging directory")
@@ -665,13 +799,23 @@ class SamInterpolationTracker:
                     raise RuntimeError("SAM raw evidence changed its immutable original-run/tile attribution")
                 receipt = dict(result.receipt)
                 receipt["dispatch"] = {"input_index": prepared.input_index,
-                                       "execution_device_id": device, "worker_pid": event.worker_pid}
+                                       "execution_device_id": device, "worker_pid": event.worker_pid,
+                                       "refill_after_consumption": defer_refill_until_consumed}
+                if _family_dispatch is not None:
+                    receipt["dispatch"]["family_id"] = prepared.family_id
                 result = SamTrackerRunResult(result.frames, result.tracker_scores, result.observation_status, receipt)
                 self.dispatch_stats["completed"] += 1
                 yield prepared.input_index, result
                 self._remove_staging(prepared.output_directory)
                 staging_directories.discard(prepared.output_directory)
                 del result
+                if defer_refill_until_consumed:
+                    while len(pending) < capacity and submit_next():
+                        pass
+            if _family_dispatch is not None:
+                if next_index != _family_dispatch.total_jobs:
+                    raise RuntimeError("SAM family dispatcher omitted immutable original jobs")
+                self.dispatch_stats["family_completed"] = _family_dispatch.completed_families
             complete = True
         finally:
             primary_error = sys.exc_info()[1]
@@ -704,6 +848,27 @@ class SamInterpolationTracker:
                 add_note = getattr(primary_error, "add_note", None)
                 if callable(add_note):
                     add_note(f"SAM bounded staging cleanup also failed: {type(cleanup_error).__name__}: {cleanup_error}")
+
+    def iter_family_results(
+        self, families: Sequence[SamTrackerFamily], *,
+        source_cache_ref: object | None = None, max_in_flight: int | None = None,
+        defer_refill_until_consumed: bool = False, schedule: str = "fifo",
+    ) -> Iterator[tuple[int, SamTrackerRunResult]]:
+        """Family-local dispatch, yielding immutable original indices.
+
+        One family stays on one worker through its independently seeded runs.
+        Ready workers take another family immediately; after all unassigned
+        families are exhausted, the final family tail can leave workers idle.
+        LPT uses declared frame work only and is a diagnostic ordering option.
+        Flat/tiled callers continue to use the existing ``iter_results`` path.
+        """
+        if not isinstance(families, (tuple, list)):
+            raise TypeError("SAM family inventory must be a finite metadata sequence")
+        dispatcher = _FamilyDispatch(families, schedule)
+        capacity = len(self.device_ids) if max_in_flight is None else max_in_flight
+        yield from self.iter_results((), source_cache_ref=source_cache_ref,
+            max_in_flight=capacity, defer_refill_until_consumed=defer_refill_until_consumed,
+            _family_dispatch=dispatcher)
 
     def run(
         self, *, run_id: str, seed_mask: object, seed_frame: int,

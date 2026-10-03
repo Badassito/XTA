@@ -11,6 +11,7 @@ from collections.abc import Mapping
 import hashlib
 import json
 import os
+import operator
 from pathlib import Path
 import shutil
 from types import MappingProxyType
@@ -80,6 +81,149 @@ def _group_shape(group):
     return y1 - y0, x1 - x0
 
 
+def _frame_integer(value, name):
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f'{name} must be an integer')
+    try:
+        return operator.index(value)
+    except TypeError as error:
+        raise ValueError(f'{name} must be an integer') from error
+
+
+def _shape_tyx(value, name):
+    shape = tuple(_frame_integer(item, name) for item in value)
+    if len(shape) != 3 or any(item < 1 for item in shape):
+        raise ValueError(f'{name} must contain three positive dimensions')
+    return shape
+
+
+def _scope_frame_geometry(scope):
+    addressing = scope.get('frame_addressing')
+    shape = (_shape_tyx(scope['shape_tyx'], 'SAM native shape') if 'shape_tyx' in scope else None)
+    if not addressing:
+        if 'evidence_shape_tyx' in scope and tuple(scope['evidence_shape_tyx']) != shape:
+            raise ValueError('Extended SAM frames require an explicit cyclic closure')
+        return dict(cyclic=False, native_shape_tyx=shape, evidence_shape_tyx=shape, addressing=None)
+    from .sam_cyclic import validate_cyclic_frame_addressing, IMPLEMENTATION_SHA256
+    validate_cyclic_frame_addressing(addressing)
+    if scope.get('cyclic_implementation_sha256') not in (None, IMPLEMENTATION_SHA256):
+        raise ValueError('Cyclic SAM helper implementation identity differs from saved evidence')
+    native = _shape_tyx(addressing['native_shape_tyx'], 'SAM cyclic native shape')
+    evidence = _shape_tyx(addressing['evidence_shape_tyx'], 'SAM cyclic evidence shape')
+    if shape != native or ('evidence_shape_tyx' in scope and tuple(scope['evidence_shape_tyx']) != evidence):
+        raise ValueError('Cyclic SAM scope shape differs from its native/evidence closure')
+    return dict(cyclic=True, native_shape_tyx=native, evidence_shape_tyx=evidence,
+                addressing=addressing, cyclic_implementation_sha256=IMPLEMENTATION_SHA256)
+
+
+def _group_frame_geometry(group, scope_geometry):
+    addressing = group.get('frame_addressing')
+    if not scope_geometry['cyclic']:
+        if addressing or group.get('frame_addresses'):
+            raise ValueError('Cyclic SAM group requires its scope native frame closure')
+        return dict(addresses=None, bbox_yx=tuple(group['context_bbox_yx']))
+    if not addressing:
+        raise ValueError('Cyclic SAM group is missing its declared frame addresses')
+    from .sam_cyclic import validate_cyclic_frame_addressing
+    frames = tuple(_frame_integer(frame, 'SAM unfolded frame') for frame in group['frame_indices'])
+    if not frames or frames != tuple(range(frames[0], frames[-1] + 1)):
+        raise ValueError('Cyclic SAM group frames must be distinct increasing contiguous indices')
+    addresses = validate_cyclic_frame_addressing(addressing, expected_frames=frames)
+    recipe = scope_geometry['addressing']
+    for key in ('schema', 'native_shape_tyx', 'evidence_shape_tyx', 'alias_frames', 'period_degrees'):
+        left, right = addressing.get(key), recipe.get(key)
+        if isinstance(left, (list, tuple)):
+            left, right = tuple(left), tuple(right)
+        if left != right:
+            raise ValueError('Cyclic SAM group and scope frame closure disagree')
+    duplicate = group.get('frame_addresses')
+    if duplicate is None:
+        raise ValueError('Cyclic SAM group is missing its explicit native frame-address map')
+    duplicated = validate_cyclic_frame_addressing({**dict(recipe), 'addresses': duplicate}, expected_frames=frames)
+    if any(dict(addresses[frame]) != dict(duplicated[frame]) for frame in frames):
+        raise ValueError('Cyclic SAM duplicated native addresses disagree')
+    native = scope_geometry['native_shape_tyx']
+    if group.get('native_shape_tyx') is not None and tuple(group['native_shape_tyx']) != native:
+        raise ValueError('Cyclic SAM group native shape differs from its scope')
+    bbox = tuple(_frame_integer(value, 'SAM cyclic crop bound') for value in group['context_bbox_yx'])
+    if len(bbox) != 4 or not (0 <= bbox[0] < bbox[2] <= native[1] and 0 <= bbox[1] < bbox[3] <= native[2]):
+        raise ValueError('Cyclic SAM crop is outside its native working canvas')
+    for endpoint in group.get('endpoints', ()):
+        frame = _frame_integer(endpoint['frame_index'], 'SAM endpoint unfolded frame')
+        if frame not in addresses:
+            raise ValueError('Cyclic SAM endpoint lacks its declared frame address')
+        address = addresses[frame]
+        if (not isinstance(endpoint.get('original_observation_id'), str) or not endpoint['original_observation_id']
+                or _frame_integer(endpoint.get('native_frame_index'), 'SAM endpoint native frame') != address['native_index']
+                or type(endpoint.get('mirror_u')) is not bool or endpoint['mirror_u'] != address['mirror_u']):
+            raise ValueError('Cyclic SAM original endpoint identity or mirror address is corrupted')
+        lineage = endpoint.get('lineage', {})
+        for key, expected in (('native_frame_index', address['native_index']),
+                              ('unfolded_frame_index', frame), ('cycle_index', address['cycle_index']),
+                              ('mirror_u', address['mirror_u']),
+                              ('original_observation_id', endpoint['original_observation_id'])):
+            if key in lineage and (type(lineage[key]) is not type(expected) or lineage[key] != expected):
+                raise ValueError('Cyclic SAM endpoint lineage disagrees with its native closure')
+    return dict(addresses=addresses, bbox_yx=bbox)
+
+
+def _evidence_frame_geometry(scope, groups, runs):
+    geometry = _scope_frame_geometry(scope)
+    geometry['groups'] = {str(key): _group_frame_geometry(group, geometry) for key, group in groups.items()}
+    if geometry['cyclic']:
+        original_frames = {}
+        for group in groups.values():
+            for endpoint in group.get('endpoints', ()):
+                original = endpoint['original_observation_id']
+                frame = endpoint['native_frame_index']
+                if original in original_frames and original_frames[original] != frame:
+                    raise ValueError('One original SAM observation is assigned to different native frames')
+                original_frames[original] = frame
+        for run in runs.values():
+            group_id = str(run['group_id'])
+            if group_id not in geometry['groups']:
+                raise ValueError('Cyclic SAM run references an unknown group')
+            allowed = geometry['groups'][group_id]['addresses']
+            for key in ('expected_frames', 'observed_frames', 'injected_frames'):
+                if any(_frame_integer(frame, 'SAM run unfolded frame') not in allowed for frame in run.get(key, ())):
+                    raise ValueError('Cyclic SAM run coverage lies outside its declared address map')
+            expected = set(run.get('expected_frames', ()))
+            observed = set(run.get('observed_frames', ()))
+            if not observed.issubset(expected):
+                raise ValueError('Cyclic SAM observed frames lie outside expected coverage')
+            for owner in (run, *run.get('tile_evidence', ())):
+                owner_frames = {_frame_integer(frame, 'SAM owner unfolded frame') for frame in owner.get('observed_frames', ())}
+                if not owner_frames.issubset(expected):
+                    raise ValueError('Cyclic SAM tile coverage lies outside its original run')
+                keys = ('raw_mask_keys', 'candidate_mask_keys', 'availability_mask_keys') if owner is run else ('raw_mask_keys',)
+                for key in keys:
+                    if key not in owner:
+                        continue
+                    saved = owner[key]
+                    if (not isinstance(saved, Mapping) or set(saved) != {str(frame) for frame in owner_frames}):
+                        raise ValueError('Cyclic SAM mask addresses differ from their observed frame coverage')
+    return geometry
+
+
+def evidence_frame_geometry(bundle):
+    """Return validated immutable native closure for a bundle or active reader."""
+    owner = getattr(bundle, 'bundle', bundle)
+    if owner.scope.get('frame_addressing'):
+        from .sam_cyclic import assert_cyclic_implementation_unchanged
+        assert_cyclic_implementation_unchanged()
+    geometry = getattr(owner, '_frame_geometry', None)
+    if geometry is None:
+        geometry = _freeze(_evidence_frame_geometry(owner.scope, owner.groups, owner.runs))
+    return geometry
+
+
+def native_output_shape_tyx(bundle):
+    shape = evidence_frame_geometry(bundle)['native_shape_tyx']
+    if shape is None:
+        raise ValueError('SAM native publication requires its recorded shape_tyx')
+    return tuple(shape)
+
+
 class SamEvidenceWriter:
     """Stream bounded masks into an atomically published, immutable bundle.
 
@@ -103,6 +247,14 @@ class SamEvidenceWriter:
             self.abort()
             raise ValueError("SAM evidence budgets must be positive")
         self.scope = _plain(scope_metadata)
+        if self.scope.get('frame_addressing'):
+            from .sam_cyclic import IMPLEMENTATION_SHA256
+            self.scope.setdefault('cyclic_implementation_sha256', IMPLEMENTATION_SHA256)
+        try:
+            self._scope_frame_geometry = _scope_frame_geometry(self.scope)
+        except BaseException:
+            self.abort()
+            raise
         self.groups, self.runs, self.records = {}, {}, {}
         self._pending_tiles = {}
         self._closed = False
@@ -142,13 +294,16 @@ class SamEvidenceWriter:
             raise ValueError("Duplicate endpoint identity within SAM group")
         if any(int(v["frame_index"]) not in frames for v in endpoints):
             raise ValueError("SAM endpoint is outside its declared group frames")
+        _group_frame_geometry(group, self._scope_frame_geometry)
         if group.get("status") in {"incomplete", "unresolved", "invalid"} or not group.get("complete", True):
             # Resource-limited inventories are metadata, never successful crops.
             # Optional endpoint_local masks retain native observation silhouettes
             # without allocating the oversized unresolved group canvas.
-            group.update(complete=False, geometry_contract_status="unresolved",
-                         mask_keys={name: self._put(f"g/{identity}/{name}", value, np.asarray(value).shape)
-                                    for name, value in sorted(masks.items())})
+            keys={}
+            for name in sorted(masks):
+                value=masks[name]
+                keys[name]=self._put(f"g/{identity}/{name}",value,np.asarray(value).shape)
+            group.update(complete=False, geometry_contract_status="unresolved",mask_keys=keys)
             self.groups[identity] = group
             return
         required = {f"{kind}:{frame}" for kind in ("acceptance", "write") for frame in frames}
@@ -173,8 +328,11 @@ class SamEvidenceWriter:
         for edge in group.get("edges", []):
             if str(edge["source_id"]) not in ids or str(edge["target_id"]) not in ids:
                 raise ValueError("SAM edge references an unknown original endpoint")
-        group["mask_keys"] = {name: self._put(f"g/{identity}/{name}", value, shape)
-                              for name, value in sorted(masks.items())}
+        # Sort identities, not materialized values: a streaming Mapping can
+        # produce one endpoint crop plane at a time without an O(refs * crop)
+        # transient list of dense arrays before compression.
+        group["mask_keys"] = {name: self._put(f"g/{identity}/{name}", masks[name], shape)
+                              for name in sorted(masks)}
         group.setdefault("complete", group.get("status", "complete") not in {"incomplete", "unresolved"})
         self.groups[identity] = group
 
@@ -346,6 +504,7 @@ class SamEvidenceWriter:
             return _decode_mask(stream, self.records[key], self.max_mask_bytes)
 
     def commit(self, *, complete=True):
+        _evidence_frame_geometry(self.scope, self.groups, self.runs)
         if self._closed:
             raise RuntimeError("SAM evidence writer is already closed")
         index = dict(groups=self.groups, runs=self.runs, masks=self.records)
@@ -452,6 +611,7 @@ class SamEvidenceBundle:
                 raise ValueError(f"Invalid SAM evidence payload bounds: {key}")
         if (len(self.groups), len(self.runs), len(self.records)) != (manifest["group_count"], manifest["run_count"], manifest["mask_count"]):
             raise ValueError("SAM evidence record counts disagree with manifest")
+        self._frame_geometry = _freeze(_evidence_frame_geometry(self.scope, self.groups, self.runs))
         return self
 
     def mask(self, key):
@@ -530,7 +690,11 @@ class SamEvidenceBundle:
 
 
 def iter_selected_planes(bundle, selection, *, direction=None, pass_index=None):
-    """Yield (group_id, native_frame, cropped union) rebuilt from exact owners."""
+    """Yield exact (group_id, stored/unfolded_frame, cropped union) evidence.
+
+    Cyclic aliases remain unfolded here for compatibility with measurement
+    consumers. Native publication must use iter_selected_native_crops instead.
+    """
     from .sam_mask_reader import SamMaskReader
     if isinstance(bundle, SamMaskReader):
         yield from _iter_selected_planes(bundle, selection, direction=direction, pass_index=pass_index)
@@ -541,6 +705,9 @@ def iter_selected_planes(bundle, selection, *, direction=None, pass_index=None):
 
 def _iter_selected_planes(bundle, selection, *, direction=None, pass_index=None):
     from .sam_mask_reader import effective_candidate_mask
+    evidence_frame_geometry(bundle)
+    if selection.get('resolved_policy', {}).get('version') in (4,5) and 'mask_filter' not in selection:
+        raise ValueError('Guarded SAM support requires its retained mask filter specification')
     snapshot = bundle.filter_snapshot(selection)
     selected = set(selection["selected_run_ids"])
     unknown = selected - set(bundle.runs)
@@ -558,6 +725,83 @@ def _iter_selected_planes(bundle, selection, *, direction=None, pass_index=None)
                     plane |= effective_candidate_mask(bundle, run["run_id"], frame, snapshot)
             plane.setflags(write=False)
             yield group_id, int(frame), plane
+
+
+def iter_selected_native_crops(bundle, selection, *, direction=None, pass_index=None):
+    """Yield group, stored frame, native frame, native bbox and exact mask.
+
+    Stored ownership stays intact. Each selected contributor union is folded
+    by its saved address; spatial/temporal overlaps collapse only when the
+    native publication consumer explicitly ORs these crops.
+    """
+    from .sam_cyclic import address_for_unfolded_index, transform_crop_between_frame_addresses
+    geometry = evidence_frame_geometry(bundle)
+    for group_id, stored_frame, mask in iter_selected_planes(bundle, selection,
+            direction=direction, pass_index=pass_index):
+        group_geometry = geometry['groups'][str(group_id)]
+        bbox = tuple(group_geometry['bbox_yx'])
+        addresses = group_geometry['addresses']
+        native_frame = stored_frame
+        if addresses is not None:
+            address = addresses[stored_frame]
+            native_frame = int(address['native_index'])
+            target = address_for_unfolded_index(native_frame, geometry['native_shape_tyx'][0],
+                period_degrees=geometry['addressing']['period_degrees'])
+            mask, bbox = transform_crop_between_frame_addresses(mask, bbox, address, target,
+                geometry['native_shape_tyx'][2])
+        mask.setflags(write=False)
+        yield group_id, stored_frame, native_frame, tuple(bbox), mask
+
+
+def selected_native_plane(bundle, selection, frame, *, direction=None, pass_index=None, shape_yx=None):
+    """Rebuild one folded native binary plane from retained effective owners."""
+    from .sam_cyclic import address_for_unfolded_index, transform_crop_between_frame_addresses
+    from .sam_mask_reader import SamMaskReader, effective_candidate_mask
+    if not isinstance(bundle, SamMaskReader):
+        with bundle.reader() as reader:
+            return selected_native_plane(reader, selection, frame, direction=direction,
+                pass_index=pass_index, shape_yx=shape_yx)
+    geometry = evidence_frame_geometry(bundle)
+    native_shape = geometry['native_shape_tyx']
+    frame = _frame_integer(frame, 'SAM native output frame')
+    if native_shape is None:
+        if shape_yx is None:
+            raise ValueError('SAM native plane requires its recorded shape_tyx')
+    elif not 0 <= frame < native_shape[0]:
+        raise ValueError('SAM native output frame is outside its saved canvas')
+    shape = tuple(native_shape[1:] if shape_yx is None else shape_yx)
+    if native_shape is not None and shape != tuple(native_shape[1:]):
+        raise ValueError('SAM native plane shape differs from its saved closure')
+    selected = set(selection['selected_run_ids'])
+    if selected - set(bundle.runs):
+        raise ValueError('Selection references unknown SAM runs')
+    if selection.get('resolved_policy', {}).get('version') in (4,5) and 'mask_filter' not in selection:
+        raise ValueError('Guarded SAM support requires its retained mask filter specification')
+    snapshot = bundle.filter_snapshot(selection)
+    plane = np.zeros(shape, np.uint8)
+    for run_id in sorted(selected):
+        run = bundle.runs[run_id]
+        if ((direction is not None and run['direction'] != direction) or
+                (pass_index is not None and int(run['pass_index']) != int(pass_index))):
+            continue
+        group_geometry = geometry['groups'][str(run['group_id'])]
+        addresses = group_geometry['addresses']
+        for key in run['candidate_mask_keys']:
+            stored_frame = int(key)
+            address = addresses[stored_frame] if addresses is not None else None
+            if int(address['native_index'] if address is not None else stored_frame) != frame:
+                continue
+            mask = effective_candidate_mask(bundle, run_id, stored_frame, snapshot)
+            bbox = tuple(group_geometry['bbox_yx'])
+            if address is not None:
+                target = address_for_unfolded_index(frame, native_shape[0],
+                    period_degrees=geometry['addressing']['period_degrees'])
+                mask, bbox = transform_crop_between_frame_addresses(mask, bbox, address, target, shape[1])
+            y0,x0,y1,x1 = bbox
+            if mask.shape != (y1-y0,x1-x0) or not (0<=y0<y1<=shape[0] and 0<=x0<x1<=shape[1]):
+                raise ValueError('SAM native candidate crop lies outside its published plane')
+            plane[y0:y1,x0:x1] |= mask
+    return plane
 
 
 def load_sam_online_selection(bundle, *, policy_hash=None, selected_run_ids=None,
@@ -588,10 +832,10 @@ def load_sam_online_selection(bundle, *, policy_hash=None, selected_run_ids=None
             or receipt.get("evidence_fingerprint") != bundle.evidence_fingerprint
             or set(receipt.get("selected_run_ids", ())) - set(bundle.runs)):
         raise ValueError("SAM online selection receipt does not belong to its proposal bundle")
-    if bundle.scope.get("selection_receipt_required", False) and "mask_filter" not in receipt:
+    if (bundle.scope.get("selection_receipt_required", False) or receipt.get('resolved_policy', {}).get('version') in (4,5)) and "mask_filter" not in receipt:
         raise ValueError("Published SAM component filtering requires its retained mask filter specification")
     tiled=bundle.scope.get("sam_crop_mode")=="tiled" or any(run.get("generation_mode")=="tiled" for run in bundle.runs.values())
-    if tiled and (receipt.get("resolved_policy",{}).get("version")!=3 or "mask_filter" not in receipt
+    if tiled and (receipt.get("resolved_policy",{}).get("version") not in (3,5) or "mask_filter" not in receipt
                   or receipt.get("tiled_quality_contract",{}).get("schema")!="xta.sam_tiled_quality/1"):
         raise ValueError("Published tiled SAM support requires its retained quality-v3 filter/halo contract")
     # Validation belongs to the same central interpreter used for effective

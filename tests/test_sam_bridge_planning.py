@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from scipy import ndimage as ndi
 
-from XTA.sam_bridge_planning import SamPlanningLimits, plan_sam_bridges
+from XTA.sam_bridge_planning import (
+    SAM_CROP_PLANNING_CONTRACT_VERSION, SamObservation, SamPlanningLimits, _corridor,
+    _identity, _paint_shifted, _swept_endpoint_bbox, _swept_family_bbox, plan_sam_bridges,
+)
 
 
 def _plan(volume, **kwargs):
@@ -276,3 +280,170 @@ def test_observation_snapshot_memory_and_slice_bounds_are_explicitly_unresolved(
     pixels = _plan(volume, limits=SamPlanningLimits(max_slice_pixels=1))
     assert pixels.status == "unresolved" and not pixels.runs
     assert "observation_slice_pixel_limit" in pixels.reasons
+
+
+def _asymmetric_volume(*, x_offset=0):
+    volume = np.zeros((11, 160, 1400), bool)
+    volume[0, 50:100, 1210+x_offset:1220+x_offset] = True
+    volume[0, 74, 1100+x_offset:1210+x_offset] = True
+    volume[10, 70:80, 1060+x_offset:1070+x_offset] = True
+    return volume
+
+
+def _asymmetric_plan(volume, **kwargs):
+    return _plan(volume, interpolation_distance=15, interpolation_search_angle=80,
+                 limits=kwargs.pop("limits", SamPlanningLimits()), **kwargs)
+
+
+def _canvas_reference(a, b, frame, shape, margin, origin):
+    """Independent global-canvas oracle: never clip at a family crop."""
+    alpha = (frame - a.frame_index) / (b.frame_index - a.frame_index)
+    dy, dx = (bv-av for av, bv in zip(a.anchor_yx, b.anchor_yx))
+    output = np.zeros(shape, bool)
+    for observed, factor in ((a, alpha), (b, -(1-alpha))):
+        ys, xs = np.nonzero(observed.mask_crop)
+        ys = np.rint(ys + observed.bbox_yx[0] + factor*dy - origin[0]).astype(int) + origin[0]
+        xs = np.rint(xs + observed.bbox_yx[1] + factor*dx - origin[1]).astype(int) + origin[1]
+        valid = (ys >= 0) & (ys < shape[0]) & (xs >= 0) & (xs < shape[1])
+        output[ys[valid], xs[valid]] = True
+    return ndi.binary_dilation(output, iterations=margin) if margin else output
+
+
+def _world_plane(mask, crop, shape):
+    result = np.zeros(shape, bool)
+    y0, x0, y1, x1 = crop
+    result[y0:y1, x0:x1] = mask
+    return result
+
+
+def test_swept_crop_restores_clipped_asymmetric_contract_and_matches_full_canvas():
+    volume = _asymmetric_volume()
+    plan = _asymmetric_plan(volume)
+    group = plan.groups[0]
+    contract = group.crop_contract
+    assert contract["schema"] == plan.crop_contract_version == SAM_CROP_PLANNING_CONTRACT_VERSION
+    assert contract["legacy_context_bbox_yx"] == (10, 1020, 140, 1260)
+    assert contract["legacy_raster_origin_yx"] == (10, 1020)
+    assert contract["swept_silhouette_bbox_yx"] == (50, 961, 100, 1220)
+    assert group.context_bbox_yx == (10, 921, 140, 1260)
+    assert not contract["canvas_clamped_sides"]
+    a, b = plan.observations
+    edge = group.edges[0]
+    old = contract["legacy_context_bbox_yx"]
+    for frame in range(11):
+        expected_acceptance = _canvas_reference(a, b, frame, volume.shape[1:], 16, old[:2])
+        actual_acceptance = _world_plane(group.acceptance_masks[frame], group.context_bbox_yx, volume.shape[1:])
+        np.testing.assert_array_equal(actual_acceptance, expected_acceptance)
+        expected_contract = _canvas_reference(a, b, frame, volume.shape[1:], 8, old[:2])
+        np.testing.assert_array_equal(_world_plane(group.edge_contract_masks[edge.edge_id][frame],
+                                                  group.context_bbox_yx, volume.shape[1:]), expected_contract)
+        expected_write = expected_contract & ~volume[frame] if frame not in (0, 10) else np.zeros(volume.shape[1:], bool)
+        np.testing.assert_array_equal(_world_plane(group.write_masks[frame], group.context_bbox_yx,
+                                                  volume.shape[1:]), expected_write)
+        # The unaffected interior is exactly the legacy result. Pixels near a
+        # formerly clipped boundary may be restored by the existing dilation.
+        legacy_acceptance = _corridor(a, b, frame, old, 16)
+        y0, x0, y1, x1 = old
+        np.testing.assert_array_equal(actual_acceptance[y0+16:y1-16, x0+16:x1-16],
+                                      legacy_acceptance[16:-16, 16:-16])
+    legacy6 = _world_plane(_corridor(a, b, 6, old, 16), old, volume.shape[1:])
+    corrected6 = _world_plane(group.acceptance_masks[6], group.context_bbox_yx, volume.shape[1:])
+    assert np.count_nonzero(corrected6 & ~legacy6) == 388
+    assert not np.any(legacy6 & ~corrected6)
+    with pytest.raises(TypeError):
+        group.crop_contract["context_margin_px"] = 100
+
+
+def test_sweep_bounds_include_both_hybrid_endpoint_extents_without_frame_rasterization(monkeypatch):
+    plan = _asymmetric_plan(_asymmetric_volume())
+    a, b = plan.observations
+    origin = plan.groups[0].crop_contract["legacy_raster_origin_yx"]
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Bounds must not rasterize a dense frame")
+    monkeypatch.setattr("XTA.sam_bridge_planning._corridor", forbidden)
+    assert _swept_endpoint_bbox(a, b, origin) == (50, 961, 100, 1220)
+    assert _swept_endpoint_bbox(b, a, origin) == (50, 961, 100, 1220)
+
+
+def test_family_sweep_reads_shared_parent_anchor_once_per_bounds_pass(monkeypatch):
+    observations = [SamObservation(str(index), 0 if index == 0 else 10, 1, index,
+                                    (10+index, 10+index, 13+index, 13+index), np.ones((3, 3), bool))
+                    for index in range(17)]
+    graph = {0: set(range(1, 17)), **{index: {0} for index in range(1, 17)}}
+    calls = {item.observation_id: 0 for item in observations}
+    original = SamObservation.anchor_yx.fget
+    def counted(item):
+        calls[item.observation_id] += 1
+        return original(item)
+    monkeypatch.setattr(SamObservation, "anchor_yx", property(counted))
+    assert _swept_family_bbox(observations, set(range(17)), graph, (10, 10, 29, 29), (0, 0)) == (10, 10, 29, 29)
+    assert set(calls.values()) == {1}
+
+
+def test_explicit_legacy_raster_origin_preserves_half_pixel_lattice():
+    volume = np.zeros((3, 31, 31), bool)
+    volume[0, 10:12, 11:13] = True
+    volume[2, 10:12, 12:14] = True
+    plan = _plan(volume)
+    a, _ = plan.observations
+    original_crop, enlarged_crop = (1, 1, 25, 25), (0, 0, 26, 26)
+    legacy = np.zeros((24, 24), bool)
+    corrected = np.zeros((26, 26), bool)
+    moved_origin = np.zeros_like(corrected)
+    _paint_shifted(legacy, a, original_crop, 0, .5)
+    _paint_shifted(corrected, a, enlarged_crop, 0, .5, raster_origin_yx=original_crop[:2])
+    _paint_shifted(moved_origin, a, enlarged_crop, 0, .5)
+    np.testing.assert_array_equal(corrected[1:25, 1:25], legacy)
+    assert not np.array_equal(corrected, moved_origin)
+
+
+def test_uncensored_symmetric_crop_keeps_exact_pixels_but_revision_changes_identity():
+    volume = np.zeros((9, 121, 151), bool)
+    _patch(volume, 1, 60, 65)
+    _patch(volume, 7, 64, 70)
+    bounds = SamPlanningLimits()
+    plan = _plan(volume, limits=bounds)
+    group = plan.groups[0]
+    assert group.context_bbox_yx == group.crop_contract["legacy_context_bbox_yx"]
+    a, b = plan.observations
+    for offset, frame in enumerate(group.frame_indices):
+        np.testing.assert_array_equal(group.acceptance_masks[offset],
+                                      _corridor(a, b, frame, group.context_bbox_yx, 16))
+    legacy_fingerprint = _identity("sam_planning", plan.inventory_fingerprint, 12, 3, 0,
+                                   30, (1.0, 1.0, 1.0), tuple(vars(bounds).items()))
+    assert plan.planning_fingerprint != legacy_fingerprint
+
+
+def test_swept_physical_canvas_clip_is_explicit_and_has_no_border_exemption():
+    volume = _asymmetric_volume(x_offset=-970)
+    plan = _asymmetric_plan(volume)
+    group = plan.groups[0]
+    assert group.crop_contract["unclipped_context_bbox_yx"][1] < 0
+    assert group.context_bbox_yx[1] == 0
+    assert group.crop_contract["canvas_clamped_sides"] == ("left",)
+    assert group.crop_contract["legacy_raster_origin_yx"] == (10, 50)
+    a, b = plan.observations
+    for offset, frame in enumerate(group.frame_indices):
+        reference = _canvas_reference(a, b, frame, volume.shape[1:], 16,
+                                      group.crop_contract["legacy_raster_origin_yx"])
+        np.testing.assert_array_equal(_world_plane(group.acceptance_masks[offset],
+                                                  group.context_bbox_yx, volume.shape[1:]), reference)
+    assert group.acceptance_masks[-1, :, 0].any()
+
+
+@pytest.mark.parametrize("bound_name", ["max_crop_pixels", "max_group_bytes", "max_total_contract_bytes"])
+def test_swept_enlargement_refuses_existing_resource_caps_instead_of_shortening(bound_name):
+    volume = _asymmetric_volume()
+    reference = _asymmetric_plan(volume)
+    contract = reference.groups[0].crop_contract
+    old_charge, new_charge = contract["legacy_charged_contract_bytes"], contract["charged_contract_bytes"]
+    threshold = (contract["legacy_crop_pixels"] + contract["crop_pixels"]) // 2 if bound_name == "max_crop_pixels" else (old_charge + new_charge) // 2
+    limits = SamPlanningLimits(**{bound_name: threshold})
+    plan = _asymmetric_plan(volume, limits=limits)
+    assert plan.status == "unresolved" and not plan.runs
+    assert plan.groups[0].context_bbox_yx == reference.groups[0].context_bbox_yx
+    expected = {"max_crop_pixels": "context_crop_pixel_limit", "max_group_bytes": "group_contract_memory_limit",
+                "max_total_contract_bytes": "total_contract_memory_limit"}[bound_name]
+    assert expected in plan.groups[0].reasons
+    assert plan.groups[0].acceptance_masks.size == 0
+    assert plan.groups[0].crop_contract["schema"] == SAM_CROP_PLANNING_CONTRACT_VERSION

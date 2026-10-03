@@ -11,6 +11,7 @@ import json
 import math
 import shutil
 from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -113,11 +114,25 @@ class AdmittedViewPrepare:
     close_dense: Callable[..., object] = close_memmap_array_without_flush
     interpolation_backend: str = 'sdf'
     sam_context: object | None = None
+    sam_base_allowance_bytes: int = 0
+
+    @contextmanager
+    def _reservation(self):
+        if (self.interpolation_backend == 'sam' and self.sam_context is not None
+                and int(self.interpolation_distance) > 0):
+            from .sam_resources import admit_sam_parent_resources
+            workers = len(getattr(self.sam_context, 'device_ids', ())) or 1
+            with admit_sam_parent_resources(self.admission, self.transient_bytes,
+                    f'{self.model_name}/{self.view.name}/fullframe', worker_count=workers,
+                    base_allowance_bytes=self.sam_base_allowance_bytes) as profile:
+                with self.sam_context.resource_scope(profile):
+                    yield
+        else:
+            with self.admission.reserve(int(self.transient_bytes), f'{self.model_name}/{self.view.name}'):
+                yield
 
     def __call__(self) -> PreparedViewResult:
-        with self.admission.reserve(
-            int(self.transient_bytes), f'{self.model_name}/{self.view.name}',
-        ):
+        with self._reservation():
             local_union_mm = self.union_mm
             try:
                 if local_union_mm is None:

@@ -887,8 +887,8 @@ def interpolation_local_label_uint16_enabled() -> bool:
     """Use uint16 for stores that contain only slice-local ids.
 
  Compact relabeling still requires uint32 because canonical/global component ids
- can exceed 65535. Set YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16=0 to restore
- the previous uint32 local-label store."""
+ can exceed 65535. Slice-local overflow restarts the complete pass with uint32.
+ Set YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16=0 to select uint32 immediately."""
     return _env_flag('YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16', True)
 
 def _local_label_store_dtype(compact_relabel: bool) -> np.dtype:
@@ -899,13 +899,22 @@ def _local_label_store_dtype(compact_relabel: bool) -> np.dtype:
 class _LocalLabelCapacityError(RuntimeError):
     """Signal local-label dtype exhaustion so the caller can retry with a wider or CPU path."""
 
+    def __init__(self, count: int, dtype: np.dtype, z: int) -> None:
+        self.component_count = int(count)
+        self.label_dtype = np.dtype(dtype)
+        self.slice_index = int(z)
+        super().__init__(
+            f'Interpolation slice {self.slice_index} has {self.component_count} local components, '
+            f'exceeding {self.label_dtype.name} local-label capacity '
+            f'({int(np.iinfo(self.label_dtype).max)}).'
+        )
+
+    def __reduce__(self):
+        return type(self), (self.component_count, self.label_dtype.name, self.slice_index)
+
 def _check_local_label_store_capacity(count: int, dtype: np.dtype, *, z: int) -> None:
     if np.dtype(dtype) == np.dtype(np.uint16) and int(count) > int(np.iinfo(np.uint16).max):
-        raise _LocalLabelCapacityError(
-            f'Interpolation slice {int(z)} has {int(count)} local components, exceeding the '
-            'uint16 local-label capacity (65535). Set '
-            'YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16=0 and rerun.'
-        )
+        raise _LocalLabelCapacityError(count, dtype, z=z)
 
 @dataclass(frozen=True)
 class BinaryVolumeSliceMetadata:
@@ -1776,6 +1785,31 @@ def _slice_label_metadata_is_bounded(
         return False
 
 
+def _discard_capacity_exhausted_label_store(labels_store: object, paths: Sequence[Path]) -> None:
+    """Retire an unreturned store after every labeling worker has settled.
+
+    A capacity check happens before narrowing each slice. Earlier slices may
+    nevertheless already have written their local IDs. None of those partial
+    rasters, counts, pair codes or LUTs may enter the restarted wide pass.
+    """
+    if isinstance(labels_store, SparseSliceLabelStore):
+        labels_store._pending = None
+        labels_store.flat = np.empty((0,), dtype=labels_store.dtype)
+        labels_store.bboxes.fill(0)
+        labels_store.offsets.fill(0)
+        labels_store._finalized = True
+    elif isinstance(labels_store, np.memmap):
+        # This store has never been returned, and stage-A cleanup has settled
+        # all CPU/GPU writers. Close the failed scratch mapping directly;
+        # normal deferred map retirement would keep its pages alive during
+        # the larger replacement allocation.
+        mapping = getattr(labels_store, '_mmap', None)
+        if mapping is not None:
+            mapping.close()
+    for path in paths:
+        Path(path).unlink(missing_ok=True)
+
+
 def label_foreground_volume_streaming(
     mask_mm: np.ndarray,
     work_prefix: Path,
@@ -1789,6 +1823,71 @@ def label_foreground_volume_streaming(
     known_slice_bboxes: Optional[np.ndarray] = None,
     sparse_local_labels: bool = False,
     prefer_crop_bounded_cpu_labeling: bool = False,
+) -> Tuple[object, int, List[Path]]:
+    """Label complete topology, promoting exhausted slice-local stores once.
+
+    Only the explicit uint16 capacity signal causes a retry. The first attempt
+    retires its whole partial store after worker settlement; the uint32 pass
+    labels the immutable binary source again and recomputes workspace admission.
+    The environment setting is never mutated, including concurrent callers.
+    """
+    requested_dtype = _local_label_store_dtype(bool(compact_relabel))
+    arguments = dict(prefer_memory=prefer_memory, reserve_bytes=reserve_bytes,
+        wrap_axis=wrap_axis, workers=workers, compact_relabel=compact_relabel,
+        component_stats_out=component_stats_out, known_slice_any=known_slice_any,
+        known_slice_bboxes=known_slice_bboxes, sparse_local_labels=sparse_local_labels,
+        prefer_crop_bounded_cpu_labeling=prefer_crop_bounded_cpu_labeling)
+    fallback = None
+    try:
+        result = _label_foreground_volume_streaming_impl(
+            mask_mm, work_prefix, _local_label_dtype_override=requested_dtype, **arguments)
+    except _LocalLabelCapacityError as error:
+        if (requested_dtype != np.dtype(np.uint16) or error.label_dtype != np.dtype(np.uint16)
+                or error.component_count <= int(np.iinfo(np.uint16).max)
+                or not 0 <= error.slice_index < int(mask_mm.shape[0])):
+            raise
+        fallback = dict(from_dtype='uint16', to_dtype='uint32',
+                        overflowing_slice=error.slice_index,
+                        overflowing_slice_components=error.component_count,
+                        action='discard_partial_store_and_restart_complete_labeling',
+                        attempts=2)
+        # Worker futures have already settled and the narrow store was retired
+        # inside stage A. Remove traceback-held label arrays/future cycles before
+        # admitting the larger workspace. Keep only scalar diagnostic evidence.
+        error.__traceback__ = None
+    if fallback is not None:
+        gc.collect()
+        print(f'Interpolation local-label capacity exceeded on slice {fallback["overflowing_slice"]} '
+              f'({fallback["overflowing_slice_components"]} components); discarded the partial '
+              'uint16 store and restarting the complete labeling pass with uint32.', flush=True)
+        runtime_telemetry().add('interpolation.local_labels.uint32_capacity_retries', 1)
+        runtime_telemetry().gauge('interpolation.local_labels.last_capacity_retry', dict(fallback))
+        result = _label_foreground_volume_streaming_impl(
+            mask_mm, work_prefix, _local_label_dtype_override=np.dtype(np.uint32), **arguments)
+    if component_stats_out is not None:
+        component_stats_out['label_store_dtype'] = np.dtype(result[0].dtype).name
+        if fallback is not None:
+            component_stats_out['local_label_dtype_fallback'] = fallback
+        else:
+            component_stats_out.pop('local_label_dtype_fallback', None)
+    return result
+
+
+def _label_foreground_volume_streaming_impl(
+    mask_mm: np.ndarray,
+    work_prefix: Path,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 16 * GIB,
+    wrap_axis: bool = False,
+    workers: int = 1,
+    compact_relabel: bool = True,
+    component_stats_out: Optional[Dict[str, object]] = None,
+    known_slice_any: Optional[np.ndarray] = None,
+    known_slice_bboxes: Optional[np.ndarray] = None,
+    sparse_local_labels: bool = False,
+    prefer_crop_bounded_cpu_labeling: bool = False,
+    *,
+    _local_label_dtype_override: Optional[np.dtype] = None,
 ) -> Tuple[object, int, List[Path]]:
     """Resolve 3D foreground topology from parallel per-slice labels and slab-local unions.
     
@@ -1814,7 +1913,12 @@ def label_foreground_volume_streaming(
     # when compact relabel is skipped, this raster never holds
     # canonical/global ids — only per-slice local ids 1..k. Halve the dominant
     # workspace with uint16 while retaining uint32 for the compact/global path.
-    label_dtype = _local_label_store_dtype(bool(compact_relabel))
+    label_dtype = (_local_label_store_dtype(bool(compact_relabel)) if _local_label_dtype_override is None
+                   else np.dtype(_local_label_dtype_override))
+    if label_dtype not in (np.dtype(np.uint16), np.dtype(np.uint32)):
+        raise ValueError('Local-label stores must use uint16 or uint32')
+    if compact_relabel and label_dtype != np.dtype(np.uint32):
+        raise ValueError('Compact global relabeling requires a uint32 store')
     estimated_bytes = estimate_voidfill_workspace_bytes((z_dim, h, w), dtype=label_dtype)
     use_in_memory = bool(prefer_memory) and should_use_in_memory_workspace(estimated_bytes, reserve_bytes=reserve_bytes)
 
@@ -2001,27 +2105,34 @@ def label_foreground_volume_streaming(
     runtime_telemetry().gauge('topology.slice_label.crop_cpu_selected', bool(sparse_cpu_selected))
     runtime_telemetry().gauge('topology.slice_label.support_bbox_fraction', float(support_bbox_fraction))
     label_phase_started = time.perf_counter()
-    if bool(gpu_labeling_requested):
-        gpu_stage_a_done, gpu_stage_a_pair_codes = _try_label_slices_stage_a_gpu(
-            mask_mm,
-            labels_store,
-            component_counts,
-            slice_bboxes,
-            slice_areas if collect_stats else None,
-            known_slice_any=known_slice_any,
-            preferred_block_slices=int(topology_slab_slices()),
-        )
-    else:
-        gpu_stage_a_done, gpu_stage_a_pair_codes = False, None
-    if not gpu_stage_a_done:
-        parallel_for_indices_chunked(
-            int(z_dim),
-            _label_slice_local,
-            max_workers=label_workers,
-            desc='3D topology: 2D slice labeling',
-            show_progress=True,
-            target_chunks_per_worker=2,
-        )
+    try:
+        if bool(gpu_labeling_requested):
+            gpu_stage_a_done, gpu_stage_a_pair_codes = _try_label_slices_stage_a_gpu(
+                mask_mm,
+                labels_store,
+                component_counts,
+                slice_bboxes,
+                slice_areas if collect_stats else None,
+                known_slice_any=known_slice_any,
+                preferred_block_slices=int(topology_slab_slices()),
+            )
+        else:
+            gpu_stage_a_done, gpu_stage_a_pair_codes = False, None
+        if not gpu_stage_a_done:
+            parallel_for_indices_chunked(
+                int(z_dim),
+                _label_slice_local,
+                max_workers=label_workers,
+                desc='3D topology: 2D slice labeling',
+                show_progress=True,
+                target_chunks_per_worker=2,
+            )
+    except _LocalLabelCapacityError:
+        # Both parallel helpers settle running work before propagating this
+        # typed failure. Retire all partial labels before allowing any retry.
+        _discard_capacity_exhausted_label_store(labels_store, label_paths)
+        labels_store = None
+        raise
     label_phase_seconds = time.perf_counter() - label_phase_started
 
     if sparse_enabled:

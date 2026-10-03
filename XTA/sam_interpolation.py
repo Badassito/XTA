@@ -10,7 +10,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
 import hashlib
+import heapq
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -76,18 +78,53 @@ def _planning_identity(*, scope: object, pass_index: int, gap_distance: int,
                        interpolation_passes: int, wrap_axis: bool,
                        upstream_lineage: object, spacing_zyx: tuple[float, float, float],
                        planner_limits: object, view: object) -> str:
+    from .sam_bridge_planning import (SAM_CROP_PLANNING_CONTRACT_VERSION,
+                                      SAM_CONTRACT_STORAGE_VERSION, SamPlanningLimits)
+    from .sam_cyclic import CYCLIC_FRAME_ADDRESSING_SCHEMA, IMPLEMENTATION_SHA256 as CYCLIC_IMPLEMENTATION_SHA256
     metadata = _scope_metadata(scope)
+    if view is not None and is_dataclass(view):
+        # Match the canonical sampler recipe: presentation, augmentation
+        # provenance and certificate diagnostics do not alter image samples.
+        # In particular an infinite diagnostic error bound is legitimate.
+        diagnostic_fields = {"name", "summary_family", "display_name", "physical_view_name",
+            "tta_aug_id", "tta_angle_deg", "augmentation_pass", "augmentation_base_view",
+            "sampling_policy", "sampling_certificate", "sampling_error_bound_sq",
+            "sampling_reference_frames", "sampling_reason"}
+        view_recipe = _plain({key: value for key, value in asdict(view).items() if key not in diagnostic_fields})
+    else:
+        # Controlled callers can use lightweight view descriptors. Bind every
+        # parameter used by established native renderers, not just its name.
+        recipe_keys = ("name", "physical_view_name", "family", "num_slices", "src_h", "src_w",
+            "pad_mode", "tta_angle_deg", "tilt_angle_deg", "tilt_direction", "tilt_base_view",
+            "tilt_frame_start", "tilt_frame_stop", "horizontal_axis", "vertical_axis", "stack_axis",
+            "full_t", "full_h", "full_w", "azimuths_deg", "diameter", "center_x", "center_y",
+            "roi_radius", "azimuthal_base_view", "azimuthal_tilted_source", "azimuthal_source_view_name",
+            "radial_base_view", "radial_tilted_source", "radial_source_view_name", "radial_radii",
+            "radial_arc_origin", "radial_height_origin", "radial_patch_size", "radial_patch_index",
+            "spherical_face", "spherical_radii", "spherical_face_intervals", "spherical_patch_size",
+            "spherical_u_origin", "spherical_v_origin", "spherical_rotation_xyz")
+        view_recipe = {key: _plain(getattr(view, key)) for key in recipe_keys if hasattr(view, key)}
     settings = dict(scope_id=str(metadata.get("scope_id", "sam")),
+                    crop_contract_version=SAM_CROP_PLANNING_CONTRACT_VERSION,
+                    contract_storage_version=SAM_CONTRACT_STORAGE_VERSION,
+                    interpolation_session_contract="tta_complete_endpoint_interval_without_lta30",
                     pass_index=int(pass_index), gap_distance=int(gap_distance),
                     min_radius=float(min_radius), search_angle_deg=float(search_angle_deg),
                     interpolation_walk_back=int(interpolation_walk_back),
                     interpolation_candidates=int(interpolation_candidates),
                     interpolation_passes=int(interpolation_passes), wrap_axis=bool(wrap_axis),
+                    cyclic_address_schema=CYCLIC_FRAME_ADDRESSING_SCHEMA if wrap_axis else None,
+                    cyclic_implementation_sha256=CYCLIC_IMPLEMENTATION_SHA256 if wrap_axis else None,
+                    view_sampler_recipe=view_recipe,
+                    canvas_transform=_plain(metadata.get("canvas_transform", {})),
+                    resource_admission_identity=_plain(metadata.get("sam_resource_profile", {}).get("effective_budgets", {})),
                     upstream_lineage=_plain(upstream_lineage), spacing_zyx=list(spacing_zyx),
-                    planner_limits=_plain(planner_limits),
+                    planner_limits=_plain(planner_limits if planner_limits is not None else SamPlanningLimits()),
                     view_name=str(getattr(view, "name", view)),
                     physical_view=str(getattr(view, "physical_view_name", "")),
                     angle_deg=float(getattr(view, "tta_angle_deg", 0.0) or 0.0),
+                    augmentation_pass=int(getattr(view, "augmentation_pass", metadata.get("augmentation_pass", 0)) or 0),
+                    augmentation_id=str(getattr(view, "tta_aug_id", "") or ""),
                     sam_crop_mode=str(metadata.get("sam_crop_mode", "whole")))
     return hashlib.sha256(json.dumps(settings, sort_keys=True, allow_nan=False).encode("utf-8")).hexdigest()
 
@@ -117,6 +154,7 @@ class SamPreparedInterpolationPass:
     tile_inventory: Mapping[int, tuple[object, ...]] = field(default_factory=lambda: MappingProxyType({}), compare=False, repr=False)
     tiling_sha256: str = ""
     tiled_assembly_bytes: int = 0
+    cpu_wave_admission: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}), compare=False, repr=False)
 
     @property
     def needs_tracking(self) -> bool:
@@ -146,7 +184,7 @@ class SamPreparedInterpolationPass:
         return tuple(output)
 
     def execution_batches(self, worker_count=1):
-        """Drain bounded parent cohorts before opening another tiled assembly."""
+        """Drain bounded cohorts; single workers finish each exact crop queue."""
         if self.crop_mode != "tiled":
             return (self.execution_order(worker_count),)
         from .sam_crop_tiling import MAX_ACTIVE_PARENT_ASSEMBLIES
@@ -164,12 +202,16 @@ class SamPreparedInterpolationPass:
         for offset in range(0, len(parent_order), MAX_ACTIVE_PARENT_ASSEMBLIES):
             parents = parent_order[offset:offset+MAX_ACTIVE_PARENT_ASSEMBLIES]
             indices = [index for parent in parents for index in by_parent.get(parent, ())]
+            queues = {}
+            for index in indices:
+                queues.setdefault(self.tracker_jobs[index].tile.crop_bbox_yx, []).append(index)
             if int(worker_count)>1:
-                queues = {}
-                for index in indices:
-                    queues.setdefault(self.tracker_jobs[index].tile.crop_bbox_yx, []).append(index)
                 indices = [queue[wave] for wave in range(max((len(q) for q in queues.values()), default=0))
                            for queue in queues.values() if wave < len(queue)]
+            else:
+                # Opposite endpoint sessions remain independent. Only their
+                # immutable visual crop/frame products can be reused here.
+                indices = [index for queue in queues.values() for index in queue]
             batches.append(tuple(indices))
         return tuple(batches)
 
@@ -184,6 +226,7 @@ def prepare_sam_interpolation_pass(
     planner_limits: object = None, canonical_labels: np.ndarray | None = None,
     policy: object = None,
     crop_mode: str | None = None,
+    resource_profile: object = None,
 ) -> SamPreparedInterpolationPass:
     """Plan exhaustive original-anchor jobs without images, CUDA, or a tracker."""
     observations = np.asarray(observation_volume)
@@ -195,6 +238,11 @@ def prepare_sam_interpolation_pass(
     if observations.ndim != 3 or any(value <= 0 for value in observations.shape):
         raise ValueError("SAM interpolation needs a nonempty native TYX observation volume")
     metadata = _scope_metadata(scope)
+    resource_details = None
+    if resource_profile is not None:
+        from .sam_resources import validate_live_sam_resource_profile
+        resource_details = validate_live_sam_resource_profile(resource_profile)
+        metadata["sam_resource_profile"] = resource_details
     from .sam_crop_tiling import resolve_sam_crop_mode
     mode = resolve_sam_crop_mode(crop_mode if crop_mode is not None else metadata.get("sam_crop_mode"))
     metadata["sam_crop_mode"] = mode
@@ -212,17 +260,19 @@ def prepare_sam_interpolation_pass(
         interpolation_min_radius=float(min_radius), interpolation_search_angle=float(search_angle_deg),
         scope_id=str(metadata.get("scope_id", "sam")), spacing_zyx=spacing_zyx,
         canonical_labels=canonical_labels, observation_lineage=upstream_lineage,
-        limits=planner_limits, planning_pass_index=int(pass_index))
+        limits=planner_limits, planning_pass_index=int(pass_index), wrap_axis=bool(wrap_axis), lazy_contracts=True)
+    if resource_profile is not None and getattr(plan, "contract_lease_budget", None) is not None:
+        plan.contract_lease_budget.bind_live_resource_profile(resource_profile)
     planning_seconds = time.perf_counter() - planning_started
     runs = tuple(run for run in plan.runs if int(run.pass_index) == int(pass_index))
     if runs:
         # These are runtime/measurement capacity checks, not quality selection.
         # Reject a request before rendering/model admission instead of silently
         # shortening a declared endpoint session or omitting a hypothesis.
-        from .lta_sam import SamSessionPlan
+        from .lta_sam import SamInterpolationSessionPlan
         for run in runs:
             try:
-                SamSessionPlan(sequence_id=str(run.run_id), session_index=0,
+                SamInterpolationSessionPlan(sequence_id=str(run.run_id), session_index=0,
                     frame_start=min(run.expected_frames), frame_stop=max(run.expected_frames) + 1)
             except (TypeError, ValueError) as error:
                 raise SamInterpolationInfrastructureError(
@@ -232,6 +282,8 @@ def prepare_sam_interpolation_pass(
         if "kind" in source_policy and "mode" not in source_policy:
             source_policy = {"sam_bridge_policy": source_policy}
         topology_limit = int(resolve_sam_bridge_policy(source_policy, generation_mode=mode)["max_group_bytes"])
+        if resource_details is not None and resource_profile.has_extra_credit:
+            topology_limit = int(resource_details["assigned_topology_bytes"])
         tracked_group_ids = {str(run.group_id) for run in runs}
         for group in plan.groups:
             if str(group.group_id) not in tracked_group_ids:
@@ -240,6 +292,17 @@ def prepare_sam_interpolation_pass(
             if len(group.frame_indices) * (y1 - y0) * (x1 - x0) * 16 > topology_limit:
                 raise SamInterpolationInfrastructureError(
                     f"SAM group {group.group_id} topology exceeds its declared memory budget before tracker admission")
+        from .sam_resources import cpu_session_bytes
+        cpu_budget = 2 * 1024**3 if resource_details is None else int(resource_details["assigned_session_cpu_bytes"])
+        groups_by_id = {group.group_id: group for group in plan.groups}
+        if mode == "whole":
+            for run in runs:
+                y0, x0, y1, x1 = groups_by_id[run.group_id].context_bbox_yx
+                estimate = cpu_session_bytes(len(run.expected_frames), (y1 - y0) * (x1 - x0))
+                if estimate["estimated_peak_bytes"] > cpu_budget:
+                    raise SamInterpolationInfrastructureError(
+                        f"SAM run {run.run_id} known CPU session buffers require {estimate['estimated_peak_bytes']} "
+                        f"bytes; admitted budget is {cpu_budget}; full interval was not started or truncated")
     snapshot_started = time.perf_counter()
     snapshot = "" if int(pass_index) > 1 else observation_snapshot_sha256(observations)
     snapshot_seconds = time.perf_counter() - snapshot_started
@@ -252,6 +315,15 @@ def prepare_sam_interpolation_pass(
                 {str(group.group_id): group for group in plan.groups}, plan.by_id)
         except (MemoryError, ValueError) as error:
             raise SamInterpolationInfrastructureError(f"SAM tiled generation preflight failed: {error}") from error
+        from .sam_resources import cpu_session_bytes
+        cpu_budget = 2 * 1024**3 if resource_details is None else int(resource_details["assigned_session_cpu_bytes"])
+        for job in tracker_jobs:
+            y0, x0, y1, x1 = job.tile.crop_bbox_yx
+            estimate = cpu_session_bytes(len(job.original_run.expected_frames), (y1-y0)*(x1-x0))
+            if estimate["estimated_peak_bytes"] > cpu_budget:
+                raise SamInterpolationInfrastructureError(
+                    f"SAM tile run {job.run_id} known CPU session buffers require {estimate['estimated_peak_bytes']} "
+                    f"bytes; admitted budget is {cpu_budget}; full interval was not started or truncated")
         needed_frames = tuple(sorted({int(frame) for job in tracker_jobs for frame in job.original_run.expected_frames}))
         demand = {}
         for job in tracker_jobs:
@@ -261,17 +333,35 @@ def prepare_sam_interpolation_pass(
                 demand[int(frame)] = crop if old is None else (
                     min(old[0], crop[0]), min(old[1], crop[1]), max(old[2], crop[2]), max(old[3], crop[3]))
         frame_crop_bounds = MappingProxyType(demand)
+    wave_details = {}
+    if resource_details is not None:
+        from .sam_resources import cpu_session_bytes, cpu_wave_admission
+        group_lookup = {str(group.group_id): group for group in plan.groups}
+        max_session = max_raw = 0
+        for work in (tracker_jobs if mode == 'tiled' else runs):
+            run = work.original_run if mode == 'tiled' else work
+            bbox = work.tile.crop_bbox_yx if mode == 'tiled' else group_lookup[str(run.group_id)].context_bbox_yx
+            pixels = (bbox[2]-bbox[0])*(bbox[3]-bbox[1])
+            count = len(run.expected_frames)
+            max_session = max(max_session, cpu_session_bytes(count, pixels)['estimated_peak_bytes'])
+            max_raw = max(max_raw, count*pixels)
+        try:
+            wave_details = cpu_wave_admission(max_session, max_raw,
+                resource_details['assigned_cpu_wave_bytes'], resource_details['worker_count'])
+        except RuntimeError as error:
+            raise SamInterpolationInfrastructureError(str(error)) from error
     return SamPreparedInterpolationPass(plan, runs, tuple(observations.shape),
         _buffer_identity(observations), snapshot, settings_sha256, planning_seconds,
         snapshot_seconds, needed_frames, frame_crop_bounds,
         canonical_buffer_identity=(None if canonical_labels is None else
                                    _buffer_identity(np.asarray(canonical_labels))),
         crop_mode=mode, tracker_jobs=tracker_jobs, tile_inventory=tile_inventory,
-        tiling_sha256=tiling_sha256, tiled_assembly_bytes=assembly_bytes)
+        tiling_sha256=tiling_sha256, tiled_assembly_bytes=assembly_bytes,
+        cpu_wave_admission=MappingProxyType(wave_details))
 
 
 def _tracker_requests(runs: tuple[object, ...], groups: Mapping[str, object],
-                      observations: Mapping[str, object], cancel_event: object):
+                      observations: Mapping[str, object], cancel_event: object, resource_profile: object = None):
     """Lazily build one seed payload per fixed run; tracker bounds admission."""
     for run in runs:
         _check_cancelled(cancel_event)
@@ -289,11 +379,12 @@ def _tracker_requests(runs: tuple[object, ...], groups: Mapping[str, object],
             seed_frame=int(run.expected_frames[0]), frame_start=min(run.expected_frames),
             frame_stop=max(run.expected_frames) + 1,
             direction="forward" if int(run.direction) > 0 else "backward",
-            crop_xyxy=(x0, y0, x1, y1))
+            crop_xyxy=(x0, y0, x1, y1),
+            **({"resource_profile": resource_profile} if resource_profile is not None else {}))
         del seed_mask
 
 
-def _tiled_tracker_requests(jobs, groups, observations, cancel_event):
+def _tiled_tracker_requests(jobs, groups, observations, cancel_event, resource_profile=None):
     from .sam_crop_tiling import clipped_seed_mask
     for job in jobs:
         _check_cancelled(cancel_event)
@@ -308,28 +399,68 @@ def _tiled_tracker_requests(jobs, groups, observations, cancel_event):
             metadata=dict(parent_run_id=str(run.run_id), tile_id=tile.tile_id,
                 ownership_bbox_yx=list(tile.ownership_bbox_yx),
                 whole_crop_bbox_yx=list(groups[str(run.group_id)].context_bbox_yx),
-                crop_mode="tiled", rule="1008/128/midpoint-v1"))
+                crop_mode="tiled", rule="1008/128/midpoint-v1"),
+            **({"resource_profile": resource_profile} if resource_profile is not None else {}))
         del seed
 
 
-def _iterate_tracker_results(runtime: object, requests: object, cache_ref: object):
+def _family_dispatch_balance(runs, flat_execution_order, admitted_slots):
+    """Compare scheduling imbalance using sealed frame counts, never image work.
+
+    This deterministic proxy ignores cache savings and predicts no runtime. It
+    protects the automatic default when pinning families loses substantial job
+    parallelism; explicit scheduling choices remain caller-owned.
+    """
+    slots = int(admitted_slots)
+    if slots < 1:
+        raise ValueError("SAM scheduling balance requires an admitted worker")
+    frame_work = tuple(len(run.expected_frames) for run in runs)
+    family_work = {}
+    for run, frames in zip(runs, frame_work):
+        identity = str(run.group_id)
+        family_work[identity] = family_work.get(identity, 0) + frames
+
+    def span(weights):
+        lanes = [(0, lane) for lane in range(slots)]
+        heapq.heapify(lanes)
+        for weight in weights:
+            previous, lane = heapq.heappop(lanes)
+            heapq.heappush(lanes, (previous + weight, lane))
+        return max(value for value, lane in lanes)
+
+    flat_span = span(frame_work[index] for index in flat_execution_order)
+    family_span = span(family_work.values())
+    return dict(schema="xta.sam_family_dispatch_balance/1", basis="expected_frame_count",
+        admitted_slots=slots, logical_run_count=len(runs), family_count=len(family_work),
+        flat_job_makespan_frames=flat_span, fifo_family_makespan_frames=family_span,
+        fifo_to_flat_ratio=(family_span / flat_span if flat_span else None),
+        fallback_flat=family_span * 4 > flat_span * 5, walltime_prediction=False)
+
+
+def _iterate_tracker_results(runtime: object, requests: object, cache_ref: object, cpu_wave=None):
     if hasattr(runtime, "iter_results"):
-        yield from runtime.iter_results(requests, source_cache_ref=cache_ref)
+        options = {} if not cpu_wave else dict(max_in_flight=int(cpu_wave['max_in_flight']),
+            defer_refill_until_consumed=bool(cpu_wave['defer_refill_until_consumed']))
+        if options and getattr(runtime, 'device_ids', None):
+            options['max_in_flight'] = min(options['max_in_flight'], len(runtime.device_ids))
+        yield from runtime.iter_results(requests, source_cache_ref=cache_ref, **options)
     else:
         for index, request in enumerate(requests):
             yield index, runtime.run(**request)
 
 
-def _iterate_tiled_tracker_results(runtime, prepared, worker_count, groups, observations, cache_ref, cancel_event):
+def _iterate_tiled_tracker_results(runtime, prepared, worker_count, groups, observations, cache_ref, cancel_event, resource_profile=None):
     offset = 0
     for batch in prepared.execution_batches(worker_count):
         jobs = tuple(prepared.tracker_jobs[index] for index in batch)
         stream = _iterate_tracker_results(runtime,
-            _tiled_tracker_requests(jobs, groups, observations, cancel_event), cache_ref)
+            _tiled_tracker_requests(jobs, groups, observations, cancel_event, resource_profile), cache_ref,
+            prepared.cpu_wave_admission)
         try:
             for index, result in stream:
                 valid = not isinstance(index, bool) and isinstance(index, (int, np.integer)) and 0<=int(index)<len(batch)
                 yield offset+int(index) if valid else -1, result
+                del result
         finally:
             stream.close()
         offset += len(batch)
@@ -347,27 +478,22 @@ def _store_generated_parent_run(writer, run, result, group, observation_by_id,
             writer.scope[identity_key] = actual_identity
     descriptor["lineage"] = {
         "original_detector_observations": [
-            {"observation_id": str(identifier), "lineage": _plain(observation_by_id[str(identifier)].lineage)}
+            {"observation_id": str(identifier),
+             "original_observation_id": str(getattr(observation_by_id[str(identifier)], "original_observation_id", "") or identifier),
+             "native_frame_index": int(getattr(observation_by_id[str(identifier)], "native_frame_index", None)
+                if getattr(observation_by_id[str(identifier)], "native_frame_index", None) is not None else observation_by_id[str(identifier)].frame_index),
+             "lineage": _plain(observation_by_id[str(identifier)].lineage)}
             for identifier in tuple(run.seed_ids) + tuple(run.held_out_ids)],
         "upstream": _plain(upstream_lineage)}
     raw_masks = {int(frame): np.asarray(mask) for frame, mask in result.frames.items()}
-    branch_masks = [_frame_masks(group.edge_write_masks[edge_id], tuple(group.frame_indices))
-                    for edge_id in getattr(run, "edge_ids", ())
-                    if edge_id in getattr(group, "edge_write_masks", {})]
-    candidates = None
-    if branch_masks:
-        candidates = {}
-        y0, x0, y1, x1 = group.context_bbox_yx
-        for frame, mask in raw_masks.items():
-            write = np.zeros((y1-y0, x1-x0), dtype=bool)
-            for branch in branch_masks:
-                write |= branch[frame]
-            candidates[frame] = (mask != 0) & write
+    # The writer already owns the exact staged per-edge write contracts. It
+    # clips one raw plane at a time using run.edge_ids, without retaining or
+    # rematerializing a family's dense planning masks throughout inference.
     if availability_masks is None:
-        writer.add_run(descriptor, raw_masks, candidate_masks=candidates)
+        writer.add_run(descriptor, raw_masks)
     else:
         descriptor["sam_crop_mode"] = "tiled"
-        writer.add_run(descriptor, raw_masks, candidate_masks=candidates, availability_masks=availability_masks)
+        writer.add_run(descriptor, raw_masks, availability_masks=availability_masks)
     if not bool(descriptor["structurally_valid"]):
         raise SamInterpolationInfrastructureError("SAM tracker produced structurally invalid expected object evidence")
     return descriptor
@@ -392,21 +518,8 @@ def _base_stats(pass_index: int, requested_passes: int) -> dict[str, object]:
 
 
 def _validate_view(view: object, wrap_axis: bool, scope: Mapping[str, object]) -> None:
-    if wrap_axis:
-        raise ValueError("SAM interpolation does not support wrapping view frames")
-    if float(scope.get("angle_deg", 0.0) or 0.0) != 0.0:
-        raise ValueError("SAM interpolation currently requires augmentation angle zero")
-    if view is None:
-        return
-    family = str(getattr(view, "family", "orthogonal")).lower()
-    orientation = str(getattr(view, "physical_view_name", "") or
-                      getattr(view, "name", getattr(view, "summary_family", view))).lower()
-    if family != "orthogonal" or orientation != "transverse":
-        raise ValueError("SAM interpolation currently supports native Transverse only")
-    if float(getattr(view, "tilt_angle_deg", 0.0) or 0.0) != 0.0:
-        raise ValueError("SAM interpolation does not support tilted view geometry")
-    if float(getattr(view, "tta_angle_deg", 0.0) or 0.0) != 0.0:
-        raise ValueError("SAM interpolation currently requires augmentation angle zero")
+    from .sam_view_geometry import validate_sam_view_geometry
+    validate_sam_view_geometry(view, wrap_axis=wrap_axis, scope=scope)
 
 
 def _frame_masks(masks: object, frames: tuple[int, ...]) -> dict[int, np.ndarray]:
@@ -418,10 +531,47 @@ def _frame_masks(masks: object, frames: tuple[int, ...]) -> dict[int, np.ndarray
     return {int(frame): array[index] for index, frame in enumerate(frames)}
 
 
+class _StreamingGroupMasks(Mapping):
+    """Endpoint crop planes are transient; contract planes remain sealed views."""
+    def __init__(self):
+        self.entries = {}
+
+    def __getitem__(self, name):
+        value = self.entries[name]
+        return value() if callable(value) else value
+
+    def __iter__(self):
+        return iter(self.entries)
+
+    def __len__(self):
+        return len(self.entries)
+
+    def __setitem__(self, name, value):
+        self.entries[name] = value
+
+
 def _write_group(writer: object, group: object, observations: Mapping[str, object],
                  min_radius: float) -> None:
+    materialize=getattr(group,"materialize_contracts",None)
+    if callable(materialize):
+        # One sealed family is streamed to indexed evidence, then its dense
+        # contracts leave scope before the next family/model work is admitted.
+        with materialize() as concrete:
+            _write_materialized_group(writer,concrete,observations,min_radius)
+    else:
+        # Literal historical/research dataclasses retain their existing API.
+        _write_materialized_group(writer,group,observations,min_radius)
+
+
+def _write_materialized_group(writer: object, group: object, observations: Mapping[str, object],
+                              min_radius: float) -> None:
     frames = tuple(int(frame) for frame in group.frame_indices)
     bbox = tuple(int(value) for value in group.context_bbox_yx)
+    crop_metadata = ({"crop_contract": _plain(group.crop_contract)} if getattr(group,"crop_contract",None) else {})
+    if getattr(group, "frame_addressing", None):
+        crop_metadata.update(frame_addressing=_plain(group.frame_addressing),
+                             frame_addresses=_plain(group.frame_addresses),
+                             native_shape_tyx=list(group.native_shape_tyx))
     if str(group.status) in {"unresolved", "incomplete", "invalid"}:
         # Capped groups intentionally have no allocated crop contracts. Persist
         # their bounds/reasons without allocating the very resource they exceed.
@@ -431,6 +581,10 @@ def _write_group(writer: object, group: object, observations: Mapping[str, objec
                 {"observation_id": str(observations[str(identifier)].observation_id),
                  "frame_index": int(observations[str(identifier)].frame_index),
                  "canonical_label": int(observations[str(identifier)].canonical_label),
+                 "original_observation_id": str(getattr(observations[str(identifier)], "original_observation_id", "") or identifier),
+                 "native_frame_index": int(getattr(observations[str(identifier)], "native_frame_index", None)
+                                            if getattr(observations[str(identifier)], "native_frame_index", None) is not None else observations[str(identifier)].frame_index),
+                 "mirror_u": bool(getattr(observations[str(identifier)], "mirror_u", False)),
                  "bbox_yx": list(observations[str(identifier)].bbox_yx),
                  "lineage": _plain(observations[str(identifier)].lineage)}
                 for identifier in group.observation_ids],
@@ -438,6 +592,7 @@ def _write_group(writer: object, group: object, observations: Mapping[str, objec
             "status": str(group.status), "reasons": list(group.reasons),
             "complete": False, "interpolation_min_radius": float(min_radius),
             "connectivity": 6, "endpoint_identity_basis": "slice_connected_components",
+            **crop_metadata,
         }, {f"endpoint_local:{identifier}": observations[str(identifier)].mask_crop
             for identifier in group.observation_ids})
         return
@@ -445,17 +600,19 @@ def _write_group(writer: object, group: object, observations: Mapping[str, objec
     known = _frame_masks(group.known_foreground_masks, frames) if hasattr(group, "known_foreground_masks") else {}
     evaluations = getattr(group, "branch_evaluation_masks", {})
     endpoints = []
-    masks: dict[str, np.ndarray] = {}
+    masks = _StreamingGroupMasks()
     for observation_id in group.observation_ids:
         observation = observations[str(observation_id)]
         endpoints.append({
             "observation_id": str(observation.observation_id),
             "frame_index": int(observation.frame_index),
             "canonical_label": int(observation.canonical_label),
+            "original_observation_id": str(getattr(observation, "original_observation_id", "") or observation.observation_id),
+            "native_frame_index": int(getattr(observation, "native_frame_index", None) if getattr(observation, "native_frame_index", None) is not None else observation.frame_index),
+            "mirror_u": bool(getattr(observation, "mirror_u", False)),
             "lineage": _plain(observation.lineage),
         })
-        silhouette = observation.mask_in_crop(bbox)
-        masks[f"endpoint:{observation_id}"] = silhouette
+        masks[f"endpoint:{observation_id}"] = lambda observation=observation: observation.mask_in_crop(bbox)
         # Nonterminal continuation/walk-back observations still need portable
         # references. Only held-out terminal domains are scored by the policy.
         masks[f"evaluation:{observation_id}"] = np.asarray(
@@ -464,7 +621,7 @@ def _write_group(writer: object, group: object, observations: Mapping[str, objec
             permitted = getattr(group, "branch_permitted_masks", {}).get(str(observation_id))
             masks[f"permitted:{observation_id}"] = (
                 np.asarray(permitted, dtype=bool) if permitted is not None else
-                known[int(observation.frame_index)] & ~silhouette)
+                lambda observation=observation: known[int(observation.frame_index)] & ~observation.mask_in_crop(bbox))
     for frame, mask in acceptance.items():
         masks[f"acceptance:{frame}"] = mask
     for frame, mask in _frame_masks(group.write_masks, frames).items():
@@ -490,6 +647,7 @@ def _write_group(writer: object, group: object, observations: Mapping[str, objec
         "connectivity": 6,
         "endpoint_identity_basis": "slice_connected_components",
         "endpoint_ids": list(getattr(group, "endpoint_ids", tuple(evaluations))),
+        **crop_metadata,
     }
     writer.add_group(metadata, masks)
 
@@ -539,19 +697,35 @@ def selected_sam_plane(bundle: object, receipt: Mapping[str, object], frame: int
         sign = (1 if run_direction == "forward" else -1) if isinstance(run_direction, str) else int(run_direction)
         if direction is not None and sign != int(direction):
             continue
-        if int(frame) not in {int(value) for value in run["expected_frames"]}:
-            continue
         group = groups[str(run["group_id"])]
-        y0, x0, y1, x1 = (int(value) for value in group["context_bbox_yx"])
-        crop = effective_candidate_mask(bundle, str(run_id), int(frame), receipt)
-        if crop is None:
-            continue
-        crop = np.asarray(crop, dtype=bool)
-        if crop.shape != (y1 - y0, x1 - x0):
-            raise SamInterpolationInfrastructureError("Candidate mask shape differs from stored crop geometry")
-        if not (0 <= y0 < y1 <= shape_yx[0] and 0 <= x0 < x1 <= shape_yx[1]):
-            raise SamInterpolationInfrastructureError("Candidate crop is outside its native view canvas")
-        plane[y0:y1, x0:x1] |= crop
+        addresses = None
+        if group.get("frame_addressing"):
+            from .sam_cyclic import (address_for_unfolded_index, transform_crop_between_frame_addresses,
+                                     validate_cyclic_frame_addressing)
+            addresses = validate_cyclic_frame_addressing(group["frame_addressing"], expected_frames=group["frame_indices"])
+            native_shape = tuple(group["frame_addressing"]["native_shape_tyx"])
+            if native_shape[1:] != tuple(shape_yx):
+                raise SamInterpolationInfrastructureError("Cyclic native output shape differs from saved addresses")
+        for stored_frame in run["expected_frames"]:
+            stored_frame = int(stored_frame)
+            address = addresses[stored_frame] if addresses is not None else None
+            if int(address["native_index"] if address is not None else stored_frame) != int(frame):
+                continue
+            crop = effective_candidate_mask(bundle, str(run_id), stored_frame, receipt)
+            if crop is None:
+                continue
+            crop = np.asarray(crop, dtype=bool)
+            bbox = tuple(map(int, group["context_bbox_yx"]))
+            if address is not None:
+                target = address_for_unfolded_index(int(frame), native_shape[0],
+                    period_degrees=group["frame_addressing"]["period_degrees"])
+                crop, bbox = transform_crop_between_frame_addresses(crop, bbox, address, target, shape_yx[1])
+            y0, x0, y1, x1 = bbox
+            if crop.shape != (y1 - y0, x1 - x0):
+                raise SamInterpolationInfrastructureError("Candidate mask shape differs from stored crop geometry")
+            if not (0 <= y0 < y1 <= shape_yx[0] and 0 <= x0 < x1 <= shape_yx[1]):
+                raise SamInterpolationInfrastructureError("Candidate crop is outside its native view canvas")
+            plane[y0:y1, x0:x1] |= crop
     return plane
 
 
@@ -595,9 +769,21 @@ def _publish_directions_with_reader(bundle: object, receipt: Mapping[str, object
             _check_cancelled(cancel_event)
             directional_run_ids = [str(identifier) for identifier in receipt.get("selected_run_ids", ())
                                    if runs[str(identifier)]["direction"] in (sign, direction)]
-            active_frames = sorted({int(frame) for identifier in directional_run_ids
-                                    for frame, key in runs[identifier]["candidate_mask_keys"].items()
-                                    if int(bundle.records[key]["foreground"]) > 0})
+            active_frames_set = set()
+            for identifier in directional_run_ids:
+                group = groups[str(runs[identifier]["group_id"])]
+                addresses = None
+                if group.get("frame_addressing"):
+                    from .sam_cyclic import validate_cyclic_frame_addressing
+                    addresses = validate_cyclic_frame_addressing(group["frame_addressing"],
+                        expected_frames=group["frame_indices"])
+                for frame, key in runs[identifier]["candidate_mask_keys"].items():
+                    if int(bundle.records[key]["foreground"]) > 0:
+                        native_frame = int(addresses[int(frame)]["native_index"]) if addresses is not None else int(frame)
+                        if not 0 <= native_frame < shape[0]:
+                            raise SamInterpolationInfrastructureError("Selected SAM frame is outside its native publication canvas")
+                        active_frames_set.add(native_frame)
+            active_frames = sorted(active_frames_set)
             path = destination / f"sam_bridge_pass{pass_index:02d}_{direction}.cvol"
             writer = IncrementalRawBBoxMaskStoreWriter(
                 shape=shape, store_dir=path, format_name=INTERNAL_PACKED_CVOL_FORMAT,
@@ -606,6 +792,8 @@ def _publish_directions_with_reader(bundle: object, receipt: Mapping[str, object
                             "interpolation_direction": direction,
                             "interpolation_pass_index": int(pass_index),
                             "sam_policy_hash": str(receipt["policy_hash"]),
+                            "sam_selection_identity": str(receipt.get("selection_identity", "")),
+                            "sam_selection_resources": _plain(receipt.get("selection_resources", {})),
                             "sam_mask_filter": _plain(receipt.get("mask_filter")),
                             "sam_evidence_path": str(bundle.directory)},
             )
@@ -641,6 +829,8 @@ def _publish_directions_with_reader(bundle: object, receipt: Mapping[str, object
                     writer.consume_empty_range(next_unwritten, shape[0] - next_unwritten)
                 _check_cancelled(cancel_event)
                 store_meta = writer.finalize()
+                store_meta.update(sam_selection_identity=str(receipt.get('selection_identity', '')),
+                    sam_selection_resources=_plain(receipt.get('selection_resources', {})))
             except BaseException as error:
                 writer.abort(error)
                 raise
@@ -650,12 +840,19 @@ def _publish_directions_with_reader(bundle: object, receipt: Mapping[str, object
                 "voxel_count": int(store_meta.get("foreground_voxels", store_meta.get("added_voxels", 0))),
                 "evidence_path": str(bundle.directory),
                 "policy_hash": str(receipt["policy_hash"]), "metadata": store_meta,
+                "sam_selection_identity": str(receipt.get("selection_identity", "")),
+                "selection_resources": _plain(receipt.get("selection_resources", {})),
                 "selection_receipt_path": str(selection_path),
             })
             directional_group_ids = sorted({str(runs[identifier]["group_id"]) for identifier in directional_run_ids})
-            observation_roots = sorted({str(identifier) for run_id in directional_run_ids
-                                        for key in ("seed_ids", "held_out_ids")
-                                        for identifier in runs[run_id].get(key, ())})
+            observation_roots = set()
+            for run_id in directional_run_ids:
+                endpoints = {str(endpoint["observation_id"]): endpoint for endpoint in
+                             groups[str(runs[run_id]["group_id"])].get("endpoints", ())}
+                for key in ("seed_ids", "held_out_ids"):
+                    for identifier in runs[run_id].get(key, ()):
+                        observation_roots.add(str(endpoints.get(str(identifier), {}).get("original_observation_id", identifier)))
+            observation_roots = sorted(observation_roots)
             group_receipts = receipt.get("group_receipts", {})
             all_connected = bool(directional_group_ids) and all(
                 group_receipts.get(group_id, {}).get("topology", {}).get("all_requested_edges_connected", False)
@@ -689,6 +886,7 @@ def interpolate_sam_view_volume_pass(
     cancel_event: object = None,
     prepared_plan: SamPreparedInterpolationPass | None = None,
     crop_mode: str | None = None,
+    resource_profile: object = None,
 ) -> tuple[np.ndarray, dict[str, object], list[dict[str, object]]]:
     """Generate one SAM planning round from immutable detector observations.
 
@@ -697,7 +895,8 @@ def interpolate_sam_view_volume_pass(
     this function after a bounded independent run. Never pass a bridge-mutated
     volume as ``observation_volume``. The returned merged mmap is caller-owned.
     """
-    del workers  # Tracking concurrency is admitted and owned by the persistent runtime.
+    # Tracking remains owned by the runtime; this hint bounds authenticated
+    # independent CPU measurements after all raw proposals have completed.
     started = time.perf_counter()
     stats = _base_stats(pass_index, interpolation_passes)
     if int(gap_distance) <= 0:
@@ -709,11 +908,15 @@ def interpolate_sam_view_volume_pass(
     if observations.ndim != 3 or any(value <= 0 for value in observations.shape):
         raise ValueError("SAM interpolation needs a nonempty native TYX observation volume")
     metadata = _scope_metadata(scope)
+    if resource_profile is not None:
+        from .sam_resources import validate_live_sam_resource_profile
+        metadata["sam_resource_profile"] = validate_live_sam_resource_profile(resource_profile)
     from .sam_crop_tiling import resolve_sam_crop_mode
     resolved_mode = resolve_sam_crop_mode(crop_mode if crop_mode is not None else
         metadata.get("sam_crop_mode", prepared_plan.crop_mode if prepared_plan is not None else None))
     metadata["sam_crop_mode"] = resolved_mode
     _validate_view(view, wrap_axis, metadata)
+    stats["wrap_axis"] = bool(wrap_axis)
 
     from .sam_evidence import SamEvidenceWriter
     from .sam_policy import select_sam_proposals
@@ -724,14 +927,17 @@ def interpolate_sam_view_volume_pass(
             search_angle_deg=search_angle_deg, interpolation_walk_back=interpolation_walk_back,
             interpolation_candidates=interpolation_candidates, interpolation_passes=interpolation_passes,
             wrap_axis=wrap_axis, upstream_lineage=upstream_lineage, spacing_zyx=spacing_zyx,
-            planner_limits=planner_limits, canonical_labels=canonical_labels, policy=policy, crop_mode=resolved_mode)
+            planner_limits=planner_limits, canonical_labels=canonical_labels, policy=policy, crop_mode=resolved_mode,
+            resource_profile=resource_profile)
     else:
+        from .sam_bridge_planning import SAM_CROP_PLANNING_CONTRACT_VERSION
         expected_settings = _planning_identity(scope=metadata, view=view, pass_index=pass_index,
             gap_distance=gap_distance, min_radius=min_radius, search_angle_deg=search_angle_deg,
             interpolation_walk_back=interpolation_walk_back, interpolation_candidates=interpolation_candidates,
             interpolation_passes=interpolation_passes, wrap_axis=wrap_axis, upstream_lineage=upstream_lineage,
             spacing_zyx=spacing_zyx, planner_limits=planner_limits)
         if (prepared_plan.disabled or prepared_plan.settings_sha256 != expected_settings
+                or getattr(prepared_plan.plan,"crop_contract_version",None)!=SAM_CROP_PLANNING_CONTRACT_VERSION
                 or prepared_plan.observation_buffer_identity != _buffer_identity(observations)
                 or prepared_plan.canonical_buffer_identity != (None if canonical_labels is None else
                                                               _buffer_identity(np.asarray(canonical_labels)))):
@@ -740,6 +946,8 @@ def interpolate_sam_view_volume_pass(
                 and observation_snapshot_sha256(observations) != prepared_plan.observation_snapshot_sha256):
             raise ValueError("Prepared SAM original observation snapshot changed before execution")
     plan = prepared_plan.plan
+    if resource_profile is not None and getattr(plan, "contract_lease_budget", None) is not None:
+        plan.contract_lease_budget.bind_live_resource_profile(resource_profile)
     runs = prepared_plan.runs
     stats["planner_wall_seconds"] = prepared_plan.planner_wall_seconds
     stats["observation_snapshot_wall_seconds"] = prepared_plan.snapshot_wall_seconds
@@ -768,6 +976,24 @@ def interpolate_sam_view_volume_pass(
                  candidate_connections=sum(len(group.edges) for group in plan.groups),
                  planner_plan_count=len(runs), requested_passes=int(plan.requested_passes),
                  completed_passes=int(plan.completed_passes), skipped_passes=int(plan.skipped_passes))
+    session_lengths = [len(run.expected_frames) for run in runs]
+    stats["sam_session_frame_range"] = ([min(session_lengths), max(session_lengths)] if session_lengths else [0, 0])
+    stats["sam_planned_groups"] = sum(group.status == "planned" for group in plan.groups)
+    refusal_reasons = {}
+    for group in plan.groups:
+        if group.status != "planned":
+            for reason in group.reasons:
+                refusal_reasons[str(reason)] = refusal_reasons.get(str(reason), 0) + 1
+    stats["sam_group_refusal_reasons"] = dict(sorted(refusal_reasons.items()))
+    from .sam_bridge_planning import SamPlanningLimits
+    resolved_limits = planner_limits if planner_limits is not None else SamPlanningLimits()
+    stats["sam_group_peak_budget_bytes"] = int(resolved_limits.max_group_bytes)
+    stats["sam_contract_resident_budget_bytes"] = int(resolved_limits.max_total_contract_bytes)
+    stats["sam_contract_storage_version"] = str(getattr(plan, "contract_storage_version", "eager"))
+    stats["sam_original_observation_count"] = len({str(getattr(observation, "original_observation_id", "")
+        or observation.observation_id) for observation in plan.observations})
+    stats["sam_observation_alias_count"] = sum(getattr(observation, "native_frame_index", None) is not None
+        and int(observation.native_frame_index) != int(observation.frame_index) for observation in plan.observations)
     stats["sam_planning_status"] = str(plan.status)
     stats["sam_planning_reasons"] = list(plan.reasons)
     stats["sam_group_planning_receipts"] = [
@@ -786,7 +1012,8 @@ def interpolate_sam_view_volume_pass(
         raise ValueError("Active SAM interpolation requires a persistent raw-mask tracker runtime")
     cache_ref = getattr(image_provider, "cache_ref", image_provider)
     if cache_ref is not None:
-        if tuple(int(value) for value in cache_ref.shape) != observations.shape:
+        image_shape = tuple(getattr(plan, "virtual_shape_tyx", ()) or observations.shape)
+        if tuple(int(value) for value in cache_ref.shape) != image_shape:
             raise ValueError("SAM native image cache and observation canvas geometry differ")
         if hasattr(cache_ref, "revalidate"):
             cache_ref.revalidate()
@@ -800,11 +1027,19 @@ def interpolate_sam_view_volume_pass(
         "image_snapshot_sha256": str(getattr(cache_ref, "identity_sha256", "")),
         "model_identity": str(getattr(runtime, "model_path", "")),
         "pass_index": int(pass_index), "spacing_zyx": list(spacing_zyx),
-        "planning_contract": "original_observations_only_fixed_context_branch_write",
+        "planning_contract": str(plan.crop_contract_version),
+        "crop_contract_version": str(plan.crop_contract_version),
         "interpolation_min_radius": float(min_radius),
         "planning_status": str(plan.status), "planning_reasons": list(plan.reasons),
         "selection_receipt_required": True,
+        "contract_storage_version": str(getattr(plan, "contract_storage_version", "eager")),
+        "interpolation_session_contract": "tta_complete_endpoint_interval_without_lta30",
+        "evidence_shape_tyx": list(getattr(plan, "virtual_shape_tyx", ()) or observations.shape),
     })
+    if getattr(plan, "frame_addressing", None):
+        metadata["frame_addressing"] = _plain(plan.frame_addressing)
+    if getattr(plan, "contract_lease_budget", None) is not None:
+        metadata["contract_resident_budget_bytes"] = int(plan.contract_lease_budget.maximum_bytes)
     metadata["input_fingerprints"] = {
         "original_snapshot": str(metadata["observation_snapshot_sha256"]),
         "image_snapshot": str(metadata["image_snapshot_sha256"]),
@@ -822,6 +1057,14 @@ def interpolate_sam_view_volume_pass(
             metadata.setdefault("gate_support_fingerprints", {})[
                 str(upstream_lineage.get("parent_scope", "parent_bridge"))] = gate_identity
     scope_hash = hashlib.sha256(json.dumps(_plain(metadata), sort_keys=True).encode("utf-8")).hexdigest()[:20]
+    family_configuration = os.environ.get('YOLO_TTA_SAM_FAMILY_SCHEDULE')
+    family_setting = ('fifo' if family_configuration is None else family_configuration).strip().lower()
+    if family_setting not in {'flat', 'fifo'}:
+        raise SamInterpolationInfrastructureError('YOLO_TTA_SAM_FAMILY_SCHEDULE must be flat or fifo')
+    family_capable = callable(getattr(runtime, 'iter_family_results', None))
+    if (family_configuration is not None and family_setting == 'fifo' and resolved_mode == 'whole'
+            and runs and not family_capable):
+        raise SamInterpolationInfrastructureError('Explicit family FIFO dispatch requires a family-aware SAM runtime')
     destination = Path(work_dir) / f"sam_{scope_hash}"
     destination.mkdir(parents=True, exist_ok=True)
     writer = SamEvidenceWriter(destination / "evidence", metadata)
@@ -829,12 +1072,58 @@ def interpolate_sam_view_volume_pass(
     groups = {str(group.group_id): group for group in plan.groups}
     generated_by_index: dict[int, dict[str, object]] = {}
     worker_count = len(getattr(runtime, "device_ids", ())) or 1
+    if prepared_plan.cpu_wave_admission and runs:
+        worker_count = min(worker_count, int(prepared_plan.cpu_wave_admission['max_in_flight']))
+    stats['sam_cpu_wave_admission'] = _plain(prepared_plan.cpu_wave_admission)
+    stats['sam_effective_in_flight'] = worker_count if runs else 0
+    stats['sam_defer_refill_until_consumed'] = bool(prepared_plan.cpu_wave_admission.get('defer_refill_until_consumed', False))
     execution_order = prepared_plan.execution_order(worker_count)
     tracking_work = prepared_plan.tracker_jobs if resolved_mode == "tiled" else runs
     execution_runs = tuple(tracking_work[index] for index in execution_order)
-    stats["sam_execution_schedule"] = ("bounded_tiled_parent_cohorts" if resolved_mode == "tiled" else
+    family_dispatch = (family_setting == 'fifo' and resolved_mode == 'whole' and bool(runs)
+                       and family_capable)
+    family_fallback = None
+    if family_setting == 'fifo' and not family_dispatch:
+        family_fallback = ('tiled_generation_uses_flat_dispatch' if resolved_mode == 'tiled' else
+                           'no_tracker_jobs' if not runs else 'runtime_without_family_dispatch')
+    family_balance = None
+    if family_dispatch and family_configuration is None:
+        family_balance = _family_dispatch_balance(runs, execution_order, worker_count)
+        if family_balance['fallback_flat']:
+            family_dispatch = False
+            family_fallback = 'automatic_family_imbalance'
+    family_inventory = ()
+    if family_dispatch:
+        from .sam_tracker_runtime import SamTrackerFamily
+        indices_by_family = {}
+        for index, run in enumerate(runs):
+            indices_by_family.setdefault(str(run.group_id), []).append(index)
+        def original_request(index):
+            source = _tracker_requests((runs[int(index)],), groups, observation_by_id, cancel_event, resource_profile)
+            try:
+                return next(source)
+            finally:
+                source.close()
+        family_inventory = tuple(SamTrackerFamily(
+            family_id=identity, input_indices=tuple(indices),
+            run_ids=tuple(str(runs[index].run_id) for index in indices),
+            request_factory=original_request,
+            frame_work_proxy=sum(len(runs[index].expected_frames) for index in indices))
+            for identity, indices in indices_by_family.items())
+        stats['sam_effective_in_flight'] = worker_count
+    stats["sam_execution_schedule"] = (("bounded_tiled_parent_cohorts" if worker_count>1 else
+                                       "bounded_tiled_parent_cohorts_crop_local") if resolved_mode == "tiled" else
                                       "crop_waves" if worker_count > 1 else "group_contiguous")
     stats["sam_execution_order"] = list(execution_order)
+    if family_dispatch:
+        stats['sam_execution_schedule'] = 'family_fifo'
+        stats['sam_execution_order'] = []
+        stats['sam_family_completion_order'] = []
+    stats['sam_family_schedule_requested'] = family_setting
+    stats['sam_family_schedule_explicit'] = family_configuration is not None
+    stats['sam_family_schedule_effective'] = 'fifo' if family_dispatch else 'flat'
+    stats['sam_family_schedule_fallback_reason'] = family_fallback
+    stats['sam_family_dispatch_balance'] = family_balance
     assemblies = {}
     completed_jobs = set()
     assembly_root = ((Path(runtime_work_dir) / scope_hash) if runtime_work_dir is not None else
@@ -851,16 +1140,23 @@ def interpolate_sam_view_volume_pass(
                     if not tile.attempted:
                         writer.add_run_tile(runs[parent_index].run_id, tile_descriptor(runs[parent_index], tile), {})
         tracker_started = time.perf_counter()
-        result_stream = (_iterate_tiled_tracker_results(runtime, prepared_plan, worker_count, groups,
-            observation_by_id, cache_ref, cancel_event) if resolved_mode == "tiled" else
-            _iterate_tracker_results(runtime, _tracker_requests(execution_runs, groups,
-                observation_by_id, cancel_event), cache_ref))
+        if family_dispatch:
+            result_stream = runtime.iter_family_results(family_inventory,
+                source_cache_ref=cache_ref, max_in_flight=worker_count,
+                defer_refill_until_consumed=bool(prepared_plan.cpu_wave_admission.get('defer_refill_until_consumed', False)))
+        else:
+            result_stream = (_iterate_tiled_tracker_results(runtime, prepared_plan, worker_count, groups,
+                observation_by_id, cache_ref, cancel_event, resource_profile) if resolved_mode == "tiled" else
+                _iterate_tracker_results(runtime, _tracker_requests(execution_runs, groups,
+                    observation_by_id, cancel_event, resource_profile), cache_ref, prepared_plan.cpu_wave_admission))
         for execution_index, result in result_stream:
             try:
                 if (isinstance(execution_index, bool) or not isinstance(execution_index, (int, np.integer))
                         or not 0 <= int(execution_index) < len(tracking_work)):
                     raise SamInterpolationInfrastructureError("SAM worker returned duplicate or unknown run ownership")
-                work_index = execution_order[int(execution_index)]
+                work_index = int(execution_index) if family_dispatch else execution_order[int(execution_index)]
+                if family_dispatch:
+                    stats['sam_family_completion_order'].append(work_index)
                 if work_index in completed_jobs:
                     raise SamInterpolationInfrastructureError("SAM worker returned duplicate or unknown run ownership")
                 job = tracking_work[work_index]
@@ -911,6 +1207,8 @@ def interpolate_sam_view_volume_pass(
                 del result
         if len(completed_jobs) != len(tracking_work) or len(generated_by_index) != len(runs):
             raise SamInterpolationInfrastructureError("SAM worker stream omitted expected independently seeded runs/tiles")
+        if family_dispatch:
+            stats['sam_execution_order'] = list(getattr(runtime, 'dispatch_stats', {}).get('family_execution_order', ()))
         if resolved_mode == "tiled":
             stats["sam_tiled_child_jobs_generated"] = len(completed_jobs)
             stats["sam_tiled_parent_runs_generated"] = len(generated_by_index)
@@ -967,7 +1265,9 @@ def interpolate_sam_view_volume_pass(
                         else destination / "_runtime")
     try:
         _check_cancelled(cancel_event)
-        receipt = select_sam_proposals(bundle, policy=policy)
+        receipt = select_sam_proposals(bundle, policy=policy,
+            workers=workers,
+            **({"resource_profile": resource_profile} if resource_profile is not None else {}))
         stats["sam_policy_wall_seconds"] = time.perf_counter() - policy_started
         (destination / "selection.json").write_text(json.dumps(_plain(receipt), indent=2), encoding="utf-8")
         merged, components, added, publication_cache_stats = _publish_directions(bundle, receipt, observations,
@@ -991,6 +1291,9 @@ def interpolate_sam_view_volume_pass(
         "added_voxels": int(added), "bridge_component_count": 2,
         "sam_generated_runs": len(generated), "sam_selected_runs": len(selected),
         "sam_incomplete_runs": sum(not bool(run["complete"]) for run in generated),
+        "sam_guarded_rescue": _plain(receipt.get("guarded_rescue", {})),
+        "sam_guarded_rescued_groups": len(receipt.get("guarded_rescue", {}).get("rescued_group_ids", ())),
+        "sam_guarded_rescued_runs": len(receipt.get("guarded_rescue", {}).get("rescued_run_ids", ())),
         "skipped_by_min_radius": 0,
         "sam_mask_filter": _plain(receipt.get("mask_filter")),
         "sam_radius_filter_run_summaries": {
@@ -1009,6 +1312,10 @@ def interpolate_sam_view_volume_pass(
             for record in receipt.get("run_receipts", {}).values()
             for item in record.get("measurements", {}).get("component_filter", ())),
         "sam_policy_hash": str(receipt["policy_hash"]),
+        "sam_selection_identity": str(receipt.get("selection_identity", "")),
+        "sam_selection_resources": _plain(receipt.get("selection_resources", {})),
+        "sam_policy_name": str(receipt.get("policy_name", "")),
+        "sam_policy_version": int(receipt.get("resolved_policy", {}).get("version", 0)),
         "sam_evidence_path": str(bundle.directory), "sam_selection_receipt": _plain(receipt),
         "sam_directional_components": components,
         "sam_scope_metadata": metadata,

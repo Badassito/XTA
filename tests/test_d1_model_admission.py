@@ -39,6 +39,7 @@ class LegacyD1ModelAdmissionTests(unittest.TestCase):
                 for cpu in (False, True):
                     env = dict(view=replace(view, family=family), kind='fullframe',
                                v1613_d1_owner_active=True, legacy_d1_model_eligible=eligible,
+                               d1_categorical_coverage_eligible_by_view={view.name:True},
                                worker_direct_union_active=cpu, cpu_eligible=cpu, gpu_eligible=True,
                                azimuthal_parent_requires_seam_union=False, radial_owner=False,
                                gpu_worker_result_dir=Path('unused'), prefix='probe', chunk_idx=0,
@@ -47,7 +48,7 @@ class LegacyD1ModelAdmissionTests(unittest.TestCase):
                                HYBRID_DEFERRED_RESULT_MODE=pipeline.HYBRID_DEFERRED_RESULT_MODE)
                     exec(program, env)
                     expected = ('direct_union' if cpu else 'file')
-                    if eligible and family in ('orthogonal', 'tilted', 'azimuthal'):
+                    if eligible and family == 'orthogonal':
                         expected = pipeline.HYBRID_DEFERRED_RESULT_MODE if cpu else 'd1_owner'
                     with self.subTest(path=path, family=family, cpu=cpu):
                         self.assertEqual(env['result_mode'], expected)

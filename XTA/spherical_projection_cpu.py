@@ -12,6 +12,7 @@ import math
 import numpy as np
 
 from ._deps import _numba
+from .spherical_projection_bounds import SPHERICAL_RADIUS_ROUNDOFF_RELATIVE
 
 
 _EMPTY_BOXES = np.empty((0, 4), dtype=np.int64)
@@ -27,7 +28,7 @@ def _pull_spherical_f64(source, radii, rotation, boxes, use_boxes,
                         minimum, maximum, z, first, stop,
                         rectangle_width=0, rectangle_x=0, rectangle_y=0, scalar_max=False):
     result = np.zeros(stop - first, dtype=np.uint8)
-    dz = ((float(z) + .5) * work_t / out_t - .5) - (work_t - 1) / 2.0
+    dz = ((float(z) + .5) - out_t / 2.0) * work_t / out_t
     source_h, source_w = source.shape[1], source.shape[2]
     for offset in range(stop - first):
         pixel = np.int64(first) + np.int64(offset)
@@ -35,10 +36,11 @@ def _pull_spherical_f64(source, radii, rotation, boxes, use_boxes,
         if rectangle_width:
             x = pixel % rectangle_width + rectangle_x
             y = pixel // rectangle_width + rectangle_y
-        dx = ((float(x) + .5) * work_w / out_w - .5) - (work_w - 1) / 2.0
-        dy = ((float(y) + .5) * work_h / out_h - .5) - (work_h - 1) / 2.0
+        dx = ((float(x) + .5) - out_w / 2.0) * work_w / out_w
+        dy = ((float(y) + .5) - out_h / 2.0) * work_h / out_h
         radius = math.sqrt((dx * dx + dy * dy) + dz * dz)
-        if radius < minimum or radius > maximum:
+        if ((radius < minimum and minimum - radius > SPHERICAL_RADIUS_ROUNDOFF_RELATIVE * max(radius, minimum))
+                or (radius > maximum and radius - maximum > SPHERICAL_RADIUS_ROUNDOFF_RELATIVE * max(radius, maximum))):
             continue
         # Empty shell metadata proves that no face pixel can contribute. This
         # uses the identical global nearest-shell search and midpoint rule.

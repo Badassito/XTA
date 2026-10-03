@@ -6,9 +6,11 @@ import sys
 import unittest
 from pathlib import Path
 
+from XTA import __version__
+
 
 ROOT = Path(__file__).resolve().parents[1]
-WRAPPER = ROOT / "GPT-6-Astra-Ultra_v24.0.0_SLURM.py"
+WRAPPER = ROOT / f"GPT-6-Astra-Ultra_v{__version__}_SLURM.py"
 UNIFIED_MODULES = (
     "experimental_features",
     "gaussian",
@@ -96,7 +98,7 @@ class ImportSurfaceTests(unittest.TestCase):
     def test_module_version(self) -> None:
         completed = self.run_python("-m", "XTA", "--version")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("24.0.0", completed.stdout)
+        self.assertIn(__version__, completed.stdout)
 
     def test_cycle_safe_full_import_smoke(self) -> None:
         completed = self.run_python(str(ROOT / "tools" / "smoke_import.py"), "pipeline")

@@ -18,6 +18,8 @@ import zlib
 import numpy as np
 
 from .json_publication import write_json_atomic
+from .confidence_capture import (NativeConfidenceCapturePlan, plan_confidence_capture,
+    confidence_capture_resources, current_confidence_capture_plan)
 
 
 SCHEMA = 'xta.confidence_evidence/1'
@@ -460,12 +462,55 @@ class _MaskedNativeScoreReader:
     """Read observed scores only inside trusted, pre-interpolation mask bounds."""
     def __init__(self, mask, scores, known_slice_any, known_slice_bboxes):
         self.mask, self.scores = mask, scores
-        self.active = np.asarray(known_slice_any, dtype=bool)
+        typed = (isinstance(mask, np.ndarray) and isinstance(scores, np.ndarray)
+                 and mask.dtype in (np.dtype(np.uint8), np.dtype(bool))
+                 and scores.dtype == np.uint8)
+        if typed and (scores.ndim != 3 or mask.shape != scores.shape):
+            raise ValueError('Compiled confidence capture mask/score geometry differs')
+        plan = current_confidence_capture_plan() if typed else None
+        if plan is not None and plan.shape != tuple(scores.shape):
+            raise ValueError('Confidence capture plan differs from retained source geometry')
+        if typed and plan is None:
+            # Admit snapshot/control ownership before making independent
+            # active/bbox arrays. The writer resolves its actual grid later.
+            plan_confidence_capture(scores.shape, 1)
+        if typed:
+            count = scores.shape[0]
+            if isinstance(known_slice_any, np.ndarray):
+                if (known_slice_any.shape != (count,)
+                        or not (known_slice_any.dtype == np.bool_
+                                or np.issubdtype(known_slice_any.dtype, np.integer))):
+                    raise ValueError('Confidence active metadata has invalid shape or scalar dtype')
+            elif isinstance(known_slice_any, (list, tuple)):
+                if len(known_slice_any) != count or any(
+                        not isinstance(value, (bool, int, np.integer, np.bool_))
+                        or not -2**63 <= int(value) <= 2**64-1 for value in known_slice_any):
+                    raise ValueError('Confidence active metadata needs bounded integer scalars')
+            else:
+                raise ValueError('Confidence active metadata must be an array or integer sequence')
+            if isinstance(known_slice_bboxes, np.ndarray):
+                if (known_slice_bboxes.shape != (count, 4)
+                        or not np.issubdtype(known_slice_bboxes.dtype, np.integer)):
+                    raise ValueError('Confidence bbox metadata has invalid shape or scalar dtype')
+            elif isinstance(known_slice_bboxes, (list, tuple)):
+                if len(known_slice_bboxes) != count:
+                    raise ValueError('Confidence bbox metadata has invalid frame count')
+                for row in known_slice_bboxes:
+                    if (not isinstance(row, (list, tuple)) or len(row) != 4
+                            or any(not isinstance(value, (int, np.integer))
+                                   or not -2**63 <= int(value) <= 2**63-1 for value in row)):
+                        raise ValueError('Confidence bbox metadata needs four bounded integer scalars')
+            else:
+                raise ValueError('Confidence bbox metadata must be an array or integer rows')
+        active_values = np.asarray(known_slice_any)
         raw_boxes = np.asarray(known_slice_bboxes)
-        if (self.active.shape != (scores.shape[0],) or raw_boxes.shape != (scores.shape[0],4)
-                or not np.issubdtype(raw_boxes.dtype, np.integer)):
+        if (active_values.shape != (scores.shape[0],) or raw_boxes.shape != (scores.shape[0],4)
+                or not np.issubdtype(raw_boxes.dtype, np.integer)
+                or (typed and not (np.issubdtype(active_values.dtype, np.integer)
+                                   or active_values.dtype == np.bool_))):
             raise ValueError('Confidence support metadata has invalid shape or bounds dtype')
-        self.boxes = raw_boxes.astype(np.int64, copy=False)
+        self.active = np.array(active_values, dtype=bool, copy=True) if typed else np.asarray(active_values, dtype=bool)
+        self.boxes = np.array(raw_boxes, dtype=np.int64, copy=True) if typed else raw_boxes.astype(np.int64, copy=False)
         boxes = self.boxes[self.active]
         if boxes.size and (np.any(boxes[:,0] < 0) or np.any(boxes[:,1] > scores.shape[1])
                 or np.any(boxes[:,2] < 0) or np.any(boxes[:,3] > scores.shape[2])
@@ -476,6 +521,16 @@ class _MaskedNativeScoreReader:
         self.capture_metrics = dict(dense_equivalent_input_bytes=2*int(scores.size),
             bounded_input_bytes=2*int(np.sum((boxes[:,1]-boxes[:,0])*(boxes[:,3]-boxes[:,2]))),
             empty_slices_skipped=int(scores.shape[0]-indices.size))
+        self.capture_plan = None
+        self.compiled_capture_capable = False
+        if typed:
+            self.mask, self.scores = mask.view(), scores.view()
+            self.mask.setflags(write=False)
+            self.scores.setflags(write=False)
+            self.active.setflags(write=False)
+            self.boxes.setflags(write=False)
+            self.capture_plan = plan
+            self.compiled_capture_capable = True
 
     def iter_crops(self, z):
         if self.active[z]:
@@ -483,6 +538,36 @@ class _MaskedNativeScoreReader:
             values = np.where(self.mask[z,y0:y1,x0:x1] != 0,
                               self.scores[z,y0:y1,x0:x1],np.uint8(0))
             yield y0,y1,x0,x1,values
+
+    def encode_frame(self, z, block_size):
+        """Typed retiring inputs: fused bounds/count, bounded exact zlib cells."""
+        from .confidence_capture_cpu import masked_cell_bounds, copy_masked_cell
+        if not self.compiled_capture_capable:
+            raise ValueError('Compiled confidence capture needs its admitted grid plan')
+        if self.capture_plan is not None and int(block_size) != self.capture_plan.block_size:
+            raise ValueError('Compiled confidence capture grid differs from its admitted task plan')
+        if not 0 <= int(z) < self.scores.shape[0] or not 1 <= int(block_size) <= 65535:
+            raise ValueError('Compiled confidence capture frame/grid is outside its source')
+        if not self.active[z]:
+            return [], dict(scan_seconds=0., compression_seconds=0., known_voxels=0)
+        y0, y1, x0, x1 = map(int, self.boxes[z])
+        started = time.perf_counter()
+        bounds = masked_cell_bounds(self.mask, self.scores, z, y0, y1, x0, x1, block_size)
+        scan_seconds = time.perf_counter() - started
+        compression_seconds = 0.
+        records = []
+        for item in bounds:
+            a, b, c, d, known = map(int, item)
+            started = time.perf_counter()
+            crop = copy_masked_cell(self.mask, self.scores, z, a, b, c, d)
+            scan_seconds += time.perf_counter() - started
+            started = time.perf_counter()
+            encoded = zlib.compress(crop.tobytes(), level=3)
+            compression_seconds += time.perf_counter() - started
+            records.append((a, b, c, d, known, encoded))
+        return records, dict(scan_seconds=scan_seconds,
+                             compression_seconds=compression_seconds,
+                             known_voxels=int(bounds[:, 4].sum()) if len(bounds) else 0)
 
 
 def capture_prediction_confidence(mask, scores, *, view, model_name, temp_dir,

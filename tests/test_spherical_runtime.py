@@ -89,6 +89,7 @@ class SphericalSchedulerContracts(unittest.TestCase):
         for cpu, d1, direct in product((False, True), repeat=3):
             env = dict(view=view, kind='fullframe', v1613_d1_owner_active=d1,
                        legacy_d1_model_eligible=True,
+                       d1_categorical_coverage_eligible_by_view={view.name:True},
                        worker_direct_union_active=direct, cpu_eligible=cpu, gpu_eligible=True,
                        azimuthal_parent_requires_seam_union=False, radial_owner=False,
                        gpu_worker_result_dir=Path('unused'), prefix='probe', chunk_idx=0,

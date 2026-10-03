@@ -151,7 +151,7 @@ class ProjectionSamplingIntegrationTests(unittest.TestCase):
             expected = 'coverage' if any(angle % 360.0 == 0.0 for angle in angles) else 'dense'
             self.assertEqual(compiler.call_args.kwargs['sampling_policy'], expected)
 
-    def test_d1_and_hybrid_production_routes_bypass_only_coarsened_azimuthal(self):
+    def test_d1_and_hybrid_production_routes_require_cartesian_coverage(self):
         tree = ast.parse(inspect.getsource(pipeline._main_impl))
         hybrid = next(node for node in ast.walk(tree) if _assigned(node, 'hybrid_deferred'))
         routing = next(node for node in ast.walk(tree)
@@ -169,13 +169,16 @@ class ProjectionSamplingIntegrationTests(unittest.TestCase):
             for cpu in (False, True):
                 env = dict(view=view, kind='fullframe', v1613_d1_owner_active=True,
                            legacy_d1_model_eligible=True, worker_direct_union_active=cpu,
+                           # This fixture isolates the sampling-policy gate;
+                           # Cartesian area fallback has separate coverage tests.
+                           d1_categorical_coverage_eligible_by_view={view.name:True},
                            cpu_eligible=cpu, gpu_eligible=True, radial_owner=False,
                            azimuthal_parent_requires_seam_union=False, prefix='probe', chunk_idx=0,
                            gpu_worker_result_dir=Path('unused'), args=SimpleNamespace(min_conf=0.0),
                            requires_native_pull=requires_native_pull,
                            HYBRID_DEFERRED_RESULT_MODE=pipeline.HYBRID_DEFERRED_RESULT_MODE)
                 exec(program, env)
-                expected = ('direct_union' if cpu else 'file') if bypass else (
+                expected = ('direct_union' if cpu else 'file') if view.family != 'orthogonal' or bypass else (
                     pipeline.HYBRID_DEFERRED_RESULT_MODE if cpu else 'd1_owner')
                 with self.subTest(view=view.name, bypass=bypass, cpu=cpu):
                     self.assertEqual(env['result_mode'], expected)

@@ -53,7 +53,7 @@ def scalar_oracle(data, view, shape):
         if view.radial_tilted_source:
             stack -= math.tan(math.radians(view.tilt_angle_deg)) * (dy if view.tilt_direction == 'vertical' else dx)
         true_height = stack
-        if not 0 <= true_height <= length - 1:
+        if not -.5 <= true_height < length - .5:
             continue
         chosen = min(range(count), key=lambda i: abs(radii[i] - distance))
         frame = chosen - view.radial_shell_start
@@ -281,7 +281,7 @@ class CylindricalProjectionTests(unittest.TestCase):
                                 radius = np.hypot(dx, dy)
                                 height = stack - np.tan(np.radians(view.tilt_angle_deg)) * (dy if direction == 'vertical' else dx)
                                 wanted = ((radius >= minimum) & (radius <= view.radial_max_radius)
-                                          & (height >= 0) & (height <= length - 1))
+                                          & (height >= -.5) & (height < length - .5))
                                 with self.subTest(shape=shape, size=size, base=base, minimum=minimum,
                                                   direction=direction, angle=angle, sign=sign):
                                     np.testing.assert_array_equal(union.astype(bool), wanted)

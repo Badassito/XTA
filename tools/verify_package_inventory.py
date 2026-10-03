@@ -246,6 +246,277 @@ REVIEWED_V24_0_0_ADDED_VALIDATION_TOOLS = {
     'tools/qualify_sam_tiled_integration.py': None,
 }
 
+# This uncommitted development successor preserves the exact tagged v25 receipt.
+# Final source/tool pins are populated only after outer-crop development freezes.
+REVIEWED_V24_OUTER_CROP_DEVELOPMENT_PREDECESSOR_COMMIT = 'b0152ec399578070d7c2adcf7c81a939e8b9986e'
+REVIEWED_V24_OUTER_CROP_DEVELOPMENT_PREDECESSOR_SHA256 = 'e2f177c286cda52bb74c10623f6aad37083025a817be1b83a687999315a9aacf'
+REVIEWED_V24_OUTER_CROP_DEVELOPMENT_SHA256 = 'dd38dffcc2bf4f5636829c02b8e97441ae2f0aceb18bb8fc629855781516bd48'
+REVIEWED_V24_OUTER_CROP_DEVELOPMENT_PREDECESSOR_MODULES = {'sam_bridge_planning': {'ast_sha256': '06079a643c1fdd00fffff851aeb60aff8017bbdee62d2d41fe402c0a833ea767',
+                         'statements_sha256': 'e9886cc45f13bda5edb5b6db8eef3496b1f0ebd8fbc8a1b866e082402d431c08'},
+ 'sam_interpolation': {'ast_sha256': 'aa2b9261d6441cb6eef74ec528a062b68a017875cceaa37d47e30c5f47ad092c',
+                       'statements_sha256': 'eb6aa48dfb6d72fd345814540143f8b9cde15f042cc44c5aaf41fbc492ec2131'},
+ 'sam_policy': {'ast_sha256': '4b9050507ddb8f8cc3cc42126627e96ebc231c947a20a7529a475fa84b504a5c',
+                'statements_sha256': 'fbb2d0c4eb6389253d2f2e9c1d34b4807509f595d3f31e38b38ad2fab9e4378e'}}
+REVIEWED_V24_OUTER_CROP_DEVELOPMENT_REMOVALS = {'definitions': (), 'statements': ()}
+REVIEWED_V24_OUTER_CROP_DEVELOPMENT_ADDED_VALIDATION_TOOLS = {'tools/prepare_reconciliation_release.py': 'c28393d52a7962b4d0f9bfd89a4d3a11b30506e2334f9d2915969f3d9013753e',
+ 'tools/sam_outer_crop_geometry.py': None,
+ 'tools/prepare_sam_outer_crop_experiment.py': None,
+ 'tools/prepare_sam_outer_crop_protocol.py': None,
+ 'tools/run_sam_outer_crop_experiment.py': None,
+ 'tools/run_sam_outer_crop_stress.py': None,
+ 'tools/analyze_sam_outer_crop.py': None,
+ 'tools/derive_sam_acceptance_evidence.py': None,
+ 'tools/qualify_sam_tiled_schedule.py': None,
+ 'tools/report_sam_outer_crop.py': None,
+ 'tools/generate_sam_outer_crop_sdf.py': None}
+
+# The qualified outer-crop development archive is immutable. Its successor
+# authenticates this receipt rather than rewriting it or the tagged release.
+REVIEWED_V24_GUARDED_RESCUE_DEVELOPMENT_PREDECESSOR_COMMIT = 'b0152ec399578070d7c2adcf7c81a939e8b9986e'
+REVIEWED_V24_GUARDED_RESCUE_DEVELOPMENT_PREDECESSOR_SHA256 = '08f423f44e474fcd351eccb86d3f069d821d6ce77d940ef950a80e7bd223f332'
+REVIEWED_V24_GUARDED_RESCUE_DEVELOPMENT_PREDECESSOR_ARCHIVE_SHA256 = '6ca3e8158c42aaaba1b09fbf4e8c62495f2dbfb221fedf09e7c41d9b2e8bb4a6'
+REVIEWED_V24_GUARDED_RESCUE_DEVELOPMENT_PREDECESSOR_SOURCE_COUNT = 670
+REVIEWED_V24_GUARDED_RESCUE_DEVELOPMENT_SHA256 = 'e33ab93f1880cddee017f93d75f3e6b2295ce67695a988ba49d8ea0054c3d082'
+REVIEWED_V24_GUARDED_RESCUE_DEVELOPMENT_PREDECESSOR_MODULES = {'assembly': {'ast_sha256': 'f6770302457043c501d2134671419f2e659f890be5f6d8d02ba73337c5a05032',
+              'statements_sha256': '24f3abd4b984646489337d876a88d04a38b90a42bcd183e168266075e2b8c32d'},
+ 'lta_execution': {'ast_sha256': '23426644020dd92a1cfc1c322937948abdeaf6aa2a520ea82c5744388ef58abd',
+                   'statements_sha256': 'c905408b8a9c3a292ac659df605eed59d10744529ce517e54cc165b2972d3c58'},
+ 'outputs': {'ast_sha256': 'ee7bc088bf9eb95a09bcc08f9b88eb30f1766c1becbee45d9d73c75b5d2d6da3',
+             'statements_sha256': '2c4a8bbb7c4198c3c5f9166741729f672a58209fb2f31f0dd09ba766a83c2ba5'},
+ 'pipeline': {'ast_sha256': 'd79c990c7758c10b90ce2e524b2b27ff6d66c3794fd97d08043f8d36406ebd0c',
+              'statements_sha256': '7522b6d936df74cc070187e406cc59e28dc75faf92e86749b99251774d624f2f'},
+ 'sam_bridge_planning': {'ast_sha256': '6ddd1ac97ad2cd8dcd73f7b2c757def89884c38d816f7d5a654e5bf2683dcfe4',
+                         'statements_sha256': '52791b0a56a0ffe4b5192d8c951d6663512df1cafb25ce3b89368edf03ee1ae0'},
+ 'sam_canvas_rendering': {'ast_sha256': None,
+                          'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'sam_cyclic': {'ast_sha256': None,
+                'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'sam_evidence': {'ast_sha256': '62142dea97d49da378e4d7a90fdcae245c19d70792c8b478937c20e2a1542fa4',
+                  'statements_sha256': '254673585df2819d6c863299564559c37a38df11a544f4ce194999ded30a7ad0'},
+ 'sam_filtering': {'ast_sha256': 'e4478f74d4ec046525031571e5d73ee95d4ea61e29cc0b36443e92f11333b255',
+                   'statements_sha256': '049c20e0d9195dfc4c1405f151106f617942e39f43d422b4e6d382497401fb72'},
+ 'sam_integration': {'ast_sha256': '0a6154b735005ce8b95d7143c6194144de7f9bf36b757683fb5de6209e8c0691',
+                     'statements_sha256': '4c97a7c766badcbc071522615067af17ea4af38393967a2afe118b1f48899168'},
+ 'sam_interpolation': {'ast_sha256': '89b9e86077e4ff17ba3b5064581bc54735b3ea8d2bffd961325f9a9517d730a3',
+                       'statements_sha256': 'a637a31947948d8ca86946bc9042c6af63508a55a660c3d8dd7c373e325c3b4d'},
+ 'sam_parent_staging': {'ast_sha256': None,
+                        'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'sam_policy': {'ast_sha256': '41fd164ef15b6ec4d945bf1074dc37404aa2640e55b6761b1b9b650ff0b65c03',
+                'statements_sha256': 'ea44bbc36214ceefe2a1ae4dea90fe4df98b82475a95c7bde109f4bf88bf9009'},
+ 'sam_replay': {'ast_sha256': 'ebefa2295ec5cec7cbba88ae97c52726523cfa07dc94dea0338b0a6c610feb1e',
+                'statements_sha256': '1e9a70edd211a80ae2b16b73c7ad7dc8a41c5d596fac5822da7f77420f312229'},
+ 'sam_view_geometry': {'ast_sha256': None,
+                       'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'}}
+REVIEWED_V24_GUARDED_RESCUE_DEVELOPMENT_REMOVALS = {'definitions': (), 'statements': ()}
+REVIEWED_V24_GUARDED_RESCUE_DEVELOPMENT_ADDED_VALIDATION_TOOLS = {}
+# This successor preserves the qualified guarded-rescue source bundle and its
+# complete inventory. Current-source pins remain empty until final review.
+REVIEWED_V24_JOB150615_DEVELOPMENT_PREDECESSOR_COMMIT = 'b0152ec399578070d7c2adcf7c81a939e8b9986e'
+REVIEWED_V24_JOB150615_DEVELOPMENT_PREDECESSOR_SHA256 = '3afb13121f097bc3b2bd5b1d7afaa67be1ece6c88ef36fd9f0750ff6383ea6b3'
+REVIEWED_V24_JOB150615_DEVELOPMENT_PREDECESSOR_ARCHIVE_SHA256 = '8a8c839fad58d443d44f2df9898aae8111505e81e8e4dcdcc23c5bbf39a9809d'
+REVIEWED_V24_JOB150615_DEVELOPMENT_PREDECESSOR_SOURCE_COUNT = 685
+REVIEWED_V24_JOB150615_DEVELOPMENT_SHA256 = '3d6795cf8fdda3a90a3fd20ef759dbcd617d946551ed47b2d11084c8a11f0cdf'
+REVIEWED_V24_JOB150615_DEVELOPMENT_PREDECESSOR_MODULES = {'cuda_d1': {'ast_sha256': '40f1ef43a8025bdef78b4338cebec4eabef550f92cb85fc3840b079557f9197c',
+             'statements_sha256': 'ab0bc9c9ac13c9c4b9b4486b5b5b8ec4165daa5df928f4c117e1c29af0261005'},
+ 'd1_orthogonal_coverage': {'ast_sha256': None,
+                            'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'lta_sam': {'ast_sha256': '99797e2ee8bda3dcac859dfb318a4e10db4f0be26f8597e378a33df215b953c8',
+             'statements_sha256': 'e54562cdafdb7bee91d874d45b7be080068ef16dc8213b3d18d49adc8f151dee'},
+ 'outputs': {'ast_sha256': '7c693302bd2f94dde8711dc569dd28a6ba474e4a5f61a3695b02be82c8359bd3',
+             'statements_sha256': '79867d679ccac57e45849e94858794ddfd2eb166676ba9dea8c22f6cdc12d392'},
+ 'pipeline': {'ast_sha256': '08ceab57a4f6f637d75f412a15a7a374fe5f4f1ea4bec2aab1c49694641fb156',
+              'statements_sha256': 'b4433f75706eb3ede22d8332edadf10d4a27c580d9c19cc2e765823cba532ead'},
+ 'sam_bridge_planning': {'ast_sha256': '7f441ffcb02a682e678cfb761ed1172c52fba654bed347bfdd7cfab1673cef34',
+                         'statements_sha256': '3ee59fc7096ea71a8203a9d9b8825955d83d47db673135409a1111b91f7a5b4e'},
+ 'sam_evidence': {'ast_sha256': 'fc56edee38165827a9d4ce9aea63bc9aa9d1ba9691841fe3eecc8433728c5a5b',
+                  'statements_sha256': 'e607a59b1cca29a182a31b4396ae569cd8304bd24173ee9f77f15752fbe4097d'},
+ 'sam_integration': {'ast_sha256': 'eba749bd559ea4f743f4345250ccf61b31fa276b2e230b1300df7ddbec37ed43',
+                     'statements_sha256': 'd82d3e17b42a73dd3d302b6fc8d1c6fb414e66d488e5229ab3f9a5d0e6dc2282'},
+ 'sam_interpolation': {'ast_sha256': '20378c423bbd576d11bf6c673a8df1bd55ada5cc559d5b038381632ef9698fd2',
+                       'statements_sha256': '23c23d6782ee80e864fc43c25479464e38aeb5c348b1974f05528c7faa3e6191'},
+ 'sam_policy': {'ast_sha256': 'fe23c399bf1956aa416ee351d1b3062c8f23c5b0c5491da34f4741e39d4940e3',
+                'statements_sha256': 'd8665a30ef740332c149a6ce7accc512a4ae9fd93ff4d2adb24ecf29d11fef60'},
+ 'sam_resources': {'ast_sha256': None,
+                   'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'sam_tracker_runtime': {'ast_sha256': 'f0fe717e14f00fe7f6682218276e714107972aeeef08454aba19eef0a2e1723a',
+                         'statements_sha256': '4445401523712e14bad3ded0a068cb7c17234521b989e76b22faae24bf990a4c'},
+ 'topology': {'ast_sha256': 'f4dff92b5b15c953ba7ab0d65ec91f10743e6f9d2161dff808384c8611979498',
+              'statements_sha256': 'bffc8964ed8843ab899d82f39285bbaa6389a742498b1db185254eebcdc13f6a'},
+ 'view_prepare': {'ast_sha256': 'd560e7b1884af5d01dc72bb43e33560f2741bf9b20794a0feb7e77ee2c23e67b',
+                  'statements_sha256': '6bed79f35fb4619c28693c861f1cd50486976fb933bbdf907e6be7a250f66e1b'}}
+REVIEWED_V24_JOB150615_DEVELOPMENT_REMOVALS = {'definitions': (), 'statements': ()}
+REVIEWED_V24_JOB150615_DEVELOPMENT_ADDED_VALIDATION_TOOLS = {
+    'tools/qualify_sam_interpolation_long_session.py': None,
+}
+# Preserve the reviewed 9af tree despite its interrupted full qualification.
+# This source archive authenticates review history, not completed qualification.
+REVIEWED_V24_JOB150615_HEADROOM_DEVELOPMENT_PREDECESSOR_COMMIT = 'b0152ec399578070d7c2adcf7c81a939e8b9986e'
+REVIEWED_V24_JOB150615_HEADROOM_DEVELOPMENT_PREDECESSOR_SHA256 = 'a8d9d91034b1f0fd4752fbba9db9c546dd1a9c73ea4dd7ed9a1a58c1f9e89727'
+REVIEWED_V24_JOB150615_HEADROOM_DEVELOPMENT_PREDECESSOR_ARCHIVE_SHA256 = '15ee0488a0f750e69623ba13c33fc318dc411429329b2502e25787fe853ffb4d'
+REVIEWED_V24_JOB150615_HEADROOM_DEVELOPMENT_PREDECESSOR_SOURCE_COUNT = 698
+REVIEWED_V24_JOB150615_HEADROOM_DEVELOPMENT_SHA256 = '8c3231070c44a3dcaf7e52796effd97417dcb094aee1fa02c8db144e82126180'
+REVIEWED_V24_JOB150615_HEADROOM_DEVELOPMENT_PREDECESSOR_MODULES = {'sam_resources': {'ast_sha256': '6ade87cc5e49ba8f3052a191c804fa37c16dd1295ff3ae24c87112ed1f54d05b',
+                   'statements_sha256': '1ffec24ead19e3875bc1e11f1af7f370e5316f04afb6990ebea6eb0680751f1a'}}
+REVIEWED_V24_JOB150615_HEADROOM_DEVELOPMENT_REMOVALS = {'definitions': (), 'statements': ()}
+REVIEWED_V24_JOB150615_HEADROOM_DEVELOPMENT_ADDED_VALIDATION_TOOLS = {}
+# The released parent stays v25.0.0. The immediately preceding reviewed tree
+# includes every immutable development appendix, but did not pass its original
+# strict qualification gate. Never promote that source archive's provenance.
+REVIEWED_V24_0_1_RELEASE_PREDECESSOR_COMMIT = 'b0152ec399578070d7c2adcf7c81a939e8b9986e'
+REVIEWED_V24_0_1_RELEASE_PREDECESSOR_SHA256 = '4f06d220c82f31068e267ebbed46f661a2d0be2d716d1677c0e2d0c982e0e361'
+REVIEWED_V24_0_1_RELEASE_PREDECESSOR_ARCHIVE_SHA256 = '626cf097a9c6467b9507059822380bb02586ce31fc9a5e7fc4c48072ae3a1415'
+REVIEWED_V24_0_1_RELEASE_PREDECESSOR_SOURCE_COUNT = 699
+REVIEWED_V24_0_1_RELEASE_SHA256 = 'aafb2f1bd5ccf8d3d206d2d015e59cc915ab54bfb5454f9a0693eb5ad14496b2'
+REVIEWED_V24_0_1_RELEASE_PREDECESSOR_MODULES = {'__init__': {'ast_sha256': 'f26a1a42527cff5e332544486c2678e827bd4378169049182b394f1427762765',
+              'statements_sha256': 'bb2d2fa1fa41950ab0d37c48acb5f6076b812a0429aeaf47a307f33368217a4e'},
+ 'assembly': {'ast_sha256': '4b141e79c5a842a90c06e4f0a90c4c2c4d328b7c4766be073ae1ac8c1cf9305f',
+              'statements_sha256': '0a8c7a9dd9b6eb9b133a4c8ff248e14cd3cda73bcd00c26d2121faebc1b02682'},
+ 'backprojection': {'ast_sha256': '0959cbd801b80e67f926c0181bb56a8d0a13672139ddc6d6b74bfb12b73eb5fc',
+                    'statements_sha256': '4ee4e7ef2808de56039795819f7aa94887795855cf1c4aea1298df0b186b46d9'},
+ 'confidence_projection': {'ast_sha256': '7a70aa6c005e9e415afc8e623bb428754e31c2ced00d9783f9c81d66747fad6b',
+                           'statements_sha256': '17981b3cc4b44ca9849037ccabb9cb75c13eab1bbc7b766a3486095c25fb2014'},
+ 'cuda_d1': {'ast_sha256': 'ee671081ec1ea382ac6c2e91ecd13304acc5aecf8075b1205aec4c6643d2030d',
+             'statements_sha256': '57f3735ab2ee38dfa482b6caf81f8724dd9f63873f6d737ac751384e44300d8a'},
+ 'cylindrical_cuda_projection': {'ast_sha256': '0cf65e8687c12e73e1700770a58dab7506a706320b0b7ce8780ce7609ed7ee02',
+                                 'statements_sha256': '594f89607e473edc734c70c4dabd135eb77f0ba77815b5e5a834e107dc47c1ea'},
+ 'cylindrical_owner': {'ast_sha256': '3d2db4424d2fc0d4816dabb91fbc7e038b3a63cc42322fdb0f17f1401e4fee74',
+                       'statements_sha256': '2a4a8c420cc7e23b79b338081c0b8428eabaaa9e5e598e45356e6c964a289217'},
+ 'cylindrical_projection': {'ast_sha256': '87acaa52bc8075e033cc9c5229e5ea452c05eb12d9251aa0960e8503be59a778',
+                            'statements_sha256': 'bfd7e886dbc494a657f61ddb9eccbc7712c12ed084f5165b973ad9d9e60793e4'},
+ 'pipeline': {'ast_sha256': '793b9dbd9ec1ba9eefb288858590a2c4f26b1c52e764a14a5752076958ecd845',
+              'statements_sha256': '88e6fe8fb377577def4debae60201117f276c379547c7fd50a8f9e87b9382531'},
+ 'projection_coverage': {'ast_sha256': None,
+                         'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'sam_view_geometry': {'ast_sha256': 'c6531f0b3e8ce67a233ac623f2b5cd1e41b09b14f6af4a3c3a716e8bc02851cb',
+                       'statements_sha256': '519e33d03c147fc3a1a0fe8633b396df02e244b431235938f17ecfcde495d64f'},
+ 'sparse_projection': {'ast_sha256': 'f796eceb5f224752a89676e2f8beb32d02c834a20a84b1a085c68a7b61479b5b',
+                       'statements_sha256': '2f2a38f8557ffb6fae495320c84b0ad3e6f754d4d11dfafb02b440108581d7c1'},
+ 'spherical_projection': {'ast_sha256': '84fd4a74de2c116c2f2988a963b4f29175293afa1def826ae343afa971074b2a',
+                          'statements_sha256': 'd85116c0884339af1d3f21dbfdc3a2b6e237891817aaec1f572b9a6fcf65a3c3'},
+ 'spherical_projection_bounds': {'ast_sha256': '487298cdbb5e2df4385b97dfc2c26cf2444ec95a8616ef3f2c046b148232c2a9',
+                                 'statements_sha256': '69bbfb98eab2b09acb4a37f485c0c51ba24f43b13804ea165361424550c419aa'},
+ 'spherical_projection_cpu': {'ast_sha256': '75daadc01a8a4022663ecad29951c5632475b20d397cfcb57f15115b531bb42b',
+                              'statements_sha256': 'b2f1cca7c32aa3778ff01ad3a829a73920389c29c773586c1bfb4bb3560393f6'},
+ 'spherical_projection_cuda': {'ast_sha256': 'b17e4cf9bbf6df42052ae0d8ae6a40333be53242d54f9552de1381e2119cd000',
+                               'statements_sha256': '35160f07f5fbafcad9d3dd029ef09ec4147854a3fd0c1831abdb711a0845f119'},
+ 'tilted_azimuthal_projection': {'ast_sha256': 'cb523cf3d97cbe86a98d5533862b38c1dee9ffb276caf4cbe3ba1aa3b46c595e',
+                                 'statements_sha256': '7c454b9bcdf60f131ef2fa7dae7f7ff27ed051f49210f901361ea1bde18386ef'},
+ 'tilted_azimuthal_projection_cuda': {'ast_sha256': 'ecdeb9db33de3a9cf6b60c8195bb531e6c5f2e3cf029331a478ad64ec400bef7',
+                                      'statements_sha256': 'd77e4ed035286e3822f65a8a4f5b74cd12191a1268ce52478caa57bdacddda91'}}
+REVIEWED_V24_0_1_RELEASE_REMOVALS = {'definitions': (('confidence_projection',
+                  '_bounded_azimuthal_geometry',
+                  12,
+                  '3f47d3904e95dd24f6f773e70fd9afc668d323d19d4c8ccbc91e166622ad2c9d'),
+                 ('confidence_projection',
+                  '_bounded_azimuthal_map',
+                  11,
+                  '36064469c5f193842027450d29d6acecc34e856aa00816a58b3be08b0a05c104'),
+                 ('confidence_projection',
+                  '_bounded_tilted_azimuthal_projection',
+                  17,
+                  'fa9d1b79bb9d3ef1658aad08ec0a576c00038e45b763a64a4b46276278f88094'),
+                 ('confidence_projection',
+                  '_bounded_tilted_projection',
+                  16,
+                  '1083008a6c27454cfef1451371f29070e03eca29a43dd473db1e8f1825691ccb'),
+                 ('confidence_projection',
+                  '_bounded_upright_reader',
+                  13,
+                  '3bb42e1e6573c8b361867bd23196aa52523ddc788f93bfa7c646a8ad3a79597e'),
+                 ('confidence_projection',
+                  '_project_tilted_azimuthal_scores',
+                  23,
+                  'f145d76d05564c719df9e2cc6e65f7ce0cd9a7b22e2a9d4bd7c0c5c9e26ace09'),
+                 ('confidence_projection',
+                  '_scatter_score_strip',
+                  14,
+                  '29b8f5f97257f2075cea77fd208934468a54058e28e36a15e61c77f44c4f5ab8'),
+                 ('confidence_projection',
+                  '_upright_azimuthal_reader',
+                  22,
+                  '6d63608880b45883e8c30236732964ca7582a432dcfd73fb6b34df4512e462f6'),
+                 ('sparse_projection',
+                  '_InverseMap',
+                  21,
+                  '817815a40487cf215da8be8cc6f6432b76143b38bdb82674976e02640328a80a'),
+                 ('sparse_projection',
+                  '_inverse_map',
+                  34,
+                  '2b524b20ec7d47e6e60de8d0aa9d90a4fdb1c7567ae036ee5bcb4eceb17ce6e0'),
+                 ('sparse_projection',
+                  '_make_inverse_map',
+                  33,
+                  '564f79f8a4ca0e2affa813fd5052c15a12b67789cfa9fd7f749cdc37321cbca2'),
+                 ('sparse_projection',
+                  '_scatter_crop',
+                  27,
+                  'fbf5655251566ea10ae454fe97381005a9c883149e8d5b3b1231700633d76eb8')),
+ 'statements': (('confidence_projection',
+                 6,
+                 'ff05bad0fd9a7212d3cd85fd2726055168be21bc8f6e0d93b29965794b0675d4'),
+                ('sparse_projection',
+                 31,
+                 '4ba5310e952e771ee961b7c204a4bcf097f7413a3aa7a38c70e728d26c4c5fa8'))}
+REVIEWED_V24_0_1_RELEASE_ADDED_VALIDATION_TOOLS = {
+    'tools/qualify_projection_coverage.py': None,
+}
+REVIEWED_V24_0_1_RELEASE_RETIRED_LOCAL_IMPORT_SEAMS = {
+    ('backprojection', 'backproject_tilted_volume_to_volume'): (
+        '2e23f76c7b54f80aef146c68c32bd8fb86fe2e204919e1cc92ecd7623463b00e',
+        '103bcd919155cd1041b3dba63e18f574816a01ae096f6145d71615f97b9df124',
+        '431e18c5d3ef480cfb062daf01c65f02371c215485ec436bb815767a87b4b144'),
+}
+REVIEWED_V24_JOB150772_PERFORMANCE_DEVELOPMENT_PREDECESSOR_COMMIT = 'b0152ec399578070d7c2adcf7c81a939e8b9986e'
+REVIEWED_V24_JOB150772_PERFORMANCE_DEVELOPMENT_PREDECESSOR_SHA256 = '4989006ed6327297c85fb8ce520685767cd3c1a0dc537de15509cb77a2105f3a'
+REVIEWED_V24_JOB150772_PERFORMANCE_DEVELOPMENT_PREDECESSOR_ARCHIVE_SHA256 = 'd5d2d939f775c3153f4889cecbf779b65e4e297314b72f06137fd8a93dd1301a'
+REVIEWED_V24_JOB150772_PERFORMANCE_DEVELOPMENT_PREDECESSOR_SOURCE_COUNT = 715
+REVIEWED_V24_JOB150772_PERFORMANCE_DEVELOPMENT_SHA256 = 'd52241531b956555ab71e59d0711762c8848181cd0608b98a0dfca7622a3ab53'
+REVIEWED_V24_JOB150772_PERFORMANCE_DEVELOPMENT_PREDECESSOR_MODULES = {'backprojection': {'ast_sha256': '0af8fd840242ac86fa856108c979cc883e6b28d8034ccc8b77aadad600f615ea',
+                    'statements_sha256': '7a1241622da899d85cf9cc6f554aab2a5f8ace1f55bb333e2e658e31dee8496d'},
+ 'confidence_projection': {'ast_sha256': '82e3b273f25bb392b35fda7b9e5a789121d6ae455b2b696e80dc35b557dc47c8',
+                           'statements_sha256': '5dcc09ab1c1f70ad81ea2b0a3bae6671115a3f6773e72d0a561a5f20046af860'},
+ 'pipeline': {'ast_sha256': '807e7a094d2bd0b7de0d5605550233803e446ae71b75f8159fa3ac87ca1d5a5e',
+              'statements_sha256': 'd473ebdbc89eefe4b7cbffc3c50e3d045fdacf01766afc6c22fb2055e09346be'},
+ 'projection_coverage_cpu': {'ast_sha256': None,
+                             'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'}}
+REVIEWED_V24_JOB150772_PERFORMANCE_DEVELOPMENT_REMOVALS = {'definitions': (), 'statements': ()}
+REVIEWED_V24_JOB150772_PERFORMANCE_DEVELOPMENT_ADDED_VALIDATION_TOOLS = {
+    'tools/benchmark_native_pull_projection.py': None,
+}
+REVIEWED_V24_JOB150790_150798_THROUGHPUT_DEVELOPMENT_PREDECESSOR_COMMIT = 'b0152ec399578070d7c2adcf7c81a939e8b9986e'
+REVIEWED_V24_JOB150790_150798_THROUGHPUT_DEVELOPMENT_PREDECESSOR_SHA256 = '5a421dee44b8013b89007738c5a3a2e506947b925f2a0e0d2698c7c0305edfa5'
+REVIEWED_V24_JOB150790_150798_THROUGHPUT_DEVELOPMENT_PREDECESSOR_ARCHIVE_SHA256 = '3cf2d7b0e759e873350c944297aa97d441fec3f4d617522f38df809a4e287e6d'
+REVIEWED_V24_JOB150790_150798_THROUGHPUT_DEVELOPMENT_PREDECESSOR_SOURCE_COUNT = 724
+REVIEWED_V24_JOB150790_150798_THROUGHPUT_DEVELOPMENT_SHA256 = '301690b230c28ef24b336d3ee6f4631481b42ab819a2f1cb88dee906f1376891'
+REVIEWED_V24_JOB150790_150798_THROUGHPUT_DEVELOPMENT_PREDECESSOR_MODULES = {'confidence_capture': {'ast_sha256': None,
+                        'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'confidence_capture_cpu': {'ast_sha256': None,
+                            'statements_sha256': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'},
+ 'confidence_evidence': {'ast_sha256': '7f82f76db7134827fa1c71562d3328640a0a31d811a4463d2620c3e54aa8ee33',
+                         'statements_sha256': '30b7c568ae05ffbcbcff1904c50cb7fa37f71a68f750366849cac729e7b2d6b7'},
+ 'confidence_storage': {'ast_sha256': 'ca499e2d0f714b59d72178cd7555bc99e46a4b3a3915a0ad0d1d961d6b288b91',
+                        'statements_sha256': '9bf9a528eae4e06c4ea268caf87113c4de7d96cb4d9fd0cf24fe4ed22821ff58'},
+ 'pipeline': {'ast_sha256': '06c6c4328a098d7f9f8fa7088b45fbdf1afab24ec12fbecde7d4006eee05a5cd',
+              'statements_sha256': '4b8cf4524a3d0303872e6159b163485271cc10230866d5ce3a690bf3e27d20dc'},
+ 'sam_filtering': {'ast_sha256': 'ac3a1f49d6a046b6de5ed88592c64c4b55f19c5eb131196a084ac36014213e8a',
+                   'statements_sha256': '548bdc16b5f3c4fa439107d57cbf1d71fe461ef42358fea2939dd3694829fd41'},
+ 'sam_interpolation': {'ast_sha256': '62312e12471c56da175f985ccf2a46db6759606f2cadae38cc312c3ccefb6211',
+                       'statements_sha256': 'd713b59ae721b47138e08a3f8555a65b46e6c2742b591641a7a8353e82a42ea1'},
+ 'sam_mask_reader': {'ast_sha256': 'b80003c1fa7bd33d7bad974e0edd622370dccdc52990cf83361f4d660b12821b',
+                     'statements_sha256': 'f2036f0c9691c18df2b04866a86d7e9c82c353ec526a2478461adcb661eee58c'},
+ 'sam_policy': {'ast_sha256': 'abb7cfd05cdcdec7ae637c426a90681abb815fd75531f4d6c392e69ebae2ad60',
+                'statements_sha256': '546b524a83ea440ef48bcbddde8cb69fc9941b36c4edbbaca356919f7d64affe'},
+ 'sam_tracker_runtime': {'ast_sha256': '1bd166acd345631ddefa22d5eb0099a183b2f9d1a4b946ce1c8c9480da5a1f56',
+                         'statements_sha256': '3deded5260387efc5acb628cc7546bf40d42e187010788d0fdd4c64f45a27ccf'}}
+REVIEWED_V24_JOB150790_150798_THROUGHPUT_DEVELOPMENT_REMOVALS = {'definitions': (), 'statements': ()}
+REVIEWED_V24_JOB150790_150798_THROUGHPUT_DEVELOPMENT_ADDED_VALIDATION_TOOLS = {
+    'tools/benchmark_confidence_capture.py': None,
+    'tools/qualify_sam_policy_throughput.py': None,
+    'tools/qualify_sam_family_dispatch.py': None,
+}
+UNQUALIFIED_THROUGHPUT_CANDIDATE_SHA256 = '92fad99e47314c0c0cf95fda1daa5a7965322e3cba133597f8699a8fa9380256'
+UNQUALIFIED_THROUGHPUT_FAILED_GATE_SHA256 = 'e3d10f2af832836534472f4de01491e7c8d6e69f32e7f99370d5f3209c07a5ad'
+
 REVIEWED_V23_0_4_RELEASE_PREDECESSOR_MODULES = {'__init__': {'ast_sha256': '06cab8fb84fe1b0d128e79914bf7b85d06e19e1d7ea60632cabb45d61b803372',
               'statements_sha256': 'a846fd38a2701ec3b095f34b403e143b74e695dec8c579b2379a58db2fd71e56'},
  '_deps': {'ast_sha256': '5c5900b0274d8b4a1f0ded960929b803257beba5454dcc1b56bcdbede73c35c6',
@@ -2166,7 +2437,7 @@ def _reviewed_v21_patch_contract(
         keys = [(item['module'], item[identity]) for item in review[category]]
         if len(keys) != len(set(keys)) or any(not item.get('reason') for item in review[category]):
             raise RuntimeError(f'v{release} review has duplicate or unexplained {category}')
-        for item in review[category]:
+        for item in _logical_archive_source_review(review)[category]:
             key = (item['module'], item[identity])
             if key in historical and item.get('previous_sha256') != historical[key]:
                 raise RuntimeError(f'v{release} supersession does not match its historical pin: {key[0]}.{key[1]}')
@@ -2335,7 +2606,7 @@ def reviewed_v22_coverage_contract(
 
 def verify_coverage_validation_tools(review) -> None:
     """The full-domain rational certificate is independently reviewed source."""
-    for item in review['validation_tools']:
+    for item in _logical_archive_source_review(review)['validation_tools']:
         path = ROOT / item['path']
         if not path.is_file() or hashlib.sha256(path.read_text(encoding='utf-8').encode('utf-8')).hexdigest() != item['sha256']:
             raise RuntimeError(f'v22 coverage validation tool changed or is missing: {item["path"]}')
@@ -2969,7 +3240,7 @@ def reviewed_v23_0_2_release_contract(manifest, v21, *earlier_patches):
     tools = review.get('validation_tools', ())
     if [item.get('path') for item in tools] != list(prior_tools):
         raise RuntimeError('v23.0.2 validation-tool review has missing or duplicate paths')
-    for item in tools:
+    for item in _logical_archive_source_review(review)['validation_tools']:
         value = item.get('sha256')
         if (item.get('previous_sha256') != prior_tools[item['path']] or not item.get('reason')
                 or not isinstance(value, str) or len(value) != 64
@@ -3047,7 +3318,7 @@ def reviewed_v23_0_3_release_contract(manifest, v21, *earlier_patches):
                       'tools/qualify_d1_confidence_masked_transfer.py', 'tools/qualify_release.py']
     if [item.get('path') for item in tools] != expected_paths:
         raise RuntimeError('v23.0.3 validation-tool review has missing or duplicate paths')
-    for item in tools:
+    for item in _logical_archive_source_review(review)['validation_tools']:
         value = item.get('sha256')
         if (item.get('previous_sha256') != prior_tools.get(item['path']) or not item.get('reason')
                 or not isinstance(value, str) or len(value) != 64
@@ -3148,7 +3419,7 @@ def reviewed_v23_0_4_release_contract(manifest, v21, *earlier_patches):
     tools = review.get('validation_tools', ())
     if [item.get('path') for item in tools] != list(prior_tools):
         raise RuntimeError('v23.0.4 validation-tool review has missing or duplicate paths')
-    for item in tools:
+    for item in _logical_archive_source_review(review)['validation_tools']:
         value = item.get('sha256')
         if (item.get('previous_sha256') != prior_tools.get(item['path']) or not item.get('reason')
                 or not isinstance(value, str) or len(value) != 64
@@ -3250,7 +3521,7 @@ def reviewed_v23_0_5_release_contract(manifest, v21, *earlier_patches):
     expected_paths = [*prior_tools, *REVIEWED_V23_0_5_ADDED_VALIDATION_TOOLS]
     if [item.get('path') for item in tools] != expected_paths:
         raise RuntimeError('v23.0.5 validation-tool review has missing or duplicate paths')
-    for item in tools:
+    for item in _logical_archive_source_review(review)['validation_tools']:
         value = item.get('sha256')
         previous = prior_tools.get(item['path'], REVIEWED_V23_0_5_ADDED_VALIDATION_TOOLS.get(item['path']))
         if (item.get('previous_sha256') != previous or not item.get('reason')
@@ -3262,6 +3533,7 @@ def reviewed_v23_0_5_release_contract(manifest, v21, *earlier_patches):
 
 def reviewed_v24_0_0_release_contract(manifest, v21, *earlier_patches):
     """Authenticate the SAM interpolation appendix against the complete tagged 23.0.5 receipt."""
+    manifest = _without_reviewed_v24_outer_crop_development(manifest)
     key = 'v24_0_0_release_review'
     prior = {name: value for name, value in manifest.items() if name != key}
     encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
@@ -3352,7 +3624,7 @@ def reviewed_v24_0_0_release_contract(manifest, v21, *earlier_patches):
     expected_paths = [*prior_tools, *REVIEWED_V24_0_0_ADDED_VALIDATION_TOOLS]
     if [item.get('path') for item in tools] != expected_paths:
         raise RuntimeError('v24.0.0 validation-tool review has missing or duplicate paths')
-    for item in tools:
+    for item in _logical_archive_source_review(review)['validation_tools']:
         value = item.get('sha256')
         previous = prior_tools.get(item['path'], REVIEWED_V24_0_0_ADDED_VALIDATION_TOOLS.get(item['path']))
         if (item.get('previous_sha256') != previous or not item.get('reason')
@@ -3362,7 +3634,315 @@ def reviewed_v24_0_0_release_contract(manifest, v21, *earlier_patches):
     return review
 
 
+def reviewed_v24_outer_crop_development_contract(manifest, v21, *earlier_patches,
+                                                _guarded_rescue=False, _job150615=False,
+                                                _job150615_headroom=False, _release24_0_1=False,
+                                                _job150772_performance=False, _job150790_throughput=False):
+    """Authenticate the outer-crop development appendix against the complete tagged 24.0.0 receipt."""
+    if _job150790_throughput:
+        key = 'v24_job150790_150798_throughput_development_review'
+        prefix = 'REVIEWED_V24_JOB150790_150798_THROUGHPUT_DEVELOPMENT'
+        previous_key = 'v24_job150772_performance_development_review'
+        previous_digest = REVIEWED_V24_JOB150772_PERFORMANCE_DEVELOPMENT_SHA256
+        previous_contract = reviewed_v24_job150772_performance_development_contract
+        development_name = 'job150790-150798-throughput'
+    elif _job150772_performance:
+        manifest = _without_reviewed_v24_job150790_150798_throughput_development(manifest)
+        key = 'v24_job150772_performance_development_review'
+        prefix = 'REVIEWED_V24_JOB150772_PERFORMANCE_DEVELOPMENT'
+        previous_key, previous_digest = 'v24_0_1_release_review', REVIEWED_V24_0_1_RELEASE_SHA256
+        previous_contract = reviewed_v24_0_1_release_contract
+        development_name = 'job150772-performance'
+    elif _release24_0_1:
+        manifest = _without_reviewed_v24_job150772_performance_development(manifest)
+        key, prefix = 'v24_0_1_release_review', 'REVIEWED_V24_0_1_RELEASE'
+        previous_key = 'v24_job150615_headroom_development_review'
+        previous_digest = REVIEWED_V24_JOB150615_HEADROOM_DEVELOPMENT_SHA256
+        previous_contract = reviewed_v24_job150615_headroom_development_contract
+        development_name = None
+    elif _job150615_headroom:
+        manifest = _without_reviewed_v24_0_1_release(manifest)
+        key = 'v24_job150615_headroom_development_review'
+        prefix = 'REVIEWED_V24_JOB150615_HEADROOM_DEVELOPMENT'
+        previous_key, previous_digest = 'v24_job150615_development_review', REVIEWED_V24_JOB150615_DEVELOPMENT_SHA256
+        previous_contract = reviewed_v24_job150615_development_contract
+        development_name = 'job150615-headroom'
+    elif _job150615:
+        manifest = _without_reviewed_v24_job150615_headroom_development(manifest)
+        key, prefix = 'v24_job150615_development_review', 'REVIEWED_V24_JOB150615_DEVELOPMENT'
+        previous_key = 'v24_guarded_rescue_development_review'
+        previous_digest = REVIEWED_V24_GUARDED_RESCUE_DEVELOPMENT_SHA256
+        previous_contract = reviewed_v24_guarded_rescue_development_contract
+        development_name = 'job150615'
+    elif _guarded_rescue:
+        manifest = _without_reviewed_v24_job150615_development(manifest)
+        key, prefix = 'v24_guarded_rescue_development_review', 'REVIEWED_V24_GUARDED_RESCUE_DEVELOPMENT'
+        previous_key, previous_digest = 'v24_outer_crop_development_review', REVIEWED_V24_OUTER_CROP_DEVELOPMENT_SHA256
+        previous_contract = reviewed_v24_outer_crop_development_contract
+        development_name = 'guarded-rescue'
+    else:
+        manifest = _without_reviewed_v24_guarded_rescue_development(manifest)
+        key, prefix = 'v24_outer_crop_development_review', 'REVIEWED_V24_OUTER_CROP_DEVELOPMENT'
+        previous_key, previous_digest = 'v24_0_0_release_review', REVIEWED_V24_0_0_RELEASE_SHA256
+        previous_contract = reviewed_v24_0_0_release_contract
+        development_name = 'outer-crop'
+    pins = globals()[prefix + '_PREDECESSOR_MODULES']
+    expected_removals = globals()[prefix + '_REMOVALS']
+    added_tools = globals()[prefix + '_ADDED_VALIDATION_TOOLS']
+    prior = {name: value for name, value in manifest.items() if name != key}
+    encoded = json.dumps(prior, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    if hashlib.sha256(encoded).hexdigest() != globals()[prefix + '_PREDECESSOR_SHA256']:
+        raise RuntimeError('v25 outer-crop development predecessor inventory changed; preserve every historical record')
+    _authenticate_successor_once(prior, previous_key, previous_contract)
+    earlier = tuple(value for name, value in prior.items()
+                    if name != 'v21_review' and isinstance(value, dict)
+                    and 'release' in value and 'definitions' in value)
+    review = _reviewed_v21_patch_contract(
+        manifest, prior['v21_review'], key=key, release='24.0.1' if _release24_0_1 or _job150772_performance or _job150790_throughput else '24.0.0',
+        expected_digest=globals()[prefix + '_SHA256'],
+        previous_digest=previous_digest,
+        earlier_patches=earlier)
+    if (review.get('predecessor_commit') != globals()[prefix + '_PREDECESSOR_COMMIT']
+            or review.get('predecessor_inventory_sha256') != globals()[prefix + '_PREDECESSOR_SHA256']
+            or review.get('feature') != ('all-view-projection-coverage' if _release24_0_1 else
+                                        'sam-' + development_name + '-development')):
+        raise RuntimeError('v25 outer-crop development review has an unexpected predecessor or feature')
+
+    if _release24_0_1:
+        if (review.get('kind') != 'release' or review.get('package_version') != '24.0.1'
+                or review.get('predecessor_tag') != 'v24.0.0'
+                or review.get('released_predecessor_version') != '24.0.0'):
+            raise RuntimeError('v24.0.1 must identify the unchanged tagged v24.0.0 release parent')
+        seam_retirements = review.get('retired_local_import_seams', ())
+        actual_retirements = {(item['module'], item['name']): (
+            item.get('previous_definition_sha256'), item.get('previous_seam_sha256'), item.get('definition_sha256'))
+            for item in seam_retirements}
+        if (len(actual_retirements) != len(seam_retirements)
+                or actual_retirements != REVIEWED_V24_0_1_RELEASE_RETIRED_LOCAL_IMPORT_SEAMS
+                or any(not item.get('reason') or not any(
+                    definition.get('module') == item['module'] and definition.get('name') == item['name']
+                    and definition.get('previous_sha256') == item['previous_definition_sha256']
+                    and definition.get('sha256') == item['definition_sha256']
+                    for definition in review['definitions']) for item in seam_retirements)):
+            raise RuntimeError('v24.0.1 retired local-import seams differ from their independent review')
+    if _job150790_throughput and 'prequalification_amendment' in review:
+        if review['prequalification_amendment'] != {
+                'superseded_candidate_sha256': UNQUALIFIED_THROUGHPUT_CANDIDATE_SHA256,
+                'failed_qualification_sha256': UNQUALIFIED_THROUGHPUT_FAILED_GATE_SHA256,
+                'qualification_result': 'failed'}:
+            raise RuntimeError('Unqualified candidate amendment has unexpected prior candidate or gate proof')
+    if not _release24_0_1 and (review.get('kind') != 'development' or review.get('development') != development_name
+            or review.get('package_version') != ('24.0.1' if _job150772_performance or _job150790_throughput else '24.0.0')
+            or review.get('released') is not False
+            or review.get('predecessor_tag') != 'v24.0.0'):
+        raise RuntimeError('Outer-crop appendix must be labelled development of the unchanged v24.0.0 package')
+    if _guarded_rescue or _job150615 or _job150615_headroom or _release24_0_1 or _job150772_performance or _job150790_throughput:
+        predecessor_source = review.get('predecessor_source_archive', {})
+        expected_kind = ('reviewed_development_source_zip' if _job150615_headroom or _release24_0_1
+                         else 'qualified_development_source_zip')
+        if (predecessor_source.get('sha256') != globals()[prefix + '_PREDECESSOR_ARCHIVE_SHA256']
+                or predecessor_source.get('source_identity_count') != globals()[prefix + '_PREDECESSOR_SOURCE_COUNT']
+                or predecessor_source.get('kind') != expected_kind):
+            raise RuntimeError('Reviewed development predecessor archive changed' if _job150615_headroom or _release24_0_1 else
+                               'Guarded-rescue development qualified predecessor archive changed')
+        if _job150615_headroom and (predecessor_source.get('qualification_status') != 'incomplete'
+                                   or predecessor_source.get('full_qualification') is not False):
+            raise RuntimeError('Reviewed predecessor must retain its incomplete qualification status')
+        if _release24_0_1 and (predecessor_source.get('qualification_status') != 'strict_gate_failed_followup_audited'
+                              or predecessor_source.get('full_qualification') is not False):
+            raise RuntimeError('Reviewed release predecessor must retain its failed strict-gate status')
+        if (_job150772_performance or _job150790_throughput) and (predecessor_source.get('qualification_status') != 'passed'
+                                      or predecessor_source.get('full_qualification') is not True
+                                      or predecessor_source.get('package_version') != '25.0.1'):
+            raise RuntimeError('Performance predecessor must retain its completed v24.0.1 qualification')
+    identity_bindings = {('__init__', '__version__'), ('cli', 'SCRIPT_VERSION'),
+                         ('cli', 'SCRIPT_BASENAME'), ('config', 'SCRIPT_VERSION'),
+                         ('config', 'SCRIPT_VERSION_COMPACT'), ('config', 'SCRIPT_BASENAME')}
+    if not _release24_0_1 and any((record.get('module'), record.get('binding')) in identity_bindings
+           for record in review.get('statements', ())):
+        raise RuntimeError('Development review cannot change the package or launcher release identity')
+
+    snapshots = review.get('module_snapshots', ())
+    modules = [item.get('module') for item in snapshots]
+    if (len(modules) != len(set(modules))
+            or set(modules) != set(pins)):
+        raise RuntimeError('v25 outer-crop development source snapshot coverage differs')
+    if set(review.get('complete_modules', ())) - set(modules):
+        raise RuntimeError('v25 outer-crop development complete source snapshot has no module')
+    records = review['definitions'] + review['statements']
+    for item in snapshots:
+        module = item['module']
+        previous = pins[module]
+        historical = item.get('previous_top_level', ())
+        historical_digest = hashlib.sha256(json.dumps(historical, separators=(',', ':')).encode()).hexdigest()
+        if (item.get('previous_ast_sha256') != previous['ast_sha256']
+                or historical_digest != previous['statements_sha256']):
+            raise RuntimeError(f'v25 outer-crop development source predecessor changed: {module}')
+        if item.get('removed'):
+            raise RuntimeError(f'v25 outer-crop development has an unreviewed module removal: {module}')
+        for value in (item.get('ast_sha256'), *historical, *item.get('top_level', ())):
+            if (not isinstance(value, str) or len(value) != 64
+                    or any(char not in '0123456789abcdef' for char in value)):
+                raise RuntimeError(f'v25 outer-crop development source snapshot has an invalid digest: {module}')
+        if not item.get('reason'):
+            raise RuntimeError(f'v25 outer-crop development source snapshot has no review reason: {module}')
+        positions = []
+        for record in records:
+            if record['module'] != module:
+                continue
+            current_index, previous_index = record.get('current_index'), record.get('previous_index')
+            if (type(current_index) is not int or not 0 <= current_index < len(item['top_level'])
+                    or item['top_level'][current_index] != record['sha256']):
+                raise RuntimeError(f'v25 outer-crop development statement position differs: {module}')
+            if previous_index is None:
+                if record['previous_sha256'] is not None:
+                    raise RuntimeError(f'v25 outer-crop development new statement has an unexpected predecessor: {module}')
+            elif (type(previous_index) is not int or not 0 <= previous_index < len(historical)
+                    or historical[previous_index] != record['previous_sha256']):
+                raise RuntimeError(f'v25 outer-crop development statement predecessor changed: {module}')
+            positions.append(current_index)
+        if len(positions) != len(set(positions)):
+            raise RuntimeError(f'v25 outer-crop development source has duplicate reviewed positions: {module}')
+    if any(record['module'] not in set(modules) for record in records):
+        raise RuntimeError('v25 outer-crop development statement has no complete source snapshot')
+
+    removals = {
+        'definitions': tuple(sorted((item['module'], item['name'], item['previous_index'],
+                                     item['previous_sha256']) for item in review.get('removed_definitions', ()))),
+        'statements': tuple(sorted((item['module'], item['previous_index'], item['previous_sha256'])
+                                   for item in review.get('removed_statements', ()))),
+    }
+    if removals != expected_removals:
+        raise RuntimeError('v25 outer-crop development reviewed removal scope differs')
+    removed_positions = set()
+    for category in ('removed_definitions', 'removed_statements'):
+        for record in review.get(category, ()):
+            module, index = record['module'], record['previous_index']
+            snapshot = next((item for item in snapshots if item['module'] == module), None)
+            if (snapshot is None or type(index) is not int
+                    or not 0 <= index < len(snapshot['previous_top_level'])
+                    or snapshot['previous_top_level'][index] != record['previous_sha256']
+                    or not record.get('reason') or (module, index) in removed_positions):
+                raise RuntimeError(f'v25 outer-crop development retired predecessor changed: {module}')
+            removed_positions.add((module, index))
+    reviewed_radial_module_hashes(prior['v21_review'], (*earlier, review))
+    reviewed_radial_definition_hashes(prior['v21_review'], (*earlier, review))
+
+    prior_tools = {item['path']: item['sha256'] for item in prior[previous_key]['validation_tools']}
+    tools = review.get('validation_tools', ())
+    expected_paths = [*prior_tools, *added_tools]
+    if [item.get('path') for item in tools] != expected_paths:
+        raise RuntimeError('v25 outer-crop development validation-tool review has missing or duplicate paths')
+    for item in _logical_archive_source_review(review)['validation_tools']:
+        value = item.get('sha256')
+        previous = prior_tools.get(item['path'], added_tools.get(item['path']))
+        if (item.get('previous_sha256') != previous or not item.get('reason')
+                or not isinstance(value, str) or len(value) != 64
+                or any(char not in '0123456789abcdef' for char in value)):
+            raise RuntimeError('v25 outer-crop development validation-tool review has invalid predecessor, digest or reason')
+    return review
+
+
+def reviewed_v24_guarded_rescue_development_contract(manifest, v21, *earlier_patches):
+    """Authenticate a successor to the qualified, immutable outer-crop audit."""
+    return reviewed_v24_outer_crop_development_contract(manifest, v21, *earlier_patches,
+                                                       _guarded_rescue=True)
+
+
+def reviewed_v24_job150615_development_contract(manifest, v21, *earlier_patches):
+    """Authenticate the job150615 successor to qualified guarded rescue."""
+    return reviewed_v24_outer_crop_development_contract(manifest, v21, *earlier_patches,
+                                                       _job150615=True)
+
+
+def reviewed_v24_job150615_headroom_development_contract(manifest, v21, *earlier_patches):
+    """Authenticate a narrow successor to the reviewed, unqualified 9af tree."""
+    return reviewed_v24_outer_crop_development_contract(manifest, v21, *earlier_patches,
+                                                       _job150615_headroom=True)
+
+
+def reviewed_v24_0_1_release_contract(manifest, v21, *earlier_patches):
+    """Authenticate v24.0.1 against its released and reviewed predecessors."""
+    return reviewed_v24_outer_crop_development_contract(manifest, v21, *earlier_patches,
+                                                       _release24_0_1=True)
+
+
+def reviewed_v24_job150772_performance_development_contract(manifest, v21, *earlier_patches):
+    """Authenticate performance development against the qualified v24.0.1 ZIP."""
+    return reviewed_v24_outer_crop_development_contract(manifest, v21, *earlier_patches,
+                                                       _job150772_performance=True)
+
+
+def reviewed_v24_job150790_150798_throughput_development_contract(manifest, v21, *earlier_patches):
+    """Authenticate throughput work against the strictly qualified performance snapshot."""
+    return reviewed_v24_outer_crop_development_contract(manifest, v21, *earlier_patches,
+                                                       _job150790_throughput=True)
+
+
+def _without_reviewed_v24_job150790_150798_throughput_development(manifest):
+    key = 'v24_job150790_150798_throughput_development_review'
+    if key not in manifest:
+        return manifest
+    _authenticate_successor_once(manifest, key, reviewed_v24_job150790_150798_throughput_development_contract)
+    return {name: value for name, value in manifest.items() if name != key}
+
+
+def _without_reviewed_v24_job150772_performance_development(manifest):
+    manifest = _without_reviewed_v24_job150790_150798_throughput_development(manifest)
+    key = 'v24_job150772_performance_development_review'
+    if key not in manifest:
+        return manifest
+    _authenticate_successor_once(manifest, key, reviewed_v24_job150772_performance_development_contract)
+    return {name: value for name, value in manifest.items() if name != key}
+
+
+def _without_reviewed_v24_0_1_release(manifest):
+    manifest = _without_reviewed_v24_job150772_performance_development(manifest)
+    key = 'v24_0_1_release_review'
+    if key not in manifest:
+        return manifest
+    _authenticate_successor_once(manifest, key, reviewed_v24_0_1_release_contract)
+    return {name: value for name, value in manifest.items() if name != key}
+
+
+def _without_reviewed_v24_job150615_headroom_development(manifest):
+    manifest = _without_reviewed_v24_0_1_release(manifest)
+    key = 'v24_job150615_headroom_development_review'
+    if key not in manifest:
+        return manifest
+    _authenticate_successor_once(manifest, key, reviewed_v24_job150615_headroom_development_contract)
+    return {name: value for name, value in manifest.items() if name != key}
+
+
+def _without_reviewed_v24_job150615_development(manifest):
+    manifest = _without_reviewed_v24_job150615_headroom_development(manifest)
+    key = 'v24_job150615_development_review'
+    if key not in manifest:
+        return manifest
+    _authenticate_successor_once(manifest, key, reviewed_v24_job150615_development_contract)
+    return {name: value for name, value in manifest.items() if name != key}
+
+
+def _without_reviewed_v24_guarded_rescue_development(manifest):
+    manifest = _without_reviewed_v24_job150615_development(manifest)
+    key = 'v24_guarded_rescue_development_review'
+    if key not in manifest:
+        return manifest
+    _authenticate_successor_once(manifest, key, reviewed_v24_guarded_rescue_development_contract)
+    return {name: value for name, value in manifest.items() if name != key}
+
+
+def _without_reviewed_v24_outer_crop_development(manifest):
+    manifest = _without_reviewed_v24_guarded_rescue_development(manifest)
+    key = 'v24_outer_crop_development_review'
+    if key not in manifest:
+        return manifest
+    _authenticate_successor_once(manifest, key, reviewed_v24_outer_crop_development_contract)
+    return {name: value for name, value in manifest.items() if name != key}
+
+
 def _without_reviewed_v24_0_0_release(manifest):
+    manifest = _without_reviewed_v24_outer_crop_development(manifest)
     key = 'v24_0_0_release_review'
     if key not in manifest:
         return manifest
@@ -3710,6 +4290,8 @@ def _without_reviewed_v22_3_release(manifest):
 
 def verify_v22_3_source_snapshots(review, trees, successors=()):
     """Rewind authenticated successors before checking the release source snapshot."""
+    review = _logical_archive_source_review(review)
+    successors = tuple(_logical_archive_source_review(item) for item in successors)
     for item in review['module_snapshots']:
         module = item['module']
         tree = trees.get(module)
@@ -3728,7 +4310,9 @@ def verify_v22_3_source_snapshots(review, trees, successors=()):
 
 def verify_v22_3_validation_tools(review, successors=()):
     """Authenticate tool sources through explicit successor hash links."""
-    for item in review['validation_tools']:
+    review = _logical_archive_source_review(review)
+    successors = tuple(_logical_archive_source_review(item) for item in successors)
+    for item in _logical_archive_source_review(review)['validation_tools']:
         path = ROOT / item['path']
         expected = item['sha256']
         for successor in successors:
@@ -3821,8 +4405,40 @@ def _without_reviewed_v22_2_release(manifest):
     return {name: value for name, value in manifest.items() if name != key}
 
 
+def _retired_seam_replacement_hash(module, name, previous_hash, successors):
+    """Follow only position-bound later supersessions of a retired seam's function."""
+    expected = previous_hash
+    for successor in successors:
+        if any(item.get('module') == module and item.get('name') == name
+               for item in successor.get('removed_definitions', ())):
+            raise RuntimeError('retired seam replacement was removed without a supported continuation')
+        matches = [item for item in successor.get('definitions', ())
+                   if item.get('module') == module and item.get('name') == name]
+        if not matches:
+            continue
+        if len(matches) != 1:
+            raise RuntimeError('retired seam replacement has duplicate successor definitions')
+        item = matches[0]
+        snapshot = next((value for value in successor.get('module_snapshots', ())
+                         if value.get('module') == module), None)
+        old_index, new_index = item.get('previous_index'), item.get('current_index')
+        value = item.get('sha256')
+        if (item.get('previous_sha256') != expected or not item.get('reason')
+                or not isinstance(value, str) or len(value) != 64
+                or any(char not in '0123456789abcdef' for char in value)
+                or snapshot is None or type(old_index) is not int or type(new_index) is not int
+                or not 0 <= old_index < len(snapshot.get('previous_top_level', ()))
+                or not 0 <= new_index < len(snapshot.get('top_level', ()))
+                or snapshot['previous_top_level'][old_index] != expected
+                or snapshot['top_level'][new_index] != value):
+            raise RuntimeError('retired seam replacement has an unbound or broken successor hash link')
+        expected = value
+    return expected
+
+
 def rewind_reviewed_statements(module, statements, successors):
     """Restore authenticated predecessor hashes while retaining statement identities."""
+    successors = tuple(_logical_archive_source_review(item) for item in successors)
     current = [(node, digest(node)) for node in statements]
     for successor in reversed(successors):
         snapshot = next((item for item in successor.get('module_snapshots', ()) if item['module'] == module), None)
@@ -3836,6 +4452,45 @@ def rewind_reviewed_statements(module, statements, successors):
             if current or records or snapshot.get('ast_sha256') is not None:
                 raise RuntimeError(f'reviewed removed module has current source: {module}')
             current = [(None, value) for value in snapshot['previous_top_level']]
+            continue
+        if successor.get('release') == '24.0.1' and snapshot is not None:
+            historical = snapshot['previous_top_level']
+            by_position = {item['current_index']: item for item in records}
+            if len(by_position) != len(records):
+                raise RuntimeError(f'reviewed duplicate statement positions: {module}')
+            retired = [item for category in ('removed_definitions', 'removed_statements')
+                       for item in successor.get(category, ()) if item['module'] == module]
+            reserved = {item['previous_index'] for item in (*records, *retired)
+                        if item.get('previous_index') is not None}
+            restored_by_position = {}
+
+            def retain(index, node, value):
+                if (type(index) is not int or not 0 <= index < len(historical)
+                        or historical[index] != value or index in restored_by_position):
+                    raise RuntimeError(f'reviewed predecessor statement position differs: {module}')
+                restored_by_position[index] = (node, value)
+
+            for index, (node, value) in enumerate(current):
+                record = by_position.get(index)
+                if record is not None:
+                    if record['sha256'] != value:
+                        raise RuntimeError(f'reviewed current statement position differs: {module}')
+                    if record['previous_index'] is not None:
+                        retain(record['previous_index'], node, record['previous_sha256'])
+                    elif record['previous_sha256'] is not None:
+                        raise RuntimeError(f'reviewed new statement has a predecessor: {module}')
+                else:
+                    candidates = [position for position, previous in enumerate(historical)
+                                  if previous == value and position not in reserved
+                                  and position not in restored_by_position]
+                    if not candidates:
+                        raise RuntimeError(f'reviewed retained statement has no predecessor: {module}')
+                    retain(candidates[0], node, value)
+            for item in retired:
+                retain(item['previous_index'], None, item['previous_sha256'])
+            if set(restored_by_position) != set(range(len(historical))):
+                raise RuntimeError(f'reviewed predecessor statement coverage differs: {module}')
+            current = [restored_by_position[index] for index in range(len(historical))]
             continue
         restored = []
         for node, value in current:
@@ -3858,6 +4513,8 @@ def rewind_reviewed_statements(module, statements, successors):
 
 def verify_v22_2_source_snapshots(review, trees, successors=()):
     """Rewind authenticated successors before checking the complete v22.2 sources."""
+    review = _logical_archive_source_review(review)
+    successors = tuple(_logical_archive_source_review(item) for item in successors)
     for item in review['module_snapshots']:
         module = item['module']
         actual = digest(trees[module])
@@ -3875,6 +4532,8 @@ def verify_v22_2_source_snapshots(review, trees, successors=()):
 
 def verify_v22_1_release_scope(review, top_level, successors=()) -> None:
     """Every other AST statement in the three version-bearing modules is fixed."""
+    review = _logical_archive_source_review(review)
+    successors = tuple(_logical_archive_source_review(item) for item in successors)
     bindings = {}
     for item in review['statements']:
         bindings.setdefault(item['module'], set()).add(item['binding'])
@@ -3894,6 +4553,8 @@ def verify_v22_1_release_scope(review, top_level, successors=()) -> None:
 
 def verify_pta_source_snapshots(review, trees, successors=()) -> None:
     """Cover entire existing PTA modules in addition to changed named records."""
+    review = _logical_archive_source_review(review)
+    successors = tuple(_logical_archive_source_review(item) for item in successors)
     for item in review['module_snapshots']:
         actual = digest(trees[item['module']])
         for successor in reversed(successors):
@@ -3909,6 +4570,8 @@ def verify_pta_source_snapshots(review, trees, successors=()) -> None:
 
 def verify_policy_window_runtime_scope(review, pipeline_statements, successors=()) -> None:
     """Reconstruct the window review's source snapshot through approved successors."""
+    review = _logical_archive_source_review(review)
+    successors = tuple(_logical_archive_source_review(item) for item in successors)
     try:
         restored = rewind_reviewed_statements('pipeline', pipeline_statements, successors)
     except RuntimeError as exc:
@@ -3921,6 +4584,7 @@ def verify_policy_window_runtime_scope(review, pipeline_statements, successors=(
 
 def reviewed_v20_statement_hashes(reviews) -> dict[tuple[str, str], str]:
     """Resolve authenticated successors without replacing the original v20 pins."""
+    reviews = tuple(_logical_archive_source_review(item) for item in reviews)
     expected = {key: record[0] for key, record in REVIEWED_V20_ADDED_STATEMENTS.items()}
     for review in reviews:
         for item in review['statements']:
@@ -4044,10 +4708,38 @@ def _verify_main() -> None:
                                   if 'v22_3_1_release_review' in manifest else None)
     publication_release_review = (reviewed_v22_3_2_release_contract(manifest, v21)
                                   if 'v22_3_2_release_review' in manifest else None)
+    throughput_development_review = (_authenticate_successor_once(
+        manifest, 'v24_job150790_150798_throughput_development_review', reviewed_v24_job150790_150798_throughput_development_contract)
+        if 'v24_job150790_150798_throughput_development_review' in manifest else None)
+    performance_development_manifest = _without_reviewed_v24_job150790_150798_throughput_development(manifest)
+    performance_development_review = (_authenticate_successor_once(
+        performance_development_manifest, 'v24_job150772_performance_development_review', reviewed_v24_job150772_performance_development_contract)
+        if 'v24_job150772_performance_development_review' in manifest else None)
+    coverage_release_manifest = _without_reviewed_v24_job150772_performance_development(manifest)
+    coverage_release_review = (_authenticate_successor_once(
+        coverage_release_manifest, 'v24_0_1_release_review', reviewed_v24_0_1_release_contract)
+        if 'v24_0_1_release_review' in manifest else None)
+    headroom_manifest = _without_reviewed_v24_0_1_release(manifest)
+    headroom_review = (_authenticate_successor_once(
+        headroom_manifest, 'v24_job150615_headroom_development_review', reviewed_v24_job150615_headroom_development_contract)
+        if 'v24_job150615_headroom_development_review' in manifest else None)
+    job150615_manifest = _without_reviewed_v24_job150615_headroom_development(manifest)
+    job150615_review = (_authenticate_successor_once(
+        job150615_manifest, 'v24_job150615_development_review', reviewed_v24_job150615_development_contract)
+        if 'v24_job150615_development_review' in manifest else None)
+    guarded_rescue_manifest = _without_reviewed_v24_job150615_development(manifest)
+    guarded_rescue_review = (_authenticate_successor_once(
+        guarded_rescue_manifest, 'v24_guarded_rescue_development_review', reviewed_v24_guarded_rescue_development_contract)
+        if 'v24_guarded_rescue_development_review' in manifest else None)
+    outer_crop_manifest = _without_reviewed_v24_guarded_rescue_development(manifest)
+    development_review = (_authenticate_successor_once(
+                          outer_crop_manifest, 'v24_outer_crop_development_review', reviewed_v24_outer_crop_development_contract)
+                          if 'v24_outer_crop_development_review' in manifest else None)
+    development_manifest = _without_reviewed_v24_outer_crop_development(manifest)
     sam_release_review = (_authenticate_successor_once(
-                          manifest, 'v24_0_0_release_review', reviewed_v24_0_0_release_contract)
+                          development_manifest, 'v24_0_0_release_review', reviewed_v24_0_0_release_contract)
                           if 'v24_0_0_release_review' in manifest else None)
-    sam_manifest = _without_reviewed_v24_0_0_release(manifest)
+    sam_manifest = _without_reviewed_v24_0_0_release(development_manifest)
     throughput_release_review = (_authenticate_successor_once(
                                  sam_manifest, 'v23_0_5_release_review', reviewed_v23_0_5_release_contract)
                                  if 'v23_0_5_release_review' in manifest else None)
@@ -4067,7 +4759,21 @@ def _verify_main() -> None:
     semantic_release_review = (_authenticate_successor_once(
                                semantic_manifest, 'v23_release_review', reviewed_v23_release_contract)
                                if 'v23_release_review' in manifest else None)
-    sam_successors = ((sam_release_review,) if sam_release_review is not None else ())
+    throughput_development_successors = ((throughput_development_review,) if throughput_development_review is not None else ())
+    performance_development_successors = (((performance_development_review,) if performance_development_review is not None else ())
+                                         + throughput_development_successors)
+    coverage_release_successors = (((coverage_release_review,) if coverage_release_review is not None else ())
+                                   + performance_development_successors)
+    headroom_successors = (((headroom_review,) if headroom_review is not None else ())
+                          + coverage_release_successors)
+    job150615_successors = (((job150615_review,) if job150615_review is not None else ())
+                           + headroom_successors)
+    guarded_rescue_successors = (((guarded_rescue_review,) if guarded_rescue_review is not None else ())
+                                + job150615_successors)
+    development_successors = (((development_review,) if development_review is not None else ())
+                             + guarded_rescue_successors)
+    sam_successors = (((sam_release_review,) if sam_release_review is not None else ())
+                      + development_successors)
     throughput_successors = (((throughput_release_review,) if throughput_release_review is not None else ())
                              + sam_successors)
     cleanup_successors = (((cleanup_release_review,) if cleanup_release_review is not None else ())
@@ -4084,7 +4790,7 @@ def _verify_main() -> None:
                               + publication_successors)
     reconciliation_successors = (((reconciliation_release_review,) if reconciliation_release_review is not None else ())
                                  + performance_successors)
-    patches = (*patches, *reconciliation_successors)
+    patches = tuple(_logical_archive_source_review(item) for item in (*patches, *reconciliation_successors))
     removed_modules = {item['module'] for review in patches for item in review.get('module_snapshots', ())
                        if item.get('removed') is True}
     patch_definitions = {
@@ -4241,8 +4947,29 @@ def _verify_main() -> None:
         verify_v22_3_source_snapshots(throughput_release_review, trees, sam_successors)
         verify_v22_3_validation_tools(throughput_release_review, sam_successors)
     if sam_release_review is not None:
-        verify_v22_3_source_snapshots(sam_release_review, trees)
-        verify_v22_3_validation_tools(sam_release_review)
+        verify_v22_3_source_snapshots(sam_release_review, trees, development_successors)
+        verify_v22_3_validation_tools(sam_release_review, development_successors)
+    if development_review is not None:
+        verify_v22_3_source_snapshots(development_review, trees, guarded_rescue_successors)
+        verify_v22_3_validation_tools(development_review, guarded_rescue_successors)
+    if guarded_rescue_review is not None:
+        verify_v22_3_source_snapshots(guarded_rescue_review, trees, job150615_successors)
+        verify_v22_3_validation_tools(guarded_rescue_review, job150615_successors)
+    if job150615_review is not None:
+        verify_v22_3_source_snapshots(job150615_review, trees, headroom_successors)
+        verify_v22_3_validation_tools(job150615_review, headroom_successors)
+    if headroom_review is not None:
+        verify_v22_3_source_snapshots(headroom_review, trees, coverage_release_successors)
+        verify_v22_3_validation_tools(headroom_review, coverage_release_successors)
+    if coverage_release_review is not None:
+        verify_v22_3_source_snapshots(coverage_release_review, trees, performance_development_successors)
+        verify_v22_3_validation_tools(coverage_release_review, performance_development_successors)
+    if performance_development_review is not None:
+        verify_v22_3_source_snapshots(performance_development_review, trees, throughput_development_successors)
+        verify_v22_3_validation_tools(performance_development_review, throughput_development_successors)
+    if throughput_development_review is not None:
+        verify_v22_3_source_snapshots(throughput_development_review, trees)
+        verify_v22_3_validation_tools(throughput_development_review)
     for module, expected_hash in reviewed_radial_module_hashes(v21, patches).items():
         source = (PACKAGE / f'{module}.py').read_text(encoding='utf-8')
         if hashlib.sha256(source.encode('utf-8')).hexdigest() != expected_hash:
@@ -4259,7 +4986,7 @@ def _verify_main() -> None:
             raise RuntimeError(f'v21 changed preserved Radial arithmetic: {qualified_name}')
 
     expected_local_import_seams = {**REVIEWED_LOCAL_IMPORT_SEAMS, **v21_seams}
-    for review in patches:
+    for review_index, review in enumerate(patches):
         seen_seams = set()
         for item in review.get('local_import_seam_updates', ()):
             key = (item['module'], item['name'])
@@ -4274,6 +5001,19 @@ def _verify_main() -> None:
                    any(char not in '0123456789abcdef' for char in value) for value in current):
                 raise RuntimeError('local-import seam update has an invalid digest')
             expected_local_import_seams[key] = current
+        for item in review.get('retired_local_import_seams', ()):
+            key = (item['module'], item['name'])
+            previous = (item.get('previous_definition_sha256'), item.get('previous_seam_sha256'))
+            replacement = next((node for node in trees[item['module']].body
+                                if getattr(node, 'name', None) == item['name']), None)
+            current_hash = _retired_seam_replacement_hash(item['module'], item['name'],
+                item['definition_sha256'], patches[review_index + 1:])
+            if (key in seen_seams or expected_local_import_seams.get(key) != previous
+                    or key in local_import_seams or replacement is None
+                    or digest(replacement) != current_hash or not item.get('reason')):
+                raise RuntimeError('retired local-import seam does not match its predecessor or current replacement')
+            seen_seams.add(key)
+            del expected_local_import_seams[key]
         for item in review.get('removed_definitions', ()):
             key = (item['module'], item['name'])
             if key in expected_local_import_seams:
@@ -4531,6 +5271,30 @@ def main() -> None:
     finally:
         _ACTIVE_REVIEW_AUTH_CACHE.reset(review_token)
         _ACTIVE_DIGEST_CACHE.reset(digest_token)
+
+
+
+
+def _logical_archive_source_review(review):
+    """Apply release-only predecessor aliases after authenticating raw history."""
+    if review.get('_archive_release_identity_view') is True:
+        return review
+    aliases = review.get('predecessor_source_archive', {}).get('release_identity_migration', {}).get('source_hash_aliases', {})
+    if not aliases:
+        return review
+    def converted(value, field=''):
+        if field == 'predecessor_source_archive':
+            return value
+        if isinstance(value, dict):
+            return {key: converted(item, key) for key, item in value.items()}
+        if isinstance(value, list):
+            return [converted(item, field) for item in value]
+        if isinstance(value, str) and field.startswith('previous_'):
+            return aliases.get(value, value)
+        return value
+    logical = converted(review)
+    logical['_archive_release_identity_view'] = True
+    return logical
 
 
 if __name__ == "__main__":

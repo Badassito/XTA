@@ -145,7 +145,7 @@ def test_real_pipeline_background_checkpoint_refills_four_workers_before_next_ou
     namespace.update(scheduler=scheduler, inference_worker_process_active=True,
         background_drain_budget=budget, _drain_parent_mask_ready_events=lambda: None,
         _flush_ready_postprocessed_tiles=lambda: None, _flush_ready_residual_tiles=lambda: None,
-        view_processing_futures={}, tile_cleanup_futures={}, tile_parent_gate_futures={},
+        view_processing_futures={}, sam_parent_staging=None, tile_cleanup_futures={}, tile_parent_gate_futures={},
         tile_bridge_gate_futures={}, tile_consolidation_futures={},
         tile_parent_finalization_futures={}, physical_view_finalization_futures={},
         physical_view_union_futures=unions, physical_view_union_completed=completed,

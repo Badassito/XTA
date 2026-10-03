@@ -53,8 +53,8 @@ def test_streaming_full_halo_large_leak_rejects_original_run_without_contaminati
     assert np.array_equal(bundle.raw_mask("F",2),good[2])
     assert bundle.halo_union_mask("F",2)[0,7]
     receipt=select_sam_proposals(bundle)
-    assert receipt["resolved_policy"]["version"]==3
-    assert receipt["policy_name"]=="sam_conservative_tiled_v3"
+    assert receipt["resolved_policy"]["version"]==5
+    assert receipt["policy_name"]=="sam_conservative_tiled_guarded_rescue_v5"
     assert receipt["selected_run_ids"]==[]
     metrics=receipt["run_receipts"]["F"]["measurements"]
     assert metrics["first_observed_violation"] is None
@@ -101,7 +101,7 @@ def test_attempted_tile_suffix_missing_is_not_successful_empty_evidence(tmp_path
 def test_tiled_version2_policy_is_rejected_and_replay_uses_saved_mode(tmp_path,monkeypatch):
     bundle,_=tiled_bundle(tmp_path)
     monkeypatch.setenv("XTA_SAM_INTERPOLATION_CROP_MODE","whole")
-    assert select_sam_proposals(bundle)["resolved_policy"]["version"]==3
+    assert select_sam_proposals(bundle)["resolved_policy"]["version"]==5
     with pytest.raises(ValueError,match="incompatible"):
         select_sam_proposals(bundle,{"sam_bridge_policy":{"version":2}})
     with pytest.raises(ValueError,match="incompatible"):

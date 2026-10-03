@@ -224,6 +224,8 @@ class TiltedAzimuthalCudaProjector:
 
     def __init__(self, source, plan, device_index=0, *, initial_packed=None, first_frame=0,
                  block_bytes=_BLOCK_BYTES, upload_bytes=_UPLOAD_BYTES, reserve_bytes=_RESERVE_BYTES):
+        from .tilted_azimuthal_projection import TILTED_AZIMUTHAL_CUDA_UNAVAILABLE_REASON
+        raise TiltedAzimuthalCudaProjectionUnavailable(TILTED_AZIMUTHAL_CUDA_UNAVAILABLE_REASON)
         started = time.perf_counter()
         self.contract = _validate_tilted_azimuthal_contract(source, plan, block_bytes, upload_bytes)
         initial = _validate_initial_packed(initial_packed, first_frame, self.contract)

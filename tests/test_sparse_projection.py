@@ -1,4 +1,4 @@
-"""Sparse projector equality against actual legacy Azimuthal projection operators."""
+"""Sparse projector equality against the shared native destination-pull operators."""
 from __future__ import annotations
 
 import contextlib
@@ -114,22 +114,28 @@ class SparseAzimuthalProjectionTests(unittest.TestCase):
                 with self.subTest(view=view.name, fill=fill):
                     self.compare(view, np.full(shape, fill, np.uint8), (3, 5, 11), INTERNAL_PACKED_CVOL_FORMAT)
 
-    def test_map_strip_equations_equal_actual_dense_map_and_cache_is_bounded(self):
-        for view in views(shape=(9, 11, 13), spacing=37.0)[::2]:
-            probe = np.zeros((view.num_slices, view.src_h, view.src_w), np.uint8)
-            grid = backprojection.resolve_azimuthal_processing_grid(probe, view)
-            plan, _ = backprojection.build_azimuthal_backprojection_plan(view)
-            expected = backprojection._azimuthal_dense_map_for_processing(
-                backprojection.build_dense_azimuthal_backprojection_map(view, plan, out_shape_hw=(8, 10)), grid)
-            with mock.patch.object(sparse_projection, '_MAP_STRIP_PIXELS', 20):
-                parts = list(sparse_projection._map_key_strips(view, plan, grid, (8, 10)))
-            keys = np.concatenate([pair[0] for pair in parts])
-            positions = np.concatenate([pair[1] for pair in parts])
-            valid = np.flatnonzero(expected.valid_mask.reshape(-1))
-            np.testing.assert_array_equal(positions, valid)
-            expected_keys = expected.source_idx_map.reshape(-1)[valid].astype(np.int64)*grid.processing_w + expected.u_idx_map.reshape(-1)[valid]
-            np.testing.assert_array_equal(keys, expected_keys)
+    def test_encoded_sampler_matches_native_bits_without_decoding(self):
+        rng = np.random.default_rng(289)
+        for fmt in (CVOL_FORMAT, INTERNAL_PACKED_CVOL_FORMAT):
+            data = (rng.random((4, 7, 13)) < 0.19).astype(np.uint8)
+            source = self.root / fmt
+            with contextlib.redirect_stdout(io.StringIO()):
+                write_raw_bbox_mask_store(data, source, format_name=fmt, desc='sampler fixture')
+            store = RawBBoxMaskStore.open(source, mmap_payload=False)
+            sampler = sparse_projection._SparseMaskSampler(store)
+            try:
+                frames, rows, columns = np.indices(data.shape, dtype=np.int32)
+                with mock.patch.object(RawBBoxMaskStore, 'decode_slice', side_effect=AssertionError('dense decode')):
+                    actual = sampler.sample(frames.reshape(-1), rows.reshape(-1), columns.reshape(-1))
+                np.testing.assert_array_equal(actual.reshape(data.shape), data)
+                with mock.patch.object(sparse_projection, '_MAP_STRIP_PIXELS', 1):
+                    with self.assertRaisesRegex(ValueError, 'strip budget'):
+                        sampler.sample(frames.reshape(-1), rows.reshape(-1), columns.reshape(-1))
+            finally:
+                sampler.close()
+                store.close()
         sparse_projection.clear_sparse_projection_cache()
+        self.assertEqual(sparse_projection.sparse_projection_cache_info()['bytes'], 0)
 
     def test_basis_impulses_single_angle_and_degenerate_output_axes(self):
         selected = views(shape=(3, 5, 7), spacing=90.0)
@@ -149,7 +155,7 @@ class SparseAzimuthalProjectionTests(unittest.TestCase):
 
     def test_concurrent_projection_uses_shared_immutable_maps_and_separate_outputs(self):
         sparse_projection.clear_sparse_projection_cache()
-        view = views()[3]
+        view = views()[0]
         data = np.zeros((view.num_slices, view.src_h, view.src_w), np.uint8)
         data[:, 1:5, 2:6] = 1
         source_path = self.root/'concurrent.cvol'
@@ -163,6 +169,7 @@ class SparseAzimuthalProjectionTests(unittest.TestCase):
                 results = list(pool.map(lambda i: sparse_projection.project_azimuthal_sparse_store(
                     source_path, view, self.root/f'parallel-{i}', out_shape_tyx=(7, 8, 11), workers=2), range(4)))
         self.assertEqual(sum(bool(result['map_cache_hit']) for result in results), 3)
+        self.assertTrue(all(result['map_bytes'] > 0 for result in results))
         for result in results:
             np.testing.assert_array_equal(read_store(result['path']), expected)
 
@@ -170,7 +177,14 @@ class SparseAzimuthalProjectionTests(unittest.TestCase):
         view = replace(views()[0], center_x=5.125)
         shape = (view.num_slices, view.src_h, view.src_w)
         before = set(backprojection._DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE)
-        sparse_projection._inverse_map(view, shape, (7, 8, 11))
+        probe_path = self.root / 'bounds.cvol'
+        with contextlib.redirect_stdout(io.StringIO()):
+            write_raw_bbox_mask_store(np.ones(shape, np.uint8), probe_path, desc='bounds input')
+        bounds_store = RawBBoxMaskStore.open(probe_path, mmap_payload=True)
+        try:
+            sparse_projection._destination_bbox_for_sparse_input(bounds_store, view, (7, 8, 11))
+        finally:
+            bounds_store.close()
         self.assertEqual(set(backprojection._DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE), before)
         source_path = self.root/'slabs.cvol'
         with contextlib.redirect_stdout(io.StringIO()):
@@ -187,7 +201,7 @@ class SparseAzimuthalProjectionTests(unittest.TestCase):
         sparse_projection.clear_sparse_projection_cache()
         view = views()[0]
         with mock.patch.object(sparse_projection, '_MAP_CACHE_MAX_BYTES', 1024):
-            sparse_projection._inverse_map(view, (view.num_slices, view.src_h, view.src_w), (9, 11, 13))
+            sparse_projection._upright_inverse_map(view, (view.num_slices, view.src_h, view.src_w), (9, 11, 13))
             self.assertLessEqual(sparse_projection.sparse_projection_cache_info()['bytes'], 1024)
         sparse_projection.clear_sparse_projection_cache()
 
@@ -205,7 +219,7 @@ class SparseAzimuthalProjectionTests(unittest.TestCase):
         self.assertEqual((target/'keep').read_bytes(), b'preserve')
         with self.assertRaises(ValueError):
             sparse_projection.project_azimuthal_sparse_store(source, view, source/'child', out_shape_tyx=(9, 11, 13))
-        with mock.patch.object(sparse_projection, '_scatter_crop', side_effect=RuntimeError('fault')):
+        with mock.patch.object(sparse_projection, '_scatter_upright_crop', side_effect=RuntimeError('fault')):
             with self.assertRaisesRegex(RuntimeError, 'fault'):
                 sparse_projection.project_azimuthal_sparse_store(source, view, self.root/'failed', out_shape_tyx=(9, 11, 13))
         # Mock's recorded call tuple can keep its borrowed mmap crop alive until

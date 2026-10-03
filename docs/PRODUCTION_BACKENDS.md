@@ -55,6 +55,18 @@ for an arbitrarily large requested candidate count. Radial plan refusal keeps a
 bounded compiled route instead of materializing a full coordinate map or running
 the old single-worker NumPy reference.
 
+Slice-local topology stores prefer `uint16` while each slice fits its 65,535
+foreground-component capacity. If a slice exceeds that capacity, the complete
+unpublished label workspace is discarded after its workers settle and the pass
+automatically restarts with `uint32`; memory/disk admission is recomputed.
+Counts, areas, root lookup tables and adjacent-slice connectivity are rebuilt
+from the original mask. This promotion never reuses narrowed partial labels or
+changes a shared environment setting. Set
+`YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16=0` to select `uint32` immediately;
+manual reruns are no longer required for valid slice-local overflow. Compact
+global labels already use `uint32`. Only a verified capacity signal triggers
+promotion; unrelated failures retain their established backend error contracts.
+
 The `YOLO_TTA_TOPOLOGY_COMPILED_KERNELS`,
 `YOLO_TTA_INTERPOLATION_COMPILED_KERNELS`, and
 `YOLO_TTA_CPU_SPHERICAL_COMPILED` opt-outs are retired. The compiled Spherical CPU

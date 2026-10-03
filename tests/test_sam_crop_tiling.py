@@ -65,8 +65,8 @@ def test_one_tile_control_retains_original_run_ids_and_exact_whole_pixels(tmp_pa
         assert stats['sam_tiled_child_jobs_generated'] == 2
         assert stats['sam_tiled_multi_tile_runs'] == 0
         assert len(components) == 2
-        assert stats['sam_selection_receipt']['resolved_policy']['version'] == 3
-        assert whole_stats['sam_selection_receipt']['resolved_policy']['version'] == 2
+        assert stats['sam_selection_receipt']['resolved_policy']['version'] == 5
+        assert whole_stats['sam_selection_receipt']['resolved_policy']['version'] == 4
         for run in b.runs.values():
             assert run['tracker_scores'] is None
             assert run['tile_evidence'][0]['tracker_scores']['2'] == .8
@@ -191,6 +191,41 @@ def test_parent_cohorts_bound_every_incomplete_assembly_before_next_batch():
     assert set(index for batch in batches for index in batch) == set(range(len(jobs)))
     for batch in batches:
         assert len({jobs[index].original_run_index for index in batch})<=MAX_ACTIVE_PARENT_ASSEMBLIES
+
+
+def test_single_worker_crop_adjacent_order_reuses_views_without_changing_multi_worker_waves():
+    prepared=prepare_sam_interpolation_pass(_wide(),**_options())
+    assert len(prepared.runs)==2 and len(prepared.tracker_jobs)==4
+    assert prepared.execution_batches(1)==((0,2,1,3),)
+    assert prepared.execution_batches(2)==((0,1,2,3),)
+    for first,second in ((0,2),(1,3)):
+        a,b=prepared.tracker_jobs[first],prepared.tracker_jobs[second]
+        assert a.tile.crop_bbox_yx==b.tile.crop_bbox_yx
+        assert a.original_run.run_id!=b.original_run.run_id
+        assert a.original_run.direction==-b.original_run.direction
+        assert a.original_run.seed_ids!=b.original_run.seed_ids
+    assert set(prepared.execution_order(1))==set(range(len(prepared.tracker_jobs)))
+
+
+def test_single_worker_crop_grouping_keeps_exact_owned_masks_and_original_run_ids(tmp_path):
+    source=_wide()
+    tracker=RepeatedSeedTracker()
+    merged,stats,_=interpolate_sam_view_volume_pass(source,work_dir=tmp_path,runtime=tracker,**_options())
+    try:
+        assert stats['sam_execution_schedule']=='bounded_tiled_parent_cohorts_crop_local'
+        assert stats['sam_execution_order']==[0,2,1,3]
+        assert [r['metadata']['tile_id'] for r in tracker.calls]==[
+            'tile_r00_c00','tile_r00_c00','tile_r00_c01','tile_r00_c01']
+        assert stats['sam_generated_runs']==2 and stats['sam_tiled_child_jobs_generated']==4
+        assert stats['added_voxels']==3*1440*8
+        bundle=SamEvidenceBundle.open(stats['sam_evidence_path'])
+        for run_id,run in bundle.runs.items():
+            expected=np.zeros(bundle.raw_mask(run_id,2).shape,bool)
+            expected[40:48,30:1470]=True
+            np.testing.assert_array_equal(bundle.raw_mask(run_id,2),expected)
+            assert len(run['tile_evidence'])==2
+    finally:
+        _close(merged)
 
 
 def test_tiled_cancellation_retains_full_halo_prefix_and_retires_file_backed_assembly(tmp_path):

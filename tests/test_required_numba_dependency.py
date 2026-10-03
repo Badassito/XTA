@@ -12,7 +12,7 @@ from unittest import mock
 
 import pytest
 
-from XTA import _deps
+from XTA import __version__, _deps
 
 
 DEPS_PATH = Path(_deps.__file__)
@@ -60,4 +60,4 @@ def test_disabled_jit_fails_runtime_import_but_keeps_cli_version_light() -> None
         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
     )
     assert version.returncode == 0, version.stdout
-    assert "25.0.0" in version.stdout
+    assert __version__ in version.stdout

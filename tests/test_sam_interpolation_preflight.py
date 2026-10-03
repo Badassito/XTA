@@ -36,17 +36,18 @@ def context(tmp_path, source):
 
 
 @pytest.mark.parametrize('changes', (
-    {'physical_view_name': 'sagittal'},
-    {'physical_view_name': 'coronal'},
-    {'family': 'azimuthal', 'physical_view_name': 'azimuthal_transverse'},
-    {'family': 'tilted', 'physical_view_name': 'tilted_transverse'},
-    {'family': 'radial'},
-    {'family': 'spherical'},
-    {'tta_angle_deg': 120.0},
+    {'physical_view_name': 'future_cartesian_axis'},
+    {'family': 'future_projection'},
+    {'tta_angle_deg': float('nan')},
+    {'tilt_angle_deg': float('inf')},
+    {'src_w': 0},
+    {'num_slices': 0},
+    {'family': 'tilted', 'tilt_base_view': 'future_axis', 'tilt_direction': 'vertical'},
+    {'family': 'tilted', 'tilt_base_view': 'transverse', 'tilt_direction': 'diagonal'},
 ))
-def test_active_sam_rejects_unsupported_views_before_runtime(changes):
+def test_active_sam_rejects_unknown_or_malformed_view_geometry_before_runtime(changes):
     view = replace(transverse(), **changes)
-    with pytest.raises(ValueError, match='native Transverse at angle zero'):
+    with pytest.raises(ValueError, match='SAM'):
         validate_sam_interpolation_geometry([transverse(), view])
 
 

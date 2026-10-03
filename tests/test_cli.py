@@ -11,12 +11,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from XTA import cli
+from XTA import __version__, cli
 from XTA.unification.context import current_unified_launch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LAUNCHER = ROOT / "GPT-6-Astra-Ultra_v24.0.0_SLURM.py"
+LAUNCHER = ROOT / f"GPT-6-Astra-Ultra_v{__version__}_SLURM.py"
 
 
 class CliTests(unittest.TestCase):
@@ -42,7 +42,7 @@ class CliTests(unittest.TestCase):
 
         completed = self.run_python(str(LAUNCHER), "--version")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("24.0.0", completed.stdout)
+        self.assertIn(__version__, completed.stdout)
 
         for mode in ("tta", "pta", "lta"):
             with self.subTest(mode_version=mode):
@@ -50,7 +50,7 @@ class CliTests(unittest.TestCase):
                     str(LAUNCHER), "--mode", mode, "--version"
                 )
                 self.assertEqual(completed.returncode, 0, completed.stdout)
-                self.assertIn("24.0.0", completed.stdout)
+                self.assertIn(__version__, completed.stdout)
 
         program = (
             "import sys; import XTA.cli; "

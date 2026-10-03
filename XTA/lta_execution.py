@@ -504,6 +504,14 @@ def _require_supported_runtime(plan: LtaRunPlan) -> tuple[object, object, LtaRun
         )
     if view_plan.runtime_view is None:
         raise RuntimeError("LTA planning did not retain its runtime ViewInfo")
+    runtime_view = view_plan.runtime_view
+    from .geometry import physical_view_name
+    runtime_angle = float(getattr(runtime_view, 'tta_angle_deg', 0.0))
+    if (str(getattr(runtime_view, 'family', '')) != 'orthogonal'
+            or physical_view_name(runtime_view) != 'transverse'
+            or not math.isfinite(runtime_angle) or abs(runtime_angle) > 1e-12):
+        raise ValueError("production LTA supports only native Transverse at angle zero; "
+                         "use --enable_cartesian transverse --angle 0")
     if plan.crop_backend not in {"tiled", "dynamic"}:
         raise ValueError("LTA crop_backend must be tiled or dynamic")
     if plan.crop_backend == "dynamic":
