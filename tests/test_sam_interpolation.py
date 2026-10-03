@@ -88,6 +88,11 @@ def test_sam_generates_selected_additions_without_mutating_detector_anchors(tmp_
         assert {component["direction"] for component in components} == {"forward", "backward"}
         assert [component["voxel_count"] for component in components] == [108, 108]
         assert len(tracker.released) == 2
+        assert stats['sam_selection_identity'] == stats['sam_selection_receipt']['selection_identity']
+        for component in components:
+            assert component['sam_selection_identity'] == stats['sam_selection_identity']
+            assert component['metadata']['sam_selection_identity'] == stats['sam_selection_identity']
+            assert component['metadata']['sam_selection_resources'] == stats['sam_selection_resources']
         bundle = SamEvidenceBundle.open(stats["sam_evidence_path"])
         assert len(bundle.runs) == 2
         for run in bundle.runs.values():
@@ -193,8 +198,8 @@ def test_no_candidate_first_round_publishes_two_empty_slots_and_portable_evidenc
 
 def test_unsupported_active_view_fails_before_tracker(tmp_path):
     tracker = RepeatedSeedTracker()
-    with pytest.raises(ValueError, match="Transverse"):
-        _generate(tmp_path, tracker, view=SimpleNamespace(family="orthogonal", summary_family="coronal"))
+    with pytest.raises(ValueError, match="Unsupported SAM TTA view family"):
+        _generate(tmp_path, tracker, view=SimpleNamespace(family="unknown", summary_family="coronal"))
     assert tracker.calls == []
 
 

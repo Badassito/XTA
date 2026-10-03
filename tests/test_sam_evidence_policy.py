@@ -416,8 +416,8 @@ def test_small_outside_component_is_removed_before_containment_without_rejecting
     raw[2][1, 13] = True  # Detached acceptance-boundary contact also removed.
     bundle = build_bundle(tmp_path, [(fixture_run("F", group), raw)], group=group, masks=masks)
     receipt = select_sam_proposals(bundle)
-    assert receipt["policy_name"] == "sam_conservative_v2"
-    assert receipt["resolved_policy"]["version"] == 2
+    assert receipt["policy_name"] == "sam_conservative_guarded_rescue_v4"
+    assert receipt["resolved_policy"]["version"] == 4
     assert receipt["selected_run_ids"] == ["F"]
     row = receipt["run_receipts"]["F"]["measurements"]["containment"][2]
     raw_row = receipt["run_receipts"]["F"]["measurements"]["raw_containment"][2]

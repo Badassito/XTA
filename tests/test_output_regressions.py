@@ -42,7 +42,18 @@ class SummaryTests(unittest.TestCase):
                 model_paths=['gpu:model.engine'],
                 view_names=['transverse (4 frames)'],
                 view_prediction_stats={'transverse': 4},
-                interpolation_stats=[],
+                interpolation_stats=[{
+                    'interpolation_backend': 'sam', 'pass_index': 1,
+                    'sam_planning_status': 'unresolved', 'planner_plan_count': 2,
+                    'sam_unresolved_groups': 2, 'sam_generated_runs': 2,
+                    'sam_group_planning_receipts': [
+                        {'status': 'planned', 'reasons': []},
+                        {'status': 'unresolved', 'reasons': ['total_contract_memory_limit']},
+                        {'status': 'unresolved', 'reasons': ['total_contract_memory_limit', 'group_contract_memory_limit']},
+                    ],
+                    'sam_resource_profile': {'status': 'legacy_bounds_uncredited',
+                                             'assigned_contract_bytes': 256*1024**2},
+                }],
                 enable_3d_void_fill=False,
                 gaussian_smoothing_stats=None,
                 keep_objects_stats={
@@ -69,6 +80,9 @@ class SummaryTests(unittest.TestCase):
             self.assertIn('Final outputs:', text)
             self.assertIn('gpu_resident_tail: gpus=4, peer_bytes=4096', text)
             self.assertNotIn('Specification notes:', text)
+            self.assertIn('families=3, planned=1, unresolved=2, planned_runs=2', text)
+            self.assertIn('group_contract_memory_limit=1, total_contract_memory_limit=2', text)
+            self.assertIn('family_MiB=256.0', text)
 
 
 class AtomicNrrdTests(unittest.TestCase):

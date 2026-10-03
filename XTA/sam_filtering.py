@@ -9,16 +9,22 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import hashlib
+import inspect
 import json
 from pathlib import Path
 
 import numpy as np
 from scipy import ndimage
 
+from ._deps import _numba
+
 SCHEMA = "xta.sam_component_filter/1"
 _SOURCE_PATH = Path(__file__).resolve()
 IMPLEMENTATION_SHA256 = hashlib.sha256(_SOURCE_PATH.read_bytes()).hexdigest()
 _MAX_COMPONENT_RECORDS = 128
+_QUALIFIED_LEGACY_IMPLEMENTATION = "bac0f301626e20500c3b8beab261b1f9ea64289de2af2add26b883507495a780"
+_QUALIFIED_PREVIOUS_IMPLEMENTATION = "96278bbc549acb81c54f1e6f8124faa1d091ffbca378e98cd73d09040f44368c"
+_QUALIFIED_NUMERICAL_SOURCE = "c98e939e8187951f7f77a78c3401800bf2d85405c4acd9cde8c65f9ae8f33fd3"
 
 
 def assert_filter_implementation_unchanged():
@@ -54,6 +60,24 @@ def build_mask_filter(bundle, *, enabled=True, min_radius=None):
     return spec
 
 
+def _compatible_filter_implementation(identifier):
+    """Accept the qualified v25 receipts only while their exact numerics remain."""
+    if identifier == IMPLEMENTATION_SHA256:
+        return True
+    if identifier not in (_QUALIFIED_LEGACY_IMPLEMENTATION, _QUALIFIED_PREVIOUS_IMPLEMENTATION):
+        return False
+    # The bounded radius implementation preserves the original padded EDT and
+    # complete-component decision. Bind historical receipts to every numerical
+    # helper, including the compiled reduction's Python source.
+    try:
+        parts = [function.__name__ + "\n" +
+                 inspect.getsource(getattr(function, "py_func", function)).replace("\r\n", "\n").rstrip("\n") + "\n"
+                 for function in (_readonly, _component_maxima, _component_inscribed_radii, filter_sam_components)]
+    except (OSError, TypeError):
+        return False
+    return hashlib.sha256("".join(parts).encode("utf-8")).hexdigest() == _QUALIFIED_NUMERICAL_SOURCE
+
+
 def _spec(value):
     if value is None:
         return None
@@ -69,9 +93,14 @@ def _spec(value):
         if str(value.get("schema", "")).startswith("xta.sam_component_filter/"):
             raise ValueError("Unsupported SAM component filter schema")
         resolved = value.get("resolved_policy", {})
-        if (isinstance(resolved, Mapping) and resolved.get("version") == 2
-                or str(value.get("policy_name", "")).endswith("_v2")):
-            raise ValueError("SAM quality-v2 selection receipt is missing its component filter spec")
+        version = resolved.get("version") if isinstance(resolved, Mapping) else None
+        name = str(value.get("policy_name", ""))
+        named_version = next((v for v in (2, 3, 4, 5) if name.endswith(f"_v{v}")), None)
+        modern = (version in (2, 3, 4, 5, "2", "3", "4", "5") or named_version is not None
+                  or "component_filter_implementation_sha256" in value
+                  or isinstance(resolved, Mapping) and "enforce_interpolation_min_radius" in resolved)
+        if modern:
+            raise ValueError(f"SAM quality-v{version or named_version or 'current'} selection receipt is missing its component filter spec")
         return None
     if not isinstance(result, Mapping) or result.get("schema") != SCHEMA:
         raise ValueError("Unsupported SAM component filter schema")
@@ -87,9 +116,57 @@ def _spec(value):
     thresholds = result.get("thresholds_by_group")
     if (not isinstance(thresholds, Mapping) or any(isinstance(v, bool) or not np.isfinite(float(v)) or float(v) < 0 for v in thresholds.values())):
         raise ValueError("SAM component filter thresholds must be finite and nonnegative")
-    if result.get("enabled") and result.get("implementation_sha256") != IMPLEMENTATION_SHA256:
+    if result.get("enabled") and not _compatible_filter_implementation(result.get("implementation_sha256")):
         raise ValueError("SAM component filter implementation differs from its selection receipt")
     return result
+
+
+@_numba.njit(nogil=True, cache=False)
+def _component_maxima(labels, distances, count):
+    """Linear numeric reduction without sorting the complete label image."""
+    maxima = np.zeros(count, np.float64)
+    for y in range(labels.shape[0]):
+        for x in range(labels.shape[1]):
+            label = int(labels[y, x])
+            if 0 < label <= count and distances[y, x] > maxima[label - 1]:
+                maxima[label - 1] = distances[y, x]
+    return maxima
+
+
+def _component_inscribed_radii(raw, labels, count):
+    """Exact padded EDT maxima with bounded work for sparse components.
+
+    Every component's bounding rectangle is surrounded by background. Other
+    disconnected components cannot supply a nearer zero than the background
+    separating them, so its own cropped EDT has the same foreground distances.
+    Overlapping/nested rectangles fall back to one full-plane EDT and a linear
+    reduction, keeping the total transformed area bounded by the full plane.
+    """
+    count = int(count)
+    if count <= 0:
+        return np.empty(0, np.float64)
+    regions = ndimage.find_objects(labels, max_label=count)
+    cells = sum((region[0].stop-region[0].start+2) * (region[1].stop-region[1].start+2)
+                for region in regions if region is not None)
+    full_cells = (raw.shape[0]+2) * (raw.shape[1]+2)
+    if cells > full_cells:
+        distance = ndimage.distance_transform_edt(np.pad(raw, 1))[1:-1, 1:-1]
+        return _component_maxima(labels, distance, count)
+    radii = np.zeros(count, np.float64)
+    for index, region in enumerate(regions):
+        if region is None:
+            continue
+        height, width = region[0].stop-region[0].start, region[1].stop-region[1].start
+        if min(height, width) <= 2:
+            radii[index] = 1.
+            continue
+        component = labels[region] == index + 1
+        if component.all():
+            radii[index] = min((component.shape[0]+1)//2, (component.shape[1]+1)//2)
+        else:
+            distance = ndimage.distance_transform_edt(np.pad(component, 1))
+            radii[index] = distance.max()
+    return radii
 
 
 def filter_sam_components(raw_mask, min_radius, *, enabled=True):
@@ -120,8 +197,7 @@ def filter_sam_components(raw_mask, min_radius, *, enabled=True):
     if not count:
         diagnostic["retained_component_count"] = 0
         return _readonly(raw), diagnostic
-    distance = ndimage.distance_transform_edt(np.pad(raw, 1))[1:-1, 1:-1]
-    radii = np.asarray(ndimage.maximum(distance, labels, np.arange(1, count + 1)), dtype=np.float64).reshape(-1)
+    radii = _component_inscribed_radii(raw, labels, count)
     sizes = np.bincount(labels.reshape(-1), minlength=count+1)[1:]
     keep = np.concatenate(([False], radii > threshold))
     effective = keep[labels]

@@ -15,6 +15,7 @@ import time
 import weakref
 import multiprocessing as mp
 from dataclasses import replace
+from functools import partial
 from collections import (
     Counter,
     deque,
@@ -443,6 +444,80 @@ def _spherical_workload_groups(views: Sequence[ViewInfo]) -> List[Dict[str, obje
     return list(groups.values())
 
 
+def _scheduler_wait_activity_summary(parent_futures, projection_gauges):
+    """Describe queued work and live native projection without changing admission."""
+    counts = dict(running=0, queued=0, awaiting_components=0, completed_awaiting_drain=0)
+    for future in parent_futures:
+        if not future.done():
+            counts['running' if future.running() else 'queued'] += 1
+        elif (not future.cancelled() and future.exception() is None
+              and any(not child.done() for child in getattr(future.result(), 'pending_component_layers', ()))):
+            counts['awaiting_components'] += 1
+        else:
+            counts['completed_awaiting_drain'] += 1
+    live = []
+    for key, value in projection_gauges.items():
+        if (str(key).startswith('projection.native_destination_pull.live.')
+                and isinstance(value, Mapping) and value.get('state') == 'running'):
+            live.append(dict(value))
+    live.sort(key=lambda value: float(value.get('elapsed_seconds', 0.)), reverse=True)
+    return dict(parent_prepares=counts, active_native_projections=len(live), oldest_native_projections=live[:3])
+
+
+PARENT_CONFIDENCE_CAPTURE_WORKSPACE_BYTES = 256 * 1024**2
+
+
+def _parent_confidence_capture_plan(shape, workers, *, enabled):
+    """Resolve bounded capture scratch before its parent admission is requested."""
+    if not enabled:
+        return None
+    from .confidence_evidence import plan_confidence_capture
+    return plan_confidence_capture(tuple(int(v) for v in shape), int(workers),
+        workspace_bytes=PARENT_CONFIDENCE_CAPTURE_WORKSPACE_BYTES)
+
+
+def _prepare_parent_with_confidence_capture(prepare, *, capture_plan, **kwargs):
+    """Enter capture's CPU budget inside AdmittedViewPrepare's live reservation."""
+    if capture_plan is None:
+        return prepare(**kwargs)
+    from .confidence_evidence import confidence_capture_resources
+    with confidence_capture_resources(capture_plan):
+        return prepare(**kwargs)
+
+
+def _parent_prepare_transient_bytes(view, processing_bytes, source_bytes, *,
+                                   interpolation_enabled, confidence_workspace_bytes=0):
+    """Use one estimate for actual reservations and policy pre-dispatch planning."""
+    name = str(view.name).lower()
+    transient = 2 * GIB
+    if 'tilted' in name:
+        transient = int(source_bytes) + 4 * GIB
+    elif interpolation_enabled:
+        transient = 2 * int(processing_bytes) + 4 * GIB
+    return transient + int(confidence_workspace_bytes)
+
+
+def _policy_parent_prepare_transient_bytes(tasks, source_bytes, workers, *,
+                                          interpolation_distance, retain_confidence):
+    """Charge the same capture scratch before policy parent dispatch begins."""
+    largest = 2 * GIB
+    plans = {}
+    for task in tasks:
+        if str(task['kind']) != 'fullframe':
+            continue
+        shape = tuple(int(v) for v in task['processing_shape'])
+        enabled = bool(retain_confidence) and 'd1_output_shape' not in task
+        key = (shape, enabled)
+        if key not in plans:
+            plans[key] = _parent_confidence_capture_plan(shape, workers, enabled=enabled)
+        plan = plans[key]
+        workspace = 0 if plan is None else int(plan.workspace_bytes)
+        largest = max(largest, _parent_prepare_transient_bytes(task['view'], math.prod(shape),
+            source_bytes, interpolation_enabled=_view_uses_interpolation(
+                task['view'], int(interpolation_distance)), confidence_workspace_bytes=workspace))
+    return largest
+
+
 def _execution_runtime_provenance() -> Dict[str, object]:
     """Include nonlinear geometry and scheduling sources in the run receipt."""
     import hashlib
@@ -459,7 +534,10 @@ def _execution_runtime_provenance() -> Dict[str, object]:
                  'spherical_preflight', 'spherical_projection_cpu', 'geometry_quality',
                  'unification.sampling', 'cylindrical_cuda_projection',
                  'tilted_azimuthal_projection', 'tilted_azimuthal_projection_cuda',
-                 'tta_scheduler', 'backprojection'):
+                 'tta_scheduler', 'backprojection', 'd1_orthogonal_coverage',
+                 'projection_coverage', 'projection_coverage_cpu',
+                 'confidence_evidence', 'confidence_storage',
+                 'confidence_capture', 'confidence_capture_cpu'):
         path = package.joinpath(*name.split('.')).with_suffix('.py')
         entry = {'path': str(path), 'loaded_in_parent': 'XTA.' + name in sys.modules}
         try:
@@ -1606,11 +1684,12 @@ def _main_impl() -> None:
         print(
             'Fast bundle active: hardware-linear Azimuthal texture sampling, B1 sparse '
             'slice metadata, D3 resident-proto closing, C1 runtime-sized leases, C2 '
-            'compute/publication credit separation, C3 predicted-cost scheduling, and D1 '
+            'compute/publication credit separation, C3 predicted-cost scheduling, and Cartesian D1 '
             'project -> infer -> proto-close -> immediate owner-GPU backprojection -> '
             'source-space sparse cvol publication. Commands with interpolation and/or tiles '
             'retain an exact packed view-native shadow and materialize it only in the asynchronous '
-            'parent postprocess stage. Native fallback views use bounded shared unions. '
+            'parent postprocess stage. Tilted and Azimuthal views use bounded shared unions '
+            'followed by destination-grid projection. '
             'YOLO_TTA_V1613_FAST_BUNDLE=0 restores the compatibility paths.'
         )
         if not legacy_d1_model_eligible:
@@ -1815,6 +1894,21 @@ def _main_impl() -> None:
     )
     cartesian_views = orthogonal_views_only(physical_views)
     inference_views = list(views)
+    from .d1_orthogonal_coverage import orthogonal_coverage_supported, ORTHOGONAL_COVERAGE_CONTRACT
+    d1_categorical_coverage_eligible_by_view = {
+        view.name: (orthogonal_coverage_supported(
+            view, view_processing_volume_shape(view, int(args.imgsz)),
+            (int(input_T), int(input_H), int(input_W))) if str(view.family) == 'orthogonal' else False)
+        for view in inference_views
+    }
+    runtime_telemetry().gauge('d1.orthogonal_categorical_routing', {
+        'contract': ORTHOGONAL_COVERAGE_CONTRACT,
+        'canonical_area_fallback_views': sorted(
+            view.name for view in inference_views if str(view.family) == 'orthogonal'
+            and not d1_categorical_coverage_eligible_by_view[view.name]),
+        'native_pull_views': sorted(view.name for view in inference_views
+                                    if str(view.family) != 'orthogonal'),
+    })
     if interpolation_settings.enabled and interpolation_settings.backend == 'sam':
         from .sam_integration import validate_sam_interpolation_geometry
         try:
@@ -2141,6 +2235,11 @@ def _main_impl() -> None:
         f'slice_workers/view={parent_slice_postprocess_workers}; expected interpolation overlap: '
         f'{parent_interpolation_overlap}, per-parent interpolation workers: {parent_interpolation_task_workers})'
     )
+    if bool(getattr(args, 'reconciliation_retain_confidence', False)):
+        print('Parent confidence capture: '
+              f'CPU workers bounded by slice_workers/view={parent_slice_postprocess_workers}; '
+              f'workspace cap={PARENT_CONFIDENCE_CAPTURE_WORKSPACE_BYTES / 1024**2:.0f} MiB/view, '
+              'effective scratch charged to the existing parent transient admission.')
     print(
         'Tile postprocess workers: '
         f'{tile_postprocess_workers} (dedicated tile-result cleanup/CTILE retirement workers: '
@@ -2735,6 +2834,23 @@ def _main_impl() -> None:
     prediction_accumulation_futures: Dict[Future, Dict[str, object]] = {}
 
     view_processing_futures: Dict[Future, Tuple[str, str]] = {}
+    sam_parent_staging = None
+    sam_checkpoint_executor = None
+    if sam_context is not None and sam_context.shared_detector_devices:
+        from .sam_parent_staging import DeferredSamParentQueue
+        sam_checkpoint_executor = _create_tracked_thread_pool(
+            max_workers=1, thread_name_prefix='sam-parent-checkpoint',
+        )
+        sam_parent_staging = DeferredSamParentQueue(
+            temp_dir=temp_dir, output_dir=out_dir,
+            checkpoint_executor=sam_checkpoint_executor,
+            prepare_executor=parent_postprocess_executor, leases=view_prepare_leases,
+            dense_limit=lambda: int(direct_union_total_dense_byte_limit),
+            ready=lambda: bool(sam_context.detector_retirement_ready),
+            keep_temp=bool(keep_temp_artifacts),
+            bounded_parent_keys=bounded_policy_parent_keys,
+        )
+        _run_resources().track_closeable(sam_parent_staging)
     view_processing_submitted: set[Tuple[str, str]] = set()
     physical_view_finalization_futures: Dict[Future, Tuple[str, str]] = {}
     physical_view_finalization_submitted: set[Tuple[str, str]] = set()
@@ -2915,6 +3031,16 @@ def _main_impl() -> None:
         key = (str(model_name), str(view.name))
         if key in view_processing_submitted:
             return
+        processing_shape = view_processing_volume_shape(view, int(args.imgsz))
+        # Preflight capture before removing the live dense owner's dictionary
+        # entries. Retain only scalar shape/plan data, never extra array aliases.
+        has_shadow = d1_view_shadow_path_by_parent.get(key) is not None
+        capture_shape = (processing_shape if has_shadow
+                         else tuple(baseline_union_by_model_view[key].shape))
+        capture_plan = _parent_confidence_capture_plan(capture_shape,
+            parent_slice_postprocess_workers,
+            enabled=bool(getattr(args, 'reconciliation_retain_confidence', False))
+                and not has_shadow and baseline_confmap_by_model_view.get(key) is not None)
         view_processing_submitted.add(key)
         d1_shadow_path = d1_view_shadow_path_by_parent.pop(key, None)
         preinterpolation_layer_already_published = bool(d1_shadow_path is not None)
@@ -2942,18 +3068,12 @@ def _main_impl() -> None:
         slice_meta_holder = view_slice_meta.pop(key, None)
         if slice_meta_holder is not None and not bool(slice_meta_holder.get('valid', False)):
             slice_meta_holder = None
-        processing_bytes = int(array_nbytes(view_processing_volume_shape(view, int(args.imgsz)), np.uint8))
+        processing_bytes = int(array_nbytes(processing_shape, np.uint8))
         source_bytes = int(array_nbytes((int(input_T), int(input_H), int(input_W)), np.uint8))
-        view_name_lower = str(view.name).lower()
-        transient_bytes = 2 * GIB
-        if 'azimuthal_tilted' in view_name_lower or ('tilted' in view_name_lower and str(view.family) == 'azimuthal'):
-            # v16.1.3 D2 writes the final source destination directly and no longer owns a
-            # processing-sized tilted base stack in addition to that destination.
-            transient_bytes = int(source_bytes) + 4 * GIB
-        elif 'tilted' in view_name_lower:
-            transient_bytes = int(source_bytes) + 4 * GIB
-        elif _view_uses_interpolation(view, int(args.interpolation_distance)):
-            transient_bytes = int(processing_bytes) * 2 + 4 * GIB
+        capture_workspace_bytes = 0 if capture_plan is None else int(capture_plan.workspace_bytes)
+        transient_bytes = _parent_prepare_transient_bytes(view, processing_bytes, source_bytes,
+            interpolation_enabled=_view_uses_interpolation(view, int(args.interpolation_distance)),
+            confidence_workspace_bytes=capture_workspace_bytes)
 
         task = AdmittedViewPrepare(
             admission=parent_transient_admission,
@@ -2972,6 +3092,8 @@ def _main_impl() -> None:
             interpolation_search_angle=float(args.interpolation_search_angle),
             interpolation_backend=interpolation_settings.backend,
             sam_context=sam_context,
+            sam_base_allowance_bytes=(4*GIB if _view_uses_interpolation(view,
+                int(args.interpolation_distance)) else 0),
             keep_temp_artifacts=bool(keep_temp_artifacts),
             slice_workers=int(parent_slice_postprocess_workers),
             interpolation_task_workers=int(parent_interpolation_task_workers),
@@ -2988,13 +3110,32 @@ def _main_impl() -> None:
             parent_mask_ready_callback=_publish_parent_mask_ready,
             submit_component_projection=_submit_component_projection,
             materialize_workspace=materialize_raw_bbox_mask_store_workspace,
-            prepare=prepare_view_volume_after_fullframe,
+            prepare=partial(_prepare_parent_with_confidence_capture,
+                prepare_view_volume_after_fullframe, capture_plan=capture_plan),
         )
 
         transitioned = view_prepare_leases.handoff(key)
+        deferred_to_sam = False
         try:
-            fut = parent_postprocess_executor.submit(task)
+            if (sam_parent_staging is not None and not sam_context.detector_retirement_ready
+                    and _view_uses_interpolation(view, int(args.interpolation_distance))):
+                dense_inputs = int(np.asarray(union_mm).nbytes) if union_mm is not None else processing_bytes
+                if confmap_mm is not None:
+                    dense_inputs += int(np.asarray(confmap_mm).nbytes)
+                future_canvases = (1 + (2 if component_layers_needed else 0)) if dense_tiling_active else 0
+                required_bytes = dense_inputs + int(processing_bytes) * int(future_canvases)
+                # The checkpoint task is the sole dense owner. Do not leave
+                # aliases in this submission frame when its writer can start.
+                union_mm = None
+                confmap_mm = None
+                sam_parent_staging.defer(task, required_bytes)
+                deferred_to_sam = True
+            else:
+                fut = parent_postprocess_executor.submit(task)
         except BaseException:
+            if union_mm is None and d1_shadow_path is None:
+                union_mm = task.union_mm
+                confmap_mm = task.confmap_mm
             if transitioned:
                 view_prepare_leases.rollback_handoff(key)
             # Restore ownership registries because the postprocess closure never started.
@@ -3011,7 +3152,8 @@ def _main_impl() -> None:
                 ]
             view_processing_submitted.discard(key)
             raise
-        view_processing_futures[fut] = key
+        if not deferred_to_sam:
+            view_processing_futures[fut] = key
         # The last inference chunk has committed and the backing is now owned solely by the
         # postprocess closure. Refill worker queues immediately instead of waiting for cvol/NRRD
         # completion to release a GPU-admission slot.
@@ -3536,8 +3678,7 @@ def _main_impl() -> None:
             return
 
         view = view_infos_by_name[str(view_name)]
-        fut = tile_postprocess_executor.submit(
-            finalize_consolidated_tile_volume_for_parent,
+        consolidation_kwargs = dict(
             model_name=str(model_name),
             view=view,
             tile_accumulator_mm=acc,
@@ -3564,6 +3705,17 @@ def _main_impl() -> None:
             sam_context=sam_context,
             sam_upstream_lineage=dict(sam_gate_lineage_by_parent.get((str(model_name), str(view_name)), {})),
         )
+        if (sam_context is not None and interpolation_settings.backend == 'sam'
+                and _view_uses_interpolation(view, int(args.interpolation_distance))):
+            from .sam_resources import run_admitted_sam_call
+            transient_bytes = 2*int(np.asarray(acc).nbytes)+4*GIB
+            fut = tile_postprocess_executor.submit(run_admitted_sam_call,
+                parent_transient_admission, transient_bytes,
+                f'{model_name}/{view.name}/tile/{config_id}', sam_context,
+                finalize_consolidated_tile_volume_for_parent, consolidation_kwargs)
+        else:
+            fut = tile_postprocess_executor.submit(
+                finalize_consolidated_tile_volume_for_parent, **consolidation_kwargs)
         tile_consolidation_futures[fut] = set_key
 
     def _maybe_submit_tile_consolidations_for_parent(
@@ -4230,6 +4382,10 @@ def _main_impl() -> None:
     @scheduler_operation('background_drain')
     def _drain_completed_background_futures() -> None:
         direct_union_capacity_released = False
+        if sam_parent_staging is not None:
+            resumed, released = sam_parent_staging.pump()
+            view_processing_futures.update(resumed)
+            direct_union_capacity_released |= released
         background_drain_budget.begin(enabled=bool(
             inference_worker_process_active and scheduler.process_inference_outstanding()))
         _drain_parent_mask_ready_events()
@@ -4489,6 +4645,12 @@ def _main_impl() -> None:
         background_drain_budget.finish()
         output_manager.reap_completed(
             max_completed=1 if background_drain_budget.enabled else None)
+        if sam_parent_staging is not None:
+            # Completed parent/tile retirement above may have returned the
+            # capacity needed by another restored parent.
+            resumed, released = sam_parent_staging.pump()
+            view_processing_futures.update(resumed)
+            direct_union_capacity_released |= released
         # Allocation admission can block every otherwise-idle worker while the active
         # view window is full. Completing cvol materialization releases that slot, so
         # immediately refill the worker queues instead of waiting for an unrelated event.
@@ -4510,6 +4672,21 @@ def _main_impl() -> None:
         with parent_transient_admission.condition:
             parent_transient_in_use = int(parent_transient_admission.in_use)
             parent_transient_capacity = int(parent_transient_admission.capacity)
+        telemetry = runtime_telemetry()
+        with telemetry.lock:
+            projection_gauges = {key: dict(value) for key, value in telemetry.gauges.items()
+                                 if str(key).startswith('projection.native_destination_pull.live.')
+                                 and isinstance(value, Mapping)}
+        activity = _scheduler_wait_activity_summary(view_processing_futures, projection_gauges)
+        runtime_telemetry().gauge('scheduler.wait_activity', {
+            **activity,
+            'inference_pending_tasks': len(gpu_worker_pending_task_ids),
+            'inference_received_results': int(scheduler_state.gpu_worker_results_collected),
+            'inference_total_tasks': int(scheduler_state.gpu_worker_total_tasks),
+            'dense_retained_bytes': sum(direct_union_inference_bytes.values()) + sum(direct_union_postprocess_bytes.values()),
+            'dense_limit_bytes': int(direct_union_total_dense_byte_limit),
+        })
+        parent_counts = activity['parent_prepares']
         print(
             'Scheduler wait: no inference-ready in-memory volume; '
             f'gpu_inference_inflight={gpu_stage_state.get("inference_inflight", {})}, '
@@ -4527,6 +4704,12 @@ def _main_impl() -> None:
             f'queued_build_jobs={len(pending_prediction_build_jobs)}, '
             f'prediction_accumulation={len(prediction_accumulation_futures)}, '
             f'parent_postprocess={len(view_processing_futures)}, '
+            f'parent_running={parent_counts["running"]}, parent_queued={parent_counts["queued"]}, '
+            f'parent_component_wait={parent_counts["awaiting_components"]}, '
+            f'inference_pending={len(gpu_worker_pending_task_ids)}, '
+            f'inference_received={scheduler_state.gpu_worker_results_collected}/{scheduler_state.gpu_worker_total_tasks}, '
+            f'native_projection_active={activity["active_native_projections"]}, '
+            f'native_projection_oldest={activity["oldest_native_projections"]}, '
             f'physical_finalization={len(physical_view_finalization_futures)}, '
             f'physical_union={len(physical_view_union_futures)}, '
             f'parent_transient={parent_transient_in_use / GIB:.1f}/'
@@ -4822,8 +5005,8 @@ def _main_impl() -> None:
         if gpu_worker_process_active:
             if v1613_d1_owner_active:
                 print(
-                    'D1 owner pipeline active inside the persistent CUDA workers: '
-                    'backprojection is part of each inference lease, while main-process NRRD, '
+                    'D1 owners enabled for eligible Cartesian and Radial tasks in CUDA workers: '
+                    'their backprojection is part of each inference lease, while main-process NRRD, '
                     'downbin, and topology GPU stages remain inference-first until global drain.'
                 )
             elif v1613_d1_backprojection_overlap_enabled():
@@ -5153,9 +5336,10 @@ def _main_impl() -> None:
                 )
                 hybrid_deferred = bool(
                     str(kind) == 'fullframe'
-                    and view.family not in ('radial', 'spherical')
+                    and view.family == 'orthogonal'
                     and not requires_native_pull(view)
                     and legacy_d1_model_eligible
+                    and d1_categorical_coverage_eligible_by_view[view.name]
                     and v1613_d1_owner_active
                     and worker_direct_union_active
                     and cpu_eligible
@@ -5176,15 +5360,16 @@ def _main_impl() -> None:
                 elif hybrid_deferred:
                     # First claim resolves the whole view: OpenVINO -> shared direct union;
                     # CUDA -> D1. This prevents mere CPU eligibility from disabling D1 for
-                    # every Cartesian/Tilted view before either backend performs work.
+                    # every Cartesian view before either backend performs work.
                     rmask = None
                     rconf = None
                     result_mode = HYBRID_DEFERRED_RESULT_MODE
                 elif (
                     str(kind) == 'fullframe'
-                    and view.family not in ('radial', 'spherical')
+                    and view.family == 'orthogonal'
                     and not requires_native_pull(view)
                     and legacy_d1_model_eligible
+                    and d1_categorical_coverage_eligible_by_view[view.name]
                     and v1613_d1_owner_active
                     and not cpu_eligible
                     and not azimuthal_parent_requires_seam_union
@@ -5378,16 +5563,10 @@ def _main_impl() -> None:
             parent_transient_admission.capacity = min(
                 parent_transient_admission.capacity, max(1, policy_headroom // 8))
             source_bytes = math.prod((int(input_T), int(input_H), int(input_W)))
-            parent_working = 2 * GIB
-            for task in gpu_worker_tasks_by_id.values():
-                if str(task['kind']) != 'fullframe':
-                    continue
-                view = task['view']
-                processing_bytes = math.prod(task['processing_shape'])
-                if 'tilted' in str(view.name).lower():
-                    parent_working = max(parent_working, source_bytes + 4 * GIB)
-                elif _view_uses_interpolation(view, int(args.interpolation_distance)):
-                    parent_working = max(parent_working, 2 * processing_bytes + 4 * GIB)
+            parent_working = _policy_parent_prepare_transient_bytes(
+                gpu_worker_tasks_by_id.values(), source_bytes, parent_slice_postprocess_workers,
+                interpolation_distance=int(args.interpolation_distance),
+                retain_confidence=bool(getattr(args, 'reconciliation_retain_confidence', False)))
             parent_reserve = max(parent_working, min(
                 parent_transient_admission.capacity,
                 int(parent_postprocess_workers) * parent_working))
@@ -6752,6 +6931,8 @@ def _main_impl() -> None:
             waitables: List[Future] = list(pending_prediction_volume_futures)
             waitables.extend(list(prediction_accumulation_futures.keys()))
             waitables.extend(prepared_view_waitables(view_processing_futures))
+            if sam_parent_staging is not None:
+                waitables.extend(sam_parent_staging.checkpoint_futures)
             waitables.extend(list(physical_view_finalization_futures.keys()))
             waitables.extend(list(physical_view_union_futures.keys()))
             waitables.extend(list(tile_cleanup_futures.keys()))
@@ -6783,6 +6964,7 @@ def _main_impl() -> None:
                     not tile_consolidation_futures and
                     not tile_parent_finalization_futures and
                     not view_processing_futures and
+                    not (sam_parent_staging is not None and sam_parent_staging.pending) and
                     not physical_view_finalization_futures and
                     not physical_view_union_futures
                 )
@@ -6854,6 +7036,8 @@ def _main_impl() -> None:
     finally:
         physical_view_finalization_stop.set()
         if sys.exc_info()[0] is not None:
+            if sam_parent_staging is not None:
+                sam_parent_staging.abort()
             if sam_context is not None:
                 sam_context.cancel('TTA scheduler failed before SAM completion')
             component_projection_queue.abort()
@@ -6881,7 +7065,12 @@ def _main_impl() -> None:
         prediction_volume_executor.shutdown(wait=True)
         prediction_join_executor.shutdown(wait=True)
         prediction_result_executor.shutdown(wait=True)
+        if sam_checkpoint_executor is not None:
+            sam_checkpoint_executor.shutdown(wait=True)
         parent_postprocess_executor.shutdown(wait=True)
+        if sam_parent_staging is not None:
+            runtime_telemetry().gauge('sam_interpolation.parent_staging', sam_parent_staging.snapshot())
+            sam_parent_staging.close()
         component_projection_queue.shutdown(cancel_futures=sys.exc_info()[0] is not None)
         runtime_telemetry().gauge('projection.component_queue', component_projection_queue.snapshot())
         runtime_telemetry().gauge('projection.component_replay_capture', component_replay_capture_status())
@@ -6899,6 +7088,16 @@ def _main_impl() -> None:
                 'rendered_pixels': sam_context.rendered_pixels,
                 'image_cache_payload_bytes': sam_context.cache_logical_bytes,
                 'exact_backing_reuses': sam_context.exact_backing_reuses,
+                'image_cache_hits': getattr(sam_context, 'image_cache_hits', None),
+                'image_cache_superset_hits': getattr(sam_context, 'image_cache_superset_hits', None),
+                'image_cache_reused_pixels': getattr(sam_context, 'image_cache_reused_pixels', None),
+                'native_sampling_calls': getattr(sam_context, 'native_sampling_calls', None),
+                'native_sampling_pixels': getattr(sam_context, 'native_sampling_pixels', None),
+                'canonical_sampling_pixels': getattr(sam_context, 'canonical_sampling_pixels', None),
+                'canonical_phase_self_check': getattr(sam_context, 'canonical_phase_self_check_receipt', None),
+                'resource_assignments': getattr(sam_context, 'resource_assignments', None),
+                'source_materializations': getattr(sam_context, 'source_materializations', None),
+                'source_materialization_seconds': getattr(sam_context, 'source_materialization_seconds', None),
                 'shared_detector_devices': list(sam_context.shared_detector_devices),
                 'gpu_scope_concurrency': 'serialized result consumer; work-conserving endpoint jobs per admitted device',
                 'tracker_dispatch': dict(sam_context.dispatch_summary),
@@ -7860,6 +8059,8 @@ def _main_impl() -> None:
         streaming_final_union_holder.clear()
         nrrd_layer_refs.clear()
         gc.collect()
+        if sam_parent_staging is not None:
+            sam_parent_staging.finalize_cleanup()
         policy_settings.assert_unchanged()
         reconciliation_settings.assert_unchanged()
         if run_manifest_path is not None:

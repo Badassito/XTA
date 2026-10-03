@@ -47,7 +47,7 @@ def source_domain(view):
         height -= math.tan(math.radians(view.tilt_angle_deg)) * (
             dy if view.tilt_direction == 'vertical' else dx)
     return ((radius >= view.radial_min_radius) & (radius <= view.radial_max_radius)
-            & (height >= 0.) & (height <= length-1)), radius
+            & (height >= -.5) & (height < length-.5)), radius
 
 
 def native_source_taps(views):

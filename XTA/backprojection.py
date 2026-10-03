@@ -189,17 +189,9 @@ def resolve_azimuthal_processing_grid(
             f'Reduced Azimuthal processing raster must be square, got '
             f'{processing_h}x{processing_w}'
         )
-    if not view_uses_inference_processing_grid(azimuthal_view, processing_w):
-        raise ValueError(
-            f'Azimuthal layer {src.shape} differs from native '
-            f'({native_h},{native_w}) without delayed-expansion capability'
-        )
-    expected = view_processing_plane_shape(azimuthal_view, processing_w)
-    if tuple(int(v) for v in expected) != (processing_h, processing_w):
-        raise ValueError(
-            f'Azimuthal processing raster {processing_h}x{processing_w} does not match '
-            f'canonical geometry {expected}'
-        )
+    # Actual stored geometry owns restoration, including direct callers with
+    # delayed expansion disabled. A square nonnative raster is canonicalized
+    # by the same angle-zero affine; an environment toggle cannot reinterpret it.
     canonical = build_affine(
         view=str(azimuthal_view.name),
         src_w=native_w,
@@ -407,9 +399,8 @@ def build_dense_azimuthal_backprojection_map(
         return cached
 
     diameter = int(u_len)
-    radius = float(azimuthal_view.roi_radius)
-    if radius <= 0.0:
-        radius = max(1.0, float(azimuthal_view.diameter - 1) / 2.0)
+    from .projection_coverage import effective_azimuthal_radius
+    radius = effective_azimuthal_radius(azimuthal_view)
 
     plan_angles = np.asarray([float(s.angle_deg) % 180.0 for s in plan], dtype=np.float32)
     plan_sources = np.asarray([int(s.source_index) for s in plan], dtype=np.int32)
@@ -417,14 +408,6 @@ def build_dense_azimuthal_backprojection_map(
     n_plan = int(plan_angles.size)
     if n_plan <= 0:
         raise ValueError('Dense azimuthal backprojection requires at least one angular plan sample')
-
-    if n_plan >= 2:
-        diffs = np.diff(plan_angles.astype(np.float64, copy=False))
-        positive_diffs = diffs[diffs > 1e-9]
-        step = float(np.median(positive_diffs)) if positive_diffs.size else 180.0 / float(n_plan)
-    else:
-        step = 180.0
-    step = max(float(step), 1e-9)
 
     yy, xx = np.indices((out_h, out_w), dtype=np.float32)
     if (out_h, out_w) != (int(work_plane_h), int(work_plane_w)):
@@ -437,7 +420,8 @@ def build_dense_azimuthal_backprojection_map(
 
     theta = np.degrees(np.arctan2(dy, dx)).astype(np.float32, copy=False)
     theta = np.mod(theta, 180.0).astype(np.float32, copy=False)
-    nearest_plan_idx = np.mod(np.rint(theta / float(step)).astype(np.int32, copy=False), n_plan)
+    from .projection_coverage import nearest_plan_indices
+    nearest_plan_idx = nearest_plan_indices(theta, plan)
 
     target_angles = plan_angles[nearest_plan_idx]
     cos_t = np.cos(np.deg2rad(target_angles)).astype(np.float32, copy=False)
@@ -445,8 +429,11 @@ def build_dense_azimuthal_backprojection_map(
     signed_r = (dx * cos_t) + (dy * sin_t)
     signed_r[plan_reverses[nearest_plan_idx]] *= -1.0
 
-    u_float = ((signed_r + float(radius)) / max(1e-6, 2.0 * float(radius))) * float(diameter - 1)
-    u_idx = np.clip(np.rint(u_float).astype(np.int32, copy=False), 0, diameter - 1)
+    if diameter == 1:
+        u_idx = np.zeros((out_h, out_w), dtype=np.int32)
+    else:
+        u_float = ((signed_r + float(radius)) / max(1e-6, 2.0 * float(radius))) * float(diameter - 1)
+        u_idx = np.clip(np.rint(u_float).astype(np.int32, copy=False), 0, diameter - 1)
     source_idx = plan_sources[nearest_plan_idx].astype(np.int32, copy=False)
 
     source_idx[~valid] = 0
@@ -4237,6 +4224,12 @@ def _try_tilted_azimuthal_cuda_stage(source, view, shape, known_row_occupancy=No
     """Decline before consumption, or acquire a bounded source-retirement stage."""
     if retry_state is not None:
         retry_state['retryable'] = False
+    from .tilted_azimuthal_projection import tilted_azimuthal_cuda_capability
+    available, reason = tilted_azimuthal_cuda_capability()
+    if not available:
+        if not quiet:
+            print(f'Tilted Azimuthal CUDA unavailable: {reason}.', flush=True)
+        return None
     if (not gpu_backproject_enabled()
             or not _env_flag('YOLO_TTA_GPU_TILTED_AZIMUTHAL_BACKPROJECT', True)
             or not isinstance(source, np.ndarray) or source.dtype != np.uint8
@@ -4319,427 +4312,289 @@ def _ordered_tilted_azimuthal_coordinates(compose, count, workers, cancel_event)
 
 
 def _project_tilted_azimuthal_sink(source, view, shape, compose, frame_count, out_path,
-                                  desc, *, workers, prefer_memory, reserve_bytes,
-                                  known_row_occupancy, known_slice_bboxes, callback):
-    """Build one complete source union, then publish independent output blocks."""
-    t_dim, out_h, out_w = map(int, shape)
-    packed_w = (out_w + 7) // 8
-    packed_path = Path(out_path).with_name(Path(out_path).name + '.tilted_azimuthal.bits.dat')
-    packed_destination = cuda_stage = None
-    flat = packed = None
-    failed = callback_aborted = False
-    next_frame = cpu_frames = admission_attempts = 0
-    admission_seconds = reader_drain_seconds = 0.0
-    started = time.perf_counter()
-    retry_state, plan_holder = {'retryable': True}, {}
-    purpose = f'Tilted Azimuthal source projection {view.name}'
+                                    desc, *, workers, prefer_memory, reserve_bytes,
+                                    known_row_occupancy, known_slice_bboxes, callback):
+    """Compatibility entry: bounded native pull, with no legacy CUDA handoff."""
+    return _backproject_native_destination_pull(
+        source, view, out_path, desc, output_shape=shape, prefer_memory=prefer_memory,
+        reserve_bytes=reserve_bytes, callback=callback, sink_only=True,
+        known_row_occupancy=known_row_occupancy, workers=workers)
 
-    def try_stage():
-        nonlocal admission_attempts, admission_seconds
-        admission_attempts += 1
-        before = time.perf_counter()
-        try:
-            return _try_tilted_azimuthal_cuda_stage(source, view, shape,
-                known_row_occupancy, known_slice_bboxes, initial_packed=packed_destination,
-                first_frame=next_frame, quiet=admission_attempts > 1,
-                retry_state=retry_state, plan_holder=plan_holder)
-        finally:
-            admission_seconds += time.perf_counter() - before
 
+def _native_pull_ordered_planes(count, operation, workers):
+    """Bound unfinished planes and join every reader before releasing its source."""
+    if int(workers) <= 1:
+        for z in range(int(count)):
+            yield z, operation(z)
+        return
+    pending = deque()
+    pool = ThreadPoolExecutor(max_workers=int(workers), thread_name_prefix='native-pull')
     try:
-        cuda_stage = try_stage()
-        if cuda_stage is None:
-            packed_destination = allocate_workspace_array(
-                shape=(t_dim, out_h, packed_w), dtype=np.uint8, path=packed_path,
-                desc=f'{desc} direct composed packed sink', prefer_memory=bool(prefer_memory),
-                prefer_memfd=bool(prefer_memory), reserve_bytes=int(reserve_bytes))
-            print(f'Tilted Azimuthal projection start {view.name}: backend=cpu_composed, '
-                  f'packed_source_gib={t_dim * out_h * packed_w / GIB:.3f}', flush=True)
-            flat = np.asarray(packed_destination).reshape(-1)
-            sink_workers = max(1, min(int(workers),
-                _env_int('YOLO_TTA_TILTED_AZIMUTHAL_SINK_WORKERS', int(workers))))
-            cancel = threading.Event()
-            frames = _ordered_tilted_azimuthal_coordinates(compose, frame_count, sink_workers, cancel)
-            recheck_frame = max(1, _TILTED_AZIMUTHAL_CUDA_RECHECK_FRAMES)
-            recheck_time = time.monotonic() + _TILTED_AZIMUTHAL_CUDA_RECHECK_SECONDS
-            try:
-                for frame, coordinates in frames:
-                    if frame != next_frame:
-                        raise RuntimeError('Tilted Azimuthal CPU projection skipped or duplicated a frame')
-                    if coordinates is not None:
-                        _or_tilted_azimuthal_coordinates_into_packed(
-                            flat, *coordinates, out_h=out_h, packed_w=packed_w)
-                    next_frame += 1
-                    cpu_frames += 1
-                    if (next_frame < frame_count and retry_state['retryable']
-                            and (next_frame >= recheck_frame or time.monotonic() >= recheck_time)):
-                        recheck_frame = next_frame + max(1, _TILTED_AZIMUTHAL_CUDA_RECHECK_FRAMES)
-                        recheck_time = time.monotonic() + _TILTED_AZIMUTHAL_CUDA_RECHECK_SECONDS
-                        # Only this consumer mutates the prefix. It stays frozen
-                        # during upload while CPU futures read the immutable input.
-                        # Failed admission leaves the current CPU iterator alive.
-                        cuda_stage = try_stage()
-                        if cuda_stage is not None:
-                            break
-            finally:
-                before = time.perf_counter()
-                cancel.set()
-                frames.close()
-                reader_drain_seconds += time.perf_counter() - before
-        if cuda_stage is not None:
-            if cpu_frames:
-                print(f'Tilted Azimuthal projection promoted {view.name}: CPU completed '
-                      f'frames=[0,{next_frame}); continuing on cuda:{cuda_stage.device_index}; '
-                      f'cpu_reader_drain_s={reader_drain_seconds:.6f}', flush=True)
-            else:
-                print(f'Tilted Azimuthal projection start {view.name}: '
-                      f'backend=cuda_composed, device=cuda:{cuda_stage.device_index}', flush=True)
-            cuda_stage.accumulate(next_frame, frame_count)
-            next_frame = frame_count
-        if next_frame != frame_count:
-            raise RuntimeError('Tilted Azimuthal projection has an incomplete input-frame union')
-        # Later input planes can modify earlier source-z slices. Do not publish
-        # any output until all input frames have contributed to the bitset.
-        encoding = getattr(callback, 'encoded_slice_format', None)
-        compact = bool(cuda_stage is not None and encoding in ('raw_u8', 'packbits_little')
-                       and callable(getattr(callback, 'consume_encoded_block', None)))
-        block_bytes = max(16 * 1024**2, int(max(16., _env_float(
-            'YOLO_TTA_TILTED_AZIMUTHAL_SINK_BLOCK_MIB', 256.)) * 1024**2))
-        block_slices = max(1, min(max(1, _env_int('YOLO_TTA_PROJECTION_CALLBACK_BLOCK', 64)),
-                                 block_bytes // (out_h * out_w)))
-        if cuda_stage is not None:
-            block_slices = min(block_slices, int(cuda_stage.max_block_depth))
-        for first in range(0, t_dim, block_slices):
-            count = min(block_slices, t_dim - first)
-            if compact:
-                block = cuda_stage.project_encoded(first, count, packed=encoding == 'packbits_little')
-                if (block.first_z != first or len(block.records) != count
-                        or bool(block.packed) != (encoding == 'packbits_little')):
-                    raise RuntimeError('Tilted Azimuthal encoded block identity/count/format mismatch')
-                callback.consume_encoded_block(first, block.records, block.payload, packed=block.packed)
-                continue
-            if cuda_stage is not None:
-                block = cuda_stage.project(first, count)
-                if tuple(block.shape) != (count, out_h, out_w) or block.dtype != np.uint8:
-                    raise RuntimeError('Tilted Azimuthal device block shape/dtype mismatch')
-            else:
-                packed = np.asarray(packed_destination[first:first + count], dtype=np.uint8)
-                if not np.any(packed):
-                    try:
-                        _emit_projection_empty_range(callback, first, count, (out_h, out_w), desc=desc, required=True)
-                    except BaseException:
-                        callback_aborted = True
-                        raise
-                    continue
-                block = np.unpackbits(packed, axis=2, count=out_w, bitorder='big').astype(np.uint8, copy=False)
-            try:
-                _emit_projection_block_callback(callback, first, block, desc=desc, required=True)
-            except BaseException:
-                callback_aborted = True
-                raise
-        backend = 'cuda_composed_compact' if compact else ('cuda_composed' if cuda_stage is not None else 'cpu_composed')
-        metrics = dict(backend=backend, cpu_frames=cpu_frames, cuda_frames=frame_count - cpu_frames,
-                       admission_attempts=admission_attempts, admission_seconds=admission_seconds,
-                       cpu_reader_drain_seconds=reader_drain_seconds, total_seconds=time.perf_counter() - started)
-        if cuda_stage is not None:
-            for name in ('source_h2d_bytes', 'geometry_bytes', 'packed_bytes', 'source_upload_seconds',
-                         'kernel_seconds', 'metadata_seconds', 'pack_seconds', 'd2h_seconds',
-                         'accumulation_kernel_seconds', 'accumulate_wall_seconds', 'prefix_h2d_bytes',
-                         'geometry_upload_seconds', 'prefix_upload_seconds', 'constructor_seconds',
-                         'preflight_seconds', 'source_band_uploads', 'source_band_hits'):
-                metrics[name] = getattr(cuda_stage.projector, name, None)
-        runtime_telemetry().gauge('projection.tilted_azimuthal', metrics)
-        device_metrics = ''
-        if cuda_stage is not None:
-            device_metrics = ''.join(f', {name}={float(getattr(cuda_stage.projector, name, 0.0)):.6f}'
-                for name in ('source_upload_seconds', 'accumulation_kernel_seconds', 'accumulate_wall_seconds',
-                             'constructor_seconds', 'prefix_upload_seconds', 'geometry_upload_seconds'))
-            device_metrics += ''.join(f', {name}={int(getattr(cuda_stage.projector, name, 0))}'
-                for name in ('source_h2d_bytes', 'prefix_h2d_bytes', 'source_band_uploads', 'source_band_hits'))
-        print(f'Tilted Azimuthal projection complete {view.name}: backend={backend}, '
-              f'cpu_frames={cpu_frames}, cuda_frames={frame_count - cpu_frames}, '
-              f'admission_attempts={admission_attempts}, admission_probe_s={admission_seconds:.6f}, '
-              f'cpu_reader_drain_s={reader_drain_seconds:.6f}, total_s={metrics["total_seconds"]:.6f}'
-              + device_metrics, flush=True)
-        return SinkOnlyProjectionResult(tuple(shape))
+        indices = iter(range(int(count)))
+        for _ in range(int(workers)):
+            z = next(indices, None)
+            if z is not None:
+                pending.append((z, pool.submit(operation, z)))
+        while pending:
+            z, future = pending.popleft()
+            yield z, future.result()
+            following = next(indices, None)
+            if following is not None:
+                pending.append((following, pool.submit(operation, following)))
+    finally:
+        for _, future in pending:
+            future.cancel()
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+def _backproject_native_destination_pull(
+    source, view, out_path, desc, *, output_shape, prefer_memory=True,
+    reserve_bytes=16 * GIB, scalar_max=False, callback=None, sink_only=False,
+    known_row_occupancy=None, workers=1,
+):
+    """Restore directly into native destination cells with bounded geometry.
+
+    Output slices own all writes, so OR/max cannot race. Sink-only publication
+    retains only the bounded pending planes, not a full-volume accumulator.
+    """
+    import os
+    from .projection_coverage import iter_destination_samples
+
+    shape = tuple(int(value) for value in output_shape)
+    if len(shape) != 3 or min(shape) <= 0:
+        raise ValueError(f'{desc}: invalid native output shape {shape}')
+    if sink_only and callback is None:
+        raise ValueError(f'{desc}: sink_only requires a projection callback')
+    source = np.asarray(source)
+    if source.ndim != 3:
+        raise ValueError(f'{desc}: native coverage source must be three dimensional')
+    started = time.perf_counter()
+    support_bbox = _native_pull_occupied_stack_bbox(source, view, shape, known_row_occupancy)
+    chunk = max(1, min(262144, _env_int('YOLO_TTA_NATIVE_PULL_CHUNK', 65536)))
+    backend = os.environ.get('YOLO_TTA_NATIVE_PULL_BACKEND', 'compiled').strip().lower()
+    if backend not in ('compiled', 'numpy'):
+        raise ValueError(f'{desc}: unsupported native pull backend {backend!r}')
+    # Production masks/scores are uint8. Keep the historical array API for
+    # other numeric mask types without copying an entire borrowed volume.
+    dtype_fallback = backend == 'compiled' and source.dtype != np.uint8
+    if dtype_fallback:
+        backend = 'numpy'
+    plane_size = shape[1] * shape[2]
+    plan = None
+    plan_bytes = 0
+    temporary_bytes = 256 * chunk
+    if backend == 'compiled' and support_bbox is not None:
+        from .projection_coverage_cpu import prepare_native_pull_plan, pull_native_flat_into
+        plan = prepare_native_pull_plan(view, source.shape, shape,
+            max_plan_bytes=max(1, _env_int('YOLO_TTA_NATIVE_PULL_PLAN_MIB', 64)) * 1024**2)
+        plan_bytes = int(plan.persistent_bytes)
+        temporary_bytes = int(plan.temporary_strip_bytes)
+    # The caller already admits the dense destination. Sink-only jobs instead
+    # retain at most one output plane per unfinished future. Each worker's
+    # bounded geometry strip is charged too; cached plans are shared read-only.
+    transient_budget = max(1, _env_int('YOLO_TTA_NATIVE_PULL_WORKSPACE_MIB', 256)) * 1024**2
+    per_worker = max(1, temporary_bytes + (plane_size if sink_only else 0))
+    # The consumer may still hold the just-published plane while its next
+    # future finishes. Include that plane separately from the worker window.
+    consumer_bytes = plane_size if sink_only else 0
+    if per_worker + consumer_bytes > transient_budget:
+        raise MemoryError(f'{desc}: native pull requires at least '
+                          f'{per_worker + consumer_bytes} transient bytes; '
+                          f'workspace allowance is {transient_budget}')
+    worker_count = max(1, min(int(workers), shape[0],
+                              max(0, transient_budget - consumer_bytes) // per_worker))
+    destination = None
+    planes = None
+    complete = False
+    address_count = 0
+    visited_voxels = 0
+    completed_planes = 0
+    last_progress = started
+    telemetry = runtime_telemetry()
+    progress_key = 'projection.native_destination_pull.live.' + str(view.name)
+    def progress(state):
+        record = {
+            'view': str(view.name), 'description': str(desc), 'state': state,
+            'backend': str(plan.backend) if plan is not None else backend,
+            'workers': worker_count, 'completed_planes': completed_planes,
+            'total_planes': shape[0], 'elapsed_seconds': time.perf_counter() - started,
+            'last_update_monotonic': time.monotonic(),
+            'plan_bytes': plan_bytes, 'worker_workspace_bytes': per_worker,
+            'plan_build_peak_bytes': int(plan.workspace_bytes) if plan is not None else 0,
+            'consumer_plane_bytes': consumer_bytes,
+            'dtype_compatibility_fallback': dtype_fallback,
+        }
+        telemetry.gauge(progress_key, record)
+        return record
+    progress('running')
+    try:
+        if not sink_only:
+            destination = allocate_workspace_array(
+                shape=shape, dtype=np.uint8, path=out_path,
+                desc=f'{desc} native destination coverage',
+                prefer_memory=bool(prefer_memory), prefer_memfd=bool(prefer_memory),
+                reserve_bytes=int(reserve_bytes))
+        def project_plane(z):
+            if sink_only and (support_bbox is None or not support_bbox[0] <= z < support_bbox[3]):
+                return None, 0
+            plane = (np.zeros(shape[1:], np.uint8) if sink_only
+                     else np.asarray(destination[z]))
+            if not sink_only:
+                plane.fill(0)
+            flat = plane.reshape(-1)
+            first = z * plane_size
+            addresses = 0
+            if support_bbox is not None and support_bbox[0] <= z < support_bbox[3]:
+                if plan is not None:
+                    strip = max(1, int(plan.max_strip_voxels))
+                    for offset in range(0, plane_size, strip):
+                        sample_stats = pull_native_flat_into(source, plan,
+                            flat[offset:min(plane_size, offset + strip)], first_flat=first + offset,
+                            scalar_max=scalar_max, destination_bbox_tyx=support_bbox)
+                        addresses += int((sample_stats or {}).get('contribution_addresses', 0))
+                else:
+                    for dest, frame, row, column in iter_destination_samples(
+                            view, source.shape, shape, first_flat=first,
+                            stop_flat=first + plane_size, chunk_voxels=chunk,
+                            destination_bbox_tyx=support_bbox):
+                        values = source[frame, row, column]
+                        addresses += int(dest.size)
+                        if scalar_max:
+                            np.maximum.at(flat, dest - first, values)
+                        else:
+                            flat[dest[values != 0] - first] = np.uint8(1)
+            return plane, addresses
+        planes = _native_pull_ordered_planes(shape[0], project_plane, worker_count)
+        for z, (plane, addresses) in planes:
+            address_count += addresses
+            if support_bbox is not None and support_bbox[0] <= z < support_bbox[3]:
+                visited_voxels += ((support_bbox[4] - support_bbox[1])
+                                   * (support_bbox[5] - support_bbox[2]))
+            if callback is not None:
+                if plane is not None and np.any(plane):
+                    _emit_projection_block_callback(callback, z, plane[np.newaxis],
+                                                    desc=desc, required=bool(sink_only))
+                else:
+                    _emit_projection_empty_range(callback, z, 1, shape[1:],
+                                                 desc=desc, required=bool(sink_only))
+            completed_planes += 1
+            now = time.perf_counter()
+            if now - last_progress >= 2.:
+                progress('running')
+                last_progress = now
+        complete = True
+        progress('complete')
+        telemetry.gauge('projection.native_destination_pull', {
+            'contract': 'xta.native_destination_pull/1',
+            'source_shape': tuple(source.shape), 'output_shape': shape,
+            'destination_voxels_visited': visited_voxels,
+            'destination_voxels_total': math.prod(shape),
+            'conservative_occupied_bbox_tyx': support_bbox,
+            'contribution_addresses': address_count,
+            'chunk_voxels': min(plane_size, int(plan.max_strip_voxels)) if plan is not None else chunk,
+            'sink_plane_bytes': plane_size if sink_only else 0,
+            'elapsed_seconds': time.perf_counter() - started,
+            'scalar_max': bool(scalar_max),
+            'backend': str(plan.backend) if plan is not None else backend,
+            'workers': worker_count, 'plan_bytes': plan_bytes,
+            'plan_build_peak_bytes': int(plan.workspace_bytes) if plan is not None else 0,
+            'worker_workspace_bytes': per_worker,
+            'consumer_plane_bytes': consumer_bytes,
+            'dtype_compatibility_fallback': dtype_fallback,
+        })
+        return SinkOnlyProjectionResult(shape) if sink_only else destination
     except BaseException as exc:
-        failed = True
-        if not callback_aborted:
-            try:
-                _abort_projection_block_callback(callback, exc)
-            except BaseException as cleanup_error:
-                if callable(getattr(exc, 'add_note', None)):
-                    exc.add_note(f'Tilted Azimuthal sink abort failed: {cleanup_error}')
+        _abort_projection_block_callback(callback, exc)
         raise
     finally:
-        _cancel_main_process_spherical_retirement_request(purpose)
-        try:
-            if cuda_stage is not None:
-                from .cylindrical_cuda_projection import RadialCudaProjectionUnsafeFailure
-                try:
-                    cuda_stage.close()
-                except RadialCudaProjectionUnsafeFailure:
-                    raise
-                except BaseException:
-                    if not failed:
-                        raise
-        finally:
-            active_error = sys.exc_info()[1]
-            try:
-                if isinstance(packed_destination, np.memmap):
-                    close_memmap_array_without_flush(packed_destination, unlink_path=packed_path)
-                else:
-                    close_memmap_array_without_flush(packed_destination)
-                    packed_path.unlink(missing_ok=True)
-            except BaseException as cleanup_error:
-                if active_error is None:
-                    raise
-                if callable(getattr(active_error, 'add_note', None)):
-                    active_error.add_note(f'Tilted Azimuthal packed scratch cleanup failed: {cleanup_error}')
-            finally:
-                # Readers have joined and CUDA retirement has settled. Drop our
-                # own aliases; any exception-held consumer must remain readable.
-                flat = packed = packed_destination = None
+        if planes is not None:
+            planes.close()
+        if not complete:
+            progress('failed')
+        if destination is not None and not complete:
+            close_memmap_array(destination)
+
+
+def _native_pull_occupied_stack_bbox(source, view, output_shape, row_occupancy=None):
+    """Skip conservatively empty stack bands; never clip angular/plane support.
+
+    One bounded source reduction discovers occupied rows/frames unless trusted
+    matching row metadata is supplied. It allocates only one boolean axis.
+    Native row cell intervals are bounded before physical shear; outward
+    destination padding covers expansion and categorical contraction edges.
+    """
+    az = is_azimuthal_view(view)
+    tilted = is_tilted_azimuthal_view(view) if az else is_tilted_view(view)
+    base = azimuthal_base_view_name(view) if az else tilted_base_view_name(view)
+    stack_axis, v_axis, u_axis = {'transverse': (0, 1, 2), 'sagittal': (1, 0, 2),
+                                 'coronal': (2, 0, 1)}[base]
+    work = (int(view.full_t), int(view.full_h), int(view.full_w))
+    if az:
+        grid = resolve_azimuthal_processing_grid(source, view)
+        occupied = None
+        if row_occupancy is not None:
+            candidate = np.asarray(row_occupancy, dtype=bool).reshape(-1)
+            if candidate.size == source.shape[1]:
+                occupied = candidate
+        if occupied is None:
+            occupied = np.any(source, axis=(0, 2))
+        native = np.flatnonzero(occupied[grid.native_row_to_processing])
+        if not native.size:
+            return None
+        low = float(native[0]) * work[stack_axis] / grid.native_h - .5
+        high = float(native[-1] + 1) * work[stack_axis] / grid.native_h - .5
+    else:
+        native = np.flatnonzero(np.any(source, axis=(1, 2)))
+        if not native.size:
+            return None
+        low, high = float(native[0]) - .5, float(native[-1]) + .5
+    if tilted:
+        shear_axis = v_axis if view.tilt_direction == 'vertical' else u_axis
+        tangent = math.tan(math.radians(float(view.tilt_angle_deg)))
+        center = (work[shear_axis] - 1) / 2.0
+        shifts = (tangent * (-.5 - center),
+                  tangent * (work[shear_axis] - .5 - center))
+        low += int(view.tilt_frame_start) + min(shifts)
+        high += int(view.tilt_frame_start) + max(shifts)
+    lower, upper = [0, 0, 0], list(output_shape)
+    lower[stack_axis] = max(0, math.floor((low + .5) * output_shape[stack_axis]
+                                         / work[stack_axis] - .5) - 2)
+    upper[stack_axis] = min(output_shape[stack_axis],
+                           math.ceil((high + .5) * output_shape[stack_axis]
+                                     / work[stack_axis] - .5) + 3)
+    return (*lower, *upper)
 
 
 def _backproject_tilted_azimuthal_volume_to_volume(
-    azimuthal_mask_mm: np.ndarray,
-    azimuthal_view: ViewInfo,
-    out_path: Path,
-    desc: str,
-    *,
-    prefer_memory: bool,
-    reserve_bytes: int,
-    workers: int,
-    out_shape_tyx: Optional[Tuple[int, int, int]],
-    known_row_occupancy: Optional[np.ndarray],
-    known_slice_bboxes: Optional[np.ndarray],
-    projection_block_callback: Optional[Callable[[int, np.ndarray], None]],
-    sink_only: bool,
-) -> np.ndarray | SinkOnlyProjectionResult:
-    """Compose Azimuthal reconstruction and Tilted inverse projection into one destination.
+    azimuthal_mask_mm, azimuthal_view, out_path, desc, *, prefer_memory,
+    reserve_bytes, workers, out_shape_tyx, known_row_occupancy,
+    known_slice_bboxes, projection_block_callback, sink_only,
+):
+    """Compose angular gather and inverse shear into final native cells.
 
-    The retired implementation first wrote a dense ``(stack, plane_v, plane_u)`` tilted
-    Cartesian volume, then read that roughly 25 GiB workspace a second time to scatter it
-    into source geometry.  The dense path now gathers only foreground positions from one
-    reconstructed azimuthal frame and immediately scatters those coordinates into the final
-    destination.  Sink-only callers use a source-space packed-bit accumulator (one eighth the
-    uint8 size) and emit completed t-major blocks directly to the callback; neither mode ever
-    materializes the tilted base stack.
+    The former rounded forward CUDA scatter is unavailable. The corrected
+    CPU operator never allocates a full tilted base stack and publishes bounded
+    native slices identically in dense and sink-only modes.
     """
-    if bool(sink_only) and projection_block_callback is None:
-        raise ValueError(f'{desc}: sink_only=True requires projection_block_callback')
     if not is_tilted_azimuthal_view(azimuthal_view):
-        raise ValueError(f'{desc}: composed tilted-Azimuthal projection requires a tilted Azimuthal view')
+        raise ValueError(f'{desc}: expected a tilted Azimuthal view')
+    shape = ((int(azimuthal_view.full_t), int(azimuthal_view.full_h),
+              int(azimuthal_view.full_w)) if out_shape_tyx is None
+             else tuple(int(value) for value in out_shape_tyx))
+    plan, stats = build_azimuthal_backprojection_plan(azimuthal_view)
+    _log_azimuthal_backprojection_densification(desc, stats)
+    print(f'{desc}: native inverse coverage on CPU; legacy Tilted Azimuthal '
+          'CUDA scatter is unsupported (destination coverage).', flush=True)
+    runtime_telemetry().gauge('projection.tilted_azimuthal.cuda_unavailable', {
+        'reason': 'legacy_scatter_does_not_cover_native_destination_cells',
+        'lease_acquired': False, 'allocation_attempted': False,
+    })
+    return _backproject_native_destination_pull(
+        azimuthal_mask_mm, azimuthal_view, out_path, desc, output_shape=shape,
+        prefer_memory=prefer_memory, reserve_bytes=reserve_bytes,
+        callback=projection_block_callback, sink_only=sink_only,
+        known_row_occupancy=known_row_occupancy, workers=workers)
 
-    tilted_source = azimuthal_source_tilted_view(azimuthal_view)
-    target_shape = (
-        (int(azimuthal_view.full_t), int(azimuthal_view.full_h), int(azimuthal_view.full_w))
-        if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
-    )
-    t_dim, out_h, out_w = (int(v) for v in target_shape)
-    if min(t_dim, out_h, out_w) <= 0:
-        raise ValueError(f'{desc}: invalid output shape {target_shape}')
-
-    plan, plan_stats = build_azimuthal_backprojection_plan(azimuthal_view)
-    _log_azimuthal_backprojection_densification(desc, plan_stats)
-    if not plan:
-        _emit_projection_empty_range(
-            projection_block_callback, 0, int(t_dim), (int(out_h), int(out_w)),
-            desc=desc, required=bool(sink_only),
-        )
-        if bool(sink_only):
-            return SinkOnlyProjectionResult(tuple(int(v) for v in target_shape))
-        destination = allocate_workspace_array(
-            shape=target_shape,
-            dtype=np.uint8,
-            path=out_path,
-            desc=f'{desc} direct composed destination',
-            prefer_memory=bool(prefer_memory),
-            prefer_memfd=bool(prefer_memory),
-            reserve_bytes=int(reserve_bytes),
-        )
-        return destination
-
-    plane_h, plane_w = (int(tilted_source.src_h), int(tilted_source.src_w))
-    stack_len = int(tilted_source.num_slices)
-    grid = resolve_azimuthal_processing_grid(azimuthal_mask_mm, azimuthal_view)
-    dense_map = _azimuthal_dense_map_for_processing(
-        build_dense_azimuthal_backprojection_map(
-            azimuthal_view, plan, out_shape_hw=(int(plane_h), int(plane_w)),
-        ),
-        grid,
-    )
-    valid_flat = np.flatnonzero(np.asarray(dense_map.valid_mask, dtype=bool).reshape(-1))
-    valid_v = np.ascontiguousarray((valid_flat // int(plane_w)).astype(np.int32, copy=False))
-    valid_u = np.ascontiguousarray((valid_flat % int(plane_w)).astype(np.int32, copy=False))
-    azimuthal_source_idx = np.ascontiguousarray(
-        np.asarray(dense_map.source_idx_map, dtype=np.int32).reshape(-1)[valid_flat]
-    )
-    azimuthal_u_idx = np.ascontiguousarray(
-        np.asarray(dense_map.u_idx_map, dtype=np.int32).reshape(-1)[valid_flat]
-    )
-
-    row_occ: Optional[np.ndarray] = None
-    if known_row_occupancy is not None:
-        candidate = np.asarray(known_row_occupancy, dtype=bool).reshape(-1)
-        if int(candidate.shape[0]) == int(grid.processing_h):
-            row_occ = candidate
-    # Validate metadata even though the direct gather currently uses row occupancy as its
-    # high-value skip.  This catches stale descriptors at the same boundary as upright Azimuthal.
-    _validated_azimuthal_slice_bboxes(
-        known_slice_bboxes,
-        int(np.asarray(azimuthal_mask_mm).shape[0]),
-        int(grid.processing_h),
-        int(np.asarray(azimuthal_mask_mm).shape[2]),
-    )
-
-    work_t = int(tilted_source.full_t)
-    work_h = int(tilted_source.full_h)
-    work_w = int(tilted_source.full_w)
-    base_view = tilted_base_view_name(tilted_source)
-    tan_alpha = float(math.tan(math.radians(float(tilted_source.tilt_angle_deg))))
-    vertical = str(tilted_source.tilt_direction) == 'vertical'
-    if not vertical and str(tilted_source.tilt_direction) != 'horizontal':
-        raise ValueError(f'{desc}: unsupported tilt direction {tilted_source.tilt_direction!r}')
-    axis_center = float(
-        (int(tilted_source.src_h) - 1) / 2.0
-        if vertical else (int(tilted_source.src_w) - 1) / 2.0
-    )
-
-    def _map_axis_to_out(values: np.ndarray, in_len: int, out_len: int) -> np.ndarray:
-        if int(in_len) == int(out_len):
-            return values.astype(np.int32, copy=False)
-        mapped = (values.astype(np.int64, copy=False) * int(out_len)) // int(in_len)
-        return np.minimum(mapped, int(out_len) - 1).astype(np.int32, copy=False)
-
-    def _compose_frame_indices(
-        frame_index: int,
-    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """Return final source coordinates contributed by one tilted-Azimuthal frame."""
-        rows = _azimuthal_processing_rows_for_output(grid, int(stack_len), int(frame_index))
-        if int(rows.size) <= 0:
-            return None
-        if row_occ is not None and not bool(np.any(row_occ[rows])):
-            return None
-        hit = np.zeros((int(valid_flat.size),), dtype=bool)
-        for processing_row in rows.tolist():
-            if row_occ is not None and not bool(row_occ[int(processing_row)]):
-                continue
-            hit |= np.asarray(
-                azimuthal_mask_mm[
-                    azimuthal_source_idx,
-                    int(processing_row),
-                    azimuthal_u_idx,
-                ],
-                dtype=np.uint8,
-            ) != 0
-        if not bool(np.any(hit)):
-            return None
-        selected = np.flatnonzero(hit)
-        vv = valid_v[selected]
-        uu = valid_u[selected]
-        axis_coords = vv if vertical else uu
-        stack_float = float(tilted_frame_center(tilted_source, int(frame_index))) + (
-            float(tan_alpha) * (axis_coords.astype(np.float32, copy=False) - float(axis_center))
-        )
-        ss = np.rint(stack_float).astype(np.int32, copy=False)
-        inside = (ss >= 0) & (ss < int(tilted_stack_axis_length(tilted_source)))
-        if not bool(np.any(inside)):
-            return None
-        ss = ss[inside]
-        vv = vv[inside]
-        uu = uu[inside]
-        if base_view == 'transverse':
-            ti = _map_axis_to_out(ss, work_t, t_dim)
-            yi = _map_axis_to_out(vv, work_h, out_h)
-            xi = _map_axis_to_out(uu, work_w, out_w)
-        elif base_view == 'sagittal':
-            ti = _map_axis_to_out(vv, work_t, t_dim)
-            yi = _map_axis_to_out(ss, work_h, out_h)
-            xi = _map_axis_to_out(uu, work_w, out_w)
-        elif base_view == 'coronal':
-            ti = _map_axis_to_out(vv, work_t, t_dim)
-            yi = _map_axis_to_out(uu, work_h, out_h)
-            xi = _map_axis_to_out(ss, work_w, out_w)
-        else:
-            raise ValueError(f'{desc}: unsupported Tilted base {base_view!r}')
-        return (
-            np.ascontiguousarray(ti, dtype=np.int32),
-            np.ascontiguousarray(yi, dtype=np.int32),
-            np.ascontiguousarray(xi, dtype=np.int32),
-        )
-
-    worker_count = choose_slice_parallel_workers(int(workers), int(stack_len))
-    avoided_base_bytes = array_nbytes(
-        (int(tilted_source.num_slices), int(tilted_source.src_h), int(tilted_source.src_w)),
-        np.uint8,
-    )
-
-    if not bool(sink_only):
-        destination = allocate_workspace_array(
-            shape=target_shape,
-            dtype=np.uint8,
-            path=out_path,
-            desc=f'{desc} direct composed destination',
-            prefer_memory=bool(prefer_memory),
-            prefer_memfd=bool(prefer_memory),
-            reserve_bytes=int(reserve_bytes),
-        )
-        print(
-            f'{desc}: direct tilted-Azimuthal composition active; no '
-            f'{avoided_base_bytes / GIB:.2f} GiB tilted base-stack intermediate is allocated.'
-        )
-        destination_flat = np.asarray(destination).reshape(-1)
-        plane_stride = np.int64(int(out_h) * int(out_w))
-
-        def _scatter_frame(frame_index: int) -> None:
-            coordinates = _compose_frame_indices(int(frame_index))
-            if coordinates is None:
-                return
-            ti, yi, xi = coordinates
-            flat = ti.astype(np.int64, copy=False) * plane_stride
-            flat += yi.astype(np.int64, copy=False) * np.int64(out_w)
-            flat += xi.astype(np.int64, copy=False)
-            # Same-byte stores are idempotent; this preserves the established Tilted
-            # projector's parallel sparse-scatter contract.
-            destination_flat[flat] = np.uint8(1)
-
-        parallel_for_indices_chunked(
-            int(stack_len),
-            _scatter_frame,
-            max_workers=int(worker_count),
-            desc=f'{desc} [direct composed frames]',
-            show_progress=True,
-            target_chunks_per_worker=4,
-        )
-        if projection_block_callback is not None:
-            block = max(1, _env_int('YOLO_TTA_PROJECTION_CALLBACK_BLOCK', 64))
-            for t0 in range(0, int(t_dim), int(block)):
-                t1 = min(int(t_dim), int(t0) + int(block))
-                block_view = np.asarray(destination[int(t0):int(t1)])
-                if bool(np.any(block_view)):
-                    _emit_projection_block_callback(
-                        projection_block_callback, int(t0), block_view,
-                        desc=desc, required=False,
-                    )
-                else:
-                    _emit_projection_empty_range(
-                        projection_block_callback, int(t0), int(t1 - t0),
-                        (int(out_h), int(out_w)), desc=desc, required=False,
-                    )
-        return destination
-
-    # Sink-only mode commits through a packed source-space accumulator.  This preserves
-    # exact union semantics while reducing the live destination from one byte to one bit per
-    # voxel and lets the cvol writer receive final t-major blocks without a dense uint8 file.
-    return _project_tilted_azimuthal_sink(
-        azimuthal_mask_mm, azimuthal_view, target_shape, _compose_frame_indices,
-        int(stack_len), out_path, desc, workers=int(worker_count),
-        prefer_memory=bool(prefer_memory), reserve_bytes=int(reserve_bytes),
-        known_row_occupancy=known_row_occupancy, known_slice_bboxes=known_slice_bboxes,
-        callback=projection_block_callback,
-    )
 
 def backproject_azimuthal_volume_to_volume(
     azimuthal_mask_mm: np.ndarray,
@@ -5020,263 +4875,26 @@ def backproject_azimuthal_volume_to_volume(
     return SinkOnlyProjectionResult((int(t_dim), int(out_h), int(out_w)))
 
 def backproject_tilted_volume_to_volume(
-    tilted_mask_mm: np.ndarray,
-    tilted_view: ViewInfo,
-    out_path: Path,
-    desc: str,
-    *,
-    prefer_memory: bool = True,
-    reserve_bytes: int = 16 * GIB,
-    workers: int = 1,
-    out_shape_tyx: Optional[Tuple[int, int, int]] = None,
-    scalar_max: bool = False,
-) -> np.ndarray:
-    """Backproject a Tilted volume into the requested source geometry.
-    
-    Supports reduced processing rasters and direct output-geometry scattering without an intermediate full native view."""
+    tilted_mask_mm, tilted_view, out_path, desc, *, prefer_memory=True,
+    reserve_bytes=16 * GIB, workers=1, out_shape_tyx=None, scalar_max=False,
+):
+    """Invert physical shear before quantizing directly into native cells.
+
+    Stored model/native geometry owns sampling independently of the delayed
+    expansion toggle. No rounded reduced orthogonal intermediate is restored.
+    """
     if not is_tilted_view(tilted_view):
         raise ValueError('backproject_tilted_volume_to_volume expects a Tilted View')
+    source = np.asarray(tilted_mask_mm)
+    if source.ndim != 3 or source.shape[0] != int(tilted_view.num_slices):
+        raise ValueError(f'{desc}: invalid Tilted source frame geometry {source.shape}')
+    shape = ((int(tilted_view.full_t), int(tilted_view.full_h), int(tilted_view.full_w))
+             if out_shape_tyx is None else tuple(int(value) for value in out_shape_tyx))
+    return _backproject_native_destination_pull(
+        source, tilted_view, out_path, desc, output_shape=shape,
+        prefer_memory=prefer_memory, reserve_bytes=reserve_bytes,
+        scalar_max=scalar_max, workers=workers)
 
-    work_t = int(tilted_view.full_t)
-    work_h = int(tilted_view.full_h)
-    work_w = int(tilted_view.full_w)
-
-    src = np.asarray(tilted_mask_mm)
-    if int(src.ndim) != 3 or int(src.shape[0]) != int(tilted_view.num_slices):
-        raise ValueError(
-            f'{desc}: tilted layer shape {tuple(src.shape)} must start with '
-            f'{int(tilted_view.num_slices)} frames'
-        )
-    plane_h, plane_w = int(src.shape[1]), int(src.shape[2])
-    native_plane = (int(tilted_view.src_h), int(tilted_view.src_w))
-    reduced_processing = bool(
-        delayed_native_expansion_enabled()
-        and (int(plane_h), int(plane_w)) != native_plane
-    )
-    if reduced_processing and int(plane_h) != int(plane_w):
-        raise ValueError(
-            f'{desc}: delayed Tilted processing requires a square inference raster, '
-            f'got {(int(plane_h), int(plane_w))}'
-        )
-    base_view = tilted_base_view_name(tilted_view)
-
-    if reduced_processing and out_shape_tyx is not None:
-        # Use the exact same terminal definition with and without --save nrrd:
-        # reduced-view shear -> reduced orthogonal grid -> one orthogonal restore. Shear and
-        # native-plane expansion do not commute at rounded stack boundaries, so expanding each
-        # tilted frame first would make final masks depend on whether component NRRDs were saved.
-        reduced_path = out_path.with_name(out_path.stem + '.d6_reduced_orthogonal.u8.dat')
-        reduced_mm: Optional[np.ndarray] = None
-        restored_mm: Optional[np.ndarray] = None
-        restore_succeeded = False
-        try:
-            reduced_mm = backproject_tilted_volume_to_volume(
-                tilted_mask_mm=src,
-                tilted_view=tilted_view,
-                out_path=reduced_path,
-                desc=f'{desc} [reduced orthogonal projection]',
-                prefer_memory=bool(prefer_memory),
-                reserve_bytes=int(reserve_bytes),
-                workers=int(workers),
-                out_shape_tyx=None,
-                scalar_max=bool(scalar_max),
-            )
-            target_shape = tuple(int(v) for v in out_shape_tyx)
-            restored_mm = allocate_workspace_array(
-                shape=target_shape,
-                dtype=np.uint8,
-                path=out_path,
-                desc=f'{desc} workspace',
-                prefer_memory=bool(prefer_memory),
-                reserve_bytes=int(reserve_bytes),
-            )
-
-            def _restore_tilted_slice(z_idx: int) -> None:
-                # Local import keeps the package dependency graph acyclic.
-                from .outputs import _read_layer_slice_in_output_shape
-
-                if scalar_max:
-                    from .confidence_projection import read_score_slice_in_output_shape
-                    restored_mm[int(z_idx), :, :] = read_score_slice_in_output_shape(
-                        reduced_mm, target_shape, int(z_idx))
-                else:
-                    restored_mm[int(z_idx), :, :] = _read_layer_slice_in_output_shape(
-                        reduced_mm, target_shape, int(z_idx),
-                    )
-
-            parallel_for_indices_chunked(
-                int(target_shape[0]),
-                _restore_tilted_slice,
-                max_workers=choose_slice_parallel_workers(int(workers), int(target_shape[0])),
-                desc=f'{desc} [terminal reduced-grid restore]',
-                show_progress=True,
-                target_chunks_per_worker=2,
-            )
-            restore_succeeded = True
-            return restored_mm
-        finally:
-            if reduced_mm is not None:
-                close_memmap_array(reduced_mm, unlink_path=reduced_path)
-                reduced_mm = None
-            if restored_mm is not None and not bool(restore_succeeded):
-                close_memmap_array(restored_mm)
-                restored_mm = None
-            try:
-                reduced_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-    if out_shape_tyx is None:
-        if reduced_processing:
-            if base_view == 'transverse':
-                t_dim, out_h, out_w = int(work_t), int(plane_h), int(plane_w)
-            elif base_view == 'sagittal':
-                t_dim, out_h, out_w = int(plane_h), int(work_h), int(plane_w)
-            elif base_view == 'coronal':
-                t_dim, out_h, out_w = int(plane_h), int(plane_w), int(work_w)
-            else:  # pragma: no cover
-                raise ValueError(f'Unsupported Tilted View base: {base_view}')
-        else:
-            t_dim, out_h, out_w = work_t, work_h, work_w
-    else:
-        t_dim, out_h, out_w = (int(v) for v in out_shape_tyx)
-    if t_dim <= 0 or out_h <= 0 or out_w <= 0:
-        raise ValueError(
-            f'Tilted view {tilted_view.name} has invalid output geometry '
-            f'(t,Y,X)=({t_dim},{out_h},{out_w})'
-        )
-
-    vol_mm = allocate_workspace_array(
-        shape=(t_dim, out_h, out_w),
-        dtype=np.uint8,
-        path=out_path,
-        desc=f'{desc} workspace',
-        prefer_memory=bool(prefer_memory),
-        reserve_bytes=int(reserve_bytes),
-    )
-
-    tan_alpha = float(math.tan(math.radians(float(tilted_view.tilt_angle_deg))))
-    if str(tilted_view.tilt_direction) == 'vertical':
-        axis_center = float((int(tilted_view.src_h) - 1) / 2.0)
-    elif str(tilted_view.tilt_direction) == 'horizontal':
-        axis_center = float((int(tilted_view.src_w) - 1) / 2.0)
-    else:  # pragma: no cover
-        raise ValueError(f'Unsupported tilt direction: {tilted_view.tilt_direction}')
-
-    stack_len = tilted_stack_axis_length(tilted_view)
-
-    worker_count = choose_slice_parallel_workers(int(workers), int(tilted_view.num_slices))
-    if scalar_max:
-        # Several frames may hit the same destination. Numeric max must serialize
-        # those writes; the ordinary binary scatter keeps its existing schedule.
-        worker_count = 1
-
-    def _map_axis_to_out(idx_arr: np.ndarray, in_len: int, out_len: int) -> np.ndarray:
-        # union-biased floor scaling from working-grid indices to source indices
-        # (in_len >= out_len; the cube resize only grows axes). Identity when the axis is unscaled.
-        if int(in_len) == int(out_len):
-            return idx_arr
-        mapped = (idx_arr.astype(np.int64, copy=False) * int(out_len)) // int(in_len)
-        return np.minimum(mapped, int(out_len) - 1).astype(np.int32, copy=False)
-
-    # per-frame invariants hoisted; the frame's emptiness test and nonzero run on
-    # the raw uint8 plane (the old dtype=bool asarray made a full-plane cast COPY per frame);
-    # the three mapped coordinate arrays collapse into ONE flat scatter index (built with
-    # GIL-releasing int64 ufuncs) so the GIL-held portion is a single 1-array store.
-    is_vertical_dir = str(tilted_view.tilt_direction) == 'vertical'
-    vol_flat_scatter = np.asarray(vol_mm).reshape(-1)
-    plane_stride = np.int64(int(out_h) * int(out_w))
-    reduced_out_to_native: Optional[np.ndarray] = None
-    if reduced_processing and out_shape_tyx is None:
-        # Frame-invariant canonical-grid -> native-view transform. Building/inverting this
-        # affine inside every one of ~3k frames per Tilted stack would serialize the otherwise
-        # parallel projection on OpenCV/NumPy setup work.
-        canonical = build_affine(
-            view=str(tilted_view.name),
-            src_w=int(tilted_view.src_w),
-            src_h=int(tilted_view.src_h),
-            out_size=int(plane_w),
-            angle_deg=0.0,
-            pad_mode=str(tilted_view.pad_mode),
-        )
-        reduced_out_to_native = np.asarray(canonical.M_out_to_src, dtype=np.float32)
-
-    def _backproject_frame(frame_idx: int) -> None:
-        frame_arr = np.asarray(src[int(frame_idx)])
-        if not np.any(frame_arr):
-            return
-        vv, uu = np.nonzero(frame_arr)
-        if vv.size <= 0:
-            return
-
-        frame_center = float(tilted_frame_center(tilted_view, int(frame_idx)))
-        if reduced_processing and out_shape_tyx is None:
-            # Convert only the coordinate used by the physical shear to native-view units;
-            # the orthogonal in-plane coordinates themselves stay reduced.
-            if reduced_out_to_native is None:  # pragma: no cover - guarded above
-                raise RuntimeError(f'{desc}: reduced Tilted affine was not initialized')
-            m = reduced_out_to_native
-            native_u = m[0, 0] * uu.astype(np.float32, copy=False) + m[0, 1] * vv + m[0, 2]
-            native_v = m[1, 0] * uu.astype(np.float32, copy=False) + m[1, 1] * vv + m[1, 2]
-            axis_coords = native_v if is_vertical_dir else native_u
-        else:
-            axis_coords = vv if is_vertical_dir else uu
-        stack_float = frame_center + tan_alpha * (axis_coords.astype(np.float32, copy=False) - axis_center)
-
-        ss = np.rint(stack_float).astype(np.int32, copy=False)
-        valid = (ss >= 0) & (ss < int(stack_len))
-        if not np.any(valid):
-            return
-
-        ss_v = ss[valid]
-        vv_v = vv[valid]
-        uu_v = uu[valid]
-        if reduced_processing and out_shape_tyx is None:
-            # Reduced orthogonal projection. The stacking axis keeps working-grid pitch;
-            # the two axes represented by the model plane retain inference pitch.
-            if base_view == 'transverse':
-                ti, yi, xi = ss_v, vv_v, uu_v
-            elif base_view == 'sagittal':
-                ti, yi, xi = vv_v, ss_v, uu_v
-            elif base_view == 'coronal':
-                ti, yi, xi = vv_v, uu_v, ss_v
-            else:  # pragma: no cover
-                raise ValueError(f'Unsupported Tilted View base: {base_view}')
-        elif base_view == 'transverse':
-            # base in-plane: horizontal X=uu, vertical Y=vv; stack t=ss
-            ti = _map_axis_to_out(ss_v, work_t, t_dim)
-            yi = _map_axis_to_out(vv_v, work_h, out_h)
-            xi = _map_axis_to_out(uu_v, work_w, out_w)
-        elif base_view == 'sagittal':
-            # base in-plane: horizontal X=uu, vertical t=vv; stack Y=ss
-            ti = _map_axis_to_out(vv_v, work_t, t_dim)
-            yi = _map_axis_to_out(ss_v, work_h, out_h)
-            xi = _map_axis_to_out(uu_v, work_w, out_w)
-        elif base_view == 'coronal':
-            # base in-plane: horizontal Y=uu, vertical t=vv; stack X=ss
-            ti = _map_axis_to_out(vv_v, work_t, t_dim)
-            yi = _map_axis_to_out(uu_v, work_h, out_h)
-            xi = _map_axis_to_out(ss_v, work_w, out_w)
-        else:  # pragma: no cover
-            raise ValueError(f'Unsupported Tilted View base: {base_view}')
-        flat = ti.astype(np.int64, copy=False) * plane_stride
-        flat += yi.astype(np.int64, copy=False) * np.int64(out_w)
-        flat += xi.astype(np.int64, copy=False)
-        if scalar_max:
-            np.maximum.at(vol_flat_scatter, flat, frame_arr[vv_v, uu_v])
-        else:
-            vol_flat_scatter[flat] = np.uint8(1)
-
-    parallel_for_indices_chunked(
-        int(tilted_view.num_slices),
-        _backproject_frame,
-        max_workers=worker_count,
-        desc=desc,
-        show_progress=True,
-        target_chunks_per_worker=4,
-    )
-
-    return vol_mm
 
 def backproject_radial_volume_to_volume(*args, **kwargs):
     """Dispatch radius-swept shell patches to their bounded source-space projector."""

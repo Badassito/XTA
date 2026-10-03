@@ -367,9 +367,10 @@ class SamSessionPlan:
             raise ValueError("frame_start must be >= 0")
         if isinstance(self.frame_stop, bool) or int(self.frame_stop) <= int(self.frame_start):
             raise ValueError("frame_stop must be greater than frame_start")
-        if int(self.frame_stop) - int(self.frame_start) > LTA_SESSION_FRAMES:
+        frame_limit = self._session_frame_limit()
+        if frame_limit is not None and int(self.frame_stop) - int(self.frame_start) > frame_limit:
             raise ValueError(
-                f"one LTA session may contain at most {LTA_SESSION_FRAMES} frames"
+                f"one LTA session may contain at most {frame_limit} frames"
             )
         object.__setattr__(self, "sequence_id", sequence_id)
         object.__setattr__(self, "session_index", int(self.session_index))
@@ -383,6 +384,20 @@ class SamSessionPlan:
     @property
     def frame_indices(self) -> range:
         return range(int(self.frame_start), int(self.frame_stop))
+
+    def _session_frame_limit(self) -> int | None:
+        return LTA_SESSION_FRAMES
+
+
+@dataclass(frozen=True)
+class SamInterpolationSessionPlan(SamSessionPlan):
+    """One TTA endpoint session; resource admission owns its duration budget.
+
+    Tracker history is retained for the complete requested interval. This does
+    not alter LTA's fixed thirty-frame session partition or its relays.
+    """
+    def _session_frame_limit(self) -> int | None:
+        return None
 
 
 @dataclass(frozen=True)
@@ -1624,6 +1639,7 @@ __all__ = (
     "SamFramePrediction",
     "SamPromptBox",
     "SamSessionPlan",
+    "SamInterpolationSessionPlan",
     "build_local_sam_predictor",
     "configure_constrained_gpu_batches",
     "configure_predictor_confidence",

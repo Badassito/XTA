@@ -1,8 +1,8 @@
-"""Exact host lookup tables for bounded Tilted Azimuthal GPU projection.
+"""Compatibility declarations for the retired Tilted Azimuthal scatter backend.
 
-The existing CPU projector remains the numerical reference. In particular, its
-float32 shear and ties-to-even rounding are resolved here, before CUDA sees any
-coordinates. The device only gathers binary samples and combines integer bits.
+Rounded forward scatter tables do not cover native destination cells. The
+capability is explicitly unavailable before table allocation or GPU admission;
+canonical projection uses the bounded inverse-coverage CPU implementation.
 """
 from __future__ import annotations
 
@@ -14,6 +14,17 @@ import numpy as np
 
 class TiltedAzimuthalPlanUnavailable(RuntimeError):
     """This geometry cannot use the bounded lookup-table backend."""
+
+
+TILTED_AZIMUTHAL_CUDA_UNAVAILABLE_REASON = (
+    'Legacy Tilted Azimuthal CUDA scatter does not cover native destination cells; '
+    'use canonical bounded CPU inverse coverage'
+)
+
+
+def tilted_azimuthal_cuda_capability():
+    """Safe pre-admission capability probe; never initializes GPU or geometry."""
+    return False, TILTED_AZIMUTHAL_CUDA_UNAVAILABLE_REASON
 
 
 @dataclass(frozen=True)
@@ -38,7 +49,7 @@ class TiltedAzimuthalProjectionPlan:
 
 def build_tilted_azimuthal_plan(source, view, output_shape, known_row_occupancy=None,
                                 known_slice_bboxes=None, *, max_plan_bytes=512 * 1024**2):
-    """Compile the CPU operator's exact gather and coordinate membership tables.
+    """Refuse the retired scatter plan before geometry-sized allocation.
 
     ``points`` columns are angle, processing-u, shear-axis index, fixed-a and
     fixed-b. The mapped shear coordinate fills t/y/x for base ids 0/1/2;
@@ -46,7 +57,9 @@ def build_tilted_azimuthal_plan(source, view, output_shape, known_row_occupancy=
     CSR indexed by tilted frame and retains the reference's multi-row OR.
     Building this plan never copies the source volume.
     """
-    # Local import keeps the geometry/backend import graph acyclic.
+    raise TiltedAzimuthalPlanUnavailable(TILTED_AZIMUTHAL_CUDA_UNAVAILABLE_REASON)
+    # Retained legacy declaration code documents the rejected table format;
+    # it must never be used as a native coverage plan.
     from .backprojection import (
         _azimuthal_dense_map_for_processing, _azimuthal_processing_rows_for_output,
         _validated_azimuthal_slice_bboxes, build_azimuthal_backprojection_plan,

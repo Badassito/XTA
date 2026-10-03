@@ -43,9 +43,9 @@ version = {attr = "XTA.__version__"}
 [tool.setuptools.data-files]
 "share/xta" = [
   "ARCHITECTURE.md",
-  "GPT-6-Astra-Ultra_v24.0.0_SLURM.py",
+  "GPT-6-Astra-Ultra_v24.0.1_SLURM.py",
 ]
-"share/xta/docs" = ["docs/sam_interpolation.md", "docs/lta_dynamic_crops.md"]
+"share/xta/docs" = ["docs/sam_interpolation.md", "docs/lta_dynamic_crops.md", "docs/projection_coverage.md"]
 "share/xta/tools" = [
   "tools/compare_reconciliation.py",
   "tools/export_semantic_logits.py",
@@ -105,4 +105,20 @@ version = {attr = "XTA.__version__"}
   "tools/prepare_sam_crop_two_tile.py",
   "tools/compare_sam_crop_zoom.py",
   "tools/qualify_sam_tiled_integration.py",
+  "tools/sam_outer_crop_geometry.py",
+  "tools/prepare_sam_outer_crop_experiment.py",
+  "tools/prepare_sam_outer_crop_protocol.py",
+  "tools/run_sam_outer_crop_experiment.py",
+  "tools/run_sam_outer_crop_stress.py",
+  "tools/analyze_sam_outer_crop.py",
+  "tools/derive_sam_acceptance_evidence.py",
+  "tools/qualify_sam_tiled_schedule.py",
+  "tools/report_sam_outer_crop.py",
+  "tools/generate_sam_outer_crop_sdf.py",
+  "tools/qualify_sam_interpolation_long_session.py",
+  "tools/qualify_projection_coverage.py",
+  "tools/benchmark_native_pull_projection.py",
+  "tools/benchmark_confidence_capture.py",
+  "tools/qualify_sam_policy_throughput.py",
+  "tools/qualify_sam_family_dispatch.py",
 ]

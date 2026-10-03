@@ -135,6 +135,10 @@ def materialize_sam_directional_view_layer(
         store.close()
     stage = f'sam_selected_{direction}'
     lineage = dict(upstream_lineage or {})
+    from .sam_view_geometry import sam_native_transform_record
+    native_transform = sam_native_transform_record(view, shape,
+        final_source_output_shape() or (int(view.full_t), int(view.full_h), int(view.full_w)),
+        source_processing_shape_tyx=getattr(getattr(sam_context, 'source_volume', None), 'shape', None))
     ref = NrrdLayerRef(
         key=_nrrd_layer_key(view_name=view.name, source=source, mask_kind='bridge',
                             pass_index=pass_index, tile_config_id=tile_config_id, stage=stage),
@@ -158,12 +162,7 @@ def materialize_sam_directional_view_layer(
         observation_roots=tuple(str(value) for value in entry.get('observation_roots', ())),
         gate_support_identity=str(lineage.get('gate_support_identity', '')),
         upstream_interpolation_policy_identity=str(lineage.get('interpolation_policy_identity', '')),
-        native_transform={'kind': 'identity' if shape == (final_source_output_shape() or
-                            (int(view.full_t), int(view.full_h), int(view.full_w))) else 'resampled',
-                          'view_name': physical_view_name(view), 'native_shape_tyx': list(shape),
-                          'source_shape_tyx': list(final_source_output_shape() or
-                            (int(view.full_t), int(view.full_h), int(view.full_w))),
-                          'angle_deg': float(view.tta_angle_deg)},
+        native_transform=native_transform,
         interpolation_connectivity=int(entry.get('topology_connectivity', 6)),
         selected_bridge_connection_status=str(entry.get('connection_status', 'selected_native')),
         segment_extent_ijk=(_nrrd_empty_segment_extent() if int(entry.get('voxel_count', 0)) <= 0 else None),
@@ -482,19 +481,14 @@ def materialize_nrrd_view_layer(
     raw_path = temp_dir / 'nrrd_work' / 'projected_layers' / str(view.name) / f'{key}.orthogonal.u8.dat'
     out_path = layer_dir / f'{key}.orthogonal.cvol'
     transient_projection_in_memory = not force_path_backed_store
-    # projected azimuthal/tilted layers directly into source geometry. keeps
-    # non-azimuthal layers reduced: Cartesian layers are reduced axis permutations and Tilted
-    # layers are reduced sheared orthogonal grids. Their sparse stores are therefore built at
-    # inference pitch and the NRRD/final-union reader performs the one terminal restore.
+    # Nonlinear projections resolve directly on the final source grid. A
+    # reduced tilted scatter followed by restoration can leave native support
+    # holes and applies the shear/resampling in the wrong order. Cartesian
+    # axis-permutation stores still perform their one terminal source restore.
     projection_out_shape: Optional[Tuple[int, int, int]] = None
-    reduced_view_layer = bool(
-        delayed_native_expansion_enabled()
-        and tuple(int(v) for v in np.asarray(view_volume_mm).shape[-2:])
-        != (int(view.src_h), int(view.src_w))
-    )
-    if view.family in ('azimuthal', 'radial', 'spherical') or (is_tilted_view(view) and not reduced_view_layer):
+    if view.family in ('azimuthal', 'radial', 'spherical') or is_tilted_view(view):
         projection_out_shape = final_source_output_shape()
-    if view.family in ('radial', 'spherical') and projection_out_shape is None:
+    if (view.family in ('azimuthal', 'radial', 'spherical') or is_tilted_view(view)) and projection_out_shape is None:
         projection_out_shape = (int(view.full_t), int(view.full_h), int(view.full_w))
     incremental_writer: Optional[IncrementalRawBBoxMaskStoreWriter] = None
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None
@@ -504,13 +498,18 @@ def materialize_nrrd_view_layer(
         'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',
         'projection_payload_fusion': ('spherical_qsc_shell_sink' if view.family == 'spherical' else 'cylindrical_shell_sink' if view.family == 'radial' else (
             (
-                f'{azimuthal_base_view_name(view)}_tilted_azimuthal_composed_sink'
+                f'{azimuthal_base_view_name(view)}_tilted_azimuthal_native_destination_pull_sink'
                 if is_tilted_azimuthal_view(view)
-                else f'{azimuthal_base_view_name(view)}_azimuthal_sink_only'
+                else f'{azimuthal_base_view_name(view)}_azimuthal_native_destination_pull_sink'
             )
             if azimuthal_sink_only_projection_supported(view) else 'dense_projection'
         )),
     }
+    if projection_out_shape is not None:
+        incremental_extra_meta['projection_geometry_contract'] = 'xta.native_destination_pull/1'
+        incremental_extra_meta['projection_output_shape_tyx'] = list(projection_out_shape)
+        if is_tilted_view(view):
+            incremental_extra_meta['projection_payload_fusion'] = 'tilted_native_destination_pull'
     if view.family in ('radial', 'spherical') or azimuthal_sink_only_projection_supported(view):
         expected_shape = (
             tuple(int(v) for v in projection_out_shape)
@@ -661,6 +660,7 @@ def materialize_nrrd_view_layer(
             desc=f'NRRD layer {key}',
             workers=int(workers),
             extra_meta={
+                **incremental_extra_meta,
                 'nrrd_layer_key': key,
                 'source_raw_path': 'encoded_direct_from_view_volume' if projected_is_source else str(raw_path),
                 'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',

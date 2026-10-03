@@ -101,6 +101,8 @@ class SamMaskReader:
         self._active = False
         self._closed = False
         self._identity = object()
+        self._integrity_parent = None
+        self._children = set()
         self._stats = dict(max_cache_bytes=self.max_cache_bytes, cache_bytes=0, peak_cache_bytes=0,
             cache_hits=0, cache_misses=0, cache_evictions=0, oversized_products=0,
             mask_decodes=0, filter_computations=0, effective_candidate_computations=0,
@@ -126,10 +128,24 @@ class SamMaskReader:
     def __enter__(self):
         if self._active or self._closed:
             raise RuntimeError("SAM mask reader transactions cannot be reused or nested")
-        _assert_source_unchanged()
-        self.bundle.assert_unchanged()
-        self._stats["integrity_checks"] += 1
-        self._stream = (self.bundle.directory / "masks.bin").open("rb")
+        parent = self._integrity_parent
+        if parent is None:
+            _assert_source_unchanged()
+            self.bundle.assert_unchanged()
+            self._stats["integrity_checks"] += 1
+        else:
+            with parent._lock:
+                parent._require_active()
+                if self.bundle is not parent.bundle:
+                    raise RuntimeError("SAM reader lane changed its outer evidence transaction")
+                parent._children.add(self)
+        try:
+            self._stream = (self.bundle.directory / "masks.bin").open("rb")
+        except BaseException:
+            if parent is not None:
+                with parent._lock:
+                    parent._children.discard(self)
+            raise
         self._active = True
         return self
 
@@ -137,19 +153,54 @@ class SamMaskReader:
         with self._lock:
             if self._closed:
                 return
+            if self._children:
+                raise RuntimeError("SAM outer mask transaction still has active reader lanes")
             try:
                 if self._active:
-                    self.bundle.assert_unchanged()
-                    _assert_source_unchanged()
-                    self._stats["integrity_checks"] += 1
+                    if self._integrity_parent is None:
+                        self.bundle.assert_unchanged()
+                        _assert_source_unchanged()
+                        self._stats["integrity_checks"] += 1
+                    else:
+                        self._integrity_parent._require_active()
                     self._stats["transaction_complete"] = True
             finally:
                 if self._stream is not None:
                     self._stream.close()
+                    self._stream = None
                 self._cache.clear()
                 self._stats["cache_bytes"] = 0
                 self._active = False
                 self._closed = True
+                if self._integrity_parent is not None:
+                    with self._integrity_parent._lock:
+                        self._integrity_parent._children.discard(self)
+
+    def fork(self, *, max_cache_bytes):
+        """Borrow verified immutable metadata with a private cursor and cache.
+
+        The caller must charge every lane's cache/workspace and join all lanes
+        before outer exit. The outer transaction verifies the complete payload
+        before admission and after the joined reads; cached lane hits cannot
+        waive that final corruption check.
+        """
+        self._require_active()
+        child = SamMaskReader(self.bundle, max_cache_bytes=max_cache_bytes)
+        child._integrity_parent = self
+        return child
+
+    def borrowed_filter_snapshot(self, value):
+        """Rebind only an immutable snapshot issued by this lane's parent."""
+        self._require_active()
+        parent = self._integrity_parent
+        if (parent is None or not isinstance(value, _FilterSnapshot)
+                or value.owner is not parent._identity):
+            raise ValueError("SAM filter snapshot must belong to the active outer transaction")
+        parent._require_active()
+        snapshot = object.__new__(_FilterSnapshot)
+        object.__setattr__(snapshot, "owner", self._identity)
+        object.__setattr__(snapshot, "spec", value.spec)
+        return snapshot
 
     def __exit__(self, *exc):
         self.close()

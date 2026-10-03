@@ -15,26 +15,14 @@ import uuid
 import numpy as np
 
 from .reconciliation_io import ReferenceGeometry, write_seg_nrrd
-from .sam_evidence import SamEvidenceBundle
+from .sam_evidence import SamEvidenceBundle, evidence_frame_geometry, native_output_shape_tyx, selected_native_plane
 from .sam_policy import resolve_sam_bridge_policy, select_sam_proposals
 from .sam_mask_reader import effective_candidate_mask
 
 
 def _selected_plane(bundle, run_ids, frame, shape_yx, selection=None):
-    output = np.zeros(shape_yx, dtype=np.uint8)
-    for run_id in run_ids:
-        run = bundle.runs[run_id]
-        if str(frame) not in run['candidate_mask_keys']:
-            continue
-        group = bundle.groups[run['group_id']]
-        y0, x0, y1, x1 = map(int, group['context_bbox_yx'])
-        if not (0 <= y0 < y1 <= shape_yx[0] and 0 <= x0 < x1 <= shape_yx[1]):
-            raise ValueError('SAM replay crop lies outside its declared native canvas')
-        mask = effective_candidate_mask(bundle, run_id, frame, selection)
-        if mask.shape != (y1 - y0, x1 - x0):
-            raise ValueError('SAM replay mask differs from its declared crop')
-        output[y0:y1, x0:x1] |= mask
-    return output
+    receipt = {**(selection or {}), 'selected_run_ids': tuple(run_ids)}
+    return selected_native_plane(bundle, receipt, frame, shape_yx=shape_yx)
 
 
 def replay_sam_directional_nrrds(bundle, output, *, policy=None,
@@ -54,7 +42,7 @@ def replay_sam_directional_nrrds(bundle, output, *, policy=None,
     reader_cache_bytes = min(32 * 1024**2, max(0, budget_bytes // 8))
     if not isinstance(bundle, SamEvidenceBundle):
         bundle = SamEvidenceBundle.open(bundle, max_mask_bytes=max(1, budget_bytes // 4))
-    shape = tuple(bundle.scope.get('shape_tyx', ()))
+    shape = native_output_shape_tyx(bundle)
     if (len(shape) != 3 or any(isinstance(v, bool) or not isinstance(v, int) or v <= 0 for v in shape)):
         raise ValueError('Directional SAM replay requires its recorded shape_tyx')
     shape = tuple(map(int, shape))
@@ -72,8 +60,9 @@ def replay_sam_directional_nrrds(bundle, output, *, policy=None,
         if not (0 <= y0 < y1 <= shape[1] and 0 <= x0 < x1 <= shape[2]):
             raise ValueError('SAM replay crop lies outside its declared native canvas')
         frames = tuple(group['frame_indices'])
+        frame_limit = evidence_frame_geometry(bundle)['evidence_shape_tyx'][0]
         if any(isinstance(frame, bool) or not isinstance(frame, int)
-               or not 0 <= frame < shape[0] for frame in frames):
+               or not 0 <= frame < frame_limit for frame in frames):
             raise ValueError('SAM replay frame lies outside its declared native canvas')
         topology_bytes = len(frames) * (y1 - y0) * (x1 - x0) * 16
         if topology_bytes > min(budget_bytes, policy_group_bytes):
@@ -120,12 +109,16 @@ def replay_sam_directional_nrrds(bundle, output, *, policy=None,
                         interpolation_policy_identity=selection['policy_hash']))
         manifest = dict(schema='xta.sam_directional_replay/1', complete=True,
             coordinate_space='view_native', source_grid_projected=False,
-            direction_semantics='increasing/decreasing view-native frame index',
+            direction_semantics=('increasing/decreasing unfolded view-native frame index, folded modulo the saved period'
+                if evidence_frame_geometry(bundle)['cyclic'] else 'increasing/decreasing view-native frame index'),
             shape_tyx=list(shape), spacing_zyx=list(spacing),
             evidence_fingerprint=bundle.evidence_fingerprint,
             scope=json.loads(json.dumps(dict(bundle.scope), default=_json_value)),
             selection=selection, layers=layers,
             mask_reader=dict(reader.stats),
+            evidence_coordinate_space=('unfolded_cyclic_view_crop' if evidence_frame_geometry(bundle)['cyclic'] else 'view_native_crop'),
+            cyclic_aliases_folded=bool(evidence_frame_geometry(bundle)['cyclic']),
+            cyclic_implementation_sha256=evidence_frame_geometry(bundle).get('cyclic_implementation_sha256'),
             limitation='Fixed proposals only; changed upstream tile support requires regeneration.')
         (staging / 'manifest.json').write_text(json.dumps(manifest, indent=2, sort_keys=True,
             allow_nan=False), encoding='utf-8')

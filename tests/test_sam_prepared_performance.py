@@ -50,13 +50,14 @@ def test_exhausted_pass_does_not_scan_original_masks(monkeypatch):
     assert prepared.plan.status == 'exhausted'
 
 
-def test_overlong_requested_tracker_session_fails_during_preparation():
+def test_tta_interval_longer_than_lta_partition_retains_all_requested_frames():
     source = np.zeros((36, 25, 29), np.uint8)
     source[0, 9:15, 10:16] = 1
     source[35, 9:15, 10:16] = 1
-    with pytest.raises(SamInterpolationInfrastructureError, match='at most 30 frames'):
-        prepare_sam_interpolation_pass(source, gap_distance=35, min_radius=0,
-                                      interpolation_walk_back=0)
+    prepared = prepare_sam_interpolation_pass(source, gap_distance=35, min_radius=0,
+                                             interpolation_walk_back=0)
+    assert prepared.needs_tracking
+    assert all(len(run.expected_frames) == 36 for run in prepared.runs)
 
 
 def test_declared_topology_budget_fails_before_image_or_tracker_admission():

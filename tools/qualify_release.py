@@ -100,20 +100,8 @@ def _verify_cuda_tests(junit: Path) -> None:
             raise RuntimeError(f'Required CUDA numerical tests did not all run successfully: {prefix}')
 
 
-def qualify(output: Path, *, snapshot: bool, gpu_lock_timeout: float,
-            cpu_only: bool = False) -> dict[str, object]:
-    output = output.resolve()
-    if output == ROOT or output.is_relative_to(ROOT):
-        raise ValueError('Qualification artifacts must be outside the repository')
-    before = source_identity()
-    if before['status'] and not snapshot:
-        raise ValueError('Release qualification requires a clean checkout; use --snapshot for development')
-    if cpu_only and not snapshot:
-        raise ValueError('Reduced CPU-only qualification is allowed only with --snapshot')
-    output.mkdir(parents=True, exist_ok=True)
-    receipt_path = output / 'qualification.json'
-    if receipt_path.exists():
-        raise FileExistsError(f'Use a new output directory; qualification already exists: {receipt_path}')
+def _qualification_environment(output: Path, *, cpu_only: bool) -> dict[str, str]:
+    """Construct the subprocess environment before any CUDA runtime imports."""
     env = os.environ.copy()
     env.pop('PYTHONOPTIMIZE', None)
     generated_dirs = {
@@ -133,11 +121,32 @@ def qualify(output: Path, *, snapshot: bool, gpu_lock_timeout: float,
                CUDA_CACHE_PATH=str(generated_dirs['cuda-cache']))
     Path(env['YOLO_CONFIG_DIR']).mkdir(parents=True, exist_ok=True)
     if cpu_only:
-        env['CUDA_VISIBLE_DEVICES'] = ''
+        # An empty string can leave the device visible on Windows. The explicit
+        # invalid ordinal hides all devices in CUDA and PyTorch subprocesses.
+        env['CUDA_VISIBLE_DEVICES'] = '-1'
     scratch = ROOT.parent / 'Scratch'
     workspace_tools = scratch / 'Environment' / 'tools'
     if workspace_tools.is_dir():
         env['PATH'] = str(workspace_tools) + os.pathsep + env.get('PATH', '')
+    return env
+
+
+def qualify(output: Path, *, snapshot: bool, gpu_lock_timeout: float,
+            cpu_only: bool = False) -> dict[str, object]:
+    output = output.resolve()
+    if output == ROOT or output.is_relative_to(ROOT):
+        raise ValueError('Qualification artifacts must be outside the repository')
+    before = source_identity()
+    if before['status'] and not snapshot:
+        raise ValueError('Release qualification requires a clean checkout; use --snapshot for development')
+    if cpu_only and not snapshot:
+        raise ValueError('Reduced CPU-only qualification is allowed only with --snapshot')
+    output.mkdir(parents=True, exist_ok=True)
+    receipt_path = output / 'qualification.json'
+    if receipt_path.exists():
+        raise FileExistsError(f'Use a new output directory; qualification already exists: {receipt_path}')
+    env = _qualification_environment(output, cpu_only=cpu_only)
+    scratch = ROOT.parent / 'Scratch'
     steps = [
         ('full-tests', [sys.executable, '-B', '-m', 'pytest', '-p', 'no:cacheprovider',
                         '--maxfail=1',

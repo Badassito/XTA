@@ -35,6 +35,13 @@ def _evidence(root, view, source_shape, values):
 
 
 def test_real_conversion_cold_warm_and_distinct_geometries_fit_three_mib(tmp_path):
+    # JIT compiler/code-cache initialization is process-wide control memory,
+    # as for the existing Radial/Spherical Numba backends. Warm only tiny
+    # uint8 kernel signatures; every measured large geometry below stays cold.
+    import os
+    if os.environ.get('YOLO_TTA_NATIVE_PULL_BACKEND', 'compiled') == 'compiled':
+        from XTA.projection_coverage_cpu import warm_native_pull_kernels
+        warm_native_pull_kernels()
     cache = backprojection._DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE
     original = cache.copy()
     cache.clear()
@@ -122,9 +129,10 @@ def test_projection_minimum_rejection_precedes_native_staging(tmp_path):
     assert not (tmp_path/'work').exists()
 
 
-def test_projection_exception_retires_temporary_maps(tmp_path, monkeypatch, gc_disabled):
+@pytest.mark.parametrize('backend', ('numpy', 'compiled'))
+def test_projection_exception_retires_temporary_maps(tmp_path, monkeypatch, gc_disabled, backend):
     assert not gc.isenabled()
-    from XTA import confidence_projection
+    from XTA import projection_coverage, projection_coverage_cpu
     shape = (5, 7, 9)
     view = geometry.get_view_infos(*shape, cartesian_views=(),
         tilt_groups=(TiltedViewGroup(('transverse',), (23.,), ('vertical',)),))[0]
@@ -132,10 +140,14 @@ def test_projection_exception_retires_temporary_maps(tmp_path, monkeypatch, gc_d
     reference = _evidence(tmp_path/'evidence', view, shape, values)
     def fail(*args, **kwargs):
         raise OSError('injected strip failure')
-    monkeypatch.setattr(confidence_projection, '_scatter_score_strip', fail)
+    monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_BACKEND', backend)
+    if backend == 'compiled':
+        monkeypatch.setattr(projection_coverage_cpu, 'pull_native_flat_into', fail)
+    else:
+        monkeypatch.setattr(projection_coverage, 'iter_destination_samples', fail)
     with pytest.raises(OSError, match='injected strip failure'):
-        with reference.source_reader(tmp_path/'work', memory_mib=4, max_staging_mib=5):
-            pass
+        with reference.source_reader(tmp_path/'work', memory_mib=4, max_staging_mib=5) as reader:
+            reader(0, 1)
     # Projector traceback frames retain the source map until this cycle is collected.
     gc.collect()
     from XTA.runtime import wait_for_retired_memmap_directory_cleanup

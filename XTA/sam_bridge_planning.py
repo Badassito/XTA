@@ -9,8 +9,12 @@ slice-local component IDs describe endpoints (including same-label daughters).
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from contextlib import contextmanager
 import hashlib
 import math
+import threading
+import traceback
+import weakref
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
@@ -19,6 +23,8 @@ from scipy import ndimage as ndi
 
 
 BBoxYX = tuple[int, int, int, int]  # y0, x0, y1, x1; upper bounds exclusive
+SAM_CROP_PLANNING_CONTRACT_VERSION = "xta.sam_fixed_family_swept_context/2"
+SAM_CONTRACT_STORAGE_VERSION = "xta.sam_family_contract_leases/1"
 
 
 def _readonly(mask: np.ndarray) -> np.ndarray:
@@ -41,7 +47,8 @@ class SamPlanningLimits:
     max_observations_per_group: int = 512
     max_edges_per_group: int = 128
     max_proposed_edges: int = 100_000
-    max_frames_per_group: int = 128
+    max_frame_address_records: int = 100_000
+    max_frames_per_group: int | None = None
     max_crop_pixels: int = 4_194_304
     max_group_bytes: int = 256 * 1024 * 1024
     max_total_contract_bytes: int = 512 * 1024 * 1024
@@ -51,6 +58,8 @@ class SamPlanningLimits:
 
     def __post_init__(self) -> None:
         for key, value in vars(self).items():
+            if key == "max_frames_per_group" and value is None:
+                continue
             if int(value) < (0 if key.endswith("margin_px") else 1):
                 raise ValueError(f"{key} has an invalid planning bound")
 
@@ -65,6 +74,9 @@ class SamObservation:
     mask_crop: np.ndarray = field(compare=False, repr=False)
     lineage: Mapping[str, Any] = field(default_factory=dict, compare=False)
     identity_limitation: str = "slice_connected_components_not_detector_instances"
+    original_observation_id: str = ""
+    native_frame_index: int | None = None
+    mirror_u: bool = False
 
     @property
     def area(self) -> int:
@@ -114,6 +126,20 @@ class SamBridgeGroup:
     endpoint_ids: tuple[str, ...] = ()
     branch_permitted_masks: Mapping[str, np.ndarray] = field(default_factory=dict, compare=False, repr=False)
     edge_contract_masks: Mapping[str, np.ndarray] = field(default_factory=dict, compare=False, repr=False)
+    crop_contract: Mapping[str, Any] = field(default_factory=dict, compare=False)
+    frame_addresses: Mapping[int, Mapping[str, object]] = field(default_factory=dict, compare=False)
+    frame_addressing: Mapping[str, Any] = field(default_factory=dict, compare=False)
+    native_shape_tyx: tuple[int, int, int] = ()
+    contract_recipe: Any = field(default=None, compare=False, repr=False)
+
+    @contextmanager
+    def materialize_contracts(self):
+        """Borrow this family's exact immutable arrays under its resident lease."""
+        if self.contract_recipe is None:
+            yield self
+        else:
+            with self.contract_recipe.materialize() as materialized:
+                yield materialized
 
     @property
     def frame_start(self) -> int:
@@ -160,6 +186,13 @@ class SamBridgePlan:
     reasons: tuple[str, ...] = ()
     inventory_fingerprint: str = ""
     planning_fingerprint: str = ""
+    crop_contract_version: str = SAM_CROP_PLANNING_CONTRACT_VERSION
+    virtual_shape_tyx: tuple[int, int, int] = ()
+    native_shape_tyx: tuple[int, int, int] = ()
+    frame_addresses: Mapping[int, Mapping[str, object]] = field(default_factory=dict, compare=False)
+    frame_addressing: Mapping[str, Any] = field(default_factory=dict, compare=False)
+    contract_storage_version: str = "eager"
+    contract_lease_budget: Any = field(default=None, compare=False, repr=False)
 
     @property
     def by_id(self) -> Mapping[str, SamObservation]:
@@ -233,12 +266,30 @@ def _observations(volume: object, *, scope: str, labels: object | None,
                 crop = _readonly(local[slices] == local_index)
                 digest = hashlib.sha256(np.packbits(crop).tobytes()).hexdigest()
                 identifier = _identity("sam_obs", scope, frame, bbox, digest, int(value))
+                original_identifier, native_frame, mirror_u = identifier, frame, False
                 roots = dict(lineage or {})
                 roots.setdefault("observation_source", "detector")
                 roots.setdefault("scope_id", scope)
+                address_metadata = getattr(volume, "frame_addressing", None)
+                if address_metadata:
+                    address = volume.frame_addresses[frame]
+                    native_frame, mirror_u = int(address["native_index"]), bool(address["mirror_u"])
+                    original_bbox, original_mask = bbox, crop
+                    if mirror_u:
+                        from .sam_cyclic import mirror_bbox_yx
+                        original_bbox = mirror_bbox_yx(bbox, shape[2])
+                        original_mask = crop[:, ::-1]
+                    original_digest = hashlib.sha256(np.packbits(original_mask).tobytes()).hexdigest()
+                    original_identifier = _identity("sam_obs", scope, native_frame, original_bbox, original_digest, int(value))
+                    identifier = (original_identifier if int(address["cycle_index"]) == 0 else
+                                  _identity("sam_obs_alias", original_identifier, frame, address_metadata["schema"], mirror_u))
+                    roots.update(original_observation_id=original_identifier, native_frame_index=native_frame,
+                                 unfolded_frame_index=frame, cycle_index=int(address["cycle_index"]), mirror_u=mirror_u)
                 frame_items.append(len(result))
                 result.append(SamObservation(identifier, frame, int(value), component_index,
-                                             bbox, crop, MappingProxyType(roots)))
+                                             bbox, crop, MappingProxyType(roots),
+                                             original_observation_id=original_identifier,
+                                             native_frame_index=native_frame, mirror_u=mirror_u))
         by_frame[frame] = frame_items
     return result, by_frame, None
 
@@ -334,29 +385,307 @@ def _cone_candidates(source: SamObservation, targets: Sequence[int],
 
 
 def _paint_shifted(destination: np.ndarray, observation: SamObservation,
-                   crop: BBoxYX, shift_y: float, shift_x: float) -> None:
+                   crop: BBoxYX, shift_y: float, shift_x: float, *,
+                   raster_origin_yx: tuple[int, int] | None = None) -> None:
     ys, xs = np.nonzero(observation.mask_crop)
-    iy = np.rint(ys + observation.bbox_yx[0] + shift_y - crop[0]).astype(np.int64)
-    ix = np.rint(xs + observation.bbox_yx[1] + shift_x - crop[1]).astype(np.int64)
+    origin_y, origin_x = crop[:2] if raster_origin_yx is None else raster_origin_yx
+    # Preserve the original crop-relative ties-to-even lattice. Rounding after
+    # subtracting a changed crop origin can move a half-pixel by one native pixel.
+    iy = (np.rint(ys + observation.bbox_yx[0] + shift_y - origin_y).astype(np.int64)
+          + int(origin_y) - crop[0])
+    ix = (np.rint(xs + observation.bbox_yx[1] + shift_x - origin_x).astype(np.int64)
+          + int(origin_x) - crop[1])
     inside = (iy >= 0) & (iy < destination.shape[0]) & (ix >= 0) & (ix < destination.shape[1])
     destination[iy[inside], ix[inside]] = True
 
 
 def _corridor(a: SamObservation, b: SamObservation, frame: int,
-              crop: BBoxYX, margin: int) -> np.ndarray:
+              crop: BBoxYX, margin: int, *,
+              raster_origin_yx: tuple[int, int] | None = None) -> np.ndarray:
     output = np.zeros((crop[2] - crop[0], crop[3] - crop[1]), dtype=bool)
     alpha = (frame - a.frame_index) / (b.frame_index - a.frame_index)
     ay, ax = a.anchor_yx
     by, bx = b.anchor_yx
-    _paint_shifted(output, a, crop, alpha * (by - ay), alpha * (bx - ax))
-    _paint_shifted(output, b, crop, (1 - alpha) * (ay - by), (1 - alpha) * (ax - bx))
+    _paint_shifted(output, a, crop, alpha * (by - ay), alpha * (bx - ax),
+                   raster_origin_yx=raster_origin_yx)
+    _paint_shifted(output, b, crop, (1 - alpha) * (ay - by), (1 - alpha) * (ax - bx),
+                   raster_origin_yx=raster_origin_yx)
     if margin:
         output = ndi.binary_dilation(output, iterations=margin)
     return output
 
 
+def _swept_endpoint_bbox(a: SamObservation, b: SamObservation,
+                         raster_origin_yx: tuple[int, int], *,
+                         anchors_yx: tuple[tuple[float, float], tuple[float, float]] | None = None) -> BBoxYX:
+    """Exact full silhouette sweep bounds without rendering a tracking frame.
+
+    Both endpoint silhouettes move linearly between the two observed anchors.
+    Rounding is monotone on each axis, so extrema occur at the two extreme shifts.
+    The fixed legacy origin makes these bounds use the same lattice as painting.
+    """
+    anchor_a, anchor_b = (a.anchor_yx, b.anchor_yx) if anchors_yx is None else anchors_yx
+    delta = tuple(anchor_b[axis] - anchor_a[axis] for axis in (0, 1))
+    lows: list[int] = []
+    highs: list[int] = []
+    for axis in (0, 1):
+        origin = int(raster_origin_yx[axis])
+        axis_lows: list[int] = []
+        axis_highs: list[int] = []
+        for observation, shift in ((a, delta[axis]), (b, -delta[axis])):
+            low = observation.bbox_yx[axis]
+            high_pixel = observation.bbox_yx[axis + 2] - 1
+            axis_lows.append(origin + int(np.rint(low + min(0.0, shift) - origin)))
+            axis_highs.append(origin + int(np.rint(high_pixel + max(0.0, shift) - origin)) + 1)
+        lows.append(min(axis_lows))
+        highs.append(max(axis_highs))
+    return (lows[0], lows[1], highs[0], highs[1])
+
+
+def _swept_family_bbox(observations: Sequence[SamObservation], endpoints: set[int],
+                       graph: Mapping[int, set[int]], observed_bbox: BBoxYX,
+                       raster_origin_yx: tuple[int, int]) -> BBoxYX:
+    """Bound a family in O(total endpoint pixels + inventoried edges)."""
+    y0, x0, y1, x1 = observed_bbox
+    anchors: dict[int, tuple[float, float]] = {}
+
+    def anchor(index: int) -> tuple[float, float]:
+        if index not in anchors:
+            anchors[index] = observations[index].anchor_yx
+        return anchors[index]
+
+    for source in sorted(endpoints):
+        for target in graph.get(source, ()):
+            if target not in endpoints or source > target:
+                continue
+            sweep = _swept_endpoint_bbox(observations[source], observations[target], raster_origin_yx,
+                                        anchors_yx=(anchor(source), anchor(target)))
+            y0, x0 = min(y0, sweep[0]), min(x0, sweep[1])
+            y1, x1 = max(y1, sweep[2]), max(x1, sweep[3])
+    return y0, x0, y1, x1
+
+
 def _empty_contracts() -> np.ndarray:
     return _readonly(np.empty((0, 0, 0), dtype=bool))
+
+
+class _ContractLeaseBudget:
+    """Nonblocking peak admission; borrowed ndarray owners stay charged."""
+    def __init__(self, maximum_bytes):
+        self.maximum_bytes = int(maximum_bytes)
+        self.live_bytes = self.peak_bytes = self.active_leases = 0
+        self._resource_profile = None
+        self._lock = threading.Lock()
+
+    def acquire(self, peak_bytes):
+        peak = int(peak_bytes)
+        if self._resource_profile is not None:
+            from .sam_resources import validate_live_sam_resource_profile
+            validate_live_sam_resource_profile(self._resource_profile)
+        with self._lock:
+            if peak > self.maximum_bytes or self.live_bytes + peak > self.maximum_bytes:
+                raise MemoryError(f"SAM family contract resident lease requires {peak} bytes with "
+                                  f"{self.live_bytes} live; admitted budget is {self.maximum_bytes}")
+            self.live_bytes += peak
+            self.peak_bytes = max(self.peak_bytes, self.live_bytes)
+            self.active_leases += 1
+        return _ContractLeaseTicket(self, peak)
+
+    def bind_live_resource_profile(self, profile):
+        from .sam_resources import validate_live_sam_resource_profile
+        assigned = validate_live_sam_resource_profile(profile)
+        if self.maximum_bytes > int(assigned["assigned_live_contract_bytes"]):
+            raise MemoryError("SAM contract lease budget exceeds its owned parent memory credit")
+        with self._lock:
+            if self.active_leases:
+                raise RuntimeError("Cannot rebind a SAM contract budget while borrowed arrays remain live")
+            self._resource_profile = profile
+
+    def snapshot(self):
+        with self._lock:
+            return dict(maximum_bytes=self.maximum_bytes, live_bytes=self.live_bytes,
+                        peak_bytes=self.peak_bytes, active_leases=self.active_leases)
+
+
+class _ContractLeaseTicket:
+    def __init__(self, budget, charged):
+        self.budget, self.charged, self.active = budget, int(charged), True
+
+    def abort(self):
+        with self.budget._lock:
+            if self.active:
+                self.budget.live_bytes -= self.charged
+                self.budget.active_leases -= 1
+                self.charged, self.active = 0, False
+
+    def bind(self, group):
+        arrays = [group.acceptance_masks, group.write_masks, group.known_foreground_masks, group.unrelated_masks]
+        for mapping in (group.branch_evaluation_masks, group.branch_permitted_masks,
+                        group.edge_write_masks, group.edge_contract_masks):
+            arrays.extend(mapping.values())
+        owners = {}
+        for array in arrays:
+            owner = array
+            while isinstance(owner.base, np.ndarray):
+                owner = owner.base
+            if owner.nbytes:
+                owners[id(owner)] = owner
+        retained = sum(owner.nbytes for owner in owners.values())
+        if retained > self.charged:
+            raise MemoryError("SAM family retained contracts exceed their conservative construction charge")
+        with self.budget._lock:
+            self.budget.live_bytes -= self.charged - retained
+            self.charged = retained
+        for owner in owners.values():
+            # A retained slice keeps its underlying ndarray alive; charging the
+            # owner therefore survives callers retaining views after `with`.
+            weakref.finalize(owner, self._owner_released, int(owner.nbytes))
+        if not retained:
+            self.abort()
+
+    def _owner_released(self, count):
+        with self.budget._lock:
+            if self.active:
+                self.charged -= int(count)
+                self.budget.live_bytes -= int(count)
+                if self.charged == 0:
+                    self.active = False
+                    self.budget.active_leases -= 1
+
+
+@dataclass(frozen=True)
+class _SamGroupContractRecipe:
+    descriptor: SamBridgeGroup
+    observations: tuple[SamObservation, ...] = field(repr=False)
+    by_frame: Mapping[int, tuple[int, ...]] = field(repr=False)
+    family: frozenset[int]
+    endpoints: frozenset[int]
+    graph: Mapping[int, frozenset[int]] = field(repr=False)
+    pairs: tuple[tuple[int, int, int], ...]
+    bounds: SamPlanningLimits
+    lease_budget: _ContractLeaseBudget = field(repr=False, compare=False)
+
+    @contextmanager
+    def materialize(self):
+        ticket = self.lease_budget.acquire(self.descriptor.crop_contract["charged_contract_bytes"])
+        materialized = None
+        try:
+            materialized = _materialize_contract_group(self)
+            ticket.bind(materialized)
+        except BaseException as error:
+            # A failed construction's traceback must not retain uncharged
+            # scratch arrays after its parent cancels or handles the error.
+            materialized = None
+            traceback.clear_frames(error.__traceback__)
+            ticket.abort()
+            raise
+        try:
+            yield materialized
+        finally:
+            # Byte credit follows ndarray owners, rather than trusting the
+            # context boundary to destroy arrays borrowed by another consumer.
+            del materialized
+
+
+def _materialize_contract_group(recipe: _SamGroupContractRecipe) -> SamBridgeGroup:
+    descriptor = recipe.descriptor
+    observations, by_frame = recipe.observations, recipe.by_frame
+    family, endpoints, graph, pairs, bounds = recipe.family, recipe.endpoints, recipe.graph, recipe.pairs, recipe.bounds
+    frames, crop = descriptor.frame_indices, descriptor.context_bbox_yx
+    lo = frames[0]
+    group_id, observation_ids, edge_records = descriptor.group_id, descriptor.observation_ids, descriptor.edges
+    crop_contract = descriptor.crop_contract
+    raster_origin = tuple(crop_contract['legacy_raster_origin_yx'])
+    interpolation_min_radius, spacing = descriptor.interpolation_min_radius, descriptor.spacing_zyx
+    group_addresses, group_addressing, native_shape = descriptor.frame_addresses, descriptor.frame_addressing, descriptor.native_shape_tyx
+    contract_shape = (len(frames), crop[2] - crop[0], crop[3] - crop[1])
+    acceptance = np.zeros(contract_shape, dtype=bool)
+    known = np.zeros(contract_shape, dtype=bool)
+    original = np.zeros(contract_shape, dtype=bool)
+    family_ids = set(family)
+    for frame in frames:
+        for item in by_frame.get(frame, ()):
+            record = observations[item]
+            if not _intersects(record.bbox_yx, crop):
+                continue
+            # Other components may extend beyond the crop, so paste an intersection.
+            oy0, ox0, oy1, ox1 = record.bbox_yx
+            cy0, cx0 = max(oy0, crop[0]), max(ox0, crop[1])
+            cy1, cx1 = min(oy1, crop[2]), min(ox1, crop[3])
+            target = original[frame - lo, cy0 - crop[0]:cy1 - crop[0], cx0 - crop[1]:cx1 - crop[1]]
+            target |= record.mask_crop[cy0 - oy0:cy1 - oy0, cx0 - ox0:cx1 - ox0]
+            if item in family_ids:
+                known[frame - lo] |= record.mask_in_crop(crop)
+    # Acceptance includes all inventoried candidate corridors and known sibling
+    # continuations. Write contracts contain only requested missing branches.
+    for source in sorted(endpoints):
+        for target in graph.get(source, ()):
+            if target not in endpoints or source > target:
+                continue
+            a, b = sorted((observations[source], observations[target]), key=lambda item: item.frame_index)
+            for frame in range(a.frame_index, b.frame_index + 1):
+                acceptance[frame - lo] |= _corridor(a, b, frame, crop,
+                                                   bounds.curvature_margin_px + bounds.acceptance_margin_px,
+                                                   raster_origin_yx=raster_origin)
+    for offset in range(len(frames)):
+        acceptance[offset] |= (ndi.binary_dilation(known[offset], iterations=bounds.acceptance_margin_px)
+                               if bounds.acceptance_margin_px else known[offset])
+    writes = np.zeros(contract_shape, dtype=bool)
+    per_edge: dict[str, np.ndarray] = {}
+    edge_contracts: dict[str, np.ndarray] = {}
+    evaluations: dict[str, np.ndarray] = {}
+    permitted: dict[str, np.ndarray] = {}
+    for (a_index, b_index, _), edge in zip(sorted(pairs), edge_records):
+        a, b = observations[a_index], observations[b_index]
+        branch = np.zeros(contract_shape, dtype=bool)
+        for frame in range(a.frame_index, b.frame_index + 1):
+            branch[frame - lo] = _corridor(a, b, frame, crop, bounds.curvature_margin_px,
+                                          raster_origin_yx=raster_origin)
+        edge_contracts[edge.edge_id] = _readonly(branch)
+        branch[a.frame_index - lo] = False
+        branch[b.frame_index - lo] = False
+        branch &= ~original
+        writes |= branch
+        per_edge[edge.edge_id] = _readonly(branch)
+    for endpoint in sorted(endpoints):
+        record = observations[endpoint]
+        region = ndi.binary_dilation(record.mask_in_crop(crop),
+                                      iterations=max(1, bounds.curvature_margin_px + bounds.acceptance_margin_px))
+        # Assign nearby sibling support to its own evaluation region. This
+        # spatial partition is predeclared, never derived from a predicted mask.
+        competitors = [observations[item] for item in endpoints if item != endpoint
+                       and observations[item].frame_index == record.frame_index]
+        if competitors:
+            own_distance = ndi.distance_transform_edt(~record.mask_in_crop(crop), sampling=spacing[1:])
+            for sibling in competitors:
+                sibling_distance = ndi.distance_transform_edt(~sibling.mask_in_crop(crop), sampling=spacing[1:])
+                region &= own_distance <= sibling_distance
+        evaluations[record.observation_id] = _readonly(region)
+        other_branches = np.zeros(region.shape, dtype=bool)
+        for source in sorted(endpoints):
+            for target in graph.get(source, ()):
+                if target not in endpoints or source > target or endpoint in (source, target):
+                    continue
+                a, b = sorted((observations[source], observations[target]), key=lambda item: item.frame_index)
+                if a.frame_index <= record.frame_index <= b.frame_index:
+                    other_branches |= _corridor(a, b, record.frame_index, crop,
+                                                bounds.curvature_margin_px + bounds.acceptance_margin_px,
+                                                raster_origin_yx=raster_origin)
+        for item in family:
+            sibling = observations[item]
+            if item != endpoint and sibling.frame_index == record.frame_index:
+                other_branches |= ndi.binary_dilation(sibling.mask_in_crop(crop),
+                                                       iterations=max(1, bounds.acceptance_margin_px))
+        other_branches &= ~record.mask_in_crop(crop)
+        permitted[record.observation_id] = _readonly(other_branches)
+    group = SamBridgeGroup(group_id, observation_ids, edge_records, crop, frames,
+                           _readonly(acceptance), _readonly(writes), MappingProxyType(evaluations),
+                           MappingProxyType(per_edge), _readonly(known), _readonly(original & ~known),
+                           "planned", (), interpolation_min_radius, spacing,
+                           tuple(observations[item].observation_id for item in sorted(endpoints)),
+                           MappingProxyType(permitted), MappingProxyType(edge_contracts), crop_contract,
+                           group_addresses, group_addressing, native_shape)
+    return group
 
 
 def plan_sam_bridges(
@@ -369,6 +698,8 @@ def plan_sam_bridges(
     observation_lineage: Mapping[str, Any] | None = None,
     limits: SamPlanningLimits | None = None,
     planning_pass_index: int = 1,
+    wrap_axis: bool = False,
+    lazy_contracts: bool = False,
 ) -> SamBridgePlan:
     """Plan fixed family crops and independently detector-seeded tracker runs.
 
@@ -410,6 +741,22 @@ def plan_sam_bridges(
     if shape[1] * shape[2] > bounds.max_slice_pixels:
         return SamBridgePlan((), (), (), interpolation_passes, 0, interpolation_passes,
                              "unresolved", ("observation_slice_pixel_limit",))
+    native_shape = shape
+    candidate_distance = int(interpolation_distance)
+    frame_addressing: Mapping[str, Any] = MappingProxyType({})
+    frame_addresses: Mapping[int, Mapping[str, object]] = MappingProxyType({})
+    cyclic_implementation_sha256 = ""
+    if wrap_axis:
+        from .sam_cyclic import CyclicObservationVolume, IMPLEMENTATION_SHA256
+        cyclic_implementation_sha256 = IMPLEMENTATION_SHA256
+        candidate_distance = min(int(interpolation_distance), max(0, shape[0] - 1))
+        aliases = min(int(interpolation_distance) + int(interpolation_walk_back), max(0, shape[0] - 1))
+        observed_volume = CyclicObservationVolume(observed_volume, aliases)
+        if canonical_labels is not None:
+            canonical_labels = CyclicObservationVolume(canonical_labels, aliases)
+        shape = tuple(observed_volume.shape)
+        frame_addressing = observed_volume.frame_addressing
+        frame_addresses = observed_volume.frame_addresses
     observations, by_frame, truncated = _observations(
         observed_volume, scope=scope_id, labels=canonical_labels,
         lineage=observation_lineage, limits=bounds)
@@ -430,9 +777,13 @@ def plan_sam_bridges(
     fingerprint = _identity("sam_input", scope_id, shape,
                             tuple(item.observation_id for item in observations),
                             repr(dict(observation_lineage or {})))
-    planning_fingerprint = _identity("sam_planning", fingerprint, interpolation_distance,
+    planning_fingerprint = _identity("sam_planning", SAM_CROP_PLANNING_CONTRACT_VERSION,
+                                     fingerprint, interpolation_distance,
                                      interpolation_candidates, interpolation_walk_back,
-                                     interpolation_search_angle, spacing, tuple(vars(bounds).items()))
+                                     interpolation_search_angle, spacing, tuple(vars(bounds).items()),
+                                     frame_addressing.get("schema", ""), native_shape,
+                                     frame_addressing.get("alias_frames", 0), cyclic_implementation_sha256,
+                                     SAM_CONTRACT_STORAGE_VERSION if lazy_contracts else "eager")
     # Required edges use the bounded nearest-candidate flag. Family inventory also
     # retains other compatible endpoints, so legitimate sibling support is measured
     # against a complete declared local family rather than an SDF candidate list.
@@ -450,7 +801,7 @@ def plan_sam_bridges(
                 continue
             possible: list[int] = []
             available = shape[0] - 1 - source.frame_index if direction > 0 else source.frame_index
-            search_distance = min(interpolation_distance, available)
+            search_distance = min(candidate_distance, available)
             for steps in range(2, search_distance + 1):
                 frame = source.frame_index + direction * steps
                 possible.extend(target for target in by_frame.get(frame, ()) if not opposite[target])
@@ -460,6 +811,14 @@ def plan_sam_bridges(
                 search_failures[index] = error
                 continue
             if found:
+                if wrap_axis:
+                    # Alias-only jobs duplicate a repair wholly inside the first
+                    # native frames. Only primary/primary or primary/alias edges
+                    # can establish an original missing connection.
+                    found = [target for target in found if source.frame_index < native_shape[0]
+                             or observations[target].frame_index < native_shape[0]]
+                    if not found:
+                        continue
                 proposed_count += len(found)
                 if proposed_count > bounds.max_proposed_edges:
                     return SamBridgePlan(tuple(observations), (), (), interpolation_passes, 0,
@@ -508,7 +867,12 @@ def plan_sam_bridges(
             members.append(index)
     groups: list[SamBridgeGroup] = []
     runs: list[SamBridgeRunPlan] = []
+    immutable_observations = tuple(observations)
+    immutable_by_frame = MappingProxyType({frame: tuple(indexes) for frame, indexes in by_frame.items()})
+    immutable_graph = MappingProxyType({index: frozenset(neighbors) for index, neighbors in graph.items()})
+    contract_lease_budget = _ContractLeaseBudget(bounds.max_total_contract_bytes)
     total_bytes = 0
+    stored_address_records = 0
     for first, members in sorted(families.items()):
         family = set(members)
         endpoints = set(family)
@@ -576,24 +940,74 @@ def plan_sam_bridges(
                 reasons.append("family_observation_limit")
                 break
         frames = tuple(range(lo, hi + 1))
-        if len(frames) > bounds.max_frames_per_group:
+        if frame_addressing and stored_address_records + len(frames) > bounds.max_frame_address_records:
+            return SamBridgePlan(tuple(observations), tuple(groups), (), interpolation_passes, 0,
+                interpolation_passes, "unresolved", ("cyclic_frame_address_record_limit",),
+                fingerprint, planning_fingerprint, virtual_shape_tyx=shape, native_shape_tyx=native_shape,
+                frame_addresses=frame_addresses, frame_addressing=frame_addressing)
+        group_addresses = MappingProxyType({frame: frame_addresses[frame] for frame in frames}) if frame_addressing else MappingProxyType({})
+        group_addressing = MappingProxyType({**dict(frame_addressing), "addresses": group_addresses}) if frame_addressing else MappingProxyType({})
+        stored_address_records += len(group_addresses)
+        if bounds.max_frames_per_group is not None and len(frames) > bounds.max_frames_per_group:
             reasons.append("family_frame_limit")
         y0 = min(observations[item].bbox_yx[0] for item in family)
         x0 = min(observations[item].bbox_yx[1] for item in family)
         y1 = max(observations[item].bbox_yx[2] for item in family)
         x1 = max(observations[item].bbox_yx[3] for item in family)
+        observed_bbox = (y0, x0, y1, x1)
         margin = bounds.context_margin_px + bounds.curvature_margin_px + bounds.acceptance_margin_px
-        crop = (max(0, y0 - margin), max(0, x0 - margin),
-                min(shape[1], y1 + margin), min(shape[2], x1 + margin))
+        legacy_unclipped_crop = (y0 - margin, x0 - margin, y1 + margin, x1 + margin)
+        legacy_crop = (max(0, legacy_unclipped_crop[0]), max(0, legacy_unclipped_crop[1]),
+                       min(shape[1], legacy_unclipped_crop[2]), min(shape[2], legacy_unclipped_crop[3]))
+        raster_origin = legacy_crop[:2]
+        # Acceptance inventories may contain siblings beyond the requested edge
+        # cap. Bound every corridor actually used by that complete local inventory.
+        swept_bbox = _swept_family_bbox(observations, endpoints, graph, observed_bbox, raster_origin)
+        y0, x0, y1, x1 = swept_bbox
+        unclipped_crop = (y0 - margin, x0 - margin, y1 + margin, x1 + margin)
+        crop = (max(0, unclipped_crop[0]), max(0, unclipped_crop[1]),
+                min(shape[1], unclipped_crop[2]), min(shape[2], unclipped_crop[3]))
         pixels = (crop[2] - crop[0]) * (crop[3] - crop[1])
         if pixels > bounds.max_crop_pixels:
             reasons.append("context_crop_pixel_limit")
         # Charge retained Boolean masks plus one float64 distance/geometry workspace.
         charge = pixels * (2 * len(frames) * (5 + 2 * len(pairs)) + 4 * len(endpoints) + 16)
+        legacy_pixels = (legacy_crop[2] - legacy_crop[0]) * (legacy_crop[3] - legacy_crop[1])
+        clamped_sides = tuple(side for side, changed in (
+            ("top", unclipped_crop[0] < 0), ("left", unclipped_crop[1] < 0),
+            ("bottom", unclipped_crop[2] > shape[1]), ("right", unclipped_crop[3] > shape[2])) if changed)
+        crop_contract = MappingProxyType({
+            "schema": SAM_CROP_PLANNING_CONTRACT_VERSION,
+            "coordinate_order": "y0,x0,y1,x1",
+            "legacy_context_bbox_yx": legacy_crop,
+            "legacy_unclipped_context_bbox_yx": legacy_unclipped_crop,
+            "legacy_raster_origin_yx": raster_origin,
+            "observed_family_bbox_yx": observed_bbox,
+            "swept_silhouette_bbox_yx": swept_bbox,
+            "unclipped_context_bbox_yx": unclipped_crop,
+            "context_bbox_yx": crop,
+            "canvas_shape_yx": shape[1:],
+            "canvas_clamped_sides": clamped_sides,
+            "context_margin_px": bounds.context_margin_px,
+            "acceptance_margin_px": bounds.acceptance_margin_px,
+            "curvature_margin_px": bounds.curvature_margin_px,
+            "support_padding_px": bounds.curvature_margin_px + bounds.acceptance_margin_px,
+            "total_context_padding_px": margin,
+            "bounds_basis": "full_swept_original_endpoint_silhouettes_and_observed_continuations",
+            "rounding_rule": "numpy_rint_ties_to_even_relative_legacy_raster_origin",
+            "legacy_crop_pixels": legacy_pixels,
+            "crop_pixels": pixels,
+            "charged_contract_bytes": charge,
+            "legacy_charged_contract_bytes": legacy_pixels * (charge // pixels),
+            "contract_storage_version": SAM_CONTRACT_STORAGE_VERSION if lazy_contracts else "eager",
+            "contract_resident_budget_bytes": bounds.max_total_contract_bytes,
+        })
         if charge > bounds.max_group_bytes:
             reasons.append("group_contract_memory_limit")
-        if total_bytes + charge > bounds.max_total_contract_bytes:
+        if (charge if lazy_contracts else total_bytes + charge) > bounds.max_total_contract_bytes:
             reasons.append("total_contract_memory_limit")
+        if lazy_contracts and len(frames) * pixels * 16 > bounds.max_group_bytes:
+            reasons.append("topology_workspace_memory_limit")
         observation_ids = tuple(observations[item].observation_id for item in sorted(family))
         edge_records = tuple(SamBridgeEdge(_identity("sam_edge", scope_id, observations[a].observation_id,
                                                     observations[b].observation_id),
@@ -607,93 +1021,25 @@ def plan_sam_bridges(
                                           empty, empty, MappingProxyType({}), MappingProxyType({}),
                                           empty, empty, "unresolved", tuple(sorted(set(reasons or ["no_missing_connection"]))),
                                           interpolation_min_radius, spacing,
-                                          tuple(observations[item].observation_id for item in sorted(endpoints))))
+                                          tuple(observations[item].observation_id for item in sorted(endpoints)),
+                                          crop_contract=crop_contract, frame_addresses=group_addresses,
+                                          frame_addressing=group_addressing, native_shape_tyx=native_shape))
             continue
-        contract_shape = (len(frames), crop[2] - crop[0], crop[3] - crop[1])
-        acceptance = np.zeros(contract_shape, dtype=bool)
-        known = np.zeros(contract_shape, dtype=bool)
-        original = np.zeros(contract_shape, dtype=bool)
-        family_ids = set(family)
-        for frame in frames:
-            for item in by_frame.get(frame, ()):
-                record = observations[item]
-                if not _intersects(record.bbox_yx, crop):
-                    continue
-                # Other components may extend beyond the crop, so paste an intersection.
-                oy0, ox0, oy1, ox1 = record.bbox_yx
-                cy0, cx0 = max(oy0, crop[0]), max(ox0, crop[1])
-                cy1, cx1 = min(oy1, crop[2]), min(ox1, crop[3])
-                target = original[frame - lo, cy0 - crop[0]:cy1 - crop[0], cx0 - crop[1]:cx1 - crop[1]]
-                target |= record.mask_crop[cy0 - oy0:cy1 - oy0, cx0 - ox0:cx1 - ox0]
-                if item in family_ids:
-                    known[frame - lo] |= record.mask_in_crop(crop)
-        # Acceptance includes all inventoried candidate corridors and known sibling
-        # continuations. Write contracts contain only requested missing branches.
-        for source in sorted(endpoints):
-            for target in graph.get(source, ()):
-                if target not in endpoints or source > target:
-                    continue
-                a, b = sorted((observations[source], observations[target]), key=lambda item: item.frame_index)
-                for frame in range(a.frame_index, b.frame_index + 1):
-                    acceptance[frame - lo] |= _corridor(a, b, frame, crop,
-                                                       bounds.curvature_margin_px + bounds.acceptance_margin_px)
-        for offset in range(len(frames)):
-            acceptance[offset] |= (ndi.binary_dilation(known[offset], iterations=bounds.acceptance_margin_px)
-                                   if bounds.acceptance_margin_px else known[offset])
-        writes = np.zeros(contract_shape, dtype=bool)
-        per_edge: dict[str, np.ndarray] = {}
-        edge_contracts: dict[str, np.ndarray] = {}
-        evaluations: dict[str, np.ndarray] = {}
-        permitted: dict[str, np.ndarray] = {}
-        for (a_index, b_index, _), edge in zip(sorted(pairs), edge_records):
-            a, b = observations[a_index], observations[b_index]
-            branch = np.zeros(contract_shape, dtype=bool)
-            for frame in range(a.frame_index, b.frame_index + 1):
-                branch[frame - lo] = _corridor(a, b, frame, crop, bounds.curvature_margin_px)
-            edge_contracts[edge.edge_id] = _readonly(branch)
-            branch[a.frame_index - lo] = False
-            branch[b.frame_index - lo] = False
-            branch &= ~original
-            writes |= branch
-            per_edge[edge.edge_id] = _readonly(branch)
-        for endpoint in sorted(endpoints):
-            record = observations[endpoint]
-            region = ndi.binary_dilation(record.mask_in_crop(crop),
-                                          iterations=max(1, bounds.curvature_margin_px + bounds.acceptance_margin_px))
-            # Assign nearby sibling support to its own evaluation region. This
-            # spatial partition is predeclared, never derived from a predicted mask.
-            competitors = [observations[item] for item in endpoints if item != endpoint
-                           and observations[item].frame_index == record.frame_index]
-            if competitors:
-                own_distance = ndi.distance_transform_edt(~record.mask_in_crop(crop), sampling=spacing[1:])
-                for sibling in competitors:
-                    sibling_distance = ndi.distance_transform_edt(~sibling.mask_in_crop(crop), sampling=spacing[1:])
-                    region &= own_distance <= sibling_distance
-            evaluations[record.observation_id] = _readonly(region)
-            other_branches = np.zeros(region.shape, dtype=bool)
-            for source in sorted(endpoints):
-                for target in graph.get(source, ()):
-                    if target not in endpoints or source > target or endpoint in (source, target):
-                        continue
-                    a, b = sorted((observations[source], observations[target]), key=lambda item: item.frame_index)
-                    if a.frame_index <= record.frame_index <= b.frame_index:
-                        other_branches |= _corridor(a, b, record.frame_index, crop,
-                                                    bounds.curvature_margin_px + bounds.acceptance_margin_px)
-            for item in family:
-                sibling = observations[item]
-                if item != endpoint and sibling.frame_index == record.frame_index:
-                    other_branches |= ndi.binary_dilation(sibling.mask_in_crop(crop),
-                                                           iterations=max(1, bounds.acceptance_margin_px))
-            other_branches &= ~record.mask_in_crop(crop)
-            permitted[record.observation_id] = _readonly(other_branches)
-        group = SamBridgeGroup(group_id, observation_ids, edge_records, crop, frames,
-                               _readonly(acceptance), _readonly(writes), MappingProxyType(evaluations),
-                               MappingProxyType(per_edge), _readonly(known), _readonly(original & ~known),
-                               "planned", (), interpolation_min_radius, spacing,
-                               tuple(observations[item].observation_id for item in sorted(endpoints)),
-                               MappingProxyType(permitted), MappingProxyType(edge_contracts))
+        empty = _empty_contracts()
+        descriptor = SamBridgeGroup(group_id, observation_ids, edge_records, crop, frames,
+            empty, empty, MappingProxyType({}), MappingProxyType({}), empty, empty,
+            "planned", (), interpolation_min_radius, spacing,
+            tuple(observations[item].observation_id for item in sorted(endpoints)),
+            crop_contract=crop_contract, frame_addresses=group_addresses,
+            frame_addressing=group_addressing, native_shape_tyx=native_shape)
+        recipe = _SamGroupContractRecipe(descriptor, immutable_observations, immutable_by_frame,
+            frozenset(family), frozenset(endpoints), immutable_graph, tuple(pairs), bounds, contract_lease_budget)
+        if lazy_contracts:
+            group = replace(descriptor, contract_recipe=recipe)
+        else:
+            group = _materialize_contract_group(recipe)
         groups.append(group)
-        total_bytes += charge
+        total_bytes += 0 if lazy_contracts else charge
         # One session per independently conditioned endpoint, and separately per
         # requested observed walk-back seed. No shared multi-object competition.
         for endpoint in sorted(endpoints):
@@ -720,8 +1066,13 @@ def plan_sam_bridges(
     return SamBridgePlan(tuple(observations), tuple(groups), tuple(runs), interpolation_passes, 1,
                          interpolation_passes - 1, status,
                          ("original_anchor_hypotheses_exhausted",) if interpolation_passes > 1 else (),
-                         fingerprint, planning_fingerprint)
+                         fingerprint, planning_fingerprint, virtual_shape_tyx=shape,
+                         native_shape_tyx=native_shape,
+                         frame_addresses=frame_addresses,
+                         frame_addressing=frame_addressing,
+                         contract_storage_version=SAM_CONTRACT_STORAGE_VERSION if lazy_contracts else "eager",
+                         contract_lease_budget=contract_lease_budget if lazy_contracts else None)
 
 
-__all__ = ["SamPlanningLimits", "SamObservation", "SamBridgeEdge", "SamBridgeGroup",
+__all__ = ["SAM_CROP_PLANNING_CONTRACT_VERSION", "SAM_CONTRACT_STORAGE_VERSION", "SamPlanningLimits", "SamObservation", "SamBridgeEdge", "SamBridgeGroup",
            "SamBridgeRunPlan", "SamBridgePlan", "plan_sam_bridges"]

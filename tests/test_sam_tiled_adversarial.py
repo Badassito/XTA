@@ -141,7 +141,7 @@ def test_large_discarded_halo_leak_rejects_instead_of_hiding_in_owned_cores(tmp_
     assert np.array_equal(bundle.raw_mask('R', 1), body)
     assert bundle.halo_union_mask('R', 1)[3, 992]
     receipt = select_sam_proposals(bundle)
-    assert receipt['resolved_policy']['version'] == 3
+    assert receipt['resolved_policy']['version'] == 5
     assert receipt['selected_run_ids'] == []
     measurement = receipt['run_receipts']['R']['measurements']
     assert measurement['containment'][1]['outside'] == 0
@@ -199,7 +199,7 @@ def test_tiled_replay_uses_saved_mode_and_exact_core_masks_regardless_of_env(tmp
     replay = replay_sam_proposals(bundle, tmp_path / 'replay')
     assert replay['selected_run_ids'] == online['selected_run_ids']
     assert replay['policy_hash'] == online['policy_hash']
-    assert replay['resolved_policy']['version'] == 3
+    assert replay['resolved_policy']['version'] == 5
     with np.load(tmp_path / 'replay' / 'selected_planes.npz') as archive:
         row = next(row for row in replay['replay_outputs']['packed_plane_index']
                    if row['direction'] == 'forward' and row['native_frame'] == 1)
@@ -215,7 +215,7 @@ def test_legacy_whole_replay_does_not_read_tiled_env_or_create_v3(tmp_path, monk
     baseline = select_sam_proposals(bundle)
     monkeypatch.setenv('YOLO_TTA_SAM_CROP_MODE', 'tiled')
     selected = select_sam_proposals(bundle)
-    assert selected['resolved_policy']['version'] == 2
+    assert selected['resolved_policy']['version'] == 4
     assert selected['selected_run_ids'] == baseline['selected_run_ids']
     assert selected['policy_hash'] == baseline['policy_hash']
 

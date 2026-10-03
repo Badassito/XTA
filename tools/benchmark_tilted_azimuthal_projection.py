@@ -276,6 +276,14 @@ def main():
         timing_notes='Source creation, parity decoding and warmups are outside measurements. Whole wall includes writer construction, production geometry/projection, CVOL callbacks/finalize and GPU close. Process CPU covers all process threads and can exceed wall; nested phase timers overlap and must not be added. Short CPU-clock samples can quantize to zero on Windows.')
     def save():
         (args.output/'benchmark.json').write_text(json.dumps(report,indent=2,default=str)+'\n',encoding='utf-8')
+    from XTA.tilted_azimuthal_projection import tilted_azimuthal_cuda_capability
+    available, reason = tilted_azimuthal_cuda_capability()
+    if not available:
+        report.update(status='unsupported', reason=reason, gpu_performed=False,
+                      cpu_fallback='Canonical bounded CPU inverse coverage')
+        save()
+        print(reason, flush=True)
+        return
     try:
         import torch
         if not torch.cuda.is_available() or args.device>=torch.cuda.device_count():

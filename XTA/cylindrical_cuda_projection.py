@@ -281,7 +281,9 @@ extern "C" __global__ void project_radial_plan(
     if (use_bboxes && (bboxes[box + 1] <= bboxes[box] || bboxes[box + 3] <= bboxes[box + 2])) return;
     double stack = stack_centers[stack_index];
     double ideal_height = __dsub_rn(stack, ideal_axis[vertical ? v : u]);
-    if (ideal_height < 0.0 || ideal_height > (double)(stack_length - 1)) return;
+    // Source samples own [-.5,N-.5) height cells. Nearest addresses below are
+    // clamped; annulus/radius validity is independently fixed by the plane plan.
+    if (ideal_height < -0.5 || ideal_height >= (double)stack_length - 0.5) return;
     for (unsigned long long at = offsets[p]; at < (unsigned long long)offsets[p + 1]; ++at) {
         int column = columns[at];
         double height = __dsub_rn(stack, sampled[(unsigned long long)shell * native_width + column]);

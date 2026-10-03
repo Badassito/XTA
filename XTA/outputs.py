@@ -5985,13 +5985,57 @@ def write_summary_file(
                     f"skipped={bool(s.get('skipped', False))}"
                 )
                 if s.get('interpolation_backend') == 'sam':
+                    family_receipts = list(s.get('sam_group_planning_receipts') or ())
+                    refusal_counts: Dict[str, int] = {}
+                    for family in family_receipts:
+                        if family.get('status') != 'planned':
+                            for reason in set(family.get('reasons') or ()):
+                                refusal_counts[str(reason)] = refusal_counts.get(str(reason), 0) + 1
+                    lines.append(
+                        f"      SAM planning: status={s.get('sam_planning_status', 'unknown')}, "
+                        f"families={len(family_receipts)}, "
+                        f"planned={sum(family.get('status') == 'planned' for family in family_receipts)}, "
+                        f"unresolved={int(s.get('sam_unresolved_groups', 0))}, "
+                        f"planned_runs={int(s.get('planner_plan_count', 0))}"
+                    )
+                    if refusal_counts:
+                        lines.append('        Family refusal reasons (can overlap): ' + ', '.join(
+                            f'{reason}={count}' for reason, count in sorted(refusal_counts.items())))
+                    if s.get('sam_planning_reasons'):
+                        lines.append('        Plan reasons: ' + ', '.join(
+                            str(reason) for reason in s['sam_planning_reasons']))
+                    if s.get('sam_session_frame_range'):
+                        lines.append(f"        Session frame range (endpoints included): {s['sam_session_frame_range']}")
+                    if 'sam_group_peak_budget_bytes' in s and 'sam_contract_resident_budget_bytes' in s:
+                        lines.append(
+                            f"        Planning limits: family_MiB={int(s['sam_group_peak_budget_bytes']) / (1024**2):.1f}, "
+                            f"resident_contract_MiB={int(s['sam_contract_resident_budget_bytes']) / (1024**2):.1f}")
+                    resource_profile = s.get('sam_resource_profile') or {}
+                    if resource_profile:
+                        resource_fields = [f"status={resource_profile.get('status', 'unknown')}"]
+                        for key, label in (('assigned_contract_bytes', 'assigned_family_MiB'),
+                                           ('assigned_live_contract_bytes', 'assigned_resident_contract_MiB'),
+                                           ('assigned_topology_bytes', 'assigned_topology_MiB'),
+                                           ('assigned_session_cpu_bytes', 'assigned_session_CPU_MiB'),
+                                           ('assigned_cpu_wave_bytes', 'assigned_CPU_wave_MiB')):
+                            if key in resource_profile:
+                                resource_fields.append(f'{label}={int(resource_profile[key]) / (1024**2):.1f}')
+                        lines.append('        SAM resources: ' + ', '.join(resource_fields))
+                    if 'sam_effective_in_flight' in s:
+                        lines.append(
+                            f"        SAM scheduling: max_in_flight={int(s['sam_effective_in_flight'])}, "
+                            f"defer_refill_until_consumed={bool(s.get('sam_defer_refill_until_consumed', False))}")
                     lines.append(
                         f"      SAM generated_runs={int(s.get('sam_generated_runs', 0))}, "
                         f"selected_runs={int(s.get('sam_selected_runs', 0))}, "
+                        f"rescued_groups={int(s.get('sam_guarded_rescued_groups', 0))}, "
+                        f"rescued_runs={int(s.get('sam_guarded_rescued_runs', 0))}, "
+                        f"rescue_enabled={bool(s.get('sam_guarded_rescue', {}).get('enabled', False))}, "
                         f"incomplete_runs={int(s.get('sam_incomplete_runs', 0))}, "
                         f"passes_requested={int(s.get('requested_passes', 0))}, "
                         f"passes_completed={int(s.get('completed_passes', 0))}, "
                         f"passes_skipped={int(s.get('skipped_passes', 0))}, "
+                        f"policy_version={int(s.get('sam_policy_version', 0))}, "
                         f"policy={s.get('sam_policy_hash', '')}, evidence={s.get('sam_evidence_path', '')}"
                     )
 

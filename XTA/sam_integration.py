@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 import threading
 import time
@@ -50,18 +52,32 @@ def _forget_settled_context(context) -> None:
 
 
 def validate_sam_interpolation_geometry(views) -> None:
-    """Reject geometry not verified by the native Transverse rollout."""
-    from .geometry import physical_view_name
-    unsupported = [str(view.name) for view in views if (
-        str(view.family) != 'orthogonal'
-        or physical_view_name(view) != 'transverse'
-        or float(view.tta_angle_deg) != 0.0
-    )]
-    if unsupported:
-        raise ValueError(
-            'SAM interpolation currently supports native Transverse at angle zero; '
-            'unsupported view(s): ' + ', '.join(unsupported)
-        )
+    """Validate the canonical TTA samplers, independently of LTA restrictions."""
+    from .sam_view_geometry import validate_sam_view_geometry
+    for view in views:
+        validate_sam_view_geometry(view)
+
+
+def _intersect_bbox(left, right):
+    y0, x0 = max(left[0], right[0]), max(left[1], right[1])
+    y1, x1 = min(left[2], right[2]), min(left[3], right[3])
+    return (y0, x0, y1, x1) if y0 < y1 and x0 < x1 else None
+
+
+def _subtract_bbox(bbox, covered):
+    """Disjoint rectangles left after one covered intersection."""
+    y0, x0, y1, x1 = bbox
+    cy0, cx0, cy1, cx1 = covered
+    return tuple(item for item in ((y0, x0, cy0, x1), (cy1, x0, y1, x1),
+                                  (cy0, x0, cy1, cx0), (cy0, cx1, cy1, x1))
+                 if item[0] < item[2] and item[1] < item[3])
+
+
+def _canonical_image_transform(transform):
+    # These fields describe the detector pass, which has already been undone
+    # before accumulation. Every sampler/source/basis field remains in the key.
+    return {key: value for key, value in transform.items() if key not in
+            {'runtime_view_name', 'detector_augmentation_angle_deg'}}
 
 
 def _store_fingerprint(path: Path) -> str:
@@ -134,6 +150,9 @@ class SamInterpolationContext:
         self._leases = []
         self._caches = {}
         self._cache_transforms = {}
+        self._cache_entries = []
+        self._resource_local = threading.local()
+        self.resource_assignments = {}
         self._failure = ''
         self._closed = False
         self.wait_seconds = 0.0
@@ -143,6 +162,15 @@ class SamInterpolationContext:
         self.rendered_pixels = 0
         self.cache_logical_bytes = 0
         self.exact_backing_reuses = 0
+        self.image_cache_hits = 0
+        self.image_cache_superset_hits = 0
+        self.image_cache_reused_pixels = 0
+        self.source_materializations = 0
+        self.source_materialization_seconds = 0.0
+        self.native_sampling_calls = 0
+        self.native_sampling_pixels = 0
+        self.canonical_sampling_pixels = 0
+        self.canonical_phase_self_check_receipt = {'status': 'not_required'}
         self.planning_seconds = 0.0
         self.no_job_passes = 0
         self.dispatch_summary = {}
@@ -154,6 +182,27 @@ class SamInterpolationContext:
     def detector_assets_retired(self) -> None:
         self._ready.set()
 
+    @property
+    def detector_retirement_ready(self) -> bool:
+        """Read the admission signal without starting or rendering SAM work."""
+        # Cancellation wakes existing waiters, but does not grant new work
+        # detector-retirement or GPU-residency permission.
+        return self._ready.is_set() and not self._cancel.is_set() and not self._closed
+
+    @contextmanager
+    def resource_scope(self, profile):
+        """Bind this preparation thread's live lease through all SAM phases."""
+        from .sam_resources import SamResourceProfile
+        if not isinstance(profile, SamResourceProfile):
+            raise TypeError('SAM resource scope requires an admitted profile')
+        profile._validate_owner()
+        previous = getattr(self._resource_local, 'profile', None)
+        self._resource_local.profile = profile
+        try:
+            yield
+        finally:
+            self._resource_local.profile = previous
+
     def cancel(self, reason='TTA scheduler cancelled') -> None:
         self._failure = str(reason)
         self._cancel.set()
@@ -164,84 +213,129 @@ class SamInterpolationContext:
                 cancel(str(reason))
 
     def _canvas_transform(self, view, shape):
-        from .geometry import build_affine
-        if tuple(shape[-2:]) == (int(view.src_h), int(view.src_w)):
-            affine = np.array([[1., 0., 0.], [0., 1., 0.]], dtype=np.float32)
-            inverse = affine
-        else:
-            plan = build_affine(view=str(view.name), src_w=int(view.src_w),
-                src_h=int(view.src_h), out_size=int(shape[1]), angle_deg=0.0,
-                pad_mode=str(view.pad_mode))
-            affine, inverse = plan.M_src_to_out, plan.M_out_to_src
-        transform = {
-            'M_native_to_canvas': np.asarray(affine).tolist(),
-            'M_canvas_to_native': np.asarray(inverse).tolist(),
-            'native_view_shape_tyx': [int(view.num_slices), int(view.src_h), int(view.src_w)],
-            'canvas_shape_tyx': list(shape), 'source_grid_shape_tyx': list(self.source_grid_shape),
-            'source_processing_shape_tyx': list(self.source_volume.shape),
-            'source_resize_semantics': self.source_resize_semantics,
-            'projection_contract': 'tta_native_transverse_categorical_source_restore',
-        }
+        from .sam_view_geometry import sam_native_transform_record
+        from .sam_canvas_rendering import (CANONICAL_CROP_RENDER_CONTRACT, IMPLEMENTATION_SHA256,
+            CANONICAL_PHASE_SELF_CHECK_CONTRACT, canonical_sampling_backend)
+        transform = sam_native_transform_record(view, shape, self.source_grid_shape,
+            source_processing_shape_tyx=self.source_volume.shape)
+        transform.update(canvas_shape_tyx=list(shape), source_grid_shape_tyx=list(self.source_grid_shape),
+            source_resize_semantics=self.source_resize_semantics,
+            interpolation_metric_units='view_native_frame_index_and_working_canvas_pixels',
+            canonical_crop_render_contract=CANONICAL_CROP_RENDER_CONTRACT,
+            canonical_crop_render_implementation_sha256=IMPLEMENTATION_SHA256,
+            canonical_crop_sampling_backend=canonical_sampling_backend(),
+            canonical_phase_self_check_contract=CANONICAL_PHASE_SELF_CHECK_CONTRACT)
+        affine = np.asarray(transform['M_native_to_canvas'], dtype=np.float32)
+        inverse = np.asarray(transform['M_canvas_to_native'], dtype=np.float32)
         return affine, inverse, transform
 
     def image_provider(self, view, shape, prepared_plan=None):
-        """Reuse exact backing or render only the immutable planned frame crops."""
-        from .geometry import build_affine, render_intensity_frame_on_grid
-        from .lta_rendering import LtaPhysicalViewCacheRef, reference_existing_physical_view_cache
-        from .media import wait_for_volume_ready
+        """Materialize only missing canonical pixels; retain immutable cache files.
+
+        The public canvas has native frame addresses. A cyclic plan may append
+        aliases in its logical tracker cache; their u reflection is applied in
+        working coordinates after the ordinary TTA sampler/affine.
+        """
+        from .geometry import physical_view_name
+        from .lta_rendering import LtaPhysicalViewCacheRef
+        from .sam_cyclic import mirror_bbox_yx, validate_cyclic_frame_addressing
         from .runtime import _interpolation_array_backing_path
         shape = tuple(int(value) for value in shape)
         if len(shape) != 3 or any(value <= 0 for value in shape) or shape[0] != int(view.num_slices):
             raise ValueError('SAM image canvas must match the positive view-native frame count')
         if shape[-2:] != (int(view.src_h), int(view.src_w)) and shape[1] != shape[2]:
             raise ValueError('SAM detector processing canvas must be native or square')
+        plan = getattr(prepared_plan, 'plan', prepared_plan)
+        logical_shape = tuple(getattr(plan, 'virtual_shape_tyx', ()) or shape)
+        addressing = dict(getattr(plan, 'frame_addressing', {}) or {})
+        if addressing:
+            address_lookup = validate_cyclic_frame_addressing(addressing)
+            if tuple(addressing['native_shape_tyx']) != shape or tuple(addressing['evidence_shape_tyx']) != logical_shape:
+                raise ValueError('SAM cyclic image addresses differ from the prepared canvas')
+        else:
+            if logical_shape != shape:
+                raise ValueError('SAM extended image frames require explicit cyclic addresses')
+            address_lookup = None
         required = dict(getattr(prepared_plan, 'frame_crop_bounds', {}) or {}) if prepared_plan is not None else {
             index: (0, 0, shape[1], shape[2]) for index in range(shape[0])}
         if not required:
             raise ValueError('SAM image provider requires at least one planned tracking frame')
         required = {int(frame): tuple(int(value) for value in bbox) for frame, bbox in required.items()}
         for frame, (y0, x0, y1, x1) in required.items():
-            if not 0 <= frame < shape[0] or not (0 <= y0 < y1 <= shape[1] and 0 <= x0 < x1 <= shape[2]):
+            if not 0 <= frame < logical_shape[0] or not (0 <= y0 < y1 <= shape[1] and 0 <= x0 < x1 <= shape[2]):
                 raise ValueError('SAM image demand is outside the detector canvas')
+        addresses = {frame: dict(address_lookup[frame]) if address_lookup is not None else
+                     dict(unfolded_index=frame, native_index=frame, cycle_index=0, mirror_u=False)
+                     for frame in required}
         demand_identity = hashlib.sha256(json.dumps(required, sort_keys=True).encode()).hexdigest()
-        key = (str(view.name), shape, demand_identity)
         with self._lock:
             if self._closed:
                 raise RuntimeError('SAM interpolation source lifetime has ended')
+            if self._cancel.is_set():
+                raise RuntimeError(self._failure)
+            validate_sam_interpolation_geometry([view])
+            if addressing:
+                from .sam_view_geometry import validate_sam_view_geometry
+                validate_sam_view_geometry(view, wrap_axis=True)
+            affine, inverse, transform = self._canvas_transform(view, shape)
+            canonical_transform = _canonical_image_transform(transform)
+            geometry_identity = hashlib.sha256(json.dumps(dict(source=self.source_identity,
+                transform=canonical_transform), sort_keys=True, allow_nan=False).encode()).hexdigest()
+            from .sam_cyclic import IMPLEMENTATION_SHA256 as cyclic_sha256
+            image_identity = hashlib.sha256(json.dumps(dict(geometry=geometry_identity,
+                shape=logical_shape, frame_addressing=addressing,
+                cyclic_implementation_sha256=cyclic_sha256 if addressing else None),
+                sort_keys=True, allow_nan=False).encode()).hexdigest()
+            key = (image_identity, demand_identity)
             if key in self._caches:
                 self._caches[key].revalidate()
+                self.image_cache_hits += 1
                 return self._caches[key]
-            validate_sam_interpolation_geometry([view])
+            # A prior immutable descriptor can satisfy a later subset without
+            # rendering or changing bytes still owned by an active worker.
+            for entry in self._cache_entries:
+                reference = entry['reference']
+                if reference.identity_sha256 != image_identity or reference.shape != logical_shape:
+                    continue
+                coverage = {record[0]: record[1:5] for record in reference.frame_crops}
+                if not coverage or all(frame in coverage and _intersect_bbox(bbox, coverage[frame]) == bbox
+                                       for frame, bbox in required.items()):
+                    reference.revalidate()
+                    self._caches[key] = reference
+                    self._cache_transforms[key] = transform
+                    self.image_cache_superset_hits += 1
+                    return reference
             render_started = time.perf_counter()
-            lazy_source = bool(getattr(self.source_volume, '_is_lazy_processing_cube', False))
-            if not lazy_source or self.source_volume.materialized:
-                wait_for_volume_ready(self.source_volume)
-            affine, inverse, transform = self._canvas_transform(view, shape)
-            image_identity = json.dumps(dict(source=self.source_identity, view=str(view.name),
-                affine=np.asarray(affine).tolist(), shape=shape,
-                source_resize_semantics=self.source_resize_semantics), sort_keys=True)
-            # Native angle-zero input already is the canonical uint8 frame stack.
-            # Adopt the immutable existing map instead of copying every frame.
+            # Shape equality is insufficient: a cubic sagittal/coronal stack
+            # still has another source-axis recipe.
             source_array = (getattr(self.source_volume, '_array', None)
                 if bool(getattr(self.source_volume, '_is_lazy_processing_cube', False)) else self.source_volume)
             backing = _interpolation_array_backing_path(source_array)
-            if (backing is not None and tuple(source_array.shape) == shape
+            if (str(view.family) == 'orthogonal' and physical_view_name(view) == 'transverse'
+                    and logical_shape == shape and backing is not None and tuple(source_array.shape) == shape
                     and np.dtype(source_array.dtype) == np.uint8
                     and bool(source_array.flags['C_CONTIGUOUS'])
                     and np.array_equal(affine, np.array([[1., 0., 0.], [0., 1., 0.]], np.float32))
                     and Path(backing).is_file() and Path(backing).stat().st_size == int(np.prod(shape))):
+                from .media import wait_for_volume_ready
+                wait_for_volume_ready(self.source_volume)
                 stat = Path(backing).stat()
                 reference = LtaPhysicalViewCacheRef(path=Path(backing), shape=shape, dtype='uint8',
-                    physical_view_id=str(view.name), identity_sha256=hashlib.sha256(image_identity.encode()).hexdigest(),
+                    physical_view_id=physical_view_name(view), identity_sha256=image_identity,
                     size_bytes=stat.st_size, mtime_ns=stat.st_mtime_ns)
                 self._caches[key] = reference
                 self._cache_transforms[key] = transform
+                self._cache_entries.append(dict(reference=reference, geometry_identity=geometry_identity,
+                                                addresses={}, native_shape=shape))
                 self.exact_backing_reuses += 1
                 return reference
-            render_identity = hashlib.sha256(json.dumps(
-                dict(source=self.source_identity, view=str(view.name), shape=shape,
-                     angle=float(view.tta_angle_deg), pad=str(view.pad_mode), demand=demand_identity), sort_keys=True).encode()).hexdigest()[:16]
-            path = self.temp_dir / 'sam_image_cache' / (f'{view.name}.{render_identity}.' + 'x'.join(map(str, shape)) + '.gray8.dat')
+            identity_affine = np.array([[1., 0., 0.], [0., 1., 0.]], np.float32)
+            if not (np.array_equal(affine, identity_affine) and np.array_equal(inverse, identity_affine)):
+                from .sam_canvas_rendering import ensure_canonical_phase_supported
+                self.canonical_phase_self_check_receipt = ensure_canonical_phase_supported(
+                    transform['canonical_crop_sampling_backend'])
+            render_identity = hashlib.sha256((image_identity+demand_identity).encode()).hexdigest()[:24]
+            path = self.temp_dir / 'sam_image_cache' / (f'{physical_view_name(view)}.{render_identity}.gray8.dat')
             path.parent.mkdir(parents=True, exist_ok=True)
             records = []
             payload_bytes = 0
@@ -253,22 +347,64 @@ class SamInterpolationContext:
             if payload_bytes > budget:
                 raise RuntimeError(f'SAM planned image demand {payload_bytes} bytes exceeds cache budget {budget}')
             cache = np.memmap(path, dtype=np.uint8, mode='w+', shape=(payload_bytes,))
+            completed = []
             try:
                 for index, y0, x0, y1, x1, offset in records:
                     if self._cancel.is_set():
                         raise RuntimeError(self._failure)
-                    crop_affine = np.array(affine, copy=True)
-                    crop_affine[:, 2] -= [x0, y0]
-                    crop_inverse = np.array(inverse, copy=True)
-                    crop_inverse[:, 2] += np.asarray(inverse)[:, :2] @ np.array([x0, y0])
-                    image = self._render_demand_crop(view, index, crop_affine, crop_inverse,
-                        output_height=y1-y0, output_width=x1-x0)
-                    if image.dtype != np.uint8 or image.shape != (y1-y0, x1-x0):
-                        raise ValueError('SAM image provider returned a mismatched detector canvas')
-                    cache[offset:offset+image.size] = image.reshape(-1)
-                    self.rendered_frames += 1
-                    self.rendered_pixels += int(image.size)
+                    address = addresses[index]
+                    physical_bbox = mirror_bbox_yx((y0, x0, y1, x1), shape[2]) if address['mirror_u'] else (y0, x0, y1, x1)
+                    target = cache[offset:offset+(y1-y0)*(x1-x0)].reshape(y1-y0, x1-x0)
+                    physical_target = target[:, ::-1] if address['mirror_u'] else target
+                    native_frame_cache = {}
+                    missing = self._copy_cached_pixels(physical_target, physical_bbox,
+                        int(address['native_index']), geometry_identity)
+                    # Earlier native/alias records in this private transaction
+                    # are already complete. Reuse their physical pixels before
+                    # publishing an immutable descriptor to any worker.
+                    for done_frame, done_bbox, done_mirror, done_offset in completed:
+                        if done_frame != int(address['native_index']) or not missing:
+                            continue
+                        done_size = (done_bbox[2]-done_bbox[0])*(done_bbox[3]-done_bbox[1])
+                        done = cache[done_offset:done_offset+done_size].reshape(
+                            done_bbox[2]-done_bbox[0], done_bbox[3]-done_bbox[1])
+                        if done_mirror:
+                            done = done[:, ::-1]
+                        remainder = []
+                        for remaining in missing:
+                            intersection = _intersect_bbox(remaining, done_bbox)
+                            if intersection is None:
+                                remainder.append(remaining)
+                                continue
+                            cy0, cx0, cy1, cx1 = intersection
+                            physical_target[cy0-physical_bbox[0]:cy1-physical_bbox[0],
+                                cx0-physical_bbox[1]:cx1-physical_bbox[1]] = done[
+                                    cy0-done_bbox[0]:cy1-done_bbox[0], cx0-done_bbox[1]:cx1-done_bbox[1]]
+                            self.image_cache_reused_pixels += (cy1-cy0)*(cx1-cx0)
+                            remainder.extend(_subtract_bbox(remaining, intersection))
+                        missing = tuple(remainder)
+                        del done
+                    for cy0, cx0, cy1, cx1 in missing:
+                        if self._cancel.is_set():
+                            raise RuntimeError(self._failure)
+                        image = self._render_demand_crop(view, int(address['native_index']), affine, inverse,
+                            output_height=cy1-cy0, output_width=cx1-cx0,
+                            output_origin_yx=(cy0, cx0), output_canvas_width=shape[2],
+                            native_frame_cache=native_frame_cache, native_preparation_bbox=physical_bbox)
+                        if image.dtype != np.uint8 or image.shape != (cy1-cy0, cx1-cx0):
+                            raise ValueError('SAM image provider returned a mismatched detector canvas')
+                        physical_target[cy0-physical_bbox[0]:cy1-physical_bbox[0],
+                                        cx0-physical_bbox[1]:cx1-physical_bbox[1]] = image
+                        self.rendered_frames += 1
+                        self.rendered_pixels += int(image.size)
+                    completed.append((int(address['native_index']), physical_bbox,
+                                      bool(address['mirror_u']), offset))
+                    del target, physical_target, native_frame_cache
                 cache.flush()
+            except BaseException:
+                cache._mmap.close()
+                path.unlink(missing_ok=True)
+                raise
             finally:
                 del cache
             # Identity describes canonical image bytes, independently of how
@@ -276,33 +412,109 @@ class SamInterpolationContext:
             # Exact model/crop/frame feature keys can therefore survive a
             # different scope's demand inventory without admitting new pixels.
             stat = path.stat()
-            reference = LtaPhysicalViewCacheRef(path=path, shape=shape, dtype='uint8',
-                physical_view_id=str(view.name), identity_sha256=hashlib.sha256(image_identity.encode()).hexdigest(),
+            reference = LtaPhysicalViewCacheRef(path=path, shape=logical_shape, dtype='uint8',
+                physical_view_id=physical_view_name(view), identity_sha256=image_identity,
                 size_bytes=stat.st_size, mtime_ns=stat.st_mtime_ns,
                 frame_crops=tuple(records) if prepared_plan is not None else ())
             self._caches[key] = reference
             self._cache_transforms[key] = transform
+            self._cache_entries.append(dict(reference=reference, geometry_identity=geometry_identity,
+                                            addresses=addresses, native_shape=shape))
             self.render_seconds += time.perf_counter() - render_started
             self.cache_logical_bytes += payload_bytes
             return reference
 
-    def _render_demand_crop(self, view, index, affine, inverse, *, output_height, output_width):
-        """Render needed native frames without materializing an unused lazy cube."""
+    def _copy_cached_pixels(self, target, bbox, native_frame, geometry_identity):
+        """Copy intersections in physical working coordinates; return holes."""
+        from .sam_cyclic import mirror_bbox_yx
+        missing = [bbox]
+        for entry in self._cache_entries:
+            if entry['geometry_identity'] != geometry_identity:
+                continue
+            reference = entry['reference']
+            if reference.frame_crops:
+                records = [record for record in reference.frame_crops
+                    if int(entry['addresses'][record[0]]['native_index']) == native_frame]
+            else:
+                records = [(native_frame, 0, 0, reference.shape[1], reference.shape[2], 0)]
+            for frame, y0, x0, y1, x1, offset in records:
+                mirrored = bool(entry['addresses'].get(frame, {}).get('mirror_u', False))
+                coverage = mirror_bbox_yx((y0, x0, y1, x1), reference.shape[2]) if mirrored else (y0, x0, y1, x1)
+                intersections = [(remaining, _intersect_bbox(remaining, coverage)) for remaining in missing]
+                if not any(intersection is not None for _, intersection in intersections):
+                    continue
+                cached = reference.open()
+                try:
+                    plane = (cached[offset:offset+(y1-y0)*(x1-x0)].reshape(y1-y0, x1-x0)
+                             if reference.frame_crops else cached[frame])
+                    if mirrored:
+                        plane = plane[:, ::-1]
+                    remainder = []
+                    for remaining, intersection in intersections:
+                        if intersection is None:
+                            remainder.append(remaining)
+                            continue
+                        cy0, cx0, cy1, cx1 = intersection
+                        target[cy0-bbox[0]:cy1-bbox[0], cx0-bbox[1]:cx1-bbox[1]] = plane[
+                            cy0-coverage[0]:cy1-coverage[0], cx0-coverage[1]:cx1-coverage[1]]
+                        self.image_cache_reused_pixels += (cy1-cy0)*(cx1-cx0)
+                        remainder.extend(_subtract_bbox(remaining, intersection))
+                    missing = remainder
+                    del plane
+                finally:
+                    cached._mmap.close()
+                if not missing:
+                    return ()
+        return tuple(missing)
+
+    def _render_demand_crop(self, view, index, affine, inverse, *, output_height, output_width,
+                            output_origin_yx=(0, 0), output_canvas_width=None,
+                            native_frame_cache=None, native_preparation_bbox=None):
+        """Use the established TTA grayscale sampler on the canonical grid.
+
+        Only a Transverse plane can be reconstructed from decoded Z slices.
+        Other orientations materialize the existing shared processing memmap
+        once, then reuse it for every needed frame/crop and endpoint session.
+        """
         from ._deps import cv2
-        from .geometry import render_intensity_frame_on_grid
+        from .geometry import physical_view_name
+        from .sam_canvas_rendering import render_canonical_crop
         from .media import (_linear_source_index, _resize_gray_slice_nearest_or_linear,
                             wait_for_volume_ready, wait_for_volume_slice_ready)
         source = self.source_volume
         frames = None
-        if bool(getattr(source, '_is_lazy_processing_cube', False)) and not source.materialized:
+        native_origin_xy = (0, 0)
+        if native_frame_cache is not None and 'plane' in native_frame_cache:
+            previous_pixels = int(native_frame_cache.get('sampled_output_pixels', 0))
+            rendered = render_canonical_crop(source, view, index, affine=affine, inverse=inverse,
+                output_origin_yx=output_origin_yx, output_height=output_height, output_width=output_width,
+                output_canvas_width=output_canvas_width, native_frame_cache=native_frame_cache)
+            self.canonical_sampling_pixels += int(native_frame_cache['sampled_output_pixels'])-previous_pixels
+            return rendered
+        lazy_unmaterialized = bool(getattr(source, '_is_lazy_processing_cube', False)) and not source.materialized
+        transverse = str(view.family) == 'orthogonal' and physical_view_name(view) == 'transverse'
+        if lazy_unmaterialized and not transverse:
+            started = time.perf_counter()
+            wait_for_volume_ready(source)
+            self.source_materializations += 1
+            self.source_materialization_seconds += time.perf_counter() - started
+        elif not lazy_unmaterialized:
+            wait_for_volume_ready(source)
+        if bool(getattr(source, '_is_lazy_processing_cube', False)) and source.materialized:
+            # Standard coronal/block and shell renderers require ndarray
+            # strides/flags. Keep the owning lazy proxy alive in the context,
+            # and lend its existing map rather than rematerializing a proxy.
+            source = source._array
+        if lazy_unmaterialized and transverse:
             decoded = source.source
             in_t, in_h, in_w = (int(value) for value in decoded.shape)
             out_t, out_h, out_w = (int(value) for value in source.shape)
             if (in_h, in_w) == (out_h, out_w) and not source.streaming_backend:
                 # Match the production OpenCV slab resize exactly. Restrict the
                 # spatial slab to the native pixels sampled by this tracker crop.
-                corners = np.array([[0., 0.], [output_width-1., 0.],
-                    [0., output_height-1.], [output_width-1., output_height-1.]])
+                cy0, cx0, cy1, cx1 = native_preparation_bbox or (output_origin_yx[0],
+                    output_origin_yx[1], output_origin_yx[0]+output_height, output_origin_yx[1]+output_width)
+                corners = np.array([[cx0, cy0], [cx1-1., cy0], [cx0, cy1-1.], [cx1-1., cy1-1.]])
                 mapped = corners @ np.asarray(inverse)[:, :2].T + np.asarray(inverse)[:, 2]
                 x0 = max(0, int(np.floor(mapped[:, 0].min()))-2)
                 x1 = min(out_w, int(np.ceil(mapped[:, 0].max()))+3)
@@ -327,11 +539,8 @@ class SamInterpolationContext:
                         resized = cv2.resize(slab.reshape(in_t, -1), (slab.shape[1]*slab.shape[2], out_t),
                             interpolation=cv2.INTER_LINEAR)
                         native[row-y0:stop-y0, column-x0:column_stop-x0] = resized[index].reshape(stop-row, column_stop-column)
-                origin = np.array([x0, y0])
-                affine = np.array(affine, copy=True)
-                affine[:, 2] += np.asarray(affine)[:, :2] @ origin
-                inverse = np.array(inverse, copy=True)
-                inverse[:, 2] -= origin
+                del slab, resized
+                native_origin_xy = (x0, y0)
             else:
                 from .workspace import _env_int
                 render_budget = max(1, _env_int('YOLO_TTA_SAM_RENDER_MAX_BYTES', 256*1024**2))
@@ -346,15 +555,22 @@ class SamInterpolationContext:
                     wait_for_volume_slice_ready(decoded, z1)
                     other = _resize_gray_slice_nearest_or_linear(decoded[z1], out_w, out_h, cv2.INTER_LINEAR)
                     native = cv2.addWeighted(native, 1.-alpha, other, alpha, 0.)
+                    del other
             class OneNativeFrame:
                 def __getitem__(self, frame_index):
                     if int(frame_index) != int(index):
                         raise RuntimeError('SAM demand renderer accessed an unplanned frame')
                     return native
             frames = OneNativeFrame()
-        return render_intensity_frame_on_grid(source, view, index, M_src_to_out=affine,
-            M_out_to_src=inverse, output_height=output_height, output_width=output_width,
-            view_frames=frames)
+        local_cache = native_frame_cache if native_frame_cache is not None else {}
+        rendered = render_canonical_crop(source, view, index, affine=affine, inverse=inverse,
+            output_origin_yx=output_origin_yx, output_height=output_height, output_width=output_width,
+            view_frames=frames, native_origin_xy=native_origin_xy, output_canvas_width=output_canvas_width,
+            native_frame_cache=local_cache)
+        self.native_sampling_calls += 1
+        self.native_sampling_pixels += int(local_cache['plane'].size)
+        self.canonical_sampling_pixels += int(local_cache['sampled_output_pixels'])
+        return rendered
 
     def _start(self):
         with self._runtime_lock:
@@ -465,11 +681,38 @@ class SamInterpolationContext:
                     (int(view.src_h), int(view.src_w)) else 'detector_processing'),
                 sam_working_canvas_shape_tyx=list(shape),
                 sam_native_view_shape_tyx=[int(view.num_slices), int(view.src_h), int(view.src_w)])
+            profile = getattr(self._resource_local, 'profile', None)
+            live_profile = None
+            if profile is not None:
+                scope_metadata['sam_resource_profile'] = profile.metadata()
+                live_profile = profile
+                if profile.has_extra_credit:
+                    from .sam_bridge_planning import SamPlanningLimits
+                    from .sam_resources import validate_live_sam_resource_profile
+                    validate_live_sam_resource_profile(profile)
+                    declared_limits = kwargs.get('planner_limits')
+                    if declared_limits is None:
+                        kwargs['planner_limits'] = SamPlanningLimits(
+                            max_group_bytes=profile.assigned_contract_bytes,
+                            max_total_contract_bytes=profile.assigned_live_contract_bytes)
+                    else:
+                        kwargs['planner_limits'] = replace(declared_limits,
+                            max_group_bytes=min(declared_limits.max_group_bytes, profile.assigned_contract_bytes),
+                            max_total_contract_bytes=min(declared_limits.max_total_contract_bytes,
+                                profile.assigned_live_contract_bytes))
+            else:
+                scope_metadata['sam_resource_profile'] = {
+                    'schema': 'xta.sam_live_resources/1', 'status': 'direct_declared_bounds',
+                    'reserved_extra_bytes': 0}
+            with self._lock:
+                self.resource_assignments[str(scope)] = dict(scope_metadata['sam_resource_profile'])
+            profile_kwargs = {} if live_profile is None else {'resource_profile': live_profile}
             planning_keys = {'pass_index', 'gap_distance', 'min_radius', 'search_angle_deg',
                 'interpolation_walk_back', 'interpolation_candidates', 'interpolation_passes',
                 'wrap_axis', 'upstream_lineage', 'spacing_zyx', 'planner_limits', 'canonical_labels'}
             prepared = prepare_sam_interpolation_pass(observed, view=view,
                 scope=scope_metadata, policy=self.policy,
+                **profile_kwargs,
                 **{key: value for key, value in kwargs.items() if key in planning_keys})
             tracked_group_ids = {str(run.group_id) for run in prepared.runs}
             oversized_groups = [group for group in prepared.groups if str(group.group_id) in tracked_group_ids
@@ -499,6 +742,7 @@ class SamInterpolationContext:
             merged, stats, components = interpolate_sam_view_volume_pass(
                 observed, image_provider=provider, view=view,
                 runtime=runtime, scope=scope_metadata, policy=self.policy, cancel_event=self._cancel,
+                **profile_kwargs,
                 prepared_plan=prepared,
                 runtime_work_dir=self.temp_dir / 'sam_merged' / hashlib.sha256(str(scope).encode()).hexdigest()[:20],
                 **kwargs)
@@ -512,6 +756,8 @@ class SamInterpolationContext:
             stats.setdefault('sam_working_canvas_shape_tyx', list(shape))
             stats.setdefault('sam_native_view_shape_tyx', scope_metadata['sam_native_view_shape_tyx'])
             stats.setdefault('delayed_native_expansion_at_launch', self.delayed_native_expansion_at_launch)
+            stats.setdefault('sam_canonical_phase_self_check', dict(self.canonical_phase_self_check_receipt))
+            stats.setdefault('sam_resource_profile', dict(scope_metadata['sam_resource_profile']))
             return merged, stats, components
         except BaseException as error:
             if prepared is not None and prepared.needs_tracking and not execution_started:
@@ -568,6 +814,7 @@ class SamInterpolationContext:
                 self._leases.clear()
                 self._caches.clear()
                 self._cache_transforms.clear()
+                self._cache_entries.clear()
                 self.source_volume = None
             finally:
                 self._idle.notify_all()

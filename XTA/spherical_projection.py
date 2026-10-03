@@ -430,6 +430,9 @@ def backproject_spherical_volume_to_volume(
     blocks in source-z order. Input masks are borrowed and never modified.
     The nearest radius is global, with exact midpoints assigned inward; row
     and column nearest ties use NumPy's round-to-even on the global lattice.
+    Native destination centers use cancellation-free centered scaling. Closed
+    radius endpoints admit only eight float64 epsilons of relative roundoff at
+    each limit; this does not add a voxel-scale shell or change declared radii.
     """
     from .backprojection import (
         SinkOnlyProjectionResult, _emit_projection_block_callback,

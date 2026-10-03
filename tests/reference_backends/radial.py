@@ -67,7 +67,17 @@ def pull_radial_chunk(
         stack, py, px, stack_len = wx, np.full(flat.shape, wt), wy, work_w
     else:
         raise ValueError(f'Unsupported Radial base {base!r}')
-    dx, dy = px - float(view.center_x), py - float(view.center_y)
+    # Center-relative arithmetic avoids cancellation at exact rational bounds.
+    # The independent oracle retains the same physical closed annulus; only
+    # float64-sized roundoff at each individual bound is tolerated.
+    work_plane = {'transverse': (work_h, work_w), 'sagittal': (work_t, work_w),
+                  'coronal': (work_t, work_h)}[base]
+    out_plane = {'transverse': (out_h, out_w), 'sagittal': (out_t, out_w),
+                 'coronal': (out_t, out_h)}[base]
+    native_y = flat // out_w if base == 'transverse' else np.full(flat.shape, z)
+    native_x = flat % out_w if base != 'coronal' else flat // out_w
+    dx = ((native_x*2.+1.-out_plane[1])*work_plane[1])/(2.*out_plane[1]) + ((work_plane[1]-1.)*.5-view.center_x)
+    dy = ((native_y*2.+1.-out_plane[0])*work_plane[0])/(2.*out_plane[0]) + ((work_plane[0]-1.)*.5-view.center_y)
     radius = np.hypot(dx, dy)
     source_stack = np.broadcast_to(np.asarray(stack, dtype=np.float64), flat.shape)
     height = source_stack.copy()
@@ -80,9 +90,9 @@ def pull_radial_chunk(
     global_shell = _nearest_global_shell(radius, radii)
     shell = global_shell - int(view.radial_shell_start)
     valid = (
-        (radius >= float(view.radial_min_radius))
-        & (radius <= float(view.radial_max_radius))
-        & (height >= 0.0) & (height <= float(stack_len - 1))
+        (radius >= float(view.radial_min_radius) - 8*np.finfo(np.float64).eps*np.maximum(radius, abs(view.radial_min_radius)))
+        & (radius <= float(view.radial_max_radius) + 8*np.finfo(np.float64).eps*np.maximum(radius, abs(view.radial_max_radius)))
+        & (height >= -0.5) & (height < float(stack_len) - 0.5)
         & (shell >= 0) & (shell < source.shape[0])
     )
     result = np.zeros(flat.shape, dtype=source.dtype if scalar_max else np.uint8)

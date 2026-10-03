@@ -1,5 +1,5 @@
 include ARCHITECTURE.md
-include GPT-6-Astra-Ultra_v24.0.0_SLURM.py
+include GPT-6-Astra-Ultra_v24.0.1_SLURM.py
 include setup.py
 include release/_package_inventory.json
 include release/README.md

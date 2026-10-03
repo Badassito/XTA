@@ -28,10 +28,31 @@ def test_real_successor_contract_is_checked_once_per_context():
 
 def test_latest_successor_tampering_is_rechecked_in_a_new_pass():
     manifest = json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
-    latest = ('v24_0_0_release_review' if 'v24_0_0_release_review' in manifest
+    latest = ('v24_job150790_150798_throughput_development_review' if 'v24_job150790_150798_throughput_development_review' in manifest
+              else 'v24_job150772_performance_development_review' if 'v24_job150772_performance_development_review' in manifest
+              else 'v24_0_1_release_review' if 'v24_0_1_release_review' in manifest
+              else 'v24_job150615_headroom_development_review' if 'v24_job150615_headroom_development_review' in manifest
+              else 'v24_job150615_development_review' if 'v24_job150615_development_review' in manifest
+              else 'v24_guarded_rescue_development_review' if 'v24_guarded_rescue_development_review' in manifest
+              else 'v24_outer_crop_development_review' if 'v24_outer_crop_development_review' in manifest
+              else 'v24_0_0_release_review' if 'v24_0_0_release_review' in manifest
               else 'v23_0_5_release_review' if 'v23_0_5_release_review' in manifest
               else 'v23_0_4_release_review')
-    without_latest = (inventory._without_reviewed_v24_0_0_release
+    without_latest = (inventory._without_reviewed_v24_job150790_150798_throughput_development
+                      if latest == 'v24_job150790_150798_throughput_development_review'
+                      else inventory._without_reviewed_v24_job150772_performance_development
+                      if latest == 'v24_job150772_performance_development_review'
+                      else inventory._without_reviewed_v24_0_1_release
+                      if latest == 'v24_0_1_release_review'
+                      else inventory._without_reviewed_v24_job150615_headroom_development
+                      if latest == 'v24_job150615_headroom_development_review'
+                      else inventory._without_reviewed_v24_job150615_development
+                      if latest == 'v24_job150615_development_review'
+                      else inventory._without_reviewed_v24_guarded_rescue_development
+                      if latest == 'v24_guarded_rescue_development_review'
+                      else inventory._without_reviewed_v24_outer_crop_development
+                      if latest == 'v24_outer_crop_development_review'
+                      else inventory._without_reviewed_v24_0_0_release
                       if latest == 'v24_0_0_release_review'
                       else inventory._without_reviewed_v23_0_5_release
                       if latest == 'v23_0_5_release_review'

@@ -32,8 +32,12 @@ def test_compact_demand_pixels_match_full_canonical_cache(tmp_path, native_shape
     full_ref = context.image_provider(geometry, canvas)
     full = np.array(full_ref.open(), copy=True)
     bbox = (1, 2, canvas[1]-1, canvas[2]-1)
-    compact = context.image_provider(geometry, canvas,
-        SimpleNamespace(frame_crop_bounds={1: bbox, 3: bbox}))
+    demand = SimpleNamespace(frame_crop_bounds={1: bbox, 3: bbox})
+    # Already-covered demand reuses the immutable superset. A fresh context
+    # still proves the compact storage/read boundary itself independently.
+    assert context.image_provider(geometry, canvas, demand) is full_ref
+    compact_context = owner(tmp_path/'compact', source)
+    compact = compact_context.image_provider(geometry, canvas, demand)
     assert compact.size_bytes == 2*(bbox[2]-bbox[0])*(bbox[3]-bbox[1])
     assert compact.shape == canvas
     assert compact.frame_crops
@@ -47,6 +51,7 @@ def test_compact_demand_pixels_match_full_canonical_cache(tmp_path, native_shape
         render_native_tile_window(restored, frame_start=2, frame_stop=3,
             tile_xyxy=(bbox[1], bbox[0], bbox[3], bbox[2]))
     context.close()
+    compact_context.close()
 
 
 @pytest.mark.parametrize('input_shape,output_shape,streaming', [

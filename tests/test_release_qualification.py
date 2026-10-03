@@ -1,6 +1,10 @@
 """A failed or source-mutating qualification cannot produce a release bundle."""
 import json
+import importlib.util
+import os
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -62,6 +66,7 @@ def test_success_runs_whole_suite_then_inventory_then_snapshot(qualification_wor
         commands.append(command)
         assert kwargs['cwd'] == gate.ROOT
         env = kwargs['env']
+        assert env['CUDA_VISIBLE_DEVICES'] == '-1'
         assert env['PYTHONIOENCODING'] == 'utf-8'
         assert 'PYTHONOPTIMIZE' not in env
         for name, dirname in (
@@ -81,6 +86,42 @@ def test_success_runs_whole_suite_then_inventory_then_snapshot(qualification_wor
     assert '--continue-on-collection-errors' not in commands[0]
     assert '--snapshot' in commands[-1]
     assert receipt['coverage'] == 'cpu-only'
+    assert not (gate.ROOT.parent / 'Scratch/Temp/GPU_LOCK').exists()
+
+
+@pytest.mark.parametrize('inherited', ['', '0', '3,7', 'GPU-inherited'])
+def test_cpu_environment_hides_cuda_without_mutating_the_parent(tmp_path, monkeypatch, inherited):
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', inherited)
+    monkeypatch.setenv('PYTHONOPTIMIZE', '1')
+    env = gate._qualification_environment(tmp_path / 'evidence', cpu_only=True)
+    assert env['CUDA_VISIBLE_DEVICES'] == '-1'
+    assert os.environ['CUDA_VISIBLE_DEVICES'] == inherited
+    assert 'PYTHONOPTIMIZE' not in env and os.environ['PYTHONOPTIMIZE'] == '1'
+
+
+def test_cuda_qualification_preserves_the_selected_device_pool(tmp_path, monkeypatch):
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '3,7')
+    assert gate._qualification_environment(tmp_path / 'evidence', cpu_only=False)['CUDA_VISIBLE_DEVICES'] == '3,7'
+
+
+@pytest.mark.parametrize('nvml_check', [None, '1'])
+def test_real_cpu_environment_has_no_cuda_device_or_initialized_context(tmp_path, nvml_check):
+    if importlib.util.find_spec('torch') is None:
+        pytest.skip('PyTorch is unavailable for a real CUDA availability probe')
+    env = gate._qualification_environment(tmp_path / 'cpu-probe', cpu_only=True)
+    env.pop('PYTORCH_NVML_BASED_CUDA_CHECK', None)
+    if nvml_check is not None:
+        env['PYTORCH_NVML_BASED_CUDA_CHECK'] = nvml_check
+    # Fresh process, visibility set before importing torch, and no tensor or
+    # device-property calls: this verifies isolation without GPU allocation.
+    command = [sys.executable, '-B', '-c',
+        "import json,torch; before=torch.cuda.is_initialized(); "
+        "available=torch.cuda.is_available(); count=torch.cuda.device_count(); "
+        "print(json.dumps({'before':before,'available':available,'count':count,"
+        "'after':torch.cuda.is_initialized()}))"]
+    result = subprocess.run(command, env=env, cwd=gate.ROOT, check=True,
+                            capture_output=True, encoding='utf-8', timeout=60)
+    assert json.loads(result.stdout) == {'before': False, 'available': False, 'count': 0, 'after': False}
 
 
 def test_release_requires_clean_source(qualification_workspace):

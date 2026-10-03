@@ -67,7 +67,9 @@ class ShellChunkPullReference:
         for pixel in self.pixels_by_shell[shell]:
             py, px = divmod(int(pixel), plane_w)
             ideal_height = self.centers - self.ideal[py if self.vertical else px]
-            valid = (ideal_height >= 0.) & (ideal_height <= self.stack_length - 1)
+            # Match sampled voxel-cell coverage, including restored height caps;
+            # the production ownership plan separately preserves the annulus ROI.
+            valid = (ideal_height >= -.5) & (ideal_height < self.stack_length - .5)
             values = np.zeros(len(self.centers), bool)
             first, stop = self.plan.column_offsets[pixel:pixel + 2]
             for column in self.plan.native_columns[first:stop]:
