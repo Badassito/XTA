@@ -41,10 +41,12 @@ def test_sam_presets_declare_quality_ablation_without_changing_source_union():
         assert policy['mode'] == 'union'
         assert policy['proposal_api_version'] == 1
         assert policy['select_proposals'] is None
-        bridge = resolve_sam_bridge_policy(policy)
+        bridge = resolve_sam_bridge_policy(policy, environ={})
         assert bridge['strict_family_agreement'] == (name == 'sam_strict')
         assert bridge['kind'] == ('permissive' if name == 'sam_raw_candidates' else 'conservative')
-        assert bridge['strict_containment'] == (name != 'sam_raw_candidates')
+        assert bridge['strict_containment'] is False
+        assert bridge['version'] == (2 if name == 'sam_raw_candidates' else 6)
+        assert bridge['branch_aware_selection'] == (name != 'sam_raw_candidates')
 
 
 def test_snapshotted_custom_presets_load_outside_the_example_directory(tmp_path):

@@ -288,6 +288,9 @@ class DeferredSamParentQueue:
             self.leases.postprocess_views.add(key)
             self.leases.postprocess_bytes[key] = snapshot.required_bytes
             try:
+                rebind_retirement = getattr(task, 'rebind_confidence_retirement', None)
+                if callable(rebind_retirement):
+                    rebind_retirement(self.leases.leases[key])
                 if snapshot.mask is not None:
                     task.union_mm = snapshot.mask.open()
                     task.union_path = snapshot.mask.path

@@ -8,12 +8,16 @@ volume-sized coordinate list is materialized.
 from __future__ import annotations
 
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 import math
+import os
+import shutil
 from pathlib import Path
 import tempfile
 import threading
 import time
+import weakref
 from typing import Dict, Iterator, Tuple
 
 import numpy as np
@@ -22,7 +26,8 @@ from .geometry import (ViewInfo, is_azimuthal_view, is_tilted_azimuthal_view,
                        azimuthal_base_view_name, azimuthal_plane_shape,
                        azimuthal_source_tilted_view)
 from .interpolation import INTERNAL_PACKED_CVOL_FORMAT, RawBBoxMaskStore, RawBBoxSlicePayload, _write_raw_bbox_payload_store
-from .runtime import close_memmap_array_without_flush, defer_retired_memmap_directory_cleanup
+from .runtime import (close_memmap_array_without_flush, defer_retired_memmap_directory_cleanup,
+                      wait_for_retired_memmap_unlinks)
 
 _MAP_STRIP_PIXELS = 262144
 _INPUT_SLAB_BYTES = 8 * 1024 * 1024
@@ -30,6 +35,131 @@ _MAP_CACHE_MAX_BYTES = 256 * 1024 * 1024
 _CACHE: OrderedDict[tuple, '_UprightInverseMap'] = OrderedDict()
 _CACHE_BYTES = 0
 _CACHE_LOCK = threading.Lock()
+
+
+@contextmanager
+def _owned_projection_directory(target, retirement):
+    """Clean owned scratch without racing deletion or masking worker failures."""
+    owner = tempfile.TemporaryDirectory(prefix=f'.{target.name}.projection-',dir=target.parent,
+                                        ignore_cleanup_errors=True)
+    path = Path(owner.name)
+    try:
+        yield path
+    except BaseException as original:
+        # Encoding futures have settled before their iterator raises. Partial
+        # output payloads are ordinary closed files, independent of source.bits.
+        # The directory reaper only removes empty directories, so retire this
+        # invocation's exact staging tree before handing off mapped-file cleanup.
+        staged = path/'projected.cvol'
+        if staged.exists():
+            try:
+                shutil.rmtree(staged)
+            except OSError as cleanup_error:
+                if hasattr(original,'add_note'):
+                    original.add_note(f'Owned projection staging cleanup failed: {cleanup_error}')
+        mapping = retirement.get('mapping')
+        if mapping is not None and mapping() is not None:
+            # Exception tracebacks can legitimately retain a worker's borrowed
+            # packed argument. Its weakref must not become a second owner here.
+            owner._finalizer.detach()
+            defer_retired_memmap_directory_cleanup(path)
+        else:
+            try:
+                if mapping is not None:
+                    wait_for_retired_memmap_unlinks(path=path/'source.bits')
+                owner.cleanup()
+            except BaseException as cleanup_error:
+                owner._finalizer.detach()
+                defer_retired_memmap_directory_cleanup(path)
+                if hasattr(original,'add_note'):
+                    original.add_note(f'Owned projection cleanup deferred: {cleanup_error}')
+        raise
+    else:
+        owner.cleanup()
+
+
+def _project_encoded_native_planes(store, sampler, view, output_shape, bbox, packed, bounds, slice_counts, workers):
+    """Parallel destination-owned planes; inputs and prepared geometry stay borrowed."""
+    from .backprojection import _native_pull_ordered_planes
+    from .projection_coverage_cpu import prepare_native_pull_plan, pull_native_encoded_flat_into, NativePullPlanUnavailable
+    from .runtime import runtime_telemetry
+    from .workspace import _env_int
+
+    started = time.perf_counter()
+    plan = prepare_native_pull_plan(view, tuple(store.shape), output_shape,
+        max_plan_bytes=max(1,_env_int('YOLO_TTA_NATIVE_PULL_PLAN_MIB',64))*1024**2)
+    plan_seconds = time.perf_counter()-started
+    out_t,out_h,out_w = output_shape
+    plane_size = out_h*out_w
+    packed_plane_bytes = out_h*((out_w+7)//8)
+    # One uint8 plane plus packbits output and uncached angular strip work.
+    # Futures return only scalars, so no additional consumer plane is retained.
+    per_worker = plane_size+packed_plane_bytes+plan.temporary_strip_bytes+9*(out_h+out_w)+1024**2
+    workspace = max(1,_env_int('YOLO_TTA_NATIVE_PULL_WORKSPACE_MIB',256))*1024**2
+    if per_worker > workspace:
+        raise NativePullPlanUnavailable('Encoded sparse native pull cannot fit one admitted output worker')
+    worker_count = max(1,min(int(workers),out_t,workspace//per_worker))
+    telemetry = runtime_telemetry()
+    progress_key = ('projection.native_destination_pull.live.'+str(view.name)
+                    +'.sparse.'+str(threading.get_ident()))
+    completed = 0
+    def progress(state):
+        telemetry.gauge(progress_key,dict(view=str(view.name),description='Sparse encoded Azimuthal bridge projection',
+            state=state,backend='compiled_sparse_'+plan.backend,workers=worker_count,
+            completed_planes=completed,total_planes=out_t,elapsed_seconds=time.perf_counter()-started,
+            last_update_monotonic=time.monotonic(),plan_bytes=int(plan.persistent_bytes),
+            worker_workspace_bytes=per_worker,plan_build_peak_bytes=int(plan.workspace_bytes),consumer_plane_bytes=0))
+    # Compile one signature before workers share immutable buffers.
+    pull_native_encoded_flat_into(sampler.encoded,store.index,store._packbits_payload,plan,
+        np.empty(0,np.uint8),first_flat=0,destination_bbox_tyx=bbox)
+    def project_plane(z):
+        if not bbox[0] <= z < bbox[3]:
+            return (0,0,0,0)
+        plane = np.zeros((out_h,out_w),np.uint8)
+        flat = plane.reshape(-1)
+        totals = [0,0,0]
+        first = z*plane_size
+        strip = max(1,int(plan.max_strip_voxels))
+        # Restrict work to the bbox's row band while preserving global addresses.
+        begin,stop = bbox[1]*out_w,bbox[4]*out_w
+        for offset in range(begin,stop,strip):
+            result = pull_native_encoded_flat_into(sampler.encoded,store.index,store._packbits_payload,plan,
+                flat[offset:min(stop,offset+strip)],first_flat=first+offset,destination_bbox_tyx=bbox)
+            totals[0] += result['contribution_addresses']
+            totals[1] += result['indexed_input_byte_reads']
+            totals[2] += result['projected_contributions']
+        foreground = int(np.count_nonzero(plane))
+        if foreground:
+            ys = np.flatnonzero(np.any(plane,axis=1))
+            xs = np.flatnonzero(np.any(plane,axis=0))
+            bounds[z] = (int(ys[0]),int(ys[-1])+1,int(xs[0]),int(xs[-1])+1)
+            slice_counts[z] = foreground
+            packed[z] = np.packbits(plane,axis=1,bitorder='little')
+        return (*totals,foreground)
+    progress('running')
+    total_addresses = total_reads = contributions = unique = 0
+    iterator = _native_pull_ordered_planes(out_t,project_plane,worker_count)
+    last_progress = started
+    complete = False
+    try:
+        for z,result in iterator:
+            addresses,reads,positive,foreground = result
+            total_addresses += addresses; total_reads += reads
+            contributions += positive; unique += foreground
+            completed += 1
+            now = time.perf_counter()
+            if now-last_progress >= 2.:
+                progress('running'); last_progress = now
+        complete = True
+        progress('complete')
+    finally:
+        iterator.close()  # Joins/cancels before the caller retires any mapping.
+        if not complete:
+            progress('failed')
+    return dict(map_seconds=plan_seconds,map_bytes=int(plan.persistent_bytes),
+        projected_contributions=contributions,unique=unique,indexed_input_byte_reads=total_reads,
+        contribution_addresses=total_addresses,workers=worker_count,worker_workspace_bytes=per_worker,
+        backend='compiled_sparse_'+plan.backend)
 
 
 def _sample_encoded_mask(encoded, index, angles, rows, columns, valid, packed):
@@ -529,9 +659,11 @@ def project_azimuthal_sparse_store(
 ) -> Dict[str, object]:
     """Write one exact source-space packed CVOL; preserve caller-owned input.
 
-    The result is published only after its writer closes successfully. ``workers``
-    bounds independent output-slice encoding; destination contributions use one
-    nogil kernel so packed bits cannot race. GPU execution is not selected here.
+    The result is published only after its writer closes successfully. Tilted
+    jobs use the prepared compiled pull and bounded destination-slice workers;
+    each slice owns its packed writes. Upright inverse-map scatter stays serial.
+    The existing native-pull ``numpy`` debug setting retains its reference path.
+    GPU execution is not selected here.
     """
     started = time.perf_counter()
     if not is_azimuthal_view(view):
@@ -548,6 +680,7 @@ def project_azimuthal_sparse_store(
     sampler = None
     temporary_path = None
     staging = None
+    retirement = {}
     try:
         if not all(int(value) > 0 for value in store.shape):
             raise ValueError('Sparse Azimuthal input requires three positive dimensions')
@@ -559,8 +692,7 @@ def project_azimuthal_sparse_store(
         if np.any((store.index['kind'] != 0) & (store.index['kind'] != 1)):
             raise ValueError('Invalid mask chunk marker')
         target.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=f'.{target.name}.projection-', dir=target.parent,
-                                         ignore_cleanup_errors=True) as temporary:
+        with _owned_projection_directory(target, retirement) as temporary:
             temporary = Path(temporary)
             temporary_path = temporary
             staging = temporary/'projected.cvol'
@@ -572,6 +704,8 @@ def project_azimuthal_sparse_store(
                 input_bytes = foreground = contributions = unique = max_slab = 0
                 max_addresses = max_address_bytes = 0
                 destination_bbox = None
+                compiled_stats = None
+                compiled_fallback_reason = None
                 candidate_voxels = 0
                 out_t, out_h, out_w = output_shape
                 packed_w = (out_w+7)//8
@@ -593,6 +727,7 @@ def project_azimuthal_sparse_store(
                         map_bytes = mapping.nbytes
                     packed = np.memmap(temporary/'source.bits', mode='w+', dtype=np.uint8,
                                        shape=(out_t, out_h, packed_w))
+                    retirement['mapping'] = weakref.ref(packed._mmap)
                     flat = packed.reshape(-1)
                     scatter_started = time.perf_counter()
                     slabs = _input_slabs(store)
@@ -617,10 +752,26 @@ def project_azimuthal_sparse_store(
                                 del crop
                     finally:
                         slabs.close()
+                    pull_backend = os.environ.get('YOLO_TTA_NATIVE_PULL_BACKEND','compiled').strip().lower()
+                    if pull_backend not in ('compiled','numpy'):
+                        raise ValueError('Sparse native pull backend must be compiled or numpy')
+                    if destination_bbox is not None and pull_backend == 'compiled':
+                        from .projection_coverage_cpu import NativePullPlanUnavailable
+                        try:
+                            compiled_stats = _project_encoded_native_planes(store,sampler,view,output_shape,
+                                destination_bbox,packed,bounds,slice_counts,workers)
+                        except NativePullPlanUnavailable as error:
+                            compiled_fallback_reason = str(error)
+                        if compiled_stats is not None:
+                            contributions += compiled_stats['projected_contributions']
+                            unique += compiled_stats['unique']
+                            map_bytes = compiled_stats['map_bytes']
+                            map_seconds = compiled_stats['map_seconds']
+                            sampler.encoded_bytes_read += compiled_stats['indexed_input_byte_reads']
                     samples = (iter_destination_samples(
                         view, tuple(store.shape), output_shape, chunk_voxels=_MAP_STRIP_PIXELS,
                         destination_bbox_tyx=destination_bbox,
-                    ) if destination_bbox is not None else iter(()))
+                    ) if destination_bbox is not None and compiled_stats is None else iter(()))
                     try:
                         for destinations, angles, rows, columns in samples:
                             if destinations.size != angles.size:
@@ -658,11 +809,22 @@ def project_azimuthal_sparse_store(
                 encode_seconds = time.perf_counter()-encode_started
                 if int(stats['foreground_voxels']) != unique:
                     raise RuntimeError('Packed projection foreground count differs from encoded store')
+                # The encoder has joined all consumers. Release every local
+                # alias, then wait for this owned file's registered unlink.
+                # Windows rmtree/chmod cannot race a pending delete handle.
+                if packed is not None:
+                    flat = None
+                    close_memmap_array_without_flush(packed, unlink_path=temporary/'source.bits')
+                    packed = None
+                    wait_for_retired_memmap_unlinks(path=temporary/'source.bits')
                 if target.exists():
                     raise FileExistsError(f'Projected store appeared during publication: {target}')
                 staging.rename(target)
                 return {**stats, 'path': str(target), 'storage_format': INTERNAL_PACKED_CVOL_FORMAT,
-                        'shape': output_shape, 'backend': 'cpu_numba',
+                        'shape': output_shape, 'backend': compiled_stats['backend'] if compiled_stats is not None else 'cpu_numba',
+                        'projection_workers': compiled_stats['workers'] if compiled_stats is not None else 1,
+                        'projection_worker_workspace_bytes': compiled_stats['worker_workspace_bytes'] if compiled_stats is not None else 0,
+                        'compiled_fallback_reason': compiled_fallback_reason,
                         'map_cache_hit': cache_hit, 'map_bytes': map_bytes,
                         'input_payload_bytes': input_bytes, 'input_foreground_samples': foreground,
                         'projected_contributions': contributions, 'max_decoded_input_slab_bytes': max_slab,
@@ -674,12 +836,14 @@ def project_azimuthal_sparse_store(
                         'destination_full_voxels': math.prod(output_shape),
                         'projection_geometry_contract': 'xta.native_destination_pull/1',
                         'map_seconds': map_seconds, 'scatter_seconds': scatter_seconds,
+                        'scatter_timing_includes_plan_setup': compiled_stats is not None,
                         'encode_seconds': encode_seconds, 'seconds': time.perf_counter()-started}
             finally:
                 if sampler is not None:
                     sampler.close()
                     sampler = None
                 if packed is not None:
+                    flat = None
                     close_memmap_array_without_flush(packed, unlink_path=temporary/'source.bits')
                     packed = None
                 flat = None

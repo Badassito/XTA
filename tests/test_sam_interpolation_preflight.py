@@ -6,6 +6,7 @@ from dataclasses import replace
 import io
 import sys
 import types
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -17,6 +18,43 @@ from XTA.config import (
 )
 from XTA.geometry import ViewInfo
 from XTA.sam_integration import SamInterpolationContext, validate_sam_interpolation_geometry
+
+
+def test_explicit_pretracker_topology_cap_is_preserved_with_live_extra_credit(tmp_path):
+    from XTA.sam_interpolation import prepare_sam_interpolation_pass, SamInterpolationInfrastructureError
+    from XTA.sam_resources import admit_sam_parent_resources
+    from tests.test_sam_selection_resources import Pool, GIB
+    observations=np.zeros((3,7,9),np.uint8)
+    observations[[0,2],3,4]=1
+    with admit_sam_parent_resources(Pool(),GIB,'explicit-preflight',headroom_probe=lambda:64*GIB) as profile:
+        assert profile.has_extra_credit and profile.assigned_topology_bytes>1024
+        with pytest.raises(SamInterpolationInfrastructureError,match='topology exceeds'):
+            prepare_sam_interpolation_pass(observations,gap_distance=5,min_radius=0,
+                interpolation_walk_back=0,resource_profile=profile,
+                policy={'sam_bridge_policy':{'max_group_bytes':1024}})
+
+
+def test_inherited_pretracker_topology_cap_can_use_live_extra_credit(tmp_path):
+    from XTA.sam_interpolation import prepare_sam_interpolation_pass
+    from XTA.sam_resources import admit_sam_parent_resources
+    from XTA.sam_branch_selection import branch_workspace_bytes
+    from XTA.sam_policy import resolve_sam_bridge_policy
+    from tests.test_sam_selection_resources import Pool, GIB
+    shape=(18,1024,1024)
+    observations=np.zeros(shape,np.uint8)
+    frames=tuple(range(shape[0]))
+    group=SimpleNamespace(group_id='large',context_bbox_yx=(0,0,1024,1024),frame_indices=frames)
+    run=SimpleNamespace(run_id='large-run',group_id='large',pass_index=1,expected_frames=frames)
+    plan=SimpleNamespace(groups=(group,),runs=(run,),needed_frames=frames,
+        frame_crop_bounds={frame:group.context_bbox_yx for frame in frames},contract_lease_budget=None)
+    required=branch_workspace_bytes(shape)
+    assert required>resolve_sam_bridge_policy(environ={})['max_group_bytes']
+    with admit_sam_parent_resources(Pool(),GIB,'inherited-preflight',headroom_probe=lambda:64*GIB) as profile:
+        assert profile.assigned_topology_bytes>required
+        with mock.patch('XTA.sam_bridge_planning.plan_sam_bridges',return_value=plan):
+            prepared=prepare_sam_interpolation_pass(observations,gap_distance=17,min_radius=0,
+                interpolation_walk_back=0,resource_profile=profile)
+    assert prepared.runs==(run,)
 
 
 def transverse(*, shape=(3, 4, 6)):

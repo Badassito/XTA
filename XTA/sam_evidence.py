@@ -835,14 +835,18 @@ def load_sam_online_selection(bundle, *, policy_hash=None, selected_run_ids=None
     if (bundle.scope.get("selection_receipt_required", False) or receipt.get('resolved_policy', {}).get('version') in (4,5)) and "mask_filter" not in receipt:
         raise ValueError("Published SAM component filtering requires its retained mask filter specification")
     tiled=bundle.scope.get("sam_crop_mode")=="tiled" or any(run.get("generation_mode")=="tiled" for run in bundle.runs.values())
-    if tiled and (receipt.get("resolved_policy",{}).get("version") not in (3,5) or "mask_filter" not in receipt
+    if tiled and (receipt.get("resolved_policy",{}).get("version") not in (3,5,7) or "mask_filter" not in receipt
                   or receipt.get("tiled_quality_contract",{}).get("schema")!="xta.sam_tiled_quality/1"):
         raise ValueError("Published tiled SAM support requires its retained quality-v3 filter/halo contract")
     # Validation belongs to the same central interpreter used for effective
     # support. A portable sidecar cannot downgrade new filtered outputs to old
     # unfiltered semantics merely by changing its stated policy version.
     from .sam_filtering import _spec as validate_mask_filter
-    validate_mask_filter(receipt)
+    from .sam_branch_selection import validate_branch_selection
+    filter_spec = validate_mask_filter(receipt)
+    branch = validate_branch_selection(receipt, bundle, mask_filter_sha256=None if filter_spec is None else filter_spec['sha256'])
+    if branch is not None and set(receipt['selected_run_ids']) != set(branch['selected_edge_ids_by_run']):
+        raise ValueError('Published SAM branch ownership differs from its retained selected contributors')
     if policy_hash and receipt.get("policy_hash") != str(policy_hash):
         raise ValueError("SAM published policy identity differs from its retained selection")
     if selected_run_ids is not None and set(map(str, selected_run_ids)) - set(receipt["selected_run_ids"]):

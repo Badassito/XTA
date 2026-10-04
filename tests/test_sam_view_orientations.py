@@ -187,9 +187,32 @@ def test_fake_sam_selected_directional_slots_use_native_view_geometry_and_existi
                 mock.patch.object(assembly, 'final_source_output_shape', return_value=SOURCE_SHAPE):
             refs = [assembly.materialize_sam_directional_view_layer(dict(item), model_name='detector', view=view,
                     source='fullframe', pass_index=1, sam_context=context) for item in components]
-        assert all(ref.shape == shape for ref in refs)
+        assert all(ref.shape == SOURCE_SHAPE for ref in refs)
         assert all(ref.native_transform['view_family'] == view.family for ref in refs)
         assert all(ref.native_transform['detector_augmentation_angle_deg'] == 31. for ref in refs)
+        assert all(ref.native_transform['native_shape_tyx'] == list(shape) for ref in refs)
+        from XTA.interpolation import RawBBoxMaskStore
+        from XTA.reconciliation_runtime import RuntimeLayer
+        # Exercise the public ref that export, reconciliation and survival
+        # readers actually use. Transform metadata alone never moves a voxel.
+        for ref in refs:
+            direction = 1 if ref.interpolation_direction == 'forward' else -1
+            source_store = RawBBoxMaskStore.open(Path(components[0 if direction == 1 else 1]['path']))
+            try:
+                assert source_store.shape == shape
+                native = np.stack([source_store.decode_slice(frame) for frame in range(shape[0])])
+            finally:
+                source_store.close()
+            expected_public = assembly.project_view_volume_to_orthogonal_volume(native, view,
+                tmp_path/f'{direction}.expected.u8', 'expected SAM public projection',
+                out_shape_tyx=SOURCE_SHAPE, prefer_memory=True, reserve_bytes=0)
+            owner = RuntimeLayer(ref, SOURCE_SHAPE)
+            try:
+                np.testing.assert_array_equal(owner.read_slab(0, SOURCE_SHAPE[0]), expected_public)
+            finally:
+                owner.close()
+                if isinstance(expected_public, np.memmap):
+                    expected_public._mmap.close()
         projected = assembly.project_view_volume_to_orthogonal_volume(np.asarray(merged), view,
                     tmp_path/'source.u8', 'selected SAM view projection', out_shape_tyx=SOURCE_SHAPE,
                     prefer_memory=True, reserve_bytes=0)

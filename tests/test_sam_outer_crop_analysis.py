@@ -72,7 +72,8 @@ def test_receipt_for_C2_is_rejected_against_A2_despite_preserved_run_and_group_i
     spec=importlib.util.spec_from_file_location("scorer_acceptance_fixture",fixture_path)
     fixture=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixture)
     source,_,a2,proof=fixture._source(tmp_path,leak=True)
-    source_receipt=fixture.select_sam_proposals(source,policy={"sam_bridge_policy":{"max_group_bytes":512*1024**2}})
+    source_receipt=fixture.select_sam_proposals(source,policy={"sam_bridge_policy":{
+        "version":4,"strict_containment":True,"max_group_bytes":512*1024**2}})
     derived,derived_receipt,_=fixture.derive_a2_bundle(source,a2,proof,tmp_path/"A2")
     assert set(source.runs)==set(derived.runs)and set(source.groups)==set(derived.groups)
     assert not source_receipt["selected_run_ids"]and derived_receipt["selected_run_ids"]

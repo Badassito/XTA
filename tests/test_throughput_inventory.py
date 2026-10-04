@@ -22,6 +22,7 @@ def predecessor():
         return files, metadata, json.loads(files['release/_package_inventory.json'])
     prior = json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
     prior.pop(KEY, None)
+    prior.pop('v24_0_2_sam_bridges_development_review', None)
     metadata = dict(kind='qualified_development_source_zip', qualification_status='passed',
         full_qualification=True, package_version='25.0.1', source_identity_count=724,
         sha256=inventory.REVIEWED_V24_JOB150790_150798_THROUGHPUT_DEVELOPMENT_PREDECESSOR_ARCHIVE_SHA256,

@@ -23,6 +23,7 @@ def predecessor():
         return files, metadata, json.loads(files['release/_package_inventory.json'])
     prior = json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
     prior.pop('v24_job150790_150798_throughput_development_review', None)
+    prior.pop('v24_0_2_sam_bridges_development_review', None)
     prior.pop('v24_job150772_performance_development_review', None)
     prior.pop(KEY, None)
     metadata = dict(kind='reviewed_development_source_zip',

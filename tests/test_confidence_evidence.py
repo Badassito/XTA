@@ -21,7 +21,7 @@ from XTA.confidence_evidence import (
 from XTA.confidence_projection import score_projection_reader, resize_score_plane_max
 from XTA.config import TiltedViewGroup
 from XTA.outputs import _read_layer_slice_in_output_shape
-from XTA.runtime import close_memmap_array_without_flush
+from XTA.runtime import close_memmap_array_without_flush, wait_for_retired_memmap_unlinks
 
 
 class ConfidenceEvidenceTests(unittest.TestCase):
@@ -198,15 +198,21 @@ class ConfidenceEvidenceTests(unittest.TestCase):
                 expected = np.zeros(output, dtype=np.uint8)
                 for level in (32, 137, 241):
                     mask = np.asarray(values >= level, dtype=np.uint8)
+                    binary_path = self.root / f'binary{index}_{level}.dat'
                     binary = assembly.project_view_volume_to_orthogonal_volume(mask, view,
-                        self.root / f'binary{index}_{level}.dat', 'confidence oracle', workers=1,
+                        binary_path, 'confidence oracle', workers=1,
                         out_shape_tyx=output if view.family in ('azimuthal', 'radial', 'spherical') or geometry.is_tilted_view(view) else None)
                     try:
                         support = np.stack([_read_layer_slice_in_output_shape(binary, output, z)
                                             for z in range(output[0])]) > 0
                         expected[support] = level
                     finally:
-                        close_memmap_array_without_flush(binary)
+                        # Retirement preserves live consumers; release this last
+                        # local and await deletion before TemporaryDirectory cleanup.
+                        close_memmap_array_without_flush(binary, unlink_path=binary_path)
+                        binary = None
+                        wait_for_retired_memmap_unlinks(path=binary_path)
+                    self.assertFalse(binary_path.exists())
                 np.testing.assert_array_equal(actual, expected)
 
 

@@ -93,11 +93,13 @@ def _bundle(path, families, *, tiled=False, halo_leak=False, missing_tile=False)
 
 
 def _stock(bundle):
-    return select_sam_proposals(bundle,{'sam_bridge_policy':{'guarded_rescue':False}})
+    version = 5 if bundle.scope.get('sam_crop_mode') == 'tiled' else 4
+    return select_sam_proposals(bundle,{'sam_bridge_policy':{'version':version,'guarded_rescue':False}})
 
 
 def _rescue(bundle):
-    return select_sam_proposals(bundle)
+    version = 5 if bundle.scope.get('sam_crop_mode') == 'tiled' else 4
+    return select_sam_proposals(bundle,{'sam_bridge_policy':{'version':version}})
 
 
 def _assert_rejected(bundle, reason=None):

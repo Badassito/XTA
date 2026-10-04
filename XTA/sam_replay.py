@@ -16,7 +16,8 @@ import numpy as np
 
 from .reconciliation_io import ReferenceGeometry, write_seg_nrrd
 from .sam_evidence import SamEvidenceBundle, evidence_frame_geometry, native_output_shape_tyx, selected_native_plane
-from .sam_policy import resolve_sam_bridge_policy, select_sam_proposals
+from .sam_policy import (resolve_sam_bridge_policy, select_sam_proposals,
+                         _saved_generation_mode, _branch_contract_fallback)
 from .sam_mask_reader import effective_candidate_mask
 
 
@@ -54,7 +55,13 @@ def replay_sam_directional_nrrds(bundle, output, *, policy=None,
     source_policy = policy or {}
     if 'kind' in source_policy and 'mode' not in source_policy:
         source_policy = {'sam_bridge_policy': source_policy}
-    policy_group_bytes = int(resolve_sam_bridge_policy(source_policy)['max_group_bytes'])
+    generation_mode = _saved_generation_mode(bundle)
+    resolved_policy = resolve_sam_bridge_policy(source_policy, generation_mode=generation_mode)
+    if resolved_policy['branch_aware_selection']:
+        source_policy, fallback = _branch_contract_fallback(bundle, source_policy, generation_mode)
+        if fallback is not None:
+            resolved_policy = resolve_sam_bridge_policy(source_policy, generation_mode=generation_mode)
+    policy_group_bytes = int(resolved_policy['max_group_bytes'])
     for group in bundle.groups.values():
         y0, x0, y1, x1 = map(int, group['context_bbox_yx'])
         if not (0 <= y0 < y1 <= shape[1] and 0 <= x0 < x1 <= shape[2]):
@@ -64,8 +71,13 @@ def replay_sam_directional_nrrds(bundle, output, *, policy=None,
         if any(isinstance(frame, bool) or not isinstance(frame, int)
                or not 0 <= frame < frame_limit for frame in frames):
             raise ValueError('SAM replay frame lies outside its declared native canvas')
-        topology_bytes = len(frames) * (y1 - y0) * (x1 - x0) * 16
-        if topology_bytes > min(budget_bytes, policy_group_bytes):
+        topology_shape = (len(frames), y1-y0, x1-x0)
+        if resolved_policy.get('branch_aware_selection', False):
+            from .sam_branch_selection import branch_workspace_bytes
+            topology_bytes = branch_workspace_bytes(topology_shape)
+        else:
+            topology_bytes = len(frames)*(y1-y0)*(x1-x0)*16
+        if topology_bytes > min(max(0,budget_bytes-reader_cache_bytes), policy_group_bytes):
             raise ValueError('SAM replay budget cannot fit bounded group topology')
     output = Path(output).resolve()
     if output.exists():
@@ -90,6 +102,7 @@ def replay_sam_directional_nrrds(bundle, output, *, policy=None,
     try:
         with bundle.reader(max_cache_bytes=reader_cache_bytes) as reader:
             selection_view = {**selection, 'mask_filter': reader.filter_snapshot(selection)}
+            selection_view.pop('branch_selection', None)
             for pass_index in passes:
                 for direction in ('forward', 'backward'):
                     run_ids = tuple(run_id for run_id in selection['selected_run_ids']

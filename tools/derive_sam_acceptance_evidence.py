@@ -2,8 +2,8 @@
 
 This performs no inference. Actual proposal group/run/child identities, receipts,
 scores and every original payload record remain C2 evidence. Only the declared
-acceptance masks change; A2 measurement identities remain separate metadata. The usual conservative
-whole-v2/tiled-v3 evaluator handles the derived bundle as a frozen diagnostic.
+acceptance masks change; A2 measurement identities remain separate metadata. The
+sealed whole-v4/tiled-v5 evaluator handles the derived bundle as a frozen diagnostic.
 """
 from __future__ import annotations
 
@@ -231,18 +231,26 @@ def derive_a2_bundle(c2bundle, a2plan, proof, outdir, *, policy=None):
     source.assert_unchanged()
     proof = _plain(proof)
     groups, group_records, run_maps, removed, group_map, changes = _verify_plan(source, a2plan, proof)
-    policy = {"sam_bridge_policy": {"max_group_bytes": 512 * 1024**2}} if policy is None else policy
+    mode = source.scope.get("sam_crop_mode", "whole")
+    legacy_version = 5 if mode == "tiled" else 4
+    policy = {"sam_bridge_policy": {"version": legacy_version,
+        "max_group_bytes": 512 * 1024**2}} if policy is None else policy
     if set(policy) - {"sam_bridge_policy"}:
         raise ValueError("A2 diagnostics cannot use a custom selector or reconciliation hook")
-    mode = source.scope.get("sam_crop_mode", "whole")
-    resolved = resolve_sam_bridge_policy(policy, generation_mode=mode)
-    stock = resolve_sam_bridge_policy(None, generation_mode=mode)
+    if isinstance(policy.get("sam_bridge_policy"), dict):
+        policy = {"sam_bridge_policy": {"version": legacy_version, **policy["sam_bridge_policy"]}}
+    # Changed-A replay is a sealed historical protocol, so a new production
+    # default or process environment must not silently change its causal test.
+    resolved = resolve_sam_bridge_policy(policy, generation_mode=mode, environ={})
+    stock = resolve_sam_bridge_policy({"sam_bridge_policy": {"version": legacy_version}},
+        generation_mode=mode, environ={})
     for field, value in stock.items():
         if field not in {"name", "max_group_bytes", "strict_family_agreement"}:
             if field not in resolved:
                 raise ValueError(f"A2 diagnostics require stock strict quality field {field}")
             _equal(resolved[field], value, f"stock strict quality field {field}")
     _equal(resolved["max_group_bytes"], 512 * 1024**2, "the frozen research operational cap")
+    policy = {"sam_bridge_policy": resolved}
     outdir = Path(outdir).resolve()
     if outdir.exists():
         raise FileExistsError(f"A2 measurement destination must be fresh: {outdir}")

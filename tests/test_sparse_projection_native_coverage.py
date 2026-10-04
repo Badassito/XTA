@@ -80,7 +80,9 @@ def test_sparse_selected_cells_equal_full_destination_pull(tmp_path, view, targe
     assert result['foreground_voxels'] == np.count_nonzero(expected)
     assert result['input_foreground_samples'] == 3
     assert result['max_destination_address_count'] <= sparse_projection._MAP_STRIP_PIXELS
-    assert (result['map_bytes'] == 0) == geometry.is_tilted_azimuthal_view(view)
+    assert result['map_bytes'] > 0
+    if geometry.is_tilted_azimuthal_view(view):
+        assert result['backend'].startswith('compiled_sparse_')
 
 
 @pytest.mark.parametrize('view', _views((61, 73, 89))[::3], ids=lambda view: view.name)
@@ -110,7 +112,7 @@ def test_tiny_component_native_upscale_visits_bounded_destination(tmp_path, view
             result = sparse_projection.project_azimuthal_sparse_store(
                 source_path, view, tmp_path / 'tiny-projected.cvol', out_shape_tyx=target,
             )
-    assert len(seen) == int(geometry.is_tilted_azimuthal_view(view))
+    assert not seen  # Tilted jobs now use the fused compiled destination pull.
     assert result['destination_candidate_voxels'] < np.prod(target) // 2
     if position == 'center':
         assert result['destination_candidate_voxels'] < np.prod(target) // 100
@@ -195,10 +197,10 @@ def test_tilted_pull_failure_preserves_source_and_never_publishes_partial_store(
     with contextlib.redirect_stdout(io.StringIO()):
         write_raw_bbox_mask_store(data, source_path, desc='failure source')
 
-    def fail(*_args):
+    def fail(*_args, **_kwargs):
         raise RuntimeError('injected pull failure')
 
-    with mock.patch.object(sparse_projection, '_or_pulled_addresses', new=fail):
+    with mock.patch('XTA.projection_coverage_cpu.pull_native_encoded_flat_into', new=fail):
         with pytest.raises(RuntimeError, match='injected pull failure'):
             sparse_projection.project_azimuthal_sparse_store(
                 source_path, view, target, out_shape_tyx=(11, 13, 15),

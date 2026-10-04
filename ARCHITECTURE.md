@@ -10,7 +10,7 @@ document is available in Git with `git show 597fc45:ARCHITECTURE.md`.
 
 ## Entry points and shared contracts
 
-`GPT-6-Astra-Ultra_v24.0.1_SLURM.py`, the installed `xta` command, and
+`GPT-6-Astra-Ultra_v24.0.2_SLURM.py`, the installed `xta` command, and
 `python -m XTA` enter `XTA.cli.run()`. The CLI selects exactly one mode and
 validates that mode's grammar before importing its heavy runtime. `tta_mode`
 enters `pipeline.main`, `pta_mode` resolves `PtaConfig` before `pta_runtime`
@@ -127,6 +127,13 @@ not the acceptance criterion.
 
 Worker GPUs retain inference-first ownership, full-frame workers write bounded
 direct unions, and result queues wake the scheduler through the result pump.
+The v24.0.2 scheduler reuses identical parent-admission decisions within each
+read-only backlog scan. It also returns the confidence portion of a parent's
+dense credit after the backing mapping and its aliases have actually retired,
+so slow source projection does not keep charging confidence storage it no longer
+owns. Parent-union credit remains held until its own retirement. These changes
+address CPU backlog overhead and admission stalls introduced by the larger
+direct-union workload; they retain the canonical projection coverage.
 Split-view hole filling runs after view completion; single-lease eligibility
 still permits device filling. Resource controls remain available where they
 change concurrency or peak storage. Two redundant booleans were consolidated:
@@ -211,6 +218,15 @@ Confidence uses the matching source sampling taps. This correction covers
 Transverse, Sagittal and Coronal; oblique and Azimuthal kernels are separate.
 Source publication begins only after the complete producer coverage has settled.
 
+Sparse Tilted Azimuthal bridge publication uses the same prepared angular
+ownership and native destination equations as dense projection, with encoded
+CVOL bit reads fused into the compiled CPU loop. Workers own distinct output
+slices under a bounded plane-and-packing budget. This avoids serial construction
+of destination address vectors while completed-parent masks hold admission
+credit. Live projection gauges include this sparse work. Job150993 supplies
+timing evidence for this path; its bridge masks are excluded from correctness
+qualification.
+
 `--reconciliation POLICY.py` evaluates completed source-space component layers
 before global postprocessing. The additive layers remain available; the policy
 changes the derived final mask. `reconciliation_policy` resolves external
@@ -267,27 +283,26 @@ mode. The retained canvas contract distinguishes working and native shapes;
 disabling delayed native mask expansion does not bypass processing-cube
 resampling.
 
-Historical whole-v2 and tiled-v3 selection receipts keep their strict quality
-interpretation. Current development stock defaults are whole v4 and tiled v5:
-the ordinary conservative stage runs first, followed by guarded rescue over
-complete, previously unselected containment-only candidates. Stock-selected
-owners have absolute priority. Rescue supports exactly one requested edge per
-group and requires both independently seeded directions, stronger
-endpoint/agreement checks, bounded component spill,
-protected-domain crop-edge clearance, and the existing local topology/contact
-rules. Each rescued direction must separately supply the requested local
-connection. A bounded allowance covers only small, wholly outside, nonwriting
-satellites, disjoint from protected write/evaluation/reference neighborhoods;
-their raw support remains diagnostic and cannot become published additions.
-Write geometry, central component filtering, coverage, and resource caps
-remain unchanged; refused or missing evidence cannot be rescued. A current
-`guarded_rescue=False` policy is the strict comparator, and explicit v2/v3
-settings remain available. Custom hooks and permissive policies do not receive
-automatic rescue. See the documented thresholds and inspectable
-`xta.sam_guarded_rescue/1` receipt in [SAM policy controls](docs/sam_interpolation.md).
-Multi-edge rescue is excluded with the non-overridable
-`rescue_multibranch_attribution_not_supported` reason; ordinary stock multi-edge
-decisions are unchanged, with no rescue branch salvage or ownership partition.
+The v24.0.2 defaults are whole v6 and tiled v7. `sam_branch_selection`
+certifies each requested connection independently using original seed-connected
+SAM support and immutable detector anchors. It can retain a successful daughter
+when another fails, or join independently seeded prefixes that meet inside the
+gap. Actual gap connectivity replaces a requirement to reproduce half of a much
+larger observed parent. Output uses the fixed tracker context, subtracts all
+original detections, and preserves radius filtering and unrelated-contact checks.
+Context-border contact is recorded as censored object extent rather than erasing
+an otherwise certified connection; no pixels beyond the crop are invented.
+Packed per-owner masks and observed attachment proofs are shared by policy,
+replay, publication and final-survival readers. Final cleanup cannot restore a
+removed observed attachment merely to certify survival.
+
+`YOLO_TTA_SAM_TIGHT_CROP_GUARD=0|1` controls the inherited acceptance-corridor
+veto. An unset value inherits the resolved policy: off in v6/v7, on in explicit
+legacy v2-v5. Launch pinning distinguishes an unset request from an explicit
+choice. Saved complete policies do not depend on ambient environment settings.
+Historical whole v2/tiled v3 keep strict family selection; explicit whole v4/
+tiled v5 retain their separate guarded-rescue stage. Legacy run-ID callbacks
+keep their prior semantics. See [SAM policy controls](docs/sam_interpolation.md).
 Tiled selected additions use native owned-core assembly, while
 retained full halo unions remain quality evidence. Complete raw
 halo, seed, frame, score, and availability records live in the existing indexed
@@ -295,15 +310,20 @@ bundle. Unknown unseeded cores are not successful empty predictions. Fixed
 replay reads the saved mode and cannot turn whole generation into tiled evidence.
 
 `sam_bridge_planning` retains original detector slice-component identities and
-plans bounded observed families. Each plan fixes context, acceptance, and write
-geometry. Context can cross detector tile seams; write geometry protects
-observed support per branch. `sam_tracker_runtime` reuses isolated persistent
+plans bounded observed families. Each plan fixes context, acceptance, and legacy
+write geometry. Context can cross detector tile seams. The selected policy
+chooses the legacy write mask or certified support within that fixed context;
+both protect original observations. `sam_tracker_runtime` reuses isolated persistent
 LTA tracker workers with independent endpoint-seeded sessions. Raw observations
 precede tracker confidence filtering and publication cleanup. `sam_evidence`
 keeps overlapping masks attributable in an indexed compressed scope bundle.
 
 `sam_policy` resolves proposal quality and selects contributors before their
 forward/backward directional unions are published by `sam_interpolation`.
+Public directional references carry actually projected source-oriented backing;
+native transform metadata alone does not perform that projection. Native
+disjoint additions can overlap detector support after source restoration or
+low-quality downsampling merges distinct samples.
 Source-slab reconciliation runs later and its union-reuse optimization consumes
 already selected support. Tracker scores remain separate from detector
 confidence. A selected bridge and its eventual survival after source voting

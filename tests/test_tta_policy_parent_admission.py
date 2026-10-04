@@ -286,6 +286,7 @@ class PolicyParentWorkspaceIntegrationTests(unittest.TestCase):
                 angle_variant_gpu_fastpath_active=False,
                 component_ref_dense_retirement_active=True,
                 _publish_parent_mask_ready=mock.Mock(),
+                _publish_parent_confidence_retired=mock.Mock(),
                 _submit_component_projection=mock.Mock(),
                 _dispatch_inference_windows=mock.Mock(),
                 keep_temp_artifacts=False)

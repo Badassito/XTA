@@ -2342,17 +2342,46 @@ class TtaScheduler:
     def publish_gpu_worker_admissible_backlog(self) -> None:
         """Keep D1 from winning a device while dispatchable inference remains central."""
         admissible = False
-        for pending_task_id in list(self.state.gpu_worker_pending_task_ids):
+        # A full dense window makes every lease of an unopened parent fail the
+        # same check. Recomputing live totals and its byte request for thousands
+        # of sibling leases twice per refill made memory backpressure itself a
+        # substantial scheduler workload. Reuse only within this read-only scan;
+        # a handoff/retirement or mutable task contract is observed on the next call.
+        direct_admission = {}
+        admission_totals = None
+        for pending_task_id in self.state.gpu_worker_pending_task_ids:
             pending_task = self.state.gpu_worker_tasks_by_id[int(pending_task_id)]
             gpu_policy_eligible = bool(
                 self.hybrid_task_is_gpu_mandatory(pending_task)
                 or self.hybrid_task_is_active_cpu_assist(pending_task)
             )
-            if (
-                gpu_policy_eligible
-                and self.direct_union_task_admissible(pending_task)
-                and self.tile_dense_result_task_admissible(pending_task)
-            ):
+            if not gpu_policy_eligible:
+                continue
+            parent = self.direct_union_task_key(pending_task)
+            shape = pending_task.get('processing_shape', ())
+            shared_admission = bool(parent is not None
+                and not pending_task.get('bounded_parent_admission', False)
+                and isinstance(shape, (tuple, list)) and len(shape) == 3
+                and all(isinstance(value, (int, np.integer)) for value in shape))
+            if parent is not None and admission_totals is None:
+                admission_totals = (
+                    len({self.state.direct_union_admission_group_by_parent.get(key, key)
+                         for key in self.state.direct_union_inference_views}),
+                    int(sum(self.state.direct_union_inference_bytes.values())),
+                    int(sum(self.state.direct_union_postprocess_bytes.values())),
+                )
+            if shared_admission:
+                contract = (parent, str(pending_task.get('result_mode', 'file')), tuple(shape))
+                if contract not in direct_admission:
+                    direct_admission[contract] = self.direct_union_task_admissible(
+                        pending_task, precomputed_key=parent, admission_totals=admission_totals)
+                storage_admissible = direct_admission[contract]
+            else:
+                # Policy siblings and inferred/heterogeneous shapes retain their
+                # individual validation, including ownership consistency errors.
+                storage_admissible = self.direct_union_task_admissible(
+                    pending_task, precomputed_key=parent, admission_totals=admission_totals)
+            if storage_admissible and self.tile_dense_result_task_admissible(pending_task):
                 admissible = True
                 break
         self.operations._set_main_process_gpu_pending_inference(bool(admissible))

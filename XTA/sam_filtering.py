@@ -24,6 +24,7 @@ IMPLEMENTATION_SHA256 = hashlib.sha256(_SOURCE_PATH.read_bytes()).hexdigest()
 _MAX_COMPONENT_RECORDS = 128
 _QUALIFIED_LEGACY_IMPLEMENTATION = "bac0f301626e20500c3b8beab261b1f9ea64289de2af2add26b883507495a780"
 _QUALIFIED_PREVIOUS_IMPLEMENTATION = "96278bbc549acb81c54f1e6f8124faa1d091ffbca378e98cd73d09040f44368c"
+_QUALIFIED_RADIUS_ONLY_IMPLEMENTATION = "c67e0fed11962aba7b106cb7dce3f60b5eb6ce44b042159cb73cc99767c78cf7"
 _QUALIFIED_NUMERICAL_SOURCE = "c98e939e8187951f7f77a78c3401800bf2d85405c4acd9cde8c65f9ae8f33fd3"
 
 
@@ -64,7 +65,8 @@ def _compatible_filter_implementation(identifier):
     """Accept the qualified v25 receipts only while their exact numerics remain."""
     if identifier == IMPLEMENTATION_SHA256:
         return True
-    if identifier not in (_QUALIFIED_LEGACY_IMPLEMENTATION, _QUALIFIED_PREVIOUS_IMPLEMENTATION):
+    if identifier not in (_QUALIFIED_LEGACY_IMPLEMENTATION, _QUALIFIED_PREVIOUS_IMPLEMENTATION,
+                          _QUALIFIED_RADIUS_ONLY_IMPLEMENTATION):
         return False
     # The bounded radius implementation preserves the original padded EDT and
     # complete-component decision. Bind historical receipts to every numerical
@@ -95,8 +97,8 @@ def _spec(value):
         resolved = value.get("resolved_policy", {})
         version = resolved.get("version") if isinstance(resolved, Mapping) else None
         name = str(value.get("policy_name", ""))
-        named_version = next((v for v in (2, 3, 4, 5) if name.endswith(f"_v{v}")), None)
-        modern = (version in (2, 3, 4, 5, "2", "3", "4", "5") or named_version is not None
+        named_version = next((v for v in (2, 3, 4, 5, 6, 7) if name.endswith(f"_v{v}")), None)
+        modern = (version in (2, 3, 4, 5, 6, 7, "2", "3", "4", "5", "6", "7") or named_version is not None
                   or "component_filter_implementation_sha256" in value
                   or isinstance(resolved, Mapping) and "enforce_interpolation_min_radius" in resolved)
         if modern:
@@ -229,6 +231,7 @@ def effective_raw_mask(bundle, run_id, frame, receipt_or_filter=None):
 
 
 def effective_candidate_mask(bundle, run_id, frame, receipt_or_filter=None):
-    """Apply full-raw component filtering, then preserve original write ownership."""
-    raw = effective_raw_mask(bundle, run_id, frame, receipt_or_filter)
-    return _readonly(bundle.candidate_mask(run_id, frame) & raw)
+    """Use the central owner interpreter, including retained branch restrictions."""
+    _spec(receipt_or_filter)
+    from .sam_mask_reader import effective_candidate_mask as central_candidate_mask
+    return central_candidate_mask(bundle, run_id, frame, receipt_or_filter)

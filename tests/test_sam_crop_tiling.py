@@ -65,8 +65,10 @@ def test_one_tile_control_retains_original_run_ids_and_exact_whole_pixels(tmp_pa
         assert stats['sam_tiled_child_jobs_generated'] == 2
         assert stats['sam_tiled_multi_tile_runs'] == 0
         assert len(components) == 2
-        assert stats['sam_selection_receipt']['resolved_policy']['version'] == 5
-        assert whole_stats['sam_selection_receipt']['resolved_policy']['version'] == 4
+        assert stats['sam_selection_receipt']['resolved_policy']['version'] == 7
+        assert whole_stats['sam_selection_receipt']['resolved_policy']['version'] == 6
+        assert stats['sam_selection_receipt']['resolved_policy']['branch_write_domain'] == 'fixed_context'
+        assert whole_stats['sam_selection_receipt']['resolved_policy']['branch_write_domain'] == 'fixed_context'
         for run in b.runs.values():
             assert run['tracker_scores'] is None
             assert run['tile_evidence'][0]['tracker_scores']['2'] == .8
@@ -111,7 +113,7 @@ def test_large_discarded_halo_leak_rejects_its_original_run_before_publication(t
                 result.frames[2][5:15, 900:910] = True
             return result
     merged, stats, _ = interpolate_sam_view_volume_pass(_wide(), work_dir=tmp_path,
-        runtime=LeakTracker(), **_options())
+        runtime=LeakTracker(), policy={'sam_bridge_policy':{'strict_containment':True}}, **_options())
     try:
         bundle = SamEvidenceBundle.open(stats['sam_evidence_path'])
         forward = next(key for key, value in bundle.runs.items() if value['direction']=='forward')
