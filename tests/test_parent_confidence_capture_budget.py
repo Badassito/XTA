@@ -97,7 +97,8 @@ def test_submitted_capture_scope_runs_inside_exact_parent_reservation(tmp_path):
     def prepare(**kwargs):
         assert kwargs['slice_workers'] == 32
         assert kwargs['union_mm'].shape == (3, 4, 5)
-        assert kwargs['confmap_mm'].shape == (3, 4, 5)
+        assert kwargs['confmap_mm'] is None
+        assert kwargs['confidence_owner'].pop().shape == (3, 4, 5)
         events.append(('prepare', 32))
         return 'prepared'
     ns['parent_transient_admission'] = SimpleNamespace(reserve=reserve)

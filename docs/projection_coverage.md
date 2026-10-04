@@ -197,6 +197,30 @@ components share the dense/score destination addresses while reading encoded
 CVOL bits directly. Raw and packed inputs preserve selected-component bounds
 and physical shear; neither route requires a decoded native volume.
 
+The v25.0.2 Job150993 performance correction uses the prepared angular plan
+and a fused compiled encoded-mask reader for these sparse Tilted Azimuthal
+components. Bounded CPU workers own separate output slices, so packed output
+bits cannot race. Geometry preparation is shared across the workers; source
+payloads remain immutable. Memory admission includes output planes and packing
+workspace, and live projection progress exposes work that previously appeared
+only in completion counters.
+If the prepared plan or one output worker cannot fit the configured fast-path
+bounds, the existing bounded reference path remains available with an explicit
+fallback reason. Invalid geometry and corrupt payloads still fail normally.
+Successful publication retires the owned packed mapping and waits for its
+scratch-file deletion before removing the temporary directory. Failed workers
+or encoders preserve their original exception; traceback-held mappings remain
+valid until their consumers retire, while partial owned output staging is
+cleaned separately. Borrowed input stores are never part of this cleanup.
+
+The earlier serial address-vector path scanned billions of destination cells
+and held completed-parent masks while doing so. Three overlapping bridge
+projections in Job150993 took approximately 19, 24.5 and 51.8 minutes, filling
+the postprocessing storage allowance and starving detector workers. That run
+is timing evidence only: its bridge masks are not correctness references.
+Projection correctness is checked with independent synthetic geometry and
+the established native destination-pull oracle.
+
 ## CPU qualification and release receipts
 
 The focused receipts below describe the original v25.0.1 coverage patch.

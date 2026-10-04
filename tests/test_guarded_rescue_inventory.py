@@ -24,6 +24,7 @@ def qualified():
     # inventory embeds the entire prior receipt; no host Scratch path is needed.
     predecessor = json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
     predecessor.pop('v24_job150790_150798_throughput_development_review', None)
+    predecessor.pop('v24_0_2_sam_bridges_development_review', None)
     predecessor.pop('v24_job150772_performance_development_review', None)
     predecessor.pop('v24_0_1_release_review', None)
     predecessor.pop('v24_job150615_headroom_development_review', None)

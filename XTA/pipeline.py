@@ -2864,6 +2864,7 @@ def _main_impl() -> None:
     # P (cleaned parent YOLO) is published before parent interpolation through this queue.
     # B (parent-only interpolation delta) becomes ready when the parent future completes.
     parent_mask_ready_events = queue.SimpleQueue()
+    parent_confidence_retired_events = queue.SimpleQueue()
     parent_bridge_ready: set[Tuple[str, str]] = set()
     parent_tile_supports_retired: set[Tuple[str, str]] = set()
     postprocessed_tiles_waiting_by_parent: Dict[Tuple[str, str], Dict[str, object]] = {}
@@ -3020,6 +3021,14 @@ def _main_impl() -> None:
         except (NameError, UnboundLocalError):
             pass
 
+    def _publish_parent_confidence_retired(model_name: str, view_name: str, nbytes: int,
+                                         *, expected_lease: _DirectUnionBackingLease) -> None:
+        parent_confidence_retired_events.put(
+            ((str(model_name), str(view_name)), expected_lease, int(nbytes)))
+        # Initial worker dispatch can complete parents before the event loop
+        # binds its local scheduler_wake alias.
+        scheduler_state.scheduler_wake.set()
+
 
     _submit_component_projection = ComponentProjectionSubmitter(
         queue=component_projection_queue,
@@ -3112,6 +3121,12 @@ def _main_impl() -> None:
             materialize_workspace=materialize_raw_bbox_mask_store_workspace,
             prepare=partial(_prepare_parent_with_confidence_capture,
                 prepare_view_volume_after_fullframe, capture_plan=capture_plan),
+            confidence_retired_callback=(
+                partial(_publish_parent_confidence_retired,
+                        expected_lease=direct_union_backing_leases[key])
+                if key in direct_union_backing_leases else None),
+            confidence_retired_callback_factory=lambda lease:partial(
+                _publish_parent_confidence_retired, expected_lease=lease),
         )
 
         transitioned = view_prepare_leases.handoff(key)
@@ -4382,6 +4397,14 @@ def _main_impl() -> None:
     @scheduler_operation('background_drain')
     def _drain_completed_background_futures() -> None:
         direct_union_capacity_released = False
+        while True:
+            try:
+                key, lease, nbytes = parent_confidence_retired_events.get_nowait()
+            except queue.Empty:
+                break
+            if view_prepare_leases.retire_input_bytes(key, lease, nbytes, token='confidence'):
+                direct_union_capacity_released = True
+                runtime_telemetry().add('inference.dense_confidence_retired_bytes', nbytes)
         if sam_parent_staging is not None:
             resumed, released = sam_parent_staging.pump()
             view_processing_futures.update(resumed)
@@ -7964,6 +7987,8 @@ def _main_impl() -> None:
                     'sam_devices': list(interpolation_settings.sam_devices),
                     'sam_feature_cache_mib': interpolation_settings.sam_feature_cache_mib,
                     'sam_crop_mode': interpolation_settings.sam_crop_mode,
+                    'sam_tight_crop_guard': (sam_context.tight_crop_guard if sam_context is not None else None),
+                    'sam_tight_crop_guard_at_launch': interpolation_settings.sam_tight_crop_guard,
                     'sam_crop_tile_side': (1008 if interpolation_settings.sam_crop_mode is not None else None),
                     'sam_crop_halo': (128 if interpolation_settings.sam_crop_mode is not None else None),
                     'sam_crop_canvas_contract': 'current_interpolation_working_canvas',

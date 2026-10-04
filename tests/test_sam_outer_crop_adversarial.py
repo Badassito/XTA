@@ -320,7 +320,7 @@ def test_generation_bundle_persists_crop_revision_without_reinterpreting_masks(t
         online = stats['sam_selection_receipt']
         before = bundle.evidence_fingerprint
         replay = select_sam_proposals(bundle)
-        assert replay['resolved_policy']['version'] == online['resolved_policy']['version'] == (5 if crop_mode == 'tiled' else 4)
+        assert replay['resolved_policy']['version'] == online['resolved_policy']['version'] == (7 if crop_mode == 'tiled' else 6)
         assert replay['selected_run_ids'] == online['selected_run_ids']
         assert bundle.evidence_fingerprint == before
     finally:

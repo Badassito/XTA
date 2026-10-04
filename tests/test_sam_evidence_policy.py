@@ -69,6 +69,7 @@ def test_same_direction_overlap_rejects_whole_leaking_run_preserves_shared_owner
                                      (fixture_run("F2", group), good)], group=group, masks=masks)
     receipt = select_sam_proposals(bundle)
     assert receipt["selected_run_ids"] == ["F2"]
+    assert receipt["legacy_contract_fallback"]["resolved_quality_version"] == 4
     assert receipt["run_receipts"]["F1"]["measurements"]["first_observed_violation"] == 2
     assert receipt["run_receipts"]["F1"]["measurements"]["containment"][2]["outside"] == 1
     selected = {frame: plane for _, frame, plane in iter_selected_planes(bundle, receipt, direction="forward")}
@@ -77,6 +78,30 @@ def test_same_direction_overlap_rejects_whole_leaking_run_preserves_shared_owner
     assert np.array_equal(bundle.raw_mask("F1", 1), bad[1])
     assert bundle.manifest["run_count"] == 2
     assert len(list(bundle.directory.iterdir())) == 3
+
+
+def test_modern_default_replays_two_seed_rooted_tracks_that_meet_without_terminal_recall(tmp_path):
+    from tests.test_sam_branch_selection_adversarial import _single_edge, _bundle, _run
+    group, masks, raw = _single_edge()
+    forward = {frame:mask.copy() for frame,mask in raw.items()}
+    backward = {frame:mask.copy() for frame,mask in raw.items()}
+    forward[3][:] = forward[4][:] = False
+    backward[0][:] = backward[1][:] = False
+    bundle = _bundle(tmp_path, group, masks, [(_run('F'), forward),
+        (_run('R', source='B', target_ids=('A',), direction=-1), backward)],
+        scope={'shape_tyx':[5,32,48], 'sam_crop_mode':'whole',
+               'crop_contract_version':'xta.sam_fixed_family_swept_context/2'})
+    receipt = select_sam_proposals(bundle)
+    assert receipt['resolved_policy']['version'] == 6
+    assert receipt['resolved_policy']['branch_write_domain'] == 'fixed_context'
+    assert receipt['resolved_policy']['strict_containment'] is False
+    assert 'legacy_contract_fallback' not in receipt
+    assert receipt['selected_run_ids'] == ['F', 'R']
+    assert set(receipt['branch_selection']['edges']) == {'E'}
+    planes = dict((frame, plane) for _,frame,plane in iter_selected_planes(bundle, receipt))
+    for frame in (1,2,3):
+        np.testing.assert_array_equal(planes[frame], raw[frame])
+    assert not planes[0].any() and not planes[4].any()
 
 
 def test_portable_roundtrip_and_identical_replay_no_model_import(tmp_path):

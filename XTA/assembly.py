@@ -9,6 +9,7 @@ import shutil
 import threading
 import tempfile
 import time
+import weakref
 from concurrent.futures import Future
 from dataclasses import replace as dataclasses_replace
 from pathlib import Path
@@ -122,8 +123,9 @@ def materialize_sam_directional_view_layer(
     entry: Dict[str, object], *, model_name: str, view: ViewInfo, source: str,
     pass_index: int, sam_context: object, tile_config_id: str = '',
     upstream_lineage: Optional[Dict[str, object]] = None,
+    workers: int = 1,
 ) -> NrrdLayerRef:
-    """Publish one selected native directional slot without SDF index encoding."""
+    """Project a selected directional slot before source-grid consumers read it."""
     direction = str(entry['direction'])
     if direction not in ('forward', 'backward'):
         raise ValueError(f'Invalid SAM interpolation direction: {direction}')
@@ -139,12 +141,18 @@ def materialize_sam_directional_view_layer(
     native_transform = sam_native_transform_record(view, shape,
         final_source_output_shape() or (int(view.full_t), int(view.full_h), int(view.full_w)),
         source_processing_shape_tyx=getattr(getattr(sam_context, 'source_volume', None), 'shape', None))
+    backing = _sam_directional_source_backing(path, view=view, stage=stage,
+        has_foreground=int(entry.get('voxel_count', 0)) > 0,
+        model_name=model_name, source=source, pass_index=pass_index,
+        tile_config_id=tile_config_id, workers=max(1,int(workers)))
+    native_transform.update(public_backing_coordinate_space=backing['coordinate_space'],
+        public_backing_shape_tyx=list(backing['shape']))
     ref = NrrdLayerRef(
         key=_nrrd_layer_key(view_name=view.name, source=source, mask_kind='bridge',
                             pass_index=pass_index, tile_config_id=tile_config_id, stage=stage),
         name=_nrrd_layer_name(view=view, source=source, mask_kind='bridge',
                               pass_index=pass_index, tile_config_id=tile_config_id, stage=stage),
-        path=path, shape=shape, dtype='uint8', storage_format=str(entry.get('storage_format', CVOL_FORMAT)),
+        path=backing['path'], shape=backing['shape'], dtype='uint8', storage_format=backing['storage_format'],
         model_name=model_name, view_name=view.name, physical_view_name=physical_view_name(view),
         aug_id=view.tta_aug_id, angle_deg=float(view.tta_angle_deg), view_family=view.family,
         source=source, mask_kind='bridge', pass_index=pass_index,
@@ -165,9 +173,9 @@ def materialize_sam_directional_view_layer(
         native_transform=native_transform,
         interpolation_connectivity=int(entry.get('topology_connectivity', 6)),
         selected_bridge_connection_status=str(entry.get('connection_status', 'selected_native')),
-        segment_extent_ijk=(_nrrd_empty_segment_extent() if int(entry.get('voxel_count', 0)) <= 0 else None),
-        segment_extent_shape_tyx=shape,
-        segment_extent_source='sam_selected_directional_cvol',
+        segment_extent_ijk=backing['extent'],
+        segment_extent_shape_tyx=backing['shape'],
+        segment_extent_source='sam_projected_directional_cvol',
     )
     sink = nrrd_layer_sink()
     if sink is not None:
@@ -179,6 +187,73 @@ def materialize_sam_directional_view_layer(
             sam_bundle_identity=ref.sam_bundle_identity,
             interpolation_policy_identity=ref.interpolation_policy_identity))
     return ref
+
+
+def _sam_directional_source_backing(
+    native_path: Path, *, view: ViewInfo, stage: str, has_foreground: bool,
+    model_name: str, source: str, pass_index: int, tile_config_id: str,
+    workers: int = 1,
+) -> Dict[str, object]:
+    """Keep native proposals for replay/gating and publish source-oriented masks.
+
+    Output and reconciliation readers restore TYX sizes; they do not interpret
+    ``native_transform`` metadata. Cartesian axis permutation and nonlinear
+    projection must therefore happen before constructing the public layer ref.
+    """
+    destination = native_path.parent / 'source_layers' / f'{native_path.stem}.orthogonal.cvol'
+    source_shape = final_source_output_shape() or (int(view.full_t), int(view.full_h), int(view.full_w))
+    with contextlib.closing(RawBBoxMaskStore.open(native_path, mmap_payload=True)) as store:
+        if view.family == 'orthogonal' and not is_tilted_view(view):
+            shape = _sparse_component_orthogonal_shape(store.shape, view)
+            orientation = physical_view_name(view)
+            if orientation == 'transverse':
+                path = native_path
+                storage_format = str(store.meta['format'])
+                extent = _coerce_segment_extent(store.meta.get('segment_extent_ijk'))
+            else:
+                stats = _transpose_sparse_component_store(store, destination, orientation, shape)
+                path, storage_format = destination, INTERNAL_PACKED_CVOL_FORMAT
+                extent = tuple(stats['segment_extent_ijk'])
+            return dict(path=path, shape=shape, storage_format=storage_format,
+                extent=extent, coordinate_space='orthogonal_processing')
+    if not has_foreground:
+        writer = IncrementalRawBBoxMaskStoreWriter(shape=source_shape, store_dir=destination,
+            format_name=INTERNAL_PACKED_CVOL_FORMAT, desc=f'Empty selected SAM {view.name}/{stage}')
+        try:
+            writer.consume_empty_range(0, source_shape[0])
+            stats = writer.finalize()
+        except BaseException as error:
+            writer.abort(error)
+            writer.discard()
+            raise
+        return dict(path=destination, shape=source_shape, storage_format=INTERNAL_PACKED_CVOL_FORMAT,
+            extent=tuple(stats['segment_extent_ijk']), coordinate_space='source_grid')
+    if view.family == 'azimuthal':
+        from .sparse_projection import project_azimuthal_sparse_store
+        stats = project_azimuthal_sparse_store(native_path, view, destination,
+            out_shape_tyx=source_shape, workers=max(1,int(workers)))
+        return dict(path=destination, shape=source_shape, storage_format=INTERNAL_PACKED_CVOL_FORMAT,
+            extent=tuple(stats['segment_extent_ijk']), coordinate_space='source_grid')
+    from .interpolation import materialize_raw_bbox_mask_store_workspace
+    workspace_path = native_path.parent / 'source_layers' / f'{native_path.stem}.native.u8.dat'
+    workspace_path.parent.mkdir(parents=True, exist_ok=True)
+    workspace = None
+    try:
+        workspace = materialize_raw_bbox_mask_store_workspace(native_path, workspace_path,
+            desc=f'Selected SAM {view.name}/{stage} projection workspace', workers=max(1,int(workers)))
+        projected = materialize_nrrd_view_layer(workspace, model_name=model_name, view=view,
+            source=source, mask_kind='bridge', pass_index=pass_index, tile_config_id=tile_config_id,
+            tile_acceptance='consolidated' if source == 'tile' else '', stage=stage,
+            temp_dir=native_path.parent / 'source_layers', workers=max(1,int(workers)), known_has_foreground=True,
+            submit_to_sink=False, internal_packbits_store=True)
+        if projected is None:
+            raise RuntimeError('Selected SAM source projection did not produce a layer')
+        return dict(path=projected.path, shape=projected.shape, storage_format=projected.storage_format,
+            extent=projected.segment_extent_ijk, coordinate_space='source_grid')
+    finally:
+        close_memmap_array_without_flush(workspace, unlink_path=workspace_path)
+        # Retirement unmaps/unlinks after the last NumPy alias is released.
+        workspace = None
 
 def set_final_source_output_shape(shape_tyx: Optional[Tuple[int, int, int]]) -> None:
     global _FINAL_SOURCE_OUTPUT_SHAPE_TYX
@@ -1505,6 +1580,8 @@ def prepare_view_volume_after_fullframe(
     retire_dense_after_prepare: bool = False,
     interpolation_backend: str = 'sdf',
     sam_context: Optional[object] = None,
+    confidence_retired_callback: Optional[Callable[[str, str, int], object]] = None,
+    confidence_owner: Optional[list] = None,
 ) -> PreparedViewResult:
     # Local import keeps the package dependency graph acyclic.
     from .finalization import union_volume_into_volume
@@ -1512,6 +1589,12 @@ def prepare_view_volume_after_fullframe(
     backend = str(interpolation_backend)
     if backend not in ('sdf', 'sam'):
         raise ValueError(f'Unsupported interpolation backend: {backend}')
+    if confidence_owner is not None:
+        if confmap_mm is not None or len(confidence_owner) != 1:
+            raise RuntimeError('Parent confidence must have exactly one transferred owner')
+        # Call argument dictionaries can survive through nested wrappers.
+        # Empty the shared container so those dictionaries pin no score array.
+        confmap_mm = confidence_owner.pop()
     baseline_native_volume = union_mm
     d1_delta_only = bool(preinterpolation_layer_already_published)
     d1_additions_mm: Optional[np.ndarray] = None
@@ -1609,6 +1692,22 @@ def prepare_view_volume_after_fullframe(
                 known_slice_any=(meta_slice_any if hole_metadata_valid else None),
                 known_slice_bboxes=(meta_slice_bboxes if hole_metadata_valid else None))
     finally:
+        if confmap_mm is not None and confidence_retired_callback is not None:
+            # Runtime retirement deliberately preserves any derived live views.
+            # Return dense credit only when the underlying owner is destroyed,
+            # never just because close_memmap_array was requested. NumPy views
+            # keep their root/mmap alive until their last consumer has finished.
+            confidence_owner = confmap_mm
+            seen_owners = set()
+            while (getattr(confidence_owner, 'base', None) is not None
+                   and id(confidence_owner) not in seen_owners):
+                seen_owners.add(id(confidence_owner))
+                confidence_owner = confidence_owner.base
+            confidence_finalizer = weakref.finalize(
+                confidence_owner, confidence_retired_callback,
+                str(model_name), str(view.name), int(confmap_mm.nbytes))
+            confidence_finalizer.atexit = False
+            confidence_owner = None
         close_memmap_array(
             confmap_mm,
             unlink_path=confmap_path if confmap_path is not None and not keep_temp else None,
@@ -1618,6 +1717,7 @@ def prepare_view_volume_after_fullframe(
                 confmap_path.unlink(missing_ok=True)
             except Exception:
                 pass
+        confmap_mm = None
 
     if bool(d1_delta_only) and not bool(d1_component_refs_only):
         d1_additions_path = (
@@ -1743,7 +1843,8 @@ def prepare_view_volume_after_fullframe(
                             raise RuntimeError('SAM interpolation must produce exactly two selected directional slots')
                         nrrd_layers.extend(materialize_sam_directional_view_layer(
                             dict(entry), model_name=str(model_name), view=view, source='fullframe',
-                            pass_index=pass_idx, sam_context=sam_context) for entry in sam_components)
+                            pass_index=pass_idx, sam_context=sam_context,
+                            workers=int(slice_workers)) for entry in sam_components)
                     if d1_additions_mm is not None:
                         for index in range(int(baseline_native_volume.shape[0])):
                             d1_additions_mm[index] |= ((baseline_native_volume[index] > 0)
@@ -3170,7 +3271,7 @@ def finalize_consolidated_tile_volume_for_parent(
                     nrrd_layers.extend(materialize_sam_directional_view_layer(
                         dict(entry), model_name=str(model_name), view=view, source='tile',
                         pass_index=pass_idx, sam_context=sam_context, tile_config_id=config_id_norm,
-                        upstream_lineage=sam_upstream_lineage) for entry in sam_components)
+                        upstream_lineage=sam_upstream_lineage, workers=int(slice_workers)) for entry in sam_components)
             else:
                 tile_accumulator_mm, stats_local = interpolate_view_volume_pass_maybe_process(
                     mask_mm=tile_accumulator_mm,

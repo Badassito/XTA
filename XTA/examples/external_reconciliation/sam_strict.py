@@ -7,7 +7,7 @@ def build_reconciliation():
         "mode": "union",
         "proposal_api_version": 1,
         "sam_bridge_policy": {
-            "name": "sam_strict_independent_family_v2",
+            "name": "sam_strict_independent_family",
             "strict_family_agreement": True,
         },
     }

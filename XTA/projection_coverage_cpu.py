@@ -460,6 +460,121 @@ def pull_native_flat_into(source, plan, output_flat, *, first_flat,
                 persistent_bytes=plan.persistent_bytes, temporary_strip_bytes=plan.temporary_strip_bytes)
 
 
+@_numba.njit(nogil=True, cache=False)
+def _pull_azimuthal_encoded(encoded, index, packed_input, source_width, output, first,
+                            integer, coefficient, bbox, keys, keys_are_plane, invalid, rows):
+    """The dense kernel's destination equations with immutable bbox/bit lookup."""
+    base, vertical = integer[0], integer[1]
+    wt, wh, ww, ot, oh, ow = integer[2:8]
+    nh = integer[8]
+    tangent, origin, shear_center = coefficient[0:3]
+    stack_size = wt if base == 0 else (wh if base == 1 else ww)
+    output_stack = ot if base == 0 else (oh if base == 1 else ow)
+    visited = addresses = reads = positive = 0
+    for local_index in range(output.size):
+        at = first+local_index
+        z,y,x = at//(oh*ow), (at//ow)%oh, at%ow
+        value = 0
+        if not (bbox[0] <= z < bbox[3] and bbox[1] <= y < bbox[4] and bbox[2] <= x < bbox[5]):
+            output[local_index] = 0
+            continue
+        visited += 1
+        if keys_are_plane:
+            plane_index = y*ow+x if base == 0 else (z*ow+x if base == 1 else z*oh+y)
+            key = keys[plane_index]
+        else:
+            key = keys[local_index]
+        if key == invalid:
+            output[local_index] = 0
+            continue
+        cz = (z+.5)*coefficient[9]-.5
+        cy = (y+.5)*coefficient[10]-.5
+        cx = (x+.5)*coefficient[11]-.5
+        nv = cy if base == 0 else cz
+        nu = cx if base != 2 else cy
+        stack = cz if base == 0 else (cy if base == 1 else cx)
+        destination_stack = z if base == 0 else (y if base == 1 else x)
+        axis = nv if vertical else nu
+        center = stack-tangent*(axis-shear_center)
+        local_frame = center-origin
+        if nh > output_stack:
+            shift = center-stack-origin
+            lower = max(0,int(math.floor(destination_stack*nh/output_stack+shift*nh/stack_size)))
+            upper = min(nh,int(math.ceil((destination_stack+1)*nh/output_stack+shift*nh/stack_size)))
+        else:
+            if local_frame < -.5 or local_frame >= stack_size-.5:
+                output[local_index] = 0
+                continue
+            native_row = (local_frame+.5)*nh/stack_size-.5
+            lower = min(nh-1,max(0,int(np.rint(native_row))))
+            upper = lower+1
+        angle,column = int(key//source_width),int(key%source_width)
+        record = index[angle]
+        y0,x0,y1,x1 = (np.int64(record['y0']),np.int64(record['x0']),
+                       np.int64(record['y1']),np.int64(record['x1']))
+        for native_row in range(lower,upper):
+            addresses += 1
+            row = np.int64(rows[native_row])
+            if (record['kind'] == 0 or row < y0 or row >= y1 or column < x0 or column >= x1):
+                continue
+            width = x1-x0
+            local_column = np.int64(column)-x0
+            stride = (width+7)//8 if packed_input else width
+            address = np.int64(record['offset'])+(row-y0)*stride
+            address += local_column//8 if packed_input else local_column
+            pixel = encoded[address]
+            if packed_input:
+                pixel = (pixel >> (local_column&7))&1
+            reads += 1
+            if pixel:
+                positive += 1
+                value = 1
+        output[local_index] = value
+    return visited,addresses,reads,positive
+
+
+def pull_native_encoded_flat_into(encoded, index, packed_input, plan, output_flat, *,
+                                  first_flat, destination_bbox_tyx=None):
+    """Overwrite one destination span from validated immutable sparse records.
+
+    The store adapter validates record bounds and payload sizes once before
+    worker launch. This function owns no pool, source expansion, or output.
+    """
+    if (not isinstance(encoded,np.ndarray) or encoded.ndim != 1 or encoded.dtype != np.uint8
+            or not isinstance(index,np.ndarray) or index.shape != (plan.source_shape[0],)):
+        raise ValueError('Encoded native pull requires its bound uint8 payload/index geometry')
+    if (not isinstance(output_flat,np.ndarray) or output_flat.dtype != np.uint8
+            or output_flat.ndim != 1 or not output_flat.flags.writeable):
+        raise ValueError('Encoded native pull output must be a writable uint8 flat span')
+    if plan.backend == 'compiled_native_tilted':
+        raise ValueError('Encoded native pull requires an Azimuthal angular plan')
+    first = int(first_flat)
+    if not 0 <= first <= first+output_flat.size <= math.prod(plan.output_shape):
+        raise ValueError('Encoded native pull span exceeds its output geometry')
+    if output_flat.size > plan.max_strip_voxels:
+        raise NativePullPlanUnavailable('Encoded native pull span exceeds admitted strip workspace')
+    if np.may_share_memory(encoded,output_flat):
+        raise ValueError('Encoded native pull cannot alias borrowed source and output')
+    bbox = (0,0,0,*plan.output_shape) if destination_bbox_tyx is None else tuple(map(int,destination_bbox_tyx))
+    if len(bbox)!=6 or any(not 0 <= bbox[axis] <= bbox[axis+3] <= plan.output_shape[axis] for axis in range(3)):
+        raise ValueError('Encoded native pull bbox exceeds its output geometry')
+    cached = plan.backend == 'compiled_azimuthal_cached'
+    if cached:
+        keys = plan.keys.reshape(-1)
+    else:
+        indices = np.arange(first,first+output_flat.size,dtype=np.int64)
+        oh,ow = plan.output_shape[1:]
+        base = int(plan.integers[0])
+        vertical = ((indices//ow)%oh) if base == 0 else indices//(oh*ow)
+        horizontal = (indices%ow) if base != 2 else (indices//ow)%oh
+        keys = _angular_keys(plan,vertical,horizontal)
+    visited,addresses,reads,positive = _pull_azimuthal_encoded(encoded,index,bool(packed_input),
+        int(plan.source_shape[2]),output_flat,first,plan.integers,plan.coefficients,np.asarray(bbox,np.int64),
+        keys,cached,plan.invalid_key,plan.row_lookup)
+    return dict(destination_voxels_visited=int(visited),contribution_addresses=int(addresses),
+        indexed_input_byte_reads=int(reads),projected_contributions=int(positive))
+
+
 def warm_native_pull_kernels(*, include_strided=False):
     """Explicitly separate fixed-signature JIT control from numeric workspace.
 

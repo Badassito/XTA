@@ -2360,7 +2360,7 @@ def _label_foreground_volume_streaming_impl(
             boundary_pending_count = 0
 
         def _submit_original_boundary_codes(original_codes: np.ndarray) -> None:
-            nonlocal boundary_pending_count
+            nonlocal boundary_pending_count, topology_boundary_union_seconds
             codes = np.asarray(original_codes, dtype=np.uint64)
             if codes.size <= 0:
                 return

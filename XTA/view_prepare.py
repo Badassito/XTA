@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import math
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Mapping
@@ -115,6 +115,16 @@ class AdmittedViewPrepare:
     interpolation_backend: str = 'sdf'
     sam_context: object | None = None
     sam_base_allowance_bytes: int = 0
+    confidence_retired_callback: Callable[[str, str, int], object] | None = None
+    confidence_retired_callback_factory: Callable[[object], Callable] | None = None
+
+    def rebind_confidence_retirement(self, lease):
+        if self.confidence_retired_callback_factory is not None:
+            self.confidence_retired_callback = self.confidence_retired_callback_factory(lease)
+
+    def _take_confidence(self):
+        owner, self.confmap_mm = self.confmap_mm, None
+        return owner
 
     @contextmanager
     def _reservation(self):
@@ -152,11 +162,17 @@ class AdmittedViewPrepare:
                             shutil.rmtree(self.d1_shadow_path, ignore_errors=True)
                         except Exception:
                             pass
+                # The prepare function owns confidence through capture only.
+                # Keeping a second task alias pinned its mmap until the much
+                # longer mask projection finished, even after capture retired it.
                 return self.prepare(
                     model_name=str(self.model_name),
                     view=self.view,
                     union_mm=local_union_mm,
-                    confmap_mm=self.confmap_mm,
+                    confmap_mm=(self._take_confidence()
+                                if self.confidence_retired_callback is None else None),
+                    confidence_owner=([self._take_confidence()]
+                                      if self.confidence_retired_callback is not None else None),
                     union_path=self.union_path,
                     confmap_path=self.confmap_path,
                     temp_dir=self.temp_dir,
@@ -197,6 +213,7 @@ class AdmittedViewPrepare:
                         self.preinterpolation_layer_already_published
                     ),
                     submit_component_projection=self.submit_component_projection,
+                    confidence_retired_callback=self.confidence_retired_callback,
                 )
             except BaseException:
                 # The original/local dense mapping belongs to this reservation.
@@ -219,6 +236,7 @@ class ViewPrepareLeaseState:
     inference_bytes: dict[tuple[str, str], int]
     postprocess_views: set[tuple[str, str]]
     postprocess_bytes: dict[tuple[str, str], int]
+    retired_inputs: set[tuple[tuple[str, str], int, str]] = field(default_factory=set)
 
     def handoff(self, key: tuple[str, str]) -> bool:
         lease = self.leases.get(key)
@@ -257,4 +275,27 @@ class ViewPrepareLeaseState:
         lease.release('postprocess')
         self.postprocess_views.remove(key)
         self.postprocess_bytes.pop(key, None)
+        return True
+
+    def retire_input_bytes(self, key: tuple[str, str], expected_lease: _DirectUnionBackingLease,
+                           nbytes: int, *, token: str) -> bool:
+        """Return an input's credit after its final owner dies, on the scheduler thread.
+
+        A finalizer can arrive after whole-parent retirement. Lease identity and
+        the input token make stale/duplicate notifications harmless and prevent
+        them from crediting a replacement parent's allocation.
+        """
+        identity = (key, id(expected_lease), str(token))
+        lease = self.leases.get(key)
+        if lease is not expected_lease or identity in self.retired_inputs:
+            return False
+        if (lease.phase != 'postprocess' or key not in self.postprocess_views
+                or int(self.postprocess_bytes.get(key, -1)) != int(lease.nbytes)):
+            raise RuntimeError(f'direct-union input {key} retired without its postprocess owner')
+        released = int(nbytes)
+        if not 0 < released < int(lease.nbytes):
+            raise RuntimeError(f'direct-union input {key} returned invalid dense credit {released}')
+        self.retired_inputs.add(identity)
+        lease.nbytes -= released
+        self.postprocess_bytes[key] = int(lease.nbytes)
         return True

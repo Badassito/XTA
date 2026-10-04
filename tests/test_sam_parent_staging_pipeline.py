@@ -45,6 +45,7 @@ def submission(tmp_path, *, ready=False, staged=True, dispatch_error=False):
         component_layers_needed=True,angle_variant_streaming_cleanup_active=False,
         angle_variant_gpu_fastpath_active=False,component_ref_dense_retirement_active=True,
         _publish_parent_mask_ready=mock.Mock(),_submit_component_projection=mock.Mock(),
+        _publish_parent_confidence_retired=mock.Mock(),direct_union_backing_leases=leases.leases,
         view_prepare_leases=leases,parent_postprocess_executor=executor,view_processing_futures={},
         gpu_worker_pending_task_ids=[123],_dispatch_inference_windows=dispatch,
         view_processing_volume_shape=lambda *_args:(3,4,5),_view_uses_interpolation=lambda *_args:True)

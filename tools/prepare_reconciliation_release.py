@@ -207,6 +207,45 @@ DEVELOPMENTS['job150790-150798-throughput'] = dict(
         'tools/benchmark_confidence_capture.py', 'tools/qualify_sam_policy_throughput.py',
         'tools/qualify_sam_family_dispatch.py'),
 )
+DEVELOPMENTS['sam-bridges-v24.0.2'] = dict(
+    token='24_0_2_sam_bridges_development', prefix='REVIEWED_V24_0_2_SAM_BRIDGES_DEVELOPMENT',
+    key='v24_0_2_sam_bridges_development_review', contract='reviewed_v24_0_2_sam_bridges_development_contract',
+    previous_review_key='v24_job150790_150798_throughput_development_review',
+    previous_review_prefix='REVIEWED_V24_JOB150790_150798_THROUGHPUT_DEVELOPMENT',
+    feature='sam-bridges-v24.0.2-development', predecessor_inventory_path='release/_package_inventory.json',
+    validation_tools=DEVELOPMENTS['job150790-150798-throughput']['validation_tools'] + (
+        'tools/study_sam_largest_island.py', 'tools/evaluate_sam_extrapolation.py',
+        'tools/audit_sam_bridge_overlap.py', 'tools/analyze_tta_scheduling.py',
+        'tools/ablate_sam_tight_crop_guard.py', 'tools/evaluate_sam_reference_quality.py',
+        'tools/generate_sam_group_sdf_reference.py', 'tools/evaluate_sam_group_reference_quality.py',
+        'tools/plot_sam_reference_quality.py',
+        'tools/replay_sam_branch_policies.py', 'tools/recover_sam_refused_family.py',
+        'tools/export_sam_source_replay.py', 'tools/benchmark_sparse_azimuthal_projection.py'),
+)
+SAM_BRIDGES_DEVELOPMENT_REASONS = {
+    '__init__': 'Identify the separately source-reviewed, uncommitted v24.0.2 candidate.',
+    'assembly': 'Project selected native SAM masks into the source grid with admitted worker counts and return dense-confidence credit only after its last owner retires.',
+    'cli': 'Snapshot the resolved SAM tight-crop guard setting for each CLI launch.',
+    'config': 'Validate and snapshot the environment switch for the SAM tight-crop guard.',
+    'interpolation': 'Retire and unlink a failed dense SAM projection workspace when materialization raises.',
+    'pipeline': 'Carry the resolved SAM acceptance setting and retired-confidence credits through bounded scheduling.',
+    'sam_integration': 'Apply the resolved tight-crop guard switch and persist it with SAM policy identity.',
+    'sam_policy': 'Retain versioned branch, crop, radius and endpoint contracts, share effective resource admission, and preserve contact semantics when skipping temporally disjoint pair scans.',
+    'sam_parent_staging': 'Track dense-confidence retirement independently of sparse prepared SAM context lifetime.',
+    'sam_branch_selection': 'Authenticate endpoint-connected branches within declared original SAM ownership and charge shared bounded label-membership workspaces.',
+    'sam_filtering': 'Bind explicit radius thresholds to their receipt-defined source and route effective masks through the central owner reader.',
+    'sam_mask_reader': 'Interpret explicit radius overrides and authenticated branch ownership consistently before selection, replay and publication.',
+    'sam_evidence': 'Authenticate extended branch selection receipts, bounded owner support and selected-plane provenance while retaining historical receipt interpretation.',
+    'sam_interpolation': 'Persist canonical view sampler recipes, admit generation under the same effective selection resource caps, and retain selected branch support through publication and survival assessment.',
+    'sam_replay': 'Preserve selected branch ownership and compatible policy interpretation while preflighting the shared branch workspace before retained-evidence replay.',
+    'tta_outputs': 'Measure final surviving connections with the authenticated selected branch owners and the same bounded original-observation attachment contract.',
+    'tta_scheduler': 'Distinguish dense-confidence and sparse SAM context ownership when admitting view work.',
+    'view_prepare': 'Return retired dense-confidence ownership without discarding a live sparse SAM context.',
+    'examples/external_reconciliation/sam_strict': 'Give the explicit strict SAM preset a version-independent name while preserving its strict settings.',
+    'topology': 'Share the boundary-union timing accumulator with nested batch submission so telemetry cannot raise an unbound-local error.',
+    'projection_coverage_cpu': 'Fuse bounded encoded-mask reads with the prepared categorical native pull while preserving established projection ownership and arithmetic.',
+    'sparse_projection': 'Project encoded Tilted-Azimuthal planes with bounded compiled workers, exact legacy fallback and live progress; retire only owned staging after real mappings close without obscuring original errors.',
+}
 OUTER_CROP_DEVELOPMENT_REASONS = {
     'sam_bridge_planning': 'Bound the complete translated endpoint-silhouette sweep and preserve legacy raster rounding while declaring context/canvas clamp and contract memory diagnostics.',
     'sam_interpolation': 'Drain single-worker tiled jobs by exact crop inside bounded parent cohorts, retaining every original hypothesis and unchanged mask/quality semantics.',
@@ -549,7 +588,7 @@ TOOL_REASONS = {
     'tools/run_sam_outer_crop_experiment.py': 'Execute sealed outer-crop research plans through a common tracker/evaluator with attributable raw evidence and explicit non-production baseline recipes.',
     'tools/run_sam_outer_crop_stress.py': 'Run separately declared single-family outer-context stress controls while reusing retained controls and preserving production defaults.',
     'tools/analyze_sam_outer_crop.py': 'Score sealed raw, radius-filtered, candidate, and selected research layers separately, preserving refusal/unknown outcomes and fixed native contour domains.',
-    'tools/derive_sam_acceptance_evidence.py': 'Derive A-only fixed-raw diagnostic evidence with byte-identical C2 masks/scores and explicit changed-acceptance attribution, never fresh pipeline equivalence.',
+    'tools/derive_sam_acceptance_evidence.py': 'Derive sealed A-only fixed-raw diagnostic evidence with byte-identical C2 masks/scores and explicit historical guarded v4/v5 controls after production defaults change.',
     'tools/qualify_sam_tiled_schedule.py': 'Run exact-mask/score ABBA qualification of crop-contiguous single-worker scheduling with model startup separated and no geometry or quality changes.',
     'tools/report_sam_outer_crop.py': 'Report already scored outer-crop research with validated provenance and explicit limits without selecting masks or inventing accuracy metrics.',
     'tools/generate_sam_outer_crop_sdf.py': 'Generate unchanged production SDF references from exact sealed observations without reading images/labels, CUDA execution, or overwriting existing references.',
@@ -587,6 +626,19 @@ TOOL_REASONS = {
     'tools/qualify_d1_confidence_masked_transfer.py': 'Qualify exact cropped confidence payloads and reduced device-to-host calls for masked transfer.',
     'tools/qualify_release.py': 'Route qualification temporary files and GPU compiler caches into task Scratch while preserving the source and test gates.',
     'tools/qualify_native_trt_lease.py': 'Qualify explicit native TensorRT lease modes, execution and output parity.',
+    'tools/study_sam_largest_island.py': 'Replay largest-island SAM interpolation filtering against retained crop-strategy masks and report endpoint recall without changing production defaults.',
+    'tools/evaluate_sam_extrapolation.py': 'Evaluate research-only unidirectional SAM trajectories with terminal-free generation and holdout diagnostics, without claiming a production extrapolation backend.',
+    'tools/audit_sam_bridge_overlap.py': 'Audit source-grid and native SAM bridge occupancy against final raw predictions with comparable-frame coverage and no invented independent labels.',
+    'tools/analyze_tta_scheduling.py': 'Compare retained production scheduling traces, dense-confidence ownership, SAM contexts and dispatch latency with incomplete-capture limitations.',
+    'tools/ablate_sam_tight_crop_guard.py': 'Replay a bounded tight-crop guard ablation with policy and input identities, recomputed safety checks and explicit resource or reuse limitations.',
+    'tools/evaluate_sam_reference_quality.py': 'Compare retained SAM selections and diagnostic ceilings against the same-input SDF reference with explicit original-observation exclusions and domains.',
+    'tools/generate_sam_group_sdf_reference.py': 'Generate bounded crop-local SDF references from retained original observations, recording native transforms and limits on whole-production parity.',
+    'tools/evaluate_sam_group_reference_quality.py': 'Measure bounded SAM group support against crop-local SDF references and distinguish working-canvas quality from native/source rendering.',
+    'tools/plot_sam_reference_quality.py': 'Render retained same-input SAM and SDF quality measurements with explicit evaluation domains and selected-policy provenance.',
+    'tools/replay_sam_branch_policies.py': 'Replay explicit branch policies on immutable evidence with shared workspace accounting, fresh receipts and optional scalar phase timing.',
+    'tools/recover_sam_refused_family.py': 'Generate original-seed research proposals for a resource-refused family and retain exact evidence, reference quality and branch-policy replay.',
+    'tools/export_sam_source_replay.py': 'Export an authenticated retained SAM selection through the production source-grid and NRRD publication route without model inference.',
+    'tools/benchmark_sparse_azimuthal_projection.py': 'Measure CPU sparse Tilted-Azimuthal projection on synthetic masks with exact predecessor parity and an independent physical row-band oracle.',
 }
 
 
@@ -848,10 +900,14 @@ def prepare(*, output_dir, release='24.0.0', development=None, write=False, pred
             ['git', 'tag', '--list', f'v{release}'], cwd=root).strip():
         raise ValueError(f'v{release} is already tagged; its authenticated review cannot be rewritten')
     spec = DEVELOPMENTS[development] if development is not None else RELEASES[release]
+    sam_bridges_candidate = development == 'sam-bridges-v24.0.2'
     if development is not None:
-        actual_tag = subprocess.check_output(['git', 'rev-parse', 'v24.0.0^{commit}'], cwd=root, text=True).strip()
-        if actual_tag != inventory.REVIEWED_V24_OUTER_CROP_DEVELOPMENT_PREDECESSOR_COMMIT:
-            raise ValueError('Development predecessor differs from the independently pinned v24.0.0 tag')
+        tag = 'v24.0.1' if sam_bridges_candidate else 'v24.0.0'
+        actual_tag = subprocess.check_output(['git', 'rev-parse', tag + '^{commit}'], cwd=root, text=True).strip()
+        expected_tag = (inventory.REVIEWED_V24_0_2_SAM_BRIDGES_DEVELOPMENT_PREDECESSOR_COMMIT
+                        if sam_bridges_candidate else inventory.REVIEWED_V24_OUTER_CROP_DEVELOPMENT_PREDECESSOR_COMMIT)
+        if actual_tag != expected_tag:
+            raise ValueError(f'Development predecessor differs from the independently pinned {tag} tag')
     release_patch = release == '24.0.1' and development is None
     if release_patch:
         actual_tag = subprocess.check_output(['git', 'rev-parse', 'v24.0.0^{commit}'], cwd=root, text=True).strip()
@@ -859,7 +915,8 @@ def prepare(*, output_dir, release='24.0.0', development=None, write=False, pred
             raise ValueError('Released predecessor tag differs from the independently pinned v24.0.0 commit')
     archived_development = development in ('guarded-rescue', 'job150615', 'job150615-headroom', 'job150772-performance', 'job150790-150798-throughput')
     archived_source = archived_development or release_patch
-    reasons = ({} if archived_source else OUTER_CROP_DEVELOPMENT_REASONS if development is not None else
+    reasons = (SAM_BRIDGES_DEVELOPMENT_REASONS if sam_bridges_candidate else
+               {} if archived_source else OUTER_CROP_DEVELOPMENT_REASONS if development is not None else
                SAM_INTERPOLATION_REASONS if release == '24.0.0' else
                TTA_PTA_THROUGHPUT_REASONS if release == '23.0.5' else
                {} if release == '23.0.4' else
@@ -867,7 +924,9 @@ def prepare(*, output_dir, release='24.0.0', development=None, write=False, pred
                 **(SEMANTIC_REASONS if release == '23.0.1' else {}),
                 **(PATCH_REASONS if release == '23.0.2' else {}),
                 **(TTA_THROUGHPUT_REASONS if release == '23.0.3' else {})})
-    fallback_reason = ('Reduce confidence-evidence and SAM publication work while preserving required mask, radius and reader contracts.'
+    fallback_reason = ('Correct SAM bridge scheduling, acceptance and spatial publication in the uncommitted v24.0.2 candidate.'
+                       if sam_bridges_candidate else
+                       'Reduce confidence-evidence and SAM publication work while preserving required mask, radius and reader contracts.'
                        if development == 'job150790-150798-throughput' else
                        'Accelerate qualified native projection and retain performance diagnostics without changing package identity.'
                        if development == 'job150772-performance' else
@@ -941,8 +1000,8 @@ def prepare(*, output_dir, release='24.0.0', development=None, write=False, pred
         paths = subprocess.check_output(['git', 'diff', '--name-only', predecessor_commit, '--', 'XTA'], cwd=root, text=True).splitlines()
         paths += subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard', '--', 'XTA'], cwd=root, text=True).splitlines()
     patch_development = development in ('job150772-performance', 'job150790-150798-throughput')
-    review = dict(release='24.0.1' if patch_development else release, feature=spec['feature'],
-        previous_review_sha256=getattr(inventory, spec['previous_review_prefix'] + '_SHA256') if archived_source else
+    review = dict(release='24.0.2' if sam_bridges_candidate else '24.0.1' if patch_development else release, feature=spec['feature'],
+        previous_review_sha256=getattr(inventory, spec['previous_review_prefix'] + '_SHA256') if 'previous_review_prefix' in spec else
             getattr(inventory, 'REVIEWED_V' + spec['previous_token'] + '_RELEASE_SHA256'),
         predecessor_commit=predecessor_commit, predecessor_inventory_sha256=canonical(predecessor),
         definitions=[], statements=[], removed_definitions=[], removed_statements=[],
@@ -950,8 +1009,10 @@ def prepare(*, output_dir, release='24.0.0', development=None, write=False, pred
         preserved_radial_module_updates=[], complete_modules=[], module_snapshots=[])
     if development is not None:
         review.update(kind='development', development=development,
-                      package_version='24.0.1' if patch_development else '24.0.0',
-                      released=False, predecessor_tag='v24.0.0')
+                      package_version='24.0.2' if sam_bridges_candidate else '24.0.1' if patch_development else '24.0.0',
+                      released=False, predecessor_tag='v24.0.1' if sam_bridges_candidate else 'v24.0.0')
+    if sam_bridges_candidate:
+        review.update(released_predecessor_version='24.0.1', source_review_only=True)
     if archived_source:
         review['predecessor_source_archive'] = archive_metadata
     if amendment is not None:
@@ -1007,7 +1068,7 @@ def prepare(*, output_dir, release='24.0.0', development=None, write=False, pred
             review['preserved_radial_definition_updates'].append(dict(module=module, qualified_name=name,
                 previous_sha256=previous_hash, sha256=new_hash,
                 reason=reasons.get(module, fallback_reason).format(release=release)))
-    previous_review = predecessor[spec['previous_review_key']] if archived_source else predecessor['v' + spec['previous_token'] + '_release_review']
+    previous_review = predecessor[spec['previous_review_key']] if 'previous_review_key' in spec else predecessor['v' + spec['previous_token'] + '_release_review']
     previous_tools = {item['path']: item['sha256'] for item in previous_review.get('validation_tools', ())}
 
     def previous_tool_sha(path):
@@ -1081,7 +1142,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument('--release', choices=tuple(RELEASES))
-    selection.add_argument('--development', choices=tuple(DEVELOPMENTS), help='Prepare an uncommitted development audit; preserve package version and tagged release records')
+    selection.add_argument('--development', choices=tuple(DEVELOPMENTS), help='Prepare an uncommitted development audit; preserve tagged release records')
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--write', action='store_true')
     parser.add_argument('--predecessor-archive', type=Path,

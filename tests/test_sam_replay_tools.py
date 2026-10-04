@@ -14,6 +14,8 @@ from XTA.sam_replay import replay_sam_directional_nrrds
 from tests.test_sam_evidence_policy import fixture_group, fixture_run, build_bundle
 from tools import compare_reconciliation, export_reconciliation_evidence
 
+LEGACY_POLICY = {'sam_bridge_policy': {'version': 4}}
+
 
 def _fixture(path, *, gate=False):
     group, masks, raw = fixture_group()
@@ -38,6 +40,7 @@ def _read(path):
 def test_directional_replay_preserves_good_overlap_and_empty_reverse(tmp_path):
     bundle, raw = _fixture(tmp_path)
     result = replay_sam_directional_nrrds(bundle, tmp_path / 'replay', memory_mib=1)
+    assert result['selection']['legacy_contract_fallback']['resolved_quality_version']==4
     assert len(result['layers']) == 2
     assert result['selection']['selected_run_ids'] == ['good']
     assert result['coordinate_space'] == 'view_native'
@@ -66,13 +69,13 @@ def test_filtered_online_iterators_and_offline_nrrds_match_without_changing_raw_
     bundle = build_bundle(tmp_path, [(fixture_run('filtered', group), raw)],
         group=group, masks=masks, scope={'shape_tyx': [5, 12, 16]})
     fingerprint_before = bundle.evidence_fingerprint
-    receipt = select_sam_proposals(bundle)
+    receipt = select_sam_proposals(bundle, LEGACY_POLICY)
     assert receipt['selected_run_ids'] == ['filtered']
     online = np.stack([selected_sam_plane(bundle, receipt, frame, (12, 16)) for frame in range(5)])
     assert not online[2, 0, 0] and not online[2, 9, 12]
     compact_planes = {frame: plane for _, frame, plane in iter_selected_planes(bundle, receipt)}
     assert np.array_equal(online, np.stack([compact_planes[frame] for frame in range(5)]))
-    result = replay_sam_directional_nrrds(bundle, tmp_path / 'filtered_replay', memory_mib=1)
+    result = replay_sam_directional_nrrds(bundle, tmp_path / 'filtered_replay', policy=LEGACY_POLICY, memory_mib=1)
     replayed, _ = _read(tmp_path / 'filtered_replay' / result['layers'][0]['path'])
     assert np.array_equal(replayed, online)
     assert result['selection']['mask_filter'] == receipt['mask_filter']
@@ -162,7 +165,7 @@ def test_replay_budget_and_failed_publication_preserve_source(tmp_path, monkeypa
         raise OSError('controlled publication failure')
     monkeypatch.setattr(sam_replay, 'write_seg_nrrd', fail)
     with pytest.raises(OSError, match='publication'):
-        replay_sam_directional_nrrds(bundle, tmp_path / 'failed', memory_mib=1)
+        replay_sam_directional_nrrds(bundle, tmp_path / 'failed', policy=LEGACY_POLICY, memory_mib=1)
     assert not (tmp_path / 'failed').exists()
     assert not list(tmp_path.glob('.failed.replay-*'))
     assert SamEvidenceBundle.open(bundle.directory).evidence_fingerprint == bundle.evidence_fingerprint
@@ -203,7 +206,7 @@ def test_view_native_crop_translation_and_retained_transform_are_explicit(tmp_pa
                  'source_shape_tyx': [5, 50, 60]}
     bundle = build_bundle(tmp_path, [(fixture_run('offset-run', group), raw)],
         group=group, masks=masks, scope={'shape_tyx': [5, 25, 30], 'source_transform': transform})
-    result = replay_sam_directional_nrrds(bundle, tmp_path / 'native', memory_mib=1)
+    result = replay_sam_directional_nrrds(bundle, tmp_path / 'native', policy=LEGACY_POLICY, memory_mib=1)
     exported, header = _read(tmp_path / 'native' / result['layers'][0]['path'])
     expected = np.zeros((5, 25, 30), np.uint8)
     for frame in (1, 2, 3):
@@ -256,7 +259,7 @@ def test_two_directional_slots_scale_with_passes_instead_of_run_count(tmp_path):
     ]
     bundle = build_bundle(tmp_path, variants, group=group, masks=masks,
                           scope={'shape_tyx': [5, 12, 16]})
-    result = replay_sam_directional_nrrds(bundle, tmp_path / 'two-passes', memory_mib=1)
+    result = replay_sam_directional_nrrds(bundle, tmp_path / 'two-passes', policy=LEGACY_POLICY, memory_mib=1)
     assert len(result['selection']['selected_run_ids']) == 5
     assert len(result['layers']) == 4
     assert [(v['pass_index'], v['interpolation_direction']) for v in result['layers']] == [
@@ -284,7 +287,7 @@ def test_replay_revalidates_source_before_atomic_publication(tmp_path, monkeypat
         return result
     monkeypatch.setattr(sam_replay, 'write_seg_nrrd', write_then_mutate_source)
     with pytest.raises(RuntimeError, match='evidence changed'):
-        replay_sam_directional_nrrds(bundle, tmp_path / 'raced', memory_mib=1)
+        replay_sam_directional_nrrds(bundle, tmp_path / 'raced', policy=LEGACY_POLICY, memory_mib=1)
     assert not (tmp_path / 'raced').exists()
     assert not list(tmp_path.glob('.raced.replay-*'))
     assert (bundle.directory / 'manifest.json').exists()

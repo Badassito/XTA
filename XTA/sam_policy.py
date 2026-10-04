@@ -36,6 +36,9 @@ STOCK_SAM_POLICY = dict(name="sam_conservative_v2", kind="conservative", version
                         reject_unintended_contact=True, strict_family_agreement=False,
                 min_family_iou=.5, min_family_slice_iou=.25, connectivity=26,
                         enforce_interpolation_min_radius=True, component_min_radius=None,
+                        branch_aware_selection=False, allow_paired_seed_tracks=False,
+                        branch_write_domain="edge_write",
+                        branch_crop_boundary_policy="reject",
                         max_group_bytes=256 * 1024**2)
 PERMISSIVE_SAM_POLICY = {**STOCK_SAM_POLICY, "name": "sam_permissive_raw_candidates_v2",
                          "kind": "permissive", "strict_containment": False,
@@ -57,7 +60,17 @@ GUARDED_SAM_POLICY = {**STOCK_SAM_POLICY, **RESCUE_SETTINGS,
     "name": "sam_conservative_guarded_rescue_v4", "version": 4}
 GUARDED_TILED_SAM_POLICY = {**TILED_SAM_POLICY, **RESCUE_SETTINGS,
     "name": "sam_conservative_tiled_guarded_rescue_v5", "version": 5}
+BRANCH_SAM_POLICY = {**GUARDED_SAM_POLICY, "name": "sam_conservative_connected_branches_v6",
+    "version": 6, "guarded_rescue": False, "branch_aware_selection": True,
+    "allow_paired_seed_tracks": True, "strict_containment": False, "min_endpoint_recall": 0.,
+    "branch_write_domain": "fixed_context", "branch_crop_boundary_policy": "retain_censored"}
+BRANCH_TILED_SAM_POLICY = {**GUARDED_TILED_SAM_POLICY, "name": "sam_conservative_tiled_connected_branches_v7",
+    "version": 7, "guarded_rescue": False, "branch_aware_selection": True,
+    "allow_paired_seed_tracks": True, "strict_containment": False, "min_endpoint_recall": 0.,
+    "branch_write_domain": "fixed_context", "branch_crop_boundary_policy": "retain_censored"}
 RESCUE_SCHEMA = "xta.sam_guarded_rescue/1"
+_BRANCH_SPATIAL_COVERAGE_ERRORS = frozenset({"tiled_required_write_coverage_incomplete",
+    "tiled_required_endpoint_coverage_incomplete", "tiled_required_evaluation_coverage_incomplete"})
 
 
 class SamRegenerationRequired(RuntimeError):
@@ -76,11 +89,13 @@ def _assert_policy_source_unchanged():
         raise RuntimeError("SAM cyclic quality implementation changed after loading")
 
 
-def resolve_sam_bridge_policy(source_policy=None, *, overrides=None, generation_mode=None):
+def resolve_sam_bridge_policy(source_policy=None, *, overrides=None, generation_mode=None, environ=None):
     source_policy = source_policy or {}
     if generation_mode not in {None,"whole","tiled"}:
         raise ValueError("SAM proposal generation mode must be whole or tiled")
-    conservative=GUARDED_TILED_SAM_POLICY if generation_mode=="tiled" else GUARDED_SAM_POLICY
+    conservative = ((GUARDED_TILED_SAM_POLICY if generation_mode == "tiled" else GUARDED_SAM_POLICY)
+        if source_policy.get("select_proposals") is not None else
+        (BRANCH_TILED_SAM_POLICY if generation_mode == "tiled" else BRANCH_SAM_POLICY))
     permissive=PERMISSIVE_TILED_SAM_POLICY if generation_mode=="tiled" else PERMISSIVE_SAM_POLICY
     declared = source_policy.get("sam_bridge_policy")
     if declared is None:
@@ -89,8 +104,18 @@ def resolve_sam_bridge_policy(source_policy=None, *, overrides=None, generation_
         result = dict(permissive if declared in {"permissive", "raw_candidates"} else conservative)
     elif isinstance(declared, Mapping):
         explicit = dict(declared)
-        base = (TILED_SAM_POLICY if explicit.get("version") == 3 else STOCK_SAM_POLICY
-                if explicit.get("version") == 2 else conservative)
+        if "version" in explicit:
+            value = explicit["version"]
+            try:
+                version = int(value)
+            except (ValueError, TypeError, OverflowError) as error:
+                raise ValueError("SAM bridge policy version must be a supported integer") from error
+            if isinstance(value, bool) or (isinstance(value, (float, np.floating)) and value != version):
+                raise ValueError("SAM bridge policy version must be a supported integer")
+            explicit["version"] = version
+        base = {2: STOCK_SAM_POLICY, 3: TILED_SAM_POLICY, 4: GUARDED_SAM_POLICY,
+                5: GUARDED_TILED_SAM_POLICY, 6: BRANCH_SAM_POLICY,
+                7: BRANCH_TILED_SAM_POLICY}.get(explicit.get("version"), conservative)
         if explicit.get("kind")=="permissive" and "version" not in explicit:
             base=permissive
         result = {**base, **explicit}
@@ -98,13 +123,33 @@ def resolve_sam_bridge_policy(source_policy=None, *, overrides=None, generation_
         raise ValueError("sam_bridge_policy requires stock/conservative, permissive/raw_candidates, or settings")
     if overrides:
         result.update(overrides)
+    try:
+        value = result["version"]
+        result["version"] = int(value)
+    except (ValueError, TypeError, OverflowError) as error:
+        raise ValueError("SAM bridge policy version must be a supported integer") from error
+    if isinstance(value, bool) or (isinstance(value, (float, np.floating)) and value != result["version"]):
+        raise ValueError("SAM bridge policy version must be a supported integer")
+    # The launch switch is a convenience override for inherited conservative
+    # containment only. Explicit settings, including a saved resolved policy,
+    # are authoritative and independent of the current process environment.
+    explicit_containment = ((isinstance(declared, Mapping) and 'strict_containment' in declared)
+                            or (overrides is not None and 'strict_containment' in overrides))
+    if result['kind'] == 'conservative' and not explicit_containment:
+        from .config import resolve_sam_tight_crop_guard
+        requested_guard = resolve_sam_tight_crop_guard(environ)
+        if requested_guard is not None:
+            result['strict_containment'] = requested_guard
+        if requested_guard is False:
+            result['guarded_rescue'] = False
+            result['name'] = f"{result['name']}_tight_crop_guard_off"
     unknown = set(result) - (set(STOCK_SAM_POLICY) | set(RESCUE_SETTINGS))
     if unknown:
         raise ValueError(f"Unknown SAM bridge policy fields: {sorted(unknown)}")
-    if result["kind"] not in {"conservative", "permissive"} or int(result["version"]) not in {2,3,4,5}:
+    if result["kind"] not in {"conservative", "permissive"} or int(result["version"]) not in {2,3,4,5,6,7}:
         raise ValueError("Unsupported SAM bridge policy kind/version")
-    if generation_mode is not None and int(result["version"]) not in ({3,5} if generation_mode=="tiled" else {2,4}):
-        raise ValueError(f"SAM quality version {result['version']} is incompatible with {generation_mode} generation; tiled requires v3/v5 and whole requires v2/v4")
+    if generation_mode is not None and int(result["version"]) not in ({3,5,7} if generation_mode=="tiled" else {2,4,6}):
+        raise ValueError(f"SAM quality version {result['version']} is incompatible with {generation_mode} generation; tiled requires v3/v5/v7 and whole requires v2/v4/v6")
     for key in ("min_endpoint_recall", "max_endpoint_excess", "min_family_iou", "min_family_slice_iou"):
         value = float(result[key])
         if not np.isfinite(value) or not 0 <= value <= 1:
@@ -120,10 +165,29 @@ def resolve_sam_bridge_policy(source_policy=None, *, overrides=None, generation_
             raise ValueError("component_min_radius must be finite and nonnegative or None")
         result["component_min_radius"] = float(radius)
     for key in ("strict_containment", "require_local_topology", "reject_unintended_contact",
-                "strict_family_agreement", "enforce_interpolation_min_radius"):
+                "strict_family_agreement", "enforce_interpolation_min_radius", "branch_aware_selection",
+                "allow_paired_seed_tracks"):
         if not isinstance(result[key], bool):
             raise ValueError(f"{key} must be a boolean")
-    rescue_version = int(result["version"]) in {4,5}
+    branch_version = int(result["version"]) in {6,7}
+    if result["branch_aware_selection"] != branch_version:
+        raise ValueError("Connected branch selection requires explicit whole-v6 or tiled-v7 quality identity")
+    if result["allow_paired_seed_tracks"] and not branch_version:
+        raise ValueError("Paired seed tracks require connected branch selection")
+    if result["branch_write_domain"] not in {"edge_write", "fixed_context"}:
+        raise ValueError("branch_write_domain must be edge_write or fixed_context")
+    if not branch_version and result["branch_write_domain"] != "edge_write":
+        raise ValueError("Expanded fixed-context write domains require whole-v6 or tiled-v7 quality identity")
+    if result["branch_crop_boundary_policy"] not in {"reject", "retain_censored"}:
+        raise ValueError("branch_crop_boundary_policy must be reject or retain_censored")
+    if not branch_version and result["branch_crop_boundary_policy"] != "reject":
+        raise ValueError("Extent-censored branch publication requires whole-v6 or tiled-v7 quality identity")
+    if branch_version and (result["kind"] != "conservative" or not result["require_local_topology"]
+                          or not result["reject_unintended_contact"] or result.get("guarded_rescue", False)):
+        raise ValueError("Connected branch selection requires conservative topology/contact guards and guarded_rescue=False")
+    if branch_version and source_policy.get("select_proposals") is not None:
+        raise ValueError("select_proposals v1 run-ID hooks require legacy SAM quality v2-v5; connected branch v6/v7 needs edge certificates")
+    rescue_version = int(result["version"]) in {4,5,6,7}
     if not rescue_version and result.get("guarded_rescue", False):
         raise ValueError("Guarded rescue requires explicit whole-v4 or tiled-v5 quality identity")
     if rescue_version:
@@ -163,6 +227,51 @@ def _saved_generation_mode(bundle):
     if declared=="tiled" and any(run.get("generation_mode")!="tiled" or not run.get("tile_evidence") for run in bundle.runs.values()):
         raise ValueError("Saved tiled SAM scope requires independent raw tile evidence for every original run")
     return declared or ("tiled" if tiled else "whole")
+
+
+def _branch_contract_fallback(bundle, source_policy, generation_mode):
+    """Choose legacy semantics only for unversioned historical inventories."""
+    declared = source_policy.get("sam_bridge_policy")
+    explicit_new = isinstance(declared, Mapping) and (
+        "version" in declared or declared.get("branch_aware_selection") is True
+        or declared.get("branch_write_domain") == "fixed_context"
+        or declared.get("branch_crop_boundary_policy") == "retain_censored")
+    missing = []
+    active_groups = {run["group_id"] for run in bundle.runs.values() if run.get("complete", False)}
+    for group_id in sorted(active_groups):
+        group = bundle.groups[group_id]
+        if not group.get("complete", True) or group.get("status") in {"incomplete", "unresolved", "invalid"}:
+            continue
+        for run_id, run in bundle.runs.items():
+            if run["group_id"] == group_id and run.get("complete", False) and not run.get("edge_ids"):
+                missing.append(f"run_edge_attribution:{run_id}")
+        keys = group["mask_keys"]
+        for frame in group["frame_indices"]:
+            for name in ("known_foreground", "unrelated"):
+                if f"{name}:{frame}" not in keys:
+                    missing.append(f"{group_id}:{name}:{frame}")
+            for edge in group.get("edges", ()):
+                for name in ("edge_write", "edge_contract"):
+                    if f"{name}:{edge['edge_id']}:{frame}" not in keys:
+                        missing.append(f"{group_id}:{name}:{edge['edge_id']}:{frame}")
+    if not missing:
+        return source_policy, None
+    planning = bundle.scope.get("crop_contract_version") or bundle.scope.get("planning_contract")
+    legacy_planning = planning is None or (isinstance(planning, str) and planning.startswith("xta.sam_")
+                                           and planning.endswith("/1"))
+    modern = (not legacy_planning
+              or any(group.get("crop_contract", {}).get("schema", "").endswith("/2") for group in bundle.groups.values()))
+    if explicit_new or modern:
+        raise ValueError("SAM branch-aware evidence is missing declared edge ownership/write/attachment contracts: "
+                         + ", ".join(missing[:4]))
+    version = 5 if generation_mode == "tiled" else 4
+    legacy = dict(declared) if isinstance(declared, Mapping) else {}
+    legacy.update(version=version)
+    result = dict(source_policy, sam_bridge_policy=legacy)
+    audit = dict(status="legacy_contract_fallback", resolved_quality_version=version,
+        reason="Historical unversioned evidence lacks per-edge ownership/attachment contracts",
+        missing_contract_count=len(missing), missing_contract_examples=missing[:16])
+    return result, audit
 
 
 def _dependencies(bundle, current, frozen):
@@ -540,7 +649,8 @@ def _label_foreground_crop(volume, structure):
     return labels, bounds
 
 
-def measure_group_topology(bundle, group_id, selected_run_ids, *, connectivity=6, max_group_bytes=256 * 1024**2, mask_filter=None):
+def measure_group_topology(bundle, group_id, selected_run_ids, *, connectivity=6, max_group_bytes=256 * 1024**2,
+                           mask_filter=None, respect_edge_contract=True, edge_ids=None):
     """Test local selected additions plus fixed attachments, excluding remote routes."""
     group = bundle.groups[group_id]
     additions = _group_additions(bundle, group, selected_run_ids, max_group_bytes, mask_filter)
@@ -549,6 +659,8 @@ def measure_group_topology(bundle, group_id, selected_run_ids, *, connectivity=6
     structure = ndimage.generate_binary_structure(3, {6: 1, 18: 2, 26: 3}[connectivity])
     edges = []
     for edge in group.get("edges", ()):
+        if edge_ids is not None and edge["edge_id"] not in edge_ids:
+            continue
         source, target = endpoints[edge["source_id"]], endpoints[edge["target_id"]]
         lo, hi = sorted((int(source["frame_index"]), int(target["frame_index"])))
         z0, z1 = frame_to_index[lo], frame_to_index[hi] + 1
@@ -561,9 +673,15 @@ def measure_group_topology(bundle, group_id, selected_run_ids, *, connectivity=6
             known_key = f"known_foreground:{frame}"
             if contract_key in group["mask_keys"]:
                 contract = bundle.group_mask(group_id, contract_key)
-                local[frame-lo] &= contract
+                if respect_edge_contract:
+                    local[frame-lo] &= contract
                 if known_key in group["mask_keys"]:
-                    local[frame-lo] |= bundle.group_mask(group_id, known_key) & contract
+                    if getattr(mask_filter, "branch_selection", None) is not None or (
+                            isinstance(mask_filter, Mapping) and "branch_selection" in mask_filter):
+                        from .sam_branch_selection import branch_attachment_mask
+                        local[frame-lo] |= branch_attachment_mask(bundle, group_id, edge["edge_id"], frame, mask_filter)
+                    else:
+                        local[frame-lo] |= bundle.group_mask(group_id, known_key) & contract
         source_plane, target_plane = int(source["frame_index"]) - lo, int(target["frame_index"]) - lo
         source_mask = bundle.group_mask(group_id, f"endpoint:{source['observation_id']}")
         target_mask = bundle.group_mask(group_id, f"endpoint:{target['observation_id']}")
@@ -624,13 +742,14 @@ def measure_group_topology(bundle, group_id, selected_run_ids, *, connectivity=6
                 unintended_contact_status="measured" if unrelated_available else "ambiguous_unrelated_identity_unavailable")
 
 
-def measure_family_agreement(bundle, group_id, selected_run_ids, *, mask_filter=None):
+def measure_family_agreement(bundle, group_id, selected_run_ids, *, mask_filter=None, edge_ids=None):
     """Compare independently seeded edge families, preserving unavailable coverage."""
     group = bundle.groups[group_id]
     endpoints = {v["observation_id"]: v for v in group["endpoints"]}
     selected = [bundle.runs[key] for key in selected_run_ids]
+    edges = [edge for edge in group.get("edges", ()) if edge_ids is None or edge["edge_id"] in edge_ids]
     forward_by_edge, reverse_by_edge, missing = {}, {}, []
-    for edge in group.get("edges", ()):
+    for edge in edges:
         source, target = endpoints[edge["source_id"]], endpoints[edge["target_id"]]
         interval = set(range(min(source["frame_index"], target["frame_index"]), max(source["frame_index"], target["frame_index"]) + 1))
         forward = [run for run in selected if edge["source_id"] in run.get("seed_ids", ()) and edge["target_id"] in run.get("held_out_ids", ())
@@ -643,7 +762,7 @@ def measure_family_agreement(bundle, group_id, selected_run_ids, *, mask_filter=
     slices = []
     intersection_total, union_total = 0, 0
     for frame in group["frame_indices"]:
-        active = [edge for edge in group.get("edges", ()) if min(endpoints[edge["source_id"]]["frame_index"], endpoints[edge["target_id"]]["frame_index"]) < frame
+        active = [edge for edge in edges if min(endpoints[edge["source_id"]]["frame_index"], endpoints[edge["target_id"]]["frame_index"]) < frame
                   < max(endpoints[edge["source_id"]]["frame_index"], endpoints[edge["target_id"]]["frame_index"])]
         if not active:
             continue
@@ -971,6 +1090,91 @@ def _quality_reasons(measurement, group, policy):
     return sorted(set(reasons))
 
 
+def _branch_edge_eligibility(bundle, group, run_ids, measurements, policy):
+    """Qualify original owners per edge before any connected-path certificate.
+
+    A missed held-out endpoint may contribute a seed-rooted partial track only
+    when the later path builder certifies independent opposite-seed support on
+    the same source-to-target component. Excess, unknown/injected coverage,
+    infrastructure and enabled containment gates cannot enter that pairing.
+    """
+    eligible, audit = {}, {}
+    for edge in group.get("edges", ()):
+        edge_id = str(edge["edge_id"])
+        eligible[edge_id] = {name: [] for name in (
+            "direct_run_ids", "source_partial_run_ids", "target_partial_run_ids")}
+        audit[edge_id] = {}
+        for run_id in run_ids:
+            run, measurement = bundle.runs[run_id], measurements[run_id]
+            if edge_id not in run.get("edge_ids", ()):
+                continue
+            seeds, held_out = set(run.get("seed_ids", ())), set(run.get("held_out_ids", ()))
+            if edge["source_id"] in seeds and edge["target_id"] in held_out:
+                endpoint_id, partial_category = edge["target_id"], "source_partial_run_ids"
+            elif edge["target_id"] in seeds and edge["source_id"] in held_out:
+                endpoint_id, partial_category = edge["source_id"], "target_partial_run_ids"
+            else:
+                # Walk-back conditioning uses an earlier original observation,
+                # while run.edge_ids and its unique held-out endpoint preserve
+                # which original edge end owns that tracking hypothesis.
+                terminals = {edge["source_id"], edge["target_id"]} & held_out
+                endpoint_id = next(iter(terminals)) if len(terminals) == 1 else None
+                partial_category = ("source_partial_run_ids" if endpoint_id == edge["target_id"]
+                                    else "target_partial_run_ids")
+            scores = {row["observation_id"]: row for row in measurement["endpoint_agreement"]}
+            score = scores.get(endpoint_id)
+            # These three errors aggregate every planned branch/terminal. A
+            # fully covered sibling edge may survive an unowned, unknown edge.
+            # Actual seed loss, attempted-tile/frame failure and foreground in
+            # an unavailable core remain fatal. The selected endpoint score and
+            # the central owner-availability mask certify this edge's support.
+            reasons = [reason for reason in measurement["infrastructure_errors"] if reason not in _BRANCH_SPATIAL_COVERAGE_ERRORS]
+            if endpoint_id not in run.get("held_out_ids", ()) or score is None:
+                reasons.append("edge_held_out_endpoint_identity_unavailable")
+            else:
+                trusted_spatial_anchor = (score["status"] == "unknown_spatial_coverage"
+                    and policy["min_endpoint_recall"] == 0.)
+                if score["status"] != "measured" and not trusted_spatial_anchor:
+                    reasons.append("held_out_endpoint_unknown")
+                if score.get("excess_fraction", 0.) > policy["max_endpoint_excess"]:
+                    reasons.append("held_out_endpoint_excess")
+            if policy["strict_containment"]:
+                if measurement["first_observed_violation"] is not None:
+                    reasons.append("effective_acceptance_violation_whole_run")
+                if measurement.get("first_effective_halo_violation") is not None:
+                    reasons.append("effective_full_halo_acceptance_violation_whole_original_run")
+            category = None
+            if not reasons:
+                if score["recall"] >= policy["min_endpoint_recall"]:
+                    category = "direct_run_ids"
+                elif policy["allow_paired_seed_tracks"]:
+                    category = partial_category
+                else:
+                    reasons.append("held_out_endpoint_recall")
+            if category is not None:
+                eligible[edge_id][category].append(run_id)
+            audit[edge_id][run_id] = dict(run_id=run_id, held_out_id=endpoint_id,
+                qualification=category or "rejected", reasons=sorted(set(reasons)),
+                endpoint_agreement=_plain(score),
+                target_anchor_basis=("trusted_original_endpoint_with_spatially_partial_tracker_coverage"
+                    if score is not None and score["status"] == "unknown_spatial_coverage" and policy["min_endpoint_recall"] == 0.
+                    else "measured_tracker_endpoint_agreement"),
+                paired_track_certificate_required=category in {"source_partial_run_ids", "target_partial_run_ids"})
+    return eligible, audit
+
+
+def _restrict_branch_recipe(recipe, edge_ids):
+    """Retain only independently safe certified edges, including their owners."""
+    selected = set(edge_ids)
+    result = {key: _plain(value) for key, value in recipe.items()
+              if key not in {"sha256", "edges", "selected_edge_ids_by_run"}}
+    result["edges"] = {edge_id: _plain(record) for edge_id, record in recipe["edges"].items() if edge_id in selected}
+    result["selected_edge_ids_by_run"] = {run_id: retained for run_id, edges in recipe["selected_edge_ids_by_run"].items()
+        if (retained := [edge_id for edge_id in edges if edge_id in selected])}
+    result["sha256"] = fingerprint(result)
+    return result
+
+
 def _custom_selection(hook, context):
     value = hook(context)
     if isinstance(value, Mapping):
@@ -1094,14 +1298,20 @@ def _pair_contact(bundle, group_a, runs_a, group_b, runs_b, connectivity, mask_f
         return _cyclic_pair_contact(bundle,group_a,runs_a,group_b,runs_b,connectivity,mask_filter,address_a,address_b)
     if {v["observation_id"] for v in group_a["endpoints"]}.intersection(v["observation_id"] for v in group_b["endpoints"]):
         return False
+    frames_b = set(group_b["frame_indices"])
+    # The exact 3D contact kernel reaches only the same or adjacent stored
+    # frame. Reject disjoint temporal neighborhoods before decoding a plane.
+    possible_frames = [frame for frame in group_a["frame_indices"]
+                       if any(frame+offset in frames_b for offset in (-1, 0, 1))]
+    if not possible_frames:
+        return False
     ay0, ax0, ay1, ax1 = group_a["context_bbox_yx"]
     by0, bx0, by1, bx1 = group_b["context_bbox_yx"]
     y0, x0, y1, x1 = max(ay0-1, by0), max(ax0-1, bx0), min(ay1+1, by1), min(ax1+1, bx1)
     if y0 >= y1 or x0 >= x1:
         return False
     structure = ndimage.generate_binary_structure(3, {6: 1, 18: 2, 26: 3}[connectivity])
-    frames_b = set(group_b["frame_indices"])
-    for frame in group_a["frame_indices"]:
+    for frame in possible_frames:
         candidate = _support_plane(bundle, group_a, runs_a, frame, attachments=False, mask_filter=mask_filter)
         if not candidate.any():
             continue
@@ -1370,6 +1580,11 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
         source_policy = {"sam_bridge_policy": source_policy}
     generation_mode=_saved_generation_mode(bundle)
     resolved = resolve_sam_bridge_policy(source_policy,generation_mode=generation_mode)
+    legacy_contract_fallback = None
+    if resolved["branch_aware_selection"]:
+        source_policy, legacy_contract_fallback = _branch_contract_fallback(bundle, source_policy, generation_mode)
+        if legacy_contract_fallback is not None:
+            resolved = resolve_sam_bridge_policy(source_policy, generation_mode=generation_mode)
     operative,selection_resources=_selection_resources(source_policy,resolved,resource_profile)
     mask_filter = build_mask_filter(bundle, enabled=resolved["enforce_interpolation_min_radius"],
                                    min_radius=resolved["component_min_radius"])
@@ -1404,11 +1619,18 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
         # Callback source identity must be supplied for deterministic audited replay.
         hook_identity = f"{hook.__module__}.{hook.__qualname__}"
     implementation_sha256 = _POLICY_IMPLEMENTATION_SHA256
+    branch_mode = bool(resolved["branch_aware_selection"])
+    if branch_mode:
+        from .sam_branch_selection import (build_connected_edge_selection, merge_branch_selections,
+            IMPLEMENTATION_SHA256 as BRANCH_IMPLEMENTATION_SHA256)
     policy_hash = fingerprint(dict(settings=resolved, custom_hook=hook_identity,
         implementation_sha256=implementation_sha256, component_filter_implementation_sha256=FILTER_IMPLEMENTATION_SHA256,
         cyclic_quality_implementation_sha256=_CYCLIC_IMPLEMENTATION_SHA256,
         reader_implementation_sha256=READER_IMPLEMENTATION_SHA256,
         mask_filter_sha256=mask_filter["sha256"]))
+    if branch_mode:
+        policy_hash = fingerprint(dict(base_policy_hash=policy_hash,
+            branch_implementation_sha256=BRANCH_IMPLEMENTATION_SHA256))
     tiled_contract=None
     if generation_mode=="tiled":
         tiled_contract=dict(schema="xta.sam_tiled_quality/1",quality_version=int(resolved["version"]),
@@ -1425,6 +1647,7 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
             aggregate_tracker_probability="Undefined; every child probability and status retained independently")
         policy_hash=fingerprint(dict(base_policy_hash=policy_hash,tiled_quality_contract=tiled_contract))
     receipts, group_receipts, selected = {}, {}, []
+    branch_recipes = []
     for group_id in sorted(bundle.groups):
         group = bundle.groups[group_id]
         run_ids = sorted(key for key, run in bundle.runs.items() if run["group_id"] == group_id)
@@ -1434,7 +1657,12 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
                 status="not_attempted_unresolved", topology={"status": "not_assessed_unresolved"},
                 family_agreement={"status": "unknown_incomplete_family"})
             continue
-        topology_estimate=len(group["frame_indices"])*int(np.prod(_group_shape(group)))*16
+        group_shape = (len(group["frame_indices"]), *_group_shape(group))
+        if branch_mode:
+            from .sam_branch_selection import branch_workspace_bytes
+            topology_estimate = branch_workspace_bytes(group_shape)
+        else:
+            topology_estimate = int(np.prod(group_shape))*16
         if topology_estimate>operative["max_group_bytes"]:
             # Saved larger-generation credit is not permission to allocate in
             # this reader/replay. Refuse one family without losing other ones.
@@ -1454,6 +1682,9 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
         valid = [key for key in run_ids if not measurements[key]["infrastructure_errors"]]
         quality = {key: _quality_reasons(measurements[key], group, resolved) for key in run_ids}
         hook_reasons = {}
+        branch_recipe, branch_diagnostics, branch_quality = None, {}, {}
+        selection_filter = mask_filter
+        selected_edge_ids = None
         if hook is not None:
             bounded_ids = frozenset(run_ids)
             def raw_access(run_id, frame):
@@ -1486,15 +1717,63 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
                 raise ValueError("Proposal policy selected a run outside its current bounded group")
             if set(chosen) - set(valid):
                 raise ValueError("Proposal policy attempted to select incomplete or structurally invalid evidence")
+        elif branch_mode:
+            eligible, branch_quality = _branch_edge_eligibility(bundle, group, run_ids, measurements, resolved)
+            eligible = {edge_id: roles for edge_id, roles in eligible.items() if any(roles.values())}
+            branch_recipe, branch_diagnostics = build_connected_edge_selection(bundle, mask_filter, group_id, eligible,
+                connectivity=resolved["connectivity"], max_group_bytes=operative["max_group_bytes"],
+                write_domain=resolved["branch_write_domain"], crop_boundary_policy=resolved["branch_crop_boundary_policy"])
+            safe_edges = []
+            for edge_id in sorted(branch_recipe["edges"]):
+                edge_recipe = _restrict_branch_recipe(branch_recipe, [edge_id])
+                edge_combined = merge_branch_selections(bundle, mask_filter, [*branch_recipes, edge_recipe],
+                    connectivity=resolved["connectivity"], max_group_bytes=operative["max_group_bytes"],
+                    write_domain=resolved["branch_write_domain"], crop_boundary_policy=resolved["branch_crop_boundary_policy"])
+                edge_filter = bundle.filter_snapshot(dict(mask_filter=mask_filter, branch_selection=edge_combined))
+                edge_runs = sorted(edge_recipe["selected_edge_ids_by_run"])
+                edge_topology = measure_group_topology(bundle, group_id, edge_runs,
+                    connectivity=resolved["connectivity"], max_group_bytes=operative["max_group_bytes"],
+                    mask_filter=edge_filter, edge_ids=[edge_id],
+                    respect_edge_contract=resolved["branch_write_domain"] != "fixed_context")
+                rejected = []
+                if not edge_topology["all_requested_edges_connected"]:
+                    rejected.append("selected_branch_connection_lost")
+                if edge_topology["unintended_contact_voxels"]:
+                    rejected.append("unintended_observed_attachment")
+                for previous_id, previous in group_receipts.items():
+                    previous_runs = previous["selected_run_ids"]
+                    if previous_runs and (_pair_contact(bundle, group, edge_runs, bundle.groups[previous_id],
+                            previous_runs, resolved["connectivity"], edge_filter)
+                            or _pair_contact(bundle, bundle.groups[previous_id], previous_runs, group, edge_runs,
+                                resolved["connectivity"], edge_filter)):
+                        rejected.append("selected_families_create_unintended_joint_attachment")
+                        break
+                branch_diagnostics[edge_id].update(selection_rejection_reasons=sorted(set(rejected)),
+                    unintended_contact_voxels=edge_topology["unintended_contact_voxels"])
+                if not rejected:
+                    safe_edges.append(edge_id)
+            branch_recipe = _restrict_branch_recipe(branch_recipe, safe_edges)
+            combined = merge_branch_selections(bundle, mask_filter, [*branch_recipes, branch_recipe],
+                connectivity=resolved["connectivity"], max_group_bytes=operative["max_group_bytes"],
+                write_domain=resolved["branch_write_domain"], crop_boundary_policy=resolved["branch_crop_boundary_policy"])
+            selection_filter = bundle.filter_snapshot(dict(mask_filter=mask_filter, branch_selection=combined))
+            chosen = sorted(branch_recipe["selected_edge_ids_by_run"])
+            selected_edge_ids = set(branch_recipe["edges"])
         else:
             chosen = [key for key in valid if not quality[key]]
         topology = measure_group_topology(bundle, group_id, chosen, connectivity=resolved["connectivity"],
-                                         max_group_bytes=operative["max_group_bytes"], mask_filter=mask_filter)
-        family = measure_family_agreement(bundle, group_id, chosen, mask_filter=mask_filter)
-        raw_family = measure_family_agreement(bundle, group_id, chosen)
+            max_group_bytes=operative["max_group_bytes"], mask_filter=selection_filter,
+            respect_edge_contract=not (branch_mode and resolved["branch_write_domain"] == "fixed_context"))
+        family = measure_family_agreement(bundle, group_id, chosen, mask_filter=selection_filter, edge_ids=selected_edge_ids)
+        raw_family = measure_family_agreement(bundle, group_id, chosen, edge_ids=selected_edge_ids)
         group_reasons = []
         if hook is None:
-            if resolved["require_local_topology"] and not topology["all_requested_edges_connected"]:
+            if branch_mode:
+                connected = {edge["edge_id"] for edge in topology["edges"] if edge["connected"]}
+                if not selected_edge_ids or not selected_edge_ids.issubset(connected):
+                    group_reasons.append("no_qualified_connected_edges" if not selected_edge_ids
+                                         else "selected_branch_connection_lost")
+            elif resolved["require_local_topology"] and not topology["all_requested_edges_connected"]:
                 group_reasons.append("all_requested_local_connections_required")
             if resolved["reject_unintended_contact"] and topology["unintended_contact_voxels"]:
                 group_reasons.append("unintended_observed_attachment")
@@ -1507,24 +1786,38 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
             if resolved["reject_unintended_contact"] and chosen:
                 for previous_id, previous in group_receipts.items():
                     previous_runs = previous["selected_run_ids"]
-                    if previous_runs and (_pair_contact(bundle, group, chosen, bundle.groups[previous_id], previous_runs, resolved["connectivity"], mask_filter)
-                            or _pair_contact(bundle, bundle.groups[previous_id], previous_runs, group, chosen, resolved["connectivity"], mask_filter)):
+                    if previous_runs and (_pair_contact(bundle, group, chosen, bundle.groups[previous_id], previous_runs, resolved["connectivity"], selection_filter)
+                            or _pair_contact(bundle, bundle.groups[previous_id], previous_runs, group, chosen, resolved["connectivity"], selection_filter)):
                         group_reasons.append("selected_families_create_unintended_joint_attachment")
                         break
         if group_reasons:
             candidate_topology = topology
             chosen = []
             topology = measure_group_topology(bundle, group_id, chosen, connectivity=resolved["connectivity"],
-                                             max_group_bytes=operative["max_group_bytes"], mask_filter=mask_filter)
+                max_group_bytes=operative["max_group_bytes"], mask_filter=selection_filter,
+                respect_edge_contract=not (branch_mode and resolved["branch_write_domain"] == "fixed_context"))
         else:
             candidate_topology = topology
+        if branch_mode and chosen:
+            branch_recipes.append(branch_recipe)
         selected.extend(chosen)
         group_receipts[group_id] = dict(group_id=group_id, selected_run_ids=chosen, reasons=group_reasons,
             status="policy_selected" if chosen else "policy_rejected" if valid else "generated_incomplete_or_invalid",
             topology=topology, candidate_topology=candidate_topology, family_agreement=family,
             raw_family_agreement=raw_family, custom_reason_records=hook_reasons)
+        if branch_mode:
+            group_receipts[group_id].update(selected_edge_ids=sorted(selected_edge_ids) if chosen else [],
+                branch_selection_status=("selected_all_requested_edges" if chosen and len(selected_edge_ids) == len(group.get("edges", ()))
+                    else "selected_connected_subset" if chosen else "no_selected_branches"),
+                branch_edge_receipts={edge["edge_id"]: dict(
+                    selected=bool(chosen) and edge["edge_id"] in selected_edge_ids,
+                    qualification=branch_quality.get(edge["edge_id"], {}),
+                    path_certificate=branch_diagnostics.get(edge["edge_id"], dict(connected=False,
+                        reasons=["no_quality_eligible_edge_owners"]))) for edge in group.get("edges", ())})
         for key in run_ids:
             invalid = measurements[key]["infrastructure_errors"]
+            if branch_mode:
+                invalid = [reason for reason in invalid if reason not in _BRANCH_SPATIAL_COVERAGE_ERRORS]
             frame_filters = measurements[key]["component_filter"]
             filter_summary = dict(removed_component_count=sum(v["removed_component_count"] for v in frame_filters),
                 removed_foreground=sum(v["removed_foreground"] for v in frame_filters),
@@ -1534,10 +1827,17 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
             receipts[key] = dict(run_id=key, group_id=group_id,
                 status="infrastructure_invalid" if invalid and not set(invalid).intersection({"run_coverage_incomplete","tiled_required_write_coverage_incomplete", "tiled_required_endpoint_coverage_incomplete", "tiled_required_evaluation_coverage_incomplete", "tiled_seed_coverage_incomplete"}) else
                        "generated_incomplete" if invalid else "policy_selected" if key in chosen else "policy_rejected",
-                selected=key in chosen, reasons=invalid or (quality[key] + group_reasons if hook is None else ["external_proposal_selection"] if key not in chosen else []),
+                selected=key in chosen, reasons=invalid or ([] if branch_mode and key in chosen else
+                    quality[key] + group_reasons if hook is None else ["external_proposal_selection"] if key not in chosen else []),
                 measurements=measurements[key], mask_filter_summary=filter_summary, direction=bundle.runs[key]["direction"],
                 seed_ids=list(bundle.runs[key].get("seed_ids", ())), held_out_ids=list(bundle.runs[key].get("held_out_ids", ())),
                 lineage=_plain(bundle.runs[key].get("lineage", {})))
+            if branch_mode:
+                receipts[key].update(stock_whole_run_quality_reasons=quality[key],
+                    selected_edge_ids=branch_recipe["selected_edge_ids_by_run"].get(key, []) if key in chosen else [])
+                if key not in chosen:
+                    receipts[key]["reasons"] = sorted(set(receipts[key]["reasons"]) |
+                        (set(measurements[key]["infrastructure_errors"]) & _BRANCH_SPATIAL_COVERAGE_ERRORS))
     rescue_summary=_apply_guarded_rescue(bundle,operative,mask_filter,receipts,group_receipts,selected,
         enabled=bool(resolved.get("guarded_rescue",False)) and hook is None and resolved["kind"]=="conservative")
     if resource_profile is not None:
@@ -1555,9 +1855,27 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
                 group_receipts=group_receipts, dependencies=dependencies,
                 bridge_role="bridge", final_connection_survival="not_assessed_before_source_voting",
                 guarded_rescue=rescue_summary,selection_resources=selection_resources)
+    if legacy_contract_fallback is not None:
+        result["legacy_contract_fallback"] = legacy_contract_fallback
+    if branch_mode:
+        result["branch_selection"] = merge_branch_selections(bundle, mask_filter, branch_recipes,
+            connectivity=resolved["connectivity"], max_group_bytes=operative["max_group_bytes"],
+            write_domain=resolved["branch_write_domain"], crop_boundary_policy=resolved["branch_crop_boundary_policy"])
+        branch_edges = result["branch_selection"]["edges"]
+        censored = sorted(edge_id for edge_id, edge in branch_edges.items() if edge.get("extent_censored", False))
+        result["branch_selection_summary"] = dict(requested_edge_count=sum(len(group.get("edges", ()))
+                for group in bundle.groups.values()), selected_edge_count=len(branch_edges),
+            selected_extent_censored_edge_count=len(censored), selected_extent_censored_edge_ids=censored,
+            selected_internal_crop_edge_pixels=sum(int(branch_edges[edge_id].get("internal_crop_edge_pixels", 0))
+                for edge_id in censored),
+            selected_partial_family_count=sum(record.get("branch_selection_status") == "selected_connected_subset"
+                for record in group_receipts.values()),
+            connection_claim="Certified local original-endpoint gap connection",
+            object_extent_claim="Unknown outside fixed context for extent-censored edges")
     result["selection_identity"]=fingerprint(dict(evidence_fingerprint=result["evidence_fingerprint"],
         policy_hash=policy_hash,selected_run_ids=result["selected_run_ids"],
-        effective_resource_identity=selection_resources["effective_resource_identity"]))
+        effective_resource_identity=selection_resources["effective_resource_identity"],
+        branch_selection_sha256=result.get("branch_selection", {}).get("sha256")))
     if tiled_contract is not None:
         result.update(generation_mode="tiled",tiled_quality_contract=tiled_contract)
     return result

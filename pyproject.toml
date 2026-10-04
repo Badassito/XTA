@@ -43,7 +43,7 @@ version = {attr = "XTA.__version__"}
 [tool.setuptools.data-files]
 "share/xta" = [
   "ARCHITECTURE.md",
-  "GPT-6-Astra-Ultra_v24.0.1_SLURM.py",
+  "GPT-6-Astra-Ultra_v24.0.2_SLURM.py",
 ]
 "share/xta/docs" = ["docs/sam_interpolation.md", "docs/lta_dynamic_crops.md", "docs/projection_coverage.md"]
 "share/xta/tools" = [
@@ -121,4 +121,17 @@ version = {attr = "XTA.__version__"}
   "tools/benchmark_confidence_capture.py",
   "tools/qualify_sam_policy_throughput.py",
   "tools/qualify_sam_family_dispatch.py",
+  "tools/study_sam_largest_island.py",
+  "tools/evaluate_sam_extrapolation.py",
+  "tools/audit_sam_bridge_overlap.py",
+  "tools/analyze_tta_scheduling.py",
+  "tools/ablate_sam_tight_crop_guard.py",
+  "tools/evaluate_sam_reference_quality.py",
+  "tools/generate_sam_group_sdf_reference.py",
+  "tools/evaluate_sam_group_reference_quality.py",
+  "tools/plot_sam_reference_quality.py",
+  "tools/replay_sam_branch_policies.py",
+  "tools/recover_sam_refused_family.py",
+  "tools/export_sam_source_replay.py",
+  "tools/benchmark_sparse_azimuthal_projection.py",
 ]

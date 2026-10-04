@@ -138,7 +138,22 @@ class SamInterpolationContext:
         self.bundle_identity = str(bundle_identity)
         self.detector_identity = str(detector_identity)
         self.source_grid_shape = tuple(int(value) for value in (source_grid_shape or source_volume.shape))
-        self.policy = policy
+        from .sam_policy import resolve_sam_bridge_policy
+        # Resolve launch-scoped controls before dispatching threaded scopes.
+        # Pin only the guard fields: copying every inherited default here would
+        # falsely turn workspace defaults into explicit resource caps.
+        self.policy = dict(policy or {})
+        if 'kind' in self.policy and 'mode' not in self.policy:
+            self.policy = {'sam_bridge_policy': self.policy}
+        resolved_policy = resolve_sam_bridge_policy(self.policy, generation_mode=self.crop_mode)
+        declared_policy = self.policy.get('sam_bridge_policy')
+        bridge_policy = (dict(declared_policy) if isinstance(declared_policy, Mapping)
+                         else {'kind': resolved_policy['kind']})
+        self.tight_crop_guard = bool(resolved_policy['strict_containment'])
+        bridge_policy['strict_containment'] = self.tight_crop_guard
+        if not self.tight_crop_guard:
+            bridge_policy.update(guarded_rescue=False, name=resolved_policy['name'])
+        self.policy['sam_bridge_policy'] = bridge_policy
         self._ready = threading.Event()
         self._cancel = threading.Event()
         self._lock = threading.RLock()
@@ -674,6 +689,7 @@ class SamInterpolationContext:
                 physical_view=physical_view_name(view), angle_deg=float(view.tta_angle_deg),
                 augmentation_pass=int(getattr(view, 'augmentation_pass', 0)),
                 canvas_transform=transform, sam_crop_mode=self.crop_mode,
+                sam_tight_crop_guard=self.tight_crop_guard,
                 sam_crop_tile_side=1008, sam_crop_halo=128,
                 sam_crop_canvas_contract='current_interpolation_working_canvas',
                 delayed_native_expansion_at_launch=self.delayed_native_expansion_at_launch,
@@ -750,6 +766,7 @@ class SamInterpolationContext:
                 merged = observation_volume
             stats = dict(stats)
             stats.setdefault('sam_crop_mode', self.crop_mode)
+            stats.setdefault('sam_tight_crop_guard', self.tight_crop_guard)
             stats.setdefault('sam_oversized_group_count', len(oversized_groups))
             stats.setdefault('sam_multi_tile_group_count', multi_tile_groups)
             stats.setdefault('sam_working_canvas_kind', scope_metadata['sam_working_canvas_kind'])

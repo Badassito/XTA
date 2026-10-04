@@ -5,10 +5,9 @@ Choose one backend for a run. `sam` uses the local mask-conditioned LTA tracker
 to propose image-guided additions between detector observations. A rejected SAM
 proposal receives no SDF fallback. `both` is rejected during argument parsing.
 
-The tagged v25.0.0 release is immutable. The post-tag notes below describe the
-uncommitted development tree, whose package/launcher version still reads
-25.0.0. Its source review and snapshot qualification are separate from the
-released receipt; see [the development audit workflow](../release/README.md).
+The tagged releases remain immutable. These notes describe the v25.0.2
+development candidate. Its source review and snapshot qualification are
+separate from a tagged release; see [the development audit workflow](../release/README.md).
 
 The current development SAM path supports all existing TTA view families:
 Transverse, Sagittal and Coronal, their tilted variants, Azimuthal views,
@@ -79,10 +78,10 @@ The assembled parent run contains fixed owned-core support. Its aggregate
 tracker probability is undefined; retain and inspect the individual child
 scores instead of inventing one probability or detector confidence.
 
-The current development defaults are whole-policy v4 and tiled-policy v5,
-which run the ordinary conservative checks first and then the guarded selection
-stage described below. Explicit whole v2 and tiled v3 retain strict legacy
-behavior. Endpoint, family, and topology decisions use filtered owned-core
+The v25.0.2 defaults are whole-policy v6 and tiled-policy v7, which qualify and
+publish connected branches independently. Explicit whole v2 and tiled v3 retain
+strict legacy behavior; whole v4 and tiled v5 add the historical guarded-rescue
+stage described below. Endpoint, family, and topology decisions use filtered owned-core
 support. A separately filtered full union of that original seed's tile halos
 remains quality evidence, never output support; discarded halos cannot hide
 spill from either stage. Whole-policy versions cannot select tiled evidence.
@@ -433,6 +432,21 @@ connectivity as `not_assessed` while
 still measuring retained/removed bridge voxels; voxel survival alone does not
 establish a connected final repair.
 
+The v25.0.2 publication path projects each selected directional mask into
+orthogonal/source coordinates before constructing its public layer reference.
+Earlier SAM references carried `native_transform` as metadata without applying
+that transform. This misplaced decomposed non-Transverse SAM layers and affected
+consumers of those references, including custom source reconciliation. The
+default plain union used its separately projected assembled volume. Native
+proposal masks remain available for exact replay and tile admission.
+
+Additive support is defined in the detector's working canvas. It need not remain
+disjoint from detector support after source restoration: several processing
+frames can contribute to one source frame, and smaller spatial output cells can
+combine neighboring support. Low-quality NRRDs make that collapse more visible.
+Inspect full-resolution additions and native selection receipts before treating
+a low-quality layer's overlap as evidence that SAM painted detector pixels.
+
 ## Proposal quality policy
 
 Existing external reconciliation policies remain usable. They inherit the
@@ -470,12 +484,135 @@ change the threshold comparison, or alter the filtered mask.
 Filtering precedes acceptance-region and write-region clipping. A removed dot
 outside either region remains visible in the raw diagnostics but cannot reject
 the run or appear in selected output. A larger component that survives the
-radius filter still violates containment if it touches or crosses the declared
-acceptance boundary; clipping it to the write region cannot hide that violation.
+radius filter still records a containment violation if it touches or crosses the
+declared acceptance boundary. When strict containment is enabled, clipping it
+to a write region cannot hide that violation.
 Original detector observations and stored raw tracker masks remain immutable.
 
-The policy evaluates containment, held-out endpoint agreement, family agreement,
-local topology and unintended contact using the filtered support. It requires
+### Tight-crop guard switch
+
+In v25.0.2, `YOLO_TTA_SAM_TIGHT_CROP_GUARD=0` disables an inherited conservative
+policy's acceptance-containment veto; `1` enables it. An unset value inherits the
+policy: off for the new v6/v7 defaults, on for explicit legacy v2-v5. Accepted values
+are `1`/`0`, `true`/`false`, and `on`/`off`, with case and surrounding whitespace
+ignored. Active SAM validates and pins the setting at launch; SDF and disabled
+interpolation ignore it.
+
+```powershell
+$env:YOLO_TTA_SAM_TIGHT_CROP_GUARD = '0'
+```
+
+This guard checks the fixed acceptance corridor inferred from the observations.
+A prediction that grows beyond that corridor and later shrinks can fail the
+entire run. Turning the guard off disables that quality veto for both whole
+predictions and retained tiled halos. It also disables guarded rescue, whose
+purpose is to reconsider containment failures. Endpoint agreement, topology,
+unintended-contact checks, component filtering, and evidence completeness still
+apply.
+
+The switch does not enlarge the tracker context or choose a write-domain policy.
+Legacy policies remain clipped to their old branch write masks. The v6/v7
+defaults use the broader fixed context with the connected-path restrictions
+below. Both exclude original detector observations. Disabling containment on
+a legacy policy alone cannot recover growth beyond its old write masks.
+An explicitly configured `sam_bridge_policy.strict_containment` takes
+precedence. The effective policy and its hash record the choice; replaying a
+complete saved policy does not consult the ambient switch.
+
+### Connected branch selection (whole v6 / tiled v7)
+
+Quality versions 6 and 7 certify each requested edge independently. A failed
+daughter or a bad contact does not erase another qualified connection in the
+same family. Selected receipts retain explicit successful and failed edge IDs,
+original run owners, and an authenticated packed mask for each owner's selected
+support. Every online, replay, export, and survival reader uses that same mask.
+Radius filtering still precedes the connectivity analysis; no SDF pixels are
+inserted into SAM output.
+
+The v25.0.2 defaults select `branch_write_domain="fixed_context"`,
+`min_endpoint_recall=0`, `branch_crop_boundary_policy="retain_censored"`, and
+disable strict containment and guarded rescue. Local connectivity, original-seed
+identity, component-radius filtering, endpoint excess, unrelated-contact checks,
+and attributable frame/pixel coverage remain enforced. Explicit v2-v5 policies
+retain their recorded semantics. Existing proposal callbacks that return run IDs
+inherit legacy selection semantics rather than silently acquiring branch behavior.
+
+The branch path must connect its original observed endpoints through actual
+seed-connected tracker support. Independent directional prefixes may meet in
+the open gap. They cannot claim agreement merely by touching different parts
+of a broad endpoint reference. Walk-back sessions retain their actual original
+seed lineage. Only contributing owners appear in selected output.
+
+`branch_write_domain="fixed_context"` permits growth beyond the old interpolated
+silhouette corridor, within the tracker context fixed before inference. It
+subtracts every original detector pixel, keeps only connected selected paths,
+and rejects unrelated observed contacts. An observed same-family section
+outside the old corridor can attach a path only where actual seed-connected SAM
+support also saw it. Remote detector-only routes cannot certify a bridge.
+
+With `min_endpoint_recall=0`, original detector endpoints serve as trusted
+anchors: a small daughter need not reproduce half of a much larger merged
+parent to establish a real connection. Unknown tracker frames remain invalid,
+and a missing interior gap plane cannot be supplied by the endpoint reference.
+For tiled tracking, selected pixels must have attributable owned-core coverage;
+unknown regions and discarded halos never become published support.
+
+`branch_crop_boundary_policy="retain_censored"` retains a certified connection
+that touches an internal context border, with `extent_censored` and border
+counts in the edge receipt. This certifies the observed gap connection, not
+complete object extent outside the crop. `"reject"` retains the stricter
+requirement for a larger crop. Neither setting predicts pixels outside the
+fixed context.
+
+The final-survival audit also uses the tracked-observation attachment proof.
+An attachment removed by final reconciliation or cleanup cannot be silently
+restored to certify survival. Nonidentity source transforms retain their
+separate `not_assessed` connectivity limitation.
+
+Branch admission reserves a conservative numeric workspace of 32 bytes per
+group voxel plus 2 MiB; legacy topology keeps its existing estimate. A bounded
+compressed owner spool uses only remaining current workspace credit and falls
+back to recomputation when full. Label membership uses a bounded lookup instead
+of NumPy's larger temporary vectors. Reader caches and packed receipt metadata
+retain their separate explicit caps. A saved receipt's budget never authorizes
+a new replay allocation, and publishing saved support decodes one bounded plane
+at a time.
+
+### Largest-island and one-direction continuation experiments
+
+`tools/study_sam_largest_island.py` compares retained raw masks, the existing
+component-radius filter, largest 8-connected island per frame, and both filters.
+It filters each original seed run independently after assembling tile owners,
+then unions independent runs. It preserves the raw evidence and reports both
+all-endpoint recall and the experimental any-endpoint alternative. It does not
+change production filtering or feed filtered masks back into tracker memory.
+
+Largest area is not a lineage rule. Connected daughters remain one island, and
+the largest disconnected island can change between frames. In particular, a
+parent run following only one daughter fails the legacy all-held-out endpoint
+test when another requested daughter is missed. The v6/v7 connected-edge policy
+addresses that acceptance problem without replacing radius filtering with
+largest-area selection.
+
+`tools/evaluate_sam_extrapolation.py` provides `replay-holdout` and `generate`
+subcommands. Replay measures single-seed directional prefixes while declaring
+that the original crops were planned with future endpoints. Fresh generation
+uses the original seed's bounding rectangle plus fixed padding and a bounded
+outward horizon, without an opposite endpoint. Both modes compare raw,
+score-filtered, largest-island, and cautious contiguous prefixes. An unavailable,
+empty, or rejected frame stops a prefix; later recovery cannot restart it.
+Growth and shrinkage are measured without a monotonic-area requirement.
+
+These tools emit research evidence, not production-accepted bridge layers.
+Fresh terminal-free tails require their own annotated quality validation;
+tracker confidence and agreement with the detector are not ground truth.
+The integrated planner still requires observed endpoint pairs. The extrapolation
+prototype does not enable an additional production backend.
+
+### Legacy quality versions 2 through 5
+
+These policies evaluate containment, held-out endpoint agreement, family agreement,
+local topology and unintended contact using the filtered support. They require
 held-out endpoint recall of at least 0.5, permits endpoint excess of at most 0.5
 in its evaluation region, and requires the requested local connections without
 unintended observed contacts. Filtering alone never supplies a whole-run rejection
@@ -516,8 +653,11 @@ relaxes stock quality checks and disables component-radius filtering while
 retaining structural validity. Label such
 results as permissive candidates; they do not become stock-selected repairs.
 The unchanged parent bridge tile gate still applies to their resulting support.
+This legacy preset retains the narrow write domain, so it is not a pixel
+superset of the new fixed-context v6/v7 output. Research comparisons distinguish
+unqualified full raw support from these clipped candidate masks.
 
-Quality policy versions 2 through 5 record the exact component filter in each selection
+Quality policy versions 2 through 7 record the exact component filter in each selection
 receipt. Online output, directional replay, previews and connection-survival
 checks reconstruct the same filtered contributors. Older selection receipts
 without a `mask_filter` retain their original unfiltered interpretation;
@@ -533,15 +673,13 @@ bundle or add a second command-line radius control. Setting
 `enforce_interpolation_min_radius=False` disables filtering, as used by the
 raw-candidate ablation.
 
-### Guarded rescue in the current development tree
+### Historical guarded rescue (explicit whole v4 / tiled v5)
 
-Active SAM now resolves stock whole mode to
-`sam_conservative_guarded_rescue_v4` and stock tiled mode to
-`sam_conservative_tiled_guarded_rescue_v5`. Deploy the audited guarded-rescue
-development tree/archive on the cluster; the existing SAM command and crop-mode
-setting then activate the matching default. There is no new public
-`--interpolation_*` flag. Package version `25.0.0` alone does not identify this
-post-tag patch; verify the source audit and resolved policy identity.
+These explicitly requested versions resolve to
+`sam_conservative_guarded_rescue_v4` and
+`sam_conservative_tiled_guarded_rescue_v5`. They were defaults before v24.0.2.
+Use `sam_bridge_policy={"version": 4}` (or `5` for tiled evidence) to compare
+their historical behavior. They are separate from the new connected-branch policy.
 
 This is a second **selection** stage over existing complete raw evidence, not
 another interpolation pass or a new model run. Ordinary stock selections are
@@ -603,7 +741,7 @@ refused before generation has no complete raw evidence to rescue. The patch
 therefore does not promise to recover memory-refused groups or qualify a full
 cluster workload.
 
-For a strict comparator using the current policy identity, an external source
+For a strict comparator using the historical policy identity, an external source
 policy can disable only the additional stage:
 
 ```python
@@ -611,7 +749,7 @@ def build_reconciliation():
     return {
         "name": "stock_without_guarded_rescue",
         "mode": "union",
-        "sam_bridge_policy": {"guarded_rescue": False},
+        "sam_bridge_policy": {"version": 4, "guarded_rescue": False},
     }
 ```
 
@@ -639,7 +777,8 @@ checks; a failure reports `rescue_independent_direction_local_connection`.
 
 Previously saved selection receipts keep their recorded versions and selected
 contributors. Applying current stock selection to their immutable raw bundle
-creates a new v4/v5 receipt; it does not rewrite the historical decision. A
+creates a new v6/v7 receipt when the saved edge contracts support it; it does
+not rewrite the historical decision. A
 changed parent selection can change ordinary tile admission, so dependent
 consolidated evidence still needs its upstream fingerprint checked or regenerated.
 
@@ -653,7 +792,7 @@ observations require generation again.
 Replay resolves crop mode from saved evidence, rather than the current
 environment. Legacy bundles without tiled evidence keep whole generation
 geometry. Historical v2/v3 selection receipts keep their recorded decisions;
-an explicit new selection uses its resolved v4/v5 or requested legacy policy
+an explicit new selection uses its resolved v6/v7 or requested legacy policy
 identity. Changing crop mode requires generation.
 
 Changing parent bridge selection can change tile admission and therefore the
@@ -915,6 +1054,5 @@ remeasures retained complete raw support under a changed declared acceptance
 region; it is not a fresh pipeline-equivalent replay. Preserve the tagged
 baseline, original recipe seals, source/frame/seed identities, and raw reuse
 attribution. Those research geometry variants do not alter central component
-filtering or the ordinary tile gate. The separately audited guarded-rescue patch
-changes current stock selection defaults as described above. Final experiment
-scoring, source pins, and full snapshot qualification wait for a frozen tree.
+filtering or the ordinary tile gate. Their historical guarded-rescue successor
+is described above; v25.0.2 uses the separately evaluated connected-branch policy.

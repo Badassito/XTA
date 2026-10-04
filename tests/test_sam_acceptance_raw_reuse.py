@@ -127,14 +127,15 @@ def test_only_declared_acceptance_and_measurement_assignment_change(tmp_path, ti
     assert json.loads((tmp_path/"A2"/"selection.json").read_text())["selected_run_ids"] == selection["selected_run_ids"]
     # Independent fixed replay must use saved mode/contracts, and the output is
     # still an explicitly changed-A diagnostic rather than new model inference.
-    again = select_sam_proposals(derived, policy={"sam_bridge_policy":{"max_group_bytes":512*1024**2}}, frozen_evidence=True)
+    again = select_sam_proposals(derived, policy={"sam_bridge_policy":selection["resolved_policy"]}, frozen_evidence=True)
     assert again["selected_run_ids"] == selection["selected_run_ids"]
     assert again["run_receipts"] == selection["run_receipts"]
 
 
 def test_changed_A_is_actually_evaluated_without_widening_candidates(tmp_path):
     source, _, a2, proof = _source(tmp_path, leak=True)
-    stock = select_sam_proposals(source, policy={"sam_bridge_policy":{"max_group_bytes":512*1024**2}})
+    stock = select_sam_proposals(source, policy={"sam_bridge_policy":{
+        "version":4,"strict_containment":True,"max_group_bytes":512*1024**2}})
     derived, selection, _ = derive_a2_bundle(source, a2, proof, tmp_path/"A2")
     assert not stock["selected_run_ids"]
     assert selection["selected_run_ids"]

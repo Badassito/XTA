@@ -16,6 +16,15 @@ import numpy as np
 from XTA import assembly, interpolation, media, pipeline, runtime
 
 
+def _policy_memfd_transfer_members(owners: list[object]) -> list[dict[str, str]]:
+    """Use stable owner paths for both portable and real Linux transfer tests."""
+    return [{
+        'source_volume_path': str(runtime._memfd_backing_path_from_array(owners[0])),
+        'result_mask_path': str(runtime._memfd_backing_path_from_array(owners[1 + 2 * index])),
+        'result_conf_path': str(runtime._memfd_backing_path_from_array(owners[2 + 2 * index])),
+    } for index in range(3)]
+
+
 class _DetachHandle:
     def __init__(self, fd: int) -> None:
         self.fd = int(fd)
@@ -85,6 +94,20 @@ class ProcessRuntimeRegressionTests(unittest.TestCase):
         for path in work_dir.glob('*fallback-stage*'):
             runtime.wait_for_retired_memmap_unlinks(path=path, timeout_s=5.0)
         self.assertEqual(list(work_dir.glob('*fallback-stage*')), [])
+
+    def test_policy_memfd_transfer_fixture_uses_reopenable_owner_paths_across_platforms(self) -> None:
+        paths = [Path(f'/proc/12345/fd/{100 + index}') for index in range(7)]
+        roots = [types.SimpleNamespace(_workspace_memfd_path=str(path),
+            filename=f'/memfd:policy-owner-{index} (deleted)') for index, path in enumerate(paths)]
+        owners = [types.SimpleNamespace(base=owner) for owner in roots]
+        members = _policy_memfd_transfer_members(owners)
+        self.assertEqual(len(members), 3)
+        for index, member in enumerate(members):
+            self.assertEqual(member['source_volume_path'], str(paths[0]))
+            self.assertEqual(member['result_mask_path'], str(paths[1 + 2 * index]))
+            self.assertEqual(member['result_conf_path'], str(paths[2 + 2 * index]))
+            self.assertFalse(any('memfd:' in path for path in member.values()))
+        self.assertIsNone(runtime._memfd_backing_path_from_array(np.zeros((2, 3), np.uint8)))
 
     def test_fork_start_method_is_rejected(self) -> None:
         with mock.patch.dict(
@@ -256,13 +279,7 @@ class ProcessRuntimeRegressionTests(unittest.TestCase):
                 for index in range(7):
                     owners.append(runtime._allocate_memfd_workspace_array(
                         shape, np.uint8, f'policy-transfer-{index}', initialize_zero=True))
-            members = []
-            for index in range(3):
-                members.append({
-                    'source_volume_path': str(runtime._memmap_backing_path(owners[0])),
-                    'result_mask_path': str(runtime._memmap_backing_path(owners[1 + 2 * index])),
-                    'result_conf_path': str(runtime._memmap_backing_path(owners[2 + 2 * index])),
-                })
+            members = _policy_memfd_transfer_members(owners)
             members[0]['augmentation_pass_tasks'] = members[1:]
             dispatch = dict(members[0])
             runtime._attach_memfd_transfers_to_task(dispatch)

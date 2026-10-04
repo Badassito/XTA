@@ -1,5 +1,34 @@
 # Release inventory
 
+## v25.0.2 SAM bridge development candidate
+
+The package and versioned launcher identify this uncommitted candidate as
+`25.0.2`. Its separate `v25_0_2_sam_bridges_development_review` begins at the
+exact tagged `v25.0.1` source (`d34b9ef7270f395efd87bc54e7b7803a467a9eda`),
+including every prior development appendix. It preserves all historical
+receipts and reviews changed source statements and inherited/new research tools.
+The candidate has `kind=development`, `released=false`, and
+`source_review_only=true`; this record makes no test or model qualification claim.
+
+```text
+python -B tools/prepare_reconciliation_release.py --development sam-bridges-v25.0.2 --output-dir ../Scratch/Experiments/SAM_v25_0_2_20261003/release/inventory
+```
+
+After source and validation tools are frozen, append the reviewed draft using
+the same command with `--write`. Default preparation rejects overwriting an
+existing appendix. Tagged receipts and all inherited history stay immutable.
+If validation reveals a defect in this still-uncommitted source-only candidate,
+preserve the withdrawn candidate and its pins in Scratch, verify that removing
+only its key restores the exact tagged `v25.0.1` inventory, and restore only those
+new candidate fields before regenerating the corrected audit. This recovery
+must also verify unchanged `v25.0.1` HEAD and absence of a `v25.0.2` tag.
+Execute and retain actual validation
+with `tools/qualify_release.py --snapshot`, or `--snapshot --cpu-only` when only
+the reduced CPU gate was run. These receipts state their coverage and exact source
+identity. Complete source bundles of an uncommitted checkout use
+`tools/build_source_release.py --snapshot`. Git commits and tags require a
+separate request.
+
 `_package_inventory.json` is a development audit record. It is included in the
 source distribution and complete source bundle, but is not needed by the
 installed `XTA` package or wheel.

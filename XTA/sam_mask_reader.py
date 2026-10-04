@@ -44,11 +44,12 @@ def _assert_source_unchanged():
 class _FilterSnapshot(Mapping):
     """Validated deep immutable spec, confined to a reader transaction."""
 
-    __slots__ = ("spec", "owner")
+    __slots__ = ("spec", "owner", "branch_selection")
 
     def __init__(self, value, owner):
         spec = _filtering._spec(value)
         object.__setattr__(self, "spec", None if spec is None else _freeze(_plain(spec)))
+        object.__setattr__(self, "branch_selection", None)
         object.__setattr__(self, "owner", owner)
 
     def __setattr__(self, name, value):
@@ -200,6 +201,7 @@ class SamMaskReader:
         snapshot = object.__new__(_FilterSnapshot)
         object.__setattr__(snapshot, "owner", self._identity)
         object.__setattr__(snapshot, "spec", value.spec)
+        object.__setattr__(snapshot, "branch_selection", value.branch_selection)
         return snapshot
 
     def __exit__(self, *exc):
@@ -292,9 +294,36 @@ class SamMaskReader:
     def filter_snapshot(self, value):
         with self._lock:
             self._require_active()
+            if isinstance(value, Mapping) and isinstance(value.get('mask_filter'), _FilterSnapshot) and 'branch_selection' not in value:
+                snapshot = value['mask_filter']
+                if snapshot.owner is not self._identity:
+                    raise ValueError('SAM filter snapshots belong to one reader transaction')
+                if value.get('resolved_policy', {}).get('version') in (6, 7) and snapshot.branch_selection is None:
+                    raise ValueError('SAM branch-aware support requires its retained branch selection recipe')
+                if snapshot.branch_selection is not None and set(value.get('selected_run_ids', ())) - set(snapshot.branch_selection['selected_edge_ids_by_run']):
+                    raise ValueError('SAM branch selection differs from its selected contributors')
+                return snapshot
             _validate_tiled_filter(value,self.scope.get("sam_crop_mode")=="tiled")
             self._stats["filter_spec_validations"] += 1
-            return _FilterSnapshot(value, self._identity)
+            snapshot = _FilterSnapshot(value, self._identity)
+            from .sam_branch_selection import validate_branch_selection
+            branch = validate_branch_selection(value, self, mask_filter_sha256=None if snapshot.spec is None else snapshot.spec['sha256'])
+            object.__setattr__(snapshot, 'branch_selection', branch)
+            return snapshot
+
+    def _branch_selection(self, value, spec):
+        if isinstance(value, Mapping) and isinstance(value.get('mask_filter'), _FilterSnapshot):
+            snapshot = value['mask_filter']
+            if snapshot.owner is not self._identity:
+                raise ValueError('SAM filter snapshots belong to one reader transaction')
+            if 'branch_selection' not in value:
+                return snapshot.branch_selection
+        elif isinstance(value, _FilterSnapshot):
+            if value.owner is not self._identity:
+                raise ValueError('SAM filter snapshots belong to one reader transaction')
+            return value.branch_selection
+        from .sam_branch_selection import validate_branch_selection
+        return validate_branch_selection(value, self, mask_filter_sha256=None if spec is None else spec['sha256'])
 
     def _filter_spec(self, value):
         self._require_active()
@@ -328,12 +357,24 @@ class SamMaskReader:
 
     def effective_candidate_mask(self, run_id, frame, value=None):
         spec = self._filter_spec(value)
+        branch = self._branch_selection(value, spec)
         identity = "legacy_unfiltered" if spec is None else str(spec["sha256"])
-        key = ("effective_candidate", self.evidence_fingerprint, identity, str(run_id), int(frame))
+        from .sam_branch_selection import candidate_branch_identity
+        branch_identity = None if branch is None else candidate_branch_identity(branch, run_id, frame)
+        key = ("effective_candidate", self.evidence_fingerprint, identity, branch_identity, str(run_id), int(frame))
         def calculate():
             self._stats["effective_candidate_computations"] += 1
             raw = self._effective_product(run_id, frame, spec)[0]
-            candidate = self.candidate_mask(run_id, frame) & raw
+            candidate = (raw if branch is not None and branch.get('write_domain') == 'fixed_context'
+                         else self.candidate_mask(run_id, frame) & raw)
+            if branch is not None:
+                from .sam_branch_selection import apply_edge_selection_to_candidate, decode_owner_support_plane, packet_identity
+                def path_reader(edge_id, owner, stored_frame):
+                    packed = branch['edges'][edge_id]['owner_support'][owner][str(stored_frame)]
+                    return self._product(('branch_plane', self.evidence_fingerprint, edge_id, owner, stored_frame, packet_identity(packed)),
+                        lambda: decode_owner_support_plane(packed, max_plane_bytes=self.bundle.max_mask_bytes))
+                candidate = apply_edge_selection_to_candidate(self, run_id, frame, candidate, value,
+                    recipe=branch, path_reader=path_reader)
             return np.frombuffer(candidate.tobytes(), dtype=np.bool_).reshape(candidate.shape)
         return self._product(key, calculate)
 
@@ -356,4 +397,10 @@ def effective_candidate_mask(bundle, run_id, frame, receipt_or_filter=None):
     if isinstance(bundle, SamMaskReader):
         return bundle.effective_candidate_mask(run_id, frame, receipt_or_filter)
     _validate_tiled_filter(receipt_or_filter,bundle.runs[str(run_id)].get("generation_mode")=="tiled")
-    return _filtering.effective_candidate_mask(bundle, run_id, frame, receipt_or_filter)
+    from .sam_branch_selection import validate_branch_selection, apply_edge_selection_to_candidate
+    spec = _filtering._spec(receipt_or_filter)
+    branch = validate_branch_selection(receipt_or_filter, bundle, mask_filter_sha256=None if spec is None else spec['sha256'])
+    candidate = (_filtering.effective_raw_mask(bundle, run_id, frame, receipt_or_filter)
+        if branch is not None and branch.get('write_domain') == 'fixed_context' else
+        bundle.candidate_mask(run_id, frame) & _filtering.effective_raw_mask(bundle, run_id, frame, receipt_or_filter))
+    return apply_edge_selection_to_candidate(bundle, run_id, frame, candidate, receipt_or_filter, recipe=branch) if branch is not None else candidate

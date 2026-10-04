@@ -4,7 +4,16 @@ import pytest
 from scipy import ndimage as ndi
 
 from XTA.sam_evidence import SamEvidenceWriter, iter_selected_planes
-from XTA.sam_policy import select_sam_proposals, resolve_sam_bridge_policy, _rescue_spill_plane
+from XTA.sam_policy import select_sam_proposals as _select_sam_proposals, resolve_sam_bridge_policy, _rescue_spill_plane
+
+
+def select_sam_proposals(bundle, policy=None, **kwargs):
+    """Retain the explicit v4 rescue contract exercised by these fixtures."""
+    source = dict(policy or {})
+    declared = source.get('sam_bridge_policy')
+    if declared is None or isinstance(declared, dict):
+        source['sam_bridge_policy'] = {'version': 4, **(declared or {})}
+    return _select_sam_proposals(bundle, source, **kwargs)
 
 
 def _family(identity="family", *, flaw="shallow", censor=False):
@@ -57,7 +66,7 @@ def _bundle(tmp_path,*,flaw="shallow",censor=False,only_forward=False,bad_endpoi
         return writer.commit(),group,masks,raw
 
 
-def test_default_rescue_selects_complete_shallow_pair_and_preserves_stock_evidence(tmp_path):
+def test_legacy_v4_rescue_selects_complete_shallow_pair_and_preserves_stock_evidence(tmp_path):
     bundle,group,masks,raw=_bundle(tmp_path)
     off=select_sam_proposals(bundle,{"sam_bridge_policy":{"guarded_rescue":False}})
     legacy=select_sam_proposals(bundle,{"sam_bridge_policy":{"version":2}})

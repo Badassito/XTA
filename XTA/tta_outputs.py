@@ -176,6 +176,7 @@ def measure_sam_final_connections(
         reader_cache_bytes = min(32 * 1024**2, max(0, budget // 8))
         with bundle.reader(max_cache_bytes=reader_cache_bytes) as reader:
             selection_view = {**(selection or {}), 'mask_filter': reader.filter_snapshot(selection)}
+            selection_view.pop('branch_selection', None)
             group_runs = {}
             for run_id in sorted(scope['runs']):
                 run = bundle.runs[run_id]
@@ -207,22 +208,42 @@ def measure_sam_final_connections(
                 endpoints = {str(value['observation_id']): value for value in group['endpoints']}
                 edges = []
                 for edge in group.get('edges', ()):
+                    branch = (selection or {}).get('branch_selection')
+                    if branch is not None and edge['edge_id'] not in branch['edges']:
+                        continue
                     source, target = endpoints[str(edge['source_id'])], endpoints[str(edge['target_id'])]
                     source_frame, target_frame = int(source['frame_index']), int(target['frame_index'])
                     lo, hi = sorted((source_frame, target_frame))
                     z0, z1 = frame_indices[lo], frame_indices[hi] + 1
                     local = surviving[z0:z1].copy()
+                    if branch is not None:
+                        from .sam_branch_selection import decode_owner_support_plane
+                        edge_record = branch['edges'][edge['edge_id']]
+                        for frame in range(lo, hi+1):
+                            allowed = np.zeros(shape[1:], bool)
+                            for owner in edge_record['eligible_run_ids']:
+                                if owner not in selected:
+                                    continue
+                                packed = edge_record['owner_support'][owner].get(str(frame))
+                                if packed is not None:
+                                    allowed |= decode_owner_support_plane(packed, max_plane_bytes=max(1, budget//4))
+                            local[frame-lo] &= allowed
                     edge_additions = local.copy()
                     for frame in range(lo, hi + 1):
                         contract_key = f"edge_contract:{edge['edge_id']}:{frame}"
                         known_key = f'known_foreground:{frame}'
                         if contract_key in group['mask_keys']:
                             contract = reader.group_mask(group_id, contract_key)
-                            local[frame - lo] &= contract
-                            edge_additions[frame - lo] &= contract
+                            if branch is None or branch.get('write_domain') != 'fixed_context':
+                                local[frame - lo] &= contract
+                                edge_additions[frame - lo] &= contract
                             if known_key in group['mask_keys']:
-                                local[frame - lo] |= (reader.group_mask(group_id, known_key) & contract
-                                    & final[frame, y0:y1, x0:x1].astype(bool))
+                                if branch is None:
+                                    attachment = reader.group_mask(group_id, known_key) & contract
+                                else:
+                                    from .sam_branch_selection import branch_attachment_mask
+                                    attachment = branch_attachment_mask(reader, group_id, edge['edge_id'], frame, selection_view)
+                                local[frame - lo] |= attachment & final[frame, y0:y1, x0:x1].astype(bool)
                     attachments = []
                     for endpoint, frame in ((source, source_frame), (target, target_frame)):
                         original = reader.group_mask(group_id, f"endpoint:{endpoint['observation_id']}")
@@ -245,7 +266,8 @@ def measure_sam_final_connections(
                     status='survived' if connected else 'connection_lost', edges=edges,
                     all_requested_edges_connected=connected, connectivity=connectivity,
                     selected_run_ids=selected, interpolation_policy_identity=policy_identity,
-                    selected_mask_semantics=('receipt_controlled_component_filter' if selection and selection.get('mask_filter')
+                    selected_mask_semantics=('receipt_controlled_connected_branch_owners' if branch is not None else
+                                             'receipt_controlled_component_filter' if selection and selection.get('mask_filter')
                                              else 'legacy_unfiltered_candidates'),
                     evidence_fingerprint=bundle.evidence_fingerprint,
                     attachment_contract='surviving_selected_additions_and_fixed_local_original_observation_masks')

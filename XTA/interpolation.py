@@ -4573,7 +4573,7 @@ def materialize_raw_bbox_mask_store_workspace(
         )
         return workspace
     except BaseException:
-        close_memmap_array_without_flush(workspace)
+        close_memmap_array_without_flush(workspace, unlink_path=Path(out_path))
         raise
     finally:
         store.close()

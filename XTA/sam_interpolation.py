@@ -277,19 +277,25 @@ def prepare_sam_interpolation_pass(
             except (TypeError, ValueError) as error:
                 raise SamInterpolationInfrastructureError(
                     f"SAM planned run {run.run_id} is outside the bounded tracker session contract: {error}") from error
-        from .sam_policy import resolve_sam_bridge_policy
+        from .sam_policy import resolve_sam_bridge_policy, _selection_resources
         source_policy = policy or {}
         if "kind" in source_policy and "mode" not in source_policy:
             source_policy = {"sam_bridge_policy": source_policy}
-        topology_limit = int(resolve_sam_bridge_policy(source_policy, generation_mode=mode)["max_group_bytes"])
-        if resource_details is not None and resource_profile.has_extra_credit:
-            topology_limit = int(resource_details["assigned_topology_bytes"])
+        topology_policy = resolve_sam_bridge_policy(source_policy, generation_mode=mode)
+        topology_operative, _ = _selection_resources(source_policy, topology_policy, resource_profile)
+        topology_limit = int(topology_operative['max_group_bytes'])
         tracked_group_ids = {str(run.group_id) for run in runs}
         for group in plan.groups:
             if str(group.group_id) not in tracked_group_ids:
                 continue
             y0, x0, y1, x1 = group.context_bbox_yx
-            if len(group.frame_indices) * (y1 - y0) * (x1 - x0) * 16 > topology_limit:
+            topology_shape = (len(group.frame_indices), y1-y0, x1-x0)
+            if topology_policy.get('branch_aware_selection', False):
+                from .sam_branch_selection import branch_workspace_bytes
+                topology_bytes = branch_workspace_bytes(topology_shape)
+            else:
+                topology_bytes = len(group.frame_indices)*(y1-y0)*(x1-x0)*16
+            if topology_bytes > topology_limit:
                 raise SamInterpolationInfrastructureError(
                     f"SAM group {group.group_id} topology exceeds its declared memory budget before tracker admission")
         from .sam_resources import cpu_session_bytes
@@ -737,6 +743,7 @@ def _publish_directions(bundle: object, receipt: Mapping[str, object], observati
     try:
         with bundle.reader(max_cache_bytes=32 * 1024**2) as reader:
             selection_view = {**receipt, "mask_filter": reader.filter_snapshot(receipt)}
+            selection_view.pop('branch_selection', None)
             merged, components, added = _publish_directions_with_reader(reader, receipt,
                 observations, destination, metadata, pass_index, merged_work_dir,
                 cancel_event, selection_view)
@@ -777,12 +784,18 @@ def _publish_directions_with_reader(bundle: object, receipt: Mapping[str, object
                     from .sam_cyclic import validate_cyclic_frame_addressing
                     addresses = validate_cyclic_frame_addressing(group["frame_addressing"],
                         expected_frames=group["frame_indices"])
-                for frame, key in runs[identifier]["candidate_mask_keys"].items():
-                    if int(bundle.records[key]["foreground"]) > 0:
-                        native_frame = int(addresses[int(frame)]["native_index"]) if addresses is not None else int(frame)
-                        if not 0 <= native_frame < shape[0]:
-                            raise SamInterpolationInfrastructureError("Selected SAM frame is outside its native publication canvas")
-                        active_frames_set.add(native_frame)
+                branch = receipt.get('branch_selection')
+                if branch is not None:
+                    active_owner_frames = {int(frame) for edge_id in branch['selected_edge_ids_by_run'].get(identifier, ())
+                        for frame in branch['edges'][edge_id]['owner_support'][identifier]}
+                else:
+                    active_owner_frames = {int(frame) for frame, key in runs[identifier]['candidate_mask_keys'].items()
+                                           if int(bundle.records[key]['foreground']) > 0}
+                for frame in sorted(active_owner_frames):
+                    native_frame = int(addresses[int(frame)]["native_index"]) if addresses is not None else int(frame)
+                    if not 0 <= native_frame < shape[0]:
+                        raise SamInterpolationInfrastructureError("Selected SAM frame is outside its native publication canvas")
+                    active_frames_set.add(native_frame)
             active_frames = sorted(active_frames_set)
             path = destination / f"sam_bridge_pass{pass_index:02d}_{direction}.cvol"
             writer = IncrementalRawBBoxMaskStoreWriter(
@@ -849,19 +862,32 @@ def _publish_directions_with_reader(bundle: object, receipt: Mapping[str, object
             for run_id in directional_run_ids:
                 endpoints = {str(endpoint["observation_id"]): endpoint for endpoint in
                              groups[str(runs[run_id]["group_id"])].get("endpoints", ())}
-                for key in ("seed_ids", "held_out_ids"):
-                    for identifier in runs[run_id].get(key, ()):
+                roots = list(runs[run_id].get('seed_ids', ()))
+                branch = receipt.get('branch_selection')
+                if branch is None:
+                    roots.extend(runs[run_id].get('held_out_ids', ()))
+                else:
+                    for edge_id in branch['selected_edge_ids_by_run'].get(run_id, ()):
+                        roots.extend(branch['edges'][edge_id][key] for key in ('source_id', 'target_id'))
+                for identifier in roots:
                         observation_roots.add(str(endpoints.get(str(identifier), {}).get("original_observation_id", identifier)))
             observation_roots = sorted(observation_roots)
             group_receipts = receipt.get("group_receipts", {})
-            all_connected = bool(directional_group_ids) and all(
-                group_receipts.get(group_id, {}).get("topology", {}).get("all_requested_edges_connected", False)
-                for group_id in directional_group_ids)
+            def connected_group(group_id):
+                group_receipt = group_receipts.get(group_id, {})
+                topology = group_receipt.get('topology', {})
+                if receipt.get('branch_selection') is None:
+                    return bool(topology.get('all_requested_edges_connected', False))
+                requested = set(group_receipt.get('selected_edge_ids', ()))
+                connected = {edge['edge_id'] for edge in topology.get('edges', ()) if edge.get('connected')}
+                return bool(requested) and requested.issubset(connected)
+            all_connected = bool(directional_group_ids) and all(connected_group(group_id) for group_id in directional_group_ids)
             components[-1].update(
                 run_ids=directional_run_ids, group_ids=directional_group_ids,
                 observation_roots=observation_roots,
                 connection_status="connected" if all_connected else "not_connected_or_not_assessed",
-                connection_assessment_scope="complete_selected_group_union",
+                connection_assessment_scope=('qualified_selected_branch_union' if receipt.get('branch_selection') is not None
+                                             else 'complete_selected_group_union'),
                 topology_connectivity=int(receipt.get("resolved_policy", {}).get("connectivity", 6)))
         if merged is not None:
             merged.flush()
@@ -1285,7 +1311,8 @@ def interpolate_sam_view_volume_pass(
     selected = [run for run in generated if str(run["run_id"]) in selected_ids]
     selected_groups = {str(run["group_id"]) for run in selected}
     stats.update({
-        "accepted_connections": sum(len(groups[group_id].edges) for group_id in selected_groups),
+        "accepted_connections": (len(receipt['branch_selection']['edges']) if receipt.get('branch_selection') is not None else
+                                  sum(len(groups[group_id].edges) for group_id in selected_groups)),
         "default_bridges": sum(int(run["walk_back_index"]) == 0 for run in selected),
         "walk_back_bridges": sum(int(run["walk_back_index"]) > 0 for run in selected),
         "added_voxels": int(added), "bridge_component_count": 2,
