@@ -1450,9 +1450,14 @@ def _measurement_charge(bundle, group, run_id, cache_bytes):
     return int(cache_bytes) + pixels*(128 + 2*edges + 4*tiles) + diagnostics + 1024**2
 
 
-def _measure_group_intrinsic(bundle, group, run_ids, mask_filter, execution):
+def _measure_group_intrinsic(bundle, group, run_ids, mask_filter, execution, *, retained_index_bytes=0):
     """Complete independent measurements before any ordered selection decision."""
-    credit = int(execution["parallel_credit_bytes"])
+    credit = max(0, int(execution["parallel_credit_bytes"])-int(retained_index_bytes))
+    if "branch_metadata" in execution:
+        metadata = execution["branch_metadata"]
+        metadata["peak_retained_index_bytes"] = max(metadata["peak_retained_index_bytes"], int(retained_index_bytes))
+        metadata["minimum_effective_parallel_credit_bytes"] = min(
+            metadata["minimum_effective_parallel_credit_bytes"], credit)
     workers = int(execution["requested_workers"])
     cache_bytes = int(execution["lane_cache_bytes"])
     charges = {key: _measurement_charge(bundle, group, key, cache_bytes) for key in run_ids}
@@ -1517,6 +1522,8 @@ def select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fro
     """Run proposal selection in a bounded, integrity-checked mask transaction."""
     if isinstance(workers, bool) or not isinstance(workers, (int, np.integer)) or int(workers) < 1:
         raise ValueError("SAM measurement workers must be a positive integer")
+    if isinstance(bundle, (SamMaskReader, SamEvidenceBundle)) and bundle.scope.get('evidence_purpose') == 'sam_extrapolation':
+        raise ValueError('One-seed SAM extrapolation evidence requires its dedicated tail selector')
     if isinstance(bundle, SamMaskReader):
         if not bundle.active:
             raise RuntimeError("SAM proposal selection needs an active mask reader")
@@ -1526,6 +1533,8 @@ def select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fro
         return result
     if not isinstance(bundle, SamEvidenceBundle):
         bundle = SamEvidenceBundle.open(bundle)
+    if bundle.scope.get('evidence_purpose') == 'sam_extrapolation':
+        raise ValueError('One-seed SAM extrapolation evidence requires its dedicated tail selector')
     with bundle.reader(max_cache_bytes=reader_cache_bytes) as reader:
         result = _select_sam_proposals(reader, policy, upstream_fingerprints=upstream_fingerprints,
                                         frozen_evidence=frozen_evidence,resource_profile=resource_profile,workers=int(workers))
@@ -1608,10 +1617,20 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
         reader_totals={name: 0 for name in ("mask_decodes", "filter_computations",
             "effective_candidate_computations", "cache_hits", "cache_misses", "cache_evictions")})
     selection_resources["intrinsic_measurements"] = execution
-    selection_resources["effective_resource_identity"] = fingerprint(dict(
-        original=selection_resources["effective_resource_identity"],
+    if resolved["branch_aware_selection"]:
+        execution["branch_metadata"] = dict(
+            index_admission="simultaneous_prefix_chunk_candidate_indexes_within_unused_topology_credit",
+            parallel_credit_rule="parallel_credit_bytes_minus_retained_prefix_index_bytes",
+            peak_retained_index_bytes=0, peak_simultaneous_index_bytes=0,
+            minimum_effective_parallel_credit_bytes=credit,
+            overlay_snapshot_count=0, full_merge_fallback_count=0)
+    admission_identity = dict(original=selection_resources["effective_resource_identity"],
         measurement_admission={key: execution[key] for key in ("schema", "requested_workers",
-            "parallel_credit_bytes", "lane_cache_bytes", "workspace_rule", "fallback_reason")}))
+            "parallel_credit_bytes", "lane_cache_bytes", "workspace_rule", "fallback_reason")})
+    if resolved["branch_aware_selection"]:
+        admission_identity["branch_metadata_admission"] = {key: execution["branch_metadata"][key]
+            for key in ("index_admission", "parallel_credit_rule")}
+    selection_resources["effective_resource_identity"] = fingerprint(admission_identity)
     if hook is not None and source_policy.get("proposal_api_version") != PROPOSAL_API_VERSION:
         raise ValueError("select_proposals requires proposal_api_version=1")
     hook_identity = source_policy.get("proposal_policy_sha256") or source_policy.get("policy_sha256")
@@ -1647,8 +1666,10 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
             aggregate_tracker_probability="Undefined; every child probability and status retained independently")
         policy_hash=fingerprint(dict(base_policy_hash=policy_hash,tiled_quality_contract=tiled_contract))
     receipts, group_receipts, selected = {}, {}, []
-    branch_recipes = []
+    branch_prefix = mask_filter
     for group_id in sorted(bundle.groups):
+        # Drop the previous candidate alias before retiring an accepted prefix.
+        selection_filter = mask_filter
         group = bundle.groups[group_id]
         run_ids = sorted(key for key, run in bundle.runs.items() if run["group_id"] == group_id)
         if not group.get("complete", True) or group.get("status") in {"incomplete", "unresolved", "invalid"}:
@@ -1676,8 +1697,18 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
                     reasons=["selection_group_workspace_limit"],measurements=dict(infrastructure_errors=[],assessment_status="resource_refused"),
                     selection_resources=resource)
             continue
+        retained_index_bytes = bundle._branch_index_bytes(branch_prefix) if branch_mode else 0
+        if branch_mode and retained_index_bytes > operative["max_group_bytes"]-topology_estimate:
+            # A later, larger family may leave no index slack. Materialize the
+            # ordinary retained recipe before its numeric work starts, then
+            # retire the old shallow indexes by replacing their sole owner.
+            ordinary = merge_branch_selections(bundle, mask_filter, [branch_prefix.branch_selection])
+            branch_prefix = bundle.filter_snapshot(dict(mask_filter=mask_filter, branch_selection=ordinary))
+            del ordinary
+            retained_index_bytes = 0
         measurement_started = time.perf_counter()
-        measurements = _measure_group_intrinsic(bundle, group, run_ids, mask_filter, execution)
+        measurements = _measure_group_intrinsic(bundle, group, run_ids, mask_filter, execution,
+            retained_index_bytes=retained_index_bytes)
         execution["wall_seconds"] += time.perf_counter()-measurement_started
         valid = [key for key in run_ids if not measurements[key]["infrastructure_errors"]]
         quality = {key: _quality_reasons(measurements[key], group, resolved) for key in run_ids}
@@ -1718,6 +1749,18 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
             if set(chosen) - set(valid):
                 raise ValueError("Proposal policy attempted to select incomplete or structurally invalid evidence")
         elif branch_mode:
+            metadata = execution["branch_metadata"]
+            index_credit = max(0, operative["max_group_bytes"]-topology_estimate)
+            def branch_trial_snapshot(recipe):
+                snapshot = bundle._branch_filter_overlay(branch_prefix, recipe, max_index_bytes=index_credit)
+                charge = bundle._branch_index_bytes(snapshot)
+                if charge:
+                    metadata["overlay_snapshot_count"] += 1
+                    metadata["peak_simultaneous_index_bytes"] = max(
+                        metadata["peak_simultaneous_index_bytes"], 3*charge)
+                else:
+                    metadata["full_merge_fallback_count"] += 1
+                return snapshot
             eligible, branch_quality = _branch_edge_eligibility(bundle, group, run_ids, measurements, resolved)
             eligible = {edge_id: roles for edge_id, roles in eligible.items() if any(roles.values())}
             branch_recipe, branch_diagnostics = build_connected_edge_selection(bundle, mask_filter, group_id, eligible,
@@ -1726,10 +1769,7 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
             safe_edges = []
             for edge_id in sorted(branch_recipe["edges"]):
                 edge_recipe = _restrict_branch_recipe(branch_recipe, [edge_id])
-                edge_combined = merge_branch_selections(bundle, mask_filter, [*branch_recipes, edge_recipe],
-                    connectivity=resolved["connectivity"], max_group_bytes=operative["max_group_bytes"],
-                    write_domain=resolved["branch_write_domain"], crop_boundary_policy=resolved["branch_crop_boundary_policy"])
-                edge_filter = bundle.filter_snapshot(dict(mask_filter=mask_filter, branch_selection=edge_combined))
+                edge_filter = branch_trial_snapshot(edge_recipe)
                 edge_runs = sorted(edge_recipe["selected_edge_ids_by_run"])
                 edge_topology = measure_group_topology(bundle, group_id, edge_runs,
                     connectivity=resolved["connectivity"], max_group_bytes=operative["max_group_bytes"],
@@ -1752,11 +1792,9 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
                     unintended_contact_voxels=edge_topology["unintended_contact_voxels"])
                 if not rejected:
                     safe_edges.append(edge_id)
+                del edge_filter, edge_recipe
             branch_recipe = _restrict_branch_recipe(branch_recipe, safe_edges)
-            combined = merge_branch_selections(bundle, mask_filter, [*branch_recipes, branch_recipe],
-                connectivity=resolved["connectivity"], max_group_bytes=operative["max_group_bytes"],
-                write_domain=resolved["branch_write_domain"], crop_boundary_policy=resolved["branch_crop_boundary_policy"])
-            selection_filter = bundle.filter_snapshot(dict(mask_filter=mask_filter, branch_selection=combined))
+            selection_filter = branch_trial_snapshot(branch_recipe)
             chosen = sorted(branch_recipe["selected_edge_ids_by_run"])
             selected_edge_ids = set(branch_recipe["edges"])
         else:
@@ -1799,7 +1837,7 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
         else:
             candidate_topology = topology
         if branch_mode and chosen:
-            branch_recipes.append(branch_recipe)
+            branch_prefix = selection_filter
         selected.extend(chosen)
         group_receipts[group_id] = dict(group_id=group_id, selected_run_ids=chosen, reasons=group_reasons,
             status="policy_selected" if chosen else "policy_rejected" if valid else "generated_incomplete_or_invalid",
@@ -1858,9 +1896,13 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
     if legacy_contract_fallback is not None:
         result["legacy_contract_fallback"] = legacy_contract_fallback
     if branch_mode:
-        result["branch_selection"] = merge_branch_selections(bundle, mask_filter, branch_recipes,
+        result["branch_selection"] = merge_branch_selections(bundle, mask_filter,
+            [] if branch_prefix.branch_selection is None else [branch_prefix.branch_selection],
             connectivity=resolved["connectivity"], max_group_bytes=operative["max_group_bytes"],
             write_domain=resolved["branch_write_domain"], crop_boundary_policy=resolved["branch_crop_boundary_policy"])
+        # Portable publication crosses the complete public trust boundary once;
+        # immutable internal indexes never stand in for a receipt fingerprint.
+        bundle.filter_snapshot(result)
         branch_edges = result["branch_selection"]["edges"]
         censored = sorted(edge_id for edge_id, edge in branch_edges.items() if edge.get("extent_censored", False))
         result["branch_selection_summary"] = dict(requested_edge_count=sum(len(group.get("edges", ()))

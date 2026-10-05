@@ -31,7 +31,7 @@ BASE_BYTES = 4 * GIB
 EXTRA_BYTES = 3 * GIB
 CACHE_BYTES = 32 * 1024**2
 SOURCE_FILES = (
-    'XTA/sam_policy.py', 'XTA/sam_mask_reader.py', 'XTA/sam_filtering.py',
+    'XTA/sam_policy.py', 'XTA/sam_mask_reader.py', 'XTA/sam_filtering.py', 'XTA/sam_branch_selection.py',
     'XTA/sam_evidence.py', 'XTA/sam_cyclic.py', 'XTA/sam_resources.py',
     'XTA/interpolation.py', 'tools/qualify_sam_policy_throughput.py',
 )
@@ -42,11 +42,12 @@ IDENTITY_PATHS = {
     ('cyclic_quality_implementation_sha256',), ('selection_identity',),
     ('mask_filter', 'implementation_sha256'), ('mask_filter', 'sha256'),
     ('reader_cache', 'implementation_sha256'),
+    ('branch_selection', 'implementation_sha256'), ('branch_selection', 'sha256'),
 }
 READER_COUNTERS = frozenset(('max_cache_bytes', 'cache_bytes', 'peak_cache_bytes',
     'cache_hits', 'cache_misses', 'cache_evictions', 'oversized_products',
     'mask_decodes', 'filter_computations', 'effective_candidate_computations',
-    'filter_spec_validations', 'integrity_checks'))
+    'filter_spec_validations', 'integrity_checks', 'packed_boundary_contact_scans'))
 PROFILE_FIELDS = frozenset(('scope_id', 'status', 'base_requested_bytes',
     'base_charged_bytes', 'reserved_extra_bytes', 'pool_capacity_bytes',
     'physical_headroom_bytes', 'worker_count', 'assigned_contract_bytes',
@@ -64,7 +65,10 @@ EXECUTION_FIELDS = frozenset(('schema', 'requested_workers', 'parallel_credit_by
     'lane_cache_bytes', 'workspace_rule', 'fallback_reason', 'peak_pending_runs',
     'peak_charged_bytes', 'parallel_group_count', 'serial_group_count', 'parallel_run_count',
     'oversized_serial_runs', 'maximum_run_charge_bytes', 'wall_seconds', 'serial_reasons',
-    'reader_totals'))
+    'reader_totals', 'branch_metadata'))
+BRANCH_METADATA_FIELDS = frozenset(('index_admission', 'parallel_credit_rule',
+    'peak_retained_index_bytes', 'peak_simultaneous_index_bytes',
+    'minimum_effective_parallel_credit_bytes', 'overlay_snapshot_count', 'full_merge_fallback_count'))
 _MISSING = object()
 
 
@@ -94,7 +98,16 @@ def _valid_execution(value):
     return (isinstance(value, dict) and set(value) <= EXECUTION_FIELDS
         and set(value.get('reader_totals', {})) <= READER_COUNTERS
         and set(value.get('serial_reasons', {})) <= {
-            'worker_hint_serial', 'single_run_group', 'insufficient_parallel_credit'})
+            'worker_hint_serial', 'single_run_group', 'insufficient_parallel_credit'}
+        and ('branch_metadata' not in value or _valid_branch_metadata(value['branch_metadata'])))
+
+
+def _valid_branch_metadata(value):
+    return (isinstance(value, dict) and set(value) == BRANCH_METADATA_FIELDS
+        and value['index_admission'] == 'simultaneous_prefix_chunk_candidate_indexes_within_unused_topology_credit'
+        and value['parallel_credit_rule'] == 'parallel_credit_bytes_minus_retained_prefix_index_bytes'
+        and all(type(value[key]) is int and value[key] >= 0 for key in BRANCH_METADATA_FIELDS
+                if key not in ('index_admission', 'parallel_credit_rule')))
 
 
 def allowed_difference(path, before, after, allow_implementation_changes=True):
@@ -107,6 +120,8 @@ def allowed_difference(path, before, after, allow_implementation_changes=True):
         return True
     if path == ('selection_resources', 'effective_resource_identity'):
         return _sha(before) and _sha(after)
+    if path == ('branch_selection', 'max_group_bytes'):
+        return all(type(value) is int and value > 0 for value in (before, after))
     if len(path) == 3 and path[:2] == ('selection_resources', 'effective_budgets'):
         return path[2] in {'topology_bytes', 'plane_bytes'}
     if len(path) == 3 and path[:2] == ('selection_resources', 'live_profile'):
@@ -119,6 +134,9 @@ def allowed_difference(path, before, after, allow_implementation_changes=True):
             return _valid_execution(value)
         if path[2] not in EXECUTION_FIELDS:
             return False
+        if path[2] == 'branch_metadata':
+            return len(path) == 3 and all(value is _MISSING or _valid_branch_metadata(value)
+                                         for value in (before, after))
         if path[2] == 'reader_totals':
             return len(path) == 4 and path[3] in READER_COUNTERS
         if path[2] == 'serial_reasons':
@@ -201,7 +219,12 @@ def inspect_demands(bundle, selection, workers=8, cache_bytes=CACHE_BYTES):
         if not group.get('complete', True) or group.get('status') in {'incomplete', 'unresolved', 'invalid'}:
             continue
         y0, x0, y1, x1 = map(int, group['context_bbox_yx'])
-        topologies[key] = len(group['frame_indices']) * (y1-y0) * (x1-x0) * 16
+        shape = (len(group['frame_indices']), y1-y0, x1-x0)
+        if resolved['branch_aware_selection']:
+            from XTA.sam_branch_selection import branch_workspace_bytes
+            topologies[key] = branch_workspace_bytes(shape)
+        else:
+            topologies[key] = math.prod(shape)*16
     for key, run in bundle.runs.items():
         charges[key] = _measurement_charge(bundle, bundle.groups[run['group_id']], key, cache_bytes)
     return dict(group_count=len(bundle.groups), run_count=len(bundle.runs),
@@ -262,6 +285,10 @@ def validate_execution(selection, requested_workers):
             or execution['peak_pending_runs'] > requested_workers
             or execution['peak_charged_bytes'] > execution['parallel_credit_bytes']):
         raise ValueError('Parallel measurement exceeded its admitted worker/byte bounds')
+    metadata = execution.get('branch_metadata')
+    if metadata is not None and (metadata['minimum_effective_parallel_credit_bytes'] > execution['parallel_credit_bytes']
+            or metadata['peak_simultaneous_index_bytes'] > resources['effective_budgets']['topology_bytes']):
+        raise ValueError('Branch metadata exceeded its admitted index/measurement bounds')
     refused = [key for key, row in selection['group_receipts'].items()
                if row['status'] == 'not_assessed_resource_refused']
     if refused:
@@ -290,7 +317,10 @@ def compare_saved_bridges(bundle, selection, parent, cache_bytes=CACHE_BYTES):
                     continue
                 addresses = geometry['groups'][run['group_id']]['addresses']
                 for frame, mask_key in run['candidate_mask_keys'].items():
-                    if bundle.records[mask_key]['foreground']:
+                    # Expanded branch owners can write on a plane whose old
+                    # clipped candidate packet is empty. Compare every selected
+                    # owner's covered plane for branch-aware receipts.
+                    if selection.get('branch_selection') is not None or bundle.records[mask_key]['foreground']:
                         frame = int(frame)
                         active.add(int(addresses[frame]['native_index']) if addresses is not None else frame)
             old_hash, new_hash = hashlib.sha256(), hashlib.sha256()
@@ -298,9 +328,14 @@ def compare_saved_bridges(bundle, selection, parent, cache_bytes=CACHE_BYTES):
             old_hash.update(header); new_hash.update(header)
             changed = old_foreground = new_foreground = 0
             with bundle.reader(max_cache_bytes=cache_bytes) as reader:
+                bound_selection = selection
+                if hasattr(reader, 'filter_snapshot'):
+                    snapshot = reader.filter_snapshot(selection)
+                    bound_selection = dict(selection, mask_filter=snapshot)
+                    bound_selection.pop('branch_selection', None)
                 for frame in sorted(active):
                     old = saved.decode_slice(frame, dtype=bool)
-                    new = selected_native_plane(reader, selection, frame, direction=direction,
+                    new = selected_native_plane(reader, bound_selection, frame, direction=direction,
                                                 pass_index=pass_index, shape_yx=shape[1:])
                     changed += int(np.count_nonzero(old != new))
                     old_foreground += int(np.count_nonzero(old)); new_foreground += int(np.count_nonzero(new))

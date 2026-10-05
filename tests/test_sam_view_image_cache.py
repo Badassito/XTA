@@ -256,6 +256,11 @@ def test_failed_render_publishes_no_partial_descriptor_and_can_retry(tmp_path):
             with pytest.raises(RuntimeError, match='render failed'):
                 context.image_provider(view, source.shape, demand(source.shape, {0: (0, 0, 4, 4)}))
         assert not context._caches
+        # Failure retirement preserves live NumPy/traceback aliases, and the
+        # owned scratch unlink runs asynchronously after the last alias dies.
+        from XTA.runtime import wait_for_retired_memmap_unlinks
+        for path in (tmp_path/'runtime'/'sam_image_cache').glob('*.dat'):
+            wait_for_retired_memmap_unlinks(path=path)
         assert not list((tmp_path/'runtime'/'sam_image_cache').glob('*.dat'))
         assert context.image_provider(view, source.shape, demand(source.shape, {0: (0, 0, 4, 4)}))
     finally:

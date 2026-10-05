@@ -19,6 +19,7 @@ DEVELOPMENT = 'sam-bridges-v24.0.2'
 @pytest.fixture(scope='module')
 def predecessor():
     current = json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
+    current.pop('v24_1_0_sam_extrapolation_development_review', None)
     current.pop(KEY, None)
     return current
 
@@ -60,7 +61,7 @@ def test_candidate_starts_from_exact_tagged_v24_0_1(predecessor):
 
 def test_candidate_version_bump_has_exact_source_predecessor_link(predecessor):
     previous = prepare.git_file(prepare.ROOT, 'v24.0.1', 'XTA/__init__.py')
-    current = (prepare.ROOT / 'XTA/__init__.py').read_text(encoding='utf-8')
+    current = prepare.git_file(prepare.ROOT, 'v24.0.2', 'XTA/__init__.py')
     pin, snapshot, records = prepare.review_module('__init__', previous, current,
         complete=False, labels_by_hash={}, reason='Identify the separately reviewed v24.0.2 candidate.')
     review = fixture_review(predecessor)

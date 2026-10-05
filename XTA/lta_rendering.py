@@ -233,21 +233,37 @@ def render_native_tile_window(
     x0, y0, x1, y1 = (int(value) for value in tile_xyxy)
     if not 0 <= x0 < x1 <= cache_ref.shape[2] or not 0 <= y0 < y1 <= cache_ref.shape[1]:
         raise ValueError("tile_xyxy is outside the physical-view cache")
+    import weakref
+    from .runtime import close_memmap_array_without_flush
     cache = cache_ref.open(mode="r")
+    mapping = weakref.ref(cache._mmap)
     records = {record[0]: record for record in cache_ref.frame_crops}
-    images = []
-    for index in range(start, stop):
-        if records:
-            if index not in records:
-                raise ValueError('SAM image cache does not contain a requested tracking frame')
-            _, cy0, cx0, cy1, cx1, offset = records[index]
-            if not (cx0 <= x0 < x1 <= cx1 and cy0 <= y0 < y1 <= cy1):
-                raise ValueError('SAM tracker crop exceeds its immutable image demand')
-            frame = cache[offset:offset+(cy1-cy0)*(cx1-cx0)].reshape(cy1-cy0, cx1-cx0)
-            crop = frame[y0-cy0:y1-cy0, x0-cx0:x1-cx0]
-        else:
-            crop = cache[index, y0:y1, x0:x1]
-        images.append(Image.fromarray(implicit_rgb(np.ascontiguousarray(crop)), mode='RGB'))
+    class DetachedRgbFrames(list):
+        source_cache_mapping_retired = False
+    images = DetachedRgbFrames()
+    frame = crop = None
+    try:
+        for index in range(start, stop):
+            if records:
+                if index not in records:
+                    raise ValueError('SAM image cache does not contain a requested tracking frame')
+                _, cy0, cx0, cy1, cx1, offset = records[index]
+                if not (cx0 <= x0 < x1 <= cx1 and cy0 <= y0 < y1 <= cy1):
+                    raise ValueError('SAM tracker crop exceeds its immutable image demand')
+                frame = cache[offset:offset+(cy1-cy0)*(cx1-cx0)].reshape(cy1-cy0, cx1-cx0)
+                crop = frame[y0-cy0:y1-cy0, x0-cx0:x1-cx0]
+            else:
+                crop = cache[index, y0:y1, x0:x1]
+            # A gray cache is always 2D here. implicit_rgb repeats into a new
+            # RGB allocation, so PIL/model images never borrow this gray mmap.
+            images.append(Image.fromarray(implicit_rgb(np.ascontiguousarray(crop)), mode='RGB'))
+    finally:
+        frame = crop = None
+        close_memmap_array_without_flush(cache)
+        cache = None
+        # Inspect the shared mmap, not merely the outer NumPy wrapper. Error
+        # traceback aliases remain valid and defer retirement naturally.
+        images.source_cache_mapping_retired = mapping() is None
     return images
 
 
@@ -417,6 +433,7 @@ def build_lta_rendered_view(
     """Bind one expanded LTA runtime view to canonical geometry and RGB policy."""
 
     from .unification.tta_manifest import radial_view_plan_metadata, spherical_view_plan_metadata
+    from .unification.geometry_identity import geometry_recipe_metadata
     volume = np.asarray(volume_u8)
     if volume.dtype != np.uint8 or volume.ndim != 3:
         raise ValueError("LTA source volume must be uint8 with (t,Y,X) shape")
@@ -439,6 +456,7 @@ def build_lta_rendered_view(
             "runtime_kind": "fullframe_sam",
             "channel_policy": "implicit_rgb_v1",
             "source_shape_tyx": [int(value) for value in volume.shape],
+            **geometry_recipe_metadata(view, job.aff),
             **radial_view_plan_metadata(view),
             **spherical_view_plan_metadata(view),
         },

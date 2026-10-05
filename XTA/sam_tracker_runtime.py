@@ -99,13 +99,18 @@ class _FamilyDispatch:
         self.total_jobs = len(indices)
         self.assigned_families = self.completed_families = self.peak_active = 0
 
-    def next_for(self, free_devices):
-        for device in sorted(free_devices):
+    def retire_completed(self, free_devices):
+        """Retire exhausted cursors only after their worker becomes free."""
+        for device in free_devices:
             current = self.active.get(device)
             if current is not None and current[1] == len(current[0].input_indices):
                 self.completed_families += 1
                 del self.active[device]
-                current = None
+
+    def next_for(self, free_devices):
+        for device in sorted(free_devices):
+            self.retire_completed((device,))
+            current = self.active.get(device)
             if current is None and not self.waiting_exhausted:
                 family = next(self.waiting, None)
                 if family is None:
@@ -270,6 +275,10 @@ def execute_interpolation_tracker_task(
         cache_ref, frame_start=start, frame_stop=stop, tile_xyxy=crop,
     )
     render_seconds = time.perf_counter() - render_started
+    image_cache_lifetime = dict(schema='xta.sam_image_cache_lifetime/1',
+        gray_mapping_retired_after_render=getattr(resource, 'source_cache_mapping_retired', False) is True,
+        model_input='independent_rgb_pil_frames',
+        detach_allocation='existing_gray_to_rgb_repeat_counted_by_session_cpu_admission')
     feature_cache = getattr(context, "feature_cache", None)
     cache_before = None if feature_cache is None else feature_cache.snapshot()
     observations: dict[int, object] = {}
@@ -297,6 +306,13 @@ def execute_interpolation_tracker_task(
         ),
     )
     tracker_seconds = time.perf_counter() - tracker_started
+    torch_mod = getattr(context, 'torch_module', None)
+    cuda_quiescence = dict(synchronized=False, worker_local_device=0,
+        execution_device_id=int(os.environ.get('LTA_EXECUTION_DEVICE_ID', '0')),
+        run_id=str(payload['run_id']))
+    if torch_mod is not None:
+        torch_mod.cuda.synchronize(0)
+        cuda_quiescence['synchronized'] = True
     expected = (
         tuple(range(prompt, stop)) if direction == "forward"
         else tuple(range(start, prompt + 1))
@@ -342,6 +358,8 @@ def execute_interpolation_tracker_task(
         "seed_artifact_sha256": str(payload["seed_sha256"]),
         "frame_range": [start, stop], "expected_frames": list(expected),
         "direction": direction, "image_cache": _image_cache_summary(cache_ref.payload()),
+        "image_cache_lifetime": image_cache_lifetime,
+        "cuda_quiescence": cuda_quiescence,
         "raw_masks": {"path": str(mask_path), "sha256": _sha256(mask_path),
                       "size_bytes": mask_path.stat().st_size},
         "adapter_receipt": _jsonable(receipt),
@@ -448,6 +466,8 @@ class SamInterpolationTracker:
         feature_cache_bytes: int = 512 * 1024 * 1024,
         feature_cache_headroom_bytes: int | None = None,
         session_cpu_budget_bytes: int = 2 * 1024**3,
+        compute_lease_factory=None, compute_lease_release=None,
+        residency_quarantine=None, before_worker_shutdown=None, after_worker_shutdown=None,
     ) -> None:
         self.model_path = str(model_path)
         self.device_ids = tuple(_integer(value, "device_id") for value in device_ids)
@@ -483,6 +503,14 @@ class SamInterpolationTracker:
             "affinity_hits": 0, "affinity_lends": 0, "wait_seconds": 0.0,
         }
         self._source_cache_ref = None
+        self._source_cache_retirement_proofs = {}
+        self._compute_lease_factory = compute_lease_factory
+        self._compute_lease_release = compute_lease_release
+        self._residency_quarantine = residency_quarantine
+        self._before_worker_shutdown = before_worker_shutdown
+        self._after_worker_shutdown = after_worker_shutdown
+        self._compute_leases = {}
+        self.startup_cuda_quiescent = False
         if source_cache_ref is not None:
             self.set_source_cache(source_cache_ref)
 
@@ -495,6 +523,34 @@ class SamInterpolationTracker:
             raise RuntimeError("cannot replace SAM source cache while a bounded iterator is active")
         cache_ref.revalidate()
         self._source_cache_ref = cache_ref
+
+    def release_source_cache(self, cache_ref: object) -> dict[str, object]:
+        """Prove complete iterator consumption before a cache owner unlinks it."""
+        from .lta_rendering import LtaPhysicalViewCacheRef
+        if not isinstance(cache_ref, LtaPhysicalViewCacheRef):
+            raise TypeError('SAM cache retirement requires an immutable cache descriptor')
+        key = hashlib.sha256(json.dumps(cache_ref.payload(), sort_keys=True).encode()).hexdigest()
+        with self._dispatch_lock:
+            if self._iteration_active:
+                raise RuntimeError('SAM image cache still has an active iterator owner')
+            proof = self._source_cache_retirement_proofs.pop(key, None)
+            if proof is None:
+                proof = dict(complete=True, all_gray_mappings_retired=True, completed_runs=0)
+                basis = 'no_submitted_consumers'
+            elif self._closed and self.workers_settled:
+                proof = dict(proof, complete=True, all_gray_mappings_retired=True)
+                basis = 'worker_processes_exited'
+            else:
+                basis = 'completed_iterator_and_detached_worker_rgb'
+            if not proof['complete'] or not proof['all_gray_mappings_retired']:
+                self._source_cache_retirement_proofs[key] = proof
+                raise RuntimeError('SAM image cache has no completed worker mapping-retirement proof')
+            if self._source_cache_ref == cache_ref:
+                self._source_cache_ref = None
+            return dict(schema='xta.sam_image_cache_retirement/1', status='retired',
+                completed_runs=int(proof['completed_runs']), workers_finished=True,
+                gray_mappings_retired=True, model_and_feature_cache_retained=not self._closed,
+                proof_basis=basis)
 
     def start(self) -> "SamInterpolationTracker":
         from .lta_workers import LtaWorkerInit, LtaWorkerPool
@@ -524,6 +580,15 @@ class SamInterpolationTracker:
                 self._pool = getattr(error, "unsettled_worker_pool", None)
                 self._residency_released = self._pool is None
                 raise
+            if self._compute_lease_factory is not None:
+                ready = tuple(self._pool.ready_events)
+                if (set(int(event.execution_device_id) for event in ready) != set(self.device_ids)
+                        or any(event.metadata.get('sam_runtime', {}).get('startup_cuda_quiescence', {}).get('synchronized') is not True
+                            or type(event.metadata.get('sam_runtime', {}).get('startup_cuda_quiescence', {}).get('worker_local_device')) is not int
+                            or event.metadata.get('sam_runtime', {}).get('startup_cuda_quiescence', {}).get('worker_local_device') != 0
+                            for event in ready)):
+                    raise RuntimeError('SAM startup has no exact worker CUDA-quiescence proof')
+                self.startup_cuda_quiescent = True
         return self
 
     @property
@@ -538,6 +603,8 @@ class SamInterpolationTracker:
         pool = self._pool
         if pool is None:
             return
+        if self._before_worker_shutdown is not None:
+            self._before_worker_shutdown()
         original_error = None
         try:
             pool.shutdown(timeout=timeout, force=True)
@@ -554,6 +621,8 @@ class SamInterpolationTracker:
                     if callable(add_note):
                         add_note(f"SAM forced worker cleanup also failed: {type(error).__name__}: {error}")
         self._residency_released = bool(pool.workers_settled)
+        if self._residency_released and self._after_worker_shutdown is not None:
+            self._after_worker_shutdown()
         if self._residency_released:
             self._pool = None
         if original_error is not None:
@@ -684,37 +753,78 @@ class SamInterpolationTracker:
             if not isinstance(cache_ref, LtaPhysicalViewCacheRef):
                 raise RuntimeError("SAM tracker requires an immutable image cache for this iterator")
             cache_ref.revalidate()
+            cache_retirement_key = hashlib.sha256(json.dumps(cache_ref.payload(), sort_keys=True).encode()).hexdigest()
+            cache_proof = self._source_cache_retirement_proofs.setdefault(cache_retirement_key,
+                dict(complete=False, all_gray_mappings_retired=True, completed_runs=0))
+            cache_proof['complete'] = False
             self._iteration_active = True
             iterator = iter(requests)
             source_exhausted = False
             next_index = 0
+            waiting_request = None
             seen_run_ids: set[str] = set()
             free_devices = set(self.device_ids)
 
             def submit_next() -> bool:
-                nonlocal source_exhausted, next_index
+                nonlocal source_exhausted, next_index, waiting_request
                 if source_exhausted or not free_devices:
                     return False
                 if self._cancel.is_set():
                     raise RuntimeError(self._cancel_reason)
                 family_id = None
                 chosen_device = None
+                compute_lease = None
                 if _family_dispatch is None:
-                    try:
-                        request = next(iterator)
-                    except StopIteration:
-                        source_exhausted = True
-                        return False
+                    if waiting_request is None:
+                        try:
+                            waiting_request = next(iterator)
+                        except StopIteration:
+                            source_exhausted = True
+                            return False
+                    request = waiting_request
                     input_index = next_index
+                    if self._compute_lease_factory is not None:
+                        crop = tuple(request['crop_xyxy'])
+                        preferred = self._crop_affinity.get((cache_ref.identity_sha256, crop))
+                        rank = sorted(free_devices, key=lambda dev: (dev != preferred, self._device_submissions[dev], dev))
+                        for dev in rank:
+                            compute_lease = self._compute_lease_factory(dev, f'SAM tracker compute {request["run_id"]}')
+                            if compute_lease is not None:
+                                chosen_device = dev
+                                break
+                        if compute_lease is None:
+                            return False
+                    waiting_request = None
                 else:
-                    chosen = _family_dispatch.next_for(free_devices)
+                    admitted = {}
+                    if self._compute_lease_factory is not None:
+                        for dev in sorted(free_devices):
+                            lease = self._compute_lease_factory(dev, 'SAM tracker compute family dispatch')
+                            if lease is not None:
+                                admitted[dev] = lease
+                    chosen = _family_dispatch.next_for(set(admitted) if self._compute_lease_factory is not None else free_devices)
                     if chosen is None:
+                        for lease in admitted.values():
+                            self._compute_lease_release(lease)
+                        if next_index == _family_dispatch.total_jobs:
+                            source_exhausted = True
                         return False
                     chosen_device, input_index, family_id, request = chosen
-                prepared = self._prepare_task(
-                    request, cache_ref=cache_ref, input_index=input_index,
-                    staging_directories=staging_directories,
-                )
+                    compute_lease = admitted.pop(chosen_device, None)
+                    for lease in admitted.values():
+                        self._compute_lease_release(lease)
+                reservation_key = None
+                if compute_lease is not None:
+                    reservation_key = ('unsubmitted', id(compute_lease))
+                    self._compute_leases[reservation_key] = compute_lease
+                try:
+                    prepared = self._prepare_task(request, cache_ref=cache_ref, input_index=input_index,
+                        staging_directories=staging_directories)
+                except BaseException:
+                    if compute_lease is not None:
+                        self._compute_leases.pop(reservation_key, None)
+                        self._compute_lease_release(compute_lease)
+                    raise
                 del request
                 if prepared.task.work_id in seen_run_ids:
                     raise ValueError(f"duplicate SAM run_id in one iterator: {prepared.task.work_id}")
@@ -742,6 +852,9 @@ class SamInterpolationTracker:
                     device = min(free_devices, key=lambda value: (self._device_submissions[value], value))
                     if owner is not None:
                         self.dispatch_stats["affinity_lends"] += 1
+                if compute_lease is not None:
+                    self._compute_leases.pop(reservation_key, None)
+                    self._compute_leases[(prepared.task.work_id, prepared.task.attempt_token)] = compute_lease
                 self._pool.submit(prepared.task, execution_device_id=device)
                 free_devices.remove(device)
                 self._device_submissions[device] += 1
@@ -760,7 +873,14 @@ class SamInterpolationTracker:
 
             while len(pending) < capacity and submit_next():
                 pass
-            while pending:
+            while pending or not source_exhausted:
+                if not pending:
+                    if self._cancel.is_set():
+                        raise RuntimeError(self._cancel_reason)
+                    if not submit_next():
+                        if not source_exhausted:
+                            self._cancel.wait(0.05)
+                        continue
                 waiting_started = time.perf_counter()
                 event = self._wait_result()
                 self.dispatch_stats["wait_seconds"] += time.perf_counter() - waiting_started
@@ -770,10 +890,11 @@ class SamInterpolationTracker:
                 prepared, device = pending.pop(identity)
                 if int(event.execution_device_id) != device:
                     raise RuntimeError("SAM worker result changed its admitted device ownership")
-                free_devices.add(device)
+                if self._compute_lease_factory is None:
+                    free_devices.add(device)
                 # Start the next GPU session before CPU transfer verification and
                 # evidence packing; completed and active runs never share masks.
-                if not defer_refill_until_consumed:
+                if not defer_refill_until_consumed and self._compute_lease_factory is None:
                     while len(pending) < capacity and submit_next():
                         pass
                 artifact_path = Path(event.artifact_path).resolve(strict=True)
@@ -797,6 +918,24 @@ class SamInterpolationTracker:
                     raise RuntimeError("SAM raw evidence changed its immutable image/seed/geometry contract")
                 if result.receipt.get("request_metadata", {}) != prepared.task.payload["request_metadata"]:
                     raise RuntimeError("SAM raw evidence changed its immutable original-run/tile attribution")
+                if self._compute_lease_factory is not None:
+                    proof = result.receipt.get('cuda_quiescence', {})
+                    local_device = proof.get('worker_local_device')
+                    logical_device = proof.get('execution_device_id')
+                    if (proof.get('synchronized') is not True or type(local_device) is not int or local_device != 0
+                            or type(logical_device) is not int or logical_device != device
+                            or proof.get('run_id') != prepared.task.work_id):
+                        raise RuntimeError('SAM completion lacks exact CUDA-quiescence/device/run proof')
+                    lease = self._compute_leases.pop(identity)
+                    self._compute_lease_release(lease)
+                    free_devices.add(device)
+                    if not defer_refill_until_consumed:
+                        while len(pending) < capacity and submit_next():
+                            pass
+                lifetime = result.receipt.get('image_cache_lifetime', {})
+                cache_proof['all_gray_mappings_retired'] &= (
+                    lifetime.get('gray_mapping_retired_after_render') is True)
+                cache_proof['completed_runs'] += 1
                 receipt = dict(result.receipt)
                 receipt["dispatch"] = {"input_index": prepared.input_index,
                                        "execution_device_id": device, "worker_pid": event.worker_pid,
@@ -815,8 +954,17 @@ class SamInterpolationTracker:
             if _family_dispatch is not None:
                 if next_index != _family_dispatch.total_jobs:
                     raise RuntimeError("SAM family dispatcher omitted immutable original jobs")
+                # Exhaustion can be discovered while other final family jobs
+                # are pending. With no further submission, next_for never sees
+                # those workers again. All ACKs and yielded consumers are now
+                # drained, so retire their exhausted cursors explicitly.
+                _family_dispatch.retire_completed(free_devices)
+                if (_family_dispatch.active or _family_dispatch.completed_families !=
+                        _family_dispatch.assigned_families):
+                    raise RuntimeError("SAM family completion inventory did not settle after its jobs drained")
                 self.dispatch_stats["family_completed"] = _family_dispatch.completed_families
             complete = True
+            cache_proof['complete'] = True
         finally:
             primary_error = sys.exc_info()[1]
             cleanup_error = None
@@ -825,6 +973,8 @@ class SamInterpolationTracker:
                 # Only this consumer shuts down queues. Asynchronous cancellation
                 # merely sets an event, so no wait-result/shutdown race is possible.
                 self.cancel("SAM bounded generation failed or its consumer stopped before completion")
+                if self._residency_quarantine is not None:
+                    self._residency_quarantine('SAM bounded generation failed before safe handback')
                 if self._pool is not None:
                     try:
                         self._settle_pool(timeout=1.0)
@@ -840,6 +990,10 @@ class SamInterpolationTracker:
                 if cleanup_error is None:
                     cleanup_error = error
             finally:
+                if self.workers_settled and self._compute_lease_release is not None:
+                    for lease in self._compute_leases.values():
+                        self._compute_lease_release(lease)
+                    self._compute_leases.clear()
                 self._iteration_active = False
                 self._dispatch_lock.release()
             if cleanup_error is not None:
@@ -902,6 +1056,8 @@ class SamInterpolationTracker:
         are diagnostic data and never a completed empty support layer.
         """
 
+        if self._residency_quarantine is not None:
+            self._residency_quarantine(str(reason))
         self._cancel_reason = str(reason)
         self._cancel.set()
 
@@ -971,6 +1127,9 @@ def build_interpolation_predictor(config: Mapping[str, object]):
             )
         else:
             context.feature_cache = None
+        context.torch_module.cuda.synchronize(0)
+        context.sam_runtime = dict(context.sam_runtime, startup_cuda_quiescence={
+            'synchronized': True, 'worker_local_device': 0})
     except BaseException:
         close_worker_predictor(context)
         raise

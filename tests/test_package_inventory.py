@@ -29,6 +29,7 @@ def _release_22_2_inventory():
     manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
     manifest.pop('v24_job150790_150798_throughput_development_review', None)
     manifest.pop('v24_0_2_sam_bridges_development_review', None)
+    manifest.pop('v24_1_0_sam_extrapolation_development_review', None)
     manifest.pop('v24_job150772_performance_development_review', None)
     manifest.pop('v24_0_1_release_review', None)
     manifest.pop('v24_job150615_headroom_development_review', None)
@@ -60,7 +61,8 @@ def _reconciliation_successors():
                                          'v24_0_1_release_review',
                                          'v24_job150772_performance_development_review',
                                          'v24_job150790_150798_throughput_development_review',
-                                         'v24_0_2_sam_bridges_development_review') if key in manifest)
+                                         'v24_0_2_sam_bridges_development_review',
+                                         'v24_1_0_sam_extrapolation_development_review') if key in manifest)
 
 
 def _release_22_1_inventory():

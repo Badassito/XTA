@@ -2813,6 +2813,20 @@ def _write_nrrd_ascii_header(
     text = '\n'.join(lines) + '\n\n'
     fh.write(text.encode('ascii', errors='ignore'))
 
+def nrrd_layer_file_basename(stem: str, unique_suffix: str) -> str:
+    """Bound physical layer names while retaining full labels in metadata."""
+    logical_name = f'{stem}_{unique_suffix}'
+    extension = '.seg.nrrd'
+    ordinary = logical_name + extension
+    if len(ordinary) <= 120:
+        return ordinary
+    import hashlib
+    digest = hashlib.sha256(logical_name.encode('utf-8')).hexdigest()
+    prefix_budget = 120 - len(extension) - len(digest) - 2
+    prefix = logical_name[:prefix_budget].rstrip(' ._-')
+    return f'{prefix}__{digest}{extension}'
+
+
 def nrrd_layer_output_suffix(
     *,
     view_token: str,
@@ -2844,6 +2858,12 @@ def nrrd_layer_output_suffix(
             return f'Global_smoothing_pass{int(pass_index):02d}'
         return 'Global_union_presmoothing'
     vt = _sanitize_nrrd_layer_token(view_token) or 'view'
+    if mask_kind_l == 'extrapolation':
+        direction = str(stage).removeprefix('sam_extrapolation_')
+        if direction not in {'forward', 'backward'} or source_l not in {'fullframe', 'tile'}:
+            raise ValueError('SAM extrapolation output requires a direction and native source scope')
+        config = _sanitize_nrrd_layer_token(tile_config_id) if tile_config_id else ''
+        return f'{vt}_{source_l}{"_" + config if config else ""}_sam_extrapolation_{direction}'
     if mask_kind_l == 'bridge' and str(interpolation_backend).lower() == 'sam':
         direction = str(interpolation_direction).strip().lower()
         if direction not in {'forward', 'backward'}:
@@ -3752,6 +3772,13 @@ _INTERPOLATION_PROVENANCE_FIELDS = (
 
 def interpolation_layer_provenance(ref: NrrdLayerRef, *, relative_to: Optional[Path] = None) -> Dict[str, object]:
     """Return explicit SAM/gate lineage without changing legacy SDF metadata."""
+    tail = dict(getattr(ref, 'extrapolation_provenance', {}) or {})
+    if tail:
+        if relative_to is not None and tail.get('evidence_path'):
+            tail['evidence_path'] = Path(os.path.relpath(
+                str(Path(str(tail['evidence_path'])).resolve()), str(Path(relative_to).resolve()))).as_posix()
+            tail['evidence_path_base'] = 'manifest_directory'
+        return {'extrapolation': tail, 'native_transform': ref.native_transform}
     if (str(getattr(ref, 'interpolation_backend', '')).lower() != 'sam'
             and not getattr(ref, 'gate_support_identity', '')
             and not getattr(ref, 'upstream_interpolation_policy_identity', '')):
@@ -3793,6 +3820,7 @@ class NrrdLayerSink:
         self._source_refs: Dict[Future, NrrdLayerRef] = {}
         self._manifest: List[Dict[str, object]] = []
         self._suffix_counts: Dict[str, int] = {}
+        self._physical_names: Dict[str, str] = {}
         self._sam_output_slots: set = set()
         # Slicer segment colors already assigned in this run, so two layers whose
         # suffix hashes collide still render distinctly (deterministic forward probing).
@@ -3845,6 +3873,13 @@ class NrrdLayerSink:
         if ref is None:
             return None
         provenance = interpolation_layer_provenance(ref, relative_to=self.nrrd_dir)
+        if ref.mask_kind == 'extrapolation':
+            tail = dict(getattr(ref, 'extrapolation_provenance', {}) or {})
+            if tail.get('direction') not in {'forward', 'backward'} or tail.get('backend') != 'sam':
+                raise ValueError('Extrapolation output requires explicit SAM tail provenance')
+            suffix = nrrd_layer_output_suffix(view_token=ref.view_name, source=ref.source,
+                mask_kind='extrapolation', tile_config_id=ref.tile_config_id,
+                stage='sam_extrapolation_' + tail['direction'])
         if str(getattr(ref, 'interpolation_backend', '')).lower() == 'sam':
             if ref.mask_kind == 'bridge' and ref.proposal_selection_status != 'policy_selected':
                 raise ValueError('SAM directional output requires completed proposal-quality selection')
@@ -3879,10 +3914,14 @@ class NrrdLayerSink:
             seen = int(self._suffix_counts.get(str(suffix), 0))
             self._suffix_counts[str(suffix)] = seen + 1
             unique_suffix = str(suffix) if seen == 0 else f'{suffix}_{seen + 1:02d}'
-            # .seg.nrrd + Slicer segmentation header fields; the segment is named
-            # after the file and colored from the deterministic per-suffix palette.
-            out_path = self.nrrd_dir / f'{self.stem}_{unique_suffix}.seg.nrrd'
+            # Keep full logical segment labels and palette identity even when a
+            # long physical basename is shortened for portable loose transfer.
             segment_name = f'{self.stem}_{unique_suffix}'
+            basename = nrrd_layer_file_basename(self.stem, unique_suffix)
+            previous_name = self._physical_names.setdefault(basename.casefold(), segment_name)
+            if previous_name != segment_name:
+                raise ValueError('NRRD physical filename collision between distinct logical layer names')
+            out_path = self.nrrd_dir / basename
             segment_color = self._segment_color_for_suffix(unique_suffix)
             manifest_entry: Dict[str, object] = {
                 'filename': out_path.name,
@@ -3935,7 +3974,7 @@ class NrrdLayerSink:
                     int(spec.output_shape_t_y_x[1]),
                     int(spec.output_shape_t_y_x[2]),
                 )
-                lq_path = self._lq_nrrd_dir(spec) / f'{self.stem}_{unique_suffix}.seg.nrrd'
+                lq_path = self._lq_nrrd_dir(spec) / basename
                 lq_mirror_args.append((lq_shape, lq_path))
                 lq_manifest_entry: Dict[str, object] = {
                     'filename': lq_path.name,
@@ -4168,7 +4207,7 @@ class NrrdLayerSink:
                         'Low-quality distribution: eligible component layers and complete checkpoints from the '
                         'full-quality nrrd/ folder, isotropically downbinned to this spec.',
                         'Each NRRD is one uint8 binary mask in source output geometry (X, Y, t), downbinned.',
-                        'v13.2.3: each file is a 3D Slicer segmentation (.seg.nrrd) sharing its full-quality layer\'s segment name and color.',
+                        'Each file is a 3D Slicer segmentation (.seg.nrrd) sharing its full-quality layer\'s logical segment name and color; physical basenames longer than 120 characters are shortened.',
                         'Layer suffixes match the corresponding full-quality layers. Centerline removed-component and watershed-candidate audit layers are mirrored as non-recomposable downbins (diagnostic_only and none, respectively).',
                         'Use each layer\'s recomposition_op. Only union entries marked union; select entries are complete checkpoints.',
                     ],
@@ -4184,7 +4223,7 @@ class NrrdLayerSink:
             'layers': manifest_layers,
             'notes': [
                 'Each NRRD is one uint8 binary mask in source output geometry (X, Y, t).',
-                'v13.2.3: each file is a 3D Slicer segmentation (.seg.nrrd) holding one segment named after the file; segment_color_rgb records the assigned Slicer color.',
+                'Each file is a 3D Slicer segmentation (.seg.nrrd) holding one full logical segment label; segment_color_rgb records the assigned Slicer color. Physical basenames longer than 120 characters are shortened.',
                 'Recomposition is role-aware: union only layers whose recomposition_op is union; select chooses a complete checkpoint; subtract_from_previous_checkpoint removes that full-quality delta; none is diagnostic only.',
                 'YOLO layers are cleaned masks before interpolation bridges; bridge layers contain only voxels added by that pass.',
                 'Global checkpoints, including centerline pass00_input/result and Global_final_output, are complete alternatives and must never be unioned with component or audit layers.',
@@ -5947,6 +5986,16 @@ def write_summary_file(
         lines.append(f'  {label}: predictions={count}')
     lines.append(f'  Total prediction count: {int(total_prediction_count)}')
 
+    extrapolation_stats = [item for item in interpolation_stats
+                           if item.get('processing_role') == 'extrapolation']
+    interpolation_stats = [item for item in interpolation_stats
+                           if item.get('processing_role') != 'extrapolation']
+    if extrapolation_stats:
+        lines.append('SAM extrapolation: remaining post-interpolation terminals; raw-empty/horizon stop; contacts continue.')
+        for item in extrapolation_stats:
+            lines.append(f"  {item.get('model', '?')}/{item.get('view', '?')}/{item.get('source', '?')}: "
+                         f"added_voxels={int(item.get('added_voxels', 0))}, "
+                         f"evidence={item.get('sam_evidence_path', item.get('evidence_path', ''))}")
     if interpolation_stats:
         lines.append('')
         sam_stats = [item for item in interpolation_stats if item.get('interpolation_backend') == 'sam']

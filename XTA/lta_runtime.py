@@ -383,6 +383,7 @@ def build_lta_run_plan(
     volume_plans = []
     from .unification.sampling import build_forward_raster_plan
     from .unification.tta_manifest import radial_view_plan_metadata, spherical_view_plan_metadata
+    from .unification.geometry_identity import geometry_recipe_metadata
     for volume in discovery.target_volumes:
         if volume.width is None or volume.height is None:
             raise RuntimeError(
@@ -444,6 +445,7 @@ def build_lta_run_plan(
                     "source_shape_tyx": list(shape),
                     "channel_policy": LTA_CHANNEL_POLICY,
                     "runtime_kind": "fullframe_sam",
+                    **geometry_recipe_metadata(physical),
                     **radial_view_plan_metadata(physical),
                     **spherical_view_plan_metadata(physical),
                 },

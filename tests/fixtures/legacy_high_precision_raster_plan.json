@@ -1,0 +1,113 @@
+{
+  "schema_version": "v18.raster-plan.spawn-spec.1",
+  "plan_digest": "69bbc9538d720c46a63f29e1f8760cfccaae76cd47b9ffdaf263f3864a8e3fbd",
+  "sampling_policy_digest": "fc75c645eb72d2ef0e609f5b342a52f20adfa7be0b7e3aa64d34ad87d818ee14",
+  "plan": {
+    "schema_version": "v18.raster-plan.1",
+    "mode": "tta",
+    "physical_view_id": "transverse",
+    "in_plane_variant": {
+      "variant_id": "a12p3457",
+      "angle_deg": 12.345671
+    },
+    "channel_variant": {
+      "layout": {
+        "token": "gray",
+        "kind": "gray",
+        "channel_count": 1,
+        "stride": 1,
+        "offsets": [
+          0
+        ]
+      },
+      "direction": "ascending",
+      "offsets": [
+        0
+      ]
+    },
+    "sampling_policy": {
+      "policy_id": "xta.forward_sampling",
+      "policy_version": 23,
+      "coordinate_convention": "gray8_t_y_x_frame_index; destination-pixel-center to source; azimuthal [0,180) index wrap with odd-crossing radius-axis mirror; radial radius stacks at fixed patch origins with periodic azimuth; spherical radius stacks on six equal-area QSC faces with fixed outer-radius endpoint-inclusive grids and canonical rotated-cube orientation",
+      "stage_order": [
+        "physical_view_extraction",
+        "radial_periodic_patch_extraction",
+        "spherical_qsc_face_patch_extraction",
+        "in_plane_affine_and_output_resize",
+        "channel_addressing",
+        "dense_tile_transform"
+      ],
+      "role_kernels": {
+        "categorical_ground_truth": "nearest categorical taps; tilted stack blend threshold >=0.5",
+        "intensity": "backend-registered TTA intensity sampler"
+      },
+      "role_boundaries": {
+        "categorical_ground_truth": "same coordinate boundary with categorical outside value zero",
+        "intensity": "TTA family-specific boundary; azimuthal seam index-wrap+mirror-u; radial periodic azimuth, radius channel clamp, unsheared height padding zero and zero-extended source taps; spherical radius channel clamp within one face-patch trajectory, inclusive face edges, outside-face patch padding zero, and zero-extended source taps"
+      },
+      "backend_implementations": [
+        {
+          "backend": "cpu",
+          "implementation": "XTA.geometry.render_categorical_frame_on_grid@v18; nearest categorical sampling",
+          "roles": [
+            "categorical_ground_truth"
+          ],
+          "exact": true,
+          "absolute_tolerance": 0.0,
+          "relative_tolerance": 0.0
+        },
+        {
+          "backend": "cpu",
+          "implementation": "XTA.geometry.render_intensity_frame_on_grid@v18; OpenCV linear affine/resize and TTA hardware-linear azimuthal tables",
+          "roles": [
+            "intensity"
+          ],
+          "exact": true,
+          "absolute_tolerance": 0.0,
+          "relative_tolerance": 0.0
+        },
+        {
+          "backend": "cuda",
+          "implementation": "XTA.cuda_backend TTA resident/direct-ring forward renderer@v18",
+          "roles": [
+            "intensity"
+          ],
+          "exact": false,
+          "absolute_tolerance": 1.0,
+          "relative_tolerance": 0.0
+        },
+        {
+          "backend": "cuda",
+          "implementation": "XTA.pta_cuda_masks resident categorical renderer; fused foreground/coverage nearest sampling with zero outside boundary; tilted stack blend threshold >=0.5; spatial parity qualified separately at boundaries",
+          "roles": [
+            "categorical_ground_truth"
+          ],
+          "exact": false,
+          "absolute_tolerance": 1.0,
+          "relative_tolerance": 0.0
+        }
+      ]
+    },
+    "output_shape": [
+      16,
+      16
+    ],
+    "tile_layout": null,
+    "metadata": {
+      "runtime_job_id": "a12p3457",
+      "runtime_kind": "fullframe",
+      "runtime_view_id": "transverse__tta_a12p3457"
+    }
+  },
+  "geometry_quality_requests": {
+    "fast_geometry_requested": false,
+    "cpu_spherical_compiled_requested": true,
+    "gpu_radial_column_geometry_requested": false,
+    "gpu_spherical_fp32_requested": false,
+    "spherical_sampler_requested": "reference_fp64",
+    "spherical_fp32_max_axis": 4096,
+    "native_t_fusion": false,
+    "categorical_sampling": "unchanged_nearest",
+    "requested_not_actual_dispatch": true
+  }
+}

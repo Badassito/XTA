@@ -8,8 +8,9 @@ import pytest
 
 from tools import prepare_reconciliation_release as prepare
 from tools import verify_package_inventory as inventory
+from tools.source_archive_history import require_history_archive
 
-ARCHIVE = Path('C:\\Users\\Bry\\Documents\\ChatGPT\\Scratch\\Experiments\\SAM_Job150615_20261001\\unqualified_9af_review\\XTA_v25.0.0_complete_source.zip')
+ARCHIVE = require_history_archive('job150615_headroom', inventory.REVIEWED_V24_JOB150615_HEADROOM_DEVELOPMENT_PREDECESSOR_ARCHIVE_SHA256)
 KEY = 'v24_job150615_headroom_development_review'
 PREFIX = 'REVIEWED_V24_JOB150615_HEADROOM_DEVELOPMENT'
 
@@ -22,6 +23,7 @@ def reviewed():
     predecessor = json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
     predecessor.pop('v24_job150790_150798_throughput_development_review', None)
     predecessor.pop('v24_0_2_sam_bridges_development_review', None)
+    predecessor.pop('v24_1_0_sam_extrapolation_development_review', None)
     predecessor.pop('v24_job150772_performance_development_review', None)
     predecessor.pop('v24_0_1_release_review', None)
     predecessor.pop(KEY, None)

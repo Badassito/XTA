@@ -69,21 +69,44 @@ def write_fresh(path,value):
 def validate_recipe_proof(proof):
     """Reject false world-pixel or cap claims before sealing a numeric recipe."""
     if proof.get("schema") != "xta.sam_outer_crop_geometry/1":
-        return  # Literal tagged B0 uses a separately identified planner declaration.
+        if (proof.get('schema') is None and proof.get('variant') == 'B0'
+                and proof.get('geometry_identity') == 'literal_tagged_v25'
+                and isinstance(proof.get('planner_sha256'),str) and len(proof['planner_sha256']) == 64
+                and all(letter in '0123456789abcdef' for letter in proof['planner_sha256'])):
+            return  # Explicit legacy literal-B0 planner declaration.
+        raise ValueError("Unsupported geometry proof schema or legacy declaration")
     if proof.get("recipe_sha256") != fingerprint({k:v for k,v in proof.items() if k!="recipe_sha256"}):
         raise ValueError("Numeric geometry proof fingerprint changed")
     for key in ("planner_group_bytes","planner_total_bytes","policy_topology_bytes"):
         if proof["caps"][key] != CAP_BYTES:
             raise ValueError("Geometry recipe changed the common research caps")
+    if type(proof['total_charged_contract_bytes']) is not int or proof['total_charged_contract_bytes']<0:
+        raise ValueError("Geometry proof has invalid total charged contract bytes")
     if proof["total_charged_contract_bytes"] > CAP_BYTES:
         raise ValueError("Complete recipe exceeds the total research cap")
+    identities=set();planned_count=refused_count=charged_total=0
     for group in proof["groups"]:
+        identity=group.get('group_id')
+        if not isinstance(identity,str) or not identity or identity in identities:
+            raise ValueError("Geometry proof requires a unique complete group inventory")
+        identities.add(identity)
         if group.get("status") == "refused":
+            refused_count+=1
             if not group.get("refusal_reasons"):
                 raise ValueError("Refused family lacks explicit reasons")
-            if group.get("retained_contract_bytes",0) != 0:
+            if type(group.get('retained_contract_bytes',0)) is not int or group.get("retained_contract_bytes",0) != 0:
                 raise ValueError("Refused family claims retained model geometry")
             continue
+        if group.get('status','planned') != 'planned':
+            raise ValueError("Unsupported geometry group status")
+        planned_count+=1
+        charge=group['charged_contract_bytes']
+        retained=group.get('retained_contract_bytes',charge)
+        topology=group['topology_workspace_bytes']
+        if (any(type(value) is not int or value<0 for value in (charge,retained,topology))
+                or retained != charge):
+            raise ValueError("Geometry proof has invalid charged/retained contract bytes")
+        charged_total+=retained
         if not all(group["world_contracts_preserved"].values()):
             raise ValueError("Fixed world-coordinate contract support changed")
         if max(group["charged_contract_bytes"],group["topology_workspace_bytes"]) > CAP_BYTES:
@@ -94,11 +117,17 @@ def validate_recipe_proof(proof):
         before,after=group["tiles_before_yx"],group["tiles_after_yx"]
         if before[0] != after[0] or after[1] > before[1]+1:
             raise ValueError("Recipe exceeds the predeclared tile-growth bound")
-    if "original_family_count" in proof:
-        if proof["original_family_count"] != proof["planned_family_count"]+proof["refused_family_count"]:
-            raise ValueError("Family refusal denominator does not preserve the original inventory")
-        if proof["refused_family_count"] and proof.get("cohort_complete"):
-            raise ValueError("Refused families cannot imply a complete cohort")
+    for key,expected in (('original_family_count',len(identities)),('planned_family_count',planned_count),
+                         ('refused_family_count',refused_count)):
+        if key in proof and (type(proof[key]) is not int or proof[key]<0 or proof[key] != expected):
+            raise ValueError("Family refusal denominator/counts do not match the original group inventory")
+    total=proof['total_charged_contract_bytes']
+    if type(total) is not int or total<0 or total != charged_total:
+        raise ValueError("Total charged contract bytes do not match the retained group inventory")
+    if 'cohort_complete' in proof and type(proof['cohort_complete']) is not bool:
+        raise ValueError("Cohort completeness must be an explicit boolean")
+    if proof.get('cohort_complete') and (refused_count or proof.get('baseline_plan_status')=='unresolved'):
+        raise ValueError("Refused/unresolved families cannot imply a complete cohort")
     if proof["variant"] == "A2" and any(not run.get("raw_reuse_parent_run_id") for run in proof["runs"]):
         raise ValueError("A2 lacks exact C2 raw-lineage reuse")
 
@@ -112,11 +141,14 @@ def validate_recipe_publication(path,constants_sha256):
     if document.get("schema") == "xta.sam_outer_crop_geometry/1":
         validate_recipe_proof(document)
         return document
+    if document.get('schema') != 'xta.outer_crop_research_recipes/1':
+        raise ValueError("Unsupported geometry recipe publication schema")
     for record in document.get("entries",document.get("records",())):
         if record.get("status") in {"refused","censored","unresolved","resource_refused"}:
             if not record.get("refusals") and not record.get("reasons"):
                 raise ValueError("Refused geometry must retain explicit reasons")
-            continue
+            # A recorded refusal is valid, but cannot hide an inconsistent or
+            # missing numeric proof when it explicitly links one.
         if record.get("proof_file"):
             proof_path=Path(record["proof_file"])
             if not proof_path.is_absolute():proof_path=Path(path).parent/proof_path

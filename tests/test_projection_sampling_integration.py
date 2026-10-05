@@ -22,6 +22,7 @@ from XTA.interpolation import write_raw_bbox_mask_store
 from XTA.unification.context import activate_unified_launch
 from XTA.unification.runtime import compile_physical_views
 from XTA.unification.sampling import build_forward_raster_plan
+from XTA.unification.geometry_identity import geometry_recipe_metadata
 from XTA.unification.tta_manifest import (
     build_tta_run_manifest,
     projection_sampling_record,
@@ -196,7 +197,10 @@ class ProjectionSamplingIntegrationTests(unittest.TestCase):
             mode='tta', physical_view_id=g.physical_view_name(dense), angle_deg=0.0,
             channel_token='gray', channel_kind='gray', channel_count=1, channel_stride=1,
             channel_offsets=(0,), channel_direction='ascending', output_shape=(32, 32), metadata=old_metadata)
-        self.assertEqual(dense_plan.digest, old_plan.digest)
+        self.assertNotEqual(dense_plan.digest, old_plan.digest)
+        expected = replace(old_plan, metadata={**old_metadata, **geometry_recipe_metadata(dense, affine)})
+        self.assertEqual(dense_plan.canonical_record(), expected.canonical_record())
+        self.assertEqual(dense_plan.digest, expected.digest)
         self.assertNotEqual(dense_plan.digest, coverage_plan.digest)
         self.assertNotIn('projection_sampling', dict(dense_plan.metadata))
         self.assertIn('projection_sampling', dict(coverage_plan.metadata))

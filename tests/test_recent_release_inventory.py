@@ -103,7 +103,8 @@ def test_v23_0_5_predecessor_pin_is_the_tagged_v23_0_4_inventory(complete_manife
                                   'v24_job150615_development_review', 'v24_job150615_headroom_development_review',
                                   'v24_0_1_release_review', 'v24_job150772_performance_development_review',
                                   'v24_job150790_150798_throughput_development_review',
-                                  'v24_0_2_sam_bridges_development_review')}
+                                  'v24_0_2_sam_bridges_development_review',
+                                  'v24_1_0_sam_extrapolation_development_review')}
     assert _digest(predecessor) == inventory.REVIEWED_V23_0_5_RELEASE_PREDECESSOR_SHA256
     assert PENDING_V23_0_5.predecessor_commit == '654e7c8572d925e00a1a597b780e34e224cd31c1'
 
@@ -131,6 +132,8 @@ def current_trees(complete_manifest):
         'v24_job150790_150798_throughput_development_review', {}).get('module_snapshots', ()))
     modules.update(item['module'] for item in complete_manifest.get(
         'v24_0_2_sam_bridges_development_review', {}).get('module_snapshots', ()))
+    modules.update(item['module'] for item in complete_manifest.get(
+        'v24_1_0_sam_extrapolation_development_review', {}).get('module_snapshots', ()))
     return {
         module: ast.parse(path.read_text(encoding='utf-8'))
         for module in modules
@@ -142,6 +145,7 @@ def _at_release(complete_manifest, release):
     manifest = copy.deepcopy(complete_manifest)
     manifest.pop('v24_job150790_150798_throughput_development_review', None)
     manifest.pop('v24_0_2_sam_bridges_development_review', None)
+    manifest.pop('v24_1_0_sam_extrapolation_development_review', None)
     manifest.pop('v24_job150772_performance_development_review', None)
     manifest.pop('v24_0_1_release_review', None)
     manifest.pop('v24_job150615_headroom_development_review', None)
@@ -159,7 +163,8 @@ def _development_successors(complete_manifest):
         'v24_job150615_headroom_development_review', 'v24_0_1_release_review',
         'v24_job150772_performance_development_review',
         'v24_job150790_150798_throughput_development_review',
-        'v24_0_2_sam_bridges_development_review') if key in complete_manifest)
+        'v24_0_2_sam_bridges_development_review',
+        'v24_1_0_sam_extrapolation_development_review') if key in complete_manifest)
 
 
 @pytest.mark.parametrize('release', RELEASES, ids=lambda item: item.number)
@@ -325,6 +330,7 @@ def test_semantic_release_identifies_new_model_and_qualification_tools(complete_
 def test_retired_geometry_helper_keeps_authenticated_predecessor(complete_manifest, mutation, message):
     altered = copy.deepcopy(complete_manifest)
     altered.pop('v24_0_2_sam_bridges_development_review', None)
+    altered.pop('v24_1_0_sam_extrapolation_development_review', None)
     altered.pop('v24_job150790_150798_throughput_development_review', None)
     altered.pop('v24_job150772_performance_development_review', None)
     altered.pop('v24_0_1_release_review', None)
@@ -354,6 +360,7 @@ def test_retired_geometry_helper_keeps_authenticated_predecessor(complete_manife
 def test_cleanup_retirements_require_independent_scope_and_exact_predecessor(complete_manifest):
     altered = copy.deepcopy(complete_manifest)
     altered.pop('v24_0_2_sam_bridges_development_review', None)
+    altered.pop('v24_1_0_sam_extrapolation_development_review', None)
     altered.pop('v24_job150790_150798_throughput_development_review', None)
     altered.pop('v24_job150772_performance_development_review', None)
     altered.pop('v24_0_1_release_review', None)

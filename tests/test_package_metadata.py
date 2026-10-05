@@ -18,7 +18,7 @@ from XTA import cli, config
 ROOT = Path(__file__).resolve().parents[1]
 CURRENT_VERSION = XTA.__version__
 CURRENT_LAUNCHER = f"GPT-6-Astra-Ultra_v{CURRENT_VERSION}_SLURM.py"
-PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v24.0.1_SLURM.py"
+PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v24.0.2_SLURM.py"
 SCRATCH_REPORTS = (
     "TTA_EXTERNAL_AUGMENTATION.md",
     "TTA_TEST_CLI_AUDIT.md",

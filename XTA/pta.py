@@ -1895,6 +1895,8 @@ def build_render_plan(
     publish_images: bool = True,
     publish_labels: bool = True,
 ) -> RenderPlan:
+    from .unification.geometry_identity import geometry_recipe_metadata
+
     images_dir = out_dir / "images"
     labels_dir = out_dir / "labels"
     overlays_dir = out_dir / "overlays"
@@ -1935,6 +1937,7 @@ def build_render_plan(
                 "runtime_view_id": str(view.name),
                 "runtime_job_id": str(tag),
                 "runtime_kind": "fullframe",
+                **geometry_recipe_metadata(view.shared_view, aff),
                 **radial_view_plan_metadata(view.shared_view),
                 **spherical_view_plan_metadata(view.shared_view),
             },
@@ -2003,6 +2006,7 @@ def build_render_plan(
                         "tile_config_id": str(cfg.config_id),
                         "tile_x": int(x),
                         "tile_y": int(y),
+                        **geometry_recipe_metadata(view.shared_view, shared_job if shared_job is not None else aff),
                         **radial_view_plan_metadata(view.shared_view),
                         **spherical_view_plan_metadata(view.shared_view),
                     },
@@ -4395,7 +4399,22 @@ def write_v18_output_sentinel(out_dir: Path) -> Path:
     )
 
 
-def clean_generated_output_dirs(out_dir: Path) -> None:
+def invalidate_v18_pta_completion(out_dir: Path) -> Path:
+    """Replace prior completion before any published artifact is removed."""
+    output = Path(out_dir).resolve(strict=False)
+    return write_json_manifest(
+        output / "manifest.json",
+        {
+            "schema": "pta-tta.v21.manifest.1",
+            "status": "in_progress",
+            "pipeline_version": SCRIPT_VERSION,
+            "mode": "pta",
+            "outputs": {"paths": {"root": str(output)}},
+        },
+    )
+
+
+def clean_generated_output_dirs(out_dir: Path, *, preserve_manifest: bool = False) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     with _CREATED_OUTPUT_DIRS_LOCK:
         _CREATED_OUTPUT_DIRS.clear()
@@ -4404,6 +4423,8 @@ def clean_generated_output_dirs(out_dir: Path) -> None:
         if path.exists():
             shutil.rmtree(path)
     for name in _GENERATED_OUTPUT_FILE_NAMES:
+        if preserve_manifest and name == "manifest.json":
+            continue
         path = out_dir / name
         if path.exists():
             path.unlink()
@@ -5173,8 +5194,11 @@ def main(
             else None
         ),
     )
-    clean_generated_output_dirs(out_dir)
+    # Establish ownership before the live marker so an interrupted first run
+    # remains restartable. Failed invalidation must prevent all artifact deletion.
     write_v18_output_sentinel(out_dir)
+    invalidate_v18_pta_completion(out_dir)
+    clean_generated_output_dirs(out_dir, preserve_manifest=True)
 
     labels_available = all(spec.label_source in {"yolo", "nrrd"} and spec.volume_class != "unlabeled" for spec in specs)
     create_output_dirs(

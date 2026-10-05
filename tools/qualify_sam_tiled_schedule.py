@@ -138,6 +138,8 @@ def evidence_snapshot(path):
     from XTA.sam_evidence import SamEvidenceBundle
 
     bundle = SamEvidenceBundle.open(path)
+    if not bundle.manifest.get('complete'):
+        raise ValueError("Scheduling comparison requires complete generated evidence")
     masks = {}
     for key in sorted(bundle.records):
         mask = bundle.mask(key)
@@ -184,7 +186,8 @@ def _plain(value):
 
 def collect_trial(runroot):
     report = json.loads((runroot / "qualification.json").read_text())
-    if report.get("status") != "passed" or report.get("unsettled_sam_workers"):
+    if (report.get("status") != "passed" or report.get("unsettled_sam_workers")
+            or report.get('context_closed') is not True or report.get('gpu_leases_released') is not True):
         raise ValueError("Scheduling trial did not settle the qualified production seam")
     scopes = [("parent", report["parent_stats"])]
     scopes.extend((f"consolidated_{index:02d}", value)
@@ -192,12 +195,17 @@ def collect_trial(runroot):
     snapshots, timings = {}, {}
     for name, stats in scopes:
         if not stats.get("sam_evidence_path"):
-            continue
+            if (name != 'parent' and type(stats.get('planner_plan_count')) is int
+                    and stats['planner_plan_count'] == 0):
+                continue  # Explicitly empty consolidated planning scope.
+            raise ValueError(f"Scheduling comparison is missing generated evidence for {name}")
         snapshots[name] = evidence_snapshot(stats["sam_evidence_path"])
         timings[name] = {key: stats.get(key) for key in (
             "planner_wall_seconds", "observation_snapshot_wall_seconds", "sam_tracker_wall_seconds",
             "sam_policy_wall_seconds", "generator_wall_seconds")}
     added = np.load(runroot / "online_selected_additions.npy", allow_pickle=False)
+    if added.ndim != 3 or not np.isin(added, (0, 1)).all():
+        raise ValueError("Scheduling comparison requires binary selected parent additions")
     return dict(scopes=snapshots, selected_parent_additions=dict(shape=list(added.shape),
         foreground=int(added.sum()), decoded_sha256=hashlib.sha256(np.ascontiguousarray(added).tobytes()).hexdigest()),
         startup_seconds=float(report["context_runtime"]["start_seconds"]),
@@ -207,9 +215,20 @@ def collect_trial(runroot):
 
 
 def compare_trials(trials):
-    if len(trials) != 4 or [trial["slot"] for trial in trials] != [row[0] for row in TRIALS]:
+    if (len(trials) != 4 or [(trial.get('slot'), trial.get('schedule'), trial.get('repeat'))
+            for trial in trials] != list(TRIALS)
+            or any(type(trial.get('repeat')) is not int for trial in trials)):
         raise ValueError("Qualification requires the complete A1 B1 B2 A2 matrix")
     reference = trials[0]["result"]
+    for trial in trials:
+        scopes = trial['result'].get('scopes', {})
+        if not scopes or 'parent' not in scopes:
+            raise ValueError("Scheduling comparison requires the generated parent evidence scope")
+        for snapshot in scopes.values():
+            content = snapshot.get('content', {})
+            if not all(isinstance(content.get(key), dict) and content[key]
+                       for key in ('masks', 'parents', 'children')):
+                raise ValueError("Scheduling comparison has incomplete generated masks/parent/child inventory")
     for trial in trials[1:]:
         candidate = trial["result"]
         if set(reference["scopes"]) != set(candidate["scopes"]):
@@ -219,9 +238,40 @@ def compare_trials(trials):
                 raise AssertionError(f"Scheduling changed raw/owned/candidate masks, geometry, or scores in {scope}")
         if reference["selected_parent_additions"] != candidate["selected_parent_additions"]:
             raise AssertionError("Scheduling changed selected parent bridge support")
+    for trial in trials:
+        if not trial.get('output'):
+            raise ValueError("Scheduling comparison requires persisted trial artifacts")
+        current = collect_trial(Path(trial['output']))
+        saved = trial['result']
+        if set(current['scopes']) != set(saved['scopes']):
+            raise AssertionError("Persisted trial artifacts changed the evidence scopes")
+        for scope in current['scopes']:
+            for key in ('content', 'content_sha256'):
+                if current['scopes'][scope][key] != saved['scopes'][scope].get(key):
+                    raise AssertionError(f"Persisted trial artifacts changed raw/owned/candidate masks or scores in {scope}")
+        if current['selected_parent_additions'] != saved['selected_parent_additions']:
+            raise AssertionError("Persisted trial artifacts changed selected parent additions")
     return dict(exact_all_child_raw_owned_candidate_availability_masks=True,
                 exact_all_child_object_scores=True, exact_selected_parent_additions=True,
-                compared_trial_slots=[trial["slot"] for trial in trials], accuracy_claim=False)
+                compared_trial_slots=[trial["slot"] for trial in trials], artifact_coverage_verified=True,
+                qualification_claim=False, accuracy_claim=False)
+
+
+def validate_comparison_fixture(fixture_path, report):
+    """Authenticate the saved source identities without executing a GPU seam."""
+    if file_sha(fixture_path) != report.get('fixture_sha256'):
+        raise ValueError("Scheduling comparison fixture identity differs")
+    fixture = json.loads(Path(fixture_path).read_text())
+    for path_key, hash_key, report_key in (('image_path', 'image_sha256', 'image_sha256'),
+            ('parent_observations', 'parent_observations_sha256', 'observations_sha256')):
+        if (file_sha(fixture[path_key]) != fixture[hash_key]
+                or fixture[hash_key] != report.get(report_key)):
+            raise ValueError("Scheduling comparison source image/observation identity differs")
+    for trial in report['trials']:
+        actual = json.loads((Path(trial['output']) / 'qualification.json').read_text())
+        if (actual.get('image_sha256') != fixture['image_sha256']
+                or actual.get('original_input_sha256') != fixture['parent_observations_sha256']):
+            raise ValueError("Scheduling trial references a different source fixture")
 
 
 def prepare_fixture_copy(fixture_path, output):
@@ -256,9 +306,20 @@ def main(argv=None):
     report_path = args.output / "schedule_qualification.json"
     if args.compare_only:
         report = json.loads(report_path.read_text())
-        report["exact_comparison"] = compare_trials(report["trials"])
-        report["status"] = "passed"
-        report_path.write_text(json.dumps(report, indent=2))
+        report.pop('exact_comparison', None)
+        report.update(comparison_status='incomplete', comparison_helper_sha256=file_sha(__file__))
+        try:
+            comparison = compare_trials(report['trials'])
+            validate_comparison_fixture(args.fixture, report)
+            report.update(exact_comparison=comparison, comparison_status='passed')
+            report.pop('comparison_error', None)
+        except Exception as error:
+            report.pop('exact_comparison', None)
+            report.update(comparison_status='failed', comparison_error=str(error))
+            raise
+        finally:
+            # Existing execution/qualification failure and its error stay intact.
+            report_path.write_text(json.dumps(report, indent=2))
         return 0
     if args.model is None or args.heatsoak_receipt is None or not args.heatsoak_receipt.is_file():
         parser.error("GPU run requires --model and an existing --heatsoak-receipt from its operator")
@@ -297,6 +358,7 @@ def main(argv=None):
             report["trials"].append(trial)
             report_path.write_text(json.dumps(report, indent=2))
         report["exact_comparison"] = compare_trials(report["trials"])
+        report['comparison_status'] = 'passed'
         report["status"] = "passed"
     except BaseException as error:
         report.update(status="failed", error_type=type(error).__name__, error=str(error))

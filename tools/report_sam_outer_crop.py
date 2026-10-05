@@ -47,14 +47,19 @@ def analysis_data(root, constants):
         return None
     aliases = {"development":"development_seen655", "source_590_599":"followup_594", "source_686_695":"followup_690"}
     specs = {entry["dataset_id"]:entry for entry in constants.get("datasets",[])}
-    result = {"schema":"xta.sam_outer_crop_report_data/1","status":index.get("status","analysis_available"),"datasets":[],"sources":[{"path":"analysis_index.json"}]}
+    result = {"schema":"xta.sam_outer_crop_report_data/1","status":index.get("status","analysis_available"),"datasets":[],"sources":[{"path":"analysis_index.json"}],"missing_analysis_ids":[]}
     for entry in index.get("entries",[]):
+        identifier = entry["dataset_id"]
+        spec = specs.get(aliases.get(identifier,identifier),{})
         path = resolve(root,entry["analysis_file"])
         analysis = read_json(path)
         if analysis is None:
+            result['missing_analysis_ids'].append(identifier)
+            result['datasets'].append(dict(id=identifier,title=spec.get('dataset_id',identifier),
+                scope=spec.get('stage','unreported'),exposure=entry.get('exposure','unreported'),
+                analysis_available=False,status='missing_analysis',analysis_file=str(path),
+                results=[],common_results=[],models=[],dataset_spec=spec,sources=[{'path':str(path)}]))
             continue
-        identifier = entry["dataset_id"]
-        spec = specs.get(aliases.get(identifier,identifier),{})
         rows=[];common_rows=[]
         for model in analysis.get("models",[]):
             for key in ('selection_file','timing_source','preview_file'):
@@ -77,7 +82,7 @@ def analysis_data(root, constants):
                         "metric_availability":domain.get("metric_availability"),"known_coverage_fraction":domain.get("known_coverage_fraction"),
                         "refusal_reasons":domain.get("refused_overlap_ids",[]),"cohort":counts,"timing_source":model.get("timing_source"),"timing":model.get("timing"),
                         "evidence_file":model.get("evidence_file"),"selection_file":model.get("selection_file")})
-        result["datasets"].append({"id":identifier,"title":spec.get("dataset_id",identifier),
+        result["datasets"].append({"id":identifier,"title":spec.get("dataset_id",identifier),"analysis_available":True,
             "scope":spec.get("stage",str(analysis.get("dataset","unreported"))),
             "exposure":entry.get("exposure",analysis.get("exposure",constants.get("exposure",{}))),
             "results":rows,"common_results":common_rows,"common_surviving_lineage_count":analysis.get('common_surviving_lineage_count'),
@@ -85,6 +90,9 @@ def analysis_data(root, constants):
             "label_file":analysis.get("label_file",analysis.get("label")),"label_sha256":analysis.get("label_sha256"),
             "sources":[{"path":str(path),"label":"Authoritative stage analysis"}]})
         result["sources"].append({"path":str(path)})
+    if result['missing_analysis_ids']:
+        result['upstream_status'] = result['status']
+        result['status'] = 'incomplete'
     return result
 
 
@@ -240,8 +248,22 @@ def build(args):
     data_path=args.data or root/"report_data.json"
     constants=read_json(root/"protocol_constants.json",{})
     data=read_json(data_path)
+    indexed=analysis_data(root,constants)
     if data is None:
-        data=analysis_data(root,constants) or {"schema":"xta.sam_outer_crop_report_data/1","status":"awaiting_actual_model_results","datasets":[],"sources":[]}
+        data=indexed or {"schema":"xta.sam_outer_crop_report_data/1","status":"awaiting_actual_model_results","datasets":[],"sources":[]}
+    elif indexed is not None:
+        # A normalized view cannot silently omit or replace unavailable indexed
+        # evidence with saved metrics. Keep every authoritative indexed ID.
+        datasets={dataset['id']:dataset for dataset in data.get('datasets',[])}
+        for dataset in indexed['datasets']:
+            if dataset.get('analysis_available') is False or dataset['id'] not in datasets:
+                datasets[dataset['id']]=dataset
+        data['datasets']=list(datasets.values())
+        data.setdefault('sources',[]).extend(indexed['sources'])
+        data['missing_analysis_ids']=indexed['missing_analysis_ids']
+        if indexed['missing_analysis_ids']:
+            data['upstream_status']=data.get('status','unreported')
+            data['status']='incomplete'
     extraction=read_json(root/"extraction.json",{})
     planner=read_json(root/"planner_validation.json",{})
     scheduling=read_json(root/"scheduler_abba/summary.json",{})
@@ -279,6 +301,8 @@ def build(args):
         title=escape(dataset.get("title",dataset.get("id","Unnamed stage")))
         exposure=escape(dataset.get("exposure","Prior exposure not yet reported; do not infer a pristine holdout."))
         description=escape(dataset.get("scope","No scope supplied"))
+        if dataset.get('analysis_available') is False:
+            description += ' — Required indexed analysis is missing; its metrics are unavailable.'
         cohort = dataset.get("cohort",{})
         cohort_rows = [[escape(name.replace('_',' ')),escape(value)] for name,value in cohort.items()]
         cohort_html = table(['Cohort scope','Recorded value'],cohort_rows) if cohort_rows else '<p class="small">Cohort completeness has not been reported; no complete-cohort claim is inferred.</p>'
@@ -329,7 +353,7 @@ def build(args):
     for window in extraction.get('windows',[]):
         windows.append([escape(window['window_full_source_half_open']),str(window['middle_full_source_frame']),escape(window['endpoint_full_source_frames']),
                         'Exact retained pixel match' if window['middle_pixel_match_exact'] else 'Pixel mismatch'])
-    available={dataset['id']:dataset for dataset in data.get('datasets',[])}
+    available={dataset['id']:dataset for dataset in data.get('datasets',[]) if dataset.get('analysis_available',True)}
     aliases={'development_seen655':'development','followup_594':'source_590_599','followup_690':'source_686_695'}
     stage_rows=[[escape(spec['dataset_id']),escape(spec.get('stage','unreported')),escape(spec.get('middle_full_source_frame','unreported')),
                  'Actual scored outputs available' if aliases.get(spec['dataset_id'],spec['dataset_id'])in available else 'No scored analysis published yet']
@@ -355,6 +379,7 @@ def build(args):
     unique={str(item['path']):item for item in sources}
     summary={'schema':'xta.sam_outer_crop_report/1','status':data.get('status','unreported'),'generated_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'baseline_commit':planner.get('release_baseline'),'datasets':data.get('datasets',[]),'planner_validation':planner,'scheduling':scheduling,
+        'missing_analysis_ids':data.get('missing_analysis_ids',[]),'upstream_status':data.get('upstream_status'),
         'oracle':None if not oracle else {'frame':oracle['frame'],'frame_selection':oracle['frame_selection'],'metadata':oracle['metadata']},
         'sources':[{'path':path,'sha256':file_sha(resolve(root,path))} for path in unique if resolve(root,path).is_file()]}
     output.with_suffix('.metrics.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')

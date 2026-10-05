@@ -16,7 +16,8 @@ import threading
 
 import numpy as np
 
-from .sam_evidence import SamEvidenceBundle, _decode_mask, _freeze, _plain
+from .sam_evidence import (SamEvidenceBundle, _decode_mask, _decode_raw_crop_boundary_contacts_with_foreground,
+    native_output_shape_tyx, _freeze, _plain)
 from . import sam_filtering as _filtering
 
 _SOURCE_PATH = Path(__file__).resolve()
@@ -107,6 +108,7 @@ class SamMaskReader:
         self._stats = dict(max_cache_bytes=self.max_cache_bytes, cache_bytes=0, peak_cache_bytes=0,
             cache_hits=0, cache_misses=0, cache_evictions=0, oversized_products=0,
             mask_decodes=0, filter_computations=0, effective_candidate_computations=0,
+            packed_boundary_contact_scans=0,
             filter_spec_validations=0, integrity_checks=0, transaction_complete=False,
             implementation_sha256=IMPLEMENTATION_SHA256)
 
@@ -240,6 +242,37 @@ class SamMaskReader:
     def raw_mask(self, run_id, frame):
         return self.mask(self.runs[str(run_id)]["raw_mask_keys"][str(int(frame))])
 
+    def raw_crop_boundary_contacts(self, run_id, frame, *, crop_bbox_yx=None, canvas_shape_yx=None):
+        """Verify full packed evidence, then read only four raw crop edges."""
+        return self.raw_crop_boundary_contacts_with_foreground(run_id, frame,
+            crop_bbox_yx=crop_bbox_yx, canvas_shape_yx=canvas_shape_yx)[0]
+
+    def raw_crop_boundary_contacts_with_foreground(self, run_id, frame, *,
+            crop_bbox_yx=None, canvas_shape_yx=None):
+        """Reuse one validated raw census for contacts and raw-only empty stopping."""
+        run_id, frame = str(run_id), int(frame)
+        run = self.runs[run_id]
+        if run.get('generation_mode') == 'tiled' or run.get('tile_evidence'):
+            raise ValueError('Tiled raw contacts require the dense overlapping halo union')
+        group = self.groups[str(run['group_id'])]
+        shape = native_output_shape_tyx(self)
+        box = tuple(group['context_bbox_yx'])
+        if crop_bbox_yx is not None and tuple(crop_bbox_yx) != box:
+            raise ValueError('Raw SAM contact crop differs from the caller\'s original planned geometry')
+        if canvas_shape_yx is not None and tuple(canvas_shape_yx) != shape[1:]:
+            raise ValueError('Raw SAM contact canvas differs from the caller\'s original planned geometry')
+        key = run['raw_mask_keys'][str(frame)]
+        def census():
+            self._stats['packed_boundary_contact_scans'] += 1
+            contacts, foreground = _decode_raw_crop_boundary_contacts_with_foreground(self._stream, self.records[key],
+                self.bundle.max_mask_bytes, box, shape[1:])
+            return json.dumps(dict(contacts=contacts, foreground=foreground),
+                separators=(',', ':'), allow_nan=False).encode('utf-8')
+        encoded = self._product(('raw_crop_boundary_contacts_with_foreground', self.evidence_fingerprint,
+            key, box, tuple(shape[1:])), census)
+        decoded = json.loads(encoded)
+        return decoded['contacts'], decoded['foreground']
+
     def candidate_mask(self, run_id, frame):
         return self.mask(self.runs[str(run_id)]["candidate_mask_keys"][str(int(frame))])
 
@@ -310,6 +343,51 @@ class SamMaskReader:
             branch = validate_branch_selection(value, self, mask_filter_sha256=None if snapshot.spec is None else snapshot.spec['sha256'])
             object.__setattr__(snapshot, 'branch_selection', branch)
             return snapshot
+
+    def _branch_filter_overlay(self, prefix, recipe, *, max_index_bytes):
+        """Validate a new chunk and share this transaction's immutable prefix.
+
+        The index allowance is caller-admitted topology slack, not permission
+        from receipt metadata. Insufficient slack uses the former full merge
+        and validation path. That path has the same three metadata owners as
+        before: retained prefix, mutable merge, frozen snapshot. Neither result
+        retains the old prefix's indexes; replacing the caller's accepted
+        snapshot retires them, while immutable packed records may be shared.
+        """
+        with self._lock:
+            self._require_active()
+            if not isinstance(prefix, _FilterSnapshot) or prefix.owner is not self._identity:
+                raise ValueError('SAM filter snapshots belong to one reader transaction')
+            if isinstance(max_index_bytes, bool) or not isinstance(max_index_bytes, int) or max_index_bytes < 0:
+                raise ValueError('SAM branch index allowance must be a nonnegative integer')
+            from .sam_branch_selection import (validate_branch_selection,
+                _validated_branch_overlay, merge_connected_edge_selections)
+            incoming = validate_branch_selection(dict(branch_selection=recipe), self,
+                mask_filter_sha256=None if prefix.spec is None else prefix.spec['sha256'])
+            if incoming is None:
+                raise ValueError('SAM branch overlay requires a complete branch recipe')
+            branch = _validated_branch_overlay(prefix.branch_selection, incoming,
+                max_index_bytes=max_index_bytes)
+            if branch is None:
+                recipes = [value for value in (prefix.branch_selection, incoming) if value is not None]
+                merged = merge_connected_edge_selections(recipes)
+                # Retire the validated incoming copy before the full freeze;
+                # merged now owns its independent plain records.
+                del recipes, incoming
+                return self.filter_snapshot(dict(mask_filter=prefix, branch_selection=merged))
+            snapshot = object.__new__(_FilterSnapshot)
+            object.__setattr__(snapshot, 'owner', self._identity)
+            object.__setattr__(snapshot, 'spec', prefix.spec)
+            object.__setattr__(snapshot, 'branch_selection', branch)
+            return snapshot
+
+    def _branch_index_bytes(self, snapshot):
+        self._require_active()
+        if not isinstance(snapshot, _FilterSnapshot) or snapshot.owner is not self._identity:
+            raise ValueError('SAM filter snapshots belong to one reader transaction')
+        from .sam_branch_selection import _BranchPrefix
+        branch = snapshot.branch_selection
+        return branch.index_bytes if isinstance(branch, _BranchPrefix) else 0
 
     def _branch_selection(self, value, spec):
         if isinstance(value, Mapping) and isinstance(value.get('mask_filter'), _FilterSnapshot):

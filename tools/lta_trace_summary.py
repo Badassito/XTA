@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import sys
@@ -12,18 +13,19 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from XTA.lta_outputs import write_json_atomically
+from XTA.run_transport import telemetry_streams
 
 
 def summarize(directory: Path) -> dict[str, object]:
     streams = []
     partial_lines = 0
-    for path in sorted(Path(directory).glob('*.jsonl')):
+    for path, stream in telemetry_streams((directory,), lta=True):
         phases = {}
         open_phases = {}
         events = 0
         first_ns = last_ns = None
         metadata = {}
-        with path.open(encoding='utf-8') as handle:
+        with nullcontext(stream) as handle:
             for line in handle:
                 try:
                     record = json.loads(line)

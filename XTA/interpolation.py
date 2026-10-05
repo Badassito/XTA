@@ -3443,6 +3443,9 @@ class NrrdLayerRef:
     # Source reconciliation and global cleanup are later transactions. Their
     # result must never inherit the selected native proposal's topology claim.
     final_connection_survival: str = 'not_assessed'
+    # Extrapolated tails have single post-interpolation terminal seeds, not a
+    # paired bridge connection certificate or detector-confidence claim.
+    extrapolation_provenance: Dict[str, object] = field(default_factory=dict, compare=False)
 
 @dataclass(frozen=True)
 class NrrdRasterPlan:

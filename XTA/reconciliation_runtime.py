@@ -83,7 +83,8 @@ def union_nrrd_exports_can_overlap(layer_sink, assembled_union, *, policy, sourc
     return True
 
 
-def preflight_reconciliation(views, *, source_shape_tyx, processing_shape_tyx, settings, policy):
+def preflight_reconciliation(views, *, source_shape_tyx, processing_shape_tyx, settings, policy,
+                             include_extrapolation=False):
     """Check a conservative planned-view workspace before model inference begins."""
     from .reconciliation import voting_memory_plan
     from .reconciliation_geometry import section_descriptor
@@ -101,7 +102,8 @@ def preflight_reconciliation(views, *, source_shape_tyx, processing_shape_tyx, s
             key = (section_descriptor(metadata, geometry_context=context)['group_key']
                    if policy['grouping'] == 'sections' else metadata['physical_view_name'])
             groups.add(key)
-    plan = voting_memory_plan(source_shape_tyx, len(groups), settings.memory_mib, union_only=union_only)
+    plan = voting_memory_plan(source_shape_tyx, len(groups), settings.memory_mib,
+        union_only=union_only, include_extrapolation=include_extrapolation)
     if policy['island_weighting'] and not union_only:
         from .reconciliation_components import _plan_slabs
         _plan_slabs(source_shape_tyx, float(settings.memory_mib) * .8)
@@ -172,6 +174,10 @@ def _reconciliation_refs(refs, shape, *, needs_confidence):
             if metadata.get('interpolation_direction') not in {'forward', 'backward'}:
                 raise ValueError('SAM source reconciliation requires explicit view-native direction')
         evidence_role(metadata)
+        if metadata.get('mask_kind') == 'extrapolation':
+            tail = metadata.get('extrapolation_provenance') or {}
+            if tail.get('backend') != 'sam' or tail.get('direction') not in {'forward', 'backward'}:
+                raise ValueError('SAM extrapolation reconciliation requires explicit tail provenance')
         confidence = lookup_confidence_evidence(ref)
         if confidence is not None:
             if needs_confidence and tuple(confidence.shape) != shape:

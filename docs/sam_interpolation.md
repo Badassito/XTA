@@ -1,13 +1,13 @@
-# SAM interpolation in TTA
+# SAM interpolation and extrapolation in TTA
 
-Version 25.0.0 adds `--interpolation_backend sdf|sam`. The default is `sdf`.
-Choose one backend for a run. `sam` uses the local mask-conditioned LTA tracker
+`--interpolation_backend sdf|sam` selects interpolation, with `sdf` as the default.
+Choose one interpolation backend for a run. `sam` uses the local mask-conditioned LTA tracker
 to propose image-guided additions between detector observations. A rejected SAM
 proposal receives no SDF fallback. `both` is rejected during argument parsing.
 
-The tagged releases remain immutable. These notes describe the v25.0.2
-development candidate. Its source review and snapshot qualification are
-separate from a tagged release; see [the development audit workflow](../release/README.md).
+SAM extrapolation is independently enabled by `--extrapolation_distance` and
+can follow either interpolation backend. Source review and snapshot qualification
+are separate from a tagged release; see [the development audit workflow](../release/README.md).
 
 The current development SAM path supports all existing TTA view families:
 Transverse, Sagittal and Coronal, their tilted variants, Azimuthal views,
@@ -16,8 +16,8 @@ tile observations. Detector angle augmentation is inverted before accumulation,
 so SAM uses the canonical angle-zero canvas and retains the original detector
 angle as provenance. LTA remains Transverse-only; sharing its tracker does not
 extend LTA's supported views. SDF retains its existing iterative passes and layer
-decomposition. `--interpolation_distance 0` disables either configured backend
-and avoids initializing unused SAM assets.
+decomposition. `--interpolation_distance 0` disables interpolation. SAM assets
+are initialized only when SAM interpolation or extrapolation is active.
 
 Here, a native view means the active detector/working-view canvas. It
 includes TTA's existing processing-volume transform, including any stack
@@ -35,13 +35,97 @@ Spherical radius-frame order, remain clamped. There is no new fusion across
 radial arcs or spherical patches. These routes have focused CPU geometry tests;
 they do not constitute full GPU or cluster qualification for every orientation.
 
+## SAM extrapolation
+
+Extrapolation propagates a single initial mask outward from a remaining terminal
+after local interpolation. It has no opposite endpoint and no backend selector.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--extrapolation_distance` | `0` | Maximum additional native frames beyond the terminal; zero disables extrapolation |
+| `--extrapolation_walk_back` | `1` | Additional inward observations used as independent original-seeded runs; zero uses only the terminal |
+| `--extrapolation_min_radius` | `3` | Skip a terminal whose maximum inscribed radius is at or below this value; never filter predicted tails |
+
+Radius is measured in the current working canvas, with background padding around
+the terminal mask. Thin walk-back seeds remain eligible when their terminal passes.
+Walk-back history does not consume the outward distance. Each independent run
+receives exactly one original seed; subsequent observations are not injected.
+
+The pipeline freezes the cleaned detector masks plus accepted interpolation
+support for the local native scope before finding terminals. A terminal is a
+component with no continuation in the outward adjacent slice, including an early
+ending daughter. Already connected interpolation endpoints do not create tails.
+All seeds and plans are frozen before any tail is merged, so extrapolated masks
+cannot generate further extrapolation in the same pass.
+
+Propagation ends at the first **raw SAM-empty mask** or the effective distance
+horizon. It continues through unrelated observed objects. Their detector masks,
+bridges, or combined masks do not replace the SAM prediction, become new seeds,
+or terminate the run. Existing baseline pixels are subtracted only when publishing
+new support. A fully overlapped but nonempty prediction can therefore lead to new
+support in later slices. Scores, object-removal bookkeeping, radius, crop contact,
+area change, and overlap between consecutive masks do not add stopping rules.
+Missing or corrupt tracker evidence remains an infrastructure error.
+
+This subtraction and the added-voxel count refer to the native working canvas.
+Source restoration or low-resolution export can map a tail and a baseline pixel
+to the same source voxel, as with interpolation. A separate exported tail layer
+can therefore overlap source predictions even though its native additions were
+disjoint; the final union still combines those supports normally.
+
+Noncyclic views stop at the available native stack boundary. Azimuthal tails use
+the same mirrored half-turn addressing as interpolation and emit at most one
+unique native period excluding the terminal (`N - 1` frames). Receipts record
+requested and period-limited horizons; each run's planned output frames also
+record clipping at the available stack boundary. Walk-back frames remain separate from this
+emitted-tail limit, including when their native address is revisited later at a
+different unfolded phase.
+
+The current tracker generates the declared interval, then selection retains its
+empty-limited prefix. `generation_early_stop=False` makes this explicit: an early
+empty prediction limits output but does not yet save inference on later planned
+frames. Tiled runs test the retained raw halo union for emptiness and publish only
+attributable owned-core pixels. An unseeded tile is unknown coverage, not an empty
+SAM prediction.
+
+Evidence is stored under `OUTPUT/sam_extrapolation` with purpose
+`sam_extrapolation` and source stage `post_interpolation`. Directional output
+layers use the separate `extrapolation` role and record the terminal, seed,
+distance, radius gate, and selection identity. These are one-seed tails rather
+than certified two-endpoint bridges. Built-in union includes them. Custom weighted
+reconciliation exposes separate extrapolation support, defaults its weight to
+`0.35`, and inherits the configured bridge weight for legacy three-role mappings;
+an explicit extrapolation weight of zero opts out.
+
+For example, add SAM extrapolation after SDF interpolation:
+
+```text
+python -m XTA --mode tta --input /data/volume.mkv --output /data/tails \
+  --device 0 --model gpu:/models/detector.engine sam:/models/sam_bundle \
+  --enable_cartesian transverse --interpolation_backend sdf \
+  --extrapolation_distance 5 --extrapolation_walk_back 1 --extrapolation_min_radius 3
+```
+
+The native processing order is projection, detector prediction, filtering,
+interpolation, extrapolation, then backprojection. Readiness is local: a completed
+full-frame view/angle or consolidated tile configuration may extrapolate while
+interpolation continues in an independent scope. All interpolation able to change
+that scope's baseline, including crop retries, must finish first. Device ownership
+and memory admission still constrain overlap.
+
+SAM interpolation and extrapolation share the persistent predictor and bounded
+feature cache; reuse requires identical image/crop geometry. The current terminal
+labeling and planning, image preparation, and packed mask evidence use CPU memory.
+Tracker inference uses the GPU. The entire chain is therefore not yet resident on
+device, even when detector inference and backprojection use accelerated paths.
+
 ## Experimental SAM tracking crop mode
 
 `YOLO_TTA_SAM_CROP_MODE` selects `whole` (default) or `tiled` for active SAM
 tracking. It is validated before heavy startup and pinned for that launch.
 Values are trimmed and case-insensitive; other active values fail clearly.
-SDF and `--interpolation_distance 0` do not read this unused environment setting;
-their recorded mode is null and no SAM crop resources start. This is an
+Runs with neither SAM interpolation nor extrapolation active do not read this
+unused environment setting; their recorded mode is null and no SAM crop resources start. This is an
 experimental environment control with no CLI counterpart or 1260-pixel mode.
 
 For example, enable the tiled experiment in a PowerShell session before using
@@ -78,7 +162,7 @@ The assembled parent run contains fixed owned-core support. Its aggregate
 tracker probability is undefined; retain and inspect the individual child
 scores instead of inventing one probability or detector confidence.
 
-The v25.0.2 defaults are whole-policy v6 and tiled-policy v7, which qualify and
+The interpolation defaults are whole-policy v6 and tiled-policy v7, which qualify and
 publish connected branches independently. Explicit whole v2 and tiled v3 retain
 strict legacy behavior; whole v4 and tiled v5 add the historical guarded-rescue
 stage described below. Endpoint, family, and topology decisions use filtered owned-core
@@ -138,7 +222,17 @@ loading a predictor. Empty or exhausted plans perform none of those operations.
 When SAM and detector devices overlap, admission requires a successful detector
 asset-retirement acknowledgement. A CPU detector route or an entirely separate
 SAM device pool can acquire its devices independently. Failed retirement or
-unreleased model residency must not advertise a shared device as available.
+unsettled model work must not advertise a shared device as available.
+
+After startup, a resident-owner guard keeps the predictor and feature cache
+loaded while fencing detector and auxiliary inference reuse. Each endpoint job
+takes a separate exclusive compute lease. A worker must acknowledge device-wide
+CUDA completion after session cleanup before handing that lease back. Eligible
+Spherical, Radial and Tilted-Azimuthal projection stages may borrow an idle
+resident device through their existing capability and live-VRAM checks. This
+does not enable a projection backend whose geometry contract refuses CUDA.
+Startup, shutdown and cancellation retain or quarantine ownership until cleanup
+is proved; an idle model is never treated as free memory.
 
 For shared detector/SAM devices, completed full-frame parents can be checkpointed
 before preparation waits on that retirement signal. The scheduler closes their
@@ -160,6 +254,15 @@ copied bytes, reused disk bytes and I/O time. Cluster runs should inspect these
 costs alongside inference time; local CPU qualification does not establish their
 production throughput.
 
+Parents that must wait for shared SAM device retirement now allocate their union
+and retained confidence arrays directly on their verified regular, run-owned
+disk paths when that backing can be reused by the checkpoint. Fresh mappings
+retain exact zero initialization, shape, dtype, admission charges and ownership.
+Tmpfs and other noneligible paths keep their existing allocation behavior.
+Accumulation may still dirty full planes; reuse removes the duplicate checkpoint
+copy. Staging byte counters describe cumulative application payload, not peak
+disk occupancy or physical device traffic.
+
 Each admitted SAM device owns one isolated persistent predictor and at most one
 endpoint job at a time. A free worker takes the next bounded job. GPU/result
 consumption for different scopes is serialized by its owner, while their CPU
@@ -168,6 +271,12 @@ stable run IDs, lineage, selection, and directional pixels despite out-of-order
 worker completion. Packed bundle offsets, checksums, and timings can differ
 between fresh generation attempts.
 
+With `YOLO_TTA_TASK_TRACE=1`, `sam_phase_begin` and `sam_phase_end` events identify
+planning, image rendering, retry, selection and publication in the existing
+telemetry streams. Scope, operation and phase identities pair concurrent calls.
+An unmatched begin in an interrupted capture identifies unfinished host work;
+these spans may overlap and are not GPU kernel durations.
+
 Automatic whole-crop generation prefers family FIFO when the runtime supports
 its family API, subject to the balance guard below. One family stays on one device through independently seeded runs,
 allowing exact feature reuse; a ready worker takes the next family immediately.
@@ -175,7 +284,7 @@ The final family tail can leave other workers idle. Capacity follows the actual
 admitted devices and CPU wave, with no artificial four-device cap. Each endpoint
 still starts its own tracker session; cache/model/quality settings are unchanged.
 
-Automatic selection compares flat-job and FIFO-family frame-work spans using a
+Automatic interpolation selection compares flat-job and FIFO-family frame-work spans using a
 greedy minimum-heap assignment to the actual admitted slots. It falls back to
 flat when `family_span * 4 > flat_span * 5`; this is a load-balance proxy, not a
 runtime prediction. Explicit selectors bypass this guard. A small job count
@@ -186,8 +295,17 @@ alone is not an automatic fallback criterion.
 selector automatically falls back to flat for older/custom runtimes lacking
 callable family dispatch, recording `runtime_without_family_dispatch`. Explicit
 FIFO for whole-crop tracker work requires that API and fails clearly if absent.
-Tiled generation remains flat, recording `tiled_generation_uses_flat_dispatch`.
+Tiled interpolation remains flat, recording `tiled_generation_uses_flat_dispatch`.
 Flat dispatch continues crop affinity and lending idle workers between crops.
+
+Extrapolation groups independent requests with identical image and crop identity
+on one worker, within each existing image cohort or bounded tiled batch. Other
+workers take other ready crop families. The same 25% frame-work imbalance guard
+keeps a large single family from unnecessarily serializing the worker pool.
+The explicit `flat` environment value also disables this grouping; extrapolation
+retains its imbalance guard even for explicit `fifo`. These choices affect
+dispatch and exact feature reuse, while original seeds, intervals and request
+identities remain fixed.
 
 Receipts retain original input indices, requested/effective/explicit scheduling,
 fallback reason, device/worker identities, effective in-flight count and execution/
@@ -206,6 +324,32 @@ overlapping demands render only missing pixels. Empty plans still cause no
 materialization. Reduced square canvases retain their existing affine and
 stack-resampling semantics.
 
+When a lazy Transverse source has unchanged XY geometry and only its time axis
+needs resizing, bounded batches reuse the exact OpenCV temporal resize for
+multiple requested frames. Native planes, crop outputs, resize slabs and remap
+workspace share the existing render cap and live resource allowance. A source
+already materialized by another view, cached partial pixels, unsupported geometry
+or insufficient capacity retains the ordinary rendering path. The
+`sam.transverse_cache.*` counters identify which route ran.
+
+Extrapolation freezes its complete plan and baseline, then groups whole original
+terminal groups into image cohorts that fit `YOLO_TTA_SAM_IMAGE_CACHE_MAX_BYTES`.
+The union of requested rectangles on each frame determines each cohort's actual
+cache demand. Groups and their complete tracking intervals are not split. Every
+planned group is checked before rendering or SDK work; a single oversized group
+causes an explicit resource error rather than silently disappearing from output.
+Preexisting planner refusals remain separately reported.
+
+All cohorts share one evidence writer, predictor pool, final selection and
+publication. Adaptive retry budgets apply to the complete pass. Frozen
+per-frame observation indexes avoid rescanning all observations for each crop,
+and cohort transitions do not repeat whole-volume snapshot hashing.
+In a multi-cohort pass, owned gray caches retire only after detached RGB inputs,
+completed worker streams and raw-result packing/release have been verified.
+Borrowed source backing and protected shared caches retain their owners.
+Predictors and encoded feature caches survive cohort transitions. A scope that
+already fits one cache retains its ordinary cache-reuse behavior.
+
 ## Bounded reuse and resource controls
 
 These caches reuse identical inputs and measurements. They do not share tracker
@@ -215,7 +359,7 @@ state between independent endpoint sessions or relax proposal quality.
 | --- | --- | --- |
 | `YOLO_TTA_SAM_IMAGE_CACHE_MAX_BYTES` | 1 GiB | Each immutable image-demand cache; not a total process budget. Aliased canonical backing adds no cache storage |
 | `YOLO_TTA_SAM_RENDER_MAX_BYTES` | 256 MiB | Exact native rendering intermediates |
-| `--sam_feature_cache_mib` | `512` MiB | Requested retained feature budget per admitted predictor; zero disables retention |
+| `--sam_feature_cache_mib` | `1024` MiB | Requested retained feature budget per admitted predictor; zero disables retention |
 | `YOLO_TTA_SAM_FAMILY_SCHEDULE` | Automatic whole-crop scheduling | Balanced supported FIFO, otherwise recorded flat fallback; explicit `flat` backout or `fifo`; tiled stays flat |
 | Proposal reader `max_cache_bytes` Python argument | 32 MiB | One evidence-reader transaction; zero disables retention |
 
@@ -237,12 +381,30 @@ inspected position encoder. Missing, custom, or compiled encoder identities
 retain ordinary per-frame positions; exact same-frame feature reuse remains
 available.
 
+The 1 GiB request reduces eviction during longer traversals and nearby walk-back
+sessions. Actual capacity depends on the retained tensor layout and shared
+positional storage. The budget remains a fixed upper limit, capped by usable
+CUDA memory and the headroom above; explicit CLI budgets,
+including zero, remain authoritative. Reuse changes visual-feature retention,
+not the independent prompt or tracker history. Larger budgets cannot eliminate
+first-use misses for different immutable images or crop footprints.
+
 The CPU proposal reader retains immutable raw, filtered, and candidate products
 within its transaction. Memory-limited replay and final audits cap retention at
 the smaller of 32 MiB or one eighth of their workspace budget. Entry/exit
 integrity checks preserve source/payload identity. Cache statistics distinguish
 hits, decoding, filtering, evictions, peak bytes, and completed transactions;
 retention is released when the owner closes.
+
+Stock branch selection keeps a reader-owned immutable prefix of validated
+records. Each incoming chunk is fully validated, while earlier packed support
+records are shared instead of repeatedly deep-copied. Ordered cross-family
+contact and topology checks remain in place. Simultaneous prefix/candidate
+indexes are charged to admitted topology slack and effective measurement
+credit; insufficient space uses the original full-merge path. The complete
+portable receipt is flattened, fingerprinted and fully validated before return.
+Prefixes cannot move to unrelated or closed readers; authorized borrowed lanes
+retain their parent transaction's lifetime checks.
 
 The existing interpolation worker hint also reaches stock proposal measurement.
 Parallel intrinsic measurements require authenticated live extra parent credit;
@@ -432,7 +594,7 @@ connectivity as `not_assessed` while
 still measuring retained/removed bridge voxels; voxel survival alone does not
 establish a connected final repair.
 
-The v25.0.2 publication path projects each selected directional mask into
+The publication path projects each selected directional mask into
 orthogonal/source coordinates before constructing its public layer reference.
 Earlier SAM references carried `native_transform` as metadata without applying
 that transform. This misplaced decomposed non-Transverse SAM layers and affected
@@ -491,12 +653,12 @@ Original detector observations and stored raw tracker masks remain immutable.
 
 ### Tight-crop guard switch
 
-In v25.0.2, `YOLO_TTA_SAM_TIGHT_CROP_GUARD=0` disables an inherited conservative
+`YOLO_TTA_SAM_TIGHT_CROP_GUARD=0` disables an inherited conservative
 policy's acceptance-containment veto; `1` enables it. An unset value inherits the
 policy: off for the new v6/v7 defaults, on for explicit legacy v2-v5. Accepted values
 are `1`/`0`, `true`/`false`, and `on`/`off`, with case and surrounding whitespace
-ignored. Active SAM validates and pins the setting at launch; SDF and disabled
-interpolation ignore it.
+ignored. Active SAM interpolation validates and pins the setting at launch;
+SDF interpolation and extrapolation alone ignore it.
 
 ```powershell
 $env:YOLO_TTA_SAM_TIGHT_CROP_GUARD = '0'
@@ -529,7 +691,7 @@ support. Every online, replay, export, and survival reader uses that same mask.
 Radius filtering still precedes the connectivity analysis; no SDF pixels are
 inserted into SAM output.
 
-The v25.0.2 defaults select `branch_write_domain="fixed_context"`,
+The defaults select `branch_write_domain="fixed_context"`,
 `min_endpoint_recall=0`, `branch_crop_boundary_policy="retain_censored"`, and
 disable strict containment and guarded rescue. Local connectivity, original-seed
 identity, component-radius filtering, endpoint excess, unrelated-contact checks,
@@ -578,6 +740,66 @@ retain their separate explicit caps. A saved receipt's budget never authorizes
 a new replay allocation, and publishing saved support decodes one bounded plane
 at a time.
 
+### Bounded adaptive crop retry
+
+`YOLO_TTA_SAM_ADAPTIVE_CROP=1` enables an experimental retry for interpolation and
+extrapolation. It defaults to `0` and is validated and pinned only when SAM work
+is active. Each attempt uses a fixed crop throughout its complete tracker
+interval; the crop does not move between individual frames.
+
+After the original attempt, raw mask contact with an internal crop edge can
+request one larger attempt for that original group. Contacts are checked across
+the sequence, so growth that touches an edge and later shrinks is still detected.
+For extrapolation, only the prefix reached before raw-empty termination can
+trigger a retry. Contact with the declared canvas boundary cannot request pixels
+outside that canvas; the canvas boundary is not necessarily a physical image
+boundary after view transforms.
+
+Whole-crop contact checks authenticate the complete compressed and packed mask,
+its shape and its foreground count, then inspect boundary bits without expanding
+the full binary raster. The caller's original crop and canvas geometry must
+match the evidence. Tiled checks retain the dense overlapping halo union.
+Contact counts, retry decisions and acceptance rules are unchanged.
+
+This retry enlarges the group's outer context. In tiled mode it may change the
+footprint layout, but it does not enlarge an individual child's fixed 1008-pixel
+footprint or seed previously unseeded neighbors from predictions. Contact with an
+internal child-crop edge remains separately diagnosed censoring. Neither group
+enlargement nor a nonempty halo proves coverage beyond an owned tile core.
+
+The retry enlarges the contacted sides and rerenders the needed image rectangles.
+It restarts fresh tracker sessions using the exact same frozen original seeds and
+complete intervals. A clipped prediction never becomes a new prompt. Attempt
+identity and evidence remain separate, and the selected attempt undergoes the
+operation's usual selection rules. Interpolation still checks contacts and
+topology across the combined scope. Extrapolation retains its raw-empty/horizon
+rule without introducing a crop-border rejection.
+
+Extra work is charged before retry submission and is not refunded after a failed
+attempt. The controller imposes all of these limits in addition to current live
+resource admission:
+
+| Limit | Bound |
+| --- | --- |
+| Attempts | At most one additional attempt per original group; no recursive retry |
+| Enlargement | Contacted sides request at least 64 pixels or 25% of that dimension, reduced as needed to fit the area caps |
+| Crop area | At most twice the original area and at most 16,777,216 pixels |
+| Extra native pixel-frames per scope | Maximum of 25% of original scope work, 16,777,216, or twice the largest original group's work; capped at 268,435,456 |
+| Extra tracker frames per scope | Maximum of 25% of original scope frames or the largest original group's frames; capped at 512 |
+| Retry CPU workspace | At most 2 GiB and no more than the current admitted byte allowance; GPU admission remains separate |
+
+Frame accounting includes all independent seeds, walk-back runs, and tiled child
+jobs with their halos. Pixel-frame accounting charges the full retry, not just
+the newly exposed area. The one-group allowance permits a useful retry in a
+small scope, so the limit is not a strict 25% overhead guarantee. Absolute caps
+can refuse a large group, and wall-clock cost also depends on inference and I/O.
+
+When enlargement, admission, or the retry fails, the original evidence remains
+available with an explicit refusal/failure receipt and censored-extent status.
+One retry may still touch the enlarged boundary; the runtime does not continue
+enlarging until the object fits. With adaptive cropping disabled, growth and
+shrinkage remain supported only within the original fixed context.
+
 ### Largest-island and one-direction continuation experiments
 
 `tools/study_sam_largest_island.py` compares retained raw masks, the existing
@@ -606,8 +828,8 @@ Growth and shrinkage are measured without a monotonic-area requirement.
 These tools emit research evidence, not production-accepted bridge layers.
 Fresh terminal-free tails require their own annotated quality validation;
 tracker confidence and agreement with the detector are not ground truth.
-The integrated planner still requires observed endpoint pairs. The extrapolation
-prototype does not enable an additional production backend.
+These research tools retain their own prefix variants. Production extrapolation,
+described below, uses raw-mask emptiness and the distance horizon alone.
 
 ### Legacy quality versions 2 through 5
 
@@ -978,15 +1200,14 @@ The reporter's `two-tile-report --experiment NEW_EXPERIMENT_DIRECTORY` stage
 writes a separate three-way report in that new directory and preserves the
 earlier paired-study reports.
 
-Future work includes other SAM view geometries, more general crop/frontier
-planning, extracted tile-gating policies, and mixed-backend execution. These
-are separate changes to the declared rollout.
+Further crop/frontier planning and extracted tile-gating policies remain
+separate changes to the declared rollout.
 
 LTA's opt-in [dynamic crop backend](lta_dynamic_crops.md) has its own execution
-contract. The TTA generator shares a fixed family context across independently
+contract. Each TTA attempt shares a fixed family context across independently
 seeded sessions and does not inherit LTA's between-window crop updates.
 
-## Post-tag development notes
+## Context geometry and crop scheduling
 
 The safe planner correction bounds the complete endpoint silhouettes swept
 between their original observed anchors. Bounding only the observed endpoint
@@ -998,20 +1219,11 @@ where they were already covered. The planning receipt records
 `xta.sam_fixed_family_swept_context/2`, observed/swept/unclipped/clamped boxes,
 canvas-clamped sides, margins, and charged memory. This changes generation
 geometry; fixed-evidence selection cannot reproduce an omitted context.
-The unchanged resource caps can now refuse a larger corrected family. In the
-independent default-cap audit, development admission changed from 15/16 to
-14/16; the two later source windows stayed at 12/12 and 25/25. The lost
-merge/bifurcation family's crop grew from 912 by 799 (207.09 MiB charge) to
-944 by 1136 (304.766 MiB), exceeding the 256 MiB group cap. This was a group-cap
-refusal, not total-cap loss. Re-clipping the corrected sweep would hide intended
-acceptance/write space. Resource accounting was not changed.
-
-The explicit 512 MiB research setup has a different admission comparison:
-B0 admits 15 families and B1 13 because of its aggregate budget. Those refusals
-must remain in denominators; admitted-only scores do not represent coverage of
-the full inventory. Extra context and acceptance-only diagnostics produced no
-strict-selection gain in the development experiment, so no wider-context or
-acceptance policy is promoted to a default.
+Resource caps can refuse a larger corrected family. Re-clipping the corrected
+sweep would hide intended acceptance/write space. Refusals must remain in
+evaluation denominators; admitted-only scores do not represent full inventory
+coverage. Run-specific admission comparisons and measurements belong in the
+Scratch XTA History directory.
 
 Tiled execution on one worker now finishes each exact crop queue within the
 existing bounded parent cohort before switching crops. Independent endpoint
@@ -1024,14 +1236,6 @@ working-canvas edges separately, deduplicating shared corner pixels. Inconsisten
 canvas metadata stays unknown. A working-canvas edge is not proof of a physical
 source-image boundary, and no contact category waives containment or changes
 selection.
-
-The local GPU ABBA check preserved every raw mask and object score. It reduced
-encoder preparations from 66 to 33. Median worker tracking was 12.558 to
-8.731 seconds (30.5% lower); the complete bounded assembly seam was 43.566 to
-38.829 seconds (10.9% lower), including predictor startup with startup also
-reported separately. These timings exclude video decoding and detector work.
-They describe the exercised local fixture, not target H100 throughput or a
-general accuracy improvement.
 
 The maintained development tools separate protocol, inference, scoring, and
 reporting:
@@ -1055,4 +1259,4 @@ region; it is not a fresh pipeline-equivalent replay. Preserve the tagged
 baseline, original recipe seals, source/frame/seed identities, and raw reuse
 attribution. Those research geometry variants do not alter central component
 filtering or the ordinary tile gate. Their historical guarded-rescue successor
-is described above; v25.0.2 uses the separately evaluated connected-branch policy.
+is described above; the defaults use the connected-branch policy.

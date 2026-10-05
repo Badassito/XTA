@@ -32,9 +32,9 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 SCRATCH = ROOT.parent / 'Scratch'
+from tools.source_archive_history import history_archive_path
 TASK = SCRATCH / 'Experiments/Job150790_150798_Performance_20261002/confidence_benchmark'
-ARCHIVE = SCRATCH / ('Experiments/Job150772_Performance_20261002/final_qualification_v2/'
-                     'source/XTA_v25.0.1_complete_source.zip')
+ARCHIVE = history_archive_path('throughput')
 ARCHIVE_SHA256 = '3cf2d7b0e759e873350c944297aa97d441fec3f4d617522f38df809a4e287e6d'
 REAL_MANIFEST = SCRATCH / ('Experiments/Results/F3_10_4_30_2026_8bit_Y_150790/'
                            'reconciliation_evidence/manifest.json')

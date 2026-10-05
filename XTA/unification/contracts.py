@@ -104,8 +104,19 @@ def _normalize_angle(angle_deg: object) -> float:
     return normalized
 
 
+def format_angle_identity_text(angle_deg: float) -> str:
+    """Retain legacy spelling only when it represents the exact finite angle."""
+    angle = float(angle_deg)
+    if not math.isfinite(angle):
+        raise ValueError("angle identity requires a finite angle")
+    if angle == 0.0:
+        return "0"
+    legacy = f"{angle:g}"
+    return legacy if float(legacy) == angle else repr(angle)
+
+
 def _format_angle_variant_id(angle_deg: float) -> str:
-    token = f"{float(angle_deg):g}".replace("-", "m").replace(".", "p")
+    token = format_angle_identity_text(angle_deg).replace("-", "m").replace(".", "p")
     return f"a{token}"
 
 
@@ -114,13 +125,19 @@ class InPlaneVariant:
     """One normalized 2-D rotation applied after physical-view extraction."""
 
     angle_deg: float = 0.0
+    # Reader compatibility only: production factories always use lossless IDs.
+    legacy_variant_id: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "angle_deg", _normalize_angle(self.angle_deg))
+        if self.legacy_variant_id is not None:
+            historical = f"a{self.angle_deg:g}".replace("-", "m").replace(".", "p")
+            if self.legacy_variant_id != historical:
+                raise ValueError("legacy angle ID does not match the historical formatter")
 
     @property
     def variant_id(self) -> str:
-        return _format_angle_variant_id(self.angle_deg)
+        return self.legacy_variant_id or _format_angle_variant_id(self.angle_deg)
 
 
 @dataclass(frozen=True)

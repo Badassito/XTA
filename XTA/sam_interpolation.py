@@ -8,13 +8,15 @@ contributors before any additive volume or parent-gate support is published.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field, is_dataclass
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 import hashlib
 import heapq
 import json
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 from types import MappingProxyType
 from typing import Any
@@ -24,6 +26,25 @@ import numpy as np
 
 class SamInterpolationInfrastructureError(RuntimeError):
     """A generation failure, which must never become an empty successful bridge."""
+
+
+@contextmanager
+def _trace_sam_phase(phase, scope_id, *, operation=None):
+    """Retain host phase boundaries in the existing optional task trace."""
+    from .runtime import runtime_trace_event
+    fields = dict(sam_phase=str(phase), scope_id=str(scope_id),
+                  sam_phase_id=f'{threading.get_ident()}:{time.monotonic_ns()}')
+    if operation is not None:
+        fields['sam_operation'] = str(operation)
+    runtime_trace_event('sam_phase_begin', **fields)
+    failed = False
+    try:
+        yield
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        runtime_trace_event('sam_phase_end', failed=failed, **fields)
 
 
 def _check_cancelled(cancel_event: object) -> None:
@@ -505,6 +526,401 @@ def _store_generated_parent_run(writer, run, result, group, observation_by_id,
     return descriptor
 
 
+def _retry_work(prepared):
+    """Count complete SDK jobs, including independent tiled halo sessions."""
+    grouped = {}
+    groups = {str(group.group_id): group for group in prepared.groups}
+    for item in (prepared.tracker_jobs if prepared.crop_mode == 'tiled' else prepared.runs):
+        run = item.original_run if prepared.crop_mode == 'tiled' else item
+        box = item.tile.crop_bbox_yx if prepared.crop_mode == 'tiled' else groups[str(run.group_id)].context_bbox_yx
+        frames = len(run.expected_frames)
+        work, count = grouped.get(str(run.group_id), (0, 0))
+        grouped[str(run.group_id)] = (work + frames*(box[2]-box[0])*(box[3]-box[1]), count + frames)
+    return grouped
+
+
+def _retry_child_crop_contacts(bundle, reader, group_id, canvas_shape_yx):
+    from .sam_crop_retry import raw_child_crop_boundary_contacts, summarize_child_crop_contacts
+    group = bundle.groups[str(group_id)]
+    def records():
+        for run_id, run in bundle.runs.items():
+            if str(run['group_id']) != str(group_id):
+                continue
+            for tile in run.get('tile_evidence', ()):
+                if not tile.get('attempted'):
+                    continue
+                for frame in run['expected_frames']:
+                    raw = reader.tile_raw_mask(run_id, str(tile['tile_id']), int(frame))
+                    yield raw_child_crop_boundary_contacts(raw, tile['crop_bbox_yx'],
+                        group['context_bbox_yx'], canvas_shape_yx)
+                    del raw
+    return summarize_child_crop_contacts(records())
+
+
+def _prepare_sam_group_retry(prepared, group, crop, *, retry_policy, policy,
+        resource_profile, worker_count):
+    """Prepare only the same original family under a fresh enlarged context."""
+    from .sam_bridge_planning import expand_sam_bridge_group_context
+    from .sam_policy import resolve_sam_bridge_policy, _selection_resources
+    from .sam_resources import cpu_session_bytes, cpu_wave_admission, validate_live_sam_resource_profile
+    from .workspace import _env_int
+    lineage = dict(schema='xta.sam_crop_retry_attempt/1', original_group_id=str(group.group_id),
+        original_context_bbox_yx=list(group.context_bbox_yx), retry_index=1,
+        original_observation_snapshot_sha256=prepared.observation_snapshot_sha256)
+    enlarged = expand_sam_bridge_group_context(group, crop,
+        max_crop_pixels=retry_policy.max_crop_pixels, retry_lineage=lineage)
+    original_runs = tuple(run for run in prepared.runs if str(run.group_id) == str(group.group_id))
+    runs = tuple(replace(run, group_id=enlarged.group_id,
+        run_id=str(run.run_id) + '__retry1_' + hashlib.sha256(enlarged.group_id.encode()).hexdigest()[:12])
+        for run in original_runs)
+    plan = replace(prepared.plan, groups=(enlarged,), runs=runs,
+        planning_fingerprint=hashlib.sha256((prepared.settings_sha256 + enlarged.group_id).encode()).hexdigest())
+    jobs, inventory, tiling_sha, assembly_bytes = (), MappingProxyType({}), '', 0
+    demand = plan.frame_crop_bounds
+    if prepared.crop_mode == 'tiled':
+        from .sam_crop_tiling import prepare_tiled_jobs
+        jobs, inventory, tiling_sha, assembly_bytes = prepare_tiled_jobs(runs,
+            {enlarged.group_id: enlarged}, plan.by_id)
+        tiled_demand = {}
+        for job in jobs:
+            box = job.tile.crop_bbox_yx
+            for frame in job.original_run.expected_frames:
+                old = tiled_demand.get(int(frame), box)
+                tiled_demand[int(frame)] = (min(old[0], box[0]), min(old[1], box[1]),
+                    max(old[2], box[2]), max(old[3], box[3]))
+        demand = MappingProxyType(tiled_demand)
+    source_policy = policy or {}
+    if 'kind' in source_policy and 'mode' not in source_policy:
+        source_policy = {'sam_bridge_policy': source_policy}
+    bridge_policy = resolve_sam_bridge_policy(source_policy, generation_mode=prepared.crop_mode)
+    operative, _ = _selection_resources(source_policy, bridge_policy, resource_profile)
+    shape = (len(enlarged.frame_indices), crop[2]-crop[0], crop[3]-crop[1])
+    if bridge_policy.get('branch_aware_selection', False):
+        from .sam_branch_selection import branch_workspace_bytes
+        topology_bytes = branch_workspace_bytes(shape)
+    else:
+        topology_bytes = int(np.prod(shape))*16
+    if topology_bytes > int(operative['max_group_bytes']):
+        raise MemoryError('Enlarged SAM family exceeds its current topology admission')
+    profile = (validate_live_sam_resource_profile(resource_profile)
+        if resource_profile is not None else None)
+    session_cap = 2*1024**3 if profile is None else int(profile['assigned_session_cpu_bytes'])
+    owned_wave = 2*1024**3 if profile is None else int(profile['assigned_cpu_wave_bytes'])
+    max_session = max_raw = 0
+    for item in (jobs if prepared.crop_mode == 'tiled' else runs):
+        run = item.original_run if prepared.crop_mode == 'tiled' else item
+        box = item.tile.crop_bbox_yx if prepared.crop_mode == 'tiled' else crop
+        pixels = (box[2]-box[0])*(box[3]-box[1])
+        peak = cpu_session_bytes(len(run.expected_frames), pixels)['estimated_peak_bytes']
+        if peak > session_cap:
+            raise MemoryError('Enlarged SAM full interval exceeds its current CPU session admission')
+        max_session, max_raw = max(max_session, peak), max(max_raw, pixels*len(run.expected_frames))
+    gray_bytes = sum((box[2]-box[0])*(box[3]-box[1]) for box in demand.values())
+    cache_cap = max(1, _env_int('YOLO_TTA_SAM_IMAGE_CACHE_MAX_BYTES', 1024**3))
+    if gray_bytes > cache_cap:
+        raise MemoryError('Enlarged SAM image demand exceeds its immutable cache admission')
+    render_reserve = max(1, _env_int('YOLO_TTA_SAM_RENDER_MAX_BYTES', 256*1024**2))
+    # Retry SDK sessions are serial within the held parent lease. The existing
+    # transfer barrier releases every result before a later session can start.
+    wave_budget = min(owned_wave, max(1, retry_policy.max_retry_memory_bytes-gray_bytes))
+    wave = cpu_wave_admission(max_session, max_raw, wave_budget, 1)
+    peak = max(int(enlarged.crop_contract['charged_contract_bytes']) + 32*1024**2,
+        topology_bytes + 32*1024**2, int(wave['peak_cpu_wave_estimate_bytes']) + gray_bytes,
+        2*gray_bytes + render_reserve, int(assembly_bytes) + gray_bytes)
+    retry = replace(prepared, plan=plan, runs=runs, needed_frames=plan.needed_frames,
+        frame_crop_bounds=demand, tracker_jobs=jobs, tile_inventory=inventory,
+        tiling_sha256=tiling_sha, tiled_assembly_bytes=assembly_bytes,
+        cpu_wave_admission=MappingProxyType(wave),
+        settings_sha256=hashlib.sha256((prepared.settings_sha256+enlarged.group_id).encode()).hexdigest())
+    return retry, peak, {str(new.run_id): str(old.run_id) for old, new in zip(original_runs, runs)}
+
+
+def _regenerate_sam_group_retry(prepared, *, destination, metadata, image_provider,
+        runtime, resource_profile, upstream_lineage, min_radius, cancel_event, original_run_ids):
+    """Track only the enlarged family, retaining its own immutable raw attempt."""
+    from .sam_evidence import SamEvidenceWriter
+    from .sam_crop_tiling import TiledRunAssembly, tile_descriptor
+    groups = {str(group.group_id): group for group in prepared.groups}
+    by_id = prepared.plan.by_id
+    cache = getattr(image_provider, 'cache_ref', image_provider)
+    writer = SamEvidenceWriter(destination / 'evidence', metadata)
+    assemblies = {}
+    stream = None
+    completed = set()
+    try:
+        for group in prepared.groups:
+            _write_group(writer, group, by_id, min_radius)
+        tiled = prepared.crop_mode == 'tiled'
+        work = prepared.tracker_jobs if tiled else prepared.runs
+        if tiled:
+            for index, tiles in prepared.tile_inventory.items():
+                for tile in tiles:
+                    if not tile.attempted:
+                        writer.add_run_tile(prepared.runs[index].run_id,
+                            tile_descriptor(prepared.runs[index], tile), {})
+        order = prepared.execution_order(1)
+        stream = (_iterate_tiled_tracker_results(runtime, prepared, 1, groups, by_id, cache,
+            cancel_event, resource_profile) if tiled else _iterate_tracker_results(runtime,
+            _tracker_requests(tuple(prepared.runs[i] for i in order), groups, by_id,
+                cancel_event, resource_profile), cache, prepared.cpu_wave_admission))
+        for index, result in stream:
+            try:
+                if isinstance(index, bool) or not isinstance(index, (int, np.integer)) or not 0 <= int(index) < len(order):
+                    raise SamInterpolationInfrastructureError('SAM retry returned invalid job ownership')
+                work_index = order[int(index)]
+                if work_index in completed:
+                    raise SamInterpolationInfrastructureError('SAM retry returned duplicate job ownership')
+                item = work[work_index]
+                run = item.original_run if tiled else item
+                group = groups[str(run.group_id)]
+                expected_id = item.run_id if tiled else run.run_id
+                declared = getattr(result, 'receipt', {}).get('run_id')
+                if declared is not None and str(declared) != str(expected_id):
+                    raise SamInterpolationInfrastructureError('SAM retry changed its job identity')
+                if tiled:
+                    for identity_key in ('sam_model', 'sam_runtime'):
+                        actual = dict(result.receipt or {}).get(identity_key)
+                        if actual is not None:
+                            actual = _plain(actual)
+                            if identity_key in metadata and metadata[identity_key] != actual:
+                                raise SamInterpolationInfrastructureError('SAM retry tile changed its model/runtime identity')
+                            metadata[identity_key] = actual
+                            writer.scope[identity_key] = actual
+                    parent = item.original_run_index
+                    if parent not in assemblies:
+                        assemblies[parent] = TiledRunAssembly(run, group, prepared.tile_inventory[parent],
+                            destination / 'tile_assemblies' / str(run.run_id))
+                    assembly = assemblies[parent]
+                    child, masks = assembly.consume(item, result)
+                    writer.add_run_tile(run.run_id, child, masks)
+                    if not child['structurally_valid']:
+                        raise SamInterpolationInfrastructureError('SAM retry returned invalid tiled raw evidence')
+                    if assembly.ready:
+                        full = assembly.result()
+                        for identity_key in ('sam_model', 'sam_runtime'):
+                            if identity_key in metadata:
+                                full.receipt[identity_key] = metadata[identity_key]
+                        descriptor = _store_generated_parent_run(writer, run, full, group, by_id,
+                            metadata, upstream_lineage, assembly.availability())
+                        descriptor['crop_retry_of_run_id'] = original_run_ids[str(run.run_id)]
+                        writer.runs[str(run.run_id)]['crop_retry_of_run_id'] = original_run_ids[str(run.run_id)]
+                        del full
+                        assembly.close()
+                        del assemblies[parent]
+                else:
+                    _store_generated_parent_run(writer, run, result, group, by_id, metadata, upstream_lineage)
+                    writer.runs[str(run.run_id)]['crop_retry_of_run_id'] = original_run_ids[str(run.run_id)]
+                completed.add(work_index)
+            finally:
+                if hasattr(runtime, 'release_result'):
+                    runtime.release_result(result)
+                del result
+        if len(completed) != len(work) or assemblies:
+            raise SamInterpolationInfrastructureError('SAM retry omitted its complete original interval')
+        return writer.commit(complete=True)
+    except BaseException as error:
+        try:
+            writer.commit(complete=False)
+        except BaseException:
+            pass
+        _failure_receipt(destination, error, 'crop_retry_generation', len(completed))
+        raise
+    finally:
+        for assembly in assemblies.values():
+            assembly.close()
+        if stream is not None:
+            stream.close()
+
+
+def _apply_sam_crop_retries(bundle, prepared, *, destination, metadata, runtime,
+        retry_policy, retry_image_provider, policy, resource_profile, min_radius,
+        upstream_lineage, cancel_event):
+    """Choose one full attempt per family, then preserve global quality gates."""
+    if retry_policy is None or not retry_policy.enabled or not prepared.runs:
+        return bundle, destination, None
+    from .sam_crop_retry import (SamCropRetryController, raw_crop_boundary_contacts, merge_crop_contacts)
+    from .sam_evidence import SamEvidenceWriter, fingerprint
+    from .sam_resources import validate_live_sam_resource_profile
+    work = _retry_work(prepared)
+    controller = SamCropRetryController(retry_policy,
+        baseline_pixel_frames=sum(value[0] for value in work.values()),
+        baseline_tracker_frames=sum(value[1] for value in work.values()),
+        largest_original_group_pixel_frames=max(value[0] for value in work.values()),
+        largest_original_group_tracker_frames=max(value[1] for value in work.values()))
+    profile = validate_live_sam_resource_profile(resource_profile) if resource_profile is not None else None
+    available = 2*1024**3 if profile is None else int(profile['assigned_cpu_wave_bytes'])
+    replacements = {}
+    attempts = []
+    preflight_refusals = {}
+    tiled_child_contacts = {}
+    with bundle.reader(max_cache_bytes=0) as reader:
+        for group in prepared.groups:
+            group_id = str(group.group_id)
+            if group_id not in work:
+                continue
+            _check_cancelled(cancel_event)
+            original_runs = tuple(run for run in prepared.runs if str(run.group_id) == group_id)
+            seed_identity = fingerprint(dict(snapshot=prepared.observation_snapshot_sha256,
+                seeds=[(str(run.run_id), tuple(run.seed_ids)) for run in original_runs]))
+            interval_identity = fingerprint([(str(run.run_id), tuple(run.expected_frames), int(run.direction))
+                for run in original_runs])
+            contacts = []
+            for run in original_runs:
+                for frame in run.expected_frames:
+                    if prepared.crop_mode == 'tiled':
+                        raw = reader.halo_union_mask(str(run.run_id), int(frame))
+                        contacts.append(raw_crop_boundary_contacts(raw, group.context_bbox_yx,
+                            prepared.native_shape[1:]))
+                        del raw
+                    else:
+                        contacts.append(reader.raw_crop_boundary_contacts(str(run.run_id), int(frame),
+                            crop_bbox_yx=group.context_bbox_yx, canvas_shape_yx=prepared.native_shape[1:]))
+            if prepared.crop_mode == 'tiled':
+                tiled_child_contacts[group_id] = {'initial': _retry_child_crop_contacts(
+                    bundle, reader, group_id, prepared.native_shape[1:])}
+            contacts = merge_crop_contacts(contacts)
+            candidates = {}
+            def candidate(box):
+                if box not in candidates:
+                    candidates[box] = _prepare_sam_group_retry(prepared, group, box,
+                        retry_policy=retry_policy, policy=policy, resource_profile=resource_profile,
+                        worker_count=1)
+                return candidates[box]
+            def memory(box):
+                try:
+                    return candidate(box)[1]
+                except Exception as error:
+                    preflight_refusals[group_id] = str(error)
+                    return max(available, retry_policy.max_retry_memory_bytes) + 1
+            def pixel_work(box):
+                try:
+                    return sum(value[0] for value in _retry_work(candidate(box)[0]).values())
+                except Exception as error:
+                    preflight_refusals[group_id] = str(error)
+                    return retry_policy.max_extra_pixel_frames + 1
+            def frame_work(box):
+                try:
+                    return sum(value[1] for value in _retry_work(candidate(box)[0]).values())
+                except Exception:
+                    return 513
+            decision = controller.reserve_retry(group_id, crop_bbox_yx=group.context_bbox_yx,
+                canvas_shape_yx=prepared.native_shape[1:], frame_count=sum(len(run.expected_frames) for run in original_runs),
+                seed_identity=seed_identity, interval_identity=interval_identity, contacts=contacts,
+                available_memory_bytes=available, memory_estimator=memory,
+                work_estimator=pixel_work if prepared.crop_mode == 'tiled' else None,
+                tracker_frame_estimator=frame_work if prepared.crop_mode == 'tiled' else None)
+            if not decision.retry:
+                continue
+            retry, _, run_ids = candidate(decision.crop_bbox_yx)
+            controller.verify_retry_identity(decision, seed_identity=seed_identity, interval_identity=interval_identity)
+            retry_destination = destination / 'crop_retries' / hashlib.sha256(group_id.encode()).hexdigest()[:20]
+            retry_destination.mkdir(parents=True, exist_ok=True)
+            attempt_metadata = dict(metadata, sam_crop_retry_attempt=decision.record,
+                sam_crop_retry_policy=retry_policy.to_dict(),
+                retry_tiling_plan_sha256=retry.tiling_sha256)
+            try:
+                if not callable(retry_image_provider):
+                    raise ValueError('Adaptive SAM crop cannot render without a fresh image-provider factory')
+                provider = retry_image_provider(retry)
+                cache = getattr(provider, 'cache_ref', provider)
+                if cache is not None:
+                    if tuple(cache.shape) != tuple(retry.plan.virtual_shape_tyx or retry.native_shape):
+                        raise ValueError('SAM retry image descriptor changed the original canvas/frame geometry')
+                    coverage = {int(record[0]): tuple(map(int, record[1:5]))
+                        for record in getattr(cache, 'frame_crops', ())}
+                    if coverage:
+                        for frame, box in retry.frame_crop_bounds.items():
+                            present = coverage.get(int(frame))
+                            if present is None or present[0] > box[0] or present[1] > box[1] or present[2] < box[2] or present[3] < box[3]:
+                                raise ValueError('SAM retry image descriptor does not cover the enlarged context')
+                    if hasattr(cache, 'revalidate'):
+                        cache.revalidate()
+                    image_identity = str(getattr(cache, 'identity_sha256', ''))
+                    pinned_image_identity = str(metadata.get('image_snapshot_sha256', ''))
+                    if image_identity and pinned_image_identity and image_identity != pinned_image_identity:
+                        raise ValueError('SAM retry image descriptor changed its pinned canonical source-image identity')
+                    attempt_metadata['retry_image_snapshot_sha256'] = image_identity
+                    attempt_metadata['retry_image_frame_crops'] = _plain(getattr(cache, 'frame_crops', ()))
+                attempt = _regenerate_sam_group_retry(retry, destination=retry_destination,
+                    metadata=attempt_metadata, image_provider=provider, runtime=runtime,
+                    resource_profile=resource_profile, upstream_lineage=upstream_lineage,
+                    min_radius=min_radius, cancel_event=cancel_event, original_run_ids=run_ids)
+                retry_contacts = []
+                with attempt.reader(max_cache_bytes=0) as attempt_reader:
+                    for retry_run in retry.runs:
+                        for frame in retry_run.expected_frames:
+                            if prepared.crop_mode == 'tiled':
+                                raw = attempt_reader.halo_union_mask(str(retry_run.run_id), int(frame))
+                                retry_contacts.append(raw_crop_boundary_contacts(raw, decision.crop_bbox_yx,
+                                    prepared.native_shape[1:]))
+                                del raw
+                            else:
+                                retry_contacts.append(attempt_reader.raw_crop_boundary_contacts(
+                                    str(retry_run.run_id), int(frame), crop_bbox_yx=decision.crop_bbox_yx,
+                                    canvas_shape_yx=prepared.native_shape[1:]))
+                    if prepared.crop_mode == 'tiled':
+                        tiled_child_contacts[group_id]['retry'] = _retry_child_crop_contacts(
+                            attempt, attempt_reader, retry.groups[0].group_id, prepared.native_shape[1:])
+                retry_contacts = merge_crop_contacts(retry_contacts)
+                controller.complete_retry(decision, status='succeeded',
+                    detail={'evidence_path': str(attempt.directory), 'chosen_group_ids': list(attempt.groups),
+                        'outer_context_contacts': retry_contacts,
+                        'extent_remains_censored': any(retry_contacts['internal_contacts'].values()),
+                        'maximum_additional_attempts': 0, 'coverage_proof': False})
+                replacements[group_id] = attempt
+                attempts.append(attempt)
+            except BaseException as error:
+                controller.complete_retry(decision, status='cancelled' if getattr(cancel_event, 'is_set', lambda: False)()
+                    else 'failed', detail={'error': str(error)})
+                (destination/'crop_retry.json').write_text(json.dumps(controller.receipt(), indent=2), encoding='utf-8')
+                runtime_cancel = getattr(runtime, '_cancel', None)
+                cancelled = getattr(cancel_event, 'is_set', lambda: False)() or (
+                    runtime_cancel is not None and getattr(runtime_cancel, 'is_set', lambda: False)() is True)
+                if cancelled or isinstance(error, (KeyboardInterrupt, SystemExit)) or getattr(runtime, '_closed', False) is True:
+                    raise
+                # The complete initial attempt remains authoritative for this
+                # optional retry failure. Drop closed traceback-frame aliases
+                # before another group or global selection borrows workspace.
+                import traceback
+                traceback.clear_frames(error.__traceback__)
+                continue
+    receipt = controller.receipt()
+    receipt['preflight_refusals'] = preflight_refusals
+    receipt['tiled_child_crop_contacts'] = tiled_child_contacts
+    receipt['initial_evidence_path'] = str(bundle.directory)
+    receipt['initial_evidence_fingerprint'] = bundle.evidence_fingerprint
+    (destination/'crop_retry.json').write_text(json.dumps(receipt, indent=2), encoding='utf-8')
+    if not replacements:
+        return bundle, destination, receipt
+    final_destination = destination/'adaptive_final'
+    final_destination.mkdir(parents=True, exist_ok=True)
+    final_metadata = dict(metadata, sam_crop_retry=receipt,
+        chosen_attempt_basis='one_complete_raw_attempt_per_original_family_global_reselection')
+    final_writer = SamEvidenceWriter(final_destination/'evidence', final_metadata)
+    try:
+        with final_writer.import_transaction(bundle):
+            for group_id in bundle.groups:
+                if group_id not in replacements:
+                    final_writer.import_group(bundle, group_id)
+            for run_id, run in bundle.runs.items():
+                if str(run['group_id']) not in replacements:
+                    final_writer.import_run(bundle, run_id)
+        for attempt in attempts:
+            with final_writer.import_transaction(attempt):
+                for group_id in attempt.groups:
+                    final_writer.import_group(attempt, group_id)
+                for run_id in attempt.runs:
+                    final_writer.import_run(attempt, run_id)
+        final_bundle = final_writer.commit(complete=True)
+    except BaseException:
+        final_writer.abort()
+        raise
+    receipt['final_evidence_path'] = str(final_bundle.directory)
+    receipt['final_evidence_fingerprint'] = final_bundle.evidence_fingerprint
+    (destination/'crop_retry.json').write_text(json.dumps(receipt, indent=2), encoding='utf-8')
+    return final_bundle, final_destination, receipt
+
+
 def _base_stats(pass_index: int, requested_passes: int) -> dict[str, object]:
     return {
         "interpolation_backend": "sam", "backend": "sam",
@@ -913,6 +1329,8 @@ def interpolate_sam_view_volume_pass(
     prepared_plan: SamPreparedInterpolationPass | None = None,
     crop_mode: str | None = None,
     resource_profile: object = None,
+    crop_retry_policy: object = None,
+    retry_image_provider: object = None,
 ) -> tuple[np.ndarray, dict[str, object], list[dict[str, object]]]:
     """Generate one SAM planning round from immutable detector observations.
 
@@ -1285,19 +1703,33 @@ def interpolate_sam_view_volume_pass(
             raise SamInterpolationInfrastructureError(
                 f"SAM tiled assembly cleanup failed: {assembly_cleanup_errors[0]}") from assembly_cleanup_errors[0]
     generated = [generated_by_index[index] for index in sorted(generated_by_index)]
+    if crop_retry_policy is not None and crop_retry_policy.enabled:
+        retry_started = time.perf_counter()
+        with _trace_sam_phase('retry', metadata.get('scope_id', ''), operation='interpolation'):
+            bundle, destination, retry_receipt = _apply_sam_crop_retries(bundle, prepared_plan,
+                destination=destination, metadata=metadata, runtime=runtime,
+                retry_policy=crop_retry_policy, retry_image_provider=retry_image_provider,
+                policy=policy, resource_profile=resource_profile, min_radius=float(min_radius),
+                upstream_lineage=upstream_lineage, cancel_event=cancel_event)
+        stats['sam_crop_retry'] = retry_receipt
+        stats['sam_crop_retry_wall_seconds'] = time.perf_counter()-retry_started
+        generated = [dict(run) for run in bundle.runs.values()]
+        metadata = _plain(bundle.scope)
 
     policy_started = time.perf_counter()
     merged_directory = ((Path(runtime_work_dir) / scope_hash) if runtime_work_dir is not None
                         else destination / "_runtime")
     try:
         _check_cancelled(cancel_event)
-        receipt = select_sam_proposals(bundle, policy=policy,
-            workers=workers,
-            **({"resource_profile": resource_profile} if resource_profile is not None else {}))
+        with _trace_sam_phase('selection', metadata.get('scope_id', ''), operation='interpolation'):
+            receipt = select_sam_proposals(bundle, policy=policy,
+                workers=workers,
+                **({"resource_profile": resource_profile} if resource_profile is not None else {}))
         stats["sam_policy_wall_seconds"] = time.perf_counter() - policy_started
         (destination / "selection.json").write_text(json.dumps(_plain(receipt), indent=2), encoding="utf-8")
-        merged, components, added, publication_cache_stats = _publish_directions(bundle, receipt, observations,
-            destination, metadata, int(pass_index), merged_directory, cancel_event)
+        with _trace_sam_phase('publication', metadata.get('scope_id', ''), operation='interpolation'):
+            merged, components, added, publication_cache_stats = _publish_directions(bundle, receipt, observations,
+                destination, metadata, int(pass_index), merged_directory, cancel_event)
         stats["sam_publication_mask_reader"] = publication_cache_stats
         if not added:
             if (observations.flags.writeable and prepared_plan.observation_snapshot_sha256
@@ -1312,7 +1744,7 @@ def interpolate_sam_view_volume_pass(
     selected_groups = {str(run["group_id"]) for run in selected}
     stats.update({
         "accepted_connections": (len(receipt['branch_selection']['edges']) if receipt.get('branch_selection') is not None else
-                                  sum(len(groups[group_id].edges) for group_id in selected_groups)),
+                                  sum(len(bundle.groups[group_id].get('edges', ())) for group_id in selected_groups)),
         "default_bridges": sum(int(run["walk_back_index"]) == 0 for run in selected),
         "walk_back_bridges": sum(int(run["walk_back_index"]) > 0 for run in selected),
         "added_voxels": int(added), "bridge_component_count": 2,

@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 from pathlib import Path
+from types import MappingProxyType
 import zlib
 
 import numpy as np
@@ -34,6 +35,9 @@ _QUALIFIED_PACKED_OWNER_IMPLEMENTATIONS = {
     '660f2e4eb8bab05b7315419fd6b64a3af8011bb9dac9b7dab5b614f4e3b8d6ea': 'narrow_only',
     '37a9eeee35a90d6bca89de115714a9d08d1390086bce7d92b4fc01e24cbd4859': 'tracked_known',
     'fbc427e0ce3476fd6019f375325b6ad09a5b698d8581885094f6ae32638754d5': 'tracked_known',
+    # Qualified v25.1.0 job151147 source archive; immutable-prefix reuse only
+    # changes metadata ownership, not this packed owner/attachment contract.
+    '254fbb676b0585baf9f0dfc9a680884a70270c3987177cafd4aa2fc511dabe42': 'tracked_known',
 }
 
 
@@ -515,6 +519,114 @@ def merge_branch_selections(bundle, mask_filter, recipes, *, connectivity=6,
         edges={}, selected_edge_ids_by_run={})
     result['sha256'] = fingerprint(result)
     return result
+
+
+def _json_size(value):
+    return len(json.dumps(_plain(value), separators=(',', ':')).encode('utf-8'))
+
+
+def _branch_index_bytes(edge_count, owner_count, owner_edges):
+    """Conservative shallow-index charge; packed records are shared, not cached."""
+    return 1024 + 256*(int(edge_count)+int(owner_count)) + 16*int(owner_edges)
+
+
+class _BranchPrefix(Mapping):
+    """Reader-only immutable indexes over fully validated packed records.
+
+    This is deliberately not a portable receipt: it has no whole-prefix SHA.
+    Public receipt validation therefore cannot mistake it for sealed evidence.
+    Finalization uses the ordinary merge, fingerprint and complete validator.
+    """
+
+    __slots__ = ('_header', '_edges', '_by_run', '_edge_bytes', '_owner_bytes',
+                 '_owner_edges', 'serialized_bytes', 'index_bytes')
+
+    def __init__(self, header, edges, by_run, edge_bytes, owner_bytes, owner_edges):
+        object.__setattr__(self, '_header', header)
+        object.__setattr__(self, '_edges', MappingProxyType(edges))
+        object.__setattr__(self, '_by_run', MappingProxyType(by_run))
+        object.__setattr__(self, '_edge_bytes', int(edge_bytes))
+        object.__setattr__(self, '_owner_bytes', int(owner_bytes))
+        object.__setattr__(self, '_owner_edges', int(owner_edges))
+        # JSON object order cannot affect its byte count. Include the exact
+        # eventual 64-character SHA field and the commas between map entries.
+        empty = dict(header, edges={}, selected_edge_ids_by_run={}, sha256='0'*64)
+        size = (_json_size(empty) + edge_bytes + owner_bytes
+                + max(0, len(edges)-1) + max(0, len(by_run)-1))
+        if size > _MAX_RECIPE_BYTES:
+            raise MemoryError('SAM branch selection exceeds its bounded packed metadata budget')
+        if len(edges) > _MAX_EDGE_RECORDS or len(by_run) > _MAX_RUN_RECORDS:
+            raise ValueError('SAM branch selection exceeds its bounded edge/owner inventory')
+        object.__setattr__(self, 'serialized_bytes', size)
+        object.__setattr__(self, 'index_bytes', _branch_index_bytes(len(edges), len(by_run), owner_edges))
+
+    def __setattr__(self, name, value):
+        raise TypeError('SAM branch prefixes are immutable')
+
+    def __delattr__(self, name):
+        raise TypeError('SAM branch prefixes are immutable')
+
+    def __getitem__(self, key):
+        if key == 'edges':
+            return self._edges
+        if key == 'selected_edge_ids_by_run':
+            return self._by_run
+        return self._header[key]
+
+    def __iter__(self):
+        yield from self._header
+        yield 'edges'
+        yield 'selected_edge_ids_by_run'
+
+    def __len__(self):
+        return len(self._header)+2
+
+
+def _validated_branch_overlay(prefix, incoming, *, max_index_bytes):
+    """Join immutable validated chunks, or request the original bounded path.
+
+    Only the reader calls this after validating the incoming public recipe and
+    authenticating the prefix snapshot's transaction. Never use a receipt flag
+    to bypass validation. The allowance covers simultaneously live old/new and
+    combined indexes; the ordinary full merge remains the low-credit fallback.
+    """
+    recipes = [recipe for recipe in (prefix, incoming) if recipe is not None]
+    edge_count = sum(len(recipe['edges']) for recipe in recipes)
+    owner_count = sum(len(recipe['selected_edge_ids_by_run']) for recipe in recipes)
+    owner_edges = sum(recipe._owner_edges if isinstance(recipe, _BranchPrefix) else
+        sum(len(ids) for ids in recipe['selected_edge_ids_by_run'].values()) for recipe in recipes)
+    if 3*_branch_index_bytes(edge_count, owner_count, owner_edges) > int(max_index_bytes):
+        return None
+    base = {key: value for key, value in incoming.items()
+            if key not in ('edges', 'selected_edge_ids_by_run', 'sha256')}
+    if prefix is not None and {key: value for key, value in prefix.items()
+            if key not in ('edges', 'selected_edge_ids_by_run', 'sha256')} != base:
+        raise ValueError('SAM branch groups have inconsistent evidence/filter/geometry identities')
+    if prefix is None:
+        edges, by_run, edge_bytes, owner_bytes = {}, {}, 0, 0
+    else:
+        edges, by_run = dict(prefix['edges']), dict(prefix['selected_edge_ids_by_run'])
+        edge_bytes = (prefix._edge_bytes if isinstance(prefix, _BranchPrefix) else
+            _json_size(edges)-2-max(0, len(edges)-1))
+        owner_bytes = (prefix._owner_bytes if isinstance(prefix, _BranchPrefix) else
+            _json_size(by_run)-2-max(0, len(by_run)-1))
+    for edge_id, record in incoming['edges'].items():
+        if edge_id in edges:
+            raise ValueError('SAM branch merge duplicates an edge')
+        edges[edge_id] = record
+    incoming_edges = incoming['edges']
+    edge_bytes += _json_size(incoming_edges)-2-max(0, len(incoming_edges)-1)
+    for run_id, ids in incoming['selected_edge_ids_by_run'].items():
+        if run_id in by_run:
+            owner_bytes -= _json_size({run_id: by_run[run_id]})-2
+            merged = tuple(sorted(set(by_run[run_id]).union(ids)))
+            owner_edges -= len(by_run[run_id])+len(ids)-len(merged)
+        else:
+            merged = ids
+        by_run[run_id] = merged
+        owner_bytes += _json_size({run_id: merged})-2
+    return _BranchPrefix(MappingProxyType(base), edges, by_run,
+        edge_bytes, owner_bytes, owner_edges)
 
 
 def branch_selection_from_value(value):

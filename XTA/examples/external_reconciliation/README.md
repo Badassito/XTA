@@ -77,7 +77,7 @@ Supported fields:
 | `threshold` | Minimum positive support score |
 | `min_sources` | Minimum independently capped evidence groups |
 | `min_prediction_sources` | Minimum groups containing direct prediction evidence |
-| `provenance_weights` | Weights for `prediction`, `bridge`, and `mixed` layers |
+| `provenance_weights` | Weights for `prediction`, `bridge`, `mixed`, and `extrapolation` layers; older three-role policies inherit their bridge weight for extrapolation |
 | `island_weighting` | Enable exact grouped six-connected component statistics |
 | `island_weight_min`, `island_weight_max` | Bounds on the island multiplier |
 | `angular_tolerance_deg` | Orientation-bin width used by section grouping |
@@ -85,7 +85,7 @@ Supported fields:
 | `anchor_bonus` | Bounded bonus where at least two independent predictions meet |
 | `decide` | Optional callable taking a read-only vote-block dictionary and returning a boolean mask |
 
-A vote block exposes `candidate`, `score`, `support`, `prediction_support`,
+A vote block exposes `candidate`, `score`, `support`, `prediction_support`, `extrapolation_support`,
 `anchored`, and `z0`/`z1`. Decisions must preserve shape and may not introduce
 foreground outside the additive candidate union. Input layers are never
 modified. Source bytes are compiled directly after hash verification, avoiding
@@ -187,14 +187,26 @@ Reading native storage never silently starts that
 conversion. Conversion can remain expensive on large views; collection no
 longer pays that cost when confidence is not part of the decision.
 
-Prediction, bridge, and mixed-layer weights remain separate. A bridge has no
-detector confidence of its own; its configured weight is a provenance prior.
+Prediction, bridge, mixed-layer, and extrapolation weights remain separate.
+Bridges and extrapolated tails have no detector confidence of their own; their
+configured weights are provenance priors. Extrapolation support is capped by
+the same geometric evidence groups as ordinary support, so forward/backward
+files from one view cannot invent independent votes. A policy can explicitly
+set `extrapolation=0` or use `extrapolation_support` in its custom decision.
 Tile predictions retain the distinction between parent-prediction acceptance
 and parent-bridge acceptance. Layers belonging to one evidence group contribute
 their maximum at a voxel, so more tiles, TTA copies, or repeated files cannot
 create additional votes for that group.
 Reconciliation operates on accepted components. Proposals already rejected by
 the existing tile gates are not restored by later voting.
+
+SAM extrapolation starts after interpolation completes for each full-frame
+view/angle or consolidated tile configuration. It freezes that scope's
+post-interpolation terminal masks before tracking any tails. Independent
+scopes may run concurrently; source-grid reconciliation is a later stage.
+The `extrapolation` layers carry single-terminal lineage and a raw-empty or
+horizon stop contract, without paired bridge connection certificates. Tails
+do not become parent interpolation support for the existing tile bridge gate.
 
 The anchored example is deliberately **voxel-local**. It rewards an independent
 strong/weak intersection without promoting an entire object because of a

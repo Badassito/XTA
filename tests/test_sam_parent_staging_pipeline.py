@@ -39,8 +39,10 @@ def submission(tmp_path, *, ready=False, staged=True, dispatch_error=False):
             interpolation_walk_back=0,interpolation_candidates=1,interpolation_passes=1,
             interpolation_min_radius=0,interpolation_search_angle=90),
         input_T=3,input_H=4,input_W=5,temp_dir=tmp_path,dense_tiling_active=True,
-        parent_transient_admission=mock.Mock(),interpolation_settings=SimpleNamespace(backend='sam'),
-        sam_context=SimpleNamespace(detector_retirement_ready=ready),sam_parent_staging=stager,
+        parent_transient_admission=mock.Mock(),interpolation_settings=SimpleNamespace(backend='sam',
+            extrapolation_enabled=False, extrapolation_distance=0,
+            extrapolation_walk_back=1, extrapolation_min_radius=3.),
+        sam_context=SimpleNamespace(detector_retirement_ready=ready,shared_detector_devices=('cuda:0',)),sam_parent_staging=stager,
         keep_temp_artifacts=False,parent_slice_postprocess_workers=1,parent_interpolation_task_workers=1,
         component_layers_needed=True,angle_variant_streaming_cleanup_active=False,
         angle_variant_gpu_fastpath_active=False,component_ref_dense_retirement_active=True,
@@ -49,7 +51,9 @@ def submission(tmp_path, *, ready=False, staged=True, dispatch_error=False):
         view_prepare_leases=leases,parent_postprocess_executor=executor,view_processing_futures={},
         gpu_worker_pending_task_ids=[123],_dispatch_inference_windows=dispatch,
         view_processing_volume_shape=lambda *_args:(3,4,5),_view_uses_interpolation=lambda *_args:True)
-    function=_function(Path(pipeline.__file__).read_text(encoding='utf-8'),
+    source=Path(pipeline.__file__).read_text(encoding='utf-8')
+    _function(source,'_sam_parent_requires_staging',namespace)
+    function=_function(source,
         '_submit_view_prepare',namespace)
     return function,namespace,view,key,leases,captured,executor,future,dispatch
 

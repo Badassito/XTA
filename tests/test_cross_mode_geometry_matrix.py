@@ -23,6 +23,7 @@ from XTA.unification.sampling import (
     build_forward_raster_plan,
     forward_sampling_policy,
 )
+from XTA.unification.geometry_identity import geometry_recipe_metadata
 
 
 def _rotation_matrix(
@@ -303,6 +304,7 @@ class CrossModeGeometryMatrixTests(unittest.TestCase):
                 "runtime_view_id": str(plan.view.name),
                 "runtime_job_id": str(plan.tag),
                 "runtime_kind": "fullframe",
+                **geometry_recipe_metadata(plan.view.shared_view, plan.aff),
             },
         )
         self.assertEqual(plan.canonical_plan.digest, expected.digest)
