@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest import mock
 
@@ -211,7 +212,12 @@ class CompleteManifestBoundaryTests(unittest.TestCase):
 
             revalidate.assert_not_called()
             complete_write.assert_not_called()
-            self.assertFalse((output_dir / "manifest.json").exists())
+            manifest_path = output_dir / "manifest.json"
+            self.assertTrue(manifest_path.is_file())
+            self.assertEqual(
+                json.loads(manifest_path.read_text(encoding="utf-8"))["status"],
+                "in_progress",
+            )
 
 
 if __name__ == "__main__":

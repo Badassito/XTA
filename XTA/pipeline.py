@@ -498,7 +498,8 @@ def _parent_prepare_transient_bytes(view, processing_bytes, source_bytes, *,
 
 
 def _policy_parent_prepare_transient_bytes(tasks, source_bytes, workers, *,
-                                          interpolation_distance, retain_confidence):
+                                          interpolation_distance, retain_confidence,
+                                          extrapolation_distance=0):
     """Charge the same capture scratch before policy parent dispatch begins."""
     largest = 2 * GIB
     plans = {}
@@ -513,8 +514,9 @@ def _policy_parent_prepare_transient_bytes(tasks, source_bytes, workers, *,
         plan = plans[key]
         workspace = 0 if plan is None else int(plan.workspace_bytes)
         largest = max(largest, _parent_prepare_transient_bytes(task['view'], math.prod(shape),
-            source_bytes, interpolation_enabled=_view_uses_interpolation(
-                task['view'], int(interpolation_distance)), confidence_workspace_bytes=workspace))
+            source_bytes, interpolation_enabled=(int(extrapolation_distance) > 0 or
+                _view_uses_interpolation(task['view'], int(interpolation_distance))),
+            confidence_workspace_bytes=workspace))
     return largest
 
 
@@ -913,7 +915,7 @@ def _main_impl() -> None:
     gpu_model_path: Optional[str] = None
     cpu_model_path: Optional[str] = None
     sam_bundle = None
-    if interpolation_settings.enabled and interpolation_settings.backend == 'sam':
+    if interpolation_settings.sam_enabled:
         from .lta_sam import resolve_local_sam_bundle
         try:
             sam_bundle = resolve_local_sam_bundle(interpolation_settings.sam_model)
@@ -1909,7 +1911,7 @@ def _main_impl() -> None:
         'native_pull_views': sorted(view.name for view in inference_views
                                     if str(view.family) != 'orthogonal'),
     })
-    if interpolation_settings.enabled and interpolation_settings.backend == 'sam':
+    if interpolation_settings.sam_enabled:
         from .sam_integration import validate_sam_interpolation_geometry
         try:
             validate_sam_interpolation_geometry(inference_views)
@@ -1920,7 +1922,8 @@ def _main_impl() -> None:
         reconciliation_preflight = preflight_reconciliation(
             inference_views, source_shape_tyx=(int(input_T), int(input_H), int(input_W)),
             processing_shape_tyx=(int(T), int(H), int(W)), settings=reconciliation_settings,
-            policy=reconciliation_policy)
+            policy=reconciliation_policy,
+            include_extrapolation=interpolation_settings.extrapolation_enabled)
         write_json_manifest(out_dir / 'reconciliation' / 'preflight.json', reconciliation_preflight)
     interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolation_distance))]
 
@@ -2080,7 +2083,8 @@ def _main_impl() -> None:
         worker_budget=int(worker_budget),
         views=inference_views,
         nrrd_layers_enabled=bool(component_layers_needed),
-        interpolation_enabled=bool(len(interpolating_views) > 0),
+        interpolation_enabled=bool(len(interpolating_views) > 0 or
+                                   interpolation_settings.extrapolation_enabled),
     )
     (
         parent_interpolation_overlap,
@@ -2324,13 +2328,14 @@ def _main_impl() -> None:
         view_prediction_labels[key] = pretty_view_name(_view_for_stats)
     interpolation_stats: List[Dict[str, object]] = []
     sam_context = None
-    if interpolation_settings.enabled and interpolation_settings.backend == 'sam':
+    if interpolation_settings.sam_enabled:
         from .sam_integration import SamInterpolationContext
         source_stat = input_path.stat()
         sam_context = SamInterpolationContext(
             model_path=str(interpolation_settings.sam_model),
             device_ids=interpolation_settings.sam_devices, temp_dir=temp_dir,
             evidence_root=out_dir / 'sam_interpolation', source_volume=volume_rgb,
+            extrapolation_evidence_root=out_dir / 'sam_extrapolation',
             source_identity=f'{input_path}:{source_stat.st_size}:{source_stat.st_mtime_ns}',
             policy=reconciliation_policy,
             bundle_identity=str(sam_bundle.checkpoint_identity_sha256),
@@ -2340,6 +2345,9 @@ def _main_impl() -> None:
             feature_cache_mib=interpolation_settings.sam_feature_cache_mib,
             crop_mode=interpolation_settings.sam_crop_mode,
             delayed_native_expansion=delayed_native_expansion_at_launch,
+            adaptive_crop=interpolation_settings.sam_adaptive_crop,
+            interpolation_policy_enabled=(interpolation_settings.enabled and
+                                          interpolation_settings.backend == 'sam'),
             source_resize_semantics=('native' if not cube_resize_will_apply else
                 'endpoint_aligned_linear_xy_and_t' if preprocess_streaming_active else
                 'opencv_half_pixel_t_slab' if (int(input_H), int(input_W)) == tuple(volume_rgb.shape[-2:]) else
@@ -2898,6 +2906,13 @@ def _main_impl() -> None:
         prediction_sources.drain_completed_prediction_volume_futures
     )
 
+    def _sam_parent_requires_staging(view):
+        return bool(sam_parent_staging is not None and sam_context is not None
+                    and sam_context.shared_detector_devices and not sam_context.detector_retirement_ready
+                    and (interpolation_settings.extrapolation_enabled or
+                         interpolation_settings.backend == 'sam'
+                         and _view_uses_interpolation(view, int(args.interpolation_distance))))
+
     @scheduler_operation('workspace_admission')
     def _ensure_baseline_workspaces(model_name: str, view: ViewInfo) -> None:
         key = (str(model_name), str(view.name))
@@ -2913,6 +2928,13 @@ def _main_impl() -> None:
         # may prefer anonymous RAM. v17.0.1 fixed hybrid D1 runs where GPU direct union was
         # disabled for GPU-only views but CPU-eligible views still write a common direct union.
         process_worker_direct_union = bool(worker_direct_union_active)
+        sam_blocked = _sam_parent_requires_staging(view)
+        staged_disk_backing = bool(sam_blocked
+            and sam_parent_staging.reusable_workspace_paths(union_path, confmap_path))
+        if staged_disk_backing:
+            runtime_telemetry().add('sam_interpolation.staging.disk_from_birth_parents', 1)
+        elif sam_blocked:
+            runtime_telemetry().add('sam_interpolation.staging.checkpoint_copy_backing_parents', 1)
         union_prefer_memory = not policy_settings.enabled and not (
             (
                 interpolation_process_backend_enabled()
@@ -2929,8 +2951,8 @@ def _main_impl() -> None:
                 dtype=np.uint8,
                 path=union_path,
                 desc=f'{model_name}/{view.name} baseline union workspace',
-                prefer_memory=bool(union_prefer_memory),
-                prefer_memfd=bool(process_worker_direct_union),
+                prefer_memory=bool(union_prefer_memory and not staged_disk_backing),
+                prefer_memfd=bool(process_worker_direct_union and not staged_disk_backing),
             )
             if float(args.min_conf) > 0.0 or bool(getattr(args, 'reconciliation_retain_confidence', False)):
                 conf_mm = allocate_workspace_array(
@@ -2938,9 +2960,9 @@ def _main_impl() -> None:
                     dtype=np.uint8,
                     path=confmap_path,
                     desc=f'{model_name}/{view.name} baseline confidence workspace',
-                    prefer_memory=(not process_worker_direct_union and not policy_settings.enabled
+                    prefer_memory=(not staged_disk_backing and not process_worker_direct_union and not policy_settings.enabled
                                    and not bool(getattr(args, 'reconciliation_retain_confidence', False))),
-                    prefer_memfd=bool(process_worker_direct_union),
+                    prefer_memfd=bool(process_worker_direct_union and not staged_disk_backing),
                 )
         except BaseException:
             close_memmap_array_without_flush(
@@ -3081,7 +3103,8 @@ def _main_impl() -> None:
         source_bytes = int(array_nbytes((int(input_T), int(input_H), int(input_W)), np.uint8))
         capture_workspace_bytes = 0 if capture_plan is None else int(capture_plan.workspace_bytes)
         transient_bytes = _parent_prepare_transient_bytes(view, processing_bytes, source_bytes,
-            interpolation_enabled=_view_uses_interpolation(view, int(args.interpolation_distance)),
+            interpolation_enabled=(interpolation_settings.extrapolation_enabled or
+                _view_uses_interpolation(view, int(args.interpolation_distance))),
             confidence_workspace_bytes=capture_workspace_bytes)
 
         task = AdmittedViewPrepare(
@@ -3101,8 +3124,11 @@ def _main_impl() -> None:
             interpolation_search_angle=float(args.interpolation_search_angle),
             interpolation_backend=interpolation_settings.backend,
             sam_context=sam_context,
-            sam_base_allowance_bytes=(4*GIB if _view_uses_interpolation(view,
-                int(args.interpolation_distance)) else 0),
+            extrapolation_distance=interpolation_settings.extrapolation_distance,
+            extrapolation_walk_back=interpolation_settings.extrapolation_walk_back,
+            extrapolation_min_radius=interpolation_settings.extrapolation_min_radius,
+            sam_base_allowance_bytes=(4*GIB if interpolation_settings.extrapolation_enabled or
+                _view_uses_interpolation(view, int(args.interpolation_distance)) else 0),
             keep_temp_artifacts=bool(keep_temp_artifacts),
             slice_workers=int(parent_slice_postprocess_workers),
             interpolation_task_workers=int(parent_interpolation_task_workers),
@@ -3132,8 +3158,7 @@ def _main_impl() -> None:
         transitioned = view_prepare_leases.handoff(key)
         deferred_to_sam = False
         try:
-            if (sam_parent_staging is not None and not sam_context.detector_retirement_ready
-                    and _view_uses_interpolation(view, int(args.interpolation_distance))):
+            if _sam_parent_requires_staging(view):
                 dense_inputs = int(np.asarray(union_mm).nbytes) if union_mm is not None else processing_bytes
                 if confmap_mm is not None:
                     dense_inputs += int(np.asarray(confmap_mm).nbytes)
@@ -3719,9 +3744,13 @@ def _main_impl() -> None:
             interpolation_backend=interpolation_settings.backend,
             sam_context=sam_context,
             sam_upstream_lineage=dict(sam_gate_lineage_by_parent.get((str(model_name), str(view_name)), {})),
+            extrapolation_distance=interpolation_settings.extrapolation_distance,
+            extrapolation_walk_back=interpolation_settings.extrapolation_walk_back,
+            extrapolation_min_radius=interpolation_settings.extrapolation_min_radius,
         )
-        if (sam_context is not None and interpolation_settings.backend == 'sam'
-                and _view_uses_interpolation(view, int(args.interpolation_distance))):
+        if (sam_context is not None and (interpolation_settings.extrapolation_enabled or
+                interpolation_settings.backend == 'sam' and
+                _view_uses_interpolation(view, int(args.interpolation_distance)))):
             from .sam_resources import run_admitted_sam_call
             transient_bytes = 2*int(np.asarray(acc).nbytes)+4*GIB
             fut = tile_postprocess_executor.submit(run_admitted_sam_call,
@@ -4438,7 +4467,9 @@ def _main_impl() -> None:
                 parent_bridge_support_by_model[result.model_name][result.view_name] = result.parent_bridge_support_mm
             if sam_context is not None:
                 support_meta = dict(getattr(result.parent_bridge_support_mm, 'meta', {}))
-                parent_stats = result.interpolation_stats[-1] if result.interpolation_stats else {}
+                parent_interpolation_stats = [item for item in result.interpolation_stats
+                    if item.get('processing_role') != 'extrapolation']
+                parent_stats = parent_interpolation_stats[-1] if parent_interpolation_stats else {}
                 sam_gate_lineage_by_parent[(str(result.model_name), str(result.view_name))] = {
                     'gate_support_identity': str(support_meta.get('gate_support_identity',
                         parent_stats.get('parent_gate_support_identity', ''))),
@@ -5005,7 +5036,8 @@ def _main_impl() -> None:
             'd1_pipeline_active': bool(v1613_d1_owner_active),
             'radial_owner_preflight': any(radial_owner_eligible(
                 view, d1_active=v1613_d1_owner_active, cpu_workers=cpu_worker_process_active,
-                kind='fullframe', interpolation=args.interpolation_distance, tiled=dense_tiling_active,
+                kind='fullframe', interpolation=max(args.interpolation_distance,
+                    interpolation_settings.extrapolation_distance), tiled=dense_tiling_active,
                 angle_count=len(angles), min_conf=args.min_conf, min_radius=args.min_radius,
                 batch=args.gpu_batch, gray=channel_format.kind == 'gray' and channel_format.channel_count == 1,
                 retain_native=bool(keep_temp_artifacts or save_images_enabled or save_labels_enabled or save_binary_enabled),
@@ -5371,7 +5403,8 @@ def _main_impl() -> None:
                 )
                 radial_owner = radial_owner_eligible(
                     view, d1_active=v1613_d1_owner_active, cpu_workers=cpu_worker_process_active,
-                    kind=kind, interpolation=args.interpolation_distance,
+                    kind=kind, interpolation=max(args.interpolation_distance,
+                        interpolation_settings.extrapolation_distance),
                     tiled=bool(dense_tiling_active), angle_count=len(angles),
                     min_conf=args.min_conf, min_radius=args.min_radius, batch=args.gpu_batch,
                     gray=channel_format.kind == 'gray' and channel_format.channel_count == 1,
@@ -5482,6 +5515,8 @@ def _main_impl() -> None:
                         / f'{d1_key}.orthogonal.cvol'
                     )
                     d1_shadow_required = bool(
+                        interpolation_settings.extrapolation_enabled
+                        or
                         _view_uses_interpolation(view, int(args.interpolation_distance))
                         or bool(tile_jobs_by_view_config.get(str(view.name)))
                     )
@@ -5588,6 +5623,7 @@ def _main_impl() -> None:
             source_bytes = math.prod((int(input_T), int(input_H), int(input_W)))
             parent_working = _policy_parent_prepare_transient_bytes(
                 gpu_worker_tasks_by_id.values(), source_bytes, parent_slice_postprocess_workers,
+                extrapolation_distance=interpolation_settings.extrapolation_distance,
                 interpolation_distance=int(args.interpolation_distance),
                 retain_confidence=bool(getattr(args, 'reconciliation_retain_confidence', False)))
             parent_reserve = max(parent_working, min(
@@ -7987,6 +8023,7 @@ def _main_impl() -> None:
                     'sam_devices': list(interpolation_settings.sam_devices),
                     'sam_feature_cache_mib': interpolation_settings.sam_feature_cache_mib,
                     'sam_crop_mode': interpolation_settings.sam_crop_mode,
+                    'sam_adaptive_crop': interpolation_settings.sam_adaptive_crop,
                     'sam_tight_crop_guard': (sam_context.tight_crop_guard if sam_context is not None else None),
                     'sam_tight_crop_guard_at_launch': interpolation_settings.sam_tight_crop_guard,
                     'sam_crop_tile_side': (1008 if interpolation_settings.sam_crop_mode is not None else None),
@@ -8003,6 +8040,23 @@ def _main_impl() -> None:
                     'passes': int(args.interpolation_passes),
                     'search_angle_deg': float(args.interpolation_search_angle),
                     'min_radius': float(args.interpolation_min_radius),
+                },
+                'extrapolation': {
+                    'enabled': interpolation_settings.extrapolation_enabled,
+                    'backend': 'sam',
+                    'distance': interpolation_settings.extrapolation_distance,
+                    'walk_back': interpolation_settings.extrapolation_walk_back,
+                    'min_radius': interpolation_settings.extrapolation_min_radius,
+                    'min_radius_applies_to': 'post_interpolation_terminal_seed_only',
+                    'seed_stage': 'post_interpolation_before_any_extrapolated_tail',
+                    'contact_policy': 'continue',
+                    'stop_contract': 'raw_sam_empty_or_requested_horizon',
+                    'sam_model': str(interpolation_settings.sam_model or ''),
+                    'sam_devices': list(interpolation_settings.sam_devices),
+                    'sam_crop_mode': interpolation_settings.sam_crop_mode,
+                    'sam_adaptive_crop': interpolation_settings.sam_adaptive_crop,
+                    'scopes': [item for item in interpolation_stats
+                               if item.get('processing_role') == 'extrapolation'],
                 },
                 'postprocessing': {
                     'fill_3d_voids': bool(args.enable_3d_void_fill),

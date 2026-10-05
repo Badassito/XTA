@@ -47,9 +47,15 @@ def run_ablation(evidence, selection, output, *, max_group_mib=256,
     policy.update(max_group_bytes=int(max_group_mib*1024**2))
     if 'rescue_max_plane_bytes' in policy:
         policy['rescue_max_plane_bytes'] = int(max_rescue_plane_mib*1024**2)
+    def topology_bytes(group):
+        shape = (len(group['frame_indices']), group['context_bbox_yx'][2]-group['context_bbox_yx'][0],
+                 group['context_bbox_yx'][3]-group['context_bbox_yx'][1])
+        if policy.get('branch_aware_selection', False):
+            from XTA.sam_branch_selection import branch_workspace_bytes
+            return branch_workspace_bytes(shape)
+        return shape[0]*shape[1]*shape[2]*16
     refused = sorted(group_id for group_id, group in raw_bundle.groups.items()
-        if len(group['frame_indices'])*(group['context_bbox_yx'][2]-group['context_bbox_yx'][0])*
-           (group['context_bbox_yx'][3]-group['context_bbox_yx'][1])*16 > policy['max_group_bytes'])
+        if topology_bytes(group) > policy['max_group_bytes'])
     if reuse_original_measurements:
         for field, identity in [('component_filter_implementation_sha256', FILTER_IMPLEMENTATION_SHA256),
                                 ('reader_implementation_sha256', READER_IMPLEMENTATION_SHA256)]:
@@ -61,11 +67,20 @@ def run_ablation(evidence, selection, output, *, max_group_mib=256,
                     original.get('run_receipts', {}).get(run_id, {}).get('measurements', {})):
                 raise ValueError(f'Original intrinsic measurements unavailable for admitted run {run_id}')
 
-    def frozen_measurements(bundle, group, run_ids, mask_filter, execution):
+    def frozen_measurements(bundle, group, run_ids, mask_filter, execution, *, retained_index_bytes=0):
         for field in ('schema', 'enabled', 'connectivity', 'measurement_domain', 'comparison',
                       'threshold_source', 'thresholds_by_group'):
             if mask_filter[field] != original['mask_filter'][field]:
                 raise ValueError(f'Original intrinsic measurement reuse requires unchanged filter {field}')
+        # Reusing measurements starts no worker lanes, but the accepted branch
+        # prefix still occupies its admitted indexes throughout this phase.
+        # Preserve the same effective-credit accounting as the real adapter.
+        credit = max(0, int(execution['parallel_credit_bytes'])-int(retained_index_bytes))
+        if 'branch_metadata' in execution:
+            metadata = execution['branch_metadata']
+            metadata['peak_retained_index_bytes'] = max(metadata['peak_retained_index_bytes'], int(retained_index_bytes))
+            metadata['minimum_effective_parallel_credit_bytes'] = min(
+                metadata['minimum_effective_parallel_credit_bytes'], credit)
         return {run_id: copy.deepcopy(original['run_receipts'][run_id]['measurements']) for run_id in run_ids}
 
     method = ('Frozen original intrinsic measurements, recomputed topology/contact/conflict selection'

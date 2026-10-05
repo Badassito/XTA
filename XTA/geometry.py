@@ -9,6 +9,7 @@ import os
 import queue
 import re
 import threading
+import weakref
 from collections import (
     OrderedDict,
     deque,
@@ -84,6 +85,7 @@ from .unification.contracts import (
     FrameAddress,
     RasterPlan,
     RenderItem,
+    format_angle_identity_text,
 )
 from .unification.sampling import (
     build_forward_raster_plan,
@@ -142,7 +144,7 @@ def _affine2x3_to_3x3(M: np.ndarray) -> np.ndarray:
     return out
 
 def _format_angle_aug_id(angle_deg: float) -> str:
-    token = f'{float(angle_deg):g}'.replace('-', 'm').replace('.', 'p')
+    token = format_angle_identity_text(angle_deg).replace('-', 'm').replace('.', 'p')
     return f'a{token}'
 
 def build_affine(
@@ -711,7 +713,7 @@ def tilted_frame_center(view: ViewInfo, frame_idx: int) -> int:
 
 def _format_signed_angle_token(angle_deg: float) -> str:
     sign = 'p' if float(angle_deg) >= 0.0 else 'm'
-    mag = f'{abs(float(angle_deg)):g}'.replace('.', 'p')
+    mag = format_angle_identity_text(abs(float(angle_deg))).replace('.', 'p')
     return f'{sign}{mag}'
 
 def _format_signed_angle_label(angle_deg: float) -> str:
@@ -3447,13 +3449,13 @@ class TiltedRenderPlan:
     c_lo2d: Optional[np.ndarray] = None        # int32 (H,W)
     c_hi2d: Optional[np.ndarray] = None        # int32 (H,W)
 
-_TILTED_RENDER_PLAN_CACHE: 'OrderedDict[Tuple[str, int, int, Tuple[float, ...]], TiltedRenderPlan]' = OrderedDict()
+_TILTED_RENDER_PLAN_CACHE: 'OrderedDict[Tuple[object, ...], TiltedRenderPlan]' = OrderedDict()
 
 _TILTED_RENDER_PLAN_CACHE_BYTES = 0
 
 _TILTED_RENDER_PLAN_CACHE_LOCK = threading.Lock()
 
-_TILTED_RENDER_PLAN_BUILDS_IN_FLIGHT: Dict[Tuple[str, int, int, Tuple[float, ...]], threading.Event] = {}
+_TILTED_RENDER_PLAN_BUILDS_IN_FLIGHT: Dict[Tuple[object, ...], threading.Event] = {}
 
 def tilted_render_plan_cache_max_bytes() -> int:
     return int(max(0.0, _env_float('YOLO_TTA_TILTED_PLAN_CACHE_GIB', 4.0)) * GIB)
@@ -3470,9 +3472,17 @@ def _tilted_render_plan_nbytes(plan: TiltedRenderPlan) -> int:
             total += int(extra.nbytes)
     return total
 
-def _tilted_plan_cache_key(view: ViewInfo, M_grid_to_src: np.ndarray, grid_h: int, grid_w: int) -> Tuple[str, int, int, Tuple[float, ...]]:
-    mat = tuple(round(float(x), 6) for x in np.asarray(M_grid_to_src, dtype=np.float32).reshape(-1).tolist())
-    return (str(view.name), int(grid_h), int(grid_w), mat)
+def _tilted_plan_cache_key(view: ViewInfo, M_grid_to_src: np.ndarray, grid_h: int, grid_w: int) -> Tuple[object, ...]:
+    # The plan consumes the physical source geometry, not its display/name token.
+    # Keep the effective affine coefficients exact: neighboring float32 values
+    # can choose different nearest taps at a half-pixel boundary.
+    from .unification.geometry_identity import physical_view_recipe
+    base = tilted_base_view_name(view)
+    geometry = json.dumps(
+        physical_view_recipe(view), sort_keys=True, separators=(',', ':'), allow_nan=False,
+    )
+    mat = np.asarray(M_grid_to_src, dtype=np.float32).reshape(2, 3).tobytes(order='C')
+    return (base, int(grid_h), int(grid_w), geometry, mat)
 
 def get_tilted_render_plan(
     view: ViewInfo,
@@ -4273,6 +4283,7 @@ def build_fullframe_raster_plan(
     """Build the canonical TTA plan consumed by one full-frame job."""
 
     from .unification.tta_manifest import radial_view_plan_metadata, spherical_view_plan_metadata, projection_sampling_record
+    from .unification.geometry_identity import geometry_recipe_metadata
     fmt = resolve_channel_format(channel_format)
     return build_forward_raster_plan(
         mode='tta',
@@ -4289,6 +4300,7 @@ def build_fullframe_raster_plan(
             'runtime_view_id': str(view.name),
             'runtime_job_id': str(job.aug_id),
             'runtime_kind': 'fullframe',
+            **geometry_recipe_metadata(view, job.aff),
             **radial_view_plan_metadata(view),
             **spherical_view_plan_metadata(view),
             **projection_sampling_record(view),
@@ -4304,6 +4316,7 @@ def build_dense_tile_raster_plan(
     """Build the canonical TTA plan consumed by one collapsed tile job."""
 
     from .unification.tta_manifest import radial_view_plan_metadata, spherical_view_plan_metadata, projection_sampling_record
+    from .unification.geometry_identity import geometry_recipe_metadata
     fmt = resolve_channel_format(channel_format)
     return build_forward_raster_plan(
         mode='tta',
@@ -4326,6 +4339,7 @@ def build_dense_tile_raster_plan(
             'tile_config_id': str(tile_job.config_id),
             'tile_x': int(tile_job.tile_x),
             'tile_y': int(tile_job.tile_y),
+            **geometry_recipe_metadata(view, tile_job),
             **radial_view_plan_metadata(view),
             **spherical_view_plan_metadata(view),
             **projection_sampling_record(view),
@@ -4581,11 +4595,17 @@ def build_view_frame_cache(
     )
     return cache_mm
 
-_CORONAL_BLOCK_CACHE: 'OrderedDict[Tuple[int, Tuple[int, int, int], int], np.ndarray]' = OrderedDict()
+@dataclass(frozen=True)
+class _CoronalBlockCacheEntry:
+    source_ref: weakref.ReferenceType[np.ndarray]
+    block: np.ndarray
+
+
+_CORONAL_BLOCK_CACHE: 'OrderedDict[Tuple[object, ...], _CoronalBlockCacheEntry]' = OrderedDict()
 
 _CORONAL_BLOCK_CACHE_LOCK = threading.Lock()
 
-_CORONAL_BLOCK_BUILDS_IN_FLIGHT: Dict[Tuple[int, Tuple[int, int, int], int], threading.Event] = {}
+_CORONAL_BLOCK_BUILDS_IN_FLIGHT: Dict[Tuple[object, ...], threading.Event] = {}
 
 def coronal_block_cols() -> int:
     """Columns per cached coronal block (64 x 1 B = one full cache line)."""
@@ -4595,9 +4615,29 @@ def coronal_block_cache_blocks() -> int:
     """Coronal block LRU capacity, in blocks (each K*T*H bytes)."""
     return max(1, _env_int('YOLO_TTA_CORONAL_BLOCK_CACHE', 2))
 
-def _coronal_block_cache_key(volume: np.ndarray, block_idx: int) -> Tuple[int, Tuple[int, int, int], int]:
+def _coronal_block_cache_key(
+    volume: np.ndarray,
+    block_idx: int,
+    block_cols: Optional[int] = None,
+) -> Tuple[object, ...]:
     ptr = int(volume.__array_interface__['data'][0])
-    return (ptr, tuple(int(x) for x in volume.shape), int(block_idx))
+    K = int(coronal_block_cols()) if block_cols is None else int(block_cols)
+    return (
+        id(volume), ptr, tuple(int(x) for x in volume.shape),
+        tuple(int(x) for x in volume.strides), volume.dtype, K, int(block_idx),
+    )
+
+
+def _remove_coronal_block_for_collected_source(
+    key: Tuple[object, ...],
+    source_ref: weakref.ReferenceType[np.ndarray],
+) -> None:
+    with _CORONAL_BLOCK_CACHE_LOCK:
+        cached = _CORONAL_BLOCK_CACHE.get(key)
+        # An old callback must not remove a replacement stored under a recycled
+        # identity, including after eviction while a returned frame is alive.
+        if cached is not None and cached.source_ref is source_ref:
+            _CORONAL_BLOCK_CACHE.pop(key, None)
 
 def _build_coronal_block(volume: np.ndarray, x0: int, x1: int) -> np.ndarray:
     T, H, _W = (int(v) for v in volume.shape)
@@ -4610,16 +4650,19 @@ def _build_coronal_block(volume: np.ndarray, x0: int, x1: int) -> np.ndarray:
     return blk
 
 def _coronal_frame_from_block_cache(volume: np.ndarray, x: int) -> np.ndarray:
+    """Read cached copies from a weakly owned, immutable source volume."""
     K = int(coronal_block_cols())
     W = int(volume.shape[2])
     block_idx = int(x) // K
-    key = _coronal_block_cache_key(volume, block_idx)
+    key = _coronal_block_cache_key(volume, block_idx, K)
     while True:
         with _CORONAL_BLOCK_CACHE_LOCK:
             cached = _CORONAL_BLOCK_CACHE.get(key)
-            if cached is not None:
+            if cached is not None and cached.source_ref() is volume:
                 _CORONAL_BLOCK_CACHE.move_to_end(key)
-                return cached[int(x) - block_idx * K]
+                return cached.block[int(x) - block_idx * K]
+            if cached is not None:
+                _CORONAL_BLOCK_CACHE.pop(key, None)
             in_flight = _CORONAL_BLOCK_BUILDS_IN_FLIGHT.get(key)
             if in_flight is None:
                 _CORONAL_BLOCK_BUILDS_IN_FLIGHT[key] = threading.Event()
@@ -4628,8 +4671,12 @@ def _coronal_frame_from_block_cache(volume: np.ndarray, x: int) -> np.ndarray:
     try:
         x0 = block_idx * K
         blk = _build_coronal_block(volume, x0, min(W, x0 + K))
+        source_ref = weakref.ref(
+            volume,
+            lambda ref: _remove_coronal_block_for_collected_source(key, ref),
+        )
         with _CORONAL_BLOCK_CACHE_LOCK:
-            _CORONAL_BLOCK_CACHE[key] = blk
+            _CORONAL_BLOCK_CACHE[key] = _CoronalBlockCacheEntry(source_ref, blk)
             _CORONAL_BLOCK_CACHE.move_to_end(key)
             while len(_CORONAL_BLOCK_CACHE) > coronal_block_cache_blocks():
                 _CORONAL_BLOCK_CACHE.popitem(last=False)

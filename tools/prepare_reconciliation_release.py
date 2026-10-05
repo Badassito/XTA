@@ -222,6 +222,58 @@ DEVELOPMENTS['sam-bridges-v24.0.2'] = dict(
         'tools/replay_sam_branch_policies.py', 'tools/recover_sam_refused_family.py',
         'tools/export_sam_source_replay.py', 'tools/benchmark_sparse_azimuthal_projection.py'),
 )
+DEVELOPMENTS['sam-extrapolation-v24.1.0'] = dict(
+    token='24_1_0_sam_extrapolation_development', prefix='REVIEWED_V24_1_0_SAM_EXTRAPOLATION_DEVELOPMENT',
+    key='v24_1_0_sam_extrapolation_development_review', contract='reviewed_v24_1_0_sam_extrapolation_development_contract',
+    previous_review_key='v24_0_2_sam_bridges_development_review',
+    previous_review_prefix='REVIEWED_V24_0_2_SAM_BRIDGES_DEVELOPMENT',
+    feature='sam-extrapolation-v24.1.0-development', predecessor_inventory_path='release/_package_inventory.json',
+    validation_tools=DEVELOPMENTS['sam-bridges-v24.0.2']['validation_tools'] + (
+        'tools/smoke_sam_extrapolation.py', 'tools/smoke_sam_crop_retry.py',
+        'tools/smoke_sam_image_cohorts.py', 'tools/smoke_sam_gpu_handoff.py',
+        'tools/smoke_sam_feature_dispatch.py', 'tools/profile_sam_branch_metadata.py',
+        'tools/run_transport.py', 'tools/source_archive_history.py',
+        'tools/lta_trace_summary.py'),
+)
+SAM_EXTRAPOLATION_DEVELOPMENT_REASONS = {
+    '__init__': 'Identify the separately source-reviewed, uncommitted v24.1.0 candidate.',
+    'config': 'Resolve independent interpolation and extrapolation settings, an explicit tail horizon and walk-back seed, disabled-by-default bounded adaptive crop retry options, and a 1024 MiB default feature cache bounded by effective free memory and headroom.',
+    'cli': 'Pass the validated SAM interpolation and extrapolation contract into one mode launch.',
+    'sam_extrapolation_planning': 'Freeze eligible post-interpolation terminals and plan original-seed tails with one shared per-frame observation index across cohorts and retries.',
+    'sam_extrapolation': 'Generate frozen original-seed tails through bounded complete-group image cohorts and balanced exact-crop family dispatch with an explicit flat backout, retaining one scope/selection/publication and uniform child model/runtime provenance.',
+    'sam_extrapolation_policy': 'Retain binary-authoritative tail prefixes through the first actual SDK-empty mask or declared horizon with separate authenticated selection receipts.',
+    'sam_crop_retry': 'Decide one bounded crop enlargement from raw internal-border contact, preserving the original seed and complete interval without granting resource credits.',
+    'sam_evidence': 'Import bounded encoded proposal payloads with validated geometry and immutable source identity, retain separate retry-attempt lineage, and inspect packed crop boundaries without full-plane decoding.',
+    'sam_policy': 'Keep paired interpolation policy interpretation separate from explicitly tagged one-seed extrapolation evidence and reuse validated branch-prefix metadata under the original ownership and resource contracts.',
+    'sam_branch_selection': 'Avoid repeated branch-prefix Python copies while retaining bounded metadata, authenticated selection ownership and complete final validation.',
+    'sam_mask_reader': 'Reuse validated branch-prefix state only within the authenticated reader owner and declared caps, preserving final metadata and pixel validation.',
+    'sam_replay': 'Preserve explicit extrapolation provenance when choosing the compatible retained-evidence replay route.',
+    'sam_integration': 'Run extrapolation after interpolation with bounded image cohorts, batch canonical lazy Transverse rendering within admitted host workspace, and lend idle SAM compute to approved projections only after validated worker completion while retaining resident model ownership.',
+    'sam_transverse_cache_rendering': 'Batch lazy Transverse image-cache rendering over bounded spatial slabs while preserving exact OpenCV depth interpolation and canonical plane remapping.',
+    'sam_interpolation': 'Retain interpolation and shared tracker contracts, optionally retry the complete original-seeded interval under the bounded crop controller, and expose optional operation-specific host phase traces.',
+    'assembly': 'Publish SAM extrapolation layers through the recorded source-grid transform and preserve their distinct tail provenance.',
+    'pipeline': 'Carry optional SAM tails and live context admission while selecting verified run-owned backing from birth for blocked shared-SAM parents.',
+    'view_prepare': 'Retain prepared source and SAM context ownership through the optional extrapolation stage.',
+    'outputs': 'Record tail provenance and cap only oversized physical NRRD basenames while preserving logical labels, pixels, headers and manifest identity.',
+    'interpolation': 'Declare extrapolation-compatible layer and mask semantics without changing the SDF interpolation arithmetic.',
+    'reconciliation': 'Reconcile directional extrapolation layers with independent raw SAM lineage and charge their additional per-group role workspace before startup.',
+    'reconciliation_io': 'Validate explicit SAM tail provenance when reading extrapolation layer manifests.',
+    'reconciliation_policy': 'Preserve extrapolation lineage separately from paired-endpoint interpolation policy metadata.',
+    'reconciliation_runtime': 'Carry authenticated tail provenance through retained-evidence reconciliation and publication.',
+    'geometry': 'Keep Coronal and tilted raster caches tied to exact physical geometry and lifetime, with lossless angle IDs and complete effective raster metadata.',
+    'backprojection': 'Use exact dense Azimuthal geometry cache identities, admit tilted projection plans before reporting their geometry, and permit approved source projections to borrow validated idle SAM compute without borrowing resident model memory.',
+    'pta': 'Invalidate previous completion before startup cleanup, preserve failure provenance and declare complete effective physical raster metadata.',
+    'unification/geometry_identity': 'Declare versioned exact physical raster geometry and effective affine identity without changing the historical generic plan hash protocol.',
+    'unification/contracts': 'Format finite angle identities losslessly so distinct physical views cannot share a truncated public identifier.',
+    'unification/sampling': 'Preserve independently validated historical high-precision angle spelling only in the generic reader while new workers require complete physical raster recipes.',
+    'lta_runtime': 'Bind native LTA raster plans to complete versioned physical geometry and effective affine metadata.',
+    'lta_rendering': 'Bind public LTA rendered-view plans to the same complete physical geometry and effective affine recipe.',
+    'sam_bridge_planning': 'Preserve original frozen observations and shared planning contracts when reused by bounded extrapolation and crop retry.',
+    'sam_cyclic': 'Retain cyclic original-observation history and seam addressing in bounded one-direction terminal planning.',
+    'sam_tracker_runtime': 'Retire every tracker result and completed family exactly once before releasing owned cohort image mappings, retain borrowed permanent inputs, and authenticate device-wide worker completion before any idle compute handoff.',
+    'sam_parent_staging': 'Expose verified reusable run-owned backing paths without changing logical parent credits, lease rebinds or immutable baseline lifetime.',
+    'run_transport': 'Create verified ZIP64 run-transfer envelopes with complete scientific diagnostics and separate public-output inventories, preserving producer schemas and files.',
+}
 SAM_BRIDGES_DEVELOPMENT_REASONS = {
     '__init__': 'Identify the separately source-reviewed, uncommitted v24.0.2 candidate.',
     'assembly': 'Project selected native SAM masks into the source grid with admitted worker counts and return dense-confidence credit only after its last owner retires.',
@@ -577,20 +629,20 @@ REMOVED_STATEMENT_HASH_REASONS = {
 TOOL_REASONS = {
     'tools/qualify_sam_family_dispatch.py': 'Qualify experimental family dispatch with bounded real-model mask/score equivalence, cache/resource counters, explicit GPU reservation and source identities.',
     'tools/qualify_sam_policy_throughput.py': 'Qualify bounded serial/parallel saved-evidence policy replay, selected directional bridge bytes and CPU performance without loading tracker models or modifying raw evidence.',
-    'tools/benchmark_confidence_capture.py': 'Compare bounded qualified-source and current confidence capture with exact payload/summary parity, source identity, resource checks and declared CPU measurement conditions.',
+    'tools/benchmark_confidence_capture.py': 'Use the exact retained History baseline for bounded confidence capture comparisons with unchanged payload parity, source/resource provenance and CPU measurement controls.',
     'tools/benchmark_native_pull_projection.py': 'Compare bounded native destination projection throughput with recorded worker/cache budgets, numerical equivalence and hardware/source provenance.',
     'tools/qualify_projection_coverage.py': 'Require selected projection coverage numerical cases to execute without skips and retain actual hardware, source identity, JUnit and GPU-reservation evidence.',
     'tools/qualify_sam_interpolation_long_session.py': 'Check long independent SAM endpoint sessions on a declared repetition of one retained real frame and prescribed original seed, without claiming interpolation accuracy or production throughput.',
-    'tools/prepare_reconciliation_release.py': 'Prepare a clearly labelled development audit against exact tagged source without rewriting a release or changing package identity.',
+    'tools/prepare_reconciliation_release.py': 'Prepare an independently pinned source-review appendix against exact tagged predecessor source, retaining statement/tool lineage and truthful uncommitted identity.',
     'tools/sam_outer_crop_geometry.py': 'Define frozen research-only C/A outer-context variants by integer embedding of complete swept-corrected contracts without relabeling tagged geometry.',
     'tools/prepare_sam_outer_crop_experiment.py': 'Prepare exact native source windows and input hashes without reading annotations or modifying intensity pixels.',
-    'tools/prepare_sam_outer_crop_protocol.py': 'Lock data-only outer-crop recipes and seal geometry before model work and label scoring, distinguishing literal tagged baseline from revised planning.',
+    'tools/prepare_sam_outer_crop_protocol.py': 'Validate exact unique group counts, retained bytes and linked schemas before sealing data-only crop protocols while preserving partial/refused and empty controls.',
     'tools/run_sam_outer_crop_experiment.py': 'Execute sealed outer-crop research plans through a common tracker/evaluator with attributable raw evidence and explicit non-production baseline recipes.',
     'tools/run_sam_outer_crop_stress.py': 'Run separately declared single-family outer-context stress controls while reusing retained controls and preserving production defaults.',
     'tools/analyze_sam_outer_crop.py': 'Score sealed raw, radius-filtered, candidate, and selected research layers separately, preserving refusal/unknown outcomes and fixed native contour domains.',
     'tools/derive_sam_acceptance_evidence.py': 'Derive sealed A-only fixed-raw diagnostic evidence with byte-identical C2 masks/scores and explicit historical guarded v4/v5 controls after production defaults change.',
-    'tools/qualify_sam_tiled_schedule.py': 'Run exact-mask/score ABBA qualification of crop-contiguous single-worker scheduling with model startup separated and no geometry or quality changes.',
-    'tools/report_sam_outer_crop.py': 'Report already scored outer-crop research with validated provenance and explicit limits without selecting masks or inventing accuracy metrics.',
+    'tools/qualify_sam_tiled_schedule.py': 'Authenticate the exact ABBA trials and source artifacts for mask/score comparison while retaining original execution qualification failures separately.',
+    'tools/report_sam_outer_crop.py': 'Account for every indexed crop dataset, preserve missing evidence as incomplete and keep unavailable metrics absent in normalized research reports.',
     'tools/generate_sam_outer_crop_sdf.py': 'Generate unchanged production SDF references from exact sealed observations without reading images/labels, CUDA execution, or overwriting existing references.',
     'tools/study_sam_fusion.py': 'Compare frozen fusion variants over retained selected SAM proposals without inference, separating development diagnostics from independently withheld labels.',
     'tools/qualify_sdf_alignment.py': 'Evaluate predeclared SDF anchor/transport/area experiments without changing the production SDF generator or using labels before predictions are frozen.',
@@ -630,7 +682,7 @@ TOOL_REASONS = {
     'tools/evaluate_sam_extrapolation.py': 'Evaluate research-only unidirectional SAM trajectories with terminal-free generation and holdout diagnostics, without claiming a production extrapolation backend.',
     'tools/audit_sam_bridge_overlap.py': 'Audit source-grid and native SAM bridge occupancy against final raw predictions with comparable-frame coverage and no invented independent labels.',
     'tools/analyze_tta_scheduling.py': 'Compare retained production scheduling traces, dense-confidence ownership, SAM contexts and dispatch latency with incomplete-capture limitations.',
-    'tools/ablate_sam_tight_crop_guard.py': 'Replay a bounded tight-crop guard ablation with policy and input identities, recomputed safety checks and explicit resource or reuse limitations.',
+    'tools/ablate_sam_tight_crop_guard.py': 'Replay a bounded tight-crop guard ablation with policy and input identities, recomputed safety checks, explicit reuse limitations, retained branch-index credit and resource abstention using the shared branch workspace estimate.',
     'tools/evaluate_sam_reference_quality.py': 'Compare retained SAM selections and diagnostic ceilings against the same-input SDF reference with explicit original-observation exclusions and domains.',
     'tools/generate_sam_group_sdf_reference.py': 'Generate bounded crop-local SDF references from retained original observations, recording native transforms and limits on whole-production parity.',
     'tools/evaluate_sam_group_reference_quality.py': 'Measure bounded SAM group support against crop-local SDF references and distinguish working-canvas quality from native/source rendering.',
@@ -639,6 +691,15 @@ TOOL_REASONS = {
     'tools/recover_sam_refused_family.py': 'Generate original-seed research proposals for a resource-refused family and retain exact evidence, reference quality and branch-policy replay.',
     'tools/export_sam_source_replay.py': 'Export an authenticated retained SAM selection through the production source-grid and NRRD publication route without model inference.',
     'tools/benchmark_sparse_azimuthal_projection.py': 'Measure CPU sparse Tilted-Azimuthal projection on synthetic masks with exact predecessor parity and an independent physical row-band oracle.',
+    'tools/smoke_sam_extrapolation.py': 'Prepare and run a bounded real-SAM functional smoke with atomic GPU reservation, immutable fixture/source pins and explicit extrapolation provenance.',
+    'tools/smoke_sam_crop_retry.py': 'Validate bounded opt-in crop retry on one predeclared original family with actual model contact triggers, live admission and a shared atomic GPU reservation.',
+    'tools/smoke_sam_image_cohorts.py': 'Compare bounded uncapped and forced-cohort real-SAM execution with immutable complete-group inputs, raw mask parity and actual source/resource evidence.',
+    'tools/smoke_sam_gpu_handoff.py': 'Qualify actual persistent-SAM compute handoff to admitted source projections with worker quiescence, resident-owner fencing, exact repeated-session parity and immutable source/input pins.',
+    'tools/smoke_sam_feature_dispatch.py': 'Compare bounded 512/1024 MiB feature-cache and flat/family dispatch arms on identical frozen original seeds with exact functional parity and immutable source/input pins.',
+    'tools/profile_sam_branch_metadata.py': 'Measure retained branch-prefix metadata work and warmed paired runtimes under a bounded RSS envelope, preserving exact final metadata recipes without mask decoding or model quality claims.',
+    'tools/run_transport.py': 'Expose verified run diagnostics/output transport and extraction without changing producer execution or measurement schemas.',
+    'tools/source_archive_history.py': 'Resolve canonical retained History fixtures and require exact independent archive hashes so missing copies cannot silently skip guards.',
+    'tools/lta_trace_summary.py': 'Read ordinary or verified transported LTA diagnostics without changing producer event schemas or source measurement values.',
 }
 
 
@@ -901,10 +962,13 @@ def prepare(*, output_dir, release='24.0.0', development=None, write=False, pred
         raise ValueError(f'v{release} is already tagged; its authenticated review cannot be rewritten')
     spec = DEVELOPMENTS[development] if development is not None else RELEASES[release]
     sam_bridges_candidate = development == 'sam-bridges-v24.0.2'
+    sam_extrapolation_candidate = development == 'sam-extrapolation-v24.1.0'
     if development is not None:
-        tag = 'v24.0.1' if sam_bridges_candidate else 'v24.0.0'
+        tag = 'v24.0.2' if sam_extrapolation_candidate else 'v24.0.1' if sam_bridges_candidate else 'v24.0.0'
         actual_tag = subprocess.check_output(['git', 'rev-parse', tag + '^{commit}'], cwd=root, text=True).strip()
-        expected_tag = (inventory.REVIEWED_V24_0_2_SAM_BRIDGES_DEVELOPMENT_PREDECESSOR_COMMIT
+        expected_tag = (inventory.REVIEWED_V24_1_0_SAM_EXTRAPOLATION_DEVELOPMENT_PREDECESSOR_COMMIT
+                        if sam_extrapolation_candidate else
+                        inventory.REVIEWED_V24_0_2_SAM_BRIDGES_DEVELOPMENT_PREDECESSOR_COMMIT
                         if sam_bridges_candidate else inventory.REVIEWED_V24_OUTER_CROP_DEVELOPMENT_PREDECESSOR_COMMIT)
         if actual_tag != expected_tag:
             raise ValueError(f'Development predecessor differs from the independently pinned {tag} tag')
@@ -915,7 +979,8 @@ def prepare(*, output_dir, release='24.0.0', development=None, write=False, pred
             raise ValueError('Released predecessor tag differs from the independently pinned v24.0.0 commit')
     archived_development = development in ('guarded-rescue', 'job150615', 'job150615-headroom', 'job150772-performance', 'job150790-150798-throughput')
     archived_source = archived_development or release_patch
-    reasons = (SAM_BRIDGES_DEVELOPMENT_REASONS if sam_bridges_candidate else
+    reasons = (SAM_EXTRAPOLATION_DEVELOPMENT_REASONS if sam_extrapolation_candidate else
+               SAM_BRIDGES_DEVELOPMENT_REASONS if sam_bridges_candidate else
                {} if archived_source else OUTER_CROP_DEVELOPMENT_REASONS if development is not None else
                SAM_INTERPOLATION_REASONS if release == '24.0.0' else
                TTA_PTA_THROUGHPUT_REASONS if release == '23.0.5' else
@@ -924,7 +989,9 @@ def prepare(*, output_dir, release='24.0.0', development=None, write=False, pred
                 **(SEMANTIC_REASONS if release == '23.0.1' else {}),
                 **(PATCH_REASONS if release == '23.0.2' else {}),
                 **(TTA_THROUGHPUT_REASONS if release == '23.0.3' else {})})
-    fallback_reason = ('Correct SAM bridge scheduling, acceptance and spatial publication in the uncommitted v24.0.2 candidate.'
+    fallback_reason = ('Implement bounded one-direction SAM extrapolation from original observations in the uncommitted v24.1.0 candidate.'
+                       if sam_extrapolation_candidate else
+                       'Correct SAM bridge scheduling, acceptance and spatial publication in the uncommitted v24.0.2 candidate.'
                        if sam_bridges_candidate else
                        'Reduce confidence-evidence and SAM publication work while preserving required mask, radius and reader contracts.'
                        if development == 'job150790-150798-throughput' else
@@ -1000,7 +1067,7 @@ def prepare(*, output_dir, release='24.0.0', development=None, write=False, pred
         paths = subprocess.check_output(['git', 'diff', '--name-only', predecessor_commit, '--', 'XTA'], cwd=root, text=True).splitlines()
         paths += subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard', '--', 'XTA'], cwd=root, text=True).splitlines()
     patch_development = development in ('job150772-performance', 'job150790-150798-throughput')
-    review = dict(release='24.0.2' if sam_bridges_candidate else '24.0.1' if patch_development else release, feature=spec['feature'],
+    review = dict(release='24.1.0' if sam_extrapolation_candidate else '24.0.2' if sam_bridges_candidate else '24.0.1' if patch_development else release, feature=spec['feature'],
         previous_review_sha256=getattr(inventory, spec['previous_review_prefix'] + '_SHA256') if 'previous_review_prefix' in spec else
             getattr(inventory, 'REVIEWED_V' + spec['previous_token'] + '_RELEASE_SHA256'),
         predecessor_commit=predecessor_commit, predecessor_inventory_sha256=canonical(predecessor),
@@ -1009,8 +1076,10 @@ def prepare(*, output_dir, release='24.0.0', development=None, write=False, pred
         preserved_radial_module_updates=[], complete_modules=[], module_snapshots=[])
     if development is not None:
         review.update(kind='development', development=development,
-                      package_version='24.0.2' if sam_bridges_candidate else '24.0.1' if patch_development else '24.0.0',
-                      released=False, predecessor_tag='v24.0.1' if sam_bridges_candidate else 'v24.0.0')
+                      package_version='24.1.0' if sam_extrapolation_candidate else '24.0.2' if sam_bridges_candidate else '24.0.1' if patch_development else '24.0.0',
+                      released=False, predecessor_tag='v24.0.2' if sam_extrapolation_candidate else 'v24.0.1' if sam_bridges_candidate else 'v24.0.0')
+    if sam_extrapolation_candidate:
+        review.update(released_predecessor_version='24.0.2', source_review_only=True)
     if sam_bridges_candidate:
         review.update(released_predecessor_version='24.0.1', source_review_only=True)
     if archived_source:

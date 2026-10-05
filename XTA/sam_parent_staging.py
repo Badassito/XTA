@@ -234,6 +234,19 @@ class DeferredSamParentQueue:
     def dense_limit(self):
         return int(self._dense_limit() if callable(self._dense_limit) else self._dense_limit)
 
+    def reusable_workspace_paths(self, *paths):
+        """Allow disk-from-birth only on the existing owned regular-disk root.
+
+        A tmpfs input keeps the ordinary checkpoint-copy route to the verified
+        output backing. This does not introduce another input ownership root.
+        """
+        if self.stop.is_set() or not paths:
+            return False
+        root = self.source_root.resolve()
+        return all(Path(path).resolve().is_relative_to(root)
+                   and not Path(path).is_symlink()
+                   and not path_is_memory_backed(Path(path).parent) for path in paths)
+
     def defer(self, task, required_bytes):
         key = (str(task.model_name), str(task.view.name))
         if self.stop.is_set():

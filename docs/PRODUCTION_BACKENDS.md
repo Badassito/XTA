@@ -1,7 +1,6 @@
 # Production backend policy
 
-This policy accompanies the separate required-compiled-CPU change in the current
-v24.0.4 working tree. Production numerical modules require Numba; slow scalar
+Production numerical modules require Numba; slow scalar
 reference implementations live in the test suite instead of serving as automatic
 recovery from a missing or failed compiler.
 
@@ -9,10 +8,9 @@ recovery from a missing or failed compiler.
 
 - H100 is the primary production GPU; A100 is the fallback target.
 - Volta/V100 is outside the supported deployment scope.
-- The local RTX 4090 Laptop GPU and Ryzen CPU provide development correctness
-  checks and directional measurements, not H100/A100 throughput qualification.
-- The current local inference stack is TensorRT 10.16.1.11 for CUDA 12.
-  Model engines and their dependencies still require target-specific validation.
+- Development hardware provides correctness checks and local performance sanity
+  measurements. Production throughput, model engines and their dependencies
+  require target-specific validation.
 
 ## Admission principles
 
@@ -82,11 +80,11 @@ explicit CPU inference, or different algorithms retain their separate contracts.
 
 ```powershell
 python -B tools/benchmark_cpu_backends.py --mode check --workload smoke `
-  --output-dir ../Scratch/Experiments/Backend_Policy/check-new
+  --output-dir ../Scratch/Experiments/REVIEW_NAME/backend-check
 
 python -B tools/benchmark_cpu_backends.py --mode benchmark --workload scaled `
   --threads 1 --heatsoak-seconds 60 --repeats 5 `
-  --output-dir ../Scratch/Experiments/Backend_Policy/benchmark-new
+  --output-dir ../Scratch/Experiments/REVIEW_NAME/backend-benchmark
 ```
 
 Run these development tools from the complete source checkout or source

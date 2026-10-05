@@ -18,6 +18,7 @@ from typing import Mapping
 import numpy as np
 
 CYCLIC_FRAME_ADDRESSING_SCHEMA = "xta.sam_cyclic_view_frames/1"
+CYCLIC_EXTRAPOLATION_ADDRESSING_SCHEMA = "xta.sam_cyclic_extrapolation_frames/1"
 _SOURCE_PATH = Path(__file__).resolve()
 IMPLEMENTATION_SHA256 = hashlib.sha256(_SOURCE_PATH.read_bytes()).hexdigest()
 
@@ -33,11 +34,14 @@ class CyclicFrameAddresses(MappingABC):
     native_count: int
     evidence_count: int
     period_degrees: float
+    addressing_schema: str = CYCLIC_FRAME_ADDRESSING_SCHEMA
 
     def __post_init__(self):
         native = _integer(self.native_count, "native frame count")
         evidence = _integer(self.evidence_count, "evidence frame count")
-        if not 1 <= native <= evidence < 2 * native:
+        maximum=(3*native-2 if self.addressing_schema==CYCLIC_EXTRAPOLATION_ADDRESSING_SCHEMA else 2*native-1)
+        if (self.addressing_schema not in {CYCLIC_FRAME_ADDRESSING_SCHEMA,CYCLIC_EXTRAPOLATION_ADDRESSING_SCHEMA}
+                or not 1 <= native <= evidence <= maximum):
             raise ValueError("Cyclic frame map exceeds its bounded alias prefix")
         address_for_unfolded_index(0, native, period_degrees=self.period_degrees)
 
@@ -113,21 +117,22 @@ def build_cyclic_frame_addressing(native_shape_tyx, alias_frames: int, *, period
 def validate_cyclic_frame_addressing(metadata, *, expected_frames=None):
     """Check shape, bounded closure, frame identity and mirror parity on reading."""
     assert_cyclic_implementation_unchanged()
-    if not isinstance(metadata, Mapping) or metadata.get("schema") != CYCLIC_FRAME_ADDRESSING_SCHEMA:
+    if not isinstance(metadata, Mapping) or metadata.get("schema") not in {CYCLIC_FRAME_ADDRESSING_SCHEMA,CYCLIC_EXTRAPOLATION_ADDRESSING_SCHEMA}:
         raise ValueError("Unsupported cyclic SAM frame-address schema")
     native = tuple(_integer(value, "native shape") for value in metadata["native_shape_tyx"])
     evidence = tuple(_integer(value, "evidence shape") for value in metadata["evidence_shape_tyx"])
     alias = _integer(metadata["alias_frames"], "alias frame count")
     if len(native) != 3 or len(evidence) != 3 or any(value < 1 for value in native):
         raise ValueError("Malformed cyclic SAM native/evidence shape")
-    if not 0 <= alias < native[0] or evidence != (native[0] + alias, *native[1:]):
+    maximum=2*(native[0]-1) if metadata['schema']==CYCLIC_EXTRAPOLATION_ADDRESSING_SCHEMA else native[0]-1
+    if not 0 <= alias <= maximum or evidence != (native[0] + alias, *native[1:]):
         raise ValueError("Cyclic SAM aliases violate their bounded native closure")
     period = metadata["period_degrees"]
     address_for_unfolded_index(0, native[0], period_degrees=period)
     if "addresses" not in metadata:
         if expected_frames is not None:
             raise ValueError("Cyclic SAM group must retain each declared frame address")
-        return CyclicFrameAddresses(native[0], evidence[0], period)
+        return CyclicFrameAddresses(native[0], evidence[0], period,metadata['schema'])
     raw_addresses = metadata["addresses"]
     if not isinstance(raw_addresses, Mapping):
         raise ValueError("Cyclic SAM frame addresses must be a mapping")
@@ -173,6 +178,23 @@ class CyclicObservationVolume:
 
     def __array__(self, *args, **kwargs):
         raise RuntimeError("Cyclic SAM observations are slice-only; dense extended volumes are forbidden")
+
+
+class ExtrapolationCyclicObservationVolume(CyclicObservationVolume):
+    """Tail-scoped extra aliases preserve both inward seeds and full tail horizon."""
+    def __init__(self,original,alias_frames,*,period_degrees=180.):
+        shape=tuple(_integer(v,'native shape') for v in original.shape)
+        aliases=_integer(alias_frames,'alias frame count')
+        if len(shape)!=3 or any(v<1 for v in shape) or not 0<=aliases<=2*(shape[0]-1):
+            raise ValueError('Extrapolation cyclic aliases exceed their separate bounded closure')
+        self.original=original
+        self.frame_addressing=MappingProxyType(dict(schema=CYCLIC_EXTRAPOLATION_ADDRESSING_SCHEMA,
+            native_shape_tyx=shape,evidence_shape_tyx=(shape[0]+aliases,*shape[1:]),
+            alias_frames=aliases,period_degrees=float(period_degrees)))
+        self.shape=self.frame_addressing['evidence_shape_tyx']
+        self.dtype=np.dtype(original.dtype)
+        self.frame_addresses=CyclicFrameAddresses(shape[0],self.shape[0],float(period_degrees),
+                                                  CYCLIC_EXTRAPOLATION_ADDRESSING_SCHEMA)
 
 
 __all__ = ["CYCLIC_FRAME_ADDRESSING_SCHEMA", "IMPLEMENTATION_SHA256", "assert_cyclic_implementation_unchanged",

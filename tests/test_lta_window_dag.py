@@ -21,6 +21,7 @@ from XTA.lta_tile_tracking import LtaLineageId
 from XTA.lta_tiles import plan_tile_grid
 from XTA.lta_worker_adapter import execute_worker_task
 from XTA.lta_workers import LtaWorkerResult
+from tests._lta_fake_worker_gc import batch_fake_worker_collections
 
 
 class CpuWorkerPool:
@@ -79,6 +80,9 @@ class CpuWorkerPool:
 
 
 class LtaWindowDagTests(unittest.TestCase):
+    def setUp(self):
+        self.worker_collection_requests = batch_fake_worker_collections(self)
+
     def run_driver(self, root, *, windowed, order="roots_first", empty_backward=False, corrupt_dogfood=False,
                    devices=(0, 1, 2, 3), workers_per_device=1):
         root.mkdir(parents=True)
@@ -143,6 +147,7 @@ class LtaWindowDagTests(unittest.TestCase):
             baseline, baseline_result, _baseline_pool, _ = self.run_driver(root / "whole", windowed=False)
             first, result, pool, scheduler = self.run_driver(root / "windows", windowed=True)
             reverse, reverse_result, _, _ = self.run_driver(root / "reverse", windowed=True, order="reverse")
+            self.assertGreater(self.worker_collection_requests.count, 0)
             np.testing.assert_array_equal(first, baseline)
             np.testing.assert_array_equal(reverse, baseline)
             self.assertEqual(result[0], baseline_result[0])

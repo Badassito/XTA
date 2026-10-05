@@ -5,12 +5,19 @@ and result handling. They are not CUDA-event or GPU-kernel durations.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 import argparse
 from bisect import bisect_right
 from collections import defaultdict
 import json
 from pathlib import Path
 import statistics
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from XTA.run_transport import telemetry_streams
 
 
 PHASES = {
@@ -32,13 +39,11 @@ def read_events(paths):
     events, seen, warnings = [], {}, []
     recognized_sessions = set()
     session_sequences = defaultdict(set)
-    files = sorted({file for path in map(Path, paths) for file in
-                    (path.glob('telemetry-*.jsonl') if path.is_dir() else (path,))})
-    for path in files:
+    for path, stream in telemetry_streams(paths):
         capture_disabled = False
         dropped_events = 0
         first_dropped_sequence = None
-        with path.open(encoding='utf-8') as handle:
+        with nullcontext(stream) as handle:
             for line_number, line in enumerate(handle, 1):
                 try:
                     payload = json.loads(line)
@@ -284,7 +289,7 @@ def analyze_events(events):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('paths', nargs='+', type=Path, help='Telemetry JSONL files or per-run telemetry directories')
+    parser.add_argument('paths', nargs='+', type=Path, help='Telemetry JSONL files, directories, or checked run-transport ZIPs')
     parser.add_argument('--output', type=Path, help='Write joined JSON to a task-specific Scratch path')
     args = parser.parse_args()
     events, warnings = read_events(args.paths)

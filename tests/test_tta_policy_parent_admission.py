@@ -253,7 +253,9 @@ class PolicyParentWorkspaceIntegrationTests(unittest.TestCase):
             root = Path(td)
             namespace = dict(vars(pipeline))
             namespace.update(temp_dir=root, worker_direct_union_active=False,
-                interpolation_settings=SimpleNamespace(backend='sdf', enabled=False),
+                interpolation_settings=SimpleNamespace(backend='sdf', enabled=False,
+                    extrapolation_enabled=False, extrapolation_distance=0,
+                    extrapolation_walk_back=1, extrapolation_min_radius=3.),
                 sam_context=None, sam_parent_staging=None,
                 policy_settings=SimpleNamespace(enabled=True), bounded_policy_parent_keys=keys,
                 args=SimpleNamespace(imgsz=8, min_conf=1., min_radius=0.,
@@ -298,6 +300,7 @@ class PolicyParentWorkspaceIntegrationTests(unittest.TestCase):
                 postprocess_bytes=state.direct_union_postprocess_bytes,
             )
             source = Path(pipeline.__file__).read_text(encoding='utf-8')
+            _function(source, '_sam_parent_requires_staging', namespace)
             ensure = _function(source, '_ensure_baseline_workspaces', namespace)
             _function(source, '_merge_pending_azimuthal_padding_for_parent', namespace)
             _function(source, '_submit_view_prepare', namespace)

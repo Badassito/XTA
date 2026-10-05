@@ -192,7 +192,7 @@ def materialize_sam_directional_view_layer(
 def _sam_directional_source_backing(
     native_path: Path, *, view: ViewInfo, stage: str, has_foreground: bool,
     model_name: str, source: str, pass_index: int, tile_config_id: str,
-    workers: int = 1,
+    workers: int = 1, mask_kind: str = 'bridge',
 ) -> Dict[str, object]:
     """Keep native proposals for replay/gating and publish source-oriented masks.
 
@@ -242,7 +242,7 @@ def _sam_directional_source_backing(
         workspace = materialize_raw_bbox_mask_store_workspace(native_path, workspace_path,
             desc=f'Selected SAM {view.name}/{stage} projection workspace', workers=max(1,int(workers)))
         projected = materialize_nrrd_view_layer(workspace, model_name=model_name, view=view,
-            source=source, mask_kind='bridge', pass_index=pass_index, tile_config_id=tile_config_id,
+            source=source, mask_kind=mask_kind, pass_index=pass_index, tile_config_id=tile_config_id,
             tile_acceptance='consolidated' if source == 'tile' else '', stage=stage,
             temp_dir=native_path.parent / 'source_layers', workers=max(1,int(workers)), known_has_foreground=True,
             submit_to_sink=False, internal_packbits_store=True)
@@ -254,6 +254,117 @@ def _sam_directional_source_backing(
         close_memmap_array_without_flush(workspace, unlink_path=workspace_path)
         # Retirement unmaps/unlinks after the last NumPy alias is released.
         workspace = None
+
+
+def materialize_sam_extrapolation_view_layer(
+    entry, *, model_name, view, source, sam_context, distance, walk_back,
+    min_radius, tile_config_id='', workers=1,
+) -> NrrdLayerRef:
+    """Publish a single-seed tail without a paired bridge topology claim."""
+    direction = str(entry['direction'])
+    if direction not in {'forward', 'backward'}:
+        raise ValueError('SAM extrapolation requires a view-native direction')
+    native_path = Path(str(entry['path']))
+    with contextlib.closing(RawBBoxMaskStore.open(native_path, mmap_payload=True)) as store:
+        shape = tuple(int(value) for value in store.shape)
+    stage = 'sam_extrapolation_' + direction
+    backing = _sam_directional_source_backing(native_path, view=view, stage=stage,
+        has_foreground=int(entry.get('voxel_count', 0)) > 0, model_name=model_name,
+        source=source, pass_index=0, tile_config_id=tile_config_id,
+        workers=workers, mask_kind='extrapolation')
+    from .sam_view_geometry import sam_native_transform_record
+    transform = sam_native_transform_record(view, shape,
+        final_source_output_shape() or (view.full_t, view.full_h, view.full_w),
+        source_processing_shape_tyx=getattr(getattr(sam_context, 'source_volume', None), 'shape', None))
+    transform.update(public_backing_coordinate_space=backing['coordinate_space'],
+        public_backing_shape_tyx=list(backing['shape']))
+    provenance = dict(backend='sam', direction=direction, distance=int(distance),
+        walk_back=int(walk_back), terminal_min_radius=float(min_radius),
+        requested_terminal_min_radius=float(entry.get('requested_min_radius', min_radius)),
+        terminal_radius_units='working_canvas_pixels',
+        min_radius_applies_to='post_interpolation_terminal_seed_only',
+        seed_stage='post_interpolation_before_any_extrapolated_tail',
+        native_write_rule='raw_sam_mask_and_not_frozen_post_interpolation_baseline',
+        public_backing_role='projected_native_tail_support',
+        source_exclusivity_guaranteed=False,
+        source_restoration='existing_positive_support_categorical_projection_and_restore',
+        native_directional_support_voxels=int(entry.get('voxel_count', 0)),
+        stop_contract='raw_sam_empty_or_requested_horizon', contact_policy='continue',
+        evidence_path=str(entry.get('evidence_path', '')),
+        selection_status=str(entry.get('selection_status', 'selected_prefix')),
+        policy_identity=str(entry.get('policy_hash', '')),
+        sam_bundle_identity=str(sam_context.bundle_identity),
+        run_ids=[str(value) for value in entry.get('run_ids', ())],
+        terminal_roots=[str(value) for value in entry.get('terminal_roots', ())])
+    ref = NrrdLayerRef(
+        key=_nrrd_layer_key(view_name=view.name, source=source, mask_kind='extrapolation',
+            pass_index=0, tile_config_id=tile_config_id, stage=stage),
+        name=_nrrd_layer_name(view=view, source=source, mask_kind='extrapolation',
+            pass_index=0, tile_config_id=tile_config_id, stage=stage),
+        path=backing['path'], shape=backing['shape'], dtype='uint8', storage_format=backing['storage_format'],
+        model_name=str(model_name), view_name=view.name, physical_view_name=physical_view_name(view),
+        aug_id=view.tta_aug_id, angle_deg=float(view.tta_angle_deg), view_family=view.family,
+        source=source, mask_kind='extrapolation', tile_config_id=tile_config_id,
+        tile_acceptance='consolidated' if source == 'tile' else '', stage=stage,
+        description='SAM extrapolated tail from a frozen post-interpolation terminal.',
+        native_transform=transform, extrapolation_provenance=provenance,
+        segment_extent_ijk=backing['extent'], segment_extent_shape_tyx=backing['shape'],
+        segment_extent_source='sam_projected_extrapolation_cvol')
+    sink = nrrd_layer_sink()
+    if sink is not None:
+        sink.submit_layer(ref, nrrd_layer_output_suffix(view_token=view_output_token(view),
+            source=source, mask_kind='extrapolation', tile_config_id=tile_config_id, stage=stage))
+    return ref
+
+
+def _run_sam_extrapolation(native_volume, *, view, model_name, source, sam_context,
+    distance=0, walk_back=1, min_radius=3., workers=1, nrrd_layers_enabled=False,
+    tile_config_id='', upstream_lineage=None, additions_volume=None, merge_native=True,
+    requested_min_radius=None):
+    """Freeze the completed interpolation baseline through all tail tracking."""
+    if int(distance) <= 0:
+        return None, []
+    if sam_context is None:
+        raise RuntimeError('Active SAM extrapolation requires an admitted tracker context')
+    scope = f'{model_name}/{view.name}/{source}' + (f'/{tile_config_id}' if tile_config_id else '')
+    _, stats, components = sam_context.extrapolate(native_volume, view=view,
+        scope=scope + '/extrapolation',
+        work_dir=getattr(sam_context, 'extrapolation_evidence_root', sam_context.evidence_root) /
+            str(model_name) / view.name / (source + ('_' + tile_config_id if tile_config_id else '')),
+        distance=int(distance), walk_back=int(walk_back), min_radius=float(min_radius),
+        workers=int(workers), wrap_axis=view_interpolation_wrap_axis(view),
+        upstream_lineage={**dict(upstream_lineage or {}),
+            'seed_stage': 'post_interpolation_before_any_extrapolated_tail'},
+        return_components=True)
+    stats = dict(stats, processing_role='extrapolation', extrapolation_backend='sam',
+        model=str(model_name), view=str(view.name), source=source, tile_config_id=tile_config_id,
+        added_voxel_coordinate_space='native_working_canvas',
+        requested_extrapolation_min_radius=float(min_radius if requested_min_radius is None else requested_min_radius),
+        processing_extrapolation_min_radius=float(min_radius))
+    refs = []
+    # Every request is finished before any tail is merged, so sibling tails can
+    # never become a later request's seed or an authoritative future mask.
+    for entry in components:
+        if nrrd_layers_enabled:
+            refs.append(materialize_sam_extrapolation_view_layer(dict(entry,
+                requested_min_radius=stats['requested_extrapolation_min_radius']),
+                model_name=model_name, view=view, source=source, sam_context=sam_context,
+                distance=distance, walk_back=walk_back, min_radius=min_radius,
+                tile_config_id=tile_config_id, workers=workers))
+        if merge_native or additions_volume is not None:
+            with contextlib.closing(RawBBoxMaskStore.open(Path(str(entry['path'])), mmap_payload=True)) as store:
+                if tuple(store.shape) != tuple(native_volume.shape):
+                    raise ValueError('SAM extrapolation contribution shape does not match its native baseline')
+                for frame in range(int(store.shape[0])):
+                    decoded = store.decode_slice_crop(frame)
+                    if decoded is None:
+                        continue
+                    y0, x0, y1, x1, crop = decoded
+                    if additions_volume is not None:
+                        additions_volume[frame, y0:y1, x0:x1] |= crop
+                    if merge_native:
+                        native_volume[frame, y0:y1, x0:x1] |= crop
+    return stats, refs
 
 def set_final_source_output_shape(shape_tyx: Optional[Tuple[int, int, int]]) -> None:
     global _FINAL_SOURCE_OUTPUT_SHAPE_TYX
@@ -1580,6 +1691,9 @@ def prepare_view_volume_after_fullframe(
     retire_dense_after_prepare: bool = False,
     interpolation_backend: str = 'sdf',
     sam_context: Optional[object] = None,
+    extrapolation_distance: int = 0,
+    extrapolation_walk_back: int = 1,
+    extrapolation_min_radius: float = 3.,
     confidence_retired_callback: Optional[Callable[[str, str, int], object]] = None,
     confidence_owner: Optional[list] = None,
 ) -> PreparedViewResult:
@@ -1614,6 +1728,7 @@ def prepare_view_volume_after_fullframe(
         and str(view.family) == 'azimuthal'
         and not bool(dense_tiling_active)
         and not bool(preinterpolation_layer_already_published)
+        and int(extrapolation_distance) <= 0
         and not (
             _view_uses_interpolation(view, int(interpolate))
             and int(interpolation_walk_back) > 0
@@ -2123,6 +2238,18 @@ def prepare_view_volume_after_fullframe(
                         pass
             else:
                 parent_bridge_support_mm = RawBBoxMaskStore.open(parent_bridge_support_path, mmap_payload=True)
+
+        extrapolation_stats_local, tail_refs = _run_sam_extrapolation(
+            baseline_native_volume, view=view, model_name=model_name, source='fullframe',
+            sam_context=sam_context, distance=extrapolation_distance,
+            walk_back=extrapolation_walk_back, min_radius=view_processing_min_radius(
+                view, float(extrapolation_min_radius), processing_plane_shape),
+            workers=slice_workers, nrrd_layers_enabled=nrrd_layers_enabled,
+            additions_volume=d1_additions_mm, merge_native=not d1_component_refs_only,
+            requested_min_radius=extrapolation_min_radius)
+        nrrd_layers.extend(tail_refs)
+        if extrapolation_stats_local is not None:
+            interpolation_stats.append(extrapolation_stats_local)
 
         if (
             bool(internal_final_layer_enabled)
@@ -3107,6 +3234,9 @@ def finalize_consolidated_tile_volume_for_parent(
     interpolation_backend: str = 'sdf',
     sam_context: Optional[object] = None,
     sam_upstream_lineage: Optional[Dict[str, object]] = None,
+    extrapolation_distance: int = 0,
+    extrapolation_walk_back: int = 1,
+    extrapolation_min_radius: float = 3.,
 ) -> TileConsolidationResult:
     """Interpolate one configuration's consolidated gated tiles, then union them.
 
@@ -3357,6 +3487,18 @@ def finalize_consolidated_tile_volume_for_parent(
 
             if backend == 'sam' or int(stats_local.get('added_voxels', 0)) <= 0:
                 break
+
+    extrapolation_stats_local, tail_refs = _run_sam_extrapolation(
+        tile_accumulator_mm, view=view, model_name=model_name, source='tile',
+        sam_context=sam_context, distance=extrapolation_distance,
+        walk_back=extrapolation_walk_back, min_radius=view_processing_min_radius(
+            view, float(extrapolation_min_radius), tile_plane_shape),
+        workers=slice_workers, nrrd_layers_enabled=nrrd_layers_enabled,
+        tile_config_id=config_id_norm, upstream_lineage=sam_upstream_lineage,
+        requested_min_radius=extrapolation_min_radius)
+    nrrd_layers.extend(tail_refs)
+    if extrapolation_stats_local is not None:
+        interpolation_stats.append(extrapolation_stats_local)
 
     with destination_lock:
         union_volume_into_volume(

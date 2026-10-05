@@ -1,6 +1,6 @@
-# Projection coverage in v25.0.1
+# Projection coverage
 
-This patch addresses source-grid holes caused by projecting reduced prediction
+Projection prevents source-grid holes caused by treating reduced prediction
 canvases as isolated points. A positive categorical sample represents support
 under its declared view transform and sampling rule. Projection must evaluate
 that support on the destination grid, including the valid space between sample
@@ -13,18 +13,18 @@ recovered simply by changing projection.
 
 ## Routes
 
-The CPU routes and qualifications are below. Actual device execution and the
-complete release qualification are recorded in separate receipts.
+The routes and device admission boundaries are below. Actual numerical checks,
+device execution and complete source qualification belong in separate receipts.
 
-| View family | Projection route | Qualification |
+| View family | Projection route | Device admission |
 | --- | --- | --- |
-| Cartesian: Transverse, Sagittal, Coronal | Canonical categorical restoration; matching bounded D1 native-coverage pull for eligible layouts | CPU route/coverage checks passed; device receipt separate |
-| Tilted Cartesian | Shared view union followed by canonical destination pull | CPU passed; projection CUDA disabled |
-| Upright Azimuthal, dense | Shared view union and canonical destination pull; eligible Transverse CUDA, Sagittal/Coronal CPU | CPU passed; device receipt separate |
-| Upright Azimuthal, coverage | Declared reconstruction-plan angular/column pull; eligible Transverse CUDA, Sagittal/Coronal CPU | CPU passed; device receipt separate |
-| Tilted Azimuthal | Shared view union and bounded canonical CPU pull; unsafe CUDA plan refused | CPU passed; projection CUDA unsupported |
-| Radial and tilted Radial | Bounded native shell pull; eligible parent CUDA or separate native owner | CPU passed; device receipt separate |
-| Spherical and rotated Spherical | Bounded destination-native QSC pull | CPU passed; device receipt separate |
+| Cartesian: Transverse, Sagittal, Coronal | Canonical categorical restoration; matching bounded D1 native-coverage pull for eligible layouts | CUDA requires its own eligible layout and device checks |
+| Tilted Cartesian | Shared view union followed by canonical destination pull | CPU; projection CUDA disabled |
+| Upright Azimuthal, dense | Shared view union and canonical destination pull | Eligible Transverse CUDA; Sagittal/Coronal CPU |
+| Upright Azimuthal, coverage | Declared reconstruction-plan angular/column pull | Eligible Transverse CUDA; Sagittal/Coronal CPU |
+| Tilted Azimuthal | Shared view union and bounded canonical CPU pull; unsafe CUDA plan refused | CPU; projection CUDA unsupported |
+| Radial and tilted Radial | Bounded native shell pull | Eligible parent CUDA or separate native owner |
+| Spherical and rotated Spherical | Bounded destination-native QSC pull | CUDA requires its own eligible layout and device checks |
 
 Immediate D1 point scatter is no longer used for Tilted Cartesian, dense
 Azimuthal, or Tilted Azimuthal, including hybrid detector runs. Their masks pass
@@ -42,7 +42,7 @@ inference on GPU is unchanged. Full-cluster wall-time improvement remains
 unmeasured; local CPU projection trials have a separate scope.
 Ordinary Tilted projection uses canonical CPU processing, including engine
 views whose legacy D1 fast projection previously used GPU. The old Tilted
-Azimuthal CUDA plan encodes the unsafe scatter geometry, so this patch refuses
+Azimuthal CUDA plan encodes the unsafe scatter geometry, so dispatch refuses
 it before allocation/publication and automatically uses bounded CPU pull.
 Both ordinary Tilted and Tilted Azimuthal engine projection can be slower than
 the former scatter route. CUDA projection remains unavailable for those routes;
@@ -130,9 +130,8 @@ preparation, child-publication waits, pending inference, and active native
 projection. A running parent has entered its executor and may still be awaiting
 admission; it is not proof of current numerical work. The diagnostics do not
 classify deadlock or change resource caps. The execution change does not
-establish a full-cluster speedup; matched local trials and source
-qualification are recorded separately under
-`Scratch/Experiments/Job150772_Performance_20261002`.
+establish a full-cluster speedup. Matched local trials and source qualification
+are recorded separately in task output directories and the workspace History.
 
 ## Geometry and evidence boundaries
 
@@ -197,7 +196,7 @@ components share the dense/score destination addresses while reading encoded
 CVOL bits directly. Raw and packed inputs preserve selected-component bounds
 and physical shear; neither route requires a decoded native volume.
 
-The v25.0.2 Job150993 performance correction uses the prepared angular plan
+Sparse Tilted Azimuthal projection uses the prepared angular plan
 and a fused compiled encoded-mask reader for these sparse Tilted Azimuthal
 components. Bounded CPU workers own separate output slices, so packed output
 bits cannot race. Geometry preparation is shared across the workers; source
@@ -213,61 +212,46 @@ or encoders preserve their original exception; traceback-held mappings remain
 valid until their consumers retire, while partial owned output staging is
 cleaned separately. Borrowed input stores are never part of this cleanup.
 
-The earlier serial address-vector path scanned billions of destination cells
-and held completed-parent masks while doing so. Three overlapping bridge
-projections in Job150993 took approximately 19, 24.5 and 51.8 minutes, filling
-the postprocessing storage allowance and starving detector workers. That run
-is timing evidence only: its bridge masks are not correctness references.
-Projection correctness is checked with independent synthetic geometry and
-the established native destination-pull oracle.
+Projection correctness is checked with independent synthetic geometry and the
+native destination-pull oracle. Timing traces measure pipeline behavior; they
+cannot serve as a numerical correctness reference.
 
-## CPU qualification and release receipts
+## Validation and reproduction
 
-The focused receipts below describe the original v25.0.1 coverage patch.
-The Job150772 CPU execution refinement has separate qualification receipts;
-its local measurements do not qualify a full-cluster inference run.
+Routing checks establish worker admission and preserve separate
+Cartesian/Radial/Spherical routes. Numerical checks must independently cover
+physical ROI and field of view, reduced-to-native and anisotropic grids,
+positive and all-black inputs, sharp background bands and shell gaps,
+seams/padding, chunk/ROI paths, and mask/confidence alignment.
 
-Routing tests currently cover removal of the unsafe non-Cartesian D1 dispatch.
-The frozen D1/compatibility CPU suite reports 89 passed, 315 subtests, and eight
-skipped CUDA checks. Its assertions cover worker admission and preserve the
-separate Cartesian/Radial/Spherical routes.
-They do not alone establish numerical correctness for every view. Separate
-device and full-suite receipts must record independent physical ROI/field-of-view
-oracles, reduced-to-native and anisotropic grids, positive and all-black cases,
-sharp background bands and
-shell gaps, seams/padding, chunk/ROI paths, and mask/confidence alignment.
-Unavailable or unexecuted CUDA checks must remain explicit.
+Spherical checks cover all faces, corners, poles, active-shell gaps, enlarged
+cubic and noncubic grids, rotations, signed tilted groups, Cartesian aliases,
+positive-score support and rational closed-radius boundaries. Radial checks
+cover all base axes, enlarged and contracted noncubic grids, height caps, signed
+tilted directions, shell gaps, radius boundaries and actual model-grid
+restoration with intrinsic ring-tile seams. Sparse-component checks additionally
+exercise encoded raw/packed masks, reduced-to-native support and single-column
+disk projection. Confidence/publication checks cover inverse-shear values,
+offset/nonuniform angular ownership, contraction maximum with unknown zeros,
+positive-score versus binary support, and final native shape/metadata.
 
-Spherical CPU evidence now reports 47 independent native-coverage tests and
-61 existing tests with 1,177 subtests passed; two CUDA checks were skipped.
-The independent cases cover six faces, seams/padding/corners/poles, active-shell
-gaps and ROI limits, enlarged cubic and noncubic output grids, four rotations,
-signed tilted groups, Cartesian aliases, and positive-score support. The
-rational boundary audit records zero missing and zero excess voxels after the
-fix. Actual CUDA execution is recorded separately.
+Receipts must retain source pins, workload identity, executed and skipped checks,
+and device scope. Overlapping focused suites are not additive counts of unique
+tests. CPU evidence does not establish CUDA or native-owner execution. Compiler
+or routing success alone is not release qualification; the final source freeze
+and complete qualification receipt remain separate.
 
-Radial CPU evidence includes 60 new tests in a broader receipt of 96 passed,
-642 subtests passed, and 38 skipped checks. It covers all three base axes,
-enlarged and contracted noncubic grids, height caps, signed tilted directions,
-shell gaps, positive-score support, rational radius boundaries, and actual
-model-grid restoration/augmentation with intrinsic ring-tile seams. The CPU
-receipt does not establish execution of the parent CUDA or native-owner paths.
+Use a fresh task-specific output directory for reproducible synthetic CPU work:
 
-Canonical Tilted/Azimuthal final-v2 CPU evidence reports 360 tests and 335 subtests
-passed with all nine audited source pins unchanged before and after the run.
-Sparse-component final-v2 evidence reports 130 CPU tests and 235 subtests passed,
-including encoded-mask, reduced-to-native, and single-column disk projection
-paths. Its audited
-source pins also remained unchanged. These receipts overlap other focused
-suites and must not be added together as a count of unique tests.
+```text
+python -B tools/benchmark_sparse_azimuthal_projection.py --output ../Scratch/Experiments/REVIEW_NAME/synthetic-projection --shape 384 512 640 --target 256 480 608 --workers 4 --heatsoak-seconds 60 --repetitions 3
+```
 
-The confidence/publication CPU audit reports 323 tests and 77 subtests passed,
-with 13 GPU-specific tests skipped. Independent checks cover inverse-shear
-numeric values, offset/nonuniform angular ownership, contraction maximum with
-unknown zeros, exact positive-score versus binary support, and final native
-shape/metadata publication. These are correctness receipts, not benchmarks.
-
-Receipts, plots, and the short mobile report belong under
-`Scratch/Experiments/Projection_Coverage_v25_0_1_20261001`. Compilation or routing
-success alone is not release qualification; the final source freeze and full
-qualification receipt remain separate.
+Replace `REVIEW_NAME` with the task's output directory name. The tool compares the
+bounded NumPy path with compiled single/multiple-worker execution, checks an
+independent scalar physical row-band oracle, and records exact native mask and
+source hashes. `--source-root EXTRACTED_SOURCE_ROOT --backends numpy` can exercise
+an extracted predecessor with the same synthetic fixture. Local CPU timings
+remain sanity checks rather than target-cluster throughput claims. Preserve
+run-specific measurements and qualification history outside the repository in
+`Scratch/Data/XTA/History`.

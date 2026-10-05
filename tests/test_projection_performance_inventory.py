@@ -23,6 +23,7 @@ def predecessor():
     prior = json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
     prior.pop('v24_job150790_150798_throughput_development_review', None)
     prior.pop('v24_0_2_sam_bridges_development_review', None)
+    prior.pop('v24_1_0_sam_extrapolation_development_review', None)
     prior.pop(KEY, None)
     metadata = dict(kind='qualified_development_source_zip', qualification_status='passed',
         full_qualification=True, package_version='25.0.1', source_identity_count=715,

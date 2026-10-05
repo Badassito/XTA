@@ -7,6 +7,7 @@ interpolation, backprojection, and fusion are deliberately outside this policy.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import lru_cache
 from typing import Any, Mapping, Sequence
 
@@ -334,6 +335,20 @@ def raster_plan_from_spawn_spec(spec: Mapping[str, Any]) -> RasterPlan:
         )
     except Exception as exc:
         raise ValueError("invalid canonical raster plan in spawn spec") from exc
+
+    recorded_variant_id = in_plane.get("variant_id")
+    if recorded_variant_id != rebuilt.in_plane_variant.variant_id:
+        try:
+            # Preserve validated historical spelling when reading an old record.
+            # New factories never select this compatibility identity, and workers
+            # still compare the restored digest against the current render recipe.
+            legacy_variant = InPlaneVariant(
+                rebuilt.in_plane_variant.angle_deg,
+                legacy_variant_id=recorded_variant_id,
+            )
+            rebuilt = replace(rebuilt, in_plane_variant=legacy_variant)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("invalid historical raster-plan angle identity") from exc
 
     if str(record.get("schema_version", "")) != str(rebuilt.schema_version):
         raise RuntimeError(

@@ -122,6 +122,9 @@ class LtaWorkerAdapterTests(unittest.TestCase):
 
     def test_coverage_marks_only_completed_context_and_keeps_authoritative_prompt(self):
         from XTA.lta_coverage import LtaCoverageBuilder, LtaCoverageLedger
+        from XTA import lta_worker_adapter
+        import gc
+        full_collection = mock.Mock(wraps=gc.collect)
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             payload, seed, context = self._coverage_task(root)
@@ -144,6 +147,7 @@ class LtaWorkerAdapterTests(unittest.TestCase):
                     hole_fill_added_pixels=0)
             with (mock.patch("XTA.lta_coverage.LtaCoverageBuilder", return_value=spy),
                   mock.patch("XTA.lta_propagation.run_mask_injected_session", side_effect=propagate),
+                  mock.patch.object(lta_worker_adapter, 'gc', types.SimpleNamespace(collect=full_collection)),
                   mock.patch("XTA.lta_rendering.render_native_tile_window", return_value=[object(), object()])):
                 result = execute_worker_task(context, "propagation_chain", payload)
             manifest = __import__("json").loads(Path(result["artifact_path"]).read_text())
@@ -171,6 +175,11 @@ class LtaWorkerAdapterTests(unittest.TestCase):
                           for line in path.read_text().splitlines()]
             self.assertTrue(any(row.get("phase") == "lineage_coverage_artifact" and
                                 row["event"] == "phase_end" for row in trace_rows))
+            completed_chunks = sum(row.get('phase') == 'union_chunk_pack' and row['event'] == 'phase_end'
+                                   for row in trace_rows)
+            self.assertGreater(completed_chunks, 0)
+            self.assertEqual(full_collection.call_count, completed_chunks)
+            self.assertTrue(all(call == mock.call() for call in full_collection.call_args_list))
 
     def test_failed_session_never_marks_observed_or_writes_coverage(self):
         from XTA.lta_coverage import LtaCoverageBuilder

@@ -10,8 +10,9 @@ import pytest
 
 from tools import prepare_reconciliation_release as prepare
 from tools import verify_package_inventory as inventory
+from tools.source_archive_history import require_history_archive
 
-ARCHIVE = Path('C:\\Users\\Bry\\Documents\\ChatGPT\\Scratch\\Experiments\\SAM_Guarded_Rescue_20261001\\final_qualification\\source\\XTA_v25.0.0_complete_source.zip')
+ARCHIVE = require_history_archive('job150615', inventory.REVIEWED_V24_JOB150615_DEVELOPMENT_PREDECESSOR_ARCHIVE_SHA256)
 KEY = 'v24_job150615_development_review'
 PREFIX = 'REVIEWED_V24_JOB150615_DEVELOPMENT'
 
@@ -24,6 +25,7 @@ def qualified():
     predecessor = json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
     predecessor.pop('v24_job150790_150798_throughput_development_review', None)
     predecessor.pop('v24_0_2_sam_bridges_development_review', None)
+    predecessor.pop('v24_1_0_sam_extrapolation_development_review', None)
     predecessor.pop('v24_job150772_performance_development_review', None)
     predecessor.pop('v24_0_1_release_review', None)
     predecessor.pop('v24_job150615_headroom_development_review', None)
@@ -141,9 +143,7 @@ def test_three_development_successors_rewind_to_the_tagged_source():
 
 
 def test_published_guarded_review_cannot_be_overwritten(tmp_path):
-    previous_archive = ARCHIVE.parent.parent.parent.parent/'SAM_Outer_Crop_20261001'/'final_qualification'/'source'/'XTA_v25.0.0_complete_source.zip'
-    if not previous_archive.is_file():
-        pytest.skip('Retained outer-crop archive is needed for preparation')
+    previous_archive = require_history_archive('guarded_rescue', inventory.REVIEWED_V24_GUARDED_RESCUE_DEVELOPMENT_PREDECESSOR_ARCHIVE_SHA256)
     with pytest.raises(ValueError, match='Published development reviews are immutable'):
         prepare.prepare(output_dir=tmp_path, development='guarded-rescue',
                         predecessor_archive=previous_archive, write=True)

@@ -86,7 +86,8 @@ def validate_policy(value) -> dict[str, Any]:
                     min_sources=2, min_prediction_sources=1, island_weighting=False,
                     island_weight_min=.75, island_weight_max=1.25,
                     angular_tolerance_deg=1., anchor_confidence=.8, anchor_bonus=0.,
-                    provenance_weights={'prediction': 1., 'bridge': .35, 'mixed': .5},
+                    provenance_weights={'prediction': 1., 'bridge': .35, 'mixed': .5,
+                                        'extrapolation': .35},
                     decide=None, select_proposals=None, proposal_api_version=1,
                     sam_bridge_policy=None, proposal_policy_sha256='')
     unknown = set(value) - set(defaults)
@@ -115,8 +116,12 @@ def validate_policy(value) -> dict[str, Any]:
             raise ValueError(f'{name} must be a nonnegative integer')
         result[name] = int(number)
     weights = dict(result['provenance_weights'])
-    if set(weights) != {'prediction', 'bridge', 'mixed'}:
-        raise ValueError('provenance_weights must define prediction, bridge, and mixed')
+    if set(weights) == {'prediction', 'bridge', 'mixed'}:
+        # Historical policies inherit their explicit interpolation-addition
+        # weight; a policy may separately opt out with extrapolation=0.
+        weights['extrapolation'] = weights['bridge']
+    if set(weights) != {'prediction', 'bridge', 'mixed', 'extrapolation'}:
+        raise ValueError('provenance_weights must define prediction, bridge, mixed, and extrapolation')
     for name, weight in weights.items():
         if not math.isfinite(float(weight)) or float(weight) < 0:
             raise ValueError('Provenance weights must be finite and nonnegative')

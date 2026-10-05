@@ -8,7 +8,7 @@ from unittest import mock
 import numpy as np
 import pytest
 
-from XTA import assembly, geometry, interpolation, outputs
+from XTA import __version__, assembly, geometry, interpolation, outputs
 from XTA.reconciliation_io import read_layer_manifest
 from XTA.sam_evidence import selected_native_plane
 from XTA.sam_policy import select_sam_proposals
@@ -102,8 +102,8 @@ def test_source_export_matches_current_projection_and_mirror_routes_without_infe
     assert result['source_shape_tyx'] == list(source_shape)
     assert result['native_shape_tyx'] == [5, 16, 16]
     assert result['replay']['original_generation_pipeline_version'] == '25.0.1'
-    assert result['replay']['export_pipeline_version'] == '25.0.2'
-    assert result['replay']['selection_pipeline_version'] == '25.0.2'
+    assert result['replay']['export_pipeline_version'] == __version__
+    assert result['replay']['selection_pipeline_version'] == __version__
     assert not result['replay']['fresh_detector_run'] and not result['replay']['fresh_sam_run']
     assert (tmp_path/'replay/selection.json').read_bytes() == selection.read_bytes()
     manifest = next((tmp_path/'replay/nrrd').glob('*_nrrd_manifest.json'))

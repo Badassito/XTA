@@ -29,6 +29,7 @@ from XTA.lta_tile_tracking import LtaLineageId
 from XTA.lta_tiles import plan_tile_grid
 from XTA.lta_worker_adapter import execute_worker_task
 from XTA.lta_workers import LtaWorkerResult
+from tests._lta_fake_worker_gc import batch_fake_worker_collections
 
 
 class ArtifactWorkerPool:
@@ -113,6 +114,9 @@ class RecordingTrace:
 
 
 class LtaFrontierExecutionTests(unittest.TestCase):
+    def setUp(self):
+        self.worker_collection_requests = batch_fake_worker_collections(self)
+
     @staticmethod
     def mask(*points):
         result = np.zeros((4, 4), dtype=bool)
@@ -230,6 +234,7 @@ class LtaFrontierExecutionTests(unittest.TestCase):
         offerings = [("same", frame, "forward", mask) for frame in range(1, 21)]
         with tempfile.TemporaryDirectory() as folder:
             result = self.run_frontier(Path(folder) / "fanin", offerings)
+        self.assertGreater(self.worker_collection_requests.count, 0)
         self.assertEqual(int(result.union[:1].sum()), 0)
         np.testing.assert_array_equal(result.union[1:, 1, 5], np.ones(119, dtype=np.uint8))
         continuation = [item for item in result.pool.submitted

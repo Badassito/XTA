@@ -384,6 +384,10 @@ def read_layer_manifest(path: str | Path, *, workspace: str | Path, memory_mib: 
                 raise ValueError('SAM directional layer requires explicit forward/backward direction')
             if metadata.get('proposal_selection_status') != 'policy_selected':
                 raise ValueError('SAM directional layer requires completed proposal-quality selection')
+        if metadata.get('mask_kind') == 'extrapolation':
+            tail = metadata.get('extrapolation') or {}
+            if tail.get('backend') != 'sam' or tail.get('direction') not in {'forward', 'backward'}:
+                raise ValueError('SAM extrapolation layer requires explicit tail provenance')
         layer_path = (path.parent / filename).resolve()
         if not layer_path.is_relative_to(path.parent):
             raise ValueError(f"Layer path escapes its manifest directory: {filename}")

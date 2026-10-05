@@ -79,6 +79,37 @@ def test_new_operational_metadata_cannot_hide_unknown_quality_reason_fields():
     assert tool.compare_selections(old, new)['exact_quality']
 
 
+def test_branch_metadata_admission_allows_only_exact_operational_schema():
+    old, new = _receipt(), _receipt()
+    metadata = dict(index_admission='simultaneous_prefix_chunk_candidate_indexes_within_unused_topology_credit',
+        parallel_credit_rule='parallel_credit_bytes_minus_retained_prefix_index_bytes',
+        peak_retained_index_bytes=2048, peak_simultaneous_index_bytes=8192,
+        minimum_effective_parallel_credit_bytes=1024, overlay_snapshot_count=3, full_merge_fallback_count=0)
+    new['selection_resources']['intrinsic_measurements'] = {'branch_metadata': metadata}
+    assert tool.compare_selections(old, new)['exact_quality']
+    metadata['quality_override'] = True
+    assert not tool.compare_selections(old, new)['exact_quality']
+    metadata.pop('quality_override')
+    metadata['peak_retained_index_bytes'] = True
+    assert not tool.compare_selections(old, new)['exact_quality']
+
+
+def test_branch_provenance_exceptions_never_hide_owner_packet_or_conflict_changes():
+    old, new = _receipt(), _receipt()
+    branch = dict(implementation_sha256='a'*64, sha256='b'*64, max_group_bytes=256,
+        edges={'edge': {'owner_support': {'run': {'1': {'sha256': 'c'*64, 'data': 'AAAA'}}}}},
+        selected_edge_ids_by_run={'run': ['edge']})
+    old['branch_selection'] = copy.deepcopy(branch)
+    new['branch_selection'] = copy.deepcopy(branch)
+    new['branch_selection'].update(implementation_sha256='d'*64, sha256='e'*64, max_group_bytes=512)
+    assert tool.compare_selections(old, new)['exact_quality']
+    assert not tool.compare_selections(old, new, allow_implementation_changes=False)['exact_quality']
+    new['branch_selection']['edges']['edge']['owner_support']['run']['1']['sha256'] = 'f'*64
+    mismatch = tool.compare_selections(old, new)
+    assert not mismatch['exact_quality']
+    assert mismatch['mismatches'][0]['path'] == ['branch_selection', 'edges', 'edge', 'owner_support', 'run', '1', 'sha256']
+
+
 def test_reconstruction_preserves_intentional_caps_only():
     receipt = dict(resolved_policy={'kind': 'conservative', 'max_group_bytes': 256,
         'rescue_max_plane_bytes': 128, 'min_endpoint_recall': .5},

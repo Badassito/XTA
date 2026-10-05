@@ -360,7 +360,9 @@ def build_azimuthal_backprojection_plan(azimuthal_view: ViewInfo) -> Tuple[List[
     }
 
 def _azimuthal_plan_signature(plan: Sequence[AzimuthalBackprojectionSample]) -> Tuple[Tuple[float, int, bool], ...]:
-    return tuple((round(float(s.angle_deg), 6), int(s.source_index), bool(s.reverse_u)) for s in plan)
+    # Nearest ownership consumes actual float64 angles; rounding can merge
+    # requests on opposite sides of an angular ownership boundary.
+    return tuple((float(s.angle_deg), int(s.source_index), bool(s.reverse_u)) for s in plan)
 
 def build_dense_azimuthal_backprojection_map(
     azimuthal_view: ViewInfo,
@@ -471,6 +473,14 @@ class _MainProcessGpuStageLease:
         runtime_trace_event('gpu_stage_released', device=f'cuda:{self.device_index}',
                             purpose=self.purpose)
 
+    def promote_residency(self):
+        """Retain allocator ownership while making idle compute lendable."""
+        if self._released:
+            raise RuntimeError('Cannot promote a released CUDA stage lease')
+        resident = self._coordinator.promote_residency(self.device_index, self.purpose, self._token)
+        self._released = True
+        return resident
+
     def __enter__(self) -> '_MainProcessGpuStageLease':
         return self
 
@@ -482,6 +492,30 @@ class _MainProcessGpuStageLease:
             self.release()
         except Exception:
             pass
+
+class _MainProcessGpuResidencyLease:
+    """A live model's allocator fence; garbage collection cannot release it."""
+    def __init__(self, coordinator, device_index, purpose, token):
+        self._coordinator, self.device_index, self.purpose = coordinator, int(device_index), str(purpose)
+        self._token, self._released = token, False
+
+    def try_acquire_compute(self, torch_mod, purpose):
+        if self._released:
+            return None
+        return self._coordinator.try_acquire_resident_compute(torch_mod, self.device_index,
+            str(purpose), self._token)
+
+    def quarantine(self, reason):
+        self._coordinator.quarantine_residency(self.device_index, self._token, str(reason))
+
+    def release(self, *, residency_settled=False):
+        if self._released:
+            return
+        if residency_settled is not True:
+            raise RuntimeError('CUDA model residency requires explicit worker settlement')
+        if self._coordinator.release_residency(self.device_index, self._token):
+            self._released = True
+
 
 class _MainProcessGpuStageCoordinator:
     """Coordinate device ownership across independent CUDA allocator processes.
@@ -496,6 +530,7 @@ class _MainProcessGpuStageCoordinator:
         self._worker_devices: set[int] = set()
         self._inference_inflight: Counter[int] = Counter()
         self._stage_leases: Dict[int, str] = {}
+        self._resident_owners = {}
         self._stage_tokens: Dict[int, object] = {}
         self._stage_claims: Dict[int, Tuple[object, object]] = {}
         self._provisional_stages: Dict[int, object] = {}
@@ -521,6 +556,8 @@ class _MainProcessGpuStageCoordinator:
     def configure_workers(self, worker_devices: Sequence[int]) -> None:
         claims: List[Tuple[int, object, object]] = []
         with self._lock:
+            if self._resident_owners:
+                raise RuntimeError('Cannot reconfigure CUDA workers while model residency is owned')
             self._epoch += 1
             claims = [(device, pool, claim) for device, (pool, claim)
                       in self._stage_claims.items()]
@@ -787,6 +824,8 @@ class _MainProcessGpuStageCoordinator:
     def reset(self) -> None:
         claims: List[Tuple[int, object, object]] = []
         with self._lock:
+            if self._resident_owners:
+                raise RuntimeError('Cannot reset CUDA coordinator while model residency is owned')
             self._epoch += 1
             claims = [(device, pool, claim) for device, (pool, claim)
                       in self._stage_claims.items()]
@@ -817,6 +856,8 @@ class _MainProcessGpuStageCoordinator:
 
     def can_dispatch_inference(self, device_index: int) -> bool:
         with self._lock:
+            if int(device_index) in self._resident_owners:
+                return False
             if int(device_index) in self._provisional_stages:
                 return False
             if self._reserved_spherical_device_locked() == int(device_index):
@@ -827,6 +868,8 @@ class _MainProcessGpuStageCoordinator:
     def begin_inference(self, device_index: int) -> bool:
         device = int(device_index)
         with self._lock:
+            if device in self._resident_owners:
+                return False
             if device in self._provisional_stages:
                 return False
             if self._reserved_spherical_device_locked() == device:
@@ -850,28 +893,40 @@ class _MainProcessGpuStageCoordinator:
                 self._inference_inflight.pop(device, None)
 
     def _stage_eligible_locked(self, device: int, purpose: str,
-                               provisional: Optional[object] = None) -> bool:
+                               provisional: Optional[object] = None, resident_token=None) -> bool:
+        resident = self._resident_owners.get(device)
+        if resident_token is not None and (resident is None or resident['token'] is not resident_token):
+            return False
+        if resident is not None:
+            if resident_token is not None:
+                if resident['token'] is not resident_token:
+                    return False
+            elif not (resident['lendable'] and self._is_spherical_retirement(purpose)):
+                return False
         if (device in self._stage_leases
                 or (device in self._provisional_stages
                     and self._provisional_stages[device] is not provisional)
-                or self._priority_blocks_stage_locked(device, purpose)):
+                or (resident_token is None and self._priority_blocks_stage_locked(device, purpose))):
             return False
         return int(self._inference_inflight.get(device, 0)) == 0
 
     def _claim_stage_device(self, device: int, purpose: str, epoch: int,
-                            torch_mod: Optional[object] = None) -> Optional[_MainProcessGpuStageLease]:
+                            torch_mod: Optional[object] = None, resident_token=None) -> Optional[_MainProcessGpuStageLease]:
         """Reserve one device, then release the global lock for auxiliary revocation."""
         reservation = object()
         with self._lock:
             if (self._epoch != epoch
-                    or not self._stage_eligible_locked(device, purpose)):
+                    or not self._stage_eligible_locked(device, purpose, resident_token=resident_token)):
                 return None
             self._provisional_stages[device] = reservation
         aux_pool: Optional[object] = None
         claim: Optional[object] = None
         try:
             aux_pool = gpu_worker_aux_interpolation_pool()
-            if aux_pool is not None:
+            with self._lock:
+                resident = self._resident_owners.get(device)
+                resident_aux_guard = resident is not None and resident.get('aux_claim') is not None
+            if aux_pool is not None and not resident_aux_guard:
                 acquire_claim = getattr(aux_pool, 'claim_worker_for_stage', None)
                 release_claim = getattr(aux_pool, 'release_stage_claim', None)
                 if not callable(acquire_claim) or not callable(release_claim):
@@ -892,7 +947,7 @@ class _MainProcessGpuStageCoordinator:
             with self._lock:
                 if (self._epoch != epoch
                         or self._provisional_stages.get(device) is not reservation
-                        or not self._stage_eligible_locked(device, purpose, reservation)):
+                        or not self._stage_eligible_locked(device, purpose, reservation, resident_token)):
                     return None
                 token = object()
                 self._stage_leases[device] = str(purpose)
@@ -931,6 +986,54 @@ class _MainProcessGpuStageCoordinator:
         self._spherical_retirement_handoff_device = None
         self._spherical_retirement_handoff_deadline = 0.0
         self._spherical_retirement_retry_after = time.monotonic() + 10.0
+
+    def promote_residency(self, device, purpose, stage_token):
+        with self._lock:
+            if (device in self._resident_owners or self._stage_tokens.get(device) is not stage_token
+                    or self._stage_leases.get(device) != purpose):
+                raise RuntimeError('CUDA residency promotion requires the exact live startup stage owner')
+            token = object()
+            self._resident_owners[device] = dict(token=token, purpose=purpose, lendable=True,
+                quarantined=False, reason='', aux_claim=self._stage_claims.pop(device, None))
+            self._stage_leases.pop(device)
+            self._stage_tokens.pop(device)
+        runtime_trace_event('gpu_residency_acquired', device=f'cuda:{device}', purpose=purpose)
+        return _MainProcessGpuResidencyLease(self, device, purpose, token)
+
+    def try_acquire_resident_compute(self, torch_mod, device, purpose, resident_token):
+        try:
+            if not 0 <= device < int(torch_mod.cuda.device_count()):
+                return None
+        except Exception:
+            return None
+        with self._lock:
+            owner = self._resident_owners.get(device)
+            if owner is None or owner['token'] is not resident_token:
+                return None
+            epoch = self._epoch
+        return self._claim_stage_device(device, purpose, epoch, torch_mod, resident_token)
+
+    def quarantine_residency(self, device, token, reason):
+        with self._lock:
+            owner = self._resident_owners.get(device)
+            if owner is not None and owner['token'] is token:
+                owner.update(lendable=False, quarantined=True, reason=reason)
+
+    def release_residency(self, device, token):
+        claim = None
+        with self._lock:
+            owner = self._resident_owners.get(device)
+            if owner is None or owner['token'] is not token:
+                return False
+            if device in self._stage_leases or device in self._provisional_stages:
+                raise RuntimeError('Cannot release CUDA model residency while a compute stage is active')
+            claim = owner.get('aux_claim')
+            self._resident_owners.pop(device)
+        if claim is not None:
+            pool, aux_token = claim
+            pool.release_stage_claim(device, aux_token)
+        runtime_trace_event('gpu_residency_released', device=f'cuda:{device}')
+        return True
 
     def try_acquire_specific_stage(
         self,
@@ -1039,6 +1142,8 @@ class _MainProcessGpuStageCoordinator:
                 'worker_devices': sorted(self._worker_devices),
                 'inference_inflight': dict(self._inference_inflight),
                 'stage_leases': dict(self._stage_leases),
+                'resident_owners': {device: {key: owner[key] for key in ('purpose', 'lendable', 'quarantined', 'reason')}
+                    for device, owner in self._resident_owners.items()},
                 'provisional_stage_devices': sorted(self._provisional_stages),
                 'inference_priority_active': bool(self._inference_priority_active),
                 'inference_asset_retirement_pending': bool(self._inference_asset_retirement_pending),
@@ -4581,8 +4686,6 @@ def _backproject_tilted_azimuthal_volume_to_volume(
     shape = ((int(azimuthal_view.full_t), int(azimuthal_view.full_h),
               int(azimuthal_view.full_w)) if out_shape_tyx is None
              else tuple(int(value) for value in out_shape_tyx))
-    plan, stats = build_azimuthal_backprojection_plan(azimuthal_view)
-    _log_azimuthal_backprojection_densification(desc, stats)
     print(f'{desc}: native inverse coverage on CPU; legacy Tilted Azimuthal '
           'CUDA scatter is unsupported (destination coverage).', flush=True)
     runtime_telemetry().gauge('projection.tilted_azimuthal.cuda_unavailable', {

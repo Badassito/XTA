@@ -1,8 +1,9 @@
 """Bounded, observation-only planning for native-view SAM interpolation.
 
 SAM crops are planned in the consolidated view canvas. Detector tile rectangles
-never enter this module. Every mask contract is fixed before inference; tracker
-output cannot enlarge it. Canonical labels describe provenance, while stable
+never enter this module. Every attempt's mask contract is fixed before inference;
+a bounded retry declares a fresh context and preserves the original seeds.
+Canonical labels describe provenance, while stable
 slice-local component IDs describe endpoints (including same-label daughters).
 """
 
@@ -686,6 +687,52 @@ def _materialize_contract_group(recipe: _SamGroupContractRecipe) -> SamBridgeGro
                            MappingProxyType(permitted), MappingProxyType(edge_contracts), crop_contract,
                            group_addresses, group_addressing, native_shape)
     return group
+
+
+def expand_sam_bridge_group_context(group: SamBridgeGroup, crop_bbox_yx: BBoxYX, *,
+        max_crop_pixels: int, retry_lineage: Mapping[str, Any] | None = None) -> SamBridgeGroup:
+    """Declare fresh contracts for one retry, preserving native seed geometry.
+
+    The caller owns the retry reservation and model/image budgets. This helper
+    preserves the current contract lease and its explicit memory caps; it does
+    not infer resource permission from serialized receipt fields.
+    """
+    recipe = group.contract_recipe
+    if not isinstance(recipe, _SamGroupContractRecipe) or group.status != 'planned':
+        raise ValueError('SAM crop retry requires a planned immutable family recipe')
+    crop = tuple(int(value) for value in crop_bbox_yx)
+    canvas = tuple(int(value) for value in group.crop_contract['canvas_shape_yx'])
+    old = tuple(group.context_bbox_yx)
+    if (len(crop) != 4 or not 0 <= crop[0] < crop[2] <= canvas[0]
+            or not 0 <= crop[1] < crop[3] <= canvas[1]
+            or crop[0] > old[0] or crop[1] > old[1]
+            or crop[2] < old[2] or crop[3] < old[3] or crop == old):
+        raise ValueError('SAM retry crop must strictly enlarge its original native context')
+    pixels = (crop[2]-crop[0])*(crop[3]-crop[1])
+    if int(max_crop_pixels) < 1 or pixels > int(max_crop_pixels):
+        raise MemoryError('SAM retry crop exceeds its explicit pixel cap')
+    old_pixels = (old[2]-old[0])*(old[3]-old[1])
+    old_charge = int(group.crop_contract['charged_contract_bytes'])
+    if old_charge % old_pixels:
+        raise ValueError('SAM original contract charge is not an exact pixel-based recipe')
+    charge = pixels * (old_charge // old_pixels)
+    if (charge > recipe.bounds.max_group_bytes
+            or charge > recipe.lease_budget.maximum_bytes):
+        raise MemoryError('SAM enlarged contracts exceed the current owned family/resident memory caps')
+    identity = _identity('sam_group_retry', group.group_id, crop)
+    contract = dict(group.crop_contract)
+    contract.update(context_bbox_yx=crop, unclipped_context_bbox_yx=crop,
+        crop_pixels=pixels, charged_contract_bytes=charge,
+        bounds_basis='bounded_retry_of_original_frozen_family',
+        retry_of_group_id=group.group_id, retry_crop_bbox_yx=crop,
+        retry_lineage=dict(retry_lineage or {}))
+    descriptor = replace(group, group_id=identity, context_bbox_yx=crop,
+        crop_contract=MappingProxyType(contract), contract_recipe=None)
+    # All endpoint/corridor painting keeps the original raster origin. The
+    # recipe inventories ALL original observations in the larger rectangle.
+    enlarged_recipe = replace(recipe, descriptor=descriptor,
+        bounds=replace(recipe.bounds, max_crop_pixels=int(max_crop_pixels)))
+    return replace(descriptor, contract_recipe=enlarged_recipe)
 
 
 def plan_sam_bridges(

@@ -43,6 +43,8 @@ def replay_sam_directional_nrrds(bundle, output, *, policy=None,
     reader_cache_bytes = min(32 * 1024**2, max(0, budget_bytes // 8))
     if not isinstance(bundle, SamEvidenceBundle):
         bundle = SamEvidenceBundle.open(bundle, max_mask_bytes=max(1, budget_bytes // 4))
+    if bundle.scope.get('evidence_purpose') == 'sam_extrapolation':
+        raise ValueError('SAM extrapolation requires its dedicated tail replay contract')
     shape = native_output_shape_tyx(bundle)
     if (len(shape) != 3 or any(isinstance(v, bool) or not isinstance(v, int) or v <= 0 for v in shape)):
         raise ValueError('Directional SAM replay requires its recorded shape_tyx')

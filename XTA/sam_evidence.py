@@ -8,6 +8,7 @@ No SAM or detector runtime is imported here.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -104,7 +105,9 @@ def _scope_frame_geometry(scope):
         if 'evidence_shape_tyx' in scope and tuple(scope['evidence_shape_tyx']) != shape:
             raise ValueError('Extended SAM frames require an explicit cyclic closure')
         return dict(cyclic=False, native_shape_tyx=shape, evidence_shape_tyx=shape, addressing=None)
-    from .sam_cyclic import validate_cyclic_frame_addressing, IMPLEMENTATION_SHA256
+    from .sam_cyclic import validate_cyclic_frame_addressing, IMPLEMENTATION_SHA256, CYCLIC_EXTRAPOLATION_ADDRESSING_SCHEMA
+    if addressing.get('schema')==CYCLIC_EXTRAPOLATION_ADDRESSING_SCHEMA and scope.get('evidence_purpose')!='sam_extrapolation':
+        raise ValueError('Extended cyclic tail addresses require explicit SAM extrapolation purpose')
     validate_cyclic_frame_addressing(addressing)
     if scope.get('cyclic_implementation_sha256') not in (None, IMPLEMENTATION_SHA256):
         raise ValueError('Cyclic SAM helper implementation identity differs from saved evidence')
@@ -257,7 +260,255 @@ class SamEvidenceWriter:
             raise
         self.groups, self.runs, self.records = {}, {}, {}
         self._pending_tiles = {}
+        self._import_source = None
         self._closed = False
+
+    def _check_import_source(self, bundle):
+        if self._closed:
+            raise RuntimeError("SAM evidence writer is already closed")
+        if not isinstance(bundle, SamEvidenceBundle) or not getattr(bundle, '_verified', False):
+            raise ValueError("SAM evidence import requires a verified SamEvidenceBundle")
+        if self._import_source is not None:
+            if self._import_source is not bundle:
+                raise ValueError("SAM evidence import transaction cannot switch source bundles")
+            # Scope identities were checked at entry and cannot change before
+            # the final scope fingerprint/source integrity check. Do not walk
+            # the full cyclic address map again for every copied descriptor.
+            return
+        for scope in (self.scope, bundle.scope):
+            snapshots = [scope[key] for key in ('observation_snapshot_sha256',
+                         'frozen_observation_snapshot_sha256') if key in scope]
+            if (not snapshots or any(not isinstance(value, str) or len(value) != 64
+                    or any(letter not in '0123456789abcdef' for letter in value) for value in snapshots)
+                    or len(set(snapshots)) != 1):
+                raise ValueError("SAM evidence import requires one frozen observation SHA-256")
+            source_inputs = scope.get('input_fingerprints', {})
+            if not isinstance(source_inputs, Mapping):
+                raise ValueError("Malformed SAM evidence import input fingerprints")
+            original = source_inputs.get('original_snapshot', snapshots[0])
+            if original != snapshots[0]:
+                raise ValueError("SAM evidence original snapshot differs from its frozen observations")
+        source_snapshot = bundle.scope.get('observation_snapshot_sha256',
+            bundle.scope.get('frozen_observation_snapshot_sha256'))
+        target_snapshot = self.scope.get('observation_snapshot_sha256',
+            self.scope.get('frozen_observation_snapshot_sha256'))
+        if source_snapshot != target_snapshot:
+            raise ValueError("SAM evidence import frozen observation snapshot differs")
+        source_geometry = _scope_frame_geometry(bundle.scope)
+        target_geometry = _scope_frame_geometry(self.scope)
+        if (target_geometry['native_shape_tyx'] is None
+                or fingerprint(source_geometry) != fingerprint(target_geometry)):
+            raise ValueError("SAM evidence import scope frame geometry differs or is missing")
+        for key in ('view_name', 'physical_view', 'angle_deg', 'augmentation_pass',
+                    'canvas_transform', 'spacing_zyx', 'sam_working_canvas_kind',
+                    'sam_working_canvas_shape_tyx', 'sam_native_view_shape_tyx',
+                    'sam_crop_canvas_contract', 'sam_crop_mode', 'evidence_purpose', 'source_stage'):
+            if _plain(self.scope.get(key)) != _plain(bundle.scope.get(key)):
+                raise ValueError(f"SAM evidence import scope geometry/purpose differs: {key}")
+        identities = {'scope_id', 'detector_identity', 'sam_bundle_identity', 'sam_model', 'sam_runtime',
+            'model_identity', 'image_snapshot_sha256', 'source_identity', 'source_fingerprints',
+            'image_source_identity', 'image_geometry_identity', 'view_sampler_recipe', 'sampler_recipe',
+            'sampler_identity', 'upstream_fingerprints', 'gate_support_fingerprints', 'upstream_lineage',
+            'post_interpolation_snapshot_sha256'}
+        identities.update(key for scope in (self.scope, bundle.scope) for key in scope
+                          if key.startswith(('source_', 'sampler_')))
+        for key in identities:
+            if _plain(self.scope.get(key)) != _plain(bundle.scope.get(key)):
+                raise ValueError(f"SAM evidence import source/model identity differs: {key}")
+        inputs = []
+        for scope in (self.scope, bundle.scope):
+            value = scope.get('input_fingerprints', {})
+            if not isinstance(value, Mapping):
+                raise ValueError("Malformed SAM evidence import input fingerprints")
+            inputs.append({key: _plain(item) for key, item in value.items()
+                           if not key.startswith(('retry_', 'sam_crop_retry_'))})
+        if inputs[0] != inputs[1]:
+            raise ValueError("SAM evidence import source input fingerprints differ")
+
+    @contextmanager
+    def import_transaction(self, bundle):
+        """Copy several descriptors with one source integrity check at each end.
+
+        Only encoded packets are copied; no source paths are borrowed. A failed
+        transaction aborts this writer's private stage, preventing partial
+        imports from being published. Nested/source-switching transactions are
+        deliberately unsupported. Retry policy/attempt metadata may differ,
+        while frozen observations and the native frame/canvas closure must match.
+        """
+        self._check_import_source(bundle)
+        if self._import_source is not None:
+            raise ValueError("SAM evidence import transactions cannot be nested")
+        scope_identity = fingerprint(self.scope)
+        self._import_source = bundle
+        try:
+            bundle.assert_unchanged()
+            yield self
+            if self._closed or fingerprint(self.scope) != scope_identity:
+                raise ValueError("SAM evidence writer scope changed during import")
+            self._check_import_source(bundle)
+            bundle.assert_unchanged()
+        except BaseException:
+            self.abort()
+            raise
+        finally:
+            self._import_source = None
+
+    def _import_mask_records(self, bundle, references):
+        """Validate metadata first, then copy at most 64 KiB per read/write."""
+        records = {}
+        total = int(bundle.manifest['files']['masks.bin']['bytes'])
+        for key, expected_shape in references:
+            if not isinstance(key, str) or not key or key not in bundle.records:
+                raise ValueError("SAM evidence import references an unknown mask")
+            if key in self.records:
+                raise ValueError(f"Duplicate SAM mask identity: {key}")
+            record = _plain(bundle.records[key])
+            try:
+                shape = tuple(_frame_integer(value, 'SAM imported mask shape') for value in record['shape'])
+                offset = _frame_integer(record['offset'], 'SAM imported mask offset')
+                size = _frame_integer(record['bytes'], 'SAM imported mask bytes')
+                packed = _frame_integer(record['packed_bytes'], 'SAM imported packed bytes')
+                foreground = _frame_integer(record['foreground'], 'SAM imported foreground')
+            except (KeyError, TypeError) as error:
+                raise ValueError("Malformed SAM evidence import mask record") from error
+            pixels = shape[0] * shape[1] if len(shape) == 2 else 0
+            if pixels > self.max_mask_bytes:
+                raise MemoryError("SAM evidence mask exceeds configured memory limit")
+            if (len(shape) != 2 or any(value <= 0 for value in shape)
+                    or expected_shape is not None and shape != tuple(expected_shape)
+                    or packed != (pixels + 7) // 8 or not 0 <= foreground <= pixels
+                    or offset < 0 or size <= 0 or offset + size > total
+                    or size > packed + packed // 1000 + 1024):
+                raise ValueError("Malformed SAM evidence import mask shape or payload bounds")
+            for field in ('sha256', 'compressed_sha256'):
+                digest = record.get(field)
+                if (not isinstance(digest, str) or len(digest) != 64
+                        or any(letter not in '0123456789abcdef' for letter in digest)):
+                    raise ValueError("Malformed SAM evidence import mask checksum")
+            records[key] = record
+        if self._stream.tell() + sum(record['bytes'] for record in records.values()) > self.max_payload_bytes:
+            raise OSError("SAM evidence payload exceeds configured staging disk limit")
+        with (bundle.directory / 'masks.bin').open('rb') as source:
+            for key, record in records.items():
+                source.seek(record['offset'])
+                target_offset, remaining = self._stream.tell(), record['bytes']
+                digest = hashlib.sha256()
+                while remaining:
+                    block = source.read(min(remaining, 64 * 1024))
+                    if not block:
+                        raise ValueError("Truncated SAM evidence imported mask payload")
+                    digest.update(block)
+                    self._stream.write(block)
+                    remaining -= len(block)
+                if digest.hexdigest() != record['compressed_sha256']:
+                    raise ValueError("SAM evidence imported compressed-mask checksum mismatch")
+                self.records[key] = {**record, 'offset': target_offset}
+
+    def import_group(self, bundle, group_id):
+        """Import one unchanged group and every encoded geometry mask it owns."""
+        self._check_import_source(bundle)
+        identity = str(group_id)
+        if identity in self.groups or identity not in bundle.groups:
+            raise ValueError("Duplicate SAM group or unknown imported group identity")
+        group = _plain(bundle.groups[identity])
+        if str(group.get('group_id')) != identity or not isinstance(group.get('mask_keys'), Mapping):
+            raise ValueError("Malformed SAM imported group identity or mask references")
+        shape = _group_shape(group)
+        frames = [_frame_integer(frame, 'SAM imported group frame') for frame in group['frame_indices']]
+        native = self._scope_frame_geometry['native_shape_tyx']
+        if (not frames or frames != list(range(frames[0], frames[-1] + 1))
+                or not self._scope_frame_geometry['cyclic'] and not 0 <= frames[0] <= frames[-1] < native[0]
+                or group['context_bbox_yx'][2] > native[1] or group['context_bbox_yx'][3] > native[2]):
+            raise ValueError("SAM imported group lies outside its scope frame geometry")
+        _group_frame_geometry(group, self._scope_frame_geometry)
+        endpoints = group.get('endpoints', ())
+        endpoint_ids = [str(endpoint['observation_id']) for endpoint in endpoints]
+        if (len(set(endpoint_ids)) != len(endpoint_ids)
+                or any(endpoint['frame_index'] not in frames for endpoint in endpoints)):
+            raise ValueError("Malformed SAM imported original endpoint identities")
+        complete = group.get('complete', True) and group.get('status') not in {'incomplete', 'unresolved', 'invalid'}
+        required = {f'{kind}:{frame}' for kind in ('acceptance', 'write') for frame in frames}
+        required.update(f'{kind}:{key}' for kind in ('endpoint', 'evaluation') for key in endpoint_ids)
+        if complete and required - set(group['mask_keys']):
+            raise ValueError("Missing SAM imported group geometry/reference masks")
+        if any(str(edge['source_id']) not in endpoint_ids or str(edge['target_id']) not in endpoint_ids
+                for edge in group.get('edges', ())):
+            raise ValueError("SAM imported edge references an unknown endpoint")
+        if self._import_source is None:
+            with self.import_transaction(bundle):
+                return self.import_group(bundle, identity)
+        self._import_mask_records(bundle, [(key, shape if complete else None)
+            for key in group['mask_keys'].values()])
+        self.groups[identity] = group
+        return identity
+
+    def import_run(self, bundle, run_id):
+        """Import raw, candidate, availability and nested tile-halo packets."""
+        self._check_import_source(bundle)
+        identity = str(run_id)
+        if identity in self.runs or identity in self._pending_tiles or identity not in bundle.runs:
+            raise ValueError("Duplicate SAM run or unknown imported run identity")
+        run = _plain(bundle.runs[identity])
+        group_id = str(run.get('group_id'))
+        if (str(run.get('run_id')) != identity or group_id not in self.groups
+                or self.groups[group_id] != _plain(bundle.groups.get(group_id))):
+            raise ValueError("SAM imported run must reference its unchanged imported group")
+        group, shape = self.groups[group_id], _group_shape(self.groups[group_id])
+        expected = [_frame_integer(frame, 'SAM imported expected frame') for frame in run['expected_frames']]
+        observed = [_frame_integer(frame, 'SAM imported observed frame') for frame in run['observed_frames']]
+        backward = run.get('direction') in (-1, 'backward')
+        if (not group.get('complete', True) or not expected or len(set(expected)) != len(expected)
+                or run.get('direction') not in (1, -1, 'forward', 'backward')
+                or expected != sorted(expected, reverse=backward)
+                or set(expected) - set(group['frame_indices'])
+                or observed != sorted(set(observed)) or set(observed) - set(expected)):
+            raise ValueError("Malformed SAM imported run coverage or direction")
+        endpoint_ids = {str(endpoint['observation_id']) for endpoint in group.get('endpoints', ())}
+        if any(set(map(str, run.get(field, ()))) - endpoint_ids for field in ('seed_ids', 'held_out_ids')):
+            raise ValueError("SAM imported run references an unknown endpoint")
+        references = []
+
+        def add_references(owner, field, frames, mask_shape):
+            keys = owner.get(field)
+            if not isinstance(keys, Mapping) or set(keys) != {str(frame) for frame in frames}:
+                raise ValueError("Malformed SAM imported mask frame coverage")
+            references.extend((key, mask_shape) for key in keys.values())
+
+        for field in ('raw_mask_keys', 'candidate_mask_keys'):
+            add_references(run, field, observed, shape)
+        tiles = run.get('tile_evidence', ())
+        if run.get('generation_mode') == 'tiled' and not tiles:
+            raise ValueError("Tiled SAM imported run has no retained tile evidence")
+        if tiles and (run.get('generation_mode') != 'tiled'
+                      or run.get('tile_evidence_schema') != TILE_EVIDENCE_SCHEMA):
+            raise ValueError("Malformed SAM imported tiled evidence schema")
+        if 'availability_mask_keys' in run or tiles:
+            add_references(run, 'availability_mask_keys', observed, shape)
+        tile_ids = set()
+        for tile in tiles:
+            tile_id = str(tile.get('tile_id'))
+            crop = tuple(tile['crop_bbox_yx'])
+            owner = tuple(tile['ownership_bbox_yx'])
+            gy0, gx0, gy1, gx1 = group['context_bbox_yx']
+            if (tile_id in tile_ids or tile.get('parent_run_id') != identity or tile.get('group_id') != group_id
+                    or tile.get('schema') != TILE_EVIDENCE_SCHEMA or tile.get('expected_frames') != expected
+                    or len(crop) != 4 or len(owner) != 4
+                    or not (gy0 <= crop[0] <= owner[0] < owner[2] <= crop[2] <= gy1
+                            and gx0 <= crop[1] <= owner[1] < owner[3] <= crop[3] <= gx1)):
+                raise ValueError("Malformed SAM imported tile lineage or crop ownership")
+            tile_ids.add(tile_id)
+            tile_frames = tile.get('observed_frames', ())
+            if (list(tile_frames) != sorted(set(tile_frames)) or set(tile_frames) - set(expected)
+                    or not tile.get('attempted') and tile_frames
+                    or set(tile.get('seed_ids', ())) - set(run.get('seed_ids', ()))):
+                raise ValueError("Malformed SAM imported tile coverage or seed lineage")
+            add_references(tile, 'raw_mask_keys', tile_frames, (crop[2] - crop[0], crop[3] - crop[1]))
+        if self._import_source is None:
+            with self.import_transaction(bundle):
+                return self.import_run(bundle, identity)
+        self._import_mask_records(bundle, references)
+        self.runs[identity] = run
+        return identity
 
     def _put(self, key, value, shape):
         if key in self.records:
@@ -504,6 +755,8 @@ class SamEvidenceWriter:
             return _decode_mask(stream, self.records[key], self.max_mask_bytes)
 
     def commit(self, *, complete=True):
+        if self._import_source is not None:
+            raise RuntimeError("SAM evidence import transaction must finish before publication")
         _evidence_frame_geometry(self.scope, self.groups, self.runs)
         if self._closed:
             raise RuntimeError("SAM evidence writer is already closed")
@@ -551,9 +804,10 @@ class SamEvidenceWriter:
             self.abort()
 
 
-def _decode_mask(stream, record, max_mask_bytes):
+def _read_verified_packed_mask(stream, record, max_mask_bytes):
+    """Authenticate one complete record before any dense or sparse bit access."""
     shape = tuple(map(int, record["shape"]))
-    if len(shape) != 2 or any(v <= 0 for v in shape) or int(np.prod(shape)) > max_mask_bytes:
+    if len(shape) != 2 or any(v <= 0 for v in shape) or shape[0]*shape[1] > max_mask_bytes:
         raise ValueError("Invalid or oversized SAM evidence mask shape")
     packed_size = (shape[0] * shape[1] + 7) // 8
     if int(record["packed_bytes"]) != packed_size:
@@ -570,11 +824,79 @@ def _decode_mask(stream, record, max_mask_bytes):
         raise ValueError("Malformed SAM evidence mask payload")
     if hashlib.sha256(packed).hexdigest() != record["sha256"]:
         raise ValueError("SAM evidence mask checksum mismatch")
+    return shape, packed
+
+
+def _decode_mask(stream, record, max_mask_bytes):
+    shape, packed = _read_verified_packed_mask(stream, record, max_mask_bytes)
     unpacked = np.unpackbits(np.frombuffer(packed, dtype=np.uint8), count=shape[0]*shape[1], bitorder="little")
     result = np.frombuffer(unpacked.tobytes(), dtype=np.bool_).reshape(shape)
     if int(np.count_nonzero(result)) != int(record["foreground"]):
         raise ValueError("SAM evidence foreground count disagrees with indexed payload")
     return result
+
+
+_PACKED_BIT_COUNTS = np.frombuffer(bytes(value.bit_count() for value in range(256)), dtype=np.uint8)
+_PACKED_CONTACT_BLOCK_BYTES = 64*1024
+_PACKED_CONTACT_ROW_BLOCK = 8192
+
+
+def _byte_popcount(values):
+    """A fixed-size lookup workspace, including extreme 1xN/Nx1 canvases."""
+    total = 0
+    for start in range(0, len(values), _PACKED_CONTACT_BLOCK_BYTES):
+        total += int(_PACKED_BIT_COUNTS[values[start:start+_PACKED_CONTACT_BLOCK_BYTES]].sum(dtype=np.uint64))
+    return total
+
+
+def _bit_range_popcount(values, start, stop):
+    """Count a little-endian bit interval without expanding its raster row."""
+    if start >= stop:
+        return 0
+    first, last = start//8, (stop-1)//8
+    lo, hi = start % 8, (stop-1) % 8+1
+    if first == last:
+        return int(_PACKED_BIT_COUNTS[int(values[first]) & (((1 << hi)-1) & (255 << lo))])
+    return (int(_PACKED_BIT_COUNTS[int(values[first]) & (255 << lo)])
+        + _byte_popcount(values[first+1:last])
+        + int(_PACKED_BIT_COUNTS[int(values[last]) & ((1 << hi)-1)]))
+
+
+def _decode_raw_crop_boundary_contacts(stream, record, max_mask_bytes, crop_bbox_yx,
+        canvas_shape_yx):
+    return _decode_raw_crop_boundary_contacts_with_foreground(stream, record, max_mask_bytes,
+        crop_bbox_yx, canvas_shape_yx)[0]
+
+
+def _decode_raw_crop_boundary_contacts_with_foreground(stream, record, max_mask_bytes,
+        crop_bbox_yx, canvas_shape_yx):
+    """Exact contact census with full authentication and no dense mask decode.
+
+    Compressed/packed SHA and foreground validation still touch the full packed
+    record. Only O(H+W) boundary bits are inspected for contacts, with fixed-size
+    column blocks; even a 1xN crop never allocates a full N-byte binary mask.
+    """
+    from .sam_crop_retry import crop_boundary_contacts_from_counts
+    shape, packed = _read_verified_packed_mask(stream, record, max_mask_bytes)
+    y0, x0, y1, x1 = crop_bbox_yx
+    if shape != (y1-y0, x1-x0):
+        raise ValueError('Raw SAM mask differs from its declared crop geometry')
+    values = np.frombuffer(packed, dtype=np.uint8)
+    pixels = shape[0]*shape[1]
+    foreground = _bit_range_popcount(values, 0, pixels)
+    if foreground != int(record['foreground']):
+        raise ValueError('SAM evidence foreground count disagrees with indexed payload')
+    height, width = shape
+    left = right = 0
+    for start in range(0, height, _PACKED_CONTACT_ROW_BLOCK):
+        positions = np.arange(start, min(start+_PACKED_CONTACT_ROW_BLOCK, height), dtype=np.int64)*width
+        left += int(np.count_nonzero((values[positions//8] >> (positions % 8)) & 1))
+        positions += width-1
+        right += int(np.count_nonzero((values[positions//8] >> (positions % 8)) & 1))
+    contacts = crop_boundary_contacts_from_counts(dict(top=_bit_range_popcount(values, 0, width),
+        left=left, bottom=_bit_range_popcount(values, pixels-width, pixels), right=right),
+        crop_bbox_yx, canvas_shape_yx)
+    return contacts, foreground
 
 
 class SamEvidenceBundle:
@@ -612,6 +934,7 @@ class SamEvidenceBundle:
         if (len(self.groups), len(self.runs), len(self.records)) != (manifest["group_count"], manifest["run_count"], manifest["mask_count"]):
             raise ValueError("SAM evidence record counts disagree with manifest")
         self._frame_geometry = _freeze(_evidence_frame_geometry(self.scope, self.groups, self.runs))
+        self._verified = bool(verify)
         return self
 
     def mask(self, key):
@@ -623,6 +946,29 @@ class SamEvidenceBundle:
 
     def raw_mask(self, run_id, frame):
         return self.mask(self.runs[str(run_id)]["raw_mask_keys"][str(int(frame))])
+
+    def raw_crop_boundary_contacts(self, run_id, frame, *, crop_bbox_yx=None, canvas_shape_yx=None):
+        """Authenticated sparse census for one whole-crop raw observation."""
+        return self.raw_crop_boundary_contacts_with_foreground(run_id, frame,
+            crop_bbox_yx=crop_bbox_yx, canvas_shape_yx=canvas_shape_yx)[0]
+
+    def raw_crop_boundary_contacts_with_foreground(self, run_id, frame, *,
+            crop_bbox_yx=None, canvas_shape_yx=None):
+        """One authenticated census plus full raw foreground count for empty stopping."""
+        run = self.runs[str(run_id)]
+        if run.get('generation_mode') == 'tiled' or run.get('tile_evidence'):
+            raise ValueError('Tiled raw contacts require the dense overlapping halo union')
+        group = self.groups[str(run['group_id'])]
+        shape = native_output_shape_tyx(self)
+        box = tuple(group['context_bbox_yx'])
+        if crop_bbox_yx is not None and tuple(crop_bbox_yx) != box:
+            raise ValueError('Raw SAM contact crop differs from the caller\'s original planned geometry')
+        if canvas_shape_yx is not None and tuple(canvas_shape_yx) != shape[1:]:
+            raise ValueError('Raw SAM contact canvas differs from the caller\'s original planned geometry')
+        record = self.records[run['raw_mask_keys'][str(int(frame))]]
+        with (self.directory / 'masks.bin').open('rb') as stream:
+            return _decode_raw_crop_boundary_contacts_with_foreground(stream, record, self.max_mask_bytes,
+                box, shape[1:])
 
     def candidate_mask(self, run_id, frame):
         return self.mask(self.runs[str(run_id)]["candidate_mask_keys"][str(int(frame))])

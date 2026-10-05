@@ -27,6 +27,8 @@ def evidence_role(metadata):
     kind = str(metadata.get('mask_kind', '')).lower()
     if kind == 'bridge':
         return 'bridge'
+    if kind == 'extrapolation':
+        return 'extrapolation'
     if kind == 'yolo':
         return 'prediction'
     if kind == 'union':
@@ -102,7 +104,8 @@ def _binary_mask(layer, z0, z1, shape):
     return values != 0
 
 
-def voting_memory_plan(shape_tyx, group_count, memory_mib, *, union_only=False):
+def voting_memory_plan(shape_tyx, group_count, memory_mib, *, union_only=False,
+                       include_extrapolation=False):
     """Plan the same bounded vote workspace before inference or array allocation."""
     shape = tuple(int(v) for v in shape_tyx)
     if len(shape) != 3 or min(shape) <= 0 or int(group_count) < 0:
@@ -110,7 +113,7 @@ def voting_memory_plan(shape_tyx, group_count, memory_mib, *, union_only=False):
     if not math.isfinite(float(memory_mib)) or memory_mib <= 0:
         raise ValueError('Voting memory budget must be positive and finite')
     budget = int(float(memory_mib) * 1024**2)
-    bytes_per_voxel = 8 if union_only else 6 * int(group_count) + 160
+    bytes_per_voxel = 8 if union_only else (6 + int(include_extrapolation)) * int(group_count) + 160
     plane_bytes = shape[1] * shape[2] * bytes_per_voxel
     if plane_bytes > budget:
         raise ValueError(f'Reconciliation needs at least {math.ceil(plane_bytes / 1024**2)} MiB for one XY slab with {group_count} groups')
@@ -188,7 +191,8 @@ def reconcile(layers: Sequence[EvidenceLayer], *, shape_tyx, policy, write_slab,
     group_count = len(groups)
     # Six bytes per group hold score, direct-source support, and anchor support;
     # reserve additional temporaries, dynamic orientation codes and input planes.
-    plan = voting_memory_plan(shape, group_count, memory_mib)
+    has_extrapolation = any(evidence_role(layer.metadata) == 'extrapolation' for layer in layers)
+    plan = voting_memory_plan(shape, group_count, memory_mib, include_extrapolation=has_extrapolation)
     slab_depth = plan['slab_depth']
     weights, component_records = ({layer.layer_id: 1. for layer in layers}, {})
     if policy['island_weighting']:
@@ -206,6 +210,7 @@ def reconcile(layers: Sequence[EvidenceLayer], *, shape_tyx, policy, write_slab,
         scores = np.zeros((group_count, *block_shape), np.float32)
         direct = np.zeros((group_count, *block_shape), bool)
         anchors = np.zeros((group_count, *block_shape), bool)
+        extrapolated = np.zeros((group_count, *block_shape), bool) if has_extrapolation else None
         candidate = np.zeros(block_shape, bool)
         for layer, group in zip(layers, layer_groups):
             mask = _binary_mask(layer, z0, z1, block_shape)
@@ -232,6 +237,8 @@ def reconcile(layers: Sequence[EvidenceLayer], *, shape_tyx, policy, write_slab,
             np.maximum(scores[group], contribution, out=scores[group])
             if role == 'prediction':
                 direct[group] |= known & (contribution > 0)
+            elif role == 'extrapolation':
+                extrapolated[group] |= mask & (contribution > 0)
         if policy['grouping'] == 'sections' and policy['mode'] != 'union':
             codes = [section_codes(descriptor, z0, z1, shape, geometry_context,
                                    angular_tolerance_deg=policy['angular_tolerance_deg'])
@@ -248,19 +255,26 @@ def reconcile(layers: Sequence[EvidenceLayer], *, shape_tyx, policy, write_slab,
                     np.maximum(scores[previous], np.where(same, scores[current], 0.), out=scores[previous])
                     direct[previous] |= same & direct[current]
                     anchors[previous] |= same & anchors[current]
+                    if extrapolated is not None:
+                        extrapolated[previous] |= same & extrapolated[current]
                     scores[current][same] = 0.
                     direct[current][same] = False
                     anchors[current][same] = False
+                    if extrapolated is not None:
+                        extrapolated[current][same] = False
         support = np.count_nonzero(scores > 0, axis=0).astype(np.uint16)
         direct_support = np.count_nonzero(direct, axis=0).astype(np.uint16)
+        extrapolation_support = (np.count_nonzero(extrapolated, axis=0).astype(np.uint16)
+            if extrapolated is not None else np.broadcast_to(np.uint16(0), block_shape))
         total = scores.sum(axis=0, dtype=np.float32)
         anchored = anchors.any(axis=0) & (direct_support >= 2)
         effective = total + np.where(anchored, policy['anchor_bonus'], 0.)
         counts['anchored_voxels'] += int(np.count_nonzero(anchored))
         block = dict(candidate=candidate, score=effective, support=support,
-                     prediction_support=direct_support, anchored=anchored, z0=z0, z1=z1)
+                     prediction_support=direct_support, extrapolation_support=extrapolation_support,
+                     anchored=anchored, z0=z0, z1=z1)
         if policy['decide'] is not None:
-            for value in (candidate, effective, support, direct_support, anchored):
+            for value in (candidate, effective, support, direct_support, extrapolation_support, anchored):
                 value.flags.writeable = False
             keep = np.asarray(policy['decide'](block))
             if keep.dtype != np.bool_ or keep.shape != block_shape:

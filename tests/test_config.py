@@ -300,8 +300,18 @@ class ConfigTests(unittest.TestCase):
 
     def test_sam_feature_cache_limit_defaults_and_overrides_are_operational_only(self) -> None:
         parser = build_argparser()
-        self.assertEqual(parser.parse_args(self.REQUIRED).sam_feature_cache_mib, 512)
-        for budget in (0, 192, 512, 2048):
+        default_args = parser.parse_args(self.REQUIRED)
+        self.assertEqual(default_args.sam_feature_cache_mib, 1024)
+        for legacy_namespace in (False, True):
+            with self.subTest(legacy_namespace=legacy_namespace):
+                args = parser.parse_args([*self.REQUIRED, '--device', '0'])
+                if legacy_namespace:
+                    del args.sam_feature_cache_mib
+                settings = resolve_interpolation_settings(
+                    args, resolve_backend_models(args.model), resolve_backend_devices(args.device),
+                )
+                self.assertEqual(settings.sam_feature_cache_mib, 1024)
+        for budget in (0, 192, 512, 1024, 2048):
             args = parser.parse_args([
                 *self.REQUIRED, 'sam:bundle', '--device', '0', '--interpolation_backend', 'sam',
                 '--sam_feature_cache_mib', str(budget),

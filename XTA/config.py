@@ -682,26 +682,65 @@ class BackendDeviceSelection:
 
 @dataclass(frozen=True)
 class InterpolationSettings:
-    """Selected bridge generator and its independently owned SAM resources.
+    """Selected interpolation and extrapolation with shared SAM resources.
 
-    Disabled interpolation retains the configured backend while exposing no SAM
-    resources to initialize. Detector devices, batches, channels and precision
-    remain separate from this selection.
+    ``enabled`` refers only to interpolation. SAM extrapolation can independently
+    require its own model/device pool while interpolation is SDF or disabled.
+    Detector devices, batches, channels and precision remain separate.
     """
 
     backend: str = 'sdf'
     enabled: bool = True
     sam_model: Optional[str] = None
     sam_devices: Tuple[str, ...] = ()
-    sam_feature_cache_mib: int = 512
+    sam_feature_cache_mib: int = 1024
     sam_crop_mode: Optional[str] = None
     sam_tight_crop_guard: Optional[bool] = None
+    sam_adaptive_crop: Optional[bool] = None
+    extrapolation_distance: int = 0
+    extrapolation_walk_back: int = 1
+    extrapolation_min_radius: float = 3.
+
+    @property
+    def extrapolation_enabled(self) -> bool:
+        return self.extrapolation_distance > 0
+
+    @property
+    def sam_enabled(self) -> bool:
+        return self.extrapolation_enabled or (self.enabled and self.backend == 'sam')
 
 
 _SAM_CROP_MODE_SNAPSHOT = contextvars.ContextVar('tta_sam_crop_mode_snapshot', default=None)
 _SAM_TIGHT_CROP_GUARD_UNSET = object()
 _SAM_TIGHT_CROP_GUARD_SNAPSHOT = contextvars.ContextVar('tta_sam_tight_crop_guard_snapshot',
     default=_SAM_TIGHT_CROP_GUARD_UNSET)
+_SAM_ADAPTIVE_CROP_UNSET = object()
+_SAM_ADAPTIVE_CROP_SNAPSHOT = contextvars.ContextVar('tta_sam_adaptive_crop_snapshot',
+    default=_SAM_ADAPTIVE_CROP_UNSET)
+
+
+def resolve_sam_adaptive_crop(environ=None) -> bool:
+    """Opt in to one bounded retry from the same original SAM seed."""
+    snapshot = _SAM_ADAPTIVE_CROP_SNAPSHOT.get()
+    if snapshot is not _SAM_ADAPTIVE_CROP_UNSET and environ is None:
+        return bool(snapshot)
+    environment = os.environ if environ is None else environ
+    value = str(environment.get('YOLO_TTA_SAM_ADAPTIVE_CROP', '0')).strip()
+    if value not in {'0', '1'}:
+        raise ValueError('YOLO_TTA_SAM_ADAPTIVE_CROP must be 0 or 1')
+    return value == '1'
+
+
+@contextlib.contextmanager
+def activate_sam_adaptive_crop(enabled: Optional[bool]):
+    """Pin active or unused adaptive-crop settings before runtime startup."""
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ValueError('SAM adaptive crop snapshot must be a boolean or None')
+    token = _SAM_ADAPTIVE_CROP_SNAPSHOT.set(enabled)
+    try:
+        yield enabled
+    finally:
+        _SAM_ADAPTIVE_CROP_SNAPSHOT.reset(token)
 
 
 def resolve_sam_tight_crop_guard(environ=None) -> Optional[bool]:
@@ -863,11 +902,12 @@ def resolve_interpolation_settings(
     models: BackendModelSelection,
     devices: BackendDeviceSelection,
 ) -> InterpolationSettings:
-    """Validate bridge selection before model startup, without loading a bundle.
+    """Validate interpolation/extrapolation before any model startup.
 
     Active SAM inherits the selected detector CUDA pool only when no explicit
     ``--sam_device`` is given. A CPU-only detector therefore needs an explicit
-    SAM pool. A disabled or SDF interpolation selection owns no SAM resources.
+    SAM pool. Extrapolation always uses SAM and can activate that pool while
+    interpolation uses SDF or has distance zero.
     """
     backend = str(getattr(args, 'interpolation_backend', 'sdf')).strip().lower()
     if backend not in {'sdf', 'sam'}:
@@ -877,7 +917,20 @@ def resolve_interpolation_settings(
     distance = int(getattr(args, 'interpolation_distance', 15))
     if distance < 0:
         raise ValueError('--interpolation_distance must be >= 0')
-    sam_feature_cache_mib = getattr(args, 'sam_feature_cache_mib', 512)
+    extrapolation_distance = getattr(args, 'extrapolation_distance', 0)
+    extrapolation_walk_back = getattr(args, 'extrapolation_walk_back', 1)
+    for name, value in (('extrapolation_distance', extrapolation_distance),
+                        ('extrapolation_walk_back', extrapolation_walk_back)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f'--{name} must be a nonnegative integer')
+    radius = getattr(args, 'extrapolation_min_radius', 3.)
+    try:
+        extrapolation_min_radius = float(radius)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError('--extrapolation_min_radius must be finite and nonnegative') from error
+    if isinstance(radius, bool) or not math.isfinite(extrapolation_min_radius) or extrapolation_min_radius < 0:
+        raise ValueError('--extrapolation_min_radius must be finite and nonnegative')
+    sam_feature_cache_mib = getattr(args, 'sam_feature_cache_mib', 1024)
     if (isinstance(sam_feature_cache_mib, bool)
             or not isinstance(sam_feature_cache_mib, int) or sam_feature_cache_mib < 0):
         raise ValueError('--sam_feature_cache_mib must be a nonnegative integer')
@@ -886,24 +939,31 @@ def resolve_interpolation_settings(
         resolve_sam_devices(requested_sam_devices)
         if requested_sam_devices is not None else None
     )
-    if distance == 0 or backend == 'sdf':
+    extrapolation = dict(extrapolation_distance=extrapolation_distance,
+        extrapolation_walk_back=extrapolation_walk_back, extrapolation_min_radius=extrapolation_min_radius)
+    sam_interpolation_enabled = distance > 0 and backend == 'sam'
+    if not sam_interpolation_enabled and extrapolation_distance == 0:
         return InterpolationSettings(backend=backend, enabled=distance > 0,
-                                     sam_feature_cache_mib=sam_feature_cache_mib)
+            sam_feature_cache_mib=sam_feature_cache_mib, **extrapolation)
     if not models.sam:
-        raise ValueError('--interpolation_backend sam requires a sam:PATH bundle in --model')
+        requirement = '--interpolation_backend sam' if sam_interpolation_enabled else '--extrapolation_distance > 0'
+        raise ValueError(f'{requirement} requires a sam:PATH bundle in --model')
     sam_devices = devices.gpu_devices if explicit_sam_devices is None else explicit_sam_devices
     if not sam_devices:
         raise ValueError(
-            '--interpolation_backend sam with a CPU-only detector requires '
+            ('--interpolation_backend sam' if sam_interpolation_enabled else 'SAM extrapolation')
+            + ' with a CPU-only detector requires '
             '--sam_device GPU_INDEXES'
         )
     sam_crop_mode = resolve_sam_crop_mode()
-    sam_tight_crop_guard = resolve_sam_tight_crop_guard()
+    sam_tight_crop_guard = resolve_sam_tight_crop_guard() if sam_interpolation_enabled else None
     return InterpolationSettings(
-        backend=backend, enabled=True, sam_model=models.sam, sam_devices=tuple(sam_devices),
+        backend=backend, enabled=distance > 0, sam_model=models.sam, sam_devices=tuple(sam_devices),
         sam_feature_cache_mib=sam_feature_cache_mib,
         sam_crop_mode=sam_crop_mode,
         sam_tight_crop_guard=sam_tight_crop_guard,
+        sam_adaptive_crop=resolve_sam_adaptive_crop(),
+        **extrapolation,
     )
 
 _CPU_PRECISION_ALIASES: Dict[str, str] = {
@@ -1084,13 +1144,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--sam_device", nargs="+", default=None, type=str, metavar="GPU_INDEXES",
         help=(
-            "Separate logical CUDA indexes for SAM interpolation. Defaults to the "
+            "Separate logical CUDA indexes for SAM interpolation or extrapolation. Defaults to the "
             "selected detector CUDA pool; CPU-only detectors require this flag for "
-            "active SAM interpolation. This does not enable a GPU detector"
+            "active SAM work. This does not enable a GPU detector"
         ),
     )
     p.add_argument(
-        '--sam_feature_cache_mib', default=512, type=_bounded_number(int, minimum=0), metavar='MiB',
+        '--sam_feature_cache_mib', default=1024, type=_bounded_number(int, minimum=0), metavar='MiB',
         help=('Upper limit per SAM worker for exact cross-session frame-feature LRU reuse. '
               'Actual admission is bounded by free GPU memory and reserved session headroom; '
               '0 disables the worker LRU. This does not change interpolation quality policy'),
@@ -1099,7 +1159,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--model", required=True, nargs="+", type=str, metavar="{gpu,cpu,sam}:PATH",
         help=(
             "Tagged model artifacts. Supply gpu:/path/to/engine, cpu:/path/to/openvino, "
-            "or both detector entries, plus sam:/path/to/bundle for SAM interpolation. "
+            "or both detector entries, plus sam:/path/to/bundle for SAM interpolation or extrapolation. "
             "The SAM bundle is separate from detector scheduling, precision and channels. "
             "The CPU artifact must be an ordinary raw-head OpenVINO segmentation "
             "IR, not an end-to-end/NMS-embedded export. Hybrid inference requires both "
@@ -1342,6 +1402,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--interpolation_search_angle", default=15.0,
                    type=_bounded_number(float, minimum=-90, maximum=90, exclusive=True),
                    help="Projection growth angle in degrees. Must be greater than -90 and less than 90")
+    p.add_argument('--extrapolation_distance', default=0, type=_bounded_number(int, minimum=0),
+                   help='Maximum additional view-native slices/frames tracked with SAM beyond remaining post-interpolation terminals (cleaned detector terminals when interpolation is disabled). 0 disables extrapolation; raw SAM emptiness or this distance ends a tail')
+    p.add_argument('--extrapolation_walk_back', default=1, type=_bounded_number(int, minimum=0),
+                   help='Number of prior slices of the same terminal component used to condition SAM extrapolation. 0 uses the terminal alone; contacted predictions never become new seeds')
+    p.add_argument('--extrapolation_min_radius', default=3., type=_bounded_number(float, minimum=0),
+                   help='Skip post-interpolation terminal objects whose terminal radius is at or below this threshold. This gate applies only to terminal seeds; extrapolated masks are not radius-filtered')
     p.add_argument("--capture_component_replay", default=None, type=str, metavar="PERSISTENT_DIR",
                    help="Copy a bounded sample of view-native Azimuthal bridge components for isolated projection replay; must survive job completion")
     p.add_argument("--capture_component_views", nargs='+', default=None, metavar="VIEW_GLOB",

@@ -196,6 +196,8 @@ class SharedNativeWorkspaceTests(unittest.TestCase):
         self.shape = (4, 5, 6)
         self.namespace = dict(vars(pipeline))
         self.namespace.update(temp_dir=self.root, worker_direct_union_active=True,
+            sam_context=None,sam_parent_staging=None,
+            interpolation_settings=SimpleNamespace(backend='sdf',extrapolation_enabled=False),
             policy_settings=SimpleNamespace(enabled=False),
             bounded_policy_parent_keys=set(),
             args=SimpleNamespace(imgsz=8, min_conf=1., interpolation_distance=0), dense_tiling_active=False,
@@ -210,6 +212,8 @@ class SharedNativeWorkspaceTests(unittest.TestCase):
             direct_union_inference_bytes=self.state.direct_union_inference_bytes,
             direct_union_postprocess_bytes=self.state.direct_union_postprocess_bytes,
             view_processing_volume_shape=lambda *_args: self.shape)
+        _function(Path(pipeline.__file__).read_text(encoding='utf-8'),
+                  '_sam_parent_requires_staging',self.namespace)
         self.ensure = _function(Path(pipeline.__file__).read_text(encoding='utf-8'),
                                 '_ensure_baseline_workspaces', self.namespace)
         tree = ast.parse(Path(workers.__file__).read_text(encoding='utf-8'))

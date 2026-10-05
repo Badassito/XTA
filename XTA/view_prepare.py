@@ -114,6 +114,9 @@ class AdmittedViewPrepare:
     close_dense: Callable[..., object] = close_memmap_array_without_flush
     interpolation_backend: str = 'sdf'
     sam_context: object | None = None
+    extrapolation_distance: int = 0
+    extrapolation_walk_back: int = 1
+    extrapolation_min_radius: float = 3.
     sam_base_allowance_bytes: int = 0
     confidence_retired_callback: Callable[[str, str, int], object] | None = None
     confidence_retired_callback_factory: Callable[[object], Callable] | None = None
@@ -128,8 +131,8 @@ class AdmittedViewPrepare:
 
     @contextmanager
     def _reservation(self):
-        if (self.interpolation_backend == 'sam' and self.sam_context is not None
-                and int(self.interpolation_distance) > 0):
+        if (self.sam_context is not None and (int(self.extrapolation_distance) > 0
+                or self.interpolation_backend == 'sam' and int(self.interpolation_distance) > 0)):
             from .sam_resources import admit_sam_parent_resources
             workers = len(getattr(self.sam_context, 'device_ids', ())) or 1
             with admit_sam_parent_resources(self.admission, self.transient_bytes,
@@ -187,6 +190,9 @@ class AdmittedViewPrepare:
                     interpolation_search_angle=float(self.interpolation_search_angle),
                     interpolation_backend=str(self.interpolation_backend),
                     sam_context=self.sam_context,
+                    extrapolation_distance=int(self.extrapolation_distance),
+                    extrapolation_walk_back=int(self.extrapolation_walk_back),
+                    extrapolation_min_radius=float(self.extrapolation_min_radius),
                     keep_temp=bool(self.keep_temp_artifacts),
                     slice_workers=int(self.slice_workers),
                     interpolation_task_workers=int(self.interpolation_task_workers),

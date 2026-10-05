@@ -245,6 +245,67 @@ def test_ablation_tool_rejects_unrelated_measurements_before_writing(tmp_path, m
     assert not output.exists()
 
 
+def test_frozen_branch_measurements_keep_retained_index_charge_and_exact_values(tmp_path, monkeypatch):
+    from tools import ablate_sam_tight_crop_guard as ablation
+    from tests.test_sam_branch_performance import two_groups
+    from tests.test_sam_selection_resources import Pool, GIB
+    from XTA.sam_resources import admit_sam_parent_resources
+    bundle = two_groups(tmp_path/'input')
+    policy = {'sam_bridge_policy': {'version': 6, 'strict_containment': True, 'component_min_radius': 0}}
+    with admit_sam_parent_resources(Pool(), GIB, 'frozen-measurements-test', headroom_probe=lambda: 64*GIB) as profile:
+        original = _select_sam_proposals(bundle, policy, resource_profile=profile, workers=2)
+        selection = tmp_path/'original.json'
+        source_text = json.dumps(original)
+        selection.write_text(source_text)
+        # Exercise positive fresh credit without accepting saved allocation
+        # metadata. The ablation's bounded policy caps remain authoritative.
+        monkeypatch.setattr(ablation, 'select_sam_proposals',
+            lambda *args, **kwargs: _select_sam_proposals(*args, **kwargs, resource_profile=profile, workers=2))
+        for reuse in (False, True):
+            result = ablation.run_ablation(bundle.directory, selection, tmp_path/str(reuse),
+                reuse_original_measurements=reuse)
+            assert result['baseline_original_admitted_selection_match']
+    assert selection.read_text() == source_text
+    for arm in ('guard_on', 'guard_off'):
+        full = json.loads((tmp_path/'False'/(arm+'_selection.json')).read_text())
+        frozen = json.loads((tmp_path/'True'/(arm+'_selection.json')).read_text())
+        execution = frozen['selection_resources']['intrinsic_measurements']
+        metadata = execution['branch_metadata']
+        assert metadata == full['selection_resources']['intrinsic_measurements']['branch_metadata']
+        assert metadata['peak_retained_index_bytes'] > 0
+        assert metadata['minimum_effective_parallel_credit_bytes'] == (
+            execution['parallel_credit_bytes']-metadata['peak_retained_index_bytes'])
+        assert execution['parallel_run_count'] == execution['peak_pending_runs'] == 0
+        for key in ('branch_selection', 'selected_run_ids', 'run_receipts', 'group_receipts'):
+            assert frozen[key] == full[key]
+        for run_id, row in frozen['run_receipts'].items():
+            assert row['measurements'] == original['run_receipts'][run_id]['measurements']
+
+
+@pytest.mark.parametrize('reuse', (False, True))
+def test_branch_ablation_uses_current_workspace_for_resource_abstentions(tmp_path, reuse):
+    from tools.ablate_sam_tight_crop_guard import run_ablation
+    from tests.test_sam_branch_performance import two_groups
+    from XTA.sam_branch_selection import branch_workspace_bytes
+    bundle = two_groups(tmp_path/'input')
+    original = _select_sam_proposals(bundle, {'sam_bridge_policy': {'version': 6,
+        'strict_containment': True, 'component_min_radius': 0}})
+    selection = tmp_path/'original.json'
+    selection.write_text(json.dumps(original))
+    cap = branch_workspace_bytes((5, 13, 15))-1
+    result = run_ablation(bundle.directory, selection, tmp_path/'out', max_group_mib=cap/1024**2,
+        reuse_original_measurements=reuse)
+    assert result['allocation_bound_bytes'] == cap
+    assert result['resource_abstention_group_ids'] == ['g', 'g2']
+    assert result['assessed_group_count'] == 0
+    assert result['abstained_original_selected_run_ids'] == original['selected_run_ids']
+    assert result['baseline_original_admitted_selection_match']
+    for arm in ('guard_on', 'guard_off'):
+        receipt = json.loads((tmp_path/'out'/(arm+'_selection.json')).read_text())
+        assert not receipt['selected_run_ids']
+        assert all(row['status'] == 'not_assessed_resource_refused' for row in receipt['group_receipts'].values())
+
+
 def test_auto_launch_snapshot_does_not_read_later_environment(monkeypatch):
     monkeypatch.delenv(ENV, raising=False)
     observed = []

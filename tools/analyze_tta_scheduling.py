@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import re
@@ -15,13 +16,14 @@ try:
     from .analyze_pipeline_trace import analyze_events, read_events
 except ImportError:
     from analyze_pipeline_trace import analyze_events, read_events
+from XTA.run_transport import telemetry_streams
 
 
 def _parent_final_sample(paths):
     samples = []
-    for path in paths:
+    for path, stream in telemetry_streams(paths):
         last = None
-        with path.open(encoding='utf-8') as handle:
+        with nullcontext(stream) as handle:
             for line in handle:
                 try:
                     last = json.loads(line)
