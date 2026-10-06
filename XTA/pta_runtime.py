@@ -29,6 +29,7 @@ def build_runtime_options(config: PtaConfig) -> argparse.Namespace:
         output_format=str(config.effective_output_format),
         channel_format=[str(config.channel_format.token)],
         force=public.force,
+        task=public.task,
         gaussian_smoothing=(
             float(preprocessing.gaussian_sigma)
             if preprocessing.gaussian_smoothing_enabled
@@ -42,6 +43,7 @@ def build_runtime_options(config: PtaConfig) -> argparse.Namespace:
         save_images=save.enabled("images"),
         save_labels=save.enabled("labels"),
         save_binary=save.enabled("binary"),
+        save_semantic=save.enabled("semantic"),
         save_nrrd=save.enabled("nrrd"),
         save_overlay=save.enabled("overlay"),
         voxel_volume=save.enabled("voxel_volume"),

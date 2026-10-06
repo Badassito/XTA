@@ -10,6 +10,7 @@ from concurrent.futures import Future
 from dataclasses import replace
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -237,6 +238,62 @@ def test_unchanged_policy_forward_equivalence_on_cpu(profile):
     assert int(delta.max()) <= 1
     assert float((delta!=0).float().mean()) < .01
     assert len(replays)==len(seeds)
+
+
+@pytest.mark.parametrize('profile', ['light', 'baseline', 'heavy', 'superheavy'])
+def test_cuda_policy_masks_match_host_upload(profile):
+    # GPU access is coordinated by the caller via Scratch/Temp/GPU_LOCK.
+    if os.environ.get('XTA_RUN_CUDA_TESTS') != '1' or not torch.cuda.is_available():
+        pytest.skip('opt-in CUDA test requires XTA_RUN_CUDA_TESTS=1 and a CUDA device')
+    policy, _module = cpu_policy(profile, batch_size=4)
+    policy.device = torch.device('cuda:0')
+    assert policy.supports_cuda_sources and policy.supports_cuda_masks
+    rng = np.random.default_rng(81)
+    images = [rng.integers(0, 256, (24, 32), dtype=np.uint8) for _ in range(2)]
+    masks = [
+        rng.choice(np.array([0, value], dtype=np.uint8), (24, 32))
+        for value in (255, 1)
+    ]
+    coverage = [
+        rng.choice(np.array([0, 1], dtype=np.uint8), (24, 32))
+        for _ in range(2)
+    ]
+    seeds = [[None, 23], [None, 37]]
+    cuda_images = [torch.from_numpy(image).to(policy.device) for image in images]
+    cuda_masks = [torch.from_numpy(mask).to(policy.device) for mask in masks]
+    cuda_coverage = [torch.from_numpy(mask).to(policy.device) for mask in coverage]
+    saved_images = [image.clone() for image in cuda_images]
+    saved_masks = [mask.clone() for mask in cuda_masks]
+    saved_coverage = [mask.clone() for mask in cuda_coverage]
+
+    host_images, host_masks = policy.apply_batch_many(
+        images=images, masks=masks, seeds=seeds, output_size=(24, 32)
+    )
+    cuda_result_images, cuda_result_masks = policy.apply_batch_many(
+        images=cuda_images, masks=cuda_masks, seeds=seeds, output_size=(24, 32)
+    )
+    assert torch.equal(cuda_result_images, host_images)
+    assert torch.equal(cuda_result_masks, host_masks)
+    _, host_coverage = policy.apply_batch_many(
+        images=images, masks=coverage, seeds=seeds, output_size=(24, 32)
+    )
+    _, cuda_result_coverage = policy.apply_batch_many(
+        images=cuda_images, masks=cuda_coverage, seeds=seeds, output_size=(24, 32)
+    )
+    assert torch.equal(cuda_result_coverage, host_coverage)
+    assert all(torch.equal(value, saved) for value, saved in zip(cuda_images, saved_images))
+    assert all(torch.equal(value, saved) for value, saved in zip(cuda_masks, saved_masks))
+    assert all(torch.equal(value, saved) for value, saved in zip(cuda_coverage, saved_coverage))
+    assert bool(cuda_result_images.is_cuda and cuda_result_masks.is_cuda)
+
+    with pytest.raises(ValueError, match='same source device'):
+        policy.apply_batch_many(images=cuda_images, masks=masks, seeds=seeds, output_size=(24, 32))
+    with pytest.raises(ValueError, match='same source device'):
+        policy.apply_batch_many(images=images, masks=cuda_masks, seeds=seeds, output_size=(24, 32))
+    with pytest.raises(ValueError, match='source masks'):
+        policy.apply_batch_many(
+            images=cuda_images, masks=[cuda_masks[0], masks[1]], seeds=seeds, output_size=(24, 32)
+        )
 
 
 def test_channel_geometry_and_cache_budget():

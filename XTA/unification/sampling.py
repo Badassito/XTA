@@ -36,11 +36,11 @@ def forward_sampling_policy() -> ForwardSamplingPolicy:
 
 @lru_cache(maxsize=2)
 def _forward_sampling_policy(spherical_fp32: bool) -> ForwardSamplingPolicy:
-    """The strict canonical record stays byte-for-byte equivalent to v21."""
+    """Version 23 adds resident CUDA categorical sampling to the v21 policy."""
 
     return ForwardSamplingPolicy(
         policy_id="xta.forward_sampling",
-        policy_version=22 if spherical_fp32 else 21,
+        policy_version=24 if spherical_fp32 else 23,
         coordinate_convention=(
             "gray8_t_y_x_frame_index; destination-pixel-center to source; "
             "azimuthal [0,180) index wrap with odd-crossing radius-axis mirror; "
@@ -105,6 +105,18 @@ def _forward_sampling_policy(spherical_fp32: bool) -> ForwardSamplingPolicy:
                     "XTA.cuda_backend TTA resident/direct-ring forward renderer@v18"
                 ),
                 roles=(DataRole.INTENSITY,),
+                exact=False,
+                absolute_tolerance=1.0,
+                relative_tolerance=0.0,
+            ),
+            BackendSamplingImplementation(
+                backend="cuda",
+                implementation=(
+                    "XTA.pta_cuda_masks resident categorical renderer; fused foreground/coverage "
+                    "nearest sampling with zero outside boundary; tilted stack blend "
+                    "threshold >=0.5; spatial parity qualified separately at boundaries"
+                ),
+                roles=(DataRole.CATEGORICAL_GROUND_TRUTH,),
                 exact=False,
                 absolute_tolerance=1.0,
                 relative_tolerance=0.0,

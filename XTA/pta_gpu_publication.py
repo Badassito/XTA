@@ -14,6 +14,7 @@ import threading
 import time
 
 from .pta_batch_pipeline import OrderedBatchPipeline
+from .pta_publication import semantic_png_backend
 
 
 _QUARANTINED_PUBLICATIONS: list[object] = []
@@ -45,23 +46,32 @@ class GpuPublicationResources:
         self.gpu_bytes = _byte_limit('PTA_GPU_PUBLICATION_GPU_MIB', 2048)
         self.host_bytes = _byte_limit('PTA_GPU_PUBLICATION_HOST_MIB', 512)
         self.cpu_threads = max(1, min(4, int(cpu_threads)))
+        self.file_threads = max(1, min(
+            int(cpu_threads), int(os.environ.get('PTA_GPU_PUBLICATION_FILE_THREADS', '8')),
+        ))
         with self.torch.cuda.device(self.device):
             self.stream = self.torch.cuda.Stream(device=self.device)
         self.gpu_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='pta-publish-gpu')
         self.host_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='pta-publish-host')
         self.label_executor = ThreadPoolExecutor(max_workers=self.cpu_threads, thread_name_prefix='pta-polygons')
-        self.file_executor = ThreadPoolExecutor(max_workers=self.cpu_threads, thread_name_prefix='pta-files')
+        self.file_executor = ThreadPoolExecutor(max_workers=self.file_threads, thread_name_prefix='pta-files')
         self.poisoned = False
         self.closed = False
         self.timings: dict[str, float] = {}
         self.counts: dict[str, int] = {}
         self.lock = threading.Lock()
+        self.report_interval = max(0, int(os.environ.get('PTA_GPU_PUBLICATION_REPORT_SEC', '60')))
+        self.last_report = time.perf_counter()
+        self.last_report_timings: dict[str, float] = {}
+        self.last_report_images = 0
         from multiprocessing.util import Finalize
         self.finalizer = Finalize(self, _finalize_resources, (self,), exitpriority=15)
         print(f'PTA GPU publication pipeline cuda:{self.device}: depth=2, '
               f'GPU outputs={self.gpu_bytes / 1024**2:.0f} MiB, '
               f'encoded queue={self.host_bytes / 1024**2:.0f} MiB, '
-              f'polygon/file workers={self.cpu_threads}; oversized batches run exclusively.', flush=True)
+              f'semantic_png={semantic_png_backend()}, '
+              f'polygon workers={self.cpu_threads}, file workers={self.file_threads}; '
+              'oversized batches run exclusively.', flush=True)
 
     @contextmanager
     def measure(self, name):
@@ -72,10 +82,40 @@ class GpuPublicationResources:
             with self.lock:
                 self.timings[name] = self.timings.get(name, 0.) + time.perf_counter() - started
 
+    def add_time(self, name, seconds):
+        with self.lock:
+            self.timings[name] = self.timings.get(name, 0.) + float(seconds)
+
     def task(self, consume, on_result):
         if self.poisoned or self.closed:
             raise RuntimeError('PTA GPU publication worker is closed or failed')
         return GpuPublicationTask(self, consume, on_result)
+
+    def report_if_due(self):
+        """Expose long-running host/GPU stalls before the volume completes."""
+        if not self.report_interval:
+            return
+        now = time.perf_counter()
+        with self.lock:
+            elapsed = now - self.last_report
+            if elapsed < self.report_interval:
+                return
+            images = self.counts.get('images', 0)
+            image_delta = images - self.last_report_images
+            stage_deltas = {
+                name: seconds - self.last_report_timings.get(name, 0.)
+                for name, seconds in self.timings.items()
+            }
+            self.last_report = now
+            self.last_report_images = images
+            self.last_report_timings = dict(self.timings)
+        stages = ', '.join(
+            f'{name}={seconds:.1f}s' for name, seconds in sorted(stage_deltas.items())
+            if seconds >= 0.05
+        )
+        print(f'PTA publication window cuda:{self.device}: '
+              f'{image_delta} images/{elapsed:.1f}s={image_delta / elapsed:.1f}/s, '
+              f'{stages}. Stage wall times overlap.', flush=True)
 
     def quarantine(self, payload):
         self.poisoned = True
@@ -129,6 +169,9 @@ class GpuPublicationTask:
     def measure(self, name):
         return self.resources.measure(name)
 
+    def add_time(self, name, seconds):
+        self.resources.add_time(name, seconds)
+
     def reserve(self, byte_count):
         if self.resources.poisoned:
             raise RuntimeError('PTA GPU publication worker failed; no further policy batches may launch')
@@ -144,7 +187,8 @@ class GpuPublicationTask:
     def submit(self, reservation, kwargs):
         torch = self.resources.torch
         images, masks = kwargs['batch_images'], kwargs['batch_masks']
-        owners = (images, masks)
+        coverage = kwargs.get('semantic_coverage_masks')
+        owners = (images, masks) + ((coverage,) if coverage is not None else ())
         with torch.cuda.device(self.resources.device):
             producer = torch.cuda.current_stream(self.resources.device)
             # The original API permits reuse on the next policy call. Owning a
@@ -158,10 +202,16 @@ class GpuPublicationTask:
                     retained.append(images)
                     masks = masks.clone(memory_format=torch.contiguous_format)
                     retained.append(masks)
+                    if coverage is not None:
+                        coverage = coverage.clone(memory_format=torch.contiguous_format)
+                        retained.append(coverage)
                     ready = torch.cuda.Event()
                     ready.record(producer)
                     retained.append(ready)
-                payload = _GpuBatch(dict(kwargs, batch_images=images, batch_masks=masks), ready, owners)
+                payload_kwargs = dict(kwargs, batch_images=images, batch_masks=masks)
+                if 'semantic_coverage_masks' in kwargs:
+                    payload_kwargs['semantic_coverage_masks'] = coverage
+                payload = _GpuBatch(payload_kwargs, ready, owners)
                 reservation.submit(payload)
             except BaseException:
                 try:
@@ -197,7 +247,10 @@ class GpuPublicationTask:
         with torch.cuda.device(resource.device), torch.cuda.stream(stream):
             try:
                 stream.wait_event(payload.ready)
-                for value in (payload.kwargs['batch_images'], payload.kwargs['batch_masks']):
+                for value in (payload.kwargs['batch_images'], payload.kwargs['batch_masks'],
+                              payload.kwargs.get('semantic_coverage_masks')):
+                    if value is None:
+                        continue
                     value.record_stream(stream)
                 try:
                     result = self.consume(**payload.kwargs, publication=self)
@@ -210,6 +263,7 @@ class GpuPublicationTask:
                     resource.counts['images'] = resource.counts.get('images', 0) + size
                     resource.counts['batch_min'] = min(resource.counts.get('batch_min', size), size)
                     resource.counts['batch_max'] = max(resource.counts.get('batch_max', size), size)
+                resource.report_if_due()
                 return result
             finally:
                 try:

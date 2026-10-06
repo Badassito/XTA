@@ -168,8 +168,10 @@ class UnificationContractTests(unittest.TestCase):
             require_forward_sampling("cpu", "intensity").backend,
             "cpu",
         )
-        with self.assertRaises(KeyError):
-            require_forward_sampling("cuda", "categorical_ground_truth")
+        self.assertEqual(
+            require_forward_sampling("cuda", "categorical_ground_truth").backend,
+            "cuda",
+        )
 
         plan = build_forward_raster_plan(
             mode="pta",

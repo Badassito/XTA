@@ -712,6 +712,57 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
         self.assertEqual(images.shape, (2, 1, 8, 8))
         self.assertEqual(masks.shape, (2, 8, 8))
 
+    def test_cuda_categorical_identity_sources_stay_on_device(self) -> None:
+        dtype = object()
+        stacks: list[tuple[tuple[int, ...], ...]] = []
+
+        class DeviceTensor:
+            is_cuda = True
+
+            def __init__(self, shape: tuple[int, ...]):
+                self.shape = shape
+                self.dtype = dtype
+                self.device = "cuda:0"
+
+            def __array__(self, *_args: object, **_kwargs: object) -> np.ndarray:
+                raise AssertionError("CUDA mask must not cross to NumPy")
+
+            def unsqueeze(self, _axis: int) -> "DeviceTensor":
+                return DeviceTensor((1,) + self.shape)
+
+            def contiguous(self) -> "DeviceTensor":
+                return self
+
+        def stack(values: list[DeviceTensor], *, dim: int) -> DeviceTensor:
+            self.assertEqual(dim, 0)
+            stacks.append(tuple(value.shape for value in values))
+            return DeviceTensor((len(values),) + values[0].shape)
+
+        fake_torch = types.SimpleNamespace(
+            uint8=dtype,
+            device=lambda value: value,
+            stack=stack,
+        )
+        work = tuple(
+            pta._GpuItemWork(
+                candidates=(dataclasses.replace(self._candidate(index), label_enabled=True),),
+                image=DeviceTensor((8, 8)),
+                mask=DeviceTensor((8, 8)),
+                output_size=(8, 8),
+                channel_kind="gray",
+                context=str(index),
+            )
+            for index in range(2)
+        )
+
+        images, masks = pta._apply_gpu_identity_batch_many(
+            {"torch": fake_torch, "device_id": 0}, work,
+        )
+
+        self.assertEqual(images.shape, (2, 1, 8, 8))
+        self.assertEqual(masks.shape, (2, 8, 8))
+        self.assertEqual(stacks, [((1, 8, 8), (1, 8, 8)), ((8, 8), (8, 8))])
+
     def test_augmented_policy_boundary_materializes_cuda_source_once(self) -> None:
         expected = np.arange(64, dtype=np.uint8).reshape(8, 8)
 

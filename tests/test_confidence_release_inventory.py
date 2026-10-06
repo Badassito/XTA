@@ -24,7 +24,7 @@ def manifest():
 @pytest.fixture
 def successors():
     value=json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
-    return tuple(value[key] for key in ('v22_3_2_release_review',) if key in value)
+    return tuple(value[key] for key in ('v22_3_2_release_review', 'v23_release_review') if key in value)
 
 
 def test_commit_and_entire_predecessor_are_preserved(manifest):

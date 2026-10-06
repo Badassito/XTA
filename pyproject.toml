@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xta"
-version = "22.3.2"
+version = "23.0.0"
 description = "Volume test-time, pretraining, and label-time augmentation"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,7 +13,7 @@ dependencies = [
   "scipy",
   "tifffile",
   "tqdm",
-  "ultralytics",
+  "ultralytics>=8.4.128",
 ]
 
 [project.optional-dependencies]
@@ -39,10 +39,15 @@ include = ["XTA*"]
 [tool.setuptools.data-files]
 "share/xta" = [
   "ARCHITECTURE.md",
-  "GPT-6-Astra-Ultra_v22.3.2_SLURM.py",
+  "GPT-6-Astra-Ultra_v23.0.0_SLURM.py",
 ]
 "share/xta/tools" = [
   "tools/compare_reconciliation.py",
+  "tools/export_semantic_logits.py",
+  "tools/qualify_semantic_trt.py",
+  "tools/qualify_pta_classification.py",
+  "tools/qualify_pta_gpu_masks.py",
+  "tools/qualify_pta_gpu_render.py",
   "tools/export_reconciliation_evidence.py",
   "tools/qualify_tta_reconciliation.py",
   "tools/qualify_confidence_consolidation.py",

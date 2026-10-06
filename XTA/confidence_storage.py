@@ -171,7 +171,7 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
             output_shape_tyx=None if source_shape is None else list(source_shape),
             layer_key=str(layer_key),model_name=str(model_name),dtype='uint8',unknown='score_zero',
             score_semantics=SCORE_SEMANTICS,
-            quantization='round-half-even(clip(instance_score,0,1)*255); quantized zero is unknown',
+            quantization='round-half-even(clip(prediction_score,0,1)*255); quantized zero is unknown',
             payload='scores.u8.zlib',index='index.bin',index_layout='z:u32,y:u32,x:u32,h:u16,w:u16,offset:u64,length:u32; little-endian',
             index_record_bytes=_RECORD.size,block_size=block_size,block_count=blocks,
             payload_bytes=payload_bytes,payload_sha256=digest.hexdigest(),index_sha256=index_digest.hexdigest(),

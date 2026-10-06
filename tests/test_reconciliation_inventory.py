@@ -19,7 +19,7 @@ class ReconciliationInventoryTests(unittest.TestCase):
     def setUp(self):
         self.manifest = json.loads(inventory.MANIFEST.read_text(encoding='utf-8'))
         self.successors = tuple(self.manifest[key] for key in (
-            'v22_3_1_release_review', 'v22_3_2_release_review') if key in self.manifest)
+            'v22_3_1_release_review', 'v22_3_2_release_review', 'v23_release_review') if key in self.manifest)
         self.manifest = inventory._without_reviewed_v22_3_1_release(self.manifest)
         if 'v22_3_release_review' not in self.manifest:
             self.skipTest('Reconciliation release source review is awaiting final qualification')

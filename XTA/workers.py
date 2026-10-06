@@ -114,6 +114,10 @@ from .inference import (
     set_retina_mask_processor,
     validate_yolo_model_input_channels,
 )
+from .semantic_inference import (
+    accumulate_semantic_probability_frame,
+    semantic_foreground_probability_numpy,
+)
 from .cuda_d1 import (
     D1GroupReductionFallbackRequired,
     _d1_backproject_kernels,
@@ -558,6 +562,7 @@ class _OpenVinoCpuSegmenter:
         physical_cores: int,
         streams: Optional[int],
         infer_requests: Optional[int],
+        task: str = 'segment',
     ) -> None:
         try:
             import openvino as ov  # type: ignore
@@ -571,6 +576,7 @@ class _OpenVinoCpuSegmenter:
         self.imgsz = int(imgsz)
         self.batch = max(1, int(batch))
         self.input_channels = max(1, int(input_channels))
+        self.task = str(task)
         self.inference_threads = max(1, int(inference_threads))
         self.physical_cores = max(1, int(physical_cores))
         self.requested_precision = _resolve_cpu_precision(requested_precision)
@@ -852,17 +858,20 @@ class _OpenVinoCpuSegmenter:
                     continue
                 submission_index, frame_specs, submitted_batch = userdata
                 try:
-                    payloads = _openvino_cpu_payloads_from_outputs(
-                        payload,
-                        batch_size=int(submitted_batch),
-                        # CUDA's direct proto-union path applies positive --min_conf at
-                        # instance selection time. Match that contract before CPU mask
-                        # reconstruction so a low-confidence mask cannot survive merely by
-                        # touching a high-confidence component in a hybrid view.
-                        conf_threshold=max(float(conf_threshold), float(min_conf)),
-                        out_size=int(out_size),
-                        expected_class_count=self.expected_class_count,
-                    )
+                    if getattr(self, 'task', 'segment') == 'semantic':
+                        probabilities = semantic_foreground_probability_numpy(
+                            payload, batch_size=int(submitted_batch), output_size=int(out_size),
+                        )
+                    else:
+                        payloads = _openvino_cpu_payloads_from_outputs(
+                            payload,
+                            batch_size=int(submitted_batch),
+                            # A low-confidence instance must not survive by touching a
+                            # high-confidence component in a hybrid view.
+                            conf_threshold=max(float(conf_threshold), float(min_conf)),
+                            out_size=int(out_size),
+                            expected_class_count=self.expected_class_count,
+                        )
                     batch_prediction_count = 0
                     batch_frames_with_predictions = 0
                     for local_index, spec_obj in enumerate(frame_specs):
@@ -889,19 +898,34 @@ class _OpenVinoCpuSegmenter:
                         target_lock = _target_slice_lock(target_union, int(frame_index))
                         restore = getattr(source, 'restore_prediction_planes', None)
                         with target_lock:
-                            instance_count, frame_count = _process_cpu_retina_prediction_frame(
-                                frame_index,
-                                payloads[int(local_index)],
-                                int(out_size),
-                                target_union,
-                                target_conf,
-                                np.asarray(target_affine, dtype=np.float32),
-                                int(native_h),
-                                int(native_w),
-                                slice_lock=None,
-                                **({'restore_planes': lambda planes, active_spec=spec: restore(active_spec, planes)}
-                                   if callable(restore) else {}),
-                            )
+                            if getattr(self, 'task', 'segment') == 'semantic':
+                                instance_count, frame_count = accumulate_semantic_probability_frame(
+                                    probabilities[int(local_index)],
+                                    frame_index=int(frame_index),
+                                    conf_threshold=float(conf_threshold),
+                                    view_union_mm=target_union,
+                                    view_confmap_mm=target_conf,
+                                    M_out_to_native=np.asarray(target_affine, dtype=np.float32),
+                                    native_h=int(native_h), native_w=int(native_w),
+                                    restore_planes=(
+                                        (lambda planes, active_spec=spec: restore(active_spec, planes))
+                                        if callable(restore) else None
+                                    ),
+                                )
+                            else:
+                                instance_count, frame_count = _process_cpu_retina_prediction_frame(
+                                    frame_index,
+                                    payloads[int(local_index)],
+                                    int(out_size),
+                                    target_union,
+                                    target_conf,
+                                    np.asarray(target_affine, dtype=np.float32),
+                                    int(native_h),
+                                    int(native_w),
+                                    slice_lock=None,
+                                    **({'restore_planes': lambda planes, active_spec=spec: restore(active_spec, planes)}
+                                       if callable(restore) else {}),
+                                )
                             has_foreground = _cleanup_prediction_slice_inplace(
                                 target_union,
                                 target_conf,
@@ -1194,6 +1218,7 @@ def _cpu_inference_worker_main(
             batch=max(1, int(init_dict.get('batch', 1))),
             input_channels=max(1, int(init_dict.get('input_channels', 1))),
             channel_token=str(init_dict.get('channel_token', 'gray')),
+            task=str(init_dict.get('task', 'segment')),
         )
         runner = _OpenVinoCpuSegmenter(
             str(model_path),
@@ -1210,6 +1235,7 @@ def _cpu_inference_worker_main(
                 int(init_dict['infer_requests'])
                 if init_dict.get('infer_requests') is not None else None
             ),
+            task=str(cfg.task),
         )
         policy_settings = init_dict.get('augmentation_settings')
         if policy_settings is not None and policy_settings.enabled:
@@ -1769,6 +1795,9 @@ def run_prediction_volume_in_worker(
         for policy_key in ('augmentation_results', 'augmentation_records', 'augmentation_execution'):
             if policy_key in stats:
                 public_stats[policy_key] = stats[policy_key]
+        public_stats.update({
+            key: value for key, value in stats.items() if key.startswith('semantic_trt_ring_')
+        })
         if spherical_cache_before is not None:
             spherical_cache_delta = {
                 name: value - spherical_cache_before.get(name, 0)
@@ -1976,6 +2005,8 @@ def _release_gpu_worker_inference_assets(
     if active:
         raise RuntimeError(f'Cannot retire inference assets with active D1 views/group leases: {active}')
     ring_count = _resident_trt_pipeline_retirement_ready()
+    from .semantic_trt import semantic_trt_retirement_ready, release_semantic_trt_cache
+    semantic_ring_count = semantic_trt_retirement_ready()
     retirement = _gpu_union_retirement_manager()
     if retirement is not None and any(bool(getattr(lane, '_active', False)) for lane in retirement.lanes):
         raise RuntimeError('Cannot retire inference assets while a GPU union retirement lane is active')
@@ -1998,6 +2029,11 @@ def _release_gpu_worker_inference_assets(
     stats['resident_trt_rings'] = int(_release_resident_trt_pipeline_cache())
     if stats['resident_trt_rings'] != ring_count:
         raise RuntimeError('TensorRT cache changed across the inference retirement fence')
+    stats['semantic_trt_rings'] = int(release_semantic_trt_cache())
+    if stats['semantic_trt_rings'] != semantic_ring_count:
+        raise RuntimeError('Semantic TensorRT cache changed across the inference retirement fence')
+    from .semantic_cuda import clear_semantic_cuda_cache
+    stats['semantic_cuda_workspace_bytes'] = int(clear_semantic_cuda_cache())
     _shutdown_gpu_union_retirement_manager()
     _shutdown_d1_worker_pipeline()
     shutdown_radial_owners()
@@ -2051,6 +2087,7 @@ def _gpu_inference_worker_main(
 ) -> None:
     """Persistent GPU worker process: pin to one physical GPU, load the model once, serve tasks."""
     global _GPU_WORKER_NUMA_PIN, _GPU_WORKER_NUMA_FULL
+    from .semantic_trt import SemanticTrtRingConsumedError, release_semantic_trt_cache
     try:
         # Pin the process to its physical GPU before any CUDA context is created, so the model and
         # all tensors live on that device and never contend with the other workers' GPUs. The
@@ -2103,6 +2140,7 @@ def _gpu_inference_worker_main(
             batch=max(1, int(init_dict['batch'])),
             input_channels=max(1, int(init_dict.get('input_channels', 1))),
             channel_token=str(init_dict.get('channel_token', 'gray')),
+            task=str(init_dict.get('task', 'segment')),
         )
         policy_settings = init_dict.get('augmentation_settings')
         if policy_settings is not None and policy_settings.enabled:
@@ -2119,7 +2157,7 @@ def _gpu_inference_worker_main(
             )
         if bool(init_dict.get('radial_owner_preflight', False)):
             preflight_radial_owner()
-        model = load_ultralytics_model(str(model_path), task='segment')
+        model = load_ultralytics_model(str(model_path), task=str(cfg.task))
         ensure_yolo_ready_for_predict(model, cfg)
         validate_yolo_model_input_channels(
             model,
@@ -2128,7 +2166,9 @@ def _gpu_inference_worker_main(
             context=f'GPU worker cuda:{int(gpu_index)} model load',
         )
         require_channel_aware_yolo_preprocess_patch(str(cfg.channel_token))
-        if cpu_retina_masks_enabled():
+        if str(cfg.task) == 'semantic':
+            pass  # semantic backend logits bypass instance retina prediction
+        elif cpu_retina_masks_enabled():
             try:
                 ensure_cpu_retina_mask_predictor_patch()
             except Exception:
@@ -2461,7 +2501,8 @@ def _gpu_inference_worker_main(
                     'type': 'result', 'task_id': task_id, 'gpu_index': int(gpu_index),
                     'ok': True, 'stats': completed,
                 })
-        except (_ResidentTensorRTRingFatalError, RadialCudaProjectionUnsafeFailure) as exc:  # pragma: no cover - unsafe device state
+        except (_ResidentTensorRTRingFatalError, RadialCudaProjectionUnsafeFailure,
+                SemanticTrtRingConsumedError) as exc:  # unsafe device state or consumed semantic task
             # A failed post/infer-stream drain or binding-address restore means this process's
             # TensorRT contexts can no longer be reused safely. Surface a worker-fatal result
             # and exit instead of dequeuing another view on the compromised backend.
@@ -2489,6 +2530,7 @@ def _gpu_inference_worker_main(
             shutdown_policy_retirement()
             _shutdown_d1_worker_pipeline()
             shutdown_radial_owners()
+            release_semantic_trt_cache()
             _shutdown_resident_trt_pipeline_cache()
             _shutdown_gpu_union_retirement_manager()
             _close_fd_list(persistent_source_memfds.values())

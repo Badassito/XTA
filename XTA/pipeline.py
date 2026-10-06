@@ -752,6 +752,7 @@ def _main_impl() -> None:
     save_images_enabled = 'images' in save_option_set
     save_labels_enabled = 'labels' in save_option_set
     save_binary_enabled = 'binary' in save_option_set
+    save_semantic_enabled = 'semantic' in save_option_set
     save_low_quality_enabled = 'low_quality' in save_option_set
     save_nrrd_enabled = 'nrrd' in save_option_set
     save_voxel_volume_enabled = 'voxel_volume' in save_option_set
@@ -1192,7 +1193,8 @@ def _main_impl() -> None:
     # PCIe. Every TTA angle is an independent variant, so the confidence/radius ordering
     # is variant-local regardless of how many --angle values were requested.
     angle_variant_gpu_fastpath_active = bool(
-        angle_variant_streaming_cleanup_active and str(retina_processor).strip().lower() == 'gpu'
+        args.task != 'semantic' and angle_variant_streaming_cleanup_active
+        and str(retina_processor).strip().lower() == 'gpu'
     )
     angle_variant_gpu_fastpath_min_conf_value = (
         float(args.min_conf) if angle_variant_gpu_fastpath_active else None
@@ -1220,6 +1222,9 @@ def _main_impl() -> None:
             'otherwise). v13.3.0 (R8): the per-frame retina GPU 2D hole fill is removed; a '
             'completed-view pass or eligible task-end device-union pass performs it once in spec order.'
         )
+    elif args.task == 'semantic':
+        print('Semantic inference retains foreground probabilities before thresholding; '
+              'native component cleanup and reconciliation use those probabilities.')
     elif str(retina_processor).strip().lower() == 'gpu':
         print(
             'v13.1.0 GPU retina flatten active: the (n,H,W) retina-mask stack is reduced to union + '
@@ -1242,6 +1247,8 @@ def _main_impl() -> None:
     # resolution complete, so geometry-dependent activation is finalized below after T/H/W
     # are assigned. Unsupported commands retain the dense compatibility paths.
     v1613_bundle_reasons: List[str] = []
+    if args.task == 'semantic':
+        v1613_bundle_reasons.append('semantic logits use probability decoding before native accumulation')
     if policy_settings.enabled:
         v1613_bundle_reasons.append('external policy copies require inverse mapping before native accumulation')
         print(f'External TTA: {policy_settings.ratio} passes (one base), '
@@ -1875,6 +1882,7 @@ def _main_impl() -> None:
     # Metadata-only compatibility config. Each worker receives its backend-specific batch and
     # precision below; no model is loaded in the parent.
     pred_cfg = PredictConfig(
+        task=args.task,
         imgsz=args.imgsz,
         conf=args.conf,
         device=(str(backend_devices.gpu_devices[0]) if gpu_worker_process_active else 'cpu'),
@@ -4723,7 +4731,7 @@ def _main_impl() -> None:
             if gpu_worker_process_active else 1
         )
         fused_preflight_specs: List[Dict[str, object]] = []
-        if gpu_worker_process_active and fused_renderer_preflight_enabled():
+        if args.task != 'semantic' and gpu_worker_process_active and fused_renderer_preflight_enabled():
             fused_preflight_specs = build_fused_renderer_preflight_specs(
                 scheduled_inference_views,
                 aug_jobs_by_view,
@@ -4738,6 +4746,7 @@ def _main_impl() -> None:
                 )
 
         worker_init = {
+            'task': args.task,
             'augmentation_settings': policy_settings,
             'reconciliation_retain_confidence': bool(getattr(args, 'reconciliation_retain_confidence', False)),
             'reconciliation_min_conf': float(args.min_conf),
@@ -4865,6 +4874,7 @@ def _main_impl() -> None:
                 cpu_worker_dispatched_by_id[instance_id] = 0
                 cpu_worker_results_by_id[instance_id] = 0
                 cpu_init = {
+                    'task': args.task,
                     'augmentation_settings': policy_settings,
                     'imgsz': int(args.imgsz),
                     'conf': float(args.conf),
@@ -7311,7 +7321,7 @@ def _main_impl() -> None:
 
 
     native_final_outputs_requested = bool(
-        save_high_quality_enabled or save_binary_enabled or save_labels_enabled
+        save_high_quality_enabled or save_binary_enabled or save_labels_enabled or save_semantic_enabled
     )
     if native_final_outputs_requested:
         print('\n=== Scheduling selected native-resolution outputs in background ===')
@@ -7324,6 +7334,7 @@ def _main_impl() -> None:
             fps=fps,
             save_high_quality=bool(save_high_quality_enabled),
             save_binary_pattern_value='__DEFAULT__' if save_binary_enabled else None,
+            save_semantic_pattern_value='__DEFAULT__' if save_semantic_enabled else None,
             save_labels_pattern_value='__DEFAULT__' if save_labels_enabled else None,
             tag=None,
             frame_workers=tail_output_frame_workers,
