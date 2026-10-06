@@ -108,12 +108,18 @@ Optional `build_reconciliation()` fields:
 | `proposal_api_version` | `1` when supplying a proposal callback |
 | `select_proposals` | Callable receiving a bounded read-only group context and choosing stable run IDs |
 
-The stock policy removes full raw 2D components at or below the configured
-minimum radius before checking containment, held-out endpoint recall and excess,
-local topology, and unintended observed attachment. Removed dots outside the
-write/acceptance region do not reject an otherwise valid run. Raw evidence and
-raw violations remain recorded separately from the effective filtered support. Strict
-independent family agreement is optional. For example:
+The stock connected-branch policy uses v6 for whole crops and v7 for tiled crops.
+It removes full raw 2D components at or below the configured minimum radius, then
+qualifies seed-connected owner paths between original detector endpoints and
+rejects unintended observed contact. The defaults allow tracked growth within
+the fixed context, use original endpoints as trusted anchors with
+`min_endpoint_recall=0`, and disable strict containment. Independent directional
+prefixes may meet within a gap. Selected paths touching an internal context edge
+retain explicit censored-extent diagnostics; selection does not prove complete
+object extent beyond that crop. Raw evidence and raw violations remain recorded
+separately from effective support. Strict independent family agreement is
+optional. Explicit legacy versions 2 through 5 retain their containment and
+held-out endpoint recall gates. For example:
 
 ```python
 def build_reconciliation():

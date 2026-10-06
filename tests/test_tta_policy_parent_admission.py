@@ -290,6 +290,7 @@ class PolicyParentWorkspaceIntegrationTests(unittest.TestCase):
                 _publish_parent_mask_ready=mock.Mock(),
                 _publish_parent_confidence_retired=mock.Mock(),
                 _submit_component_projection=mock.Mock(),
+                _submit_sam_layer_projection=None,
                 _dispatch_inference_windows=mock.Mock(),
                 keep_temp_artifacts=False)
             namespace['view_prepare_leases'] = pipeline.ViewPrepareLeaseState(

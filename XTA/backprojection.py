@@ -393,8 +393,8 @@ def build_dense_azimuthal_backprojection_map(
         azimuthal_base_view_name(azimuthal_view), bool(is_tilted_azimuthal_view(azimuthal_view)),
         int(out_h), int(out_w), int(work_plane_h), int(work_plane_w),
         int(azimuthal_view.diameter), int(u_len),
-        round(float(azimuthal_view.center_x), 6), round(float(azimuthal_view.center_y), 6),
-        round(float(azimuthal_view.roi_radius), 6), _azimuthal_plan_signature(plan),
+        float(azimuthal_view.center_x), float(azimuthal_view.center_y),
+        float(azimuthal_view.roi_radius), _azimuthal_plan_signature(plan),
     )
     cached = _DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE.get(key)
     if cached is not None:
@@ -411,35 +411,27 @@ def build_dense_azimuthal_backprojection_map(
     if n_plan <= 0:
         raise ValueError('Dense azimuthal backprojection requires at least one angular plan sample')
 
-    yy, xx = np.indices((out_h, out_w), dtype=np.float32)
-    if (out_h, out_w) != (int(work_plane_h), int(work_plane_w)):
-        xx = (xx + np.float32(0.5)) * np.float32(float(work_plane_w) / float(out_w)) - np.float32(0.5)
-        yy = (yy + np.float32(0.5)) * np.float32(float(work_plane_h) / float(out_h)) - np.float32(0.5)
-    dx = xx - float(azimuthal_view.center_x)
-    dy = yy - float(azimuthal_view.center_y)
-    rr = np.sqrt((dx * dx) + (dy * dy)).astype(np.float32, copy=False)
-    valid = rr <= (float(radius) + 0.5)
-
-    theta = np.degrees(np.arctan2(dy, dx)).astype(np.float32, copy=False)
-    theta = np.mod(theta, 180.0).astype(np.float32, copy=False)
-    from .projection_coverage import nearest_plan_indices
-    nearest_plan_idx = nearest_plan_indices(theta, plan)
-
-    target_angles = plan_angles[nearest_plan_idx]
-    cos_t = np.cos(np.deg2rad(target_angles)).astype(np.float32, copy=False)
-    sin_t = np.sin(np.deg2rad(target_angles)).astype(np.float32, copy=False)
-    signed_r = (dx * cos_t) + (dy * sin_t)
-    signed_r[plan_reverses[nearest_plan_idx]] *= -1.0
-
-    if diameter == 1:
-        u_idx = np.zeros((out_h, out_w), dtype=np.int32)
-    else:
-        u_float = ((signed_r + float(radius)) / max(1e-6, 2.0 * float(radius))) * float(diameter - 1)
-        u_idx = np.clip(np.rint(u_float).astype(np.int32, copy=False), 0, diameter - 1)
-    source_idx = plan_sources[nearest_plan_idx].astype(np.int32, copy=False)
-
-    source_idx[~valid] = 0
-    u_idx[~valid] = 0
+    from .projection_coverage import azimuthal_plane_samples, _prepare_angular_owners
+    sorted_angles, owner_order = _prepare_angular_owners(
+        np.asarray([float(s.angle_deg) % 180.0 for s in plan], dtype=np.float64))
+    # Retain only the three final maps. Physical float64 coordinates and
+    # angular temporaries belong to a bounded strip, even for native 3k grids.
+    valid = np.empty((out_h, out_w), dtype=bool)
+    source_idx = np.empty((out_h, out_w), dtype=np.int32)
+    u_idx = np.empty((out_h, out_w), dtype=np.int32)
+    for first in range(0, out_h * out_w, 65536):
+        stop = min(out_h * out_w, first + 65536)
+        indices = np.arange(first, stop, dtype=np.int64)
+        strip_valid, strip_source, strip_u = azimuthal_plane_samples(
+            indices // out_w, indices % out_w, (work_plane_h, work_plane_w),
+            (out_h, out_w), azimuthal_view.center_y, azimuthal_view.center_x,
+            radius, diameter, plan_angles, plan_sources, plan_reverses,
+            sorted_angles, owner_order)
+        strip_source[~strip_valid] = 0
+        strip_u[~strip_valid] = 0
+        valid.reshape(-1)[first:stop] = strip_valid
+        source_idx.reshape(-1)[first:stop] = strip_source
+        u_idx.reshape(-1)[first:stop] = strip_u
 
     dense_map = DenseAzimuthalBackprojectionMap(
         valid_mask=np.ascontiguousarray(valid),

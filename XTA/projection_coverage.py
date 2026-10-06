@@ -46,6 +46,43 @@ def _nearest_prepared_angles(theta, sorted_angles, order):
     return np.where(choose_left, order[left], order[right]).astype(np.int32)
 
 
+def azimuthal_plane_samples(vertical, horizontal, work_plane, output_plane,
+                            center_y, center_x, radius, diameter, plan_angles,
+                            plan_sources, plan_reverses, sorted_angles, owner_order):
+    """Share exact physical ROI and declared float32 angular/raster addresses.
+
+    Native output centers can lie exactly on the closed circle. Test that
+    physical boundary in centered float64 coordinates before raster rounding;
+    float32 scaling can otherwise remove a boundary cell or admit an exterior
+    one. The allowance is only eight float64 epsilons, never a voxel margin.
+    Angular and diameter quantization retain the processing-raster contract.
+    """
+    work_h, work_w = map(int, work_plane)
+    out_h, out_w = map(int, output_plane)
+    vertical = np.asarray(vertical, np.float64)
+    horizontal = np.asarray(horizontal, np.float64)
+    dy = ((2.0 * vertical + 1.0 - out_h) * work_h / (2.0 * out_h)
+          + ((work_h - 1.0) * .5 - float(center_y)))
+    dx = ((2.0 * horizontal + 1.0 - out_w) * work_w / (2.0 * out_w)
+          + ((work_w - 1.0) * .5 - float(center_x)))
+    distance = np.hypot(dx, dy)
+    limit = float(radius) + .5
+    valid = distance <= limit + 8.0 * np.finfo(np.float64).eps * np.maximum(distance, abs(limit))
+    # Preserve the canonical sampler's operation order for categorical
+    # angles/columns, while sharing it with the dense and sparse maps.
+    dy = ((vertical + .5) * (work_h / out_h) - .5).astype(np.float32) - float(center_y)
+    dx = ((horizontal + .5) * (work_w / out_w) - .5).astype(np.float32) - float(center_x)
+    theta = np.degrees(np.arctan2(dy, dx)).astype(np.float32) % np.float32(180.)
+    nearest = _nearest_prepared_angles(theta, sorted_angles, owner_order)
+    angle = plan_angles[nearest]
+    signed = dx * np.cos(np.deg2rad(angle)) + dy * np.sin(np.deg2rad(angle))
+    signed = np.where(plan_reverses[nearest], -signed, signed)
+    columns = (np.zeros(theta.shape, np.int32) if diameter == 1 else
+               np.clip(np.rint((signed + radius) / max(1e-6, 2 * radius)
+                               * (diameter - 1)), 0, diameter - 1).astype(np.int32))
+    return valid, plan_sources[nearest], columns
+
+
 def _axis_contributors(destination, in_size, out_size):
     if out_size < in_size:
         lo = (destination * in_size) // out_size
@@ -226,18 +263,12 @@ def iter_destination_samples(view, source_shape, output_shape, *, first_flat=0,
             if az:
                 # Preserve native angular/diameter quantization before the
                 # canonical processing lookup, as in upright cached gather.
-                dx = coords[u_axis].astype(np.float32) - float(view.center_x)
-                dy = coords[v_axis].astype(np.float32) - float(view.center_y)
-                valid &= np.sqrt(dx * dx + dy * dy) <= radius + .5
-                theta = np.degrees(np.arctan2(dy, dx)).astype(np.float32) % np.float32(180.)
-                nearest = _nearest_prepared_angles(theta, sorted_angles, owner_order)
-                angle = plan_angles[nearest]
-                signed = dx * np.cos(np.deg2rad(angle)) + dy * np.sin(np.deg2rad(angle))
-                signed = np.where(plan_reverse[nearest], -signed, signed)
-                native_u = (np.zeros(destination.shape, np.int32) if native_w == 1 else
-                            np.clip(np.rint((signed + radius) / max(1e-6, 2 * radius)
-                                            * (native_w - 1)), 0, native_w - 1).astype(np.int32))
-                source_frame = plan_source[nearest]
+                plane_valid, source_frame, native_u = azimuthal_plane_samples(
+                    xyz[v_axis], xyz[u_axis], (work[v_axis], work[u_axis]),
+                    (output_shape[v_axis], output_shape[u_axis]), view.center_y,
+                    view.center_x, radius, native_w, plan_angles, plan_source,
+                    plan_reverse, sorted_angles, owner_order)
+                valid &= plane_valid
                 col = grid.native_u_to_processing[native_u]
                 # Azimuthal plane restoration owns one continuous plane
                 # center. Only the native angular-raster stack contracts by

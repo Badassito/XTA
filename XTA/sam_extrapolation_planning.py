@@ -69,6 +69,7 @@ class SamExtrapolationPlan:
     requested_distance: int = 0
     effective_distance: int = 0
     observations_by_frame: Mapping = field(default_factory=dict,compare=False,repr=False)
+    _observation_id_index: Mapping = field(default_factory=dict,compare=False,repr=False)
     _observation_index_source: tuple | None = field(default=None,compare=False,repr=False)
 
     def __post_init__(self):
@@ -76,15 +77,18 @@ class SamExtrapolationPlan:
         # and reuse this immutable metadata index. A new inventory rebuilds it.
         if self._observation_index_source is not self.observations:
             indexed={}
+            by_id={}
             for observation in self.observations:
                 indexed.setdefault(int(observation.frame_index),[]).append(observation)
+                by_id[observation.observation_id]=observation
             object.__setattr__(self,'observations_by_frame',MappingProxyType(
                 {frame:tuple(values) for frame,values in indexed.items()}))
+            object.__setattr__(self,'_observation_id_index',MappingProxyType(by_id))
             object.__setattr__(self,'_observation_index_source',self.observations)
 
     @property
     def by_id(self):
-        return MappingProxyType({obs.observation_id: obs for obs in self.observations})
+        return self._observation_id_index
 
     @property
     def needed_frames(self):

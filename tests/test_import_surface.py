@@ -117,7 +117,7 @@ class ImportSurfaceTests(unittest.TestCase):
             with self.subTest(module=module):
                 self.assertIn(f"imported XTA.{module}", completed.stdout)
 
-    def test_package_statement_inventory(self) -> None:
+    def test_current_source_inventory(self) -> None:
         completed = self.run_python(str(ROOT / "tools" / "verify_package_inventory.py"))
         self.assertEqual(completed.returncode, 0, completed.stdout)
         self.assertIn("package inventory verified", completed.stdout)

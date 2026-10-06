@@ -381,7 +381,9 @@ _scatter_upright_crop = _numba.njit(cache=True, nogil=True)(_scatter_upright_cro
 
 def _map_key_strips(view, plan, grid, plane_shape):
     """Exact upright destination-plane ownership in bounded full-width strips."""
-    from .projection_coverage import nearest_plan_indices, effective_azimuthal_radius
+    from .projection_coverage import (
+        azimuthal_plane_samples, effective_azimuthal_radius, _prepare_angular_owners,
+    )
 
     work_h, work_w = azimuthal_plane_shape(view)
     out_h, out_w = plane_shape
@@ -392,26 +394,19 @@ def _map_key_strips(view, plan, grid, plane_shape):
     angles = np.asarray([float(sample.angle_deg) % 180.0 for sample in plan], dtype=np.float32)
     sources = np.asarray([int(sample.source_index) for sample in plan], dtype=np.int32)
     reverses = np.asarray([bool(sample.reverse_u) for sample in plan], dtype=bool)
+    sorted_angles, owner_order = _prepare_angular_owners(
+        np.asarray([float(sample.angle_deg) % 180.0 for sample in plan], dtype=np.float64))
     strip_rows = max(1, _MAP_STRIP_PIXELS // max(1, out_w))
     for y0 in range(0, out_h, strip_rows):
         y1 = min(out_h, y0 + strip_rows)
-        yy, xx = np.indices((y1 - y0, out_w), dtype=np.float32)
-        yy += np.float32(y0)
-        if (out_h, out_w) != (int(work_h), int(work_w)):
-            xx = (xx + np.float32(0.5)) * np.float32(float(work_w) / float(out_w)) - np.float32(0.5)
-            yy = (yy + np.float32(0.5)) * np.float32(float(work_h) / float(out_h)) - np.float32(0.5)
-        dx, dy = xx - float(view.center_x), yy - float(view.center_y)
-        valid = np.sqrt(dx * dx + dy * dy) <= radius + 0.5
-        theta = np.degrees(np.arctan2(dy, dx)).astype(np.float32) % np.float32(180.0)
-        nearest = nearest_plan_indices(theta, plan)
-        target = angles[nearest]
-        signed = dx * np.cos(np.deg2rad(target)).astype(np.float32) + dy * np.sin(np.deg2rad(target)).astype(np.float32)
-        signed[reverses[nearest]] *= -1.0
-        native_u = (np.zeros(signed.shape, dtype=np.int32) if diameter == 1 else
-                    np.clip(np.rint((signed + radius) / max(1e-6, 2.0 * radius)
-                                    * float(diameter - 1)).astype(np.int32), 0, diameter - 1))
+        yy, xx = np.indices((y1 - y0, out_w), dtype=np.int64)
+        yy += y0
+        valid, source, native_u = azimuthal_plane_samples(
+            yy, xx, (work_h, work_w), (out_h, out_w), view.center_y,
+            view.center_x, radius, diameter, angles, sources, reverses,
+            sorted_angles, owner_order)
         local = np.flatnonzero(valid.reshape(-1))
-        keys = sources[nearest].reshape(-1)[local].astype(np.int64) * int(grid.processing_w)
+        keys = source.reshape(-1)[local].astype(np.int64) * int(grid.processing_w)
         keys += grid.native_u_to_processing[native_u.reshape(-1)[local]]
         yield np.ascontiguousarray(keys), np.asarray(local + y0 * out_w, dtype=np.uint32)
 

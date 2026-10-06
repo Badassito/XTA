@@ -5,6 +5,9 @@ import hashlib
 import json
 from pathlib import Path
 from contextlib import nullcontext
+from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
 
 import numpy as np
 
@@ -122,6 +125,134 @@ def _validate_receipt(bundle,receipt):
         raise ValueError('SAM extrapolation selection receipt was modified')
     if not set(receipt['selected_run_ids']).issubset(bundle.runs):
         raise ValueError('SAM extrapolation selection has unknown run owners')
+
+
+class _PublicationReuseLimit(Exception):
+    """Use the existing streaming reconstruction when metadata cannot be reused."""
+
+
+@dataclass(frozen=True,slots=True)
+class _PublicationOwner:
+    run_id: str
+    group_id: str
+    stored_frame: int
+    native_bbox_yx: tuple
+    mirror_u: bool
+
+
+@dataclass(frozen=True,slots=True)
+class _PublicationIndex:
+    reader: object
+    owners_by_frame: Mapping
+    run_ids_by_direction: tuple
+    roots_by_direction: tuple
+    selection_identity: str
+    policy_hash: str
+    charged_metadata_bytes: int
+    uses_cyclic: bool
+
+
+def _publication_index(reader,receipt,*,max_metadata_bytes):
+    """Authenticate one detached snapshot, then retain only native owner metadata.
+
+    Credit bounds both the temporary receipt copy and the immutable index. This
+    is a reuse limit: callers retain the validated streaming path when it is too
+    small, rather than omitting any selected owner or rejecting valid evidence.
+    """
+    reader._require_active()
+    charge=0
+    def reserve(amount):
+        nonlocal charge
+        charge+=amount
+        if charge>max_metadata_bytes:
+            raise _PublicationReuseLimit
+    def snapshot(value):
+        if isinstance(value,Mapping):
+            # Include dictionary slots and the temporary fingerprint expansion.
+            reserve(256+256*len(value))
+            return MappingProxyType({str(key):snapshot(item) for key,item in value.items()})
+        if isinstance(value,(list,tuple)):
+            reserve(128+32*len(value))
+            return tuple(snapshot(item) for item in value)
+        plain=_plain(value)
+        reserve(128+4*len(plain) if isinstance(plain,str) else 128)
+        return plain
+    frozen=snapshot(receipt)
+    _validate_receipt(reader,frozen)
+    shape=tuple(reader.scope['shape_tyx'])
+    owners={}
+    run_ids=[[],[]]
+    roots=[set(),set()]
+    crops={}
+    target_addresses={}
+    uses_cyclic=False
+    for rid in frozen['selected_run_ids']:
+        run=reader.runs[rid]
+        if run['direction'] not in ('forward','backward'):
+            raise ValueError('SAM extrapolation selected owner has an invalid direction')
+        direction=0 if run['direction']=='forward' else 1
+        group=reader.groups[run['group_id']]
+        reserve(1024)
+        run_ids[direction].append(rid)
+        roots[direction].add(group['terminal_id'])
+        bbox=tuple(group['context_bbox_yx'])
+        if not (0<=bbox[0]<bbox[2]<=shape[1] and 0<=bbox[1]<bbox[3]<=shape[2]):
+            raise ValueError('SAM extrapolation selected crop is outside its native canvas')
+        reserve(128+64*len(run['output_frames']))
+        output=set(run['output_frames'])
+        for stored in frozen['selected_frames_by_run'][rid]:
+            reserve(512)
+            if (isinstance(stored,(bool,np.bool_)) or not isinstance(stored,(int,np.integer))
+                    or stored not in output or str(stored) not in run['raw_mask_keys']
+                    or f'write:{stored}' not in group['mask_keys']):
+                raise ValueError('SAM extrapolation selected frame differs from its declared output ownership')
+            native=int(stored)
+            mirror=False
+            if group.get('frame_addressing'):
+                from .sam_cyclic import address_for_unfolded_index,mirror_bbox_yx
+                uses_cyclic=True
+                address=group['frame_addresses'][str(stored)]
+                native=int(address['native_index'])
+                if native not in target_addresses:
+                    target_addresses[native]=address_for_unfolded_index(native,shape[0])
+                mirror=bool(address['mirror_u'])^bool(target_addresses[native]['mirror_u'])
+            if not 0<=native<shape[0]:
+                raise ValueError('SAM extrapolation selected frame is outside its native canvas')
+            crop_key=(run['group_id'],mirror)
+            if crop_key not in crops:
+                crops[crop_key]=mirror_bbox_yx(bbox,shape[2]) if mirror else bbox
+            if native not in owners:
+                reserve(1024)
+                owners[native]=[[],[]]
+            owners[native][direction].append(_PublicationOwner(rid,run['group_id'],
+                int(stored),crops[crop_key],mirror))
+    return _PublicationIndex(reader,MappingProxyType({frame:(tuple(values[0]),tuple(values[1]))
+        for frame,values in sorted(owners.items())}),tuple(tuple(values) for values in run_ids),
+        tuple(tuple(sorted(values)) for values in roots),frozen['selection_identity'],
+        frozen['policy_hash'],charge,uses_cyclic)
+
+
+def _indexed_publication_crop(reader,owner):
+    mask=reader.raw_mask(owner.run_id,owner.stored_frame)&reader.group_mask(
+        owner.group_id,f'write:{owner.stored_frame}')
+    if owner.mirror_u:
+        mask=mask[:,::-1]
+    y0,x0,y1,x1=owner.native_bbox_yx
+    if mask.shape!=(y1-y0,x1-x0):
+        raise ValueError('SAM extrapolation raw crop shape differs from its native owner')
+    return owner.native_bbox_yx,mask
+
+
+def _indexed_publication_plane(reader,index,frame,*,direction,shape_yx):
+    """Reconstruct only this frame's owners inside their authenticated transaction."""
+    reader._require_active()
+    if index.reader is not reader:
+        raise ValueError('SAM extrapolation owner index belongs to another reader transaction')
+    plane=np.zeros(shape_yx,bool)
+    for owner in index.owners_by_frame.get(frame,((),()))[direction]:
+        (y0,x0,y1,x1),mask=_indexed_publication_crop(reader,owner)
+        plane[y0:y1,x0:x1]|=mask
+    return plane
 
 
 def iter_selected_extrapolation_crops(bundle,receipt,*,frame=None,direction=None):

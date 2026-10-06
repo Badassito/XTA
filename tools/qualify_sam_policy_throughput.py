@@ -47,7 +47,9 @@ IDENTITY_PATHS = {
 READER_COUNTERS = frozenset(('max_cache_bytes', 'cache_bytes', 'peak_cache_bytes',
     'cache_hits', 'cache_misses', 'cache_evictions', 'oversized_products',
     'mask_decodes', 'filter_computations', 'effective_candidate_computations',
-    'filter_spec_validations', 'integrity_checks', 'packed_boundary_contact_scans'))
+    'filter_spec_validations', 'integrity_checks', 'packed_boundary_contact_scans',
+    'compact_filter_expansions', 'compact_filter_parent_hits', 'compact_filter_parent_exports',
+    'compact_cache_bytes', 'peak_compact_cache_bytes'))
 PROFILE_FIELDS = frozenset(('scope_id', 'status', 'base_requested_bytes',
     'base_charged_bytes', 'reserved_extra_bytes', 'pool_capacity_bytes',
     'physical_headroom_bytes', 'worker_count', 'assigned_contract_bytes',

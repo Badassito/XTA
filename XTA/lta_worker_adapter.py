@@ -567,7 +567,7 @@ def _execute_worker_task_impl(
     if crop_model_side is not None:
         if type(crop_model_side) is not int or crop_model_side != 1008:
             raise ValueError("crop_model_side must be the qualified 1008-pixel SAM side")
-        from .lta_dynamic_crops import resize_crop_frame, resize_crop_mask
+        from .lta_dynamic_crops import resize_crop_mask
     scaled_crop = crop_model_side is not None and source_tile.size != crop_model_side
     tile_index = int(payload["tile_index"])
     generation = int(payload.get("relay_generation", 0))
@@ -664,11 +664,8 @@ def _execute_worker_task_impl(
                     frame_start=window.frame_start,
                     frame_stop=window.frame_stop,
                     tile_xyxy=source_tile.xyxy,
+                    model_side=crop_model_side,
                 )
-                if scaled_crop:
-                    from PIL import Image
-                    resource = [Image.fromarray(resize_crop_frame(frame, side=crop_model_side))
-                                for frame in resource]
             seed_by_lineage.update({seed.lineage: seed for seed in seeds})
             reduced_prediction_keys: set[tuple[str, int, int]] = set()
             owned_start, owned_stop = owned_frame_range(window)

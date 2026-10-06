@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 import hashlib
 import heapq
+import inspect
 import json
 import os
 from pathlib import Path
@@ -557,6 +558,35 @@ def _retry_child_crop_contacts(bundle, reader, group_id, canvas_shape_yx):
     return summarize_child_crop_contacts(records())
 
 
+def _retry_cpu_wave_within_peak(serial_wave, *, approved_peak_bytes, image_bytes,
+                                worker_count, persistent_bytes=0):
+    """Reuse already approved phase credit without changing retry admission.
+
+    Rendering/selection scratch can dominate the serial retry's peak. Independent
+    endpoint sessions may share that credit while those CPU phases are inactive.
+    Full contract, writer and tiled assembly owners remain separately charged.
+    The original serial estimate still decides crop eligibility; a larger GPU
+    wave must fit both its owned CPU credit and that unchanged approved peak.
+    """
+    from .sam_resources import cpu_wave_admission
+    original = dict(serial_wave)
+    workers = max(1, int(worker_count))
+    if workers == 1 or original['defer_refill_until_consumed']:
+        return original
+    wave_bytes = min(int(original['assigned_cpu_wave_bytes']),
+        int(approved_peak_bytes)-int(image_bytes)-int(persistent_bytes))
+    if wave_bytes < int(original['peak_cpu_wave_estimate_bytes']):
+        return original
+    admitted = cpu_wave_admission(int(original['maximum_session_cpu_estimate_bytes']),
+        int(original['maximum_raw_mask_bytes']), wave_bytes, workers)
+    if (int(admitted['max_in_flight']) <= int(original['max_in_flight'])
+            or int(admitted['peak_cpu_wave_estimate_bytes'])+int(image_bytes)+int(persistent_bytes)
+                > int(approved_peak_bytes)):
+        return original
+    return dict(admitted, retry_approved_peak_bytes=int(approved_peak_bytes),
+        retry_image_bytes=int(image_bytes), retry_persistent_bytes=int(persistent_bytes))
+
+
 def _prepare_sam_group_retry(prepared, group, crop, *, retry_policy, policy,
         resource_profile, worker_count):
     """Prepare only the same original family under a fresh enlarged context."""
@@ -620,13 +650,16 @@ def _prepare_sam_group_retry(prepared, group, crop, *, retry_policy, policy,
     if gray_bytes > cache_cap:
         raise MemoryError('Enlarged SAM image demand exceeds its immutable cache admission')
     render_reserve = max(1, _env_int('YOLO_TTA_SAM_RENDER_MAX_BYTES', 256*1024**2))
-    # Retry SDK sessions are serial within the held parent lease. The existing
-    # transfer barrier releases every result before a later session can start.
+    # Preserve the serial estimate used to decide whether this crop is eligible.
+    # A larger worker wave may spend only credit already inside that peak.
     wave_budget = min(owned_wave, max(1, retry_policy.max_retry_memory_bytes-gray_bytes))
     wave = cpu_wave_admission(max_session, max_raw, wave_budget, 1)
     peak = max(int(enlarged.crop_contract['charged_contract_bytes']) + 32*1024**2,
         topology_bytes + 32*1024**2, int(wave['peak_cpu_wave_estimate_bytes']) + gray_bytes,
         2*gray_bytes + render_reserve, int(assembly_bytes) + gray_bytes)
+    wave = _retry_cpu_wave_within_peak(wave, approved_peak_bytes=peak,
+        image_bytes=gray_bytes, worker_count=worker_count,
+        persistent_bytes=int(assembly_bytes)+int(enlarged.crop_contract['charged_contract_bytes'])+32*1024**2)
     retry = replace(prepared, plan=plan, runs=runs, needed_frames=plan.needed_frames,
         frame_crop_bounds=demand, tracker_jobs=jobs, tile_inventory=inventory,
         tiling_sha256=tiling_sha, tiled_assembly_bytes=assembly_bytes,
@@ -658,8 +691,10 @@ def _regenerate_sam_group_retry(prepared, *, destination, metadata, image_provid
                     if not tile.attempted:
                         writer.add_run_tile(prepared.runs[index].run_id,
                             tile_descriptor(prepared.runs[index], tile), {})
-        order = prepared.execution_order(1)
-        stream = (_iterate_tiled_tracker_results(runtime, prepared, 1, groups, by_id, cache,
+        worker_count = min(len(getattr(runtime, 'device_ids', ())) or 1,
+            int(prepared.cpu_wave_admission.get('max_in_flight', 1)))
+        order = prepared.execution_order(worker_count)
+        stream = (_iterate_tiled_tracker_results(runtime, prepared, worker_count, groups, by_id, cache,
             cancel_event, resource_profile) if tiled else _iterate_tracker_results(runtime,
             _tracker_requests(tuple(prepared.runs[i] for i in order), groups, by_id,
                 cancel_event, resource_profile), cache, prepared.cpu_wave_admission))
@@ -784,7 +819,7 @@ def _apply_sam_crop_retries(bundle, prepared, *, destination, metadata, runtime,
                 if box not in candidates:
                     candidates[box] = _prepare_sam_group_retry(prepared, group, box,
                         retry_policy=retry_policy, policy=policy, resource_profile=resource_profile,
-                        worker_count=1)
+                        worker_count=len(getattr(runtime, 'device_ids', ())) or 1)
                 return candidates[box]
             def memory(box):
                 try:
@@ -1537,15 +1572,31 @@ def interpolate_sam_view_volume_pass(
             family_dispatch = False
             family_fallback = 'automatic_family_imbalance'
     family_inventory = ()
+    family_requested_order = []
+    family_submission_receipt = None
+    requires_family_submission_receipt = False
+
+    def record_family_submission_order(order):
+        nonlocal family_submission_receipt
+        if (family_submission_receipt is not None or not isinstance(order, tuple)
+                or any(isinstance(index, bool) or not isinstance(index, (int, np.integer)) for index in order)):
+            raise SamInterpolationInfrastructureError('SAM family submission order receipt is malformed or repeated')
+        family_submission_receipt = tuple(int(index) for index in order)
+
     if family_dispatch:
         from .sam_tracker_runtime import SamTrackerFamily
         indices_by_family = {}
         for index, run in enumerate(runs):
             indices_by_family.setdefault(str(run.group_id), []).append(index)
         def original_request(index):
+            if (isinstance(index, bool) or not isinstance(index, (int, np.integer))
+                    or not 0 <= int(index) < len(runs)):
+                raise SamInterpolationInfrastructureError('SAM family factory requested an invalid original job index')
             source = _tracker_requests((runs[int(index)],), groups, observation_by_id, cancel_event, resource_profile)
             try:
-                return next(source)
+                request = next(source)
+                family_requested_order.append(int(index))
+                return request
             finally:
                 source.close()
         family_inventory = tuple(SamTrackerFamily(
@@ -1585,9 +1636,20 @@ def interpolate_sam_view_volume_pass(
                         writer.add_run_tile(runs[parent_index].run_id, tile_descriptor(runs[parent_index], tile), {})
         tracker_started = time.perf_counter()
         if family_dispatch:
+            try:
+                parameters = inspect.signature(runtime.iter_family_results).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            declared_receipt = parameters.get('execution_order_callback')
+            requires_family_submission_receipt = (declared_receipt is not None
+                and declared_receipt.kind != inspect.Parameter.POSITIONAL_ONLY)
+            receipt_options = ({'execution_order_callback': record_family_submission_order}
+                if requires_family_submission_receipt or any(parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()) else {})
             result_stream = runtime.iter_family_results(family_inventory,
                 source_cache_ref=cache_ref, max_in_flight=worker_count,
-                defer_refill_until_consumed=bool(prepared_plan.cpu_wave_admission.get('defer_refill_until_consumed', False)))
+                defer_refill_until_consumed=bool(prepared_plan.cpu_wave_admission.get('defer_refill_until_consumed', False)),
+                **receipt_options)
         else:
             result_stream = (_iterate_tiled_tracker_results(runtime, prepared_plan, worker_count, groups,
                 observation_by_id, cache_ref, cancel_event, resource_profile) if resolved_mode == "tiled" else
@@ -1652,7 +1714,18 @@ def interpolate_sam_view_volume_pass(
         if len(completed_jobs) != len(tracking_work) or len(generated_by_index) != len(runs):
             raise SamInterpolationInfrastructureError("SAM worker stream omitted expected independently seeded runs/tiles")
         if family_dispatch:
-            stats['sam_execution_order'] = list(getattr(runtime, 'dispatch_stats', {}).get('family_execution_order', ()))
+            # Legacy scripted runtimes may ignore the optional callback. Their
+            # passed factory still belongs to this exact scope; another scope
+            # cannot overwrite its recorded order after tracker lock handoff.
+            scoped_order = (tuple(family_requested_order) if family_submission_receipt is None
+                            else family_submission_receipt)
+            if (requires_family_submission_receipt and family_submission_receipt is None
+                    or len(scoped_order) != len(tracking_work) or set(scoped_order) != set(range(len(tracking_work)))
+                    or scoped_order != tuple(family_requested_order)):
+                raise SamInterpolationInfrastructureError('SAM family submission order differs from original job ownership')
+            stats['sam_execution_order'] = list(scoped_order)
+            stats['sam_execution_order_provenance'] = ('scope_owned_request_factory'
+                if family_submission_receipt is None else 'completed_iterator_submission_receipt')
         if resolved_mode == "tiled":
             stats["sam_tiled_child_jobs_generated"] = len(completed_jobs)
             stats["sam_tiled_parent_runs_generated"] = len(generated_by_index)

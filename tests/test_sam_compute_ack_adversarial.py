@@ -234,6 +234,82 @@ def test_tracker_cancellation_immediately_quarantines_idle_residency(tmp_path, m
         resident.release(residency_settled=True)
 
 
+def test_verified_idle_worker_is_refilled_before_raw_transfer_and_cache_retirement(
+        tmp_path, monkeypatch):
+    tracker, request, worker, _coordinator, resident, _aux, handbacks = _protocol(tmp_path, monkeypatch)
+    successor = dict(request, run_id='next-endpoint')
+    original_load = sam.load_tracker_run_result
+    transfers = []
+
+    def load(path, **kwargs):
+        if not transfers:
+            assert worker.active[1].work_id == successor['run_id']
+            assert handbacks == ['compute_released']
+            assert tracker._iteration_active
+            assert not next(iter(tracker._source_cache_retirement_proofs.values()))['complete']
+        transfers.append(path)
+        return original_load(path, **kwargs)
+
+    monkeypatch.setattr(sam, 'load_tracker_run_result', load)
+    cache = tracker._source_cache_ref
+    try:
+        results = list(tracker.iter_results((request, successor)))
+        assert [result.receipt['run_id'] for _index, result in results] == [request['run_id'], successor['run_id']]
+        assert tracker.dispatch_stats['refilled_before_raw_transfer'] == 1
+        assert tracker.dispatch_stats['completion_manifest_validation_seconds'] >= 0.
+        assert tracker.dispatch_stats['raw_transfer_decode_seconds'] >= 0.
+        proof = tracker.release_source_cache(cache)
+        assert proof['completed_runs'] == 2 and proof['gray_mappings_retired']
+        cache.path.unlink()
+        for _index, result in results:
+            assert all(np.array_equal(mask, request['seed_mask']) for mask in result.frames.values())
+    finally:
+        tracker.close()
+        resident.release(residency_settled=True)
+
+
+@pytest.mark.parametrize('refuse_shutdown', [False, True])
+def test_corrupt_raw_transfer_publishes_nothing_and_settles_already_refilled_work(
+        tmp_path, monkeypatch, refuse_shutdown):
+    def corrupt(receipt):
+        path = Path(receipt['raw_masks']['path'])
+        path.write_bytes(path.read_bytes() + b'controlled corruption')
+
+    tracker, request, worker, coordinator, resident, _aux, handbacks = _protocol(
+        tmp_path, monkeypatch, corrupt, refuse_shutdown=refuse_shutdown)
+    successor = dict(request, run_id='next-endpoint')
+    submitted = []
+    original_submit = worker.submit
+
+    def submit(task, **kwargs):
+        submitted.append(task.work_id)
+        return original_submit(task, **kwargs)
+
+    monkeypatch.setattr(worker, 'submit', submit)
+    stream = tracker.iter_results((request, successor))
+    try:
+        with pytest.raises(RuntimeError, match='checksum/size'):
+            next(stream)
+        assert submitted == [request['run_id'], successor['run_id']]
+        assert tracker.dispatch_stats['completed'] == 0
+        assert handbacks == ['compute_released']
+        assert not next(iter(tracker._source_cache_retirement_proofs.values()))['complete']
+        if refuse_shutdown:
+            assert not tracker.residency_released
+            assert worker.active[1].work_id == successor['run_id']
+            assert coordinator.snapshot()['stage_leases']
+            assert coordinator.snapshot()['resident_owners'][1]['quarantined']
+        else:
+            assert tracker.residency_released
+            assert not worker.active and not tracker._compute_leases
+            assert not coordinator.snapshot()['stage_leases']
+    finally:
+        worker.refuse_shutdown = False
+        stream.close()
+        tracker.close()
+        resident.release(residency_settled=True)
+
+
 @pytest.mark.parametrize('local_device', [False, 1], ids=['boolean-local', 'wrong-local'])
 def test_startup_ack_requires_exact_cuda_local_device(tmp_path, monkeypatch, local_device):
     from XTA import lta_workers

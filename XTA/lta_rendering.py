@@ -221,8 +221,15 @@ def render_native_tile_window(
     frame_start: int,
     frame_stop: int,
     tile_xyxy: Sequence[int],
+    model_side: int | None = None,
 ) -> list[object]:
-    """Read one native tile window from the shared cache as RGB PIL frames."""
+    """Read native gray crops and detach model-sized RGB PIL frames.
+
+    Scaled dynamic crops resize the gray frame before expanding its identical
+    RGB channels. This retains the same INTER_AREA pixels without building an
+    entire window of larger RGB frames that would immediately be discarded.
+    Native crop coordinates and the shared cache remain unchanged.
+    """
 
     from PIL import Image
 
@@ -233,6 +240,13 @@ def render_native_tile_window(
     x0, y0, x1, y1 = (int(value) for value in tile_xyxy)
     if not 0 <= x0 < x1 <= cache_ref.shape[2] or not 0 <= y0 < y1 <= cache_ref.shape[1]:
         raise ValueError("tile_xyxy is outside the physical-view cache")
+    if model_side is not None:
+        if isinstance(model_side, (bool, np.bool_)):
+            raise TypeError("model_side must be a positive integer")
+        model_side = operator.index(model_side)
+        if model_side < 1:
+            raise ValueError("model_side must be a positive integer")
+        from .lta_dynamic_crops import resize_crop_frame
     import weakref
     from .runtime import close_memmap_array_without_flush
     cache = cache_ref.open(mode="r")
@@ -254,6 +268,8 @@ def render_native_tile_window(
                 crop = frame[y0-cy0:y1-cy0, x0-cx0:x1-cx0]
             else:
                 crop = cache[index, y0:y1, x0:x1]
+            if model_side is not None:
+                crop = resize_crop_frame(crop, side=model_side)
             # A gray cache is always 2D here. implicit_rgb repeats into a new
             # RGB allocation, so PIL/model images never borrow this gray mmap.
             images.append(Image.fromarray(implicit_rgb(np.ascontiguousarray(crop)), mode='RGB'))

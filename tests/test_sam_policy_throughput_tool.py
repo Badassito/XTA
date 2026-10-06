@@ -36,6 +36,15 @@ def test_only_explicit_identity_and_operational_paths_may_change():
     assert not tool.compare_selections(old, new, allow_implementation_changes=False)['exact_quality']
 
 
+def test_compact_filter_reuse_counters_are_operational_but_mask_changes_remain_quality():
+    old, new = _receipt(), _receipt()
+    new['reader_cache'].update(compact_filter_expansions=5, compact_filter_parent_hits=2,
+        compact_filter_parent_exports=3, compact_cache_bytes=0, peak_compact_cache_bytes=4096)
+    assert tool.compare_selections(old, new)['exact_quality']
+    new['reader_cache']['removed_foreground_override'] = 2
+    assert not tool.compare_selections(old, new)['exact_quality']
+
+
 @pytest.mark.parametrize('before,after', [(True, 1), (False, 0), (1, 1.0), (0, 0.0)])
 def test_nested_quality_json_types_remain_exact(before, after):
     old, new = _receipt(), _receipt()

@@ -38,6 +38,8 @@ _QUALIFIED_PACKED_OWNER_IMPLEMENTATIONS = {
     # Qualified v25.1.0 job151147 source archive; immutable-prefix reuse only
     # changes metadata ownership, not this packed owner/attachment contract.
     '254fbb676b0585baf9f0dfc9a680884a70270c3987177cafd4aa2fc511dabe42': 'tracked_known',
+    # v25.1.0 before receipt-presence hardening; packed geometry is unchanged.
+    '9473abe3904f033d5ea1597122494685e535aefd5f03fc04f409c0513a6caf7b': 'tracked_known',
 }
 
 
@@ -639,11 +641,31 @@ def branch_selection_from_value(value):
     return getattr(value, 'branch_selection', None)
 
 
+def branch_selection_required(value):
+    """Recognize retained branch semantics even if a version field is lost.
+
+    Legacy radius-only receipts keep their original candidate-union meaning.
+    A receipt that declares connected branches cannot fall back to that union
+    when its required owner recipe is missing, including snapshot wrappers.
+    """
+    if not isinstance(value, Mapping):
+        return False
+    resolved = value.get('resolved_policy', {})
+    if not isinstance(resolved, Mapping):
+        raise ValueError('SAM selection resolved policy must be a mapping')
+    return (resolved.get('version') in (6, 7, '6', '7')
+        or resolved.get('branch_aware_selection') is True
+        or resolved.get('allow_paired_seed_tracks') is True
+        or resolved.get('branch_write_domain') == 'fixed_context'
+        or str(value.get('policy_name', '')).endswith(('_v6', '_v7'))
+        or 'branch_selection_summary' in value)
+
+
 def validate_branch_selection(value, bundle, *, mask_filter_sha256=None):
     """Validate bounded, complete owner recipes without decoding a mask."""
     _assert_unchanged()
     recipe = branch_selection_from_value(value)
-    required = isinstance(value, Mapping) and value.get('resolved_policy', {}).get('version') in (6, 7)
+    required = branch_selection_required(value)
     if recipe is None:
         if required:
             raise ValueError('SAM branch-aware support requires its retained branch selection recipe')
