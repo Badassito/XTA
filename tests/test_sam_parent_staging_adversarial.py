@@ -262,6 +262,53 @@ def test_memory_shadow_relocation_does_not_expand_dense_canvas(tmp_path,monkeypa
     staged.close()
 
 
+@pytest.mark.parametrize('no_progress', [False, True])
+def test_shadow_checkpoint_short_writes_preserve_bytes_or_refuse_source_retirement(
+        tmp_path, monkeypatch, no_progress):
+    source = tmp_path / 'temp' / 'private-shadow'
+    source.mkdir(parents=True)
+    expected = b'exact sparse payload, including the terminal bytes'
+    (source / 'payload.bin').write_bytes(expected)
+    root = tmp_path / 'checkpoints'
+    root.mkdir()
+    task = TinyTask(tmp_path, 'd1', None)
+    task.d1_shadow_path = source
+    original_open = Path.open
+
+    class ShortWriter:
+        def __init__(self, stream):
+            self.stream = stream
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            self.stream.close()
+        def fileno(self):
+            return self.stream.fileno()
+        def write(self, data):
+            if no_progress:
+                return 0
+            return self.stream.write(data[:max(1, len(data) // 2)])
+
+    def short_open(path, *args, **kwargs):
+        stream = original_open(path, *args, **kwargs)
+        mode = args[0] if args else kwargs.get('mode', 'r')
+        if path.name == 'payload.bin' and path.is_relative_to(root) and mode == 'xb':
+            return ShortWriter(stream)
+        return stream
+
+    monkeypatch.setattr(Path, 'open', short_open)
+    if no_progress:
+        with pytest.raises(OSError, match='write made no progress'):
+            staging.checkpoint_parent(task, root, tmp_path / 'temp', 60, threading.Event())
+        assert source.exists() and (source / 'payload.bin').read_bytes() == expected
+        assert list(root.iterdir()) == []
+    else:
+        snapshot = staging.checkpoint_parent(task, root, tmp_path / 'temp', 60, threading.Event())
+        assert not source.exists()
+        assert snapshot.written_bytes == len(expected)
+        assert (snapshot.shadow_path / 'payload.bin').read_bytes() == expected
+
+
 def test_tmpfs_falls_back_to_output_and_both_ram_refuse(tmp_path,monkeypatch):
     temp=tmp_path/'temp';output=tmp_path/'output'
     monkeypatch.setattr(staging,'path_is_memory_backed',lambda path:Path(path).is_relative_to(temp))

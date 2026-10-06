@@ -148,6 +148,11 @@ The existing coarse-sweep plan still densifies requested angles into virtual
 reconstruction planes assigned to the nearest completed source frame, with
 half-turn mirroring where required. This patch preserves those reconstruction
 rules; angular prediction interpolation is unchanged.
+Azimuthal physical circle membership uses stable centered float64 coordinates
+and an eight-float64-epsilon roundoff allowance at the closed boundary, while
+angular and diameter raster quantization remains float32. Dense, sparse, and
+confidence routes share that plane-address implementation; reduced prediction
+canvases cannot change the physical circle or its boundary membership.
 Reduction combines categorical foreground with OR and scores with maximum;
 confidence uses the same address
 plan. These rules do not extend the physical field of view.

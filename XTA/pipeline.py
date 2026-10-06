@@ -331,6 +331,8 @@ from .assembly import (
     gate_tile_result_against_parent_mask,
     materialize_nrrd_global_layer,
     materialize_interpolation_component_nrrd_view_layer,
+    materialize_sam_directional_view_layer,
+    materialize_sam_extrapolation_view_layer,
     postprocess_tile_volume_after_inference,
     prepare_view_volume_after_fullframe,
     set_final_source_output_shape,
@@ -344,6 +346,7 @@ from .projection_queue import (
 from .view_prepare import (
     AdmittedViewPrepare,
     ComponentProjectionSubmitter,
+    SamLayerProjectionSubmitter,
     ViewPrepareLeaseState,
     scratch_unlink_path_for_memmap,
 )
@@ -548,6 +551,20 @@ def _execution_runtime_provenance() -> Dict[str, object]:
             entry.update(sha256=None, read_error=type(exc).__name__)
         sources[name] = entry
     result['spherical_sources'] = sources
+    # A package version can describe several development snapshots. Retain the
+    # actual SAM preparation/publication bytes for next-run timing attribution
+    # without importing optional model runtimes merely to fingerprint them.
+    for name in ('assembly', 'view_prepare', 'projection_queue', 'sam_integration',
+                 'sam_interpolation', 'sam_extrapolation', 'sam_extrapolation_policy',
+                 'sam_tracker_runtime', 'sam_resources', 'sam_policy', 'sam_mask_reader',
+                 'sam_branch_selection', 'sam_evidence', 'sam_canvas_rendering'):
+        path = package / (name + '.py')
+        entry = {'path': str(path), 'loaded_in_parent': 'XTA.' + name in sys.modules}
+        try:
+            entry['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            entry.update(sha256=None, read_error=type(exc).__name__)
+        result['modules'][name] = entry
     result['geometry_quality_requests'] = geometry_quality_request_record()
     result['native_trt_ring_requested'] = native_trt_ring_enabled()
     result['native_trt_ring_mode'] = native_trt_ring_mode()
@@ -2873,6 +2890,7 @@ def _main_impl() -> None:
     # B (parent-only interpolation delta) becomes ready when the parent future completes.
     parent_mask_ready_events = queue.SimpleQueue()
     parent_confidence_retired_events = queue.SimpleQueue()
+    parent_dense_retired_events = queue.SimpleQueue()
     parent_bridge_ready: set[Tuple[str, str]] = set()
     parent_tile_supports_retired: set[Tuple[str, str]] = set()
     postprocessed_tiles_waiting_by_parent: Dict[Tuple[str, str], Dict[str, object]] = {}
@@ -3051,11 +3069,21 @@ def _main_impl() -> None:
         # binds its local scheduler_wake alias.
         scheduler_state.scheduler_wake.set()
 
+    def _publish_parent_dense_retired(key, expected_lease):
+        parent_dense_retired_events.put((key, expected_lease))
+        scheduler_state.scheduler_wake.set()
+
 
     _submit_component_projection = ComponentProjectionSubmitter(
         queue=component_projection_queue,
         source_shape=(int(input_T), int(input_H), int(input_W)),
         materialize=materialize_interpolation_component_nrrd_view_layer,
+    )
+    _submit_sam_layer_projection = SamLayerProjectionSubmitter(
+        queue=component_projection_queue,
+        source_shape=(int(input_T), int(input_H), int(input_W)),
+        materialize_directional=materialize_sam_directional_view_layer,
+        materialize_extrapolation=materialize_sam_extrapolation_view_layer,
     )
 
     def _submit_view_prepare(model_name: str, view: ViewInfo) -> None:
@@ -3144,6 +3172,7 @@ def _main_impl() -> None:
             preinterpolation_layer_already_published=bool(preinterpolation_layer_already_published),
             parent_mask_ready_callback=_publish_parent_mask_ready,
             submit_component_projection=_submit_component_projection,
+            submit_sam_layer_projection=_submit_sam_layer_projection,
             materialize_workspace=materialize_raw_bbox_mask_store_workspace,
             prepare=partial(_prepare_parent_with_confidence_capture,
                 prepare_view_volume_after_fullframe, capture_plan=capture_plan),
@@ -3581,8 +3610,13 @@ def _main_impl() -> None:
                 f'for {parent_key[0]}/{parent_key[1]} ({reason}).'
             )
 
-        lease = direct_union_backing_leases.pop(parent_key, None)
+        lease = direct_union_backing_leases.get(parent_key)
+        if parent_key in view_prepare_leases.retired_for_publication:
+            # Its independent publications may be complete before a caller's
+            # last dense alias dies. The owner-death receipt returns credit.
+            lease = None
         if lease is not None:
+            direct_union_backing_leases.pop(parent_key)
             if (
                 parent_key not in direct_union_postprocess_views
                 or str(lease.phase) != 'postprocess'
@@ -4428,6 +4462,13 @@ def _main_impl() -> None:
         direct_union_capacity_released = False
         while True:
             try:
+                key, expected_lease = parent_dense_retired_events.get_nowait()
+            except queue.Empty:
+                break
+            direct_union_capacity_released |= view_prepare_leases.settle_publication_retirement(
+                key, expected_lease)
+        while True:
+            try:
                 key, lease, nbytes = parent_confidence_retired_events.get_nowait()
             except queue.Empty:
                 break
@@ -4446,6 +4487,16 @@ def _main_impl() -> None:
                 continue
             result = fut.result()
             if not settle_prepared_view_components(result):
+                completed_key = (str(result.model_name), str(result.view_name))
+                if view_prepare_leases.retire_dense_for_publication(
+                    result, enabled=bool(component_ref_dense_retirement_active),
+                    tiled=int(tile_expected_by_parent.get(completed_key, 0)) > 0,
+                    keep_temp=bool(keep_temp_artifacts),
+                    retired_callback=_publish_parent_dense_retired,
+                ):
+                    # Terminal refs remain pending. Only independent dense
+                    # admission returns, so staged parents can reach SAM now.
+                    direct_union_capacity_released = True
                 continue
             del view_processing_futures[fut]
             completed_view_key = (str(result.model_name), str(result.view_name))
@@ -6073,6 +6124,7 @@ def _main_impl() -> None:
                 'slice_bboxes': np.zeros((int(view.num_slices), 4), dtype=np.int64),
                 'slice_row_any': None,
                 'slice_row_count': 0,
+                'row_metadata_complete': True,
             }
             view_slice_meta[meta_key] = holder
         task_meta = stats.get('slice_meta')
@@ -6083,23 +6135,46 @@ def _main_impl() -> None:
             return
         try:
             s0_meta = int(task.get('slice_start', 0))
+            expected_count = int(task.get('slice_count', view.num_slices))
             any_arr = np.asarray(task_meta['slice_any'], dtype=bool)
-            n_meta = int(any_arr.shape[0])
-            holder['slice_any'][s0_meta:s0_meta + n_meta] = any_arr
-            holder['slice_bboxes'][s0_meta:s0_meta + n_meta] = np.asarray(
-                task_meta['slice_bboxes'], dtype=np.int64,
-            )
+            bboxes = np.asarray(task_meta['slice_bboxes'], dtype=np.int64)
+            if (expected_count <= 0 or s0_meta < 0
+                    or s0_meta + expected_count > int(view.num_slices)
+                    or any_arr.shape != (expected_count,)
+                    or bboxes.shape != (expected_count, 4)):
+                raise ValueError('slice metadata does not cover its dispatched window')
             rows_packed = task_meta.get('slice_row_any')
             if rows_packed is not None:
                 rows_packed = np.asarray(rows_packed, dtype=np.uint8)
+                row_count_data = np.asarray(task_meta['slice_row_count']).reshape(-1)
+                if row_count_data.size != 1:
+                    raise ValueError('slice row metadata must declare one row count')
+                row_count = int(row_count_data[0])
+                processing_shape = task.get('processing_shape')
+                if (row_count <= 0
+                        or rows_packed.shape != (expected_count, (row_count + 7) // 8)
+                        or (processing_shape is not None
+                            and row_count != int(processing_shape[1]))):
+                    raise ValueError('slice row metadata does not cover its processing plane')
+                if holder['slice_row_any'] is not None and row_count != holder['slice_row_count']:
+                    raise ValueError('slice row metadata changed processing-plane height')
+            # Validate before NumPy assignment, which otherwise broadcasts a
+            # short/malformed hint into apparently complete parent metadata.
+            holder['slice_any'][s0_meta:s0_meta + expected_count] = any_arr
+            holder['slice_bboxes'][s0_meta:s0_meta + expected_count] = bboxes
+            if rows_packed is None:
+                # Row occupancy is optional, but partial occupancy cannot prune
+                # a full view: omitted windows must use authoritative scanning.
+                holder['row_metadata_complete'] = False
+                holder['slice_row_any'] = None
+                holder['slice_row_count'] = 0
+            elif holder['row_metadata_complete']:
                 if holder['slice_row_any'] is None:
                     holder['slice_row_any'] = np.zeros(
                         (int(view.num_slices), int(rows_packed.shape[1])), dtype=np.uint8,
                     )
-                    holder['slice_row_count'] = int(
-                        np.asarray(task_meta['slice_row_count']).reshape(-1)[0]
-                    )
-                holder['slice_row_any'][s0_meta:s0_meta + n_meta] = rows_packed
+                    holder['slice_row_count'] = row_count
+                holder['slice_row_any'][s0_meta:s0_meta + expected_count] = rows_packed
         except Exception:
             holder['valid'] = False
 

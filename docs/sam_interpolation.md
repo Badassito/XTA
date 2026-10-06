@@ -7,7 +7,7 @@ proposal receives no SDF fallback. `both` is rejected during argument parsing.
 
 SAM extrapolation is independently enabled by `--extrapolation_distance` and
 can follow either interpolation backend. Source review and snapshot qualification
-are separate from a tagged release; see [the development audit workflow](../release/README.md).
+are separate from a tagged release; see [the development audit workflow](../../Scratch/Data/XTA/History/release/README.md).
 
 The current development SAM path supports all existing TTA view families:
 Transverse, Sagittal and Coronal, their tilted variants, Azimuthal views,
@@ -739,6 +739,15 @@ of NumPy's larger temporary vectors. Reader caches and packed receipt metadata
 retain their separate explicit caps. A saved receipt's budget never authorizes
 a new replay allocation, and publishing saved support decodes one bounded plane
 at a time.
+
+Within one integrity-checked evidence transaction, half the reader cache allowance
+can retain packed component-filter results and their original diagnostics. Intrinsic
+measurement lanes share these immutable products with the parent so connected
+branch qualification and publication can reuse the same filtering decisions.
+Other mask and topology products can borrow unused compact capacity. Both portions stay
+inside the existing total allowance, expire with the owning outer transaction,
+and preserve its complete payload checks before and after use. Cache pressure
+causes recomputation; it cannot change a mask or relax a selection gate.
 
 ### Bounded adaptive crop retry
 

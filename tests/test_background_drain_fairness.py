@@ -145,6 +145,7 @@ def test_real_pipeline_background_checkpoint_refills_four_workers_before_next_ou
     namespace.update(scheduler=scheduler, inference_worker_process_active=True,
         background_drain_budget=budget, _drain_parent_mask_ready_events=lambda: None,
         parent_confidence_retired_events=queue.SimpleQueue(),
+        parent_dense_retired_events=queue.SimpleQueue(),
         _flush_ready_postprocessed_tiles=lambda: None, _flush_ready_residual_tiles=lambda: None,
         view_processing_futures={}, sam_parent_staging=None, tile_cleanup_futures={}, tile_parent_gate_futures={},
         tile_bridge_gate_futures={}, tile_consolidation_futures={},
@@ -158,6 +159,7 @@ def test_real_pipeline_background_checkpoint_refills_four_workers_before_next_ou
                          # other drain branches so a newly captured name fails here.
                          unreachable_globals=frozenset('''
                              _dispatch_inference_windows _mark_tile_complete
+                             _publish_parent_dense_retired
                              _mark_view_variant_terminal _maybe_finalize_tile_parent
                              _maybe_submit_tile_consolidations_for_parent
                              _release_tile_dense_result_for_key _retire_parent_dense_view

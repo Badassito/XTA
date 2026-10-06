@@ -212,29 +212,21 @@ def estimate_native_pull_plan_bytes(view, source_shape, output_shape):
 
 def _angular_keys(plan, vertical_indices, horizontal_indices):
     """Exact frozen sampler operation order, bounded to one admitted strip."""
-    from .projection_coverage import _nearest_prepared_angles
+    from .projection_coverage import azimuthal_plane_samples
     base = int(plan.integers[0])
     va, ua = ((1, 2), (0, 2), (0, 1))[base]
-    vertical = ((vertical_indices.astype(np.float64) + .5)
-                * plan.coefficients[9 + va] - .5).astype(np.float32)
-    horizontal = ((horizontal_indices.astype(np.float64) + .5)
-                  * plan.coefficients[9 + ua] - .5).astype(np.float32)
-    dx = horizontal - float(plan.coefficients[14])
-    dy = vertical - float(plan.coefficients[13])
     radius = float(plan.coefficients[12])
-    valid = np.sqrt(dx * dx + dy * dy) <= radius + .5
-    theta = np.degrees(np.arctan2(dy, dx)).astype(np.float32) % np.float32(180.)
-    nearest = _nearest_prepared_angles(theta, plan.sorted_angles, plan.owner_order)
-    angle = plan.plan_angles[nearest]
-    signed = dx * np.cos(np.deg2rad(angle)) + dy * np.sin(np.deg2rad(angle))
-    signed = np.where(plan.plan_reverses[nearest], -signed, signed)
     native_w = int(plan.integers[9])
-    native_u = (np.zeros(theta.shape, np.int32) if native_w == 1 else
-                np.clip(np.rint((signed + radius) / max(1e-6, 2 * radius)
-                                * (native_w - 1)), 0, native_w - 1).astype(np.int32))
+    work = plan.integers[2:5]
+    output = plan.integers[5:8]
+    valid, sources, native_u = azimuthal_plane_samples(
+        vertical_indices, horizontal_indices, (work[va], work[ua]),
+        (output[va], output[ua]), plan.coefficients[13], plan.coefficients[14],
+        radius, native_w, plan.plan_angles, plan.plan_sources, plan.plan_reverses,
+        plan.sorted_angles, plan.owner_order)
     columns = plan.column_lookup[native_u]
     key_dtype = np.uint32 if plan.invalid_key <= np.iinfo(np.uint32).max else np.uint64
-    keys = (plan.plan_sources[nearest].astype(key_dtype) * plan.source_shape[2]
+    keys = (sources.astype(key_dtype) * plan.source_shape[2]
             + columns.astype(key_dtype))
     keys[~valid] = key_dtype(plan.invalid_key)
     return keys

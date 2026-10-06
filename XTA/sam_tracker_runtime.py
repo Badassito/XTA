@@ -98,6 +98,7 @@ class _FamilyDispatch:
         self.active = {}
         self.total_jobs = len(indices)
         self.assigned_families = self.completed_families = self.peak_active = 0
+        self.execution_order = []
 
     def retire_completed(self, free_devices):
         """Retire exhausted cursors only after their worker becomes free."""
@@ -387,17 +388,51 @@ def execute_interpolation_tracker_task(
     }
 
 
+def _read_tracker_manifest(manifest_path: Path, *, expected_sha256: str | None = None):
+    """Verify the small completion receipt independently of the raw transfer."""
+    path = Path(manifest_path).resolve(strict=True)
+    encoded = path.read_bytes()
+    if expected_sha256 is not None and hashlib.sha256(encoded).hexdigest() != expected_sha256:
+        raise RuntimeError("SAM tracker manifest checksum changed in transfer")
+    manifest = json.loads(encoded.decode("utf-8"))
+    if manifest.get("schema") != "xta.sam-raw-tracker-run/1":
+        raise RuntimeError("SAM tracker returned an unsupported evidence schema")
+    return path, manifest
+
+
+def _validate_completion_manifest(manifest, prepared, device, *, require_cuda):
+    """Bind a worker's quiescence proof to its exact admitted request."""
+    if str(manifest.get("run_id")) != prepared.task.work_id:
+        raise RuntimeError("SAM raw evidence changed its immutable run identity")
+    expected_contract = {
+        "crop_xyxy": prepared.task.payload["crop_xyxy"],
+        "frame_range": [prepared.task.payload["frame_start"], prepared.task.payload["frame_stop"]],
+        "seed_frame": prepared.task.payload["seed_frame"],
+        "direction": prepared.task.payload["direction"],
+        "image_cache": _image_cache_summary(prepared.task.payload["image_cache"]),
+        "seed_artifact_sha256": prepared.task.payload["seed_sha256"],
+        "temporary_artifact_directory": str(prepared.output_directory),
+    }
+    if any(manifest.get(key) != value for key, value in expected_contract.items()):
+        raise RuntimeError("SAM raw evidence changed its immutable image/seed/geometry contract")
+    if manifest.get("request_metadata", {}) != prepared.task.payload["request_metadata"]:
+        raise RuntimeError("SAM raw evidence changed its immutable original-run/tile attribution")
+    if require_cuda:
+        proof = manifest.get('cuda_quiescence', {})
+        local_device = proof.get('worker_local_device')
+        logical_device = proof.get('execution_device_id')
+        if (proof.get('synchronized') is not True or type(local_device) is not int or local_device != 0
+                or type(logical_device) is not int or logical_device != device
+                or proof.get('run_id') != prepared.task.work_id):
+            raise RuntimeError('SAM completion lacks exact CUDA-quiescence/device/run proof')
+
+
 def load_tracker_run_result(
     manifest_path: Path, *, expected_sha256: str | None = None,
 ) -> SamTrackerRunResult:
     """Verify file-backed transfer and unpack complete attributable observations."""
 
-    path = Path(manifest_path).resolve(strict=True)
-    if expected_sha256 is not None and _sha256(path) != expected_sha256:
-        raise RuntimeError("SAM tracker manifest checksum changed in transfer")
-    manifest = json.loads(path.read_text(encoding="utf-8"))
-    if manifest.get("schema") != "xta.sam-raw-tracker-run/1":
-        raise RuntimeError("SAM tracker returned an unsupported evidence schema")
+    path, manifest = _read_tracker_manifest(manifest_path, expected_sha256=expected_sha256)
     packet = manifest["raw_masks"]
     artifact = Path(packet["path"]).resolve(strict=True)
     if artifact.parent != path.parent:
@@ -501,6 +536,8 @@ class SamInterpolationTracker:
         self.dispatch_stats = {
             "submitted": 0, "completed": 0, "peak_in_flight": 0,
             "affinity_hits": 0, "affinity_lends": 0, "wait_seconds": 0.0,
+            "completion_manifest_validation_seconds": 0.0,
+            "raw_transfer_decode_seconds": 0.0, "refilled_before_raw_transfer": 0,
         }
         self._source_cache_ref = None
         self._source_cache_retirement_proofs = {}
@@ -726,9 +763,12 @@ class SamInterpolationTracker:
         masks remain independently owned CPU arrays. Stable input indices retain
         attribution when consumers pack evidence in execution completion order.
 
-        Different scope iterators serialize only their GPU execution because the
-        worker pool has one result consumer. Each captures an immutable image
-        reference, allowing other scopes to plan/render/measure concurrently.
+        Different scope iterators serialize this entire iterator, including
+        result decoding and caller work between yields: the worker pool has one
+        result consumer. Immutable image references allow other scopes to plan
+        independently, but idle devices cannot borrow their jobs until this
+        scope drains. Quiescence validation permits refill within the active
+        scope before CPU raw-packet decoding.
         """
 
         from .lta_rendering import LtaPhysicalViewCacheRef
@@ -869,6 +909,7 @@ class SamInterpolationTracker:
                     self.dispatch_stats["family_active_peak"] = _family_dispatch.peak_active
                     self.dispatch_stats["family_assigned"] = _family_dispatch.assigned_families
                     self.dispatch_stats['family_execution_order'].append(prepared.input_index)
+                    _family_dispatch.execution_order.append(prepared.input_index)
                 return True
 
             while len(pending) < capacity and submit_next():
@@ -900,38 +941,36 @@ class SamInterpolationTracker:
                 artifact_path = Path(event.artifact_path).resolve(strict=True)
                 if artifact_path != prepared.output_directory.resolve(strict=True) / "manifest.json":
                     raise RuntimeError("SAM worker manifest escaped its assigned run staging directory")
-                result = load_tracker_run_result(
-                    artifact_path, expected_sha256=event.artifact_sha256,
-                )
-                if str(result.receipt.get("run_id")) != prepared.task.work_id:
-                    raise RuntimeError("SAM raw evidence changed its immutable run identity")
-                expected_contract = {
-                    "crop_xyxy": prepared.task.payload["crop_xyxy"],
-                    "frame_range": [prepared.task.payload["frame_start"], prepared.task.payload["frame_stop"]],
-                    "seed_frame": prepared.task.payload["seed_frame"],
-                    "direction": prepared.task.payload["direction"],
-                    "image_cache": _image_cache_summary(prepared.task.payload["image_cache"]),
-                    "seed_artifact_sha256": prepared.task.payload["seed_sha256"],
-                    "temporary_artifact_directory": str(prepared.output_directory),
-                }
-                if any(result.receipt.get(key) != value for key, value in expected_contract.items()):
-                    raise RuntimeError("SAM raw evidence changed its immutable image/seed/geometry contract")
-                if result.receipt.get("request_metadata", {}) != prepared.task.payload["request_metadata"]:
-                    raise RuntimeError("SAM raw evidence changed its immutable original-run/tile attribution")
                 if self._compute_lease_factory is not None:
-                    proof = result.receipt.get('cuda_quiescence', {})
-                    local_device = proof.get('worker_local_device')
-                    logical_device = proof.get('execution_device_id')
-                    if (proof.get('synchronized') is not True or type(local_device) is not int or local_device != 0
-                            or type(logical_device) is not int or logical_device != device
-                            or proof.get('run_id') != prepared.task.work_id):
-                        raise RuntimeError('SAM completion lacks exact CUDA-quiescence/device/run proof')
+                    # A checksum-verified, attributable CUDA receipt proves that
+                    # this worker is idle. Raw packet decompression is a CPU
+                    # publication check and need not delay the next GPU session.
+                    validation_started = time.perf_counter()
+                    _path, manifest = _read_tracker_manifest(
+                        artifact_path, expected_sha256=event.artifact_sha256)
+                    _validate_completion_manifest(manifest, prepared, device, require_cuda=True)
+                    self.dispatch_stats["completion_manifest_validation_seconds"] += (
+                        time.perf_counter() - validation_started)
+                    del manifest
                     lease = self._compute_leases.pop(identity)
                     self._compute_lease_release(lease)
                     free_devices.add(device)
                     if not defer_refill_until_consumed:
+                        submitted_before = self.dispatch_stats["submitted"]
                         while len(pending) < capacity and submit_next():
                             pass
+                        self.dispatch_stats["refilled_before_raw_transfer"] += (
+                            self.dispatch_stats["submitted"] - submitted_before)
+                transfer_started = time.perf_counter()
+                result = load_tracker_run_result(
+                    artifact_path, expected_sha256=event.artifact_sha256,
+                )
+                self.dispatch_stats["raw_transfer_decode_seconds"] += time.perf_counter() - transfer_started
+                # Recheck the manifest during transfer. No result becomes
+                # visible until its full raw packet and immutable attribution
+                # pass, even when its verified idle worker has been refilled.
+                _validate_completion_manifest(result.receipt, prepared, device,
+                    require_cuda=self._compute_lease_factory is not None)
                 lifetime = result.receipt.get('image_cache_lifetime', {})
                 cache_proof['all_gray_mappings_retired'] &= (
                     lifetime.get('gray_mapping_retired_after_render') is True)
@@ -1007,6 +1046,7 @@ class SamInterpolationTracker:
         self, families: Sequence[SamTrackerFamily], *,
         source_cache_ref: object | None = None, max_in_flight: int | None = None,
         defer_refill_until_consumed: bool = False, schedule: str = "fifo",
+        execution_order_callback: Callable[[tuple[int, ...]], object] | None = None,
     ) -> Iterator[tuple[int, SamTrackerRunResult]]:
         """Family-local dispatch, yielding immutable original indices.
 
@@ -1015,14 +1055,21 @@ class SamInterpolationTracker:
         families are exhausted, the final family tail can leave workers idle.
         LPT uses declared frame work only and is a diagnostic ordering option.
         Flat/tiled callers continue to use the existing ``iter_results`` path.
+        The optional callback receives this iterator's immutable submission
+        order after all results are consumed successfully. Scope provenance
+        must use this receipt rather than the shared diagnostic statistics.
         """
         if not isinstance(families, (tuple, list)):
             raise TypeError("SAM family inventory must be a finite metadata sequence")
+        if execution_order_callback is not None and not callable(execution_order_callback):
+            raise TypeError("SAM execution-order callback must be callable")
         dispatcher = _FamilyDispatch(families, schedule)
         capacity = len(self.device_ids) if max_in_flight is None else max_in_flight
         yield from self.iter_results((), source_cache_ref=source_cache_ref,
             max_in_flight=capacity, defer_refill_until_consumed=defer_refill_until_consumed,
             _family_dispatch=dispatcher)
+        if execution_order_callback is not None:
+            execution_order_callback(tuple(dispatcher.execution_order))
 
     def run(
         self, *, run_id: str, seed_mask: object, seed_frame: int,

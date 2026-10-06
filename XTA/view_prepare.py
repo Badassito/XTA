@@ -7,9 +7,12 @@ both can be exercised without extracting a closure from ``pipeline``.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import shutil
+import threading
+import weakref
 from dataclasses import dataclass, field
 from contextlib import contextmanager
 from pathlib import Path
@@ -18,9 +21,17 @@ from typing import Callable, Mapping
 import numpy as np
 
 from .config import GIB
-from .geometry import ViewInfo, physical_view_name
+from .geometry import ViewInfo, is_tilted_view, physical_view_name
 from .interpolation import NrrdLayerRef, PreparedViewResult, _DirectUnionBackingLease
-from .runtime import close_memmap_array_without_flush
+from .runtime import _interpolation_array_backing_path, close_memmap_array_without_flush
+
+
+def _array_lifetime_owner(array):
+    owner, seen = array, set()
+    while getattr(owner, 'base', None) is not None and id(owner) not in seen:
+        seen.add(id(owner))
+        owner = owner.base
+    return owner
 
 
 def scratch_unlink_path_for_memmap(arr: object, path: Path | None) -> Path | None:
@@ -74,6 +85,78 @@ class ComponentProjectionSubmitter:
         )
 
 
+@dataclass(frozen=True)
+class _SamPublicationSource:
+    shape: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _SamPublicationIdentity:
+    """Only publication metadata crosses threads; no live tracker or profile."""
+
+    detector_identity: str
+    bundle_identity: str
+    source_volume: _SamPublicationSource | None
+
+
+@dataclass
+class SamLayerProjectionSubmitter:
+    """Detach immutable SAM stores under the existing projection byte limits."""
+
+    queue: object
+    source_shape: tuple[int, int, int]
+    materialize_directional: Callable[..., NrrdLayerRef]
+    materialize_extrapolation: Callable[..., NrrdLayerRef]
+
+    def __call__(self, entry, *, layer_kind, **kwargs):
+        if layer_kind not in ('interpolation', 'extrapolation'):
+            raise ValueError(f'Unknown SAM publication kind: {layer_kind}')
+        entry = copy.deepcopy(dict(entry))
+        source = Path(str(entry['path']))
+        metadata = json.loads((source / 'meta.json').read_text(encoding='utf-8'))
+        native_shape = tuple(int(value) for value in metadata['shape'])
+        if len(native_shape) != 3 or min(native_shape) < 1:
+            raise ValueError('SAM publication requires a positive TYX store')
+        source_bytes = sum(path.stat().st_size for path in source.iterdir() if path.is_file())
+        view = kwargs['view']
+        target_shape = tuple(int(value) for value in self.source_shape)
+        target_bytes = math.prod(target_shape)
+        if int(entry.get('voxel_count', 0)) <= 0:
+            working_bytes = 64 * 1024**2
+        elif view.family == 'azimuthal':
+            packed_target_bytes = target_shape[0] * target_shape[1] * ((target_shape[2] + 7) // 8)
+            map_bound = 16 * max(
+                int(view.full_t) * int(view.full_h), int(view.full_t) * int(view.full_w),
+                int(view.full_h) * int(view.full_w), int(view.num_slices) * native_shape[2],
+                target_shape[0] * target_shape[1], target_shape[0] * target_shape[2],
+                target_shape[1] * target_shape[2],
+            )
+            working_bytes = packed_target_bytes + map_bound + GIB
+        elif (view.family == 'orthogonal' and not is_tilted_view(view)
+                and physical_view_name(view) == 'transverse'):
+            working_bytes = 256 * 1024**2
+        else:
+            # Sparse transpose or nonlinear source projection may own native
+            # decode and source outputs. Encoded input size cannot bound them.
+            working_bytes = 2 * math.prod(native_shape) + 2 * target_bytes + 4 * GIB
+        context = kwargs['sam_context']
+        processing_shape = getattr(getattr(context, 'source_volume', None), 'shape', None)
+        kwargs['sam_context'] = _SamPublicationIdentity(
+            detector_identity=str(context.detector_identity or ''),
+            bundle_identity=str(context.bundle_identity),
+            source_volume=(None if processing_shape is None else
+                           _SamPublicationSource(tuple(int(value) for value in processing_shape))),
+        )
+        materialize = (self.materialize_directional if layer_kind == 'interpolation'
+                       else self.materialize_extrapolation)
+        future = self.queue.submit(materialize, entry, source_bytes=int(source_bytes),
+                                   working_bytes=int(working_bytes), **kwargs)
+        # The scheduler may retire a completed parent's dense canvas before
+        # publication finishes, but only for these independent immutable inputs.
+        future._xta_dense_independent_publication_paths = (source,)
+        return future
+
+
 @dataclass
 class AdmittedViewPrepare:
     """A submitted parent prepare with all former closure inputs made explicit."""
@@ -120,6 +203,7 @@ class AdmittedViewPrepare:
     sam_base_allowance_bytes: int = 0
     confidence_retired_callback: Callable[[str, str, int], object] | None = None
     confidence_retired_callback_factory: Callable[[object], Callable] | None = None
+    submit_sam_layer_projection: Callable[..., object] | None = None
 
     def rebind_confidence_retirement(self, lease):
         if self.confidence_retired_callback_factory is not None:
@@ -168,7 +252,9 @@ class AdmittedViewPrepare:
                 # The prepare function owns confidence through capture only.
                 # Keeping a second task alias pinned its mmap until the much
                 # longer mask projection finished, even after capture retired it.
-                return self.prepare(
+                input_owner_ref = weakref.ref(_array_lifetime_owner(local_union_mm))
+                input_nbytes = int(np.asarray(local_union_mm).nbytes)
+                result = self.prepare(
                     model_name=str(self.model_name),
                     view=self.view,
                     union_mm=local_union_mm,
@@ -219,8 +305,14 @@ class AdmittedViewPrepare:
                         self.preinterpolation_layer_already_published
                     ),
                     submit_component_projection=self.submit_component_projection,
+                    submit_sam_layer_projection=self.submit_sam_layer_projection,
                     confidence_retired_callback=self.confidence_retired_callback,
                 )
+                # The scheduler needs no strong input alias. Its retirement
+                # fence still observes any producer/caller view of the backing.
+                result._dense_input_owner_ref = input_owner_ref
+                result._dense_input_nbytes = input_nbytes
+                return result
             except BaseException:
                 # The original/local dense mapping belongs to this reservation.
                 # Immutable component and tile support stores have other owners.
@@ -243,6 +335,84 @@ class ViewPrepareLeaseState:
     postprocess_views: set[tuple[str, str]]
     postprocess_bytes: dict[tuple[str, str], int]
     retired_inputs: set[tuple[tuple[str, str], int, str]] = field(default_factory=set)
+    retired_for_publication: set[tuple[str, str]] = field(default_factory=set)
+
+    def retire_dense_for_publication(self, prepared, *, enabled: bool, tiled: bool,
+                                    keep_temp: bool, retired_callback,
+                                    close_dense=close_memmap_array_without_flush) -> bool:
+        """Detach dense inputs; return admission only after their last owner dies."""
+        key = (str(prepared.model_name), str(prepared.view_name))
+        input_owner_ref = getattr(prepared, '_dense_input_owner_ref', None)
+        if (not enabled or tiled or keep_temp or key in self.retired_for_publication
+                or input_owner_ref is None
+                or not prepared.pending_component_layers
+                or prepared.parent_mask_support_mm is not None
+                or prepared.parent_bridge_support_mm is not None
+                or getattr(prepared, 'confidence', None) is not None
+                or any(getattr(ref, 'live_array', None) is not None for ref in prepared.nrrd_layers)):
+            return False
+        lease = self.leases.get(key)
+        if lease is not None:
+            if (lease.phase != 'postprocess' or key not in self.postprocess_views
+                    or self.postprocess_bytes.get(key) != lease.nbytes):
+                raise RuntimeError(f'dense publication {key} has no consistent postprocess owner')
+            if int(lease.nbytes) > int(prepared._dense_input_nbytes):
+                # A transferred confidence owner has not yet returned its
+                # separate credit; its still-live bytes cannot be released here.
+                return False
+        sources = []
+        for future in prepared.pending_component_layers:
+            paths = getattr(future, '_xta_dense_independent_publication_paths', ())
+            if not paths:
+                return False
+            sources.extend(Path(path).resolve() for path in paths)
+        arrays = []
+        for volume in (prepared.native_support_mm, prepared.final_view_volume_mm):
+            if volume is not None and all(volume is not prior for prior in arrays):
+                arrays.append(volume)
+        backings = [_interpolation_array_backing_path(volume) for volume in arrays]
+        if any(backing is not None and any(
+                Path(backing).resolve().is_relative_to(source) for source in sources)
+               for backing in backings):
+            # Never retire a dense file belonging to a queued input store.
+            return False
+        roots = []
+        original_owner = input_owner_ref()
+        if original_owner is not None:
+            roots.append(original_owner)
+        for volume in arrays:
+            owner = _array_lifetime_owner(volume)
+            if all(owner is not prior for prior in roots):
+                roots.append(owner)
+        for volume, backing in zip(arrays, backings):
+            close_dense(volume, unlink_path=(None if backing is None
+                or str(backing).startswith('/proc/') else Path(backing)))
+        prepared.native_support_mm = None
+        prepared.final_view_volume_mm = None
+        self.retired_for_publication.add(key)
+        if lease is None:
+            return False
+        if not roots:
+            return self.complete(key, retain_for_dense_retirement=False)
+        remaining, lock = [len(roots)], threading.Lock()
+
+        def retired():
+            with lock:
+                remaining[0] -= 1
+                completed = remaining[0] == 0
+            if completed:
+                retired_callback(key, lease)
+
+        for owner in roots:
+            finalizer = weakref.finalize(owner, retired)
+            finalizer.atexit = False
+        return False
+
+    def settle_publication_retirement(self, key, expected_lease) -> bool:
+        """Apply an owner-death receipt only on the scheduler state thread."""
+        if key not in self.retired_for_publication or self.leases.get(key) is not expected_lease:
+            return False
+        return self.complete(key, retain_for_dense_retirement=False)
 
     def handoff(self, key: tuple[str, str]) -> bool:
         lease = self.leases.get(key)

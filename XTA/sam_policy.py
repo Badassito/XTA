@@ -1507,8 +1507,9 @@ def _measure_group_intrinsic(bundle, group, run_ids, mask_filter, execution, *, 
                     active_charge -= charges[key]
                     execution["parallel_run_count"] += 1
                     for name in ("mask_decodes", "filter_computations", "effective_candidate_computations",
-                                 "cache_hits", "cache_misses", "cache_evictions"):
-                        execution["reader_totals"][name] += int(stats[name])
+                                 "cache_hits", "cache_misses", "cache_evictions",
+                                 "compact_filter_expansions", "compact_filter_parent_hits", "compact_filter_parent_exports"):
+                        execution["reader_totals"][name] += int(stats.get(name, 0))
                 submit_available()
         except BaseException:
             for future in pending.values():
@@ -1615,7 +1616,8 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
         serial_group_count=0, parallel_run_count=0, oversized_serial_runs=0,
         maximum_run_charge_bytes=0, wall_seconds=0., serial_reasons={},
         reader_totals={name: 0 for name in ("mask_decodes", "filter_computations",
-            "effective_candidate_computations", "cache_hits", "cache_misses", "cache_evictions")})
+            "effective_candidate_computations", "cache_hits", "cache_misses", "cache_evictions",
+            "compact_filter_expansions", "compact_filter_parent_hits", "compact_filter_parent_exports")})
     selection_resources["intrinsic_measurements"] = execution
     if resolved["branch_aware_selection"]:
         execution["branch_metadata"] = dict(

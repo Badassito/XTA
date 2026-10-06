@@ -3,7 +3,7 @@
 The component-filter implementation remains unchanged. First reads retain its
 validation, source guards and exact measurements; repeat reads reuse immutable
 products. Payload and loaded-source identity are checked before and after each
-transaction. No cache survives its reader or crosses evidence attempts.
+transaction. No cache survives its owning outer transaction or crosses evidence attempts.
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from collections.abc import Mapping
 import hashlib
 import json
 from pathlib import Path
+import struct
 import threading
 
 import numpy as np
@@ -81,13 +82,16 @@ def _charge(value):
 
 
 class SamMaskReader:
-    """One payload handle and a byte-bounded LRU of raw/effective products.
+    """One payload handle and byte-bounded raw/compact product LRUs.
 
     Arrays are bytes-backed and read-only. Eviction retires cache ownership;
     arrays already returned to callers remain valid. Filter measurements are
     copied on return, so callers cannot mutate another measurement or the cache.
     Mutable receipts are revalidated on every external access. Internal callers
     may bind a validated immutable ``filter_snapshot`` once per transaction.
+    Up to half the total allowance preserves packed effective support and
+    diagnostics across intrinsic lanes and ordered qualification. Other products
+    can borrow unused compact capacity; their churn never evicts filter results.
     """
 
     def __init__(self, bundle, *, max_cache_bytes=DEFAULT_CACHE_BYTES):
@@ -98,6 +102,8 @@ class SamMaskReader:
         self.bundle = bundle
         self.max_cache_bytes = int(max_cache_bytes)
         self._cache = OrderedDict()
+        self._compact_cache = OrderedDict()
+        self._compact_cache_limit = self.max_cache_bytes//2
         self._lock = threading.RLock()
         self._stream = None
         self._active = False
@@ -109,6 +115,9 @@ class SamMaskReader:
             cache_hits=0, cache_misses=0, cache_evictions=0, oversized_products=0,
             mask_decodes=0, filter_computations=0, effective_candidate_computations=0,
             packed_boundary_contact_scans=0,
+            compact_filter_expansions=0, compact_filter_parent_hits=0,
+            compact_filter_parent_exports=0,
+            compact_cache_bytes=0, peak_compact_cache_bytes=0,
             filter_spec_validations=0, integrity_checks=0, transaction_complete=False,
             implementation_sha256=IMPLEMENTATION_SHA256)
 
@@ -172,7 +181,9 @@ class SamMaskReader:
                     self._stream.close()
                     self._stream = None
                 self._cache.clear()
+                self._compact_cache.clear()
                 self._stats["cache_bytes"] = 0
+                self._stats["compact_cache_bytes"] = 0
                 self._active = False
                 self._closed = True
                 if self._integrity_parent is not None:
@@ -212,25 +223,65 @@ class SamMaskReader:
     def _product(self, key, create):
         with self._lock:
             self._require_active()
-            if key in self._cache:
+            cache = self._compact_cache if key[0] == 'compact_effective_raw' else self._cache
+            if key in cache:
                 self._stats["cache_hits"] += 1
-                value, charge = self._cache.pop(key)
-                self._cache[key] = value, charge
+                value, charge = cache.pop(key)
+                cache[key] = value, charge
                 return value
             self._stats["cache_misses"] += 1
             value = create()
-            charge = _charge(value)
-            if charge > self.max_cache_bytes:
-                self._stats["oversized_products"] += 1
-                return value
-            while self._cache and self._stats["cache_bytes"] + charge > self.max_cache_bytes:
-                _, (_, retired_charge) = self._cache.popitem(last=False)
-                self._stats["cache_bytes"] -= retired_charge
-                self._stats["cache_evictions"] += 1
-            self._cache[key] = value, charge
-            self._stats["cache_bytes"] += charge
-            self._stats["peak_cache_bytes"] = max(self._stats["peak_cache_bytes"], self._stats["cache_bytes"])
+            self._remember_product(key, value)
             return value
+
+    def _cached_product(self, key):
+        """Borrow an immutable cached value without doing work under this lock."""
+        with self._lock:
+            self._require_active()
+            cache = self._compact_cache if key[0] == 'compact_effective_raw' else self._cache
+            if key not in cache:
+                return None
+            self._stats["cache_hits"] += 1
+            value, charge = cache.pop(key)
+            cache[key] = value, charge
+            return value
+
+    def _remember_product(self, key, value):
+        """Share immutable products within this reader's existing byte allowance."""
+        with self._lock:
+            self._require_active()
+            compact = key[0] == 'compact_effective_raw'
+            cache = self._compact_cache if compact else self._cache
+            if key in cache:
+                return True
+            charge = _charge(value)
+            limit = self._compact_cache_limit if compact else self.max_cache_bytes-self._stats['compact_cache_bytes']
+            if charge > limit:
+                self._stats["oversized_products"] += 1
+                return False
+            owned = self._stats['compact_cache_bytes'] if compact else self._stats['cache_bytes']-self._stats['compact_cache_bytes']
+            while cache and owned+charge > limit:
+                _, (_, retired_charge) = cache.popitem(last=False)
+                owned -= retired_charge
+                self._stats["cache_bytes"] -= retired_charge
+                if compact:
+                    self._stats['compact_cache_bytes'] -= retired_charge
+                self._stats["cache_evictions"] += 1
+            # Ordinary products may borrow currently unused compact capacity.
+            # Reclaim that loan before a compact insertion, without allowing
+            # ordinary churn to retire expensive filtered products.
+            while compact and self._cache and self._stats['cache_bytes']+charge > self.max_cache_bytes:
+                _, (_, retired_charge) = self._cache.popitem(last=False)
+                self._stats['cache_bytes'] -= retired_charge
+                self._stats['cache_evictions'] += 1
+            cache[key] = value, charge
+            self._stats["cache_bytes"] += charge
+            if compact:
+                self._stats['compact_cache_bytes'] += charge
+                self._stats['peak_compact_cache_bytes'] = max(
+                    self._stats['peak_compact_cache_bytes'], self._stats['compact_cache_bytes'])
+            self._stats["peak_cache_bytes"] = max(self._stats["peak_cache_bytes"], self._stats["cache_bytes"])
+            return True
 
     def mask(self, key):
         key = str(key)
@@ -331,7 +382,8 @@ class SamMaskReader:
                 snapshot = value['mask_filter']
                 if snapshot.owner is not self._identity:
                     raise ValueError('SAM filter snapshots belong to one reader transaction')
-                if value.get('resolved_policy', {}).get('version') in (6, 7) and snapshot.branch_selection is None:
+                from .sam_branch_selection import branch_selection_required
+                if branch_selection_required(value) and snapshot.branch_selection is None:
                     raise ValueError('SAM branch-aware support requires its retained branch selection recipe')
                 if snapshot.branch_selection is not None and set(value.get('selected_run_ids', ())) - set(snapshot.branch_selection['selected_edge_ids_by_run']):
                     raise ValueError('SAM branch selection differs from its selected contributors')
@@ -395,6 +447,9 @@ class SamMaskReader:
             if snapshot.owner is not self._identity:
                 raise ValueError('SAM filter snapshots belong to one reader transaction')
             if 'branch_selection' not in value:
+                from .sam_branch_selection import branch_selection_required
+                if branch_selection_required(value) and snapshot.branch_selection is None:
+                    raise ValueError('SAM branch-aware support requires its retained branch selection recipe')
                 return snapshot.branch_selection
         elif isinstance(value, _FilterSnapshot):
             if value.owner is not self._identity:
@@ -417,13 +472,38 @@ class SamMaskReader:
 
     def _effective_product(self, run_id, frame, spec):
         identity = "legacy_unfiltered" if spec is None else str(spec["sha256"])
-        key = ("effective_raw", self.evidence_fingerprint, identity, str(run_id), int(frame))
+        key = ("compact_effective_raw", self.evidence_fingerprint, identity, str(run_id), int(frame))
         def calculate():
+            parent = self._integrity_parent
+            if parent is not None:
+                cached = parent._cached_product(key)
+                if cached is not None:
+                    self._stats["compact_filter_parent_hits"] += 1
+                    return cached
             self._stats["filter_computations"] += 1
             mask, measurements = _filtering.measure_effective_raw_mask(self, run_id, frame, spec)
             encoded = json.dumps(measurements, separators=(",", ":"), allow_nan=False).encode("utf-8")
-            return mask, encoded
-        return self._product(key, calculate)
+            compact = (struct.pack('<QQ', *mask.shape)
+                + np.packbits(mask.reshape(-1), bitorder="little").tobytes(), encoded)
+            if parent is not None:
+                # The parent cache was charged before intrinsic lane admission.
+                # Lanes compute privately; only immutable insertion holds its
+                # lock. Finished lanes can retire without discarding this work.
+                if parent._remember_product(key, compact):
+                    self._stats["compact_filter_parent_exports"] += 1
+            return compact
+        packed, encoded = self._product(key, calculate)
+        record = self.records[self.runs[str(run_id)]["raw_mask_keys"][str(int(frame))]]
+        shape = tuple(record["shape"])
+        if len(packed) < 16 or struct.unpack_from('<QQ', packed) != shape:
+            raise ValueError('SAM compact filter product differs from its authenticated raw shape')
+        pixels = int(np.prod(shape))
+        if len(packed) != 16+(pixels+7)//8:
+            raise ValueError('SAM compact filter product has malformed packed bounds')
+        unpacked = np.unpackbits(np.frombuffer(packed, dtype=np.uint8, offset=16), count=pixels, bitorder="little")
+        self._stats["compact_filter_expansions"] += 1
+        mask = np.frombuffer(unpacked.tobytes(), dtype=np.bool_).reshape(shape)
+        return mask, encoded
 
     def measure_effective_raw_mask(self, run_id, frame, value=None):
         spec = self._filter_spec(value)

@@ -495,10 +495,14 @@ class PredictionAccumulationHandle:
     def wait(self) -> Dict[str, int]:
         prediction_count = int(self.precompleted_prediction_count)
         frames_with_predictions = int(self.precompleted_frames_with_predictions)
-        for fut in as_completed(list(self.futures)):
-            pred_inc, frame_inc = fut.result()
-            prediction_count += int(pred_inc)
-            frames_with_predictions += int(frame_inc)
+        try:
+            for fut in as_completed(list(self.futures)):
+                pred_inc, frame_inc = fut.result()
+                prediction_count += int(pred_inc)
+                frames_with_predictions += int(frame_inc)
+        except BaseException:
+            _settle_parallel_futures(self.futures)
+            raise
         return {
             'prediction_count': int(prediction_count),
             'frames_with_predictions': int(frames_with_predictions),
@@ -507,6 +511,37 @@ class PredictionAccumulationHandle:
             'azimuthal_padding_processed': int(self.azimuthal_padding_processed),
             'async_accumulation': 1,
         }
+
+class _PredictionResultCoverage:
+    """Require every logical frame before publishing a generic prediction task."""
+
+    def __init__(self, source_label: str, num_frames: int, padding_count: int) -> None:
+        self.source_label = str(source_label)
+        self.seen = bytearray(max(0, int(num_frames)))
+        self.real_count = 0
+        self.padding_count = 0
+        self.expected_padding = max(0, int(padding_count))
+
+    def add(self, spec: BatchResultFrameSpec) -> None:
+        if spec.is_azimuthal_padding:
+            self.padding_count += 1
+            return
+        index = int(spec.task_index)
+        if not 0 <= index < len(self.seen) or self.seen[index]:
+            raise RuntimeError(
+                f'{self.source_label}: prediction stream returned an invalid or duplicate '
+                f'logical frame {index} for {len(self.seen)} frames'
+            )
+        self.seen[index] = 1
+        self.real_count += 1
+
+    def validate(self) -> None:
+        if self.real_count != len(self.seen) or self.padding_count != self.expected_padding:
+            raise RuntimeError(
+                f'{self.source_label}: incomplete prediction stream: received '
+                f'{self.real_count}/{len(self.seen)} logical frames and '
+                f'{self.padding_count}/{self.expected_padding} azimuthal padding frames'
+            )
 
 DEFAULT_GAUSSIAN_SMOOTHING_SIGMA = 3.0
 
@@ -1151,8 +1186,10 @@ def _build_gpu_flattened_payload_from_proto(pred: object, img: object, proto: ob
  Instead of letting Ultralytics materialize the (n, imgsz, imgsz) float retina stack that the
  pipeline immediately reduces to one plane, the per-instance mask logits are combined from
  the protos, box-cropped at proto scale, reduced with a single max-logit plane, and ONE plane
- is bilinearly upsampled to the network raster and thresholded at 0 (union(bilinear(l_i)>0)
- becomes bilinear(max_i l_i)>0 — identical away from instance box edges, sub-voxel there).
+ is bilinearly upsampled to the network raster and thresholded at 0. This is an approximation:
+ interpolation and instance maximum do not commute. Neighboring instance logits can create
+ foreground bridges that per-instance retina interpolation would leave empty, including away
+ from box edges. Native-grid scaling can magnify these differences.
  Instance-level --min_conf (angle-variant fast path) and the optional per-pixel max-confidence
  plane are applied at proto resolution. Returns None on any unexpected condition so the
  caller falls back to the unpatched Ultralytics path."""
@@ -2639,8 +2676,11 @@ def _process_gpu_flattened_prediction_frame(
         try:
             import torch  # type: ignore
             frame_union = np.ascontiguousarray((union_gpu.detach().cpu().numpy() > 0).astype(np.uint8))
-        except Exception:
-            return int(instance_count), 0
+        except Exception as exc:
+            raise RuntimeError(
+                f'Prediction frame {int(idx)} could not be accumulated on the GPU '
+                'or recovered through the CPU mask fallback'
+            ) from exc
         if int(frame_union.shape[0]) != int(out_size) or int(frame_union.shape[1]) != int(out_size):
             frame_union = cv2.resize(frame_union, (int(out_size), int(out_size)), interpolation=cv2.INTER_NEAREST)
         native_union_np = cv2.warpAffine(
@@ -4322,6 +4362,7 @@ def predict_source_and_accumulate(
             )
 
         source_padding_count = max(0, int(getattr(source, 'azimuthal_padding_count', 0) or 0))
+        result_coverage = _PredictionResultCoverage(source_label, num_frames, source_padding_count)
         effective_slice_locks = slice_locks
         if effective_slice_locks is None and source_padding_count > 0:
             effective_slice_locks = [
@@ -4440,6 +4481,7 @@ def predict_source_and_accumulate(
                 spec = prediction_result_frame_spec(source, int(idx), num_frames=int(num_frames))
                 if spec is None:
                     continue
+                result_coverage.add(spec)
                 azimuthal_padding_processed += int(bool(spec.is_azimuthal_padding))
                 masks_np, confs_np = _extract_result_masks_and_confs(r)
                 pred_inc, frame_inc = _process_prediction_unit(spec, masks_np, confs_np)
@@ -4454,6 +4496,7 @@ def predict_source_and_accumulate(
                     spec = prediction_result_frame_spec(source, int(idx), num_frames=int(num_frames))
                     if spec is None:
                         continue
+                    result_coverage.add(spec)
                     azimuthal_padding_processed += int(bool(spec.is_azimuthal_padding))
 
                     if gpu_flatten_eager:
@@ -4479,6 +4522,9 @@ def predict_source_and_accumulate(
             finally:
                 _settle_parallel_futures(pending)
                 _release_parallel_pool(worker_count, executor)
+
+        if specialized_stats is None and semantic_ring_stats is None:
+            result_coverage.validate()
 
         # Keep the inference handoff to one producer-stream seal. Device counts and slice
         # metadata are consumed on the retirement lane from the same D2H chunks that commit
@@ -4760,6 +4806,7 @@ def predict_source_and_submit_accumulation(
         semantic_gpu_path = _semantic_gpu_path_available(cfg, source, stream_min_radius)
 
         source_padding_count = max(0, int(getattr(source, 'azimuthal_padding_count', 0) or 0))
+        result_coverage = _PredictionResultCoverage(source_label, num_frames, source_padding_count)
         effective_slice_locks = slice_locks
         if effective_slice_locks is None and source_padding_count > 0:
             effective_slice_locks = [
@@ -4865,26 +4912,34 @@ def predict_source_and_submit_accumulation(
                 precompleted_prediction_count += int(pred_inc)
                 precompleted_frames_with_predictions += int(frame_inc)
 
-        for idx, r in enumerate(results):
-            spec = prediction_result_frame_spec(source, int(idx), num_frames=int(num_frames))
-            if spec is None:
-                synthetic_discarded += 1
-                continue
-            if spec.is_azimuthal_padding:
-                azimuthal_padding_processed += 1
-            else:
-                submitted_frames += 1
-            if gpu_flatten_eager:
-                masks_np, confs_np = _extract_result_masks_and_confs(r)
-                try:
-                    del r
-                except Exception:
-                    pass
-                futures.append(postprocess_executor.submit(_process_prediction_unit, spec, masks_np, confs_np))
-            else:
-                futures.append(postprocess_executor.submit(_extract_and_process_result, spec, r))
-            while int(pending_limit) > 0 and len(futures) >= int(pending_limit):
-                _join_one_pending()
+        try:
+            for idx, r in enumerate(results):
+                spec = prediction_result_frame_spec(source, int(idx), num_frames=int(num_frames))
+                if spec is None:
+                    synthetic_discarded += 1
+                    continue
+                result_coverage.add(spec)
+                if spec.is_azimuthal_padding:
+                    azimuthal_padding_processed += 1
+                else:
+                    submitted_frames += 1
+                if gpu_flatten_eager:
+                    masks_np, confs_np = _extract_result_masks_and_confs(r)
+                    try:
+                        del r
+                    except Exception:
+                        pass
+                    futures.append(postprocess_executor.submit(_process_prediction_unit, spec, masks_np, confs_np))
+                else:
+                    futures.append(postprocess_executor.submit(_extract_and_process_result, spec, r))
+                while int(pending_limit) > 0 and len(futures) >= int(pending_limit):
+                    _join_one_pending()
+            result_coverage.validate()
+        except BaseException:
+            # The caller may close/release destination arrays immediately on error.
+            # Settle our writes before returning control, as the synchronous path does.
+            _settle_parallel_futures(futures)
+            raise
 
         return PredictionAccumulationHandle(
             source_label=str(source_label),

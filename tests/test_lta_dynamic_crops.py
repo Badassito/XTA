@@ -262,7 +262,6 @@ class DynamicCropTests(unittest.TestCase):
         self.assertEqual(outputs[0], outputs[1])
 
     def test_worker_scaled_context_injects_model_masks_and_returns_native_dogfood(self):
-        from PIL import Image
         from XTA.lta_propagation import LtaObjectPrediction, LtaPropagationResult, write_seed_artifact
         from XTA.lta_sam import SamFramePrediction
         from XTA.lta_union_artifacts import read_union_array
@@ -276,8 +275,13 @@ class DynamicCropTests(unittest.TestCase):
                         physical_view_id="transverse", source_identity="fixture")
             tile = TilePlan(0, 0, 1764, 1764, 1764)
             item = obj(frame=0, top=350, left=500, mask=np.ones((500, 450), dtype=bool))
-            seed = item.in_crop(tile, object_id=0)
-            artifact = write_seed_artifact(root / "seed.npz", (seed,))
+            irregular = np.eye(150, 120, dtype=bool)
+            irregular[30:110, 20:100] = True
+            peer = obj(frame=0, top=1200, left=1300, mask=irregular)
+            peer = replace(peer, seed=replace(peer.seed,
+                lineage=replace(peer.seed.lineage, lineage_id="irregular-peer")))
+            seeds = tuple(value.in_crop(tile, object_id=index) for index, value in enumerate((item, peer)))
+            artifact = write_seed_artifact(root / "seed.npz", seeds)
             window = WindowPlan("center", 0, 0, 3, 0, "both", "authoritative")
             payload = {"work_id": "scaled", "chain_work_id": "scaled", "sequence_id": "fixture",
                        "cache_ref": cache.payload(), "tile_index": 0, "tile_config_id": "dynamic",
@@ -289,31 +293,47 @@ class DynamicCropTests(unittest.TestCase):
                        "output_dir": str(root / "output")}
             context = SimpleNamespace(predictor=object(), profile={"name": "fixture"},
                                       sam_runtime={"version": "controlled"}, constrained_batches=None)
-            expected = resize_crop_mask(seed.mask)
+            expected = {seed.lineage: resize_crop_mask(seed.mask) for seed in seeds}
             def propagate(_a, _b, *, resource, request, prediction_callback, **_kwargs):
                 self.assertIsInstance(resource, list)
                 self.assertEqual(len(resource), 3)
                 self.assertEqual(np.asarray(resource[0]).shape, (1008, 1008, 3))
-                np.testing.assert_array_equal(request.seeds[0].mask, expected)
-                for frame in range(3):
-                    prediction_callback(LtaObjectPrediction(seed.lineage, SamFramePrediction(
-                        request.session.sequence_id, request.session.session_index, frame, 0, 1.0,
-                        expected, 0.9), 0, seed.provenance))
-                boundary = replace(request.seeds[0], frame_index=2)
-                return LtaPropagationResult(request, (), (boundary,),
+                self.assertTrue(resource.source_cache_mapping_retired)
+                self.assertEqual(len(request.seeds), 2)
+                for seed in request.seeds:
+                    np.testing.assert_array_equal(seed.mask, expected[seed.lineage])
+                    for frame in range(3):
+                        prediction_callback(LtaObjectPrediction(seed.lineage, SamFramePrediction(
+                            request.session.sequence_id, request.session.session_index, frame, seed.object_id, 1.0,
+                            expected[seed.lineage], 0.9), 0, seed.provenance))
+                boundary = tuple(replace(seed, frame_index=2) for seed in request.seeds)
+                return LtaPropagationResult(request, (), boundary,
                                              {"model_visited_frame_ranges": [[0, 3]]}, 0)
-            frames = [Image.fromarray(np.zeros((1764, 1764, 3), dtype=np.uint8)) for _ in range(3)]
-            with mock.patch("XTA.lta_rendering.render_native_tile_window", return_value=frames), \
-                    mock.patch("XTA.lta_propagation.run_mask_injected_session", side_effect=propagate):
+            with mock.patch("XTA.lta_propagation.run_mask_injected_session", side_effect=propagate):
                 result = execute_worker_task(context, "propagation_window", payload)
             manifest = json.loads(Path(result["artifact_path"]).read_text())
             union = read_union_array(manifest["union"])
-            restored = resize_crop_mask(expected, side=1764, restore=True)
+            restored_masks = {lineage: resize_crop_mask(mask, side=1764, restore=True)
+                              for lineage, mask in expected.items()}
+            restored = np.logical_or.reduce(tuple(restored_masks.values()))
             self.assertEqual(union.shape, (3, 1764, 1764))
             np.testing.assert_array_equal(union[1], restored)
             dogfood = read_seed_artifact(manifest["dogfood_seed_artifacts"][0]["path"])
-            np.testing.assert_array_equal(dogfood[0].mask, restored)
+            self.assertEqual(len(dogfood), 2)
+            for seed in dogfood:
+                np.testing.assert_array_equal(seed.mask, restored_masks[seed.lineage])
             self.assertEqual(manifest["crop_transform"]["prediction_and_dogfood_coordinates"], "native_crop")
+            # A subpixel seed cannot be certified as a successful empty run
+            # when area downsampling removes all of its model-space support.
+            tiny = obj(frame=0, top=800, left=800, mask=np.ones((1, 1), dtype=bool))
+            tiny_artifact = write_seed_artifact(root / "tiny-seed.npz", (tiny.in_crop(tile, object_id=0),))
+            tiny_payload = {**payload, "seed_artifact_path": str(tiny_artifact.path),
+                "seed_artifact_sha256": tiny_artifact.sha256, "output_dir": str(root / "tiny-output")}
+            with mock.patch("XTA.lta_propagation.run_mask_injected_session") as tracker:
+                with self.assertRaisesRegex(ValueError, "seed mask must contain foreground"):
+                    execute_worker_task(context, "propagation_window", tiny_payload)
+            tracker.assert_not_called()
+            self.assertFalse((root / "tiny-output" / "manifest.json").exists())
 
 
 if __name__ == "__main__":

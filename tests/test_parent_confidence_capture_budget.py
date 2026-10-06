@@ -8,6 +8,7 @@ import pytest
 
 from XTA import confidence_evidence, pipeline
 from XTA.config import GIB
+from XTA.interpolation import PreparedViewResult
 from tests.test_sam_parent_staging_pipeline import submission
 
 
@@ -80,6 +81,7 @@ def test_submitted_capture_scope_runs_inside_exact_parent_reservation(tmp_path):
     ns['parent_slice_postprocess_workers'] = 32
     ns['interpolation_settings'].backend = 'sdf'
     plan, events = SimpleNamespace(workspace_bytes=123456), []
+    prepared = PreparedViewResult('model', view.name, '0', 0., None, None, [])
     ns['_parent_confidence_capture_plan'] = mock.Mock(return_value=plan)
     @contextmanager
     def reserve(nbytes, _description):
@@ -100,7 +102,7 @@ def test_submitted_capture_scope_runs_inside_exact_parent_reservation(tmp_path):
         assert kwargs['confmap_mm'] is None
         assert kwargs['confidence_owner'].pop().shape == (3, 4, 5)
         events.append(('prepare', 32))
-        return 'prepared'
+        return prepared
     ns['parent_transient_admission'] = SimpleNamespace(reserve=reserve)
     ns['prepare_view_volume_after_fullframe'] = prepare
     function('model', view)
@@ -108,7 +110,7 @@ def test_submitted_capture_scope_runs_inside_exact_parent_reservation(tmp_path):
     ns['_parent_confidence_capture_plan'].assert_called_once_with((3, 4, 5), 32, enabled=True)
     assert task.transient_bytes == 2*60+4*GIB+plan.workspace_bytes
     with mock.patch.object(confidence_evidence, 'confidence_capture_resources', scope, create=True):
-        assert task() == 'prepared'
+        assert task() is prepared
     assert events == [('reserve', task.transient_bytes), ('scope', 123456),
                       ('prepare', 32), ('scope_end', 123456), ('release', task.transient_bytes)]
     assert key in ns['view_processing_submitted']

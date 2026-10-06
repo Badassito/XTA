@@ -7,6 +7,11 @@ experiments, and release history live outside this repository in the workspace's
 `Scratch/Data/XTA/History`. Those local experiment files are not
 part of an installed package or source bundle.
 
+Historical labels use the numbering recorded when the evidence was created.
+Before comparing them with current releases, consult the
+[release identity map](../Scratch/Data/XTA/History/release/version_migrations.json) and
+[interpretation rules](../Scratch/Data/XTA/History/release/README.md#historical-release-identities).
+
 ## Entry points and shared contracts
 
 The versioned SLURM launcher, the installed `xta` command, and
@@ -215,6 +220,22 @@ private two-context TensorRT ring; the instance pipeline retains its separate
 inference path. GPU failures after a partially consumed task abort it rather
 than replaying writes.
 
+GPU instance-mask composition uses a deliberate approximation: it reduces
+instance logits with a maximum on the prototype grid before interpolation.
+Interpolation and that maximum do not commute. The result can add foreground
+between neighboring instances even away from box boundaries; native-grid
+restoration can enlarge the difference. Coverage qualification proves the
+projection of the accepted canvas, not equivalence to per-instance retina
+masks. Quality changes to this reduction need a separate mask-level comparison
+and end-to-end timing. Disabling direct prediction does not select an exact
+GPU alternative.
+
+Generic prediction consumers require every logical frame and declared angular
+padding frame before reporting completion. Missing or duplicate logical results
+abort the task, and asynchronous failure drains pending destination writes.
+If both GPU accumulation and CPU mask recovery fail, the frame is an error
+rather than a successful empty prediction.
+
 TTA augmentation runs each policy pass independently and records the policy
 snapshot. Each pass owns its result and inverse-validity support; passes
 contribute to the terminal union while interpolation uses the base pass.
@@ -382,12 +403,35 @@ over bounded spatial slabs and scatter only requested frames. Native planes,
 outputs and exact remap intermediates share admitted workspace; existing
 materialized, cached and unsupported routes retain their original sampler.
 
+Independent image-cache builds run as private transactions on their admitting
+parent threads. Registry locks cover lookup, ownership and publication rather
+than pixel rendering or worker-retirement waits. At most two builders run;
+distinct live parent profiles can fund their own image and render reservations,
+while uncredited callers share the existing aggregate allowance. Identical
+demand joins one builder. Donor pins and per-invocation cohort claims prevent
+retirement races; cancellation and close settle creators, waiters and consumers
+before releasing sources. Canonical pixels and per-descriptor limits are unchanged.
+
 Extrapolation plans complete original groups before splitting image demand into
 bounded cohorts. The full frozen baseline, one writer, predictor pool and global
-retry budgets remain shared. Per-frame observation indexes avoid repeated scans
-of unrelated frames. Detached RGB input and completed worker/result barriers
+retry budgets remain shared. Immutable frame and observation-ID indexes avoid
+repeated scans of unrelated observations. Detached RGB input and completed worker/result barriers
 precede retirement of a cohort's owned gray backing; borrowed/shared sources are
 protected. A planned group that cannot fit alone fails admission explicitly.
+Native extrapolation publication authenticates one immutable owner index and
+visits each active native frame once for both directions and their union count.
+Receipt/evidence checks still bracket the transaction; standalone plane helpers
+remain independently validating. Index admission and a bounded fallback retain
+valid work when credit is tight. Failed paired publication retracts both stores.
+
+Fullframe selected SAM source projection/publication uses the existing bounded
+component queue. Frozen metadata and immutable CVOL paths cross that boundary;
+live model contexts, source arrays and thread-owned profiles do not. Terminal
+output waits for every required child reference. Non-tiled parents without
+retained debug arrays can return redundant dense credit before those children
+finish, but only after actual original/result allocation or mmap owners die.
+Scheduler-owned retirement receipts fence aliases and outstanding confidence
+credit. Tiles retain their synchronous publication path.
 
 Shared detector/SAM devices require successful detector asset retirement;
 entirely separate SAM devices and CPU detector routes acquire independently.
@@ -427,6 +471,11 @@ model/source/transform/precision identity and headroom admission. It accounts
 shared tensor storage and never reuses tracker state. `sam_mask_reader` retains
 bounded immutable mask/measurement products within one verified evidence
 transaction. Owners close on success, cancellation, or infrastructure failure.
+Intrinsic readers share packed effective-mask products with the outer reader
+inside its existing cache allowance. Ordinary products borrow unused compact
+capacity; pressure causes recomputation without changing filtering or topology.
+Family execution provenance comes from an iterator-owned immutable receipt,
+not another scope's shared runtime counters.
 Extrapolation groups exact image/crop requests within existing bounded batches,
 subject to the frame-work balance guard and explicit flat backout. Whole-crop
 retry contacts use authenticated packed-bit edge counts and full foreground
@@ -446,8 +495,10 @@ Gate-support fingerprints preserve dependency lineage for later replay.
 Fixed-proposal replay requires no inference, but an upstream parent selection
 change may invalidate downstream tile admission and planning. Changed inputs
 require explicit regeneration or a labelled frozen-evidence comparison. The
-append-only release inventory authenticates source changes; it is separate
-from workload qualification and measured quality.
+current-source inventory detects file-set and byte drift; the enclosing Git
+commit or complete-source archive binds that record. Historical source reviews
+live in History. Source identity is separate from workload qualification and
+measured quality.
 
 The paired crop-strategy tools under `tools/` compare whole-native-crop resizing
 with independently seeded overlapping tiles. They preserve matched source and
@@ -683,10 +734,18 @@ long Windows paths. Future NRRD basenames are capped at 120 characters while ful
 labels, colors and provenance remain in headers/manifests. See
 [run transfer](docs/run_transport.md) for packing, verification and recovery.
 
-Release qualification runs the full suite from the repository root before
-inventory verification and source-bundle construction:
+After reviewing and freezing source, replace the single current-source inventory;
+it records all maintained files, not another version-specific statement history.
+NUL-free UTF-8 text hashes normalize CRLF to LF for checkout portability, while
+raw before/after checks still detect byte changes during verification. Binary
+bytes stay exact. The inventory excludes its own digest; Git and the complete
+source manifest cover that file too.
+
+Release qualification checks numbering before GPU work, then runs the full suite
+from the repository root before inventory verification and source-bundle construction:
 
 ```powershell
+python -B tools/prepare_reconciliation_release.py --output-dir ../Scratch/Releases/REVIEW_NAME/inventory --write
 python -B tools/qualify_release.py --output-dir ../Scratch/Releases/REVIEW_NAME/qualification
 ```
 
@@ -697,5 +756,9 @@ the receipt and logs stay in the requested Scratch directory. Tests establish
 Ultralytics settings outside the checkout and check for leaked dependency stubs
 and TF32 settings. CUDA tests share the workspace's atomic `Scratch/Temp/GPU_LOCK`.
 The gate requires an available CUDA device and successful execution of the
-CUDA geometry/policy cases that exposed the TF32 leak. `--snapshot --cpu-only`
+CUDA geometry/policy cases that exposed the TF32 leak, plus independent
+Cartesian, upright Azimuthal, Radial and Spherical native-coverage oracles.
+Required groups are listed in `tools/qualify_release.py`; missing, skipped or
+failed cases cannot qualify, and receipts retain their executed case names.
+Guarded tilted routes continue to use their CPU checks. `--snapshot --cpu-only`
 records explicitly reduced coverage and does not qualify a release.

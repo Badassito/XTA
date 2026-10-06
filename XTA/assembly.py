@@ -320,12 +320,14 @@ def materialize_sam_extrapolation_view_layer(
 def _run_sam_extrapolation(native_volume, *, view, model_name, source, sam_context,
     distance=0, walk_back=1, min_radius=3., workers=1, nrrd_layers_enabled=False,
     tile_config_id='', upstream_lineage=None, additions_volume=None, merge_native=True,
-    requested_min_radius=None):
+    requested_min_radius=None, submit_sam_layer_projection=None, pending_component_layers=None):
     """Freeze the completed interpolation baseline through all tail tracking."""
     if int(distance) <= 0:
         return None, []
     if sam_context is None:
         raise RuntimeError('Active SAM extrapolation requires an admitted tracker context')
+    if submit_sam_layer_projection is not None and pending_component_layers is None:
+        raise RuntimeError('Detached SAM publication requires a terminal dependency owner')
     scope = f'{model_name}/{view.name}/{source}' + (f'/{tile_config_id}' if tile_config_id else '')
     _, stats, components = sam_context.extrapolate(native_volume, view=view,
         scope=scope + '/extrapolation',
@@ -346,11 +348,18 @@ def _run_sam_extrapolation(native_volume, *, view, model_name, source, sam_conte
     # never become a later request's seed or an authoritative future mask.
     for entry in components:
         if nrrd_layers_enabled:
-            refs.append(materialize_sam_extrapolation_view_layer(dict(entry,
+            materialize = submit_sam_layer_projection or materialize_sam_extrapolation_view_layer
+            publication_kwargs = ({'layer_kind': 'extrapolation'}
+                                  if submit_sam_layer_projection is not None else {})
+            ref = materialize(dict(entry,
                 requested_min_radius=stats['requested_extrapolation_min_radius']),
                 model_name=model_name, view=view, source=source, sam_context=sam_context,
                 distance=distance, walk_back=walk_back, min_radius=min_radius,
-                tile_config_id=tile_config_id, workers=workers))
+                tile_config_id=tile_config_id, workers=workers, **publication_kwargs)
+            if isinstance(ref, Future):
+                pending_component_layers.append(ref)
+            else:
+                refs.append(ref)
         if merge_native or additions_volume is not None:
             with contextlib.closing(RawBBoxMaskStore.open(Path(str(entry['path'])), mmap_payload=True)) as store:
                 if tuple(store.shape) != tuple(native_volume.shape):
@@ -1696,6 +1705,7 @@ def prepare_view_volume_after_fullframe(
     extrapolation_min_radius: float = 3.,
     confidence_retired_callback: Optional[Callable[[str, str, int], object]] = None,
     confidence_owner: Optional[list] = None,
+    submit_sam_layer_projection: Optional[Callable[..., Future[NrrdLayerRef]]] = None,
 ) -> PreparedViewResult:
     # Local import keeps the package dependency graph acyclic.
     from .finalization import union_volume_into_volume
@@ -1925,7 +1935,10 @@ def prepare_view_volume_after_fullframe(
                     and not bool(fused_azimuthal_components)
                     and not bool(d1_component_refs_only)
                 ):
-                    pass_delta_path = temp_dir / 'nrrd_work' / view.name / f'fullframe_bridge_pass{int(pass_idx):02d}.u8.dat'
+                    pass_delta_path = (
+                        temp_dir / 'nrrd_work' / str(model_name) / view.name
+                        / f'fullframe_bridge_pass{int(pass_idx):02d}.u8.dat'
+                    )
                 pass_component_dir: Optional[Path] = None
                 if (backend == 'sdf' and
                     bool(nrrd_layers_enabled)
@@ -1933,8 +1946,10 @@ def prepare_view_volume_after_fullframe(
                     and int(interpolation_walk_back) > 0
                     and int(interpolation_candidates) > 0
                 ):
+                    # The immutable stores can outlive this prepare call; keep
+                    # their ownership scope even for concurrent embedded models.
                     pass_component_dir = (
-                        temp_dir / 'nrrd_work' / view.name
+                        temp_dir / 'nrrd_work' / str(model_name) / view.name
                         / f'fullframe_bridge_pass{int(pass_idx):02d}_components'
                     )
 
@@ -1956,10 +1971,18 @@ def prepare_view_volume_after_fullframe(
                     if bool(nrrd_layers_enabled) and not stats_local.get('skipped', False):
                         if {str(item['direction']) for item in sam_components} != {'forward', 'backward'} or len(sam_components) != 2:
                             raise RuntimeError('SAM interpolation must produce exactly two selected directional slots')
-                        nrrd_layers.extend(materialize_sam_directional_view_layer(
-                            dict(entry), model_name=str(model_name), view=view, source='fullframe',
-                            pass_index=pass_idx, sam_context=sam_context,
-                            workers=int(slice_workers)) for entry in sam_components)
+                        for entry in sam_components:
+                            materialize = submit_sam_layer_projection or materialize_sam_directional_view_layer
+                            publication_kwargs = ({'layer_kind': 'interpolation'}
+                                                  if submit_sam_layer_projection is not None else {})
+                            ref = materialize(
+                                dict(entry), model_name=str(model_name), view=view, source='fullframe',
+                                pass_index=pass_idx, sam_context=sam_context,
+                                workers=int(slice_workers), **publication_kwargs)
+                            if isinstance(ref, Future):
+                                pending_component_layers.append(ref)
+                            else:
+                                nrrd_layers.append(ref)
                     if d1_additions_mm is not None:
                         for index in range(int(baseline_native_volume.shape[0])):
                             d1_additions_mm[index] |= ((baseline_native_volume[index] > 0)
@@ -2246,7 +2269,9 @@ def prepare_view_volume_after_fullframe(
                 view, float(extrapolation_min_radius), processing_plane_shape),
             workers=slice_workers, nrrd_layers_enabled=nrrd_layers_enabled,
             additions_volume=d1_additions_mm, merge_native=not d1_component_refs_only,
-            requested_min_radius=extrapolation_min_radius)
+            requested_min_radius=extrapolation_min_radius,
+            submit_sam_layer_projection=submit_sam_layer_projection,
+            pending_component_layers=pending_component_layers)
         nrrd_layers.extend(tail_refs)
         if extrapolation_stats_local is not None:
             interpolation_stats.append(extrapolation_stats_local)
@@ -3376,7 +3401,7 @@ def finalize_consolidated_tile_volume_for_parent(
                 and int(interpolation_candidates) > 0
             ):
                 pass_component_dir = (
-                    temp_dir / 'nrrd_work' / view.name / config_label /
+                    temp_dir / 'nrrd_work' / str(model_name) / view.name / config_label /
                     f'tile_bridge_pass{int(pass_idx):02d}_components'
                 )
 

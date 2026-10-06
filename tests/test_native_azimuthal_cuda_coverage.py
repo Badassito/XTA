@@ -8,6 +8,39 @@ from XTA import backprojection as bp, geometry as g
 
 @pytest.mark.skipif(os.environ.get('XTA_TEST_NATIVE_AZIMUTHAL_CUDA') != '1', reason='Explicit GPU coordinator authorization required')
 @pytest.mark.parametrize('backend', ['resident', 'streaming'])
+@pytest.mark.parametrize('plane_work,plane_output', [((10, 12), (1, 42)), ((9, 11), (59, 20))])
+def test_real_upright_azimuthal_cuda_rational_circle(tmp_path, backend, plane_work, plane_output):
+    """Actual device publication preserves exact closed edges and exterior."""
+    from tests.test_azimuthal_native_boundaries import _case, _physical_oracle
+    import torch
+    assert torch.cuda.is_available(), 'Requested real CUDA qualification cannot fall back'
+    view, shape, axes = _case('transverse', plane_work, plane_output, False)
+    source = np.ones((view.num_slices, view.src_h, view.src_w), np.uint8)
+    expected = _physical_oracle(view, shape, axes)
+    plan, _ = bp.build_azimuthal_backprojection_plan(view)
+    dense = bp.build_dense_azimuthal_backprojection_map(view, plan, out_shape_hw=shape[1:])
+    output = np.zeros(shape, np.uint8)
+    rows = lambda z: (z, z + 1)
+    with torch.cuda.device(0):
+        device = torch.device('cuda:0')
+        if backend == 'resident':
+            kernels = bp._azimuthal_resident_backproject_kernel()
+            assert kernels is not None, 'Actual resident CUDA kernels are required'
+            actual = bp._azimuthal_backproject_gpu_resident_on_device(
+                source, output, dense.valid_mask, dense.source_idx_map, dense.u_idx_map,
+                rows, *shape, 'actual rational circle', kernels=kernels, torch=torch, dev=device)
+        else:
+            valid = np.flatnonzero(dense.valid_mask.reshape(-1)).astype(np.int64)
+            flat = dense.source_idx_map.reshape(-1)[valid].astype(np.int64) * source.shape[2] + dense.u_idx_map.reshape(-1)[valid]
+            actual = bp._azimuthal_backproject_gpu_streaming_on_device(
+                source, output, valid, flat, rows, *shape, 'actual rational circle', torch=torch, dev=device)
+        assert actual is True, 'No CPU fallback is allowed in this qualification'
+        torch.cuda.synchronize()
+    np.testing.assert_array_equal(output, expected)
+
+
+@pytest.mark.skipif(os.environ.get('XTA_TEST_NATIVE_AZIMUTHAL_CUDA') != '1', reason='Explicit GPU coordinator authorization required')
+@pytest.mark.parametrize('backend', ['resident', 'streaming'])
 @pytest.mark.parametrize('spacing', [7., 40.])
 @pytest.mark.parametrize('pattern', ['positive', 'gap'])
 def test_real_upright_azimuthal_cuda_native_cells(tmp_path, backend, spacing, pattern):

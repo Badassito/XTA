@@ -187,6 +187,39 @@ def test_cohort_and_retry_plans_share_the_same_immutable_frame_index():
     enlarged=(y0,max(0,x0-1),y1,x1) if x0 else (y0,x0,y1,min(1600,x1+1))
     retry=expanded_extrapolation_plan(prepared.plan,group.group_id,enlarged)
     assert retry.observations_by_frame is prepared.plan.observations_by_frame
+    assert retry.by_id is prepared.plan.by_id
+    assert all(c.prepared.plan.by_id is prepared.plan.by_id for c in cohorts)
+
+
+def test_observation_id_index_is_built_once_and_new_inventory_replaces_every_entry():
+    prepared=prepare_sam_extrapolation_pass(_baseline(),distance=3,walk_back=0,min_radius=3.)
+    visits=[]
+    class CountedObservation:
+        def __init__(self,source):
+            self.source=source
+        def __getattr__(self,name):
+            if name=='observation_id':
+                visits.append(self.source.observation_id)
+            return getattr(self.source,name)
+    inventory=tuple(CountedObservation(o) for o in prepared.plan.observations)
+    plan=replace(prepared.plan,observations=inventory)
+    assert visits==[o.observation_id for o in prepared.plan.observations]
+    expected={o.source.observation_id:o for o in inventory}
+    visits.clear()
+    for _ in range(20):
+        assert plan.by_id is plan.by_id
+        assert dict(plan.by_id)==expected
+    assert visits==[]
+    with pytest.raises(TypeError):
+        plan.by_id['unplanned-observation']=inventory[0]
+
+    original=prepared.plan.observations[0]
+    changed=replace(original,observation_id='new-inventory-id',frame_index=original.frame_index+1)
+    rebuilt=replace(plan,observations=(changed,))
+    assert rebuilt.by_id is not plan.by_id
+    assert dict(rebuilt.by_id)=={'new-inventory-id':changed}
+    assert dict(rebuilt.observations_by_frame)=={changed.frame_index:(changed,)}
+    assert original.observation_id not in rebuilt.by_id
 
 
 def test_indexed_frozen_planes_preserve_unfolded_cyclic_alias_foreground():

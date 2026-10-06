@@ -18,7 +18,7 @@ from XTA import cli, config
 ROOT = Path(__file__).resolve().parents[1]
 CURRENT_VERSION = XTA.__version__
 CURRENT_LAUNCHER = f"GPT-6-Astra-Ultra_v{CURRENT_VERSION}_SLURM.py"
-PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v24.0.2_SLURM.py"
+PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v24.1.0_SLURM.py"
 SCRATCH_REPORTS = (
     "TTA_EXTERNAL_AUGMENTATION.md",
     "TTA_TEST_CLI_AUDIT.md",
@@ -135,7 +135,8 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertNotIn("include GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py", manifest_lines)
         self.assertNotIn(f"include {PREVIOUS_LAUNCHER}", manifest_lines)
         self.assertIn("include release/_package_inventory.json", manifest_lines)
-        self.assertIn("include release/README.md", manifest_lines)
+        self.assertNotIn("include release/README.md", manifest_lines)
+        self.assertNotIn("include release/version_migrations.json", manifest_lines)
         self.assertIn("include ARCHITECTURE.md", manifest_lines)
         for report in SCRATCH_REPORTS:
             self.assertNotIn(f"include {report}", manifest_lines)
@@ -203,7 +204,8 @@ class PackageMetadataTests(unittest.TestCase):
                 self.assertEqual(manifest["launcher"], CURRENT_LAUNCHER)
                 self.assertEqual(manifest["source"], "working-tree-snapshot")
                 self.assertIn("release/_package_inventory.json", manifest["files"])
-                self.assertIn("release/README.md", manifest["files"])
+                self.assertNotIn("release/README.md", manifest["files"])
+                self.assertNotIn("release/version_migrations.json", manifest["files"])
                 for name in (CURRENT_LAUNCHER, "ARCHITECTURE.md", "docs/PRODUCTION_BACKENDS.md", "docs/sam_interpolation.md", "docs/lta_dynamic_crops.md", ".gitattributes",
                              "tests/__init__.py", "tests/reference_backends/__init__.py",
                              "tests/reference_backends/spherical.py", "tests/reference_backends/interpolation.py",

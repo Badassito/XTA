@@ -1,7 +1,9 @@
-"""Build a reproducible source bundle from a clean Git commit.
+"""Build a source bundle from a clean Git commit and recorded release context.
 
 Use --snapshot only to inspect an uncommitted development tree. Snapshot bundles
 are labelled as such and must not be treated as release artifacts.
+Reproducibility assumes the same inputs, options and local release-tag context;
+the manifest preserves the version check and any acknowledged-gap reason.
 """
 from __future__ import annotations
 
@@ -12,15 +14,19 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import zipfile
 
+if __package__:
+    from .check_release_version import check_release_version
+    from .verify_package_inventory import read_source_files, validate_source_member
+else:
+    from check_release_version import check_release_version
+    from verify_package_inventory import read_source_files, validate_source_member
+
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE_DIRECTORIES = ('XTA/', 'tools/', 'native/', 'tests/', 'release/', 'docs/')
-SOURCE_SUFFIXES = {'.py', '.json', '.md', '.c', '.h', '.sh', '.ps1'}
-ROOT_FILES = {'ARCHITECTURE.md', 'pyproject.toml', 'setup.py', 'MANIFEST.in',
-              '.gitignore', '.gitattributes'}
 
 
 def digest(data: bytes) -> str:
@@ -31,13 +37,6 @@ def _git(root: Path, *args: str) -> bytes:
     return subprocess.check_output(('git', *args), cwd=root)
 
 
-def _selected(name: str) -> bool:
-    if name in ROOT_FILES or (name.startswith('GPT-') and name.endswith('_SLURM.py')
-                              and '/' not in name):
-        return True
-    return name.startswith(SOURCE_DIRECTORIES) and Path(name).suffix in SOURCE_SUFFIXES
-
-
 def source_payloads(root: Path, *, snapshot: bool = False) -> tuple[dict[str, bytes], str]:
     """Read tracked commit bytes, or explicitly requested development bytes."""
     root = root.resolve()
@@ -46,18 +45,10 @@ def source_payloads(root: Path, *, snapshot: bool = False) -> tuple[dict[str, by
         raise ValueError(f'{root} is not the Git repository root')
     commit = _git(root, 'rev-parse', 'HEAD').decode('ascii').strip()
     if snapshot:
-        names = (_git(root, 'ls-files', '--cached', '--others', '--exclude-standard', '-z')
-                 .decode('utf-8', errors='surrogateescape').split('\0'))
-        payloads = {}
-        for name in sorted(set(names)):
-            if not name or not _selected(name):
-                continue
-            path = root / name
-            if not path.resolve().is_relative_to(root):
-                raise ValueError(f'Source path resolves outside the repository: {name}')
-            if path.is_file():
-                payloads[name] = path.read_bytes()
-        return payloads, 'working-tree-snapshot'
+        try:
+            return read_source_files(root), 'working-tree-snapshot'
+        except RuntimeError as error:
+            raise ValueError(str(error)) from error
     if _git(root, 'status', '--porcelain=v1', '-z', '--untracked-files=all'):
         raise ValueError('Release bundles require a clean Git tree; use --snapshot for development validation')
     entries = []
@@ -67,11 +58,15 @@ def source_payloads(root: Path, *, snapshot: bool = False) -> tuple[dict[str, by
         metadata, raw_name = raw.split(b'\t', 1)
         mode, kind, object_id = metadata.split(b' ')
         name = raw_name.decode('utf-8', errors='surrogateescape')
-        if not _selected(name):
-            continue
+        try:
+            validate_source_member(name)
+        except RuntimeError as error:
+            raise ValueError(str(error)) from error
         if kind != b'blob' or mode == b'120000':
             raise ValueError(f'Source member is not a regular Git blob: {name}')
         entries.append((name, object_id))
+    if len({name.casefold() for name, _ in entries}) != len(entries):
+        raise ValueError('Source members have ambiguous case-insensitive paths')
     requested = b''.join(object_id + b'\n' for _name, object_id in entries)
     batch = subprocess.check_output(('git', 'cat-file', '--batch'), input=requested, cwd=root)
     payloads = {}
@@ -95,15 +90,23 @@ def source_payloads(root: Path, *, snapshot: bool = False) -> tuple[dict[str, by
 
 
 def build(*, root: Path, output: Path, readme: Path | None = None,
-          wheel: Path | None = None, snapshot: bool = False) -> Path:
+          wheel: Path | None = None, snapshot: bool = False,
+          acknowledge_gap: str | None = None, reason: str | None = None) -> Path:
     root, output = root.resolve(), output.resolve()
     if output.is_relative_to(root):
         raise ValueError('Generated releases belong in task Scratch, outside the repository')
     payloads, source = source_payloads(root, snapshot=snapshot)
+    version_check = check_release_version(root, snapshot=snapshot,
+                                         acknowledge_gap=acknowledge_gap, reason=reason)
+    for warning in version_check['warnings']:
+        print(f'WARNING: {warning}', file=sys.stderr)
     tree = ast.parse(payloads['XTA/__init__.py'].decode('utf-8'))
     version = next(ast.literal_eval(node.value) for node in tree.body
                    if isinstance(node, ast.Assign) and any(
                        getattr(target, 'id', '') == '__version__' for target in node.targets))
+    if version_check['target_version'] != version or (
+            not snapshot and version_check['head_commit'] != source):
+        raise ValueError('Source identity changed during the release-version check; retry from a stable checkout')
     launcher = f'GPT-6-Astra-Ultra_v{version}_SLURM.py'
     if launcher not in payloads:
         raise ValueError(f'Expected versioned launcher is absent: {launcher}')
@@ -113,6 +116,7 @@ def build(*, root: Path, output: Path, readme: Path | None = None,
     if readme:
         payloads['READ_ME_FIRST.txt'] = readme.read_bytes()
     manifest = {'version': version, 'launcher': launcher, 'source': source,
+                'release_version_check': version_check,
                 'files': {name: digest(data) for name, data in sorted(payloads.items())}}
     payloads['RELEASE_MANIFEST.json'] = (json.dumps(manifest, indent=2) + '\n').encode()
     if wheel:
@@ -177,10 +181,14 @@ def main() -> None:
     parser.add_argument('--wheel', type=Path)
     parser.add_argument('--snapshot', action='store_true',
                         help='validate the uncommitted working tree as a labelled development snapshot')
+    parser.add_argument('--acknowledge-gap', metavar='FROM:TO',
+                        help='Acknowledge this exact version gap only, e.g. v24.1.0:v26.0.0; requires --reason')
+    parser.add_argument('--reason', help='Record the user-approved reason for --acknowledge-gap')
     args = parser.parse_args()
     try:
         build(root=ROOT, output=args.output_dir, readme=args.readme,
-              wheel=args.wheel, snapshot=args.snapshot)
+              wheel=args.wheel, snapshot=args.snapshot,
+              acknowledge_gap=args.acknowledge_gap, reason=args.reason)
     except ValueError as exc:
         parser.error(str(exc))
 

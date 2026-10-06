@@ -315,11 +315,11 @@ def _context(tmp_path, *, owned, retire):
         'source', stat.st_size, stat.st_mtime_ns)
     context._runtime = SimpleNamespace(release_source_cache=retire, close=lambda: None)
     def provider(*_args, **_kwargs):
-        context._register_image_cache_owner(reference, owned=owned)
-        context._caches['test'] = reference
-        context._cache_entries.append({'reference': reference})
-        context.cache_logical_bytes = reference.size_bytes
-        return reference
+        with context._idle:
+            context._caches['test'] = reference
+            context._cache_entries.append({'reference': reference})
+            context.cache_logical_bytes = reference.size_bytes
+            return context._claim_image_reference(reference, owned=owned)
     context.image_provider = provider
     return context, reference, source
 

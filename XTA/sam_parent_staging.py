@@ -89,6 +89,16 @@ def _reusable_disk_owner(array, declared_path, source_root):
     return path
 
 
+def _write_all(stream, data):
+    """Keep an exact checkpoint when unbuffered disk writes are short."""
+    chunk = memoryview(data)
+    while chunk:
+        written = stream.write(chunk)
+        if not written:
+            raise OSError('SAM parent checkpoint write made no progress')
+        chunk = chunk[written:]
+
+
 def _snapshot_array(array, declared_path, destination, source_root, stop):
     array = _validate_owner(array)
     reused = _reusable_disk_owner(array, declared_path, source_root)
@@ -105,13 +115,7 @@ def _snapshot_array(array, declared_path, destination, source_root, stop):
             for offset in range(0, flat.size, STREAM_BYTES):
                 if stop.is_set():
                     raise RuntimeError('SAM parent checkpoint cancelled')
-                chunk = memoryview(flat[offset:offset + STREAM_BYTES])
-                while chunk:
-                    written = stream.write(chunk)
-                    if not written:
-                        raise OSError('SAM parent checkpoint write made no progress')
-                    chunk = chunk[written:]
-                del chunk
+                _write_all(stream, flat[offset:offset + STREAM_BYTES])
             os.fsync(stream.fileno())
         del flat
         path = destination
@@ -174,7 +178,7 @@ def checkpoint_parent(task, root, source_root, required_bytes, stop):
                     while chunk := reader.read(STREAM_BYTES):
                         if stop.is_set():
                             raise RuntimeError('SAM parent checkpoint cancelled')
-                        writer.write(chunk)
+                        _write_all(writer, chunk)
                     os.fsync(writer.fileno())
             if stop.is_set():
                 raise RuntimeError('SAM parent checkpoint cancelled')
