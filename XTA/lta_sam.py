@@ -22,8 +22,9 @@ import math
 import sys
 import threading
 import types
+import weakref
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Iterable, Mapping
 from typing import Callable, Iterator, Optional, Tuple
@@ -52,6 +53,8 @@ _PINNED_SAM_BPE_SHA256 = (
 _PINNED_SAM_BPE_PREFIX = b'"bpe_simple_vocab_16e6.txt#version: 0.2\n'
 _SAM_REMOVED_OBJECT_SCORE = -1e4
 _SAM31_BUILD_PATCH_LOCK = threading.RLock()
+_SAM_PREPARED_FRAME_SEAL = object()
+_SAM_INPUT_PREPARATION_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 _SAM_PKG_RESOURCES_COMPAT_LOCK = threading.RLock()
 _SAM_BPE_RESOURCE = "assets/bpe_simple_vocab_16e6.txt.gz"
 
@@ -692,8 +695,23 @@ def _validate_pinned_sam_bpe(path: Path) -> Path:
     return resolved
 
 
+@dataclass(frozen=True)
+class _PreparedSamVideoFrames:
+    """One locally generated clip, bound to its exact native input and model."""
+
+    images: object = field(repr=False)
+    model: object = field(repr=False)
+    resource: object = field(repr=False)
+    height: int
+    width: int
+    side: int
+    mean: tuple
+    std: tuple
+    seal: object = field(repr=False)
+
+
 def patch_sam_init_state_signature(predictor: object) -> Tuple[str, ...]:
-    """Filter wrapper-only kwargs before the pinned model ``init_state`` call.
+    """Filter wrapper kwargs and consume locally prepared pinned video inputs.
 
     Current SAM 3.1's base predictor forwards ``offload_state_to_cpu`` even
     though the multiplex model does not accept it.  Wrapping only ``init_state``
@@ -705,24 +723,169 @@ def patch_sam_init_state_signature(predictor: object) -> Tuple[str, ...]:
     if not callable(init_state):
         raise TypeError("SAM predictor model must expose init_state")
     signature = inspect.signature(init_state)
-    if any(
+    accepts_kwargs = any(
         parameter.kind is inspect.Parameter.VAR_KEYWORD
         for parameter in signature.parameters.values()
-    ):
-        return ()
+    )
     allowed = frozenset(signature.parameters)
     incompatible = "offload_state_to_cpu"
-    if incompatible in allowed:
+    dropped = () if accepts_kwargs or incompatible in allowed else (incompatible,)
+    pinned_loader = (
+        type(model).__module__ == "sam3.model.sam3_multiplex_tracking"
+        and type(model).__name__ == "Sam3MultiplexTrackingWithInteractivity"
+        and getattr(init_state, "__func__", None) is getattr(type(model), "init_state", None)
+    )
+    if not dropped and not pinned_loader:
         return ()
 
     @functools.wraps(init_state)
     def filtered_init_state(*args: object, **kwargs: object) -> object:
         filtered = dict(kwargs)
-        filtered.pop(incompatible, None)
-        return init_state(*args, **filtered)
+        if dropped:
+            filtered.pop(incompatible, None)
+        resource = filtered.get("resource_path", args[0] if args else None)
+        prepared = getattr(resource, "_xta_prepared_video_frames", None)
+        if prepared is None:
+            if pinned_loader:
+                with _SAM31_BUILD_PATCH_LOCK:
+                    return init_state(*args, **filtered)
+            return init_state(*args, **filtered)
+        delattr(resource, "_xta_prepared_video_frames")
+        arguments = signature.bind_partial(*args, **filtered).arguments
+        if not pinned_loader or arguments.get("offload_video_to_cpu") is not True:
+            raise RuntimeError("prepared SAM frames require the pinned CPU-offloaded loader")
+        # Consume the extra owner before entering the SDK. The SDK state owns
+        # its clip afterwards; error cleanup cannot leave a second clip owner.
+        import torch
+        if (type(prepared) is not _PreparedSamVideoFrames or prepared.seal is not _SAM_PREPARED_FRAME_SEAL
+                or prepared.model is not model or prepared.resource() is not resource
+                or prepared.side != int(model.image_size) or prepared.mean != tuple(model.image_mean)
+                or prepared.std != tuple(model.image_std)):
+            raise ValueError("SAM prepared clip was not generated for this live model and resource")
+        images, height, width = prepared.images, prepared.height, prepared.width
+        if (not isinstance(images, torch.Tensor) or images.device.type != "cpu" or images.dtype != torch.float16
+                or tuple(images.shape) != (len(resource), 3, int(model.image_size), int(model.image_size))
+                or resource[0].size != (width, height)):
+            raise ValueError("prepared SAM clip differs from its complete native RGB resource")
+        module = importlib.import_module("sam3.model.sam3_multiplex_tracking")
+        with _SAM31_BUILD_PATCH_LOCK:
+            original_loader = module.load_resource_as_video_frames
+            consumed = False
+
+            def prepared_loader(*loader_args, **loader_kwargs):
+                nonlocal consumed
+                requested = loader_kwargs.get("resource_path", loader_args[0] if loader_args else None)
+                if requested is resource:
+                    side = loader_kwargs.get("image_size", loader_args[1] if len(loader_args) > 1 else None)
+                    offload = loader_kwargs.get("offload_video_to_cpu", loader_args[2] if len(loader_args) > 2 else None)
+                    mean = loader_kwargs.get("img_mean", loader_args[3] if len(loader_args) > 3 else (.5,)*3)
+                    std = loader_kwargs.get("img_std", loader_args[4] if len(loader_args) > 4 else (.5,)*3)
+                    if (side != prepared.side or offload is not True
+                            or tuple(mean) != prepared.mean or tuple(std) != prepared.std):
+                        raise ValueError("native SAM loader differs from its prepared RGB normalization")
+                    if consumed:
+                        raise RuntimeError("SAM consumed its prepared clip more than once")
+                    consumed = True
+                    return prepared.images, prepared.height, prepared.width
+                return original_loader(*loader_args, **loader_kwargs)
+
+            module.load_resource_as_video_frames = prepared_loader
+            try:
+                state = init_state(*args, **filtered)
+                if not consumed:
+                    raise RuntimeError("pinned SAM did not consume its complete prepared clip")
+                return state
+            finally:
+                module.load_resource_as_video_frames = original_loader
+                prepared = resource = images = None
 
     setattr(model, "init_state", filtered_init_state)
-    return (incompatible,)
+    setattr(model, "_xta_prepared_video_loader", pinned_loader)
+    return dropped
+
+
+def _resize_sam_rgb_u8(pixels, side, torch_module, device):
+    """Pillow's separable bicubic convention, including per-axis uint8 clamp."""
+    # Keep the transfer NCHW-contiguous: CUDA antialiased resize otherwise
+    # allocates an uncounted second full input for the PIL HWC stride layout.
+    tensor = torch_module.from_numpy(pixels).permute(2, 0, 1).contiguous()[None].to(
+        device=device, dtype=torch_module.float32)
+    for size in ((pixels.shape[0], side), (side, side)):
+        tensor = torch_module.nn.functional.interpolate(tensor, size=size,
+            mode="bicubic", align_corners=False, antialias=True).round_().clamp_(0, 255)
+    return tensor[0].to(dtype=torch_module.uint8)
+
+
+def prepare_sam_video_frames(predictor, resource, *, torch_module=None, cuda_quota_bytes=None):
+    """Prepare one admitted offloaded clip; unsupported predictors keep SDK IO.
+
+    No normalized clip remains on CUDA. Only one frame's resize workspace is
+    live there, and the existing session CPU estimate covers this CPU stack.
+    """
+    model = predictor.model
+    legacy = dict(policy="pinned_rgb_u8_loader_v1", backend="sdk", prepared=False)
+    if not getattr(model, "_xta_prepared_video_loader", False) or not hasattr(resource, "__dict__"):
+        return legacy
+    try:
+        resource_ref = weakref.ref(resource)
+    except TypeError:
+        return legacy
+    import numpy as np
+    import torch
+    from PIL import Image
+    from .runtime import _env_flag
+
+    side = int(model.image_size)
+    if not isinstance(resource, list) or not resource or side < 1 or not isinstance(resource[0], Image.Image):
+        return legacy
+    width, height = resource[0].size
+    if any(not isinstance(frame, Image.Image) or frame.mode != "RGB" or frame.size != (width, height)
+           for frame in resource):
+        return legacy
+    mean, std = tuple(model.image_mean), tuple(model.image_std)
+    if (len(mean) != 3 or len(std) != 3 or not all(math.isfinite(float(v)) for v in (*mean, *std))
+            or not all(float(v) > 0 for v in std)):
+        raise ValueError("SAM RGB normalization requires three finite means and positive standard deviations")
+    with torch.inference_mode():
+        lookup = torch.arange(256, dtype=torch.float64).div_(255).half().repeat(3, 1)
+        lookup.sub_(torch.tensor(mean, dtype=torch.float16)[:, None])
+        lookup.div_(torch.tensor(std, dtype=torch.float16)[:, None])
+        if not bool(torch.isfinite(lookup).all()):
+            raise ValueError("SAM normalization is not finite in its fp16 storage dtype")
+        images = torch.empty((len(resource), 3, side, side), dtype=torch.float16)
+        cuda = False
+        workspace = 12*height*width + 12*height*side + 32*side*side
+        if torch_module is not None and _env_flag("YOLO_TTA_SAM_GPU_IMAGES", True):
+            free, total = torch_module.cuda.mem_get_info(0)
+            allocated = int(torch_module.cuda.memory_allocated(0))
+            reusable = max(0, int(torch_module.cuda.memory_reserved(0))-allocated)
+            available = int(free)+reusable
+            if cuda_quota_bytes is not None:
+                available = min(available, max(0, int(cuda_quota_bytes)-allocated))
+            cuda = available >= workspace + max(2*1024**3, int(total*.15))
+        if cuda:
+            device_lookup = lookup.to(device="cuda:0")
+            for index, frame in enumerate(resource):
+                pixels = _resize_sam_rgb_u8(np.array(frame), side, torch_module, "cuda:0")
+                normalized = torch_module.stack([device_lookup[channel, pixels[channel].long()]
+                    for channel in range(3)])
+                images[index].copy_(normalized)
+                pixels = normalized = None
+            pixels = normalized = device_lookup = None
+        else:
+            target, table = images.numpy(), lookup.numpy()
+            for index, frame in enumerate(resource):
+                pixels = np.asarray(frame.resize((side, side)))
+                for channel in range(3):
+                    np.take(table[channel], pixels[:, :, channel], out=target[index, channel])
+        resource._xta_prepared_video_frames = _PreparedSamVideoFrames(images, model, resource_ref,
+            height, width, side, mean, std, _SAM_PREPARED_FRAME_SEAL)
+    return dict(policy="torch_separable_bicubic_u8_half_lut_v1" if cuda else "pillow_bicubic_preallocated_half_lut_v1",
+        backend="cuda" if cuda else "cpu", prepared=True, frames=len(resource),
+        image_size=side, original_shape=[height, width], image_mean=list(mean), image_std=list(std),
+        implementation_sha256=_SAM_INPUT_PREPARATION_SHA256,
+        clip_storage="cpu_float16_tchw", cuda_workspace_estimate_bytes=workspace if cuda else 0,
+        cuda_resize_qualification_maximum_u8_delta=2 if cuda else 0)
 
 
 def _same_local_path(value: object, expected: Path) -> bool:

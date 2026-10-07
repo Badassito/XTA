@@ -1667,6 +1667,37 @@ def view_interpolation_wrap_axis(view: ViewInfo) -> bool:
     """
     return bool(is_azimuthal_view(view))
 
+def prepare_detector_view_cpu(mask, scores, view, min_conf, min_radius, *, workers,
+                              precleaned_slice_cleanup=False, hole_fill_done_on_device=False,
+                              slice_meta=None):
+    """Clean the detector parent and preserve valid sparse slice metadata."""
+    meta_valid = bool(slice_meta) and bool(slice_meta.get('valid', False))
+    meta_slice_any = meta_slice_bboxes = meta_row_occupancy = None
+    if meta_valid:
+        try:
+            meta_slice_any = np.asarray(slice_meta['slice_any'], dtype=bool)
+            meta_slice_bboxes = np.asarray(slice_meta['slice_bboxes'], dtype=np.int64)
+            rows_packed = slice_meta.get('slice_row_any')
+            row_count = int(slice_meta.get('slice_row_count', 0) or 0)
+            if rows_packed is not None and row_count > 0:
+                meta_row_occupancy = np.unpackbits(
+                    np.asarray(rows_packed, dtype=np.uint8), axis=1, count=row_count,
+                ).astype(bool, copy=False)
+            if int(meta_slice_any.shape[0]) != int(view.num_slices):
+                raise ValueError('slice metadata length mismatch')
+        except Exception:
+            meta_valid = False
+            meta_slice_any = meta_slice_bboxes = meta_row_occupancy = None
+    hole_metadata_valid = bool(meta_valid and (
+        bool(precleaned_slice_cleanup) or (float(min_conf) <= 0.0 and float(min_radius) <= 0.0)))
+    cleanup_view_volume_after_prediction_inplace(mask, scores, view, float(min_conf), float(min_radius),
+        workers=int(workers), precleaned_slice_cleanup=bool(precleaned_slice_cleanup),
+        skip_hole_fill=bool(hole_fill_done_on_device),
+        known_slice_any=(meta_slice_any if hole_metadata_valid else None),
+        known_slice_bboxes=(meta_slice_bboxes if hole_metadata_valid else None))
+    return meta_valid, meta_slice_any, meta_slice_bboxes, meta_row_occupancy, hole_metadata_valid
+
+
 def prepare_view_volume_after_fullframe(
     *,
     model_name: str,
@@ -1767,47 +1798,10 @@ def prepare_view_volume_after_fullframe(
     # It remains valid through skipped cleanup and per-slice hole filling, which do not change
     # foreground presence/bounds/row occupancy; interpolation bridges invalidate it. It feeds
     # only pre-interpolation consumers and the first interpolation pass's labeling.
-    meta_valid = bool(slice_meta) and bool(slice_meta.get('valid', False))
-    meta_slice_any: Optional[np.ndarray] = None
-    meta_slice_bboxes: Optional[np.ndarray] = None
-    meta_row_occupancy: Optional[np.ndarray] = None
-    if meta_valid:
-        try:
-            meta_slice_any = np.asarray(slice_meta['slice_any'], dtype=bool)
-            meta_slice_bboxes = np.asarray(slice_meta['slice_bboxes'], dtype=np.int64)
-            rows_packed = slice_meta.get('slice_row_any')
-            row_count = int(slice_meta.get('slice_row_count', 0) or 0)
-            if rows_packed is not None and row_count > 0:
-                meta_row_occupancy = np.unpackbits(
-                    np.asarray(rows_packed, dtype=np.uint8), axis=1, count=row_count,
-                ).astype(bool, copy=False)
-            if int(meta_slice_any.shape[0]) != int(view.num_slices):
-                raise ValueError('slice metadata length mismatch')
-        except Exception:
-            meta_valid = False
-            meta_slice_any = None
-            meta_slice_bboxes = None
-            meta_row_occupancy = None
-
-    hole_metadata_valid = bool(
-        meta_valid
-        and (
-            bool(precleaned_slice_cleanup)
-            or (float(min_conf) <= 0.0 and float(min_radius) <= 0.0)
-        )
-    )
-    cleanup_view_volume_after_prediction_inplace(
-        baseline_native_volume,
-        confmap_mm,
-        view,
-        float(min_conf),
-        float(min_radius),
-        workers=int(slice_workers),
-        precleaned_slice_cleanup=bool(precleaned_slice_cleanup),
-        skip_hole_fill=bool(hole_fill_done_on_device),
-        known_slice_any=(meta_slice_any if hole_metadata_valid else None),
-        known_slice_bboxes=(meta_slice_bboxes if hole_metadata_valid else None),
-    )
+    meta_valid, meta_slice_any, meta_slice_bboxes, meta_row_occupancy, hole_metadata_valid = (
+        prepare_detector_view_cpu(baseline_native_volume, confmap_mm, view, min_conf, min_radius,
+            workers=slice_workers, precleaned_slice_cleanup=precleaned_slice_cleanup,
+            hole_fill_done_on_device=hole_fill_done_on_device, slice_meta=slice_meta))
 
     try:
         from .confidence_evidence import capture_prediction_confidence

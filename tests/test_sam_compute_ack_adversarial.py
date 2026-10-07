@@ -21,6 +21,7 @@ class _HostWorker:
         self.mutate = mutate
         self.refuse_shutdown = refuse_shutdown
         self.active = {}
+        self.submissions = []
         self.alive = True
         self.boundary = []
         self.ready_events = ()
@@ -28,6 +29,7 @@ class _HostWorker:
         self.sync_failure = False
 
     def submit(self, task, *, execution_device_id):
+        self.submissions.append(task.payload['run_id'])
         self.active[execution_device_id] = task
 
     def wait_result(self, *, timeout):
@@ -103,7 +105,7 @@ def _protocol(tmp_path, monkeypatch, mutate=lambda _receipt: None, *, refuse_shu
 
     def before_shutdown():
         resident.quarantine('worker teardown')
-        if tracker._compute_leases:
+        if tracker._compute_leases or teardown:
             return  # The live task's existing exclusive lease fences teardown.
         lease = resident.try_acquire_compute(torch, 'SAM owned shutdown')
         assert lease is not None, 'unregistered pre-submit compute lease blocks its own teardown'
@@ -161,7 +163,7 @@ def test_invalid_cuda_ack_keeps_compute_and_residency_until_workers_exit(
     assert coordinator.snapshot()['resident_owners'] == {}
 
 
-def test_valid_device_wide_ack_allows_compute_handback_before_cpu_consumption(
+def test_valid_worker_context_ack_allows_compute_handback_before_cpu_consumption(
         tmp_path, monkeypatch):
     tracker, request, worker, coordinator, resident, aux, handbacks = _protocol(tmp_path, monkeypatch)
     stream = tracker.iter_results((request,), defer_refill_until_consumed=True)
@@ -170,7 +172,8 @@ def test_valid_device_wide_ack_allows_compute_handback_before_cpu_consumption(
         assert handbacks == ['compute_released']
         assert worker.boundary == ['device_sync', 'artifact_published']
         assert result.receipt['cuda_quiescence'] == dict(synchronized=True,
-            worker_local_device=0, execution_device_id=1, run_id='ack-endpoint')
+            worker_local_device=0, execution_device_id=1, worker_index=0,
+            scope='worker_process_cuda_context', run_id='ack-endpoint')
         assert tracker._iteration_active  # Gray source retirement is a distinct barrier.
         assert coordinator.snapshot()['stage_leases'] == {}
         assert not aux.enable_worker(1)
@@ -243,8 +246,8 @@ def test_verified_idle_worker_is_refilled_before_raw_transfer_and_cache_retireme
 
     def load(path, **kwargs):
         if not transfers:
-            assert worker.active[1].work_id == successor['run_id']
-            assert handbacks == ['compute_released']
+            assert worker.submissions == [request['run_id'], successor['run_id']]
+            assert 1 <= len(handbacks) <= 2
             assert tracker._iteration_active
             assert not next(iter(tracker._source_cache_retirement_proofs.values()))['complete']
         transfers.append(path)
@@ -282,7 +285,7 @@ def test_corrupt_raw_transfer_publishes_nothing_and_settles_already_refilled_wor
     original_submit = worker.submit
 
     def submit(task, **kwargs):
-        submitted.append(task.work_id)
+        submitted.append(task.payload['run_id'])
         return original_submit(task, **kwargs)
 
     monkeypatch.setattr(worker, 'submit', submit)
@@ -292,11 +295,16 @@ def test_corrupt_raw_transfer_publishes_nothing_and_settles_already_refilled_wor
             next(stream)
         assert submitted == [request['run_id'], successor['run_id']]
         assert tracker.dispatch_stats['completed'] == 0
-        assert handbacks == ['compute_released']
+        assert 1 <= len(handbacks) <= 2
+        assert len(handbacks) == worker.boundary.count('device_sync')
         assert not next(iter(tracker._source_cache_retirement_proofs.values()))['complete']
         if refuse_shutdown:
             assert not tracker.residency_released
-            assert worker.active[1].work_id == successor['run_id']
+            # The successor may already have a proof-valid ACK even though its
+            # corrupt raw packet is never decoded/published. Live residency
+            # still requires its shutdown fence when teardown refuses to exit.
+            if worker.active:
+                assert worker.active[1].payload['run_id'] == successor['run_id']
             assert coordinator.snapshot()['stage_leases']
             assert coordinator.snapshot()['resident_owners'][1]['quarantined']
         else:
@@ -314,7 +322,7 @@ def test_corrupt_raw_transfer_publishes_nothing_and_settles_already_refilled_wor
 def test_startup_ack_requires_exact_cuda_local_device(tmp_path, monkeypatch, local_device):
     from XTA import lta_workers
     worker = _HostWorker(lambda _receipt: None, refuse_shutdown=False)
-    worker.ready_events = (SimpleNamespace(execution_device_id=1,
+    worker.ready_events = (SimpleNamespace(execution_device_id=1, worker_index=0, worker_pid=501,
         metadata={'sam_runtime': {'startup_cuda_quiescence': dict(
             synchronized=True, worker_local_device=local_device)}}),)
     monkeypatch.setattr(lta_workers, 'LtaWorkerPool', lambda *args, **kwargs: worker)

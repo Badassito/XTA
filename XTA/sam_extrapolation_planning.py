@@ -275,7 +275,7 @@ def plan_sam_extrapolation(observations, *, extrapolation_distance=0,
 
 
 def expanded_extrapolation_plan(plan,group_id,crop_bbox_yx):
-    """One bounded retry from exactly the same frozen masks and intervals."""
+    """Enlarge only geometry while retaining exact frozen seeds and intervals."""
     group=next(g for g in plan.groups if g.group_id==group_id)
     new=tuple(map(int,crop_bbox_yx));old=group.context_bbox_yx
     if (not 0<=new[0]<=old[0]<old[2]<=new[2]<=plan.native_shape_tyx[1]

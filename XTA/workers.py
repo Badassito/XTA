@@ -1303,6 +1303,7 @@ def _cpu_inference_worker_main(
                     'type': 'result', 'worker_kind': 'cpu',
                     'cpu_index': int(instance_id), 'task_id': int(task_id),
                     'ok': True, 'stats': stats,
+                    'memfd_parent_proc_capability': task_local.get('_memfd_parent_proc_capability'),
                 })
             except Exception as exc:
                 import traceback
@@ -2213,7 +2214,7 @@ def _gpu_inference_worker_main(
     manager = None
 
     def _publish_deferred(finished_task_id: int, deferred: _DeferredGpuWorkerTaskResult,
-                          trace_context: Dict[str, object]) -> None:
+                          trace_context: Dict[str, object], proc_capability: object = None) -> None:
         try:
             finished_stats = deferred.finish()
             runtime_trace_event('worker_publication_done', task_id=finished_task_id,
@@ -2221,6 +2222,7 @@ def _gpu_inference_worker_main(
             result_queue.put({
                 'type': 'result', 'task_id': int(finished_task_id),
                 'gpu_index': int(gpu_index), 'ok': True, 'stats': finished_stats,
+                'memfd_parent_proc_capability': proc_capability,
             })
         except Exception as exc:  # pragma: no cover - surfaced to scheduler
             import traceback
@@ -2236,6 +2238,7 @@ def _gpu_inference_worker_main(
         finished_task_id: int,
         deferred: _DeferredGpuWorkerTaskResult,
         trace_context: Dict[str, object],
+        proc_capability: object = None,
     ) -> None:
         future = deferred.flush_future
         with publication_condition:
@@ -2243,7 +2246,7 @@ def _gpu_inference_worker_main(
 
         def _done(_future: Future) -> None:
             try:
-                _publish_deferred(int(finished_task_id), deferred, trace_context)
+                _publish_deferred(int(finished_task_id), deferred, trace_context, proc_capability)
             except BaseException as exc:
                 # Do not strand worker teardown if the result transport itself is broken.
                 try:
@@ -2472,10 +2475,12 @@ def _gpu_inference_worker_main(
                     'kind': str(task.get('kind', '')), 'model_name': str(task.get('model_name', '')),
                     'task_type': task_type, 'slice_start': task.get('slice_start'),
                     'slice_count': task.get('slice_count')}
-                _schedule_deferred_publication(int(task_id), completed, trace_context)
+                _schedule_deferred_publication(int(task_id), completed, trace_context,
+                                               task_local.get('_memfd_parent_proc_capability'))
                 result_queue.put({
                     'type': 'compute_released', 'task_id': int(task_id),
                     'gpu_index': int(gpu_index), 'ok': True,
+                    'memfd_parent_proc_capability': task_local.get('_memfd_parent_proc_capability'),
                     'stats': {
                         'worker_compute_seconds': float(compute_seconds),
                         'slice_count': int(task_local.get('slice_count', 0)),
@@ -2502,6 +2507,7 @@ def _gpu_inference_worker_main(
                 result_queue.put({
                     'type': 'result', 'task_id': task_id, 'gpu_index': int(gpu_index),
                     'ok': True, 'stats': completed,
+                    'memfd_parent_proc_capability': task_local.get('_memfd_parent_proc_capability'),
                 })
         except (_ResidentTensorRTRingFatalError, RadialCudaProjectionUnsafeFailure,
                 SemanticTrtRingConsumedError) as exc:  # unsafe device state or consumed semantic task

@@ -35,15 +35,17 @@ class _CombinedPredictor(_Predictor):
 class _CompletionPool:
     """CPU protocol fixture delivering later submissions before the first."""
 
-    def __init__(self, *, fail_run=None, shutdown_failure=False, corrupt_metadata=False):
+    def __init__(self, *, fail_run=None, shutdown_failure=False, corrupt_metadata=False,expected_initial=0):
         self.active = {}
         self.submissions = []
+        self.completions = []
         self.peak_active = 0
         self.fail_run = fail_run
         self.shutdown_failure = shutdown_failure
         self.corrupt_metadata = corrupt_metadata
         self.closed = False
         self.shutdown_count = 0
+        self.expected_initial=expected_initial
 
     def submit(self, task, *, execution_device_id):
         if execution_device_id in self.active:
@@ -55,9 +57,12 @@ class _CompletionPool:
     def wait_result(self, *, timeout):
         import XTA.sam_tracker_runtime as runtime
 
+        if not self.completions and len(self.active)<self.expected_initial:
+            raise TimeoutError
+
         device = next(reversed(self.active))
         task = self.active.pop(device)
-        if task.work_id == self.fail_run:
+        if task.payload['run_id'] == self.fail_run:
             raise RuntimeError("controlled raw worker failure")
         predictor = _CombinedPredictor(_Tracker())
         context = SimpleNamespace(predictor=predictor, profile={}, sam_runtime={})
@@ -67,6 +72,7 @@ class _CompletionPool:
             receipt = json.loads(path.read_text(encoding="utf-8"))
             receipt["request_metadata"]["parent_run_id"] = "wrong-original-hypothesis"
             path.write_text(json.dumps(receipt), encoding="utf-8")
+        self.completions.append(task.payload['run_id'])
         return SimpleNamespace(
             work_id=task.work_id, attempt_token=task.attempt_token,
             execution_device_id=device, worker_pid=100 + device,
@@ -106,7 +112,9 @@ class SamRawObservationTests(unittest.TestCase):
 
     def test_low_score_masks_remain_raw_through_terminal(self):
         streamed = []
-        predictor, result = self._run(callback=streamed.append)
+        with patch("XTA.lta_experimental.perf_counter", side_effect=(10.0, 12.5)):
+            predictor, result = self._run(callback=streamed.append)
+        self.assertEqual(result["sdk_session_init_seconds"], 2.5)
         self.assertEqual(result["propagation"], ())
         self.assertEqual([item.frame_index for item in streamed], [10, 11, 12])
         self.assertTrue(all(item.binary_mask.any() for item in streamed))
@@ -166,7 +174,9 @@ class SamTrackerArtifactTests(unittest.TestCase):
 
     def test_rectangular_raw_packet_roundtrip_independent_of_score(self):
         with tempfile.TemporaryDirectory() as directory:
-            result = self._execute(directory)
+            with patch("XTA.lta_experimental.perf_counter", side_effect=(10.0, 12.5)):
+                result = self._execute(directory)
+            self.assertEqual(result.receipt["timings"]["sdk_session_init_seconds"], 2.5)
             self.assertEqual(tuple(result.frames), (0, 1, 2))
             self.assertEqual(result.frames[2].shape, (9, 13))
             self.assertTrue(result.frames[2].any())
@@ -237,7 +247,7 @@ class SamConcurrentDispatchTests(unittest.TestCase):
 
     def test_reverse_completion_keeps_identity_and_dispatches_next_before_yield(self):
         with tempfile.TemporaryDirectory() as directory:
-            pool = _CompletionPool()
+            pool = _CompletionPool(expected_initial=2)
             tracker, cache = self._tracker(directory, pool)
             consumed = []
             requests = [self._request(index) for index in range(4)]
@@ -249,10 +259,15 @@ class SamConcurrentDispatchTests(unittest.TestCase):
                     for mask in result.frames.values():
                         self.assertTrue(np.array_equal(mask, requests[index]["seed_mask"]))
                     if len(consumed) == 1:
+                        deadline=time.monotonic()+2.
+                        while len(pool.submissions)<3 and time.monotonic()<deadline:
+                            time.sleep(.001)
                         self.assertEqual(len(pool.submissions), 3)
                     tracker.release_result(result)
                 self.assertGreater(started.call_count, 0)
-            self.assertEqual(consumed, [1, 2, 3, 0])
+            self.assertEqual(consumed[0], 1)
+            self.assertEqual(sorted(consumed), list(range(4)))
+            self.assertEqual(consumed, [int(identity.split('-')[1]) for identity in pool.completions])
             self.assertEqual(pool.peak_active, 2)
             self.assertEqual(tracker.dispatch_stats["peak_in_flight"], 2)
             self.assertEqual(tracker.dispatch_stats["submitted"], 4)
@@ -306,8 +321,9 @@ class SamConcurrentDispatchTests(unittest.TestCase):
                     list(tracker.iter_results((self._request(0), self._request(1)), source_cache_ref=cache))
             self.assertTrue(tracker._closed)
             self.assertEqual(list(tracker.artifact_root.glob("run-*")), [])
-            self.assertTrue(tracker._dispatch_lock.acquire(blocking=False))
-            tracker._dispatch_lock.release()
+            self.assertTrue(tracker._state_condition.acquire(blocking=False))
+            tracker._state_condition.release()
+            self.assertFalse(tracker._scopes)
 
     def test_duplicate_run_identity_invalidates_outstanding_work(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -449,8 +465,8 @@ class SamConcurrentDispatchTests(unittest.TestCase):
                     stream.close()
             self.assertFalse(tracker.residency_released)
             self.assertTrue(Path(result.receipt["temporary_artifact_directory"]).exists())
-            self.assertTrue(tracker._dispatch_lock.acquire(blocking=False))
-            tracker._dispatch_lock.release()
+            self.assertTrue(tracker._state_condition.acquire(blocking=False))
+            tracker._state_condition.release()
             pool.sticky = False
             tracker.close()
 

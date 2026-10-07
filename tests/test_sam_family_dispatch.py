@@ -36,7 +36,7 @@ def families_for(specifications, calls, seed_refs):
 
 
 def test_family_refill_preserves_original_indices_and_exact_family_owner(tmp_path,monkeypatch):
-    pool=_CompletionPool();tracker,cache=tracker_for(tmp_path,pool,monkeypatch)
+    pool=_CompletionPool(expected_initial=4);tracker,cache=tracker_for(tmp_path,pool,monkeypatch)
     calls=[];refs=[];specs=[('A',(10,2,7)),('B',(9,1)),('C',(6,15)),('D',(4,3)),('E',(20,8))]
     families=families_for(specs,calls,refs);stream=tracker.iter_family_results(families,source_cache_ref=cache)
     assert calls==[]
@@ -52,7 +52,8 @@ def test_family_refill_preserves_original_indices_and_exact_family_owner(tmp_pat
         tracker.release_result(result)
         del result
     assert set(found)=={i for unused,indices in specs for i in indices}
-    assert all(len(devices)==1 for devices in byfamily.values())
+    assert found=={index:identity for identity,indices in specs for index in indices}
+    assert all(devices and devices<=set(tracker.device_ids) for devices in byfamily.values())
     assert tracker.dispatch_stats['family_active_peak']==4
     assert tracker.dispatch_stats['family_completed']==len(specs)
     assert pool.peak_active==4 and len(calls)==11
@@ -167,19 +168,20 @@ def test_whole_generator_auto_guard_and_explicit_fifo_preserve_pixels_and_run_id
 
 @pytest.mark.parametrize('capacity', [None,3])
 def test_family_dispatch_honors_six_devices_and_reduced_admitted_wave(tmp_path,monkeypatch,capacity):
-    pool=_CompletionPool();tracker,cache=tracker_for(tmp_path,pool,monkeypatch,devices=tuple(range(6)))
+    pool=_CompletionPool(expected_initial=6 if capacity is None else capacity);tracker,cache=tracker_for(tmp_path,pool,monkeypatch,devices=tuple(range(6)))
     calls=[];refs=[];specs=[(str(i),(i,i+8,i+16)) for i in range(8)]
     families=families_for(specs,calls,refs);found={};owners=defaultdict(set)
     admitted=6 if capacity is None else capacity
     for index,result in tracker.iter_family_results(families,max_in_flight=capacity):
         if not found:assert len(calls)==admitted+1
         owners[result.receipt['dispatch']['family_id']].add(result.receipt['dispatch']['execution_device_id'])
+        assert result.receipt['dispatch']['family_id']==next(identity for identity,indices in specs if index in indices)
         assert index not in found;found[index]=result.receipt['run_id']
         assert len(list(tracker.artifact_root.glob('run-*')))<=admitted+1
         assert sum(reference() is not None for reference in refs)<=1
         tracker.release_result(result);del result
     assert found=={i:f'run-{i}' for unused,indices in specs for i in indices}
-    assert all(len(devices)==1 for devices in owners.values())
+    assert all(devices and devices<=set(tracker.device_ids) for devices in owners.values())
     assert pool.peak_active==admitted
     assert tracker.dispatch_stats['family_active_peak']==admitted
     assert tracker.dispatch_stats['family_completed']==len(specs)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
@@ -19,11 +20,26 @@ import uuid
 from typing import Mapping
 
 import numpy as np
-from .runtime import runtime_telemetry
+from .runtime import runtime_telemetry, sam_sessions_per_gpu
 
 
 _UNSETTLED_SAM_CONTEXTS = {}
 _UNSETTLED_SAM_LOCK = threading.Lock()
+
+
+class SamConcurrentStartupResourceError(RuntimeError):
+    """Measured resources cannot safely start two isolated predictor contexts."""
+
+
+def _concurrent_startup_resource_failure(error):
+    from .lta_workers import LtaWorkerStartupError
+    if isinstance(error, SamConcurrentStartupResourceError):
+        return True
+    if not isinstance(error, LtaWorkerStartupError):
+        return False
+    event = error.event
+    return (event.error_type in {'OutOfMemoryError', 'MemoryError'} or
+            event.error_type == 'RuntimeError' and 'cuda out of memory' in event.message.lower())
 
 
 def sam_workers_unsettled() -> bool:
@@ -114,6 +130,20 @@ def publish_sam_gate_identity(store, *, policy_identity: str, evidence_path: str
     return identity
 
 
+def _write_context_preparation_failure(destination, receipt, error):
+    """Diagnostic publication cannot replace the actual preparation failure."""
+    try:
+        destination = Path(destination)
+        destination.mkdir(parents=True, exist_ok=True)
+        target = destination / 'context_preparation_failure.json'
+        temporary = target.with_suffix('.json.tmp')
+        temporary.write_text(json.dumps(receipt, sort_keys=True), encoding='utf-8')
+        temporary.replace(target)
+    except Exception as receipt_error:
+        if callable(getattr(error, 'add_note', None)):
+            error.add_note(f'SAM context failure receipt could not be written: {receipt_error}')
+
+
 class SamInterpolationContext:
     """One run's persistent predictor, immutable image caches, and device leases."""
 
@@ -143,6 +173,9 @@ class SamInterpolationContext:
         if not self.device_ids or len(set(self.device_ids)) != len(self.device_ids) or any(
                 int(value.split(':')[-1]) < 0 for value in self.device_ids):
             raise ValueError('SAM context requires unique nonnegative CUDA devices')
+        self.sessions_per_gpu = sam_sessions_per_gpu()
+        self.startup_admission = dict(requested_sessions_per_gpu=self.sessions_per_gpu,
+            effective_sessions_per_gpu=self.sessions_per_gpu, attempts=[])
         self.temp_dir = Path(temp_dir)
         self.evidence_root = Path(evidence_root)
         self.extrapolation_evidence_root = (Path(extrapolation_evidence_root)
@@ -180,6 +213,9 @@ class SamInterpolationContext:
         self._active_image_calls = 0
         self._active_image_cohorts = 0
         self._image_retirements = 0
+        self._image_prefetches = set()
+        self._next_image_prefetch = None
+        self._retained_image_prefetch_credits = []
         self._image_builds = {}
         self._image_build_bytes = 0
         self._image_build_credit_bytes = 0
@@ -188,6 +224,7 @@ class SamInterpolationContext:
         self._source_materialization_lock = threading.Lock()
         self._runtime = None
         self._starting_runtime = None
+        self._startup_pool = None
         self._leases = []
         self._resident_leases = {}
         self._active_compute = {}
@@ -197,6 +234,8 @@ class SamInterpolationContext:
         self._cache_transforms = {}
         self._cache_entries = []
         self._cache_owners = {}
+        self._image_sampling_proofs = {}
+        self._unsettled_image_renderers = []
         self.image_cohort_retirement_receipts = []
         self.image_cache_retired_bytes = 0
         self.image_cohort_peak_owned_bytes = 0
@@ -232,6 +271,15 @@ class SamInterpolationContext:
         self._ready.set()
 
     @property
+    def worker_count(self):
+        return len(self.device_ids)*self.sessions_per_gpu
+
+    @property
+    def worker_slots(self):
+        return tuple((int(device.split(':')[-1]), index)
+            for device in self.device_ids for index in range(self.sessions_per_gpu))
+
+    @property
     def detector_retirement_ready(self) -> bool:
         """Read the admission signal without starting or rendering SAM work."""
         # Cancellation wakes existing waiters, but does not grant new work
@@ -257,7 +305,10 @@ class SamInterpolationContext:
             self._failure = str(reason)
             self._cancel.set()
             self._ready.set()
+            prefetches = tuple(self._image_prefetches)
             self._idle.notify_all()
+        for prefetch in prefetches:
+            prefetch.cancel_builder()
         self._quarantine_sam_residency(str(reason))
         for runtime in (self._runtime, self._starting_runtime):
             cancel = getattr(runtime, 'cancel', None)
@@ -313,7 +364,47 @@ class SamInterpolationContext:
                 image_cache_borrower_pins=sum(state.get('pins', 0) for state in self._cache_owners.values()),
                 pinned_image_cache_logical_bytes=sum(state['reference'].size_bytes for state in self._cache_owners.values()
                     if state.get('pins', 0)),
-                active_image_calls=self._active_image_calls)
+                active_image_calls=self._active_image_calls,
+                live_image_prefetches=len(self._image_prefetches),
+                unconsumed_image_prefetches=int(self._next_image_prefetch is not None),
+                image_prefetch_charged_bytes=sum(prefetch._admitted_bytes for prefetch in self._image_prefetches),
+                retained_image_prefetch_credit_bytes=sum(getattr(release, 'image_phase_bytes', 0)
+                    for release in self._retained_image_prefetch_credits))
+
+    def prefetch_image_cohort(self, view, shape, prepared_plan, *, max_cache_bytes=None):
+        """Try one next cohort on its own image-only producer grant."""
+        from .sam_image_prefetch import SamImageCohortPrefetch
+        from .workspace import _env_int
+        profile = getattr(self._resource_local, 'profile', None)
+        if profile is None or not callable(getattr(self._runtime, 'release_source_cache', None)):
+            return None
+        profile._validate_owner()
+        required = dict(getattr(prepared_plan, 'frame_crop_bounds', {}) or {})
+        payload = sum((int(box[2])-int(box[0]))*(int(box[3])-int(box[1])) for box in required.values())
+        cap = (max(1, _env_int('YOLO_TTA_SAM_IMAGE_CACHE_MAX_BYTES', 1024**3))
+               if max_cache_bytes is None else int(max_cache_bytes))
+        if not required or payload <= 0 or payload > cap:
+            return None  # The ordinary provider remains the admission authority.
+        scratch = max(1, _env_int('YOLO_TTA_SAM_RENDER_MAX_BYTES', 256*1024**2))
+        with self._idle:
+            self._check_image_lifetime()
+            if (self._next_image_prefetch is not None or len(self._image_prefetches) >= 2
+                    or any(owner.get('retirement_unproven') for owner in self._cache_owners.values())):
+                return None
+            prefetch = SamImageCohortPrefetch(self, view, tuple(shape), prepared_plan,
+                cap, profile, payload+scratch)
+            self._image_prefetches.add(prefetch)
+            self._next_image_prefetch = prefetch
+        try:
+            prefetch.start()
+        except BaseException:
+            with self._idle:
+                self._image_prefetches.discard(prefetch)
+                if self._next_image_prefetch is prefetch:
+                    self._next_image_prefetch = None
+                self._idle.notify_all()
+            raise
+        return prefetch
 
     @contextmanager
     def image_cohort_provider(self, view, shape, prepared_plan, *, max_cache_bytes=None):
@@ -470,7 +561,39 @@ class SamInterpolationContext:
             self._active_image_calls += 1
         try:
             with _trace_sam_phase('image_render', scope_id, operation=operation):
-                return self._image_provider(view, shape, prepared_plan=prepared_plan)
+                from .sam_gpu_rendering import (try_gpu_crop_renderer, SamGpuRenderingUnavailable,
+                    clear_image_error_frames)
+                if (self._cache_entries and self.detector_retirement_ready
+                        and getattr(self._resource_local, 'profile', None) is not None):
+                    # An immutable complete CPU cache needs no upload/rerender.
+                    cached = self._image_provider(view, shape, prepared_plan=prepared_plan, _cache_only=True)
+                    if cached is not None:
+                        return cached
+                renderer = try_gpu_crop_renderer(self, view, shape, prepared_plan)
+                previous = getattr(self._resource_local, 'gpu_image_renderer', None)
+                try:
+                    self._resource_local.gpu_image_renderer = renderer
+                    try:
+                        return self._image_provider(view, shape, prepared_plan=prepared_plan)
+                    except RuntimeError as error:
+                        cause = error
+                        while cause is not None and not isinstance(cause, SamGpuRenderingUnavailable):
+                            cause = cause.__cause__
+                        if renderer is None or cause is None:
+                            raise
+                        self._check_image_lifetime()
+                        clear_image_error_frames(error)
+                        renderer.close()
+                        renderer = None
+                        self._resource_local.gpu_image_renderer = None
+                        runtime_telemetry().add('sam.gpu_images.cpu_fallbacks', 1)
+                        runtime_telemetry().gauge('sam.gpu_images.last_fallback_reason', str(cause))
+                        return self._image_provider(view, shape, prepared_plan=prepared_plan)
+                finally:
+                    self._resource_local.gpu_image_renderer = previous
+                    if renderer is not None:
+                        clear_image_error_frames(sys.exc_info()[1])
+                        renderer.close()
         finally:
             with self._idle:
                 self._active_image_calls -= 1
@@ -481,6 +604,9 @@ class SamInterpolationContext:
             raise RuntimeError('SAM interpolation source lifetime has ended')
         if self._cancel.is_set():
             raise RuntimeError(self._failure)
+        prefetch_cancel = getattr(self._resource_local, 'image_prefetch_cancel', None)
+        if prefetch_cancel is not None and prefetch_cancel.is_set():
+            raise RuntimeError('SAM image prefetch was abandoned')
         if getattr(self._resource_local, 'ephemeral_images', False) and any(
                 state.get('retirement_unproven') for state in self._cache_owners.values()):
             raise RuntimeError('SAM cannot stage another image cohort while an owned cache retirement is unproven')
@@ -520,16 +646,18 @@ class SamInterpolationContext:
             # callers share the previous target+render peak instead of minting
             # a new parent reservation merely by starting another thread.
             uncredited = tuple(item for item in active if not item['credited'])
-            fits = (len(active) < 2 and
-                (credited and all(item['lease_id'] != lease_id for item in active)
-                 or not credited and sum(item['credit_bytes'] for item in uncredited)+credit_bytes
-                    <= min([fallback_limit]+[item['fallback_limit'] for item in uncredited])))
+            # Parent executor lanes already bound CPU producers. Independently
+            # owned image credits may render together; a global count limit
+            # leaves every GPU waiting behind two large view-cache builders.
+            fits = (credited and all(item['lease_id'] != lease_id for item in active)
+                or not credited and sum(item['credit_bytes'] for item in uncredited)+credit_bytes
+                    <= min([fallback_limit]+[item['fallback_limit'] for item in uncredited]))
             if fits:
                 return dict(credited=credited, lease_id=lease_id, credit_bytes=credit_bytes,
                     payload_bytes=int(payload_bytes), fallback_limit=fallback_limit)
             self._idle.wait(timeout=0.05)
 
-    def _image_provider(self, view, shape, prepared_plan=None):
+    def _image_provider(self, view, shape, prepared_plan=None, *, _cache_only=False):
         """Materialize only missing canonical pixels; retain immutable cache files.
 
         The public canvas has native frame addresses. A cyclic plan may append
@@ -584,6 +712,29 @@ class SamInterpolationContext:
                 from .sam_view_geometry import validate_sam_view_geometry
                 validate_sam_view_geometry(view, wrap_axis=True)
             affine, inverse, transform = self._canvas_transform(view, shape)
+            from .sam_cyclic import IMPLEMENTATION_SHA256 as cyclic_sha256
+            # Geometry/source proof excludes only numerical sampler provenance.
+            # Cache/feature identity below still includes the chosen byte contract.
+            image_geometry_identity = hashlib.sha256(json.dumps(dict(source=self.source_identity,
+                transform={field: value for field, value in _canonical_image_transform(transform).items()
+                    if not field.startswith(('canonical_crop_', 'canonical_phase_'))},
+                shape=logical_shape, frame_addressing=addressing,
+                cyclic_implementation_sha256=cyclic_sha256 if addressing else None), sort_keys=True,
+                allow_nan=False).encode()).hexdigest()
+            gpu_renderer = getattr(self._resource_local, 'gpu_image_renderer', None)
+            from .sam_canvas_rendering import CANONICAL_CROP_RENDER_CONTRACT
+            sampling = dict(contract=CANONICAL_CROP_RENDER_CONTRACT, backend='cpu',
+                numerical_backend=transform['canonical_crop_sampling_backend'])
+            if gpu_renderer is not None:
+                # Translating a float32 CUDA affine can change a crop's
+                # numerical phase. Different demand origins must not donate
+                # pixels or share frame features under one image identity.
+                sampling = dict(gpu_renderer.sampling_identity(),
+                    demand_identity_sha256=demand_identity)
+                transform.update(canonical_crop_render_contract=sampling['contract'],
+                    canonical_crop_render_implementation_sha256=sampling['implementation_sha256'],
+                    canonical_crop_sampling_backend=sampling,
+                    canonical_phase_self_check_contract='registered_TTA_CUDA_intensity_sampler')
             canonical_transform = _canonical_image_transform(transform)
             geometry_identity = hashlib.sha256(json.dumps(dict(source=self.source_identity,
                 transform=canonical_transform), sort_keys=True, allow_nan=False).encode()).hexdigest()
@@ -598,6 +749,8 @@ class SamInterpolationContext:
                 exact = self._caches.get(key)
                 exact_state = self._cache_owners.get(str(exact.path), {}) if exact is not None else {}
                 if exact is not None and exact_state.get('retiring'):
+                    if _cache_only:
+                        return None
                     self._idle.wait(timeout=0.05)
                     continue
                 if exact is not None and not (pinned_cap is not None and exact_state.get('owned')
@@ -620,6 +773,8 @@ class SamInterpolationContext:
                         self._cache_transforms[key] = transform
                         self.image_cache_superset_hits += 1
                         return self._claim_image_reference(reference)
+                if _cache_only:
+                    return None
                 ticket = self._image_builds.get(key)
                 if ticket is not None:
                     ticket['waiters'] += 1
@@ -647,7 +802,7 @@ class SamInterpolationContext:
                 source_array = (getattr(self.source_volume, '_array', None)
                     if bool(getattr(self.source_volume, '_is_lazy_processing_cube', False)) else self.source_volume)
                 backing = _interpolation_array_backing_path(source_array)
-                borrow_backing = (str(view.family) == 'orthogonal' and physical_view_name(view) == 'transverse'
+                borrow_backing = (gpu_renderer is None and str(view.family) == 'orthogonal' and physical_view_name(view) == 'transverse'
                     and logical_shape == shape and backing is not None and tuple(source_array.shape) == shape
                     and np.dtype(source_array.dtype) == np.uint8 and bool(source_array.flags['C_CONTIGUOUS'])
                     and np.array_equal(affine, np.array([[1., 0., 0.], [0., 1., 0.]], np.float32))
@@ -689,7 +844,7 @@ class SamInterpolationContext:
             source_array = (getattr(self.source_volume, '_array', None)
                 if bool(getattr(self.source_volume, '_is_lazy_processing_cube', False)) else self.source_volume)
             backing = _interpolation_array_backing_path(source_array)
-            if (str(view.family) == 'orthogonal' and physical_view_name(view) == 'transverse'
+            if (gpu_renderer is None and str(view.family) == 'orthogonal' and physical_view_name(view) == 'transverse'
                     and logical_shape == shape and backing is not None and tuple(source_array.shape) == shape
                     and np.dtype(source_array.dtype) == np.uint8
                     and bool(source_array.flags['C_CONTIGUOUS'])
@@ -705,7 +860,7 @@ class SamInterpolationContext:
                 return reference, False, dict(reference=reference, geometry_identity=geometry_identity,
                     addresses={}, native_shape=shape)
             identity_affine = np.array([[1., 0., 0.], [0., 1., 0.]], np.float32)
-            if not (np.array_equal(affine, identity_affine) and np.array_equal(inverse, identity_affine)):
+            if gpu_renderer is None and not (np.array_equal(affine, identity_affine) and np.array_equal(inverse, identity_affine)):
                 from .sam_canvas_rendering import ensure_canonical_phase_supported
                 receipt = ensure_canonical_phase_supported(transform['canonical_crop_sampling_backend'])
                 with self._lock:
@@ -726,11 +881,11 @@ class SamInterpolationContext:
             batch_iterator = None
             batch_images = {}
             try:
-                batch_iterator = self._transverse_batch_iterator(view, shape, records, addresses,
-                    affine, inverse, geometry_identity, payload_bytes, cache_entries=donor_entries)
+                if gpu_renderer is None:
+                    batch_iterator = self._transverse_batch_iterator(view, shape, records, addresses,
+                        affine, inverse, geometry_identity, payload_bytes, cache_entries=donor_entries)
                 for index, y0, x0, y1, x1, offset in records:
-                    if self._cancel.is_set():
-                        raise RuntimeError(self._failure)
+                    self._check_image_lifetime()
                     address = addresses[index]
                     physical_bbox = mirror_bbox_yx((y0, x0, y1, x1), shape[2]) if address['mirror_u'] else (y0, x0, y1, x1)
                     target = cache[offset:offset+(y1-y0)*(x1-x0)].reshape(y1-y0, x1-x0)
@@ -775,8 +930,7 @@ class SamInterpolationContext:
                         missing = tuple(remainder)
                         del done
                     for cy0, cx0, cy1, cx1 in missing:
-                        if self._cancel.is_set():
-                            raise RuntimeError(self._failure)
+                        self._check_image_lifetime()
                         image = (pre_rendered[cy0-physical_bbox[0]:cy1-physical_bbox[0],
                                               cx0-physical_bbox[1]:cx1-physical_bbox[1]]
                             if pre_rendered is not None else
@@ -833,6 +987,8 @@ class SamInterpolationContext:
                 reference.revalidate()
             with self._idle:
                 self._check_image_lifetime()
+                from .sam_gpu_rendering import register_live_image
+                register_live_image(self, reference, image_geometry_identity, sampling)
                 self._claim_image_reference(reference, owned=owned)
                 self._caches[key] = reference
                 self._cache_transforms[key] = transform
@@ -962,6 +1118,13 @@ class SamInterpolationContext:
         Other orientations materialize the existing shared processing memmap
         once, then reuse it for every needed frame/crop and endpoint session.
         """
+        gpu_renderer = getattr(self._resource_local, 'gpu_image_renderer', None)
+        if gpu_renderer is not None:
+            image = gpu_renderer.render(view, index, inverse, output_origin_yx=output_origin_yx,
+                output_height=output_height, output_width=output_width)
+            runtime_telemetry().add('sam.gpu_images.frames', 1)
+            runtime_telemetry().add('sam.gpu_images.pixels', int(image.size))
+            return image
         from ._deps import cv2
         from .geometry import physical_view_name
         from .sam_canvas_rendering import render_canonical_crop
@@ -1114,6 +1277,107 @@ class SamInterpolationContext:
         with self._runtime_lock:
             self._start_admitted()
 
+    def prepare_runtime(self, parent_pool):
+        """Warm the existing predictor pool before admitting deferred parents."""
+        if parent_pool is None:
+            raise TypeError('SAM runtime preparation requires the parent admission pool')
+        with self._idle:
+            if self._closed or self._cancel.is_set():
+                raise RuntimeError(self._failure or 'SAM interpolation runtime is closed')
+            self._active_passes += 1
+        try:
+            with self._runtime_lock:
+                if self._startup_pool is not None and self._startup_pool is not parent_pool:
+                    raise RuntimeError('SAM runtime preparation cannot change its parent admission pool')
+                profile = getattr(self._resource_local, 'profile', None)
+                if profile is not None:
+                    profile._validate_owner()
+                    if profile._lease.pool is not parent_pool:
+                        raise RuntimeError('SAM startup pool differs from the live parent profile')
+                self._startup_pool = parent_pool
+                self._start_admitted()
+        finally:
+            with self._idle:
+                self._active_passes -= 1
+                self._idle.notify_all()
+
+    def _startup_host_headroom(self):
+        from .sam_resources import physical_sam_headroom
+        profile = getattr(self._resource_local, 'profile', None)
+        pool = self._startup_pool
+        if profile is not None:
+            profile._validate_owner()
+            if pool is not None and profile._lease.pool is not pool:
+                raise RuntimeError('SAM startup pool differs from the live parent profile')
+            pool = profile._lease.pool
+        if pool is None:
+            return max(0, int(physical_sam_headroom())), 0
+        # Parents can have been admitted before these duplicated models load.
+        # Physical free RAM already subtracts resident bytes; all outstanding
+        # pool promises remain unavailable for model startup and its reserve.
+        with pool.condition:
+            if profile is not None:
+                profile._validate_owner()
+            return (max(0, int(physical_sam_headroom())),
+                    max(0, int(pool.in_use)))
+
+    def _concurrent_startup_budget(self, torch, attempt):
+        from .sam_resources import GIB
+        from .lta_sam import resolve_local_sam_bundle
+        bundle = resolve_local_sam_bundle(self.model_path)
+        checkpoint_bytes = int(Path(bundle.checkpoint_path).stat().st_size)
+        host, promised = self._startup_host_headroom()
+        # Conservative startup eligibility, not a measured peak: mmap pages
+        # can be shared/reclaimed, and loader/library overhead is variable.
+        # Existing full histories retain their separate parent-wave admission.
+        required_host = 2*checkpoint_bytes*self.worker_count+2*GIB+promised
+        attempt.update(host_headroom_before_bytes=host,
+            minimum_host_startup_bytes=required_host, devices_before=[],
+            promised_host_before_bytes=promised,
+            host_startup_basis='conservative_two_checkpoint_copies_per_worker_plus_reserve_and_parent_promises',
+            checkpoint_bytes=checkpoint_bytes,
+            checkpoint_identity_sha256=bundle.checkpoint_identity_sha256)
+        if host < required_host:
+            raise SamConcurrentStartupResourceError(
+                f'Two SAM sessions per GPU require {required_host} bytes of physical host startup '
+                f'headroom; measured {host}')
+        fractions = {}
+        for device in self.device_ids:
+            index = int(device.split(':')[-1])
+            free, total = map(int, torch.cuda.mem_get_info(index))
+            headroom = max(2*GIB, int(total*.15))
+            quota = max(0, free-headroom)//2
+            attempt['devices_before'].append(dict(device_index=index, free_bytes=free,
+                total_bytes=total, headroom_bytes=headroom, allocator_bytes_per_worker=quota))
+            if total <= 0 or quota <= 0:
+                raise SamConcurrentStartupResourceError(
+                    f'Two SAM sessions cannot retain mandatory CUDA headroom on {device}')
+            fractions[str(index)] = quota/total
+        return fractions
+
+    def _check_concurrent_startup(self, torch, attempt):
+        from .sam_resources import GIB
+        # Probe after the complete worker readiness inventory, when every
+        # duplicated model is resident. Early worker snapshots can overclaim.
+        attempt['devices_after'] = []
+        for device in self.device_ids:
+            index = int(device.split(':')[-1])
+            free, total = map(int, torch.cuda.mem_get_info(index))
+            headroom = max(2*GIB, int(total*.15))
+            attempt['devices_after'].append(dict(device_index=index, free_bytes=free,
+                total_bytes=total, headroom_bytes=headroom))
+            if free < headroom:
+                raise SamConcurrentStartupResourceError(
+                    f'Two SAM predictor contexts on {device} leave {free} bytes free; '
+                    f'mandatory CUDA headroom is {headroom}')
+        host, promised = self._startup_host_headroom()
+        attempt['host_headroom_after_bytes'] = host
+        attempt['promised_host_after_bytes'] = promised
+        if host < 2*GIB+promised:
+            raise SamConcurrentStartupResourceError(
+                f'Two SAM predictor contexts leave {host} bytes of physical host headroom; '
+                f'minimum reserve including admitted parent work is {2*GIB+promised}')
+
     def _start_admitted(self):
         if self._cancel.is_set():
             raise RuntimeError(self._failure)
@@ -1151,22 +1415,59 @@ class SamInterpolationContext:
                             raise RuntimeError(f'SAM GPU admission timed out on {device}')
                         self._cancel.wait(timeout=0.05)
                 self._leases.append(lease)
-            runtime = SamInterpolationTracker(
-                model_path=self.model_path, device_ids=tuple(int(value.split(':')[-1]) for value in self.device_ids),
-                artifact_root=self.temp_dir / 'sam_runtime',
-                feature_cache_bytes=self.feature_cache_mib*1024**2,
-                compute_lease_factory=self._try_sam_compute_lease,
-                compute_lease_release=self._release_sam_compute_lease,
-                residency_quarantine=self._quarantine_sam_residency,
-                before_worker_shutdown=self._before_sam_worker_shutdown,
-                after_worker_shutdown=self._after_sam_worker_shutdown)
-            self._starting_runtime = runtime
-            if self._cancel.is_set():
-                cancel = getattr(runtime, 'cancel', None)
-                if callable(cancel):
-                    cancel(self._failure)
-                raise RuntimeError(self._failure)
-            runtime.start()
+            while True:
+                attempt = dict(sessions_per_gpu=self.sessions_per_gpu)
+                self.startup_admission['attempts'].append(attempt)
+                try:
+                    fractions = (self._concurrent_startup_budget(torch, attempt)
+                        if self.sessions_per_gpu == 2 else None)
+                    runtime = SamInterpolationTracker(
+                        model_path=self.model_path, device_ids=tuple(int(value.split(':')[-1]) for value in self.device_ids),
+                        artifact_root=self.temp_dir / 'sam_runtime',
+                        feature_cache_bytes=self.feature_cache_mib*1024**2,
+                        workers_per_device=self.sessions_per_gpu,
+                        cuda_allocator_fractions=fractions,
+                        compute_lease_factory=self._try_sam_compute_lease,
+                        compute_lease_release=self._release_sam_compute_lease,
+                        residency_quarantine=self._quarantine_sam_residency,
+                        before_worker_shutdown=self._before_sam_worker_shutdown,
+                        after_worker_shutdown=self._after_sam_worker_shutdown)
+                    self._starting_runtime = runtime
+                    if self._cancel.is_set():
+                        cancel = getattr(runtime, 'cancel', None)
+                        if callable(cancel):
+                            cancel(self._failure)
+                        raise RuntimeError(self._failure)
+                    runtime.start()
+                    receipts = getattr(runtime, 'startup_receipts', ())
+                    if isinstance(receipts, (tuple, list)):
+                        attempt['workers'] = receipts
+                    if self._cancel.is_set():
+                        raise RuntimeError(self._failure)
+                    if self.sessions_per_gpu == 2:
+                        self._check_concurrent_startup(torch, attempt)
+                    attempt['status'] = 'admitted'
+                    break
+                except BaseException as error:
+                    attempt.update(status='failed', error=str(error))
+                    if (self.sessions_per_gpu != 2 or self._cancel.is_set()
+                            or not _concurrent_startup_resource_failure(error)):
+                        raise
+                    if runtime is not None:
+                        try:
+                            runtime.close()
+                        except BaseException as cleanup_error:
+                            error.add_note(f'SAM two-session startup cleanup: {cleanup_error}')
+                        if getattr(runtime, 'residency_released', False) is not True:
+                            raise
+                    if self._cancel.is_set():
+                        raise RuntimeError(self._failure)
+                    # The physical startup fence remains held throughout the
+                    # fully settled retry. No work/history/crop was submitted.
+                    runtime = self._starting_runtime = None
+                    self.sessions_per_gpu = 1
+                    self.startup_admission.update(effective_sessions_per_gpu=1,
+                        fallback_reason=str(error))
             if getattr(runtime, 'startup_cuda_quiescent', False) is True:
                 with self._gpu_lease_lock:
                     for lease in self._leases:
@@ -1207,6 +1508,11 @@ class SamInterpolationContext:
                 self.cancel('SAM startup failed with unsettled worker residency')
                 raise RuntimeError('SAM startup failed; GPU ownership retained until worker cleanup is proven') from startup_error
             raise
+        finally:
+            try:
+                runtime_telemetry().gauge('sam.startup_admission', self.startup_admission)
+            except Exception:
+                pass  # Diagnostics must not replace startup or cleanup results.
 
     def interpolate(self, observation_volume, *, view, scope, **kwargs):
         from .sam_interpolation import (interpolate_sam_view_volume_pass,
@@ -1221,6 +1527,8 @@ class SamInterpolationContext:
         self._resource_local.sam_phase_scope = ('interpolation', str(scope))
         prepared = None
         execution_started = False
+        preparation_phase = 'geometry_or_resource_admission'
+        shape, scope_metadata = None, {}
         try:
             from .geometry import physical_view_name
             # The baseline owner retains mutation rights after this bounded
@@ -1273,11 +1581,13 @@ class SamInterpolationContext:
             planning_keys = {'pass_index', 'gap_distance', 'min_radius', 'search_angle_deg',
                 'interpolation_walk_back', 'interpolation_candidates', 'interpolation_passes',
                 'wrap_axis', 'upstream_lineage', 'spacing_zyx', 'planner_limits', 'canonical_labels'}
+            preparation_phase = 'planning'
             with _trace_sam_phase('planning', scope_metadata['scope_id'], operation='interpolation'):
                 prepared = prepare_sam_interpolation_pass(observed, view=view,
                     scope=scope_metadata, policy=self.policy,
                     **profile_kwargs,
                     **{key: value for key, value in kwargs.items() if key in planning_keys})
+            preparation_phase = 'image_or_gpu_admission'
             tracked_group_ids = {str(run.group_id) for run in prepared.runs}
             oversized_groups = [group for group in prepared.groups if str(group.group_id) in tracked_group_ids
                 and max(group.context_bbox_yx[2]-group.context_bbox_yx[0],
@@ -1306,7 +1616,7 @@ class SamInterpolationContext:
             if self.crop_retry_policy is not None:
                 kwargs.setdefault('crop_retry_policy', self.crop_retry_policy)
                 kwargs.setdefault('retry_image_provider',
-                    lambda retry: self.image_provider(view, shape, prepared_plan=retry))
+                    lambda retry: self.image_cohort_provider(view, shape, retry))
             merged, stats, components = interpolate_sam_view_volume_pass(
                 observed, image_provider=provider, view=view,
                 runtime=runtime, scope=scope_metadata, policy=self.policy, cancel_event=self._cancel,
@@ -1329,24 +1639,28 @@ class SamInterpolationContext:
             stats.setdefault('sam_resource_profile', dict(scope_metadata['sam_resource_profile']))
             return merged, stats, components
         except BaseException as error:
-            if prepared is not None and prepared.needs_tracking and not execution_started:
-                destination = Path(kwargs.get('work_dir', self.evidence_root/hashlib.sha256(str(scope).encode()).hexdigest()[:20]))
-                destination.mkdir(parents=True, exist_ok=True)
+            if not execution_started:
+                destination = kwargs.get('work_dir', self.evidence_root/hashlib.sha256(str(scope).encode()).hexdigest()[:20])
                 receipt = {
                     'schema': 'xta.sam-context-preparation-failure/1', 'complete': False,
-                    'status': 'infrastructure_invalid', 'phase': 'image_or_gpu_admission',
-                    'error': str(error), 'scope_id': str(scope),
-                    'pass_index': int(kwargs.get('pass_index', 1)),
-                    'observation_snapshot_sha256': prepared.observation_snapshot_sha256,
-                    'planning_settings_sha256': prepared.settings_sha256,
-                    'native_shape_tyx': list(prepared.native_shape),
+                    'status': 'infrastructure_invalid', 'phase': preparation_phase,
+                    'error_type': type(error).__name__, 'error': str(error), 'scope_id': str(scope),
+                    'sam_operation': 'interpolation',
+                    'view_name': scope_metadata.get('view_name', str(getattr(view, 'name', ''))),
+                    'physical_view': scope_metadata.get('physical_view'),
+                    'sam_crop_mode': self.crop_mode,
+                    'sam_resource_profile': scope_metadata.get('sam_resource_profile'),
+                    'pass_index': kwargs.get('pass_index', 1),
+                    'prepared_plan_available': prepared is not None,
+                    'observation_snapshot_sha256': None if prepared is None else prepared.observation_snapshot_sha256,
+                    'planning_settings_sha256': None if prepared is None else prepared.settings_sha256,
+                    'native_shape_tyx': shape if prepared is None else list(prepared.native_shape),
                     'runs': [{'run_id': str(run.run_id), 'group_id': str(run.group_id),
-                              'status': 'not_attempted'} for run in prepared.runs],
+                              'status': 'not_attempted'} for run in (() if prepared is None else prepared.runs)],
                 }
-                target = destination/'context_preparation_failure.json'
-                temporary = target.with_suffix('.json.tmp')
-                temporary.write_text(json.dumps(receipt, sort_keys=True), encoding='utf-8')
-                temporary.replace(target)
+                if isinstance(getattr(error, 'receipt', None), Mapping):
+                    receipt['resource_admission'] = dict(error.receipt)
+                _write_context_preparation_failure(destination, receipt, error)
             raise
         finally:
             self._resource_local.sam_phase_scope = previous_phase_scope
@@ -1371,6 +1685,8 @@ class SamInterpolationContext:
         self._resource_local.sam_phase_scope = ('extrapolation', str(scope))
         prepared = None
         execution_started = False
+        preparation_phase = 'geometry_or_resource_admission'
+        shape, metadata = None, {}
         try:
             observed = np.asarray(observation_volume).view()
             observed.flags.writeable = False
@@ -1407,10 +1723,12 @@ class SamInterpolationContext:
             planning_keys = {'distance', 'walk_back', 'min_radius', 'wrap_axis',
                 'upstream_lineage', 'spacing_zyx', 'planner_limits', 'canonical_labels',
                 'eligible_terminals'}
+            preparation_phase = 'planning'
             with _trace_sam_phase('planning', metadata['scope_id'], operation='extrapolation'):
                 prepared = prepare_sam_extrapolation_pass(observed, view=view, scope=metadata,
                     crop_mode=self.crop_mode, **profile_kwargs,
                     **{key: value for key, value in kwargs.items() if key in planning_keys})
+            preparation_phase = 'image_or_gpu_admission'
             with self._lock:
                 self.planning_seconds += (getattr(prepared, 'planner_wall_seconds', 0.)
                                           + getattr(prepared, 'snapshot_wall_seconds', 0.))
@@ -1439,6 +1757,8 @@ class SamInterpolationContext:
                     kwargs['image_cohorts'] = cohorts
                     kwargs['image_cohort_provider'] = lambda subset: self.image_cohort_provider(
                         view, shape, subset, max_cache_bytes=cap)
+                    kwargs['image_cohort_prefetch'] = lambda subset: self.prefetch_image_cohort(
+                        view, shape, subset, max_cache_bytes=cap)
             else:
                 with self._lock:
                     self.no_job_passes += 1
@@ -1448,7 +1768,7 @@ class SamInterpolationContext:
             if self.crop_retry_policy is not None:
                 kwargs.setdefault('crop_retry_policy', self.crop_retry_policy)
                 kwargs.setdefault('retry_image_provider',
-                    lambda retry: self.image_provider(view, shape, prepared_plan=retry))
+                    lambda retry: self.image_cohort_provider(view, shape, retry))
             _, stats, components = extrapolate_sam_view_volume_pass(observed,
                 image_provider=provider, runtime=runtime, view=view, scope=metadata,
                 prepared_plan=prepared, crop_mode=self.crop_mode, cancel_event=self._cancel,
@@ -1459,23 +1779,24 @@ class SamInterpolationContext:
             stats['sam_image_cache_lifetime'] = self.image_cache_lifetime_snapshot()
             return observation_volume, stats, components
         except BaseException as error:
-            if prepared is not None and prepared.needs_tracking and not execution_started:
-                destination = Path(kwargs.get('work_dir', self.extrapolation_evidence_root /
-                    hashlib.sha256(str(scope).encode()).hexdigest()[:20]))
-                destination.mkdir(parents=True, exist_ok=True)
+            if not execution_started:
+                destination = kwargs.get('work_dir', self.extrapolation_evidence_root /
+                    hashlib.sha256(str(scope).encode()).hexdigest()[:20])
                 receipt = dict(schema='xta.sam-context-preparation-failure/1', complete=False,
                     evidence_purpose='sam_extrapolation', source_stage='post_interpolation',
-                    status='infrastructure_invalid', phase='image_or_gpu_admission',
-                    error=str(error), scope_id=str(scope),
-                    observation_snapshot_sha256=prepared.observation_snapshot_sha256,
-                    planning_settings_sha256=prepared.settings_sha256,
-                    native_shape_tyx=list(prepared.native_shape))
+                    status='infrastructure_invalid', phase=preparation_phase,
+                    error_type=type(error).__name__, error=str(error), scope_id=str(scope),
+                    sam_operation='extrapolation',
+                    view_name=metadata.get('view_name', str(getattr(view, 'name', ''))),
+                    physical_view=metadata.get('physical_view'), sam_crop_mode=self.crop_mode,
+                    sam_resource_profile=metadata.get('sam_resource_profile'),
+                    prepared_plan_available=prepared is not None,
+                    observation_snapshot_sha256=None if prepared is None else prepared.observation_snapshot_sha256,
+                    planning_settings_sha256=None if prepared is None else prepared.settings_sha256,
+                    native_shape_tyx=shape if prepared is None else list(prepared.native_shape))
                 if isinstance(getattr(error, 'receipt', None), Mapping):
                     receipt['resource_admission'] = dict(error.receipt)
-                target = destination / 'context_preparation_failure.json'
-                temporary = target.with_suffix('.json.tmp')
-                temporary.write_text(json.dumps(receipt, sort_keys=True), encoding='utf-8')
-                temporary.replace(target)
+                _write_context_preparation_failure(destination, receipt, error)
             raise
         finally:
             self._resource_local.sam_phase_scope = previous_phase_scope
@@ -1486,13 +1807,23 @@ class SamInterpolationContext:
     def close(self):
         self.cancel('SAM interpolation runtime is closing')
         with self._idle:
+            prefetches = tuple(self._image_prefetches)
+        for prefetch in prefetches:
+            try:
+                prefetch.close_if_unused()
+            except BaseException:
+                _retain_unsettled_context(self)
+                raise
+        with self._idle:
             if self._closed:
                 return
             while (self._active_passes or self._active_image_calls or self._active_image_cohorts
-                    or self._image_retirements):
+                    or self._image_retirements or self._image_prefetches):
                 self._idle.wait(timeout=0.25)
             close_error = None
             try:
+                for renderer in tuple(self._unsettled_image_renderers):
+                    renderer.close()
                 if self._runtime is not None:
                     dispatch = getattr(self._runtime, 'dispatch_stats', {})
                     self.dispatch_summary = dict(dispatch) if isinstance(dispatch, Mapping) else {}
@@ -1507,6 +1838,9 @@ class SamInterpolationContext:
                             raise
                         close_error = error
                     self._runtime = None
+                for release_credit in self._retained_image_prefetch_credits:
+                    release_credit()
+                self._retained_image_prefetch_credits.clear()
                 self._closed = True
                 _forget_settled_context(self)
                 for lease in reversed(self._leases):
@@ -1519,6 +1853,9 @@ class SamInterpolationContext:
                 self._caches.clear()
                 self._cache_transforms.clear()
                 self._cache_entries.clear()
+                self._cache_owners.clear()
+                self._image_sampling_proofs.clear()
+                self.cache_logical_bytes = 0
                 self.source_volume = None
             finally:
                 self._idle.notify_all()

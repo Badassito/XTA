@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import ast
+import os
 from pathlib import Path
 import sys
 import threading
@@ -16,12 +17,15 @@ from XTA import backprojection, geometry, interpolation, pipeline, sam_integrati
 
 
 def _context(tmp_path, *, devices=('0',)):
-    return sam_integration.SamInterpolationContext(
-        model_path='test-bundle', device_ids=devices,
-        temp_dir=tmp_path / 'temporary', evidence_root=tmp_path / 'retained',
-        source_volume=np.arange(60, dtype=np.uint8).reshape(3, 4, 5),
-        source_identity='source-identity', detector_identity='detector-identity',
-    )
+    # These legacy admission fakes have no model or allocator. Dual-context
+    # startup and its measured gates are exercised in the resource suite.
+    with mock.patch.dict(os.environ, {'YOLO_TTA_SAM_SESSIONS_PER_GPU': '1'}):
+        return sam_integration.SamInterpolationContext(
+            model_path='test-bundle', device_ids=devices,
+            temp_dir=tmp_path / 'temporary', evidence_root=tmp_path / 'retained',
+            source_volume=np.arange(60, dtype=np.uint8).reshape(3, 4, 5),
+            source_identity='source-identity', detector_identity='detector-identity',
+        )
 
 
 def _fake_runtime(factory):

@@ -460,8 +460,10 @@ class _MainProcessGpuStageLease:
     def release(self) -> None:
         if self._released:
             return
-        self._released = True
         self._coordinator.release_stage(self.device_index, self.purpose, token=self._token)
+        if self._released:
+            return
+        self._released = True
         runtime_trace_event('gpu_stage_released', device=f'cuda:{self.device_index}',
                             purpose=self.purpose)
 

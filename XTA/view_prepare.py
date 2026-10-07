@@ -10,11 +10,13 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 import shutil
 import threading
 import weakref
+from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -23,14 +25,25 @@ import numpy as np
 from .config import GIB
 from .geometry import ViewInfo, is_tilted_view, physical_view_name
 from .interpolation import NrrdLayerRef, PreparedViewResult, _DirectUnionBackingLease
-from .runtime import _interpolation_array_backing_path, close_memmap_array_without_flush
+from .runtime import (_interpolation_array_backing_path, close_memmap_array_without_flush,
+                      _memfd_owner_key_from_array, _mount_fstype_for_path,
+                      _MEMORY_BACKED_FSTYPES)
 
 
 def _array_lifetime_owner(array):
     owner, seen = array, set()
-    while getattr(owner, 'base', None) is not None and id(owner) not in seen:
+    while id(owner) not in seen:
+        base = getattr(owner, 'base', None)
+        if base is None and isinstance(owner, memoryview):
+            base = owner.obj
+            try:
+                weakref.ref(base)
+            except TypeError:
+                break  # Keep the weakrefable carrier for bytes/bytearray storage.
+        if base is None:
+            break
         seen.add(id(owner))
-        owner = owner.base
+        owner = base
     return owner
 
 
@@ -46,6 +59,72 @@ def scratch_unlink_path_for_memmap(arr: object, path: Path | None) -> Path | Non
     except OSError:
         pass
     return None
+
+
+def _windows_volume_ram_backing(path) -> bool | None:
+    """Use the native volume/drive classification; failed probes grant nothing."""
+    try:
+        import ctypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.GetVolumePathNameW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
+        kernel.GetVolumePathNameW.restype = ctypes.c_int
+        kernel.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
+        kernel.GetDriveTypeW.restype = ctypes.c_uint
+        root = ctypes.create_unicode_buffer(32768)
+        if not kernel.GetVolumePathNameW(str(path), root, len(root)) or not root.value:
+            return None
+        kind = int(kernel.GetDriveTypeW(root.value))
+        return True if kind == 6 else False if kind in (2,3,4,5) else None
+    except (OSError, AttributeError, TypeError, ValueError):
+        return None
+
+
+def _dense_mapping_ram_backing(path) -> bool | None:
+    filesystem = _mount_fstype_for_path(path)
+    if filesystem is not None:
+        return str(filesystem).lower() in _MEMORY_BACKED_FSTYPES
+    return _windows_volume_ram_backing(path) if os.name == 'nt' else None
+
+
+def classify_dense_ram_backing(arrays, *, future_ram_bytes=0) -> bool | None:
+    """Exclude only proven disk-only mappings with no future RAM allocation."""
+    if int(future_ram_bytes) < 0:
+        raise ValueError('Future dense RAM promise cannot be negative')
+    if future_ram_bytes:
+        return None
+    kinds = []
+    for array in arrays:
+        if array is None:
+            continue
+        if not isinstance(array, np.memmap):
+            kinds.append(True)
+            continue
+        if array._mmap is None or array._mmap.closed:
+            return None
+        if array.mode == 'c' or _memfd_owner_key_from_array(array) is not None:
+            kinds.append(True)
+            continue
+        backing = _interpolation_array_backing_path(array)
+        if backing is None:
+            return None
+        path = Path(backing)
+        if str(path).startswith('/proc/'):
+            kinds.append(True)
+            continue
+        try:
+            if path.is_symlink() or path.resolve() != path.absolute():
+                return None
+            if not path.is_file() or path.stat().st_size < int(array.offset) + int(array.nbytes):
+                return None
+        except OSError:
+            return None
+        kind = _dense_mapping_ram_backing(path)
+        if kind is None:
+            return None
+        kinds.append(kind)
+    if not kinds or any(kinds) and not all(kinds):
+        return None
+    return any(kinds)
 
 
 @dataclass
@@ -204,7 +283,9 @@ class AdmittedViewPrepare:
     confidence_retired_callback: Callable[[str, str, int], object] | None = None
     confidence_retired_callback_factory: Callable[[object], Callable] | None = None
     submit_sam_layer_projection: Callable[..., object] | None = None
-
+    backing_lease: _DirectUnionBackingLease | None = None
+    _cancelled_owner_refs: tuple = field(default=(), init=False, repr=False)
+    _cancelled_before_prepare: bool = field(default=False, init=False, repr=False)
     def rebind_confidence_retirement(self, lease):
         if self.confidence_retired_callback_factory is not None:
             self.confidence_retired_callback = self.confidence_retired_callback_factory(lease)
@@ -213,15 +294,69 @@ class AdmittedViewPrepare:
         owner, self.confmap_mm = self.confmap_mm, None
         return owner
 
+    def _retire_unstarted_inputs(self):
+        self._cancelled_before_prepare = True
+        self._cancelled_owner_refs = tuple(weakref.ref(_array_lifetime_owner(value))
+            for value in (self.union_mm, self.confmap_mm) if value is not None)
+        for name, path_name in (('union_mm', 'union_path'), ('confmap_mm', 'confmap_path')):
+            value = getattr(self, name)
+            if value is not None:
+                setattr(self, name, None)
+                path = getattr(self, path_name)
+                try:
+                    self.close_dense(value, unlink_path=(None if self.keep_temp_artifacts else
+                        scratch_unlink_path_for_memmap(value, path)))
+                except BaseException as error:
+                    self._cancelled_cleanup_error = error
+                    raise
+
+    def retire_cancelled_future(self, future):
+        """A successful Future.cancel proves this prepare never acquired inputs."""
+        if not (future.cancelled() or self._cancelled_before_prepare):
+            return
+        try:
+            if not self._cancelled_before_prepare:
+                self._retire_unstarted_inputs()
+        except BaseException as error:
+            future._xta_cancelled_prepare_cleanup_error = error
+        finally:
+            if getattr(self, '_cancelled_cleanup_error', None) is not None:
+                future._xta_cancelled_prepare_cleanup_error = self._cancelled_cleanup_error
+            future._xta_cancelled_prepare_owner_refs = self._cancelled_owner_refs
+
+    def track_cancellation(self, future):
+        # A successful future must not pin the task's original dense input.
+        reference = weakref.ref(self)
+        def retired(done):
+            task = reference()
+            if task is not None:
+                task.retire_cancelled_future(done)
+        future.add_done_callback(retired)
+
+    def check_cancelled(self):
+        cancelled = getattr(self.sam_context, '_cancel', None)
+        if cancelled is not None and cancelled.is_set():
+            self._retire_unstarted_inputs()
+            raise CancelledError(getattr(self.sam_context, '_failure', 'SAM preparation cancelled'))
+
     @contextmanager
     def _reservation(self):
+        self.check_cancelled()
         if (self.sam_context is not None and (int(self.extrapolation_distance) > 0
                 or self.interpolation_backend == 'sam' and int(self.interpolation_distance) > 0)):
-            from .sam_resources import admit_sam_parent_resources
+            from .sam_resources import admit_sam_parent_resources, sam_worker_count
             workers = len(getattr(self.sam_context, 'device_ids', ())) or 1
-            with admit_sam_parent_resources(self.admission, self.transient_bytes,
-                    f'{self.model_name}/{self.view.name}/fullframe', worker_count=workers,
-                    base_allowance_bytes=self.sam_base_allowance_bytes) as profile:
+            with ExitStack() as reservation:
+                try:
+                    profile = reservation.enter_context(admit_sam_parent_resources(
+                        self.admission, self.transient_bytes,
+                        f'{self.model_name}/{self.view.name}/fullframe', worker_count=workers,
+                        execution_slots=sam_worker_count(self.sam_context),
+                        base_allowance_bytes=self.sam_base_allowance_bytes,
+                        cancel_event=getattr(self.sam_context, '_cancel', None)))
+                except CancelledError:
+                    self.check_cancelled()
+                    raise
                 with self.sam_context.resource_scope(profile):
                     yield
         else:
@@ -230,6 +365,11 @@ class AdmittedViewPrepare:
 
     def __call__(self) -> PreparedViewResult:
         with self._reservation():
+            self.check_cancelled()
+            if self.backing_lease is not None:
+                # Preparation can replace a disk input with a newly allocated
+                # canvas. Keep its full dense promise until actual retirement.
+                self.backing_lease.ram_backed = None
             local_union_mm = self.union_mm
             try:
                 if local_union_mm is None:
@@ -254,6 +394,16 @@ class AdmittedViewPrepare:
                 # longer mask projection finished, even after capture retired it.
                 input_owner_ref = weakref.ref(_array_lifetime_owner(local_union_mm))
                 input_nbytes = int(np.asarray(local_union_mm).nbytes)
+                input_unlink_path = None
+                input_path_identity = None
+                if not self.keep_temp_artifacts:
+                    input_unlink_path = scratch_unlink_path_for_memmap(local_union_mm, self.union_path)
+                    if input_unlink_path is not None:
+                        try:
+                            identity = input_unlink_path.lstat()
+                            input_path_identity = (identity.st_dev, identity.st_ino)
+                        except OSError:
+                            input_unlink_path = None
                 result = self.prepare(
                     model_name=str(self.model_name),
                     view=self.view,
@@ -312,6 +462,21 @@ class AdmittedViewPrepare:
                 # fence still observes any producer/caller view of the backing.
                 result._dense_input_owner_ref = input_owner_ref
                 result._dense_input_nbytes = input_nbytes
+                if not self.keep_temp_artifacts and all(
+                    volume is None or _array_lifetime_owner(volume) is not input_owner_ref()
+                    for volume in (result.native_support_mm, result.final_view_volume_mm)
+                ):
+                    # All native readers/retries finished, and publications own
+                    # independent CVOLs. Preserve outside aliases via deferred
+                    # retirement of the original backing, not the rebound mask.
+                    if input_unlink_path is not None:
+                        try:
+                            identity = input_unlink_path.lstat()
+                            if (identity.st_dev, identity.st_ino) != input_path_identity:
+                                input_unlink_path = None
+                        except OSError:
+                            input_unlink_path = None
+                    self.close_dense(local_union_mm, unlink_path=input_unlink_path)
                 return result
             except BaseException:
                 # The original/local dense mapping belongs to this reservation.
@@ -336,6 +501,14 @@ class ViewPrepareLeaseState:
     postprocess_bytes: dict[tuple[str, str], int]
     retired_inputs: set[tuple[tuple[str, str], int, str]] = field(default_factory=set)
     retired_for_publication: set[tuple[str, str]] = field(default_factory=set)
+
+    @property
+    def ram_commitment_bytes(self) -> int:
+        return sum(lease.ram_commitment_bytes for lease in tuple(self.leases.values()))
+
+    @property
+    def disk_backed_logical_bytes(self) -> int:
+        return sum(int(lease.nbytes) for lease in tuple(self.leases.values()) if lease.ram_backed is False)
 
     def retire_dense_for_publication(self, prepared, *, enabled: bool, tiled: bool,
                                     keep_temp: bool, retired_callback,
@@ -389,6 +562,20 @@ class ViewPrepareLeaseState:
                 or str(backing).startswith('/proc/') else Path(backing)))
         prepared.native_support_mm = None
         prepared.final_view_volume_mm = None
+        return self._retire_after_owners(key, lease, roots, retired_callback)
+
+    def retire_cancelled(self, key, future, *, retired_callback) -> bool:
+        """Queued cancellation returns dense credit only after its last array owner dies."""
+        refs = getattr(future, '_xta_cancelled_prepare_owner_refs', None)
+        lease = self.leases.get(key)
+        if refs is None or lease is None or key in self.retired_for_publication:
+            return False
+        if getattr(future, '_xta_cancelled_prepare_cleanup_error', None) is not None:
+            return False
+        roots = {id(owner): owner for reference in refs if (owner := reference()) is not None}
+        return self._retire_after_owners(key, lease, list(roots.values()), retired_callback)
+
+    def _retire_after_owners(self, key, lease, roots, retired_callback):
         self.retired_for_publication.add(key)
         if lease is None:
             return False

@@ -10,6 +10,7 @@ high-level scheduler.
 from __future__ import annotations
 
 import math
+import os
 import queue
 import threading
 import time
@@ -56,6 +57,7 @@ class _WorkerMemfdSourceCache:
     pid: Optional[int] = None
     known: Dict[str, None] = field(default_factory=dict)
     pending: Dict[int, Tuple[str, ...]] = field(default_factory=dict)
+    direct_output_capability: Optional[Dict[str, int]] = None
 
     def completed(self, task_id: int, *, ok: bool) -> None:
         keys = self.pending.pop(int(task_id), ())
@@ -120,6 +122,7 @@ class TtaSchedulerOperations:
     view_processing_volume_shape: Callable[..., Sequence[int]]
     workspace_anon_cap_bytes: Callable[[], int]
     _set_main_process_gpu_spherical_retirement_pressure: Optional[Callable[[bool], object]] = None
+    staged_ram_backlog_bytes: Optional[Callable[[], int]] = None
 
 
 @dataclass(frozen=True)
@@ -414,18 +417,38 @@ class TtaScheduler:
         if cache is None or cache.queue is not queue_obj:
             cache = _WorkerMemfdSourceCache(queue_obj)
             self.state.worker_memfd_sources[key] = cache
+        pid = self._worker_process_pid(worker_kind, worker_id)
+        if pid is not None:
+            if cache.pid is not None and cache.pid != pid:
+                cache.known.clear()
+                cache.pending.clear()
+                cache.direct_output_capability = None
+            cache.pid = pid
         return cache
+
+    def _worker_process_pid(self, worker_kind: str, worker_id: int) -> Optional[int]:
+        processes = self.state.cpu_worker_processes if worker_kind == 'cpu' else self.state.gpu_worker_processes
+        name = f'openvino-worker-{worker_id}' if worker_kind == 'cpu' else f'gpu-worker-{worker_id}'
+        return next((int(process.pid) for process in processes
+                     if getattr(process, 'name', '') == name and getattr(process, 'pid', None) is not None
+                     and getattr(process, 'exitcode', None) is None), None)
 
     def _put_worker_inference_task(
         self, dispatch_task: Dict[str, object], worker_kind: str, worker_id: int,
     ) -> None:
         cache = self._worker_memfd_source_cache(worker_kind, worker_id)
+        actual_pid = self._worker_process_pid(worker_kind, worker_id)
+        capability = cache.direct_output_capability
+        if (actual_pid is None or capability is None or cache.pid != actual_pid
+                or capability.get('worker_pid') != actual_pid or capability.get('parent_pid') != os.getpid()):
+            capability = None
         batch = None
         try:
             with scheduler_step('memfd_attach', worker_id=worker_id,
                                 task_id=int(dispatch_task['task_id'])):
                 batch = self.operations._attach_memfd_transfers_to_task(
                     dispatch_task, known_sources=tuple(cache.known),
+                    direct_output_capability=capability,
                 )
             with scheduler_step('payload_serialize', worker_id=worker_id,
                                 task_id=int(dispatch_task['task_id'])):
@@ -455,14 +478,29 @@ class TtaScheduler:
         if mtype == 'ready':
             pid = msg.get('pid')
             if pid is not None:
+                actual_pid = self._worker_process_pid(worker_kind, worker_id)
+                if actual_pid is not None and int(pid) != actual_pid:
+                    return
                 if cache.pid is not None and cache.pid != int(pid):
                     cache.known.clear()
                     cache.pending.clear()
+                    cache.direct_output_capability = None
                 cache.pid = int(pid)
         elif mtype in {'compute_released', 'result'}:
             # The result's worker identity must match the queue which received this
             # task. A different worker has no pending entry and cannot authorize it.
-            cache.completed(int(msg.get('task_id', -1)), ok=bool(msg.get('ok')))
+            task_id = int(msg.get('task_id', -1))
+            sources = cache.pending.get(task_id, ())
+            cache.completed(task_id, ok=bool(msg.get('ok')))
+            capability = msg.get('memfd_parent_proc_capability')
+            actual_pid = self._worker_process_pid(worker_kind, worker_id)
+            if (bool(msg.get('ok')) and isinstance(capability, dict)
+                    and set(capability) == {'parent_pid', 'worker_pid', 'source_key'}
+                    and type(capability['parent_pid']) is int and type(capability['worker_pid']) is int
+                    and capability['parent_pid'] == os.getpid()
+                    and actual_pid is not None and actual_pid == cache.pid == capability['worker_pid']
+                    and capability['source_key'] in sources):
+                cache.direct_output_capability = {'parent_pid': os.getpid(), 'worker_pid': actual_pid}
 
     def bind_result_callbacks(self, callbacks: TtaSchedulerCallbacks) -> None:
         """Bind the main-thread completion callbacks exactly once before result drain."""
@@ -1980,6 +2018,19 @@ class TtaScheduler:
         return sum(self._direct_union_parent_bytes(member)
                    for member in self._direct_union_admission_tasks(task))
 
+    def _direct_union_admission_totals(self) -> Tuple[int, int, int]:
+        postprocess = int(sum(self.state.direct_union_postprocess_bytes.values()))
+        staged = (0 if self.operations.staged_ram_backlog_bytes is None else
+                  int(self.operations.staged_ram_backlog_bytes()))
+        if not 0 <= staged <= postprocess:
+            raise RuntimeError('SAM RAM backlog exceeds its postprocess ownership')
+        return (
+            len({self.state.direct_union_admission_group_by_parent.get(parent, parent)
+                 for parent in self.state.direct_union_inference_views}),
+            int(sum(self.state.direct_union_inference_bytes.values())),
+            postprocess - staged,
+        )
+
     def direct_union_task_admissible(
         self, task: Dict[str, object], *,
         precomputed_key: object = _SELECTION_KEY_UNSET,
@@ -2018,17 +2069,7 @@ class TtaScheduler:
                 'bounded parent dense limit'
             )
         if admission_totals is None:
-            active_groups = {
-                self.state.direct_union_admission_group_by_parent.get(parent, parent)
-                for parent in self.state.direct_union_inference_views
-            }
-            if len(active_groups) >= int(self.inputs.direct_union_inference_view_limit):
-                return False
-            admission_totals = (
-                len(active_groups),
-                int(sum(self.state.direct_union_inference_bytes.values())),
-                int(sum(self.state.direct_union_postprocess_bytes.values())),
-            )
+            admission_totals = self._direct_union_admission_totals()
         active_group_count, inference_active, postprocess_active = admission_totals
         if int(active_group_count) >= int(self.inputs.direct_union_inference_view_limit):
             return False
@@ -2201,14 +2242,7 @@ class TtaScheduler:
             direct_parent = descriptor.direct_parent
             direct_parents[task_id] = direct_parent
             if direct_parent is not None and admission_totals is None:
-                admission_totals = (
-                    len({
-                        self.state.direct_union_admission_group_by_parent.get(parent, parent)
-                        for parent in self.state.direct_union_inference_views
-                    }),
-                    int(sum(self.state.direct_union_inference_bytes.values())),
-                    int(sum(self.state.direct_union_postprocess_bytes.values())),
-                )
+                admission_totals = self._direct_union_admission_totals()
             shape = task.get('processing_shape', ())
             # An ordinary parent's explicit dense shape completely determines its
             # memory request. Heterogeneous/fallback shapes and policy groups retain
@@ -2364,12 +2398,7 @@ class TtaScheduler:
                 and isinstance(shape, (tuple, list)) and len(shape) == 3
                 and all(isinstance(value, (int, np.integer)) for value in shape))
             if parent is not None and admission_totals is None:
-                admission_totals = (
-                    len({self.state.direct_union_admission_group_by_parent.get(key, key)
-                         for key in self.state.direct_union_inference_views}),
-                    int(sum(self.state.direct_union_inference_bytes.values())),
-                    int(sum(self.state.direct_union_postprocess_bytes.values())),
-                )
+                admission_totals = self._direct_union_admission_totals()
             if shared_admission:
                 contract = (parent, str(pending_task.get('result_mode', 'file')), tuple(shape))
                 if contract not in direct_admission:

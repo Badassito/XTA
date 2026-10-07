@@ -96,7 +96,8 @@ def test_retry_real_raw_adapter_preserves_all_seed_frame_crop_and_mask_owners(
         monkeypatch.setattr(TiledRunAssembly, 'consume', measured_consume)
         monkeypatch.setattr(TiledRunAssembly, 'close', measured_close)
     for name, retry in (('serial', serial), ('parallel', parallel)):
-        pool = _CompletionPool()
+        jobs=len(retry.tracker_jobs if mode=='tiled' else retry.runs)
+        pool = _CompletionPool(expected_initial=min(jobs,int(retry.cpu_wave_admission['max_in_flight'])))
         tracker = SamInterpolationTracker(model_path='unused', device_ids=(0, 1, 2, 3),
             artifact_root=tmp_path/name/'staging', source_cache_ref=cache)
         tracker._pool = pool
@@ -108,7 +109,7 @@ def test_retry_real_raw_adapter_preserves_all_seed_frame_crop_and_mask_owners(
                 runtime=tracker, resource_profile=None, upstream_lineage={}, min_radius=3.,
                 cancel_event=None, original_run_ids=serial_ids)
             bundles.append(bundle)
-            inventories.append({task.work_id: (tuple(task.payload['crop_xyxy']),
+            inventories.append({task.payload['run_id']: (tuple(task.payload['crop_xyxy']),
                 task.payload['seed_frame'], task.payload['frame_start'], task.payload['frame_stop'],
                 task.payload['direction'], task.payload['seed_sha256'])
                 for _device, task in pool.submissions})

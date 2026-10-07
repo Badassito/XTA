@@ -720,7 +720,7 @@ _SAM_ADAPTIVE_CROP_SNAPSHOT = contextvars.ContextVar('tta_sam_adaptive_crop_snap
 
 
 def resolve_sam_adaptive_crop(environ=None) -> bool:
-    """Opt in to one bounded retry from the same original SAM seed."""
+    """Opt in to admitted crop enlargement and replay from original SAM seeds."""
     snapshot = _SAM_ADAPTIVE_CROP_SNAPSHOT.get()
     if snapshot is not _SAM_ADAPTIVE_CROP_UNSET and environ is None:
         return bool(snapshot)

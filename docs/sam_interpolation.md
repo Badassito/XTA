@@ -224,15 +224,52 @@ asset-retirement acknowledgement. A CPU detector route or an entirely separate
 SAM device pool can acquire its devices independently. Failed retirement or
 unsettled model work must not advertise a shared device as available.
 
-After startup, a resident-owner guard keeps the predictor and feature cache
-loaded while fencing detector and auxiliary inference reuse. Each endpoint job
-takes a separate exclusive compute lease. A worker must acknowledge device-wide
-CUDA completion after session cleanup before handing that lease back. Eligible
+After startup, a resident-owner guard keeps predictors and feature caches
+loaded while fencing detector and auxiliary inference reuse. One physical GPU
+compute lease covers every active worker slot on that device. Each worker
+acknowledges completion of its own CUDA context after session cleanup; only the
+last authenticated completion can return the physical compute lease. Eligible
 Spherical, Radial and Tilted-Azimuthal projection stages may borrow an idle
 resident device through their existing capability and live-VRAM checks. This
 does not enable a projection backend whose geometry contract refuses CUDA.
 Startup, shutdown and cancellation retain or quarantine ownership until cleanup
 is proved; an idle model is never treated as free memory.
+
+A persistent pool scheduler owns worker submission and result reception across
+admitted scopes. It verifies each exact completion manifest and CUDA proof before
+returning compute credit. A paused CPU consumer or a one-job retry does not exclude
+another ready, admitted scope from idle workers. Internal task IDs are namespaced
+by scope; original scientific run IDs, seeds, crops, frames and result indices are
+preserved and validated on return.
+
+The original producer thread prepares requests and decodes raw masks. Ready job
+envelopes can be staged ahead in a bounded bank, letting the scheduler refill while
+that thread consumes a result. Each scope keeps its existing SDK-wave limit and
+decoded-consumer margin. Additional seed/packed-result/metadata slots require a
+separate nonblocking reservation from the same parent pool and available physical
+headroom. If no extra bank can be funded, the original bounded window remains
+usable across independently admitted scopes. Saved metadata cannot grant credit;
+legacy callers without live scope admission retain exclusive execution.
+
+For multi-cohort extrapolation, one background CPU producer can render the next
+frozen image cohort while the current cohort runs. It reserves separate image
+and render-scratch credit from the existing parent pool; unavailable credit
+falls back to ordinary synchronous rendering. At most the consumed cohort and
+one next cohort are retained. The image producer owns its resource and cache
+contexts through retirement; this image-only grant does not authorize SDK work.
+Retry crops are still planned from observed boundary contact.
+
+GPU compute credit is acquired after request/seed preparation, immediately before
+submission. The worker still renders RGB frames and initializes SDK inputs under
+that lease. Scheduler join precedes pool shutdown, and outstanding producer,
+worker, packet and cache owners retain their resources through cancellation or
+uncertain cleanup. A cache's retirement depends on its own scope/mapping proofs,
+rather than requiring unrelated SAM scopes to finish.
+
+The existing system sampler reports aggregate `sam.scheduler.live` counts for
+ready, preparing, running, completed-waiting and consumer-held work. Running
+includes worker preparation and packing until its completion acknowledgement;
+it is not a GPU-kernel utilization measurement.
 
 For shared detector/SAM devices, completed full-frame parents can be checkpointed
 before preparation waits on that retirement signal. The scheduler closes their
@@ -242,40 +279,121 @@ limit and the existing transient admission rules. Tile detector cleanup can
 publish compact results while its parent support is deferred. A checkpoint is
 not a completed parent, a published bridge, or permission to start SAM early.
 
-Suitable owned regular disk mappings are reused without a full copy. Anonymous
-or memory-backed masks and confidence arrays are copied with bounded streaming
-I/O, preserving their shape, dtype and exact values. Deferred D1 shadows remain
-compact. Checkpoints use disk-backed run scratch, or the run output directory
-when scratch is memory-backed; shared-device staging requires at least one of
-those locations to be disk-backed. With retained temporary artifacts, the disk
-checkpoint takes ownership of the debug copy when a memory-backed input retires.
-The `sam_interpolation.parent_staging` telemetry records parent counts, actual
-copied bytes, reused disk bytes and I/O time. Cluster runs should inspect these
-costs alongside inference time; local CPU qualification does not establish their
-production throughput.
+Multiple parents can own RAM-first backing, claimed before workspace allocation
+and bounded by retained bytes, physical/cgroup headroom and room for the next
+detector group. Completed immutable RAM parents leave the active detector
+admission window while retaining their original backing lease and RAM charge
+until checkpoint retirement. At the RAM threshold, new parents use reusable
+disk backing; freed RAM becomes eligible again after drain. Disk
+flush/fsync/retirement runs independently of the RAM codecs. Completed
+uint8 masks with a single nonzero value
+use the existing packed CVOL format; uint8 confidence uses existing lossless
+blocks, preserving all scores independently of mask support. The first disk
+write is compact. Codec workspace is separately bounded; unavailable checkpoint
+codec credit takes the raw streaming route without waiting behind SAM.
+Unsupported numeric inputs remain exact raw arrays. Already written owned disk
+maps are reused, and existing compact D1 shadows stay compact.
 
-Parents that must wait for shared SAM device retirement now allocate their union
-and retained confidence arrays directly on their verified regular, run-owned
-disk paths when that backing can be reused by the checkpoint. Fresh mappings
-retain exact zero initialization, shape, dtype, admission charges and ownership.
-Tmpfs and other noneligible paths keep their existing allocation behavior.
-Accumulation may still dirty full planes; reuse removes the duplicate checkpoint
-copy. Staging byte counters describe cumulative application payload, not peak
-disk occupancy or physical device traffic.
+Original owners close before dense credit returns. Restore runs off the scheduler
+under fresh dense and codec admission, using RAM when possible and raw disk
+otherwise. Checkpoints require ordinary disk scratch or output backing. Existing
+`sam_interpolation.parent_staging` counters include compact logical/stored bytes,
+raw fallbacks and `checkpoint_wall_seconds` (including CPU encoding and fsync).
+They measure application work, not physical device traffic or peak occupancy.
+RAM birth admission counts actual RAM commitments rather than full logical
+disk-backed arrays. Only proven disk-only mappings are excluded; mixed backing,
+unknown filesystems, lazy RAM and future canvases stay fully charged. Preparation
+restores the full promise before it can create RAM output. Logical dense leases
+and ownership limits remain unchanged. The existing staging gauge records the
+latest refusal's requested bytes, active RAM commitments, excluded disk bytes,
+detector reserve, limits and sampled physical headroom.
+On scheduler failure, the first traceback is flushed before teardown waits.
+Queued preparation is cancelled before restore or admission; its dense credit
+returns only after actual input owners retire. Running work still settles, and
+GPU quarantine remains in force until cleanup is proved.
 
-Each admitted SAM device owns one isolated persistent predictor and at most one
-endpoint job at a time. A free worker takes the next bounded job. GPU/result
-consumption for different scopes is serialized by its owner, while their CPU
-planning, rendering, and reconciliation can overlap. Evidence commits retain
+Checkpoint workers use the existing parent concurrency allocation and start
+encoding immediately after the last detector writer finishes. Optional SAM
+cleanup/planning no longer delays that drain. A separate request can build
+the existing lazy host processing cube after decode readiness, while reserving
+headroom for unused dense/transient allowances. Neither path loads SAM on a GPU.
+Authoritative planning runs under fresh admission and reuses matching pixels;
+the ordinary preparation stage performs detector cleanup exactly once.
+
+SAM parent preparation derives its default from the allocated main-process CPU
+budget: one parent per sixteen allocated workers, or two parents per requested
+tracker slot, whichever is larger. Four GPUs with two sessions therefore target
+at least sixteen parents; larger CPU allocations can raise the target. View,
+CPU and physical-memory caps still apply, and live memory admission determines
+which parents start. Slice workers divide the existing CPU budget across them.
+Image builds with distinct live parent credits can use those producer lanes
+without a separate two-builder ceiling. Same-credit builds cannot overlap, and
+uncredited callers share the existing aggregate cache/render allowance.
+`YOLO_TTA_PARENT_POSTPROCESS_WORKERS` retains its explicit override. These tasks
+include planning, rendering, selection and publication, so they need spare lanes
+while other parents wait or consume results; they are not extra GPU sessions.
+On large hosts, SAM dense and transient defaults use 40% and 25% of actual
+physical/cgroup/SLURM headroom after a 64 GiB reserve. The inference cap, small-host
+floors, explicit byte limits and policy clamps remain. Non-SAM defaults retain
+their previous ceilings. Policy admission includes the full SAM transient pool
+when reserving space for dense parents and output work.
+
+Production requests two isolated predictor processes per physical GPU. Set
+`YOLO_TTA_SAM_SESSIONS_PER_GPU=1` for the serial path; supported values are 1 and 2.
+Each slot has independent model/session state, precision context and feature
+cache. This uses more model memory and permits CPU preparation/consumption in one
+worker while another uses the GPU. Separate CUDA contexts do not imply simultaneous
+kernels without MPS; no MPS service or policy is changed automatically.
+[NVIDIA documents that scheduling distinction](https://docs.nvidia.com/deploy/mps/595/architecture.html).
+
+Dual startup divides measured free VRAM, after mandatory headroom, into enforced
+per-process PyTorch allocator quotas before loading models. Host startup checks
+also preserve outstanding parent-pool promises. Admission rechecks actual free
+memory after every worker is ready. Resource refusal at startup retires the whole
+attempt before falling back to one worker and submitting any original job.
+For shared detector devices, a nonempty or unknown parent triggers startup on
+the existing preparation executor after detector retirement. Deferred parents
+resume only after this startup check finishes, so their reservations do not
+preempt model startup. Valid empty detector metadata avoids unnecessary model
+loading. Nonempty tile callbacks likewise warm before reserving their own SAM
+workspace. Codec and other outstanding memory promises remain counted.
+The startup decision is published in `sam.startup_admission` telemetry so an
+interrupted run retains its requested/effective worker count and fallback reason.
+Successful startup does not prove that every future full history fits a quota;
+later OOM fails explicitly without shortening histories or publishing partial
+support. Serial mode retains the previous allocator behavior.
+
+Resource-grant eligibility and per-session acceptance keep their physical-device
+policy. Separate authenticated `execution_slots` can increase concurrency only
+within the same owned CPU-wave bytes; uncredited legacy calls retain their old
+physical-device cap. Ready scopes are served round-robin. Dispatch fills idle
+physical GPUs before second slots, then uses advisory slot-local crop affinity.
+Slot index, PID and attempt are checked independently of scientific model identity.
+Evidence commits retain
 stable run IDs, lineage, selection, and directional pixels despite out-of-order
 worker completion. Packed bundle offsets, checksums, and timings can differ
 between fresh generation attempts.
+
+Group evidence is written as results arrive when its estimated contract/packing
+and tiled-assembly scratch fits beside the unchanged CPU inference wave in owned
+credit. Insufficient credit retains the original pre-inference barrier. All
+groups and skipped tiles are still included before evidence commit. Generation
+stats report `sam_group_evidence_schedule` and
+`sam_group_evidence_overlap_bytes`; interleaving changes scheduling, not masks,
+acceptance rules or frame intervals.
 
 With `YOLO_TTA_TASK_TRACE=1`, `sam_phase_begin` and `sam_phase_end` events identify
 planning, image rendering, retry, selection and publication in the existing
 telemetry streams. Scope, operation and phase identities pair concurrent calls.
 An unmatched begin in an interrupted capture identifies unfinished host work;
 these spans may overlap and are not GPU kernel durations.
+Failed phase-end events include the exception class and a bounded message.
+`context_preparation_failure.json` also records planning errors raised before a
+prepared plan exists; failure to write diagnostics does not replace the original
+exception. Scheduler wait telemetry includes transient-pool usage, GPU resident
+owners and quarantine reasons, asset retirement, and inference backlog.
+Per-job `timings.sdk_session_init_seconds` separates SDK input loading/state
+initialization from the remaining work inside inclusive `tracker_seconds`.
 
 Automatic whole-crop generation prefers family FIFO when the runtime supports
 its family API, subject to the balance guard below. One family stays on one device through independently seeded runs,
@@ -314,15 +432,60 @@ selection. Completed masks are packed and released promptly. No-op or reject-all
 scopes retain the original volume and empty directional slots without allocating
 a dense merged workspace. There is no new command-line flag.
 
-The image provider pins the exact detector canvas. It aliases verified canonical
-Transverse backing when available; otherwise the established TTA grayscale
-sampler renders the requested frame/crop rectangles into an immutable compact
-cache. Generic views can require one shared processing-volume memmap
+The image provider pins the detector canvas geometry. It aliases verified
+canonical Transverse backing when available; otherwise it renders the requested
+frame/crop rectangles into an immutable compact cache. Generic CPU views can
+require one shared processing-volume memmap
 materialization, reused across their demands. The decoded-slice shortcut remains
-limited to Transverse. Identical demands or covered subsets reuse saved pixels;
-overlapping demands render only missing pixels. Empty plans still cause no
+limited to Transverse. Identical demands reuse saved pixels; CPU canonical
+covered subsets and overlaps can reuse matching saved pixels. Empty plans cause no
 materialization. Reduced square canvases retain their existing affine and
 stack-resampling semantics.
+
+GPU image construction is enabled by default (`YOLO_TTA_SAM_GPU_IMAGES=0` selects
+CPU only). It reuses TTA's GPU projectors and uint8 affine sampling for supported
+Cartesian, Tilted, Azimuthal, Radial and Spherical views. Tilted crops use TTA's
+existing fused crop entry point and its fallback. A complete existing CPU
+cache takes precedence. Otherwise a producer wins its host-memory credit and
+cache-build ticket before requesting a GPU. Busy devices are retried for up to
+30 seconds without holding a GPU lease or source allocation; cancellation wakes
+the wait. Insufficient VRAM on idle devices keeps the CPU fallback. The bounded
+wait prevents starvation under the existing coordinator's non-fair claims.
+The transaction admits source
+residency and projection/grid scratch, returns only demanded crops to the host,
+and releases GPU storage before returning its compute lease. Missing capacity,
+unfinished source decode or unsupported source geometry keeps the CPU path.
+Ready materialized processing cubes, including streaming-preprocessing outputs,
+are used directly. Unmaterialized streaming cubes keep CPU preparation to retain
+their endpoint-aligned temporal grid; the GPU virtual native-T path is used only
+for the matching nonstreaming center-aligned recipe.
+
+This route accepts the existing TTA fast-path intensity differences; it does not
+change frame selection, crop coverage or source coordinates. CPU/GPU pixel and
+feature-cache identities stay separate. GPU identities include the exact crop
+demand, preventing a feature hit or partial donor reuse across GPU crop-origin
+rounding phases. CPU canonical cross-demand reuse remains available.
+Authenticated matching source, geometry,
+logical shape and cyclic frame-address proofs permit a retry/cohort to use the
+other sampler. Saved metadata alone cannot authorize that switch. Portable
+`image_sampling_sources` and per-run/cohort identities record the actual inputs;
+the evidence scope identity remains pinned for import validation.
+`sam.gpu_images.*` counters report admissions, rendered pixels, source uploads,
+admission wait time/timeouts and fallback reasons. These are route diagnostics,
+not a throughput guarantee.
+
+The pinned SAM SDK's RGB loader also has a prepared-input route. The worker
+allocates one contiguous CPU float16 clip within its existing CPU-wave allowance.
+The exact CPU path uses Pillow resizing and a 256-value normalization lookup;
+the CUDA path resizes one frame at a time with separable antialiased bicubic
+sampling and uint8 rounding/clamping between axes, then copies normalized pixels
+to the CPU clip. It retains native frame count, geometry and CPU offloading.
+Insufficient CUDA workspace keeps the exact CPU route. Unsupported SDKs retain
+their original loader. The scoped adapter preserves the SDK's complete session
+initialization and restores the original loader on success or error. Per-run
+receipts and feature-cache identities record the actual input policy; the CUDA
+path accepts small intensity differences. `YOLO_TTA_SAM_GPU_IMAGES=0` also selects
+the exact CPU input-preparation path.
 
 When a lazy Transverse source has unchanged XY geometry and only its time axis
 needs resizing, bounded batches reuse the exact OpenCV temporal resize for
@@ -515,7 +678,13 @@ Production can admit larger families through a live memory profile. Additional
 SAM credit, up to 16 GiB, is reserved atomically with the parent's existing
 transient work and constrained by physical/cgroup/SLURM headroom and the current
 pool capacity. Pool capacity or swap alone cannot authorize the increase.
-Insufficient credit retains the lower declared bounds. Contract construction
+If total pool capacity and isolated physical headroom can fund the minimum extra,
+admission waits when incumbent promises consume either pool credit or physical
+allowance. It also waits when incumbents alone clamp the identified base CPU
+allowance. Waiting takes no partial reservation, observes cancellation, and
+resamples both limits. Genuine isolated low headroom, insufficient total capacity,
+and the emergency oversize lane retain the lower declared bounds.
+Contract construction
 and policy topology use the credit in separate phases, and the resolved limits
 are recorded with the plan and selection. Serialized profile metadata does not
 authorize a replay allocation: replay must obtain its own live credit.
@@ -749,15 +918,15 @@ inside the existing total allowance, expire with the owning outer transaction,
 and preserve its complete payload checks before and after use. Cache pressure
 causes recomputation; it cannot change a mask or relax a selection gate.
 
-### Bounded adaptive crop retry
+### Adaptive crop enlargement and replay
 
-`YOLO_TTA_SAM_ADAPTIVE_CROP=1` enables an experimental retry for interpolation and
+`YOLO_TTA_SAM_ADAPTIVE_CROP=1` enables adaptive replay for interpolation and
 extrapolation. It defaults to `0` and is validated and pinned only when SAM work
 is active. Each attempt uses a fixed crop throughout its complete tracker
 interval; the crop does not move between individual frames.
 
-After the original attempt, raw mask contact with an internal crop edge can
-request one larger attempt for that original group. Contacts are checked across
+After each complete attempt, raw mask contact with an internal group-crop edge
+requires another admitted larger attempt for that original group. Contacts are checked across
 the sequence, so growth that touches an edge and later shrinks is still detected.
 For extrapolation, only the prefix reached before raw-empty termination can
 trigger a retry. Contact with the declared canvas boundary cannot request pixels
@@ -768,7 +937,8 @@ Whole-crop contact checks authenticate the complete compressed and packed mask,
 its shape and its foreground count, then inspect boundary bits without expanding
 the full binary raster. The caller's original crop and canvas geometry must
 match the evidence. Tiled checks retain the dense overlapping halo union.
-Contact counts, retry decisions and acceptance rules are unchanged.
+Each enlargement is based on freshly authenticated contacts from the latest
+complete attempt, including an object that touches an edge and later shrinks.
 
 This retry enlarges the group's outer context. In tiled mode it may change the
 footprint layout, but it does not enlarge an individual child's fixed 1008-pixel
@@ -780,34 +950,45 @@ The retry enlarges the contacted sides and rerenders the needed image rectangles
 It restarts fresh tracker sessions using the exact same frozen original seeds and
 complete intervals. A clipped prediction never becomes a new prompt. Attempt
 identity and evidence remain separate, and the selected attempt undergoes the
-operation's usual selection rules. Interpolation still checks contacts and
-topology across the combined scope. Extrapolation retains its raw-empty/horizon
-rule without introducing a crop-border rejection.
+operation's usual selection rules. Only the final complete attempt with resolved
+outer-context contact replaces the original group; older attempts are not unioned
+or spliced into it. Interpolation still checks contacts and topology across the
+combined scope. Extrapolation retains its raw-empty/horizon rule.
 
-Extra work is charged before retry submission and is not refunded after a failed
-attempt. The controller imposes all of these limits in addition to current live
-resource admission:
+The contacted sides initially request at least 64 pixels or 25% of their current
+dimension, with at most a twofold area increase per step. If that proposal cannot
+be admitted, a bounded sequence of smaller enlargements is evaluated independently;
+tiled resource costs are not assumed to be monotone. Only the admitted candidate
+is charged. Crops grow strictly within the declared canvas, so the chain is finite.
+Full original-seed histories are replayed
+at every step; a nearer predicted frame is never substituted as a seed.
+Each attempt uses an owned image-cache context. The cache retires after its worker
+mapping proof and iterator lifetime settle, while compact attempt evidence and
+the resident predictor/feature cache remain available.
 
-| Limit | Bound |
-| --- | --- |
-| Attempts | At most one additional attempt per original group; no recursive retry |
-| Enlargement | Contacted sides request at least 64 pixels or 25% of that dimension, reduced as needed to fit the area caps |
-| Crop area | At most twice the original area and at most 16,777,216 pixels |
-| Extra native pixel-frames per scope | Maximum of 25% of original scope work, 16,777,216, or twice the largest original group's work; capped at 268,435,456 |
-| Extra tracker frames per scope | Maximum of 25% of original scope frames or the largest original group's frames; capped at 512 |
-| Retry CPU workspace | At most 2 GiB and no more than the current admitted byte allowance; GPU admission remains separate |
+Each attempt still requires live resource admission. Session/CPU-wave allowances,
+immutable image-cache limits, planner/decoder bounds and GPU admission remain
+operative. The controller has no default single-attempt, extra-frame, pixel-work,
+absolute crop-area or separate 2 GiB retry ceiling. Explicit caller-supplied caps
+remain enforceable and are reported as such; free system RAM does not authorize
+allocations outside the current lease.
+Standalone callers without a live resource profile keep the existing conservative
+2 GiB declared allowance. Reported available/admitted bytes describe that operative
+budget, not a measurement of all free system memory.
 
 Frame accounting includes all independent seeds, walk-back runs, and tiled child
 jobs with their halos. Pixel-frame accounting charges the full retry, not just
-the newly exposed area. The one-group allowance permits a useful retry in a
-small scope, so the limit is not a strict 25% overhead guarantee. Absolute caps
-can refuse a large group, and wall-clock cost also depends on inference and I/O.
+the newly exposed area. Cumulative work and every attempt's geometry, contacts,
+resource estimate and outcome remain in the retry ledger. Failed work is not
+refunded. Runtime can increase when an object needs several enlargements.
 
-When enlargement, admission, or the retry fails, the original evidence remains
-available with an explicit refusal/failure receipt and censored-extent status.
-One retry may still touch the enlarged boundary; the runtime does not continue
-enlarging until the object fits. With adaptive cropping disabled, growth and
-shrinkage remain supported only within the original fixed context.
+If required enlargement cannot fit an operative bound, makes no progress, or
+fails, the affected SAM scope raises a clear error and retains its diagnostic
+evidence. It does not publish the unresolved clipped attempt as a successful
+adaptive result. Original detector observations remain intact. Resolution here
+means no internal **outer-group** contact; it does not certify extent beyond the
+canvas or change the separate child-tile rules above. With adaptive cropping
+disabled, growth and shrinkage remain limited to the original fixed context.
 
 ### Largest-island and one-direction continuation experiments
 

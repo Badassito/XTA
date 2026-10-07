@@ -143,6 +143,8 @@ def test_real_pipeline_background_checkpoint_refills_four_workers_before_next_ou
     unions = {PublishedUnion(index): ('model', str(index)) for index in range(10)}
     namespace = dict(vars(pipeline))
     namespace.update(scheduler=scheduler, inference_worker_process_active=True,
+        _maybe_prepare_sam_cpu_source=lambda:None,
+        _maybe_prepare_sam_runtime=lambda:None,
         background_drain_budget=budget, _drain_parent_mask_ready_events=lambda: None,
         parent_confidence_retired_events=queue.SimpleQueue(),
         parent_dense_retired_events=queue.SimpleQueue(),

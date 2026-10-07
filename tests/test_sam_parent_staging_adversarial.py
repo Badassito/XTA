@@ -1,7 +1,9 @@
 """Independent bounded parent staging, physical ownership and continuation tests."""
 from concurrent.futures import Future
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 import gc
 import os
 import threading
@@ -317,4 +319,546 @@ def test_tmpfs_falls_back_to_output_and_both_ram_refuse(tmp_path,monkeypatch):
     monkeypatch.setattr(staging,'path_is_memory_backed',lambda path:True)
     with pytest.raises(RuntimeError,match='both destinations are memory-backed'):
         staging.select_checkpoint_root(tmp_path/'a',tmp_path/'b')
+
+
+@pytest.mark.parametrize('foreground', [1, 255])
+def test_compact_first_write_restores_exact_native_mask_scores_and_or_max(tmp_path, monkeypatch, foreground):
+    ready = [False]
+    staged, check, prepare, leases = queue(tmp_path, cap=200000, ready=lambda:ready[0])
+    shape = (7, 33, 35)  # Odd native width, empty frames, unaligned crop starts.
+    mask = np.zeros(shape, np.uint8)
+    mask[0,0,-1] = mask[-1,-1,0] = foreground
+    mask[2:5,3:29,5:33] = foreground
+    rng = np.random.default_rng(3184)
+    scores = rng.integers(0,256,shape,dtype=np.uint8)  # Include evidence outside labels.
+    scores[0,0,-1] = 0
+    scores[-1,-1,0] = 255
+    expected_mask, expected_scores = mask.copy(), scores.copy()
+    mask_ref, score_ref = weakref.ref(mask), weakref.ref(scores)
+    task = TinyTask(tmp_path, 'compact', mask, scores)
+    required = mask.nbytes + scores.nbytes
+    key = admit(leases, task, required)
+    workspace = []
+    active_codec = [False]
+    @contextmanager
+    def reserve(amount, name):
+        assert leases.postprocess_bytes[key] == required
+        active_codec[0] = True
+        workspace.append(amount)
+        try:yield
+        finally:active_codec[0] = False
+    task.admission = SimpleNamespace(reserve=reserve)
+    staged.defer(task, required)
+    del mask, scores
+    check.finish()
+    assert leases.postprocess_bytes[key] == required  # No early credit before pump.
+    assert mask_ref() is None and score_ref() is None
+    staged.pump()
+    assert not leases.leases
+    snapshot = staged.deferred[key][1]
+    assert snapshot.mask.encoding == 'packed_mask'
+    assert snapshot.mask.foreground_value == foreground
+    assert snapshot.confidence.encoding == 'score_blocks'
+    assert not tuple(snapshot.owned_dir.rglob('*.dat'))  # First disk bytes are compact.
+    assert snapshot.written_bytes == snapshot.mask.physical_bytes + snapshot.confidence.physical_bytes
+    original_allocate = staging.allocate_workspace_array
+    def admitted_allocate(*args, **kwargs):
+        assert active_codec[0] and leases.postprocess_bytes[key] == required
+        return original_allocate(*args, **kwargs)
+    monkeypatch.setattr(staging, 'allocate_workspace_array', admitted_allocate)
+    monkeypatch.setattr(staging, '_ram_fits', lambda *_args:False)  # Exact raw restore fallback.
+    ready[0] = True
+    resumed, _ = staged.pump()
+    assert task.union_mm is None and task.confmap_mm is None  # Scheduler did not decode.
+    assert leases.postprocess_bytes[key] == required
+    prepare.finish()
+    result = next(iter(resumed)).result()
+    np.testing.assert_array_equal(result.final_view_volume_mm, expected_mask)
+    np.testing.assert_array_equal(result.confidence, expected_scores)
+    other_mask = np.roll(expected_mask, 1, axis=2)
+    other_scores = np.flip(expected_scores, axis=2).copy()
+    np.testing.assert_array_equal(np.bitwise_or(result.final_view_volume_mm, other_mask),
+                                  np.bitwise_or(expected_mask, other_mask))
+    np.testing.assert_array_equal(np.maximum(result.confidence, other_scores),
+                                  np.maximum(expected_scores, other_scores))
+    assert result.final_view_volume_mm[0,0,-1] == foreground and result.confidence[0,0,-1] == 0
+    assert staged.restore_raw_bytes == required
+    assert len(workspace) == 2 and all(value >= staging.CODEC_CONTROL_BYTES for value in workspace)
+    staged.close()
+    for array in (task.union_mm, task.confmap_mm):array._mmap.close()
+    task.union_mm = task.confmap_mm = None
+    leases.complete(key, retain_for_dense_retirement=False)
+    staged.finalize_cleanup()
+
+
+@pytest.mark.parametrize('kind', ['mixed-mask', 'float32', 'complex64'])
+def test_compact_checkpoint_never_quantizes_unsupported_mask_or_confidence(tmp_path, kind):
+    shape = (7,33,35)
+    mask = np.zeros(shape, np.uint8)
+    mask[0,0,0] = 1
+    mask[-1,-1,-1] = 255 if kind == 'mixed-mask' else 1
+    dtype = np.uint8 if kind == 'mixed-mask' else np.dtype(kind)
+    values = np.arange(np.prod(shape),dtype=np.float32).reshape(shape).astype(dtype)
+    if dtype != np.uint8:
+        values[0,0,0] = -0.0
+        values[1,1,1] = np.nan
+    wanted_mask, wanted_values = mask.tobytes(), values.tobytes()
+    task = TinyTask(tmp_path, kind, mask, values)
+    root = tmp_path/'checkpoints';root.mkdir()
+    snapshot = staging.checkpoint_parent(task,root,tmp_path,mask.nbytes+values.nbytes,threading.Event())
+    assert snapshot.mask.encoding == ('raw' if kind == 'mixed-mask' else 'packed_mask')
+    assert snapshot.confidence.encoding == ('score_blocks' if dtype == np.uint8 else 'raw')
+    for saved, wanted in ((snapshot.mask,wanted_mask),(snapshot.confidence,wanted_values)):
+        restored = saved.open()
+        assert restored.tobytes() == wanted
+        restored._mmap.close()
+
+
+def test_ram_first_requires_physical_headroom_dense_limit_and_aggregate_anon_cap(monkeypatch):
+    reserve = staging.RAM_RESERVE_BYTES
+    monkeypatch.setattr(staging,'publication_ram_headroom',lambda:reserve+159)
+    monkeypatch.setattr(staging,'workspace_anon_cap_bytes',lambda:0)
+    assert not staging._ram_fits(120,40,256)
+    monkeypatch.setattr(staging,'publication_ram_headroom',lambda:reserve+160)
+    assert staging._ram_fits(120,40,256)
+    assert not staging._ram_fits(120,40,159)
+    monkeypatch.setattr(staging,'workspace_anon_cap_bytes',lambda:159)
+    assert not staging._ram_fits(120,40,256)
+
+
+@pytest.mark.parametrize('failure', ['encode', 'restore', 'cancel-restore'])
+def test_compact_failure_or_cancel_settles_owners_and_admission(tmp_path, monkeypatch, failure):
+    ready = [False]
+    staged, check, prepare, leases = queue(tmp_path, cap=200000, ready=lambda:ready[0])
+    mask = np.zeros((7,33,35),np.uint8);mask[:,2:-2,3:-3] = 1
+    task = TinyTask(tmp_path, 'v', mask)
+    required = mask.nbytes;key = admit(leases,task,required)
+    staged.defer(task,required);del mask
+    if failure == 'encode':
+        from XTA.interpolation import IncrementalRawBBoxMaskStoreWriter
+        def fail(*_args):raise RuntimeError('controlled compact encoder failure')
+        monkeypatch.setattr(IncrementalRawBBoxMaskStoreWriter,'consume',fail)
+        check.finish()
+        with pytest.raises(RuntimeError,match='encoder failure'):staged.pump()
+        assert leases.postprocess_bytes[key] == required  # Failure granted no reusable credit.
+        assert task.union_mm is None and list(staged.root.iterdir()) == []
+    else:
+        check.finish();staged.pump();ready[0] = True
+        resumed,_ = staged.pump()
+        if failure == 'cancel-restore':
+            staged.cancel()
+            assert next(iter(resumed)).cancelled()
+        else:
+            from XTA.interpolation import RawBBoxMaskStore
+            def fail(*_args):raise RuntimeError('controlled compact decoder failure')
+            monkeypatch.setattr(RawBBoxMaskStore,'decode_slice_crop',fail)
+            prepare.finish()
+            with pytest.raises(RuntimeError,match='decoder failure'):staged.pump()
+            assert task.union_mm is None and not leases.leases
+    staged.close();staged.finalize_cleanup()
+    assert not leases.leases and not staged.root.exists()
+
+
+def test_compact_restore_refuses_changed_payload_before_allocating(tmp_path, monkeypatch):
+    mask = np.zeros((7,33,35),np.uint8);mask[:,2:-2,3:-3] = 1
+    task = TinyTask(tmp_path,'v',mask)
+    root = tmp_path/'checkpoints';root.mkdir()
+    snapshot = staging.checkpoint_parent(task,root,tmp_path,mask.nbytes,threading.Event())
+    chunks = snapshot.mask.path/'chunks.bin'
+    original = chunks.read_bytes();chunks.write_bytes(bytes([original[0]^1])+original[1:])
+    monkeypatch.setattr(staging,'allocate_workspace_array',lambda *_a,**_k:pytest.fail('allocated before identity check'))
+    with pytest.raises(RuntimeError,match='changed before resume'):snapshot.mask.open()
+
+
+def test_busy_codec_pool_uses_raw_stream_without_waiting_or_extra_credit(tmp_path):
+    from XTA.interpolation import _ByteAdmissionPool
+    staged,check,_prepare,leases = queue(tmp_path,cap=200000)
+    mask = np.ones((7,33,35),np.uint8)
+    expected = mask.tobytes()
+    task = TinyTask(tmp_path,'busy-codec',mask)
+    amount = mask.nbytes;key = admit(leases,task,amount)
+    workspace = staging._codec_workspace_bytes(mask.shape)
+    pool = _ByteAdmissionPool(workspace,'controlled CPU preparation')
+    task.admission = pool
+    with pool.reserve(workspace,'already running CPU stage'):
+        staged.defer(task,amount);check.finish();staged.pump()
+        assert pool.in_use == workspace and not leases.leases
+    snapshot = staged.deferred[key][1]
+    assert snapshot.mask.encoding == 'raw' and snapshot.codec_fallback_bytes == amount
+    assert snapshot.mask.path.read_bytes() == expected
+    assert staged.snapshot()['codec_raw_fallback_bytes'] == amount and pool.in_use == 0
+    staged.close();staged.finalize_cleanup()
+
+
+@pytest.mark.parametrize('running', [False, True])
+def test_checkpoint_cancel_waits_for_running_owner_before_cleanup(tmp_path,running):
+    staged,check,_prepare,leases = queue(tmp_path,cap=200000)
+    task = TinyTask(tmp_path,'cpu',np.ones((7,33,35),np.uint8))
+    amount = task.union_mm.nbytes;key = admit(leases,task,amount)
+    staged.defer(task,amount)
+    cpu = next(iter(staged.checkpoint_futures))
+    if running:assert cpu.set_running_or_notify_cancel()
+    staged.abort()
+    if running:
+        assert task.union_mm is not None and key in leases.leases
+        with pytest.raises(RuntimeError,match='must settle'):staged.close()
+        cpu.set_result(None)
+    else:
+        assert cpu.cancelled() and task.union_mm is None
+    if running:check.entries.pop(cpu)
+    check.finish();staged.close();staged.finalize_cleanup()
+    assert not leases.leases and not check.entries
+
+
+def test_full_native_plane_codec_allocations_fit_separate_workspace(tmp_path):
+    import tracemalloc
+    shape = (2,3072,3073)
+    mask = np.ones(shape,np.uint8)
+    scores = np.full(shape,255,np.uint8);scores[:,::3,::5] = 0
+    task = TinyTask(tmp_path,'native',mask,scores)
+    root=tmp_path/'checkpoints';root.mkdir()
+    workspace=staging._codec_workspace_bytes(shape)
+    tracemalloc.start()
+    try:
+        snapshot=staging.checkpoint_parent(task,root,tmp_path,mask.nbytes+scores.nbytes,threading.Event())
+        _,peak=tracemalloc.get_traced_memory()
+    finally:tracemalloc.stop()
+    assert peak < workspace, (peak,workspace)
+    assert snapshot.mask.encoding=='packed_mask' and snapshot.confidence.encoding=='score_blocks'
+    assert snapshot.written_bytes < mask.nbytes+scores.nbytes
+
+
+def test_compact_mask_restore_drops_previous_bbox_before_decoding_next(tmp_path,monkeypatch):
+    from XTA.interpolation import RawBBoxMaskStore
+    mask=np.ones((7,33,35),np.uint8)
+    task=TinyTask(tmp_path,'crop-lifetime',mask)
+    root=tmp_path/'checkpoints';root.mkdir()
+    snapshot=staging.checkpoint_parent(task,root,tmp_path,mask.nbytes,threading.Event())
+    original=RawBBoxMaskStore.decode_slice_crop
+    previous=[None]
+    def one_live_crop(store,z):
+        assert previous[0] is None or previous[0]() is None
+        crop=original(store,z)
+        if crop is not None:previous[0]=weakref.ref(crop[-1])
+        return crop
+    monkeypatch.setattr(RawBBoxMaskStore,'decode_slice_crop',one_live_crop)
+    result=snapshot.mask.open()
+    try:np.testing.assert_array_equal(result,np.ones(result.shape,np.uint8))
+    finally:result._mmap.close()
+    assert previous[0]() is None
+
+
+def test_unusually_wide_row_codec_is_exact_and_separately_bounded(tmp_path):
+    import tracemalloc
+    shape=(2,1,1024**2+9)
+    mask=np.full(shape,255,np.uint8)
+    scores=np.full(shape,128,np.uint8);scores[:,:,::7]=0
+    expected_mask,expected_scores=mask.tobytes(),scores.tobytes()
+    task=TinyTask(tmp_path,'wide',mask,scores)
+    root=tmp_path/'checkpoints';root.mkdir()
+    charge=staging._codec_workspace_bytes(shape)
+    assert charge >= staging.CODEC_CONTROL_BYTES + 5*shape[2]
+    tracemalloc.start()
+    try:
+        snapshot=staging.checkpoint_parent(task,root,tmp_path,mask.nbytes+scores.nbytes,threading.Event())
+        _,peak=tracemalloc.get_traced_memory()
+    finally:tracemalloc.stop()
+    assert peak < charge, (peak,charge)
+    for saved,wanted in ((snapshot.mask,expected_mask),(snapshot.confidence,expected_scores)):
+        restored=saved.open()
+        try:assert restored.tobytes()==wanted
+        finally:restored._mmap.close()
+
+
+def test_failed_prepare_keeps_derived_restored_alias_readable_and_credited(tmp_path,monkeypatch):
+    from XTA.runtime import wait_for_retired_memmap_unlinks
+    aliases=[]
+    class FailingPrepare(TinyTask):
+        def __call__(self):
+            aliases.append(self.union_mm[:,1:-1,2:-2])
+            raise RuntimeError('controlled post-restore prepare failure')
+    ready=[False]
+    staged,check,prepare,leases=queue(tmp_path,cap=200000,ready=lambda:ready[0])
+    task=FailingPrepare(tmp_path,'alias-failure',np.ones((7,33,35),np.uint8))
+    amount=task.union_mm.nbytes;key=admit(leases,task,amount)
+    staged.defer(task,amount);check.finish();staged.pump();ready[0]=True
+    monkeypatch.setattr(staging,'_ram_fits',lambda *_args:False)
+    resumed,_=staged.pump();prepare.finish()
+    with pytest.raises(RuntimeError,match='post-restore prepare failure'):staged.pump()
+    assert leases.postprocess_bytes[key]==amount
+    assert task.union_mm is None and np.all(aliases[0]==1)
+    owner=aliases[0].base
+    assert isinstance(owner,np.memmap) and not owner._mmap.closed
+    path=Path(owner.filename)
+    staged.close()
+    assert np.all(aliases[0]==1)  # Queue close cannot force-close prepared consumers.
+    aliases.clear();del owner,resumed
+    gc.collect();wait_for_retired_memmap_unlinks(path=path,timeout_s=3)
+    leases.complete(key,retain_for_dense_retirement=False)
+    staged.finalize_cleanup()
+
+
+def test_checkpoint_submit_failure_retains_original_owner_and_admission(tmp_path):
+    staged, check, _prepare, leases = queue(tmp_path, cap=200000)
+    task = TinyTask(tmp_path, 'submit', np.ones((7,33,35),np.uint8))
+    amount = task.union_mm.nbytes; key = admit(leases, task, amount)
+    check.fail_submit = True
+    with pytest.raises(RuntimeError, match='submit failure'):
+        staged.defer(task, amount)
+    assert task.union_mm is not None and key in leases.leases
+    assert not staged.checkpoint_futures
+    check.fail_submit = False
+    staged.defer(task, amount); check.finish(); staged.pump()
+    assert task.union_mm is None and not leases.leases
+    staged.close(); staged.finalize_cleanup()
+
+
+def test_ram_restore_allocates_only_after_fresh_lease_and_leaves_no_raw_restore_path(tmp_path,monkeypatch):
+    from XTA import runtime
+    ready=[False]
+    staged,check,prepare,leases=queue(tmp_path,cap=200000,ready=lambda:ready[0])
+    mask=np.ones((7,33,35),np.uint8)
+    scores=np.full(mask.shape,255,np.uint8);scores[0,0,0]=0
+    task=TinyTask(tmp_path,'ram-restore',mask,scores)
+    amount=mask.nbytes+scores.nbytes;key=admit(leases,task,amount)
+    old_lease=leases.leases[key]
+    staged.defer(task,amount);check.finish();staged.pump()
+    owned=staged.deferred[key][1].owned_dir
+    calls=[]
+    def simulated_memfd(shape,dtype,destination,_description,**kwargs):
+        assert leases.leases[key] is not old_lease and leases.postprocess_bytes[key]==amount
+        assert kwargs['prefer_memfd'] and not kwargs['prefer_memory']
+        path=tmp_path/f'simulated-RAM-{len(calls)}'
+        array=np.memmap(path,mode='w+',dtype=dtype,shape=shape)
+        descriptor=os.open(path,os.O_RDWR)
+        runtime._register_memfd_owner(str(path),descriptor,'independent restored RAM-fd ownership proof')
+        array._workspace_memfd_owner_key=str(path)
+        array._workspace_memfd_path=str(path)
+        calls.append((descriptor,path))
+        return array
+    monkeypatch.setattr(staging,'allocate_workspace_array',simulated_memfd)
+    monkeypatch.setattr(staging,'_ram_fits',lambda *_args:True)
+    ready[0]=True;resumed,_=staged.pump();prepare.finish()
+    result=next(iter(resumed)).result()
+    np.testing.assert_array_equal(result.final_view_volume_mm,mask)
+    np.testing.assert_array_equal(result.confidence,scores)
+    assert len(calls)==2 and staged.restore_raw_bytes==0
+    assert not tuple(owned.rglob('*.restored.dat'))
+    staged.close()
+    result.native_support_mm=result.final_view_volume_mm=result.confidence=None
+    for name in ('union_mm','confmap_mm'):
+        array=getattr(task,name);setattr(task,name,None)
+        runtime.close_memmap_array_without_flush(array)
+    del array
+    gc.collect()
+    for descriptor,_path in calls:
+        with pytest.raises(OSError):os.fstat(descriptor)
+    leases.complete(key,retain_for_dense_retirement=False)
+    staged.finalize_cleanup()
+
+
+def test_ram_first_birth_charges_multiple_owners_and_leaves_detector_room(tmp_path,monkeypatch):
+    staged,_check,_prepare,_leases=queue(tmp_path,cap=120)
+    monkeypatch.setattr(staging,'publication_ram_headroom',lambda:staging.RAM_RESERVE_BYTES+1000)
+    monkeypatch.setattr(staging,'workspace_anon_cap_bytes',lambda:0)
+    first,second=('model','first'),('model','second')
+    assert staged.claim_ram_first(first,50,0,50)
+    assert staged.owns_ram_first_parent(first) and staged.ram_first_bytes==50
+    assert staged.claim_ram_first(second,10,50,50)
+    assert staged.ram_first_bytes==60 and len(staged.ram_first_owners)==2
+    with pytest.raises(RuntimeError,match='claimed twice'):
+        staged.claim_ram_first(second,10,60,50)
+    assert not staged.release_ram_first(('model','foreign'))
+    assert staged.release_ram_first(first)
+    assert staged.ram_first_bytes==10
+    assert staged.release_ram_first(second)
+    assert not staged.claim_ram_first(second,50,50,50)  # Would leave no detector room.
+    assert staged.claim_ram_first(second,50,10,50)
+    assert staged.snapshot()['ram_first_grants']==3
+    assert staged.release_ram_first(second)
+    staged.close();staged.finalize_cleanup()
+
+
+def test_ram_token_survives_running_codec_cancel_and_releases_after_source_close(tmp_path,monkeypatch):
+    staged,_check,_prepare,leases=queue(tmp_path,cap=200000)
+    monkeypatch.setattr(staging,'_ram_fits',lambda *_args:True)
+    task=TinyTask(tmp_path,'bank',np.ones((7,33,35),np.uint8))
+    amount=task.union_mm.nbytes;key=admit(leases,task,amount)
+    assert staged.claim_ram_first(key,amount,0,amount)
+    staged.defer(task,amount)
+    cpu=next(iter(staged.checkpoint_futures));cpu.set_running_or_notify_cancel()
+    staged.abort()
+    assert task.union_mm is not None and staged.owns_ram_first_parent(key)
+    with pytest.raises(RuntimeError,match='must settle'):staged.close()
+    cpu.set_result(False)
+    staged.close()
+    assert task.union_mm is None and not leases.leases and staged.ram_first_key is None
+    assert staged.snapshot()['ram_first_releases']==1
+    staged.finalize_cleanup()
+
+
+def test_ram_token_held_until_complete_codec_future_and_retirement_pump(tmp_path,monkeypatch):
+    staged,check,_prepare,leases=queue(tmp_path,cap=200000)
+    monkeypatch.setattr(staging,'_ram_fits',lambda *_args:True)
+    task=TinyTask(tmp_path,'bank',np.ones((7,33,35),np.uint8))
+    amount=task.union_mm.nbytes;key=admit(leases,task,amount)
+    staged._dense_limit=amount
+    assert staged.claim_ram_first(key,amount,0,amount)
+    staged.defer(task,amount)
+    assert not staged.claim_ram_first(('model','next'),amount,amount,amount)
+    check.finish()
+    assert task.union_mm is None and staged.owns_ram_first_parent(key)
+    staged.pump()
+    assert staged.ram_first_key is None and not leases.leases
+    assert staged.claim_ram_first(('model','next'),amount,0,amount)
+    staged.release_ram_first(('model','next'))
+    staged.close();staged.finalize_cleanup()
+
+
+def test_verified_raw_disk_retirement_bypasses_blocked_codec_and_refills_detector(tmp_path,monkeypatch):
+    from tests.test_tta_scheduler_boundary import _state,_scheduler,_view
+    state=_state()
+    scheduler=_scheduler(tmp_path,state=state,input_overrides=dict(
+        direct_union_inference_view_limit=4,direct_union_inference_byte_limit=120,
+        direct_union_total_dense_byte_limit=120))
+    leases=ViewPrepareLeaseState(state.direct_union_backing_leases,state.direct_union_inference_views,
+        state.direct_union_inference_bytes,state.direct_union_postprocess_views,state.direct_union_postprocess_bytes)
+    staged,codec,fast,_=queue(tmp_path,cap=120,leases=leases)
+    ram=TinyTask(tmp_path,'bank',np.ones((1,5,5),np.uint8),np.ones((1,5,5),np.uint8))
+    key=admit(leases,ram,50)
+    monkeypatch.setattr(staging,'_ram_fits',lambda *_args:True)
+    assert staged.claim_ram_first(key,50,0,50)
+    staged.defer(ram,50)
+    arrays=[];paths=[]
+    for name in ('mask','confidence'):
+        path=staged.source_root/(name+'.dat')
+        array=np.memmap(path,mode='w+',dtype=np.uint8,shape=(1,5,5));array[:]=255
+        arrays.append(array);paths.append(path)
+    disk=TinyTask(staged.source_root,'disk',*arrays)
+    disk.union_path,disk.confmap_path=paths
+    disk_key=admit(leases,disk,50);staged.defer(disk,50)
+    with mock.patch('XTA.confidence_evidence.confidence_evidence_enabled',return_value=True):
+        candidate=dict(kind='fullframe',model_name='model',view=_view(),
+            result_mode='direct_union',processing_shape=(1,5,5))
+        assert not scheduler.direct_union_task_admissible(candidate)
+        assert len(codec.entries)==1 and len(fast.entries)==1
+        fast.finish();staged.pump()
+        assert disk_key not in leases.leases and key in leases.leases
+        assert staged.owns_ram_first_parent(key) and not next(iter(codec.entries)).done()
+        assert scheduler.direct_union_task_admissible(candidate)
+    saved=staged.deferred[disk_key][1]
+    assert saved.mask.reused and saved.confidence.reused and saved.written_bytes==0
+    for snapshot in (saved.mask,saved.confidence):
+        restored=snapshot.open()
+        try:np.testing.assert_array_equal(restored,np.full(restored.shape,255,np.uint8))
+        finally:restored._mmap.close()
+    codec.finish();staged.pump()
+    staged.close();staged.finalize_cleanup()
+
+
+def test_two_ram_parents_drain_while_full_spool_routes_detector_to_disk(tmp_path,monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from tests.test_tta_scheduler_boundary import _state,_scheduler,_view
+    state=_state();shape=(7,33,35);amount=2*int(np.prod(shape));cap=3*amount
+    leases=ViewPrepareLeaseState(state.direct_union_backing_leases,state.direct_union_inference_views,
+        state.direct_union_inference_bytes,state.direct_union_postprocess_views,state.direct_union_postprocess_bytes)
+    monkeypatch.setattr(staging,'publication_ram_headroom',lambda:staging.RAM_RESERVE_BYTES+cap)
+    monkeypatch.setattr(staging,'workspace_anon_cap_bytes',lambda:0)
+    gate=threading.Event();both_started=threading.Event();started=[];lock=threading.Lock()
+    checkpoint=staging.checkpoint_parent
+    def held_checkpoint(task,*args):
+        if task.view.name in ('first','second'):
+            with lock:
+                started.append(task.view.name)
+                if len(started)==2:both_started.set()
+            assert gate.wait(10)
+        return checkpoint(task,*args)
+    monkeypatch.setattr(staging,'checkpoint_parent',held_checkpoint)
+    expected={};disk_task=None
+    with ThreadPoolExecutor(max_workers=2) as codec,ThreadPoolExecutor(max_workers=1) as fast:
+        staged=staging.DeferredSamParentQueue(temp_dir=tmp_path/'temp',output_dir=tmp_path/'output',
+            checkpoint_executor=codec,prepare_executor=fast,leases=leases,dense_limit=cap,ready=lambda:False)
+        def ensure(model,view):
+            key=(model,view.name);arrays=[]
+            for label in ('mask','confidence'):
+                path=staged.source_root/(label+'.dat')
+                value=np.memmap(path,mode='w+',dtype=np.uint8,shape=shape);value[:]=0
+                arrays.append(value)
+            nonlocal disk_task
+            disk_task=TinyTask(staged.source_root,view.name,*arrays)
+            disk_task.union_path=Path(arrays[0].filename);disk_task.confmap_path=Path(arrays[1].filename)
+            state.baseline_union_paths[key]=disk_task.union_path
+            state.baseline_confmap_paths[key]=disk_task.confmap_path
+            state.direct_union_backing_leases[key]=_DirectUnionBackingLease(key,amount)
+            state.direct_union_inference_views.add(key);state.direct_union_inference_bytes[key]=amount
+        scheduler=_scheduler(tmp_path,state=state,input_overrides=dict(ensure_baseline_workspaces=ensure,
+            min_conf=.5,direct_union_inference_byte_limit=amount,direct_union_total_dense_byte_limit=cap),
+            operation_overrides=dict(staged_ram_backlog_bytes=staged.detector_backlog_bytes))
+        try:
+            for name in ('first','second'):
+                mask=np.zeros(shape,np.uint8);mask[:,2:-2,3:-3]=255
+                scores=np.arange(np.prod(shape),dtype=np.uint8).reshape(shape).copy()
+                expected[name]=(mask.copy(),scores.copy())
+                task=TinyTask(staged.source_root,name,mask,scores);key=('model',name)
+                active=sum(leases.postprocess_bytes.values())
+                assert staged.claim_ram_first(key,amount,active,amount)
+                admit(leases,task,amount);staged.defer(task,amount)
+                del mask,scores,task
+            assert both_started.wait(5)
+            assert staged.ram_first_bytes==2*amount and staged.detector_backlog_bytes()==2*amount
+            next_key=('model','transverse__tta_a0')
+            assert not staged.claim_ram_first(next_key,amount,2*amount,amount)
+            candidate=dict(kind='fullframe',model_name='model',view=_view(),
+                result_mode='direct_union',processing_shape=shape)
+            assert scheduler.direct_union_task_admissible(candidate)
+            scheduler.activate_direct_union_task(candidate)
+            disk_task.union_mm[:]=expected['first'][0];disk_task.confmap_mm[:]=expected['first'][1]
+            assert leases.handoff(next_key);staged.defer(disk_task,amount)
+            assert staged.detector_backlog_bytes()==2*amount  # Disk owners remain in the active window.
+            disk_future=next(future for future,saved in staged.checkpoint_futures.items() if saved[0]==next_key)
+            disk_future.result(timeout=5);staged.pump()
+            assert next_key not in leases.leases and staged.ram_first_bytes==2*amount
+            assert scheduler.direct_union_task_admissible(candidate)
+            gate.set()
+            for future in list(staged.checkpoint_futures):future.result(timeout=10)
+            staged.pump()
+            assert not leases.leases and not staged.ram_first_owners
+            assert staged.detector_backlog_bytes()==0
+            assert staged.claim_ram_first(('model','next'),amount,0,amount)
+            staged.release_ram_first(('model','next'))
+            for name in ('first','second',next_key[1]):
+                saved=staged.deferred[('model',name)][1]
+                wanted=expected['first' if name==next_key[1] else name]
+                assert saved.mask.encoding==('raw' if name==next_key[1] else 'packed_mask')
+                for reference,values in zip((saved.mask,saved.confidence),wanted):
+                    restored=reference.open()
+                    try:np.testing.assert_array_equal(restored,values)
+                    finally:restored._mmap.close()
+        finally:
+            gate.set();codec.shutdown(wait=True);fast.shutdown(wait=True)
+            staged.close();staged.finalize_cleanup()
+
+
+def test_ram_backlog_rejects_replaced_original_lease(tmp_path,monkeypatch):
+    staged,check,_prepare,leases=queue(tmp_path,cap=200000)
+    monkeypatch.setattr(staging,'_ram_fits',lambda *_args:True)
+    task=TinyTask(tmp_path,'v',owning_mask());amount=task.union_mm.nbytes;key=admit(leases,task,amount)
+    assert staged.claim_ram_first(key,amount,0,amount)
+    staged.defer(task,amount)
+    assert staged.detector_backlog_bytes()==amount
+    original=leases.leases[key]
+    leases.leases[key]=_DirectUnionBackingLease(key,amount,phase='postprocess')
+    with pytest.raises(RuntimeError,match='original postprocess lease'):staged.detector_backlog_bytes()
+    leases.leases[key]=original
+    check.finish();staged.pump();staged.close();staged.finalize_cleanup()
+
+
+def test_unowned_ram_checkpoint_rejects_before_executor_acceptance(tmp_path,monkeypatch):
+    staged,check,_prepare,_leases=queue(tmp_path,cap=200000)
+    monkeypatch.setattr(staging,'_ram_fits',lambda *_args:True)
+    task=TinyTask(tmp_path,'v',owning_mask());amount=task.union_mm.nbytes;key=('model','v')
+    assert staged.claim_ram_first(key,amount,0,amount)
+    with pytest.raises(RuntimeError,match='original postprocess lease'):staged.defer(task,amount)
+    assert not check.entries and task.union_mm is not None
+    staged.release_ram_first(key);staged.close();staged.finalize_cleanup()
 

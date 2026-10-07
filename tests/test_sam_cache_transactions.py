@@ -219,6 +219,116 @@ def test_two_realistic_large_targets_require_distinct_live_additive_credit(tmp_p
         context.close()
 
 
+@pytest.mark.parametrize('ending', ('completed', 'render_error', 'cancel', 'close'))
+def test_four_funded_parent_builds_overlap_and_retire_all_owners(tmp_path, monkeypatch, ending):
+    source = np.arange(5*12*17, dtype=np.uint16).reshape(5, 12, 17).astype(np.uint8)
+    context = context_for(tmp_path, source)
+    view = geometry.get_view_infos(*source.shape, cartesian_views=('transverse',))[0]
+    pool = SimpleNamespace(condition=threading.Condition(), capacity=192*GIB, in_use=0)
+    context._runtime = proof_runtime()
+    entered = [threading.Event() for _ in range(4)]
+    release = threading.Event()
+    original = context._render_demand_crop
+    bbox = (1, 1, 7, 9)
+
+    def render(current_view, index, *args, **kwargs):
+        entered[index].set()
+        assert release.wait(10), 'four admitted renderers were not released'
+        if ending == 'render_error' and index == 1:
+            raise ValueError('controlled parallel renderer failure')
+        return original(current_view, index, *args, **kwargs)
+
+    def parent(index):
+        with admit_sam_parent_resources(pool, 4*GIB, f'parent-{index}', worker_count=1,
+                base_allowance_bytes=4*GIB, headroom_probe=lambda:256*GIB) as profile:
+            with context.resource_scope(profile):
+                with context.image_cohort_provider(view, source.shape,
+                        demand(source.shape, {index:bbox})) as reference:
+                    return reference, crop_from(reference, index, bbox)
+
+    monkeypatch.setattr(context, '_render_demand_crop', render)
+    try:
+        # These are the existing bounded parent executor lanes. Each thread
+        # mints and owns its real grant; copying a profile is not permission.
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(parent, index) for index in range(4)]
+            closing = None
+            try:
+                assert all(event.wait(5) for event in entered), 'funded parents hit a global render-count cap'
+                snapshot = context.image_cache_lifetime_snapshot()
+                assert snapshot['active_image_builders'] == snapshot['image_build_peak_count'] == 4
+                with context._lock:
+                    tickets = tuple(context._image_builds.values())
+                    assert all(ticket['credited'] for ticket in tickets)
+                    assert len({ticket['lease_id'] for ticket in tickets}) == 4
+                    assert sum(ticket['credit_bytes'] for ticket in tickets) <= pool.in_use
+                if ending == 'cancel':
+                    context.cancel('controlled parallel cancellation')
+                elif ending == 'close':
+                    closing = executor.submit(context.close)
+                    assert context._cancel.wait(5)
+                    assert not closing.done() and context.source_volume is source
+            finally:
+                release.set()
+            references = []
+            for index, future in enumerate(futures):
+                if ending in ('cancel', 'close'):
+                    with pytest.raises(RuntimeError, match='cancellation|closing|lifetime|ended'):
+                        future.result(timeout=5)
+                elif ending == 'render_error' and index == 1:
+                    with pytest.raises(ValueError, match='controlled parallel renderer failure'):
+                        future.result(timeout=5)
+                else:
+                    reference, pixels = future.result(timeout=5)
+                    references.append(reference)
+                    np.testing.assert_array_equal(pixels, source[index, 1:7, 1:9])
+                    assert not reference.path.exists()
+            if closing is not None:
+                closing.result(timeout=5)
+        assert pool.in_use == 0
+        snapshot = context.image_cache_lifetime_snapshot()
+        assert snapshot['active_image_builders'] == snapshot['pending_image_builds'] == 0
+        assert snapshot['active_image_build_credit_bytes'] == snapshot['image_cache_borrower_pins'] == 0
+        assert not context._cache_owners
+        assert not list((context.temp_dir/'sam_image_cache').glob('*.dat'))
+    finally:
+        release.set()
+        context.close()
+    assert not list((context.temp_dir/'sam_image_cache').glob('*.dat'))
+
+
+def test_one_parent_image_allowance_cannot_be_spent_twice(tmp_path):
+    context = context_for(tmp_path, np.zeros((2, 3, 4), np.uint8))
+    pool = SimpleNamespace(condition=threading.Condition(), capacity=192*GIB, in_use=0)
+    waiting, release_first = threading.Event(), threading.Event()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            def release_ticket():
+                assert waiting.wait(5)
+                with context._idle:
+                    assert not release_first.is_set()
+                    context._image_builds.pop('first')
+                    release_first.set()
+                    context._idle.notify_all()
+            sibling = executor.submit(release_ticket)
+            with admit_sam_parent_resources(pool, 4*GIB, 'same-parent', worker_count=1,
+                    base_allowance_bytes=4*GIB, headroom_probe=lambda:256*GIB) as profile:
+                with context.resource_scope(profile), context._idle:
+                    context._image_builds['first'] = dict(context._admit_image_build(100, 100, 1000), admitted=True)
+                    original_wait = context._idle.wait
+                    def mark_wait(timeout=None):
+                        waiting.set()
+                        return original_wait(timeout)
+                    context._idle.wait = mark_wait
+                    second = context._admit_image_build(100, 100, 1000)
+                    assert waiting.is_set() and release_first.is_set()
+                    assert second['credited'] and second['lease_id'] == profile._lease.lease_id
+            sibling.result(timeout=5)
+        assert pool.in_use == 0 and not context._image_builds
+    finally:
+        context.close()
+
+
 def test_batch_initializer_failure_discards_private_file_and_credit(tmp_path, monkeypatch):
     source = np.zeros((3, 7, 9), np.uint8)
     context = context_for(tmp_path, source)

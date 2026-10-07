@@ -4,6 +4,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import gc
 import json
+import os
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -143,9 +144,10 @@ def _view(shape):
 
 def _context(tmp_path, source=None, **kwargs):
     source = np.arange(6*24*28, dtype=np.uint16).reshape(6, 24, 28).astype(np.uint8) if source is None else source
-    return sam_integration.SamInterpolationContext(model_path='never-loaded', device_ids=('1',),
-        source_volume=source, source_identity='immutable-source',
-        temp_dir=tmp_path / 'temporary', evidence_root=tmp_path / 'evidence', **kwargs)
+    with mock.patch.dict(os.environ, {'YOLO_TTA_SAM_SESSIONS_PER_GPU': '1'}):
+        return sam_integration.SamInterpolationContext(model_path='never-loaded', device_ids=('1',),
+            source_volume=source, source_identity='immutable-source',
+            temp_dir=tmp_path / 'temporary', evidence_root=tmp_path / 'evidence', **kwargs)
 
 
 def test_no_hypotheses_never_render_images_or_admit_model(tmp_path):
@@ -306,20 +308,39 @@ def test_writable_same_buffer_mutation_invalidates_prepared_observation_plan(tmp
 
 
 class _FakePool:
-    def __init__(self):
+    def __init__(self, *, expected_initial=0):
         self.pending, self.submitted = [], []
         self.closed = False
+        self.expected_initial, self.completion_started = expected_initial, False
     def submit(self, task, *, execution_device_id):
+        from XTA.sam_tracker_runtime import _image_cache_summary
         assert not any(device == execution_device_id for _, device in self.pending)
         self.pending.append((task, execution_device_id))
         self.submitted.append(task)
         path = Path(task.payload['output_dir']) / 'manifest.json'
-        path.write_text('{}', encoding='utf-8')
+        payload = task.payload
+        # These tests replace the large raw decoder, not the completion trust
+        # boundary. Emit its real compact schema/attribution and checksum.
+        packet = path.with_name('raw_masks.npz')
+        packet.write_bytes(b'CPU-only replacement raw decoder')
+        receipt = dict(schema='xta.sam-raw-tracker-run/1', run_id=payload['run_id'],
+            crop_xyxy=payload['crop_xyxy'], frame_range=[payload['frame_start'], payload['frame_stop']],
+            seed_frame=payload['seed_frame'], direction=payload['direction'],
+            image_cache=_image_cache_summary(payload['image_cache']),
+            seed_artifact_sha256=payload['seed_sha256'], temporary_artifact_directory=payload['output_dir'],
+            request_metadata=payload.get('request_metadata', {}),
+            raw_masks=dict(path=str(packet), size_bytes=packet.stat().st_size))
+        path.write_text(json.dumps(receipt), encoding='utf-8')
     def wait_result(self, *, timeout):
+        from XTA.sam_tracker_runtime import _sha256
+        if not self.completion_started and len(self.pending) < self.expected_initial:
+            raise TimeoutError
+        self.completion_started = True
         task, device = self.pending.pop()
+        path = Path(task.payload['output_dir']) / 'manifest.json'
         return SimpleNamespace(work_id=task.work_id, attempt_token=task.attempt_token,
             execution_device_id=device, worker_pid=900+device,
-            artifact_path=str(Path(task.payload['output_dir']) / 'manifest.json'), artifact_sha256='mocked')
+            artifact_path=str(path), artifact_sha256=_sha256(path))
     def shutdown(self, *, timeout, force):
         self.closed = True
         self.pending.clear()
@@ -330,12 +351,12 @@ class _FakePool:
         self.shutdown(timeout=timeout, force=True)
 
 
-def _async_tracker(tmp_path):
+def _async_tracker(tmp_path, *, expected_initial=0):
     cache = materialize_interpolation_image_cache(np.zeros((8, 24, 28), dtype=np.uint8),
         path=tmp_path / 'images.u8', physical_view_id='transverse', source_identity='source-a')
     tracker = SamInterpolationTracker(model_path='never-loaded', device_ids=(0, 1),
         artifact_root=tmp_path / 'runs', source_cache_ref=cache)
-    pool = _FakePool()
+    pool = _FakePool(expected_initial=expected_initial)
     tracker._pool = pool
     return tracker, pool, cache
 
@@ -352,7 +373,7 @@ def _loaded(pool, path, *, altered=None):
     task = next(task for task in pool.submitted if Path(task.payload['output_dir']) == Path(path).parent)
     payload = task.payload
     frames = {frame: np.ones((8, 9), dtype=bool) for frame in range(1, 7)}
-    receipt = dict(run_id=task.work_id, crop_xyxy=payload['crop_xyxy'],
+    receipt = dict(run_id=payload['run_id'], crop_xyxy=payload['crop_xyxy'],
         frame_range=[payload['frame_start'], payload['frame_stop']],
         seed_frame=payload['seed_frame'], direction=payload['direction'],
         image_cache=_image_cache_summary(payload['image_cache']),
@@ -365,7 +386,7 @@ def _loaded(pool, path, *, altered=None):
 
 def test_async_dispatch_bound_and_consumer_close_settle_before_staging_cleanup(tmp_path):
     from XTA import sam_tracker_runtime as module
-    tracker, pool, cache = _async_tracker(tmp_path)
+    tracker, pool, cache = _async_tracker(tmp_path, expected_initial=2)
     original_remove = tracker._remove_staging
     def remove(directory):
         assert pool.closed
@@ -374,8 +395,11 @@ def test_async_dispatch_bound_and_consumer_close_settle_before_staging_cleanup(t
         iterator = tracker.iter_results((_request(index) for index in range(4)))
         index, result = next(iterator)
         assert index == 1
-        assert len(pool.submitted) == 3  # Freed device refilled before CPU evidence yield.
-        assert len(pool.pending) == 2
+        with tracker._state_condition:
+            scope = next(iter(tracker._scopes.values()))
+            assert tracker._state_condition.wait_for(lambda:len(scope.completed) == 2, timeout=2)
+        assert len(pool.submitted) == 3  # Only N+1 attributable packets while the consumer is paused.
+        assert len(pool.pending) == 0  # Both ACKs drained, still bounded/undecoded.
         assert tracker.dispatch_stats['peak_in_flight'] == 2
         assert len(list(tracker.artifact_root.glob('run-*'))) == 3
         with pytest.raises(RuntimeError, match='iterator is active'):
@@ -385,8 +409,7 @@ def test_async_dispatch_bound_and_consumer_close_settle_before_staging_cleanup(t
         assert pool.closed
         assert not list(tracker.artifact_root.glob('run-*'))
         assert result.frames[2].any()
-        assert tracker._dispatch_lock.acquire(blocking=False)
-        tracker._dispatch_lock.release()
+        assert not tracker._scopes
 
 
 def test_failed_async_close_surfaces_unsettled_residency_and_keeps_transfer_staging(tmp_path):
@@ -401,12 +424,12 @@ def test_failed_async_close_surfaces_unsettled_residency_and_keeps_transfer_stag
             iterator.close()
     assert not tracker.residency_released
     assert list(tracker.artifact_root.glob('run-*'))
-    assert tracker._dispatch_lock.acquire(blocking=False)
-    tracker._dispatch_lock.release()
+    assert tracker._scopes  # Unsettled workers retain their scope and staging ownership.
     pool.shutdown = lambda **kwargs: setattr(pool, 'closed', True)
     pool.force_close = lambda **kwargs: setattr(pool, 'closed', True)
     tracker.close()
     assert tracker.residency_released
+    assert not tracker._scopes and not list(tracker.artifact_root.glob('run-*'))
 
 
 @pytest.mark.parametrize('field', ('image_cache', 'crop_xyxy', 'frame_range', 'seed_frame', 'direction', 'seed_artifact_sha256'))

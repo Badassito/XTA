@@ -388,14 +388,24 @@ def test_global_retry_ledger_is_not_reset_per_cohort_and_starts_only_after_all_i
         jobs = prepared.tracker_jobs if mode == 'tiled' else prepared.runs
         total = sum(len(job.original_run.expected_frames if mode == 'tiled' else job.expected_frames)
                     for job in jobs)
-        largest = max(sum(len(job.original_run.expected_frames if mode == 'tiled' else job.expected_frames)
-            for job in jobs if (job.original_run.group_id if mode == 'tiled' else job.group_id) == group.group_id)
-            for group in prepared.groups)
         assert ledger['baseline_tracker_frames'] == total
-        assert ledger['charged_tracker_frames'] == ledger['extra_tracker_frame_limit'] == largest
-        assert len(retry_calls) == 1
-        assert sum(record['status'] == 'succeeded' for record in ledger['attempts'].values()) == 1
-        assert any(record['reason'] == 'extra_tracker_frame_budget_exhausted'
+        assert ledger['extra_tracker_frame_limit'] is None
+        assert ledger['extra_work_limit_pixel_frames'] is None
+        rows = [record for history in ledger['attempt_history'].values() for record in history if record['retry']]
+        assert len(retry_calls) == len(rows) > 1
+        charged_frames = charged_pixels = 0
+        for record in rows:
+            assert record['status'] == 'succeeded'
+            assert record['charged_before_tracker_frames'] == charged_frames
+            assert record['charged_before_pixel_frames'] == charged_pixels
+            charged_frames += record['retry_tracker_frames']
+            charged_pixels += record['retry_pixel_frames']
+            assert record['charged_after_tracker_frames'] == charged_frames
+            assert record['charged_after_pixel_frames'] == charged_pixels
+        assert ledger['charged_tracker_frames'] == charged_frames
+        assert ledger['charged_pixel_frames'] == charged_pixels
+        assert set(ledger['attempts']) == {group.group_id for group in prepared.groups}
+        assert all(record['status'] == 'succeeded' and record['resolution_status'] == 'outer_context_resolved'
                    for record in ledger['attempts'].values())
         assert source_path.exists() and int(source[1, 2, 3]) == 40
     finally:
