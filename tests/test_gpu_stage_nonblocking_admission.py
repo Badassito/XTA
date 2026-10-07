@@ -40,6 +40,21 @@ class StageAdmissionConcurrencyTests(unittest.TestCase):
         thread.start()
         return thread, result, errors
 
+    def test_failed_coordinator_release_remains_owned_and_can_retry(self) -> None:
+        lease = self.coordinator.try_acquire_specific_stage(self.torch, 0, 'output')
+        with mock.patch.object(self.coordinator, 'release_stage',
+                               side_effect=RuntimeError('release before ledger update')):
+            with self.assertRaisesRegex(RuntimeError, 'before ledger update'):
+                lease.release()
+        self.assertFalse(lease._released)
+        self.assertFalse(self.coordinator.can_dispatch_inference(0))
+        self.assertFalse(self.pool.enable_worker(0))
+        lease.release()
+        lease.release()
+        self.assertTrue(lease._released)
+        self.assertTrue(self.coordinator.can_dispatch_inference(0))
+        self.assertTrue(self.pool.enable_worker(0))
+
     def test_blocked_cuda_query_does_not_hold_dispatch_lock(self) -> None:
         entered = threading.Event()
         resume = threading.Event()

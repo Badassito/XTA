@@ -272,6 +272,7 @@ def test_one_scope_retry_budget_is_considered_after_every_initial_cohort(tmp_pat
 
 @pytest.mark.parametrize('mode',['whole','tiled'])
 def test_actual_retry_controller_charges_full_scope_once_after_cohorts(tmp_path,monkeypatch,mode):
+    import json
     import XTA.sam_crop_retry as retry
     baseline=_baseline()
     prepared=prepare_sam_extrapolation_pass(baseline,distance=3,walk_back=0,min_radius=3.,crop_mode=mode)
@@ -286,14 +287,22 @@ def test_actual_retry_controller_charges_full_scope_once_after_cohorts(tmp_path,
     runtime=Tracker(baseline)
     def unexpected_retry(prepared):
         raise AssertionError('One-pixel extra-work budget must refuse before rendering')
-    _,stats,_=extrapolate_sam_view_volume_pass(baseline,work_dir=tmp_path,runtime=runtime,
-        prepared_plan=prepared,distance=3,walk_back=0,min_radius=3.,crop_mode=mode,
-        image_cohorts=cohorts,image_cohort_provider=lambda p:nullcontext(None),
-        crop_retry_policy=retry.SamCropRetryPolicy(enabled=True,max_extra_pixel_frames=1),
-        retry_image_provider=unexpected_retry)
+    with pytest.raises(retry.SamCropRetryAdmissionError,match='extra_work_budget_exhausted'):
+        extrapolate_sam_view_volume_pass(baseline,work_dir=tmp_path,runtime=runtime,
+            prepared_plan=prepared,distance=3,walk_back=0,min_radius=3.,crop_mode=mode,
+            image_cohorts=cohorts,image_cohort_provider=lambda p:nullcontext(None),
+            crop_retry_policy=retry.SamCropRetryPolicy(enabled=True,max_extra_pixel_frames=1),
+            retry_image_provider=unexpected_retry)
+    ledger_path=next(tmp_path.glob('sam_extrap_*/crop_retry.json'))
+    ledger=json.loads(ledger_path.read_text())
     work=prepared.tracker_jobs if mode=='tiled' else prepared.runs
     expected_frames=sum(len(item.original_run.expected_frames if mode=='tiled' else item.expected_frames) for item in work)
     assert len(constructions)==1
     assert constructions[0]['baseline_tracker_frames']==expected_frames
-    assert stats['sam_crop_retry']['baseline_tracker_frames']==expected_frames
+    assert ledger['baseline_tracker_frames']==expected_frames
+    assert ledger['status']=='failed'
+    assert ledger['charged_pixel_frames']==ledger['charged_tracker_frames']==0
     assert len(runtime.requests)==len(work)
+    assert not (ledger_path.parent/'selection.json').exists()
+    assert not list(ledger_path.parent.glob('sam_extrapolation_*.cvol'))
+    np.testing.assert_array_equal(baseline,_baseline())

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import gc
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from threading import Event
@@ -53,7 +54,7 @@ def _retire_owned(array):
     return None
 
 
-def _interpolation_case(tmp_path, *, mode='whole', enabled=True, failure=False, stale=False, policy=None):
+def _interpolation_case(tmp_path, *, mode='whole', enabled=True, failure=False, stale=False, policy=None,capture=None):
     observations = np.zeros((5, 256, 256), np.uint8)
     observations[0, 100:107, 100:107] = observations[4, 100:107, 100:107] = 1
     scope = {'scope_id': 'independent_dynamic_interpolation'}
@@ -67,6 +68,8 @@ def _interpolation_case(tmp_path, *, mode='whole', enabled=True, failure=False, 
     truth[1] = truth[3] = observations[0]
     truth[2, 100:107, x0-10:x1+10] = 1
     requests, providers = [], []
+    if capture is not None:
+        capture.update(requests=requests,providers=providers,observations=observations,original=observations.copy())
     def run(**request):
         box = request['crop_xyxy']
         a, b, c, d = box
@@ -133,27 +136,30 @@ def test_default_off_retains_exact_initial_clipped_attempt_without_factory_or_ex
 
 @pytest.mark.parametrize('mode', ['whole', 'tiled'])
 def test_failed_retry_is_explicit_keeps_initial_attempt_and_never_refunds_or_reseeds(tmp_path, mode):
-    observations, truth, old, actual, stats, requests, providers, _ = _interpolation_case(
-        tmp_path, mode=mode, failure=True)
-    assert len(requests) == 3 and len(providers) == 1
-    attempt = next(iter(stats['sam_crop_retry']['attempts'].values()))
+    capture={}
+    with pytest.raises(RuntimeError,match='synthetic ordinary retry SDK failure'):
+        _interpolation_case(tmp_path,mode=mode,failure=True,capture=capture)
+    ledger=json.loads(next((tmp_path/'interpolation').glob('*/crop_retry.json')).read_text())
+    assert len(capture['requests']) == 3 and len(capture['providers']) == 1
+    attempt = next(iter(ledger['attempts'].values()))
     assert attempt['status'] == 'failed'
     assert 'synthetic ordinary retry SDK failure' in attempt['completion_detail']['error']
-    assert stats['sam_crop_retry']['charged_tracker_frames'] == 10
-    expected = observations.copy()
-    expected[1] = truth[1]
-    expected[3] = truth[3]
-    expected[2, old[0]:old[2], old[1]:old[3]] = truth[2, old[0]:old[2], old[1]:old[3]]
-    np.testing.assert_array_equal(actual, expected)
+    assert ledger['charged_tracker_frames'] == 10 and ledger['scope_failed'] is True
+    np.testing.assert_array_equal(capture['observations'],capture['original'])
+    assert not list(tmp_path.glob('**/selection.json')) and not list(tmp_path.glob('**/sam_bridge_*.cvol'))
 
 
 def test_stale_crop_only_image_cache_fails_before_retry_sdk_and_retains_initial(tmp_path):
-    _, _, _, _, stats, requests, providers, _ = _interpolation_case(tmp_path, stale=True)
-    assert len(requests) == 2 and len(providers) == 1
-    attempt = next(iter(stats['sam_crop_retry']['attempts'].values()))
+    capture={}
+    with pytest.raises(ValueError,match='cover the enlarged context'):
+        _interpolation_case(tmp_path,stale=True,capture=capture)
+    ledger=json.loads(next((tmp_path/'interpolation').glob('*/crop_retry.json')).read_text())
+    assert len(capture['requests']) == 2 and len(capture['providers']) == 1
+    attempt = next(iter(ledger['attempts'].values()))
     assert attempt['status'] == 'failed'
     assert 'cover the enlarged context' in attempt['completion_detail']['error']
-    assert stats['sam_crop_retry']['charged_tracker_frames'] == 10
+    assert ledger['charged_tracker_frames'] == 10 and ledger['scope_failed'] is True
+    assert not list(tmp_path.glob('**/sam_bridge_*.cvol'))
 
 
 @pytest.mark.parametrize('cap', ['pixels', 'tracker_frames', 'memory'])
@@ -165,16 +171,21 @@ def test_exhausted_independent_retry_budget_has_diagnostic_and_no_render_or_mode
         policy = replace(policy, max_extra_tracker_frames=1)
     else:
         policy = replace(policy, max_retry_memory_bytes=1)
-    _, _, _, _, stats, requests, providers, _ = _interpolation_case(tmp_path, policy=policy)
-    assert len(requests) == 2 and not providers
-    attempt = next(iter(stats['sam_crop_retry']['attempts'].values()))
+    capture={}
+    with pytest.raises(RuntimeError,match='Unresolved SAM outer crop'):
+        _interpolation_case(tmp_path,policy=policy,capture=capture)
+    ledger=json.loads(next((tmp_path/'interpolation').glob('*/crop_retry.json')).read_text())
+    assert len(capture['requests']) == 2 and not capture['providers']
+    attempt = next(iter(ledger['attempts'].values()))
     assert not attempt['retry'] and attempt['status'] == 'refused'
-    assert attempt['reason'] in {'extra_work_budget_exhausted', 'extra_tracker_frame_budget_exhausted', 'memory_limit'}
-    assert stats['sam_crop_retry']['charged_pixel_frames'] == stats['sam_crop_retry']['charged_tracker_frames'] == 0
+    assert attempt['reason'] in {'extra_work_budget_exhausted','extra_tracker_frame_budget_exhausted','preflight_failed'}
+    assert attempt['candidate_search_exhausted'] is True
+    assert ledger['charged_pixel_frames'] == ledger['charged_tracker_frames'] == 0
+    assert ledger['scope_failed'] is True and not list(tmp_path.glob('**/sam_bridge_*.cvol'))
 
 
 @pytest.mark.parametrize('mode', ['whole', 'tiled'])
-def test_retry_and_unaffected_group_are_reselected_together_without_contact_bypass(tmp_path, mode):
+def test_grown_groups_are_reselected_together_without_contact_bypass(tmp_path, mode):
     observations = np.zeros((5, 256, 320), np.uint8)
     observations[0, 100:107, 100:107] = observations[4, 100:107, 100:107] = 1
     observations[0, 100:107, 190:197] = observations[4, 100:107, 190:197] = 1
@@ -211,13 +222,13 @@ def test_retry_and_unaffected_group_are_reselected_together_without_contact_bypa
     if path is not None:
         wait_for_retired_memmap_unlinks(path=path)
     attempts = stats['sam_crop_retry']['attempts']
-    assert sum(value['status'] == 'succeeded' for value in attempts.values()) == 1
+    assert sum(value['status'] == 'succeeded' for value in attempts.values()) == 2
     labels, _ = ndimage.label(actual, ndimage.generate_binary_structure(3, 3))
     assert labels[0, 100, 100] != labels[0, 100, 190], 'per-group retry selection fabricated a cross-family connection'
 
 
 def _extrapolation_case(tmp_path, *, mode='whole', enabled=True, early_empty=False,
-                        failure=None, stale=False):
+                        failure=None, stale=False,capture=None):
     from XTA import sam_extrapolation as extrapolation
     observations = np.zeros((14, 512, 512), np.uint8)
     observations[5:9, 200:207, 200:207] = 1
@@ -235,6 +246,8 @@ def _extrapolation_case(tmp_path, *, mode='whole', enabled=True, early_empty=Fal
     if early_empty:
         truth[9][:] = 0  # All later border contacts are beyond a real empty prefix.
     requests, providers, scan_count = [], [], []
+    if capture is not None:
+        capture.update(requests=requests,providers=providers,observations=observations,original=observations.copy())
     runtime = SimpleNamespace(_closed=False, _cancel=Event())
     def run(**request):
         a, b, c, d = request['crop_xyxy']
@@ -300,21 +313,24 @@ def test_extrapolation_border_contacts_after_first_raw_empty_do_not_trigger_retr
     assert stats['sam_crop_retry']['charged_tracker_frames'] == 0
 
 
-def test_extrapolation_default_off_and_failed_optional_retry_keep_raw_empty_boundary(tmp_path):
+def test_extrapolation_default_off_keeps_raw_empty_boundary_and_failed_needed_retry_stops(tmp_path):
     disabled = _extrapolation_case(tmp_path / 'disabled', enabled=False)
-    failed = _extrapolation_case(tmp_path / 'failed', failure='ordinary')
-    for result in (disabled, failed):
-        observations, truth, old, stats, _, _, components, _ = result
-        actual = _decode_components(components, observations.shape)
-        expected = np.zeros_like(observations)
-        expected[9:11, old[0]:old[2], old[1]:old[3]] = truth[9:11, old[0]:old[2], old[1]:old[3]]
-        np.testing.assert_array_equal(actual, expected)
-        assert not actual[11:13].any()
+    observations,truth,old,_,_,_,components,_=disabled
+    actual = _decode_components(components, observations.shape)
+    expected = np.zeros_like(observations)
+    expected[9:11, old[0]:old[2], old[1]:old[3]] = truth[9:11, old[0]:old[2], old[1]:old[3]]
+    np.testing.assert_array_equal(actual, expected)
+    assert not actual[11:13].any()
     assert len(disabled[4]) == 2 and not disabled[5]
-    assert len(failed[4]) == 3 and len(failed[5]) == 1
-    ledger = failed[3]['sam_crop_retry']
+    capture={}
+    with pytest.raises(RuntimeError,match='synthetic ordinary retry failure'):
+        _extrapolation_case(tmp_path/'failed',failure='ordinary',capture=capture)
+    assert len(capture['requests'])==3 and len(capture['providers'])==1
+    np.testing.assert_array_equal(capture['observations'],capture['original'])
+    ledger=json.loads(next((tmp_path/'failed'/'extrapolation').glob('*/crop_retry.json')).read_text())
     assert next(iter(ledger['attempts'].values()))['status'] == 'failed'
     assert ledger['charged_tracker_frames'] == 11
+    assert not list((tmp_path/'failed').glob('**/sam_extrapolation_*.cvol'))
 
 
 @pytest.mark.parametrize('failure', ['closed', 'cancelled'])
@@ -331,9 +347,12 @@ def test_extrapolation_retry_does_not_add_whole_baseline_hash_scans(tmp_path):
 
 
 def test_extrapolation_stale_crop_descriptor_is_rejected_before_retry_tracker(tmp_path):
-    result = _extrapolation_case(tmp_path, stale=True)
-    assert len(result[4]) == 2 and len(result[5]) == 1
-    attempt = next(iter(result[3]['sam_crop_retry']['attempts'].values()))
+    capture={}
+    with pytest.raises(RuntimeError,match='does not cover'):
+        _extrapolation_case(tmp_path,stale=True,capture=capture)
+    assert len(capture['requests']) == 2 and len(capture['providers']) == 1
+    ledger=json.loads(next((tmp_path/'extrapolation').glob('*/crop_retry.json')).read_text())
+    attempt = next(iter(ledger['attempts'].values()))
     assert attempt['status'] == 'failed'
     assert 'cover' in attempt['completion_detail']['error'] or 'crop' in attempt['completion_detail']['error']
 

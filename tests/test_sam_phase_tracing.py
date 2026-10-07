@@ -1,6 +1,9 @@
 """CPU-only attribution for planning and canonical image-cache work."""
 from __future__ import annotations
 
+import hashlib
+import json
+from pathlib import Path
 import numpy as np
 import pytest
 
@@ -37,13 +40,71 @@ def test_context_failed_planning_is_balanced_and_restores_thread_scope(tmp_path,
         assert context._active_passes == 0
         assert [event for event, _ in events] == ['sam_phase_begin', 'sam_phase_end']
         begin, end = events[0][1], events[1][1]
-        assert begin == {key: value for key, value in end.items() if key != 'failed'}
+        assert begin == {key: value for key, value in end.items()
+                         if key not in ('failed', 'error', 'error_type')}
         assert end['failed'] is True
+        assert end['error_type'] == 'RuntimeError' and end['error'] == 'planning failed'
         assert begin['sam_phase'] == 'planning'
         assert begin['sam_operation'] == operation
         assert begin['scope_id'] == 'local-scope'
+        root = context.evidence_root if operation == 'interpolation' else context.extrapolation_evidence_root
+        target = root / hashlib.sha256(b'local-scope').hexdigest()[:20] / 'context_preparation_failure.json'
+        receipt = json.loads(target.read_text())
+        assert receipt['phase'] == 'planning'
+        assert receipt['error_type'] == 'RuntimeError' and receipt['error'] == 'planning failed'
+        assert receipt['sam_operation'] == operation
+        assert receipt['scope_id'] == 'local-scope' and receipt['view_name'] == view.name
+        assert receipt['physical_view'] == 'transverse' and receipt['native_shape_tyx'] == [3, 4, 5]
+        assert receipt['sam_resource_profile']['status'] == 'direct_declared_bounds'
+        assert not receipt['complete'] and not receipt['prepared_plan_available']
+        assert receipt['observation_snapshot_sha256'] is None
+        # The actual failure is durable before sibling/global cancellation.
+        assert not context._cancel.is_set()
     finally:
         context.close()
+
+
+@pytest.mark.parametrize('operation', ('interpolation', 'extrapolation'))
+def test_receipt_write_failure_preserves_exact_planning_error(tmp_path, monkeypatch, operation):
+    from XTA import sam_extrapolation
+    context = _context(tmp_path)
+    view = geometry.get_view_infos(3, 4, 5, cartesian_views=('transverse',))[0]
+    original = MemoryError('original planner resource failure')
+    def fail_plan(*args, **kwargs):
+        raise original
+    target = sam_interpolation if operation == 'interpolation' else sam_extrapolation
+    monkeypatch.setattr(target, 'prepare_sam_' + operation + '_pass', fail_plan)
+    write = Path.write_text
+    def fail_write(path, *args, **kwargs):
+        if path.name == 'context_preparation_failure.json.tmp':
+            raise OSError('diagnostic disk unavailable')
+        return write(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'write_text', fail_write)
+    method = context.interpolate if operation == 'interpolation' else context.extrapolate
+    try:
+        with pytest.raises(MemoryError) as caught:
+            method(np.zeros((3, 4, 5), np.uint8), view=view, scope='failed')
+        assert caught.value is original
+        assert any('diagnostic disk unavailable' in note for note in original.__notes__)
+        assert context._active_passes == 0 and not context._cancel.is_set()
+    finally:
+        context.close()
+
+
+def test_phase_error_is_bounded_and_caught_fallback_remains_local(tmp_path, monkeypatch):
+    events = []
+    monkeypatch.setattr(runtime, 'runtime_trace_event', lambda event, **fields: events.append((event, fields)))
+    with sam_interpolation._trace_sam_phase('image_render', 'fallback', operation='interpolation'):
+        try:
+            with sam_interpolation._trace_sam_phase('gpu_projection', 'fallback', operation='interpolation'):
+                raise MemoryError('gpu fallback ' + 'x'*5000)
+        except MemoryError:
+            pass  # The existing CPU fallback completes the enclosing operation.
+    ends = [fields for event, fields in events if event == 'sam_phase_end']
+    assert ends[0]['failed'] and ends[0]['sam_phase'] == 'gpu_projection'
+    assert ends[0]['error_type'] == 'MemoryError' and len(ends[0]['error']) == 4096
+    assert not ends[1]['failed'] and ends[1]['sam_phase'] == 'image_render'
+    assert 'error' not in ends[1] and 'error_type' not in ends[1]
 
 
 @pytest.mark.parametrize('failed', (False, True))

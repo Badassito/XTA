@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import operator
 from dataclasses import asdict, dataclass
+from time import perf_counter
 from typing import Any, Callable, Mapping
 
 from .lta_sam import (
@@ -292,6 +293,7 @@ def run_mask_seed_session(
 
     raw_shape = None
     if raw_requested:
+        from PIL import Image
         if not isinstance(resource, list) or len(resource) != int(session.frame_count):
             raise ValueError("raw observation resource must contain every fixed session frame")
         if not 0 <= int(prompt_frame) - int(session.frame_start) < int(session.frame_count):
@@ -300,6 +302,10 @@ def run_mask_seed_session(
         if len(raw_shape) != 2 or any(value < 1 for value in raw_shape):
             raise ValueError("raw observation seed must have nonempty HxW geometry")
         for frame in resource:
+            if isinstance(frame, Image.Image):
+                if frame.mode != "RGB" or frame.size != (raw_shape[1], raw_shape[0]):
+                    raise ValueError("raw observation RGB resource geometry differs from its seed")
+                continue
             frame_array = np.asarray(frame)
             if frame_array.dtype != np.uint8 or tuple(frame_array.shape) != (*raw_shape, 3):
                 raise ValueError("raw observation RGB resource geometry differs from its seed")
@@ -309,6 +315,7 @@ def run_mask_seed_session(
             raise ValueError("raw observation object masks differ from resource geometry")
 
     local_prompt = int(prompt_frame) - int(session.frame_start)
+    sdk_session_init_started = perf_counter()
     started = measured.handle_request(
         {
             "type": "start_session",
@@ -316,6 +323,7 @@ def run_mask_seed_session(
             "offload_video_to_cpu": True,
         }
     )
+    sdk_session_init_seconds = perf_counter() - sdk_session_init_started
     if not isinstance(started, Mapping) or not str(started.get("session_id", "")).strip():
         raise RuntimeError("mask-seed start_session returned no session_id")
     session_id = str(started["session_id"])
@@ -902,6 +910,8 @@ def run_mask_seed_session(
         anchor_integrity_passed and non_anchor_active_frames
     )
     return {
+        # Includes SDK input loading and session-state allocation, not pure CPU or H2D time.
+        "sdk_session_init_seconds": sdk_session_init_seconds,
         "strategy": "private_mask_seed" if object_masks is None else "private_multi_mask_seed",
         "initial_clicks": () if seed is None else (seed,),
         "final_clicks": () if seed is None else (seed,),

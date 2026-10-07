@@ -446,7 +446,7 @@ def test_known_long_session_cpu_refusal_precedes_images_and_model_admission(tmp_
 
 def test_tiled_iterator_drops_previous_dense_result_before_next_transfer_decode():
     import weakref
-    from types import SimpleNamespace
+    from dataclasses import replace
     from XTA import sam_interpolation
     from XTA.sam_tracker_runtime import SamTrackerRunResult
     references = []
@@ -462,9 +462,10 @@ def test_tiled_iterator_drops_previous_dense_result_before_next_transfer_decode(
                 yield index, result
                 del result, mask
 
-    prepared = SimpleNamespace(tracker_jobs=(object(), object()),
-                               execution_batches=lambda _workers: ((0, 1),), cpu_wave_admission={})
-    with mock.patch.object(sam_interpolation, '_tiled_tracker_requests', return_value=()):
+    prepared = replace(sam_interpolation.prepare_sam_interpolation_pass(np.zeros((1, 4, 5), np.uint8)),
+                       tracker_jobs=(object(), object()))
+    with mock.patch.object(sam_interpolation.SamPreparedInterpolationPass, 'execution_batches', return_value=((0, 1),)), \
+            mock.patch.object(sam_interpolation, '_tiled_tracker_requests', return_value=()):
         stream = sam_interpolation._iterate_tiled_tracker_results(
             TransferBoundaryRuntime(), prepared, 4, {}, {}, None, None)
         first = next(stream)
@@ -506,7 +507,7 @@ def _wave_loaded_result(pool, path, credit, samples, *, broadcast=False):
         with np.load(payload['seed_path'], allow_pickle=False) as saved:
             mask = saved['seed'].copy()
     frames = {frame: mask for frame in range(payload['frame_start'], payload['frame_stop'])}
-    receipt = dict(run_id=task.work_id, crop_xyxy=payload['crop_xyxy'],
+    receipt = dict(run_id=payload['run_id'], crop_xyxy=payload['crop_xyxy'],
         frame_range=[payload['frame_start'], payload['frame_stop']],
         seed_frame=payload['seed_frame'], direction=payload['direction'],
         image_cache=_image_cache_summary(payload['image_cache']),
@@ -558,12 +559,15 @@ def test_four_worker_long_sessions_spend_only_owned_no_extra_parent_wave(tmp_pat
             assert wave['peak_cpu_wave_estimate_bytes'] <= profile.assigned_cpu_wave_bytes
             assert len(prepared.runs) == 8
             assert sorted(len(run.expected_frames) for run in prepared.runs) == [100, 100, 120, 120, 140, 140, 150, 150]
-            with mock.patch.object(sam_tracker_runtime, 'load_tracker_run_result',
+            with mock.patch.object(sam_resources, 'admit_sam_prepared_scope',
+                    wraps=sam_resources.admit_sam_prepared_scope) as admitted, \
+                    mock.patch.object(sam_tracker_runtime, 'load_tracker_run_result',
                     side_effect=lambda path, **_: _wave_loaded_result(
                         workers, path, profile.assigned_cpu_wave_bytes, samples)):
                 merged, stats, _ = interpolate_sam_view_volume_pass(
                     source, runtime=tracker, prepared_plan=prepared, resource_profile=profile,
                     work_dir=tmp_path / 'evidence', **options)
+            assert admitted.call_args.args[2] is cache  # Omitted image_provider uses the configured source for credit.
             try:
                 assert stats['sam_generated_runs'] == stats['sam_selected_runs'] == 8
                 assert stats['added_voxels'] == (98+118+138+148)*16
@@ -684,32 +688,40 @@ def test_session_within_declared_limit_but_over_physical_headroom_never_admits_m
         context.close()
 
 
-def test_other_promised_credits_reduce_physical_wave_then_release_restores_it():
+def test_other_promised_credits_wait_for_full_physical_wave_then_release_restores_it():
+    import threading
     from XTA import sam_resources
     from XTA.interpolation import _ByteAdmissionPool
     pool = _ByteAdmissionPool(64*sam_resources.GIB, 'dynamic physical headroom')
+    sampled, entered = threading.Event(), threading.Event()
+    def physical():
+        sampled.set()
+        return 6*sam_resources.GIB
     options = dict(worker_count=4, base_allowance_bytes=4*sam_resources.GIB,
-                   headroom_probe=lambda: 6*sam_resources.GIB)
-    with pool.reserve(3*sam_resources.GIB, 'already promised elsewhere'):
+                   headroom_probe=physical)
+    def prepare():
         with sam_resources.admit_sam_parent_resources(pool, 4*sam_resources.GIB,
                                                      'after-other-promises', **options) as profile:
-            assert pool.in_use == 7*sam_resources.GIB
+            entered.set()
+            assert pool.in_use == 4*sam_resources.GIB
             record = profile.metadata()
-            assert record['other_promised_bytes_at_admission'] == 3*sam_resources.GIB
+            assert record['other_promised_bytes_at_admission'] == 0
             assert record['base_non_cpu_allowance_bytes'] == 2*sam_resources.GIB
-            assert record['cpu_wave_physical_residual_bytes'] == sam_resources.GIB
-            assert profile.assigned_cpu_wave_bytes == sam_resources.GIB
+            assert record['cpu_wave_physical_residual_bytes'] == 4*sam_resources.GIB
+            assert profile.assigned_cpu_wave_bytes == 2*sam_resources.GIB
             assert profile.assigned_cpu_wave_bytes + profile.non_cpu_base_allowance_bytes + profile.other_promised_bytes <= profile.physical_headroom_bytes
             single = sam_resources.cpu_session_bytes(100, 25*25)['estimated_peak_bytes']
             assert single < profile.assigned_session_cpu_bytes
-            with pytest.raises(RuntimeError, match='known CPU wave'):
-                sam_resources.cpu_wave_admission(single, 100*25*25,
-                    profile.assigned_cpu_wave_bytes, profile.worker_count)
-        assert pool.in_use == 3*sam_resources.GIB
-    with sam_resources.admit_sam_parent_resources(pool, 4*sam_resources.GIB,
-                                                 'other-credit-released', **options) as profile:
-        assert profile.other_promised_bytes == 0
-        assert profile.cpu_wave_physical_residual_bytes == 4*sam_resources.GIB
-        assert profile.assigned_cpu_wave_bytes == 2*sam_resources.GIB
-        assert not profile.has_extra_credit
+            wave = sam_resources.cpu_wave_admission(single, 100*25*25,
+                profile.assigned_cpu_wave_bytes, profile.worker_count)
+            assert wave['peak_cpu_wave_estimate_bytes'] <= profile.assigned_cpu_wave_bytes
+            assert not profile.has_extra_credit
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with pool.reserve(3*sam_resources.GIB, 'already promised elsewhere'):
+            future = executor.submit(prepare)
+            assert sampled.wait(2)
+            assert not entered.wait(.05)
+            with pool.condition:
+                assert pool.in_use == 3*sam_resources.GIB
+        future.result(timeout=5)
     assert pool.in_use == 0

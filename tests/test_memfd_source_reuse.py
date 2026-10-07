@@ -6,6 +6,7 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 import queue
+import re
 import tempfile
 import time
 from types import SimpleNamespace
@@ -36,11 +37,20 @@ def _owner(path, data=b'source pixels'):
         backing.write(data)
         backing.flush()
         owned = os.dup(backing.fileno())
+        path = runtime._memfd_proc_path(owned).as_posix() if path is None else path
         runtime._register_memfd_owner(path, owned, 'source reuse test')
         try:
             yield owned
         finally:
             runtime._release_memfd_owner_key(path)
+
+
+def _local_proc_open(path, flags):
+    """Exercise real FD ownership on hosts without procfs; never weaken RW intent."""
+    match = re.fullmatch(r'/proc/' + str(os.getpid()) + r'/fd/([0-9]+)', str(path).replace('\\', '/'))
+    if match is None or not flags & os.O_RDWR:
+        raise OSError('unsupported parent proc access')
+    return os.dup(int(match.group(1)))
 
 
 def _scheduler(*, queue_obj=None, preflight=None):
@@ -75,10 +85,21 @@ def _spawn_materializer(tasks, results):
                 if task.get('result_mask_path'):
                     with open(task['result_mask_path'], 'r+b') as handle:
                         handle.write(b'Z')
-                results.put({'task_id': task['task_id'], 'source': source,
-                             'path': task['source_volume_path'], 'sources': len(persistent)})
+                if task.get('result_conf_path'):
+                    with open(task['result_conf_path'], 'r+b') as handle:
+                        handle.write(b'C')
+                result = {'task_id': task['task_id'], 'source': source,
+                          'path': task['source_volume_path'], 'sources': len(persistent),
+                          'capability': task.get('_memfd_parent_proc_capability')}
             finally:
                 runtime._close_fd_list(transient)
+            result['closed_outputs'] = 0
+            for fd in transient:
+                try:
+                    os.fstat(fd)
+                except OSError:
+                    result['closed_outputs'] += 1
+            results.put(result)
     finally:
         fds = tuple(persistent.values())
         runtime._close_fd_list(fds)
@@ -140,6 +161,131 @@ class MemfdSourceReuseTests(unittest.TestCase):
             self.assertEqual(len(self.materialize(second)), 4)
             self.assertEqual(second['source_volume_path'], first['source_volume_path'])
             os.fstat(next(iter(self.persistent.values())))
+
+    def test_positive_source_proof_removes_only_output_ipc_and_closes_task_fds(self):
+        scheduler = _scheduler()
+        scheduler.state.gpu_worker_processes = [SimpleNamespace(name='gpu-worker-0', pid=os.getpid())]
+        with _owner(None) as source_fd, _owner(None, b'old') as output_fd, \
+             mock.patch.object(runtime.os, 'open', side_effect=_local_proc_open):
+            source, output = (runtime._memfd_proc_path(fd).as_posix() for fd in (source_fd, output_fd))
+            first = {'task_id': 1, 'source_volume_path': source}
+            scheduler._put_worker_inference_task(first, 'gpu', 0)
+            self.materialize(scheduler.state.gpu_task_queues[0].get_nowait())
+            proof = first['_memfd_parent_proc_capability']
+            scheduler._record_worker_memfd_completion({'type': 'compute_released', 'gpu_index': 0,
+                'task_id': 1, 'ok': True, 'memfd_parent_proc_capability': proof})
+            second = {'task_id': 2, 'source_volume_path': source, 'result_mask_path': output,
+                      'result_conf_path': output, 'canvas_path': output, 'd1_bitset_path': output,
+                      'augmentation_pass_tasks': [{'result_mask_path': output}]}
+            scheduler._put_worker_inference_task(second, 'gpu', 0)
+            sent = scheduler.state.gpu_task_queues[0].get_nowait()
+            self.assertNotIn('result_mask_fd', sent)
+            self.assertNotIn('result_conf_fd', sent)
+            self.assertIn('canvas_fd', sent)
+            self.assertIn('d1_bitset_fd', sent)
+            self.assertNotIn('result_mask_fd', sent['augmentation_pass_tasks'][0])
+            transient = runtime._materialize_worker_task_memfd_paths(sent, self.persistent)
+            try:
+                self.assertEqual(len(transient), 5)
+                self.assertEqual(len(self.persistent), 1)
+                os.lseek(transient[0], 0, os.SEEK_SET)
+                os.write(transient[0], b'new')
+                os.lseek(output_fd, 0, os.SEEK_SET)
+                self.assertEqual(os.read(output_fd, 3), b'new')
+            finally:
+                runtime._close_fd_list(transient)
+            for fd in transient:
+                self.assertClosed(fd)
+
+    def test_forged_or_unsuccessful_capability_ack_keeps_legacy_output_transfer(self):
+        for invalid in ('parent', 'worker', 'source', 'failed'):
+            with self.subTest(invalid=invalid), _owner(None) as source_fd, _owner(None) as output_fd, \
+                 mock.patch.object(runtime.os, 'open', side_effect=_local_proc_open):
+                scheduler = _scheduler()
+                scheduler.state.gpu_worker_processes = [SimpleNamespace(name='gpu-worker-0', pid=os.getpid())]
+                first = {'task_id': 1, 'source_volume_path': runtime._memfd_proc_path(source_fd).as_posix()}
+                scheduler._put_worker_inference_task(first, 'gpu', 0)
+                self.materialize(scheduler.state.gpu_task_queues[0].get_nowait())
+                proof = dict(first['_memfd_parent_proc_capability'])
+                if invalid == 'parent':
+                    proof['parent_pid'] += 1
+                elif invalid == 'worker':
+                    proof['worker_pid'] += 1
+                elif invalid == 'source':
+                    proof['source_key'] = 'memfd-source-v1:unrequested'
+                scheduler._record_worker_memfd_completion({'type': 'result', 'gpu_index': 0,
+                    'task_id': 1, 'ok': invalid != 'failed', 'memfd_parent_proc_capability': proof})
+                self.assertIsNone(scheduler._worker_memfd_source_cache('gpu', 0).direct_output_capability)
+                second = {'task_id': 2, 'result_mask_path': runtime._memfd_proc_path(output_fd).as_posix()}
+                scheduler._put_worker_inference_task(second, 'gpu', 0)
+                self.materialize(scheduler.state.gpu_task_queues[0].get_nowait())
+                self.assertIn('result_mask_path', second)
+                self.assertNotIn('result_mask_fd_proc', second)
+
+    def test_worker_pid_change_before_ready_invalidates_proc_access_and_source_ack(self):
+        scheduler = _scheduler()
+        scheduler.state.gpu_worker_processes = [SimpleNamespace(name='gpu-worker-0', pid=os.getpid())]
+        cache = scheduler._worker_memfd_source_cache('gpu', 0)
+        cache.known['old'] = None
+        cache.direct_output_capability = {'parent_pid': os.getpid(), 'worker_pid': os.getpid()}
+        scheduler.state.gpu_worker_processes = [SimpleNamespace(name='gpu-worker-0', pid=os.getpid() + 1)]
+        with _owner('source'), _owner('result'):
+            task = {'task_id': 1, 'source_volume_path': 'source', 'result_mask_path': 'result'}
+            scheduler._put_worker_inference_task(task, 'gpu', 0)
+            self.assertIn('source_volume_fd', task)
+            self.assertIn('result_mask_fd', task)
+            self.assertNotIn('result_mask_fd_proc', task)
+            self.assertIsNone(cache.direct_output_capability)
+            self.materialize(scheduler.state.gpu_task_queues[0].get_nowait())
+
+    def test_direct_output_recycled_fd_is_rejected_before_writes_and_drains_later_handles(self):
+        opened = []
+        def open_proc(path, flags):
+            fd = _local_proc_open(path, flags)
+            opened.append(fd)
+            return fd
+        with _owner(None, b'original') as output_fd, _owner(None, b'wrong') as other_fd:
+            task = {'result_mask_path': runtime._memfd_proc_path(output_fd).as_posix(), 'canvas_path': runtime._memfd_proc_path(other_fd).as_posix()}
+            batch = runtime._attach_memfd_transfers_to_task(task,
+                direct_output_capability={'parent_pid': os.getpid(), 'worker_pid': os.getpid()})
+            self.assertEqual(len(batch.handles), 1)  # Canvas only; no output backup handle.
+            os.dup2(other_fd, output_fd)
+            with mock.patch.object(runtime.os, 'open', side_effect=open_proc):
+                with self.assertRaisesRegex(RuntimeError, 'output identity changed'):
+                    runtime._materialize_worker_task_memfd_paths(task, self.persistent)
+            for fd in opened + [batch.handles[0].original_duplicate]:
+                self.assertClosed(fd)
+            os.lseek(other_fd, 0, os.SEEK_SET)
+            self.assertEqual(os.read(other_fd, 5), b'wrong')
+
+    def test_second_direct_open_failure_closes_first_output_without_writing(self):
+        opened = []
+        def open_proc(path, flags):
+            if opened:
+                raise PermissionError('direct open denied')
+            fd = _local_proc_open(path, flags)
+            opened.append(fd)
+            return fd
+        with _owner(None, b'old') as output_fd:
+            output = runtime._memfd_proc_path(output_fd).as_posix()
+            task = {'result_mask_path': output, 'result_conf_path': output}
+            runtime._attach_memfd_transfers_to_task(task,
+                direct_output_capability={'parent_pid': os.getpid(), 'worker_pid': os.getpid()})
+            with mock.patch.object(runtime.os, 'open', side_effect=open_proc):
+                with self.assertRaisesRegex(PermissionError, 'direct open denied'):
+                    runtime._materialize_worker_task_memfd_paths(task, self.persistent)
+            self.assertClosed(opened[0])
+            os.lseek(output_fd, 0, os.SEEK_SET)
+            self.assertEqual(os.read(output_fd, 3), b'old')
+
+    def test_unsupported_proc_probe_keeps_source_transfer_valid_without_capability(self):
+        with _owner(None) as fd:
+            task = {'source_volume_path': runtime._memfd_proc_path(fd).as_posix()}
+            runtime._attach_memfd_transfers_to_task(task, known_sources=())
+            with mock.patch.object(runtime.os, 'open', side_effect=PermissionError('unsupported procfs')):
+                self.materialize(task)
+            self.assertNotIn('_memfd_parent_proc_capability', task)
+            self.assertEqual(len(self.persistent), 1)
 
     def test_same_parent_fd_number_with_different_inode_gets_new_child_owner(self):
         with _owner('source', b'old') as owner_fd, _owner('other', b'new') as other_fd:
@@ -410,6 +556,55 @@ class LinuxMemfdSourceReuseTests(unittest.TestCase):
             previous = count
             time.sleep(0.01)
         raise AssertionError('resource-sharer descriptor count did not settle')
+
+    def test_spawn_direct_outputs_match_legacy_bytes_without_output_transfer_or_cache(self):
+        context = mp.get_context('spawn')
+        tasks, results = context.Queue(), context.Queue()
+        worker = context.Process(target=_spawn_materializer, args=(tasks, results))
+        fds = [os.memfd_create('direct-output-test', flags=getattr(os, 'MFD_CLOEXEC', 0)) for _ in range(3)]
+        paths = [runtime._memfd_proc_path(fd).as_posix() for fd in fds]
+        for fd, path, data in zip(fds, paths, (b'pixels', b'.', b'.')):
+            os.write(fd, data)
+            runtime._register_memfd_owner(path, fd, 'direct output spawn test')
+        worker.start()
+        try:
+            first = {'task_id': 1, 'source_volume_path': paths[0], 'result_mask_path': paths[1], 'result_conf_path': paths[2]}
+            batch = runtime._attach_memfd_transfers_to_task(first, known_sources=())
+            self.assertEqual(len(batch.handles), 3)
+            tasks.put(first)
+            initial = results.get(timeout=20)
+            if initial['capability'] is None:
+                self.skipTest('Host denies verified child-to-parent RW proc access; legacy transfer remains valid')
+            proof = initial['capability']
+            self.assertEqual((proof['parent_pid'], proof['worker_pid']), (os.getpid(), worker.pid))
+            self.assertIn(proof['source_key'], batch.source_keys)
+            second = {'task_id': 2, 'source_volume_path': paths[0], 'result_mask_path': paths[1], 'result_conf_path': paths[2]}
+            repeated = runtime._attach_memfd_transfers_to_task(second, known_sources=batch.source_keys,
+                direct_output_capability={'parent_pid': os.getpid(), 'worker_pid': worker.pid})
+            self.assertEqual(repeated.handles, [])
+            runtime.preflight_multiprocessing_payload(second)
+            tasks.put(second)
+            direct = results.get(timeout=20)
+            self.assertEqual(direct['source'], initial['source'])
+            self.assertEqual(direct['path'], initial['path'])
+            self.assertEqual((initial['closed_outputs'], direct['closed_outputs'], direct['sources']), (2, 2, 1))
+            for fd, expected in zip(fds[1:], (b'Z', b'C')):
+                os.lseek(fd, 0, os.SEEK_SET)
+                self.assertEqual(os.read(fd, 1), expected)
+            tasks.put(None)
+            self.assertEqual(results.get(timeout=20)['closed_sources'], 1)
+            worker.join(timeout=20)
+            self.assertEqual(worker.exitcode, 0)
+        finally:
+            if worker.is_alive():
+                worker.terminate()
+                worker.join(timeout=10)
+            for path in paths:
+                runtime._release_memfd_owner_key(path)
+            tasks.close()
+            results.close()
+            tasks.join_thread()
+            results.join_thread()
 
     def test_spawn_reuse_survives_parent_close_and_releases_child_descriptors(self):
         context = mp.get_context('spawn')

@@ -1,5 +1,6 @@
 """Actual atomic credit, late headroom resolution and scoped SAM resources."""
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import replace
 import os
 from types import SimpleNamespace
@@ -14,6 +15,36 @@ from XTA import sam_resources as resources
 from XTA.sam_integration import SamInterpolationContext
 
 GIB = 1024**3
+
+
+@pytest.mark.parametrize('fail_startup', [False, True])
+def test_tile_runtime_starts_before_parent_credit_and_preserves_startup_failure(monkeypatch, fail_startup):
+    pool = _ByteAdmissionPool(64*GIB, 'test')
+    order = []
+    error = RuntimeError('startup refused')
+
+    def warm(parent_pool):
+        assert parent_pool is pool and pool.in_use == 0
+        order.append('runtime')
+        if fail_startup:
+            raise error
+
+    def work():
+        assert pool.in_use > 0
+        order.append('work')
+        return 'complete'
+
+    context = SimpleNamespace(device_ids=('cuda:0',), worker_count=1,
+        prepare_runtime=warm, resource_scope=lambda profile:nullcontext(profile))
+    monkeypatch.setattr(resources, 'physical_sam_headroom', lambda:128*GIB)
+    if fail_startup:
+        with pytest.raises(RuntimeError) as caught:
+            resources.run_admitted_sam_call(pool, 4*GIB, 'tile', context, work, {})
+        assert caught.value is error and order == ['runtime']
+    else:
+        assert resources.run_admitted_sam_call(pool, 4*GIB, 'tile', context, work, {}) == 'complete'
+        assert order == ['runtime', 'work']
+    assert pool.in_use == 0
 
 
 def test_large_profile_owns_one_atomic_base_plus_extra_reservation():
@@ -99,12 +130,12 @@ def test_other_promised_credits_reduce_actual_cpu_wave_at_admission():
     with pool.reserve(3*GIB, 'other promised work'):
         with resources.admit_sam_parent_resources(pool, 4*GIB, 'residual',
                 worker_count=4, base_allowance_bytes=4*GIB,
-                headroom_probe=lambda: 6*GIB) as profile:
+                headroom_probe=lambda: 3*GIB) as profile:
             record = profile.metadata()
             assert record['other_promised_bytes_at_admission'] == 3*GIB
             assert record['base_non_cpu_allowance_bytes'] == 2*GIB
-            assert record['cpu_wave_physical_residual_bytes'] == GIB
-            assert record['assigned_cpu_wave_bytes'] == GIB
+            assert record['cpu_wave_physical_residual_bytes'] == 0
+            assert record['assigned_cpu_wave_bytes'] == 0
             assert pool.in_use == 7*GIB
         assert pool.in_use == 3*GIB
     assert pool.in_use == 0
@@ -203,6 +234,161 @@ def test_late_pool_capacity_reduction_is_resolved_after_wait_without_partial_cre
         record = future.result(timeout=5)
     assert record['pool_capacity_bytes'] == 32*GIB
     assert record['base_charged_bytes']+record['reserved_extra_bytes'] <= 32*GIB
+    assert pool.in_use == 0
+
+
+def test_funded_parent_waits_for_minimum_extra_without_owning_partial_credit():
+    pool = _ByteAdmissionPool(64*GIB, 'test')
+    sampled, entered = threading.Event(), threading.Event()
+
+    def prepare():
+        def physical():
+            sampled.set()
+            return 128*GIB
+        with resources.admit_sam_parent_resources(pool, 4*GIB, 'contended',
+                worker_count=4, headroom_probe=physical) as profile:
+            entered.set()
+            return profile.metadata()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with pool.reserve(54*GIB, 'incumbent'):
+            future = executor.submit(prepare)
+            assert sampled.wait(2)
+            assert not entered.wait(.05)
+            with pool.condition:
+                assert pool.in_use == 54*GIB
+        record = future.result(timeout=5)
+    assert record['reserved_extra_bytes'] == 16*GIB
+    assert record['base_charged_bytes']+record['reserved_extra_bytes'] <= 64*GIB
+    assert pool.in_use == 0
+
+
+@pytest.mark.parametrize(('capacity', 'held', 'headroom'), ((64, 54, 16), (10, 2, 128)))
+def test_contention_wait_preserves_physical_and_isolated_capacity_fallbacks(capacity, held, headroom):
+    pool = _ByteAdmissionPool(capacity*GIB, 'test')
+    with pool.reserve(held*GIB, 'incumbent'):
+        with resources.admit_sam_parent_resources(pool, 4*GIB, 'unfunded', worker_count=4,
+                headroom_probe=lambda: headroom*GIB) as profile:
+            assert not profile.has_extra_credit
+            assert profile.assigned_topology_bytes == 256*1024**2
+            assert pool.in_use == (held+4)*GIB
+        assert pool.in_use == held*GIB
+    assert pool.in_use == 0
+
+
+def test_run154672_promise_contention_waits_instead_of_minting_zero_cpu_wave():
+    # Exact first planning-failure receipt, not an allocation of its large data.
+    pool = _ByteAdmissionPool(304_665_156_608, 'run154672')
+    sampled, entered = threading.Event(), threading.Event()
+
+    def prepare():
+        def physical():
+            sampled.set()
+            return 227_170_508_800
+        with resources.admit_sam_parent_resources(pool, 22_223_466_697, 'run154672',
+                worker_count=4, execution_slots=8, base_allowance_bytes=4*GIB,
+                headroom_probe=physical) as profile:
+            entered.set()
+            record = profile.metadata()
+            wave = resources.cpu_wave_admission(144_484_938, 1000,
+                profile.assigned_cpu_wave_bytes, profile.execution_slots)
+            assert wave['peak_cpu_wave_estimate_bytes'] <= pool.in_use
+            return record
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with pool.reserve(228_490_547_241, 'incumbents'):
+            future = executor.submit(prepare)
+            assert sampled.wait(2)
+            assert not entered.wait(.05)
+            with pool.condition:
+                assert pool.in_use == 228_490_547_241
+        record = future.result(timeout=5)
+    assert record['assigned_cpu_wave_bytes'] == 18*GIB
+    assert record['assigned_topology_bytes'] == 16*GIB
+    assert record['other_promised_bytes_at_admission'] == 0
+    assert pool.in_use == 0
+
+
+@pytest.mark.parametrize(('held', 'allowance', 'headroom'), ((3, 4, 6), (5, 4, 6), (3, 8, 10)))
+def test_only_identified_base_wave_waits_when_isolated_extra_is_unaffordable(held, allowance, headroom):
+    pool = _ByteAdmissionPool(64*GIB, 'test')
+    sampled, entered = threading.Event(), threading.Event()
+
+    def prepare():
+        def physical():
+            sampled.set()
+            return headroom*GIB
+        with resources.admit_sam_parent_resources(pool, allowance*GIB, 'base-only', worker_count=4,
+                base_allowance_bytes=allowance*GIB, headroom_probe=physical) as profile:
+            entered.set()
+            return profile.metadata()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with pool.reserve(held*GIB, 'incumbents'):
+            future = executor.submit(prepare)
+            assert sampled.wait(2)
+            assert not entered.wait(.05)
+            with pool.condition:
+                assert pool.in_use == held*GIB
+        record = future.result(timeout=5)
+    assert record['assigned_cpu_wave_bytes'] == 2*GIB
+    assert record['reserved_extra_bytes'] == 0
+    assert pool.in_use == 0
+
+
+def test_isolated_physical_shortage_after_wake_retains_fallback_and_wave_guard():
+    pool = _ByteAdmissionPool(64*GIB, 'test')
+    sampled = threading.Event()
+    headroom = [128*GIB]
+
+    def prepare():
+        def physical():
+            sampled.set()
+            return headroom[0]
+        with resources.admit_sam_parent_resources(pool, 4*GIB, 'changing-physical', worker_count=4,
+                base_allowance_bytes=4*GIB, headroom_probe=physical) as profile:
+            record = profile.metadata()
+            with pytest.raises(RuntimeError, match='owned phase credit is 0'):
+                resources.cpu_wave_admission(144_484_938, 1000, profile.assigned_cpu_wave_bytes, 4)
+            return record
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with pool.reserve(54*GIB, 'incumbents'):
+            future = executor.submit(prepare)
+            assert sampled.wait(2)
+            with pool.condition:
+                assert pool.in_use == 54*GIB
+                headroom[0] = GIB
+                pool.condition.notify_all()
+            record = future.result(timeout=5)
+            assert pool.in_use == 54*GIB
+    assert record['physical_headroom_bytes'] == GIB
+    assert record['reserved_extra_bytes'] == record['assigned_cpu_wave_bytes'] == 0
+    assert pool.in_use == 0
+
+
+@pytest.mark.parametrize(('held', 'headroom', 'allowance'),
+                         ((54, 128, 0), (64, 128, 0), (54, 64, 0), (5, 6, 4)))
+def test_cancelled_base_or_extra_wait_never_mints_credit(held, headroom, allowance):
+    pool = _ByteAdmissionPool(64*GIB, 'test')
+    cancel, started, entered = threading.Event(), threading.Event(), threading.Event()
+
+    def prepare():
+        started.set()
+        with resources.admit_sam_parent_resources(pool, 4*GIB, 'cancelled', worker_count=4,
+                headroom_probe=lambda: headroom*GIB, base_allowance_bytes=allowance*GIB,
+                cancel_event=cancel):
+            entered.set()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with pool.reserve(held*GIB, 'incumbent'):
+            future = executor.submit(prepare)
+            assert started.wait(2)
+            assert not entered.wait(.05)
+            cancel.set()
+            with pytest.raises(CancelledError, match='admission cancelled'):
+                future.result(timeout=2)
+            assert pool.in_use == held*GIB
     assert pool.in_use == 0
 
 

@@ -3174,6 +3174,12 @@ class _DirectUnionBackingLease:
     nbytes: int
     phase: str = 'inference'
     owner_count: int = 1
+    ram_backed: bool | None = None
+
+    @property
+    def ram_commitment_bytes(self) -> int:
+        # Unknown, mixed and future RAM retain their complete logical promise.
+        return 0 if self.ram_backed is False else int(self.nbytes)
 
     def transition(self, expected: str, new_phase: str) -> None:
         if self.phase != str(expected) or int(self.owner_count) != 1:

@@ -12,6 +12,7 @@ import shutil
 import sys
 import threading
 import time
+import traceback
 import weakref
 import multiprocessing as mp
 from dataclasses import replace
@@ -145,6 +146,8 @@ from .runtime import (
     reset_runtime_state_for_new_run,
     resolve_parent_interpolation_worker_allocation,
     resolve_parent_postprocess_worker_allocation,
+    resolve_parent_memory_limits,
+    sam_sessions_per_gpu,
     resolve_worker_count,
     runtime_telemetry,
     scratch_dir_is_memory_backed,
@@ -348,6 +351,7 @@ from .view_prepare import (
     ComponentProjectionSubmitter,
     SamLayerProjectionSubmitter,
     ViewPrepareLeaseState,
+    classify_dense_ram_backing,
     scratch_unlink_path_for_memmap,
 )
 from .component_replay import (
@@ -556,7 +560,9 @@ def _execution_runtime_provenance() -> Dict[str, object]:
     # without importing optional model runtimes merely to fingerprint them.
     for name in ('assembly', 'view_prepare', 'projection_queue', 'sam_integration',
                  'sam_interpolation', 'sam_extrapolation', 'sam_extrapolation_policy',
-                 'sam_tracker_runtime', 'sam_resources', 'sam_policy', 'sam_mask_reader',
+                 'sam_tracker_runtime', 'sam_resources', 'sam_image_prefetch', 'sam_crop_retry',
+                 'sam_parent_staging',
+                 'sam_policy', 'sam_mask_reader',
                  'sam_branch_selection', 'sam_evidence', 'sam_canvas_rendering'):
         path = package / (name + '.py')
         entry = {'path': str(path), 'loaded_in_parent': 'XTA.' + name in sys.modules}
@@ -742,6 +748,30 @@ def _reset_gpu_stage_coordinator_if_sam_settled() -> bool:
         return False
     _reset_main_process_gpu_stage_coordinator()
     return True
+
+
+def _cancel_scheduler_prepares(error, *, sam_context, sam_parent_staging,
+                              view_processing_futures):
+    """Expose the primary failure before queued cancellation or blocking teardown."""
+    try:
+        print('Scheduler failed; cancelling queued preparation before resource teardown.',
+              file=sys.stderr, flush=True)
+        traceback.print_exception(type(error), error, error.__traceback__, file=sys.stderr)
+        sys.stderr.flush()
+    except Exception as diagnostic_error:
+        error.add_note(f'Scheduler error logging also failed: {diagnostic_error}')
+    if sam_context is not None:
+        try:
+            sam_context.cancel(f'TTA scheduler failed before SAM completion: {type(error).__name__}: {error}')
+        except BaseException as cleanup_error:
+            error.add_note(f'SAM cancellation also failed: {cleanup_error}')
+    if sam_parent_staging is not None:
+        try:
+            sam_parent_staging.abort()
+        except BaseException as cleanup_error:
+            error.add_note(f'Parent checkpoint cancellation also failed: {cleanup_error}')
+    for future in tuple(view_processing_futures):
+        future.cancel()
 
 
 def main() -> None:
@@ -2102,6 +2132,8 @@ def _main_impl() -> None:
         nrrd_layers_enabled=bool(component_layers_needed),
         interpolation_enabled=bool(len(interpolating_views) > 0 or
                                    interpolation_settings.extrapolation_enabled),
+        sam_execution_slots=(len(interpolation_settings.sam_devices)*sam_sessions_per_gpu()
+                             if interpolation_settings.sam_enabled else 0),
     )
     (
         parent_interpolation_overlap,
@@ -2511,53 +2543,23 @@ def _main_impl() -> None:
     component_ref_dense_retirement_active = bool(not keep_temp_artifacts)
     direct_union_sparse_retirement_active = bool(component_ref_dense_retirement_active)
 
-    _direct_headroom = max(0, int(available_anon_work_bytes()) - 64 * GIB)
     _default_inference_view_limit = max(2, min(4, max(1, int(gpu_device_count))))
     direct_union_inference_view_limit = max(
         1,
         _env_int('YOLO_TTA_DIRECT_UNION_INFERENCE_VIEWS', int(_default_inference_view_limit)),
     )
-    # Keep the live dense inference window deliberately below the interpolation heap.
-    # The former 512/768 GiB defaults could legally retain almost the entire 1 TiB job
-    # allocation before the one active interpolation pass allocated labels/bridges.  An
-    # individual oversize view still has an emergency lane, so these conservative caps never
-    # deadlock a 100+ GiB logical tiled parent.
-    _default_inference_bytes = max(
-        64 * GIB, min(128 * GIB, int(max(1, _direct_headroom) * 0.25)),
-    )
-    direct_union_inference_byte_limit = int(
-        max(
-            1.0,
-            _env_float(
-                'YOLO_TTA_DIRECT_UNION_INFERENCE_GIB',
-                _default_inference_bytes / GIB,
-            ),
-        ) * GIB
-    )
-    # A four-pass tilted-Azimuthal group can exceed 150 GiB. Reserve room
-    # for one group in inference while its predecessor is postprocessing.
-    # Policy planning below still clamps this request to physical/cgroup RAM,
-    # including support, pinned staging, output and transient allowances.
-    _default_total_dense_bytes = (
-        384 * GIB if policy_settings.enabled else max(
-            128 * GIB, min(256 * GIB, int(max(1, _direct_headroom) * 0.40)),
-        )
-    )
-    direct_union_total_dense_byte_limit = int(
-        max(
-            direct_union_inference_byte_limit / GIB,
-            _env_float(
-                'YOLO_TTA_DIRECT_UNION_TOTAL_GIB',
-                _default_total_dense_bytes / GIB,
-            ),
-        ) * GIB
-    )
-    _parent_transient_default = max(
-        64 * GIB,
-        min(192 * GIB, int(max(1, available_anon_work_bytes() - 64 * GIB) * 0.25)),
-    )
+    # Capture one real RAM budget for the SAM feeder lanes. Policy planning
+    # below additionally deducts support, output and worker commitments.
+    if interpolation_settings.sam_enabled:
+        from .sam_resources import physical_sam_headroom
+        _parent_startup_headroom = physical_sam_headroom()
+    else:
+        _parent_startup_headroom = available_anon_work_bytes()
+    (direct_union_inference_byte_limit, direct_union_total_dense_byte_limit,
+     _parent_transient_bytes) = resolve_parent_memory_limits(_parent_startup_headroom,
+        sam_enabled=interpolation_settings.sam_enabled, policy_enabled=policy_settings.enabled)
     parent_transient_admission = _ByteAdmissionPool(
-        int(max(1.0, _env_float('YOLO_TTA_PARENT_TRANSIENT_GIB', _parent_transient_default / GIB)) * GIB),
+        _parent_transient_bytes,
         'Parent view postprocess admission',
     )
     if direct_union_sparse_retirement_active:
@@ -2861,21 +2863,85 @@ def _main_impl() -> None:
     view_processing_futures: Dict[Future, Tuple[str, str]] = {}
     sam_parent_staging = None
     sam_checkpoint_executor = None
+    sam_cpu_prepare_executor = None
+    sam_cpu_futures = {'source': None, 'runtime': None, 'runtime_needed': False}
+    sam_cpu_max_detector_parent = 0
     if sam_context is not None and sam_context.shared_detector_devices:
         from .sam_parent_staging import DeferredSamParentQueue
         sam_checkpoint_executor = _create_tracked_thread_pool(
-            max_workers=1, thread_name_prefix='sam-parent-checkpoint',
+            max_workers=int(parent_postprocess_workers), thread_name_prefix='sam-parent-checkpoint',
         )
+        sam_cpu_prepare_executor = _create_tracked_thread_pool(
+            max_workers=1, thread_name_prefix='sam-parent-cpu-prepare',
+        )
+        sam_cpu_max_detector_parent = max((int(array_nbytes(
+            view_processing_volume_shape(candidate,int(args.imgsz)),np.uint8))
+            *(2 if float(args.min_conf)>0 or bool(getattr(args,'reconciliation_retain_confidence',False)) else 1)
+            for candidate in views),default=0)
         sam_parent_staging = DeferredSamParentQueue(
             temp_dir=temp_dir, output_dir=out_dir,
             checkpoint_executor=sam_checkpoint_executor,
             prepare_executor=parent_postprocess_executor, leases=view_prepare_leases,
             dense_limit=lambda: int(direct_union_total_dense_byte_limit),
-            ready=lambda: bool(sam_context.detector_retirement_ready),
+            ready=lambda: _sam_parents_ready(),
             keep_temp=bool(keep_temp_artifacts),
             bounded_parent_keys=bounded_policy_parent_keys,
         )
         _run_resources().track_closeable(sam_parent_staging)
+
+    def _sam_parents_ready():
+        if not sam_context.detector_retirement_ready:
+            return False
+        future = sam_cpu_futures['runtime']
+        if future is None:
+            return not sam_cpu_futures['runtime_needed']
+        if not future.done():
+            return False
+        future.result()
+        return True
+
+    def _maybe_prepare_sam_runtime():
+        future = sam_cpu_futures['runtime']
+        if future is not None:
+            if future.done():
+                future.result()
+        elif (sam_cpu_prepare_executor is not None and sam_cpu_futures['runtime_needed']
+                and sam_context.detector_retirement_ready):
+            # Boot before deferred parents consume the pool. The same startup
+            # guards still account for checkpoint codecs and other live work.
+            sam_cpu_futures['runtime'] = sam_cpu_prepare_executor.submit(
+                sam_context.prepare_runtime, parent_transient_admission)
+
+    def _maybe_prepare_sam_cpu_source():
+        if sam_cpu_futures['source'] is not None:
+            if sam_cpu_futures['source'].done():
+                sam_cpu_futures['source'].result()
+            return
+        if sam_cpu_prepare_executor is None or sam_context.detector_retirement_ready:
+            return
+        source = sam_context.source_volume
+        if (not bool(getattr(source,'_is_lazy_processing_cube',False)) or source.materialized
+                or not any(str(view.family)!='orthogonal' or physical_view_name(view)!='transverse'
+                           for view in views)):
+            return
+        from .media import volume_readiness
+        ready = volume_readiness(source.source)
+        if ready is not None and not ready._all_event.is_set():
+            return
+        from .sam_resources import physical_sam_headroom
+        dense_used = sum(direct_union_inference_bytes.values())+sum(direct_union_postprocess_bytes.values())
+        # Leave every unspent detector/parent allowance free. The existing
+        # exact cube producer owns its disk map; no parent or profile is parked.
+        required = (int(source.nbytes)+max(0,int(direct_union_total_dense_byte_limit)-dense_used)
+                    +max(0,int(parent_transient_admission.capacity)-int(parent_transient_admission.in_use)))
+        if physical_sam_headroom() < required:
+            return
+        def materialize_cpu_source():
+            started=time.perf_counter()
+            source.materialize(reason='SAM CPU prerequisites while detector inference is active')
+            sam_context._add_image_metrics(source_materializations=1,
+                source_materialization_seconds=time.perf_counter()-started)
+        sam_cpu_futures['source'] = sam_cpu_prepare_executor.submit(materialize_cpu_source)
     view_processing_submitted: set[Tuple[str, str]] = set()
     physical_view_finalization_futures: Dict[Future, Tuple[str, str]] = {}
     physical_view_finalization_submitted: set[Tuple[str, str]] = set()
@@ -2926,7 +2992,7 @@ def _main_impl() -> None:
 
     def _sam_parent_requires_staging(view):
         return bool(sam_parent_staging is not None and sam_context is not None
-                    and sam_context.shared_detector_devices and not sam_context.detector_retirement_ready
+                    and sam_context.shared_detector_devices and not _sam_parents_ready()
                     and (interpolation_settings.extrapolation_enabled or
                          interpolation_settings.backend == 'sam'
                          and _view_uses_interpolation(view, int(args.interpolation_distance))))
@@ -2947,9 +3013,21 @@ def _main_impl() -> None:
         # disabled for GPU-only views but CPU-eligible views still write a common direct union.
         process_worker_direct_union = bool(worker_direct_union_active)
         sam_blocked = _sam_parent_requires_staging(view)
-        staged_disk_backing = bool(sam_blocked
+        processing_shape = view_processing_volume_shape(view, int(args.imgsz))
+        staged_volume_count = 2 if (float(args.min_conf) > 0.0
+            or bool(getattr(args, 'reconciliation_retain_confidence', False))) else 1
+        if dense_tiling_active:
+            staged_volume_count += 1 + (2 if component_layers_needed else 0)
+        staged_logical_bytes = int(array_nbytes(processing_shape, np.uint8)) * staged_volume_count
+        staged_active_bytes = view_prepare_leases.ram_commitment_bytes
+        staged_ram_backing = bool(sam_blocked
+            and sam_parent_staging.claim_ram_first(key,staged_logical_bytes,staged_active_bytes,
+                detector_room_bytes=int(sam_cpu_max_detector_parent)))
+        staged_disk_backing = bool(sam_blocked and not staged_ram_backing
             and sam_parent_staging.reusable_workspace_paths(union_path, confmap_path))
-        if staged_disk_backing:
+        if staged_ram_backing:
+            runtime_telemetry().add('sam_interpolation.staging.ram_first_attempt_parents', 1)
+        elif staged_disk_backing:
             runtime_telemetry().add('sam_interpolation.staging.disk_from_birth_parents', 1)
         elif sam_blocked:
             runtime_telemetry().add('sam_interpolation.staging.checkpoint_copy_backing_parents', 1)
@@ -2960,9 +3038,22 @@ def _main_impl() -> None:
             )
             or process_worker_direct_union
         )
-        processing_shape = view_processing_volume_shape(view, int(args.imgsz))
         union_mm: Optional[np.ndarray] = None
         conf_mm: Optional[np.ndarray] = None
+        def retire_unpublished_workspaces():
+            nonlocal union_mm, conf_mm
+            from .view_prepare import _array_lifetime_owner
+            # No worker has received these private allocations. Still respect
+            # allocator/caller aliases before freeing this RAM-birth charge.
+            owner_refs = [weakref.ref(_array_lifetime_owner(value))
+                          for value in (union_mm,conf_mm) if value is not None]
+            close_memmap_array_without_flush(
+                conf_mm, unlink_path=scratch_unlink_path_for_memmap(conf_mm,confmap_path))
+            close_memmap_array_without_flush(
+                union_mm, unlink_path=scratch_unlink_path_for_memmap(union_mm,union_path))
+            union_mm = conf_mm = None
+            if staged_ram_backing and not any(reference() is not None for reference in owner_refs):
+                sam_parent_staging.release_ram_first(key)
         try:
             union_mm = allocate_workspace_array(
                 shape=processing_shape,
@@ -2970,7 +3061,7 @@ def _main_impl() -> None:
                 path=union_path,
                 desc=f'{model_name}/{view.name} baseline union workspace',
                 prefer_memory=bool(union_prefer_memory and not staged_disk_backing),
-                prefer_memfd=bool(process_worker_direct_union and not staged_disk_backing),
+                prefer_memfd=bool((process_worker_direct_union or staged_ram_backing) and not staged_disk_backing),
             )
             if float(args.min_conf) > 0.0 or bool(getattr(args, 'reconciliation_retain_confidence', False)):
                 conf_mm = allocate_workspace_array(
@@ -2980,15 +3071,10 @@ def _main_impl() -> None:
                     desc=f'{model_name}/{view.name} baseline confidence workspace',
                     prefer_memory=(not staged_disk_backing and not process_worker_direct_union and not policy_settings.enabled
                                    and not bool(getattr(args, 'reconciliation_retain_confidence', False))),
-                    prefer_memfd=bool(process_worker_direct_union and not staged_disk_backing),
+                    prefer_memfd=bool((process_worker_direct_union or staged_ram_backing) and not staged_disk_backing),
                 )
         except BaseException:
-            close_memmap_array_without_flush(
-                conf_mm, unlink_path=scratch_unlink_path_for_memmap(conf_mm, confmap_path),
-            )
-            close_memmap_array_without_flush(
-                union_mm, unlink_path=scratch_unlink_path_for_memmap(union_mm, union_path),
-            )
+            retire_unpublished_workspaces()
             for failed_path in (union_path, confmap_path):
                 try:
                     failed_path.unlink(missing_ok=True)
@@ -2999,6 +3085,16 @@ def _main_impl() -> None:
         assert union_mm is not None
         union_backing = _memmap_backing_path(union_mm)
         conf_backing = _memmap_backing_path(conf_mm) if conf_mm is not None else None
+        if staged_ram_backing:
+            ram_owner_flags = tuple(not isinstance(value, np.memmap)
+                or _memfd_owner_key_from_array(value) is not None
+                or backing is not None and path_is_memory_backed(backing)
+                for value,backing in ((union_mm,union_backing),(conf_mm,conf_backing)) if value is not None)
+            ram_owners = all(ram_owner_flags)
+            runtime_telemetry().add('sam_interpolation.staging.' +
+                ('ram_first_actual_parents' if ram_owners else 'ram_first_raw_allocation_fallback_parents'), 1)
+            if not any(ram_owner_flags):
+                sam_parent_staging.release_ram_first(key)
         backing_error: Optional[str] = None
         if process_worker_direct_union and union_backing is None:
             backing_error = (
@@ -3009,12 +3105,7 @@ def _main_impl() -> None:
                 f'{model_name}/{view.name} direct-union confidence workspace is not process-shareable'
             )
         if backing_error is not None:
-            close_memmap_array_without_flush(
-                conf_mm, unlink_path=scratch_unlink_path_for_memmap(conf_mm, confmap_path),
-            )
-            close_memmap_array_without_flush(
-                union_mm, unlink_path=scratch_unlink_path_for_memmap(union_mm, union_path),
-            )
+            retire_unpublished_workspaces()
             for failed_path in (union_path, confmap_path):
                 try:
                     failed_path.unlink(missing_ok=True)
@@ -3048,6 +3139,9 @@ def _main_impl() -> None:
             backing_bytes = int(dense_volume_bytes) * int(dense_volume_count)
             direct_union_backing_leases[key] = _DirectUnionBackingLease(
                 key=key, nbytes=int(backing_bytes), phase='inference', owner_count=1,
+                ram_backed=classify_dense_ram_backing((union_mm, conf_mm),
+                    future_ram_bytes=max(0, int(backing_bytes)-int(union_mm.nbytes)
+                        -(0 if conf_mm is None else int(conf_mm.nbytes)))),
             )
             direct_union_inference_views.add(key)
             direct_union_inference_bytes[key] = int(backing_bytes)
@@ -3127,6 +3221,15 @@ def _main_impl() -> None:
         slice_meta_holder = view_slice_meta.pop(key, None)
         if slice_meta_holder is not None and not bool(slice_meta_holder.get('valid', False)):
             slice_meta_holder = None
+        if (sam_parent_staging is not None and (interpolation_settings.extrapolation_enabled
+                or interpolation_settings.backend == 'sam'
+                and _view_uses_interpolation(view, int(args.interpolation_distance)))):
+            # Valid detector metadata avoids loading predictors for an empty
+            # run. Missing metadata stays conservative without scanning pixels.
+            active_slices = None if slice_meta_holder is None else np.asarray(
+                slice_meta_holder.get('slice_any', ()), dtype=bool)
+            sam_cpu_futures['runtime_needed'] |= (active_slices is None
+                or active_slices.shape != (int(view.num_slices),) or bool(active_slices.any()))
         processing_bytes = int(array_nbytes(processing_shape, np.uint8))
         source_bytes = int(array_nbytes((int(input_T), int(input_H), int(input_W)), np.uint8))
         capture_workspace_bytes = 0 if capture_plan is None else int(capture_plan.workspace_bytes)
@@ -3137,6 +3240,7 @@ def _main_impl() -> None:
 
         task = AdmittedViewPrepare(
             admission=parent_transient_admission,
+            backing_lease=direct_union_backing_leases.get(key),
             transient_bytes=int(transient_bytes),
             model_name=str(model_name), view=view,
             union_mm=union_mm, confmap_mm=confmap_mm,
@@ -3197,10 +3301,16 @@ def _main_impl() -> None:
                 # aliases in this submission frame when its writer can start.
                 union_mm = None
                 confmap_mm = None
+                # The final detector writer has retired. Drain these immutable
+                # bytes immediately; optional CPU cleanup/prewarm would mutate
+                # them and delay RAM credit behind unrelated SAM preparation.
                 sam_parent_staging.defer(task, required_bytes)
                 deferred_to_sam = True
             else:
+                if task.backing_lease is not None:
+                    task.backing_lease.ram_backed = None
                 fut = parent_postprocess_executor.submit(task)
+                task.track_cancellation(fut)
         except BaseException:
             if union_mm is None and d1_shadow_path is None:
                 union_mm = task.union_mm
@@ -4459,6 +4569,8 @@ def _main_impl() -> None:
 
     @scheduler_operation('background_drain')
     def _drain_completed_background_futures() -> None:
+        _maybe_prepare_sam_runtime()
+        _maybe_prepare_sam_cpu_source()
         direct_union_capacity_released = False
         while True:
             try:
@@ -4790,6 +4902,11 @@ def _main_impl() -> None:
             'inference_total_tasks': int(scheduler_state.gpu_worker_total_tasks),
             'dense_retained_bytes': sum(direct_union_inference_bytes.values()) + sum(direct_union_postprocess_bytes.values()),
             'dense_limit_bytes': int(direct_union_total_dense_byte_limit),
+            'parent_transient_in_use_bytes': parent_transient_in_use,
+            'parent_transient_capacity_bytes': parent_transient_capacity,
+            'gpu_resident_owners': gpu_stage_state.get('resident_owners', {}),
+            'inference_asset_retirement_pending': gpu_stage_state.get('inference_asset_retirement_pending', False),
+            'pending_inference_backlog': gpu_stage_state.get('pending_inference_backlog', False),
         })
         parent_counts = activity['parent_prepares']
         print(
@@ -4797,6 +4914,9 @@ def _main_impl() -> None:
             f'gpu_inference_inflight={gpu_stage_state.get("inference_inflight", {})}, '
             f'gpu_stage_leases={gpu_stage_state.get("stage_leases", {})}, '
             f'gpu_stage_admission_pending={gpu_stage_state.get("provisional_stage_devices", [])}, '
+            f'gpu_resident_owners={gpu_stage_state.get("resident_owners", {})}, '
+            f'gpu_assets_retiring={gpu_stage_state.get("inference_asset_retirement_pending", False)}, '
+            f'gpu_inference_backlog={gpu_stage_state.get("pending_inference_backlog", False)}, '
             f'spherical_pressure={gpu_stage_state.get("spherical_retirement_pressure", False)}, '
             f'spherical_reserved_device={gpu_stage_state.get("spherical_retirement_reserved_device")}, '
             f'spherical_requests={gpu_stage_state.get("spherical_retirement_request_count", 0)}, '
@@ -4969,6 +5089,8 @@ def _main_impl() -> None:
             tile_dense_worker_result_warn_seconds=tile_dense_worker_result_warn_seconds,
             view_processing_volume_shape=view_processing_volume_shape,
             workspace_anon_cap_bytes=workspace_anon_cap_bytes,
+            staged_ram_backlog_bytes=(None if sam_parent_staging is None else
+                                      sam_parent_staging.detector_backlog_bytes),
         ),
     )
 
@@ -5669,6 +5791,8 @@ def _main_impl() -> None:
             # Repeated checks of untouched mmap pages would promise the same RAM
             # to every policy pass. Swap is deliberately excluded from this budget.
             policy_headroom = int(publication_ram_headroom())
+            if interpolation_settings.sam_enabled:
+                policy_headroom = min(policy_headroom, physical_sam_headroom())
             parent_transient_admission.capacity = min(
                 parent_transient_admission.capacity, max(1, policy_headroom // 8))
             source_bytes = math.prod((int(input_T), int(input_H), int(input_W)))
@@ -5680,6 +5804,10 @@ def _main_impl() -> None:
             parent_reserve = max(parent_working, min(
                 parent_transient_admission.capacity,
                 int(parent_postprocess_workers) * parent_working))
+            if interpolation_settings.sam_enabled:
+                # Parent resource profiles also spend extra SAM credit from
+                # this pool; reserving only their base omits that commitment.
+                parent_reserve = max(parent_working, parent_transient_admission.capacity)
             worker_buffers = confidence_worker_reserve + int(gpu_device_count) * max(
                 256 * 1024**2,
                 int(args.gpu_batch) * int(args.imgsz)**2
@@ -5750,6 +5878,11 @@ def _main_impl() -> None:
                 f'physical/cgroup headroom={policy_headroom / GIB:.2f} GiB. '
                 'Completed parents retire individually after component publication.', flush=True)
             write_json_manifest(support_dir / 'parent_memory_plan.json', policy_memory_plan)
+        # Policy dispatch admits every sibling together. Freeze the actual
+        # aggregate room needed by any detector group before any RAM birth.
+        sam_cpu_max_detector_parent = max(sam_cpu_max_detector_parent,
+            max((scheduler.direct_union_task_bytes(task) for task in gpu_worker_tasks_by_id.values()
+                 if str(task.get('kind'))=='fullframe'),default=0))
         native_dense_reserve_bytes = native_fullframe_dense_reserve(
             gpu_worker_tasks_by_id.values(),
             total_dense_limit=int(direct_union_total_dense_byte_limit),
@@ -7063,6 +7196,8 @@ def _main_impl() -> None:
                         and scheduler.has_pending_process_results())):
                 continue
             waitables: List[Future] = list(pending_prediction_volume_futures)
+            waitables.extend(sam_cpu_futures[name] for name in ('source', 'runtime')
+                if sam_cpu_futures[name] is not None and not sam_cpu_futures[name].done())
             waitables.extend(list(prediction_accumulation_futures.keys()))
             waitables.extend(prepared_view_waitables(view_processing_futures))
             if sam_parent_staging is not None:
@@ -7169,11 +7304,11 @@ def _main_impl() -> None:
 
     finally:
         physical_view_finalization_stop.set()
-        if sys.exc_info()[0] is not None:
-            if sam_parent_staging is not None:
-                sam_parent_staging.abort()
-            if sam_context is not None:
-                sam_context.cancel('TTA scheduler failed before SAM completion')
+        scheduler_error = sys.exc_info()[1]
+        if scheduler_error is not None:
+            _cancel_scheduler_prepares(scheduler_error, sam_context=sam_context,
+                sam_parent_staging=sam_parent_staging,
+                view_processing_futures=view_processing_futures)
             component_projection_queue.abort()
             # (completion): the wait=True shutdowns below block on render
             # tasks parked in wait_for_volume_ready for still-running streaming
@@ -7199,12 +7334,27 @@ def _main_impl() -> None:
         prediction_volume_executor.shutdown(wait=True)
         prediction_join_executor.shutdown(wait=True)
         prediction_result_executor.shutdown(wait=True)
+        if sam_cpu_prepare_executor is not None:
+            sam_cpu_prepare_executor.shutdown(wait=True)
         if sam_checkpoint_executor is not None:
             sam_checkpoint_executor.shutdown(wait=True)
-        parent_postprocess_executor.shutdown(wait=True)
+        parent_postprocess_executor.shutdown(wait=True, cancel_futures=scheduler_error is not None)
         if sam_parent_staging is not None:
             runtime_telemetry().gauge('sam_interpolation.parent_staging', sam_parent_staging.snapshot())
             sam_parent_staging.close()
+        if scheduler_error is not None:
+            for future, key in view_processing_futures.items():
+                cleanup_error = getattr(future, '_xta_cancelled_prepare_cleanup_error', None)
+                if cleanup_error is not None:
+                    scheduler_error.add_note(f'Cancelled parent {key} cleanup also failed: {cleanup_error}')
+                view_prepare_leases.retire_cancelled(key, future,
+                    retired_callback=_publish_parent_dense_retired)
+            while True:
+                try:
+                    key, expected_lease = parent_dense_retired_events.get_nowait()
+                except queue.Empty:
+                    break
+                view_prepare_leases.settle_publication_retirement(key, expected_lease)
         component_projection_queue.shutdown(cancel_futures=sys.exc_info()[0] is not None)
         runtime_telemetry().gauge('projection.component_queue', component_projection_queue.snapshot())
         runtime_telemetry().gauge('projection.component_replay_capture', component_replay_capture_status())
@@ -7233,7 +7383,10 @@ def _main_impl() -> None:
                 'source_materializations': getattr(sam_context, 'source_materializations', None),
                 'source_materialization_seconds': getattr(sam_context, 'source_materialization_seconds', None),
                 'shared_detector_devices': list(sam_context.shared_detector_devices),
-                'gpu_scope_concurrency': 'serialized result consumer; work-conserving endpoint jobs per admitted device',
+                'worker_count': int(sam_context.worker_count),
+                'worker_slots': [list(slot) for slot in sam_context.worker_slots],
+                'startup_admission': dict(sam_context.startup_admission),
+                'gpu_scope_concurrency': 'bounded result consumer per scope; work-conserving admitted predictor slots',
                 'tracker_dispatch': dict(sam_context.dispatch_summary),
                 'feature_cache_mib_per_worker': sam_context.feature_cache_mib,
                 'crop_mode': sam_context.crop_mode,

@@ -379,6 +379,7 @@ def test_startup_cancellation_never_publishes_a_lendable_new_resident(
     from XTA import sam_integration, sam_tracker_runtime
 
     coordinator, _pool, torch = admission
+    monkeypatch.setenv('YOLO_TTA_SAM_SESSIONS_PER_GPU', '1')
     context = sam_integration.SamInterpolationContext(model_path='unused-host-model',
         device_ids=('0', '1'), temp_dir=tmp_path, evidence_root=tmp_path / 'evidence',
         source_volume=np.zeros((3, 4, 4), np.uint8), source_identity='startup-cancel-source')

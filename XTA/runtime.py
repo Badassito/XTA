@@ -2086,18 +2086,50 @@ def _estimate_parent_view_postprocess_bytes(
         estimate = max(int(estimate), int(view_bytes) * 2 + 4 * GIB)
     return max(512 * 1024 * 1024, min(96 * GIB, int(estimate)))
 
+def sam_sessions_per_gpu() -> int:
+    sessions = os.environ.get('YOLO_TTA_SAM_SESSIONS_PER_GPU', '2').strip()
+    if sessions not in {'1', '2'}:
+        raise ValueError('YOLO_TTA_SAM_SESSIONS_PER_GPU must be 1 or 2')
+    return int(sessions)
+
+
+def resolve_parent_memory_limits(available_bytes: int, *, sam_enabled: bool,
+                                 policy_enabled: bool) -> Tuple[int, int, int]:
+    """Keep inference bounded while SAM parent lanes share real host headroom.
+
+    The SAM caller supplies physical/cgroup/SLURM headroom without swap. Its
+    dense and transient defaults use 40% and 25% of the same post-reserve
+    budget. Small-host floors retain the existing exclusive emergency lane.
+    """
+    headroom = max(1, int(available_bytes)-64*GIB)
+    inference_default = max(64*GIB, min(128*GIB, int(headroom*.25)))
+    dense_default = (max(384*GIB if policy_enabled else 128*GIB, int(headroom*.40))
+        if sam_enabled else 384*GIB if policy_enabled else
+        max(128*GIB, min(256*GIB, int(headroom*.40))))
+    transient_default = max(64*GIB, int(headroom*.25) if sam_enabled else
+                            min(192*GIB, int(headroom*.25)))
+    inference = int(max(1., _env_float('YOLO_TTA_DIRECT_UNION_INFERENCE_GIB',
+                                     inference_default/GIB))*GIB)
+    dense = int(max(inference/GIB, _env_float('YOLO_TTA_DIRECT_UNION_TOTAL_GIB',
+                                            dense_default/GIB))*GIB)
+    transient = int(max(1., _env_float('YOLO_TTA_PARENT_TRANSIENT_GIB',
+                                     transient_default/GIB))*GIB)
+    return inference, dense, transient
+
+
 def resolve_parent_postprocess_worker_allocation(
     worker_budget: int,
     views: Sequence['ViewInfo'],
     *,
     nrrd_layers_enabled: bool,
     interpolation_enabled: bool,
+    sam_execution_slots: int = 0,
 ) -> Tuple[int, int, int, int, int]:
     """Resolve independent parent-view and per-view slice concurrency.
 
-    Defaults admit up to four views within CPU and anonymous-memory limits, then divide
-    the worker budget across their nested slice pools. Interpolation enablement affects
-    only the per-view memory estimate.
+    SAM starts with two producers per execution slot and grows with the CPU
+    budget's existing 16-thread share. Real RAM and live weighted admission
+    bound the work. Other backends retain the four-parent default.
     """
     budget = max(1, int(worker_budget))
     view_list = list(views)
@@ -2111,9 +2143,16 @@ def resolve_parent_postprocess_worker_allocation(
         or [512 * 1024 * 1024]
     )
     reserve = int(max(0.0, _env_float('YOLO_TTA_PARENT_POSTPROCESS_RESERVE_GIB', 16.0)) * GIB)
-    usable = max(0, int(available_anon_work_bytes()) - int(reserve))
+    if int(sam_execution_slots) > 0:
+        from .sam_resources import physical_sam_headroom
+        available = physical_sam_headroom()
+    else:
+        available = available_anon_work_bytes()
+    usable = max(0, int(available) - int(reserve))
     memory_cap = max(1, min(int(view_count), int(usable // max(1, int(per_view_bytes)))))
-    cpu_cap = max(1, min(4, int(view_count), max(1, int(budget) // 16)))
+    cpu_target = (max(2*int(sam_execution_slots), max(1, int(budget)//16))
+                  if int(sam_execution_slots) > 0 else min(4, max(1, int(budget)//16)))
+    cpu_cap = max(1, min(int(view_count), int(budget), cpu_target))
     default_outer = max(1, min(int(view_count), int(cpu_cap), int(memory_cap)))
     requested_outer = max(1, _env_int('YOLO_TTA_PARENT_POSTPROCESS_WORKERS', int(default_outer)))
     outer_workers = max(1, min(int(view_count), int(budget), int(requested_outer)))
@@ -2356,6 +2395,25 @@ def _memfd_source_identity(fd: int) -> str:
     return f'memfd-source-v1:{int(stat.st_dev)}:{int(stat.st_ino)}:{int(stat.st_size)}'
 
 
+def _probe_memfd_parent_proc_capability(path: object, source_fd: int) -> Optional[Dict[str, object]]:
+    """Prove RW procfs access against a source already transferred to this worker."""
+    match = re.fullmatch(r'/proc/([1-9][0-9]*)/fd/([0-9]+)', str(path))
+    if match is None:
+        return None
+    opened = None
+    try:
+        opened = os.open(str(path), os.O_RDWR | getattr(os, 'O_CLOEXEC', 0))
+        key = _memfd_source_identity(source_fd)
+        if _memfd_source_identity(opened) == key:
+            return {'parent_pid': int(match.group(1)), 'worker_pid': int(os.getpid()), 'source_key': key}
+    except OSError:
+        pass  # Unsupported proc permissions keep the existing DupFd protocol.
+    finally:
+        if opened is not None:
+            _close_fd_list((opened,))
+    return None
+
+
 @dataclass
 class _MemfdTransferBatch:
     """Parent dispatch transaction; registered handles belong to the receiver after put."""
@@ -2377,6 +2435,7 @@ class _MemfdTransferBatch:
 
 def _attach_memfd_transfers_to_task(
     task: Dict[str, object], *, known_sources: Optional[Iterable[str]] = None,
+    direct_output_capability: Optional[Dict[str, int]] = None,
 ) -> _MemfdTransferBatch:
     """Attach handles to a dispatch copy, including independent policy result parents.
 
@@ -2391,11 +2450,24 @@ def _attach_memfd_transfers_to_task(
     batch = _MemfdTransferBatch([])
     known = None if known_sources is None else set(known_sources)
     source_keys: Dict[str, None] = {}
+    direct = (direct_output_capability is not None
+              and direct_output_capability.get('parent_pid') == os.getpid()
+              and int(direct_output_capability.get('worker_pid', 0)) > 0)
 
     def attach(holder: Dict[str, object], path_field: str, handle_field: str,
                *, persistent: bool = False) -> None:
         raw_path = holder.get(path_field)
         key = str(raw_path)
+        if direct and path_field in {'result_mask_path', 'result_conf_path'}:
+            with _MEMFD_OWNER_LOCK:
+                fd = _memfd_owner_fd_for_path(raw_path)
+                if fd is not None:
+                    holder[f'{handle_field}_proc'] = {
+                        'parent_pid': int(os.getpid()),
+                        'worker_pid': int(direct_output_capability['worker_pid']),
+                        'fd': int(fd), 'identity': _memfd_source_identity(fd),
+                    }
+                    return
         if persistent and known is not None:
             # Keep the owner registry stable through identity lookup and DupFd's dup.
             # The owner lock is reentrant; the path helper uses this same registry.
@@ -2472,7 +2544,10 @@ def _materialize_worker_task_memfd_paths(
     detach_calls = 0
     source_reference_hits = 0
     duplicate_sources_closed = 0
+    direct_open_ns = 0
+    direct_open_calls = 0
     failed = False
+    task.pop('_memfd_parent_proc_capability', None)
     # The caller can only close descriptors after this function returns.  Keep enough
     # transaction state here to roll back descriptors detached before a later handle
     # fails to materialize; otherwise the assignment at the call site never happens and
@@ -2486,7 +2561,31 @@ def _materialize_worker_task_memfd_paths(
         handle_field: str,
         persistent: bool,
     ) -> None:
-        nonlocal detach_ns, detach_calls, source_reference_hits, duplicate_sources_closed
+        nonlocal detach_ns, detach_calls, source_reference_hits, duplicate_sources_closed, direct_open_ns, direct_open_calls
+        parent_source_path = holder.get(path_field)
+        direct_reference = holder.pop(f'{handle_field}_proc', None)
+        if direct_reference is not None:
+            if (path_field not in {'result_mask_path', 'result_conf_path'} or persistent
+                    or holder.get(handle_field) is not None or holder.get(f'{handle_field}_ref') is not None
+                    or not isinstance(direct_reference, dict)
+                    or set(direct_reference) != {'parent_pid', 'worker_pid', 'fd', 'identity'}
+                    or any(type(direct_reference[field]) is not int for field in ('parent_pid', 'worker_pid', 'fd'))
+                    or direct_reference['worker_pid'] != os.getpid()
+                    or direct_reference['parent_pid'] <= 0 or direct_reference['fd'] < 0
+                    or not isinstance(direct_reference['identity'], str)):
+                raise ValueError(f'Invalid direct memfd output reference for {handle_field}')
+            started_open = time.perf_counter_ns()
+            direct_open_calls += 1
+            try:
+                fd = os.open(str(_memfd_proc_path(direct_reference['fd'], owner_pid=direct_reference['parent_pid'])),
+                             os.O_RDWR | getattr(os, 'O_CLOEXEC', 0))
+                transient_fds.append(int(fd))
+                if _memfd_source_identity(fd) != direct_reference['identity']:
+                    raise RuntimeError(f'Direct memfd output identity changed for {handle_field}')
+            finally:
+                direct_open_ns += time.perf_counter_ns() - started_open
+            holder[path_field] = str(_memfd_proc_path(fd, owner_pid=os.getpid()))
+            return
         reference = holder.pop(f'{handle_field}_ref', None)
         if reference is not None:
             if not persistent or holder.get(handle_field) is not None:
@@ -2498,6 +2597,9 @@ def _materialize_worker_task_memfd_paths(
                 raise RuntimeError(f'Worker has no matching persistent memfd source: {key}')
             source_reference_hits += 1
             holder[path_field] = str(_memfd_proc_path(int(fd), owner_pid=os.getpid()))
+            capability = _probe_memfd_parent_proc_capability(parent_source_path, int(fd))
+            if capability is not None:
+                task['_memfd_parent_proc_capability'] = capability
             return
         handle = holder.pop(handle_field, None)
         key_raw = holder.pop(f'{handle_field}_key', None)
@@ -2535,6 +2637,10 @@ def _materialize_worker_task_memfd_paths(
             fd = int(received_fd)
             transient_fds.append(int(fd))
         holder[path_field] = str(_memfd_proc_path(int(fd), owner_pid=os.getpid()))
+        if persistent:
+            capability = _probe_memfd_parent_proc_capability(parent_source_path, int(fd))
+            if capability is not None:
+                task['_memfd_parent_proc_capability'] = capability
 
     def _resolve_task(holder: Dict[str, object]) -> None:
         _resolve(holder, path_field='source_volume_path', handle_field='source_volume_fd', persistent=True)
@@ -2590,6 +2696,7 @@ def _materialize_worker_task_memfd_paths(
                 ('calls', 1), ('seconds', (time.perf_counter_ns() - started_ns) / 1e9),
                 ('detach_calls', detach_calls), ('detach_seconds', detach_ns / 1e9),
                 ('source_reference_hits', source_reference_hits),
+                ('output_proc_open_calls', direct_open_calls), ('output_proc_open_seconds', direct_open_ns / 1e9),
                 ('duplicate_sources_closed', duplicate_sources_closed), ('failures', int(failed)),
             ):
                 telemetry.add(f'worker.memfd_materialize.{name}', value)

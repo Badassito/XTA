@@ -291,6 +291,10 @@ class PolicyParentWorkspaceIntegrationTests(unittest.TestCase):
                 _publish_parent_confidence_retired=mock.Mock(),
                 _submit_component_projection=mock.Mock(),
                 _submit_sam_layer_projection=None,
+                sam_cpu_prepare_executor=None,
+                sam_cpu_futures={'source':None,'runtime':None,'runtime_needed':False},
+                _sam_parents_ready=lambda:False,
+                sam_cpu_max_detector_parent=0,direct_union_total_dense_byte_limit=10000,
                 _dispatch_inference_windows=mock.Mock(),
                 keep_temp_artifacts=False)
             namespace['view_prepare_leases'] = pipeline.ViewPrepareLeaseState(

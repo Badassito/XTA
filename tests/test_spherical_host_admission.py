@@ -197,6 +197,8 @@ class SharedNativeWorkspaceTests(unittest.TestCase):
         self.namespace = dict(vars(pipeline))
         self.namespace.update(temp_dir=self.root, worker_direct_union_active=True,
             sam_context=None,sam_parent_staging=None,
+            _sam_parents_ready=lambda:True,
+            sam_cpu_max_detector_parent=0,
             interpolation_settings=SimpleNamespace(backend='sdf',extrapolation_enabled=False),
             policy_settings=SimpleNamespace(enabled=False),
             bounded_policy_parent_keys=set(),
@@ -212,6 +214,10 @@ class SharedNativeWorkspaceTests(unittest.TestCase):
             direct_union_inference_bytes=self.state.direct_union_inference_bytes,
             direct_union_postprocess_bytes=self.state.direct_union_postprocess_bytes,
             view_processing_volume_shape=lambda *_args: self.shape)
+        self.namespace['view_prepare_leases'] = pipeline.ViewPrepareLeaseState(
+            self.state.direct_union_backing_leases, self.state.direct_union_inference_views,
+            self.state.direct_union_inference_bytes, self.state.direct_union_postprocess_views,
+            self.state.direct_union_postprocess_bytes)
         _function(Path(pipeline.__file__).read_text(encoding='utf-8'),
                   '_sam_parent_requires_staging',self.namespace)
         self.ensure = _function(Path(pipeline.__file__).read_text(encoding='utf-8'),

@@ -38,7 +38,8 @@ def _build(tmp_path, *, requested, free, total, reserved=0, allocated=0, headroo
         result = sam_tracker_runtime.build_interpolation_predictor(config)
     cuda.synchronize.assert_called_once_with(0)
     assert result.sam_runtime['startup_cuda_quiescence'] == {
-        'synchronized': True, 'worker_local_device': 0,
+        'synchronized': True, 'worker_local_device': 0, 'worker_index': 0,
+        'scope': 'worker_process_cuda_context',
     }
     return result, cuda
 
