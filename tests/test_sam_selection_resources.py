@@ -1,5 +1,6 @@
 """Live admission credit changes assessment capacity, never quality predicates."""
 import threading
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -29,6 +30,12 @@ def test_live_credit_keeps_quality_hash_and_thresholds_but_binds_selection_resou
         assert credited['selection_resources']['status']=='live_parent_credit'
         assert credited['selection_resources']['effective_budgets']['topology_bytes']==profile.assigned_topology_bytes
         assert credited['selection_identity']!=plain['selection_identity']
+        cache = credited['reader_cache']['max_cache_bytes']
+        assert cache == min(2*GIB,profile.reserved_extra_bytes//8)
+        assert plain['reader_cache']['max_cache_bytes'] == 32*1024**2
+        execution = credited['selection_resources']['intrinsic_measurements']
+        assert execution['parallel_credit_bytes'] == profile.reserved_extra_bytes-cache
+        assert execution['lane_cache_bytes'] == 32*1024**2
     assert pool.in_use==0
 
 
@@ -67,6 +74,30 @@ def test_no_extra_credit_preserves_explicit_declared_budgets(tmp_path):
     assert selected['selected_run_ids']==plain['selected_run_ids']
     assert selected['selection_resources']['status']=='live_base_credit_legacy_bounds'
     assert selected['selection_resources']['effective_budgets']==dict(topology_bytes=512*1024**2,plane_bytes=256*1024**2)
+    assert selected['reader_cache']['max_cache_bytes'] == 32*1024**2
+
+
+@pytest.mark.parametrize('budget', [0, 1024**2, 32*1024**2])
+def test_explicit_reader_cache_budget_is_preserved_with_live_credit(tmp_path, budget):
+    bundle,_,_,_=_bundle(tmp_path)
+    with admit_sam_parent_resources(Pool(),GIB,'explicit-cache',headroom_probe=lambda:64*GIB) as profile:
+        receipt=select_sam_proposals(bundle,reader_cache_bytes=budget,resource_profile=profile)
+    assert receipt['reader_cache']['max_cache_bytes']==budget
+
+
+def test_cache_growth_leaves_full_topology_and_owner_spool_credited():
+    from XTA.sam_policy import _selection_reader_cache_bytes
+    from XTA.sam_branch_selection import branch_workspace_bytes
+    group=dict(frame_indices=list(range(31)),context_bbox_yx=(0,0,2048,8000),complete=True)
+    bundle=SimpleNamespace(groups={'family':group})
+    with admit_sam_parent_resources(Pool(32*GIB),GIB,'cache-slack',headroom_probe=lambda:64*GIB) as profile:
+        cache=_selection_reader_cache_bytes(bundle,profile)
+        peak=branch_workspace_bytes((31,2048,8000))
+        assert 32*1024**2 < cache < 2*GIB
+        assert cache+peak+32*1024**2 <= profile.reserved_extra_bytes
+        assert cache <= profile.reserved_extra_bytes//8
+        group['frame_indices']=list(range(33))
+        assert _selection_reader_cache_bytes(bundle,profile)==32*1024**2
 
 
 def test_credit_must_still_be_live_at_selection_end(tmp_path):

@@ -17,7 +17,7 @@ from concurrent.futures import (
     Future,
     ThreadPoolExecutor,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
     Callable,
@@ -511,6 +511,33 @@ class _MainProcessGpuResidencyLease:
             self._released = True
 
 
+_GPU_ASSET_RETIREMENT_PROOF_SEAL = object()
+
+
+@dataclass(frozen=True)
+class GpuInferenceAssetsRetired:
+    """A scheduler-authenticated release reply bound to one coordinator run."""
+
+    device_index: int
+    control_task_id: int
+    coordinator_epoch: int
+    _seal: object = field(default=None, repr=False, compare=False)
+
+    @property
+    def authenticated(self) -> bool:
+        return self._seal == (_GPU_ASSET_RETIREMENT_PROOF_SEAL, self.device_index,
+                              self.control_task_id, self.coordinator_epoch)
+
+
+def _make_gpu_inference_assets_retired_proof(device_index, control_task_id, coordinator_epoch):
+    if (type(device_index) is not int or device_index < 0
+            or type(control_task_id) is not int or control_task_id >= 0
+            or type(coordinator_epoch) is not int or coordinator_epoch < 0):
+        raise RuntimeError('Invalid authenticated GPU asset-retirement identity')
+    return GpuInferenceAssetsRetired(device_index, control_task_id, coordinator_epoch,
+        (_GPU_ASSET_RETIREMENT_PROOF_SEAL, device_index, control_task_id, coordinator_epoch))
+
+
 class _MainProcessGpuStageCoordinator:
     """Coordinate device ownership across independent CUDA allocator processes.
 
@@ -531,6 +558,7 @@ class _MainProcessGpuStageCoordinator:
         self._epoch = 0
         self._inference_priority_active = False
         self._inference_asset_retirement_pending = False
+        self._retired_inference_devices: Dict[int, GpuInferenceAssetsRetired] = {}
         self._pending_inference_backlog = False
         self._spherical_retirement_pressure = False
         # expiry, compatible workers, first continuously live request time
@@ -575,6 +603,7 @@ class _MainProcessGpuStageCoordinator:
             self._spherical_retirement_cursor = 0
             self._spherical_retirement_retry_after = 0.0
             self._inference_asset_retirement_pending = False
+            self._retired_inference_devices.clear()
             self._inference_priority_active = bool(self._worker_devices)
         for device, pool, claim in claims:
             pool.release_stage_claim(device, claim)
@@ -774,7 +803,8 @@ class _MainProcessGpuStageCoordinator:
 
     def _priority_blocks_stage_locked(self, device_index: int, purpose: str) -> bool:
         if self._inference_asset_retirement_pending and int(device_index) in self._worker_devices:
-            return True
+            return not (int(device_index) in self._retired_inference_devices
+                        and str(purpose).strip().lower().startswith(('tta persistent sam ', 'sam ')))
         purpose_l = str(purpose).strip().lower()
         # Completed spherical and radial parents hold native-memory credits until
         # source projection finishes. When no central inference is admissible,
@@ -831,6 +861,7 @@ class _MainProcessGpuStageCoordinator:
             self._stage_leases.clear()
             self._inference_priority_active = False
             self._inference_asset_retirement_pending = False
+            self._retired_inference_devices.clear()
             self._pending_inference_backlog = False
             self._spherical_retirement_pressure = False
             self._spherical_retirement_requests.clear()
@@ -850,18 +881,25 @@ class _MainProcessGpuStageCoordinator:
 
     def can_dispatch_inference(self, device_index: int) -> bool:
         with self._lock:
-            if int(device_index) in self._resident_owners:
-                return False
-            if int(device_index) in self._provisional_stages:
-                return False
-            if self._reserved_spherical_device_locked() == int(device_index):
-                return False
-            owner = self._stage_leases.get(int(device_index))
-            return owner is None
+            return (int(device_index) not in self._retired_inference_devices
+                    and self._worker_available_locked(int(device_index)))
+
+    def can_dispatch_auxiliary(self, device_index: int) -> bool:
+        """Worker availability without reopening terminal detector dispatch."""
+        with self._lock:
+            return (not self._inference_inflight.get(int(device_index), 0)
+                    and self._worker_available_locked(int(device_index)))
+
+    def _worker_available_locked(self, device: int) -> bool:
+        return (device not in self._resident_owners and device not in self._provisional_stages
+                and self._reserved_spherical_device_locked() != device
+                and device not in self._stage_leases)
 
     def begin_inference(self, device_index: int) -> bool:
         device = int(device_index)
         with self._lock:
+            if device in self._retired_inference_devices:
+                return False
             if device in self._resident_owners:
                 return False
             if device in self._provisional_stages:
@@ -876,6 +914,33 @@ class _MainProcessGpuStageCoordinator:
             # burst. Pressure oscillation alone cannot reset the two-turn cap.
             self._spherical_retirement_burst_counts.pop(device, None)
             return True
+
+    def current_epoch(self) -> int:
+        with self._lock:
+            return self._epoch
+
+    def mark_inference_assets_retired(self, proof: GpuInferenceAssetsRetired) -> None:
+        if type(proof) is not GpuInferenceAssetsRetired or not proof.authenticated:
+            raise RuntimeError('GPU asset retirement requires an authenticated scheduler proof')
+        with self._lock:
+            device = proof.device_index
+            if proof.coordinator_epoch != self._epoch or device not in self._worker_devices:
+                raise RuntimeError('Stale or unconfigured GPU asset-retirement proof')
+            previous = self._retired_inference_devices.get(device)
+            if previous is not None:
+                if previous != proof:
+                    raise RuntimeError('Conflicting GPU asset-retirement proof')
+                return
+            if (not self._inference_asset_retirement_pending or self._pending_inference_backlog
+                    or any(self._inference_inflight.values())):
+                raise RuntimeError('GPU asset retirement requires the sealed global inference drain')
+            self._retired_inference_devices[device] = proof
+            callback = self._wake_callback
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
 
     def finish_inference(self, device_index: int) -> None:
         device = int(device_index)
@@ -1134,6 +1199,7 @@ class _MainProcessGpuStageCoordinator:
         with self._lock:
             return {
                 'worker_devices': sorted(self._worker_devices),
+                'retired_inference_devices': sorted(self._retired_inference_devices),
                 'inference_inflight': dict(self._inference_inflight),
                 'stage_leases': dict(self._stage_leases),
                 'resident_owners': {device: {key: owner[key] for key in ('purpose', 'lendable', 'quarantined', 'reason')}
@@ -1169,6 +1235,14 @@ def _set_main_process_gpu_inference_priority_active(active: bool) -> None:
 def _set_main_process_gpu_asset_retirement_pending(active: bool) -> None:
     _MAIN_PROCESS_GPU_STAGE_COORDINATOR.set_inference_asset_retirement_pending(bool(active))
 
+
+def _main_process_gpu_stage_epoch() -> int:
+    return _MAIN_PROCESS_GPU_STAGE_COORDINATOR.current_epoch()
+
+
+def _mark_main_process_gpu_inference_assets_retired(proof: GpuInferenceAssetsRetired) -> None:
+    _MAIN_PROCESS_GPU_STAGE_COORDINATOR.mark_inference_assets_retired(proof)
+
 def _set_main_process_gpu_pending_inference(active: bool) -> None:
     _MAIN_PROCESS_GPU_STAGE_COORDINATOR.set_pending_inference_backlog(bool(active))
 
@@ -1185,6 +1259,10 @@ def _set_main_process_gpu_stage_wake_callback(callback: Optional[Callable[[], No
 
 def _main_process_gpu_stage_can_dispatch_inference(device_index: int) -> bool:
     return _MAIN_PROCESS_GPU_STAGE_COORDINATOR.can_dispatch_inference(int(device_index))
+
+
+def _main_process_gpu_stage_can_dispatch_auxiliary(device_index: int) -> bool:
+    return _MAIN_PROCESS_GPU_STAGE_COORDINATOR.can_dispatch_auxiliary(int(device_index))
 
 def _main_process_gpu_stage_begin_inference(device_index: int) -> bool:
     return _MAIN_PROCESS_GPU_STAGE_COORDINATOR.begin_inference(int(device_index))
@@ -1220,8 +1298,9 @@ def _trim_main_process_cuda_device(
     *,
     cupy_module: Optional[object] = None,
     desc: str = 'main-process GPU stage',
+    repeat_garbage_collection: bool = True,
 ) -> None:
-    """Return completed stage allocations to the driver for worker-process reuse."""
+    """Return stage allocations; owned SAM cleanup needs only the pre-trim GC."""
     before_reserved: Optional[int] = None
     before_free: Optional[int] = None
     after_reserved: Optional[int] = None
@@ -1254,7 +1333,8 @@ def _trim_main_process_cuda_device(
             torch_mod.cuda.empty_cache()
     except Exception:
         pass
-    gc.collect()
+    if repeat_garbage_collection:
+        gc.collect()
     try:
         after_reserved = int(torch_mod.cuda.memory_reserved(device))
     except Exception:

@@ -121,6 +121,42 @@ class GpuAssetRetirementTests(unittest.TestCase):
         self.stack.enter_context(mock.patch.dict(backprojection._RESIDENT_TRT_PIPELINE_CACHE, {}, clear=True))
         self.stack.enter_context(mock.patch.dict(inference._AFFINE_GRID_CACHE, {}, clear=True))
 
+    def test_owned_trim_keeps_pre_allocator_collection_and_generic_trim_keeps_both(self):
+        for repeat in (False, True):
+            with self.subTest(repeat_garbage_collection=repeat):
+                events=[]
+                cuda=_Cuda(events)
+                torch=SimpleNamespace(cuda=cuda)
+                with mock.patch.object(backprojection.gc,'collect',side_effect=lambda:events.append('gc')):
+                    kwargs={} if repeat else {'repeat_garbage_collection':False}
+                    backprojection._trim_main_process_cuda_device(torch,SimpleNamespace(index=0),**kwargs)
+                expected=['device_fence','gc','torch_trim']+(['gc'] if repeat else [])
+                self.assertEqual(events,expected)
+
+    def test_single_collection_retires_unreachable_cycle_before_returning_allocator(self):
+        enabled=gc.isenabled()
+        gc.disable()
+        try:
+            source=_Owner(4096)
+            source.cycle=source
+            reference=weakref.ref(source)
+            del source
+            self.assertIsNotNone(reference())
+            events=[]
+            cuda=_Cuda(events)
+            def trim():
+                self.assertIsNone(reference())
+                events.append('torch_trim')
+            cuda.empty_cache=trim
+            collect=gc.collect
+            with mock.patch.object(backprojection.gc,'collect',wraps=collect) as collection:
+                backprojection._trim_main_process_cuda_device(SimpleNamespace(cuda=cuda),
+                    SimpleNamespace(index=0),repeat_garbage_collection=False)
+            collection.assert_called_once()
+            self.assertEqual(events,['device_fence','torch_trim'])
+        finally:
+            if enabled:gc.enable()
+
     def test_renderer_releases_all_linear_texture_aliases_and_preserves_host_input(self):
         events = []
         with tempfile.TemporaryDirectory() as directory:

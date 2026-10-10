@@ -1,4 +1,26 @@
-Transfer one ZIP64 diagnostics/evidence archive while keeping public NRRDs separate:
+TTA retains SAM evidence during execution in `OUTPUT/sam-artifacts.tar`.
+`sam-artifacts.tar.lock` coordinates writers and reader snapshots; the companion
+lock must be writable. Long interpolation and extrapolation
+scope paths are logical TAR/PAX members, addressed as
+`OUTPUT/sam-artifacts.tar#/sam_interpolation/.../evidence` or
+`OUTPUT/sam-artifacts.tar#/sam_extrapolation/.../evidence`.
+Evidence bundles, CVOL stores and JSON receipts commit as they become available.
+Active builders use short temporary stages; successful stages retire after
+publication. Public NRRDs, telemetry and ordinary run manifests remain files
+outside this container.
+
+A stopped or interrupted run's SAM container can be transferred as one file.
+SAM scientific readers, replay and export tools read its committed members
+directly, without extraction. They also accept legacy directory bundles. Member
+streams are bounded to their payloads and retain scientific checksum and identity
+checks. A torn final append leaves earlier committed transactions readable;
+the next writer overwrites from the last committed boundary. Container integrity does not
+establish a complete scope or run, and required selection receipts still apply.
+After transfer, references use the local container path with the same logical
+member path; saved provenance retains its recorded identities.
+
+`run_transport` optionally creates a separate ZIP64 envelope for a stopped run's
+diagnostics and evidence, while keeping public NRRDs separate:
 
 ```powershell
 python tools/run_transport.py pack C:/XTA/run C:/XTA/run-diagnostics.zip --run-status failed
@@ -10,26 +32,28 @@ python tools/run_transport.py unpack C:/XTA/run-diagnostics.zip C:/XTA/restored
 Choose a fresh archive outside the source folder and a fresh extraction directory.
 Use a short extraction root on Windows. The utility uses extended Windows API
 paths, but external viewers and copy programs may still require shorter paths.
-Original loose files remain available; there is no automatic pipeline archive or
-deletion. Stored ZIP members avoid recompressing already compressed payloads.
+Packing preserves the source run files, including its live-format SAM container.
+Stored ZIP members avoid recompressing already compressed payloads. This optional
+transport envelope is separate from SAM's during-run transactional publication.
 
 `diagnostics` is the default scope. It includes telemetry, configuration/logs,
-sealed SAM evidence files (`manifest.json`, `index.json`, `masks.bin`),
-selection/generation/retry receipts, CVOL component stores and reconciliation
-evidence. Scientific files retain their schemas, exact bytes and separate typing;
+the SAM container and any legacy loose sealed SAM evidence, selection/generation/
+retry receipts, CVOL component stores and reconciliation evidence. Scientific
+files retain their schemas, exact bytes and separate typing;
 raw masks are never classified as telemetry. Public NRRD payloads stay outside
 the archive and appear in an explicit external path/size/SHA-256 inventory. Copy
 those NRRDs separately when needed. Their manifests remain in the archive.
-`--scope all` optionally includes public NRRDs too. Unpack scientific evidence
-before using its checked loaders. The archive is a transport envelope, never a
-scientific qualification.
+`--scope all` optionally includes public NRRDs too. Restoring an outer ZIP writes
+the SAM container as one file; scientific APIs then read its members directly.
+Legacy loose scientific payloads are restored to their original directory layout.
+The transport envelope is never a scientific qualification.
 
 `verify --outputs-root DIR` additionally checks the separately transferred
 NRRD files under their original relative paths. Missing or corrupt NRRDs return
 exit code 3 with a separate transfer availability report; source run status is
 unchanged. Archive structure/checksum failures return exit code 2.
 
-Future NRRD layer basenames stay identical through 120 characters, including
+NRRD layer basenames stay identical through 120 characters, including
 `.seg.nrrd`. Longer names use a readable prefix and full SHA-256 suffix. Full
 logical segment labels, colors and provenance remain in Slicer headers and
 manifests, whose `filename` field resolves the actual physical name. Full and

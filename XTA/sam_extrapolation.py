@@ -1,13 +1,14 @@
 """SAM-only extrapolation from one frozen post-interpolation terminal per run."""
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import nullcontext, ExitStack
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import os
 from pathlib import Path
 import time
+import tempfile
 from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
@@ -22,6 +23,8 @@ from .sam_interpolation import (SamPreparedInterpolationPass,_scope_metadata,_bu
     _retry_cpu_wave_within_peak,_tracker_scope_admission)
 from .sam_resources import sam_worker_count
 from .sam_evidence import SamEvidenceWriter
+from .artifact_archive import split_reference, member_exists, artifact_directory
+from .json_publication import write_json_atomic
 
 
 def _identity(scope,distance,walk_back,min_radius,wrap_axis,crop_mode,shape):
@@ -468,7 +471,7 @@ def store_extrapolation_result(writer,run,result,group,*,availability_masks=None
     writer.add_run(descriptor,frames,availability_masks=availability_masks)
 
 
-def _publish(bundle,receipt,destination,metadata,*,cancel_event=None,resource_profile=None):
+def _publish(bundle,receipt,destination,metadata,*,cancel_event=None,resource_profile=None,runtime_work_dir=None):
     from .interpolation import IncrementalRawBBoxMaskStoreWriter,INTERNAL_PACKED_CVOL_FORMAT
     from .sam_extrapolation_policy import (_publication_index,_indexed_publication_plane,_indexed_publication_crop,
         _PublicationReuseLimit,_validate_receipt)
@@ -476,7 +479,8 @@ def _publish(bundle,receipt,destination,metadata,*,cancel_event=None,resource_pr
     names=('forward','backward')
     paths=tuple(destination/f'sam_extrapolation_{name}.cvol' for name in names)
     for path in paths:
-        if path.exists():
+        exists = member_exists(path/'meta.json') if split_reference(path) is not None else path.exists()
+        if exists:
             raise FileExistsError('SAM extrapolation publication destination must be fresh')
     # The planes, cache, writer indices and reused owner metadata share the
     # existing publication workspace credit. Saved receipt credit is not live.
@@ -495,134 +499,136 @@ def _publish(bundle,receipt,destination,metadata,*,cancel_event=None,resource_pr
     fused=2*plane_bytes+fixed_bytes<=plane_budget
     metadata_bytes=max(0,min(64*1024**2,plane_budget-fixed_bytes
         -(2 if fused else 1)*plane_bytes))
-    outputs=[]
-    records=[]
-    added=0
-    def cancelled():
-        if cancel_event is not None and cancel_event.is_set():
-            raise RuntimeError('SAM extrapolation cancelled')
-    try:
-        cancelled()
-        with bundle.reader(max_cache_bytes=cache_bytes) as reader:
-            try:
-                index=_publication_index(reader,receipt,max_metadata_bytes=metadata_bytes)
-            except _PublicationReuseLimit:
-                # Preserve the established validated path if reuse does not fit.
-                _validate_receipt(reader,receipt)
-                index=None
-            if index is not None:
-                identity=index.selection_identity
-                policy_hash=index.policy_hash
-                ids=index.run_ids_by_direction
-                roots=index.roots_by_direction
-                active=(set(frame for frame,owners in index.owners_by_frame.items() if owners[0]),
-                        set(frame for frame,owners in index.owners_by_frame.items() if owners[1]))
-            else:
-                identity=receipt['selection_identity']
-                policy_hash=receipt['policy_hash']
-                ids=tuple(tuple(rid for rid in receipt['selected_run_ids']
-                    if bundle.runs[rid]['direction']==name) for name in names)
-                roots=tuple(tuple(sorted({bundle.groups[bundle.runs[rid]['group_id']]['terminal_id']
-                    for rid in direction_ids})) for direction_ids in ids)
-                active=(set(),set())
-                for direction,direction_ids in enumerate(ids):
-                    for rid in direction_ids:
-                        group=bundle.groups[bundle.runs[rid]['group_id']]
-                        for frame in receipt['selected_frames_by_run'][rid]:
-                            native=(int(group['frame_addresses'][str(frame)]['native_index'])
-                                if group.get('frame_addressing') else int(frame))
-                            if not 0<=native<shape[0]:
-                                raise ValueError('SAM extrapolation selected frame is outside its native canvas')
-                            active[direction].add(native)
-            for name,path in zip(names,paths):
-                outputs.append(IncrementalRawBBoxMaskStoreWriter(shape=shape,store_dir=path,
-                    format_name=INTERNAL_PACKED_CVOL_FORMAT,desc='SAM extrapolation '+name,
-                    extra_meta={**metadata,'component_role':'sam_extrapolation','direction':name,
-                        'evidence_path':str(bundle.directory),'source_stage':'post_interpolation',
-                        'policy_hash':policy_hash}))
-            def plane(frame,direction):
+    with ExitStack() as stages:
+        outputs=[]
+        records=[]
+        added=0
+        def cancelled():
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError('SAM extrapolation cancelled')
+        try:
+            cancelled()
+            with bundle.reader(max_cache_bytes=cache_bytes) as reader:
+                try:
+                    index=_publication_index(reader,receipt,max_metadata_bytes=metadata_bytes)
+                except _PublicationReuseLimit:
+                    # Preserve the established validated path if reuse does not fit.
+                    _validate_receipt(reader,receipt)
+                    index=None
                 if index is not None:
-                    return _indexed_publication_plane(reader,index,frame,direction=direction,shape_yx=shape[1:])
-                return selected_extrapolation_plane(reader,receipt,frame,shape_yx=shape[1:],
-                    direction=1 if direction==0 else -1)
-            cursors=[0,0]
-            if fused:
-                # One native-frame visit; each stored owner is decoded once.
-                # Reuse a consumed direction plane for OR, avoiding a third raster.
-                for frame in sorted(active[0]|active[1]):
-                    cancelled()
-                    planes=[]
-                    for direction,output in enumerate(outputs):
-                        if frame not in active[direction]:
-                            continue
-                        if frame>cursors[direction]:
-                            output.consume_empty_range(cursors[direction],frame-cursors[direction])
-                        current=plane(frame,direction)
-                        output.consume(frame,current[None])
-                        cursors[direction]=frame+1
-                        planes.append(current)
-                        del current
-                    if len(planes)==2:
-                        np.logical_or(planes[0],planes[1],out=planes[0])
-                    added+=int(np.count_nonzero(planes[0]))
-                    del planes
-            else:
-                # Tight original workspace credit retains single-raster execution.
-                for direction,output in enumerate(outputs):
-                    for frame in sorted(active[direction]):
+                    identity=index.selection_identity
+                    policy_hash=index.policy_hash
+                    ids=index.run_ids_by_direction
+                    roots=index.roots_by_direction
+                    active=(set(frame for frame,owners in index.owners_by_frame.items() if owners[0]),
+                            set(frame for frame,owners in index.owners_by_frame.items() if owners[1]))
+                else:
+                    identity=receipt['selection_identity']
+                    policy_hash=receipt['policy_hash']
+                    ids=tuple(tuple(rid for rid in receipt['selected_run_ids']
+                        if bundle.runs[rid]['direction']==name) for name in names)
+                    roots=tuple(tuple(sorted({bundle.groups[bundle.runs[rid]['group_id']]['terminal_id']
+                        for rid in direction_ids})) for direction_ids in ids)
+                    active=(set(),set())
+                    for direction,direction_ids in enumerate(ids):
+                        for rid in direction_ids:
+                            group=bundle.groups[bundle.runs[rid]['group_id']]
+                            for frame in receipt['selected_frames_by_run'][rid]:
+                                native=(int(group['frame_addresses'][str(frame)]['native_index'])
+                                    if group.get('frame_addressing') else int(frame))
+                                if not 0<=native<shape[0]:
+                                    raise ValueError('SAM extrapolation selected frame is outside its native canvas')
+                                active[direction].add(native)
+                for name,path in zip(names,paths):
+                    store_dir=stages.enter_context(artifact_directory(path,temp_root=runtime_work_dir))
+                    outputs.append(IncrementalRawBBoxMaskStoreWriter(shape=shape,store_dir=store_dir,
+                        format_name=INTERNAL_PACKED_CVOL_FORMAT,desc='SAM extrapolation '+name,
+                        extra_meta={**metadata,'component_role':'sam_extrapolation','direction':name,
+                            'evidence_path':str(bundle.directory),'source_stage':'post_interpolation',
+                            'policy_hash':policy_hash}))
+                def plane(frame,direction):
+                    if index is not None:
+                        return _indexed_publication_plane(reader,index,frame,direction=direction,shape_yx=shape[1:])
+                    return selected_extrapolation_plane(reader,receipt,frame,shape_yx=shape[1:],
+                        direction=1 if direction==0 else -1)
+                cursors=[0,0]
+                if fused:
+                    # One native-frame visit; each stored owner is decoded once.
+                    # Reuse a consumed direction plane for OR, avoiding a third raster.
+                    for frame in sorted(active[0]|active[1]):
                         cancelled()
-                        if frame>cursors[direction]:
-                            output.consume_empty_range(cursors[direction],frame-cursors[direction])
-                        current=plane(frame,direction)
-                        output.consume(frame,current[None])
-                        cursors[direction]=frame+1
-                        del current
-                for frame in sorted(active[0]|active[1]):
-                    cancelled()
-                    if index is None:
-                        union=selected_extrapolation_plane(reader,receipt,frame,shape_yx=shape[1:])
-                    else:
-                        union=np.zeros(shape[1:],bool)
-                        # Stream cropped owners into the one existing union plane.
-                        for direction in (0,1):
-                            for owner in index.owners_by_frame[frame][direction]:
-                                (y0,x0,y1,x1),mask=_indexed_publication_crop(reader,owner)
-                                union[y0:y1,x0:x1]|=mask
-                    added+=int(np.count_nonzero(union))
-                    del union
-            for direction,output in enumerate(outputs):
-                if cursors[direction]<shape[0]:
-                    output.consume_empty_range(cursors[direction],shape[0]-cursors[direction])
+                        planes=[]
+                        for direction,output in enumerate(outputs):
+                            if frame not in active[direction]:
+                                continue
+                            if frame>cursors[direction]:
+                                output.consume_empty_range(cursors[direction],frame-cursors[direction])
+                            current=plane(frame,direction)
+                            output.consume(frame,current[None])
+                            cursors[direction]=frame+1
+                            planes.append(current)
+                            del current
+                        if len(planes)==2:
+                            np.logical_or(planes[0],planes[1],out=planes[0])
+                        added+=int(np.count_nonzero(planes[0]))
+                        del planes
+                else:
+                    # Tight original workspace credit retains single-raster execution.
+                    for direction,output in enumerate(outputs):
+                        for frame in sorted(active[direction]):
+                            cancelled()
+                            if frame>cursors[direction]:
+                                output.consume_empty_range(cursors[direction],frame-cursors[direction])
+                            current=plane(frame,direction)
+                            output.consume(frame,current[None])
+                            cursors[direction]=frame+1
+                            del current
+                    for frame in sorted(active[0]|active[1]):
+                        cancelled()
+                        if index is None:
+                            union=selected_extrapolation_plane(reader,receipt,frame,shape_yx=shape[1:])
+                        else:
+                            union=np.zeros(shape[1:],bool)
+                            # Stream cropped owners into the one existing union plane.
+                            for direction in (0,1):
+                                for owner in index.owners_by_frame[frame][direction]:
+                                    (y0,x0,y1,x1),mask=_indexed_publication_crop(reader,owner)
+                                    union[y0:y1,x0:x1]|=mask
+                        added+=int(np.count_nonzero(union))
+                        del union
+                for direction,output in enumerate(outputs):
+                    if cursors[direction]<shape[0]:
+                        output.consume_empty_range(cursors[direction],shape[0]-cursors[direction])
+                cancelled()
+            # Both output stores remain private until source and receipt validation
+            # succeed. A later writer/finalizer failure invalidates both fresh stores.
+            _validate_receipt(bundle,receipt)
+            if receipt['selection_identity']!=identity:
+                raise ValueError('SAM extrapolation selection changed during publication')
+            if index is not None and index.uses_cyclic:
+                from .sam_cyclic import assert_cyclic_implementation_unchanged
+                assert_cyclic_implementation_unchanged()
+            for output in outputs:
+                cancelled()
+                records.append(output.finalize())
             cancelled()
-        # Both output stores remain private until source and receipt validation
-        # succeed. A later writer/finalizer failure invalidates both fresh stores.
-        _validate_receipt(bundle,receipt)
-        if receipt['selection_identity']!=identity:
-            raise ValueError('SAM extrapolation selection changed during publication')
-        if index is not None and index.uses_cyclic:
-            from .sam_cyclic import assert_cyclic_implementation_unchanged
-            assert_cyclic_implementation_unchanged()
-        for output in outputs:
-            cancelled()
-            records.append(output.finalize())
-        cancelled()
-    except BaseException as error:
-        for output in outputs:
-            try:
-                output.abort(error)
-                output.discard()
-            except BaseException as cleanup_error:
-                if hasattr(error,'add_note'):
-                    error.add_note('SAM extrapolation publication cleanup failed: '+str(cleanup_error))
-        raise
-    components=[]
-    for direction,(name,path,record) in enumerate(zip(names,paths,records)):
-        components.append(dict(direction=name,path=str(path),storage_format=INTERNAL_PACKED_CVOL_FORMAT,
-            voxel_count=int(record.get('foreground_voxels',0)),metadata=record,
-            evidence_path=str(bundle.directory),selection_receipt_path=str(destination/'selection.json'),
-            policy_hash=policy_hash,run_ids=list(ids[direction]),terminal_roots=list(roots[direction]),
-            selection_status='raw_mask_prefix',component_role='sam_extrapolation',source_stage='post_interpolation'))
-    return components,added
+        except BaseException as error:
+            for output in outputs:
+                try:
+                    output.abort(error)
+                    output.discard()
+                except BaseException as cleanup_error:
+                    if hasattr(error,'add_note'):
+                        error.add_note('SAM extrapolation publication cleanup failed: '+str(cleanup_error))
+            raise
+        components=[]
+        for direction,(name,path,record) in enumerate(zip(names,paths,records)):
+            components.append(dict(direction=name,path=str(path),storage_format=INTERNAL_PACKED_CVOL_FORMAT,
+                voxel_count=int(record.get('foreground_voxels',0)),metadata=record,
+                evidence_path=str(bundle.directory),selection_receipt_path=str(destination/'selection.json'),
+                policy_hash=policy_hash,run_ids=list(ids[direction]),terminal_roots=list(roots[direction]),
+                selection_status='raw_mask_prefix',component_role='sam_extrapolation',source_stage='post_interpolation'))
+        return components,added
 
 
 def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,policy,provider_factory,
@@ -882,7 +888,7 @@ def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,pol
             last_complete_attempts=last_complete,orchestration_refusals=refusals,
             initial_child_crop_diagnostics=tile_censoring,retry_child_crop_diagnostics=retry_tile_censoring,
             final_reached_prefix_extent_diagnostics=final_extent_diagnostics)
-        (destination/'crop_retry.json').write_text(json.dumps(ledger,indent=2),encoding='utf-8')
+        write_json_atomic(destination/'crop_retry.json', ledger)
     return combined,combined_receipt,ledger
 
 
@@ -961,7 +967,8 @@ def extrapolate_sam_view_volume_pass(observations,*,work_dir,image_provider=None
     if prepared.plan.frame_addressing:
         metadata['frame_addressing']=_plain(prepared.plan.frame_addressing)
     destination=Path(work_dir)/('sam_extrap_'+prepared.settings_sha256[:20])
-    destination.mkdir(parents=True,exist_ok=True)
+    if split_reference(destination) is None:
+        destination.mkdir(parents=True,exist_ok=True)
     groups={g.group_id:g for g in prepared.groups}
     by_id=prepared.plan.by_id
     count=sam_worker_count(runtime,legacy=resource_profile is None)
@@ -986,10 +993,23 @@ def extrapolate_sam_view_volume_pass(observations,*,work_dir,image_provider=None
         else 'before_tracking_resource_barrier')
     stats['sam_group_evidence_overlap_bytes']=evidence_peak
     assemblies={}
+    if mode=='tiled' and split_reference(destination) is not None and runtime_work_dir is not None:
+        Path(runtime_work_dir).mkdir(parents=True,exist_ok=True)
+    assembly_root=(Path(tempfile.mkdtemp(prefix='sam-tail-tiles-',dir=runtime_work_dir))
+        if mode=='tiled' and split_reference(destination) is not None else destination/'assembly')
     completed=set()
     stream=None
     prefetched=None
+    lease=None
     try:
+        if _cancelled(runtime,cancel_event):
+            raise RuntimeError('SAM extrapolation cancelled before image cohort generation')
+        # Frozen images use separate credit while initial evidence is written.
+        lease=(image_cohort_provider(cohorts[0].prepared) if image_cohort_provider is not None else nullcontext(cache_ref))
+        if _cancelled(runtime,cancel_event):
+            raise RuntimeError('SAM extrapolation cancelled before image cohort generation')
+        if image_cohort_prefetch is not None and len(cohorts)>1:
+            prefetched=image_cohort_prefetch(cohorts[1].prepared)
         with SamEvidenceWriter(destination/'evidence',metadata) as writer:
             def write_group(group):
                 if group.group_id not in writer.groups:
@@ -1016,60 +1036,62 @@ def extrapolate_sam_view_volume_pass(observations,*,work_dir,image_provider=None
                 subset=cohort.prepared
                 order=subset.execution_order(count)
                 cohort_work=subset.tracker_jobs if mode=='tiled' else subset.runs
-                lease=prefetched
-                prefetched=None
-                if lease is None:
-                    lease=(image_cohort_provider(subset) if image_cohort_provider is not None else nullcontext(cache_ref))
+                if cohort_index:
+                    lease=prefetched
+                    prefetched=None
+                    if lease is None:
+                        lease=(image_cohort_provider(subset) if image_cohort_provider is not None else nullcontext(cache_ref))
+                    if image_cohort_prefetch is not None and cohort_index+1<len(cohorts):
+                        prefetched=image_cohort_prefetch(cohorts[cohort_index+1].prepared)
                 with lease as provider:
                     cohort_cache=getattr(provider,'cache_ref',provider)
                     _bind_image_cache(metadata,cohort_cache,subset,writer)
                     if cohort_cache is not None and not hasattr(runtime,'iter_results') and hasattr(runtime,'set_source_cache'):
                         runtime.set_source_cache(cohort_cache)
-                    if image_cohort_prefetch is not None and cohort_index+1<len(cohorts):
-                        prefetched=image_cohort_prefetch(cohorts[cohort_index+1].prepared)
                     try:
                         stream=_iterate_extrapolation_tracker_results(runtime,subset,count,groups,by_id,
                             cohort_cache,cancel_event,resource_profile,stats['sam_exact_crop_family_batches'],
                             family_dispatch_enabled=family_enabled,flat_control_reason=flat_reason)
                         for execution_index,result in stream:
                             try:
-                                if (isinstance(execution_index,(bool,np.bool_)) or not isinstance(execution_index,(int,np.integer))
-                                        or not 0<=int(execution_index)<len(cohort_work)):
-                                    raise RuntimeError('SAM extrapolation returned an unknown job owner')
-                                item=cohort_work[order[int(execution_index)]]
-                                if item.run_id not in all_work or item.run_id in completed:
-                                    raise RuntimeError('SAM extrapolation returned duplicate or unknown job ownership')
+                                with writer.parallel_packing(getattr(result, 'packing_admission', None)):
+                                    if (isinstance(execution_index,(bool,np.bool_)) or not isinstance(execution_index,(int,np.integer))
+                                            or not 0<=int(execution_index)<len(cohort_work)):
+                                        raise RuntimeError('SAM extrapolation returned an unknown job owner')
+                                    item=cohort_work[order[int(execution_index)]]
+                                    if item.run_id not in all_work or item.run_id in completed:
+                                        raise RuntimeError('SAM extrapolation returned duplicate or unknown job ownership')
+                                    if result.receipt.get('run_id') not in (None,item.run_id):
+                                        raise RuntimeError('SAM extrapolation result identity differs from its declared job')
+                                    if cohort_cache is not None:
+                                        result.receipt['image_snapshot_sha256']=cohort_cache.identity_sha256
+                                    run=item.original_run if mode=='tiled' else item
+                                    write_group(groups[run.group_id])
+                                    if mode=='whole':
+                                        store_extrapolation_result(writer,item,result,groups[item.group_id])
+                                    else:
+                                        # Cohort plans reindex original runs; the writer owns
+                                        # the complete scope's parent/tile inventory.
+                                        write_empty_tiles(parent_indices[run.run_id])
+                                        parent=run.run_id
+                                        if parent not in assemblies:
+                                            assemblies[parent]=TiledRunAssembly(run,groups[run.group_id],subset.tile_inventory[item.original_run_index],assembly_root/run.run_id)
+                                        assembly=assemblies[parent]
+                                        descriptor,masks=assembly.consume(item,result)
+                                        normalized=_raw_authority_receipt(result.receipt,expected_frames=run.expected_frames,frames=masks)
+                                        _bind_tracker_identity(writer,normalized)
+                                        descriptor.update(structurally_valid=True,status='generated_complete',runtime_receipt=normalized)
+                                        assembly.receipts[item.tile.tile_id]=descriptor
+                                        writer.add_run_tile(run.run_id,descriptor,masks)
+                                        if assembly.ready:
+                                            parent_result=assembly.result()
+                                            if cohort_cache is not None:
+                                                parent_result.receipt['image_snapshot_sha256']=cohort_cache.identity_sha256
+                                            parent_result.receipt.update({key:_plain(writer.scope[key])
+                                                for key in ('sam_model','sam_runtime') if key in writer.scope})
+                                            store_extrapolation_result(writer,run,parent_result,groups[run.group_id],availability_masks=assembly.availability())
+                                            assembly.close();del assemblies[parent]
                                 completed.add(item.run_id)
-                                if result.receipt.get('run_id') not in (None,item.run_id):
-                                    raise RuntimeError('SAM extrapolation result identity differs from its declared job')
-                                if cohort_cache is not None:
-                                    result.receipt['image_snapshot_sha256']=cohort_cache.identity_sha256
-                                run=item.original_run if mode=='tiled' else item
-                                write_group(groups[run.group_id])
-                                if mode=='whole':
-                                    store_extrapolation_result(writer,item,result,groups[item.group_id])
-                                else:
-                                    # Cohort plans reindex original runs; the writer owns
-                                    # the complete scope's parent/tile inventory.
-                                    write_empty_tiles(parent_indices[run.run_id])
-                                    parent=run.run_id
-                                    if parent not in assemblies:
-                                        assemblies[parent]=TiledRunAssembly(run,groups[run.group_id],subset.tile_inventory[item.original_run_index],destination/'assembly'/run.run_id)
-                                    assembly=assemblies[parent]
-                                    descriptor,masks=assembly.consume(item,result)
-                                    normalized=_raw_authority_receipt(result.receipt,expected_frames=run.expected_frames,frames=masks)
-                                    _bind_tracker_identity(writer,normalized)
-                                    descriptor.update(structurally_valid=True,status='generated_complete',runtime_receipt=normalized)
-                                    assembly.receipts[item.tile.tile_id]=descriptor
-                                    writer.add_run_tile(run.run_id,descriptor,masks)
-                                    if assembly.ready:
-                                        parent_result=assembly.result()
-                                        if cohort_cache is not None:
-                                            parent_result.receipt['image_snapshot_sha256']=cohort_cache.identity_sha256
-                                        parent_result.receipt.update({key:_plain(writer.scope[key])
-                                            for key in ('sam_model','sam_runtime') if key in writer.scope})
-                                        store_extrapolation_result(writer,run,parent_result,groups[run.group_id],availability_masks=assembly.availability())
-                                        assembly.close();del assemblies[parent]
                             finally:
                                 if hasattr(runtime,'release_result'):
                                     runtime.release_result(result)
@@ -1086,6 +1108,7 @@ def extrapolate_sam_view_volume_pass(observations,*,work_dir,image_provider=None
                         image_snapshot_sha256=str(getattr(cohort_cache,'identity_sha256','')),
                         image_sampling_backend=metadata.get('image_sampling_sources',{}).get(
                             str(getattr(cohort_cache,'identity_sha256','')))))
+                lease=None
             if len(completed)!=len(work) or assemblies:
                 raise RuntimeError('SAM extrapolation tracker omitted declared jobs')
             for group in prepared.groups:
@@ -1100,16 +1123,23 @@ def extrapolate_sam_view_volume_pass(observations,*,work_dir,image_provider=None
                 stream.close()
         finally:
             try:
-                if prefetched is not None:
-                    prefetched.close()
+                close=getattr(lease,'close',None)
+                if callable(close):
+                    close()
             finally:
-                for assembly in assemblies.values():
-                    assembly.close()
+                try:
+                    if prefetched is not None:
+                        prefetched.close()
+                finally:
+                    for assembly in assemblies.values():
+                        assembly.close()
+                    if mode=='tiled' and split_reference(destination) is not None:
+                        assembly_root.rmdir()
     with _trace_sam_phase('selection',metadata.get('scope_id',''),operation='extrapolation'):
         receipt=select_sam_extrapolation(bundle)
     stats['initial_generated_runs']=len(bundle.runs)
     if crop_retry_policy is not None and crop_retry_policy.enabled:
-        (destination/'initial_selection.json').write_text(json.dumps(receipt,indent=2),encoding='utf-8')
+        write_json_atomic(destination/'initial_selection.json', receipt)
         with _trace_sam_phase('retry',metadata.get('scope_id',''),operation='extrapolation'):
             bundle,receipt,ledger=_retry_tails(bundle,receipt,prepared,observations,destination,metadata,
                 policy=crop_retry_policy,provider_factory=retry_image_provider,runtime=runtime,view=view,
@@ -1118,7 +1148,7 @@ def extrapolate_sam_view_volume_pass(observations,*,work_dir,image_provider=None
                 resource_profile=resource_profile,cancel_event=cancel_event,
                 exact_crop_family_dispatch=exact_crop_family_dispatch)
         stats['sam_crop_retry']=ledger
-    (destination/'selection.json').write_text(json.dumps(receipt,indent=2),encoding='utf-8')
+    write_json_atomic(destination/'selection.json', receipt)
     if _evidence_only:
         stats.update(generated_runs=len(bundle.runs),selected_runs=len(receipt['selected_run_ids']),
             sam_evidence_path=str(bundle.directory),sam_selection_receipt_path=str(destination/'selection.json'),
@@ -1128,7 +1158,7 @@ def extrapolate_sam_view_volume_pass(observations,*,work_dir,image_provider=None
         raise ValueError('Frozen post-interpolation baseline changed before final tail publication')
     with _trace_sam_phase('publication',metadata.get('scope_id',''),operation='extrapolation'):
         components,added=_publish(bundle,receipt,destination,metadata,cancel_event=cancel_event,
-            resource_profile=resource_profile)
+            resource_profile=resource_profile,runtime_work_dir=runtime_work_dir)
     stats.update(generated_runs=len(bundle.runs),selected_runs=len(receipt['selected_run_ids']),
         added_voxels=added,sam_evidence_path=str(bundle.directory),
         sam_selection_receipt_path=str(destination/'selection.json'),policy_hash=receipt['policy_hash'],

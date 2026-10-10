@@ -15,20 +15,36 @@ import json
 import os
 from pathlib import Path
 import statistics
+import sys
+
+REPO = Path(__file__).resolve().parents[1]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+from XTA.artifact_archive import (open_artifact, read_artifact, artifact_exists,
+    physical_path, member_exists, split_reference)
 
 
 def read_json(path, default=None):
     path = Path(path)
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
+    return json.loads(read_artifact(path)) if artifact_exists(path) else default
 
 
 def file_sha(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with open_artifact(path) as stream:
+        while block := stream.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def resolve(root, path):
     result = Path(path)
     return result if result.is_absolute() else root / result
+
+
+def is_source_file(path):
+    return member_exists(path) if split_reference(path) is not None else Path(path).is_file()
 
 
 def number(value, digits=4):
@@ -270,7 +286,7 @@ def build(args):
     oracle=None if args.skip_figures else synthetic_figure(root,figures)
     escape=lambda value:html.escape(str(value))
     def link(path,label=None):
-        actual=resolve(root,path)
+        actual=physical_path(resolve(root,path))
         relative=os.path.relpath(actual,output.parent).replace("\\","/")
         return '<a href="'+escape(relative)+'">'+escape(label or path)+'</a>'
     def metric_rows(dataset, compact=False, common=False, stress=None):
@@ -381,7 +397,7 @@ def build(args):
         'baseline_commit':planner.get('release_baseline'),'datasets':data.get('datasets',[]),'planner_validation':planner,'scheduling':scheduling,
         'missing_analysis_ids':data.get('missing_analysis_ids',[]),'upstream_status':data.get('upstream_status'),
         'oracle':None if not oracle else {'frame':oracle['frame'],'frame_selection':oracle['frame_selection'],'metadata':oracle['metadata']},
-        'sources':[{'path':path,'sha256':file_sha(resolve(root,path))} for path in unique if resolve(root,path).is_file()]}
+        'sources':[{'path':path,'sha256':file_sha(resolve(root,path))} for path in unique if is_source_file(resolve(root,path))]}
     output.with_suffix('.metrics.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
     document=f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SAM outer-crop evidence</title><style>body{{font:16px/1.55 system-ui,sans-serif;background:#f3f6f8;color:#223746}}main{{max-width:1200px;margin:28px auto;padding:26px;background:white}}h1{{font-size:30px}}h2{{margin-top:28px}}.note{{background:#eef5f7;padding:14px;border-left:4px solid #23858a}}.scroll{{overflow:auto}}table{{width:100%;border-collapse:collapse;font-size:14px}}th,td{{padding:9px;border-bottom:1px solid #dce5eb;text-align:right}}th:first-child,td:first-child{{text-align:left}}th{{background:#eef3f6}}img{{max-width:100%}}a{{color:#176f89}}figcaption,.small{{font-size:14px;color:#596d78}}</style></head><body><main><h1>Outer-crop geometry, context and selection</h1><p>Status: <strong>{escape(data.get('status','unreported').replace('_',' '))}</strong>. This report keeps structural geometry restoration separate from observed model behavior and actual bridge selection.</p>
     <div class="note"><strong>Distinct spatial contracts.</strong> Image context C controls pixels the model can see. Acceptance A controls quality measurement and containment. Permitted writes W control publishable additions. Owned cores govern tile assembly; full raw halos remain separate quality evidence. None is interchangeable with the others.</div>
@@ -389,7 +405,7 @@ def build(args):
     <section><h2>Scheduling qualification — separate from geometry and accuracy</h2>{schedule_html}</section>
     <section><h2>Study stages and original pixels</h2>{table(['Stage','Exposure scope','Evaluation source frame','Analysis status'],stage_rows)}{table(['Full-source window [first,last)','Evaluation source frame','Original endpoint source frames','Pixel validation'],windows)}<p>Frame 61 of the retained segment is full-source 655. Frames 594/690 are current-tuning-held-out follow-ups, with prior LTA prompt exposure disclosed. Same scan and detector training membership unverified; no independent-patient accuracy claim.</p></section>
     {''.join(dataset_html)}<section><h2>Reading the experiment variants</h2><p>B0 is baseline geometry; B1 restores swept-envelope correctness. C2 tests two long-axis model-patch units of image context while A/W/evaluation/raster contracts remain fixed relative to B1. A2 reuses C2 raw evidence with an altered acceptance contract: its selected W is a diagnostic reselection, never a fresh pipeline result. Any preregistered C3/full-context variants keep their own scope and resource status.</p><p>Equal research caps, resource refusals, unknown coverage and skipped seeds must stay visible. A complete generated run rejected by policy can legitimately publish zero selected writes. A resource-refused or missing run instead has unavailable model metrics and unknown coverage; it does not become successful predicted background. Partial published output is labeled as a partial-cohort effect. Numeric thresholds are not inferred from variant labels; persisted contracts and selection receipts are authoritative.</p></section>
-    <section><h2>Timing and selection provenance</h2><p>Inference, predictor startup, rendering/transfers, policy/replay and publication timings are shown only when measured. Fixed-evidence A2 replay has no new inference. Raw candidates, filtered owned-core support, full-halo veto evidence and actually selected writes remain distinct. SDF is a separate mask-only reference where supplied, not a fallback for rejected SAM proposals.</p><p>{' · '.join(link(path,unique[path].get('label',path)) for path in unique if resolve(root,path).is_file())} · {link(output.with_suffix('.metrics.json'),'Report metrics')}</p></section><p class="small">Generated {escape(summary['generated_utc'])}. This reporter performs no model inference, policy selection, commits, or modifications to prior reports.</p></main></body></html>'''
+    <section><h2>Timing and selection provenance</h2><p>Inference, predictor startup, rendering/transfers, policy/replay and publication timings are shown only when measured. Fixed-evidence A2 replay has no new inference. Raw candidates, filtered owned-core support, full-halo veto evidence and actually selected writes remain distinct. SDF is a separate mask-only reference where supplied, not a fallback for rejected SAM proposals.</p><p>{' · '.join(link(path,unique[path].get('label',path)) for path in unique if is_source_file(resolve(root,path)))} · {link(output.with_suffix('.metrics.json'),'Report metrics')}</p></section><p class="small">Generated {escape(summary['generated_utc'])}. This reporter performs no model inference, policy selection, commits, or modifications to prior reports.</p></main></body></html>'''
     output.write_text(document,encoding='utf-8')
     print(json.dumps({'html':str(output),'metrics':str(output.with_suffix('.metrics.json')),'status':summary['status']},indent=2))
 

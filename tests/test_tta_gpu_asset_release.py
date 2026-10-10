@@ -47,7 +47,8 @@ def _ready_state():
 def _ack(worker, command, *, ok=True, intact=False):
     return {'type': 'inference_assets_released', 'op': 'release_inference_assets',
             'gpu_index': worker, 'task_id': command['task_id'], 'ok': ok,
-            'stats': {'assets_intact': intact, 'phase': 'validate_drain' if intact else 'release'},
+            'stats': {'assets_intact': intact, 'released': ok and not intact,
+                      'phase': 'validate_drain' if intact else 'released' if ok else 'release'},
             'error': '' if ok else 'retained active cache'}
 
 

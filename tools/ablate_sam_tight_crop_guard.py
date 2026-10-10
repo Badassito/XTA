@@ -24,6 +24,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from XTA.sam_evidence import SamEvidenceBundle
+from XTA.artifact_archive import read_artifact
 from XTA.sam_filtering import IMPLEMENTATION_SHA256 as FILTER_IMPLEMENTATION_SHA256
 from XTA.sam_mask_reader import IMPLEMENTATION_SHA256 as READER_IMPLEMENTATION_SHA256
 from XTA.sam_policy import select_sam_proposals
@@ -36,7 +37,8 @@ def run_ablation(evidence, selection, output, *, max_group_mib=256,
     if max_group_mib <= 0 or max_rescue_plane_mib <= 0 or reader_cache_mib < 0:
         raise ValueError('Workspace bounds must be positive; reader cache must be nonnegative')
     evidence, selection, output = Path(evidence).resolve(), Path(selection).resolve(), Path(output).resolve()
-    original = json.loads(selection.read_text(encoding='utf-8'))
+    original_bytes = read_artifact(selection)
+    original = json.loads(original_bytes)
     raw_bundle = SamEvidenceBundle.open(evidence)
     if (original.get('schema') != 'xta.sam_selection/1'
             or original.get('evidence_fingerprint') != raw_bundle.evidence_fingerprint):
@@ -86,7 +88,7 @@ def run_ablation(evidence, selection, output, *, max_group_mib=256,
     method = ('Frozen original intrinsic measurements, recomputed topology/contact/conflict selection'
               if reuse_original_measurements else 'Full fixed-evidence policy replay from immutable masks')
     summary = dict(schema='xta.sam_tight_crop_guard_ablation/1', source_evidence=str(evidence),
-        source_selection=str(selection), source_selection_sha256=hashlib.sha256(selection.read_bytes()).hexdigest(),
+        source_selection=str(selection), source_selection_sha256=hashlib.sha256(original_bytes).hexdigest(),
         evidence_fingerprint=raw_bundle.evidence_fingerprint, method=method,
         original_policy_hash=original['policy_hash'],
         allocation_bound_bytes=policy['max_group_bytes'], saved_runtime_allocation_permission=False,

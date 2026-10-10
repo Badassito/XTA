@@ -460,7 +460,10 @@ def publish_confidence_scores(scores, *, view, model_name, temp_dir, output_shap
 
 class _MaskedNativeScoreReader:
     """Read observed scores only inside trusted, pre-interpolation mask bounds."""
-    def __init__(self, mask, scores, known_slice_any, known_slice_bboxes):
+    def __init__(self, mask, scores, known_slice_any, known_slice_bboxes, *, stop=None):
+        self.stop = stop
+        if stop is not None and stop.is_set():
+            raise RuntimeError('Confidence capture cancelled')
         self.mask, self.scores = mask, scores
         typed = (isinstance(mask, np.ndarray) and isinstance(scores, np.ndarray)
                  and mask.dtype in (np.dtype(np.uint8), np.dtype(bool))
@@ -542,6 +545,8 @@ class _MaskedNativeScoreReader:
     def encode_frame(self, z, block_size):
         """Typed retiring inputs: fused bounds/count, bounded exact zlib cells."""
         from .confidence_capture_cpu import masked_cell_bounds, copy_masked_cell
+        if self.stop is not None and self.stop.is_set():
+            raise RuntimeError('Confidence capture cancelled')
         if not self.compiled_capture_capable:
             raise ValueError('Compiled confidence capture needs its admitted grid plan')
         if self.capture_plan is not None and int(block_size) != self.capture_plan.block_size:
@@ -557,6 +562,8 @@ class _MaskedNativeScoreReader:
         compression_seconds = 0.
         records = []
         for item in bounds:
+            if self.stop is not None and self.stop.is_set():
+                raise RuntimeError('Confidence capture cancelled')
             a, b, c, d, known = map(int, item)
             started = time.perf_counter()
             crop = copy_masked_cell(self.mask, self.scores, z, a, b, c, d)

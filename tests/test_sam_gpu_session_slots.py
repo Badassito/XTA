@@ -377,7 +377,8 @@ def test_real_context_normal_interpolation_uses_both_funded_logical_slots(tmp_pa
         context.close()
 
 
-def test_first_four_dispatches_spread_physical_devices_before_eight_slots_fill(tmp_path):
+@pytest.mark.parametrize('drain_device', (None, 0))
+def test_first_four_dispatches_spread_physical_devices_before_eight_slots_fill(tmp_path, drain_device):
     # Placement-only check; actual independent SDK execution is proved by the process tests above.
     class GatedPool:
         def __init__(self):
@@ -400,7 +401,8 @@ def test_first_four_dispatches_spread_physical_devices_before_eight_slots_fill(t
     pool = GatedPool()
     cache = cache_for(tmp_path, 'A', 13)
     tracker = sam.SamInterpolationTracker(model_path='placement only', device_ids=(0, 1, 2, 3),
-        workers_per_device=2, artifact_root=tmp_path/'runs')
+        workers_per_device=2, artifact_root=tmp_path/'runs',
+        compute_yield_requested=lambda device:device == drain_device)
     tracker._pool = pool
     tracker._residency_released = False
     tracker._crop_affinity[(cache.identity_sha256, (4, 2, 17, 11))] = (0, 0)
@@ -410,9 +412,11 @@ def test_first_four_dispatches_spread_physical_devices_before_eight_slots_fill(t
             future = threads.submit(consume, tracker, cache,
                 [request(index, label='A', frames=13) for index in range(8)], capacity=8, admissions=admissions)
             try:
-                wait_for(lambda:len(pool.submissions) == 8)
-                assert {device for device, index in pool.submissions[:4]} == set(range(4))
-                assert set(pool.submissions) == set(tracker.worker_slots)
+                devices = set(range(4))-{drain_device}
+                wait_for(lambda:len(pool.submissions) == 2*len(devices))
+                assert {device for device, index in pool.submissions[:len(devices)]} == devices
+                assert set(pool.submissions) == {slot for slot in tracker.worker_slots if slot[0] in devices}
+                assert tracker.has_ready_work() == (drain_device is not None)
             finally:
                 tracker.cancel('placement gate cancelled after proof')
             with pytest.raises(RuntimeError, match='cancel'):

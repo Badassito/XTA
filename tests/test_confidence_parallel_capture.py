@@ -140,3 +140,26 @@ def test_stage_capacity_failure_preserves_original_error_and_settles_workers(tmp
     with pytest.raises(storage.ConfidenceStageLimit):
         storage.write_blocks(tmp_path/'limited',scores.shape,reader,layer_key='k',model_name='m',provenance={},max_numeric_bytes=1)
     assert list((tmp_path/'limited').iterdir())==[]
+
+
+@pytest.mark.parametrize('where', ['frame', 'cell'])
+def test_optional_cancellation_stops_before_next_source_read(monkeypatch, where):
+    from XTA import confidence_capture_cpu
+    mask,scores,active,boxes = fixture()
+    stop = threading.Event()
+    reader = _MaskedNativeScoreReader(mask,scores,active,boxes,stop=stop)
+    original = confidence_capture_cpu.masked_cell_bounds
+    def bounds(*args):
+        values = original(*args)
+        stop.set()
+        return values
+    if where == 'frame':
+        stop.set()
+        monkeypatch.setattr(confidence_capture_cpu,'masked_cell_bounds',
+            lambda *a:pytest.fail('Cancelled frame read its source'))
+    else:
+        monkeypatch.setattr(confidence_capture_cpu,'masked_cell_bounds',bounds)
+        monkeypatch.setattr(confidence_capture_cpu,'copy_masked_cell',
+            lambda *a:pytest.fail('Cancelled cell read its source'))
+    with pytest.raises(RuntimeError,match='Confidence capture cancelled'):
+        reader.encode_frame(1,128)

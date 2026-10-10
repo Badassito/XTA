@@ -26,13 +26,16 @@ REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+from XTA.artifact_archive import (open_artifact, read_artifact, artifact_size,
+    artifact_exists, iter_artifacts, physical_path)
+
 GIB = 1024**3
 BASE_BYTES = 4 * GIB
 EXTRA_BYTES = 3 * GIB
 CACHE_BYTES = 32 * 1024**2
 SOURCE_FILES = (
     'XTA/sam_policy.py', 'XTA/sam_mask_reader.py', 'XTA/sam_filtering.py', 'XTA/sam_branch_selection.py',
-    'XTA/sam_evidence.py', 'XTA/sam_cyclic.py', 'XTA/sam_resources.py',
+    'XTA/sam_evidence.py', 'XTA/artifact_archive.py', 'XTA/sam_cyclic.py', 'XTA/sam_resources.py',
     'XTA/interpolation.py', 'tools/qualify_sam_policy_throughput.py',
 )
 AUDIT_ONLY_FILES = ('XTA/sam_interpolation.py', 'XTA/sam_tracker_runtime.py')
@@ -76,7 +79,7 @@ _MISSING = object()
 
 def file_digest(path):
     digest = hashlib.sha256()
-    with Path(path).open('rb') as stream:
+    with open_artifact(path) as stream:
         for block in iter(lambda: stream.read(8 * 1024**2), b''):
             digest.update(block)
     return digest.hexdigest()
@@ -244,17 +247,20 @@ def input_inventory(evidence, selection_path):
     parent = evidence.parent
     files = [evidence / name for name in ('manifest.json', 'index.json', 'masks.bin')]
     files.append(selection_path)
-    if (parent / 'generation.json').exists():
+    if artifact_exists(parent / 'generation.json'):
         files.append(parent / 'generation.json')
-    for store in sorted(parent.glob('sam_bridge_pass*_*.cvol')):
+    stores = {path.parent for path in iter_artifacts(parent, 'sam_bridge_pass*_*.cvol/*')}
+    if physical_path(parent) == parent:
+        stores.update(parent.glob('sam_bridge_pass*_*.cvol'))
+    for store in sorted(stores):
         files.extend(store / name for name in ('meta.json', 'index.bin', 'chunks.bin'))
-    return {str(path.resolve()): dict(bytes=path.stat().st_size, sha256=file_digest(path)) for path in files}
+    return {str(path.resolve()): dict(bytes=artifact_size(path), sha256=file_digest(path)) for path in files}
 
 
 def assert_inputs_unchanged(expected):
     for name, record in expected.items():
         path = Path(name)
-        if path.stat().st_size != record['bytes'] or file_digest(path) != record['sha256']:
+        if artifact_size(path) != record['bytes'] or file_digest(path) != record['sha256']:
             raise ValueError(f'Immutable qualification input changed: {name}')
 
 
@@ -448,14 +454,15 @@ def main(argv=None):
 
     evidence, output = args.evidence.resolve(), args.output.resolve()
     selection_path = (args.selection or evidence.parent / 'selection.json').resolve()
-    if output.is_relative_to(evidence.parent) or evidence.parent.is_relative_to(output):
+    input_parent = physical_path(evidence).parent
+    if output.is_relative_to(input_parent) or input_parent.is_relative_to(output):
         raise ValueError('Qualification outputs must not overlap immutable input receipts')
     output.mkdir(parents=True, exist_ok=True)
     sources, producer_before = source_hashes(), source_hashes(AUDIT_ONLY_FILES)
     inputs = input_inventory(evidence, selection_path)
-    if selection_path.stat().st_size > 64 * 1024**2:
+    if artifact_size(selection_path) > 64 * 1024**2:
         raise MemoryError('Reference selection exceeds its bounded receipt budget')
-    reference = json.loads(selection_path.read_text(encoding='utf-8'))
+    reference = json.loads(read_artifact(selection_path))
     bundle = SamEvidenceBundle.open(evidence)
     plan = inspect_demands(bundle, reference, args.workers)
     plan.update(mode=args.mode, evidence=str(evidence), selection=str(selection_path),

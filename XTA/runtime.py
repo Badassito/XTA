@@ -61,6 +61,7 @@ from .mmap_advice import madvise_mmap
 
 # Explicit lower-layer dependencies keep imports one-way.
 from .workspace import (
+    _read_meminfo_bytes,
     _cpu_count,
     _env_flag,
     _env_float,
@@ -1782,6 +1783,7 @@ def _numa_interleave_range(addr: int, nbytes: int, mems: Sequence[int]) -> bool:
         print(f'Warning: [numa] mbind unavailable ({exc}); page interleave disabled for this process.')
         return False
 
+@runtime_telemetry_phase('workspace.numa_policy')
 def numa_interleave_memory(arr: object, desc: str = '') -> bool:
     """Round-robin a big shared buffer's pages across the allowed NUMA nodes.
 
@@ -2098,8 +2100,10 @@ def resolve_parent_memory_limits(available_bytes: int, *, sam_enabled: bool,
     """Keep inference bounded while SAM parent lanes share real host headroom.
 
     The SAM caller supplies physical/cgroup/SLURM headroom without swap. Its
-    dense and transient defaults use 40% and 25% of the same post-reserve
-    budget. Small-host floors retain the existing exclusive emergency lane.
+    Large SAM hosts give dense and transient promises up to 40% each of the
+    same post-reserve budget. The remaining 20% plus 64 GiB stays available for
+    source, model, staging and publication work. Floor-bound hosts keep their previous
+    transient default and exclusive emergency lane; explicit limits still win.
     """
     headroom = max(1, int(available_bytes)-64*GIB)
     inference_default = max(64*GIB, min(128*GIB, int(headroom*.25)))
@@ -2112,6 +2116,11 @@ def resolve_parent_memory_limits(available_bytes: int, *, sam_enabled: bool,
                                      inference_default/GIB))*GIB)
     dense = int(max(inference/GIB, _env_float('YOLO_TTA_DIRECT_UNION_TOTAL_GIB',
                                             dense_default/GIB))*GIB)
+    if sam_enabled and dense_default <= int(headroom*.40):
+        # Increase only the default, without spending an explicit dense
+        # allowance twice or changing the legacy small-host floors.
+        transient_default = max(transient_default,
+            min(int(headroom*.40), int(headroom*.80)-dense))
     transient = int(max(1., _env_float('YOLO_TTA_PARENT_TRANSIENT_GIB',
                                      transient_default/GIB))*GIB)
     return inference, dense, transient
@@ -2299,6 +2308,7 @@ def release_memfd_owners_under(root: Path) -> int:
             continue
     return int(released)
 
+@runtime_telemetry_phase('workspace.memfd_allocate')
 def _allocate_memfd_workspace_array(
     shape: Sequence[int],
     dtype: np.dtype | str | type,
@@ -2381,6 +2391,107 @@ def _memfd_owner_fd_for_path(path: object) -> Optional[int]:
             if entry is not None:
                 return int(entry[0])
     return None
+
+
+def capture_memfd_owner_proofs(arrays) -> tuple:
+    """Freeze registered raw-workspace identities without retaining arrays or FDs."""
+    proofs = []
+    with _MEMFD_OWNER_LOCK:
+        for role, array in arrays.items():
+            if (not isinstance(array, _NUMPY_MEMMAP_TYPE) or array._mmap is None or array.base is not array._mmap
+                    or array.mode == 'c' or int(array.offset) != 0 or array._mmap.closed):
+                continue
+            key = _memfd_owner_key_from_array(array)
+            entry = _MEMFD_OWNERS.get(key)
+            if entry is None or int(entry[0]) != getattr(array, '_workspace_memfd_owner_fd', None):
+                continue
+            try:
+                info = os.fstat(entry[0])
+                if int(info.st_size) == int(array.nbytes):
+                    proofs.append((str(role), key, int(info.st_dev), int(info.st_ino), int(info.st_size)))
+            except OSError:
+                pass
+    return tuple(proofs)
+
+
+@runtime_telemetry_phase('workspace.ram_headroom')
+def memfd_ram_headroom(promises, headroom_probe):
+    """Credit only owned no-swap shmem pages already included in fresh headroom.
+
+    Registered raw workspaces are size-stable and never hole-punched. Sample
+    their blocks before headroom, fencing owner retirement with the FD lock;
+    concurrent writers can only add occupied pages. Unknown owners stay owed.
+    """
+    resident = eligible = validated = 0
+    status, swap = 'unsupported_platform', None
+    with _MEMFD_OWNER_LOCK:
+        if sys.platform.startswith('linux'):
+            try:
+                swap = _read_meminfo_bytes().get('SwapTotal')
+            except (OSError, ValueError, TypeError):
+                pass
+            status = 'swap_unproven' if type(swap) is not int else 'swap_enabled'
+            if type(swap) is int and swap == 0:
+                status, seen, sampled = 'no_authenticated_memfd', set(), []
+                for lease in promises:
+                    basis = (lease.owner_count, lease.phase, lease.ram_backed,
+                             lease.nbytes, lease.memfd_owner_proofs)
+                    promised, owners = lease.ram_commitment_bytes, []
+                    if basis[0] != 1 or promised <= 0:
+                        continue
+                    proofs = basis[-1]
+                    for _role, key, device, inode, size in proofs:
+                        entry = _MEMFD_OWNERS.get(key)
+                        if entry is None or (device, inode) in seen:
+                            continue
+                        try:
+                            info = os.fstat(entry[0])
+                            if (info.st_dev, info.st_ino, info.st_size) != (device, inode, size):
+                                continue
+                            blocks = max(0, int(info.st_blocks))
+                        except (OSError, AttributeError, TypeError, ValueError):
+                            continue
+                        seen.add((device, inode))
+                        owners.append((key, entry[0], (device, inode, size), min(int(size), blocks*512)))
+                        eligible += 1
+                    sampled.append((lease, basis, promised, owners))
+                if eligible:
+                    status = 'owned_memfd_no_swap'
+        try:
+            headroom = max(0, int(headroom_probe()))
+        except (OSError, ValueError, TypeError):
+            headroom, resident, status = 0, 0, 'headroom_unproven'
+        if eligible and status != 'headroom_unproven':
+            try:
+                verified_swap = _read_meminfo_bytes().get('SwapTotal')
+            except (OSError, ValueError, TypeError):
+                verified_swap = None
+            if type(verified_swap) is not int or verified_swap != 0:
+                resident, status = 0, 'swap_proof_lost'
+            else:
+                for lease, basis, promised, owners in sampled:
+                    if basis != (lease.owner_count, lease.phase, lease.ram_backed,
+                                 lease.nbytes, lease.memfd_owner_proofs):
+                        continue
+                    occupied = 0
+                    for key, fd, identity, before in owners:
+                        entry = _MEMFD_OWNERS.get(key)
+                        if entry is None or entry[0] != fd:
+                            continue
+                        try:
+                            info = os.fstat(fd)
+                            if (info.st_dev, info.st_ino, info.st_size) != identity:
+                                continue
+                            occupied += min(before, max(0, int(info.st_blocks))*512)
+                            validated += 1
+                        except (OSError, AttributeError, TypeError, ValueError):
+                            pass
+                    resident += min(max(0, int(promised)), occupied)
+    if eligible and not validated and status == 'owned_memfd_no_swap':
+        status = 'resident_basis_changed'
+    return headroom, resident, dict(memfd_resident_probe_status=status,
+        eligible_memfd_owner_count=eligible, validated_memfd_owner_count=validated,
+        swap_total_bytes=swap)
 
 def _duplicate_memfd_path_for_child(path: object) -> Optional[object]:
     """Create a multiprocessing descriptor-transfer handle for a memfd path."""
@@ -2788,18 +2899,23 @@ def allocate_workspace_array(
 ) -> np.ndarray:
     dtype_obj = np.dtype(dtype)
     need_bytes = array_nbytes(shape, dtype_obj)
-    budget = workspace_budget_summary(need_bytes, reserve_bytes=reserve_bytes)
+    # Diagnostic logging must not repeat physical/cgroup admission probes.
+    budget = f'need={need_bytes / GIB:.1f} GiB, reserve={max(0, reserve_bytes) / GIB:.1f} GiB'
+    cap = workspace_anon_cap_bytes()
+    if cap > 0:
+        budget += f', anon-cap={cap / GIB:.1f} GiB'
     use_in_memory = bool(prefer_memory) and should_use_in_memory_workspace(need_bytes, reserve_bytes=reserve_bytes)
 
     if use_in_memory:
         try:
             print(f"{desc}: in-memory ({budget})")
             shape_tuple = tuple(int(x) for x in shape)
-            arr = (
-                np.zeros(shape_tuple, dtype=dtype_obj)
-                if bool(initialize_zero)
-                else np.empty(shape_tuple, dtype=dtype_obj)
-            )
+            with runtime_telemetry().span('workspace.anonymous_allocate'):
+                arr = (
+                    np.zeros(shape_tuple, dtype=dtype_obj)
+                    if bool(initialize_zero)
+                    else np.empty(shape_tuple, dtype=dtype_obj)
+                )
             # big allocations are still untouched here (>32 MiB glibc allocations
             # are fresh private mmaps, and np.zeros defers to lazily-faulted zero pages), so the
             # interleave policy lands before first touch.
@@ -2829,14 +2945,16 @@ def allocate_workspace_array(
     path.parent.mkdir(parents=True, exist_ok=True)
     if reuse_existing and path.exists():
         print(f"{desc}: disk-backed reuse ({budget}) -> {path}")
-        mm = np.memmap(path, dtype=dtype_obj, mode='r+', shape=tuple(int(x) for x in shape))
+        with runtime_telemetry().span('workspace.path_map'):
+            mm = np.memmap(path, dtype=dtype_obj, mode='r+', shape=tuple(int(x) for x in shape))
         numa_interleave_memory(mm, desc=desc)  # best-effort (existing pages stay put)
         return mm
 
     if path.exists():
         path.unlink()
     print(f"{desc}: disk-backed ({budget}) -> {path}")
-    mm = np.memmap(path, dtype=dtype_obj, mode='w+', shape=tuple(int(x) for x in shape))
+    with runtime_telemetry().span('workspace.path_map'):
+        mm = np.memmap(path, dtype=dtype_obj, mode='w+', shape=tuple(int(x) for x in shape))
     numa_interleave_memory(mm, desc=desc)  #
     return mm
 
@@ -3336,6 +3454,7 @@ def workspace_budget_summary(required_bytes: int, reserve_bytes: int = 16 * GIB)
         parts.append(f'anon-cap={cap / GIB:.1f} GiB')
     return ', '.join(parts)
 
+@runtime_telemetry_phase('workspace.memory_admission')
 def should_use_in_memory_workspace(required_bytes: int, reserve_bytes: int = 16 * GIB) -> bool:
     if int(required_bytes) <= 0:
         return False

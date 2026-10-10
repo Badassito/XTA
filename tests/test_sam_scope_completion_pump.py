@@ -268,8 +268,15 @@ def test_resistant_receiver_retains_pool_and_staging_until_join_can_be_retried(t
 
 
 @pytest.mark.parametrize('action', ('close', 'throw', 'cancel'))
+@pytest.mark.parametrize('coarse_clock', (False, True))
 def test_early_consumer_stop_joins_before_pool_teardown_and_preserves_decoded_masks(
-        tmp_path, monkeypatch, action):
+        tmp_path, monkeypatch, action, coarse_clock):
+    if coarse_clock:
+        # Python 3.12 Windows monotonic can remain on one 15.625ms tick while
+        # perf_counter resolves a complete decode/consumer/cancellation cycle.
+        monkeypatch.setattr(sam,'time',SimpleNamespace(monotonic=lambda:17.,
+            monotonic_ns=time.monotonic_ns,perf_counter=time.perf_counter,
+            thread_time=time.thread_time))
     tracker, pool, _cache, _coordinator, residents, _torch, _releases = protocol(tmp_path, monkeypatch)
     stream = tracker.iter_results(request(index) for index in range(8))
     try:
@@ -287,6 +294,8 @@ def test_early_consumer_stop_joins_before_pool_teardown_and_preserves_decoded_ma
         assert pool.shutdown_calls == 1 and not list(tracker.artifact_root.glob('run-*'))
         assert not tracker._scopes and not tracker._compute_leases
         np.testing.assert_array_equal(first.frames[0], request(0)['seed_mask'])
+        snapshot=tracker.snapshot()
+        assert snapshot['consumer_hold_seconds'] >= snapshot['raw_transfer_decode_seconds'] > 0
     finally:
         pool.remaining.set()
         stream.close()

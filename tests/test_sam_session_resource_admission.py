@@ -133,6 +133,161 @@ def test_real_physical_coordinator_cannot_lend_gpu_between_peer_session_acks(
         context.close()
 
 
+def test_continuous_dual_slot_refill_yields_image_turn_after_both_acks(admission, tmp_path, monkeypatch):
+    from tests.test_sam_gpu_session_slots import (Admissions, cache_for, consume,
+        protocol, release_slot, request, wait_for)
+    coordinator, _auxiliary, torch = admission
+    tracker, pool, _, _, _, _ = protocol(tmp_path, monkeypatch)
+    monkeypatch.setitem(sys.modules, 'torch', torch)
+    resident = coordinator.try_acquire_specific_stage(torch, 0, 'SAM startup').promote_residency()
+    context = sam_integration.SamInterpolationContext(model_path='CPU protocol', device_ids=(0,),
+        temp_dir=tmp_path/'context', evidence_root=tmp_path/'evidence', source_identity='source',
+        source_volume=np.zeros((3, 4, 5), np.uint8))
+    context._resident_leases[0] = resident
+    context._runtime = tracker
+    tracker._compute_lease_factory = context._try_sam_compute_lease
+    tracker._compute_lease_release = context._release_sam_compute_lease
+    tracker._compute_yield_requested = context._sam_compute_should_yield
+    tracker._residency_quarantine = context._quarantine_sam_residency
+    tracker._before_worker_shutdown = context._before_sam_worker_shutdown
+    tracker._after_worker_shutdown = context._after_sam_worker_shutdown
+    grants, first = Admissions(1), threading.Event()
+    original = tracker.iter_results
+    def observed(*args, **kwargs):
+        for item in original(*args, **kwargs):
+            first.set()
+            yield item
+    monkeypatch.setattr(tracker, 'iter_results', observed)
+    renderer = SimpleNamespace(lease=None, device_index=None, name='waiting image')
+    try:
+        with ThreadPoolExecutor(1) as threads:
+            future = threads.submit(consume, tracker, cache_for(tmp_path, 'A', 13),
+                [request(index, label='A', frames=13) for index in range(4)],
+                capacity=2, admissions=grants)
+            try:
+                wait_for(lambda:all((tmp_path/f'active-{slot}.json').exists() for slot in (0, 1)))
+                context._queue_gpu_image(renderer)
+                release_slot(tmp_path, 0)
+                assert first.wait(15)
+                assert tracker.dispatch_stats['submitted'] == 2
+                assert context._try_gpu_image_lease(renderer, torch) is None
+                assert pool.is_alive(0, 1) and coordinator.snapshot()['stage_leases']
+                release_slot(tmp_path, 1)
+                wait_for(lambda:tracker.dispatch_stats['completion_acks_pumped'] == 2)
+                assert tracker.dispatch_stats['submitted'] == 2
+                renderer.lease = context._try_gpu_image_lease(renderer, torch)
+                assert renderer.lease is not None
+                context._finish_gpu_image_wait(renderer, granted=True)
+                assert coordinator.snapshot()['stage_leases'] == {0:'SAM image preparation'}
+                renderer.lease.release()
+                renderer.lease = None
+                context._finish_gpu_image(renderer)
+                assert len(future.result(15)) == 4
+            finally:
+                context._finish_gpu_image_wait(renderer)
+                if renderer.lease is not None:
+                    renderer.lease.release()
+                    context._finish_gpu_image(renderer)
+                release_slot(tmp_path, 0)
+                release_slot(tmp_path, 1)
+        assert grants.pool.in_use == 0 and not context._gpu_image_waiters
+        assert not context._gpu_image_owners and not coordinator.snapshot()['stage_leases']
+    finally:
+        context.close()
+
+
+def test_one_gpu_fifo_gives_sdk_a_turn_but_does_not_block_first_inputs(admission, tmp_path, monkeypatch):
+    coordinator, _auxiliary, torch = admission
+    monkeypatch.setitem(sys.modules, 'torch', torch)
+    context = sam_integration.SamInterpolationContext(model_path='CPU admission', device_ids=(0,),
+        temp_dir=tmp_path/'context', evidence_root=tmp_path/'evidence', source_identity='source',
+        source_volume=np.zeros((3, 4, 5), np.uint8))
+    context._resident_leases[0] = coordinator.try_acquire_specific_stage(torch, 0, 'SAM startup').promote_residency()
+    ready = [False]
+    def sdk_ready():
+        assert not context._gpu_lease_lock._is_owned()
+        return ready[0]
+    context._runtime = SimpleNamespace(has_ready_work=sdk_ready, close=lambda:None)
+    owners = [SimpleNamespace(lease=None, device_index=None, name=str(index)) for index in range(3)]
+    try:
+        for owner in owners:context._queue_gpu_image(owner)
+        assert context._try_gpu_image_lease(owners[1], torch) is None
+        for owner in owners[:2]:
+            assert context._try_gpu_image_lease(owner, torch) is not None
+            context._finish_gpu_image_wait(owner, granted=True)
+            owner.lease.release();owner.lease=None
+            context._finish_gpu_image(owner)
+        ready[0] = True
+        assert context._try_gpu_image_lease(owners[2], torch) is None
+        assert not context._sam_compute_should_yield(0)
+        sdk = context._try_sam_compute_lease(0, 'SAM tracker compute ready')
+        assert sdk is not None and context._sam_compute_should_yield(0)
+        context._release_sam_compute_lease(sdk)
+        assert context._try_gpu_image_lease(owners[2], torch) is not None
+        context._finish_gpu_image_wait(owners[2], granted=True)
+        owners[2].lease.release();owners[2].lease=None
+        context._finish_gpu_image(owners[2])
+        assert not context._gpu_image_waiters and not context._gpu_image_owners
+    finally:
+        context.close()
+
+
+@pytest.mark.parametrize('granted', (False, True))
+def test_image_wait_cancellation_does_not_discard_an_owned_physical_fence(admission, tmp_path, monkeypatch, granted):
+    coordinator, _auxiliary, torch = admission
+    monkeypatch.setitem(sys.modules, 'torch', torch)
+    context = sam_integration.SamInterpolationContext(model_path='CPU admission', device_ids=(0,),
+        temp_dir=tmp_path/'context', evidence_root=tmp_path/'evidence', source_identity='source',
+        source_volume=np.zeros((3, 4, 5), np.uint8))
+    context._resident_leases[0] = coordinator.try_acquire_specific_stage(torch, 0, 'SAM startup').promote_residency()
+    renderer = SimpleNamespace(lease=None, device_index=None)
+    context._queue_gpu_image(renderer)
+    if granted:
+        assert context._try_gpu_image_lease(renderer, torch) is not None
+        context._finish_gpu_image_wait(renderer, granted=True)
+    context.cancel('upstream SAM failure')
+    try:
+        with pytest.raises(RuntimeError, match='upstream SAM failure'):
+            context._try_gpu_image_lease(renderer, torch)
+        context._finish_gpu_image_wait(renderer)
+        assert not context._gpu_image_waiters and not context._sam_compute_should_yield(0)
+        assert coordinator.snapshot()['resident_owners'][0]['quarantined']
+        assert bool(coordinator.snapshot()['stage_leases']) == granted
+        if granted:
+            assert context._gpu_image_owners[0] is renderer
+            renderer.lease.release();renderer.lease=None
+            context._finish_gpu_image(renderer)
+        assert not context._gpu_image_owners and not coordinator.snapshot()['stage_leases']
+    finally:
+        context.close()
+
+
+def test_gpu_image_watchdog_starts_at_head_and_does_not_reset_on_device_rejection(tmp_path, monkeypatch):
+    clock = [1000.]
+    monkeypatch.setattr(sam_integration, 'time', SimpleNamespace(monotonic=lambda:clock[0]))
+    context = sam_integration.SamInterpolationContext(model_path='CPU admission', device_ids=(0, 1),
+        temp_dir=tmp_path/'context', evidence_root=tmp_path/'evidence', source_identity='source',
+        source_volume=np.zeros((3, 4, 5), np.uint8))
+    owners = [SimpleNamespace(lease=None, engine=None, device_index=None, name=str(index)) for index in range(2)]
+    try:
+        for owner in owners:context._queue_gpu_image(owner)
+        assert owners[0]._gpu_wait_deadline == 1030. and owners[1]._gpu_wait_deadline is None
+        clock[0] += 31.
+        context._finish_gpu_image_wait(owners[0])
+        assert owners[1]._gpu_wait_deadline == 1061.
+        deadline = owners[1]._gpu_wait_deadline
+        lease = SimpleNamespace(device_index=context._gpu_image_target)
+        owners[1].lease, owners[1].device_index = lease, lease.device_index
+        clock[0] += 5.
+        assert context._reject_gpu_image_device(owners[1], lease)
+        assert owners[1].lease is None and owners[1]._gpu_wait_deadline == deadline
+        context.cancel('tail cancelled')
+        context._finish_gpu_image_wait(owners[1])
+        assert not context._gpu_image_waiters and context._gpu_image_target is None
+    finally:
+        context.close()
+
+
 def startup_fixture(tmp_path, monkeypatch, *, memory=((14*GIB, 16*GIB), (12*GIB, 16*GIB)),
                     host=64*GIB, first_error=None, settle=True):
     from XTA import sam_tracker_runtime

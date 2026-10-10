@@ -312,11 +312,11 @@ def _radial_native_kernels() -> Optional[object]:
 
         __device__ __forceinline__ float radial_logical_voxel(
             const unsigned char* source, int t, int y, int x,
-            int native_t, int logical_t, int full_h, int full_w) {
+            int native_t, int logical_t, int full_h, int full_w, int source_t_origin) {
             const unsigned long long stride = (unsigned long long)full_h * full_w;
             const unsigned long long spatial = (unsigned long long)y * full_w + x;
             if (native_t == logical_t)
-                return (float)source[(unsigned long long)t * stride + spatial];
+                return (float)source[(unsigned long long)(t - source_t_origin) * stride + spatial];
             // Reproduce the integer logical-T cube first, including its uint8
             // rounding. Interpolating native T directly changes the source data.
             double rf = __dadd_rn(__dmul_rn(__dadd_rn((double)t, 0.5),
@@ -324,15 +324,15 @@ def _radial_native_kernels() -> Optional[object]:
             int t0 = radial_clip_index((int)floor(rf), native_t);
             int t1 = radial_clip_index(t0 + 1, native_t);
             float alpha = __double2float_rn(fmin(1.0, fmax(0.0, rf - (double)t0)));
-            float f0 = (float)source[(unsigned long long)t0 * stride + spatial];
-            float f1 = (float)source[(unsigned long long)t1 * stride + spatial];
+            float f0 = (float)source[(unsigned long long)(t0 - source_t_origin) * stride + spatial];
+            float f1 = (float)source[(unsigned long long)(t1 - source_t_origin) * stride + spatial];
             float value = __fadd_rn(f0, __fmul_rn(alpha, __fsub_rn(f1, f0)));
             return (float)__float2uint_rn(fminf(255.0f, fmaxf(0.0f, value)));
         }
 
         extern "C" __global__ void radial_native_f32(
             const unsigned char* source, float* out,
-            int native_t, int logical_t, int full_h, int full_w,
+            int native_t, int logical_t, int full_h, int full_w, int source_t_origin,
             int rows, int columns, int base_id, int direction_id,
             int height_origin, double radius, double arc_origin,
             double center_x, double center_y, double shear) {
@@ -386,7 +386,7 @@ def _radial_native_kernels() -> Optional[object]:
                         if (ti >= 0 && ti < logical_t && yi >= 0 && yi < full_h &&
                             xi >= 0 && xi < full_w) {
                             float voxel = radial_logical_voxel(source, ti, yi, xi,
-                                native_t, logical_t, full_h, full_w);
+                                native_t, logical_t, full_h, full_w, source_t_origin);
                             float weight = __fmul_rn(__fmul_rn(wt, wy), wx);
                             value = __fadd_rn(value, __fmul_rn(voxel, weight));
                         }
@@ -416,7 +416,7 @@ def _radial_native_kernels() -> Optional[object]:
 
         extern "C" __global__ void radial_native_columns_f32(
             const unsigned char* source, const double* geometry, float* out,
-            int native_t, int logical_t, int full_h, int full_w,
+            int native_t, int logical_t, int full_h, int full_w, int source_t_origin,
             int rows, int columns, int base_id, int height_origin) {
             int u = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
             int row = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
@@ -460,7 +460,7 @@ def _radial_native_kernels() -> Optional[object]:
                         if (ti >= 0 && ti < logical_t && yi >= 0 && yi < full_h &&
                             xi >= 0 && xi < full_w) {
                             float voxel = radial_logical_voxel(source, ti, yi, xi,
-                                native_t, logical_t, full_h, full_w);
+                                native_t, logical_t, full_h, full_w, source_t_origin);
                             float weight = __fmul_rn(__fmul_rn(wt, wy), wx);
                             value = __fadd_rn(value, __fmul_rn(voxel, weight));
                         }
@@ -1366,9 +1366,11 @@ class _GpuWorkerRenderEngine:
         self._volume_mm: Optional[np.ndarray] = None
         self._volume_gpu: Optional[object] = None
         self._volume_flat: Optional[object] = None
+        self._source_residency_timings = {}
         # _volume_gpu keeps NATIVE t while _logical_t is the
         # approximately-cubic working t seen by ViewInfo/render coordinates.
         self._logical_t = 0
+        self._radial_source_t = None  # Original native T and pointer origin for SAM-only slabs.
         self._native_t_map_cache: Dict[Tuple[int, int], Tuple[object, object, object]] = {}
         self._mode = 'unresolved'
         self._tilted_plans: 'OrderedDict[Tuple[str, int, int, Tuple[float, ...]], Dict[str, object]]' = OrderedDict()
@@ -1439,6 +1441,7 @@ class _GpuWorkerRenderEngine:
         self._volume_gpu = None
         self._volume_flat = None
         self._logical_t = int(out_t)
+        self._radial_source_t = None
         self._native_t_map_cache.clear()
         self._native_plane_cache.clear()
         self._native_u8_plane_cache.clear()
@@ -1471,11 +1474,15 @@ class _GpuWorkerRenderEngine:
                 )
                 need = nbytes + texture_copy_bytes + gpu_render_reserve_bytes()
                 if int(free_bytes) >= int(need):
+                    started = time.monotonic()
                     vol = torch.empty((int(in_t), int(in_h), int(in_w)), dtype=torch.uint8, device=self.device)
+                    self._source_residency_timings = {'allocation_host_seconds': time.monotonic()-started}
+                    started = time.monotonic()
                     chunk = 256
                     for t0 in range(0, int(in_t), chunk):
                         t1 = min(int(in_t), t0 + chunk)
                         vol[t0:t1].copy_(torch.from_numpy(np.ascontiguousarray(self._volume_mm[t0:t1])))
+                    self._source_residency_timings['upload_host_seconds'] = time.monotonic()-started
                     self._volume_gpu = vol
                     self._volume_flat = vol.view(-1)
                     # Build/cache the integer logical-t taps now; transverse and
@@ -1569,6 +1576,7 @@ class _GpuWorkerRenderEngine:
         self._volume_gpu = None
         self._volume_flat = None
         self._logical_t = int(shape_t[0])
+        self._radial_source_t = None
         self._native_t_map_cache.clear()
         self._native_plane_cache.clear()
         self._native_u8_plane_cache.clear()
@@ -1602,7 +1610,10 @@ class _GpuWorkerRenderEngine:
                 resident_need = nbytes + gpu_render_reserve_bytes()
                 preferred_need = resident_need + texture_copy_bytes
                 if int(free_bytes) >= int(resident_need):
+                    started = time.monotonic()
                     resident = torch.empty(shape_t, dtype=torch.uint8, device=self.device)
+                    self._source_residency_timings = {'allocation_host_seconds': time.monotonic()-started}
+                    started = time.monotonic()
                     chunk_slices = max(
                         1,
                         min(256, (512 * 1024 * 1024) // max(1, int(shape_t[1]) * int(shape_t[2]))),
@@ -1613,6 +1624,7 @@ class _GpuWorkerRenderEngine:
                             torch.from_numpy(source[t0:t1]),
                             non_blocking=False,
                         )
+                    self._source_residency_timings['upload_host_seconds'] = time.monotonic()-started
                     self._volume_gpu = resident
                     self._volume_flat = resident.view(-1)
                     self._native_t_indices(int(shape_t[0]))
@@ -1740,6 +1752,8 @@ class _GpuWorkerRenderEngine:
         """Integer logical-t planes -> native two-tap indices/weights on device."""
         torch = self.torch
         native_t = int(self._volume_gpu.shape[0])
+        if getattr(self, '_radial_source_t', None) is not None:
+            native_t = int(self._radial_source_t[0])
         logical = int(self._logical_t if logical_t is None else logical_t)
         key = (native_t, logical)
         cached = self._native_t_map_cache.get(key)
@@ -3567,6 +3581,8 @@ class _GpuWorkerRenderEngine:
         self._native_u8_plane_cache.clear()
 
     def _render_native_plane(self, view: ViewInfo, frame_idx: int) -> object:
+        if getattr(self, '_radial_source_t', None) is not None and not is_radial_view(view):
+            raise RuntimeError('A partial Radial source cannot render another physical family')
         if is_spherical_view(view):
             return self._render_spherical_native_resident(view, int(frame_idx))
         if is_radial_view(view):
@@ -3630,6 +3646,9 @@ class _GpuWorkerRenderEngine:
         if volume is None or volume.dtype != torch.uint8 or not bool(volume.is_contiguous()):
             raise RuntimeError('Radial native CUDA sampling requires a contiguous resident uint8 source')
         native_t, full_h, full_w = (int(v) for v in volume.shape)
+        source_t_origin = 0
+        if getattr(self, '_radial_source_t', None) is not None:
+            native_t, source_t_origin = map(int, self._radial_source_t)
         logical_t = int(self._logical_t)
         if (logical_t, full_h, full_w) != (int(view.full_t), int(view.full_h), int(view.full_w)):
             raise ValueError('Radial shell source shape does not match physical view geometry')
@@ -3681,7 +3700,7 @@ class _GpuWorkerRenderEngine:
             kernels.radial_native_columns_f32(
                 ((columns + block[0] - 1) // block[0], (rows + block[1] - 1) // block[1]), block,
                 (cp_source, cp_geometry, cp_out, np.int32(native_t), np.int32(logical_t),
-                 np.int32(full_h), np.int32(full_w), np.int32(rows), np.int32(columns),
+                 np.int32(full_h), np.int32(full_w), np.int32(source_t_origin), np.int32(rows), np.int32(columns),
                  np.int32(base_id), np.int32(view.radial_height_origin)), stream=external,
             )
             if not bool(getattr(self, '_radial_column_geometry_announced', False)):
@@ -3692,6 +3711,7 @@ class _GpuWorkerRenderEngine:
             ((columns + block[0] - 1) // block[0], (rows + block[1] - 1) // block[1]), block,
             (cp_source, cp_out,
              np.int32(native_t), np.int32(logical_t), np.int32(full_h), np.int32(full_w),
+             np.int32(source_t_origin),
              np.int32(rows), np.int32(columns), np.int32(base_id), np.int32(direction_id),
              np.int32(view.radial_height_origin), np.float64(radius), np.float64(view.radial_arc_origin),
              np.float64(view.center_x), np.float64(view.center_y), np.float64(shear)),
@@ -3720,6 +3740,10 @@ class _GpuWorkerRenderEngine:
         if volume is None:
             raise RuntimeError('Radial shell rendering requires a resident source volume')
         native_t, full_h, full_w = (int(v) for v in volume.shape)
+        source_t_origin = 0
+        partial = getattr(self, '_radial_source_t', None)
+        if partial is not None:
+            native_t, source_t_origin = map(int, partial)
         logical_t = int(self._logical_t)
         if (logical_t, full_h, full_w) != (int(view.full_t), int(view.full_h), int(view.full_w)):
             raise ValueError('Radial shell source shape does not match physical view geometry')
@@ -3729,14 +3753,22 @@ class _GpuWorkerRenderEngine:
         source_flat = self._volume_flat
         native_indices = self._native_t_indices(logical_t) if native_t != logical_t else None
 
-        def gather(t: object, y: object, x: object) -> object:
+        def gather(t: object, y: object, x: object, relevant: object) -> object:
             spatial = y * full_w + x
             stride = full_h * full_w
+            def local(tap):
+                if partial is None:
+                    return tap
+                at = tap-source_t_origin
+                if bool(torch.any(relevant & ((at < 0) | (at >= int(volume.shape[0]))))):
+                    raise RuntimeError('Radial source window omitted a contributing native T tap')
+                # Irrelevant padded/zero-weight reads still occur in the Torch reference.
+                return at.clamp(0, int(volume.shape[0])-1)
             if native_indices is None:
-                return torch.take(source_flat, t * stride + spatial).to(torch.float32)
+                return torch.take(source_flat, local(t) * stride + spatial).to(torch.float32)
             r0, r1, alpha = native_indices
-            f0 = torch.take(source_flat, r0[t] * stride + spatial).to(torch.float32)
-            f1 = torch.take(source_flat, r1[t] * stride + spatial).to(torch.float32)
+            f0 = torch.take(source_flat, local(r0[t]) * stride + spatial).to(torch.float32)
+            f1 = torch.take(source_flat, local(r1[t]) * stride + spatial).to(torch.float32)
             return (f0 + alpha[t] * (f1 - f0)).round_().clamp_(0.0, 255.0)
 
         for row0 in range(0, rows, row_block):
@@ -3768,7 +3800,8 @@ class _GpuWorkerRenderEngine:
             for ti, tw in axis_taps[0]:
                 for yi, yw in axis_taps[1]:
                     for xi, xw in axis_taps[2]:
-                        values.add_(gather(ti, yi, xi) * (tw * yw * xw))
+                        relevant = None if partial is None else valid & (tw != 0) & (yw != 0) & (xw != 0)
+                        values.add_(gather(ti, yi, xi, relevant) * (tw * yw * xw))
             out[row0:row1] = values.masked_fill_(~valid, 0.0).round_().clamp_(0.0, 255.0)
         return out
 

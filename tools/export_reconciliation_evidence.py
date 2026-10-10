@@ -18,7 +18,7 @@ def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--run_manifest", type=Path, help="Completed source run's manifest.json")
-    source.add_argument("--sam_bundle", type=Path, help="Indexed SAM proposal bundle directory to copy without inference")
+    source.add_argument("--sam_bundle", type=Path, help="Indexed SAM proposal directory or archive reference to copy without inference")
     parser.add_argument("--compact_manifest", type=Path, help="Matching low-quality NRRD layer manifest (required with --run_manifest)")
     parser.add_argument("--output", type=Path, required=True, help="Fresh portable-package directory")
     parser.add_argument("--memory_mib", type=int, default=256, help="Crop/plane workspace budget")

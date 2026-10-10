@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -51,8 +52,15 @@ class RunTransportTests(unittest.TestCase):
             self.write(name, data)
         archive = self.root / "run.zip"
         packed = transport.pack_run(self.run, archive, scope="all")
-        with zipfile.ZipFile(archive) as stored:
-            self.assertTrue(all(info.extract_version >= 45 for info in stored.infolist() if info.filename.startswith("DATA/")))
+        with zipfile.ZipFile(archive) as stored, archive.open("rb") as raw:
+            for info in stored.infolist():
+                if info.filename.startswith("DATA/"):
+                    raw.seek(info.header_offset + 26)
+                    name_bytes, extra_bytes = struct.unpack("<HH", raw.read(4))
+                    raw.seek(name_bytes, os.SEEK_CUR)
+                    # Python 3.10 records small forced-ZIP64 entries as version 2.0.
+                    self.assertIn(struct.pack("<HHQQ", 1, 16, info.file_size, info.compress_size),
+                                  raw.read(extra_bytes))
         self.assertEqual(packed["source_run"], {"status": "failed", "origin": "source_manifest", "partial": True})
         self.assertEqual(packed["source_changes"], [])
         self.assertIn("unknown", packed["source_inventory_completeness"])
@@ -67,6 +75,7 @@ class RunTransportTests(unittest.TestCase):
 
     def test_default_diagnostics_includes_evidence_and_lists_external_nrrds(self):
         self.write("telemetry/telemetry-1.jsonl", b"{}\n")
+        self.write("sam-artifacts.tar", b"live scientific container")
         self.write("sam_extrapolation/a/selection.json", b"{}")
         self.write("sam_extrapolation/a/evidence/masks.bin", b"mask")
         self.write("sam_extrapolation/a/evidence/index.json", b"{}")
@@ -81,13 +90,15 @@ class RunTransportTests(unittest.TestCase):
         packed = transport.pack_run(self.run, self.root / "diagnostics.zip", run_status="in_progress")
         self.assertEqual(packed["scope"], "diagnostics")
         self.assertEqual({row["path"] for row in packed["files"]},
-                         {"manifest.json", "telemetry/telemetry-1.jsonl", "sam_extrapolation/a/selection.json",
+                         {"manifest.json", "sam-artifacts.tar", "telemetry/telemetry-1.jsonl", "sam_extrapolation/a/selection.json",
                           "sam_extrapolation/a/evidence/masks.bin", "sam_extrapolation/a/evidence/index.json",
                           "sam_extrapolation/a/evidence/manifest.json", "sam_interpolation/a/component.cvol/chunks.bin",
                           "sam_interpolation/a/component.cvol/index.bin", "sam_interpolation/a/component.cvol/manifest.json",
                           "reconciliation_evidence/a/index.bin", "reconciliation_evidence/a/payloads.zlib",
                           "reconciliation_evidence/a/metadata.json"})
         self.assertEqual(len(packed["omitted"]), 1)
+        self.assertEqual(next(row["category"] for row in packed["files"]
+                              if row["path"] == "sam-artifacts.tar"), "scientific_evidence")
         self.assertEqual(packed["omitted"][0]["kind"], "external_nrrd")
         self.assertEqual(packed["external_outputs"][0]["path"], "nrrd/mask.nrrd")
         self.assertEqual(packed["external_outputs"][0]["sha256"], hashlib.sha256(b"mask").hexdigest())

@@ -94,6 +94,20 @@ def test_full_crop_foreground_uses_padded_boundary_distance(threshold, retained)
     assert np.array_equal(filtered, raw if retained else np.zeros_like(raw))
 
 
+def test_boolean_validation_fast_path_matches_binary_numeric_inputs_and_rejects_other_values():
+    raw=_body()[::2,::2]
+    expected,diagnostic=filter_sam_components(raw,2.)
+    for dtype in (np.uint8,np.int32,np.float32):
+        actual,details=filter_sam_components(raw.astype(dtype),2.)
+        assert np.array_equal(actual,expected) and details==diagnostic
+        invalid=raw.astype(dtype)
+        invalid[0,0]=2
+        with pytest.raises(ValueError,match='binary two-dimensional'):
+            filter_sam_components(invalid,2.)
+    with pytest.raises(ValueError,match='binary two-dimensional'):
+        filter_sam_components(raw[None],2.)
+
+
 def test_attached_thin_spurs_and_diagonal_pixels_are_not_eroded_or_reclassified():
     raw = _body()
     raw[27, 35:61] = True  # Thin but attached to a substantial body.

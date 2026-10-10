@@ -21,6 +21,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from XTA.sam_evidence import SamEvidenceBundle
+from XTA.artifact_archive import read_artifact
 from XTA.sam_policy import resolve_sam_bridge_policy, select_sam_proposals
 
 VARIANTS = ('legacy', 'branches', 'paired_context', 'anchor_context', 'anchor_context_censored',
@@ -160,7 +161,7 @@ def run_replays(evidence, output, *, original_selection=None, variants=VARIANTS[
         'tiled' if any(run.get('generation_mode') == 'tiled' for run in bundle.runs.values()) else 'whole')
     original = None
     if original_selection is not None:
-        original = json.loads(Path(original_selection).read_text(encoding='utf-8'))
+        original = json.loads(read_artifact(original_selection))
         if original.get('schema') != 'xta.sam_selection/1' or original.get('evidence_fingerprint') != bundle.evidence_fingerprint:
             raise ValueError('Original selection receipt does not belong to the evidence')
     cap = int(max_group_mib)*1024**2

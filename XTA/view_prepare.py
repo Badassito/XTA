@@ -23,6 +23,7 @@ from typing import Callable, Mapping
 import numpy as np
 
 from .config import GIB
+from .artifact_archive import artifact_size, iter_artifacts, physical_path, read_artifact, split_reference
 from .geometry import ViewInfo, is_tilted_view, physical_view_name
 from .interpolation import NrrdLayerRef, PreparedViewResult, _DirectUnionBackingLease
 from .runtime import (_interpolation_array_backing_path, close_memmap_array_without_flush,
@@ -137,9 +138,10 @@ class ComponentProjectionSubmitter:
 
     def __call__(self, component_path: Path, **kwargs):
         component_path = Path(component_path)
-        metadata = json.loads((component_path / 'meta.json').read_text(encoding='utf-8'))
+        metadata = json.loads(read_artifact(component_path / 'meta.json'))
         shape = tuple(int(v) for v in metadata['shape'])
-        source_bytes = sum(path.stat().st_size for path in component_path.iterdir() if path.is_file())
+        source_bytes = sum(artifact_size(path) for path in iter_artifacts(component_path, recursive=False)
+                           if split_reference(path) is not None or path.is_file())
         view = kwargs['view']
         source_shape = tuple(int(v) for v in self.source_shape)
         source_volume_bytes = math.prod(source_shape)
@@ -192,11 +194,12 @@ class SamLayerProjectionSubmitter:
             raise ValueError(f'Unknown SAM publication kind: {layer_kind}')
         entry = copy.deepcopy(dict(entry))
         source = Path(str(entry['path']))
-        metadata = json.loads((source / 'meta.json').read_text(encoding='utf-8'))
+        metadata = json.loads(read_artifact(source / 'meta.json'))
         native_shape = tuple(int(value) for value in metadata['shape'])
         if len(native_shape) != 3 or min(native_shape) < 1:
             raise ValueError('SAM publication requires a positive TYX store')
-        source_bytes = sum(path.stat().st_size for path in source.iterdir() if path.is_file())
+        source_bytes = sum(artifact_size(path) for path in iter_artifacts(source, recursive=False)
+                           if split_reference(path) is not None or path.is_file())
         view = kwargs['view']
         target_shape = tuple(int(value) for value in self.source_shape)
         target_bytes = math.prod(target_shape)
@@ -364,12 +367,15 @@ class AdmittedViewPrepare:
                 yield
 
     def __call__(self) -> PreparedViewResult:
+        self.check_cancelled()
+        if self.backing_lease is not None:
+            from .sam_parent_staging import fence_dense_proof_reset
+            # A new/rebound canvas remains a real dense RAM promise. Fund the
+            # change while inputs still have their residency proof, before
+            # base credit or a GPU lease can be held waiting for startup.
+            fence_dense_proof_reset(self)
         with self._reservation():
             self.check_cancelled()
-            if self.backing_lease is not None:
-                # Preparation can replace a disk input with a newly allocated
-                # canvas. Keep its full dense promise until actual retirement.
-                self.backing_lease.ram_backed = None
             local_union_mm = self.union_mm
             try:
                 if local_union_mm is None:
@@ -510,6 +516,11 @@ class ViewPrepareLeaseState:
     def disk_backed_logical_bytes(self) -> int:
         return sum(int(lease.nbytes) for lease in tuple(self.leases.values()) if lease.ram_backed is False)
 
+    def ram_residency_promises(self):
+        # Snapshot membership; leases contain only scalar/frozen metadata. The
+        # probe revalidates their live basis after any reentrant retirement.
+        return tuple(self.leases.values())
+
     def retire_dense_for_publication(self, prepared, *, enabled: bool, tiled: bool,
                                     keep_temp: bool, retired_callback,
                                     close_dense=close_memmap_array_without_flush) -> bool:
@@ -538,7 +549,7 @@ class ViewPrepareLeaseState:
             paths = getattr(future, '_xta_dense_independent_publication_paths', ())
             if not paths:
                 return False
-            sources.extend(Path(path).resolve() for path in paths)
+            sources.extend(physical_path(path).resolve() for path in paths)
         arrays = []
         for volume in (prepared.native_support_mm, prepared.final_view_volume_mm):
             if volume is not None and all(volume is not prior for prior in arrays):
@@ -659,6 +670,7 @@ class ViewPrepareLeaseState:
         if not 0 < released < int(lease.nbytes):
             raise RuntimeError(f'direct-union input {key} returned invalid dense credit {released}')
         self.retired_inputs.add(identity)
+        lease.memfd_owner_proofs = tuple(proof for proof in lease.memfd_owner_proofs if proof[0] != token)
         lease.nbytes -= released
         self.postprocess_bytes[key] = int(lease.nbytes)
         return True

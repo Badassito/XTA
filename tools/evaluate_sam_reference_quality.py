@@ -21,6 +21,7 @@ if str(REPOSITORY) not in sys.path:
     sys.path.insert(0, str(REPOSITORY))
 
 from XTA.sam_evidence import SamEvidenceBundle, iter_selected_planes, _plain
+from XTA.artifact_archive import read_artifact
 from XTA.sam_filtering import build_mask_filter
 from XTA.sam_mask_reader import effective_raw_mask, effective_candidate_mask
 from tools.analyze_sam_crop_strategies import load_truth
@@ -333,7 +334,7 @@ def main():
         name,path = value.split("=",1)
         if name in selections:
             raise ValueError("Duplicate named selection")
-        selections[name] = json.loads(Path(path).read_text("utf-8"))
+        selections[name] = json.loads(read_artifact(path))
     labels = {int(value.split("=",1)[0]):Path(value.split("=",1)[1]) for value in args.manual_label}
     rois = json.loads(args.rois.read_text("utf-8")) if args.rois else []
     evaluate_bundle(args.evidence,args.sdf_reference,selections,args.output,labels=labels,rois=rois)

@@ -1,4 +1,4 @@
-"""Bounded crops of the exact canonical OpenCV TTA intensity raster.
+"""Bounded native shell crops and canonical OpenCV TTA image remapping.
 
 Rebasing a float32 affine to a crop origin changes the inverse/interpolation
 phase at awkward scales. Preserve GLOBAL output coordinates and OpenCV's
@@ -18,15 +18,219 @@ import numpy as np
 CANONICAL_CROP_RENDER_CONTRACT = 'xta.sam_global_canonical_warp_crop/1'
 IMPLEMENTATION_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 CANONICAL_PHASE_SELF_CHECK_CONTRACT = 'xta.sam_canonical_phase_self_check/1'
+NATIVE_SHELL_CROP_CONTRACT = 'xta.sam_native_shell_demand_crop/1'
 _PHASE_SELF_CHECK_LOCK = threading.Lock()
 _PHASE_SELF_CHECKS = {}
+
+
+def native_shell_workspace_bytes(view, bbox_yx=None):
+    """Bound one native byte plane and the shell sampler's 32-row temporaries."""
+    height, width = int(view.src_h), int(view.src_w)
+    if str(view.family) not in {'radial', 'spherical'} or min(height, width) <= 0:
+        raise ValueError('Native shell workspace requires positive Radial/Spherical geometry')
+    if bbox_yx is not None:
+        import operator
+        try:
+            bbox_yx = tuple(bbox_yx)
+            y0, x0, y1, x1 = (operator.index(value) for value in bbox_yx)
+        except (TypeError, ValueError) as error:
+            raise ValueError('Native shell crop requires four integer bounds') from error
+        if (any(isinstance(value, (bool, np.bool_)) for value in bbox_yx)
+                or not 0 <= y0 < y1 <= height or not 0 <= x0 < x1 <= width):
+            raise ValueError('Native shell crop is outside its physical view')
+        height, width = y1-y0, x1-x0
+    return height*width+1024*min(32, height)*width
+
+
+def native_shell_crop_bbox(view, affine, output_bbox_yx):
+    from ._deps import cv2
+    from .sam_transverse_cache_rendering import native_crop_bbox
+    matrix = np.asarray(affine, dtype=np.float32).reshape(2, 3).astype(np.float64)
+    if not np.isfinite(matrix).all():
+        raise ValueError('Native shell crop affine must be finite')
+    return native_crop_bbox(output_bbox_yx, cv2.invertAffineTransform(matrix),
+        (int(view.src_h), int(view.src_w)))
+
+
+def _render_native_shell_crop(source, view, index, bbox):
+    from .runtime import runtime_telemetry
+    telemetry = runtime_telemetry()
+    started, cpu_started = time.perf_counter(), time.thread_time()
+    try:
+        if bbox is None:
+            plane = np.zeros((1, 1), np.uint8)
+        else:
+            if str(view.family) == 'radial':
+                from .cylindrical_geometry import render_shell_frame
+            else:
+                from .spherical_geometry import render_shell_frame
+            plane = render_shell_frame(source, view, int(index), bbox_yx=bbox)
+        telemetry.add('sam.cpu_images.native_sampled_pixels', 0 if bbox is None else int(plane.size))
+        telemetry.add('sam.cpu_images.native_full_frame_pixels', int(view.src_h)*int(view.src_w))
+        return plane
+    finally:
+        telemetry.add('sam.cpu_images.native_sampling_host_seconds', time.perf_counter()-started)
+        telemetry.add('sam.cpu_images.native_sampling_thread_cpu_seconds', time.thread_time()-cpu_started)
+
+
+def prepare_native_shell_crop(source, view, index, *, affine, output_bbox_yx,
+                              max_workspace_bytes):
+    from . import geometry
+    geometry.require_forward_sampling('cpu', geometry.DataRole.INTENSITY)
+    if (str(view.family) not in {'radial', 'spherical'}
+            or not isinstance(source, np.ndarray) or source.ndim != 3
+            or tuple(source.shape) != (int(view.full_t), int(view.full_h), int(view.full_w))
+            or not 0 <= int(index) < int(view.num_slices)):
+        raise ValueError('Native shell crop requires its physical source and frame')
+    bbox = native_shell_crop_bbox(view, affine, output_bbox_yx)
+    needed = native_shell_workspace_bytes(view, bbox) if bbox is not None else 1
+    if needed > int(max_workspace_bytes):
+        raise RuntimeError('SAM native shell crop exceeds admitted rendering workspace')
+    return _render_native_shell_crop(source, view, index, bbox), ((bbox[1], bbox[0]) if bbox is not None else (0, 0))
+
+
+def iter_prefetched_native_planes(source, view, frames, *, max_workspace_bytes,
+                                  min_remap_workspace_bytes, max_workers=8, check_cancel=None,
+                                  native_crop_bounds=None):
+    """Yield ordered native planes and their owner's remaining remap allowance.
+
+    The caller owns one yielded plane; close this iterator before releasing its
+    scratch credit. Workers only read a ready source and never own live profiles.
+    """
+    from . import geometry
+    from .media import volume_readiness
+    from .runtime import choose_slice_parallel_workers, parallel_map_in_order
+    from .sam_gpu_rendering import clear_image_error_frames
+    from .workspace import _cpu_count
+    if (not isinstance(source, np.ndarray) or source.ndim != 3 or source.dtype != np.uint8
+            or tuple(source.shape) != (int(view.full_t), int(view.full_h), int(view.full_w))):
+        raise ValueError('Native prefetch requires the ready materialized uint8 source geometry')
+    readiness = volume_readiness(source)
+    if readiness is not None and (not readiness._all_event.is_set() or readiness._exception is not None):
+        raise ValueError('Native prefetch cannot wait for or materialize its source')
+    frames = tuple(frames)
+    if any(isinstance(frame, (bool, np.bool_)) or not isinstance(frame, (int, np.integer))
+           or not 0 <= int(frame) < int(view.num_slices) for frame in frames):
+        raise ValueError('Native prefetch frame is outside its physical view')
+    crops = (None if native_crop_bounds is None else
+        {int(frame): None if native_crop_bounds[frame] is None else tuple(native_crop_bounds[frame])
+         for frame in frames})
+    if crops is None:
+        native_bytes = int(view.src_h)*int(view.src_w)
+        job_bytes = native_shell_workspace_bytes(view)
+    else:
+        job_bytes = max((native_shell_workspace_bytes(view, box) if box is not None else 1
+            for box in crops.values()), default=1)
+        native_bytes = max(((box[2]-box[0])*(box[3]-box[1]) if box is not None else 1
+            for box in crops.values()), default=1)
+    budget, minimum = int(max_workspace_bytes), int(min_remap_workspace_bytes)
+    # One old yielded plane can survive normal next()/tuple assignment briefly.
+    slots = (budget-minimum-native_bytes)//job_bytes
+    if minimum <= native_bytes or slots < 1:
+        raise ValueError('Native prefetch scratch cannot fit a job, transfer plane and remap lane')
+    if not frames:
+        return
+    workers = choose_slice_parallel_workers(min(8, int(max_workers), max(1, int(_cpu_count())), slots), len(frames))
+    remap_bytes = budget-workers*job_bytes-native_bytes
+    from .runtime import runtime_telemetry
+    runtime_telemetry().gauge('sam.cpu_images.last_native_prefetch', dict(
+        workers=workers, frames=len(frames), native_plane_bytes=native_bytes,
+        native_job_bound_bytes=job_bytes, remap_workspace_bytes=remap_bytes,
+        admitted_workspace_bytes=budget, cropped=crops is not None))
+
+    def render(frame):
+        plane = None
+        try:
+            if check_cancel is not None:
+                check_cancel()
+            geometry.require_forward_sampling('cpu', geometry.DataRole.INTENSITY)
+            if crops is None:
+                plane = geometry.get_view_frame_by_index(source, view, int(frame))
+                expected_shape = (int(view.src_h), int(view.src_w))
+            else:
+                bbox = crops[int(frame)]
+                plane = _render_native_shell_crop(source, view, frame, bbox)
+                expected_shape = (bbox[2]-bbox[0], bbox[3]-bbox[1]) if bbox is not None else (1, 1)
+            if check_cancel is not None:
+                check_cancel()
+            if (not isinstance(plane, np.ndarray) or plane.dtype != np.uint8
+                    or plane.shape != expected_shape or not plane.flags.c_contiguous):
+                raise ValueError('Native prefetch sampler returned an incompatible plane')
+            return plane
+        except BaseException as error:
+            plane = None
+            clear_image_error_frames(error)
+            raise
+
+    pending = parallel_map_in_order(render, frames, max_workers=workers, max_pending=workers)
+    plane = None
+    try:
+        for frame, plane in zip(frames, pending):
+            if check_cancel is not None:
+                check_cancel()
+            yield int(frame), plane, remap_bytes
+            plane = None
+    except BaseException as error:
+        plane = None
+        clear_image_error_frames(error)
+        raise
+    finally:
+        plane = None
+        pending.close()
+
+
+def cartesian_source_view(source, view):
+    """Lend an exact materialized Cartesian axis recipe without copying pixels."""
+    from .geometry import physical_view_name
+    if (not isinstance(source, np.ndarray) or source.ndim != 3 or source.dtype != np.uint8
+            or str(view.family) != 'orthogonal'):
+        return None
+    axes = {'transverse': (0, 1, 2), 'sagittal': (1, 0, 2),
+            'coronal': (2, 0, 1)}.get(physical_view_name(view))
+    if axes is None:
+        return None
+    oriented = source.transpose(axes)
+    if tuple(oriented.shape) != (int(view.num_slices), int(view.src_h), int(view.src_w)):
+        return None
+    from .media import volume_readiness
+    readiness = volume_readiness(source)
+    if readiness is not None and not readiness._all_event.is_set():
+        return None
+    return oriented
+
+
+def prepare_cartesian_native_crop(source, view, index, *, affine, output_bbox_yx):
+    """Gather only the native taps needed by the unchanged global affine remap."""
+    from ._deps import cv2
+    from .sam_transverse_cache_rendering import native_crop_bbox
+    from .workspace import _env_int
+    oriented = cartesian_source_view(source, view)
+    if oriented is None:
+        raise ValueError('SAM Cartesian crop requires a ready materialized uint8 axis recipe')
+    if not 0 <= int(index) < int(oriented.shape[0]):
+        raise IndexError('SAM Cartesian crop frame is outside its physical view')
+    box = tuple(map(int, output_bbox_yx))
+    if len(box) != 4 or min(box[:2]) < 0 or box[0] >= box[2] or box[1] >= box[3]:
+        raise ValueError('SAM Cartesian preparation crop must be positive and nonnegative')
+    matrix = np.asarray(affine, dtype=np.float32).reshape(2, 3).astype(np.float64)
+    if not np.isfinite(matrix).all():
+        raise ValueError('SAM Cartesian crop affine must be finite')
+    inverse = cv2.invertAffineTransform(matrix)
+    roi = native_crop_bbox(box, inverse, oriented.shape[1:])
+    if roi is None:
+        # No source tap is reachable; a zero plane also preserves border output.
+        return np.zeros((1, 1), np.uint8), (0, 0)
+    y0, x0, y1, x1 = roi
+    if (y1-y0)*(x1-x0) >= max(1, _env_int('YOLO_TTA_SAM_RENDER_MAX_BYTES', 256*1024**2)):
+        raise RuntimeError('SAM Cartesian native crop exceeds the bounded rendering memory budget')
+    return np.ascontiguousarray(oriented[int(index), y0:y1, x0:x1]), (x0, y0)
 
 
 def render_canonical_crop(source, view, index, *, affine, inverse, output_origin_yx,
                           output_height, output_width, view_frames=None,
                           native_origin_xy=(0, 0), output_canvas_width=None,
-                          native_frame_cache=None):
-    """Match a full canonical render slice without rendering that full canvas."""
+                          native_frame_cache=None, max_workspace_bytes=None):
+    """Apply the canonical global affine phase to the requested rectangle."""
     from . import geometry
     from .workspace import _env_int
     geometry.require_forward_sampling('cpu', geometry.DataRole.INTENSITY)
@@ -35,7 +239,8 @@ def render_canonical_crop(source, view, index, *, affine, inverse, output_origin
         # Established samplers may need one native plane before resizing. Refuse
         # an oversized plane before its allocation, rather than building a full
         # view stack or growing an unbounded per-endpoint native cache.
-        budget = max(1, _env_int('YOLO_TTA_SAM_RENDER_MAX_BYTES', 256*1024**2))
+        budget = max(1, int(max_workspace_bytes) if max_workspace_bytes is not None else
+                     _env_int('YOLO_TTA_SAM_RENDER_MAX_BYTES', 256*1024**2))
         native_bytes = int(view.src_h)*int(view.src_w)
         if native_bytes+int(output_height)*int(output_width)+64*(int(output_width)+16) > budget:
             raise RuntimeError('SAM native plane and canonical crop exceed the bounded rendering memory budget')
@@ -59,9 +264,16 @@ def render_canonical_crop(source, view, index, *, affine, inverse, output_origin
         # warpAffine converts its input float32 coefficients to double before
         # inversion. Inverting in float32 produces another noncanonical phase.
         matrix = cv2.invertAffineTransform(np.asarray(affine, dtype=np.float32).astype(np.float64))
-    return _remap_global_affine_crop(native, matrix, output_origin_yx=output_origin_yx,
-        output_height=output_height, output_width=output_width, native_origin_xy=native_origin_xy,
-        output_canvas_width=output_canvas_width, sampling_stats=native_frame_cache)
+    started = time.perf_counter()
+    try:
+        return _remap_global_affine_crop(native, matrix, output_origin_yx=output_origin_yx,
+            output_height=output_height, output_width=output_width, native_origin_xy=native_origin_xy,
+            output_canvas_width=output_canvas_width, sampling_stats=native_frame_cache,
+            max_workspace_bytes=max_workspace_bytes)
+    finally:
+        if str(view.family) in {'radial', 'spherical'}:
+            from .runtime import runtime_telemetry
+            runtime_telemetry().add('sam.cpu_images.canonical_remap_host_seconds', time.perf_counter()-started)
 
 
 def canonical_sampling_backend():
@@ -244,5 +456,8 @@ def _remap_global_affine_crop(native, inverse_double, *, output_origin_yx,
 
 
 __all__ = ['CANONICAL_CROP_RENDER_CONTRACT', 'IMPLEMENTATION_SHA256', 'render_canonical_crop',
+           'NATIVE_SHELL_CROP_CONTRACT', 'native_shell_crop_bbox', 'prepare_native_shell_crop',
+           'native_shell_workspace_bytes', 'iter_prefetched_native_planes',
+           'cartesian_source_view', 'prepare_cartesian_native_crop',
            'canonical_sampling_backend', 'CANONICAL_PHASE_SELF_CHECK_CONTRACT',
            'ensure_canonical_phase_supported']

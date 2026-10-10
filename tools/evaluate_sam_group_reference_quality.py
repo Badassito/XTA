@@ -19,6 +19,7 @@ if str(REPOSITORY) not in sys.path:
     sys.path.insert(0,str(REPOSITORY))
 
 from XTA.sam_evidence import SamEvidenceBundle
+from XTA.artifact_archive import read_artifact
 from XTA.sam_filtering import build_mask_filter
 from XTA.sam_mask_reader import effective_raw_mask, effective_candidate_mask
 from tools.evaluate_sam_reference_quality import sha, binary_metrics, sum_metrics, edge_path_metrics
@@ -114,7 +115,7 @@ def main():
     parser.add_argument("--selection",action="append",default=[],help="Named receipt NAME=PATH")
     parser.add_argument("--output",type=Path,required=True)
     args = parser.parse_args()
-    selections = {value.split("=",1)[0]:json.loads(Path(value.split("=",1)[1]).read_text("utf-8")) for value in args.selection}
+    selections = {value.split("=",1)[0]:json.loads(read_artifact(value.split("=",1)[1])) for value in args.selection}
     evaluate(args.evidence,args.references,selections,args.output)
 
 

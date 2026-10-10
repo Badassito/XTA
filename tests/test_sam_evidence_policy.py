@@ -14,6 +14,22 @@ from XTA.sam_filtering import effective_candidate_mask, effective_raw_mask
 from XTA.reconciliation_policy import validate_policy
 
 
+def test_boolean_evidence_validation_keeps_numeric_boundary_checks_and_crop_shape():
+    from XTA.sam_evidence import _mask
+    raw=np.array([[False,True],[True,False]],bool)[:,::-1]
+    assert _mask(raw,(2,2)) is raw
+    for dtype in (np.uint8,np.int32,np.float32):
+        assert np.array_equal(_mask(raw.astype(dtype),(2,2)),raw)
+        invalid=raw.astype(dtype)
+        invalid[0,0]=2
+        with pytest.raises(ValueError,match='must be binary'):
+            _mask(invalid,(2,2))
+    with pytest.raises(ValueError,match='nonempty two-dimensional'):
+        _mask(raw[None])
+    with pytest.raises(ValueError,match='fixed context crop'):
+        _mask(raw,(2,3))
+
+
 def fixture_group(group_id="family", x=5, *, min_radius=0., missing_terminal=False):
     shape = (12, 16)
     reference = np.zeros(shape, bool)

@@ -90,6 +90,7 @@ from .runtime import (
     _attach_memfd_transfers_to_task,
     _filesystem_free_bytes,
     _memfd_owner_key_from_array,
+    capture_memfd_owner_proofs,
     _mount_fstype_for_path,
     _sanitize_filesystem_token,
     _sched_setaffinity_all_threads,
@@ -297,6 +298,9 @@ from .backprojection import (
     _configure_main_process_gpu_stage_workers,
     _main_process_gpu_stage_begin_inference,
     _main_process_gpu_stage_can_dispatch_inference,
+    _main_process_gpu_stage_can_dispatch_auxiliary,
+    _main_process_gpu_stage_epoch,
+    _mark_main_process_gpu_inference_assets_retired,
     _main_process_gpu_stage_finish_inference,
     _reset_main_process_gpu_stage_coordinator,
     _set_main_process_gpu_inference_priority_active,
@@ -560,7 +564,7 @@ def _execution_runtime_provenance() -> Dict[str, object]:
     # without importing optional model runtimes merely to fingerprint them.
     for name in ('assembly', 'view_prepare', 'projection_queue', 'sam_integration',
                  'sam_interpolation', 'sam_extrapolation', 'sam_extrapolation_policy',
-                 'sam_tracker_runtime', 'sam_resources', 'sam_image_prefetch', 'sam_crop_retry',
+                 'sam_tracker_runtime', 'sam_device_pool', 'sam_resources', 'sam_image_prefetch', 'sam_crop_retry',
                  'sam_parent_staging',
                  'sam_policy', 'sam_mask_reader',
                  'sam_branch_selection', 'sam_evidence', 'sam_canvas_rendering'):
@@ -2377,14 +2381,21 @@ def _main_impl() -> None:
         view_prediction_labels[key] = pretty_view_name(_view_for_stats)
     interpolation_stats: List[Dict[str, object]] = []
     sam_context = None
+    sam_parent_staging = None
+
+    def _sam_startup_checkpoint_promises():
+        return 0 if sam_parent_staging is None else sam_parent_staging.checkpoint_copy_promises()
+
     if interpolation_settings.sam_enabled:
         from .sam_integration import SamInterpolationContext
+        from .artifact_archive import reference as artifact_reference
         source_stat = input_path.stat()
         sam_context = SamInterpolationContext(
             model_path=str(interpolation_settings.sam_model),
             device_ids=interpolation_settings.sam_devices, temp_dir=temp_dir,
-            evidence_root=out_dir / 'sam_interpolation', source_volume=volume_rgb,
-            extrapolation_evidence_root=out_dir / 'sam_extrapolation',
+            evidence_root=Path(artifact_reference(out_dir / 'sam-artifacts.tar', 'sam_interpolation')),
+            source_volume=volume_rgb,
+            extrapolation_evidence_root=Path(artifact_reference(out_dir / 'sam-artifacts.tar', 'sam_extrapolation')),
             source_identity=f'{input_path}:{source_stat.st_size}:{source_stat.st_mtime_ns}',
             policy=reconciliation_policy,
             bundle_identity=str(sam_bundle.checkpoint_identity_sha256),
@@ -2395,6 +2406,8 @@ def _main_impl() -> None:
             crop_mode=interpolation_settings.sam_crop_mode,
             delayed_native_expansion=delayed_native_expansion_at_launch,
             adaptive_crop=interpolation_settings.sam_adaptive_crop,
+            progressive_startup=True,
+            startup_pending_host_bytes=_sam_startup_checkpoint_promises,
             interpolation_policy_enabled=(interpolation_settings.enabled and
                                           interpolation_settings.backend == 'sam'),
             source_resize_semantics=('native' if not cube_resize_will_apply else
@@ -2562,6 +2575,8 @@ def _main_impl() -> None:
         _parent_transient_bytes,
         'Parent view postprocess admission',
     )
+    if sam_context is not None:
+        sam_context.configure_startup_parent_pool(parent_transient_admission)
     if direct_union_sparse_retirement_active:
         print(
             'Split direct-union leases active: '
@@ -2861,7 +2876,6 @@ def _main_impl() -> None:
     prediction_accumulation_futures: Dict[Future, Dict[str, object]] = {}
 
     view_processing_futures: Dict[Future, Tuple[str, str]] = {}
-    sam_parent_staging = None
     sam_checkpoint_executor = None
     sam_cpu_prepare_executor = None
     sam_cpu_futures = {'source': None, 'runtime': None, 'runtime_needed': False}
@@ -2890,23 +2904,29 @@ def _main_impl() -> None:
         _run_resources().track_closeable(sam_parent_staging)
 
     def _sam_parents_ready():
-        if not sam_context.detector_retirement_ready:
-            return False
+        check = getattr(sam_context, 'check_startup', None)
+        if callable(check):
+            check()
         future = sam_cpu_futures['runtime']
         if future is None:
-            return not sam_cpu_futures['runtime_needed']
+            return not sam_cpu_futures['runtime_needed'] and sam_context.detector_retirement_ready
         if not future.done():
             return False
         future.result()
-        return True
+        return bool(getattr(sam_context, 'runtime_ready', sam_context.detector_retirement_ready))
 
     def _maybe_prepare_sam_runtime():
+        if sam_context is None or getattr(sam_context, '_closed', False):
+            return
+        check = getattr(sam_context, 'check_startup', None)
+        if callable(check):
+            check()
         future = sam_cpu_futures['runtime']
         if future is not None:
             if future.done():
                 future.result()
         elif (sam_cpu_prepare_executor is not None and sam_cpu_futures['runtime_needed']
-                and sam_context.detector_retirement_ready):
+                and getattr(sam_context, 'runtime_start_ready', sam_context.detector_retirement_ready)):
             # Boot before deferred parents consume the pool. The same startup
             # guards still account for checkpoint codecs and other live work.
             sam_cpu_futures['runtime'] = sam_cpu_prepare_executor.submit(
@@ -3142,6 +3162,7 @@ def _main_impl() -> None:
                 ram_backed=classify_dense_ram_backing((union_mm, conf_mm),
                     future_ram_bytes=max(0, int(backing_bytes)-int(union_mm.nbytes)
                         -(0 if conf_mm is None else int(conf_mm.nbytes)))),
+                memfd_owner_proofs=capture_memfd_owner_proofs({'mask':union_mm, 'confidence':conf_mm}),
             )
             direct_union_inference_views.add(key)
             direct_union_inference_bytes[key] = int(backing_bytes)
@@ -3307,8 +3328,6 @@ def _main_impl() -> None:
                 sam_parent_staging.defer(task, required_bytes)
                 deferred_to_sam = True
             else:
-                if task.backing_lease is not None:
-                    task.backing_lease.ram_backed = None
                 fut = parent_postprocess_executor.submit(task)
                 task.track_cancellation(fut)
         except BaseException:
@@ -4565,10 +4584,13 @@ def _main_impl() -> None:
 
     background_drain_budget = BackgroundDrainBudget(
         lambda: scheduler.service_pending_compute_credits(),
+        stages=9,
     )
 
     @scheduler_operation('background_drain')
     def _drain_completed_background_futures() -> None:
+        background_drain_budget.begin(enabled=bool(
+            inference_worker_process_active and scheduler.process_inference_outstanding()))
         _maybe_prepare_sam_runtime()
         _maybe_prepare_sam_cpu_source()
         direct_union_capacity_released = False
@@ -4588,13 +4610,12 @@ def _main_impl() -> None:
                 direct_union_capacity_released = True
                 runtime_telemetry().add('inference.dense_confidence_retired_bytes', nbytes)
         if sam_parent_staging is not None:
-            resumed, released = sam_parent_staging.pump()
+            resumed, released = sam_parent_staging.pump(
+                budget=background_drain_budget, resumed_futures=view_processing_futures)
             view_processing_futures.update(resumed)
             direct_union_capacity_released |= released
-        background_drain_budget.begin(enabled=bool(
-            inference_worker_process_active and scheduler.process_inference_outstanding()))
         _drain_parent_mask_ready_events()
-        for fut in background_drain_budget.items(0, view_processing_futures):
+        for fut in background_drain_budget.items(1, view_processing_futures):
             if not fut.done():
                 continue
             result = fut.result()
@@ -4679,9 +4700,9 @@ def _main_impl() -> None:
             _maybe_submit_tile_consolidations_for_parent(
                 str(result.model_name), str(result.view_name),
             )
-            background_drain_budget.completed(0)
+            background_drain_budget.completed(1)
 
-        for fut in background_drain_budget.items(1, tile_cleanup_futures):
+        for fut in background_drain_budget.items(2, tile_cleanup_futures):
             if not fut.done():
                 continue
             ready_key = tile_cleanup_futures.pop(fut)
@@ -4695,7 +4716,7 @@ def _main_impl() -> None:
                     str(ready_key[0]), str(ready_key[1]),
                     str(ready_key[2]), str(ready_key[3]),
                 )
-                background_drain_budget.completed(1)
+                background_drain_budget.completed(2)
                 continue
             if isinstance(result, DeferredTilePostprocessResult):
                 # v16.4.3: CTILE publication is the array-backed-result retirement boundary.
@@ -4706,11 +4727,11 @@ def _main_impl() -> None:
                     reason='immediate CTILE retirement after tile cleanup',
                 )
             _submit_tile_parent_gate(result)
-            background_drain_budget.completed(1)
+            background_drain_budget.completed(2)
 
         _flush_ready_postprocessed_tiles()
 
-        for fut in background_drain_budget.items(2, tile_parent_gate_futures):
+        for fut in background_drain_budget.items(3, tile_parent_gate_futures):
             if not fut.done():
                 continue
             model_name, view_name, config_id, tile_id = tile_parent_gate_futures.pop(fut)
@@ -4725,11 +4746,11 @@ def _main_impl() -> None:
                 )
             else:
                 _submit_tile_bridge_gate(parent_gate_result.residual_result)
-            background_drain_budget.completed(2)
+            background_drain_budget.completed(3)
 
         _flush_ready_residual_tiles()
 
-        for fut in background_drain_budget.items(3, tile_bridge_gate_futures):
+        for fut in background_drain_budget.items(4, tile_bridge_gate_futures):
             if not fut.done():
                 continue
             model_name, view_name, config_id, tile_id = tile_bridge_gate_futures.pop(fut)
@@ -4741,9 +4762,9 @@ def _main_impl() -> None:
             _mark_tile_complete(
                 str(model_name), str(view_name), str(config_id), str(tile_id),
             )
-            background_drain_budget.completed(3)
+            background_drain_budget.completed(4)
 
-        for fut in background_drain_budget.items(4, tile_consolidation_futures):
+        for fut in background_drain_budget.items(5, tile_consolidation_futures):
             if not fut.done():
                 continue
             set_key = tile_consolidation_futures.pop(fut)
@@ -4801,9 +4822,9 @@ def _main_impl() -> None:
 
             tile_consolidation_completed.add(set_key)
             _maybe_finalize_tile_parent(str(parent_key[0]), str(parent_key[1]))
-            background_drain_budget.completed(4)
+            background_drain_budget.completed(5)
 
-        for fut in background_drain_budget.items(5, tile_parent_finalization_futures):
+        for fut in background_drain_budget.items(6, tile_parent_finalization_futures):
             if not fut.done():
                 continue
             parent_key = tile_parent_finalization_futures.pop(fut)
@@ -4815,9 +4836,9 @@ def _main_impl() -> None:
                 str(parent_key[1]),
                 reason='full-frame and all configured tile-set terminal refs are complete',
             )
-            background_drain_budget.completed(5)
+            background_drain_budget.completed(6)
 
-        for fut in background_drain_budget.items(6, physical_view_finalization_futures):
+        for fut in background_drain_budget.items(7, physical_view_finalization_futures):
             if not fut.done():
                 continue
             expected_key = physical_view_finalization_futures.pop(fut)
@@ -4841,9 +4862,9 @@ def _main_impl() -> None:
                 f'Streaming physical-view finalization completed '
                 f'{result_model}/{result_view}; terminal global fusion is queued.'
             )
-            background_drain_budget.completed(6)
+            background_drain_budget.completed(7)
 
-        for fut in background_drain_budget.items(7, physical_view_union_futures):
+        for fut in background_drain_budget.items(8, physical_view_union_futures):
             if not fut.done():
                 continue
             expected_key = physical_view_union_futures.pop(fut)
@@ -4857,7 +4878,7 @@ def _main_impl() -> None:
             print(
                 f'Streaming final union committed {expected_key[0]}/{expected_key[1]}.'
             )
-            background_drain_budget.completed(7)
+            background_drain_budget.completed(8)
 
         background_drain_budget.finish()
         output_manager.reap_completed(
@@ -4865,7 +4886,8 @@ def _main_impl() -> None:
         if sam_parent_staging is not None:
             # Completed parent/tile retirement above may have returned the
             # capacity needed by another restored parent.
-            resumed, released = sam_parent_staging.pump()
+            resumed, released = sam_parent_staging.pump(
+                budget=background_drain_budget, resumed_futures=view_processing_futures)
             view_processing_futures.update(resumed)
             direct_union_capacity_released |= released
         # Allocation admission can block every otherwise-idle worker while the active
@@ -5042,6 +5064,8 @@ def _main_impl() -> None:
             _main_process_gpu_stage_can_dispatch_inference=(
                 _main_process_gpu_stage_can_dispatch_inference
             ),
+            _main_process_gpu_stage_can_dispatch_auxiliary=_main_process_gpu_stage_can_dispatch_auxiliary,
+            gpu_stage_epoch=_main_process_gpu_stage_epoch,
             _main_process_gpu_stage_finish_inference=(
                 _main_process_gpu_stage_finish_inference
             ),
@@ -6604,6 +6628,12 @@ def _main_impl() -> None:
         )
         tile_cleanup_futures[fut] = (model_name_s, str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
 
+    def _announce_gpu_inference_assets_retired(proof) -> None:
+        _mark_main_process_gpu_inference_assets_retired(proof)
+        if (sam_context is not None and
+                f'cuda:{proof.device_index}' in sam_context.shared_detector_devices):
+            sam_context.detector_device_assets_retired(proof.device_index)
+
     def _announce_process_inference_drain_if_complete() -> None:
         if int(scheduler_state.gpu_worker_results_collected) < int(
             scheduler_state.gpu_worker_total_tasks
@@ -6613,12 +6643,6 @@ def _main_impl() -> None:
         if gpu_worker_process_active:
             _set_main_process_gpu_asset_retirement_pending(True)
             inference_assets_ready = scheduler.request_gpu_inference_asset_release()
-            if inference_assets_ready:
-                # Result drain and HBM retirement are separate boundaries. A
-                # projector must not make its residency decision against buffers
-                # the worker has merely promised to release.
-                _set_main_process_gpu_inference_priority_active(False)
-                _set_main_process_gpu_asset_retirement_pending(False)
         if sam_context is not None and inference_assets_ready:
             failed_retirement = {
                 worker: record for worker, record in
@@ -6631,6 +6655,11 @@ def _main_impl() -> None:
                     'SAM GPU admission failed: detector GPU assets remain resident after retirement '
                     f'handshake: {failed_retirement}')
             sam_context.detector_assets_retired()
+        if gpu_worker_process_active and inference_assets_ready:
+            # Outputs wait for the complete handoff; admitted SAM devices use
+            # their individual authenticated retirement permission.
+            _set_main_process_gpu_inference_priority_active(False)
+            _set_main_process_gpu_asset_retirement_pending(False)
         _restore_parent_post_inference_affinity()
         if bool(scheduler_state.gpu_inference_drain_announced):
             return
@@ -6763,6 +6792,7 @@ def _main_impl() -> None:
             _announce_process_inference_drain_if_complete
         ),
         check_parent_affinity=_check_parent_affinity_for_scheduler,
+        gpu_inference_assets_retired=_announce_gpu_inference_assets_retired,
     ))
     scheduler.configure_result_transport(
         push_drain_active=bool(
@@ -7287,6 +7317,8 @@ def _main_impl() -> None:
                             f'missing_physical_unions={missing_physical_unions}, '
                             f'process_scheduler={process_scheduler_issues}'
                         )
+                    if sam_context is not None and sam_cpu_futures['runtime'] is not None:
+                        sam_context.ensure_all_devices()
                     break
                 continue
             _log_scheduler_wait_state()

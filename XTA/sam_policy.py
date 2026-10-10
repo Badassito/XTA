@@ -1518,8 +1518,28 @@ def _measure_group_intrinsic(bundle, group, run_ids, mask_filter, execution, *, 
     return measurements
 
 
+def _selection_reader_cache_bytes(bundle, resource_profile):
+    """Grow the existing cache only inside unused live parent phase credit."""
+    legacy = 32 * 1024**2
+    if resource_profile is None:
+        return legacy
+    from .sam_resources import validate_live_sam_resource_profile
+    live = validate_live_sam_resource_profile(resource_profile)
+    credit = min(int(live[name]) for name in (
+        'reserved_extra_bytes', 'assigned_plane_bytes', 'assigned_topology_bytes'))
+    if not credit:
+        return legacy
+    from .sam_branch_selection import branch_workspace_bytes
+    # The branch bound also conservatively covers nonbranch topology. Leave
+    # the existing owner spool separate from cached numeric products.
+    peak = max((branch_workspace_bytes((len(group['frame_indices']), *_group_shape(group)))
+        for group in bundle.groups.values() if group.get('complete', True)
+        and group.get('status') not in {'incomplete', 'unresolved', 'invalid'}), default=0)
+    return max(legacy, min(2*1024**3, credit//8, credit-peak-legacy))
+
+
 def select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, frozen_evidence=False,
-                         reader_cache_bytes=32 * 1024**2, resource_profile=None, workers=1):
+                         reader_cache_bytes=None, resource_profile=None, workers=1):
     """Run proposal selection in a bounded, integrity-checked mask transaction."""
     if isinstance(workers, bool) or not isinstance(workers, (int, np.integer)) or int(workers) < 1:
         raise ValueError("SAM measurement workers must be a positive integer")
@@ -1536,6 +1556,8 @@ def select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fro
         bundle = SamEvidenceBundle.open(bundle)
     if bundle.scope.get('evidence_purpose') == 'sam_extrapolation':
         raise ValueError('One-seed SAM extrapolation evidence requires its dedicated tail selector')
+    if reader_cache_bytes is None:
+        reader_cache_bytes = _selection_reader_cache_bytes(bundle, resource_profile)
     with bundle.reader(max_cache_bytes=reader_cache_bytes) as reader:
         result = _select_sam_proposals(reader, policy, upstream_fingerprints=upstream_fingerprints,
                                         frozen_evidence=frozen_evidence,resource_profile=resource_profile,workers=int(workers))
@@ -1608,7 +1630,7 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
     # pending operation and close before topology, contacts or custom hooks.
     credit = max(0, credit-int(bundle.max_cache_bytes)) if hook is None else 0
     execution = dict(schema="xta.sam_intrinsic_measurements/1", requested_workers=int(workers),
-        parallel_credit_bytes=credit, lane_cache_bytes=int(bundle.max_cache_bytes),
+        parallel_credit_bytes=credit, lane_cache_bytes=min(32*1024**2, int(bundle.max_cache_bytes)),
         workspace_rule="pixels*(128+2*owned_edges+4*tiles)+bounded_frame_diagnostics+1MiB+lane_cache",
         fallback_reason="custom_hook_order_preserved" if hook is not None else
                         "no_authenticated_extra_capacity" if not credit else None,
@@ -1700,7 +1722,12 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
                     selection_resources=resource)
             continue
         retained_index_bytes = bundle._branch_index_bytes(branch_prefix) if branch_mode else 0
-        if branch_mode and retained_index_bytes > operative["max_group_bytes"]-topology_estimate:
+        index_credit = max(0, operative["max_group_bytes"]-topology_estimate)
+        if int(live.get('reserved_extra_bytes', 0)) > 0:
+            # credit already excludes the complete outer cache. A declared
+            # per-group cap and shared parent phase credit are separate bounds.
+            index_credit = min(index_credit, max(0, credit-topology_estimate))
+        if branch_mode and retained_index_bytes > index_credit:
             # A later, larger family may leave no index slack. Materialize the
             # ordinary retained recipe before its numeric work starts, then
             # retire the old shallow indexes by replacing their sole owner.
@@ -1752,7 +1779,6 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
                 raise ValueError("Proposal policy attempted to select incomplete or structurally invalid evidence")
         elif branch_mode:
             metadata = execution["branch_metadata"]
-            index_credit = max(0, operative["max_group_bytes"]-topology_estimate)
             def branch_trial_snapshot(recipe):
                 snapshot = bundle._branch_filter_overlay(branch_prefix, recipe, max_index_bytes=index_credit)
                 charge = bundle._branch_index_bytes(snapshot)

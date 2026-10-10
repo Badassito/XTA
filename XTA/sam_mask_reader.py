@@ -20,6 +20,7 @@ import numpy as np
 from .sam_evidence import (SamEvidenceBundle, _decode_mask, _decode_raw_crop_boundary_contacts_with_foreground,
     native_output_shape_tyx, _freeze, _plain)
 from . import sam_filtering as _filtering
+from .artifact_archive import open_artifact
 
 _SOURCE_PATH = Path(__file__).resolve()
 IMPLEMENTATION_SHA256 = hashlib.sha256(_SOURCE_PATH.read_bytes()).hexdigest()
@@ -152,7 +153,7 @@ class SamMaskReader:
                     raise RuntimeError("SAM reader lane changed its outer evidence transaction")
                 parent._children.add(self)
         try:
-            self._stream = (self.bundle.directory / "masks.bin").open("rb")
+            self._stream = open_artifact(self.bundle.directory / "masks.bin")
         except BaseException:
             if parent is not None:
                 with parent._lock:

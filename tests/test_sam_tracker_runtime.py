@@ -184,6 +184,28 @@ class SamTrackerArtifactTests(unittest.TestCase):
             self.assertTrue(all(value < 0.1 for value in result.tracker_scores.values()))
             self.assertTrue(all(value == "observed" for value in result.observation_status.values()))
 
+    def test_decoded_boolean_history_borrows_frozen_owned_unpack_and_outlives_packet(self):
+        unpacked=[]
+        original=np.unpackbits
+        def record(*args,**kwargs):
+            value=original(*args,**kwargs)
+            unpacked.append(value)
+            return value
+        with tempfile.TemporaryDirectory() as directory:
+            with patch('XTA.sam_tracker_runtime.np.unpackbits',side_effect=record):
+                result=self._execute(directory)
+            owner=unpacked[-1]
+            self.assertFalse(owner.flags.writeable)
+            expected={frame:mask.copy() for frame,mask in result.frames.items()}
+            for mask in result.frames.values():
+                self.assertEqual(mask.dtype,np.bool_)
+                self.assertTrue(np.shares_memory(mask,owner))
+                self.assertFalse(mask.flags.writeable)
+                with self.assertRaises(ValueError):
+                    mask.setflags(write=True)
+        for frame,mask in result.frames.items():
+            np.testing.assert_array_equal(mask,expected[frame])
+
     def test_removed_masks_are_invalid_evidence_instead_of_successful_empty(self):
         with tempfile.TemporaryDirectory() as directory:
             result = self._execute(directory, removed=True)

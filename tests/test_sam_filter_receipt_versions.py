@@ -45,7 +45,9 @@ def _legacy_spec(bundle):
 
 
 @pytest.mark.parametrize('implementation', [filtering._QUALIFIED_LEGACY_IMPLEMENTATION,
-                                           filtering._QUALIFIED_PREVIOUS_IMPLEMENTATION])
+                                           filtering._QUALIFIED_PREVIOUS_IMPLEMENTATION,
+                                           filtering._QUALIFIED_RADIUS_ONLY_IMPLEMENTATION,
+                                           filtering._QUALIFIED_PRE_BOOLEAN_IMPLEMENTATION])
 def test_qualified_legacy_filter_has_exact_current_pixels(implementation):
     bundle = _Bundle()
     current = filtering.effective_candidate_mask(bundle, "r", 0, filtering.build_mask_filter(bundle))

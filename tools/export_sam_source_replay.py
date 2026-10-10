@@ -26,6 +26,7 @@ from XTA import __version__, assembly, outputs
 from XTA.geometry import ViewInfo
 from XTA.interpolation import IncrementalRawBBoxMaskStoreWriter, INTERNAL_PACKED_CVOL_FORMAT
 from XTA.sam_evidence import SamEvidenceBundle, iter_selected_native_crops, native_output_shape_tyx
+from XTA.artifact_archive import read_artifact
 
 
 def file_sha256(path):
@@ -177,7 +178,7 @@ def export_source_replay(evidence, selection_path, reference_run, output, *, dow
     budget = int(float(memory_mib)*1024**2)
     bundle = SamEvidenceBundle.open(evidence)
     selection_path = Path(selection_path).resolve()
-    selection_bytes = selection_path.read_bytes()
+    selection_bytes = read_artifact(selection_path)
     selection = json.loads(selection_bytes)
     if (selection.get('evidence_fingerprint') != bundle.evidence_fingerprint
             or not selection.get('policy_hash')):
@@ -279,7 +280,7 @@ def export_source_replay(evidence, selection_path, reference_run, output, *, dow
             layers=entries, detector_reference_copies=detector_receipts,
             limitation='Fixed proposals and preserved source detector; no SAM regeneration, final voting or changed upstream tile gates.')
         bundle.assert_unchanged()
-        if selection_path.read_bytes() != selection_bytes:
+        if read_artifact(selection_path) != selection_bytes:
             raise RuntimeError('Selection receipt changed during source export')
         (staging/'replay_manifest.json').write_text(json.dumps(result, indent=2)+'\n', encoding='utf-8')
         if output.exists():
