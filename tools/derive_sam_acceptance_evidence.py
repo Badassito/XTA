@@ -25,6 +25,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from XTA.sam_evidence import SamEvidenceBundle, fingerprint, _plain
+from XTA.artifact_archive import open_artifact, artifact_size
 from XTA.sam_policy import resolve_sam_bridge_policy, select_sam_proposals
 from tools.sam_outer_crop_geometry import SCHEMA as GEOMETRY_SCHEMA, group_world_hashes, world_mask_hash
 
@@ -261,7 +262,8 @@ def derive_a2_bundle(c2bundle, a2plan, proof, outdir, *, policy=None):
     try:
         # Original compressed records are retained verbatim, including the old
         # A masks. No dense per-run or per-volume stacks are materialized.
-        shutil.copyfile(source.directory / "masks.bin", evidence_dir / "masks.bin")
+        with open_artifact(source.directory / "masks.bin") as incoming, (evidence_dir / "masks.bin").open("wb") as outgoing:
+            shutil.copyfileobj(incoming, outgoing, length=1024 * 1024)
         index = dict(groups={}, runs={}, masks=_plain(source.records))
         changed_records = []
         with (evidence_dir / "masks.bin").open("ab") as stream:
@@ -306,7 +308,7 @@ def derive_a2_bundle(c2bundle, a2plan, proof, outdir, *, policy=None):
         lineage = dict(schema=SCHEMA, variant="A2", generation_performed=False,
             source_bundle_fingerprint=source.manifest["evidence_fingerprint"], source_bundle_path=str(source.directory),
             source_scope_id=source.scope.get("scope_id"), actual_generation_variant="C2",
-            raw_payload_prefix_bytes=(source.directory / "masks.bin").stat().st_size,
+            raw_payload_prefix_bytes=artifact_size(source.directory / "masks.bin"),
             raw_payload_prefix_sha256=source.manifest["files"]["masks.bin"]["sha256"],
             source_record_index_sha256=fingerprint(source.records), geometry_proof_sha256=fingerprint(proof),
             measurement_planning_fingerprint=a2plan.planning_fingerprint,

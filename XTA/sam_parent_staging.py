@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextlib import contextmanager, nullcontext
+from concurrent.futures import CancelledError
 import os
 from pathlib import Path
 import shutil
@@ -19,7 +20,8 @@ import numpy as np
 from .interpolation import _DirectUnionBackingLease, _ByteAdmissionPool
 from .runtime import (path_is_memory_backed, allocate_workspace_array,
                       _memfd_owner_key_from_array, _memfd_backing_path_from_array,
-                      close_memmap_array_without_flush, workspace_anon_cap_bytes, runtime_telemetry)
+                      close_memmap_array_without_flush, workspace_anon_cap_bytes, runtime_telemetry,
+                      memfd_ram_headroom, capture_memfd_owner_proofs)
 from .publication_memory import publication_ram_headroom
 from .view_prepare import scratch_unlink_path_for_memmap, classify_dense_ram_backing
 
@@ -28,20 +30,24 @@ CODEC_CONTROL_BYTES = 64 * 1024**2
 RAM_RESERVE_BYTES = 16 * 1024**3
 
 
-def _ram_fits(required_bytes, active_bytes=0, dense_limit=None, receipt=None):
+def _ram_fits(required_bytes, active_bytes=0, dense_limit=None, receipt=None, promises=()):
     """Use actual physical/cgroup headroom, never swap, for another live owner."""
     required, active = max(0, int(required_bytes)), max(0, int(active_bytes))
     total = required + active
     cap = int(workspace_anon_cap_bytes())
-    headroom = int(publication_ram_headroom())
+    headroom, resident, proof = memfd_ram_headroom(promises, publication_ram_headroom)
+    resident = min(active, resident)
+    future = active-resident
+    physical_required = required+future+RAM_RESERVE_BYTES
     reason = ('empty_request' if not required else
               'dense_limit' if dense_limit is not None and total > int(dense_limit) else
               'anonymous_workspace_cap' if cap > 0 and total > cap else
-              'physical_headroom' if headroom < total + RAM_RESERVE_BYTES else None)
+              'physical_headroom' if headroom < physical_required else None)
     if receipt is not None:
         receipt.update(total_checked_bytes=total, anonymous_cap_bytes=cap,
             physical_headroom_bytes=headroom, physical_reserve_bytes=RAM_RESERVE_BYTES,
-            reason=reason)
+            proven_resident_ram_bytes=resident, future_ram_commitments_bytes=future,
+            physical_required_bytes=physical_required, reason=reason, **proof)
     return reason is None
 
 
@@ -52,6 +58,93 @@ def _codec_workspace_bytes(shape):
     # charge overlapping row normalization/packing and confidence vectors too.
     return (CODEC_CONTROL_BYTES + int(shape[1]) * int(shape[2])
             + 4 * int(shape[2]) + int(shape[0]) * 64)
+
+
+def _parent_condition(task):
+    return getattr(getattr(task, 'admission', None), 'condition', nullcontext())
+
+
+def _dense_startup_budget_locked(task, additional_bytes=0, *, reset_lease=None):
+    context = getattr(task, 'sam_context', None)
+    if context is None or not getattr(context, 'progressive_startup', False):
+        return None
+    # Forecasts are not owned grants. Mixed/empty parents must still retire
+    # before startup is needed; the later initial grant sees their new debt.
+    if (not getattr(context, '_startup_fleet_funded', False)
+            or not int(getattr(context, '_startup_fleet_credit_bytes', 0))):
+        return None
+    admission = getattr(task, 'admission', None)
+    snapshot = getattr(context, 'startup_budget_snapshot_locked', None)
+    if (snapshot is None or getattr(admission, 'condition', None) is None
+            or getattr(context, '_startup_pool', admission) is not admission):
+        raise RuntimeError('SAM dense admission requires its configured startup condition')
+    check = getattr(context, 'check_startup', None)
+    if check is not None:
+        check()
+    if reset_lease is not None:
+        additional_bytes = dense_proof_reset_bytes(reset_lease)
+    return snapshot(additional_pending_bytes=max(0, int(additional_bytes)))
+
+
+def _dense_startup_fits(budget):
+    return (budget is None or not int(budget.get('remaining_startup_bytes', 0))
+            or int(budget['physical_headroom_bytes']) >= int(budget['required_host_bytes']))
+
+
+def dense_proof_reset_bytes(lease):
+    """Bound credit removed by a proof reset without a page-fault sampling race."""
+    promised = max(0, int(lease.ram_commitment_bytes))
+    disk_to_ram = max(0, int(lease.nbytes)-promised)
+    # Occupancy can grow between a first hint and startup's resident probe.
+    # Charge every old proof's possible credit, including stale proofs (which
+    # may overcharge). No array/RSS assumption reduces this upper bound.
+    try:
+        sizes = sum(max(0, int(proof[4])) for proof in lease.memfd_owner_proofs)
+    except (IndexError, TypeError, ValueError, OverflowError) as error:
+        raise RuntimeError('SAM dense residency proof is malformed') from error
+    return disk_to_ram+min(promised, sizes)
+
+
+def fence_dense_proof_reset(task):
+    """Fund new dense debt before taking base/GPU credit or dropping proofs."""
+    lease = task.backing_lease
+    with _parent_condition(task):
+        while True:
+            task.check_cancelled()
+            budget = _dense_startup_budget_locked(task, reset_lease=lease)
+            if _dense_startup_fits(budget):
+                lease.memfd_owner_proofs = ()
+                lease.ram_backed = None
+                return
+            task.admission.condition.wait(.05)
+
+
+@contextmanager
+def _restore_allocation_guard(task, receipt):
+    """Serialize backing birth with startup grants, never with decoding."""
+    context = getattr(task, 'sam_context', None)
+    if context is None or not getattr(context, 'progressive_startup', False):
+        yield True
+        return
+    snapshot = getattr(context, 'startup_budget_snapshot_locked', None)
+    admission = getattr(task, 'admission', None)
+    condition = getattr(admission, 'condition', None)
+    if (snapshot is None or condition is None
+            or getattr(context, '_startup_pool', admission) is not admission):
+        receipt['startup_ram_admitted'] = False
+        yield False  # Missing accounting permission selects ordinary disk.
+        return
+    with condition:
+        check = getattr(context, 'check_startup', None)
+        if check is not None:
+            check()
+        budget = snapshot()
+        headroom, required = (max(0, int(budget[name])) for name in
+                              ('physical_headroom_bytes', 'required_host_bytes'))
+        admitted = headroom >= required
+        receipt.update(startup_ram_admitted=admitted,
+            startup_headroom_bytes=headroom, startup_required_host_bytes=required)
+        yield admitted
 
 
 @contextmanager
@@ -107,18 +200,45 @@ class ArrayCheckpoint:
     files: tuple = ()
     foreground_value: int = 1
 
-    def open(self, *, prefer_ram=False, stop=None):
+    def open(self, *, prefer_ram=False, stop=None, metrics=None,
+             allocation_guard=None, allocation_callback=None):
+        if metrics is not None:
+            metrics.update(allocation_seconds=0., allocation_bytes=0, decoded_bytes=0)
         if path_is_memory_backed(self.path) or _stat_identity(self.path) != self.identity:
             raise RuntimeError('SAM parent checkpoint backing changed before resume')
         if self.encoding == 'raw':
-            return np.memmap(self.path, mode='r+', dtype=np.dtype(self.dtype), shape=self.shape)
+            started = time.perf_counter()
+            try:
+                return np.memmap(self.path, mode='r+', dtype=np.dtype(self.dtype), shape=self.shape)
+            finally:
+                if metrics is not None:
+                    metrics['allocation_seconds'] = time.perf_counter()-started
         for name, identity in self.files:
             if _stat_identity(self.path / name) != identity:
                 raise RuntimeError('SAM compact checkpoint backing changed before resume')
         destination = self.path.with_name(self.path.name + '.restored.dat')
-        output = allocate_workspace_array(self.shape, np.dtype(self.dtype), destination,
-            'SAM compact parent restore', prefer_memory=False, prefer_memfd=bool(prefer_ram),
-            reserve_bytes=RAM_RESERVE_BYTES, initialize_zero=True)
+        started = time.perf_counter()
+        output = None
+        try:
+            with (allocation_guard() if allocation_guard is not None else nullcontext(True)) as admitted:
+                output = allocate_workspace_array(self.shape, np.dtype(self.dtype), destination,
+                    'SAM compact parent restore', prefer_memory=False,
+                    prefer_memfd=bool(prefer_ram and admitted),
+                    reserve_bytes=RAM_RESERVE_BYTES, initialize_zero=True)
+                if allocation_callback is not None:
+                    allocation_callback(output)
+            if metrics is not None:
+                metrics['allocation_bytes'] = self.nbytes
+        except BaseException:
+            if output is not None:
+                close_memmap_array_without_flush(output, unlink_path=destination)
+                if isinstance(output, np.memmap) and not output._mmap.closed:
+                    output._mmap.close()
+            raise
+        finally:
+            if metrics is not None:
+                metrics['allocation_seconds'] = time.perf_counter()-started
+        decoded_bytes = 0
         try:
             # The allocator creates fresh zeroed backing. Only decoded crops
             # touch pages; absent score cells and empty frames remain zero.
@@ -137,6 +257,7 @@ class ArrayCheckpoint:
                             if self.foreground_value != 1:
                                 np.multiply(values, self.foreground_value, out=values)
                             output[z,y0:y1,x0:x1] = values
+                            decoded_bytes += int(values.nbytes)
                             del values
                         del crop  # Keep only one decoded bbox plane live.
                 finally:
@@ -152,6 +273,7 @@ class ArrayCheckpoint:
                             raise RuntimeError('SAM compact parent restore cancelled')
                         for y0,y1,x0,x1,crop in reader.iter_crops(z):
                             output[z,y0:y1,x0:x1] = crop
+                            decoded_bytes += int(crop.nbytes)
             else:
                 raise ValueError('Unknown SAM checkpoint encoding')
             return output
@@ -160,6 +282,9 @@ class ArrayCheckpoint:
             if isinstance(output, np.memmap) and not output._mmap.closed:
                 output._mmap.close()
             raise
+        finally:
+            if metrics is not None:
+                metrics['decoded_bytes'] = decoded_bytes
 
     @property
     def physical_bytes(self):
@@ -229,7 +354,8 @@ def _uniform_foreground_value(array, stop):
     return value or 1
 
 
-def _snapshot_array(array, declared_path, destination, source_root, stop, *, mask=False, allow_compact=True):
+def _snapshot_array(array, declared_path, destination, source_root, stop, *, mask=False,
+                    allow_compact=True, capture_workers=1, capture_workspace_bytes=None):
     array = _validate_owner(array)
     reused = _reusable_disk_owner(array, declared_path, source_root)
     if reused is not None:
@@ -264,13 +390,35 @@ def _snapshot_array(array, declared_path, destination, source_root, stop, *, mas
                     raise
             else:
                 from .confidence_storage import write_blocks
+                from .confidence_capture import plan_confidence_capture, confidence_capture_resources
+                from .confidence_evidence import _MaskedNativeScoreReader
                 def read(z):
                     if stop.is_set():
                         raise RuntimeError('SAM parent checkpoint cancelled')
                     return array[z]
-                write_blocks(path, tuple(array.shape), read, layer_key='sam-parent-checkpoint',
-                    model_name='checkpoint', provenance={'sam_parent_checkpoint': True},
-                    coordinate_space='native_view_processing', source_shape=tuple(array.shape))
+                capture_plan = None
+                if capture_workspace_bytes is not None:
+                    try:
+                        capture_plan = plan_confidence_capture(array.shape, capture_workers,
+                            workspace_bytes=capture_workspace_bytes)
+                    except MemoryError:
+                        pass  # The already-funded serial codec needs no frame window.
+                metrics = {}
+                with confidence_capture_resources(capture_plan):
+                    reader = read if capture_plan is None else _MaskedNativeScoreReader(
+                        array, array, np.ones(array.shape[0], dtype=bool),
+                        np.broadcast_to(np.array([0, array.shape[1], 0, array.shape[2]],
+                                                 dtype=np.int64), (array.shape[0], 4)), stop=stop)
+                    # Borrow scores as their own mask: all nonzero uint8 values,
+                    # including scores outside detector support, remain exact.
+                    write_blocks(path, tuple(array.shape), reader, layer_key='sam-parent-checkpoint',
+                        model_name='checkpoint', provenance={'sam_parent_checkpoint': True},
+                        coordinate_space='native_view_processing', source_shape=tuple(array.shape),
+                        metrics=metrics)
+                runtime_telemetry().add_scheduler_counter('sam_parent_checkpoint.confidence.' +
+                    ('compiled' if capture_plan is not None else 'serial'))
+                runtime_telemetry().trace_event('sam_parent_checkpoint_confidence',
+                    **metrics)
             files = []
             for file in sorted(path.iterdir()):
                 with file.open('r+b') as stream:
@@ -380,7 +528,9 @@ def checkpoint_parent(task, root, source_root, required_bytes, stop):
                 array = getattr(task, name)
                 snapshots.append(None if array is None else _snapshot_array(array,
                     getattr(task, path_name), owned / filename, source_root, stop,
-                    mask=name=='union_mm', allow_compact=compact_credit))
+                    mask=name=='union_mm', allow_compact=compact_credit,
+                    capture_workers=int(getattr(task, 'slice_workers', 1)),
+                    capture_workspace_bytes=workspace if compact_credit else None))
                 del array
         if stop.is_set():
             raise RuntimeError('SAM parent checkpoint cancelled')
@@ -421,6 +571,7 @@ class DeferredSamParentQueue:
         self.count = self.written_bytes = self.reused_bytes = self.resumed_count = 0
         self.io_seconds = 0.
         self.compact_bytes = self.compact_logical_bytes = self.restore_raw_bytes = 0
+        self.restore_startup_fallback_bytes = 0
         self.codec_fallback_bytes = 0
         self.ram_first_owners = {}
         self.ram_first_grants = self.ram_first_denials = self.ram_first_releases = 0
@@ -468,7 +619,7 @@ class DeferredSamParentQueue:
         reason = ('cancelled' if self.stop.is_set() else
                   'ram_owner_limit' if self.ram_first_bytes + required_bytes > self.dense_limit else None)
         if reason is not None or not _ram_fits(required_bytes+detector_room_bytes,
-                                             active_bytes, self.dense_limit, receipt):
+                active_bytes, self.dense_limit, receipt, self.leases.ram_residency_promises()):
             receipt['reason'] = reason or receipt.get('reason') or 'ram_admission_refused'
             self.last_ram_denial = receipt
             self.ram_first_denials += 1
@@ -508,6 +659,17 @@ class DeferredSamParentQueue:
         """Exclude immutable RAM checkpoints, retaining birth charges and leases."""
         return sum(self._ram_checkpoint_bytes(*saved) for saved in self.checkpoint_futures.values())
 
+    def checkpoint_copy_promises(self):
+        """Actual future RAM debt; call under the shared parent condition.
+
+        Startup probes physical headroom after this resident proof. Disk-only
+        deferred checkpoints and unused dense capacity are not allocations.
+        """
+        promises = self.leases.ram_residency_promises()
+        promised = sum(max(0, int(lease.ram_commitment_bytes)) for lease in promises)
+        _headroom, resident, _proof = memfd_ram_headroom(promises, publication_ram_headroom)
+        return max(0, promised-min(promised, resident))
+
     def _submit_checkpoint(self, key, task, required_bytes):
         # Completed owned disk arrays need only the established flush/fsync
         # and descriptor capture. Never park their retirement behind RAM codec.
@@ -525,37 +687,105 @@ class DeferredSamParentQueue:
 
     def _restore_and_prepare(self, task, snapshot, lease):
         """Decode after dense admission, on the prepare executor, never the scheduler."""
-        check_cancelled = getattr(task, 'check_cancelled', None)
-        if check_cancelled is not None:
-            check_cancelled()
         key = (str(task.model_name), str(task.view.name))
-        if self.leases.leases.get(key) is not lease:
-            raise RuntimeError('SAM compact restore lost its dense reservation')
-        active = self.leases.ram_commitment_bytes
-        prefer_ram = _ram_fits(snapshot.required_bytes,
-            max(0, active-lease.ram_commitment_bytes), self.dense_limit)
-        workspace = max(_codec_workspace_bytes(saved.shape)
-                        for saved in (snapshot.mask, snapshot.confidence) if saved is not None)
+        started = time.perf_counter()
+        record = dict(model_name=key[0], view_name=key[1], restore_started_monotonic=started,
+            codec_admission_started_monotonic=None, codec_admitted=False,
+            codec_admission_wait_seconds=0., allocation_seconds=0., allocation_bytes=0,
+            mask_restore_seconds=0., confidence_restore_seconds=0.,
+            mask_decoded_bytes=0, confidence_decoded_bytes=0, active_stage='preflight')
+        for name, saved in (('mask', snapshot.mask), ('confidence', snapshot.confidence)):
+            record[name+'_logical_bytes'] = 0 if saved is None else saved.nbytes
+            record[name+'_stored_bytes'] = 0 if saved is None else saved.physical_bytes
+        failed = cancelled = False
+        error_class = None
         try:
-            with _codec_reservation(task, workspace):
-                for saved, name, path_name in ((snapshot.mask, 'union_mm', 'union_path'),
-                                               (snapshot.confidence, 'confmap_mm', 'confmap_path')):
-                    if saved is None:
-                        continue
-                    if self.stop.is_set():
-                        raise RuntimeError('SAM compact parent restore cancelled')
-                    array = saved.open(prefer_ram=prefer_ram, stop=self.stop)
-                    setattr(task, name, array)
-                    backing = _memfd_backing_path_from_array(array) or Path(str(array.filename))
-                    setattr(task, path_name, backing or saved.path)
-                    if saved.encoding != 'raw' and _memfd_owner_key_from_array(array) is None:
-                        self.restore_raw_bytes += saved.nbytes
-                    del array  # Confidence retirement must not retain a wrapper alias.
-        except BaseException:
-            _close_sources(task, preserve=False)
+            check_cancelled = getattr(task, 'check_cancelled', None)
+            if check_cancelled is not None:
+                check_cancelled()
+            if self.leases.leases.get(key) is not lease:
+                raise RuntimeError('SAM compact restore lost its dense reservation')
+            active = self.leases.ram_commitment_bytes
+            promises = tuple(other for other in tuple(self.leases.leases.values()) if other is not lease)
+            prefer_ram = _ram_fits(snapshot.required_bytes,
+                max(0, active-lease.ram_commitment_bytes), self.dense_limit, None, promises)
+            record['prefer_ram'] = prefer_ram
+            workspace = max(_codec_workspace_bytes(saved.shape)
+                            for saved in (snapshot.mask, snapshot.confidence) if saved is not None)
+            record.update(active_stage='codec_admission',
+                codec_admission_started_monotonic=time.perf_counter())
+            try:
+                with _codec_reservation(task, workspace):
+                    record['codec_admission_wait_seconds'] = (time.perf_counter()
+                        - record['codec_admission_started_monotonic'])
+                    record['codec_admitted'] = True
+                    for saved, name, path_name, kind in (
+                            (snapshot.mask, 'union_mm', 'union_path', 'mask'),
+                            (snapshot.confidence, 'confmap_mm', 'confmap_path', 'confidence')):
+                        if saved is None:
+                            continue
+                        record['active_stage'] = kind
+                        if self.stop.is_set():
+                            raise RuntimeError('SAM compact parent restore cancelled')
+                        metrics = {}
+                        restore_started = time.perf_counter()
+                        def allocated(array):
+                            if getattr(getattr(task, 'sam_context', None), 'progressive_startup', False):
+                                # Facts do not retain arrays/FDs. Decode can add
+                                # resident pages while startup sees the rest owed.
+                                proofs = capture_memfd_owner_proofs({kind: array})
+                                lease.memfd_owner_proofs = tuple(proof for proof in
+                                    lease.memfd_owner_proofs if proof[0] != kind) + proofs
+                        try:
+                            array = saved.open(prefer_ram=prefer_ram, stop=self.stop, metrics=metrics,
+                                allocation_guard=lambda: _restore_allocation_guard(task, metrics),
+                                allocation_callback=allocated)
+                        finally:
+                            allocation = metrics.get('allocation_seconds', 0.)
+                            record['allocation_seconds'] += allocation
+                            record['allocation_bytes'] += metrics.get('allocation_bytes', 0)
+                            record[kind+'_restore_seconds'] = max(0., time.perf_counter()-restore_started-allocation)
+                            record[kind+'_decoded_bytes'] = metrics.get('decoded_bytes', 0)
+                            for field in ('startup_ram_admitted', 'startup_headroom_bytes',
+                                          'startup_required_host_bytes'):
+                                if field in metrics:
+                                    record[kind+'_'+field] = metrics[field]
+                        setattr(task, name, array)
+                        backing = _memfd_backing_path_from_array(array) or Path(str(array.filename))
+                        setattr(task, path_name, backing or saved.path)
+                        if saved.encoding != 'raw' and _memfd_owner_key_from_array(array) is None:
+                            self.restore_raw_bytes += saved.nbytes
+                            if prefer_ram and metrics.get('startup_ram_admitted') is False:
+                                self.restore_startup_fallback_bytes += saved.nbytes
+                        del array  # Confidence retirement must not retain a wrapper alias.
+            except BaseException:
+                _close_sources(task, preserve=False)
+                raise
+            lease.ram_backed = self._restored_ram_backing(task, lease)
+            task._sam_checkpoint_prepare_started = True
+            record['active_stage'] = 'complete'
+        except BaseException as exc:
+            failed = True
+            cancelled = self.stop.is_set() or isinstance(exc, CancelledError)
+            error_class = type(exc).__name__
             raise
-        lease.ram_backed = self._restored_ram_backing(task, lease)
-        task._sam_checkpoint_prepare_started = True
+        finally:
+            if not record['codec_admitted'] and record['codec_admission_started_monotonic'] is not None:
+                record['codec_admission_wait_seconds'] = (time.perf_counter()
+                    - record['codec_admission_started_monotonic'])
+            record.update(elapsed_seconds=time.perf_counter()-started, failed=failed,
+                cancelled=cancelled, status='cancelled' if cancelled else 'failed' if failed else 'complete',
+                error_class=error_class)
+            try:
+                telemetry = runtime_telemetry()
+                telemetry.trace_event('sam_parent_restore', **record)
+                telemetry.add_scheduler_counter('sam_parent_restore.'+record['status'])
+                for name in ('elapsed_seconds', 'codec_admission_wait_seconds', 'allocation_seconds',
+                        'allocation_bytes', 'mask_restore_seconds', 'confidence_restore_seconds',
+                        'mask_decoded_bytes', 'confidence_decoded_bytes'):
+                    telemetry.add_scheduler_counter('sam_parent_restore.'+name, record[name])
+            except Exception:
+                pass  # Diagnostics cannot replace the restore error or cancel preparation.
         return task()
 
     @staticmethod
@@ -613,10 +843,34 @@ class DeferredSamParentQueue:
         self._ram_checkpoint_bytes(key, task, required_bytes)
         self._submit_checkpoint(key, task, required_bytes)
 
-    def pump(self):
-        """Return newly resumed prepare futures and whether dense credit returned."""
+    def pump(self, *, budget=None, resumed_futures=None):
+        """Resume parents within the caller's shared background-completion budget.
+
+        One ownership transition/probe is atomic and can exceed the time budget.
+        Denied parents rotate so an interrupted pass still reaches later views.
+        A caller-owned future registry receives each handoff before a budget
+        checkpoint can fail, so cancellation can still find submitted work.
+        """
+        def items(mapping):
+            return list(mapping) if budget is None else budget.items(0, mapping)
+
+        def completed():
+            if budget is not None:
+                budget.completed(0)
+
         released = False
+        # A previously failed checkpoint/restore must surface even when this
+        # pass has yielded. Failed restores still retire their exact ownership.
         for future, (key, task, lease) in list(self.restore_futures.items()):
+            if future.done() and not future.cancelled() and future.exception() is not None:
+                del self.restore_futures[future]
+                self._retire_failed_restore(key, task, lease)
+                future.result()
+        for future in self.checkpoint_futures:
+            if future.done() and not future.cancelled() and future.exception() is not None:
+                future.result()
+        for future in items(self.restore_futures):
+            key, task, lease = self.restore_futures[future]
             if not future.done():
                 continue
             del self.restore_futures[future]
@@ -624,7 +878,9 @@ class DeferredSamParentQueue:
                 released |= self._retire_failed_restore(key, task, lease)
                 if not future.cancelled():
                     future.result()
-        for future, (key, task, required_bytes) in list(self.checkpoint_futures.items()):
+            completed()
+        for future in items(self.checkpoint_futures):
+            key, task, required_bytes = self.checkpoint_futures[future]
             if not future.done():
                 continue
             snapshot = future.result()
@@ -643,21 +899,32 @@ class DeferredSamParentQueue:
                 if saved is not None and saved.encoding != 'raw':
                     self.compact_bytes += saved.physical_bytes
                     self.compact_logical_bytes += saved.nbytes
+            completed()
         resumed = {}
         if self.stop.is_set() or not self.ready():
             self._publish_staging()
             return resumed, released
-        for key, (task, snapshot) in list(self.deferred.items()):
+        for key in items(self.deferred):
+            task, snapshot = self.deferred[key]
             if key in self.bounded_parent_keys and snapshot.required_bytes > self.dense_limit:
                 raise RuntimeError('SAM deferred policy parent exceeds bounded dense limit')
-            active = sum(self.leases.inference_bytes.values()) + sum(self.leases.postprocess_bytes.values())
-            emergency = not self.leases.leases and key not in self.bounded_parent_keys
-            if not emergency and active + snapshot.required_bytes > self.dense_limit:
+            denied = False
+            with _parent_condition(task):
+                active = sum(self.leases.inference_bytes.values()) + sum(self.leases.postprocess_bytes.values())
+                emergency = not self.leases.leases and key not in self.bounded_parent_keys
+                if not emergency and active + snapshot.required_bytes > self.dense_limit:
+                    denied = True
+                elif not _dense_startup_fits(_dense_startup_budget_locked(task, snapshot.required_bytes)):
+                    denied = True  # No dense/base/GPU credit is parked behind startup.
+                else:
+                    self.leases.leases[key] = _DirectUnionBackingLease(key, snapshot.required_bytes, phase='postprocess')
+                    self.leases.postprocess_views.add(key)
+                    self.leases.postprocess_bytes[key] = snapshot.required_bytes
+                    lease = self.leases.leases[key]
+            if denied:
+                self.deferred[key] = self.deferred.pop(key)
+                completed()
                 continue
-            self.leases.leases[key] = _DirectUnionBackingLease(key, snapshot.required_bytes, phase='postprocess')
-            self.leases.postprocess_views.add(key)
-            self.leases.postprocess_bytes[key] = snapshot.required_bytes
-            lease = self.leases.leases[key]
             try:
                 if hasattr(task, 'backing_lease'):
                     task.backing_lease = lease
@@ -693,7 +960,10 @@ class DeferredSamParentQueue:
                 # backings. Queue teardown must not unlink a live result.
                 self.transferred_roots.add(snapshot.owned_dir)
             resumed[future] = key
+            if resumed_futures is not None:
+                resumed_futures[future] = key
             self.resumed_count += 1
+            completed()
         self._publish_staging()
         return resumed, released
 
@@ -729,6 +999,7 @@ class DeferredSamParentQueue:
             compact_checkpoint_bytes=self.compact_bytes,
             compact_logical_input_bytes=self.compact_logical_bytes,
             restore_raw_fallback_bytes=self.restore_raw_bytes,
+            restore_startup_fallback_bytes=self.restore_startup_fallback_bytes,
             codec_raw_fallback_bytes=self.codec_fallback_bytes,
             codec_raw_fallback_reason='transient_credit_unavailable' if self.codec_fallback_bytes else None,
             restore_raw_fallback_reason='physical_headroom_or_memfd_unavailable' if self.restore_raw_bytes else None,

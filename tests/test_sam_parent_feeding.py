@@ -24,8 +24,8 @@ def test_sam_memory_defaults_scale_with_one_ram_budget_and_keep_legacy_floors(mo
     clear_memory_overrides(monkeypatch)
     gib = runtime.GIB
     limits = runtime.resolve_parent_memory_limits(1400*gib, sam_enabled=True, policy_enabled=False)
-    assert limits == (128*gib, int(1336*gib*.40), 334*gib)
-    assert limits[1]+limits[2] <= int(1336*gib*.65)
+    assert limits == (128*gib, int(1336*gib*.40), int(1336*gib*.40))
+    assert limits[1]+limits[2] <= int(1336*gib*.80)
     assert runtime.resolve_parent_memory_limits(1400*gib, sam_enabled=False,
         policy_enabled=False) == (128*gib, 256*gib, 192*gib)
     for sam in (False, True):
@@ -35,12 +35,81 @@ def test_sam_memory_defaults_scale_with_one_ram_budget_and_keep_legacy_floors(mo
             policy_enabled=True) == (64*gib, 384*gib, 64*gib)
 
 
+@pytest.mark.parametrize('available_gib,policy,expected_transient_gib', [
+    (256,False,64), (383,False,79.75), (384,False,128),
+    (512,True,112), (1023,True,239.75), (1024,True,384)])
+def test_sam_transient_increase_preserves_floor_bound_hosts(
+        monkeypatch, available_gib, policy, expected_transient_gib):
+    clear_memory_overrides(monkeypatch)
+    _, _, transient = runtime.resolve_parent_memory_limits(available_gib*runtime.GIB,
+        sam_enabled=True, policy_enabled=policy)
+    assert transient == int(expected_transient_gib*runtime.GIB)
+
+
+def test_run155423_headroom_funds_more_parents_without_spending_other_reserves(monkeypatch):
+    clear_memory_overrides(monkeypatch)
+    # Recover the startup probe from the recorded legacy 25% transient cap.
+    previous_transient = 304642772992
+    available = 4*previous_transient+64*runtime.GIB
+    inference, dense, transient = runtime.resolve_parent_memory_limits(available,
+        sam_enabled=True, policy_enabled=False)
+    assert inference == 128*runtime.GIB
+    assert dense == transient == 487428436787
+    assert transient > previous_transient
+    assert available-dense-transient >= 64*runtime.GIB+(available-64*runtime.GIB)//5
+
+
+@pytest.mark.parametrize('dense_gib,expected_transient_gib', [(700,368.8), (1000,334)])
+def test_explicit_dense_allowance_only_reduces_the_default_transient_increase(
+        monkeypatch, dense_gib, expected_transient_gib):
+    clear_memory_overrides(monkeypatch)
+    monkeypatch.setenv('YOLO_TTA_DIRECT_UNION_TOTAL_GIB', str(dense_gib))
+    _, dense, transient = runtime.resolve_parent_memory_limits(1400*runtime.GIB,
+        sam_enabled=True, policy_enabled=False)
+    assert dense == dense_gib*runtime.GIB
+    # Rounding the combined byte budget can differ from converting 368.8 GiB.
+    assert abs(transient-int(expected_transient_gib*runtime.GIB)) <= 1
+
+
+def test_explicit_inference_floor_counts_against_default_transient_increase(monkeypatch):
+    clear_memory_overrides(monkeypatch)
+    monkeypatch.setenv('YOLO_TTA_DIRECT_UNION_INFERENCE_GIB', '700')
+    inference, dense, transient = runtime.resolve_parent_memory_limits(1400*runtime.GIB,
+        sam_enabled=True, policy_enabled=False)
+    assert inference == dense == 700*runtime.GIB
+    assert dense+transient <= int(1336*runtime.GIB*.80)
+    assert transient > 334*runtime.GIB
+
+
 def test_explicit_memory_overrides_remain_authoritative(monkeypatch):
     monkeypatch.setenv('YOLO_TTA_DIRECT_UNION_INFERENCE_GIB', '15')
     monkeypatch.setenv('YOLO_TTA_DIRECT_UNION_TOTAL_GIB', '40')
     monkeypatch.setenv('YOLO_TTA_PARENT_TRANSIENT_GIB', '33')
     assert runtime.resolve_parent_memory_limits(1400*runtime.GIB, sam_enabled=True,
         policy_enabled=False) == (15*runtime.GIB,40*runtime.GIB,33*runtime.GIB)
+
+
+def test_explicit_transient_limit_remains_authoritative_above_default(monkeypatch):
+    clear_memory_overrides(monkeypatch)
+    monkeypatch.setenv('YOLO_TTA_PARENT_TRANSIENT_GIB', '800')
+    assert runtime.resolve_parent_memory_limits(1400*runtime.GIB, sam_enabled=True,
+        policy_enabled=False)[2] == 800*runtime.GIB
+
+
+def test_job_memory_limit_prevents_large_node_from_raising_sam_transient_default(monkeypatch):
+    import psutil
+    from XTA import publication_memory, sam_resources, workspace
+    clear_memory_overrides(monkeypatch)
+    monkeypatch.setenv('SLURM_MEM_PER_NODE', str(256*1024))
+    monkeypatch.delenv('SLURM_MEM_PER_CPU', raising=False)
+    monkeypatch.setattr(publication_memory, 'publication_ram_headroom', lambda: 1400*runtime.GIB)
+    monkeypatch.setattr(workspace, 'available_anon_work_bytes', lambda: 2800*runtime.GIB)
+    monkeypatch.setattr(psutil, 'Process', lambda: SimpleNamespace(
+        memory_info=lambda: SimpleNamespace(rss=16*runtime.GIB), children=lambda **_kwargs: []))
+    available = sam_resources.physical_sam_headroom()
+    assert available == 240*runtime.GIB
+    assert runtime.resolve_parent_memory_limits(available, sam_enabled=True,
+        policy_enabled=False) == (64*runtime.GIB,128*runtime.GIB,64*runtime.GIB)
 
 
 def pipeline_statements():

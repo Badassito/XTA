@@ -17,6 +17,62 @@ from XTA.sam_integration import SamInterpolationContext
 GIB = 1024**3
 
 
+def test_parent_memory_trace_separates_owner_expiry_from_actual_credit_return():
+    events=[]
+    pool=_ByteAdmissionPool(64*GIB,'test')
+    with mock.patch('XTA.runtime.runtime_trace_event',side_effect=lambda event,**fields:events.append((event,fields))):
+        with resources.admit_sam_parent_resources(pool,4*GIB,'parent',worker_count=4,
+                headroom_probe=lambda:128*GIB) as profile:
+            lease=profile._lease
+            with pool.condition:
+                lease.scope_holds+=1
+        assert pool.in_use==20*GIB and not lease.credit_returned
+        assert [name for name,_ in events]==['sam_parent_memory_requested',
+            'sam_parent_memory_admitted','sam_parent_memory_owner_expired']
+        assert events[-1][1]['scope_holds']==1
+        with pool.condition:
+            lease.scope_holds-=1
+            resources._return_parent_credit_if_settled(lease)
+        assert pool.in_use==0 and lease.credit_returned
+    assert events[-1][0]=='sam_parent_memory_credit_returned'
+    assert events[-1][1]['charged_bytes']==20*GIB
+    assert all(isinstance(value,(str,int,float,bool,type(None))) for _,fields in events for value in fields.values())
+
+
+def test_parent_memory_trace_measures_real_condition_wait_without_changing_credit():
+    events=[];waiting=threading.Event();pool=_ByteAdmissionPool(8*GIB,'test')
+    original_wait=pool.condition.wait
+    def wait(*args,**kwargs):
+        waiting.set()
+        return original_wait(*args,**kwargs)
+    def admitted():
+        with resources.admit_sam_parent_resources(pool,4*GIB,'waiting-parent',worker_count=1,
+                headroom_probe=lambda:64*GIB,cancel_event=threading.Event()) as profile:
+            assert pool.in_use==profile._lease.charged_bytes==8*GIB
+    with mock.patch('XTA.runtime.runtime_trace_event',side_effect=lambda event,**fields:events.append((event,fields))), \
+         mock.patch.object(pool.condition,'wait',side_effect=wait), ThreadPoolExecutor(1) as executor:
+        with pool.reserve(6*GIB,'incumbent'):
+            future=executor.submit(admitted)
+            assert waiting.wait(3) and not future.done()
+            assert pool.in_use==6*GIB
+        future.result(timeout=3)
+    record=next(fields for name,fields in events if name=='sam_parent_memory_admitted')
+    assert record['condition_wait_count']>=1 and record['condition_wait_seconds']>=0
+    assert record['admission_seconds']>=record['condition_wait_seconds'] and pool.in_use==0
+
+
+def test_parent_memory_diagnostics_do_not_replace_failure_or_retain_credit():
+    pool=_ByteAdmissionPool(64*GIB,'test')
+    original=ValueError('original preparation failure')
+    with mock.patch('XTA.runtime.runtime_trace_event',side_effect=RuntimeError('diagnostic failure')):
+        with pytest.raises(ValueError) as caught:
+            with resources.admit_sam_parent_resources(pool,4*GIB,'parent',worker_count=4,
+                    headroom_probe=lambda:128*GIB) as profile:
+                raise original
+    assert caught.value is original and pool.in_use==0
+    assert not profile._lease.active and profile._lease.credit_returned
+
+
 @pytest.mark.parametrize('fail_startup', [False, True])
 def test_tile_runtime_starts_before_parent_credit_and_preserves_startup_failure(monkeypatch, fail_startup):
     pool = _ByteAdmissionPool(64*GIB, 'test')

@@ -245,22 +245,35 @@ def shell_coordinates(view: 'ViewInfo', index: int, x=None, y=None):
     return tt, sy, sx, valid
 
 
-def render_shell_frame(volume: np.ndarray, view: 'ViewInfo', index: int, *, categorical=False):
+def render_shell_frame(volume: np.ndarray, view: 'ViewInfo', index: int, *, categorical=False,
+                       bbox_yx=None):
     """Bounded native rendering: trilinear gray8 intensity or nearest categorical."""
     array = np.asarray(volume)
     if array.ndim != 3 or tuple(array.shape) != (view.full_t, view.full_h, view.full_w):
         raise ValueError('Radial source shape does not match physical view geometry')
-    out = np.empty((int(view.src_h), int(view.src_w)), dtype=np.uint8)
-    for row in range(0, int(view.src_h), 32):
-        stop = min(int(view.src_h), row + 32)
-        coords = shell_coordinates(view, index, y=np.arange(row, stop)[:, None])
+    bounds = (0, 0, int(view.src_h), int(view.src_w)) if bbox_yx is None else bbox_yx
+    try:
+        bounds = tuple(bounds)
+        if len(bounds) != 4 or any(isinstance(value, (bool, np.bool_)) for value in bounds):
+            raise ValueError('Shell crop bounds require four integers')
+        native_y0, native_x0, native_y1, native_x1 = map(operator.index, bounds)
+    except (TypeError, ValueError) as error:
+        raise ValueError('Shell crop bounds require four integers') from error
+    if not (0 <= native_y0 < native_y1 <= int(view.src_h)
+            and 0 <= native_x0 < native_x1 <= int(view.src_w)):
+        raise ValueError('Shell crop bounds are outside the native frame')
+    columns = None if bbox_yx is None else np.arange(native_x0, native_x1, dtype=np.float64)[None, :]
+    out = np.empty((native_y1-native_y0, native_x1-native_x0), dtype=np.uint8)
+    for row in range(native_y0, native_y1, 32):
+        stop = min(native_y1, row + 32)
+        coords = shell_coordinates(view, index, x=columns, y=np.arange(row, stop)[:, None])
         tt, yy, xx, valid = coords
         if categorical:
             ti, yi, xi = (np.floor(c + 0.5).astype(np.intp) for c in (tt, yy, xx))
             valid &= ((ti >= 0) & (ti < array.shape[0]) & (yi >= 0) & (yi < array.shape[1])
                       & (xi >= 0) & (xi < array.shape[2]))
             ti, yi, xi = (np.clip(a, 0, n - 1) for a, n in zip((ti, yi, xi), array.shape))
-            out[row:stop] = np.asarray(valid & (array[ti, yi, xi] != 0), dtype=np.uint8)
+            out[row-native_y0:stop-native_y0] = np.asarray(valid & (array[ti, yi, xi] != 0), dtype=np.uint8)
             continue
         t0, y0, x0 = (np.floor(c).astype(np.intp) for c in (tt, yy, xx))
         dt, dy, dx = ((c - lower).astype(np.float32) for c, lower in zip((tt, yy, xx), (t0, y0, x0)))
@@ -275,5 +288,5 @@ def render_shell_frame(volume: np.ndarray, view: 'ViewInfo', index: int, *, cate
                     wx = (dx if ix else np.float32(1) - dx) * ((x0 + ix >= 0) & (x0 + ix < array.shape[2]))
                     xi = np.clip(x0 + ix, 0, array.shape[2] - 1)
                     acc += array[ti, yi, xi].astype(np.float32) * (wt * wy * wx)
-        out[row:stop] = np.where(valid, np.clip(np.rint(acc), 0, 255), 0).astype(np.uint8)
+        out[row-native_y0:stop-native_y0] = np.where(valid, np.clip(np.rint(acc), 0, 255), 0).astype(np.uint8)
     return out

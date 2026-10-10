@@ -10,6 +10,8 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
+from .artifact_archive import append_members, split_reference
+
 
 class _LockEntry:
     __slots__ = ("lock", "users")
@@ -101,6 +103,11 @@ def write_json_atomic(
         serialized += "\n"
 
     destination = Path(path)
+    archived = split_reference(destination)
+    if archived is not None:
+        archive, member = archived
+        append_members(archive, {member: serialized.encode("utf-8")}, replace=True)
+        return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
     descriptor, stage_name = tempfile.mkstemp(
         prefix=f".{destination.name}.", suffix=suffix, dir=destination.parent

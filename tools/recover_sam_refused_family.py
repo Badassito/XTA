@@ -20,6 +20,8 @@ REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+from XTA.artifact_archive import iter_artifacts
+
 
 def _source(args):
     reference = json.loads((args.experiment/'sdf_references'/args.dataset/'reference.json').read_text('utf-8'))
@@ -90,7 +92,10 @@ def load_proxy(path, reference, frame):
 
 def selected_bundles(root, families, modes):
     for mode in modes:
-        for path in sorted((root/'bundles'/mode).glob('*/manifest.json')):
+        prefix = root / 'bundles' / mode
+        for path in sorted(iter_artifacts(prefix, '*/manifest.json')):
+            if len(path.relative_to(prefix).parts) != 2:
+                continue
             family = path.parent.name
             if families is None or family in families:
                 yield family, mode

@@ -66,7 +66,7 @@ def test_context_failed_planning_is_balanced_and_restores_thread_scope(tmp_path,
 
 @pytest.mark.parametrize('operation', ('interpolation', 'extrapolation'))
 def test_receipt_write_failure_preserves_exact_planning_error(tmp_path, monkeypatch, operation):
-    from XTA import sam_extrapolation
+    from XTA import json_publication, sam_extrapolation
     context = _context(tmp_path)
     view = geometry.get_view_infos(3, 4, 5, cartesian_views=('transverse',))[0]
     original = MemoryError('original planner resource failure')
@@ -74,12 +74,12 @@ def test_receipt_write_failure_preserves_exact_planning_error(tmp_path, monkeypa
         raise original
     target = sam_interpolation if operation == 'interpolation' else sam_extrapolation
     monkeypatch.setattr(target, 'prepare_sam_' + operation + '_pass', fail_plan)
-    write = Path.write_text
+    write = json_publication.write_json_atomic
     def fail_write(path, *args, **kwargs):
-        if path.name == 'context_preparation_failure.json.tmp':
+        if Path(path).name == 'context_preparation_failure.json':
             raise OSError('diagnostic disk unavailable')
         return write(path, *args, **kwargs)
-    monkeypatch.setattr(Path, 'write_text', fail_write)
+    monkeypatch.setattr(json_publication, 'write_json_atomic', fail_write)
     method = context.interpolate if operation == 'interpolation' else context.extrapolate
     try:
         with pytest.raises(MemoryError) as caught:

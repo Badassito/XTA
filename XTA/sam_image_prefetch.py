@@ -1,11 +1,15 @@
-"""One bounded next cohort, with image credit and cache contexts on its producer."""
+"""Bounded per-parent cohort preparation, with credit owned by its producer."""
 from concurrent.futures import Future
 from contextlib import contextmanager
+from types import SimpleNamespace
 import threading
+import time
 import sys
 import uuid
 
 from . import sam_resources as resources
+
+PREFETCH_CANCEL_JOIN_SECONDS = 30.
 
 
 class _ImageProfile(resources.SamResourceProfile):
@@ -25,27 +29,45 @@ class _ImageProfile(resources.SamResourceProfile):
 
 @contextmanager
 def _try_image_profile(pool, needed, scope_id, probe):
-    """Use the same parent pool, with no emergency lane or nested wait."""
+    """Fund bounded images separately, preserving all future parent credit."""
     profile = None
     with pool.condition:
+        staging = getattr(pool, '_sam_image_staging_pool', None)
+        if staging is None:
+            staging = pool._sam_image_staging_pool = SimpleNamespace(
+                capacity=resources.MAX_IMAGE_STAGING_BYTES, in_use=0, condition=pool.condition,
+                _sam_parent_pool=pool)
         try:
             physical = max(0, int(probe()))
         except Exception:
             physical = 0
-        other = int(pool.in_use)
-        if needed <= max(0, int(pool.capacity)-other) and needed <= max(0, physical-other):
-            lease = resources._LiveLease(uuid.uuid4().hex, threading.get_ident(), pool=pool,
-                charged_bytes=needed, headroom_probe=probe)
-            profile = _ImageProfile(scope_id, needed, needed, 0, int(pool.capacity), physical,
+        other = resources.sam_parent_promised_bytes(pool)
+        # Generic parent reservations may fill their budget without another probe.
+        protected = max(int(pool.capacity), int(pool.in_use))+int(staging.in_use)
+        reason = ('parent_emergency' if getattr(pool, 'oversize_requested_bytes', 0) else
+                  'staging_capacity' if needed > max(0, int(staging.capacity)-int(staging.in_use)) else
+                  'physical_headroom' if needed > max(0, physical-protected) else None)
+        if reason is None:
+            lease = resources._LiveLease(uuid.uuid4().hex, threading.get_ident(), pool=staging,
+                charged_bytes=needed, headroom_probe=probe, scope_id=str(scope_id),
+                admitted_monotonic=time.monotonic())
+            profile = _ImageProfile(scope_id, needed, needed, 0, int(staging.capacity), physical,
                 1, needed, other, lease)
-            pool.in_use += needed
+            staging.in_use += needed
             try:
                 with resources._LIVE_LOCK:
                     resources._LIVE_PROFILES[lease.lease_id] = profile
             except BaseException:
-                pool.in_use -= needed
+                staging.in_use -= needed
                 pool.condition.notify_all()
                 raise
+        resources._trace_parent_memory('sam_image_memory_admitted' if profile is not None else
+            'sam_image_memory_declined', scope_id=str(scope_id),
+            lease_id=None if profile is None else profile._lease.lease_id,
+            requested_bytes=needed, parent_pool_in_use_bytes=int(pool.in_use),
+            parent_pool_capacity_bytes=int(pool.capacity), physical_headroom_bytes=physical,
+            protected_parent_and_image_bytes=protected, reason=reason,
+            **resources.sam_image_staging_snapshot(pool))
     if profile is None:
         yield None
         return
@@ -149,8 +171,6 @@ class SamImageCohortPrefetch:
                     release_credit()
             with self.context._idle:
                 self.context._image_prefetches.discard(self)
-                if self.context._next_image_prefetch is self:
-                    self.context._next_image_prefetch = None
                 self.context._idle.notify_all()
 
     def __enter__(self):
@@ -164,8 +184,6 @@ class SamImageCohortPrefetch:
                 self._entered = True
             with self.context._idle:
                 self.context._check_image_lifetime()
-                if self.context._next_image_prefetch is self:
-                    self.context._next_image_prefetch = None
             reference = self.future.result()
             with self._lock:
                 if self._closed:
@@ -203,7 +221,10 @@ class SamImageCohortPrefetch:
             self._consumer_failed = exc is not None
             self.finish.set()
         try:
-            self._join()
+            if exc is None:
+                self._join(normal_exit=True)
+            else:
+                self._join()
         except BaseException as cleanup:
             if exc is None:
                 raise
@@ -224,10 +245,19 @@ class SamImageCohortPrefetch:
             if not self._entered:
                 self.finish.set()
 
-    def _join(self):
-        self._thread.join(timeout=30.)
-        if self._thread.is_alive():
-            raise RuntimeError('SAM image prefetch producer remains active; image/profile ownership retained')
+    def _join(self, *, normal_exit=False):
+        # Normal retirement can wait for live donors; failed or cancelled work has a deadline.
+        deadline = None if normal_exit else time.monotonic()+PREFETCH_CANCEL_JOIN_SECONDS
+        while True:
+            self._thread.join(timeout=.1)
+            if not self._thread.is_alive():
+                return
+            now = time.monotonic()
+            if deadline is None and (self.cancelled.is_set() or self.context._cancel.is_set()
+                    or self.context._closed):
+                deadline = now+PREFETCH_CANCEL_JOIN_SECONDS
+            if deadline is not None and now >= deadline:
+                raise RuntimeError('SAM image prefetch producer remains active; image/profile ownership retained')
 
     def close(self):
         """Abandon an unused wrapper; its errors cannot replace a current failure."""

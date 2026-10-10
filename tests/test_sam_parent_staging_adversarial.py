@@ -570,6 +570,107 @@ def test_unusually_wide_row_codec_is_exact_and_separately_bounded(tmp_path):
         finally:restored._mmap.close()
 
 
+@pytest.mark.parametrize('pattern', ['random', 'sparse', 'zero'])
+def test_checkpoint_confidence_reuses_exact_ordered_capture_outside_mask(tmp_path, monkeypatch, pattern):
+    import json
+    from XTA import confidence_storage, confidence_evidence
+    shape = (5,133,257)
+    scores = np.random.default_rng(154786).integers(0,256,shape,dtype=np.uint8)
+    if pattern == 'sparse':
+        scores[:] = 0
+        scores[1,0,0] = 1; scores[3,-1,-1] = 255; scores[4,129:131,128:130] = 173
+    elif pattern == 'zero':scores[:] = 0
+    expected = scores.copy()
+    mask = np.zeros(shape,np.uint8);mask[:,50:55,50:55] = 1
+    task = TinyTask(tmp_path,'ordered',mask,scores);task.slice_workers = 3
+    root = tmp_path/'checkpoints';root.mkdir()
+    serial = staging._snapshot_array(scores,None,root/'serial.dat',tmp_path,threading.Event())
+    observed = []
+    original = confidence_storage.write_blocks
+    def record(directory,shape,reader,**options):
+        observed.append((isinstance(reader, confidence_evidence._MaskedNativeScoreReader),
+                         reader.capture_plan.workers))
+        return original(directory,shape,reader,**options)
+    monkeypatch.setattr(confidence_storage,'write_blocks',record)
+    snapshot = staging.checkpoint_parent(task,root,tmp_path,mask.nbytes+scores.nbytes,threading.Event())
+    assert observed == [(True,3)]
+    assert snapshot.confidence.encoding == 'score_blocks'
+    for name in ('metadata.json','index.bin','scores.u8.zlib'):
+        assert (snapshot.confidence.path/name).read_bytes() == (serial.path/name).read_bytes()
+    metadata = json.loads((snapshot.confidence.path/'metadata.json').read_text())
+    assert metadata['known_voxels'] == int(np.count_nonzero(expected))
+    restored = snapshot.confidence.open()
+    try:np.testing.assert_array_equal(restored,expected)
+    finally:restored._mmap.close()
+
+
+def test_wide_confidence_budget_falls_back_before_typed_reader_or_payload(tmp_path, monkeypatch):
+    from XTA import confidence_evidence, confidence_storage
+    shape = (2,1,131073)
+    scores = np.full(shape,173,np.uint8);scores[:,:,::7] = 0
+    original = confidence_storage.write_blocks
+    calls = []
+    def record(directory,shape,reader,**options):
+        assert not Path(directory).exists()  # Admission resolved before payload allocation.
+        assert callable(reader)
+        calls.append(True)
+        return original(directory,shape,reader,**options)
+    monkeypatch.setattr(confidence_storage,'write_blocks',record)
+    # write_blocks uses this class for its type test, so retain a class boundary.
+    class ForbiddenReader:
+        def __init__(self,*a,**k):pytest.fail('Unfunded typed reader allocated metadata')
+    monkeypatch.setattr(confidence_evidence,'_MaskedNativeScoreReader',ForbiddenReader)
+    saved = staging._snapshot_array(scores,None,tmp_path/'wide.dat',tmp_path,threading.Event(),
+        capture_workers=8,capture_workspace_bytes=1024**2)
+    assert calls == [True] and saved.encoding == 'score_blocks'
+    restored = saved.open()
+    try:np.testing.assert_array_equal(restored,scores)
+    finally:restored._mmap.close()
+
+
+def test_checkpoint_cancellation_joins_confidence_reads_before_source_retirement(tmp_path, monkeypatch):
+    from XTA import confidence_capture_cpu
+    shape = (3,129,133)
+    task = TinyTask(tmp_path,'cancel-capture',np.ones(shape,np.uint8),np.full(shape,173,np.uint8))
+    task.slice_workers = 2
+    root = tmp_path/'checkpoints';root.mkdir()
+    stop = threading.Event();slow_started = threading.Event()
+    release_fast = threading.Event();release_slow = threading.Event();finished = threading.Event()
+    running = set();lock = threading.Lock();closed = [];errors = []
+    def bounds(mask,scores,z,*args):
+        with lock:running.add(z)
+        try:
+            if z == 0:assert release_fast.wait(5)
+            else:slow_started.set();assert release_slow.wait(5)
+            return np.array([[0,shape[1],0,shape[2],shape[1]*shape[2]]],np.int64)
+        finally:
+            with lock:running.remove(z)
+    monkeypatch.setattr(confidence_capture_cpu,'masked_cell_bounds',bounds)
+    original_close = task.close_dense
+    def close(array,**options):
+        assert not running
+        closed.append(array)
+        return original_close(array,**options)
+    task.close_dense = close
+    def checkpoint():
+        try:staging.checkpoint_parent(task,root,tmp_path,2*int(np.prod(shape)),stop)
+        except BaseException as error:errors.append(error)
+        finally:finished.set()
+    worker = threading.Thread(target=checkpoint);worker.start()
+    try:
+        assert slow_started.wait(5)
+        stop.set();release_fast.set()
+        assert not finished.wait(.05)
+        assert task.union_mm is not None and task.confmap_mm is not None and not closed
+        release_slow.set();worker.join(5)
+        assert not worker.is_alive() and not running and len(errors) == 1
+        assert 'Confidence capture cancelled' in str(errors[0])
+        assert len(closed) == 2 and task.union_mm is None and task.confmap_mm is None
+        assert list(root.iterdir()) == []
+    finally:
+        release_fast.set();release_slow.set();worker.join(5)
+
+
 def test_failed_prepare_keeps_derived_restored_alias_readable_and_credited(tmp_path,monkeypatch):
     from XTA.runtime import wait_for_retired_memmap_unlinks
     aliases=[]
@@ -861,4 +962,86 @@ def test_unowned_ram_checkpoint_rejects_before_executor_acceptance(tmp_path,monk
     with pytest.raises(RuntimeError,match='original postprocess lease'):staged.defer(task,amount)
     assert not check.entries and task.union_mm is not None
     staged.release_ram_first(key);staged.close();staged.finalize_cleanup()
+
+
+@pytest.mark.parametrize('outcome', ['complete', 'decode-failure', 'cancel', 'prepare-failure', 'diagnostic-failure'])
+def test_restore_timing_separates_codec_wait_allocation_decode_and_preparation(tmp_path, monkeypatch, outcome):
+    from XTA.interpolation import _ByteAdmissionPool, RawBBoxMaskStore
+    staged,_check,_prepare,leases = queue(tmp_path,cap=200000)
+    class Task(TinyTask):
+        def __call__(self):
+            if outcome == 'prepare-failure':raise RuntimeError('controlled preparation failure')
+            return super().__call__()
+    shape = (7,33,35)
+    task = Task(tmp_path,'timing',np.ones(shape,np.uint8),np.full(shape,173,np.uint8))
+    amount = 2*int(np.prod(shape))
+    snapshot = staging.checkpoint_parent(task,staged.root,tmp_path,amount,threading.Event())
+    key = admit(leases,task,amount);lease = leases.leases[key]
+    workspace = staging._codec_workspace_bytes(shape)
+    task.admission = _ByteAdmissionPool(workspace,'controlled codec pool')
+    monkeypatch.setattr(staging,'_ram_fits',lambda *_args:False)
+    events = [];counters = {}
+    def counter(name,value=1):counters[name] = counters.get(name,0)+value
+    def trace(event,**fields):
+        events.append((event,fields))
+        if outcome == 'diagnostic-failure':raise RuntimeError('controlled diagnostic failure')
+    monkeypatch.setattr(staging,'runtime_telemetry',lambda:SimpleNamespace(
+        trace_event=trace,add_scheduler_counter=counter))
+    original_decode = RawBBoxMaskStore.decode_slice_crop
+    def decode(store,z):
+        if z == 1 and outcome in ('decode-failure','diagnostic-failure'):
+            raise OSError('controlled restore failure')
+        result = original_decode(store,z)
+        if z == 0 and outcome == 'cancel':staged.stop.set()
+        return result
+    monkeypatch.setattr(RawBBoxMaskStore,'decode_slice_crop',decode)
+    original_reservation = staging._codec_reservation
+    waiting = threading.Event();finished = threading.Event();errors = [];results = []
+    @contextmanager
+    def reservation(*args,**kwargs):
+        waiting.set()
+        with original_reservation(*args,**kwargs) as credit:yield credit
+    monkeypatch.setattr(staging,'_codec_reservation',reservation)
+    def restore():
+        try:results.append(staged._restore_and_prepare(task,snapshot,lease))
+        except BaseException as error:errors.append(error)
+        finally:finished.set()
+    worker = threading.Thread(target=restore)
+    try:
+        with task.admission.reserve(workspace,'other admitted work'):
+            worker.start();assert waiting.wait(5)
+            assert not finished.wait(.05) and not events
+        worker.join(5)
+        assert not worker.is_alive() and len(events) == 1
+        event,record = events[0]
+        assert event == 'sam_parent_restore'
+        assert record['codec_admitted'] and record['codec_admission_wait_seconds'] > 0
+        assert record['codec_admission_started_monotonic'] >= record['restore_started_monotonic']
+        assert record['allocation_seconds'] > 0 and record['mask_restore_seconds'] > 0
+        assert record['mask_logical_bytes'] == record['confidence_logical_bytes'] == amount//2
+        assert record['mask_stored_bytes'] == snapshot.mask.physical_bytes
+        assert record['mask_decoded_bytes'] > 0
+        if outcome in ('complete','prepare-failure'):
+            assert record['status'] == 'complete' and not record['failed'] and not record['cancelled']
+            assert record['allocation_bytes'] == amount
+            assert record['confidence_decoded_bytes'] == record['mask_decoded_bytes'] == amount//2
+            assert record['confidence_restore_seconds'] > 0
+            assert counters['sam_parent_restore.complete'] == 1
+            if outcome == 'prepare-failure':assert str(errors[0]) == 'controlled preparation failure'
+            else:assert not errors and len(results) == 1
+        else:
+            assert len(errors) == 1 and record['failed'] and record['confidence_decoded_bytes'] == 0
+            assert record['status'] == ('cancelled' if outcome == 'cancel' else 'failed')
+            assert record['cancelled'] == (outcome == 'cancel')
+            assert record['error_class'] == ('RuntimeError' if outcome == 'cancel' else 'OSError')
+            assert 'controlled restore failure' in str(errors[0]) if outcome != 'cancel' else 'cancelled' in str(errors[0])
+            assert record['active_stage'] == 'mask'
+            assert task.union_mm is None and task.confmap_mm is None
+    finally:
+        worker.join(5);results.clear();errors.clear()
+        staging._close_sources(task)
+        leases.complete(key,retain_for_dense_retirement=False)
+        for saved in (snapshot.mask,snapshot.confidence):
+            wait_for_retired_memmap_unlinks(path=saved.path.with_name(saved.path.name+'.restored.dat'),timeout_s=3)
+        staged.close();staged.finalize_cleanup()
 

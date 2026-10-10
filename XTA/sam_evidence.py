@@ -7,7 +7,9 @@ No SAM or detector runtime is imported here.
 """
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
 import json
@@ -15,11 +17,44 @@ import os
 import operator
 from pathlib import Path
 import shutil
+import tempfile
+import threading
+import time
 from types import MappingProxyType
 import uuid
 import zlib
 
 import numpy as np
+
+_MASK_PACKING_POOL = None
+_MASK_PACKING_POOL_LOCK = threading.Lock()
+
+
+def _encode_mask(value):
+    """Encode one owned immutable mask; no contracts, files or writer state."""
+    started, cpu_started = time.perf_counter(), time.thread_time()
+    packed = np.packbits(value.reshape(-1), bitorder='little').tobytes()
+    encoded = zlib.compress(packed, level=6)
+    result = (encoded, len(packed), hashlib.sha256(packed).hexdigest(),
+              hashlib.sha256(encoded).hexdigest(), int(np.count_nonzero(value)))
+    from .runtime import runtime_telemetry
+    telemetry = runtime_telemetry()
+    telemetry.add('sam.consumer.mask_encode_host_seconds', time.perf_counter()-started)
+    telemetry.add('sam.consumer.mask_encode_thread_cpu_seconds', time.thread_time()-cpu_started)
+    telemetry.add('sam.consumer.mask_encode_masks', 1)
+    return result
+
+
+def _mask_packing_pool(max_workers):
+    global _MASK_PACKING_POOL
+    with _MASK_PACKING_POOL_LOCK:
+        if _MASK_PACKING_POOL is None:
+            _MASK_PACKING_POOL = ThreadPoolExecutor(max_workers=max_workers,
+                thread_name_prefix='sam-mask-pack')
+        return _MASK_PACKING_POOL
+
+from .artifact_archive import (artifact_exists, artifact_size, open_artifact,
+    publish_directory, read_artifact, reference, split_reference)
 
 SCHEMA = "xta.sam_proposals/1"
 TILE_EVIDENCE_SCHEMA = "xta.sam_run_tiles/1"
@@ -58,10 +93,15 @@ def fingerprint(value):
 
 def _file_hash(path):
     result = hashlib.sha256()
-    with Path(path).open("rb") as stream:
+    with open_artifact(path) as stream:
         while block := stream.read(1024 * 1024):
             result.update(block)
     return result.hexdigest()
+
+
+def _bundle_path(directory):
+    archived = split_reference(directory)
+    return Path(reference(*archived)) if archived else Path(directory).resolve()
 
 
 def _mask(value, shape=None):
@@ -70,7 +110,7 @@ def _mask(value, shape=None):
         raise ValueError("SAM evidence masks require a nonempty two-dimensional canvas")
     if shape is not None and result.shape != tuple(shape):
         raise ValueError("SAM evidence mask shape disagrees with its fixed context crop")
-    if not np.isin(result, (0, 1)).all():
+    if result.dtype != np.bool_ and not np.isin(result, (0, 1)).all():
         raise ValueError("SAM evidence masks must be binary")
     return np.asarray(result, dtype=np.bool_)
 
@@ -238,13 +278,22 @@ class SamEvidenceWriter:
 
     def __init__(self, directory, scope_metadata, *, max_mask_bytes=64 * 1024 * 1024,
                  max_payload_bytes=32 * 1024**3):
-        self.directory = Path(directory).resolve()
-        if self.directory.exists():
+        self.directory = _bundle_path(directory)
+        if artifact_exists(self.directory):
             raise FileExistsError(f"SAM evidence destination must be fresh: {self.directory}")
-        self.directory.parent.mkdir(parents=True, exist_ok=True)
-        self.staging = self.directory.parent / ("." + self.directory.name + ".stage-" + uuid.uuid4().hex)
-        self.staging.mkdir()
+        if split_reference(self.directory):
+            self.staging = Path(tempfile.mkdtemp(prefix="xta-sam-"))
+        else:
+            self.directory.parent.mkdir(parents=True, exist_ok=True)
+            self.staging = self.directory.parent / ("." + self.directory.name + ".stage-" + uuid.uuid4().hex)
+            self.staging.mkdir()
         self._stream = (self.staging / "masks.bin").open("wb")
+        self._packing = None
+        self._packing_pending = deque()
+        self._packing_reserved = set()
+        self._packing_bytes = 0
+        self._packing_max_plane = 0
+        self._packing_failure = False
         self.max_mask_bytes, self.max_payload_bytes = int(max_mask_bytes), int(max_payload_bytes)
         if self.max_mask_bytes <= 0 or self.max_payload_bytes <= 0:
             self.abort()
@@ -388,7 +437,7 @@ class SamEvidenceWriter:
             records[key] = record
         if self._stream.tell() + sum(record['bytes'] for record in records.values()) > self.max_payload_bytes:
             raise OSError("SAM evidence payload exceeds configured staging disk limit")
-        with (bundle.directory / 'masks.bin').open('rb') as source:
+        with open_artifact(bundle.directory / 'masks.bin') as source:
             for key, record in records.items():
                 source.seek(record['offset'])
                 target_offset, remaining = self._stream.tell(), record['bytes']
@@ -510,22 +559,103 @@ class SamEvidenceWriter:
         self.runs[identity] = run
         return identity
 
+    @contextmanager
+    def parallel_packing(self, admission):
+        """Prepare encodings concurrently, publishing in original owner order."""
+        if admission is None:
+            yield
+            return
+        from .sam_resources import SamMaskPackingAdmission
+        if not isinstance(admission, SamMaskPackingAdmission):
+            raise TypeError('SAM parallel packing requires live scope admission')
+        admission.validate()
+        if self._packing is not None:
+            raise RuntimeError('SAM evidence already owns a parallel packing context')
+        self._packing = admission
+        self._packing_max_plane = 0
+        try:
+            yield
+            self._drain_packing()
+        except BaseException as error:
+            self._packing_failure = True
+            try:
+                self._cancel_packing()
+            except BaseException as cleanup_error:
+                if callable(getattr(error, 'add_note', None)):
+                    error.add_note(f'SAM packing cleanup also failed: {cleanup_error}')
+            raise
+        finally:
+            try:
+                admission.close()
+            finally:
+                self._packing = None
+                self._packing_max_plane = 0
+
+    def _cancel_packing(self):
+        for future, *_ in self._packing_pending:
+            future.cancel()
+        try:
+            if self._packing is not None:
+                self._packing.close()
+        finally:
+            self._packing_pending.clear()
+            self._packing_reserved.clear()
+            self._packing_bytes = 0
+
+    def _drain_packing(self, until=None):
+        while self._packing_pending and (until is None or until not in self.records):
+            future, key, shape, charged = self._packing_pending.popleft()
+            encoding = future.result()
+            self._publish_mask(key, shape, encoding)
+            self._packing_bytes -= charged
+            self._packing_reserved.remove(key)
+            self._packing.release(future)
+
+    def _publish_mask(self, key, shape, encoding):
+        started = time.perf_counter()
+        encoded, packed_bytes, packed_hash, compressed_hash, foreground = encoding
+        offset = self._stream.tell()
+        if offset + len(encoded) > self.max_payload_bytes:
+            raise OSError('SAM evidence payload exceeds configured staging disk limit')
+        self._stream.write(encoded)
+        self.records[key] = dict(offset=offset, bytes=len(encoded), shape=list(shape),
+            packed_bytes=packed_bytes, sha256=packed_hash,
+            compressed_sha256=compressed_hash, foreground=foreground)
+        from .runtime import runtime_telemetry
+        runtime_telemetry().add('sam.consumer.mask_publish_host_seconds', time.perf_counter()-started)
+
     def _put(self, key, value, shape):
-        if key in self.records:
+        if key in self.records or key in self._packing_reserved:
             raise ValueError(f"Duplicate SAM mask identity: {key}")
         value = _mask(value, shape)
         if value.size > self.max_mask_bytes:
             raise MemoryError("SAM evidence mask exceeds configured memory limit")
-        packed = np.packbits(value.reshape(-1), bitorder="little").tobytes()
-        encoded = zlib.compress(packed, level=6)
-        offset = self._stream.tell()
-        if offset + len(encoded) > self.max_payload_bytes:
-            raise OSError("SAM evidence payload exceeds configured staging disk limit")
-        self._stream.write(encoded)
-        self.records[key] = dict(offset=offset, bytes=len(encoded), shape=list(shape),
-                                 packed_bytes=len(packed), sha256=hashlib.sha256(packed).hexdigest(),
-                                 compressed_sha256=hashlib.sha256(encoded).hexdigest(),
-                                 foreground=int(np.count_nonzero(value)))
+        parallel = self._packing
+        if parallel is not None:
+            self._packing_max_plane = max(self._packing_max_plane, int(value.size))
+            scratch = parallel.scratch_bytes(self._packing_max_plane)
+            # Include deflate's fixed window/state as well as snapshot,
+            # normalization, packed bytes and bounded compressed output.
+            charged = 3*int(value.size)+512*1024
+            worker_limit = parallel.cpu_worker_limit()
+            capacity = min(8, worker_limit, scratch//charged)
+            if capacity >= 2:
+                while (len(self._packing_pending) >= capacity
+                        or self._packing_bytes+charged > scratch):
+                    self._drain_packing(until=self._packing_pending[0][1])
+                # A lazy writer contract may reuse its yielded raster. Give
+                # helpers an owned snapshot rather than borrowing that buffer.
+                snapshot = np.array(value, dtype=np.bool_, copy=True, order='C')
+                snapshot.setflags(write=False)
+                future = parallel.submit(_mask_packing_pool(worker_limit), _encode_mask, snapshot)
+                self._packing_pending.append((future, key, tuple(shape), charged))
+                self._packing_reserved.add(key)
+                self._packing_bytes += charged
+                from .runtime import runtime_telemetry
+                runtime_telemetry().add('sam.consumer.parallel_mask_submissions', 1)
+                return key
+        self._drain_packing()
+        self._publish_mask(key, shape, _encode_mask(value))
         return key
 
     def add_group(self, group, masks):
@@ -555,6 +685,7 @@ class SamEvidenceWriter:
                 value=masks[name]
                 keys[name]=self._put(f"g/{identity}/{name}",value,np.asarray(value).shape)
             group.update(complete=False, geometry_contract_status="unresolved",mask_keys=keys)
+            self._drain_packing()
             self.groups[identity] = group
             return
         required = {f"{kind}:{frame}" for kind in ("acceptance", "write") for frame in frames}
@@ -585,6 +716,7 @@ class SamEvidenceWriter:
         group["mask_keys"] = {name: self._put(f"g/{identity}/{name}", masks[name], shape)
                               for name in sorted(masks)}
         group.setdefault("complete", group.get("status", "complete") not in {"incomplete", "unresolved"})
+        self._drain_packing()
         self.groups[identity] = group
 
     def add_run_tile(self, parent_run_id, tile_descriptor, raw_masks):
@@ -638,6 +770,7 @@ class SamEvidenceWriter:
                            for frame,mask in sorted(raw_masks.items())})
         tile["complete"] = attempted and bool(tile.get("complete", True)) and set(raw_masks)==set(expected)
         tile.setdefault("status", "generated_complete" if tile["complete"] else "generated_incomplete" if attempted else "unavailable_empty_original_seed")
+        self._drain_packing()
         pending[tile_id] = tile
 
     def add_run(self, run, raw_masks, candidate_masks=None, *, availability_masks=None):
@@ -746,15 +879,26 @@ class SamEvidenceWriter:
         run.setdefault("status", "generated_complete" if run["complete"] else "generated_incomplete")
         run.setdefault("pass_index", 1)
         run.setdefault("injected_frames", [expected[0]])
+        self._drain_packing()
         self.runs[identity] = run
         self._pending_tiles.pop(identity,None)
 
     def _read_staged(self, key):
+        self._drain_packing(until=key)
+        started, cpu_started = time.perf_counter(), time.thread_time()
         self._stream.flush()
         with (self.staging / "masks.bin").open("rb") as stream:
-            return _decode_mask(stream, self.records[key], self.max_mask_bytes)
+            result = _decode_mask(stream, self.records[key], self.max_mask_bytes)
+        from .runtime import runtime_telemetry
+        telemetry = runtime_telemetry()
+        telemetry.add('sam.consumer.evidence_read_host_seconds', time.perf_counter()-started)
+        telemetry.add('sam.consumer.evidence_read_thread_cpu_seconds', time.thread_time()-cpu_started)
+        return result
 
     def commit(self, *, complete=True):
+        if complete and self._packing_failure:
+            raise RuntimeError('SAM evidence packing failed; successful publication is forbidden')
+        self._drain_packing()
         if self._import_source is not None:
             raise RuntimeError("SAM evidence import transaction must finish before publication")
         _evidence_frame_geometry(self.scope, self.groups, self.runs)
@@ -780,21 +924,29 @@ class SamEvidenceWriter:
             manifest["tile_evidence_schema"] = TILE_EVIDENCE_SCHEMA
         manifest["evidence_fingerprint"] = fingerprint(manifest)
         (self.staging / "manifest.json").write_bytes(_json_bytes(manifest))
-        os.replace(self.staging, self.directory)
+        if split_reference(self.directory):
+            publish_directory(self.staging, self.directory)
+            shutil.rmtree(self.staging)
+        else:
+            os.replace(self.staging, self.directory)
         self._closed = True
         return SamEvidenceBundle.open(self.directory, max_mask_bytes=self.max_mask_bytes)
 
     close = commit
 
     def abort(self):
-        stream = getattr(self, "_stream", None)
-        if stream is not None and not stream.closed:
-            stream.close()
-        staging = getattr(self, "staging", None)
-        if staging is not None and staging.exists():
-            # This UUID-owned staging directory is the only tree removed here.
-            shutil.rmtree(staging)
-        self._closed = True
+        try:
+            if getattr(self, '_packing', None) is not None:
+                self._cancel_packing()
+        finally:
+            stream = getattr(self, "_stream", None)
+            if stream is not None and not stream.closed:
+                stream.close()
+            staging = getattr(self, "staging", None)
+            if staging is not None and staging.exists():
+                # This UUID-owned staging directory is the only tree removed here.
+                shutil.rmtree(staging)
+            self._closed = True
 
     def __enter__(self):
         return self
@@ -905,9 +1057,9 @@ class SamEvidenceBundle:
     @classmethod
     def open(cls, directory, *, verify=True, max_mask_bytes=64 * 1024 * 1024):
         self = cls()
-        self.directory = Path(directory).resolve()
+        self.directory = _bundle_path(directory)
         self.max_mask_bytes = int(max_mask_bytes)
-        manifest = json.loads((self.directory / "manifest.json").read_text("utf-8"))
+        manifest = json.loads(read_artifact(self.directory / "manifest.json", max_bytes=64 * 1024**2))
         if manifest.get("schema") != SCHEMA:
             raise ValueError("Unsupported SAM proposal evidence schema")
         saved = manifest.get("evidence_fingerprint")
@@ -917,13 +1069,14 @@ class SamEvidenceBundle:
             raise ValueError("SAM evidence files must use the portable fixed-file contract")
         for name, entry in manifest["files"].items():
             path = self.directory / name
-            if not path.resolve().is_relative_to(self.directory) or path.stat().st_size != entry["bytes"]:
+            if ((not split_reference(path) and not path.resolve().is_relative_to(self.directory))
+                    or artifact_size(path) != entry["bytes"]):
                 raise ValueError("Missing or escaped SAM evidence payload")
             if verify and _file_hash(path) != entry["sha256"]:
                 raise ValueError("SAM evidence file checksum mismatch")
         if manifest["files"]["index.json"]["bytes"] > 64 * 1024**2:
             raise MemoryError("SAM evidence index exceeds bounded metadata budget")
-        index = json.loads((self.directory / "index.json").read_text("utf-8"))
+        index = json.loads(read_artifact(self.directory / "index.json", max_bytes=64 * 1024**2))
         self.groups, self.runs, self.records = _freeze(index["groups"]), _freeze(index["runs"]), _freeze(index["masks"])
         self.unfinalized_tile_runs = _freeze(index.get("unfinalized_tile_runs",{}))
         self.manifest, self.scope = _freeze(manifest), _freeze(manifest["scope"])
@@ -938,7 +1091,7 @@ class SamEvidenceBundle:
         return self
 
     def mask(self, key):
-        with (self.directory / "masks.bin").open("rb") as stream:
+        with open_artifact(self.directory / "masks.bin") as stream:
             return _decode_mask(stream, self.records[str(key)], self.max_mask_bytes)
 
     def group_mask(self, group_id, name):
@@ -966,7 +1119,7 @@ class SamEvidenceBundle:
         if canvas_shape_yx is not None and tuple(canvas_shape_yx) != shape[1:]:
             raise ValueError('Raw SAM contact canvas differs from the caller\'s original planned geometry')
         record = self.records[run['raw_mask_keys'][str(int(frame))]]
-        with (self.directory / 'masks.bin').open('rb') as stream:
+        with open_artifact(self.directory / 'masks.bin') as stream:
             return _decode_raw_crop_boundary_contacts_with_foreground(stream, record, self.max_mask_bytes,
                 box, shape[1:])
 
@@ -1026,12 +1179,12 @@ class SamEvidenceBundle:
 
     def assert_unchanged(self):
         """Verify publication identity after lazy reads and before publishing replay."""
-        current = json.loads((self.directory / "manifest.json").read_text("utf-8"))
+        current = json.loads(read_artifact(self.directory / "manifest.json", max_bytes=64 * 1024**2))
         if current != _plain(self.manifest):
             raise ValueError("SAM evidence manifest changed during selection/replay")
         for name, entry in self.manifest["files"].items():
             path = self.directory / name
-            if path.stat().st_size != int(entry["bytes"]) or _file_hash(path) != entry["sha256"]:
+            if artifact_size(path) != int(entry["bytes"]) or _file_hash(path) != entry["sha256"]:
                 raise ValueError("SAM evidence payload changed during selection/replay")
 
 
@@ -1162,17 +1315,17 @@ def load_sam_online_selection(bundle, *, policy_hash=None, selected_run_ids=None
         bundle = SamEvidenceBundle.open(bundle)
     path = bundle.directory / "online_selection.json"
     exported = bundle.directory / "export.json"
-    if path.exists() != exported.exists():
+    if artifact_exists(path) != artifact_exists(exported):
         raise ValueError("Incomplete SAM online-selection export sidecars")
-    if not path.exists():
+    if not artifact_exists(path):
         path = bundle.directory.parent / "selection.json"
-    if not path.exists():
+    if not artifact_exists(path):
         if bundle.scope.get("selection_receipt_required", False):
             raise ValueError("Published SAM component filtering requires its retained online selection receipt")
         return None
-    if path.stat().st_size > int(max_receipt_bytes):
+    if artifact_size(path) > int(max_receipt_bytes):
         raise ValueError("SAM online selection receipt exceeds its bounded metadata budget")
-    encoded = path.read_bytes()
+    encoded = read_artifact(path, max_bytes=int(max_receipt_bytes))
     receipt = json.loads(encoded)
     if (receipt.get("schema") != "xta.sam_selection/1"
             or receipt.get("evidence_fingerprint") != bundle.evidence_fingerprint
@@ -1197,8 +1350,8 @@ def load_sam_online_selection(bundle, *, policy_hash=None, selected_run_ids=None
         raise ValueError("SAM published policy identity differs from its retained selection")
     if selected_run_ids is not None and set(map(str, selected_run_ids)) - set(receipt["selected_run_ids"]):
         raise ValueError("SAM published contributors differ from its retained selection")
-    if exported.exists():
-        metadata = json.loads(exported.read_text(encoding="utf-8"))
+    if artifact_exists(exported):
+        metadata = json.loads(read_artifact(exported, max_bytes=int(max_receipt_bytes)))
         expected = metadata.get("online_selection", {})
         if (metadata.get("schema") != "xta.sam_export/1"
                 or metadata.get("evidence_fingerprint") != bundle.evidence_fingerprint
@@ -1220,23 +1373,23 @@ def export_sam_evidence(source, destination):
     load_sam_online_selection(bundle)
     receipt_path = bundle.directory / "online_selection.json"
     export_path = bundle.directory / "export.json"
-    if receipt_path.exists() != export_path.exists():
+    if artifact_exists(receipt_path) != artifact_exists(export_path):
         raise ValueError("Incomplete SAM online-selection export sidecars")
-    exported_receipt = receipt_path.exists()
+    exported_receipt = artifact_exists(receipt_path)
     if not exported_receipt:
         receipt_path = bundle.directory.parent / "selection.json"
     receipt_bytes = None
-    if receipt_path.is_file():
-        if receipt_path.stat().st_size > 64 * 1024**2:
+    if artifact_exists(receipt_path):
+        if artifact_size(receipt_path) > 64 * 1024**2:
             raise ValueError("SAM online selection receipt exceeds its bounded metadata budget")
-        receipt_bytes = receipt_path.read_bytes()
+        receipt_bytes = read_artifact(receipt_path, max_bytes=64 * 1024**2)
         receipt = json.loads(receipt_bytes)
         if (receipt.get("schema") != "xta.sam_selection/1"
                 or receipt.get("evidence_fingerprint") != bundle.evidence_fingerprint
                 or set(receipt.get("selected_run_ids", ())) - set(bundle.runs)):
             raise ValueError("SAM online selection receipt does not belong to its proposal bundle")
         if exported_receipt:
-            exported = json.loads(export_path.read_text(encoding="utf-8"))
+            exported = json.loads(read_artifact(export_path, max_bytes=64 * 1024**2))
             expected = exported.get("online_selection", {})
             if (exported.get("schema") != "xta.sam_export/1"
                     or exported.get("evidence_fingerprint") != bundle.evidence_fingerprint
@@ -1244,15 +1397,19 @@ def export_sam_evidence(source, destination):
                     or expected.get("bytes") != len(receipt_bytes)
                     or expected.get("sha256") != hashlib.sha256(receipt_bytes).hexdigest()):
                 raise ValueError("SAM exported online selection checksum or identity differs")
-    destination = Path(destination).resolve()
-    if destination.exists():
+    destination = _bundle_path(destination)
+    if artifact_exists(destination):
         raise FileExistsError("SAM evidence export destination must be fresh")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    staging = destination.parent / ("." + destination.name + ".export-" + uuid.uuid4().hex)
-    staging.mkdir()
+    if split_reference(destination):
+        staging = Path(tempfile.mkdtemp(prefix="xta-sam-export-"))
+    else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        staging = destination.parent / ("." + destination.name + ".export-" + uuid.uuid4().hex)
+        staging.mkdir()
     try:
         for name in ("manifest.json", "index.json", "masks.bin"):
-            shutil.copyfile(bundle.directory / name, staging / name)
+            with open_artifact(bundle.directory / name) as source_file, (staging / name).open("wb") as target_file:
+                shutil.copyfileobj(source_file, target_file, length=1024 * 1024)
         if receipt_bytes is not None:
             (staging / "online_selection.json").write_bytes(receipt_bytes)
             (staging / "export.json").write_bytes(_json_bytes(dict(
@@ -1262,9 +1419,13 @@ def export_sam_evidence(source, destination):
                 semantics="Retained online measurements and selection; raw bundle unchanged.")))
         SamEvidenceBundle.open(staging)
         bundle.assert_unchanged()
-        if receipt_bytes is not None and receipt_path.read_bytes() != receipt_bytes:
+        if receipt_bytes is not None and read_artifact(receipt_path, max_bytes=64 * 1024**2) != receipt_bytes:
             raise RuntimeError("SAM online selection changed during export")
-        os.replace(staging, destination)
+        if split_reference(destination):
+            publish_directory(staging, destination)
+            shutil.rmtree(staging)
+        else:
+            os.replace(staging, destination)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise

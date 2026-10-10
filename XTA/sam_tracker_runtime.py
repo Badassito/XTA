@@ -8,6 +8,7 @@ by the admitted worker for its lifetime. Quality selection happens elsewhere.
 from __future__ import annotations
 
 from collections import OrderedDict, deque
+from contextlib import contextmanager
 import copy
 import hashlib
 import json
@@ -31,7 +32,15 @@ _LIVE_SAM_TRACKERS = weakref.WeakSet()
 _LIVE_SAM_TRACKERS_LOCK = threading.Lock()
 _SAM_SNAPSHOT_COUNTS = ('active_scopes', 'credited_scopes', 'ready_jobs', 'preparing_jobs',
     'running_jobs', 'acked_awaiting_consumer_jobs', 'consumer_held_jobs',
-    'live_prepared_bank_bytes', 'submitted_jobs', 'completed_jobs', 'completion_acks')
+    'live_prepared_bank_bytes', 'submitted_jobs', 'completed_jobs', 'completion_acks',
+    'raw_transfer_decode_seconds', 'consumer_hold_seconds')
+
+
+def _consumer_time(stage, started, cpu_started):
+    from .runtime import runtime_telemetry
+    telemetry = runtime_telemetry()
+    telemetry.add(f'sam.consumer.{stage}_host_seconds', time.perf_counter()-started)
+    telemetry.add(f'sam.consumer.{stage}_thread_cpu_seconds', time.thread_time()-cpu_started)
 
 
 def _sam_scheduler_sample():
@@ -39,6 +48,7 @@ def _sam_scheduler_sample():
         trackers = tuple(_LIVE_SAM_TRACKERS)
     snapshots = tuple(tracker.snapshot() for tracker in trackers)
     return dict(sample_monotonic_ns=time.monotonic_ns(), tracker_instances=len(snapshots),
+        scope_consumers=[scope for row in snapshots for scope in row.get('scope_consumers', ())],
         closed_instances=sum(row['closed'] for row in snapshots),
         cancelled_instances=sum(row['cancelled'] for row in snapshots),
         **{key: sum(row[key] for row in snapshots) for key in _SAM_SNAPSHOT_COUNTS})
@@ -252,6 +262,7 @@ class SamTrackerRunResult:
     tracker_scores: Mapping[int, float | None]
     observation_status: Mapping[int, str]
     receipt: Mapping[str, object]
+    packing_admission: object | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -497,11 +508,14 @@ def load_tracker_run_result(
 
     path, manifest = _read_tracker_manifest(manifest_path, expected_sha256=expected_sha256)
     packet = manifest["raw_masks"]
+    started, cpu_started = time.perf_counter(), time.thread_time()
     artifact = Path(packet["path"]).resolve(strict=True)
     if artifact.parent != path.parent:
         raise RuntimeError("SAM raw masks artifact escaped its run directory")
     if artifact.stat().st_size != packet["size_bytes"] or _sha256(artifact) != packet["sha256"]:
         raise RuntimeError("SAM raw mask transfer checksum/size changed")
+    _consumer_time('raw_packet_verify', started, cpu_started)
+    started, cpu_started = time.perf_counter(), time.thread_time()
     with np.load(artifact, allow_pickle=False) as saved:
         packed = saved["packed_masks"].copy()
         if saved["shape"].dtype.kind not in "iu" or saved["frame_indices"].dtype.kind not in "iu":
@@ -510,6 +524,7 @@ def load_tracker_run_result(
         frames = tuple(_integer(value, "raw frame") for value in saved["frame_indices"])
         scores = saved["tracker_scores"].copy()
         removed = saved["removed"].copy()
+    _consumer_time('raw_packet_decode', started, cpu_started)
     crop = tuple(_integer(value, "manifest crop") for value in manifest["crop_xyxy"])
     expected_shape = (crop[3] - crop[1], crop[2] - crop[0])
     if shape != expected_shape or min(shape) < 1:
@@ -537,8 +552,14 @@ def load_tracker_run_result(
         for flag, score in zip(removed, scores)
     ):
         raise RuntimeError("SAM raw tracker score/status packet has invalid values")
-    masks = np.unpackbits(packed, axis=1, count=math.prod(shape)).reshape(count, *shape).astype(bool)
+    # unpackbits owns fresh 0/1 bytes. Borrow them as Boolean masks instead of
+    # allocating/copying a second complete history, and freeze the owner too.
+    started, cpu_started = time.perf_counter(), time.thread_time()
+    unpacked = np.unpackbits(packed, axis=1, count=math.prod(shape))
+    unpacked.setflags(write=False)
+    masks = unpacked.view(np.bool_).reshape(count, *shape)
     masks.setflags(write=False)
+    _consumer_time('raw_unpack', started, cpu_started)
     return SamTrackerRunResult(
         frames={frame: masks[index] for index, frame in enumerate(frames)},
         tracker_scores={frame: None if removed[index] else float(scores[index])
@@ -569,7 +590,12 @@ class _TrackerScope:
     preparing: int = 0
     transfer_held: bool = False
     transfer_received_monotonic: float = 0.
+    # Match decode durations; keep monotonic above for dispatch ordering.
+    transfer_received_perf_counter: float = 0.
     raw_decode_started_monotonic: float | None = None
+    consumer_stage: str | None = None
+    producer_thread_id: int = field(default_factory=threading.get_ident)
+    held_run_id: str | None = None
     source_exhausted: bool = False
     closing: bool = False
     abandoned: bool = False
@@ -625,7 +651,10 @@ class _PoolScheduler:
                     prepared, device, event = scope.completed.popleft()
                     scope.transfer_held = True
                     scope.transfer_received_monotonic = time.monotonic()
+                    scope.transfer_received_perf_counter = time.perf_counter()
                     scope.raw_decode_started_monotonic = None
+                    scope.consumer_stage = 'refill'
+                    scope.held_run_id = str(prepared.task.payload['run_id'])
                     self._condition.notify_all()
                     return prepared, device, event
                 self._condition.wait(timeout=0.05)
@@ -663,6 +692,9 @@ class _PoolScheduler:
                 self.tracker._slot_submissions[slot], slot))
         selected, lease = None, None
         for candidate in candidates:
+            if (self.tracker._compute_yield_requested is not None
+                    and self.tracker._compute_yield_requested(candidate[0])):
+                continue
             if self.tracker._compute_lease_factory is None:
                 selected = candidate
                 break
@@ -848,8 +880,9 @@ class SamInterpolationTracker:
         feature_cache_bytes: int = 512 * 1024 * 1024,
         feature_cache_headroom_bytes: int | None = None,
         session_cpu_budget_bytes: int = 2 * 1024**3,
-        compute_lease_factory=None, compute_lease_release=None,
+        compute_lease_factory=None, compute_lease_release=None, compute_yield_requested=None,
         residency_quarantine=None, before_worker_shutdown=None, after_worker_shutdown=None,
+        progressive_pool=None,
     ) -> None:
         self.model_path = str(model_path)
         self.device_ids = tuple(_integer(value, "device_id") for value in device_ids)
@@ -858,9 +891,13 @@ class SamInterpolationTracker:
         self.workers_per_device = _integer(workers_per_device, 'workers_per_device')
         if self.workers_per_device not in (1, 2):
             raise ValueError('SAM workers_per_device must be one or two isolated predictor processes')
-        self.worker_slots = tuple((device, index) for device in self.device_ids
+        self._configured_worker_slots = tuple((device, index) for device in self.device_ids
             for index in range(self.workers_per_device))
-        self.worker_count = len(self.worker_slots)
+        self.worker_slots = self._configured_worker_slots if progressive_pool is None else ()
+        self.worker_count = len(self._configured_worker_slots)
+        self._progressive_pool = progressive_pool
+        self._device_worker_counts = {}
+        self._active_allocator_fractions = {}
         self.cuda_allocator_fractions = None
         if cuda_allocator_fractions is not None:
             if self.workers_per_device != 2 or not isinstance(cuda_allocator_fractions, Mapping):
@@ -886,11 +923,12 @@ class SamInterpolationTracker:
             self.feature_cache_headroom_bytes is not None and self.feature_cache_headroom_bytes < 0
         ):
             raise ValueError("SAM feature-cache byte limits must be nonnegative")
-        self._pool = None
-        self._residency_released = True
+        self._pool = progressive_pool
+        self._residency_released = progressive_pool is None
         self._closed = False
         self._run_index = 0
-        self._cancel = threading.Event()
+        self._cancel = (getattr(progressive_pool, 'cancel_event', None)
+            if progressive_pool is not None else None) or threading.Event()
         self._cancel_reason = "SAM tracker operation cancelled"
         self._state_condition = threading.Condition(threading.RLock())
         self._scopes = {}
@@ -899,7 +937,7 @@ class SamInterpolationTracker:
         self._scheduler = None
         self._crop_affinity: OrderedDict[tuple[object, ...], int] = OrderedDict()
         self._device_submissions = {device: 0 for device in self.device_ids}
-        self._slot_submissions = {slot: 0 for slot in self.worker_slots}
+        self._slot_submissions = {slot: 0 for slot in self._configured_worker_slots}
         self._worker_pids = {}
         self._startup_receipts = ()
         self.dispatch_stats = {
@@ -908,11 +946,13 @@ class SamInterpolationTracker:
             "completion_manifest_validation_seconds": 0.0,
             "raw_transfer_decode_seconds": 0.0, "refilled_before_raw_transfer": 0,
             "completion_acks_pumped": 0,
+            "consumer_hold_seconds": 0.0,
         }
         self._source_cache_ref = None
         self._source_cache_retirement_proofs = {}
         self._compute_lease_factory = compute_lease_factory
         self._compute_lease_release = compute_lease_release
+        self._compute_yield_requested = compute_yield_requested
         self._residency_quarantine = residency_quarantine
         self._before_worker_shutdown = before_worker_shutdown
         self._after_worker_shutdown = after_worker_shutdown
@@ -921,6 +961,21 @@ class SamInterpolationTracker:
         if source_cache_ref is not None:
             self.set_source_cache(source_cache_ref)
         _register_sam_scheduler_sample(self)
+
+    def has_ready_work(self):
+        """Read runnable SDK envelopes without entering the context GPU lock."""
+        with self._state_condition:
+            if self._closed or self._cancel.is_set():
+                return False
+            return any(not scope.closing and scope.ready and scope.running < scope.capacity
+                       and not (scope.deferred and (scope.completed or scope.transfer_held))
+                       for scope in self._scopes.values())
+
+    @contextmanager
+    def idle_image_handoff(self):
+        """Fence enqueue/dispatch while an existing image source changes owner."""
+        with self._state_condition:
+            yield not self._closed and not self._cancel.is_set() and not self.has_ready_work()
 
     def snapshot(self):
         """Compact ownership counts; running includes worker CPU/packing phases."""
@@ -933,11 +988,27 @@ class SamInterpolationTracker:
                 running_jobs=sum(scope.running for scope in scopes),
                 acked_awaiting_consumer_jobs=sum(len(scope.completed) for scope in scopes),
                 consumer_held_jobs=sum(scope.transfer_held for scope in scopes),
+                scope_consumers=[dict(scope_token=scope.token,
+                    parent_scope_id=getattr(getattr(scope.admission, '_profile', None), 'scope_id', None),
+                    producer_thread_id=scope.producer_thread_id, held_run_id=scope.held_run_id,
+                    held_seconds=max(0., time.perf_counter()-scope.transfer_received_perf_counter)
+                        if scope.transfer_held else 0.,
+                    capacity=scope.capacity, lookahead=scope.lookahead, window=scope.window,
+                    outstanding=len(scope.outstanding), ready=len(scope.ready), running=scope.running,
+                    acked=len(scope.completed), held=scope.transfer_held,
+                    source_exhausted=scope.source_exhausted, consumer_stage=scope.consumer_stage)
+                    for scope in scopes],
                 live_prepared_bank_bytes=sum(int(scope.admission_limits['prepared_bank_bytes'])
                     for scope in scopes if scope.admission_limits is not None),
                 submitted_jobs=int(self.dispatch_stats['submitted']),
                 completed_jobs=int(self.dispatch_stats['completed']),
                 completion_acks=int(self.dispatch_stats['completion_acks_pumped']),
+                raw_transfer_decode_seconds=self.dispatch_stats['raw_transfer_decode_seconds'],
+                # Held walltime includes refill, decode, evidence consumption
+                # and staging retirement; it is not exclusive CPU time.
+                consumer_hold_seconds=self.dispatch_stats['consumer_hold_seconds']+sum(
+                    max(0., time.perf_counter()-scope.transfer_received_perf_counter)
+                    for scope in scopes if scope.transfer_held),
                 closed=self._closed, cancelled=self._cancel.is_set())
 
     def set_source_cache(self, cache_ref: object) -> None:
@@ -989,23 +1060,21 @@ class SamInterpolationTracker:
         with self._pool_lifecycle_lock:
             return self._start_owned()
 
-    def _capture_worker_inventory(self):
-        ready = tuple(self._pool.ready_events)
+    def _validate_worker_inventory(self, ready, expected_slots, fractions, *, progressive=False):
+        ready = tuple(ready)
         slots = tuple((getattr(event, 'execution_device_id', None), getattr(event, 'worker_index', None)) for event in ready)
-        if (len(slots) != self.worker_count or set(slots) != set(self.worker_slots)
+        if (not slots or len(slots) != len(expected_slots) or set(slots) != set(expected_slots)
                 or any(type(device) is not int or type(index) is not int for device, index in slots)
                 or any(type(getattr(event, 'worker_pid', None)) is not int
                     or event.worker_pid <= 0 for event in ready)
-                or len({event.worker_pid for event in ready}) != self.worker_count):
+                or len({event.worker_pid for event in ready}) != len(expected_slots)):
             raise RuntimeError('SAM startup has no exact worker-slot/process readiness inventory')
-        self._worker_pids = {slot: event.worker_pid for slot, event in zip(slots, ready)}
-        self._startup_receipts = tuple(dict(execution_device_id=event.execution_device_id,
-            worker_index=event.worker_index, worker_pid=event.worker_pid,
-            sam_runtime=copy.deepcopy(event.metadata.get('sam_runtime', {}))) for event in ready)
-        if self.cuda_allocator_fractions is not None:
+        if fractions:
             for event in ready:
+                if str(event.execution_device_id) not in fractions:
+                    continue
                 quota = event.metadata.get('sam_runtime', {}).get('cuda_allocator_quota', {})
-                fraction = self.cuda_allocator_fractions[str(event.execution_device_id)]
+                fraction = fractions[str(event.execution_device_id)]
                 total, limit = quota.get('cuda_total_bytes'), quota.get('limit_bytes')
                 if (quota.get('schema') != 'xta.sam_cuda_allocator_quota/1'
                         or quota.get('enforcement') != 'torch_caching_allocator_fraction'
@@ -1019,15 +1088,86 @@ class SamInterpolationTracker:
                         or type(quota.get('cuda_free_bytes')) is not int
                         or not 0 <= quota['cuda_free_bytes'] <= total):
                     raise RuntimeError('SAM dual startup has no exact enforced allocator-quota/slot proof')
-        if self._compute_lease_factory is not None:
+        if self._compute_lease_factory is not None or progressive:
             for event in ready:
                 proof = event.metadata.get('sam_runtime', {}).get('startup_cuda_quiescence', {})
                 if (proof.get('synchronized') is not True
                         or type(proof.get('worker_local_device')) is not int or proof['worker_local_device'] != 0
-                        or self.workers_per_device == 2 and (
+                        or (self.workers_per_device == 2 or progressive) and (
                             type(proof.get('worker_index')) is not int or proof['worker_index'] != event.worker_index)):
                     raise RuntimeError('SAM startup has no exact worker CUDA-quiescence/slot proof')
+        return {slot: event.worker_pid for slot, event in zip(slots, ready)}, tuple(
+            dict(execution_device_id=event.execution_device_id, worker_index=event.worker_index,
+                worker_pid=event.worker_pid, sam_runtime=copy.deepcopy(event.metadata.get('sam_runtime', {})))
+            for event in ready)
+
+    def _capture_worker_inventory(self):
+        with self._state_condition:
+            self._worker_pids, self._startup_receipts = self._validate_worker_inventory(
+                self._pool.ready_events, self.worker_slots,
+                self.cuda_allocator_fractions if self._progressive_pool is None else self._active_allocator_fractions,
+                progressive=self._progressive_pool is not None)
+        if self._compute_lease_factory is not None or self._progressive_pool is not None:
             self.startup_cuda_quiescent = True
+
+    def worker_init(self, cuda_allocator_fractions=None):
+        """Use the configured whole-fleet CPU share for every fixed cohort."""
+        from .lta_workers import LtaWorkerInit
+        from .lta_cpu import resolve_worker_cpu_budget
+        fractions = (self.cuda_allocator_fractions if cuda_allocator_fractions is None
+            and self._progressive_pool is None else cuda_allocator_fractions)
+        return LtaWorkerInit(adapter_module='XTA.sam_tracker_runtime',
+            adapter_factory='build_interpolation_predictor', adapter_execute='execute_interpolation_tracker_task',
+            adapter_shutdown='close_interpolation_predictor', adapter_config=dict(
+                model_path=self.model_path, profile=self.profile, conf=0.0, max_num_objects=16,
+                feature_cache_bytes=self.feature_cache_bytes,
+                feature_cache_headroom_bytes=self.feature_cache_headroom_bytes,
+                sam_global_cpu_budget=resolve_worker_cpu_budget(self.worker_count),
+                **({'cuda_allocator_fractions': fractions} if fractions is not None else {})))
+
+    def register_device_pool(self, device_id, pool, *, cuda_allocator_fraction=None, admission_callback=None):
+        """Publish a proven ready cohort only after its residency is promoted."""
+        device = _integer(device_id, 'device_id')
+        if self._progressive_pool is None or self._pool is not self._progressive_pool:
+            raise RuntimeError('SAM device registration requires the owned progressive router')
+        count = _integer(getattr(pool, 'workers_per_device', None), 'workers_per_device')
+        if (device not in self.device_ids or count not in {1, self.workers_per_device}
+                or tuple(pool.device_ids) != (device,) or bool(pool.closed) or bool(pool.workers_settled)):
+            raise RuntimeError('SAM device cohort differs from configured live slots')
+        if count == 2:
+            fraction = cuda_allocator_fraction
+            if (isinstance(fraction, bool) or not isinstance(fraction, (int, float))
+                    or not math.isfinite(fraction) or not 0 < fraction <= .5):
+                raise RuntimeError('SAM dual cohort requires a measured allocator fraction')
+            fractions = {str(device): fraction}
+        else:
+            if cuda_allocator_fraction is not None:
+                raise RuntimeError('SAM single cohort cannot claim a dual allocator quota')
+            fractions = {}
+        slots = tuple((device, index) for index in range(count))
+        pids, receipts = self._validate_worker_inventory(pool.ready_events, slots, fractions, progressive=True)
+        pool.check_liveness()
+        with self._state_condition:
+            if self._closed or self._cancel.is_set() or device in self._device_worker_counts:
+                raise RuntimeError('SAM device cohort cannot register after cancellation or twice')
+            if set(pids.values()) & set(self._worker_pids.values()):
+                raise RuntimeError('SAM device cohort reused an existing worker PID')
+            if self._compute_lease_factory is not None and not callable(admission_callback):
+                raise RuntimeError('SAM device residency promotion callback is required')
+            if admission_callback is not None:
+                admission_callback()
+            if self._closed or self._cancel.is_set():
+                raise RuntimeError('SAM device registration was cancelled during residency promotion')
+            self._progressive_pool.register(device, pool)
+            self._device_worker_counts[device] = count
+            self._active_allocator_fractions.update(fractions)
+            self.worker_slots = tuple(self._progressive_pool.worker_slots)
+            self._worker_pids.update(pids)
+            self._startup_receipts += receipts
+            self.startup_cuda_quiescent = True
+            if self._scheduler is not None:
+                self._scheduler._free.update(slots)
+            self._state_condition.notify_all()
 
     @property
     def startup_receipts(self):
@@ -1040,6 +1180,8 @@ class SamInterpolationTracker:
             raise RuntimeError("SAM tracker has been closed")
         if self._cancel.is_set():
             raise RuntimeError(self._cancel_reason)
+        if self._progressive_pool is not None and not self.worker_slots:
+            raise RuntimeError('SAM progressive startup has no admitted ready device cohort')
         if self._pool is None:
             if self.workers_per_device == 2 and self.cuda_allocator_fractions is None:
                 raise RuntimeError('Dual SAM startup requires measured per-process CUDA allocator fractions')
@@ -1048,18 +1190,7 @@ class SamInterpolationTracker:
             try:
                 self._pool = LtaWorkerPool(
                     self.device_ids,
-                    LtaWorkerInit(
-                        adapter_module="XTA.sam_tracker_runtime",
-                        adapter_factory="build_interpolation_predictor",
-                        adapter_execute="execute_interpolation_tracker_task",
-                        adapter_shutdown="close_interpolation_predictor",
-                        adapter_config={"model_path": self.model_path, "profile": self.profile,
-                                        "conf": 0.0, "max_num_objects": 16,
-                                        "feature_cache_bytes": self.feature_cache_bytes,
-                                        "feature_cache_headroom_bytes": self.feature_cache_headroom_bytes,
-                                        **({"cuda_allocator_fractions": self.cuda_allocator_fractions}
-                                            if self.cuda_allocator_fractions is not None else {})},
-                    ), startup_timeout=self.startup_timeout, cancel_event=self._cancel,
+                    self.worker_init(), startup_timeout=self.startup_timeout, cancel_event=self._cancel,
                     workers_per_device=self.workers_per_device,
                 )
             except BaseException as error:
@@ -1075,6 +1206,15 @@ class SamInterpolationTracker:
     @property
     def workers_settled(self) -> bool:
         return self._residency_released if self._pool is None else bool(self._pool.workers_settled)
+
+    @property
+    def consumers_settled(self) -> bool:
+        with self._state_condition:
+            return not self._scopes
+
+    @property
+    def cleanup_settled(self) -> bool:
+        return self.workers_settled and self.consumers_settled
 
     @property
     def residency_released(self) -> bool:
@@ -1194,11 +1334,13 @@ class SamInterpolationTracker:
         return _SubmittedRun(input_index, task, output_dir, (cache_ref.identity_sha256, crop))
 
     def _remove_staging(self, directory: Path) -> None:
+        started, cpu_started = time.perf_counter(), time.thread_time()
         resolved = Path(directory).resolve(strict=False)
         if resolved.parent != self.artifact_root or not resolved.name.startswith("run-"):
             raise RuntimeError("SAM staging cleanup target is outside the admitted artifact root")
         if resolved.exists():
             shutil.rmtree(resolved)
+        _consumer_time('staging_remove', started, cpu_started)
 
     def _register_scope(self, cache_ref, *, capacity, deferred, admission, family_dispatch):
         """Claim bounded producer ownership before invoking any request factory."""
@@ -1265,6 +1407,9 @@ class SamInterpolationTracker:
         with self._state_condition:
             if self._scopes.pop(scope.token, None) is not scope:
                 raise RuntimeError('SAM scoped iterator changed during credit retirement')
+            if scope.transfer_held:
+                self.dispatch_stats['consumer_hold_seconds'] += max(
+                    0., time.perf_counter()-scope.transfer_received_perf_counter)
             if self._scheduler is not None:
                 try:
                     self._scheduler._round_robin.remove(scope.token)
@@ -1445,6 +1590,7 @@ class SamInterpolationTracker:
                 started = time.perf_counter()
                 with self._state_condition:
                     scope.raw_decode_started_monotonic = time.monotonic()
+                    scope.consumer_stage = 'raw_decode'
                 result = load_tracker_run_result(artifact_path, expected_sha256=event.artifact_sha256)
                 _validate_completion_manifest(result.receipt, prepared, device,
                     require_cuda=self._compute_lease_factory is not None,
@@ -1457,12 +1603,20 @@ class SamInterpolationTracker:
                     prepared_lookahead_jobs=scope.lookahead)
                 if prepared.family_id is not None:
                     receipt['dispatch']['family_id'] = prepared.family_id
+                packing = None if scope.admission is None else scope.admission.admit_mask_packing()
                 result = SamTrackerRunResult(result.frames, result.tracker_scores,
-                    result.observation_status, receipt)
+                    result.observation_status, receipt, packing)
                 with self._state_condition:
                     self.dispatch_stats['raw_transfer_decode_seconds'] += time.perf_counter()-started
                     self.dispatch_stats['completed'] += 1
-                yield prepared.input_index, result
+                    scope.consumer_stage = 'evidence_consumer'
+                try:
+                    yield prepared.input_index, result
+                finally:
+                    if packing is not None:
+                        packing.close()
+                with self._state_condition:
+                    scope.consumer_stage = 'staging_cleanup'
                 self._remove_staging(prepared.output_directory)
                 scope.staging_directories.discard(prepared.output_directory)
                 del result
@@ -1470,7 +1624,11 @@ class SamInterpolationTracker:
                     identity = prepared.task.work_id, prepared.task.attempt_token
                     if scope.outstanding.pop(identity, None) is None or not scope.transfer_held:
                         raise RuntimeError('SAM scope lost its consumed raw-packet owner')
+                    self.dispatch_stats['consumer_hold_seconds'] += max(
+                        0., time.perf_counter()-scope.transfer_received_perf_counter)
                     scope.transfer_held = False
+                    scope.consumer_stage = None
+                    scope.held_run_id = None
                     scope.consumed += 1
                     self._state_condition.notify_all()
             if self._cancel.is_set():
@@ -1628,6 +1786,11 @@ class SamInterpolationTracker:
         if not isinstance(result, SamTrackerRunResult):
             raise TypeError("result must be a SamTrackerRunResult")
         directory = Path(str(result.receipt["temporary_artifact_directory"])).resolve(strict=False)
+        scope_token = result.receipt.get('dispatch', {}).get('scope_token')
+        with self._state_condition:
+            scope = self._scopes.get(scope_token)
+            if scope is not None and scope.transfer_held:
+                scope.consumer_stage = 'staging_cleanup'
         self._remove_staging(directory)
 
     def __enter__(self) -> "SamInterpolationTracker":
@@ -1638,6 +1801,9 @@ class SamInterpolationTracker:
 
 
 def build_interpolation_predictor(config: Mapping[str, object]):
+    if config.get('sam_global_cpu_budget') is not None:
+        from .lta_cpu import bind_worker_cpu_environment
+        bind_worker_cpu_environment(config['sam_global_cpu_budget'])
     from .lta_worker_adapter import build_worker_predictor, close_worker_predictor
     from .lta_sam import resolve_local_sam_bundle
 

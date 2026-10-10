@@ -124,6 +124,8 @@ def _temporary_reason(relative, info, owned_run):
 
 def _category(relative):
     parts = relative.parts
+    if parts == ("sam-artifacts.tar",):
+        return "scientific_evidence"
     if parts[0] in {"telemetry", "lta_diagnostics"} and relative.suffix == ".jsonl":
         return "telemetry"
     if parts[0] in {"sam_interpolation", "sam_extrapolation", "reconciliation_evidence"}:

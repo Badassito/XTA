@@ -31,6 +31,7 @@ from .geometry import ViewInfo
 from .cylindrical_owner import is_radial_owner_task
 from .runtime import _MemfdTransferBatch, runtime_trace_event
 from .scheduler_diagnostics import scheduler_operation, scheduler_step
+from .backprojection import GpuInferenceAssetsRetired, _make_gpu_inference_assets_retired_proof
 
 
 _SELECTION_KEY_UNSET = object()
@@ -123,6 +124,8 @@ class TtaSchedulerOperations:
     workspace_anon_cap_bytes: Callable[[], int]
     _set_main_process_gpu_spherical_retirement_pressure: Optional[Callable[[bool], object]] = None
     staged_ram_backlog_bytes: Optional[Callable[[], int]] = None
+    gpu_stage_epoch: Optional[Callable[[], int]] = None
+    _main_process_gpu_stage_can_dispatch_auxiliary: Optional[Callable[[int], bool]] = None
 
 
 @dataclass(frozen=True)
@@ -166,6 +169,7 @@ class TtaSchedulerCallbacks:
     handle_tile_worker_result: Callable[[Dict[str, object], Dict[str, object]], None]
     announce_process_inference_drain_if_complete: Callable[[], None]
     check_parent_affinity: Callable[[], None]
+    gpu_inference_assets_retired: Optional[Callable[[GpuInferenceAssetsRetired], None]] = None
 
 
 @dataclass
@@ -286,6 +290,8 @@ class TtaSchedulerState:
     gpu_inference_asset_release_requested: bool = False
     gpu_inference_asset_release_pending_by_worker: Dict[int, int] = field(default_factory=dict)
     gpu_inference_asset_release_results_by_worker: Dict[int, Dict[str, object]] = field(default_factory=dict)
+    gpu_inference_asset_release_epoch: Optional[int] = None
+    gpu_inference_asset_release_proofs_by_worker: Dict[int, GpuInferenceAssetsRetired] = field(default_factory=dict)
     d1_owner_by_parent: Dict[Tuple[str, str], int] = field(default_factory=dict)
     d1_active_parent_by_worker: Dict[int, Tuple[str, str]] = field(default_factory=dict)
     d1_layer_ref_by_parent: Dict[Tuple[str, str], object] = field(default_factory=dict)
@@ -2451,10 +2457,12 @@ class TtaScheduler:
                 aux_pool.revoke_worker(worker_id)
             return
         for worker_id in worker_ids:
+            available = (self.operations._main_process_gpu_stage_can_dispatch_auxiliary
+                         or self.operations._main_process_gpu_stage_can_dispatch_inference)
             if (
                 self.gpu_worker_inflight(worker_id) == 0
                 and worker_id in self.state.gpu_inference_asset_release_results_by_worker
-                and self.operations._main_process_gpu_stage_can_dispatch_inference(worker_id)
+                and available(worker_id)
             ):
                 # Feeder exclusivity ends at global drain; post-inference interpolation may
                 # reclaim the worker's full inherited allocation.
@@ -2505,6 +2513,14 @@ class TtaScheduler:
         if state.gpu_inference_asset_release_requested:
             return self.gpu_inference_asset_release_complete()
 
+        epoch_probe = self.operations.gpu_stage_epoch
+        callback = None if self._callbacks is None else self._callbacks.gpu_inference_assets_retired
+        if callback is not None and epoch_probe is None:
+            raise RuntimeError('Progressive GPU asset retirement requires the coordinator epoch')
+        epoch = None if epoch_probe is None else epoch_probe()
+        if epoch is not None and (type(epoch) is not int or epoch < 0):
+            raise RuntimeError('Invalid coordinator epoch before GPU asset retirement')
+
         aux_pool = self.operations.gpu_worker_aux_interpolation_pool()
         if aux_pool is not None:
             for worker in worker_ids:
@@ -2521,6 +2537,7 @@ class TtaScheduler:
         # Register the complete barrier before dispatch. A queue failure is fatal
         # and cannot make an unacknowledged worker appear released.
         state.gpu_inference_asset_release_requested = True
+        state.gpu_inference_asset_release_epoch = epoch
         state.gpu_inference_asset_release_pending_by_worker.update(
             (worker, int(command['task_id'])) for worker, command in controls.items()
         )
@@ -2533,15 +2550,34 @@ class TtaScheduler:
 
     def _process_inference_asset_release_result(self, msg: Dict[str, object]) -> None:
         state = self.state
-        worker = int(msg.get('gpu_index', -1))
-        task_id = int(msg.get('task_id', 0))
+        worker = msg.get('gpu_index', -1)
+        task_id = msg.get('task_id', 0)
         if (
-            str(msg.get('worker_kind', 'gpu')).lower() != 'gpu'
+            type(worker) is not int or type(task_id) is not int
+            or type(msg.get('ok')) is not bool
+            or str(msg.get('worker_kind', 'gpu')).lower() != 'gpu'
             or str(msg.get('op', '')) != 'release_inference_assets'
             or worker not in state.gpu_task_queues
             or task_id >= 0
         ):
             raise RuntimeError(f'Invalid inference-asset release acknowledgement: worker={worker}, task={task_id}')
+        stats_value = msg.get('stats') or {}
+        if not isinstance(stats_value, Mapping):
+            raise RuntimeError('Invalid inference-asset release acknowledgement stats')
+        stats = dict(stats_value)
+        ok = msg['ok']
+        if ok and (stats.get('released') is not True or stats.get('assets_intact', False) is not False
+                   or stats.get('phase', 'released') != 'released'):
+            raise RuntimeError('Successful inference-asset release did not prove completed retirement')
+        safe_refusal = bool(
+            stats.get('assets_intact') is True and stats.get('released', False) is False
+            and str(stats.get('phase', '')) == 'validate_drain'
+        )
+        if not ok and not safe_refusal:
+            raise RuntimeError(
+                f'GPU worker {worker} failed during inference-asset release '
+                f'(task {task_id}): {msg.get("error")}\n{msg.get("traceback")}'
+            )
         completed = state.gpu_inference_asset_release_results_by_worker.get(worker)
         if completed is not None:
             if task_id == int(completed['task_id']) and bool(msg.get('ok')) == bool(completed['ok']):
@@ -2550,17 +2586,6 @@ class TtaScheduler:
         expected = state.gpu_inference_asset_release_pending_by_worker.get(worker)
         if expected is None or int(expected) != task_id:
             raise RuntimeError(f'Unrequested inference-asset release acknowledgement: worker={worker}, task={task_id}')
-        stats = dict(msg.get('stats') or {})
-        ok = bool(msg.get('ok'))
-        safe_refusal = bool(
-            stats.get('assets_intact', False)
-            and str(stats.get('phase', '')) == 'validate_drain'
-        )
-        if not ok and not safe_refusal:
-            raise RuntimeError(
-                f'GPU worker {worker} failed during inference-asset release '
-                f'(task {task_id}): {msg.get("error")}\n{msg.get("traceback")}'
-            )
         record = {'task_id': task_id, 'ok': ok, 'stats': stats, 'error': str(msg.get('error') or '')}
         state.gpu_inference_asset_release_results_by_worker[worker] = record
         del state.gpu_inference_asset_release_pending_by_worker[worker]
@@ -2570,6 +2595,12 @@ class TtaScheduler:
         if not ok:
             self._telemetry_add('inference.asset_release.safe_refusals', 1)
             print(f'GPU worker {worker} retained inference assets: {record["error"]}; continuing with existing memory admission.')
+        elif state.gpu_inference_asset_release_epoch is not None:
+            proof = _make_gpu_inference_assets_retired_proof(worker, task_id, state.gpu_inference_asset_release_epoch)
+            state.gpu_inference_asset_release_proofs_by_worker[worker] = proof
+            callback = self._result_callbacks().gpu_inference_assets_retired
+            if callback is not None:
+                callback(proof)
         if self.gpu_inference_asset_release_complete():
             self._result_callbacks().announce_process_inference_drain_if_complete()
         self.refresh_gpu_aux_interpolation_leases()

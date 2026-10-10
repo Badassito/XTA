@@ -23,6 +23,8 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 if str(REPOSITORY) not in sys.path:
     sys.path.insert(0, str(REPOSITORY))
 
+from XTA.artifact_archive import artifact_size, iter_artifacts, reference, split_reference
+
 
 def write_json(path, value):
     Path(path).write_text(json.dumps(value, indent=2, default=str), encoding="utf-8")
@@ -920,15 +922,21 @@ def replay(args):
         start = time.perf_counter()
         receipt = select_sam_proposals(bundle)
         regenerated = rebuild(bundle,receipt,observations)
+        members = tuple(iter_artifacts(bundle.directory, recursive=False))
         rows.append({"case":case["id"],"status":"passed" if np.array_equal(online,regenerated) else "mismatch",
                      "bundle_open_seconds":opened,"replay_selection_and_rebuild_seconds":time.perf_counter()-start,
                      "exact_online_union":bool(np.array_equal(online,regenerated)),
-                     "bundle_files":len(list(bundle.directory.iterdir())),
-                     "bundle_bytes":sum(p.stat().st_size for p in bundle.directory.iterdir() if p.is_file()),
+                     "bundle_files":len(members),
+                     "bundle_bytes":sum(artifact_size(p) for p in members if split_reference(p) is not None or p.is_file()),
                      "policy_hash":receipt["policy_hash"]})
     dependency_checks = []
     integrated_path = args.output/"integrated_controlled_sam_consolidated"/"sam_interpolation"
-    for path in integrated_path.rglob("evidence/manifest.json"):
+    roots = [integrated_path]
+    archive = integrated_path.parent / 'sam-artifacts.tar'
+    if archive.is_file():
+        roots.append(Path(reference(archive, 'sam_interpolation')))
+    manifests = sorted(path for root in roots for path in iter_artifacts(root, 'evidence/manifest.json'))
+    for path in manifests:
         bundle = SamEvidenceBundle.open(path.parent)
         fingerprints = {}
         for key in ("input_fingerprints","upstream_fingerprints","gate_support_fingerprints"):

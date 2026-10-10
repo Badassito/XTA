@@ -25,7 +25,8 @@ _MAX_COMPONENT_RECORDS = 128
 _QUALIFIED_LEGACY_IMPLEMENTATION = "bac0f301626e20500c3b8beab261b1f9ea64289de2af2add26b883507495a780"
 _QUALIFIED_PREVIOUS_IMPLEMENTATION = "96278bbc549acb81c54f1e6f8124faa1d091ffbca378e98cd73d09040f44368c"
 _QUALIFIED_RADIUS_ONLY_IMPLEMENTATION = "c67e0fed11962aba7b106cb7dce3f60b5eb6ce44b042159cb73cc99767c78cf7"
-_QUALIFIED_NUMERICAL_SOURCE = "c98e939e8187951f7f77a78c3401800bf2d85405c4acd9cde8c65f9ae8f33fd3"
+_QUALIFIED_PRE_BOOLEAN_IMPLEMENTATION = "dc97330222b3ca987787cff5451525d8917a43ece38058221d091c99a789c10b"
+_QUALIFIED_NUMERICAL_SOURCE = "20944399631c47bbb1ecab1999ebf40ba7141ca7a60f36fa4750614ccfa86d84"
 
 
 def assert_filter_implementation_unchanged():
@@ -66,7 +67,7 @@ def _compatible_filter_implementation(identifier):
     if identifier == IMPLEMENTATION_SHA256:
         return True
     if identifier not in (_QUALIFIED_LEGACY_IMPLEMENTATION, _QUALIFIED_PREVIOUS_IMPLEMENTATION,
-                          _QUALIFIED_RADIUS_ONLY_IMPLEMENTATION):
+                          _QUALIFIED_RADIUS_ONLY_IMPLEMENTATION, _QUALIFIED_PRE_BOOLEAN_IMPLEMENTATION):
         return False
     # The bounded radius implementation preserves the original padded EDT and
     # complete-component decision. Bind historical receipts to every numerical
@@ -181,7 +182,7 @@ def filter_sam_components(raw_mask, min_radius, *, enabled=True):
     assert_filter_implementation_unchanged()
     raw = np.asarray(raw_mask)
     threshold = float(min_radius)
-    if raw.ndim != 2 or not np.isin(raw, (0, 1)).all():
+    if raw.ndim != 2 or (raw.dtype != np.bool_ and not np.isin(raw, (0, 1)).all()):
         raise ValueError("SAM component filtering requires a binary two-dimensional raw mask")
     if not np.isfinite(threshold) or threshold < 0 or not isinstance(enabled, bool):
         raise ValueError("SAM component filter threshold must be finite/nonnegative and enabled boolean")

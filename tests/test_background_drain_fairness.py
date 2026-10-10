@@ -124,7 +124,7 @@ def test_real_pipeline_background_checkpoint_refills_four_workers_before_next_ou
         input_overrides={'gpu_device_count': 4})
     callbacks = _bind_callbacks(scheduler)
     budget = BackgroundDrainBudget(scheduler.service_pending_compute_credits,
-                                   max_completed=1, clock=lambda: 0)
+                                   stages=9, max_completed=1, clock=lambda: 0)
     completed, visited, reaped = set(), [], []
 
     class PublishedUnion:

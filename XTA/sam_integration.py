@@ -8,6 +8,7 @@ devices may serve admitted projections after a worker CUDA-completion proof.
 from __future__ import annotations
 
 import hashlib
+from collections import deque
 import json
 import os
 import sys
@@ -133,12 +134,8 @@ def publish_sam_gate_identity(store, *, policy_identity: str, evidence_path: str
 def _write_context_preparation_failure(destination, receipt, error):
     """Diagnostic publication cannot replace the actual preparation failure."""
     try:
-        destination = Path(destination)
-        destination.mkdir(parents=True, exist_ok=True)
-        target = destination / 'context_preparation_failure.json'
-        temporary = target.with_suffix('.json.tmp')
-        temporary.write_text(json.dumps(receipt, sort_keys=True), encoding='utf-8')
-        temporary.replace(target)
+        from .json_publication import write_json_atomic
+        write_json_atomic(Path(destination) / 'context_preparation_failure.json', receipt, sort_keys=True)
     except Exception as receipt_error:
         if callable(getattr(error, 'add_note', None)):
             error.add_note(f'SAM context failure receipt could not be written: {receipt_error}')
@@ -153,7 +150,7 @@ class SamInterpolationContext:
                  detector_device_ids=None, source_resize_semantics='caller_owned_exact_raster',
                  feature_cache_mib=1024, crop_mode='whole', delayed_native_expansion=None,
                  interpolation_policy_enabled=True, extrapolation_evidence_root=None,
-                 adaptive_crop=False):
+                 adaptive_crop=False, progressive_startup=False, startup_pending_host_bytes=None):
         self.model_path = str(model_path)
         self.crop_mode = str(crop_mode).strip().lower()
         if self.crop_mode not in {'whole', 'tiled'}:
@@ -174,8 +171,22 @@ class SamInterpolationContext:
                 int(value.split(':')[-1]) < 0 for value in self.device_ids):
             raise ValueError('SAM context requires unique nonnegative CUDA devices')
         self.sessions_per_gpu = sam_sessions_per_gpu()
+        if not isinstance(progressive_startup, bool):
+            raise TypeError('SAM progressive startup must be boolean')
+        if startup_pending_host_bytes is not None and not callable(startup_pending_host_bytes):
+            raise TypeError('SAM pending host commitment probe must be callable')
+        shared = (self.device_ids if detector_device_ids is None else set(self.device_ids) &
+            {f'cuda:{int(str(value).split(":")[-1])}' for value in detector_device_ids})
+        # A shared retirement ACK proves YOLO has stopped creating RAM debt.
+        # Mixed fleets retain legacy startup rather than fund before that proof.
+        self.progressive_startup = bool(progressive_startup and len(self.device_ids) > 1
+            and set(shared) == set(self.device_ids))
+        self._startup_pending_host_bytes = startup_pending_host_bytes
         self.startup_admission = dict(requested_sessions_per_gpu=self.sessions_per_gpu,
             effective_sessions_per_gpu=self.sessions_per_gpu, attempts=[])
+        if self.progressive_startup:
+            self.startup_admission.update(effective_sessions_per_gpu=None,
+                effective_sessions_per_device={}, admitted_device_ids=[], complete=False)
         self.temp_dir = Path(temp_dir)
         self.evidence_root = Path(evidence_root)
         self.extrapolation_evidence_root = (Path(extrapolation_evidence_root)
@@ -214,7 +225,6 @@ class SamInterpolationContext:
         self._active_image_cohorts = 0
         self._image_retirements = 0
         self._image_prefetches = set()
-        self._next_image_prefetch = None
         self._retained_image_prefetch_credits = []
         self._image_builds = {}
         self._image_build_bytes = 0
@@ -225,11 +235,33 @@ class SamInterpolationContext:
         self._runtime = None
         self._starting_runtime = None
         self._startup_pool = None
+        self._progressive_pool = None
+        self._progressive_threads = {}
+        self._progressive_error = None
+        self._startup_host_reserved = 0
+        self._startup_host_grants = {}
+        self._startup_fleet_funded = False
+        self._startup_fleet_credit_bytes = 0
+        self._startup_parent_envelope_bytes = 0
+        self._startup_funding_lock = threading.Lock()
+        self._startup_diagnostics_lock = threading.Lock()
+        self._startup_progress = {}
+        self._startup_wait_timeout = 300.
+        self._startup_future_peaks = {}
+        self._progressive_bundle = None
+        self._startup_host_plan = None
+        self._startup_host_condition = threading.Condition(threading.RLock())
+        self._runtime_admitted = threading.Event()
         self._leases = []
         self._resident_leases = {}
         self._active_compute = {}
         self._shutdown_compute = {}
         self._gpu_lease_lock = threading.RLock()
+        self._gpu_image_waiters = deque()
+        self._gpu_image_target = None
+        self._gpu_image_cursor = 0
+        self._gpu_image_owners = {}
+        self._gpu_image_sdk_owed = set()
         self._caches = {}
         self._cache_transforms = {}
         self._cache_entries = []
@@ -264,11 +296,72 @@ class SamInterpolationContext:
         self.dispatch_summary = {}
         self.shared_detector_devices = tuple(self.device_ids if detector_device_ids is None else
             sorted(set(self.device_ids) & {f'cuda:{int(str(value).split(":")[-1])}' for value in detector_device_ids}))
+        self._retired_devices = {int(device.split(':')[-1]) for device in self.device_ids
+            if device not in self.shared_detector_devices}
         if detector_device_ids is not None and not self.shared_detector_devices:
             self._ready.set()
+        if self.progressive_startup:
+            from .lta_sam import resolve_local_sam_bundle
+            from .sam_resources import GIB
+            self._progressive_bundle = resolve_local_sam_bundle(self.model_path)
+            peak = 2*int(Path(self._progressive_bundle.checkpoint_path).stat().st_size)*self.sessions_per_gpu+2*GIB
+            self._startup_future_peaks = {int(device.split(':')[-1]):peak for device in self.device_ids}
 
     def detector_assets_retired(self) -> None:
+        if self.progressive_startup:
+            for device in self.device_ids:
+                self.detector_device_assets_retired(int(device.split(':')[-1]))
         self._ready.set()
+
+    def detector_device_assets_retired(self, device_index):
+        """Pipeline calls only after this exact detector release ACK was verified."""
+        if type(device_index) is not int or device_index < 0:
+            raise ValueError('SAM detector retirement requires an exact nonnegative device ID')
+        device = device_index
+        configured = {int(value.split(':')[-1]) for value in self.device_ids}
+        if device not in configured:
+            return False
+        if not self.progressive_startup:
+            return False
+        with self._runtime_lock:
+            self._retired_devices.add(device)
+            if configured <= self._retired_devices:
+                self._ready.set()
+            if self.progressive_startup and self._progressive_pool is not None:
+                self._launch_progressive_devices()
+        return True
+
+    @property
+    def runtime_start_ready(self):
+        return (bool(self._retired_devices) if self.progressive_startup else self._ready.is_set()) and not self._cancel.is_set() and not self._closed
+
+    @property
+    def runtime_ready(self):
+        return (self._runtime_admitted.is_set() if self.progressive_startup else self._runtime is not None) and not self._cancel.is_set() and not self._closed
+
+    @property
+    def gpu_image_ready(self):
+        return self.runtime_ready if self.progressive_startup else self.detector_retirement_ready
+
+    def check_startup(self):
+        if self._progressive_error is not None:
+            raise self._progressive_error
+        if self._cancel.is_set() and not self._closed:
+            raise RuntimeError(self._failure or 'SAM startup cancelled')
+
+    def ensure_all_devices(self, timeout=300.):
+        if not self.progressive_startup:
+            self._start()
+            return
+        self._start_progressive()
+        deadline = time.monotonic()+float(timeout)
+        configured = {int(device.split(':')[-1]) for device in self.device_ids}
+        while (set(self._progressive_pool.device_ids) != configured
+                or any(thread.is_alive() for thread in self._progressive_threads.values())):
+            self.check_startup()
+            if time.monotonic() >= deadline:
+                raise RuntimeError('SAM configured device startup did not complete')
+            self._cancel.wait(.05)
 
     @property
     def worker_count(self):
@@ -344,7 +437,7 @@ class SamInterpolationContext:
 
     def image_cache_lifetime_snapshot(self):
         with self._lock:
-            return dict(owned_cohort_current_bytes=sum(state['reference'].size_bytes
+            snapshot = dict(owned_cohort_current_bytes=sum(state['reference'].size_bytes
                     for state in self._cache_owners.values() if state['owned'] and not state['persistent']),
                 owned_cohort_peak_bytes=self.image_cohort_peak_owned_bytes,
                 owned_cache_retired_bytes=self.image_cache_retired_bytes,
@@ -366,13 +459,20 @@ class SamInterpolationContext:
                     if state.get('pins', 0)),
                 active_image_calls=self._active_image_calls,
                 live_image_prefetches=len(self._image_prefetches),
-                unconsumed_image_prefetches=int(self._next_image_prefetch is not None),
+                unconsumed_image_prefetches=sum(not prefetch._entered for prefetch in self._image_prefetches),
                 image_prefetch_charged_bytes=sum(prefetch._admitted_bytes for prefetch in self._image_prefetches),
                 retained_image_prefetch_credit_bytes=sum(getattr(release, 'image_phase_bytes', 0)
                     for release in self._retained_image_prefetch_credits))
+            profile = getattr(self._resource_local, 'profile', None)
+            pool = self._startup_pool or (profile._lease.pool if profile is not None else None)
+        if pool is not None:
+            from .sam_resources import sam_image_staging_snapshot
+            with pool.condition:
+                snapshot.update(sam_image_staging_snapshot(pool))
+        return snapshot
 
     def prefetch_image_cohort(self, view, shape, prepared_plan, *, max_cache_bytes=None):
-        """Try one next cohort on its own image-only producer grant."""
+        """Try current/next cohorts per parent, each on fresh image-only credit."""
         from .sam_image_prefetch import SamImageCohortPrefetch
         from .workspace import _env_int
         profile = getattr(self._resource_local, 'profile', None)
@@ -388,23 +488,29 @@ class SamInterpolationContext:
         scratch = max(1, _env_int('YOLO_TTA_SAM_RENDER_MAX_BYTES', 256*1024**2))
         with self._idle:
             self._check_image_lifetime()
-            if (self._next_image_prefetch is not None or len(self._image_prefetches) >= 2
+            if (sum(prefetch.parent is profile for prefetch in self._image_prefetches) >= 2
                     or any(owner.get('retirement_unproven') for owner in self._cache_owners.values())):
                 return None
             prefetch = SamImageCohortPrefetch(self, view, tuple(shape), prepared_plan,
                 cap, profile, payload+scratch)
             self._image_prefetches.add(prefetch)
-            self._next_image_prefetch = prefetch
         try:
             prefetch.start()
         except BaseException:
             with self._idle:
                 self._image_prefetches.discard(prefetch)
-                if self._next_image_prefetch is prefetch:
-                    self._next_image_prefetch = None
                 self._idle.notify_all()
             raise
         return prefetch
+
+    def _prepare_image_cohort(self, view, shape, prepared_plan, *, max_cache_bytes=None):
+        if self._can_prefetch_cpu_images(view, prepared_plan):
+            pending = self.prefetch_image_cohort(view, shape, prepared_plan,
+                max_cache_bytes=max_cache_bytes)
+            if pending is not None:
+                return pending
+        return self.image_cohort_provider(view, shape, prepared_plan,
+            max_cache_bytes=max_cache_bytes)
 
     @contextmanager
     def image_cohort_provider(self, view, shape, prepared_plan, *, max_cache_bytes=None):
@@ -508,8 +614,7 @@ class SamInterpolationContext:
                     claimed = False
                     self._idle.notify_all()
                     return
-            # The pool's global iterator barrier may wait for unrelated scopes.
-            # Its wait must never hold the image registry/context lock.
+            # Check this descriptor's worker-mapping proof outside the image registry lock.
             proof = self._runtime.release_source_cache(reference)
             if (not isinstance(proof, Mapping) or proof.get('status') != 'retired'
                     or proof.get('workers_finished') is not True
@@ -569,7 +674,16 @@ class SamInterpolationContext:
                     cached = self._image_provider(view, shape, prepared_plan=prepared_plan, _cache_only=True)
                     if cached is not None:
                         return cached
-                renderer = try_gpu_crop_renderer(self, view, shape, prepared_plan)
+                cpu_prefetch = (getattr(self._resource_local, 'image_prefetch_cancel', None) is not None
+                    and self._can_prefetch_cpu_images(view, prepared_plan))
+                cpu_started = time.perf_counter() if cpu_prefetch else None
+                if cpu_prefetch:
+                    renderer = None
+                    runtime_telemetry().add('sam.gpu_images.cpu_admissions', 1)
+                    runtime_telemetry().add('sam.cpu_images.prefetch_admissions', 1)
+                    runtime_telemetry().gauge('sam.gpu_images.last_cpu_reason', 'bounded_cpu_prefetch')
+                else:
+                    renderer = try_gpu_crop_renderer(self, view, shape, prepared_plan)
                 previous = getattr(self._resource_local, 'gpu_image_renderer', None)
                 try:
                     self._resource_local.gpu_image_renderer = renderer
@@ -591,6 +705,9 @@ class SamInterpolationContext:
                         return self._image_provider(view, shape, prepared_plan=prepared_plan)
                 finally:
                     self._resource_local.gpu_image_renderer = previous
+                    if cpu_started is not None:
+                        runtime_telemetry().add('sam.cpu_images.prefetch_host_seconds',
+                            time.perf_counter()-cpu_started)
                     if renderer is not None:
                         clear_image_error_frames(sys.exc_info()[1])
                         renderer.close()
@@ -598,6 +715,29 @@ class SamInterpolationContext:
             with self._idle:
                 self._active_image_calls -= 1
                 self._idle.notify_all()
+
+    def _can_prefetch_cpu_images(self, view, prepared_plan):
+        if str(view.family) not in {'radial', 'spherical'}:
+            return False
+        source = self.source_volume
+        if bool(getattr(source, '_is_lazy_processing_cube', False)):
+            source = source._array if source.materialized else None
+        if (not isinstance(source, np.ndarray) or source.ndim != 3 or source.dtype != np.uint8
+                or tuple(source.shape) != (int(view.full_t), int(view.full_h), int(view.full_w))):
+            return False
+        from .media import volume_readiness
+        ready = volume_readiness(source)
+        if ready is not None and not ready._all_event.is_set():
+            return False
+        required = dict(getattr(prepared_plan, 'frame_crop_bounds', {}) or {})
+        if not required:
+            return False
+        from .workspace import _env_int
+        from .sam_canvas_rendering import native_shell_workspace_bytes
+        crop_bytes = max((int(box[2])-int(box[0]))*(int(box[3])-int(box[1]))
+                         +64*(int(box[3])-int(box[1])+32) for box in required.values())
+        return native_shell_workspace_bytes(view)+crop_bytes <= max(
+            1, _env_int('YOLO_TTA_SAM_RENDER_MAX_BYTES', 256*1024**2))
 
     def _check_image_lifetime(self):
         if self._closed:
@@ -725,6 +865,14 @@ class SamInterpolationContext:
             from .sam_canvas_rendering import CANONICAL_CROP_RENDER_CONTRACT
             sampling = dict(contract=CANONICAL_CROP_RENDER_CONTRACT, backend='cpu',
                 numerical_backend=transform['canonical_crop_sampling_backend'])
+            if gpu_renderer is None and str(view.family) in {'radial', 'spherical'}:
+                from .sam_canvas_rendering import NATIVE_SHELL_CROP_CONTRACT
+                # Different ROI shapes may round differently; feature reuse
+                # must not promise identical bytes across those demands.
+                sampling.update(native_sampler=dict(contract=NATIVE_SHELL_CROP_CONTRACT,
+                    absolute_tolerance=1.0), demand_sha256=demand_identity)
+                transform.update(canonical_crop_native_sampler=sampling['native_sampler'],
+                    canonical_crop_native_demand_sha256=demand_identity)
             if gpu_renderer is not None:
                 # Translating a float32 CUDA affine can change a crop's
                 # numerical phase. Different demand origins must not donate
@@ -877,13 +1025,57 @@ class SamInterpolationContext:
                 path.unlink(missing_ok=True)
                 raise
             completed = []
-            target = physical_target = done = native_frame_cache = None
+            target = physical_target = done = native_frame_cache = native_plane = None
             batch_iterator = None
+            native_iterator = None
+            native_rois = {}
             batch_images = {}
             try:
                 if gpu_renderer is None:
                     batch_iterator = self._transverse_batch_iterator(view, shape, records, addresses,
                         affine, inverse, geometry_identity, payload_bytes, cache_entries=donor_entries)
+                    prefetch_cancel = getattr(self._resource_local, 'image_prefetch_cancel', None)
+                    if prefetch_cancel is not None and self._can_prefetch_cpu_images(view, prepared_plan):
+                        from .sam_canvas_rendering import (iter_prefetched_native_planes,
+                                                          native_shell_workspace_bytes,
+                                                          native_shell_crop_bbox)
+                        for index, y0, x0, y1, x1, _offset in records:
+                            address = addresses[index]
+                            box = ((y0, x0, y1, x1) if not address['mirror_u'] else
+                                mirror_bbox_yx((y0, x0, y1, x1), shape[2]))
+                            roi = native_shell_crop_bbox(view, affine, box)
+                            frame = int(address['native_index'])
+                            previous_roi = native_rois.get(frame)
+                            if previous_roi is not None:
+                                roi = previous_roi if roi is None else (
+                                    min(previous_roi[0], roi[0]), min(previous_roi[1], roi[1]),
+                                    max(previous_roi[2], roi[2]), max(previous_roi[3], roi[3]))
+                            native_rois[frame] = roi
+                        native_bytes = max(((box[2]-box[0])*(box[3]-box[1])
+                            if box is not None else 1 for box in native_rois.values()), default=1)
+                        native_work_bytes = max((native_shell_workspace_bytes(view, box)
+                            if box is not None else 1 for box in native_rois.values()), default=1)
+                        remap_minimum = native_bytes+max((y1-y0)*(x1-x0)+64*(x1-x0+32)
+                            for _index, y0, x0, y1, x1, _offset in records)
+                        if (not donor_entries and len(records) > 1 and scratch_bytes >= native_work_bytes
+                                +remap_minimum+native_bytes):
+                            def check_native_preparation():
+                                with self._idle:
+                                    self._check_image_lifetime()
+                                    if prefetch_cancel.is_set():
+                                        raise RuntimeError('SAM image prefetch was abandoned')
+                                    if any(owner.get('retirement_unproven') for owner in self._cache_owners.values()):
+                                        raise RuntimeError('SAM image cache retirement is unproven')
+                            native_source = (self.source_volume._array
+                                if bool(getattr(self.source_volume, '_is_lazy_processing_cube', False))
+                                else self.source_volume)
+                            native_iterator = iter_prefetched_native_planes(native_source, view,
+                                (addresses[index]['native_index'] for index, *_ in records),
+                                max_workspace_bytes=scratch_bytes,
+                                min_remap_workspace_bytes=remap_minimum,
+                                check_cancel=check_native_preparation,
+                                native_crop_bounds=native_rois)
+                            runtime_telemetry().add('sam.cpu_images.native_prefetch_cohorts', 1)
                 for index, y0, x0, y1, x1, offset in records:
                     self._check_image_lifetime()
                     address = addresses[index]
@@ -902,6 +1094,21 @@ class SamInterpolationContext:
                             del batch
                         pre_rendered = batch_images.pop(index)
                     native_frame_cache = {}
+                    if native_iterator is not None:
+                        waiting_started = time.perf_counter()
+                        native_index, native_plane, remap_budget = next(native_iterator)
+                        runtime_telemetry().add('sam.cpu_images.native_prefetch_wait_seconds',
+                            time.perf_counter()-waiting_started)
+                        if native_index != int(address['native_index']):
+                            raise RuntimeError('SAM native prefetch returned an unplanned frame')
+                        roi = native_rois[native_index]
+                        native_frame_cache.update(plane=native_plane,
+                            origin_xy=(roi[1], roi[0]) if roi is not None else (0, 0),
+                            max_workspace_bytes=remap_budget)
+                        self._add_image_metrics(native_sampling_calls=1,
+                            native_sampling_pixels=int(native_plane.size))
+                        native_plane = None
+                        runtime_telemetry().add('sam.cpu_images.native_prefetch_frames', 1)
                     missing = self._copy_cached_pixels(physical_target, physical_bbox,
                         int(address['native_index']), geometry_identity, cache_entries=donor_entries)
                     # Earlier native/alias records in this private transaction
@@ -940,24 +1147,36 @@ class SamInterpolationContext:
                                 native_frame_cache=native_frame_cache, native_preparation_bbox=physical_bbox))
                         if image.dtype != np.uint8 or image.shape != (cy1-cy0, cx1-cx0):
                             raise ValueError('SAM image provider returned a mismatched detector canvas')
+                        copy_started = time.perf_counter()
                         physical_target[cy0-physical_bbox[0]:cy1-physical_bbox[0],
                                         cx0-physical_bbox[1]:cx1-physical_bbox[1]] = image
+                        if gpu_renderer is None:
+                            runtime_telemetry().add('sam.cpu_images.cache_write_host_seconds',
+                                time.perf_counter()-copy_started)
                         self._add_image_metrics(rendered_frames=1, rendered_pixels=int(image.size))
                         del image
                     completed.append((int(address['native_index']), physical_bbox,
                                       bool(address['mirror_u']), offset))
                     del target, physical_target, native_frame_cache, pre_rendered
+                flush_started = time.perf_counter()
                 cache.flush()
+                if gpu_renderer is None:
+                    runtime_telemetry().add('sam.cpu_images.cache_flush_host_seconds',
+                        time.perf_counter()-flush_started)
             except BaseException:
                 from .runtime import close_memmap_array_without_flush
-                target = physical_target = done = native_frame_cache = None
+                target = physical_target = done = native_frame_cache = native_plane = None
                 close_memmap_array_without_flush(cache, unlink_path=path)
                 cache = None
                 raise
             finally:
                 try:
-                    if batch_iterator is not None:
-                        batch_iterator.close()
+                    try:
+                        if native_iterator is not None:
+                            native_iterator.close()
+                    finally:
+                        if batch_iterator is not None:
+                            batch_iterator.close()
                 finally:
                     from .runtime import close_memmap_array_without_flush
                     batch_images.clear()
@@ -1127,7 +1346,8 @@ class SamInterpolationContext:
             return image
         from ._deps import cv2
         from .geometry import physical_view_name
-        from .sam_canvas_rendering import render_canonical_crop
+        from .sam_canvas_rendering import (render_canonical_crop, cartesian_source_view,
+                                           prepare_cartesian_native_crop)
         from .media import (_linear_source_index, _resize_gray_slice_nearest_or_linear,
                             wait_for_volume_ready, wait_for_volume_slice_ready)
         source = self.source_volume
@@ -1137,7 +1357,8 @@ class SamInterpolationContext:
             previous_pixels = int(native_frame_cache.get('sampled_output_pixels', 0))
             rendered = render_canonical_crop(source, view, index, affine=affine, inverse=inverse,
                 output_origin_yx=output_origin_yx, output_height=output_height, output_width=output_width,
-                output_canvas_width=output_canvas_width, native_frame_cache=native_frame_cache)
+                output_canvas_width=output_canvas_width, native_frame_cache=native_frame_cache,
+                max_workspace_bytes=native_frame_cache.get('max_workspace_bytes'))
             self._add_image_metrics(canonical_sampling_pixels=int(native_frame_cache['sampled_output_pixels'])-previous_pixels)
             return rendered
         lazy_unmaterialized = bool(getattr(source, '_is_lazy_processing_cube', False)) and not source.materialized
@@ -1157,7 +1378,11 @@ class SamInterpolationContext:
             # strides/flags. Keep the owning lazy proxy alive in the context,
             # and lend its existing map rather than rematerializing a proxy.
             source = source._array
-        if lazy_unmaterialized and transverse:
+        if cartesian_source_view(source, view) is not None:
+            native, native_origin_xy = prepare_cartesian_native_crop(source, view, index, affine=affine,
+                output_bbox_yx=native_preparation_bbox or (output_origin_yx[0], output_origin_yx[1],
+                    output_origin_yx[0]+output_height, output_origin_yx[1]+output_width))
+        elif lazy_unmaterialized and transverse:
             decoded = source.source
             in_t, in_h, in_w = (int(value) for value in decoded.shape)
             out_t, out_h, out_w = (int(value) for value in source.shape)
@@ -1208,6 +1433,7 @@ class SamInterpolationContext:
                     other = _resize_gray_slice_nearest_or_linear(decoded[z1], out_w, out_h, cv2.INTER_LINEAR)
                     native = cv2.addWeighted(native, 1.-alpha, other, alpha, 0.)
                     del other
+        if cartesian_source_view(source, view) is not None or lazy_unmaterialized and transverse:
             class OneNativeFrame:
                 def __getitem__(self, frame_index):
                     if int(frame_index) != int(index):
@@ -1215,6 +1441,15 @@ class SamInterpolationContext:
                     return native
             frames = OneNativeFrame()
         local_cache = native_frame_cache if native_frame_cache is not None else {}
+        if str(view.family) in {'radial', 'spherical'}:
+            from .sam_canvas_rendering import prepare_native_shell_crop
+            from .workspace import _env_int
+            native, native_origin_xy = prepare_native_shell_crop(source, view, index,
+                affine=affine, output_bbox_yx=native_preparation_bbox or (
+                    output_origin_yx[0], output_origin_yx[1],
+                    output_origin_yx[0]+output_height, output_origin_yx[1]+output_width),
+                max_workspace_bytes=max(1, _env_int('YOLO_TTA_SAM_RENDER_MAX_BYTES', 256*1024**2)))
+            local_cache.update(plane=native, origin_xy=native_origin_xy)
         rendered = render_canonical_crop(source, view, index, affine=affine, inverse=inverse,
             output_origin_yx=output_origin_yx, output_height=output_height, output_width=output_width,
             view_frames=frames, native_origin_xy=native_origin_xy, output_canvas_width=output_canvas_width,
@@ -1223,6 +1458,138 @@ class SamInterpolationContext:
             native_sampling_pixels=int(local_cache['plane'].size),
             canonical_sampling_pixels=int(local_cache['sampled_output_pixels']))
         return rendered
+
+    def _next_gpu_image_target(self):
+        if not self._gpu_image_waiters:
+            return None
+        owner = self._gpu_image_waiters[0]
+        if owner._gpu_wait_deadline is None:
+            owner._gpu_wait_deadline = time.monotonic()+30.
+        rejected = owner._gpu_image_rejected_devices
+        devices = self._image_device_ids()
+        for _ in devices:
+            device = devices[self._gpu_image_cursor % len(devices)]
+            self._gpu_image_cursor = (self._gpu_image_cursor+1) % len(devices)
+            if device not in rejected:
+                return device
+        return None
+
+    def _image_device_ids(self):
+        if self.progressive_startup:
+            return tuple(device for device in (self._progressive_pool.device_ids
+                if self._progressive_pool is not None else ()) if device in self._resident_leases)
+        return tuple(int(token.split(':')[-1]) for token in self.device_ids)
+
+    def _queue_gpu_image(self, renderer):
+        self._check_image_lifetime()
+        with self._gpu_lease_lock:
+            renderer._gpu_image_rejected_devices = set()
+            renderer._gpu_wait_deadline = None
+            self._gpu_image_waiters.append(renderer)
+            if self._gpu_image_target is None:
+                self._gpu_image_target = self._next_gpu_image_target()
+
+    def _sam_sdk_ready(self):
+        # Never take the scheduler condition while holding the GPU lock.
+        ready = getattr(self._runtime, 'has_ready_work', None)
+        return bool(ready()) if callable(ready) else False
+
+    def _can_extend_gpu_image_burst(self):
+        return (callable(getattr(self._runtime, 'idle_image_handoff', None))
+                and not self._sam_sdk_ready())
+
+    def _try_gpu_image_lease(self, renderer, torch):
+        sdk_ready = self._sam_sdk_ready()
+        with self._gpu_lease_lock:
+            self._check_image_lifetime()
+            if renderer.lease is not None:
+                return renderer.lease
+            if not self._gpu_image_waiters or self._gpu_image_waiters[0] is not renderer:
+                return None
+            target = self._gpu_image_target
+            if target is None:
+                return None
+            # Drain only the head's target, but use another already-idle GPU
+            # without waiting for that drain. Memory refusals rotate the head.
+            devices = [target]+[device for device in self._image_device_ids() if device != target]
+            for device in devices:
+                if (device in renderer._gpu_image_rejected_devices
+                        or sdk_ready and device in self._gpu_image_sdk_owed):
+                    continue
+                runtime_telemetry().add('sam.gpu_images.admission_attempts', 1)
+                resident = self._resident_leases.get(device)
+                if resident is not None:
+                    lease = resident.try_acquire_compute(torch, 'SAM image preparation')
+                else:
+                    from .backprojection import _try_acquire_specific_main_process_gpu_stage
+                    lease = _try_acquire_specific_main_process_gpu_stage(torch, device, 'SAM image preparation')
+                if lease is not None:
+                    renderer.lease, renderer.device_index = lease, device
+                    self._gpu_image_target = device
+                    return lease
+            return None
+
+    def _reject_gpu_image_device(self, renderer, released_lease):
+        """A released, proven-insufficient GPU cannot block the same FIFO head."""
+        with self._gpu_lease_lock:
+            if (renderer.lease is not released_lease or renderer.engine is not None
+                    or not self._gpu_image_waiters
+                    or self._gpu_image_waiters[0] is not renderer):
+                raise RuntimeError('SAM image memory rejection requires its exact released FIFO-head lease')
+            device = int(released_lease.device_index)
+            # Keep the released token attached until this atomic commit, so a
+            # source handoff cannot replace it while its rejection is pending.
+            renderer.lease = None
+            if self._gpu_image_owners.get(device) is renderer:
+                self._gpu_image_owners.pop(device)
+            renderer._gpu_image_rejected_devices.add(device)
+            self._gpu_image_target = self._next_gpu_image_target()
+            return self._gpu_image_target is not None
+
+    def _finish_gpu_image_wait(self, renderer, *, granted=False):
+        with self._gpu_lease_lock:
+            if renderer in self._gpu_image_waiters:
+                head = self._gpu_image_waiters[0] is renderer
+                self._gpu_image_waiters.remove(renderer)
+                if head:
+                    self._gpu_image_target = self._next_gpu_image_target()
+            if granted:
+                device = int(renderer.lease.device_index)
+                self._gpu_image_owners[device] = renderer
+                self._gpu_image_sdk_owed.add(device)
+
+    def _finish_gpu_image(self, renderer):
+        with self._gpu_lease_lock:
+            for device, owner in tuple(self._gpu_image_owners.items()):
+                if owner is renderer:
+                    self._gpu_image_owners.pop(device)
+
+    def _try_gpu_image_handoff(self, old_renderer, transfer_callback):
+        guard = getattr(self._runtime, 'idle_image_handoff', None)
+        # Scheduler state precedes the GPU lock; enqueue cannot race this grant.
+        with (guard() if callable(guard) else nullcontext(False)) as extend:
+            with self._gpu_lease_lock:
+                if self._cancel.is_set() or self._closed or not self._gpu_image_waiters:
+                    return False
+                device = int(old_renderer.lease.device_index)
+                if (self._gpu_image_owners.get(device) is not old_renderer
+                        or old_renderer._image_burst_count >= 2 and not extend):
+                    return False
+                owner = self._gpu_image_waiters[0]
+                if not transfer_callback(owner):
+                    return False
+                self._gpu_image_waiters.popleft()
+                self._gpu_image_owners[device] = owner
+                # Ready SDK work keeps its owed turn after the bounded image pair.
+                self._gpu_image_sdk_owed.add(device)
+                self._gpu_image_target = self._next_gpu_image_target()
+                return True
+
+    def _sam_compute_should_yield(self, device):
+        with self._gpu_lease_lock:
+            return (not self._cancel.is_set() and bool(self._gpu_image_waiters)
+                    and self._gpu_image_target == int(device)
+                    and int(device) not in self._gpu_image_sdk_owed)
 
     def _try_sam_compute_lease(self, device_index, purpose):
         import torch
@@ -1233,6 +1600,7 @@ class SamInterpolationContext:
             lease = resident.try_acquire_compute(torch, purpose)
             if lease is not None:
                 self._active_compute[int(device_index)] = lease
+                self._gpu_image_sdk_owed.discard(int(device_index))
             return lease
 
     def _release_sam_compute_lease(self, lease):
@@ -1248,6 +1616,9 @@ class SamInterpolationContext:
                 resident.quarantine(reason)
 
     def _before_sam_worker_shutdown(self):
+        if self.progressive_startup:
+            self._cancel.set()
+            self._join_progressive_startup()
         import torch
         self._quarantine_sam_residency('SAM predictor shutdown or failed worker settlement')
         deadline = time.monotonic() + 30.
@@ -1274,6 +1645,9 @@ class SamInterpolationContext:
             self._shutdown_compute.clear()
 
     def _start(self):
+        if self.progressive_startup:
+            self._start_progressive()
+            return
         with self._runtime_lock:
             self._start_admitted()
 
@@ -1295,14 +1669,19 @@ class SamInterpolationContext:
                     if profile._lease.pool is not parent_pool:
                         raise RuntimeError('SAM startup pool differs from the live parent profile')
                 self._startup_pool = parent_pool
-                self._start_admitted()
+                with parent_pool.condition:
+                    self._update_startup_debt_locked()
+                if not self.progressive_startup:
+                    self._start_admitted()
+            if self.progressive_startup:
+                self._start_progressive()
         finally:
             with self._idle:
                 self._active_passes -= 1
                 self._idle.notify_all()
 
     def _startup_host_headroom(self):
-        from .sam_resources import physical_sam_headroom
+        from .sam_resources import physical_sam_headroom, sam_parent_promised_bytes
         profile = getattr(self._resource_local, 'profile', None)
         pool = self._startup_pool
         if profile is not None:
@@ -1319,7 +1698,448 @@ class SamInterpolationContext:
             if profile is not None:
                 profile._validate_owner()
             return (max(0, int(physical_sam_headroom())),
-                    max(0, int(pool.in_use)))
+                    sam_parent_promised_bytes(pool))
+
+    def configure_startup_parent_pool(self, parent_pool):
+        """Bind the shared admission condition before checkpoints open RAM births."""
+        if parent_pool is None:
+            raise TypeError('SAM startup requires its parent admission pool')
+        with self._runtime_lock:
+            if self._startup_pool is not None and self._startup_pool is not parent_pool:
+                raise RuntimeError('SAM startup cannot change parent admission ownership')
+            self._startup_pool = parent_pool
+            with parent_pool.condition:
+                self._update_startup_debt_locked()
+
+    def _update_startup_debt_locked(self):
+        if self._startup_pool is not None:
+            self._startup_pool._sam_startup_future_bytes = (
+                sum(self._startup_future_peaks.values()) if self._startup_fleet_funded else 0)
+            self._startup_pool._sam_startup_active_bytes = (
+                self._startup_fleet_credit_bytes if self._startup_fleet_funded else self._startup_host_reserved)
+
+    def _sync_startup_fleet_credit_locked(self):
+        if self._startup_fleet_funded:
+            remaining = sum(self._startup_future_peaks.values())
+            if remaining > self._startup_fleet_credit_bytes:
+                raise RuntimeError('SAM startup cannot create an unfunded model promise')
+            refund = self._startup_fleet_credit_bytes-remaining
+            if self._startup_pool is not None:
+                self._startup_pool.in_use -= refund
+            self._startup_fleet_credit_bytes = remaining
+        self._update_startup_debt_locked()
+
+    def _publish_startup_progress(self, device, stage, snapshot=None, error=None):
+        # No context/lifecycle lock is acquired while holding the admission lock.
+        key = 'fleet' if device is None else str(device)
+        with self._startup_diagnostics_lock:
+            previous = self._startup_progress.get(key, {})
+            record = dict(previous, stage=stage, device_index=device, monotonic=time.monotonic())
+            if snapshot is not None:
+                record.update(snapshot)
+            if error is not None:
+                record['error'] = str(error)
+            elif stage != 'failed':
+                record.pop('error', None)
+            self._startup_progress[key] = record
+            publish = (previous.get('stage') != stage
+                or record['monotonic']-previous.get('published_monotonic', 0) >= 1.)
+            record['published_monotonic'] = (record['monotonic'] if publish
+                else previous.get('published_monotonic', 0))
+            progress = {name:dict(value) for name,value in self._startup_progress.items()}
+        if publish:
+            try:
+                runtime_telemetry().gauge('sam.startup_progress', progress)
+            except Exception:
+                pass
+
+    def _join_progressive_startup(self):
+        current = threading.current_thread()
+        with self._runtime_lock:
+            threads = tuple(self._progressive_threads.values())
+        for thread in threads:
+            if thread is current:
+                continue
+            thread.join(timeout=2.)
+            if thread.is_alive():
+                _retain_unsettled_context(self)
+                raise RuntimeError('SAM cohort startup is unsettled; model and host grants retained')
+
+    def _launch_progressive_devices(self):
+        if self._cancel.is_set() or self._closed or not self._startup_fleet_funded:
+            return
+        for device in sorted(self._retired_devices):
+            if device in self._progressive_threads:
+                continue
+            thread = threading.Thread(target=self._boot_progressive_device, args=(device,),
+                name=f'sam-startup-cuda-{device}', daemon=True)
+            self._progressive_threads[device] = thread
+            self._progressive_pool.begin_boot(device)
+            try:
+                thread.start()
+            except BaseException:
+                self._progressive_pool.finish_boot(device)
+                del self._progressive_threads[device]
+                raise
+
+    def _start_progressive(self):
+        self.check_startup()
+        with self._runtime_lock:
+            if self._progressive_pool is None:
+                from .sam_device_pool import SamDeviceWorkerPools
+                from .sam_tracker_runtime import SamInterpolationTracker
+                profile = getattr(self._resource_local, 'profile', None)
+                if self._startup_pool is None and profile is not None:
+                    profile._validate_owner()
+                    self._startup_pool = profile._lease.pool
+                    with self._startup_pool.condition:
+                        self._update_startup_debt_locked()
+                self._progressive_pool = SamDeviceWorkerPools(
+                    tuple(int(device.split(':')[-1]) for device in self.device_ids), cancel_event=self._cancel)
+                self._starting_runtime = SamInterpolationTracker(model_path=self.model_path,
+                    device_ids=self._progressive_pool.configured_device_ids,
+                    artifact_root=self.temp_dir / 'sam_runtime', feature_cache_bytes=self.feature_cache_mib*1024**2,
+                    workers_per_device=self.sessions_per_gpu, progressive_pool=self._progressive_pool,
+                    compute_lease_factory=self._try_sam_compute_lease,
+                    compute_lease_release=self._release_sam_compute_lease,
+                    compute_yield_requested=self._sam_compute_should_yield,
+                    residency_quarantine=self._quarantine_sam_residency,
+                    before_worker_shutdown=self._before_sam_worker_shutdown,
+                    after_worker_shutdown=self._after_sam_worker_shutdown)
+        self._fund_progressive_fleet()
+        with self._runtime_lock:
+            self._launch_progressive_devices()
+        started = time.perf_counter()
+        while not self._runtime_admitted.wait(.05):
+            self.check_startup()
+        self.wait_seconds += time.perf_counter()-started
+        self.check_startup()
+
+    def _progressive_future_host_bytes(self):
+        from .sam_resources import sam_image_staging_snapshot
+        pool = self._startup_pool
+        if pool is None:
+            parent, staging = 0, 0
+        else:
+            charged = self._startup_fleet_credit_bytes if self._startup_fleet_funded else self._startup_host_reserved
+            parent = max(int(pool.capacity),
+                max(0, int(pool.in_use)-charged), int(getattr(pool, 'oversize_requested_bytes', 0)))
+            staging = int(sam_image_staging_snapshot(pool)['image_staging_capacity_bytes'])
+        pending = (0 if self._startup_pending_host_bytes is None else
+                   max(0, int(self._startup_pending_host_bytes())))
+        source = self.source_volume
+        if bool(getattr(source, '_is_lazy_processing_cube', False)) and not source.materialized:
+            pending += int(np.prod(source.shape, dtype=np.int64))
+        return parent, staging, pending
+
+    def startup_budget_snapshot_locked(self, *, additional_pending_bytes=0):
+        """Caller holds the shared condition; resident proof precedes fresh RAM."""
+        from .sam_resources import GIB, physical_sam_headroom
+        parent, staging, pending = self._progressive_future_host_bytes()
+        remaining = sum(self._startup_future_peaks.values())
+        pending += max(0, int(additional_pending_bytes))
+        required = parent+staging+pending+remaining+2*GIB
+        return dict(physical_headroom_bytes=max(0,int(physical_sam_headroom())),
+            required_host_bytes=required, protected_parent_bytes=parent,
+            protected_image_bytes=staging, pending_host_bytes=pending,
+            remaining_startup_bytes=remaining, active_startup_grants_bytes=self._startup_host_reserved,
+            owned_startup_credit_bytes=self._startup_fleet_credit_bytes,
+            startup_fleet_funded=self._startup_fleet_funded,
+            mandatory_reserve_bytes=2*GIB)
+
+    def _progressive_cohort_budget_snapshot_locked(self):
+        from .sam_resources import GIB, physical_sam_headroom
+        parent, staging, pending = self._progressive_future_host_bytes()
+        # The initial grant owns C even after its parents allocate. New dense
+        # debt still pays the full envelope at birth; only expanded rights are new.
+        parent = max(0,parent-self._startup_parent_envelope_bytes)
+        remaining = sum(self._startup_future_peaks.values())
+        return dict(physical_headroom_bytes=max(0,int(physical_sam_headroom())),
+            required_host_bytes=parent+staging+pending+remaining+2*GIB,
+            protected_parent_bytes=parent, protected_image_bytes=staging,
+            pending_host_bytes=pending, remaining_startup_bytes=remaining,
+            active_startup_grants_bytes=self._startup_host_reserved,
+            owned_startup_credit_bytes=self._startup_fleet_credit_bytes,
+            owned_parent_envelope_bytes=self._startup_parent_envelope_bytes,
+            startup_fleet_funded=self._startup_fleet_funded,
+            mandatory_reserve_bytes=2*GIB)
+
+    def _fund_progressive_fleet(self):
+        from .sam_resources import GIB, sam_image_staging_snapshot
+        pool = self._startup_pool
+        condition = self._startup_host_condition if pool is None else pool.condition
+        with self._startup_funding_lock:
+            if self._startup_fleet_funded:
+                return
+            while not self._retired_devices:
+                self.check_startup()
+                self._publish_startup_progress(None, 'waiting_detector_retirement')
+                self._cancel.wait(.05)
+            deadline = time.monotonic()+self._startup_wait_timeout
+            with condition:
+                while True:
+                    self.check_startup()
+                    snapshot = self.startup_budget_snapshot_locked()
+                    host, required = snapshot['physical_headroom_bytes'], snapshot['required_host_bytes']
+                    if host >= required:
+                        self._startup_fleet_credit_bytes = sum(self._startup_future_peaks.values())
+                        self._startup_parent_envelope_bytes = snapshot['protected_parent_bytes']
+                        if pool is not None:
+                            pool.in_use += self._startup_fleet_credit_bytes
+                        self._startup_fleet_funded = True
+                        self._update_startup_debt_locked()
+                        self._publish_startup_progress(None, 'funded', dict(snapshot,
+                            owned_startup_credit_bytes=self._startup_fleet_credit_bytes,
+                            owned_parent_envelope_bytes=self._startup_parent_envelope_bytes,
+                            startup_fleet_funded=True))
+                        for device in self._startup_future_peaks:
+                            if device not in self._retired_devices:
+                                self._publish_startup_progress(device, 'waiting_detector_retirement')
+                        return
+                    parents = 0 if pool is None else int(pool.in_use)
+                    staging = 0 if pool is None else sam_image_staging_snapshot(pool)['image_staging_in_use_bytes']
+                    cold = not parents and not staging and not snapshot['pending_host_bytes']
+                    if cold:
+                        checkpoint = int(Path(self._progressive_bundle.checkpoint_path).stat().st_size)
+                        minimum = 2*checkpoint+2*GIB
+                        minimum_required = required-snapshot['remaining_startup_bytes']+minimum*len(self._startup_future_peaks)
+                        if self.sessions_per_gpu == 2 and host >= minimum_required:
+                            self._startup_future_peaks = {index:minimum for index in self._startup_future_peaks}
+                            self._startup_host_plan = dict(status='minimum_single_fleet',
+                                physical_headroom_bytes=host, minimum_required_host_bytes=minimum_required,
+                                planned_device_ids=list(self._startup_future_peaks), sessions_per_device=1)
+                            self._update_startup_debt_locked()
+                            continue
+                        error = SamConcurrentStartupResourceError('SAM cold host budget cannot admit the configured minimum fleet')
+                        self._publish_startup_progress(None, 'failed', snapshot, error)
+                        raise error
+                    self._publish_startup_progress(None, 'waiting_host_funding', snapshot)
+                    if time.monotonic() >= deadline:
+                        error = SamConcurrentStartupResourceError('SAM whole-fleet host funding timed out')
+                        self._publish_startup_progress(None, 'failed', snapshot, error)
+                        raise error
+                    condition.wait(.05)
+
+    @contextmanager
+    def dense_restore_allocation_guard(self):
+        if not self.progressive_startup:
+            yield True
+            return
+        if self._startup_pool is None:
+            raise RuntimeError('SAM restore admission has no configured parent condition')
+        with self._startup_pool.condition:
+            self.check_startup()
+            snapshot = self.startup_budget_snapshot_locked()
+            yield snapshot['physical_headroom_bytes'] >= snapshot['required_host_bytes']
+
+    def _reserve_progressive_host(self, device, peak, attempt):
+        pool = self._startup_pool
+        condition = self._startup_host_condition if pool is None else pool.condition
+        deadline = time.monotonic()+self._startup_wait_timeout
+        with condition:
+            while True:
+                self.check_startup()
+                if not self._startup_fleet_funded:
+                    raise RuntimeError('SAM cohort has no owned fleet host grant')
+                snapshot = self._progressive_cohort_budget_snapshot_locked()
+                host, required = snapshot['physical_headroom_bytes'], snapshot['required_host_bytes']
+                attempt.update(host_headroom_before_bytes=host, minimum_host_startup_bytes=required,
+                    future_parent_capacity_bytes=snapshot['protected_parent_bytes'],
+                    future_image_staging_bytes=snapshot['protected_image_bytes'],
+                    future_external_host_bytes=snapshot['pending_host_bytes'],
+                    remaining_startup_bytes=snapshot['remaining_startup_bytes'],
+                    prior_startup_grants_bytes=self._startup_host_reserved,
+                    owned_parent_envelope_bytes=snapshot['owned_parent_envelope_bytes'],
+                    owned_startup_credit_bytes=snapshot['owned_startup_credit_bytes'],
+                    host_startup_basis='preowned_fleet_and_parent_envelope_plus_new_debt_and_reserve',
+                    startup_host_grant_bytes=peak)
+                if peak > self._startup_future_peaks.get(device, peak):
+                    raise SamConcurrentStartupResourceError('SAM host budget planned a single-session cohort')
+                if host >= required:
+                    self._startup_host_reserved += peak
+                    self._startup_host_grants[device] = peak
+                    self._update_startup_debt_locked()
+                    self._publish_startup_progress(device, 'host_grant_claimed', snapshot)
+                    return
+                self._publish_startup_progress(device, 'waiting_host_headroom', snapshot)
+                if time.monotonic() >= deadline:
+                    error = SamConcurrentStartupResourceError(f'SAM cohort host startup admission timed out on cuda:{device}')
+                    self._publish_startup_progress(device, 'failed', snapshot, error)
+                    raise error
+                condition.wait(.05)
+
+    def _release_progressive_host(self, device):
+        pool = self._startup_pool
+        condition = self._startup_host_condition if pool is None else pool.condition
+        with condition:
+            amount = self._startup_host_grants.pop(device, 0)
+            self._startup_host_reserved -= amount
+            if pool is not None and not self._startup_fleet_funded:
+                pool.in_use -= amount
+            self._update_startup_debt_locked()
+            condition.notify_all()
+
+    def _check_progressive_host(self, device, attempt):
+        pool = self._startup_pool
+        condition = self._startup_host_condition if pool is None else pool.condition
+        with condition:
+            snapshot = self._progressive_cohort_budget_snapshot_locked()
+            host, required = snapshot['physical_headroom_bytes'], snapshot['required_host_bytes']
+            required -= self._startup_future_peaks.get(device, 0)
+            attempt.update(host_headroom_after_bytes=host, minimum_host_after_bytes=required)
+            if host < required:
+                raise SamConcurrentStartupResourceError('SAM cohort leaves insufficient future parent/startup headroom')
+            self._publish_startup_progress(device, 'host_after_load_proven', dict(snapshot,
+                required_host_bytes=required,
+                completed_model_peak_bytes=self._startup_future_peaks.get(device, 0)))
+
+    def _boot_progressive_device(self, device):
+        from .sam_resources import GIB
+        from .lta_sam import resolve_local_sam_bundle
+        from .lta_workers import LtaWorkerPool
+        from .backprojection import _try_acquire_specific_main_process_gpu_stage
+        import torch
+        started, lease, pool, admitted = time.perf_counter(), None, None, False
+        runtime = self._runtime or self._starting_runtime
+        attempt = {}
+        try:
+            if device >= int(torch.cuda.device_count()):
+                raise RuntimeError(f'SAM device cuda:{device} is unavailable')
+            bundle = self._progressive_bundle
+            checkpoint = int(Path(bundle.checkpoint_path).stat().st_size)
+            sessions = (1 if self._startup_host_plan is not None else self.sessions_per_gpu)
+            while True:
+                attempt = dict(device_index=device, sessions_per_gpu=sessions,
+                    checkpoint_identity_sha256=bundle.checkpoint_identity_sha256,
+                    checkpoint_bytes=checkpoint, started_monotonic=time.monotonic())
+                try:
+                    deadline = time.monotonic()+self._startup_wait_timeout
+                    while lease is None:
+                        self._reserve_progressive_host(device, 2*checkpoint*sessions+2*GIB, attempt)
+                        lease = _try_acquire_specific_main_process_gpu_stage(torch, device,
+                            'TTA persistent SAM interpolation predictor')
+                        if lease is None:
+                            self._release_progressive_host(device)
+                            self._publish_startup_progress(device, 'waiting_gpu_ownership')
+                            if time.monotonic() >= deadline:
+                                raise RuntimeError(f'SAM cohort GPU admission timed out on cuda:{device}')
+                            self._cancel.wait(.05)
+                    with self._gpu_lease_lock:
+                        self._leases.append(lease)
+                    free, total = map(int, torch.cuda.mem_get_info(device))
+                    headroom = max(2*GIB, int(total*.15))
+                    fraction = (max(0, free-headroom)//2)/total if sessions == 2 and total > 0 else None
+                    if sessions == 2 and (fraction is None or fraction <= 0):
+                        raise SamConcurrentStartupResourceError('SAM cohort cannot preserve mandatory GPU headroom')
+                    attempt['devices_before'] = [dict(device_index=device, free_bytes=free,
+                        total_bytes=total, headroom_bytes=headroom)]
+                    fractions = None if fraction is None else {str(device):fraction}
+                    self._publish_startup_progress(device, 'loading_model')
+                    try:
+                        pool = LtaWorkerPool((device,), runtime.worker_init(cuda_allocator_fractions=fractions),
+                            workers_per_device=sessions, startup_timeout=runtime.startup_timeout, cancel_event=self._cancel)
+                    except BaseException as error:
+                        pool = getattr(error, 'unsettled_worker_pool', None)
+                        if pool is not None:
+                            self._progressive_pool.retain(pool)
+                        raise
+                    self._progressive_pool.retain(pool)
+                    self.check_startup()
+                    free, total = map(int, torch.cuda.mem_get_info(device))
+                    attempt['devices_after'] = [dict(device_index=device, free_bytes=free, total_bytes=total)]
+                    if free < max(2*GIB, int(total*.15)):
+                        raise SamConcurrentStartupResourceError('SAM cohort model load violated mandatory GPU headroom')
+                    self._check_progressive_host(device, attempt)
+
+                    def activate():
+                        self.check_startup()
+                        resident = lease.promote_residency()
+                        with self._gpu_lease_lock:
+                            self._resident_leases[device] = resident
+                            self._leases.remove(lease)
+
+                    runtime.register_device_pool(device, pool, cuda_allocator_fraction=fraction,
+                        admission_callback=activate)
+                    admitted = True
+                    with self._runtime_lock:
+                        runtime.start()
+                        self._runtime = runtime
+                    attempt.update(status='admitted', workers=tuple(receipt for receipt in runtime.startup_receipts
+                        if receipt['execution_device_id'] == device),
+                        elapsed_seconds=time.perf_counter()-started)
+                    with self._idle:
+                        self.startup_admission['attempts'].append(attempt)
+                        self.startup_admission.setdefault('effective_sessions_per_device', {})[str(device)] = sessions
+                        counts = self.startup_admission['effective_sessions_per_device']
+                        complete = len(counts) == len(self.device_ids)
+                        self.startup_admission.update(complete=complete,
+                            admitted_device_ids=list(self._progressive_pool.device_ids),
+                            effective_sessions_per_gpu=(next(iter(counts.values())) if complete
+                                and len(set(counts.values())) == 1 else None))
+                    condition = self._startup_host_condition if self._startup_pool is None else self._startup_pool.condition
+                    with condition:
+                        self._startup_future_peaks.pop(device, None)
+                        self._sync_startup_fleet_credit_locked()
+                    self._release_progressive_host(device)
+                    with self._runtime_lock:
+                        if not self._runtime_admitted.is_set():
+                            self.start_seconds += time.perf_counter()-started
+                        self._runtime_admitted.set()
+                    self._publish_startup_progress(device, 'admitted')
+                    break
+                except BaseException as error:
+                    if admitted:
+                        raise
+                    if pool is not None:
+                        try:
+                            pool.shutdown(timeout=1., force=True)
+                        except BaseException as cleanup_error:
+                            if callable(getattr(error, 'add_note', None)):
+                                error.add_note(f'SAM cohort startup cleanup failed: {cleanup_error}')
+                        if not pool.workers_settled:
+                            raise RuntimeError('SAM failed cohort retains unproven child ownership') from error
+                    self._release_progressive_host(device)
+                    attempt.update(status='failed', error=str(error))
+                    with self._idle:
+                        self.startup_admission['attempts'].append(attempt)
+                    if sessions != 2 or admitted or self._cancel.is_set() or not _concurrent_startup_resource_failure(error):
+                        raise
+                    with self._gpu_lease_lock:
+                        if lease in self._leases:
+                            lease.release()
+                            self._leases.remove(lease)
+                    lease, pool, sessions = None, None, 1
+                    condition = self._startup_host_condition if self._startup_pool is None else self._startup_pool.condition
+                    with condition:
+                        self._startup_future_peaks[device] = 2*checkpoint+2*GIB
+                        self._sync_startup_fleet_credit_locked()
+        except BaseException as error:
+            self._publish_startup_progress(device, 'failed', error=error)
+            with self._idle:
+                self._progressive_error = error
+            self.cancel(f'SAM progressive startup failed on cuda:{device}: {error}')
+            settled = pool is None or bool(pool.workers_settled)
+            if settled and not admitted:
+                with self._gpu_lease_lock:
+                    resident = self._resident_leases.pop(device, None)
+                    if resident is not None:
+                        resident.release(residency_settled=True)
+                    if lease in self._leases:
+                        lease.release()
+                        self._leases.remove(lease)
+                self._release_progressive_host(device)
+            else:
+                _retain_unsettled_context(self)
+        finally:
+            self._progressive_pool.finish_boot(device)
+            try:
+                with self._idle:
+                    snapshot = json.loads(json.dumps(self.startup_admission))
+                if self._startup_host_plan is not None:
+                    snapshot['host_plan'] = self._startup_host_plan
+                runtime_telemetry().gauge('sam.startup_admission', snapshot)
+            except Exception:
+                pass
 
     def _concurrent_startup_budget(self, torch, attempt):
         from .sam_resources import GIB
@@ -1429,6 +2249,7 @@ class SamInterpolationContext:
                         cuda_allocator_fractions=fractions,
                         compute_lease_factory=self._try_sam_compute_lease,
                         compute_lease_release=self._release_sam_compute_lease,
+                        compute_yield_requested=self._sam_compute_should_yield,
                         residency_quarantine=self._quarantine_sam_residency,
                         before_worker_shutdown=self._before_sam_worker_shutdown,
                         after_worker_shutdown=self._after_sam_worker_shutdown)
@@ -1616,7 +2437,7 @@ class SamInterpolationContext:
             if self.crop_retry_policy is not None:
                 kwargs.setdefault('crop_retry_policy', self.crop_retry_policy)
                 kwargs.setdefault('retry_image_provider',
-                    lambda retry: self.image_cohort_provider(view, shape, retry))
+                    lambda retry: self._prepare_image_cohort(view, shape, retry))
             merged, stats, components = interpolate_sam_view_volume_pass(
                 observed, image_provider=provider, view=view,
                 runtime=runtime, scope=scope_metadata, policy=self.policy, cancel_event=self._cancel,
@@ -1755,7 +2576,7 @@ class SamInterpolationContext:
                     if not callable(getattr(runtime, 'release_source_cache', None)):
                         raise RuntimeError('Multiple SAM image cohorts require a worker source-cache retirement barrier')
                     kwargs['image_cohorts'] = cohorts
-                    kwargs['image_cohort_provider'] = lambda subset: self.image_cohort_provider(
+                    kwargs['image_cohort_provider'] = lambda subset: self._prepare_image_cohort(
                         view, shape, subset, max_cache_bytes=cap)
                     kwargs['image_cohort_prefetch'] = lambda subset: self.prefetch_image_cohort(
                         view, shape, subset, max_cache_bytes=cap)
@@ -1768,7 +2589,8 @@ class SamInterpolationContext:
             if self.crop_retry_policy is not None:
                 kwargs.setdefault('crop_retry_policy', self.crop_retry_policy)
                 kwargs.setdefault('retry_image_provider',
-                    lambda retry: self.image_cohort_provider(view, shape, retry))
+                    lambda retry: self._prepare_image_cohort(view, shape, retry))
+            kwargs.setdefault('runtime_work_dir', self.temp_dir / 'sam_extrap_runtime')
             _, stats, components = extrapolate_sam_view_volume_pass(observed,
                 image_provider=provider, runtime=runtime, view=view, scope=metadata,
                 prepared_plan=prepared, crop_mode=self.crop_mode, cancel_event=self._cancel,
@@ -1806,6 +2628,11 @@ class SamInterpolationContext:
 
     def close(self):
         self.cancel('SAM interpolation runtime is closing')
+        if self.progressive_startup:
+            self._join_progressive_startup()
+            if self._runtime is None:
+                self._runtime = self._starting_runtime
+            self._starting_runtime = None
         with self._idle:
             prefetches = tuple(self._image_prefetches)
         for prefetch in prefetches:
@@ -1830,7 +2657,8 @@ class SamInterpolationContext:
                     try:
                         self._runtime.close()
                     except BaseException as error:
-                        if getattr(self._runtime, 'residency_released', False) is not True:
+                        if (getattr(self._runtime, 'residency_released', False) is not True
+                                or getattr(self._runtime, 'cleanup_settled', True) is not True):
                             # A retry still owns both model and device lease.
                             # Never advertise memory as available while a
                             # worker process may retain the predictor.
@@ -1838,6 +2666,17 @@ class SamInterpolationContext:
                             raise
                         close_error = error
                     self._runtime = None
+                if self._progressive_pool is not None and not self._progressive_pool.workers_settled:
+                    self._progressive_pool.force_close(timeout=1.)
+                    if not self._progressive_pool.workers_settled:
+                        _retain_unsettled_context(self)
+                        raise RuntimeError('SAM progressive child ownership remains unsettled')
+                for device in tuple(self._startup_host_grants):
+                    self._release_progressive_host(device)
+                if self._startup_pool is not None:
+                    with self._startup_pool.condition:
+                        self._startup_future_peaks.clear()
+                        self._sync_startup_fleet_credit_locked()
                 for release_credit in self._retained_image_prefetch_credits:
                     release_credit()
                 self._retained_image_prefetch_credits.clear()

@@ -3144,7 +3144,9 @@ class _ByteAdmissionPool:
         charged = min(int(requested), int(self.capacity))
         waited = False
         with self.condition:
-            while int(self.in_use) > 0 and int(self.in_use) + int(charged) > int(self.capacity):
+            while (int(self.in_use) > 0 and int(self.in_use) + int(charged) > int(self.capacity)
+                   or requested > int(self.capacity) and int(getattr(
+                       getattr(self, '_sam_image_staging_pool', None), 'in_use', 0)) > 0):
                 if not waited:
                     print(
                         f'{self.name}: waiting to admit {desc} '
@@ -3154,11 +3156,15 @@ class _ByteAdmissionPool:
                     waited = True
                 self.condition.wait()
             self.in_use += int(charged)
+            if requested > int(self.capacity):
+                self.oversize_requested_bytes = requested
         try:
             yield
         finally:
             with self.condition:
                 self.in_use = max(0, int(self.in_use) - int(charged))
+                if requested > int(self.capacity):
+                    self.oversize_requested_bytes = 0
                 self.condition.notify_all()
 
 @dataclass
@@ -3175,6 +3181,7 @@ class _DirectUnionBackingLease:
     phase: str = 'inference'
     owner_count: int = 1
     ram_backed: bool | None = None
+    memfd_owner_proofs: tuple = ()
 
     @property
     def ram_commitment_bytes(self) -> int:
@@ -4212,6 +4219,9 @@ class RawBBoxMaskStore:
         cls, root: Path, *, cache_payload_in_ram: bool = False, mmap_payload: bool = False,
     ) -> 'RawBBoxMaskStore':
         root = Path(root)
+        from .artifact_archive import split_reference
+        if split_reference(root) is not None:
+            return cls._open_archive(root)
         meta_path = root / 'meta.json'
         index_path = root / 'index.bin'
         chunks_path = root / 'chunks.bin'
@@ -4252,6 +4262,51 @@ class RawBBoxMaskStore:
                 _release_raw_store_chunks_ram_cache(chunks_path)
             raise
         store._ram_cache_ref_held = bool(ram_cache_ref_held)
+        return store
+
+    @classmethod
+    def _open_archive(cls, root: Path) -> 'RawBBoxMaskStore':
+        from .artifact_archive import member_info, open_artifact, read_artifact, split_reference
+        meta = json.loads(read_artifact(root / 'meta.json'))
+        if not isinstance(meta, dict) or meta.get('format') not in MASK_STORE_FORMATS:
+            raise ValueError(f'{root}: invalid raw-mask format metadata')
+        shape = meta.get('shape')
+        if (not isinstance(shape, list) or len(shape) != 3
+                or any(type(value) is not int or value < 0 for value in shape)):
+            raise ValueError(f'{root}: invalid shape metadata {shape!r}')
+        record_bytes = int(CTILE_INDEX_DTYPE.itemsize)
+        if meta.get('index_record_bytes', record_bytes) != record_bytes:
+            raise ValueError(f'{root}: invalid index record size')
+        index_bytes = read_artifact(root / 'index.bin', max_bytes=shape[0] * record_bytes)
+        if len(index_bytes) != shape[0] * record_bytes:
+            raise ValueError(f'{root}: index byte count does not match shape')
+        index = np.frombuffer(index_bytes, dtype=CTILE_INDEX_DTYPE)
+        chunks_path = root / 'chunks.bin'
+        info = member_info(chunks_path)
+        size = int(info['bytes'])
+        stats = meta.get('stats', {})
+        if not isinstance(stats, dict):
+            raise ValueError(f'{root}: invalid raw-mask statistics metadata')
+        declared = stats.get('raw_payload_bytes', size)
+        if type(declared) is not int or declared != size:
+            raise ValueError(f'{root}: declared payload byte count does not match chunks.bin')
+        for rec in index:
+            kind = int(rec['kind'])
+            if kind not in (0, 1):
+                raise ValueError(f'{root}: invalid raw-mask chunk marker {kind}')
+            if kind == 1:
+                start, length = int(rec['offset']), int(rec['payload_size'])
+                if length <= 0 or start > size or length > size - start:
+                    raise ValueError(f'{root}: slice payload extends beyond chunks.bin')
+        store = cls(root, meta, index, chunks_bytes=b'')
+        # Verify the sealed member without retaining its potentially multi-GiB bytes.
+        with open_artifact(chunks_path) as stream:
+            while stream.read(1024 * 1024):
+                pass
+        archive, _member = split_reference(chunks_path)
+        store._chunks_bytes = (np.memmap(archive, mode='r', dtype=np.uint8,
+            offset=int(info['offset']), shape=(size,)) if size else b'')
+        store._archive_payload = True
         return store
 
 
@@ -4541,6 +4596,8 @@ class RawBBoxMaskStore:
 
     def unlink(self) -> None:
         self.close()
+        if bool(getattr(self, '_archive_payload', False)):
+            return  # Sealed archive members share an immutable container.
         if bool(getattr(self, '_ram_cache_ref_held', False)):
             self._ram_cache_ref_held = False
             _release_raw_store_chunks_ram_cache(self.chunks_path)

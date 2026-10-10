@@ -205,7 +205,8 @@ class _SparseMaskSampler:
         self.store = store
         self._owned_mapping = None
         backing = store._chunks_bytes if store._chunks_bytes is not None else store._chunks_mmap
-        size = len(backing) if backing is not None else store.chunks_path.stat().st_size
+        from .artifact_archive import artifact_size
+        size = len(backing) if backing is not None else artifact_size(store.chunks_path)
         for record in store.index:
             kind = int(record['kind'])
             if kind == 0:
@@ -615,7 +616,8 @@ def _input_slabs(store: RawBBoxMaskStore):
                     raise IOError(f'{store.root}: short input payload')
                 data = np.frombuffer(backing, dtype=np.uint8, count=count, offset=start).reshape(count_rows, stride)
             else:
-                with store.chunks_path.open('rb') as stream:
+                from .artifact_archive import open_artifact
+                with open_artifact(store.chunks_path) as stream:
                     stream.seek(start)
                     payload = stream.read(count)
                 if len(payload) != count:
@@ -681,8 +683,10 @@ def project_azimuthal_sparse_store(
             raise ValueError('Sparse Azimuthal input requires three positive dimensions')
         if int(store.shape[0]) != int(view.num_slices) or int(store.shape[0]) != len(view.azimuths_deg):
             raise ValueError('Sparse Azimuthal depth differs from the view azimuths')
-        if (target == store.root.resolve() or target in store.root.resolve().parents
-                or store.root.resolve() in target.parents):
+        from .artifact_archive import physical_path
+        source_path = physical_path(store.root).resolve()
+        if (target == source_path or target in source_path.parents
+                or source_path in target.parents):
             raise ValueError('Projected store must not replace its input')
         if np.any((store.index['kind'] != 0) & (store.index['kind'] != 1)):
             raise ValueError('Invalid mask chunk marker')

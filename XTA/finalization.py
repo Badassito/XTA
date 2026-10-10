@@ -257,7 +257,8 @@ def _try_union_temporal_sparse_layer_refs_into_volume(
                 return False
             if tuple(int(value) for value in store.shape[1:]) != (out_h, out_w):
                 return False
-            if store.chunks_path.resolve() in destination_paths:
+            from .artifact_archive import physical_path
+            if physical_path(store.chunks_path).resolve() in destination_paths:
                 return False
             if (
                 store.meta.get('logical_dtype_in_pipeline') != 'uint8_0_or_1'

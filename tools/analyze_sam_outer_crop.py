@@ -20,6 +20,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from tools.prepare_sam_outer_crop_protocol import fingerprint,sha,write_fresh
 from tools.analyze_sam_crop_strategies import contour,load_truth,mask_metrics
 from XTA.sam_evidence import SamEvidenceBundle
+from XTA.artifact_archive import read_artifact
 from XTA.sam_mask_reader import effective_raw_mask,effective_candidate_mask
 
 LAYERS=("raw","radius3","raw_halo","candidate_W","selected_W")
@@ -227,7 +228,7 @@ def analyze(args):
     previewroot=root/"previews"/args.dataset
     # All native evidence reconstruction precedes reading annotation contents.
     for stats,statsfile in publications:
-        selection=json.loads(Path(stats["selection"]).read_text("utf-8"))
+        selection=json.loads(read_artifact(stats["selection"]))
         bundle=SamEvidenceBundle.open(stats["evidence"])
         if not bundle.scope.get("research_only"):
             raise ValueError("Outer-crop scorer requires explicitly identified research evidence")
@@ -261,7 +262,7 @@ def analyze(args):
         stress_seal=validate_stress_seal(root)
         for statsfile in stress_files:
             stats=json.loads(statsfile.read_text("utf-8"));mode=stats["crop_mode"];variant=stats["variant"]
-            selection=json.loads(Path(stats["selection"]).read_text("utf-8"))
+            selection=json.loads(read_artifact(stats["selection"]))
             bundle=SamEvidenceBundle.open(stats["evidence"])
             stress_keys={group_lineage_key(group)for group in bundle.groups.values()}
             if len(stress_keys)!=1:raise ValueError("Stress scope must preserve its single original family")
@@ -273,7 +274,7 @@ def analyze(args):
             for identity in("shape_tyx","source_frame_start","source_image_sha256"):
                 if controls.scope[identity]!=bundle.scope[identity]:
                     raise ValueError("Stress family and retained controls have different native source geometry")
-            control_selection=json.loads(Path(parent_stats["selection"]).read_text("utf-8"))
+            control_selection=json.loads(read_artifact(parent_stats["selection"]))
             retained={group_lineage_key(group)for group in controls.groups.values()}-stress_keys
             control_arrays,control_groups=collect_native_planes(controls,control_selection,frame,retained)
             arrays=union_planes(control_arrays,stress_arrays)
@@ -404,7 +405,7 @@ def diagnose_containment(args):
         if len(groups)!=1:raise ValueError("Main original family is not uniquely matched")
         gid,group=groups[0];y0,x0,y1,x1=map(int,group["context_bbox_yx"])
         frame=stage["middle_full_source_frame"]-bundle.scope["source_frame_start"]
-        selection=json.loads(Path(model["selection_file"]).read_text("utf-8"))
+        selection=json.loads(read_artifact(model["selection_file"]))
         validate_selection_bundle(bundle,selection)
         with bundle.reader()as reader:
             snapshot=reader.filter_snapshot(selection)

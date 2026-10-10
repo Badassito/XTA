@@ -19,11 +19,14 @@ from pathlib import Path
 import sys
 import threading
 import time
+import tempfile
 from types import MappingProxyType
 from typing import Any
 
 import numpy as np
 from .sam_resources import sam_worker_count
+from .artifact_archive import split_reference, read_member, artifact_directory
+from .json_publication import write_json_atomic
 
 
 class SamInterpolationInfrastructureError(RuntimeError):
@@ -60,7 +63,7 @@ def _failure_receipt(destination: Path, error: BaseException, phase: str, genera
     failure = {"status": "infrastructure_invalid", "complete": False,
                "backend": "sam", "phase": str(phase), "error": str(error),
                "generated_runs": int(generated_runs)}
-    (destination / "failure.json").write_text(json.dumps(failure, indent=2), encoding="utf-8")
+    write_json_atomic(destination / "failure.json", failure)
 
 
 def _plain(value: Any) -> Any:
@@ -748,6 +751,9 @@ def _regenerate_sam_group_retry(prepared, *, destination, metadata, image_provid
     by_id = prepared.plan.by_id
     cache = getattr(image_provider, 'cache_ref', image_provider)
     assemblies = {}
+    assembly_root = (Path(tempfile.mkdtemp(prefix='sam-retry-tiles-'))
+        if prepared.crop_mode == 'tiled' and split_reference(destination) is not None
+        else destination / 'tile_assemblies')
     stream = None
     completed = set()
     worker_count = min(sam_worker_count(runtime,legacy=resource_profile is None),
@@ -773,51 +779,52 @@ def _regenerate_sam_group_retry(prepared, *, destination, metadata, image_provid
                     cancel_event, resource_profile), cache, prepared.cpu_wave_admission,scope_admission=permit))
             for index, result in stream:
                 try:
-                    if isinstance(index, bool) or not isinstance(index, (int, np.integer)) or not 0 <= int(index) < len(order):
-                        raise SamInterpolationInfrastructureError('SAM retry returned invalid job ownership')
-                    work_index = order[int(index)]
-                    if work_index in completed:
-                        raise SamInterpolationInfrastructureError('SAM retry returned duplicate job ownership')
-                    item = work[work_index]
-                    run = item.original_run if tiled else item
-                    group = groups[str(run.group_id)]
-                    expected_id = item.run_id if tiled else run.run_id
-                    declared = getattr(result, 'receipt', {}).get('run_id')
-                    if declared is not None and str(declared) != str(expected_id):
-                        raise SamInterpolationInfrastructureError('SAM retry changed its job identity')
-                    if tiled:
-                        for identity_key in ('sam_model', 'sam_runtime'):
-                            actual = dict(result.receipt or {}).get(identity_key)
-                            if actual is not None:
-                                actual = _plain(actual)
-                                if identity_key in metadata and metadata[identity_key] != actual:
-                                    raise SamInterpolationInfrastructureError('SAM retry tile changed its model/runtime identity')
-                                metadata[identity_key] = actual
-                                writer.scope[identity_key] = actual
-                        parent = item.original_run_index
-                        if parent not in assemblies:
-                            assemblies[parent] = TiledRunAssembly(run, group, prepared.tile_inventory[parent],
-                                destination / 'tile_assemblies' / hashlib.sha256(str(run.run_id).encode()).hexdigest()[:12])
-                        assembly = assemblies[parent]
-                        child, masks = assembly.consume(item, result)
-                        writer.add_run_tile(run.run_id, child, masks)
-                        if not child['structurally_valid']:
-                            raise SamInterpolationInfrastructureError('SAM retry returned invalid tiled raw evidence')
-                        if assembly.ready:
-                            full = assembly.result()
+                    with writer.parallel_packing(getattr(result, 'packing_admission', None)):
+                        if isinstance(index, bool) or not isinstance(index, (int, np.integer)) or not 0 <= int(index) < len(order):
+                            raise SamInterpolationInfrastructureError('SAM retry returned invalid job ownership')
+                        work_index = order[int(index)]
+                        if work_index in completed:
+                            raise SamInterpolationInfrastructureError('SAM retry returned duplicate job ownership')
+                        item = work[work_index]
+                        run = item.original_run if tiled else item
+                        group = groups[str(run.group_id)]
+                        expected_id = item.run_id if tiled else run.run_id
+                        declared = getattr(result, 'receipt', {}).get('run_id')
+                        if declared is not None and str(declared) != str(expected_id):
+                            raise SamInterpolationInfrastructureError('SAM retry changed its job identity')
+                        if tiled:
                             for identity_key in ('sam_model', 'sam_runtime'):
-                                if identity_key in metadata:
-                                    full.receipt[identity_key] = metadata[identity_key]
-                            descriptor = _store_generated_parent_run(writer, run, full, group, by_id,
-                                metadata, upstream_lineage, assembly.availability())
-                            descriptor['crop_retry_of_run_id'] = original_run_ids[str(run.run_id)]
+                                actual = dict(result.receipt or {}).get(identity_key)
+                                if actual is not None:
+                                    actual = _plain(actual)
+                                    if identity_key in metadata and metadata[identity_key] != actual:
+                                        raise SamInterpolationInfrastructureError('SAM retry tile changed its model/runtime identity')
+                                    metadata[identity_key] = actual
+                                    writer.scope[identity_key] = actual
+                            parent = item.original_run_index
+                            if parent not in assemblies:
+                                assemblies[parent] = TiledRunAssembly(run, group, prepared.tile_inventory[parent],
+                                    assembly_root / hashlib.sha256(str(run.run_id).encode()).hexdigest()[:12])
+                            assembly = assemblies[parent]
+                            child, masks = assembly.consume(item, result)
+                            writer.add_run_tile(run.run_id, child, masks)
+                            if not child['structurally_valid']:
+                                raise SamInterpolationInfrastructureError('SAM retry returned invalid tiled raw evidence')
+                            if assembly.ready:
+                                full = assembly.result()
+                                for identity_key in ('sam_model', 'sam_runtime'):
+                                    if identity_key in metadata:
+                                        full.receipt[identity_key] = metadata[identity_key]
+                                descriptor = _store_generated_parent_run(writer, run, full, group, by_id,
+                                    metadata, upstream_lineage, assembly.availability())
+                                descriptor['crop_retry_of_run_id'] = original_run_ids[str(run.run_id)]
+                                writer.runs[str(run.run_id)]['crop_retry_of_run_id'] = original_run_ids[str(run.run_id)]
+                                del full
+                                assembly.close()
+                                del assemblies[parent]
+                        else:
+                            _store_generated_parent_run(writer, run, result, group, by_id, metadata, upstream_lineage)
                             writer.runs[str(run.run_id)]['crop_retry_of_run_id'] = original_run_ids[str(run.run_id)]
-                            del full
-                            assembly.close()
-                            del assemblies[parent]
-                    else:
-                        _store_generated_parent_run(writer, run, result, group, by_id, metadata, upstream_lineage)
-                        writer.runs[str(run.run_id)]['crop_retry_of_run_id'] = original_run_ids[str(run.run_id)]
                     completed.add(work_index)
                 finally:
                     if hasattr(runtime, 'release_result'):
@@ -839,6 +846,8 @@ def _regenerate_sam_group_retry(prepared, *, destination, metadata, image_provid
                 assembly.close()
             if stream is not None:
                 stream.close()
+            if split_reference(destination) is not None and prepared.crop_mode == 'tiled':
+                assembly_root.rmdir()
 
 
 def _apply_sam_crop_retries(bundle, prepared, *, destination, metadata, runtime,
@@ -925,7 +934,8 @@ def _apply_sam_crop_retries(bundle, prepared, *, destination, metadata, runtime,
                     controller.verify_retry_identity(decision, seed_identity=seed_identity, interval_identity=interval_identity)
                     retry_destination = destination / 'crop_retries' / (
                         hashlib.sha256(group_id.encode()).hexdigest()[:12]+'_'+str(retry_index))
-                    retry_destination.mkdir(parents=True, exist_ok=True)
+                    if split_reference(retry_destination) is None:
+                        retry_destination.mkdir(parents=True, exist_ok=True)
                     attempt_metadata = dict(metadata, sam_crop_retry_attempt=decision.record,
                         sam_crop_retry_policy=retry_policy.to_dict(),
                         retry_tiling_plan_sha256=retry.tiling_sha256)
@@ -989,15 +999,16 @@ def _apply_sam_crop_retries(bundle, prepared, *, destination, metadata, runtime,
     except BaseException as error:
         receipt=ledger()
         receipt.update(scope_failed=True,error=str(error))
-        (destination/'crop_retry.json').write_text(json.dumps(receipt,indent=2),encoding='utf-8')
+        write_json_atomic(destination/'crop_retry.json', receipt)
         _failure_receipt(destination,error,'crop_retry',len(bundle.runs))
         raise
     receipt = ledger()
-    (destination/'crop_retry.json').write_text(json.dumps(receipt, indent=2), encoding='utf-8')
+    write_json_atomic(destination/'crop_retry.json', receipt)
     if not replacements:
         return bundle, destination, receipt
     final_destination = destination/'adaptive_final'
-    final_destination.mkdir(parents=True, exist_ok=True)
+    if split_reference(final_destination) is None:
+        final_destination.mkdir(parents=True, exist_ok=True)
     final_metadata = dict(metadata, sam_crop_retry=receipt,
         chosen_attempt_basis='one_complete_raw_attempt_per_original_family_global_reselection')
     final_writer = SamEvidenceWriter(final_destination/'evidence', final_metadata)
@@ -1019,12 +1030,12 @@ def _apply_sam_crop_retries(bundle, prepared, *, destination, metadata, runtime,
     except BaseException as error:
         final_writer.abort()
         receipt.update(scope_failed=True,error=str(error))
-        (destination/'crop_retry.json').write_text(json.dumps(receipt,indent=2),encoding='utf-8')
+        write_json_atomic(destination/'crop_retry.json', receipt)
         _failure_receipt(destination,error,'crop_retry_final_import',len(final_writer.runs))
         raise
     receipt['final_evidence_path'] = str(final_bundle.directory)
     receipt['final_evidence_fingerprint'] = final_bundle.evidence_fingerprint
-    (destination/'crop_retry.json').write_text(json.dumps(receipt, indent=2), encoding='utf-8')
+    write_json_atomic(destination/'crop_retry.json', receipt)
     return final_bundle, final_destination, receipt
 
 
@@ -1321,55 +1332,56 @@ def _publish_directions_with_reader(bundle: object, receipt: Mapping[str, object
                     active_frames_set.add(native_frame)
             active_frames = sorted(active_frames_set)
             path = destination / f"sam_bridge_pass{pass_index:02d}_{direction}.cvol"
-            writer = IncrementalRawBBoxMaskStoreWriter(
-                shape=shape, store_dir=path, format_name=INTERNAL_PACKED_CVOL_FORMAT,
-                desc=f"Selected SAM {direction} pass {pass_index}",
-                extra_meta={**dict(metadata), "interpolation_backend": "sam",
-                            "interpolation_direction": direction,
-                            "interpolation_pass_index": int(pass_index),
-                            "sam_policy_hash": str(receipt["policy_hash"]),
-                            "sam_selection_identity": str(receipt.get("selection_identity", "")),
-                            "sam_selection_resources": _plain(receipt.get("selection_resources", {})),
-                            "sam_mask_filter": _plain(receipt.get("mask_filter")),
-                            "sam_evidence_path": str(bundle.directory)},
-            )
-            try:
-                next_unwritten = 0
-                for frame in active_frames:
+            with artifact_directory(path, temp_root=merged_work_dir) as store_dir:
+                writer = IncrementalRawBBoxMaskStoreWriter(
+                    shape=shape, store_dir=store_dir, format_name=INTERNAL_PACKED_CVOL_FORMAT,
+                    desc=f"Selected SAM {direction} pass {pass_index}",
+                    extra_meta={**dict(metadata), "interpolation_backend": "sam",
+                                "interpolation_direction": direction,
+                                "interpolation_pass_index": int(pass_index),
+                                "sam_policy_hash": str(receipt["policy_hash"]),
+                                "sam_selection_identity": str(receipt.get("selection_identity", "")),
+                                "sam_selection_resources": _plain(receipt.get("selection_resources", {})),
+                                "sam_mask_filter": _plain(receipt.get("mask_filter")),
+                                "sam_evidence_path": str(bundle.directory)},
+                )
+                try:
+                    next_unwritten = 0
+                    for frame in active_frames:
+                        _check_cancelled(cancel_event)
+                        if frame > next_unwritten:
+                            writer.consume_empty_range(next_unwritten, frame - next_unwritten)
+                        plane = selected_sam_plane(bundle, selection_view or receipt, frame, shape[1:], direction=sign)
+                        # The write contract is additive. Guard this invariant again
+                        # at publication in case a corrupt/custom evidence writer errs.
+                        if np.any(plane & (np.asarray(observations[frame]) != 0)):
+                            raise SamInterpolationInfrastructureError("SAM candidate repaints original observations")
+                        writer.consume(frame, plane[None])
+                        next_unwritten = frame + 1
+                        if plane.any():
+                            if merged is None:
+                                merged_work_dir.mkdir(parents=True, exist_ok=True)
+                                merged = np.memmap(merged_path, mode="w+", dtype=np.uint8, shape=shape)
+                                snapshot = hashlib.sha256(json.dumps(list(shape)).encode("ascii"))
+                                for source_frame in range(shape[0]):
+                                    _check_cancelled(cancel_event)
+                                    original_plane = np.asarray(observations[source_frame]) != 0
+                                    merged[source_frame] = original_plane
+                                    snapshot.update(np.packbits(original_plane, bitorder="little").tobytes())
+                                expected_snapshot = str(metadata.get("observation_snapshot_sha256", ""))
+                                if expected_snapshot and snapshot.hexdigest() != expected_snapshot:
+                                    raise SamInterpolationInfrastructureError("Pinned SAM original observations changed during tracking")
+                            added += int(np.count_nonzero(plane & ~(merged[frame] != 0)))
+                            merged[frame] |= plane
+                    if next_unwritten < shape[0]:
+                        writer.consume_empty_range(next_unwritten, shape[0] - next_unwritten)
                     _check_cancelled(cancel_event)
-                    if frame > next_unwritten:
-                        writer.consume_empty_range(next_unwritten, frame - next_unwritten)
-                    plane = selected_sam_plane(bundle, selection_view or receipt, frame, shape[1:], direction=sign)
-                    # The write contract is additive. Guard this invariant again
-                    # at publication in case a corrupt/custom evidence writer errs.
-                    if np.any(plane & (np.asarray(observations[frame]) != 0)):
-                        raise SamInterpolationInfrastructureError("SAM candidate repaints original observations")
-                    writer.consume(frame, plane[None])
-                    next_unwritten = frame + 1
-                    if plane.any():
-                        if merged is None:
-                            merged_work_dir.mkdir(parents=True, exist_ok=True)
-                            merged = np.memmap(merged_path, mode="w+", dtype=np.uint8, shape=shape)
-                            snapshot = hashlib.sha256(json.dumps(list(shape)).encode("ascii"))
-                            for source_frame in range(shape[0]):
-                                _check_cancelled(cancel_event)
-                                original_plane = np.asarray(observations[source_frame]) != 0
-                                merged[source_frame] = original_plane
-                                snapshot.update(np.packbits(original_plane, bitorder="little").tobytes())
-                            expected_snapshot = str(metadata.get("observation_snapshot_sha256", ""))
-                            if expected_snapshot and snapshot.hexdigest() != expected_snapshot:
-                                raise SamInterpolationInfrastructureError("Pinned SAM original observations changed during tracking")
-                        added += int(np.count_nonzero(plane & ~(merged[frame] != 0)))
-                        merged[frame] |= plane
-                if next_unwritten < shape[0]:
-                    writer.consume_empty_range(next_unwritten, shape[0] - next_unwritten)
-                _check_cancelled(cancel_event)
-                store_meta = writer.finalize()
-                store_meta.update(sam_selection_identity=str(receipt.get('selection_identity', '')),
-                    sam_selection_resources=_plain(receipt.get('selection_resources', {})))
-            except BaseException as error:
-                writer.abort(error)
-                raise
+                    store_meta = writer.finalize()
+                    store_meta.update(sam_selection_identity=str(receipt.get('selection_identity', '')),
+                        sam_selection_resources=_plain(receipt.get('selection_resources', {})))
+                except BaseException as error:
+                    writer.abort(error)
+                    raise
             components.append({
                 "direction": direction, "path": str(path),
                 "storage_format": INTERNAL_PACKED_CVOL_FORMAT,
@@ -1620,7 +1632,10 @@ def interpolate_sam_view_volume_pass(
             and runs and not family_capable):
         raise SamInterpolationInfrastructureError('Explicit family FIFO dispatch requires a family-aware SAM runtime')
     destination = Path(work_dir) / f"sam_{scope_hash}"
-    destination.mkdir(parents=True, exist_ok=True)
+    if split_reference(destination) is None:
+        destination.mkdir(parents=True, exist_ok=True)
+    if runtime_work_dir is None and split_reference(destination) is not None:
+        runtime_work_dir = Path(tempfile.mkdtemp(prefix='sam-runtime-'))
     observation_by_id = {str(observation.observation_id): observation for observation in plan.observations}
     groups = {str(group.group_id): group for group in plan.groups}
     generated_by_index: dict[int, dict[str, object]] = {}
@@ -1767,57 +1782,58 @@ def interpolate_sam_view_volume_pass(
                         observation_by_id, cancel_event, resource_profile), cache_ref, prepared_plan.cpu_wave_admission,scope_admission=permit))
             for execution_index, result in result_stream:
                 try:
-                    if (isinstance(execution_index, bool) or not isinstance(execution_index, (int, np.integer))
-                            or not 0 <= int(execution_index) < len(tracking_work)):
-                        raise SamInterpolationInfrastructureError("SAM worker returned duplicate or unknown run ownership")
-                    work_index = int(execution_index) if family_dispatch else execution_order[int(execution_index)]
-                    if family_dispatch:
-                        stats['sam_family_completion_order'].append(work_index)
-                    if work_index in completed_jobs:
-                        raise SamInterpolationInfrastructureError("SAM worker returned duplicate or unknown run ownership")
-                    job = tracking_work[work_index]
-                    run = job.original_run if resolved_mode == "tiled" else job
-                    run_index = job.original_run_index if resolved_mode == "tiled" else work_index
-                    group = groups[str(run.group_id)]
-                    expected_run_id = job.run_id if resolved_mode == "tiled" else run.run_id
-                    declared_run_id = getattr(result, "receipt", {}).get("run_id")
-                    if declared_run_id is not None and str(declared_run_id) != str(expected_run_id):
-                        raise SamInterpolationInfrastructureError("SAM worker result differs from its planned run identity")
-                    write_group(group)
-                    if resolved_mode == "whole":
-                        generated_by_index[run_index] = _store_generated_parent_run(writer, run, result,
-                            group, observation_by_id, metadata, upstream_lineage)
-                    else:
-                        write_empty_tiles(run_index)
-                        for identity_key in ("sam_model", "sam_runtime"):
-                            actual_identity = dict(result.receipt or {}).get(identity_key)
-                            if actual_identity is not None:
-                                actual_identity = _plain(actual_identity)
-                                if identity_key in metadata and metadata[identity_key] != actual_identity:
-                                    raise SamInterpolationInfrastructureError("SAM tile model/runtime identity changed within a scope")
-                                metadata[identity_key] = actual_identity
-                                writer.scope[identity_key] = actual_identity
-                        if run_index not in assemblies:
-                            if len(assemblies) >= MAX_ACTIVE_PARENT_ASSEMBLIES:
-                                raise SamInterpolationInfrastructureError("SAM tiled parent assembly admission exceeded its bounded cohort")
-                            assemblies[run_index] = TiledRunAssembly(run, group,
-                                prepared_plan.tile_inventory[run_index], assembly_root / str(run.run_id))
-                        assembly = assemblies[run_index]
-                        child_descriptor, raw_tile_masks = assembly.consume(job, result)
-                        writer.add_run_tile(run.run_id, child_descriptor, raw_tile_masks)
-                        if not child_descriptor["structurally_valid"]:
-                            raise SamInterpolationInfrastructureError("SAM tile tracker produced structurally invalid expected object evidence")
-                        if assembly.ready:
-                            assembled_result = assembly.result()
+                    with writer.parallel_packing(getattr(result, 'packing_admission', None)):
+                        if (isinstance(execution_index, bool) or not isinstance(execution_index, (int, np.integer))
+                                or not 0 <= int(execution_index) < len(tracking_work)):
+                            raise SamInterpolationInfrastructureError("SAM worker returned duplicate or unknown run ownership")
+                        work_index = int(execution_index) if family_dispatch else execution_order[int(execution_index)]
+                        if family_dispatch:
+                            stats['sam_family_completion_order'].append(work_index)
+                        if work_index in completed_jobs:
+                            raise SamInterpolationInfrastructureError("SAM worker returned duplicate or unknown run ownership")
+                        job = tracking_work[work_index]
+                        run = job.original_run if resolved_mode == "tiled" else job
+                        run_index = job.original_run_index if resolved_mode == "tiled" else work_index
+                        group = groups[str(run.group_id)]
+                        expected_run_id = job.run_id if resolved_mode == "tiled" else run.run_id
+                        declared_run_id = getattr(result, "receipt", {}).get("run_id")
+                        if declared_run_id is not None and str(declared_run_id) != str(expected_run_id):
+                            raise SamInterpolationInfrastructureError("SAM worker result differs from its planned run identity")
+                        write_group(group)
+                        if resolved_mode == "whole":
+                            generated_by_index[run_index] = _store_generated_parent_run(writer, run, result,
+                                group, observation_by_id, metadata, upstream_lineage)
+                        else:
+                            write_empty_tiles(run_index)
                             for identity_key in ("sam_model", "sam_runtime"):
-                                if identity_key in metadata:
-                                    assembled_result.receipt[identity_key] = metadata[identity_key]
-                            generated_by_index[run_index] = _store_generated_parent_run(writer, run, assembled_result,
-                                group, observation_by_id, metadata, upstream_lineage, assembly.availability())
-                            del assembled_result
-                            assembly.close()
-                            del assemblies[run_index]
-                        del raw_tile_masks
+                                actual_identity = dict(result.receipt or {}).get(identity_key)
+                                if actual_identity is not None:
+                                    actual_identity = _plain(actual_identity)
+                                    if identity_key in metadata and metadata[identity_key] != actual_identity:
+                                        raise SamInterpolationInfrastructureError("SAM tile model/runtime identity changed within a scope")
+                                    metadata[identity_key] = actual_identity
+                                    writer.scope[identity_key] = actual_identity
+                            if run_index not in assemblies:
+                                if len(assemblies) >= MAX_ACTIVE_PARENT_ASSEMBLIES:
+                                    raise SamInterpolationInfrastructureError("SAM tiled parent assembly admission exceeded its bounded cohort")
+                                assemblies[run_index] = TiledRunAssembly(run, group,
+                                    prepared_plan.tile_inventory[run_index], assembly_root / str(run.run_id))
+                            assembly = assemblies[run_index]
+                            child_descriptor, raw_tile_masks = assembly.consume(job, result)
+                            writer.add_run_tile(run.run_id, child_descriptor, raw_tile_masks)
+                            if not child_descriptor["structurally_valid"]:
+                                raise SamInterpolationInfrastructureError("SAM tile tracker produced structurally invalid expected object evidence")
+                            if assembly.ready:
+                                assembled_result = assembly.result()
+                                for identity_key in ("sam_model", "sam_runtime"):
+                                    if identity_key in metadata:
+                                        assembled_result.receipt[identity_key] = metadata[identity_key]
+                                generated_by_index[run_index] = _store_generated_parent_run(writer, run, assembled_result,
+                                    group, observation_by_id, metadata, upstream_lineage, assembly.availability())
+                                del assembled_result
+                                assembly.close()
+                                del assemblies[run_index]
+                            del raw_tile_masks
                     completed_jobs.add(work_index)
                 finally:
                     if hasattr(runtime, "release_result"):
@@ -1882,9 +1898,10 @@ def interpolate_sam_view_volume_pass(
                         add_note(f"SAM worker cleanup also failed: {cleanup_error}")
                     failure_path = destination / "failure.json"
                     try:
-                        failure = json.loads(failure_path.read_text(encoding="utf-8"))
+                        failure = json.loads(read_member(failure_path) if split_reference(failure_path) is not None
+                                             else failure_path.read_bytes())
                         failure["worker_cleanup_error"] = str(cleanup_error)
-                        failure_path.write_text(json.dumps(failure, indent=2), encoding="utf-8")
+                        write_json_atomic(failure_path, failure)
                     except Exception as receipt_error:
                         add_note = getattr(original_error, "add_note", None)
                         if callable(add_note):
@@ -1917,7 +1934,7 @@ def interpolate_sam_view_volume_pass(
                 workers=workers,
                 **({"resource_profile": resource_profile} if resource_profile is not None else {}))
         stats["sam_policy_wall_seconds"] = time.perf_counter() - policy_started
-        (destination / "selection.json").write_text(json.dumps(_plain(receipt), indent=2), encoding="utf-8")
+        write_json_atomic(destination / "selection.json", _plain(receipt))
         with _trace_sam_phase('publication', metadata.get('scope_id', ''), operation='interpolation'):
             merged, components, added, publication_cache_stats = _publish_directions(bundle, receipt, observations,
                 destination, metadata, int(pass_index), merged_directory, cancel_event)
@@ -1974,7 +1991,7 @@ def interpolate_sam_view_volume_pass(
         "sam_merged_workspace_bytes": int(merged.nbytes) if added else 0,
         "generator_wall_seconds": time.perf_counter() - started,
     })
-    (destination / "generation.json").write_text(json.dumps(_plain(stats), indent=2), encoding="utf-8")
+    write_json_atomic(destination / "generation.json", _plain(stats))
     return merged, stats, components if return_bridge_components else []
 
 

@@ -123,6 +123,7 @@ def measure_sam_final_connections(
     native Transverse with an identity source transform.
     """
     from .sam_evidence import SamEvidenceBundle, load_sam_online_selection
+    from .artifact_archive import reference as artifact_reference, split_reference
     from .sam_mask_reader import effective_candidate_mask
     from scipy import ndimage
 
@@ -155,7 +156,9 @@ def measure_sam_final_connections(
                       'Final connection audit requires a verified identity Transverse source transform.')
             results[identity] = dict(status='not_assessed', reason=reason, groups=[])
             continue
-        key = (str(Path(path).resolve()), str(getattr(ref, 'interpolation_policy_identity', '')),
+        parsed = split_reference(path)
+        canonical = artifact_reference(*parsed) if parsed is not None else str(Path(path).resolve())
+        key = (canonical, str(getattr(ref, 'interpolation_policy_identity', '')),
                int(getattr(ref, 'interpolation_connectivity', 6)))
         scope = scopes.setdefault(key, dict(refs=[], runs=set()))
         scope['refs'].append((identity, ref))
@@ -164,7 +167,7 @@ def measure_sam_final_connections(
         if connectivity not in (6, 18, 26):
             raise ValueError('SAM final topology connectivity must be 6, 18 or 26')
         bundle_path = Path(path)
-        if bundle_path.is_file() and bundle_path.name == 'manifest.json':
+        if bundle_path.name == 'manifest.json':
             bundle_path = bundle_path.parent
         bundle = SamEvidenceBundle.open(bundle_path, max_mask_bytes=max(1, budget // 4))
         if not bundle.manifest.get('complete'):

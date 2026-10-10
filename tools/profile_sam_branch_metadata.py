@@ -24,6 +24,8 @@ REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+from XTA.artifact_archive import read_artifact, physical_path
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
@@ -51,15 +53,16 @@ def main(argv=None):
     evidence = args.evidence.resolve()
     selection_path = (args.selection or evidence.parent/'selection.json').resolve()
     output = args.output.resolve()
-    if output.is_relative_to(evidence.parent) or evidence.parent.is_relative_to(output):
+    input_parent = physical_path(evidence).parent
+    if output.is_relative_to(input_parent) or input_parent.is_relative_to(output):
         raise ValueError('Profile output must not overlap immutable evidence')
     output.mkdir(parents=True, exist_ok=False)
     names = ('XTA/sam_policy.py', 'XTA/sam_branch_selection.py', 'XTA/sam_mask_reader.py',
-             'XTA/sam_evidence.py', 'XTA/sam_filtering.py', 'tools/profile_sam_branch_metadata.py',
+             'XTA/sam_evidence.py', 'XTA/artifact_archive.py', 'XTA/sam_filtering.py', 'tools/profile_sam_branch_metadata.py',
              'tools/qualify_sam_policy_throughput.py')
     sources = {name: hashlib.sha256((REPO/name).read_bytes()).hexdigest() for name in names}
     inputs = input_inventory(evidence, selection_path)
-    saved = json.loads(selection_path.read_text(encoding='utf-8'))
+    saved = json.loads(read_artifact(selection_path))
     bundle = SamEvidenceBundle.open(evidence)
     recipe = saved['branch_selection']
     with bundle.reader(max_cache_bytes=0) as reader:

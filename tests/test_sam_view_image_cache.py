@@ -315,18 +315,20 @@ def test_awkward_scale_nonlinear_views_match_full_canonical_grid(tmp_path, famil
         context.close()
 
 
-def test_native_plane_budget_refusal_precedes_sampler_allocation(tmp_path, monkeypatch):
+def test_cartesian_crop_budget_uses_only_demanded_native_pixels(tmp_path, monkeypatch):
     monkeypatch.setenv('YOLO_TTA_SAM_RENDER_MAX_BYTES', '2048')
     source = np.zeros((17, 67, 113), np.uint8)
     view = geometry.get_view_infos(*source.shape, cartesian_views=('sagittal',))[0]
     context = context_for(tmp_path, source)
     try:
-        with mock.patch.object(geometry, 'get_view_frame_by_index', side_effect=AssertionError('oversized native allocation')):
-            with pytest.raises(RuntimeError, match='bounded rendering memory budget'):
-                context.image_provider(view, (view.num_slices, 1024, 1024),
-                    demand((view.num_slices, 1024, 1024), {0: (500, 500, 508, 508)}))
-        assert context.native_sampling_calls == 0
-        assert not context._caches
+        with mock.patch.object(geometry, 'get_view_frame_by_index',
+                wraps=geometry.get_view_frame_by_index) as sampler:
+            reference = context.image_provider(view, (view.num_slices, 1024, 1024),
+                demand((view.num_slices, 1024, 1024), {0: (500, 500, 508, 508)}))
+        assert sampler.call_args.kwargs['view_frames'] is not None
+        assert not crop_from(reference, 0, (500, 500, 508, 508)).any()
+        assert context.native_sampling_calls == 1
+        assert context.native_sampling_pixels < int(view.src_h)*int(view.src_w)
     finally:
         context.close()
 

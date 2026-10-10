@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import math
 import shutil
@@ -26,6 +27,7 @@ from typing import (
 import numpy as np
 from ._deps import _numba, cv2, ndi, tqdm
 from .gaussian import binary_gaussian_pass
+from .artifact_archive import artifact_directory, artifact_size, open_artifact, split_reference
 
 from .config import (
     GIB,
@@ -192,7 +194,7 @@ def materialize_sam_directional_view_layer(
 def _sam_directional_source_backing(
     native_path: Path, *, view: ViewInfo, stage: str, has_foreground: bool,
     model_name: str, source: str, pass_index: int, tile_config_id: str,
-    workers: int = 1, mask_kind: str = 'bridge',
+    workers: int = 1, mask_kind: str = 'bridge', _work_root: Optional[Path] = None,
 ) -> Dict[str, object]:
     """Keep native proposals for replay/gating and publish source-oriented masks.
 
@@ -200,7 +202,33 @@ def _sam_directional_source_backing(
     ``native_transform`` metadata. Cartesian axis permutation and nonlinear
     projection must therefore happen before constructing the public layer ref.
     """
-    destination = native_path.parent / 'source_layers' / f'{native_path.stem}.orthogonal.cvol'
+    if (split_reference(native_path) is not None and _work_root is None
+            and not (view.family == 'orthogonal' and not is_tilted_view(view)
+                     and physical_view_name(view) == 'transverse')):
+        logical_root = native_path.parent / 'source_layers' / native_path.stem
+        with artifact_directory(logical_root) as staging:
+            work_root = staging.with_name(staging.name + '.work')
+            work_root.mkdir()
+            try:
+                backing = _sam_directional_source_backing(native_path, view=view, stage=stage,
+                    has_foreground=has_foreground, model_name=model_name, source=source,
+                    pass_index=pass_index, tile_config_id=tile_config_id, workers=workers,
+                    mask_kind=mask_kind, _work_root=work_root)
+                # Runtime workspaces retire asynchronously; commit only the sealed store.
+                Path(backing['path']).rename(staging / 'projected.cvol')
+            except BaseException as error:
+                add_note = getattr(error, 'add_note', None)
+                if callable(add_note):
+                    add_note(f'SAM source projection recovery files remain at {work_root}')
+                raise
+            backing['path'] = logical_root / 'projected.cvol'
+            shutil.rmtree(work_root, ignore_errors=True)
+            if work_root.exists():
+                defer_retired_memmap_directory_cleanup(work_root)
+        return backing
+    work_root = _work_root or native_path.parent / 'source_layers'
+    destination = (work_root / 'projected.cvol' if _work_root is not None else
+                   work_root / f'{native_path.stem}.orthogonal.cvol')
     source_shape = final_source_output_shape() or (int(view.full_t), int(view.full_h), int(view.full_w))
     with contextlib.closing(RawBBoxMaskStore.open(native_path, mmap_payload=True)) as store:
         if view.family == 'orthogonal' and not is_tilted_view(view):
@@ -235,7 +263,8 @@ def _sam_directional_source_backing(
         return dict(path=destination, shape=source_shape, storage_format=INTERNAL_PACKED_CVOL_FORMAT,
             extent=tuple(stats['segment_extent_ijk']), coordinate_space='source_grid')
     from .interpolation import materialize_raw_bbox_mask_store_workspace
-    workspace_path = native_path.parent / 'source_layers' / f'{native_path.stem}.native.u8.dat'
+    workspace_path = work_root / ('native.u8.dat' if _work_root is not None else
+                                  f'{native_path.stem}.native.u8.dat')
     workspace_path.parent.mkdir(parents=True, exist_ok=True)
     workspace = None
     try:
@@ -244,7 +273,7 @@ def _sam_directional_source_backing(
         projected = materialize_nrrd_view_layer(workspace, model_name=model_name, view=view,
             source=source, mask_kind=mask_kind, pass_index=pass_index, tile_config_id=tile_config_id,
             tile_acceptance='consolidated' if source == 'tile' else '', stage=stage,
-            temp_dir=native_path.parent / 'source_layers', workers=max(1,int(workers)), known_has_foreground=True,
+            temp_dir=work_root, workers=max(1,int(workers)), known_has_foreground=True,
             submit_to_sink=False, internal_packbits_store=True)
         if projected is None:
             raise RuntimeError('Selected SAM source projection did not produce a layer')
@@ -667,14 +696,16 @@ def materialize_nrrd_view_layer(
         tile_acceptance=str(tile_acceptance),
         stage=str(stage),
     )
-    layer_dir = temp_dir / 'nrrd_layers' / str(view.name)
+    storage_token = hashlib.sha256(key.encode('utf-8')).hexdigest() if internal_packbits_store else str(view.name)
+    file_token = 'mask' if internal_packbits_store else key
+    layer_dir = temp_dir / 'nrrd_layers' / storage_token
     bbox_store_format = (
         INTERNAL_PACKED_CVOL_FORMAT
         if bool(internal_packbits_store)
         else CVOL_FORMAT
     )
-    raw_path = temp_dir / 'nrrd_work' / 'projected_layers' / str(view.name) / f'{key}.orthogonal.u8.dat'
-    out_path = layer_dir / f'{key}.orthogonal.cvol'
+    raw_path = temp_dir / 'nrrd_work' / 'projected_layers' / storage_token / f'{file_token}.orthogonal.u8.dat'
+    out_path = layer_dir / f'{file_token}.orthogonal.cvol'
     transient_projection_in_memory = not force_path_backed_store
     # Nonlinear projections resolve directly on the final source grid. A
     # reduced tilted scatter followed by restoration can leave native support
@@ -993,7 +1024,7 @@ def _iter_sparse_component_decoded_slabs(
         if backing is not None:
             encoded = np.frombuffer(backing, dtype=np.uint8, count=count, offset=start).reshape(row1 - row0, stride)
         else:
-            with store.chunks_path.open('rb') as stream:
+            with open_artifact(store.chunks_path) as stream:
                 stream.seek(start)
                 data = stream.read(count)
             if len(data) != count:
@@ -1162,7 +1193,7 @@ def _materialize_sparse_cartesian_component(
                           int(valid['y0'].min()), int(valid['y1'].max()) - 1,
                           int(zs[0]), int(zs[-1])) if len(zs) else _nrrd_empty_segment_extent()
             maximum_crop_bytes = 0
-            payload_bytes = int(store.chunks_path.stat().st_size)
+            payload_bytes = int(artifact_size(store.chunks_path))
         else:
             path = Path(temp_dir) / 'nrrd_layers' / str(view.name) / f'{key}.orthogonal.cvol'
             stats = _transpose_sparse_component_store(store, path, orientation, shape)

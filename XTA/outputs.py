@@ -3772,11 +3772,18 @@ _INTERPOLATION_PROVENANCE_FIELDS = (
 
 def interpolation_layer_provenance(ref: NrrdLayerRef, *, relative_to: Optional[Path] = None) -> Dict[str, object]:
     """Return explicit SAM/gate lineage without changing legacy SDF metadata."""
+    from .artifact_archive import split_reference
+
+    def relative_reference(value):
+        parsed = split_reference(value)
+        physical, logical = parsed if parsed is not None else (Path(value).resolve(), None)
+        relative = Path(os.path.relpath(str(physical), str(Path(relative_to).resolve()))).as_posix()
+        return relative if logical is None else relative + '#/' + logical
+
     tail = dict(getattr(ref, 'extrapolation_provenance', {}) or {})
     if tail:
         if relative_to is not None and tail.get('evidence_path'):
-            tail['evidence_path'] = Path(os.path.relpath(
-                str(Path(str(tail['evidence_path'])).resolve()), str(Path(relative_to).resolve()))).as_posix()
+            tail['evidence_path'] = relative_reference(str(tail['evidence_path']))
             tail['evidence_path_base'] = 'manifest_directory'
         return {'extrapolation': tail, 'native_transform': ref.native_transform}
     if (str(getattr(ref, 'interpolation_backend', '')).lower() != 'sam'
@@ -3789,10 +3796,7 @@ def interpolation_layer_provenance(ref: NrrdLayerRef, *, relative_to: Optional[P
     for name in ('sam_group_ids', 'sam_run_ids', 'observation_roots'):
         result[name] = list(result[name])
     if relative_to is not None and result.get('proposal_evidence_path'):
-        result['proposal_evidence_path'] = Path(os.path.relpath(
-            str(Path(str(result['proposal_evidence_path'])).resolve()),
-            str(Path(relative_to).resolve()),
-        )).as_posix()
+        result['proposal_evidence_path'] = relative_reference(str(result['proposal_evidence_path']))
         result['proposal_evidence_path_base'] = 'manifest_directory'
     return result
 

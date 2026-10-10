@@ -118,6 +118,11 @@ def test_snapshot_records_preparation_ready_ack_and_held_consumer(monkeypatch, t
             assert sample['ready_jobs'] == sample['running_jobs'] == sample['consumer_held_jobs'] == 1
             assert sample['completion_acks'] == sample['completed_jobs'] == 1
             assert sample['preparing_jobs'] == sample['acked_awaiting_consumer_jobs'] == 0
+            assert sample['raw_transfer_decode_seconds'] > 0
+            with tracker._state_condition:
+                next(iter(tracker._scopes.values())).transfer_received_perf_counter -= 2.
+            held_before=tracker.snapshot()['consumer_hold_seconds']
+            assert held_before >= 2.
             pool.gates['live-1'].set()
             wait_for(lambda: tracker.snapshot()['completion_acks'] == 2
                 and tracker.snapshot()['submitted_jobs'] == 3)
@@ -135,3 +140,5 @@ def test_snapshot_records_preparation_ready_ack_and_held_consumer(monkeypatch, t
     assert all(sample[key] == 0 for key in sam._SAM_SNAPSHOT_COUNTS[:8])
     assert sample['submitted_jobs'] == sample['completed_jobs'] == sample['completion_acks'] == 3
     assert sample['closed'] and sample['cancelled'] and admitted.pool.in_use == 0
+    assert sample['consumer_hold_seconds'] >= held_before
+    assert sample['raw_transfer_decode_seconds'] > 0
