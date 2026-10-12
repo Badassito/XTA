@@ -14,6 +14,161 @@ import numpy as np
 
 
 class LtaSamBoundaryTests(unittest.TestCase):
+    def test_attention_backend_environment_and_explicit_baseline(self) -> None:
+        from XTA.lta_sam import resolve_sam_attention_backend
+
+        with mock.patch.dict("os.environ", {"YOLO_TTA_SAM_ATTENTION_BACKEND": "sdpa"}):
+            self.assertEqual(resolve_sam_attention_backend((9, 0)), "sdpa")
+            self.assertEqual(resolve_sam_attention_backend((9, 0), "fa3_fp8"), "fa3_fp8")
+        for value in ("fp8", "", "fallback"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "attention_backend"):
+                resolve_sam_attention_backend((9, 0), value)
+
+    def test_fa3_preflight_runs_both_kernel_shapes_and_rejects_bad_outputs(self) -> None:
+        from XTA.lta_sam import preflight_sam_fa3
+
+        class Scalar:
+            def __init__(self, value):
+                self.value = value
+            def item(self):
+                return self.value
+            def all(self):
+                return self
+
+        class Tensor:
+            is_cuda = True
+            def __init__(self, shape, dtype, value=0):
+                self.shape, self.dtype, self.value = shape, dtype, value
+            def to(self, dtype):
+                return Tensor(self.shape, dtype, self.value)
+            def get_device(self):
+                return 0
+            def __eq__(self, value):
+                return Scalar(self.value == value)
+
+        cuda = types.SimpleNamespace(get_device_capability=lambda _device: (9, 0),
+                                     synchronize=mock.Mock())
+        runtime = types.SimpleNamespace(cuda=cuda, Tensor=Tensor, bfloat16="bf16", float8_e4m3fn="fp8",
+            __version__="test-torch", version=types.SimpleNamespace(cuda="13.0"),
+            inference_mode=nullcontext,
+            zeros=lambda shape, dtype, device: Tensor(shape, dtype),
+            ones=lambda shape, dtype, device: Tensor(shape, dtype, 1),
+            isfinite=lambda out: Scalar(np.isfinite(out.value)))
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            interface_path = root / "flash_attn_interface.py"
+            extension_path = root / "_C.so"
+            interface_path.write_bytes(b"interface")
+            extension_path.write_bytes(b"native")
+            calls = []
+            def kernel(q, k, v):
+                calls.append((q.shape, k.shape, q.dtype, k.dtype, v.dtype))
+                return Tensor(q.shape, "bf16", 1)
+            interface = types.SimpleNamespace(__file__=str(interface_path), flash_attn_func=kernel)
+            extension = types.SimpleNamespace(__file__=str(extension_path))
+            def sam_kernel(q, k, v):
+                self.assertEqual((q.dtype, k.dtype, v.dtype), ("bf16", "bf16", "bf16"))
+                return interface.flash_attn_func(q.to("fp8"), k.to("fp8"), v.to("fp8")).to(q.dtype)
+            distribution = types.SimpleNamespace(version="3.0.0", files=(interface_path, extension_path),
+                                                 locate_file=lambda item: item)
+            modules = {"flash_attn_interface": interface, "flash_attn_3._C": extension,
+                       "sam3.perflib.fa3": types.SimpleNamespace(flash_attn_func=sam_kernel)}
+            with mock.patch("XTA.lta_sam.importlib.metadata.distribution", return_value=distribution), \
+                 mock.patch("XTA.lta_sam.resolve_pinned_sam_runtime_provenance", return_value={}), \
+                 mock.patch("XTA.lta_sam.importlib.import_module", side_effect=modules.__getitem__):
+                receipt = preflight_sam_fa3(runtime, 0)
+                self.assertEqual([call[0][-1] for call in calls], [64, 64, 32, 32])
+                self.assertEqual(calls[-1][1][1], 256)
+                self.assertTrue(all(call[2:] == ("fp8", "fp8", "fp8") for call in calls))
+                self.assertEqual(receipt["extension"]["sha256"], hashlib.sha256(b"native").hexdigest())
+                self.assertFalse(receipt["fallback"])
+                modules["sam3.perflib.fa3"].flash_attn_func = lambda q, k, v: (q, k, v)
+                with self.assertRaisesRegex(RuntimeError, "SAM FA3 wrapper head"):
+                    preflight_sam_fa3(runtime, 0)
+                modules["sam3.perflib.fa3"].flash_attn_func = sam_kernel
+                interface.flash_attn_func = lambda q, k, v: Tensor(q.shape, "fp32", 1)
+                with self.assertRaisesRegex(RuntimeError, "before model allocation.*incompatible output"):
+                    preflight_sam_fa3(runtime, 0)
+                interface.flash_attn_func = lambda q, k, v: Tensor(q.shape, "bf16", float("nan"))
+                with self.assertRaisesRegex(RuntimeError, "known-value kernel check"):
+                    preflight_sam_fa3(runtime, 0)
+                distribution.version = "4.0.0"
+                with self.assertRaisesRegex(RuntimeError, "expected flash-attn-3==3.0.0"):
+                    preflight_sam_fa3(runtime, 0)
+                distribution.version = "3.0.0"
+                distribution.files = (extension_path,)
+                with self.assertRaisesRegex(RuntimeError, "outside its installed distribution"):
+                    preflight_sam_fa3(runtime, 0)
+
+    def test_fa3_routing_audits_both_model_paths_and_complex_rope(self) -> None:
+        from XTA.lta_sam import audit_sam_fa3_routing
+
+        Attention = type("Attention", (), {"__module__": "sam3.model.vitdet",
+                                           "use_fa3": True, "use_rope_real": False})
+        Memory = type("SimpleRoPEAttention", (), {"__module__": "sam3.model.decoder",
+                                                  "use_fa3": True, "use_rope_real": False})
+        modules = [(f"visual.{index}", Attention()) for index in range(32)]
+        modules += [(f"memory.{index}", Memory()) for index in range(8)]
+        predictor = types.SimpleNamespace(model=types.SimpleNamespace(named_modules=lambda: modules))
+        receipt = audit_sam_fa3_routing(predictor)
+        self.assertEqual(len(receipt["image_encoder"]), 32)
+        self.assertEqual(len(receipt["memory_attention"]), 8)
+        modules[-1][1].use_fa3 = False
+        with self.assertRaisesRegex(RuntimeError, "routing audit failed"):
+            audit_sam_fa3_routing(predictor)
+        modules[-1][1].use_fa3 = True
+        modules[-1][1].use_rope_real = True
+        with self.assertRaisesRegex(RuntimeError, "routing audit failed"):
+            audit_sam_fa3_routing(predictor)
+        modules.pop()
+        with self.assertRaisesRegex(RuntimeError, "unexpected attention inventory"):
+            audit_sam_fa3_routing(predictor)
+
+    def test_worker_fa3_preflight_precedes_model_allocation_and_publishes_receipts(self) -> None:
+        from XTA.lta_worker_adapter import build_worker_predictor
+
+        runtime = types.SimpleNamespace(cuda=types.SimpleNamespace(device_count=lambda: 1,
+            set_device=mock.Mock(), get_device_name=lambda _: "NVIDIA H100 80GB HBM3",
+            get_device_capability=lambda _: (9, 0), empty_cache=mock.Mock()))
+        order = mock.Mock()
+        order.preflight.return_value = {"kernel_checks": [32, 64]}
+        order.builder.return_value = object()
+        order.routing.return_value = {"policy": "fp8"}
+        with mock.patch.dict(sys.modules, {"torch": runtime, "cv2": types.SimpleNamespace()}), \
+             mock.patch("XTA.lta_cpu.configure_worker_runtime_threads", return_value={}), \
+             mock.patch("XTA.lta_sam.resolve_local_sam_bundle",
+                        return_value=types.SimpleNamespace(model_version="sam3.1")), \
+             mock.patch("XTA.lta_sam.resolve_pinned_sam_runtime_provenance", return_value={}), \
+             mock.patch("XTA.lta_sam.preflight_sam_fa3", order.preflight), \
+             mock.patch("XTA.lta_sam.build_local_sam_predictor", order.builder), \
+             mock.patch("XTA.lta_sam.audit_sam_fa3_routing", order.routing), \
+             mock.patch("XTA.lta_sam.install_sdpa_fallback", return_value=None):
+            context = build_worker_predictor({"model_path": "local.pt", "attention_backend": "fa3_fp8"})
+            self.assertEqual([call[0] for call in order.mock_calls], ["preflight", "builder", "routing"])
+            self.assertEqual(context.profile["attention_preflight"], {"kernel_checks": [32, 64]})
+            self.assertEqual(context.profile["attention_routing"], {"policy": "fp8"})
+            self.assertEqual(order.builder.call_args.kwargs["weight_storage"], "float32")
+            self.assertFalse(order.builder.call_args.kwargs["use_rope_real"])
+            order.reset_mock()
+            build_worker_predictor({"model_path": "local.pt", "attention_backend": "sdpa"})
+            order.preflight.assert_not_called()
+            order.routing.assert_not_called()
+            self.assertFalse(order.builder.call_args.kwargs["use_fa3"])
+            order.reset_mock()
+            order.preflight.side_effect = RuntimeError("no native kernel")
+            with self.assertRaisesRegex(RuntimeError, "no native kernel"):
+                build_worker_predictor({"model_path": "local.pt", "attention_backend": "fa3_fp8"})
+            order.builder.assert_not_called()
+            order.preflight.side_effect = None
+            order.reset_mock()
+            predictor = types.SimpleNamespace(shutdown=mock.Mock())
+            order.builder.return_value = predictor
+            order.routing.side_effect = RuntimeError("incorrect model route")
+            with self.assertRaisesRegex(RuntimeError, "incorrect model route"):
+                build_worker_predictor({"model_path": "local.pt", "attention_backend": "fa3_fp8"})
+            predictor.shutdown.assert_called_once_with()
+            runtime.cuda.empty_cache.assert_called_once_with()
+
     def test_module_import_does_not_import_torch_or_sam(self) -> None:
         previous = {
             name: sys.modules.pop(name)
@@ -193,16 +348,27 @@ class LtaSamBoundaryTests(unittest.TestCase):
                 return cls.capability
 
         torch = types.SimpleNamespace(cuda=Cuda)
-        h100 = resolve_sam_device_profile(torch, 0)
+        h100 = resolve_sam_device_profile(torch, 0, attention_backend="auto")
         self.assertEqual(h100["name"], "h100")
         self.assertEqual(h100["weight_storage"], "float32")
-        self.assertFalse(h100["use_fa3"])
+        self.assertTrue(h100["use_fa3"])
+        self.assertFalse(h100["use_rope_real"])
+        self.assertFalse(h100["compile"])
+        self.assertEqual(h100["attention_backend"], "meta_fa3_fp8_e4m3fn")
+        baseline = resolve_sam_device_profile(torch, 0, attention_backend="sdpa")
+        self.assertFalse(baseline["use_fa3"])
+        self.assertEqual(baseline["weight_storage"], "float32")
 
         Cuda.name = "NVIDIA GeForce RTX 4090 Laptop GPU"
         Cuda.capability = (8, 9)
-        egpu = resolve_sam_device_profile(torch, 0)
+        egpu = resolve_sam_device_profile(torch, 0, attention_backend="auto")
         self.assertEqual(egpu["name"], "egpu")
         self.assertEqual(egpu["weight_storage"], "bfloat16_egpu")
+        self.assertEqual(egpu["attention_backend"], "torch_sdpa_flash_efficient_math")
+        self.assertEqual(egpu["runtime_autocast_dtype"], "bfloat16")
+        self.assertFalse(egpu["use_fa3"])
+        with self.assertRaisesRegex(ValueError, "Hopper"):
+            resolve_sam_device_profile(torch, 0, attention_backend="fa3_fp8")
 
         Cuda.name = "NVIDIA A100-SXM4-80GB"
         Cuda.capability = (8, 0)

@@ -37,7 +37,7 @@ class StrictDecodeCountTests(unittest.TestCase):
         processes = []
         mappings = []
         commands = []
-        original_popen = subprocess.Popen
+        original_spawn = media._spawn_decode_process
         output_path = root / "decoded.u8.raw"
         # Diagnostics precede stdout and exceed ordinary pipe capacity. Strict
         # EOF verification must drain them while reading the decoded pixels.
@@ -58,7 +58,7 @@ class StrictDecodeCountTests(unittest.TestCase):
 
         def spawn(command, **kwargs):
             commands.append(command)
-            process = original_popen([sys.executable, "-B", "-c", child], **kwargs)
+            process = original_spawn([sys.executable, "-B", "-c", child])
             processes.append(process)
             return process
 
@@ -67,7 +67,7 @@ class StrictDecodeCountTests(unittest.TestCase):
             with (
                 mock.patch.object(media, "_require_bin"),
                 mock.patch.object(media, "allocate_workspace_array", side_effect=allocate),
-                mock.patch.object(media.subprocess, "Popen", side_effect=spawn),
+                mock.patch.object(media, "_spawn_decode_process", side_effect=spawn),
                 mock.patch.object(media, "tqdm", _Progress),
                 redirect_stdout(io.StringIO()),
             ):

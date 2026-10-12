@@ -23,7 +23,8 @@ _BLOCK = 512
 _CHUNK = 1024 * 1024
 _MAX_COMMIT = 64 * 1024**2
 _LOCKS = {}
-_CACHE = {}
+_ARCHIVE_INDEX_CACHE = {}
+_APPEND_SNAPSHOTS = {}
 _GUARD = threading.Lock()
 
 
@@ -32,8 +33,8 @@ class ArchiveError(ValueError):
 
 
 def _after_fork():
-    global _LOCKS, _CACHE, _GUARD
-    _LOCKS, _CACHE, _GUARD = {}, {}, threading.Lock()
+    global _LOCKS, _ARCHIVE_INDEX_CACHE, _APPEND_SNAPSHOTS, _GUARD
+    _LOCKS, _ARCHIVE_INDEX_CACHE, _APPEND_SNAPSHOTS, _GUARD = {}, {}, {}, threading.Lock()
 
 
 if hasattr(os, "register_at_fork"):
@@ -213,11 +214,11 @@ def _index(path, stream=None):
         stream = open(_api_path(path), "rb")
     try:
         signature = _stamp(os.fstat(stream.fileno()))
-        cached = _CACHE.get(str(path))
+        cached = _ARCHIVE_INDEX_CACHE.get(str(path))
         if cached is not None and cached[0] == signature:
             return cached[1], cached[2]
         entries, end = _scan(stream)
-        _CACHE[str(path)] = signature, entries, end
+        _ARCHIVE_INDEX_CACHE[str(path)] = signature, entries, end
         return entries, end
     finally:
         if owned:
@@ -304,6 +305,9 @@ def append_members(archive, members, *, replace=False, fresh_prefix=None):
             # Overwrite the TAR footer; shrinking breaks live Windows mappings.
             stream.seek(end)
             try:
+                # Only this exclusive writer may lend its verified immutable prefix.
+                with _GUARD:
+                    _APPEND_SNAPSHOTS[str(path)] = (_stamp(os.fstat(stream.fileno()))[:2], entries, end)
                 published = {}
                 for name, source in normalized.items():
                     published[name] = {**_write_member(stream, "DATA/" + transaction + "/" + name, source),
@@ -333,27 +337,62 @@ def append_members(archive, members, *, replace=False, fresh_prefix=None):
                 stream.write(b"\0" * (2 * _BLOCK))
                 stream.flush()
                 os.fsync(stream.fileno())
-                _CACHE.pop(str(path), None)
+                _ARCHIVE_INDEX_CACHE.pop(str(path), None)
                 raise
+            finally:
+                with _GUARD:
+                    _APPEND_SNAPSHOTS.pop(str(path), None)
             updated = {**entries, **published}
-            _CACHE[str(path)] = _stamp(os.fstat(stream.fileno())), updated, committed_end
+            _ARCHIVE_INDEX_CACHE[str(path)] = _stamp(os.fstat(stream.fileno())), updated, committed_end
     return transaction
 
 
-def _entry(value):
+def _open_append_prefix(path, snapshot):
+    """Called under _GUARD; lend a descriptor only for this writer's old prefix."""
+    identity, _entries, end = snapshot
+    stream = None
+    try:
+        _plain_ancestors(path)
+        stream = open(_api_path(path), "rb")
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or _stamp(info)[:2] != identity
+                or info.st_size < end):
+            raise ArchiveError("Artifact committed prefix changed during append")
+        return stream
+    except BaseException:
+        _APPEND_SNAPSHOTS.pop(str(path), None)
+        if stream is not None:
+            stream.close()
+        raise
+
+
+def _entry(value, *, open_payload=False):
     parsed = split_reference(value)
     if parsed is None or not parsed[1]:
         raise ArchiveError("Expected an artifact archive member reference")
     path, name = parsed
+    with _GUARD:
+        snapshot = _APPEND_SNAPSHOTS.get(str(path))
+        if snapshot is not None and name in snapshot[1]:
+            stream = _open_append_prefix(path, snapshot)
+            try:
+                entry = dict(snapshot[1][name])
+                if open_payload:
+                    result, stream = stream, None
+                    return path, entry, result
+                return path, entry, None
+            finally:
+                if stream is not None:
+                    stream.close()
     with _writer_lock(path):
         entries, _ = _index(path)
         if name not in entries:
             raise FileNotFoundError(str(value))
-        return path, dict(entries[name])
+        return path, dict(entries[name]), open(_api_path(path), "rb") if open_payload else None
 
 
 def member_info(value):
-    _, entry = _entry(value)
+    _, entry, _ = _entry(value)
     return dict(entry)
 
 
@@ -368,14 +407,21 @@ def member_exists(value):
 def list_members(archive, prefix=""):
     path = _canonical_path(archive)
     prefix = _name(prefix.rstrip("/\\")) if prefix else ""
+    with _GUARD:
+        snapshot = _APPEND_SNAPSHOTS.get(str(path))
+        if snapshot is not None and prefix:
+            names = sorted(name for name in snapshot[1] if name == prefix or name.startswith(prefix + "/"))
+            if names:
+                with _open_append_prefix(path, snapshot):
+                    return names
     with _writer_lock(path):
         entries, _ = _index(path)
         return sorted(name for name in entries if not prefix or name == prefix or name.startswith(prefix + "/"))
 
 
 class _MemberReader(io.RawIOBase):
-    def __init__(self, path, entry):
-        self._stream = open(_api_path(path), "rb")
+    def __init__(self, stream, entry):
+        self._stream = stream
         self._entry, self._position = entry, 0
         self._digest, self._sequential = hashlib.sha256(), True
 
@@ -430,8 +476,8 @@ class _MemberReader(io.RawIOBase):
 
 def open_member(value):
     """Open a private cursor bounded to one immutable committed payload."""
-    path, entry = _entry(value)
-    return _MemberReader(path, entry)
+    _, entry, stream = _entry(value, open_payload=True)
+    return _MemberReader(stream, entry)
 
 
 def read_member(value):
@@ -444,9 +490,11 @@ def open_artifact(value):
 
 
 def read_artifact(value, *, max_bytes=None):
-    if max_bytes is not None and artifact_size(value) > max_bytes:
-        raise ArchiveError("Artifact exceeds its bounded read budget")
     with open_artifact(value) as stream:
+        if max_bytes is not None:
+            if stream.seek(0, os.SEEK_END) > max_bytes:
+                raise ArchiveError("Artifact exceeds its bounded read budget")
+            stream.seek(0)
         return stream.read()
 
 

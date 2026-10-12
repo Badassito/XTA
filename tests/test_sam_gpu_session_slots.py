@@ -1,4 +1,4 @@
-"""Two CPU-only SDK sessions in real isolated workers exercise one GPU's routes."""
+"""CPU-only SDK sessions in real isolated workers exercise shared GPU routes."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
@@ -71,7 +71,8 @@ class Session(_CombinedPredictor):
 def build(config):
     predictor = Session(dict(config))
     record(config['root'], 'factory', dict(pid=os.getpid(), slot=SLOT, visible=VISIBLE))
-    return SimpleNamespace(predictor=predictor, config=dict(config), profile={},
+    return SimpleNamespace(predictor=predictor, config=dict(config),
+        profile={'attention_preflight': {'backend': 'cpu-protocol', 'extension': {'sha256': 'e'*64}}},
         sam_runtime={'package_tree_sha256':('b' if config.get('runtime_drift_slot') == SLOT else 'a')*64,
             'startup_cuda_quiescence':dict(synchronized=True,
             worker_local_device=0, worker_index=SLOT)},
@@ -105,16 +106,17 @@ def wait_for(predicate, timeout=20.):
 
 
 class Admissions:
-    def __init__(self, parties, *, physical_devices=1):
+    def __init__(self, parties, *, physical_devices=1, workers_per_device=2):
         self.parties = parties
         self.physical_devices = physical_devices
+        self.workers_per_device = workers_per_device
         self.pool = Pool((4+4*physical_devices)*GIB if physical_devices > 1 else (12*GIB if parties == 1 else 24*GIB))
         self.barrier = threading.Barrier(parties)
 
     @contextmanager
     def scope(self, requests, capacity):
         with sam_resources.admit_sam_parent_resources(self.pool, 4*GIB, 'two-session-proof',
-                worker_count=self.physical_devices, execution_slots=2*self.physical_devices,
+                worker_count=self.physical_devices, execution_slots=self.workers_per_device*self.physical_devices,
                 base_allowance_bytes=4*GIB, headroom_probe=lambda:64*GIB if self.physical_devices > 1 else 32*GIB) as profile:
             self.barrier.wait(10.)
             pixels = max(item['seed_mask'].size for item in requests)
@@ -130,7 +132,7 @@ class Admissions:
                 yield permit
 
 
-def protocol(tmp_path, monkeypatch, *, fault=None):
+def protocol(tmp_path, monkeypatch, *, fault=None, workers_per_device=2):
     # These workers deliberately expose a non-existent token, and use only CPU Torch tensors.
     monkeypatch.setenv('CUDA_VISIBLE_DEVICES', 'GPU-cpu-protocol-only')
     module_name = 'sam_two_session_adapter_'+uuid.uuid4().hex
@@ -146,7 +148,7 @@ def protocol(tmp_path, monkeypatch, *, fault=None):
         config['runtime_drift_slot'] = 1
     pool = LtaWorkerPool((0,), LtaWorkerInit(adapter_module=module_name,
         adapter_factory='build', adapter_execute='execute', adapter_shutdown='close',
-        adapter_config=config), workers_per_device=2, startup_timeout=20)
+        adapter_config=config), workers_per_device=workers_per_device, startup_timeout=20)
     held, acquisitions, releases, quarantines = {}, [], [], []
     def acquire(device, purpose):
         assert device == 0 and not held, 'a second SDK context tried to claim a separate physical GPU fence'
@@ -155,11 +157,11 @@ def protocol(tmp_path, monkeypatch, *, fault=None):
         acquisitions.append(device)
         return lease
     def release(lease):
-        assert pool.workers_settled or all((tmp_path/f'finished-{slot}.json').exists() for slot in (0, 1))
+        assert pool.workers_settled or all((tmp_path/f'finished-{slot}.json').exists() for slot in range(workers_per_device))
         assert held.pop(lease.device_index) is lease
         releases.append(lease.device_index)
     tracker = sam.SamInterpolationTracker(model_path='CPU protocol only', device_ids=(0,),
-        workers_per_device=2, artifact_root=tmp_path/'runs', compute_lease_factory=acquire,
+        workers_per_device=workers_per_device, artifact_root=tmp_path/'runs', compute_lease_factory=acquire,
         compute_lease_release=release, residency_quarantine=quarantines.append)
     tracker._pool = pool
     tracker._residency_released = False
@@ -191,16 +193,18 @@ def protocol_factory(tmp_path, monkeypatch):
         return result
     yield create
     for tracker in trackers:
-        release_slot(tmp_path, 0)
-        release_slot(tmp_path, 1)
+        for slot in range(tracker.workers_per_device):
+            release_slot(tmp_path, slot)
         tracker._before_worker_shutdown = None
         tracker.close()
 
 
-def test_two_independent_sdk_states_are_active_on_same_physical_gpu_and_share_fence(tmp_path, monkeypatch, protocol_factory):
-    tracker, pool, held, acquisitions, releases, _ = protocol_factory()
+@pytest.mark.parametrize('workers_per_device', (2, 3, 4))
+def test_independent_sdk_states_are_active_on_same_physical_gpu_and_share_fence(
+        tmp_path, monkeypatch, protocol_factory, workers_per_device):
+    tracker, pool, held, acquisitions, releases, _ = protocol_factory(workers_per_device=workers_per_device)
     cache = cache_for(tmp_path, 'A', 13)
-    admissions = Admissions(1)
+    admissions = Admissions(1, workers_per_device=workers_per_device)
     completed = threading.Event()
     seen = []
     iterator = tracker.iter_results
@@ -214,26 +218,31 @@ def test_two_independent_sdk_states_are_active_on_same_physical_gpu_and_share_fe
     monkeypatch.setattr(tracker, 'iter_results', observed)
     with ThreadPoolExecutor(max_workers=1) as threads:
         future = threads.submit(consume, tracker, cache,
-            [request(index, label='A', frames=13) for index in range(2)], capacity=2, admissions=admissions)
+            [request(index, label='A', frames=13) for index in range(workers_per_device)],
+            capacity=workers_per_device, admissions=admissions)
         try:
-            wait_for(lambda:all((tmp_path/f'active-{slot}.json').exists() for slot in (0, 1)))
-            active = [json.loads((tmp_path/f'active-{slot}.json').read_text()) for slot in (0, 1)]
+            wait_for(lambda:all((tmp_path/f'active-{slot}.json').exists() for slot in range(workers_per_device)))
+            active = [json.loads((tmp_path/f'active-{slot}.json').read_text()) for slot in range(workers_per_device)]
             assert all(row['state_exists'] and row['frames'] == 13 and row['device'] == 0 for row in active)
             assert {row['pid'] for row in active} == set(pool.pids_by_slot.values())
             assert {row['worker_pid'] for row in tracker.startup_receipts} == set(pool.pids_by_slot.values())
-            assert len({row['pid'] for row in active}) == 2 and acquisitions == [0] and held and not releases
-            assert not future.done() and tracker.worker_slots == ((0, 0), (0, 1)) and tracker.worker_count == 2
+            assert all(row['profile']['attention_preflight']['extension']['sha256'] == 'e'*64
+                       for row in tracker.startup_receipts)
+            assert len({row['pid'] for row in active}) == workers_per_device and acquisitions == [0] and held and not releases
+            assert not future.done() and tracker.worker_slots == tuple((0, index) for index in range(workers_per_device))
+            assert tracker.worker_count == workers_per_device
             release_slot(tmp_path, 0)
             assert completed.wait(10.)
             assert seen[0]['worker_index'] == 0 and held and not releases
             assert pool.is_alive(0, 1) and not (tmp_path/'finished-1.json').exists()
-            release_slot(tmp_path, 1)
-            assert len(future.result(15.)) == 2
+            for slot in range(1, workers_per_device):
+                release_slot(tmp_path, slot)
+            assert len(future.result(15.)) == workers_per_device
             assert releases == [0] and not held
-            assert {(row['execution_device_id'], row['worker_index']) for row in seen} == {(0, 0), (0, 1)}
+            assert {(row['execution_device_id'], row['worker_index']) for row in seen} == set(tracker.worker_slots)
         finally:
-            release_slot(tmp_path, 0)
-            release_slot(tmp_path, 1)
+            for slot in range(workers_per_device):
+                release_slot(tmp_path, slot)
     tracker.close()
     assert pool.workers_settled and admissions.pool.in_use == 0 and not tracker._scopes
 
@@ -270,22 +279,26 @@ def test_same_original_ids_in_two_scopes_remain_exact_through_actual_child_slot_
 
 
 @pytest.mark.parametrize('fault', ('sdk_failure', 'wrong_cuda_slot', 'wrong_event_slot', 'wrong_pid', 'stale_attempt'))
-def test_one_child_failure_keeps_peer_source_and_physical_fence_until_all_processes_settle(tmp_path, protocol_factory, fault):
-    tracker, pool, held, _, releases, quarantines = protocol_factory(fault=fault)
+@pytest.mark.parametrize('workers_per_device', (2, 3, 4))
+def test_one_child_failure_keeps_peer_source_and_physical_fence_until_all_processes_settle(
+        tmp_path, protocol_factory, fault, workers_per_device):
+    tracker, pool, held, _, releases, quarantines = protocol_factory(fault=fault, workers_per_device=workers_per_device)
     cache = cache_for(tmp_path, 'A', 13)
-    admissions = Admissions(1)
+    admissions = Admissions(1, workers_per_device=workers_per_device)
     shutdown = []
     def before_shutdown():
-        assert quarantines and held and not releases and pool.is_alive(0, 1)
+        assert quarantines and held and not releases
+        assert all(pool.is_alive(0, slot) for slot in range(1, workers_per_device))
         assert cache.path.exists() and admissions.pool.in_use >= 4*GIB
         assert list(tracker.artifact_root.glob('run-*'))
         shutdown.append(True)
     tracker._before_worker_shutdown = before_shutdown
     with ThreadPoolExecutor(max_workers=1) as threads:
         future = threads.submit(consume, tracker, cache,
-            [request(index, label='A', frames=13) for index in range(2)], capacity=2, admissions=admissions)
+            [request(index, label='A', frames=13) for index in range(workers_per_device)],
+            capacity=workers_per_device, admissions=admissions)
         try:
-            wait_for(lambda:all((tmp_path/f'active-{slot}.json').exists() for slot in (0, 1)))
+            wait_for(lambda:all((tmp_path/f'active-{slot}.json').exists() for slot in range(workers_per_device)))
             release_slot(tmp_path, 0)
             with pytest.raises(RuntimeError):
                 future.result(15.)
@@ -293,8 +306,8 @@ def test_one_child_failure_keeps_peer_source_and_physical_fence_until_all_proces
             assert admissions.pool.in_use == 0 and not tracker._scopes
             assert not list(tracker.artifact_root.glob('run-*')) and cache.path.exists()
         finally:
-            release_slot(tmp_path, 0)
-            release_slot(tmp_path, 1)
+            for slot in range(workers_per_device):
+                release_slot(tmp_path, slot)
             tracker._before_worker_shutdown = None
             tracker.close()
 

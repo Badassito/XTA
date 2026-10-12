@@ -60,7 +60,8 @@ def same_live_image_geometry(pinned_identity, reference):
             return False
         context = entry[1]()
         previous = None if context is None else context._image_sampling_proofs.get(str(pinned_identity))
-        approved = {CANONICAL_CROP_RENDER_CONTRACT, SAM_GPU_IMAGE_CONTRACT}
+        approved = {CANONICAL_CROP_RENDER_CONTRACT, SAM_GPU_IMAGE_CONTRACT,
+                    'xta.sam_canonical_yolo_gray8/1'}
         return (context is not None and not context._closed and previous is not None and previous[0] == entry[2][0]
             and previous[1] in approved and entry[2][1] in approved)
 
@@ -163,11 +164,12 @@ def radial_source_t_window(view, source_shape, logical_t, frames):
 
 class SamGpuCropRenderer:
     def __init__(self, context, view, source, logical_t, lease, torch, scratch_bytes, *, required_gpu=0,
-                 source_t_window=None, source_frames=()):
+                 source_t_window=None, source_frames=(), opportunistic=False):
         self.context, self.view, self.source = context, view, source
         self.logical_t, self.lease, self.torch = int(logical_t), lease, torch
         self.scratch_bytes = int(scratch_bytes)
         self.required_gpu = int(required_gpu)
+        self.opportunistic = bool(opportunistic)
         self.engine = None
         self.device_index = int(lease.device_index) if lease is not None else None
         self._image_burst_count = 1
@@ -227,6 +229,21 @@ class SamGpuCropRenderer:
         from .media import wait_for_volume_ready
         from .runtime import _interpolation_array_backing_path
         wait_for_volume_ready(self.source)
+        if self.lease is None and self.opportunistic:
+            self.lease = self.context._try_idle_gpu_image_lease(self.torch)
+            if self.lease is None:
+                raise SamGpuRenderingUnavailable('No already-idle GPU for prefetched SAM images')
+            self.device_index = int(self.lease.device_index)
+            try:
+                free, _total = self.torch.cuda.mem_get_info(self.device_index)
+            except RuntimeError:
+                free = 0
+            if int(free) < self.required_gpu:
+                self.lease.release()
+                self.lease = None
+                raise SamGpuRenderingUnavailable('Idle GPU lacks admitted SAM source/render headroom')
+            self.context._finish_gpu_image_wait(self, granted=True)
+            self.context._check_image_lifetime()
         if self.lease is None:
             from .runtime import runtime_telemetry
             self._gpu_wait_deadline = None  # Only the FIFO head starts its 30s drain turn.
@@ -513,7 +530,7 @@ class SamGpuCropRenderer:
         return handed
 
 
-def try_gpu_crop_renderer(context, view, shape, prepared_plan):
+def try_gpu_crop_renderer(context, view, shape, prepared_plan, *, opportunistic=False):
     """Defer compute admission until pixels are needed; reject unsupported sources."""
     from .workspace import _env_flag, _env_int
     from .runtime import runtime_telemetry
@@ -587,4 +604,5 @@ def try_gpu_crop_renderer(context, view, shape, prepared_plan):
     # No compute ownership while waiting for an image ticket or CPU credit.
     # The first missing crop waits for compute without holding a CUDA allocation.
     return SamGpuCropRenderer(context, view, source, logical_t, None, torch, scratch,
-        required_gpu=required_gpu, source_t_window=source_window, source_frames=required)
+        required_gpu=required_gpu, source_t_window=source_window, source_frames=required,
+        opportunistic=opportunistic)

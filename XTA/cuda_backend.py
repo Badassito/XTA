@@ -4030,6 +4030,9 @@ class _GpuWorkerRenderEngine:
             # this stream still has writes queued. Allocation usually occurred
             # on the default stream; keep the input storage alive through ours.
             slot.input.record_stream(self._stream)
+            capture_read = getattr(slot, '_sam_gray_capture_read_done', None)
+            if capture_read is not None:
+                self._stream.wait_event(capture_read)
             if bool(slot.infer_valid):
                 # This slot's preceding TensorRT enqueue has consumed its input before
                 # the low-priority renderer writes the next frame into the same address.
@@ -4146,6 +4149,7 @@ class GpuRenderedYoloSource:
         name: str,
         channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
         render_batch_sink: Optional[object] = None,
+        gray_capture: Optional[object] = None,
     ) -> None:
         require_forward_sampling('cuda', DataRole.INTENSITY)
         self.engine = engine
@@ -4155,6 +4159,7 @@ class GpuRenderedYoloSource:
         self.name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(name)).strip('_') or 'gpu_rendered_volume'
         self.channel_format = resolve_channel_format(channel_format)
         self.channel_count = int(self.channel_format.channel_count)
+        self.gray_capture = gray_capture
         # The CUDA renderer currently produces normalized BCHW tensors directly. Keep
         # the common observer slot on the source so a device-aware RenderBatch adapter
         # can be qualified without changing scheduler/task plumbing; never feed its
@@ -4213,7 +4218,16 @@ class GpuRenderedYoloSource:
         return None
 
     def close(self) -> None:
-        return None
+        if self.gray_capture is not None and not self.gray_capture._closed:
+            self.gray_capture.cancel()
+            self.gray_capture.wait_device_copies()
+
+    def finish_gray_capture(self) -> Optional[object]:
+        if self.gray_capture is None:
+            return None
+        future = self.gray_capture.finish_capture()
+        self.gray_capture.wait_device_copies()
+        return future
 
     def prepare_direct_ring(self, input_dtype: Optional[object] = None) -> List[_ResidentGpuPipelineSlot]:
         """Allocate the two-entry ring in the TensorRT ENGINE input binding dtype.
@@ -4333,6 +4347,8 @@ class GpuRenderedYoloSource:
             slot, self.view, self.job, int(absolute_index), int(self.out_size),
             channel_format=self.channel_format,
         )
+        if self.gray_capture is not None:
+            self.gray_capture.capture_gpu(slot.input,(absolute_index,),slot.render_done,ring_slot=slot)
         self._direct_count += 1
         return int(local_index), slot
 
@@ -4372,6 +4388,13 @@ class GpuRenderedYoloSource:
             bool(self.fp16),
             channel_format=self.channel_format,
         )
+        if self.gray_capture is not None:
+            centers = tuple(
+                None if self.result_frame_spec(index) is None
+                    or self.result_frame_spec(index).is_azimuthal_padding else
+                self.result_frame_spec(index).global_destination_index
+                for index in range(start,stop))
+            self.gray_capture.capture_gpu(gpu_tensor,centers,ready_event)
         batch = GpuPrefetchedYoloBatch(
             [self._fake_frame] * len(abs_indices),
             gpu_tensor=gpu_tensor,
@@ -4379,6 +4402,160 @@ class GpuRenderedYoloSource:
             source_label=self.name,
         )
         return paths, batch, info
+
+_CPU_INPUT_UNCERTAIN_SOURCES: List[object] = []
+
+
+class CpuPreparedYoloSource(GpuRenderedYoloSource):
+    """CPU canvases feeding the same persistent TensorRT input slots."""
+
+    def __init__(self, *args, prepared_frames, **kwargs):
+        super().__init__(*args, **kwargs)
+        frames = np.asarray(prepared_frames)
+        if (self.bs != 1 or self.channel_count != 1 or frames.dtype != np.uint8
+                or frames.shape != (self.nf, self.out_size, self.out_size)):
+            raise ValueError('CPU prepared source requires batch-1 gray uint8 canvases')
+        self.prepared_frames = frames
+        self.copy_bytes = 0
+        self.copy_submit_seconds = 0.
+        self.copy_wait_seconds = 0.
+        self.copy_h2d_seconds = 0.
+        self._copy_failed = False
+        self._cpu_input_slots = []
+        self._cpu_input_cuda_owners = []
+        self._cpu_input_copy_stream = None
+        self.resident_ring_supported = True
+
+    def prepare_direct_ring(self, input_dtype=None):
+        torch = self.engine.torch
+        dtype = input_dtype if input_dtype is not None else (torch.float16 if self.fp16 else torch.float32)
+        if dtype not in (torch.float16, torch.float32):
+            raise ValueError('Unsupported CPU input binding dtype')
+        if self._cpu_input_copy_stream is None:
+            self._cpu_input_copy_stream = torch.cuda.Stream(device=self.engine.device)
+        if self._direct_ring is None or any(slot.input.dtype != dtype for slot in self._direct_ring):
+            self._direct_ring = [_ResidentGpuPipelineSlot(torch, self.engine.device,
+                self.out_size, 1, dtype, slot_id=index) for index in range(2)]
+        for slot in self._direct_ring:
+            # A cached slot may still carry the preceding view's render graph.
+            slot.render_graph = slot.render_graph_key = slot.render_expected_key = None
+            if getattr(slot, '_cpu_input_pinned', None) is None:
+                slot._cpu_input_pinned = torch.empty((self.out_size, self.out_size),
+                    dtype=torch.uint8, pin_memory=True)
+                slot._cpu_input_device = torch.empty((self.out_size, self.out_size),
+                    dtype=torch.uint8, device=self.engine.device)
+                slot._cpu_input_copy_start = torch.cuda.Event(enable_timing=True, blocking=False)
+                slot._cpu_input_copy_done = torch.cuda.Event(enable_timing=True, blocking=False)
+                slot._cpu_input_copy_valid = False
+                slot._cpu_input_read_done = torch.cuda.Event(enable_timing=False, blocking=False)
+                slot._cpu_input_read_valid = False
+        self._direct_count = self.count = 0
+        self._cpu_input_slots = list(self._direct_ring)
+        self._cpu_input_cuda_owners = [owner for slot in self._direct_ring
+            for owner in (slot.input, slot._cpu_input_device, slot._cpu_input_pinned)]
+        return self._direct_ring
+
+    def _unsafe_copy(self, error):
+        if not getattr(self, '_copy_failed', False):
+            self._copy_failed = True
+            # Borrowed pinned buffers and CUDA input addresses remain owned until
+            # this fatal worker exits, even if the TRT cache drops its ring owners.
+            _CPU_INPUT_UNCERTAIN_SOURCES.append(self)
+        from .backprojection import _ResidentTensorRTRingFatalError
+        raise _ResidentTensorRTRingFatalError('CPU prepared input has an uncertain CUDA copy/fence') from error
+
+    def _copy_frame(self, index, slot):
+        torch = self.engine.torch
+        started = time.perf_counter()
+        if slot._cpu_input_copy_valid:
+            try:
+                slot._cpu_input_copy_done.synchronize()
+                self.copy_h2d_seconds += slot._cpu_input_copy_start.elapsed_time(slot._cpu_input_copy_done) / 1000.
+                slot._cpu_input_copy_valid = False
+            except Exception as exc:
+                self._unsafe_copy(exc)
+        self.copy_wait_seconds += time.perf_counter() - started
+        np.copyto(slot._cpu_input_pinned.numpy(), self.prepared_frames[index])
+        started = time.perf_counter()
+        stream = self.engine._stream
+        copy_stream = self._cpu_input_copy_stream
+        try:
+            with torch.cuda.stream(copy_stream):
+                slot._cpu_input_device.record_stream(copy_stream)
+                # The wait captures the preceding read event before the render stream
+                # records this frame's read; only that read owns the uint8 staging slot.
+                if slot._cpu_input_read_valid:
+                    copy_stream.wait_event(slot._cpu_input_read_done)
+                slot._cpu_input_copy_start.record(copy_stream)
+                slot._cpu_input_device.copy_(slot._cpu_input_pinned, non_blocking=True)
+                slot._cpu_input_copy_done.record(copy_stream)
+                slot._cpu_input_copy_valid = True
+            with torch.cuda.stream(stream):
+                slot.input.record_stream(stream)
+                slot._cpu_input_device.record_stream(stream)
+                stream.wait_event(slot._cpu_input_copy_done)
+                if slot.infer_valid:
+                    stream.wait_event(slot.infer_done)
+                torch.mul(slot._cpu_input_device, 1. / 255., out=slot.input[0, 0])
+                slot._cpu_input_read_done.record(stream)
+                slot._cpu_input_read_valid = True
+                slot.render_done.record(stream)
+        except Exception as exc:
+            self._unsafe_copy(exc)
+        self.copy_submit_seconds += time.perf_counter() - started
+        self.copy_bytes += self.out_size ** 2
+
+    def next_direct_slot(self):
+        if self._direct_ring is None:
+            raise RuntimeError('CPU input ring has not been prepared')
+        index = self._direct_count
+        if index >= self.nf:
+            return None
+        slot = self._direct_ring[index & 1]
+        slot.frame_index, slot.absolute_index, slot.synthetic = index, self.slice_offset + index, False
+        self._copy_frame(index, slot)
+        self._direct_count += 1
+        return index, slot
+
+    def __next__(self):
+        if self.count >= self.nf:
+            raise StopIteration
+        if self._direct_ring is None:
+            self.prepare_direct_ring()
+        index = self.count
+        self.count += 1
+        slot = self._direct_ring[index & 1]
+        self._copy_frame(index, slot)
+        # Generic backends may retain the yielded input beyond this source call.
+        try:
+            with self.engine.torch.cuda.stream(self.engine._stream):
+                tensor = slot.input.clone()
+                ready = self.engine.torch.cuda.Event()
+                ready.record(self.engine._stream)
+        except Exception as exc:
+            self._unsafe_copy(exc)
+        return [f'{self.name}_{index:06d}'], GpuPrefetchedYoloBatch(
+            [self._fake_frame], gpu_tensor=tensor, ready_event=ready, source_label=self.name), ['CPU prepared input']
+
+    def finish_cpu_copies(self):
+        if self._copy_failed:
+            self._unsafe_copy(RuntimeError('CPU input copy was already quarantined'))
+        if self._cpu_input_slots:
+            # This fence precedes the worker's compute_released message: the parent
+            # can retire shared canvases only after every pinned H2D read is finished.
+            for slot in self._cpu_input_slots:
+                if getattr(slot, '_cpu_input_copy_valid', False):
+                    try:
+                        slot._cpu_input_copy_done.synchronize()
+                        self.copy_h2d_seconds += slot._cpu_input_copy_start.elapsed_time(slot._cpu_input_copy_done) / 1000.
+                        slot._cpu_input_copy_valid = False
+                    except Exception as exc:
+                        self._unsafe_copy(exc)
+
+    def close(self):
+        self.finish_cpu_copies()
+        self.prepared_frames = None
+
 
 class GpuTileRenderedYoloSource:
     """GPU-rendered source for exactly one tile.

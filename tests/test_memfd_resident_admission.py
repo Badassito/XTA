@@ -38,8 +38,9 @@ def linux_probe(monkeypatch, descriptor, info, *, blocks=1, swap=0):
     monkeypatch.setattr(runtime,'_read_meminfo_bytes',lambda:{'SwapTotal':swap} if swap is not None else {})
     original=os.fstat
     def fstat(fd):
-        if fd!=descriptor:
-            return original(fd)
+        actual=original(fd)
+        if (actual.st_dev,actual.st_ino,actual.st_size)!=(info.st_dev,info.st_ino,info.st_size):
+            return actual
         return SimpleNamespace(st_dev=info.st_dev,st_ino=info.st_ino,st_size=info.st_size,st_blocks=blocks)
     monkeypatch.setattr(runtime.os,'fstat',fstat)
 

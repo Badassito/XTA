@@ -170,6 +170,39 @@ def test_first_verified_device_tracks_before_late_ack_then_all_devices_join(boot
     assert boot.parent.in_use == 0 and all(pool.workers_settled for pool in boot.pools)
 
 
+@pytest.mark.parametrize('sessions', [3, 4])
+@pytest.mark.parametrize('fallback', [False, True])
+def test_larger_progressive_cohorts_keep_actual_slots_and_quota(boot, monkeypatch, sessions, fallback):
+    monkeypatch.setattr('XTA.sam_integration.sam_sessions_per_gpu', lambda:sessions)
+    if fallback:
+        boot.failures[1, sessions] = lambda:SamConcurrentStartupResourceError('cohort memory refusal')
+    context = boot.make()
+    context.configure_startup_parent_pool(boot.parent)
+    try:
+        context.detector_assets_retired()
+        context.prepare_runtime(boot.parent)
+        context.ensure_all_devices(timeout=2.)
+        counts = {'0':sessions, '1':1 if fallback else sessions}
+        assert context.startup_admission['effective_sessions_per_device'] == counts
+        assert context._runtime.worker_slots == tuple(
+            (int(device), slot) for device, count in counts.items() for slot in range(count))
+        fraction = ((100*GIB-int(100*GIB*.15))//sessions)/(100*GIB)
+        for pool in boot.pools:
+            if pool.closed:
+                assert pool.workers_settled
+                continue
+            for event in pool.ready_events:
+                quota = event.metadata['sam_runtime'].get('cuda_allocator_quota')
+                if pool.workers_per_device == 1:
+                    assert quota is None
+                else:
+                    assert quota['fraction'] == fraction
+        _run_first_frame(context, boot.root)
+    finally:
+        context.close()
+    assert boot.parent.in_use == 0 and all(pool.workers_settled for pool in boot.pools)
+
+
 def test_fleet_credit_is_owned_before_first_constructor_and_runtime_admission(boot,monkeypatch):
     from XTA import lta_workers
     raw_pool = lta_workers.LtaWorkerPool

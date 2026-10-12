@@ -72,6 +72,28 @@ def test_after_inference_all_completions_drain_without_credit_checkpoints():
     assert not budget.deferred and budget.cursor == 0
 
 
+def test_denied_probes_are_bounded_without_requesting_immediate_retry():
+    credits, now = [], [0.]
+    budget = BackgroundDrainBudget(lambda: credits.append('credit'), stages=3,
+                                   max_completed=2, seconds=.01, clock=lambda: now[0])
+    budget.begin(enabled=True)
+    for _ in budget.items(0, range(100)):
+        now[0] += .006
+        budget.completed(0, progress=False)
+    budget.finish()
+    assert credits == ['credit', 'credit']
+    assert not budget.exhausted and not budget.deferred and budget.blocked_stages == {0}
+    assert list(budget.items(1, ['ready'])) == ['ready']
+    assert list(budget.items(0, ['denied'])) == []
+    # An actual completion still requests another bounded pass.
+    budget.begin(enabled=True)
+    budget.completed(1, progress=False)
+    now[0] += .02
+    budget.completed(1)
+    budget.finish()
+    assert budget.deferred and budget.cursor == 2
+
+
 def test_output_reaping_limit_preserves_pending_and_late_failures():
     settled = []
     ready = Future()
@@ -142,7 +164,7 @@ def test_real_pipeline_background_checkpoint_refills_four_workers_before_next_ou
 
     unions = {PublishedUnion(index): ('model', str(index)) for index in range(10)}
     namespace = dict(vars(pipeline))
-    namespace.update(scheduler=scheduler, inference_worker_process_active=True,
+    namespace.update(scheduler=scheduler, inference_worker_process_active=True, sam_context=None,
         _maybe_prepare_sam_cpu_source=lambda:None,
         _maybe_prepare_sam_runtime=lambda:None,
         background_drain_budget=budget, _drain_parent_mask_ready_events=lambda: None,
@@ -171,7 +193,7 @@ def test_real_pipeline_background_checkpoint_refills_four_workers_before_next_ou
                              interpolation_stats keep_temp_artifacts native_view_support_by_model
                              nrrd_layer_refs parent_bridge_ready parent_bridge_support_by_model
                              parent_mask_support_by_model physical_view_dense_handoff_credit
-                             sam_context sam_gate_lineage_by_parent
+                             sam_gate_lineage_by_parent
                              physical_view_finalization_refs tile_accumulator_by_set
                              tile_accumulator_paths tile_consolidation_completed
                              tile_expected_by_parent tile_parent_bridge_accumulator_by_set

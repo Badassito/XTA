@@ -814,14 +814,19 @@ def run_mask_seed_session(
                 inference_state.get(TRACKER_FEATURE_AUDIT_KEY, {})
             )
         cleanup_errors: list[tuple[str, Exception]] = []
+        close_response = None
+        close_completed = False
         close_stream = getattr(stream, "close", None)
+        iterator_settled = True if stream is None else None
         if callable(close_stream):
             try:
                 close_stream()
+                iterator_settled = True
             except Exception as exc:
                 cleanup_errors.append(("propagation iterator", exc))
         try:
-            measured.handle_request({"type": "close_session", "session_id": session_id})
+            close_response = measured.handle_request({"type": "close_session", "session_id": session_id})
+            close_completed = True
         except Exception as exc:
             cleanup_errors.append(("close_session", exc))
         try:
@@ -829,6 +834,28 @@ def run_mask_seed_session(
                 tracker_state.clear()
         except Exception as exc:
             cleanup_errors.append(("private tracker-state clear", exc))
+        live_registry = getattr(raw_predictor, "_all_inference_states", None)
+        session_retirement = dict(
+            schema="xta.sam_session_retirement/1", session_id=session_id,
+            close_call_completed=close_completed,
+            propagation_iterator_settled=iterator_settled,
+            session_registry_removed=(session_id not in live_registry
+                                      if isinstance(live_registry, Mapping) else None),
+            inference_state_cleared=(not inference_state if isinstance(inference_state, dict) else None),
+            private_tracker_state_cleared=(not tracker_state if isinstance(tracker_state, dict) else None),
+        )
+        # Custom predictors can close successfully without the pinned ownership protocol.
+        pinned_close = (isinstance(close_response, Mapping)
+                        and type(close_response.get("is_success")) is bool)
+        checks = [session_retirement[key] for key in (
+            "close_call_completed", "propagation_iterator_settled", "session_registry_removed",
+            "inference_state_cleared", "private_tracker_state_cleared")]
+        if pinned_close:
+            checks.append(close_response["is_success"])
+        session_retirement["verified"] = (
+            None if not pinned_close else False if any(value is False for value in checks)
+            else None if any(value is None for value in checks) else True
+        )
         feature = None
         video_masks = None
         mask_tensor = None
@@ -910,6 +937,7 @@ def run_mask_seed_session(
         anchor_integrity_passed and non_anchor_active_frames
     )
     return {
+        "session_retirement": session_retirement,
         # Includes SDK input loading and session-state allocation, not pure CPU or H2D time.
         "sdk_session_init_seconds": sdk_session_init_seconds,
         "strategy": "private_mask_seed" if object_masks is None else "private_multi_mask_seed",

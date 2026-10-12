@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import time
 import tempfile
+import threading
 from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
@@ -23,7 +24,7 @@ from .sam_interpolation import (SamPreparedInterpolationPass,_scope_metadata,_bu
     _retry_cpu_wave_within_peak,_tracker_scope_admission)
 from .sam_resources import sam_worker_count
 from .sam_evidence import SamEvidenceWriter
-from .artifact_archive import split_reference, member_exists, artifact_directory
+from .artifact_archive import split_reference, member_exists, artifact_directory, read_artifact
 from .json_publication import write_json_atomic
 
 
@@ -245,7 +246,7 @@ def _iterate_extrapolation_tracker_results(runtime,prepared,worker_count,groups,
         cache_ref,cancel_event,resource_profile,schedule_records,*,family_dispatch_enabled=True,
         flat_control_reason='explicit_flat_control'):
     """Pin exact image/crop reuse without changing independent seed sessions."""
-    from .sam_interpolation import _family_dispatch_balance
+    from .sam_interpolation import _family_dispatch_balance, _family_preparation_options, _tracker_request_stream
     work=prepared.tracker_jobs if prepared.crop_mode=='tiled' else prepared.runs
     batches=(prepared.execution_batches(worker_count) if prepared.crop_mode=='tiled'
              else (prepared.execution_order(worker_count),))
@@ -274,7 +275,8 @@ def _iterate_extrapolation_tracker_results(runtime,prepared,worker_count,groups,
             frame_work_balance=balance))
         request_builder=_tiled_tracker_requests if prepared.crop_mode=='tiled' else _tracker_requests
         stream=None
-        with _tracker_scope_admission(runtime,prepared,cache_ref,resource_profile,worker_count,
+        admitted_plan = replace(prepared,tracker_jobs=items) if prepared.crop_mode=='tiled' else prepared
+        with _tracker_scope_admission(runtime,admitted_plan,cache_ref,resource_profile,worker_count,
                                       family=grouped) as admission:
             try:
                 if grouped:
@@ -290,13 +292,15 @@ def _iterate_extrapolation_tracker_results(runtime,prepared,worker_count,groups,
                         request_factory=request,frame_work_proxy=sum(len(costs[i].expected_frames) for i in indices))
                         for identity,indices in families.items())
                     options={} if admission is None else dict(scope_admission=admission)
+                    options.update(_family_preparation_options(runtime,prepared,items,groups,observations,
+                        cancel_event,resource_profile,admission))
                     stream=runtime.iter_family_results(inventory,source_cache_ref=cache_ref,
                         max_in_flight=min(worker_count,sam_worker_count(runtime,legacy=admission is None)),
                         defer_refill_until_consumed=bool(prepared.cpu_wave_admission.get('defer_refill_until_consumed',False)),
                         **options)
                 else:
-                    stream=_iterate_tracker_results(runtime,request_builder(items,groups,observations,
-                        cancel_event,resource_profile),cache_ref,prepared.cpu_wave_admission,
+                    stream=_iterate_tracker_results(runtime,_tracker_request_stream(prepared,items,groups,observations,
+                        cancel_event,resource_profile,admission),cache_ref,prepared.cpu_wave_admission,
                         scope_admission=admission)
                 for index,result in stream:
                     valid=not isinstance(index,(bool,np.bool_)) and isinstance(index,(int,np.integer)) and 0<=int(index)<len(batch)
@@ -633,7 +637,7 @@ def _publish(bundle,receipt,destination,metadata,*,cancel_event=None,resource_pr
 
 def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,policy,provider_factory,
                  runtime,view,distance,walk_back,min_radius,wrap_axis,upstream_lineage,spacing_zyx,
-                 planner_limits,resource_profile,cancel_event,exact_crop_family_dispatch=True):
+                 planner_limits,resource_profile,cancel_event,exact_crop_family_dispatch=True,retry_group_context=None):
     """Replay original seeds until the latest complete outer context resolves."""
     from .sam_crop_retry import (SamCropRetryController,SamCropRetryAdmissionError,raw_crop_boundary_contacts,merge_crop_contacts,
                                  raw_child_crop_boundary_contacts,summarize_child_crop_contacts)
@@ -641,16 +645,19 @@ def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,pol
     from .sam_resources import cpu_session_bytes,cpu_wave_admission,validate_live_sam_resource_profile
     from .workspace import _env_int
     groups={g.group_id:g for g in prepared.groups}
-    costs={}
+    costs=threading.local()
     profile=validate_live_sam_resource_profile(resource_profile) if resource_profile is not None else None
     memory_limit=2*1024**3 if profile is None else int(profile['assigned_session_cpu_bytes'])
     wave_limit=2*1024**3 if profile is None else int(profile['assigned_cpu_wave_bytes'])
     retry_memory_limit=policy.memory_limit(memory_limit)
     def estimate(gid,box,*,admit=True):
+        cache=getattr(costs,'cache',None)
+        if cache is None:
+            cache=costs.cache={}
         key=(gid,tuple(box),admit)
-        if key in costs:
-            return costs[key]
-        costs.clear()  # Scalar/wave metadata for the current candidate only.
+        if key in cache:
+            return cache[key]
+        cache.clear()  # Scalar/wave metadata for the current candidate only.
         pixel_frames=tracker_frames=max_session=max_raw=0
         demand={}
         for run in prepared.runs:
@@ -672,8 +679,8 @@ def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,pol
                     demand[frame]=(min(prior[0],a),min(prior[1],b),max(prior[2],c),max(prior[3],d))
         gray=sum((p[2]-p[0])*(p[3]-p[1]) for p in demand.values())
         if not admit:
-            costs[key]=(pixel_frames,tracker_frames,0,{})
-            return costs[key]
+            cache[key]=(pixel_frames,tracker_frames,0,{})
+            return cache[key]
         area=(box[2]-box[0])*(box[3]-box[1])
         from .sam_bridge_planning import SamPlanningLimits
         limits=planner_limits or SamPlanningLimits()
@@ -692,10 +699,11 @@ def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,pol
             2*gray+max(1,_env_int('YOLO_TTA_SAM_RENDER_MAX_BYTES',256*1024**2)),
             assembly+gray,area*16+32*1024**2)
         wave=_retry_cpu_wave_within_peak(wave,approved_peak_bytes=memory,
-            image_bytes=gray,worker_count=sam_worker_count(runtime,legacy=resource_profile is None),
+            image_bytes=gray,worker_count=(1 if getattr(costs,'serial_pair',False) else
+                sam_worker_count(runtime,legacy=resource_profile is None)),
             persistent_bytes=assembly+area*16+32*1024**2)
-        costs[key]=(pixel_frames,tracker_frames,memory,wave)
-        return costs[key]
+        cache[key]=(pixel_frames,tracker_frames,memory,wave)
+        return cache[key]
     baseline=[estimate(gid,g.context_bbox_yx,admit=False) for gid,g in groups.items() if g.status=='planned']
     controller=SamCropRetryController(policy,baseline_pixel_frames=sum(c[0] for c in baseline),
         baseline_tracker_frames=sum(c[1] for c in baseline),
@@ -739,15 +747,23 @@ def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,pol
                 outer_context_resolved=not internal,coverage_proof=False,
                 child_crop_diagnostics=summarize_child_crop_contacts(records.get(gid,[])))
         return result
-    last_complete={}
-    status='failed'
-    phase='contact_scan'
-    scope_error=None
-    try:
-        initial_diagnostics=child_diagnostics(bundle,receipt)
-        for gid,group in groups.items():
-            if group.status!='planned':
-                continue
+    planned_groups=tuple((gid,group) for gid,group in groups.items() if group.status=='planned')
+    progress={}
+
+    def run_group(ordinal,worker_profile,serial_pair):
+        gid,group=planned_groups[ordinal]
+        costs.cache={}
+        costs.serial_pair=serial_pair
+        result=dict(replacements={},refusals=[],tile_censoring={},retry_tile_censoring={},
+            final_extent_diagnostics={},last_complete={},attempt_count=0)
+        replacements=result['replacements']
+        refusals=result['refusals']
+        tile_censoring=result['tile_censoring']
+        retry_tile_censoring=result['retry_tile_censoring']
+        final_extent_diagnostics=result['final_extent_diagnostics']
+        last_complete=result['last_complete']
+        phase='retry_admission'
+        try:
             runs=[run for run in prepared.runs if run.group_id==gid]
             seed_identity=hashlib.sha256(''.join(
                 oid+hashlib.sha256(prepared.plan.by_id[oid].mask_crop.tobytes()).hexdigest()
@@ -800,7 +816,7 @@ def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,pol
                     # Always reconstruct from the original frozen seed/history,
                     # never inject a mask produced by the preceding attempt.
                     expanded=expanded_extrapolation_plan(prepared.plan,gid,decision.crop_bbox_yx)
-                    retry_scope={**metadata,'crop_retry_attempt':attempt_index,'crop_retry_parent_group_id':gid,
+                    retry_scope={**_plain(metadata),'crop_retry_attempt':attempt_index,'crop_retry_parent_group_id':gid,
                         'crop_retry_original_evidence':bundle.evidence_fingerprint,
                         'crop_retry_previous_evidence':current_bundle.evidence_fingerprint,
                         'retry_previous_context_bbox_yx':list(current_box),
@@ -808,10 +824,12 @@ def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,pol
                         'crop_retry_original_run_ids':{retry.run_id:original.run_id
                             for original,retry in zip(runs,expanded.runs)},
                         'retry_policy_sha256':policy.to_dict()['policy_sha256']}
+                    if worker_profile is not None:
+                        retry_scope['sam_resource_profile']=validate_live_sam_resource_profile(worker_profile)
                     retry_prepared=prepare_sam_extrapolation_pass(observations,view=view,scope=retry_scope,
                         distance=distance,walk_back=walk_back,min_radius=min_radius,wrap_axis=wrap_axis,
                         upstream_lineage=upstream_lineage,spacing_zyx=spacing_zyx,planner_limits=planner_limits,
-                        crop_mode=prepared.crop_mode,resource_profile=resource_profile,_frozen_plan=expanded,
+                        crop_mode=prepared.crop_mode,resource_profile=worker_profile,_frozen_plan=expanded,
                         _frozen_snapshot=prepared.observation_snapshot_sha256)
                     retry_prepared=replace(retry_prepared,cpu_wave_admission=MappingProxyType(estimate(gid,decision.crop_bbox_yx)[3]))
                     controller.verify_retry_identity(decision,seed_identity=seed_identity,interval_identity=interval_identity)
@@ -831,7 +849,7 @@ def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,pol
                             image_provider=retry_provider,view=view,runtime=runtime,scope=retry_scope,
                             prepared_plan=retry_prepared,distance=distance,walk_back=walk_back,min_radius=min_radius,
                             wrap_axis=wrap_axis,upstream_lineage=upstream_lineage,spacing_zyx=spacing_zyx,
-                            planner_limits=planner_limits,crop_mode=prepared.crop_mode,resource_profile=resource_profile,
+                            planner_limits=planner_limits,crop_mode=prepared.crop_mode,resource_profile=worker_profile,
                             cancel_event=cancel_event,crop_retry_policy=None,_evidence_only=True,
                             _snapshot_authenticated=True,exact_crop_family_dispatch=exact_crop_family_dispatch)
                         from .sam_evidence import SamEvidenceBundle
@@ -839,7 +857,21 @@ def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,pol
                         last_complete[gid]=dict(attempt_index=attempt_index,crop_bbox_yx=list(decision.crop_bbox_yx),
                             evidence_path=str(completed_bundle.directory),evidence_fingerprint=completed_bundle.evidence_fingerprint)
                     current_bundle=completed_bundle
-                    current_receipt=select_sam_extrapolation(current_bundle)
+                    from .sam_extrapolation_policy import _validate_receipt
+                    receipt_bytes=retry_stats.get('selection_receipt_bytes')
+                    if type(receipt_bytes) is not int or receipt_bytes<=0:
+                        raise ValueError('SAM retry selection lacks its generated byte bound')
+                    encoded_receipt=read_artifact(retry_stats['sam_selection_receipt_path'],max_bytes=receipt_bytes)
+                    if len(encoded_receipt)!=receipt_bytes:
+                        raise ValueError('SAM retry selection differs from its generated byte count')
+                    current_receipt=json.loads(encoded_receipt)
+                    del encoded_receipt
+                    if not isinstance(current_receipt,dict):
+                        raise ValueError('SAM retry selection receipt must be an object')
+                    _validate_receipt(current_bundle,current_receipt)
+                    if (current_receipt['selection_identity']!=retry_stats.get('selection_identity')
+                            or current_receipt['policy_hash']!=retry_stats.get('policy_hash')):
+                        raise ValueError('SAM retry selection differs from its generated receipt')
                     current_box=decision.crop_bbox_yx
                     current_gid=expanded.groups[0].group_id
                     phase='retry_selection_and_contacts'
@@ -857,6 +889,61 @@ def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,pol
                         error.add_note(f'SAM extrapolation scope {metadata.get("scope_id","sam")}, '
                             f'original_group={gid}, attempt={attempt_index}, crop={decision.crop_bbox_yx}')
                     raise
+        except BaseException as error:
+            error._sam_retry_phase=phase
+            error._sam_retry_group_id=gid
+            error._sam_retry_attempt_count=locals().get('attempt_index',0)
+            raise
+        finally:
+            result['attempt_count']=locals().get('attempt_index',0)
+            progress[ordinal]=result
+        return result
+
+    last_complete={}
+    status='failed'
+    phase='contact_scan'
+    scope_error=None
+    execution=dict(mode='serial')
+    try:
+        initial_diagnostics=child_diagnostics(bundle,receipt)
+        phase='retry_group_execution'
+        from .sam_retry_groups import execute_retry_groups
+        from .sam_integration import SamInterpolationContext
+        from .sam_tracker_runtime import SamInterpolationTracker
+        unresolved=tuple(index for index,(gid,_group) in enumerate(planned_groups)
+            if gid in initial_diagnostics and not initial_diagnostics[gid]['outer_context_resolved'])
+        slots=len(getattr(runtime,'worker_slots',()))
+        parallel=(controller.extra_work_limit is None and controller.extra_tracker_frame_limit is None
+            and isinstance(retry_group_context,SamInterpolationContext)
+            and isinstance(runtime,SamInterpolationTracker) and retry_group_context._runtime is runtime
+            and resource_profile is not None and resource_profile.has_extra_credit
+            and slots>1 and len(unresolved)>1)
+        outcomes={}
+        if parallel:
+            execution=dict(mode='parallel_unlimited',capacity=min(8,slots,len(unresolved)),
+                child_groups=0,serial_fallback_groups=0,resource_declines=0,peak_pending_groups=0)
+            for index in range(len(planned_groups)):
+                if index not in unresolved:
+                    outcomes[index]=run_group(index,resource_profile,False)
+            selected=tuple(planned_groups[index][0] for index in unresolved)
+            def admitted_run(index,child,serial_pair):
+                return run_group(unresolved[index],child,serial_pair)
+            completed,execution=execute_retry_groups(selected,admitted_run,parent_profile=resource_profile,
+                context=retry_group_context,runtime=runtime,parent_scope=metadata.get('scope_id','sam'),
+                family=getattr(view,'family',None),max_in_flight=slots,group_ordinals=unresolved)
+            outcomes.update((original,value) for original,value in zip(unresolved,completed))
+        else:
+            execution=dict(mode='serial',reason=('finite_global_retry_budget'
+                if controller.extra_work_limit is not None or controller.extra_tracker_frame_limit is not None
+                else 'no_fresh_production_group_boundary'),child_groups=0,serial_fallback_groups=len(unresolved))
+            outcomes={index:run_group(index,resource_profile,False) for index in range(len(planned_groups))}
+        for index in range(len(planned_groups)):
+            outcome=outcomes[index]
+            for target,key in ((replacements,'replacements'),(tile_censoring,'tile_censoring'),
+                    (retry_tile_censoring,'retry_tile_censoring'),(final_extent_diagnostics,'final_extent_diagnostics'),
+                    (last_complete,'last_complete')):
+                target.update(outcome[key])
+            refusals.extend(outcome['refusals'])
         phase='final_import_or_selection'
         if replacements:
             scope={**_plain(bundle.scope),'crop_retry_final_selection':dict(original_evidence=bundle.evidence_fingerprint,
@@ -877,12 +964,25 @@ def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,pol
             combined,combined_receipt=bundle,receipt
         status='complete'
     except BaseException as error:
-        scope_error=dict(phase=phase,error=str(error),error_type=type(error).__name__)
+        execution.update(getattr(error,'_sam_retry_group_execution',{}))
+        scope_error=dict(phase=getattr(error,'_sam_retry_phase',phase),error=str(error),error_type=type(error).__name__,
+            original_group_id=getattr(error,'_sam_retry_group_id',None))
         raise
     finally:
+        # Child callbacks have joined before this point, including failure.
+        # Preserve complete prior attempts and contact diagnostics on failure.
+        replacements.clear()
+        refusals.clear()
+        for index in sorted(progress):
+            outcome=progress[index]
+            for target,key in ((replacements,'replacements'),(tile_censoring,'tile_censoring'),
+                    (retry_tile_censoring,'retry_tile_censoring'),(final_extent_diagnostics,'final_extent_diagnostics'),
+                    (last_complete,'last_complete')):
+                target.update(outcome[key])
+            refusals.extend(outcome['refusals'])
         ledger=controller.receipt()
         ledger.update(status='cancelled' if status!='complete' and _cancelled(runtime,cancel_event) else status,
-            scope_id=metadata.get('scope_id','sam'),
+            scope_id=metadata.get('scope_id','sam'),group_execution=execution,
             scope_error=scope_error,
             original_evidence_path=str(bundle.directory),original_evidence_fingerprint=bundle.evidence_fingerprint,
             last_complete_attempts=last_complete,orchestration_refusals=refusals,
@@ -899,7 +999,7 @@ def extrapolate_sam_view_volume_pass(observations,*,work_dir,image_provider=None
         cancel_event=None,runtime_work_dir=None,crop_retry_policy=None,retry_image_provider=None,
         _evidence_only=False,_snapshot_authenticated=False,image_cohorts=None,
         exact_crop_family_dispatch=True,
-        image_cohort_provider=None,image_cohort_prefetch=None,**unused):
+        image_cohort_provider=None,image_cohort_prefetch=None,_retry_group_context=None,**unused):
     if not isinstance(exact_crop_family_dispatch,bool):
         raise ValueError('SAM exact-crop family dispatch control must be boolean')
     metadata=_scope_metadata(scope)
@@ -1146,13 +1246,16 @@ def extrapolate_sam_view_volume_pass(observations,*,work_dir,image_provider=None
                 distance=distance,walk_back=walk_back,min_radius=min_radius,wrap_axis=wrap_axis,
                 upstream_lineage=upstream_lineage,spacing_zyx=spacing_zyx,planner_limits=planner_limits,
                 resource_profile=resource_profile,cancel_event=cancel_event,
-                exact_crop_family_dispatch=exact_crop_family_dispatch)
+                exact_crop_family_dispatch=exact_crop_family_dispatch,retry_group_context=_retry_group_context)
         stats['sam_crop_retry']=ledger
+    # Match the JSON writer's ASCII output without trusting a replaceable file's size.
+    receipt_bytes=(len(json.dumps(receipt,indent=2,ensure_ascii=True,allow_nan=False)) if _evidence_only else None)
     write_json_atomic(destination/'selection.json', receipt)
     if _evidence_only:
         stats.update(generated_runs=len(bundle.runs),selected_runs=len(receipt['selected_run_ids']),
             sam_evidence_path=str(bundle.directory),sam_selection_receipt_path=str(destination/'selection.json'),
-            publication_performed=False,policy_hash=receipt['policy_hash'])
+            publication_performed=False,policy_hash=receipt['policy_hash'],selection_identity=receipt['selection_identity'],
+            selection_receipt_bytes=receipt_bytes)
         return observations,stats,[]
     if prepared.observation_snapshot_sha256 and observation_snapshot_sha256(np.asarray(observations))!=prepared.observation_snapshot_sha256:
         raise ValueError('Frozen post-interpolation baseline changed before final tail publication')

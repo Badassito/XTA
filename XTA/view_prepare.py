@@ -289,6 +289,7 @@ class AdmittedViewPrepare:
     backing_lease: _DirectUnionBackingLease | None = None
     _cancelled_owner_refs: tuple = field(default=(), init=False, repr=False)
     _cancelled_before_prepare: bool = field(default=False, init=False, repr=False)
+    _sam_parent_protection_token: str | None = field(default=None, init=False, repr=False)
     def rebind_confidence_retirement(self, lease):
         if self.confidence_retired_callback_factory is not None:
             self.confidence_retired_callback = self.confidence_retired_callback_factory(lease)
@@ -356,6 +357,7 @@ class AdmittedViewPrepare:
                         f'{self.model_name}/{self.view.name}/fullframe', worker_count=workers,
                         execution_slots=sam_worker_count(self.sam_context),
                         base_allowance_bytes=self.sam_base_allowance_bytes,
+                        protection_token=self._sam_parent_protection_token,
                         cancel_event=getattr(self.sam_context, '_cancel', None)))
                 except CancelledError:
                     self.check_cancelled()

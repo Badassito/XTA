@@ -1,6 +1,7 @@
 """Lazy source warmup stays independent of the immutable checkpoint drain."""
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 from unittest import mock
 
@@ -10,6 +11,7 @@ import pytest
 from XTA import media, pipeline, sam_resources
 from XTA.config import GIB
 from XTA.interpolation import _ByteAdmissionPool
+from XTA.tta_background import SchedulerBackgroundExecutor
 from tests.test_sam_parent_staging_pipeline import submission
 from tests.test_terminal_component_refs import _function
 
@@ -67,6 +69,8 @@ def test_completed_parent_foreground_gates_runtime_without_scanning_pixels(tmp_p
     assert ns['sam_cpu_futures']['runtime_needed'] is needed
     assert bool(captured) is needed
     assert executor.submit.called is not needed
+    if not needed:
+        ns['sam_parent_staging'].enqueue_ready.assert_not_called()
 
 
 @pytest.mark.parametrize('failed', [False, True])
@@ -99,11 +103,11 @@ def test_existing_lazy_cube_warms_without_parent_or_gpu_owner(tmp_path,monkeypat
         request_path=tmp_path/'request',ready_path=tmp_path/'ready',failed_path=tmp_path/'failed')
     if unready:
         readiness=media.VolumeReadiness(3)
-        media.register_volume_readiness(decoded,readiness)
+        monkeypatch.setitem(media._VOLUME_READINESS_BY_ARRAY_ID,id(decoded),readiness)
     state={'source':None,'parent':None}
     context=SimpleNamespace(source_volume=source,detector_retirement_ready=False,_add_image_metrics=mock.Mock())
     monkeypatch.setattr(sam_resources,'physical_sam_headroom',lambda:0 if low_headroom else 128*GIB)
-    with ThreadPoolExecutor(max_workers=1) as executor:
+    with SchedulerBackgroundExecutor(thread_name='test-sam-source') as executor:
         ns=dict(vars(pipeline))
         ns.update(sam_cpu_futures=state,sam_cpu_prepare_executor=executor,sam_context=context,
             views=(SimpleNamespace(family='tilted'),),direct_union_inference_bytes={},
@@ -111,11 +115,16 @@ def test_existing_lazy_cube_warms_without_parent_or_gpu_owner(tmp_path,monkeypat
             parent_transient_admission=_ByteAdmissionPool(GIB,'test'))
         warm=_function(Path(pipeline.__file__).read_text(),'_maybe_prepare_sam_cpu_source',ns)
         warm()
-        if low_headroom or unready:
+        if unready:
+            assert state['source'] is None and not source.materialized
+            context._add_image_metrics.assert_not_called()
+        elif low_headroom:
+            assert state['source'].result(timeout=5) is False
+            warm()
             assert state['source'] is None and not source.materialized
             context._add_image_metrics.assert_not_called()
         else:
-            assert state['source'].result(timeout=5) is None  # Future owns no dense result alias.
+            assert state['source'].result(timeout=5) is True  # No dense result alias.
             assert source.materialized
             warm()
             context._add_image_metrics.assert_called_once()
@@ -126,4 +135,88 @@ def test_existing_lazy_cube_warms_without_parent_or_gpu_owner(tmp_path,monkeypat
             from XTA.runtime import close_memmap_array_without_flush
             close_memmap_array_without_flush(expected)
     source.close()
+
+
+def source_warmup(executor):
+    source = SimpleNamespace(_is_lazy_processing_cube=True, materialized=False,
+        source=np.zeros((2, 3, 4), np.uint8), nbytes=24, materialize=mock.Mock())
+    context = SimpleNamespace(source_volume=source, detector_retirement_ready=False,
+        _closed=False, _cancel=threading.Event(), _add_image_metrics=mock.Mock())
+    state = dict(source=None)
+    ns = dict(vars(pipeline), sam_cpu_futures=state, sam_cpu_prepare_executor=executor,
+        sam_context=context, views=(SimpleNamespace(family='tilted'),),
+        direct_union_total_dense_byte_limit=100,
+        parent_transient_admission=_ByteAdmissionPool(200, 'test'))
+    warm = _function(Path(pipeline.__file__).read_text(), '_maybe_prepare_sam_cpu_source', ns)
+    return warm, state, context
+
+
+@pytest.mark.parametrize('interruption', [None, 'cancel', 'retire', 'close'])
+def test_source_probe_never_blocks_drain_and_rechecks_lifetime(monkeypatch, interruption):
+    entered, release = threading.Event(), threading.Event()
+    def headroom():
+        entered.set()
+        assert release.wait(5)
+        return 1000
+    monkeypatch.setattr(sam_resources, 'physical_sam_headroom', headroom)
+    with SchedulerBackgroundExecutor(thread_name='test-sam-source') as executor:
+        warm, state, context = source_warmup(executor)
+        try:
+            warm()
+            assert entered.wait(5)
+            future = state['source']
+            for _ in range(10):
+                warm()
+                assert state['source'] is future and not future.done()
+            if interruption == 'cancel':
+                context._cancel.set()
+            elif interruption == 'retire':
+                context.detector_retirement_ready = True
+            elif interruption == 'close':
+                context._closed = True
+        finally:
+            release.set()
+        assert future.result(timeout=5) is True
+        warm()
+        assert context.source_volume.materialize.call_count == (interruption is None)
+        assert context._add_image_metrics.call_count == (interruption is None)
+
+
+def test_source_decline_preserves_full_allowances_and_retries(monkeypatch):
+    # Enough for the source alone is insufficient: future grants remain funded.
+    headroom = mock.Mock(return_value=323)
+    monkeypatch.setattr(sam_resources, 'physical_sam_headroom', headroom)
+    with SchedulerBackgroundExecutor(thread_name='test-sam-source') as executor:
+        warm, state, context = source_warmup(executor)
+        warm()
+        assert state['source'].result(timeout=5) is False
+        warm()
+        for _ in range(10):
+            warm()
+        assert state['source'] is None and headroom.call_count == 1
+        context.source_volume.materialize.assert_not_called()
+        headroom.return_value = 324
+        state['source_retry_after'] = 0
+        warm()
+        assert state['source'].result(timeout=5) is True
+        context.source_volume.materialize.assert_called_once()
+
+
+@pytest.mark.parametrize('stage', ['headroom', 'materialize'])
+def test_source_background_error_reaches_scheduler(monkeypatch, stage):
+    error = RuntimeError('controlled source failure')
+    monkeypatch.setattr(sam_resources, 'physical_sam_headroom',
+        mock.Mock(side_effect=error) if stage == 'headroom' else lambda: 1000)
+    with SchedulerBackgroundExecutor(thread_name='test-sam-source') as executor:
+        warm, state, context = source_warmup(executor)
+        if stage == 'materialize':
+            context.source_volume.materialize.side_effect = error
+        warm()
+        with pytest.raises(RuntimeError) as caught:
+            state['source'].result(timeout=5)
+        assert caught.value is error
+        with pytest.raises(RuntimeError) as caught:
+            warm()
+        assert caught.value is error
+        context._add_image_metrics.assert_not_called()
 

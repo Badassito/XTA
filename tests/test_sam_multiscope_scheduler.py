@@ -168,7 +168,7 @@ class LiveAdmissions:
 
 
 def consume(tracker,cache,requests,*,capacity=4,paused=None,resume=None,admissions=None,start_gate=None,
-        consumer_delay=0.,digests=None,**kwargs):
+        consumer_delay=0.,digests=None,view_family=None,**kwargs):
     producer=threading.get_ident()
     for item in requests:
         item['metadata']['producer_thread']=producer
@@ -180,8 +180,9 @@ def consume(tracker,cache,requests,*,capacity=4,paused=None,resume=None,admissio
     with lease as admission:
         if start_gate is not None:
             assert start_gate.wait(5.)
-        return _consume_stream(tracker,cache,requests,original_requests,capacity,paused,resume,admission,kwargs,
-            consumer_delay,digests)
+        with sam.sam_view_producer_family(view_family):
+            return _consume_stream(tracker,cache,requests,original_requests,capacity,paused,resume,admission,kwargs,
+                consumer_delay,digests)
 
 
 def _consume_stream(tracker,cache,requests,original_requests,capacity,paused,resume,admission,kwargs,consumer_delay,digests):
@@ -705,6 +706,131 @@ def test_round_robin_ready_scopes_avoid_starvation_and_keep_each_fifo(tmp_path,m
             pool.unblock()
     tracker.close()
     assert admissions.pool.in_use==0
+
+
+def test_curved_first_scopes_bound_cheap_turns_and_preserve_original_fifo(tmp_path,monkeypatch):
+    labels=('R','S','T')
+    families=('radial','spherical','tilted')
+    pool=FourSlotPool(gated=[f'{label}-{i}' for label in labels for i in range(16)])
+    tracker=tracker_for(tmp_path,pool,monkeypatch)
+    admissions=LiveAdmissions(3,bank=True)
+    caches=[cache_for(tmp_path,label) for label in labels]
+    digests={}
+    with ThreadPoolExecutor(max_workers=3) as threads:
+        futures=[threads.submit(consume,tracker,cache,[request(i,label=label) for i in range(16)],
+            capacity=4,admissions=admissions,view_family=family,digests=digests)
+            for label,family,cache in zip(labels,families,caches)]
+        try:
+            pool.until(lambda:len(pool.active)==4 or any(future.done() for future in futures))
+            for future in futures:
+                if future.done():
+                    future.result()
+            deadline=time.monotonic()+5.
+            while True:
+                with tracker._state_condition:
+                    ready=len(tracker._scopes)==3 and all(len(scope.ready)>=4 for scope in tracker._scopes.values())
+                    classes={scope.view_class for scope in tracker._scopes.values()}
+                if ready:
+                    break
+                assert time.monotonic()<deadline
+                time.sleep(.002)
+            assert classes=={'curved','cheap'}
+            begin=len(pool.submissions)
+            for offset in range(12):
+                with pool.condition:
+                    device=min(pool.active)
+                    pool.gates[pool.active[device].payload['run_id']].set()
+                    pool.condition.notify_all()
+                pool.until(lambda:len(pool.submissions)>=begin+offset+1)
+                assert len(pool.active)==4,'ready fallback left an available device idle'
+            refill=[task.payload['request_metadata']['fixture_scope']
+                for device,task,when in pool.submissions[begin:begin+12]]
+            for start in range(0,12,4):
+                assert sum(label in ('R','S') for label in refill[start:start+4])==3
+                assert sum(label=='T' for label in refill[start:start+4])==1
+            pool.unblock()
+            for future in futures:
+                assert len(future.result(timeout=8.))==16
+            assert len(digests)==48
+            for label in labels:
+                order=[task.payload['input_index'] for device,task,when in pool.submissions
+                    if task.payload['request_metadata']['fixture_scope']==label]
+                assert order==list(range(16))
+        finally:
+            pool.unblock()
+    tracker.close()
+    assert admissions.pool.in_use==0
+
+
+@pytest.mark.parametrize('blocked',('closing','empty','capacity','completed','transfer'))
+@pytest.mark.parametrize('blocked_class',('curved','cheap'))
+def test_view_preference_never_waits_for_an_ineligible_scope(blocked,blocked_class):
+    from collections import deque
+    def scope(token,view_class):
+        return SimpleNamespace(token=token,view_class=view_class,closing=False,ready=deque([token]),
+            running=0,capacity=1,deferred=True,completed=deque(),transfer_held=False)
+    blocked_scope=scope('blocked',blocked_class)
+    fallback=scope('fallback','cheap' if blocked_class=='curved' else 'curved')
+    if blocked=='closing':
+        blocked_scope.closing=True
+    elif blocked=='empty':
+        blocked_scope.ready.clear()
+    elif blocked=='capacity':
+        blocked_scope.running=blocked_scope.capacity
+    elif blocked=='completed':
+        blocked_scope.completed.append(object())
+    else:
+        blocked_scope.transfer_held=True
+    scheduler=object.__new__(sam._PoolScheduler)
+    scheduler.tracker=SimpleNamespace(_scopes={'blocked':blocked_scope,'fallback':fallback})
+    scheduler._round_robin=deque(('blocked','fallback'))
+    scheduler._curved_since_cheap=3 if blocked_class=='cheap' else 0
+    assert scheduler._choose_scope() is fallback
+
+
+def test_neutral_scope_retains_round_robin_among_known_view_classes():
+    from collections import deque
+    scopes={label:SimpleNamespace(token=label,view_class=family,closing=False,ready=deque([label]),
+        running=0,capacity=1,deferred=False,completed=deque(),transfer_held=False)
+        for label,family in (('C','curved'),('N',None),('L','cheap'))}
+    scheduler=object.__new__(sam._PoolScheduler)
+    scheduler.tracker=SimpleNamespace(_scopes=scopes)
+    scheduler._round_robin=deque(scopes)
+    scheduler._curved_since_cheap=3
+    assert [scheduler._choose_scope().token for _ in range(6)]==['C','N','L','C','N','L']
+
+
+def test_view_preference_keeps_independent_round_robin_within_each_class():
+    from collections import deque
+    scopes={label:SimpleNamespace(token=label,view_class=family,closing=False,ready=deque([label]),
+        running=0,capacity=1,deferred=False,completed=deque(),transfer_held=False)
+        for label,family in (('R','curved'),('O','cheap'),('S','curved'),('T','cheap'))}
+    scheduler=object.__new__(sam._PoolScheduler)
+    scheduler.tracker=SimpleNamespace(_scopes=scopes)
+    scheduler._round_robin=deque(scopes)
+    chosen=[]
+    for turns in (0,0,0,3,0,0,0,3):
+        scheduler._curved_since_cheap=turns
+        chosen.append(scheduler._choose_scope().token)
+    assert chosen==['R','S','R','O','S','R','S','T']
+
+
+def test_view_producer_context_restores_nested_and_thread_local_priorities():
+    captured=[]
+    assert getattr(sam._SAM_VIEW_PRODUCER,'view_class',None) is None
+    with sam.sam_view_producer_family('radial'):
+        assert sam._SAM_VIEW_PRODUCER.view_class=='curved'
+        with sam.sam_view_producer_family('tilted'):
+            assert sam._SAM_VIEW_PRODUCER.view_class=='cheap'
+            with ThreadPoolExecutor(max_workers=1) as threads:
+                assert threads.submit(lambda:getattr(sam._SAM_VIEW_PRODUCER,'view_class',None)).result() is None
+        assert sam._SAM_VIEW_PRODUCER.view_class=='curved'
+        with pytest.raises(RuntimeError):
+            with sam.sam_view_producer_family('unknown'):
+                captured.append(sam._SAM_VIEW_PRODUCER.view_class)
+                raise RuntimeError('producer stopped')
+        assert sam._SAM_VIEW_PRODUCER.view_class=='curved'
+    assert captured==[None] and sam._SAM_VIEW_PRODUCER.view_class is None
 
 
 def test_close_after_live_scope_acquire_blocks_registration_and_pool_restart(tmp_path,monkeypatch):

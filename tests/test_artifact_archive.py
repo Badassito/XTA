@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import hashlib
 import mmap
 import os
@@ -60,6 +60,159 @@ class ArtifactArchiveTests(unittest.TestCase):
             artifacts.append_members(self.archive, {"new": b"later"})
             self.assertEqual(stream.read(), b"unchanged")
         self.assertEqual(artifacts.member_info(self.ref("old")), before)
+
+    def test_committed_lookup_during_local_append_does_not_wait_for_new_payload(self):
+        artifacts.append_members(self.archive, {"old": b"committed"})
+        entered, release, reader_started = threading.Event(), threading.Event(), threading.Event()
+        original = artifacts._write_member
+        def pause(stream, name, source):
+            if name.endswith("/new"):
+                entered.set()
+                if not release.wait(10):
+                    raise TimeoutError("append was not released")
+            return original(stream, name, source)
+        def read_new():
+            reader_started.set()
+            return artifacts.read_member(self.ref("new"))
+        with mock.patch.object(artifacts, "_write_member", side_effect=pause), ThreadPoolExecutor(max_workers=3) as pool:
+            writer = pool.submit(artifacts.append_members, self.archive, {"new": b"later"})
+            try:
+                self.assertTrue(entered.wait(10))
+                old = pool.submit(artifacts.read_artifact, self.ref("old"), max_bytes=100)
+                self.assertEqual(old.result(timeout=2), b"committed")
+                new = pool.submit(read_new)
+                self.assertTrue(reader_started.wait(2))
+                with self.assertRaises(FutureTimeout):
+                    new.result(timeout=.1)
+            finally:
+                release.set()
+            writer.result(timeout=10)
+            self.assertEqual(new.result(timeout=2), b"later")
+        self.assertNotIn(str(self.archive), artifacts._APPEND_SNAPSHOTS)
+
+    def test_replacement_snapshot_and_failed_append_keep_exact_old_payload(self):
+        artifacts.append_members(self.archive, {"old": b"committed"})
+        for fail in (True, False):
+            entered, release = threading.Event(), threading.Event()
+            original = artifacts._write_member
+            def pause(stream, name, source):
+                if name.endswith("/old"):
+                    entered.set()
+                    if not release.wait(10):
+                        raise TimeoutError("append was not released")
+                    if fail:
+                        raise OSError("injected append failure")
+                return original(stream, name, source)
+            cursor = None
+            with self.subTest(fail=fail), mock.patch.object(artifacts, "_write_member", side_effect=pause), ThreadPoolExecutor(max_workers=2) as pool:
+                writer = pool.submit(artifacts.append_members, self.archive, {"old": b"replacement"}, replace=True)
+                try:
+                    self.assertTrue(entered.wait(10))
+                    cursor = pool.submit(artifacts.open_member, self.ref("old")).result(timeout=2)
+                finally:
+                    release.set()
+                try:
+                    if fail:
+                        with self.assertRaisesRegex(OSError, "injected"):
+                            writer.result(timeout=10)
+                    else:
+                        writer.result(timeout=10)
+                    self.assertEqual(cursor.read(), b"committed")
+                finally:
+                    if cursor is not None:
+                        cursor.close()
+            self.assertNotIn(str(self.archive), artifacts._APPEND_SNAPSHOTS)
+            self.assertEqual(artifacts.read_member(self.ref("old")), b"committed" if fail else b"replacement")
+
+    def test_existing_prefix_projection_lookup_bypasses_append_but_new_inventory_waits(self):
+        artifacts.append_members(self.archive, {"existing/meta.json": b"{}", "existing/data.bin": b"data"})
+        entered, release = threading.Event(), threading.Event()
+        full_started, missing_started = threading.Event(), threading.Event()
+        original = artifacts._write_member
+        def pause(stream, name, source):
+            if name.endswith("/pending/new"):
+                entered.set()
+                if not release.wait(10):
+                    raise TimeoutError("append was not released")
+            return original(stream, name, source)
+        def projection_lookup():
+            self.assertTrue(artifacts.artifact_exists(self.ref("existing")))
+            self.assertTrue(artifacts.artifact_exists(self.ref("existing/meta.json")))
+            return sum(artifacts.artifact_size(path) for path in
+                       artifacts.iter_artifacts(self.ref("existing"), recursive=False))
+        def full_lookup():
+            full_started.set()
+            return artifacts.list_members(self.archive)
+        def missing_lookup():
+            missing_started.set()
+            return list(artifacts.iter_artifacts(self.ref("pending")))
+        with mock.patch.object(artifacts, "_write_member", side_effect=pause), ThreadPoolExecutor(max_workers=4) as pool:
+            writer = pool.submit(artifacts.append_members, self.archive, {"pending/new": b"later"})
+            try:
+                self.assertTrue(entered.wait(10))
+                self.assertEqual(pool.submit(projection_lookup).result(timeout=2), 6)
+                full, missing = pool.submit(full_lookup), pool.submit(missing_lookup)
+                self.assertTrue(full_started.wait(2))
+                self.assertTrue(missing_started.wait(2))
+                for pending in (full, missing):
+                    with self.assertRaises(FutureTimeout):
+                        pending.result(timeout=.1)
+            finally:
+                release.set()
+            writer.result(timeout=10)
+            self.assertEqual(full.result(timeout=2), ["existing/data.bin", "existing/meta.json", "pending/new"])
+            self.assertEqual(missing.result(timeout=2), [Path(self.ref("pending/new"))])
+
+    def test_append_snapshot_rejects_replaced_file_or_shortened_prefix(self):
+        artifacts.append_members(self.archive, {"old": b"committed"})
+        replacement = self.root / "replacement.tar"
+        replacement.write_bytes(self.archive.read_bytes())
+        for mutation in ("replacement", "truncation"):
+            entered, release = threading.Event(), threading.Event()
+            original = artifacts._write_member
+            def pause(stream, name, source):
+                if name.endswith("/" + mutation):
+                    entered.set()
+                    if not release.wait(10):
+                        raise TimeoutError("append was not released")
+                return original(stream, name, source)
+            with self.subTest(mutation=mutation), mock.patch.object(artifacts, "_write_member", side_effect=pause), ThreadPoolExecutor(max_workers=1) as pool:
+                writer = pool.submit(artifacts.append_members, self.archive, {mutation: b"later"})
+                try:
+                    self.assertTrue(entered.wait(10))
+                    if mutation == "replacement":
+                        real_open = open
+                        def replaced_open(path, mode):
+                            return real_open(replacement if mode == "rb" else path, mode)
+                        with mock.patch.object(artifacts, "open", side_effect=replaced_open, create=True):
+                            with self.assertRaisesRegex(artifacts.ArchiveError, "prefix changed"):
+                                artifacts.read_member(self.ref("old"))
+                    else:
+                        end = artifacts._APPEND_SNAPSHOTS[str(self.archive)][2]
+                        with self.archive.open("r+b") as stream:
+                            stream.truncate(end - 1)
+                        with self.assertRaisesRegex(artifacts.ArchiveError, "prefix changed"):
+                            artifacts.member_info(self.ref("old"))
+                    self.assertNotIn(str(self.archive), artifacts._APPEND_SNAPSHOTS)
+                finally:
+                    release.set()
+                writer.result(timeout=10)
+            self.assertNotIn(str(self.archive), artifacts._APPEND_SNAPSHOTS)
+
+    def test_fork_reset_does_not_inherit_append_snapshot_authority(self):
+        with mock.patch.object(artifacts, "_APPEND_SNAPSHOTS", {"inherited": object()}):
+            artifacts._after_fork()
+            self.assertEqual(artifacts._APPEND_SNAPSHOTS, {})
+
+    def test_bounded_read_checks_opened_payload_after_logical_replacement(self):
+        artifacts.append_members(self.archive, {"old": b"tiny"})
+        original = artifacts.open_artifact
+        def replace_before_open(value):
+            artifacts.append_members(self.archive, {"old": b"larger replacement"}, replace=True)
+            return original(value)
+        with mock.patch.object(artifacts, "open_artifact", side_effect=replace_before_open):
+            with self.assertRaisesRegex(artifacts.ArchiveError, "bounded read budget"):
+                artifacts.read_artifact(self.ref("old"), max_bytes=4)
 
     def test_live_readonly_mapping_survives_append_and_failed_append(self):
         artifacts.append_members(self.archive, {"old": b"mapped evidence"})

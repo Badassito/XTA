@@ -167,7 +167,8 @@ class RadialTorchNumericalTests(unittest.TestCase):
         self.assertEqual(calls[0][:2], ((1, 1), (32, 8)))
         self.assertIs(calls[0][2][0], source_ref)
         self.assertTrue(all(isinstance(arg, np.generic) for arg in calls[0][2][2:]))
-        self.assertEqual(len(calls[0][2]), 16)
+        self.assertEqual(len(calls[0][2]), 17)
+        self.assertEqual(int(calls[0][2][6]), 0)  # Full-source time-window origin.
         self.assertEqual(calls[0][3], 'render-stream')
 
     def test_thin_tilted_source_retains_boundary_taps_without_height_padding_leaks(self):

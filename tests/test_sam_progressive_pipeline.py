@@ -113,6 +113,20 @@ def test_post_shutdown_background_drain_does_not_restart_context():
 
 def test_pending_copy_callback_uses_real_stage_promises_not_unused_dense_capacity():
     stage = SimpleNamespace(checkpoint_copy_promises=mock.Mock(return_value=123))
-    assert seam('_sam_startup_checkpoint_promises', sam_parent_staging=stage)() == 123
+    inputs = dict(cpu_input_prefetch=None, cpu_input_pinned_reserve_bytes=0)
+    assert seam('_sam_startup_checkpoint_promises', sam_parent_staging=stage,
+                gray_capture_reserve_bytes=7, **inputs)() == 130
     stage.checkpoint_copy_promises.assert_called_once_with()
-    assert seam('_sam_startup_checkpoint_promises', sam_parent_staging=None)() == 0
+    assert seam('_sam_startup_checkpoint_promises', sam_parent_staging=None,
+                gray_capture_reserve_bytes=7, **inputs)() == 7
+    assert seam('_sam_startup_checkpoint_promises', sam_parent_staging=None,
+                gray_capture_reserve_bytes=0, **inputs)() == 0
+
+
+def test_pending_input_capacity_and_pinned_buffers_remain_startup_promises():
+    queue = SimpleNamespace(reserved_bytes=1024, bytes=16)
+    callback = seam('_sam_startup_checkpoint_promises', sam_parent_staging=None,
+        gray_capture_reserve_bytes=7, cpu_input_prefetch=queue, cpu_input_pinned_reserve_bytes=8)
+    assert callback() == 1039
+    queue.reserved_bytes = 0
+    assert callback() == 15

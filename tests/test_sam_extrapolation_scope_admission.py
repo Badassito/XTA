@@ -85,11 +85,27 @@ def test_real_orchestrator_receives_live_admission_and_retires_every_scope(
                 assert limits['max_in_flight']==subset.cpu_wave_admission['max_in_flight']
                 assert limits['maximum_session_cpu_bytes']==subset.cpu_wave_admission['maximum_session_cpu_estimate_bytes']
                 assert limits['consumer_transfer_bytes']==subset.cpu_wave_admission['transfer_margin_bytes']
-                assert limits['lookahead_jobs']>0
+                jobs = subset.tracker_jobs if subset.crop_mode=='tiled' else subset.runs
+                extra_jobs = max(0,len(jobs)-limits['max_in_flight'])
+                assert limits['lookahead_jobs']<=min(limits['max_in_flight'],extra_jobs)
+                assert limits['completion_bank_jobs']<=extra_jobs
+                if extra_jobs:
+                    assert limits['completion_bank_jobs']>0 or limits['lookahead_jobs']>0
+                else:
+                    assert limits['completion_bank_jobs']==limits['lookahead_jobs']==0
                 with pytest.raises(RuntimeError,match='expired'):
                     resources.validate_sam_tracker_scope_admission(permit)
             if cohorts:
-                assert {id(subset) for subset,_,_ in records}=={id(c.prepared) for c in cohort_inventory}
+                if mode=='tiled':
+                    assert {id(subset.plan) for subset,_,_ in records}=={id(c.prepared.plan) for c in cohort_inventory}
+                    for cohort in cohort_inventory:
+                        batches = [subset for subset,_,_ in records if subset.plan is cohort.prepared.plan]
+                        jobs = [job for subset in batches for job in subset.tracker_jobs]
+                        assert {id(job) for job in jobs}=={id(job) for job in cohort.prepared.tracker_jobs}
+                        assert len(jobs)==len(cohort.prepared.tracker_jobs)
+                        assert all(subset.runs is cohort.prepared.runs for subset in batches)
+                else:
+                    assert {id(subset) for subset,_,_ in records}=={id(c.prepared) for c in cohort_inventory}
             if not cohorts:
                 assert any(row['mode']=='exact_crop_family_fifo' for row in stats['sam_exact_crop_family_batches'])==family
             else:

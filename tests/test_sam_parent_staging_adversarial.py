@@ -804,14 +804,14 @@ def test_ram_token_held_until_complete_codec_future_and_retirement_pump(tmp_path
     task=TinyTask(tmp_path,'bank',np.ones((7,33,35),np.uint8))
     amount=task.union_mm.nbytes;key=admit(leases,task,amount)
     staged._dense_limit=amount
-    assert staged.claim_ram_first(key,amount,0,amount)
+    assert staged.claim_ram_first(key,amount,0,0)  # This isolated token test funds no competing detector parent.
     staged.defer(task,amount)
-    assert not staged.claim_ram_first(('model','next'),amount,amount,amount)
+    assert not staged.claim_ram_first(('model','next'),amount,amount,0)
     check.finish()
     assert task.union_mm is None and staged.owns_ram_first_parent(key)
     staged.pump()
     assert staged.ram_first_key is None and not leases.leases
-    assert staged.claim_ram_first(('model','next'),amount,0,amount)
+    assert staged.claim_ram_first(('model','next'),amount,0,0)
     staged.release_ram_first(('model','next'))
     staged.close();staged.finalize_cleanup()
 

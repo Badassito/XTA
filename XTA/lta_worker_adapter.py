@@ -75,9 +75,11 @@ def build_worker_predictor(config: Mapping[str, object]) -> LtaSamWorkerContext:
 
     from .lta_sam import (
         LTA_MAX_NUM_OBJECTS,
+        audit_sam_fa3_routing,
         build_local_sam_predictor,
         configure_constrained_gpu_batches,
         install_sdpa_fallback,
+        preflight_sam_fa3,
         resolve_local_sam_bundle,
         resolve_pinned_sam_runtime_provenance,
         resolve_sam_device_profile,
@@ -96,7 +98,10 @@ def build_worker_predictor(config: Mapping[str, object]) -> LtaSamWorkerContext:
         torch,
         0,
         requested=str(config.get("profile", "auto")),
+        attention_backend=config.get("attention_backend"),
     )
+    if bool(profile["use_fa3"]):
+        profile["attention_preflight"] = preflight_sam_fa3(torch, 0)
     predictor = build_local_sam_predictor(
         bundle,
         device_id=0,
@@ -110,22 +115,32 @@ def build_worker_predictor(config: Mapping[str, object]) -> LtaSamWorkerContext:
         max_num_objects=int(config.get("max_num_objects", LTA_MAX_NUM_OBJECTS)),
         construction_device=str(profile["construction_device"]),
     )
-    constrained = (
-        configure_constrained_gpu_batches(predictor)
-        if bool(profile["constrained_batches"])
-        else None
-    )
-    restore_sdpa = install_sdpa_fallback() if bool(profile["sdpa_fallback"]) else None
-    return LtaSamWorkerContext(
+    context = LtaSamWorkerContext(
         predictor=predictor,
         profile=dict(profile),
         sam_runtime=dict(sam_runtime),
         torch_module=torch,
-        restore_sdpa=restore_sdpa,
-        constrained_batches=constrained,
+        restore_sdpa=None,
+        constrained_batches=None,
         cpu_budget=cpu_budget,
         trace_root=(None if config.get("worker_trace_root") is None else str(config["worker_trace_root"])),
     )
+    del predictor
+    try:
+        if bool(profile["use_fa3"]):
+            profile["attention_routing"] = audit_sam_fa3_routing(context.predictor)
+            context.profile = dict(profile)
+        if bool(profile["constrained_batches"]):
+            context.constrained_batches = configure_constrained_gpu_batches(context.predictor)
+        if bool(profile["sdpa_fallback"]):
+            context.restore_sdpa = install_sdpa_fallback()
+        return context
+    except Exception as exc:
+        try:
+            close_worker_predictor(context)
+        except Exception as cleanup_error:
+            exc.add_note(f"SAM worker initialization cleanup also failed: {cleanup_error}")
+        raise
 
 
 def close_worker_predictor(context: LtaSamWorkerContext) -> None:

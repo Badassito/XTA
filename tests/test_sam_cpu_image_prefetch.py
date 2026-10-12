@@ -1,6 +1,8 @@
-"""Credited shell preparation runs without acquiring tracker GPU ownership."""
+"""Credited shell prefetch preserves bounded CPU fallback and idle-GPU routing."""
+from contextlib import nullcontext
 import threading
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -22,6 +24,245 @@ def runtime():
         residency_released=True, dispatch_stats={})
 
 
+@pytest.mark.parametrize('sdk_ready', (False, True))
+@pytest.mark.parametrize('route', ('gpu', 'declined', 'failed'))
+@pytest.mark.parametrize('family', ('spherical', 'radial'))
+def test_async_shell_prefetch_tries_gpu_before_bounded_cpu_fallback(
+        tmp_path, monkeypatch, sdk_ready, route, family):
+    from tests.test_sam_gpu_rendering import FakeRenderer
+    monkeypatch.setenv('YOLO_TTA_SAM_RENDER_MAX_BYTES', str(1024**2))
+    context = context_for(tmp_path, np.zeros(SOURCE_SHAPE, np.uint8))
+    context._runtime = runtime()
+    context._runtime.has_ready_work = lambda: sdk_ready
+    context._runtime.idle_image_handoff = lambda: nullcontext(not sdk_ready)
+    view = next(view for view in SHELL_VIEWS if view.family == family)
+    attempted = not sdk_ready
+    gpu = attempted and route == 'gpu'
+    shape = (view.num_slices, 17, 17)
+    bbox = (2, 3, 14, 15)
+    frames = (0, 1)
+    renderer = FakeRenderer(context, fail_after=1 if route == 'failed' else None)
+    selected = []
+    telemetry = SimpleNamespace(add=mock.Mock(), gauge=mock.Mock())
+    monkeypatch.setattr('XTA.sam_integration.runtime_telemetry', lambda: telemetry)
+    def select(*args, **kwargs):
+        selected.append(threading.get_ident())
+        assert kwargs == {'opportunistic': True}
+        assert context._resource_local.image_prefetch_cancel is not None
+        if route == 'declined':
+            telemetry.add('sam.gpu_images.cpu_admissions', 1)
+            telemetry.gauge('sam.gpu_images.last_cpu_reason', 'controlled_unavailable')
+            return None
+        return renderer
+    monkeypatch.setattr('XTA.sam_gpu_rendering.try_gpu_crop_renderer', select)
+    original = context._render_demand_crop
+    def render(*args, **kwargs):
+        if context._resource_local.gpu_image_renderer is None:
+            assert not gpu
+            assert not attempted or route != 'failed' or renderer.closed
+        return original(*args, **kwargs)
+    monkeypatch.setattr(context, '_render_demand_crop', render)
+    pool = SimpleNamespace(capacity=4*GIB, in_use=0, condition=threading.Condition(threading.RLock()))
+    owner = threading.get_ident()
+    try:
+        with sam_resources.admit_sam_parent_resources(pool, 4*GIB, 'gpu-first-shell',
+                worker_count=1, base_allowance_bytes=4*GIB, headroom_probe=lambda: 64*GIB) as profile:
+            with context.resource_scope(profile):
+                holder = context._prepare_image_cohort(view, shape,
+                    demand(shape, {frame: bbox for frame in frames}))
+                assert holder.future.result(timeout=10) is not None
+                assert len(selected) == int(attempted)
+                assert not selected or selected[0] != owner
+                with holder as ref:
+                    assert live_image_sampling(ref)['backend'] == ('cuda' if gpu else 'cpu')
+                    for frame in frames:
+                        np.testing.assert_array_equal(crop_from(ref, frame, bbox),
+                            201+frame%7 if gpu else 0)
+                    assert pool._sam_image_staging_pool.in_use == holder.phase_bytes
+                    assert len(context._cache_entries) == 1
+                    assert not context._image_builds
+                assert not ref.path.exists()
+                assert not context._image_prefetches
+                assert pool._sam_image_staging_pool.in_use == 0
+        assert pool.in_use == 0
+        count = lambda key: sum(call.args[1] for call in telemetry.add.call_args_list if call.args[0] == key)
+        assert count('sam.cpu_images.prefetch_admissions') == int(not gpu)
+        assert count('sam.gpu_images.cpu_admissions') == int(not gpu)
+        assert count('sam.gpu_images.cpu_fallbacks') == int(attempted and route == 'failed')
+        assert bool(count('sam.cpu_images.prefetch_host_seconds')) == (not gpu)
+        assert count(f'sam.cpu_images.{family}_prefetch_admissions') == int(not gpu)
+        if attempted and route == 'declined':
+            assert telemetry.gauge.call_args_list == [mock.call(
+                'sam.gpu_images.last_cpu_reason', 'controlled_unavailable')]
+        elif attempted:
+            assert renderer.closed
+    finally:
+        context.close()
+
+
+@pytest.mark.parametrize('sdk_ready', (False, True))
+@pytest.mark.parametrize('family', ('radial', 'spherical'))
+def test_bounded_async_shell_prefetch_uses_exact_cpu_pixels_without_gpu_queue(
+        tmp_path, monkeypatch, sdk_ready, family):
+    monkeypatch.setenv('YOLO_TTA_SAM_RENDER_MAX_BYTES', str(1024**2))
+    source = (np.arange(np.prod(SOURCE_SHAPE))*17 % 251).astype(np.uint8).reshape(SOURCE_SHAPE)
+    context = context_for(tmp_path, source)
+    context._runtime = runtime()
+    context._runtime.has_ready_work = lambda: sdk_ready
+    view = next(view for view in SHELL_VIEWS if view.family == family)
+    shape, bbox, frames = (view.num_slices, 17, 17), (2, 3, 14, 15), (0, 1)
+    telemetry = SimpleNamespace(add=mock.Mock(), gauge=mock.Mock())
+    monkeypatch.setattr('XTA.sam_integration.runtime_telemetry', lambda: telemetry)
+    monkeypatch.setattr('XTA.sam_gpu_rendering.try_gpu_crop_renderer',
+        mock.Mock(side_effect=AssertionError('Shell prefetch selected GPU')))
+    monkeypatch.setattr(context, '_queue_gpu_image',
+        mock.Mock(side_effect=AssertionError('Shell prefetch drained a GPU')))
+    pool = SimpleNamespace(capacity=4*GIB, in_use=0, condition=threading.Condition(threading.RLock()))
+    try:
+        with sam_resources.admit_sam_parent_resources(pool, 4*GIB, 'radial-cpu',
+                worker_count=1, base_allowance_bytes=4*GIB, headroom_probe=lambda: 64*GIB) as profile:
+            with context.resource_scope(profile):
+                holder = context._prepare_image_cohort(view, shape,
+                    demand(shape, {frame: bbox for frame in frames}))
+                assert holder.future.result(timeout=10) is not None
+                with holder as ref:
+                    assert live_image_sampling(ref)['backend'] == 'cpu'
+                    for frame in frames:
+                        expected = expected_canvas(context, view, shape, frame)[2:14, 3:15]
+                        assert np.max(np.abs(crop_from(ref, frame, bbox).astype(int)-expected.astype(int))) <= 1
+                    assert pool._sam_image_staging_pool.in_use == holder.phase_bytes
+                assert not ref.path.exists() and not context._gpu_image_waiters
+        assert pool.in_use == pool._sam_image_staging_pool.in_use == 0
+        assert mock.call(f'sam.cpu_images.{family}_prefetch_admissions', 1) in telemetry.add.call_args_list
+        assert mock.call('sam.gpu_images.last_cpu_reason', f'bounded_{family}_cpu_prefetch') in telemetry.gauge.call_args_list
+    finally:
+        context.close()
+
+
+@pytest.mark.parametrize('case', ('synchronous', 'uncredited', 'scratch'))
+@pytest.mark.parametrize('family', ('radial', 'spherical'))
+def test_shell_prefetch_cpu_policy_keeps_unqualified_gpu_route(tmp_path, monkeypatch, case, family):
+    monkeypatch.setenv('YOLO_TTA_SAM_RENDER_MAX_BYTES', '1' if case == 'scratch' else str(1024**2))
+    context = context_for(tmp_path, np.zeros(SOURCE_SHAPE, np.uint8))
+    view = next(view for view in SHELL_VIEWS if view.family == family)
+    shape = (view.num_slices, 17, 17)
+    if case != 'synchronous':
+        context._resource_local.image_prefetch_cancel = threading.Event()
+    select = mock.Mock(side_effect=LookupError('existing GPU renderer route'))
+    monkeypatch.setattr('XTA.sam_gpu_rendering.try_gpu_crop_renderer', select)
+    pool = SimpleNamespace(capacity=4*GIB, in_use=0, condition=threading.Condition(threading.RLock()))
+    grant = (nullcontext(None) if case == 'uncredited' else
+        sam_resources.admit_sam_parent_resources(pool, 4*GIB, 'unqualified-radial',
+            worker_count=1, base_allowance_bytes=4*GIB, headroom_probe=lambda: 64*GIB))
+    try:
+        with grant as profile, (context.resource_scope(profile) if profile is not None else nullcontext()):
+            with pytest.raises(LookupError, match='existing GPU renderer route'):
+                context.image_provider(view, shape, demand(shape, {0: (2, 3, 14, 15)}))
+        select.assert_called_once()
+        assert pool.in_use == 0
+    finally:
+        context._resource_local.image_prefetch_cancel = None
+        context.close()
+
+
+@pytest.mark.parametrize('family', ('radial', 'spherical'))
+def test_shell_prefetch_authenticates_profile_before_cpu_selection(tmp_path, monkeypatch, family):
+    monkeypatch.setenv('YOLO_TTA_SAM_RENDER_MAX_BYTES', str(1024**2))
+    context = context_for(tmp_path, np.zeros(SOURCE_SHAPE, np.uint8))
+    view = next(view for view in SHELL_VIEWS if view.family == family)
+    shape = (view.num_slices, 17, 17)
+    context._resource_local.image_prefetch_cancel = threading.Event()
+    context._resource_local.profile = {'saved_metadata': True}
+    monkeypatch.setattr(context, '_image_provider', mock.Mock(side_effect=AssertionError('unfunded CPU images')))
+    try:
+        with pytest.raises(TypeError, match='live SamResourceProfile'):
+            context.image_provider(view, shape, demand(shape, {0: (2, 3, 14, 15)}))
+    finally:
+        context._resource_local.image_prefetch_cancel = None
+        context._resource_local.profile = None
+        context.close()
+
+
+@pytest.mark.parametrize('family', ('radial', 'spherical'))
+def test_shell_prefetch_reuses_complete_cpu_cache_before_routing(tmp_path, monkeypatch, family):
+    monkeypatch.setenv('YOLO_TTA_SAM_RENDER_MAX_BYTES', str(1024**2))
+    context = context_for(tmp_path, np.zeros(SOURCE_SHAPE, np.uint8))
+    view = next(view for view in SHELL_VIEWS if view.family == family)
+    shape = (view.num_slices, 17, 17)
+    planned = demand(shape, {0: (2, 3, 14, 15)})
+    select = mock.Mock(return_value=None)
+    monkeypatch.setattr('XTA.sam_gpu_rendering.try_gpu_crop_renderer', select)
+    pool = SimpleNamespace(capacity=4*GIB, in_use=0, condition=threading.Condition(threading.RLock()))
+    try:
+        original = context.image_provider(view, shape, planned)
+        select.reset_mock()
+        context._ready.set()
+        context._resource_local.image_prefetch_cancel = threading.Event()
+        telemetry = SimpleNamespace(add=mock.Mock(), gauge=mock.Mock())
+        monkeypatch.setattr('XTA.sam_integration.runtime_telemetry', lambda: telemetry)
+        with sam_resources.admit_sam_parent_resources(pool, 4*GIB, 'cached-radial',
+                worker_count=1, base_allowance_bytes=4*GIB, headroom_probe=lambda: 64*GIB) as profile:
+            with context.resource_scope(profile):
+                assert context.image_provider(view, shape, planned) is original
+        select.assert_not_called()
+        assert mock.call(f'sam.cpu_images.{family}_prefetch_admissions', 1) not in telemetry.add.call_args_list
+    finally:
+        context._resource_local.image_prefetch_cancel = None
+        context.close()
+
+
+@pytest.mark.parametrize('route', ('gpu', 'declined', 'cpu'))
+@pytest.mark.parametrize('family', ('radial', 'spherical'))
+def test_cancelled_async_shell_prefetch_retires_renderer_and_image_credit(
+        tmp_path, monkeypatch, route, family):
+    from tests.test_sam_gpu_rendering import FakeRenderer
+    monkeypatch.setenv('YOLO_TTA_SAM_RENDER_MAX_BYTES', str(1024**2))
+    context = context_for(tmp_path, np.zeros(SOURCE_SHAPE, np.uint8))
+    context._runtime = runtime()
+    context._runtime.has_ready_work = lambda: route == 'cpu'
+    context._runtime.idle_image_handoff = lambda: nullcontext(route != 'cpu')
+    view = next(view for view in SHELL_VIEWS if view.family == family)
+    shape = (view.num_slices, 17, 17)
+    renderer = FakeRenderer(context)
+    monkeypatch.setattr('XTA.sam_gpu_rendering.try_gpu_crop_renderer',
+        lambda *args, **kwargs: renderer if route == 'gpu' else None)
+    started, release = threading.Event(), threading.Event()
+    original = context._render_demand_crop
+    def render(*args, **kwargs):
+        started.set()
+        assert release.wait(10)
+        context._check_image_lifetime()
+        return original(*args, **kwargs)
+    monkeypatch.setattr(context, '_render_demand_crop', render)
+    pool = SimpleNamespace(capacity=4*GIB, in_use=0, condition=threading.Condition(threading.RLock()))
+    holder = None
+    try:
+        with sam_resources.admit_sam_parent_resources(pool, 4*GIB, 'cancelled-shell',
+                worker_count=1, base_allowance_bytes=4*GIB, headroom_probe=lambda: 64*GIB) as profile:
+            with context.resource_scope(profile):
+                holder = context._prepare_image_cohort(view, shape,
+                    demand(shape, {0: (2, 3, 14, 15)}))
+                assert started.wait(10)
+                assert pool._sam_image_staging_pool.in_use == holder.phase_bytes
+                holder.cancel_builder()
+                release.set()
+                with pytest.raises(RuntimeError, match='SAM image prefetch was abandoned'):
+                    holder.future.result(timeout=10)
+                holder.close()
+                assert not context._image_prefetches
+                assert not context._image_builds
+                assert not context._cache_owners
+                assert pool._sam_image_staging_pool.in_use == 0
+        assert pool.in_use == 0
+        assert route != 'gpu' or renderer.closed
+        assert not list((context.temp_dir/'sam_image_cache').glob('*.gray8.dat'))
+    finally:
+        release.set()
+        if holder is not None:
+            holder.close()
+        context.close()
+
+
 @pytest.mark.parametrize('view', SHELL_VIEWS, ids=lambda view: view.name)
 @pytest.mark.parametrize('processing', (False, True))
 def test_prefetched_shell_matches_canonical_with_full_parent_pool_and_no_gpu(
@@ -35,7 +276,7 @@ def test_prefetched_shell_matches_canonical_with_full_parent_pool_and_no_gpu(
     frames = sorted({0, view.num_slices//2})
     bbox = (1, 1, shape[1]-1, shape[2]-1)
     monkeypatch.setattr('XTA.sam_gpu_rendering.try_gpu_crop_renderer',
-        lambda *args: pytest.fail('CPU prefetch must not request GPU ownership'))
+        lambda *args: None)
     try:
         with sam_resources.admit_sam_parent_resources(pool, 4*GIB, 'shell-parent',
                 worker_count=1, base_allowance_bytes=4*GIB, headroom_probe=lambda: 64*GIB) as profile:
@@ -72,7 +313,7 @@ def test_two_shell_cohorts_prepare_concurrently_without_tracker_gpu(tmp_path, mo
         return original(*args, **kwargs)
     monkeypatch.setattr(context, '_render_demand_crop', render)
     monkeypatch.setattr('XTA.sam_gpu_rendering.try_gpu_crop_renderer',
-        lambda *args: pytest.fail('A busy tracker must not block CPU preparation'))
+        lambda *args: None)
     pool = SimpleNamespace(capacity=4*GIB, in_use=0, condition=threading.Condition(threading.RLock()))
     holders = []
     try:
@@ -128,11 +369,12 @@ def test_shell_crop_demands_keep_distinct_image_identities(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize('reason', ('lazy', 'not_ready', 'scratch', 'other_family', 'source_shape'))
-def test_cpu_prefetch_gate_preserves_existing_route_for_unqualified_work(tmp_path, monkeypatch, reason):
+@pytest.mark.parametrize('family', ('radial', 'spherical'))
+def test_cpu_prefetch_gate_preserves_existing_route_for_unqualified_work(tmp_path, monkeypatch, reason, family):
     monkeypatch.setenv('YOLO_TTA_SAM_RENDER_MAX_BYTES', str(1024**2))
     source = np.zeros(SOURCE_SHAPE, np.uint8)
     context = context_for(tmp_path, source)
-    view = SHELL_VIEWS[0]
+    view = next(view for view in SHELL_VIEWS if view.family == family)
     shape = (view.num_slices, view.src_h, view.src_w)
     planned = demand(shape, {0: (0, 0, shape[1], shape[2])})
     assert context._can_prefetch_cpu_images(view, planned)

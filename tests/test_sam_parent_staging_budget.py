@@ -1,17 +1,17 @@
 """Parent resume batches return the owner thread to late detector ACKs."""
-from concurrent.futures import Future
+from concurrent.futures import Future, wait
+import ast
 from pathlib import Path
 from types import SimpleNamespace
 import queue as queues
-import gc
 import threading
-import weakref
 
 import numpy as np
 import pytest
 
 from XTA import pipeline, sam_parent_staging as staging
 from XTA.interpolation import _DirectUnionBackingLease
+from XTA.interpolation import _ByteAdmissionPool
 from XTA.tta_background import BackgroundDrainBudget
 from XTA.view_prepare import AdmittedViewPrepare
 from tests.test_per_device_gpu_asset_retirement import case
@@ -27,10 +27,11 @@ def add_deferred(stage, root, name, amount=1):
     return key, task
 
 
-def pipeline_drain(stage, budget, scheduler):
+def pipeline_drain(stage, budget, scheduler, *, sam_context=None):
     namespace = dict(vars(pipeline))
     namespace.update(scheduler=scheduler, inference_worker_process_active=True,
-        background_drain_budget=budget, sam_parent_staging=stage,
+        detector_workspace_preparation=None,
+        background_drain_budget=budget, sam_parent_staging=stage, sam_context=sam_context,
         _maybe_prepare_sam_runtime=lambda: None, _maybe_prepare_sam_cpu_source=lambda: None,
         parent_dense_retired_events=queues.SimpleQueue(),
         parent_confidence_retired_events=queues.SimpleQueue(),
@@ -50,7 +51,7 @@ def pipeline_drain(stage, budget, scheduler):
         _submit_tile_parent_gate azimuthal_native_output_by_model component_ref_dense_retirement_active
         interpolation_stats keep_temp_artifacts native_view_support_by_model nrrd_layer_refs
         parent_bridge_ready parent_bridge_support_by_model parent_mask_support_by_model
-        physical_view_dense_handoff_credit sam_context sam_gate_lineage_by_parent
+        physical_view_dense_handoff_credit sam_gate_lineage_by_parent
         physical_view_finalization_refs tile_accumulator_by_set tile_accumulator_paths
         tile_consolidation_completed tile_expected_by_parent tile_parent_bridge_accumulator_by_set
         tile_parent_mask_accumulator_by_set tile_slice_postprocess_workers tilted_native_output_by_model
@@ -96,21 +97,16 @@ def test_slow_resume_sweep_returns_to_authentic_late_ack(
     stage.close()
 
 
-def test_denied_prefix_rotates_until_later_parent_is_admitted(tmp_path):
+def test_dense_denied_prefix_does_not_hide_later_fitting_parent(tmp_path):
     stage, _writer, prepare, leases = queue(tmp_path, cap=10, ready=lambda: True)
     leases.leases[('model', 'live')] = _DirectUnionBackingLease(('model', 'live'), 1)
     leases.postprocess_bytes[('model', 'live')] = 1
-    denied = [add_deferred(stage, tmp_path, f'large-{i}', 11)[0] for i in range(9)]
+    denied = [add_deferred(stage, tmp_path, f'large-{i}', 11)[0] for i in range(32)]
     eligible, _task = add_deferred(stage, tmp_path, 'small', 2)
     budget = BackgroundDrainBudget(lambda: None, stages=9, max_completed=2, clock=lambda: 0)
-    resumed = {}
-    for _ in range(12):
-        budget.begin(enabled=True)
-        batch, _released = stage.pump(budget=budget)
-        resumed.update(batch)
-        budget.finish()
-        if eligible not in stage.deferred:
-            break
+    budget.begin(enabled=True)
+    resumed, _released = stage.pump(budget=budget)
+    budget.finish()
     assert list(resumed.values()) == [eligible]
     assert set(stage.deferred) == set(denied)
     assert not any(key in leases.leases for key in denied)
@@ -194,7 +190,7 @@ def test_checkpoint_error_after_raw_submission_keeps_caller_cleanup_owner(tmp_pa
         retire_cancelled_future = AdmittedViewPrepare.retire_cancelled_future
         _retire_unstarted_inputs = AdmittedViewPrepare._retire_unstarted_inputs
 
-    task = CancellableTask(tmp_path, 'raw', owning_mask())
+    task = CancellableTask(tmp_path, 'raw', None)
     task._cancelled_before_prepare = False
     task._cancelled_cleanup_error = None
     task._cancelled_owner_refs = ()
@@ -209,26 +205,182 @@ def test_checkpoint_error_after_raw_submission_keeps_caller_cleanup_owner(tmp_pa
     with pytest.raises(RuntimeError) as caught:
         stage.pump(budget=budget, resumed_futures=caller)
     assert caught.value is failure
-    assert len(caller) == 1 and not stage.deferred and not stage.restore_futures
+    assert len(caller) == 1 and not stage.deferred and len(stage.restore_futures) == 1
     future, handed_key = next(iter(caller.items()))
     assert handed_key == key and future in prepare.entries
-    owner = task.union_mm
+    assert task.union_mm is None  # Raw backings have not been opened on the owner thread.
     pipeline._cancel_scheduler_prepares(failure, sam_context=None,
         sam_parent_staging=stage, view_processing_futures=caller)
     assert future.cancelled() and task.union_mm is None
-    assert not owner._mmap.closed  # Cancellation preserves this explicit alias.
-    np.testing.assert_array_equal(owner, owning_mask())
     prepare.finish()  # Settle the queued executor work; the task never runs.
     assert not prepare.entries and task.calls == 0
     retired = []
-    assert not leases.retire_cancelled(key, future, retired_callback=lambda *args: retired.append(args))
-    assert key in leases.leases  # An explicit alias still keeps the exact owner alive.
-    owner_ref, mapping_ref = weakref.ref(owner), weakref.ref(owner._mmap)
-    del owner
-    gc.collect()
-    assert len(retired) == 1 and retired[0][0] == key
-    assert leases.settle_publication_retirement(*retired[0])
+    assert leases.retire_cancelled(key, future, retired_callback=lambda *args: retired.append(args))
     assert key not in leases.leases and key not in leases.postprocess_bytes
-    assert owner_ref() is None
-    assert mapping_ref() is None or mapping_ref().closed
     stage.close()
+
+
+@pytest.mark.parametrize('closed,expected_probes', [(False, 1), (True, 64)])
+def test_sam_completion_pass_stays_bounded_until_context_closes(
+        tmp_path, monkeypatch, closed, expected_probes):
+    stage, _writer, _prepare, leases = queue(tmp_path, ready=lambda: True)
+    for number in range(32):
+        add_deferred(stage, tmp_path, f'parent-{number}')
+    now, probes, checkpoints = [0.], [], []
+    def slow_probe(task, _amount):
+        probes.append(task.view.name)
+        now[0] += .05
+        return dict(physical_headroom_bytes=0, required_host_bytes=1, remaining_startup_bytes=1)
+    monkeypatch.setattr(staging, '_dense_startup_budget_locked', slow_probe)
+    scheduler = SimpleNamespace(process_inference_outstanding=lambda: False,
+        service_pending_compute_credits=lambda: checkpoints.append(True))
+    budget = BackgroundDrainBudget(scheduler.service_pending_compute_credits,
+        stages=9, seconds=.01, clock=lambda: now[0])
+    pipeline_drain(stage, budget, scheduler, sam_context=SimpleNamespace(_closed=closed))()
+    assert len(probes) == expected_probes
+    assert len(checkpoints) == (0 if closed else 1)
+    assert budget.enabled is not closed and not budget.deferred
+    assert len(stage.deferred) == 32
+    assert not leases.leases
+    stage.deferred.clear()
+    stage.close()
+
+
+@pytest.mark.parametrize('wait_mode', ['future_free', 'nonpush_unrelated', 'nonpush_detector'])
+def test_locked_parent_drain_reaches_wakeable_wait_and_independent_completion(tmp_path, wait_mode):
+    stage, _writer, prepare, leases = queue(tmp_path, ready=lambda: True)
+    pool = _ByteAdmissionPool(1024, 'parent')
+    for number in range(64):
+        _key, task = add_deferred(stage, tmp_path, f'parent-{number}')
+        task.admission = pool
+    locked, release, wake = threading.Event(), threading.Event(), threading.Event()
+    def hold_parent_condition():
+        with pool.condition:
+            locked.set()
+            assert release.wait(3)
+    holder = threading.Thread(target=hold_parent_condition)
+    holder.start()
+    assert locked.wait(2)
+    checkpoints = []
+    scheduler = SimpleNamespace(process_inference_outstanding=lambda: False,
+        service_pending_compute_credits=lambda: checkpoints.append(True))
+    budget = BackgroundDrainBudget(scheduler.service_pending_compute_credits,
+        stages=9, max_completed=2)
+    drain = pipeline_drain(stage, budget, scheduler, sam_context=SimpleNamespace(_closed=False))
+    independent = Future()
+    independent.set_result(('model', 'independent'))
+    completed = set()
+    drain.__globals__.update(physical_view_union_futures={independent: ('model', 'independent')},
+                            physical_view_union_completed=completed)
+    waits, iterations = [], []
+    class WaitsObserved(Exception):
+        pass
+    class Wake:
+        def wait(self, timeout):
+            assert not pool.condition._is_owned()
+            waits.append(timeout)
+            return wake.wait(timeout)
+        def clear(self):
+            wake.clear()
+            if len(waits) == 3:
+                raise WaitsObserved
+    def check_loop_limit():
+        iterations.append(True)
+        assert len(iterations) <= 20, 'owner spun instead of reaching its wakeable wait'
+    unrelated = Future()
+    def bounded_future_wait(futures, *, timeout, return_when):
+        assert list(futures) == [unrelated]
+        assert not pool.condition._is_owned()
+        waits.append(timeout)
+        wait(futures, timeout=timeout, return_when=return_when)
+        if len(waits) == 3:
+            raise WaitsObserved
+    detector_active = wait_mode == 'nonpush_detector'
+    expected_timeout = .1 if detector_active else .002
+    namespace = drain.__globals__
+    namespace.update(inference_worker_process_active=detector_active,
+        _test_drain=drain, _check_loop_limit=check_loop_limit,
+        pending_prediction_volume_futures=[] if wait_mode == 'future_free' else [unrelated],
+        sam_cpu_futures={'source': None, 'runtime': None},
+        prediction_accumulation_futures={}, pending_prediction_build_jobs=[],
+        _process_inference_outstanding=lambda: False, ready_fullframe=[], ready_tile_infer=[],
+        _pump_prediction_volume_build_queue=lambda: None,
+        scheduler_wake=Wake(), scheduler_push_drain_heartbeat_seconds=lambda: .002,
+        _log_scheduler_wait_state=lambda: None,
+        scheduler_state=SimpleNamespace(push_drain_active=wait_mode == 'future_free'),
+        wait=bounded_future_wait,
+        _hook_scheduler_wake=lambda futures: [
+            future.add_done_callback(lambda _future: wake.set()) for future in futures])
+    scheduler.has_pending_process_results = lambda: False
+    # Execute the actual outer gate, waitable collection and wait branches.
+    tree = ast.parse(Path(pipeline.__file__).read_text())
+    loop = next(node for node in ast.walk(tree) if isinstance(node, ast.While)
+        and any(isinstance(item, ast.If) and 'background_drain_budget.deferred' in ast.unparse(item.test)
+                for item in node.body))
+    start = next(index for index, node in enumerate(loop.body) if isinstance(node, ast.If)
+        and 'background_drain_budget.deferred' in ast.unparse(node.test))
+    body = [ast.Expr(ast.Call(ast.Name('_check_loop_limit', ast.Load()), [], [])),
+            ast.Expr(ast.Call(ast.Name('_test_drain', ast.Load()), [], [])), *loop.body[start:]]
+    module = ast.Module([ast.FunctionDef('_test_outer_loop',
+        ast.arguments([], [], None, [], [], None, []),
+        [ast.While(ast.Constant(True), body, [])], [])], [])
+    ast.fix_missing_locations(module)
+    exec(compile(module, '<scheduler-outer-wait>', 'exec'), namespace)
+    try:
+        with pytest.raises(WaitsObserved):
+            namespace['_test_outer_loop']()
+        assert waits == [expected_timeout] * 3 and len(iterations) <= 6
+        assert completed == {('model', 'independent')}
+        assert len(checkpoints) >= 8  # Detector credits are serviced before waiting.
+        assert stage.resume_lock_denials <= 128 * len(iterations)
+        assert len(stage.deferred) == 64 and not leases.leases and not prepare.entries
+        stage.cancel()
+        drain()
+        assert not budget.deferred and not prepare.entries
+    finally:
+        release.set()
+        holder.join(3)
+        assert not holder.is_alive()
+        stage.deferred.clear()
+        stage.close()
+
+
+def test_denied_probe_keeps_ready_prepared_parent_ahead_of_unrelated_wait(tmp_path):
+    from XTA.projection_queue import prepared_view_waitables
+    stage, _writer, _prepare, leases = queue(tmp_path, ready=lambda: True)
+    add_deferred(stage, tmp_path, 'blocked', 1)
+    leases.leases[('model', 'live')] = _DirectUnionBackingLease(('model', 'live'), 120)
+    leases.postprocess_bytes[('model', 'live')] = 120
+    now = [0.]
+    scheduler = SimpleNamespace(process_inference_outstanding=lambda: False,
+        service_pending_compute_credits=lambda: now.__setitem__(0, now[0] + .02))
+    budget = BackgroundDrainBudget(scheduler.service_pending_compute_credits,
+                                   stages=9, max_completed=1, clock=lambda: now[0])
+    drain = pipeline_drain(stage, budget, scheduler, sam_context=SimpleNamespace(_closed=False))
+    ready, unrelated = Future(), Future()
+    ready.set_result(SimpleNamespace(model_name='model', view_name='ready',
+        pending_component_layers=[], nrrd_layers=[], interpolation_stats=[],
+        native_support_mm=None, parent_mask_support_mm=None, parent_bridge_support_mm=None,
+        final_view_volume_mm=None))
+    parents = {ready: ('model', 'ready'), unrelated: ('model', 'unrelated')}
+    assert prepared_view_waitables(parents) == [unrelated]
+    settled = []
+    drain.__globals__.update(inference_worker_process_active=False,
+        view_processing_futures=parents, component_ref_dense_retirement_active=False,
+        tile_expected_by_parent={}, sam_gate_lineage_by_parent={}, parent_bridge_ready=set(),
+        interpolation_stats=[], nrrd_layer_refs=[],
+        view_prepare_leases=SimpleNamespace(complete=lambda key, **_kw: settled.append(key) or True),
+        view_infos_by_name={'ready': SimpleNamespace(family='cartesian')},
+        _mark_view_variant_terminal=lambda *_args: None,
+        _maybe_submit_tile_consolidations_for_parent=lambda *_args: None)
+    try:
+        drain()
+        assert settled == [('model', 'ready')]
+        assert parents == {unrelated: ('model', 'unrelated')} and not unrelated.done()
+        assert budget.deferred  # The actual lease release gets an immediate retry.
+        assert stage.deferred and 0 in budget.blocked_stages
+    finally:
+        stage.deferred.clear()
+        leases.leases.clear()
+        leases.postprocess_bytes.clear()
+        stage.close()

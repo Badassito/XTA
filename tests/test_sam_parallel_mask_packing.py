@@ -1,7 +1,9 @@
 """Real scope grants fund concurrent immutable encoding, never writer mutation."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from collections import Counter
 import threading
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -108,6 +110,42 @@ def test_live_owner_permission_cannot_be_replayed_on_worker(tmp_path):
             with writer.parallel_packing({'unused_attempt_wave_bytes':4*GIB}):
                 pass
     writer.abort()
+
+
+def test_staged_read_records_wait_for_pending_encoder(tmp_path, monkeypatch):
+    original = evidence._encode_mask
+    release, waiting = threading.Event(), threading.Event()
+    counters = Counter()
+    def add(name, value):
+        counters[name] += value
+    monkeypatch.setattr('XTA.runtime.runtime_telemetry', lambda:SimpleNamespace(add=add))
+    def encode(mask):
+        assert release.wait(5)
+        return original(mask)
+    monkeypatch.setattr(evidence, '_encode_mask', encode)
+    writer = evidence.SamEvidenceWriter(tmp_path/'wait', {})
+    try:
+        with admitted() as (_, _, _, permit), writer.parallel_packing(permit):
+            mask = np.eye(32, dtype=bool)
+            writer._put('pending', mask, mask.shape)
+            future = writer._packing_pending[0][0]
+            result = future.result
+            def entered(*args, **kwargs):
+                waiting.set()
+                return result(*args, **kwargs)
+            monkeypatch.setattr(future, 'result', entered)
+            def finish():
+                assert waiting.wait(5)
+                release.set()
+            with ThreadPoolExecutor(1) as observer:
+                finished = observer.submit(finish)
+                np.testing.assert_array_equal(writer._read_staged('pending'), mask)
+                finished.result(5)
+        assert counters['sam.consumer.mask_pack_waits'] == 1
+        assert counters['sam.consumer.mask_pack_wait_host_seconds'] > 0
+    finally:
+        release.set()
+        writer.abort()
 
 
 def test_encoder_failure_joins_running_peer_before_scope_refund(tmp_path, monkeypatch):

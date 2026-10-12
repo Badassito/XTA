@@ -2090,8 +2090,8 @@ def _estimate_parent_view_postprocess_bytes(
 
 def sam_sessions_per_gpu() -> int:
     sessions = os.environ.get('YOLO_TTA_SAM_SESSIONS_PER_GPU', '2').strip()
-    if sessions not in {'1', '2'}:
-        raise ValueError('YOLO_TTA_SAM_SESSIONS_PER_GPU must be 1 or 2')
+    if sessions not in {'1', '2', '3', '4'}:
+        raise ValueError('YOLO_TTA_SAM_SESSIONS_PER_GPU must be between 1 and 4')
     return int(sessions)
 
 
@@ -2237,6 +2237,42 @@ _MEMFD_OWNER_LOCK = threading.RLock()
 _MEMFD_OWNERS: Dict[str, Tuple[int, str]] = {}
 
 _MEMFD_ATEXIT_REGISTERED = False
+
+
+@dataclass(frozen=True)
+class _MemfdProbePin:
+    entry: Tuple[int, str]
+    fd: int
+    pid: int
+
+
+_MEMFD_PROBE_PIN_LOCK = threading.RLock()
+_MEMFD_PROBE_PINS: Dict[int, _MemfdProbePin] = {}
+
+
+def _before_memfd_probe_fork() -> None:
+    _MEMFD_PROBE_PIN_LOCK.acquire()
+
+
+def _after_memfd_probe_fork_parent() -> None:
+    _MEMFD_PROBE_PIN_LOCK.release()
+
+
+def _after_memfd_probe_fork_child() -> None:
+    global _MEMFD_PROBE_PIN_LOCK
+    for pin in _MEMFD_PROBE_PINS.values():
+        try:
+            os.close(pin.fd)
+        except OSError:
+            pass
+    _MEMFD_PROBE_PINS.clear()
+    _MEMFD_PROBE_PIN_LOCK = threading.RLock()
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(before=_before_memfd_probe_fork,
+        after_in_parent=_after_memfd_probe_fork_parent,
+        after_in_child=_after_memfd_probe_fork_child)
 
 def memfd_workspace_enabled() -> bool:
     return bool(
@@ -2393,24 +2429,87 @@ def _memfd_owner_fd_for_path(path: object) -> Optional[int]:
     return None
 
 
+@contextlib.contextmanager
+def _pinned_memfd_owners(keys):
+    """Keep snapshot backings alive while slow work runs outside the registry."""
+    pins = {}
+    keys = tuple(dict.fromkeys(keys))
+    try:
+        while True:
+            with _MEMFD_PROBE_PIN_LOCK:
+                owner_lock = _MEMFD_OWNER_LOCK
+                # Never park the fork boundary behind an owner held by its forking thread.
+                if owner_lock.acquire(blocking=False):
+                    try:
+                        for key in keys:
+                            entry = _MEMFD_OWNERS.get(key)
+                            if entry is None:
+                                continue
+                            try:
+                                fd = os.dup(entry[0])
+                            except OSError:
+                                continue
+                            try:
+                                pin = _MemfdProbePin(entry, fd, os.getpid())
+                                _MEMFD_PROBE_PINS[fd] = pin
+                                pins[key] = pin
+                            except BaseException:
+                                _MEMFD_PROBE_PINS.pop(fd, None)
+                                try:
+                                    os.close(fd)
+                                except OSError:
+                                    pass
+                                raise
+                    finally:
+                        owner_lock.release()
+                    break
+            with _MEMFD_OWNER_LOCK:
+                pass
+        yield pins
+    finally:
+        for pin in pins.values():
+            _close_memfd_probe_pin(pin)
+
+
+def _close_memfd_probe_pin(pin):
+    with _MEMFD_PROBE_PIN_LOCK:
+        if pin.pid != os.getpid() or _MEMFD_PROBE_PINS.get(pin.fd) is not pin:
+            return
+        # Removal and close share the fork boundary; a child cannot inherit an untracked FD.
+        del _MEMFD_PROBE_PINS[pin.fd]
+        try:
+            os.close(pin.fd)
+        except OSError:
+            pass
+
+
 def capture_memfd_owner_proofs(arrays) -> tuple:
     """Freeze registered raw-workspace identities without retaining arrays or FDs."""
     proofs = []
-    with _MEMFD_OWNER_LOCK:
-        for role, array in arrays.items():
-            if (not isinstance(array, _NUMPY_MEMMAP_TYPE) or array._mmap is None or array.base is not array._mmap
-                    or array.mode == 'c' or int(array.offset) != 0 or array._mmap.closed):
+    for role, array in arrays.items():
+        if (not isinstance(array, _NUMPY_MEMMAP_TYPE) or array._mmap is None or array.base is not array._mmap
+                or array.mode == 'c' or int(array.offset) != 0 or array._mmap.closed):
+            continue
+        key = _memfd_owner_key_from_array(array)
+        mapping = array._mmap
+        with _pinned_memfd_owners((key,)) as pins:
+            if key not in pins:
                 continue
-            key = _memfd_owner_key_from_array(array)
-            entry = _MEMFD_OWNERS.get(key)
-            if entry is None or int(entry[0]) != getattr(array, '_workspace_memfd_owner_fd', None):
+            pin = pins[key]
+            entry, fd = pin.entry, pin.fd
+            if int(entry[0]) != getattr(array, '_workspace_memfd_owner_fd', None):
                 continue
             try:
-                info = os.fstat(entry[0])
-                if int(info.st_size) == int(array.nbytes):
-                    proofs.append((str(role), key, int(info.st_dev), int(info.st_ino), int(info.st_size)))
+                info = os.fstat(fd)
             except OSError:
-                pass
+                continue
+            with _MEMFD_OWNER_LOCK:
+                if (pin.pid == os.getpid() and _MEMFD_OWNERS.get(key) is entry and array._mmap is mapping
+                        and array.base is mapping and not mapping.closed
+                        and array.mode != 'c' and int(array.offset) == 0
+                        and int(entry[0]) == getattr(array, '_workspace_memfd_owner_fd', None)
+                        and int(info.st_size) == int(array.nbytes)):
+                    proofs.append((str(role), key, int(info.st_dev), int(info.st_ino), int(info.st_size)))
     return tuple(proofs)
 
 
@@ -2419,44 +2518,51 @@ def memfd_ram_headroom(promises, headroom_probe):
     """Credit only owned no-swap shmem pages already included in fresh headroom.
 
     Registered raw workspaces are size-stable and never hole-punched. Sample
-    their blocks before headroom, fencing owner retirement with the FD lock;
-    concurrent writers can only add occupied pages. Unknown owners stay owed.
+    their blocks before headroom using temporary owned FDs, then validate the
+    registry entry and lease basis. Unknown or retired owners stay owed.
     """
     resident = eligible = validated = 0
     status, swap = 'unsupported_platform', None
-    with _MEMFD_OWNER_LOCK:
-        if sys.platform.startswith('linux'):
-            try:
-                swap = _read_meminfo_bytes().get('SwapTotal')
-            except (OSError, ValueError, TypeError):
-                pass
-            status = 'swap_unproven' if type(swap) is not int else 'swap_enabled'
-            if type(swap) is int and swap == 0:
-                status, seen, sampled = 'no_authenticated_memfd', set(), []
-                for lease in promises:
-                    basis = (lease.owner_count, lease.phase, lease.ram_backed,
-                             lease.nbytes, lease.memfd_owner_proofs)
-                    promised, owners = lease.ram_commitment_bytes, []
-                    if basis[0] != 1 or promised <= 0:
+    candidates = []
+    if sys.platform.startswith('linux'):
+        try:
+            swap = _read_meminfo_bytes().get('SwapTotal')
+        except (OSError, ValueError, TypeError):
+            pass
+        status = 'swap_unproven' if type(swap) is not int else 'swap_enabled'
+        if type(swap) is int and swap == 0:
+            status = 'no_authenticated_memfd'
+            for lease in promises:
+                basis = (lease.owner_count, lease.phase, lease.ram_backed,
+                         lease.nbytes, lease.memfd_owner_proofs)
+                promised = lease.ram_commitment_bytes
+                if basis[0] == 1 and promised > 0:
+                    candidates.append((lease, basis, promised))
+    with _pinned_memfd_owners(key for _lease, basis, _promised in candidates
+            for _role, key, _device, _inode, _size in basis[-1]) as pins:
+        seen, sampled = set(), []
+        for lease, basis, promised in candidates:
+            owners = []
+            for _role, key, device, inode, size in basis[-1]:
+                if key not in pins or (device, inode) in seen:
+                    continue
+                pin = pins[key]
+                entry, fd = pin.entry, pin.fd
+                if pin.pid != os.getpid():
+                    continue
+                try:
+                    info = os.fstat(fd)
+                    if (info.st_dev, info.st_ino, info.st_size) != (device, inode, size):
                         continue
-                    proofs = basis[-1]
-                    for _role, key, device, inode, size in proofs:
-                        entry = _MEMFD_OWNERS.get(key)
-                        if entry is None or (device, inode) in seen:
-                            continue
-                        try:
-                            info = os.fstat(entry[0])
-                            if (info.st_dev, info.st_ino, info.st_size) != (device, inode, size):
-                                continue
-                            blocks = max(0, int(info.st_blocks))
-                        except (OSError, AttributeError, TypeError, ValueError):
-                            continue
-                        seen.add((device, inode))
-                        owners.append((key, entry[0], (device, inode, size), min(int(size), blocks*512)))
-                        eligible += 1
-                    sampled.append((lease, basis, promised, owners))
-                if eligible:
-                    status = 'owned_memfd_no_swap'
+                    blocks = max(0, int(info.st_blocks))
+                except (OSError, AttributeError, TypeError, ValueError):
+                    continue
+                seen.add((device, inode))
+                owners.append((key, pin, (device, inode, size), min(int(size), blocks*512)))
+                eligible += 1
+            sampled.append((lease, basis, promised, owners))
+        if eligible:
+            status = 'owned_memfd_no_swap'
         try:
             headroom = max(0, int(headroom_probe()))
         except (OSError, ValueError, TypeError):
@@ -2473,20 +2579,27 @@ def memfd_ram_headroom(promises, headroom_probe):
                     if basis != (lease.owner_count, lease.phase, lease.ram_backed,
                                  lease.nbytes, lease.memfd_owner_proofs):
                         continue
-                    occupied = 0
-                    for key, fd, identity, before in owners:
-                        entry = _MEMFD_OWNERS.get(key)
-                        if entry is None or entry[0] != fd:
+                    occupied, owner_count = 0, 0
+                    for key, pin, identity, before in owners:
+                        if pin.pid != os.getpid():
                             continue
                         try:
-                            info = os.fstat(fd)
+                            info = os.fstat(pin.fd)
                             if (info.st_dev, info.st_ino, info.st_size) != identity:
                                 continue
-                            occupied += min(before, max(0, int(info.st_blocks))*512)
-                            validated += 1
+                            blocks = max(0, int(info.st_blocks))
                         except (OSError, AttributeError, TypeError, ValueError):
-                            pass
-                    resident += min(max(0, int(promised)), occupied)
+                            continue
+                        with _MEMFD_OWNER_LOCK:
+                            # Entry identity rejects replacement even when an FD number is reused.
+                            if _MEMFD_OWNERS.get(key) is not pin.entry:
+                                continue
+                            occupied += min(before, blocks*512)
+                            owner_count += 1
+                    if basis == (lease.owner_count, lease.phase, lease.ram_backed,
+                                 lease.nbytes, lease.memfd_owner_proofs):
+                        resident += min(max(0, int(promised)), occupied)
+                        validated += owner_count
     if eligible and not validated and status == 'owned_memfd_no_swap':
         status = 'resident_basis_changed'
     return headroom, resident, dict(memfd_resident_probe_status=status,
@@ -2569,7 +2682,7 @@ def _attach_memfd_transfers_to_task(
                *, persistent: bool = False) -> None:
         raw_path = holder.get(path_field)
         key = str(raw_path)
-        if direct and path_field in {'result_mask_path', 'result_conf_path'}:
+        if direct and path_field in {'result_mask_path', 'result_conf_path', 'cpu_input_path'}:
             with _MEMFD_OWNER_LOCK:
                 fd = _memfd_owner_fd_for_path(raw_path)
                 if fd is not None:
@@ -2606,6 +2719,7 @@ def _attach_memfd_transfers_to_task(
             ('result_mask_path', 'result_mask_fd'),
             ('result_conf_path', 'result_conf_fd'),
             ('canvas_path', 'canvas_fd'),
+            ('cpu_input_path', 'cpu_input_fd'),
             ('d1_bitset_path', 'd1_bitset_fd'),
         ):
             attach(holder, path_field, handle_field, persistent=path_field == 'source_volume_path')
@@ -2645,8 +2759,8 @@ def _materialize_worker_task_memfd_paths(
     """Replace transferred handles with worker-local procfs paths.
 
     Source-volume descriptors are cached for the worker lifetime so the resident render
-    engine sees one stable source identity. Result and canvas descriptors are task-local;
-    dropping them after the task permits immediate sparse retirement in the parent.
+    engine sees one stable source identity. Results, canvases and immutable prepared
+    inputs are task-local; dropping them permits immediate retirement in the parent.
     All policy siblings share this transaction and its returned descriptor ownership list.
     """
     transient_fds: List[int] = []
@@ -2657,6 +2771,8 @@ def _materialize_worker_task_memfd_paths(
     duplicate_sources_closed = 0
     direct_open_ns = 0
     direct_open_calls = 0
+    input_open_ns = 0
+    input_open_calls = 0
     failed = False
     task.pop('_memfd_parent_proc_capability', None)
     # The caller can only close descriptors after this function returns.  Keep enough
@@ -2672,11 +2788,13 @@ def _materialize_worker_task_memfd_paths(
         handle_field: str,
         persistent: bool,
     ) -> None:
-        nonlocal detach_ns, detach_calls, source_reference_hits, duplicate_sources_closed, direct_open_ns, direct_open_calls
+        nonlocal detach_ns, detach_calls, source_reference_hits, duplicate_sources_closed, direct_open_ns, direct_open_calls, input_open_ns, input_open_calls
         parent_source_path = holder.get(path_field)
         direct_reference = holder.pop(f'{handle_field}_proc', None)
         if direct_reference is not None:
-            if (path_field not in {'result_mask_path', 'result_conf_path'} or persistent
+            prepared_input = path_field == 'cpu_input_path'
+            role = 'input' if prepared_input else 'output'
+            if (path_field not in {'result_mask_path', 'result_conf_path', 'cpu_input_path'} or persistent
                     or holder.get(handle_field) is not None or holder.get(f'{handle_field}_ref') is not None
                     or not isinstance(direct_reference, dict)
                     or set(direct_reference) != {'parent_pid', 'worker_pid', 'fd', 'identity'}
@@ -2684,17 +2802,23 @@ def _materialize_worker_task_memfd_paths(
                     or direct_reference['worker_pid'] != os.getpid()
                     or direct_reference['parent_pid'] <= 0 or direct_reference['fd'] < 0
                     or not isinstance(direct_reference['identity'], str)):
-                raise ValueError(f'Invalid direct memfd output reference for {handle_field}')
+                raise ValueError(f'Invalid direct memfd {role} reference for {handle_field}')
             started_open = time.perf_counter_ns()
-            direct_open_calls += 1
+            if prepared_input:
+                input_open_calls += 1
+            else:
+                direct_open_calls += 1
             try:
                 fd = os.open(str(_memfd_proc_path(direct_reference['fd'], owner_pid=direct_reference['parent_pid'])),
-                             os.O_RDWR | getattr(os, 'O_CLOEXEC', 0))
+                             (os.O_RDONLY if prepared_input else os.O_RDWR) | getattr(os, 'O_CLOEXEC', 0))
                 transient_fds.append(int(fd))
                 if _memfd_source_identity(fd) != direct_reference['identity']:
-                    raise RuntimeError(f'Direct memfd output identity changed for {handle_field}')
+                    raise RuntimeError(f'Direct memfd {role} identity changed for {handle_field}')
             finally:
-                direct_open_ns += time.perf_counter_ns() - started_open
+                if prepared_input:
+                    input_open_ns += time.perf_counter_ns() - started_open
+                else:
+                    direct_open_ns += time.perf_counter_ns() - started_open
             holder[path_field] = str(_memfd_proc_path(fd, owner_pid=os.getpid()))
             return
         reference = holder.pop(f'{handle_field}_ref', None)
@@ -2758,6 +2882,7 @@ def _materialize_worker_task_memfd_paths(
         _resolve(holder, path_field='result_mask_path', handle_field='result_mask_fd', persistent=False)
         _resolve(holder, path_field='result_conf_path', handle_field='result_conf_fd', persistent=False)
         _resolve(holder, path_field='canvas_path', handle_field='canvas_fd', persistent=False)
+        _resolve(holder, path_field='cpu_input_path', handle_field='cpu_input_fd', persistent=False)
         _resolve(holder, path_field='d1_bitset_path', handle_field='d1_bitset_fd', persistent=False)
 
         native_resize = holder.get('native_resize')
@@ -2788,7 +2913,7 @@ def _materialize_worker_task_memfd_paths(
 
         def collect(holder: Dict[str, object]) -> None:
             for field in ('source_volume_fd', 'result_mask_fd', 'result_conf_fd',
-                          'canvas_fd', 'd1_bitset_fd'):
+                          'canvas_fd', 'cpu_input_fd', 'd1_bitset_fd'):
                 if holder.get(field) is not None:
                     remaining.append(holder[field])
             native = holder.get('native_resize')
@@ -2808,6 +2933,7 @@ def _materialize_worker_task_memfd_paths(
                 ('detach_calls', detach_calls), ('detach_seconds', detach_ns / 1e9),
                 ('source_reference_hits', source_reference_hits),
                 ('output_proc_open_calls', direct_open_calls), ('output_proc_open_seconds', direct_open_ns / 1e9),
+                ('input_proc_open_calls', input_open_calls), ('input_proc_open_seconds', input_open_ns / 1e9),
                 ('duplicate_sources_closed', duplicate_sources_closed), ('failures', int(failed)),
             ):
                 telemetry.add(f'worker.memfd_materialize.{name}', value)

@@ -36,7 +36,8 @@ class Gray8DecodeCleanupTests(unittest.TestCase):
         spawned = []
         thread_errors = []
         producer_targets = []
-        original_popen = subprocess.Popen
+        startup_events = []
+        original_spawn = media._spawn_decode_process
         child = (
             'import sys; '
             f'sys.stdout.buffer.write(bytes(i % 256 for i in range({byte_count}))); sys.stdout.buffer.flush(); '
@@ -49,7 +50,7 @@ class Gray8DecodeCleanupTests(unittest.TestCase):
             self.assertEqual(command[-1], '-')
             if strict_frame_count:
                 self.assertEqual(command[command.index('-map') + 1], '0:v:0')
-            process = original_popen([sys.executable, '-B', '-c', child], **kwargs)
+            process = original_spawn([sys.executable, '-B', '-c', child])
             spawned.append((process, process.stdout, process.stderr))
             return process
 
@@ -60,7 +61,9 @@ class Gray8DecodeCleanupTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(media, 'allocate_workspace_array',
                 side_effect=lambda *, shape, **kwargs: np.empty(shape, np.uint8)))
             stack.enter_context(mock.patch.object(media, 'tqdm', _Progress))
-            stack.enter_context(mock.patch.object(media.subprocess, 'Popen', side_effect=spawn_ffmpeg_replacement))
+            stack.enter_context(mock.patch.object(media, 'runtime_trace_event',
+                side_effect=lambda name, **fields: startup_events.append((name, fields))))
+            stack.enter_context(mock.patch.object(media, '_spawn_decode_process', side_effect=spawn_ffmpeg_replacement))
             stack.enter_context(mock.patch.object(threading, 'excepthook', side_effect=thread_errors.append))
             stack.enter_context(mock.patch.object(media, '_start_streaming_producer',
                 side_effect=lambda target, **kwargs: producer_targets.append(target)))
@@ -95,7 +98,30 @@ class Gray8DecodeCleanupTests(unittest.TestCase):
         self.assertIsNone(process.stdout, 'Consumed stdout must be detached before communicate')
         self.assertTrue(stdout.closed)
         self.assertTrue(stderr.closed)
+        self.startup_events = startup_events
         return result, error, readiness, process.returncode
+
+    def test_startup_decode_done_reports_verified_exit_after_frames_are_read(self):
+        for streaming in (False, True):
+            for exit_code in (0, 7):
+                with self.subTest(streaming=streaming, exit_code=exit_code):
+                    self._run_decode(streaming=streaming, exit_code=exit_code)
+                    names = [name for name, _ in self.startup_events]
+                    self.assertEqual(names[0], 'startup_decode_start')
+                    self.assertEqual(names[-1], 'startup_decode_done')
+                    self.assertEqual(self.startup_events[-1][1]['failed'], exit_code != 0)
+                    if streaming:
+                        self.assertLess(names.index('startup_decode_frames_read'),
+                                        names.index('startup_decode_done'))
+
+    def test_startup_decode_failure_is_reported_without_false_success(self):
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                self._run_decode(streaming=streaming, byte_count=5, stderr_bytes=32)
+                done = [fields for name, fields in self.startup_events if name == 'startup_decode_done']
+                self.assertEqual(len(done), 1)
+                self.assertTrue(done[0]['failed'])
+                self.assertNotIn('startup_decode_frames_read', [name for name, _ in self.startup_events])
 
     def test_strict_count_reaches_eof_while_draining_large_stderr(self):
         result, error, _, code = self._run_decode(streaming=False, strict_frame_count=True)

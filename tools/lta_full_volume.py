@@ -60,7 +60,10 @@ from XTA.lta_inputs import parse_yolo_segmentation_label, split_indexed_stem  # 
 from XTA.lta_sam import (  # noqa: E402
     LTA_MAX_NUM_OBJECTS,
     LTA_MULTIPLEX_COUNT,
+    audit_sam_fa3_routing,
     build_local_sam_predictor,
+    preflight_sam_fa3,
+    resolve_sam_attention_backend,
     resolve_local_sam_bundle,
 )
 
@@ -1686,6 +1689,7 @@ def run_tile(
 
 def _resolve_profile(torch_module: Any, device: int, requested: str) -> dict[str, Any]:
     capability = tuple(int(value) for value in torch_module.cuda.get_device_capability(int(device)))
+    attention = resolve_sam_attention_backend(capability)
     profile = str(requested)
     if profile == "auto":
         profile = "h100" if capability[0] >= 9 else "egpu"
@@ -1698,20 +1702,20 @@ def _resolve_profile(torch_module: Any, device: int, requested: str) -> dict[str
         return {
             "name": profile,
             "weight_storage": "float32",
-            # External FA3 is optional and has no compatible prebuilt wheel in
-            # the qualified Torch 2.13/CUDA 13 cluster environment. Building
-            # its 293 CUDA translation units exhausted a 200 GiB SLURM step.
-            # Use PyTorch SDPA, whose ordered backend policy still prefers its
-            # built-in flash kernel before efficient attention and math.
-            "use_fa3": False,
+            "use_fa3": attention == "fa3_fp8",
             # Real-valued RoPE is needed only for torch.compile compatibility;
             # this diagnostic harness deliberately runs compile=False.
             "use_rope_real": False,
             "constrained_batches": False,
             "sdpa_fallback": True,
-            "attention_backend": "torch_sdpa_flash_efficient_math",
+            "attention_backend": ("meta_fa3_fp8_e4m3fn" if attention == "fa3_fp8"
+                                  else "torch_sdpa_flash_efficient_math"),
+            "attention_qkv_dtype": "float8_e4m3fn" if attention == "fa3_fp8" else "bfloat16",
+            "runtime_autocast_dtype": "bfloat16",
         }
     if profile == "egpu":
+        if attention != "sdpa":
+            raise ValueError("the eGPU SAM profile requires sdpa attention")
         return {
             "name": profile,
             "weight_storage": "bfloat16_egpu",
@@ -1923,6 +1927,8 @@ def main() -> None:
             )
         torch.cuda.set_device(int(args.device))
         profile = _resolve_profile(torch, int(args.device), str(args.profile))
+        if profile["use_fa3"]:
+            profile["attention_preflight"] = preflight_sam_fa3(torch, int(args.device))
         if profile["name"] == "egpu" and not 2 <= int(args.chunk_frames) <= 48:
             raise ValueError(
                 "the constrained eGPU profile requires --chunk-frames in [2,48]"
@@ -1979,6 +1985,8 @@ def main() -> None:
                 max_num_objects=int(plan["model_object_capacity"]),
                 construction_device="meta",
             )
+            if profile["use_fa3"]:
+                profile["attention_routing"] = audit_sam_fa3_routing(predictor)
             if profile["constrained_batches"]:
                 constrained = configure_constrained_gpu_batches(predictor)
             if profile["sdpa_fallback"]:

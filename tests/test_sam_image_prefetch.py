@@ -1,5 +1,6 @@
 """Continuous next-cohort rendering owns fresh credit and retires on its producer."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 import threading
 from types import SimpleNamespace
 
@@ -92,7 +93,19 @@ def test_four_cohorts_each_next_builds_while_current_is_consumed_with_two_live_g
 def test_cpu_fallback_current_does_not_block_next_gpu_cohort_or_other_parent(tmp_path, monkeypatch):
     from XTA.sam_gpu_rendering import live_image_sampling
     from tests.test_sam_gpu_rendering import FakeRenderer
+    from tests.test_sam_view_image_cache import expected_canvas
     source, context, view, bbox, plans, _retirements = setup(tmp_path, monkeypatch)
+    context._runtime.has_ready_work = lambda: False
+    context._runtime.idle_image_handoff = lambda: nullcontext(True)
+    source = np.pad(source, ((1, 1), (0, 0), (0, 0)), mode='edge')
+    context.source_volume, context.source_grid_shape = source, source.shape
+    monkeypatch.setenv('YOLO_TTA_SAM_RENDER_MAX_BYTES', str(256*1024))
+    view = geometry.get_view_infos(*source.shape, cartesian_views=(),
+        spherical_views=('transverse',), spherical_patch_size=8, spherical_min_radius=.5)[0]
+    shape, bbox = (view.num_slices, view.src_h, view.src_w), (2, 1, 7, 7)
+    assert view.num_slices >= 4
+    plans = [demand(shape, {frame:bbox}) for frame in range(4)]
+    cpu_expected = expected_canvas(context, view, shape, 0)[2:7, 1:7]
     pool = account(64*GIB)
     cpu_started, cpu_release, finish = (threading.Event() for _ in range(3))
     ready = [threading.Event(), threading.Event()]
@@ -104,7 +117,8 @@ def test_cpu_fallback_current_does_not_block_next_gpu_cohort_or_other_parent(tmp
             assert cpu_release.wait(5)
         return original(*args, **kwargs)
     monkeypatch.setattr(context, '_render_demand_crop', render)
-    def gpu(_context, _view, _shape, prepared):
+    def gpu(_context, _view, _shape, prepared, *, opportunistic=False):
+        assert opportunistic
         frame = next(iter(prepared.frame_crop_bounds))
         return FakeRenderer(context, fail_after=0 if frame == 0 else None)
     monkeypatch.setattr('XTA.sam_gpu_rendering.try_gpu_crop_renderer', gpu)
@@ -115,12 +129,12 @@ def test_cpu_fallback_current_does_not_block_next_gpu_cohort_or_other_parent(tmp
                     worker_count=1, base_allowance_bytes=4*GIB, headroom_probe=lambda:128*GIB) as profile:
                 with context.resource_scope(profile):
                     for frame in (2*index, 2*index+1):
-                        holders.append(context.prefetch_image_cohort(view, source.shape,
+                        holders.append(context.prefetch_image_cohort(view, shape,
                             plans[frame], max_cache_bytes=1000))
                     assert all(holders)
                     # Both wrappers may be pending; a third cannot spend this
                     # same parent's image pipeline slots again.
-                    assert context.prefetch_image_cohort(view, source.shape, plans[-1], max_cache_bytes=1000) is None
+                    assert context.prefetch_image_cohort(view, shape, plans[-1], max_cache_bytes=1000) is None
                     ref = holders[-1].future.result(timeout=5)
                     assert live_image_sampling(ref)['backend'] == 'cuda'
                     records[index] = (profile, tuple(holders), ref)
@@ -128,8 +142,10 @@ def test_cpu_fallback_current_does_not_block_next_gpu_cohort_or_other_parent(tmp
                     assert finish.wait(5)
                     for frame, holder in zip((2*index,2*index+1),holders):
                         with holder as current:
-                            expected = source[frame, 2:8, 3:9] if frame == 0 else 201+frame%7
-                            np.testing.assert_array_equal(crop_from(current, frame, bbox), expected)
+                            if frame == 0:
+                                assert np.max(np.abs(crop_from(current, frame, bbox).astype(int)-cpu_expected.astype(int))) <= 1
+                            else:
+                                np.testing.assert_array_equal(crop_from(current, frame, bbox), 201+frame%7)
                             assert current.path.exists()
         finally:
             for holder in holders:

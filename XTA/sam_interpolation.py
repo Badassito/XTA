@@ -438,6 +438,102 @@ def _tiled_tracker_requests(jobs, groups, observations, cancel_event, resource_p
         del seed
 
 
+_PREPARED_TRACKER_SOURCE_SEAL = object()
+
+
+class _PreparedTrackerSource:
+    """Finite approved jobs; only the established seed builder runs off-thread."""
+
+    def __init__(self, prepared, items, groups, observations, cancel_event, profile,
+                 admission, request_order, *, _seal):
+        if _seal is not _PREPARED_TRACKER_SOURCE_SEAL:
+            raise TypeError('SAM production sources must be minted from a prepared plan')
+        self._seal, self.admission, self.profile = _seal, admission, profile
+        self.items, self.groups, self.observations = tuple(items), groups, observations
+        self.cancel_event, self.request_order = cancel_event, request_order
+        self.tiled = prepared.crop_mode == 'tiled'
+        self.run_ids = tuple(str(item.run_id) for item in self.items)
+
+    def request(self, index):
+        if isinstance(index, (bool, np.bool_)) or not isinstance(index, (int, np.integer)) or not 0<=int(index)<len(self.items):
+            raise SamInterpolationInfrastructureError('SAM producer requested an unknown sealed job')
+        index = int(index)
+        builder = _tiled_tracker_requests if self.tiled else _tracker_requests
+        stream = builder((self.items[index],), self.groups, self.observations, self.cancel_event, self.profile)
+        try:
+            request = next(stream)
+        finally:
+            stream.close()
+        self.validate_request(request, index)
+        if self.request_order is not None:
+            self.request_order.append(index)
+        return request
+
+    def validate_request(self, request, index):
+        item = self.items[int(index)]
+        run = item.original_run if self.tiled else item
+        y0,x0,y1,x1 = item.tile.crop_bbox_yx if self.tiled else self.groups[str(run.group_id)].context_bbox_yx
+        contract = dict(run_id=str(item.run_id), seed_frame=int(run.expected_frames[0]),
+            frame_start=min(run.expected_frames), frame_stop=max(run.expected_frames)+1,
+            direction='forward' if int(run.direction)>0 else 'backward', crop_xyxy=(x0,y0,x1,y1))
+        if any(request.get(key) != value for key, value in contract.items()):
+            raise SamInterpolationInfrastructureError('SAM seed source changed a sealed run/interval/crop')
+
+    def __iter__(self):
+        for index in range(len(self.items)):
+            yield self.request(index)
+
+
+def _is_prepared_tracker_source(source, admission):
+    return (isinstance(source, _PreparedTrackerSource)
+        and source._seal is _PREPARED_TRACKER_SOURCE_SEAL and source.admission is admission
+        and source.profile is admission._profile)
+
+
+def _prepared_tracker_source(prepared, items, groups, observations, cancel_event,
+                             resource_profile, admission, *, request_order=None):
+    """Research/custom plans retain their synchronous request adapter."""
+    if admission is None or not isinstance(prepared, SamPreparedInterpolationPass):
+        return None
+    from .sam_bridge_planning import SamBridgePlan, SamObservation
+    from .sam_extrapolation_planning import SamExtrapolationPlan
+    if not isinstance(prepared.plan, (SamBridgePlan, SamExtrapolationPlan)):
+        return None
+    inventory = prepared.tracker_jobs if prepared.crop_mode == 'tiled' else prepared.runs
+    identities = {id(item) for item in inventory}
+    items = tuple(items)
+    if not items or any(id(item) not in identities for item in items) or len({str(item.run_id) for item in items}) != len(items):
+        raise SamInterpolationInfrastructureError('SAM producer source is outside its approved finite inventory')
+    planned_groups = {str(group.group_id): group for group in prepared.groups}
+    planned_observations = {str(item.observation_id): item for item in prepared.plan.observations}
+    if (any(groups.get(key) is not value for key,value in planned_groups.items())
+            or any(observations.get(key) is not value for key,value in planned_observations.items())
+            or any(not isinstance(item, SamObservation) or item.mask_crop.flags.writeable
+                   for item in planned_observations.values())):
+        raise SamInterpolationInfrastructureError('SAM producer source changed its sealed observation owners')
+    admission._validate_producer()
+    return _PreparedTrackerSource(prepared, items, groups, observations, cancel_event, resource_profile,
+        admission, request_order, _seal=_PREPARED_TRACKER_SOURCE_SEAL)
+
+
+def _tracker_request_stream(prepared, items, groups, observations, cancel_event, profile, admission):
+    source = _prepared_tracker_source(prepared, items, groups, observations, cancel_event, profile, admission)
+    if source is not None:
+        return source
+    builder = _tiled_tracker_requests if prepared.crop_mode=='tiled' else _tracker_requests
+    return builder(items, groups, observations, cancel_event, profile)
+
+
+def _family_preparation_options(runtime, prepared, items, groups, observations,
+                                cancel_event, profile, admission, request_order=None):
+    from .sam_tracker_runtime import SamInterpolationTracker
+    if not isinstance(runtime, SamInterpolationTracker):
+        return {}
+    source = _prepared_tracker_source(prepared, items, groups, observations, cancel_event,
+        profile, admission, request_order=request_order)
+    return {} if source is None else dict(preparation_source=source)
+
+
 def _family_dispatch_balance(runs, flat_execution_order, admitted_slots):
     """Compare scheduling imbalance using sealed frame counts, never image work.
 
@@ -504,6 +600,8 @@ def _iterate_tracker_results(runtime: object, requests: object, cache_ref: objec
             options['max_in_flight'] = min(options['max_in_flight'], sam_worker_count(runtime,legacy=scope_admission is None))
         if scope_admission is not None and _supports_scope_admission(runtime.iter_results):
             options['scope_admission']=scope_admission
+            options['max_in_flight']=min(options.get('max_in_flight',scope_admission.max_in_flight),
+                scope_admission.max_in_flight)
         yield from runtime.iter_results(requests, source_cache_ref=cache_ref, **options)
     else:
         for index, request in enumerate(requests):
@@ -517,7 +615,7 @@ def _iterate_tiled_tracker_results(runtime, prepared, worker_count, groups, obse
         with _tracker_scope_admission(runtime,replace(prepared,tracker_jobs=jobs),cache_ref,
                 resource_profile,worker_count) as permit:
             stream = _iterate_tracker_results(runtime,
-                _tiled_tracker_requests(jobs, groups, observations, cancel_event, resource_profile), cache_ref,
+                _tracker_request_stream(prepared, jobs, groups, observations, cancel_event, resource_profile, permit), cache_ref,
                 prepared.cpu_wave_admission,scope_admission=permit)
             try:
                 for index, result in stream:
@@ -775,8 +873,8 @@ def _regenerate_sam_group_retry(prepared, *, destination, metadata, image_provid
             order = prepared.execution_order(worker_count)
             stream = (_iterate_tiled_tracker_results(runtime, prepared, worker_count, groups, by_id, cache,
                 cancel_event, resource_profile) if tiled else _iterate_tracker_results(runtime,
-                _tracker_requests(tuple(prepared.runs[i] for i in order), groups, by_id,
-                    cancel_event, resource_profile), cache, prepared.cpu_wave_admission,scope_admission=permit))
+                _tracker_request_stream(prepared, tuple(prepared.runs[i] for i in order), groups, by_id,
+                    cancel_event, resource_profile, permit), cache, prepared.cpu_wave_admission,scope_admission=permit))
             for index, result in stream:
                 try:
                     with writer.parallel_packing(getattr(result, 'packing_admission', None)):
@@ -1771,6 +1869,8 @@ def interpolate_sam_view_volume_pass(
                         for parameter in parameters.values()) else {})
                 if permit is not None:
                     receipt_options['scope_admission']=permit
+                receipt_options.update(_family_preparation_options(runtime, prepared_plan, runs, groups,
+                    observation_by_id, cancel_event, resource_profile, permit, family_requested_order))
                 result_stream = runtime.iter_family_results(family_inventory,
                     source_cache_ref=cache_ref, max_in_flight=min(worker_count,sam_worker_count(runtime,legacy=permit is None)),
                     defer_refill_until_consumed=bool(prepared_plan.cpu_wave_admission.get('defer_refill_until_consumed', False)),
@@ -1778,8 +1878,8 @@ def interpolate_sam_view_volume_pass(
             else:
                 result_stream = (_iterate_tiled_tracker_results(runtime, prepared_plan, worker_count, groups,
                     observation_by_id, cache_ref, cancel_event, resource_profile) if resolved_mode == "tiled" else
-                    _iterate_tracker_results(runtime, _tracker_requests(execution_runs, groups,
-                        observation_by_id, cancel_event, resource_profile), cache_ref, prepared_plan.cpu_wave_admission,scope_admission=permit))
+                    _iterate_tracker_results(runtime, _tracker_request_stream(prepared_plan, execution_runs, groups,
+                        observation_by_id, cancel_event, resource_profile, permit), cache_ref, prepared_plan.cpu_wave_admission,scope_admission=permit))
             for execution_index, result in result_stream:
                 try:
                     with writer.parallel_packing(getattr(result, 'packing_admission', None)):

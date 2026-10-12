@@ -30,10 +30,26 @@ import numpy as np
 
 _LIVE_SAM_TRACKERS = weakref.WeakSet()
 _LIVE_SAM_TRACKERS_LOCK = threading.Lock()
+_SAM_VIEW_PRODUCER = threading.local()
 _SAM_SNAPSHOT_COUNTS = ('active_scopes', 'credited_scopes', 'ready_jobs', 'preparing_jobs',
     'running_jobs', 'acked_awaiting_consumer_jobs', 'consumer_held_jobs',
-    'live_prepared_bank_bytes', 'submitted_jobs', 'completed_jobs', 'completion_acks',
-    'raw_transfer_decode_seconds', 'consumer_hold_seconds')
+    'live_prepared_bank_bytes', 'live_completion_bank_bytes', 'live_completion_wave_loan_bytes',
+    'submitted_jobs', 'completed_jobs', 'completion_acks',
+    'raw_transfer_decode_seconds', 'consumer_hold_seconds',
+    'scope_dispatchable_jobs', 'free_worker_slots')
+
+
+@contextmanager
+def sam_view_producer_family(family):
+    """Capture view cost on its producer without changing scientific requests."""
+    previous = getattr(_SAM_VIEW_PRODUCER, 'view_class', None)
+    _SAM_VIEW_PRODUCER.view_class = (
+        'curved' if family in {'radial', 'azimuthal', 'spherical'} else
+        'cheap' if family in {'orthogonal', 'tilted'} else None)
+    try:
+        yield
+    finally:
+        _SAM_VIEW_PRODUCER.view_class = previous
 
 
 def _consumer_time(stage, started, cpu_started):
@@ -43,11 +59,63 @@ def _consumer_time(stage, started, cpu_started):
     telemetry.add(f'sam.consumer.{stage}_thread_cpu_seconds', time.thread_time()-cpu_started)
 
 
+def _record_worker_completion(manifest, prepared):
+    """Record host elapsed timers once per settled ACK, not per consumer read."""
+    try:
+        from . import runtime
+        telemetry = runtime._RUNTIME_TELEMETRY
+        if telemetry is None or not telemetry.enabled:
+            return
+        telemetry.add('sam.worker.completed_jobs', 1)
+        timings = manifest.get('timings')
+        if isinstance(timings, Mapping):
+            for key in ('render_seconds', 'input_preparation_seconds', 'tracker_seconds',
+                    'sdk_session_init_seconds', 'pack_seconds', 'worker_seconds', 'queue_seconds'):
+                value = timings.get(key)
+                if type(value) not in (int, float):
+                    continue
+                try:
+                    value = float(value)
+                except OverflowError:
+                    continue
+                if math.isfinite(value) and value >= 0:
+                    telemetry.add('sam.worker.'+key, value)
+        payload = prepared.task.payload
+        start, stop = ((payload['seed_frame'], payload['frame_stop']) if payload['direction']=='forward'
+            else (payload['frame_start'], payload['seed_frame']+1))
+        frames = manifest.get('expected_frames')
+        if (manifest.get('coverage_complete') is True and isinstance(frames, list)
+                and len(frames)==stop-start
+                and all(type(frame) is int and frame==start+index for index,frame in enumerate(frames))):
+            telemetry.add('sam.worker.completed_output_frames', len(frames))
+    except Exception:
+        pass  # Optional diagnostics cannot change settled task ownership.
+
+
+def _clear_producer_error_frames(error):
+    """Keep failure messages/trace locations without retaining seed owners."""
+    import traceback
+    pending,seen = [error],set()
+    while pending:
+        current = pending.pop()
+        if not isinstance(current,BaseException) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        traceback.clear_frames(current.__traceback__)
+        pending.extend((current.__cause__,current.__context__))
+        pending.extend(getattr(current,'exceptions',()))
+
+
 def _sam_scheduler_sample():
     with _LIVE_SAM_TRACKERS_LOCK:
         trackers = tuple(_LIVE_SAM_TRACKERS)
     snapshots = tuple(tracker.snapshot() for tracker in trackers)
+    device_active = {}
+    for row in snapshots:
+        for device, count in row['active_workers_by_device'].items():
+            device_active[device] = device_active.get(device, 0)+count
     return dict(sample_monotonic_ns=time.monotonic_ns(), tracker_instances=len(snapshots),
+        active_workers_by_device=device_active,
         scope_consumers=[scope for row in snapshots for scope in row.get('scope_consumers', ())],
         closed_instances=sum(row['closed'] for row in snapshots),
         cancelled_instances=sum(row['cancelled'] for row in snapshots),
@@ -139,6 +207,7 @@ class _FamilyDispatch:
             raise ValueError("Experimental SAM family schedule must be fifo or lpt")
         if schedule == "lpt":
             sealed = tuple(sorted(sealed, key=lambda value: (-value.frame_work_proxy, value.input_indices[0])))
+        self._inventory = sealed
         self.waiting = iter(sealed)
         self.waiting_exhausted = False
         self.active = {}
@@ -158,7 +227,7 @@ class _FamilyDispatch:
                 self.completed_families += 1
                 del self.active[device]
 
-    def next_for(self, free_devices):
+    def next_for(self, free_devices, request_source=None):
         for device in sorted(free_devices):
             self.retire_completed((device,))
             current = self.active.get(device)
@@ -176,7 +245,8 @@ class _FamilyDispatch:
             family, position = current
             index = family.input_indices[position]
             self.active[device] = (family, position + 1)
-            request = family.request_factory(index)
+            request = (family.request_factory(index) if request_source is None else
+                request_source.request(index))
             if not isinstance(request, Mapping) or str(request.get("run_id")) != family.run_ids[position]:
                 raise RuntimeError("SAM family factory changed its immutable original run identity")
             return device, index, family.family_id, request
@@ -277,10 +347,33 @@ class _SubmittedRun:
 def execute_interpolation_tracker_task(
     context: object, kind: str, payload: Mapping[str, object],
 ) -> Mapping[str, object]:
-    """Worker entry point: run raw observations and publish a packed artifact."""
+    """Publish only after the heavy task frame and its known CPU owners retire."""
+    from .lta_outputs import write_json_atomically
+
+    output, manifest, owners, session_retirement = _execute_interpolation_tracker_task(
+        context, kind, payload)
+    owners_retired = all(owner() is None for owner in owners)
+    verified = session_retirement.get('verified')
+    if not owners_retired or verified is False:
+        raise RuntimeError('SAM task retained CPU input/session owners after completion')
+    bound = all(isinstance(payload.get(key),str) and bool(payload[key]) for key in ('work_id','attempt_token'))
+    manifest['cpu_task_retirement'] = dict(schema='xta.sam_cpu_task_retirement/1',
+        verified=True if verified is True and bound else None,
+        known_owners_retired=owners_retired, known_owner_count=len(owners),
+        session_retirement=session_retirement,
+        run_id=str(payload['run_id']), work_id=str(payload.get('work_id', '')),
+        attempt_token=str(payload.get('attempt_token', '')), worker_pid=os.getpid(),
+        execution_device_id=int(os.environ.get('LTA_EXECUTION_DEVICE_ID', '0')),
+        worker_index=int(os.environ.get('LTA_WORKER_INDEX', '0')))
+    output['artifact_path'] = str(write_json_atomically(
+        Path(str(payload['output_dir'])) / 'manifest.json', manifest))
+    return output
+
+
+def _execute_interpolation_tracker_task(context, kind, payload):
+    """Heavy scope: return compact primitives and weak retirement witnesses."""
 
     from .lta_experimental import run_mask_seed_session
-    from .lta_outputs import write_json_atomically
     from .lta_rendering import LtaPhysicalViewCacheRef, render_native_tile_window
     from .lta_sam import SamInterpolationSessionPlan, prepare_sam_video_frames
     from .lta_worker_adapter import _jsonable
@@ -336,6 +429,11 @@ def execute_interpolation_tracker_task(
         torch_module=getattr(context, 'torch_module', None),
         cuda_quota_bytes=getattr(context, 'sam_runtime', {}).get('cuda_allocator_quota', {}).get('limit_bytes'))
     input_seconds = time.perf_counter() - input_started
+    owners = [weakref.ref(resource), *(weakref.ref(frame) for frame in resource)]
+    prepared_clip = getattr(resource, '_xta_prepared_video_frames', None)
+    if prepared_clip is not None:
+        owners.append(weakref.ref(prepared_clip.images))
+    del prepared_clip
     if input_preparation['prepared']:
         image_cache_lifetime['model_input'] = input_preparation['clip_storage']
     loader_identity = (input_preparation['policy'], input_preparation.get('implementation_sha256'), image_side,
@@ -450,12 +548,12 @@ def execute_interpolation_tracker_task(
         "seed_policy": "one original endpoint; held-out terminal; no hole filling",
         "detector_confidence": None,
     }
-    manifest_path = write_json_atomically(output_dir / "manifest.json", manifest)
+    owners.extend(weakref.ref(owner) for owner in (seed, frames, scores, removed))
+    owners.extend(weakref.ref(item.binary_mask) for item in observations.values())
     return {
-        "artifact_path": str(manifest_path),
         "metrics": {"frame_count": len(expected), "foreground_pixels": int(frames.sum())},
         "metadata": {"raw": True, "status": str(manifest["status"])},
-    }
+    }, manifest, tuple(owners), dict(result.get('session_retirement', {}))
 
 
 def _read_tracker_manifest(manifest_path: Path, *, expected_sha256: str | None = None):
@@ -499,6 +597,34 @@ def _validate_completion_manifest(manifest, prepared, device, *, require_cuda, w
                 or type(logical_device) is not int or logical_device != device
                 or proof.get('run_id') != prepared.task.payload['run_id']):
             raise RuntimeError('SAM completion lacks exact CUDA-quiescence/device/run proof')
+
+
+def _cpu_completion_retired(manifest, prepared, slot, event):
+    """Unknown adapters keep their base owner; a claimed proof is exact-bound."""
+    proof = manifest.get('cpu_task_retirement', {})
+    if proof.get('verified') is False or proof.get('known_owners_retired') is False:
+        raise RuntimeError('SAM worker retained CPU owners after its completion ACK')
+    if proof.get('verified') is not True:
+        return False
+    device, worker_index = slot
+    session = proof.get('session_retirement', {})
+    expected = dict(schema='xta.sam_cpu_task_retirement/1',
+        run_id=prepared.task.payload['run_id'], work_id=prepared.task.work_id,
+        attempt_token=prepared.task.attempt_token, worker_pid=event.worker_pid,
+        execution_device_id=device, worker_index=worker_index)
+    if (any(proof.get(key) != value for key,value in expected.items())
+            or any(type(proof.get(key)) is not int for key in ('worker_pid','execution_device_id','worker_index'))
+            or type(event.worker_pid) is not int or event.worker_pid<=0
+            or proof.get('known_owners_retired') is not True
+            or type(proof.get('known_owner_count')) is not int or proof['known_owner_count']<1
+            or session.get('schema') != 'xta.sam_session_retirement/1'
+            or session.get('verified') is not True
+            or not isinstance(session.get('session_id'),str) or not session['session_id']
+            or any(session.get(key) is not True for key in ('close_call_completed',
+                'propagation_iterator_settled','session_registry_removed',
+                'inference_state_cleared','private_tracker_state_cleared'))):
+        raise RuntimeError('SAM CPU completion retirement changed its bound task/worker proof')
+    return True
 
 
 def load_tracker_run_result(
@@ -581,6 +707,7 @@ class _TrackerScope:
     admission: object | None = None
     admission_limits: Mapping | None = None
     family_dispatch: _FamilyDispatch | None = None
+    view_class: str | None = None
     ready: deque = field(default_factory=deque)
     completed: deque = field(default_factory=deque)
     outstanding: dict = field(default_factory=dict)
@@ -600,21 +727,49 @@ class _TrackerScope:
     closing: bool = False
     abandoned: bool = False
     consumed: int = 0
+    completion_capacity: int = 0
+    completion_owned: set = field(default_factory=set)
+    cpu_retired: set = field(default_factory=set)
+    producer: object | None = None
+    preparation: object | None = None
+    producer_error: BaseException | None = None
+    producer_state: str | None = None
+    preparation_thread_id: int | None = None
+    independent_preparation: bool = False
 
     @property
     def window(self):
-        return self.capacity + self.lookahead
+        return self.capacity + self.lookahead + (self.completion_capacity if self.independent_preparation else 0)
 
     @property
     def work_count(self):
         return len(self.outstanding) + self.preparing - int(self.transfer_held)
 
+    @property
+    def base_input_count(self):
+        return len(self.outstanding)-len(self.completion_owned)+self.preparing
+
+    @property
+    def producer_settled(self):
+        return (self.producer is None or not self.producer.is_alive()) and not self.preparing
+
+    def promote_completions(self):
+        if not self.independent_preparation:
+            return
+        for prepared, _slot, _event in self.completed:
+            identity = prepared.task.work_id, prepared.task.attempt_token
+            if len(self.completion_owned) >= self.completion_capacity:
+                break
+            if identity in self.cpu_retired:
+                self.completion_owned.add(identity)
+
 
 class _PoolScheduler:
     """One persistent pool API owner, fair scoped FIFO jobs and compact ACKs.
 
-    Factories, profile validation, seed staging and raw decoding belong to the
-    producing thread. This owner can spend only already admitted immutable
+    Authenticated finite sources may stage seeds on their bounded producer;
+    profile authorization and raw decoding remain on the original owner.
+    This scheduler can spend only already admitted immutable
     envelopes. The global running inventory is bounded by physical workers;
     each scope separately bounds ready, running and unconsumed packets.
     """
@@ -625,9 +780,11 @@ class _PoolScheduler:
         self._pending = {}
         self._free = set(tracker.worker_slots)
         self._device_active = {device: 0 for device in tracker.device_ids}
-        if tracker.workers_per_device == 2:
+        self._compute_epoch_slots = {device: set() for device in tracker.device_ids}
+        if tracker.workers_per_device > 1:
             tracker._capture_worker_inventory()
         self._round_robin = deque(tracker._scopes)
+        self._curved_since_cheap = 0
         self._error = None
         self._stopping = False
         self._thread = threading.Thread(target=self._run, name='sam-pool-scheduler', daemon=True)
@@ -645,6 +802,8 @@ class _PoolScheduler:
         with self._condition:
             while True:
                 self._check()
+                if scope.producer_error is not None:
+                    raise scope.producer_error
                 if scope.completed:
                     if scope.transfer_held:
                         raise RuntimeError('SAM scope already owns a decoded transfer')
@@ -668,17 +827,33 @@ class _PoolScheduler:
             raise RuntimeError('SAM pool scheduler remains active; pool/GPU ownership retained')
 
     def _choose_scope(self):
-        for _ in range(len(self._round_robin)):
-            token = self._round_robin.popleft()
+        ready = []
+        for token in tuple(self._round_robin):
             scope = self.tracker._scopes.get(token)
             if scope is None:
+                self._round_robin.remove(token)
                 continue
-            self._round_robin.append(token)
             if (scope.closing or not scope.ready or scope.running >= scope.capacity
                     or scope.deferred and (scope.completed or scope.transfer_held)):
                 continue
-            return scope
-        return None
+            ready.append(scope)
+        if not ready:
+            return None
+        classes = {scope.view_class for scope in ready}
+        if classes == {'curved', 'cheap'}:
+            # Three expensive-view turns leave a bounded turn for CPU-ready work.
+            preferred = 'cheap' if self._curved_since_cheap >= 3 else 'curved'
+            selected = next(scope for scope in ready if scope.view_class == preferred)
+        else:
+            selected = ready[0]
+        if classes <= {'curved', 'cheap'}:
+            self._round_robin.remove(selected.token)
+            self._round_robin.append(selected.token)
+        else:
+            while self._round_robin[0] != selected.token:
+                self._round_robin.rotate(-1)
+            self._round_robin.rotate(-1)
+        return selected
 
     def _dispatch(self, scope):
         from .lta_workers import LtaWorkerTask
@@ -690,17 +865,24 @@ class _PoolScheduler:
             candidates = sorted(self._free, key=lambda slot: (
                 self._device_active[slot[0]], slot != preferred,
                 self.tracker._slot_submissions[slot], slot))
+            if (scope.capacity == 1 and scope.admission is not None
+                    and scope.admission_limits.get('retry_group_affine') is True
+                    and preferred in candidates):
+                # Reuse a child retry's encoder only when its exact worker is free.
+                candidates.remove(preferred)
+                candidates.insert(0, preferred)
         selected, lease = None, None
         for candidate in candidates:
+            device, worker_index = candidate
+            with self.tracker._compute_lease_lock:
+                existing = self.tracker._compute_leases.get(device)
             if (self.tracker._compute_yield_requested is not None
-                    and self.tracker._compute_yield_requested(candidate[0])):
+                    and self.tracker._compute_yield_requested(device)
+                    and (existing is None or worker_index in self._compute_epoch_slots[device])):
                 continue
             if self.tracker._compute_lease_factory is None:
                 selected = candidate
                 break
-            device = candidate[0]
-            with self.tracker._compute_lease_lock:
-                existing = self.tracker._compute_leases.get(device)
             if existing is not None:
                 selected = candidate
                 break
@@ -725,6 +907,8 @@ class _PoolScheduler:
             scope.ready.popleft()
             self._free.remove(selected)
             self._device_active[device] += 1
+            # Join each context once per lease, then drain when image work waits.
+            self._compute_epoch_slots[device].add(worker_index)
             scope.running += 1
             self._pending[identity] = scope, prepared, selected
         payload = dict(prepared.task.payload)
@@ -737,9 +921,13 @@ class _PoolScheduler:
             self._pending[identity] = scope, prepared, selected
             scope.outstanding[identity] = prepared
         self.tracker._pool.submit(task, execution_device_id=device,
-            **({'worker_index': worker_index} if self.tracker.workers_per_device == 2 else {}))
+            **({'worker_index': worker_index} if self.tracker.workers_per_device > 1 else {}))
         accepted_monotonic = time.monotonic()
         with self._condition:
+            if scope.view_class == 'curved':
+                self._curved_since_cheap = min(3, self._curved_since_cheap + 1)
+            elif scope.view_class == 'cheap':
+                self._curved_since_cheap = 0
             scope.submitted_order.append(prepared.input_index)
             self.tracker._device_submissions[device] += 1
             self.tracker._slot_submissions[selected] += 1
@@ -776,7 +964,7 @@ class _PoolScheduler:
         event_index = getattr(event, 'worker_index', 0)
         if (int(event.execution_device_id) != device or type(event_index) is not int
                 or event_index != worker_index
-                or self.tracker.workers_per_device == 2 and not hasattr(event, 'worker_index')):
+                or self.tracker.workers_per_device > 1 and not hasattr(event, 'worker_index')):
             raise RuntimeError('SAM worker result changed its admitted device/worker-slot ownership')
         expected_pid = self.tracker._worker_pids.get(slot)
         if expected_pid is not None and (type(event.worker_pid) is not int or event.worker_pid != expected_pid):
@@ -791,7 +979,7 @@ class _PoolScheduler:
         _path, manifest = _read_tracker_manifest(artifact_path, expected_sha256=event.artifact_sha256)
         _validate_completion_manifest(manifest, prepared, device,
             require_cuda=self.tracker._compute_lease_factory is not None,
-            worker_index=worker_index if self.tracker.workers_per_device == 2 else None)
+            worker_index=worker_index if self.tracker.workers_per_device > 1 else None)
         packet = Path(str(manifest['raw_masks']['path'])).resolve(strict=True)
         if packet.parent != prepared.output_directory.resolve(strict=True):
             raise RuntimeError('SAM worker raw packet escaped its assigned scoped staging directory')
@@ -800,7 +988,7 @@ class _PoolScheduler:
             raise RuntimeError('SAM worker raw packet exceeded its admitted packed-mask bytes')
         gray_retired = manifest.get('image_cache_lifetime', {}).get(
             'gray_mapping_retired_after_render') is True
-        del manifest
+        cpu_retired = _cpu_completion_retired(manifest, prepared, slot, event)
         if self._device_active[device] <= 0:
             raise RuntimeError('SAM physical worker-slot activity count underflow')
         # synchronize(0) proves this process context only. A physical lease is
@@ -817,11 +1005,16 @@ class _PoolScheduler:
         with self._condition:
             del self._pending[identity]
             self._device_active[device] -= 1
+            if self._device_active[device] == 0:
+                self._compute_epoch_slots[device].clear()
             scope.running -= 1
             self._free.add(slot)
             if identity not in scope.outstanding or len(scope.completed) >= scope.window:
                 raise RuntimeError('SAM scoped completion exceeded its charged packet window')
             scope.completed.append((prepared, slot, event))
+            if cpu_retired:
+                scope.cpu_retired.add(identity)
+            scope.promote_completions()
             proof = self.tracker._source_cache_retirement_proofs[scope.cache_key]
             proof['all_gray_mappings_retired'] &= gray_retired
             proof['completed_runs'] += 1
@@ -829,6 +1022,7 @@ class _PoolScheduler:
                 time.perf_counter()-validation_started)
             self.tracker.dispatch_stats['completion_acks_pumped'] += 1
             self._condition.notify_all()
+        _record_worker_completion(manifest, prepared)
 
     def _run(self):
         try:
@@ -889,8 +1083,8 @@ class SamInterpolationTracker:
         if not self.device_ids or len(set(self.device_ids)) != len(self.device_ids) or min(self.device_ids) < 0:
             raise ValueError("SAM tracker requires unique nonnegative CUDA devices")
         self.workers_per_device = _integer(workers_per_device, 'workers_per_device')
-        if self.workers_per_device not in (1, 2):
-            raise ValueError('SAM workers_per_device must be one or two isolated predictor processes')
+        if self.workers_per_device not in (1, 2, 3, 4):
+            raise ValueError('SAM workers_per_device must be one to four isolated predictor processes')
         self._configured_worker_slots = tuple((device, index) for device in self.device_ids
             for index in range(self.workers_per_device))
         self.worker_slots = self._configured_worker_slots if progressive_pool is None else ()
@@ -900,13 +1094,13 @@ class SamInterpolationTracker:
         self._active_allocator_fractions = {}
         self.cuda_allocator_fractions = None
         if cuda_allocator_fractions is not None:
-            if self.workers_per_device != 2 or not isinstance(cuda_allocator_fractions, Mapping):
-                raise ValueError('SAM allocator fractions require dual predictor processes')
+            if self.workers_per_device <= 1 or not isinstance(cuda_allocator_fractions, Mapping):
+                raise ValueError('SAM allocator fractions require multiple predictor processes')
             fractions = dict(cuda_allocator_fractions)
             if set(fractions) != {str(device) for device in self.device_ids} or any(
                     isinstance(value, bool) or not isinstance(value, (int, float))
-                    or not math.isfinite(value) or not 0 < value <= .5 for value in fractions.values()):
-                raise ValueError('SAM dual allocator fractions must name every device and be finite in (0, 0.5]')
+                    or not math.isfinite(value) or not 0 < value <= 1/self.workers_per_device for value in fractions.values()):
+                raise ValueError('SAM allocator fractions must name every device and fit its predictor process count')
             self.cuda_allocator_fractions = fractions
         self.artifact_root = Path(artifact_root).resolve(strict=False)
         self.profile = str(profile)
@@ -981,25 +1175,52 @@ class SamInterpolationTracker:
         """Compact ownership counts; running includes worker CPU/packing phases."""
         with self._state_condition:
             scopes = tuple(self._scopes.values())
+            dispatchable = {scope.token: (0 if self._closed or self._cancel.is_set() or scope.closing
+                or scope.deferred and (scope.completed or scope.transfer_held)
+                else min(len(scope.ready), max(0, scope.capacity-scope.running))) for scope in scopes}
             return dict(sample_monotonic_ns=time.monotonic_ns(),
                 active_scopes=len(scopes), credited_scopes=sum(scope.admission is not None for scope in scopes),
                 ready_jobs=sum(len(scope.ready) for scope in scopes),
+                scope_dispatchable_jobs=sum(dispatchable.values()),
+                free_worker_slots=len(self._scheduler._free) if self._scheduler is not None else 0,
+                active_workers_by_device=(dict(self._scheduler._device_active) if self._scheduler is not None
+                    else {device: 0 for device in self.device_ids}),
                 preparing_jobs=sum(scope.preparing for scope in scopes),
                 running_jobs=sum(scope.running for scope in scopes),
                 acked_awaiting_consumer_jobs=sum(len(scope.completed) for scope in scopes),
                 consumer_held_jobs=sum(scope.transfer_held for scope in scopes),
                 scope_consumers=[dict(scope_token=scope.token,
                     parent_scope_id=getattr(getattr(scope.admission, '_profile', None), 'scope_id', None),
+                    view_class=scope.view_class,
                     producer_thread_id=scope.producer_thread_id, held_run_id=scope.held_run_id,
                     held_seconds=max(0., time.perf_counter()-scope.transfer_received_perf_counter)
                         if scope.transfer_held else 0.,
                     capacity=scope.capacity, lookahead=scope.lookahead, window=scope.window,
                     outstanding=len(scope.outstanding), ready=len(scope.ready), running=scope.running,
+                    dispatchable=dispatchable[scope.token],
                     acked=len(scope.completed), held=scope.transfer_held,
+                    independent_preparation=scope.independent_preparation,
+                    preparation_thread_id=scope.preparation_thread_id,
+                    producer_alive=scope.producer is not None and scope.producer.is_alive(),
+                    producer_state=scope.producer_state,
+                    base_input_jobs=scope.base_input_count,
+                    base_input_capacity=scope.capacity+scope.lookahead,
+                    completion_bank_jobs=len(scope.completion_owned),
+                    completion_bank_capacity=scope.completion_capacity,
+                    completion_bank_bytes=int((scope.admission_limits or {}).get('completion_bank_bytes',0)),
+                    completion_fresh_bytes=int((scope.admission_limits or {}).get('completion_fresh_bytes',0)),
+                    completion_wave_loan_bytes=int((scope.admission_limits or {}).get('completion_wave_loan_bytes',0)),
+                    completion_bank_denial_reason=(scope.admission_limits or {}).get('completion_bank_denial_reason'),
+                    fresh_headroom_probe=(scope.admission_limits or {}).get('fresh_headroom_probe'),
+                    missing_cpu_retirement_jobs=sum(
+                        (prepared.task.work_id,prepared.task.attempt_token) not in scope.cpu_retired
+                        for prepared,_slot,_event in scope.completed),
                     source_exhausted=scope.source_exhausted, consumer_stage=scope.consumer_stage)
                     for scope in scopes],
                 live_prepared_bank_bytes=sum(int(scope.admission_limits['prepared_bank_bytes'])
                     for scope in scopes if scope.admission_limits is not None),
+                live_completion_bank_bytes=sum(int((scope.admission_limits or {}).get('completion_bank_bytes',0)) for scope in scopes),
+                live_completion_wave_loan_bytes=sum(int((scope.admission_limits or {}).get('completion_wave_loan_bytes',0)) for scope in scopes),
                 submitted_jobs=int(self.dispatch_stats['submitted']),
                 completed_jobs=int(self.dispatch_stats['completed']),
                 completion_acks=int(self.dispatch_stats['completion_acks_pumped']),
@@ -1087,18 +1308,19 @@ class SamInterpolationTracker:
                             for key in ('allocated_bytes', 'reserved_bytes'))
                         or type(quota.get('cuda_free_bytes')) is not int
                         or not 0 <= quota['cuda_free_bytes'] <= total):
-                    raise RuntimeError('SAM dual startup has no exact enforced allocator-quota/slot proof')
+                    raise RuntimeError('SAM startup has no exact enforced allocator-quota/slot proof')
         if self._compute_lease_factory is not None or progressive:
             for event in ready:
                 proof = event.metadata.get('sam_runtime', {}).get('startup_cuda_quiescence', {})
                 if (proof.get('synchronized') is not True
                         or type(proof.get('worker_local_device')) is not int or proof['worker_local_device'] != 0
-                        or (self.workers_per_device == 2 or progressive) and (
+                        or (self.workers_per_device > 1 or progressive) and (
                             type(proof.get('worker_index')) is not int or proof['worker_index'] != event.worker_index)):
                     raise RuntimeError('SAM startup has no exact worker CUDA-quiescence/slot proof')
         return {slot: event.worker_pid for slot, event in zip(slots, ready)}, tuple(
             dict(execution_device_id=event.execution_device_id, worker_index=event.worker_index,
-                worker_pid=event.worker_pid, sam_runtime=copy.deepcopy(event.metadata.get('sam_runtime', {})))
+                worker_pid=event.worker_pid, sam_runtime=copy.deepcopy(event.metadata.get('sam_runtime', {})),
+                profile=copy.deepcopy(event.metadata.get('profile', {})))
             for event in ready)
 
     def _capture_worker_inventory(self):
@@ -1123,6 +1345,7 @@ class SamInterpolationTracker:
                 feature_cache_bytes=self.feature_cache_bytes,
                 feature_cache_headroom_bytes=self.feature_cache_headroom_bytes,
                 sam_global_cpu_budget=resolve_worker_cpu_budget(self.worker_count),
+                sam_workers_per_device=self.workers_per_device if fractions is not None else 1,
                 **({'cuda_allocator_fractions': fractions} if fractions is not None else {})))
 
     def register_device_pool(self, device_id, pool, *, cuda_allocator_fraction=None, admission_callback=None):
@@ -1134,15 +1357,15 @@ class SamInterpolationTracker:
         if (device not in self.device_ids or count not in {1, self.workers_per_device}
                 or tuple(pool.device_ids) != (device,) or bool(pool.closed) or bool(pool.workers_settled)):
             raise RuntimeError('SAM device cohort differs from configured live slots')
-        if count == 2:
+        if count > 1:
             fraction = cuda_allocator_fraction
             if (isinstance(fraction, bool) or not isinstance(fraction, (int, float))
-                    or not math.isfinite(fraction) or not 0 < fraction <= .5):
-                raise RuntimeError('SAM dual cohort requires a measured allocator fraction')
+                    or not math.isfinite(fraction) or not 0 < fraction <= 1/count):
+                raise RuntimeError('SAM multi-process cohort requires a measured allocator fraction')
             fractions = {str(device): fraction}
         else:
             if cuda_allocator_fraction is not None:
-                raise RuntimeError('SAM single cohort cannot claim a dual allocator quota')
+                raise RuntimeError('SAM single cohort cannot claim a shared allocator quota')
             fractions = {}
         slots = tuple((device, index) for index in range(count))
         pids, receipts = self._validate_worker_inventory(pool.ready_events, slots, fractions, progressive=True)
@@ -1183,8 +1406,8 @@ class SamInterpolationTracker:
         if self._progressive_pool is not None and not self.worker_slots:
             raise RuntimeError('SAM progressive startup has no admitted ready device cohort')
         if self._pool is None:
-            if self.workers_per_device == 2 and self.cuda_allocator_fractions is None:
-                raise RuntimeError('Dual SAM startup requires measured per-process CUDA allocator fractions')
+            if self.workers_per_device > 1 and self.cuda_allocator_fractions is None:
+                raise RuntimeError('Multi-process SAM startup requires measured per-process CUDA allocator fractions')
             self.artifact_root.mkdir(parents=True, exist_ok=True)
             self._residency_released = False
             try:
@@ -1274,6 +1497,7 @@ class SamInterpolationTracker:
     def _prepare_task(
         self, request: Mapping[str, object], *, cache_ref: object,
         input_index: int, staging_directories: set[Path],
+        preparation: object | None = None,
     ) -> _SubmittedRun:
         from .lta_sam import SamInterpolationSessionPlan
         from .lta_workers import LtaWorkerTask
@@ -1305,7 +1529,10 @@ class SamInterpolationTracker:
         from .sam_resources import cpu_session_bytes
         cpu_budget = self.session_cpu_budget_bytes
         resource_profile = request.get("resource_profile")
-        if resource_profile is not None:
+        if preparation is not None:
+            limits = preparation.validate_request(request, input_index)
+            cpu_budget = int(limits['maximum_session_cpu_bytes'])
+        elif resource_profile is not None:
             from .sam_resources import validate_live_sam_resource_profile
             assigned = validate_live_sam_resource_profile(resource_profile)
             cpu_budget = int(assigned["assigned_session_cpu_bytes"])
@@ -1378,7 +1605,7 @@ class SamInterpolationTracker:
                         else 'SAM tracker has been closed')
                 scope = _TrackerScope(uuid.uuid4().hex, cache_ref, key, capacity,
                     lookahead, deferred, admission, limits if admission is not None else None,
-                    family_dispatch)
+                    family_dispatch, getattr(_SAM_VIEW_PRODUCER, 'view_class', None))
                 proof = self._source_cache_retirement_proofs.setdefault(key, dict(
                     complete=False, all_gray_mappings_retired=True, completed_runs=0,
                     active_scopes=0, failed_scopes=0))
@@ -1397,6 +1624,10 @@ class SamInterpolationTracker:
     def _unregister_scope(self, scope, *, complete):
         """Retire only settled source/packet owners, releasing credit afterward."""
         with self._state_condition:
+            if not scope.producer_settled:
+                raise RuntimeError('SAM producer remains active; image/staging/scope owners retained')
+            if scope.producer_error is not None:
+                _clear_producer_error_frames(scope.producer_error)
             if self._scopes.get(scope.token) is not scope:
                 raise RuntimeError('SAM scoped iterator lost its ownership registration')
             proof = self._source_cache_retirement_proofs[scope.cache_key]
@@ -1428,7 +1659,7 @@ class SamInterpolationTracker:
             return
         with self._state_condition:
             abandoned = tuple(scope for scope in self._scopes.values()
-                if scope.abandoned and not scope.preparing)
+                if scope.abandoned and scope.producer_settled)
         for scope in abandoned:
             for directory in tuple(scope.staging_directories):
                 self._remove_staging(directory)
@@ -1441,13 +1672,16 @@ class SamInterpolationTracker:
         defer_refill_until_consumed: bool = False,
         scope_admission: object | None = None,
         _family_dispatch: _FamilyDispatch | None = None,
+        preparation_source: object | None = None,
     ) -> Iterator[tuple[int, SamTrackerRunResult]]:
         """Yield exact scoped completions through the persistent fair scheduler.
 
         Live producer admission funds each scope's CPU wave, one transfer and
-        any additional immutable prepared bank. Preparation/factories/decoding
-        stay on this original thread. While its CPU consumer is paused, the
-        pool owner may dispatch its charged ready bank or another ready scope.
+        any additional immutable input and compact completion banks. Approved
+        finite sources prepare independently while the original owner decodes
+        and publishes ACKs in arrival order. Missing retirement proof or a full
+        completion bank keeps the base input claim and applies backpressure.
+        Other callers retain original-thread factories and preparation.
         An uncredited legacy iterator remains globally exclusive, preserving
         its historical N+1 packet/one transfer ownership rather than inventing
         additional CPU credit. All paths share the same scheduler and proofs.
@@ -1475,6 +1709,32 @@ class SamInterpolationTracker:
         iterator = None
         seen_run_ids = set()
 
+        def start_scheduler():
+            # Only the original owner touches startup/lifecycle state. The
+            # delegated producer never competes with teardown for this lock.
+            with self._pool_lifecycle_lock:
+                self.start()
+                if self._closed or self._cancel.is_set():
+                    raise RuntimeError(self._cancel_reason if self._cancel.is_set()
+                        else 'SAM tracker has been closed')
+                if self._pool is None:
+                    raise RuntimeError('SAM startup did not provide an admitted worker pool')
+                if self._scheduler is None:
+                    with self._state_condition:
+                        self._scheduler = _PoolScheduler(self)
+        source = requests if preparation_source is None else preparation_source
+        from .sam_interpolation import _is_prepared_tracker_source
+        independent = (scope.admission is not None and not scope.deferred
+            and _is_prepared_tracker_source(source, scope.admission)
+            and int(scope.admission_limits.get('completion_bank_jobs', 0))>0
+            and int(scope.admission_limits['producer_scratch_bytes'])
+                <=int(scope.admission_limits['maximum_session_cpu_bytes']))
+        if independent:
+            scope.independent_preparation = True
+            scope.completion_capacity = int(scope.admission_limits['completion_bank_jobs'])
+        else:
+            scope.producer_state = 'synchronous'
+
         def prepare_bank():
             nonlocal next_index, family_lane
             while True:
@@ -1482,8 +1742,17 @@ class SamInterpolationTracker:
                     if self._closed or self._cancel.is_set():
                         raise RuntimeError(self._cancel_reason if self._cancel.is_set()
                             else 'SAM tracker has been closed')
-                    if scope.source_exhausted or scope.work_count >= scope.window:
+                    if scope.closing or scope.source_exhausted:
                         return
+                    occupied = scope.base_input_count if independent else scope.work_count
+                    if occupied >= (scope.capacity+scope.lookahead if independent else scope.window):
+                        if independent:
+                            scope.producer_state = ('completion_bank_full' if len(scope.completion_owned)>=scope.completion_capacity
+                                else 'missing_cpu_retirement' if any(
+                                    (item.task.work_id,item.task.attempt_token) not in scope.cpu_retired
+                                    for item,_slot,_event in scope.completed) else 'base_input_bank_full')
+                        return
+                    scope.producer_state = 'preparing'
                     # This reservation precedes the lazy factory and every
                     # seed/cached-source/NPZ allocation. Its credit was already
                     # acquired on the producing thread at scope registration.
@@ -1505,7 +1774,7 @@ class SamInterpolationTracker:
                         for _ in range(capacity):
                             lane = family_lane % capacity
                             family_lane += 1
-                            chosen = _family_dispatch.next_for((lane,))
+                            chosen = _family_dispatch.next_for((lane,), source if independent else None)
                             if chosen is not None:
                                 break
                         if chosen is None:
@@ -1513,13 +1782,14 @@ class SamInterpolationTracker:
                                 scope.source_exhausted = True
                             return
                         _lane, input_index, family_id, request = chosen
-                    if scope.admission is not None:
+                    if scope.admission is not None and not independent:
                         crop = tuple(request['crop_xyxy'])
                         scope.admission.validate_request(
                             _integer(request['frame_stop'], 'frame_stop')-_integer(request['frame_start'], 'frame_start'),
                             (crop[2]-crop[0])*(crop[3]-crop[1]))
                     prepared = self._prepare_task(request, cache_ref=cache_ref,
-                        input_index=input_index, staging_directories=scope.staging_directories)
+                        input_index=input_index, staging_directories=scope.staging_directories,
+                        preparation=scope.preparation if independent else None)
                     del request
                     if (scope.admission_limits is not None
                             and Path(prepared.task.payload['seed_path']).stat().st_size
@@ -1531,6 +1801,8 @@ class SamInterpolationTracker:
                     seen_run_ids.add(scientific_id)
                     transport_id = f'sam-scope-{scope.token}:{scientific_id}'
                     payload = dict(prepared.task.payload)
+                    payload['work_id'] = transport_id
+                    payload['attempt_token'] = prepared.task.attempt_token
                     if scope.admission_limits is not None:
                         payload['session_cpu_budget_bytes'] = min(
                             payload['session_cpu_budget_bytes'],
@@ -1539,16 +1811,8 @@ class SamInterpolationTracker:
                         kind=prepared.task.kind, payload=payload)
                     prepared = _SubmittedRun(prepared.input_index, task,
                         prepared.output_directory, prepared.affinity_key, family_id)
-                    with self._pool_lifecycle_lock:
-                        self.start()
-                        if self._closed or self._cancel.is_set():
-                            raise RuntimeError(self._cancel_reason if self._cancel.is_set()
-                                else 'SAM tracker has been closed')
-                        if self._pool is None:
-                            raise RuntimeError('SAM startup did not provide an admitted worker pool')
-                        if self._scheduler is None:
-                            with self._state_condition:
-                                self._scheduler = _PoolScheduler(self)
+                    if not independent:
+                        start_scheduler()
                     with self._state_condition:
                         self._scheduler._check()
                         identity = task.work_id, task.attempt_token
@@ -1559,6 +1823,8 @@ class SamInterpolationTracker:
                         scope.outstanding[identity] = prepared
                         scope.ready.append(prepared)
                         next_index += 1
+                        if independent and next_index == len(source.items):
+                            scope.source_exhausted = True
                         if _family_dispatch is not None:
                             self.dispatch_stats['family_assigned'] = _family_dispatch.assigned_families
                             self.dispatch_stats['family_active_peak'] = _family_dispatch.peak_active
@@ -1570,21 +1836,65 @@ class SamInterpolationTracker:
                             self._state_condition.notify_all()
 
         try:
-            iterator = iter(requests)
-            prepare_bank()
+            if independent:
+                if _family_dispatch is not None:
+                    if {index for family in _family_dispatch._inventory for index in family.input_indices} != set(range(len(source.run_ids))):
+                        raise RuntimeError('SAM families omitted the sealed production source inventory')
+                    for family in _family_dispatch._inventory:
+                        if any(index>=len(source.run_ids) or source.run_ids[index] != run_id
+                               for index,run_id in zip(family.input_indices,family.run_ids)):
+                            raise RuntimeError('SAM families changed the sealed production source inventory')
+                start_scheduler()
+                scope.preparation = scope.admission.delegate_prepared_source(source)
+                def produce():
+                    nonlocal iterator
+                    try:
+                        scope.preparation.bind()
+                        scope.preparation_thread_id = threading.get_ident()
+                        iterator = iter(source)
+                        while True:
+                            prepare_bank()
+                            with self._state_condition:
+                                if scope.closing or scope.source_exhausted:
+                                    scope.producer_state = 'source_exhausted' if scope.source_exhausted else 'closing'
+                                    return
+                                self._state_condition.wait(timeout=.05)
+                    except BaseException as error:
+                        _clear_producer_error_frames(error)
+                        with self._state_condition:
+                            scope.producer_error = error
+                            scope.producer_state = 'failed'
+                    finally:
+                        if callable(getattr(iterator, 'close', None)):
+                            iterator.close()
+                        iterator = None
+                        scope.preparation.finish()
+                        with self._state_condition:
+                            self._state_condition.notify_all()
+                scope.producer = threading.Thread(target=produce, name='sam-scope-input-producer', daemon=True)
+                scope.producer.start()
+            else:
+                iterator = iter(requests)
+                prepare_bank()
             while scope.outstanding or not scope.source_exhausted:
                 with self._state_condition:
                     if self._cancel.is_set():
                         raise RuntimeError(self._cancel_reason)
-                prepare_bank()
+                    if scope.producer_error is not None:
+                        raise scope.producer_error
+                if not independent:
+                    prepare_bank()
                 if not scope.outstanding:
+                    if independent:
+                        with self._state_condition:
+                            self._state_condition.wait(timeout=.05)
                     continue
                 started = time.perf_counter()
                 prepared, slot, event = self._scheduler.receive(scope)
                 device, worker_index = slot
                 with self._state_condition:
                     self.dispatch_stats['wait_seconds'] += time.perf_counter()-started
-                if not defer_refill_until_consumed:
+                if not defer_refill_until_consumed and not independent:
                     prepare_bank()
                 artifact_path = Path(event.artifact_path).resolve(strict=True)
                 started = time.perf_counter()
@@ -1594,7 +1904,7 @@ class SamInterpolationTracker:
                 result = load_tracker_run_result(artifact_path, expected_sha256=event.artifact_sha256)
                 _validate_completion_manifest(result.receipt, prepared, device,
                     require_cuda=self._compute_lease_factory is not None,
-                    worker_index=worker_index if self.workers_per_device == 2 else None)
+                    worker_index=worker_index if self.workers_per_device > 1 else None)
                 receipt = dict(result.receipt)
                 receipt['dispatch'] = dict(input_index=prepared.input_index,
                     execution_device_id=device, worker_pid=event.worker_pid,
@@ -1630,6 +1940,9 @@ class SamInterpolationTracker:
                     scope.consumer_stage = None
                     scope.held_run_id = None
                     scope.consumed += 1
+                    scope.completion_owned.discard(identity)
+                    scope.cpu_retired.discard(identity)
+                    scope.promote_completions()
                     self._state_condition.notify_all()
             if self._cancel.is_set():
                 raise RuntimeError(self._cancel_reason)
@@ -1651,6 +1964,13 @@ class SamInterpolationTracker:
             with self._state_condition:
                 scope.closing = True
                 self._state_condition.notify_all()
+            if scope.producer is not None:
+                try:
+                    scope.producer.join(timeout=1.)
+                    if not scope.producer_settled:
+                        raise RuntimeError('SAM input producer remains active; source/credit retained')
+                except BaseException as error:
+                    cleanup_error = error
             if not complete:
                 try:
                     self.cancel('SAM scoped generation failed or its consumer stopped before completion')
@@ -1658,7 +1978,7 @@ class SamInterpolationTracker:
                 except BaseException as error:
                     cleanup_error = error
                 self._closed = True
-            settled = complete or self.workers_settled and self._scheduler is None
+            settled = scope.producer_settled and (complete or self.workers_settled and self._scheduler is None)
             if settled:
                 try:
                     for directory in tuple(scope.staging_directories):
@@ -1693,6 +2013,7 @@ class SamInterpolationTracker:
         source_cache_ref: object | None = None, max_in_flight: int | None = None,
         defer_refill_until_consumed: bool = False, schedule: str = "fifo",
         scope_admission: object | None = None,
+        preparation_source: object | None = None,
         execution_order_callback: Callable[[tuple[int, ...]], object] | None = None,
     ) -> Iterator[tuple[int, SamTrackerRunResult]]:
         """Family-local dispatch, yielding immutable original indices.
@@ -1715,7 +2036,7 @@ class SamInterpolationTracker:
         yield from self.iter_results((), source_cache_ref=source_cache_ref,
             max_in_flight=capacity, defer_refill_until_consumed=defer_refill_until_consumed,
             scope_admission=scope_admission,
-            _family_dispatch=dispatcher)
+            _family_dispatch=dispatcher, preparation_source=preparation_source)
         if execution_order_callback is not None:
             execution_order_callback(tuple(dispatcher.execution_order))
 
@@ -1811,11 +2132,14 @@ def build_interpolation_predictor(config: Mapping[str, object]):
     fraction = None
     if config.get('cuda_allocator_fractions') is not None:
         import torch
+        process_count = _integer(config.get('sam_workers_per_device'), 'sam_workers_per_device')
         fractions = config['cuda_allocator_fractions']
+        if process_count not in (2, 3, 4) or not isinstance(fractions, Mapping):
+            raise ValueError('SAM worker allocator quota requires two to four predictor processes')
         fraction = fractions.get(os.environ.get('LTA_EXECUTION_DEVICE_ID', '0'))
         if (isinstance(fraction, bool) or not isinstance(fraction, (int, float))
-                or not math.isfinite(fraction) or not 0 < fraction <= .5):
-            raise ValueError('SAM worker has no valid dual-process CUDA allocator fraction')
+                or not math.isfinite(fraction) or not 0 < fraction <= 1/process_count):
+            raise ValueError('SAM worker has no valid per-process CUDA allocator fraction')
         torch.cuda.set_per_process_memory_fraction(float(fraction), 0)
         quota_bytes = int(torch.cuda.mem_get_info(0)[1] * fraction)
     context = build_worker_predictor(config)

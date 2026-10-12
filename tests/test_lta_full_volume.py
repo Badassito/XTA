@@ -5,6 +5,7 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -481,13 +482,18 @@ class LtaFullVolumeTests(unittest.TestCase):
         hopper = SimpleNamespace(
             cuda=SimpleNamespace(get_device_capability=lambda _device: (9, 0))
         )
-        profile = self.tool._resolve_profile(hopper, 0, "h100")
-        self.assertFalse(profile["use_fa3"])
+        with mock.patch.dict("os.environ", {"YOLO_TTA_SAM_ATTENTION_BACKEND": "auto"}):
+            profile = self.tool._resolve_profile(hopper, 0, "h100")
+        self.assertTrue(profile["use_fa3"])
         self.assertFalse(profile["use_rope_real"])
         self.assertTrue(profile["sdpa_fallback"])
         self.assertEqual(
-            profile["attention_backend"], "torch_sdpa_flash_efficient_math"
+            profile["attention_backend"], "meta_fa3_fp8_e4m3fn"
         )
+        with mock.patch.dict("os.environ", {"YOLO_TTA_SAM_ATTENTION_BACKEND": "sdpa"}):
+            baseline = self.tool._resolve_profile(hopper, 0, "h100")
+        self.assertFalse(baseline["use_fa3"])
+        self.assertEqual(baseline["weight_storage"], "float32")
 
 
 if __name__ == "__main__":

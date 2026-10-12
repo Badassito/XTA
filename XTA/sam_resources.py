@@ -29,10 +29,58 @@ MIN_PRODUCTION_EXTRA_BYTES = 512*1024**2
 _LIVE_PROFILES = {}
 _LIVE_LOCK = threading.RLock()
 _LIVE_TRACKER_ADMISSIONS = {}
+_LIVE_RETRY_CHILD_REQUESTS = {}
 _TRACKER_ADMISSION_SEAL = object()
 _MASK_PACKING_SEAL = object()
+_RETRY_CHILD_SEAL = object()
 MAX_TRACKER_LOOKAHEAD_BYTES = GIB
 MAX_IMAGE_STAGING_BYTES = 16*GIB
+
+
+def _bounded_parent_protections(pool):
+    """Called under the parent condition; a reduced budget cannot strand waiters."""
+    pending = getattr(pool, '_sam_pending_parent_protections', {})
+    remaining = max(1, int(pool.capacity))
+    for token, amount in tuple(pending.items()):
+        if amount <= remaining:
+            remaining -= amount
+        else:
+            pending.pop(token)
+            pool.condition.notify_all()
+    return pending
+
+
+def register_sam_parent_protection(task, pool, minimum_extra_bytes):
+    """Protect one waiting parent's base and minimum extra, without granting credit."""
+    base = max(1, int(task.transient_bytes))
+    extra = max(0, int(minimum_extra_bytes))
+    with pool.condition:
+        pending = _bounded_parent_protections(pool)
+        token = getattr(task, '_sam_parent_protection_token', None)
+        if token in pending:
+            return token
+        if (extra > MAX_PRODUCTION_EXTRA_BYTES
+                or base+extra > int(pool.capacity)-sum(pending.values())):
+            return None
+        token = uuid.uuid4().hex
+        pending[token] = base+extra
+        pool._sam_pending_parent_protections = pending
+        task._sam_parent_protection_token = token
+        pool.condition.notify_all()
+        return token
+
+
+def release_sam_parent_protection(pool, token):
+    """Release only this registration after rejection, failure or cancellation."""
+    with pool.condition:
+        pending = getattr(pool, '_sam_pending_parent_protections', {})
+        if pending.pop(token, None) is not None:
+            pool.condition.notify_all()
+
+
+def sam_parent_protection_active(pool, token):
+    with pool.condition:
+        return token in _bounded_parent_protections(pool)
 
 
 def sam_parent_promised_bytes(pool):
@@ -114,6 +162,9 @@ class _LiveLease:
     scope_id: str = ''
     admitted_monotonic: float = 0.
     oversize_requested_bytes: int = 0
+    cancel_event: object = field(default=None, repr=False)
+    borrowed_parent_lease: object = field(default=None, repr=False)
+    retry_child_factory: object = field(default=None, repr=False)
 
 
 def _trace_parent_memory(event, **fields):
@@ -132,6 +183,17 @@ def _return_parent_credit_if_settled(lease):
             lease.pool.oversize_requested_bytes = 0
         lease.credit_returned = True
         lease.pool.condition.notify_all()
+        parent, request = lease.borrowed_parent_lease, lease.retry_child_factory
+        lease.borrowed_parent_lease = lease.retry_child_factory = None
+        if request is not None:
+            request._finished = True
+            request._parent_hold_pending = False
+            with _LIVE_LOCK:
+                if _LIVE_RETRY_CHILD_REQUESTS.get(request._identity) is request:
+                    _LIVE_RETRY_CHILD_REQUESTS.pop(request._identity)
+        if parent is not None:
+            parent.scope_holds -= 1
+            _return_parent_credit_if_settled(parent)
         event = ('sam_image_memory_credit_returned' if hasattr(lease.pool, '_sam_parent_pool')
                  else 'sam_parent_memory_credit_returned')
         _trace_parent_memory(event, scope_id=lease.scope_id,
@@ -152,6 +214,21 @@ def _scope_integer(value, name, *, positive=False):
     if parsed < int(bool(positive)):
         raise ValueError(f'{name} must be {"positive" if positive else "nonnegative"}')
     return parsed
+
+
+def _sam_evidence_residual_bytes(unused_wave, fixed, contract, plane):
+    """One proof for disjoint packing scratch and compact completion rights."""
+    if contract is None or plane is None:
+        return 0
+    return max(0,int(unused_wave)-int(fixed)-max(16*int(plane),int(contract)))
+
+
+def _live_retry_child_lease(lease):
+    request = lease.retry_child_factory
+    with _LIVE_LOCK:
+        return (request is not None and _LIVE_RETRY_CHILD_REQUESTS.get(request._identity) is request
+                and request._lease is lease and request._started and not request._parent_hold_pending
+                and lease.borrowed_parent_lease is request._parent._lease and not lease.credit_returned)
 
 
 class SamTrackerScopeAdmission:
@@ -175,6 +252,7 @@ class SamTrackerScopeAdmission:
         self._scope_used = False
         self._returned = False
         self._packing_admissions = set()
+        self._preparation = None
 
     @property
     def lookahead_jobs(self):
@@ -226,6 +304,9 @@ class SamTrackerScopeAdmission:
 
     def release_scope(self):
         """Scheduler calls only after producer, SDK and transfer owners settle."""
+        with self._lock:
+            if self._preparation is not None and not self._preparation.settled:
+                raise RuntimeError('SAM input producer is still active; scope/source credit retained')
         for packing in tuple(self._packing_admissions):
             packing.close()
         with self._lock:
@@ -272,6 +353,16 @@ class SamTrackerScopeAdmission:
             self._packing_admissions.add(packing)
             return packing
 
+    def delegate_prepared_source(self, source):
+        """Delegate bounded seed creation, never the parent profile permission."""
+        from .sam_interpolation import _is_prepared_tracker_source
+        with self._lock:
+            self._validate_producer()
+            if self._preparation is not None or not _is_prepared_tracker_source(source, self):
+                raise RuntimeError('SAM preparation requires one sealed finite production source')
+            self._preparation = _SamTrackerPreparation(self, source)
+            return self._preparation
+
     def __enter__(self):
         with self._lock:
             self._validate_producer()
@@ -279,6 +370,53 @@ class SamTrackerScopeAdmission:
 
     def __exit__(self, *exc):
         self.close()
+
+
+class _SamTrackerPreparation:
+    """One source-bound thread may spend the scope's existing input envelopes."""
+
+    def __init__(self, scope, source):
+        self._scope, self.source = scope, source
+        self._thread_id = None
+        self.settled = False
+
+    def bind(self):
+        with self._scope._lock:
+            if self._thread_id is not None or self.settled:
+                raise RuntimeError('SAM preparation delegation cannot be replayed')
+            self._thread_id = threading.get_ident()
+            self._validate()
+
+    def _validate(self):
+        scope = self._scope
+        scope._require_minted()
+        if (self.settled or self._thread_id != threading.get_ident()
+                or scope._preparation is not self
+                or not scope._creator_active or not scope._scope_active
+                or not scope._profile._lease.active
+                or scope._profile._lease.tracker_scope_identity != scope._identity):
+            raise RuntimeError('SAM delegated input preparation has expired or changed thread')
+
+    def validate_request(self, request, input_index):
+        with self._scope._lock:
+            self._validate()
+            self.source.validate_request(request, input_index)
+            crop = tuple(request['crop_xyxy'])
+            frames, pixels = int(request['frame_stop'])-int(request['frame_start']), (crop[2]-crop[0])*(crop[3]-crop[1])
+            limits = self._scope._limits
+            if (frames > limits['maximum_frame_count'] or pixels > limits['maximum_seed_pixels']
+                    or frames*pixels > limits['maximum_raw_mask_bytes']
+                    or cpu_session_bytes(frames, pixels)['estimated_peak_bytes'] > limits['maximum_session_cpu_bytes']):
+                raise RuntimeError('SAM delegated request exceeds its original attempt admission')
+            if request.get('resource_profile') is not self._scope._profile:
+                raise RuntimeError('SAM delegated source changed its original parent profile')
+            return limits
+
+    def finish(self):
+        with self._scope._lock:
+            if self._thread_id != threading.get_ident():
+                raise RuntimeError('SAM preparation can settle only on its own producer')
+            self.settled = True
 
 
 class SamMaskPackingAdmission:
@@ -314,8 +452,10 @@ class SamMaskPackingAdmission:
             return 0  # An unproven live contract cannot authorize helper scratch.
         # Protect the serial writer's full plane allowance and persistent
         # assembly, in addition to the complete original SDK/raw peak.
-        return max(0, int(limits['unused_attempt_wave_bytes'])
-            -int(limits['evidence_fixed_bytes'])-max(16*plane, int(contract)))
+        protected_plane = max(plane,int(limits.get('maximum_evidence_plane_pixels') or 0))
+        return max(0,_sam_evidence_residual_bytes(limits['unused_attempt_wave_bytes'],
+            limits['evidence_fixed_bytes'],contract,protected_plane)
+            -int(limits.get('completion_wave_loan_bytes',0)))
 
     def cpu_worker_limit(self):
         self.validate()
@@ -399,7 +539,8 @@ def sam_cache_descriptor_bytes(cache_ref):
 
 def admit_sam_tracker_scope(profile, cpu_wave_admission, *, max_seed_pixels, max_frame_count,
                             max_in_flight=None, cache_payload_bytes=None,
-                            evidence_persistent_bytes=0, evidence_contract_bytes=None):
+                            evidence_persistent_bytes=0, evidence_contract_bytes=None, job_count=None,
+                            max_evidence_plane_pixels=None):
     """Try an additional bounded prepared bank; never wait behind the parent.
 
     A funded base wave remains concurrent when the extra bank cannot be funded.
@@ -410,6 +551,7 @@ def admit_sam_tracker_scope(profile, cpu_wave_admission, *, max_seed_pixels, max
     record = validate_live_sam_resource_profile(profile)
     wave = dict(cpu_wave_admission)
     capacity = _scope_integer(wave['max_in_flight'], 'SAM admitted SDK slots', positive=True)
+    known_jobs = None if job_count is None else _scope_integer(job_count, 'SAM approved job count', positive=True)
     wave_slots = _scope_integer(wave.get('execution_slots', capacity), 'SAM wave execution slots', positive=True)
     if max_in_flight is not None:
         capacity = min(capacity, _scope_integer(max_in_flight, 'SAM requested SDK slots', positive=True))
@@ -425,6 +567,8 @@ def admit_sam_tracker_scope(profile, cpu_wave_admission, *, max_seed_pixels, max
     evidence_persistent = _scope_integer(evidence_persistent_bytes, 'SAM persistent evidence bytes')
     evidence_contract = (None if evidence_contract_bytes is None else
         _scope_integer(evidence_contract_bytes, 'SAM live evidence contract bytes'))
+    group_plane = (None if max_evidence_plane_pixels is None else
+        _scope_integer(max_evidence_plane_pixels,'SAM largest evidence group plane',positive=True))
     deferred = wave['defer_refill_until_consumed']
     if not isinstance(deferred, bool):
         raise ValueError('SAM transfer deferral must be boolean')
@@ -437,34 +581,74 @@ def admit_sam_tracker_scope(profile, cpu_wave_admission, *, max_seed_pixels, max
     # Deflate/ZIP overhead is conservatively bounded above uncompressed bytes.
     # Frame vectors contain int64 indices/float64 scores/bool status: 17 bytes.
     seed_npz = 2*pixels+64*1024
-    packed_npz = 2*(frames*((pixels+7)//8)+17*frames+16)+64*1024
+    # Per-job F*P is already bounded by raw. Independent max(F)/max(P) may
+    # belong to different jobs; allow one padding byte per actual frame.
+    packed_npz = 2*((raw+7)//8+frames+17*frames+16)+64*1024
     manifest = 256*1024+1024*frames
     # One foreground seed creator/compressor can own temporary crop buffers.
     # Charging that scratch for every extra slot is conservative and explicit.
     per_job = 2*pixels+32*1024**2+seed_npz+packed_npz+manifest+descriptor_bytes
+    # A completed packet retains its seed and transport descriptors too. JSON
+    # inflation and ACK/attempt bookkeeping are paid independently of 3*raw.
+    compact_job = seed_npz+packed_npz+8*manifest+descriptor_bytes+64*1024
     lease, pool = profile._lease, profile._lease.pool
     identity = uuid.uuid4().hex
+    # Sampling host/cgroup headroom may involve procfs I/O. It does not own the
+    # ledger lock; all current promises and owner proofs are checked below.
     with pool.condition:
         profile._validate_owner()
         if lease.tracker_scope_identity is not None:
             raise RuntimeError('SAM parent base-wave credit already belongs to an unsettled tracker scope')
+        probe_needed = int(pool.capacity)-int(pool.in_use)-sum(_bounded_parent_protections(pool).values())>0
+    physical = 0
+    probe_status = 'skipped_full_ledger'
+    if probe_needed:
         try:
             physical = max(0, int(lease.headroom_probe()))
+            probe_status = 'measured'
         except Exception:
-            physical = 0  # Unproven extra headroom keeps the formerly admitted path.
+            probe_status = 'failed'
+    with pool.condition:
         profile._validate_owner()
-        free_pool = max(0, int(pool.capacity)-int(pool.in_use))
+        if lease.tracker_scope_identity is not None:
+            raise RuntimeError('SAM parent base-wave credit already belongs to an unsettled tracker scope')
+        free_pool = max(0, int(pool.capacity)-int(pool.in_use)
+                        -sum(_bounded_parent_protections(pool).values()))
         free_ram = max(0, physical-sam_parent_promised_bytes(pool)
                        -max(0, profile.base_requested_bytes-profile.base_charged_bytes))
         available = min(MAX_TRACKER_LOOKAHEAD_BYTES, free_pool, free_ram)
-        lookahead = min(capacity, available//per_job) if not deferred else 0
-        charged = lookahead*per_job
+        additional_jobs = capacity if known_jobs is None else max(0, known_jobs-capacity)
+        residual = (_sam_evidence_residual_bytes(owned-attempt_peak,
+            32*1024**2+evidence_persistent,evidence_contract,group_plane)
+            if not deferred and known_jobs is not None else 0)
+        completion_jobs = (min(additional_jobs, min(MAX_TRACKER_LOOKAHEAD_BYTES,available+residual)//compact_job)
+            if not deferred and known_jobs is not None else 0)
+        completion_bytes = completion_jobs*compact_job
+        fresh_completion = min(completion_bytes,available)
+        completion_loan = completion_bytes-fresh_completion
+        lookahead = min(capacity,max(0,additional_jobs-completion_jobs),
+            min(available-fresh_completion,MAX_TRACKER_LOOKAHEAD_BYTES-completion_bytes)//per_job) if not deferred else 0
+        charged = lookahead*per_job+fresh_completion
+        denial = None
+        if not completion_jobs:
+            denial = ('exclusive_transfer_barrier' if deferred else
+                'unsealed_inventory' if known_jobs is None else
+                'inventory_fits_base' if not additional_jobs else
+                'unproven_group_plane' if group_plane is None and not available else
+                'unproven_evidence_contract' if evidence_contract is None and not available else
+                'insufficient_compact_bank_bytes')
         pool.in_use += charged
         lease.scope_holds += 1  # Creator lifetime; a scheduler hold is separate.
         lease.tracker_scope_identity = identity
     try:
         limits = dict(schema='xta.sam_tracker_scope_admission/1', lease_id=lease.lease_id,
             max_in_flight=capacity, lookahead_jobs=lookahead, prepared_bank_bytes=charged,
+            completion_bank_jobs=completion_jobs, completion_bank_bytes=completion_bytes,
+            completion_fresh_bytes=fresh_completion, completion_wave_loan_bytes=completion_loan,
+            completion_bank_denial_reason=denial, fresh_headroom_probe=probe_status,
+            fresh_headroom_sample_bytes=physical if probe_status=='measured' else None,
+            per_completion_job_bytes=compact_job,
+            producer_scratch_bytes=2*pixels+32*1024**2,
             per_prepared_job_bytes=per_job, maximum_seed_npz_bytes=seed_npz,
             maximum_packed_packet_bytes=packed_npz, maximum_manifest_bytes=manifest,
             maximum_cache_payload_bytes=descriptor_bytes, maximum_seed_pixels=pixels,
@@ -474,7 +658,9 @@ def admit_sam_tracker_scope(profile, cpu_wave_admission, *, max_seed_pixels, max
             unused_attempt_wave_bytes=owned-attempt_peak,
             evidence_fixed_bytes=32*1024**2+evidence_persistent,
             evidence_contract_bytes=evidence_contract,
+            maximum_evidence_plane_pixels=group_plane,
             defer_refill_until_consumed=deferred,
+            retry_group_affine=_live_retry_child_lease(lease),
             raw_consumer_margin_is_not_prepared_bank_credit=True)
         admission = SamTrackerScopeAdmission(profile, limits, _seal=_TRACKER_ADMISSION_SEAL,
                                              _identity=identity)
@@ -529,10 +715,28 @@ def admit_sam_prepared_scope(profile, prepared, cache_ref, *, max_in_flight=None
                 contract_bytes = None
         except ValueError:
             contract_bytes = None
+    group_plane = None
+    from .sam_interpolation import SamPreparedInterpolationPass
+    from .sam_bridge_planning import SamBridgePlan, SamBridgeGroup
+    from .sam_extrapolation_planning import SamExtrapolationGroup
+    if isinstance(prepared,SamPreparedInterpolationPass) and isinstance(prepared.plan,(SamBridgePlan,SamExtrapolationPlan)):
+        maximum_group_plane = 0
+        for group in prepared.groups:
+            if not isinstance(group,(SamBridgeGroup,SamExtrapolationGroup)):
+                break
+            try:
+                y0,x0,y1,x1 = (_scope_integer(value,'SAM evidence group coordinate') for value in group.context_bbox_yx)
+            except (ValueError,TypeError):
+                break
+            if y1<=y0 or x1<=x0:
+                break
+            maximum_group_plane = max(maximum_group_plane,(y1-y0)*(x1-x0))
+        else:
+            group_plane = maximum_group_plane
     admission = admit_sam_tracker_scope(profile, wave, max_seed_pixels=max_pixels,
         max_frame_count=max_frames, max_in_flight=max_in_flight, cache_payload_bytes=descriptor_bytes,
         evidence_persistent_bytes=int(getattr(prepared, 'tiled_assembly_bytes', 0)),
-        evidence_contract_bytes=contract_bytes)
+        evidence_contract_bytes=contract_bytes, job_count=len(work),max_evidence_plane_pixels=group_plane)
     with admission:
         yield admission
 
@@ -662,6 +866,226 @@ def validate_live_sam_resource_profile(profile, *, require_extra=False):
     return profile.metadata()
 
 
+class _RetryChildResources:
+    """One fresh retry-group grant; its issued callback already retains the parent."""
+
+    def __init__(self, parent, scope_id, expected, *, _seal=None):
+        if _seal is not _RETRY_CHILD_SEAL:
+            raise TypeError('SAM retry child resources require an original-owner factory')
+        self._parent, self._pool = parent, parent._lease.pool
+        self._scope_id, self._identity = str(scope_id), uuid.uuid4().hex
+        self._expected = MappingProxyType(dict(expected))
+        self._base = min(parent.base_charged_bytes, parent.base_allowance_bytes)
+        self._extra = parent.reserved_extra_bytes
+        self._started = self._cancelled = self._finished = False
+        self._decline_reason = None
+        self._parent_hold_pending = True
+        self._lease = None
+
+    @property
+    def started(self):
+        with self._pool.condition:
+            return self._started
+
+    @property
+    def activated(self):
+        with self._pool.condition:
+            return self._lease is not None
+
+    @property
+    def cancelled(self):
+        with self._pool.condition:
+            return self._cancelled
+
+    @property
+    def decline_reason(self):
+        with self._pool.condition:
+            return self._decline_reason
+
+    @property
+    def settled(self):
+        with self._pool.condition:
+            return (self._lease.credit_returned if self._lease is not None else
+                    self._finished and not self._parent_hold_pending)
+
+    def done(self):
+        return self.settled
+
+    def _require_minted(self):
+        with _LIVE_LOCK:
+            if _LIVE_RETRY_CHILD_REQUESTS.get(self._identity) is not self:
+                raise RuntimeError('SAM retry child factory expired or was not minted')
+
+    def _require_parent(self):
+        parent = self._parent
+        with _LIVE_LOCK:
+            valid = _LIVE_PROFILES.get(parent._lease.lease_id) is parent
+        if not valid or not parent._lease.active:
+            raise RuntimeError('SAM retry child source parent has expired')
+
+    def _finish_pending(self):
+        # Caller holds the shared condition; no child has taken this borrow hold.
+        if not self._parent_hold_pending:
+            return
+        self._parent_hold_pending = False
+        self._finished = True
+        with _LIVE_LOCK:
+            if _LIVE_RETRY_CHILD_REQUESTS.get(self._identity) is self:
+                _LIVE_RETRY_CHILD_REQUESTS.pop(self._identity)
+        self._parent._lease.scope_holds -= 1
+        _return_parent_credit_if_settled(self._parent._lease)
+        self._pool.condition.notify_all()
+
+    def cancel_if_unstarted(self):
+        """Revoke an issued callback atomically, including an unknown submit outcome."""
+        with self._pool.condition:
+            if self._cancelled:
+                return True
+            if self._finished:
+                return False
+            self._require_minted()
+            if self._started:
+                return False
+            self._cancelled = True
+            self._decline_reason = 'cancelled_before_start'
+            self._finish_pending()
+            return True
+
+    def _capacity_reason(self):
+        pool = self._pool
+        if self._base <= 0:
+            return 'unidentified_fixed_allowance'
+        if getattr(pool, 'oversize_requested_bytes', 0):
+            return 'parent_emergency'
+        protected = sum(_bounded_parent_protections(pool).values())
+        if self._base+self._extra > max(0, int(pool.capacity)-int(pool.in_use)-protected):
+            return 'parent_capacity_or_protection'
+        return None
+
+    def _try_charge(self, physical):
+        pool, parent = self._pool, self._parent
+        self._require_parent()
+        reason = self._capacity_reason()
+        other = sam_parent_promised_bytes(pool)
+        if reason is None and physical < other+self._base+2*self._extra:
+            reason = 'physical_headroom'
+        if reason is not None:
+            return None, reason
+        lease = _LiveLease(uuid.uuid4().hex, threading.get_ident(), pool=pool,
+            charged_bytes=self._base+self._extra, headroom_probe=parent._lease.headroom_probe,
+            execution_slots=parent.execution_slots, scope_id=self._scope_id,
+            admitted_monotonic=time.monotonic(), cancel_event=parent._lease.cancel_event)
+        profile = SamResourceProfile(self._scope_id, self._base, self._base, self._extra,
+            int(pool.capacity), physical, parent.worker_count, parent.base_allowance_bytes, other, lease)
+        pool.in_use += lease.charged_bytes
+        try:
+            with _LIVE_LOCK:
+                _LIVE_PROFILES[lease.lease_id] = profile
+            if profile.metadata()['effective_budgets'] != dict(self._expected):
+                return None, 'effective_budget_mismatch'
+            lease.borrowed_parent_lease = parent._lease
+            lease.retry_child_factory = self
+            self._lease = lease
+            self._parent_hold_pending = False
+            return profile, None
+        finally:
+            if self._lease is not lease:
+                with _LIVE_LOCK:
+                    _LIVE_PROFILES.pop(lease.lease_id, None)
+                pool.in_use -= lease.charged_bytes
+                lease.active = False
+                lease.owner_closed = lease.credit_returned = True
+                lease.borrowed_parent_lease = lease.retry_child_factory = None
+                pool.condition.notify_all()
+
+    def __call__(self):
+        return self._claim()
+
+    @contextmanager
+    def _claim(self):
+        accepted, profile, reason = False, None, None
+        try:
+            with self._pool.condition:
+                # A revoked queued callback must decline before consulting its source.
+                if self._cancelled:
+                    revoked = True
+                else:
+                    revoked = False
+                    self._require_minted()
+                    if self._started:
+                        raise RuntimeError('SAM retry child factory is one-shot')
+                    self._started = accepted = True
+                    self._require_parent()
+                    cancel = self._parent._lease.cancel_event
+                    if cancel is not None and cancel.is_set():
+                        self._cancelled = True
+                        reason = 'cancelled'
+                    else:
+                        reason = self._capacity_reason()
+            if not revoked and reason is None:
+                try:
+                    physical = max(0, int(self._parent._lease.headroom_probe()))
+                except Exception:
+                    physical = 0
+                with self._pool.condition:
+                    self._require_parent()
+                    cancel = self._parent._lease.cancel_event
+                    if cancel is not None and cancel.is_set():
+                        self._cancelled = True
+                        reason = 'cancelled'
+                    else:
+                        profile, reason = self._try_charge(physical)
+            if profile is None:
+                if accepted:
+                    with self._pool.condition:
+                        self._decline_reason = reason
+                        self._finish_pending()
+                    _trace_parent_memory('sam_retry_child_memory_declined', scope_id=self._scope_id,
+                        parent_lease_id=self._parent._lease.lease_id, reason=reason)
+                yield None
+                return
+            _trace_parent_memory('sam_retry_child_memory_admitted', scope_id=self._scope_id,
+                lease_id=profile._lease.lease_id, parent_lease_id=self._parent._lease.lease_id,
+                charged_bytes=profile._lease.charged_bytes)
+            yield profile
+        finally:
+            if accepted:
+                with self._pool.condition:
+                    if self._lease is None:
+                        self._finish_pending()
+                    else:
+                        lease = self._lease
+                        lease.active = False
+                        lease.owner_closed = True
+                        with _LIVE_LOCK:
+                            _LIVE_PROFILES.pop(lease.lease_id, None)
+                        _return_parent_credit_if_settled(lease)
+
+
+def prepare_retry_child_resources(parent_profile, child_scope_id):
+    """Original owner issues one callback; fresh child credit never waits behind it."""
+    expected = validate_live_sam_resource_profile(parent_profile)['effective_budgets']
+    pool = parent_profile._lease.pool
+    with pool.condition:
+        parent_profile._validate_owner()
+        if parent_profile._lease.borrowed_parent_lease is not None:
+            raise RuntimeError('SAM retry child factories cannot create nested child grants')
+        request = _RetryChildResources(parent_profile, child_scope_id, expected, _seal=_RETRY_CHILD_SEAL)
+        parent_profile._lease.scope_holds += 1
+        try:
+            with _LIVE_LOCK:
+                _LIVE_RETRY_CHILD_REQUESTS[request._identity] = request
+        except BaseException:
+            with _LIVE_LOCK:
+                if _LIVE_RETRY_CHILD_REQUESTS.get(request._identity) is request:
+                    _LIVE_RETRY_CHILD_REQUESTS.pop(request._identity)
+            parent_profile._lease.scope_holds -= 1
+            request._parent_hold_pending = False
+            request._finished = True
+            raise
+        return request
+
+
 def sam_worker_count(owner, *, legacy=False):
     """Actual session slots; uncredited callers retain the physical-device wave."""
     physical = max(1, len(getattr(owner, 'device_ids', ())))
@@ -730,20 +1154,22 @@ def cpu_wave_admission(max_session_bytes, max_raw_mask_bytes, owned_wave_bytes, 
 @contextmanager
 def admit_sam_parent_resources(pool, base_bytes, scope_id, *, worker_count=1,
                                base_allowance_bytes=0, headroom_probe=None, execution_slots=None,
-                               cancel_event=None):
+                               cancel_event=None, protection_token=None):
     """Resolve late and reserve base+SAM credit in one atomic acquisition.
 
     The emergency base lane retains its legacy behavior and never grants extra
     credit. Waiting owns no part of this reservation, so no nested lease can
     wait behind itself. Other promised pool credits are conservatively deducted
     from physical headroom even if some are already reflected in RSS.
+    Pending parent protection limits accounting capacity and is consumed only
+    by its own grant; the submitting queue releases registrations that fail.
     """
     base = max(1, int(base_bytes))
     workers = max(1, int(worker_count))
     slots = workers if execution_slots is None else _scope_integer(
         execution_slots, 'SAM execution slots', positive=True)
-    if not workers <= slots <= 2*workers:
-        raise ValueError('SAM execution slots must represent one or two sessions per physical GPU')
+    if not workers <= slots <= 4*workers:
+        raise ValueError('SAM execution slots must represent one to four sessions per physical GPU')
     probe = headroom_probe or physical_sam_headroom
     minimum_extra = max(MIN_PRODUCTION_EXTRA_BYTES, workers*2*GIB)
     requested_at, wait_seconds, wait_count = time.monotonic(), 0., 0
@@ -756,8 +1182,12 @@ def admit_sam_parent_resources(pool, base_bytes, scope_id, *, worker_count=1,
             if cancel_event is not None and cancel_event.is_set():
                 raise CancelledError('SAM parent resource admission cancelled')
             capacity = max(1, int(pool.capacity))
+            pending = _bounded_parent_protections(pool)
+            protected = sum(amount for token, amount in pending.items()
+                            if token != protection_token)
             base_charge = min(base, capacity)
-            if (int(pool.in_use) > 0 and int(pool.in_use)+base_charge > capacity
+            if (protected > 0 and int(pool.in_use)+base_charge > capacity-protected
+                    or int(pool.in_use) > 0 and int(pool.in_use)+base_charge > capacity
                     or base > capacity and sam_parent_promised_bytes(pool) > 0):
                 waiting_at = time.monotonic()
                 pool.condition.wait(timeout=.1 if cancel_event is not None else None)
@@ -766,7 +1196,7 @@ def admit_sam_parent_resources(pool, base_bytes, scope_id, *, worker_count=1,
                 continue
             physical = max(0, int(probe()))
             other_promised = sam_parent_promised_bytes(pool)
-            free_pool = max(0, capacity-int(pool.in_use)-base_charge)
+            free_pool = max(0, capacity-int(pool.in_use)-base_charge-protected)
             unpromised_ram = max(0, physical-base-other_promised)
             fixed_allowance = min(base_charge, max(0, int(base_allowance_bytes)))
             nominal_cpu_wave = max(0, min(fixed_allowance, 4*GIB)-2*GIB)
@@ -780,7 +1210,7 @@ def admit_sam_parent_resources(pool, base_bytes, scope_id, *, worker_count=1,
                              and base+minimum_extra <= capacity
                              and max(0, physical-base)//2 >= minimum_extra
                              and (free_pool < minimum_extra or unpromised_ram//2 < minimum_extra))
-            if other_promised > 0 and (base_blocked or extra_blocked):
+            if (other_promised > 0 or protected > 0) and (base_blocked or extra_blocked):
                 waiting_at = time.monotonic()
                 pool.condition.wait(timeout=.1 if cancel_event is not None else None)
                 wait_seconds += time.monotonic()-waiting_at
@@ -797,14 +1227,16 @@ def admit_sam_parent_resources(pool, base_bytes, scope_id, *, worker_count=1,
             raise CancelledError('SAM parent resource admission cancelled')
         charged = base_charge+extra
         other_promised = sam_parent_promised_bytes(pool)
+        pending.pop(protection_token, None)
         pool.in_use += charged
+        pool.condition.notify_all()
         oversize_requested = base if base > capacity else 0
         if oversize_requested:
             pool.oversize_requested_bytes = oversize_requested
         lease = _LiveLease(uuid.uuid4().hex, threading.get_ident(), pool=pool,
                            charged_bytes=charged, headroom_probe=probe, execution_slots=slots,
                            scope_id=str(scope_id), admitted_monotonic=time.monotonic(),
-                           oversize_requested_bytes=oversize_requested)
+                           oversize_requested_bytes=oversize_requested, cancel_event=cancel_event)
         profile = SamResourceProfile(str(scope_id), base, base_charge, extra, capacity, physical,
                                      workers, max(0, int(base_allowance_bytes)), other_promised, lease)
         with _LIVE_LOCK:
@@ -848,7 +1280,9 @@ __all__ = ['SCHEMA', 'IMPLEMENTATION_SHA256', 'SamResourceProfile',
            'sam_parent_promised_bytes', 'sam_image_staging_snapshot',
            'physical_sam_headroom', 'validate_live_sam_resource_profile',
            'estimate_sam_session_cpu_bytes', 'cpu_session_bytes', 'cpu_wave_admission',
-           'admit_sam_parent_resources', 'run_admitted_sam_call',
+           'admit_sam_parent_resources', 'run_admitted_sam_call', 'prepare_retry_child_resources',
+           'register_sam_parent_protection', 'release_sam_parent_protection',
+           'sam_parent_protection_active',
            'SamTrackerScopeAdmission', 'admit_sam_tracker_scope',
            'validate_sam_tracker_scope_admission', 'admit_sam_prepared_scope',
            'sam_cache_descriptor_bytes', 'sam_worker_count']

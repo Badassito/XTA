@@ -165,5 +165,55 @@ def sam_native_transform_record(view, canvas_shape_tyx, source_shape_tyx,
     return record
 
 
+def sam_gray_cache_geometry_record(view, canvas_shape_tyx, source_shape_tyx,
+                                   *, source_processing_shape_tyx=None):
+    """Bind captured pixels to physical geometry shared by canonical SAM views."""
+    record = sam_native_transform_record(view, canvas_shape_tyx, source_shape_tyx,
+        source_processing_shape_tyx=source_processing_shape_tyx)
+    for name in ('runtime_view_name', 'detector_augmentation_angle_deg'):
+        record.pop(name, None)
+    return record
+
+
+def sam_gray_capture_spec(view, job, channel_format, *, source_identity,
+                          source_shape_tyx, source_processing_shape_tyx,
+                          source_resize_semantics):
+    """Capture only angle-zero full canvases in the accumulated SAM coordinates."""
+    import numpy as np
+    from .geometry import AugJob, output_to_view_processing_affine, view_processing_volume_shape
+    from .workspace import _env_flag
+    if not _env_flag('YOLO_TTA_SAM_GRAY_CACHE', True):
+        return None
+    if (not isinstance(job, AugJob) or str(view.family) not in
+            {'spherical', 'radial', 'azimuthal', 'tilted'}
+            or float(job.angle_deg) != 0.0 or float(view.tta_angle_deg) != 0.0
+            or int(getattr(view, 'augmentation_pass', 0)) != 0):
+        return None
+    out_size = int(job.aff.out_size)
+    shape = tuple(view_processing_volume_shape(view, out_size))
+    matrix = np.asarray(output_to_view_processing_affine(
+        view, job.aff.M_out_to_src, out_size), dtype=np.float64)
+    identity = np.array([[1., 0., 0.], [0., 1., 0.]])
+    if (shape != (int(view.num_slices), out_size, out_size)
+            or matrix.shape != identity.shape or not np.isfinite(matrix).all()
+            or not np.allclose(matrix, identity, rtol=0., atol=1e-6)):
+        return None
+    offsets = tuple(int(value) for value in channel_format.offsets)
+    if 0 not in offsets:
+        return None
+    return dict(source_identity=str(source_identity),
+        source_resize_semantics=str(source_resize_semantics),
+        physical_view_record=sam_gray_cache_geometry_record(view, shape, source_shape_tyx,
+            source_processing_shape_tyx=source_processing_shape_tyx),
+        native_centers=list(range(shape[0])), processing_shape=list(source_processing_shape_tyx),
+        canvas_shape=list(shape), output_to_processing_affine=identity.tolist(),
+        capture_contract=dict(contract='xta.cuda_yolo_center_gray8/1',
+            backend='cuda_normalized_yolo', channel_token=str(channel_format.token),
+            channel_offsets=list(offsets), channel_index=offsets.index(0),
+            input_dtype='float16_or_float32', output_dtype='uint8',
+            conversion='float32_clamp_0_1_multiply_255_round_to_nearest_even'))
+
+
 __all__ = ("SAM_VIEW_GEOMETRY_CONTRACT", "SAM_TTA_VIEW_FAMILIES",
-           "validate_sam_view_geometry", "sam_native_transform_record")
+           "validate_sam_view_geometry", "sam_native_transform_record",
+           "sam_gray_cache_geometry_record", "sam_gray_capture_spec")

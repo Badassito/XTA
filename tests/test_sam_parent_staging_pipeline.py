@@ -29,6 +29,8 @@ def submission(tmp_path, *, ready=False, staged=True, dispatch_error=False):
     executor=mock.Mock()
     future=Future()
     executor.submit.return_value=future
+    if stager is not None:
+        stager.enqueue_ready.return_value=future
     dispatch=mock.Mock(side_effect=RuntimeError('injected dispatch failure') if dispatch_error else None)
     namespace=dict(vars(pipeline))
     namespace.update(view_processing_submitted=set(),d1_view_shadow_path_by_parent={},
@@ -94,13 +96,31 @@ def test_dispatch_failure_after_staging_cannot_restore_or_roll_back_owned_input(
 
 
 @pytest.mark.parametrize('ready,staged', [(True,True),(False,False)])
-def test_ready_or_unstaged_route_preserves_ordinary_prepare(tmp_path,ready,staged):
+def test_ready_parent_uses_bounded_queue_and_unstaged_parent_stays_direct(tmp_path,ready,staged):
     function,ns,view,key,_leases,captured,executor,future,dispatch=submission(tmp_path,ready=ready,staged=staged)
     function('model',view)
     assert not captured
-    executor.submit.assert_called_once()
+    if staged:
+        executor.submit.assert_not_called()
+        task, required = ns['sam_parent_staging'].enqueue_ready.call_args.args
+        assert required == _leases.leases[key].nbytes == 480
+        assert task.backing_lease is _leases.leases[key]
+        assert task.union_mm.shape == (3, 4, 5)
+    else:
+        executor.submit.assert_called_once()
     assert ns['view_processing_futures']=={future:key}
     dispatch.assert_called_once()
+
+
+def test_late_queue_failure_restores_original_dense_ownership(tmp_path):
+    function,ns,view,key,leases,_captured,executor,_future,_dispatch=submission(tmp_path,ready=True)
+    ns['sam_parent_staging'].enqueue_ready.side_effect = RuntimeError('queue refused')
+    with pytest.raises(RuntimeError, match='queue refused'):
+        function('model', view)
+    executor.submit.assert_not_called()
+    assert leases.leases[key].phase == 'inference'
+    assert key in ns['baseline_union_by_model_view'] and key in ns['baseline_confmap_by_model_view']
+    assert key not in ns['view_processing_submitted'] and not ns['view_processing_futures']
 
 
 def test_failed_run_cancels_checkpoint_writer_before_executor_shutdown(tmp_path):

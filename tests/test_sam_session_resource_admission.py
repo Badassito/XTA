@@ -17,7 +17,7 @@ from tests.test_sam_resident_lease_adversarial import admission
 GIB = resources.GIB
 
 
-@pytest.mark.parametrize('slots', [4, 8])
+@pytest.mark.parametrize('slots', [4, 8, 12, 16])
 def test_logical_slots_do_not_tighten_physical_budget_or_invent_cpu_credit(slots):
     account = _ByteAdmissionPool(64*GIB, 'sessions')
     with resources.admit_sam_parent_resources(account, 4*GIB, 'scope', worker_count=4,
@@ -55,7 +55,7 @@ def test_actual_extra_slots_are_authorized_by_same_live_wave():
     assert account.in_use == 0
 
 
-@pytest.mark.parametrize('slots', [True, 0, -1, 3, 9, 8.0])
+@pytest.mark.parametrize('slots', [True, 0, -1, 3, 17, 8.0])
 def test_invalid_execution_slot_count_reserves_nothing(slots):
     account = _ByteAdmissionPool(64*GIB, 'sessions')
     with pytest.raises(ValueError, match='execution slots'):
@@ -133,11 +133,14 @@ def test_real_physical_coordinator_cannot_lend_gpu_between_peer_session_acks(
         context.close()
 
 
-def test_continuous_dual_slot_refill_yields_image_turn_after_both_acks(admission, tmp_path, monkeypatch):
+@pytest.mark.parametrize('image_waiting_before_compute', (False, True))
+@pytest.mark.parametrize('workers_per_device', (2, 3, 4))
+def test_compute_turn_fills_unused_slots_then_yields_after_all_acks(
+        admission, tmp_path, monkeypatch, image_waiting_before_compute, workers_per_device):
     from tests.test_sam_gpu_session_slots import (Admissions, cache_for, consume,
         protocol, release_slot, request, wait_for)
     coordinator, _auxiliary, torch = admission
-    tracker, pool, _, _, _, _ = protocol(tmp_path, monkeypatch)
+    tracker, pool, _, _, _, _ = protocol(tmp_path, monkeypatch, workers_per_device=workers_per_device)
     monkeypatch.setitem(sys.modules, 'torch', torch)
     resident = coordinator.try_acquire_specific_stage(torch, 0, 'SAM startup').promote_residency()
     context = sam_integration.SamInterpolationContext(model_path='CPU protocol', device_ids=(0,),
@@ -151,7 +154,7 @@ def test_continuous_dual_slot_refill_yields_image_turn_after_both_acks(admission
     tracker._residency_quarantine = context._quarantine_sam_residency
     tracker._before_worker_shutdown = context._before_sam_worker_shutdown
     tracker._after_worker_shutdown = context._after_sam_worker_shutdown
-    grants, first = Admissions(1), threading.Event()
+    grants, first = Admissions(1, workers_per_device=workers_per_device), threading.Event()
     original = tracker.iter_results
     def observed(*args, **kwargs):
         for item in original(*args, **kwargs):
@@ -159,22 +162,32 @@ def test_continuous_dual_slot_refill_yields_image_turn_after_both_acks(admission
             yield item
     monkeypatch.setattr(tracker, 'iter_results', observed)
     renderer = SimpleNamespace(lease=None, device_index=None, name='waiting image')
+    if image_waiting_before_compute:
+        first_image = SimpleNamespace(lease=None, device_index=None, name='first image')
+        context._queue_gpu_image(first_image)
+        assert context._try_gpu_image_lease(first_image, torch) is not None
+        context._finish_gpu_image_wait(first_image, granted=True)
+        first_image.lease.release()
+        context._finish_gpu_image(first_image)
+        context._queue_gpu_image(renderer)
     try:
         with ThreadPoolExecutor(1) as threads:
             future = threads.submit(consume, tracker, cache_for(tmp_path, 'A', 13),
-                [request(index, label='A', frames=13) for index in range(4)],
-                capacity=2, admissions=grants)
+                [request(index, label='A', frames=13) for index in range(2*workers_per_device)],
+                capacity=workers_per_device, admissions=grants)
             try:
-                wait_for(lambda:all((tmp_path/f'active-{slot}.json').exists() for slot in (0, 1)))
-                context._queue_gpu_image(renderer)
+                wait_for(lambda:all((tmp_path/f'active-{slot}.json').exists() for slot in range(workers_per_device)))
+                if not image_waiting_before_compute:
+                    context._queue_gpu_image(renderer)
                 release_slot(tmp_path, 0)
                 assert first.wait(15)
-                assert tracker.dispatch_stats['submitted'] == 2
+                assert tracker.dispatch_stats['submitted'] == workers_per_device
                 assert context._try_gpu_image_lease(renderer, torch) is None
                 assert pool.is_alive(0, 1) and coordinator.snapshot()['stage_leases']
-                release_slot(tmp_path, 1)
-                wait_for(lambda:tracker.dispatch_stats['completion_acks_pumped'] == 2)
-                assert tracker.dispatch_stats['submitted'] == 2
+                for slot in range(1, workers_per_device):
+                    release_slot(tmp_path, slot)
+                wait_for(lambda:tracker.dispatch_stats['completion_acks_pumped'] == workers_per_device)
+                assert tracker.dispatch_stats['submitted'] == workers_per_device
                 renderer.lease = context._try_gpu_image_lease(renderer, torch)
                 assert renderer.lease is not None
                 context._finish_gpu_image_wait(renderer, granted=True)
@@ -182,14 +195,14 @@ def test_continuous_dual_slot_refill_yields_image_turn_after_both_acks(admission
                 renderer.lease.release()
                 renderer.lease = None
                 context._finish_gpu_image(renderer)
-                assert len(future.result(15)) == 4
+                assert len(future.result(15)) == 2*workers_per_device
             finally:
                 context._finish_gpu_image_wait(renderer)
                 if renderer.lease is not None:
                     renderer.lease.release()
                     context._finish_gpu_image(renderer)
-                release_slot(tmp_path, 0)
-                release_slot(tmp_path, 1)
+                for slot in range(workers_per_device):
+                    release_slot(tmp_path, slot)
         assert grants.pool.in_use == 0 and not context._gpu_image_waiters
         assert not context._gpu_image_owners and not coordinator.snapshot()['stage_leases']
     finally:
@@ -289,9 +302,11 @@ def test_gpu_image_watchdog_starts_at_head_and_does_not_reset_on_device_rejectio
 
 
 def startup_fixture(tmp_path, monkeypatch, *, memory=((14*GIB, 16*GIB), (12*GIB, 16*GIB)),
-                    host=64*GIB, first_error=None, settle=True):
+                    host=64*GIB, first_error=None, settle=True, sessions=None):
     from XTA import sam_tracker_runtime
     monkeypatch.delenv('YOLO_TTA_SAM_SESSIONS_PER_GPU', raising=False)
+    if sessions is not None:
+        monkeypatch.setenv('YOLO_TTA_SAM_SESSIONS_PER_GPU', str(sessions))
     checkpoint = tmp_path/'checkpoint.pt'
     checkpoint.write_bytes(b'checkpoint-storage')
     # The import-boundary tests replace this module after test collection.
@@ -355,18 +370,34 @@ def startup_fixture(tmp_path, monkeypatch, *, memory=((14*GIB, 16*GIB), (12*GIB,
     return context, configs, events, runtimes
 
 
-def test_two_context_startup_charges_actual_gpu_share_and_samples_after_all_ready(tmp_path, monkeypatch):
-    context, configs, events, _ = startup_fixture(tmp_path, monkeypatch)
+@pytest.mark.parametrize('sessions', [2, 3, 4])
+def test_multi_context_startup_charges_actual_gpu_share_and_samples_after_all_ready(tmp_path, monkeypatch, sessions):
+    context, configs, events, _ = startup_fixture(tmp_path, monkeypatch, sessions=sessions)
     context._start()
     try:
         config, = configs
-        assert config['workers_per_device'] == 2
-        assert context.worker_count == 2 and context.worker_slots == ((0, 0), (0, 1))
+        assert config['workers_per_device'] == sessions
+        assert context.worker_count == sessions and context.worker_slots == tuple((0, i) for i in range(sessions))
         headroom = max(2*GIB, int(16*GIB*.15))
-        assert config['cuda_allocator_fractions'] == {'0':((14*GIB-headroom)//2)/(16*GIB)}
-        assert events.index(('all-ready', 2)) < len(events)-2
+        assert config['cuda_allocator_fractions'] == {'0':((14*GIB-headroom)//sessions)/(16*GIB)}
+        assert events.index(('all-ready', sessions)) < len(events)-2
         assert events[-2:] == [('probe', 0), ('promote',)]
         assert context.startup_admission['attempts'][0]['status'] == 'admitted'
+    finally:
+        context.close()
+
+
+@pytest.mark.parametrize('sessions', [3, 4])
+def test_larger_cohort_falls_back_only_after_failed_workers_settle(tmp_path, monkeypatch, sessions):
+    context, configs, events, _ = startup_fixture(tmp_path, monkeypatch, sessions=sessions,
+        first_error=sam_integration.SamConcurrentStartupResourceError('insufficient cohort headroom'))
+    try:
+        context._start()
+        assert [config['workers_per_device'] for config in configs] == [sessions, 1]
+        assert events.index(('settle', sessions)) < events.index(('construct', 1))
+        assert context.startup_admission['requested_sessions_per_gpu'] == sessions
+        assert context.startup_admission['effective_sessions_per_gpu'] == 1
+        assert configs[1]['cuda_allocator_fractions'] is None
     finally:
         context.close()
 
@@ -568,7 +599,7 @@ def test_unproven_two_worker_exit_retains_physical_fence_without_fallback(tmp_pa
     assert not sam_integration.sam_workers_unsettled()
 
 
-@pytest.mark.parametrize('value', ['', '0', '3', 'true', '2.0'])
+@pytest.mark.parametrize('value', ['', '0', '5', 'true', '2.0'])
 def test_sessions_backout_control_is_bounded(tmp_path, monkeypatch, value):
     monkeypatch.setenv('YOLO_TTA_SAM_SESSIONS_PER_GPU', value)
     with pytest.raises(ValueError, match='SESSIONS_PER_GPU'):

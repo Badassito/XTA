@@ -31,6 +31,7 @@ from .cylindrical_owner import (
 from .cylindrical_cuda_projection import RadialCudaProjectionUnsafeFailure
 
 from .cuda_backend import (
+    CpuPreparedYoloSource,
     GpuRenderedYoloSource,
     GpuTileRenderedYoloSource,
     _WORKER_TILTED_AZIMUTHAL_CPU_WARNED,
@@ -63,6 +64,7 @@ from .runtime import (
     initialize_runtime_observability,
     runtime_trace_event,
     flush_runtime_task_trace,
+    runtime_telemetry,
 )
 from .workspace import configure_pipeline_modes
 from .geometry import (
@@ -95,6 +97,8 @@ from .inference import (
     ModelInputChannelMismatchError,
     PredictConfig,
     _cleanup_prediction_slice_inplace,
+    _direct_predict_applicable,
+    _ensure_predictor_for_direct_predict,
     _clip_boxes_np,
     _gpu_union_retirement_manager,
     _init_gpu_union_retirement_manager,
@@ -1400,6 +1404,7 @@ def run_prediction_volume_in_worker(
     native_resize = task.get('native_resize') if isinstance(task.get('native_resize'), dict) else None
 
     source_mm: Optional[np.memmap] = None
+    prepared_input_mm: Optional[np.memmap] = None
     result_mask: Optional[np.ndarray] = None
     result_conf: Optional[np.ndarray] = None
     result_mask_full: Optional[np.memmap] = None
@@ -1412,8 +1417,12 @@ def run_prediction_volume_in_worker(
     azimuthal_padding_conf_owned = False
     source: Optional[object] = None
     deferred_result: Optional[_DeferredGpuWorkerTaskResult] = None
+    gray_capture = None
     raster_plan = _canonical_raster_plan_for_task(task)
     render_batch_sink = _canonical_image_sink_for_task(task, backend='cuda_cpu_source')
+    startup_source_started = None
+    startup_source_prepared = False
+    startup_device = str(task.get('_startup_device', getattr(cfg, 'device', 'cuda:0')))
 
     azimuthal_padding_count = azimuthal_batch_padding_count(
         view,
@@ -1554,6 +1563,9 @@ def run_prediction_volume_in_worker(
         # Full-frame and tile tasks use separate source classes but the same cached native
         # planes; a tile is cropped/warped/resized directly on device before inference.
         render_path = 'cpu'
+        if bool(task.get('_startup_first_task', False)):
+            startup_source_started = time.perf_counter()
+            runtime_trace_event('worker_source_prepare_start', task=task, device=startup_device)
         gpu_engine = _worker_gpu_render_engine()
         spherical_cache_before = (
             dict(getattr(gpu_engine, '_spherical_direction_cache_stats', {}))
@@ -1610,8 +1622,30 @@ def run_prediction_volume_in_worker(
                         channel_format=channel_format,
                         render_batch_sink=render_batch_sink,
                     )
+                elif render_mode == 'resident' and resident_view_supported and task.get('cpu_input_path'):
+                    input_shape = tuple(int(value) for value in task['cpu_input_shape'])
+                    offset = int(task.get('cpu_input_offset', 0))
+                    if (len(input_shape) != 3 or any(value <= 0 for value in input_shape)
+                            or input_shape[1:] != (out_size, out_size)
+                            or offset < 0 or offset + num_frames > input_shape[0]):
+                        raise ValueError('CPU prepared input has an invalid frame window')
+                    if os.stat(task['cpu_input_path']).st_size != int(np.prod(input_shape)):
+                        raise ValueError('CPU prepared input backing size does not match its descriptor')
+                    prepared_input_mm = open_existing_gray_memmap(task['cpu_input_path'],
+                        input_shape, 'uint8', mode='r')
+                    source = CpuPreparedYoloSource(gpu_engine, view, job,
+                        slice_offset=slice_offset, num_frames=num_frames,
+                        batch_size=1, out_size=out_size, fp16=quantize_uses_fp16(cfg.quantize),
+                        name=f'cpu-prepared-{view.name}-{task["job_id"]}', channel_format=channel_format,
+                        prepared_frames=prepared_input_mm[offset:offset + num_frames])
+                    render_path = 'cpu_prepared_trt_input'
                 elif render_mode == 'resident' and resident_view_supported:
                     render_path = 'gpu_resident'
+                    gray_payload = task.get('sam_gray_cache_spec')
+                    if isinstance(gray_payload,dict):
+                        from .sam_yolo_capture import worker_capture_session
+                        gray_capture = worker_capture_session(gray_payload,torch=gpu_engine.torch,
+                            device=gpu_engine.device,cpu_workers=int(task.get('postprocess_workers',1)))
                     source = GpuRenderedYoloSource(
                         gpu_engine,
                         view,
@@ -1624,6 +1658,7 @@ def run_prediction_volume_in_worker(
                         name=f"gpu-render-fullframe-{view.name}-{task['job_id']}",
                         channel_format=channel_format,
                         render_batch_sink=render_batch_sink,
+                        **({'gray_capture':gray_capture} if gray_capture is not None else {}),
                     )
                 elif (
                     kind == 'fullframe'
@@ -1684,6 +1719,12 @@ def run_prediction_volume_in_worker(
             source_mm, source = _open_cpu_render_source()
 
         _announce_worker_render_path(view, kind, render_path, str(task.get('result_mode', 'file')))
+        if startup_source_started is not None:
+            runtime_trace_event('worker_source_prepare_done', task=task, device=startup_device,
+                failed=False, render_path=render_path,
+                host_seconds=time.perf_counter()-startup_source_started,
+                **dict(getattr(gpu_engine, '_source_residency_timings', {})))
+            startup_source_prepared = True
 
         if task.get('M_out_to_processing') is not None:
             task_affine = np.asarray(task['M_out_to_processing'], dtype=np.float32)
@@ -1789,6 +1830,13 @@ def run_prediction_volume_in_worker(
             _announce_worker_render_path(view, kind, 'cpu_after_gpu_failure', str(task.get('result_mode', 'file')))
             stats = _predict(source)
 
+        gray_future = None
+        if gray_capture is not None:
+            # Only CUDA reads/copies are fenced here. Encoding/seal waits join
+            # ordinary publication after the worker releases its compute credit.
+            gray_future = gray_capture.finish_capture()
+            gray_capture.wait_device_copies()
+
         public_stats: Dict[str, object] = {
             'prediction_count': int(stats.get('prediction_count', 0)),
             'frames_with_predictions': int(stats.get('frames_with_predictions', 0)),
@@ -1799,6 +1847,16 @@ def run_prediction_volume_in_worker(
             'slice_meta': stats.get('slice_meta'),
             'azimuthal_padding_processed': int(stats.get('azimuthal_padding_processed', 0)),
         }
+        if isinstance(source, CpuPreparedYoloSource):
+            source.finish_cpu_copies()
+            public_stats.update(cpu_input_frames=int(num_frames), cpu_input_copy_bytes=int(source.copy_bytes),
+                cpu_input_h2d_seconds=float(source.copy_h2d_seconds),
+                cpu_input_copy_submit_seconds=float(source.copy_submit_seconds),
+                cpu_input_copy_wait_seconds=float(source.copy_wait_seconds))
+            print(f'CPU prepared YOLO input {view.name}: frames={num_frames}, '
+                f'H2D_MiB={source.copy_bytes / (1024 ** 2):.3f}, '
+                f'H2D_s={source.copy_h2d_seconds:.6f}, submit_s={source.copy_submit_seconds:.6f}, '
+                f'wait_s={source.copy_wait_seconds:.6f}', flush=True)
         for policy_key in ('augmentation_results', 'augmentation_records', 'augmentation_execution'):
             if policy_key in stats:
                 public_stats[policy_key] = stats[policy_key]
@@ -1877,6 +1935,9 @@ def run_prediction_volume_in_worker(
             if d1_key in stats:
                 public_stats[d1_key] = stats[d1_key]
         flush_future = stats.get('_device_union_flush_future')
+        if isinstance(gray_future,Future):
+            from .sam_yolo_capture import merge_publication_futures
+            flush_future = merge_publication_futures(flush_future,gray_future)
         if isinstance(flush_future, Future):
             deferred_result = _DeferredGpuWorkerTaskResult(
                 stats=public_stats,
@@ -1895,14 +1956,19 @@ def run_prediction_volume_in_worker(
             return deferred_result
         return public_stats
     finally:
+        if startup_source_started is not None and not startup_source_prepared:
+            runtime_trace_event('worker_source_prepare_done', task=task, device=startup_device,
+                failed=True, host_seconds=time.perf_counter()-startup_source_started)
         if source is not None:
             try:
                 source.close()
             except Exception:
+                if isinstance(source, CpuPreparedYoloSource):
+                    raise
                 pass
         for mm in (
             result_mask, result_conf, result_mask_full, result_conf_full,
-            azimuthal_padding_mask, azimuthal_padding_conf, source_mm,
+            azimuthal_padding_mask, azimuthal_padding_conf, source_mm, prepared_input_mm,
         ):
             if mm is not None:
                 try:
@@ -2005,6 +2071,8 @@ def _release_gpu_worker_inference_assets(
         raise RuntimeError('Inference-asset release requires authoritative global inference drain')
     before_wait = time.perf_counter()
     wait_for_publications()
+    from .sam_yolo_capture import close_worker_capture_pools
+    close_worker_capture_pools()
     stats['publication_drain_seconds'] = time.perf_counter() - before_wait
     from . import cuda_d1, inference as inference_module
     with cuda_d1._D1_WORKER_VIEW_LOCK:
@@ -2111,6 +2179,7 @@ def _gpu_inference_worker_main(
             min_conf=float(init_dict.get('reconciliation_min_conf', 0.0)),
         )
         initialize_runtime_observability()
+        runtime_trace_event('worker_startup_begin', device=f'cuda:{gpu_index}')
         # pin every thread of this worker to its GPU's NUMA node BEFORE any
         # CUDA/model work, so allocator arenas, pinned staging and TRT host scratch land
         # node-local. The parent computed the plan (None = stay unpinned).
@@ -2157,15 +2226,19 @@ def _gpu_inference_worker_main(
                 raise ValueError('External TTA policies require GPU retina flattening')
             worker_policy(policy_settings, device='cuda:0', batch_size=int(cfg.batch))
         if d1_owner_pipeline_enabled():
-            _d1_backproject_kernels()
+            with runtime_telemetry().span('startup.worker.d1_preflight'):
+                _d1_backproject_kernels()
             print(
                 f'D1 backprojection NVRTC preflight passed on cuda:{int(gpu_index)}: '
                 'header-free source-geometry atomic-OR kernel compiled before TensorRT load.'
             )
         if bool(init_dict.get('radial_owner_preflight', False)):
-            preflight_radial_owner()
-        model = load_ultralytics_model(str(model_path), task=str(cfg.task))
-        ensure_yolo_ready_for_predict(model, cfg)
+            with runtime_telemetry().span('startup.worker.radial_preflight'):
+                preflight_radial_owner()
+        with runtime_telemetry().span('startup.worker.model_wrapper'):
+            model = load_ultralytics_model(str(model_path), task=str(cfg.task))
+        with runtime_telemetry().span('startup.worker.model_placement'):
+            ensure_yolo_ready_for_predict(model, cfg)
         validate_yolo_model_input_channels(
             model,
             int(cfg.input_channels),
@@ -2182,22 +2255,38 @@ def _gpu_inference_worker_main(
             # GPU retina mode — reduce per-frame unions at proto resolution.
             if not ensure_gpu_retina_proto_union_predictor_patch():
                 raise RuntimeError('GPU proto-union predictor patch was not installed')
+        if (Path(model_path).suffix.lower() == '.engine'
+                and str(cfg.task) == 'segment'
+                and not (policy_settings is not None and policy_settings.enabled)
+                and _direct_predict_applicable(cfg)):
+            with runtime_telemetry().span('startup.worker.backend_prime'):
+                backend_primed = _ensure_predictor_for_direct_predict(model, cfg) is not None
+                if (not backend_primed
+                        and getattr(getattr(model, 'predictor', None), 'model', None) is None):
+                    model.predictor = None  # A declined cold setup must remain retryable.
+            runtime_trace_event('worker_backend_prime_done', device=f'cuda:{gpu_index}',
+                                primed=backend_primed, declined=not backend_primed)
         # per-worker GPU render engine (volume residency resolves lazily on
         # the first task, once the shared source volume exists and VRAM headroom is known).
         try:
-            _init_worker_gpu_render_engine('cuda:0')
+            with runtime_telemetry().span('startup.worker.render_engine'):
+                _init_worker_gpu_render_engine('cuda:0')
         except Exception as _render_engine_exc:
             print(f'Warning: GPU render engine init failed ({_render_engine_exc}); worker uses CPU rendering.')
         try:
-            _init_gpu_union_retirement_manager('cuda:0', int(cfg.imgsz))
+            with runtime_telemetry().span('startup.worker.retirement_lanes'):
+                _init_gpu_union_retirement_manager('cuda:0', int(cfg.imgsz))
         except Exception as _retirement_exc:
             print(
                 f'Warning: persistent GPU retirement lanes unavailable ({_retirement_exc}); '
                 'using the event-compatible fallback retirement executor.'
             )
+        runtime_trace_event('worker_ready', device=f'cuda:{gpu_index}', failed=False)
         result_queue.put({'type': 'ready', 'gpu_index': int(gpu_index), 'pid': int(os.getpid())})
     except Exception as exc:  # pragma: no cover - worker init failure surfaced to main
         import traceback
+        runtime_trace_event('worker_startup_failed', device=f'cuda:{gpu_index}', failed=True,
+                            error=repr(exc))
         try:
             result_queue.put({'type': 'fatal', 'gpu_index': int(gpu_index), 'error': repr(exc), 'traceback': traceback.format_exc()})
         except Exception:
@@ -2212,6 +2301,7 @@ def _gpu_inference_worker_main(
     model = None  # The phase owner above is the only long-lived model reference.
     completed = None
     manager = None
+    startup_first_task = True
 
     def _publish_deferred(finished_task_id: int, deferred: _DeferredGpuWorkerTaskResult,
                           trace_context: Dict[str, object], proc_capability: object = None) -> None:
@@ -2457,6 +2547,9 @@ def _gpu_inference_worker_main(
                 1, min(local_cpu_workers, int(task.get('slice_count', 1))),
             )
             task_local['postprocess_workers'] = int(local_cpu_workers)
+            task_local['_startup_first_task'] = startup_first_task
+            task_local['_startup_device'] = f'cuda:{gpu_index}'
+            startup_first_task = False
             compute_started = time.perf_counter()
             runtime_trace_event('worker_compute_start', task=task_local, device=f'cuda:{gpu_index}')
             completed = run_prediction_volume_in_worker(inference_assets.model, cfg, task_local)

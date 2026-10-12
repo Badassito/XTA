@@ -256,7 +256,7 @@ def test_cancelled_context_cannot_allocate_even_when_budget_fits(tmp_path):
     assert not pool.condition._is_owned()
 
 
-def test_new_restore_lease_cannot_race_a_startup_budget_snapshot(tmp_path):
+def test_new_restore_lease_defers_without_waiting_for_startup_condition(tmp_path):
     stage, _writer, prepare, leases = queue(tmp_path,cap=120,ready=lambda:True)
     task = TinyTask(tmp_path,'deferred',None)
     task.admission = _ByteAdmissionPool(2048,'parent')
@@ -272,12 +272,15 @@ def test_new_restore_lease_cannot_race_a_startup_budget_snapshot(tmp_path):
         worker = threading.Thread(target=pump)
         worker.start()
         assert started.wait(2)
-        assert not finished.wait(.05)
+        assert finished.wait(2)
         assert stage.checkpoint_copy_promises() == 0
+        assert result == [({}, False)] and not prepare.entries
+        assert stage.snapshot()['resume_lock_denials'] == 1
     worker.join(3)
     assert not worker.is_alive()
+    resumed, _released = stage.pump()
     assert stage.checkpoint_copy_promises() == 60
-    assert len(result[0][0]) == len(prepare.entries) == 1
+    assert len(resumed) == len(prepare.entries) == 1
     for future in prepare.entries:
         future.cancel()
     leases.complete(key,retain_for_dense_retirement=False)

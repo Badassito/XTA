@@ -31,6 +31,31 @@ def _fake_ultralytics_modules() -> dict[str, types.ModuleType]:
     return modules
 
 
+@contextlib.contextmanager
+def _patch_ultralytics_modules(modules):
+    # Restoring all of sys.modules would unload native dependencies imported by a hook.
+    with pytest.MonkeyPatch.context() as patcher:
+        for name, module in modules.items():
+            patcher.setitem(sys.modules, name, module)
+        yield
+
+
+def test_fake_module_context_preserves_unrelated_imports() -> None:
+    name = '_tta_contract_imported_dependency'
+    dependency = types.ModuleType(name)
+    modules = _fake_ultralytics_modules()
+    original = sys.modules.get('ultralytics')
+    assert name not in sys.modules
+    try:
+        with _patch_ultralytics_modules(modules):
+            assert sys.modules['ultralytics'] is modules['ultralytics']
+            sys.modules[name] = dependency
+        assert sys.modules[name] is dependency
+        assert sys.modules.get('ultralytics') is original
+    finally:
+        sys.modules.pop(name, None)
+
+
 def test_channel_patch_rejects_changed_preprocess_signature() -> None:
     class Predictor:
         def preprocess(self) -> None:
@@ -38,7 +63,7 @@ def test_channel_patch_rejects_changed_preprocess_signature() -> None:
 
     modules = _fake_ultralytics_modules()
     modules['ultralytics.engine.predictor'].BasePredictor = Predictor
-    with mock.patch.dict(sys.modules, modules), mock.patch.object(
+    with _patch_ultralytics_modules(modules), mock.patch.object(
         inference, '_ULTRALYTICS_CHANNEL_AWARE_PREPROCESS_PATCHED', False
     ):
         with pytest.raises(RuntimeError, match='BasePredictor.preprocess signature'):
@@ -55,7 +80,7 @@ def test_retina_patch_rejects_changed_construct_result_signature(processor: str)
     modules = _fake_ultralytics_modules()
     modules['ultralytics.engine.results'].Results = type('Results', (), {})
     modules['ultralytics.models.yolo.segment.predict'].SegmentationPredictor = Predictor
-    with (mock.patch.dict(sys.modules, modules),
+    with (_patch_ultralytics_modules(modules),
           mock.patch.object(inference, '_ULTRALYTICS_CPU_RETINA_PATCHED', False),
           mock.patch.object(inference, '_ULTRALYTICS_GPU_PROTO_UNION_PATCHED', False),
           mock.patch.object(inference, 'cpu_retina_masks_enabled', return_value=processor == 'cpu')):
@@ -71,7 +96,7 @@ def test_source_registration_rejects_loaders_not_used_by_check_source() -> None:
     build = modules['ultralytics.data.build']
     build.LOADERS = ()
     build.check_source = lambda source: source  # LOADERS is no longer consulted
-    with mock.patch.dict(sys.modules, modules):
+    with _patch_ultralytics_modules(modules):
         with pytest.raises(RuntimeError, match='Unsupported Ultralytics in-memory source API'):
             geometry.ensure_ultralytics_accepts_in_memory_volume_source()
 

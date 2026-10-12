@@ -55,6 +55,8 @@ from .runtime import (
     choose_slice_parallel_workers,
     parallel_for_indices_chunked,
     runtime_telemetry_phase,
+    runtime_telemetry,
+    runtime_trace_event,
 )
 from .geometry import (
     BatchResultFrameSpec,
@@ -3668,20 +3670,27 @@ def _ensure_predictor_for_direct_predict(model: object, cfg: 'PredictConfig') ->
     try:
         predictor = getattr(model, 'predictor', None)
         if predictor is None or getattr(predictor, 'model', None) is None:
-            _ = model.predict(
-                source=np.zeros((32, 32, max(1, int(cfg.input_channels))), dtype=np.uint8),
-                task=str(cfg.task),
-                imgsz=cfg.imgsz,
-                conf=cfg.conf,
-                iou=1.0,
-                save=False,
-                stream=True,
-                retina_masks=True,
-                batch=max(1, int(cfg.batch)),
-                device=cfg.device,
-                quantize=cfg.quantize,
-                verbose=False,
-            )
+            runtime_trace_event('startup_backend_setup_start', device=str(cfg.device))
+            failed = True
+            try:
+                with runtime_telemetry().span('startup.yolo.backend_setup'):
+                    _ = model.predict(
+                        source=np.zeros((32, 32, max(1, int(cfg.input_channels))), dtype=np.uint8),
+                        task=str(cfg.task),
+                        imgsz=cfg.imgsz,
+                        conf=cfg.conf,
+                        iou=1.0,
+                        save=False,
+                        stream=True,
+                        retina_masks=True,
+                        batch=max(1, int(cfg.batch)),
+                        device=cfg.device,
+                        quantize=cfg.quantize,
+                        verbose=False,
+                    )
+                failed = False
+            finally:
+                runtime_trace_event('startup_backend_setup_done', device=str(cfg.device), failed=failed)
             predictor = getattr(model, 'predictor', None)
         if predictor is None or getattr(predictor, 'model', None) is None:
             return None

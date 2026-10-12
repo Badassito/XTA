@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 import threading
 import time
@@ -19,6 +20,7 @@ CANONICAL_CROP_RENDER_CONTRACT = 'xta.sam_global_canonical_warp_crop/1'
 IMPLEMENTATION_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 CANONICAL_PHASE_SELF_CHECK_CONTRACT = 'xta.sam_canonical_phase_self_check/1'
 NATIVE_SHELL_CROP_CONTRACT = 'xta.sam_native_shell_demand_crop/1'
+NATIVE_TILTED_CROP_CONTRACT = 'xta.sam_native_tilted_demand_crop/1'
 _PHASE_SELF_CHECK_LOCK = threading.Lock()
 _PHASE_SELF_CHECKS = {}
 
@@ -60,11 +62,18 @@ def _render_native_shell_crop(source, view, index, bbox):
         if bbox is None:
             plane = np.zeros((1, 1), np.uint8)
         else:
-            if str(view.family) == 'radial':
+            if str(view.family) == 'radial' and source.dtype == np.uint8:
+                from .radial_rendering_cpu import render_radial_gray8_crop
+                plane = render_radial_gray8_crop(source, view, int(index), bbox)
+            elif str(view.family) == 'radial':
                 from .cylindrical_geometry import render_shell_frame
+                plane = render_shell_frame(source, view, int(index), bbox_yx=bbox)
+            elif source.dtype == np.uint8:
+                from .spherical_rendering_cpu import render_spherical_gray8_crop
+                plane = render_spherical_gray8_crop(source, view, int(index), bbox)
             else:
                 from .spherical_geometry import render_shell_frame
-            plane = render_shell_frame(source, view, int(index), bbox_yx=bbox)
+                plane = render_shell_frame(source, view, int(index), bbox_yx=bbox)
         telemetry.add('sam.cpu_images.native_sampled_pixels', 0 if bbox is None else int(plane.size))
         telemetry.add('sam.cpu_images.native_full_frame_pixels', int(view.src_h)*int(view.src_w))
         return plane
@@ -224,6 +233,67 @@ def prepare_cartesian_native_crop(source, view, index, *, affine, output_bbox_yx
     if (y1-y0)*(x1-x0) >= max(1, _env_int('YOLO_TTA_SAM_RENDER_MAX_BYTES', 256*1024**2)):
         raise RuntimeError('SAM Cartesian native crop exceeds the bounded rendering memory budget')
     return np.ascontiguousarray(oriented[int(index), y0:y1, x0:x1]), (x0, y0)
+
+
+def native_tilted_workspace_bytes(bbox_yx):
+    height, width = int(bbox_yx[2])-int(bbox_yx[0]), int(bbox_yx[3])-int(bbox_yx[1])
+    return height*width+64*min(32, height)*width
+
+
+def prepare_tilted_native_crop(source, view, index, *, affine, output_bbox_yx,
+                               max_workspace_bytes, check_cancel=None):
+    """Sample the established two-tap Tilted integer grid without a full-plane plan."""
+    from . import geometry
+    geometry.require_forward_sampling('cpu', geometry.DataRole.INTENSITY)
+    if (str(view.family) != 'tilted' or not isinstance(source, np.ndarray)
+            or source.dtype != np.uint8 or source.ndim != 3
+            or tuple(source.shape) != (int(view.full_t), int(view.full_h), int(view.full_w))
+            or not 0 <= int(index) < int(view.num_slices)):
+        raise ValueError('SAM Tilted crop requires its physical uint8 source and frame')
+    roi = native_shell_crop_bbox(view, affine, output_bbox_yx)
+    if roi is None:
+        return np.zeros((1, 1), np.uint8), (0, 0)
+    if native_tilted_workspace_bytes(roi) > int(max_workspace_bytes):
+        raise RuntimeError('SAM Tilted native crop exceeds admitted rendering workspace')
+    y0, x0, y1, x1 = roi
+    output = np.zeros((y1-y0, x1-x0), np.uint8)
+    base = geometry.tilted_base_view_name(view)
+    stack_length = geometry.tilted_stack_axis_length(view)
+    center = int(geometry.tilted_frame_center(view, int(index)))
+    tangent = np.float32(math.tan(math.radians(float(view.tilt_angle_deg))))
+    xx = np.arange(x0, x1, dtype=np.int32)[None, :]
+    for row in range(y0, y1, 32):
+        if check_cancel is not None:
+            check_cancel()
+        stop = min(y1, row+32)
+        yy = np.arange(row, stop, dtype=np.int32)[:, None]
+        if str(view.tilt_direction) == 'vertical':
+            offset = yy.astype(np.float32)-np.float32((int(view.src_h)-1)/2.)
+        elif str(view.tilt_direction) == 'horizontal':
+            offset = xx.astype(np.float32)-np.float32((int(view.src_w)-1)/2.)
+        else:
+            raise ValueError('SAM Tilted crop has an unsupported tilt direction')
+        position = offset*tangent
+        lower = np.floor(position).astype(np.int32)
+        alpha = (position-lower).astype(np.float32)
+        lower += center
+        valid = (lower >= 0) & (lower+(alpha > 0) < stack_length)
+        upper = np.clip(lower+1, 0, stack_length-1)
+        lower = np.clip(lower, 0, stack_length-1)
+        if base == 'transverse':
+            first, second = source[lower, yy, xx], source[upper, yy, xx]
+        elif base == 'sagittal':
+            first, second = source[yy, lower, xx], source[yy, upper, xx]
+        elif base == 'coronal':
+            first, second = source[yy, xx, lower], source[yy, xx, upper]
+        else:
+            raise ValueError('SAM Tilted crop has an unsupported Cartesian base')
+        values = (np.float32(1.)-alpha)*first+alpha*second
+        np.rint(values, out=values)
+        np.clip(values, 0., 255., out=values)
+        values *= valid
+        output[row-y0:stop-y0] = values
+    return output, (x0, y0)
 
 
 def render_canonical_crop(source, view, index, *, affine, inverse, output_origin_yx,
@@ -459,5 +529,6 @@ __all__ = ['CANONICAL_CROP_RENDER_CONTRACT', 'IMPLEMENTATION_SHA256', 'render_ca
            'NATIVE_SHELL_CROP_CONTRACT', 'native_shell_crop_bbox', 'prepare_native_shell_crop',
            'native_shell_workspace_bytes', 'iter_prefetched_native_planes',
            'cartesian_source_view', 'prepare_cartesian_native_crop',
+           'NATIVE_TILTED_CROP_CONTRACT', 'native_tilted_workspace_bytes', 'prepare_tilted_native_crop',
            'canonical_sampling_backend', 'CANONICAL_PHASE_SELF_CHECK_CONTRACT',
            'ensure_canonical_phase_supported']

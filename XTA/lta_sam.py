@@ -19,6 +19,7 @@ import importlib.util
 import inspect
 import json
 import math
+import os
 import sys
 import threading
 import types
@@ -254,17 +255,121 @@ def install_sdpa_fallback(decoder_module: object | None = None) -> Callable[[], 
     return restore
 
 
+def resolve_sam_attention_backend(
+    capability: tuple[int, ...], requested: str | None = None,
+) -> str:
+    """Select the approved Hopper FP8 attention or explicit SDPA baseline."""
+    backend = str(requested if requested is not None else os.environ.get(
+        "YOLO_TTA_SAM_ATTENTION_BACKEND", "auto"
+    )).strip().lower()
+    if backend not in {"auto", "sdpa", "fa3_fp8"}:
+        raise ValueError("SAM attention_backend must be auto, sdpa, or fa3_fp8")
+    if backend == "auto":
+        backend = "fa3_fp8" if capability[0] >= 9 else "sdpa"
+    if backend == "fa3_fp8" and capability[0] < 9:
+        raise ValueError("SAM fa3_fp8 attention requires Hopper or newer")
+    return backend
+
+
+def preflight_sam_fa3(runtime_torch: object, device_id: int) -> dict[str, object]:
+    """Execute the pinned native FP8 kernels before allocating the SAM model."""
+    device = int(device_id)
+    capability = tuple(runtime_torch.cuda.get_device_capability(device))
+    if capability[0] < 9:
+        raise ValueError("SAM fa3_fp8 attention requires Hopper or newer")
+    try:
+        resolve_pinned_sam_runtime_provenance()
+        distribution = importlib.metadata.distribution("flash-attn-3")
+        if distribution.version != "3.0.0":
+            raise RuntimeError(f"expected flash-attn-3==3.0.0, found {distribution.version}")
+        interface = importlib.import_module("flash_attn_interface")
+        extension = importlib.import_module("flash_attn_3._C")
+        sam_fa3 = importlib.import_module("sam3.perflib.fa3").flash_attn_func
+        fa3 = getattr(interface, "flash_attn_func", None)
+        if not callable(fa3):
+            raise RuntimeError("flash_attn_interface exposes no flash_attn_func")
+        identities = {}
+        for name, module in (("interface", interface), ("extension", extension)):
+            origin = Path(module.__file__).resolve(strict=True)
+            files = tuple(distribution.files or ())
+            if not any(Path(distribution.locate_file(item)).resolve() == origin for item in files):
+                raise RuntimeError(f"FA3 {name} import is outside its installed distribution")
+            with origin.open("rb") as handle:
+                digest = hashlib.file_digest(handle, "sha256").hexdigest()
+            identities[name] = {"path": str(origin), "sha256": digest}
+        checks = []
+        # Exercise self-attention and unequal-length memory cross-attention.
+        with runtime_torch.inference_mode():
+            for head, heads, q_length, kv_length in ((64, 16, 128, 128), (32, 8, 128, 256)):
+                q_shape = (1, q_length, heads, head)
+                kv_shape = (1, kv_length, heads, head)
+                q = runtime_torch.zeros(q_shape, dtype=runtime_torch.bfloat16, device=f"cuda:{device}")
+                k = runtime_torch.zeros(kv_shape, dtype=runtime_torch.bfloat16, device=f"cuda:{device}")
+                v = runtime_torch.ones(kv_shape, dtype=runtime_torch.bfloat16, device=f"cuda:{device}")
+                out = fa3(q.to(runtime_torch.float8_e4m3fn), k.to(runtime_torch.float8_e4m3fn),
+                          v.to(runtime_torch.float8_e4m3fn))
+                if (not isinstance(out, runtime_torch.Tensor) or tuple(out.shape) != q_shape
+                        or out.dtype != runtime_torch.bfloat16 or not out.is_cuda
+                        or out.get_device() != device):
+                    raise RuntimeError(f"FA3 head {head} returned incompatible output")
+                if not bool(runtime_torch.isfinite(out).all().item()) or not bool((out == 1).all().item()):
+                    raise RuntimeError(f"FA3 head {head} failed the known-value kernel check")
+                wrapped = sam_fa3(q, k, v)
+                if (not isinstance(wrapped, runtime_torch.Tensor) or tuple(wrapped.shape) != q_shape
+                        or wrapped.dtype != runtime_torch.bfloat16 or not wrapped.is_cuda
+                        or wrapped.get_device() != device
+                        or not bool(runtime_torch.isfinite(wrapped).all().item())
+                        or not bool((wrapped == 1).all().item())):
+                    raise RuntimeError(f"SAM FA3 wrapper head {head} returned incompatible output")
+                checks.append({"q_shape": q_shape, "kv_shape": kv_shape,
+                               "qkv_dtype": "float8_e4m3fn", "output_dtype": "bfloat16",
+                               "sam_wrapper_output_dtype": "bfloat16"})
+                del q, k, v, out, wrapped
+            runtime_torch.cuda.synchronize(device)
+        return {"backend": "meta_fa3_fp8_e4m3fn", "version": distribution.version,
+                "torch_version": str(runtime_torch.__version__),
+                "torch_cuda_version": runtime_torch.version.cuda,
+                **identities, "kernel_checks": checks, "fallback": False}
+    except Exception as exc:
+        raise RuntimeError(
+            "SAM FP8 FA3 preflight failed before model allocation; install the matched "
+            "official flash-attn-3==3.0.0 wheel or select "
+            "YOLO_TTA_SAM_ATTENTION_BACKEND=sdpa for the baseline: " + str(exc)
+        ) from exc
+
+
+def audit_sam_fa3_routing(predictor: object) -> dict[str, object]:
+    """Verify the pinned encoder and recurrent attention receive the FA3 switch."""
+    groups: dict[str, list[str]] = {"image_encoder": [], "memory_attention": []}
+    named_modules = getattr(getattr(predictor, "model", None), "named_modules", None)
+    if not callable(named_modules):
+        raise RuntimeError("SAM FA3 routing audit exposes no module inventory")
+    for name, module in named_modules():
+        identity = (type(module).__module__, type(module).__name__)
+        group = ({("sam3.model.vitdet", "Attention"): "image_encoder",
+                  ("sam3.model.decoder", "SimpleRoPEAttention"): "memory_attention"}).get(identity)
+        if group is not None:
+            if getattr(module, "use_fa3", None) is not True or getattr(module, "use_rope_real", None) is not False:
+                raise RuntimeError(f"SAM FA3 routing audit failed for {name}")
+            groups[group].append(str(name))
+    if len(groups["image_encoder"]) != 32 or len(groups["memory_attention"]) != 8:
+        raise RuntimeError(f"SAM FA3 routing audit found unexpected attention inventory: {groups}")
+    return {"policy": "meta_fp8_qkv_bf16_runtime_complex_rope", **groups}
+
+
 def resolve_sam_device_profile(
     torch_module: object,
     device_id: int,
     *,
     requested: str = "auto",
+    attention_backend: str | None = None,
 ) -> dict[str, object]:
     """Resolve the production H100 or bounded eGPU storage/runtime profile."""
 
     device = int(device_id)
     name = str(torch_module.cuda.get_device_name(device))
     capability = tuple(int(value) for value in torch_module.cuda.get_device_capability(device))
+    attention = resolve_sam_attention_backend(capability, attention_backend)
     profile = str(requested).strip().lower()
     if profile == "auto":
         profile = "h100" if capability[0] >= 9 else "egpu"
@@ -280,15 +385,21 @@ def resolve_sam_device_profile(
             "capability": capability,
             "weight_storage": "float32",
             "construction_device": "meta",
-            "use_fa3": False,
+            "use_fa3": attention == "fa3_fp8",
             "use_rope_real": False,
             "compile": False,
             "warm_up": False,
             "async_loading_frames": False,
             "constrained_batches": False,
             "sdpa_fallback": True,
+            "attention_backend": ("meta_fa3_fp8_e4m3fn" if attention == "fa3_fp8"
+                                  else "torch_sdpa_flash_efficient_math"),
+            "attention_qkv_dtype": "float8_e4m3fn" if attention == "fa3_fp8" else "bfloat16",
+            "runtime_autocast_dtype": "bfloat16",
         }
     if profile == "egpu":
+        if attention != "sdpa":
+            raise ValueError("the eGPU SAM profile requires sdpa attention")
         if "4090" not in name.lower():
             raise ValueError(
                 "the constrained eGPU profile is qualified only for an RTX 4090-class "
@@ -307,6 +418,9 @@ def resolve_sam_device_profile(
             "async_loading_frames": False,
             "constrained_batches": True,
             "sdpa_fallback": True,
+            "attention_backend": "torch_sdpa_flash_efficient_math",
+            "attention_qkv_dtype": "bfloat16",
+            "runtime_autocast_dtype": "bfloat16",
         }
     raise ValueError("requested SAM device profile must be auto, h100, or egpu")
 
@@ -1803,6 +1917,7 @@ __all__ = (
     "SamPromptBox",
     "SamSessionPlan",
     "SamInterpolationSessionPlan",
+    "audit_sam_fa3_routing",
     "build_local_sam_predictor",
     "configure_constrained_gpu_batches",
     "configure_predictor_confidence",
@@ -1810,9 +1925,11 @@ __all__ = (
     "normalize_video_frame_output",
     "install_sdpa_fallback",
     "plan_sam_sessions",
+    "preflight_sam_fa3",
     "resolve_confidence",
     "resolve_local_sam_bundle",
     "resolve_pinned_sam_runtime_provenance",
+    "resolve_sam_attention_backend",
     "resolve_sam_device_profile",
     "resolve_installed_sam_bpe",
     "revalidate_local_sam_bundle",

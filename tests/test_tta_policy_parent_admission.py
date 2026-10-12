@@ -257,6 +257,9 @@ class PolicyParentWorkspaceIntegrationTests(unittest.TestCase):
                     extrapolation_enabled=False, extrapolation_distance=0,
                     extrapolation_walk_back=1, extrapolation_min_radius=3.),
                 sam_context=None, sam_parent_staging=None,
+                detector_workspace_preparation=None, cpu_input_prefetch=None,
+                gray_capture_reserve_bytes=0, cpu_input_pinned_reserve_bytes=0,
+                input_volume_rgb=np.zeros(shape, np.uint8),
                 policy_settings=SimpleNamespace(enabled=True), bounded_policy_parent_keys=keys,
                 args=SimpleNamespace(imgsz=8, min_conf=1., min_radius=0.,
                     interpolation_distance=0, interpolation_walk_back=1,
@@ -283,7 +286,7 @@ class PolicyParentWorkspaceIntegrationTests(unittest.TestCase):
                 view_processing_futures={}, gpu_worker_pending_task_ids=[],
                 slice_postprocess_workers=1, parent_slice_postprocess_workers=1,
                 parent_interpolation_task_workers=1,
-                parent_transient_admission=SimpleNamespace(reserve=mock.Mock()),
+                parent_transient_admission=SimpleNamespace(reserve=mock.Mock(), in_use=0),
                 angle_variant_streaming_cleanup_active=False,
                 angle_variant_gpu_fastpath_active=False,
                 component_ref_dense_retirement_active=True,
@@ -306,6 +309,10 @@ class PolicyParentWorkspaceIntegrationTests(unittest.TestCase):
             )
             source = Path(pipeline.__file__).read_text(encoding='utf-8')
             _function(source, '_sam_parent_requires_staging', namespace)
+            for helper in ('_detector_future_ram_rights', '_plan_baseline_workspace',
+                           '_discard_baseline_bundles', '_build_baseline_workspaces',
+                           '_adopt_baseline_workspaces'):
+                _function(source, helper, namespace)
             ensure = _function(source, '_ensure_baseline_workspaces', namespace)
             _function(source, '_merge_pending_azimuthal_padding_for_parent', namespace)
             _function(source, '_submit_view_prepare', namespace)

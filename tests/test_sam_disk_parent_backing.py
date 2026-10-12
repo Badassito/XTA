@@ -141,8 +141,10 @@ def test_actual_uint8_allocations_start_zero_and_checkpoint_reuses_identical_mas
     telemetry.add.assert_called_with('sam_interpolation.staging.disk_from_birth_parents',1)
     staged.ready=lambda:True
     resumed,released=staged.pump();assert len(resumed)==1
-    assert leases.leases[key].ram_commitment_bytes == 0
+    # Reopening now runs off the owner thread; keep the promise until it proves disk backing.
+    assert leases.leases[key].ram_commitment_bytes == 120
     prepare.finish();result=next(iter(resumed)).result()
+    assert leases.leases[key].ram_commitment_bytes == 0
     np.testing.assert_array_equal(result.final_view_volume_mm,wanted_mask)
     np.testing.assert_array_equal(result.confidence,wanted_conf)
     task.union_mm._mmap.close();task.confmap_mm._mmap.close()

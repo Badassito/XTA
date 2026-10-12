@@ -43,6 +43,9 @@ from .runtime import (
     choose_slice_parallel_workers,
     close_memmap_array,
     parallel_for_indices_chunked,
+    runtime_telemetry,
+    runtime_telemetry_phase,
+    runtime_trace_event,
 )
 
 
@@ -83,6 +86,53 @@ def _spawn_subprocess_with_retry(spawn: Callable[[], object], desc: str) -> obje
         f'{desc} could not be launched after {attempts} attempts; aborting instead of '
         f'continuing without it: {last_exc}'
     ) from last_exc
+
+def _spawn_decode_process(cmd: Sequence[str]) -> subprocess.Popen:
+    if os.name != 'nt':
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    import _winapi
+    import msvcrt
+    from contextlib import ExitStack
+
+    # Windows' small default pipe throttles raw frames even with parallel decode.
+    read_handle, write_handle = _winapi.CreatePipe(None, 1024 * 1024)
+    read_fd = write_fd = reader = writer = proc = None
+    try:
+        read_fd = msvcrt.open_osfhandle(read_handle, os.O_RDONLY | os.O_BINARY)
+        read_handle = None
+        reader = os.fdopen(read_fd, 'rb')
+        read_fd = None
+        write_fd = msvcrt.open_osfhandle(write_handle, os.O_WRONLY | os.O_BINARY)
+        write_handle = None
+        writer = os.fdopen(write_fd, 'wb', buffering=0)
+        write_fd = None
+        proc = subprocess.Popen(cmd, stdout=writer, stderr=subprocess.PIPE)
+        writer.close()
+        writer = None
+        proc.stdout = reader
+        reader = None
+        return proc
+    except BaseException:
+        if proc is not None:
+            try:
+                proc.kill()
+                proc.wait()
+            finally:
+                if proc.stderr is not None:
+                    proc.stderr.close()
+        raise
+    finally:
+        with ExitStack() as cleanup:
+            for handle in (read_handle, write_handle):
+                if handle is not None:
+                    cleanup.callback(_winapi.CloseHandle, handle)
+            for fd in (read_fd, write_fd):
+                if fd is not None:
+                    cleanup.callback(os.close, fd)
+            for stream in (reader, writer):
+                if stream is not None:
+                    cleanup.callback(stream.close)
+
 
 def ffmpeg_decode_threads() -> int:
     """Return the decoder thread count for input-volume materialization.
@@ -295,6 +345,7 @@ def wait_for_volume_ready(arr: object) -> None:
     if readiness is not None:
         readiness.wait_all()
 
+@runtime_telemetry_phase('startup.source_probe')
 def ffprobe_info(video_path: Path) -> Dict[str, object]:
     """Return dict with width, height, fps, num_frames."""
     _require_bin("ffprobe")
@@ -306,13 +357,20 @@ def ffprobe_info(video_path: Path) -> Dict[str, object]:
         "-of", "json",
         str(video_path),
     ]
-    p = _spawn_subprocess_with_retry(
-        lambda: subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", check=True,
-        ),
-        'ffprobe stream metadata probe',
-    )
+    runtime_trace_event('startup_source_probe_start', phase='metadata')
+    failed = True
+    try:
+        with runtime_telemetry().span('startup.source_probe.metadata'):
+            p = _spawn_subprocess_with_retry(
+                lambda: subprocess.run(
+                    cmd, capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", check=True,
+                ),
+                'ffprobe stream metadata probe',
+            )
+        failed = False
+    finally:
+        runtime_trace_event('startup_source_probe_done', phase='metadata', failed=failed)
     info = json.loads(p.stdout)
     if "streams" not in info or not info["streams"]:
         raise RuntimeError(f"ffprobe: no video stream found in {video_path}")
@@ -346,13 +404,20 @@ def ffprobe_info(video_path: Path) -> Dict[str, object]:
             "-of", "json",
             str(video_path),
         ]
-        p2 = _spawn_subprocess_with_retry(
-            lambda: subprocess.run(
-                fallback_cmd, capture_output=True, text=True, encoding="utf-8",
-                errors="replace", check=True,
-            ),
-            'ffprobe packet-count probe',
-        )
+        runtime_trace_event('startup_source_probe_start', phase='packet_count')
+        failed = True
+        try:
+            with runtime_telemetry().span('startup.source_probe.packet_count'):
+                p2 = _spawn_subprocess_with_retry(
+                    lambda: subprocess.run(
+                        fallback_cmd, capture_output=True, text=True, encoding="utf-8",
+                        errors="replace", check=True,
+                    ),
+                    'ffprobe packet-count probe',
+                )
+            failed = False
+        finally:
+            runtime_trace_event('startup_source_probe_done', phase='packet_count', failed=failed)
         info2 = json.loads(p2.stdout)
         nf = info2["streams"][0].get("nb_read_packets", None)
     if nf is None or str(nf).strip() == "" or str(nf) == "N/A":
@@ -362,6 +427,7 @@ def ffprobe_info(video_path: Path) -> Dict[str, object]:
     num_frames = int(nf)
     return {"width": width, "height": height, "fps": fps, "num_frames": num_frames}
 
+@runtime_telemetry_phase('startup.decode')
 def decode_video_to_memmap_gray8(
     input_video: Path,
     out_dat: Path,
@@ -414,10 +480,15 @@ def decode_video_to_memmap_gray8(
         "-",
     ]
     print(f'FFmpeg gray8 decode threads: {ffmpeg_decode_threads()}')
-    proc = _spawn_subprocess_with_retry(
-        lambda: subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
-        'ffmpeg gray8 decode',
-    )
+    runtime_trace_event('startup_decode_start', streaming=False, frames=int(num_frames))
+    try:
+        proc = _spawn_subprocess_with_retry(
+            lambda: _spawn_decode_process(cmd),
+            'ffmpeg gray8 decode',
+        )
+    except BaseException:
+        runtime_trace_event('startup_decode_done', streaming=False, failed=True, frames=int(num_frames))
+        raise
     assert proc.stdout is not None
 
     stderr_tail = bytearray()
@@ -492,6 +563,9 @@ def decode_video_to_memmap_gray8(
                     view.release()
                 raw_bytes.release()
                 close_memmap_array(arr)
+            runtime_trace_event('startup_decode_done', streaming=False,
+                                failed=decode_error is not None or not process_verified,
+                                frames=int(num_frames))
     return arr
 
 def decode_video_to_memmap_gray8_streaming(
@@ -536,19 +610,21 @@ def decode_video_to_memmap_gray8_streaming(
     frame_bytes = int(width) * int(height)
     chunk_frames = max(1, min(128, max(1, (256 * 1024 * 1024) // max(1, frame_bytes))))
 
+    @runtime_telemetry_phase('startup.decode')
     def _decode_worker() -> None:
         cmd = [
             "ffmpeg", "-v", "error", "-threads", str(ffmpeg_decode_threads()),
             "-i", str(input_video), "-f", "rawvideo", "-pix_fmt", "gray", "-vsync", "0", "-",
         ]
         print(f'FFmpeg gray8 streaming decode threads: {ffmpeg_decode_threads()}')
+        runtime_trace_event('startup_decode_start', streaming=True, frames=int(num_frames))
         # The launch itself must sit inside the failure path: a spawn OSError that escaped
         # this thread used to leave the VolumeReadiness unmarked, so every consumer of the
         # decoded volume blocked forever on wait_for_slice while the pipeline "continued".
         proc: Optional[subprocess.Popen] = None
         try:
             proc = _spawn_subprocess_with_retry(
-                lambda: subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+                lambda: _spawn_decode_process(cmd),
                 'ffmpeg streaming gray8 decode',
             )
             _register_streaming_subprocess(proc)
@@ -571,6 +647,7 @@ def decode_video_to_memmap_gray8_streaming(
                         readiness.mark_slice_ready(int(frame_idx))
                     pbar.update(int(nframes))
             readiness.mark_all_ready()
+            runtime_trace_event('startup_decode_frames_read', streaming=True, frames=int(num_frames))
         except BaseException as exc:
             # Loud failure: waking every waiter with the root cause is what turns a silent
             # consumer hang into an immediate pipeline abort.
@@ -585,18 +662,24 @@ def decode_video_to_memmap_gray8_streaming(
                 pass
             raise
         finally:
-            if proc is not None:
-                try:
-                    if proc.stdout:
-                        proc.stdout.close()
-                        # Keep stderr attached, but do not reread the consumed stdout.
-                        proc.stdout = None
-                    _out, err = proc.communicate()
-                    if proc.returncode not in (0, None):
-                        msg = err.decode("utf-8", errors="replace") if isinstance(err, (bytes, bytearray)) else str(err)
-                        readiness.mark_failed(RuntimeError(f"ffmpeg decode failed: {msg}"))
-                finally:
-                    _unregister_streaming_subprocess(proc)
+            process_verified = False
+            try:
+                if proc is not None:
+                    try:
+                        if proc.stdout:
+                            proc.stdout.close()
+                            # Keep stderr attached, but do not reread the consumed stdout.
+                            proc.stdout = None
+                        _out, err = proc.communicate()
+                        if proc.returncode not in (0, None):
+                            msg = err.decode("utf-8", errors="replace") if isinstance(err, (bytes, bytearray)) else str(err)
+                            readiness.mark_failed(RuntimeError(f"ffmpeg decode failed: {msg}"))
+                        process_verified = readiness._exception is None
+                    finally:
+                        _unregister_streaming_subprocess(proc)
+            finally:
+                runtime_trace_event('startup_decode_done', streaming=True,
+                                    failed=not process_verified, frames=int(num_frames))
 
     # daemon=True: if main dies without reaching abort_streaming_producers,
     # interpreter shutdown must not join a producer that may have hours of decode left.

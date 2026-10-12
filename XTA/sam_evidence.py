@@ -288,6 +288,7 @@ class SamEvidenceWriter:
             self.staging = self.directory.parent / ("." + self.directory.name + ".stage-" + uuid.uuid4().hex)
             self.staging.mkdir()
         self._stream = (self.staging / "masks.bin").open("wb")
+        self._staged_reader = None
         self._packing = None
         self._packing_pending = deque()
         self._packing_reserved = set()
@@ -605,7 +606,16 @@ class SamEvidenceWriter:
     def _drain_packing(self, until=None):
         while self._packing_pending and (until is None or until not in self.records):
             future, key, shape, charged = self._packing_pending.popleft()
-            encoding = future.result()
+            waiting = not future.done()
+            started = time.perf_counter() if waiting else None
+            try:
+                encoding = future.result()
+            finally:
+                if waiting:
+                    from .runtime import runtime_telemetry
+                    telemetry = runtime_telemetry()
+                    telemetry.add('sam.consumer.mask_pack_wait_host_seconds', time.perf_counter()-started)
+                    telemetry.add('sam.consumer.mask_pack_waits', 1)
             self._publish_mask(key, shape, encoding)
             self._packing_bytes -= charged
             self._packing_reserved.remove(key)
@@ -700,13 +710,19 @@ class SamEvidenceWriter:
             write = _mask(masks[f"write:{int(endpoint['frame_index'])}"], shape)
             if np.any(write & observed):
                 raise ValueError("SAM write domain may not repaint an original observation")
+        # Index names only; rescanning every mask for every frame is quadratic.
+        edge_writes = {}
+        for name in masks:
+            if name.startswith("edge_write:"):
+                suffix = name.rsplit(":", 1)[-1]
+                if f"write:{suffix}" in required:
+                    edge_writes.setdefault(suffix, []).append(name)
         for frame in frames:
             if np.any(_mask(masks[f"write:{frame}"], shape) & ~_mask(masks[f"acceptance:{frame}"], shape)):
                 raise ValueError("SAM write domain must be a subset of predeclared acceptance")
-            for name in masks:
-                if name.startswith("edge_write:") and name.endswith(f":{frame}"):
-                    if np.any(_mask(masks[name], shape) & ~_mask(masks[f"write:{frame}"], shape)):
-                        raise ValueError("Branch-specific SAM write domain must be a subset of group write")
+            for name in edge_writes.get(str(frame), ()):
+                if np.any(_mask(masks[name], shape) & ~_mask(masks[f"write:{frame}"], shape)):
+                    raise ValueError("Branch-specific SAM write domain must be a subset of group write")
         for edge in group.get("edges", []):
             if str(edge["source_id"]) not in ids or str(edge["target_id"]) not in ids:
                 raise ValueError("SAM edge references an unknown original endpoint")
@@ -887,15 +903,27 @@ class SamEvidenceWriter:
         self._drain_packing(until=key)
         started, cpu_started = time.perf_counter(), time.thread_time()
         self._stream.flush()
-        with (self.staging / "masks.bin").open("rb") as stream:
-            result = _decode_mask(stream, self.records[key], self.max_mask_bytes)
+        path = self.staging / "masks.bin"
+        if self._staged_reader is None:
+            # Do not retain prefetched bytes across appends or integrity checks.
+            self._staged_reader = path.open("rb", buffering=0)
+        if not os.path.samestat(path.stat(), os.fstat(self._staged_reader.fileno())):
+            raise ValueError("SAM private evidence payload was replaced during staging")
+        result = _decode_mask(self._staged_reader, self.records[key], self.max_mask_bytes)
         from .runtime import runtime_telemetry
         telemetry = runtime_telemetry()
         telemetry.add('sam.consumer.evidence_read_host_seconds', time.perf_counter()-started)
         telemetry.add('sam.consumer.evidence_read_thread_cpu_seconds', time.thread_time()-cpu_started)
         return result
 
+    def _close_staged_reader(self):
+        reader = getattr(self, '_staged_reader', None)
+        if reader is not None:
+            reader.close()
+            self._staged_reader = None
+
     def commit(self, *, complete=True):
+        self._close_staged_reader()
         if complete and self._packing_failure:
             raise RuntimeError('SAM evidence packing failed; successful publication is forbidden')
         self._drain_packing()
@@ -939,6 +967,7 @@ class SamEvidenceWriter:
             if getattr(self, '_packing', None) is not None:
                 self._cancel_packing()
         finally:
+            self._close_staged_reader()
             stream = getattr(self, "_stream", None)
             if stream is not None and not stream.closed:
                 stream.close()

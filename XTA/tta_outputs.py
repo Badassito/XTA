@@ -33,6 +33,7 @@ def measure_bridge_output_survival(
     """
     from .outputs import _nrrd_layer_zero_skip_window
     from .reconciliation_runtime import RuntimeLayer
+    from .interpolation import RawBBoxMaskStore
 
     refs = [ref for ref in refs if (getattr(ref, 'mask_kind', '') == 'bridge'
             and getattr(ref, 'interpolation_backend', '') == 'sam'
@@ -45,12 +46,13 @@ def measure_bridge_output_survival(
         raise ValueError('Bridge survival requires a binary TYX final output')
     if not math.isfinite(float(memory_mib)) or float(memory_mib) <= 0:
         raise ValueError('Bridge survival memory_mib must be positive and finite')
-    # The current source-grid readers return complete planes. Reject an
+    # The fallback source-grid reader returns complete planes. Reject an
     # insufficient budget explicitly rather than allocate an unbounded slab.
     if final.shape[1] * final.shape[2] * 4 > int(float(memory_mib) * 1024**2):
         raise ValueError('Bridge survival memory budget must fit four source-grid planes')
     receipts = []
     seen = set()
+    validated_planes = set()
     for ref in refs:
         if (getattr(ref, 'mask_kind', '') != 'bridge'
                 or getattr(ref, 'interpolation_backend', '') != 'sam'
@@ -67,17 +69,42 @@ def measure_bridge_output_survival(
         start, stop = window if window is not None else (0, int(final.shape[0]))
         measured_start = time.perf_counter()
         selected, retained = 0, 0
+        dense_planes, bbox_crops, validation_planes = 0, 0, 0
+        read_strategy = 'empty_extent'
         owner = None
         try:
             if stop > start:
                 owner = RuntimeLayer(ref, final.shape)
+                source = getattr(owner, 'source', None)
+                # This is precisely the identity branch of the shared
+                # _read_layer_slice_in_output_shape reader. Ref native_transform
+                # describes the original proposal; its backing is already
+                # projected onto this source grid and no view mapping remains.
+                native_bbox = (isinstance(source, RawBBoxMaskStore)
+                    and tuple(source.shape) == tuple(owner.shape_tyx) == tuple(final.shape))
+                read_strategy = 'native_bbox_crops' if native_bbox else 'restored_full_planes'
                 for z in range(start, stop):
-                    mask = owner.read_slab(z, z + 1)
-                    output = final[z:z + 1]
-                    if np.any(output > 1):
-                        raise ValueError('Bridge survival final output must be binary 0/1')
+                    if native_bbox:
+                        decoded = source.decode_slice_crop(z, dtype=np.uint8)
+                        mask = decoded[4] if decoded is not None else None
+                    else:
+                        mask = owner.read_slab(z, z + 1)
+                    if z not in validated_planes:
+                        if np.any(final[z] > 1):
+                            raise ValueError('Bridge survival final output must be binary 0/1')
+                        validated_planes.add(z)
+                        validation_planes += 1
+                    if native_bbox:
+                        if decoded is None:
+                            continue
+                        y0, x0, y1, x1, _crop = decoded
+                        output = final[z, y0:y1, x0:x1]
+                        bbox_crops += 1
+                    else:
+                        output = final[z:z + 1]
+                        dense_planes += 1
                     selected += int(np.count_nonzero(mask))
-                    retained += int(np.count_nonzero(mask.astype(bool) & output.astype(bool)))
+                    retained += int(np.count_nonzero(np.logical_and(mask, output)))
         finally:
             if owner is not None:
                 owner.close()
@@ -89,6 +116,8 @@ def measure_bridge_output_survival(
             selected_voxels=selected, retained_voxels=retained,
             removed_voxels=selected - retained,
             component_payload_reads=int(stop > start), source_grid_planes_read=max(0, stop - start),
+            support_read_strategy=read_strategy, source_grid_full_planes_read=dense_planes,
+            source_grid_bbox_crops_read=bbox_crops, final_binary_validation_planes=validation_planes,
             support_measurement_seconds=time.perf_counter() - measured_start,
             support_survival='later_filtered' if retained < selected else 'support_preserved',
             connection_survival='not_assessed',

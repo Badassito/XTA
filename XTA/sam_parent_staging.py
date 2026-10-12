@@ -7,9 +7,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextlib import contextmanager, nullcontext
-from concurrent.futures import CancelledError
+from concurrent.futures import CancelledError, Future
 import os
 from pathlib import Path
+from types import MappingProxyType
 import shutil
 import threading
 import time
@@ -24,6 +25,7 @@ from .runtime import (path_is_memory_backed, allocate_workspace_array,
                       memfd_ram_headroom, capture_memfd_owner_proofs)
 from .publication_memory import publication_ram_headroom
 from .view_prepare import scratch_unlink_path_for_memmap, classify_dense_ram_backing
+from .scheduler_diagnostics import scheduler_operation, scheduler_step
 
 STREAM_BYTES = 8 * 1024**2
 CODEC_CONTROL_BYTES = 64 * 1024**2
@@ -51,6 +53,20 @@ def _ram_fits(required_bytes, active_bytes=0, dense_limit=None, receipt=None, pr
     return reason is None
 
 
+@dataclass(frozen=True)
+class _RamPromiseSnapshot:
+    key: tuple
+    nbytes: int
+    phase: str
+    owner_count: int
+    ram_backed: object
+    memfd_owner_proofs: tuple
+
+    @property
+    def ram_commitment_bytes(self):
+        return 0 if self.ram_backed is False else int(self.nbytes)
+
+
 def _codec_workspace_bytes(shape):
     # The mask decoder owns at most one bbox plane; the incremental encoder
     # owns <=1MiB row slabs plus its per-frame index. Confidence cells are 128².
@@ -62,6 +78,17 @@ def _codec_workspace_bytes(shape):
 
 def _parent_condition(task):
     return getattr(getattr(task, 'admission', None), 'condition', nullcontext())
+
+
+@contextmanager
+def _try_parent_condition(task):
+    condition = getattr(getattr(task, 'admission', None), 'condition', None)
+    acquired = condition is None or condition.acquire(blocking=False)
+    try:
+        yield acquired
+    finally:
+        if acquired and condition is not None:
+            condition.release()
 
 
 def _dense_startup_budget_locked(task, additional_bytes=0, *, reset_lease=None):
@@ -81,6 +108,9 @@ def _dense_startup_budget_locked(task, additional_bytes=0, *, reset_lease=None):
     check = getattr(context, 'check_startup', None)
     if check is not None:
         check()
+    peaks = getattr(context, '_startup_future_peaks', None)
+    if isinstance(peaks, dict) and all(value == 0 for value in peaks.values()):
+        return None  # No remaining startup grant needs a resident/physical probe.
     if reset_lease is not None:
         additional_bytes = dense_proof_reset_bytes(reset_lease)
     return snapshot(additional_pending_bytes=max(0, int(additional_bytes)))
@@ -553,7 +583,8 @@ class DeferredSamParentQueue:
     """Scheduler-thread queue with a bounded RAM backlog and no SAM waits."""
 
     def __init__(self, *, temp_dir, output_dir, checkpoint_executor, prepare_executor,
-                 leases, dense_limit, ready, keep_temp=False, bounded_parent_keys=()):
+                 leases, dense_limit, ready, keep_temp=False, bounded_parent_keys=(),
+                 prepare_workers=None, prepare_view_families=()):
         self.root = select_checkpoint_root(temp_dir, output_dir)
         self.source_root = Path(temp_dir)
         self.checkpoint_executor = checkpoint_executor
@@ -563,6 +594,14 @@ class DeferredSamParentQueue:
         self.ready = ready
         self.keep_temp = bool(keep_temp)
         self.bounded_parent_keys = bounded_parent_keys
+        if prepare_workers is not None and int(prepare_workers) < 1:
+            raise ValueError('SAM parent preparation workers must be positive')
+        self.prepare_workers = None if prepare_workers is None else int(prepare_workers)
+        self.prepare_view_families = dict(prepare_view_families)
+        self._live_prepares = {}
+        self.ready_prepares = {}
+        self.ready_execution_futures = {}
+        self._cpu_protections = {}
         self.stop = threading.Event()
         self.checkpoint_futures = {}
         self.restore_futures = {}
@@ -577,10 +616,169 @@ class DeferredSamParentQueue:
         self.ram_first_grants = self.ram_first_denials = self.ram_first_releases = 0
         self.last_ram_denial = None
         self.raw_reuse_submissions = 0
+        self.resume_lock_denials = 0
+
+    @staticmethod
+    def _cpu_prepare_family(family):
+        return str(family) in {'orthogonal', 'tilted'}
+
+    def _prepare_family(self, key, task=None):
+        return (str(getattr(task.view, 'family', '')) if task is not None else
+                str(self.prepare_view_families.get(str(key[1]), '')))
+
+    def _prepare_inventory(self, resumed_futures=None):
+        executing = {future for execution, future in self.ready_execution_futures.items()
+                     if not execution.done()}
+        self._live_prepares = {future: saved for future, saved in self._live_prepares.items()
+                               if not future.done() or future in executing}
+        active = dict(self._live_prepares)
+        queued = {saved[2] for saved in self.ready_prepares.values()}
+        if resumed_futures is not None:
+            active.update((future, (key, self._prepare_family(key)))
+                          for future, key in resumed_futures.items()
+                          if not future.done() and future not in active and future not in queued)
+        return active
+
+    def _waiting_cpu_prepares(self):
+        waiting = [(key, task, int(snapshot.required_bytes))
+                   for key, (task, snapshot) in self.deferred.items()
+                   if self._cpu_prepare_family(self._prepare_family(key, task))]
+        waiting.extend((key, task, int(required))
+                       for future, (key, task, required) in self.checkpoint_futures.items()
+                       if not future.cancelled()
+                       and self._cpu_prepare_family(self._prepare_family(key, task)))
+        waiting.extend((key, task, 0) for key, (task, _required, future, _lease)
+                       in self.ready_prepares.items() if not future.cancelled()
+                       and self._cpu_prepare_family(self._prepare_family(key, task)))
+        return waiting
+
+    def _prepare_wave(self, resumed_futures=None):
+        active = self._prepare_inventory(resumed_futures)
+        cpu_active = sum(self._cpu_prepare_family(saved[1]) for saved in active.values())
+        selected = self._selected_cpu_prepares(cpu_active)
+        return active, cpu_active, len(selected), sum(saved[2] for saved in selected)
+
+    def _selected_cpu_prepares(self, cpu_active):
+        if self.prepare_workers is None:
+            return []
+        slots = max(0, min(2, self.prepare_workers-1)-cpu_active)
+        dense_used = sum(self.leases.inference_bytes.values())+sum(self.leases.postprocess_bytes.values())
+        free = max(0, self.dense_limit-dense_used)
+        waiting = sorted(self._waiting_cpu_prepares(),
+            key=lambda saved: (saved[0] not in self._cpu_protections, saved[2]))
+        selected = []
+        for saved in waiting:
+            if len(selected) >= slots:
+                break
+            if saved[2] <= free:
+                selected.append(saved)
+                free -= saved[2]
+        return selected
+
+    def _ordered_deferred(self, resumed_futures=None):
+        pending = list(self.deferred)+list(self.ready_prepares)
+        if self.prepare_workers is None:
+            return pending
+        _active, cpu_active, _protected_slots, _dense = self._prepare_wave(resumed_futures)
+        cpu, expensive = [], []
+        for key in pending:
+            task = (self.ready_prepares[key][0] if key in self.ready_prepares else
+                    self.deferred[key][0])
+            (cpu if self._cpu_prepare_family(self._prepare_family(key, task)) else expensive).append(key)
+        selected = [saved[0] for saved in self._selected_cpu_prepares(cpu_active) if saved[0] in cpu]
+        unselected = [key for key in cpu if key not in selected]
+        # Start GPU work, then fill the CPU lanes before the rest of the GPU wave.
+        return expensive[:1]+selected+expensive[1:]+unselected
+
+    def _protect_cpu_prepares(self, resumed_futures=None):
+        if self.prepare_workers is None:
+            return
+        from .sam_resources import (register_sam_parent_protection,
+            release_sam_parent_protection, sam_parent_protection_active,
+            GIB, MIN_PRODUCTION_EXTRA_BYTES)
+        for key, (pool, token) in list(self._cpu_protections.items()):
+            if not pool.condition.acquire(blocking=False):
+                continue
+            try:
+                if not sam_parent_protection_active(pool, token):
+                    del self._cpu_protections[key]
+            finally:
+                pool.condition.release()
+        _active, cpu_active, _protected_slots, _dense = self._prepare_wave(resumed_futures)
+        selected = self._selected_cpu_prepares(cpu_active)
+        selected_keys = {saved[0] for saved in selected}
+        waiting_keys = (set(self.deferred) | set(self.ready_prepares)
+                        | {saved[0] for saved in self.checkpoint_futures.values()})
+        for key in list(self._cpu_protections):
+            if key in waiting_keys and key not in selected_keys:
+                pool, _token = self._cpu_protections[key]
+                if not pool.condition.acquire(blocking=False):
+                    continue
+                try:
+                    self._release_cpu_protection(key)
+                finally:
+                    pool.condition.release()
+        for key, task, required in selected:
+            if key in self._cpu_protections:
+                continue
+            if required > self.dense_limit:
+                continue  # An exclusive dense parent cannot block an incumbent's transient grant.
+            pool = getattr(task, 'admission', None)
+            if getattr(pool, 'condition', None) is None or not pool.condition.acquire(blocking=False):
+                continue
+            try:
+                workers = len(getattr(getattr(task, 'sam_context', None), 'device_ids', ())) or 1
+                token = register_sam_parent_protection(task, pool,
+                    max(MIN_PRODUCTION_EXTRA_BYTES, workers*2*GIB))
+                if token is not None:
+                    self._cpu_protections[key] = pool, token
+            finally:
+                pool.condition.release()
+
+    def _release_cpu_protection(self, key):
+        saved = self._cpu_protections.pop(key, None)
+        if saved is not None:
+            from .sam_resources import release_sam_parent_protection
+            release_sam_parent_protection(*saved)
+
+    def enqueue_ready(self, task, required_bytes):
+        """Queue an already-owned parent without checkpointing its live input."""
+        key = (str(task.model_name), str(task.view.name))
+        if self.stop.is_set():
+            raise RuntimeError('SAM parent staging is cancelled')
+        if (key in self.ready_prepares or key in self.deferred
+                or any(saved[0] == key for saved in self.checkpoint_futures.values())
+                or any(saved[0] == key for saved in self._live_prepares.values())):
+            raise RuntimeError('SAM parent was queued twice')
+        lease = self.leases.leases.get(key)
+        if (int(required_bytes) <= 0
+                or lease is not None and (lease.phase != 'postprocess'
+                    or key not in self.leases.postprocess_views
+                    or self.leases.postprocess_bytes.get(key) != lease.nbytes
+                    or int(required_bytes) != lease.nbytes
+                    or getattr(task, 'backing_lease', lease) is not lease)
+                or lease is None and getattr(task, 'backing_lease', None) is not None):
+            raise RuntimeError('SAM ready parent lost its original postprocess lease')
+        future = Future()
+        track_cancellation = getattr(task, 'track_cancellation', None)
+        if track_cancellation is not None:
+            track_cancellation(future)
+        self.ready_prepares[key] = task, int(required_bytes), future, lease
+        return future
+
+    @staticmethod
+    def _run_ready_prepare(task, future):
+        if future.set_running_or_notify_cancel():
+            try:
+                result = task()
+            except BaseException as error:
+                future.set_exception(error)
+            else:
+                future.set_result(result)
 
     @property
     def pending(self):
-        return bool(self.checkpoint_futures or self.deferred)
+        return bool(self.checkpoint_futures or self.deferred or self.ready_prepares)
 
     @property
     def dense_limit(self):
@@ -600,11 +798,18 @@ class DeferredSamParentQueue:
             self._published_staging = record
             runtime_telemetry().gauge('sam_interpolation.parent_staging', record)
 
-    def claim_ram_first(self, key, required_bytes, active_bytes, detector_room_bytes=0):
-        """Reserve a RAM owner at birth, leaving room for detector progress."""
-        required_bytes, active_bytes, detector_room_bytes = map(int,
-            (required_bytes, active_bytes, detector_room_bytes))
-        if required_bytes <= 0 or active_bytes < 0 or detector_room_bytes < 0:
+    def _ram_first_basis(self, excluded_key=None):
+        return (int(self.dense_limit), tuple(sorted((key, id(lease), int(lease.nbytes), lease.phase,
+                              lease.owner_count, lease.ram_backed, tuple(lease.memfd_owner_proofs))
+                    for key, lease in self.leases.leases.items() if key != excluded_key)),
+                tuple(sorted(self.ram_first_owners.items())))
+
+    def plan_ram_first(self, key, required_bytes, active_bytes, detector_room_bytes=0,
+                       *, external_future_bytes=0):
+        """Snapshot rights on their owner thread; qualification performs no registry writes."""
+        required_bytes, active_bytes, detector_room_bytes, external_future_bytes = map(int,
+            (required_bytes, active_bytes, detector_room_bytes, external_future_bytes))
+        if required_bytes <= 0 or min(active_bytes, detector_room_bytes, external_future_bytes) < 0:
             raise ValueError('RAM-first claim requires positive owner bytes and nonnegative admission room')
         key = tuple(key)
         if key in self.ram_first_owners:
@@ -614,21 +819,75 @@ class DeferredSamParentQueue:
             excluded_disk_logical_bytes=self.leases.disk_backed_logical_bytes,
             ram_first_reserved_bytes=self.ram_first_bytes, ram_limit_bytes=self.dense_limit,
             total_checked_bytes=required_bytes+detector_room_bytes+active_bytes,
+            external_future_ram_bytes=external_future_bytes,
             anonymous_cap_bytes=None, physical_headroom_bytes=None,
             physical_reserve_bytes=RAM_RESERVE_BYTES)
         reason = ('cancelled' if self.stop.is_set() else
                   'ram_owner_limit' if self.ram_first_bytes + required_bytes > self.dense_limit else None)
-        if reason is not None or not _ram_fits(required_bytes+detector_room_bytes,
-                active_bytes, self.dense_limit, receipt, self.leases.ram_residency_promises()):
+        return MappingProxyType(dict(key=key, required_bytes=required_bytes, active_bytes=active_bytes,
+            detector_room_bytes=detector_room_bytes, external_future_bytes=external_future_bytes,
+            dense_limit=int(self.dense_limit), basis=self._ram_first_basis(key),
+            receipt=MappingProxyType(receipt), reason=reason,
+            promises=tuple(_RamPromiseSnapshot(lease.key, lease.nbytes, lease.phase,
+                lease.owner_count, lease.ram_backed, tuple(lease.memfd_owner_proofs))
+                for parent, lease in self.leases.leases.items() if parent != key)))
+
+    @staticmethod
+    def qualify_ram_first(plan):
+        receipt = dict(plan['receipt'])
+        reason = plan['reason']
+        if (reason is None and plan['required_bytes']+plan['detector_room_bytes']
+                +plan['active_bytes'] > plan['dense_limit']):
+            reason = 'dense_limit'
+        admitted = reason is None and _ram_fits(
+            plan['required_bytes']+plan['detector_room_bytes'],
+            plan['active_bytes']+plan.get('external_future_bytes', 0),
+            None, receipt, plan['promises'])
+        if not admitted:
             receipt['reason'] = reason or receipt.get('reason') or 'ram_admission_refused'
-            self.last_ram_denial = receipt
+        return bool(admitted), receipt
+
+    def ram_first_plans_current(self, claims):
+        return all(plan['basis'] == self._ram_first_basis(plan['key']) for plan, _qualified in claims)
+
+    def adopt_ram_first(self, claims):
+        """Validate a qualified group completely before committing any owner."""
+        claims = tuple((plan, (bool(qualified[0]), dict(qualified[1])))
+                       for plan, qualified in claims)
+        keys = [plan['key'] for plan, _qualified in claims]
+        if len(set(keys)) != len(keys) or any(key in self.ram_first_owners for key in keys):
+            raise RuntimeError('SAM RAM parent was claimed twice')
+        if not self.ram_first_plans_current(claims):
+            return None
+        granted, reserved = [], self.ram_first_bytes
+        for plan, (qualified, _receipt) in claims:
+            admitted = bool(qualified and not self.stop.is_set()
+                and reserved + plan['required_bytes'] <= self.dense_limit)
+            granted.append(admitted)
+            if admitted:
+                reserved += plan['required_bytes']
+        for (plan, (_allowed, receipt)), admitted in zip(claims, granted):
+            if admitted:
+                self.ram_first_owners[plan['key']] = plan['required_bytes']
+                self.ram_first_grants += 1
+            else:
+                self.last_ram_denial = dict(receipt)
+                self.last_ram_denial['reason'] = ('cancelled' if self.stop.is_set()
+                    else receipt.get('reason') or 'group_ram_admission_refused')
+                self.ram_first_denials += 1
+        self._publish_staging()
+        return tuple(granted)
+
+    def claim_ram_first(self, key, required_bytes, active_bytes, detector_room_bytes=0):
+        """Synchronous adapter for callers outside prepared detector admission."""
+        plan = self.plan_ram_first(key, required_bytes, active_bytes, detector_room_bytes)
+        result = self.adopt_ram_first(((plan, self.qualify_ram_first(plan)),))
+        if result is None:
+            self.last_ram_denial = dict(plan['receipt'], reason='ram_promise_basis_changed')
             self.ram_first_denials += 1
             self._publish_staging()
             return False
-        self.ram_first_owners[key] = int(required_bytes)
-        self.ram_first_grants += 1
-        self._publish_staging()
-        return True
+        return result[0]
 
     def owns_ram_first_parent(self, key):
         return tuple(key) in self.ram_first_owners
@@ -686,7 +945,7 @@ class DeferredSamParentQueue:
         self._publish_staging()
 
     def _restore_and_prepare(self, task, snapshot, lease):
-        """Decode after dense admission, on the prepare executor, never the scheduler."""
+        """Reopen/decode after dense admission, never on the scheduler thread."""
         key = (str(task.model_name), str(task.view.name))
         started = time.perf_counter()
         record = dict(model_name=key[0], view_name=key[1], restore_started_monotonic=started,
@@ -697,6 +956,9 @@ class DeferredSamParentQueue:
         for name, saved in (('mask', snapshot.mask), ('confidence', snapshot.confidence)):
             record[name+'_logical_bytes'] = 0 if saved is None else saved.nbytes
             record[name+'_stored_bytes'] = 0 if saved is None else saved.physical_bytes
+            record[name+'_encoding'] = None if saved is None else saved.encoding
+        compact = any(saved is not None and saved.encoding != 'raw'
+                      for saved in (snapshot.mask, snapshot.confidence))
         failed = cancelled = False
         error_class = None
         try:
@@ -705,20 +967,25 @@ class DeferredSamParentQueue:
                 check_cancelled()
             if self.leases.leases.get(key) is not lease:
                 raise RuntimeError('SAM compact restore lost its dense reservation')
-            active = self.leases.ram_commitment_bytes
-            promises = tuple(other for other in tuple(self.leases.leases.values()) if other is not lease)
-            prefer_ram = _ram_fits(snapshot.required_bytes,
-                max(0, active-lease.ram_commitment_bytes), self.dense_limit, None, promises)
+            prefer_ram = False
+            if compact:
+                active = self.leases.ram_commitment_bytes
+                promises = tuple(other for other in tuple(self.leases.leases.values()) if other is not lease)
+                prefer_ram = _ram_fits(snapshot.required_bytes,
+                    max(0, active-lease.ram_commitment_bytes), self.dense_limit, None, promises)
             record['prefer_ram'] = prefer_ram
-            workspace = max(_codec_workspace_bytes(saved.shape)
-                            for saved in (snapshot.mask, snapshot.confidence) if saved is not None)
-            record.update(active_stage='codec_admission',
-                codec_admission_started_monotonic=time.perf_counter())
+            workspace = (max(_codec_workspace_bytes(saved.shape)
+                             for saved in (snapshot.mask, snapshot.confidence) if saved is not None)
+                         if compact else 0)
+            if compact:
+                record.update(active_stage='codec_admission',
+                    codec_admission_started_monotonic=time.perf_counter())
             try:
-                with _codec_reservation(task, workspace):
-                    record['codec_admission_wait_seconds'] = (time.perf_counter()
-                        - record['codec_admission_started_monotonic'])
-                    record['codec_admitted'] = True
+                with (_codec_reservation(task, workspace) if compact else nullcontext()):
+                    if compact:
+                        record['codec_admission_wait_seconds'] = (time.perf_counter()
+                            - record['codec_admission_started_monotonic'])
+                        record['codec_admitted'] = True
                     for saved, name, path_name, kind in (
                             (snapshot.mask, 'union_mm', 'union_path', 'mask'),
                             (snapshot.confidence, 'confmap_mm', 'confmap_path', 'confidence')):
@@ -737,9 +1004,10 @@ class DeferredSamParentQueue:
                                 lease.memfd_owner_proofs = tuple(proof for proof in
                                     lease.memfd_owner_proofs if proof[0] != kind) + proofs
                         try:
-                            array = saved.open(prefer_ram=prefer_ram, stop=self.stop, metrics=metrics,
-                                allocation_guard=lambda: _restore_allocation_guard(task, metrics),
-                                allocation_callback=allocated)
+                            with scheduler_step('sam_parent_restore_'+kind+'_open'):
+                                array = saved.open(prefer_ram=prefer_ram, stop=self.stop, metrics=metrics,
+                                    allocation_guard=lambda: _restore_allocation_guard(task, metrics),
+                                    allocation_callback=allocated)
                         finally:
                             allocation = metrics.get('allocation_seconds', 0.)
                             record['allocation_seconds'] += allocation
@@ -758,8 +1026,10 @@ class DeferredSamParentQueue:
                             if prefer_ram and metrics.get('startup_ram_admitted') is False:
                                 self.restore_startup_fallback_bytes += saved.nbytes
                         del array  # Confidence retirement must not retain a wrapper alias.
+                    if self.stop.is_set():
+                        raise CancelledError('SAM parent restore cancelled')
             except BaseException:
-                _close_sources(task, preserve=False)
+                _close_sources(task, preserve=not compact)
                 raise
             lease.ram_backed = self._restored_ram_backing(task, lease)
             task._sam_checkpoint_prepare_started = True
@@ -843,6 +1113,7 @@ class DeferredSamParentQueue:
         self._ram_checkpoint_bytes(key, task, required_bytes)
         self._submit_checkpoint(key, task, required_bytes)
 
+    @scheduler_operation('sam_parent_pump')
     def pump(self, *, budget=None, resumed_futures=None):
         """Resume parents within the caller's shared background-completion budget.
 
@@ -854,9 +1125,9 @@ class DeferredSamParentQueue:
         def items(mapping):
             return list(mapping) if budget is None else budget.items(0, mapping)
 
-        def completed():
+        def completed(*, progress=True):
             if budget is not None:
-                budget.completed(0)
+                budget.completed(0, progress=progress)
 
         released = False
         # A previously failed checkpoint/restore must surface even when this
@@ -904,57 +1175,98 @@ class DeferredSamParentQueue:
         if self.stop.is_set() or not self.ready():
             self._publish_staging()
             return resumed, released
-        for key in items(self.deferred):
-            task, snapshot = self.deferred[key]
-            if key in self.bounded_parent_keys and snapshot.required_bytes > self.dense_limit:
+        self._protect_cpu_prepares(resumed_futures)
+        for execution, future in list(self.ready_execution_futures.items()):
+            if execution.done():
+                del self.ready_execution_futures[execution]
+                if execution.cancelled():
+                    future.cancel()
+                elif execution.exception() is not None:
+                    if not future.done():
+                        future.set_exception(execution.exception())
+                    execution.result()
+        for key in items(self._ordered_deferred(resumed_futures)):
+            already_owned = key in self.ready_prepares
+            if already_owned:
+                task, required, ready_future, lease = self.ready_prepares[key]
+                if ready_future.cancelled():
+                    del self.ready_prepares[key]
+                    self._release_cpu_protection(key)
+                    completed(progress=False)
+                    continue
+                snapshot = ParentCheckpoint(None, None, required, 0, 0, 0.)
+            else:
+                task, snapshot = self.deferred[key]
+            if (not already_owned and key in self.bounded_parent_keys
+                    and snapshot.required_bytes > self.dense_limit):
                 raise RuntimeError('SAM deferred policy parent exceeds bounded dense limit')
             denied = False
-            with _parent_condition(task):
-                active = sum(self.leases.inference_bytes.values()) + sum(self.leases.postprocess_bytes.values())
-                emergency = not self.leases.leases and key not in self.bounded_parent_keys
-                if not emergency and active + snapshot.required_bytes > self.dense_limit:
+            active_prepares, _cpu_active, protected_slots, protected_dense = self._prepare_wave(
+                resumed_futures)
+            cpu_prepare = self._cpu_prepare_family(self._prepare_family(key, task))
+            if self.prepare_workers is not None and (
+                    len(active_prepares) >= self.prepare_workers
+                    or not cpu_prepare and len(active_prepares) >= self.prepare_workers-protected_slots):
+                completed(progress=False)
+                continue
+            with scheduler_step('sam_parent_resume_admission'), _try_parent_condition(task) as acquired:
+                if not acquired:
+                    self.resume_lock_denials += 1
                     denied = True
-                elif not _dense_startup_fits(_dense_startup_budget_locked(task, snapshot.required_bytes)):
-                    denied = True  # No dense/base/GPU credit is parked behind startup.
                 else:
-                    self.leases.leases[key] = _DirectUnionBackingLease(key, snapshot.required_bytes, phase='postprocess')
-                    self.leases.postprocess_views.add(key)
-                    self.leases.postprocess_bytes[key] = snapshot.required_bytes
-                    lease = self.leases.leases[key]
+                    active = sum(self.leases.inference_bytes.values()) + sum(self.leases.postprocess_bytes.values())
+                    emergency = not self.leases.leases and key not in self.bounded_parent_keys
+                    dense_limit = self.dense_limit-(0 if cpu_prepare else protected_dense)
+                    if (not already_owned and (not emergency and active + snapshot.required_bytes > dense_limit
+                            or emergency and protected_dense
+                            and snapshot.required_bytes > dense_limit)):
+                        denied = True
+                    elif not _dense_startup_fits(_dense_startup_budget_locked(task,
+                            0 if already_owned else snapshot.required_bytes)):
+                        denied = True  # No dense/base/GPU credit is parked behind startup.
+                    elif not already_owned:
+                        self.leases.leases[key] = _DirectUnionBackingLease(key, snapshot.required_bytes, phase='postprocess')
+                        self.leases.postprocess_views.add(key)
+                        self.leases.postprocess_bytes[key] = snapshot.required_bytes
+                        lease = self.leases.leases[key]
             if denied:
-                self.deferred[key] = self.deferred.pop(key)
-                completed()
+                if not already_owned:
+                    self.deferred[key] = self.deferred.pop(key)
+                completed(progress=False)
                 continue
             try:
-                if hasattr(task, 'backing_lease'):
+                if hasattr(task, 'backing_lease') and lease is not None:
                     task.backing_lease = lease
                 rebind_retirement = getattr(task, 'rebind_confidence_retirement', None)
-                if callable(rebind_retirement):
+                if callable(rebind_retirement) and lease is not None:
                     rebind_retirement(lease)
-                compact = any(saved is not None and saved.encoding != 'raw'
-                              for saved in (snapshot.mask, snapshot.confidence))
-                if compact:
+                if already_owned:
+                    future = ready_future
+                    execution = self.prepare_executor.submit(self._run_ready_prepare, task, future)
+                    self.ready_execution_futures[execution] = future
+                elif snapshot.mask is not None or snapshot.confidence is not None:
                     task._sam_checkpoint_prepare_started = False
                     future = self.prepare_executor.submit(self._restore_and_prepare, task, snapshot,
                         lease)
                     self.restore_futures[future] = (key, task, lease)
                 else:
-                    if snapshot.mask is not None:
-                        task.union_mm = snapshot.mask.open()
-                        task.union_path = snapshot.mask.path
-                    if snapshot.confidence is not None:
-                        task.confmap_mm = snapshot.confidence.open()
-                        task.confmap_path = snapshot.confidence.path
                     lease.ram_backed = self._restored_ram_backing(task, lease)
                     future = self.prepare_executor.submit(task)
                 track_cancellation = getattr(task, 'track_cancellation', None)
-                if track_cancellation is not None:
+                if not already_owned and track_cancellation is not None:
                     track_cancellation(future)
             except BaseException:
-                _close_sources(task, preserve=True)
-                self.leases.complete(key, retain_for_dense_retirement=False)
+                self._release_cpu_protection(key)
+                if already_owned:
+                    ready_future.cancel()
+                else:
+                    _close_sources(task, preserve=True)
+                    self.leases.complete(key, retain_for_dense_retirement=False)
                 raise
-            del self.deferred[key]
+            if already_owned:
+                del self.ready_prepares[key]
+            else:
+                del self.deferred[key]
             if snapshot.owned_dir is not None:
                 # The normal prepared-view/run lifecycle now owns these exact
                 # backings. Queue teardown must not unlink a live result.
@@ -962,6 +1274,12 @@ class DeferredSamParentQueue:
             resumed[future] = key
             if resumed_futures is not None:
                 resumed_futures[future] = key
+            self._live_prepares[future] = (key, self._prepare_family(key, task))
+            saved_protection = self._cpu_protections.get(key)
+            if saved_protection is not None:
+                from .sam_resources import release_sam_parent_protection
+                future.add_done_callback(lambda _done, saved=saved_protection:
+                    release_sam_parent_protection(*saved))
             self.resumed_count += 1
             completed()
         self._publish_staging()
@@ -969,6 +1287,15 @@ class DeferredSamParentQueue:
 
     def abort(self):
         self.stop.set()
+        for key in list(self._cpu_protections):
+            self._release_cpu_protection(key)
+        for _task, _required, future, _lease in self.ready_prepares.values():
+            future.cancel()
+        for execution, future in self.ready_execution_futures.items():
+            if execution.cancel():
+                future.cancel()
+        for future in self._live_prepares:
+            future.cancel()
         for future, (_key, task, _required) in self.checkpoint_futures.items():
             if future.cancel():
                 _close_sources(task, preserve=self.keep_temp)
@@ -980,8 +1307,14 @@ class DeferredSamParentQueue:
         self.abort()
 
     def snapshot(self):
+        active, cpu_active, protected_slots, protected_dense = self._prepare_wave()
         return dict(checkpoint_parents=self.count, resumed_parents=self.resumed_count,
+            prepare_workers=self.prepare_workers, active_prepares=len(active),
+            active_cpu_prepares=cpu_active, protected_cpu_prepare_slots=protected_slots,
+            protected_cpu_dense_bytes=protected_dense,
+            parent_prepare_order='gpu_first_with_cpu_lanes' if self.prepare_workers is not None else 'fifo',
             pending_checkpoints=len(self.checkpoint_futures), deferred_parents=len(self.deferred),
+            queued_ready_parents=len(self.ready_prepares),
             pending_checkpoint_dense_bytes=sum(int(saved[2]) for saved in self.checkpoint_futures.values()),
             ram_first_owner_key=self.ram_first_key,
             ram_first_owner_keys=tuple(self.ram_first_owners),
@@ -993,6 +1326,7 @@ class DeferredSamParentQueue:
             last_ram_denial=self.last_ram_denial,
             ram_first_releases=self.ram_first_releases,
             raw_reuse_submissions=self.raw_reuse_submissions,
+            resume_lock_denials=self.resume_lock_denials,
             written_bytes=self.written_bytes, reused_regular_disk_bytes=self.reused_bytes,
             io_seconds=self.io_seconds, stream_buffer_limit=STREAM_BYTES,
             checkpoint_wall_seconds=self.io_seconds,
@@ -1023,6 +1357,14 @@ class DeferredSamParentQueue:
             if future.cancelled() or future.exception() is not None:
                 self._retire_failed_restore(key, task, lease)
         self.restore_futures.clear()
+        if any(not future.done() for future in self.ready_execution_futures):
+            raise RuntimeError('SAM ready execution must settle before staging cleanup')
+        self.ready_execution_futures.clear()
+        self.ready_prepares.clear()
+        self._cpu_protections.clear()
+        if any(not future.done() for future in self._live_prepares):
+            raise RuntimeError('SAM parent prepares must settle before staging cleanup')
+        self._live_prepares.clear()
         self.deferred.clear()
         if not self.keep_temp and self.root.exists():
             for child in self.root.iterdir():

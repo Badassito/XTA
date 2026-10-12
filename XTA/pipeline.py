@@ -151,6 +151,7 @@ from .runtime import (
     sam_sessions_per_gpu,
     resolve_worker_count,
     runtime_telemetry,
+    runtime_trace_event,
     scratch_dir_is_memory_backed,
     set_gpu_worker_aux_interpolation_pool,
     set_interpolation_process_executor,
@@ -406,8 +407,8 @@ from .tta_prediction import (
     PredictionSourceOperations,
     ViewFrameCache,
 )
-from .scheduler_diagnostics import scheduler_operation
-from .tta_background import BackgroundDrainBudget
+from .scheduler_diagnostics import scheduler_operation, scheduler_step
+from .tta_background import BackgroundDrainBudget, SchedulerBackgroundExecutor
 from .tta_scheduler import (
     TtaScheduler,
     TtaSchedulerCallbacks,
@@ -563,11 +564,11 @@ def _execution_runtime_provenance() -> Dict[str, object]:
     # actual SAM preparation/publication bytes for next-run timing attribution
     # without importing optional model runtimes merely to fingerprint them.
     for name in ('assembly', 'view_prepare', 'projection_queue', 'sam_integration',
-                 'sam_interpolation', 'sam_extrapolation', 'sam_extrapolation_policy',
+                 'sam_interpolation', 'sam_extrapolation', 'sam_extrapolation_policy', 'sam_retry_groups',
                  'sam_tracker_runtime', 'sam_device_pool', 'sam_resources', 'sam_image_prefetch', 'sam_crop_retry',
-                 'sam_parent_staging',
+                 'sam_parent_staging', 'tta_background', 'detector_workspaces', 'yolo_cpu_input', 'gray_cache', 'sam_yolo_capture', 'sam_view_geometry',
                  'sam_policy', 'sam_mask_reader',
-                 'sam_branch_selection', 'sam_evidence', 'sam_canvas_rendering'):
+                 'sam_branch_selection', 'sam_evidence', 'sam_canvas_rendering', 'tta_outputs'):
         path = package / (name + '.py')
         entry = {'path': str(path), 'loaded_in_parent': 'XTA.' + name in sys.modules}
         try:
@@ -579,6 +580,8 @@ def _execution_runtime_provenance() -> Dict[str, object]:
     result['native_trt_ring_requested'] = native_trt_ring_enabled()
     result['native_trt_ring_mode'] = native_trt_ring_mode()
     result['task_trace_requested'] = _env_flag('YOLO_TTA_TASK_TRACE', False)
+    result['sam_gray_capture_requested'] = _env_flag('YOLO_TTA_SAM_GRAY_CACHE', True)
+    result['cpu_input_prefetch_requested'] = _env_flag('YOLO_TTA_CPU_INPUT_PREFETCH', True)
     result['cropped_upload_pipeline_requested'] = True
     result['spherical_cpu_compact_requested'] = True
     result['tilted_azimuthal_cuda_projection_requested'] = _env_flag(
@@ -859,6 +862,7 @@ def main() -> None:
 def _main_impl() -> None:
     pipeline_wall_started = time.perf_counter()
     initialize_runtime_observability()
+    runtime_trace_event('startup_pipeline_begin')
     parser = build_argparser()
     args = parser.parse_args()
     configure_component_replay_capture(
@@ -969,7 +973,8 @@ def _main_impl() -> None:
     if interpolation_settings.sam_enabled:
         from .lta_sam import resolve_local_sam_bundle
         try:
-            sam_bundle = resolve_local_sam_bundle(interpolation_settings.sam_model)
+            with runtime_telemetry().span('startup.sam_bundle_validation'):
+                sam_bundle = resolve_local_sam_bundle(interpolation_settings.sam_model)
         except (ValueError, OSError) as exc:
             parser.error(str(exc))
     for backend_name, requested_path in (
@@ -1050,10 +1055,11 @@ def _main_impl() -> None:
         ]
     except RuntimeError as exc:
         parser.error(str(exc))
-    gpu_feeder_core_plan: List[List[int]] = (
-        plan_gpu_feeder_core_reservations(pinned_gpu_tokens)
-        if gpu_worker_process_active else []
-    )
+    with runtime_telemetry().span('startup.gpu_feeder_topology'):
+        gpu_feeder_core_plan: List[List[int]] = (
+            plan_gpu_feeder_core_reservations(pinned_gpu_tokens)
+            if gpu_worker_process_active else []
+        )
     gpu_feeder_reserved_cpus = {
         int(cpu) for values in gpu_feeder_core_plan for cpu in values
     }
@@ -1483,11 +1489,14 @@ def _main_impl() -> None:
         unified_launch_at_start is not None
         and str(unified_launch_at_start.mode) == 'tta'
     ):
-        tta_artifact_identities = capture_tta_artifact_identities(
-            input_path=input_path,
-            gpu_model_path=gpu_model_path,
-            cpu_model_path=cpu_model_path,
-        )
+        runtime_trace_event('startup_artifact_identity_start')
+        with runtime_telemetry().span('startup.artifact_identity'):
+            tta_artifact_identities = capture_tta_artifact_identities(
+                input_path=input_path,
+                gpu_model_path=gpu_model_path,
+                cpu_model_path=cpu_model_path,
+            )
+        runtime_trace_event('startup_artifact_identity_done')
         # Atomically invalidate any prior successful association before this run
         # starts creating or replacing output artifacts.
         write_json_manifest(
@@ -2382,14 +2391,32 @@ def _main_impl() -> None:
     interpolation_stats: List[Dict[str, object]] = []
     sam_context = None
     sam_parent_staging = None
+    sam_gray_cache_root = None
+    gray_capture_reserve_bytes = 0
+    cpu_input_prefetch = None
+    cpu_input_pinned_reserve_bytes = 0
 
     def _sam_startup_checkpoint_promises():
-        return 0 if sam_parent_staging is None else sam_parent_staging.checkpoint_copy_promises()
+        return (gray_capture_reserve_bytes + cpu_input_pinned_reserve_bytes
+            + (0 if cpu_input_prefetch is None else cpu_input_prefetch.reserved_bytes)
+            + (0 if sam_parent_staging is None else sam_parent_staging.checkpoint_copy_promises()))
 
     if interpolation_settings.sam_enabled:
         from .sam_integration import SamInterpolationContext
         from .artifact_archive import reference as artifact_reference
+        from .workspace import _env_flag
         source_stat = input_path.stat()
+        gray_capture_enabled = _env_flag('YOLO_TTA_SAM_GRAY_CACHE', True)
+        if not gray_capture_enabled:
+            print('SAM gray capture disabled (YOLO_TTA_SAM_GRAY_CACHE=0); using source rendering.', flush=True)
+        if gray_capture_enabled and gpu_worker_process_active and not path_is_memory_backed(temp_dir):
+            from .gray_cache import gray_encoder_info
+            from uuid import uuid4
+            gray_codec = gray_encoder_info()
+            print(f"SAM gray capture codec: {gray_codec['backend']} "
+                  f"({gray_codec['codec']}, level={gray_codec['level']}, "
+                  f"version={gray_codec['version']}).", flush=True)
+            sam_gray_cache_root = temp_dir / 'sam_gray_cache' / uuid4().hex
         sam_context = SamInterpolationContext(
             model_path=str(interpolation_settings.sam_model),
             device_ids=interpolation_settings.sam_devices, temp_dir=temp_dir,
@@ -2408,6 +2435,7 @@ def _main_impl() -> None:
             adaptive_crop=interpolation_settings.sam_adaptive_crop,
             progressive_startup=True,
             startup_pending_host_bytes=_sam_startup_checkpoint_promises,
+            gray_cache_root=sam_gray_cache_root,
             interpolation_policy_enabled=(interpolation_settings.enabled and
                                           interpolation_settings.backend == 'sam'),
             source_resize_semantics=('native' if not cube_resize_will_apply else
@@ -2878,16 +2906,16 @@ def _main_impl() -> None:
     view_processing_futures: Dict[Future, Tuple[str, str]] = {}
     sam_checkpoint_executor = None
     sam_cpu_prepare_executor = None
-    sam_cpu_futures = {'source': None, 'runtime': None, 'runtime_needed': False}
+    sam_cpu_futures = {'source': None, 'runtime': None, 'runtime_needed': False,
+                       'source_retry_after': 0.}
     sam_cpu_max_detector_parent = 0
     if sam_context is not None and sam_context.shared_detector_devices:
         from .sam_parent_staging import DeferredSamParentQueue
         sam_checkpoint_executor = _create_tracked_thread_pool(
             max_workers=int(parent_postprocess_workers), thread_name_prefix='sam-parent-checkpoint',
         )
-        sam_cpu_prepare_executor = _create_tracked_thread_pool(
-            max_workers=1, thread_name_prefix='sam-parent-cpu-prepare',
-        )
+        sam_cpu_prepare_executor = SchedulerBackgroundExecutor(thread_name='sam-parent-cpu-prepare')
+        _run_resources().track_executor(sam_cpu_prepare_executor)
         sam_cpu_max_detector_parent = max((int(array_nbytes(
             view_processing_volume_shape(candidate,int(args.imgsz)),np.uint8))
             *(2 if float(args.min_conf)>0 or bool(getattr(args,'reconciliation_retain_confidence',False)) else 1)
@@ -2900,6 +2928,8 @@ def _main_impl() -> None:
             ready=lambda: _sam_parents_ready(),
             keep_temp=bool(keep_temp_artifacts),
             bounded_parent_keys=bounded_policy_parent_keys,
+            prepare_workers=int(parent_postprocess_workers),
+            prepare_view_families={str(view.name): str(view.family) for view in inference_views},
         )
         _run_resources().track_closeable(sam_parent_staging)
 
@@ -2915,6 +2945,7 @@ def _main_impl() -> None:
         future.result()
         return bool(getattr(sam_context, 'runtime_ready', sam_context.detector_retirement_ready))
 
+    @scheduler_operation('sam_runtime_poll')
     def _maybe_prepare_sam_runtime():
         if sam_context is None or getattr(sam_context, '_closed', False):
             return
@@ -2932,15 +2963,21 @@ def _main_impl() -> None:
             sam_cpu_futures['runtime'] = sam_cpu_prepare_executor.submit(
                 sam_context.prepare_runtime, parent_transient_admission)
 
+    @scheduler_operation('sam_cpu_source_poll')
     def _maybe_prepare_sam_cpu_source():
-        if sam_cpu_futures['source'] is not None:
-            if sam_cpu_futures['source'].done():
-                sam_cpu_futures['source'].result()
+        future = sam_cpu_futures['source']
+        if future is not None:
+            if not future.done() or future.result():
+                return
+            sam_cpu_futures['source'] = None
+            sam_cpu_futures['source_retry_after'] = time.monotonic() + .5
+        if (sam_cpu_prepare_executor is None or sam_context.detector_retirement_ready
+                or getattr(sam_context, '_closed', False)):
             return
-        if sam_cpu_prepare_executor is None or sam_context.detector_retirement_ready:
+        if time.monotonic() < sam_cpu_futures.get('source_retry_after', 0.):
             return
         source = sam_context.source_volume
-        if (not bool(getattr(source,'_is_lazy_processing_cube',False)) or source.materialized
+        if (not bool(getattr(source,'_is_lazy_processing_cube',False))
                 or not any(str(view.family)!='orthogonal' or physical_view_name(view)!='transverse'
                            for view in views)):
             return
@@ -2948,19 +2985,33 @@ def _main_impl() -> None:
         ready = volume_readiness(source.source)
         if ready is not None and not ready._all_event.is_set():
             return
-        from .sam_resources import physical_sam_headroom
-        dense_used = sum(direct_union_inference_bytes.values())+sum(direct_union_postprocess_bytes.values())
-        # Leave every unspent detector/parent allowance free. The existing
-        # exact cube producer owns its disk map; no parent or profile is parked.
-        required = (int(source.nbytes)+max(0,int(direct_union_total_dense_byte_limit)-dense_used)
-                    +max(0,int(parent_transient_admission.capacity)-int(parent_transient_admission.in_use)))
-        if physical_sam_headroom() < required:
-            return
+        # Full ceilings remain conservative while the scheduler changes live
+        # grants; the background probe never reads its mutable ownership maps.
+        required = (int(source.nbytes)+max(0,int(direct_union_total_dense_byte_limit))
+                    +max(0,int(parent_transient_admission.capacity)))
         def materialize_cpu_source():
+            from .sam_resources import physical_sam_headroom
+            def unneeded():
+                cancel = getattr(sam_context, '_cancel', None)
+                return (getattr(sam_context, '_closed', False)
+                        or cancel is not None and cancel.is_set()
+                        or sam_context.detector_retirement_ready or source.materialized)
+            if unneeded():
+                return True
+            with scheduler_step('sam_cpu_source_headroom'):
+                headroom = physical_sam_headroom()
+            runtime_telemetry().gauge('sam.cpu_source_headroom',
+                dict(required_bytes=required, available_bytes=headroom))
+            if unneeded():
+                return True
+            if headroom < required:
+                return False
             started=time.perf_counter()
-            source.materialize(reason='SAM CPU prerequisites while detector inference is active')
+            with scheduler_step('sam_cpu_source_materialize'):
+                source.materialize(reason='SAM CPU prerequisites while detector inference is active')
             sam_context._add_image_metrics(source_materializations=1,
                 source_materialization_seconds=time.perf_counter()-started)
+            return True
         sam_cpu_futures['source'] = sam_cpu_prepare_executor.submit(materialize_cpu_source)
     view_processing_submitted: set[Tuple[str, str]] = set()
     physical_view_finalization_futures: Dict[Future, Tuple[str, str]] = {}
@@ -3017,155 +3068,267 @@ def _main_impl() -> None:
                          interpolation_settings.backend == 'sam'
                          and _view_uses_interpolation(view, int(args.interpolation_distance))))
 
+    detector_workspace_preparation = None
+
+    def _detector_future_ram_rights():
+        from .media import volume_readiness
+        prefill = 0 if cpu_input_prefetch is None else int(cpu_input_prefetch.reserved_bytes)
+        native_ready = volume_readiness(input_volume_rgb)
+        native_bytes = (int(input_volume_rgb.nbytes) if native_ready is not None
+                        and not native_ready._all_event.is_set() else 0)
+        source = None if sam_context is None else sam_context.source_volume
+        source_bytes = (int(source.nbytes) if source is not None
+            and bool(getattr(source, '_is_lazy_processing_cube', False))
+            and not source.materialized and sam_cpu_futures['source'] is not None else 0)
+        funded = bool(sam_context is not None and getattr(sam_context, '_startup_fleet_funded', False))
+        peaks = (() if not funded else tuple(sorted(getattr(sam_context, '_startup_future_peaks', {}).items())))
+        startup = (0 if not funded else int(getattr(sam_context, '_startup_fleet_credit_bytes', 0))
+                   + sum(max(0, int(value)) for _key, value in peaks))
+        transient = int(parent_transient_admission.in_use)
+        capture, pinned = int(gray_capture_reserve_bytes), int(cpu_input_pinned_reserve_bytes)
+        return (prefill + native_bytes + source_bytes + max(startup, transient) + capture + pinned,
+                (prefill, native_bytes, source_bytes, funded, peaks, startup, transient, capture, pinned))
+
+    def _plan_baseline_workspace(model_name, view, *, lease=None, legacy=False):
+        from types import MappingProxyType
+        key = (str(model_name), str(view.name))
+        shape = tuple(view_processing_volume_shape(view, int(args.imgsz)))
+        volume_count = (2 if float(args.min_conf) > 0
+            or bool(getattr(args, 'reconciliation_retain_confidence', False)) else 1)
+        if dense_tiling_active:
+            volume_count += 1 + (2 if component_layers_needed else 0)
+        logical_bytes = int(array_nbytes(shape, np.uint8)) * volume_count
+        sam_blocked = _sam_parent_requires_staging(view)
+        active = view_prepare_leases.ram_commitment_bytes
+        if lease is not None:
+            active -= lease.ram_commitment_bytes
+        external_bytes, external_basis = _detector_future_ram_rights()
+        ram_plan, ram_claimed = None, False
+        if sam_blocked:
+            if legacy:
+                ram_claimed = sam_parent_staging.claim_ram_first(key, logical_bytes, active,
+                    detector_room_bytes=int(sam_cpu_max_detector_parent))
+            else:
+                ram_plan = sam_parent_staging.plan_ram_first(key, logical_bytes, active,
+                    detector_room_bytes=int(sam_cpu_max_detector_parent), external_future_bytes=external_bytes)
+        union_path = temp_dir / 'union' / str(model_name) / f'{view.name}.union.u8.dat'
+        confmap_path = temp_dir / 'union' / str(model_name) / f'{view.name}.confmap.u8.dat'
+        return MappingProxyType(dict(key=key, model_name=str(model_name), view=view, shape=shape,
+            union_path=union_path, confmap_path=confmap_path, logical_bytes=logical_bytes,
+            shared=bool(worker_direct_union_active), lease=lease, legacy=legacy,
+            sam_blocked=sam_blocked, ram_plan=ram_plan, ram_claimed=ram_claimed,
+            external_basis=external_basis))
+
+    def _discard_baseline_bundles(bundles):
+        from .view_prepare import _array_lifetime_owner
+        refs = []
+        for bundle in bundles:
+            for name, path_name in (('conf_mm', 'confmap_path'), ('union_mm', 'union_path')):
+                value = bundle.get(name)
+                if value is not None:
+                    refs.append(weakref.ref(_array_lifetime_owner(value)))
+                    close_memmap_array_without_flush(value,
+                        unlink_path=scratch_unlink_path_for_memmap(value, bundle[path_name]))
+                    bundle[name] = None
+                    del value
+        return tuple(refs)
+
+    def _build_baseline_workspaces(plans, existing, stop):
+        from .detector_workspaces import WorkspaceBirthFailure
+        bundles = [] if existing is None else existing
+        try:
+            qualifications = [((plan['ram_claimed'], {}) if plan['ram_plan'] is None else
+                sam_parent_staging.qualify_ram_first(plan['ram_plan'])) for plan in plans]
+            if existing is not None:
+                for bundle, qualified in zip(bundles, qualifications):
+                    bundle['ram_qualification'] = qualified
+                if stop.is_set():
+                    raise RuntimeError('Detector workspace preparation cancelled')
+                return bundles
+            for plan, qualified in zip(plans, qualifications):
+                if stop.is_set():
+                    raise RuntimeError('Detector workspace preparation cancelled')
+                union_path, confmap_path = plan['union_path'], plan['confmap_path']
+                union_path.parent.mkdir(parents=True, exist_ok=True)
+                ram = bool(qualified[0])
+                disk = bool(plan['sam_blocked'] and not ram
+                    and sam_parent_staging.reusable_workspace_paths(union_path, confmap_path))
+                prefer_memory = not policy_settings.enabled and not (
+                    interpolation_process_backend_enabled() and _view_uses_interpolation(plan['view'], int(args.interpolation_distance))
+                    or plan['shared'])
+                bundle = dict(union_mm=None, conf_mm=None, union_path=union_path,
+                    confmap_path=confmap_path, ram_qualification=qualified, disk_birth=disk,
+                    key=plan['key'])
+                bundles.append(bundle)
+                bundle['union_mm'] = allocate_workspace_array(shape=plan['shape'], dtype=np.uint8,
+                    path=union_path, desc=f"{plan['model_name']}/{plan['view'].name} baseline union workspace",
+                    prefer_memory=bool(prefer_memory and not disk),
+                    prefer_memfd=bool((plan['shared'] or ram) and not disk))
+                if float(args.min_conf) > 0 or bool(getattr(args, 'reconciliation_retain_confidence', False)):
+                    if stop.is_set():
+                        raise RuntimeError('Detector workspace preparation cancelled')
+                    bundle['conf_mm'] = allocate_workspace_array(shape=plan['shape'], dtype=np.uint8,
+                        path=confmap_path, desc=f"{plan['model_name']}/{plan['view'].name} baseline confidence workspace",
+                        prefer_memory=bool(not disk and not plan['shared'] and not policy_settings.enabled
+                            and not bool(getattr(args, 'reconciliation_retain_confidence', False))),
+                        prefer_memfd=bool((plan['shared'] or ram) and not disk))
+                union_mm, conf_mm = bundle['union_mm'], bundle['conf_mm']
+                union_backing = _memmap_backing_path(union_mm)
+                conf_backing = _memmap_backing_path(conf_mm) if conf_mm is not None else None
+                if plan['shared'] and (union_backing is None or conf_mm is not None and conf_backing is None):
+                    raise RuntimeError(f"{plan['key']} direct-union workspace is not process-shareable")
+                flags = tuple(not isinstance(value, np.memmap) or _memfd_owner_key_from_array(value) is not None
+                    or backing is not None and path_is_memory_backed(backing)
+                    for value, backing in ((union_mm, union_backing), (conf_mm, conf_backing)) if value is not None)
+                bundle.update(union_backing=union_backing or union_path,
+                    conf_backing=(conf_backing or confmap_path) if conf_mm is not None else None,
+                    slice_locks=[threading.Lock() for _ in range(int(plan['view'].num_slices))],
+                    ram_flags=flags, ram_backed=classify_dense_ram_backing((union_mm, conf_mm),
+                        future_ram_bytes=max(0, plan['logical_bytes']-int(union_mm.nbytes)
+                            -(0 if conf_mm is None else int(conf_mm.nbytes)))),
+                    proofs=capture_memfd_owner_proofs({'mask': union_mm, 'confidence': conf_mm}))
+                del union_mm, conf_mm
+            if stop.is_set():
+                raise RuntimeError('Detector workspace preparation cancelled')
+            return bundles
+        except BaseException as error:
+            union_mm = conf_mm = None
+            refs = _discard_baseline_bundles(bundles)
+            bundles.clear()
+            error.__traceback__ = None  # Failed helper frames must not keep retired array aliases alive.
+            raise WorkspaceBirthFailure(error, refs) from error
+
+    def _adopt_baseline_workspaces(plans, bundles):
+        if len(plans) != len(bundles) or len({plan['key'] for plan in plans}) != len(plans):
+            raise RuntimeError('Detector workspace preparation returned an incomplete group')
+        claims = []
+        for plan, bundle in zip(plans, bundles):
+            key, lease = plan['key'], plan['lease']
+            if bundle['key'] != key:
+                raise RuntimeError('Detector workspace preparation changed a member identity')
+            if key in baseline_union_by_model_view:
+                raise RuntimeError(f'detector workspace {key} was published twice')
+            if lease is not None and (direct_union_backing_leases.get(key) is not lease
+                    or lease.phase != 'preparing' or lease.owner_count != 1
+                    or key not in direct_union_inference_views
+                    or direct_union_inference_bytes.get(key) != lease.nbytes
+                    or lease.nbytes != plan['logical_bytes']):
+                raise RuntimeError(f'detector workspace {key} lost its preparing reservation')
+            if lease is None and key in direct_union_backing_leases:
+                raise RuntimeError(f'detector workspace {key} already has another backing owner')
+            if not plan['legacy'] and plan['external_basis'] != _detector_future_ram_rights()[1]:
+                return False
+            if plan['ram_plan'] is not None:
+                allowed, receipt = bundle['ram_qualification']
+                receipt = dict(receipt)
+                if not any(bundle['ram_flags']):
+                    allowed, receipt['reason'] = False, 'ram_allocation_fallback'
+                claims.append((plan['ram_plan'], (allowed, receipt)))
+        grants = () if not claims else sam_parent_staging.adopt_ram_first(claims)
+        if grants is None:
+            return False
+        granted_by_key = {plan['key']: granted for (plan, _receipt), granted in zip(claims, grants)}
+        for plan, bundle in zip(plans, bundles):
+            key, lease = plan['key'], plan['lease']
+            if lease is None and (plan['shared'] or key in bounded_policy_parent_keys):
+                if key in direct_union_backing_leases:
+                    raise RuntimeError(f'direct-union backing {key} was admitted more than once')
+                lease = _DirectUnionBackingLease(key, plan['logical_bytes'])
+                direct_union_backing_leases[key] = lease
+                direct_union_inference_views.add(key)
+                direct_union_inference_bytes[key] = plan['logical_bytes']
+            baseline_union_by_model_view[key] = bundle['union_mm']
+            baseline_confmap_by_model_view[key] = bundle['conf_mm']
+            baseline_union_paths[key] = bundle['union_backing']
+            baseline_confmap_paths[key] = bundle['conf_backing']
+            baseline_slice_locks_by_model_view[key] = bundle['slice_locks']
+            if lease is not None:
+                lease.ram_backed, lease.memfd_owner_proofs = bundle['ram_backed'], bundle['proofs']
+                if lease.phase == 'preparing':
+                    lease.transition('preparing', 'inference')
+            claimed = plan['ram_claimed'] if plan['legacy'] else granted_by_key.get(key, False)
+            if claimed and not any(bundle['ram_flags']):
+                sam_parent_staging.release_ram_first(key)
+                claimed = False
+            if plan['sam_blocked']:
+                runtime_telemetry().add('sam_interpolation.staging.' + (
+                    'ram_first_actual_parents' if claimed else 'disk_from_birth_parents'
+                    if bundle['disk_birth'] else 'checkpoint_copy_backing_parents'), 1)
+            bundle.clear()  # Completed futures must not retain arrays moved to the live maps.
+        return True
+
+    def _refresh_workspace_plans(plans):
+        return tuple(_plan_baseline_workspace(plan['model_name'], plan['view'], lease=plan['lease']) for plan in plans)
+
+    def _rollback_workspace_plans(plans):
+        for plan in plans:
+            key, lease = plan['key'], plan['lease']
+            if lease is not None and (direct_union_backing_leases.get(key) is not lease
+                    or lease.phase != 'preparing' or lease.owner_count != 1):
+                raise RuntimeError(f'detector workspace {key} cannot return another owner\'s credit')
+        for plan in plans:
+            key, lease = plan['key'], plan['lease']
+            if lease is not None:
+                if direct_union_backing_leases.get(key) is not lease or lease.phase != 'preparing':
+                    raise RuntimeError(f"detector workspace {key} cannot return another owner's credit")
+                direct_union_backing_leases.pop(key)
+                direct_union_inference_views.remove(key)
+                direct_union_inference_bytes.pop(key)
+                scheduler_state.direct_union_admission_group_by_parent.pop(key, None)
+                lease.release('preparing')
+            if plan['ram_claimed']:
+                sam_parent_staging.release_ram_first(key)
+        if scheduler is not None:
+            scheduler.notify_gpu_stage_admission_change()
+
+    def _request_baseline_workspaces(task):
+        key = scheduler.direct_union_task_key(task)
+        if key is None:
+            return True
+        members = scheduler._direct_union_admission_tasks(task)
+        keys = tuple(scheduler.direct_union_task_key(member) for member in members)
+        if all(member_key in baseline_union_by_model_view for member_key in keys):
+            return True
+        if key in detector_workspace_preparation.records:
+            return False
+        if any(member_key in baseline_union_by_model_view or member_key in direct_union_backing_leases for member_key in keys):
+            raise RuntimeError(f'detector workspace group {key} was partly admitted')
+        leases = tuple(_DirectUnionBackingLease(member_key, scheduler._direct_union_parent_bytes(member),
+            phase='preparing') for member_key, member in zip(keys, members))
+        for member_key, lease in zip(keys, leases):
+            direct_union_backing_leases[member_key] = lease
+            direct_union_inference_views.add(member_key)
+            direct_union_inference_bytes[member_key] = lease.nbytes
+            scheduler_state.direct_union_admission_group_by_parent[member_key] = key
+        try:
+            plans = tuple(_plan_baseline_workspace(str(member_key[0]), member['view'], lease=lease)
+                          for member_key, member, lease in zip(keys, members, leases))
+        except BaseException:
+            _rollback_workspace_plans(tuple(dict(key=member_key, lease=lease, ram_claimed=False)
+                                            for member_key, lease in zip(keys, leases)))
+            raise
+        detector_workspace_preparation.request(key, plans)
+        return False
+
     @scheduler_operation('workspace_admission')
     def _ensure_baseline_workspaces(model_name: str, view: ViewInfo) -> None:
         key = (str(model_name), str(view.name))
         if key in baseline_union_by_model_view:
             return
-        union_path = temp_dir / 'union' / str(model_name) / f'{view.name}.union.u8.dat'
-        confmap_path = temp_dir / 'union' / str(model_name) / f'{view.name}.confmap.u8.dat'
-        union_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Interpolated views retain a real pathname because the isolated interpolation
-        # backend reopens them by path. Every process-worker direct-union view (CUDA and/or
-        # OpenVINO) must instead have reopenable shared backing; ordinary in-process views
-        # may prefer anonymous RAM. v17.0.1 fixed hybrid D1 runs where GPU direct union was
-        # disabled for GPU-only views but CPU-eligible views still write a common direct union.
-        process_worker_direct_union = bool(worker_direct_union_active)
-        sam_blocked = _sam_parent_requires_staging(view)
-        processing_shape = view_processing_volume_shape(view, int(args.imgsz))
-        staged_volume_count = 2 if (float(args.min_conf) > 0.0
-            or bool(getattr(args, 'reconciliation_retain_confidence', False))) else 1
-        if dense_tiling_active:
-            staged_volume_count += 1 + (2 if component_layers_needed else 0)
-        staged_logical_bytes = int(array_nbytes(processing_shape, np.uint8)) * staged_volume_count
-        staged_active_bytes = view_prepare_leases.ram_commitment_bytes
-        staged_ram_backing = bool(sam_blocked
-            and sam_parent_staging.claim_ram_first(key,staged_logical_bytes,staged_active_bytes,
-                detector_room_bytes=int(sam_cpu_max_detector_parent)))
-        staged_disk_backing = bool(sam_blocked and not staged_ram_backing
-            and sam_parent_staging.reusable_workspace_paths(union_path, confmap_path))
-        if staged_ram_backing:
-            runtime_telemetry().add('sam_interpolation.staging.ram_first_attempt_parents', 1)
-        elif staged_disk_backing:
-            runtime_telemetry().add('sam_interpolation.staging.disk_from_birth_parents', 1)
-        elif sam_blocked:
-            runtime_telemetry().add('sam_interpolation.staging.checkpoint_copy_backing_parents', 1)
-        union_prefer_memory = not policy_settings.enabled and not (
-            (
-                interpolation_process_backend_enabled()
-                and _view_uses_interpolation(view, int(args.interpolation_distance))
-            )
-            or process_worker_direct_union
-        )
-        union_mm: Optional[np.ndarray] = None
-        conf_mm: Optional[np.ndarray] = None
-        def retire_unpublished_workspaces():
-            nonlocal union_mm, conf_mm
-            from .view_prepare import _array_lifetime_owner
-            # No worker has received these private allocations. Still respect
-            # allocator/caller aliases before freeing this RAM-birth charge.
-            owner_refs = [weakref.ref(_array_lifetime_owner(value))
-                          for value in (union_mm,conf_mm) if value is not None]
-            close_memmap_array_without_flush(
-                conf_mm, unlink_path=scratch_unlink_path_for_memmap(conf_mm,confmap_path))
-            close_memmap_array_without_flush(
-                union_mm, unlink_path=scratch_unlink_path_for_memmap(union_mm,union_path))
-            union_mm = conf_mm = None
-            if staged_ram_backing and not any(reference() is not None for reference in owner_refs):
-                sam_parent_staging.release_ram_first(key)
+        if key in direct_union_backing_leases and direct_union_backing_leases[key].phase == 'preparing':
+            raise RuntimeError(f'detector workspace {key} was used before asynchronous adoption')
+        plans = (_plan_baseline_workspace(model_name, view, legacy=True),)
+        bundles = None
         try:
-            union_mm = allocate_workspace_array(
-                shape=processing_shape,
-                dtype=np.uint8,
-                path=union_path,
-                desc=f'{model_name}/{view.name} baseline union workspace',
-                prefer_memory=bool(union_prefer_memory and not staged_disk_backing),
-                prefer_memfd=bool((process_worker_direct_union or staged_ram_backing) and not staged_disk_backing),
-            )
-            if float(args.min_conf) > 0.0 or bool(getattr(args, 'reconciliation_retain_confidence', False)):
-                conf_mm = allocate_workspace_array(
-                    shape=processing_shape,
-                    dtype=np.uint8,
-                    path=confmap_path,
-                    desc=f'{model_name}/{view.name} baseline confidence workspace',
-                    prefer_memory=(not staged_disk_backing and not process_worker_direct_union and not policy_settings.enabled
-                                   and not bool(getattr(args, 'reconciliation_retain_confidence', False))),
-                    prefer_memfd=bool((process_worker_direct_union or staged_ram_backing) and not staged_disk_backing),
-                )
-        except BaseException:
-            retire_unpublished_workspaces()
-            for failed_path in (union_path, confmap_path):
-                try:
-                    failed_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-            raise
-
-        assert union_mm is not None
-        union_backing = _memmap_backing_path(union_mm)
-        conf_backing = _memmap_backing_path(conf_mm) if conf_mm is not None else None
-        if staged_ram_backing:
-            ram_owner_flags = tuple(not isinstance(value, np.memmap)
-                or _memfd_owner_key_from_array(value) is not None
-                or backing is not None and path_is_memory_backed(backing)
-                for value,backing in ((union_mm,union_backing),(conf_mm,conf_backing)) if value is not None)
-            ram_owners = all(ram_owner_flags)
-            runtime_telemetry().add('sam_interpolation.staging.' +
-                ('ram_first_actual_parents' if ram_owners else 'ram_first_raw_allocation_fallback_parents'), 1)
-            if not any(ram_owner_flags):
+            bundles = _build_baseline_workspaces(plans, None, threading.Event())
+            if not _adopt_baseline_workspaces(plans, bundles):
+                raise RuntimeError('Synchronous detector workspace lost its qualified ownership')
+        except BaseException as error:
+            refs = (_discard_baseline_bundles(bundles) if bundles is not None
+                    else getattr(error, 'owner_refs', None))
+            if plans[0]['ram_claimed'] and refs is not None and not any(ref() is not None for ref in refs):
                 sam_parent_staging.release_ram_first(key)
-        backing_error: Optional[str] = None
-        if process_worker_direct_union and union_backing is None:
-            backing_error = (
-                f'{model_name}/{view.name} direct-union workspace is not process-shareable'
-            )
-        elif process_worker_direct_union and conf_mm is not None and conf_backing is None:
-            backing_error = (
-                f'{model_name}/{view.name} direct-union confidence workspace is not process-shareable'
-            )
-        if backing_error is not None:
-            retire_unpublished_workspaces()
-            for failed_path in (union_path, confmap_path):
-                try:
-                    failed_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-            raise RuntimeError(backing_error)
-        baseline_union_by_model_view[key] = union_mm
-        baseline_union_paths[key] = union_backing or union_path
-        baseline_confmap_by_model_view[key] = conf_mm
-        baseline_confmap_paths[key] = (
-            (conf_backing or confmap_path) if conf_mm is not None else None
-        )
-        baseline_slice_locks_by_model_view[key] = [threading.Lock() for _ in range(int(view.num_slices))]
-        if process_worker_direct_union or key in bounded_policy_parent_keys:
-            if (
-                key in direct_union_backing_leases
-                or key in direct_union_inference_views
-                or key in direct_union_postprocess_views
-            ):
-                raise RuntimeError(f'direct-union backing {key} was admitted more than once')
-            dense_volume_bytes = int(array_nbytes(processing_shape, np.uint8))
-            # Reserve the complete deterministic per-parent dense set before inference
-            # starts. Tiling adds the consolidated accumulator and NRRD decomposition adds
-            # two category accumulators; charging only the parent union let those canvases
-            # appear later outside admission.
-            dense_volume_count = (2 if conf_mm is not None else 1)
-            if bool(dense_tiling_active):
-                dense_volume_count += 1
-                if bool(component_layers_needed):
-                    dense_volume_count += 2
-            backing_bytes = int(dense_volume_bytes) * int(dense_volume_count)
-            direct_union_backing_leases[key] = _DirectUnionBackingLease(
-                key=key, nbytes=int(backing_bytes), phase='inference', owner_count=1,
-                ram_backed=classify_dense_ram_backing((union_mm, conf_mm),
-                    future_ram_bytes=max(0, int(backing_bytes)-int(union_mm.nbytes)
-                        -(0 if conf_mm is None else int(conf_mm.nbytes)))),
-                memfd_owner_proofs=capture_memfd_owner_proofs({'mask':union_mm, 'confidence':conf_mm}),
-            )
-            direct_union_inference_views.add(key)
-            direct_union_inference_bytes[key] = int(backing_bytes)
+            raise
 
     def _publish_parent_mask_ready(model_name: str, view_name: str, support_mm: object) -> None:
         parent_mask_ready_events.put((str(model_name), str(view_name), support_mm))
@@ -3327,6 +3490,19 @@ def _main_impl() -> None:
                 # them and delay RAM credit behind unrelated SAM preparation.
                 sam_parent_staging.defer(task, required_bytes)
                 deferred_to_sam = True
+            elif sam_parent_staging is not None and sam_cpu_futures['runtime_needed'] and (
+                    interpolation_settings.extrapolation_enabled
+                    or interpolation_settings.backend == 'sam'
+                    and _view_uses_interpolation(view, int(args.interpolation_distance))):
+                # Late detector results enter the bounded wave with their
+                # original dense ownership, without another checkpoint copy.
+                dense_inputs = int(np.asarray(union_mm).nbytes) if union_mm is not None else processing_bytes
+                if confmap_mm is not None:
+                    dense_inputs += int(np.asarray(confmap_mm).nbytes)
+                future_canvases = (1 + (2 if component_layers_needed else 0)) if dense_tiling_active else 0
+                required_bytes = (int(task.backing_lease.nbytes) if task.backing_lease is not None else
+                    dense_inputs + int(processing_bytes) * int(future_canvases))
+                fut = sam_parent_staging.enqueue_ready(task, required_bytes)
             else:
                 fut = parent_postprocess_executor.submit(task)
                 task.track_cancellation(fut)
@@ -4590,7 +4766,8 @@ def _main_impl() -> None:
     @scheduler_operation('background_drain')
     def _drain_completed_background_futures() -> None:
         background_drain_budget.begin(enabled=bool(
-            inference_worker_process_active and scheduler.process_inference_outstanding()))
+            (sam_context is not None and not getattr(sam_context, '_closed', False))
+            or (inference_worker_process_active and scheduler.process_inference_outstanding())))
         _maybe_prepare_sam_runtime()
         _maybe_prepare_sam_cpu_source()
         direct_union_capacity_released = False
@@ -5050,6 +5227,9 @@ def _main_impl() -> None:
             v1613_d1_owner_active=bool(v1613_d1_owner_active),
             gpu_worker_result_dir=gpu_worker_result_dir,
             ensure_baseline_workspaces=_ensure_baseline_workspaces,
+            request_baseline_workspaces=(_request_baseline_workspaces if inference_worker_process_active else None),
+            drain_baseline_workspaces=(lambda: detector_workspace_preparation.drain()
+                if detector_workspace_preparation is not None else None),
             gib=int(GIB),
             hybrid_deferred_result_mode=str(HYBRID_DEFERRED_RESULT_MODE),
         ),
@@ -5157,6 +5337,13 @@ def _main_impl() -> None:
     _publish_gpu_worker_admissible_backlog = scheduler.publish_gpu_worker_admissible_backlog
     _gpu_worker_inflight = scheduler.gpu_worker_inflight
     _refresh_gpu_aux_interpolation_leases = scheduler.refresh_gpu_aux_interpolation_leases
+    if inference_worker_process_active:
+        from .detector_workspaces import DetectorWorkspacePreparation
+        detector_workspace_preparation = DetectorWorkspacePreparation(
+            build=_build_baseline_workspaces, refresh=_refresh_workspace_plans,
+            adopt=_adopt_baseline_workspaces, discard=_discard_baseline_bundles,
+            rollback=_rollback_workspace_plans, wake=scheduler.notify_gpu_stage_admission_change)
+        _run_resources().track_executor(detector_workspace_preparation)
     _dispatch_gpu_worker_inference_window = scheduler.dispatch_gpu_worker_inference_window
     _cpu_worker_task_seconds = scheduler.cpu_worker_task_seconds
     _update_cpu_worker_cost = scheduler.update_cpu_worker_cost
@@ -5329,7 +5516,11 @@ def _main_impl() -> None:
                 name=f'gpu-worker-{gpu_index}', daemon=True,
             )
             _run_resources().track_process(proc)
-            proc.start()
+            runtime_trace_event('startup_worker_spawn_start', worker_kind='gpu', worker_id=worker_id)
+            with runtime_telemetry().span('startup.worker_spawn.gpu'):
+                proc.start()
+            runtime_trace_event('startup_worker_spawn_done', worker_kind='gpu', worker_id=worker_id,
+                                worker_pid=proc.pid)
             gpu_worker_processes.append(proc)
         startup_overlap_note = (
             'model load/CUDA init overlaps streaming decode'
@@ -5378,7 +5569,11 @@ def _main_impl() -> None:
                     name=f'openvino-worker-{instance_id}', daemon=True,
                 )
                 _run_resources().track_process(proc)
-                proc.start()
+                runtime_trace_event('startup_worker_spawn_start', worker_kind='cpu', worker_id=instance_id)
+                with runtime_telemetry().span('startup.worker_spawn.cpu'):
+                    proc.start()
+                runtime_trace_event('startup_worker_spawn_done', worker_kind='cpu', worker_id=instance_id,
+                                    worker_pid=proc.pid)
                 cpu_worker_processes.append(proc)
             print(
                 f'Started {len(cpu_worker_processes)} socket-local OpenVINO worker process(es); '
@@ -5403,6 +5598,7 @@ def _main_impl() -> None:
         # for the decode, not the resize tail + cube flush.
         native_resize_task_spec: Optional[Dict[str, object]] = None
         source_volume_ready_async = False
+        runtime_trace_event('startup_source_gate_start')
         native_shape_now = tuple(int(x) for x in np.asarray(input_volume_rgb).shape)
         # metadata access must not invoke LazyProcessingCube.__array__.
         working_shape_now = tuple(int(x) for x in volume_rgb.shape)
@@ -5476,6 +5672,7 @@ def _main_impl() -> None:
             )
         if not source_volume_ready_async:
             source_volume_path, source_volume_shape, source_volume_dtype = _ensure_source_volume_file_backed()
+        runtime_trace_event('startup_source_gate_done', native_t=source_volume_ready_async)
         # Split each full-frame volume into contiguous slice-range chunks so multiple GPUs can work
         # the SAME (often huge, e.g. full-coverage Azimuthal) volume in parallel, instead of one GPU per
         # whole volume leaving the other GPUs idle at the tail. The chunk is large relative to the
@@ -5569,6 +5766,24 @@ def _main_impl() -> None:
             processing_min_radius = view_processing_min_radius(
                 view, float(args.min_radius), threshold_plane_shape,
             )
+            sam_gray_cache_spec = None
+            if (sam_gray_cache_root is not None and str(kind) == 'fullframe'
+                    and str(model_name) == str(yolo_models[0][0])):
+                from .sam_view_geometry import sam_gray_capture_spec
+                from .sam_yolo_capture import capture_host_capacity_bytes
+                gray_spec = sam_gray_capture_spec(view, job_obj, channel_format,
+                    source_identity=sam_context.source_identity,
+                    source_shape_tyx=sam_context.source_grid_shape,
+                    source_processing_shape_tyx=tuple(volume_rgb.shape),
+                    source_resize_semantics=sam_context.source_resize_semantics)
+                if gray_spec is not None:
+                    capture_bytes = capture_host_capacity_bytes(int(args.gpu_batch), int(out_size),
+                        cpu_workers=max(worker_cpu_budgets, default=int(per_worker_workers)))
+                    sam_gray_cache_spec = dict(store_root=str(sam_gray_cache_root),
+                        spec=gray_spec, host_capacity_bytes=capture_bytes)
+                    sam_context.gray_cache_specs[physical_view_name(view)] = gray_spec
+                    gray_capture_reserve_bytes = max(gray_capture_reserve_bytes,
+                        int(gpu_device_count) * capture_bytes)
             for chunk_idx, (s0, s1) in enumerate(ranges):
                 count = int(s1) - int(s0)
                 # Size the render pool to this worker's CPU share (NOT streaming_prediction_source_workers,
@@ -5649,6 +5864,7 @@ def _main_impl() -> None:
                     'view': view, 'job': job_obj, 'job_id': job_id, 'out_size': int(out_size),
                     'channel_format': channel_format,
                     'raster_plan_spec': worker_raster_plan_spec,
+                    'sam_gray_cache_spec': sam_gray_cache_spec,
                     'canonical_image_spec': (
                         {
                             'stage_root': str(canonical_images_stage_root),
@@ -5780,7 +5996,8 @@ def _main_impl() -> None:
                         copy_job = tile_lookup[(copy_view.name, base_job.config_id, int(base_job.tile_x), int(base_job.tile_y))]
                         copy_job_id = str(copy_job.tile_id)
                     copy_task.update(view=copy_view, job=copy_job, job_id=copy_job_id,
-                                     canonical_image_spec=None, result_mode=str(base_task.get('result_mode', 'file')))
+                                     canonical_image_spec=None, sam_gray_cache_spec=None,
+                                     result_mode=str(base_task.get('result_mode', 'file')))
                     for field_name in ('result_mask_path', 'result_conf_path'):
                         if base_task.get(field_name):
                             original = Path(str(base_task[field_name]))
@@ -5801,7 +6018,23 @@ def _main_impl() -> None:
             for (copy_model, base_name), count in list(fullframe_subtasks_per_view.items()):
                 for copy_view in policy_views_by_base.get(base_name, ()):
                     fullframe_subtasks_per_view[(copy_model, copy_view.name)] = int(count)
+        if gray_capture_reserve_bytes:
+            # Every current/deferred task shares the worker's single funded cap.
+            capture_capacity = gray_capture_reserve_bytes // max(1, int(gpu_device_count))
+            for task in gpu_worker_tasks_by_id.values():
+                if task.get('sam_gray_cache_spec') is not None:
+                    task['sam_gray_cache_spec']['host_capacity_bytes'] = capture_capacity
         scheduler_state.gpu_worker_total_tasks = int(next_task_id)
+        if sam_context is not None and sam_context.gray_cache_specs:
+            gray_capture_plan = dict(views=len(sam_context.gray_cache_specs),
+                raw_bytes=sum(math.prod(spec['canvas_shape'])
+                    for spec in sam_context.gray_cache_specs.values()),
+                host_reserve_bytes=gray_capture_reserve_bytes,
+                root=str(sam_gray_cache_root), families=['spherical', 'radial', 'azimuthal', 'tilted'])
+            runtime_telemetry().gauge('sam.gray_cache.capture_plan', gray_capture_plan)
+            print(f"SAM gray capture: {gray_capture_plan['views']} canonical views, "
+                  f"{gray_capture_plan['raw_bytes'] / GIB:.1f} GiB before compression; "
+                  f"{gray_capture_reserve_bytes / GIB:.2f} GiB bounded worker buffers.", flush=True)
         from .cuda_d1 import d1_confidence_retirement_host_bytes
         from .confidence_evidence import confidence_publication_reserve_bytes
         confidence_worker_reserve = (
@@ -5832,7 +6065,7 @@ def _main_impl() -> None:
                 # Parent resource profiles also spend extra SAM credit from
                 # this pool; reserving only their base omits that commitment.
                 parent_reserve = max(parent_working, parent_transient_admission.capacity)
-            worker_buffers = confidence_worker_reserve + int(gpu_device_count) * max(
+            worker_buffers = confidence_worker_reserve + gray_capture_reserve_bytes + int(gpu_device_count) * max(
                 256 * 1024**2,
                 int(args.gpu_batch) * int(args.imgsz)**2
                 * (16 * int(channel_format.channel_count) + 64))
@@ -5882,6 +6115,7 @@ def _main_impl() -> None:
                 batch_size=int(args.gpu_batch),
             )
             policy_memory_plan.update(cpu_worker_buffer_plan=cpu_buffer_plan,
+                                      gray_capture_host_reserve_bytes=gray_capture_reserve_bytes,
                                       confidence_host_reserve_bytes=confidence_worker_reserve,
                                       confidence_stage_reserve_bytes=confidence_stage_reserve,
                                       gpu_worker_buffer_reserve_bytes=gpu_worker_buffers,
@@ -5921,7 +6155,7 @@ def _main_impl() -> None:
             publication_pending=d1_publication_max_pending_per_worker(),
             unpack_bytes=d1_unpack_target_mib() * 1024 * 1024,
             native_dense_reserve_bytes=int(native_dense_reserve_bytes),
-            worker_buffer_reserve_bytes=confidence_worker_reserve,
+            worker_buffer_reserve_bytes=confidence_worker_reserve + gray_capture_reserve_bytes,
             output_reserve_bytes=publication_output_reserve(
                 nrrd_layer_sink(), nrrd_member_gzip_window_bytes(), nrrd_gzip_chunk_bytes()) + confidence_stage_reserve,
         )
@@ -6010,6 +6244,28 @@ def _main_impl() -> None:
                 )
         pending_prediction_build_jobs.clear()
 
+        if (gpu_worker_process_active and _env_flag('YOLO_TTA_CPU_INPUT_PREFETCH', True)
+                and memfd_workspace_enabled() and int(args.gpu_batch) == 1
+                and channel_format.kind == 'gray' and not cpu_worker_process_active):
+            from .yolo_cpu_input import CpuInputPrefetch
+            cpu_input_budget = min(64 * GIB, int(direct_union_total_dense_byte_limit) // 4,
+                max(0, int(available_anon_work_bytes())) // 8)
+            scheduler.cpu_input_prefetch = CpuInputPrefetch(gpu_worker_tasks_by_id.values(),
+                input_volume_rgb if native_resize_task_spec is not None else volume_rgb,
+                prediction_render_executor or prediction_volume_executor,
+                max_bytes=cpu_input_budget, headroom=available_anon_work_bytes,
+                on_capacity_change=scheduler.notify_gpu_stage_admission_change)
+            cpu_input_prefetch = scheduler.cpu_input_prefetch
+            # Cached ring slots keep two pinned gray canvases per worker until
+            # detector asset retirement; retain their conservative startup debt.
+            cpu_input_pinned_reserve_bytes = 2 * int(args.imgsz) ** 2 * max(
+                int(gpu_device_count), len(gpu_task_queues))
+            _run_resources().track_executor(scheduler.cpu_input_prefetch)
+            print(f'YOLO CPU input prefetch: curved GPU projections first; gray Cartesian/Tilted '
+                f'canvases prepared from decoded native t in bounded shared RAM '
+                f'({cpu_input_budget / GIB:.2f} GiB charged to the detector workspace budget). '
+                'Unavailable CPU inputs retain GPU rendering. YOLO_TTA_CPU_INPUT_PREFETCH=0 disables this route.', flush=True)
+
         tile_result_sizes = [
             int(_tile_dense_result_task_bytes(task_obj))
             for task_obj in gpu_worker_tasks_by_id.values()
@@ -6055,6 +6311,7 @@ def _main_impl() -> None:
         gpu_worker_pending_task_ids.extend(
             range(int(scheduler_state.gpu_worker_total_tasks))
         )
+        scheduler.prepare_baseline_backlog()
         experimental = experimental_features_snapshot(
             device_count=int(gpu_device_count),
         )
@@ -6139,6 +6396,9 @@ def _main_impl() -> None:
         else:
             _apply_parent_inference_affinity(fail_fast=True)
         _dispatch_inference_windows()
+        runtime_trace_event('startup_initial_dispatch_done',
+                            pipeline_elapsed_seconds=time.perf_counter() - pipeline_wall_started,
+                            gpu_tasks=int(scheduler_state.gpu_worker_dispatched_tasks))
         lease_details: List[str] = []
         if gpu_worker_process_active:
             lease_details.append(f'GPU target={gpu_worker_target_lease_seconds():.2f}s')
@@ -7226,6 +7486,8 @@ def _main_impl() -> None:
                         and scheduler.has_pending_process_results())):
                 continue
             waitables: List[Future] = list(pending_prediction_volume_futures)
+            if detector_workspace_preparation is not None:
+                waitables.extend(detector_workspace_preparation.futures)
             waitables.extend(sam_cpu_futures[name] for name in ('source', 'runtime')
                 if sam_cpu_futures[name] is not None and not sam_cpu_futures[name].done())
             waitables.extend(list(prediction_accumulation_futures.keys()))
@@ -7251,6 +7513,7 @@ def _main_impl() -> None:
                     _check_inference_workers_alive()
                     continue
                 scheduler_quiescent = bool(
+                    not (detector_workspace_preparation is not None and detector_workspace_preparation.pending) and
                     not pending_prediction_build_jobs and
                     not pending_prediction_volume_futures and
                     not prediction_accumulation_futures and
@@ -7320,6 +7583,11 @@ def _main_impl() -> None:
                     if sam_context is not None and sam_cpu_futures['runtime'] is not None:
                         sam_context.ensure_all_devices()
                     break
+                if sam_parent_staging is not None and sam_parent_staging.pending:
+                    # Admission can be waiting without a future to register;
+                    # keep it wakeable and bound retries by the same heartbeat.
+                    scheduler_wake.wait(timeout=float(scheduler_push_drain_heartbeat_seconds()))
+                    scheduler_wake.clear()
                 continue
             _log_scheduler_wait_state()
             if scheduler_state.push_drain_active:
@@ -7332,7 +7600,10 @@ def _main_impl() -> None:
             else:
                 # Poll the inference-worker result queue while CPU-side futures run, so completed
                 # inference results are unioned without waiting for a future to finish.
-                wait(waitables, timeout=(0.1 if inference_worker_process_active else None), return_when=FIRST_COMPLETED)
+                wait(waitables, timeout=(0.1 if inference_worker_process_active else
+                    float(scheduler_push_drain_heartbeat_seconds())
+                    if sam_parent_staging is not None and sam_parent_staging.pending else None),
+                    return_when=FIRST_COMPLETED)
 
     finally:
         physical_view_finalization_stop.set()
@@ -7363,6 +7634,10 @@ def _main_impl() -> None:
         _set_main_process_gpu_asset_retirement_pending(False)
         if inference_worker_process_active:
             _shutdown_inference_worker_processes()
+        if detector_workspace_preparation is not None:
+            detector_workspace_preparation.shutdown()
+        if cpu_input_prefetch is not None:
+            cpu_input_prefetch.shutdown()
         prediction_volume_executor.shutdown(wait=True)
         prediction_join_executor.shutdown(wait=True)
         prediction_result_executor.shutdown(wait=True)
