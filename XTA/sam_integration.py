@@ -352,6 +352,12 @@ class SamInterpolationContext:
         return (self._runtime_admitted.is_set() if self.progressive_startup else self._runtime is not None) and not self._cancel.is_set() and not self._closed
 
     @property
+    def cpu_prepare_ready(self):
+        return (self.runtime_ready or self.progressive_startup
+                and bool(self._retired_devices) and self._startup_fleet_funded
+                and self._starting_runtime is not None) and not self._cancel.is_set() and not self._closed
+
+    @property
     def gpu_image_ready(self):
         return self.runtime_ready if self.progressive_startup else self.detector_retirement_ready
 
@@ -744,26 +750,26 @@ class SamInterpolationContext:
                     and self._can_prefetch_cpu_images(view, prepared_plan, shape=shape))
                 cheap_cpu = (getattr(self._resource_local, 'profile', None) is not None
                     and self._can_prepare_cheap_cpu_images(view, shape, prepared_plan))
-                shell_prefetch = (cpu_prefetch and str(view.family) in {'radial', 'spherical'}
-                    and getattr(self._resource_local, 'profile', None) is not None)
-                opportunistic = shell_prefetch and self._can_extend_gpu_image_burst()
-                shell_cpu = shell_prefetch and not opportunistic
+                shell_cpu = (str(view.family) in {'radial', 'spherical'}
+                    and getattr(self._resource_local, 'profile', None) is not None
+                    and (cpu_prefetch or self._can_prefetch_cpu_images(view, prepared_plan, shape=shape)))
+                # Qualified, funded shell crops already have a bounded native
+                # CPU route. A transient empty SDK queue does not justify a
+                # cold source upload and whole-renderer retirement per cohort.
+                shell_route = 'prefetch' if cpu_prefetch else 'synchronous'
+                shell_counter = f'sam.cpu_images.{view.family}_{shell_route}_admissions'
                 if cheap_cpu or shell_cpu:
                     from .sam_resources import validate_live_sam_resource_profile
                     validate_live_sam_resource_profile(self._resource_local.profile)
                     runtime_telemetry().add('sam.gpu_images.cpu_admissions', 1)
                     runtime_telemetry().gauge('sam.gpu_images.last_cpu_reason',
-                        f'bounded_{view.family}_cpu_prefetch' if shell_cpu else
+                        f'bounded_{view.family}_cpu_{shell_route}' if shell_cpu else
                         'bounded_tilted_cpu_crop' if str(view.family) == 'tilted' else 'bounded_cartesian_source_crop')
                     if shell_cpu:
-                        runtime_telemetry().add(f'sam.cpu_images.{view.family}_prefetch_admissions', 1)
+                        runtime_telemetry().add(shell_counter, 1)
                 renderer = None
-                if opportunistic and not cheap_cpu:
-                    renderer = try_gpu_crop_renderer(self, view, shape, prepared_plan, opportunistic=True)
-                elif not cheap_cpu and not shell_cpu:
+                if not cheap_cpu and not shell_cpu:
                     renderer = try_gpu_crop_renderer(self, view, shape, prepared_plan)
-                if opportunistic and renderer is None:
-                    runtime_telemetry().add(f'sam.cpu_images.{view.family}_prefetch_admissions', 1)
                 cpu_started = time.perf_counter() if cpu_prefetch and renderer is None else None
                 if cpu_started is not None:
                     runtime_telemetry().add('sam.cpu_images.prefetch_admissions', 1)
@@ -785,9 +791,6 @@ class SamInterpolationContext:
                         self._resource_local.gpu_image_renderer = None
                         runtime_telemetry().add('sam.gpu_images.cpu_fallbacks', 1)
                         runtime_telemetry().gauge('sam.gpu_images.last_fallback_reason', str(cause))
-                        if opportunistic:
-                            runtime_telemetry().add('sam.gpu_images.cpu_admissions', 1)
-                            runtime_telemetry().add(f'sam.cpu_images.{view.family}_prefetch_admissions', 1)
                         if cpu_prefetch:
                             cpu_started = time.perf_counter()
                             runtime_telemetry().add('sam.cpu_images.prefetch_admissions', 1)
@@ -994,6 +997,7 @@ class SamInterpolationContext:
         from .geometry import physical_view_name
         from .lta_rendering import LtaPhysicalViewCacheRef
         from .sam_cyclic import mirror_bbox_yx, validate_cyclic_frame_addressing
+        from .sam_gpu_rendering import _record_image_phase
         from .runtime import _interpolation_array_backing_path
         shape = tuple(int(value) for value in shape)
         if len(shape) != 3 or any(value <= 0 for value in shape) or shape[0] != int(view.num_slices):
@@ -1321,6 +1325,8 @@ class SamInterpolationContext:
                             native_sampling_pixels=int(native_plane.size))
                         native_plane = None
                         runtime_telemetry().add('sam.cpu_images.native_prefetch_frames', 1)
+                    _record_image_phase(gpu_renderer, 'host_cache_copy',
+                        frame=int(address['native_index']), crop_shape=(y1-y0, x1-x0))
                     missing = self._copy_cached_pixels(physical_target, physical_bbox,
                         int(address['native_index']), geometry_identity, cache_entries=donor_entries)
                     # Earlier native/alias records in this private transaction
@@ -1364,6 +1370,8 @@ class SamInterpolationContext:
                         if gray_reader is not None:
                             runtime_telemetry().add('sam.gray_cache.read_pixels', int(image.size))
                         copy_started = time.perf_counter()
+                        _record_image_phase(gpu_renderer, 'host_cache_copy',
+                            frame=int(address['native_index']), crop_shape=(cy1-cy0, cx1-cx0))
                         physical_target[cy0-physical_bbox[0]:cy1-physical_bbox[0],
                                         cx0-physical_bbox[1]:cx1-physical_bbox[1]] = image
                         if gpu_renderer is None:
@@ -1375,6 +1383,7 @@ class SamInterpolationContext:
                                       bool(address['mirror_u']), offset))
                     del target, physical_target, native_frame_cache, pre_rendered
                 flush_started = time.perf_counter()
+                _record_image_phase(gpu_renderer, 'cache_flush')
                 cache.flush()
                 if gpu_renderer is None:
                     runtime_telemetry().add('sam.cpu_images.cache_flush_host_seconds',
@@ -1403,6 +1412,7 @@ class SamInterpolationContext:
             # much of that immutable canvas this compact descriptor stores.
             # Exact model/crop/frame feature keys can therefore survive a
             # different scope's demand inventory without admitting new pixels.
+            _record_image_phase(gpu_renderer, 'cache_commit')
             stat = path.stat()
             reference = LtaPhysicalViewCacheRef(path=path, shape=logical_shape, dtype='uint8',
                 physical_view_id=physical_view_name(view), identity_sha256=image_identity,
@@ -2650,7 +2660,8 @@ class SamInterpolationContext:
             profile_kwargs = {} if live_profile is None else {'resource_profile': live_profile}
             planning_keys = {'pass_index', 'gap_distance', 'min_radius', 'search_angle_deg',
                 'interpolation_walk_back', 'interpolation_candidates', 'interpolation_passes',
-                'wrap_axis', 'upstream_lineage', 'spacing_zyx', 'planner_limits', 'canonical_labels'}
+                'wrap_axis', 'upstream_lineage', 'spacing_zyx', 'planner_limits', 'canonical_labels',
+                '_observation_inventory'}
             preparation_phase = 'planning'
             with _trace_sam_phase('planning', scope_metadata['scope_id'], operation='interpolation'):
                 prepared = prepare_sam_interpolation_pass(observed, view=view,
@@ -2699,6 +2710,8 @@ class SamInterpolationContext:
             if merged is observed:
                 merged = observation_volume
             stats = dict(stats)
+            if kwargs.get('_observation_inventory') is not None:
+                stats['sam_observation_inventory'] = kwargs['_observation_inventory'].snapshot()
             stats.setdefault('sam_crop_mode', self.crop_mode)
             stats.setdefault('sam_tight_crop_guard', self.tight_crop_guard)
             stats.setdefault('sam_oversized_group_count', len(oversized_groups))
@@ -2794,7 +2807,7 @@ class SamInterpolationContext:
             profile_kwargs = {} if profile is None else {'resource_profile': profile}
             planning_keys = {'distance', 'walk_back', 'min_radius', 'wrap_axis',
                 'upstream_lineage', 'spacing_zyx', 'planner_limits', 'canonical_labels',
-                'eligible_terminals'}
+                'eligible_terminals', '_observation_inventory'}
             preparation_phase = 'planning'
             with _trace_sam_phase('planning', metadata['scope_id'], operation='extrapolation'):
                 prepared = prepare_sam_extrapolation_pass(observed, view=view, scope=metadata,
@@ -2852,6 +2865,8 @@ class SamInterpolationContext:
             stats = dict(stats)
             if cohort_record is not None:
                 stats['sam_image_cache_cohorts'] = cohort_record
+            if kwargs.get('_observation_inventory') is not None:
+                stats['sam_observation_inventory'] = kwargs['_observation_inventory'].snapshot()
             stats['sam_image_cache_lifetime'] = self.image_cache_lifetime_snapshot()
             return observation_volume, stats, components
         except BaseException as error:

@@ -65,8 +65,10 @@ class Context:
 
 
 class Runtime:
-    def __init__(self, *close_actions):
+    def __init__(self, *close_actions, slots=8, configured_slots=None):
         self._cancel = threading.Event()
+        self.worker_slots = tuple(range(slots))
+        self._configured_worker_slots = tuple(range(slots if configured_slots is None else configured_slots))
         self.close_actions = close_actions
         self.close_calls = self.cancel_calls = 0
 
@@ -102,7 +104,8 @@ class Monitor:
 
 
 def execute(monkeypatch, executor, original, context, runtime, run, *, count, capacity):
-    monkeypatch.setattr(groups, '_executor', lambda: executor)
+    context.controller_runtime = runtime
+    monkeypatch.setattr(groups, '_executor', lambda _runtime: executor)
     monkeypatch.setattr(groups, '_event', lambda *_args, **_kwargs: None)
     return groups.execute_retry_groups(tuple(f'group-{i}' for i in range(count)), run,
         parent_profile=original, context=context, runtime=runtime,
@@ -113,32 +116,33 @@ def assert_settled(context, pool, before):
     assert context.active_children == 0
     assert all(hold.closed and hold.request.settled for hold in context.holds)
     assert pool.in_use == before
-    assert_controller_slots_returned(groups._CONTROLLER_SLOTS, groups._MAX_RETRY_GROUP_CONTROLLERS)
+    controllers = groups._controllers(context.controller_runtime)
+    assert_controller_slots_returned(controllers, controllers.capacity)
 
 
 def assert_controller_slots_returned(slots, count):
-    acquired = 0
+    acquired = []
     try:
         for _ in range(count):
-            assert slots.acquire(blocking=False), 'retry controller permit leaked'
-            acquired += 1
-        assert not slots.acquire(blocking=False), 'retry controller permit returned twice'
+            permit = slots.acquire(count)
+            assert permit is not None, 'retry controller permit leaked'
+            acquired.append(permit)
+        assert slots.acquire(count) is None, 'retry controller permit returned twice'
     finally:
-        for _ in range(acquired):
-            slots.release()
+        for permit in acquired:
+            permit.release()
 
 
-@pytest.mark.parametrize('controller_count', [1, 8])
+@pytest.mark.parametrize('controller_count', [1, 8, 16])
 def test_saturated_controllers_leave_other_parent_free_to_use_its_funded_lane(monkeypatch, controller_count):
     entered, release, other_done = threading.Event(), threading.Event(), threading.Event()
-    slots = threading.BoundedSemaphore(controller_count)
-    monkeypatch.setattr(groups, '_CONTROLLER_SLOTS', slots)
     monkeypatch.setattr(groups, '_event', lambda *_args, **_kwargs: None)
     calls, lock = [], threading.Lock()
     first_context, other_context = Context(), Context()
-    runtime = Runtime(release.set)
+    runtime = Runtime(release.set, slots=controller_count)
+    slots = groups._controllers(runtime)
     with ThreadPoolExecutor(controller_count) as workers, ThreadPoolExecutor(1) as owners:
-        monkeypatch.setattr(groups, '_executor', lambda: workers)
+        monkeypatch.setattr(groups, '_executor', lambda _runtime: workers)
         def first_parent():
             with parent(physical=1024*resources.GIB, capacity=512*resources.GIB) as (pool, original):
                 before = pool.in_use
@@ -171,7 +175,7 @@ def test_saturated_controllers_leave_other_parent_free_to_use_its_funded_lane(mo
                     other_calls.append(index)
                     return dict(ordinal=index, attempt_count=1)
                 results, stats = groups.execute_retry_groups(('a', 'b'), run_other,
-                    parent_profile=original, context=other_context, runtime=Runtime(),
+                    parent_profile=original, context=other_context, runtime=runtime,
                     parent_scope='other', max_in_flight=2)
                 assert other_calls == [0, 1]
                 assert [row['ordinal'] for row in results] == [0, 1]

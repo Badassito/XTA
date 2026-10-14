@@ -107,7 +107,7 @@ def test_checkpoint_resume_rebinds_confidence_credit_to_restored_lease(tmp_path)
     with ThreadPoolExecutor(max_workers=1) as writer:
         stage = DeferredSamParentQueue(temp_dir=tmp_path, output_dir=tmp_path/'output',
             checkpoint_executor=writer,
-            prepare_executor=SimpleNamespace(submit=lambda value:queued.append(value) or Future()),
+            prepare_executor=SimpleNamespace(submit=lambda fn,*args:queued.append((fn,args)) or Future()),
             leases=state, dense_limit=4096, ready=lambda:ready[0])
         stage.defer(task, 2048)
         next(iter(stage.checkpoint_futures)).result()
@@ -116,7 +116,11 @@ def test_checkpoint_resume_rebinds_confidence_credit_to_restored_lease(tmp_path)
         ready[0] = True
         stage.pump()
         restored_lease = state.leases[key]
-        assert restored_lease is not old_lease and queued == [task]
+        assert restored_lease is not old_lease and len(queued) == 1
+        restore_prepare, args = queued[0]
+        assert restore_prepare == stage._restore_and_prepare
+        assert args[0] is task and args[2] is restored_lease
+        assert task.union_mm is None and task.confmap_mm is None
         def projection(*_args, **_kwargs):
             assert len(events) == 1 and events[0][0] is restored_lease
             lease, model, view, nbytes = events[0]
@@ -129,7 +133,7 @@ def test_checkpoint_resume_rebinds_confidence_credit_to_restored_lease(tmp_path)
              mock.patch.object(confidence_evidence, 'capture_prediction_confidence',
                                new=lambda *_args,**_kwargs:None), \
              mock.patch.object(assembly, 'materialize_nrrd_view_layer', new=projection):
-            task()
+            restore_prepare(*args)
         stage.close()
 
 

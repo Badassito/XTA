@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import hashlib
 import json
 import math
@@ -230,6 +231,7 @@ def _sam_directional_source_backing(
     destination = (work_root / 'projected.cvol' if _work_root is not None else
                    work_root / f'{native_path.stem}.orthogonal.cvol')
     source_shape = final_source_output_shape() or (int(view.full_t), int(view.full_h), int(view.full_w))
+    sparse_shell = False
     with contextlib.closing(RawBBoxMaskStore.open(native_path, mmap_payload=True)) as store:
         if view.family == 'orthogonal' and not is_tilted_view(view):
             shape = _sparse_component_orthogonal_shape(store.shape, view)
@@ -244,6 +246,14 @@ def _sam_directional_source_backing(
                 extent = tuple(stats['segment_extent_ijk'])
             return dict(path=path, shape=shape, storage_format=storage_format,
                 extent=extent, coordinate_space='orthogonal_processing')
+        # ponytail: Radial encoded pulls failed production-size parallel timing;
+        # tilted Spherical remains unqualified. Re-enable only after that validation.
+        if view.family == 'spherical' and not view.spherical_tilted_source:
+            flag = 'YOLO_TTA_GPU_'+str(view.family).upper()+'_BACKPROJECT'
+            explicit_gpu = flag in os.environ and os.environ[flag].strip().lower() not in ('0','false','no','off')
+            if not explicit_gpu:
+                from .sam_sparse_shell_projection import encoded_shell_has_unused_canvas
+                sparse_shell = encoded_shell_has_unused_canvas(store)
     if not has_foreground:
         writer = IncrementalRawBBoxMaskStoreWriter(shape=source_shape, store_dir=destination,
             format_name=INTERNAL_PACKED_CVOL_FORMAT, desc=f'Empty selected SAM {view.name}/{stage}')
@@ -262,6 +272,22 @@ def _sam_directional_source_backing(
             out_shape_tyx=source_shape, workers=max(1,int(workers)))
         return dict(path=destination, shape=source_shape, storage_format=INTERNAL_PACKED_CVOL_FORMAT,
             extent=tuple(stats['segment_extent_ijk']), coordinate_space='source_grid')
+    if sparse_shell:
+        from .sam_sparse_shell_projection import project_shell_sparse_store, SparseShellProjectionUnavailable
+        try:
+            stats = project_shell_sparse_store(native_path, view, destination,
+                out_shape_tyx=source_shape, workers=max(1,int(workers)))
+        except SparseShellProjectionUnavailable as error:
+            # Only capability/workspace qualification can decline, before a
+            # writer exists. Corrupt inputs and runtime failures stay failures.
+            from .sam_gpu_rendering import clear_image_error_frames
+            clear_image_error_frames(error)
+            runtime_telemetry().add('projection.sam_encoded_shell.preflight_fallbacks', 1)
+        else:
+            runtime_telemetry().add('projection.sam_encoded_shell.native_decode_bytes_avoided',
+                stats['native_logical_bytes'])
+            return dict(path=destination, shape=source_shape, storage_format=INTERNAL_PACKED_CVOL_FORMAT,
+                extent=tuple(stats['segment_extent_ijk']), coordinate_space='source_grid')
     from .interpolation import materialize_raw_bbox_mask_store_workspace
     workspace_path = work_root / ('native.u8.dat' if _work_root is not None else
                                   f'{native_path.stem}.native.u8.dat')
@@ -349,7 +375,8 @@ def materialize_sam_extrapolation_view_layer(
 def _run_sam_extrapolation(native_volume, *, view, model_name, source, sam_context,
     distance=0, walk_back=1, min_radius=3., workers=1, nrrd_layers_enabled=False,
     tile_config_id='', upstream_lineage=None, additions_volume=None, merge_native=True,
-    requested_min_radius=None, submit_sam_layer_projection=None, pending_component_layers=None):
+    requested_min_radius=None, submit_sam_layer_projection=None, pending_component_layers=None,
+    _observation_inventory=None, _before_publication=None):
     """Freeze the completed interpolation baseline through all tail tracking."""
     if int(distance) <= 0:
         return None, []
@@ -366,12 +393,15 @@ def _run_sam_extrapolation(native_volume, *, view, model_name, source, sam_conte
         workers=int(workers), wrap_axis=view_interpolation_wrap_axis(view),
         upstream_lineage={**dict(upstream_lineage or {}),
             'seed_stage': 'post_interpolation_before_any_extrapolated_tail'},
-        return_components=True)
+        return_components=True,
+        **({'_observation_inventory': _observation_inventory} if _observation_inventory is not None else {}))
     stats = dict(stats, processing_role='extrapolation', extrapolation_backend='sam',
         model=str(model_name), view=str(view.name), source=source, tile_config_id=tile_config_id,
         added_voxel_coordinate_space='native_working_canvas',
         requested_extrapolation_min_radius=float(min_radius if requested_min_radius is None else requested_min_radius),
         processing_extrapolation_min_radius=float(min_radius))
+    if _before_publication is not None:
+        _before_publication()
     refs = []
     # Every request is finished before any tail is merged, so sibling tails can
     # never become a later request's seed or an authoritative future mask.
@@ -1768,6 +1798,7 @@ def prepare_view_volume_after_fullframe(
     confidence_retired_callback: Optional[Callable[[str, str, int], object]] = None,
     confidence_owner: Optional[list] = None,
     submit_sam_layer_projection: Optional[Callable[..., Future[NrrdLayerRef]]] = None,
+    _observation_inventory=None,
 ) -> PreparedViewResult:
     # Local import keeps the package dependency graph acyclic.
     from .finalization import union_volume_into_volume
@@ -1834,7 +1865,25 @@ def prepare_view_volume_after_fullframe(
             workers=slice_workers, precleaned_slice_cleanup=precleaned_slice_cleanup,
             hole_fill_done_on_device=hole_fill_done_on_device, slice_meta=slice_meta))
 
+    observation_inventory = _observation_inventory
     try:
+        if observation_inventory is not None:
+            from .sam_bridge_planning import SamPlanningLimits, _observations
+            from .sam_interpolation import _trace_sam_phase
+            sam_context.check_startup()
+            if (not sam_context.runtime_ready
+                    and (str(interpolation_backend).strip().lower() == 'sam' or int(interpolate) <= 0)):
+                limits = SamPlanningLimits()
+                shape = tuple(int(value) for value in baseline_native_volume.shape)
+                if len(shape) != 3 or any(value <= 0 for value in shape):
+                    raise ValueError('SAM observations require a nonempty frame,y,x canvas')
+                if shape[1] * shape[2] <= limits.max_slice_pixels:
+                    with _trace_sam_phase('cpu_observation_prestage',
+                            f'{model_name}/{view.name}/fullframe', operation='interpolation'):
+                        _observations(baseline_native_volume, scope='', labels=None, lineage=None,
+                            limits=limits, inventory=observation_inventory)
+            # The CPU prefix owns no projection/image CUDA rights before cohort admission.
+            sam_context._start()
         from .confidence_evidence import capture_prediction_confidence
         if not preinterpolation_layer_already_published:
             capture_prediction_confidence(
@@ -1938,8 +1987,25 @@ def prepare_view_volume_after_fullframe(
             parent_mask_ready_callback(str(model_name), str(view.name), parent_mask_support_mm)
 
 
+    if (observation_inventory is None and backend == 'sam'
+            and int(extrapolation_distance) > 0 and int(interpolate_passes) > 0
+            and _view_uses_interpolation(view, int(interpolate))):
+        from .sam_bridge_planning import SamObservationInventory
+        observation_inventory = SamObservationInventory()
     try:
         interpolation_stats: List[Dict[str, object]] = []
+        deferred_sam_publications = []
+        def publish_deferred_sam_layers():
+            while deferred_sam_publications:
+                entry, pass_index = deferred_sam_publications[0]
+                ref = submit_sam_layer_projection(entry, layer_kind='interpolation',
+                    model_name=str(model_name), view=view, source='fullframe',
+                    pass_index=pass_index, sam_context=sam_context, workers=int(slice_workers))
+                if isinstance(ref, Future):
+                    pending_component_layers.append(ref)
+                else:
+                    nrrd_layers.append(ref)
+                deferred_sam_publications.pop(0)
         processing_plane_shape = tuple(int(v) for v in np.asarray(baseline_native_volume).shape[-2:])
         effective_interpolate_min_radius = view_processing_min_radius(
             view, float(interpolate_min_radius), processing_plane_shape,
@@ -1992,11 +2058,17 @@ def prepare_view_volume_after_fullframe(
                         interpolation_passes=total_passes, workers=int(interpolation_task_workers),
                         wrap_axis=view_interpolation_wrap_axis(view),
                         upstream_lineage={'seed_detector_identity': str(model_name)},
-                        return_bridge_components=bool(nrrd_layers_enabled))
+                        return_bridge_components=bool(nrrd_layers_enabled),
+                        **({'_observation_inventory': observation_inventory} if observation_inventory is not None else {}))
                     if bool(nrrd_layers_enabled) and not stats_local.get('skipped', False):
                         if {str(item['direction']) for item in sam_components} != {'forward', 'backward'} or len(sam_components) != 2:
                             raise RuntimeError('SAM interpolation must produce exactly two selected directional slots')
                         for entry in sam_components:
+                            if submit_sam_layer_projection is not None and int(extrapolation_distance) > 0:
+                                # The bounded projection queue can block submission itself.
+                                # Retain only these two immutable stores until SAM finishes.
+                                deferred_sam_publications.append((dict(entry), pass_idx))
+                                continue
                             materialize = submit_sam_layer_projection or materialize_sam_directional_view_layer
                             publication_kwargs = ({'layer_kind': 'interpolation'}
                                                   if submit_sam_layer_projection is not None else {})
@@ -2296,7 +2368,11 @@ def prepare_view_volume_after_fullframe(
             additions_volume=d1_additions_mm, merge_native=not d1_component_refs_only,
             requested_min_radius=extrapolation_min_radius,
             submit_sam_layer_projection=submit_sam_layer_projection,
-            pending_component_layers=pending_component_layers)
+            pending_component_layers=pending_component_layers,
+            _observation_inventory=observation_inventory,
+            _before_publication=publish_deferred_sam_layers if deferred_sam_publications else None)
+        if observation_inventory is not None:
+            observation_inventory.clear()
         nrrd_layers.extend(tail_refs)
         if extrapolation_stats_local is not None:
             interpolation_stats.append(extrapolation_stats_local)
@@ -2418,6 +2494,10 @@ def prepare_view_volume_after_fullframe(
             close_memmap_array_without_flush(baseline_native_volume)
             baseline_native_volume = None
         raise
+
+    finally:
+        if observation_inventory is not None:
+            observation_inventory.clear()
 
 def gate_tile_components_against_support_inplace(
     tile_mask_mm: np.ndarray,
@@ -3413,142 +3493,152 @@ def finalize_consolidated_tile_volume_for_parent(
                 nrrd_layers.append(layer_ref)
 
 
-    sam_observations = tile_accumulator_mm
-    if _view_uses_interpolation(view, int(interpolate)):
-        total_passes = int(interpolate_passes)
-        for pass_idx in range(1, total_passes + 1):
-            # the pass writes the exact added-voxel delta itself,
-            # replacing the old full-volume before-copy + subtract bookkeeping.
-            pass_component_dir: Optional[Path] = None
-            if (backend == 'sdf' and
-                bool(nrrd_layers_enabled)
-                and int(interpolation_walk_back) > 0
-                and int(interpolation_candidates) > 0
-            ):
-                pass_component_dir = (
-                    temp_dir / 'nrrd_work' / str(model_name) / view.name / config_label /
-                    f'tile_bridge_pass{int(pass_idx):02d}_components'
-                )
-
-            if backend == 'sam':
-                if sam_context is None:
-                    raise RuntimeError('Active consolidated SAM interpolation requires an admitted tracker context')
-                tile_accumulator_mm, stats_local, sam_components = sam_context.interpolate(
-                    sam_observations, view=view,
-                    work_dir=sam_context.evidence_root / str(model_name) / view.name / f'tile_{config_label}',
-                    scope=f'{model_name}/{view.name}/tile/{config_label}', pass_index=pass_idx,
-                    gap_distance=int(interpolate), min_radius=float(effective_interpolate_min_radius),
-                    search_angle_deg=float(effective_interpolation_search_angle),
-                    interpolation_walk_back=int(interpolation_walk_back),
-                    interpolation_candidates=int(interpolation_candidates),
-                    interpolation_passes=total_passes, workers=int(interpolation_task_workers),
-                    wrap_axis=view_interpolation_wrap_axis(view),
-                    upstream_lineage=dict(sam_upstream_lineage or {}),
-                    return_bridge_components=bool(nrrd_layers_enabled))
-                if bool(nrrd_layers_enabled) and not stats_local.get('skipped', False):
-                    if {str(item['direction']) for item in sam_components} != {'forward', 'backward'} or len(sam_components) != 2:
-                        raise RuntimeError('SAM interpolation must produce exactly two selected directional slots')
-                    nrrd_layers.extend(materialize_sam_directional_view_layer(
-                        dict(entry), model_name=str(model_name), view=view, source='tile',
-                        pass_index=pass_idx, sam_context=sam_context, tile_config_id=config_id_norm,
-                        upstream_lineage=sam_upstream_lineage, workers=int(slice_workers)) for entry in sam_components)
-            else:
-                tile_accumulator_mm, stats_local = interpolate_view_volume_pass_maybe_process(
-                    mask_mm=tile_accumulator_mm,
-                    view=view,
-                    work_dir=(
-                        temp_dir / 'tile_interpolation' / str(model_name) /
-                        view.name / config_label
-                    ),
-                    pass_tag=f'pass{pass_idx}',
-                    max_slice_distance=int(interpolate),
-                    search_angle_deg=float(effective_interpolation_search_angle),
-                    interpolation_walk_back=int(interpolation_walk_back),
-                    interpolation_candidates=int(interpolation_candidates),
-                    interpolate_min_radius=float(effective_interpolate_min_radius),
-                    keep_temp=bool(keep_temp),
-                    prefer_memory=True,
-                    workers=int(interpolation_task_workers),
-                    bridge_component_dir=pass_component_dir,
-                )
-            stats_local = dict(stats_local)
-            stats_local.update({
-                'interpolation_backend': backend,
-                'pass_index': int(pass_idx),
-                'model': str(model_name),
-                'view': f'{view.name}[tiles:{config_label}]',
-                'source': 'tile',
-                'tile_config_id': config_id_norm,
-                'max_slice_distance': int(interpolate),
-                'interpolation_walk_back': int(interpolation_walk_back),
-                'interpolation_candidates': int(interpolation_candidates),
-                'interpolation_search_angle': float(interpolation_search_angle),
-                'processing_interpolation_search_angle': float(effective_interpolation_search_angle),
-                'processing_interpolate_min_radius': float(effective_interpolate_min_radius),
-            })
-            interpolation_stats.append(stats_local)
-
-            if pass_component_dir is not None:
-                component_entries = [
-                    dict(entry)
-                    for entry in stats_local.get('bridge_component_deltas', [])
-                ]
-                expected_components = int(interpolation_walk_back) * int(interpolation_candidates)
-                if len(component_entries) != int(expected_components):
-                    raise RuntimeError(
-                        f'{model_name}/{view.name}/{config_label} interpolation pass '
-                        f'{int(pass_idx)} returned {len(component_entries)} component delta(s); '
-                        f'expected {int(interpolation_walk_back)} x '
-                        f'{int(interpolation_candidates)} = {int(expected_components)}'
+    observation_inventory = None
+    if (backend == 'sam' and int(extrapolation_distance) > 0 and int(interpolate_passes) > 0
+            and _view_uses_interpolation(view, int(interpolate))):
+        from .sam_bridge_planning import SamObservationInventory
+        observation_inventory = SamObservationInventory()
+    try:
+        sam_observations = tile_accumulator_mm
+        if _view_uses_interpolation(view, int(interpolate)):
+            total_passes = int(interpolate_passes)
+            for pass_idx in range(1, total_passes + 1):
+                # the pass writes the exact added-voxel delta itself,
+                # replacing the old full-volume before-copy + subtract bookkeeping.
+                pass_component_dir: Optional[Path] = None
+                if (backend == 'sdf' and
+                    bool(nrrd_layers_enabled)
+                    and int(interpolation_walk_back) > 0
+                    and int(interpolation_candidates) > 0
+                ):
+                    pass_component_dir = (
+                        temp_dir / 'nrrd_work' / str(model_name) / view.name / config_label /
+                        f'tile_bridge_pass{int(pass_idx):02d}_components'
                     )
-                component_entries.sort(key=lambda entry: (
-                    int(entry.get('walk_back_index', 0)),
-                    int(entry.get('candidate_index', 0)),
-                ))
-                for component_entry in component_entries:
-                    walk_back_index = int(component_entry['walk_back_index'])
-                    candidate_index = int(component_entry['candidate_index'])
-                    layer_ref = materialize_interpolation_component_nrrd_view_layer(
-                        Path(str(component_entry['path'])),
-                        added_voxels=int(component_entry.get('added_voxels', 0)),
-                        model_name=str(model_name),
+
+                if backend == 'sam':
+                    if sam_context is None:
+                        raise RuntimeError('Active consolidated SAM interpolation requires an admitted tracker context')
+                    tile_accumulator_mm, stats_local, sam_components = sam_context.interpolate(
+                        sam_observations, view=view,
+                        work_dir=sam_context.evidence_root / str(model_name) / view.name / f'tile_{config_label}',
+                        scope=f'{model_name}/{view.name}/tile/{config_label}', pass_index=pass_idx,
+                        gap_distance=int(interpolate), min_radius=float(effective_interpolate_min_radius),
+                        search_angle_deg=float(effective_interpolation_search_angle),
+                        interpolation_walk_back=int(interpolation_walk_back),
+                        interpolation_candidates=int(interpolation_candidates),
+                        interpolation_passes=total_passes, workers=int(interpolation_task_workers),
+                        wrap_axis=view_interpolation_wrap_axis(view),
+                        upstream_lineage=dict(sam_upstream_lineage or {}),
+                        return_bridge_components=bool(nrrd_layers_enabled),
+                        **({'_observation_inventory': observation_inventory} if observation_inventory is not None else {}))
+                    if bool(nrrd_layers_enabled) and not stats_local.get('skipped', False):
+                        if {str(item['direction']) for item in sam_components} != {'forward', 'backward'} or len(sam_components) != 2:
+                            raise RuntimeError('SAM interpolation must produce exactly two selected directional slots')
+                        nrrd_layers.extend(materialize_sam_directional_view_layer(
+                            dict(entry), model_name=str(model_name), view=view, source='tile',
+                            pass_index=pass_idx, sam_context=sam_context, tile_config_id=config_id_norm,
+                            upstream_lineage=sam_upstream_lineage, workers=int(slice_workers)) for entry in sam_components)
+                else:
+                    tile_accumulator_mm, stats_local = interpolate_view_volume_pass_maybe_process(
+                        mask_mm=tile_accumulator_mm,
                         view=view,
-                        source='tile',
-                        pass_index=int(pass_idx),
-                        interpolation_walk_back_index=int(walk_back_index),
-                        interpolation_candidate_index=int(candidate_index),
-                        tile_config_id=config_id_norm,
-                        tile_acceptance='consolidated',
-                        stage=interpolation_stage,
-                        description=(
-                            f'Voxels added by this {config_label} tile interpolation pass '
-                            f'for walk-back origin {int(walk_back_index)} and candidate '
-                            f'{int(candidate_index)} only. Bridges are generated after '
-                            'accepted tile masks within this configuration are consolidated, '
-                            'so they are not attributed back to parent-mask vs parent-bridge '
-                            'acceptance categories.'
+                        work_dir=(
+                            temp_dir / 'tile_interpolation' / str(model_name) /
+                            view.name / config_label
                         ),
-                        temp_dir=temp_dir,
-                        workers=int(slice_workers),
+                        pass_tag=f'pass{pass_idx}',
+                        max_slice_distance=int(interpolate),
+                        search_angle_deg=float(effective_interpolation_search_angle),
+                        interpolation_walk_back=int(interpolation_walk_back),
+                        interpolation_candidates=int(interpolation_candidates),
+                        interpolate_min_radius=float(effective_interpolate_min_radius),
                         keep_temp=bool(keep_temp),
+                        prefer_memory=True,
+                        workers=int(interpolation_task_workers),
+                        bridge_component_dir=pass_component_dir,
                     )
-                    nrrd_layers.append(layer_ref)
+                stats_local = dict(stats_local)
+                stats_local.update({
+                    'interpolation_backend': backend,
+                    'pass_index': int(pass_idx),
+                    'model': str(model_name),
+                    'view': f'{view.name}[tiles:{config_label}]',
+                    'source': 'tile',
+                    'tile_config_id': config_id_norm,
+                    'max_slice_distance': int(interpolate),
+                    'interpolation_walk_back': int(interpolation_walk_back),
+                    'interpolation_candidates': int(interpolation_candidates),
+                    'interpolation_search_angle': float(interpolation_search_angle),
+                    'processing_interpolation_search_angle': float(effective_interpolation_search_angle),
+                    'processing_interpolate_min_radius': float(effective_interpolate_min_radius),
+                })
+                interpolation_stats.append(stats_local)
+
+                if pass_component_dir is not None:
+                    component_entries = [
+                        dict(entry)
+                        for entry in stats_local.get('bridge_component_deltas', [])
+                    ]
+                    expected_components = int(interpolation_walk_back) * int(interpolation_candidates)
+                    if len(component_entries) != int(expected_components):
+                        raise RuntimeError(
+                            f'{model_name}/{view.name}/{config_label} interpolation pass '
+                            f'{int(pass_idx)} returned {len(component_entries)} component delta(s); '
+                            f'expected {int(interpolation_walk_back)} x '
+                            f'{int(interpolation_candidates)} = {int(expected_components)}'
+                        )
+                    component_entries.sort(key=lambda entry: (
+                        int(entry.get('walk_back_index', 0)),
+                        int(entry.get('candidate_index', 0)),
+                    ))
+                    for component_entry in component_entries:
+                        walk_back_index = int(component_entry['walk_back_index'])
+                        candidate_index = int(component_entry['candidate_index'])
+                        layer_ref = materialize_interpolation_component_nrrd_view_layer(
+                            Path(str(component_entry['path'])),
+                            added_voxels=int(component_entry.get('added_voxels', 0)),
+                            model_name=str(model_name),
+                            view=view,
+                            source='tile',
+                            pass_index=int(pass_idx),
+                            interpolation_walk_back_index=int(walk_back_index),
+                            interpolation_candidate_index=int(candidate_index),
+                            tile_config_id=config_id_norm,
+                            tile_acceptance='consolidated',
+                            stage=interpolation_stage,
+                            description=(
+                                f'Voxels added by this {config_label} tile interpolation pass '
+                                f'for walk-back origin {int(walk_back_index)} and candidate '
+                                f'{int(candidate_index)} only. Bridges are generated after '
+                                'accepted tile masks within this configuration are consolidated, '
+                                'so they are not attributed back to parent-mask vs parent-bridge '
+                                'acceptance categories.'
+                            ),
+                            temp_dir=temp_dir,
+                            workers=int(slice_workers),
+                            keep_temp=bool(keep_temp),
+                        )
+                        nrrd_layers.append(layer_ref)
 
 
-            if backend == 'sam' or int(stats_local.get('added_voxels', 0)) <= 0:
-                break
+                if backend == 'sam' or int(stats_local.get('added_voxels', 0)) <= 0:
+                    break
 
-    extrapolation_stats_local, tail_refs = _run_sam_extrapolation(
-        tile_accumulator_mm, view=view, model_name=model_name, source='tile',
-        sam_context=sam_context, distance=extrapolation_distance,
-        walk_back=extrapolation_walk_back, min_radius=view_processing_min_radius(
-            view, float(extrapolation_min_radius), tile_plane_shape),
-        workers=slice_workers, nrrd_layers_enabled=nrrd_layers_enabled,
-        tile_config_id=config_id_norm, upstream_lineage=sam_upstream_lineage,
-        requested_min_radius=extrapolation_min_radius)
-    nrrd_layers.extend(tail_refs)
-    if extrapolation_stats_local is not None:
-        interpolation_stats.append(extrapolation_stats_local)
+        extrapolation_stats_local, tail_refs = _run_sam_extrapolation(
+            tile_accumulator_mm, view=view, model_name=model_name, source='tile',
+            sam_context=sam_context, distance=extrapolation_distance,
+            walk_back=extrapolation_walk_back, min_radius=view_processing_min_radius(
+                view, float(extrapolation_min_radius), tile_plane_shape),
+            workers=slice_workers, nrrd_layers_enabled=nrrd_layers_enabled,
+            tile_config_id=config_id_norm, upstream_lineage=sam_upstream_lineage,
+            requested_min_radius=extrapolation_min_radius, _observation_inventory=observation_inventory)
+        nrrd_layers.extend(tail_refs)
+        if extrapolation_stats_local is not None:
+            interpolation_stats.append(extrapolation_stats_local)
+    finally:
+        if observation_inventory is not None:
+            observation_inventory.clear()
 
     with destination_lock:
         union_volume_into_volume(

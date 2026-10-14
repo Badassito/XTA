@@ -26,6 +26,7 @@ _LOCKS = {}
 _ARCHIVE_INDEX_CACHE = {}
 _APPEND_SNAPSHOTS = {}
 _GUARD = threading.Lock()
+_READERS_CHANGED = threading.Condition(_GUARD)
 
 
 class ArchiveError(ValueError):
@@ -33,8 +34,9 @@ class ArchiveError(ValueError):
 
 
 def _after_fork():
-    global _LOCKS, _ARCHIVE_INDEX_CACHE, _APPEND_SNAPSHOTS, _GUARD
+    global _LOCKS, _ARCHIVE_INDEX_CACHE, _APPEND_SNAPSHOTS, _GUARD, _READERS_CHANGED
     _LOCKS, _ARCHIVE_INDEX_CACHE, _APPEND_SNAPSHOTS, _GUARD = {}, {}, {}, threading.Lock()
+    _READERS_CHANGED = threading.Condition(_GUARD)
 
 
 if hasattr(os, "register_at_fork"):
@@ -81,32 +83,64 @@ def _writer_lock(path):
     _plain_ancestors(lock_path)
     if os.path.exists(_api_path(lock_path)) and not stat.S_ISREG(os.stat(_api_path(lock_path)).st_mode):
         raise ArchiveError("Artifact lock must be a regular file")
-    with _lock_for(path), open(_api_path(lock_path), "a+b") as handle:
-        if os.fstat(handle.fileno()).st_size == 0:
-            handle.write(b"\0")
-            handle.flush()
-        if os.name == "nt":
-            import msvcrt
-            while True:
-                handle.seek(0)
-                try:
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                    break
-                except OSError as error:
-                    if error.errno not in (13, 36):
-                        raise
-                    time.sleep(.02)
-        else:
-            import fcntl
-            fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
+    try:
+        with _lock_for(path), open(_api_path(lock_path), "a+b") as handle:
+            if os.fstat(handle.fileno()).st_size == 0:
+                handle.write(b"\0")
+                handle.flush()
             if os.name == "nt":
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                import msvcrt
+                while True:
+                    handle.seek(0)
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError as error:
+                        if error.errno not in (13, 36):
+                            raise
+                        time.sleep(.02)
             else:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+                import fcntl
+                fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        with _READERS_CHANGED:
+            _READERS_CHANGED.notify_all()
+
+
+@contextmanager
+def _reader_lock(path, snapshot_result):
+    """Recheck a verified old prefix when an in-process writer publishes it."""
+    lock, result, acquired = _lock_for(path), None, False
+    try:
+        with _READERS_CHANGED:
+            while True:
+                snapshot = _APPEND_SNAPSHOTS.get(str(path))
+                if snapshot is not None:
+                    result = snapshot_result(snapshot)
+                    if result is not None:
+                        break
+                acquired = lock.acquire(blocking=False)
+                if acquired:
+                    break
+                _READERS_CHANGED.wait()
+        if result is not None:
+            yield result
+            return
+        with _writer_lock(path):
+            yield None
+    finally:
+        if acquired:
+            lock.release()
+            with _READERS_CHANGED:
+                _READERS_CHANGED.notify_all()
 
 
 def _header_available(stream, offset, size):
@@ -306,8 +340,9 @@ def append_members(archive, members, *, replace=False, fresh_prefix=None):
             stream.seek(end)
             try:
                 # Only this exclusive writer may lend its verified immutable prefix.
-                with _GUARD:
+                with _READERS_CHANGED:
                     _APPEND_SNAPSHOTS[str(path)] = (_stamp(os.fstat(stream.fileno()))[:2], entries, end)
+                    _READERS_CHANGED.notify_all()
                 published = {}
                 for name, source in normalized.items():
                     published[name] = {**_write_member(stream, "DATA/" + transaction + "/" + name, source),
@@ -371,9 +406,8 @@ def _entry(value, *, open_payload=False):
     if parsed is None or not parsed[1]:
         raise ArchiveError("Expected an artifact archive member reference")
     path, name = parsed
-    with _GUARD:
-        snapshot = _APPEND_SNAPSHOTS.get(str(path))
-        if snapshot is not None and name in snapshot[1]:
+    def lookup(snapshot):
+        if name in snapshot[1]:
             stream = _open_append_prefix(path, snapshot)
             try:
                 entry = dict(snapshot[1][name])
@@ -384,7 +418,9 @@ def _entry(value, *, open_payload=False):
             finally:
                 if stream is not None:
                     stream.close()
-    with _writer_lock(path):
+    with _reader_lock(path, lookup) as result:
+        if result is not None:
+            return result
         entries, _ = _index(path)
         if name not in entries:
             raise FileNotFoundError(str(value))
@@ -407,14 +443,15 @@ def member_exists(value):
 def list_members(archive, prefix=""):
     path = _canonical_path(archive)
     prefix = _name(prefix.rstrip("/\\")) if prefix else ""
-    with _GUARD:
-        snapshot = _APPEND_SNAPSHOTS.get(str(path))
-        if snapshot is not None and prefix:
+    def lookup(snapshot):
+        if prefix:
             names = sorted(name for name in snapshot[1] if name == prefix or name.startswith(prefix + "/"))
             if names:
                 with _open_append_prefix(path, snapshot):
                     return names
-    with _writer_lock(path):
+    with _reader_lock(path, lookup) as result:
+        if result is not None:
+            return result
         entries, _ = _index(path)
         return sorted(name for name in entries if not prefix or name == prefix or name.startswith(prefix + "/"))
 

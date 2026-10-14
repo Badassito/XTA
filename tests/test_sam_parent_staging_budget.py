@@ -33,6 +33,7 @@ def pipeline_drain(stage, budget, scheduler, *, sam_context=None):
         detector_workspace_preparation=None,
         background_drain_budget=budget, sam_parent_staging=stage, sam_context=sam_context,
         _maybe_prepare_sam_runtime=lambda: None, _maybe_prepare_sam_cpu_source=lambda: None,
+        _reclaim_drained_sam_dense_capacity=lambda: None,
         parent_dense_retired_events=queues.SimpleQueue(),
         parent_confidence_retired_events=queues.SimpleQueue(),
         _drain_parent_mask_ready_events=lambda: None,
@@ -259,8 +260,6 @@ def test_locked_parent_drain_reaches_wakeable_wait_and_independent_completion(tm
             locked.set()
             assert release.wait(3)
     holder = threading.Thread(target=hold_parent_condition)
-    holder.start()
-    assert locked.wait(2)
     checkpoints = []
     scheduler = SimpleNamespace(process_inference_outstanding=lambda: False,
         service_pending_compute_credits=lambda: checkpoints.append(True))
@@ -326,7 +325,9 @@ def test_locked_parent_drain_reaches_wakeable_wait_and_independent_completion(tm
         [ast.While(ast.Constant(True), body, [])], [])], [])
     ast.fix_missing_locations(module)
     exec(compile(module, '<scheduler-outer-wait>', 'exec'), namespace)
+    holder.start()
     try:
+        assert locked.wait(2)
         with pytest.raises(WaitsObserved):
             namespace['_test_outer_loop']()
         assert waits == [expected_timeout] * 3 and len(iterations) <= 6

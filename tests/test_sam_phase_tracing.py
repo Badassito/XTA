@@ -110,6 +110,8 @@ def test_phase_error_is_bounded_and_caught_fallback_remains_local(tmp_path, monk
 @pytest.mark.parametrize('failed', (False, True))
 def test_image_provider_trace_preserves_result_or_error(tmp_path, monkeypatch, failed):
     context = _context(tmp_path)
+    view = geometry.get_view_infos(3, 4, 5, cartesian_views=('transverse',))[0]
+    monkeypatch.setattr('XTA.sam_gpu_rendering.try_gpu_crop_renderer', lambda *a, **k: None)
     events = []
     result = object()
     context._resource_local.sam_phase_scope = ('extrapolation', 'cohort-scope')
@@ -124,9 +126,9 @@ def test_image_provider_trace_preserves_result_or_error(tmp_path, monkeypatch, f
     try:
         if failed:
             with pytest.raises(RuntimeError, match='render failed'):
-                context.image_provider(None, (3, 4, 5))
+                context.image_provider(view, (3, 4, 5))
         else:
-            assert context.image_provider(None, (3, 4, 5)) is result
+            assert context.image_provider(view, (3, 4, 5)) is result
         assert [event for event, _ in events] == ['sam_phase_begin', 'sam_phase_end']
         assert events[1][1]['failed'] is failed
         assert events[0][1]['sam_phase'] == 'image_render'

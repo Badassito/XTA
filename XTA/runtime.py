@@ -2126,6 +2126,25 @@ def resolve_parent_memory_limits(available_bytes: int, *, sam_enabled: bool,
     return inference, dense, transient
 
 
+def repartition_sam_parent_memory(inference_bytes, dense_bytes, transient_bytes, *,
+                                  max_parent_bytes, cpu_input_bytes):
+    """Move only unused default dense capacity, retaining two future parent births."""
+    if max_parent_bytes <= 0 or cpu_input_bytes < 0:
+        return dense_bytes, transient_bytes
+    floor = max(2*inference_bytes, inference_bytes+cpu_input_bytes+2*max_parent_bytes)
+    dense = min(dense_bytes, floor)
+    return dense, transient_bytes+dense_bytes-dense
+
+
+def reclaim_drained_sam_parent_memory(dense_bytes, transient_bytes, *,
+                                     owned_dense_bytes, max_future_parent_bytes):
+    """After detector retirement, retain live owners and two future restore births."""
+    if owned_dense_bytes < 0 or max_future_parent_bytes < 0:
+        return dense_bytes, transient_bytes
+    dense = min(dense_bytes, max(1, owned_dense_bytes+2*max_future_parent_bytes))
+    return dense, transient_bytes+dense_bytes-dense
+
+
 def resolve_parent_postprocess_worker_allocation(
     worker_budget: int,
     views: Sequence['ViewInfo'],

@@ -5,10 +5,8 @@ import time
 import weakref
 
 
-_RETRY_GROUP_POOL = None
+_RETRY_GROUP_POOLS = weakref.WeakKeyDictionary()
 _RETRY_GROUP_POOL_LOCK = threading.Lock()
-_MAX_RETRY_GROUP_CONTROLLERS = 8
-_CONTROLLER_SLOTS = threading.BoundedSemaphore(_MAX_RETRY_GROUP_CONTROLLERS)
 
 
 class _ControllerPermit:
@@ -22,13 +20,39 @@ class _ControllerPermit:
                 self.slots = None
 
 
-def _executor():
-    global _RETRY_GROUP_POOL
+class _RuntimeControllers:
+    def __init__(self, capacity):
+        self.capacity, self.active, self.lock = capacity, 0, threading.Lock()
+        self.executor = ThreadPoolExecutor(max_workers=capacity, thread_name_prefix='sam-retry-group')
+
+    def acquire(self, started_slots):
+        with self.lock:
+            if self.active >= min(self.capacity, started_slots):
+                return None
+            self.active += 1
+        return _ControllerPermit(self)
+
+    def release(self):
+        with self.lock:
+            if self.active <= 0:
+                raise ValueError('SAM retry controller permit returned twice')
+            self.active -= 1
+
+
+def _controllers(runtime):
     with _RETRY_GROUP_POOL_LOCK:
-        if _RETRY_GROUP_POOL is None:
-            _RETRY_GROUP_POOL = ThreadPoolExecutor(max_workers=_MAX_RETRY_GROUP_CONTROLLERS,
-                thread_name_prefix='sam-retry-group')
-        return _RETRY_GROUP_POOL
+        state = _RETRY_GROUP_POOLS.get(runtime)
+        if state is None:
+            capacity = len(getattr(runtime, '_configured_worker_slots', runtime.worker_slots))
+            state = _RuntimeControllers(capacity)
+            _RETRY_GROUP_POOLS[runtime] = state
+            # Active source owners retain runtime until callbacks and rights settle.
+            weakref.finalize(runtime, state.executor.shutdown, wait=False)
+        return state
+
+
+def _executor(runtime):
+    return _controllers(runtime).executor
 
 
 def _event(name, **fields):
@@ -90,7 +114,7 @@ def _child(request, owner_ref, ordinal, group_id, parent_scope, original_ordinal
 
 
 def execute_retry_groups(group_ids, run_group, *, parent_profile, context, runtime,
-                         parent_scope, family=None, max_in_flight=8, group_ordinals=None):
+                         parent_scope, family=None, max_in_flight=None, group_ordinals=None):
     """Drain any completion; retry declined grants after funded work frees credit.
 
     Every group calls the same scientific runner. A child is allowed to touch
@@ -104,10 +128,13 @@ def execute_retry_groups(group_ids, run_group, *, parent_profile, context, runti
     if (len(ordinals)!=len(ids) or any(type(value) is not int or value<0 for value in ordinals)
             or len(set(ordinals))!=len(ordinals)):
         raise ValueError('SAM retry group ordinals must identify the finite original inventory')
-    capacity = min(_MAX_RETRY_GROUP_CONTROLLERS,max(1,int(max_in_flight)),len(ids))
+    configured = len(getattr(runtime, '_configured_worker_slots', getattr(runtime, 'worker_slots', ())))
+    limit = min(configured, configured if max_in_flight is None else max(1,int(max_in_flight)), len(ids))
+    capacity = min(limit, len(getattr(runtime, 'worker_slots', ())))
     owner = _SourceOwner(run_group,context,runtime,parent_scope,family,ordinals)
     owner_ref = weakref.ref(owner)
-    pool = _executor()
+    controllers = _controllers(runtime) if limit else None
+    pool = _executor(runtime) if controllers is not None else None
     pending, owned, deferred, results = {}, [], set(), {}
     next_ordinal = 0
     refill_slots = capacity
@@ -116,13 +143,13 @@ def execute_retry_groups(group_ids, run_group, *, parent_profile, context, runti
 
     def submit(ordinal):
         # A queued controller would park the funded owner behind unrelated GPU work.
-        if not _CONTROLLER_SLOTS.acquire(blocking=False):
+        permit = controllers.acquire(len(runtime.worker_slots))
+        if permit is None:
             deferred.add(ordinal)
             stats['controller_declines'] += 1
             _event('sam_retry_group_declined', scope_id=parent_scope,
                 original_group_id=ids[ordinal], group_ordinal=ordinals[ordinal], reason='controller_capacity')
             return False
-        permit = _ControllerPermit(_CONTROLLER_SLOTS)
         try:
             request = prepare_retry_child_resources(parent_profile,
                 f'{parent_scope}/retry-group/{ordinals[ordinal]}')
@@ -187,6 +214,11 @@ def execute_retry_groups(group_ids, run_group, *, parent_profile, context, runti
         while len(results)<len(ids):
             if context._cancel.is_set() or getattr(runtime,'_cancel',context._cancel).is_set():
                 raise RuntimeError('SAM independent retry groups cancelled')
+            current_capacity = min(limit, len(getattr(runtime, 'worker_slots', ())))
+            if current_capacity > capacity:
+                refill_slots = max(refill_slots, current_capacity-len(pending))
+            capacity = current_capacity
+            stats['capacity'] = max(stats['capacity'], capacity)
             while refill_slots and len(pending)<capacity and (deferred or next_ordinal<len(ids)):
                 if deferred:
                     ordinal = min(deferred)
@@ -199,8 +231,12 @@ def execute_retry_groups(group_ids, run_group, *, parent_profile, context, runti
                     break
                 refill_slots -= 1
             if not pending:
-                ordinal = min(deferred)
-                deferred.remove(ordinal)
+                if deferred:
+                    ordinal = min(deferred)
+                    deferred.remove(ordinal)
+                else:
+                    ordinal = next_ordinal
+                    next_ordinal += 1
                 results[ordinal] = owner.execute(ordinal,parent_profile,ids[ordinal],child=False)
                 stats['serial_fallback_groups'] += 1
                 refill_slots = capacity

@@ -155,6 +155,89 @@ def test_same_parent_extrapolation_and_next_parent_progress_before_publication(t
         assembly.set_final_source_output_shape(None)
 
 
+@pytest.mark.parametrize('pressure', ['pending', 'source_bytes'])
+def test_saturated_unrelated_projection_does_not_delay_same_parent_extrapolation(tmp_path, pressure):
+    target = (5, 7, 9)
+    view = geometry.get_view_infos(*target, cartesian_views=('transverse',))[0]
+    context = SelectedContext(tmp_path/'evidence', target)
+    started, release = Event(), Event()
+    queue = make_queue(max_pending=1 if pressure == 'pending' else 8,
+                       max_source_bytes=1024**2)
+    def unrelated():
+        started.set()
+        if not release.wait(10):
+            raise RuntimeError('test unrelated projection stalled')
+    unrelated_future = queue.submit(unrelated, source_bytes=1024**2, working_bytes=1)
+    assembly.set_final_source_output_shape(target)
+    try:
+        assert started.wait(3)
+        with ThreadPoolExecutor(max_workers=1) as parent, redirect_stdout(StringIO()):
+            future = parent.submit(prepare, tmp_path/'parent', view, context,
+                                   make_submitter(queue, target))
+            try:
+                assert context.interpolation_entered.wait(3)
+                assert context.extrapolation_entered.wait(3), 'Projection admission blocked the next SAM stage'
+                assert not unrelated_future.done() and not release.is_set()
+            finally:
+                release.set()
+            result = future.result(5)
+        queue.shutdown()
+        assert settle_prepared_view_components(result)
+        assert [(ref.mask_kind, ref.interpolation_direction or ref.extrapolation_provenance['direction'])
+                for ref in result.nrrd_layers] == [
+                    ('bridge', 'forward'), ('bridge', 'backward'),
+                    ('extrapolation', 'forward'), ('extrapolation', 'backward')]
+        state = queue.snapshot()
+        assert state['peak_pending'] <= state['max_pending']
+        assert state['peak_source_bytes'] <= state['max_source_bytes']
+        assert state['pending'] == state['source_bytes'] == state['working_bytes'] == 0
+    finally:
+        release.set()
+        queue.abort()
+        queue.shutdown(cancel_futures=True)
+        assembly.set_final_source_output_shape(None)
+
+
+def test_extrapolation_failure_preserves_error_without_submitting_deferred_layers(tmp_path, monkeypatch):
+    target = (5, 7, 9)
+    view = geometry.get_view_infos(*target, cartesian_views=('transverse',))[0]
+    context = SelectedContext(tmp_path/'evidence', target)
+    failure = RuntimeError('controlled extrapolation failure')
+    def extrapolate(*args, **kwargs):
+        raise failure
+    monkeypatch.setattr(context, 'extrapolate', extrapolate)
+    submitted = []
+    def submit(*args, **kwargs):
+        submitted.append((args, kwargs))
+        raise AssertionError('Deferred layers submitted before extrapolation')
+    with pytest.raises(RuntimeError) as caught:
+        prepare(tmp_path/'parent', view, context, submit)
+    assert caught.value is failure and not submitted
+
+
+def test_deferred_interpolation_is_published_when_extrapolation_has_no_components(tmp_path, monkeypatch):
+    target = (5, 7, 9)
+    view = geometry.get_view_infos(*target, cartesian_views=('transverse',))[0]
+    context = SelectedContext(tmp_path/'evidence', target)
+    def extrapolate(observations, **kwargs):
+        context.extrapolation_entered.set()
+        return observations, {'skipped': True}, []
+    monkeypatch.setattr(context, 'extrapolate', extrapolate)
+    queue = make_queue(max_pending=1)
+    assembly.set_final_source_output_shape(target)
+    try:
+        result = prepare(tmp_path/'parent', view, context, make_submitter(queue, target))
+        queue.shutdown()
+        assert context.extrapolation_entered.is_set() and settle_prepared_view_components(result)
+        assert [(ref.mask_kind, ref.interpolation_direction) for ref in result.nrrd_layers] == [
+            ('bridge', 'forward'), ('bridge', 'backward')]
+        assert queue.snapshot()['submitted'] == 2 and queue.snapshot()['pending'] == 0
+    finally:
+        queue.abort()
+        queue.shutdown(cancel_futures=True)
+        assembly.set_final_source_output_shape(None)
+
+
 def test_source_projected_layers_match_synchronous_publication_across_views(tmp_path):
     shape, target = (5, 9, 11), (7, 13, 15)
     views = geometry.get_view_infos(*shape, cartesian_views=('transverse', 'sagittal', 'coronal'),

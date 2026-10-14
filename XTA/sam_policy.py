@@ -6,7 +6,7 @@ coverage and write-domain invariants cannot be waived by an external policy.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import hashlib
 import json
 import os
@@ -18,6 +18,7 @@ import uuid
 import numpy as np
 from scipy import ndimage
 
+from ._deps import _numba
 from .sam_evidence import (SamEvidenceBundle, TILE_EVIDENCE_SCHEMA, _freeze, _plain, _group_shape,
                            fingerprint, iter_selected_planes, iter_selected_native_crops, evidence_frame_geometry)
 from .sam_filtering import (IMPLEMENTATION_SHA256 as FILTER_IMPLEMENTATION_SHA256,
@@ -424,6 +425,40 @@ def _crop_contact_diagnostic(raw, effective, group, scope):
     return result
 
 
+@_numba.njit(nogil=True, cache=False)
+def _containment_counts_kernel(raw, effective, acceptance):
+    raw_foreground = foreground = raw_outside = outside = raw_touch = touch = 0
+    height, width = raw.shape
+    for y in range(height):
+        for x in range(width):
+            r, e = raw[y, x], effective[y, x]
+            raw_foreground += int(r)
+            foreground += int(e)
+            if not r and not e:
+                continue
+            if not acceptance[y, x]:
+                raw_outside += int(r)
+                outside += int(e)
+                continue
+            boundary = y == 0 or x == 0 or y == height - 1 or x == width - 1
+            if not boundary:
+                boundary = not (acceptance[y-1, x-1] and acceptance[y-1, x] and acceptance[y-1, x+1]
+                    and acceptance[y, x-1] and acceptance[y, x+1]
+                    and acceptance[y+1, x-1] and acceptance[y+1, x] and acceptance[y+1, x+1])
+            if boundary:
+                raw_touch += int(r)
+                touch += int(e)
+    return raw_foreground, foreground, raw_outside, outside, raw_touch, touch
+
+
+def _containment_counts(raw, effective, acceptance):
+    """Count support against the finite 3x3 acceptance erosion without mask temporaries."""
+    if (raw.ndim != 2 or effective.shape != raw.shape or acceptance.shape != raw.shape
+            or any(mask.dtype != np.bool_ for mask in (raw, effective, acceptance))):
+        raise ValueError("SAM containment requires matching boolean planes")
+    return _containment_counts_kernel(raw, effective, acceptance)
+
+
 def measure_sam_run(bundle, run_id, *, mask_filter=None):
     """Retain raw diagnostics and measure effective component-filtered support."""
     run = bundle.runs[str(run_id)]
@@ -454,14 +489,19 @@ def measure_sam_run(bundle, run_id, *, mask_filter=None):
         raw = bundle.raw_mask(run_id, frame)
         effective, filtering = measure_effective_raw_mask(bundle, run_id, frame, mask_filter)
         acceptance = bundle.group_mask(group["group_id"], f"acceptance:{frame}")
-        boundary = acceptance & ~ndimage.binary_erosion(acceptance, structure=np.ones((3, 3), bool), border_value=0)
-        raw_outside, raw_touch = int(np.count_nonzero(raw & ~acceptance)), int(np.count_nonzero(raw & boundary))
-        outside, touch = int(np.count_nonzero(effective & ~acceptance)), int(np.count_nonzero(effective & boundary))
-        raw_containment.append(dict(frame_index=int(frame), foreground=int(np.count_nonzero(raw)),
+        if tiled:
+            # Halo diagnostics below still need the complete boundary plane.
+            boundary = acceptance & ~ndimage.binary_erosion(acceptance, structure=np.ones((3, 3), bool), border_value=0)
+            raw_outside, raw_touch = int(np.count_nonzero(raw & ~acceptance)), int(np.count_nonzero(raw & boundary))
+            outside, touch = int(np.count_nonzero(effective & ~acceptance)), int(np.count_nonzero(effective & boundary))
+            raw_foreground, foreground = int(np.count_nonzero(raw)), int(np.count_nonzero(effective))
+        else:
+            raw_foreground, foreground, raw_outside, outside, raw_touch, touch = _containment_counts(raw, effective, acceptance)
+        raw_containment.append(dict(frame_index=int(frame), foreground=raw_foreground,
                                    outside=raw_outside, boundary_touch=raw_touch,
                                    injected=frame in run.get("injected_frames", ())))
-        row = dict(frame_index=int(frame), foreground=int(np.count_nonzero(effective)), outside=outside, boundary_touch=touch,
-                   raw_foreground=int(np.count_nonzero(raw)), raw_outside=raw_outside, raw_boundary_touch=raw_touch,
+        row = dict(frame_index=int(frame), foreground=foreground, outside=outside, boundary_touch=touch,
+                   raw_foreground=raw_foreground, raw_outside=raw_outside, raw_boundary_touch=raw_touch,
                    removed_outside=raw_outside-outside, removed_boundary_touch=raw_touch-touch,
                    injected=frame in run.get("injected_frames", ()))
         row["crop_contacts"]=_crop_contact_diagnostic(raw,effective,group,bundle.scope)
@@ -1491,17 +1531,20 @@ def _measure_group_intrinsic(bundle, group, run_ids, mask_filter, execution, *, 
                 execution["peak_pending_runs"] = max(execution["peak_pending_runs"], len(pending))
                 execution["peak_charged_bytes"] = max(execution["peak_charged_bytes"], active_charge)
         try:
-            submit_available()
-            for key in run_ids:
-                if key not in pending:
+            while next_index < len(run_ids) or pending:
+                submit_available()
+                if not pending:
                     # A single operation can use the serial legacy path. Drain
                     # already-submitted lanes before doing that operation.
-                    if pending:
-                        raise RuntimeError("SAM measurement admission lost its ordered ownership")
+                    key = run_ids[next_index]
                     measurements[key] = measure_sam_run(bundle, key, mask_filter=mask_filter)
                     execution["oversized_serial_runs"] += 1
                     next_index += 1
-                else:
+                    continue
+                done, _ = wait(tuple(pending.values()), return_when=FIRST_COMPLETED)
+                for key in tuple(pending):
+                    if pending[key] not in done:
+                        continue
                     result, stats = pending.pop(key).result()
                     measurements[key] = result
                     active_charge -= charges[key]
@@ -1510,12 +1553,11 @@ def _measure_group_intrinsic(bundle, group, run_ids, mask_filter, execution, *, 
                                  "cache_hits", "cache_misses", "cache_evictions",
                                  "compact_filter_expansions", "compact_filter_parent_hits", "compact_filter_parent_exports"):
                         execution["reader_totals"][name] += int(stats.get(name, 0))
-                submit_available()
         except BaseException:
             for future in pending.values():
                 future.cancel()
             raise  # Executor joins all running borrows before outer integrity exit.
-    return measurements
+    return {key: measurements[key] for key in run_ids}
 
 
 def _selection_reader_cache_bytes(bundle, resource_profile):

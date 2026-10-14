@@ -235,9 +235,101 @@ def _adjacent_masks(a: SamObservation, b: SamObservation) -> bool:
                        & b.mask_in_crop(crop)))
 
 
+class SamObservationInventory:
+    """Parent-owned, bounded geometry shared by consecutive observation scans.
+
+    Entries borrow immutable crops already owned by a completed plan. Scope,
+    labels, topology and terminal decisions are deliberately never cached.
+    """
+    def __init__(self):
+        self._frames = {}
+        self._old = {}
+        self._old_bytes = self._empty_bytes = 0
+        self._active = False
+        self._counts = dict(scans=0, reused_frames=0, reused_components=0,
+                            label_calls=0, evicted_frames=0)
+
+    def snapshot(self):
+        """Small diagnostics only; never part of a scientific planning identity."""
+        return dict(self._counts, retained_frames=len(self._frames),
+                    retained_bytes=sum(entry[2] for entry in self._frames.values()))
+
+    def clear(self):
+        if self._active:
+            raise RuntimeError('Cannot clear an active SAM observation inventory')
+        self._frames.clear()
+        self._old.clear()
+        self._old_bytes = self._empty_bytes = 0
+
+    def _begin(self, limits):
+        if self._active:
+            raise RuntimeError('SAM observation inventory cannot have concurrent owners')
+        self._active = True
+        self._counts['scans'] += 1
+        self._old, self._frames = self._frames, {}
+        self._old_bytes = sum(entry[2] for entry in self._old.values())
+        self._empty_bytes = 0
+        self._limit = limits.max_observation_bytes
+        self._trim(0)
+
+    def _trim(self, observed_bytes):
+        # Old future frames can be recomputed. Never impose a cache-only refusal.
+        while self._old and self._old_bytes + self._empty_bytes + observed_bytes > self._limit:
+            _, entry = self._old.popitem()
+            self._old_bytes -= entry[2]
+            self._counts['evicted_frames'] += 1
+        if self._empty_bytes + observed_bytes > self._limit:
+            for key in tuple(self._frames):
+                if not self._frames[key][1]:
+                    del self._frames[key]
+                    self._empty_bytes -= 256
+                    self._counts['evicted_frames'] += 1
+                    if self._empty_bytes + observed_bytes <= self._limit:
+                        break
+
+    def _take(self, key, digest):
+        entry = self._old.pop(key, None)
+        if entry is not None:
+            self._old_bytes -= entry[2]
+        if entry is not None and entry[0] == digest:
+            return entry[1]
+        return None
+
+    def _remember(self, key, digest, components, observed_bytes):
+        charge = sum(crop.size + 1024 for _, crop, _ in components)
+        if not components:
+            if self._old_bytes + self._empty_bytes + observed_bytes + 256 > self._limit:
+                return
+            charge = 256
+            self._empty_bytes += charge
+        previous = self._frames.get(key)
+        if previous is not None and not previous[1]:
+            self._empty_bytes -= 256
+        self._frames[key] = (digest, tuple(components), charge)
+
+    def _finish(self):
+        self._old.clear()
+        self._old_bytes = 0
+        self._active = False
+
+
 def _observations(volume: object, *, scope: str, labels: object | None,
-                  lineage: Mapping[str, Any] | None, limits: SamPlanningLimits
+                  lineage: Mapping[str, Any] | None, limits: SamPlanningLimits,
+                  inventory: SamObservationInventory | None = None,
                   ) -> tuple[list[SamObservation], dict[int, list[int]], str | None]:
+    if inventory is not None:
+        if not isinstance(inventory, SamObservationInventory):
+            raise TypeError('SAM observation reuse requires its parent-owned inventory')
+        inventory._begin(limits)
+    try:
+        return _discover_observations(volume, scope=scope, labels=labels,
+            lineage=lineage, limits=limits, inventory=inventory)
+    finally:
+        if inventory is not None:
+            inventory._finish()
+
+
+def _discover_observations(volume, *, scope, labels, lineage, limits, inventory):
     result: list[SamObservation] = []
     by_frame: dict[int, list[int]] = {}
     shape = tuple(int(v) for v in volume.shape)  # type: ignore[attr-defined]
@@ -250,30 +342,62 @@ def _observations(volume: object, *, scope: str, labels: object | None,
         component_index = 0
         foreground = plane != 0
         values = np.unique(canonical[foreground]) if labelled else (0,)
+        # One self-equal label reproduces the binary partition; NaN/NaT do not.
+        # Multiple labels may touch; extrapolation must rediscover their union.
+        reusable = (inventory is not None and len(values) <= 1
+                    and (not len(values) or bool(values[0] == values[0])))
+        address_metadata = getattr(volume, "frame_addressing", None)
+        address = volume.frame_addresses[frame] if address_metadata else None
+        key = (shape[1:], int(address['native_index']) if address else frame,
+               bool(address['mirror_u']) if address else False)
+        frame_digest = hashlib.sha256(np.packbits(foreground).tobytes()).digest() if reusable else None
+        cached = inventory._take(key, frame_digest) if inventory is not None else None
+        if not reusable:
+            cached = None
+        if cached is not None:
+            inventory._counts['reused_frames'] += 1
+        components = []
+        remaining = sum(crop.size + 1024 for _, crop, _ in cached) if cached is not None else 0
         for value in values:
-            mask = foreground & (canonical == value) if labelled else foreground
-            local, count = ndi.label(mask, structure=np.ones((3, 3), dtype=bool))
-            for local_index, slices in enumerate(ndi.find_objects(local), start=1):
-                if slices is None:
-                    continue
+            if cached is None:
+                mask = foreground & (canonical == value) if labelled else foreground
+                if inventory is not None:
+                    inventory._counts['label_calls'] += 1
+                local, count = ndi.label(mask, structure=np.ones((3, 3), dtype=bool))
+                candidates = ((index, slices, None) for index, slices in
+                              enumerate(ndi.find_objects(local), start=1) if slices is not None)
+            else:
+                candidates = ((None, None, item) for item in cached)
+            for local_index, slices, reused in candidates:
                 if len(result) >= limits.max_observations:
                     return result, by_frame, "observation_inventory_limit"
                 component_index += 1
-                sy, sx = slices
-                bbox = (int(sy.start), int(sx.start), int(sy.stop), int(sx.stop))
+                if reused is None:
+                    sy, sx = slices
+                    bbox = (int(sy.start), int(sx.start), int(sy.stop), int(sx.stop))
+                else:
+                    bbox = reused[0]
                 charge += (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) + 1024
                 if charge > limits.max_observation_bytes:
                     return result, by_frame, "observation_inventory_memory_limit"
-                crop = _readonly(local[slices] == local_index)
-                digest = hashlib.sha256(np.packbits(crop).tobytes()).hexdigest()
+                if reused is not None:
+                    remaining -= reused[1].size + 1024
+                if inventory is not None:
+                    inventory._trim(charge + remaining)
+                if reused is None:
+                    crop = _readonly(local[slices] == local_index)
+                    digest = hashlib.sha256(np.packbits(crop).tobytes()).hexdigest()
+                else:
+                    _, crop, digest = reused
+                    inventory._counts['reused_components'] += 1
+                if reusable:
+                    components.append((bbox, crop, digest))
                 identifier = _identity("sam_obs", scope, frame, bbox, digest, int(value))
                 original_identifier, native_frame, mirror_u = identifier, frame, False
                 roots = dict(lineage or {})
                 roots.setdefault("observation_source", "detector")
                 roots.setdefault("scope_id", scope)
-                address_metadata = getattr(volume, "frame_addressing", None)
                 if address_metadata:
-                    address = volume.frame_addresses[frame]
                     native_frame, mirror_u = int(address["native_index"]), bool(address["mirror_u"])
                     original_bbox, original_mask = bbox, crop
                     if mirror_u:
@@ -292,6 +416,8 @@ def _observations(volume: object, *, scope: str, labels: object | None,
                                              original_observation_id=original_identifier,
                                              native_frame_index=native_frame, mirror_u=mirror_u))
         by_frame[frame] = frame_items
+        if reusable:
+            inventory._remember(key, frame_digest, components, charge)
     return result, by_frame, None
 
 
@@ -747,6 +873,7 @@ def plan_sam_bridges(
     planning_pass_index: int = 1,
     wrap_axis: bool = False,
     lazy_contracts: bool = False,
+    _observation_inventory: SamObservationInventory | None = None,
 ) -> SamBridgePlan:
     """Plan fixed family crops and independently detector-seeded tracker runs.
 
@@ -806,7 +933,7 @@ def plan_sam_bridges(
         frame_addresses = observed_volume.frame_addresses
     observations, by_frame, truncated = _observations(
         observed_volume, scope=scope_id, labels=canonical_labels,
-        lineage=observation_lineage, limits=bounds)
+        lineage=observation_lineage, limits=bounds, inventory=_observation_inventory)
     if truncated:
         return SamBridgePlan(tuple(observations), (), (), interpolation_passes, 0,
                              interpolation_passes, "unresolved", (truncated,))

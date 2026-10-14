@@ -315,7 +315,7 @@ def _iterate_extrapolation_tracker_results(runtime,prepared,worker_count,groups,
 def prepare_sam_extrapolation_pass(observations,*,view=None,scope='sam',distance=0,
         walk_back=1,min_radius=3.,wrap_axis=False,upstream_lineage=None,spacing_zyx=(1.,1.,1.),
         planner_limits=None,canonical_labels=None,crop_mode=None,eligible_terminals=None,
-        resource_profile=None,_frozen_plan=None,_frozen_snapshot=None):
+        resource_profile=None,_frozen_plan=None,_frozen_snapshot=None,_observation_inventory=None):
     from .sam_crop_tiling import resolve_sam_crop_mode,prepare_tiled_jobs
     began=time.perf_counter()
     metadata=_scope_metadata(scope)
@@ -326,7 +326,7 @@ def prepare_sam_extrapolation_pass(observations,*,view=None,scope='sam',distance
         extrapolation_walk_back=walk_back,extrapolation_min_radius=min_radius,wrap_axis=wrap_axis,
         limits=planner_limits,scope_id=str(metadata.get('scope_id','sam')),
         observation_lineage=upstream_lineage,canonical_labels=canonical_labels,
-        eligible_terminals=eligible_terminals)
+        eligible_terminals=eligible_terminals,_observation_inventory=_observation_inventory)
     jobs,inventory,tiling_hash,assembly_bytes=(),MappingProxyType({}),'',0
     if mode=='tiled' and plan.runs:
         jobs,inventory,tiling_hash,assembly_bytes=prepare_tiled_jobs(plan.runs,
@@ -920,7 +920,7 @@ def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,pol
             and slots>1 and len(unresolved)>1)
         outcomes={}
         if parallel:
-            execution=dict(mode='parallel_unlimited',capacity=min(8,slots,len(unresolved)),
+            execution=dict(mode='parallel_unlimited',capacity=min(slots,len(unresolved)),
                 child_groups=0,serial_fallback_groups=0,resource_declines=0,peak_pending_groups=0)
             for index in range(len(planned_groups)):
                 if index not in unresolved:
@@ -930,7 +930,8 @@ def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,pol
                 return run_group(unresolved[index],child,serial_pair)
             completed,execution=execute_retry_groups(selected,admitted_run,parent_profile=resource_profile,
                 context=retry_group_context,runtime=runtime,parent_scope=metadata.get('scope_id','sam'),
-                family=getattr(view,'family',None),max_in_flight=slots,group_ordinals=unresolved)
+                family=getattr(view,'family',None),
+                max_in_flight=len(runtime._configured_worker_slots),group_ordinals=unresolved)
             outcomes.update((original,value) for original,value in zip(unresolved,completed))
         else:
             execution=dict(mode='serial',reason=('finite_global_retry_budget'
@@ -999,7 +1000,8 @@ def extrapolate_sam_view_volume_pass(observations,*,work_dir,image_provider=None
         cancel_event=None,runtime_work_dir=None,crop_retry_policy=None,retry_image_provider=None,
         _evidence_only=False,_snapshot_authenticated=False,image_cohorts=None,
         exact_crop_family_dispatch=True,
-        image_cohort_provider=None,image_cohort_prefetch=None,_retry_group_context=None,**unused):
+        image_cohort_provider=None,image_cohort_prefetch=None,_retry_group_context=None,
+        _observation_inventory=None,**unused):
     if not isinstance(exact_crop_family_dispatch,bool):
         raise ValueError('SAM exact-crop family dispatch control must be boolean')
     metadata=_scope_metadata(scope)
@@ -1007,7 +1009,7 @@ def extrapolate_sam_view_volume_pass(observations,*,work_dir,image_provider=None
         distance=distance,walk_back=walk_back,min_radius=min_radius,wrap_axis=wrap_axis,
         upstream_lineage=upstream_lineage,spacing_zyx=spacing_zyx,planner_limits=planner_limits,
         canonical_labels=canonical_labels,crop_mode=crop_mode,eligible_terminals=eligible_terminals,
-        resource_profile=resource_profile)
+        resource_profile=resource_profile,_observation_inventory=_observation_inventory)
     if (prepared.observation_buffer_identity!=_buffer_identity(np.asarray(observations))
             or not _snapshot_authenticated and prepared.observation_snapshot_sha256
             and observation_snapshot_sha256(np.asarray(observations))!=prepared.observation_snapshot_sha256):

@@ -143,11 +143,64 @@ interpolation continues in an independent scope. All interpolation able to chang
 that scope's baseline, including crop retries, must finish first. Device ownership
 and memory admission still constrain overlap.
 
+For parents using asynchronous layer projection, admission to the bounded output
+queue happens after SAM extrapolation returns. At most two immutable interpolation
+layer descriptors wait locally; they are submitted before the extrapolation layers
+to preserve output order. A full projection queue therefore cannot prevent that
+parent from starting extrapolation. Publication after tracking remains bounded.
+The `projection_admission` SAM phase records time waiting for queue admission;
+it ends when a future is returned, not when the projection finishes.
+
+The component projection queue allows up to four active projections and eight
+pending jobs, independent of `YOLO_TTA_PARENT_POSTPROCESS_WORKERS`. Each bounded
+pending job can seek admission without taking an active projection slot. The
+oldest job starts first when it fits; at most two younger fitting jobs may pass
+a job waiting for memory before it receives priority as active work drains.
+Its working-byte ceiling is
+recomputed at admission from one eighth of current physical/cgroup/SLURM memory
+headroom, with the existing 4 GiB minimum; swap grants no credit. This replaces
+the fixed ceiling and lets waiting work notice memory released by other stages.
+Falling headroom restricts new overlap without revoking active reservations.
+An oversized job still runs alone until it finishes, even if the budget grows.
+The allowance is accounting credit, not an immediate allocation or an RSS
+measurement. Startup prints the initial allowance. The existing telemetry sampler
+records live `projection.component_queue` occupancy, working/source credit,
+admission waiters and backfill counts, including in partial captures. No
+environment-variable override is needed.
+
+Selected upright Spherical SAM masks whose stored bounding boxes leave unused
+native canvas use an encoded CPU input adapter. It reads
+raw or packed mask bits through the existing geometry kernels and streams bounded output
+planes, without restoring a full native uint8 volume. Existing geometric bounds
+skip proven-empty planes where supported. All Radial orientations, including
+tilted variants, use the established CPU/GPU projection route: production-sized
+checks found the encoded implementation failed to scale across workers. Tilted
+Spherical views also retain the established route pending equivalent performance
+qualification. Encoded Radial remains available for direct qualification only.
+Full bounding-box coverage or an explicit `YOLO_TTA_GPU_SPHERICAL_BACKPROJECT=1`
+also selects the established Spherical route. Existing family GPU flags still
+control GPU admission on the restored routes. The ordinary per-job
+reservation remains conservative enough for fallback. Only CPU capability or
+workspace refusal before publication can fall back; malformed stores and
+runtime failures remain errors. The
+`projection.sam_encoded_shell.native_decode_bytes_avoided` counter records the
+logical native restore omitted, not measured RAM savings.
+
 SAM interpolation and extrapolation share the persistent predictor and bounded
 feature cache; reuse requires identical image/crop geometry. The current terminal
 labeling and planning, image preparation, and packed mask evidence use CPU memory.
 Tracker inference uses the GPU. The entire chain is therefore not yet resident on
 device, even when detector inference and backprojection use accelerated paths.
+
+When both stages run for a parent, they also share a bounded inventory of slice
+components. Unchanged binary or single-label slices reuse their immutable component
+crops, including observations without an interpolation candidate. Changed slices
+and slices with multiple labels are discovered again. Each stage still computes
+its own topology, terminals, seed identities and acceptance decisions from the
+current mask. This preserves the existing plans; it does not copy tracker output
+or retain recurrent SAM state. The inventory is cleared after extrapolation and
+on failure. Returned `sam_observation_inventory` statistics count discovery and
+reuse without changing scientific identities.
 
 ## Experimental SAM tracking crop mode
 
@@ -440,6 +493,28 @@ byte limits and policy clamps remain authoritative; non-SAM defaults keep their
 existing ceilings. Policy admission includes the full SAM transient pool
 when reserving space for dense parents and output work.
 
+Before dispatch, eligible GPU-detector-only SAM runs transfer spare default dense
+capacity to the transient pool without increasing their combined ceiling. The
+dense floor retains the inference allowance, the original CPU-input cache budget
+and two allocations of the largest full parent in the actual task inventory, and is
+never below twice the inference allowance. Individual memory charges are unchanged.
+Policy groups, tiles, CPU/hybrid detectors, retained temporary output, explicit
+dense/transient overrides and existing resource owners keep the previous split.
+`sam.parent_memory_partition` records the resolved split and its inputs. This can
+admit more parent preparation; it does not guarantee that every configured parent
+fits concurrently or that dense capacity cannot become the next constraint.
+
+After detector and input preparation have fully retired, the coordinator checks
+the split again as work completes. It retains the exact bytes of live dense
+leases plus two allocations of the largest deferred restore, and transfers the
+remaining dense capacity to SAM. Pending builders, checkpoint owners, input
+packets, startup promises or uncertain ownership postpone this adjustment.
+The combined ceiling stays fixed; active parent grants keep their original size
+and planning limits. Waiting parents are notified when capacity grows.
+`sam.parent_memory_dynamic_partition` records each transfer and the retained
+ownership and future-restore bounds. This uses the allocation ledger rather than
+discounting a live reservation because its pages are currently absent from RSS.
+
 Production requests two isolated predictor processes per physical GPU. Set
 `YOLO_TTA_SAM_SESSIONS_PER_GPU=1` for the serial path, or 3 or 4 to evaluate more
 independent tracks. Two remains the default; compare total workload completion
@@ -468,9 +543,16 @@ turn once; used slots then drain before image preparation acquires the device.
 
 In progressive startup, each physical device initializes a fixed cohort. Cohorts
 can initialize concurrently and register with one shared tracker scheduler after
-admission; they keep their configured device and exact worker-slot identities. With fleet
-startup credit owned, the first ready admitted cohort allows parent work while
-later cohorts continue starting.
+admission; they keep their configured device and exact worker-slot identities.
+Once a detector device has retired and the full fleet's host credit is funded,
+parent restoration, CPU cleanup and bounded observation discovery may overlap
+model startup. The existing observation inventory avoids repeating discovery
+in normal planning, which still rebuilds scope identities and topology. This
+prefix retains its original parent reservation and releases its cached data
+before that reservation ends. Projection and GPU image/tracking work still wait
+for the first ready admitted cohort; later cohorts may continue starting.
+Already-ready parents do not perform an extra discovery pass. SDF interpolation
+before SAM extrapolation skips early discovery of masks that SDF will change.
 Later startup failures remain explicit and retain cleanup ownership; a partial
 ready pool does not silently become a successful smaller fleet. SAM residency
 continues to forbid YOLO reuse on the same GPU.
@@ -721,26 +803,25 @@ materialized source and demanded workspace are ready. Tilted native ROIs use
 bounded 32-row two-tap sampling and the canonical affine remap, without building
 full-native-plane plans. Its sampler identity and demand prevent incompatible
 feature reuse. Unready or unsupported cheap inputs retain the GPU route.
-Curved cohorts, retries and asynchronous prefetch request the existing TTA GPU
-renderer first, with the same registered intensity semantics and geometry-quality
-selectors as YOLO. Tilted curved views retain their Radial/Azimuthal/Spherical
-classification. Complete reusable image caches take precedence. GPU capacity
-checks, FIFO admission, SDK turns and cancellation apply to background producers
-as well as synchronous builders. Eligible Radial and Spherical prefetch uses an idle GPU only
-when no SDK work is dispatchable and an immediate lease is available, without
-queuing behind another image request or asking a busy device to drain. Otherwise
-it continues through the bounded CPU sampler, leaving ready tracking work its GPU
-turn. This requires an already-ready materialized source, live image credit and
-qualified workspace; other curved requests retain ordinary GPU admission.
-Radial/Spherical cohorts use canonical CPU preparation when GPU admission declines
-or rendering is unavailable, their complete uint8 processing source is ready,
-and the native ROI, shell strips and remap workspace fit the render cap. The canonical affine
+Other curved requests use the existing TTA GPU renderer first, with the same
+registered intensity semantics and geometry-quality selectors as YOLO. Tilted
+curved views retain their Radial/Azimuthal/Spherical classification. Complete
+reusable image caches take precedence. GPU capacity checks, FIFO admission, SDK
+turns and cancellation apply to background producers and synchronous builders.
+Eligible Radial and Spherical image preparation uses the bounded CPU sampler
+even when the SDK queue is empty, avoiding a cold full-volume GPU upload and
+retirement before tracking can resume. This requires a ready, complete uint8
+processing source, live image credit, and native ROI, shell strips and remap
+workspace that fit the render cap. The same rule covers background prefetch,
+synchronous first cohorts and retry fallback; synchronous CPU rendering stays
+serial. Unready, unsupported or unfunded requests retain ordinary GPU admission.
+The canonical affine
 crop determines each frame's native tap rectangle with the existing two-pixel
 guard. Both synchronous fallback and parallel futures sample only that rectangle,
 using global native coordinates. `xta.sam_native_shell_demand_crop/1` permits at
 most one gray level of rounding difference from full-plane grayscale sampling;
 geometry, frame order, crop coverage and categorical sampling rules stay fixed.
-Ready native shell ROIs prepare as independent CPU frame jobs within the same
+Background prefetch of ready native shell ROIs uses independent CPU frame jobs within the same
 render-scratch credit and unchanged 256 MiB default. Admission reserves the
 owner's remap workspace and a transfer-plane margin, then uses ROI-sized job
 accounting to bound up to eight workers by CPU count, frame count and remaining
@@ -790,7 +871,7 @@ are used directly. Unmaterialized streaming cubes keep CPU preparation to retain
 their endpoint-aligned temporal grid; the GPU virtual native-T path is used only
 for the matching nonstreaming center-aligned recipe.
 
-Qualified Radial cohorts upload only the conservative native-time slab needed
+GPU-selected Radial cohorts upload only the conservative native-time slab needed
 by their frozen radius inventory and full native patch. Bounds include every
 angular column, both height endpoints and temporal sampling guards. Unsupported
 geometry retains the full source. The CUDA and Torch samplers preserve global
@@ -818,10 +899,18 @@ admission wait time/timeouts, source handoffs and fallback reasons. Separate hos
 timings cover allocation/upload, render submission, copy waits and retirement;
 these are not CUDA kernel durations. Window savings and actual upload bytes are
 separate from handoff savings. These are route diagnostics, not a throughput guarantee.
+`sam.gpu_images.phase.cuda:{device}` keeps one latest operation record per GPU,
+including its start time, image owner, scope, frame and reporting thread. It marks
+entry into source upload, native rendering, quantization, warping, device-to-host
+copy, cache publication and retirement. Interpret it alongside current image-lease
+ownership: a final release record can remain after the device changes purpose.
+These bounded gauges add no CUDA queries, synchronization or per-frame trace events.
 `sam.cpu_images.prefetch_admissions` and `sam.cpu_images.prefetch_host_seconds` report admitted
 CPU image construction and its host time. `radial_prefetch_admissions` and
 `spherical_prefetch_admissions` under the same prefix count each shell family's
-CPU route. `sam_image_memory_admitted`,
+CPU prefetch route; `radial_synchronous_admissions` and
+`spherical_synchronous_admissions` count the corresponding synchronous route.
+`sam_image_memory_admitted`,
 `sam_image_memory_declined` and `sam_image_memory_credit_returned` separately
 report staging grants and settlement. Their `image_staging_in_use_bytes` and
 `image_staging_capacity_bytes` fields retain unsettled debt after a producer
@@ -945,11 +1034,21 @@ without that credit, or with a custom proposal hook, evaluation remains serial.
 Within the current family, each lane owns its cache/cursor over shared immutable
 metadata and one outer integrity transaction. Conservative charges include plane,
 diagnostic, cache and control buffers, and pending work is bounded by the worker
-hint. All lanes join and retire their caches before the unchanged ordered stock,
+hint. Completed lanes return their credit immediately and allow new independent
+measurements to start without waiting for an older slow lane. Results are restored
+to their original run order; an oversized serial measurement waits for all active
+lanes to retire. All lanes join and retire their caches before the unchanged ordered stock,
 topology, joint, rescue or custom-hook decisions. Operational receipts under
 `selection_resources.intrinsic_measurements` record admitted credit, pending work,
 serial reasons, task/reader counters and measurement time. This concurrency does
 not change quality thresholds or deterministic selection order.
+
+Whole-crop containment uses one compiled, GIL-releasing scan to count raw and
+effective foreground, acceptance leakage and boundary contacts. It reproduces
+the finite 3x3 erosion with zero-valued exterior pixels without constructing
+full-plane erosion and intersection temporaries. Tiled halo diagnostics retain
+their existing full boundary mask. Evidence authentication and selection
+thresholds are unchanged.
 
 Empty supporting regions skip mask reads. Group dilation evaluates foreground
 plus a one-voxel halo, and edge connected-component work crops only known zero
@@ -1132,6 +1231,12 @@ full-run completion. Readers expose only committed transactions, so a torn final
 append leaves earlier evidence readable. The next writer discards only the
 uncommitted tail. Scope completeness and required selection-receipt checks still
 apply; an archive with recoverable members is not a completed-run receipt.
+
+Readers of already committed members can use an authenticated prefix while a
+writer appends. A reader that arrives before that prefix is published wakes and
+checks it again, avoiding a wait for the entire append. New members and complete
+inventories still wait for the writer; inode, payload bounds and checksum checks
+remain required. The wait condition is recreated after a process fork.
 
 `SamEvidenceBundle`, bounded mask readers, CVOL readers, export and replay tools
 read these references directly without unpacking. They also accept legacy bundle
@@ -1383,9 +1488,14 @@ frames) are unlimited. Groups needing no enlargement follow their existing
 serial path. Finite global caps, standalone callers and unsupported resource or
 runtime boundaries retain serial execution.
 
-A dedicated process-wide pool has at most eight controller threads. Each pass
-limits pending groups to its actual started worker slots. Controller admission
-is nonblocking: a saturated pool uses the original owner's funded fallback
+A dedicated pool is shared by every parent using the same tracker runtime.
+Active child controllers are bounded by that runtime's actually started SDK
+slots; the executor's configured-slot ceiling permits progressive startup to
+add slots without replacing a live pool. Each pass also respects its requested
+pending limit. Started-slot growth refills new capacity while older groups run;
+a reduction prevents new admission without revoking active work. The pool owns
+no runtime reference and shuts down when its settled runtime is collected.
+Controller admission is nonblocking: a saturated pool uses the original owner's funded fallback
 instead of parking that owner behind unrelated retry chains. Before accessing the
 frozen source, each child acquires fresh physical and parent-pool credit with
 exactly matching effective budgets and binds its authenticated profile on that
@@ -1622,6 +1732,59 @@ changed parent selection can change ordinary tile admission, so dependent
 consolidated evidence still needs its upstream fingerprint checked or regenerated.
 
 ## Replay and validation boundaries
+
+### Short component-projection loop
+
+To retain a real SAM projection case during an ordinary run, add these arguments
+with a persistent capture directory. Specify an actual view name or glob; the
+historical default selectors target tilted Azimuthal views.
+
+```bash
+--capture_component_replay "$DEST_DIR/component-replay" \
+--capture_component_views 'radial_coronal_patch_u4_h1*' \
+--capture_component_limit 1
+```
+
+Capture is opt-in, limited to one nonempty component per selected view and the
+existing 4 GiB total quota. It retains the checksummed native CVOL, full view
+recipe, output shape and SAM publication metadata before queue admission.
+Archive-backed components copy only their required members. A completed capture
+can be replayed immediately without waiting for the full run to finish:
+
+```bash
+python -B tools/replay_component_projection.py "$CAPTURE" \
+  --sam-production --output "$FRESH_REPLAY_DIR" --scratch /tmp --workers 6
+```
+
+`CAPTURE` is the emitted case directory or its `manifest.json`; output must be
+fresh and separate from the capture. This runs the production SAM source-projection
+path on CPU for Cartesian, Radial, Spherical or Azimuthal inputs, without video,
+YOLO or SAM inference. The new route defaults to a 300-second worker deadline
+and thread-stack dumps every 30 seconds; `--timeout-seconds` and
+`--stack-dump-seconds` override them. Logs and metrics survive timeout; temporary
+workspaces are removed unless `--keep-work` is set. Existing replay routes retain
+their previous defaults.
+
+The report records input identity, stage wall/thread CPU time and output SHA256.
+SAM replay also records `resource_observations`: sampled process-tree RSS and
+owned workspace file lengths/allocated blocks, with active-phase context and
+incomplete-sample counts. Sampling is bounded and asynchronous; unsupported
+values remain null. Latest observations are preserved on failure or timeout.
+File lengths are not RAM, shared mappings can appear in multiple RSS totals,
+and brief allocations or unlinked mapped files can be missed. These are observed
+peaks, not proven reservation bounds; phase context does not assign ownership.
+Supply `--reference-store` for an exact voxel comparison against an existing
+projected CVOL. Without it, `all_exact` is null: a completed replay alone does not
+establish output equivalence. This isolates source projection, not queue waits,
+NRRD compression or fleet throughput. The saturated-queue assembly tests cover
+the ordering bug separately. Use warmed, quiet target hardware for performance
+comparisons and full runs for final makespan validation.
+
+Diagnostic `.ready` snapshots contain logs and telemetry, not these replay inputs.
+Already retained evidence can drive the selection tools below; an exact projection
+replay additionally needs the captured view recipe and native component.
+
+### Evidence selection and scope replay
 
 Fixed-evidence replay changes proposal selection without loading the detector
 or SAM model. It requires the same complete, structurally valid proposals,

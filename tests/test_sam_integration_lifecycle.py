@@ -52,7 +52,7 @@ def _view():
 def test_runtime_start_waits_for_retired_detector_then_loads_once(tmp_path):
     context = _context(tmp_path)
     lease = mock.Mock()
-    runtime = mock.Mock()
+    runtime = mock.Mock(cleanup_settled=True)
     factory = mock.Mock(return_value=runtime)
     started = threading.Event()
 
@@ -148,7 +148,7 @@ def test_failed_runtime_start_releases_device_lease(tmp_path):
 
 def test_cancelled_resident_context_admits_no_new_sam_jobs(tmp_path):
     context = _context(tmp_path)
-    context._runtime = mock.Mock()
+    context._runtime = mock.Mock(cleanup_settled=True)
     context.cancel('upstream generation failed')
     try:
         with pytest.raises(RuntimeError, match='upstream generation failed'):
@@ -310,7 +310,7 @@ def test_cpu_detector_sam_pool_does_not_keep_detector_inference_priority(tmp_pat
     assert not coordinator.snapshot()['inference_priority_active']
     context = _context(tmp_path)
     context.detector_assets_retired()
-    runtime = mock.Mock()
+    runtime = mock.Mock(cleanup_settled=True)
     fake_torch = types.SimpleNamespace(cuda=types.SimpleNamespace(device_count=lambda: 1))
     with _fake_runtime(mock.Mock(return_value=runtime)), mock.patch.object(
         backprojection, '_try_acquire_specific_main_process_gpu_stage',

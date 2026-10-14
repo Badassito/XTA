@@ -3141,12 +3141,18 @@ class _ByteAdmissionPool:
     @contextlib.contextmanager
     def reserve(self, requested_bytes: int, desc: str) -> Iterator[None]:
         requested = max(1, int(requested_bytes))
-        charged = min(int(requested), int(self.capacity))
         waited = False
         with self.condition:
-            while (int(self.in_use) > 0 and int(self.in_use) + int(charged) > int(self.capacity)
-                   or requested > int(self.capacity) and int(getattr(
-                       getattr(self, '_sam_image_staging_pool', None), 'in_use', 0)) > 0):
+            while True:
+                # Capacity can grow while this caller waits. Charge the grant,
+                # not the capacity observed before admission became possible.
+                charged = min(requested, int(self.capacity))
+                oversize = requested > int(self.capacity)
+                if not (int(getattr(self, 'oversize_requested_bytes', 0)) > 0
+                        or int(self.in_use) > 0 and int(self.in_use) + charged > int(self.capacity)
+                        or oversize and int(getattr(
+                            getattr(self, '_sam_image_staging_pool', None), 'in_use', 0)) > 0):
+                    break
                 if not waited:
                     print(
                         f'{self.name}: waiting to admit {desc} '
@@ -3156,14 +3162,14 @@ class _ByteAdmissionPool:
                     waited = True
                 self.condition.wait()
             self.in_use += int(charged)
-            if requested > int(self.capacity):
+            if oversize:
                 self.oversize_requested_bytes = requested
         try:
             yield
         finally:
             with self.condition:
                 self.in_use = max(0, int(self.in_use) - int(charged))
-                if requested > int(self.capacity):
+                if oversize:
                     self.oversize_requested_bytes = 0
                 self.condition.notify_all()
 

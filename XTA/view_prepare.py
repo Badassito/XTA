@@ -231,8 +231,24 @@ class SamLayerProjectionSubmitter:
         )
         materialize = (self.materialize_directional if layer_kind == 'interpolation'
                        else self.materialize_extrapolation)
-        future = self.queue.submit(materialize, entry, source_bytes=int(source_bytes),
-                                   working_bytes=int(working_bytes), **kwargs)
+        from .component_replay import capture_component_projection
+        capture_component_projection(source, view=view, out_shape_tyx=target_shape,
+            added_voxels=int(entry.get('voxel_count', 0)),
+            layer_metadata=dict(sam_projection=dict(layer_kind=layer_kind, entry=entry,
+                model_name=str(kwargs['model_name']), source=str(kwargs['source']),
+                pass_index=int(kwargs.get('pass_index', 1)) if layer_kind == 'interpolation' else 0,
+                tile_config_id=str(kwargs.get('tile_config_id', '')),
+                workers=int(kwargs.get('workers', 1)),
+                detector_identity=kwargs['sam_context'].detector_identity,
+                bundle_identity=kwargs['sam_context'].bundle_identity,
+                source_processing_shape_tyx=processing_shape)))
+        from .sam_interpolation import _trace_sam_phase
+        scope = f"{kwargs['model_name']}/{view.name}/{kwargs['source']}"
+        if kwargs.get('tile_config_id'):
+            scope += '/' + str(kwargs['tile_config_id'])
+        with _trace_sam_phase('projection_admission', scope, operation=layer_kind):
+            future = self.queue.submit(materialize, entry, source_bytes=int(source_bytes),
+                                       working_bytes=int(working_bytes), **kwargs)
         # The scheduler may retire a completed parent's dense canvas before
         # publication finishes, but only for these independent immutable inputs.
         future._xta_dense_independent_publication_paths = (source,)
@@ -379,7 +395,14 @@ class AdmittedViewPrepare:
         with self._reservation():
             self.check_cancelled()
             local_union_mm = self.union_mm
+            observation_inventory = None
             try:
+                if ((int(self.extrapolation_distance) > 0
+                        or self.interpolation_backend == 'sam' and int(self.interpolation_distance) > 0)
+                        and getattr(self.sam_context, 'cpu_prepare_ready', False)
+                        and not getattr(self.sam_context, 'runtime_ready', True)):
+                    from .sam_bridge_planning import SamObservationInventory
+                    observation_inventory = SamObservationInventory()
                 if local_union_mm is None:
                     if self.d1_shadow_path is None:
                         raise RuntimeError(
@@ -465,6 +488,8 @@ class AdmittedViewPrepare:
                     submit_component_projection=self.submit_component_projection,
                     submit_sam_layer_projection=self.submit_sam_layer_projection,
                     confidence_retired_callback=self.confidence_retired_callback,
+                    **({'_observation_inventory': observation_inventory}
+                       if observation_inventory is not None else {}),
                 )
                 # The scheduler needs no strong input alias. Its retirement
                 # fence still observes any producer/caller view of the backing.
@@ -496,6 +521,9 @@ class AdmittedViewPrepare:
                 self.close_dense(local_union_mm, unlink_path=unlink_path)
                 local_union_mm = None
                 raise
+            finally:
+                if observation_inventory is not None:
+                    observation_inventory.clear()
 
 
 @dataclass

@@ -124,7 +124,8 @@ def _integer(value, name):
 def plan_sam_extrapolation(observations, *, extrapolation_distance=0,
                            extrapolation_walk_back=1, extrapolation_min_radius=3.,
                            limits=None, scope_id='sam', observation_lineage=None,
-                           canonical_labels=None, wrap_axis=False, eligible_terminals=None):
+                           canonical_labels=None, wrap_axis=False, eligible_terminals=None,
+                           _observation_inventory=None):
     """Freeze every tail before any tracking; walk-back uses one prior mask/run.
 
     Distance counts frames beyond the actual remaining terminal. The radius
@@ -160,7 +161,7 @@ def plan_sam_extrapolation(observations, *, extrapolation_distance=0,
     lineage = dict(observation_lineage or {})
     lineage.update(source_stage='post_interpolation', observation_source='post_interpolation')
     observed, by_frame, failure = _observations(volume, scope=str(scope_id), labels=None,
-                                               lineage=lineage, limits=bounds)
+                                               lineage=lineage, limits=bounds, inventory=_observation_inventory)
     if failure:
         return SamExtrapolationPlan(tuple(observed), (), (), shape, tuple(volume.shape),
                                     'unresolved', (failure,), frame_addressing=addressing,

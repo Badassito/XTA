@@ -277,7 +277,9 @@ def test_decoder_workspace_is_charged_before_read_and_insufficient_profile_falls
                 mock.patch.object(GrayCacheReader, 'read_crop', side_effect=AssertionError('unfunded decoder read')), \
                 mock.patch.object(context, '_render_demand_crop', return_value=np.zeros((6, 6), np.uint8)) as render:
             source = context.image_provider(view, shape, demand(shape, {0: bbox}))
-        assert gpu.call_count == int(view.family != 'tilted')
+        # Qualified shell crops use the bounded CPU route when no idle SDK
+        # handoff is available; Azimuthal retains its GPU-first fallback.
+        assert gpu.call_count == int(view.family == 'azimuthal')
         assert render.call_count == 1 and context._image_build_credit_bytes == 0
         assert live_image_sampling(source)['backend'] == 'cpu'
     finally:

@@ -1,4 +1,5 @@
 """Cheap SAM preparation keeps Cartesian work off CUDA and bounds Tilted native taps."""
+from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 import threading
@@ -109,10 +110,15 @@ def test_credited_cheap_parent_and_next_cohort_use_cpu_and_return_credit(tmp_pat
 
 @pytest.mark.parametrize('family', ('azimuthal', 'radial', 'spherical'))
 @pytest.mark.parametrize('tilted', (False, True))
-def test_curved_family_including_tilted_variants_still_attempts_gpu(tmp_path, family, tilted):
+@pytest.mark.parametrize('sdk_ready', (False, True))
+def test_curved_family_including_tilted_variants_respects_ready_sdk_work(tmp_path, family, tilted, sdk_ready):
     view = next(view for view in VIEWS if view.family == family
         and bool(view.tilt_angle_deg) == tilted)
     context = context_for(tmp_path, np.zeros(SOURCE_SHAPE, np.uint8))
+    context._runtime = runtime()
+    context._runtime.has_ready_work = lambda: sdk_ready
+    context._runtime.idle_image_handoff = lambda: nullcontext(not sdk_ready)
+    gpu_expected = family == 'azimuthal'
     renderer = FakeRenderer(context)
     pool = SimpleNamespace(capacity=4*GIB, in_use=0, condition=threading.Condition(threading.RLock()))
     shape = (view.num_slices, 17, 17)
@@ -122,9 +128,13 @@ def test_curved_family_including_tilted_variants_still_attempts_gpu(tmp_path, fa
             with context.resource_scope(profile), mock.patch('XTA.sam_gpu_rendering.try_gpu_crop_renderer',
                     return_value=renderer) as select:
                 reference = context.image_provider(view, shape, demand(shape, {0:(2, 3, 14, 15)}))
-                assert select.call_count == 1
-                assert live_image_sampling(reference)['backend'] == 'cuda'
-        assert renderer.calls == 1 and renderer.closed
+                assert select.call_count == int(gpu_expected)
+                if gpu_expected:
+                    assert select.call_args.kwargs == {}
+                assert live_image_sampling(reference)['backend'] == ('cuda' if gpu_expected else 'cpu')
+        assert renderer.calls == int(gpu_expected)
+        assert renderer.closed == gpu_expected
+        assert pool.in_use == 0
     finally:
         context.close()
 

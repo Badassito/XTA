@@ -32,6 +32,23 @@ def _record_image_timings(**timings):
         pass  # Timing cannot invalidate pixels or completed ownership transfers.
 
 
+def _record_image_phase(renderer, phase, *, frame=None, crop_shape=None):
+    """Latest owned-device boundary only; diagnostics never control rendering."""
+    try:
+        lease = getattr(renderer, 'lease', None)
+        if lease is None:
+            return
+        from .runtime import runtime_telemetry
+        operation, scope = renderer._phase_scope
+        runtime_telemetry().set_scheduler_gauge(
+            f'sam.gpu_images.phase.cuda:{int(lease.device_index)}',
+            dict(phase=str(phase), since_monotonic_ns=time.monotonic_ns(), owner_token=id(renderer),
+                scope_id=scope, sam_operation=operation, frame=frame, crop_shape=crop_shape,
+                thread_id=threading.get_ident(), thread=threading.current_thread().name))
+    except Exception:
+        pass  # Telemetry failures cannot change pixels, cleanup or handoffs.
+
+
 def register_live_image(context, reference, geometry_identity, sampling):
     """Authenticate live producer descriptors; serialized fields confer no trust."""
     token = id(reference)
@@ -177,6 +194,7 @@ class SamGpuCropRenderer:
         self._gpu_prefetch_cancel = None
         self._uploaded_source_key = None
         self._render_failed = False
+        self._phase_scope = getattr(getattr(context, '_resource_local', None), 'sam_phase_scope', ('', ''))
         self.source_t_window = tuple(source_t_window or (0, int(source.shape[0])))
         self.source_frames = frozenset(map(int, source_frames))
         start, stop = self.source_t_window
@@ -298,8 +316,10 @@ class SamGpuCropRenderer:
         if self.engine is not None:
             return self.engine
         started = time.monotonic()
+        _record_image_phase(self, 'renderer_init')
         engine = self.engine = _GpuWorkerRenderEngine(f'cuda:{self.device_index}')
         _record_image_timings(renderer_init_host_seconds=time.monotonic()-started)
+        _record_image_phase(self, 'source_upload')
         source_key = self._source_handoff_key()
         backing = _interpolation_array_backing_path(self.source)
         if self.source_t_window != (0, int(self.source.shape[0])):
@@ -353,21 +373,28 @@ class SamGpuCropRenderer:
             matrix = crop_inverse(inverse, output_origin_yx)
             with self.torch.cuda.device(engine.device), self.torch.cuda.stream(engine._stream):
                 started = time.monotonic()
+                _record_image_phase(self, 'native_render', frame=int(frame), crop_shape=(height, width))
                 if is_tilted_view(view):
                     pixels = engine.render_tilted_grid_resident(view, matrix, int(frame), height, width)
+                    _record_image_phase(self, 'quantize', frame=int(frame), crop_shape=(height, width))
                     pixels = pixels.round().clamp_(0, 255).to(self.torch.uint8)
                 else:
                     native = engine._render_native_plane(view, int(frame))
+                    _record_image_phase(self, 'quantize', frame=int(frame), crop_shape=(height, width))
                     native = native.round().clamp_(0, 255).to(self.torch.uint8)
+                    _record_image_phase(self, 'warp', frame=int(frame), crop_shape=(height, width))
                     pixels = engine.warp_native_uint8_frame(native, matrix, height, width)
                 # This blocking copy completes the render before immutable
                 # publication or the next crop may reuse projection storage.
                 enqueued = time.monotonic()
+                _record_image_phase(self, 'd2h', frame=int(frame), crop_shape=(height, width))
                 image = pixels.cpu().numpy()
                 _record_image_timings(render_enqueue_host_seconds=enqueued-started,
                     crop_copy_wait_host_seconds=time.monotonic()-enqueued)
+            _record_image_phase(self, 'native_cache_clear', frame=int(frame), crop_shape=(height, width))
             engine.clear_native_plane_cache()
             self.context._check_image_lifetime()
+            _record_image_phase(self, 'host_cache_copy', frame=int(frame), crop_shape=(height, width))
             return image
         except (RuntimeError, MemoryError) as error:
             self._render_failed = True
@@ -386,6 +413,7 @@ class SamGpuCropRenderer:
             if (self.engine is not None and not self._render_failed
                     and sys.exc_info()[1] is None and self._try_handoff()):
                 return
+            _record_image_phase(self, 'retirement')
             started = time.monotonic()
             real_engine = False
             if self.engine is not None:
@@ -407,6 +435,8 @@ class SamGpuCropRenderer:
                 repeat_garbage_collection=not (real_engine and not self._render_failed
                     and sys.exc_info()[1] is None and not self.context._cancel.is_set()
                     and self not in self.context._unsettled_image_renderers))
+            # Publish before releasing: a subsequent owner may immediately overwrite this key.
+            _record_image_phase(self, 'release_compute')
             self.context._release_sam_compute_lease(self.lease)
             # A pre-start global stage is not registered as predictor compute.
             self.lease.release()
@@ -444,6 +474,7 @@ class SamGpuCropRenderer:
         # These are view workspaces, not retained source storage. Complete the
         # stream before dropping all aliases; keep only source and its T maps.
         started = time.monotonic()
+        _record_image_phase(self, 'handoff_cleanup')
         from .cuda_backend import _GpuWorkerRenderEngine
         real_engine = type(engine) is _GpuWorkerRenderEngine
         engine._stream.synchronize()
@@ -512,6 +543,7 @@ class SamGpuCropRenderer:
             next_renderer._image_burst_count = self._image_burst_count+1
             next_renderer._uploaded_source_key = self._uploaded_source_key
             self.engine = self.lease = None
+            _record_image_phase(next_renderer, 'handoff_awaiting_render')
             return True
 
         handed = self.context._try_gpu_image_handoff(self, transfer)

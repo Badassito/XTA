@@ -1409,7 +1409,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument('--extrapolation_min_radius', default=3., type=_bounded_number(float, minimum=0),
                    help='Skip post-interpolation terminal objects whose terminal radius is at or below this threshold. This gate applies only to terminal seeds; extrapolated masks are not radius-filtered')
     p.add_argument("--capture_component_replay", default=None, type=str, metavar="PERSISTENT_DIR",
-                   help="Copy a bounded sample of view-native Azimuthal bridge components for isolated projection replay; must survive job completion")
+                   help="Copy bounded view-native components, including SAM layers, for isolated projection replay; must survive job completion")
     p.add_argument("--capture_component_views", nargs='+', default=None, metavar="VIEW_GLOB",
                    help="Replay capture view names/globs; default selects vertical +30 degree tilted Azimuthal transverse, sagittal and coronal")
     p.add_argument("--capture_component_limit", default=3, type=_bounded_number(int, minimum=1), metavar="N",

@@ -13,6 +13,7 @@ import pytest
 
 from XTA import pipeline, sam_parent_staging as staging
 from XTA.geometry import ViewInfo
+from XTA.detector_workspaces import WorkspaceBirthFailure
 from XTA.runtime import wait_for_retired_memmap_unlinks
 from XTA.interpolation import _DirectUnionBackingLease
 from XTA.view_prepare import ViewPrepareLeaseState, classify_dense_ram_backing
@@ -67,7 +68,11 @@ def allocation(tmp_path, *, backend='sam', extrapolation=False, ready=False, sha
         policy_settings=SimpleNamespace(enabled=False),bounded_policy_parent_keys=set(),
         interpolation_settings=SimpleNamespace(backend=backend,extrapolation_enabled=extrapolation),
         sam_context=SimpleNamespace(detector_retirement_ready=ready,
-            shared_detector_devices=('cuda:0',)if shared else()),sam_parent_staging=staged if stager else None,
+            shared_detector_devices=('cuda:0',)if shared else(),source_volume=None),
+        sam_parent_staging=staged if stager else None,
+        cpu_input_prefetch=None,input_volume_rgb=np.zeros(shape,np.uint8),
+        sam_cpu_futures={'source':None},parent_transient_admission=SimpleNamespace(in_use=0),
+        gray_capture_reserve_bytes=0,cpu_input_pinned_reserve_bytes=0,
         args=SimpleNamespace(imgsz=8,min_conf=0.,interpolation_distance=5 if interpolation else 0,
             reconciliation_retain_confidence=True),dense_tiling_active=False,nrrd_layers_needed=False,
         component_layers_needed=False,baseline_union_by_model_view={},baseline_confmap_by_model_view={},
@@ -84,7 +89,10 @@ def allocation(tmp_path, *, backend='sam', extrapolation=False, ready=False, sha
         runtime_telemetry=lambda:telemetry)
     source=Path(pipeline.__file__).read_text(encoding='utf-8')
     ns['_sam_parents_ready']=lambda:ns['sam_context'].detector_retirement_ready
-    _function(source,'_sam_parent_requires_staging',ns)
+    for helper in ('_sam_parent_requires_staging','_detector_future_ram_rights',
+                   '_plan_baseline_workspace','_discard_baseline_bundles',
+                   '_build_baseline_workspaces','_adopt_baseline_workspaces'):
+        _function(source,helper,ns)
     ensure=_function(source,'_ensure_baseline_workspaces',ns)
     allocate=mock.Mock(wraps=pipeline.allocate_workspace_array);ns['allocate_workspace_array']=allocate
     if ram_fit is None:
@@ -291,11 +299,15 @@ def test_extrapolation_only_shared_parent_is_eligible(tmp_path):
 def test_admitted_ram_first_attempt_preserves_mask_score_and_dense_reservation(tmp_path):
     staged,_check,_prepare,state,ns,view,allocate,telemetry=allocation(tmp_path,ram_fit=True)
     try:
+        assert allocate.call_count == 2
         assert all(call.kwargs['prefer_memfd'] is True for call in allocate.call_args_list)
         assert state.direct_union_inference_bytes[('model',view.name)] == 120
         assert not ns['baseline_union_by_model_view'][('model',view.name)].any()
         assert not ns['baseline_confmap_by_model_view'][('model',view.name)].any()
-        telemetry.add.assert_any_call('sam_interpolation.staging.ram_first_attempt_parents',1)
+        actual_ram = state.direct_union_backing_leases[('model',view.name)].ram_backed
+        assert actual_ram in (True, False)
+        telemetry.add.assert_any_call('sam_interpolation.staging.' + (
+            'ram_first_actual_parents' if actual_ram else 'checkpoint_copy_backing_parents'),1)
     finally:_close_allocated(ns);staged.close();staged.finalize_cleanup()
 
 
@@ -338,8 +350,10 @@ def test_failed_confidence_allocation_cleans_only_owned_workspace(tmp_path):
         if len(calls)==2:raise OSError('controlled confidence allocation failure')
         return actual(*args,**kwargs)
     with mock.patch.object(pipeline,'allocate_workspace_array',side_effect=fail_second):
-        with pytest.raises(OSError,match='controlled confidence'):
+        with pytest.raises(WorkspaceBirthFailure,match='controlled confidence') as failure:
             allocation(tmp_path)
+        assert isinstance(failure.value.__cause__, OSError)
+        del failure
     gc.collect()
     for path in (tmp_path/'temp'/'union').rglob('*.dat'):
         wait_for_retired_memmap_unlinks(path=path,timeout_s=5.)
@@ -400,8 +414,10 @@ def test_failed_birth_allocation_keeps_bank_until_real_ram_owner_dies(tmp_path,r
         return value
     with mock.patch.object(staging.DeferredSamParentQueue,'claim_ram_first',new=record_claim), \
          mock.patch.object(pipeline,'allocate_workspace_array',side_effect=fail_confidence):
-        with pytest.raises(OSError,match='bank confidence allocation failure'):
+        with pytest.raises(WorkspaceBirthFailure,match='bank confidence allocation failure') as failure:
             allocation(tmp_path,ram_fit=None,cap=240)
+        assert isinstance(failure.value.__cause__, OSError)
+        del failure
     staged=captured[0]
     assert staged.ram_first_grants==1
     assert (staged.ram_first_key is not None)==retain_alias

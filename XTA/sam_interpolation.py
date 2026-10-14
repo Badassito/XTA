@@ -255,6 +255,7 @@ def prepare_sam_interpolation_pass(
     policy: object = None,
     crop_mode: str | None = None,
     resource_profile: object = None,
+    _observation_inventory: object = None,
 ) -> SamPreparedInterpolationPass:
     """Plan exhaustive original-anchor jobs without images, CUDA, or a tracker."""
     observations = np.asarray(observation_volume)
@@ -288,7 +289,8 @@ def prepare_sam_interpolation_pass(
         interpolation_min_radius=float(min_radius), interpolation_search_angle=float(search_angle_deg),
         scope_id=str(metadata.get("scope_id", "sam")), spacing_zyx=spacing_zyx,
         canonical_labels=canonical_labels, observation_lineage=upstream_lineage,
-        limits=planner_limits, planning_pass_index=int(pass_index), wrap_axis=bool(wrap_axis), lazy_contracts=True)
+        limits=planner_limits, planning_pass_index=int(pass_index), wrap_axis=bool(wrap_axis), lazy_contracts=True,
+        _observation_inventory=_observation_inventory)
     if resource_profile is not None and getattr(plan, "contract_lease_budget", None) is not None:
         plan.contract_lease_budget.bind_live_resource_profile(resource_profile)
     planning_seconds = time.perf_counter() - planning_started
@@ -1548,6 +1550,7 @@ def interpolate_sam_view_volume_pass(
     resource_profile: object = None,
     crop_retry_policy: object = None,
     retry_image_provider: object = None,
+    _observation_inventory: object = None,
 ) -> tuple[np.ndarray, dict[str, object], list[dict[str, object]]]:
     """Generate one SAM planning round from immutable detector observations.
 
@@ -1589,7 +1592,7 @@ def interpolate_sam_view_volume_pass(
             interpolation_candidates=interpolation_candidates, interpolation_passes=interpolation_passes,
             wrap_axis=wrap_axis, upstream_lineage=upstream_lineage, spacing_zyx=spacing_zyx,
             planner_limits=planner_limits, canonical_labels=canonical_labels, policy=policy, crop_mode=resolved_mode,
-            resource_profile=resource_profile)
+            resource_profile=resource_profile, _observation_inventory=_observation_inventory)
     else:
         from .sam_bridge_planning import SAM_CROP_PLANNING_CONTRACT_VERSION
         expected_settings = _planning_identity(scope=metadata, view=view, pass_index=pass_index,

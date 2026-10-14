@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from threading import Condition
 from time import perf_counter
 from typing import Callable, Iterable, TypeVar
 
 T = TypeVar('T')
+
+
+def component_projection_working_budget() -> int:
+    """Recheck physical/cgroup/SLURM RAM without granting credit for swap."""
+    from .sam_resources import physical_sam_headroom
+    return max(4 * 1024**3, int(physical_sam_headroom()) // 8)
 
 
 class ComponentProjectionQueue:
@@ -20,14 +26,21 @@ class ComponentProjectionQueue:
     """
 
     def __init__(self, *, workers: int, max_pending: int,
-                 max_source_bytes: int, max_working_bytes: int) -> None:
+                 max_source_bytes: int, max_working_bytes: int,
+                 working_budget: Callable[[], int] | None = None) -> None:
         self._condition = Condition()
-        self._executor = ThreadPoolExecutor(
-            max_workers=max(1, int(workers)), thread_name_prefix='component-projection',
-        )
+        self._workers = max(1, int(workers))
         self._max_pending = max(1, int(max_pending))
+        # Every bounded input can seek credit; waiting must not hide a fitting
+        # input behind occupied executor threads. Only _workers may project.
+        self._executor = ThreadPoolExecutor(
+            max_workers=self._max_pending, thread_name_prefix='component-projection',
+        )
+        self._waiting = {}
         self._max_source = max(1, int(max_source_bytes))
         self._max_working = max(1, int(max_working_bytes))
+        self._working_budget = working_budget
+        self._oversized_active = False
         self._closed = False
         self._aborted = False
         self._error: BaseException | None = None
@@ -35,11 +48,34 @@ class ComponentProjectionQueue:
         self._stats = dict(submitted=0, completed=0, failed=0,
                            peak_pending=0, peak_source_bytes=0,
                            peak_active=0, peak_working_bytes=0,
+                           backfill_admissions=0,
+                           working_budget_updates=0,
+                           min_working_budget_bytes=self._max_working,
+                           peak_working_budget_bytes=self._max_working,
                            submission_wait_seconds=0.0, working_wait_seconds=0.0)
+
+    def _fitting_waiter_locked(self):
+        if self._active >= self._workers or not self._waiting:
+            return None
+        def fits(amount):
+            return not self._active or (not self._oversized_active and
+                                       self._working + amount <= self._max_working)
+        oldest = next(iter(self._waiting))
+        amount, bypasses = self._waiting[oldest]
+        if fits(amount):
+            return oldest
+        # Two backfills overlap a blocked older job without an endless cheap
+        # stream postponing it. Once incumbents drain, oldest always runs.
+        if bypasses < 2:
+            return next((ticket for ticket, (amount, _count) in self._waiting.items()
+                         if ticket is not oldest and fits(amount)), None)
+        return None
 
     def submit(self, fn: Callable[..., T], /, *args,
                source_bytes: int, working_bytes: int, **kwargs) -> Future[T]:
         source_bytes, working_bytes = max(0, int(source_bytes)), max(0, int(working_bytes))
+        ticket = object()
+        granted = revoked = retired = False
         started = perf_counter()
         with self._condition:
             while True:
@@ -53,52 +89,97 @@ class ComponentProjectionQueue:
                 self._condition.wait()
             self._pending += 1
             self._source += source_bytes
+            self._waiting[ticket] = [working_bytes, 0]
             self._stats['submitted'] += 1
             self._stats['peak_pending'] = max(self._stats['peak_pending'], self._pending)
             self._stats['peak_source_bytes'] = max(self._stats['peak_source_bytes'], self._source)
             self._stats['submission_wait_seconds'] += perf_counter() - started
 
-        def run() -> T:
-            started = perf_counter()
+        def retire(error=None) -> None:
+            nonlocal retired
             with self._condition:
-                while self._active and self._working + working_bytes > self._max_working:
+                if retired:
+                    return
+                retired = True
+                self._waiting.pop(ticket, None)
+                self._pending -= 1
+                self._source -= source_bytes
+                self._stats['completed'] += 1
+                if error is not None:
+                    self._stats['failed'] += 1
+                    if self._error is None:
+                        self._error = error
+                self._condition.notify_all()
+
+        def project() -> T:
+            nonlocal granted
+            started = perf_counter()
+            while True:
+                with self._condition:
+                    if revoked:
+                        raise CancelledError('Component projection submission was revoked')
+                # OS probes must not hold the lock needed by retirement and abort.
+                limit = None if self._working_budget is None else max(1, int(self._working_budget()))
+                with self._condition:
+                    if revoked:
+                        raise CancelledError('Component projection submission was revoked')
                     if self._aborted:
                         raise RuntimeError('Component projection aborted before admission')
-                    self._condition.wait()
-                if self._aborted:
-                    raise RuntimeError('Component projection aborted before admission')
-                self._active += 1
-                self._working += working_bytes
-                self._stats['peak_active'] = max(self._stats['peak_active'], self._active)
-                self._stats['peak_working_bytes'] = max(self._stats['peak_working_bytes'], self._working)
-                self._stats['working_wait_seconds'] += perf_counter() - started
+                    if limit is not None and limit != self._max_working:
+                        self._max_working = limit
+                        self._stats['working_budget_updates'] += 1
+                        self._stats['min_working_budget_bytes'] = min(self._stats['min_working_budget_bytes'], limit)
+                        self._stats['peak_working_budget_bytes'] = max(self._stats['peak_working_budget_bytes'], limit)
+                    if self._fitting_waiter_locked() is ticket:
+                        oldest = next(iter(self._waiting))
+                        if oldest is not ticket:
+                            self._waiting[oldest][1] += 1
+                            self._stats['backfill_admissions'] += 1
+                        del self._waiting[ticket]
+                        granted = True
+                        self._oversized_active = working_bytes > self._max_working
+                        self._active += 1
+                        self._working += working_bytes
+                        self._stats['peak_active'] = max(self._stats['peak_active'], self._active)
+                        self._stats['peak_working_bytes'] = max(self._stats['peak_working_bytes'], self._working)
+                        self._stats['working_wait_seconds'] += perf_counter() - started
+                        self._condition.notify_all()
+                        break
+                    # External RAM recovery does not notify this queue.
+                    self._condition.wait(timeout=0.25 if self._working_budget is not None else None)
             try:
                 return fn(*args, **kwargs)
             finally:
                 with self._condition:
                     self._active -= 1
                     self._working -= working_bytes
+                    if not self._active:
+                        self._oversized_active = False
                     self._condition.notify_all()
 
-        def retired(future: Future) -> None:
-            with self._condition:
-                self._pending -= 1
-                self._source -= source_bytes
-                self._stats['completed'] += 1
-                if not future.cancelled() and future.exception() is not None:
-                    self._stats['failed'] += 1
-                    self._error = future.exception()
-                self._condition.notify_all()
+        def run() -> T:
+            try:
+                return project()
+            except BaseException as error:
+                retire(error)
+                raise
+            finally:
+                retire()
+
+        def completed(future: Future) -> None:
+            retire(None if future.cancelled() else future.exception())
 
         try:
             future = self._executor.submit(run)
         except BaseException:
             with self._condition:
-                self._pending -= 1
-                self._source -= source_bytes
-                self._condition.notify_all()
+                # submit() can enqueue before thread creation raises. Revoke
+                # an ungranted wrapper; actual work retains credit until done.
+                if not granted:
+                    revoked = True
+                    retire()
             raise
-        future.add_done_callback(retired)
+        future.add_done_callback(completed)
         return future
 
     def abort(self) -> None:
@@ -119,8 +200,11 @@ class ComponentProjectionQueue:
         with self._condition:
             return dict(self._stats, pending=self._pending, source_bytes=self._source,
                         active=self._active, working_bytes=self._working,
+                        max_active=self._workers, admission_waiters=len(self._waiting),
                         max_pending=self._max_pending, max_source_bytes=self._max_source,
-                        max_working_bytes=self._max_working)
+                        max_working_bytes=self._max_working,
+                        dynamic_working_budget=self._working_budget is not None,
+                        oversized_active=self._oversized_active)
 
 
 def prepared_view_waitables(parents: Iterable[Future]) -> list[Future]:

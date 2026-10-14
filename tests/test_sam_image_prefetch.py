@@ -97,7 +97,8 @@ def test_cpu_fallback_current_does_not_block_next_gpu_cohort_or_other_parent(tmp
     source, context, view, bbox, plans, _retirements = setup(tmp_path, monkeypatch)
     context._runtime.has_ready_work = lambda: False
     context._runtime.idle_image_handoff = lambda: nullcontext(True)
-    source = np.pad(source, ((1, 1), (0, 0), (0, 0)), mode='edge')
+    # Non-uint8 sources retain the ordinary GPU route, including CPU retry.
+    source = np.pad(source, ((1, 1), (0, 0), (0, 0)), mode='edge').astype(np.float32)
     context.source_volume, context.source_grid_shape = source, source.shape
     monkeypatch.setenv('YOLO_TTA_SAM_RENDER_MAX_BYTES', str(256*1024))
     view = geometry.get_view_infos(*source.shape, cartesian_views=(),
@@ -118,7 +119,7 @@ def test_cpu_fallback_current_does_not_block_next_gpu_cohort_or_other_parent(tmp
         return original(*args, **kwargs)
     monkeypatch.setattr(context, '_render_demand_crop', render)
     def gpu(_context, _view, _shape, prepared, *, opportunistic=False):
-        assert opportunistic
+        assert not opportunistic
         frame = next(iter(prepared.frame_crop_bounds))
         return FakeRenderer(context, fail_after=0 if frame == 0 else None)
     monkeypatch.setattr('XTA.sam_gpu_rendering.try_gpu_crop_renderer', gpu)

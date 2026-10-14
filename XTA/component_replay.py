@@ -18,6 +18,7 @@ from typing import Mapping, Optional, Sequence
 import uuid
 
 from .geometry import ViewInfo, physical_view_name
+from .artifact_archive import artifact_size, open_artifact, split_reference
 
 _SCHEMA = 'xta-component-projection-replay.v1'
 _FILES = ('meta.json', 'index.bin', 'chunks.bin')
@@ -28,7 +29,7 @@ _CAPTURE = None
 
 def _digest(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open('rb') as stream:
+    with open_artifact(path) as stream:
         while block := stream.read(_CHUNK_BYTES):
             digest.update(block)
     return digest.hexdigest()
@@ -124,7 +125,8 @@ def capture_component_projection(
         if str(view.name) in state['captured_views']:
             return None
     source = Path(component_store_path).resolve()
-    sizes = {name: (source/name).stat().st_size for name in _FILES}
+    archived = split_reference(source) is not None
+    sizes = {name: artifact_size(source/name) for name in _FILES}
     total_bytes = sum(sizes.values())
     output_shape = tuple(int(value) for value in out_shape_tyx)
     if len(output_shape) != 3 or min(output_shape) <= 0:
@@ -149,18 +151,22 @@ def capture_component_projection(
             records = {}
             for name in _FILES:
                 original = source/name
-                before = original.stat()
+                before = None if archived else original.stat()
                 digest = hashlib.sha256()
                 copied = 0
-                with original.open('rb') as reader, (staging/'input.cvol'/name).open('wb') as writer:
+                with open_artifact(original) as reader, (staging/'input.cvol'/name).open('wb') as writer:
                     while block := reader.read(_CHUNK_BYTES):
                         writer.write(block)
                         digest.update(block)
                         copied += len(block)
-                after = original.stat()
-                if copied != sizes[name] or (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                after = None if archived else original.stat()
+                if copied != sizes[name] or (before is not None and
+                        (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns)):
                     raise RuntimeError(f'Component store changed during immutable capture: {original}')
                 records[f'input.cvol/{name}'] = {'bytes': copied, 'sha256': digest.hexdigest()}
+            if archived and any(_digest(source/name) != records[f'input.cvol/{name}']['sha256']
+                                for name in _FILES):
+                raise RuntimeError('Archived component changed during immutable capture')
             input_meta = json.loads((staging/'input.cvol'/'meta.json').read_text(encoding='utf-8'))
             descriptor = {'schema': _SCHEMA, 'capture_id': capture_id, 'captured_unix': time.time(),
                           'source_path_for_provenance_only': str(source), 'view': asdict(view),

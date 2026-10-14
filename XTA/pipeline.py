@@ -148,6 +148,8 @@ from .runtime import (
     resolve_parent_interpolation_worker_allocation,
     resolve_parent_postprocess_worker_allocation,
     resolve_parent_memory_limits,
+    repartition_sam_parent_memory,
+    reclaim_drained_sam_parent_memory,
     sam_sessions_per_gpu,
     resolve_worker_count,
     runtime_telemetry,
@@ -347,6 +349,7 @@ from .assembly import (
     spill_waiting_tile_result_to_raw_store,
 )
 from .projection_queue import (
+    component_projection_working_budget,
     ComponentProjectionQueue,
     prepared_view_waitables,
     settle_prepared_view_components,
@@ -564,6 +567,8 @@ def _execution_runtime_provenance() -> Dict[str, object]:
     # actual SAM preparation/publication bytes for next-run timing attribution
     # without importing optional model runtimes merely to fingerprint them.
     for name in ('assembly', 'view_prepare', 'projection_queue', 'sam_integration',
+                 'sam_sparse_shell_projection', 'sam_bridge_planning',
+                 'sam_extrapolation_planning', 'sam_gpu_rendering',
                  'sam_interpolation', 'sam_extrapolation', 'sam_extrapolation_policy', 'sam_retry_groups',
                  'sam_tracker_runtime', 'sam_device_pool', 'sam_resources', 'sam_image_prefetch', 'sam_crop_retry',
                  'sam_parent_staging', 'tta_background', 'detector_workspaces', 'yolo_cpu_input', 'gray_cache', 'sam_yolo_capture', 'sam_view_geometry',
@@ -2603,6 +2608,7 @@ def _main_impl() -> None:
         _parent_transient_bytes,
         'Parent view postprocess admission',
     )
+    sam_dynamic_memory_partition_enabled = False
     if sam_context is not None:
         sam_context.configure_startup_parent_pool(parent_transient_admission)
     if direct_union_sparse_retirement_active:
@@ -2818,10 +2824,16 @@ def _main_impl() -> None:
     # deadlock a parent waiting for queue credit behind its own reservation.
     _projection_headroom = max(GIB, int(available_anon_work_bytes()))
     component_projection_queue = ComponentProjectionQueue(
-        workers=2, max_pending=8,
+        workers=4, max_pending=8,
         max_source_bytes=min(16 * GIB, max(GIB, _projection_headroom // 32)),
-        max_working_bytes=min(64 * GIB, max(4 * GIB, _projection_headroom // 8)),
+        max_working_bytes=component_projection_working_budget(),
+        working_budget=component_projection_working_budget,
     )
+    runtime_telemetry().register_sample_provider(
+        'projection.component_queue', component_projection_queue.snapshot)
+    print('Component projection queue: up to 4 workers, '
+          f'initial working allowance={component_projection_queue.snapshot()["max_working_bytes"] / GIB:.1f} GiB '
+          '(updated from live physical/cgroup/SLURM headroom)')
     _run_resources().track_executor(component_projection_queue)
     tile_dense_retirement_executor = _create_tracked_thread_pool(
         max_workers=int(tile_dense_retirement_workers),
@@ -2941,7 +2953,7 @@ def _main_impl() -> None:
         if future is None:
             return not sam_cpu_futures['runtime_needed'] and sam_context.detector_retirement_ready
         if not future.done():
-            return False
+            return bool(getattr(sam_context, 'cpu_prepare_ready', False))
         future.result()
         return bool(getattr(sam_context, 'runtime_ready', sam_context.detector_retirement_ready))
 
@@ -4763,6 +4775,64 @@ def _main_impl() -> None:
         stages=9,
     )
 
+    def _reclaim_drained_sam_dense_capacity() -> None:
+        nonlocal direct_union_total_dense_byte_limit
+        # The coordinator alone owns dense admission. A drained detector cannot
+        # create new input owners; deferred restores remain explicitly funded.
+        if (not sam_dynamic_memory_partition_enabled
+                or not scheduler_state.gpu_inference_drain_announced
+                or not sam_context.detector_retirement_ready
+                or gpu_worker_pending_task_ids or direct_union_inference_bytes
+                or (detector_workspace_preparation is not None and detector_workspace_preparation.pending)
+                or sam_parent_staging.ram_first_owners or sam_parent_staging.checkpoint_futures
+                or sam_parent_staging.ready_prepares
+                or not all((str(task['model_name']), str(task['view'].name)) in view_processing_submitted
+                    for task in gpu_worker_tasks_by_id.values())):
+            return
+        if any(future is not None and not future.done()
+               for future in (sam_cpu_futures['runtime'], sam_cpu_futures['source'])):
+            return
+        source = sam_context.source_volume
+        if (bool(getattr(source, '_is_lazy_processing_cube', False)) and not source.materialized):
+            return
+        if getattr(scheduler, 'cpu_input_prefetch', None) is not cpu_input_prefetch:
+            return  # An unknown owner cannot be inferred from a different cache's snapshot.
+        if cpu_input_prefetch is not None:
+            state = cpu_input_prefetch.snapshot()
+            if any(state.get(name, 1) != 0 for name in (
+                    'charged_bytes', 'reserved_bytes', 'pending_packets', 'building_packets',
+                    'running_builders', 'ready_packets', 'retiring_packets')):
+                return
+        # Every asynchronous restore registers its complete lease before submit.
+        # Keep logical promises even for disk backings; physical RSS is not credit.
+        if (set(direct_union_backing_leases) != set(direct_union_postprocess_bytes)
+                or any(lease.phase != 'postprocess' or lease.owner_count != 1
+                    or lease.nbytes != direct_union_postprocess_bytes[key]
+                    for key, lease in direct_union_backing_leases.items())):
+            return
+        owned = sum(lease.nbytes for lease in direct_union_backing_leases.values())
+        future_parent = max((snapshot.required_bytes
+            for _task, snapshot in sam_parent_staging.deferred.values()), default=0)
+        with parent_transient_admission.condition:
+            # Startup and singleton oversize rights are not represented solely by in_use.
+            if any(getattr(parent_transient_admission, name, 0) for name in (
+                    'oversize_requested_bytes', '_sam_startup_future_bytes', '_sam_startup_active_bytes')):
+                return
+            previous_dense = direct_union_total_dense_byte_limit
+            previous_transient = parent_transient_admission.capacity
+            dense, transient = reclaim_drained_sam_parent_memory(previous_dense, previous_transient,
+                owned_dense_bytes=owned, max_future_parent_bytes=future_parent)
+            if dense == previous_dense:
+                return
+            direct_union_total_dense_byte_limit = dense
+            scheduler.inputs = replace(scheduler.inputs, direct_union_total_dense_byte_limit=dense)
+            parent_transient_admission.capacity = transient
+            parent_transient_admission.condition.notify_all()
+            runtime_telemetry().gauge('sam.parent_memory_dynamic_partition', dict(
+                previous_dense_bytes=previous_dense, previous_transient_bytes=previous_transient,
+                dense_bytes=dense, transient_bytes=transient, owned_dense_bytes=owned,
+                maximum_future_parent_bytes=future_parent, combined_bytes=dense+transient))
+
     @scheduler_operation('background_drain')
     def _drain_completed_background_futures() -> None:
         background_drain_budget.begin(enabled=bool(
@@ -5072,6 +5142,8 @@ def _main_impl() -> None:
         # immediately refill the worker queues instead of waiting for an unrelated event.
         if direct_union_capacity_released and gpu_worker_pending_task_ids:
             _dispatch_inference_windows()
+
+        _reclaim_drained_sam_dense_capacity()
 
     last_scheduler_wait_log = 0.0
 
@@ -6244,12 +6316,58 @@ def _main_impl() -> None:
                 )
         pending_prediction_build_jobs.clear()
 
-        if (gpu_worker_process_active and _env_flag('YOLO_TTA_CPU_INPUT_PREFETCH', True)
-                and memfd_workspace_enabled() and int(args.gpu_batch) == 1
-                and channel_format.kind == 'gray' and not cpu_worker_process_active):
+        cpu_input_prefetch_requested = bool(
+            gpu_worker_process_active and _env_flag('YOLO_TTA_CPU_INPUT_PREFETCH', True)
+            and memfd_workspace_enabled() and int(args.gpu_batch) == 1
+            and channel_format.kind == 'gray' and not cpu_worker_process_active)
+        cpu_input_budget = (min(64 * GIB, int(direct_union_total_dense_byte_limit) // 4,
+            max(0, int(available_anon_work_bytes())) // 8) if cpu_input_prefetch_requested else 0)
+        if (interpolation_settings.sam_enabled and sam_parent_staging is not None
+                and gpu_worker_process_active and not cpu_worker_process_active
+                and not policy_settings.enabled and not bounded_policy_parent_keys
+                and not dense_tiling_active and not keep_temp_artifacts
+                and not any(name in os.environ for name in (
+                    'YOLO_TTA_DIRECT_UNION_TOTAL_GIB', 'YOLO_TTA_PARENT_TRANSIENT_GIB'))
+                and gpu_worker_tasks_by_id
+                and all(task.get('kind') == 'fullframe' for task in gpu_worker_tasks_by_id.values())
+                and not direct_union_backing_leases
+                and not direct_union_inference_bytes and not direct_union_postprocess_bytes
+                and all(value is None for value in (sam_cpu_futures['runtime'], sam_cpu_futures['source']))):
+            # The full task inventory is sealed; no detector/parent work has been dispatched.
+            with parent_transient_admission.condition:
+                if (not parent_transient_admission.in_use
+                        and not getattr(sam_context, '_startup_fleet_funded', False)
+                        and not getattr(sam_context, '_startup_host_reserved', 0)
+                        and not getattr(sam_context, '_startup_fleet_credit_bytes', 0)
+                        and not getattr(getattr(parent_transient_admission,
+                            '_sam_image_staging_pool', None), 'in_use', 0)):
+                    try:
+                        largest_parent = max(scheduler._direct_union_parent_bytes(task)
+                            for task in gpu_worker_tasks_by_id.values())
+                    except (AttributeError, KeyError, TypeError, ValueError):
+                        largest_parent = 0  # Incomplete inventory retains the existing partition.
+                    sam_dynamic_memory_partition_enabled = largest_parent > 0
+                    previous_dense = direct_union_total_dense_byte_limit
+                    previous_transient = parent_transient_admission.capacity
+                    direct_union_total_dense_byte_limit, parent_transient_admission.capacity = (
+                        repartition_sam_parent_memory(direct_union_inference_byte_limit,
+                            previous_dense, previous_transient, max_parent_bytes=largest_parent,
+                            cpu_input_bytes=cpu_input_budget))
+                    scheduler.inputs = replace(scheduler.inputs,
+                        direct_union_total_dense_byte_limit=direct_union_total_dense_byte_limit)
+                    runtime_telemetry().gauge('sam.parent_memory_partition', dict(
+                        previous_dense_bytes=previous_dense, previous_transient_bytes=previous_transient,
+                        dense_bytes=direct_union_total_dense_byte_limit,
+                        transient_bytes=parent_transient_admission.capacity,
+                        inference_bytes=direct_union_inference_byte_limit,
+                        cpu_input_bytes=cpu_input_budget, maximum_parent_bytes=largest_parent,
+                        combined_bytes=previous_dense+previous_transient))
+                    if direct_union_total_dense_byte_limit != previous_dense:
+                        print(f'SAM default parent budgets: dense={direct_union_total_dense_byte_limit/GIB:.2f} GiB, '
+                            f'transient={parent_transient_admission.capacity/GIB:.2f} GiB; '
+                            f'combined ceiling remains {(previous_dense+previous_transient)/GIB:.2f} GiB.', flush=True)
+        if cpu_input_prefetch_requested:
             from .yolo_cpu_input import CpuInputPrefetch
-            cpu_input_budget = min(64 * GIB, int(direct_union_total_dense_byte_limit) // 4,
-                max(0, int(available_anon_work_bytes())) // 8)
             scheduler.cpu_input_prefetch = CpuInputPrefetch(gpu_worker_tasks_by_id.values(),
                 input_volume_rgb if native_resize_task_spec is not None else volume_rgb,
                 prediction_render_executor or prediction_volume_executor,

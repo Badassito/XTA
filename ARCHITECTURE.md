@@ -535,22 +535,20 @@ source renderer fallback.
 Image-cache and rendering budgets remain separate from model memory. Ready
 materialized Cartesian sources supply only the native region needed by a crop;
 the canonical CPU remap preserves its global phase without a full-volume GPU
-upload. Qualified Radial requests upload a conservative source-time slab covering
+upload. GPU-selected Radial requests with qualified bounds upload a conservative source-time slab covering
 every demanded radius and native patch tap. Their sampling retains the original
 native/logical time dimensions; the slab origin changes source addresses only.
 Unsupported bounds keep full-source residency.
 Admitted Cartesian and Tilted Cartesian cohorts prepare on CPU when their source
 and bounded workspace are ready. Tilted preparation samples only the demanded
-native rectangle in 32-row strips, without full-plane plans or scratch. Curved
-cohorts and retries request TTA's GPU renderer first. Bounded asynchronous
-Radial batches use native CPU preparation from a ready source, avoiding a large
-GPU source upload for each small batch while SDK work is ready. When no SDK work
-is dispatchable, they can take an immediately idle GPU without entering the image
-wait queue or draining a busy device. Refusal preserves the CPU path. Spherical
-prefetch retains its existing GPU admission.
+native rectangle in 32-row strips, without full-plane plans or scratch.
+Qualified Radial and Spherical cohorts and retries use native CPU preparation
+from a ready, complete uint8 source when live image credit and bounded workspace
+are available. This covers synchronous and prefetched requests regardless of SDK
+readiness, avoiding cold GPU source uploads and retirement for each small batch.
+Other curved requests retain TTA's ordinary GPU renderer admission.
 Complete reusable image caches retain priority over either route.
-Ready materialized uint8 Radial and Spherical sources use bounded canonical CPU
-preparation when GPU admission declines or rendering is unavailable. Each native tap rectangle
+Each native tap rectangle for bounded canonical CPU preparation
 comes from the canonical affine crop with its two-pixel guard. Both synchronous
 preparation and parallel jobs render only that rectangle in global native
 coordinates. The grayscale ROI contract permits at most one gray level of
@@ -564,7 +562,7 @@ owner remap space and a transfer-plane margin.
 Results arrive in original order; one owner remaps, copies and publishes crops.
 Cancellation and joins settle jobs before source ownership returns. Tight
 budgets use serial CPU preparation.
-On an admitted idle GPU, `sam_gpu_rendering` reuses TTA's projectors
+For GPU-selected requests, `sam_gpu_rendering` reuses TTA's projectors
 and uint8 affine path for demanded SAM crops. It copies back only requested
 pixels. A completed builder can hand its source and the same compute lease to
 an already-ready, compatible image request, including a smaller demand covered
