@@ -42,11 +42,14 @@ class SphericalModeIntegrationTests(unittest.TestCase):
         )
         self.assertEqual([view.name for view in views], [view.name for view in single_views])
         self.assertEqual(compiled.spherical_targets, ("transverse", "sagittal", "coronal"))
+        self.assertEqual(min(v.spherical_min_radius for v in compiled.views), 8 / (4 * math.pi))
+        self.assertEqual(max(v.spherical_max_radius for v in compiled.views), 5.0)
+        self.assertGreater(len({v.spherical_max_radius for v in compiled.views}), 1)
+        self.assertEqual(len({geometry.physical_view_name(v) for v in compiled.views}), len(compiled.views))
         for adapted, shared in zip(views, compiled.views):
             self.assertEqual(adapted.family, "spherical")
             self.assertIs(adapted.shared_view, shared)
-            self.assertEqual(shared.spherical_min_radius, 8 / (4 * math.pi))
-            self.assertEqual(shared.spherical_max_radius, 5.0)
+            self.assertEqual(adapted.num_slices, len(shared.spherical_radii))
             record = pta._v18_view_manifest_record(adapted)["spherical_geometry"]
             self.assertEqual(record["spherical_request_tokens"], ["transverse", "sagittal", "coronal"])
         plans = [SimpleNamespace(tag=view.name, view=view) for view in views]
@@ -62,6 +65,27 @@ class SphericalModeIntegrationTests(unittest.TestCase):
         self.assertEqual(manifest["resolved_configuration"]["spherical_requests"], list(compiled.spherical_targets))
         self.assertIsNone(manifest["resolved_configuration"]["spherical_min_radius"])
         self.assertIn("face_patch", manifest["forward_sampling"]["spherical_channel_boundary"])
+
+    def test_band_publication_tokens_keep_pta_plans_and_tta_layers_distinct(self):
+        from XTA.outputs import nrrd_layer_output_suffix
+        _, views, compiled = self._pta_views()
+        tokens = [geometry.view_output_token(view) for view in compiled.views]
+        self.assertEqual(len(set(tokens)), len(tokens))
+        variants = geometry.expand_views_into_tta_variants(compiled.views, (0., 90.))
+        self.assertEqual(len({geometry.view_output_token(view) for view in variants}), len(variants))
+        layers = [nrrd_layer_output_suffix(view_token=token, source='fullframe', mask_kind='prediction') for token in tokens]
+        self.assertEqual(len(set(layers)), len(layers))
+        plans = []
+        for view in views:
+            aff = pta.build_affine(8, 8, 0., view.pad_mode, 8, shared_view=view.shared_view)
+            plans.append(pta.build_render_plan(view=view, aff=aff, tag=view.display_name,
+                out_dir=Path('unused-band-output'), stem='sample', tile_configs=(),
+                save_overlay=False, imgsz=8, label_enabled=False, publish_images=False, publish_labels=False))
+        self.assertEqual(len({plan.tag for plan in plans}), len(plans))
+        self.assertEqual(len({plan.img_pattern for plan in plans}), len(plans))
+        single = geometry.get_view_infos(7, 9, 11, cartesian_views=(), spherical_views=('transverse',),
+                                        spherical_min_radius=.7, spherical_patch_size=16)[0]
+        self.assertEqual(geometry.view_output_token(single), 'Spherical_upright_PX_PatchU0_V0')
 
     @unittest.skipIf(type(cv2).__name__ == '_StubModule', 'requires real OpenCV numerical runtime')
     def test_pta_cpu_fullframe_tiles_and_channel_directions_share_native_qsc_sampling(self):

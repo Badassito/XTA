@@ -75,7 +75,7 @@ def _cluster_workload_child(log: Path | None = None) -> tuple[list[Group], dict]
             azimuthal_native_raster=raster, radial_requests=tuple(RadialViewRequest(v) for v in targets),
             radial_patch_size=raster,
             spherical_requests=(SphericalViewRequest('transverse'), SphericalViewRequest('tilted_transverse')),
-            spherical_patch_size=raster, sampling_policy='coverage')
+            spherical_patch_size=raster)
     groups = []
     for view in compiled.views:
         processing = tuple(view_processing_volume_shape(view, raster))

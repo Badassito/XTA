@@ -5927,6 +5927,26 @@ def write_view_images(
         )
     return view_dir
 
+def collect_sam_planning_omissions(interpolation_stats, *, known_omissions=()):
+    from .sam_planning_outcomes import sam_planning_omission
+    records = list(known_omissions)
+    for stats in interpolation_stats:
+        operation = ('extrapolation' if stats.get('processing_role') == 'extrapolation'
+                     or stats.get('extrapolation_backend') == 'sam' else 'interpolation')
+        scope = str(stats.get('scope_id') or '/'.join(str(stats[key]) for key in
+                    ('model', 'view', 'source', 'tile_config_id') if stats.get(key)))
+        omission = stats.get('sam_planning_omission') or sam_planning_omission(
+            stats, operation=operation, scope_id=scope, view_name=str(stats.get('view', '')))
+        if omission is not None:
+            records.append(omission)
+    unique = {}
+    for record in records:
+        key = (record['operation'], str(record['scope_id']).removesuffix('/extrapolation'),
+               record['view'], record['pass_index'])
+        unique[key] = record
+    return list(unique.values())
+
+
 def write_summary_file(
     out_path: Path,
     *,
@@ -5951,8 +5971,19 @@ def write_summary_file(
     interpolation_workers: int,
     output_workers: int,
     view_prediction_labels: Optional[Dict[str, str]] = None,
+    sam_planning_omissions: Optional[Sequence[Dict[str, object]]] = None,
 ) -> Path:
     lines: List[str] = []
+    omissions = (collect_sam_planning_omissions(interpolation_stats)
+                 if sam_planning_omissions is None else sam_planning_omissions)
+    if omissions:
+        lines.append('Run status: INCOMPLETE; requested SAM work was omitted. Valid outputs are retained.')
+        for item in omissions:
+            lines.append(f"  SAM {item['operation']} {item['scope_id'] or item['view']} "
+                         f"pass {item['pass_index']}: unresolved_plan={item['unresolved_plan']}, "
+                         f"unresolved_groups={item['unresolved_group_count']}, "
+                         f"reasons={','.join(item['reasons'])}")
+        lines.append('')
     lines.append(f'Command: {command}')
     lines.append(f'Input: {input_path}')
     lines.append(f'Output directory: {out_dir}')

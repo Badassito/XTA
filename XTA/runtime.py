@@ -35,7 +35,7 @@ from concurrent.futures import (
     wait,
 )
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import (
     Callable,
     Dict,
@@ -460,6 +460,7 @@ class RuntimeTelemetry:
             payload: Dict[str, object] = {
                 'schema': f'gpt-6-astra-ultra-v{SCRIPT_VERSION}.telemetry.v1',
                 'pid': os.getpid(),
+                'snapshot_monotonic_ns': now_ns,
                 'monotonic_seconds': (now_ns - self.started_ns) / 1e9,
                 'wall_time': time.time(),
                 'final': bool(final),
@@ -646,22 +647,142 @@ class RuntimeSystemSampler:
         self._nvml_ready = False
 
     @staticmethod
-    def _read_cgroup_memory() -> Tuple[Optional[int], Optional[int]]:
-        candidates = (
-            (Path('/sys/fs/cgroup/memory.max'), Path('/sys/fs/cgroup/memory.current')),
-            (Path('/sys/fs/cgroup/memory/memory.limit_in_bytes'), Path('/sys/fs/cgroup/memory/memory.usage_in_bytes')),
-        )
-        for limit_path, current_path in candidates:
+    def _read_cgroup_memory_snapshot() -> Dict[str, object]:
+        result: Dict[str, object] = {
+            'sample_monotonic_ns': time.monotonic_ns(), 'levels': [],
+            'current': None, 'limit': None, 'compatibility_path': None,
+            'visible_root_reached': False, 'error': None,
+            'above_visible_root': 'unknown; diagnostic observations are not admission authority',
+        }
+
+        def text(path, limit=65536):
+            data = bytearray()
+            with path.open('rb', buffering=0) as handle:
+                while len(data) <= limit:
+                    chunk = handle.read(min(4096, limit + 1 - len(data)))
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+            if len(data) > limit:
+                raise ValueError(f'{path}: exceeds {limit}-byte observation bound')
+            return data.decode('utf-8', errors='strict').strip()
+
+        def number(raw):
+            if not raw.isascii() or not raw.isdigit():
+                raise ValueError('expected a nonnegative integer')
+            return int(raw)
+
+        def counters(raw):
+            values = {}
+            for line in raw.splitlines():
+                parts = line.split()
+                if len(parts) != 2 or parts[0] in values:
+                    raise ValueError('malformed or repeated memory counter')
+                values[parts[0]] = number(parts[1])
+            if not values:
+                raise ValueError('empty memory counters')
+            return values
+
+        def pressure(raw):
+            seen = set()
+            for line in raw.splitlines():
+                parts = line.split()
+                if not parts or parts[0] not in ('some', 'full') or parts[0] in seen:
+                    raise ValueError('malformed memory pressure')
+                seen.add(parts[0])
+                values = dict(part.split('=', 1) for part in parts[1:])
+                if len(values) != len(parts) - 1 or not {'avg10', 'avg60', 'avg300', 'total'} <= values.keys():
+                    raise ValueError('missing or repeated memory pressure fields')
+                number(values['total'])
+                for key in ('avg10', 'avg60', 'avg300'):
+                    average = float(values[key])
+                    if not math.isfinite(average) or not 0 <= average <= 100:
+                        raise ValueError('invalid memory pressure average')
+            if not seen:
+                raise ValueError('empty memory pressure')
+            return raw
+
+        def observed(path, parser):
             try:
-                raw = limit_path.read_text().strip()
-                limit = None if raw == 'max' else int(raw)
-                if limit is not None and int(limit) >= (1 << 60):
-                    limit = None
-                current = int(current_path.read_text().strip())
-                return limit, current
-            except Exception:
-                continue
-        return None, None
+                return {'value': parser(text(path)), 'error': None}
+            except (OSError, ValueError) as exc:
+                return {'value': None, 'error': f'{type(exc).__name__}: {exc}'}
+
+        try:
+            entries = [line.split(':', 2) for line in text(Path('/proc/self/cgroup')).splitlines()]
+            entry = next((row for row in entries if len(row) == 3 and 'memory' in row[1].split(',')), None)
+            v2 = entry is None
+            if entry is None:
+                entry = next((row for row in entries if len(row) == 3 and row[:2] == ['0', '']), None)
+            if entry is None:
+                raise ValueError('memory cgroup membership unavailable')
+            member = PurePosixPath(entry[2])
+            if (not member.is_absolute() or '\\' in entry[2] or '//' in entry[2]
+                    or any(part in ('.', '..') for part in entry[2].split('/'))):
+                raise ValueError('invalid memory cgroup membership path')
+            mounts, mountpoints = [], []
+            for line in text(Path('/proc/self/mountinfo'), 1048576).splitlines():
+                before, separator, after = line.partition(' - ')
+                fields, filesystem = before.split(), after.split()
+                if not separator or len(fields) < 6 or len(filesystem) < 3:
+                    continue
+                unescape = lambda raw: re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), raw)
+                root, mount = PurePosixPath(unescape(fields[3])), PurePosixPath(unescape(fields[4]))
+                mountpoints.append(mount)
+                if not (filesystem[0] == 'cgroup2' if v2 else
+                        filesystem[0] == 'cgroup' and 'memory' in filesystem[2].split(',')):
+                    continue
+                if root.is_absolute() and mount.is_absolute() and member.is_relative_to(root):
+                    mounts.append((len(root.parts), root, mount))
+            if not mounts:
+                raise ValueError('no visible memory cgroup mount covers membership')
+            choices = [row for row in mounts if row[0] == max(item[0] for item in mounts)]
+            if len(choices) != 1:
+                raise ValueError('ambiguous memory cgroup mount mapping')
+            _, root, mount = choices[0]
+            if any(point != mount and point.is_relative_to(mount) for point in mountpoints):
+                raise ValueError('nested mount obscures memory cgroup observations')
+            base = Path(str(mount))
+            current = base.joinpath(*member.relative_to(root).parts)
+            remaining = len(member.relative_to(root).parts) + 1
+            result.update(version=2 if v2 else 1, membership=str(member),
+                          mount_root=str(root), mountpoint=str(mount), compatibility_path=str(current))
+            levels = result['levels']
+            assert isinstance(levels, list)
+            for _ in range(16):
+                maximum = lambda raw: 'max' if raw == 'max' or (not v2 and number(raw) >= (1 << 60)) else number(raw)
+                level = {
+                    'path': str(current),
+                    'current': observed(current / ('memory.current' if v2 else 'memory.usage_in_bytes'), number),
+                    'max': observed(current / ('memory.max' if v2 else 'memory.limit_in_bytes'), maximum),
+                    'high': observed(current / ('memory.high' if v2 else 'memory.soft_limit_in_bytes'), maximum),
+                    'stat': observed(current / 'memory.stat', counters),
+                    'events': observed(current / 'memory.events', counters) if v2 else
+                              {'value': None, 'error': 'memory.events unavailable in cgroup v1'},
+                    'pressure': observed(current / 'memory.pressure', pressure) if v2 else
+                                {'value': None, 'error': 'memory.pressure unavailable in cgroup v1'},
+                }
+                statistics = level['stat']['value']
+                if isinstance(statistics, dict):
+                    keys = ('anon', 'file', 'shmem') if v2 else ('rss', 'cache', 'shmem', 'total_rss', 'total_cache', 'total_shmem')
+                    level['stat']['value'] = {key: statistics.get(key) for key in keys}
+                levels.append(level)
+                if current == base:
+                    result['visible_root_reached'] = True
+                    break
+                current = current.parent
+            result['omitted_visible_levels'] = max(0, remaining - len(levels))
+            result['current'] = levels[0]['current']['value']
+            maximum_value = levels[0]['max']['value']
+            result['limit'] = maximum_value if isinstance(maximum_value, int) else None
+        except (OSError, ValueError) as exc:
+            result['error'] = f'{type(exc).__name__}: {exc}'
+        return result
+
+    @classmethod
+    def _read_cgroup_memory(cls) -> Tuple[Optional[int], Optional[int]]:
+        snapshot = cls._read_cgroup_memory_snapshot()
+        return snapshot['limit'], snapshot['current']  # type: ignore[return-value]
 
     @classmethod
     def _read_proc(cls) -> Dict[str, object]:
@@ -678,11 +799,10 @@ class RuntimeSystemSampler:
                 result[key.strip()] = int(value.strip())
         except Exception:
             pass
-        limit, current = cls._read_cgroup_memory()
-        if current is not None:
-            result['cgroup_memory_current'] = int(current)
-        if limit is not None:
-            result['cgroup_memory_limit'] = int(limit)
+        memory = cls._read_cgroup_memory_snapshot()
+        result['cgroup_memory'] = memory
+        result['cgroup_memory_current'] = memory['current']
+        result['cgroup_memory_limit'] = memory['limit']
         return result
 
     def _sample_gpu(self) -> None:
@@ -742,8 +862,10 @@ class RuntimeSystemSampler:
                 page_size = 4096
             if 'rss_pages' in now:
                 self.telemetry.gauge('system.rss_bytes', int(now['rss_pages']) * page_size)
-            if 'cgroup_memory_current' in now:
-                self.telemetry.gauge('system.cgroup_memory_current', int(now['cgroup_memory_current']))
+            with self.telemetry.lock:
+                self.telemetry.gauge('system.cgroup_memory', now['cgroup_memory'])
+                self.telemetry.gauge('system.cgroup_memory_current', now['cgroup_memory_current'])
+                self.telemetry.gauge('system.cgroup_memory_limit', now['cgroup_memory_limit'])
             if prior is not None:
                 dt = max(1e-9, float(now['time']) - float(prior['time']))
                 try:

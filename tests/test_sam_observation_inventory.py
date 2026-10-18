@@ -10,6 +10,8 @@ from XTA.sam_extrapolation_planning import _BinaryBaseline
 
 
 def frozen(value):
+    if isinstance(value, planning._PackedObservationMask):
+        value = np.asarray(value)
     if isinstance(value, np.ndarray):
         return value.shape, value.dtype.str, value.tobytes()
     if is_dataclass(value):
@@ -70,7 +72,8 @@ def test_changed_slice_is_the_only_relabelled_slice(volume,monkeypatch):
     actual=scan(_BinaryBaseline(changed),inventory)
     assert frozen(actual)==frozen(expected)
     assert len(calls)==1
-    np.testing.assert_array_equal(calls[0],changed[3]!=0)
+    np.testing.assert_array_equal(calls[0],changed[3,4:9,5:10]!=0)
+    assert next(obs for obs in actual[0] if obs.frame_index==3).bbox_yx==(4,5,9,10)
     assert inventory.snapshot()['reused_frames']==8
     assert inventory.snapshot()['label_calls']==6
 

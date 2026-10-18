@@ -13,6 +13,7 @@ import numpy as np
 from XTA import __version__, pta
 from XTA import pta_publication
 from XTA import pta_rendering
+from XTA import pta_workers
 from XTA.pta_config import parse_pta_args
 from XTA.pta_runtime import build_runtime_options
 
@@ -356,12 +357,42 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
                     idx=0,
                     need_canvas=True,
                 )
+                self.assertEqual(image_tile_render.call_count, len(plan.tile_layout))
+                self.assertEqual(mask_tile_render.call_count, len(plan.tile_layout))
+                for item_key in ("full", plan.tile_layout[0].tile_tag):
+                    with self.subTest(retained_item=item_key):
+                        image_tile_render.reset_mock()
+                        mask_tile_render.reset_mock()
+                        candidate = pta.OutputCandidate(
+                            order=0, volume_name="sample", parent_view_tag=plan.tag,
+                            output_tag=plan.tag, item_key=item_key, frame_idx=0,
+                            is_tile=item_key != "full", label_enabled=False,
+                        )
+                        task = pta_workers.FrameRenderTask(0, 0, ((item_key, (candidate,)),))
+                        expected_image, expected_mask = (
+                            (source.img_full, source.mask_full) if item_key == "full"
+                            else source.tile_arrays[item_key]
+                        )
+                        with (mock.patch.dict(pta_workers._WORKER_STATIC, {
+                            "augmentation": None, "out_dir": Path(temp_dir), "split_active": False,
+                            "image_format": "png", "png_compression": 1, "jpeg_quality": 95,
+                        }, clear=True), mock.patch.object(pta_workers, "write_selected_candidate_version",
+                                                         return_value="written") as write):
+                            result = pta_workers.execute_render_task(
+                                np.zeros((2, 4, 4), np.uint8), np.zeros((2, 4, 4), np.uint8),
+                                (plan,), task,
+                            )
+                        self.assertEqual(result[0], 1)
+                        np.testing.assert_array_equal(write.call_args.kwargs["image"], expected_image)
+                        np.testing.assert_array_equal(write.call_args.kwargs["mask"], expected_mask)
+                        expected_tiles = int(item_key != "full")
+                        self.assertEqual(image_tile_render.call_count, expected_tiles)
+                        self.assertEqual(mask_tile_render.call_count, expected_tiles)
+                        self.assertEqual(len(plan.tile_layout), 4)
 
         self.assertIsNone(source.img_canvas)
         self.assertIsNone(source.mask_canvas)
         self.assertEqual(len(source.tile_arrays), len(plan.tile_layout))
-        self.assertEqual(image_tile_render.call_count, len(plan.tile_layout))
-        self.assertEqual(mask_tile_render.call_count, len(plan.tile_layout))
         for tile in plan.tile_layout:
             image, mask = source.tile_arrays[tile.tile_tag]
             self.assertEqual(image.shape, (tile.out_h, tile.out_w))

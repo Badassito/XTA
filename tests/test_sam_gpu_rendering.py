@@ -369,7 +369,7 @@ def test_unfinished_decode_declines_before_cuda_or_lease_access(tmp_path):
     context._resource_local.profile=object()
     try:
         with mock.patch('XTA.sam_resources.validate_live_sam_resource_profile',
-                return_value={'base_non_cpu_allowance_bytes':2**30}), \
+                return_value={'base_other_non_cpu_allowance_bytes':2**30}), \
                 mock.patch.object(context,'_try_sam_compute_lease',side_effect=AssertionError('claimed GPU')):
             assert try_gpu_crop_renderer(context,view,(4,8,8),demand((4,8,8),{1:(1,1,7,7)})) is None
     finally:
@@ -790,7 +790,7 @@ def test_cpu_credit_wait_and_duplicate_image_ticket_hold_no_extra_gpu_lease(tmp_
         try:results.append(context.image_provider(view,shape,planned))
         except BaseException as error:errors.append(error)
     threads=[threading.Thread(target=run)for _ in range(2)]
-    assigned={'base_non_cpu_allowance_bytes':2**30,'lease_id':'same-parent'}
+    assigned={'base_other_non_cpu_allowance_bytes':2**30,'lease_id':'same-parent'}
     try:
         with mock.patch('XTA.sam_resources.validate_live_sam_resource_profile',return_value=assigned), \
                 mock.patch('XTA.sam_canvas_rendering.cartesian_source_view',return_value=None), \
@@ -958,7 +958,7 @@ def test_lazy_source_gpu_recipe_uses_ready_processing_or_nonstreaming_native_dep
     shape=(view.num_slices,8,8);planned=demand(shape,{1:(1,1,7,7)})
     try:
         with mock.patch('XTA.sam_resources.validate_live_sam_resource_profile',
-                return_value={'base_non_cpu_allowance_bytes':2**30}), \
+                return_value={'base_other_non_cpu_allowance_bytes':2**30}), \
                 mock.patch.object(torch.cuda,'is_available',return_value=True) as cuda_available, \
                 mock.patch('XTA.backprojection._try_acquire_specific_main_process_gpu_stage',
                     side_effect=AssertionError('claimed GPU before winning CPU/image ticket')):
@@ -997,7 +997,7 @@ def test_unmaterialized_streaming_source_never_claims_gpu_for_decode_or_xy_chang
     shape=(view.num_slices,8,8)
     try:
         with mock.patch('XTA.sam_resources.validate_live_sam_resource_profile',
-                return_value={'base_non_cpu_allowance_bytes':2**30}), \
+                return_value={'base_other_non_cpu_allowance_bytes':2**30}), \
                 mock.patch('XTA.backprojection._try_acquire_specific_main_process_gpu_stage',
                     side_effect=AssertionError('claimed GPU for unavailable source')):
             assert try_gpu_crop_renderer(context,view,shape,demand(shape,{1:(1,1,7,7)})) is None
@@ -1022,7 +1022,7 @@ def test_unmaterialized_streaming_gpu_refusal_preserves_endpoint_grid_and_corner
     telemetry=SimpleNamespace(add=mock.Mock(),gauge=mock.Mock())
     try:
         with mock.patch('XTA.sam_resources.validate_live_sam_resource_profile',
-                return_value={'base_non_cpu_allowance_bytes':2**30,'lease_id':'endpoint-grid'}), \
+                return_value={'base_other_non_cpu_allowance_bytes':2**30,'lease_id':'endpoint-grid'}), \
                 mock.patch.object(runtime,'runtime_telemetry',return_value=telemetry), \
                 mock.patch('XTA.backprojection._try_acquire_specific_main_process_gpu_stage',
                     side_effect=AssertionError('claimed GPU with another temporal grid')):

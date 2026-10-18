@@ -143,6 +143,8 @@ class PtaBinaryTests(unittest.TestCase):
         self.assert_mask(pta_binary.candidate_binary_output_path(self.root, cands[0], split_active=False), self.mask)
 
     def test_gpu_single_source_fallback_publishes_binary_without_labels(self):
+        from XTA import pta
+
         torch = FakeTorch()
         cand = candidate(augmentation_index=1, augmentation_seed=17,
                          augmentation_tag="AbCd1234EfGh5678")
@@ -152,7 +154,19 @@ class PtaBinaryTests(unittest.TestCase):
             FakeTensor(torch, output_mask[None]),
         )))
         task = pta_workers.FrameRenderTask(0, 0, (("full", (cand,)),))
-        plan = SimpleNamespace(tag="Transverse")
+        config = parse_pta_args(["--input", "dataset", "--enable_cartesian", "transverse"])
+        views, _compiled = pta.compile_v18_pta_views(
+            t_dim=1, h=self.mask.shape[0], w=self.mask.shape[1], config=config,
+            azimuthal_native_raster=0,
+        )
+        view = views[0]
+        aff = pta.build_affine(view.src_w, view.src_h, 0., view.pad_mode, 0,
+                               shared_view=view.shared_view)
+        plan = pta.build_render_plan(
+            view=view, aff=aff, tag="Transverse", out_dir=self.root, stem="sample",
+            tile_configs=(), save_overlay=False, imgsz=0, label_enabled=True,
+            publish_images=False, publish_labels=False,
+        )
         with (
             mock.patch.dict(pta_workers._WORKER_STATIC, {
                 "out_dir": self.root, "split_active": False, "image_format": "png",
@@ -170,6 +184,8 @@ class PtaBinaryTests(unittest.TestCase):
             )
         self.assertEqual((written, flips), (1, {}))
         self.assert_mask(pta_binary.candidate_binary_output_path(self.root, cand, split_active=False), output_mask)
+        self.assertFalse((self.root / "images").exists())
+        self.assertFalse((self.root / "labels").exists())
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is required for a lossless video round trip")
     def test_ffv1_round_trip_and_frame_mapping_preserve_gaps_and_copies(self):

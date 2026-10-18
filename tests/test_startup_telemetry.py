@@ -174,8 +174,9 @@ def primed_worker(monkeypatch, diagnostics):
     return Model, run
 
 
+@pytest.mark.parametrize('external_policy', [False, True])
 def test_backend_prime_precedes_ready_and_first_task_reuses_backend_then_retires_all_aliases(
-        monkeypatch, diagnostics, primed_worker):
+        monkeypatch, diagnostics, primed_worker, external_policy):
     _telemetry, events = diagnostics
     Model, run = primed_worker
     model = Model()
@@ -203,13 +204,23 @@ def test_backend_prime_precedes_ready_and_first_task_reuses_backend_then_retires
 
     monkeypatch.setattr(workers, 'run_prediction_volume_in_worker', first_task)
     monkeypatch.setattr(workers, '_init_worker_gpu_render_engine', renderer)
+    init = {}
+    if external_policy:
+        from XTA import tta_augmentation
+        init['augmentation_settings'] = SimpleNamespace(enabled=True)
+        def initialize_policy(*args, **kwargs):
+            assert model.calls == 0
+            events.append(('policy_initialized', {}))
+        monkeypatch.setattr(tta_augmentation, 'worker_policy', initialize_policy)
     outgoing = Outgoing()
     run(model, tasks=[dict(task_id=1, slice_count=1),
         dict(task_id=-1, task_type='control', op='release_inference_assets', inference_drained=True)],
-        outgoing=outgoing)
+        outgoing=outgoing, init=init)
     assert model.calls == 1 and model.iterations == 0
     names = [name for name, _ in events]
     assert names.index('backend_load') < names.index('renderer_initialized') < names.index('ready_sent')
+    if external_policy:
+        assert names.index('policy_initialized') < names.index('backend_load')
     receipt = next(fields for name, fields in events if name == 'worker_backend_prime_done')
     assert receipt == dict(device='cuda:1', primed=True, declined=False)
     assert all(reference() is None for reference in model.references)
@@ -256,7 +267,7 @@ def test_declined_prime_preserves_complete_backend_for_retryable_validation(
     assert receipt == dict(device='cuda:1', primed=False, declined=True)
 
 
-@pytest.mark.parametrize('mode', ['pytorch', 'semantic', 'direct_disabled', 'external_policy'])
+@pytest.mark.parametrize('mode', ['pytorch', 'semantic', 'direct_disabled'])
 def test_backend_prime_skips_routes_outside_existing_direct_engine_contract(
         monkeypatch, diagnostics, primed_worker, mode):
     _telemetry, events = diagnostics
@@ -268,10 +279,6 @@ def test_backend_prime_skips_routes_outside_existing_direct_engine_contract(
         init['task'] = 'semantic'
     elif mode == 'direct_disabled':
         monkeypatch.setattr(workers, '_direct_predict_applicable', lambda cfg: False)
-    elif mode == 'external_policy':
-        from XTA import tta_augmentation
-        init['augmentation_settings'] = SimpleNamespace(enabled=True)
-        monkeypatch.setattr(tta_augmentation, 'worker_policy', lambda *args, **kwargs: None)
     run(model, init=init, path=path)
     assert model.calls == 0 and model.predictor is None
     assert 'worker_ready' in [name for name, _ in events]
@@ -332,6 +339,83 @@ def test_worker_ready_is_traced_before_send_and_never_sent_after_failed_initiali
         assert names.index('worker_ready') < names.index('message')
         assert outgoing.get()['type'] == 'ready'
         assert telemetry.snapshot()['phases']['startup.worker.model_wrapper']['calls'] == 1
+
+
+@pytest.mark.parametrize('identity', ['known', 'uninitialized', 'missing', 'unsupported'])
+def test_worker_ready_uuid_uses_initialized_local_device_and_keeps_logical_identity(
+        monkeypatch, diagnostics, primed_worker, identity):
+    _telemetry, events = diagnostics
+    Model, run = primed_worker
+    expected = 'GPU-actual-device-uuid' if identity == 'known' else None
+
+    def properties(index):
+        assert index == 0
+        assert os.environ['CUDA_VISIBLE_DEVICES'] == '7'
+        if identity == 'unsupported':
+            raise RuntimeError('UUID unavailable on this Torch build')
+        return SimpleNamespace(uuid=expected) if identity == 'known' else SimpleNamespace()
+
+    cuda = SimpleNamespace(get_device_properties=mock.Mock(side_effect=properties))
+    monkeypatch.setattr(workers, '_worker_initialized_torch',
+                        lambda: None if identity == 'uninitialized' else SimpleNamespace(cuda=cuda))
+    outgoing = queue.Queue()
+    run(Model(), outgoing=outgoing)
+    event = next(fields for name, fields in events if name == 'worker_ready')
+    ready = outgoing.get_nowait()
+    assert event['device'] == ready['device'] == 'cuda:1'
+    assert event['cuda_device_uuid'] == ready['cuda_device_uuid'] == expected
+    assert ready['type'] == 'ready' and ready['gpu_index'] == 1
+    if identity == 'uninitialized':
+        cuda.get_device_properties.assert_not_called()
+    else:
+        cuda.get_device_properties.assert_called_once_with(0)
+
+
+@pytest.mark.parametrize('uuid', ['GPU-actual-device-uuid', None, 123])
+def test_parent_ready_identity_gauge_uses_registered_processes_and_preserves_all_devices(
+        tmp_path, diagnostics, uuid):
+    from XTA import tta_scheduler
+    from tests.test_tta_scheduler_boundary import _scheduler, _state
+
+    telemetry, _events = diagnostics
+    state = _state()
+    state.gpu_task_queues.update({2: queue.Queue(), 7: queue.Queue()})
+    state.gpu_worker_processes.extend([
+        SimpleNamespace(name=f'gpu-worker-{index}', pid=1000 + index, exitcode=None)
+        for index in (2, 7)])
+    scheduler = _scheduler(tmp_path, state=state,
+                           operation_overrides={'runtime_telemetry': lambda: telemetry})
+    for index in (2, 7):
+        with mock.patch.object(tta_scheduler.time, 'monotonic_ns', return_value=100 + index):
+            scheduler.process_one_worker_result(dict(type='ready', gpu_index=index, pid=1000 + index,
+                                                     cuda_device_uuid=uuid))
+    gauge = telemetry.snapshot()['gauges']['gpu.device_identity']
+    assert gauge == dict(parent_pid=os.getpid(), sample_monotonic_ns=107, source='managed_worker_ready',
+        devices={f'cuda:{index}': dict(worker_pid=1000 + index,
+            cuda_device_uuid=uuid if isinstance(uuid, str) else None) for index in (2, 7)})
+    assert state.gpu_worker_results_collected == 0
+
+
+@pytest.mark.parametrize('mutation,registered', [
+    (dict(gpu_index=9), True), (dict(gpu_index=True), True),
+    (dict(pid=999), True), (dict(pid=None), True), (dict(pid=True), True), ({}, False),
+])
+def test_parent_ready_identity_cannot_authorize_unmanaged_or_mismatched_worker(
+        tmp_path, diagnostics, mutation, registered):
+    from tests.test_tta_scheduler_boundary import _scheduler, _state
+
+    telemetry, _events = diagnostics
+    state = _state()
+    state.gpu_task_queues[2] = queue.Queue()
+    if registered:
+        state.gpu_worker_processes.append(SimpleNamespace(name='gpu-worker-2', pid=1002, exitcode=None))
+    scheduler = _scheduler(tmp_path, state=state,
+                           operation_overrides={'runtime_telemetry': lambda: telemetry})
+    message = dict(type='ready', gpu_index=2, pid=1002, cuda_device_uuid='GPU-foreign')
+    message.update(mutation)
+    scheduler.process_one_worker_result(message)
+    assert 'gpu.device_identity' not in telemetry.snapshot()['gauges']
+    assert state.gpu_worker_ready_details_by_id == {}
 
 
 @pytest.mark.parametrize('fail_upload', [False, True])

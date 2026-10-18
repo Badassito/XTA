@@ -247,7 +247,10 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         allow_abbrev=False,
     )
-    parser.add_argument("--input", required=True, help="PTA input directory")
+    parser.add_argument(
+        "--input", required=True, nargs="+",
+        metavar="DIR", help="One or more PTA input directories, processed in argument order",
+    )
     parser.add_argument("--output", default=None, help="Output directory")
     parser.add_argument(
         "--device",
@@ -429,6 +432,8 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
 
 
 def resolve_pta_config(args: argparse.Namespace) -> PtaConfig:
+    if isinstance(args.input, list) and len(args.input) == 1:
+        args.input = args.input[0]
     if int(args.imgsz) < 0:
         raise ValueError("--imgsz must be >= 0 in PTA mode")
     radial_requests = tuple(resolve_radial_view_requests(args.enable_radial))

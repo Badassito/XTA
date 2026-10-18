@@ -61,7 +61,10 @@ class CylindricalGeometryTests(unittest.TestCase):
         frame = g.get_view_frame_by_index(source, first, 0)
         np.testing.assert_array_equal(frame[:, :4], frame[:, 4:])
         for view in views:
-            self.assertTrue(all(0 < d <= 1 for d in np.diff(view.radial_radii)))
+            gaps=np.diff(g.radial_global_radii(view))
+            self.assertTrue(np.all(gaps > 0))
+            gap=float(gaps.max(initial=0.))
+            self.assertLessEqual((gap/2.)**2+.25+gap/(8.*view.radial_min_radius),.99)
             self.assertEqual(view.radial_radii[-1], 5.0)
             self.assertEqual(view.stack_axis, 'radius')
             self.assertFalse(g.is_azimuthal_view(view))

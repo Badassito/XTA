@@ -196,6 +196,7 @@ class RadialTorchNumericalTests(unittest.TestCase):
         with (mock.patch.object(pta_workers, '_require_pta_canonical_plan'),
               mock.patch.object(torch.cuda, 'stream', return_value=nullcontext()),
               mock.patch.object(torch.cuda, 'Event', return_value=SimpleNamespace(record=lambda stream: None)),
+              mock.patch.object(engine, '_render_native_plane', wraps=engine._render_native_plane) as native_render,
               mock.patch('builtins.print')):
             for item in ('full', 'tile'):
                 image, event = pta_workers._gpu_projected_item_image(runtime_state, volume, plan, 0, item)
@@ -207,6 +208,7 @@ class RadialTorchNumericalTests(unittest.TestCase):
                         expected = np.zeros_like(native)
                         expected[:7, :6] = native[1:, 2:]
                     np.testing.assert_array_equal(image[:, :, channel].numpy(), expected)
+        self.assertEqual(native_render.call_count, 2)
         self.assertTrue(runtime_state['radial_renderer_announced'])
         self.assertNotIn('cartesian_renderer_announced', runtime_state)
 

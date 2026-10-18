@@ -1,7 +1,9 @@
 """CPU-only retained-plan composition; no production gate or throughput claim."""
 from concurrent.futures import CancelledError
+from contextlib import ExitStack
 import hashlib
 import json
+import sys
 from threading import Event, Thread
 
 import numpy as np
@@ -11,7 +13,7 @@ from XTA import geometry, sam_resources as resources
 from XTA.assembly import prepare_detector_view_cpu
 from XTA.interpolation import _ByteAdmissionPool
 from XTA.lta_rendering import render_native_tile_window
-from XTA.sam_image_prefetch import _retain_image_credit, _try_image_profile
+from XTA.sam_image_prefetch import _try_image_profile
 from XTA.sam_interpolation import (SamInterpolationInfrastructureError,
     interpolate_sam_view_volume_pass, prepare_sam_interpolation_pass)
 from tests.test_sam_interpolation import RepeatedSeedTracker, _observations
@@ -77,7 +79,8 @@ def _compose(root, *, early, failure=None):
         producer.join(2)
         assert yolo_done.is_set()
         sdk_start.set()
-    cache = release_images = merged = prepared = tracker = None
+    cache = merged = prepared = tracker = None
+    image_lifetime = ExitStack()
     evidence = dict(kind='retained CPU preplan composition', early=early,
         mocked=('other YOLO dependency', 'SDK start and repeated-seed outputs'),
         performance_benchmark=False, gpu_inference=False)
@@ -101,9 +104,9 @@ def _compose(root, *, early, failure=None):
                             'completed-view/gray-bank', resources.physical_sam_headroom) as images:
                         if images is None:
                             pytest.skip('Actual image-bank RAM headroom is unavailable')
-                        release_images = _retain_image_credit(images)
                         with context.resource_scope(images):
-                            cache = context.image_provider(view, mask.shape, prepared)
+                            cache = image_lifetime.enter_context(
+                                context.image_cohort_provider(view, mask.shape, prepared))
                     assert resources.sam_image_staging_snapshot(pool)['image_staging_in_use_bytes'] == payload+SCRATCH_BYTES
                     assert context._cache_owners[str(cache.path)]['owned']
                     cache.revalidate()
@@ -144,13 +147,13 @@ def _compose(root, *, early, failure=None):
                     if isinstance(merged, np.memmap):
                         merged._mmap.close()
                     prepared = merged = None
-                    context.close()
+                    try:
+                        image_lifetime.__exit__(*sys.exc_info())
+                    finally:
+                        context.close()
                     if cache is not None:
                         assert cache.path.parent == (root/'runtime'/'sam_image_cache').resolve()
-                        cache.path.unlink()
                         assert not cache.path.exists()
-                    if release_images is not None:
-                        release_images()
                     assert resources.sam_image_staging_snapshot(pool)['image_staging_in_use_bytes'] == 0
         return result, evidence
     finally:

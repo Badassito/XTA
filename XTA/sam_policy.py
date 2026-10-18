@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -299,7 +300,55 @@ def _dependencies(bundle, current, frozen):
                 fresh_pipeline_equivalent=bool(original) and current is not None and not bool(changed) and not frozen)
 
 
-def _infrastructure(bundle, group, run):
+@dataclass(frozen=True)
+class _GroupEndpointValidation:
+    """Constant-size result borrowed only inside its owning mask transaction."""
+    reader: object
+    group: object
+    records: object
+    errors: tuple[str, ...]
+
+
+def _endpoint_validation_owner(reader, group):
+    # Only native readers of the original deeply immutable descriptors may
+    # share this result. Rebound metadata and custom readers keep fresh checks.
+    if type(reader) is not SamMaskReader or not reader.active:
+        return None
+    owner = reader.bundle
+    if type(owner) is not SamEvidenceBundle:
+        return None
+    if any(name in vars(reader) for name in ('scope', 'groups', 'runs', 'records', 'group_mask', 'mask')):
+        return None
+    sources = getattr(owner, '_frame_geometry_sources', ())
+    if (len(sources) != 3
+            or any(old is not current for old, current in zip(sources, (owner.scope, owner.groups, owner.runs)))
+            or owner.records is not getattr(owner, '_mask_records_source', None)
+            or owner.groups.get(str(group.get('group_id'))) is not group):
+        return None
+    current = reader
+    while current._integrity_parent is not None:
+        current = current._integrity_parent
+        if type(current) is not SamMaskReader or not current.active or current.bundle is not owner:
+            return None
+    return current
+
+
+def _group_endpoint_validation(bundle, group):
+    owner = _endpoint_validation_owner(bundle, group)
+    if owner is None:
+        return None
+    invalid = False
+    for endpoint in group['endpoints']:
+        key = endpoint['observation_id']
+        reference = bundle.group_mask(group['group_id'], f'endpoint:{key}')
+        region = bundle.group_mask(group['group_id'], f'evaluation:{key}')
+        if np.any(reference & ~region) or np.array_equal(reference, region):
+            invalid = True
+    errors = ('endpoint_evaluation_region_not_independently_declared',) if invalid else ()
+    return _GroupEndpointValidation(owner, group, bundle.records, errors)
+
+
+def _infrastructure(bundle, group, run, *, _group_endpoints=None):
     errors = []
     if not bundle.manifest["complete"]:
         errors.append("bundle_publication_incomplete")
@@ -350,10 +399,22 @@ def _infrastructure(bundle, group, run):
             errors.append("tiled_required_write_coverage_incomplete")
         if np.any(candidate & ~(raw & write)):
             errors.append("candidate_outside_raw_or_write_domain")
-    for endpoint in group["endpoints"]:
+    cached = (isinstance(_group_endpoints, _GroupEndpointValidation)
+        and _group_endpoints.reader is _endpoint_validation_owner(bundle, group)
+        and _group_endpoints.group is group and _group_endpoints.records is bundle.records)
+    if cached:
+        errors.extend(_group_endpoints.errors)
+        # Spatial coverage is run-dependent even though evaluation geometry is
+        # invariant. Keep the complete seed/held-out checks for every tiled run.
+        needed = set(run.get('seed_ids', ())) | set(run.get('held_out_ids', ()))
+        checked_endpoints = (endpoint for endpoint in group['endpoints']
+            if endpoint['observation_id'] in needed) if run.get('generation_mode') == 'tiled' else ()
+    else:
+        checked_endpoints = group['endpoints']
+    for endpoint in checked_endpoints:
         key = endpoint["observation_id"]
         reference, region = bundle.group_mask(group["group_id"], f"endpoint:{key}"), bundle.group_mask(group["group_id"], f"evaluation:{key}")
-        if np.any(reference & ~region) or np.array_equal(reference, region):
+        if not cached and (np.any(reference & ~region) or np.array_equal(reference, region)):
             errors.append("endpoint_evaluation_region_not_independently_declared")
         if run.get("generation_mode")=="tiled" and key in set(run.get("seed_ids",()))|set(run.get("held_out_ids",())):
             frame=int(endpoint["frame_index"])
@@ -459,11 +520,11 @@ def _containment_counts(raw, effective, acceptance):
     return _containment_counts_kernel(raw, effective, acceptance)
 
 
-def measure_sam_run(bundle, run_id, *, mask_filter=None):
+def measure_sam_run(bundle, run_id, *, mask_filter=None, _group_endpoints=None):
     """Retain raw diagnostics and measure effective component-filtered support."""
     run = bundle.runs[str(run_id)]
     group = bundle.groups[run["group_id"]]
-    infrastructure = _infrastructure(bundle, group, run)
+    infrastructure = _infrastructure(bundle, group, run, _group_endpoints=_group_endpoints)
     containment, raw_containment, endpoint_scores, raw_endpoint_scores, radius, component_filter = [], [], [], [], [], []
     tiled=run.get("generation_mode")=="tiled"
     if tiled and mask_filter is None:
@@ -807,16 +868,22 @@ def measure_family_agreement(bundle, group_id, selected_run_ids, *, mask_filter=
         if not active:
             continue
         a, b = np.zeros(_group_shape(group), bool), np.zeros(_group_shape(group), bool)
+        # Owners may support several active edges. Their plane contributes to
+        # each directional union only once; edge coverage stays independent.
+        accumulated = (set(), set())
         missing_frame = []
         for edge in active:
-            for collection, plane in ((forward_by_edge[edge["edge_id"]], a), (reverse_by_edge[edge["edge_id"]], b)):
+            for collection, plane, seen in ((forward_by_edge[edge["edge_id"]], a, accumulated[0]),
+                                            (reverse_by_edge[edge["edge_id"]], b, accumulated[1])):
                 valid = [run for run in collection if frame in run["observed_frames"] and frame not in run.get("injected_frames", ())]
                 if not valid:
                     missing_frame.append(edge["edge_id"])
                 coverage=np.zeros(_group_shape(group),bool)
                 for run in valid:
-                    plane |= (bundle.raw_mask(run["run_id"],frame) if mask_filter is None else
-                              effective_raw_mask(bundle, run["run_id"], frame, mask_filter))
+                    if run["run_id"] not in seen:
+                        plane |= (bundle.raw_mask(run["run_id"],frame) if mask_filter is None else
+                                  effective_raw_mask(bundle, run["run_id"], frame, mask_filter))
+                        seen.add(run["run_id"])
                     if run.get("generation_mode")=="tiled":
                         coverage |= bundle.availability_mask(run["run_id"],frame)
                     else:
@@ -1255,6 +1322,20 @@ def _original_endpoint_frame(endpoint,addressing):
 
 def _cyclic_group_geometry(bundle,group):
     """Saved bounded metadata controls comparisons; never infer a cyclic view."""
+    owner = bundle.bundle if isinstance(bundle, SamMaskReader) else bundle
+    sources = getattr(owner, '_frame_geometry_sources', ())
+    if (isinstance(owner, SamEvidenceBundle) and len(sources) == 3
+            and all(previous is current for previous, current in zip(sources, (owner.scope, owner.groups, owner.runs)))
+            and owner.groups.get(str(group["group_id"])) is group):
+        # Bundle opening already validates and freezes this exact descriptor,
+        # its duplicate addresses, scope closure and endpoint identities. Borrow
+        # that existing map instead of rebuilding it for every family pair.
+        geometry = evidence_frame_geometry(bundle)
+        if not geometry["cyclic"]:
+            return None
+        return dict(addresses=geometry["groups"][str(group["group_id"])]["addresses"],
+            native_shape_tyx=geometry["native_shape_tyx"],
+            period_degrees=geometry["addressing"]["period_degrees"])
     from .sam_cyclic import validate_cyclic_frame_addressing
     metadata=group.get("frame_addressing")
     scope=bundle.scope.get("frame_addressing")
@@ -1370,6 +1451,18 @@ def _pair_contact(bundle, group_a, runs_a, group_b, runs_b, connectivity, mask_f
     return False
 
 
+def _group_selection_key(group_id, group):
+    """Keep restored work behind established families without trusting arbitrary ranks."""
+    if 'selection_priority' not in group:
+        return 0, str(group_id)
+    priority = group['selection_priority']
+    if (not isinstance(priority, (tuple, list)) or len(priority) != 2
+            or type(priority[0]) is not int or priority[0] not in (0, 1)
+            or priority[1] != str(group_id)):
+        raise ValueError('SAM selection_priority must be [0 or 1, matching group_id]')
+    return priority[0], str(group_id)
+
+
 def _apply_guarded_rescue(bundle,resolved,mask_filter,receipts,group_receipts,selected,*,enabled):
     """Stock owners are immutable priorities before any rescue is considered."""
     stock_run_ids=sorted(selected)
@@ -1379,7 +1472,7 @@ def _apply_guarded_rescue(bundle,resolved,mask_filter,receipts,group_receipts,se
         stock_selected_group_ids=stock_group_ids,stock_selected_run_ids=stock_run_ids)
     if not enabled: return summary
     containment_reasons={"effective_acceptance_violation_whole_run","effective_full_halo_acceptance_violation_whole_original_run"}
-    for group_id in sorted(group_receipts):
+    for group_id in sorted(group_receipts, key=lambda key: _group_selection_key(key, bundle.groups[key])):
         group=bundle.groups[group_id]; original=group_receipts[group_id]
         audit=dict(schema=RESCUE_SCHEMA,status="not_eligible",stock_status=original["status"],
             stock_reasons=list(original["reasons"]),stock_selected_run_ids=list(original["selected_run_ids"]),
@@ -1492,12 +1585,19 @@ def _measurement_charge(bundle, group, run_id, cache_bytes):
 
 def _measure_group_intrinsic(bundle, group, run_ids, mask_filter, execution, *, retained_index_bytes=0):
     """Complete independent measurements before any ordered selection decision."""
+    endpoints = _group_endpoint_validation(bundle, group) if len(run_ids) > 1 else None
+    # One descriptor and at most one error string, no retained rasters or
+    # per-endpoint index. It fits the existing 1 MiB serial measurement reserve;
+    # deduct a conservative 1 KiB from extra parallel credit while it is live.
+    endpoint_bytes = 1024 if endpoints is not None else 0
     credit = max(0, int(execution["parallel_credit_bytes"])-int(retained_index_bytes))
     if "branch_metadata" in execution:
         metadata = execution["branch_metadata"]
         metadata["peak_retained_index_bytes"] = max(metadata["peak_retained_index_bytes"], int(retained_index_bytes))
         metadata["minimum_effective_parallel_credit_bytes"] = min(
             metadata["minimum_effective_parallel_credit_bytes"], credit)
+    credit = max(0, credit-endpoint_bytes)
+    options = {} if endpoints is None else {'_group_endpoints': endpoints}
     workers = int(execution["requested_workers"])
     cache_bytes = int(execution["lane_cache_bytes"])
     charges = {key: _measurement_charge(bundle, group, key, cache_bytes) for key in run_ids}
@@ -1507,12 +1607,12 @@ def _measure_group_intrinsic(bundle, group, run_ids, mask_filter, execution, *, 
         execution["serial_group_count"] += 1
         reason = "worker_hint_serial" if workers < 2 else "single_run_group" if len(run_ids) < 2 else "insufficient_parallel_credit"
         execution["serial_reasons"][reason] = execution["serial_reasons"].get(reason, 0)+1
-        return {key: measure_sam_run(bundle, key, mask_filter=mask_filter) for key in run_ids}
+        return {key: measure_sam_run(bundle, key, mask_filter=mask_filter, **options) for key in run_ids}
 
     def measure(key):
         with bundle.fork(max_cache_bytes=cache_bytes) as lane:
             snapshot = lane.borrowed_filter_snapshot(mask_filter)
-            result = measure_sam_run(lane, key, mask_filter=snapshot)
+            result = measure_sam_run(lane, key, mask_filter=snapshot, **options)
         return result, dict(lane.stats)
 
     execution["parallel_group_count"] += 1
@@ -1537,7 +1637,7 @@ def _measure_group_intrinsic(bundle, group, run_ids, mask_filter, execution, *, 
                     # A single operation can use the serial legacy path. Drain
                     # already-submitted lanes before doing that operation.
                     key = run_ids[next_index]
-                    measurements[key] = measure_sam_run(bundle, key, mask_filter=mask_filter)
+                    measurements[key] = measure_sam_run(bundle, key, mask_filter=mask_filter, **options)
                     execution["oversized_serial_runs"] += 1
                     next_index += 1
                     continue
@@ -1733,7 +1833,7 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
         policy_hash=fingerprint(dict(base_policy_hash=policy_hash,tiled_quality_contract=tiled_contract))
     receipts, group_receipts, selected = {}, {}, []
     branch_prefix = mask_filter
-    for group_id in sorted(bundle.groups):
+    for group_id in sorted(bundle.groups, key=lambda key: _group_selection_key(key, bundle.groups[key])):
         # Drop the previous candidate alias before retiring an accepted prefix.
         selection_filter = mask_filter
         group = bundle.groups[group_id]

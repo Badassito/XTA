@@ -14,8 +14,7 @@ from XTA import cylindrical_geometry as cg, cylindrical_projection as cp, geomet
 from XTA.config import resolve_tilted_view_groups
 
 
-def radial_views(shape, *, base='transverse', patch=8, minimum=2., tilt=None,
-                 sampling_policy='coverage'):
+def radial_views(shape, *, base='transverse', patch=8, minimum=2., tilt=None):
     sources = () if tilt is None else geometry.get_view_infos(
         *shape, cartesian_views=(),
         tilt_groups=resolve_tilted_view_groups([f'{base}:{min(tilt, 45)}:both']),
@@ -27,7 +26,6 @@ def radial_views(shape, *, base='transverse', patch=8, minimum=2., tilt=None,
     return cg.build_radial_view_infos(
         *shape, targets=(('tilted_' if tilt is not None else '') + base,),
         min_radius=minimum, patch_size=patch, tilted_views=sources,
-        sampling_policy=sampling_policy,
     )
 
 
@@ -71,14 +69,11 @@ def native_source_taps(views):
 
 class RadialCoverageSamplingTests(unittest.TestCase):
     def test_large_plan_saves_over_forty_percent_with_strict_certificate(self):
-        dense = radial_views((3072, 3072, 3072), patch=3072, minimum=None,
-                             sampling_policy='dense')
         reduced = radial_views((3072, 3072, 3072), patch=3072, minimum=None)
-        dense_count = sum(v.num_slices for v in dense)
+        reference_count = 2969
         count = sum(v.num_slices for v in reduced)
-        self.assertEqual(dense_count, 2969)
-        self.assertLess(count, .60*dense_count)
-        self.assertEqual(sum(v.sampling_reference_frames for v in reduced), dense_count)
+        self.assertLess(count, .60*reference_count)
+        self.assertEqual(sum(v.sampling_reference_frames for v in reduced), reference_count)
         for view in reduced:
             self.assertEqual(view.sampling_certificate, 'radial-positive-trilinear-v1')
             self.assertLessEqual(view.sampling_error_bound_sq, .99 + 1e-12)
@@ -91,11 +86,6 @@ class RadialCoverageSamplingTests(unittest.TestCase):
             self.assertEqual(full[view.radial_shell_start:], view.radial_radii)
             self.assertEqual(full[0], 3072/(4*math.pi))
             self.assertEqual(len(full), view.radial_global_count)
-        for view in dense:
-            self.assertEqual(view.radial_global_count, 0)
-            self.assertEqual(view.sampling_policy, 'dense')
-            self.assertEqual(view.sampling_certificate, '')
-            self.assertEqual(view.sampling_reference_frames, 0)
 
     def test_native_positive_taps_cover_all_axes_and_thin_tilted_boundaries(self):
         for base in ('transverse', 'sagittal', 'coronal'):
@@ -110,6 +100,8 @@ class RadialCoverageSamplingTests(unittest.TestCase):
                         group = [v for v in views if (v.tilt_angle_deg, v.tilt_direction) == key]
                         self.assertTrue(all(v.sampling_certificate for v in group))
                         touched = native_source_taps(group)
+                        variants = geometry.expand_views_into_tta_variants(group, (45.0,))
+                        np.testing.assert_array_equal(native_source_taps(variants), touched)
                         wanted, _ = source_domain(group[0])
                         with self.subTest(base=base, height=height, plane=plane, tilt=key):
                             self.assertTrue(np.all(touched[wanted]),
@@ -133,39 +125,36 @@ class RadialCoverageSamplingTests(unittest.TestCase):
         expected = wanted & (selected % 2 == 0)
         np.testing.assert_array_equal(combined, expected.astype(np.uint8))
 
-    def test_steep_tilts_and_unhelpful_bounds_keep_exact_dense_geometry(self):
+    def test_steep_tilts_and_unhelpful_bounds_keep_conservative_unit_geometry(self):
         for kwargs in ({'tilt': 60}, {'minimum': .001}, {'minimum': 9.}):
-            dense = radial_views((3, 19, 21), sampling_policy='dense', **kwargs)
             requested = radial_views((3, 19, 21), **kwargs)
-            self.assertEqual(len(dense), len(requested))
-            for old, new in zip(dense, requested):
-                with self.subTest(kwargs=kwargs, view=new.name):
-                    self.assertEqual(old.radial_radii, new.radial_radii)
-                    self.assertEqual(old.radial_shell_start, new.radial_shell_start)
-                    self.assertEqual(new.radial_global_count, 0)
-                    self.assertEqual(new.sampling_policy, 'dense')
-                    self.assertEqual(new.sampling_certificate, '')
-                    self.assertTrue(new.sampling_reason)
-                    self.assertEqual(new.sampling_reference_frames, 0)
-                    self.assertEqual(new, replace(old, sampling_reason=new.sampling_reason))
+            for view in requested:
+                with self.subTest(kwargs=kwargs, view=view.name):
+                    radii = cg.radius_grid(view.radial_min_radius, view.radial_max_radius)
+                    self.assertEqual(view.radial_radii, radii[view.radial_shell_start:])
+                    self.assertEqual(view.radial_global_count, 0)
+                    self.assertEqual(view.sampling_policy, 'coverage')
+                    self.assertEqual(view.sampling_certificate, '')
+                    self.assertTrue(view.sampling_reason)
+                    self.assertEqual(view.sampling_reference_frames, 0)
 
     def test_count_validation_and_legacy_global_grid(self):
         view = radial_views((3, 19, 21))[0]
         for value in (-1, 1, 2.5):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 cg.global_radii(replace(view, radial_global_count=value))
-        legacy = replace(view, radial_global_count=0, sampling_policy='dense')
+        legacy = replace(view, radial_global_count=0, sampling_policy='dense', sampling_certificate='',
+                         radial_radii=cg.radius_grid(2., 9.)[view.radial_shell_start:])
         self.assertEqual(cg.global_radii(legacy), cg.radius_grid(2., 9.))
         for minimum in (0., -1., math.nan, math.inf):
             with self.subTest(minimum=minimum), self.assertRaises(ValueError):
                 cg.certified_radial_gap(minimum)
-        with self.assertRaisesRegex(ValueError, 'sampling policy'):
-            radial_views((3, 19, 21), sampling_policy='skip')
 
     def test_certificate_checks_actual_grid_and_rejects_tampered_metadata(self):
         view = radial_views((3, 19, 21))[0]
         mutations = (
             dict(radial_global_count=0),
+            dict(radial_global_count=0, sampling_certificate=''),
             dict(sampling_certificate=''),
             dict(sampling_certificate='radial-positive-trilinear-v0'),
             dict(tilt_angle_deg=46.),

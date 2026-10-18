@@ -1,7 +1,9 @@
 """Opt-in native TensorRT sources retain their generic CUDA input pixels."""
 from dataclasses import replace
+import hashlib
 import os
 from pathlib import Path
+import sys
 import threading
 from types import SimpleNamespace
 import unittest
@@ -87,10 +89,24 @@ class NativeTrtSourceContracts(unittest.TestCase):
 
     def test_runtime_provenance_records_mode_and_keeps_boolean(self):
         from XTA import pipeline
+        loaded_before = set(sys.modules)
         with mock.patch.dict(os.environ, {'YOLO_TTA_NATIVE_TRT_RING': 'radial'}):
             receipt = pipeline._execution_runtime_provenance()
         self.assertIs(receipt['native_trt_ring_requested'], True)
         self.assertEqual(receipt['native_trt_ring_mode'], 'radial')
+        for collection, names in (
+                ('spherical_sources', ('geometry', 'cylindrical_geometry', 'spherical_sampling',
+                                       'azimuthal_coverage', 'unification.runtime')),
+                ('modules', ('reconciliation_runtime', 'sam_planning_outcomes',
+                             'sam_observation_masks', 'sam_interpolation_contracts'))):
+            for name in names:
+                with self.subTest(module=name):
+                    entry = receipt[collection][name]
+                    self.assertEqual(entry['sha256'], hashlib.sha256(Path(entry['path']).read_bytes()).hexdigest())
+                    self.assertEqual(entry['loaded_in_parent'], 'XTA.' + name in loaded_before)
+                    self.assertEqual('XTA.' + name in sys.modules, 'XTA.' + name in loaded_before)
+        self.assertFalse(any(name.split('.')[0] in ('torch', 'cupy', 'sam3', 'sam2')
+                             for name in set(sys.modules) - loaded_before))
 
     def test_optin_is_independent_of_geometry_and_requires_resident_batch_one(self):
         views = native_views()

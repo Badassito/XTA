@@ -83,6 +83,27 @@ class SummaryTests(unittest.TestCase):
             self.assertIn('families=3, planned=1, unresolved=2, planned_runs=2', text)
             self.assertIn('group_contract_memory_limit=1, total_contract_memory_limit=2', text)
             self.assertIn('family_MiB=256.0', text)
+            self.assertTrue(text.startswith('Run status: INCOMPLETE; requested SAM work was omitted.'))
+            self.assertIn('unresolved_groups=2', text)
+
+    def test_sam_omissions_preserve_operation_model_and_tile_identity(self) -> None:
+        refusal = dict(sam_planning_status='planned', sam_unresolved_groups=2,
+                       sam_group_refusal_reasons={'family_endpoint_limit': 2},
+                       view='radial', source='tile')
+        stats = [{**refusal, 'model': model, 'tile_config_id': tile,
+                  'extrapolation_backend': 'sam'} for model, tile in
+                 [('first', 'one'), ('first', 'two'), ('second', 'one')]]
+        omissions = outputs.collect_sam_planning_omissions(stats)
+        self.assertEqual(len(omissions), 3)
+        self.assertEqual({item['operation'] for item in omissions}, {'extrapolation'})
+        self.assertEqual({item['scope_id'] for item in omissions},
+                         {'first/radial/tile/one', 'first/radial/tile/two', 'second/radial/tile/one'})
+        stamped = {'sam_planning_omission': {**omissions[0], 'scope_id': 'first/radial/tile/one/extrapolation'}}
+        self.assertEqual(len(outputs.collect_sam_planning_omissions(
+            [stamped], known_omissions=omissions)), 3)
+        self.assertEqual(outputs.collect_sam_planning_omissions([
+            dict(sam_planning_status='planned', sam_generated_runs=0),
+            dict(sam_planning_status='exhausted', sam_generated_runs=0)]), [])
 
 
 class AtomicNrrdTests(unittest.TestCase):

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
 import json
@@ -22,6 +22,7 @@ import threading
 import time
 from types import MappingProxyType
 import uuid
+import weakref
 import zlib
 
 import numpy as np
@@ -58,6 +59,7 @@ from .artifact_archive import (artifact_exists, artifact_size, open_artifact,
 
 SCHEMA = "xta.sam_proposals/1"
 TILE_EVIDENCE_SCHEMA = "xta.sam_run_tiles/1"
+INDEX_MAX_BYTES = 128 * 1024**2
 
 
 def _plain(value):
@@ -82,8 +84,35 @@ def _freeze(value):
     return value
 
 
+def _freeze_owned(value):
+    """Seal a freshly JSON-decoded tree without copying its owned dictionaries."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            value[key] = _freeze_owned(item)
+        return MappingProxyType(value)
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            value[index] = _freeze_owned(item)
+        return tuple(value)
+    return value
+
+
 def _json_bytes(value):
     return json.dumps(_plain(value), sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def _write_index(path, index):
+    """Stream the already-plain writer index with the existing canonical bytes."""
+    encoder = json.JSONEncoder(sort_keys=True, separators=(',', ':'), allow_nan=False)
+    written = 0
+    with Path(path).open('wb') as stream:
+        for chunk in encoder.iterencode(index):
+            # ensure_ascii=True makes character and UTF-8 byte counts equal.
+            if written + len(chunk) > INDEX_MAX_BYTES:
+                raise MemoryError('SAM evidence index exceeds bounded metadata budget')
+            encoded = chunk.encode('utf-8')
+            stream.write(encoded)
+            written += len(encoded)
 
 
 def fingerprint(value):
@@ -295,6 +324,7 @@ class SamEvidenceWriter:
         self._packing_bytes = 0
         self._packing_max_plane = 0
         self._packing_failure = False
+        self._empty_encoding = None
         self.max_mask_bytes, self.max_payload_bytes = int(max_mask_bytes), int(max_payload_bytes)
         if self.max_mask_bytes <= 0 or self.max_payload_bytes <= 0:
             self.abort()
@@ -605,7 +635,7 @@ class SamEvidenceWriter:
 
     def _drain_packing(self, until=None):
         while self._packing_pending and (until is None or until not in self.records):
-            future, key, shape, charged = self._packing_pending.popleft()
+            future, key, shape, charged, source_identity = self._packing_pending.popleft()
             waiting = not future.done()
             started = time.perf_counter() if waiting else None
             try:
@@ -616,6 +646,7 @@ class SamEvidenceWriter:
                     telemetry = runtime_telemetry()
                     telemetry.add('sam.consumer.mask_pack_wait_host_seconds', time.perf_counter()-started)
                     telemetry.add('sam.consumer.mask_pack_waits', 1)
+            self._cache_empty_encoding(source_identity, shape, encoding)
             self._publish_mask(key, shape, encoding)
             self._packing_bytes -= charged
             self._packing_reserved.remove(key)
@@ -634,6 +665,13 @@ class SamEvidenceWriter:
         from .runtime import runtime_telemetry
         runtime_telemetry().add('sam.consumer.mask_publish_host_seconds', time.perf_counter()-started)
 
+    def _cache_empty_encoding(self, source_identity, shape, encoding):
+        # Reuse one proven immutable constant plane without retaining its array owner.
+        if (source_identity is not None and source_identity[0]() is not None
+                and encoding[-1] in (0, int(shape[0])*int(shape[1]))
+                and len(encoding[0]) <= 64 * 1024):
+            self._empty_encoding = (source_identity, tuple(shape), encoding)
+
     def _put(self, key, value, shape):
         if key in self.records or key in self._packing_reserved:
             raise ValueError(f"Duplicate SAM mask identity: {key}")
@@ -641,6 +679,42 @@ class SamEvidenceWriter:
         if value.size > self.max_mask_bytes:
             raise MemoryError("SAM evidence mask exceeds configured memory limit")
         parallel = self._packing
+        cached = self._empty_encoding
+        base = value.base
+        immutable = (value.flags.c_contiguous and isinstance(base, np.ndarray)
+                     and isinstance(base.base, bytes))
+        if (immutable and cached is not None and cached[0][0]() is value
+                and cached[0][1]() is base and cached[1] == value.shape
+                and cached[0][2] == value.__array_interface__['data']
+                and cached[0][3] == base.__array_interface__['data']):
+            from .runtime import runtime_telemetry
+            runtime_telemetry().add('sam.consumer.constant_encoding_reuses')
+            if parallel is not None:
+                parallel.validate()
+                if self._packing_pending:
+                    self._packing_max_plane = max(self._packing_max_plane, int(value.size))
+                    scratch = parallel.scratch_bytes(self._packing_max_plane)
+                    charged = len(cached[2][0]) + 4096
+                    capacity = min(8, parallel.cpu_worker_limit())
+                    if capacity >= 2 and charged <= scratch:
+                        while self._packing_pending and (len(self._packing_pending) >= capacity
+                                or self._packing_bytes + charged > scratch):
+                            self._drain_packing(until=self._packing_pending[0][1])
+                        if self._packing_pending:
+                            # Preserve FIFO publication without waiting for earlier encoders here.
+                            future = Future()
+                            future.set_result(cached[2])
+                            parallel.track(future)
+                            self._packing_pending.append((future, key, tuple(shape), charged, cached[0]))
+                            self._packing_reserved.add(key)
+                            self._packing_bytes += charged
+                            return key
+            self._drain_packing()
+            self._publish_mask(key, shape, cached[2])
+            return key
+        # Older NumPy permits data rebinding; preserve the immutable reshape base too.
+        source_identity = ((weakref.ref(value), weakref.ref(base),
+            value.__array_interface__['data'], base.__array_interface__['data']) if immutable else None)
         if parallel is not None:
             self._packing_max_plane = max(self._packing_max_plane, int(value.size))
             scratch = parallel.scratch_bytes(self._packing_max_plane)
@@ -658,14 +732,16 @@ class SamEvidenceWriter:
                 snapshot = np.array(value, dtype=np.bool_, copy=True, order='C')
                 snapshot.setflags(write=False)
                 future = parallel.submit(_mask_packing_pool(worker_limit), _encode_mask, snapshot)
-                self._packing_pending.append((future, key, tuple(shape), charged))
+                self._packing_pending.append((future, key, tuple(shape), charged, source_identity))
                 self._packing_reserved.add(key)
                 self._packing_bytes += charged
                 from .runtime import runtime_telemetry
                 runtime_telemetry().add('sam.consumer.parallel_mask_submissions', 1)
                 return key
         self._drain_packing()
-        self._publish_mask(key, shape, _encode_mask(value))
+        encoding = _encode_mask(value)
+        self._cache_empty_encoding(source_identity, shape, encoding)
+        self._publish_mask(key, shape, encoding)
         return key
 
     def add_group(self, group, masks):
@@ -703,13 +779,9 @@ class SamEvidenceWriter:
         required.update(f"evaluation:{identity}" for identity in ids)
         if required - set(masks):
             raise ValueError(f"Missing SAM geometry/reference masks: {sorted(required - set(masks))}")
+        endpoints_by_frame = {}
         for endpoint in endpoints:
-            observed = _mask(masks[f"endpoint:{endpoint['observation_id']}"], shape)
-            if not observed.any():
-                raise ValueError("Original SAM endpoint reference must contain foreground")
-            write = _mask(masks[f"write:{int(endpoint['frame_index'])}"], shape)
-            if np.any(write & observed):
-                raise ValueError("SAM write domain may not repaint an original observation")
+            endpoints_by_frame.setdefault(int(endpoint['frame_index']), []).append(endpoint)
         # Index names only; rescanning every mask for every frame is quadratic.
         edge_writes = {}
         for name in masks:
@@ -717,20 +789,92 @@ class SamEvidenceWriter:
                 suffix = name.rsplit(":", 1)[-1]
                 if f"write:{suffix}" in required:
                     edge_writes.setdefault(suffix, []).append(name)
+        empty_identity = None
+        def immutable_empty(value):
+            nonlocal empty_identity
+            base = value.base
+            if (value.dtype != np.bool_ or value.shape != shape or value.flags.writeable
+                    or not value.flags.c_contiguous or not isinstance(base, np.ndarray)
+                    or not isinstance(base.base, bytes) or base.flags.writeable
+                    or len(base.base) != value.nbytes):
+                return False
+            if (empty_identity is not None and empty_identity[0]() is value
+                    and empty_identity[1]() is base and empty_identity[2] is base.base
+                    and empty_identity[3] == value.__array_interface__['data']
+                    and empty_identity[4] == base.__array_interface__['data']):
+                return True
+            if np.any(value):
+                return False
+            # One existing bytes owner prevents allocator/address reuse from
+            # turning a rebound ndarray into a false identity hit. No raster is
+            # copied; at most one crop plane remains alive through validation.
+            empty_identity = (weakref.ref(value), weakref.ref(base), base.base,
+                              value.__array_interface__['data'], base.__array_interface__['data'])
+            return True
         for frame in frames:
+            # Validate the entire group before publication, sharing the same
+            # frame-local contracts across endpoint and edge containment checks.
+            for endpoint in endpoints_by_frame.get(frame, ()):
+                observed = _mask(masks[f"endpoint:{endpoint['observation_id']}"], shape)
+                if not observed.any():
+                    raise ValueError("Original SAM endpoint reference must contain foreground")
+                write = _mask(masks[f"write:{frame}"], shape)
+                if np.any(write & observed):
+                    raise ValueError("SAM write domain may not repaint an original observation")
             if np.any(_mask(masks[f"write:{frame}"], shape) & ~_mask(masks[f"acceptance:{frame}"], shape)):
                 raise ValueError("SAM write domain must be a subset of predeclared acceptance")
             for name in edge_writes.get(str(frame), ()):
-                if np.any(_mask(masks[name], shape) & ~_mask(masks[f"write:{frame}"], shape)):
+                edge_write = _mask(masks[name], shape)
+                write = _mask(masks[f"write:{frame}"], shape)
+                # Both Mapping accesses and ordinary mask validation above are
+                # required even for a cached empty edge. Custom providers may
+                # change their values or raise on any access.
+                if not immutable_empty(edge_write) and np.any(edge_write & ~write):
                     raise ValueError("Branch-specific SAM write domain must be a subset of group write")
+        empty_identity = None
         for edge in group.get("edges", []):
             if str(edge["source_id"]) not in ids or str(edge["target_id"]) not in ids:
                 raise ValueError("SAM edge references an unknown original endpoint")
         # Sort identities, not materialized values: a streaming Mapping can
         # produce one endpoint crop plane at a time without an O(refs * crop)
         # transient list of dense arrays before compression.
+        # Interpolation's declared endpoint contract benefits from keeping its
+        # one-frame cache through edge writes and continuation evaluation.
+        # Extrapolation instead shares constant planes across whole role passes;
+        # retain lexical order there, and for unknown/custom group contracts.
+        # Choose from durable group metadata, never the Mapping implementation,
+        # so matching eager and streamed evidence keeps identical packed bytes.
+        frame_major = (group.get('endpoint_identity_basis') == 'slice_connected_components'
+                       and group.get('evidence_purpose') != 'sam_extrapolation')
+        endpoint_frames = {str(endpoint['observation_id']): int(endpoint['frame_index'])
+                           for endpoint in endpoints}
+        declared_frames = set(frames)
+        declared_edges = {str(edge['edge_id']) for edge in group.get('edges', ()) if 'edge_id' in edge}
+        def publication_order(name):
+            role, separator, identifier = name.partition(':')
+            if separator and role in ('endpoint', 'evaluation', 'permitted'):
+                if identifier in endpoint_frames:
+                    return 0, endpoint_frames[identifier], role, name
+            elif separator and role in ('acceptance', 'write', 'unrelated', 'known_foreground',
+                                        'edge_write', 'edge_contract'):
+                token = identifier
+                if role in ('edge_write', 'edge_contract'):
+                    edge_id, separator, token = identifier.rpartition(':')
+                    if not separator or edge_id not in declared_edges:
+                        return 1, 0, '', name
+                try:
+                    frame = int(token)
+                except ValueError:
+                    pass
+                else:
+                    if token == str(frame) and frame in declared_frames:
+                        return 0, frame, role, name
+            # Extension names and noncanonical/out-of-domain frame spellings
+            # retain deterministic lexical ordering and ordinary mask checks.
+            return 1, 0, '', name
+        publication_names = sorted(masks, key=publication_order) if frame_major else sorted(masks)
         group["mask_keys"] = {name: self._put(f"g/{identity}/{name}", masks[name], shape)
-                              for name in sorted(masks)}
+                              for name in publication_names}
         group.setdefault("complete", group.get("status", "complete") not in {"incomplete", "unresolved"})
         self._drain_packing()
         self.groups[identity] = group
@@ -937,13 +1081,10 @@ class SamEvidenceWriter:
             if complete:
                 raise ValueError("Cannot publish complete SAM evidence with unfinalized tiled original runs")
             index["unfinalized_tile_runs"] = self._pending_tiles
-        encoded_index = _json_bytes(index)
-        if len(encoded_index) > 64 * 1024**2:
-            raise MemoryError("SAM evidence index exceeds bounded metadata budget")
+        _write_index(self.staging / "index.json", index)
         self._stream.flush()
         os.fsync(self._stream.fileno())
         self._stream.close()
-        (self.staging / "index.json").write_bytes(encoded_index)
         manifest = dict(schema=SCHEMA, complete=bool(complete), scope=self.scope,
                         group_count=len(self.groups), run_count=len(self.runs), mask_count=len(self.records),
                         files={name: dict(bytes=(self.staging/name).stat().st_size,
@@ -958,7 +1099,14 @@ class SamEvidenceWriter:
         else:
             os.replace(self.staging, self.directory)
         self._closed = True
-        return SamEvidenceBundle.open(self.directory, max_mask_bytes=self.max_mask_bytes)
+        self._empty_encoding = None
+        # The fresh decoder must not coexist with a second full writer-owned tree.
+        self.groups, self.runs, self.records, self._pending_tiles = {}, {}, {}, {}
+        del index
+        bundle = SamEvidenceBundle.open(self.directory, max_mask_bytes=self.max_mask_bytes)
+        self.groups, self.runs, self.records = bundle.groups, bundle.runs, bundle.records
+        self._pending_tiles = bundle.unfinalized_tile_runs
+        return bundle
 
     close = commit
 
@@ -976,6 +1124,7 @@ class SamEvidenceWriter:
                 # This UUID-owned staging directory is the only tree removed here.
                 shutil.rmtree(staging)
             self._closed = True
+            self._empty_encoding = None
 
     def __enter__(self):
         return self
@@ -1103,12 +1252,18 @@ class SamEvidenceBundle:
                 raise ValueError("Missing or escaped SAM evidence payload")
             if verify and _file_hash(path) != entry["sha256"]:
                 raise ValueError("SAM evidence file checksum mismatch")
-        if manifest["files"]["index.json"]["bytes"] > 64 * 1024**2:
+        if manifest["files"]["index.json"]["bytes"] > INDEX_MAX_BYTES:
             raise MemoryError("SAM evidence index exceeds bounded metadata budget")
-        index = json.loads(read_artifact(self.directory / "index.json", max_bytes=64 * 1024**2))
-        self.groups, self.runs, self.records = _freeze(index["groups"]), _freeze(index["runs"]), _freeze(index["masks"])
-        self.unfinalized_tile_runs = _freeze(index.get("unfinalized_tile_runs",{}))
-        self.manifest, self.scope = _freeze(manifest), _freeze(manifest["scope"])
+        encoded_index = read_artifact(self.directory / "index.json", max_bytes=INDEX_MAX_BYTES)
+        text = encoded_index.decode(json.detect_encoding(encoded_index), 'surrogatepass')
+        del encoded_index
+        index = json.loads(text)
+        del text
+        index = _freeze_owned(index)
+        self.groups, self.runs, self.records = index["groups"], index["runs"], index["masks"]
+        self.unfinalized_tile_runs = index.get("unfinalized_tile_runs", MappingProxyType({}))
+        self.manifest = _freeze_owned(manifest)
+        self.scope = self.manifest["scope"]
         total = manifest["files"]["masks.bin"]["bytes"]
         for key, record in self.records.items():
             if int(record["offset"]) < 0 or int(record["bytes"]) < 0 or int(record["offset"]) + int(record["bytes"]) > total:
@@ -1116,6 +1271,11 @@ class SamEvidenceBundle:
         if (len(self.groups), len(self.runs), len(self.records)) != (manifest["group_count"], manifest["run_count"], manifest["mask_count"]):
             raise ValueError("SAM evidence record counts disagree with manifest")
         self._frame_geometry = _freeze(_evidence_frame_geometry(self.scope, self.groups, self.runs))
+        self._frame_geometry_source = self._frame_geometry
+        self._frame_geometry_sources = (self.scope, self.groups, self.runs)
+        # Bind the exclusively owned, deeply frozen payload index. A caller's
+        # replacement mappingproxy may still have an externally mutable backing.
+        self._mask_records_source = self.records
         self._verified = bool(verify)
         return self
 

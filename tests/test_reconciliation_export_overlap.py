@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import nullcontext
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 import gzip
@@ -64,8 +65,9 @@ def pipeline_block():
 
 def execute_pipeline_block(tmp_path, sink, array, ref, cfg, policy):
     namespace = dict(__name__='XTA.pipeline', __package__='XTA', reconciliation_settings=cfg,
+        sam_context=None, source_survival_reuse=None,
         reconciliation_policy=policy, nrrd_layer_sink=lambda: sink,
-        runtime_telemetry=lambda: SimpleNamespace(gauge=lambda *args: None),
+        runtime_telemetry=lambda: SimpleNamespace(gauge=lambda *args: None, span=lambda *args: nullcontext()),
         final_union_mm=array, streamed_final_union_mm=array,
         streaming_final_union_holder={'model': array}, model_name='model',
         nrrd_layer_refs=[ref], inference_views=[], source_output_shape_tyx=array.shape,

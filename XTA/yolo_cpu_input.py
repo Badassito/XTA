@@ -4,10 +4,13 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from bisect import bisect_right
 from concurrent.futures import Executor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import zip_longest
 import threading
 import time
+import errno
+import os
+import weakref
 
 import numpy as np
 
@@ -16,7 +19,8 @@ from .geometry import (AugJob, ViewInfo, physical_view_name, tilted_base_view_na
                        tilted_frame_center, tilted_stack_axis_length)
 from .media import wait_for_volume_ready
 from .runtime import (_allocate_memfd_workspace_array, _memfd_backing_path_from_array,
-                      close_memmap_array_without_flush, runtime_telemetry)
+                      _memfd_owner_key_from_array, _memfd_owner_fd_for_path,
+                      _root_memmap_for_array, close_memmap_array_without_flush, runtime_telemetry)
 from .unification.contracts import DataRole
 from .unification.sampling import require_forward_sampling
 
@@ -117,6 +121,12 @@ class _Packet:
     running: bool = False
     input_path: object = None
     input_shape: object = None
+    built_array: object = None
+    build_error: object = None
+    borrowers: set = field(default_factory=set)
+    revoked: bool = False
+    retirement_mapping: object = None
+    retirement_fd: object = None
 
 
 class CpuInputPrefetch:
@@ -127,6 +137,7 @@ class CpuInputPrefetch:
         self.executor, self.volume = executor, volume
         self.max_bytes, self.headroom = max(0, int(max_bytes)), headroom
         self.capacity_bytes = self.max_bytes
+        self.reclaim_target = None
         self.allocate, self.backing, self.close_array = allocate, backing, close_array
         self.on_capacity_change = on_capacity_change
         self.lock = threading.RLock()
@@ -162,12 +173,17 @@ class CpuInputPrefetch:
         # Keep the current grant funded while callbacks can refill it. Only the
         # scheduler can yield unused capacity or replenish it from mask headroom.
         with self.lock:
-            return self.capacity_bytes if self.bytes or (not self.closed and any(packet.remaining for packet in self.packets)) else 0
+            return self.capacity_bytes if self.bytes or (not self.closed and any(
+                packet.remaining and not packet.revoked and not packet.failed
+                for packet in self.packets)) else 0
 
     def set_capacity(self, grant_bytes):
         with self.lock:
             previous = self.capacity_bytes
-            self.capacity_bytes = max(self.bytes, min(self.max_bytes, max(0, int(grant_bytes))))
+            target = min(self.max_bytes, max(0, int(grant_bytes)))
+            if self.reclaim_target is not None:
+                target = min(target, self.reclaim_target)
+            self.capacity_bytes = max(self.bytes, target)
             expanded = self.capacity_bytes > previous
             granted = self.capacity_bytes
         if expanded:
@@ -180,11 +196,65 @@ class CpuInputPrefetch:
             if self.bytes > granted:
                 return None
             self.capacity_bytes = granted
+            self.reclaim_target = None
             return granted
 
     def can_yield_capacity(self, grant_bytes):
         with self.lock:
             return self.bytes <= min(self.capacity_bytes, max(0, int(grant_bytes)))
+
+    def can_reclaim_capacity(self, grant_bytes):
+        """Preview optional retirement, never certify that bytes are already free."""
+        with self.lock:
+            retained = sum(packet.charged_bytes for packet in self.packets if packet.borrowers)
+            return not self.closed and retained <= max(0, int(grant_bytes))
+
+    def request_reclaim_capacity(self, grant_bytes, *, preferred_parent=None, preferred_task=None):
+        """Ask the controller to retire unborrowed inputs; credit settles later.
+
+        A ready packet may be needed by future detector work whose dense parent
+        cannot yet be born. Such speculative inputs must not prevent that birth.
+        Attached packets remain owned through the existing compute-release fence.
+        """
+        requested_packets = requested_bytes = 0
+        with self.lock:
+            target = min(self.capacity_bytes, max(0, int(grant_bytes)))
+            if self.closed or not self.can_reclaim_capacity(target):
+                return False
+            if self.reclaim_target is not None:
+                target = min(target, self.reclaim_target)
+            self.reclaim_target = target
+            self.capacity_bytes = max(self.bytes, target)
+            reclaiming = sum(packet.charged_bytes for packet in self.packets
+                             if packet.revoked or packet.retiring)
+            candidates = [packet for packet in reversed(self.packets)
+                          if packet.charged_bytes and not packet.borrowers
+                          and not packet.revoked and not packet.retiring]
+            # Preserve the selected parent's useful inputs when possible, and
+            # prefer already-built speculative data over interrupting a renderer.
+            preferred_packet = None if preferred_task is None else self._packet(preferred_task)
+            candidates.sort(key=lambda packet: (
+                packet is preferred_packet,
+                self._parent(packet.task)[:2] == preferred_parent,
+                packet.building, packet.running))
+            for packet in candidates:
+                if self.bytes - reclaiming <= target:
+                    break
+                packet.revoked = True
+                reclaiming += packet.charged_bytes
+                requested_packets += 1
+                requested_bytes += packet.charged_bytes
+                self._queue_retirement(packet)
+            # No close, Future.cancel or executor operation runs on the caller.
+        if requested_packets:
+            self._record('reclaim_requested_packets', requested_packets)
+            self._record('reclaim_requested_charged_bytes', requested_bytes)
+        self.pump()
+        return True
+
+    def _settle_reclaim_capacity(self):
+        if self.reclaim_target is not None:
+            self.capacity_bytes = max(self.bytes, min(self.capacity_bytes, self.reclaim_target))
 
     def _record(self, name, value):
         telemetry = runtime_telemetry()
@@ -200,7 +270,10 @@ class CpuInputPrefetch:
                 building_packets=sum(packet.building for packet in self.packets),
                 running_builders=sum(packet.running for packet in self.packets),
                 ready_packets=len(ready), ready_frames=sum(len(packet.remaining) for packet in ready),
-                retiring_packets=sum(packet.retiring for packet in self.packets), closed=self.closed)
+                retiring_packets=sum(packet.retiring for packet in self.packets),
+                borrowed_packets=sum(bool(packet.borrowers) for packet in self.packets),
+                revoked_packets=sum(packet.revoked for packet in self.packets),
+                reclaim_target_bytes=self.reclaim_target, closed=self.closed)
 
     def _report(self):
         telemetry = runtime_telemetry()
@@ -220,26 +293,64 @@ class CpuInputPrefetch:
         with self.lock:
             array = packet.array
         if array is not None:
+            root = _root_memmap_for_array(array)
+            mapping = None if root is None else getattr(root, '_mmap', None)
+            if mapping is not None and packet.retirement_mapping is None:
+                packet.retirement_mapping = weakref.ref(mapping, self._retirement_ready)
+                fd = _memfd_owner_fd_for_path(_memfd_owner_key_from_array(array))
+                if fd is not None:
+                    identity = os.fstat(fd)
+                    packet.retirement_fd = (fd, identity.st_dev, identity.st_ino)
+            root = mapping = None
             self.close_array(array)
         with self.condition:
             packet.array = None
+            array = None  # Drop the final local mapping before returning its credit.
             packet.input_path = packet.input_shape = None
+            # close_array registers alias-aware retirement. It does not prove
+            # that another NumPy view, callback or owner FD has actually retired.
+            if packet.retirement_mapping is not None and packet.retirement_mapping() is not None:
+                return False
+            if packet.retirement_fd is not None:
+                fd, device, inode = packet.retirement_fd
+                try:
+                    identity = os.fstat(fd)
+                except OSError as error:
+                    if error.errno != errno.EBADF:
+                        raise
+                else:
+                    if (identity.st_dev, identity.st_ino) == (device, inode):
+                        return False
+            settled_bytes = packet.charged_bytes if packet.revoked else 0
+            packet.retirement_mapping = packet.retirement_fd = None
             self.bytes -= packet.charged_bytes
             packet.charged_bytes = 0
             packet.retiring = False
+            packet.borrowers.clear()
+            self._settle_reclaim_capacity()
             self.condition.notify_all()
+        if settled_bytes:
+            self._record('reclaim_settled_packets', 1)
+            self._record('reclaim_settled_charged_bytes', settled_bytes)
         self._capacity_changed()
+        return True
+
+    def _retirement_ready(self, _reference):
+        with self.condition:
+            if not self.closed:
+                self.pump_requested = self.pump_scheduled = True
+            self.condition.notify_all()
 
     def _build(self, packet):
         task = packet.task
         started = time.perf_counter()
         with self.lock:
             packet.running = True
-            if self.closed or not packet.remaining:
+            if self.closed or packet.revoked or not packet.remaining:
                 return None
         wait_for_volume_ready(self.volume)
         with self.lock:
-            if self.closed or not packet.remaining:
+            if self.closed or packet.revoked or not packet.remaining:
                 return None
         array = self.allocate((int(task['slice_count']), int(task['out_size']), int(task['out_size'])),
             np.uint8, 'YOLO CPU input', initialize_zero=False)
@@ -250,24 +361,40 @@ class CpuInputPrefetch:
             for local, index in enumerate(range(int(task['slice_start']),
                     int(task['slice_start']) + int(task['slice_count']))):
                 with self.lock:
-                    if self.closed or not packet.remaining:
+                    if self.closed or packet.revoked or not packet.remaining:
                         return None
                 array[local] = render(index)
             self._record('prepared_frames', int(task['slice_count']))
             self._record('prepare_seconds', time.perf_counter() - started)
-            result, array = array, None
-            return result
+            # The Future carries completion only. A returned ndarray would leave
+            # an alias in Future._result after adoption, delaying memfd retirement.
+            with self.lock:
+                packet.built_array, array = array, None
+            return None
+        except Exception as error:
+            # Do not retain array-bearing producer frames in Future._exception.
+            # Preparation failure still follows the established GPU fallback.
+            with self.lock:
+                packet.build_error = repr(error)
+            return None
         finally:
             if array is not None:
-                self.close_array(array)
+                # Keep failed/cancelled producer payloads in the same retirement
+                # owner. The completed Future must retain no ndarray traceback.
+                with self.lock:
+                    packet.built_array, array = array, None
 
     def _done(self, packet, future):
         error = None
         path = shape = None
         try:
-            array = future.result()
+            future.result()
         except Exception as exc:
-            array, error = None, exc
+            error = repr(exc)
+        with self.lock:
+            array, packet.built_array = packet.built_array, None
+            error = error or packet.build_error
+            packet.build_error = None
         if array is not None:
             try:
                 path, shape = self.backing(array), tuple(array.shape)
@@ -275,7 +402,7 @@ class CpuInputPrefetch:
                     raise OSError('CPU input preparation requires transferable shared RAM')
                 path = str(path)
             except Exception as exc:
-                error = exc
+                error = repr(exc)
         with self.condition:
             packet.array = array
             packet.input_path, packet.input_shape = path, shape
@@ -283,11 +410,13 @@ class CpuInputPrefetch:
             packet.future = None  # The adopted array, not a completed Future, owns the payload.
             packet.building = False
             packet.running = False
-            if self.closed or not packet.remaining or packet.array is None or error is not None:
+            if self.closed or packet.revoked or not packet.remaining or packet.array is None or error is not None:
                 self._queue_retirement(packet)
             else:
                 self.bytes -= packet.charged_bytes - self._size(packet)
                 packet.charged_bytes = self._size(packet)
+            self._settle_reclaim_capacity()
+            array = None  # Only the packet retains the adopted mapping now.
             self.condition.notify_all()
         if error is not None and not future.cancelled():
             self._record('prepare_failures', 1)
@@ -307,9 +436,13 @@ class CpuInputPrefetch:
     def _control(self):
         while True:
             with self.condition:
-                self.condition.wait_for(lambda: self.closed or self.pump_requested)
+                # Mapping death normally wakes us. The bounded retry also covers
+                # a keepalive-FD finalizer that finishes after that notification.
+                self.condition.wait_for(lambda: self.closed or self.pump_requested,
+                    timeout=.05 if self.retiring else None)
                 if self.closed:
                     return
+                self.pump_scheduled = True
             try:
                 self._pump()
                 self._report()
@@ -328,16 +461,33 @@ class CpuInputPrefetch:
                 if self.closed:
                     return
                 self.pump_requested = False
-            while True:
+                cancelled = [packet.future for packet in self.packets
+                             if packet.revoked and packet.building and not packet.running
+                             and packet.future is not None]
+            # Cancellation can invoke adoption callbacks. Keep it on the existing
+            # controller and outside the owner lock, just like array retirement.
+            for future in cancelled:
+                future.cancel()
+            with self.lock:
+                retire_count = len(self.retiring)
+            for _ in range(retire_count):
                 with self.lock:
                     if self.closed or not self.retiring:
                         break
                     packet = self.retiring.popleft()
-                self._close_packet(packet)
+                try:
+                    settled = self._close_packet(packet)
+                except BaseException:
+                    with self.lock:
+                        self.retiring.appendleft(packet)
+                    raise
+                if not settled:
+                    with self.lock:
+                        self.retiring.append(packet)
             available = None
             while True:
                 with self.lock:
-                    while self.pending and not self.pending[0].remaining:
+                    while self.pending and (self.pending[0].revoked or not self.pending[0].remaining):
                         self.pending.popleft()
                     if self.closed or not self.pending:
                         break
@@ -346,7 +496,8 @@ class CpuInputPrefetch:
                     # Native planes and NumPy lerp temporaries are live only while building.
                     size = self._size(packet) + int(view.src_h) * int(view.src_w) * 24
                     size += min(128, int(view.src_h)) * int(view.src_w) * 128
-                    if self.bytes + size > self.capacity_bytes:
+                    limit = self.capacity_bytes if self.reclaim_target is None else self.reclaim_target
+                    if self.bytes + size > limit:
                         break
                 if available is None:
                     available = max(0, int(self.headroom()))
@@ -354,9 +505,10 @@ class CpuInputPrefetch:
                 if available < size:
                     break
                 with self.lock:
-                    if self.closed or self.pending[0] is not packet or not packet.remaining:
+                    if self.closed or self.pending[0] is not packet or packet.revoked or not packet.remaining:
                         continue
-                    if self.bytes + size > self.capacity_bytes:
+                    limit = self.capacity_bytes if self.reclaim_target is None else self.reclaim_target
+                    if self.bytes + size > limit:
                         break
                     self.pending.popleft()
                     self.bytes += size
@@ -375,6 +527,10 @@ class CpuInputPrefetch:
                 with self.lock:
                     packet.future = future
                 future.add_done_callback(lambda done, packet=packet: self._done(packet, done))
+                # A reclaim request may have arrived while submit was outside the
+                # lock; revisit this newly published Future for cancellation.
+                if packet.revoked:
+                    self.pump()
             with self.lock:
                 if not self.pump_requested:
                     return
@@ -403,7 +559,7 @@ class CpuInputPrefetch:
         if not self.lock.acquire(blocking=False):
             return False
         try:
-            return not self.closed and packet.input_path is not None and not packet.retiring
+            return not self.closed and packet.input_path is not None and not packet.retiring and not packet.revoked
         finally:
             self.lock.release()
 
@@ -416,7 +572,9 @@ class CpuInputPrefetch:
             self._record('gpu_fallback_frames', int(task['slice_count']))
             return
         try:
-            if not self.closed and packet.input_path is not None and not packet.retiring:
+            if (not self.closed and packet.input_path is not None and not packet.retiring
+                    and not packet.revoked and int(task['task_id']) not in self.completed_task_ids):
+                packet.borrowers.add(int(task['task_id']))
                 task.update(cpu_input_path=packet.input_path, cpu_input_shape=packet.input_shape,
                     cpu_input_offset=int(task['slice_start']) - int(packet.task['slice_start']))
                 attached = True
@@ -433,9 +591,10 @@ class CpuInputPrefetch:
             packet = self._packet(task)
             if packet is None:
                 return
+            packet.borrowers.discard(task_id)
             packet.remaining.difference_update(range(int(task['slice_start']),
                 int(task['slice_start']) + int(task['slice_count'])))
-            if not packet.remaining and not packet.building:
+            if not packet.remaining and not packet.borrowers and not packet.building:
                 self._queue_retirement(packet)
         self.pump()
 
@@ -464,5 +623,7 @@ class CpuInputPrefetch:
             while any(packet.building for packet in self.packets):
                 self.condition.wait()
         for packet in self.packets:
-            self._close_packet(packet)
+            while not self._close_packet(packet):
+                with self.condition:
+                    self.condition.wait(timeout=.05)
         self._report()

@@ -85,6 +85,59 @@ def test_actual_retirement_and_restores_release_capacity_monotonically():
     assert ns['parent_transient_admission'].capacity == 78*GIB
 
 
+def test_busy_restore_admission_does_not_park_reclaim_and_later_drain_retries():
+    from XTA.tta_background import BackgroundDrainBudget
+    from tests.test_sam_parent_staging_budget import pipeline_drain
+
+    ns, run, _key = actual_reclaim()
+    pool = ns['parent_transient_admission']
+    scheduler = SimpleNamespace(process_inference_outstanding=lambda: False,
+        service_pending_compute_credits=lambda: None)
+    drain = pipeline_drain(None, BackgroundDrainBudget(lambda: None, stages=9),
+        scheduler, sam_context=ns['sam_context'])
+    drain.__globals__['_reclaim_drained_sam_dense_capacity'] = run
+    locked, release = threading.Event(), threading.Event()
+    progressed = threading.Event()
+    errors = []
+
+    def restoring_parent():
+        with pool.condition:
+            locked.set()
+            release.wait(10)
+
+    def scheduler_pass():
+        try:
+            drain()
+            # A scheduler must reach its next operation while restoration owns
+            # the admission condition, without changing any memory promises.
+            progressed.set()
+        except BaseException as error:
+            errors.append(error)
+            progressed.set()
+
+    restoring = threading.Thread(target=restoring_parent)
+    coordinator = threading.Thread(target=scheduler_pass)
+    restoring.start()
+    try:
+        assert locked.wait(5)
+        coordinator.start()
+        assert progressed.wait(2), 'optional reclamation blocked background scheduling'
+        assert not errors
+        assert ns['direct_union_total_dense_byte_limit'] == 64*GIB
+        assert pool.capacity == 32*GIB
+    finally:
+        release.set()
+        restoring.join(5)
+        if coordinator.ident is not None:
+            coordinator.join(5)
+    assert not restoring.is_alive() and not coordinator.is_alive()
+    drain()
+    assert ns['direct_union_total_dense_byte_limit'] == 16*GIB
+    assert ns['scheduler'].inputs.direct_union_total_dense_byte_limit == 16*GIB
+    assert pool.capacity == 80*GIB
+    assert pool.in_use == 0
+
+
 @pytest.mark.parametrize('reason',[
     'ineligible','detector_not_drained','assets_not_retired','pending_detector','inference_owner',
     'workspace_pending','ram_first','checkpoint','ready_parent','unsubmitted_parent',

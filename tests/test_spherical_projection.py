@@ -18,6 +18,7 @@ from XTA import spherical_projection as sp
 from tests.reference_backends import spherical as oracle
 from XTA.qsc import QSC_FACE_BASES
 from XTA.spherical_geometry import build_spherical_view_infos, cube_rotation
+from XTA.spherical_sampling import CERTIFICATE, coverage_error_bound, realized_gap
 
 
 def shells(*, shape=(7, 9, 11), size=5, minimum=.7, rotation=None):
@@ -106,7 +107,7 @@ class SphericalProjectionTests(unittest.TestCase):
                     union |= self.project(data, view)
                 delta = np.moveaxis(np.indices(shape), 0, -1) - (np.asarray(shape) - 1) / 2
                 radius = np.sqrt(np.sum(delta * delta, axis=-1))
-                expected = (radius >= minimum) & (radius <= views[0].spherical_max_radius)
+                expected = (radius >= minimum) & (radius <= max(v.spherical_max_radius for v in views))
                 with self.subTest(shape=shape, size=size, rotation=rotation):
                     np.testing.assert_array_equal(union, expected)
 
@@ -156,13 +157,21 @@ class SphericalProjectionTests(unittest.TestCase):
                                                                np.array([.5, 1.5, 2.5, 3.])),
                                       [0, 0, 1, 1, 2, 3])
         view = shells(shape=(7, 7, 7), size=11, minimum=.5)[0]
-        view = replace(view, spherical_radii=(.5, 1.5, 2.5, 3.))
-        data = np.zeros((4, 11, 11), np.uint8)
+        # This controlled reference lattice isolates midpoint ties from planner changes.
+        radii = (.5, 1.5, 2.5, 3.)
+        intervals = max(6, view.spherical_face_intervals)
+        origin = (intervals + 1 - view.src_w)//2
+        view = replace(view, spherical_radii=radii, num_slices=len(radii),
+            spherical_min_radius=radii[0], spherical_max_radius=radii[-1], spherical_step=max(np.diff(radii)),
+            spherical_face_intervals=intervals, spherical_u_origin=origin, spherical_v_origin=origin,
+            sampling_certificate=CERTIFICATE,
+            sampling_error_bound_sq=coverage_error_bound(radii[-1], intervals, realized_gap(radii)))
+        data = np.zeros((len(radii), view.src_h, view.src_w), np.uint8)
         data[0] = 1
         actual = self.project(data, view)
         self.assertEqual(actual[3, 3, 4], 1)
         self.assertEqual(actual[3, 3, 5], 0)
-        data[3] = 1
+        data[-1] = 1
         self.assertEqual(self.project(data, view)[3, 3, 6], 1)
 
     def test_bounding_boxes_preserve_sparse_masks_and_reject_invalid_metadata(self):

@@ -1198,6 +1198,7 @@ class _MainProcessGpuStageCoordinator:
     def snapshot(self) -> Dict[str, object]:
         with self._lock:
             return {
+                'sample_monotonic_ns': time.monotonic_ns(),
                 'worker_devices': sorted(self._worker_devices),
                 'retired_inference_devices': sorted(self._retired_inference_devices),
                 'inference_inflight': dict(self._inference_inflight),

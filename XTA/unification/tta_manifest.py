@@ -14,16 +14,17 @@ TTA_VOXEL_COUNT_SCHEMA = "xta.v18.voxel_count/1"
 
 
 def projection_sampling_record(view: Any) -> dict[str, Any]:
-    """Omit legacy defaults so dense raster-plan identities remain stable."""
-    policy = str(getattr(view, 'sampling_policy', 'dense'))
+    """Record resolved sampling certificates and conservative fallback reasons."""
+    policy = str(getattr(view, 'sampling_policy', 'coverage'))
     reason = str(getattr(view, 'sampling_reason', ''))
-    if policy == 'dense' and not reason:
+    certificate = str(getattr(view, 'sampling_certificate', ''))
+    if not reason and not certificate:
         return {}
     return {'projection_sampling': {
         'policy': policy,
-        'certificate': str(getattr(view, 'sampling_certificate', '')),
+        'certificate': certificate,
         'squared_error_bound': float(getattr(view, 'sampling_error_bound_sq', 0.0)),
-        'dense_reference_frames': int(getattr(view, 'sampling_reference_frames', 0)),
+        'legacy_reference_frames': int(getattr(view, 'sampling_reference_frames', 0)),
         'reference_scope': 'spherical_cube_group' if str(view.family) == 'spherical' else 'view_trajectory',
         'fallback_reason': reason,
         'coverage_basis': 'positive native intensity interpolation support; not categorical predictions',
@@ -144,7 +145,7 @@ def spherical_view_manifest_record(view: Any) -> dict[str, Any] | None:
         "projection": "quadrilateralized_spherical_cube_equal_area",
         "slice_direction": "radius",
         "input_axes": ["qsc_face_u", "qsc_face_v"],
-        "face_grid": "fixed_outer_radius_endpoint_inclusive_n_plus_one_samples",
+        "face_grid": "fixed_band_outer_radius_endpoint_inclusive_n_plus_one_samples",
         "face_boundary": "inclusive_shared_face_edges; outside_face_patch_padding_zero",
         "source_boundary": "zero_extended_trilinear_intensity; nearest_categorical_outside_zero",
         "channel_boundary": "clamp_radius_within_face_patch_trajectory",
@@ -152,7 +153,7 @@ def spherical_view_manifest_record(view: Any) -> dict[str, Any] | None:
         "rotation_convention": "row_major_xyz_matrix_rotates_cube_directions_about_source_center",
         "patch_is_tile": False,
         "tile_parent": "native_qsc_face_patch",
-        "coverage_domain": "minimum_radius_to_largest_inscribed_sphere; central_core_excluded",
+        "coverage_domain": "band_minimum_radius_to_band_maximum_radius; adjacent_bands_share_endpoint; central_core_excluded",
     }
 
 

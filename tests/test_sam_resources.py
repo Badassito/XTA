@@ -495,8 +495,7 @@ def test_context_live_resources_are_thread_local_and_keep_the_lease_through_sele
         source_volume=np.zeros((3, 6, 7), np.uint8), source_identity='immutable')
     view = geometry.get_view_infos(3, 6, 7, cartesian_views=('transverse',))[0]
     observed = np.zeros((3, 6, 7), np.uint8)
-    prepared = SimpleNamespace(runs=(), groups=(), tracker_jobs=(), needs_tracking=False,
-        planner_wall_seconds=0., snapshot_wall_seconds=0.)
+    prepared = sam_interpolation.prepare_sam_interpolation_pass(observed, view=view, scope='parent')
     pool = _ByteAdmissionPool(64*GIB, 'test')
     captured = {}
 
@@ -508,7 +507,7 @@ def test_context_live_resources_are_thread_local_and_keep_the_lease_through_sele
 
     try:
         with resources.admit_sam_parent_resources(pool, 4*GIB, 'parent', worker_count=4,
-                headroom_probe=lambda: 128*GIB) as profile:
+                base_allowance_bytes=4*GIB, headroom_probe=lambda: 128*GIB) as profile:
             with context.resource_scope(profile), \
                  mock.patch.object(sam_interpolation, 'prepare_sam_interpolation_pass', return_value=prepared) as plan, \
                  mock.patch.object(sam_interpolation, 'interpolate_sam_view_volume_pass', side_effect=execute):

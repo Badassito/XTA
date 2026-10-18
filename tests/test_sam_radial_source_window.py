@@ -129,10 +129,26 @@ def test_actual_job_height_band_and_late_arc_window_reduce_resident_bytes():
                                     radial_patch_size=2048)
     transverse = next(view for view in views if view.name == 'radial_transverse_patch_u3_h0')
     sagittal = next(view for view in views if view.name == 'radial_sagittal_patch_u3_h0')
-    a = radial_source_t_window(transverse, shape, shape[0], range(31))
-    b = radial_source_t_window(sagittal, shape, shape[0], range(sagittal.num_slices-31, sagittal.num_slices))
-    assert (a[1]-a[0])/shape[0] < .71
-    assert (b[1]-b[0])/shape[0] < .26
+    for view, frames in ((transverse, range(31)),
+            (sagittal, range(sagittal.num_slices-31, sagittal.num_slices))):
+        start, stop = radial_source_t_window(view, shape, shape[0], frames)
+        first, last = shape[0], 0
+        for frame in frames:
+            if view.radial_base_view == 'transverse':
+                coordinates = view.radial_height_origin + np.array([0, view.src_h-1])
+            else:
+                radius = view.radial_radii[frame]
+                angles = (view.radial_arc_origin + np.arange(view.src_w))/radius
+                coordinates = view.center_y + radius*np.sin(angles)
+            first = min(first, int(np.floor(coordinates).min()))
+            last = max(last, int(np.floor(coordinates).max())+2)
+        required = max(0, first), min(shape[0], last+1)
+        assert start <= required[0] < required[1] <= stop
+        # The two interpolation stages add at most ten outward guard rows.
+        maximum_rows = min(shape[0], required[1]-required[0]+10)
+        resident_bytes = (stop-start)*shape[1]*shape[2]
+        assert resident_bytes <= maximum_rows*shape[1]*shape[2]
+        assert resident_bytes < int(np.prod(shape))
 
 
 def test_partial_source_frame_binding_precedes_gpu_work():
@@ -166,7 +182,7 @@ def test_admission_and_upload_charge_resident_window_and_keep_global_geometry(mo
         gauge=lambda name, value: gauges.__setitem__(name, value))
     monkeypatch.setenv('YOLO_TTA_SAM_GPU_IMAGES', '1')
     monkeypatch.setattr('XTA.sam_resources.validate_live_sam_resource_profile',
-        lambda _profile: {'base_non_cpu_allowance_bytes': 2**30})
+        lambda _profile: {'base_other_non_cpu_allowance_bytes': 2**30})
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
     monkeypatch.setattr(cuda_backend, 'gpu_render_reserve_bytes', lambda: 1234)
     monkeypatch.setattr('XTA.runtime.runtime_telemetry', lambda: telemetry)

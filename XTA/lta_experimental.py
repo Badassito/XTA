@@ -9,6 +9,10 @@ from __future__ import annotations
 
 import math
 import operator
+import gc
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from time import perf_counter
 from typing import Any, Callable, Mapping
@@ -25,6 +29,81 @@ MASK_SEED_ANCHOR_IOU = 0.99
 MASK_SEED_EXACT_IOU = 0.999999
 MASK_SEED_MIN_EXCLUSIVE_FRACTION = 0.95
 _REMOVED_OBJECT_SCORE_LOGIT = -1e4
+
+# Fixed cardinality: no frame, object, crop, or session IDs become timer keys.
+SAM_SESSION_HOST_TIMING_STAGES = (
+    "session_init", "seed_prepare", "seed_feature_prepare", "seed_mask_injection",
+    "seed_mask_d2h", "propagation_preflight", "frame_feature_prepare",
+    "frame_propagation", "frame_score_d2h", "frame_mask_d2h", "frame_observation",
+    "prediction_callback", "raw_callback", "iterator_close", "close_session",
+    "close_session_gc", "anchor_diagnostics",
+)
+
+
+class _SessionHostTimings:
+    """Bounded host diagnostics; asynchronous CUDA work is never synchronized.
+
+    Seed substeps nest in seed_prepare; callbacks nest in frame_observation;
+    GC callbacks nest in close_session. Wall time includes host waits, while
+    thread CPU time covers only the calling thread. Neither is kernel time.
+    """
+
+    def __init__(self, *, wall_clock=None, cpu_clock=None):
+        self._wall = time.perf_counter if wall_clock is None else wall_clock
+        self._cpu = time.thread_time if cpu_clock is None else cpu_clock
+        self._stages = {name: dict(calls=0, host_seconds=0., thread_cpu_seconds=0.)
+                        for name in SAM_SESSION_HOST_TIMING_STAGES}
+
+    def start(self):
+        return self._wall(), self._cpu()
+
+    def finish(self, stage, started):
+        wall, cpu = self._wall(), self._cpu()
+        record = self._stages[stage]
+        record['calls'] += 1
+        record['host_seconds'] += max(0., wall-started[0])
+        record['thread_cpu_seconds'] += max(0., cpu-started[1])
+
+    @contextmanager
+    def measure(self, stage):
+        started = self.start()
+        try:
+            yield
+        finally:
+            self.finish(stage, started)
+
+    @contextmanager
+    def close_gc(self):
+        """Observe existing GC on this thread during close; never request GC."""
+        owner = threading.get_ident()
+        started = None
+
+        def observe(phase, _info):
+            nonlocal started
+            if threading.get_ident() != owner:
+                return
+            if phase == 'start':
+                started = self.start()
+            elif phase == 'stop' and started is not None:
+                self.finish('close_session_gc', started)
+                started = None
+
+        gc.callbacks.append(observe)
+        try:
+            yield
+        finally:
+            # Remove only our callback; retain all pre-existing callbacks.
+            if observe in gc.callbacks:
+                gc.callbacks.remove(observe)
+
+    def receipt(self):
+        return dict(schema='xta.sam_session_host_timings/1',
+            clocks='perf_counter_wall_and_calling_thread_cpu',
+            cuda_synchronized=False,
+            nested_stages=dict(seed_prepare=('seed_feature_prepare', 'seed_mask_injection', 'seed_mask_d2h'),
+                frame_observation=('prediction_callback', 'raw_callback'),
+                close_session=('close_session_gc',)),
+            stages={name: dict(record) for name, record in self._stages.items()})
 
 
 @dataclass(frozen=True)
@@ -315,14 +394,16 @@ def run_mask_seed_session(
             raise ValueError("raw observation object masks differ from resource geometry")
 
     local_prompt = int(prompt_frame) - int(session.frame_start)
+    host_timings = _SessionHostTimings()
     sdk_session_init_started = perf_counter()
-    started = measured.handle_request(
-        {
-            "type": "start_session",
-            "resource_path": resource,
-            "offload_video_to_cpu": True,
-        }
-    )
+    with host_timings.measure("session_init"):
+        started = measured.handle_request(
+            {
+                "type": "start_session",
+                "resource_path": resource,
+                "offload_video_to_cpu": True,
+            }
+        )
     sdk_session_init_seconds = perf_counter() - sdk_session_init_started
     if not isinstance(started, Mapping) or not str(started.get("session_id", "")).strip():
         raise RuntimeError("mask-seed start_session returned no session_id")
@@ -364,183 +445,188 @@ def run_mask_seed_session(
         if retain_predictions:
             predictions.append(prediction)
         if prediction_callback is not None:
-            prediction_callback(prediction)
+            with host_timings.measure("prediction_callback"):
+                prediction_callback(prediction)
             callback_prediction_count += 1
 
     try:
-        registry = getattr(raw_predictor, "_all_inference_states", None)
-        if not isinstance(registry, Mapping) or session_id not in registry:
-            raise RuntimeError("pinned predictor session registry is unavailable")
-        inference_state = registry[session_id]["state"]
-        model = raw_predictor.model
-        tracker = model.tracker
-        add_masks = getattr(tracker, "add_new_masks", None)
-        if not callable(add_masks):
-            raise RuntimeError("pinned multiplex tracker exposes no add_new_masks boundary")
-        if object_masks is None:
-            if seed is None:
-                raise ValueError("selected-mask seeding requires an object-creation point")
-            created = measured.handle_request(
-                {
-                    "type": "add_prompt",
-                    "session_id": session_id,
-                    "frame_index": local_prompt,
-                    "obj_id": 0,
-                    "points": [[seed.x, seed.y]],
-                    "point_labels": [1],
-                    "clear_old_points": True,
-                    "rel_coordinates": True,
-                }
-            )
-            if not isinstance(created, Mapping) or not isinstance(created.get("outputs"), Mapping):
-                raise RuntimeError("could not create the tracker object before mask seeding")
-            get_states = getattr(model, "_get_sam2_inference_states_by_obj_ids", None)
-            if not callable(get_states):
-                raise RuntimeError("pinned SAM 3.1 model exposes no SAM2 state lookup")
-            states = get_states(inference_state, [0])
-            if len(states) != 1:
-                raise RuntimeError(f"expected one SAM2 state for object 0; got {len(states)}")
-            tracker_state = states[0]
-            expected_ids = (0,)
-            mask_tensor = torch.from_numpy(np.asarray(ground_truth, dtype=np.float32))[None]
-            reconditioning = True
-        else:
-            if propagation_mode != "tracker-only":
-                raise ValueError(
-                    "multi-mask seeding is supported only by tracker-only propagation"
+        with host_timings.measure("seed_prepare"):
+            registry = getattr(raw_predictor, "_all_inference_states", None)
+            if not isinstance(registry, Mapping) or session_id not in registry:
+                raise RuntimeError("pinned predictor session registry is unavailable")
+            inference_state = registry[session_id]["state"]
+            model = raw_predictor.model
+            tracker = model.tracker
+            add_masks = getattr(tracker, "add_new_masks", None)
+            if not callable(add_masks):
+                raise RuntimeError("pinned multiplex tracker exposes no add_new_masks boundary")
+            if object_masks is None:
+                if seed is None:
+                    raise ValueError("selected-mask seeding requires an object-creation point")
+                created = measured.handle_request(
+                    {
+                        "type": "add_prompt",
+                        "session_id": session_id,
+                        "frame_index": local_prompt,
+                        "obj_id": 0,
+                        "points": [[seed.x, seed.y]],
+                        "point_labels": [1],
+                        "clear_old_points": True,
+                        "rel_coordinates": True,
+                    }
                 )
-            if not object_masks:
-                raise ValueError("multi-mask seeding requires at least one nonempty object mask")
-            initialize = getattr(model, "_init_new_sam2_state", None)
-            if not callable(initialize):
-                raise RuntimeError("pinned SAM model exposes no tracker-state initializer")
-            tracker_state = initialize(inference_state)
-            prepare_anchor = getattr(model, "_prepare_backbone_feats", None)
-            if not callable(prepare_anchor):
-                raise RuntimeError("pinned SAM model exposes no shared anchor feature bridge")
-            with torch.inference_mode():
-                prepare_tracker_frame_features(model, inference_state, local_prompt, reverse=False,
-                                               **feature_options)
-            expected_ids = tuple(range(len(object_masks)))
-            mask_tensor = torch.from_numpy(
-                np.stack([np.asarray(mask, dtype=np.float32) for mask in object_masks])
+                if not isinstance(created, Mapping) or not isinstance(created.get("outputs"), Mapping):
+                    raise RuntimeError("could not create the tracker object before mask seeding")
+                get_states = getattr(model, "_get_sam2_inference_states_by_obj_ids", None)
+                if not callable(get_states):
+                    raise RuntimeError("pinned SAM 3.1 model exposes no SAM2 state lookup")
+                states = get_states(inference_state, [0])
+                if len(states) != 1:
+                    raise RuntimeError(f"expected one SAM2 state for object 0; got {len(states)}")
+                tracker_state = states[0]
+                expected_ids = (0,)
+                mask_tensor = torch.from_numpy(np.asarray(ground_truth, dtype=np.float32))[None]
+                reconditioning = True
+            else:
+                if propagation_mode != "tracker-only":
+                    raise ValueError(
+                        "multi-mask seeding is supported only by tracker-only propagation"
+                    )
+                if not object_masks:
+                    raise ValueError("multi-mask seeding requires at least one nonempty object mask")
+                initialize = getattr(model, "_init_new_sam2_state", None)
+                if not callable(initialize):
+                    raise RuntimeError("pinned SAM model exposes no tracker-state initializer")
+                tracker_state = initialize(inference_state)
+                prepare_anchor = getattr(model, "_prepare_backbone_feats", None)
+                if not callable(prepare_anchor):
+                    raise RuntimeError("pinned SAM model exposes no shared anchor feature bridge")
+                with torch.inference_mode():
+                    with host_timings.measure("seed_feature_prepare"):
+                        prepare_tracker_frame_features(model, inference_state, local_prompt, reverse=False,
+                                                       **feature_options)
+                expected_ids = tuple(range(len(object_masks)))
+                mask_tensor = torch.from_numpy(
+                    np.stack([np.asarray(mask, dtype=np.float32) for mask in object_masks])
+                )
+                reconditioning = False
+            with host_timings.measure("seed_mask_injection"):
+                _frame, object_ids, _low_res, video_masks = add_masks(
+                    tracker_state,
+                    frame_idx=local_prompt,
+                    obj_ids=list(expected_ids),
+                    masks=mask_tensor,
+                    reconditioning=reconditioning,
+                )
+            if (
+                int(_frame) != local_prompt
+                or tuple(int(value) for value in object_ids) != expected_ids
+            ):
+                raise RuntimeError("private mask seed returned an unexpected object/frame")
+            if video_masks is None or len(video_masks) < len(expected_ids):
+                raise RuntimeError("private mask seed returned no anchor mask")
+            seeded_masks = (video_masks[: len(expected_ids)] > 0).to(torch.bool)
+            expected_seed_masks = (
+                (np.asarray(ground_truth, dtype=bool),)
+                if object_masks is None
+                else tuple(np.asarray(mask, dtype=bool) for mask in object_masks)
             )
-            reconditioning = False
-        _frame, object_ids, _low_res, video_masks = add_masks(
-            tracker_state,
-            frame_idx=local_prompt,
-            obj_ids=list(expected_ids),
-            masks=mask_tensor,
-            reconditioning=reconditioning,
-        )
-        if (
-            int(_frame) != local_prompt
-            or tuple(int(value) for value in object_ids) != expected_ids
-        ):
-            raise RuntimeError("private mask seed returned an unexpected object/frame")
-        if video_masks is None or len(video_masks) < len(expected_ids):
-            raise RuntimeError("private mask seed returned no anchor mask")
-        seeded_masks = (video_masks[: len(expected_ids)] > 0).to(torch.bool)
-        expected_seed_masks = (
-            (np.asarray(ground_truth, dtype=bool),)
-            if object_masks is None
-            else tuple(np.asarray(mask, dtype=bool) for mask in object_masks)
-        )
-        empty_expected_ids = tuple(
-            expected_ids[index]
-            for index, expected_mask in enumerate(expected_seed_masks)
-            if not bool(expected_mask.any())
-        )
-        if empty_expected_ids:
-            raise ValueError(
-                "mask seeding requires every expected object mask to contain "
-                f"foreground; empty object ids={empty_expected_ids}"
+            empty_expected_ids = tuple(
+                expected_ids[index]
+                for index, expected_mask in enumerate(expected_seed_masks)
+                if not bool(expected_mask.any())
             )
-        seeded_arrays = _binary_mask_batch_to_host(
-            seeded_masks, expected_count=len(expected_ids),
-        )
-        seed_object_metrics = tuple(
-            mask_metrics(expected_mask, seeded_array)
-            for expected_mask, seeded_array in zip(expected_seed_masks, seeded_arrays)
-        )
-        changed = [
-            index
-            for index, metrics in enumerate(seed_object_metrics)
-            if float(metrics["iou"]) < MASK_SEED_EXACT_IOU
-        ]
-        if roundtrip_policy == "overlap-aware" and len(expected_seed_masks) > 1:
-            stacked_expected = np.stack(expected_seed_masks, axis=0)
-            coverage_count = stacked_expected.sum(axis=0)
-            seed_shared_domain = coverage_count > 1
-            roundtrip_expected_masks = tuple(
-                expected & (coverage_count == 1) for expected in expected_seed_masks
+            if empty_expected_ids:
+                raise ValueError(
+                    "mask seeding requires every expected object mask to contain "
+                    f"foreground; empty object ids={empty_expected_ids}"
+                )
+            with host_timings.measure("seed_mask_d2h"):
+                seeded_arrays = _binary_mask_batch_to_host(
+                    seeded_masks, expected_count=len(expected_ids),
+                )
+            seed_object_metrics = tuple(
+                mask_metrics(expected_mask, seeded_array)
+                for expected_mask, seeded_array in zip(expected_seed_masks, seeded_arrays)
             )
-        else:
-            seed_shared_domain = np.zeros_like(expected_seed_masks[0], dtype=bool)
-            roundtrip_expected_masks = expected_seed_masks
-        seed_object_shared_domains = tuple(
-            expected & seed_shared_domain for expected in expected_seed_masks
-        )
-        seed_roundtrip_object_audit = tuple(
-            {
-                "object_id": expected_ids[index],
-                "expected_pixels": int(np.count_nonzero(expected)),
-                "shared_pixels": int(np.count_nonzero(expected & ~representable)),
-                "exclusive_pixels": int(np.count_nonzero(representable)),
-                "exclusive_fraction": float(
-                    np.count_nonzero(representable) / np.count_nonzero(expected)
-                ),
-                "raw_metrics": seed_object_metrics[index],
-                "comparison_metrics": mask_metrics(representable, actual),
-                "exact_comparison_match": bool(np.array_equal(representable, actual)),
-            }
-            for index, (expected, representable, actual) in enumerate(
-                zip(expected_seed_masks, roundtrip_expected_masks, seeded_arrays)
+            changed = [
+                index
+                for index, metrics in enumerate(seed_object_metrics)
+                if float(metrics["iou"]) < MASK_SEED_EXACT_IOU
+            ]
+            if roundtrip_policy == "overlap-aware" and len(expected_seed_masks) > 1:
+                stacked_expected = np.stack(expected_seed_masks, axis=0)
+                coverage_count = stacked_expected.sum(axis=0)
+                seed_shared_domain = coverage_count > 1
+                roundtrip_expected_masks = tuple(
+                    expected & (coverage_count == 1) for expected in expected_seed_masks
+                )
+            else:
+                seed_shared_domain = np.zeros_like(expected_seed_masks[0], dtype=bool)
+                roundtrip_expected_masks = expected_seed_masks
+            seed_object_shared_domains = tuple(
+                expected & seed_shared_domain for expected in expected_seed_masks
             )
-        )
-        insufficient_exclusive = [
-            audit
-            for audit in seed_roundtrip_object_audit
-            if int(audit["exclusive_pixels"]) < 1
-            or float(audit["exclusive_fraction"])
-            < MASK_SEED_MIN_EXCLUSIVE_FRACTION
-        ]
-        if insufficient_exclusive:
-            raise RuntimeError(
-                "overlapping session seed masks leave insufficient exclusive support "
-                f"for stable object identity (minimum fraction "
-                f"{MASK_SEED_MIN_EXCLUSIVE_FRACTION}); run conflicting lineages "
-                f"in separate tracker sessions: {insufficient_exclusive}"
+            seed_roundtrip_object_audit = tuple(
+                {
+                    "object_id": expected_ids[index],
+                    "expected_pixels": int(np.count_nonzero(expected)),
+                    "shared_pixels": int(np.count_nonzero(expected & ~representable)),
+                    "exclusive_pixels": int(np.count_nonzero(representable)),
+                    "exclusive_fraction": float(
+                        np.count_nonzero(representable) / np.count_nonzero(expected)
+                    ),
+                    "raw_metrics": seed_object_metrics[index],
+                    "comparison_metrics": mask_metrics(representable, actual),
+                    "exact_comparison_match": bool(np.array_equal(representable, actual)),
+                }
+                for index, (expected, representable, actual) in enumerate(
+                    zip(expected_seed_masks, roundtrip_expected_masks, seeded_arrays)
+                )
             )
-        failed_roundtrip = [
-            audit
-            for audit in seed_roundtrip_object_audit
-            if not bool(audit["exact_comparison_match"])
-        ]
-        if failed_roundtrip:
-            raise RuntimeError(
-                "private mask seed materially changed object mask(s) outside the "
-                f"pinned overlap-suppression contract: {failed_roundtrip}"
+            insufficient_exclusive = [
+                audit
+                for audit in seed_roundtrip_object_audit
+                if int(audit["exclusive_pixels"]) < 1
+                or float(audit["exclusive_fraction"])
+                < MASK_SEED_MIN_EXCLUSIVE_FRACTION
+            ]
+            if insufficient_exclusive:
+                raise RuntimeError(
+                    "overlapping session seed masks leave insufficient exclusive support "
+                    f"for stable object identity (minimum fraction "
+                    f"{MASK_SEED_MIN_EXCLUSIVE_FRACTION}); run conflicting lineages "
+                    f"in separate tracker sessions: {insufficient_exclusive}"
+                )
+            failed_roundtrip = [
+                audit
+                for audit in seed_roundtrip_object_audit
+                if not bool(audit["exact_comparison_match"])
+            ]
+            if failed_roundtrip:
+                raise RuntimeError(
+                    "private mask seed materially changed object mask(s) outside the "
+                    f"pinned overlap-suppression contract: {failed_roundtrip}"
+                )
+            seeded_mask = seeded_masks.any(dim=0)
+            seeded_np = np.logical_or.reduce(seeded_arrays)
+            seed_metrics = mask_metrics(ground_truth, seeded_np)
+            roundtrip_expected_union = np.logical_or.reduce(roundtrip_expected_masks)
+            seed_roundtrip_union_metrics = mask_metrics(
+                roundtrip_expected_union,
+                seeded_np,
             )
-        seeded_mask = seeded_masks.any(dim=0)
-        seeded_np = np.logical_or.reduce(seeded_arrays)
-        seed_metrics = mask_metrics(ground_truth, seeded_np)
-        roundtrip_expected_union = np.logical_or.reduce(roundtrip_expected_masks)
-        seed_roundtrip_union_metrics = mask_metrics(
-            roundtrip_expected_union,
-            seeded_np,
-        )
-        if not bool(np.array_equal(roundtrip_expected_union, seeded_np)):
-            raise RuntimeError(
-                "private mask seed materially changed the representable anchor union "
-                f"outside the pinned overlap-suppression contract: "
-                f"{seed_roundtrip_union_metrics}"
-            )
-        if object_masks is None:
-            cache = getattr(model, "_cache_frame_outputs", None)
-            if not callable(cache):
-                raise RuntimeError("pinned SAM model exposes no frame-cache boundary")
-            cache(inference_state, local_prompt, {0: seeded_mask})
+            if not bool(np.array_equal(roundtrip_expected_union, seeded_np)):
+                raise RuntimeError(
+                    "private mask seed materially changed the representable anchor union "
+                    f"outside the pinned overlap-suppression contract: "
+                    f"{seed_roundtrip_union_metrics}"
+                )
+            if object_masks is None:
+                cache = getattr(model, "_cache_frame_outputs", None)
+                if not callable(cache):
+                    raise RuntimeError("pinned SAM model exposes no frame-cache boundary")
+                cache(inference_state, local_prompt, {0: seeded_mask})
 
         if propagation_mode == "merged":
             stream = measured.handle_stream_request(
@@ -585,7 +671,8 @@ def run_mask_seed_session(
             propagate = getattr(tracker, "propagate_in_video", None)
             if not callable(preflight) or not callable(propagate):
                 raise RuntimeError("pinned tracker exposes no direct propagation boundary")
-            preflight(tracker_state, run_mem_encoder=True)
+            with host_timings.measure("propagation_preflight"):
+                preflight(tracker_state, run_mem_encoder=True)
             prepare_features = getattr(model, "_prepare_backbone_feats", None)
             if not callable(prepare_features):
                 raise RuntimeError("pinned SAM model exposes no shared feature bridge")
@@ -614,25 +701,27 @@ def run_mask_seed_session(
                 empty_streak_start = None
                 for requested_frame in order:
                     with torch.inference_mode():
-                        prepare_tracker_frame_features(
-                            model, inference_state, requested_frame, reverse=reverse,
-                            **feature_options,
-                        )
+                        with host_timings.measure("frame_feature_prepare"):
+                            prepare_tracker_frame_features(
+                                model, inference_state, requested_frame, reverse=reverse,
+                                **feature_options,
+                            )
                         feature = inference_state["feature_cache"].get(requested_frame)
                         if feature is None:
                             raise RuntimeError(
                                 f"shared SAM feature was not cached for frame {requested_frame}"
                             )
                         tracker_state["cached_features"] = {requested_frame: feature}
-                        one_frame = propagate(
-                            tracker_state,
-                            start_frame_idx=requested_frame,
-                            max_frame_num_to_track=0,
-                            reverse=reverse,
-                            tqdm_disable=True,
-                            run_mem_encoder=True,
-                        )
-                        outputs = tuple(one_frame)
+                        with host_timings.measure("frame_propagation"):
+                            one_frame = propagate(
+                                tracker_state,
+                                start_frame_idx=requested_frame,
+                                max_frame_num_to_track=0,
+                                reverse=reverse,
+                                tqdm_disable=True,
+                                run_mem_encoder=True,
+                            )
+                            outputs = tuple(one_frame)
                     if len(outputs) != 1:
                         raise RuntimeError(
                             f"tracker-only one-frame bridge returned {len(outputs)} frames"
@@ -654,71 +743,75 @@ def run_mask_seed_session(
                             "tracker-only propagation returned "
                             f"ids={ids}, masks={getattr(video_masks, 'shape', None)}"
                         )
-                    tracker_scores = _sigmoid_tracker_score_logits(
-                        _scores,
-                        expected_count=len(expected_ids),
-                        torch_module=torch,
-                    )
-                    frame_masks = _binary_mask_batch_to_host(
-                        video_masks, expected_count=len(expected_ids),
-                    )
-                    removed_ids = tuple(
-                        object_id
-                        for object_id, tracker_score in zip(expected_ids, tracker_scores)
-                        if tracker_score is None
-                    )
-                    if removed_ids:
-                        removed_object_observations.append(
-                            {
-                                "frame_index": int(session.frame_start) + local_frame,
-                                "object_ids": removed_ids,
-                                "source_value": float(_REMOVED_OBJECT_SCORE_LOGIT),
-                                "disposition": "filtered_bookkeeping_state",
-                            }
+                    with host_timings.measure("frame_score_d2h"):
+                        tracker_scores = _sigmoid_tracker_score_logits(
+                            _scores,
+                            expected_count=len(expected_ids),
+                            torch_module=torch,
                         )
-                    for object_id, binary, tracker_score in zip(
-                        expected_ids, frame_masks, tracker_scores
-                    ):
-                        if raw_requested:
-                            if tuple(binary.shape) != raw_shape:
-                                raise RuntimeError(
-                                    f"raw tracker mask geometry {binary.shape} != {raw_shape}"
+                    with host_timings.measure("frame_mask_d2h"):
+                        frame_masks = _binary_mask_batch_to_host(
+                            video_masks, expected_count=len(expected_ids),
+                        )
+                    with host_timings.measure("frame_observation"):
+                        removed_ids = tuple(
+                            object_id
+                            for object_id, tracker_score in zip(expected_ids, tracker_scores)
+                            if tracker_score is None
+                        )
+                        if removed_ids:
+                            removed_object_observations.append(
+                                {
+                                    "frame_index": int(session.frame_start) + local_frame,
+                                    "object_ids": removed_ids,
+                                    "source_value": float(_REMOVED_OBJECT_SCORE_LOGIT),
+                                    "disposition": "filtered_bookkeeping_state",
+                                }
+                            )
+                        for object_id, binary, tracker_score in zip(
+                            expected_ids, frame_masks, tracker_scores
+                        ):
+                            if raw_requested:
+                                if tuple(binary.shape) != raw_shape:
+                                    raise RuntimeError(
+                                        f"raw tracker mask geometry {binary.shape} != {raw_shape}"
+                                    )
+                                # The published LTA path owns a separate array so a
+                                # consumer cannot alter its integrity diagnostics.
+                                raw_binary = binary.copy()
+                                raw_binary.setflags(write=False)
+                                observation = SamRawFrameObservation(
+                                    sequence_id=str(session.sequence_id),
+                                    session_index=int(session.session_index),
+                                    frame_index=int(session.frame_start) + local_frame,
+                                    object_id=int(object_id),
+                                    binary_mask=raw_binary,
+                                    frame_tracker_score=tracker_score,
+                                    status=("removed" if tracker_score is None else "observed"),
                                 )
-                            # The published LTA path owns a separate array so a
-                            # consumer cannot alter its integrity diagnostics.
-                            raw_binary = binary.copy()
-                            raw_binary.setflags(write=False)
-                            observation = SamRawFrameObservation(
-                                sequence_id=str(session.sequence_id),
-                                session_index=int(session.session_index),
-                                frame_index=int(session.frame_start) + local_frame,
-                                object_id=int(object_id),
-                                binary_mask=raw_binary,
-                                frame_tracker_score=tracker_score,
-                                status=("removed" if tracker_score is None else "observed"),
+                                raw_observation_count += 1
+                                if retain_raw_observations:
+                                    raw_observations.append(observation)
+                                if raw_observation_callback is not None:
+                                    with host_timings.measure("raw_callback"):
+                                        raw_observation_callback(observation)
+                                    raw_callback_count += 1
+                            if tracker_score is None:
+                                continue
+                            if tracker_score < confidence_threshold:
+                                below_confidence_observation_count += 1
+                                continue
+                            publish_prediction(
+                                SamFramePrediction(
+                                    sequence_id=str(session.sequence_id),
+                                    session_index=int(session.session_index),
+                                    frame_index=int(session.frame_start) + local_frame,
+                                    object_id=object_id,
+                                    initial_detection_score=1.0,
+                                    frame_tracker_score=tracker_score,
+                                    binary_mask=binary,
+                                )
                             )
-                            raw_observation_count += 1
-                            if retain_raw_observations:
-                                raw_observations.append(observation)
-                            if raw_observation_callback is not None:
-                                raw_observation_callback(observation)
-                                raw_callback_count += 1
-                        if tracker_score is None:
-                            continue
-                        if tracker_score < confidence_threshold:
-                            below_confidence_observation_count += 1
-                            continue
-                        publish_prediction(
-                            SamFramePrediction(
-                                sequence_id=str(session.sequence_id),
-                                session_index=int(session.session_index),
-                                frame_index=int(session.frame_start) + local_frame,
-                                object_id=object_id,
-                                initial_detection_score=1.0,
-                                frame_tracker_score=tracker_score,
-                                binary_mask=binary,
-                            )
-                        )
                     # The authoritative prompt is visited in the forward leg so
                     # its identity can be audited, but it never contributes to
                     # an empty-propagation streak.
@@ -820,12 +913,14 @@ def run_mask_seed_session(
         iterator_settled = True if stream is None else None
         if callable(close_stream):
             try:
-                close_stream()
+                with host_timings.measure("iterator_close"):
+                    close_stream()
                 iterator_settled = True
             except Exception as exc:
                 cleanup_errors.append(("propagation iterator", exc))
         try:
-            close_response = measured.handle_request({"type": "close_session", "session_id": session_id})
+            with host_timings.measure("close_session"), host_timings.close_gc():
+                close_response = measured.handle_request({"type": "close_session", "session_id": session_id})
             close_completed = True
         except Exception as exc:
             cleanup_errors.append(("close_session", exc))
@@ -886,58 +981,60 @@ def run_mask_seed_session(
                     )
             raise cleanup_error
 
-    anchor_iou = None
-    anchor_object_metrics = None
-    anchor_integrity_object_metrics = None
-    anchor_integrity_union_metrics = None
-    anchor_ids = tuple(sorted(anchor_masks_by_object))
-    if anchor_ids == expected_ids:
-        anchor_masks = tuple(
-            anchor_masks_by_object[object_id] for object_id in expected_ids
-        )
-        anchor_union = np.logical_or.reduce(anchor_masks)
-        anchor_iou = mask_metrics(ground_truth, anchor_union)["iou"]
-        anchor_object_metrics = tuple(
-            mask_metrics(expected_mask, actual_mask)
-            for expected_mask, actual_mask in zip(expected_seed_masks, anchor_masks)
-        )
-        anchor_integrity_masks = tuple(
-            np.asarray(actual_mask, dtype=bool) & ~object_shared_domain
-            for actual_mask, object_shared_domain in zip(
-                anchor_masks,
-                seed_object_shared_domains,
+    with host_timings.measure("anchor_diagnostics"):
+        anchor_iou = None
+        anchor_object_metrics = None
+        anchor_integrity_object_metrics = None
+        anchor_integrity_union_metrics = None
+        anchor_ids = tuple(sorted(anchor_masks_by_object))
+        if anchor_ids == expected_ids:
+            anchor_masks = tuple(
+                anchor_masks_by_object[object_id] for object_id in expected_ids
+            )
+            anchor_union = np.logical_or.reduce(anchor_masks)
+            anchor_iou = mask_metrics(ground_truth, anchor_union)["iou"]
+            anchor_object_metrics = tuple(
+                mask_metrics(expected_mask, actual_mask)
+                for expected_mask, actual_mask in zip(expected_seed_masks, anchor_masks)
+            )
+            anchor_integrity_masks = tuple(
+                np.asarray(actual_mask, dtype=bool) & ~object_shared_domain
+                for actual_mask, object_shared_domain in zip(
+                    anchor_masks,
+                    seed_object_shared_domains,
+                )
+            )
+            anchor_integrity_object_metrics = tuple(
+                mask_metrics(expected_mask, actual_mask)
+                for expected_mask, actual_mask in zip(
+                    roundtrip_expected_masks,
+                    anchor_integrity_masks,
+                )
+            )
+            anchor_integrity_union_metrics = mask_metrics(
+                np.logical_or.reduce(roundtrip_expected_masks),
+                np.logical_or.reduce(anchor_integrity_masks),
+            )
+        passed = (
+            anchor_integrity_union_metrics is not None
+            and float(anchor_integrity_union_metrics["iou"]) >= MASK_SEED_ANCHOR_IOU
+            and anchor_integrity_object_metrics is not None
+            and all(
+                float(metrics["iou"]) >= MASK_SEED_ANCHOR_IOU
+                for metrics in anchor_integrity_object_metrics
             )
         )
-        anchor_integrity_object_metrics = tuple(
-            mask_metrics(expected_mask, actual_mask)
-            for expected_mask, actual_mask in zip(
-                roundtrip_expected_masks,
-                anchor_integrity_masks,
-            )
+        active_frames = sorted(active_frame_values)
+        non_anchor_active_frames = [
+            frame_index for frame_index in active_frames if frame_index != int(prompt_frame)
+        ]
+        anchor_integrity_passed = bool(passed)
+        diagnostic_propagation_gate_passed = bool(
+            anchor_integrity_passed and non_anchor_active_frames
         )
-        anchor_integrity_union_metrics = mask_metrics(
-            np.logical_or.reduce(roundtrip_expected_masks),
-            np.logical_or.reduce(anchor_integrity_masks),
-        )
-    passed = (
-        anchor_integrity_union_metrics is not None
-        and float(anchor_integrity_union_metrics["iou"]) >= MASK_SEED_ANCHOR_IOU
-        and anchor_integrity_object_metrics is not None
-        and all(
-            float(metrics["iou"]) >= MASK_SEED_ANCHOR_IOU
-            for metrics in anchor_integrity_object_metrics
-        )
-    )
-    active_frames = sorted(active_frame_values)
-    non_anchor_active_frames = [
-        frame_index for frame_index in active_frames if frame_index != int(prompt_frame)
-    ]
-    anchor_integrity_passed = bool(passed)
-    diagnostic_propagation_gate_passed = bool(
-        anchor_integrity_passed and non_anchor_active_frames
-    )
     return {
         "session_retirement": session_retirement,
+        "session_host_timings": host_timings.receipt(),
         # Includes SDK input loading and session-state allocation, not pure CPU or H2D time.
         "sdk_session_init_seconds": sdk_session_init_seconds,
         "strategy": "private_mask_seed" if object_masks is None else "private_multi_mask_seed",

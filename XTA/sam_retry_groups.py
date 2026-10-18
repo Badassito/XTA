@@ -121,6 +121,8 @@ def execute_retry_groups(group_ids, run_group, *, parent_profile, context, runti
     the frozen source only after fresh rights and Context source ownership are
     established. If none of the bounded requests can acquire those rights,
     the original owner advances one group using its existing serial profile.
+    A settled decline can also use that owner while accepted siblings run,
+    within the same group bound and after the original tracker scope retires.
     """
     from .sam_resources import prepare_retry_child_resources
     ids = tuple(group_ids)
@@ -138,8 +140,67 @@ def execute_retry_groups(group_ids, run_group, *, parent_profile, context, runti
     pending, owned, deferred, results = {}, [], set(), {}
     next_ordinal = 0
     refill_slots = capacity
+    error_lock, first_error, cancellation_sent = threading.Lock(), [None], [False]
     stats = dict(mode='parallel_unlimited', capacity=capacity, child_groups=0,
-        serial_fallback_groups=0, resource_declines=0, controller_declines=0, peak_pending_groups=0)
+        serial_fallback_groups=0, parent_inline_overlap_groups=0,
+        resource_declines=0, controller_declines=0, peak_pending_groups=0)
+
+    def remember_error(error):
+        with error_lock:
+            if first_error[0] is None:
+                first_error[0] = error
+                return error, True
+            return first_error[0], False
+
+    def check_child_error():
+        with error_lock:
+            error = first_error[0]
+        if error is not None:
+            raise error
+
+    def cancel_owner(error):
+        with error_lock:
+            if cancellation_sent[0]:
+                return
+            cancellation_sent[0] = True
+        # These cancellation hooks set flags and wake waiters; they never join
+        # the child whose Future is invoking this callback. Keep the original
+        # failure before waking an inline parent with a cancellation exception.
+        live = owner_ref()
+        if live is not None:
+            try:
+                live.context.cancel('SAM independent retry group failed')
+            except BaseException as cancellation_error:
+                if callable(getattr(error,'add_note',None)):
+                    error.add_note('SAM retry cancellation also failed: '+str(cancellation_error))
+                try:
+                    live.runtime.cancel('SAM independent retry group failed')
+                except BaseException:
+                    pass
+
+    def child_done(future, request_ref):
+        try:
+            error = future.exception()
+        except BaseException as cancelled:
+            error = cancelled
+        request = request_ref()
+        if error is None and request is not None and not request.settled:
+            error = RuntimeError('SAM retry child returned without retiring its actual resource owners')
+        if error is None:
+            return
+        _primary, first = remember_error(error)
+        if first:
+            cancel_owner(error)
+
+    def parent_wave_available():
+        condition = parent_profile._lease.pool.condition
+        if not condition.acquire(blocking=False):
+            return False
+        try:
+            parent_profile._validate_owner()
+            return parent_profile._lease.tracker_scope_identity is None
+        finally:
+            condition.release()
 
     def submit(ordinal):
         # A queued controller would park the funded owner behind unrelated GPU work.
@@ -162,6 +223,7 @@ def execute_retry_groups(group_ids, run_group, *, parent_profile, context, runti
         future = pool.submit(_child,request,owner_ref,ordinal,ids[ordinal],parent_scope,ordinals[ordinal],permit)
         item['future'] = future
         future.add_done_callback(lambda _future: permit.release())
+        future.add_done_callback(lambda done, request_ref=weakref.ref(request):child_done(done,request_ref))
         pending[future] = item
         stats['peak_pending_groups'] = max(stats['peak_pending_groups'],len(pending))
         return True
@@ -212,6 +274,7 @@ def execute_retry_groups(group_ids, run_group, *, parent_profile, context, runti
 
     try:
         while len(results)<len(ids):
+            check_child_error()
             if context._cancel.is_set() or getattr(runtime,'_cancel',context._cancel).is_set():
                 raise RuntimeError('SAM independent retry groups cancelled')
             current_capacity = min(limit, len(getattr(runtime, 'worker_slots', ())))
@@ -220,6 +283,7 @@ def execute_retry_groups(group_ids, run_group, *, parent_profile, context, runti
             capacity = current_capacity
             stats['capacity'] = max(stats['capacity'], capacity)
             while refill_slots and len(pending)<capacity and (deferred or next_ordinal<len(ids)):
+                check_child_error()
                 if deferred:
                     ordinal = min(deferred)
                     deferred.remove(ordinal)
@@ -258,10 +322,22 @@ def execute_retry_groups(group_ids, run_group, *, parent_profile, context, runti
                 else:
                     deferred.add(ordinal)
                     stats['resource_declines'] += 1
-            # A decline is not a reason to exhaust the full group inventory
-            # while funded siblings run. Refill on successful credit return.
+            # Only already-declined ordinals may use the funded original owner.
+            # A resource decline reached this set after its request and source
+            # hold settled above; a controller decline was never submitted.
+            # Leave untouched inventory to the ordinary bounded child refill.
             if successes:
                 refill_slots = capacity-len(pending)
+            if pending and deferred and len(pending)<capacity and parent_wave_available():
+                check_child_error()
+                if context._cancel.is_set() or getattr(runtime,'_cancel',context._cancel).is_set():
+                    raise RuntimeError('SAM independent retry groups cancelled')
+                ordinal = min(deferred)
+                deferred.remove(ordinal)
+                results[ordinal] = owner.execute(ordinal,parent_profile,ids[ordinal],child=False)
+                stats['serial_fallback_groups'] += 1
+                stats['parent_inline_overlap_groups'] += 1
+                continue
             if done and not successes and pending:
                 continue
             if not pending and deferred and not refill_slots:
@@ -275,20 +351,17 @@ def execute_retry_groups(group_ids, run_group, *, parent_profile, context, runti
         run_group = None
         return tuple(results[index] for index in range(len(ids))),stats
     except BaseException as error:
-        error._sam_retry_group_execution = dict(stats)
+        primary, _first = remember_error(error)
+        primary._sam_retry_group_execution = dict(stats)
         try:
-            context.cancel('SAM independent retry group failed')
-        except BaseException as cancellation_error:
-            if callable(getattr(error,'add_note',None)):
-                error.add_note('SAM retry cancellation also failed: '+str(cancellation_error))
-            try:
-                runtime.cancel('SAM independent retry group failed')
-            except BaseException:
-                pass
+            cancel_owner(primary)
         finally:
             cleanup()
             owner.run = None
             run_group = None
         from .sam_tracker_runtime import _clear_producer_error_frames
         _clear_producer_error_frames(error)
+        if primary is not error:
+            _clear_producer_error_frames(primary)
+            raise primary
         raise

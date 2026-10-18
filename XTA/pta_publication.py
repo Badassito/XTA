@@ -35,6 +35,7 @@ from .pta_augmentation import (
 from .pta_dataset import AUGMENTATION_TAG_LENGTH, OutputCandidate, WarningSink
 from .pta_binary import candidate_binary_output_path, write_binary_mask
 from .render_batch import RenderBatch as CanonicalRenderBatch, RenderBatchItem
+from .runtime import runtime_telemetry_phase
 from .unification.contracts import DataRole, FrameAddress, RasterPlan, RenderItem
 
 
@@ -354,6 +355,7 @@ def _write_nvjpeg_batch_atomically(
     _publish_nvjpeg_batch_atomically(batch)
 
 
+@runtime_telemetry_phase('pta.publish.verify_images')
 def verify_published_image_tree(
     out_dir: Path,
     *,

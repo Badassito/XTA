@@ -55,7 +55,8 @@ def test_dispatch_before_contract_preamble_preserves_every_mask_and_group(
         extra = replace(prepared.groups[0], group_id='untracked-unresolved',
                         status='unresolved', reasons=('controlled-untracked',))
         if operation == 'interpolation':
-            extra = replace(extra, contract_recipe=None)
+            extra = replace(extra, contract_recipe=None, crop_contract={**extra.crop_contract,
+                'selection_priority': (1, extra.group_id)})
         prepared = replace(prepared, plan=replace(prepared.plan, groups=prepared.groups+(extra,)))
         if mode == 'tiled':
             assert any(not tile.attempted for tiles in prepared.tile_inventory.values() for tile in tiles)

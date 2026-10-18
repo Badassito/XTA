@@ -64,8 +64,12 @@ def test_cuda_radial_gap_and_exact_midpoints_survive_packed_roi():
     unions=[np.zeros(output,np.uint8)for _ in range(3)]
     trajectories=build_spherical_view_infos(*work,targets=('transverse',),min_radius=1.,patch_size=8,tilted_views=())
     for view in trajectories:
-        source=np.zeros((view.num_slices,2,3),np.uint8);source[1]=1
-        boxes=np.zeros((view.num_slices,4),np.int64);boxes[1]=(0,2,0,3)
+        source=np.zeros((view.num_slices,2,3),np.uint8)
+        boxes=np.zeros((view.num_slices,4),np.int64)
+        if 2. in view.spherical_radii:
+            active=view.spherical_radii.index(2.)
+            source[active]=1
+            boxes[active]=(0,2,0,3)
         for union,result in zip(unions,gpu_forms(source,view,output,boxes)):union|=result
     squared,denominator=exact_squared_radius(work,output)
     expected=(4*squared>9*denominator**2)&(4*squared<=25*denominator**2)

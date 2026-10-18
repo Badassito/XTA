@@ -40,8 +40,13 @@ def test_context_failed_planning_is_balanced_and_restores_thread_scope(tmp_path,
         assert context._active_passes == 0
         assert [event for event, _ in events] == ['sam_phase_begin', 'sam_phase_end']
         begin, end = events[0][1], events[1][1]
+        timing_fields = ('phase_host_seconds', 'phase_thread_cpu_seconds')
+        for name in timing_fields:
+            assert name not in begin
+            assert type(end[name]) in (int, float)
+            assert np.isfinite(end[name]) and end[name] >= 0
         assert begin == {key: value for key, value in end.items()
-                         if key not in ('failed', 'error', 'error_type')}
+                         if key not in ('failed', 'error', 'error_type') + timing_fields}
         assert end['failed'] is True
         assert end['error_type'] == 'RuntimeError' and end['error'] == 'planning failed'
         assert begin['sam_phase'] == 'planning'

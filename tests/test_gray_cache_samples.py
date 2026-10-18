@@ -23,21 +23,27 @@ def test_no_short_window_or_fake_adjacency():
 
 
 def test_real_view_recipe_selects_two_samples_per_priority_family():
-    specs = sample_specs((63, 65, 67), size=32)
+    specs = sample_specs((127, 129, 131), size=64)
     assert len(specs) == 8
     assert sorted(view.family for _, view, *_ in specs) == sorted(
         ['spherical', 'spherical', 'radial', 'radial', 'azimuthal', 'azimuthal', 'tilted', 'tilted'])
     assert {view.tilt_direction for _, view, *_ in specs if view.family == 'tilted'} == {'vertical', 'horizontal'}
     assert any(view.spherical_tilted_source for _, view, *_ in specs if view.family == 'spherical')
     assert all(view.sampling_policy == 'coverage' for _, view, *_ in specs
-               if view.family in {'spherical', 'radial'})
+               if view.family in {'spherical', 'radial', 'azimuthal'})
     from XTA.backprojection import azimuthal_full_coverage_angle_deg
     from XTA.geometry import azimuthal_target_diameter
     for _, view, *_ in specs:
         if view.family == 'azimuthal':
-            assert math.isclose(view.azimuths_deg[1]-view.azimuths_deg[0],
-                azimuthal_full_coverage_angle_deg(azimuthal_target_diameter(
-                    view.azimuthal_request_token, 63, 65, 67)))
+            spacing = view.azimuths_deg[1]-view.azimuths_deg[0]
+            reference_spacing = azimuthal_full_coverage_angle_deg(azimuthal_target_diameter(
+                view.azimuthal_request_token, 127, 129, 131))
+            if view.sampling_certificate:
+                assert spacing > reference_spacing
+                assert view.num_slices < view.sampling_reference_frames
+                assert view.sampling_error_bound_sq < 1.
+            else:
+                assert math.isclose(spacing, reference_spacing)
 
 
 def test_histogram_metrics_keep_padding_bias_visible():

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import tempfile
 import types
 import unittest
@@ -127,6 +128,23 @@ class LtaRuntimePlanningTests(unittest.TestCase):
             )
             for angle in angles
         )
+
+    def test_physical_compiler_receives_exact_requested_model_angles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            checkpoint = root / "sam3.1_multiplex.pt"
+            checkpoint.write_bytes(b"checkpoint")
+            base = self._config(root, checkpoint)
+            for angles in ((45.0,), (90.0, 180.0), (-360.0,), (0.0, 120.0)):
+                config = replace(base, angles=angles)
+                compiler = mock.Mock(side_effect=self._physical_compiler)
+                plan = build_lta_run_plan(
+                    config, discovery_fn=mock.Mock(return_value=self._discovery(root)),
+                    physical_compiler=compiler, variant_expander=self._variant_expander, run_id="angles",
+                )
+                self.assertEqual(compiler.call_args.kwargs["augmentation_angles"], angles)
+                self.assertNotIn("sampling_policy", compiler.call_args.kwargs)
+                self.assertEqual(tuple(view.tta_angle_deg for view in plan.volumes[0].runtime_views), angles)
 
     def test_video_plan_crosses_views_angles_and_fixed_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

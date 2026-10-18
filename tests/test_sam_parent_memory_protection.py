@@ -162,6 +162,7 @@ def test_view_prepare_forwards_its_registration_to_existing_admission():
     task = SimpleNamespace(admission=pool, transient_bytes=4*GIB,
         model_name='model', view=SimpleNamespace(name='cheap'), extrapolation_distance=0,
         interpolation_distance=1, interpolation_backend='sam', sam_base_allowance_bytes=4*GIB,
+        sam_image_reserved_bytes=0, sam_image_phase_bytes=0,
         check_cancelled=lambda:None,
         sam_context=SimpleNamespace(device_ids=('cuda:0',), worker_count=1,
             resource_scope=lambda profile:nullcontext(profile)))

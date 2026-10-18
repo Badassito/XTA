@@ -46,8 +46,11 @@ def test_four_cohorts_each_next_builds_while_current_is_consumed_with_two_live_g
         profile = context._resource_local.profile
         profile._validate_owner()
         assert profile._lease.owner_thread == threading.get_ident() != owner
+        assert profile._lease.scope_holds == 1, 'prefetch must not add a duplicate build hold'
         assert profile.assigned_cpu_wave_bytes == profile.assigned_session_cpu_bytes == 0
         assert profile.non_cpu_base_allowance_bytes >= 4096+36
+        assert profile.assigned_observation_bytes == profile.assigned_contract_metadata_bytes == 0
+        assert profile.base_other_non_cpu_allowance_bytes == profile.non_cpu_base_allowance_bytes
         producers.append((threading.get_ident(), profile._lease.lease_id))
         return original(*args, **kwargs)
     monkeypatch.setattr(context, '_render_demand_crop', render)
@@ -91,7 +94,9 @@ def test_four_cohorts_each_next_builds_while_current_is_consumed_with_two_live_g
 
 
 def test_cpu_fallback_current_does_not_block_next_gpu_cohort_or_other_parent(tmp_path, monkeypatch):
+    from dataclasses import replace
     from XTA.sam_gpu_rendering import live_image_sampling
+    from XTA.spherical_sampling import coverage_error_bound, realized_gap
     from tests.test_sam_gpu_rendering import FakeRenderer
     from tests.test_sam_view_image_cache import expected_canvas
     source, context, view, bbox, plans, _retirements = setup(tmp_path, monkeypatch)
@@ -103,6 +108,11 @@ def test_cpu_fallback_current_does_not_block_next_gpu_cohort_or_other_parent(tmp
     monkeypatch.setenv('YOLO_TTA_SAM_RENDER_MAX_BYTES', str(256*1024))
     view = geometry.get_view_infos(*source.shape, cartesian_views=(),
         spherical_views=('transverse',), spherical_patch_size=8, spherical_min_radius=.5)[0]
+    # Four cohorts exercise two parent pipelines independently of the planner's shell count.
+    radii = tuple(np.linspace(view.spherical_min_radius, view.spherical_max_radius, 4))
+    view = replace(view, num_slices=4, spherical_radii=radii,
+        spherical_step=(radii[-1]-radii[0])/3,
+        sampling_error_bound_sq=coverage_error_bound(radii[-1], view.spherical_face_intervals, realized_gap(radii)))
     shape, bbox = (view.num_slices, view.src_h, view.src_w), (2, 1, 7, 7)
     assert view.num_slices >= 4
     plans = [demand(shape, {frame:bbox}) for frame in range(4)]
@@ -154,7 +164,10 @@ def test_cpu_fallback_current_does_not_block_next_gpu_cohort_or_other_parent(tmp
     try:
         with ThreadPoolExecutor(2) as executor:
             old = executor.submit(parent, 0)
-            assert cpu_started.wait(5) and ready[0].wait(5)
+            started = cpu_started.wait(5)
+            if not started and old.done():
+                old.result()  # Surface a producer failure instead of only its missed barrier.
+            assert started and ready[0].wait(5)
             other = executor.submit(parent, 1)
             assert ready[1].wait(5)
             assert not records[0][1][0].future.done(), 'the original CPU build remains blocked'
@@ -261,12 +274,12 @@ def test_unproven_prefetched_gray_retirement_preserves_file_and_fresh_image_cred
                     with holder as ref:
                         assert ref.path.exists()
                 assert ref.path.exists() and sam_resources.sam_parent_promised_bytes(pool) == 4*GIB+holder.phase_bytes
-                assert len(context._retained_image_prefetch_credits) == 1
+                assert len(context._retained_parent_image_credits) == 1
                 assert context.image_cache_lifetime_snapshot()['retirement_unproven_count'] == 1
                 assert context.prefetch_image_cohort(view, source.shape, plans[1], max_cache_bytes=1000) is None
-            context.close()  # Fake runtime here proves settlement; gray stays diagnostic data.
-            assert pool.in_use == 4*GIB and not context._retained_image_prefetch_credits
-        assert pool.in_use == sam_resources.sam_parent_promised_bytes(pool) == 0 and ref.path.exists()
+            context.close()  # Proven reader shutdown retires the funded owned file too.
+            assert pool.in_use == 4*GIB and not context._retained_parent_image_credits
+        assert pool.in_use == sam_resources.sam_parent_promised_bytes(pool) == 0 and not ref.path.exists()
     finally:
         if holder is not None:
             holder.close()
@@ -407,9 +420,9 @@ def test_partial_provider_enter_failure_retains_claimed_gray_and_image_grant(tmp
                         pytest.fail('a partially failed provider returned a consumer reference')
                 assert len(claimed) == 1 and claimed[0].path.exists()
                 assert sam_resources.sam_parent_promised_bytes(pool) == 4*GIB+holder.phase_bytes
-                assert len(context._retained_image_prefetch_credits) == 1
+                assert len(context._retained_parent_image_credits) == 1
             context.close()
-            assert pool.in_use == 4*GIB and claimed[0].path.exists()
+            assert pool.in_use == 4*GIB and not claimed[0].path.exists()
         assert pool.in_use == sam_resources.sam_parent_promised_bytes(pool) == 0
     finally:
         if holder is not None:

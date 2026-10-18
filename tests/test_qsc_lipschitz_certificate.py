@@ -5,8 +5,11 @@ import unittest
 
 import numpy as np
 
-from XTA.qsc import qsc_inverse
-from tools.certify_qsc_lipschitz import TRACE_LIMIT, certify
+from XTA.qsc import QSC_INVERSE_LIPSCHITZ, QSC_INVERSE_LIPSCHITZ_SQUARED, qsc_inverse
+from tools.certify_qsc_lipschitz import (
+    DETERMINANT_SQUARED_LOWER, INVERSE_LIPSCHITZ_SQUARED,
+    PI_LOWER, PI_UPPER, TRACE_LIMIT, certify,
+)
 
 
 class QscLipschitzCertificateTests(unittest.TestCase):
@@ -21,6 +24,25 @@ class QscLipschitzCertificateTests(unittest.TestCase):
                 bound = interval[name]
                 self.assertIsInstance(bound, Fraction)
                 self.assertLess(bound, TRACE_LIMIT)
+
+    def test_tightened_bound_encloses_both_squared_singular_values(self):
+        bound = INVERSE_LIPSCHITZ_SQUARED
+        self.assertEqual(bound, Fraction(41, 50))
+        self.assertLess((PI_UPPER / 6)**2, bound**2)
+        for interval in certify():
+            self.assertGreater(bound**2 - bound * interval['trace_upper'] + DETERMINANT_SQUARED_LOWER, 0)
+        self.assertGreaterEqual(Fraction(QSC_INVERSE_LIPSCHITZ_SQUARED), bound)
+        self.assertGreaterEqual(Fraction(QSC_INVERSE_LIPSCHITZ)**2,
+                                Fraction(QSC_INVERSE_LIPSCHITZ_SQUARED))
+        self.assertLess(QSC_INVERSE_LIPSCHITZ, 1)
+
+    def test_machin_enclosure_is_rational_and_tighter_than_classical_pi_bounds(self):
+        self.assertIsInstance(PI_LOWER, Fraction)
+        self.assertIsInstance(PI_UPPER, Fraction)
+        self.assertLess(Fraction(333, 106), PI_LOWER)
+        self.assertLess(PI_LOWER, PI_UPPER)
+        self.assertLess(PI_UPPER, Fraction(355, 113))
+        self.assertGreater(DETERMINANT_SQUARED_LOWER, Fraction(1, 4))
 
     def test_loose_enclosure_fails_instead_of_claiming_a_sampled_bound(self):
         with self.assertRaises(AssertionError):

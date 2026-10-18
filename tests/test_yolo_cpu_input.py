@@ -248,7 +248,8 @@ class YoloCpuInputTests(unittest.TestCase):
         scheduler.state.direct_union_postprocess_bytes[('model','old')]=10000
         scheduler.state.direct_union_backing_leases[('model','old')]=SimpleNamespace(phase='postprocess')
         candidate=dict(descriptor,result_mode='direct_union',processing_shape=(7,30,50))
-        self.assertFalse(scheduler.direct_union_task_admissible(candidate))
+        self.assertFalse(owner.can_yield_capacity(9500))
+        self.assertTrue(scheduler.direct_union_task_admissible(candidate))  # Pure reclaim preview.
         self.assertEqual(owner.bytes,charged)
         self.assertEqual(owner.reserved_bytes,20000)
         owner.shutdown()
@@ -339,10 +340,9 @@ class YoloCpuInputTests(unittest.TestCase):
             scheduler.pop_gpu_worker_pending_task_id=original
             scheduler.inputs=replace(scheduler.inputs,ensure_baseline_workspaces=lambda model,view:
                 state.baseline_union_paths.setdefault((model,view.name),Path('mask.dat')))
-            self.assertTrue(scheduler.service_gpu_stage_admission_retry())  # Early wake still sees writer credit.
-            self.assertTrue(state.gpu_task_queues[0].empty())
-            self.assertFalse(state.gpu_stage_admission_dirty.is_set())
-            executor.run(1)  # Private writer completion drops scratch and wakes the owner.
+            self._idle(owner)  # Queued speculative writer is cancelled by the controller.
+            self.assertTrue(executor.jobs[1][0].cancelled())
+            self.assertEqual(owner.bytes,432)  # The chosen input remains ready and charged.
             self.assertTrue(state.gpu_stage_admission_dirty.is_set())
             self.assertTrue(scheduler.service_gpu_stage_admission_retry())
             self.assertEqual(begin.call_count,1)

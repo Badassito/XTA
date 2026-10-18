@@ -56,9 +56,9 @@ def closed_face(points,rotation,face):
     return (normal>0)&(normal+tolerance>=np.max(np.abs(local[...,others]),axis=-1))
 
 
-def views(work,size,rotation,policy='dense'):
+def views(work,size,rotation):
     built=build_spherical_view_infos(*work,targets=('transverse',),min_radius=.5,
-        patch_size=size,tilted_views=(),sampling_policy=policy)
+        patch_size=size,tilted_views=())
     return [replace(view,spherical_rotation_xyz=rotation)for view in built]
 
 
@@ -80,11 +80,10 @@ def cpu_only(monkeypatch):
 ROTATIONS=[cube_rotation(),cube_rotation('vertical',31),cube_rotation('horizontal',-23),cube_rotation('vertical',90)]
 
 
-@pytest.mark.parametrize('policy',['dense','coverage'])
 @pytest.mark.parametrize('rotation',ROTATIONS)
 @pytest.mark.parametrize('work,output,size',[((7,7,7),(21,21,21),5),((7,9,11),(21,27,33),8)])
-def test_reduced_all_foreground_fills_only_native_annulus(work,output,size,rotation,policy):
-    trajectories=views(work,size,rotation,policy)
+def test_all_foreground_fills_only_native_annulus(work,output,size,rotation):
+    trajectories=views(work,size,rotation)
     union=np.zeros(output,np.uint8)
     for view in trajectories:
         data=np.ones((view.num_slices,2,3),np.uint8)
@@ -119,26 +118,42 @@ def test_enlarged_native_face_seams_corners_and_poles_are_closed():
 
 
 def test_localized_radial_cell_and_empty_gap_survive_roi_pruning():
-    work,output=(9,11,12),(27,33,36)
+    work=(9,11,12)
     trajectories=build_spherical_view_infos(*work,targets=('transverse',),min_radius=1.,patch_size=7,tilted_views=())
-    radii=np.asarray(trajectories[0].spherical_radii)
-    assert np.array_equal(radii,[1.,2.,3.,4.])
+    radii=sorted({r for view in trajectories for r in view.spherical_radii})
+    assert len(radii)>=3
+    active_radius=radii[1]
+    lower=(Fraction(radii[0])+Fraction(active_radius))/2
+    upper=(Fraction(active_radius)+Fraction(radii[2]))/2
+    assert lower.denominator==upper.denominator and lower.denominator%2==0
+    scale=3*lower.denominator//2
+    output=(27,33,work[2]*scale)
+    assert output[2]<=128
     union=np.zeros(output,np.uint8)
     for view in trajectories:
-        data=np.zeros((view.num_slices,2,3),np.uint8);data[1]=1
-        boxes=np.zeros((view.num_slices,4),np.int64);boxes[1]=(0,2,0,3)
+        data=np.zeros((view.num_slices,2,3),np.uint8)
+        boxes=np.zeros((view.num_slices,4),np.int64)
+        if active_radius in view.spherical_radii:
+            active=view.spherical_radii.index(active_radius)
+            data[active]=1
+            boxes[active]=(0,2,0,3)
         actual=project(data,view,output,boxes)
         np.testing.assert_array_equal(actual,project(data,view,output))
         union|=actual
     valid,_,radius=annulus(work,output,1.,4.)
     squared,denominator=exact_squared_radius(work,output)
-    # Active radius2 owns (1.5,2.5], using rational squared bounds rather
-    # than a floating argmin that could share the original boundary error.
-    expected=valid&(4*squared>9*denominator**2)&(4*squared<=25*denominator**2)
+    # Rational midpoint bounds avoid sharing a floating argmin boundary error.
+    squared=squared.astype(object)
+    expected=valid&(squared*lower.denominator**2>lower.numerator**2*denominator**2)&(squared*upper.denominator**2<=upper.numerator**2*denominator**2)
     np.testing.assert_array_equal(union!=0,expected)
     # Exact midpoint ties belong to the inner shell, even at the ROI limits.
-    assert radius[13,16,22]==1.5 and union[13,16,22]==0
-    assert radius[13,16,25]==2.5 and union[13,16,25]==1
+    inner_col=Fraction(output[2]-1,2)+lower*scale
+    outer_col=Fraction(output[2]-1,2)+upper*scale
+    assert inner_col.denominator==outer_col.denominator==1
+    inner=(output[0]//2,output[1]//2,int(inner_col))
+    outer=(output[0]//2,output[1]//2,int(outer_col))
+    assert radius[inner]==float(lower) and union[inner]==0
+    assert radius[outer]==float(upper) and union[outer]==1
 
 
 def test_exact_inner_radius_is_closed_without_voxel_sized_expansion():

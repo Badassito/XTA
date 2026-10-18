@@ -56,7 +56,7 @@ def sample_specs(shape, size=SIZE):
         radial_views=('transverse', 'tilted_transverse'), radial_patch_size=size,
         spherical_views=('transverse', 'tilted_transverse'), spherical_patch_size=size,
         azimuthal_views=azimuthal_targets, azimuthal_azimuth_angles=azimuthal_angles,
-        sampling_policy='coverage')
+        azimuthal_auto_views=azimuthal_targets)
 
     def choose(family, predicate):
         return next(view for view in views if view.family == family and predicate(view))
@@ -147,7 +147,7 @@ def main():
         target_processing_shape_tyx=[2911, 3064, 3022],
         geometry_limit='Native full F3 geometry; no production T interpolation to2911. Not a replay of a recorded detector job.',
         sample_shape_tyx=[FRAMES, SIZE, SIZE], samples=[], cpu_only=True,
-        requested_sampling_policy='coverage',
+        sampling_policy='coverage',
         disjoint_windows_are_separate_files=True,
         implementations={name: file_sha256(ROOT/'XTA'/name) for name in
             ('geometry.py', 'media.py', 'cylindrical_geometry.py', 'spherical_geometry.py',

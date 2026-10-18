@@ -59,6 +59,16 @@ sampling rules. Categorical rendering uses nearest spatial taps. Tilted
 Cartesian and Azimuthal label planes blend adjacent stack planes and threshold
 binary foreground and coverage at 0.5; shell views use nearest voxel sampling.
 
+Physical-view construction uses one coverage schedule across TTA, PTA and LTA;
+there is no selectable dense sampling mode. Spherical plans compare a bounded
+set of angular-grid/radius-band candidates by total native patch images,
+including shared endpoint shells. Their direct native intensity samples retain
+positive source-voxel support with a numerical reserve; this is not a guarantee
+that nearest categorical labels or later affine transforms preserve every voxel.
+The exact QSC certificate and practical workload comparison are described in
+[projection coverage](docs/projection_coverage.md). Historical capture decoding
+retains original certificate meanings without reintroducing a planning option.
+
 TTA, PTA, and LTA raster plans bind versioned physical geometry and the effective
 affine transform at their construction boundary. Source dimensions, orientation,
 trajectories, and sampling matrices contribute to identity. Exact trajectory
@@ -268,6 +278,15 @@ retention permissions and publishes backing dictionaries. In-process inference,
 ordinary unbounded file-result aggregation and tile-result workspace creation
 retain their synchronous compatibility paths.
 
+For SAM-blocked detector parents, short-lived physical RAM eligibility is
+separate from long-lived backlog retention. A logical backlog denial therefore
+does not force disk when RAM can safely fund the birth. Insufficient verified
+headroom selects exclusive ordinary-filesystem mask/score files under the
+checkpoint root, with no tmpfs fallback. Grouped file-space checks account for
+unwritten promises, existing maps use `r+`, and checkpoints reuse the same
+owned files. Failed births settle mappings before rollback; teardown validates
+the original root identity before deleting owned storage.
+
 Eligible gray, batch-one CUDA process runs admit curved full-frame views before
 unopened Cartesian and Tilted Cartesian work. Once curved inference is assigned
 to another GPU, one CPU-ready Cartesian D1 parent can open alongside it on an
@@ -287,6 +306,14 @@ existing CPU executor and retires arrays. Scheduler refill and retirement calls
 signal that thread; they do not start pool workers. Optional readiness and input
 handoff queries decline immediately when their metadata lock is busy. Memory
 grants and ownership accounting remain exact.
+
+When speculative inputs prevent a ready detector parent from fitting, the
+scheduler can request retirement of unborrowed packets through that controller.
+Attached inputs remain protected through compute release. Revoked builders
+settle cooperatively, and charged credit returns only after the mapping and
+parent keepalive descriptor retire. A reclaim preview is not an allocation
+grant. Refills remain bounded while reclamation is pending and resume after
+the selected parent commits; unavailable optional inputs use GPU rendering.
 
 Ready uint8 canvases feed the same TensorRT ring through pinned asynchronous
 copies. Workers with verified access to the parent's procfs mappings open these
@@ -487,6 +514,12 @@ Each covered final Z plane is validated once per invocation, including empty
 interior planes. Eligibility uses the already-projected backing grid, rather
 than the original proposal transform metadata. Other shapes/backings retain the
 dense restoration reader; connection-topology checks keep their existing scope.
+For unchanged plain-union outputs, final survival receipts may reuse the source
+audit after writers settle. Identity, mutation, workspace-budget and exact
+content checks protect reuse; source-integrity assertions and existing
+`not_assessed` topology scopes remain intact. Receipts retain separate stages
+and record their origin. Telemetry measures the content checks as well as the
+audit, since hashing the mask and evidence can offset the saved audit work.
 
 `sam_integration` plans before image rendering, model construction, and GPU
 admission. Empty/exhausted passes create no image cache or predictor. Compatible
@@ -579,6 +612,14 @@ No source allocation remains after the compute lease returns. Admission occurs
 after CPU image credit and duplicate-demand checks; no GPU is held while those
 checks wait. Source/grid scratch retires before the compute lease returns, and
 predictor-worker shutdown cannot release a parent renderer's borrowed lease.
+Large image builds also yield at completed crop/batch boundaries after a
+30-second render-service turn when tracker work is dispatchable. Upload time
+is excluded; CUDA resources retire while the private host cache stays owned.
+Busy resumes keep their GPU backend and remain cancellable through ordinary
+FIFO/SDK admission. Reuploads are the cost of these bounded compute turns.
+Tilted-Azimuthal SAM crops use the existing Torch sampler on only the required
+native rectangle, preserving full-plane coordinates, quantization and affine
+normalization in the existing zero canvas.
 Ready materialized processing cubes are reused directly. An unfinished streaming
 cube retains CPU preparation: its endpoint-aligned temporal grid cannot be
 substituted by TTA's center-aligned native-T route. Nonstreaming native-T inputs
@@ -605,8 +646,10 @@ Independent image-cache builds run as private transactions on their admitting
 parent threads. Registry locks cover lookup, ownership and publication rather
 than pixel rendering or worker-retirement waits. Distinct live parent profiles
 fund their own concurrent image and render reservations,
-while uncredited callers share the aggregate allowance. Identical
-demand joins one builder. Donor pins and per-invocation cohort claims prevent
+while uncredited callers share the aggregate allowance. Identical demand within
+the same funding owner joins one builder. Different mandatory parents may donate
+pixels through pins, but a receiving parent cannot extend the donor's owned cache
+beyond its funding lifetime. Donor pins and per-invocation cohort claims prevent
 retirement races; cancellation and close settle creators, waiters and consumers
 before releasing sources. Per-descriptor limits and spatial coverage remain
 enforced; the chosen intensity sampler is recorded explicitly.
@@ -703,9 +746,22 @@ parent's base reservation, using actual physical/cgroup/SLURM headroom and the
 resolved pool limit. Temporary pool or promised-RAM contention waits without
 holding partial credit when total capacity and isolated physical headroom can
 fund the minimum extra or identified base CPU allowance. Genuine isolated
-resource shortages retain the lower declared bounds. Cancellation wakes
+shortages of optional extra workspace retain the lower declared bounds;
+an unfundable mandatory image phase is rejected explicitly. Cancellation wakes
 admission waits. Lazy family contracts occupy one bounded resident lease that
 is reused across families.
+Permitted-support construction applies its existing integer owner-intersection
+operations only inside each Boolean contribution's exact nonzero rectangle.
+It retains the same corridor rasterization, owner dtype and resource bounds.
+Large observation crops retain exact packed bits within the existing inventory
+ceiling. Native interpolation evidence can stream contract planes from an immutable
+recipe instead of retaining every edge/frame stack, with dense materialization
+preserved when it has the lower peak. Fixed-base partitions separately fund
+observations and persistent metadata. Mandatory production image demand adds its
+uncovered image charge atomically to the parent; optional overlap may use a
+separately admitted image-only grant. Credit follows the actual cache lifetime.
+Existing admissible family and run identities retain compatible selection
+priority when capacities expand.
 Larger contract/topology allowances require a live profile, not serialized
 metadata or a pool's emergency oversize lane.
 Image builders with distinct live parent credits can run concurrently through
@@ -727,7 +783,12 @@ without another checkpoint or dense grant, and wrapper actors retain their lane
 until they return. Slice workers divide the same CPU budget,
 and the explicit parent-worker override remains available. Whole-parent
 selection/publication can therefore leave other lanes preparing independent
-views. On large SAM hosts, automatic dense and transient defaults each use
+views. Expensive parents use one size-priority admission followed by three
+arrival-order admissions; protected cheap lanes and all resource checks retain
+priority. A bounded scan cohort preserves progress across short pump budgets and
+new arrivals. [Parent preparation order](docs/sam_parent_prepare_order.md)
+documents the cost proxy, fairness and per-admission diagnostics.
+On large SAM hosts, automatic dense and transient defaults each use
 40% of one physical/cgroup/SLURM headroom snapshot after a 64 GiB reserve.
 The extra transient allowance fits the room below an 80% combined budget after
 resolved dense credit; existing floors and explicit limits remain authoritative.
@@ -872,15 +933,25 @@ descriptor's active scopes and mapping proofs, allowing unrelated caches to reti
 without waiting for the entire tracker pool to become idle.
 Multi-cohort extrapolation uses the same bounded producer wrapper for first,
 current and next frozen image cohorts; interpolation and extrapolation retry
-callbacks use it for eligible ephemeral crops. A separate aggregate 16 GiB
-image-staging allowance funds cache payload and render scratch. Physical,
-cgroup and SLURM checks reserve the full future parent-pool capacity before
-admitting staging work. Parent defaults remain fixed, and emergency parent
-reservations are exclusive with image staging. Each funded parent can retain
-two wrappers; unavailable staging credit uses synchronous preparation.
-Image credit cannot authorize an SDK wave. Cache and worker ownership retain
-staging debt through consumption and uncertain retirement; credit returns only
-after settlement. A healthy consumed prefetch joins its producer in short slices
+callbacks use it for eligible ephemeral crops. Before preparation, production
+parents atomically reserve any mandatory image shortfall beyond their identified
+image allowance. This funds two configured cache payloads and rendering scratch:
+the current payload and one inline retry. Future-parent estimates, pending-parent
+protection and retry children use the same charge. It remains separate from SDK,
+observation and metadata partitions, within unchanged aggregate memory limits.
+Contention waits without partial credit; an intrinsically unaffordable mandatory
+phase is rejected before preparation.
+
+The separate aggregate 16 GiB image-staging allowance funds optional overlap.
+Physical, cgroup and SLURM checks reserve the full future parent-pool capacity
+before admitting staging work; emergency parent reservations remain exclusive
+with image staging. Each funded parent can retain two wrappers. Unavailable
+optional credit uses synchronous preparation within the parent's mandatory image
+budget. Image credit cannot authorize an SDK wave. Initial interpolation and
+single-cohort extrapolation use lexical image leases. Cache funding survives
+cancellation, failed startup and unproven worker, mmap or file retirement until
+settlement; borrowed input backing retains its owner. A healthy consumed prefetch
+joins its producer in short slices
 without the cancellation deadline. Cancellation, consumer failure and unused
 abandonment use a 30-second join budget; expiry retains image/profile ownership.
 Telemetry separates image-staging admissions, declines and
@@ -902,6 +973,12 @@ retain their 32 MiB ceiling; outer cache storage is deducted before their and
 the prefix indexes' admission. Cache capacity does not alter group acceptance or
 filtering. Final portable recipes are flattened, fingerprinted and fully validated.
 Ordered cross-family contact and topology rules apply to selected support.
+Native selected-mask publication borrows authenticated ordered frame tuples and
+cyclic addresses through O(selected owners) lookup descriptors within its existing
+32 MiB reader allowance. Candidate reads and integrity checks retain their order;
+mutable or rebound metadata falls back to the original traversal. This native
+baseline must settle before dependent extrapolation starts, independently of
+later source-grid projection.
 The main component gate uses a direct-parent and residual-parent-bridge
 whole-component OR.
 It receives completed selected parent support. Admitted tile observations are
@@ -972,6 +1049,29 @@ confidence publication.
 
 ## PTA: deterministic dataset construction
 
+`--input DIR [DIR...]` flattens each directory's sorted volume inventory in
+argument order into one run. Every root keeps its existing full/partial/unlabeled
+rules; different roots may have different annotation states. Duplicate resolved
+roots and ancestor/descendant root pairs are rejected. A unique volume stem keeps
+its existing identity; colliding or case-colliding stems receive a stable hash
+of their resolved input root, with the original stem/root retained as provenance.
+Moving a colliding root changes that qualified identity and its seeds. Output
+safety checks protect every input root and source file. Without `--output`, the
+existing default uses the first root's basename under the working directory.
+
+`--pipeline_depth 2` applies to the flattened volume list, including one volume
+in each of several directories. It overlaps adjacent-volume planning/loading
+with rendering and reuses persistent workers. It does not overlap two stages
+inside a single volume. Existing 70%-of-available-memory and separate-CPU-budget
+checks can reduce effective depth to one. Background filtering and label writes
+use each volume's annotation state, not a run-wide label flag.
+
+PTA uses the same coverage planner as TTA's native angle-zero geometry. Spherical
+and eligible Radial/Azimuthal schedules can therefore produce fewer frames than
+older PTA releases. Reproducibility is scoped to the same input, command and
+version; this change does not preserve earlier dataset membership. Geometry,
+certificates and effective transforms remain part of output provenance.
+
 `pta` owns candidate membership, augmentation versions, split assignment, and
 output identities before asynchronous rendering begins. `pta_classification`
 tests foreground occupancy for background sampling, using native categorical
@@ -1004,6 +1104,13 @@ foreground and coverage volumes resident when VRAM admission succeeds.
 `pta_cuda_azimuthal`, and `pta_cuda_shells` project categorical values directly
 to the final full or tile raster. Intensity and categorical sampling remain
 separate. GPU projection events fence policy reads and source retirement.
+Curved intensity rendering shares the existing bounded native-plane cache with
+TTA. Volume-generation changes clear that cache; repeated full/tile/channel
+requests can reuse a plane without retaining another source owner. CPU and
+legacy single-source GPU workers render only the tiles retained in their task.
+The normal batched GPU-policy path already selects those items. Bundled GPU
+policies invert affine matrices as one checked batch rather than synchronizing
+for one inversion per output. These policies remain standalone files.
 Unsupported geometry or insufficient prelaunch VRAM selects the CPU categorical
 reference path; a launched CUDA failure propagates. The manifest records which
 backend actually rendered categorical items.
@@ -1034,6 +1141,22 @@ labels to Transverse full frames or tiles. Forced partial volumes without
 encoded-frame gaps can use 3-D views, including supported shells, with unknown
 semantic coverage preserved through projection. Fully labeled contiguous data
 can use all supported views.
+
+PTA uses the existing `YOLO_TTA_TELEMETRY=1`, `YOLO_TTA_TASK_TRACE=1` and
+`YOLO_TTA_TELEMETRY_DIR` controls. Put telemetry and stdout logs beside generated
+dataset roots, not inside a pre-created unowned `--output` directory. Coarse
+`pta.input.*`, `pta.prepare*`, `pta.classify.*`, `pta.plan.*`, `pta.render.*` and
+`pta.publish.*` phases separate input, planning, rendering and final publication;
+volume milestones bind the timeline to each source identity. Post-fork workers
+register a final telemetry flush after their publication resources retire.
+
+The `pta.publication` snapshot reuses existing policy, snapshot, queue-wait,
+encode/fence, mask-download, polygon and host-publication measurements. These
+wall times overlap and are not additive. Its `counts.images` counts consumed
+batch outputs, not necessarily final files after flip/drop decisions; use the
+manifest's verified output counts for dataset size. nvJPEG stream/device fences
+remain part of the codec ownership contract. A GPU allocation alone does not
+select GPU PTA rendering: that route requires an offline GPU augmentation policy.
 
 ## LTA: authoritative seeds and bounded propagation
 

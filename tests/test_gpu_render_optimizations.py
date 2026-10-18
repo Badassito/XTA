@@ -4,6 +4,7 @@ from contextlib import nullcontext
 from collections import OrderedDict
 import inspect
 import os
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -12,7 +13,7 @@ from unittest import mock
 import numpy as np
 
 
-from XTA import backprojection, cuda_backend, cuda_d1, geometry, inference
+from XTA import backprojection, cuda_backend, cuda_d1, geometry, inference, pta_workers
 from XTA.geometry import AffineSpec, AugJob
 
 
@@ -308,6 +309,12 @@ class FusedRendererOptimizationTests(unittest.TestCase):
         engine._fused_preflight_volume_key = None
         engine._native_t_indices = mock.Mock(return_value=(object(), object(), object()))
         volume = np.arange(4 * 5 * 6, dtype=np.uint8).reshape(4, 5, 6)
+        engine._native_plane_cache = OrderedDict()
+        engine._native_plane_cache_entries = lambda: 2
+        first_plane = np.full((5, 6), 11, dtype=np.float32)
+        next_plane = np.full((5, 6), 29, dtype=np.float32)
+        engine._render_native_plane = mock.Mock(side_effect=(first_plane, next_plane))
+        view = SimpleNamespace(name="same-view", family="radial")
 
         with (
             mock.patch.object(cuda_backend, "gpu_worker_render_resident_enabled", return_value=True),
@@ -315,13 +322,80 @@ class FusedRendererOptimizationTests(unittest.TestCase):
             mock.patch("builtins.print"),
         ):
             first = engine.ensure_volume_array(volume, identity="shm:test")
+            borrowed = engine._render_native_plane_cached(view, 0)
             second = engine.ensure_volume_array(volume, identity="shm:test")
+            self.assertIs(engine._render_native_plane_cached(view, 0), borrowed)
+            turnover = engine.ensure_volume_array(volume, identity="shm:next-generation")
+            self.assertIs(engine._render_native_plane_cached(view, 0), next_plane)
 
         self.assertEqual(first, "resident")
         self.assertEqual(second, "resident")
-        self.assertEqual(resident_allocations, [(4, 5, 6)])
-        self.assertEqual(copies, [(0, 4)])
+        self.assertEqual(turnover, "resident")
+        self.assertEqual(resident_allocations, [(4, 5, 6), (4, 5, 6)])
+        self.assertEqual(copies, [(0, 4), (0, 4)])
+        self.assertEqual(engine._render_native_plane.call_count, 2)
+        stream.synchronize.assert_called_once()
+        np.testing.assert_array_equal(borrowed, first_plane)
         self.assertIsNone(engine._volume_mm)
+
+    def test_native_plane_lru_eviction_preserves_borrowed_outputs(self) -> None:
+        engine = object.__new__(cuda_backend._GpuWorkerRenderEngine)
+        engine._native_plane_cache = OrderedDict()
+        engine._native_plane_cache_entries = lambda: 2
+        engine._render_native_plane = mock.Mock(
+            side_effect=lambda _view, frame: np.full((2, 3), frame, dtype=np.float32)
+        )
+        view = SimpleNamespace(name="radial", family="radial")
+        borrowed = engine._render_native_plane_cached(view, 0)
+        engine._render_native_plane_cached(view, 1)
+        self.assertIs(engine._render_native_plane_cached(view, 0), borrowed)
+        engine._render_native_plane_cached(view, 2)
+        self.assertEqual(list(engine._native_plane_cache), [("radial", 0), ("radial", 2)])
+        engine._render_native_plane_cached(view, 3)
+        self.assertEqual(len(engine._native_plane_cache), 2)
+        np.testing.assert_array_equal(borrowed, np.zeros((2, 3), dtype=np.float32))
+        self.assertIsNot(engine._render_native_plane_cached(view, 0), borrowed)
+
+    def test_pta_curved_full_and_tile_requests_share_native_planes(self) -> None:
+        for family in ("radial", "spherical", "azimuthal"):
+            with self.subTest(family=family):
+                engine = object.__new__(cuda_backend._GpuWorkerRenderEngine)
+                engine._native_plane_cache = OrderedDict()
+                engine._native_plane_cache_entries = lambda: 2
+                engine._volume_gpu = SimpleNamespace(is_cuda=False)
+                engine._stream = object()
+                engine.ensure_volume_array = mock.Mock(return_value="resident")
+                native = mock.MagicMock()
+                engine._render_native_plane = mock.Mock(return_value=native)
+                projected = object()
+                engine.warp_native_uint8_frame = mock.Mock(return_value=projected)
+                event = SimpleNamespace(record=mock.Mock())
+                runtime = {
+                    "torch": SimpleNamespace(uint8=object(), cuda=SimpleNamespace(
+                        stream=lambda _stream: nullcontext(), Event=lambda: event,
+                    )),
+                    "azimuthal_renderer": engine,
+                    "azimuthal_render_lock": threading.Lock(),
+                }
+                view = SimpleNamespace(name=family, family=family)
+                plan = SimpleNamespace(
+                    view=SimpleNamespace(shared_view=view), source_encoded_indices=(),
+                    channel_variant=SimpleNamespace(kind="gray"),
+                    aff=SimpleNamespace(out_h=8, out_w=8, M_out_to_src=self.identity),
+                    tile_layout=(SimpleNamespace(tile_tag="tile", out_h=8, out_w=8,
+                        shared_job=SimpleNamespace(M_out_to_src=self.identity)),),
+                )
+                with (mock.patch.object(pta_workers, "_require_pta_canonical_plan"),
+                      mock.patch.object(pta_workers, "_azimuthal_source_mode", return_value="texture_linear"),
+                      mock.patch("builtins.print")):
+                    for item in ("full", "tile", "full"):
+                        actual, ready = pta_workers._gpu_projected_item_image(
+                            runtime, np.zeros((2, 3, 4), np.uint8), plan, 1, item,
+                        )
+                        self.assertIs(actual, projected)
+                        self.assertIs(ready, event)
+                engine._render_native_plane.assert_called_once_with(view, 1)
+                self.assertEqual(engine.warp_native_uint8_frame.call_count, 3)
 
     def test_cartesian_resident_renderer_extracts_native_u8_without_float_roundtrip(self) -> None:
         uint8_token = object()

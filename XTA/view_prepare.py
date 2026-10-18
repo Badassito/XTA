@@ -14,7 +14,7 @@ import os
 import shutil
 import threading
 import weakref
-from concurrent.futures import CancelledError
+from concurrent.futures import CancelledError, Future
 from dataclasses import dataclass, field
 from contextlib import contextmanager, ExitStack
 from pathlib import Path
@@ -26,6 +26,7 @@ from .config import GIB
 from .artifact_archive import artifact_size, iter_artifacts, physical_path, read_artifact, split_reference
 from .geometry import ViewInfo, is_tilted_view, physical_view_name
 from .interpolation import NrrdLayerRef, PreparedViewResult, _DirectUnionBackingLease
+from .projection_queue import ComponentProjectionQueue, DeferredComponentProjection
 from .runtime import (_interpolation_array_backing_path, close_memmap_array_without_flush,
                       _memfd_owner_key_from_array, _mount_fstype_for_path,
                       _MEMORY_BACKED_FSTYPES)
@@ -190,6 +191,10 @@ class SamLayerProjectionSubmitter:
     materialize_extrapolation: Callable[..., NrrdLayerRef]
 
     def __call__(self, entry, *, layer_kind, **kwargs):
+        return self._prepare(entry, layer_kind=layer_kind, **kwargs)()
+
+    def _prepare(self, entry, *, layer_kind, **kwargs):
+        """Detach immutable inputs before any wait for projection admission."""
         if layer_kind not in ('interpolation', 'extrapolation'):
             raise ValueError(f'Unknown SAM publication kind: {layer_kind}')
         entry = copy.deepcopy(dict(entry))
@@ -246,13 +251,25 @@ class SamLayerProjectionSubmitter:
         scope = f"{kwargs['model_name']}/{view.name}/{kwargs['source']}"
         if kwargs.get('tile_config_id'):
             scope += '/' + str(kwargs['tile_config_id'])
-        with _trace_sam_phase('projection_admission', scope, operation=layer_kind):
-            future = self.queue.submit(materialize, entry, source_bytes=int(source_bytes),
-                                       working_bytes=int(working_bytes), **kwargs)
-        # The scheduler may retire a completed parent's dense canvas before
-        # publication finishes, but only for these independent immutable inputs.
-        future._xta_dense_independent_publication_paths = (source,)
-        return future
+        def submit(*, blocking=True, deferred_seconds=0.):
+            if blocking:
+                with _trace_sam_phase('projection_admission', scope, operation=layer_kind):
+                    future = self.queue.submit(materialize, entry, source_bytes=int(source_bytes),
+                                               working_bytes=int(working_bytes), **kwargs)
+            else:
+                future = self.queue.try_submit(materialize, entry, source_bytes=int(source_bytes),
+                                               working_bytes=int(working_bytes), **kwargs)
+                if future is None:
+                    return None
+                from .runtime import runtime_trace_event
+                runtime_trace_event('sam_projection_deferred_admitted', scope_id=scope,
+                    sam_operation=layer_kind, deferred_seconds=deferred_seconds,
+                    source_bytes=int(source_bytes), working_bytes=int(working_bytes))
+            # Dense retirement requires proof of independent immutable inputs.
+            future._xta_dense_independent_publication_paths = (source,)
+            return future
+        submit._xta_dense_independent_publication_paths = (source,)
+        return submit
 
 
 @dataclass
@@ -299,6 +316,8 @@ class AdmittedViewPrepare:
     extrapolation_walk_back: int = 1
     extrapolation_min_radius: float = 3.
     sam_base_allowance_bytes: int = 0
+    sam_image_phase_bytes: int = 0
+    sam_image_reserved_bytes: int = 0
     confidence_retired_callback: Callable[[str, str, int], object] | None = None
     confidence_retired_callback_factory: Callable[[object], Callable] | None = None
     submit_sam_layer_projection: Callable[..., object] | None = None
@@ -306,6 +325,21 @@ class AdmittedViewPrepare:
     _cancelled_owner_refs: tuple = field(default=(), init=False, repr=False)
     _cancelled_before_prepare: bool = field(default=False, init=False, repr=False)
     _sam_parent_protection_token: str | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self):
+        requirement = getattr(self.sam_context, 'mandatory_image_phase_bytes', None)
+        active = (int(self.extrapolation_distance) > 0 or
+            self.interpolation_backend == 'sam' and int(self.interpolation_distance) > 0)
+        if active and callable(requirement):
+            from .sam_resources import sam_parent_image_reservation_bytes
+            base = int(self.transient_bytes)-int(self.sam_image_reserved_bytes)
+            self.sam_image_phase_bytes = requirement()
+            self.sam_image_reserved_bytes = sam_parent_image_reservation_bytes(
+                base, self.sam_base_allowance_bytes, self.sam_image_phase_bytes)
+            # Staging and pending-parent protection see the full atomic charge,
+            # before this task can enter its resource reservation.
+            self.transient_bytes = base+self.sam_image_reserved_bytes
+
     def rebind_confidence_retirement(self, lease):
         if self.confidence_retired_callback_factory is not None:
             self.confidence_retired_callback = self.confidence_retired_callback_factory(lease)
@@ -369,10 +403,11 @@ class AdmittedViewPrepare:
             with ExitStack() as reservation:
                 try:
                     profile = reservation.enter_context(admit_sam_parent_resources(
-                        self.admission, self.transient_bytes,
+                        self.admission, self.transient_bytes-self.sam_image_reserved_bytes,
                         f'{self.model_name}/{self.view.name}/fullframe', worker_count=workers,
                         execution_slots=sam_worker_count(self.sam_context),
                         base_allowance_bytes=self.sam_base_allowance_bytes,
+                        image_phase_bytes=self.sam_image_phase_bytes,
                         protection_token=self._sam_parent_protection_token,
                         cancel_event=getattr(self.sam_context, '_cancel', None)))
                 except CancelledError:
@@ -385,6 +420,75 @@ class AdmittedViewPrepare:
                 yield
 
     def __call__(self) -> PreparedViewResult:
+        submitter = self.submit_sam_layer_projection
+        if not isinstance(submitter, SamLayerProjectionSubmitter):
+            return self._prepare(submitter)
+        limit = 2 * (max(0, int(self.interpolation_passes))
+                     if self.interpolation_backend == 'sam' and int(self.interpolation_distance) > 0 else 0)
+        limit += 2 if int(self.extrapolation_distance) > 0 else 0
+        publications = []
+        deferred = isinstance(submitter.queue, ComponentProjectionQueue)
+
+        def record(entry, *, layer_kind, **kwargs):
+            if len(publications) >= limit:
+                raise RuntimeError('SAM publication exceeds the configured directional inventory')
+            submit = submitter._prepare(entry, layer_kind=layer_kind, **kwargs)
+            future = DeferredComponentProjection(submit) if deferred else Future()
+            publications.append((future, submit))
+            return future
+
+        result = submit = None
+        transferred = False
+        try:
+            # Finish native work and ordinary credit settlement before output backpressure.
+            result = self._prepare(record)
+            positions = {future: index for index, future in enumerate(result.pending_component_layers)}
+            if any(result.pending_component_layers.count(future) != 1 for future, _ in publications):
+                raise RuntimeError('SAM publication has no unique terminal dependency owner')
+            for future, submit in publications:
+                cancelled = getattr(self.sam_context, '_cancel', None)
+                if cancelled is not None and cancelled.is_set():
+                    raise CancelledError(getattr(self.sam_context, '_failure', 'SAM publication cancelled'))
+                if deferred:
+                    future.try_admit()
+                    if future.done():
+                        future.result()
+                    if future.admission_pending:
+                        break
+                else:
+                    result.pending_component_layers[positions[future]] = submit()
+            transferred = True
+            return result
+        except BaseException as error:
+            if result is not None:
+                # A failed flush has no result consumer; outside aliases still own their mappings.
+                volumes = [self.union_mm, result.native_support_mm, result.final_view_volume_mm]
+                self.union_mm = result.native_support_mm = result.final_view_volume_mm = None
+                seen = set()
+                try:
+                    for volume in volumes:
+                        if volume is None or id(_array_lifetime_owner(volume)) in seen:
+                            continue
+                        seen.add(id(_array_lifetime_owner(volume)))
+                        try:
+                            # The pre-prepare pathname proof is no longer available here.
+                            self.close_dense(volume, unlink_path=None)
+                        except BaseException as cleanup:
+                            note = getattr(error, 'add_note', None)
+                            if callable(note):
+                                note(f'SAM publication input cleanup failed: {cleanup}')
+                finally:
+                    volumes.clear()
+                    volume = None
+            raise
+        finally:
+            for future, _ in publications:
+                if not transferred or not deferred:
+                    future.cancel()
+            publications.clear()
+            result = submit = None
+
+    def _prepare(self, submit_sam_layer_projection) -> PreparedViewResult:
         self.check_cancelled()
         if self.backing_lease is not None:
             from .sam_parent_staging import fence_dense_proof_reset
@@ -486,7 +590,7 @@ class AdmittedViewPrepare:
                         self.preinterpolation_layer_already_published
                     ),
                     submit_component_projection=self.submit_component_projection,
-                    submit_sam_layer_projection=self.submit_sam_layer_projection,
+                    submit_sam_layer_projection=submit_sam_layer_projection,
                     confidence_retired_callback=self.confidence_retired_callback,
                     **({'_observation_inventory': observation_inventory}
                        if observation_inventory is not None else {}),

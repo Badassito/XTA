@@ -98,6 +98,7 @@ except Exception as exc:  # pragma: no cover
 from . import geometry as shared_geometry
 from . import media as shared_media
 from .config import SCRIPT_BASENAME, SCRIPT_VERSION
+from .runtime import runtime_telemetry, runtime_telemetry_phase, runtime_trace_event
 from .gaussian import binary_gaussian_pass
 from .unification.manifest import write_json_manifest
 from .unification.contracts import RasterPlan
@@ -292,6 +293,7 @@ from .unification.channels import resolve_channel_variants as resolve_v18_channe
 from .workspace import azimuthal_source_mode as _azimuthal_source_mode
 from .unification.runtime import compile_physical_views
 from .unification.tta_manifest import (
+    projection_sampling_record,
     radial_view_manifest_record, radial_view_plan_metadata,
     spherical_view_manifest_record, spherical_view_plan_metadata,
 )
@@ -925,6 +927,7 @@ def ffprobe_info(video_path: Path) -> Dict[str, object]:
     return {"width": width, "height": height, "fps": fps, "num_frames": int(nf)}
 
 
+@runtime_telemetry_phase('pta.input.decode_video')
 def decode_video_gray8_to_memory(video_path: Path, *, warnings: WarningLog, allocator: Optional[ArrayAllocator] = None) -> Tuple[np.ndarray, float, Optional[SharedBlock]]:
     _require_bin("ffmpeg")
     info = ffprobe_info(video_path)
@@ -1155,6 +1158,7 @@ def _decode_jpeg_sequence_nvimgcodec(
             future.result()
 
 
+@runtime_telemetry_phase('pta.input.decode_sequence')
 def load_image_sequence_to_memory(
     images: Sequence[Path],
     *,
@@ -1261,6 +1265,7 @@ def nrrd_header_to_internal_permutation(header: Mapping[str, object]) -> Optiona
     return None
 
 
+@runtime_telemetry_phase('pta.mask.load_nrrd')
 def load_nrrd_mask_for_volume(nrrd_path: Path, expected_shape_tyx: Tuple[int, int, int], *, warnings: WarningLog) -> np.ndarray:
     try:
         import nrrd  # type: ignore
@@ -1313,6 +1318,7 @@ def load_nrrd_mask_for_volume(nrrd_path: Path, expected_shape_tyx: Tuple[int, in
     return mask
 
 
+@runtime_telemetry_phase('pta.mask.rasterize_yolo')
 def rasterize_yolo_labels(src: SourceVolume, *, warnings: WarningLog, workers: int, allocator: Optional[ArrayAllocator] = None) -> Tuple[np.ndarray, Optional[SharedBlock]]:
     volume = src.volume
     t, h, w = volume.shape
@@ -1589,6 +1595,7 @@ def overlay_rgb(frame_gray: np.ndarray, mask_u8: np.ndarray) -> np.ndarray:
 # Gaussian smoothing and cubic volume preprocessing
 # ---------------------------------------------------------------------------
 
+@runtime_telemetry_phase('pta.prepare.gaussian')
 def apply_gaussian_smoothing(
     mask_u8: np.ndarray,
     *,
@@ -1642,6 +1649,7 @@ def cubic_target_shape(shape_tyx: Tuple[int, int, int]) -> Tuple[int, int, int]:
     return tuple(max(int(dim), min_allowed) for dim in (t_dim, h, w))  # type: ignore[return-value]
 
 
+@runtime_telemetry_phase('pta.prepare.resize_cube')
 def resize_to_approximately_cube(
     volume_u8: np.ndarray,
     mask_u8: np.ndarray,
@@ -1746,6 +1754,7 @@ def compile_v18_pta_views(
         spherical_requests=tuple(getattr(config, "spherical_requests", ())),
         spherical_min_radius=getattr(getattr(config, "args", None), "spherical_min_radius", None),
         spherical_patch_size=int(azimuthal_native_raster),
+        augmentation_angles=(0.0,),
     )
     return [adapt_shared_view(view) for view in compiled.views], compiled
 
@@ -1938,6 +1947,7 @@ def build_render_plan(
                 "runtime_job_id": str(tag),
                 "runtime_kind": "fullframe",
                 **geometry_recipe_metadata(view.shared_view, aff),
+                **projection_sampling_record(view.shared_view),
                 **radial_view_plan_metadata(view.shared_view),
                 **spherical_view_plan_metadata(view.shared_view),
             },
@@ -2007,6 +2017,7 @@ def build_render_plan(
                         "tile_x": int(x),
                         "tile_y": int(y),
                         **geometry_recipe_metadata(view.shared_view, shared_job if shared_job is not None else aff),
+                        **projection_sampling_record(view.shared_view),
                         **radial_view_plan_metadata(view.shared_view),
                         **spherical_view_plan_metadata(view.shared_view),
                     },
@@ -2244,6 +2255,7 @@ def write_overlay_for_plan(*, volume: np.ndarray, mask: np.ndarray, plan: Render
                 close_ffmpeg_writer(proc)
 
 
+@runtime_telemetry_phase('pta.publish.overlays')
 def write_overlays_global(*, volume: np.ndarray, mask: np.ndarray, plans: Sequence[RenderPlan], fps: float, overlay_tile_writer_limit: int, workers: int, overlay_workers: int, overlay_pending_frames: int, warnings: WarningLog) -> None:
     overlay_plans = [
         plan for plan in plans
@@ -2300,6 +2312,7 @@ class VolumeInputSpec:
     frame_count_hint: Optional[int] = None
     fps_hint: Optional[float] = None
     yolo_polygons_by_index: Dict[int, YoloPolygons] = field(default_factory=dict)
+    source_stem: Optional[str] = None
 
 
 @dataclass
@@ -2385,6 +2398,7 @@ def _v18_view_manifest_record(view: ViewInfo) -> Dict[str, object]:
         "tilt_angle_deg": float(shared.tilt_angle_deg),
         "tilt_direction": str(shared.tilt_direction),
         "azimuthal_tilted_source": bool(shared.azimuthal_tilted_source),
+        **projection_sampling_record(shared),
         "radial_geometry": radial_view_manifest_record(shared),
         "spherical_geometry": spherical_view_manifest_record(shared),
     }
@@ -2434,6 +2448,8 @@ def capture_v18_pta_input_identities(
     for spec in specs:
         records.append({
             "stem": str(spec.stem),
+            "source_stem": str(spec.stem if spec.source_stem is None else spec.source_stem),
+            "input_directory": str(spec.input_dir),
             "kind": str(spec.kind),
             "volume_class": str(spec.volume_class),
             "label_source": str(spec.label_source),
@@ -2581,6 +2597,7 @@ def write_v18_pta_manifest(
         },
         "resolved_configuration": {
             "accepted_mode_arguments": dict(vars(config.args)),
+            "input_directories": [str(root) for root in dict.fromkeys(spec.input_dir for spec in specs)],
             "imgsz": int(config.args.imgsz),
             "requested_output_format": str(config.requested_output_format),
             "effective_output_format": str(config.effective_output_format),
@@ -2829,13 +2846,52 @@ def classify_sequence_spec(image_indices: Sequence[int], labels_by_index: Dict[i
     return "unlabeled", image_start
 
 
-def discover_volume_specs(input_arg: str, *, force: bool, warnings: WarningLog) -> List[VolumeInputSpec]:
-    input_path = Path(input_arg).expanduser().resolve()
-    if not input_path.exists():
-        raise FileNotFoundError(input_path)
-    if not input_path.is_dir():
-        raise ValueError("--input must be a directory containing supported PTA volume inputs")
+def resolve_pta_input_dirs(input_arg: str | Path | Sequence[str | Path]) -> List[Path]:
+    values = [input_arg] if isinstance(input_arg, (str, Path)) else list(input_arg)
+    if not values:
+        raise ValueError("--input requires at least one PTA input directory")
+    roots: List[Path] = []
+    for value in values:
+        root = Path(value).expanduser().resolve()
+        if not root.exists():
+            raise FileNotFoundError(root)
+        if not root.is_dir():
+            raise ValueError(f"--input must contain directories with supported PTA volume inputs: {root}")
+        for previous in roots:
+            if root == previous:
+                raise ValueError(f"--input contains a duplicate directory: {root}")
+            if _path_is_within(root, previous) or _path_is_within(previous, root):
+                raise ValueError(f"PTA input directories must be disjoint: {previous}, {root}")
+        roots.append(root)
+    return roots
 
+
+def discover_volume_specs(
+    input_arg: str | Path | Sequence[str | Path], *, force: bool, warnings: WarningLog,
+) -> List[VolumeInputSpec]:
+    specs = [
+        spec
+        for root in resolve_pta_input_dirs(input_arg)
+        for spec in _discover_directory_volume_specs(root, force=force, warnings=warnings)
+    ]
+    counts = Counter(spec.stem.casefold() for spec in specs)
+    used_names = {spec.stem.casefold() for spec in specs if counts[spec.stem.casefold()] == 1}
+    for index, spec in enumerate(specs):
+        if counts[spec.stem.casefold()] == 1:
+            continue
+        digest = hashlib.sha256(os.path.normcase(str(spec.input_dir)).encode("utf-8")).hexdigest()
+        for length in range(12, len(digest) + 1):
+            name = f"{spec.stem}__{digest[:length]}"
+            if name.casefold() not in used_names:
+                break
+        else:
+            raise ValueError(f"Cannot assign a unique output identity to {spec.input_dir / spec.stem}")
+        used_names.add(name.casefold())
+        specs[index] = replace(spec, stem=name, source_stem=spec.stem)
+    return specs
+
+
+def _discover_directory_volume_specs(input_path: Path, *, force: bool, warnings: WarningLog) -> List[VolumeInputSpec]:
     files = [p for p in input_path.iterdir() if p.is_file()]
     images_raw = sorted([p for p in files if p.suffix.lower() in IMAGE_EXTS], key=natural_index_key)
     labels_raw = sorted([p for p in files if p.suffix.lower() == ".txt"], key=natural_index_key)
@@ -2975,6 +3031,7 @@ def discover_volume_specs(input_arg: str, *, force: bool, warnings: WarningLog) 
     return specs
 
 
+@runtime_telemetry_phase('pta.input.load')
 def load_source_volume_from_spec(
     spec: VolumeInputSpec,
     *,
@@ -3075,6 +3132,7 @@ def load_source_volume_from_spec(
     )
 
 
+@runtime_telemetry_phase('pta.plan.geometry')
 def build_plans_for_views(
     *,
     views: Sequence[ViewInfo],
@@ -3222,6 +3280,7 @@ def build_plans_for_views(
     return plans
 
 
+@runtime_telemetry_phase('pta.prepare')
 def prepare_loaded_source(
     src: SourceVolume,
     *,
@@ -3737,6 +3796,7 @@ def _polygon_intersects_canvas_tile(
     return False
 
 
+@runtime_telemetry_phase('pta.classify.preservation')
 def classify_semantic_full_transverse_for_preservation(
     prep: PreparedVolume,
 ) -> Dict[Tuple[str, int, str, int], bool]:
@@ -3769,6 +3829,7 @@ def classify_semantic_full_transverse_for_preservation(
     return foregrounds
 
 
+@runtime_telemetry_phase('pta.classify.originals')
 def classify_original_foregrounds_for_volume(
     prep: PreparedVolume,
     *,
@@ -4301,14 +4362,17 @@ def _path_is_within(path: Path, parent: Path) -> bool:
 def validate_fresh_output_safety(
     out_dir: Path,
     *,
-    input_dir: Path,
+    input_dir: Path | Sequence[Path],
     specs: Sequence[VolumeInputSpec],
     augmentation_path: Optional[Path] = None,
 ) -> None:
     """Refuse fresh-publication cleanup that could overlap authoritative inputs."""
 
     output = Path(out_dir).resolve(strict=False)
-    source_root = Path(input_dir).resolve(strict=False)
+    roots = [input_dir] if isinstance(input_dir, (str, Path)) else list(input_dir)
+    source_roots = list(dict.fromkeys(
+        Path(root).resolve(strict=False) for root in [*roots, *(spec.input_dir for spec in specs)]
+    ))
     filesystem_root = Path(output.anchor).resolve(strict=False)
     user_home = Path.home().resolve(strict=False)
     working_directory = Path.cwd().resolve(strict=False)
@@ -4324,15 +4388,16 @@ def validate_fresh_output_safety(
             "PTA output may not be the active workspace directory or one of its ancestors: "
             f"workspace={working_directory}, output={output}"
         )
-    if (
-        output == source_root
-        or _path_is_within(output, source_root)
-        or _path_is_within(source_root, output)
-    ):
-        raise ValueError(
-            "PTA output and input directories must be disjoint for a fresh publication; "
-            f"input={source_root}, output={output}"
-        )
+    for source_root in source_roots:
+        if (
+            output == source_root
+            or _path_is_within(output, source_root)
+            or _path_is_within(source_root, output)
+        ):
+            raise ValueError(
+                "PTA output and input directories must be disjoint for a fresh publication; "
+                f"input={source_root}, output={output}"
+            )
 
     sentinel = output / _V18_OUTPUT_SENTINEL_NAME
     if output.exists():
@@ -4356,7 +4421,7 @@ def validate_fresh_output_safety(
                     f"PTA output sentinel does not own this exact directory: {sentinel}"
                 )
 
-    protected: List[Path] = [source_root]
+    protected: List[Path] = list(source_roots)
     for spec in specs:
         protected.extend(Path(value).resolve(strict=False) for value in spec.image_paths_by_index.values())
         protected.extend(Path(value).resolve(strict=False) for value in spec.labels_by_index.values())
@@ -4575,7 +4640,7 @@ def write_pta_summary(
     path: Path,
     *,
     command: str,
-    input_dir: Path,
+    input_dir: Path | Sequence[Path],
     out_dir: Path,
     specs: Sequence[VolumeInputSpec],
     volume_records: Sequence[VolumeSummaryRecord],
@@ -4605,7 +4670,9 @@ def write_pta_summary(
     lines: List[str] = []
     lines.append(f"Specification version: {PIPELINE_SPEC_VERSION}")
     lines.append(f"Command: {command}")
-    lines.append(f"Input directory: {input_dir}")
+    roots = [input_dir] if isinstance(input_dir, (str, Path)) else list(input_dir)
+    for root in roots:
+        lines.append(f"Input directory: {root}")
     lines.append(f"Output directory: {out_dir}")
     lines.append(f"Volumes discovered: {len(specs)}")
     lines.append(f"Workers: {int(workers)} (0 defaults to the process CPU-affinity count)")
@@ -4648,7 +4715,7 @@ def write_pta_summary(
     lines.append(f"NRRD export layout: {NRRD_AXIS_ORDER_NOTE}; space={NRRD_SPACE}; space_directions=identity")
     lines.append("Built-in PTA in-plane variant: fixed internally at 0 degrees; --angle is not a PTA flag")
     lines.append("Implementation notes/conflicts:")
-    lines.append("  - --force resolves Partially Labeled volumes to Fully Labeled for uniform type checking; without --force, mixed raw volume classes are rejected before processing.")
+    lines.append("  - --force resolves Partially Labeled volumes to Fully Labeled for uniform type checking within each input directory; directories may have different volume classes.")
     lines.append("  - For unlabeled volumes, --background_percent is disabled because background is defined by the YOLO label export while label operations are excluded for unlabeled annotation outputs.")
     lines.append("  - The pipeline emits frame index %04d as the one-based source-view frame index; filtered-out frames are omitted rather than compact-renumbered.")
     lines.append("  - --channel_format gray/grey emits one channel; RGB triplicates slice N; C{odd}S{stride} maps neighboring view slices into channels and adds a reverse-order output set.")
@@ -4925,7 +4992,7 @@ def _accumulate_background_stats(total: BackgroundFilterStats, part: BackgroundF
     total.dropped += int(part.dropped)
     total.original_background_dropped += int(part.original_background_dropped)
     total.augmented_background_dropped += int(part.augmented_background_dropped)
-    if part.skipped_reason and not total.skipped_reason:
+    if part.skipped_reason and not total.skipped_reason and not total.classification_performed:
         total.skipped_reason = part.skipped_reason
     for subset_name, subset in part.subset_stats.items():
         agg = total.subset_stats.setdefault(subset_name, {})
@@ -5180,13 +5247,14 @@ def main(
         )
         + f"; output_format={args.output_format}"
     )
-    input_dir = Path(args.input).expanduser().resolve()
-    default_output = Path.cwd() / input_dir.name
+    input_values = [args.input] if isinstance(args.input, (str, Path)) else args.input
+    input_dirs = [Path(value).expanduser().resolve() for value in input_values]
+    default_output = Path.cwd() / input_dirs[0].name
     out_dir = Path(args.output).expanduser().resolve() if args.output else default_output
     v18_input_identities = capture_v18_pta_input_identities(specs)
     validate_fresh_output_safety(
         out_dir,
-        input_dir=input_dir,
+        input_dir=input_dirs,
         specs=specs,
         augmentation_path=(
             augmentation_definition.path
@@ -5200,7 +5268,7 @@ def main(
     invalidate_v18_pta_completion(out_dir)
     clean_generated_output_dirs(out_dir, preserve_manifest=True)
 
-    labels_available = all(spec.label_source in {"yolo", "nrrd"} and spec.volume_class != "unlabeled" for spec in specs)
+    labels_available = any(spec.label_source in {"yolo", "nrrd"} and spec.volume_class != "unlabeled" for spec in specs)
     create_output_dirs(
         out_dir,
         split_active=bool(split_active),
@@ -5414,7 +5482,8 @@ def main(
             """
             nonlocal order_counter
             future, vol_warnings = pending_loads.pop(spec_index)
-            current_src = future.result()
+            with runtime_telemetry().span('pta.input.wait'):
+                current_src = future.result()
             _submit_load(spec_index + 1)  # depth-1 prefetch, no fork constraint (G2)
             spec = pending_specs[spec_index]
             prep = prepare_loaded_source(
@@ -5512,7 +5581,7 @@ def main(
             base_background_stats = apply_background_filter(
                 cands,
                 background_percent=float(args.background_percent),
-                labels_available=bool(labels_available),
+                labels_available=bool(prep.label_enabled),
                 warnings=vol_warnings,
             )
             physical, vol_augmentation_stats = plan_augmented_versions(
@@ -5530,7 +5599,7 @@ def main(
                 physical,
                 base_stats=base_background_stats,
                 background_percent=float(args.background_percent),
-                labels_available=bool(labels_available),
+                labels_available=bool(prep.label_enabled),
                 warnings=vol_warnings,
             )
             if semantic_classification_skipped:
@@ -5588,12 +5657,17 @@ def main(
                 "progress": None,
             }
 
+        @runtime_telemetry_phase('pta.plan.volume')
         def _plan_volume(spec_index: int) -> Dict[str, object]:
+            runtime_trace_event('pta.volume_plan_start', stem=pending_specs[spec_index].stem)
             rendering_active = any(progress.pending_a or progress.pending_b for progress in progress_by_gen.values())
             phase_workers = planning_workers if rendering_active else cpu_budget.bootstrap_workers
             phase_cpus = planning_cpu_order if rendering_active else cpu_budget.bootstrap_cpu_order
             with _planning_phase_affinity(phase_cpus if bool(args.topology_aware) else ()):
-                return _plan_volume_with_budget(spec_index, phase_workers)
+                state = _plan_volume_with_budget(spec_index, phase_workers)
+            runtime_trace_event('pta.volume_plan_complete', stem=pending_specs[spec_index].stem,
+                                candidates=len(state['cands']), versions=len(state['physical']))
+            return state
 
         def _submit_phase_a(state: Dict[str, object]) -> None:
             """Enqueue all retained candidates in one source-frame-grouped phase."""
@@ -5672,11 +5746,14 @@ def main(
                 handle = render_pool.install_phase(gen=gen, prep=prep, tasks=tasks)
                 state["handles"].append(handle)  # type: ignore[union-attr]
                 progress.pending_a = render_pool.submit_phase(handle, meta=(gen, "A"))
+                runtime_trace_event('pta.render_submitted', stem=prep.src.stem,
+                                    tasks=len(tasks), candidates=len(retained))
 
         def _submit_phase_b(state: Dict[str, object]) -> int:
             """C3: no second render phase; any rare offline flip overage is trimmed."""
             return 0
 
+        @runtime_telemetry_phase('pta.publish.volume_finalize')
         def _finalize_volume(state: Dict[str, object], withheld: int) -> None:
             nonlocal total_written, total_flip_dropped, total_background_withheld
             prep: PreparedVolume = state["prep"]  # type: ignore[assignment]
@@ -5701,7 +5778,7 @@ def main(
                 physical,
                 flips_by_subset=flips_by_subset,
                 background_percent=float(args.background_percent),
-                labels_available=bool(labels_available),
+                labels_available=bool(prep.label_enabled),
                 out_dir=out_dir,
                 split_active=bool(split_active),
                 image_format=str(args.output_format),
@@ -5798,6 +5875,7 @@ def main(
             # G2: workers have finished with this volume.  Drop parent-side
             # array views, close the mappings, and unlink their names.
             _release_render_state(state)
+            runtime_trace_event('pta.volume_complete', stem=spec.stem, written=written_effective)
 
         load_executor_stopped = False
         try:
@@ -5927,7 +6005,7 @@ def main(
         summary_path = write_pta_summary(
             out_dir / "summary.txt",
             command=summary_command,
-            input_dir=input_dir,
+            input_dir=input_dirs,
             out_dir=out_dir,
             specs=specs,
             volume_records=volume_records,

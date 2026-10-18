@@ -471,7 +471,7 @@ class ViewInfo:
     tta_angle_deg: float = 0.0
     augmentation_pass: int = 0
     augmentation_base_view: str = ''
-    sampling_policy: str = 'dense'
+    sampling_policy: str = 'coverage'
     sampling_certificate: str = ''
     sampling_error_bound_sq: float = 0.0
     sampling_reference_frames: int = 0
@@ -740,6 +740,9 @@ def view_output_token(view: ViewInfo) -> str:
         from .qsc import QSC_FACE_NAMES
         token = (f'Spherical_{view.spherical_group}_{QSC_FACE_NAMES[view.spherical_face]}_'
                  f'PatchU{view.spherical_patch_u}_V{view.spherical_patch_v}')
+        band = re.search(r'_band(\d+)_patch_', physical_view_name(view))
+        if band:
+            token += f'_Band{band.group(1)}'
     elif is_azimuthal_view(view):
         base = str(azimuthal_base_view_name(view)).capitalize()
         if is_tilted_azimuthal_view(view):
@@ -969,10 +972,10 @@ def get_view_infos(
     spherical_views: Optional[Sequence[str]] = None,
     spherical_min_radius: Optional[float] = None,
     spherical_patch_size: int = 0,
-    sampling_policy: str = 'dense',
     azimuthal_auto_views: Sequence[str] = (),
+    augmentation_angles: Sequence[float] = (0.0,),
 ) -> List[ViewInfo]:
-    """Build the complete view set without changing any view-family geometry."""
+    """Build the complete view set using certified native shell sampling."""
     enabled_cartesian = resolve_cartesian_views(cartesian_views)
     enabled_azimuthal = _resolve_unique_view_tokens(
         azimuthal_views,
@@ -1034,28 +1037,23 @@ def get_view_infos(
 
     # Scheduling order is unchanged: upright Cartesian, upright Azimuthal, concrete Tilted,
     # then Azimuthal transforms of concrete Tilted variants.
-    if sampling_policy not in ('dense', 'coverage'):
-        raise ValueError('Unknown projection sampling policy')
-    if sampling_policy == 'coverage':
-        from .azimuthal_coverage import optimize_azimuthal_view
-        automatic = set(azimuthal_auto_views)
-        azimuthal_cartesian = [optimize_azimuthal_view(view) if view.azimuthal_request_token in automatic else view
-                               for view in azimuthal_cartesian]
-        azimuthal_tilted = [optimize_azimuthal_view(view) if view.azimuthal_request_token in automatic else view
-                           for view in azimuthal_tilted]
+    from .azimuthal_coverage import optimize_azimuthal_view
+    automatic = set(azimuthal_auto_views)
+    azimuthal_cartesian = [optimize_azimuthal_view(view, augmentation_angles=augmentation_angles) if view.azimuthal_request_token in automatic else view
+                           for view in azimuthal_cartesian]
+    azimuthal_tilted = [optimize_azimuthal_view(view, augmentation_angles=augmentation_angles) if view.azimuthal_request_token in automatic else view
+                       for view in azimuthal_tilted]
     from .cylindrical_geometry import build_radial_view_infos
     shells = build_radial_view_infos(
         int(T), int(H), int(W), targets=tuple(radial_views or ()),
         min_radius=radial_min_radius, patch_size=int(radial_patch_size),
         tilted_views=tilted,
-        sampling_policy=sampling_policy,
     )
     from .spherical_geometry import build_spherical_view_infos
     spheres = build_spherical_view_infos(
         int(T), int(H), int(W), targets=tuple(spherical_views or ()),
         min_radius=spherical_min_radius, patch_size=int(spherical_patch_size),
         tilted_views=tilted,
-        sampling_policy=sampling_policy,
     )
     return orthogonal + azimuthal_cartesian + tilted + azimuthal_tilted + shells + spheres
 

@@ -262,13 +262,20 @@ def test_blocked_funded_child_and_second_decline_bound_probe_window(monkeypatch)
         assert_settled(context, pool, before)
 
 
-def test_success_restores_all_empty_slots_after_headroom_recovers(monkeypatch):
+def test_success_restores_all_empty_slots_after_headroom_recovers_when_parent_wave_is_busy(monkeypatch):
     first_entered, release_first, release_rest = (threading.Event() for _ in range(3))
     three_entered = threading.Event()
     context, runtime = Context(), Runtime(release_first.set, release_rest.set)
     state, lock = dict(room=128*resources.GIB, probes=0, parallel=set()), threading.Lock()
     with parent() as (pool, original), ThreadPoolExecutor(4) as workers:
         before = pool.in_use
+        # This case isolates child-window refill. A live original tracker scope
+        # forbids the separate already-funded parent-inline optimization.
+        wave = resources.cpu_wave_admission(resources.cpu_session_bytes(3, 9)['estimated_peak_bytes'],
+            27, original.assigned_cpu_wave_bytes, 1)
+        original_scope = resources.admit_sam_tracker_scope(original, wave,
+            max_seed_pixels=9, max_frame_count=3, job_count=1)
+        original_scope.acquire_scope()
         def probe():
             with lock:
                 state['probes'] += 1
@@ -305,7 +312,11 @@ def test_success_restores_all_empty_slots_after_headroom_recovers(monkeypatch):
             results, stats = execute(monkeypatch, FirstStartsFirst(), original, context,
                 runtime, run, count=6, capacity=3)
         finally:
-            monitor.finish()
+            try:
+                monitor.finish()
+            finally:
+                original_scope.release_scope()
+                original_scope.close()
         assert [item['ordinal'] for item in results] == list(range(6))
         assert stats['resource_declines'] == 2 and stats['child_groups'] == 6
         assert stats['serial_fallback_groups'] == 0 and context.peak_children == 3

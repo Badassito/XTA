@@ -20,13 +20,13 @@ device execution and complete source qualification belong in separate receipts.
 | --- | --- | --- |
 | Cartesian: Transverse, Sagittal, Coronal | Canonical categorical restoration; matching bounded D1 native-coverage pull for eligible layouts | CUDA requires its own eligible layout and device checks |
 | Tilted Cartesian | Shared view union followed by canonical destination pull | CPU; projection CUDA disabled |
-| Upright Azimuthal, dense | Shared view union and canonical destination pull | Eligible Transverse CUDA; Sagittal/Coronal CPU |
+| Upright Azimuthal, full-mask output | Shared view union and canonical destination pull | Eligible Transverse CUDA; Sagittal/Coronal CPU |
 | Upright Azimuthal, coverage | Declared reconstruction-plan angular/column pull | Eligible Transverse CUDA; Sagittal/Coronal CPU |
 | Tilted Azimuthal | Shared view union and bounded canonical CPU pull; unsafe CUDA plan refused | CPU; projection CUDA unsupported |
 | Radial and tilted Radial | Bounded native shell pull | Eligible parent CUDA or separate native owner |
 | Spherical and rotated Spherical | Bounded destination-native QSC pull | CUDA requires its own eligible layout and device checks |
 
-Immediate D1 point scatter is no longer used for Tilted Cartesian, dense
+Immediate D1 point scatter is no longer used for Tilted Cartesian, full-mask
 Azimuthal, or Tilted Azimuthal, including hybrid detector runs. Their masks pass
 through a bounded shared view union and the canonical projector. Cartesian D1
 native coverage and the separate Radial native owner remain available.
@@ -48,6 +48,32 @@ Both ordinary Tilted and Tilted Azimuthal engine projection can be slower than
 the former scatter route. CUDA projection remains unavailable for those routes;
 a qualified inverse GPU plan is a separate optimization. Local CPU timings do
 not establish full-cluster wall time.
+
+## Compact upright Azimuthal sampling
+
+Automatic upright Azimuthal requests can use fewer angles at the existing
+compact raster size without creating patches. For diameter `D`, `N` endpoint
+samples and angular gap `delta` radians, let
+`p = max(1/2, (D-1)/(2*(N-1)))`. The selected gap satisfies
+`p*p + (D*delta/4)^2 <= 0.99`. The independent stack-axis bound is
+`max(1/2, stack_length/(2*rows))^2 <= 0.99`; it is not added to the planar
+quadrature because it is a separate source coordinate. Both bounds retain a
+positive native interpolation tap with numerical margin.
+
+The direct sampler's positive-weight fringe clamps preserve diameter/stack
+endpoints through admitted model padding. Existing guards still require a
+qualifying unrotated pass, source axes within 4096, linear source sampling,
+matching endpoint radius and supported raster pitch. Tilted, nearest-source,
+excessively coarse and explicit user spacing requests keep their established
+behavior. Coarsened views retain native pull projection, never D1 point scatter.
+This certifies the interpolation basis, not a nonzero gray8 result or nearest
+categorical-label coverage.
+
+For F3 working shape 2911/3064/3022 and imgsz2048, upright Transverse angles
+fall from 4,747 to 3,557; Sagittal and Coronal each fall from 4,573 to 3,284.
+Total native frames decrease 13,893 to 10,125 (27.12%). Radial patching and its
+current certified radius spacing are unchanged. These are planning counts;
+GPU/model throughput and quality require separate qualification.
 
 ## Bounded CPU execution
 
@@ -173,6 +199,82 @@ at the declared closed annulus boundary; it does not add a voxel-scale margin
 or change the radii. Face seams are closed and nearest-shell midpoint ties
 resolve inward.
 
+TTA, PTA and LTA use the same coverage-only physical-view planner. There is no
+selectable dense sampling mode. PTA's built-in physical render uses angle zero;
+TTA and LTA preserve their requested angles. Spherical and Radial render their
+native patch before the in-plane affine, so their native sampling certificates
+do not depend on including angle zero. Azimuthal's fused TTA model-grid sampler
+retains its separate coarsening admission check: without a qualifying unrotated
+pass, it keeps conservative angular spacing and records the reason. Explicit
+Azimuthal spacing and unsupported geometry retain their existing semantics.
+
+Spherical plans vary both the angular grid and radial spacing by band. Each
+band keeps one endpoint-inclusive QSC lattice, fixed patch origins and a uniform
+radius trajectory. Patches sample the volume directly at native coordinates;
+the planner never combines four rendered patches into one resized input.
+
+The approved certificate means that every voxel center in the declared annulus
+has positive weight in at least one direct trilinear input sample. For a band's
+outer radius `R`, face interval count `n` and largest realized shell gap `g`, it
+checks an outward-rounded bound:
+
+```text
+g*g/4 + 2*(41/50)*(R/n)*(R/n) <= (255/256)^2 < 1.
+```
+
+The inverse QSC map's squared Lipschitz bound `41/50` is certified offline with
+exact rational interval arithmetic, a short Machin-series enclosure of pi, and
+1,024 closed intervals. That certificate is not evaluated during production
+planning. The remaining 1/256-voxel distance reserve exceeds the tested coordinate
+rounding envelope for the existing qualified FP32 path (axes at most 4096).
+FP64 coordinate tests include large anisotropic centers. These numerical tests
+are not a formal proof of every platform's math library.
+
+The guarantee is positive native input contribution, not selection of every
+voxel by the nearest categorical sampler or survival through arbitrary later
+augmentation/downsampling. The separately evaluated nearest-voxel proposal was
+rejected. Intensity and categorical rendering retain their established samplers.
+Historical v1/v2 captures retain their original bounds and provenance; their
+validation does not expose an alternative production sampling mode.
+
+Adjacent bands share their exact endpoint radius. Both lattices render that
+shell, and the closed projection annuli meet without a gap. Channels and SAM
+interpolation stay within each band because its frame spacing and ownership are
+part of the trajectory, even when neighboring bands share the same angular grid.
+
+The planner minimizes actual native patch images among a small practical set:
+a fixed outer grid, the adaptive patch-class partition of a uniform shell grid,
+and two, four or eight bands placed uniformly in radius or in an arcsine transform
+of radius. Each candidate band is independently certified after constructing its
+actual uniform radii. Duplicate endpoints are charged in the cost; ties prefer
+fewer bands. This is a bounded candidate comparison, not a global-optimum claim.
+Shell count may increase or decrease when doing so reduces total patch images.
+
+For `imgsz=2048`, automatic minimum radius and one upright cube/angle:
+
+| Working shape T/Y/X | Previous dynamic TTA patches | Previous dynamic PTA patches | Current shared patches | Current unique shells | Current band trajectories |
+| --- | --- | --- | --- | --- | --- |
+| F3: 2911/3064/3022 | 13,326 | 24,504 | 5,430 | 898 | 48 |
+| Synthetic: 3072/3072/3072 | 14,430 | 28,872 | 6,390 | 1058 | 48 |
+
+The F3 result uses eight bands of 108–122 radii each. Its 905 shell occurrences
+include seven duplicated boundaries; unique radii are counted once. All eight
+bands fit one native patch per face. Four arcsine-spaced bands use 5,778 images
+and 24 trajectories, while eight use 5,430 and 48. The lower patch count wins the
+stated objective, but additional trajectory setup and downstream SAM work remain
+runtime costs. Planning counts are not measured cluster speedups or model-quality
+claims. [Candidate comparison](../../Scratch/Experiments/spherical-coverage-20261014/joint-planning/candidate_counts.json)
+and [implemented counts](../../Scratch/Experiments/spherical-coverage-20261014/joint-planning/implemented_counts.json)
+retain the exact inputs and band layouts.
+
+Planning scans a small set of scalar candidates and shell radii, never every
+source voxel. One band plan is shared across its faces and patches. GPU direction
+keys exclude radius/band identity and retain the existing bounded cache; CPU cone
+bounds share at most 128 immutable face/rotation entries. Projection's necessary
+voxel work remains in compiled CPU or CUDA kernels. The CPU reference renderer
+still evaluates vectorized QSC coordinates in bounded row strips; it does not
+allocate an uncharged persistent full-patch direction bank.
+
 Radial pull admits valid height cells in `[-0.5, N-0.5)` and clamps their
 nearest sample addresses. Tilted Radial applies that rule after inverse shear.
 Its closed annulus uses the same roundoff-only relative tolerance, scaled
@@ -229,7 +331,8 @@ physical ROI and field of view, reduced-to-native and anisotropic grids,
 positive and all-black inputs, sharp background bands and shell gaps,
 seams/padding, chunk/ROI paths, and mask/confidence alignment.
 
-Spherical checks cover all faces, corners, poles, active-shell gaps, enlarged
+Spherical checks cover actual native input taps, changing band lattices,
+shared radius endpoints, all faces, corners, poles, active-shell gaps, enlarged
 cubic and noncubic grids, rotations, signed tilted groups, Cartesian aliases,
 positive-score support and rational closed-radius boundaries. Radial checks
 cover all base axes, enlarged and contracted noncubic grids, height caps, signed

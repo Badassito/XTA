@@ -26,20 +26,17 @@ def _read_meminfo_bytes() -> Dict[str, int]:
     return info
 
 def _cgroup_read_int(path: Path) -> Optional[int]:
+    """Read a nonnegative counter; zero differs from an unreadable counter."""
     try:
         raw = path.read_text().strip()
     except Exception:
         return None
-    if not raw or raw == 'max':
+    if not raw.isascii() or not raw.isdigit():
         return None
     try:
-        value = int(raw)
-    except Exception:
+        return int(raw)
+    except ValueError:
         return None
-    # cgroup reports "unlimited" as a huge page-rounded sentinel (~2^63).
-    if value <= 0 or value >= (1 << 60):
-        return None
-    return value
 
 def _cgroup_reclaimable_file_bytes(node: Path, *, v2: bool) -> int:
     """Return clean inactive file-cache bytes reclaimable by this cgroup."""
@@ -52,28 +49,66 @@ def _cgroup_reclaimable_file_bytes(node: Path, *, v2: bool) -> int:
         for line in (node / 'memory.stat').read_text().splitlines():
             parts = line.split()
             if len(parts) == 2 and parts[0] in keys:
-                try:
-                    found[parts[0]] = int(parts[1])
-                except Exception:
-                    continue
+                if (parts[0] in found or not parts[1].isascii()
+                        or not parts[1].isdigit()):
+                    return 0
+                found[parts[0]] = int(parts[1])
     except Exception:
         return 0
-    inactive = int(found.get(keys[0], 0))
-    if inactive <= 0:
+    # Missing dirty/writeback counters do not prove that file pages are clean.
+    if any(key not in found for key in keys):
         return 0
-    unreclaimable = int(found.get(keys[1], 0)) + int(found.get(keys[2], 0))
-    return max(0, inactive - unreclaimable)
+    return max(0, found[keys[0]] - found[keys[1]] - found[keys[2]])
 
-def _cgroup_memory_headroom_bytes() -> Optional[int]:
-    """Return the tightest cgroup memory headroom across the process ancestry.
+def _cgroup_canonical_mount_verified(mountinfo: str, base: Path, *, v2: bool) -> bool:
+    """Authenticate the simple membership-to-path mapping used below.
 
-    Usage excludes reclaimable clean file cache; ``None`` means no finite cgroup limit.
+    Non-root bind mounts and other layouts retain the conservative RSS fallback.
+    """
+    matches = []
+    for line in mountinfo.splitlines():
+        before, separator, after = line.partition(' - ')
+        fields, filesystem = before.split(), after.split()
+        if separator and len(fields) >= 6:
+            mountpoint = re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), fields[4])
+            # A nested mount can replace a cgroup directory or an individual
+            # counter file. Do not infer enforcement through such an overlay.
+            if mountpoint.startswith(base.as_posix() + '/'):
+                return False
+            if mountpoint == base.as_posix():
+                matches.append((fields, filesystem))
+    if len(matches) != 1:
+        return False
+    fields, filesystem = matches[0]
+    if fields[3] != '/' or len(filesystem) < 3:
+        return False
+    return (filesystem[0] == 'cgroup2' if v2 else
+            filesystem[0] == 'cgroup' and 'memory' in filesystem[2].split(','))
+
+
+def _cgroup_memory_budget(*, verify_enforcement: bool = True) -> tuple[Optional[int], Optional[int]]:
+    """Return (tightest headroom, verified enforcing cap) for this process.
+
+    All finite ancestors bound headroom. The second value additionally requires
+    a verified canonical mount and hierarchical accounting, so callers can use
+    it to prove that a separate allocation cap is already enforced. Unknown
+    scope never supplies that proof. Unreadable usage under a known finite cap
+    grants zero headroom, rather than treating missing usage as zero bytes.
+    Headroom-only callers skip mount discovery and never receive a cap proof.
     """
     try:
         cgroup_text = Path('/proc/self/cgroup').read_text()
     except Exception:
-        return None
+        return None, None
+    mountinfo = ''
+    if verify_enforcement:
+        try:
+            mountinfo = Path('/proc/self/mountinfo').read_text()
+        except Exception:
+            pass
     headroom: Optional[int] = None
+    enforcing_cap: Optional[int] = None
+    unresolved_scope = False
     for line in cgroup_text.splitlines():
         parts = line.split(':', 2)
         if len(parts) != 3:
@@ -91,18 +126,53 @@ def _cgroup_memory_headroom_bytes() -> Optional[int]:
             limit_name, usage_name = 'memory.limit_in_bytes', 'memory.usage_in_bytes'
         else:
             continue
+        if (not cg_path.startswith('/') or '\\' in cg_path or '//' in cg_path
+                or any(part in ('.', '..') for part in cg_path.split('/'))):
+            unresolved_scope = True
+            continue
+        verified = verify_enforcement and _cgroup_canonical_mount_verified(mountinfo, base, v2=is_v2)
         node = base / cg_path.lstrip('/')
         while node == base or base in node.parents:
-            limit = _cgroup_read_int(node / limit_name)
+            try:
+                raw_limit = (node / limit_name).read_text().strip()
+            except FileNotFoundError:
+                # A controller need not expose a limit at every ancestry level.
+                raw_limit = None
+            except Exception:
+                return 0, None
+            limit = None
+            if raw_limit is not None and not (is_v2 and raw_limit == 'max'):
+                if not raw_limit.isascii() or not raw_limit.isdigit():
+                    return 0, None
+                try:
+                    limit = int(raw_limit)
+                except ValueError:
+                    return 0, None
+                # v1 reports unlimited as a huge page-rounded sentinel (~2^63).
+                if not is_v2 and limit >= (1 << 60):
+                    limit = None
             if limit is not None:
-                usage = int(_cgroup_read_int(node / usage_name) or 0)
-                usage = max(0, usage - _cgroup_reclaimable_file_bytes(node, v2=is_v2))
-                level_headroom = max(0, int(limit) - usage)
+                usage = _cgroup_read_int(node / usage_name)
+                if usage is None:
+                    return 0, None
+                hierarchical = is_v2 or _cgroup_read_int(node / 'memory.use_hierarchy') == 1
+                # v1 total_* stats cover descendants; do not subtract those
+                # from a non-hierarchical local usage counter.
+                reclaimable = (min(usage, _cgroup_reclaimable_file_bytes(node, v2=is_v2))
+                               if hierarchical else 0)
+                level_headroom = max(0, limit - (usage - reclaimable))
                 headroom = level_headroom if headroom is None else min(headroom, level_headroom)
+                if verified and hierarchical:
+                    enforcing_cap = limit if enforcing_cap is None else min(enforcing_cap, limit)
             if node == base:
                 break
             node = node.parent
-    return headroom
+    return headroom, None if unresolved_scope else enforcing_cap
+
+
+def _cgroup_memory_headroom_bytes() -> Optional[int]:
+    """Return tightest cgroup headroom, excluding reclaimable clean file cache."""
+    return _cgroup_memory_budget(verify_enforcement=False)[0]
 
 def available_anon_work_bytes() -> int:
     info = _read_meminfo_bytes()

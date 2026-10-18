@@ -1,8 +1,8 @@
-"""Dense radius stacks on a rotated, six-face QSC atlas.
+"""Radius-adaptive stacks on a rotated, six-face QSC atlas.
 
 The unit-sphere chart is independent of the source-volume transform. Faces use
-one endpoint-inclusive grid sized for the outer radius; directions and intrinsic
-patch origins therefore remain fixed across radius channels and interpolation.
+one endpoint-inclusive grid per radial band; directions and intrinsic patch
+origins remain fixed across each trajectory's channels and interpolation.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 
-from .qsc import QSC_FACE_NAMES, qsc_face_intervals, qsc_inverse
+from .qsc import QSC_FACE_NAMES, qsc_inverse
 
 if TYPE_CHECKING:
     from .geometry import ViewInfo
@@ -30,14 +30,12 @@ class SphericalSurface:
         return np.asarray(self.center_xyz, np.float64) + float(radius) * (np.asarray(directions) @ rotation.T)
 
 
-def radius_grid(minimum, maximum):
+def _validate_radius_bounds(minimum, maximum):
     if not math.isfinite(minimum) or minimum <= 0:
         raise ValueError('--spherical_min_radius must be finite and strictly positive')
     if not math.isfinite(maximum) or maximum < minimum:
         raise ValueError(f'--spherical_min_radius {minimum:g} exceeds largest inscribed sphere radius {maximum:g}; '
                          'reduce --spherical_min_radius or --imgsz')
-    count = max(1, int(math.ceil(maximum - minimum)) + 1)
-    return tuple(float(value) for value in np.linspace(minimum, maximum, count))
 
 
 def _patch_origins(length, size):
@@ -70,7 +68,7 @@ def cube_rotation(direction='', angle=0.0):
 
 def build_spherical_view_infos(t: int, h: int, w: int, *, targets: Sequence[str],
                                min_radius: float | None, patch_size: int,
-                               tilted_views: Sequence['ViewInfo'], sampling_policy: str = 'dense') -> list['ViewInfo']:
+                               tilted_views: Sequence['ViewInfo']) -> list['ViewInfo']:
     from .config import SPHERICAL_VIEW_TOKENS, _resolve_unique_view_tokens
     from .geometry import ViewInfo, tilted_base_view_name
 
@@ -84,22 +82,10 @@ def build_spherical_view_infos(t: int, h: int, w: int, *, targets: Sequence[str]
         raise ValueError('Spherical views require at least two voxel centers on every source axis')
     minimum = float(patch_size) / (4.0 * math.pi) if min_radius is None else float(min_radius)
     maximum = (min(t, h, w) - 1) / 2.0
-    radii = radius_grid(minimum, maximum)
-    intervals = qsc_face_intervals(maximum)
-    sampling_fields = {}
-    if sampling_policy not in ('dense', 'coverage'):
-        raise ValueError('Unknown Spherical sampling policy')
-    if sampling_policy == 'coverage':
-        from .spherical_sampling import CERTIFICATE, plan_spherical_sampling
-        plan = plan_spherical_sampling(minimum, maximum, patch_size)
-        if plan.optimized:
-            radii, intervals = plan.radii, plan.intervals
-            sampling_fields = dict(sampling_policy='coverage', sampling_certificate=CERTIFICATE,
-                                   sampling_error_bound_sq=plan.error_bound_squared,
-                                   sampling_reference_frames=plan.reference_frames)
-        else:
-            sampling_fields = dict(sampling_reason='dense lattice already minimizes certified native frame count')
-    origins = _patch_origins(intervals + 1, patch_size)
+    _validate_radius_bounds(minimum, maximum)
+    from .spherical_sampling import CERTIFICATE, plan_spherical_bands
+    bands = plan_spherical_bands(minimum, maximum, patch_size)
+    reference_frames = bands[0].reference_frames
     groups = {}
     upright = tuple(token for token in SPHERICAL_VIEW_TOKENS if token in requested and not token.startswith('tilted_'))
     if upright:
@@ -116,34 +102,41 @@ def build_spherical_view_infos(t: int, h: int, w: int, *, targets: Sequence[str]
             key = (str(view.tilt_direction), float(view.tilt_angle_deg))
             groups.setdefault(key, set()).add(target)
     result = []
-    step = (maximum - minimum) / (len(radii) - 1) if len(radii) > 1 else 0.0
     for (direction, angle), aliases in sorted(groups.items()):
         token = ('p' if angle >= 0 else 'm') + format(abs(angle), '.12g').replace('.', 'p')
         group = f'{direction}_{token}' if direction else 'upright'
         rotation = cube_rotation(direction, angle)
         provenance = tuple(token for token in SPHERICAL_VIEW_TOKENS if token in aliases)
-        for face, face_name in enumerate(QSC_FACE_NAMES):
-            for iv, v0 in enumerate(origins):
-                for iu, u0 in enumerate(origins):
-                    name = f'spherical_{group}_{face_name.lower()}_patch_u{iu}_v{iv}'
-                    result.append(ViewInfo(
-                        **sampling_fields,
-                        name=name, family='spherical', summary_family=name,
-                        display_name=f'Spherical QSC {group} / {face_name} / patch {iu},{iv}',
-                        num_slices=len(radii), src_h=patch_size, src_w=patch_size,
-                        pad_mode='pad', full_t=t, full_h=h, full_w=w,
-                        diameter=min(t, h, w), roi_radius=maximum,
-                        horizontal_axis='qsc_u', vertical_axis='qsc_v', stack_axis='radius',
-                        tilt_angle_deg=angle, tilt_direction=direction,
-                        spherical_face=face, spherical_group=group,
-                        spherical_request_tokens=provenance, spherical_tilted_source=bool(direction),
-                        spherical_min_radius=minimum, spherical_max_radius=maximum,
-                        spherical_step=step, spherical_radii=radii,
-                        spherical_face_intervals=intervals, spherical_patch_size=patch_size,
-                        spherical_u_origin=u0, spherical_v_origin=v0,
-                        spherical_patch_u=iu, spherical_patch_v=iv,
-                        spherical_rotation_xyz=rotation,
-                    ))
+        for band_index, plan in enumerate(bands):
+            radii, intervals = plan.radii, plan.intervals
+            lower, upper = radii[0], radii[-1]
+            step = (upper - lower) / (len(radii) - 1) if len(radii) > 1 else 0.0
+            origins = _patch_origins(intervals + 1, patch_size)
+            band_label = f'_band{band_index}' if len(bands) > 1 else ''
+            for face, face_name in enumerate(QSC_FACE_NAMES):
+                for iv, v0 in enumerate(origins):
+                    for iu, u0 in enumerate(origins):
+                        name = f'spherical_{group}_{face_name.lower()}{band_label}_patch_u{iu}_v{iv}'
+                        result.append(ViewInfo(
+                            sampling_certificate=CERTIFICATE,
+                            sampling_error_bound_sq=plan.error_bound_squared,
+                            sampling_reference_frames=reference_frames,
+                            name=name, family='spherical', summary_family=name,
+                            display_name=f'Spherical QSC {group} / {face_name} / radius {lower:g}-{upper:g} / patch {iu},{iv}',
+                            num_slices=len(radii), src_h=patch_size, src_w=patch_size,
+                            pad_mode='pad', full_t=t, full_h=h, full_w=w,
+                            diameter=min(t, h, w), roi_radius=maximum,
+                            horizontal_axis='qsc_u', vertical_axis='qsc_v', stack_axis='radius',
+                            tilt_angle_deg=angle, tilt_direction=direction,
+                            spherical_face=face, spherical_group=group,
+                            spherical_request_tokens=provenance, spherical_tilted_source=bool(direction),
+                            spherical_min_radius=lower, spherical_max_radius=upper,
+                            spherical_step=step, spherical_radii=radii,
+                            spherical_face_intervals=intervals, spherical_patch_size=patch_size,
+                            spherical_u_origin=u0, spherical_v_origin=v0,
+                            spherical_patch_u=iu, spherical_patch_v=iv,
+                            spherical_rotation_xyz=rotation,
+                        ))
     return result
 
 

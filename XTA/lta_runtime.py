@@ -93,7 +93,7 @@ class LtaRuntimeViewPlan:
     runtime_view: object | None = field(default=None, repr=False, compare=False)
 
     def manifest_record(self) -> dict[str, object]:
-        from .unification.tta_manifest import radial_view_manifest_record, spherical_view_manifest_record
+        from .unification.tta_manifest import radial_view_manifest_record, spherical_view_manifest_record, projection_sampling_record
 
         return {
             "volume_id": self.volume_id,
@@ -118,6 +118,7 @@ class LtaRuntimeViewPlan:
                 for value in self.encoded_frame_indices
             ],
             "raster_plan_digest": self.raster_plan_digest,
+            **projection_sampling_record(self.runtime_view),
             "radial_geometry": radial_view_manifest_record(self.runtime_view),
             "spherical_geometry": spherical_view_manifest_record(self.runtime_view),
         }
@@ -382,7 +383,7 @@ def build_lta_run_plan(
         raise ValueError("run_id must not be empty")
     volume_plans = []
     from .unification.sampling import build_forward_raster_plan
-    from .unification.tta_manifest import radial_view_plan_metadata, spherical_view_plan_metadata
+    from .unification.tta_manifest import radial_view_plan_metadata, spherical_view_plan_metadata, projection_sampling_record
     from .unification.geometry_identity import geometry_recipe_metadata
     for volume in discovery.target_volumes:
         if volume.width is None or volume.height is None:
@@ -404,6 +405,7 @@ def build_lta_run_plan(
             spherical_requests=config.spherical_requests,
             spherical_min_radius=config.args.spherical_min_radius,
             spherical_patch_size=1008,
+            augmentation_angles=config.angles,
         )
         physical_views = tuple(getattr(compiled, "views"))
         variants = tuple(variant_expander(physical_views, config.angles))
@@ -446,6 +448,7 @@ def build_lta_run_plan(
                     "channel_policy": LTA_CHANNEL_POLICY,
                     "runtime_kind": "fullframe_sam",
                     **geometry_recipe_metadata(physical),
+                    **projection_sampling_record(physical),
                     **radial_view_plan_metadata(physical),
                     **spherical_view_plan_metadata(physical),
                 },

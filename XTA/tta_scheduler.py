@@ -227,6 +227,7 @@ class TtaSchedulerState:
     worker_memfd_sources: Dict[Tuple[str, int], _WorkerMemfdSourceCache] = field(default_factory=dict)
     cpu_worker_processes: List[object] = field(default_factory=list)
     gpu_worker_processes: List[object] = field(default_factory=list)
+    gpu_worker_ready_details_by_id: Dict[int, Dict[str, object]] = field(default_factory=dict)
     cpu_worker_dispatched_by_id: Dict[int, int] = field(default_factory=dict)
     cpu_worker_results_by_id: Dict[int, int] = field(default_factory=dict)
     cpu_worker_seconds_per_frame_ewma: Dict[Tuple[object, ...], float] = field(
@@ -2068,12 +2069,19 @@ class TtaScheduler:
             return True
         _count, inference, postprocess = self._direct_union_admission_totals(include_cpu_input=False)
         available = int(self.inputs.direct_union_total_dense_byte_limit) - inference - postprocess - self.direct_union_task_bytes(task)
-        if available >= self.cpu_input_prefetch.reserved_bytes:
-            return True
+        # Commit even when retirement already shrank reserved_bytes: this also
+        # releases the pending reclaim target so later free capacity can refill.
         if available >= 0 and yield_capacity(available) is not None:
             return True
         # Preserve the established empty-owner escape for one valid oversized parent.
-        return not task.get('bounded_parent_admission', False) and not self.state.direct_union_backing_leases
+        if not task.get('bounded_parent_admission', False) and not self.state.direct_union_backing_leases:
+            return True
+        request_reclaim = getattr(self.cpu_input_prefetch, 'request_reclaim_capacity', None)
+        if available >= 0 and callable(request_reclaim):
+            request_reclaim(available, preferred_parent=parent, preferred_task=task)
+        # A retirement request is not a grant. Its completion wakes the existing
+        # admission retry, which must commit settled credit before parent birth.
+        return False
 
     def direct_union_task_admissible(
         self, task: Dict[str, object], *,
@@ -2133,7 +2141,11 @@ class TtaScheduler:
             _count, mask_inference, mask_postprocess = self._direct_union_admission_totals(include_cpu_input=False)
             mask_need = mask_inference + mask_postprocess + int(need)
             if mask_need <= int(self.inputs.direct_union_total_dense_byte_limit):
-                total_ok = can_yield(int(self.inputs.direct_union_total_dense_byte_limit) - mask_need)
+                available = int(self.inputs.direct_union_total_dense_byte_limit) - mask_need
+                total_ok = can_yield(available)
+                can_reclaim = getattr(self.cpu_input_prefetch, 'can_reclaim_capacity', None)
+                if not total_ok and callable(can_reclaim):
+                    total_ok = can_reclaim(available)
         return bool(inference_ok and total_ok)
 
     def activate_direct_union_task(self, task: Dict[str, object]) -> None:
@@ -2816,7 +2828,7 @@ class TtaScheduler:
             self.state.gpu_worker_dispatch_cursor = (worker_ids.index(worker_id) + 1) % len(worker_ids)
             if not self._commit_cpu_input_capacity(task_to_dispatch):
                 self.state.gpu_worker_pending_task_ids.appendleft(int(task_id))
-                break  # A concurrent builder consumed the previewed unused grant.
+                break  # Wait for owned input retirement, never borrow unsettled credit.
             if (self.inputs.request_baseline_workspaces is not None
                     and not self.inputs.request_baseline_workspaces(task_to_dispatch)):
                 self.state.gpu_worker_pending_task_ids.appendleft(int(task_id))
@@ -3585,6 +3597,21 @@ class TtaScheduler:
                     f"model={msg.get('model_xml')})."
                 )
             else:
+                worker, worker_pid = msg.get('gpu_index'), msg.get('pid')
+                if (type(worker) is int and worker in self.state.gpu_task_queues
+                        and type(worker_pid) is int and worker_pid > 0
+                        and self._worker_process_pid('gpu', worker) == worker_pid):
+                    uuid = msg.get('cuda_device_uuid')
+                    self.state.gpu_worker_ready_details_by_id[worker] = {
+                        'cuda_device_uuid': uuid if isinstance(uuid, str) and uuid else None,
+                        'worker_pid': worker_pid,
+                    }
+                    self._telemetry_gauge('gpu.device_identity', {
+                        'parent_pid': os.getpid(), 'sample_monotonic_ns': time.monotonic_ns(),
+                        'source': 'managed_worker_ready',
+                        'devices': {f'cuda:{index}': dict(details) for index, details in
+                                    self.state.gpu_worker_ready_details_by_id.items()},
+                    })
                 print(f"GPU worker ready: device cuda:{msg.get('gpu_index')} (pid {msg.get('pid')}).")
             return
         if mtype == 'fatal':

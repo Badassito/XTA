@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
-from dataclasses import asdict, replace
+from dataclasses import replace
 import inspect
 import io
 import json
@@ -58,27 +58,41 @@ class ProjectionSamplingIntegrationTests(unittest.TestCase):
         source_mode.start()
         self.addCleanup(source_mode.stop)
 
-    def test_shared_compiler_defaults_remain_identical_to_explicit_dense(self):
-        arguments = dict(radial=('transverse',), spherical=('transverse',))
-        default = compiled(**arguments)
-        dense = compiled(**arguments, sampling_policy='dense')
-        self.assertEqual(default, dense)
+    def test_shared_compiler_has_one_coverage_schedule_for_all_families(self):
+        default = compiled(radial=('transverse',), spherical=('transverse',))
+        self.assertNotIn('sampling_policy', inspect.signature(compile_physical_views).parameters)
+        self.assertNotIn('sampling_policy', inspect.signature(g.get_view_infos).parameters)
         for view in default.views:
-            self.assertEqual(view.sampling_policy, 'dense')
-            self.assertEqual(projection_sampling_record(view), {})
+            self.assertEqual(view.sampling_policy, 'coverage')
+            self.assertTrue(view.sampling_certificate)
+            self.assertEqual(projection_sampling_record(view)['projection_sampling']['certificate'], view.sampling_certificate)
             if view.family == 'radial':
-                self.assertEqual(view.radial_global_count, 0)
+                self.assertGreater(view.radial_global_count, 0)
+
+    def test_pta_uses_the_same_coverage_geometry_as_zero_angle_tta(self):
+        from XTA.pta import compile_v18_pta_views, _v18_view_manifest_record
+        requests = SimpleNamespace(
+            cartesian_views=(), azimuthal_requests=config.resolve_azimuthal_view_requests(('transverse',)),
+            tilted_groups=(), radial_requests=config.resolve_radial_view_requests(('transverse',)),
+            spherical_requests=config.resolve_spherical_view_requests(('transverse',)),
+            args=SimpleNamespace(radial_min_radius=None, spherical_min_radius=None),
+        )
+        adapted, pta = compile_v18_pta_views(t_dim=17, h=19, w=21, config=requests,
+                                          azimuthal_native_raster=32)
+        tta = compiled(radial=('transverse',), spherical=('transverse',))
+        self.assertEqual(pta, tta)
+        self.assertEqual(tuple(view.shared_view for view in adapted), tta.views)
+        azimuthal = next(view for view in adapted if view.shared_view.family == "azimuthal")
+        self.assertEqual(_v18_view_manifest_record(azimuthal)["projection_sampling"],
+                         projection_sampling_record(azimuthal.shared_view)["projection_sampling"])
 
     def test_3072_counts_and_compiled_azimuth_metadata_match_actual_geometry(self):
-        arguments = dict(shape=(3072,) * 3, size=3072,
-                         radial=('transverse',), spherical=('transverse',))
-        dense = compiled(**arguments, sampling_policy='dense')
-        coverage = compiled(**arguments, sampling_policy='coverage')
-        expected = {'spherical': (31032, 6402), 'radial': (2969, 1726), 'azimuthal': (4826, 2805)}
-        for family, counts in expected.items():
+        coverage = compiled(shape=(3072,) * 3, size=3072,
+                            radial=('transverse',), spherical=('transverse',))
+        expected = {'spherical': 4428, 'radial': 1726, 'azimuthal': 2805}
+        for family, count in expected.items():
             with self.subTest(family=family):
-                self.assertEqual(tuple(sum(view.num_slices for view in result.views if view.family == family)
-                                       for result in (dense, coverage)), counts)
+                self.assertEqual(sum(view.num_slices for view in coverage.views if view.family == family), count)
                 self.assertTrue(all(view.sampling_certificate for view in coverage.views if view.family == family))
         azimuthal = next(view for view in coverage.views if view.family == 'azimuthal')
         self.assertEqual(coverage.azimuthal_azimuth_angles,
@@ -87,21 +101,44 @@ class ProjectionSamplingIntegrationTests(unittest.TestCase):
                          azimuthal.azimuths_deg)
 
     def test_single_frame_azimuth_metadata_reconstructs_its_actual_vector(self):
-        result = compiled(shape=(1, 1, 1), size=1, sampling_policy='coverage')
+        result = compiled(shape=(1, 1, 1), size=1)
         self.assertEqual(result.views[0].azimuths_deg, (0.0,))
         self.assertEqual(tuple(g.build_azimuthal_azimuths(result.azimuthal_azimuth_angles[0])),
                          result.views[0].azimuths_deg)
+
+    def test_compact_f3_azimuthal_saves_actual_frames_without_new_patches(self):
+        result = compiled(shape=(2911, 3064, 3022), size=2048,
+                          azimuthal=('transverse', 'sagittal', 'coronal'))
+        self.assertEqual(len(result.views), 3)
+        self.assertEqual(sum(view.num_slices for view in result.views), 10125)
+        self.assertEqual(sum(view.sampling_reference_frames for view in result.views), 13893)
+        for view, spacing in zip(result.views, result.azimuthal_azimuth_angles):
+            self.assertTrue(requires_native_pull(view))
+            self.assertEqual((view.src_h, view.src_w), (2048, 2048))
+            self.assertEqual(tuple(g.build_azimuthal_azimuths(spacing)), view.azimuths_deg)
+
+    def test_planning_tool_reports_global_shells_and_all_radius_bands(self):
+        from tools.plan_projection_sampling import plan
+        result = plan((11, 13, 15), 8)
+        self.assertEqual(tuple(result['plans']), ('coverage',))
+        record = result['plans']['coverage']['spherical']
+        self.assertEqual(record['native_frames'], 84)
+        self.assertEqual(record['radius_count'], 4)
+        self.assertEqual(len(record['radius_bands']), 2)
+        self.assertEqual(record['radius_bands'][0]['minimum_radius'], 8 / (4 * np.pi))
+        self.assertEqual(record['radius_bands'][-1]['maximum_radius'], 5.)
+        self.assertEqual(record['face_intervals'], 14)
+        self.assertEqual(record['error_bound_squared'], max(band['error_bound_squared'] for band in record['radius_bands']))
 
     def test_explicit_azimuth_spacing_is_preserved_even_if_numerically_equal_to_auto(self):
         diameter = 19
         auto_step = 360.0 / (np.pi * diameter)
         for step in (0.25, 60.0, auto_step):
             request = (f'transverse:{step!r}',)
-            dense = compiled(azimuthal=request, sampling_policy='dense')
-            coverage = compiled(azimuthal=request, sampling_policy='coverage')
+            coverage = compiled(azimuthal=request)
             with self.subTest(step=step):
-                self.assertEqual(dense, coverage)
                 self.assertEqual(coverage.azimuthal_azimuth_angles, (step,))
+                self.assertEqual(coverage.views[0].azimuths_deg, tuple(g.build_azimuthal_azimuths(step)))
                 self.assertFalse(requires_native_pull(coverage.views[0]))
 
     def test_auto_fallback_retains_geometry_for_compact_tilted_and_large_sources(self):
@@ -112,19 +149,20 @@ class ProjectionSamplingIntegrationTests(unittest.TestCase):
                  tilted=(config.TiltedViewGroup(('transverse',), (30.0,), ('vertical',)),)),
         )
         for arguments in cases:
-            dense = compiled(**arguments, sampling_policy='dense')
-            coverage = compiled(**arguments, sampling_policy='coverage')
+            coverage = compiled(**arguments)
             with self.subTest(arguments=arguments):
-                self.assertEqual(dense.azimuthal_azimuth_angles, coverage.azimuthal_azimuth_angles)
-                for before, after in zip(dense.views, coverage.views):
-                    original, actual = asdict(before), asdict(after)
-                    actual['sampling_reason'] = original['sampling_reason']
-                    self.assertEqual(original, actual)
-                    if after.family == 'azimuthal':
-                        self.assertTrue(after.sampling_reason)
-                        self.assertFalse(requires_native_pull(after))
+                for view in coverage.views:
+                    if view.family == 'azimuthal':
+                        diameter = g.azimuthal_target_diameter(view.azimuthal_request_token,
+                                                             view.full_t, view.full_h, view.full_w)
+                        self.assertEqual(view.azimuths_deg,
+                                         tuple(g.build_azimuthal_azimuths(360.0 / (np.pi * diameter))))
+                        self.assertEqual(view.sampling_policy, 'coverage')
+                        self.assertTrue(view.sampling_reason)
+                        self.assertFalse(view.sampling_certificate)
+                        self.assertFalse(requires_native_pull(view))
 
-    def test_tta_sampling_requires_an_unrotated_base_and_rejects_unknown_options(self):
+    def test_tta_forwards_requested_angles_without_an_alternative_sampling_mode(self):
         parser = config.build_argparser()
         arguments = ['--input', 'source.mkv', '--model', 'cpu:model.xml']
         self.assertFalse(hasattr(parser.parse_args(arguments), 'projection_sampling'))
@@ -135,11 +173,8 @@ class ProjectionSamplingIntegrationTests(unittest.TestCase):
                 self.assertEqual(rejected.exception.code, 2)
                 self.assertIn(f'unrecognized arguments: {option} coverage', stderr.getvalue())
         tree = ast.parse(inspect.getsource(pipeline._main_impl))
-        default = next(node for node in ast.walk(tree) if _assigned(node, 'sampling_policy', 'coverage'))
-        admission = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
-                         and any(_assigned(statement, 'sampling_policy', 'dense') for statement in node.body))
         assignment = next(node for node in ast.walk(tree) if _assigned(node, 'compiled_physical_views'))
-        program = compile(ast.fix_missing_locations(ast.Module(body=[default, admission, assignment], type_ignores=[])),
+        program = compile(ast.fix_missing_locations(ast.Module(body=[assignment], type_ignores=[])),
                           '<physical-view-compilation>', 'exec')
         for angles in ((0.0,), (360.0,), (-360.0,), (45.0,), (90.0, 180.0), (0.0, 45.0), (45.0, 360.0)):
             compiler = mock.Mock()
@@ -147,10 +182,26 @@ class ProjectionSamplingIntegrationTests(unittest.TestCase):
                        enabled_cartesian_views=(), azimuthal_requests=(), tilt_groups=(),
                        radial_requests=(), spherical_requests=(),
                        args=SimpleNamespace(imgsz=32, radial_min_radius=None, spherical_min_radius=None))
-            with contextlib.redirect_stdout(io.StringIO()):
-                exec(program, env)
-            expected = 'coverage' if any(angle % 360.0 == 0.0 for angle in angles) else 'dense'
-            self.assertEqual(compiler.call_args.kwargs['sampling_policy'], expected)
+            exec(program, env)
+            self.assertNotIn('sampling_policy', compiler.call_args.kwargs)
+            self.assertEqual(compiler.call_args.kwargs['augmentation_angles'], angles)
+
+    def test_nonzero_only_tta_preserves_native_schedules_and_limits_azimuthal_coarsening(self):
+        arguments = dict(radial=('transverse',), spherical=('transverse',))
+        base = compiled(**arguments)
+        for angles in ((45.0,), (90.0, 180.0), (0.0, 45.0), (-360.0,)):
+            current = compiled(**arguments, augmentation_angles=angles)
+            self.assertEqual([view for view in current.views if view.family in ('radial', 'spherical')],
+                             [view for view in base.views if view.family in ('radial', 'spherical')])
+            variants = g.expand_views_into_tta_variants(current.views, angles)
+            self.assertEqual(tuple(dict.fromkeys(view.tta_angle_deg for view in variants)), angles)
+            azimuthal = next(view for view in current.views if view.family == 'azimuthal')
+            admitted = any(angle % 360.0 == 0.0 for angle in angles)
+            self.assertEqual(bool(azimuthal.sampling_certificate), admitted)
+            self.assertEqual(requires_native_pull(azimuthal), admitted)
+            self.assertEqual(azimuthal.sampling_policy, 'coverage')
+            if not admitted:
+                self.assertIn('unrotated', azimuthal.sampling_reason)
 
     def test_d1_and_hybrid_production_routes_require_cartesian_coverage(self):
         tree = ast.parse(inspect.getsource(pipeline._main_impl))
@@ -161,9 +212,9 @@ class ProjectionSamplingIntegrationTests(unittest.TestCase):
                        and any(_assigned(statement, 'result_mode', 'd1_owner') for statement in node.body))
         program = compile(ast.fix_missing_locations(ast.Module(body=[hybrid, routing], type_ignores=[])),
                           '<coverage-result-routing>', 'exec')
-        dense = compiled().views[0]
-        coverage = compiled(sampling_policy='coverage').views[0]
-        fallback = compiled(shape=(65, 67, 69), size=32, sampling_policy='coverage').views[0]
+        dense = compiled(azimuthal=('transverse:1',)).views[0]
+        coverage = compiled().views[0]
+        fallback = compiled(shape=(65, 67, 69), size=32).views[0]
         for view, bypass in ((dense, False), (coverage, True), (fallback, False),
                              (replace(coverage, family='orthogonal'), False)):
             self.assertEqual(requires_native_pull(view), bypass)
@@ -184,9 +235,9 @@ class ProjectionSamplingIntegrationTests(unittest.TestCase):
                 with self.subTest(view=view.name, bypass=bypass, cpu=cpu):
                     self.assertEqual(env['result_mode'], expected)
 
-    def test_plan_metadata_is_conditional_and_coverage_changes_fullframe_and_tile_identity(self):
-        dense = compiled().views[0]
-        coverage = compiled(sampling_policy='coverage').views[0]
+    def test_plan_metadata_records_certificate_for_fullframe_and_tile_identity(self):
+        dense = compiled(azimuthal=('transverse:1',)).views[0]
+        coverage = compiled().views[0]
         affine = g.build_affine(dense.name, dense.src_w, dense.src_h, 32, 0.0, dense.pad_mode)
         job = g.AugJob('a0', 0.0, Path('unused.json'), affine)
         dense_plan = g.build_fullframe_raster_plan(dense, job)
@@ -212,9 +263,9 @@ class ProjectionSamplingIntegrationTests(unittest.TestCase):
         self.assertNotIn('projection_sampling', dict(dense_tile.metadata))
         self.assertIn('projection_sampling', dict(coverage_tile.metadata))
 
-    def test_manifest_records_resolved_certificates_and_dense_fallback_reason(self):
+    def test_manifest_records_resolved_certificates_and_conservative_fallback_reason(self):
         requests = config.resolve_azimuthal_view_requests(('transverse',))
-        results = compiled(sampling_policy='coverage')
+        results = compiled()
         view = results.views[0]
         with activate_unified_launch(version='22.0.0', launcher='xta', mode='tta', mode_arguments=()) as launch:
             manifest = build_tta_run_manifest(
@@ -227,15 +278,15 @@ class ProjectionSamplingIntegrationTests(unittest.TestCase):
                 backend={}, forward_sampling={}, prediction_processing={}, requested_outputs=(), output_paths={})
         record = manifest['geometry']['physical_views'][0]['projection_sampling']
         self.assertEqual(record['certificate'], view.sampling_certificate)
-        self.assertEqual(record['dense_reference_frames'], view.sampling_reference_frames)
+        self.assertEqual(record['legacy_reference_frames'], view.sampling_reference_frames)
         self.assertEqual(record['reference_scope'], 'view_trajectory')
         self.assertIn('positive native intensity interpolation support', record['coverage_basis'])
         group = manifest['geometry']['azimuthal_groups'][0]
         self.assertEqual(group['resolved_azimuth_angle_deg'], results.azimuthal_azimuth_angles[0])
         self.assertEqual(group['concrete_azimuth_vectors'][0]['azimuths_deg'], list(view.azimuths_deg))
-        fallback = compiled(shape=(65, 67, 69), size=32, sampling_policy='coverage').views[0]
+        fallback = compiled(shape=(65, 67, 69), size=32).views[0]
         fallback_record = projection_sampling_record(fallback)['projection_sampling']
-        self.assertEqual(fallback_record['policy'], 'dense')
+        self.assertEqual(fallback_record['policy'], 'coverage')
         self.assertFalse(fallback_record['certificate'])
         self.assertTrue(fallback_record['fallback_reason'])
 
@@ -244,7 +295,7 @@ class ProjectionSamplingIntegrationTests(unittest.TestCase):
         # coordinates; these include half-pixel padding and upscale phases.
         for shape, size in (((16, 31, 33), 31), ((17, 32, 33), 48),
                             ((32, 17, 19), 32), ((33, 18, 19), 48)):
-            view = compiled(shape=shape, size=size, sampling_policy='coverage').views[0]
+            view = compiled(shape=shape, size=size).views[0]
             self.assertTrue(view.sampling_certificate)
             variant = g.expand_views_into_tta_variants((view,), (0.0,))[0]
             affine = g.build_aug_job_for_variant(variant, size, Path('unused')).aff
@@ -312,13 +363,13 @@ class ProjectionSamplingReplayTests(unittest.TestCase):
         path.write_text(json.dumps(descriptor), encoding='utf-8')
 
     def test_legacy_dense_replay_defaults_additive_sampling_and_augmentation_fields(self):
-        view = compiled(shape=(5, 7, 9), size=9).views[0]
+        view = replace(compiled(shape=(5, 7, 9), size=9, azimuthal=('transverse:1',)).views[0], sampling_policy='dense')
         captured = self.capture(view)
         self.rewrite(captured, lambda key: key.startswith(('sampling_', 'augmentation_')) or key == 'radial_global_count')
         self.assertEqual(component_replay.load_component_replay(captured).view, view)
 
     def test_certified_replay_preserves_metadata_and_rejects_partially_missing_policy(self):
-        view = compiled(shape=(5, 7, 9), size=9, sampling_policy='coverage').views[0]
+        view = compiled(shape=(5, 7, 9), size=9).views[0]
         captured = self.capture(view)
         self.assertEqual(component_replay.load_component_replay(captured).view, view)
         self.rewrite(captured, lambda key: key == 'sampling_policy')

@@ -72,7 +72,7 @@ def build_case(size, angle, pattern, density, seed):
     views = compile_physical_views(t_dim=size, height=size, width=size, cartesian_views=(),
         azimuthal_requests=(AzimuthalViewRequest('tilted_transverse'),),
         tilted_groups=(TiltedViewGroup(('transverse',),(30.,),('vertical',)),),
-        azimuthal_native_raster=size, sampling_policy='dense').views
+        azimuthal_native_raster=size).views
     selected = [view for view in views if view.family == 'azimuthal'
                 and azimuthal_source_tilted_view(view).tilt_angle_deg == angle]
     if len(selected) != 1:

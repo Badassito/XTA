@@ -119,8 +119,9 @@ def test_batch_budget_is_clamped_to_live_remaining_profile_and_rejects_saved_met
             iterator=context._transverse_batch_iterator(view,lazy.shape,records,addresses,
                 affine,inverse,'geometry',297)
             batch,stats=next(iterator)
-            assert stats['admitted_workspace_bytes']==8192-297
-            assert stats['peak_resize_workspace_bytes']<=8192-297
+            # Observation and contract metadata each retain one quarter of the fixed base.
+            assert stats['admitted_workspace_bytes']==8192//2-297
+            assert stats['peak_resize_workspace_bytes']<=8192//2-297
             iterator.close();del batch
             context._resource_local.profile=profile.metadata()
             with pytest.raises(TypeError,match='live SamResourceProfile'):

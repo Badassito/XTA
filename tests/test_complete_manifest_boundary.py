@@ -3,6 +3,10 @@ from __future__ import annotations
 import tempfile
 import unittest
 import json
+import ast
+import contextlib
+import io
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
@@ -14,6 +18,86 @@ from XTA.pta_config import parse_pta_args
 
 
 class CompleteManifestBoundaryTests(unittest.TestCase):
+    def test_incomplete_manifest_keeps_cleanup_and_adjacent_identity_check(self) -> None:
+        events = []
+        manifest = {'status': 'incomplete', 'sam_requested_work_complete': False,
+                    'sam_planning_omissions': [{'operation': 'interpolation'}]}
+        with (mock.patch.object(pipeline, '_cleanup_tta_selected_run_scratch',
+                                side_effect=lambda **kwargs: events.append('cleanup')),
+              mock.patch.object(pipeline, 'assert_tta_artifacts_unchanged',
+                                side_effect=lambda value: events.append('revalidate')),
+              mock.patch.object(pipeline, 'write_json_manifest',
+                                side_effect=lambda path, value: events.append('write') or path)):
+            pipeline._finalize_tta_selected_run_and_publish(temp_dir=Path('temp'), out_dir=Path('out'),
+                keep_temp_artifacts=False, manifest_path=Path('manifest.json'),
+                manifest=manifest, artifact_identities={})
+        self.assertEqual(events, ['cleanup', 'revalidate', 'write'])
+
+    def test_incomplete_manifest_cannot_bypass_cleanup_or_identity_failure(self) -> None:
+        manifest = {'status': 'incomplete', 'sam_requested_work_complete': False,
+                    'sam_planning_omissions': [{'operation': 'interpolation'}]}
+        for failure_at in ('cleanup', 'identity'):
+            with (self.subTest(failure_at=failure_at),
+                mock.patch.object(pipeline, '_cleanup_tta_selected_run_scratch',
+                    side_effect=RuntimeError('cleanup failed') if failure_at == 'cleanup' else None),
+                mock.patch.object(pipeline, 'assert_tta_artifacts_unchanged',
+                    side_effect=RuntimeError('identity failed') if failure_at == 'identity' else None) as check,
+                mock.patch.object(pipeline, 'write_json_manifest') as write):
+                with self.assertRaisesRegex(RuntimeError, failure_at + ' failed'):
+                    pipeline._finalize_tta_selected_run_and_publish(temp_dir=Path('temp'), out_dir=Path('out'),
+                        keep_temp_artifacts=False, manifest_path=Path('manifest.json'),
+                        manifest=manifest, artifact_identities={})
+                write.assert_not_called()
+                if failure_at == 'cleanup':
+                    check.assert_not_called()
+
+    def test_manifest_publishers_reject_false_completion_or_unsubstantiated_incomplete(self) -> None:
+        with mock.patch.object(pipeline, 'assert_tta_artifacts_unchanged') as check:
+            with self.assertRaisesRegex(ValueError, 'omitted SAM work'):
+                pipeline._publish_complete_tta_manifest(path=Path('manifest.json'), artifact_identities={},
+                    manifest={'status': 'complete', 'sam_requested_work_complete': False})
+            for manifest in ({'status': 'complete'}, {'status': 'incomplete'}):
+                with self.subTest(manifest=manifest), self.assertRaisesRegex(ValueError, 'requires omitted SAM work'):
+                    pipeline._publish_incomplete_tta_manifest(path=Path('manifest.json'),
+                        artifact_identities={}, manifest=manifest)
+            check.assert_not_called()
+
+    def test_actual_final_tail_retires_outputs_before_omission_failure_without_optional_reports(self) -> None:
+        tree = ast.parse(Path(pipeline.__file__).read_text(encoding='utf-8'))
+        main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == '_main_impl')
+        start = next(index for index, node in enumerate(main.body) if isinstance(node, ast.With)
+            and "tta.final.output_retirement_and_publication" in ast.unparse(node))
+        code = compile(ast.Module(body=main.body[start:], type_ignores=[]), pipeline.__file__, 'exec')
+        omission = dict(operation='interpolation', scope_id='model/azimuthal/fullframe', view='azimuthal',
+                        pass_index=1, status='unresolved', reasons=['observation_inventory_memory_limit'],
+                        unresolved_plan=True, unresolved_group_count=0, group_refusal_reasons={})
+        for omissions in ([omission], []):
+            with self.subTest(incomplete=bool(omissions)):
+                events = []
+                telemetry = mock.MagicMock()
+                telemetry.gauge.side_effect = lambda name, value: events.append((name, value))
+                def retire(*args, **kwargs):
+                    events.append('retired')
+                    kwargs['after_close']()
+                namespace = dict(_close_tta_output_artifacts=retire,
+                    _finalize_selected_run_after_output_close=lambda: events.append('finalized'),
+                    _require_sam_requested_work_complete=pipeline._require_sam_requested_work_complete,
+                    runtime_telemetry=lambda: telemetry, output_artifacts=None, keep_temp_artifacts=False,
+                    tail_tile_slice_workers=1, sam_planning_omissions=omissions,
+                    time=SimpleNamespace(perf_counter=lambda: 1.), post_inference_tail_started=0.,
+                    pipeline_wall_started=0., out_dir=Path('out'), temp_dir=Path('temp'),
+                    final_paths={}, summary_path=None, run_manifest_path=None)
+                text = io.StringIO()
+                with mock.patch.object(pipeline, 'runtime_telemetry', return_value=telemetry), contextlib.redirect_stdout(text):
+                    if omissions:
+                        with self.assertRaisesRegex(RuntimeError, 'valid outputs were preserved'):
+                            exec(code, namespace)
+                    else:
+                        exec(code, namespace)
+                self.assertEqual(events[:2], ['retired', 'finalized'])
+                self.assertIn(('pipeline.phase', 'incomplete' if omissions else 'complete'), events)
+                self.assertEqual('Done.' in text.getvalue(), not bool(omissions))
+
     def test_tta_finalize_facade_preserves_private_callback_patch_seams(self) -> None:
         manifest_path = Path("manifest.json")
         manifest = {"status": "complete"}

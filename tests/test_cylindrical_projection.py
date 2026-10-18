@@ -34,7 +34,7 @@ def shells(base='transverse', *, shape=(7, 9, 11), size=5, minimum=0.7, tilt=Fal
 def scalar_oracle(data, view, shape):
     """Deliberately slow scalar nearest-shell/periodic-occurrence reference."""
     out = np.zeros(shape, np.uint8)
-    count = int(math.ceil(view.radial_max_radius - view.radial_min_radius)) + 1
+    count = view.radial_global_count or int(math.ceil(view.radial_max_radius - view.radial_min_radius)) + 1
     radii = [view.radial_min_radius + i * (view.radial_max_radius - view.radial_min_radius) / (count - 1)
              if count > 1 else view.radial_min_radius for i in range(count)]
     work = (view.full_t, view.full_h, view.full_w)

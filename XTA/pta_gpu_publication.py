@@ -15,6 +15,7 @@ import time
 
 from .pta_batch_pipeline import OrderedBatchPipeline
 from .pta_publication import semantic_png_backend
+from .runtime import runtime_telemetry
 
 
 _QUARANTINED_PUBLICATIONS: list[object] = []
@@ -66,6 +67,7 @@ class GpuPublicationResources:
         self.last_report_images = 0
         from multiprocessing.util import Finalize
         self.finalizer = Finalize(self, _finalize_resources, (self,), exitpriority=15)
+        runtime_telemetry().register_sample_provider('pta.publication', self.snapshot)
         print(f'PTA GPU publication pipeline cuda:{self.device}: depth=2, '
               f'GPU outputs={self.gpu_bytes / 1024**2:.0f} MiB, '
               f'encoded queue={self.host_bytes / 1024**2:.0f} MiB, '
@@ -81,6 +83,15 @@ class GpuPublicationResources:
         finally:
             with self.lock:
                 self.timings[name] = self.timings.get(name, 0.) + time.perf_counter() - started
+
+    def snapshot(self):
+        """Reuse publication measurements; overlapping wall times are not additive."""
+        with self.lock:
+            return {'device': self.device, 'counts': dict(self.counts),
+                    'stage_wall_seconds': dict(self.timings),
+                    'stage_times_overlap': True, 'closed': self.closed,
+                    'gpu_queue_limit_bytes': self.gpu_bytes,
+                    'host_queue_limit_bytes': self.host_bytes}
 
     def add_time(self, name, seconds):
         with self.lock:

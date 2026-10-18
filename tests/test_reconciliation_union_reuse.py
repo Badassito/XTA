@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import nullcontext
 from dataclasses import replace
 import gc
 import json
@@ -209,12 +210,16 @@ def _pipeline_reconciliation_block():
 
 
 @pytest.mark.parametrize('reuse', [False, True])
-def test_pipeline_tail_updates_all_known_union_owners_and_preserves_reused_buffer(tmp_path, reuse):
+@pytest.mark.parametrize('sam_active', [False, True])
+def test_pipeline_tail_updates_all_known_union_owners_and_preserves_reused_buffer(tmp_path, reuse, sam_active):
     original = np.zeros((2, 3, 4), np.uint8)
     weak_original = weakref.ref(original)
     replacement = original if reuse else np.ones_like(original)
     closed = []
     namespace = dict(__name__='XTA.pipeline', __package__='XTA', reconciliation_settings=SimpleNamespace(enabled=True),
+        sam_context=object() if sam_active else None, source_survival_reuse=None,
+        _source_bridge_survival_reuse_enabled=lambda *_a: pytest.fail('No final sink needs no reuse capture'),
+        runtime_telemetry=lambda: SimpleNamespace(span=lambda *args: nullcontext()),
         nrrd_layer_sink=lambda: None, final_union_mm=original, streamed_final_union_mm=original,
         streaming_final_union_holder={'model': original}, model_name='model',
         nrrd_layer_refs=[], inference_views=[], source_output_shape_tyx=original.shape,

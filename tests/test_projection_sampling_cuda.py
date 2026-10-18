@@ -28,7 +28,7 @@ def _views(shape, size, *, expanded=False):
         *shape, cartesian_views=(), radial_views=bases+tilted,
         radial_patch_size=size, radial_min_radius=2.,
         spherical_views=('transverse',)+tilted, spherical_patch_size=size,
-        spherical_min_radius=2., sampling_policy='coverage',
+        spherical_min_radius=2.,
         tilt_groups=resolve_tilted_view_groups(['transverse:30:vertical']) if expanded else (),
     ) if v.family in ('radial', 'spherical') and v.tilt_angle_deg >= 0.]
 
@@ -169,11 +169,11 @@ class ProjectionSamplingCudaTests(unittest.TestCase):
         angles = tuple(azimuthal_full_coverage_angle_deg(geometry.azimuthal_target_diameter(base, *shape))
                        for base in bases)
         views = geometry.get_view_infos(*shape, cartesian_views=(), azimuthal_views=bases,
-            azimuthal_azimuth_angles=angles, azimuthal_auto_views=bases, sampling_policy='coverage')
+            azimuthal_azimuth_angles=angles, azimuthal_auto_views=bases)
         # The same selected angles were already legal as an explicit user sweep.
         # They exercise the legacy forward path independently of coverage metadata.
         explicit = geometry.get_view_infos(*shape, cartesian_views=(), azimuthal_views=bases,
-            azimuthal_azimuth_angles=tuple(v.azimuths_deg[1] for v in views), sampling_policy='dense')
+            azimuthal_azimuth_angles=tuple(v.azimuths_deg[1] for v in views))
         volume = np.random.default_rng(1307).integers(0, 256, shape, dtype=np.uint8)
         engine = _GpuWorkerRenderEngine('cuda:0')
         maximum_error = 0.
@@ -182,7 +182,8 @@ class ProjectionSamplingCudaTests(unittest.TestCase):
             self.assertEqual(engine.ensure_volume_array(volume), 'resident')
             for view, legacy in zip(views, explicit):
                 self.assertEqual(view.sampling_policy, 'coverage')
-                self.assertEqual(legacy.sampling_policy, 'dense')
+                self.assertEqual(legacy.sampling_policy, 'coverage')
+                self.assertFalse(legacy.sampling_certificate)
                 self.assertEqual(view.azimuths_deg, legacy.azimuths_deg)
                 for index in sorted({0, 1, view.num_slices//2, view.num_slices-1}):
                     with self.subTest(view=view.name, index=index):
@@ -219,7 +220,7 @@ class ProjectionSamplingCudaTests(unittest.TestCase):
             with self.subTest(group=key):
                 np.testing.assert_array_equal(union, _domain(views[0]).astype(np.uint8))
 
-    def test_random_native_masks_match_cpu_for_coarse_shells_and_rescaled_outputs(self):
+    def test_random_native_masks_match_cpu_for_shared_plans_and_rescaled_outputs(self):
         rng = np.random.default_rng(1408)
         for shape, size in (((19, 21, 23), 32), ((31, 33, 35), 64)):
             for view in _views(shape, size):

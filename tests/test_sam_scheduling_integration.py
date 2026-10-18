@@ -120,7 +120,7 @@ def test_real_context_extrapolation_pipelines_multiple_cohorts_with_fresh_image_
             assert len(pending) == 4 and all(holder._entered and not holder._thread.is_alive() for holder in pending)
             assert stats['added_voxels'] == 7*7*7
             assert account.in_use == 4*GIB and context.cache_logical_bytes == 0
-            assert not context._image_prefetches and not context._retained_image_prefetch_credits
+            assert not context._image_prefetches and not context._retained_parent_image_credits
             assert not list((tmp_path/'runtime'/'sam_image_cache').glob('*.gray8.dat'))
         assert account.in_use == 0
     finally:

@@ -2,7 +2,7 @@
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import replace
 from queue import Empty, SimpleQueue
-from threading import Event, Lock, current_thread, get_ident
+from threading import Event, Lock
 import time
 
 import numpy as np
@@ -33,19 +33,10 @@ def test_sixty_real_parents_drain_after_legacy_projection_consumer_recovers(tmp_
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('Transverse entered compact path')))
     release = Event()
     release.set()
-    waiters, lock, all_producers_waiting = set(), Lock(), Event()
+    lock = Lock()
     projected = []
     queue = ComponentProjectionQueue(workers=2, max_pending=8, max_source_bytes=16*gib,
         max_working_bytes=96*gib, working_budget=lambda:96*gib)
-    original_wait = queue._condition.wait
-    def observe_wait(*args, **kwargs):
-        if current_thread().name.startswith('readiness-parent') and not release.is_set():
-            with lock:
-                waiters.add(get_ident())
-                if len(waiters) == 21:
-                    all_producers_waiting.set()
-        return original_wait(*args, **kwargs)
-    queue._condition.wait = observe_wait
     def materialize(kind, operation):
         def run(entry, **kwargs):
             assert release.wait(30), 'Independent test consumer was not released'
@@ -123,12 +114,25 @@ def test_sixty_real_parents_drain_after_legacy_projection_consumer_recovers(tmp_
         release.clear()
         pending = submit_batch(28, 60)
         try:
-            assert all_producers_waiting.wait(15), 'Did not reach the saturated 21-producer state'
+            for future in pending:
+                future.result(timeout=15)
             state = queue.snapshot()
             assert state['pending'] == 8 and state['active'] == 2
             assert len(retired) == 28 and len(pending) == 32
-            assert any(not context.interpolation_entered.is_set() for context in contexts[28:])
-            assert not all(future.done() for future in pending)
+            assert all(context.extrapolation_entered.is_set() for context in contexts[28:])
+            assert admission.in_use == 0
+            for future in pending:
+                prepared = future.result()
+                assert not settle_prepared_view_components(prepared)
+                leases.retire_dense_for_publication(prepared, enabled=True, tiled=False,
+                    keep_temp=False, retired_callback=lambda *args:retired_events.put(args))
+            while True:
+                try:
+                    key, lease = retired_events.get_nowait()
+                except Empty:
+                    break
+                leases.settle_publication_retirement(key, lease)
+            assert not leases.leases and not leases.postprocess_bytes
         finally:
             release.set()
         drain(pending)

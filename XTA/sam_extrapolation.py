@@ -21,7 +21,7 @@ from .sam_extrapolation_policy import (select_sam_extrapolation,
 from .sam_interpolation import (SamPreparedInterpolationPass,_scope_metadata,_buffer_identity,
     observation_snapshot_sha256,_validate_view,_tracker_requests,_tiled_tracker_requests,
     _iterate_tracker_results,_StreamingGroupMasks,_plain,_trace_sam_phase,
-    _retry_cpu_wave_within_peak,_tracker_scope_admission)
+    _retry_cpu_wave_within_peak,_tracker_scope_admission,_promote_retry_execution)
 from .sam_resources import sam_worker_count
 from .sam_evidence import SamEvidenceWriter
 from .artifact_archive import split_reference, member_exists, artifact_directory, read_artifact
@@ -244,7 +244,7 @@ def _validate_image_cohorts(prepared, cohorts, *, verify_cohort_ids=True):
 
 def _iterate_extrapolation_tracker_results(runtime,prepared,worker_count,groups,observations,
         cache_ref,cancel_event,resource_profile,schedule_records,*,family_dispatch_enabled=True,
-        flat_control_reason='explicit_flat_control'):
+        flat_control_reason='explicit_flat_control',attempt_memory_bounds=None):
     """Pin exact image/crop reuse without changing independent seed sessions."""
     from .sam_interpolation import _family_dispatch_balance, _family_preparation_options, _tracker_request_stream
     work=prepared.tracker_jobs if prepared.crop_mode=='tiled' else prepared.runs
@@ -278,6 +278,17 @@ def _iterate_extrapolation_tracker_results(runtime,prepared,worker_count,groups,
         admitted_plan = replace(prepared,tracker_jobs=items) if prepared.crop_mode=='tiled' else prepared
         with _tracker_scope_admission(runtime,admitted_plan,cache_ref,resource_profile,worker_count,
                                       family=grouped) as admission:
+            if attempt_memory_bounds is not None:
+                try:
+                    from .sam_retry_attempt_bounds import observe_retry_scope
+                    observe_retry_scope(attempt_memory_bounds, admission)
+                except BaseException:
+                    try:
+                        attempt_memory_bounds.flag('diagnostic_read_failed')
+                        attempt_memory_bounds.flag('partial_observation')
+                        attempt_memory_bounds.invalidate_scope()
+                    except BaseException:
+                        pass
             try:
                 if grouped:
                     from .sam_tracker_runtime import SamTrackerFamily
@@ -409,15 +420,37 @@ def write_extrapolation_group(writer,group,plan):
         return
     box=group.context_bbox_yx
     shape=(box[2]-box[0],box[3]-box[1])
+    from .sam_bridge_planning import _readonly
+    empty=_readonly(np.zeros(shape,bool))
+    full=_readonly(np.ones(shape,bool))
+    empty_frames=set()
+    cached_frame=cached_plane=None
+    def frozen(frame):
+        nonlocal cached_frame,cached_plane
+        if frame in empty_frames:
+            return empty
+        if frame!=cached_frame:
+            # Retire the prior raster before constructing its replacement.
+            cached_frame=cached_plane=None
+            plane=_frozen_plane(plan,frame,box)
+            if not plane.any():
+                empty_frames.add(frame)
+                return empty
+            cached_plane=_readonly(plane)
+            cached_frame=frame
+        return cached_plane
+    def write(frame):
+        plane=frozen(frame)
+        return full if plane is empty else _readonly(~plane)
     for oid in group.observation_ids:
         masks['endpoint:'+oid]=lambda oid=oid:by_id[oid].mask_in_crop(box)
-        masks['evaluation:'+oid]=lambda:np.ones(shape,bool)
-        masks['permitted:'+oid]=lambda oid=oid:_frozen_plane(plan,by_id[oid].frame_index,box)&~by_id[oid].mask_in_crop(box)
+        masks['evaluation:'+oid]=lambda:full
+        masks['permitted:'+oid]=lambda oid=oid:frozen(by_id[oid].frame_index)&~by_id[oid].mask_in_crop(box)
     for frame in group.frame_indices:
-        masks[f'acceptance:{frame}']=lambda:np.ones(shape,bool)
-        masks[f'known_foreground:{frame}']=lambda frame=frame:_frozen_plane(plan,frame,box)
-        masks[f'unrelated:{frame}']=lambda frame=frame:_frozen_plane(plan,frame,box)
-        masks[f'write:{frame}']=(lambda frame=frame:~_frozen_plane(plan,frame,box)) if frame in group.output_frames else (lambda:np.zeros(shape,bool))
+        masks[f'acceptance:{frame}']=lambda:full
+        masks[f'known_foreground:{frame}']=lambda frame=frame:frozen(frame)
+        masks[f'unrelated:{frame}']=lambda frame=frame:frozen(frame)
+        masks[f'write:{frame}']=(lambda frame=frame:write(frame)) if frame in group.output_frames else (lambda:empty)
     writer.add_group(metadata,masks)
 
 
@@ -809,6 +842,8 @@ def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,pol
                     refusals.append(row)
                     raise SamCropRetryAdmissionError(row)
                 attempt_index=int(decision.record['attempt_index'])
+                attempt_memory_bounds=None
+                attempt_status='failed'
                 try:
                     phase='retry_preparation_and_tracking'
                     if provider_factory is None:
@@ -833,6 +868,12 @@ def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,pol
                         _frozen_snapshot=prepared.observation_snapshot_sha256)
                     retry_prepared=replace(retry_prepared,cpu_wave_admission=MappingProxyType(estimate(gid,decision.crop_bbox_yx)[3]))
                     controller.verify_retry_identity(decision,seed_identity=seed_identity,interval_identity=interval_identity)
+                    retry_prepared=_promote_retry_execution(runtime,retry_prepared,worker_profile,decision)
+                    try:
+                        from .sam_retry_attempt_bounds import begin_retry_attempt_bounds
+                        attempt_memory_bounds=begin_retry_attempt_bounds(metadata,decision,retry_prepared,worker_profile)
+                    except BaseException:
+                        pass
                     candidate=provider_factory(retry_prepared)
                     lease=candidate if hasattr(candidate,'__enter__') else nullcontext(candidate)
                     with lease as retry_provider:
@@ -851,7 +892,8 @@ def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,pol
                             wrap_axis=wrap_axis,upstream_lineage=upstream_lineage,spacing_zyx=spacing_zyx,
                             planner_limits=planner_limits,crop_mode=prepared.crop_mode,resource_profile=worker_profile,
                             cancel_event=cancel_event,crop_retry_policy=None,_evidence_only=True,
-                            _snapshot_authenticated=True,exact_crop_family_dispatch=exact_crop_family_dispatch)
+                            _snapshot_authenticated=True,exact_crop_family_dispatch=exact_crop_family_dispatch,
+                            _attempt_memory_bounds=attempt_memory_bounds)
                         from .sam_evidence import SamEvidenceBundle
                         completed_bundle=SamEvidenceBundle.open(retry_stats['sam_evidence_path'])
                         last_complete[gid]=dict(attempt_index=attempt_index,crop_bbox_yx=list(decision.crop_bbox_yx),
@@ -880,8 +922,10 @@ def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,pol
                         attempt_selection='complete_larger_context_replaces_original_group',
                         outer_context_resolved=diagnostics.get(current_gid,{}).get('outer_context_resolved',True),
                         final_reached_prefix_extent_diagnostics=diagnostics,generated_original_seed_runs=len(current_bundle.runs)))
+                    attempt_status='succeeded'
                 except BaseException as error:
-                    controller.complete_retry(decision,status='cancelled' if _cancelled(runtime,cancel_event) else 'failed',
+                    attempt_status='cancelled' if _cancelled(runtime,cancel_event) else 'failed'
+                    controller.complete_retry(decision,status=attempt_status,
                         detail=dict(error=str(error),scope_id=metadata.get('scope_id','sam'),
                                     last_complete_evidence=last_complete[gid]))
                     refusals.append(dict(original_group_id=gid,status='retry_failed',attempt_index=attempt_index,reason=str(error)))
@@ -889,6 +933,13 @@ def _retry_tails(bundle,receipt,prepared,observations,destination,metadata,*,pol
                         error.add_note(f'SAM extrapolation scope {metadata.get("scope_id","sam")}, '
                             f'original_group={gid}, attempt={attempt_index}, crop={decision.crop_bbox_yx}')
                     raise
+                finally:
+                    try:
+                        from .sam_retry_attempt_bounds import finish_retry_attempt_bounds
+                        finish_retry_attempt_bounds(attempt_memory_bounds,status=attempt_status,
+                            metadata=metadata,decision=decision,resource_profile=worker_profile)
+                    except BaseException:
+                        pass
         except BaseException as error:
             error._sam_retry_phase=phase
             error._sam_retry_group_id=gid
@@ -1001,7 +1052,7 @@ def extrapolate_sam_view_volume_pass(observations,*,work_dir,image_provider=None
         _evidence_only=False,_snapshot_authenticated=False,image_cohorts=None,
         exact_crop_family_dispatch=True,
         image_cohort_provider=None,image_cohort_prefetch=None,_retry_group_context=None,
-        _observation_inventory=None,**unused):
+        _observation_inventory=None,_attempt_memory_bounds=None,**unused):
     if not isinstance(exact_crop_family_dispatch,bool):
         raise ValueError('SAM exact-crop family dispatch control must be boolean')
     metadata=_scope_metadata(scope)
@@ -1030,6 +1081,8 @@ def extrapolate_sam_view_volume_pass(observations,*,work_dir,image_provider=None
         sam_exact_crop_family_dispatch_requested=exact_crop_family_dispatch,
         planning_reasons=list(prepared.plan.reasons),generation_early_stop=False,
         group_planning_receipts=[dict(group_id=g.group_id,status=g.status,reasons=list(g.reasons)) for g in prepared.groups])
+    from .sam_planning_outcomes import sam_planning_omission
+    stats['sam_requested_work_complete'] = sam_planning_omission(stats, operation='extrapolation') is None
     if not prepared.needs_tracking:
         stats.update(skipped=True,skip_reason=('disabled' if not distance else
             'resource_limit_unresolved' if prepared.plan.status=='unresolved' else
@@ -1153,7 +1206,8 @@ def extrapolate_sam_view_volume_pass(observations,*,work_dir,image_provider=None
                     try:
                         stream=_iterate_extrapolation_tracker_results(runtime,subset,count,groups,by_id,
                             cohort_cache,cancel_event,resource_profile,stats['sam_exact_crop_family_batches'],
-                            family_dispatch_enabled=family_enabled,flat_control_reason=flat_reason)
+                            family_dispatch_enabled=family_enabled,flat_control_reason=flat_reason,
+                            attempt_memory_bounds=_attempt_memory_bounds)
                         for execution_index,result in stream:
                             try:
                                 with writer.parallel_packing(getattr(result, 'packing_admission', None)):

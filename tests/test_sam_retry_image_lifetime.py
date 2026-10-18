@@ -1,6 +1,4 @@
 """Growing retry crops retire gray files through the existing worker barrier."""
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 
@@ -12,11 +10,12 @@ from tests.test_sam_view_image_cache import context_for, crop_from, demand
 
 def _retry_factory(context, operation, view, shape, monkeypatch):
     """Capture each production default factory without a CUDA startup."""
-    prepared = SimpleNamespace(needs_tracking=False, groups=(), runs=(),
-        planner_wall_seconds=0., snapshot_wall_seconds=0.)
     module = sam_interpolation if operation == 'interpolate' else sam_extrapolation
     prepare_name = 'prepare_sam_interpolation_pass' if operation == 'interpolate' else 'prepare_sam_extrapolation_pass'
     execute_name = 'interpolate_sam_view_volume_pass' if operation == 'interpolate' else 'extrapolate_sam_view_volume_pass'
+    prepared = getattr(module, prepare_name)(np.zeros(shape, np.uint8), view=view,
+                                            scope='retry-cache-lifetime')
+    assert not prepared.needs_tracking
     captured = []
 
     def capture(observations, **kwargs):

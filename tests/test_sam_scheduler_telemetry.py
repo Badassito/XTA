@@ -148,6 +148,9 @@ def test_snapshot_records_preparation_ready_ack_and_held_consumer(monkeypatch, t
     assert sample['closed'] and sample['cancelled'] and admitted.pool.in_use == 0
     assert sample['consumer_hold_seconds'] >= held_before
     assert sample['raw_transfer_decode_seconds'] > 0
+    counters = sink.snapshot()['counters']
+    assert counters['sam.worker.family.unknown.completed_jobs'] == counters['sam.worker.completed_jobs'] == 3
+    assert counters['sam.worker.family.unknown.completed_output_frames'] == 9
 
 
 def test_worker_timers_count_once_after_ack_despite_consumer_manifest_reread(monkeypatch, tmp_path):
@@ -155,8 +158,10 @@ def test_worker_timers_count_once_after_ack_despite_consumer_manifest_reread(mon
     values = dict(render_seconds=1.25, input_preparation_seconds=2.5, tracker_seconds=4.,
         sdk_session_init_seconds=.5, pack_seconds=.75, worker_seconds=8.5, queue_seconds=.1)
     malformed = dict(zip(values, (True, float('nan'), float('inf'), 'bad', -1., 10**400, None)))
+    host_receipts = {}
     def mutate(task, manifest):
         index = int(task.payload['run_id'].rsplit('-', 1)[1])
+        host_receipts[task.payload['run_id']] = manifest['session_host_timings']
         if index == 0:
             manifest['timings'] = dict(values, worker_started_monotonic=123., unknown_seconds=999.)
         elif index == 1:
@@ -165,7 +170,8 @@ def test_worker_timers_count_once_after_ack_despite_consumer_manifest_reread(mon
             manifest['timings'] = ['not a mapping']
         else:
             manifest.pop('timings', None)
-    tracker = tracker_for(tmp_path, FourSlotPool(mutate=mutate), monkeypatch)
+    pool = FourSlotPool(mutate=mutate)
+    tracker = tracker_for(tmp_path, pool, monkeypatch)
     cache = cache_for(tmp_path, 'timed', frames=3)
     reads = []
     original = sam._read_tracker_manifest
@@ -175,14 +181,81 @@ def test_worker_timers_count_once_after_ack_despite_consumer_manifest_reread(mon
     monkeypatch.setattr(sam, '_read_tracker_manifest', read)
     try:
         assert len(consume(tracker, cache, [request(index, label='timed', frames=3)
-            for index in range(4)])) == 4
+            for index in range(4)], view_family='spherical')) == 4
     finally:
         tracker.close()
     assert len(reads) == 8  # Each ACK is authenticated again when its packet is consumed.
     counters = sink.snapshot()['counters']
-    assert {key: value for key,value in counters.items() if key.startswith('sam.worker.')} == {
+    expected = {
         'sam.worker.completed_jobs': 4., 'sam.worker.completed_output_frames': 12.,
         **{'sam.worker.'+key: value for key,value in values.items()}}
+    expected_all = {
+        **expected, **{key.replace('sam.worker.', 'sam.worker.family.spherical.'): value
+            for key, value in expected.items()}}
+    for device, task, _submitted in pool.completions:
+        device_prefix = f'sam.worker.device.{device}.'
+        for key, value in {'completed_jobs': 1, 'completed_output_frames': 3,
+                **(values if task.payload['run_id'].endswith('-0') else {})}.items():
+            name = device_prefix+key
+            expected_all[name] = expected_all.get(name, 0)+value
+        for prefix in ('sam.worker.', 'sam.worker.family.spherical.', device_prefix):
+            name = prefix+'session_timed_jobs'
+            expected_all[name] = expected_all.get(name, 0)+1
+            for stage, record in host_receipts[task.payload['run_id']]['stages'].items():
+                for field, value in record.items():
+                    name = prefix+f'session.{stage}.{field}'
+                    expected_all[name] = expected_all.get(name, 0)+value
+    assert {key: value for key,value in counters.items() if key.startswith('sam.worker.')} == expected_all
+
+
+def test_completion_families_are_captured_on_concurrent_producers(monkeypatch, tmp_path):
+    sink = telemetry(monkeypatch, tmp_path/'telemetry')
+    def mutate(task, manifest):
+        manifest['timings'] = {'tracker_seconds': 3. if task.payload['run_id'].startswith('first-') else 7.}
+    pool = FourSlotPool(gated=('first-0', 'first-1', 'second-0', 'second-1'), mutate=mutate)
+    tracker = tracker_for(tmp_path, pool, monkeypatch)
+    admitted = LiveAdmissions(2)
+    first, second = cache_for(tmp_path, 'first', frames=3), cache_for(tmp_path, 'second', frames=5)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        tasks = [executor.submit(consume, tracker, cache,
+            [request(index, label=label, frames=frames) for index in range(2)],
+            capacity=2, admissions=admitted, view_family=family)
+            for cache, label, frames, family in (
+                (first, 'first', 3, 'radial'), (second, 'second', 5, 'spherical'))]
+        try:
+            pool.until(lambda: len(pool.submissions) == 4)
+            with tracker._state_condition:
+                assert {scope.view_family for scope in tracker._scopes.values()} == {'radial', 'spherical'}
+            assert getattr(sam._SAM_VIEW_PRODUCER, 'view_family', 'unknown') == 'unknown'
+        finally:
+            pool.unblock()
+            for task in tasks:
+                assert len(task.result(timeout=8)) == 2
+            tracker.close()
+    counters = sink.snapshot()['counters']
+    assert counters['sam.worker.completed_jobs'] == 4
+    assert counters['sam.worker.completed_output_frames'] == 16
+    assert counters['sam.worker.tracker_seconds'] == 20
+    for family, frames, seconds in (('radial', 6, 6), ('spherical', 10, 14)):
+        prefix = f'sam.worker.family.{family}.'
+        assert counters[prefix+'completed_jobs'] == 2
+        assert counters[prefix+'completed_output_frames'] == frames
+        assert counters[prefix+'tracker_seconds'] == seconds
+    assert not any(key.startswith('sam.worker.family.unknown.') for key in counters)
+
+
+def test_family_context_bounds_and_restores_nested_labels():
+    assert getattr(sam._SAM_VIEW_PRODUCER, 'view_family', 'unknown') == 'unknown'
+    with sam.sam_view_producer_family('radial'):
+        for family in (*sorted(sam._SAM_VIEW_FAMILIES), 'future-family', None):
+            with sam.sam_view_producer_family(family):
+                assert sam._SAM_VIEW_PRODUCER.view_family == (family if family in sam._SAM_VIEW_FAMILIES else 'unknown')
+            assert sam._SAM_VIEW_PRODUCER.view_family == 'radial'
+        with pytest.raises(RuntimeError, match='producer stopped'):
+            with sam.sam_view_producer_family('spherical'):
+                raise RuntimeError('producer stopped')
+        assert sam._SAM_VIEW_PRODUCER.view_family == 'radial'
+    assert sam._SAM_VIEW_PRODUCER.view_family == 'unknown'
 
 
 @pytest.mark.parametrize('failure', ['contract', 'retirement'])
@@ -199,7 +272,7 @@ def test_rejected_completion_does_not_publish_worker_counters(monkeypatch, tmp_p
     cache = cache_for(tmp_path, 'rejected', frames=3)
     try:
         with pytest.raises(RuntimeError, match='contract|retirement rejection'):
-            consume(tracker, cache, [request(0, label='rejected', frames=3)])
+            consume(tracker, cache, [request(0, label='rejected', frames=3)], view_family='radial')
     finally:
         tracker.close()
     assert not any(key.startswith('sam.worker.') for key in sink.snapshot()['counters'])

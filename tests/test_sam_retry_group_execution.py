@@ -45,9 +45,19 @@ class _TruthTracker(SamInterpolationTracker):
         label=int(labels[0])
         expected=self.observed[request['seed_frame'],y0:y1,x0:x1]==label
         np.testing.assert_array_equal(request['seed_mask'],expected)
+        limits=resources.validate_sam_tracker_scope_admission(admission)
+        capacity=admission.max_in_flight
+        assert 1<=capacity<=profile.execution_slots
+        session,transfer=limits['maximum_session_cpu_bytes'],limits['consumer_transfer_bytes']
+        if limits['defer_refill_until_consumed']:
+            assert capacity==1
+            required=max(session,transfer)
+        else:
+            required=capacity*session+transfer
+        assert transfer>=3*limits['maximum_raw_mask_bytes']
+        assert required<=limits['attempt_peak_bytes']<=profile.assigned_cpu_wave_bytes
         child=profile._lease.retry_child_factory is not None
         if child:
-            assert admission.max_in_flight==1
             assert profile.scope_id!='parent'
             with self._calls_lock:
                 self.child_threads.add(threading.get_ident())
@@ -58,11 +68,17 @@ class _TruthTracker(SamInterpolationTracker):
         row=dict(label=label,seed_frame=request['seed_frame'],
             interval=(request['frame_start'],request['frame_stop'],request['direction']),
             crop=(y0,x0,y1,x1),seed_sha256=hashlib.sha256(request['seed_mask'].tobytes()).hexdigest(),
-            child=child,thread=threading.get_ident(),run_id=request['run_id'])
+            child=child,thread=threading.get_ident(),run_id=request['run_id'],wave=capacity)
         with self._calls_lock:
             self.calls.append(row)
         return _result({frame:(self.truth[frame,y0:y1,x0:x1]==label)
             for frame in range(request['frame_start'],request['frame_stop'])})
+
+    def _validate_iterator_options(self, admission, options):
+        assert admission is not None
+        limits=resources.validate_sam_tracker_scope_admission(admission)
+        assert options.get('max_in_flight',self.worker_count)==admission.max_in_flight
+        assert options.get('defer_refill_until_consumed',False)==limits['defer_refill_until_consumed']
 
     def _iterate(self, indexed, cache, admission):
         assert admission is not None
@@ -77,9 +93,11 @@ class _TruthTracker(SamInterpolationTracker):
             admission.release_scope()
 
     def iter_results(self, requests, *, source_cache_ref=None, scope_admission=None, **options):
+        self._validate_iterator_options(scope_admission,options)
         yield from self._iterate(enumerate(requests),source_cache_ref,scope_admission)
 
     def iter_family_results(self, families, *, source_cache_ref=None, scope_admission=None, **options):
+        self._validate_iterator_options(scope_admission,options)
         factories={index:family.request_factory for family in families for index in family.input_indices}
         indexed=((index,factories[index](index)) for index in sorted(factories))
         yield from self._iterate(indexed,source_cache_ref,scope_admission)
@@ -178,7 +196,7 @@ def _science(case, components, stats):
 
 
 @pytest.mark.parametrize('mode',('whole','tiled'))
-def test_independent_live_group_chains_keep_serial_science_and_c1_pairs(tmp_path,mode):
+def test_independent_live_group_chains_keep_serial_science_and_funded_pairs(tmp_path,mode):
     with _case(tmp_path/'serial',mode=mode) as serial:
         _,serial_stats,serial_components=serial['run'](parallel=False)
         expected=_science(serial,serial_components,serial_stats)
@@ -188,13 +206,25 @@ def test_independent_live_group_chains_keep_serial_science_and_c1_pairs(tmp_path
         actual=_science(parallel,components,stats)
         assert stats['sam_crop_retry']['group_execution']['child_groups']==2
         assert len(parallel['runtime'].child_threads)==2
-        assert all(row['wave']==1 for row in parallel['providers'])
+        assert all(1<=row['wave']<=2 for row in parallel['providers'])
+        assert any(row['wave']==2 for row in parallel['providers'])
         assert len(parallel['providers'])>=4
         for left,right in zip(actual,expected):
             if isinstance(left,np.ndarray):
                 np.testing.assert_array_equal(left,right)
             else:
                 assert left==right
+
+
+def test_explicit_retry_memory_cap_keeps_child_pairs_at_one_session(tmp_path,monkeypatch):
+    monkeypatch.setenv('YOLO_TTA_SAM_RENDER_MAX_BYTES','1')
+    policy=SamCropRetryPolicy(enabled=True,max_retry_memory_bytes=200*1024**2)
+    with _case(tmp_path,overlap=True) as case:
+        _,stats,components=case['run'](policy=policy)
+        _science(case,components,stats)
+        assert stats['sam_crop_retry']['group_execution']['child_groups']==2
+        assert case['providers'] and all(row['wave']==1 for row in case['providers'])
+        assert all(row['wave']==1 for row in case['runtime'].calls if row['child'])
 
 
 @pytest.mark.parametrize('cap',('pixels','frames'))

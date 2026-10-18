@@ -42,13 +42,14 @@ def compile_physical_views(
     spherical_requests: Sequence[SphericalViewRequest] = (),
     spherical_min_radius: float | None = None,
     spherical_patch_size: int = 0,
-    sampling_policy: str = 'dense',
+    augmentation_angles: Sequence[float] = (0.0,),
 ) -> CompiledPhysicalViews:
     """Compile grouped view requests through the authoritative TTA geometry.
 
     The exact generated azimuthal angle vectors live on the returned ``ViewInfo``
     objects.  The paired spacing and diameter tuples are retained separately so
     both modes can record the same planning facts in their manifests.
+    Augmentation angles admit automatic Azimuthal coarsening; native shell plans are angle-independent.
     """
 
     azimuthal_targets = tuple(str(request.view) for request in azimuthal_requests)
@@ -81,18 +82,17 @@ def compile_physical_views(
             spherical_views=spherical_targets,
             spherical_min_radius=spherical_min_radius,
             spherical_patch_size=int(spherical_patch_size),
-            sampling_policy=sampling_policy,
             azimuthal_auto_views=tuple(request.view for request in azimuthal_requests if request.azimuth_angle is None),
+            augmentation_angles=tuple(augmentation_angles),
         )
     )
-    if sampling_policy == 'coverage':
-        azimuthal_angles = tuple(
-            next(((float(view.azimuths_deg[1] - view.azimuths_deg[0]) if len(view.azimuths_deg) > 1 else 180.0)
-                  for view in views if view.family == 'azimuthal'
-                  and view.azimuthal_request_token == target
-                  and view.sampling_policy == 'coverage'), spacing)
-            for target, spacing in zip(azimuthal_targets, azimuthal_angles)
-        )
+    azimuthal_angles = tuple(
+        next(((float(view.azimuths_deg[1] - view.azimuths_deg[0]) if len(view.azimuths_deg) > 1 else 180.0)
+              for view in views if view.family == 'azimuthal'
+              and view.azimuthal_request_token == target
+              and view.sampling_certificate), spacing)
+        for target, spacing in zip(azimuthal_targets, azimuthal_angles)
+    )
     return CompiledPhysicalViews(
         views=views,
         azimuthal_targets=azimuthal_targets,

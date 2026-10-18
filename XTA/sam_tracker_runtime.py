@@ -31,6 +31,7 @@ import numpy as np
 _LIVE_SAM_TRACKERS = weakref.WeakSet()
 _LIVE_SAM_TRACKERS_LOCK = threading.Lock()
 _SAM_VIEW_PRODUCER = threading.local()
+_SAM_VIEW_FAMILIES = frozenset({'orthogonal', 'tilted', 'azimuthal', 'radial', 'spherical'})
 _SAM_SNAPSHOT_COUNTS = ('active_scopes', 'credited_scopes', 'ready_jobs', 'preparing_jobs',
     'running_jobs', 'acked_awaiting_consumer_jobs', 'consumer_held_jobs',
     'live_prepared_bank_bytes', 'live_completion_bank_bytes', 'live_completion_wave_loan_bytes',
@@ -43,6 +44,9 @@ _SAM_SNAPSHOT_COUNTS = ('active_scopes', 'credited_scopes', 'ready_jobs', 'prepa
 def sam_view_producer_family(family):
     """Capture view cost on its producer without changing scientific requests."""
     previous = getattr(_SAM_VIEW_PRODUCER, 'view_class', None)
+    previous_family = getattr(_SAM_VIEW_PRODUCER, 'view_family', 'unknown')
+    family = family if isinstance(family, str) and family in _SAM_VIEW_FAMILIES else 'unknown'
+    _SAM_VIEW_PRODUCER.view_family = family
     _SAM_VIEW_PRODUCER.view_class = (
         'curved' if family in {'radial', 'azimuthal', 'spherical'} else
         'cheap' if family in {'orthogonal', 'tilted'} else None)
@@ -50,6 +54,7 @@ def sam_view_producer_family(family):
         yield
     finally:
         _SAM_VIEW_PRODUCER.view_class = previous
+        _SAM_VIEW_PRODUCER.view_family = previous_family
 
 
 def _consumer_time(stage, started, cpu_started):
@@ -59,14 +64,27 @@ def _consumer_time(stage, started, cpu_started):
     telemetry.add(f'sam.consumer.{stage}_thread_cpu_seconds', time.thread_time()-cpu_started)
 
 
-def _record_worker_completion(manifest, prepared):
+def _record_worker_completion(manifest, prepared, view_family='unknown', *, execution_device_id=None):
     """Record host elapsed timers once per settled ACK, not per consumer read."""
     try:
         from . import runtime
         telemetry = runtime._RUNTIME_TELEMETRY
         if telemetry is None or not telemetry.enabled:
             return
-        telemetry.add('sam.worker.completed_jobs', 1)
+        view_family = (view_family if isinstance(view_family, str) and view_family in _SAM_VIEW_FAMILIES
+            else 'unknown')
+        family_prefix = f'sam.worker.family.{view_family}.'
+        prefixes = ['sam.worker.', family_prefix]
+        # The caller supplies the authenticated scheduler route, never a label
+        # taken from a worker's untrusted receipt or a per-job identifier.
+        if type(execution_device_id) is int and execution_device_id >= 0:
+            prefixes.append(f'sam.worker.device.{execution_device_id}.')
+
+        def add(key, value):
+            for prefix in prefixes:
+                telemetry.add(prefix+key, value)
+
+        add('completed_jobs', 1)
         timings = manifest.get('timings')
         if isinstance(timings, Mapping):
             for key in ('render_seconds', 'input_preparation_seconds', 'tracker_seconds',
@@ -79,7 +97,28 @@ def _record_worker_completion(manifest, prepared):
                 except OverflowError:
                     continue
                 if math.isfinite(value) and value >= 0:
-                    telemetry.add('sam.worker.'+key, value)
+                    add(key, value)
+        host_timings = manifest.get('session_host_timings')
+        if (isinstance(host_timings, Mapping)
+                and host_timings.get('schema') == 'xta.sam_session_host_timings/1'
+                and isinstance(host_timings.get('stages'), Mapping)):
+            from .lta_experimental import SAM_SESSION_HOST_TIMING_STAGES
+            add('session_timed_jobs', 1)
+            for stage in SAM_SESSION_HOST_TIMING_STAGES:
+                record = host_timings['stages'].get(stage)
+                if not isinstance(record, Mapping):
+                    continue
+                for field in ('calls', 'host_seconds', 'thread_cpu_seconds'):
+                    value = record.get(field)
+                    if type(value) not in (int, float):
+                        continue
+                    try:
+                        numeric = float(value)
+                    except OverflowError:
+                        continue
+                    if math.isfinite(numeric) and numeric >= 0 and (
+                            field != 'calls' or type(value) is int):
+                        add(f'session.{stage}.{field}', numeric)
         payload = prepared.task.payload
         start, stop = ((payload['seed_frame'], payload['frame_stop']) if payload['direction']=='forward'
             else (payload['frame_start'], payload['seed_frame']+1))
@@ -87,7 +126,7 @@ def _record_worker_completion(manifest, prepared):
         if (manifest.get('coverage_complete') is True and isinstance(frames, list)
                 and len(frames)==stop-start
                 and all(type(frame) is int and frame==start+index for index,frame in enumerate(frames))):
-            telemetry.add('sam.worker.completed_output_frames', len(frames))
+            add('completed_output_frames', len(frames))
     except Exception:
         pass  # Optional diagnostics cannot change settled task ownership.
 
@@ -548,6 +587,8 @@ def _execute_interpolation_tracker_task(context, kind, payload):
         "seed_policy": "one original endpoint; held-out terminal; no hole filling",
         "detector_confidence": None,
     }
+    if isinstance(result.get('session_host_timings'), Mapping):
+        manifest['session_host_timings'] = _jsonable(result['session_host_timings'])
     owners.extend(weakref.ref(owner) for owner in (seed, frames, scores, removed))
     owners.extend(weakref.ref(item.binary_mask) for item in observations.values())
     return {
@@ -708,6 +749,7 @@ class _TrackerScope:
     admission_limits: Mapping | None = None
     family_dispatch: _FamilyDispatch | None = None
     view_class: str | None = None
+    view_family: str = 'unknown'
     ready: deque = field(default_factory=deque)
     completed: deque = field(default_factory=deque)
     outstanding: dict = field(default_factory=dict)
@@ -1022,7 +1064,8 @@ class _PoolScheduler:
                 time.perf_counter()-validation_started)
             self.tracker.dispatch_stats['completion_acks_pumped'] += 1
             self._condition.notify_all()
-        _record_worker_completion(manifest, prepared)
+        _record_worker_completion(manifest, prepared, scope.view_family,
+            execution_device_id=int(event.execution_device_id))
 
     def _run(self):
         try:
@@ -1605,7 +1648,8 @@ class SamInterpolationTracker:
                         else 'SAM tracker has been closed')
                 scope = _TrackerScope(uuid.uuid4().hex, cache_ref, key, capacity,
                     lookahead, deferred, admission, limits if admission is not None else None,
-                    family_dispatch, getattr(_SAM_VIEW_PRODUCER, 'view_class', None))
+                    family_dispatch, getattr(_SAM_VIEW_PRODUCER, 'view_class', None),
+                    view_family=getattr(_SAM_VIEW_PRODUCER, 'view_family', 'unknown'))
                 proof = self._source_cache_retirement_proofs.setdefault(key, dict(
                     complete=False, all_gray_mappings_retired=True, completed_runs=0,
                     active_scopes=0, failed_scopes=0))

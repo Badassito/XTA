@@ -112,7 +112,7 @@ class PublicationMemoryPlanTests(unittest.TestCase):
 
     @staticmethod
     def cluster_policy_tasks():
-        """Reproduce the 144736 geometry using descriptors, never mask canvases."""
+        """Compile the full shared geometry using descriptors, never mask canvases."""
         from XTA.config import (AzimuthalViewRequest, RadialViewRequest,
                                 SphericalViewRequest, TiltedViewGroup)
         from XTA.geometry import (expand_views_into_policy_variants,
@@ -128,7 +128,7 @@ class PublicationMemoryPlanTests(unittest.TestCase):
             radial_requests=tuple(RadialViewRequest(target) for target in targets),
             radial_patch_size=3072,
             spherical_requests=(SphericalViewRequest('transverse'), SphericalViewRequest('tilted_transverse')),
-            spherical_patch_size=3072, sampling_policy='coverage').views
+            spherical_patch_size=3072).views
         tasks = []
         for view in expand_views_into_tta_variants(views, [0]):
             passes = [dict(kind='fullframe', model_name='model', view=copy,
@@ -157,8 +157,8 @@ class PublicationMemoryPlanTests(unittest.TestCase):
 
     def test_cluster_384_gib_window_fits_actual_groups_and_remains_ram_guarded(self):
         tasks = self.cluster_policy_tasks()
-        self.assertEqual(len(tasks), 110)
-        self.assertEqual(sum(task['slice_count'] for task in tasks), 160593)
+        self.assertEqual(len(tasks), 320)
+        self.assertEqual(sum(task['slice_count'] for task in tasks), 152973)
         largest = max(4*int(np.prod(task['processing_shape'])) for task in tasks)
         self.assertAlmostEqual(largest/GIB, 155.56647767871618)
         self.assertLess(2*largest, 384*GIB)

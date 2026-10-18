@@ -34,7 +34,7 @@ def mapped_source(tmp_path):
     return source
 
 
-def test_pre_submit_hold_retains_actual_context_source_until_atomic_revoke(tmp_path):
+def test_pre_submit_close_atomically_revokes_actual_context_source_hold(tmp_path):
     source = mapped_source(tmp_path)
     context = context_for(tmp_path, source)
     runtime = context._runtime = IdleRuntime()
@@ -44,12 +44,15 @@ def test_pre_submit_hold_retains_actual_context_source_until_atomic_revoke(tmp_p
             request = resources.prepare_retry_child_resources(original, 'queued-child')
             hold = context._hold_retry_source(request)
             assert not request.started and not request.settled
-            with pytest.raises(RuntimeError, match='retry source ownership remains unsettled'):
-                context.close()
+            assert context.source_volume is source and not source._mmap.closed
+            assert original._lease.scope_holds == 1
+            context.close()
             assert runtime.close_calls == 1
-            assert not context._closed and context.source_volume is source
-            assert not source._mmap.closed and not hold.closed
-            assert request.cancel_if_unstarted() and request.settled
+            assert not request.started and request.cancelled and request.settled
+            assert original._lease.scope_holds == 0 and hold.closed
+            assert context._closed and context.source_volume is None
+            with request() as late_profile:
+                assert late_profile is None  # A late callback cannot access its source.
             hold.close()
             context.close()
             assert context._closed and context.source_volume is None
@@ -191,10 +194,9 @@ def test_started_child_and_retained_scope_keep_maps_until_runtime_and_hold_settl
             assert not context._closed and not hold.closed and pool.in_use > original_charge
 
             runtime.allow_close = True
-            with pytest.raises(RuntimeError, match='retry source ownership remains unsettled'):
-                context.close()
+            context.close()
             assert request.settled and pool.in_use == original_charge
-            assert context.source_volume is source and not source._mmap.closed
+            assert hold.closed and context._closed and context.source_volume is None
             hold.close()
             context.close()
             assert context.source_volume is None and context._closed

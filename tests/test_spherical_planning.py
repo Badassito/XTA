@@ -11,6 +11,8 @@ import numpy as np
 from XTA.config import resolve_spherical_view_requests, resolve_tilted_view_groups
 from XTA.geometry import get_view_infos
 from XTA.spherical_geometry import build_spherical_view_infos
+from XTA.qsc import QSC_INVERSE_LIPSCHITZ_SQUARED
+from XTA.spherical_sampling import SUPPORT_BUDGET_SQUARED
 from XTA.unification.context import activate_unified_launch
 from XTA.unification.runtime import compile_physical_views
 from XTA.unification.tta_manifest import build_tta_run_manifest, spherical_view_plan_metadata
@@ -27,7 +29,7 @@ class SphericalPlanningTests(unittest.TestCase):
             spherical_patch_size=8, radial_min_radius=4.5,
         )
 
-    def test_default_spherical_only_request_emits_one_dense_annular_cube(self):
+    def test_default_spherical_only_request_emits_one_certified_annular_cube(self):
         compiled = self._compile("transverse")
         self.assertTrue(compiled.views)
         self.assertEqual(compiled.radial_targets, ())
@@ -35,11 +37,16 @@ class SphericalPlanningTests(unittest.TestCase):
         self.assertEqual({view.family for view in compiled.views}, {"spherical"})
         self.assertEqual({view.spherical_group for view in compiled.views}, {"upright"})
         self.assertEqual({view.spherical_face for view in compiled.views}, set(range(6)))
+        self.assertEqual(min(v.spherical_min_radius for v in compiled.views), 8 / (4 * math.pi))
+        self.assertEqual(max(v.spherical_max_radius for v in compiled.views), 5.0)
         for view in compiled.views:
             radii = np.asarray(view.spherical_radii)
-            self.assertEqual(radii[0], 8 / (4 * math.pi))
-            self.assertEqual(radii[-1], 5.0)
-            self.assertTrue(np.all((np.diff(radii) > 0) & (np.diff(radii) <= 1)))
+            self.assertEqual(radii[0], view.spherical_min_radius)
+            self.assertEqual(radii[-1], view.spherical_max_radius)
+            gaps=np.diff(radii)
+            self.assertTrue(np.all(gaps > 0))
+            bound=(float(gaps.max(initial=0.))/2.)**2+2*QSC_INVERSE_LIPSCHITZ_SQUARED*(view.spherical_max_radius/view.spherical_face_intervals)**2
+            self.assertLessEqual(bound,SUPPORT_BUDGET_SQUARED)
             self.assertEqual(view.num_slices, len(radii))
 
     def test_tilted_aliases_dedupe_within_direction_angle_groups_and_ignore_request_order(self):

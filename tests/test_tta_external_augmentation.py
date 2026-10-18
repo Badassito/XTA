@@ -296,6 +296,44 @@ def test_cuda_policy_masks_match_host_upload(profile):
         )
 
 
+@pytest.mark.parametrize('profile', ['light', 'baseline', 'heavy', 'superheavy'])
+def test_gpu_policy_batched_inverse_preserves_mixed_original_and_seeded_outputs(profile):
+    policy, _module = cpu_policy(profile, batch_size=24)
+    rng = np.random.default_rng(914)
+    images = [rng.integers(0, 256, (32, 32), np.uint8) for _ in range(4)]
+    masks = [(image > 127).astype(np.uint8) for image in images]
+    seeds = [[None, *range(first, first + 5)] for first in (11, 31, 51, 71)]
+    invert = torch.linalg.inv
+    kwargs = dict(images=images, masks=masks, seeds=seeds, output_size=(32, 32))
+    with patch.object(torch.Tensor, 'pin_memory', lambda self, *args, **kwargs: self):
+        with patch.object(torch.linalg, 'inv',
+                          side_effect=lambda batch: torch.stack([invert(matrix) for matrix in batch])):
+            expected_images, expected_masks = policy.apply_batch_many(**kwargs)
+        with patch.object(torch.linalg, 'inv', wraps=invert) as inverse:
+            actual_images, actual_masks = policy.apply_batch_many(**kwargs)
+    assert inverse.call_count == 1
+    forward = inverse.call_args.args[0]
+    assert forward.shape == (24, 3, 3) and forward.dtype == torch.float32
+    assert torch.equal(actual_images, expected_images)
+    assert torch.equal(actual_masks, expected_masks)
+    for index, image in zip((0, 6, 12, 18), images):
+        np.testing.assert_array_equal(actual_images[index, 0].numpy(), image)
+
+
+@pytest.mark.parametrize('profile', ['light', 'baseline', 'heavy', 'superheavy'])
+def test_gpu_policy_batched_inverse_retains_singular_matrix_error(profile):
+    policy, _module = cpu_policy(profile, batch_size=2)
+    image = np.ones((8, 8), np.uint8)
+    singular = [[0., 0., 0.], [0., 1., 0.], [0., 0., 1.]]
+    with (patch.object(torch.Tensor, 'pin_memory', lambda self, *args, **kwargs: self),
+          patch.object(policy, '_forward_matrix', return_value=singular),
+          patch.object(policy, '_pixel_grid') as grid):
+        with pytest.raises(RuntimeError, match='singular'):
+            policy.apply_batch_many(images=(image,), masks=(image,), seeds=((None, 23),),
+                                    output_size=(8, 8))
+    grid.assert_not_called()
+
+
 def test_channel_geometry_and_cache_budget():
     policy,module=cpu_policy('light')
     policy._apply_intensity_noise=lambda images,seeds,params:images

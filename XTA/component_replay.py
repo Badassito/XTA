@@ -221,6 +221,7 @@ def load_component_replay(path: Path) -> ComponentProjectionReplay:
                           if field.name.startswith('spherical_')}
     sampling_defaults = {field.name: field.default for field in fields(ViewInfo)
                          if field.name.startswith('sampling_') or field.name == 'radial_global_count'}
+    sampling_defaults['sampling_policy'] = 'dense'  # Captures without this field predate coverage planning.
     augmentation_defaults = {field.name: field.default for field in fields(ViewInfo)
                              if field.name.startswith('augmentation_')}
     additive_defaults = {**spherical_defaults, **sampling_defaults, **augmentation_defaults}

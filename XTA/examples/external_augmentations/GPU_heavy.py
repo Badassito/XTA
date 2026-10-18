@@ -611,7 +611,7 @@ class GPUAugmentation:
                 forward_matrices.append(self._forward_matrix(params, out_h, out_w))
 
         forward = torch.tensor(forward_matrices, device=self.device, dtype=torch.float32)
-        inverse = torch.stack([torch.linalg.inv(matrix) for matrix in forward])
+        inverse = torch.linalg.inv(forward)
         pixel_grid = self._pixel_grid(out_h, out_w)
         source = torch.stack([torch.einsum("ij,hwj->hwi", matrix, pixel_grid) for matrix in inverse])
         for index, (seed, params) in enumerate(zip(flat_seeds, params_by_sample)):

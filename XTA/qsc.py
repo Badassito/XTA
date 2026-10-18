@@ -12,8 +12,8 @@ the coverage guarantee below currently applies to spherical voxel coordinates.
 
 Sampling bound
 --------------
-The inverse map S from one normalized face to the unit sphere is globally
-1-Lipschitz in Euclidean norm. A reproducible exact-rational certificate is
+The inverse map S from one normalized face to the unit sphere has global
+squared Lipschitz bound L^2=41/50 in Euclidean norm. An exact-rational certificate is
 in tools/certify_qsc_lipschitz.py; its acceptance uses no floating-point
 trigonometry or sampled-derivative maxima.
 
@@ -27,26 +27,30 @@ The Jacobian in an orthonormal tangent basis is
 Its determinant is pi/6. Its squared Frobenius norm is Q/H**2+C*H**2,
 where Q=(2*D-t*B)**2+B**2 and C=(1+t*t)*a*a/(D*D). Convexity in H**2
 reduces the maximum over p to p=0 and p=1. The certificate encloses both
-endpoint expressions on 64 closed t intervals using rational arithmetic,
-3<pi<22/7, square-checked rational bounds on b, and alternating Taylor
-remainder bounds. Every interval has trace<5/4. Squared singular values
-therefore have sum<5/4 and product (pi/6)**2>1/4 and <1; both are <1.
+endpoint expressions on 1024 closed t intervals using rational arithmetic,
+a Machin-series enclosure of pi, square-checked bounds on b, and alternating
+Taylor remainder bounds. Put B=41/50 and D=(pi_lower/6)**2. Every interval
+has trace<B+D/B. Squared singular values have product (pi/6)**2>D and <B**2, so
+(B-lambda1)*(B-lambda2)>0; both are <B.
 Sector continuity and integration along a face segment include boundaries
 and the center in the global bound.
 
-An endpoint-inclusive grid of n intervals puts any direction within sqrt(2)/n
+An endpoint-inclusive grid of n intervals puts any direction within L*sqrt(2)/n
 of a sample direction. With maximum shell gap g and both annulus endpoints
 present, every point of radius rho has a shell r with |rho-r|<=g/2. Both
 r and rho are bounded by the outer radius R, hence
 
-    ||rho*d-r*d_sample||**2 <= g*g/4 + 2*(R/n)**2.
+    ||rho*d-r*d_sample||**2 <= g*g/4 + 2*L**2*(R/n)**2.
 
-The coverage planner in spherical_sampling retains the earlier conservative
-budget 281/324<1 while jointly selecting n and shell count. The legacy
-qsc_face_intervals and unit-gap grid remain available for dense sampling.
-Every covered voxel thus has positive trilinear input weight. This is not
-nearest-neighbor categorical coverage or coverage after arbitrary cropping
-or downsampling of the proven native grid.
+The spherical_sampling planner uses the distance budget (255/256)**2<1, proving
+positive trilinear input weight for every annular voxel. Adjacent radius bands
+share an endpoint shell and each uses its own outer radius R; each band emits
+every node of its closed face grids. Orthonormal cube rotations preserve the
+bound, which is in source voxel coordinates, not anisotropic physical units.
+The 1/256 distance reserve accommodates the qualified sampler's coordinate
+rounding; it does not certify arbitrary cropping or downsampling of the native
+grid. The legacy interval formula remains an analytic initial upper bound
+for the coverage planner and a decoder aid for historical captures.
 """
 from __future__ import annotations
 
@@ -66,7 +70,8 @@ QSC_FACE_BASES = (
     ((0., 0., 1.), (0., 1., 0.), (-1., 0., 0.)),
     ((0., 0., -1.), (0., 1., 0.), (1., 0., 0.)),
 )
-QSC_INVERSE_LIPSCHITZ = 1.0
+QSC_INVERSE_LIPSCHITZ_SQUARED = math.nextafter(41.0 / 50.0, math.inf)
+QSC_INVERSE_LIPSCHITZ = math.nextafter(math.sqrt(QSC_INVERSE_LIPSCHITZ_SQUARED), math.inf)
 _BASES = np.asarray(QSC_FACE_BASES, dtype=np.float64)
 _BASES.flags.writeable = False
 _INV_SQRT2 = 1.0 / math.sqrt(2.0)

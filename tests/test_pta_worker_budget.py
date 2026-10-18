@@ -132,19 +132,32 @@ class PtaWorkerBudgetTests(unittest.TestCase):
     def test_actual_planning_wrapper_selects_bootstrap_overlap_and_restored_idle_budget(self):
         budget = plan(overlapping=True)
         progress = {}
-        called = mock.Mock(side_effect=lambda index, workers: (index, workers))
+        called = mock.Mock(side_effect=lambda index, workers: {
+            'budget': (index, workers), 'cands': [], 'physical': []})
         affinity = mock.Mock(side_effect=lambda _cpus: contextlib.nullcontext())
+        trace = mock.Mock()
         namespace = dict(progress_by_gen=progress, cpu_budget=budget, planning_workers=budget.planning_workers,
                          planning_cpu_order=budget.planning_cpu_order, args=SimpleNamespace(topology_aware=True),
-                         _planning_phase_affinity=affinity, _plan_volume_with_budget=called)
+                         _planning_phase_affinity=affinity, _plan_volume_with_budget=called,
+                         pending_specs=[SimpleNamespace(stem=f'volume_{index}') for index in range(3)],
+                         runtime_telemetry_phase=lambda _phase: lambda function: function,
+                         runtime_trace_event=trace)
         wrapper = extracted_function('_plan_volume', namespace)
-        self.assertEqual(wrapper(0), (0, 64))
+        self.assertEqual(wrapper(0)['budget'], (0, 64))
         self.assertEqual(affinity.call_args.args[0], ALLOWED)
         progress[0] = SimpleNamespace(pending_a=1, pending_b=0)
-        self.assertEqual(wrapper(1), (1, 32))
+        self.assertEqual(wrapper(1)['budget'], (1, 32))
         self.assertEqual(affinity.call_args.args[0], budget.planning_cpu_order)
         progress[0].pending_a = 0
-        self.assertEqual(wrapper(2), (2, 64))
+        self.assertEqual(wrapper(2)['budget'], (2, 64))
+        self.assertEqual(affinity.call_args.args[0], ALLOWED)
+        self.assertEqual(called.call_args_list, [mock.call(0, 64), mock.call(1, 32), mock.call(2, 64)])
+        self.assertEqual(trace.call_args_list, [
+            call
+            for index in range(3)
+            for call in (mock.call('pta.volume_plan_start', stem=f'volume_{index}'),
+                         mock.call('pta.volume_plan_complete', stem=f'volume_{index}',
+                                   candidates=0, versions=0))])
 
     def test_actual_affinity_scope_restores_parent_even_if_planning_fails(self):
         bind = mock.Mock(return_value=True)

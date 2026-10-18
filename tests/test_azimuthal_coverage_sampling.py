@@ -61,6 +61,15 @@ class AzimuthalCoverageSamplingTests(unittest.TestCase):
         self.assertEqual(reduced.azimuths_deg, tuple(g.build_azimuthal_azimuths(spacing)))
         self.assertIs(optimize_azimuthal_view(reduced), reduced)
 
+    def test_nonzero_model_angles_keep_conservative_spacing_without_a_second_mode(self):
+        original = native_view()
+        for angles in ((45.0,), (90.0, 180.0)):
+            self.assert_geometry_unchanged(original, optimize_azimuthal_view(original, augmentation_angles=angles))
+        for angles in ((0.0, 45.0), (-360.0,), (45.0, 360.0)):
+            reduced = optimize_azimuthal_view(original, augmentation_angles=angles)
+            self.assertEqual(reduced.sampling_certificate, AZIMUTHAL_COVERAGE_CERTIFICATE)
+            self.assertLess(reduced.num_slices, original.num_slices)
+
     def test_positive_actual_sampler_taps_cover_every_native_circle_voxel(self):
         # Check all voxels, both center-grid parities, rectangles, and each base.
         # This deliberately tests positive bilinear taps, not nearest labels.
@@ -96,9 +105,66 @@ class AzimuthalCoverageSamplingTests(unittest.TestCase):
 
     def test_compact_native_diameter_and_stack_fall_back_without_changes(self):
         for original in (native_view((9, 33, 35), raster=16),
-                         native_view((35, 9, 11), raster=16)):
+                         native_view((35, 9, 11), raster=16),
+                         native_view((3, 5, 7), raster=1)):
             with self.subTest(shape=(original.full_t, original.full_h, original.full_w)):
                 self.assert_geometry_unchanged(original, optimize_azimuthal_view(original))
+
+    def test_compact_rasters_use_actual_diameter_pitch_and_independent_stack_error(self):
+        for base, expected in (('transverse', 3557), ('sagittal', 3284), ('coronal', 3284)):
+            original = native_view((2911, 3064, 3022), base, raster=2048)
+            reduced = optimize_azimuthal_view(original)
+            with self.subTest(base=base):
+                self.assertEqual(reduced.num_slices, expected)
+                self.assertEqual((reduced.src_h, reduced.src_w), (2048, 2048))
+                self.assertEqual(reduced.sampling_reference_frames, original.num_slices)
+                self.assertEqual(reduced.sampling_certificate, AZIMUTHAL_COVERAGE_CERTIFICATE)
+                gaps = np.diff(np.r_[reduced.azimuths_deg, 180.0])
+                parallel = (reduced.diameter - 1) / (2.0 * (reduced.src_w - 1))
+                perpendicular = reduced.diameter / 2.0 * math.sin(math.radians(float(gaps.max())) / 2.0)
+                stack = g.azimuthal_stack_length(reduced) / (2.0 * reduced.src_h)
+                self.assertLessEqual(parallel**2 + perpendicular**2, AZIMUTHAL_COVERAGE_ERROR_BOUND_SQ)
+                self.assertLessEqual(stack**2, AZIMUTHAL_COVERAGE_ERROR_BOUND_SQ)
+                self.assertGreater(parallel**2 + perpendicular**2 + stack**2, 1.0)
+
+    def test_compact_positive_native_taps_cover_plane_and_stack_with_padding_phase(self):
+        for shape, raster in (((33, 31, 29), 20), ((32, 34, 36), 23), ((17, 29, 31), 24)):
+            for base in ('transverse', 'sagittal', 'coronal'):
+                view = optimize_azimuthal_view(native_view(shape, base, raster=raster))
+                self.assertTrue(view.sampling_certificate)
+                height, width = g.azimuthal_plane_shape(view)
+                stack_length = g.azimuthal_stack_length(view)
+                for output in (raster, raster + 3):
+                    affine = g.build_affine(view.name, view.src_w, view.src_h, output, 0.0, view.pad_mode)
+                    grid = np.arange(output, dtype=np.float32)
+                    columns = affine.M_out_to_src[0, 0] * grid + affine.M_out_to_src[0, 2]
+                    columns = np.clip(columns[(columns > -1) & (columns < view.src_w)], 0, view.src_w - 1)
+                    line = np.float32(-view.roi_radius) + np.float32(2 * view.roi_radius) * (
+                        columns / np.float32(view.src_w - 1))
+                    support = np.zeros((height, width), dtype=bool)
+                    for angle in view.azimuths_deg:
+                        theta = math.radians(angle)
+                        coords = (np.float32(view.center_y) + line * np.float32(math.sin(theta)),
+                                  np.float32(view.center_x) + line * np.float32(math.cos(theta)))
+                        lower = [np.floor(c).astype(np.intp) for c in coords]
+                        fractions = [c - a for c, a in zip(coords, lower)]
+                        for iy in (0, 1):
+                            for ix in (0, 1):
+                                y, x = lower[0] + iy, lower[1] + ix
+                                positive = ((fractions[0] if iy else 1 - fractions[0]) > 1 / 256)
+                                positive &= ((fractions[1] if ix else 1 - fractions[1]) > 1 / 256)
+                                positive &= (y >= 0) & (y < height) & (x >= 0) & (x < width)
+                                support[y[positive], x[positive]] = True
+                    y, x = np.ogrid[:height, :width]
+                    roi = (x - view.center_x)**2 + (y - view.center_y)**2 <= (view.diameter / 2)**2
+                    rows = affine.M_out_to_src[1, 1] * grid + affine.M_out_to_src[1, 2]
+                    rows = np.clip(rows[(rows > -1) & (rows < view.src_h)], 0, view.src_h - 1)
+                    stack_coords = np.clip((rows + np.float32(.5)) * np.float32(stack_length / view.src_h)
+                                           - np.float32(.5), 0, stack_length - 1)
+                    stack_support = np.min(np.abs(np.arange(stack_length)[:, None] - stack_coords), axis=1) < 255 / 256
+                    with self.subTest(shape=shape, base=base, output=output):
+                        self.assertTrue(np.all(support[roi]))
+                        self.assertTrue(np.all(stack_support))
 
     def test_tilted_nonazimuthal_and_nonstandard_radius_fall_back(self):
         upright = native_view()

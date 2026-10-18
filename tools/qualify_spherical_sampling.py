@@ -57,7 +57,7 @@ def main():
     z, y, x = np.ogrid[:native[0], :native[1], :native[2]]
     dz = (z + .5) * working[0] / native[0] - .5 - (working[0]-1)/2
     radius = np.sqrt(dz*dz + (y-32)**2 + (x-33)**2)
-    roi = (radius >= 1) & (radius <= base[0].spherical_max_radius)
+    roi = (radius >= 1) & (radius <= max(view.spherical_max_radius for view in base))
     rows = []
     report = {'scope': __doc__, 'native_shape': native, 'working_shape': working,
               'sampler_frames_per_case': sum(v.num_slices for v in base), 'cases': rows}

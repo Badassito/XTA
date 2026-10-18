@@ -167,6 +167,7 @@ def test_real_pipeline_background_checkpoint_refills_four_workers_before_next_ou
     namespace.update(scheduler=scheduler, inference_worker_process_active=True, sam_context=None,
         _maybe_prepare_sam_cpu_source=lambda:None,
         _maybe_prepare_sam_runtime=lambda:None,
+        _reclaim_drained_sam_dense_capacity=lambda:None,
         background_drain_budget=budget, _drain_parent_mask_ready_events=lambda: None,
         parent_confidence_retired_events=queue.SimpleQueue(),
         parent_dense_retired_events=queue.SimpleQueue(),

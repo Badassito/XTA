@@ -55,7 +55,8 @@ def test_ram_totals_survive_scheduler_changes_during_restore_read(metric):
 
 
 def allocation(tmp_path, *, backend='sam', extrapolation=False, ready=False, shared=True,
-               stager=True, interpolation=True, tmpfs=False, monkeypatch=None, ram_fit=False, cap=120):
+               stager=True, interpolation=True, tmpfs=False, monkeypatch=None, ram_fit=False, cap=120,
+               birth_ram_fit=False):
     staged,check,prepare,leases=queue(tmp_path,cap=cap,ready=lambda:ready)
     if tmpfs:
         monkeypatch.setattr(staging,'path_is_memory_backed',lambda path:
@@ -100,7 +101,8 @@ def allocation(tmp_path, *, backend='sam', extrapolation=False, ready=False, sha
              mock.patch.object(staging,'workspace_anon_cap_bytes',return_value=0):
             ensure('model',view)
     else:
-        with mock.patch.object(staged,'claim_ram_first',return_value=ram_fit):
+        with mock.patch.object(staged,'claim_ram_first',return_value=ram_fit), \
+             mock.patch.object(staged,'qualify_detector_ram_birth',return_value=(birth_ram_fit, {})):
             ensure('model',view)
     return staged,check,prepare,state,ns,view,allocate,telemetry
 
@@ -141,7 +143,8 @@ def test_actual_uint8_allocations_start_zero_and_checkpoint_reuses_identical_mas
     assert snapshot.mask.path==paths[0] and snapshot.confidence.path==paths[1]
     assert snapshot.written_bytes==0 and snapshot.reused_bytes==120
     assert staged.snapshot()['written_bytes']==0 and staged.snapshot()['reused_regular_disk_bytes']==120
-    assert not tuple(staged.root.rglob('*.dat'))  # No duplicate checkpoint payload.
+    assert set(staged.root.rglob('*.dat')) == set(paths)  # Reuse the exact birth payloads.
+    assert snapshot.owned_dir == paths[0].parent
     for saved,wanted in ((snapshot.mask,wanted_mask),(snapshot.confidence,wanted_conf)):
         reopened=saved.open();np.testing.assert_array_equal(reopened,wanted)
         assert hashlib.sha256(reopened.tobytes()).digest()==hashlib.sha256(wanted.tobytes()).digest()
@@ -157,7 +160,7 @@ def test_actual_uint8_allocations_start_zero_and_checkpoint_reuses_identical_mas
     np.testing.assert_array_equal(result.confidence,wanted_conf)
     task.union_mm._mmap.close();task.confmap_mm._mmap.close()
     staged.close();staged.finalize_cleanup()
-    assert all(path.exists()for path in paths)  # Original temp owners belong to normal pipeline cleanup.
+    assert not any(path.exists()for path in paths)  # Staging owns this private birth directory.
 
 
 def test_backing_classification_keeps_lazy_mixed_cow_unknown_and_future_ram(tmp_path):
@@ -275,7 +278,7 @@ def test_last_denial_retains_requested_reserve_and_exact_guard(tmp_path,monkeypa
 
 @pytest.mark.parametrize('options', [
     {'backend':'sdf'}, {'ready':True}, {'shared':False}, {'stager':False},
-    {'interpolation':False}, {'tmpfs':True},
+    {'interpolation':False},
 ])
 def test_noneligible_and_tmpfs_paths_preserve_existing_allocation_choices(tmp_path,monkeypatch,options):
     staged,_check,_prepare,_state,ns,_view,allocate,telemetry=allocation(tmp_path,monkeypatch=monkeypatch,**options)

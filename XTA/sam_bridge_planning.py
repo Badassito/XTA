@@ -22,6 +22,9 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 from scipy import ndimage as ndi
 
+from .sam_observation_masks import (_PackedObservationMask, immutable_observation_mask,
+    observation_mask_storage_bytes, observation_mask_storage_size)
+
 
 BBoxYX = tuple[int, int, int, int]  # y0, x0, y1, x1; upper bounds exclusive
 SAM_CROP_PLANNING_CONTRACT_VERSION = "xta.sam_fixed_family_swept_context/2"
@@ -44,15 +47,16 @@ class SamPlanningLimits:
     max_observations: int = 200_000
     max_observation_bytes: int = 512 * 1024 * 1024
     max_slice_pixels: int = 16_777_216
-    max_endpoints_per_group: int = 64
-    max_observations_per_group: int = 512
-    max_edges_per_group: int = 128
+    max_endpoints_per_group: int = 1024
+    max_observations_per_group: int = 1024
+    max_edges_per_group: int = 256
     max_proposed_edges: int = 100_000
     max_frame_address_records: int = 100_000
     max_frames_per_group: int | None = None
     max_crop_pixels: int = 4_194_304
     max_group_bytes: int = 256 * 1024 * 1024
     max_total_contract_bytes: int = 512 * 1024 * 1024
+    max_contract_metadata_bytes: int = 512 * 1024 * 1024
     context_margin_px: int = 24
     acceptance_margin_px: int = 8
     curvature_margin_px: int = 8
@@ -72,7 +76,7 @@ class SamObservation:
     canonical_label: int
     component_index: int
     bbox_yx: BBoxYX
-    mask_crop: np.ndarray = field(compare=False, repr=False)
+    mask_crop: np.ndarray | _PackedObservationMask = field(compare=False, repr=False)
     lineage: Mapping[str, Any] = field(default_factory=dict, compare=False)
     identity_limitation: str = "slice_connected_components_not_detector_instances"
     original_observation_id: str = ""
@@ -81,10 +85,15 @@ class SamObservation:
 
     @property
     def area(self) -> int:
+        if isinstance(self.mask_crop, _PackedObservationMask):
+            return self.mask_crop.area
         return int(np.count_nonzero(self.mask_crop))
 
     @property
     def anchor_yx(self) -> tuple[float, float]:
+        if isinstance(self.mask_crop, _PackedObservationMask):
+            y, x = self.mask_crop.anchor_yx
+            return y + self.bbox_yx[0], x + self.bbox_yx[1]
         ys, xs = np.nonzero(self.mask_crop)
         return (float(ys.mean()) + self.bbox_yx[0],
                 float(xs.mean()) + self.bbox_yx[1])
@@ -194,6 +203,7 @@ class SamBridgePlan:
     frame_addressing: Mapping[str, Any] = field(default_factory=dict, compare=False)
     contract_storage_version: str = "eager"
     contract_lease_budget: Any = field(default=None, compare=False, repr=False)
+    contract_metadata_bytes: int = 0
 
     @property
     def by_id(self) -> Mapping[str, SamObservation]:
@@ -296,7 +306,7 @@ class SamObservationInventory:
         return None
 
     def _remember(self, key, digest, components, observed_bytes):
-        charge = sum(crop.size + 1024 for _, crop, _ in components)
+        charge = sum(observation_mask_storage_bytes(crop) + 1024 for _, crop, _ in components)
         if not components:
             if self._old_bytes + self._empty_bytes + observed_bytes + 256 > self._limit:
                 return
@@ -329,6 +339,18 @@ def _observations(volume: object, *, scope: str, labels: object | None,
             inventory._finish()
 
 
+def _observation_label_crop(foreground):
+    """Remove only zero margins, with no retained coordinate or label arrays."""
+    rows = np.any(foreground, axis=1)
+    if not rows.any():
+        return None  # Preserve the existing empty-frame label/cache behavior.
+    y0, y1 = int(rows.argmax()), len(rows)-int(rows[::-1].argmax())
+    del rows
+    columns = np.any(foreground, axis=0)
+    x0, x1 = int(columns.argmax()), len(columns)-int(columns[::-1].argmax())
+    return slice(y0, y1), slice(x0, x1)
+
+
 def _discover_observations(volume, *, scope, labels, lineage, limits, inventory):
     result: list[SamObservation] = []
     by_frame: dict[int, list[int]] = {}
@@ -357,15 +379,23 @@ def _discover_observations(volume, *, scope, labels, lineage, limits, inventory)
         if cached is not None:
             inventory._counts['reused_frames'] += 1
         components = []
-        remaining = sum(crop.size + 1024 for _, crop, _ in cached) if cached is not None else 0
+        remaining = sum(observation_mask_storage_bytes(crop) + 1024 for _, crop, _ in cached) if cached is not None else 0
+        label_crop = (_observation_label_crop(foreground)
+            if cached is None and len(values) and foreground.ndim == 2
+            and (not labelled or canonical.shape == foreground.shape) else None)
+        origin_y, origin_x = (0, 0) if label_crop is None else (label_crop[0].start, label_crop[1].start)
         for value in values:
             if cached is None:
-                mask = foreground & (canonical == value) if labelled else foreground
+                if label_crop is None:
+                    mask = foreground & (canonical == value) if labelled else foreground
+                else:
+                    mask = (foreground[label_crop] & (canonical[label_crop] == value)
+                            if labelled else foreground[label_crop])
                 if inventory is not None:
                     inventory._counts['label_calls'] += 1
                 local, count = ndi.label(mask, structure=np.ones((3, 3), dtype=bool))
                 candidates = ((index, slices, None) for index, slices in
-                              enumerate(ndi.find_objects(local), start=1) if slices is not None)
+                              enumerate(ndi.find_objects(local, max_label=count), start=1) if slices is not None)
             else:
                 candidates = ((None, None, item) for item in cached)
             for local_index, slices, reused in candidates:
@@ -374,19 +404,25 @@ def _discover_observations(volume, *, scope, labels, lineage, limits, inventory)
                 component_index += 1
                 if reused is None:
                     sy, sx = slices
-                    bbox = (int(sy.start), int(sx.start), int(sy.stop), int(sx.stop))
+                    # Translate only integer geometry. Local mask extraction and
+                    # subsequent centroid/anchor arithmetic retain their order.
+                    bbox = (int(sy.start)+origin_y, int(sx.start)+origin_x,
+                            int(sy.stop)+origin_y, int(sx.stop)+origin_x)
                 else:
                     bbox = reused[0]
-                charge += (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) + 1024
+                pixels = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+                charge += (observation_mask_storage_size(pixels) if reused is None else
+                           observation_mask_storage_bytes(reused[1])) + 1024
                 if charge > limits.max_observation_bytes:
                     return result, by_frame, "observation_inventory_memory_limit"
                 if reused is not None:
-                    remaining -= reused[1].size + 1024
+                    remaining -= observation_mask_storage_bytes(reused[1]) + 1024
                 if inventory is not None:
                     inventory._trim(charge + remaining)
                 if reused is None:
-                    crop = _readonly(local[slices] == local_index)
-                    digest = hashlib.sha256(np.packbits(crop).tobytes()).hexdigest()
+                    crop = immutable_observation_mask(local[slices] == local_index)
+                    packed = crop.packed if isinstance(crop, _PackedObservationMask) else np.packbits(crop).tobytes()
+                    digest = hashlib.sha256(packed).hexdigest()
                 else:
                     _, crop, digest = reused
                     inventory._counts['reused_components'] += 1
@@ -404,7 +440,8 @@ def _discover_observations(volume, *, scope, labels, lineage, limits, inventory)
                         from .sam_cyclic import mirror_bbox_yx
                         original_bbox = mirror_bbox_yx(bbox, shape[2])
                         original_mask = crop[:, ::-1]
-                    original_digest = hashlib.sha256(np.packbits(original_mask).tobytes()).hexdigest()
+                    original_digest = (hashlib.sha256(np.packbits(original_mask).tobytes()).hexdigest()
+                                       if mirror_u else digest)
                     original_identifier = _identity("sam_obs", scope, native_frame, original_bbox, original_digest, int(value))
                     identifier = (original_identifier if int(address["cycle_index"]) == 0 else
                                   _identity("sam_obs_alias", original_identifier, frame, address_metadata["schema"], mirror_u))
@@ -514,6 +551,53 @@ def _cone_candidates(source: SamObservation, targets: Sequence[int],
 def _paint_shifted(destination: np.ndarray, observation: SamObservation,
                    crop: BBoxYX, shift_y: float, shift_x: float, *,
                    raster_origin_yx: tuple[int, int] | None = None) -> None:
+    if _paint_shifted_rectangle(destination, observation, crop, shift_y, shift_x,
+                                raster_origin_yx=raster_origin_yx):
+        return
+    _paint_shifted_points(destination, observation, crop, shift_y, shift_x,
+                          raster_origin_yx=raster_origin_yx)
+
+
+def _paint_shifted_rectangle(destination: np.ndarray, observation: SamObservation,
+                             crop: BBoxYX, shift_y: float, shift_x: float, *,
+                             raster_origin_yx: tuple[int, int] | None = None) -> bool:
+    """Paint a translated rectangle only when its complete raster is consecutive."""
+    h, w = observation.mask_crop.shape
+    # Bound axis scratch by the admitted destination crop, even for a huge sparse
+    # source clipped to a tiny crop. Small silhouettes are cheaper as point lists.
+    if (destination.ndim != 2 or destination.dtype != np.bool_ or not destination.flags.writeable
+            or h * w < 1024 or h + w > destination.size):
+        return False
+    origin_y, origin_x = crop[:2] if raster_origin_yx is None else raster_origin_yx
+    # Keep every integer/float intermediate far inside int64's range. Unusual
+    # geometry follows the unchanged point path rather than acquiring new errors.
+    if not all(isinstance(value, (int, np.integer)) and abs(int(value)) <= 2**40
+               for value in (*observation.bbox_yx[:2], *crop[:2], origin_y, origin_x)):
+        return False
+    if not (math.isfinite(shift_y) and math.isfinite(shift_x)
+            and abs(shift_y) <= 2**40 and abs(shift_x) <= 2**40):
+        return False
+    # Match np.nonzero's integer dtype and the point raster's operation order.
+    # Half-pixel ties can duplicate/jump coordinates, so check every axis step.
+    iy = (np.rint(np.arange(h, dtype=np.intp) + observation.bbox_yx[0] + shift_y - origin_y).astype(np.int64)
+          + int(origin_y) - crop[0])
+    ix = (np.rint(np.arange(w, dtype=np.intp) + observation.bbox_yx[1] + shift_x - origin_x).astype(np.int64)
+          + int(origin_x) - crop[1])
+    if not (np.all(np.diff(iy) == 1) and np.all(np.diff(ix) == 1)):
+        return False
+    dy, dx = int(iy[0]), int(ix[0])
+    del iy, ix
+    y0, x0 = max(0, -dy), max(0, -dx)
+    y1, x1 = min(h, destination.shape[0] - dy), min(w, destination.shape[1] - dx)
+    if y0 < y1 and x0 < x1:
+        target = destination[y0 + dy:y1 + dy, x0 + dx:x1 + dx]
+        np.logical_or(target, observation.mask_crop[y0:y1, x0:x1], out=target)
+    return True
+
+
+def _paint_shifted_points(destination: np.ndarray, observation: SamObservation,
+                          crop: BBoxYX, shift_y: float, shift_x: float, *,
+                          raster_origin_yx: tuple[int, int] | None = None) -> None:
     ys, xs = np.nonzero(observation.mask_crop)
     origin_y, origin_x = crop[:2] if raster_origin_yx is None else raster_origin_yx
     # Preserve the original crop-relative ties-to-even lattice. Rounding after
@@ -533,12 +617,39 @@ def _corridor(a: SamObservation, b: SamObservation, frame: int,
     alpha = (frame - a.frame_index) / (b.frame_index - a.frame_index)
     ay, ax = a.anchor_yx
     by, bx = b.anchor_yx
-    _paint_shifted(output, a, crop, alpha * (by - ay), alpha * (bx - ax),
-                   raster_origin_yx=raster_origin_yx)
-    _paint_shifted(output, b, crop, (1 - alpha) * (ay - by), (1 - alpha) * (ax - bx),
-                   raster_origin_yx=raster_origin_yx)
+    shifted = ((a, alpha * (by - ay), alpha * (bx - ax)),
+               (b, (1 - alpha) * (ay - by), (1 - alpha) * (ax - bx)))
+    origin = crop[:2] if raster_origin_yx is None else raster_origin_yx
+    paint_crop, region = crop, output
+    if margin > 0 and all(math.isfinite(value) for _, dy, dx in shifted for value in (dy, dx)):
+        # Rounding is monotone, so shifted bbox extrema bound every painted pixel
+        # on the original ties-to-even lattice. Clip seeds before padding: pixels
+        # outside the declared crop must never dilate back into the contract.
+        boxes = []
+        for observation, dy, dx in shifted:
+            oy0, ox0, oy1, ox1 = observation.bbox_yx
+            y0 = max(crop[0], int(np.rint(oy0 + dy - origin[0])) + origin[0])
+            x0 = max(crop[1], int(np.rint(ox0 + dx - origin[1])) + origin[1])
+            y1 = min(crop[2], int(np.rint(oy1 - 1 + dy - origin[0])) + origin[0] + 1)
+            x1 = min(crop[3], int(np.rint(ox1 - 1 + dx - origin[1])) + origin[1] + 1)
+            if y0 < y1 and x0 < x1:
+                boxes.append((y0, x0, y1, x1))
+        if not boxes:
+            return output
+        paint_crop = (max(crop[0], min(box[0] for box in boxes) - margin),
+                      max(crop[1], min(box[1] for box in boxes) - margin),
+                      min(crop[2], max(box[2] for box in boxes) + margin),
+                      min(crop[3], max(box[3] for box in boxes) + margin))
+        if paint_crop != crop:
+            region = output[paint_crop[0] - crop[0]:paint_crop[2] - crop[0],
+                            paint_crop[1] - crop[1]:paint_crop[3] - crop[1]]
+    for observation, dy, dx in shifted:
+        _paint_shifted(region, observation, paint_crop, dy, dx,
+                       raster_origin_yx=origin)
     if margin:
-        output = ndi.binary_dilation(output, iterations=margin)
+        if region is output:
+            return ndi.binary_dilation(output, iterations=margin)
+        region[:] = ndi.binary_dilation(region, iterations=margin)
     return output
 
 
@@ -594,6 +705,19 @@ def _swept_family_bbox(observations: Sequence[SamObservation], endpoints: set[in
 
 def _empty_contracts() -> np.ndarray:
     return _readonly(np.empty((0, 0, 0), dtype=bool))
+
+
+def _contract_materialization(pixels, frames, edges, endpoints, observations, streamed):
+    dense = pixels * (2 * frames * (5 + 2 * edges) + 4 * endpoints + 16)
+    details = dict(dense_contract_peak_bytes=dense, charged_contract_bytes=dense,
+                   contract_materialization='dense')
+    if streamed:
+        from .sam_interpolation_contracts import streaming_sam_contract_peak_bytes
+        peak = streaming_sam_contract_peak_bytes(pixels, frames, edges, observations)
+        details['streamed_contract_peak_bytes'] = peak
+        if peak < dense:
+            details.update(charged_contract_bytes=peak, contract_materialization='streamed_planes')
+    return details
 
 
 class _ContractLeaseBudget:
@@ -694,7 +818,9 @@ class _SamGroupContractRecipe:
 
     @contextmanager
     def materialize(self):
-        ticket = self.lease_budget.acquire(self.descriptor.crop_contract["charged_contract_bytes"])
+        contract = self.descriptor.crop_contract
+        ticket = self.lease_budget.acquire(contract.get('dense_contract_peak_bytes',
+                                                       contract['charged_contract_bytes']))
         materialized = None
         try:
             materialized = _materialize_contract_group(self)
@@ -837,21 +963,22 @@ def expand_sam_bridge_group_context(group: SamBridgeGroup, crop_bbox_yx: BBoxYX,
     pixels = (crop[2]-crop[0])*(crop[3]-crop[1])
     if int(max_crop_pixels) < 1 or pixels > int(max_crop_pixels):
         raise MemoryError('SAM retry crop exceeds its explicit pixel cap')
-    old_pixels = (old[2]-old[0])*(old[3]-old[1])
-    old_charge = int(group.crop_contract['charged_contract_bytes'])
-    if old_charge % old_pixels:
-        raise ValueError('SAM original contract charge is not an exact pixel-based recipe')
-    charge = pixels * (old_charge // old_pixels)
+    materialization = _contract_materialization(pixels, len(group.frame_indices), len(group.edges),
+        len(group.endpoint_ids), len(group.observation_ids),
+        'streamed_contract_peak_bytes' in group.crop_contract)
+    charge = materialization['charged_contract_bytes']
     if (charge > recipe.bounds.max_group_bytes
             or charge > recipe.lease_budget.maximum_bytes):
         raise MemoryError('SAM enlarged contracts exceed the current owned family/resident memory caps')
     identity = _identity('sam_group_retry', group.group_id, crop)
     contract = dict(group.crop_contract)
     contract.update(context_bbox_yx=crop, unclipped_context_bbox_yx=crop,
-        crop_pixels=pixels, charged_contract_bytes=charge,
+        crop_pixels=pixels, **materialization,
         bounds_basis='bounded_retry_of_original_frozen_family',
         retry_of_group_id=group.group_id, retry_crop_bbox_yx=crop,
         retry_lineage=dict(retry_lineage or {}))
+    if 'selection_priority' in contract:
+        contract['selection_priority'] = (contract['selection_priority'][0], identity)
     descriptor = replace(group, group_id=identity, context_bbox_yx=crop,
         crop_contract=MappingProxyType(contract), contract_recipe=None)
     # All endpoint/corridor painting keeps the original raster origin. The
@@ -873,6 +1000,7 @@ def plan_sam_bridges(
     planning_pass_index: int = 1,
     wrap_axis: bool = False,
     lazy_contracts: bool = False,
+    _stream_contracts: bool = False,
     _observation_inventory: SamObservationInventory | None = None,
 ) -> SamBridgePlan:
     """Plan fixed family crops and independently detector-seeded tracker runs.
@@ -888,6 +1016,8 @@ def plan_sam_bridges(
     unions as new observations.
     """
     bounds = limits or SamPlanningLimits()
+    if _stream_contracts and not lazy_contracts:
+        raise ValueError('Streamed SAM contracts require lazy recipes')
     shape = tuple(int(value) for value in observed_volume.shape)  # type: ignore[attr-defined]
     if len(shape) != 3 or any(value <= 0 for value in shape):
         raise ValueError("SAM observations require a nonempty frame,y,x canvas")
@@ -951,13 +1081,24 @@ def plan_sam_bridges(
     fingerprint = _identity("sam_input", scope_id, shape,
                             tuple(item.observation_id for item in observations),
                             repr(dict(observation_lineage or {})))
-    planning_fingerprint = _identity("sam_planning", SAM_CROP_PLANNING_CONTRACT_VERSION,
-                                     fingerprint, interpolation_distance,
-                                     interpolation_candidates, interpolation_walk_back,
-                                     interpolation_search_angle, spacing, tuple(vars(bounds).items()),
-                                     frame_addressing.get("schema", ""), native_shape,
-                                     frame_addressing.get("alias_frames", 0), cyclic_implementation_sha256,
-                                     SAM_CONTRACT_STORAGE_VERSION if lazy_contracts else "eager")
+    def planning_identity(limit_items, *storage):
+        return _identity("sam_planning", SAM_CROP_PLANNING_CONTRACT_VERSION,
+            fingerprint, interpolation_distance, interpolation_candidates, interpolation_walk_back,
+            interpolation_search_angle, spacing, limit_items,
+            frame_addressing.get("schema", ""), native_shape,
+            frame_addressing.get("alias_frames", 0), cyclic_implementation_sha256,
+            SAM_CONTRACT_STORAGE_VERSION if lazy_contracts else "eager", *storage)
+    limit_items = tuple((key, value) for key, value in vars(bounds).items()
+                       if _stream_contracts or key != 'max_contract_metadata_bytes')
+    planning_fingerprint = planning_identity(limit_items, *(('streamed_planes',) if _stream_contracts else ()))
+    group_identity_fingerprint = planning_fingerprint
+    legacy_caps = dict(max_endpoints_per_group=64, max_observations_per_group=512, max_edges_per_group=128)
+    if _stream_contracts:
+        # Resource-only changes must not reshuffle policy tie breaks for existing work.
+        group_identity_fingerprint = planning_identity(tuple(
+            (key, min(value, legacy_caps[key]) if key in legacy_caps else value)
+            for key, value in vars(bounds).items() if key != 'max_contract_metadata_bytes'))
+    legacy_inventory_bytes = sum(item.mask_crop.size + 1024 for item in observations) if _stream_contracts else 0
     # Required edges use the bounded nearest-candidate flag. Family inventory also
     # retains other compatible endpoints, so legitimate sibling support is measured
     # against a complete declared local family rather than an SDF candidate list.
@@ -1145,7 +1286,9 @@ def plan_sam_bridges(
         if pixels > bounds.max_crop_pixels:
             reasons.append("context_crop_pixel_limit")
         # Charge retained Boolean masks plus one float64 distance/geometry workspace.
-        charge = pixels * (2 * len(frames) * (5 + 2 * len(pairs)) + 4 * len(endpoints) + 16)
+        materialization = _contract_materialization(pixels, len(frames), len(pairs), len(endpoints),
+                                                    len(family), _stream_contracts)
+        charge = materialization['charged_contract_bytes']
         legacy_pixels = (legacy_crop[2] - legacy_crop[0]) * (legacy_crop[3] - legacy_crop[1])
         clamped_sides = tuple(side for side, changed in (
             ("top", unclipped_crop[0] < 0), ("left", unclipped_crop[1] < 0),
@@ -1171,8 +1314,9 @@ def plan_sam_bridges(
             "rounding_rule": "numpy_rint_ties_to_even_relative_legacy_raster_origin",
             "legacy_crop_pixels": legacy_pixels,
             "crop_pixels": pixels,
-            "charged_contract_bytes": charge,
-            "legacy_charged_contract_bytes": legacy_pixels * (charge // pixels),
+            **materialization,
+            "legacy_charged_contract_bytes": _contract_materialization(legacy_pixels, len(frames),
+                len(pairs), len(endpoints), len(family), _stream_contracts)['charged_contract_bytes'],
             "contract_storage_version": SAM_CONTRACT_STORAGE_VERSION if lazy_contracts else "eager",
             "contract_resident_budget_bytes": bounds.max_total_contract_bytes,
         })
@@ -1187,8 +1331,19 @@ def plan_sam_bridges(
                                                     observations[b].observation_id),
                                            observations[a].observation_id, observations[b].observation_id, rank)
                              for a, b, rank in sorted(pairs))
-        group_id = _identity("sam_group", scope_id, planning_fingerprint, observation_ids,
+        group_id = _identity("sam_group", scope_id, group_identity_fingerprint, observation_ids,
                              tuple(edge.edge_id for edge in edge_records), crop, frames, spacing)
+        if _stream_contracts:
+            legacy_admissible = (
+                legacy_inventory_bytes <= bounds.max_observation_bytes
+                and family_counts[first] <= min(bounds.max_endpoints_per_group, 64)
+                and len(family) <= min(bounds.max_observations_per_group, 512)
+                and len(pairs) <= min(bounds.max_edges_per_group, 128)
+                and materialization['dense_contract_peak_bytes'] <= min(
+                    bounds.max_group_bytes, bounds.max_total_contract_bytes)
+                and len(frames) * pixels * 16 <= bounds.max_group_bytes)
+            crop_contract = MappingProxyType({**crop_contract,
+                'selection_priority': (0 if legacy_admissible else 1, group_id)})
         if reasons or not pairs:
             empty = _empty_contracts()
             groups.append(SamBridgeGroup(group_id, observation_ids, edge_records, crop, frames,
@@ -1236,6 +1391,19 @@ def plan_sam_bridges(
                     runs.append(SamBridgeRunPlan(identifier, group_id,
                                                 (observations[seed].observation_id,), held_out,
                                                 direction, coverage, edge_ids, 1, walk_index))
+    metadata_bytes = 0
+    if _stream_contracts:
+        metadata_bytes = 2048 * sum(
+            ((4 + 2 * len(group.edges)) * len(group.frame_indices) + 3 * len(group.observation_ids))
+            if group.status == 'planned' else
+            len(group.observation_ids) + len(group.frame_indices) + len(group.edges)
+            for group in groups)
+        # Raw/candidate/availability entries and run descriptors persist across waves.
+        metadata_bytes += 2048 * (4 * sum(len(run.expected_frames) for run in runs) + len(runs))
+        if metadata_bytes > bounds.max_contract_metadata_bytes:
+            return SamBridgePlan(tuple(observations), (), (), interpolation_passes, 0,
+                interpolation_passes, 'unresolved', ('contract_metadata_memory_limit',),
+                fingerprint, planning_fingerprint, contract_metadata_bytes=metadata_bytes)
     status = "unresolved" if groups and all(group.status == "unresolved" for group in groups) else "planned"
     return SamBridgePlan(tuple(observations), tuple(groups), tuple(runs), interpolation_passes, 1,
                          interpolation_passes - 1, status,
@@ -1245,7 +1413,8 @@ def plan_sam_bridges(
                          frame_addresses=frame_addresses,
                          frame_addressing=frame_addressing,
                          contract_storage_version=SAM_CONTRACT_STORAGE_VERSION if lazy_contracts else "eager",
-                         contract_lease_budget=contract_lease_budget if lazy_contracts else None)
+                         contract_lease_budget=contract_lease_budget if lazy_contracts else None,
+                         contract_metadata_bytes=metadata_bytes)
 
 
 __all__ = ["SAM_CROP_PLANNING_CONTRACT_VERSION", "SAM_CONTRACT_STORAGE_VERSION", "SamPlanningLimits", "SamObservation", "SamBridgeEdge", "SamBridgeGroup",

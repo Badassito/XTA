@@ -57,6 +57,17 @@ class SphericalSchedulerContracts(unittest.TestCase):
         self.assertEqual([record['group'] for record in records], ['upright', 'vertical_p30'])
         self.assertEqual([record['patch_trajectories'] for record in records], [len(views), len(views)])
 
+    def test_radius_band_workload_reports_the_whole_cube_and_unique_shells(self):
+        views = compiled_views()
+        self.assertGreater(len({v.spherical_max_radius for v in views}), 1)
+        record = pipeline._spherical_workload_groups(views)[0]
+        self.assertEqual(record['minimum_radius'], .63)
+        self.assertEqual(record['maximum_radius'], 5.)
+        self.assertEqual(record['radius_count'], len({r for v in views for r in v.spherical_radii}))
+        self.assertEqual(len(record['radius_bands']), len({v.spherical_max_radius for v in views}))
+        self.assertEqual(record['face_intervals'], max(v.spherical_face_intervals for v in views))
+        self.assertEqual(record['frames_per_angle'], sum(v.num_slices for v in views))
+
     def test_early_request_resolution_rejects_nonpositive_patch_size(self):
         # Execute the production early-resolution block without opening models,
         # decoding sources, or initializing the pipeline's worker infrastructure.

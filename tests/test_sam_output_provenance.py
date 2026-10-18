@@ -1,6 +1,7 @@
 """Directional SAM receipts remain distinct from final source-grid topology."""
 from dataclasses import replace
 import json
+import os
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from XTA.reconciliation_policy import resolve_reconciliation
 from XTA.reconciliation_runtime import reconcile_tta_layers
 from XTA.tta_outputs import measure_bridge_output_survival
 from XTA.sam_evidence import SamEvidenceWriter, SamEvidenceBundle, load_sam_online_selection
+from XTA.reconciliation_runtime import reuse_source_bridge_survival
 
 
 def ref(tmp_path, direction='forward', *, value=None, **extra):
@@ -364,3 +366,189 @@ def test_detached_addition_does_not_certify_already_connected_observations(tmp_p
     receipt = measure_bridge_output_survival([layer], final)[0]
     assert receipt['selected_voxels'] == 1 and receipt['support_survival'] == 'support_preserved'
     assert receipt['connection_survival'] == 'connection_lost'
+
+
+def reuse_fixture(tmp_path, *, memory_mib=256):
+    layer, final = final_fixture(tmp_path)
+    state = {}
+    result, report = reconcile_tta_layers([layer], views=[], source_shape_tyx=final.shape,
+        processing_shape_tyx=final.shape, settings=replace(cfg(tmp_path), memory_mib=memory_mib), output_dir=tmp_path/'reconciled',
+        workspace=tmp_path/'work', assembled_union=final, _survival_reuse=state)
+    assert result is final and state
+    return layer, final, report, state
+
+
+def reused(layer, final, report, state, **kwargs):
+    return reuse_source_bridge_survival([layer], final, state, report,
+        writers_settled=kwargs.get('writers_settled', True),
+        postprocessing_disabled=kwargs.get('postprocessing_disabled', True))
+
+
+def test_unchanged_final_reuses_exact_support_and_topology_without_another_audit(tmp_path, monkeypatch):
+    from XTA import tta_outputs
+    layer, final, report, state = reuse_fixture(tmp_path)
+    original = json.dumps(report, sort_keys=True)
+    monkeypatch.setattr(tta_outputs, 'measure_bridge_output_survival',
+        lambda *_a, **_k: pytest.fail('unchanged output must reuse the source audit'))
+    receipt = reused(layer, final, report, state)[0]
+    source = report['layers']['detector/forward']['source_reconciliation_survival']
+    assert receipt['selected_voxels'] == receipt['retained_voxels'] == 3
+    assert receipt['connection_survival'] == source['connection_survival'] == 'survived'
+    assert receipt['measurement_reused'] and receipt['reuse_validation_sha256'] == state['fingerprint']
+    assert receipt['measurement_origin_stage'] == source['stage'] == 'source_grid_before_global_postprocessing'
+    assert receipt['stage'] == receipt['group_connections'][0]['stage'] == 'final_output_after_global_postprocessing'
+    assert json.dumps(report, sort_keys=True) == original
+    receipt['group_connections'][0]['edges'][0]['connected'] = False
+    assert source['group_connections'][0]['edges'][0]['connected']
+
+
+@pytest.mark.parametrize('mutator', ['void_fill', 'centerline', 'gaussian', 'keep_objects'])
+def test_each_actual_global_mutator_disables_survival_reuse(tmp_path, monkeypatch, mutator):
+    from XTA import pipeline, reconciliation_runtime
+    layer, final, report, state = reuse_fixture(tmp_path)
+    args = SimpleNamespace(enable_3d_void_fill=mutator == 'void_fill',
+        centerline_filter_passes=int(mutator == 'centerline'), keep_objects=int(mutator == 'keep_objects'))
+    allowed = pipeline._source_bridge_survival_reuse_enabled(args, mutator == 'gaussian')
+    assert not allowed
+    monkeypatch.setattr(reconciliation_runtime, '_survival_reuse_fingerprint',
+        lambda *_a: pytest.fail('an active mutator must bypass reuse validation'))
+    assert reused(layer, final, report, state, postprocessing_disabled=allowed) is None
+
+
+@pytest.mark.parametrize('change', ['endpoint', 'selected_support'])
+def test_changed_final_bytes_reject_reuse_even_with_same_foreground_count(tmp_path, change):
+    layer, final, report, state = reuse_fixture(tmp_path)
+    frame = 0 if change == 'endpoint' else 2
+    count = np.count_nonzero(final)
+    final[frame, 2, 3] = 0
+    final[frame, 2, 4] = 1
+    assert np.count_nonzero(final) == count
+    assert reused(layer, final, report, state) is None
+    fresh = measure_bridge_output_survival([layer], final)[0]
+    assert fresh['connection_survival'] == 'connection_lost'
+    if change == 'endpoint':
+        assert fresh['selected_voxels'] == fresh['retained_voxels'] == 3
+
+
+@pytest.mark.parametrize('filename', ['manifest.json', 'index.json', 'masks.bin'])
+def test_edited_evidence_bytes_reject_reuse_without_trusting_size_or_mtime(tmp_path, filename):
+    layer, final, report, state = reuse_fixture(tmp_path)
+    path = Path(layer.proposal_evidence_path)/filename
+    before = path.stat()
+    data = bytearray(path.read_bytes())
+    data[-1] ^= 1
+    path.write_bytes(data)
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert path.stat().st_size == before.st_size and path.stat().st_mtime_ns == before.st_mtime_ns
+    assert reused(layer, final, report, state) is None
+
+
+def test_changed_selected_backing_rejects_reuse_and_fresh_count_remains_correct(tmp_path):
+    layer, final, report, state = reuse_fixture(tmp_path)
+    values = np.fromfile(layer.path, np.uint8).reshape(layer.shape)
+    values[2, 2, 3] = 0
+    values[2, 2, 4] = 1
+    values.tofile(layer.path)
+    assert reused(layer, final, report, state) is None
+    fresh = measure_bridge_output_survival([layer], final)[0]
+    assert fresh['selected_voxels'] == 3 and fresh['retained_voxels'] == 2
+
+
+def test_new_selection_receipt_rejects_reuse_even_when_selected_support_is_unchanged(tmp_path):
+    layer, final, report, state = reuse_fixture(tmp_path)
+    bundle = SamEvidenceBundle.open(layer.proposal_evidence_path)
+    selection = dict(schema='xta.sam_selection/1', evidence_fingerprint=bundle.evidence_fingerprint,
+        selected_run_ids=['run'], policy_hash=layer.interpolation_policy_identity)
+    (bundle.directory.parent/'selection.json').write_text(json.dumps(selection), encoding='utf-8')
+    assert reused(layer, final, report, state) is None
+    fresh = measure_bridge_output_survival([layer], final)[0]
+    assert fresh['selected_voxels'] == fresh['retained_voxels'] == 3
+    assert fresh['connection_survival'] == 'survived'
+
+
+@pytest.mark.parametrize('memory_mib', [1, 8, 4096])
+def test_different_source_topology_budget_keeps_final_audit(tmp_path, memory_mib):
+    layer, final, report, state = reuse_fixture(tmp_path, memory_mib=memory_mib)
+    assert reused(layer, final, report, state) is None
+
+
+def test_budget_independent_unsupported_transform_can_reuse_exact_support(tmp_path):
+    layer, final = final_fixture(tmp_path)
+    layer = replace(layer, native_transform={**layer.native_transform, 'kind': 'radial'})
+    state = {}
+    _, report = reconcile_tta_layers([layer], views=[], source_shape_tyx=final.shape,
+        processing_shape_tyx=final.shape, settings=cfg(tmp_path), output_dir=tmp_path/'reconciled',
+        workspace=tmp_path/'work', assembled_union=final, _survival_reuse=state)
+    receipt = reused(layer, final, report, state)[0]
+    assert receipt['selected_voxels'] == receipt['retained_voxels'] == 3
+    assert receipt['connection_survival'] == 'not_assessed' and receipt['group_connections'] == []
+
+
+def test_final_plane_budget_cannot_be_bypassed_by_a_source_audit(monkeypatch):
+    from XTA import reconciliation_runtime
+    output = np.broadcast_to(np.uint8(0), (1, 8193, 8193))
+    report = {}
+    monkeypatch.setattr(reconciliation_runtime, '_survival_reuse_fingerprint',
+        lambda *_a: pytest.fail('oversized final planes must keep the original budget error'))
+    assert reuse_source_bridge_survival([], output, dict(output=output, report=report), report,
+        writers_settled=True, postprocessing_disabled=True) is None
+
+
+@pytest.mark.parametrize('guard', ['reader', 'branch', 'filter'])
+def test_changed_loaded_scientific_implementation_keeps_fresh_audit(tmp_path, monkeypatch, guard):
+    from XTA import sam_mask_reader, sam_branch_selection, sam_filtering
+    layer, final, report, state = reuse_fixture(tmp_path)
+    module, name = {'reader': (sam_mask_reader, '_assert_source_unchanged'),
+                    'branch': (sam_branch_selection, '_assert_unchanged'),
+                    'filter': (sam_filtering, 'assert_filter_implementation_unchanged')}[guard]
+    def changed():
+        raise RuntimeError('scientific implementation changed')
+    monkeypatch.setattr(module, name, changed)
+    assert reused(layer, final, report, state) is None
+    if guard != 'branch':
+        with pytest.raises(RuntimeError, match='scientific implementation changed'):
+            measure_bridge_output_survival([layer], final)
+
+
+@pytest.mark.parametrize('packed', [False, True])
+@pytest.mark.parametrize('archive', [False, True])
+def test_selected_cvol_and_archived_backings_support_exact_reuse(tmp_path, packed, archive):
+    from XTA import interpolation
+    from XTA.artifact_archive import publish_directory, reference
+    layer, final = final_fixture(tmp_path)
+    values = np.fromfile(layer.path, np.uint8).reshape(layer.shape)
+    path = tmp_path/'selected.cvol'
+    format_name = interpolation.INTERNAL_PACKED_CVOL_FORMAT if packed else interpolation.CVOL_FORMAT
+    interpolation.write_raw_bbox_mask_store(values, path, format_name=format_name, workers=1)
+    if archive:
+        destination = Path(reference(tmp_path/'selected.tar', 'layers/selected.cvol'))
+        publish_directory(path, destination)
+        path = destination
+    layer = replace(layer, path=path, storage_format=format_name)
+    state = {}
+    _, report = reconcile_tta_layers([layer], views=[], source_shape_tyx=final.shape,
+        processing_shape_tyx=final.shape, settings=replace(cfg(tmp_path), memory_mib=256),
+        output_dir=tmp_path/'reconciled', workspace=tmp_path/'work', assembled_union=final,
+        _survival_reuse=state)
+    receipt = reused(layer, final, report, state)[0]
+    assert receipt['selected_voxels'] == receipt['retained_voxels'] == 3
+    assert receipt['connection_survival'] == 'survived' and receipt['measurement_reused']
+
+
+@pytest.mark.parametrize('change', ['new_buffer', 'restored_shape', 'new_ref', 'ref_metadata',
+                                  'source_receipt', 'source_report', 'writer_pending'])
+def test_unknown_identity_or_unsettled_boundary_keeps_fresh_audit(tmp_path, change):
+    layer, final, report, state = reuse_fixture(tmp_path)
+    if change == 'new_buffer':
+        final = final.copy()
+    elif change == 'restored_shape':
+        final = final[:, :, :-1]
+    elif change == 'new_ref':
+        layer = replace(layer, interpolation_direction='backward')
+    elif change == 'ref_metadata':
+        layer.native_transform['angle_deg'] = 90
+    elif change == 'source_receipt':
+        report['layers']['detector/forward']['source_reconciliation_survival']['selected_voxels'] = 99
+    elif change == 'source_report':
+        report = json.loads(json.dumps(report))
+    assert reused(layer, final, report, state, writers_settled=change != 'writer_pending') is None

@@ -9,12 +9,14 @@ from dataclasses import dataclass
 from contextlib import contextmanager, nullcontext
 from concurrent.futures import CancelledError, Future
 import os
+import errno
 from pathlib import Path
 from types import MappingProxyType
 import shutil
 import threading
 import time
 import uuid
+import weakref
 
 import numpy as np
 
@@ -24,7 +26,8 @@ from .runtime import (path_is_memory_backed, allocate_workspace_array,
                       close_memmap_array_without_flush, workspace_anon_cap_bytes, runtime_telemetry,
                       memfd_ram_headroom, capture_memfd_owner_proofs)
 from .publication_memory import publication_ram_headroom
-from .view_prepare import scratch_unlink_path_for_memmap, classify_dense_ram_backing
+from .view_prepare import (scratch_unlink_path_for_memmap, classify_dense_ram_backing,
+                          _dense_mapping_ram_backing)
 from .scheduler_diagnostics import scheduler_operation, scheduler_step
 
 STREAM_BYTES = 8 * 1024**2
@@ -505,14 +508,24 @@ def _close_prepared_sources(task, *, preserve=False):
                 else scratch_unlink_path_for_memmap(array,path)))
 
 
-def checkpoint_parent(task, root, source_root, required_bytes, stop):
+def checkpoint_parent(task, root, source_root, required_bytes, stop, *, owned_input_dir=None):
     if task.union_mm is not None:
         _validate_owner(task.union_mm)
         if task.confmap_mm is not None:
             _validate_owner(task.confmap_mm)
     started = time.perf_counter()
-    owned = Path(root) / uuid.uuid4().hex
-    owned.mkdir()
+    if owned_input_dir is None:
+        owned = Path(root) / uuid.uuid4().hex
+        owned.mkdir()
+    else:
+        owned = Path(owned_input_dir)
+        if (owned.is_symlink() or owned.resolve().parent != Path(root).resolve()
+                or _dense_mapping_ram_backing(owned) is not False
+                or task.union_mm is None or not all(
+                    _reusable_disk_owner(value, getattr(task, path_name), owned) is not None
+                    for name, path_name in (('union_mm', 'union_path'), ('confmap_mm', 'confmap_path'))
+                    if (value := getattr(task, name)) is not None)):
+            raise RuntimeError('SAM detector checkpoint lost its owned file backing')
     snapshots = []
     try:
         if task.union_mm is None:
@@ -587,6 +600,12 @@ class DeferredSamParentQueue:
                  prepare_workers=None, prepare_view_families=()):
         self.root = select_checkpoint_root(temp_dir, output_dir)
         self.source_root = Path(temp_dir)
+        self._checkpoint_root_identity = _stat_identity(self.root)[:2]
+        self._detector_disk_workspaces = {}
+        self._detector_disk_lock = threading.RLock()
+        self._detector_disk_retirements = {}
+        self._detector_disk_cleanup_errors = {}
+        self._detector_disk_owner_refs = {}
         self.checkpoint_executor = checkpoint_executor
         self.prepare_executor = prepare_executor
         self.leases = leases
@@ -617,6 +636,15 @@ class DeferredSamParentQueue:
         self.last_ram_denial = None
         self.raw_reuse_submissions = 0
         self.resume_lock_denials = 0
+        self._prepare_arrivals = {}
+        self._prepare_sequence = 0
+        self._expensive_admissions = 0
+        self._prepare_scan_seen = set()
+        self._prepare_scan_order = []
+        self._prepare_cpu_scan_order = []
+        self._prepare_cpu_first = False
+        self._prepare_denials = dict(worker_limit=0, cheap_lane=0, parent_condition=0,
+                                    dense_limit=0, startup_headroom=0)
 
     @staticmethod
     def _cpu_prepare_family(family):
@@ -675,20 +703,148 @@ class DeferredSamParentQueue:
                 free -= saved[2]
         return selected
 
-    def _ordered_deferred(self, resumed_futures=None):
+    def _remember_prepare(self, key, required_bytes):
+        if key not in self._prepare_arrivals:
+            self._prepare_arrivals[key] = dict(sequence=self._prepare_sequence,
+                queued_at=time.monotonic(), cost_bytes=int(required_bytes),
+                denials=dict.fromkeys(self._prepare_denials, 0))
+            self._prepare_sequence += 1
+
+    def _ordered_deferred(self, resumed_futures=None, *, cpu_first=False):
         pending = list(self.deferred)+list(self.ready_prepares)
         if self.prepare_workers is None:
             return pending
+        for key in pending:
+            required = (self.ready_prepares[key][1] if key in self.ready_prepares else
+                        self.deferred[key][1].required_bytes)
+            self._remember_prepare(key, required)
         _active, cpu_active, _protected_slots, _dense = self._prepare_wave(resumed_futures)
         cpu, expensive = [], []
         for key in pending:
             task = (self.ready_prepares[key][0] if key in self.ready_prepares else
                     self.deferred[key][0])
             (cpu if self._cpu_prepare_family(self._prepare_family(key, task)) else expensive).append(key)
+        # One large native input, then three immutable-age turns. Size is a
+        # scan/restore cost proxy only; every actual admission proof still runs.
+        size_turn = self._expensive_admissions % 4 == 0
+        # A time-bounded pass must reach past a denied prefix on its next call.
+        # Keep scan progress separate from age and from successful turn count.
+        current = set(pending)
+        self._prepare_scan_seen.intersection_update(current)
+        self._prepare_scan_order = [key for key in self._prepare_scan_order if key in current]
+        self._prepare_cpu_scan_order = [key for key in self._prepare_cpu_scan_order if key in current]
+        if not any(key not in self._prepare_scan_seen
+                   for key in self._prepare_scan_order+self._prepare_cpu_scan_order):
+            expensive.sort(key=lambda key: (
+                -self._prepare_arrivals[key]['cost_bytes'] if size_turn else 0,
+                self._prepare_arrivals[key]['sequence']))
+            self._prepare_scan_seen.clear()
+            self._prepare_scan_order = expensive
+            self._prepare_cpu_scan_order = cpu
+        # Freeze this scan's membership as well as its order. New large arrivals
+        # must not repeatedly jump ahead of an unprobed fitting parent when each
+        # scheduler slice permits only one costly denial probe.
+        expensive = self._prepare_scan_order
+        cpu = self._prepare_cpu_scan_order
         selected = [saved[0] for saved in self._selected_cpu_prepares(cpu_active) if saved[0] in cpu]
         unselected = [key for key in cpu if key not in selected]
         # Start GPU work, then fill the CPU lanes before the rest of the GPU wave.
-        return expensive[:1]+selected+expensive[1:]+unselected
+        if cpu_first:
+            order = selected+expensive+unselected
+        else:
+            order = expensive[:1]+selected+expensive[1:]+unselected
+        # A denied protected CPU candidate retains its resource protection, but
+        # not the head of every short scan. Both families share scan progress.
+        return ([key for key in order if key not in self._prepare_scan_seen]
+                + [key for key in order if key in self._prepare_scan_seen])
+
+    def _prepare_candidates(self, budget, resumed_futures):
+        if self.prepare_workers is None:
+            pending = self._ordered_deferred(resumed_futures)
+            yield from (pending if budget is None else budget.items(0, pending))
+            return
+        # Re-rank after each handoff, including within one pump. Do not probe a
+        # denied owner twice in the same pump or evade the shared time budget.
+        attempts = range(len(self.deferred)+len(self.ready_prepares))
+        if not attempts:
+            self._prepare_cpu_first = False
+        attempted = set()
+        for _ in (attempts if budget is None else budget.items(0, attempts)):
+            if len(self._prepare_inventory(resumed_futures)) >= self.prepare_workers:
+                # Whole-executor backpressure says nothing about any parent's
+                # fit or priority. Pause before selecting or advancing a scan.
+                self._prepare_denials['worker_limit'] += 1
+                break
+            pending = self._ordered_deferred(resumed_futures, cpu_first=self._prepare_cpu_first)
+            key = next((key for key in pending if key not in attempted), None)
+            if key is None:
+                break
+            attempted.add(key)
+            yield key
+
+    def _prepare_denied(self, key, reason, *, cpu_prepare):
+        self._prepare_denials[reason] += 1
+        if reason == 'worker_limit':
+            return  # Defensive late-full check also leaves candidate state untouched.
+        arrival = self._prepare_arrivals.get(key)
+        if arrival is not None:
+            arrival['denials'][reason] += 1
+        self._prepare_scan_seen.add(key)
+
+    def _prepare_admission_record(self, key, *, cpu_prepare, active_count):
+        if self.prepare_workers is None:
+            return None
+        arrival = self._prepare_arrivals[key]
+        pending = list(self.deferred)+list(self.ready_prepares)
+        peers = [other for other in pending if self._cpu_prepare_family(self._prepare_family(
+            other, self.ready_prepares[other][0] if other in self.ready_prepares
+            else self.deferred[other][0])) == cpu_prepare]
+        age_order = sorted(peers, key=lambda other: self._prepare_arrivals[other]['sequence'])
+        size_order = sorted(peers, key=lambda other: (
+            -self._prepare_arrivals[other]['cost_bytes'], self._prepare_arrivals[other]['sequence']))
+        record = dict(model_name=key[0], view_name=key[1],
+            policy='mixed_size_age_with_cpu_lanes',
+            policy_turn='cheap' if cpu_prepare else ('size' if self._expensive_admissions % 4 == 0 else 'age'),
+            expensive_turn=self._expensive_admissions % 4,
+            expensive_admissions_before=self._expensive_admissions,
+            queued_sequence=arrival['sequence'],
+            queue_age_seconds=max(0., time.monotonic()-arrival['queued_at']),
+            cost_bytes=arrival['cost_bytes'], age_rank=age_order.index(key)+1,
+            size_rank=size_order.index(key)+1, waiting_peers=len(peers),
+            active_prepares_before=active_count, prepare_workers=self.prepare_workers)
+        # RuntimeTelemetry.trace_event accepts at most 32 scalar fields. Keep
+        # these ten counters scalar so they survive that bounded serializer.
+        record.update(('candidate_denials_'+reason, value) for reason, value in arrival['denials'].items())
+        record.update(('denial_totals_'+reason, value) for reason, value in self._prepare_denials.items())
+        return record
+
+    def _forget_prepare(self, key):
+        self._prepare_arrivals.pop(key, None)
+        self._prepare_scan_seen.discard(key)
+        self._prepare_scan_order = [other for other in self._prepare_scan_order if other != key]
+        self._prepare_cpu_scan_order = [other for other in self._prepare_cpu_scan_order if other != key]
+
+    def _discard_cancelled_ready(self, key):
+        saved = self.ready_prepares.get(key)
+        if saved is None or not saved[2].cancelled():
+            return False
+        del self.ready_prepares[key]
+        self._forget_prepare(key)
+        self._release_cpu_protection(key)
+        return True
+
+    def _prepare_admitted(self, key, record, *, cpu_prepare):
+        if self.prepare_workers is not None and not cpu_prepare:
+            self._expensive_admissions += 1
+            self._prepare_scan_seen.clear()
+            self._prepare_scan_order.clear()
+            self._prepare_cpu_scan_order.clear()
+        self._forget_prepare(key)
+        if record is not None:
+            try:
+                runtime_telemetry().trace_event('sam_parent_prepare_admitted', **record)
+            except Exception:
+                pass  # Diagnostics never undo a registered ownership handoff.
 
     def _protect_cpu_prepares(self, resumed_futures=None):
         if self.prepare_workers is None:
@@ -764,6 +920,7 @@ class DeferredSamParentQueue:
         if track_cancellation is not None:
             track_cancellation(future)
         self.ready_prepares[key] = task, int(required_bytes), future, lease
+        self._remember_prepare(key, required_bytes)
         return future
 
     @staticmethod
@@ -846,6 +1003,175 @@ class DeferredSamParentQueue:
         if not admitted:
             receipt['reason'] = reason or receipt.get('reason') or 'ram_admission_refused'
         return bool(admitted), receipt
+
+    @staticmethod
+    def qualify_detector_ram_birth(plan):
+        """Prove only this birth, independently of long-lived backlog capacity."""
+        if plan is None:
+            raise RuntimeError('SAM detector RAM birth has no owned promise snapshot')
+        if plan['reason'] == 'cancelled':
+            raise CancelledError('SAM detector workspace birth cancelled')
+        receipt = {}
+        admitted = _ram_fits(plan['required_bytes'],
+            plan['active_bytes'] + plan.get('external_future_bytes', 0),
+            None, receipt, plan['promises'])
+        return bool(admitted), receipt
+
+    def detector_disk_workspace(self, key, file_bytes):
+        """Create exclusive ordinary-filesystem inputs; never spill back to tmpfs."""
+        with self._detector_disk_lock:
+            return self._create_detector_disk_workspace(key, file_bytes)
+
+    @contextmanager
+    def detector_disk_birth_group(self, required_bytes):
+        """Preflight all denied siblings together, without another credit ledger."""
+        with self._detector_disk_lock:
+            self._detector_disk_root(required_bytes)
+            yield
+
+    def _detector_disk_root(self, required_bytes):
+        if self.stop.is_set():
+            raise CancelledError('SAM detector workspace birth cancelled')
+        root = self.root.resolve(strict=True)
+        if (self.root.is_symlink() or _stat_identity(root)[:2] != self._checkpoint_root_identity
+                or _dense_mapping_ram_backing(root) is not False):
+            raise RuntimeError('SAM detector fallback requires its verified non-memory checkpoint root')
+        if shutil.disk_usage(root).free < self._unwritten_detector_disk_bytes() + required_bytes + STREAM_BYTES:
+            raise RuntimeError('Insufficient filesystem space for SAM detector mask and confidence')
+        return root
+
+    def _unwritten_detector_disk_bytes(self):
+        pending = 0
+        for proof in self._detector_disk_workspaces.values():
+            for (path, identity), reserved in zip(proof['files'], proof['reserved_extents']):
+                if reserved:
+                    continue
+                allocated = 0
+                try:
+                    info = path.stat(follow_symlinks=False)
+                    if not path.is_symlink() and (info.st_dev, info.st_ino, info.st_size) == identity:
+                        allocated = max(0, int(getattr(info, 'st_blocks', 0))) * 512
+                except OSError:
+                    pass  # Missing/changed backing cannot prove its promise was freed.
+                pending += max(0, identity[2]-allocated)
+        return pending
+
+    def _create_detector_disk_workspace(self, key, file_bytes):
+        if self.stop.is_set():
+            raise CancelledError('SAM detector workspace birth cancelled')
+        sizes = tuple(int(value) for value in file_bytes)
+        if not sizes or len(sizes) > 2 or any(value <= 0 for value in sizes):
+            raise ValueError('SAM detector disk birth requires positive mask/score sizes')
+        root = self._detector_disk_root(sum(sizes))
+        directory = root / ('detector-' + uuid.uuid4().hex)
+        directory.mkdir()
+        directory_identity = _stat_identity(directory)[:2]
+        files, reserved = [], []
+        try:
+            for name, size in zip(('mask.dat', 'confidence.dat'), sizes):
+                path = directory / name
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR
+                    | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0), 0o600)
+                try:
+                    created = os.fstat(fd)
+                    files.append((path, (created.st_dev, created.st_ino, created.st_size)))
+                    os.ftruncate(fd, size)
+                    fallocate = getattr(os, 'posix_fallocate', None)
+                    space_reserved = False
+                    if callable(fallocate):
+                        try:
+                            fallocate(fd, 0, size)
+                            space_reserved = True
+                        except OSError as error:
+                            if error.errno not in {errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP}:
+                                raise
+                    reserved.append(space_reserved)
+                    info = os.fstat(fd)
+                    files[-1] = (path, (info.st_dev, info.st_ino, info.st_size))
+                finally:
+                    os.close(fd)
+            proof = MappingProxyType(dict(parent=tuple(key), directory=directory,
+                directory_identity=directory_identity, files=tuple(files), reserved_extents=tuple(reserved)))
+            self._detector_disk_workspaces[directory] = proof
+            self.validate_detector_disk_workspace(proof)
+            return proof
+        except BaseException as error:
+            self._detector_disk_workspaces.pop(directory, None)
+            try:
+                if (not directory.is_symlink()
+                        and _stat_identity(root)[:2] == self._checkpoint_root_identity
+                        and _stat_identity(directory)[:2] == directory_identity):
+                    for path, identity in files:
+                        if not path.is_symlink() and _stat_identity(path)[:2] == identity[:2]:
+                            path.unlink()
+                    directory.rmdir()
+            except OSError as cleanup:
+                if callable(getattr(error, 'add_note', None)):
+                    error.add_note(f'SAM detector partial disk birth cleanup: {cleanup}')
+            raise
+
+    def validate_detector_disk_workspace(self, proof, *, removed_paths=()):
+        """Authenticate the exact created files before mapping, adoption or reuse."""
+        directory = proof['directory']
+        if (self._detector_disk_workspaces.get(directory) is not proof
+                or self.root.is_symlink()
+                or _stat_identity(self.root)[:2] != self._checkpoint_root_identity
+                or directory.is_symlink() or directory.resolve().parent != self.root.resolve()
+                or _stat_identity(directory)[:2] != proof['directory_identity']
+                or _dense_mapping_ram_backing(directory) is not False):
+            raise RuntimeError('SAM detector disk workspace ownership changed')
+        for path, identity in proof['files']:
+            if path in removed_paths:
+                continue
+            if (path.is_symlink() or path.resolve().parent != directory.resolve()
+                    or _stat_identity(path)[:3] != identity
+                    or _dense_mapping_ram_backing(path) is not False):
+                raise RuntimeError('SAM detector disk workspace backing changed')
+
+    def bind_detector_disk_workspace(self, proof, arrays):
+        """Retain weak ownership evidence, never another dense-array alias."""
+        from .view_prepare import _array_lifetime_owner
+        self.validate_detector_disk_workspace(proof)
+        with self._detector_disk_lock:
+            self._detector_disk_owner_refs[proof['directory']] = tuple(
+                weakref.ref(_array_lifetime_owner(array)) for array in arrays if array is not None)
+
+    def retire_detector_disk_workspace(self, proof, owner_refs=None):
+        """Rollback only after actual private mappings/aliases have retired."""
+        directory = proof['directory']
+        refs = tuple(self._detector_disk_owner_refs.get(directory, ()) if owner_refs is None else owner_refs)
+        removed = set()
+        def settled():
+            if any(reference() is not None for reference in refs):
+                return
+            with self._detector_disk_lock:
+                if self._detector_disk_workspaces.get(directory) is not proof:
+                    self._detector_disk_retirements.pop(directory, None)
+                    return
+                try:
+                    self.validate_detector_disk_workspace(proof, removed_paths=removed)
+                    for path, _identity in proof['files']:
+                        if path in removed:
+                            continue
+                        path.unlink()
+                        removed.add(path)
+                    directory.rmdir()
+                except (OSError, RuntimeError) as error:
+                    self._detector_disk_cleanup_errors[directory] = str(error)
+                    return  # Unknown paths/owners retain their storage promise.
+                self._detector_disk_workspaces.pop(directory, None)
+                self._detector_disk_owner_refs.pop(directory, None)
+                self._detector_disk_retirements.pop(directory, None)
+                self._detector_disk_cleanup_errors.pop(directory, None)
+        with self._detector_disk_lock:
+            self._detector_disk_retirements[directory] = settled
+        for reference in refs:
+            owner = reference()
+            if owner is not None:
+                callback = weakref.finalize(owner, settled)
+                callback.atexit = False
+            del owner
+        settled()
 
     def ram_first_plans_current(self, claims):
         return all(plan['basis'] == self._ram_first_basis(plan['key']) for plan, _qualified in claims)
@@ -932,13 +1258,26 @@ class DeferredSamParentQueue:
     def _submit_checkpoint(self, key, task, required_bytes):
         # Completed owned disk arrays need only the established flush/fsync
         # and descriptor capture. Never park their retirement behind RAM codec.
+        owned_input_dir = None
+        source_root = self.source_root
+        declared = getattr(task, 'union_path', None)
+        proof = None if declared is None else self._detector_disk_workspaces.get(Path(declared).parent)
+        if proof is not None:
+            self.validate_detector_disk_workspace(proof)
+            actual = tuple(Path(getattr(task, path_name))
+                for name, path_name in (('union_mm', 'union_path'), ('confmap_mm', 'confmap_path'))
+                if getattr(task, name) is not None)
+            if proof['parent'] != key or actual != tuple(path for path, _identity in proof['files']):
+                raise RuntimeError('SAM detector checkpoint changed its owned mask/score paths')
+            owned_input_dir = source_root = proof['directory']
         regular = (task.union_mm is not None and all(
-            _reusable_disk_owner(value, getattr(task,path_name), self.source_root) is not None
+            _reusable_disk_owner(value, getattr(task,path_name), source_root) is not None
             for name,path_name in (('union_mm','union_path'),('confmap_mm','confmap_path'))
             if (value := getattr(task,name)) is not None))
         executor = self.prepare_executor if regular else self.checkpoint_executor
+        options = {} if owned_input_dir is None else dict(owned_input_dir=owned_input_dir)
         future = executor.submit(checkpoint_parent, task, self.root,
-            self.source_root, required_bytes, self.stop)
+            source_root, required_bytes, self.stop, **options)
         if regular:
             self.raw_reuse_submissions += 1
         self.checkpoint_futures[future] = (key, task, int(required_bytes))
@@ -1100,6 +1439,7 @@ class DeferredSamParentQueue:
             # expanding it or retiring its previously published components.
             if not path_is_memory_backed(Path(task.d1_shadow_path)):
                 self.deferred[key] = (task, ParentCheckpoint(None, None, int(required_bytes), 0, 0, 0.))
+                self._remember_prepare(key, required_bytes)
                 self.count += 1
                 self.leases.complete(key, retain_for_dense_retirement=False)
                 return
@@ -1112,6 +1452,7 @@ class DeferredSamParentQueue:
         task._sam_checkpoint_lease = self.leases.leases.get(key)
         self._ram_checkpoint_bytes(key, task, required_bytes)
         self._submit_checkpoint(key, task, required_bytes)
+        self._remember_prepare(key, required_bytes)
 
     @scheduler_operation('sam_parent_pump')
     def pump(self, *, budget=None, resumed_futures=None):
@@ -1175,6 +1516,12 @@ class DeferredSamParentQueue:
         if self.stop.is_set() or not self.ready():
             self._publish_staging()
             return resumed, released
+        # Invalid bounded requests and terminal ready proxies must still surface
+        # while every executor lane is occupied.
+        dense_limit = self.dense_limit
+        if any(key in self.bounded_parent_keys and snapshot.required_bytes > dense_limit
+               for key, (_task, snapshot) in self.deferred.items()):
+            raise RuntimeError('SAM deferred policy parent exceeds bounded dense limit')
         self._protect_cpu_prepares(resumed_futures)
         for execution, future in list(self.ready_execution_futures.items()):
             if execution.done():
@@ -1185,13 +1532,15 @@ class DeferredSamParentQueue:
                     if not future.done():
                         future.set_exception(execution.exception())
                     execution.result()
-        for key in items(self._ordered_deferred(resumed_futures)):
+        for key in items(self.ready_prepares):
+            if self._discard_cancelled_ready(key):
+                completed(progress=False)
+        for key in self._prepare_candidates(budget, resumed_futures):
             already_owned = key in self.ready_prepares
             if already_owned:
                 task, required, ready_future, lease = self.ready_prepares[key]
                 if ready_future.cancelled():
-                    del self.ready_prepares[key]
-                    self._release_cpu_protection(key)
+                    self._discard_cancelled_ready(key)
                     completed(progress=False)
                     continue
                 snapshot = ParentCheckpoint(None, None, required, 0, 0, 0.)
@@ -1204,15 +1553,23 @@ class DeferredSamParentQueue:
             active_prepares, _cpu_active, protected_slots, protected_dense = self._prepare_wave(
                 resumed_futures)
             cpu_prepare = self._cpu_prepare_family(self._prepare_family(key, task))
-            if self.prepare_workers is not None and (
-                    len(active_prepares) >= self.prepare_workers
-                    or not cpu_prepare and len(active_prepares) >= self.prepare_workers-protected_slots):
+            if self.prepare_workers is not None and len(active_prepares) >= self.prepare_workers:
+                self._prepare_denied(key, 'worker_limit', cpu_prepare=cpu_prepare)
+                completed(progress=False)
+                break
+            # Only a candidate-specific probe consumes the cheap-lane turn;
+            # a late whole-executor capacity change above consumes nothing.
+            self._prepare_cpu_first = True
+            if (self.prepare_workers is not None and not cpu_prepare
+                    and len(active_prepares) >= self.prepare_workers-protected_slots):
+                self._prepare_denied(key, 'cheap_lane', cpu_prepare=cpu_prepare)
                 completed(progress=False)
                 continue
             with scheduler_step('sam_parent_resume_admission'), _try_parent_condition(task) as acquired:
                 if not acquired:
                     self.resume_lock_denials += 1
                     denied = True
+                    denial_reason = 'parent_condition'
                 else:
                     active = sum(self.leases.inference_bytes.values()) + sum(self.leases.postprocess_bytes.values())
                     emergency = not self.leases.leases and key not in self.bounded_parent_keys
@@ -1221,19 +1578,27 @@ class DeferredSamParentQueue:
                             or emergency and protected_dense
                             and snapshot.required_bytes > dense_limit)):
                         denied = True
+                        denial_reason = 'dense_limit'
                     elif not _dense_startup_fits(_dense_startup_budget_locked(task,
                             0 if already_owned else snapshot.required_bytes)):
                         denied = True  # No dense/base/GPU credit is parked behind startup.
+                        denial_reason = 'startup_headroom'
                     elif not already_owned:
                         self.leases.leases[key] = _DirectUnionBackingLease(key, snapshot.required_bytes, phase='postprocess')
                         self.leases.postprocess_views.add(key)
                         self.leases.postprocess_bytes[key] = snapshot.required_bytes
                         lease = self.leases.leases[key]
             if denied:
+                self._prepare_denied(key, denial_reason, cpu_prepare=cpu_prepare)
                 if not already_owned:
                     self.deferred[key] = self.deferred.pop(key)
                 completed(progress=False)
                 continue
+            try:
+                admission_record = self._prepare_admission_record(key,
+                    cpu_prepare=cpu_prepare, active_count=len(active_prepares))
+            except Exception:
+                admission_record = None  # Optional ranks cannot strand a new dense lease.
             try:
                 if hasattr(task, 'backing_lease') and lease is not None:
                     task.backing_lease = lease
@@ -1281,12 +1646,22 @@ class DeferredSamParentQueue:
                 future.add_done_callback(lambda _done, saved=saved_protection:
                     release_sam_parent_protection(*saved))
             self.resumed_count += 1
+            self._prepare_admitted(key, admission_record, cpu_prepare=cpu_prepare)
             completed()
         self._publish_staging()
         return resumed, released
 
     def abort(self):
         self.stop.set()
+        # Cancellation is terminal. Policy metadata owns no resources and must
+        # not retain identifiers for work that can never be scheduled again.
+        self._prepare_arrivals.clear()
+        self._prepare_scan_seen.clear()
+        self._prepare_scan_order.clear()
+        self._prepare_cpu_scan_order.clear()
+        self._prepare_cpu_first = False
+        self._prepare_sequence = self._expensive_admissions = 0
+        self._prepare_denials.update(dict.fromkeys(self._prepare_denials, 0))
         for key in list(self._cpu_protections):
             self._release_cpu_protection(key)
         for _task, _required, future, _lease in self.ready_prepares.values():
@@ -1312,7 +1687,9 @@ class DeferredSamParentQueue:
             prepare_workers=self.prepare_workers, active_prepares=len(active),
             active_cpu_prepares=cpu_active, protected_cpu_prepare_slots=protected_slots,
             protected_cpu_dense_bytes=protected_dense,
-            parent_prepare_order='gpu_first_with_cpu_lanes' if self.prepare_workers is not None else 'fifo',
+            parent_prepare_order='mixed_size_age_with_cpu_lanes' if self.prepare_workers is not None else 'fifo',
+            expensive_admissions=self._expensive_admissions,
+            prepare_denials=dict(self._prepare_denials),
             pending_checkpoints=len(self.checkpoint_futures), deferred_parents=len(self.deferred),
             queued_ready_parents=len(self.ready_prepares),
             pending_checkpoint_dense_bytes=sum(int(saved[2]) for saved in self.checkpoint_futures.values()),
@@ -1341,6 +1718,7 @@ class DeferredSamParentQueue:
             keep_temp_debug_ownership='durable checkpoint replaces retired memory-backed input')
 
     def close(self):
+        self._checkpoint_root_exists()
         self.abort()
         # Called after the checkpoint executor has settled, so no writer owns
         # these maps or files and failures cannot expose new admission credit.
@@ -1366,14 +1744,42 @@ class DeferredSamParentQueue:
             raise RuntimeError('SAM parent prepares must settle before staging cleanup')
         self._live_prepares.clear()
         self.deferred.clear()
-        if not self.keep_temp and self.root.exists():
+        # A raw checkpoint transferred to a result keeps its existing output
+        # lifetime. Other birth directories retire only after their actual maps.
+        for directory, proof in tuple(self._detector_disk_workspaces.items()):
+            if (directory not in self._detector_disk_retirements
+                    and (directory in self.transferred_roots or self.keep_temp)):
+                self._detector_disk_workspaces.pop(directory)
+                self._detector_disk_owner_refs.pop(directory, None)
+            elif directory not in self._detector_disk_retirements:
+                self.retire_detector_disk_workspace(proof)
+        for settle in tuple(self._detector_disk_retirements.values()):
+            settle()
+        if not self.keep_temp and self._checkpoint_root_exists():
             for child in self.root.iterdir():
-                if child not in self.transferred_roots:
+                if child not in self.transferred_roots and child not in self._detector_disk_retirements:
+                    self._checkpoint_root_exists()
                     shutil.rmtree(child)
+
+    def _checkpoint_root_exists(self):
+        """Missing is settled; a replacement root never grants deletion rights."""
+        try:
+            info = self.root.lstat()
+        except FileNotFoundError:
+            return False
+        if (self.root.is_symlink() or (info.st_dev, info.st_ino) != self._checkpoint_root_identity
+                or not self.root.is_dir()):
+            raise RuntimeError('SAM checkpoint cleanup root identity changed')
+        return True
 
     def finalize_cleanup(self):
         """Retire transferred files only after final fusion and output settle."""
-        if not self.keep_temp and self.root.exists():
+        self._checkpoint_root_exists()
+        for settle in tuple(self._detector_disk_retirements.values()):
+            settle()
+        if self._detector_disk_retirements:
+            raise RuntimeError('SAM detector private disk owners remain unsettled')
+        if not self.keep_temp and self._checkpoint_root_exists():
             shutil.rmtree(self.root)
 
 

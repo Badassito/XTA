@@ -266,13 +266,13 @@ def test_decoder_workspace_is_charged_before_read_and_insufficient_profile_falls
         return original_read(reader, *args)
     try:
         with mock.patch('XTA.sam_resources.validate_live_sam_resource_profile',
-                return_value=dict(base_non_cpu_allowance_bytes=2**30, lease_id='one-parent')), \
+                return_value=dict(base_other_non_cpu_allowance_bytes=2**30, lease_id='one-parent')), \
                 mock.patch.object(GrayCacheReader, 'read_crop', new=read), \
                 mock.patch('XTA.sam_gpu_rendering.try_gpu_crop_renderer', side_effect=AssertionError('GPU admission')):
             context.image_provider(view, shape, demand(shape, {0: bbox}))
         assert len(seen) == 1 and context._image_build_credit_bytes == 0
         with mock.patch('XTA.sam_resources.validate_live_sam_resource_profile',
-                return_value=dict(base_non_cpu_allowance_bytes=payload+64*1024**2-1, lease_id='one-parent')), \
+                return_value=dict(base_other_non_cpu_allowance_bytes=payload+64*1024**2-1, lease_id='one-parent')), \
                 mock.patch('XTA.sam_gpu_rendering.try_gpu_crop_renderer', return_value=None) as gpu, \
                 mock.patch.object(GrayCacheReader, 'read_crop', side_effect=AssertionError('unfunded decoder read')), \
                 mock.patch.object(context, '_render_demand_crop', return_value=np.zeros((6, 6), np.uint8)) as render:

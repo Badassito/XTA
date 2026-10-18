@@ -36,6 +36,7 @@ except Exception as exc:  # pragma: no cover
     raise RuntimeError("tqdm is required: pip install tqdm") from exc
 
 from . import geometry as shared_geometry
+from .runtime import runtime_telemetry_phase, shutdown_runtime_observability
 from .pta_augmentation import (
     LoadedAugmentation,
     LoadedGpuAugmentation,
@@ -295,6 +296,9 @@ def _render_worker_initializer(
 ) -> None:
     global _WORKER_GPU_DEVICE_ID, _WORKER_GPU_RUNTIME
     global _WORKER_GPU_CODEC_WARNING_EMITTED, _WORKER_GPU_BATCH_CAP_WARNING_EMITTED
+    # Pool exit skips atexit; sample after the GPU publication finalizer (15).
+    from multiprocessing.util import Finalize
+    Finalize(None, shutdown_runtime_observability, exitpriority=10)
     if worker_static_payload is not None:
         _initialize_spawned_worker_static_context(worker_static_payload)
     if _WORKER_GPU_RUNTIME is not None and _WORKER_GPU_RUNTIME.get("categorical_volume_owner") is not None:
@@ -1529,35 +1533,13 @@ def _gpu_projected_item_image(
             native_by_address: Dict[Tuple[int, bool], object] = {}
             with torch.cuda.stream(renderer._stream):  # type: ignore[union-attr]
                 for source_index, mirror_u in dict.fromkeys(addresses):
-                    if radial_view or spherical_view:
-                        if bool(mirror_u):
+                    if radial_view or spherical_view or azimuthal_view:
+                        if bool(mirror_u) and not azimuthal_view:
                             raise RuntimeError('Shell channels clamp along radius and cannot mirror azimuthal-u')
-                        render_native = (
-                            renderer._render_spherical_native_resident  # type: ignore[union-attr]
-                            if spherical_view else renderer._render_radial_native_resident  # type: ignore[union-attr]
-                        )
-                        native = render_native(
+                        # Full frames, tiles and channel neighbors reuse the same bounded native cache.
+                        native = renderer._render_native_plane_cached(  # type: ignore[union-attr]
                             shared_view, int(source_index),
                         )
-                        native_u8 = native.round().clamp_(0.0, 255.0).to(torch.uint8)
-                        rendered_u8 = renderer.warp_native_uint8_frame(  # type: ignore[union-attr]
-                            native_u8.contiguous(), output_to_source,
-                            int(output_height), int(output_width),
-                        )
-                    elif azimuthal_view:
-                        if shared_geometry.is_tilted_azimuthal_view(shared_view):
-                            native = renderer._render_tilted_azimuthal_native_resident(  # type: ignore[union-attr]
-                                shared_view,
-                                int(source_index),
-                            )
-                        else:
-                            # Upright Azimuthal uses TTA's allocation-free
-                            # hardware-linear texture projector, stopping at
-                            # the native uint8 boundary before the PTA affine.
-                            native = renderer._render_azimuthal_native_resident(  # type: ignore[union-attr]
-                                shared_view,
-                                int(source_index),
-                            )
                         native_u8 = native.round().clamp_(0.0, 255.0).to(torch.uint8)
                         if bool(mirror_u):
                             native_u8 = torch.flip(native_u8, dims=(1,))
@@ -1640,6 +1622,7 @@ def _gpu_projected_item_image(
         return None
 
 
+@runtime_telemetry_phase('pta.render.source')
 def _render_gpu_frame_items(
     volume: np.ndarray,
     mask: np.ndarray,
@@ -2607,6 +2590,8 @@ def execute_gpu_render_task(
     written = 0
     flips_by_subset: Dict[str, int] = {}
     plan = plans[int(task.plan_idx)]
+    item_keys = {str(item_key) for item_key, _ in task.items}
+    plan = replace(plan, tile_layout=tuple(tile for tile in plan.tile_layout if str(tile.tile_tag) in item_keys))
     source = render_plan_frame_source(
         volume=volume,
         mask=mask,
@@ -2779,6 +2764,7 @@ def execute_gpu_render_task(
     return written, flips_by_subset, warn_counts, warn_examples
 
 
+@runtime_telemetry_phase('pta.worker.task')
 def execute_render_task(volume: np.ndarray, mask: np.ndarray, plans: Sequence[RenderPlan], task: object, semantic_coverage: Optional[np.ndarray] = None) -> Tuple[int, Dict[str, int], Dict[str, int], Dict[str, List[str]]]:
     """Execute one source-frame task.
 
@@ -2839,6 +2825,8 @@ def execute_render_task(volume: np.ndarray, mask: np.ndarray, plans: Sequence[Re
 
     if isinstance(task, FrameRenderTask):
         plan = plans[int(task.plan_idx)]
+        item_keys = {str(item_key) for item_key, _ in task.items}
+        plan = replace(plan, tile_layout=tuple(tile for tile in plan.tile_layout if str(tile.tile_tag) in item_keys))
         source = render_plan_frame_source(
             volume=volume, mask=mask, plan=plan, idx=int(task.frame_idx),
             need_canvas=any(item_key != "full" for item_key, _ in task.items),
@@ -3156,6 +3144,7 @@ class PersistentRenderPool:
             self._executor = None
 
 
+@runtime_telemetry_phase('pta.render.wait')
 def drain_render_results(pool: PersistentRenderPool, progress_by_gen: Mapping[int, VolumeRenderProgress], *, until: Callable[[], bool]) -> None:
     """Consume pool results (from any in-flight volume) until `until` holds."""
     while not until():

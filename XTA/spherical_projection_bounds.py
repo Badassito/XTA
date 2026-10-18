@@ -17,6 +17,7 @@ nearest-neighbor test.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from itertools import combinations
 import math
 
@@ -56,6 +57,13 @@ class SphericalOutputBounds:
 
 
 def _face_direction_bounds(rotation, face):
+    values = tuple(np.asarray(rotation, dtype=np.float64).reshape(9))
+    return _cached_face_direction_bounds(values, int(face))
+
+
+@lru_cache(maxsize=128)
+def _cached_face_direction_bounds(rotation, face):
+    """Share immutable six-value extrema across a cube's bands and patches."""
     rotation = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
     normal, right, up = (rotation @ np.asarray(axis) for axis in QSC_FACE_BASES[int(face)])
     planes = np.asarray((normal - right, normal + right, normal - up, normal + up))
@@ -84,8 +92,8 @@ def _face_direction_bounds(rotation, face):
     if not candidates:
         raise ValueError('Spherical face cone has no finite directional extrema')
     points = np.asarray(candidates)
-    return (np.maximum(-1., points.min(axis=0) - _ROUNDING_MARGIN),
-            np.minimum(1., points.max(axis=0) + _ROUNDING_MARGIN))
+    return (tuple(np.maximum(-1., points.min(axis=0) - _ROUNDING_MARGIN)),
+            tuple(np.minimum(1., points.max(axis=0) + _ROUNDING_MARGIN)))
 
 
 def spherical_output_bounds(view, output_shape, bboxes=None):
@@ -97,13 +105,13 @@ def spherical_output_bounds(view, output_shape, bboxes=None):
     """
     shape = tuple(map(int, output_shape))
     work = (int(view.full_t), int(view.full_h), int(view.full_w))
-    radii = np.asarray(view.spherical_radii, dtype=np.float64)
     lower, upper = float(view.spherical_min_radius), float(view.spherical_max_radius)
     if bboxes is not None:
         boxes = np.asarray(bboxes)
         nonempty = np.flatnonzero((boxes[:, 1] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 2]))
         if not len(nonempty):
             return SphericalOutputBounds(0, 0, 0, 0, 0, 0)
+        radii = np.asarray(view.spherical_radii, dtype=np.float64)
         first, last = int(nonempty[0]), int(nonempty[-1])
         if first:
             lower = max(lower, float(radii[first - 1] + (radii[first] - radii[first - 1]) * .5))

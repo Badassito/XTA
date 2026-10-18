@@ -14,6 +14,14 @@ PREFETCH_CANCEL_JOIN_SECONDS = 30.
 
 class _ImageProfile(resources.SamResourceProfile):
     @property
+    def assigned_observation_bytes(self):
+        return 0
+
+    @property
+    def assigned_contract_metadata_bytes(self):
+        return 0
+
+    @property
     def nominal_cpu_wave_base_bytes(self):
         return 0
 
@@ -24,42 +32,95 @@ class _ImageProfile(resources.SamResourceProfile):
     def metadata(self):
         result = super().metadata()
         result['status'] = 'image_only_admission'
+        result['persistent_metadata_allowance_status'] = 'image_only_no_persistent_metadata'
         return result
 
 
 @contextmanager
-def _try_image_profile(pool, needed, scope_id, probe):
-    """Fund bounded images separately, preserving all future parent credit."""
+def _try_image_profile(pool, needed, scope_id, probe, *, parent_profile=None, cancel_event=None):
+    """Keep proven standalone grants; fund optional envelope refusals from parents."""
     profile = None
+    optional_request = parent_profile is not None
+    parent_funded = False
+    if optional_request:
+        needed = resources._scope_integer(needed, 'SAM prefetched image bytes', positive=True)
     with pool.condition:
+        reason = None
+        parent_lease = getattr(parent_profile, '_lease', None)
+        if optional_request:
+            with resources._LIVE_LOCK:
+                live_parent = (parent_lease is not None and
+                    resources._LIVE_PROFILES.get(parent_lease.lease_id) is parent_profile)
+            if (not live_parent or not parent_lease.active or parent_lease.owner_closed
+                    or parent_lease.pool is not pool or hasattr(pool, '_sam_parent_pool')):
+                reason = 'parent_inactive_or_not_canonical'
         staging = getattr(pool, '_sam_image_staging_pool', None)
-        if staging is None:
+        if staging is None and reason is None:
             staging = pool._sam_image_staging_pool = SimpleNamespace(
                 capacity=resources.MAX_IMAGE_STAGING_BYTES, in_use=0, condition=pool.condition,
                 _sam_parent_pool=pool)
-        try:
-            physical = max(0, int(probe()))
-        except Exception:
-            physical = 0
+        physical = 0
+        if reason is None:
+            try:
+                physical = max(0, int(probe()))
+            except Exception:
+                pass
         other = resources.sam_parent_promised_bytes(pool)
-        # Generic parent reservations may fill their budget without another probe.
-        protected = max(int(pool.capacity), int(pool.in_use))+int(staging.in_use)
-        reason = ('parent_emergency' if getattr(pool, 'oversize_requested_bytes', 0) else
-                  'staging_capacity' if needed > max(0, int(staging.capacity)-int(staging.in_use)) else
-                  'physical_headroom' if needed > max(0, physical-protected) else None)
+        # Parent-funded images already occupy parent rights. Only external
+        # image grants extend the full future-parent physical envelope.
+        external_images = (0 if staging is None else int(staging.in_use)) \
+            -resources._parent_funded_image_bytes(pool, staging)
+        standalone_envelope = max(int(pool.capacity), int(pool.in_use))+external_images
+        protected = standalone_envelope
+        pending = startup = 0
+        if reason is None:
+            reason = ('parent_emergency' if getattr(pool, 'oversize_requested_bytes', 0) else
+                'staging_capacity' if needed > max(0, int(staging.capacity)-int(staging.in_use)) else
+                'physical_headroom' if needed > max(0, physical-protected) else None)
+        if optional_request and reason == 'physical_headroom':
+            # Existing successful standalone overlap must not lose concurrency
+            # merely because parents currently use all of their own capacity.
+            # Only an envelope refusal may spend uncommitted parent rights.
+            parent_funded = True
+            protected = other
+            pending = sum(resources._bounded_parent_protections(pool).values())
+            startup = max(0, int(getattr(pool, '_sam_startup_future_bytes', 0))
+                -int(getattr(pool, '_sam_startup_active_bytes', 0)))
+            reason = ('parent_capacity_or_protection' if needed > max(0,
+                int(pool.capacity)-int(pool.in_use)-pending-startup) else
+                'physical_headroom' if needed > max(0, physical-protected) else None)
+        # Cancellation can arrive while the physical probe is reading procfs.
+        # Recheck at the transaction boundary, without creating a waiting grant.
+        if optional_request and reason is None:
+            with resources._LIVE_LOCK:
+                live_parent = resources._LIVE_PROFILES.get(parent_lease.lease_id) is parent_profile
+            if not live_parent or not parent_lease.active or parent_lease.owner_closed:
+                reason = 'parent_inactive_or_not_canonical'
+            elif (cancel_event is not None and cancel_event.is_set()
+                    or parent_lease.cancel_event is not None and parent_lease.cancel_event.is_set()):
+                reason = 'cancelled'
         if reason is None:
             lease = resources._LiveLease(uuid.uuid4().hex, threading.get_ident(), pool=staging,
                 charged_bytes=needed, headroom_probe=probe, scope_id=str(scope_id),
                 admitted_monotonic=time.monotonic())
             profile = _ImageProfile(scope_id, needed, needed, 0, int(staging.capacity), physical,
                 1, needed, other, lease)
-            staging.in_use += needed
+            if parent_funded:
+                resources._charge_parent_funded_image(lease)
+            else:
+                # Generic parents may fill their whole capacity without a new
+                # physical probe; preserve this standalone admission contract.
+                staging.in_use += needed
             try:
                 with resources._LIVE_LOCK:
                     resources._LIVE_PROFILES[lease.lease_id] = profile
             except BaseException:
-                staging.in_use -= needed
-                pool.condition.notify_all()
+                with resources._LIVE_LOCK:
+                    if resources._LIVE_PROFILES.get(lease.lease_id) is profile:
+                        resources._LIVE_PROFILES.pop(lease.lease_id)
+                lease.active = False
+                lease.owner_closed = True
+                resources._return_parent_credit_if_settled(lease)
                 raise
         resources._trace_parent_memory('sam_image_memory_admitted' if profile is not None else
             'sam_image_memory_declined', scope_id=str(scope_id),
@@ -67,6 +128,9 @@ def _try_image_profile(pool, needed, scope_id, probe):
             requested_bytes=needed, parent_pool_in_use_bytes=int(pool.in_use),
             parent_pool_capacity_bytes=int(pool.capacity), physical_headroom_bytes=physical,
             protected_parent_and_image_bytes=protected, reason=reason,
+            standalone_envelope_bytes=standalone_envelope,
+            image_funding_mode='parent_pool' if parent_funded else 'standalone',
+            parent_protection_bytes=pending, future_startup_bytes=startup,
             **resources.sam_image_staging_snapshot(pool))
     if profile is None:
         yield None
@@ -80,25 +144,6 @@ def _try_image_profile(pool, needed, scope_id, probe):
             with resources._LIVE_LOCK:
                 resources._LIVE_PROFILES.pop(lease.lease_id, None)
             resources._return_parent_credit_if_settled(lease)
-
-
-def _retain_image_credit(profile):
-    profile._validate_owner()
-    lease, lock, released = profile._lease, threading.Lock(), [False]
-
-    def release():
-        with lock:
-            if released[0]:
-                return
-            released[0] = True
-        with lease.pool.condition:
-            lease.scope_holds -= 1
-            resources._return_parent_credit_if_settled(lease)
-    release.image_phase_bytes = lease.charged_bytes
-    with lease.pool.condition:
-        profile._validate_owner()
-        lease.scope_holds += 1
-    return release
 
 
 class SamImageCohortPrefetch:
@@ -121,17 +166,15 @@ class SamImageCohortPrefetch:
         self._thread.start()
 
     def _produce(self):
-        reference = None
-        release_credit = None
         try:
             lease = self.parent._lease
             with _try_image_profile(lease.pool, self.phase_bytes,
-                    self.parent.scope_id+'/next-images', lease.headroom_probe) as profile:
+                    self.parent.scope_id+'/next-images', lease.headroom_probe,
+                    parent_profile=self.parent, cancel_event=self.cancelled) as profile:
                 if profile is None:
                     self.future.set_result(None)
                     return
                 self._admitted_bytes = self.phase_bytes
-                release_credit = _retain_image_credit(profile)
                 self.context._resource_local.image_prefetch_cancel = self.cancelled
                 self.context._resource_local.sam_phase_scope = self.phase_scope
                 try:
@@ -156,19 +199,6 @@ class SamImageCohortPrefetch:
             if not self.future.done():
                 self.future.set_exception(error)
         finally:
-            if release_credit is not None:
-                with self.context._idle:
-                    owner = None if reference is None else self.context._cache_owners.get(str(reference.path))
-                    unproven = (owner is not None and owner.get('retirement_unproven')) or any(
-                        state['owned'] and state.get('retirement_unproven')
-                        for state in self.context._cache_owners.values())
-                    if unproven:
-                        # Permission expires on producer exit, but uncertain gray
-                        # ownership retains its separate grant until run cleanup.
-                        self.context._retained_image_prefetch_credits.append(release_credit)
-                        release_credit = None
-                if release_credit is not None:
-                    release_credit()
             with self.context._idle:
                 self.context._image_prefetches.discard(self)
                 self.context._idle.notify_all()

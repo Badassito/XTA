@@ -23,7 +23,7 @@ def test_context_normal_close_cannot_drop_unsettled_cpu_consumers(tmp_path):
     context._runtime = runtime
     cache_owner = object()
     context._caches['pending-producer-cache'] = cache_owner
-    context._retained_image_prefetch_credits.append(lambda:released.append('credit'))
+    context._retained_parent_image_credits.append(lambda:released.append('credit'))
     try:
         with pytest.raises(RuntimeError):
             context.close()

@@ -6,7 +6,7 @@ import pytest
 
 from XTA.interpolation import _ByteAdmissionPool
 from XTA import sam_resources as resources
-from XTA.sam_image_prefetch import _retain_image_credit, _try_image_profile
+from XTA.sam_image_prefetch import _try_image_profile
 
 GIB = resources.GIB
 
@@ -179,11 +179,12 @@ def test_staging_events_and_snapshot_keep_detached_image_debt_visible(monkeypatc
     monkeypatch.setattr(resources, '_trace_parent_memory', lambda event, **fields:events.append((event, fields)))
     with pool.reserve(4*GIB, 'ordinary parent'):
         with _try_image_profile(pool, GIB, 'images', lambda:64*GIB) as images:
-            release = _retain_image_credit(images)
+            release = resources.retain_sam_parent_image_credit(images)
             assert resources.sam_image_staging_snapshot(images._lease.pool)['image_staging_in_use_bytes'] == GIB
             assert resources.sam_parent_promised_bytes(images._lease.pool) == 5*GIB
         assert resources.sam_image_staging_snapshot(pool) == dict(
-            image_staging_in_use_bytes=GIB, image_staging_capacity_bytes=16*GIB)
+            image_staging_in_use_bytes=GIB, image_staging_capacity_bytes=16*GIB,
+            image_parent_funded_bytes=0, image_external_funded_bytes=GIB)
         assert [event for event,_fields in events] == ['sam_image_memory_admitted']
         release()
         assert resources.sam_image_staging_snapshot(pool)['image_staging_in_use_bytes'] == 0

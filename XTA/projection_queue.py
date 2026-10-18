@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
-from threading import Condition
+from threading import Condition, RLock
 from time import perf_counter
 from typing import Callable, Iterable, TypeVar
 
@@ -73,6 +73,16 @@ class ComponentProjectionQueue:
 
     def submit(self, fn: Callable[..., T], /, *args,
                source_bytes: int, working_bytes: int, **kwargs) -> Future[T]:
+        return self._submit(True, fn, *args, source_bytes=source_bytes,
+                            working_bytes=working_bytes, **kwargs)
+
+    def try_submit(self, fn: Callable[..., T], /, *args,
+                   source_bytes: int, working_bytes: int, **kwargs) -> Future[T] | None:
+        """Accept atomically or leave all queue ownership unchanged."""
+        return self._submit(False, fn, *args, source_bytes=source_bytes,
+                            working_bytes=working_bytes, **kwargs)
+
+    def _submit(self, blocking, fn, /, *args, source_bytes, working_bytes, **kwargs):
         source_bytes, working_bytes = max(0, int(source_bytes)), max(0, int(working_bytes))
         ticket = object()
         granted = revoked = retired = False
@@ -86,6 +96,8 @@ class ComponentProjectionQueue:
                 if (self._pending < self._max_pending and
                     (self._pending == 0 or self._source + source_bytes <= self._max_source)):
                     break
+                if not blocking:
+                    return None
                 self._condition.wait()
             self._pending += 1
             self._source += source_bytes
@@ -207,6 +219,62 @@ class ComponentProjectionQueue:
                         oversized_active=self._oversized_active)
 
 
+class DeferredComponentProjection(Future):
+    """A prepared result owns this immutable request until bounded admission."""
+
+    def __init__(self, submit):
+        super().__init__()
+        self._submit = submit
+        self._admission_lock = RLock()
+        self._ready_at = None
+        self._xta_dense_independent_publication_paths = submit._xta_dense_independent_publication_paths
+
+    @property
+    def admission_pending(self):
+        with self._admission_lock:
+            return self._submit is not None
+
+    def try_admit(self):
+        error = None
+        with self._admission_lock:
+            if self._submit is None:
+                return
+            if self._ready_at is None:
+                self._ready_at = perf_counter()
+            try:
+                actual = self._submit(blocking=False, deferred_seconds=perf_counter()-self._ready_at)
+            except BaseException as exc:
+                error = exc
+            else:
+                if actual is None:
+                    return
+            self._submit = None
+            self.set_running_or_notify_cancel()
+        if error is not None:
+            self.set_exception(error)
+        else:
+            actual.add_done_callback(self._complete)
+
+    def _complete(self, actual):
+        try:
+            result = actual.result()
+        except BaseException as error:
+            self.set_exception(error)
+        else:
+            self.set_result(result)
+
+    def cancel(self):
+        with self._admission_lock:
+            if self._submit is None:
+                return self.cancelled()
+            self._submit = None
+        cancelled = super().cancel()
+        if cancelled:
+            # No executor will acknowledge cancellation of an unadmitted request.
+            self.set_running_or_notify_cancel()
+        return cancelled
+
+
 def prepared_view_waitables(parents: Iterable[Future]) -> list[Future]:
     """Wait on child publications after a parent releases its preparation thread.
 
@@ -230,6 +298,12 @@ def settle_prepared_view_components(prepared) -> bool:
     for child in children:
         if child.done():
             child.result()
+    for child in children:
+        if isinstance(child, DeferredComponentProjection) and child.admission_pending:
+            child.try_admit()
+            if child.done():
+                child.result()
+            break
     if any(not child.done() for child in children):
         return False
     prepared.nrrd_layers.extend(child.result() for child in children)

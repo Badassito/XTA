@@ -2257,7 +2257,6 @@ def _gpu_inference_worker_main(
                 raise RuntimeError('GPU proto-union predictor patch was not installed')
         if (Path(model_path).suffix.lower() == '.engine'
                 and str(cfg.task) == 'segment'
-                and not (policy_settings is not None and policy_settings.enabled)
                 and _direct_predict_applicable(cfg)):
             with runtime_telemetry().span('startup.worker.backend_prime'):
                 backend_primed = _ensure_predictor_for_direct_predict(model, cfg) is not None
@@ -2281,8 +2280,19 @@ def _gpu_inference_worker_main(
                 f'Warning: persistent GPU retirement lanes unavailable ({_retirement_exc}); '
                 'using the event-compatible fallback retirement executor.'
             )
-        runtime_trace_event('worker_ready', device=f'cuda:{gpu_index}', failed=False)
-        result_queue.put({'type': 'ready', 'gpu_index': int(gpu_index), 'pid': int(os.getpid())})
+        cuda_device_uuid = None
+        try:
+            torch_mod = _worker_initialized_torch()
+            if torch_mod is not None:
+                identity = getattr(torch_mod.cuda.get_device_properties(0), 'uuid', None)
+                if isinstance(identity, str) and identity:
+                    cuda_device_uuid = identity
+        except Exception:
+            pass  # Optional identity must not initialize CUDA or prevent worker readiness.
+        runtime_trace_event('worker_ready', device=f'cuda:{gpu_index}', failed=False,
+                            cuda_device_uuid=cuda_device_uuid)
+        result_queue.put({'type': 'ready', 'gpu_index': int(gpu_index), 'pid': int(os.getpid()),
+                          'device': f'cuda:{gpu_index}', 'cuda_device_uuid': cuda_device_uuid})
     except Exception as exc:  # pragma: no cover - worker init failure surfaced to main
         import traceback
         runtime_trace_event('worker_startup_failed', device=f'cuda:{gpu_index}', failed=True,

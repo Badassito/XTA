@@ -34,14 +34,21 @@ class SamInterpolationInfrastructureError(RuntimeError):
 
 
 @contextmanager
-def _trace_sam_phase(phase, scope_id, *, operation=None):
+def _trace_sam_phase(phase, scope_id, *, operation=None, group=None):
     """Retain host phase boundaries in the existing optional task trace."""
     from .runtime import runtime_trace_event
     fields = dict(sam_phase=str(phase), scope_id=str(scope_id),
-                  sam_phase_id=f'{threading.get_ident()}:{time.monotonic_ns()}')
+                  sam_phase_id=f'{threading.get_ident()}:{time.monotonic_ns()}',
+                  thread_native_id=threading.get_native_id())
     if operation is not None:
         fields['sam_operation'] = str(operation)
+    if group is not None:
+        y0, x0, y1, x1 = group.context_bbox_yx
+        fields.update(group_id=str(group.group_id), frame_count=len(group.frame_indices),
+            crop_pixels=(y1-y0)*(x1-x0), endpoint_count=len(group.endpoint_ids),
+            observation_count=len(group.observation_ids), edge_count=len(group.edges))
     runtime_trace_event('sam_phase_begin', **fields)
+    started, started_cpu = time.monotonic(), time.thread_time()
     failed = False
     failure = {}
     try:
@@ -51,7 +58,12 @@ def _trace_sam_phase(phase, scope_id, *, operation=None):
         failure = dict(error_type=type(error).__name__, error=str(error)[:4096])
         raise
     finally:
-        runtime_trace_event('sam_phase_end', failed=failed, **failure, **fields)
+        # Owner-thread CPU excludes packing helpers and time waiting to run.
+        # Keep it separate from wall time so overlap is attributable in captures.
+        runtime_trace_event('sam_phase_end', failed=failed,
+            phase_host_seconds=max(0., time.monotonic()-started),
+            phase_thread_cpu_seconds=max(0., time.thread_time()-started_cpu),
+            **failure, **fields)
 
 
 def _check_cancelled(cancel_event: object) -> None:
@@ -290,6 +302,8 @@ def prepare_sam_interpolation_pass(
         scope_id=str(metadata.get("scope_id", "sam")), spacing_zyx=spacing_zyx,
         canonical_labels=canonical_labels, observation_lineage=upstream_lineage,
         limits=planner_limits, planning_pass_index=int(pass_index), wrap_axis=bool(wrap_axis), lazy_contracts=True,
+        _stream_contracts=(resource_details is None or
+                           int(resource_details.get('assigned_contract_metadata_bytes', 0)) > 0),
         _observation_inventory=_observation_inventory)
     if resource_profile is not None and getattr(plan, "contract_lease_budget", None) is not None:
         plan.contract_lease_budget.bind_live_resource_profile(resource_profile)
@@ -360,6 +374,13 @@ def prepare_sam_interpolation_pass(
                 raise SamInterpolationInfrastructureError(
                     f"SAM tile run {job.run_id} known CPU session buffers require {estimate['estimated_peak_bytes']} "
                     f"bytes; admitted budget is {cpu_budget}; full interval was not started or truncated")
+        if getattr(plan, 'contract_metadata_bytes', 0):
+            from .sam_bridge_planning import SamPlanningLimits
+            metadata_bytes = plan.contract_metadata_bytes + 2048 * (
+                2 * sum(len(job.original_run.expected_frames) for job in tracker_jobs) + len(tracker_jobs))
+            if metadata_bytes > (planner_limits or SamPlanningLimits()).max_contract_metadata_bytes:
+                raise SamInterpolationInfrastructureError('SAM tiled evidence index exceeds its metadata budget')
+            plan = replace(plan, contract_metadata_bytes=metadata_bytes)
         needed_frames = tuple(sorted({int(frame) for job in tracker_jobs for frame in job.original_run.expected_frames}))
         demand = {}
         for job in tracker_jobs:
@@ -697,13 +718,15 @@ def _retry_child_crop_contacts(bundle, reader, group_id, canvas_shape_yx):
 
 def _retry_cpu_wave_within_peak(serial_wave, *, approved_peak_bytes, image_bytes,
                                 worker_count, persistent_bytes=0):
-    """Reuse already approved phase credit without changing retry admission.
+    """Keep candidate/legacy concurrency within its serial eligibility peak.
 
     Rendering/selection scratch can dominate the serial retry's peak. Independent
     endpoint sessions may share that credit while those CPU phases are inactive.
     Full contract, writer and tiled assembly owners remain separately charged.
     The original serial estimate still decides crop eligibility; a larger GPU
     wave must fit both its owned CPU credit and that unchanged approved peak.
+    A selected production retry can separately promote execution against its
+    authenticated live owner without changing this geometric decision.
     """
     from .sam_resources import cpu_wave_admission
     original = dict(serial_wave)
@@ -722,6 +745,24 @@ def _retry_cpu_wave_within_peak(serial_wave, *, approved_peak_bytes, image_bytes
         return original
     return dict(admitted, retry_approved_peak_bytes=int(approved_peak_bytes),
         retry_image_bytes=int(image_bytes), retry_persistent_bytes=int(persistent_bytes))
+
+
+def _promote_retry_execution(runtime, prepared, resource_profile, decision):
+    """Promote only a chosen complete retry consumed by the sealed scope API."""
+    family_iterator = getattr(runtime, 'iter_family_results', None)
+    if (resource_profile is None
+            or not _supports_scope_admission(getattr(runtime, 'iter_results', None))
+            or callable(family_iterator) and not _supports_scope_admission(family_iterator)):
+        return prepared
+    from .sam_resources import promote_sam_retry_wave
+    wave = promote_sam_retry_wave(resource_profile, prepared,
+        hard_memory_limit_bytes=decision.record['hard_memory_limit_bytes'],
+        max_in_flight=sam_worker_count(runtime))
+    if dict(wave) == dict(prepared.cpu_wave_admission):
+        return prepared
+    wave = dict(wave)
+    wave['retry_serial_eligibility_peak_bytes'] = int(decision.record['estimated_peak_bytes'])
+    return replace(prepared, cpu_wave_admission=MappingProxyType(wave))
 
 
 def _prepare_sam_group_retry(prepared, group, crop, *, retry_policy, policy,
@@ -1032,6 +1073,7 @@ def _apply_sam_crop_retries(bundle, prepared, *, destination, metadata, runtime,
                         break
                     retry, _, run_ids = candidate(decision.crop_bbox_yx)
                     controller.verify_retry_identity(decision, seed_identity=seed_identity, interval_identity=interval_identity)
+                    retry = _promote_retry_execution(runtime, retry, resource_profile, decision)
                     retry_destination = destination / 'crop_retries' / (
                         hashlib.sha256(group_id.encode()).hexdigest()[:12]+'_'+str(retry_index))
                     if split_reference(retry_destination) is None:
@@ -1192,6 +1234,28 @@ class _StreamingGroupMasks(Mapping):
 
 def _write_group(writer: object, group: object, observations: Mapping[str, object],
                  min_radius: float) -> None:
+    from .sam_evidence import SamEvidenceWriter
+    recipe = getattr(group, 'contract_recipe', None)
+    if (type(writer) is SamEvidenceWriter and recipe is not None
+            and group.crop_contract.get('contract_materialization') == 'streamed_planes'):
+        from .sam_interpolation_contracts import stream_sam_group_contracts
+        ticket = recipe.lease_budget.acquire(group.crop_contract['charged_contract_bytes'])
+        masks = metadata = None
+        try:
+            metadata, masks = stream_sam_group_contracts(recipe, min_radius)
+            with _trace_sam_phase('group_contract', writer.scope.get('scope_id', 'sam'),
+                    operation='interpolation', group=group):
+                writer.add_group(metadata, masks)
+        except BaseException as error:
+            import traceback
+            traceback.clear_frames(error.__traceback__)
+            raise
+        finally:
+            if masks is not None:
+                masks._cache.clear()
+            masks = metadata = None
+            ticket.abort()
+        return
     materialize=getattr(group,"materialize_contracts",None)
     if callable(materialize):
         # One sealed family is streamed to indexed evidence, then its dense
@@ -1217,6 +1281,7 @@ def _write_materialized_group(writer: object, group: object, observations: Mappi
         # their bounds/reasons without allocating the very resource they exceed.
         writer.add_group({
             "group_id": str(group.group_id), "context_bbox_yx": bbox,
+            "selection_priority": list(getattr(group, 'crop_contract', {}).get('selection_priority', (0, str(group.group_id)))),
             "frame_indices": frames, "endpoints": [
                 {"observation_id": str(observations[str(identifier)].observation_id),
                  "frame_index": int(observations[str(identifier)].frame_index),
@@ -1279,6 +1344,7 @@ def _write_materialized_group(writer: object, group: object, observations: Mappi
             masks[f"edge_contract:{edge_id}:{frame}"] = mask
     metadata = {
         "group_id": str(group.group_id), "context_bbox_yx": bbox,
+        "selection_priority": list(getattr(group, 'crop_contract', {}).get('selection_priority', (0, str(group.group_id)))),
         "frame_indices": frames, "endpoints": endpoints,
         "edges": [_plain(edge) for edge in group.edges],
         "status": str(group.status), "reasons": _plain(group.reasons),
@@ -1324,48 +1390,211 @@ def _records_by_id(records: object, key: str) -> dict[str, Mapping[str, object]]
     return {str(record[key]): record for record in records}
 
 
-def selected_sam_plane(bundle: object, receipt: Mapping[str, object], frame: int,
-                       shape_yx: tuple[int, int], *, direction: int | None = None) -> np.ndarray:
-    """Rebuild a selected native plane from owners, preserving shared voxels."""
-    from .sam_mask_reader import effective_candidate_mask
-    groups = _records_by_id(bundle.groups, "group_id")
-    runs = _records_by_id(bundle.runs, "run_id")
-    plane = np.zeros(tuple(shape_yx), dtype=np.uint8)
-    for run_id in receipt.get("selected_run_ids", ()):
+def _publication_frame_addresses(bundle, group):
+    """Borrow authenticated cyclic metadata; validate custom descriptors fresh."""
+    from .sam_evidence import SamEvidenceBundle, evidence_frame_geometry
+    from .sam_mask_reader import SamMaskReader
+    owner = bundle.bundle if isinstance(bundle, SamMaskReader) else bundle
+    sources = getattr(owner, '_frame_geometry_sources', ())
+    if (isinstance(owner, SamEvidenceBundle) and len(sources) == 3
+            and all(previous is current for previous, current in zip(sources, (owner.scope, owner.groups, owner.runs)))
+            and owner.groups.get(str(group["group_id"])) is group):
+        return evidence_frame_geometry(bundle)["groups"][str(group["group_id"])]["addresses"]
+    from .sam_cyclic import validate_cyclic_frame_addressing
+    return validate_cyclic_frame_addressing(group["frame_addressing"], expected_frames=group["frame_indices"])
+
+
+_PUBLICATION_READER_BYTES = 32 * 1024**2
+_PUBLICATION_LOOKUP_LIMIT = 8 * 1024**2
+_PUBLICATION_LOOKUP_FIXED_BYTES = 4096
+_PUBLICATION_LOOKUP_OWNER_BYTES = 512
+
+
+def _publication_lookup_sources(reader):
+    """Accept only the original deeply frozen metadata of an active reader."""
+    from .sam_evidence import SamEvidenceBundle
+    from .sam_mask_reader import SamMaskReader
+    if type(reader) is not SamMaskReader or not reader.active or reader._integrity_parent is not None:
+        return None
+    owner = reader.bundle
+    if type(owner) is not SamEvidenceBundle or any(name in vars(reader) for name in
+            ('scope', 'groups', 'runs', 'records', 'mask', 'raw_mask', 'candidate_mask',
+             'effective_candidate_mask', 'effective_raw_mask', 'measure_effective_raw_mask',
+             'group_mask', 'filter_snapshot')):
+        return None
+    sources = getattr(owner, '_frame_geometry_sources', ())
+    geometry = getattr(owner, '_frame_geometry_source', None)
+    if (len(sources) != 3
+            or any(old is not current for old, current in zip(sources, (owner.scope, owner.groups, owner.runs)))
+            or geometry is None or getattr(owner, '_frame_geometry', None) is not geometry
+            or owner.records is not getattr(owner, '_mask_records_source', None)):
+        return None
+    return (owner, *sources, owner.records, geometry)
+
+
+def _publication_lookup_reservation(receipt):
+    selected = receipt.get('selected_run_ids', ())
+    if type(selected) not in (list, tuple) or not selected:
+        return 0
+    charge = _PUBLICATION_LOOKUP_FIXED_BYTES + _PUBLICATION_LOOKUP_OWNER_BYTES*len(selected)
+    return charge if charge <= _PUBLICATION_LOOKUP_LIMIT else 0
+
+
+def _ordered_frame_present(frames, value, sign):
+    """Binary search the existing tuple without copying reverse-owner frames."""
+    lo, hi = 0, len(frames)
+    while lo < hi:
+        middle = (lo+hi)//2
+        if (frames[middle] < value if sign == 1 else frames[middle] > value):
+            lo = middle+1
+        else:
+            hi = middle
+    return lo < len(frames) and frames[lo] == value
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicationFrameLookup:
+    reader: object
+    view: object
+    snapshot: object
+    selected: tuple
+    sources: tuple
+    owners: tuple
+    shape_yx: tuple
+    cyclic_signs: frozenset
+    reserved_bytes: int
+
+    def matches(self, reader, view, records, shape_yx):
+        sources = _publication_lookup_sources(reader)
+        return (reader is self.reader and view is self.view
+            and view.get('selected_run_ids') is self.selected and view.get('mask_filter') is self.snapshot
+            and 'branch_selection' not in view and sources is not None
+            and all(old is current for old, current in zip(self.sources, sources))
+            and records[0] is sources[2] and records[1] is sources[3]
+            and tuple(shape_yx) == self.shape_yx)
+
+    def owner_frames(self, frame, direction):
+        frame = int(frame)
+        direction = None if direction is None else int(direction)
+        if self.cyclic_signs and (direction is None or direction in self.cyclic_signs):
+            from .sam_cyclic import assert_cyclic_implementation_unchanged
+            assert_cyclic_implementation_unchanged()
+        for run_id, group, frames, sign, addresses, native_shape in self.owners:
+            if direction is not None and sign != direction:
+                continue
+            lower, upper = (frames[0], frames[-1]) if sign == 1 else (frames[-1], frames[0])
+            if addresses is None:
+                if lower <= frame <= upper and _ordered_frame_present(frames, frame, sign):
+                    yield run_id, frame, group, None, None
+                continue
+            count = native_shape[0]
+            if not 0 <= frame < count:
+                continue
+            first = frame + max(0, (lower-frame+count-1)//count)*count
+            last = frame + ((upper-frame)//count)*count
+            aliases = range(first, last+1, count) if sign == 1 else range(last, first-1, -count)
+            for stored_frame in aliases:
+                if _ordered_frame_present(frames, stored_frame, sign):
+                    yield run_id, stored_frame, group, addresses[stored_frame], native_shape
+
+
+def _build_publication_frame_lookup(reader, view, shape_yx, *, reserved_bytes):
+    """Bound descriptor storage inside the existing publication reader allowance.
+
+    Each owner adds one six-reference tuple plus one tuple slot and borrowed
+    identifiers/geometry. 512 bytes per owner also covers simultaneous builder
+    and frozen tuple slots; 4096 bytes covers the fixed token/iterator state.
+    No frame table, mask, address copy or per-frame owner index is retained.
+    """
+    from .sam_mask_reader import _FilterSnapshot
+    sources = _publication_lookup_sources(reader)
+    selected, snapshot = view.get('selected_run_ids'), view.get('mask_filter')
+    charge = _publication_lookup_reservation(view)
+    if (sources is None or not charge or charge > int(reserved_bytes)
+            or reader.max_cache_bytes+int(reserved_bytes) > _PUBLICATION_READER_BYTES
+            or type(selected) is not tuple or type(snapshot) is not _FilterSnapshot
+            or snapshot.owner is not reader._identity or 'branch_selection' in view):
+        return None
+    # Complete snapshot contributor validation precedes any indexed lookup.
+    if reader.filter_snapshot(view) is not snapshot:
+        return None
+    owners, cyclic_signs = [], set()
+    for run_id in selected:
+        if type(run_id) is not str or run_id not in reader.runs:
+            return None
+        run = reader.runs[run_id]
+        frames, direction = run.get('expected_frames'), run.get('direction')
+        if direction not in ('forward', 'backward', 1, -1) or type(direction) is bool:
+            return None
+        sign = 1 if direction in ('forward', 1) else -1
+        if (type(frames) is not tuple or not frames or any(type(frame) is not int for frame in frames)
+                or any(sign*(frames[index]-frames[index-1]) <= 0 for index in range(1, len(frames)))):
+            return None
+        group = reader.groups[str(run['group_id'])]
+        addresses, native_shape = None, None
+        if group.get('frame_addressing'):
+            addresses = _publication_frame_addresses(reader, group)
+            native_shape = tuple(group['frame_addressing']['native_shape_tyx'])
+            if native_shape[1:] != tuple(shape_yx):
+                return None
+            cyclic_signs.add(sign)
+        owners.append((run_id, group, frames, sign, addresses, native_shape))
+    return _PublicationFrameLookup(reader, view, snapshot, selected, sources, tuple(owners),
+        tuple(shape_yx), frozenset(cyclic_signs), charge)
+
+
+def _unindexed_publication_owner_frames(bundle, receipt, frame, shape_yx, direction, groups, runs):
+    """Keep the public/custom-reader traversal and its validation order."""
+    for run_id in receipt.get('selected_run_ids', ()):
         run = runs[str(run_id)]
-        run_direction = run["direction"]
-        sign = (1 if run_direction == "forward" else -1) if isinstance(run_direction, str) else int(run_direction)
+        run_direction = run['direction']
+        sign = (1 if run_direction == 'forward' else -1) if isinstance(run_direction, str) else int(run_direction)
         if direction is not None and sign != int(direction):
             continue
-        group = groups[str(run["group_id"])]
-        addresses = None
-        if group.get("frame_addressing"):
-            from .sam_cyclic import (address_for_unfolded_index, transform_crop_between_frame_addresses,
-                                     validate_cyclic_frame_addressing)
-            addresses = validate_cyclic_frame_addressing(group["frame_addressing"], expected_frames=group["frame_indices"])
-            native_shape = tuple(group["frame_addressing"]["native_shape_tyx"])
+        group = groups[str(run['group_id'])]
+        addresses, native_shape = None, None
+        if group.get('frame_addressing'):
+            addresses = _publication_frame_addresses(bundle, group)
+            native_shape = tuple(group['frame_addressing']['native_shape_tyx'])
             if native_shape[1:] != tuple(shape_yx):
-                raise SamInterpolationInfrastructureError("Cyclic native output shape differs from saved addresses")
-        for stored_frame in run["expected_frames"]:
+                raise SamInterpolationInfrastructureError('Cyclic native output shape differs from saved addresses')
+        for stored_frame in run['expected_frames']:
             stored_frame = int(stored_frame)
             address = addresses[stored_frame] if addresses is not None else None
-            if int(address["native_index"] if address is not None else stored_frame) != int(frame):
-                continue
-            crop = effective_candidate_mask(bundle, str(run_id), stored_frame, receipt)
-            if crop is None:
-                continue
-            crop = np.asarray(crop, dtype=bool)
-            bbox = tuple(map(int, group["context_bbox_yx"]))
-            if address is not None:
-                target = address_for_unfolded_index(int(frame), native_shape[0],
-                    period_degrees=group["frame_addressing"]["period_degrees"])
-                crop, bbox = transform_crop_between_frame_addresses(crop, bbox, address, target, shape_yx[1])
-            y0, x0, y1, x1 = bbox
-            if crop.shape != (y1 - y0, x1 - x0):
-                raise SamInterpolationInfrastructureError("Candidate mask shape differs from stored crop geometry")
-            if not (0 <= y0 < y1 <= shape_yx[0] and 0 <= x0 < x1 <= shape_yx[1]):
-                raise SamInterpolationInfrastructureError("Candidate crop is outside its native view canvas")
-            plane[y0:y1, x0:x1] |= crop
+            if int(address['native_index'] if address is not None else stored_frame) == int(frame):
+                yield str(run_id), stored_frame, group, address, native_shape
+
+
+def selected_sam_plane(bundle: object, receipt: Mapping[str, object], frame: int,
+                       shape_yx: tuple[int, int], *, direction: int | None = None,
+                       _records=None, _lookup=None) -> np.ndarray:
+    """Rebuild a selected native plane from owners, preserving shared voxels."""
+    from .sam_mask_reader import effective_candidate_mask
+    groups, runs = ((_records_by_id(bundle.groups, "group_id"), _records_by_id(bundle.runs, "run_id"))
+                    if _records is None else _records)
+    plane = np.zeros(tuple(shape_yx), dtype=np.uint8)
+    owners = (_lookup.owner_frames(frame, direction)
+        if type(_lookup) is _PublicationFrameLookup and isinstance(frame, (int, np.integer))
+        and (direction is None or type(direction) is int and direction in (1, -1))
+        and _lookup.matches(bundle, receipt, (groups, runs), shape_yx)
+        else _unindexed_publication_owner_frames(bundle, receipt, frame, shape_yx, direction, groups, runs))
+    for run_id, stored_frame, group, address, native_shape in owners:
+        crop = effective_candidate_mask(bundle, str(run_id), stored_frame, receipt)
+        if crop is None:
+            continue
+        crop = np.asarray(crop, dtype=bool)
+        bbox = tuple(map(int, group['context_bbox_yx']))
+        if address is not None:
+            from .sam_cyclic import address_for_unfolded_index, transform_crop_between_frame_addresses
+            target = address_for_unfolded_index(int(frame), native_shape[0],
+                period_degrees=group['frame_addressing']['period_degrees'])
+            crop, bbox = transform_crop_between_frame_addresses(crop, bbox, address, target, shape_yx[1])
+        y0, x0, y1, x1 = bbox
+        if crop.shape != (y1-y0, x1-x0):
+            raise SamInterpolationInfrastructureError('Candidate mask shape differs from stored crop geometry')
+        if not (0 <= y0 < y1 <= shape_yx[0] and 0 <= x0 < x1 <= shape_yx[1]):
+            raise SamInterpolationInfrastructureError('Candidate crop is outside its native view canvas')
+        plane[y0:y1, x0:x1] |= crop
     return plane
 
 
@@ -1375,12 +1604,24 @@ def _publish_directions(bundle: object, receipt: Mapping[str, object], observati
                         cancel_event: object = None) -> tuple[np.ndarray, list[dict[str, object]], int, dict[str, object]]:
     merged = None
     try:
-        with bundle.reader(max_cache_bytes=32 * 1024**2) as reader:
+        lookup_bytes = _publication_lookup_reservation(receipt)
+        with bundle.reader(max_cache_bytes=_PUBLICATION_READER_BYTES-lookup_bytes) as reader:
             selection_view = {**receipt, "mask_filter": reader.filter_snapshot(receipt)}
             selection_view.pop('branch_selection', None)
+            if lookup_bytes:
+                from itertools import islice
+                count = (lookup_bytes-_PUBLICATION_LOOKUP_FIXED_BYTES)//_PUBLICATION_LOOKUP_OWNER_BYTES
+                selected = receipt.get('selected_run_ids', ())
+                frozen_ids = tuple(islice(selected, count+1))
+                if len(frozen_ids) == count and len(selected) == count:
+                    selection_view['selected_run_ids'] = frozen_ids
+            lookup = _build_publication_frame_lookup(reader, selection_view, observations.shape[1:],
+                reserved_bytes=lookup_bytes)
+            if lookup is None and lookup_bytes:
+                selection_view['selected_run_ids'] = receipt.get('selected_run_ids', ())
             merged, components, added = _publish_directions_with_reader(reader, receipt,
                 observations, destination, metadata, pass_index, merged_work_dir,
-                cancel_event, selection_view)
+                cancel_event, selection_view, _lookup=lookup)
         return merged, components, added, dict(reader.stats)
     except BaseException:
         if isinstance(merged, np.memmap):
@@ -1392,7 +1633,8 @@ def _publish_directions_with_reader(bundle: object, receipt: Mapping[str, object
                         destination: Path, metadata: Mapping[str, object],
                         pass_index: int, merged_work_dir: Path,
                         cancel_event: object = None,
-                        selection_view: Mapping[str, object] | None = None) -> tuple[np.ndarray, list[dict[str, object]], int]:
+                        selection_view: Mapping[str, object] | None = None,
+                        _lookup=None) -> tuple[np.ndarray, list[dict[str, object]], int]:
     # Ordinary binary cvol readers remain unchanged. Only the proposal bundle
     # carries multiple overlapping owners; output unions are reconstructed here.
     from .interpolation import INTERNAL_PACKED_CVOL_FORMAT, IncrementalRawBBoxMaskStoreWriter
@@ -1408,16 +1650,14 @@ def _publish_directions_with_reader(bundle: object, receipt: Mapping[str, object
     try:
         for direction, sign in (("forward", 1), ("backward", -1)):
             _check_cancelled(cancel_event)
-            directional_run_ids = [str(identifier) for identifier in receipt.get("selected_run_ids", ())
+            directional_run_ids = [str(identifier) for identifier in (selection_view or receipt).get("selected_run_ids", ())
                                    if runs[str(identifier)]["direction"] in (sign, direction)]
             active_frames_set = set()
             for identifier in directional_run_ids:
                 group = groups[str(runs[identifier]["group_id"])]
                 addresses = None
                 if group.get("frame_addressing"):
-                    from .sam_cyclic import validate_cyclic_frame_addressing
-                    addresses = validate_cyclic_frame_addressing(group["frame_addressing"],
-                        expected_frames=group["frame_indices"])
+                    addresses = _publication_frame_addresses(bundle, group)
                 branch = receipt.get('branch_selection')
                 if branch is not None:
                     active_owner_frames = {int(frame) for edge_id in branch['selected_edge_ids_by_run'].get(identifier, ())
@@ -1451,7 +1691,9 @@ def _publish_directions_with_reader(bundle: object, receipt: Mapping[str, object
                         _check_cancelled(cancel_event)
                         if frame > next_unwritten:
                             writer.consume_empty_range(next_unwritten, frame - next_unwritten)
-                        plane = selected_sam_plane(bundle, selection_view or receipt, frame, shape[1:], direction=sign)
+                        plane = selected_sam_plane(bundle, selection_view or receipt, frame, shape[1:],
+                            direction=sign, _records=((bundle.groups, bundle.runs) if _lookup is not None else (groups, runs)),
+                            _lookup=_lookup)
                         # The write contract is additive. Guard this invariant again
                         # at publication in case a corrupt/custom evidence writer errs.
                         if np.any(plane & (np.asarray(observations[frame]) != 0)):
@@ -1653,6 +1895,8 @@ def interpolate_sam_view_volume_pass(
     resolved_limits = planner_limits if planner_limits is not None else SamPlanningLimits()
     stats["sam_group_peak_budget_bytes"] = int(resolved_limits.max_group_bytes)
     stats["sam_contract_resident_budget_bytes"] = int(resolved_limits.max_total_contract_bytes)
+    stats["sam_contract_metadata_budget_bytes"] = int(resolved_limits.max_contract_metadata_bytes)
+    stats["sam_contract_metadata_bytes"] = int(getattr(plan, 'contract_metadata_bytes', 0))
     stats["sam_contract_storage_version"] = str(getattr(plan, "contract_storage_version", "eager"))
     stats["sam_original_observation_count"] = len({str(getattr(observation, "original_observation_id", "")
         or observation.observation_id) for observation in plan.observations})
@@ -1663,9 +1907,12 @@ def interpolate_sam_view_volume_pass(
     stats["sam_group_planning_receipts"] = [
         {"group_id": str(group.group_id), "status": str(group.status),
          "reasons": list(group.reasons)} for group in plan.groups]
-    unresolved = str(plan.status) == "unresolved" or any(str(group.status) == "unresolved" for group in plan.groups)
-    stats["sam_unresolved_groups"] = sum(str(group.status) == "unresolved" for group in plan.groups)
-    if not runs and int(pass_index) > 1:
+    from .sam_planning_outcomes import sam_planning_omission
+    planning_omission = sam_planning_omission(stats, operation='interpolation')
+    unresolved = planning_omission is not None
+    stats["sam_requested_work_complete"] = not unresolved
+    stats["sam_unresolved_groups"] = 0 if planning_omission is None else planning_omission['unresolved_group_count']
+    if not runs and int(pass_index) > 1 and not unresolved:
         stats.update(skipped=True, skip_reason="observed_anchor_hypotheses_exhausted",
                      generator_wall_seconds=time.perf_counter() - started)
         return observation_volume, stats, []

@@ -263,7 +263,7 @@ def test_latest_storage_is_bounded_by_devices_and_optional_renderers_are_support
     assert all(state['frame'] == 29 for state in telemetry.latest.values())
 
 
-def test_host_cache_flush_and_commit_precede_renderer_retirement(tmp_path, monkeypatch):
+def test_renderer_retirement_precedes_host_cache_flush_and_commit(tmp_path, monkeypatch):
     context = context_for(tmp_path, np.zeros(SOURCE_SHAPE, np.uint8))
     telemetry = Telemetry()
     monkeypatch.setattr('XTA.runtime.runtime_telemetry', lambda: telemetry)
@@ -271,9 +271,24 @@ def test_host_cache_flush_and_commit_precede_renderer_retirement(tmp_path, monke
     renderer.lease = SimpleNamespace(device_index=0)
     renderer._phase_scope = ('extrapolation', 'cache/scope')
     original_close = renderer.close
+    original_phase = rendering._record_image_phase
+    boundaries = []
+
+    def phase(owner, name, **fields):
+        boundaries.append(name)
+        if name in ('cache_flush', 'cache_commit'):
+            assert owner is renderer and renderer.closed and renderer.lease is None
+        original_phase(owner, name, **fields)
+
+    monkeypatch.setattr(rendering, '_record_image_phase', phase)
 
     def close():
-        assert telemetry.latest[KEY]['phase'] == 'cache_commit'
+        if renderer.lease is None:
+            assert renderer.closed
+            return
+        assert telemetry.latest[KEY]['phase'] == 'host_cache_copy'
+        assert not context._caches and context._image_build_credit_bytes > 0
+        boundaries.append('renderer_retired')
         original_close()
         renderer.lease = None
 
@@ -286,7 +301,13 @@ def test_host_cache_flush_and_commit_precede_renderer_retirement(tmp_path, monke
         reference = context.image_provider(view, shape, demand(shape, {2: bbox}))
         np.testing.assert_array_equal(crop_from(reference, 2, bbox), 203)
         phases = [state['phase'] for _key, state in telemetry.history]
-        assert phases == ['host_cache_copy', 'host_cache_copy', 'cache_flush', 'cache_commit']
-        assert renderer.closed
+        assert boundaries == ['host_cache_copy', 'host_cache_copy', 'renderer_retired',
+                              'cache_flush', 'cache_commit']
+        # CPU finalization cannot overwrite a device gauge after its owner has retired.
+        assert phases == ['host_cache_copy', 'host_cache_copy']
+        assert all(state['owner_token'] == id(renderer) and state['scope_id'] == 'cache/scope'
+                   and state['sam_operation'] == 'extrapolation' for _key, state in telemetry.history)
+        assert renderer.closed and renderer.lease is None
+        assert not context._image_builds and context._image_build_credit_bytes == 0
     finally:
         context.close()

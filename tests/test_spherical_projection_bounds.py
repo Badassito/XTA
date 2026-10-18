@@ -2,17 +2,21 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import gc
 import itertools
 import math
 import os
 import unittest
+import weakref
 from unittest import mock
 
 import numpy as np
 
 from XTA.spherical_geometry import build_spherical_view_infos, cube_rotation
 from tests.reference_backends.spherical import project_spherical_block as _project_spherical_block
-from XTA.spherical_projection_bounds import _face_direction_bounds, spherical_output_bounds
+from XTA.spherical_projection_bounds import (
+    _cached_face_direction_bounds, _face_direction_bounds, spherical_output_bounds,
+)
 from XTA.spherical_projection_cuda import SphericalCudaProjector
 
 
@@ -22,6 +26,50 @@ def projected(data, view, shape, boxes=None):
 
 
 class SphericalBoundsTests(unittest.TestCase):
+    def test_face_extrema_cache_is_immutable_and_does_not_retain_borrowed_rotation(self):
+        _cached_face_direction_bounds.cache_clear()
+        self.addCleanup(_cached_face_direction_bounds.cache_clear)
+        rotation = np.eye(3)
+        borrowed = weakref.ref(rotation)
+        limits = _face_direction_bounds(rotation, 0)
+        self.assertIs(_face_direction_bounds(tuple(rotation.reshape(-1)), 0), limits)
+        with self.assertRaises(TypeError):
+            limits[0][0] = 0.
+        rotation[:] = np.asarray(cube_rotation('vertical', 31)).reshape(3, 3)
+        changed = _face_direction_bounds(rotation, 0)
+        self.assertNotEqual(changed, limits)
+        self.assertEqual(_cached_face_direction_bounds.cache_info().misses, 2)
+        del rotation
+        gc.collect()
+        self.assertIsNone(borrowed())
+
+    def test_face_extrema_cache_is_bounded_and_eviction_preserves_exact_values(self):
+        _cached_face_direction_bounds.cache_clear()
+        self.addCleanup(_cached_face_direction_bounds.cache_clear)
+        original = _face_direction_bounds(cube_rotation(), 0)
+        for angle in range(1, 129):
+            _face_direction_bounds(cube_rotation('vertical', angle), 0)
+        self.assertEqual(_cached_face_direction_bounds.cache_info().currsize, 128)
+        before = _cached_face_direction_bounds.cache_info().misses
+        self.assertEqual(_face_direction_bounds(cube_rotation(), 0), original)
+        self.assertEqual(_cached_face_direction_bounds.cache_info().misses, before + 1)
+
+    def test_bounds_reuse_one_cone_across_bands_patches_and_output_grids(self):
+        built = build_spherical_view_infos(129, 131, 133, targets=('transverse',),
+            min_radius=.5, patch_size=15, tilted_views=())
+        selected = [view for view in built if view.spherical_face == 0]
+        self.assertGreater(len(selected), 2)
+        radii_ids = {id(view.spherical_radii) for view in selected}
+        _cached_face_direction_bounds.cache_clear()
+        self.addCleanup(_cached_face_direction_bounds.cache_clear)
+        with mock.patch('XTA.spherical_projection_bounds.np.asarray', wraps=np.asarray) as arrays:
+            for view in selected:
+                spherical_output_bounds(view, (129, 131, 133))
+                spherical_output_bounds(view, (123, 135, 131))
+        self.assertEqual(_cached_face_direction_bounds.cache_info().misses, 1)
+        self.assertEqual(_cached_face_direction_bounds.cache_info().hits, 2 * len(selected) - 1)
+        self.assertFalse(any(id(call.args[0]) in radii_ids for call in arrays.call_args_list))
+
     def test_upright_face_extrema_include_edge_stationary_points_and_corners(self):
         lower, upper = _face_direction_bounds(np.eye(3), 0)
         np.testing.assert_allclose(lower, (1 / math.sqrt(3), -1 / math.sqrt(2), -1 / math.sqrt(2)), atol=2e-12)
@@ -106,7 +154,7 @@ class SphericalBoundsTests(unittest.TestCase):
                 view = replace(initial, spherical_rotation_xyz=rotation) if rotation else initial
                 bounds = spherical_output_bounds(view, shape)
                 fractions.append(bounds.voxel_count / math.prod(shape))
-        self.assertEqual(len(fractions), 120)
+        self.assertEqual(len(fractions), 5 * len(built))
         self.assertLess(max(fractions), .5)
         self.assertLess(sum(fractions) / len(fractions), .3)
 

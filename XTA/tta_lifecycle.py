@@ -200,8 +200,23 @@ def publish_complete_tta_manifest(
 
     if str(manifest.get("status", "")) != "complete":
         raise ValueError("TTA complete-manifest publisher requires status=complete")
+    if manifest.get('sam_requested_work_complete') is False or manifest.get('sam_planning_omissions'):
+        raise ValueError('TTA complete-manifest publisher cannot certify omitted SAM work')
     # Keep this check immediately adjacent to the atomic write. In particular, no cleanup,
     # summary generation, or manifest construction may be inserted between these calls.
+    assert_artifacts_unchanged(artifact_identities)
+    return write_manifest(path, manifest)
+
+
+def publish_incomplete_tta_manifest(
+    *, path: Path, manifest: Mapping[str, object], artifact_identities: Mapping[str, object],
+    assert_artifacts_unchanged: Callable[[Mapping[str, object]], None],
+    write_manifest: Callable[[Path, Mapping[str, object]], Path],
+) -> Path:
+    """Retain settled outputs while explicitly recording omitted requested work."""
+    if (manifest.get('status') != 'incomplete' or manifest.get('sam_requested_work_complete') is not False
+            or not manifest.get('sam_planning_omissions')):
+        raise ValueError('TTA incomplete-manifest publisher requires omitted SAM work and status=incomplete')
     assert_artifacts_unchanged(artifact_identities)
     return write_manifest(path, manifest)
 
@@ -217,7 +232,7 @@ def finalize_tta_selected_run_and_publish(
     cleanup_scratch: Callable[..., None],
     publish_manifest: Callable[..., Path],
 ) -> Path:
-    """Finish selected-run cleanup before publishing the complete manifest."""
+    """Finish selected-run cleanup before publishing the settled run manifest."""
 
     if not bool(keep_temp_artifacts):
         cleanup_scratch(temp_dir=temp_dir, out_dir=out_dir)
@@ -233,4 +248,5 @@ __all__ = [
     "cleanup_tta_selected_run_scratch",
     "finalize_tta_selected_run_and_publish",
     "publish_complete_tta_manifest",
+    "publish_incomplete_tta_manifest",
 ]

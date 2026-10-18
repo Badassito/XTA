@@ -250,6 +250,19 @@ def gpu_render_tblock_slices() -> int:
     """Transient source t-block size for streaming-mode GPU azimuthal prerendering."""
     return max(16, _env_int('YOLO_TTA_GPU_RENDER_TBLOCK_SLICES', 256))
 
+def _azimuthal_gather_stack_block(stack_len: int, rows: int, columns: int, logical_t: int) -> int:
+    """Promote the legacy batch only inside the existing per-view render allowance."""
+    option = 'YOLO_TTA_GPU_AZIMUTHAL_STACK_BLOCK'
+    if option in os.environ:
+        return max(1, _env_int(option, 32))
+    # Maps, full native projection and row-fold overlap precede the separate warp allowance.
+    fixed = 256 * columns + 20 * logical_t + 32 * rows + 4 * stack_len * columns + 12 * rows * columns
+    available = min(256 * 1024**2, 256 * rows * columns - fixed)
+    # 64 B/tap covers broadcast indices, gathered bytes, live float buffers and row indices.
+    funded_rows = max(0, available) // max(1, 64 * 4 * columns)
+    return max(32, min(stack_len, funded_rows))
+
+
 def fused_direct_render_enabled() -> bool:
     """Allow resident-ring renderers to write normalized pixels straight to TRT bindings."""
     return _env_flag('YOLO_TTA_FUSED_DIRECT_RENDER', True)
@@ -291,6 +304,122 @@ def radial_column_geometry_for_shape(rows, columns, height_origin, height_length
         return True
     active_rows = max(0, min(int(height_origin) + int(rows), int(height_length)) - max(0, int(height_origin)))
     return bool(active_rows >= 256 and int(columns) >= 256 and active_rows * int(columns) >= 256 * 1024)
+
+_SAM_AZIMUTHAL_TAPS_SOURCE = r'''
+__device__ __forceinline__ void sam_azimuthal_axis_taps(
+    float coordinate, float center, float direction, int length,
+    long long& i0, long long& i1, float& w0, float& w1) {
+    const float position = __fadd_rn(center, __fmul_rn(coordinate, direction));
+    const float p0 = floorf(position);
+    const float p1 = __fadd_rn(p0, 1.0f);
+    w0 = __fsub_rn(1.0f, fabsf(__fsub_rn(position, p0)));
+    w1 = __fsub_rn(1.0f, fabsf(__fsub_rn(position, p1)));
+    w0 = w0 < 0.0f ? 0.0f : w0;
+    w1 = w1 < 0.0f ? 0.0f : w1;
+    w0 = __fmul_rn(w0, p0 >= 0.0f && p0 < (float)length ? 1.0f : 0.0f);
+    w1 = __fmul_rn(w1, p1 >= 0.0f && p1 < (float)length ? 1.0f : 0.0f);
+    const float sum = __fadd_rn(w0, w1);
+    if (fabsf(sum) > 1.0e-6f) {
+        w0 = __fdiv_rn(w0, sum);
+        w1 = __fdiv_rn(w1, sum);
+    }
+    const float high = (float)(length - 1);
+    i0 = (long long)fminf(high, fmaxf(0.0f, p0));
+    i1 = (long long)fminf(high, fmaxf(0.0f, p1));
+}
+
+extern "C" __global__ void sam_azimuthal_roi_taps(
+    const float* coordinates, int first_column, int count,
+    int plane_height, int plane_width, float center_x, float center_y,
+    float cosine, float sine, long long* indices, float* weights) {
+    const int index = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (index >= count) return;
+    const float coordinate = coordinates[first_column + index];
+    long long x0, x1, y0, y1;
+    float wx0, wx1, wy0, wy1;
+    sam_azimuthal_axis_taps(coordinate, center_x, cosine, plane_width, x0, x1, wx0, wx1);
+    sam_azimuthal_axis_taps(coordinate, center_y, sine, plane_height, y0, y1, wy0, wy1);
+    const long long output = (long long)index * 4;
+    indices[output] = y0 * (long long)plane_width + x0;
+    indices[output + 1] = y0 * (long long)plane_width + x1;
+    indices[output + 2] = y1 * (long long)plane_width + x0;
+    indices[output + 3] = y1 * (long long)plane_width + x1;
+    weights[output] = __fmul_rn(wy0, wx0);
+    weights[output + 1] = __fmul_rn(wy0, wx1);
+    weights[output + 2] = __fmul_rn(wy1, wx0);
+    weights[output + 3] = __fmul_rn(wy1, wx1);
+}
+'''
+_SAM_AZIMUTHAL_TAP_KERNELS: Dict[int, object] = {}
+_SAM_AZIMUTHAL_TAP_KERNEL_ERRORS: Dict[int, str] = {}
+_SAM_AZIMUTHAL_TAP_KERNEL_LOCK = threading.Lock()
+
+
+def _sam_azimuthal_tap_kernels(device_index: int) -> Optional[object]:
+    """Retain compiled code only; unavailable optional CuPy keeps the Torch route."""
+    device_index = int(device_index)
+    with _SAM_AZIMUTHAL_TAP_KERNEL_LOCK:
+        if device_index in _SAM_AZIMUTHAL_TAP_KERNELS:
+            return _SAM_AZIMUTHAL_TAP_KERNELS[device_index]
+        if device_index in _SAM_AZIMUTHAL_TAP_KERNEL_ERRORS:
+            return None
+        try:
+            import cupy as cp  # type: ignore
+            from cupy.cuda import compiler as cp_compiler, function as cp_function  # type: ignore
+            if not callable(getattr(cp, 'from_dlpack', None)):
+                raise RuntimeError('CuPy lacks the stream-aware DLPack tensor bridge')
+            compile_nvrtc = getattr(cp_compiler, 'compile_using_nvrtc', None)
+            module_factory = getattr(cp_function, 'Module', None)
+            if not callable(compile_nvrtc) or not callable(module_factory):
+                raise RuntimeError('CuPy lacks explicit NVRTC compilation/module loading')
+            device = cp.cuda.Device(device_index)
+            with device:
+                # RawModule's cache wrapper unconditionally adds -ftz=true.
+                # This public lower-level route preserves one explicit FTZ=false
+                # option without changing CuPy's compiler or global settings.
+                binary, _mapping = compile_nvrtc(_SAM_AZIMUTHAL_TAPS_SOURCE,
+                    options=('--std=c++11', '--fmad=false', '--ftz=false', '--prec-div=true'),
+                    arch=device.compute_capability, cache_in_memory=True)
+                module = module_factory()
+                module.load(binary)
+                kernel = module.get_function('sam_azimuthal_roi_taps')
+            result = argparse.Namespace(cp=cp, module=module, build=kernel)
+            _SAM_AZIMUTHAL_TAP_KERNELS[device_index] = result
+            return result
+        except Exception as exc:
+            _SAM_AZIMUTHAL_TAP_KERNEL_ERRORS[device_index] = f'{type(exc).__name__}: {exc}'[:512]
+            return None
+
+
+def _record_sam_azimuthal_tap_outcome(engine, backend, reason, state, detail='') -> None:
+    """Coalesce scalar selection diagnostics; never initialize telemetry or CUDA."""
+    try:
+        if (getattr(engine.device, 'type', None) != 'cuda'
+                or backend not in ('fused_cuda', 'torch_reference')
+                or state not in ('selected', 'enqueued', 'failed')
+                or reason not in ('selected', 'disabled', 'unsupported_view', 'unqualified_geometry',
+                    'invalid_geometry', 'capability_unavailable', 'stream_bridge_unavailable',
+                    'tensor_bridge_unavailable', 'launch_failed')):
+            return
+        key = backend, reason, state
+        if getattr(engine, '_sam_azimuthal_tap_reported_outcome', None) == key:
+            return
+        from . import runtime
+        telemetry = runtime._RUNTIME_TELEMETRY
+        device = getattr(engine.device, 'index', None)
+        if telemetry is None or not telemetry.enabled or device is None:
+            return
+        record = dict(engine_token=id(engine), device=f'cuda:{int(device)}',
+            backend=backend, reason=reason, state=state,
+            selection_monotonic_ns=time.monotonic_ns())
+        if detail:
+            record['detail'] = ((f'{type(detail).__name__}: {detail}'
+                if isinstance(detail, BaseException) else str(detail)))[:512]
+        telemetry.set_scheduler_gauge(f'sam.gpu_images.azimuthal_taps.cuda:{int(device)}', record)
+        engine._sam_azimuthal_tap_reported_outcome = key
+    except BaseException:
+        pass  # Optional observability must not replace a fallback or launch failure.
+
 
 _RADIAL_NATIVE_KERNELS: Optional[object] = None
 _RADIAL_NATIVE_KERNELS_FAILED = False
@@ -2770,6 +2899,87 @@ class _GpuWorkerRenderEngine:
         w2d = (y_w.unsqueeze(2) * x_w.unsqueeze(1)).reshape(n_u, -1)
         return flat_idx, w2d
 
+    def _try_sam_azimuthal_taps_gpu(self, view: ViewInfo, angle_deg: float,
+                                  first_column: int, stop_column: int) -> Optional[Tuple[object, object]]:
+        """Fuse only SAM ROI tap arithmetic; None is a pre-launch capability miss.
+
+        The original full-width Torch linspace remains authoritative. No tap
+        tensors persist beyond this call's returned arrays, and the full-plane
+        reference keeps its original eager operations.
+        """
+        if getattr(self.device, 'type', None) != 'cuda':
+            return None
+        if not _env_flag('YOLO_TTA_SAM_FUSED_AZIMUTHAL_TAPS', True):
+            _record_sam_azimuthal_tap_outcome(self, 'torch_reference', 'disabled', 'selected')
+            return None
+        try:
+            if not azimuthal_resident_gpu_render_supported(view) or is_tilted_azimuthal_view(view):
+                _record_sam_azimuthal_tap_outcome(self, 'torch_reference', 'unsupported_view', 'selected')
+                return None
+            plane_h, plane_w = map(int, azimuthal_plane_shape(view))
+            n_u = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
+            first, stop = int(first_column), int(stop_column)
+            radius, cx, cy, angle = map(float,
+                (view.roi_radius, view.center_x, view.center_y, angle_deg))
+            if (not 0 <= first < stop <= n_u or min(plane_h, plane_w) < 1
+                    or max(plane_h, plane_w, n_u) > 2**24
+                    or not all(math.isfinite(value) for value in (radius, cx, cy, angle))
+                    or max(abs(cx), abs(cy)) + abs(radius) > 2**23):
+                _record_sam_azimuthal_tap_outcome(self, 'torch_reference', 'unqualified_geometry', 'selected')
+                return None
+            # Stay in the exact float32 integer-neighbor domain. Unusual
+            # geometries use the reference rather than changing its clipping.
+            theta = math.radians(angle)
+            cosine, sine = np.float32(math.cos(theta)), np.float32(math.sin(theta))
+            center_x, center_y = np.float32(cx), np.float32(cy)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            _record_sam_azimuthal_tap_outcome(self, 'torch_reference', 'invalid_geometry', 'selected')
+            return None
+        torch = self.torch
+        device_index = getattr(self.device, 'index', None)
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        kernels = _sam_azimuthal_tap_kernels(int(device_index))
+        if kernels is None:
+            _record_sam_azimuthal_tap_outcome(self, 'torch_reference', 'capability_unavailable', 'selected',
+                _SAM_AZIMUTHAL_TAP_KERNEL_ERRORS.get(int(device_index), 'Optional CUDA capability unavailable'))
+            return None
+        cp = kernels.cp
+        stream = torch.cuda.current_stream(device=self.device)
+        count = stop-first
+        with torch.cuda.device(self.device), torch.cuda.stream(stream), cp.cuda.Device(int(device_index)):
+            try:
+                external = _cupy_external_stream(cp, stream)
+            except Exception as error:
+                _record_sam_azimuthal_tap_outcome(self, 'torch_reference', 'stream_bridge_unavailable',
+                    'selected', error)
+                return None  # No tap work has been submitted through this adapter.
+            coordinates = torch.linspace(-radius, radius, n_u, dtype=torch.float32, device=self.device)
+            indices = torch.empty((count, 4), dtype=torch.int64, device=self.device)
+            weights = torch.empty((count, 4), dtype=torch.float32, device=self.device)
+            with external:
+                try:
+                    arguments = (cp.from_dlpack(coordinates), np.int32(first), np.int32(count),
+                        np.int32(plane_h), np.int32(plane_w), center_x, center_y, cosine, sine,
+                        cp.from_dlpack(indices), cp.from_dlpack(weights))
+                except (AttributeError, TypeError) as error:
+                    _record_sam_azimuthal_tap_outcome(self, 'torch_reference', 'tensor_bridge_unavailable',
+                        'selected', error)
+                    return None  # An unsupported tensor bridge submitted no tap kernel.
+                # CuPy reads Torch-owned coordinates on their creation stream.
+                # Record that use and drop aliases before the caller allocates
+                # gather scratch; same-stream reuse follows this queued kernel.
+                coordinates.record_stream(stream)
+                # Do not catch launched runtime failures as capability misses.
+                # The caller's existing stream/lease cleanup owns their fencing.
+                try:
+                    kernels.build(((count+255)//256,), (256,), arguments, stream=external)
+                except BaseException:
+                    _record_sam_azimuthal_tap_outcome(self, 'fused_cuda', 'launch_failed', 'failed')
+                    raise
+        _record_sam_azimuthal_tap_outcome(self, 'fused_cuda', 'selected', 'enqueued')
+        return indices, weights
+
     def _azimuthal_fold_indices(
         self,
         t_dim: int,
@@ -2853,26 +3063,108 @@ class _GpuWorkerRenderEngine:
 
         stack_len = int(azimuthal_stack_length(view))
         proj = torch.empty((stack_len, u_len), dtype=torch.float32, device=self.device)
-        block = max(1, _env_int('YOLO_TTA_GPU_AZIMUTHAL_STACK_BLOCK', 32))
+        plane_width = int(azimuthal_plane_shape(view)[1])
+        logical_taps = torch.div(flat_idx, plane_width, rounding_mode='floor')
+        columns = torch.remainder(flat_idx, plane_width)
+        source_taps, next_taps, temporal_alpha = logical_taps, None, None
+        if int(vol.shape[0]) != int(self._logical_t):
+            r0, r1, alpha = self._native_t_indices()
+            source_taps, next_taps, temporal_alpha = r0[logical_taps], r1[logical_taps], alpha[logical_taps]
+        block = _azimuthal_gather_stack_block(stack_len, rows_out, u_len, int(self._logical_t))
         for s0 in range(0, stack_len, block):
             s1 = min(stack_len, s0 + block)
+            stack = torch.arange(s0, s1, device=self.device, dtype=torch.int64).view(-1, 1, 1)
             if base == 'sagittal':
-                # source (native_t, Yblock, X) -> logical (Yblock, t, X)
-                oriented = self._resample_native_t_axis(vol[:, s0:s1, :]).permute(1, 0, 2).contiguous()
+                indices = (source_taps, stack, columns)
             elif base == 'coronal':
-                # source (native_t, Y, Xblock) -> logical (Xblock, t, Y)
-                oriented = self._resample_native_t_axis(vol[:, :, s0:s1]).permute(2, 0, 1).contiguous()
+                indices = (source_taps, columns, stack)
             else:  # pragma: no cover
                 raise ValueError(f'Unsupported resident Azimuthal base: {base}')
-            proj[s0:s1] = self._azimuthal_project_blocks(
-                oriented.view(s1 - s0, -1), flat_idx, w2d,
-            )
+            # Gather only the four native taps, keeping virtual-T quantization before projection.
+            samples = vol[indices].to(torch.float32)
+            if next_taps is not None:
+                following = vol[(next_taps, *indices[1:])].to(torch.float32)
+                samples = torch.lerp(samples, following, temporal_alpha).round_().clamp_(0.0, 255.0)
+            proj[s0:s1] = (samples * w2d.unsqueeze(0)).sum(dim=-1)
         if rows_out == stack_len:
             return proj
         r0, r1, alpha = self._azimuthal_fold_indices(stack_len, rows_out)
         return proj[r0] * (1.0 - alpha) + proj[r1] * alpha
 
-    def _render_tilted_azimuthal_native_resident_torch(self, view: ViewInfo, frame_idx: int) -> object:
+    def _render_azimuthal_native_crop_resident_torch(
+        self, view: ViewInfo, frame_idx: int, bbox_yx: Tuple[int, int, int, int]
+    ) -> object:
+        """Project a native rectangle with the unchanged Torch arithmetic.
+
+        Keep full-width tap construction and global row-fold maps: changing either
+        coordinate system can change gray8 half ties. Only source gathers and
+        their four-tap reductions are restricted to the requested rectangle.
+        """
+        if not azimuthal_resident_gpu_render_supported(view):
+            raise ValueError('native Azimuthal crops require a supported view')
+        if is_tilted_azimuthal_view(view):
+            return self._render_tilted_azimuthal_native_resident_torch(
+                view, int(frame_idx), bbox_yx=bbox_yx)
+        torch, volume = self.torch, self._volume_gpu
+        rows, columns = int(view.src_h), int(view.src_w)
+        y0, x0, y1, x1 = map(int, bbox_yx)
+        if not (0 <= y0 < y1 <= rows and 0 <= x0 < x1 <= columns):
+            raise ValueError('native Azimuthal crop is outside its full plane')
+        base = azimuthal_base_view_name(view)
+        stack_len = int(volume.shape[0]) if base == 'transverse' else int(azimuthal_stack_length(view))
+        angle = float(view.azimuths_deg[int(frame_idx)])
+        taps = self._try_sam_azimuthal_taps_gpu(view, angle, x0, x1)
+        if taps is None:
+            flat, weights = self._azimuthal_taps_gpu(view, angle)
+            flat, weights = flat[x0:x1], weights[x0:x1]
+        else:
+            flat, weights = taps
+        fold = (rows != stack_len or base == 'transverse' and int(self._logical_t) != stack_len)
+        if fold:
+            lower, upper, alpha = self._azimuthal_fold_indices(
+                stack_len, rows, logical_t=int(self._logical_t) if base == 'transverse' else None)
+            selected_rows = torch.cat((lower[y0:y1], upper[y0:y1]))
+        else:
+            selected_rows = torch.arange(y0, y1, device=self.device, dtype=torch.int64)
+        projected = torch.empty((int(selected_rows.numel()), x1-x0), dtype=torch.float32, device=self.device)
+        if base == 'transverse':
+            flat_volume = volume.view(stack_len, -1)
+            block = 512
+        else:
+            plane_width = int(azimuthal_plane_shape(view)[1])
+            logical_taps = torch.div(flat, plane_width, rounding_mode='floor')
+            source_columns = torch.remainder(flat, plane_width)
+            source_taps, next_taps, temporal_alpha = logical_taps, None, None
+            if int(volume.shape[0]) != int(self._logical_t):
+                lower_t, upper_t, alpha_t = self._native_t_indices()
+                source_taps, next_taps = lower_t[logical_taps], upper_t[logical_taps]
+                temporal_alpha = alpha_t[logical_taps]
+            block = _azimuthal_gather_stack_block(stack_len, rows, columns, int(self._logical_t))
+        for start in range(0, int(selected_rows.numel()), block):
+            stop = min(int(selected_rows.numel()), start+block)
+            stack = selected_rows[start:stop].view(-1, 1, 1)
+            if base == 'transverse':
+                samples = flat_volume[stack, flat.unsqueeze(0)].to(torch.float32)
+            else:
+                if base == 'sagittal':
+                    indices = (source_taps, stack, source_columns)
+                elif base == 'coronal':
+                    indices = (source_taps, source_columns, stack)
+                else:
+                    raise ValueError(f'Unsupported resident Azimuthal base: {base}')
+                samples = volume[indices].to(torch.float32)
+                if next_taps is not None:
+                    following = volume[(next_taps, *indices[1:])].to(torch.float32)
+                    samples = torch.lerp(samples, following, temporal_alpha).round_().clamp_(0.0, 255.0)
+            projected[start:stop] = (samples * weights.unsqueeze(0)).sum(dim=-1)
+        if not fold:
+            return projected
+        height = y1-y0
+        return projected[:height] * (1.0-alpha[y0:y1]) + projected[height:] * alpha[y0:y1]
+
+    def _render_tilted_azimuthal_native_resident_torch(
+        self, view: ViewInfo, frame_idx: int, *, bbox_yx=None,
+    ) -> object:
         """Reference CUDA/Torch implementation matching ``extract_tilted_azimuthal_slice_frame``.
 
  This path is retained when the allocation-free NVRTC kernel is unavailable or explicitly
@@ -2886,10 +3178,15 @@ class _GpuWorkerRenderEngine:
         stack_len = int(azimuthal_stack_length(view))
         rows = int(view.src_h)
         u_len = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
+        y0, x0, y1, x1 = (0, 0, rows, u_len) if bbox_yx is None else map(int, bbox_yx)
+        if not (0 <= y0 < y1 <= rows and 0 <= x0 < x1 <= u_len):
+            raise ValueError('native Azimuthal crop is outside its full plane')
         plane_h, plane_w = azimuthal_plane_shape(view)
         flat_idx, w2d = self._azimuthal_taps_gpu(
             view, float(view.azimuths_deg[int(frame_idx)]),
         )
+        # Slice global taps and row centers after construction to retain half ties.
+        flat_idx, w2d = flat_idx[x0:x1], w2d[x0:x1]
         px = torch.remainder(flat_idx, int(plane_w)).to(torch.int64)
         py = torch.div(flat_idx, int(plane_w), rounding_mode='floor').to(torch.int64)
         weights = w2d.to(torch.float32)
@@ -2910,7 +3207,9 @@ class _GpuWorkerRenderEngine:
                 - 0.5
             ).clamp_(0.0, float(max(0, stack_len - 1)))
 
-        out = torch.empty((rows, u_len), dtype=torch.float32, device=self.device)
+        row_centers = row_centers[y0:y1]
+        selected_rows = y1-y0
+        out = torch.empty((selected_rows, x1-x0), dtype=torch.float32, device=self.device)
         row_block = max(
             1,
             min(256, _env_int('YOLO_TTA_GPU_TILTED_AZIMUTHAL_ROW_BLOCK', 32)),
@@ -2924,8 +3223,8 @@ class _GpuWorkerRenderEngine:
         if native_t != logical_t:
             native_r0, native_r1, native_alpha = self._native_t_indices(logical_t)
 
-        for row0 in range(0, rows, row_block):
-            row1 = min(rows, row0 + row_block)
+        for row0 in range(0, selected_rows, row_block):
+            row1 = min(selected_rows, row0 + row_block)
             centers = row_centers[row0:row1].view(-1, 1, 1)
             stack_src = centers + float(tan_tilt) * tap_offsets.unsqueeze(0)
             valid = (stack_src >= 0.0) & (stack_src <= float(stack_len - 1))

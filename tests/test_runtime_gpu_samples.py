@@ -114,3 +114,38 @@ def test_sample_provider_failure_and_fallback_failure_do_not_stop_other_samples(
     with mock.patch.object(sink, 'fallback', side_effect=RuntimeError('fallback failed')):
         sink.sample_registered_providers()
     assert sink.snapshot()['gauges']['healthy'] == {'sample_monotonic_ns': 123}
+
+
+def test_pipeline_stage_provider_timestamps_actual_samples_not_later_snapshots(tmp_path):
+    import ast
+    import inspect
+    from XTA import backprojection, pipeline
+
+    sink = telemetry(tmp_path)
+    coordinator = backprojection._MainProcessGpuStageCoordinator()
+    coordinator.configure_workers([1])
+    registration = next(node for node in ast.walk(ast.parse(inspect.getsource(pipeline._main_impl)))
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == 'register_sample_provider'
+        and node.value.args and isinstance(node.value.args[0], ast.Constant)
+        and node.value.args[0].value == 'gpu.stage.live')
+    exec(compile(ast.Module(body=[registration], type_ignores=[]), '<live-stage-registration>', 'exec'),
+         {'runtime_telemetry': lambda: sink, '_MAIN_PROCESS_GPU_STAGE_COORDINATOR': coordinator})
+    with mock.patch.object(runtime, '_load_nvidia_ml_py') as nvml:
+        with mock.patch.object(runtime.time, 'monotonic_ns', return_value=100):
+            sink.sample_registered_providers()
+        with mock.patch.object(runtime.time, 'monotonic_ns', return_value=200):
+            before = sink.snapshot()
+        assert coordinator.begin_inference(1)
+        with mock.patch.object(runtime.time, 'monotonic_ns', return_value=300):
+            sink.sample_registered_providers()
+        with mock.patch.object(runtime.time, 'monotonic_ns', return_value=400):
+            after = sink.snapshot()
+        nvml.assert_not_called()
+    assert before['snapshot_monotonic_ns'] == 200
+    assert before['gauges']['gpu.stage.live']['sample_monotonic_ns'] == 100
+    assert before['gauges']['gpu.stage.live']['inference_inflight'] == {}
+    assert after['snapshot_monotonic_ns'] == 400
+    assert after['gauges']['gpu.stage.live']['sample_monotonic_ns'] == 300
+    assert after['gauges']['gpu.stage.live']['inference_inflight'] == {'1': 1}

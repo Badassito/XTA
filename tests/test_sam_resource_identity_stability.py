@@ -5,7 +5,7 @@ import threading
 import pytest
 
 from XTA import sam_resources as resources
-from XTA.sam_image_prefetch import _retain_image_credit, _try_image_profile
+from XTA.sam_image_prefetch import _try_image_profile
 from XTA.sam_policy import select_sam_proposals
 from tests.test_sam_guarded_rescue import _bundle
 from tests.test_sam_selection_resources import Pool
@@ -20,7 +20,7 @@ def test_live_assignment_receipt_is_stable_across_retained_image_debt():
         original = profile.metadata()
         with _try_image_profile(pool, GIB, 'parent/images', lambda:64*GIB) as images:
             assert images is not None
-            release = _retain_image_credit(images)
+            release = resources.retain_sam_parent_image_credit(images)
             try:
                 assert resources.sam_image_staging_snapshot(pool)['image_staging_in_use_bytes'] == GIB
                 assert profile.metadata() == original

@@ -71,6 +71,44 @@ def _wait_logger(namespace):
     return namespace['factory']()
 
 
+def test_wait_logger_skips_busy_admission_without_waiting_or_inventing_usage():
+    telemetry = SimpleNamespace(gauge=Mock())
+    pool = SimpleNamespace(condition=threading.Condition(), in_use=88, capacity=192)
+    namespace = dict(vars(pipeline))
+    namespace.update(runtime_telemetry=lambda: telemetry,
+        _MAIN_PROCESS_GPU_STAGE_COORDINATOR=SimpleNamespace(snapshot=lambda: {}),
+        _env_float=lambda _name, default: default,
+        parent_transient_admission=pool,
+        postprocessed_tiles_waiting_by_parent={}, residual_tiles_waiting_by_parent={})
+    logger = _wait_logger(namespace)
+    finished = threading.Event()
+    errors = []
+
+    def log_while_restoring():
+        try:
+            logger(force=True)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=log_while_restoring)
+    try:
+        with pool.condition:
+            worker.start()
+            assert finished.wait(2), 'diagnostic snapshot blocked the scheduler'
+            assert not errors
+            key, record = telemetry.gauge.call_args.args
+            assert key == 'scheduler.wait_activity_skipped'
+            assert record['reason'] == 'parent_admission_busy'
+            assert record['wall_time'] > 0
+            assert set(record) == {'reason', 'wall_time'}
+            assert (pool.in_use, pool.capacity) == (88, 192)
+    finally:
+        worker.join(5)
+    assert not worker.is_alive()
+
+
 def test_actual_wait_logger_reports_credit_convoy_and_live_planes(capsys):
     telemetry = SimpleNamespace(lock=threading.RLock(), gauges={
         'projection.native_destination_pull.live.tilted': {

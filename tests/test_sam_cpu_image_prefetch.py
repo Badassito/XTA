@@ -315,8 +315,9 @@ def test_cancelled_async_shell_prefetch_returns_cpu_image_credit(
 
 @pytest.mark.parametrize('view', SHELL_VIEWS, ids=lambda view: view.name)
 @pytest.mark.parametrize('processing', (False, True))
+@pytest.mark.parametrize('physical', (4*GIB, 64*GIB), ids=('synchronous_fallback', 'standalone_overlap'))
 def test_prefetched_shell_matches_canonical_with_full_parent_pool_and_no_gpu(
-        tmp_path, monkeypatch, view, processing):
+        tmp_path, monkeypatch, view, processing, physical):
     monkeypatch.setenv('YOLO_TTA_SAM_RENDER_MAX_BYTES', str(1024**2))
     source = (np.arange(np.prod(SOURCE_SHAPE))*17 % 251).astype(np.uint8).reshape(SOURCE_SHAPE)
     context = context_for(tmp_path, source)
@@ -329,18 +330,18 @@ def test_prefetched_shell_matches_canonical_with_full_parent_pool_and_no_gpu(
         lambda *args: None)
     try:
         with sam_resources.admit_sam_parent_resources(pool, 4*GIB, 'shell-parent',
-                worker_count=1, base_allowance_bytes=4*GIB, headroom_probe=lambda: 64*GIB) as profile:
+                worker_count=1, base_allowance_bytes=4*GIB, headroom_probe=lambda: physical) as profile:
             with context.resource_scope(profile):
                 assert pool.in_use == pool.capacity
                 holder = context._prepare_image_cohort(view, shape, demand(shape, {frame: bbox for frame in frames}))
                 assert holder is not None
-                assert holder.future.result(timeout=10) is not None
+                assert (holder.future.result(timeout=10) is not None) == (physical == 64*GIB)
                 with holder as ref:
                     for frame in frames:
                         expected = expected_canvas(context, view, shape, frame)
                         assert np.max(np.abs(crop_from(ref, frame, bbox).astype(int)-expected[1:-1, 1:-1].astype(int))) <= 1
                     assert live_image_sampling(ref)['backend'] == 'cpu'
-                    assert pool._sam_image_staging_pool.in_use == holder.phase_bytes
+                    assert pool._sam_image_staging_pool.in_use == (holder.phase_bytes if physical == 64*GIB else 0)
                 assert not ref.path.exists()
         assert pool.in_use == pool._sam_image_staging_pool.in_use == 0
     finally:
