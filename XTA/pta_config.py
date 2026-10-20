@@ -59,6 +59,7 @@ class PreprocessingRequest:
     gaussian_smoothing_enabled: bool = False
     gaussian_sigma: float = 3.0
     gaussian_passes: int = 1
+    enable_3d_void_fill: bool = False
 
 
 TileRequest = ResolvedTileGroup
@@ -161,7 +162,7 @@ def resolve_pta_save_request(values: Sequence[str] | str | None) -> PtaSaveReque
 def resolve_preprocessing_options(
     values: Sequence[str] | str | None,
 ) -> PreprocessingRequest:
-    """Resolve the sole PTA preprocessing operation.
+    """Resolve optional native-mask void filling and Gaussian smoothing.
 
     Absence disables smoothing. Once selected, omitted slots use the current
     TTA defaults of sigma 3 and one pass.
@@ -170,10 +171,28 @@ def resolve_preprocessing_options(
     tokens = _token_list(values)
     if not tokens:
         return PreprocessingRequest()
-    if len(tokens) != 1:
-        raise ValueError("--preprocessing accepts gaussian_smoothing at most once")
+    seen: set[str] = set()
+    gaussian_token: Optional[str] = None
+    for raw in tokens:
+        operation = raw.split(":", 1)[0].lower()
+        if operation not in {"3d_void_fill", "gaussian_smoothing"}:
+            raise ValueError(
+                "--preprocessing accepts only 3d_void_fill and "
+                "gaussian_smoothing[:STANDARD_DEVIATION][:SMOOTHING_PASSES]"
+            )
+        if operation in seen:
+            raise ValueError(f"--preprocessing accepts {operation} at most once")
+        seen.add(operation)
+        if operation == "3d_void_fill":
+            if ":" in raw:
+                raise ValueError("--preprocessing 3d_void_fill does not accept parameters")
+        else:
+            gaussian_token = raw
 
-    raw = tokens[0]
+    if gaussian_token is None:
+        return PreprocessingRequest(enable_3d_void_fill=True)
+
+    raw = gaussian_token
     slots = [part.strip() for part in str(raw).split(":")]
     if slots[0].lower() != "gaussian_smoothing":
         raise ValueError(
@@ -202,6 +221,7 @@ def resolve_preprocessing_options(
         gaussian_smoothing_enabled=True,
         gaussian_sigma=float(sigma),
         gaussian_passes=int(passes),
+        enable_3d_void_fill="3d_void_fill" in seen,
     )
 
 
@@ -303,8 +323,9 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         default=None,
         metavar="OPERATION[:PARAMETERS]",
         help=(
-            "Pre-geometry operations. Currently accepts "
-            "gaussian_smoothing[:STANDARD_DEVIATION][:SMOOTHING_PASSES]"
+            "Native-mask operations before geometry: 3d_void_fill, then "
+            "gaussian_smoothing[:STANDARD_DEVIATION][:SMOOTHING_PASSES]; "
+            "each may appear once"
         ),
     )
     parser.add_argument(
@@ -326,6 +347,10 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         choices=("volume", "view", "slice"),
     )
     parser.add_argument("--background_percent", default=1.0, type=float)
+    parser.add_argument(
+        "--fraction", default=1.0, type=float,
+        help="Deterministic fraction of original frame/tile candidates selected before classification and rendering (0 < fraction <= 1)",
+    )
 
     from .tta_augmentation_config import add_augmentation_arguments
     add_augmentation_arguments(parser)
@@ -444,6 +469,8 @@ def resolve_pta_config(args: argparse.Namespace) -> PtaConfig:
         raise ValueError("--enable_spherical requires --imgsz > 0 to define its QSC face patches")
     if not (0.0 <= float(args.background_percent) <= 1.0):
         raise ValueError("--background_percent must be in [0,1]")
+    if not (0.0 < float(args.fraction) <= 1.0):
+        raise ValueError("--fraction must be in (0,1]")
     if args.train_split is not None and not (0.0 <= float(args.train_split) <= 1.0):
         raise ValueError("--train_split must be in [0,1]")
     if not math.isfinite(float(args.augmentation_ratio)) or float(args.augmentation_ratio) < 1.0:

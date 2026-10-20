@@ -30,6 +30,7 @@ def build_runtime_options(config: PtaConfig) -> argparse.Namespace:
         channel_format=[str(config.channel_format.token)],
         force=public.force,
         task=public.task,
+        enable_3d_void_fill=bool(preprocessing.enable_3d_void_fill),
         gaussian_smoothing=(
             float(preprocessing.gaussian_sigma)
             if preprocessing.gaussian_smoothing_enabled
@@ -51,6 +52,7 @@ def build_runtime_options(config: PtaConfig) -> argparse.Namespace:
         train_split=public.train_split,
         split_method=public.split_method,
         background_percent=public.background_percent,
+        fraction=public.fraction,
         augmentation=public.augmentation,
         augmentation_ratio=public.augmentation_ratio,
         augmentation_execution=public.augmentation_execution,

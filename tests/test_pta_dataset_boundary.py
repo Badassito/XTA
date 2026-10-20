@@ -73,6 +73,7 @@ class PtaDatasetBoundaryTests(unittest.TestCase):
         "output_source_identity_text",
         "plan_augmented_versions",
         "refresh_retained_original_split_stats",
+        "select_fraction_candidates",
         "split_round_half_toward_train",
         "stable_digest_rank",
         "withhold_background_overage_after_flips",

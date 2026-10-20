@@ -2094,7 +2094,7 @@ def _main_impl() -> None:
         f'{len(spherical_concrete_views)} Spherical QSC face-patch trajectories; '
         f'{source_frames_per_angle} source frame(s)/--angle, '
         f'{len(inference_views)} independent view-angle variant(s), and '
-        f'{source_frames_per_angle * max(1, len(angles))} total model frame(s) across '
+        f'{sum(int(v.num_slices) for v in inference_views)} total model frame(s) across '
         f'{max(1, len(angles))} TTA angle(s).'
     )
     if azimuthal_concrete_views:

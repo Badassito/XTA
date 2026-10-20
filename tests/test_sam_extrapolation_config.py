@@ -18,7 +18,7 @@ def _resolve(*extra, models=('gpu:detector.engine', 'sam:bundle'), devices=('0',
 
 
 def test_extrapolation_defaults_disable_without_changing_interpolation():
-    args, settings = _resolve(models=('gpu:detector.engine',))
+    args, settings = _resolve('--interpolation_distance', '15', models=('gpu:detector.engine',))
     assert (args.extrapolation_distance, args.extrapolation_walk_back, args.extrapolation_min_radius) == (0, 1, 3.)
     assert settings.enabled and settings.backend == 'sdf'
     assert not settings.extrapolation_enabled and not settings.sam_enabled

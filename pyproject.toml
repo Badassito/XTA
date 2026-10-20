@@ -25,6 +25,7 @@ nvtiff12 = ["nvidia-nvtiff-cu12>=0.8"]
 nvtiff13 = ["nvidia-nvtiff-cu13>=0.8"]
 acceleration = ["deflate>=0.9.0", "isal"]
 pta = ["pynrrd", "albumentations"]
+cleanup = ["scikit-image"]
 lta = ["pynrrd"]
 
 [project.scripts]
@@ -43,10 +44,13 @@ version = {attr = "XTA.__version__"}
 [tool.setuptools.data-files]
 "share/xta" = [
   "ARCHITECTURE.md",
-  "GPT-6-Astra-Ultra_v24.1.6_SLURM.py",
+  "GPT-6-Astra-Ultra_v24.2.0_SLURM.py",
 ]
-"share/xta/docs" = ["docs/sam_interpolation.md", "docs/lta_dynamic_crops.md", "docs/projection_coverage.md"]
+"share/xta/docs" = ["docs/sam_interpolation.md", "docs/lta_dynamic_crops.md", "docs/projection_coverage.md", "docs/slicer_pta_cleanup.md", "docs/pta_fraction.md"]
+"share/xta/tools/slicer" = ["tools/slicer/xta_slicerrc.py", "tools/slicer/xta_upscale_preview.py"]
 "share/xta/tools" = [
+  "tools/xta_native_filter.py",
+  "tools/xta_auto.py",
   "tools/compare_reconciliation.py",
   "tools/export_semantic_logits.py",
   "tools/qualify_semantic_trt.py",

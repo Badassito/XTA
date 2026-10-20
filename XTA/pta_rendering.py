@@ -669,8 +669,8 @@ class RenderPlan:
 
 @dataclass
 class RenderFrameSource:
-    img_full: np.ndarray
-    mask_full: np.ndarray
+    img_full: Optional[np.ndarray]
+    mask_full: Optional[np.ndarray]
     img_canvas: Optional[np.ndarray]
     mask_canvas: Optional[np.ndarray]
     # Canonical direct-to-output tile rasters.  These prevent PTA from
@@ -912,11 +912,13 @@ def render_shared_tile_images(
     )
 
 
-def render_plan_frame_source(*, volume: np.ndarray, mask: np.ndarray, plan: RenderPlan, idx: int, need_canvas: Optional[bool] = None) -> RenderFrameSource:
+def render_plan_frame_source(*, volume: np.ndarray, mask: np.ndarray, plan: RenderPlan, idx: int, need_canvas: Optional[bool] = None, need_full: bool = True) -> RenderFrameSource:
     """Render one center slice and its requested channel context.
 
     Tasks that only feed the full-frame item pass
     ``need_canvas=False`` so no canvas is rendered for them.
+    Tile-only tasks skip the full raster when all tiles have canonical jobs.
+    Legacy canvas tiles still use the combined full/canvas renderer.
 
     Image channels may come from neighboring view slices, but both
     full-frame and tile labels always use the center slice ``idx``.  Native
@@ -926,18 +928,20 @@ def render_plan_frame_source(*, volume: np.ndarray, mask: np.ndarray, plan: Rend
         need_canvas = bool(plan.tile_layout)
     shared_tiles = tuple(tile for tile in plan.tile_layout if tile.shared_job is not None)
     canvas_required = bool(need_canvas) and len(shared_tiles) != len(plan.tile_layout)
-    img_full, img_canvas = render_channel_formatted_images(
-        volume=volume,
-        plan=plan,
-        idx=int(idx),
-        need_canvas=bool(canvas_required),
-    )
-    mask_full, mask_canvas = render_plan_frame_mask_source(
-        mask=mask,
-        plan=plan,
-        idx=int(idx),
-        need_canvas=bool(canvas_required),
-    )
+    img_full = img_canvas = mask_full = mask_canvas = None
+    if need_full or canvas_required:
+        img_full, img_canvas = render_channel_formatted_images(
+            volume=volume,
+            plan=plan,
+            idx=int(idx),
+            need_canvas=bool(canvas_required),
+        )
+        mask_full, mask_canvas = render_plan_frame_mask_source(
+            mask=mask,
+            plan=plan,
+            idx=int(idx),
+            need_canvas=bool(canvas_required),
+        )
     tile_arrays: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
     for tile in shared_tiles:
         assert plan.view.shared_view is not None and tile.shared_job is not None

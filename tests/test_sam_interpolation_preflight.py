@@ -136,11 +136,12 @@ def test_invalid_canvas_geometry_is_rejected_before_cache_allocation(tmp_path, s
 
 @pytest.mark.parametrize('extra, expected_fragment', (
     (['--interpolation_backend', 'both'], 'invalid choice'),
-    (['--interpolation_backend', 'sam'], 'sam:PATH'),
+    (['--interpolation_backend', 'sam', '--interpolation_distance', '15'], 'sam:PATH'),
     (['--model', 'sam:bundle'], 'detector entry'),
     (['--model', 'cpu:openvino', 'sam:bundle', 'sam:duplicate'], 'duplicate sam:'),
     (['--model', 'cpu:openvino', 'sam:'], 'tagged'),
-    (['--model', 'cpu:openvino', 'sam:bundle', '--interpolation_backend', 'sam'], '--sam_device'),
+    (['--model', 'cpu:openvino', 'sam:bundle', '--interpolation_backend', 'sam',
+      '--interpolation_distance', '15'], '--sam_device'),
 ))
 def test_invalid_sam_role_selection_never_dispatches_runtime(extra, expected_fragment):
     runtime = types.ModuleType('XTA.tta_mode')
@@ -172,7 +173,8 @@ def test_cpu_detector_and_gpu_sam_take_the_real_cli_resolution_path():
     arguments = [
         '--input', 'input.mkv', '--model', r'cpu:C:\Detector Models\model.xml',
         r'sam:C:\SAM Bundles\sam:3.1', '--device', 'cpu', '--sam_device', '2,0',
-        '--interpolation_backend', 'sam', '--enable_cartesian', 'transverse', '--angle', '0',
+        '--interpolation_backend', 'sam', '--interpolation_distance', '15',
+        '--enable_cartesian', 'transverse', '--angle', '0',
     ]
     runtime = types.ModuleType('XTA.tta_mode')
     runtime.run = mock.Mock()
@@ -225,7 +227,8 @@ def test_pipeline_cpu_detector_gpu_sam_resolves_sam_as_a_separate_bundle(tmp_pat
     bundle = tmp_path / 'sam bundle:3.1'
     arguments = [
         'tta', '--input', str(source), '--device', 'cpu', '--model', f'cpu:{detector}',
-        f'sam:{bundle}', '--interpolation_backend', 'sam', '--sam_device', '0',
+        f'sam:{bundle}', '--interpolation_backend', 'sam', '--interpolation_distance', '15',
+        '--sam_device', '0',
     ]
     with mock.patch.object(sys, 'argv', arguments):
         with mock.patch.object(pipeline, 'initialize_runtime_observability'):

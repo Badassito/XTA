@@ -12,7 +12,8 @@ from XTA.config import (activate_sam_crop_mode, build_argparser, resolve_backend
 
 def resolve(arguments=()):
     args = build_argparser().parse_args(['--input', 'source.mkv', '--device', '0',
-        '--model', 'gpu:detector.engine', 'sam:bundle', '--interpolation_backend', 'sam', *arguments])
+        '--model', 'gpu:detector.engine', 'sam:bundle', '--interpolation_backend', 'sam',
+        '--interpolation_distance', '15', *arguments])
     return resolve_interpolation_settings(args, resolve_backend_models(args.model),
         resolve_backend_devices(args.device))
 
@@ -39,7 +40,8 @@ def test_invalid_active_mode_fails_before_runtime(monkeypatch, mode):
     with mock.patch('XTA.tta_mode.run') as runtime:
         with pytest.raises(SystemExit):
             cli._run_tta(['--input', 'source.mkv', '--device', '0', '--model',
-                'gpu:detector.engine', 'sam:bundle', '--interpolation_backend', 'sam'])
+                'gpu:detector.engine', 'sam:bundle', '--interpolation_backend', 'sam',
+                '--interpolation_distance', '15'])
         runtime.assert_not_called()
 
 
@@ -71,7 +73,8 @@ def test_cli_preflight_and_runtime_share_one_environment_snapshot(monkeypatch):
         observed.append(resolve().sam_crop_mode)
     with mock.patch('XTA.tta_mode.run', side_effect=run):
         cli._run_tta(['--input', 'source.mkv', '--device', '0', '--model',
-            'gpu:detector.engine', 'sam:bundle', '--interpolation_backend', 'sam'])
+            'gpu:detector.engine', 'sam:bundle', '--interpolation_backend', 'sam',
+            '--interpolation_distance', '15'])
     assert observed == ['tiled']
     assert resolve_sam_crop_mode() == 'whole'
 

@@ -16,7 +16,8 @@ tile observations. Detector angle augmentation is inverted before accumulation,
 so SAM uses the canonical angle-zero canvas and retains the original detector
 angle as provenance. LTA remains Transverse-only; sharing its tracker does not
 extend LTA's supported views. SDF retains its existing iterative passes and layer
-decomposition. `--interpolation_distance 0` disables interpolation. SAM assets
+decomposition. Interpolation is disabled by default (`--interpolation_distance 0`);
+set a positive distance to enable it. SAM assets
 are initialized only when SAM interpolation or extrapolation is active.
 
 Here, a native view means the active detector/working-view canvas. It
@@ -134,7 +135,7 @@ For example, add SAM extrapolation after SDF interpolation:
 ```text
 python -m XTA --mode tta --input /data/volume.mkv --output /data/tails \
   --device 0 --model gpu:/models/detector.engine sam:/models/sam_bundle \
-  --enable_cartesian transverse --interpolation_backend sdf \
+  --enable_cartesian transverse --interpolation_backend sdf --interpolation_distance 15 \
   --extrapolation_distance 5 --extrapolation_walk_back 1 --extrapolation_min_radius 3
 ```
 
@@ -170,8 +171,13 @@ records live `projection.component_queue` occupancy, working/source credit,
 admission waiters and backfill counts, including in partial captures. No
 environment-variable override is needed.
 
-Selected upright Spherical SAM masks whose stored bounding boxes leave unused
-native canvas use an encoded CPU input adapter. It reads
+Selected upright Spherical SAM masks use the established CUDA-capable projection
+route automatically when CUDA is available. This restores a temporary native
+uint8 input and retains the existing GPU admission, compact output, preflight,
+and CPU-to-CUDA promotion behavior. An unset GPU flag no longer pins these
+publications to the CPU after tracker work releases the GPUs.
+When CUDA is disabled or unavailable, masks whose stored bounding boxes leave
+unused native canvas use an encoded CPU input adapter. It reads
 raw or packed mask bits through the existing geometry kernels and streams bounded output
 planes, without restoring a full native uint8 volume. Existing geometric bounds
 skip proven-empty planes where supported. All Radial orientations, including
@@ -180,7 +186,9 @@ checks found the encoded implementation failed to scale across workers. Tilted
 Spherical views also retain the established route pending equivalent performance
 qualification. Encoded Radial remains available for direct qualification only.
 Full bounding-box coverage or an explicit `YOLO_TTA_GPU_SPHERICAL_BACKPROJECT=1`
-also selects the established Spherical route. Existing family GPU flags still
+also selects the established Spherical route, preserving the explicit flag's
+previous behavior. `YOLO_TTA_GPU_SPHERICAL_BACKPROJECT=0` selects CPU processing.
+Existing family GPU flags still
 control GPU admission on the restored routes. The ordinary per-job
 reservation remains conservative enough for fallback. Only CPU capability or
 workspace refusal before publication can fall back; malformed stores and
@@ -297,12 +305,14 @@ the flag is absent. A CPU-only detector must specify a SAM CUDA device.
 ```text
 python -m XTA --mode tta --input /data/volume.mkv --output /data/sam-run \
   --device 0 --model gpu:/models/detector.engine sam:/models/sam_bundle \
-  --enable_cartesian transverse --angle 0 --interpolation_backend sam --save nrrd summary
+  --enable_cartesian transverse --angle 0 --interpolation_backend sam \
+  --interpolation_distance 15 --save nrrd summary
 
 python -m XTA --mode tta --input /data/volume.mkv --output /data/cpu-sam-run \
   --device cpu --sam_device 0 \
   --model cpu:/models/openvino sam:/models/sam_bundle \
-  --enable_cartesian transverse --angle 0 --interpolation_backend sam --save nrrd summary
+  --enable_cartesian transverse --angle 0 --interpolation_backend sam \
+  --interpolation_distance 15 --save nrrd summary
 ```
 
 These are argument examples; substitute verified detector and SAM assets and
@@ -1192,7 +1202,7 @@ pixels; it is not an input-video pixel measurement after a changed canvas scale.
 
 | Flag | Default | SDF | SAM |
 | --- | --- | --- | --- |
-| `--interpolation_distance` | `15` | Maximum endpoint search frame distance; zero disables interpolation | Same search bound and disable behavior |
+| `--interpolation_distance` | `0` | Maximum endpoint search frame distance; zero disables interpolation | Same search bound and disable behavior |
 | `--interpolation_walk_back` | `1` | Additional source slices before an endpoint; existing SDF layer layout | Additional original detector-observed source slices; zero still keeps endpoint bridges |
 | `--interpolation_candidates` | `1` | Consider up to the Nth nearest connection for an endpoint projection | Same candidate search budget; relevant observed family continuations also inform the bounded group |
 | `--interpolation_passes` | `1` | Later passes may use the previous interpolated result | Maximum distinct observed-anchor planning rounds; stop when exhausted and record skipped rounds |

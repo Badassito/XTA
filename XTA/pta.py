@@ -16,7 +16,7 @@ Core behavior:
     binary mask volume in RAM before reslicing.
   - Classifies inputs as Fully Labeled, Partially Labeled, or Unlabeled per the
     inherited volume rules.
-  - Applies Gaussian 3D mask smoothing when enabled for fully labeled volumes.
+  - Optionally fills enclosed 3D mask voids, then applies Gaussian smoothing.
   - Cubic-resizes complete 3D volumes before view extraction.
   - Emits single-channel gray, triplicated RGB, or custom neighboring-slice
     channel stacks for active transverse, sagittal, coronal, azimuthal,
@@ -100,6 +100,7 @@ from . import media as shared_media
 from .config import SCRIPT_BASENAME, SCRIPT_VERSION
 from .runtime import runtime_telemetry, runtime_telemetry_phase, runtime_trace_event
 from .gaussian import binary_gaussian_pass
+from .topology import fill_3d_voids_inplace_streaming
 from .unification.manifest import write_json_manifest
 from .unification.contracts import RasterPlan
 from .pta_augmentation import (
@@ -145,6 +146,7 @@ from .pta_dataset import (
     refresh_retained_original_split_stats,
     split_round_half_toward_train,
     stable_digest_rank,
+    select_fraction_candidates,
     withhold_background_overage_after_flips,
 )
 from .pta_publication import (
@@ -2336,6 +2338,7 @@ class PreparedVolume:
     voxel_final: Optional[int]
     foreground_preservation_stats: Dict[str, int]
     semantic_foreground: bool = False
+    void_fill_stats: Optional[Dict[str, int]] = None
     semantic_coverage_for_render: Optional[np.ndarray] = None
     # Blocks backing volume_for_render/mask_for_render for the
     # process pool, plus every block this volume owns (released at finalize).
@@ -2372,6 +2375,9 @@ class VolumeSummaryRecord:
     augmented_candidates_planned: int = 0
     augmented_candidates_retained: int = 0
     candidates_written: int = 0
+    fraction: float = 1.0
+    candidates_before_fraction: int = 0
+    void_fill_stats: Optional[Dict[str, int]] = None
 
 
 def _v18_view_manifest_record(view: ViewInfo) -> Dict[str, object]:
@@ -2553,8 +2559,11 @@ def write_v18_pta_manifest(
             "views": [_v18_view_manifest_record(view) for view in record.views],
             "render_plans": [dict(stats) for stats in record.render_stats],
             "gaussian_preprocessing": [dict(stats) for stats in record.smoothing_stats],
+            "3d_void_fill_preprocessing": record.void_fill_stats,
             "foreground_anchor_repair": dict(record.foreground_preservation_stats),
             "candidates_total": int(record.candidates_total),
+            "fraction": float(record.fraction),
+            "candidates_before_fraction": int(record.candidates_before_fraction),
             "candidates_retained": int(record.candidates_retained),
             "candidates_processed": int(record.candidates_written),
         }
@@ -2597,6 +2606,12 @@ def write_v18_pta_manifest(
         },
         "resolved_configuration": {
             "accepted_mode_arguments": dict(vars(config.args)),
+            "fraction_sampling": {
+                "fraction": float(getattr(args, "fraction", 1.0)),
+                "method": "PTA-fraction-v1 deterministic identity hash threshold",
+                "stage": "original frame/tile metadata before classification, split and augmentation",
+                "count_is_approximate": True,
+            },
             "input_directories": [str(root) for root in dict.fromkeys(spec.input_dir for spec in specs)],
             "imgsz": int(config.args.imgsz),
             "requested_output_format": str(config.requested_output_format),
@@ -2641,6 +2656,13 @@ def write_v18_pta_manifest(
                 for tile in tile_configs
             ],
             "preprocessing": {
+                "3d_void_fill": bool(config.preprocessing.enable_3d_void_fill),
+                "execution_order": [
+                    operation for operation, enabled in (
+                        ("3d_void_fill", config.preprocessing.enable_3d_void_fill),
+                        ("gaussian_smoothing", config.preprocessing.gaussian_smoothing_enabled),
+                    ) if enabled
+                ],
                 "gaussian_smoothing": bool(config.preprocessing.gaussian_smoothing_enabled),
                 "sigma": float(config.preprocessing.gaussian_sigma),
                 "passes": int(config.preprocessing.gaussian_passes),
@@ -2765,7 +2787,7 @@ def write_v18_voxel_volume_report(
                 "target": "categorical_ground_truth",
                 "initial_stage": "rasterized_source_ground_truth_before_preprocessing",
                 "initial_foreground_voxel_count": record.voxel_initial,
-                "final_stage": "after_gaussian_preprocessing_before_cube_resize_and_anchor_repair",
+                "final_stage": "after_native_mask_preprocessing_before_cube_resize_and_anchor_repair",
                 "final_foreground_voxel_count": record.voxel_final,
                 "available": record.voxel_initial is not None,
             }
@@ -3405,6 +3427,35 @@ def prepare_loaded_source(
     if write_side_effects and label_enabled and bool(args.save_nrrd):
         nrrd_paths.append(write_nrrd(mask, out_dir / "nrrds" / f"{src.stem}_Pass_0.nrrd"))
 
+    void_fill_stats: Optional[Dict[str, int]] = None
+    if bool(getattr(args, "enable_3d_void_fill", False)):
+        if label_enabled and effective_volume_class == "fully_labeled" and not source_encoded_gaps:
+            connectivity_text = os.environ.get("YOLO_TTA_VOIDFILL_CONNECTIVITY", "").strip()
+            try:
+                connectivity = int(connectivity_text) if connectivity_text else 6
+            except ValueError:
+                connectivity = 6  # Match the shared helper's legacy invalid-text fallback.
+            foreground_before = int(np.count_nonzero(mask))
+            fill_3d_voids_inplace_streaming(
+                mask, out_dir / ".v18_work" / src.stem / "void_fill",
+                connectivity=connectivity,
+            )
+            foreground_after = int(np.count_nonzero(mask))
+            void_fill_stats = {
+                "background_connectivity": connectivity,
+                "foreground_before": foreground_before,
+                "foreground_after": foreground_after,
+                "added_voxels": foreground_after - foreground_before,
+            }
+            if write_side_effects and bool(args.save_nrrd):
+                nrrd_paths.append(write_nrrd(mask, out_dir / "nrrds" / f"{src.stem}_VoidFill.nrrd"))
+        elif not label_enabled:
+            warnings.add("3d_void_fill_disabled_for_unlabeled_volume", f"{src.stem}: Unlabeled volumes disable label operations")
+        elif source_encoded_gaps:
+            warnings.add("3d_void_fill_disabled_for_encoded_gaps", f"{src.stem}: numeric source-index gaps do not define adjacent 3D samples")
+        else:
+            warnings.add("3d_void_fill_disabled_for_partial_volume", f"{src.stem}: Partial volumes disable 3D label transformations unless --force is supplied")
+
     smoothing_stats: List[Dict[str, int | float]] = []
     gaussian_requested = float(args.gaussian_smoothing) > 0.0 and int(args.gaussian_smoothing_passes) > 0
     if (
@@ -3633,6 +3684,7 @@ def prepare_loaded_source(
         views=list(views),
         plans=list(plans),
         smoothing_stats=smoothing_stats,
+        void_fill_stats=void_fill_stats,
         nrrd_paths=nrrd_paths,
         voxel_initial=voxel_initial,
         voxel_final=voxel_final,
@@ -3835,6 +3887,7 @@ def classify_original_foregrounds_for_volume(
     *,
     workers: int,
     warnings: Optional[WarningLog] = None,
+    selected_candidates: Optional[Sequence[OutputCandidate]] = None,
 ) -> Dict[Tuple[str, int, str, int], bool]:
     """Classify copy-0 (original) frames/tiles as foreground/background.
 
@@ -3847,6 +3900,26 @@ def classify_original_foregrounds_for_volume(
     foregrounds: Dict[Tuple[str, int, str, int], bool] = {}
     if not prep.label_enabled:
         return foregrounds
+    selected_items = None
+    if selected_candidates is not None:
+        selected_items = defaultdict(set)
+        for candidate in selected_candidates:
+            selected_items[(candidate.parent_view_tag, int(candidate.frame_idx))].add(candidate.item_key)
+        if not selected_items:
+            return foregrounds
+
+    def classification_plan(plan_index: int, frame_idx: int) -> RenderPlan:
+        plan = prep.plans[int(plan_index)]
+        if selected_items is None:
+            return plan
+        items = selected_items[(plan.tag, int(frame_idx))]
+        return replace(plan, tile_layout=tuple(tile for tile in plan.tile_layout if tile.tile_tag in items))
+
+    def selected_results(values):
+        if selected_items is None:
+            return values
+        return {key: value for key, value in values.items() if key[2] in selected_items[(key[0], key[1])]}
+
     # The source can be annotated but entirely background. Check the resident
     # mask once before scheduling potentially hundreds of thousands of view
     # projections. Foreground and coverage are checked independently: their
@@ -3856,13 +3929,18 @@ def classify_original_foregrounds_for_volume(
     all_empty = not bool(np.any(prep.mask_for_render))
     if not all_empty and coverage_volume is not None:
         all_empty = not bool(np.any(coverage_volume))
-    jobs = list(iter_render_source_frame_jobs_round_robin(prep.plans))
+    if selected_items is None:
+        jobs = list(iter_render_source_frame_jobs_round_robin(prep.plans))
+    else:
+        plan_indices = {plan.tag: index for index, plan in enumerate(prep.plans)}
+        jobs = [(plan_indices[tag], frame_idx) for tag, frame_idx in selected_items]
     if not jobs:
         return foregrounds
     if all_empty:
         for plan_index, idx in jobs:
-            plan = prep.plans[int(plan_index)]
-            foregrounds[(plan.tag, int(idx), "full", 0)] = False
+            plan = classification_plan(plan_index, idx)
+            if selected_items is None or "full" in selected_items[(plan.tag, int(idx))]:
+                foregrounds[(plan.tag, int(idx), "full", 0)] = False
             for tile in plan.tile_layout:
                 foregrounds[(plan.tag, int(idx), tile.tile_tag, 0)] = False
         if warnings is not None:
@@ -3876,7 +3954,7 @@ def classify_original_foregrounds_for_volume(
             f"source_frame_jobs={len(jobs)}, native_planes=0, sample_queries=0",
             flush=True,
         )
-        return foregrounds
+        return selected_results(foregrounds)
     merge_lock = threading.Lock()
     execution_counts: Dict[str, Counter[str]] = defaultdict(Counter)
     semantic_fast_enabled = bool(
@@ -3887,19 +3965,25 @@ def classify_original_foregrounds_for_volume(
 
     geometry_jobs: List[Tuple[int, int]] = []
     dense_jobs: List[Tuple[int, int]] = []
-    # Once Gaussian smoothing has changed mask support, polygon-only geometry
+    # Once preprocessing has changed mask support, polygon-only geometry
     # is no longer authoritative for the background cap.  Use the transformed
     # dense mask in that case so --background_percent retains its documented behavior.
     use_yolo_geometry = (
         prep.src.label_source == "yolo"
         and bool(prep.src.yolo_polygons_by_frame or prep.src.labels_by_frame)
         and not prep.smoothing_stats
+        and not getattr(prep, "void_fill_stats", None)
         and not prep.semantic_foreground
     )
     if prep.src.label_source == "yolo" and prep.smoothing_stats and warnings is not None:
         warnings.add(
             "label_geometry_fallback_after_smoothing",
             f"{prep.src.stem}: transformed dense-mask classification preserves the background cap after Gaussian smoothing",
+        )
+    if prep.src.label_source == "yolo" and getattr(prep, "void_fill_stats", None) and warnings is not None:
+        warnings.add(
+            "label_geometry_fallback_after_void_fill",
+            f"{prep.src.stem}: transformed dense-mask classification preserves the background cap after 3D void filling",
         )
     for plan_idx, idx in jobs:
         plan = prep.plans[int(plan_idx)]
@@ -3914,10 +3998,10 @@ def classify_original_foregrounds_for_volume(
     dense_jobs.sort(key=lambda job: (int(job[0]), int(job[1])))
     planned_counts: Dict[str, Counter[str]] = defaultdict(Counter)
     for plan_idx, _idx in dense_jobs:
-        plan = prep.plans[int(plan_idx)]
+        plan = classification_plan(plan_idx, _idx)
         counts = planned_counts[str(plan.view.family)]
         counts["jobs"] += 1
-        counts["queries"] += 1 + len(plan.tile_layout)
+        counts["queries"] += int(selected_items is None or "full" in selected_items[(plan.tag, int(_idx))]) + len(plan.tile_layout)
     if prep.semantic_foreground:
         print(
             f"{prep.src.stem}: semantic foreground classification plan: "
@@ -3939,9 +4023,10 @@ def classify_original_foregrounds_for_volume(
         for stats in prep.smoothing_stats
     )
     for plan_idx, idx in geometry_jobs:
-        plan = prep.plans[int(plan_idx)]
+        plan = classification_plan(plan_idx, idx)
         polygons = _transverse_polygons_for_processed_frame(prep, int(idx))
-        foregrounds[(plan.tag, int(idx), "full", 0)] = bool(polygons)
+        if selected_items is None or "full" in selected_items[(plan.tag, int(idx))]:
+            foregrounds[(plan.tag, int(idx), "full", 0)] = bool(polygons)
         for tile in plan.tile_layout:
             foregrounds[(plan.tag, int(idx), tile.tile_tag, 0)] = _polygon_intersects_canvas_tile(
                 polygons,
@@ -3958,8 +4043,9 @@ def classify_original_foregrounds_for_volume(
 
     def _classify_frame(job_idx: int) -> None:
         plan_idx, idx = dense_jobs[int(job_idx)]
-        plan = prep.plans[int(plan_idx)]
+        plan = classification_plan(plan_idx, idx)
         family = str(plan.view.family)
+        need_full = selected_items is None or "full" in selected_items[(plan.tag, int(idx))]
         if semantic_fast_enabled:
             native_metrics: Dict[str, int] = {}
             fast = classify_semantic_plan_frame(
@@ -3968,9 +4054,10 @@ def classify_original_foregrounds_for_volume(
                 plan,
                 int(idx),
                 metrics=native_metrics,
+                include_full=need_full,
             )
             if fast is not None:
-                expected_keys = {"full", *(str(tile.tile_tag) for tile in plan.tile_layout)}
+                expected_keys = ({"full"} if need_full else set()) | {str(tile.tile_tag) for tile in plan.tile_layout}
                 if set(fast) != expected_keys:
                     raise RuntimeError(
                         f"Semantic classifier returned {sorted(fast)} for {plan.tag}; "
@@ -3981,7 +4068,7 @@ def classify_original_foregrounds_for_volume(
                     for item_key, value in fast.items()
                 }
                 with merge_lock:
-                    foregrounds.update(local_fast)
+                    foregrounds.update(selected_results(local_fast))
                     counts = execution_counts[family]
                     counts["fast_jobs"] += 1
                     counts["native_planes"] += int(native_metrics.get("native_planes", 0))
@@ -3994,15 +4081,17 @@ def classify_original_foregrounds_for_volume(
             and int(plan.aff.out_h) == int(plan.aff.canvas_h)
             and np.array_equal(plan.aff.M_out_to_src, plan.aff.M_canvas_to_src)
         )
-        mask_full, mask_canvas = render_plan_frame_mask_source(
-            mask=prep.mask_for_render, plan=plan, idx=int(idx),
-            need_canvas=bool(canvas_tiles) and not canvas_same_as_full,
-        )
+        mask_full = mask_canvas = None
+        if need_full or canvas_tiles:
+            mask_full, mask_canvas = render_plan_frame_mask_source(
+                mask=prep.mask_for_render, plan=plan, idx=int(idx),
+                need_canvas=bool(canvas_tiles) and not canvas_same_as_full,
+            )
         if canvas_same_as_full:
             mask_canvas = mask_full
         coverage_full: Optional[np.ndarray] = None
         coverage_canvas: Optional[np.ndarray] = None
-        if prep.semantic_foreground and prep.semantic_coverage_for_render is not None:
+        if (need_full or canvas_tiles) and prep.semantic_foreground and prep.semantic_coverage_for_render is not None:
             coverage_full, coverage_canvas = render_plan_frame_mask_source(
                 mask=prep.semantic_coverage_for_render,
                 plan=plan,
@@ -4016,7 +4105,7 @@ def classify_original_foregrounds_for_volume(
                 np.any(mask_full if coverage_full is None else np.logical_and(mask_full, coverage_full))
                 if prep.semantic_foreground else mask_has_yolo_polygon(mask_full)
             ),
-        }
+        } if need_full else {}
         if plan.tile_layout:
             for tile in plan.tile_layout:
                 if tile.shared_job is not None and plan.view.shared_view is not None:
@@ -4051,7 +4140,7 @@ def classify_original_foregrounds_for_volume(
                     np.any(tile_mask_out) if prep.semantic_foreground else mask_has_yolo_polygon(tile_mask_out)
                 )
         with merge_lock:
-            foregrounds.update(local)
+            foregrounds.update(selected_results(local))
             counts = execution_counts[family]
             counts["fallback_jobs"] += 1
             counts["fallback_queries"] += len(local)
@@ -4074,12 +4163,22 @@ def classify_original_foregrounds_for_volume(
             print("PTA semantic classification: " + message, flush=True)
             if warnings is not None:
                 warnings.add("semantic_classification_execution", message)
-    return foregrounds
+    return selected_results(foregrounds)
 
 
-def enumerate_candidates_for_volume(prep: PreparedVolume, foregrounds: Optional[Dict[Tuple[str, int, str, int], bool]] = None) -> List[OutputCandidate]:
+def enumerate_candidates_for_volume(
+    prep: PreparedVolume,
+    foregrounds: Optional[Dict[Tuple[str, int, str, int], bool]] = None,
+    *, fraction: float = 1.0,
+) -> List[OutputCandidate]:
+    return select_fraction_candidates(_iter_candidates_for_volume(prep, foregrounds), fraction=fraction)
+
+
+def _iter_candidates_for_volume(
+    prep: PreparedVolume,
+    foregrounds: Optional[Dict[Tuple[str, int, str, int], bool]],
+) -> Iterator[OutputCandidate]:
     fg_map = foregrounds or {}
-    candidates: List[OutputCandidate] = []
 
     def _fg(plan_tag: str, frame_idx: int, item_key: str) -> bool:
         if not prep.label_enabled:
@@ -4101,7 +4200,7 @@ def enumerate_candidates_for_volume(prep: PreparedVolume, foregrounds: Optional[
     # Iterate only explicitly eligible centers.
     for plan in prep.plans:
         for frame_idx in render_plan_frame_indices(plan):
-            candidates.append(OutputCandidate(
+            yield OutputCandidate(
                 order=-1,
                 volume_name=prep.src.stem,
                 parent_view_tag=plan.tag,
@@ -4119,7 +4218,7 @@ def enumerate_candidates_for_volume(prep: PreparedVolume, foregrounds: Optional[
                 channel_reverse=bool(plan.channel_variant.reverse),
                 channel_offsets=tuple(int(x) for x in plan.channel_variant.offsets),
                 foreground=_fg(plan.tag, frame_idx, "full"),
-            ))
+            )
 
     # Canonical order part 2: tile variants of each view sorted by tile config;
     # inside each frame, tiles are row-major because build_render_plan creates
@@ -4146,7 +4245,7 @@ def enumerate_candidates_for_volume(prep: PreparedVolume, foregrounds: Optional[
             tiles = sorted(by_cfg[cfg_id], key=lambda t: (int(t.y), int(t.x), t.tile_tag))
             for frame_idx in render_plan_frame_indices(plan):
                 for tile in tiles:
-                    candidates.append(OutputCandidate(
+                    yield OutputCandidate(
                         order=-1,
                         volume_name=prep.src.stem,
                         parent_view_tag=plan.tag,
@@ -4171,8 +4270,7 @@ def enumerate_candidates_for_volume(prep: PreparedVolume, foregrounds: Optional[
                         tile_stride=int(tile.cfg.tile_stride),
                         tile_x=int(tile.x),
                         tile_y=int(tile.y),
-                    ))
-    return candidates
+                    )
 
 
 def validate_foreground_transverse_candidate_invariant(
@@ -4733,7 +4831,8 @@ def write_pta_summary(
     lines.append("  - Split units are assigned by stable SHA-256 rank before background filtering; train/val enforce independent background caps so canonical validation-tail backgrounds are not preferentially removed.")
     lines.append("  - Within each subset, every unique-source (original) background is admitted up to the full B_max before any augmented duplicate; remaining capacity is filled breadth-first across source identities.")
     lines.append("  - --background_percent is enforced per volume as a maximum; no dataset-wide classification barrier exists and outputs stream from the first volume onward.")
-    lines.append("  - Complete labeled volumes preserve at least the input count of foreground transverse slices through smoothing/cubic resize; --background_percent continues to govern background retention without a C1 override.")
+    lines.append("  - Complete labeled volumes preserve foreground transverse slices through preprocessing; --fraction intentionally samples outputs before classification, splitting, background filtering and offline copies.")
+    lines.append("  - Fraction selection is deterministic per original frame/tile identity, approximate in count, and independent for each full frame and tile. Full-volume diagnostics are unaffected.")
     lines.append("  - When required for filtering or offline copies, foreground classification runs on copy-0 originals only. Semantic publication with unrestricted background retention and no offline copies skips that classification. Transverse YOLO candidates otherwise use predecoded polygon/ROI geometry; NRRD and general resliced views retain mask-only rendering.")
     lines.append("  - Source-frame scheduling is grouped and deterministic, while built-in view, affine, tile, and categorical rendering are delegated to the shared TTA geometry module.")
     lines.append("  - CPU policies use the persistent CPU pool. A build_gpu_augmentation policy uses one persistent process per selected CUDA GPU; tile resize and deterministic replay batches execute on that GPU, while fused geometry/pointwise behavior is owned by the external policy.")
@@ -4773,7 +4872,10 @@ def write_pta_summary(
         lines.append("    foreground_transverse_preservation:")
         lines.append(f"      input_foreground_slices: {int(rec.foreground_preservation_stats.get('input_foreground_transverse_slices', 0))}")
         lines.append(f"      guaranteed_after_preprocessing: {int(rec.foreground_preservation_stats.get('guaranteed_output_foreground_transverse_slices', 0))}")
-        if int(rec.foreground_preservation_stats.get("classification_skipped", 0)):
+        if rec.fraction < 1.0:
+            lines.append("      classified_output_slices: not checked for full retention (--fraction)")
+            lines.append("      retained_output_slices: intentionally sampled (--fraction)")
+        elif int(rec.foreground_preservation_stats.get("classification_skipped", 0)):
             if int(rec.foreground_preservation_stats.get("full_transverse_verified", 0)):
                 lines.append(
                     "      classified_output_slices: "
@@ -4794,6 +4896,8 @@ def write_pta_summary(
         lines.append(f"      source_polygon_anchor_seeds: {int(rec.foreground_preservation_stats.get('source_polygon_anchor_seeds', 0))}")
         lines.append(f"      smoothing_anchor_repairs: {int(rec.foreground_preservation_stats.get('smoothing_anchor_repairs', 0))}")
         lines.append(f"      processed_anchor_repairs: {int(rec.foreground_preservation_stats.get('processed_anchor_repairs', 0))}")
+        lines.append(f"    fraction: {rec.fraction:g}")
+        lines.append(f"    original_candidates_before_fraction: {int(rec.candidates_before_fraction)}")
         lines.append(f"    original_candidates_total_before_filtering: {int(rec.candidates_total)}")
         lines.append(f"    original_candidates_retained_after_filtering: {int(rec.candidates_retained)}")
         lines.append(f"    augmented_candidates_planned: {int(rec.augmented_candidates_planned)}")
@@ -4804,7 +4908,9 @@ def write_pta_summary(
             if rec.voxel_initial is not None:
                 lines.append(f"      initial_rasterized_transverse_mask: {int(rec.voxel_initial)}")
             if rec.voxel_final is not None:
-                lines.append(f"      final_mask_after_gaussian_smoothing: {int(rec.voxel_final)}")
+                lines.append(f"      final_mask_after_native_preprocessing: {int(rec.voxel_final)}")
+        if rec.void_fill_stats is not None:
+            lines.append(f"    3d_void_fill: {rec.void_fill_stats}")
         if rec.smoothing_stats:
             lines.append("    gaussian_smoothing:")
             for st in rec.smoothing_stats:
@@ -5089,6 +5195,8 @@ def main(
         raise ValueError("--jpeg_quality must be between 1 and 100")
     if not (0.0 <= float(args.background_percent) <= 1.0):
         raise ValueError("--background_percent must be in [0.0, 1.0]")
+    if not (0.0 < float(getattr(args, "fraction", 1.0)) <= 1.0):
+        raise ValueError("--fraction must be in (0,1]")
     if not math.isfinite(float(args.augmentation_ratio)) or float(args.augmentation_ratio) < 1.0:
         raise ValueError("--augmentation_ratio must be finite and >= 1.0; the ratio includes the original version")
     if float(args.augmentation_ratio) > 1.0 and not args.augmentation:
@@ -5305,6 +5413,7 @@ def main(
         volume_split_by_stem = assign_volume_split_by_stem(specs, train_split=float(train_split))
 
     background_filter_requested = float(args.background_percent) < 1.0
+    fraction = float(getattr(args, "fraction", 1.0))
     dataset_publication_selected = bool(
         getattr(args, "save_images", True) or getattr(args, "save_labels", True)
         or getattr(args, "save_binary", False)
@@ -5498,6 +5607,15 @@ def main(
                 allocator=volume_allocator,
             )
 
+            cands = (enumerate_candidates_for_volume(prep, fraction=fraction)
+                     if dataset_publication_selected else [])
+            candidates_before_fraction = (sum(
+                len(render_plan_frame_indices(plan)) * (1 + len(plan.tile_layout))
+                for plan in prep.plans
+            ) if dataset_publication_selected and fraction < 1.0 else len(cands))
+            if fraction < 1.0 and dataset_publication_selected:
+                vol_warnings.add("fraction_sampling", f"{prep.src.stem}: selected {len(cands)}/{candidates_before_fraction} original frame/tile candidates before classification (--fraction {fraction:g})")
+                print(f"{prep.src.stem}: fraction selection {len(cands)}/{candidates_before_fraction} candidates before classification/rendering", flush=True)
             foregrounds: Optional[Dict[Tuple[str, int, str, int], bool]] = None
             semantic_classification_skipped = bool(
                 prep.label_enabled
@@ -5517,7 +5635,8 @@ def main(
                 # also need source truth when the background cap is unrestricted.
                 if semantic_classification_skipped:
                     prep.foreground_preservation_stats["classification_skipped"] = 1
-                    foregrounds = classify_semantic_full_transverse_for_preservation(prep)
+                    foregrounds = (classify_semantic_full_transverse_for_preservation(prep)
+                                   if fraction == 1.0 else None)
                     semantic_transverse_verified = bool(foregrounds)
                     if semantic_transverse_verified:
                         prep.foreground_preservation_stats["full_transverse_verified"] = 1
@@ -5538,9 +5657,15 @@ def main(
                         prep,
                         workers=phase_workers,
                         warnings=vol_warnings,
+                        selected_candidates=cands if fraction < 1.0 else None,
                     )
-                cands = enumerate_candidates_for_volume(prep, foregrounds)
-                if not semantic_classification_skipped or semantic_transverse_verified:
+                if foregrounds is not None:
+                    for cand in cands:
+                        key = (cand.parent_view_tag, int(cand.frame_idx), cand.item_key, 0)
+                        if fraction < 1.0 and not semantic_classification_skipped and key not in foregrounds:
+                            raise RuntimeError(f"Missing classification for selected candidate {key}")
+                        cand.foreground = bool(foregrounds.get(key, True))
+                if fraction == 1.0 and (not semantic_classification_skipped or semantic_transverse_verified):
                     validate_foreground_transverse_candidate_invariant(
                         prep,
                         cands,
@@ -5616,7 +5741,7 @@ def main(
             # enumeration, leaving ``physical`` empty even when the source has
             # foreground.  The retained-candidate invariant applies only when
             # images or labels were selected for publication.
-            if dataset_publication_selected and (
+            if dataset_publication_selected and fraction == 1.0 and (
                 not semantic_classification_skipped or semantic_transverse_verified
             ):
                 validate_foreground_transverse_candidate_invariant(
@@ -5649,6 +5774,7 @@ def main(
                 "warnings": vol_warnings,
                 "prep": prep,
                 "cands": cands,
+                "candidates_before_fraction": candidates_before_fraction,
                 "physical": physical,
                 "split_stats": vol_split_stats,
                 "background_stats": vol_background_stats,
@@ -5848,6 +5974,7 @@ def main(
                 voxel_initial=prep.voxel_initial,
                 voxel_final=prep.voxel_final,
                 smoothing_stats=list(prep.smoothing_stats),
+                void_fill_stats=prep.void_fill_stats,
                 nrrd_paths=list(prep.nrrd_paths),
                 views=list(prep.views),
                 tile_configs=list(tile_configs),
@@ -5857,6 +5984,8 @@ def main(
                 augmented_candidates_planned=sum(1 for c in physical if int(c.augmentation_index) > 0),
                 augmented_candidates_retained=sum(1 for c in physical if int(c.augmentation_index) > 0 and c.keep),
                 candidates_written=int(written_effective),
+                fraction=fraction,
+                candidates_before_fraction=int(state["candidates_before_fraction"]),
             )
             volume_records.append(rec)
 

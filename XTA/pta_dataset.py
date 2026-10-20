@@ -16,7 +16,7 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 from .pta_augmentation import (
     AugmentationDefinition,
@@ -156,6 +156,29 @@ def stable_digest_rank(domain: str, parts: Sequence[object]) -> bytes:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(payload).digest()
+
+
+def select_fraction_candidates(
+    candidates: Iterable[OutputCandidate], *, fraction: float,
+) -> List[OutputCandidate]:
+    """Sample original full/tile identities before classification or rendering.
+
+    Each identity has a fixed SHA-256 rank, so smaller fractions are nested
+    subsets and adding views or changing worker/order settings cannot reroll it.
+    Counts are approximate; a small candidate population may yield no samples.
+    """
+    value = float(fraction)
+    if not math.isfinite(value) or not 0.0 < value <= 1.0:
+        raise ValueError("--fraction must be finite and in (0,1]")
+    if value == 1.0:
+        return list(candidates)
+    threshold = int(value * (1 << 256))
+    return [
+        cand for cand in candidates
+        if int.from_bytes(stable_digest_rank(
+            "PTA-fraction-v1", (candidate_source_identity(cand),),
+        ), "big") < threshold
+    ]
 
 
 def candidate_background_rank(cand: OutputCandidate) -> Tuple[bytes, int, int]:
@@ -845,6 +868,7 @@ __all__ = [
     "output_source_identity_text",
     "plan_augmented_versions",
     "refresh_retained_original_split_stats",
+    "select_fraction_candidates",
     "split_round_half_toward_train",
     "stable_digest_rank",
     "withhold_background_overage_after_flips",

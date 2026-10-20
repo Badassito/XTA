@@ -26,7 +26,8 @@ def select_sam_proposals(bundle, policy=None, **kwargs):
 
 def _settings(arguments=()):
     args = build_argparser().parse_args(['--input', 'source.mkv', '--device', '0',
-        '--model', 'gpu:detector.engine', 'sam:bundle', '--interpolation_backend', 'sam', *arguments])
+        '--model', 'gpu:detector.engine', 'sam:bundle', '--interpolation_backend', 'sam',
+        '--interpolation_distance', '15', *arguments])
     return resolve_interpolation_settings(args, resolve_backend_models(args.model),
         resolve_backend_devices(args.device))
 
@@ -89,7 +90,8 @@ def test_invalid_active_switch_fails_before_runtime(monkeypatch, value):
     with mock.patch('XTA.tta_mode.run') as runtime:
         with pytest.raises(SystemExit):
             cli._run_tta(['--input', 'source.mkv', '--device', '0', '--model',
-                'gpu:detector.engine', 'sam:bundle', '--interpolation_backend', 'sam'])
+                'gpu:detector.engine', 'sam:bundle', '--interpolation_backend', 'sam',
+                '--interpolation_distance', '15'])
         runtime.assert_not_called()
 
 
@@ -112,7 +114,8 @@ def test_cli_pins_guard_before_runtime_environment_change(monkeypatch):
         observed.append(resolve_sam_bridge_policy()['strict_containment'])
     with mock.patch('XTA.tta_mode.run', side_effect=run):
         cli._run_tta(['--input', 'source.mkv', '--device', '0', '--model',
-            'gpu:detector.engine', 'sam:bundle', '--interpolation_backend', 'sam'])
+            'gpu:detector.engine', 'sam:bundle', '--interpolation_backend', 'sam',
+            '--interpolation_distance', '15'])
     assert observed == [False, False]
     assert resolve_sam_tight_crop_guard() is True
 
@@ -316,7 +319,8 @@ def test_auto_launch_snapshot_does_not_read_later_environment(monkeypatch):
             resolve_sam_bridge_policy({'sam_bridge_policy': {'version': 4}})['strict_containment']])
     with mock.patch('XTA.tta_mode.run', side_effect=run):
         cli._run_tta(['--input', 'source.mkv', '--device', '0', '--model',
-            'gpu:detector.engine', 'sam:bundle', '--interpolation_backend', 'sam'])
+            'gpu:detector.engine', 'sam:bundle', '--interpolation_backend', 'sam',
+            '--interpolation_distance', '15'])
     assert observed == [None, None, False, True]
     with pytest.raises(ValueError):
         resolve_sam_tight_crop_guard()

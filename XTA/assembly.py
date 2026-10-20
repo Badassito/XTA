@@ -249,9 +249,15 @@ def _sam_directional_source_backing(
         # ponytail: Radial encoded pulls failed production-size parallel timing;
         # tilted Spherical remains unqualified. Re-enable only after that validation.
         if view.family == 'spherical' and not view.spherical_tilted_source:
-            flag = 'YOLO_TTA_GPU_'+str(view.family).upper()+'_BACKPROJECT'
-            explicit_gpu = flag in os.environ and os.environ[flag].strip().lower() not in ('0','false','no','off')
-            if not explicit_gpu:
+            from .spherical_projection import spherical_cuda_backproject_enabled
+            prefer_gpu = spherical_cuda_backproject_enabled()
+            if prefer_gpu and 'YOLO_TTA_GPU_SPHERICAL_BACKPROJECT' not in os.environ:
+                try:
+                    import torch
+                    prefer_gpu = torch.cuda.is_available()
+                except Exception:
+                    prefer_gpu = False
+            if not prefer_gpu:
                 from .sam_sparse_shell_projection import encoded_shell_has_unused_canvas
                 sparse_shell = encoded_shell_has_unused_canvas(store)
     if not has_foreground:

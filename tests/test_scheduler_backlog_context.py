@@ -92,3 +92,62 @@ def test_policy_siblings_keep_each_validation_error():
         input_overrides=dict(direct_union_total_dense_byte_limit=4096))
     with pytest.raises(RuntimeError, match='duplicate pass'):
         publish(scheduler)
+
+
+@pytest.mark.parametrize('scan', ['backlog', 'selection'])
+def test_blocked_policy_leases_check_complete_group_contract_once(scan):
+    import queue
+    from tests.test_tta_policy_parent_admission import policy_task
+
+    state = _state()
+    state.gpu_task_queues[0] = queue.Queue()
+    for group in range(20):
+        for lease in range(100):
+            tid = len(state.gpu_worker_tasks_by_id)
+            state.gpu_worker_tasks_by_id[tid] = policy_task(
+                group, task_id=tid, size=100, slice_start=lease)
+            state.gpu_worker_pending_task_ids.append(tid)
+    state.direct_union_postprocess_bytes[('model', 'completed')] = 4096
+    state.direct_union_backing_leases[('model', 'completed')] = object()
+    scheduler = _scheduler(Path('.'), state=state,
+        input_overrides=dict(direct_union_total_dense_byte_limit=4096))
+    def evaluate():
+        return (publish(scheduler) if scan == 'backlog' else
+                scheduler.pop_gpu_worker_pending_task_id(candidate_workers=[0]))
+    with mock.patch.object(scheduler, 'direct_union_task_admissible',
+                           wraps=scheduler.direct_union_task_admissible) as admission:
+        assert not evaluate()
+        assert admission.call_count == 20
+        state.direct_union_postprocess_bytes.clear()
+        state.direct_union_backing_leases.clear()
+        assert evaluate()
+        # Selection examines all groups to preserve scheduling priority.
+        assert admission.call_count == (21 if scan == 'backlog' else 40)
+
+
+@pytest.mark.parametrize('scan', ['backlog', 'selection'])
+def test_policy_group_contract_observes_changed_sibling_shape_and_validation(scan):
+    import queue
+    from tests.test_tta_policy_parent_admission import policy_task
+
+    state = _state()
+    state.gpu_task_queues[0] = queue.Queue()
+    for tid in range(2):
+        state.gpu_worker_tasks_by_id[tid] = policy_task(0, task_id=tid, size=100)
+        state.gpu_worker_pending_task_ids.append(tid)
+    state.direct_union_postprocess_bytes[('model', 'completed')] = 3746
+    state.direct_union_backing_leases[('model', 'completed')] = object()
+    scheduler = _scheduler(Path('.'), state=state,
+        input_overrides=dict(direct_union_total_dense_byte_limit=4096))
+    second = state.gpu_worker_tasks_by_id[1]
+    second['augmentation_pass_tasks'][-1]['processing_shape'] = (1, 1, 40)
+    def evaluate():
+        return (publish(scheduler) if scan == 'backlog' else
+                scheduler.pop_gpu_worker_pending_task_id(candidate_workers=[0]))
+    # The bases match; one changed sibling makes only the second group fit (340/350).
+    assert evaluate()
+    if scan == 'selection':
+        state.gpu_worker_pending_task_ids.append(1)
+    second['augmentation_pass_tasks'][1]['bounded_parent_admission'] = False
+    with pytest.raises(RuntimeError, match='independently marked'):
+        evaluate()

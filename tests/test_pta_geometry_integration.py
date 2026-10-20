@@ -986,6 +986,8 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
         arguments = [
             "--input",
             "dataset",
+            "--preprocessing",
+            "3d_void_fill",
             "--enable_azimuthal",
             "transverse:60",
             "--channel_format",
@@ -1037,6 +1039,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             foreground_preservation_stats={"processed_anchor_repairs": 2},
             voxel_initial=7,
             voxel_final=8,
+            void_fill_stats={"added_voxels": 1, "background_connectivity": 6},
             smoothing_stats=[],
             nrrd_paths=[],
             views=views,
@@ -1149,6 +1152,14 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
         self.assertEqual(voxel["units"], "foreground_voxel_count")
         self.assertFalse(voxel["physical_volume"])
         self.assertEqual(voxel["volumes"][0]["initial_foreground_voxel_count"], 7)
+        self.assertEqual(voxel["volumes"][0]["final_foreground_voxel_count"], 8)
+        self.assertEqual(voxel["volumes"][0]["final_stage"],
+                         "after_native_mask_preprocessing_before_cube_resize_and_anchor_repair")
+        self.assertEqual(manifest["volumes"][0]["3d_void_fill_preprocessing"],
+                         {"added_voxels": 1, "background_connectivity": 6})
+        self.assertTrue(manifest["resolved_configuration"]["preprocessing"]["3d_void_fill"])
+        self.assertEqual(manifest["resolved_configuration"]["preprocessing"]["execution_order"],
+                         ["3d_void_fill"])
 
     def test_pta_input_identities_detect_image_video_and_label_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -19,14 +19,14 @@ def _settings(*extra):
 
 def test_defaults_are_off_and_recordable_without_new_public_cli(monkeypatch):
     monkeypatch.delenv(ENV, raising=False)
-    settings = _settings('--interpolation_backend', 'sam')
+    settings = _settings('--interpolation_backend', 'sam', '--interpolation_distance', '15')
     assert settings.sam_adaptive_crop is False
     assert asdict(settings)['sam_adaptive_crop'] is False
     assert '--sam_adaptive_crop' not in build_argparser().format_help()
 
 
 @pytest.mark.parametrize('value,expected', [('0', False), ('1', True), (' 1 ', True)])
-@pytest.mark.parametrize('options', [('--interpolation_backend', 'sam'),
+@pytest.mark.parametrize('options', [('--interpolation_backend', 'sam', '--interpolation_distance', '15'),
     ('--interpolation_distance', '0', '--extrapolation_distance', '4')])
 def test_active_interpolation_and_extrapolation_share_switch(monkeypatch, value, expected, options):
     monkeypatch.setenv(ENV, value)
@@ -61,7 +61,8 @@ def test_launch_pins_even_the_default_off_through_env_mutation(monkeypatch, orig
         observed.append(resolve_sam_adaptive_crop())
     with mock.patch('XTA.tta_mode.run', side_effect=runtime):
         cli._run_tta(['--input', 'source.mkv', '--device', '0', '--model',
-            'gpu:detector.engine', 'sam:bundle', '--interpolation_backend', 'sam'])
+            'gpu:detector.engine', 'sam:bundle', '--interpolation_backend', 'sam',
+            '--interpolation_distance', '15'])
     assert observed == [original == '1']
 
 

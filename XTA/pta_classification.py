@@ -123,6 +123,7 @@ def classify_semantic_plan_frame(
     idx: int,
     *,
     include_tiles: bool = True,
+    include_full: bool = True,
     metrics: Optional[dict[str, int]] = None,
 ) -> Optional[dict[str, bool]]:
     """Classify one canonical plan/frame without enlarging axis-aligned masks.
@@ -135,7 +136,7 @@ def classify_semantic_plan_frame(
     if shared_view is None or shared_geometry.is_tilted_view(shared_view):
         return None
     tiles = plan.tile_layout if include_tiles else ()
-    result = {'full': False, **{str(tile.tile_tag): False for tile in tiles}}
+    result = {**({'full': False} if include_full else {}), **{str(tile.tile_tag): False for tile in tiles}}
     native_mask = np.ascontiguousarray(
         shared_geometry.get_categorical_view_frame_by_index(mask, shared_view, int(idx)) > 0,
         dtype=np.uint8,
@@ -163,16 +164,17 @@ def classify_semantic_plan_frame(
     col_any = np.any(known, axis=0)
 
     aff = plan.aff
-    full_lookup = _lookup_for_matrix(aff.M_src_to_out, native_h, native_w,
-                                     int(aff.out_h), int(aff.out_w))
-    if full_lookup is None:
-        result['full'] = _warp_any(known, aff.M_src_to_out, int(aff.out_h), int(aff.out_w))
-    else:
-        x, y, swap = full_lookup
-        active = known.T if swap else known
-        result['full'] = _any_sampled(active, x, y,
-                                      col_any if swap else row_any,
-                                      row_any if swap else col_any)
+    if include_full:
+        full_lookup = _lookup_for_matrix(aff.M_src_to_out, native_h, native_w,
+                                         int(aff.out_h), int(aff.out_w))
+        if full_lookup is None:
+            result['full'] = _warp_any(known, aff.M_src_to_out, int(aff.out_h), int(aff.out_w))
+        else:
+            x, y, swap = full_lookup
+            active = known.T if swap else known
+            result['full'] = _any_sampled(active, x, y,
+                                          col_any if swap else row_any,
+                                          row_any if swap else col_any)
 
     canvas_tiles = [tile for tile in tiles if tile.shared_job is None]
     canvas_lookup = None

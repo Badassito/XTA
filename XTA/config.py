@@ -914,7 +914,7 @@ def resolve_interpolation_settings(
         raise ValueError(
             f'--interpolation_backend must select sdf or sam; {backend!r} is unsupported'
         )
-    distance = int(getattr(args, 'interpolation_distance', 15))
+    distance = int(getattr(args, 'interpolation_distance', 0))
     if distance < 0:
         raise ValueError('--interpolation_distance must be >= 0')
     extrapolation_distance = getattr(args, 'extrapolation_distance', 0)
@@ -1389,8 +1389,8 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Seconds allowed for each isolated embedded-centerline attempt before preserving the current union and using safe pass-through behavior")
     p.add_argument("--interpolation_backend", default="sdf", choices=("sdf", "sam"),
                    help="Single interpolation generator: sdf preserves geometric bridging; sam uses image-guided mask tracking with no SDF fallback. Distance 0 disables the configured backend")
-    p.add_argument("--interpolation_distance", default=15, type=_bounded_number(int, minimum=0),
-                   help="Maximum view-native slice/frame distance used to search for interpolation candidates. Azimuthal interpolation wraps around frame order. 0 disables interpolation")
+    p.add_argument("--interpolation_distance", default=0, type=_bounded_number(int, minimum=0),
+                   help="Maximum view-native slice/frame distance used to search for interpolation candidates. Azimuthal interpolation wraps around frame order. 0 disables interpolation (default)")
     p.add_argument("--interpolation_walk_back", default=1, type=_bounded_number(int, minimum=0),
                    help="Additional source slices to bridge before the endpoint slice. SAM uses detector-observed walk-back seeds. SDF shares the endpoint and first walked-back origin in layer 1, preserving its component NRRD layout. 0 disables walk-back bridges but retains endpoint bridges")
     p.add_argument("--interpolation_candidates", default=1, type=_bounded_number(int, minimum=1),

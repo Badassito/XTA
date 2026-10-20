@@ -123,9 +123,10 @@ def test_preflight_workspace_refusal_never_publishes(tmp_path,monkeypatch):
     assert not target.exists()
 
 
-@pytest.mark.parametrize('route',('implicit','explicit_cpu','explicit_gpu','full_bbox','preflight','corrupt'))
+@pytest.mark.parametrize('route',('implicit','implicit_gpu','availability_error','explicit_cpu','explicit_gpu','full_bbox','preflight','corrupt'))
 def test_sam_dispatch_preserves_explicit_gpu_and_only_preflight_can_fallback(tmp_path,monkeypatch,route):
     from XTA import assembly, sam_sparse_shell_projection as module
+    import torch
     family='spherical'
     view=next(view for view in VIEWS if view.family==family and not view.spherical_tilted_source)
     data=np.zeros((view.num_slices,view.src_h,view.src_w),np.uint8)
@@ -138,6 +139,11 @@ def test_sam_dispatch_preserves_explicit_gpu_and_only_preflight_can_fallback(tmp
     if route=='explicit_cpu':monkeypatch.setenv(flag,'0')
     if route=='explicit_gpu':monkeypatch.setenv(flag,'1')
     calls=[]
+    def cuda_available():
+        assert route not in ('explicit_cpu','explicit_gpu'), 'Explicit policy must not probe CUDA during route selection'
+        if route=='availability_error':raise RuntimeError('controlled unavailable CUDA runtime')
+        return route=='implicit_gpu'
+    monkeypatch.setattr(torch.cuda,'is_available',cuda_available)
     original=module.project_shell_sparse_store
     def compact(*args,**kwargs):
         calls.append('compact')
@@ -155,7 +161,7 @@ def test_sam_dispatch_preserves_explicit_gpu_and_only_preflight_can_fallback(tmp
         def invoke():
             return assembly._sam_directional_source_backing(source,view=view,stage='test',has_foreground=True,
                 model_name='test',source='fullframe',pass_index=1,tile_config_id='',workers=1,_work_root=root)
-        if route in ('explicit_gpu','full_bbox','preflight'):
+        if route in ('implicit_gpu','explicit_gpu','full_bbox','preflight'):
             with pytest.raises(LookupError,match='legacy dense'):
                 invoke()
             assert calls==(['compact','dense'] if route=='preflight' else ['dense'])

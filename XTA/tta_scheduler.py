@@ -2022,6 +2022,28 @@ class TtaScheduler:
             keys.add(key)
         return members
 
+    def _direct_union_admission_contract(self, task: Dict[str, object],
+                                         parent: Tuple[str, str]) -> Optional[Tuple[object, ...]]:
+        """Share scan-local decisions only for identical explicit parent contracts."""
+        if not task.get('bounded_parent_admission', False):
+            shape = task.get('processing_shape', ())
+            if (isinstance(shape, (tuple, list)) and len(shape) == 3
+                    and all(isinstance(value, (int, np.integer)) for value in shape)):
+                return parent, str(task.get('result_mode', 'file')), tuple(shape)
+            return None
+        members = (task, *task.get('augmentation_pass_tasks', ()))
+        contract = []
+        for member in members:
+            shape = member.get('processing_shape', ())
+            view = member.get('view')
+            if (view is None or not isinstance(shape, (tuple, list)) or len(shape) != 3
+                    or not all(isinstance(value, (int, np.integer)) for value in shape)):
+                return None
+            contract.append((str(member.get('kind', '')), str(member.get('model_name', '')),
+                str(getattr(view, 'name', '')), str(member.get('result_mode', 'file')),
+                bool(member.get('bounded_parent_admission', False)), tuple(shape)))
+        return tuple(contract)
+
     def _direct_union_parent_bytes(self, task: Dict[str, object]) -> int:
         shape = tuple(int(v) for v in task.get('processing_shape', ()))
         if len(shape) != 3:
@@ -2333,17 +2355,9 @@ class TtaScheduler:
             direct_parents[task_id] = direct_parent
             if direct_parent is not None and admission_totals is None:
                 admission_totals = self._direct_union_admission_totals()
-            shape = task.get('processing_shape', ())
-            # An ordinary parent's explicit dense shape completely determines its
-            # memory request. Heterogeneous/fallback shapes and policy groups retain
-            # their full per-task validation, including sibling consistency errors.
-            shared_admission = bool(direct_parent is not None
-                and not task.get('bounded_parent_admission', False)
-                and isinstance(shape, (tuple, list)) and len(shape) == 3
-                and all(isinstance(value, (int, np.integer)) for value in shape))
-            if shared_admission:
-                admission_key = (direct_parent, descriptor.mode,
-                                 tuple(shape))
+            admission_key = (self._direct_union_admission_contract(task, direct_parent)
+                             if direct_parent is not None else None)
+            if admission_key is not None:
                 if admission_key not in direct_admission:
                     direct_admission[admission_key] = self.direct_union_task_admissible(
                         task, precomputed_key=direct_parent, admission_totals=admission_totals,
@@ -2527,22 +2541,16 @@ class TtaScheduler:
             if not gpu_policy_eligible:
                 continue
             parent = self.direct_union_task_key(pending_task)
-            shape = pending_task.get('processing_shape', ())
-            shared_admission = bool(parent is not None
-                and not pending_task.get('bounded_parent_admission', False)
-                and isinstance(shape, (tuple, list)) and len(shape) == 3
-                and all(isinstance(value, (int, np.integer)) for value in shape))
             if parent is not None and admission_totals is None:
                 admission_totals = self._direct_union_admission_totals()
-            if shared_admission:
-                contract = (parent, str(pending_task.get('result_mode', 'file')), tuple(shape))
+            contract = (self._direct_union_admission_contract(pending_task, parent)
+                        if parent is not None else None)
+            if contract is not None:
                 if contract not in direct_admission:
                     direct_admission[contract] = self.direct_union_task_admissible(
                         pending_task, precomputed_key=parent, admission_totals=admission_totals)
                 storage_admissible = direct_admission[contract]
             else:
-                # Policy siblings and inferred/heterogeneous shapes retain their
-                # individual validation, including ownership consistency errors.
                 storage_admissible = self.direct_union_task_admissible(
                     pending_task, precomputed_key=parent, admission_totals=admission_totals)
             if storage_admissible and self.tile_dense_result_task_admissible(pending_task):

@@ -639,6 +639,8 @@ def projection_phase_summary(
 
 def _derive_item_arrays(source: RenderFrameSource, plan: RenderPlan, item_key: str) -> Tuple[np.ndarray, np.ndarray]:
     if item_key == "full":
+        if source.img_full is None or source.mask_full is None:
+            raise RuntimeError(f"Full output requested without a rendered full frame for {plan.tag}")
         return source.img_full, source.mask_full
     shared_arrays = source.tile_arrays.get(str(item_key))
     if shared_arrays is not None:
@@ -702,6 +704,8 @@ def _derive_gpu_item_source(
     materialized only for a genuine edge tile.
     """
     if item_key == "full":
+        if source.img_full is None or source.mask_full is None:
+            raise RuntimeError(f"Full output requested without a rendered full frame for {plan.tag}")
         return source.img_full, source.mask_full, (
             int(source.img_full.shape[0]),
             int(source.img_full.shape[1]),
@@ -2598,6 +2602,7 @@ def execute_gpu_render_task(
         plan=plan,
         idx=int(task.frame_idx),
         need_canvas=any(item_key != "full" for item_key, _ in task.items),
+        need_full="full" in item_keys,
     )
     for item_key, candidates in task.items:
         item_image, item_mask, output_size = _derive_gpu_item_source(source, plan, str(item_key))
@@ -2830,6 +2835,7 @@ def execute_render_task(volume: np.ndarray, mask: np.ndarray, plans: Sequence[Re
         source = render_plan_frame_source(
             volume=volume, mask=mask, plan=plan, idx=int(task.frame_idx),
             need_canvas=any(item_key != "full" for item_key, _ in task.items),
+            need_full="full" in item_keys,
         )
         for item_key, candidates in task.items:
             item_image, item_mask = _derive_item_arrays(source, plan, str(item_key))

@@ -224,6 +224,7 @@ class ConfigTests(unittest.TestCase):
         args = build_argparser().parse_args([
             '--input', 'input.mkv', '--model', 'cpu:openvino', 'sam:bundle',
             '--device', 'cpu', '--sam_device', '2,0', '--interpolation_backend', 'sam',
+            '--interpolation_distance', '15',
         ])
         models = resolve_backend_models(args.model)
         devices = resolve_backend_devices(args.device)
@@ -240,6 +241,7 @@ class ConfigTests(unittest.TestCase):
         parser = build_argparser()
         args = parser.parse_args([
             *self.REQUIRED, '--interpolation_backend', 'sam', '--device', '0',
+            '--interpolation_distance', '15',
         ])
         with self.assertRaisesRegex(ValueError, 'requires a sam:PATH'):
             resolve_interpolation_settings(
@@ -247,7 +249,7 @@ class ConfigTests(unittest.TestCase):
             )
         args = parser.parse_args([
             '--input', 'input.mkv', '--model', 'cpu:openvino', 'sam:bundle',
-            '--device', 'cpu', '--interpolation_backend', 'sam',
+            '--device', 'cpu', '--interpolation_backend', 'sam', '--interpolation_distance', '15',
         ])
         with self.assertRaisesRegex(ValueError, 'CPU-only detector requires --sam_device'):
             resolve_interpolation_settings(
@@ -258,6 +260,7 @@ class ConfigTests(unittest.TestCase):
         parser = build_argparser()
         common = [
             *self.REQUIRED, 'sam:bundle', '--device', '3,1', '--interpolation_backend', 'sam',
+            '--interpolation_distance', '15',
         ]
         for extra, expected in (([], ('cuda:3', 'cuda:1')), (['--sam_device', '0'], ('cuda:0',))):
             args = parser.parse_args([*common, *extra])
@@ -266,11 +269,30 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(settings.sam_devices, expected)
             self.assertEqual(devices.gpu_devices, ('cuda:3', 'cuda:1'))
 
+    def test_interpolation_defaults_to_disabled_for_cli_and_legacy_namespaces(self) -> None:
+        for backend in ('sdf', 'sam'):
+            for legacy_namespace in (False, True):
+                with self.subTest(backend=backend, legacy_namespace=legacy_namespace):
+                    args = build_argparser().parse_args([
+                        *self.REQUIRED, '--device', '0', '--interpolation_backend', backend,
+                    ])
+                    self.assertEqual(args.interpolation_distance, 0)
+                    if legacy_namespace:
+                        del args.interpolation_distance
+                    settings = resolve_interpolation_settings(
+                        args, resolve_backend_models(args.model), resolve_backend_devices(args.device),
+                    )
+                    self.assertFalse(settings.enabled)
+                    self.assertIsNone(settings.sam_model)
+                    self.assertEqual(settings.sam_devices, ())
+
     def test_disabled_sam_and_sdf_expose_no_sam_resources(self) -> None:
         parser = build_argparser()
         for extra, backend, enabled in (
             (['--interpolation_backend', 'sam', '--interpolation_distance', '0'], 'sam', False),
-            ([], 'sdf', True),
+            ([], 'sdf', False),
+            (['--interpolation_backend', 'sam'], 'sam', False),
+            (['--interpolation_distance', '15'], 'sdf', True),
         ):
             args = parser.parse_args([
                 '--input', 'input.mkv', '--model', 'cpu:openvino', '--device', 'cpu', *extra,
@@ -314,6 +336,7 @@ class ConfigTests(unittest.TestCase):
         for budget in (0, 192, 512, 1024, 2048):
             args = parser.parse_args([
                 *self.REQUIRED, 'sam:bundle', '--device', '0', '--interpolation_backend', 'sam',
+                '--interpolation_distance', '15',
                 '--sam_feature_cache_mib', str(budget),
             ])
             settings = resolve_interpolation_settings(
