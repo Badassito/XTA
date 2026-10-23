@@ -320,6 +320,9 @@ class AdmittedViewPrepare:
     sam_image_reserved_bytes: int = 0
     confidence_retired_callback: Callable[[str, str, int], object] | None = None
     confidence_retired_callback_factory: Callable[[object], Callable] | None = None
+    mask_retired_callback: Callable[[str, str, int], object] | None = None
+    mask_retired_callback_factory: Callable[[object], Callable] | None = None
+    projected_output_memory: Mapping[str, object] | None = None
     submit_sam_layer_projection: Callable[..., object] | None = None
     backing_lease: _DirectUnionBackingLease | None = None
     _cancelled_owner_refs: tuple = field(default=(), init=False, repr=False)
@@ -343,6 +346,8 @@ class AdmittedViewPrepare:
     def rebind_confidence_retirement(self, lease):
         if self.confidence_retired_callback_factory is not None:
             self.confidence_retired_callback = self.confidence_retired_callback_factory(lease)
+        if self.mask_retired_callback_factory is not None:
+            self.mask_retired_callback = self.mask_retired_callback_factory(lease)
 
     def _take_confidence(self):
         owner, self.confmap_mm = self.confmap_mm, None
@@ -500,6 +505,9 @@ class AdmittedViewPrepare:
             self.check_cancelled()
             local_union_mm = self.union_mm
             observation_inventory = None
+            transfer_packed_source = False
+            union_owner = None
+            confidence_carrier = None
             try:
                 if ((int(self.extrapolation_distance) > 0
                         or self.interpolation_backend == 'sam' and int(self.interpolation_distance) > 0)
@@ -529,6 +537,8 @@ class AdmittedViewPrepare:
                 # longer mask projection finished, even after capture retired it.
                 input_owner_ref = weakref.ref(_array_lifetime_owner(local_union_mm))
                 input_nbytes = int(np.asarray(local_union_mm).nbytes)
+                confidence_owner_ref = (None if self.confmap_mm is None else
+                    weakref.ref(_array_lifetime_owner(self.confmap_mm)))
                 input_unlink_path = None
                 input_path_identity = None
                 if not self.keep_temp_artifacts:
@@ -539,14 +549,35 @@ class AdmittedViewPrepare:
                             input_path_identity = (identity.st_dev, identity.st_ino)
                         except OSError:
                             input_unlink_path = None
+                # Mutable transport avoids a stale array in wrapper kwargs while
+                # terminal Tilted projection continues from immutable packed bits.
+                from .packed_tilted_projection import terminal_native_source_packing_eligible
+                transfer_packed_source = terminal_native_source_packing_eligible(self.view,
+                    native_bytes=input_nbytes, retire_dense=self.component_ref_dense_retirement_active,
+                    component_layers=self.component_layers_needed, tiled=self.dense_tiling_active,
+                    keep_temp=self.keep_temp_artifacts,
+                    prepublished=self.preinterpolation_layer_already_published,
+                    interpolate=self.interpolation_distance, interpolation_passes=self.interpolation_passes,
+                    extrapolate=self.extrapolation_distance,
+                    mask_callback_available=self.mask_retired_callback is not None,
+                    confidence_can_retire=(self.confmap_mm is None or self.confidence_retired_callback is not None))
+                union_owner = [local_union_mm] if transfer_packed_source else None
+                if transfer_packed_source:
+                    self.union_mm = local_union_mm = None
+                if self.confidence_retired_callback is not None:
+                    confidence_carrier = [self._take_confidence()]
                 result = self.prepare(
                     model_name=str(self.model_name),
                     view=self.view,
                     union_mm=local_union_mm,
+                    **({'union_owner': union_owner,
+                        'mask_retired_callback': self.mask_retired_callback}
+                       if transfer_packed_source else {}),
                     confmap_mm=(self._take_confidence()
                                 if self.confidence_retired_callback is None else None),
-                    confidence_owner=([self._take_confidence()]
-                                      if self.confidence_retired_callback is not None else None),
+                    confidence_owner=confidence_carrier,
+                    **({'projected_output_memory': dict(self.projected_output_memory)}
+                       if transfer_packed_source and self.projected_output_memory else {}),
                     union_path=self.union_path,
                     confmap_path=self.confmap_path,
                     temp_dir=self.temp_dir,
@@ -599,6 +630,7 @@ class AdmittedViewPrepare:
                 # fence still observes any producer/caller view of the backing.
                 result._dense_input_owner_ref = input_owner_ref
                 result._dense_input_nbytes = input_nbytes
+                result._dense_confidence_owner_ref = confidence_owner_ref
                 if not self.keep_temp_artifacts and all(
                     volume is None or _array_lifetime_owner(volume) is not input_owner_ref()
                     for volume in (result.native_support_mm, result.final_view_volume_mm)
@@ -613,16 +645,41 @@ class AdmittedViewPrepare:
                                 input_unlink_path = None
                         except OSError:
                             input_unlink_path = None
-                    self.close_dense(local_union_mm, unlink_path=input_unlink_path)
+                    if local_union_mm is not None:
+                        self.close_dense(local_union_mm, unlink_path=input_unlink_path)
                 return result
-            except BaseException:
+            except BaseException as error:
                 # The original/local dense mapping belongs to this reservation.
                 # Immutable component and tile support stores have other owners.
                 unlink_path = (
                     scratch_unlink_path_for_memmap(local_union_mm, self.union_path)
                     if not self.keep_temp_artifacts else None
                 )
-                self.close_dense(local_union_mm, unlink_path=unlink_path)
+                if local_union_mm is not None:
+                    self.close_dense(local_union_mm, unlink_path=unlink_path)
+                clear_failure_frames = False
+                if transfer_packed_source and union_owner:
+                    # The callee has not sealed/detached its packed continuation.
+                    # The shared carrier still owns this exact original input.
+                    transferred = union_owner.pop()
+                    self.close_dense(transferred, unlink_path=(None if self.keep_temp_artifacts else
+                        scratch_unlink_path_for_memmap(transferred, self.union_path)))
+                    transferred = None
+                    clear_failure_frames = True
+                if confidence_carrier:
+                    transferred_confidence = confidence_carrier.pop()
+                    if transferred_confidence is not None:
+                        self.close_dense(transferred_confidence,
+                            unlink_path=(None if self.keep_temp_artifacts else
+                                scratch_unlink_path_for_memmap(transferred_confidence, self.confmap_path)))
+                        transferred_confidence = None
+                        clear_failure_frames = True
+                if clear_failure_frames:
+                    # Finished failure frames can otherwise retain native arrays
+                    # even after the carrier is empty. Preserve traceback/code,
+                    # release only locals in frames that have already unwound.
+                    import traceback
+                    traceback.clear_frames(error.__traceback__)
                 local_union_mm = None
                 raise
             finally:
@@ -663,7 +720,8 @@ class ViewPrepareLeaseState:
         input_owner_ref = getattr(prepared, '_dense_input_owner_ref', None)
         if (not enabled or tiled or keep_temp or key in self.retired_for_publication
                 or input_owner_ref is None
-                or not prepared.pending_component_layers
+                or (not prepared.pending_component_layers
+                    and not getattr(prepared, '_packed_native_source_retired', False))
                 or prepared.parent_mask_support_mm is not None
                 or prepared.parent_bridge_support_mm is not None
                 or getattr(prepared, 'confidence', None) is not None
@@ -674,7 +732,9 @@ class ViewPrepareLeaseState:
             if (lease.phase != 'postprocess' or key not in self.postprocess_views
                     or self.postprocess_bytes.get(key) != lease.nbytes):
                 raise RuntimeError(f'dense publication {key} has no consistent postprocess owner')
-            if int(lease.nbytes) > int(prepared._dense_input_nbytes):
+            if (int(lease.nbytes) > int(prepared._dense_input_nbytes)
+                    and not (getattr(prepared, '_packed_native_source_retired', False)
+                             and hasattr(prepared, '_dense_confidence_owner_ref'))):
                 # A transferred confidence owner has not yet returned its
                 # separate credit; its still-live bytes cannot be released here.
                 return False
@@ -698,6 +758,11 @@ class ViewPrepareLeaseState:
         original_owner = input_owner_ref()
         if original_owner is not None:
             roots.append(original_owner)
+        if getattr(prepared, '_packed_native_source_retired', False):
+            confidence_ref = getattr(prepared, '_dense_confidence_owner_ref', None)
+            confidence_owner = None if confidence_ref is None else confidence_ref()
+            if confidence_owner is not None and all(confidence_owner is not prior for prior in roots):
+                roots.append(confidence_owner)
         for volume in arrays:
             owner = _array_lifetime_owner(volume)
             if all(owner is not prior for prior in roots):
@@ -801,10 +866,13 @@ class ViewPrepareLeaseState:
                 or int(self.postprocess_bytes.get(key, -1)) != int(lease.nbytes)):
             raise RuntimeError(f'direct-union input {key} retired without its postprocess owner')
         released = int(nbytes)
-        if not 0 < released < int(lease.nbytes):
+        if (not 0 < released <= int(lease.nbytes)
+                or released == int(lease.nbytes) and str(token) != 'mask'):
             raise RuntimeError(f'direct-union input {key} returned invalid dense credit {released}')
         self.retired_inputs.add(identity)
         lease.memfd_owner_proofs = tuple(proof for proof in lease.memfd_owner_proofs if proof[0] != token)
+        if released == int(lease.nbytes):
+            return self.complete(key, retain_for_dense_retirement=False)
         lease.nbytes -= released
         self.postprocess_bytes[key] = int(lease.nbytes)
         return True

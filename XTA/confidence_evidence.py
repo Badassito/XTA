@@ -62,6 +62,13 @@ def confidence_publication_reserve_bytes():
         return 0 if _PUBLICATION is None else _PUBLICATION.workspace_reserve_bytes
 
 
+def confidence_publication_snapshot():
+    """Current numeric staging/backing state without retaining an old run owner."""
+    with _LOCK:
+        publisher = _PUBLICATION
+    return dict(configured=False) if publisher is None else dict(configured=True, **publisher.snapshot())
+
+
 def shutdown_confidence_publication(*, raise_errors=True):
     """Settle run-owned publishers before clearing their registry or workspaces."""
     global _PUBLICATION
@@ -424,7 +431,10 @@ def publish_confidence_scores(scores, *, view, model_name, temp_dir, output_shap
                 layer_key=key,model_name=model_name,provenance=provenance,
                 coordinate_space='native_view_processing',source_shape_tyx=shape,
                 metrics=metrics,max_numeric_bytes=limit)
-            metrics.update(getattr(read_native, 'capture_metrics', {}))
+            # Per-frame execution diagnostics from the writer take precedence
+            # over the reader's initialization/eligibility description.
+            for field, value in getattr(read_native, 'capture_metrics', {}).items():
+                metrics.setdefault(field, value)
             return result
         if publisher is not None:
             from .confidence_publication import copy_staged_blocks
@@ -436,7 +446,8 @@ def publish_confidence_scores(scores, *, view, model_name, temp_dir, output_shap
                 print(f'Confidence native publication complete {model_name}/{view.name}: '
                       f'queue_wait_s={queue_wait:.3f}, metrics={json.dumps(metrics,sort_keys=True)}.', flush=True)
                 return result
-            future = publisher.stage_and_submit(Path(temp_dir)/'confidence_publication', write_native, publish_staged)
+            future = publisher.stage_and_submit(Path(temp_dir)/'confidence_publication',
+                write_native, publish_staged, metrics=metrics)
             if future is not None:
                 print(f'Confidence native retention staged {model_name}/{view.name}: '
                       f'elapsed_s={time.perf_counter()-started:.3f}, '
@@ -544,7 +555,8 @@ class _MaskedNativeScoreReader:
 
     def encode_frame(self, z, block_size):
         """Typed retiring inputs: fused bounds/count, bounded exact zlib cells."""
-        from .confidence_capture_cpu import masked_cell_bounds, copy_masked_cell
+        from .confidence_capture_cpu import masked_cell_bounds, copy_masked_cell, copy_masked_cells_batch
+        from .confidence_capture import COPY_BATCH_MAX_CELLS, COPY_BATCH_MAX_BYTES
         if self.stop is not None and self.stop.is_set():
             raise RuntimeError('Confidence capture cancelled')
         if not self.compiled_capture_capable:
@@ -555,26 +567,84 @@ class _MaskedNativeScoreReader:
             raise ValueError('Compiled confidence capture frame/grid is outside its source')
         if not self.active[z]:
             return [], dict(scan_seconds=0., compression_seconds=0., known_voxels=0)
+        from .confidence_native_codec import native_confidence_codec
+        codec, codec_receipt = native_confidence_codec()
+        if codec is not None and not codec.supports(block_size):
+            codec = None
+            codec_receipt = dict(backend='python_zlib',codec_version=zlib.ZLIB_RUNTIME_VERSION,
+                                 fallback_reason='unsupported_native_block_size')
+        codec_metrics = dict(codec_backend=codec_receipt['backend'],
+            codec_version=codec_receipt['codec_version'],
+            codec_python_version=codec_receipt.get('python_zlib_version',zlib.ZLIB_RUNTIME_VERSION),
+            codec_fallback_reason=codec_receipt.get('fallback_reason'))
+        self.capture_metrics.update(codec_metrics)
         y0, y1, x0, x1 = map(int, self.boxes[z])
         started = time.perf_counter()
         bounds = masked_cell_bounds(self.mask, self.scores, z, y0, y1, x0, x1, block_size)
         scan_seconds = time.perf_counter() - started
         compression_seconds = 0.
         records = []
-        for item in bounds:
+        cell_bytes = min(int(block_size), self.scores.shape[1]) * min(int(block_size), self.scores.shape[2])
+        batch_cells = min(COPY_BATCH_MAX_CELLS, COPY_BATCH_MAX_BYTES // cell_bytes)
+        copy_kernel_calls = copy_batch_peak_bytes = native_compression_batches = 0
+        native_batch_seconds = 0.
+        for first in range(0, len(bounds), max(1, batch_cells)):
             if self.stop is not None and self.stop.is_set():
                 raise RuntimeError('Confidence capture cancelled')
-            a, b, c, d, known = map(int, item)
             started = time.perf_counter()
-            crop = copy_masked_cell(self.mask, self.scores, z, a, b, c, d)
-            scan_seconds += time.perf_counter() - started
-            started = time.perf_counter()
-            encoded = zlib.compress(crop.tobytes(), level=3)
-            compression_seconds += time.perf_counter() - started
-            records.append((a, b, c, d, known, encoded))
+            selected = bounds[first:first + max(1, batch_cells)]
+            if codec is not None and batch_cells > 0:
+                raw, offsets = codec.encode_batch(self.mask,self.scores,z,selected,block_size)
+                elapsed = time.perf_counter() - started
+                # Native copy+compression share one nogil entry. Keep their
+                # combined time explicit rather than inventing a scan split.
+                native_batch_seconds += elapsed
+                compression_seconds += elapsed
+                native_compression_batches += 1
+                copy_batch_peak_bytes = max(copy_batch_peak_bytes, raw.nbytes + offsets.nbytes + 8)
+            elif batch_cells > 0:
+                raw, offsets = copy_masked_cells_batch(self.mask, self.scores, z, selected,
+                                                       COPY_BATCH_MAX_BYTES)
+                copy_batch_peak_bytes = max(copy_batch_peak_bytes, raw.nbytes + offsets.nbytes)
+            else:
+                # Large public grids retain the separately admitted single-cell
+                # path; a 65535 block must never imply a 16-cell allocation.
+                a, b, c, d, _ = map(int, selected[0])
+                raw = copy_masked_cell(self.mask, self.scores, z, a, b, c, d).reshape(-1)
+                offsets = (0, raw.size)
+            copy_kernel_calls += 1
+            if codec is None:
+                scan_seconds += time.perf_counter() - started
+            raw_view = memoryview(raw)
+            try:
+                for item, offset in enumerate(selected):
+                    if self.stop is not None and self.stop.is_set():
+                        raise RuntimeError('Confidence capture cancelled')
+                    a, b, c, d, known = map(int, offset)
+                    started = time.perf_counter()
+                    cell_view = raw_view[int(offsets[item]):int(offsets[item + 1])]
+                    try:
+                        encoded = bytes(cell_view) if codec is not None else zlib.compress(cell_view, level=3)
+                    finally:
+                        # A failed encoder traceback can retain its arguments.
+                        # Releasing even that view prevents it pinning a slab.
+                        cell_view.release()
+                        cell_view = None
+                    if codec is None:
+                        compression_seconds += time.perf_counter() - started
+                    records.append((a, b, c, d, known, encoded))
+            finally:
+                # Do not let the last memoryview keep the previous slab alive
+                # while the next batch allocates. Records own zlib bytes only.
+                raw_view.release()
+                raw_view = raw = offsets = None
         return records, dict(scan_seconds=scan_seconds,
                              compression_seconds=compression_seconds,
-                             known_voxels=int(bounds[:, 4].sum()) if len(bounds) else 0)
+                              known_voxels=int(bounds[:, 4].sum()) if len(bounds) else 0,
+                              copy_kernel_calls=copy_kernel_calls,
+                              copy_batch_peak_bytes=copy_batch_peak_bytes,
+                              native_compression_batches=native_compression_batches,
+                              native_batch_seconds=native_batch_seconds,**codec_metrics)
 
 
 def capture_prediction_confidence(mask, scores, *, view, model_name, temp_dir,
@@ -714,7 +784,7 @@ __all__ = [
     'configure_confidence_evidence_worker', 'confidence_evidence_enabled',
     'confidence_projection_deferred',
     'drain_confidence_publication', 'shutdown_confidence_publication',
-    'confidence_publication_reserve_bytes',
+    'confidence_publication_reserve_bytes', 'confidence_publication_snapshot',
     'capture_prediction_confidence',
     'publish_confidence_scores', 'lookup_confidence_evidence', 'write_confidence_evidence',
     'publish_confidence_shards',

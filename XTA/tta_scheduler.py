@@ -1720,8 +1720,9 @@ class TtaScheduler:
             return None
         if self.state.d1_groups_by_parent:
             return next(iter(self.state.d1_groups_by_parent.values()))
+        from .yolo_cpu_input import cpu_input_family_eligible
         if self.cpu_input_prefetch is not None and any(
-                str(getattr(task.get('view'), 'family', '')) not in {'orthogonal', 'tilted'}
+                not cpu_input_family_eligible(task.get('view'))
                 and bool(task.get('gpu_eligible', True))
                 and self.direct_union_task_admissible(task)
                 and self.tile_dense_result_task_admissible(task)
@@ -2339,10 +2340,12 @@ class TtaScheduler:
                 selection_ranks[key] = self.hybrid_gpu_selection_rank(tasks[task_id])
             return selection_ranks[key]
 
+        from .yolo_cpu_input import cpu_input_family_eligible
+
         def projection_rank(task_id: int) -> int:
             if self.cpu_input_prefetch is None:
                 return 0
-            return int(str(getattr(tasks[task_id].get('view'), 'family', '')) in {'orthogonal', 'tilted'})
+            return int(cpu_input_family_eligible(tasks[task_id].get('view')))
 
         feasible_by_id: Dict[int, List[int]] = {}
         eligible: List[Tuple[int, int]] = []

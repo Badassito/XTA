@@ -237,6 +237,7 @@ from .geometry import (
     write_dense_tile_job_meta,
 )
 from .inference import (
+    device_union_task_hole_fill_eligible,
     PredictConfig,
     PredictionAccumulationHandle,
     async_predict_join_workers,
@@ -356,6 +357,7 @@ from .projection_queue import (
     prepared_view_waitables,
     settle_prepared_view_components,
 )
+from .native_pull_scheduling import configure_native_pull_scheduler
 from .view_prepare import (
     AdmittedViewPrepare,
     ComponentProjectionSubmitter,
@@ -503,6 +505,14 @@ def _parent_confidence_capture_plan(shape, workers, *, enabled):
     if not enabled:
         return None
     from .confidence_evidence import plan_confidence_capture
+    from .native_pull_scheduling import get_native_pull_scheduler
+    scheduler = get_native_pull_scheduler()
+    if scheduler is not None:
+        # This is a memory window, charged before parent admission, rather than
+        # a private CPU allocation. Actual capture jobs share the run scheduler
+        # with native projection. A queued parent must not freeze this to its
+        # executor's one-slice cleanup budget, nor upgrade it after admission.
+        workers = scheduler.max_workers
     return plan_confidence_capture(tuple(int(v) for v in shape), int(workers),
         workspace_bytes=PARENT_CONFIDENCE_CAPTURE_WORKSPACE_BYTES)
 
@@ -517,8 +527,43 @@ def _prepare_parent_with_confidence_capture(prepare, *, capture_plan, **kwargs):
 
 
 def _parent_prepare_transient_bytes(view, processing_bytes, source_bytes, *,
-                                   interpolation_enabled, confidence_workspace_bytes=0):
+                                   interpolation_enabled, confidence_workspace_bytes=0,
+                                   packed_native_source=False, native_shape=None,
+                                   source_shape=None, cleanup_workers=1,
+                                   cleanup_is_simple=False):
     """Use one estimate for actual reservations and policy pre-dispatch planning."""
+    if packed_native_source and not interpolation_enabled and cleanup_is_simple:
+        from .interpolation import CTILE_INDEX_DTYPE
+        from .workspace import _env_int
+        native = tuple(int(value) for value in native_shape or ())
+        output = tuple(int(value) for value in source_shape or ())
+        if (len(native) != 3 or len(output) != 3 or min((*native, *output)) <= 0
+                or math.prod(native) != int(processing_bytes)
+                or math.prod(output) != int(source_bytes)):
+            raise ValueError('Packed parent transient admission requires its actual native/source shapes')
+        mib = 1024**2
+        # The dense input remains charged to its existing lease while packing.
+        # Charge the complete worst-case cropped row-bit payload during that
+        # overlap, including padding at the end of EVERY row, not just the file.
+        packed = native[0] * native[1] * ((native[2] + 7) // 8)
+        records = 4 * (native[0] + output[0]) * int(CTILE_INDEX_DTYPE.itemsize)
+        states = native[0] + output[0]
+        # These are the same configured caps enforced by the encoded projector;
+        # large user overrides cannot silently retain the default admission.
+        plan = max(1, _env_int('YOLO_TTA_NATIVE_PULL_PLAN_MIB', 64)) * mib
+        workers = max(1, _env_int('YOLO_TTA_NATIVE_PULL_WORKSPACE_MIB', 256)) * mib
+        # Only precleaned/zero-threshold masks qualify for this estimate. Their
+        # remaining per-slice work is OpenCV u8/int32/boolean hole filling or
+        # SciPy boolean hole filling, with no EDT/radius/confidence filtering.
+        # Keep a conservative 32 B/pixel per active cleanup reader, and include
+        # the unpacked device row metadata that can coexist with publication.
+        cleanup = 32 * native[1] * native[2] * max(1, min(int(cleanup_workers), native[0]))
+        metadata = native[0] * native[1]
+        # Row codecs normalize bounded slabs; an exceptionally wide single row
+        # can exceed their usual 1 MiB target and must still be charged.
+        row_codec = 6 * (max(mib, native[2]) + max(mib, output[2]))
+        return (max(2 * GIB, cleanup) + packed + records + states + plan + workers
+                + metadata + row_codec + int(confidence_workspace_bytes))
     name = str(view.name).lower()
     transient = 2 * GIB
     if 'tilted' in name:
@@ -575,8 +620,10 @@ def _execution_runtime_provenance() -> Dict[str, object]:
                  'tilted_azimuthal_projection', 'tilted_azimuthal_projection_cuda',
                  'tta_scheduler', 'backprojection', 'd1_orthogonal_coverage',
                  'projection_coverage', 'projection_coverage_cpu',
+                 'native_pull_scheduling', 'native_pull_cuda', 'packed_tilted_projection',
                  'confidence_evidence', 'confidence_storage',
-                 'confidence_capture', 'confidence_capture_cpu'):
+                 'confidence_capture', 'confidence_capture_cpu', 'confidence_native_codec',
+                 'confidence_storage', 'confidence_publication'):
         path = package.joinpath(*name.split('.')).with_suffix('.py')
         entry = {'path': str(path), 'loaded_in_parent': 'XTA.' + name in sys.modules}
         try:
@@ -610,10 +657,18 @@ def _execution_runtime_provenance() -> Dict[str, object]:
     result['task_trace_requested'] = _env_flag('YOLO_TTA_TASK_TRACE', False)
     result['sam_gray_capture_requested'] = _env_flag('YOLO_TTA_SAM_GRAY_CACHE', True)
     result['cpu_input_prefetch_requested'] = _env_flag('YOLO_TTA_CPU_INPUT_PREFETCH', True)
+    result['tilted_cpu_input_prefetch_requested'] = _env_flag('YOLO_TTA_CPU_INPUT_TILTED', False)
     result['cropped_upload_pipeline_requested'] = True
     result['spherical_cpu_compact_requested'] = True
     result['tilted_azimuthal_cuda_projection_requested'] = _env_flag(
         'YOLO_TTA_GPU_TILTED_AZIMUTHAL_BACKPROJECT', True)
+    result['native_projection_requests'] = {
+        'packed_parent': _env_flag('YOLO_TTA_PACKED_PARENT', True),
+        'packed_parent_min_mib': max(0, _env_int('YOLO_TTA_PACKED_PARENT_MIN_MIB', 64)),
+        'exact_cuda': _env_flag('YOLO_TTA_NATIVE_PULL_CUDA', True),
+        'cuda_min_remaining_voxels': max(0, _env_int('YOLO_TTA_NATIVE_PULL_GPU_MIN_VOXELS', 64 * 1024**2)),
+        'shared_cpu_budget': True,
+    }
     result['spherical_retirement_requests'] = {
         'enabled': _env_flag('YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT', True),
         'age_enabled': _env_flag('YOLO_TTA_GPU_SPHERICAL_AGE_RETIREMENT', True),
@@ -2175,6 +2230,16 @@ def _main_impl() -> None:
     whole_box_worker_budget = max(1, 2 * int(len(_allowed_main_cpus)))
     tail_budget_expansion_active = bool(tail_worker_budget_expansion_enabled())
     tail_worker_budget = int(whole_box_worker_budget if tail_budget_expansion_active else worker_budget)
+    # Native destination projection is a separate CPU stage. Dividing its
+    # workers by the configured parent-view count strands most cores when only
+    # a few large views remain. Share one bounded pool across live projections;
+    # the owner outlives every parent/component executor and joins its readers
+    # before the next pipeline invocation can configure another pool.
+    native_pull_scheduler = _run_resources().track_closeable(
+        configure_native_pull_scheduler(
+            workers=int(worker_budget), max_workers=max(int(worker_budget), int(tail_worker_budget)),
+        )
+    )
     augmentation_workers = resolve_worker_count(
         0,
         'YOLO_TTA_AUG_WORKERS',
@@ -2343,7 +2408,9 @@ def _main_impl() -> None:
         if bool(interpolation_process_backend_active) else 0
     )
 
-    print(f'Allocated CPU count: {_cpu_count()}')
+    print(f'Allocated logical CPU count: {len(_allowed_main_cpus)}; '
+          f'parent inference-phase affinity: {_cpu_count()}; '
+          f'GPU feeder reservation: {len(gpu_feeder_reserved_cpus)}')
     print(f'Worker budget (main process): {worker_budget}')
     print(
         'Post-inference tail worker budget: '
@@ -2373,6 +2440,10 @@ def _main_impl() -> None:
     print(f'Augmentation workers: {augmentation_workers}')
     print(f'Slice-parallel postprocess workers: {slice_postprocess_workers}')
     print(f'Inference postprocess workers: {predict_postprocess_workers}')
+    print('Shared CPU pool for native projection and confidence capture: '
+          f'{worker_budget} shared workers during inference, '
+          f'{tail_worker_budget} after inference drain; '
+          'active jobs share bounded ordered frame credits.')
     print(
         'Parent full-frame postprocess workers: '
         f'{parent_postprocess_workers} (independent of interpolation; default={parent_postprocess_default_workers}, '
@@ -2382,7 +2453,7 @@ def _main_impl() -> None:
     )
     if bool(getattr(args, 'reconciliation_retain_confidence', False)):
         print('Parent confidence capture: '
-              f'CPU workers bounded by slice_workers/view={parent_slice_postprocess_workers}; '
+              f'active captures share the {worker_budget}-worker CPU budget; '
               f'workspace cap={PARENT_CONFIDENCE_CAPTURE_WORKSPACE_BYTES / 1024**2:.0f} MiB/view, '
               'effective scratch charged to the existing parent transient admission.')
     print(
@@ -2661,6 +2732,7 @@ def _main_impl() -> None:
     # bounded retirement path is authoritative.
     component_ref_dense_retirement_active = bool(not keep_temp_artifacts)
     direct_union_sparse_retirement_active = bool(component_ref_dense_retirement_active)
+    projected_parent_output_memory = {}
 
     _default_inference_view_limit = max(2, min(4, max(1, int(gpu_device_count))))
     direct_union_inference_view_limit = max(
@@ -2906,6 +2978,11 @@ def _main_impl() -> None:
         'projection.component_queue', component_projection_queue.snapshot)
     runtime_telemetry().register_sample_provider(
         'gpu.stage.live', _MAIN_PROCESS_GPU_STAGE_COORDINATOR.snapshot)
+    runtime_telemetry().register_sample_provider(
+        'cpu.parent_work.live', native_pull_scheduler.snapshot)
+    from .confidence_evidence import confidence_publication_snapshot
+    runtime_telemetry().register_sample_provider(
+        'confidence.publication.live', confidence_publication_snapshot)
     print('Component projection queue: up to 4 workers, '
           f'initial working allowance={component_projection_queue.snapshot()["max_working_bytes"] / GIB:.1f} GiB '
           '(updated from live physical/cgroup/SLURM headroom)')
@@ -3114,6 +3191,7 @@ def _main_impl() -> None:
     # B (parent-only interpolation delta) becomes ready when the parent future completes.
     parent_mask_ready_events = queue.SimpleQueue()
     parent_confidence_retired_events = queue.SimpleQueue()
+    parent_mask_retired_events = queue.SimpleQueue()
     parent_dense_retired_events = queue.SimpleQueue()
     parent_bridge_ready: set[Tuple[str, str]] = set()
     parent_tile_supports_retired: set[Tuple[str, str]] = set()
@@ -3465,6 +3543,15 @@ def _main_impl() -> None:
         # binds its local scheduler_wake alias.
         scheduler_state.scheduler_wake.set()
 
+    def _publish_parent_mask_retired(model_name: str, view_name: str, nbytes: int,
+                                   *, expected_lease: _DirectUnionBackingLease) -> None:
+        # Packing changes the physical source footprint while projection is
+        # still active. The event is emitted only after the original backing
+        # loses its last owner, and keeps the packed payload charged.
+        parent_mask_retired_events.put(
+            ((str(model_name), str(view_name)), expected_lease, int(nbytes)))
+        scheduler_state.scheduler_wake.set()
+
     def _publish_parent_dense_retired(key, expected_lease):
         parent_dense_retired_events.put((key, expected_lease))
         scheduler_state.scheduler_wake.set()
@@ -3535,10 +3622,26 @@ def _main_impl() -> None:
         processing_bytes = int(array_nbytes(processing_shape, np.uint8))
         source_bytes = int(array_nbytes((int(input_T), int(input_H), int(input_W)), np.uint8))
         capture_workspace_bytes = 0 if capture_plan is None else int(capture_plan.workspace_bytes)
+        from .packed_tilted_projection import terminal_native_source_packing_eligible
+        packed_source_eligible = terminal_native_source_packing_eligible(view,
+            native_bytes=math.prod(capture_shape),
+            retire_dense=component_ref_dense_retirement_active,
+            component_layers=component_layers_needed, tiled=dense_tiling_active,
+            keep_temp=keep_temp_artifacts,
+            prepublished=preinterpolation_layer_already_published,
+            interpolate=int(args.interpolation_distance), interpolation_passes=int(args.interpolation_passes),
+            extrapolate=interpolation_settings.extrapolation_distance,
+            mask_callback_available=key in direct_union_backing_leases,
+            confidence_can_retire=(confmap_mm is None or key in direct_union_backing_leases))
         transient_bytes = _parent_prepare_transient_bytes(view, processing_bytes, source_bytes,
             interpolation_enabled=(interpolation_settings.extrapolation_enabled or
                 _view_uses_interpolation(view, int(args.interpolation_distance))),
-            confidence_workspace_bytes=capture_workspace_bytes)
+            confidence_workspace_bytes=capture_workspace_bytes,
+            packed_native_source=packed_source_eligible, native_shape=capture_shape,
+            source_shape=(int(input_T), int(input_H), int(input_W)),
+            cleanup_workers=parent_slice_postprocess_workers,
+            cleanup_is_simple=(angle_variant_streaming_cleanup_active or
+                float(args.min_conf) <= 0. and float(args.min_radius) <= 0.))
 
         task = AdmittedViewPrepare(
             admission=parent_transient_admission,
@@ -3588,6 +3691,13 @@ def _main_impl() -> None:
                 if key in direct_union_backing_leases else None),
             confidence_retired_callback_factory=lambda lease:partial(
                 _publish_parent_confidence_retired, expected_lease=lease),
+            mask_retired_callback=(
+                partial(_publish_parent_mask_retired,
+                        expected_lease=direct_union_backing_leases[key])
+                if key in direct_union_backing_leases else None),
+            mask_retired_callback_factory=lambda lease: partial(
+                _publish_parent_mask_retired, expected_lease=lease),
+            projected_output_memory=projected_parent_output_memory.get(key),
         )
 
         transitioned = view_prepare_leases.handoff(key)
@@ -4969,6 +5079,14 @@ def _main_impl() -> None:
             if view_prepare_leases.retire_input_bytes(key, lease, nbytes, token='confidence'):
                 direct_union_capacity_released = True
                 runtime_telemetry().add('inference.dense_confidence_retired_bytes', nbytes)
+        while True:
+            try:
+                key, lease, nbytes = parent_mask_retired_events.get_nowait()
+            except queue.Empty:
+                break
+            if view_prepare_leases.retire_input_bytes(key, lease, nbytes, token='mask'):
+                direct_union_capacity_released = True
+                runtime_telemetry().add('inference.dense_mask_retired_bytes', nbytes)
         if sam_parent_staging is not None:
             resumed, released = sam_parent_staging.pump(
                 budget=background_drain_budget, resumed_futures=view_processing_futures)
@@ -5033,6 +5151,17 @@ def _main_impl() -> None:
             _flush_ready_residual_tiles()
             interpolation_stats.extend(result.interpolation_stats)
             nrrd_layer_refs.extend(result.nrrd_layers)
+            if bool(getattr(result, '_packed_native_source_retired', False)):
+                # An immutable packed publication may finish before an outside
+                # view of either original input dies. Preserve the same owner
+                # fence used by deferred publications even though no child
+                # future remains; individual retirement receipts are idempotent.
+                direct_union_capacity_released |= view_prepare_leases.retire_dense_for_publication(
+                    result, enabled=bool(component_ref_dense_retirement_active),
+                    tiled=int(tile_expected_by_parent.get(completed_view_key, 0)) > 0,
+                    keep_temp=bool(keep_temp_artifacts),
+                    retired_callback=_publish_parent_dense_retired,
+                )
             if view_prepare_leases.complete(
                 completed_view_key,
                 retain_for_dense_retirement=bool(component_ref_dense_retirement_active),
@@ -5891,9 +6020,9 @@ def _main_impl() -> None:
         )
         if gpu_worker_device_hole_fill:
             print(
-                'Split-view hole fill moved off the inference handoff: multi-chunk '
-                'full-frame views run one completed-view CPU pass instead of a CuPy label/fill '
-                'barrier after every GPU lease.'
+                'Device-union hole fill: eligible single-lease views and disjoint '
+                'Spherical full-frame leases finish exact per-slice cleanup on the GPU '
+                'before publication. Other split views retain completed-view CPU cleanup.'
             )
         fullframe_subtasks_per_view: Dict[Tuple[str, str], int] = {}
         next_task_id = 0
@@ -6105,11 +6234,9 @@ def _main_impl() -> None:
                     'streaming_cleanup_enabled': bool(angle_variant_streaming_cleanup_active),
                     'streaming_cleanup_min_conf': float(args.min_conf),
                     'streaming_cleanup_min_radius': float(processing_min_radius),
-                    'device_hole_fill': bool(
-                        gpu_worker_device_hole_fill
-                        and str(kind) == 'fullframe'
-                        and str(result_mode) == 'direct_union'
-                        and len(ranges) <= 1
+                    'device_hole_fill': device_union_task_hole_fill_eligible(
+                        view, enabled=bool(gpu_worker_device_hole_fill),
+                        kind=str(kind), result_mode=str(result_mode), lease_count=len(ranges),
                     ),
                 }
                 if str(result_mode) in {'d1_owner', HYBRID_DEFERRED_RESULT_MODE}:
@@ -6346,7 +6473,17 @@ def _main_impl() -> None:
             bounded_retirement=bool(direct_union_sparse_retirement_active),
             retain_confidence=bool(getattr(args, 'reconciliation_retain_confidence', False)),
         )
-        plan_native_publication_memory(
+        from .publication_memory import terminal_parent_output_specs
+        projected_parent_outputs = terminal_parent_output_specs(
+            gpu_worker_tasks_by_id.values(), temp_dir=temp_dir,
+            source_shape=(int(input_T), int(input_H), int(input_W)),
+            retire_dense=component_ref_dense_retirement_active,
+            component_layers=component_layers_needed, tiled=dense_tiling_active,
+            keep_temp=keep_temp_artifacts,
+            interpolate=int(args.interpolation_distance),
+            interpolation_passes=int(args.interpolation_passes),
+            extrapolate=interpolation_settings.extrapolation_distance)
+        native_publication_plan = plan_native_publication_memory(
             gpu_worker_tasks_by_id.values(), keep_temp=bool(keep_temp_artifacts),
             worker_count=int(gpu_device_count),
             publication_pending=d1_publication_max_pending_per_worker(),
@@ -6355,7 +6492,11 @@ def _main_impl() -> None:
             worker_buffer_reserve_bytes=confidence_worker_reserve + gray_capture_reserve_bytes,
             output_reserve_bytes=publication_output_reserve(
                 nrrd_layer_sink(), nrrd_member_gzip_window_bytes(), nrrd_gzip_chunk_bytes()) + confidence_stage_reserve,
+            projected_parent_outputs=projected_parent_outputs,
         )
+        if native_publication_plan is not None:
+            projected_parent_output_memory.update({tuple(spec['key']): spec
+                for spec in native_publication_plan['parent_outputs']})
         print('Execution provenance: ' + json.dumps(_execution_runtime_provenance(), sort_keys=True), flush=True)
         radial_owner_tasks = [task for task in gpu_worker_tasks_by_id.values()
                               if task.get('projection_contract') == RADIAL_OWNER_CONTRACT]
@@ -6504,9 +6645,12 @@ def _main_impl() -> None:
             cpu_input_pinned_reserve_bytes = 2 * int(args.imgsz) ** 2 * max(
                 int(gpu_device_count), len(gpu_task_queues))
             _run_resources().track_executor(scheduler.cpu_input_prefetch)
-            print(f'YOLO CPU input prefetch: curved GPU projections first; gray Cartesian/Tilted '
+            input_families = ('Cartesian/Tilted' if _env_flag('YOLO_TTA_CPU_INPUT_TILTED', False)
+                              else 'Cartesian')
+            print(f'YOLO CPU input prefetch: curved GPU projections first; gray {input_families} '
                 f'canvases prepared from decoded native t in bounded shared RAM '
                 f'({cpu_input_budget / GIB:.2f} GiB charged to the detector workspace budget). '
+                'Tilted views use resident GPU rendering unless YOLO_TTA_CPU_INPUT_TILTED=1. '
                 'Unavailable CPU inputs retain GPU rendering. YOLO_TTA_CPU_INPUT_PREFETCH=0 disables this route.', flush=True)
 
         tile_result_sizes = [
@@ -7165,6 +7309,10 @@ def _main_impl() -> None:
             _set_main_process_gpu_inference_priority_active(False)
             _set_main_process_gpu_asset_retirement_pending(False)
         _restore_parent_post_inference_affinity()
+        # Enlarge the existing projection pool at inference drain, while parent
+        # projections are still running. The later global-output expansion is
+        # deliberately too late for those jobs and cannot resize their work.
+        native_pull_scheduler.resize(int(tail_worker_budget))
         if bool(scheduler_state.gpu_inference_drain_announced):
             return
         scheduler_state.gpu_inference_drain_announced = True

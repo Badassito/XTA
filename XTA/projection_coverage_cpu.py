@@ -304,44 +304,59 @@ def _pull_tilted(source, output, first, integer, coefficient, bbox, scalar_max):
     tangent, origin, shear_center = coefficient[0:3]
     addresses = 0
     visited = 0
-    for local_index in range(output.size):
-        at = first + local_index
-        z, y, x = at // (oh * ow), (at // ow) % oh, at % ow
-        value = 0
-        if not (bbox[0] <= z < bbox[3] and bbox[1] <= y < bbox[4] and bbox[2] <= x < bbox[5]):
-            output[local_index] = 0
+    local_start = 0
+    while local_start < output.size:
+        # A caller span can start/end within any row. Decode flat coordinates
+        # and contraction bounds once per contiguous row, rather than once per
+        # voxel; keep the contributor order and floating-point expressions exact.
+        at = first + local_start
+        z, y, row_x = at // (oh * ow), (at // ow) % oh, at % ow
+        row_count = min(ow - row_x, output.size - local_start)
+        local_stop = local_start + row_count
+        if not (bbox[0] <= z < bbox[3] and bbox[1] <= y < bbox[4]):
+            output[local_start:local_stop] = 0
+            local_start = local_stop
             continue
-        visited += 1
+        valid_start = min(row_count, max(0, bbox[2] - row_x))
+        valid_stop = max(valid_start, min(row_count, bbox[5] - row_x))
+        output[local_start:local_start + valid_start] = 0
+        output[local_start + valid_stop:local_stop] = 0
+        visited += valid_stop - valid_start
         z0, z1 = _axis_bounds(z, wt, ot)
         y0, y1 = _axis_bounds(y, wh, oh)
-        x0, x1 = _axis_bounds(x, ww, ow)
-        for iz in range(z0, z1):
-            cz = _axis_value(z, iz, wt, ot, coefficient[9])
-            for iy in range(y0, y1):
-                cy = _axis_value(y, iy, wh, oh, coefficient[10])
-                for ix in range(x0, x1):
-                    cx = _axis_value(x, ix, ww, ow, coefficient[11])
-                    nv = cy if base == 0 else cz
-                    nu = cx if base != 2 else cy
-                    stack = cz if base == 0 else (cy if base == 1 else cx)
-                    axis = nv if vertical else nu
-                    frame = stack - tangent * (axis - shear_center) - origin
-                    if frame < -.5 or frame >= source.shape[0] - .5:
-                        continue
-                    if nv < -.5 or nv >= nh - .5 or nu < -.5 or nu >= nw - .5:
-                        continue
-                    row = coefficient[6] * nu + coefficient[7] * nv + coefficient[8]
-                    column = coefficient[3] * nu + coefficient[4] * nv + coefficient[5]
-                    f = int(math.floor(frame + .5))
-                    r = min(source.shape[1] - 1, max(0, int(math.floor(row + .5))))
-                    c = min(source.shape[2] - 1, max(0, int(math.floor(column + .5))))
-                    pixel = int(source[f, r, c])
-                    addresses += 1
-                    if scalar_max:
-                        value = max(value, pixel)
-                    elif pixel:
-                        value = 1
-        output[local_index] = value
+        for row_offset in range(valid_start, valid_stop):
+            local_index = local_start + row_offset
+            x = row_x + row_offset
+            value = 0
+            x0, x1 = _axis_bounds(x, ww, ow)
+            for iz in range(z0, z1):
+                cz = _axis_value(z, iz, wt, ot, coefficient[9])
+                for iy in range(y0, y1):
+                    cy = _axis_value(y, iy, wh, oh, coefficient[10])
+                    for ix in range(x0, x1):
+                        cx = _axis_value(x, ix, ww, ow, coefficient[11])
+                        nv = cy if base == 0 else cz
+                        nu = cx if base != 2 else cy
+                        stack = cz if base == 0 else (cy if base == 1 else cx)
+                        axis = nv if vertical else nu
+                        frame = stack - tangent * (axis - shear_center) - origin
+                        if frame < -.5 or frame >= source.shape[0] - .5:
+                            continue
+                        if nv < -.5 or nv >= nh - .5 or nu < -.5 or nu >= nw - .5:
+                            continue
+                        row = coefficient[6] * nu + coefficient[7] * nv + coefficient[8]
+                        column = coefficient[3] * nu + coefficient[4] * nv + coefficient[5]
+                        f = int(math.floor(frame + .5))
+                        r = min(source.shape[1] - 1, max(0, int(math.floor(row + .5))))
+                        c = min(source.shape[2] - 1, max(0, int(math.floor(column + .5))))
+                        pixel = int(source[f, r, c])
+                        addresses += 1
+                        if scalar_max:
+                            value = max(value, pixel)
+                        elif pixel:
+                            value = 1
+            output[local_index] = value
+        local_start = local_stop
     return visited, addresses
 
 
@@ -356,55 +371,67 @@ def _pull_azimuthal(source, output, first, integer, coefficient, bbox, scalar_ma
     output_stack = ot if base == 0 else (oh if base == 1 else ow)
     addresses = 0
     visited = 0
-    for local_index in range(output.size):
-        at = first + local_index
-        z, y, x = at // (oh * ow), (at // ow) % oh, at % ow
-        value = 0
-        if not (bbox[0] <= z < bbox[3] and bbox[1] <= y < bbox[4] and bbox[2] <= x < bbox[5]):
-            output[local_index] = 0
+    local_start = 0
+    while local_start < output.size:
+        at = first + local_start
+        z, y, row_x = at // (oh * ow), (at // ow) % oh, at % ow
+        row_count = min(ow - row_x, output.size - local_start)
+        local_stop = local_start + row_count
+        if not (bbox[0] <= z < bbox[3] and bbox[1] <= y < bbox[4]):
+            output[local_start:local_stop] = 0
+            local_start = local_stop
             continue
-        visited += 1
-        if keys_are_plane:
-            plane_index = y * ow + x if base == 0 else (z * ow + x if base == 1 else z * oh + y)
-            key = keys[plane_index]
-        else:
-            key = keys[local_index]
-        if key == invalid:
-            output[local_index] = 0
-            continue
+        valid_start = min(row_count, max(0, bbox[2] - row_x))
+        valid_stop = max(valid_start, min(row_count, bbox[5] - row_x))
+        output[local_start:local_start + valid_start] = 0
+        output[local_start + valid_stop:local_stop] = 0
+        visited += valid_stop - valid_start
         cz = (z + .5) * coefficient[9] - .5
         cy = (y + .5) * coefficient[10] - .5
-        cx = (x + .5) * coefficient[11] - .5
-        nv = cy if base == 0 else cz
-        nu = cx if base != 2 else cy
-        stack = cz if base == 0 else (cy if base == 1 else cx)
-        destination_stack = z if base == 0 else (y if base == 1 else x)
-        axis = nv if vertical else nu
-        center = stack - tangent * (axis - shear_center)
-        local_frame = center - origin
-        if nh > output_stack:
-            shift = center - stack - origin
-            lower = max(0, int(math.floor(destination_stack * nh / output_stack
-                                          + shift * nh / stack_size)))
-            upper = min(nh, int(math.ceil((destination_stack + 1) * nh / output_stack
-                                         + shift * nh / stack_size)))
-        else:
-            if local_frame < -.5 or local_frame >= stack_size - .5:
+        for row_offset in range(valid_start, valid_stop):
+            local_index = local_start + row_offset
+            x = row_x + row_offset
+            value = 0
+            if keys_are_plane:
+                plane_index = y * ow + x if base == 0 else (z * ow + x if base == 1 else z * oh + y)
+                key = keys[plane_index]
+            else:
+                key = keys[local_index]
+            if key == invalid:
                 output[local_index] = 0
                 continue
-            native_row = (local_frame + .5) * nh / stack_size - .5
-            lower = min(nh - 1, max(0, int(np.rint(native_row))))
-            upper = lower + 1
-        angle = int(key // source.shape[2])
-        column = int(key % source.shape[2])
-        for native_row in range(lower, upper):
-            pixel = int(source[angle, rows[native_row], column])
-            addresses += 1
-            if scalar_max:
-                value = max(value, pixel)
-            elif pixel:
-                value = 1
-        output[local_index] = value
+            cx = (x + .5) * coefficient[11] - .5
+            nv = cy if base == 0 else cz
+            nu = cx if base != 2 else cy
+            stack = cz if base == 0 else (cy if base == 1 else cx)
+            destination_stack = z if base == 0 else (y if base == 1 else x)
+            axis = nv if vertical else nu
+            center = stack - tangent * (axis - shear_center)
+            local_frame = center - origin
+            if nh > output_stack:
+                shift = center - stack - origin
+                lower = max(0, int(math.floor(destination_stack * nh / output_stack
+                                              + shift * nh / stack_size)))
+                upper = min(nh, int(math.ceil((destination_stack + 1) * nh / output_stack
+                                             + shift * nh / stack_size)))
+            else:
+                if local_frame < -.5 or local_frame >= stack_size - .5:
+                    output[local_index] = 0
+                    continue
+                native_row = (local_frame + .5) * nh / stack_size - .5
+                lower = min(nh - 1, max(0, int(np.rint(native_row))))
+                upper = lower + 1
+            angle = int(key // source.shape[2])
+            column = int(key % source.shape[2])
+            for native_row in range(lower, upper):
+                pixel = int(source[angle, rows[native_row], column])
+                addresses += 1
+                if scalar_max:
+                    value = max(value, pixel)
+                elif pixel:
+                    value = 1
+            output[local_index] = value
+        local_start = local_stop
     return visited, addresses
 
 
@@ -463,65 +490,77 @@ def _pull_azimuthal_encoded(encoded, index, packed_input, source_width, output, 
     stack_size = wt if base == 0 else (wh if base == 1 else ww)
     output_stack = ot if base == 0 else (oh if base == 1 else ow)
     visited = addresses = reads = positive = 0
-    for local_index in range(output.size):
-        at = first+local_index
-        z,y,x = at//(oh*ow), (at//ow)%oh, at%ow
-        value = 0
-        if not (bbox[0] <= z < bbox[3] and bbox[1] <= y < bbox[4] and bbox[2] <= x < bbox[5]):
-            output[local_index] = 0
+    local_start = 0
+    while local_start < output.size:
+        at = first + local_start
+        z, y, row_x = at // (oh * ow), (at // ow) % oh, at % ow
+        row_count = min(ow - row_x, output.size - local_start)
+        local_stop = local_start + row_count
+        if not (bbox[0] <= z < bbox[3] and bbox[1] <= y < bbox[4]):
+            output[local_start:local_stop] = 0
+            local_start = local_stop
             continue
-        visited += 1
-        if keys_are_plane:
-            plane_index = y*ow+x if base == 0 else (z*ow+x if base == 1 else z*oh+y)
-            key = keys[plane_index]
-        else:
-            key = keys[local_index]
-        if key == invalid:
-            output[local_index] = 0
-            continue
-        cz = (z+.5)*coefficient[9]-.5
-        cy = (y+.5)*coefficient[10]-.5
-        cx = (x+.5)*coefficient[11]-.5
-        nv = cy if base == 0 else cz
-        nu = cx if base != 2 else cy
-        stack = cz if base == 0 else (cy if base == 1 else cx)
-        destination_stack = z if base == 0 else (y if base == 1 else x)
-        axis = nv if vertical else nu
-        center = stack-tangent*(axis-shear_center)
-        local_frame = center-origin
-        if nh > output_stack:
-            shift = center-stack-origin
-            lower = max(0,int(math.floor(destination_stack*nh/output_stack+shift*nh/stack_size)))
-            upper = min(nh,int(math.ceil((destination_stack+1)*nh/output_stack+shift*nh/stack_size)))
-        else:
-            if local_frame < -.5 or local_frame >= stack_size-.5:
+        valid_start = min(row_count, max(0, bbox[2] - row_x))
+        valid_stop = max(valid_start, min(row_count, bbox[5] - row_x))
+        output[local_start:local_start + valid_start] = 0
+        output[local_start + valid_stop:local_stop] = 0
+        visited += valid_stop - valid_start
+        cz = (z + .5) * coefficient[9] - .5
+        cy = (y + .5) * coefficient[10] - .5
+        for row_offset in range(valid_start, valid_stop):
+            local_index = local_start + row_offset
+            x = row_x + row_offset
+            value = 0
+            if keys_are_plane:
+                plane_index = y*ow+x if base == 0 else (z*ow+x if base == 1 else z*oh+y)
+                key = keys[plane_index]
+            else:
+                key = keys[local_index]
+            if key == invalid:
                 output[local_index] = 0
                 continue
-            native_row = (local_frame+.5)*nh/stack_size-.5
-            lower = min(nh-1,max(0,int(np.rint(native_row))))
-            upper = lower+1
-        angle,column = int(key//source_width),int(key%source_width)
-        record = index[angle]
-        y0,x0,y1,x1 = (np.int64(record['y0']),np.int64(record['x0']),
-                       np.int64(record['y1']),np.int64(record['x1']))
-        for native_row in range(lower,upper):
-            addresses += 1
-            row = np.int64(rows[native_row])
-            if (record['kind'] == 0 or row < y0 or row >= y1 or column < x0 or column >= x1):
-                continue
-            width = x1-x0
-            local_column = np.int64(column)-x0
-            stride = (width+7)//8 if packed_input else width
-            address = np.int64(record['offset'])+(row-y0)*stride
-            address += local_column//8 if packed_input else local_column
-            pixel = encoded[address]
-            if packed_input:
-                pixel = (pixel >> (local_column&7))&1
-            reads += 1
-            if pixel:
-                positive += 1
-                value = 1
-        output[local_index] = value
+            cx = (x+.5)*coefficient[11]-.5
+            nv = cy if base == 0 else cz
+            nu = cx if base != 2 else cy
+            stack = cz if base == 0 else (cy if base == 1 else cx)
+            destination_stack = z if base == 0 else (y if base == 1 else x)
+            axis = nv if vertical else nu
+            center = stack-tangent*(axis-shear_center)
+            local_frame = center-origin
+            if nh > output_stack:
+                shift = center-stack-origin
+                lower = max(0,int(math.floor(destination_stack*nh/output_stack+shift*nh/stack_size)))
+                upper = min(nh,int(math.ceil((destination_stack+1)*nh/output_stack+shift*nh/stack_size)))
+            else:
+                if local_frame < -.5 or local_frame >= stack_size-.5:
+                    output[local_index] = 0
+                    continue
+                native_row = (local_frame+.5)*nh/stack_size-.5
+                lower = min(nh-1,max(0,int(np.rint(native_row))))
+                upper = lower+1
+            angle,column = int(key//source_width),int(key%source_width)
+            record = index[angle]
+            y0,x0,y1,x1 = (np.int64(record['y0']),np.int64(record['x0']),
+                           np.int64(record['y1']),np.int64(record['x1']))
+            for native_row in range(lower,upper):
+                addresses += 1
+                row = np.int64(rows[native_row])
+                if (record['kind'] == 0 or row < y0 or row >= y1 or column < x0 or column >= x1):
+                    continue
+                width = x1-x0
+                local_column = np.int64(column)-x0
+                stride = (width+7)//8 if packed_input else width
+                address = np.int64(record['offset'])+(row-y0)*stride
+                address += local_column//8 if packed_input else local_column
+                pixel = encoded[address]
+                if packed_input:
+                    pixel = (pixel >> (local_column&7))&1
+                reads += 1
+                if pixel:
+                    positive += 1
+                    value = 1
+            output[local_index] = value
+        local_start = local_stop
     return visited,addresses,reads,positive
 
 

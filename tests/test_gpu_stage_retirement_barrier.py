@@ -83,6 +83,8 @@ class GpuStageRetirementBarrierTests(unittest.TestCase):
             'sam_context': None,
             'scheduler': types.SimpleNamespace(request_gpu_inference_asset_release=request),
             '_restore_parent_post_inference_affinity': lambda: None,
+            'native_pull_scheduler': types.SimpleNamespace(resize=lambda workers: None),
+            'tail_worker_budget': 128,
             '_set_main_process_gpu_asset_retirement_pending': self.coordinator.set_inference_asset_retirement_pending,
             '_set_main_process_gpu_inference_priority_active': self.coordinator.set_inference_priority_active,
         })

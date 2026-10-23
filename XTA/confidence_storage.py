@@ -26,8 +26,33 @@ class ConfidenceStageLimit(RuntimeError):
     """A local compressed stage would exceed its reserved numeric bytes."""
 
 
-def _ordered_encoded_frames(reader, first, stop, block_size, workers):
+def _ordered_encoded_frames(reader, first, stop, block_size, workers, metrics=None):
     """Retain at most workers completed frames plus the caller's current frame."""
+    from .native_pull_scheduling import get_native_pull_scheduler
+    scheduler = get_native_pull_scheduler()
+    if scheduler is not None:
+        # Register only after the publication queue has admitted its numeric
+        # staging slot. Waiting parent executor threads own no CPU lane. Native
+        # projection and confidence share the same running/retained credits.
+        frames = scheduler.ordered_planes(stop-first,
+            lambda offset: reader.encode_frame(first+offset, block_size),
+            max_pending=workers, role='confidence_capture')
+        try:
+            for offset, result in frames:
+                yield first+offset, result
+        finally:
+            # A failed consumer or stage limit must join every borrowed mask/
+            # score reader before its parent's dense reservation can retire.
+            try:
+                if metrics is not None:
+                    state = frames.snapshot()
+                    metrics.update(capture_scheduler='run_shared',
+                        capture_cpu_budget=state['cpu_budget'],
+                        capture_peak_active_frames=state['job_peak_active_operations'],
+                        capture_peak_retained_frames=state['job_peak_retained_operations'])
+            finally:
+                frames.close()
+        return
     if workers <= 1:
         for z in range(first, stop):
             yield z, reader.encode_frame(z, block_size)
@@ -161,6 +186,10 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
     digest,index_digest = hashlib.sha256(),hashlib.sha256()
     blocks,known = 0,0
     read_seconds = scan_seconds = compression_seconds = storage_seconds = 0.0
+    codec_diagnostics, codec_frame_counts = {}, {}
+    copy_kernel_calls = copy_batch_peak_bytes = 0
+    native_compression_batches = 0
+    native_batch_seconds = 0.
     started = time.perf_counter()
     next_progress = started + 30.0
     encoded_frames = None
@@ -174,22 +203,64 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
         capture_plan = plan_confidence_capture(shape, 1, block_size=block_size)
     if capture_plan is not None:
         encoded_frames = _ordered_encoded_frames(slice_reader, first, stop, block_size,
-                                                  capture_plan.workers)
+                                                  capture_plan.workers, metrics=metrics)
+    # The consumer's already admitted frame allowance also bounds this transient
+    # copy. Leave a factor of two plus control space for bytearray overallocation.
+    # Generic readers retain their existing cell-at-a-time memory contract.
+    batch_limit = (min(1024*1024, max(0, (capture_plan.consumer_bytes-128)//2))
+                   if capture_plan is not None else 0)
+    payload_offset = 0
+    payload_write_calls = index_write_calls = 0
     try:
         with payload_tmp.open('wb') as payload,index_tmp.open('wb') as index:
+            payload_batch, index_batch = bytearray(), bytearray()
+            def flush_batch():
+                nonlocal storage_seconds, payload_write_calls, index_write_calls
+                if not index_batch:
+                    return 0.
+                phase_started = time.perf_counter()
+                index.write(index_batch); index_digest.update(index_batch)
+                payload.write(payload_batch); digest.update(payload_batch)
+                index_write_calls += 1
+                payload_write_calls += 1
+                index_batch.clear(); payload_batch.clear()
+                elapsed = time.perf_counter()-phase_started
+                storage_seconds += elapsed
+                return elapsed
             frames = ((z, None) for z in range(first, stop)) if encoded_frames is None else encoded_frames
             for z, encoded_result in frames:
                 now = time.perf_counter()
                 if now >= next_progress:
                     print(f'Confidence write progress {model_name}/{layer_key}: '
                           f'coordinates={coordinate_space}, planes={z-first}/{stop-first}, '
-                          f'blocks={blocks}, payload_bytes={payload.tell()}, elapsed_s={now-started:.1f}.',
+                          f'blocks={blocks}, payload_bytes={payload_offset}, elapsed_s={now-started:.1f}.',
                           flush=True)
                     next_progress = now + 30.0
                 if encoded_result is not None:
                     encoded_rows, phase_metrics = encoded_result
                     scan_seconds += phase_metrics['scan_seconds']
                     compression_seconds += phase_metrics['compression_seconds']
+                    copy_kernel_calls += int(phase_metrics.get('copy_kernel_calls', 0))
+                    copy_batch_peak_bytes = max(copy_batch_peak_bytes,
+                        int(phase_metrics.get('copy_batch_peak_bytes', 0)))
+                    native_compression_batches += int(phase_metrics.get('native_compression_batches', 0))
+                    native_batch_seconds += float(phase_metrics.get('native_batch_seconds', 0.))
+                    for field in ('codec_backend', 'codec_version', 'codec_python_version',
+                                  'codec_fallback_reason'):
+                        if field not in phase_metrics:
+                            continue
+                        value = phase_metrics[field]
+                        if value is not None:
+                            value = str(value)[:256]
+                        values = codec_diagnostics.setdefault(field, [])
+                        if value not in values and len(values) < 4:
+                            values.append(value)
+                    backend = phase_metrics.get('codec_backend')
+                    if backend is not None:
+                        backend = str(backend)[:256]
+                        if backend not in codec_frame_counts and len(codec_frame_counts) >= 16:
+                            backend = 'other'
+                        codec_frame_counts[backend] = codec_frame_counts.get(backend, 0)+1
                     iterator = iter(encoded_rows)
                 else:
                     phase_started = time.perf_counter()
@@ -221,16 +292,31 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
                     else:
                         y0,y1,x0,x1,known_in_block,encoded = item
                     if (max_numeric_bytes is not None
-                            and payload.tell()+len(encoded)+(blocks+1)*_RECORD.size > int(max_numeric_bytes)):
+                            and payload_offset+len(encoded)+(blocks+1)*_RECORD.size > int(max_numeric_bytes)):
                         raise ConfidenceStageLimit('Compressed confidence exceeds its local staging reservation')
                     phase_started = time.perf_counter()
-                    record = _RECORD.pack(z,y0,x0,y1-y0,x1-x0,payload.tell(),len(encoded))
-                    index.write(record); index_digest.update(record)
-                    payload.write(encoded); digest.update(encoded)
-                    storage_seconds += time.perf_counter() - phase_started
+                    flushed_seconds = 0.
+                    record = _RECORD.pack(z,y0,x0,y1-y0,x1-x0,payload_offset,len(encoded))
+                    record_bytes = len(record)+len(encoded)
+                    if batch_limit and record_bytes <= batch_limit:
+                        if len(index_batch)+len(payload_batch)+record_bytes > batch_limit:
+                            flushed_seconds += flush_batch()
+                        index_batch.extend(record)
+                        payload_batch.extend(encoded)
+                    else:
+                        flushed_seconds += flush_batch()
+                        index.write(record); index_digest.update(record)
+                        payload.write(encoded); digest.update(encoded)
+                        index_write_calls += 1
+                        payload_write_calls += 1
+                    payload_offset += len(encoded)
+                    storage_seconds += time.perf_counter() - phase_started - flushed_seconds
                     blocks += 1
                     known += known_in_block
-            payload_bytes = payload.tell()
+                # No copied batch may coexist with both the preceding frame and
+                # its successor during an ordered iterator's next() operation.
+                flush_batch()
+            payload_bytes = payload_offset
             phase_started = time.perf_counter()
             payload.flush(); index.flush()
             storage_seconds += time.perf_counter() - phase_started
@@ -256,7 +342,21 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
             metrics.update(read_seconds=read_seconds, scan_seconds=scan_seconds,
                 compression_seconds=compression_seconds, storage_seconds=storage_seconds,
                 elapsed_seconds=time.perf_counter()-started, payload_bytes=payload_bytes,
-                index_bytes=blocks*_RECORD.size, block_count=blocks)
+                index_bytes=blocks*_RECORD.size, block_count=blocks,
+                storage_batch_limit_bytes=batch_limit,
+                storage_batch_reserved_bytes=0 if not batch_limit else 2*batch_limit+128,
+                storage_payload_write_calls=payload_write_calls,
+                storage_index_write_calls=index_write_calls)
+            if codec_diagnostics:
+                metrics.update(capture_codec_frame_counts=dict(codec_frame_counts),
+                    capture_copy_kernel_calls=copy_kernel_calls,
+                    capture_copy_batch_peak_bytes=copy_batch_peak_bytes,
+                    native_compression_batches=native_compression_batches,
+                    native_batch_seconds=native_batch_seconds)
+                for field, values in codec_diagnostics.items():
+                    metrics[field] = values[0] if len(values) == 1 else 'mixed'
+                    if len(values) > 1:
+                        metrics[field+'_values'] = list(values)
             if capture_plan is not None:
                 metrics.update(capture_backend='compiled_masked_cells_ordered_frames',
                     capture_workers=capture_plan.workers,

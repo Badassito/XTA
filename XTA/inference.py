@@ -1798,6 +1798,18 @@ def gpu_device_hole_fill_enabled() -> bool:
     """2D-hole-fill eligible device unions before they are committed."""
     return _env_flag('YOLO_TTA_GPU_HOLE_FILL', True)
 
+def device_union_task_hole_fill_eligible(view, *, enabled, kind, result_mode, lease_count):
+    """Keep exact per-slice Spherical cleanup on disjoint resident task unions.
+
+    ``enabled`` is the pipeline's existing proof that confidence and radius
+    cleanup have no remaining work. Spherical leases own independent complete
+    planes, so splitting their stack does not change 2D connectivity. External
+    inverse-mapped policy masks must never gain unsupported foreground.
+    """
+    return bool(enabled and str(kind)=='fullframe' and str(result_mode)=='direct_union'
+        and int(lease_count)>0 and int(getattr(view,'augmentation_pass',0))<=0
+        and (int(lease_count)==1 or str(getattr(view,'family',''))=='spherical'))
+
 def gpu_union_flush_overlap_enabled() -> bool:
     """Retire CUDA-worker task unions on persistent event-driven D2H lanes.
 

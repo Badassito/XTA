@@ -1329,22 +1329,38 @@ class _DeferredGpuWorkerTaskResult:
     """Task stats whose device-union flush is retiring on a persistent copy lane."""
 
     stats: Dict[str, object]
-    flush_future: Future
+    flush_future: Optional[Future]
     memmaps: Tuple[object, ...]
 
     def finish(self) -> Dict[str, object]:
+        future = self.flush_future
+        if future is None:
+            raise RuntimeError('Deferred GPU worker result was already finished')
         try:
-            retired = self.flush_future.result()
+            retired = future.result()
             if isinstance(retired, dict):
                 self.stats.update(retired)
             return self.stats
         finally:
-            for mm in self.memmaps:
-                if mm is not None:
-                    try:
-                        close_memmap_array(mm)
-                    except Exception:
-                        pass
+            # The completed future retains its publication callback, whose
+            # closure owns this result. Keeping either the future or these
+            # mappings here created a cycle that pinned every retired parent
+            # union/confidence memfd until the final worker-wide gc.collect().
+            # result() has now settled all D2H writes, so detach only our owned
+            # aliases; deferred mmap retirement still preserves outside views.
+            retiring, self.memmaps = self.memmaps, ()
+            self.flush_future = None
+            try:
+                for mm in retiring:
+                    if mm is not None:
+                        try:
+                            close_memmap_array(mm)
+                        except Exception:
+                            pass
+            finally:
+                # Failed result() tracebacks must not retain these locals.
+                retiring = ()
+                mm = future = None
 
 def run_prediction_volume_in_worker(
     model: object,

@@ -56,7 +56,9 @@ def submission(tmp_path, *, ready=False, staged=True, dispatch_error=False):
         sam_cpu_max_detector_parent=120,
         direct_union_inference_bytes=leases.inference_bytes,direct_union_postprocess_bytes=leases.postprocess_bytes,
         direct_union_total_dense_byte_limit=10000,policy_settings=SimpleNamespace(enabled=False),
-        _publish_parent_confidence_retired=mock.Mock(),direct_union_backing_leases=leases.leases,
+        _publish_parent_confidence_retired=mock.Mock(),_publish_parent_mask_retired=mock.Mock(),
+        direct_union_backing_leases=leases.leases,
+        projected_parent_output_memory={},
         view_prepare_leases=leases,parent_postprocess_executor=executor,view_processing_futures={},
         gpu_worker_pending_task_ids=[123],_dispatch_inference_windows=dispatch,
         view_processing_volume_shape=lambda *_args:(3,4,5),_view_uses_interpolation=lambda *_args:True)

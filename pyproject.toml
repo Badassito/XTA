@@ -44,7 +44,7 @@ version = {attr = "XTA.__version__"}
 [tool.setuptools.data-files]
 "share/xta" = [
   "ARCHITECTURE.md",
-  "GPT-6-Astra-Ultra_v24.2.0_SLURM.py",
+  "GPT-6-Astra-Ultra_v24.2.1_SLURM.py",
 ]
 "share/xta/docs" = ["docs/sam_interpolation.md", "docs/lta_dynamic_crops.md", "docs/projection_coverage.md", "docs/slicer_pta_cleanup.md", "docs/pta_fraction.md"]
 "share/xta/tools/slicer" = ["tools/slicer/xta_slicerrc.py", "tools/slicer/xta_upscale_preview.py"]

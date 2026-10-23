@@ -293,8 +293,43 @@ def publication_output_reserve(sink, window_bytes, member_bytes):
     return int(sink.max_workers) * (canvases + windows) + dense + dense // 100 + 1024**2
 
 
+def terminal_parent_output_specs(tasks, *, temp_dir, source_shape, retire_dense,
+        component_layers, tiled, keep_temp, interpolate, interpolation_passes, extrapolate):
+    """Describe only terminal parents that execute the packed native route."""
+    from .assembly import _terminal_packed_layer_destination
+    from .packed_tilted_projection import terminal_native_source_packing_eligible
+    output_shape = tuple(map(int, source_shape))
+    if len(output_shape) != 3 or min(output_shape) < 1:
+        raise ValueError('Projected parent output requires a positive source-grid shape')
+    by_key = {}
+    paths = {}
+    for task in tasks:
+        for member in (task, *task.get('augmentation_pass_tasks', ())):
+            if (str(member.get('kind')) != 'fullframe'
+                    or str(member.get('result_mode')) != 'direct_union'):
+                continue
+            shape = tuple(map(int, member.get('processing_shape', ())))
+            if len(shape) != 3 or min(shape) < 1:
+                continue
+            view = member['view']
+            if not terminal_native_source_packing_eligible(view, native_bytes=math.prod(shape),
+                    retire_dense=retire_dense, component_layers=component_layers, tiled=tiled,
+                    keep_temp=keep_temp, prepublished=False, interpolate=interpolate,
+                    interpolation_passes=interpolation_passes, extrapolate=extrapolate):
+                continue
+            key = (str(member['model_name']), str(view.name))
+            _layer_key, path = _terminal_packed_layer_destination(temp_dir, view)
+            path = str(path.absolute())
+            if path in paths and paths[path] != key:
+                raise ValueError('Projected parent publication path belongs to multiple layer identities')
+            paths[path] = key
+            by_key[key] = dict(key=key, path=path, shape=output_shape)
+    return list(by_key.values())
+
+
 def plan_native_publication_memory(tasks, *, keep_temp, worker_count, publication_pending, unpack_bytes,
-                                   output_reserve_bytes=0, native_dense_reserve_bytes=0, worker_buffer_reserve_bytes=0):
+                                   output_reserve_bytes=0, native_dense_reserve_bytes=0, worker_buffer_reserve_bytes=0,
+                                   projected_parent_outputs=()):
     """Create parent-owned empty memfds; immutable task grants bound their growth."""
     if (keep_temp or not memfd_workspace_enabled() or scratch_dir_is_memory_backed()
             or not _env_flag('YOLO_TTA_PUBLICATION_RAM', True)
@@ -306,7 +341,8 @@ def plan_native_publication_memory(tasks, *, keep_temp, worker_count, publicatio
                 and task.get('result_mode') == 'd1_owner'
                 and not task.get('d1_view_shadow_required')):
             by_path.setdefault(str(task['d1_store_dir']), []).append(task)
-    if not by_path:
+    parent_specs = list(projected_parent_outputs)
+    if not by_path and not parent_specs:
         return None
     groups = list(by_path.values())
     shapes = [group[0]['d1_output_shape'] for group in groups]
@@ -315,6 +351,29 @@ def plan_native_publication_memory(tasks, *, keep_temp, worker_count, publicatio
         if len(owners) != 1 or any(task['d1_output_shape'] != shape for task in group):
             print('Native publication RAM plan declined ambiguous layer identities; retaining disk backings.', flush=True)
             return None
+    # All retained layers share one future-payload budget. A native parent
+    # cannot independently promise itself RAM already granted to Radial D1.
+    entries = [dict(path=str(Path(group[0]['d1_store_dir']).absolute()),
+                    tasks=group, key=None) for group in groups]
+    parent_paths = {entry['path'] for entry in entries}
+    parent_keys = set()
+    for spec in parent_specs:
+        key = tuple(map(str, spec['key']))
+        path = str(Path(spec['path']).absolute())
+        shape = tuple(map(int, spec['shape']))
+        if len(key) != 2 or key in parent_keys or path in parent_paths:
+            raise ValueError('Projected parent RAM plan requires unique layer keys and paths')
+        parent_keys.add(key)
+        parent_paths.add(path)
+        shapes.append(shape)
+        entries.append(dict(path=path, tasks=None, key=key, shape=shape))
+    if parent_specs:
+        # Parent fallback is a large raw source-grid CVOL; Radial D1 already
+        # falls back to compact row bits. Fund those expensive parent fallbacks
+        # first while preserving the same single worst-case retained budget.
+        count = len(parent_specs)
+        entries = entries[-count:] + entries[:-count]
+        shapes = shapes[-count:] + shapes[:-count]
     cap = max(0, int(_env_float('YOLO_TTA_PUBLICATION_RAM_GIB', 0.) * GIB))
     workspace_cap = int(workspace_anon_cap_bytes())
     if workspace_cap > 0:
@@ -334,21 +393,27 @@ def plan_native_publication_memory(tasks, *, keep_temp, worker_count, publicatio
     except (ImportError, OSError, ValueError):
         descriptor_budget = 0
     admitted = 0
-    for index, (group, grant) in enumerate(zip(groups, plan['grants'])):
+    plan['parent_outputs'] = []
+    for index, (entry, grant) in enumerate(zip(entries, plan['grants'])):
         if not grant or admitted >= descriptor_budget:
             plan['grants'][index] = 0
             continue
         fd = None
         try:
             fd = os.memfd_create('xta-packed-publication', flags=getattr(os, 'MFD_CLOEXEC', 0))
-            path = Path(group[0]['d1_store_dir']).absolute() / 'chunks.bin'
+            path = Path(entry['path']) / 'chunks.bin'
             _register_memfd_owner(str(path), fd, 'planned packed source contribution')
             backing = f'/proc/{os.getpid()}/fd/{fd}'
             fd = None  # runtime registry now owns it through all downstream consumers
-            for task in group:
-                task['d1_memory_payload_path'] = backing
-                task['d1_memory_payload_limit'] = int(grant)
-                task['d1_memory_payload_reserve'] = int(plan['reserve_bytes'])
+            if entry['tasks'] is not None:
+                for task in entry['tasks']:
+                    task['d1_memory_payload_path'] = backing
+                    task['d1_memory_payload_limit'] = int(grant)
+                    task['d1_memory_payload_reserve'] = int(plan['reserve_bytes'])
+            else:
+                plan['parent_outputs'].append(dict(key=entry['key'], path=entry['path'],
+                    shape=entry['shape'], payload_backing=backing, payload_limit=int(grant),
+                    reserve_bytes=int(plan['reserve_bytes'])))
             admitted += 1
         except OSError as exc:
             plan['grants'][index] = 0
@@ -356,11 +421,27 @@ def plan_native_publication_memory(tasks, *, keep_temp, worker_count, publicatio
                 os.close(fd)
             print(f'Publication RAM backing unavailable; keeping disk payload: {exc}', flush=True)
     plan['reserved_bytes'] = sum(plan['grants'])
+    plan['parent_admitted_count'] = len(plan['parent_outputs'])
+    plan['radial_admitted_count'] = admitted - plan['parent_admitted_count']
+    plan['parent_reserved_bytes'] = sum(spec['payload_limit'] for spec in plan['parent_outputs'])
+    plan['radial_reserved_bytes'] = plan['reserved_bytes'] - plan['parent_reserved_bytes']
+    from .runtime import runtime_telemetry
+    runtime_telemetry().gauge('publication.retained_memory_plan', dict(
+        available_bytes=int(headroom), reserve_bytes=int(plan['reserve_bytes']),
+        budget_bytes=int(plan['budget_bytes']), reserved_bytes=int(plan['reserved_bytes']),
+        parent_count=len(parent_specs), parent_admitted_count=int(plan['parent_admitted_count']),
+        parent_reserved_bytes=int(plan['parent_reserved_bytes']), radial_count=len(groups),
+        radial_admitted_count=int(plan['radial_admitted_count']),
+        radial_reserved_bytes=int(plan['radial_reserved_bytes']), descriptor_budget=descriptor_budget))
     print('Native publication RAM plan: '
           f'physical/cgroup_headroom={headroom / GIB:.1f} GiB, '
           f'future_work_reserve={plan["reserve_bytes"] / GIB:.1f} GiB, '
           f'native_dense_window={int(native_dense_reserve_bytes) / GIB:.1f} GiB, '
           f'retained_budget={plan["budget_bytes"] / GIB:.1f} GiB, '
           f'worst_case_reserved={plan["reserved_bytes"] / GIB:.1f} GiB; '
-          f'{admitted}/{len(groups)} layers admitted (fd_budget={descriptor_budget}), disk spill remains available.', flush=True)
+          f'{admitted}/{len(entries)} layers admitted (fd_budget={descriptor_budget}); '
+          f'parent={plan["parent_admitted_count"]}/{len(parent_specs)} '
+          f'({plan["parent_reserved_bytes"] / GIB:.1f} GiB), '
+          f'Radial={plan["radial_admitted_count"]}/{len(groups)} '
+          f'({plan["radial_reserved_bytes"] / GIB:.1f} GiB), disk spill remains available.', flush=True)
     return plan

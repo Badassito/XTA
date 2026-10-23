@@ -10,6 +10,8 @@ import math
 _CONTROL_BYTES = 256 * 1024
 _CODEC_BYTES = 1024 * 1024
 _CELL_RECORD_BYTES = 768
+COPY_BATCH_MAX_CELLS = 16
+COPY_BATCH_MAX_BYTES = 256 * 1024
 _CAPTURE_PLAN = ContextVar('native_confidence_capture_plan', default=None)
 
 
@@ -26,6 +28,8 @@ class NativeConfidenceCapturePlan:
     consumer_bytes: int
     max_pending_frames: int
     initialization_peak_bytes: int
+    copy_batch_cells: int
+    copy_batch_bytes: int
 
 
 def plan_confidence_capture(shape, workers, *, workspace_bytes=64 * 1024**2,
@@ -33,7 +37,9 @@ def plan_confidence_capture(shape, workers, *, workspace_bytes=64 * 1024**2,
     """Charge a complete ordered frame window without allocating numeric data.
 
     Source mask/scores remain borrowed. Each worker retains at most one frame's
-    compressed cells, one cell copy/bytes pair, metadata and bounded zlib state.
+    compressed cells, one bounded copy batch, one cell copy/bytes pair, metadata
+    and bounded zlib state. Copy batches have their own explicit charge; the
+    existing codec/state allowance remains available in full.
     The consumer's just-published frame is charged separately from pending work.
     """
     shape = tuple(shape)
@@ -52,7 +58,14 @@ def plan_confidence_capture(shape, workers, *, workspace_bytes=64 * 1024**2,
     if cell_bytes + zlib_extra >= 2**32:
         raise ValueError('Confidence cell compression bound exceeds its uint32 payload length')
     encoded_frame = shape[1] * shape[2] + cells * (max(64, zlib_extra) + _CELL_RECORD_BYTES)
-    worker_bytes = encoded_frame + _CODEC_BYTES + 2 * cell_bytes
+    copy_batch_cells = min(COPY_BATCH_MAX_CELLS, COPY_BATCH_MAX_BYTES // cell_bytes)
+    # Native compression reuses this charge for independent compressed cells.
+    # Reserve each zlib bound conservatively, plus offsets and an ABI length.
+    # Its one-cell copy still fits the unchanged two-cell allowance below.
+    copy_batch_bytes = (copy_batch_cells * (cell_bytes + max(64, zlib_extra))
+                        + (copy_batch_cells + 1) * 8 + 8
+                        if copy_batch_cells else 0)
+    worker_bytes = encoded_frame + _CODEC_BYTES + 2 * cell_bytes + copy_batch_bytes
     consumer_bytes = encoded_frame
     fixed_bytes = _CONTROL_BYTES + 33 * shape[0]
     # Integer-list conversions, snapshots and full validation scratch need
@@ -66,7 +79,8 @@ def plan_confidence_capture(shape, workers, *, workspace_bytes=64 * 1024**2,
         raise MemoryError('Confidence capture cannot admit one worker plus its ordered consumer frame')
     charged = max(initialization_peak, fixed_bytes + consumer_bytes + admitted * worker_bytes)
     return NativeConfidenceCapturePlan(shape, block, requested, admitted, charged, budget,
-                                        fixed_bytes, worker_bytes, consumer_bytes, admitted, initialization_peak)
+                                        fixed_bytes, worker_bytes, consumer_bytes, admitted, initialization_peak,
+                                        copy_batch_cells, copy_batch_bytes)
 
 
 @contextmanager

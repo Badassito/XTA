@@ -23,13 +23,25 @@ from .runtime import (_allocate_memfd_workspace_array, _memfd_backing_path_from_
                       _root_memmap_for_array, close_memmap_array_without_flush, runtime_telemetry)
 from .unification.contracts import DataRole
 from .unification.sampling import require_forward_sampling
+from .workspace import _env_flag
+
+
+def cpu_input_family_eligible(view):
+    """Share the prepared-input device policy with scheduler priority hints."""
+    family = str(getattr(view, 'family', ''))
+    # Tilted inputs have a resident CUDA renderer that samples directly on the
+    # model grid. Full-native NumPy shear/gather preparation competed with
+    # mandatory parent cleanup, and speculative packets were mostly revoked
+    # before consumption. Keep that CPU qualification route opt-in.
+    return family == 'orthogonal' or (family == 'tilted'
+        and _env_flag('YOLO_TTA_CPU_INPUT_TILTED', False))
 
 
 def cpu_input_eligible(task):
     view = task.get('view')
     fmt = task.get('channel_format')
     return bool(isinstance(view, ViewInfo) and isinstance(task.get('job'), AugJob)
-        and str(view.family) in {'orthogonal', 'tilted'}
+        and cpu_input_family_eligible(view)
         and (tilted_base_view_name(view) if str(view.family) == 'tilted'
              else physical_view_name(view)) in {'transverse', 'sagittal', 'coronal'}
         and str(task.get('kind')) == 'fullframe'

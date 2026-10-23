@@ -19,10 +19,10 @@ device execution and complete source qualification belong in separate receipts.
 | View family | Projection route | Device admission |
 | --- | --- | --- |
 | Cartesian: Transverse, Sagittal, Coronal | Canonical categorical restoration; matching bounded D1 native-coverage pull for eligible layouts | CUDA requires its own eligible layout and device checks |
-| Tilted Cartesian | Shared view union followed by canonical destination pull | CPU; projection CUDA disabled |
-| Upright Azimuthal, full-mask output | Shared view union and canonical destination pull | Eligible Transverse CUDA; Sagittal/Coronal CPU |
-| Upright Azimuthal, coverage | Declared reconstruction-plan angular/column pull | Eligible Transverse CUDA; Sagittal/Coronal CPU |
-| Tilted Azimuthal | Shared view union and bounded canonical CPU pull; unsafe CUDA plan refused | CPU; projection CUDA unsupported |
+| Tilted Cartesian | Shared view union followed by canonical destination pull | Shared CPU pool; exact CUDA gather after device admission |
+| Upright Azimuthal, full-mask output | Shared view union and canonical destination pull | Shared CPU pool or admitted exact native CUDA gather |
+| Upright Azimuthal, coverage | Declared reconstruction-plan angular/column pull | Existing eligible Transverse CUDA; native destination gather also supports all bases |
+| Tilted Azimuthal | Shared view union and bounded canonical destination pull; unsafe scatter refused | Shared CPU pool; exact CUDA gather after device admission |
 | Radial and tilted Radial | Bounded native shell pull | Eligible parent CUDA or separate native owner |
 | Spherical and rotated Spherical | Bounded destination-native QSC pull | CUDA requires its own eligible layout and device checks |
 
@@ -36,18 +36,21 @@ CUDA state, so a later routing mistake cannot silently reactivate point scatter.
 This route change can add host shared-union and storage overhead to workloads
 that previously used non-Cartesian D1. It does not disable all GPU projection:
 eligible Cartesian, upright Azimuthal, Radial, and Spherical projectors
-retain their separate device paths. Upright Azimuthal CUDA is Transverse-only;
-Sagittal and Coronal use the orientation-aware CPU route. SAM and detector model
+retain their separate device paths. The new native gather also handles upright
+Sagittal and Coronal plans. SAM and detector model
 inference on GPU is unchanged. Full-cluster wall-time improvement remains
 unmeasured; local CPU projection trials have a separate scope.
-Ordinary Tilted projection uses canonical CPU processing, including engine
-views whose legacy D1 fast projection previously used GPU. The old Tilted
-Azimuthal CUDA plan encodes the unsafe scatter geometry, so dispatch refuses
-it before allocation/publication and automatically uses bounded CPU pull.
-Both ordinary Tilted and Tilted Azimuthal engine projection can be slower than
-the former scatter route. CUDA projection remains unavailable for those routes;
-a qualified inverse GPU plan is a separate optimization. Local CPU timings do
-not establish full-cluster wall time.
+The old Tilted Azimuthal CUDA plan encodes unsafe scatter geometry and remains
+disabled. The separate native CUDA gather evaluates the destination cells with
+the same prepared geometry and contributor rules as CPU projection. It does not
+reactivate D1 scatter. Inference retains device priority; an existing CPU
+projection can hand off its unfinished suffix when a device becomes available.
+Native gather uses the same bounded source-retirement admission as Spherical
+projection. An idle device can be borrowed when no inference task is admissible;
+under a live backlog, pressure or starvation age grants a bounded turn and then
+returns the device to inference. The global inference-active flag alone does not
+block a native gather. Admission reasons and current device leases are recorded.
+Local numerical and performance checks do not establish full-cluster wall time.
 
 ## Compact upright Azimuthal sampling
 
@@ -86,12 +89,25 @@ Plans retain local read-only numeric tables, with packed uint32 or uint64 owners
 as capacity requires; there is no global Python plan LRU. The kernel does not
 copy its source mask or create a global thread pool.
 
-Backprojection honors the caller's per-view worker count with a bounded thread
-pool. Each worker owns a distinct destination plane, and callbacks receive
-planes in source order. The admitted count is capped by the requested count,
-destination depth, and transient workspace. Cancellation/error paths join all
-readers before releasing their source. Sink-only publication retains bounded
-pending planes rather than another full-volume accumulator.
+Independent array callers retain their requested per-view worker count. During
+a pipeline run, native pulls share one CPU pool rather than dividing their
+parallelism by the configured number of parent preparations. The pool grows
+at inference drain, including for projections already running. It fairly shares
+credits across live projections and bounds both running operations and completed
+planes awaiting their consumer. The per-projection workspace allowance remains
+an additional cap. A slow consumer therefore cannot accumulate an unbounded
+queue of planes or multiply the CPU budget by the number of views.
+
+Each worker owns a distinct destination plane, and callbacks receive planes in
+source order. Cancellation/error paths join all readers before releasing their
+source. Tilted component layers now use the existing incremental sparse-store
+writer, avoiding a full native destination allocation and its later encoding
+scan. The existing dense retry remains available after a safely discarded sink
+failure, so its conservative parent memory reservation is retained.
+
+CPU kernels traverse contiguous row spans and reuse coordinate bounds within
+each row. The contributor order, nearest rounding, numeric maximum and binary
+OR semantics are unchanged, including partial flat spans and strided sources.
 
 | Environment control | Default | Scope |
 | --- | --- | --- |
@@ -99,6 +115,10 @@ pending planes rather than another full-volume accumulator.
 | `YOLO_TTA_NATIVE_PULL_PLAN_MIB` | `64` | Per-plan geometry/build allowance; packed Azimuthal lookup is read-only and reused across planes; larger geometry uses bounded strips |
 | `YOLO_TTA_NATIVE_PULL_WORKSPACE_MIB` | `256` | Per-projection pending-plane and per-worker strip allowance, including a consumer-held plane for sink-only publication |
 | `YOLO_TTA_NATIVE_PULL_CHUNK` | `65536` | NumPy reference chunk points, clamped to 1 through 262,144 |
+| `YOLO_TTA_NATIVE_PULL_CUDA` | `1` | Allow exact native gather when the existing GPU stage coordinator grants a device; `YOLO_TTA_GPU_BACKPROJECT=0` still disables it |
+| `YOLO_TTA_NATIVE_PULL_GPU_MIN_VOXELS` | `67108864` | Minimum remaining output work for automatic CUDA setup; avoids source upload for short suffixes and small projections |
+| `YOLO_TTA_NATIVE_PULL_GPU_RESERVE_GIB` | `1` | Device memory kept free beyond the admitted source, plan and output scratch |
+| `YOLO_TTA_NATIVE_PULL_GPU_UPLOAD_MIB` | `8` | Maximum input chunk for packing/upload; the whole host volume is never copied to a second dense staging array |
 
 The plan and workspace caps are separate. Source/dense-destination credits,
 other concurrent views, and runtime/JIT compiler memory remain separate from
@@ -106,6 +126,58 @@ these explicit geometry and buffer bounds. A workspace too small for one worker
 and the consumer plane is refused. Production uint8 masks/scores use the
 compiled route; other historical array dtypes retain the exact NumPy route
 without a whole-source dtype copy.
+
+The CUDA session packs categorical nonzero values to one bit per voxel; numeric
+MAX retains uint8 values. Angular keys are prepared by the same NumPy geometry
+plan used on CPU. Device arithmetic uses float64 without fused multiply-add or
+fastmath. Output scratch is bounded to a plane/strip and copied to the caller's
+owned destination. A private allocator and stream retire before the device lease
+is released. Declared admission failures retain CPU execution; execution or
+unsettled cleanup failures abort publication instead of retrying with live GPU
+ownership. The explicit `numpy` backend remains on CPU.
+
+Handoff preserves the already-published prefix. The CPU stream cancels queued
+work and joins running readers before CUDA writes the remaining planes, so no
+callback is duplicated and no borrowed source is retired while still in use.
+Small synthetic probes can favor CPU because CUDA setup and transfer costs
+dominate; production throughput must be checked with the actual workload.
+
+## Packed parent retention
+
+Eligible terminal Tilted and Azimuthal parents seal their cleaned binary masks
+into the existing cropped, row-packed CVOL representation before projection.
+This uses one bit per stored sample and omits empty crops. On Linux the encoded
+payload can grow in a memfd while physical RAM headroom permits; it spills to
+disk between bounded writes if headroom becomes insufficient. It requires no
+ZRAM, swap device or system configuration change. CPU and CUDA project directly
+from the encoded crop/index, without recreating the dense native mask.
+
+The dense input remains charged while packing. Credit returns only when its
+last actual owner dies, and the compressed resident bytes stay charged until
+publication settles. Delayed mask and confidence aliases are fenced separately.
+Completed GPU publication callbacks detach their input mappings immediately
+after their copy Future settles; callback reference cycles no longer keep those
+large mappings alive until inference-wide garbage collection.
+
+`YOLO_TTA_PACKED_PARENT=0` disables this continuation for comparisons.
+`YOLO_TTA_PACKED_PARENT_MIN_MIB` defaults to 64 to avoid encoding tiny inputs.
+`YOLO_TTA_PACKED_PARENT_RAM_RESERVE_MIB` defaults to 1024 and guards memfd growth.
+Interpolation/extrapolation, tiled parents, retained debug workspaces, an already
+published layer, and explicit NumPy projection retain their established paths.
+Packing changes storage, not view resolution or the destination coverage rules.
+
+Terminal projected layers also use private packed CVOLs. Their retained RAM
+grants share the existing Radial publication budget, with the large parent
+outputs allocated first. Grants include future working/output reserves and
+descriptor limits. Planned memfd payloads survive until union/NRRD readers
+finish and normal scratch cleanup releases them. A memory decline or spill
+keeps the disk payload packed. Public NRRD pixels and source geometry are unchanged.
+
+Tilted inference inputs use the existing resident GPU renderer by default.
+Speculative CPU Tilted preparation requires `YOLO_TTA_CPU_INPUT_TILTED=1`;
+Cartesian prefetch retains its existing control. Eligible disjoint Spherical
+GPU task leases finish exact per-slice hole filling before their D2H publication,
+and report coverage so the parent can skip the completed-view CPU pass.
 
 Confidence readers retain one scalar-max plan per reader. Their admitted
 workspace includes output/control bytes and plan construction/runtime strips;
@@ -119,11 +191,13 @@ kernel failures propagate. Zero-score unknown semantics and binary/scalar
 address correspondence are unchanged.
 
 Confidence capture occurs before native layer materialization and is distinct
-from the source-aligned score reader above. Parent preparation passes its existing
-allocated slice-worker count through a typed task-local capture scope. The fused
-capture keeps the original masking, maximum and payload/index semantics, with
-effective workers no greater than the caller allocation. Its exact plan workspace
-is added to the existing parent transient request, capped at 256 MiB per parent;
+from the source-aligned score reader above. During a run its ordered frame jobs
+share the native-projection CPU pool. The charged memory window is planned before
+parent admission; actual CPU credits are divided among captures that have obtained
+a numeric staging slot. Queued parent threads do not reserve CPU lanes. Standalone
+callers retain their requested worker count. The original masking, maximum and
+payload/index semantics remain unchanged. Exact plan workspace is added to the
+existing parent transient request, capped at 256 MiB per parent;
 the dense and transient admission limits are unchanged. Planning occurs before
 the owner is popped, and execution stays inside the live reservation with failure
 cleanup. Disabled confidence, absent score maps, and already-published D1 parents
@@ -143,10 +217,27 @@ and each crop retains zlib level 3. Output payload, index and metadata semantics
 are unchanged. Compiler/code-cache initialization is separate process overhead;
 the helper changes neither global Numba thread settings nor disk caching.
 
+Confidence payload/index writes are batched within the charged consumer window.
+Logical byte counters replace per-cell file-position queries. Numeric stages
+prefer two owned Linux memfds within the existing 64 MiB per-stage and 256 MiB
+combined staging limit. Small metadata files and the stage directory retain the
+established artifact layout. Unsupported platforms or insufficient physical
+headroom report a disk fallback. Numeric handles stay owned through the final
+copy and close before their slot credit returns.
+
+Where a compatible zlib C API is available, a probed native loop performs masked
+copying and independent level-3 compression without Python calls inside a batch.
+Python coordinates ownership and publication. `YOLO_TTA_CONFIDENCE_NATIVE_CODEC=python`
+selects the portable encoder for comparison. Default `auto` probes Python's zlib
+extension and the system library on Linux; backend, codec version and fallback
+reason are recorded. Every path preserves the zlib-block format and decoded uint8
+values. Different library versions are identified explicitly. Workspace and
+source/output parity checks belong in the qualification receipt.
+
 Fused serial capture is not uniformly faster: direct typed calls, requested-one
 workers, single-frame inputs or small admitted credits can expose the measured
-dense/noisy regressions. The main full-frame pipeline uses its admitted caller
-worker budget; local parallel gains do not establish a full-cluster speedup.
+dense/noisy regressions. The full-frame pipeline shares its admitted CPU budget
+across active jobs; local parallel gains do not establish a full-cluster speedup.
 
 Per-view native-pull telemetry records the backend, admitted workers,
 completed/total planes, elapsed time, and geometry/worker/consumer bytes. These

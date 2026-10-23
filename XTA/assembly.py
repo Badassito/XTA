@@ -20,6 +20,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    Mapping,
     Optional,
     Sequence,
     TYPE_CHECKING,
@@ -526,9 +527,6 @@ def project_view_volume_to_orthogonal_volume(
             projection_block_callback=projection_block_callback, sink_only=sink_only,
         )
 
-    if bool(sink_only):
-        raise ValueError(f'{desc}: sink-only projection requires an Azimuthal, Radial or Spherical view')
-
     if is_tilted_view(view):
         return backproject_tilted_volume_to_volume(
             tilted_mask_mm=view_mask_mm,
@@ -539,7 +537,13 @@ def project_view_volume_to_orthogonal_volume(
             reserve_bytes=int(reserve_bytes),
             workers=int(workers),
             out_shape_tyx=out_shape_tyx,
+            known_row_occupancy=known_row_occupancy,
+            projection_block_callback=projection_block_callback,
+            sink_only=bool(sink_only),
         )
+
+    if bool(sink_only):
+        raise ValueError(f'{desc}: sink-only projection requires an Azimuthal, Tilted, Radial or Spherical view')
 
     if out_shape_tyx is not None and tuple(int(v) for v in out_shape_tyx) != (t_dim, h_dim, w_dim):
         raise ValueError(
@@ -772,7 +776,9 @@ def materialize_nrrd_view_layer(
         incremental_extra_meta['projection_output_shape_tyx'] = list(projection_out_shape)
         if is_tilted_view(view):
             incremental_extra_meta['projection_payload_fusion'] = 'tilted_native_destination_pull'
-    if view.family in ('radial', 'spherical') or azimuthal_sink_only_projection_supported(view):
+            incremental_extra_meta['projection_sink_only'] = True
+    if (view.family in ('radial', 'spherical') or is_tilted_view(view)
+            or azimuthal_sink_only_projection_supported(view)):
         expected_shape = (
             tuple(int(v) for v in projection_out_shape)
             if projection_out_shape is not None
@@ -926,6 +932,7 @@ def materialize_nrrd_view_layer(
                 'nrrd_layer_key': key,
                 'source_raw_path': 'encoded_direct_from_view_volume' if projected_is_source else str(raw_path),
                 'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',
+                'projection_sink_only': False,
             },
         )
     segment_extent = _coerce_segment_extent(layer_stats.get('segment_extent_ijk')) or _nrrd_empty_segment_extent()
@@ -1765,6 +1772,60 @@ def prepare_detector_view_cpu(mask, scores, view, min_conf, min_radius, *, worke
     return meta_valid, meta_slice_any, meta_slice_bboxes, meta_row_occupancy, hole_metadata_valid
 
 
+def _terminal_packed_layer_destination(temp_dir, view):
+    """Share the exact layer identity with its pre-dispatch RAM planner."""
+    key = _nrrd_layer_key(view_name=view.name, source='fullframe', mask_kind='yolo',
+                          pass_index=0, stage='pre_interpolation')
+    return key, Path(temp_dir) / 'nrrd_layers' / view.name / f'{key}.orthogonal.cvol'
+
+
+def _materialize_terminal_packed_tilted_view_layer(native_path, *, view, model_name,
+                                                  temp_dir, workers, has_foreground,
+                                                  projected_output_memory=None):
+    """Publish a terminal parent, retrying exclusively from immutable bits."""
+    if not has_foreground:
+        if not view.augmentation_base_view:
+            return None
+        return materialize_empty_policy_layer(model_name=model_name, view=view,
+            source='fullframe', mask_kind='yolo', stage='pre_interpolation',
+            description='Cleaned full-frame YOLO mask before interpolation bridges.',
+            temp_dir=temp_dir)
+    from .packed_tilted_projection import project_tilted_sparse_store
+    shape = final_source_output_shape() or (int(view.full_t), int(view.full_h), int(view.full_w))
+    key, path = _terminal_packed_layer_destination(temp_dir, view)
+    # This private terminal continuation has the same binary reader contract on
+    # RAM and disk. A declined RAM grant must not inflate its fallback eightfold.
+    output_format = INTERNAL_PACKED_CVOL_FORMAT
+    # A sink/encoding failure must never resurrect the retired dense native
+    # backing. A clean second transaction uses the same sealed source bits.
+    for attempt in range(2):
+        try:
+            stats = project_tilted_sparse_store(native_path, view, path,
+                out_shape_tyx=shape, workers=workers, format_name=output_format,
+                output_memory=projected_output_memory,
+                extra_meta={'nrrd_layer_key': key, 'source_raw_path': 'encoded_terminal_native_parent'})
+            break
+        except (OSError, RuntimeError):
+            if attempt:
+                raise
+            runtime_telemetry().add('projection.tilted_packed_parent.encoded_retries', 1)
+    ref = NrrdLayerRef(key=key,
+        name=_nrrd_layer_name(view=view, source='fullframe', mask_kind='yolo',
+                            pass_index=0, stage='pre_interpolation'),
+        path=path, shape=shape, dtype='uint8', storage_format=output_format,
+        model_name=model_name, view_name=view.name, physical_view_name=physical_view_name(view),
+        aug_id=view.tta_aug_id, angle_deg=float(view.tta_angle_deg), view_family=view.family,
+        source='fullframe', mask_kind='yolo', pass_index=0, stage='pre_interpolation',
+        description='Cleaned full-frame YOLO mask before interpolation bridges.',
+        segment_extent_ijk=_coerce_segment_extent(stats['segment_extent_ijk']),
+        segment_extent_shape_tyx=shape, segment_extent_source='raw_bbox_cvol_index')
+    sink = nrrd_layer_sink()
+    if sink is not None:
+        sink.submit_layer(ref, nrrd_layer_output_suffix(view_token=view_output_token(view),
+            source='fullframe', mask_kind='yolo', pass_index=0, stage='pre_interpolation'))
+    return ref
+
+
 def prepare_view_volume_after_fullframe(
     *,
     model_name: str,
@@ -1803,6 +1864,9 @@ def prepare_view_volume_after_fullframe(
     extrapolation_min_radius: float = 3.,
     confidence_retired_callback: Optional[Callable[[str, str, int], object]] = None,
     confidence_owner: Optional[list] = None,
+    projected_output_memory: Optional[Mapping[str, object]] = None,
+    union_owner: Optional[list] = None,
+    mask_retired_callback: Optional[Callable[[str, str, int], object]] = None,
     submit_sam_layer_projection: Optional[Callable[..., Future[NrrdLayerRef]]] = None,
     _observation_inventory=None,
 ) -> PreparedViewResult:
@@ -1812,12 +1876,19 @@ def prepare_view_volume_after_fullframe(
     backend = str(interpolation_backend)
     if backend not in ('sdf', 'sam'):
         raise ValueError(f'Unsupported interpolation backend: {backend}')
+    if union_owner is not None:
+        if union_mm is not None or len(union_owner) != 1:
+            raise RuntimeError('Parent mask must have exactly one transferred owner')
+        # The shared carrier remains the exception-path owner until the packed
+        # continuation seals. It is emptied before any encoded projection runs.
+        union_mm = union_owner[0]
+    confidence_owner_carrier = confidence_owner
     if confidence_owner is not None:
         if confmap_mm is not None or len(confidence_owner) != 1:
             raise RuntimeError('Parent confidence must have exactly one transferred owner')
-        # Call argument dictionaries can survive through nested wrappers.
-        # Empty the shared container so those dictionaries pin no score array.
-        confmap_mm = confidence_owner.pop()
+        # Keep the shared carrier as the caller's exception-path owner until
+        # capture finishes. It is cleared before longer mask projection runs.
+        confmap_mm = confidence_owner[0]
     baseline_native_volume = union_mm
     d1_delta_only = bool(preinterpolation_layer_already_published)
     d1_additions_mm: Optional[np.ndarray] = None
@@ -1922,7 +1993,54 @@ def prepare_view_volume_after_fullframe(
                 confmap_path.unlink(missing_ok=True)
             except Exception:
                 pass
+        if confidence_owner_carrier is not None:
+            confidence_owner_carrier.clear()
         confmap_mm = None
+
+    from .packed_tilted_projection import terminal_native_source_packing_eligible
+    if (union_owner is not None and terminal_native_source_packing_eligible(view,
+            native_bytes=int(baseline_native_volume.nbytes), retire_dense=retire_dense_after_prepare,
+            component_layers=nrrd_layers_enabled, tiled=dense_tiling_active, keep_temp=keep_temp,
+            prepublished=preinterpolation_layer_already_published,
+            interpolate=interpolate, interpolation_passes=interpolate_passes,
+            extrapolate=extrapolation_distance,
+            mask_callback_available=mask_retired_callback is not None)):
+        # Native work is terminal. Preserve an immutable compressed continuation
+        # before detaching every dense alias; projection/retry then needs bits only.
+        from .packed_tilted_projection import pack_terminal_native_source
+        from .view_prepare import _array_lifetime_owner, scratch_unlink_path_for_memmap
+        packed_path = temp_dir / 'packed_native_parents' / str(model_name) / str(view.name)
+        packed_stats = pack_terminal_native_source(baseline_native_volume, packed_path,
+            desc=f'Packed terminal native parent {model_name}/{view.name}')
+        native_bytes = int(baseline_native_volume.nbytes)
+        retired_bytes = max(0, native_bytes - int(packed_stats['resident_bytes']))
+        if retired_bytes:
+            owner = _array_lifetime_owner(baseline_native_volume)
+            finalizer = weakref.finalize(owner, mask_retired_callback,
+                str(model_name), str(view.name), retired_bytes)
+            finalizer.atexit = False
+            owner = None
+        close_memmap_array_without_flush(baseline_native_volume,
+            unlink_path=scratch_unlink_path_for_memmap(baseline_native_volume, union_path))
+        union_owner.clear()
+        baseline_native_volume = union_mm = None
+        runtime_telemetry().add('projection.tilted_packed_parent.native_bytes_detached', native_bytes)
+        runtime_telemetry().add('projection.tilted_packed_parent.resident_packed_bytes',
+                                int(packed_stats['resident_bytes']))
+        try:
+            layer_ref = _materialize_terminal_packed_tilted_view_layer(packed_path,
+                view=view, model_name=str(model_name), temp_dir=temp_dir,
+                workers=int(slice_workers), has_foreground=int(packed_stats['foreground_voxels']) > 0,
+                projected_output_memory=projected_output_memory)
+            result = PreparedViewResult(model_name=str(model_name), view_name=str(view.name),
+                aug_id=str(view.tta_aug_id), angle_deg=float(view.tta_angle_deg),
+                native_support_mm=None, final_view_volume_mm=None,
+                interpolation_stats=[], nrrd_layers=[] if layer_ref is None else [layer_ref])
+            result._packed_native_source_retired = True
+            return result
+        finally:
+            release_memfd_owners_under(packed_path)
+            shutil.rmtree(packed_path, ignore_errors=True)
 
     if bool(d1_delta_only) and not bool(d1_component_refs_only):
         d1_additions_path = (
