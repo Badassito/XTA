@@ -41,6 +41,7 @@ def _drive_canonical_relay_frontier(
     conf, empty_frame_limit, worker_task_timeout, trace, worker_audit,
     dispatched, first_plan_order, max_relay_generations,
     device_ids=None, workers_per_device=None,
+    enable_2D_hole_fill=False,
 ):
     """Advance merged relay masks one canonical slab at a time.
 
@@ -121,7 +122,8 @@ def _drive_canonical_relay_frontier(
                     grouped[(lineage, tile_index, frame, direction)].append(record)
                 for (_lineage, tile_index, _frame, direction), group in sorted(grouped.items()):
                     seed = execution._select_and_merge_relay_group(
-                        group, direction=direction, destination_tile_index=tile_index, generation=generation)
+                        group, direction=direction, destination_tile_index=tile_index, generation=generation,
+                        enable_2D_hole_fill=enable_2D_hole_fill)
                     audit["spatial_seed_candidates"] += 1
                     # Join historical input support before handoff. A fragment
                     # covered on its own can close a hole in the accumulated seed.
@@ -143,14 +145,16 @@ def _drive_canonical_relay_frontier(
                 wave_index = int(audit["waves"])
                 seed_groups = defaultdict(list)
                 for entry in entries:
-                    seed = replace(entry.seed, mask=fill_binary_mask_holes_2d(entry.seed.mask), relay_generation=generation)
+                    seed = replace(entry.seed, mask=(fill_binary_mask_holes_2d(entry.seed.mask)
+                        if enable_2D_hole_fill else entry.seed.mask), relay_generation=generation)
                     if coverage.can_handoff(seed, tile_index=entry.tile_index, direction=entry.direction):
                         audit["boundary_seed_handoffs"] += 1
                         if "spatial_relay" in seed.source_receipt.get("input_provenances", ()):
                             audit["spatial_seed_handoffs"] += 1
                         continue
                     seed = coverage.merge_prompt_support(seed, tile_index=entry.tile_index)
-                    seed = replace(seed, mask=fill_binary_mask_holes_2d(seed.mask))
+                    if enable_2D_hole_fill:
+                        seed = replace(seed, mask=fill_binary_mask_holes_2d(seed.mask))
                     window = entry.window
                     group_key = (seed.lineage.tile_config_id, entry.tile_index, entry.direction,
                                  window.frame_start, window.frame_stop, window.prompt_frame)

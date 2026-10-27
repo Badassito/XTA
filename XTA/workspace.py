@@ -221,17 +221,26 @@ _V1613_FAST_BUNDLE_ACTIVE = False
 
 _V1613_D1_PIPELINE_ACTIVE = False
 
-def configure_pipeline_modes(*, fast_bundle_active: bool, d1_pipeline_active: bool) -> None:
+_YOLO_HOLE_FILL_ACTIVE = False
+
+def configure_pipeline_modes(*, fast_bundle_active: bool, d1_pipeline_active: bool,
+                             enable_yolo_hole_fill: bool = False) -> None:
     """Publish resolved run modes within this process.
 
     Spawned workers receive the resolved values in their initialization payload instead of
     inheriting user-overridable environment state.
     """
-    global _V1613_FAST_BUNDLE_ACTIVE, _V1613_D1_PIPELINE_ACTIVE
+    global _V1613_FAST_BUNDLE_ACTIVE, _V1613_D1_PIPELINE_ACTIVE, _YOLO_HOLE_FILL_ACTIVE
     _V1613_FAST_BUNDLE_ACTIVE = bool(fast_bundle_active)
     _V1613_D1_PIPELINE_ACTIVE = bool(
         _V1613_FAST_BUNDLE_ACTIVE and d1_pipeline_active
     )
+    _YOLO_HOLE_FILL_ACTIVE = bool(enable_yolo_hole_fill)
+
+
+def yolo_hole_fill_enabled() -> bool:
+    """The resolved CLI opt-in; independent of every inference fast-path proof."""
+    return bool(_YOLO_HOLE_FILL_ACTIVE)
 
 def v1613_fast_bundle_requested() -> bool:
     """Enable the command-specialized v16.1.3 pipeline unless explicitly disabled."""
@@ -259,6 +268,8 @@ def v1613_d1_backprojection_overlap_enabled() -> bool:
 
 def proto_hole_treatment_mode() -> str:
     """Resident-proto topology treatment: ``off`` or bounded binary ``closing``."""
+    if not yolo_hole_fill_enabled():
+        return 'off'
     default = 'close' if v1613_fast_bundle_active() else 'off'
     raw = os.environ.get('YOLO_TTA_PROTO_HOLE_TREATMENT', default).strip().lower()
     aliases = {
@@ -269,6 +280,8 @@ def proto_hole_treatment_mode() -> str:
 
 def proto_hole_treatment_radius() -> int:
     """Square-neighborhood radius used by resident proto closing."""
+    if not yolo_hole_fill_enabled():
+        return 0
     default = 2 if v1613_fast_bundle_active() else 0
     return max(0, min(8, _env_int('YOLO_TTA_PROTO_HOLE_RADIUS', default)))
 

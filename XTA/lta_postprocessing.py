@@ -2,10 +2,10 @@
 
 The module keeps three operations deliberately distinct:
 
-* two-dimensional prediction/seed hole filling happens before a mask can be
-  reused as temporal or spatial dogfood;
-* completed runtime-view volumes receive the same final slice-local hole fill
-  used by TTA before native backprojection;
+* optional two-dimensional prediction/seed hole filling happens before a mask
+  can be reused as temporal or spatial dogfood;
+* when enabled, completed runtime-view volumes receive the same final
+  slice-local hole fill used by TTA before native backprojection;
 * optional three-dimensional postprocessing applies only to the settled native
   terminal union.
 
@@ -225,9 +225,11 @@ def _fill_mask_with_receipt(
     mask_index: Optional[int] = None,
     context: Optional[Mapping[str, object]] = None,
     operation: Optional[Callable[[np.ndarray], object]] = None,
+    enabled: bool = True,
 ) -> LtaFilledMask:
     source = np.asarray(mask)
-    filled = fill_binary_mask_holes_2d(source, operation=operation)
+    filled = (fill_binary_mask_holes_2d(source, operation=operation) if enabled
+              else np.ascontiguousarray(source != 0, dtype=np.bool_).copy())
     before = int(np.count_nonzero(source))
     after = int(np.count_nonzero(filled))
     receipt = LtaMaskHoleFillReceipt(
@@ -238,6 +240,7 @@ def _fill_mask_with_receipt(
         added_pixels=after - before,
         mask_index=mask_index,
         context=dict(context or {}),
+        algorithm=(_HOLE_FILL_ALGORITHM if enabled else 'disabled'),
     )
     return LtaFilledMask(mask=filled, receipt=receipt)
 
@@ -289,12 +292,14 @@ def fill_merged_seed_mask_holes_2d(
     *,
     context: Optional[Mapping[str, object]] = None,
     operation: Optional[Callable[[np.ndarray], object]] = None,
+    enabled: bool = True,
 ) -> LtaFilledMask:
     """Fill a merged spatial seed after union and before SAM injection."""
 
     return _fill_mask_with_receipt(
         mask,
         provenance_kind="merged_spatial_relay",
+        enabled=enabled,
         context=context,
         operation=operation,
     )
@@ -308,6 +313,7 @@ def fill_completed_view_holes_2d_inplace(
     known_slice_any: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
     operation: Optional[Callable[..., object]] = None,
+    enabled: bool = True,
 ) -> LtaCompletedViewFillReceipt:
     """Apply TTA's completed-view 2D fill before native backprojection."""
 
@@ -326,6 +332,12 @@ def fill_completed_view_holes_2d_inplace(
         )
     if not bool(volume_array.flags.writeable):
         raise ValueError("completed-view hole fill requires writable storage")
+    if not enabled:
+        foreground = int(np.count_nonzero(volume_array))
+        return LtaCompletedViewFillReceipt(runtime_view_id=view_id,
+            shape_tyx=tuple(int(value) for value in volume_array.shape),
+            input_foreground_pixels=foreground, output_foreground_pixels=foreground,
+            added_pixels=0, algorithm='disabled')
     if operation is None:
         from .inference import fill_view_volume_holes_2d_inplace
 

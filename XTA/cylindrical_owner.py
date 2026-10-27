@@ -16,6 +16,7 @@ import time
 import numpy as np
 
 from ._deps import _numba
+from .workspace import yolo_hole_fill_enabled
 from .cylindrical_cuda_projection import RadialCudaProjectionUnsafeFailure, _CROP_METADATA_DTYPE
 from .cylindrical_bitset_compaction import (
     RadialBitsetCompactionUnavailable,
@@ -223,11 +224,13 @@ extern "C" __global__ void gather_shell_chunk(
 
 class RadialOwner:
     """One worker's source bitset and private bounded cleanup/projection resources."""
-    def __init__(self, view, mask_shape, output_shape, *, device_index=0, reserve_bytes=_RESERVE_BYTES):
+    def __init__(self, view, mask_shape, output_shape, *, device_index=0, reserve_bytes=_RESERVE_BYTES,
+                 enable_hole_fill=True):
         from . import cylindrical_projection as reference
         from .geometry import radial_global_radii
         import cupy as cp
         self.view, self.mask_shape, self.output_shape = view, tuple(mask_shape), tuple(output_shape)
+        self.enable_hole_fill = bool(enable_hole_fill)
         if view.family != 'radial' or len(self.mask_shape) != 2 or len(self.output_shape) != 3:
             raise ValueError('Invalid Radial owner geometry')
         if min(*self.mask_shape, *self.output_shape) <= 0:
@@ -263,7 +266,8 @@ class RadialOwner:
             centers=centers, ideal=ideal)
         word_count = (math.prod(self.output_shape) + 31) // 32
         pixels_per_mask = math.prod(self.mask_shape)
-        self.required_bytes = word_count * 4 + pixels_per_mask * 8 + sum(a.nbytes for a in arrays.values()) + 256 * 1024**2
+        self.required_bytes = (word_count * 4 + (pixels_per_mask * 8 if self.enable_hole_fill else 0)
+                               + sum(a.nbytes for a in arrays.values()) + 256 * 1024**2)
         try:
             with cp.cuda.Device(self.device_index):
                 self._stream = cp.cuda.Stream(non_blocking=True)
@@ -282,8 +286,9 @@ class RadialOwner:
                     self._reset_meta = self._meta_module.get_function('reset_radial_crop_metadata')
                     self._reduce_meta = self._meta_module.get_function('reduce_radial_crop_metadata')
                     self.words = cp.zeros(word_count, cp.uint32)
-                    self._parents = cp.empty(pixels_per_mask, cp.int32)
-                    self._exterior = cp.empty(pixels_per_mask, cp.int32)
+                    if self.enable_hole_fill:
+                        self._parents = cp.empty(pixels_per_mask, cp.int32)
+                        self._exterior = cp.empty(pixels_per_mask, cp.int32)
                     started = time.perf_counter()
                     for name, array in arrays.items():
                         self._arrays[name] = cp.asarray(array)
@@ -355,7 +360,7 @@ class RadialOwner:
                 boxes = self._boxes(source)
                 nonempty = int(np.count_nonzero(boxes[:, 1] > boxes[:, 0]))
                 self.native_any |= bool(nonempty)
-                if clean:
+                if clean and self.enable_hole_fill:
                     self._clean(source, boxes)
                 self._fence()
                 self.cleanup_seconds += time.perf_counter() - started
@@ -460,7 +465,8 @@ def consume_radial_device_union(task, accumulator, *, target=None):
             if _RADIAL_OWNER_STATES or cuda_d1._D1_WORKER_VIEW_STATES:
                 raise RuntimeError('This worker already retains a native Radial owner')
             setup_started = time.perf_counter()
-            owner = RadialOwner(view, shape[1:], output_shape)
+            owner = RadialOwner(view, shape[1:], output_shape,
+                                enable_hole_fill=yolo_hole_fill_enabled())
             setup_seconds = time.perf_counter() - setup_started
             owner.key, owner.store_dir = key, Path(task['d1_store_dir'])
             owner.memory_payload_path = task.get('d1_memory_payload_path')
@@ -482,7 +488,7 @@ def consume_radial_device_union(task, accumulator, *, target=None):
     result = dict(d1_view_complete=complete, d1_covered_slices=covered, d1_total_slices=view.num_slices,
         d1_backprojected_task_slices=count, d1_nonempty_task_slices=nonempty,
         radial_owner=True, radial_owner_empty=not owner.native_any,
-        device_hole_filled_frames=count, proto_hole_treated_frames=0)
+        device_hole_filled_frames=(count if owner.enable_hole_fill else 0), proto_hole_treated_frames=0)
     if not complete:
         return result
     proven_empty = owner.proven_empty_output()
@@ -556,11 +562,13 @@ def preflight_radial_owner():
     data[:, 1:7, 1:7] = 1
     data[:, 2:6, 2:6] = 0
     expected_native = data.copy()
-    expected_native[:, 2:6, 2:6] = 1
+    if yolo_hole_fill_enabled():
+        expected_native[:, 2:6, 2:6] = 1
     radii = np.asarray(geometry.radial_global_radii(view))
     expected = np.stack([reference._pull_radial_chunk_compiled(expected_native, view, radii,
         (7, 9, 11), z, 0, 99).reshape(9, 11) for z in range(7)])
-    active = RadialOwner(view, (8, 8), (7, 9, 11), reserve_bytes=0)
+    active = RadialOwner(view, (8, 8), (7, 9, 11), reserve_bytes=0,
+                         enable_hole_fill=yolo_hole_fill_enabled())
     try:
         device = cp.asarray(data)
         active.consume(0, device)

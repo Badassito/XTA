@@ -80,6 +80,23 @@ def _parse_token_list(values: Sequence[str] | str | None) -> List[str]:
         parts.extend([p for p in re.split(r"[,\s]+", raw) if p])
     return parts
 
+class _HoleFillStagesAction(argparse.Action):
+    """Normalize the opt-in stages at parsing, including comma-separated values."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        stages = list(getattr(namespace, self.dest, ()) or ())
+        tokens = _parse_token_list(values)
+        if not tokens:
+            raise argparse.ArgumentError(self, "select yolo, sam, or both")
+        for raw in tokens:
+            stage = raw.lower()
+            if stage not in {"yolo", "sam"}:
+                raise argparse.ArgumentError(self, f"expected yolo or sam; got {raw!r}")
+            if stage not in stages:
+                stages.append(stage)
+        setattr(namespace, self.dest, tuple(stages))
+
+
 SAVE_OPTION_TOKENS: Tuple[str, ...] = (
     'images',
     'labels',
@@ -1234,6 +1251,13 @@ def build_argparser() -> argparse.ArgumentParser:
             "Rotation angles in degrees for augmentation. Comma-separated, whitespace-separated, "
             "and mixed forms are accepted"
         ),
+    )
+    p.add_argument(
+        "--enable_2D_hole_fill", nargs="+", default=(),
+        action=_HoleFillStagesAction, metavar="{yolo,sam}",
+        help=("Opt in to 2D hole filling for yolo, sam, or both (comma- or space-separated). "
+              "By default both stages preserve holes. SAM fills predictions before encoding "
+              "the memory used for the next prediction"),
     )
     p.add_argument("--min_radius", default=0.0, type=_bounded_number(float, minimum=0),
                    help="Remove objects whose radius is smaller than this value, measured on the YOLO output masks "

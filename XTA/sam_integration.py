@@ -174,8 +174,9 @@ class SamInterpolationContext:
                  feature_cache_mib=1024, crop_mode='whole', delayed_native_expansion=None,
                  interpolation_policy_enabled=True, extrapolation_evidence_root=None,
                  adaptive_crop=False, progressive_startup=False, startup_pending_host_bytes=None,
-                 gray_cache_root=None, gray_cache_specs=None):
+                 gray_cache_root=None, gray_cache_specs=None, enable_2D_hole_fill=False):
         self.model_path = str(model_path)
+        self.enable_2D_hole_fill = bool(enable_2D_hole_fill)
         self.crop_mode = str(crop_mode).strip().lower()
         if self.crop_mode not in {'whole', 'tiled'}:
             raise ValueError('SAM crop mode must be whole or tiled')
@@ -2336,6 +2337,7 @@ class SamInterpolationContext:
                 self._progressive_pool = SamDeviceWorkerPools(
                     tuple(int(device.split(':')[-1]) for device in self.device_ids), cancel_event=self._cancel)
                 self._starting_runtime = SamInterpolationTracker(model_path=self.model_path,
+                    enable_2D_hole_fill=self.enable_2D_hole_fill,
                     device_ids=self._progressive_pool.configured_device_ids,
                     artifact_root=self.temp_dir / 'sam_runtime', feature_cache_bytes=self.feature_cache_mib*1024**2,
                     workers_per_device=self.sessions_per_gpu, progressive_pool=self._progressive_pool,
@@ -2781,6 +2783,7 @@ class SamInterpolationContext:
                     fractions = (self._concurrent_startup_budget(torch, attempt)
                         if self.sessions_per_gpu > 1 else None)
                     runtime = SamInterpolationTracker(
+                        enable_2D_hole_fill=self.enable_2D_hole_fill,
                         model_path=self.model_path, device_ids=tuple(int(value.split(':')[-1]) for value in self.device_ids),
                         artifact_root=self.temp_dir / 'sam_runtime',
                         feature_cache_bytes=self.feature_cache_mib*1024**2,

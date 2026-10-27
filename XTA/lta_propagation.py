@@ -2,7 +2,7 @@
 
 Mask injection is the only production video-conditioning path.  The private
 SAM calls remain quarantined in :mod:`XTA.lta_experimental`, while this module
-owns stable requests, globally scoped identities, hole-filled predictions,
+owns stable requests, globally scoped identities, optionally hole-filled predictions,
 dogfood boundaries, and hard-positive provenance.
 """
 
@@ -505,6 +505,11 @@ def _expected_frames(request: LtaPropagationRequest) -> set[int]:
     return set(range(request.session.frame_start, request.prompt_frame + 1))
 
 
+def _binary_mask_copy_for_propagation(mask: object) -> Any:
+    import numpy as np
+    return np.ascontiguousarray(mask, dtype=np.bool_).copy()
+
+
 def run_mask_injected_session(
     measured_predictor: object,
     raw_predictor: object,
@@ -512,11 +517,12 @@ def run_mask_injected_session(
     resource: list[object],
     request: LtaPropagationRequest,
     adapter: Callable[..., Mapping[str, object]] = run_mask_seed_session,
-    fill_mask: Callable[[object], object] = _fill_binary_mask,
+    fill_mask: Callable[[object], object] | None = None,
+    enable_2D_hole_fill: bool = False,
     prediction_callback: Callable[[LtaObjectPrediction], None] | None = None,
     retain_predictions: bool = True,
 ) -> LtaPropagationResult:
-    """Execute one production mask-injected session and fill every reusable mask.
+    """Execute a mask-injected session, optionally filling reusable masks.
 
     The default remains the diagnostic/tool-friendly retained result.  A
     production reducer can instead supply ``prediction_callback`` and set
@@ -525,6 +531,9 @@ def run_mask_injected_session(
     """
 
     import numpy as np
+
+    if fill_mask is None:
+        fill_mask = _fill_binary_mask if enable_2D_hole_fill else _binary_mask_copy_for_propagation
 
     if not isinstance(request, LtaPropagationRequest):
         raise TypeError("request must be an LtaPropagationRequest")
@@ -822,6 +831,7 @@ def run_mask_injected_session(
             "seed_count": len(filled_seeds),
             "model_object_capacity": resolve_mask_seed_capacity(len(filled_seeds)),
             "seed_hole_fill_added_pixels": seed_added_pixels,
+            "enable_2D_hole_fill": bool(enable_2D_hole_fill),
             "prediction_hole_fill_added_pixels": prediction_added_pixels,
             "injected_prompt_frame": request.prompt_frame,
             "prompt_provenance": [seed.provenance.value for seed in filled_seeds],

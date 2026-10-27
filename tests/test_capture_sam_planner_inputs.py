@@ -304,7 +304,9 @@ def test_postcapture_confidence_failure_cannot_lose_race_to_completion(tmp_path,
     assert 'confidence retirement failed' in report['error']
 
 
-def test_capture_follows_real_detector_hole_cleanup(tmp_path):
+def test_capture_follows_real_detector_hole_cleanup(tmp_path, monkeypatch):
+    from XTA import workspace
+    monkeypatch.setattr(workspace, '_YOLO_HOLE_FILL_ACTIVE', True)
     from XTA.assembly import prepare_detector_view_cpu
     view = _variant(_view())
     array = np.zeros((3, 5, 11), np.uint8)

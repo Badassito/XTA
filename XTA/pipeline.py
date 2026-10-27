@@ -1561,8 +1561,8 @@ def _main_impl() -> None:
             f'confidence-filtered (--min_conf={float(args.min_conf):.3f}), warped to view-native space '
             f'(identity warps skipped, grids cached), and --min_radius={float(args.min_radius):g} '
             'is applied on the GPU before the PCIe copy when positive (cupy required; CPU fallback '
-            'otherwise). Per-frame retina GPU 2D hole fill is removed; a '
-            'completed-view pass or eligible task-end device-union pass performs it once in spec order.'
+            'otherwise). With --enable_2D_hole_fill yolo, a completed-view pass or '
+            'eligible task-end device-union pass fills holes once in spec order.'
         )
     elif args.task == 'semantic':
         print('Semantic inference retains foreground probabilities before thresholding; '
@@ -1932,6 +1932,7 @@ def _main_impl() -> None:
     configure_pipeline_modes(
         fast_bundle_active=bool(v1613_bundle_active),
         d1_pipeline_active=bool(v1613_d1_owner_active),
+        enable_yolo_hole_fill=('yolo' in getattr(args, 'enable_2D_hole_fill', ())),
     )
     if v1613_d1_owner_active:
         # Keep native shared-union capability for views that cannot use D1 (including
@@ -1939,9 +1940,9 @@ def _main_impl() -> None:
         # this capability globally sent native fallbacks into unadmitted file unions.
         print(
             'Fast bundle active: hardware-linear Azimuthal texture sampling, B1 sparse '
-            'slice metadata, D3 resident-proto closing, C1 runtime-sized leases, C2 '
+            'slice metadata, optional D3 resident-proto closing, C1 runtime-sized leases, C2 '
             'compute/publication credit separation, C3 predicted-cost scheduling, and Cartesian D1 '
-            'project -> infer -> proto-close -> immediate owner-GPU backprojection -> '
+            'project -> infer -> optional proto-close -> immediate owner-GPU backprojection -> '
             'source-space sparse cvol publication. Commands with interpolation and/or tiles '
             'retain an exact packed view-native shadow and materialize it only in the asynchronous '
             'parent postprocess stage. Tilted and Azimuthal views use bounded shared unions '
@@ -2624,6 +2625,7 @@ def _main_impl() -> None:
             sam_gray_cache_root = temp_dir / 'sam_gray_cache' / uuid4().hex
         sam_context = SamInterpolationContext(
             model_path=str(interpolation_settings.sam_model),
+            enable_2D_hole_fill=('sam' in getattr(args, 'enable_2D_hole_fill', ())),
             device_ids=interpolation_settings.sam_devices, temp_dir=temp_dir,
             evidence_root=Path(artifact_reference(out_dir / 'sam-artifacts.tar', 'sam_interpolation')),
             source_volume=volume_rgb,
@@ -5833,6 +5835,7 @@ def _main_impl() -> None:
             'retina_processor': str(retina_processor),
             'fast_bundle_active': bool(v1613_bundle_active),
             'd1_pipeline_active': bool(v1613_d1_owner_active),
+            'enable_yolo_hole_fill': ('yolo' in getattr(args, 'enable_2D_hole_fill', ())),
             'radial_owner_preflight': any(radial_owner_eligible(
                 view, d1_active=v1613_d1_owner_active, cpu_workers=cpu_worker_process_active,
                 kind='fullframe', interpolation=max(args.interpolation_distance,

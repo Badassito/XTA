@@ -32,6 +32,19 @@ This replaces the My Tools toolbar. It does not run Importer or change voxel
 arrays on load. The script is self-contained in Slicer. Keep a copy of an
 existing startup script before choosing to replace it permanently.
 
+The My Tools panel uses two rows, with Show All before Hide All. **Remove
+Slices**, between Remove Islands and Remove Markers, provides a more precise
+deletion tool: each marker removes the XY, YZ and XZ cross sections of its
+6-connected foreground island through the marker's voxel position. These are
+planes of the segmentation voxel grid, including when the segmentation is
+transformed in the scene. Other islands on those planes and voxels outside
+the selected planes are preserved. It uses the same F points, L lines and
+C/CC closed curves as Remove Islands, and processes only visible segments.
+Lines and curves select planes through every foreground voxel they intersect,
+so extensive markers can still remove an entire small island. Use a single
+point to make the narrowest three-plane selection. Marker nodes remain until
+Remove Markers is clicked.
+
 ## Align full-resolution intensity with the LQ segments
 
 Load the full-resolution scalar intensity and the matching LQ segmentations.

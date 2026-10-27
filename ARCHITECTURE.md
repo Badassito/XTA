@@ -175,8 +175,10 @@ read-only backlog scan. It also returns the confidence portion of a parent's
 dense credit after the backing mapping and its aliases have actually retired,
 so slow source projection does not keep charging confidence storage it no longer
 owns. Parent-union credit remains held until its own retirement.
-Split-view hole filling runs after view completion; single-lease eligibility
-permits device filling. Resource controls set concurrency and peak storage.
+With `--enable_2D_hole_fill yolo`, split-view hole filling runs after view
+completion; single-lease eligibility permits device filling. v25 leaves filling
+off by default and retains the same resident inference and backprojection paths.
+Resource controls set concurrency and peak storage.
 `YOLO_TTA_GPU_INPUT_STAGING_BATCHES=0` disables input staging and its eager source
 warmup. `YOLO_TTA_HYBRID_GPU_STEALBACK_MAX_FRACTION=0` disables hybrid GPU assistance.
 
@@ -1185,8 +1187,10 @@ Workers return sparse cropped, row-packed foreground and coverage artifacts.
 The coordinator verifies each packet, ORs its indexed crops into the private
 view, and releases it before admitting more work. `lta_coverage` stores the
 ephemeral visited-transition ledger; `lta_union_artifacts` owns the sparse
-view union. Once a physical view is complete, it receives final two-dimensional
-hole fill and one backprojection into the native union. `lta_postprocessing`
+view union. Once a physical view is complete, it receives one backprojection
+into the native union. The opt-in `--enable_2D_hole_fill` also fills 2D seed,
+prediction, relay and completed-view masks; v25 preserves holes by default.
+SAM filling runs before recurrent-memory encoding. `lta_postprocessing`
 writes requested filter checkpoints; exact authoritative foreground is
 restored in the final output after destructive filters. `lta_outputs` publishes
 the mandatory final NRRD and complete manifest after checkpoint and identity

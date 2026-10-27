@@ -30,6 +30,7 @@ class LtaSamWorkerContext:
     constrained_batches: Mapping[str, object] | None
     cpu_budget: Mapping[str, object] | None = None
     trace_root: str | None = None
+    enable_2D_hole_fill: bool = False
 
 
 def _sha256_file(path: Path) -> str:
@@ -134,6 +135,10 @@ def build_worker_predictor(config: Mapping[str, object]) -> LtaSamWorkerContext:
             context.constrained_batches = configure_constrained_gpu_batches(context.predictor)
         if bool(profile["sdpa_fallback"]):
             context.restore_sdpa = install_sdpa_fallback()
+        from .sam_hole_fill import configure_sam_hole_fill
+        context.enable_2D_hole_fill = bool(config.get('enable_2D_hole_fill', False))
+        context.sam_runtime = dict(context.sam_runtime, hole_fill=configure_sam_hole_fill(
+            context.predictor, enabled=context.enable_2D_hole_fill))
         return context
     except Exception as exc:
         try:
@@ -671,7 +676,7 @@ def _execute_worker_task_impl(
                 ) if scaled_crop else seeds
                 seed_partitions = partition_mask_seed_sessions(
                     model_seeds,
-                    mask_transform=fill_binary_mask_holes_2d,
+                    mask_transform=(fill_binary_mask_holes_2d if getattr(context, 'enable_2D_hole_fill', False) else None),
                 )
             with trace.phase("render_window", work_id=str(payload["work_id"]), window_index=window_index):
                 resource = render_native_tile_window(
@@ -763,6 +768,7 @@ def _execute_worker_task_impl(
                             context.predictor,
                             resource=resource,
                             request=request,
+                            enable_2D_hole_fill=getattr(context, 'enable_2D_hole_fill', False),
                             prediction_callback=reduce_prediction,
                             retain_predictions=False,
                         )

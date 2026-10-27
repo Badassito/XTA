@@ -1732,6 +1732,66 @@ def _remove_seeded_islands(binary_image, context, seed_ijk):
     return _crop_binary_to_effective_extent(result), removed_island_count
 
 
+def _erase_seeded_island_slices(binary_array, island_array, seed_ijk, extent_origin):
+    """Erase marked islands on their own IJK planes, modifying binary_array.
+
+    A seed selects three complete cross sections of its 6-connected island.
+    Group labels separately for each plane so a marker on a different island
+    cannot extend that island's selection to an unrelated plane.
+    """
+    offsets = np.asarray(seed_ijk, dtype=np.int64).reshape((-1, 3))
+    if offsets.shape[0] == 0:
+        return 0, 0
+    offsets = offsets - np.asarray(extent_origin, dtype=np.int64)
+    dimensions = np.asarray(binary_array.shape[::-1], dtype=np.int64)
+    offsets = offsets[np.all((offsets >= 0) & (offsets < dimensions), axis=1)]
+    if offsets.shape[0] == 0:
+        return 0, 0
+    labels = island_array[offsets[:, 2], offsets[:, 1], offsets[:, 0]]
+    foreground = labels > 0
+    offsets, labels = offsets[foreground], labels[foreground]
+    if labels.size == 0:
+        return 0, 0
+
+    removed_voxel_count = 0
+    for ijk_axis in range(3):
+        array_axis = 2 - ijk_axis
+        for coordinate in np.unique(offsets[:, ijk_axis]):
+            selected_labels = np.unique(labels[offsets[:, ijk_axis] == coordinate])
+            plane_index = [slice(None)] * 3
+            plane_index[array_axis] = int(coordinate)
+            plane_index = tuple(plane_index)
+            plane = binary_array[plane_index]
+            selected = np.isin(island_array[plane_index], selected_labels)
+            removed_voxel_count += int(np.count_nonzero(plane[selected]))
+            plane[selected] = 0
+    return int(np.unique(labels).size), removed_voxel_count
+
+
+def _remove_seeded_slices(binary_image, context, seed_ijk):
+    seed_ijk = _unique_foreground_seed_indices(context, seed_ijk)
+    if seed_ijk.shape[0] == 0:
+        return None, 0
+    island_image, _all_labels = _label_islands(binary_image)
+    if island_image is None:
+        return None, 0
+    island_array = numpy_support.vtk_to_numpy(
+        island_image.GetPointData().GetScalars()
+    ).reshape(context["array"].shape)
+    result = _deep_copy_oriented_image(binary_image)
+    result_array = numpy_support.vtk_to_numpy(
+        result.GetPointData().GetScalars()
+    ).reshape(context["array"].shape)
+    affected_islands, removed_voxels = _erase_seeded_island_slices(
+        result_array, island_array, seed_ijk, context["extent_origin"]
+    )
+    if removed_voxels == 0:
+        return None, 0
+    result.GetPointData().GetScalars().Modified()
+    result.Modified()
+    return _crop_binary_to_effective_extent(result), affected_islands
+
+
 def _compute_remove_islands_job(job):
     binary = _binary_effective_copy(job["segment_image"])
     if binary is None:
@@ -1751,7 +1811,11 @@ def _compute_remove_islands_job(job):
         context, (point_seeds, line_seeds, curve_seeds)
     )
 
-    result, removed_island_count = _remove_seeded_islands(
+    remove = (
+        _remove_seeded_slices if job.get("remove_slices", False)
+        else _remove_seeded_islands
+    )
+    result, removed_island_count = remove(
         binary, context, all_seeds
     )
     return (
@@ -1767,6 +1831,15 @@ def _compute_remove_islands_job(job):
 
 
 def RemoveIslands():
+    _remove_marked_regions(remove_slices=False)
+
+
+def RemoveSlices():
+    _remove_marked_regions(remove_slices=True)
+
+
+def _remove_marked_regions(remove_slices=False):
+    action_name = "Remove Slices" if remove_slices else "Remove Islands"
     point_nodes = _get_point_nodes_f()
     points_world = _defined_world_points(point_nodes)
     line_nodes = _get_line_nodes_l()
@@ -1811,6 +1884,7 @@ def RemoveIslands():
                     "node_id": segmentation_node.GetID(),
                     "node_name": segmentation_node.GetName(),
                     "segment_id": segment_id,
+                    "remove_slices": remove_slices,
                     "segment_image": _snapshot_segment_labelmap(
                         segmentation_node, segment_id
                     ),
@@ -1828,7 +1902,7 @@ def RemoveIslands():
         raise RuntimeError("No visible segments were found.")
 
     results = _run_parallel_jobs(
-        _compute_remove_islands_job, jobs, "Remove Islands"
+        _compute_remove_islands_job, jobs, action_name
     )
 
     modified_segment_count = 0
@@ -1863,7 +1937,7 @@ def RemoveIslands():
             segmentation_node = slicer.mrmlScene.GetNodeByID(node_id)
             if segmentation_node is None:
                 raise RuntimeError(
-                    "A segmentation node was removed while Remove Islands was running."
+                    f"A segmentation node was removed while {action_name} was running."
                 )
             with slicer.util.NodeModify(segmentation_node):
                 for segment_id, binary_image in segment_results:
@@ -1871,8 +1945,9 @@ def RemoveIslands():
                         segmentation_node, segment_id, binary_image
                     )
 
+    operation = "sliced" if remove_slices else "removed"
     message = (
-        f"Island removal complete: {removed_island_count} island(s) removed "
+        f"{action_name} complete: {removed_island_count} island(s) {operation} "
         f"from {modified_segment_count} visible segment(s); "
         f"F point hits={point_hit_count}, "
         f"L line hits={line_hit_count}, "
@@ -2469,26 +2544,47 @@ toolbar = qt.QToolBar("My Tools")
 toolbar.objectName = _TOOLBAR_OBJECT_NAME
 main_window.addToolBar(toolbar)
 
-for label, function in [
+_TOOLBAR_ACTIONS = [
     ("Importer", BryanImporter),
-    ("Hide All", HideAll),
     ("Show All", ShowAll),
+    ("Hide All", HideAll),
     ("Update Global", UpdateGlobal),
     ("Update Nonglobal", UpdateNonGlobal),
     ("Update Both", UpdateBoth),
     ("Remove Islands", RemoveIslands),
+    ("Remove Slices", RemoveSlices),
     ("Remove Markers", RemoveMarkers),
     ("Export XTA Edits", ExportXTAEdits),
     ("Align Native Intensity", AlignNativeIntensity),
     ("Reset Intensity Alignment", ResetNativeIntensityAlignment),
-]:
+]
+toolbar_panel = qt.QWidget(toolbar)
+toolbar_layout = qt.QGridLayout(toolbar_panel)
+toolbar_layout.setContentsMargins(0, 0, 0, 0)
+toolbar_layout.setSpacing(2)
+toolbar_columns = (len(_TOOLBAR_ACTIONS) + 1) // 2
+toolbar_actions = []
+toolbar_buttons = []
+for index, (label, function) in enumerate(_TOOLBAR_ACTIONS):
     action = qt.QAction(label, main_window)
     if function in (HideAll, ShowAll):
         action.setToolTip(
             f"{label}: toggle all segments, including Global, in every segmentation "
             "node. Preserve 2D/3D display styles; leave volumes and markers alone."
         )
+    elif function == RemoveSlices:
+        action.setToolTip(
+            "Remove each marked island's XY, YZ and XZ cross sections through "
+            "its F point, L line or C/CC curve seeds in the segmentation's "
+            "voxel grid. Other islands and off-plane voxels are preserved."
+        )
     action.triggered.connect(
         lambda checked=False, callback=function: _run_toolbar_action(callback)
     )
-    toolbar.addAction(action)
+    button = qt.QToolButton(toolbar_panel)
+    button.setDefaultAction(action)
+    button.setToolButtonStyle(qt.Qt.ToolButtonTextOnly)
+    toolbar_layout.addWidget(button, index // toolbar_columns, index % toolbar_columns)
+    toolbar_actions.append(action)
+    toolbar_buttons.append(button)
+toolbar.addWidget(toolbar_panel)

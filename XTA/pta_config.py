@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Sequence, Tuple
 
 from .config import (
@@ -60,6 +60,7 @@ class PreprocessingRequest:
     gaussian_sigma: float = 3.0
     gaussian_passes: int = 1
     enable_3d_void_fill: bool = False
+    enable_2d_hole_fill: bool = False
 
 
 TileRequest = ResolvedTileGroup
@@ -82,10 +83,11 @@ class PtaConfig:
     effective_output_format: str
     radial_requests: Tuple[RadialViewRequest, ...] = ()
     spherical_requests: Tuple[SphericalViewRequest, ...] = ()
+    enable_cpr: bool = False
 
     @property
     def has_physical_views(self) -> bool:
-        if self.cartesian_views or self.tilted_groups:
+        if self.cartesian_views or self.tilted_groups or self.enable_cpr:
             return True
         tilted_bases = {
             str(view)
@@ -318,6 +320,16 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         help="YOLO segmentation task used for dataset publication",
     )
     parser.add_argument(
+        "--enable_2D_hole_fill", action="store_true",
+        help=("Fill holes in orthogonal native-mask slices, backproject the closure, "
+              "then fill 3D voids before normal PTA view generation"),
+    )
+    parser.add_argument(
+        "--enable_cpr", action="store_true",
+        help=("Generate curved planar reformations centered on extracted centerlines, "
+              "sampled at approximately one post-cubic-resize voxel per pixel"),
+    )
+    parser.add_argument(
         "--preprocessing",
         nargs="+",
         default=None,
@@ -529,15 +541,19 @@ def resolve_pta_config(args: argparse.Namespace) -> PtaConfig:
     )
     if not 0 <= int(args.png_compression) <= 9:
         raise ValueError("--png_compression must be between 0 and 9")
+    preprocessing = resolve_preprocessing_options(args.preprocessing)
+    if bool(getattr(args, "enable_2D_hole_fill", False)):
+        preprocessing = replace(preprocessing, enable_2d_hole_fill=True, enable_3d_void_fill=True)
     return PtaConfig(
         args=args,
         channel_format=channel_format,
-        preprocessing=resolve_preprocessing_options(args.preprocessing),
+        preprocessing=preprocessing,
         save=resolve_pta_save_request(args.save),
         cartesian_views=tuple(resolve_cartesian_views(args.enable_cartesian)),
         azimuthal_requests=tuple(resolve_azimuthal_view_requests(args.enable_azimuthal)),
         radial_requests=radial_requests,
         spherical_requests=spherical_requests,
+        enable_cpr=bool(getattr(args, "enable_cpr", False)),
         tilted_groups=tuple(resolve_tilted_view_groups(args.enable_tilted)),
         tiles=resolve_tile_requests(args.enable_tile),
         device_ids=resolve_pta_device_ids(args.device),

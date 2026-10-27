@@ -467,7 +467,8 @@ def predict_policy_source(model: Any, source: Any, *, task: dict[str, Any], cfg:
                           'azimuthal_padding_union_mm': pad_mask, 'azimuthal_padding_confmap_mm': pad_conf,
                           'device_union_consumer': None, 'require_device_union': False,
                           'owned_disjoint_output': True,
-                          'require_proto_hole_treatment': False, 'defer_device_union_flush': True,
+                          'require_proto_hole_treatment': False, 'require_resident_ring': False,
+                          'defer_device_union_flush': True,
                           'device_hole_fill': False}
                 result = predict_source_and_accumulate(model, local_source, **kwargs)
                 future = result.get('_device_union_flush_future')

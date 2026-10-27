@@ -58,7 +58,7 @@ class LegacyD1ModelAdmissionTests(unittest.TestCase):
             exec(program, env)
             self.assertEqual(env['result_mode'], 'd1_owner')
 
-    def _predict(self, ring_stats, *, direct=True):
+    def _predict(self, ring_stats, *, direct=True, require_holes=True):
         results = _UnconsumedResults()
         model = SimpleNamespace(predict=mock.Mock(return_value=results))
         accumulator = SimpleNamespace(host_written=False,
@@ -84,7 +84,8 @@ class LegacyD1ModelAdmissionTests(unittest.TestCase):
                 cfg=inference.PredictConfig(imgsz=4, conf=.1, device='cuda:0', quantize=None),
                 view_union_mm=np.zeros((1, 1, 1), np.uint8), view_confmap_mm=None,
                 M_out_to_native=np.eye(2, 3, dtype=np.float32), native_h=4, native_w=4,
-                require_device_union=True, require_proto_hole_treatment=True,
+                require_device_union=True, require_proto_hole_treatment=require_holes,
+                require_resident_ring=True,
                 device_union_consumer=consumer,
             )
         return stats, consumer, accumulator
@@ -104,6 +105,18 @@ class LegacyD1ModelAdmissionTests(unittest.TestCase):
         consumer.assert_called_once_with(accumulator)
         accumulator.synchronize_for_retirement.assert_called_once_with(None)
         accumulator.take_device_prediction_stats.assert_not_called()
+
+    def test_resident_d1_ring_without_topology_treatment_still_publishes(self):
+        stats, consumer, accumulator = self._predict({
+            'prediction_count': 3, 'frames_with_predictions': 2, 'proto_hole_treated_frames': 0,
+        }, require_holes=False)
+        self.assertTrue(stats['d1_view_complete'])
+        self.assertEqual(stats['device_hole_filled_frames'], 0)
+        consumer.assert_called_once_with(accumulator)
+
+    def test_disabled_hole_fill_keeps_the_resident_ring_admission_guard(self):
+        with self.assertRaisesRegex(RuntimeError, 'D1 requires the resident TensorRT ring'):
+            self._predict(None, require_holes=False)
 
 
 if __name__ == '__main__':

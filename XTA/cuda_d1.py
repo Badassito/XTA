@@ -54,6 +54,7 @@ from .workspace import (
     _env_int,
     available_anon_work_bytes,
     v1613_d1_pipeline_active,
+    yolo_hole_fill_enabled,
 )
 from .runtime import (
     _memfd_backing_path_from_array,
@@ -993,12 +994,14 @@ def _d1_finalize_bitset_layer(
     proven_empty: bool = False,
     encoded_blocks: Optional[Tuple[RadialEncodedBlock, ...]] = None,
     encoded_packed: Optional[bool] = None,
+    hole_fill_enabled: Optional[bool] = None,
 ) -> Dict[str, object]:
     """Stream the completed owner bitset into a path-backed cvol and return its layer ref."""
     if sum((words is not None, bool(proven_empty), encoded_blocks is not None)) != 1:
         raise ValueError('Publication requires exactly one of words, proven-empty, or encoded blocks')
     if encoded_blocks is None and encoded_packed is not None:
         raise ValueError('Packed-mode override requires encoded blocks')
+    hole_fill_enabled = (yolo_hole_fill_enabled() if hole_fill_enabled is None else bool(hole_fill_enabled))
     key = _nrrd_layer_key(
         view_name=str(view.name), source='fullframe', mask_kind='yolo',
         pass_index=0, stage='pre_interpolation',
@@ -1019,7 +1022,9 @@ def _d1_finalize_bitset_layer(
             'producer': ('radial_native_owner_bitset' if projection_kind == 'radial_native_pull_v1'
                          else 'v16.1.3_d1_owner_gpu_bitset'),
             'projection_payload_fusion': (projection_kind if projection_kind != 'legacy'
-                                         else 'project_infer_proto_close_backproject'),
+                                         else 'project_infer_proto_close_backproject' if hole_fill_enabled
+                                         else 'project_infer_backproject'),
+            'enable_2D_hole_fill': bool(hole_fill_enabled),
             'source_geometry_bitset': True,
         },
     )
@@ -1114,9 +1119,13 @@ def _d1_finalize_bitset_layer(
         pass_index=0,
         stage='pre_interpolation',
         description=(
-            'Native-plane-cleaned Radial YOLO mask with exact shell-owner pull projection.'
+            ('Radial YOLO mask with native-plane hole filling and exact shell-owner pull projection.'
+             if hole_fill_enabled else
+             'Radial YOLO mask with exact shell-owner pull projection.')
             if projection_kind == 'radial_native_pull_v1' else
-            'Angle-variant YOLO mask with resident proto closing and immediate owner-GPU backprojection into source geometry.'
+            ('Angle-variant YOLO mask with resident proto closing and immediate owner-GPU backprojection into source geometry.'
+             if hole_fill_enabled else
+             'Angle-variant YOLO mask with immediate owner-GPU backprojection into source geometry.')
         ),
         segment_extent_ijk=extent,
         segment_extent_shape_tyx=tuple(int(v) for v in output_shape),
@@ -1148,6 +1157,7 @@ def _d1_submit_publication(
     if semaphore is None:
         raise RuntimeError('D1 publication semaphore was not initialized')
     semaphore.acquire()
+    hole_fill_enabled = bool(getattr(state, 'enable_hole_fill', yolo_hole_fill_enabled()))
 
     def _publish() -> Dict[str, object]:
         nonlocal words, encoded_blocks
@@ -1166,6 +1176,7 @@ def _d1_submit_publication(
                 proven_empty=proven_empty,
                 encoded_blocks=encoded_blocks,
                 encoded_packed=encoded_packed,
+                hole_fill_enabled=hole_fill_enabled,
             )
             result['d1_publication_seconds'] = max(0.0, time.perf_counter() - started)
             return result

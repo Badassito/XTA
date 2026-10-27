@@ -193,7 +193,8 @@ class RadialEmptyPublicationTests(unittest.TestCase):
         class FakeOwner:
             proven_empty_output = cylindrical_owner.RadialOwner.proven_empty_output
 
-            def __init__(self, view, mask_shape, output_shape):
+            def __init__(self, view, mask_shape, output_shape, *, enable_hole_fill):
+                self.enable_hole_fill = bool(enable_hole_fill)
                 self.coverage = np.zeros(view.num_slices, dtype=bool)
                 self.native_any = False
                 self._closed = self._failed = False
@@ -247,7 +248,8 @@ class RadialEmptyPublicationTests(unittest.TestCase):
         class FakeOwner:
             proven_empty_output = cylindrical_owner.RadialOwner.proven_empty_output
 
-            def __init__(self, view, mask_shape, output_shape):
+            def __init__(self, view, mask_shape, output_shape, *, enable_hole_fill):
+                self.enable_hole_fill = bool(enable_hole_fill)
                 self.coverage = np.zeros(view.num_slices, dtype=bool)
                 self.native_any = False
                 self._closed = self._failed = False

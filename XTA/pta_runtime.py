@@ -30,6 +30,8 @@ def build_runtime_options(config: PtaConfig) -> argparse.Namespace:
         channel_format=[str(config.channel_format.token)],
         force=public.force,
         task=public.task,
+        enable_cpr=bool(getattr(public, "enable_cpr", False)),
+        enable_2D_hole_fill=bool(preprocessing.enable_2d_hole_fill),
         enable_3d_void_fill=bool(preprocessing.enable_3d_void_fill),
         gaussian_smoothing=(
             float(preprocessing.gaussian_sigma)

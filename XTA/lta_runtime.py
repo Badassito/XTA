@@ -160,6 +160,7 @@ class LtaRunPlan:
     workers_per_gpu: int = 1
     crop_backend: str = "tiled"
     dynamic_crop_settings: Mapping[str, object] = field(default_factory=dict)
+    enable_2D_hole_fill: bool = False
 
     def manifest_record(self) -> dict[str, object]:
         input_records = []
@@ -243,6 +244,7 @@ class LtaRunPlan:
             "sam_execution": self.sam_execution,
             "workers_per_gpu": self.workers_per_gpu,
             "crop_backend": self.crop_backend,
+            "enable_2D_hole_fill": bool(self.enable_2D_hole_fill),
             "dynamic_crop_settings": dict(self.dynamic_crop_settings),
             "conf": float(self.conf),
             "channel_policy": LTA_CHANNEL_POLICY,
@@ -562,6 +564,7 @@ def build_lta_run_plan(
         view_assignments=view_assignments,
         workers_per_gpu=int(getattr(config.args, "lta_workers_per_gpu", 1)),
         crop_backend=str(getattr(config.args, "lta_crop_backend", "tiled")),
+        enable_2D_hole_fill=bool(getattr(config.args, "enable_2D_hole_fill", False)),
         dynamic_crop_settings={"margin": int(getattr(config.args, "lta_crop_margin", 96)),
                                "guard": int(getattr(config.args, "lta_crop_guard", 24)),
                                "max_scale": float(getattr(config.args, "lta_crop_max_scale", 3.0))},

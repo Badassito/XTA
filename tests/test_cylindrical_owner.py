@@ -65,6 +65,11 @@ class RadialOwnerContractTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('XTA_RUN_CUDA_RADIAL_OWNER') == '1', 'explicit native owner CUDA qualification')
 class RadialOwnerCudaTests(unittest.TestCase):
+    def setUp(self):
+        opt_in = mock.patch.object(owner, 'yolo_hole_fill_enabled', return_value=True)
+        opt_in.start()
+        self.addCleanup(opt_in.stop)
+
     def test_bucket_compilation_failure_stops_native_owner(self):
         view=geometry.get_view_infos(5,7,9,cartesian_views=(),radial_views=('transverse',),
                                     radial_min_radius=.1,radial_patch_size=8)[0]
@@ -139,6 +144,27 @@ class RadialOwnerCudaTests(unittest.TestCase):
                             active.close()
                         self.assertEqual(active._pool.total_bytes(),0)
         print(f'Native Radial owner exact CUDA output: {checked} voxels.',flush=True)
+
+    def test_no_fill_retains_native_owner_and_omits_cleanup_memory(self):
+        import cupy as cp
+        view = geometry.get_view_infos(7, 9, 11, cartesian_views=(), radial_views=('transverse',),
+                                       radial_min_radius=.1, radial_patch_size=8)[0]
+        source = np.zeros((view.num_slices, 8, 8), np.uint8)
+        source[:, 1:7, 1:7] = 1
+        source[:, 2:6, 2:6] = 0
+        active = owner.RadialOwner(view, (8, 8), (7, 9, 11), reserve_bytes=0,
+                                   enable_hole_fill=False)
+        try:
+            self.assertIsNone(active._parents)
+            self.assertIsNone(active._exterior)
+            device = cp.asarray(source)
+            with mock.patch.object(active, '_clean', side_effect=AssertionError('unrequested fill')):
+                active.consume(0, device)
+            np.testing.assert_array_equal(device.get(), source)
+            np.testing.assert_array_equal(decode_words(active.host_words(), (7, 9, 11)),
+                                          oracle(source, view, (7, 9, 11)))
+        finally:
+            active.close()
 
     def test_cleanup_background_connectivity_border_and_large_roi(self):
         import cupy as cp

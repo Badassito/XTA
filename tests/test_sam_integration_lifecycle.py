@@ -206,6 +206,8 @@ def _drain_callback(context, records, *, complete=True, collected=2):
         '_restore_parent_post_inference_affinity': mock.Mock(),
         '_set_main_process_gpu_asset_retirement_pending': mock.Mock(),
         '_set_main_process_gpu_inference_priority_active': mock.Mock(),
+        'native_pull_scheduler': mock.Mock(),
+        'tail_worker_budget': 4,
     })
     exec(compile(ast.Module(body=[function], type_ignores=[]),
                  '<sam-pipeline-drain-callback>', 'exec'), namespace)

@@ -153,6 +153,7 @@ class LtaRuntimePlanningTests(unittest.TestCase):
             checkpoint.write_bytes(b"checkpoint")
             config = self._config(root, checkpoint)
             config.args.lta_workers_per_gpu = 2
+            config.args.enable_2D_hole_fill = True
             discovery = self._discovery(root)
 
             plan = build_lta_run_plan(
@@ -175,6 +176,8 @@ class LtaRuntimePlanningTests(unittest.TestCase):
         )
         self.assertEqual(plan.run_id, "run-a")
         self.assertEqual(plan.workers_per_gpu, 2)
+        self.assertTrue(plan.enable_2D_hole_fill)
+        self.assertTrue(plan.manifest_record()["enable_2D_hole_fill"])
         self.assertEqual(plan.manifest_record()["workers_per_gpu"], 2)
         self.assertEqual(build_lta_scheduler(plan).workers_per_device, 2)
         self.assertEqual(plan.temp_root.name, "lta_run-a")

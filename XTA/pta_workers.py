@@ -647,7 +647,9 @@ def projection_phase_summary(
         if count <= 0:
             continue
         shared_view = plan.view.shared_view
-        if shared_view is not None and shared_geometry.is_spherical_view(shared_view):
+        if plan.view.family == "cpr":
+            family = "cpr"
+        elif shared_view is not None and shared_geometry.is_spherical_view(shared_view):
             family = 'spherical'
         elif shared_view is not None and shared_geometry.is_radial_view(shared_view):
             family = 'radial'

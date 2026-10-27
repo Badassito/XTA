@@ -46,6 +46,7 @@ from .workspace import (
     _env_flag,
     _env_int,
     v1613_fast_bundle_active,
+    yolo_hole_fill_enabled,
 )
 from .runtime import (
     _acquire_parallel_pool,
@@ -1796,7 +1797,7 @@ def gpu_device_union_enabled() -> bool:
 
 def gpu_device_hole_fill_enabled() -> bool:
     """2D-hole-fill eligible device unions before they are committed."""
-    return _env_flag('YOLO_TTA_GPU_HOLE_FILL', True)
+    return bool(yolo_hole_fill_enabled() and _env_flag('YOLO_TTA_GPU_HOLE_FILL', True))
 
 def device_union_task_hole_fill_eligible(view, *, enabled, kind, result_mode, lease_count):
     """Keep exact per-slice Spherical cleanup on disjoint resident task unions.
@@ -4138,6 +4139,7 @@ def predict_source_and_accumulate(
     device_union_consumer: Optional[Callable[['_DeviceUnionAccumulator'], Dict[str, object]]] = None,
     require_device_union: bool = False,
     require_proto_hole_treatment: bool = False,
+    require_resident_ring: bool = False,
     azimuthal_padding_union_mm: Optional[np.ndarray] = None,
     azimuthal_padding_confmap_mm: Optional[np.ndarray] = None,
     owned_disjoint_output: bool = False,
@@ -4374,12 +4376,11 @@ def predict_source_and_accumulate(
                 prediction_count = int(specialized_stats['prediction_count'])
                 frames_with_predictions = int(specialized_stats['frames_with_predictions'])
 
-        if bool(require_proto_hole_treatment) and specialized_stats is None:
+        if bool(require_resident_ring or require_proto_hole_treatment) and specialized_stats is None:
             # A legacy D1 task owns no host union. Reject a declined TensorRT
             # ring before generic results address its shape-only placeholder.
             raise RuntimeError(
-                f'{source_label}: D1 requires the resident TensorRT ring so D3 proto '
-                'topology treatment occurs before backprojection'
+                f'{source_label}: D1 requires the resident TensorRT ring before backprojection'
             )
 
         source_padding_count = max(0, int(getattr(source, 'azimuthal_padding_count', 0) or 0))
@@ -5494,6 +5495,12 @@ def cleanup_view_volume_after_prediction_inplace(
     known_slice_bboxes: Optional[np.ndarray] = None,
     threshold_plane_shape: Optional[Tuple[int, int]] = None,
 ) -> None:
+    enable_hole_fill = yolo_hole_fill_enabled()
+    if (not enable_hole_fill and (
+            bool(precleaned_slice_cleanup) or (float(min_conf) <= 0.0 and float(min_radius) <= 0.0))):
+        # With no requested filtering or topology work, preserve the resident/packed
+        # prediction bytes without even scanning the parent or starting a worker pool.
+        return
     # non-azimuthal masks can still be on the canonical inference grid here.
     # Convert the native-view radius once and perform every component operation on that smaller
     # raster. Azimuthal already owns a deliberately folded native raster and keeps its historical
@@ -5530,6 +5537,8 @@ def cleanup_view_volume_after_prediction_inplace(
     # min_radius inside the per-slice unit.
     # skipped when every slice of this view was already hole-filled on device by
     # the GPU workers (identical per-slice semantics; the CPU pass would be pure recompute).
+    if not enable_hole_fill:
+        return
     if int(view.augmentation_pass) > 0:
         # An inverse-invalid island is unknown, not an enclosed background hole.
         # Filtering/removal remains eligible; adding unsupported foreground does not.

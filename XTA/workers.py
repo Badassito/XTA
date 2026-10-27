@@ -66,7 +66,7 @@ from .runtime import (
     flush_runtime_task_trace,
     runtime_telemetry,
 )
-from .workspace import configure_pipeline_modes
+from .workspace import configure_pipeline_modes, yolo_hole_fill_enabled
 from .geometry import (
     AugJob,
     BatchResultFrameSpec,
@@ -1788,9 +1788,14 @@ def run_prediction_volume_in_worker(
                     if str(task.get('result_mode', 'file')) == 'd1_owner' else None
                 ),
                 require_device_union=bool(str(task.get('result_mode', 'file')) == 'd1_owner'),
+                require_resident_ring=bool(
+                    str(task.get('result_mode', 'file')) == 'd1_owner'
+                    and not is_radial_owner_task(task)
+                ),
                 require_proto_hole_treatment=bool(
                     str(task.get('result_mode', 'file')) == 'd1_owner'
                     and not is_radial_owner_task(task)
+                    and yolo_hole_fill_enabled()
                 ),
                 azimuthal_padding_union_mm=azimuthal_padding_mask,
                 azimuthal_padding_confmap_mm=azimuthal_padding_conf,
@@ -2188,6 +2193,7 @@ def _gpu_inference_worker_main(
         configure_pipeline_modes(
             fast_bundle_active=bool(init_dict.get('fast_bundle_active', False)),
             d1_pipeline_active=bool(init_dict.get('d1_pipeline_active', False)),
+            enable_yolo_hole_fill=bool(init_dict.get('enable_yolo_hole_fill', False)),
         )
         from .confidence_evidence import configure_confidence_evidence_worker
         configure_confidence_evidence_worker(

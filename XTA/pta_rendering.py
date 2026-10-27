@@ -22,6 +22,7 @@ except Exception as exc:  # pragma: no cover
     raise RuntimeError("OpenCV is required: pip install opencv-python") from exc
 
 from . import geometry as shared_geometry
+from .pta_cpr import CprGeometry, render_cpr_frame
 from .unification.contracts import RasterPlan
 from .unification.sampling import forward_sampling_policy, require_forward_sampling
 
@@ -101,6 +102,7 @@ class ViewInfo:
     # presentation/planner adapters only; all built-in pixels come from this
     # shared TTA geometry object when present.
     shared_view: Optional[shared_geometry.ViewInfo] = None
+    cpr_geometry: Optional[CprGeometry] = None
 
 
 @dataclass(frozen=True)
@@ -242,6 +244,8 @@ def azimuthal_extract_lanczos(volume: np.ndarray, sampler: AzimuthalSampler, *, 
 
 def get_native_view_image(volume: np.ndarray, view: ViewInfo, idx: int) -> np.ndarray:
     i = int(idx)
+    if view.family == "cpr" and view.cpr_geometry is not None:
+        return render_cpr_frame(volume, view.cpr_geometry, i)
     if view.family == "transverse":
         return np.asarray(volume[i])
     if view.family == "sagittal":
@@ -257,6 +261,8 @@ def get_native_view_image(volume: np.ndarray, view: ViewInfo, idx: int) -> np.nd
 def get_native_view_frame(volume: np.ndarray, mask: np.ndarray, view: ViewInfo, idx: int) -> Tuple[np.ndarray, np.ndarray]:
     i = int(idx)
     image = get_native_view_image(volume, view, i)
+    if view.family == "cpr" and view.cpr_geometry is not None:
+        return image, render_cpr_frame(mask, view.cpr_geometry, i, categorical=True)
     if view.family == "transverse":
         return image, np.asarray(mask[i])
     if view.family == "sagittal":
@@ -972,6 +978,8 @@ def render_plan_frame_source(*, volume: np.ndarray, mask: np.ndarray, plan: Rend
 
 def get_native_view_mask(mask: np.ndarray, view: ViewInfo, idx: int) -> np.ndarray:
     i = int(idx)
+    if view.family == "cpr" and view.cpr_geometry is not None:
+        return render_cpr_frame(mask, view.cpr_geometry, i, categorical=True)
     if view.family == "transverse":
         return np.asarray(mask[i])
     if view.family == "sagittal":

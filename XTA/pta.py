@@ -16,7 +16,8 @@ Core behavior:
     binary mask volume in RAM before reslicing.
   - Classifies inputs as Fully Labeled, Partially Labeled, or Unlabeled per the
     inherited volume rules.
-  - Optionally fills enclosed 3D mask voids, then applies Gaussian smoothing.
+  - Optionally closes orthogonal 2D mask holes before 3D void filling, then
+    applies Gaussian smoothing.
   - Cubic-resizes complete 3D volumes before view extraction.
   - Emits single-channel gray, triplicated RGB, or custom neighboring-slice
     channel stacks for active transverse, sagittal, coronal, azimuthal,
@@ -2474,6 +2475,7 @@ class PreparedVolume:
     foreground_preservation_stats: Dict[str, int]
     semantic_foreground: bool = False
     void_fill_stats: Optional[Dict[str, object]] = None
+    hole_fill_2d_stats: Optional[Dict[str, object]] = None
     semantic_coverage_for_render: Optional[np.ndarray] = None
     # Blocks backing volume_for_render/mask_for_render for the
     # process pool, plus every block this volume owns (released at finalize).
@@ -2513,6 +2515,7 @@ class VolumeSummaryRecord:
     fraction: float = 1.0
     candidates_before_fraction: int = 0
     void_fill_stats: Optional[Dict[str, object]] = None
+    hole_fill_2d_stats: Optional[Dict[str, object]] = None
 
 
 def _v18_view_manifest_record(view: ViewInfo) -> Dict[str, object]:
@@ -2522,6 +2525,8 @@ def _v18_view_manifest_record(view: ViewInfo) -> Dict[str, object]:
             "physical_view_id": str(view.name),
             "family": str(view.family),
             "num_slices": int(view.num_slices),
+            **({"cpr_geometry": view.cpr_geometry.manifest()}
+               if view.cpr_geometry is not None else {}),
         }
     return {
         "physical_view_id": str(shared_geometry.physical_view_name(shared)),
@@ -2695,6 +2700,7 @@ def write_v18_pta_manifest(
             "render_plans": [dict(stats) for stats in record.render_stats],
             "gaussian_preprocessing": [dict(stats) for stats in record.smoothing_stats],
             "3d_void_fill_preprocessing": record.void_fill_stats,
+            "2d_hole_fill_preprocessing": record.hole_fill_2d_stats,
             "foreground_anchor_repair": dict(record.foreground_preservation_stats),
             "candidates_total": int(record.candidates_total),
             "fraction": float(record.fraction),
@@ -2765,6 +2771,7 @@ def write_v18_pta_manifest(
             "radial_min_radius": config.args.radial_min_radius,
             "spherical_requests": [str(request.view) for request in config.spherical_requests],
             "spherical_min_radius": config.args.spherical_min_radius,
+            "enable_cpr": bool(config.enable_cpr),
             "tilted_groups": [
                 {
                     "views": list(group.views),
@@ -2791,9 +2798,11 @@ def write_v18_pta_manifest(
                 for tile in tile_configs
             ],
             "preprocessing": {
+                "2d_hole_fill": bool(getattr(config.preprocessing, "enable_2d_hole_fill", False)),
                 "3d_void_fill": bool(config.preprocessing.enable_3d_void_fill),
                 "execution_order": [
                     operation for operation, enabled in (
+                        ("2d_hole_fill", getattr(config.preprocessing, "enable_2d_hole_fill", False)),
                         ("3d_void_fill", config.preprocessing.enable_3d_void_fill),
                         ("gaussian_smoothing", config.preprocessing.gaussian_smoothing_enabled),
                     ) if enabled
@@ -3616,6 +3625,22 @@ def prepare_loaded_source(
     if write_side_effects and label_enabled and bool(args.save_nrrd):
         nrrd_paths.append(write_nrrd(mask, out_dir / "nrrds" / f"{src.stem}_Pass_0.nrrd"))
 
+    hole_fill_2d_stats: Optional[Dict[str, object]] = None
+    if bool(getattr(args, "enable_2D_hole_fill", False)):
+        if label_enabled and effective_volume_class == "fully_labeled" and not source_encoded_gaps:
+            from .pta_preprocessing import fill_orthogonal_mask_holes_2d_inplace
+
+            with runtime_telemetry().span('pta.prepare.hole_fill_2d'):
+                hole_fill_2d_stats = fill_orthogonal_mask_holes_2d_inplace(mask)
+            if write_side_effects and bool(args.save_nrrd):
+                nrrd_paths.append(write_nrrd(mask, out_dir / "nrrds" / f"{src.stem}_HoleFill2D.nrrd"))
+        elif not label_enabled:
+            warnings.add("2d_hole_fill_disabled_for_unlabeled_volume", f"{src.stem}: Unlabeled volumes disable label operations")
+        elif source_encoded_gaps:
+            warnings.add("2d_hole_fill_disabled_for_encoded_gaps", f"{src.stem}: numeric source-index gaps do not define adjacent 3D samples")
+        else:
+            warnings.add("2d_hole_fill_disabled_for_partial_volume", f"{src.stem}: Partial volumes disable 3D label transformations unless --force is supplied")
+
     void_fill_stats: Optional[Dict[str, object]] = None
     if bool(getattr(args, "enable_3d_void_fill", False)):
         if label_enabled and effective_volume_class == "fully_labeled" and not source_encoded_gaps:
@@ -3846,6 +3871,34 @@ def prepare_loaded_source(
         config=effective_config,
         azimuthal_native_raster=int(args.imgsz),
     )
+    if bool(getattr(args, "enable_cpr", False)):
+        if not label_enabled or effective_volume_class == "partially_labeled" or source_encoded_gaps:
+            warnings.add(
+                "cpr_disabled_without_complete_ground_truth",
+                f"{src.stem}: CPR requires a complete labeled volume with adjacent source slices; "
+                "--force can enable complete-volume treatment of partial labels",
+            )
+        else:
+            from .pta_cpr import extract_cpr_geometries
+
+            geometries = extract_cpr_geometries(
+                mask_for_render,
+                warn=lambda message: warnings.add("cpr_centerline_unavailable", f"{src.stem}: {message}"),
+            )
+            for geometry in geometries:
+                views.append(ViewInfo(
+                    name=f"cpr_branch{geometry.branch_id:04d}",
+                    display_name=f"CPR_branch{geometry.branch_id:04d}",
+                    family="cpr", num_slices=geometry.num_slices,
+                    src_h=geometry.height, src_w=geometry.width, pad_mode="clamp",
+                    full_t=int(t_dim), full_h=int(h), full_w=int(w),
+                    cpr_geometry=geometry,
+                ))
+            print(f"{src.stem}: CPR: {len(geometries)} centerline branch(es), "
+                  f"{sum(item.num_slices for item in geometries)} perpendicular cross-section images; "
+                  "native spacing approximately one processing voxel (before explicit --imgsz scaling)")
+            if not geometries:
+                warnings.add("cpr_centerline_unavailable", f"{src.stem}: no usable tubular centerline; CPR produced no views")
     for request, diameter, spacing in zip(
         effective_config.azimuthal_requests,
         compiled_views.azimuthal_diameters,
@@ -3920,6 +3973,7 @@ def prepare_loaded_source(
         plans=list(plans),
         smoothing_stats=smoothing_stats,
         void_fill_stats=void_fill_stats,
+        hole_fill_2d_stats=hole_fill_2d_stats,
         nrrd_paths=nrrd_paths,
         voxel_initial=voxel_initial,
         voxel_final=voxel_final,
@@ -4140,6 +4194,7 @@ def classify_original_foregrounds_for_volume(
         and bool(prep.src.yolo_polygons_by_frame or prep.src.labels_by_frame)
         and not prep.smoothing_stats
         and not getattr(prep, "void_fill_stats", None)
+        and not getattr(prep, "hole_fill_2d_stats", None)
     )
     known_foreground_slices = getattr(prep, "foreground_preservation_stats", {}).get(
         "guaranteed_output_foreground_transverse_slices"
@@ -4200,6 +4255,11 @@ def classify_original_foregrounds_for_volume(
         warnings.add(
             "label_geometry_fallback_after_void_fill",
             f"{prep.src.stem}: transformed dense-mask classification preserves the background cap after 3D void filling",
+        )
+    if prep.src.label_source == "yolo" and getattr(prep, "hole_fill_2d_stats", None) and warnings is not None:
+        warnings.add(
+            "label_geometry_fallback_after_2d_hole_fill",
+            f"{prep.src.stem}: transformed dense-mask classification preserves the background cap after 2D hole filling",
         )
     for plan_idx, idx in jobs:
         plan = prep.plans[int(plan_idx)]
@@ -5208,6 +5268,8 @@ def write_pta_summary(
                 lines.append(f"      initial_rasterized_transverse_mask: {int(rec.voxel_initial)}")
             if rec.voxel_final is not None:
                 lines.append(f"      final_mask_after_native_preprocessing: {int(rec.voxel_final)}")
+        if rec.hole_fill_2d_stats is not None:
+            lines.append(f"    2d_hole_fill: {rec.hole_fill_2d_stats}")
         if rec.void_fill_stats is not None:
             lines.append(f"    3d_void_fill: {rec.void_fill_stats}")
         if rec.smoothing_stats:
@@ -5941,6 +6003,7 @@ def main(
                     and bool(prep.src.yolo_polygons_by_frame or prep.src.labels_by_frame)
                     and not prep.smoothing_stats
                     and not prep.void_fill_stats
+                    and not getattr(prep, "hole_fill_2d_stats", None)
                 )
             )
             semantic_classification_skipped = bool(
@@ -6317,6 +6380,7 @@ def main(
                 voxel_final=prep.voxel_final,
                 smoothing_stats=list(prep.smoothing_stats),
                 void_fill_stats=prep.void_fill_stats,
+                hole_fill_2d_stats=prep.hole_fill_2d_stats,
                 nrrd_paths=list(prep.nrrd_paths),
                 views=list(prep.views),
                 tile_configs=list(tile_configs),

@@ -434,6 +434,9 @@ def _execute_interpolation_tracker_task(context, kind, payload):
     shape = (y1 - y0, x1 - x0)
     if seed.shape != shape or not bool(seed.any()):
         raise ValueError("SAM seed must be nonempty and match its declared crop geometry")
+    if getattr(context, 'enable_2D_hole_fill', False):
+        from .lta_postprocessing import fill_binary_mask_holes_2d
+        seed = fill_binary_mask_holes_2d(seed)
     start = _integer(payload["frame_start"], "frame_start")
     stop = _integer(payload["frame_stop"], "frame_stop")
     prompt = _integer(payload["seed_frame"], "seed_frame")
@@ -1120,8 +1123,10 @@ class SamInterpolationTracker:
         compute_lease_factory=None, compute_lease_release=None, compute_yield_requested=None,
         residency_quarantine=None, before_worker_shutdown=None, after_worker_shutdown=None,
         progressive_pool=None,
+        enable_2D_hole_fill: bool = False,
     ) -> None:
         self.model_path = str(model_path)
+        self.enable_2D_hole_fill = bool(enable_2D_hole_fill)
         self.device_ids = tuple(_integer(value, "device_id") for value in device_ids)
         if not self.device_ids or len(set(self.device_ids)) != len(self.device_ids) or min(self.device_ids) < 0:
             raise ValueError("SAM tracker requires unique nonnegative CUDA devices")
@@ -1385,6 +1390,7 @@ class SamInterpolationTracker:
             adapter_factory='build_interpolation_predictor', adapter_execute='execute_interpolation_tracker_task',
             adapter_shutdown='close_interpolation_predictor', adapter_config=dict(
                 model_path=self.model_path, profile=self.profile, conf=0.0, max_num_objects=16,
+                enable_2D_hole_fill=self.enable_2D_hole_fill,
                 feature_cache_bytes=self.feature_cache_bytes,
                 feature_cache_headroom_bytes=self.feature_cache_headroom_bytes,
                 sam_global_cpu_budget=resolve_worker_cpu_budget(self.worker_count),

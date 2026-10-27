@@ -249,6 +249,7 @@ def _accumulate_relay_seed_revision(
     event_key: LtaSpatialRelayKey,
     seed: LtaMaskSeed,
     revisions: dict[LtaSpatialRelayKey, _RelayMaskRevision],
+    *, enable_2D_hole_fill: bool = False,
 ) -> tuple[LtaMaskSeed, str] | None:
     """Admit only new foreground and return the accumulated event seed."""
 
@@ -286,6 +287,7 @@ def _accumulate_relay_seed_revision(
     ).reshape(shape)
     filled = fill_merged_seed_mask_holes_2d(
         accumulated_mask,
+        enabled=enable_2D_hole_fill,
         context={
             "destination_tile_index": event_key.destination_tile_index,
             "temporal_direction": event_key.temporal_direction,
@@ -1466,6 +1468,7 @@ def _select_and_merge_relay_group(
     direction: str,
     destination_tile_index: int,
     generation: int,
+    enable_2D_hole_fill: bool = False,
 ) -> LtaMaskSeed:
     import numpy as np
 
@@ -1486,6 +1489,7 @@ def _select_and_merge_relay_group(
     merged = np.logical_or.reduce(masks)
     filled = fill_merged_seed_mask_holes_2d(
         merged,
+        enabled=enable_2D_hole_fill,
         context={
             "destination_tile_index": int(destination_tile_index),
             "temporal_direction": direction,
@@ -1549,6 +1553,7 @@ def _plan_relay_generation(
     first_plan_order: int,
     coverage_ledger: object | None = None,
     admission_audit: dict[str, object] | None = None,
+    enable_2D_hole_fill: bool = False,
 ) -> tuple[_PlannedChain, ...]:
     # Validate every emitted relay, including arrivals that an idempotency key
     # will deliberately discard.  Cleanup below is therefore restricted to
@@ -1579,6 +1584,7 @@ def _plan_relay_generation(
             direction=event_key.temporal_direction,
             destination_tile_index=event_key.destination_tile_index,
             generation=generation,
+            enable_2D_hole_fill=enable_2D_hole_fill,
         )
         if admission_audit is not None:
             admission_audit["spatial_seed_candidates"] = int(admission_audit.get("spatial_seed_candidates", 0)) + 1
@@ -1593,6 +1599,7 @@ def _plan_relay_generation(
             event_key,
             seed,
             relay_mask_revisions,
+            enable_2D_hole_fill=enable_2D_hole_fill,
         )
         if accumulated is None:
             if admission_audit is not None:
@@ -1876,6 +1883,7 @@ def _drive_workers_to_fixed_point(
     worker_task_timeout: float,
     trace: object | None = None,
     canonical_frontier: bool = False,
+    enable_2D_hole_fill: bool = False,
 ):
     from .lta_coverage import LtaCoverageLedger
 
@@ -1892,6 +1900,7 @@ def _drive_workers_to_fixed_point(
             worker_task_timeout=worker_task_timeout, trace=trace,
             coverage=coverage, snapshots=snapshots,
             canonical_frontier=canonical_frontier,
+            enable_2D_hole_fill=enable_2D_hole_fill,
         )
 
 
@@ -1912,6 +1921,7 @@ def _drive_workers_with_coverage(
     coverage: object,
     snapshots: ExitStack,
     canonical_frontier: bool = False,
+    enable_2D_hole_fill: bool = False,
 ) -> tuple[
     int,
     Mapping[int, int],
@@ -2033,6 +2043,7 @@ def _drive_workers_with_coverage(
         with phase:
             return _plan_relay_generation(
                 records, **kwargs, coverage_ledger=coverage, admission_audit=admission_audit,
+                enable_2D_hole_fill=enable_2D_hole_fill,
             )
 
     def emit_generation_relays() -> None:
@@ -2262,6 +2273,7 @@ def _drive_workers_with_coverage(
             _unlink_consumed_temp_artifacts((prior_coverage_path,), temp_root=temp_root)
             generation = _drive_canonical_relay_frontier(
                 relay_records.get(0, ()), pool=pool, view_plan=view_plan,
+                enable_2D_hole_fill=enable_2D_hole_fill,
                 cache_ref=cache_ref, view_union=view_union, coverage=coverage,
                 temp_root=temp_root, conf=conf, empty_frame_limit=empty_frame_limit,
                 worker_task_timeout=worker_task_timeout, trace=trace,
@@ -2637,6 +2649,7 @@ def execute_lta_plan(
                     adapter_config={
                         "model_path": str(plan.bundle.root), "conf": float(plan.conf),
                         "profile": PRODUCTION_LTA_PROFILE, "trace_dir": str(trace_dir),
+                        "enable_2D_hole_fill": plan.enable_2D_hole_fill,
                     },
                 ),
                 startup_timeout=float(worker_startup_timeout),
@@ -2652,6 +2665,7 @@ def execute_lta_plan(
                     worker_task_timeout=float(worker_task_timeout), trace=trace, settings=crop_settings)
             else:
                 relay_generation, worker_pids, execution_schedule, worker_audit = _drive_workers_to_fixed_point(
+                    enable_2D_hole_fill=plan.enable_2D_hole_fill,
                     scheduler=scheduler,
                     pool=pool,
                     initial=initial,
@@ -2705,6 +2719,7 @@ def execute_lta_plan(
 
         view_fill = fill_completed_view_holes_2d_inplace(
             view_union,
+            enabled=plan.enable_2D_hole_fill,
             runtime_view_id=view_plan.runtime_view_id,
             workers=worker_count,
         )

@@ -73,6 +73,7 @@ class EnvironmentCleanupTests(unittest.TestCase):
             workspace.configure_pipeline_modes(
                 fast_bundle_active=True,
                 d1_pipeline_active=True,
+                enable_yolo_hole_fill=True,
             )
             self.assertTrue(workspace.v1613_fast_bundle_active())
             self.assertTrue(workspace.v1613_d1_pipeline_active())

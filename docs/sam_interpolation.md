@@ -5,6 +5,14 @@ Choose one interpolation backend for a run. `sam` uses the local mask-conditione
 to propose image-guided additions between detector observations. A rejected SAM
 proposal receives no SDF fallback. `both` is rejected during argument parsing.
 
+In v25, `--enable_2D_hole_fill sam` optionally fills SAM masks before recurrent
+memory encoding and publication. Without that stage selection, holes remain in
+SAM masks. The SDK's area-limited output-only filling stays disabled; the opt-in
+uses the shared exact 2D fill at the memory boundary, including a CPU transfer
+when SAM runs on CUDA. `--enable_2D_hole_fill yolo` independently selects detector
+mask filling. These flags do not change SDF interpolation or explicitly selected
+3D postprocessing. See [v25 migration](v25_changes.md).
+
 SAM extrapolation is independently enabled by `--extrapolation_distance` and
 can follow either interpolation backend. Source review and snapshot qualification
 are separate from a tagged release; see [the development audit workflow](../../Scratch/Data/XTA/History/release/README.md).

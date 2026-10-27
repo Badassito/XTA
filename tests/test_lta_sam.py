@@ -132,7 +132,8 @@ class LtaSamBoundaryTests(unittest.TestCase):
             get_device_capability=lambda _: (9, 0), empty_cache=mock.Mock()))
         order = mock.Mock()
         order.preflight.return_value = {"kernel_checks": [32, 64]}
-        order.builder.return_value = object()
+        order.builder.return_value = types.SimpleNamespace(model=types.SimpleNamespace(
+            tracker=types.SimpleNamespace(fill_hole_area=0)))
         order.routing.return_value = {"policy": "fp8"}
         with mock.patch.dict(sys.modules, {"torch": runtime, "cv2": types.SimpleNamespace()}), \
              mock.patch("XTA.lta_cpu.configure_worker_runtime_threads", return_value={}), \

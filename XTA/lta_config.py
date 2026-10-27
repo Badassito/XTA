@@ -290,6 +290,11 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         ),
     )
     parser.add_argument(
+        "--enable_2D_hole_fill", action="store_true",
+        help=("Fill 2D SAM mask holes before the next prediction. "
+              "By default holes are preserved"),
+    )
+    parser.add_argument(
         "--postprocessing",
         nargs="+",
         default=None,
