@@ -52,7 +52,15 @@ def spherical_cuda_backproject_enabled():
     )
 
 
-def _close_spherical_cuda_resources(projector, lease):
+def _close_spherical_cuda_resources(projector, lease, *, timings=None):
+    def release():
+        started = time.perf_counter()
+        try:
+            lease.release()
+        finally:
+            if timings is not None:
+                timings['close_lease_release_seconds'] = time.perf_counter() - started
+
     try:
         if projector is not None:
             projector.close()
@@ -60,10 +68,10 @@ def _close_spherical_cuda_resources(projector, lease):
         exc.stage_lease = lease
         raise
     except BaseException:
-        lease.release()
+        release()
         raise
     else:
-        lease.release()
+        release()
 
 
 class _SphericalCudaStage:
@@ -71,6 +79,7 @@ class _SphericalCudaStage:
         self.projector, self.lease = projector, lease
         self.device_index = int(lease.device_index)
         self.max_block_depth = int(projector.max_block_depth)
+        self.close_seconds = self.close_lease_release_seconds = 0.0
 
     def project(self, first, count):
         return self.projector.project(first, count)
@@ -81,8 +90,10 @@ class _SphericalCudaStage:
     def close(self):
         if self.lease is None:
             return
+        started = time.perf_counter()
+        timings = {}
         try:
-            _close_spherical_cuda_resources(self.projector, self.lease)
+            _close_spherical_cuda_resources(self.projector, self.lease, timings=timings)
         except SphericalCudaProjectionUnsafeFailure:
             raise
         except BaseException:
@@ -90,6 +101,9 @@ class _SphericalCudaStage:
             raise
         else:
             self.lease = None
+        finally:
+            self.close_seconds = time.perf_counter() - started
+            self.close_lease_release_seconds = timings.get('close_lease_release_seconds', 0.0)
 
 
 def _try_spherical_cuda_stage(source, view, shape, bboxes, *, quiet=False):
@@ -650,37 +664,6 @@ def backproject_spherical_volume_to_volume(
             flush = getattr(output, 'flush', None)
             if callable(flush):
                 flush()
-        if stage is not None:
-            for name in ('kernel_seconds', 'metadata_seconds', 'pack_seconds', 'd2h_seconds',
-                         'metadata_d2h_bytes', 'payload_d2h_bytes', 'dense_d2h_bytes', 'source_h2d_bytes',
-                         'roi_projection_voxels', 'roi_skipped_blocks', 'constructor_seconds', 'preflight_seconds',
-                         'preflight_mode', 'preflight_pixels', 'source_upload_seconds',
-                         'source_pack_seconds', 'source_pack_backend', 'geometry_upload_seconds',
-                         'source_upload_pipeline', 'source_upload_stage_bytes', 'source_upload_copy_count',
-                         'source_upload_stream_fences', 'source_upload_lane_wait_seconds'):
-                runtime_telemetry().gauge(f'projection.spherical.{name}', getattr(stage.projector, name, None))
-        metrics = '' if stage is None else ''.join(
-            f', {name}={getattr(stage.projector, name, None)}' for name in
-            ('source_h2d_bytes', 'metadata_d2h_bytes', 'payload_d2h_bytes', 'dense_d2h_bytes',
-             'roi_projection_voxels', 'roi_skipped_blocks', 'constructor_seconds', 'preflight_seconds',
-             'preflight_mode', 'preflight_pixels', 'source_upload_seconds',
-             'source_pack_seconds', 'source_pack_backend', 'geometry_upload_seconds',
-             'source_upload_pipeline', 'source_upload_stage_bytes', 'source_upload_copy_count',
-             'source_upload_stream_fences', 'source_upload_lane_wait_seconds',
-             'kernel_seconds', 'metadata_seconds', 'pack_seconds', 'd2h_seconds'))
-        print(f'Spherical projection complete {spherical_view.name}: backend={backend}, '
-              f'total_s={time.perf_counter() - started:.6f}, cpu_slices={cpu_slices}, '
-              f'cuda_slices={cuda_slices}, admission_attempts={admission_attempts}, '
-              f'admission_probe_s={admission_probe_s:.6f}, cpu_worker_s={cpu_worker_s:.6f}, '
-              f'cpu_result_wait_s={cpu_result_wait_s:.6f}, cpu_publish_s={cpu_publish_s:.6f}, '
-              f'cpu_reader_drain_s={cpu_reader_drain_s:.6f}, cpu_cancelled_blocks={cpu_cancelled_blocks}, '
-              f'gpu_result_wait_s={gpu_result_wait_s:.6f}, gpu_publish_s={gpu_publish_s:.6f}'
-              f', cpu_backend={cpu_backend}, cpu_setup_seconds={cpu_setup_seconds:.6f}'
-              f', cpu_compact_slices={cpu_compact_slices}, cpu_empty_slices={cpu_empty_slices}'
-              f', cpu_payload_bytes={cpu_payload_bytes}, cpu_compact_pull_voxels={cpu_compact_pull_voxels}'
-              f', cpu_compact_scan_voxels={cpu_compact_scan_voxels}'
-              f'{metrics}', flush=True)
-        return output if output is not None else SinkOnlyProjectionResult(shape)
     except BaseException as exc:
         failed = True
         if sink_only and not callback_aborted:
@@ -699,3 +682,52 @@ def backproject_spherical_volume_to_volume(
                     close_memmap_array_without_flush(output)
                     raise
                 print(f'Spherical CUDA cleanup failed {spherical_view.name}: {exc}', flush=True)
+
+    # Report only after successful cleanup has returned the GPU stage lease.
+    if stage is not None:
+        for name in ('kernel_seconds', 'metadata_seconds', 'pack_seconds', 'd2h_seconds',
+                     'metadata_d2h_bytes', 'payload_d2h_bytes', 'dense_d2h_bytes', 'source_h2d_bytes',
+                     'roi_projection_voxels', 'roi_skipped_blocks', 'constructor_seconds', 'preflight_seconds',
+                     'preflight_mode', 'preflight_pixels', 'source_upload_seconds',
+                     'source_pack_seconds', 'source_pack_backend', 'geometry_upload_seconds',
+                     'source_upload_pipeline', 'source_upload_stage_bytes', 'source_upload_copy_count',
+                     'source_upload_stream_fences', 'source_upload_lane_wait_seconds',
+                     'block_budget_bytes', 'max_block_depth', 'output_buffer_bytes',
+                     'required_device_bytes', 'admission_free_bytes',
+                     'gpu_projection_blocks', 'projection_stream_fences',
+                     'close_seconds', 'close_sync_seconds', 'close_owner_clear_seconds',
+                     'close_device_pool_seconds', 'close_pinned_pool_seconds'):
+            runtime_telemetry().gauge(f'projection.spherical.{name}', getattr(stage.projector, name, None))
+    metrics = '' if stage is None else ''.join(
+        f', {name}={getattr(stage.projector, name, None)}' for name in
+        ('source_h2d_bytes', 'metadata_d2h_bytes', 'payload_d2h_bytes', 'dense_d2h_bytes',
+         'roi_projection_voxels', 'roi_skipped_blocks', 'constructor_seconds', 'preflight_seconds',
+         'preflight_mode', 'preflight_pixels', 'source_upload_seconds',
+         'source_pack_seconds', 'source_pack_backend', 'geometry_upload_seconds',
+         'source_upload_pipeline', 'source_upload_stage_bytes', 'source_upload_copy_count',
+         'source_upload_stream_fences', 'source_upload_lane_wait_seconds',
+         'block_budget_bytes', 'max_block_depth', 'output_buffer_bytes',
+         'required_device_bytes', 'admission_free_bytes',
+         'gpu_projection_blocks', 'projection_stream_fences',
+         'kernel_seconds', 'metadata_seconds', 'pack_seconds', 'd2h_seconds',
+         'close_seconds', 'close_sync_seconds', 'close_owner_clear_seconds',
+         'close_device_pool_seconds', 'close_pinned_pool_seconds'))
+    if stage is not None:
+        runtime_telemetry().gauge('projection.spherical.close_stage_seconds', getattr(stage, 'close_seconds', 0.0))
+        runtime_telemetry().gauge('projection.spherical.close_lease_release_seconds',
+                                  getattr(stage, 'close_lease_release_seconds', 0.0))
+        metrics += (f', close_stage_seconds={getattr(stage, "close_seconds", 0.0)}'
+                    f', close_lease_release_seconds={getattr(stage, "close_lease_release_seconds", 0.0)}')
+    print(f'Spherical projection complete {spherical_view.name}: backend={backend}, '
+          f'total_s={time.perf_counter() - started:.6f}, cpu_slices={cpu_slices}, '
+          f'cuda_slices={cuda_slices}, admission_attempts={admission_attempts}, '
+          f'admission_probe_s={admission_probe_s:.6f}, cpu_worker_s={cpu_worker_s:.6f}, '
+          f'cpu_result_wait_s={cpu_result_wait_s:.6f}, cpu_publish_s={cpu_publish_s:.6f}, '
+          f'cpu_reader_drain_s={cpu_reader_drain_s:.6f}, cpu_cancelled_blocks={cpu_cancelled_blocks}, '
+          f'gpu_result_wait_s={gpu_result_wait_s:.6f}, gpu_publish_s={gpu_publish_s:.6f}'
+          f', cpu_backend={cpu_backend}, cpu_setup_seconds={cpu_setup_seconds:.6f}'
+          f', cpu_compact_slices={cpu_compact_slices}, cpu_empty_slices={cpu_empty_slices}'
+          f', cpu_payload_bytes={cpu_payload_bytes}, cpu_compact_pull_voxels={cpu_compact_pull_voxels}'
+          f', cpu_compact_scan_voxels={cpu_compact_scan_voxels}'
+          f'{metrics}', flush=True)
+    return output if output is not None else SinkOnlyProjectionResult(shape)

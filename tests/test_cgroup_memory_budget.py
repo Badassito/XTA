@@ -190,6 +190,56 @@ def test_available_anon_api_still_applies_kernel_headroom(monkeypatch):
 
 
 @pytest.mark.parametrize('v2', [True, False])
+def test_publication_shares_one_meminfo_but_refreshes_all_cgroup_limits(monkeypatch, v2):
+    from XTA import publication_memory
+
+    files, base = proc_files(monkeypatch, v2=v2)
+    finite(files, base, '/job/step', 400, 50, v2=v2)
+    finite(files, base, '/job', 600, 500, v2=v2)
+    snapshots = []
+    mem_available = 900
+
+    def read_meminfo():
+        snapshot = {'MemAvailable': mem_available, 'SwapFree': 10000}
+        snapshots.append(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(workspace, '_read_meminfo_bytes', read_meminfo)
+    monkeypatch.setattr(publication_memory, '_read_meminfo_bytes', read_meminfo)
+    assert publication_memory.publication_ram_headroom() == 100
+    finite(files, base, '/job', 1000, 500, v2=v2)
+    assert publication_memory.publication_ram_headroom() == 350
+    finite(files, base, '/job/step', 100, 75, v2=v2)
+    assert publication_memory.publication_ram_headroom() == 25
+    mem_available = 10
+    assert publication_memory.publication_ram_headroom() == 10
+    assert len(snapshots) == 4  # One fresh physical snapshot for every call.
+    assert len({id(snapshot) for snapshot in snapshots}) == 4
+
+
+def test_shared_meminfo_keeps_swap_for_anon_but_not_physical_publication(monkeypatch):
+    from XTA import publication_memory
+
+    proc_files(monkeypatch)
+    snapshot = {'MemAvailable': 20, 'SwapFree': 1000}
+    monkeypatch.setattr(workspace, '_read_meminfo_bytes', lambda: snapshot)
+    monkeypatch.setattr(publication_memory, '_read_meminfo_bytes', lambda: snapshot)
+    assert workspace.available_anon_work_bytes() == 1020
+    assert workspace.available_anon_work_bytes(meminfo=snapshot) == 1020
+    assert publication_memory.publication_ram_headroom() == 20
+
+
+def test_shared_meminfo_does_not_hide_unreadable_finite_cgroup_usage(monkeypatch):
+    from XTA import publication_memory
+
+    files, base = proc_files(monkeypatch)
+    finite(files, base, '/job', 600, PermissionError())
+    snapshot = {'MemAvailable': 900, 'SwapFree': 1000}
+    monkeypatch.setattr(publication_memory, '_read_meminfo_bytes', lambda: snapshot)
+    assert publication_memory.publication_ram_headroom() == 0
+
+
+@pytest.mark.parametrize('v2', [True, False])
 def test_headroom_only_probe_preserves_value_without_mount_discovery(monkeypatch, v2):
     files, base = proc_files(monkeypatch, v2=v2)
     finite(files, base, '/job/step', 400, 50, v2=v2)

@@ -38,7 +38,6 @@ def resolve_gpu_worker_layout(
         else max(devices, int(worker_budget))
     )
     per_owner_budget = int(math.ceil(float(cpu_budget) / float(devices)))
-    # Auto mode leaves CPU capacity for volume planning and input prefetch.
     # An explicit frame-worker budget is authoritative up to a conservative
     # per-owner ceiling for bounded host memory.
     per_owner_cap = 32 if int(requested_frame_workers) > 0 else 16
@@ -57,7 +56,7 @@ class PtaPipelineDepth:
 def resolve_pta_pipeline_depth(*, requested_depth: int, volume_count: int,
                                resident_estimates: Sequence[int | None] = (),
                                available_bytes: int | None = None) -> PtaPipelineDepth:
-    """Resolve actual overlap before any CPU capacity is reserved for it."""
+    """Resolve actual overlap within the host-memory admission limit."""
     if int(requested_depth) not in (1, 2) or int(volume_count) < 0:
         raise ValueError('PTA pipeline depth must be 1 or 2 and volume count nonnegative')
     if int(requested_depth) == 1 or int(volume_count) <= 1:
@@ -114,23 +113,21 @@ def plan_pta_cpu_budget(*, worker_budget: int, requested_frame_workers: int,
                         allowed_cpus: Sequence[int], worker_cpu_order: Sequence[int],
                         gpu_count: int = 0, gpu_cpu_sets: Sequence[Sequence[int]] = (),
                         topology_aware: bool = True, overlapping: bool = False) -> PtaCpuBudget:
-    """Budget actual CPU ownership, plus full-capacity planning while render is idle.
+    """Share the full CPU budget between volume startup and rendering.
 
     The worker initializer applies each local mask's per-owner thread cap. A
     shared ceiling therefore need not throttle wide masks to the narrowest GPU.
-    Without topology binding, only thread counts are partitioned; no CPU affinity
+    Without topology binding, only thread counts are bounded; no CPU affinity
     is invented. The legacy minimum of one preparation thread per CUDA owner
     remains available even when --workers is smaller than the GPU count; those
-    owners must time-share and overlapping planning is disabled.
+    owners must time-share. Loading and planning may also time-share those CPUs.
     """
     allowed = tuple(dict.fromkeys(int(cpu) for cpu in allowed_cpus))
     if not allowed or int(worker_budget) <= 0 or int(requested_frame_workers) < 0 or int(gpu_count) < 0:
         raise ValueError('PTA CPU planning requires allowed CPUs and positive worker bounds')
     budget = min(int(worker_budget), len(allowed))
     devices = int(gpu_count)
-    overlap = bool(overlapping and budget > max(1, devices))
-    reserve = min(max(1, int(math.ceil(budget / 4))), budget - max(1, devices)) if overlap else 0
-    render_limit = max(1, budget - reserve)
+    overlap = bool(overlapping)
     allowed_set = set(allowed)
     order = tuple(dict.fromkeys(int(cpu) for cpu in worker_cpu_order if int(cpu) in allowed_set))
     order += tuple(cpu for cpu in allowed if cpu not in set(order))
@@ -146,32 +143,26 @@ def plan_pta_cpu_budget(*, worker_budget: int, requested_frame_workers: int,
                 supplied = gpu_cpu_sets[index] if index < len(gpu_cpu_sets) else ()
                 cpus = tuple(dict.fromkeys(int(cpu) for cpu in supplied if int(cpu) in allowed_set))
                 local.append(cpus or allowed)
-            masks = _bounded_gpu_cpu_sets(local, render_limit)
+            masks = _bounded_gpu_cpu_sets(local, budget)
             per_owner = tuple(max(1, min(ceiling, len(cpus))) for cpus in masks)
             render_set = set().union(*(set(cpus) for cpus in masks))
             render_count = len(render_set)
-            free = tuple(cpu for cpu in allowed if cpu not in render_set)
-            planning = max(1, min(budget - render_count, len(free))) if overlap else budget
-            planning_order = free[:planning] if overlap and free else allowed[:planning]
             render_order = tuple(cpu for offset in range(max(map(len, masks)))
                                  for cpus in masks for cpu in cpus[offset:offset + 1])
         else:
-            per_owner = (max(1, min(ceiling, render_limit // devices)),) * devices
+            per_owner = (max(1, min(ceiling, budget // devices)),) * devices
             masks = ((),) * devices
             render_count = sum(per_owner)
-            planning = max(1, budget - render_count) if overlap else budget
-            planning_order = ()
         frame_workers, gpu_threads = owners, max(per_owner)
     else:
-        requested = int(requested_frame_workers) or render_limit
-        frame_workers, gpu_threads = max(1, min(requested, render_limit)), 1
+        requested = int(requested_frame_workers) or budget
+        frame_workers, gpu_threads = max(1, min(requested, budget)), 1
         render_count = frame_workers
-        planning = max(1, budget - frame_workers) if overlap else budget
-        planning_order = order[frame_workers:frame_workers + planning] if topology_aware and overlap else (
-            allowed if topology_aware else ())
+    # Startup bursts share allocated CPUs instead of reserving a permanent subset.
+    planning_order = allowed if topology_aware else ()
     return PtaCpuBudget(budget, overlap, frame_workers, gpu_threads, per_owner, masks,
-        render_order, render_count, planning, tuple(planning_order), min(16, planning),
-        budget, allowed if topology_aware else (), min(16, budget))
+        render_order, render_count, budget, planning_order, budget,
+        budget, allowed if topology_aware else (), budget)
 
 
 def iter_compatible_work_batches(
@@ -192,23 +183,23 @@ def iter_compatible_work_batches(
             int(getattr(item, "channel_count", 1)),
             bool(getattr(item.image, "is_cuda", False)),  # type: ignore[attr-defined]
         )
-        candidates = tuple(item.candidates)  # type: ignore[attr-defined]
-        for start in range(0, len(candidates), limit):
-            grouped[key].append(
-                replace(item, candidates=candidates[start:start + limit])
-            )
+        grouped[key].append(item)
 
     for items in grouped.values():
         pending: List[WorkT] = []
         pending_count = 0
         for item in items:
-            item_count = len(item.candidates)  # type: ignore[attr-defined]
-            if pending and pending_count + item_count > limit:
-                yield tuple(pending)
-                pending = []
-                pending_count = 0
-            pending.append(item)
-            pending_count += item_count
+            candidates = tuple(item.candidates)  # type: ignore[attr-defined]
+            start = 0
+            while start < len(candidates):
+                stop = min(len(candidates), start + limit - pending_count)
+                pending.append(replace(item, candidates=candidates[start:stop]))
+                pending_count += stop - start
+                start = stop
+                if pending_count == limit:
+                    yield tuple(pending)
+                    pending = []
+                    pending_count = 0
         if pending:
             yield tuple(pending)
 

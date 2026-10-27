@@ -216,7 +216,7 @@ def run_tasks(args, volume, mask, coverage, plan, tasks, output, mode, runtime, 
                           side_effect=AssertionError("CPU JPEG encoder fallback forbidden")),
     ):
         for task in tasks:
-            written, flips, warning_counts, _examples = pta_workers.execute_gpu_frame_batch_task(
+            written, flips, warning_counts, _examples, _classification = pta_workers.execute_gpu_frame_batch_task(
                 volume, mask, (plan,), task, semantic_coverage=coverage,
             )
             counts["written"] += int(written)

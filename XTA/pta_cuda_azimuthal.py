@@ -9,12 +9,67 @@ Intensity images retain their separate interpolation contract.
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from functools import lru_cache
 from typing import Optional
 
 import numpy as np
 
 from . import geometry
+
+
+class AzimuthalTableCache:
+    """Immutable GPU coordinate tables; the categorical owner serializes access."""
+
+    def __init__(self, *, max_bytes=8 * 1024**2, max_entries=64):
+        self.max_bytes, self.max_entries = int(max_bytes), int(max_entries)
+        self.tables = OrderedDict()
+        self.bytes = self.hits = self.misses = self.uploads = self.evictions = 0
+
+    def table(self, key, build, *, torch, stream):
+        entry = self.tables.get(key)
+        if entry is None:
+            self.misses += 1
+            tensor = build()
+            self.uploads += 1
+            ready = torch.cuda.Event()
+            ready.record(stream)
+            size = int(tensor.numel()) * int(tensor.element_size())
+            if size <= self.max_bytes and self.max_entries > 0:
+                while self.tables and (self.bytes + size > self.max_bytes
+                                       or len(self.tables) >= self.max_entries):
+                    _, (_, _, _, removed_bytes) = self.tables.popitem(last=False)
+                    self.bytes -= removed_bytes
+                    self.evictions += 1
+                self.tables[key] = (tensor, ready, stream, size)
+                self.bytes += size
+        else:
+            self.hits += 1
+            self.tables.move_to_end(key)
+            tensor, ready, producer, _ = entry
+            if stream is not producer:
+                stream.wait_event(ready)
+        tensor.record_stream(stream)
+        return tensor
+
+    def clear(self):
+        self.tables.clear()
+        self.bytes = 0
+
+    def snapshot(self):
+        return dict(hits=self.hits, misses=self.misses, uploads=self.uploads,
+                    evictions=self.evictions, entries=len(self.tables), cached_bytes=self.bytes)
+
+
+def _nearest_table_key(view, frame_idx, device):
+    return ('nearest', str(device), geometry.AZIMUTHAL_FILTER_MODE,
+            geometry.azimuthal_base_view_name(view), *geometry.azimuthal_plane_shape(view),
+            int(view.src_w), int(view.diameter), float(view.center_x), float(view.center_y),
+            float(view.roi_radius), float(view.azimuths_deg[int(frame_idx)]))
+
+
+def _row_table_key(view, tilted, device):
+    return ('rows', str(device), bool(tilted), int(geometry.azimuthal_stack_length(view)), int(view.src_h))
 
 
 _AZIMUTHAL_CATEGORICAL_CUDA = r'''
@@ -180,6 +235,7 @@ def render_azimuthal_categorical_pair(
     out_h: Optional[int] = None,
     out_w: Optional[int] = None,
     stream: Optional[object] = None,
+    table_cache: Optional[AzimuthalTableCache] = None,
 ) -> Optional[tuple[object, Optional[object]]]:
     """Render binary mask and optional coverage directly from resident TYX CUDA tensors.
 
@@ -222,8 +278,6 @@ def render_azimuthal_categorical_pair(
     direction = str(view.tilt_direction)
     if tilted and direction not in ('vertical', 'horizontal'):
         return None
-    nearest_cpu = _nearest_taps(view, int(frame_idx))
-    rows_cpu = _row_centers(view, tilted)
     inverse = _matrix_inverse_from_forward(M_src_to_out, M_grid_to_src)
     tangent = np.float32(math.tan(math.radians(float(view.tilt_angle_deg)))) if tilted else np.float32(0)
 
@@ -236,10 +290,19 @@ def render_azimuthal_categorical_pair(
             torch.empty((height, width), dtype=torch.uint8, device=mask_tyx.device)
             if coverage_tyx is not None else None
         )
-        # Small immutable per-view tables cross PCIe once per launch.  The
-        # output tensors retain them until the caller retires this work item.
-        nearest_gpu = torch.as_tensor(nearest_cpu, device=mask_tyx.device)
-        rows_gpu = torch.as_tensor(rows_cpu, device=mask_tyx.device)
+        def nearest():
+            return torch.as_tensor(_nearest_taps(view, int(frame_idx)), device=mask_tyx.device)
+
+        def rows():
+            return torch.as_tensor(_row_centers(view, tilted), device=mask_tyx.device)
+
+        if table_cache is None:
+            nearest_gpu, rows_gpu = nearest(), rows()
+        else:
+            nearest_gpu = table_cache.table(_nearest_table_key(view, frame_idx, mask_tyx.device),
+                nearest, torch=torch, stream=selected_stream)
+            rows_gpu = table_cache.table(_row_table_key(view, tilted, mask_tyx.device),
+                rows, torch=torch, stream=selected_stream)
         with _external_cupy_stream(cp, selected_stream):
             kernel = _categorical_kernel()
             args = (

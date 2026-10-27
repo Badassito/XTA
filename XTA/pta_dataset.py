@@ -28,6 +28,9 @@ from .pta_augmentation import (
 
 AUGMENTATION_TAG_LENGTH = 16
 AUGMENTATION_TAG_ALPHABET = string.digits + string.ascii_uppercase + string.ascii_lowercase
+_AUGMENTATION_TAG_PAIRS = tuple(
+    first + second for first in AUGMENTATION_TAG_ALPHABET for second in AUGMENTATION_TAG_ALPHABET
+)
 
 
 class WarningSink(Protocol):
@@ -59,6 +62,7 @@ class OutputCandidate:
     augmentation_tag: Optional[str] = None
     augmentation_seed: Optional[int] = None
     foreground: bool = True
+    foreground_deferred: str = ""
     keep: bool = True
     split_subset: Optional[str] = None
     tile_size: int = 0
@@ -134,19 +138,26 @@ def output_source_identity_text(
 
 def candidate_source_identity(cand: OutputCandidate) -> str:
     if cand.physical_view_id and cand.presentation_variant_id and cand.geometry_item_id:
-        return "\0".join((
-            str(cand.volume_name),
-            str(cand.physical_view_id),
-            str(cand.presentation_variant_id),
-            str(cand.geometry_item_id),
-            str(int(cand.frame_idx)),
-        ))
+        return physical_source_identity_text(
+            cand.volume_name, cand.physical_view_id, cand.presentation_variant_id,
+            cand.geometry_item_id, cand.frame_idx,
+        )
     return output_source_identity_text(
         cand.volume_name,
         cand.parent_view_tag,
         cand.item_key,
         int(cand.frame_idx),
     )
+
+
+def physical_source_identity_text(
+    volume_name: str, physical_view_id: str, presentation_variant_id: str,
+    geometry_item_id: str, frame_idx: int,
+) -> str:
+    return "\0".join((
+        str(volume_name), str(physical_view_id), str(presentation_variant_id),
+        str(geometry_item_id), str(int(frame_idx)),
+    ))
 
 
 def stable_digest_rank(domain: str, parts: Sequence[object]) -> bytes:
@@ -158,6 +169,19 @@ def stable_digest_rank(domain: str, parts: Sequence[object]) -> bytes:
     return hashlib.sha256(payload).digest()
 
 
+def fraction_sample_threshold(fraction: float) -> Optional[int]:
+    value = float(fraction)
+    if not math.isfinite(value) or not 0.0 < value <= 1.0:
+        raise ValueError("--fraction must be finite and in (0,1]")
+    return None if value == 1.0 else int(value * (1 << 256))
+
+
+def fraction_identity_selected(identity: str, threshold: Optional[int]) -> bool:
+    return threshold is None or int.from_bytes(stable_digest_rank(
+        "PTA-fraction-v1", (identity,),
+    ), "big") < threshold
+
+
 def select_fraction_candidates(
     candidates: Iterable[OutputCandidate], *, fraction: float,
 ) -> List[OutputCandidate]:
@@ -167,17 +191,12 @@ def select_fraction_candidates(
     subsets and adding views or changing worker/order settings cannot reroll it.
     Counts are approximate; a small candidate population may yield no samples.
     """
-    value = float(fraction)
-    if not math.isfinite(value) or not 0.0 < value <= 1.0:
-        raise ValueError("--fraction must be finite and in (0,1]")
-    if value == 1.0:
+    threshold = fraction_sample_threshold(fraction)
+    if threshold is None:
         return list(candidates)
-    threshold = int(value * (1 << 256))
     return [
         cand for cand in candidates
-        if int.from_bytes(stable_digest_rank(
-            "PTA-fraction-v1", (candidate_source_identity(cand),),
-        ), "big") < threshold
+        if fraction_identity_selected(candidate_source_identity(cand), threshold)
     ]
 
 
@@ -236,11 +255,15 @@ def augmentation_seed_for_identity(
 
 def base62_tag_from_digest(digest: bytes, length: int = AUGMENTATION_TAG_LENGTH) -> str:
     value = int.from_bytes(digest, byteorder="big", signed=False)
+    width = max(0, int(length))
     chars: List[str] = []
     radix = len(AUGMENTATION_TAG_ALPHABET)
-    for _ in range(int(length)):
-        value, remainder = divmod(value, radix)
-        chars.append(AUGMENTATION_TAG_ALPHABET[int(remainder)])
+    pair_radix = radix * radix
+    for _ in range(width // 2):
+        value, remainder = divmod(value, pair_radix)
+        chars.append(_AUGMENTATION_TAG_PAIRS[remainder])
+    if width % 2:
+        chars.append(AUGMENTATION_TAG_ALPHABET[value % radix])
     return "".join(reversed(chars))
 
 
@@ -337,24 +360,26 @@ def plan_augmented_versions(
     target_augmented = int(target_total_versions - n_eligible)
     copies_per_source, fractional_remainder = divmod(target_augmented, n_eligible)
 
-    fractional_copy_index = int(copies_per_source) + 1
-    ranked = sorted(
-        eligible,
-        key=lambda cand: (
-            0 if bool(augmented_foregrounds.get(
-                (candidate_source_identity(cand), int(fractional_copy_index)),
-                cand.foreground,
-            )) else 1,
-            augmentation_digest(
-                augmentation,
-                domain="fractional-ratio-rank",
-                source_identity=candidate_source_identity(cand),
-                copy_index=0,
+    extra_source_orders: set[int] = set()
+    if fractional_remainder:
+        fractional_copy_index = int(copies_per_source) + 1
+        ranked = sorted(
+            eligible,
+            key=lambda cand: (
+                0 if bool(augmented_foregrounds.get(
+                    (candidate_source_identity(cand), int(fractional_copy_index)),
+                    cand.foreground,
+                )) else 1,
+                augmentation_digest(
+                    augmentation,
+                    domain="fractional-ratio-rank",
+                    source_identity=candidate_source_identity(cand),
+                    copy_index=0,
+                ),
+                candidate_source_identity(cand),
             ),
-            candidate_source_identity(cand),
-        ),
-    )
-    extra_source_orders = {int(cand.source_order) for cand in ranked[:int(fractional_remainder)]}
+        )
+        extra_source_orders = {int(cand.source_order) for cand in ranked[:int(fractional_remainder)]}
     used_tags = used_tags if used_tags is not None else set()
     versions: List[OutputCandidate] = []
     eligible_source_orders = {int(cand.source_order) for cand in eligible}
@@ -362,6 +387,9 @@ def plan_augmented_versions(
     for base in base_candidates:
         base.order = len(versions)
         versions.append(base)
+        if int(base.augmentation_index) > 0:
+            stats.planned_augmented_copies += 1
+            stats.planned_augmented_foreground += bool(base.foreground)
         if int(base.source_order) not in eligible_source_orders:
             continue
         copy_count = int(copies_per_source) + (1 if int(base.source_order) in extra_source_orders else 0)
@@ -390,12 +418,13 @@ def plan_augmented_versions(
                 keep=True,
             )
             versions.append(augmented)
+            stats.planned_augmented_copies += 1
+            stats.planned_augmented_foreground += bool(copy_foreground)
 
-    augmented_versions = [cand for cand in versions if int(cand.augmentation_index) > 0]
-    stats.active = bool(augmented_versions)
-    stats.planned_augmented_copies = len(augmented_versions)
-    stats.planned_augmented_foreground = sum(1 for cand in augmented_versions if cand.foreground)
-    stats.planned_augmented_background = sum(1 for cand in augmented_versions if not cand.foreground)
+    stats.active = bool(stats.planned_augmented_copies)
+    stats.planned_augmented_background = (
+        stats.planned_augmented_copies - stats.planned_augmented_foreground
+    )
     return versions, stats
 
 
@@ -583,18 +612,19 @@ def finalize_augmentation_stats(
     *,
     split_active: bool,
 ) -> AugmentationStats:
-    retained_augmented = [
-        cand for cand in candidates
-        if cand.keep and int(cand.augmentation_index) > 0
-    ]
-    final_eligible_originals = [
-        cand for cand in candidates
-        if cand.keep
-        and int(cand.augmentation_index) == 0
-        and (not split_active or cand.split_subset == "train")
-    ]
-    stats.eligible_originals = len(final_eligible_originals)
-    stats.retained_augmented_copies = len(retained_augmented)
+    eligible_originals = retained_augmented = train_files = val_files = retained = 0
+    for cand in candidates:
+        if not cand.keep:
+            continue
+        retained += 1
+        train_files += cand.split_subset == "train"
+        val_files += cand.split_subset == "val"
+        if int(cand.augmentation_index) > 0:
+            retained_augmented += 1
+        elif int(cand.augmentation_index) == 0 and (not split_active or cand.split_subset == "train"):
+            eligible_originals += 1
+    stats.eligible_originals = eligible_originals
+    stats.retained_augmented_copies = retained_augmented
     stats.dropped_augmented_background = max(
         0,
         int(stats.planned_augmented_copies - stats.retained_augmented_copies),
@@ -606,12 +636,11 @@ def finalize_augmentation_stats(
         )
     else:
         stats.achieved_ratio = 1.0
-    retained = [cand for cand in candidates if cand.keep]
     if split_active:
-        stats.final_train_files = sum(1 for cand in retained if cand.split_subset == "train")
-        stats.final_val_files = sum(1 for cand in retained if cand.split_subset == "val")
+        stats.final_train_files = train_files
+        stats.final_val_files = val_files
     else:
-        stats.final_unsplit_files = len(retained)
+        stats.final_unsplit_files = retained
     return stats
 
 
@@ -865,7 +894,10 @@ __all__ = [
     "deterministic_augmentation_tag",
     "finalize_augmentation_stats",
     "finalize_background_filter_with_augmentations",
+    "fraction_identity_selected",
+    "fraction_sample_threshold",
     "output_source_identity_text",
+    "physical_source_identity_text",
     "plan_augmented_versions",
     "refresh_retained_original_split_stats",
     "select_fraction_candidates",

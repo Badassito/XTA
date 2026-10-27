@@ -1,5 +1,6 @@
 """Fraction selection must precede mask classification and image publication."""
 from types import SimpleNamespace
+from dataclasses import asdict
 from unittest import mock
 
 import numpy as np
@@ -55,15 +56,38 @@ def test_empty_selection_does_not_scan_source_mask():
     ) == {}
 
 
-def test_candidate_enumeration_is_lazy_before_fraction_selection(tmp_path):
+@pytest.mark.parametrize('fraction', [1.0, .5, .1, 5e-324])
+def test_candidate_enumeration_constructs_only_selected_candidates(tmp_path, fraction):
     prep = prepared(tmp_path, semantic=False)
-    def first_only(candidates, *, fraction):
-        assert iter(candidates) is candidates
-        return [next(candidates)]
-    with mock.patch.object(pta, 'select_fraction_candidates', side_effect=first_only), \
-            mock.patch.object(pta, 'OutputCandidate', wraps=pta.OutputCandidate) as constructed:
-        candidates = pta.enumerate_candidates_for_volume(prep, fraction=.1)
-    assert len(candidates) == constructed.call_count == 1
+    originals = pta.enumerate_candidates_for_volume(prep)
+    expected = pta.select_fraction_candidates(originals, fraction=fraction)
+    with mock.patch.object(pta, 'OutputCandidate', wraps=pta.OutputCandidate) as constructed:
+        candidates = pta.enumerate_candidates_for_volume(prep, fraction=fraction)
+    assert constructed.call_count == len(expected)
+    assert [asdict(c) for c in candidates] == [asdict(c) for c in expected]
+    if fraction < 1:
+        assert len(candidates) < len(originals)
+
+
+def test_candidate_metadata_is_reused_across_source_frames(tmp_path):
+    prep = prepared(tmp_path, semantic=False)
+    with mock.patch.object(pta.shared_geometry, 'physical_view_name', wraps=pta.shared_geometry.physical_view_name) as name:
+        candidates = pta.enumerate_candidates_for_volume(prep)
+    assert name.call_count == len(prep.plans)
+    for field in ('physical_view_id', 'presentation_variant_id', 'channel_offsets'):
+        assert all(getattr(c, field) is getattr(candidates[0], field) for c in candidates)
+    for item_key in {c.item_key for c in candidates}:
+        items = [c for c in candidates if c.item_key == item_key]
+        assert all(c.geometry_item_id is items[0].geometry_item_id for c in items)
+
+
+def test_fraction_selection_keeps_legacy_identity_fallback(tmp_path):
+    prep = prepared(tmp_path, semantic=False)
+    with mock.patch.object(pta.shared_geometry, 'physical_view_name', return_value=''):
+        originals = pta.enumerate_candidates_for_volume(prep)
+        expected = pta.select_fraction_candidates(originals, fraction=.5)
+        actual = pta.enumerate_candidates_for_volume(prep, fraction=.5)
+    assert [asdict(c) for c in actual] == [asdict(c) for c in expected]
 
 
 def test_fraction_one_preserves_files_and_fraction_filters_before_classification(tmp_path, monkeypatch):

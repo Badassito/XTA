@@ -40,6 +40,49 @@ from .unification.contracts import DataRole, FrameAddress, RasterPlan, RenderIte
 
 
 OUTPUT_IMAGE_FORMATS = {"png", "jpg", "jpeg", "tif", "tiff", "nvjpeg", "nvtiff"}
+MASK_POLYGON_FAST_FOREGROUND_MIN_PIXELS = 16
+
+
+def mask_has_yolo_polygon(mask01: np.ndarray) -> bool:
+    m = np.asarray(mask01, dtype=np.uint8)
+    nonzero = int(np.count_nonzero(m))
+    if nonzero == 0:
+        return False
+    # Larger masks are provisionally foreground for candidate budgeting.
+    # Publication still validates their contours; sparse or fragmented masks
+    # can be demoted there even when their total pixel count exceeds this cap.
+    # Check small masks here, where short lines often fail polygon export.
+    if nonzero >= MASK_POLYGON_FAST_FOREGROUND_MIN_PIXELS:
+        return True
+    contours, hierarchy = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return False
+    hierarchy_arr = [None] * len(contours) if hierarchy is None else list(hierarchy[0])
+    for cnt, hrow in zip(contours, hierarchy_arr):
+        if hrow is not None and int(hrow[3]) >= 0:
+            continue
+        if cnt is None or len(cnt) < 3:
+            continue
+        approx = cv2.approxPolyDP(cnt, epsilon=1.0, closed=True)
+        if approx is not None and len(approx) >= 3:
+            return True
+    return False
+
+
+def resolve_deferred_foregrounds(candidates, mask, coverage=None) -> None:
+    """Measure original class once, before a policy can mutate its source mask."""
+    pending = [candidate for candidate in candidates if candidate.foreground_deferred]
+    if not pending:
+        return
+    modes = {candidate.foreground_deferred for candidate in pending}
+    if len(modes) != 1 or not modes <= {"polygon", "semantic"}:
+        raise RuntimeError(f"Invalid deferred foreground modes: {modes}")
+    known = mask if coverage is None else np.logical_and(mask, coverage)
+    foreground = (bool(np.any(known)) if "semantic" in modes
+                  else mask_has_yolo_polygon(known))
+    for candidate in pending:
+        candidate.foreground = foreground
+        candidate.foreground_deferred = ""
 
 
 def parse_output_image_format(value: str) -> str:
@@ -62,11 +105,11 @@ def output_image_suffix(image_format: str) -> str:
 def mask_to_yolo_lines(mask01: np.ndarray, *, warnings: WarningSink, context: str, known_empty: bool = False) -> List[str]:
     if known_empty:
         return []
-    m = (np.asarray(mask01, dtype=np.uint8) > 0).astype(np.uint8)
-    if not np.any(m):
+    m = np.asarray(mask01, dtype=np.uint8)
+    if not m.size:
         return []
     h, w = m.shape
-    contours, hierarchy = cv2.findContours(m * 255, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    contours, hierarchy = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
     if hierarchy is not None:
         hinfo = hierarchy[0]
         if np.any(hinfo[:, 3] >= 0):
@@ -189,6 +232,7 @@ def _encode_nvjpeg_batch(
     cuda_stream: object,
     synchronize_device: Optional[Callable[[], None]] = None,
     input_owners: Sequence[object] = (),
+    output_streams: Optional[Sequence[object]] = None,
 ) -> NvjpegEncodedBatch:
     """Encode and settle a batch into immutable, independently owned host bytes.
 
@@ -211,15 +255,17 @@ def _encode_nvjpeg_batch(
     resolved_finals = [path.resolve(strict=False) for path in finals]
     if len(set(resolved_finals)) != len(resolved_finals):
         raise ValueError("nvJPEG atomic batch contains duplicate destination paths")
+    owned_outputs = None if output_streams is None else tuple(output_streams)
+    if owned_outputs is not None and len(owned_outputs) != len(finals):
+        raise ValueError("Reusable nvJPEG CodeStreams require one output per image")
+    retained_owners = tuple(input_owners) + (() if owned_outputs is None else owned_outputs)
     raw_results = None
     encode_error: Optional[BaseException] = None
     try:
-        raw_results = encoder.encode(  # type: ignore[union-attr]
-            list(source_images),
-            codec=".jpg",
-            params=params,
-            cuda_stream=int(getattr(cuda_stream, "cuda_stream")),
-        )
+        kwargs = dict(codec=".jpg", params=params, cuda_stream=int(getattr(cuda_stream, "cuda_stream")))
+        if owned_outputs is not None:
+            kwargs["code_stream_s"] = list(owned_outputs)
+        raw_results = encoder.encode(list(source_images), **kwargs)  # type: ignore[union-attr]
     except BaseException as exc:
         # A native exception does not prove that no CUDA work was enqueued.
         encode_error = exc
@@ -240,7 +286,7 @@ def _encode_nvjpeg_batch(
         # to transport the failure without pickling tensors or native handles.
         with _NVJPEG_QUARANTINE_LOCK:
             _NVJPEG_QUARANTINED_BATCHES.append(
-                (encoder, source_images, tuple(input_owners), params, cuda_stream,
+                (encoder, source_images, retained_owners, params, cuda_stream,
                  synchronize_device, raw_results))
         raise NvjpegCudaFenceError(
             "nvJPEG CUDA fence failed; image, encoder and CodeStream owners remain quarantined"
@@ -345,12 +391,13 @@ def _write_nvjpeg_batch_atomically(
     params: object, cuda_stream: object,
     synchronize_device: Optional[Callable[[], None]] = None,
     input_owners: Sequence[object] = (),
+    output_streams: Optional[Sequence[object]] = None,
 ) -> None:
     """Compatibility boundary: encode, settle, validate, then publish synchronously."""
     batch = _encode_nvjpeg_batch(
         encoder=encoder, images=images, final_paths=final_paths, params=params,
         cuda_stream=cuda_stream, synchronize_device=synchronize_device,
-        input_owners=input_owners,
+        input_owners=input_owners, output_streams=output_streams,
     )
     _publish_nvjpeg_batch_atomically(batch)
 
@@ -769,6 +816,7 @@ def write_selected_candidate_version(
     written so an augmented background can never enter ahead of the
     unique-source background ordering or exceed the cap.
     """
+    resolve_deferred_foregrounds((cand,), mask, semantic_coverage)
     image_out = image
     mask_out = mask
     coverage_out = semantic_coverage
@@ -780,6 +828,12 @@ def write_selected_candidate_version(
             f"frame={int(cand.frame_idx)+1:04d}/augmentation_copy={int(cand.augmentation_index)}/"
             f"tag={cand.augmentation_tag}"
         )
+        original_known_mask = (
+            mask if semantic_coverage is None
+            else np.where(np.asarray(semantic_coverage) > 0, mask, 0)
+        )
+        # Private policies may mutate their inputs; retain source truth before replay.
+        original_known_empty = not bool(np.any(np.asarray(original_known_mask) > 0))
         if semantic_coverage is None:
             image_out, mask_out = apply_augmentation_pair(
                 augmentation, image, mask, seed=int(cand.augmentation_seed),
@@ -791,23 +845,15 @@ def write_selected_candidate_version(
                 seed=int(cand.augmentation_seed), context=replay_context,
                 copy_inputs=not bool(inputs_are_private),
             )
-        # This is unconditional: background classification is skipped when
-        # --background_percent=1, but label-preserving augmentations must still
-        # never create a mask from a truly empty source.
-        original_known_mask = (
-            mask if semantic_coverage is None
-            else np.where(np.asarray(semantic_coverage) > 0, mask, 0)
-        )
-        augmented_known_mask = (
-            mask_out if coverage_out is None
-            else np.where(np.asarray(coverage_out) > 0, mask_out, 0)
-        )
-        assert_augmentation_did_not_synthesize_mask(
-            original_known_mask,
-            augmented_known_mask,
-            context=replay_context,
-            original_known_empty=not bool(cand.foreground),
-        )
+        if original_known_empty:
+            augmented_known_mask = (
+                mask_out if coverage_out is None
+                else np.where(np.asarray(coverage_out) > 0, mask_out, 0)
+            )
+            assert_augmentation_did_not_synthesize_mask(
+                original_known_mask, augmented_known_mask,
+                context=replay_context, original_known_empty=True,
+            )
 
     known_mask_out = (
         mask_out if coverage_out is None
@@ -821,7 +867,6 @@ def write_selected_candidate_version(
             known_mask_out,
             warnings=warnings,
             context=label_context,
-            known_empty=not bool(cand.foreground),
         )
         if (int(cand.augmentation_index) > 0 and bool(cand.foreground)
                 and not label_lines and not (save_semantic and np.any(known_mask_out))):

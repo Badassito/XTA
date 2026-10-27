@@ -49,7 +49,7 @@ class PtaVoidFillTests(unittest.TestCase):
             volume=np.zeros_like(mask), fps=1.0,
         )
 
-    def prepare(self, source, output, extra=()):
+    def prepare(self, source, output, extra=(), device_ids=()):
         config = parse_pta_args([
             "--input", "dataset", "--save", "voxel_volume",
             "--preprocessing", "3d_void_fill", *extra,
@@ -58,10 +58,85 @@ class PtaVoidFillTests(unittest.TestCase):
         warnings = pta.WarningLog()
         prep = pta.prepare_loaded_source(
             source, args=args, warnings=warnings, workers=1, out_dir=output,
+            preprocessing_device_ids=device_ids,
             tile_configs=(), channel_variants=pta.expand_channel_variants(
                 pta.resolve_channel_formats(args.channel_format)), write_side_effects=False,
         )
         return prep, warnings
+
+    def test_selected_gpus_fill_before_other_preprocessing(self):
+        def accelerated(mask, **kwargs):
+            self.assertEqual(kwargs['operation'], 'void_fill')
+            self.assertEqual(kwargs['device_ids'], (1, 3))
+            mask[2, 2, 2] = 1
+            return {'backend': 'cuda', 'devices': [1, 3], 'chunks': 2}
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            'XTA.pta_preprocessing.run_gpu_preprocessing', side_effect=accelerated,
+        ), mock.patch.object(pta, '_VOID_FILL_GPU_MIN_VOXELS', 0), mock.patch.object(pta, 'fill_3d_voids_inplace_streaming',
+                             side_effect=AssertionError('unexpected CPU replay')):
+            prep, _ = self.prepare(self.source(), Path(directory), device_ids=(1, 3))
+        self.assertEqual(prep.void_fill_stats['backend'], 'cuda')
+        self.assertEqual(prep.void_fill_stats['added_voxels'], 1)
+
+    def test_failed_gpu_coordinator_falls_back_to_original_cpu_mask(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            'XTA.pta_preprocessing.run_gpu_preprocessing', side_effect=RuntimeError('GPU unavailable'),
+        ), mock.patch.object(pta, '_VOID_FILL_GPU_MIN_VOXELS', 0):
+            prep, warnings = self.prepare(self.source(), Path(directory), device_ids=(0,))
+        self.assertEqual(prep.void_fill_stats['backend'], 'cpu')
+        self.assertEqual(prep.void_fill_stats['added_voxels'], 1)
+        self.assertEqual(warnings.counts['void_fill_gpu_fallback'], 1)
+
+    def test_gpu_gaussian_passes_commit_before_callbacks(self):
+        from scipy import ndimage
+        from XTA.gaussian import binary_gaussian_pass
+        mask = np.zeros((9, 9, 9), np.uint8)
+        mask[1:8, 1:8, 1:8] = 1
+        expected = mask.copy()
+        snapshots = []
+        for _ in range(2):
+            expected = binary_gaussian_pass(expected, sigma=1., gaussian_filter=ndimage.gaussian_filter)
+            snapshots.append(expected.copy())
+        calls = []
+        def accelerated(current, **kwargs):
+            self.assertEqual(kwargs['operation'], 'gaussian')
+            current[:] = binary_gaussian_pass(current, sigma=kwargs['sigma'], gaussian_filter=ndimage.gaussian_filter)
+            return {'backend': 'cupy_chunked_multi_gpu', 'device_ids': [0]}
+        with mock.patch('XTA.pta_preprocessing.run_gpu_preprocessing', side_effect=accelerated), \
+             mock.patch.object(pta, '_GAUSSIAN_GPU_MIN_VOXELS', 0), \
+             mock.patch.object(pta, 'binary_gaussian_pass', side_effect=AssertionError('unexpected CPU Gaussian')):
+            stats = pta.apply_gaussian_smoothing(mask, sigma=1., passes=2,
+                warnings=pta.WarningLog(), device_ids=(0,),
+                after_pass=lambda index, current: calls.append((index, current.copy())))
+        np.testing.assert_array_equal(mask, expected)
+        self.assertEqual([item[0] for item in calls], [1, 2])
+        for (_, actual), wanted in zip(calls, snapshots):
+            np.testing.assert_array_equal(actual, wanted)
+        self.assertEqual([row['backend'] for row in stats], ['cupy_chunked_multi_gpu'] * 2)
+
+    def test_failed_gpu_gaussian_uses_cpu_reference(self):
+        from scipy import ndimage
+        from XTA.gaussian import binary_gaussian_pass
+        mask = self.source().mask_volume
+        expected = binary_gaussian_pass(mask, sigma=.6, gaussian_filter=ndimage.gaussian_filter)
+        warnings = pta.WarningLog()
+        with mock.patch('XTA.pta_preprocessing.run_gpu_preprocessing', side_effect=RuntimeError('GPU unavailable')), \
+             mock.patch.object(pta, '_GAUSSIAN_GPU_MIN_VOXELS', 0):
+            stats = pta.apply_gaussian_smoothing(mask, sigma=.6, passes=1,
+                warnings=warnings, device_ids=(0,))
+        np.testing.assert_array_equal(mask, expected)
+        self.assertEqual(stats[0]['backend'], 'cpu')
+        self.assertEqual(warnings.counts['gaussian_gpu_fallback'], 1)
+
+    def test_small_volumes_keep_cpu_path_when_gpus_are_selected(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            'XTA.pta_preprocessing.run_gpu_preprocessing', side_effect=AssertionError('small-volume GPU startup'),
+        ):
+            prep, _ = self.prepare(self.source(), Path(directory), device_ids=(0, 1))
+            self.assertEqual(prep.void_fill_stats['added_voxels'], 1)
+            stats = pta.apply_gaussian_smoothing(self.source().mask_volume, sigma=.6, passes=1,
+                warnings=pta.WarningLog(), device_ids=(0,))
+            self.assertEqual(stats[0]['pass_index'], 1)
 
     def test_enclosed_void_is_filled_before_smoothing_and_resize(self):
         source = self.source()

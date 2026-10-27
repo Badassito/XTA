@@ -285,6 +285,7 @@ class PtaSemanticTests(unittest.TestCase):
                     batch_masks=MaskTensor(torch, np.asarray([[[0, 1], [1, 0]]], np.uint8)),
                     semantic_coverage_masks=MaskTensor(torch, np.asarray([[[1, 1], [0, 0]]], np.uint8)),
                     candidates=[candidate], output_size=(2, 2), channel_kind="gray",
+                    source_mask_nonempty=(True,),
                     local_warnings=pta_workers.WarningLog(),
                 )
             self.assertEqual((written, flips), (1, {}))

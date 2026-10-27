@@ -8,9 +8,13 @@ uploads, optionally packing categorical nonzero values to one bit each.
 from __future__ import annotations
 
 import math
+import operator
 import threading
 
 import numpy as np
+
+from .native_encoded_cuda import (NativeEncodedStaging, NativePullEncodedBlock,
+                                  estimate_native_pull_encoded_output)
 
 
 class NativePullCudaUnavailable(MemoryError):
@@ -146,19 +150,22 @@ extern "C" __global__ void native_pull(
 
 
 def estimate_native_pull_cuda_bytes(source_shape, plan, *, max_output_voxels, packed_input,
-                                    encoded_nbytes=None):
+                                    encoded_nbytes=None, encoded_output_block_depth=0):
     """Numerical residency only; caller reserves CUDA context/compiler overhead."""
     source_bytes = (int(encoded_nbytes) if encoded_nbytes is not None else
                     (math.prod(source_shape) + 7) // 8 if packed_input else math.prod(source_shape))
     cached = plan.backend == 'compiled_azimuthal_cached'
     angular = bool(plan.integers[10])
-    key_bytes = plan.keys.nbytes if cached else (int(max_output_voxels) * plan.keys.dtype.itemsize if angular else 0)
+    max_output_voxels = min(int(max_output_voxels), int(plan.max_strip_voxels))
+    encoded = estimate_native_pull_encoded_output(plan, block_depth=encoded_output_block_depth,
+        encoded_input=encoded_nbytes is not None)
+    key_bytes = plan.keys.nbytes if cached else (max_output_voxels * plan.keys.dtype.itemsize if angular else 0)
     # CuPy's private pool rounds each nonempty allocation to 512-byte units.
     # Charge that physical ownership, including the small control allocations.
-    buffers=(source_bytes,key_bytes,int(max_output_voxels),plan.integers.nbytes,
+    buffers=(source_bytes,key_bytes,max(max_output_voxels, encoded['dense_output_bytes']),plan.integers.nbytes,
              plan.coefficients.nbytes,plan.row_lookup.nbytes,6*8,3*8,
              int(source_shape[0])*6*8 if encoded_nbytes is not None else 0)
-    return sum((int(size)+511)//512*512 for size in buffers)
+    return sum((int(size)+511)//512*512 for size in buffers) + encoded['device_encoder_bytes']
 
 
 def _encoded_records(encoded,index,source_shape,packed):
@@ -187,7 +194,9 @@ def _encoded_records(encoded,index,source_shape,packed):
         records[:,field]=index[name]
     # Empty records never dereference their ignored offsets/bounds. Normalize
     # those fields before unsigned-to-signed conversion can affect a pointer.
-    records[records[:,0]==0]=0
+    for first in range(0, records.shape[0], 4096):
+        chunk = records[first:first + 4096]
+        chunk[chunk[:, 0] == 0] = 0
     return records
 
 
@@ -200,7 +209,8 @@ class NativePullCudaSession:
     """
     def __init__(self, source, plan, *, device_index, max_device_bytes,
                  max_output_voxels, scalar_max=False, packed_input=None,
-                 max_upload_bytes=8 * 1024**2, _encoded_index=None):
+                 max_upload_bytes=8 * 1024**2, _encoded_index=None,
+                 encoded_output_block_depth=0, encoded_output_slots=2, max_host_bytes=None):
         self.encoded_input=_encoded_index is not None
         if (not isinstance(source, np.ndarray) or source.dtype != np.uint8
                 or (self.encoded_input and (source.ndim!=1 or not source.flags.c_contiguous))
@@ -215,13 +225,30 @@ class NativePullCudaSession:
         self.packed_input = not self.scalar_max if packed_input is None else bool(packed_input)
         if self.scalar_max and self.packed_input:
             raise ValueError('Numeric max cannot consume packed categorical input')
+        if encoded_output_block_depth and self.scalar_max:
+            raise NativePullCudaUnavailable('Packed native output requires binary OR',
+                                             reason_code='encoded_output_numeric_max')
         self.max_output_voxels = min(int(max_output_voxels), int(plan.max_strip_voxels))
         upload_bytes = int(max_upload_bytes) // 8 * 8
         if self.max_output_voxels <= 0 or upload_bytes < 8:
             raise ValueError('CUDA native pull requires positive bounded upload/output credit')
+        self._encoded_spec = estimate_native_pull_encoded_output(plan,
+            block_depth=encoded_output_block_depth, slots=encoded_output_slots,
+            max_upload_bytes=upload_bytes, encoded_input=self.encoded_input)
+        self.max_encoded_block_depth = self._encoded_spec['block_depth']
+        self.max_encoded_payload_bytes = self._encoded_spec['max_payload_bytes']
+        self.encoded_host_bytes = self._encoded_spec['host_bytes']
+        if self.max_encoded_block_depth and max_host_bytes is None:
+            raise NativePullCudaUnavailable('Packed native output requires explicit host credit',
+                                             reason_code='host_credit')
+        if max_host_bytes is not None and self.encoded_host_bytes > int(max_host_bytes):
+            raise NativePullCudaUnavailable('Native staging exceeds its declared host credit',
+                reason_code='host_credit', details=dict(required_host_bytes=self.encoded_host_bytes,
+                                                        allowed_host_bytes=int(max_host_bytes)))
         self.device_bytes = estimate_native_pull_cuda_bytes(plan.source_shape, plan,
             max_output_voxels=self.max_output_voxels, packed_input=self.packed_input,
-            encoded_nbytes=source.size if self.encoded_input else None)
+            encoded_nbytes=source.size if self.encoded_input else None,
+            encoded_output_block_depth=self.max_encoded_block_depth)
         if self.device_bytes > int(max_device_bytes):
             raise NativePullCudaUnavailable('CUDA native source and bounded scratch exceed device credit',
                 reason_code='device_credit',details=dict(required_device_bytes=self.device_bytes,
@@ -241,38 +268,45 @@ class NativePullCudaSession:
         self._pool = cp.cuda.MemoryPool()
         self._arrays = []
         self._pending_host = []
+        self._staging = NativeEncodedStaging()
         self.stream = None
         try:
             with cp.cuda.Device(self.device_index), cp.cuda.using_allocator(self._pool.malloc):
                 self.stream = cp.cuda.Stream(non_blocking=True)
                 with self.stream:
-                    self._source = cp.empty((source.size+7)//8 if self.packed_input and not self.encoded_input else source.size, cp.uint8)
-                    self._arrays.append(self._source)
+                    self._staging.initialize(cp, self.stream, self._encoded_spec,
+                        plan.output_shape, self._arrays)
+                    def allocate(shape, dtype):
+                        array = cp.empty(shape, dtype)
+                        self._arrays.append(array)
+                        return array
+                    def upload(host):
+                        array = allocate(host.shape, host.dtype)
+                        self._staging.upload(array, host)
+                        return array
+                    self._source = allocate((source.size+7)//8 if self.packed_input and not self.encoded_input else source.size, cp.uint8)
                     flat_source = source.reshape(-1) if source.flags.c_contiguous else source.flat
                     for first in range(0, source.size, upload_bytes):
                         host = flat_source[first:min(source.size, first+upload_bytes)]
                         if self.packed_input and not self.encoded_input:
                             host = np.packbits(host != 0, bitorder='little')
-                            self._source[first//8:first//8+host.size].set(host, stream=self.stream)
+                            self._staging.upload(self._source[first//8:first//8+host.size], host)
                         else:
-                            self._source[first:first+host.size].set(host, stream=self.stream)
-                        # Host staging lifetime is bounded and complete before reuse.
-                        self.stream.synchronize()
-                    self._integer = cp.asarray(plan.integers)
-                    self._coefficient = cp.asarray(plan.coefficients)
-                    self._rows = cp.asarray(plan.row_lookup)
-                    self._bbox = cp.empty(6, cp.int64)
-                    self._output = cp.empty(self.max_output_voxels, cp.uint8)
-                    self._totals = cp.zeros(3, cp.uint64)
-                    self._records = cp.asarray(records_host)
+                            self._staging.upload(self._source[first:first+host.size], host)
+                    self._integer = upload(plan.integers)
+                    self._coefficient = upload(plan.coefficients)
+                    self._rows = upload(plan.row_lookup)
+                    self._bbox = allocate(6, cp.int64)
+                    self._output = allocate(max(self.max_output_voxels,
+                        self._encoded_spec['dense_output_bytes']), cp.uint8)
+                    self._totals = allocate(3, cp.uint64)
+                    self._records = upload(records_host)
                     self._keys_are_plane = plan.backend == 'compiled_azimuthal_cached'
                     key_count = (plan.keys.size if self._keys_are_plane else
                                  self.max_output_voxels if plan.integers[10] else 0)
-                    self._keys = cp.empty(key_count, plan.keys.dtype)
+                    self._keys = allocate(key_count, plan.keys.dtype)
                     if self._keys_are_plane:
-                        self._keys.set(plan.keys.reshape(-1), stream=self.stream)
-                    self._arrays.extend((self._integer, self._coefficient, self._rows,
-                                         self._bbox, self._output, self._totals, self._keys,self._records))
+                        self._staging.upload(self._keys, plan.keys.reshape(-1))
                     key_type = 'unsigned int' if plan.keys.dtype == np.uint32 else 'unsigned long long'
                     kernel_source=('#define ENCODED_SOURCE '+str(int(self.encoded_input))+'\n'
                                    +_KERNEL.replace('KEY_TYPE',key_type))
@@ -326,7 +360,7 @@ class NativePullCudaSession:
             self._pending_host = [bbox_host]
             try:
                 with cp.cuda.Device(self.device_index), cp.cuda.using_allocator(self._pool.malloc), self.stream:
-                    self._bbox.set(bbox_host, stream=self.stream)
+                    self._staging.upload(self._bbox, bbox_host)
                     if self.plan.integers[10] and not self._keys_are_plane and count:
                         from .projection_coverage_cpu import _angular_keys
                         indices = np.arange(first, first+count, dtype=np.int64)
@@ -335,8 +369,7 @@ class NativePullCudaSession:
                         vertical = ((indices//ow)%oh) if base == 0 else indices//(oh*ow)
                         horizontal = (indices%ow) if base != 2 else (indices//ow)%oh
                         keys = _angular_keys(self.plan, vertical, horizontal)
-                        self._pending_host.append(keys)
-                        self._keys[:count].set(keys, stream=self.stream)
+                        self._staging.upload(self._keys[:count], keys)
                     self._totals.fill(0)
                     if count:
                         self._kernel(((count+255)//256,), (256,),
@@ -345,8 +378,8 @@ class NativePullCudaSession:
                              np.int32(self._keys_are_plane), self.plan.invalid_key, self._rows,
                              *map(np.int64, self.plan.source_shape), np.int32(self.packed_input),
                              np.int32(self.scalar_max), self._records,self._totals), stream=self.stream)
-                        self._output[:count].get(out=output_flat, stream=self.stream, blocking=True)
-                    totals = self._totals.get(stream=self.stream)
+                        self._staging.download_dense(self._output[:count], output_flat)
+                    totals = self._staging.download_totals(self._totals)
                     self._pending_host.clear()
             except BaseException as exc:
                 raise NativePullCudaUnsafeFailure('CUDA native pull failed during device execution', self) from exc
@@ -355,8 +388,77 @@ class NativePullCudaSession:
                         kernel_calls=int(bool(count)), destination_voxels_visited=int(totals[0]),
                         contribution_addresses=int(totals[1]), device_bytes=self.device_bytes,
                         indexed_input_byte_reads=int(totals[2] if self.encoded_input else totals[1]),
+                         dense_d2h_bytes=count,
                         persistent_bytes=self.plan.persistent_bytes,
                         temporary_strip_bytes=self.plan.temporary_strip_bytes)
+
+    def project_encoded(self, first_z, count, *, destination_bbox_tyx=None):
+        """Project and row-pack a bounded block before any mask D2H transfer.
+
+        Returned bytes are independently owned and immutable. The caller funds
+        and enforces ``encoded_output_slots`` outstanding copied payloads.
+        Uncached angular plans prepare only their admitted CPU key strips.
+        """
+        first_z, count = operator.index(first_z), operator.index(count)
+        if not self.max_encoded_block_depth:
+            raise NativePullCudaUnavailable('Packed output was not admitted for this session',
+                                             reason_code='encoded_output_disabled')
+        if not 0 <= count <= self.max_encoded_block_depth or not 0 <= first_z <= first_z + count <= self.plan.output_shape[0]:
+            raise ValueError('Native encoded block exceeds its admitted destination depth')
+        bbox = ((0, 0, 0, *self.plan.output_shape) if destination_bbox_tyx is None
+                else tuple(map(int, destination_bbox_tyx)))
+        if len(bbox) != 6 or any(not 0 <= bbox[a] <= bbox[a+3] <= self.plan.output_shape[a] for a in range(3)):
+            raise ValueError('CUDA native bbox exceeds output geometry')
+        with self._lock:
+            if self._closed:
+                raise RuntimeError('CUDA native pull session has been closed')
+            cp = self.cp
+            voxels = count * math.prod(self.plan.output_shape[1:])
+            first = first_z * math.prod(self.plan.output_shape[1:])
+            calls = 0
+            try:
+                with cp.cuda.Device(self.device_index), cp.cuda.using_allocator(self._pool.malloc), self.stream:
+                    self._staging.upload(self._bbox, np.asarray(bbox, np.int64))
+                    self._totals.fill(0)
+                    for offset in range(0, voxels, self.max_output_voxels):
+                        length = min(self.max_output_voxels, voxels - offset)
+                        at = first + offset
+                        if self.plan.integers[10] and not self._keys_are_plane:
+                            from .projection_coverage_cpu import _angular_keys
+                            indices = np.arange(at, at + length, dtype=np.int64)
+                            oh, ow = self.plan.output_shape[1:]
+                            base = int(self.plan.integers[0])
+                            vertical = ((indices // ow) % oh) if base == 0 else indices // (oh * ow)
+                            horizontal = indices % ow if base != 2 else (indices // ow) % oh
+                            keys = _angular_keys(self.plan, vertical, horizontal)
+                            self._staging.upload(self._keys[:length], keys)
+                        self._kernel(((length + 255) // 256,), (256,),
+                            (self._source, self._output[offset:offset + length], np.int64(at), np.int64(length),
+                             self._integer, self._coefficient, self._bbox, self._keys,
+                             np.int32(self._keys_are_plane), self.plan.invalid_key, self._rows,
+                             *map(np.int64, self.plan.source_shape), np.int32(self.packed_input),
+                             np.int32(self.scalar_max), self._records, self._totals), stream=self.stream)
+                        calls += 1
+                    if count:
+                        block, metadata_bytes = self._staging.encode(self._output, first_z, count)
+                    else:
+                        from .cylindrical_cuda_projection import RadialEncodedBlock
+                        payload = np.empty(0, np.uint8)
+                        payload.flags.writeable = False
+                        block, metadata_bytes = RadialEncodedBlock(first_z, (), payload, True), 0
+                    totals = self._staging.download_totals(self._totals)
+            except BaseException as exc:
+                raise NativePullCudaUnsafeFailure('CUDA native packed output failed during device execution', self) from exc
+            stats = dict(backend='cuda_native_device_rowpacked', kernel_calls=calls,
+                destination_voxels_visited=totals[0], contribution_addresses=totals[1],
+                indexed_input_byte_reads=totals[2] if self.encoded_input else totals[1],
+                device_bytes=self.device_bytes, encoded_host_bytes=self.encoded_host_bytes,
+                dense_d2h_bytes=0, payload_d2h_bytes=block.payload.nbytes,
+                metadata_d2h_bytes=metadata_bytes + 24, encoded_blocks=int(bool(count)),
+                encoded_planes=count, projected_foreground=sum(record.foreground for record in block.records),
+                persistent_bytes=self.plan.persistent_bytes,
+                temporary_strip_bytes=self.plan.temporary_strip_bytes)
+            return NativePullEncodedBlock(block.first_z, block.records, block.payload, True, stats)
 
     def close(self):
         with self._lock:
@@ -378,6 +480,7 @@ class NativePullCudaSession:
                     for name in ('_source', '_integer', '_coefficient', '_rows', '_bbox', '_output', '_totals', '_keys','_records'):
                         setattr(self, name, None)
                     self._pool.free_all_blocks()
+                    self._staging.close()
             except BaseException as exc:
                 # Retain ownership on failed synchronization. The scheduler
                 # must quarantine this residency instead of releasing its GPU.

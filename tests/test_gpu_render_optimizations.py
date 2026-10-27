@@ -350,7 +350,7 @@ class FusedRendererOptimizationTests(unittest.TestCase):
         engine._render_native_plane_cached(view, 1)
         self.assertIs(engine._render_native_plane_cached(view, 0), borrowed)
         engine._render_native_plane_cached(view, 2)
-        self.assertEqual(list(engine._native_plane_cache), [("radial", 0), ("radial", 2)])
+        self.assertEqual(list(engine._native_plane_cache), [("radial", 0, 0, 0), ("radial", 2, 0, 0)])
         engine._render_native_plane_cached(view, 3)
         self.assertEqual(len(engine._native_plane_cache), 2)
         np.testing.assert_array_equal(borrowed, np.zeros((2, 3), dtype=np.float32))
@@ -361,6 +361,7 @@ class FusedRendererOptimizationTests(unittest.TestCase):
             with self.subTest(family=family):
                 engine = object.__new__(cuda_backend._GpuWorkerRenderEngine)
                 engine._native_plane_cache = OrderedDict()
+                engine._native_u8_plane_cache = OrderedDict()
                 engine._native_plane_cache_entries = lambda: 2
                 engine._volume_gpu = SimpleNamespace(is_cuda=False)
                 engine._stream = object()
@@ -377,7 +378,8 @@ class FusedRendererOptimizationTests(unittest.TestCase):
                     "azimuthal_renderer": engine,
                     "azimuthal_render_lock": threading.Lock(),
                 }
-                view = SimpleNamespace(name=family, family=family)
+                engine.torch = runtime["torch"]
+                view = SimpleNamespace(name=family, family=family, azimuthal_tilted_source=False)
                 plan = SimpleNamespace(
                     view=SimpleNamespace(shared_view=view), source_encoded_indices=(),
                     channel_variant=SimpleNamespace(kind="gray"),
@@ -387,14 +389,17 @@ class FusedRendererOptimizationTests(unittest.TestCase):
                 )
                 with (mock.patch.object(pta_workers, "_require_pta_canonical_plan"),
                       mock.patch.object(pta_workers, "_azimuthal_source_mode", return_value="texture_linear"),
-                      mock.patch("builtins.print")):
+                      mock.patch("builtins.print") as render_messages):
                     for item in ("full", "tile", "full"):
-                        actual, ready = pta_workers._gpu_projected_item_image(
+                        result = pta_workers._gpu_projected_item_image(
                             runtime, np.zeros((2, 3, 4), np.uint8), plan, 1, item,
                         )
+                        self.assertIsNotNone(result, render_messages.call_args_list)
+                        actual, ready = result
                         self.assertIs(actual, projected)
                         self.assertIs(ready, event)
                 engine._render_native_plane.assert_called_once_with(view, 1)
+                native.round.assert_called_once()
                 self.assertEqual(engine.warp_native_uint8_frame.call_count, 3)
 
     def test_cartesian_resident_renderer_extracts_native_u8_without_float_roundtrip(self) -> None:

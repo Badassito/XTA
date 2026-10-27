@@ -15,7 +15,7 @@ import time
 
 from .pta_batch_pipeline import OrderedBatchPipeline
 from .pta_publication import semantic_png_backend
-from .runtime import runtime_telemetry
+from .runtime import runtime_telemetry, runtime_telemetry_phase
 
 
 _QUARANTINED_PUBLICATIONS: list[object] = []
@@ -132,6 +132,7 @@ class GpuPublicationResources:
         self.poisoned = True
         _QUARANTINED_PUBLICATIONS.append((self, payload))
 
+    @runtime_telemetry_phase('pta.publish.resources_drain')
     def close(self):
         if self.closed:
             return
@@ -286,6 +287,7 @@ class GpuPublicationTask:
                     # a BaseException would kill its worker and strand the task.
                     raise RuntimeError('PTA CUDA publication could not fence its owners; worker stopped') from exc
 
+    @runtime_telemetry_phase('pta.publish.task_drain')
     def close(self):
         error = None
         try:

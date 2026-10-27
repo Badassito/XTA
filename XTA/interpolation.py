@@ -3224,7 +3224,8 @@ class PreparedViewResult:
     parent_mask_support_mm: Optional[object] = None
     parent_bridge_support_mm: Optional[object] = None
     # Thread-local publication futures: never send these across process boundaries.
-    pending_component_layers: List[Future[NrrdLayerRef]] = field(default_factory=list)
+    # Ownership-only dependencies (such as parallel confidence capture) return None.
+    pending_component_layers: List[Future[Optional[NrrdLayerRef]]] = field(default_factory=list)
 
 @dataclass
 class TilePostprocessTask:

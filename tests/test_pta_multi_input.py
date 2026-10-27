@@ -1,12 +1,14 @@
 """Each PTA directory keeps its annotation rules within one shared volume pipeline."""
 import json
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from XTA import pta
+from XTA import pta_workers
 from XTA.pta_config import build_pta_argparser, parse_pta_args
 from XTA.pta_runtime import build_runtime_options
 
@@ -172,6 +174,103 @@ def test_volumes_enter_the_same_depth_two_pipeline(tmp_path, monkeypatch, separa
     assert events[:3] == [("prepare", first), ("prepare", second), ("drain", None)]
     assert [record["stem"] for record in manifest["volumes"]] == ["a", "b"]
     assert manifest["resolved_configuration"]["input_directories"] == [str(root) for root in roots]
+
+
+def shared_preparations(monkeypatch, old_finished):
+    """Use real shared arrays with the controllable thread workers below."""
+    blocks, released = {}, set()
+    real_prepare, real_release = pta.prepare_loaded_source, pta.SharedBlock.release
+
+    def prepare(source, **kwargs):
+        kwargs["allocator"] = pta.make_volume_allocator(True)
+        prepared = real_prepare(source, **kwargs)
+        blocks[source.stem] = {id(block) for block in prepared.shm_blocks}
+        return prepared
+
+    def release(block):
+        if id(block) in blocks.get("a", set()):
+            assert old_finished.is_set(), "released old shared arrays while a worker was using them"
+        released.add(id(block))
+        real_release(block)
+
+    monkeypatch.setattr(pta, "prepare_loaded_source", prepare)
+    monkeypatch.setattr(pta.SharedBlock, "release", release)
+    return blocks, released
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+def test_volume_handoff_uses_free_worker_and_preserves_shared_arrays(tmp_path, monkeypatch, depth):
+    roots = [sequence(tmp_path / "first", "a"), sequence(tmp_path / "second", "b")]
+    old_started, old_finished, next_started, release_old = (Event() for _ in range(4))
+    blocks, released = shared_preparations(monkeypatch, old_finished)
+    real_render, real_drain = pta_workers._render_task_entry_thread, pta.drain_render_results
+
+    def render(payload, task_idx):
+        if payload["gen"] == 0 and task_idx == 0:
+            old_started.set()
+            try:
+                signal = next_started if depth == 2 else release_old
+                assert signal.wait(10), "next volume was not admitted while an old task remained"
+                return real_render(payload, task_idx)
+            finally:
+                old_finished.set()
+        if payload["gen"] == 1 and task_idx == 0:
+            assert old_started.wait(10)
+            assert old_finished.is_set() == (depth == 1)
+            if depth == 2:
+                assert blocks["a"] and not blocks["a"] & released
+            next_started.set()
+        return real_render(payload, task_idx)
+
+    def drain(*args, **kwargs):
+        if depth == 1:
+            release_old.set()
+        return real_drain(*args, **kwargs)
+
+    monkeypatch.setattr(pta_workers, "_render_task_entry_thread", render)
+    monkeypatch.setattr(pta, "drain_render_results", drain)
+    manifest = run(roots, tmp_path / "output", depth=depth, extra=["--frame_workers", "2"])
+    assert next_started.is_set() and old_finished.is_set()
+    assert all(owned and owned <= released for owned in blocks.values())
+    assert [record["stem"] for record in manifest["volumes"]] == ["a", "b"]
+    assert len(artifacts(tmp_path / "output", "images")) == 8
+
+
+def test_volume_handoff_error_stops_workers_before_releasing_both_volumes(tmp_path, monkeypatch):
+    roots = [sequence(tmp_path / "first", "a"), sequence(tmp_path / "second", "b")]
+    old_started, old_finished, release_old = (Event() for _ in range(3))
+    blocks, released = shared_preparations(monkeypatch, old_finished)
+    real_render = pta_workers._render_task_entry_thread
+    real_close = pta.PersistentRenderPool.close
+
+    def render(payload, task_idx):
+        if payload["gen"] == 0 and task_idx == 0:
+            old_started.set()
+            try:
+                assert release_old.wait(10), "error cleanup did not stop the pool"
+                return real_render(payload, task_idx)
+            finally:
+                old_finished.set()
+        if payload["gen"] == 1 and task_idx == 0:
+            assert old_started.wait(10) and not old_finished.is_set()
+            raise ValueError("handoff test failure")
+        return real_render(payload, task_idx)
+
+    def close(pool, *, terminate=False):
+        if terminate:
+            release_old.set()
+        real_close(pool, terminate=terminate)
+
+    monkeypatch.setattr(pta_workers, "_render_task_entry_thread", render)
+    monkeypatch.setattr(pta.PersistentRenderPool, "close", close)
+    with pytest.raises(RuntimeError, match="Render task failed for b") as error:
+        run(roots, tmp_path / "output", extra=["--frame_workers", "2"])
+    assert isinstance(error.value.__cause__, ValueError)
+    assert old_finished.is_set()
+    assert set(blocks) == {"a", "b"}
+    assert all(owned and owned <= released for owned in blocks.values())
+    manifest = json.loads((tmp_path / "output" / "manifest.json").read_text())
+    assert manifest["status"] == "in_progress"
 
 
 @pytest.mark.parametrize("task", ["segment", "semantic"])

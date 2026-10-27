@@ -48,7 +48,7 @@ def geometry_quality_request_record():
         'gpu_spherical_fp32_requested': spherical,
         'spherical_sampler_requested': 'fp32_fma_virtual_gray8' if spherical else 'reference_fp64',
         'spherical_fp32_max_axis': SPHERICAL_FP32_MAX_AXIS,
-        'native_t_fusion': False,
+        'native_t_fusion': False,  # Keep virtual gray8 rounding; source residency is separate.
         'categorical_sampling': 'unchanged_nearest',
         'requested_not_actual_dispatch': True,
     }

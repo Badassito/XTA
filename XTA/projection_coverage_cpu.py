@@ -44,6 +44,7 @@ class NativePullPlan:
     owner_order: np.ndarray
     row_lookup: np.ndarray
     column_lookup: np.ndarray
+    raw_angles_f64: np.ndarray | None = None
 
 
 def _readonly(array):
@@ -89,8 +90,8 @@ def _preflight(view, source_shape, output_shape, budget=None):
         # lists, lookup construction ramps and final numeric arrays. No such
         # Python records remain in the returned plan or an implicit LRU.
         axis_peak = 16 * (sum(native) + source_shape[1] + source_shape[2])
-        persistent += 4 * sum(native) + 25 * count
-        minimum += axis_peak + 537 * count + 48 * len(angles)
+        persistent += 4 * sum(native) + 33 * count
+        minimum += axis_peak + 545 * count + 48 * len(angles)
         if any(not math.isfinite(float(angle)) for angle in angles):
             raise ValueError('Azimuthal trajectory angles must all be finite')
         if budget is not None and minimum > budget:
@@ -139,18 +140,16 @@ def _geometry(view, source_shape, output_shape):
     empty32 = np.empty(0, np.int32)
     emptyf = np.empty(0, np.float32)
     arrays = (emptyf, empty32, np.empty(0, bool), np.empty(0, np.float64),
-              np.empty(0, np.int64), empty32, empty32)
+              np.empty(0, np.int64), empty32, empty32, np.empty(0, np.float64))
     radius = 0.0
     if azimuthal:
-        from .backprojection import build_azimuthal_backprojection_plan, resolve_azimuthal_processing_grid
+        from .backprojection import resolve_azimuthal_processing_grid
+        from .azimuthal_trajectory_cpu import azimuthal_backprojection_arrays
         grid = resolve_azimuthal_processing_grid(np.broadcast_to(np.uint8(0), source_shape), view)
-        trajectory, _ = build_azimuthal_backprojection_plan(view)
-        angles = np.asarray([float(sample.angle_deg) % 180.0 for sample in trajectory], np.float32)
-        sources = np.asarray([sample.source_index for sample in trajectory], np.int32)
-        reverses = np.asarray([sample.reverse_u for sample in trajectory], bool)
-        sorted_angles, order = _prepare_angular_owners(
-            np.asarray([float(sample.angle_deg) % 180.0 for sample in trajectory], np.float64))
-        del trajectory
+        raw_angles, sources, reverses = azimuthal_backprojection_arrays(view)
+        normalized_angles = np.asarray([float(angle) % 180.0 for angle in raw_angles], np.float64)
+        angles = np.asarray(normalized_angles, np.float32)
+        sorted_angles, order = _prepare_angular_owners(normalized_angles)
         if (not np.isfinite(angles).all() or not np.isfinite(sorted_angles).all()
                 or sources.size == 0 or sources.min() < 0 or sources.max() >= source_shape[0]
                 or grid.native_row_to_processing.min() < 0
@@ -162,7 +161,7 @@ def _geometry(view, source_shape, output_shape):
                       grid.native_row_to_processing, grid.native_u_to_processing):
             _readonly(array)
         arrays = (angles, sources, reverses, sorted_angles, order,
-                  grid.native_row_to_processing, grid.native_u_to_processing)
+                  grid.native_row_to_processing, grid.native_u_to_processing, raw_angles)
         radius = effective_azimuthal_radius(view)
     elif source_shape[1:] != (native_h, native_w):
         if source_shape[1] != source_shape[2]:
@@ -246,7 +245,7 @@ def prepare_native_pull_plan(view, source_shape, output_shape, *, max_plan_bytes
     key_dtype = np.uint32 if source_shape[0] * source_shape[2] < np.iinfo(np.uint32).max else np.uint64
     invalid = np.uint64(np.iinfo(key_dtype).max)
     empty_keys = _readonly(np.empty((0, 0), key_dtype))
-    angles, sources, reverses, sorted_angles, order, rows, columns = arrays
+    angles, sources, reverses, sorted_angles, order, rows, columns, raw_angles = arrays
     for array in arrays:
         _readonly(array)
     angular = bool(integers[10])
@@ -269,7 +268,7 @@ def prepare_native_pull_plan(view, source_shape, output_shape, *, max_plan_bytes
                           0 if cached or not angular else temporary,
                           math.prod(output_shape) if cached or not angular else strip_points,
                           integers, coefficients, empty_keys, invalid,
-                          angles, sources, reverses, sorted_angles, order, rows, columns)
+                          angles, sources, reverses, sorted_angles, order, rows, columns, raw_angles)
     if cached:
         keys = np.empty(plane_shape, key_dtype)
         flat = keys.reshape(-1)
@@ -280,7 +279,7 @@ def prepare_native_pull_plan(view, source_shape, output_shape, *, max_plan_bytes
         _readonly(keys)
         plan = NativePullPlan(source_shape, output_shape, backend, persistent, workspace, 0,
                               math.prod(output_shape), integers, coefficients, keys, invalid,
-                              angles, sources, reverses, sorted_angles, order, rows, columns)
+                              angles, sources, reverses, sorted_angles, order, rows, columns, raw_angles)
     return plan
 
 

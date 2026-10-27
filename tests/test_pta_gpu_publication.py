@@ -10,12 +10,13 @@ import ast
 from collections import Counter, defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager, nullcontext, redirect_stdout
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, make_dataclass, replace
 import io
 import os
 from pathlib import Path
 import pickle
 import threading
+import weakref
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -23,6 +24,7 @@ from unittest import mock
 import numpy as np
 
 from XTA import pta_gpu_publication as publication
+from XTA import pta_scheduler
 
 
 class FakeStream:
@@ -156,9 +158,17 @@ class FakeTensor:
 
 def extract_worker_functions(namespace):
     """Keep this lightweight fixture tied to the production function bodies."""
+    namespace.setdefault('runtime_telemetry_phase', lambda _phase: lambda function: function)
+    namespace.setdefault('_deferred_task_candidates', lambda _task: ())
+    namespace.setdefault('_deferred_foreground_counts', lambda _candidates: None)
+    namespace.setdefault('_resolve_gpu_source_foregrounds', lambda *_args: None)
+    namespace.setdefault('resolve_deferred_foregrounds', lambda *_args: None)
+    namespace.setdefault('_WARNING_EXAMPLE_LIMIT', 12)
     path = Path(__file__).resolve().parents[1] / 'XTA' / 'pta_workers.py'
-    selected = {'WarningLog', '_validate_gpu_policy_batch', '_publish_gpu_policy_batch',
-                '_label_payload_bytes', '_publish_label_payloads', 'execute_gpu_frame_batch_task'}
+    selected = {'WarningLog', '_retain_deterministic_warning_examples',
+                '_gpu_source_mask_nonempty', '_validate_gpu_policy_batch', '_publish_gpu_policy_batch',
+                '_label_payload_bytes', '_publish_label_payloads', 'execute_gpu_frame_batch_task',
+                'execute_gpu_render_task'}
     nodes = [node for node in ast.parse(path.read_text(encoding='utf-8')).body
              if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in selected]
     assert len(nodes) == len(selected)
@@ -404,9 +414,10 @@ class GpuPublicationTests(unittest.TestCase):
         candidates = tuple(SimpleNamespace(augmentation_index=1, augmentation_seed=index + 1,
             augmentation_tag=f'aug{index}', frame_idx=index, foreground=True,
             label_enabled=labels, volume_name='volume', output_tag=f'frame{index}',
-            split_subset='train') for index in range(2))
+            split_subset='train', foreground_deferred='') for index in range(2))
         work = tuple(SimpleNamespace(candidates=(candidate,), image=np.zeros((2, 3), np.uint8),
             mask=np.ones((2, 3), np.uint8), output_size=(2, 3),
+            semantic_coverage=None,
             channel_kind='gray' if channels == 1 else 'rgb' if channels == 3 else 'custom',
             channel_count=channels, context=f'frame{index}') for index, candidate in enumerate(candidates))
 
@@ -491,10 +502,163 @@ class GpuPublicationTests(unittest.TestCase):
             finally:
                 label_release.set()
                 file_release.set()
-        self.assertEqual(result, (2, {}, {'pta_cpu_categorical_items': 2}, {}))
+        self.assertEqual(result, (2, {}, {'pta_cpu_categorical_items': 2}, {}, None))
         self.assertEqual(fixture.calls, [((1,),), ((2,),)])
         self.assertEqual(fixture.labels_written, [('frame0.txt', ['11']), ('frame1.txt', ['22'])])
         self.assertEqual(fixture.charges, [24, 24])
+
+    def test_worker_retains_shape_tails_and_bounds_incompatible_ready_work(self):
+        work_type = make_dataclass('Work',
+            ['candidates', 'image', 'mask', 'output_size', 'channel_kind', 'channel_count',
+             'context', ('semantic_coverage', object, None)])
+        for shape_count, frame_count, expected_sizes in ((2, 8, [4, 4]), (8, 24, [1] * 24)):
+            with self.subTest(shape_count=shape_count):
+                fixture = self.worker_fixture(labels=False)
+                candidates = tuple(SimpleNamespace(augmentation_index=1,
+                    augmentation_seed=index + 1, augmentation_tag=f'aug{index}',
+                    frame_idx=index, foreground=True, label_enabled=False)
+                    for index in range(frame_count))
+                calls, produced = [], []
+
+                def render(_volume, _mask, _plan, frame_idx, _items, _runtime, _coverage):
+                    shape = (2 + frame_idx % shape_count, 3)
+                    return (work_type((candidates[frame_idx],), np.zeros(shape, np.uint8),
+                        np.ones(shape, np.uint8), shape, 'gray', 1, str(frame_idx)),)
+
+                def policy(**kwargs):
+                    calls.append((tuple(seed for seeds in kwargs['seeds'] for seed in seeds),
+                                  len(produced)))
+                    return object(), object()
+
+                def ordered_wait(futures, **_kwargs):
+                    first = next(iter(futures))
+                    first.result()
+                    produced.append(1)
+                    return {first}, set(futures) - {first}
+
+                fixture.namespace.update(
+                    _WORKER_STATIC=dict(gpu_batch_size=4, gpu_render_threads=1),
+                    _gpu_memory_candidate_limit=lambda *args, **kwargs: 4,
+                    _gpu_multi_source_work_batches=pta_scheduler.iter_compatible_work_batches,
+                    _should_flush_ready_gpu_work=pta_scheduler.should_flush_ready_gpu_work,
+                    _render_gpu_item_group=render, wait=ordered_wait,
+                )
+                self.runtime['policy'] = SimpleNamespace(apply_batch_many=policy)
+                plan = SimpleNamespace(view=SimpleNamespace(shared_view=None), tile_layout=())
+                task = SimpleNamespace(frames=tuple(SimpleNamespace(plan_idx=0, frame_idx=index,
+                    items=(('full', (candidate,)),)) for index, candidate in enumerate(candidates)))
+                run = extract_worker_functions(fixture.namespace)
+                fixture.namespace['_publish_gpu_policy_batch'] = (
+                    lambda **kwargs: (len(kwargs['candidates']), {}))
+                with mock.patch.object(publication, 'publication_resources', return_value=None):
+                    result = run(None, None, (plan,), task)
+                self.assertEqual(result[0], frame_count)
+                self.assertEqual([len(seeds) for seeds, _ in calls], expected_sizes)
+                self.assertEqual(sorted(seed for seeds, _ in calls for seed in seeds),
+                                 list(range(1, frame_count + 1)))
+                self.assertLessEqual(calls[0][1], 8, 'shape tails exceeded two admitted batches')
+
+    def test_worker_releases_failed_policy_outputs_before_split_retry(self):
+        fixture = self.worker_fixture(labels=False)
+        work_type = make_dataclass('CoverageWork',
+            ['candidates', 'image', 'mask', 'output_size', 'channel_kind', 'channel_count',
+             'context', 'semantic_coverage'])
+        work = tuple(work_type(**dict(vars(item), semantic_coverage=np.ones((2, 3), np.uint8)))
+                     for item in fixture.namespace['_render_gpu_item_group']())
+        fixture.namespace.update(
+            _WORKER_STATIC=dict(gpu_batch_size=2, gpu_render_threads=1, save_semantic=True),
+            _gpu_memory_candidate_limit=lambda *args, **kwargs: 2,
+            _gpu_multi_source_work_batches=pta_scheduler.iter_compatible_work_batches,
+            _split_gpu_work_batch=pta_scheduler.split_work_batch,
+            _is_cuda_out_of_memory=pta_scheduler.is_cuda_out_of_memory,
+            _render_gpu_item_group=lambda *args: work,
+            _require_gpu_semantic_coverage_contract=lambda *args: None,
+            replace=replace,
+        )
+        references, coverage_images, calls, retries, published = [], [], [], [], []
+
+        def empty_cache():
+            self.assertTrue(all(reference() is None for reference in references),
+                            'failed first-pass outputs remain alive during OOM recovery')
+            retries.append(1)
+
+        def policy(**kwargs):
+            calls.append(tuple(seed for seeds in kwargs['seeds'] for seed in seeds))
+            if len(calls) == 2:
+                raise RuntimeError('CUDA out of memory in semantic replay')
+            if len(calls) in (3, 5):
+                self.assertTrue(all(reference() is None for reference in references),
+                                'previous policy outputs remain alive before the next call')
+            count = len(calls[-1])
+            images = FakeTensor(self.torch, np.ones((count, 1, 2, 3), np.uint8))
+            masks = FakeTensor(self.torch, np.ones((count, 2, 3), np.uint8))
+            references.extend((weakref.ref(images), weakref.ref(masks)))
+            if len(calls) in (4, 6):
+                coverage_images.append(weakref.ref(images))
+            return images, masks
+
+        def publish(**kwargs):
+            self.assertIsNone(coverage_images[-1](), 'unused coverage image retained until publication')
+            published.extend(candidate.augmentation_seed for candidate in kwargs['candidates'])
+            return len(kwargs['candidates']), {}
+
+        self.torch.cuda.empty_cache = empty_cache
+        self.torch.equal = lambda left, right: np.array_equal(left.array, right.array)
+        self.runtime['policy'] = SimpleNamespace(apply_batch_many=policy)
+        run = extract_worker_functions(fixture.namespace)
+        fixture.namespace['_publish_gpu_policy_batch'] = publish
+        plan = SimpleNamespace(view=SimpleNamespace(shared_view=None), tile_layout=())
+        task = SimpleNamespace(frames=(SimpleNamespace(plan_idx=0, frame_idx=0,
+            items=(('full', tuple(item.candidates[0] for item in work)),)),))
+        with mock.patch.object(publication, 'publication_resources', return_value=None):
+            result = run(None, None, (plan,), task)
+        self.assertEqual(result[0], 2)
+        self.assertEqual(calls, [(1, 2), (1, 2), (1,), (1,), (2,), (2,)])
+        self.assertEqual(retries, [1])
+        self.assertEqual(published, [1, 2])
+        self.assertTrue(all(reference() is None for reference in references))
+
+    def test_single_source_worker_releases_device_outputs_before_next_chunk(self):
+        fixture = self.worker_fixture(labels=False)
+        candidates = tuple(item.candidates[0]
+                           for item in fixture.namespace['_render_gpu_item_group']())
+        frame_type = make_dataclass('FrameRenderTask', ['plan_idx', 'frame_idx', 'items'])
+        plan_type = make_dataclass('Plan', ['tag', 'tile_layout'])
+        fixture.namespace.update(
+            GpuFrameBatchTask=type('GpuFrameBatchTask', (), {}), FrameRenderTask=frame_type,
+            _WORKER_STATIC=dict(gpu_batch_size=1, out_dir=Path('unused'), split_active=False,
+                image_format='jpg', png_compression=1, jpeg_quality=90,
+                save_images=False, save_labels=False, save_semantic=True),
+            replace=replace,
+            _require_gpu_semantic_coverage_contract=lambda *args: None,
+            render_plan_frame_source=lambda **kwargs: object(),
+            _derive_gpu_item_source=lambda *args: (np.zeros((2, 3), np.uint8),
+                                                  np.ones((2, 3), np.uint8), (2, 3)),
+            _render_semantic_coverage_item=lambda *args, **kwargs: np.ones((2, 3), np.uint8),
+            publish_binary_mask_payloads=lambda payloads: None,
+        )
+        references, calls = [], []
+
+        def policy(**kwargs):
+            calls.append(tuple(kwargs['seeds']))
+            if len(calls) == 3:
+                self.assertTrue(all(reference() is None for reference in references),
+                                'previous synchronous chunk retained device outputs')
+            images = FakeTensor(self.torch, np.ones((1, 1, 2, 3), np.uint8))
+            masks = FakeTensor(self.torch, np.ones((1, 2, 3), np.uint8))
+            references.extend((weakref.ref(images), weakref.ref(masks)))
+            return images, masks
+
+        self.torch.equal = lambda left, right: np.array_equal(left.array, right.array)
+        self.runtime['policy'] = SimpleNamespace(apply_batch=policy)
+        extract_worker_functions(fixture.namespace)
+        run = fixture.namespace['execute_gpu_render_task']
+        plan = plan_type('test', ())
+        task = frame_type(0, 0, (('full', candidates),))
+        result = run(None, None, (plan,), task, np.ones((2, 3), np.uint8))
+        self.assertEqual(result[0], 2)
+        self.assertEqual(calls, [(1,), (1,), (2,), (2,)])
+        self.assertTrue(all(reference() is None for reference in references))
 
     def test_worker_charges_both_sources_and_snapshots_for_each_channel_count(self):
         for channels in (1, 3, 7):

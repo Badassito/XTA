@@ -57,6 +57,38 @@ def spherical_direction_cache_stats(engine):
     return dict(_direction_cache_stats(engine))
 
 
+def spherical_direction_key(view, device):
+    """Identity of a whole QSC patch, independent of radius or data role."""
+    return (
+        str(device), int(view.spherical_face), int(view.spherical_face_intervals),
+        int(view.src_h), int(view.src_w), int(view.spherical_u_origin),
+        int(view.spherical_v_origin), tuple(float(v) for v in view.spherical_rotation_xyz),
+    )
+
+
+def cached_spherical_directions(engine, key):
+    """Borrow a complete FP64 plan without changing another producer's LRU.
+
+    Cache publication follows blocking uploads. Local tensor references survive
+    eviction; CUDA consumers must record their stream before dropping them.
+    Strip plans and FP32 intensity plans cannot satisfy categorical sampling.
+    """
+    cache = getattr(engine, '_spherical_direction_cache', None)
+    entry = cache.get(key + (np.dtype(np.float64).str,)) if cache is not None else None
+    if entry is None:
+        return None
+    directions, valid, _size = entry
+    torch = engine.torch
+    rows, columns = key[3:5]
+    if (directions.dtype != torch.float64 or valid.dtype not in (torch.bool, torch.uint8)
+            or tuple(directions.shape) != (rows, columns, 3)
+            or tuple(valid.shape) != (rows, columns)
+            or str(directions.device) != key[0] or str(valid.device) != key[0]
+            or not directions.is_contiguous() or not valid.is_contiguous()):
+        return None
+    return directions, valid
+
+
 def _validate_spherical_rotation(engine, rotation):
     """Validate each immutable rotation value once in a bounded engine cache."""
     cache = getattr(engine, '_spherical_rotation_cache', None)
@@ -99,8 +131,7 @@ def _render_contract(engine, view, index):
         raise ValueError('Invalid spherical face or native raster dimensions')
     rotation = tuple(float(value) for value in view.spherical_rotation_xyz)
     _validate_spherical_rotation(engine, rotation)
-    key = (str(volume.device), face, intervals, rows, columns,
-           int(view.spherical_u_origin), int(view.spherical_v_origin), rotation)
+    key = spherical_direction_key(view, volume.device)
     return radius, shape, key
 
 

@@ -161,6 +161,7 @@ def test_sampler_clears_disappearing_current_and_limit_without_real_gpu_calls(fi
         lock = threading.RLock()
         gauges = {}
         def gauge(self, name, value): self.gauges[name] = value
+        def gauge_many(self, values): self.gauges.update(values)
         def sample_registered_providers(self): pass
         def maybe_flush(self):
             records.append(json.loads(json.dumps(self.gauges)))

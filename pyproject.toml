@@ -44,7 +44,7 @@ version = {attr = "XTA.__version__"}
 [tool.setuptools.data-files]
 "share/xta" = [
   "ARCHITECTURE.md",
-  "GPT-6-Astra-Ultra_v24.2.1_SLURM.py",
+  "GPT-6-Astra-Ultra_v24.2.2_SLURM.py",
 ]
 "share/xta/docs" = ["docs/sam_interpolation.md", "docs/lta_dynamic_crops.md", "docs/projection_coverage.md", "docs/slicer_pta_cleanup.md", "docs/pta_fraction.md"]
 "share/xta/tools/slicer" = ["tools/slicer/xta_slicerrc.py", "tools/slicer/xta_upscale_preview.py"]
@@ -69,6 +69,7 @@ version = {attr = "XTA.__version__"}
   "tools/qualify_tta_cpu_augmentation.py",
   "tools/qualify_tta_hybrid_augmentation.py",
   "tools/qualify_pta_gpu_publication.py",
+  "tools/benchmark_pta_nvjpeg_lanes.py",
   "tools/benchmark_tilted_azimuthal_projection.py",
   "tools/certify_qsc_lipschitz.py",
   "tools/plan_projection_sampling.py",

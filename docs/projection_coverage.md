@@ -89,14 +89,29 @@ Plans retain local read-only numeric tables, with packed uint32 or uint64 owners
 as capacity requires; there is no global Python plan LRU. The kernel does not
 copy its source mask or create a global thread pool.
 
+Densified Azimuthal trajectories use one compiled, GIL-free nearest-source loop
+instead of a Python loop of small NumPy operations. It preserves the original
+float64 wrap expression, first-source distance ties and raw-angle reversal.
+The plan retains the original float64 trajectory angles, charging eight bytes
+per angle, so conservative bounds can borrow the same exact trajectory without
+rebuilding it or reconstructing it from rounded float32 sampling angles.
+The per-pixel angular key sampler and CUDA arithmetic are unchanged.
+
+Sparse Azimuthal bounds validate indices and lookup ranges before entering a
+compiled numeric traversal. Monotone row/column maps use binary search; other
+maps retain the original scan rule. Scalar trigonometric coefficients, cell
+coverage, shear and rounding rules remain exact. No source pixels are decoded
+and no dense volume or global bounds cache is allocated.
+
 Independent array callers retain their requested per-view worker count. During
 a pipeline run, native pulls share one CPU pool rather than dividing their
 parallelism by the configured number of parent preparations. The pool grows
 at inference drain, including for projections already running. It fairly shares
-credits across live projections and bounds both running operations and completed
-planes awaiting their consumer. The per-projection workspace allowance remains
-an additional cap. A slow consumer therefore cannot accumulate an unbounded
-queue of planes or multiply the CPU budget by the number of views.
+execution credits across live jobs. Completed results no longer consume CPU
+execution permits; their storage remains bounded by each job's funded ordered
+result window and consumer allowance. Aggregate retained results can exceed the
+CPU worker count, but cannot exceed the sum of those admitted memory windows.
+A slow consumer cannot prevent unrelated ready jobs from using idle CPU lanes.
 
 Each worker owns a distinct destination plane, and callbacks receive planes in
 source order. Cancellation/error paths join all readers before releasing their
@@ -136,9 +151,25 @@ is released. Declared admission failures retain CPU execution; execution or
 unsettled cleanup failures abort publication instead of retrying with live GPU
 ownership. The explicit `numpy` backend remains on CPU.
 
+Eligible packed-parent GPU continuations now project bounded blocks and crop
+and row-pack on the device before transfer. Encoded records go directly to the
+CVOL writer, removing full destination-plane downloads and CPU crop/bitpacking
+while holding a GPU lease. The scalar-MAX/dense API and ordered CPU prefix remain
+compatible. Device buffers, shared pinned staging, two owned encoded results,
+index/control storage and strip scratch are reserved before admitting CPU
+readers, including constructor/handoff overlap. If optional GPU staging cannot
+fit, the original valid CPU window remains usable.
+
 Handoff preserves the already-published prefix. The CPU stream cancels queued
 work and joins running readers before CUDA writes the remaining planes, so no
 callback is duplicated and no borrowed source is retired while still in use.
+GPU admission precedes CPU-kernel warmup for encoded parents, so a parent that
+can start on CUDA does not compile an unused CPU specialization. One bounded
+GPU producer overlaps the preceding output's ordered publication; cancellation
+joins that producer before closing the session or retiring its source. Both
+owned outputs and staging are included in the workspace limit. Preparation telemetry
+separates source validation, geometry, destination bounds, CPU warmup, admission,
+producer waits and writer time, rather than reporting all of them as projection.
 Small synthetic probes can favor CPU because CUDA setup and transfer costs
 dominate; production throughput must be checked with the actual workload.
 
@@ -166,6 +197,13 @@ Interpolation/extrapolation, tiled parents, retained debug workspaces, an alread
 published layer, and explicit NumPy projection retain their established paths.
 Packing changes storage, not view resolution or the destination coverage rules.
 
+Terminal source packing uses a native, GIL-free cropped row-bit encoder for
+bounded blocks. Its payload cap is 32 MiB and its block cap is 64 slices, with
+64 KiB of control storage; these limits are explicitly charged to parent
+admission. Memory-headroom checks fund a complete bounded growth window. An
+oversized single plane retains the bounded row-slab path. The encoder preserves
+nonzero semantics, crop bounds, foreground counts and little-endian row bits.
+
 Terminal projected layers also use private packed CVOLs. Their retained RAM
 grants share the existing Radial publication budget, with the large parent
 outputs allocated first. Grants include future working/output reserves and
@@ -175,9 +213,52 @@ keeps the disk payload packed. Public NRRD pixels and source geometry are unchan
 
 Tilted inference inputs use the existing resident GPU renderer by default.
 Speculative CPU Tilted preparation requires `YOLO_TTA_CPU_INPUT_TILTED=1`;
-Cartesian prefetch retains its existing control. Eligible disjoint Spherical
-GPU task leases finish exact per-slice hole filling before their D2H publication,
+Cartesian prefetch retains its existing control. Optional preparation defaults
+to one builder and two retained packets per GPU, in addition to its byte grant.
+`YOLO_TTA_CPU_INPUT_BUILDERS` and `YOLO_TTA_CPU_INPUT_PACKETS` accept positive
+integer overrides; builders are capped by the existing main-process worker
+budget, without resizing the shared executor. Queued builds count toward the
+builder cap, and ready, borrowed and retiring packets retain their slots until
+their ownership and byte credit settle. An unavailable CPU packet uses the
+resident GPU renderer immediately. `YOLO_TTA_CPU_INPUT_PREFETCH=0` disables the
+optional preparation route. The effective limits appear in
+`yolo.cpu_input.policy` and the live input snapshot.
+
+Unified TTA startup overlaps model content hashing with exact source probing in
+one bounded auxiliary thread. Both readers join before decoding or model
+execution; source metadata is checked across discovery and the final artifact
+identity checks remain in place. A failed discovery leaves an in-progress
+manifest rather than a prior successful association.
+
+The scheduler skips pending-task scans while every GPU dispatch window is full.
+It still drains completed workspaces, refreshes retirement pressure and services
+auxiliary coordination. A returned compute credit triggers fresh admission
+checks before another task can be dispatched.
+
+Eligible disjoint Spherical GPU task leases finish exact per-slice hole filling before their D2H publication,
 and report coverage so the parent can skip the completed-view CPU pass.
+Spherical projection admits up to 256 MiB of output per CUDA block, reducing
+per-block transfers and synchronization. Admission accounts for both device
+buffers, source, geometry, metadata and reserve before allocating; limited
+VRAM reduces the block depth. Explicit smaller block limits remain effective.
+The existing one-block producer overlap and parent host-memory limit still apply.
+Spherical completion reporting occurs after stream fencing, allocation cleanup
+and GPU lease release. Reported total time includes cleanup, with separate
+timings for the stream fence, owner clearing, device and pinned pools, and lease
+release. An unsettled CUDA fence still retains its owners and lease.
+
+Source packing reports RAM probes, progress reporting, setup and finalization
+separately from encoding and writes. RAM probes share one current meminfo
+snapshot within the call; cgroup limits and usage remain freshly sampled on
+every call. Scheduler diagnostics include source packing and plan/bounds
+preparation before projection starts, and timestamp their activity snapshot.
+Ordinary counters, gauges and span completion use a short producer-metrics lock
+separate from the observer's snapshot/writer lifecycle. Snapshot formatting and
+file I/O do not hold that producer lock, and automatic flush requests do not
+wait for the observer. Writer acknowledgement only clears updates included in
+its snapshot. Scheduler status reads current ordinary/coalesced gauges without
+acquiring the writer lock. This removes an observation dependency from compute
+and source/GPU-credit retirement; it does not claim to eliminate Python's GIL.
 
 Confidence readers retain one scalar-max plan per reader. Their admitted
 workspace includes output/control bytes and plan construction/runtime strips;
@@ -190,17 +271,52 @@ unsupported refusals select the reference sampler; unexpected allocation and
 kernel failures propagate. Zero-score unknown semantics and binary/scalar
 address correspondence are unchanged.
 
-Confidence capture occurs before native layer materialization and is distinct
-from the source-aligned score reader above. During a run its ordered frame jobs
+Confidence capture is distinct from the source-aligned score reader above.
+For eligible terminal native parents it runs independently of binary packing
+and projection. A startup reservation carved from parent transient capacity
+funds a bounded capture queue and automatic numeric staging expansion; custom
+publisher limits remain unchanged. The prepared parent retains the capture
+Future as an ownership dependency, so completion still requires both branches.
+Eligible terminal captures prepare their exclusive uint8 scores after cleanup
+and retain those scores without borrowing the original dense mask. With trusted
+support metadata, preparation reuses one validated reader snapshot and masks
+only its active bounding boxes. That same reader survives asynchronous capture,
+synchronous queue refusal and numeric-stage retry; later caller metadata cannot
+expand its read domain. Missing metadata uses complete-grid masking. Binary
+packing still consumes the original mask, including foreground whose quantized
+score is zero. Confidence values, block/index bytes and output geometry are
+unchanged.
+
+Preparation requires a full writable contiguous score owner and distinct,
+authoritatively identified source backing. Uncertain mappings, unsafe layouts
+and metadata aliases retain the existing two-source path. A configured terminal
+capture queue is required before adding preparation work; synchronous-only runs
+retain their original path. The existing capture plan funds metadata and bounded
+masking scratch before encoding workers start. No new codec or worker pool is
+introduced.
+
+Mask credit returns only when its actual last owner dies, after its packed
+continuation is ready; any external mask alias still prevents that refund.
+Confidence charges its one score backing once and keeps it until its final read.
+Either retirement order is supported, with lease identity and per-input tokens
+rejecting stale or duplicate credit. Projection failure cancels or joins capture
+before cleanup, and failed producer closures drop source references only after
+their readers join. Aggregate `confidence.terminal_score_only` counters record
+prepared parents, full/visited score bytes and preparation time.
+`YOLO_TTA_TERMINAL_SCORE_ONLY=0` retains asynchronous capture with both original
+sources for controlled same-source comparisons. The default is enabled; the
+requested mode is recorded in execution provenance.
+
+During a run, ordered confidence frame jobs
 share the native-projection CPU pool. The charged memory window is planned before
 parent admission; actual CPU credits are divided among captures that have obtained
 a numeric staging slot. Queued parent threads do not reserve CPU lanes. Standalone
 callers retain their requested worker count. The original masking, maximum and
 payload/index semantics remain unchanged. Exact plan workspace is added to the
 existing parent transient request, capped at 256 MiB per parent;
-the dense and transient admission limits are unchanged. Planning occurs before
-the owner is popped, and execution stays inside the live reservation with failure
-cleanup. Disabled confidence, absent score maps, and already-published D1 parents
+detached capture grants stay live independently when a parent returns. Planning
+occurs before the owner is popped, with reader joins and failure cleanup.
+Disabled confidence, absent score maps, and already-published D1 parents
 skip the plan and charge.
 
 The direct capture helper defaults to 64 MiB; the production pipeline explicitly
@@ -218,9 +334,13 @@ are unchanged. Compiler/code-cache initialization is separate process overhead;
 the helper changes neither global Numba thread settings nor disk caching.
 
 Confidence payload/index writes are batched within the charged consumer window.
+Per-frame wait and consumption telemetry includes both wall time and thread CPU
+time, so future runs can distinguish producer waits from publication work.
 Logical byte counters replace per-cell file-position queries. Numeric stages
-prefer two owned Linux memfds within the existing 64 MiB per-stage and 256 MiB
-combined staging limit. Small metadata files and the stage directory retain the
+prefer two owned Linux memfds within a 64 MiB per-stage limit. The ordinary
+combined default is 256 MiB; eligible terminal runs can fund more slots from
+existing parent capacity and physical RAM headroom before admitting any source.
+Small metadata files and the stage directory retain the
 established artifact layout. Unsupported platforms or insufficient physical
 headroom report a disk fallback. Numeric handles stay owned through the final
 copy and close before their slot credit returns.

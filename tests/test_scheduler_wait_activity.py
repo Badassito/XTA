@@ -60,6 +60,25 @@ def test_native_projection_summary_retains_oldest_live_work_and_copies_records()
     assert gauges['projection.native_destination_pull.live.view4']['completed_planes'] == 4
 
 
+def test_preparation_and_packing_are_visible_before_projection_starts():
+    gauges = {
+        'projection.native_prepare.live.azimuthal': dict(
+            phase='destination_bounds', view='azimuthal', elapsed_seconds=124.),
+        'projection.native_prepare.live.ready': dict(phase='ready'),
+        'projection.native_prepare.live.done': dict(phase='complete'),
+        'projection.native_source_pack.live.tilted': dict(
+            state='running', view='tilted', elapsed_seconds=38., completed_frames=600),
+        'projection.native_source_pack.live.done': dict(state='complete'),
+    }
+    summary = pipeline._scheduler_wait_activity_summary([], gauges)
+    assert summary['active_native_projections'] == 0
+    assert summary['active_native_preparations'] == 1
+    assert summary['oldest_native_preparations'][0]['phase'] == 'destination_bounds'
+    assert summary['active_native_source_packs'] == 1
+    summary['oldest_native_source_packs'][0]['completed_frames'] = 999
+    assert gauges['projection.native_source_pack.live.tilted']['completed_frames'] == 600
+
+
 def _wait_logger(namespace):
     tree = ast.parse(Path(pipeline.__file__).read_text(encoding='utf-8'))
     function = next(node for node in ast.walk(tree)
@@ -117,6 +136,7 @@ def test_actual_wait_logger_reports_credit_convoy_and_live_planes(capsys):
             'backend': 'compiled_native_pull_cpu', 'workers': 8,
             'last_update_monotonic': 1000.,
         }}, gauge=Mock())
+    telemetry.gauges_snapshot = lambda **_kwargs: dict(telemetry.gauges)
     running = []
     for _ in range(4):
         future = Future()
@@ -158,6 +178,7 @@ def test_actual_wait_logger_reports_credit_convoy_and_live_planes(capsys):
     assert key == 'scheduler.wait_activity'
     assert receipt['dense_retained_bytes'] == 170 and receipt['dense_limit_bytes'] == 256
     assert receipt['inference_pending_tasks'] == 3868
+    assert receipt['sampled_monotonic'] > 0
     assert receipt['oldest_native_projections'][0]['workers'] == 8
     assert len(future_map) == 17 and state.gpu_worker_results_collected == 2243
     # The regular status interval still suppresses repeated output/gauge updates.

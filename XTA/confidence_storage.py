@@ -26,6 +26,26 @@ class ConfidenceStageLimit(RuntimeError):
     """A local compressed stage would exceed its reserved numeric bytes."""
 
 
+def _measured_frames(frames, timings):
+    iterator = iter(frames)
+    while True:
+        started, cpu_started = time.perf_counter(), time.thread_time()
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return
+        finally:
+            timings['frame_wait_seconds'] += time.perf_counter()-started
+            timings['frame_wait_thread_cpu_seconds'] += time.thread_time()-cpu_started
+        started, cpu_started = time.perf_counter(), time.thread_time()
+        try:
+            yield item
+        finally:
+            timings['frame_consume_seconds'] += time.perf_counter()-started
+            timings['frame_consume_thread_cpu_seconds'] += time.thread_time()-cpu_started
+            item = None
+
+
 def _ordered_encoded_frames(reader, first, stop, block_size, workers, metrics=None):
     """Retain at most workers completed frames plus the caller's current frame."""
     from .native_pull_scheduling import get_native_pull_scheduler
@@ -33,7 +53,8 @@ def _ordered_encoded_frames(reader, first, stop, block_size, workers, metrics=No
     if scheduler is not None:
         # Register only after the publication queue has admitted its numeric
         # staging slot. Waiting parent executor threads own no CPU lane. Native
-        # projection and confidence share the same running/retained credits.
+        # Projection and confidence share the running CPU allowance; this
+        # capture's admitted plan separately funds its ordered result window.
         frames = scheduler.ordered_planes(stop-first,
             lambda offset: reader.encode_frame(first+offset, block_size),
             max_pending=workers, role='confidence_capture')
@@ -52,6 +73,10 @@ def _ordered_encoded_frames(reader, first, stop, block_size, workers, metrics=No
                         capture_peak_retained_frames=state['job_peak_retained_operations'])
             finally:
                 frames.close()
+                # Failed producer Futures can retain this lambda's closure cell
+                # after traceback frames are cleared. Every reader is joined;
+                # empty the cell without altering the reader used by a retry.
+                reader = None
         return
     if workers <= 1:
         for z in range(first, stop):
@@ -193,6 +218,9 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
     started = time.perf_counter()
     next_progress = started + 30.0
     encoded_frames = None
+    measured_frames = None
+    frame_timings = dict(frame_wait_seconds=0., frame_wait_thread_cpu_seconds=0.,
+                         frame_consume_seconds=0., frame_consume_thread_cpu_seconds=0.)
     typed_capture = (isinstance(slice_reader, _MaskedNativeScoreReader)
                      and slice_reader.compiled_capture_capable)
     capture_plan = slice_reader.capture_plan if typed_capture else None
@@ -228,7 +256,8 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
                 storage_seconds += elapsed
                 return elapsed
             frames = ((z, None) for z in range(first, stop)) if encoded_frames is None else encoded_frames
-            for z, encoded_result in frames:
+            measured_frames = _measured_frames(frames,frame_timings)
+            for z, encoded_result in measured_frames:
                 now = time.perf_counter()
                 if now >= next_progress:
                     print(f'Confidence write progress {model_name}/{layer_key}: '
@@ -366,8 +395,17 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
                     capture_max_pending_frames=capture_plan.max_pending_frames)
         return metadata
     finally:
+        if measured_frames is not None:
+            measured_frames.close()
+        if metrics is not None:
+            metrics.update(frame_timings)
         if encoded_frames is not None:
             encoded_frames.close()
+        # A retained failed Future owns this traceback. Do not let that frame
+        # keep completed numeric windows or borrowed reader aliases alive after
+        # every producer has been joined by close().
+        encoded_frames = measured_frames = frames = iterator = None
+        encoded_result = encoded_rows = slice_reader = None
         payload_tmp.unlink(missing_ok=True)
         index_tmp.unlink(missing_ok=True)
 

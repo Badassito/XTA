@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from typing import Mapping, Optional, Tuple
 
@@ -149,6 +150,12 @@ class CategoricalVolumeOwner:
         self.coverage_gpu: Optional[object] = None
         self.rejected_key: Optional[tuple] = None
         self.rejected_reason = ""
+        self._capacity_rejected_at: Optional[float] = None
+        self._capacity_retry_eligible = False
+        from .pta_cuda_azimuthal import AzimuthalTableCache
+        from .runtime import runtime_telemetry
+        self.azimuthal_tables = AzimuthalTableCache()
+        runtime_telemetry().register_sample_provider('pta.cuda.azimuthal_tables', self.azimuthal_tables.snapshot)
 
     def retire(self) -> None:
         """Fence this producer before dropping a former volume generation."""
@@ -156,11 +163,14 @@ class CategoricalVolumeOwner:
             had_sources = self.mask_gpu is not None or self.coverage_gpu is not None
             if had_sources:
                 self.stream.synchronize()
+            self.azimuthal_tables.clear()
             self.mask_gpu = None
             self.coverage_gpu = None
             self.key = None
             self.rejected_key = None
             self.rejected_reason = ""
+            self._capacity_rejected_at = None
+            self._capacity_retry_eligible = False
             if not had_sources:
                 return
             shell_module = sys.modules.get(f"{__package__}.pta_cuda_shells")
@@ -170,6 +180,23 @@ class CategoricalVolumeOwner:
             empty_cache = getattr(self.torch.cuda, "empty_cache", None)
             if callable(empty_cache):
                 empty_cache()
+
+    def arm_residency_retry(self) -> bool:
+        """Reconsider headroom only at a joined task boundary after five seconds.
+
+        This method never probes or flushes CUDA, changes live source owners,
+        or retries an allocator/transfer failure. The next ensure owns admission.
+        """
+        with self.lock:
+            if (not self._capacity_retry_eligible or self.rejected_key is None
+                    or self._capacity_rejected_at is None
+                    or time.monotonic() - self._capacity_rejected_at < 5.0):
+                return False
+            self.rejected_key = None
+            self.rejected_reason = ""
+            self._capacity_rejected_at = None
+            self._capacity_retry_eligible = False
+            return True
 
     def _key(self, mask: np.ndarray, coverage: Optional[np.ndarray], identity: str) -> tuple:
         return (
@@ -205,6 +232,8 @@ class CategoricalVolumeOwner:
                 return False
             if self.key is not None:
                 self.retire()
+            self._capacity_rejected_at = None
+            self._capacity_retry_eligible = False
 
             same_source = (
                 coverage is not None and _array_identity(coverage) == _array_identity(mask)
@@ -218,12 +247,21 @@ class CategoricalVolumeOwner:
             temporary_bytes = max(256 * 1024 ** 2, 4 * int(largest_output_bytes))
             free_bytes, _total_bytes = self.torch.cuda.mem_get_info(self.device_id)
             need_bytes = new_bytes + temporary_bytes + _reserve_bytes()
+            empty_cache = getattr(self.torch.cuda, "empty_cache", None)
+            if int(free_bytes) < need_bytes and callable(empty_cache):
+                # Returned source/cache blocks may still be reserved by the
+                # allocator. One recovery probe precedes this cached decision.
+                with self.torch.cuda.device(self.device_id):
+                    empty_cache()
+                    free_bytes, _total_bytes = self.torch.cuda.mem_get_info(self.device_id)
             if int(free_bytes) < need_bytes:
                 self.rejected_key = key
                 self.rejected_reason = (
                     f"need {need_bytes / _GIB:.1f} GiB including reserve, "
                     f"free {int(free_bytes) / _GIB:.1f} GiB"
                 )
+                self._capacity_rejected_at = time.monotonic()
+                self._capacity_retry_eligible = True
                 print(
                     f"PTA CUDA categorical projection cuda:{self.device_id}: "
                     f"source not resident ({self.rejected_reason}); CPU categorical fallback.",
@@ -248,6 +286,8 @@ class CategoricalVolumeOwner:
                 except torch.cuda.OutOfMemoryError:
                     self.rejected_key = key
                     self.rejected_reason = "CUDA allocator rejected source allocation"
+                    self._capacity_rejected_at = None
+                    self._capacity_retry_eligible = False
                     print(
                         f"PTA CUDA categorical projection cuda:{self.device_id}: "
                         f"{self.rejected_reason}; CPU categorical fallback.",
@@ -268,6 +308,8 @@ class CategoricalVolumeOwner:
             self.key = key
             self.rejected_key = None
             self.rejected_reason = ""
+            self._capacity_rejected_at = None
+            self._capacity_retry_eligible = False
             print(
                 f"PTA CUDA categorical projection cuda:{self.device_id}: "
                 f"foreground{'+coverage' if coverage is not None else ''} resident "
@@ -291,6 +333,11 @@ def _owner_for_runtime(runtime: Mapping[str, object]) -> CategoricalVolumeOwner:
         if stream is None:
             stream = torch.cuda.Stream(device=device_id)
         owner = CategoricalVolumeOwner(torch, device_id, stream)
+        from .pta_cuda_shells import shell_direction_cache_stats
+        from .runtime import runtime_telemetry
+        runtime_telemetry().register_sample_provider(
+            'pta.cuda.spherical_directions', lambda: shell_direction_cache_stats(renderer),
+        )
         runtime["categorical_volume_owner"] = owner
         # multiprocessing fork workers terminate through multiprocessing's
         # finalizer registry.  Run after the publication drain (priority 15),
@@ -375,6 +422,7 @@ def render_gpu_categorical_item(
                     owner.mask_gpu, owner.coverage_gpu, view, int(frame_idx),
                     M_grid_to_src=grid.inverse, M_src_to_out=grid.forward,
                     out_h=grid.height, out_w=grid.width, stream=owner.stream,
+                    table_cache=owner.azimuthal_tables,
                 )
             else:
                 from .pta_cuda_shells import render_shell_categorical_pair
@@ -383,6 +431,7 @@ def render_gpu_categorical_item(
                     owner.mask_gpu, owner.coverage_gpu, view, int(frame_idx),
                     M_grid_to_src=grid.inverse, M_src_to_out=grid.forward,
                     out_h=grid.height, out_w=grid.width, stream=owner.stream,
+                    direction_renderer=runtime.get("azimuthal_renderer"),
                 )
             if pair is None or pair[0] is None:
                 raise RuntimeError(

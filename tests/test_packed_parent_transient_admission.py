@@ -53,11 +53,13 @@ def view():
 
 def test_packed_charge_covers_full_initial_packed_overlap_and_capture_scratch(production):
     helper, _ = production
+    from XTA.packed_dense_source import DENSE_PACKED_PAYLOAD_BYTES, DENSE_PACKED_CONTROL_BYTES
     native, output = shapes()
     kwargs = arguments()
     amount = helper(view(), math.prod(native), math.prod(output), **kwargs)
     packed = native[0]*native[1]*((native[2]+7)//8)
-    assert amount >= 2*GIB + packed + (64+256)*MIB
+    assert amount >= (2*GIB + packed + (64+256)*MIB
+                      + DENSE_PACKED_PAYLOAD_BYTES + DENSE_PACKED_CONTROL_BYTES)
     assert amount < math.prod(output) + 4*GIB
     assert helper(view(), math.prod(native), math.prod(output),
         confidence_workspace_bytes=256*MIB, **kwargs) == amount + 256*MIB

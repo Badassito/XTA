@@ -268,7 +268,8 @@ def test_packed_parent_optout_and_nonterminal_paths_remain_dense(monkeypatch, se
 
 @pytest.mark.parametrize('spill', [False, True])
 def test_packed_memfd_counts_actual_bytes_and_spills_between_callbacks(tmp_path, monkeypatch, spill):
-    from XTA import interpolation, publication_memory
+    from XTA import interpolation, publication_memory, packed_dense_source
+    monkeypatch.setattr(packed_dense_source, 'MAX_DENSE_PACKED_BLOCK_SLICES', 1)
     data = np.ones((4, 8, 17), np.uint8)
     writers = []
     registered = []
@@ -285,6 +286,10 @@ def test_packed_memfd_counts_actual_bytes_and_spills_between_callbacks(tmp_path,
             assert block.shape == (1, 8, 17)
             self.consumed.append(z)
             self._next_offset += 8 * 3
+        def consume_encoded_block(self, first, records, payload, *, packed):
+            assert packed and len(records) == 1 and payload.size == 8 * 3
+            self.consumed.append(first)
+            self._next_offset += payload.size
         def spill_payload_to_disk(self):
             self.spilled_after = len(self.consumed)
             self._ram_payload = False
@@ -307,6 +312,80 @@ def test_packed_memfd_counts_actual_bytes_and_spills_between_callbacks(tmp_path,
     else:
         assert writers[0].spilled_after is None and not released
         assert stats['resident_bytes'] == 192 + 96
+
+
+def test_source_pack_slot_allocation_failure_releases_registered_memfd(tmp_path, monkeypatch):
+    from XTA import publication_memory, packed_dense_source
+    volume = np.ones((4, 8, 17), np.uint8)
+    path = tmp_path/'source.cvol'
+    registered, released = [], []
+    monkeypatch.setattr(runtime, 'memfd_workspace_enabled', lambda: True)
+    monkeypatch.setattr(runtime, '_register_memfd_owner', lambda *args: registered.append(args))
+    monkeypatch.setattr(runtime, 'release_memfd_owners_under', lambda value: released.append(value))
+    monkeypatch.setattr(encoded.os, 'memfd_create', lambda *args, **kwargs: 981, raising=False)
+    monkeypatch.setattr(publication_memory, 'publication_ram_headroom', lambda: 2 * 1024**3)
+    real_empty = np.empty
+    failure = MemoryError('injected bounded payload allocation failure')
+    def allocate(shape, *args, **kwargs):
+        if shape == 4 * 8 * 3:
+            raise failure
+        return real_empty(shape, *args, **kwargs)
+    monkeypatch.setattr(encoded.np, 'empty', allocate)
+    with pytest.raises(MemoryError) as caught:
+        encoded.pack_terminal_native_source(volume, path, desc='allocation cleanup')
+    assert caught.value is failure
+    assert registered and released == [path.absolute()]
+    assert not path.exists()
+
+
+def test_source_pack_separates_probe_progress_setup_and_finalize_timing(tmp_path, monkeypatch):
+    from XTA import interpolation, publication_memory, packed_dense_source
+    clock, records = [0.], []
+    monkeypatch.setattr(encoded, 'time', SimpleNamespace(
+        perf_counter=lambda: clock[0], monotonic=lambda: clock[0]))
+    def headroom():
+        clock[0] += 2.
+        return 2 * 1024**3
+    monkeypatch.setattr(publication_memory, 'publication_ram_headroom', headroom)
+    monkeypatch.setattr(runtime, 'memfd_workspace_enabled', lambda: True)
+    monkeypatch.setattr(runtime, '_register_memfd_owner', lambda *args: None)
+    monkeypatch.setattr(encoded.os, 'memfd_create', lambda *args, **kwargs: 981, raising=False)
+    class Telemetry:
+        def gauge(self, key, value):
+            records.append(value)
+            clock[0] += 13.
+        def set_scheduler_gauge(self, key, value):
+            records.append(value)
+    monkeypatch.setattr(runtime, 'runtime_telemetry', lambda: Telemetry())
+    class Writer:
+        _ram_payload = True
+        def __init__(self, **kwargs):
+            clock[0] += 3.
+        def consume_encoded_block(self, first, crops, payload, *, packed):
+            assert first == 0 and len(crops) == 4 and payload.size == 96 and packed
+            clock[0] += 11.
+        def finalize(self):
+            clock[0] += 5.
+            return dict(index_bytes=192, raw_payload_bytes=96, payload_backing='planned_memfd')
+    monkeypatch.setattr(interpolation, 'IncrementalRawBBoxMaskStoreWriter', Writer)
+    def encode(volume, first, count, *, payload_buffer):
+        clock[0] += 7.
+        return (None,) * count, payload_buffer
+    monkeypatch.setattr(packed_dense_source, 'encode_dense_u8_packed_block', encode)
+    stats = encoded.pack_terminal_native_source(np.ones((4, 8, 17), np.uint8),
+        tmp_path/'source.cvol', desc='phase timing')
+    assert stats['packing_ram_probe_seconds'] == 4.
+    assert stats['packing_ram_probe_calls'] == 2
+    assert stats['packing_progress_seconds'] == 39.
+    assert stats['packing_progress_calls'] == 3
+    assert stats['packing_setup_seconds'] == 3.
+    assert stats['packing_finalize_seconds'] == 5.
+    assert stats['packing_encode_seconds'] == 7.
+    assert stats['packing_writer_seconds'] == 11.
+    assert stats['packing_elapsed_seconds'] == 69.
+    assert records[-1]['ram_probe_seconds'] == 4.
+    assert records[-1]['progress_seconds'] == 39.  # Includes the final ordinary gauge.
+    assert records[-1]['setup_seconds'] == 3. and records[-1]['finalize_seconds'] == 5.
 
 
 @pytest.mark.parametrize('mask_first', [False, True])

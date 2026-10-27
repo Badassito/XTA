@@ -333,11 +333,16 @@ def main(argv=None):
                 save_semantic=True, png_compression=1, jpeg_quality=100,
                 jpeg_encode_backend="opencv",
             )
+            workers._wait_for_gpu_work_ready(runtime, (publication_item,))
+            source_mask_nonempty = workers._gpu_source_mask_nonempty(
+                runtime, (publication_item,), include_coverage=True,
+            )
             published, flips = workers._publish_gpu_policy_batch(
                 runtime=runtime,
                 batch_images=publication_item.image.unsqueeze(0).unsqueeze(0),
                 batch_masks=publication_item.mask.unsqueeze(0),
                 semantic_coverage_masks=publication_item.semantic_coverage.unsqueeze(0),
+                source_mask_nonempty=source_mask_nonempty,
                 candidates=(publication_candidate,),
                 output_size=publication_item.output_size,
                 channel_kind="gray", channel_count=1,

@@ -186,6 +186,7 @@ class SemanticPublicationTests(unittest.TestCase):
                     batch_masks=GpuMaskTensor(torch, foreground),
                     semantic_coverage_masks=GpuMaskTensor(torch, coverage),
                     candidates=[candidate], output_size=(2, 2), channel_kind="gray",
+                    source_mask_nonempty=(True,),
                     local_warnings=pta_workers.WarningLog(), publication=publisher,
                 )
             self.assertEqual((written, flips), (1, {}))

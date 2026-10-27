@@ -42,6 +42,7 @@ from .workspace import (
 from .runtime import (
     choose_slice_parallel_workers,
     parallel_for_indices,
+    runtime_telemetry,
 )
 from .geometry import (
     AffineSpec,
@@ -97,6 +98,72 @@ from .spherical_cuda import clear_spherical_render_cache, render_spherical_nativ
 
 if TYPE_CHECKING:
     from .backprojection import _ResidentTensorRTRingFatalError
+
+
+_AZIMUTHAL_LINEAR_NATIVE_KERNEL = None
+
+
+def _azimuthal_linear_native_kernel():
+    """Fuse the reference four plane taps without a second texture-volume copy."""
+    global _AZIMUTHAL_LINEAR_NATIVE_KERNEL
+    if _AZIMUTHAL_LINEAR_NATIVE_KERNEL is None:
+        import cupy as cp
+
+        source = r'''
+        __device__ float logical_voxel(
+            const unsigned char* source, int t, int y, int x,
+            int native_t, int logical_t, int height, int width,
+            const long long* lower, const long long* upper, const float* alpha) {
+          long long spatial = (long long)y * width + x;
+          long long stride = (long long)height * width;
+          if (native_t == logical_t) return (float)source[(long long)t * stride + spatial];
+          float a = (float)source[lower[t] * stride + spatial];
+          float b = (float)source[upper[t] * stride + spatial];
+          return fminf(255.0f, fmaxf(0.0f, nearbyintf(a + alpha[t] * (b - a))));
+        }
+        extern "C" __global__ void azimuthal_linear_native(
+            const unsigned char* source, const long long* taps, const float* weights,
+            const float* row_centers, const long long* lower, const long long* upper,
+            const float* native_alpha, int native_t, int logical_t, int height, int width,
+            int rows, int columns, int plane_width, int stack_length, int base, int horizontal,
+            float tangent, float center_x, float center_y, float* output) {
+          int col = blockIdx.x * blockDim.x + threadIdx.x;
+          int row = blockIdx.y * blockDim.y + threadIdx.y;
+          if (col >= columns || row >= rows) return;
+          float values[4];
+          #pragma unroll
+          for (int tap = 0; tap < 4; ++tap) {
+            long long flat = taps[col * 4 + tap];
+            int py = (int)(flat / plane_width), px = (int)(flat % plane_width);
+            float offset = horizontal ? (float)px - center_x : (float)py - center_y;
+            float stack = row_centers[row] + tangent * offset;
+            float value = 0.0f;
+            if (stack >= 0.0f && stack <= (float)(stack_length - 1)) {
+              int s0 = max(0, min(stack_length - 1, (int)floorf(stack)));
+              int s1 = min(stack_length - 1, s0 + 1);
+              float blend = stack - (float)s0;
+              float a, b;
+              if (base == 0) {
+                a = logical_voxel(source, s0, py, px, native_t, logical_t, height, width, lower, upper, native_alpha);
+                b = logical_voxel(source, s1, py, px, native_t, logical_t, height, width, lower, upper, native_alpha);
+              } else if (base == 1) {
+                a = logical_voxel(source, py, s0, px, native_t, logical_t, height, width, lower, upper, native_alpha);
+                b = logical_voxel(source, py, s1, px, native_t, logical_t, height, width, lower, upper, native_alpha);
+              } else {
+                a = logical_voxel(source, py, px, s0, native_t, logical_t, height, width, lower, upper, native_alpha);
+                b = logical_voxel(source, py, px, s1, native_t, logical_t, height, width, lower, upper, native_alpha);
+              }
+              value = a + blend * (b - a);
+            }
+            values[tap] = value * weights[col * 4 + tap];
+          }
+          output[row * columns + col] = ((values[0] + values[1]) + values[2]) + values[3];
+        }
+        '''
+        kernel = cp.RawKernel(source, 'azimuthal_linear_native', options=('--fmad=false',))
+        kernel.compile()
+        _AZIMUTHAL_LINEAR_NATIVE_KERNEL = argparse.Namespace(cp=cp, kernel=kernel)
+    return _AZIMUTHAL_LINEAR_NATIVE_KERNEL
 
 def open_existing_gray_memmap(path: object, shape: Sequence[int], dtype: object = np.uint8, mode: str = 'r') -> np.memmap:
     return np.memmap(Path(path), dtype=np.dtype(dtype), mode=str(mode), shape=tuple(int(x) for x in shape))
@@ -1499,6 +1566,7 @@ class _GpuWorkerRenderEngine:
         # _volume_gpu keeps NATIVE t while _logical_t is the
         # approximately-cubic working t seen by ViewInfo/render coordinates.
         self._logical_t = 0
+        self._pta_native_t_exact = False
         self._radial_source_t = None  # Original native T and pointer origin for SAM-only slabs.
         self._native_t_map_cache: Dict[Tuple[int, int], Tuple[object, object, object]] = {}
         self._mode = 'unresolved'
@@ -1525,10 +1593,14 @@ class _GpuWorkerRenderEngine:
         self._resident_runtime_disabled = False
         # Native planes reused within one angle-local tile source across batches and
         # contextual channel indices; no cross-tile canvas is retained.
-        self._native_plane_cache: 'OrderedDict[Tuple[str, int], object]' = OrderedDict()
-        self._native_u8_plane_cache: 'OrderedDict[Tuple[str, int], object]' = OrderedDict()
+        self._native_plane_cache: 'OrderedDict[tuple, object]' = OrderedDict()
+        self._native_u8_plane_cache: 'OrderedDict[tuple, object]' = OrderedDict()
         self._tilted_plan_cache_floor = 0
         self._inference_assets_released = False
+        self._array_capacity_rejected = False
+        self._array_capacity_rejected_at: Optional[float] = None
+        self._array_capacity_retry_armed = False
+        self._array_source_fence_error: Optional[BaseException] = None
 
     # volume residency ----
 
@@ -1570,6 +1642,7 @@ class _GpuWorkerRenderEngine:
         self._volume_gpu = None
         self._volume_flat = None
         self._logical_t = int(out_t)
+        self._pta_native_t_exact = False
         self._radial_source_t = None
         self._native_t_map_cache.clear()
         self._native_plane_cache.clear()
@@ -1654,11 +1727,86 @@ class _GpuWorkerRenderEngine:
             )
         return self._mode
 
+    def _clear_volume_array_sources(self) -> None:
+        """Drop source owners only after the caller has fenced their producers."""
+        texture = getattr(self, '_azimuthal_texture_ref', None)
+        if texture is not None:
+            for name in ('texture', 'descriptor', 'resource', 'cuda_array', 'source_ref', 'channel'):
+                setattr(texture, name, None)
+        self._volume_key = None
+        self._volume_mm = None
+        self._volume_gpu = None
+        self._volume_flat = None
+        self._logical_t = 0
+        self._pta_native_t_exact = False
+        self._radial_source_t = None
+        for name in ('_native_t_map_cache', '_native_plane_cache', '_native_u8_plane_cache',
+                     '_fold_cache', '_tilted_plans', '_fused_azimuthal_taps',
+                     '_fused_disabled_families', '_fused_graph_rejected_keys',
+                     '_fused_validated_keys', '_fused_preflight_validated_families'):
+            getattr(self, name).clear()
+        clear_spherical_render_cache(self)
+        self._fused_volume_ref = None
+        self._azimuthal_texture_ref = None
+        self._azimuthal_texture_admitted = None
+        self._fused_preflight_volume_key = None
+        self._mode = 'unresolved'
+        self._source_residency_timings = {}
+        self._array_capacity_rejected = False
+        self._array_capacity_rejected_at = None
+        self._array_capacity_retry_armed = False
+
+    def _check_volume_array_health(self) -> None:
+        error = getattr(self, '_array_source_fence_error', None)
+        if error is not None:
+            raise RuntimeError(f'GPU array source fence failed ({error}); renderer is quarantined') from error
+
+    def _fence_volume_array_sources(self, *, device_wide: bool = False) -> None:
+        self._check_volume_array_health()
+        try:
+            if device_wide:
+                self.torch.cuda.synchronize(self.device)
+            else:
+                self._stream.synchronize()
+        except BaseException as error:
+            self._array_source_fence_error = error
+            raise RuntimeError(f'GPU array source fence failed ({error}); renderer is quarantined') from error
+
+    def retire_volume_array(self) -> None:
+        """Retire a source at a joined PTA task boundary, keeping this engine reusable.
+
+        The caller must finish consumers on other streams first. A failed render
+        fence leaves every source owner intact. Permanent disable/terminal flags
+        are preserved; this is not recovery from a CUDA execution failure.
+        """
+        self._fence_volume_array_sources()
+        self._clear_volume_array_sources()
+
+    def arm_residency_retry(self) -> bool:
+        """Permit one capacity retry at a joined task boundary, at most once per 5s.
+
+        This performs no device work. Ordinary item-level ensure calls never arm
+        themselves, and upload/runtime failures are not capacity rejections.
+        """
+        self._check_volume_array_health()
+        failed_at = getattr(self, '_array_capacity_rejected_at', None)
+        if (bool(getattr(self, '_inference_assets_released', False))
+                or self._resident_runtime_disabled
+                or not gpu_worker_render_resident_enabled()
+                or self._mode != 'stream' or self._volume_key is None
+                or not getattr(self, '_array_capacity_rejected', False)
+                or getattr(self, '_array_capacity_retry_armed', False)
+                or failed_at is None or time.monotonic() - failed_at < 5.0):
+            return False
+        self._array_capacity_retry_armed = True
+        return True
+
     def ensure_volume_array(
         self,
         volume: np.ndarray,
         *,
         identity: Optional[str] = None,
+        resize_to_t: Optional[int] = None,
         require_azimuthal_texture: bool = False,
     ) -> str:
         """Admit an already-materialized uint8 cube to the resident renderer.
@@ -1671,6 +1819,7 @@ class _GpuWorkerRenderEngine:
         while uploading directly from the caller-owned array.
         """
 
+        self._check_volume_array_health()
         if bool(getattr(self, '_inference_assets_released', False)):
             raise RuntimeError('GPU renderer was retired after inference drain')
         torch = self.torch
@@ -1685,16 +1834,23 @@ class _GpuWorkerRenderEngine:
         shape_t = tuple(int(value) for value in source.shape)
         if min(shape_t) <= 0:
             raise ValueError(f"GPU render source array has invalid shape {shape_t}")
+        logical_t = int(resize_to_t) if resize_to_t is not None else int(shape_t[0])
+        if logical_t <= 0:
+            raise ValueError('GPU render logical depth must be positive')
         data_ptr = int(source.__array_interface__["data"][0])
         source_identity = str(identity or f"array:{data_ptr}")
-        key = (source_identity, shape_t, int(shape_t[0]))
-        if self._volume_key == key and self._mode != "unresolved":
+        key = (source_identity, shape_t, logical_t)
+        capacity_retry = bool(
+            self._volume_key == key and self._mode == 'stream'
+            and getattr(self, '_array_capacity_rejected', False)
+            and getattr(self, '_array_capacity_retry_armed', False)
+            and not self._resident_runtime_disabled and gpu_worker_render_resident_enabled())
+        if self._volume_key == key and self._mode != "unresolved" and not capacity_retry:
             return self._mode
-        if self._volume_key is not None and self._volume_key != key:
-            try:
-                self._stream.synchronize()
-            except Exception:
-                pass
+        if self._volume_key is not None:
+            self.retire_volume_array()
+        else:
+            self._clear_volume_array_sources()
 
         self._volume_key = key
         # PTA retains the shared-memory array in its generation cache. The
@@ -1702,26 +1858,11 @@ class _GpuWorkerRenderEngine:
         # another exported buffer would prevent the worker from closing an old
         # shared-memory generation after a successful resident upload.
         self._volume_mm = None
-        self._volume_gpu = None
-        self._volume_flat = None
-        self._logical_t = int(shape_t[0])
-        self._radial_source_t = None
-        self._native_t_map_cache.clear()
-        self._native_plane_cache.clear()
-        self._native_u8_plane_cache.clear()
-        clear_spherical_render_cache(self)
-        self._fold_cache.clear()
-        self._tilted_plans.clear()
-        self._fused_azimuthal_taps.clear()
-        self._fused_volume_ref = None
-        self._azimuthal_texture_ref = None
-        self._azimuthal_texture_admitted = None
-        self._fused_disabled_families.clear()
-        self._fused_graph_rejected_keys.clear()
-        self._fused_validated_keys.clear()
-        self._fused_preflight_validated_families.clear()
-        self._fused_preflight_volume_key = None
+        self._logical_t = logical_t
+        self._pta_native_t_exact = logical_t != int(shape_t[0])
+        self._pta_native_azimuthal_announced = False
         self._mode = "stream"
+        self._source_residency_timings = {'admission_capacity_retry': capacity_retry}
 
         nbytes = int(source.nbytes)
         if gpu_worker_render_resident_enabled() and not self._resident_runtime_disabled:
@@ -1731,6 +1872,7 @@ class _GpuWorkerRenderEngine:
                     nbytes
                     if (
                         bool(require_azimuthal_texture)
+                        and not self._pta_native_t_exact
                         and azimuthal_source_mode() == "texture_linear"
                         and azimuthal_texture_source_copy_reserve_enabled()
                     )
@@ -1738,10 +1880,40 @@ class _GpuWorkerRenderEngine:
                 )
                 resident_need = nbytes + gpu_render_reserve_bytes()
                 preferred_need = resident_need + texture_copy_bytes
+                timings = self._source_residency_timings
+                timings.update(admission_free_bytes_before=int(free_bytes),
+                               admission_required_bytes=int(resident_need),
+                               admission_preferred_bytes=int(preferred_need),
+                               admission_reclaim_attempted=False)
+                def allocator_snapshot(suffix):
+                    for field in ('allocated', 'reserved'):
+                        probe = getattr(torch.cuda, 'memory_' + field, None)
+                        if callable(probe):
+                            try:
+                                timings['admission_' + field + '_bytes_' + suffix] = int(probe(self.device))
+                            except Exception:
+                                pass  # Diagnostics must not decide residency.
+                allocator_snapshot('before')
+                if int(free_bytes) < int(resident_need):
+                    # Old source references are gone. Release only unused blocks
+                    # on this device, then measure real capacity once more. Do
+                    # not count reserved bytes as though they were all reusable.
+                    started = time.monotonic()
+                    timings['admission_reclaim_attempted'] = True
+                    with torch.cuda.device(self.device):
+                        torch.cuda.empty_cache()
+                        free_bytes, _total_bytes = torch.cuda.mem_get_info(self.device)
+                    timings['admission_reclaim_seconds'] = time.monotonic() - started
+                    allocator_snapshot('after')
+                timings['admission_free_bytes_after'] = int(free_bytes)
                 if int(free_bytes) >= int(resident_need):
                     started = time.monotonic()
                     resident = torch.empty(shape_t, dtype=torch.uint8, device=self.device)
-                    self._source_residency_timings = {'allocation_host_seconds': time.monotonic()-started}
+                    # Own the destination before any transfer can be submitted.
+                    # An uncertain fence must keep this allocation quarantined.
+                    self._volume_gpu = resident
+                    self._volume_flat = resident.view(-1)
+                    self._source_residency_timings['allocation_host_seconds'] = time.monotonic()-started
                     started = time.monotonic()
                     chunk_slices = max(
                         1,
@@ -1754,13 +1926,10 @@ class _GpuWorkerRenderEngine:
                             non_blocking=False,
                         )
                     self._source_residency_timings['upload_host_seconds'] = time.monotonic()-started
-                    self._volume_gpu = resident
-                    self._volume_flat = resident.view(-1)
-                    self._native_t_indices(int(shape_t[0]))
+                    self._native_t_indices(logical_t)
                     self._mode = "resident"
                     self._azimuthal_texture_admitted = bool(
-                        int(free_bytes) >= int(preferred_need)
-                    )
+                        not self._pta_native_t_exact and int(free_bytes) >= int(preferred_need))
                     if int(free_bytes) < int(preferred_need):
                         print(
                             "PTA GPU view render: cube admitted without the optional "
@@ -1769,6 +1938,8 @@ class _GpuWorkerRenderEngine:
                             "Torch projector remains active."
                         )
                 else:
+                    self._array_capacity_rejected = True
+                    self._array_capacity_rejected_at = time.monotonic()
                     print(
                         "PTA GPU view render: processing cube not resident "
                         f"({nbytes / GIB:.1f} GiB cube + {texture_copy_bytes / GIB:.1f} GiB "
@@ -1777,9 +1948,21 @@ class _GpuWorkerRenderEngine:
                         f"{int(free_bytes) / GIB:.1f} GiB free); using the CPU renderer."
                     )
             except Exception as exc:
-                self._volume_gpu = None
-                self._volume_flat = None
+                if self._volume_gpu is not None or self._volume_flat is not None:
+                    # No CPU fallback may release a partially uploaded source
+                    # until every source operation has finished. Uploads/tap
+                    # setup use the caller's current stream, so this rare error
+                    # path must fence the device, not only the render stream.
+                    # Failure propagates with engine-owned tensors still intact.
+                    self._fence_volume_array_sources(device_wide=True)
+                    failed_timings = self._source_residency_timings
+                    self._clear_volume_array_sources()
+                    self._volume_key = key
+                    self._logical_t = logical_t
+                    self._pta_native_t_exact = logical_t != int(shape_t[0])
+                    self._source_residency_timings = failed_timings
                 self._mode = "stream"
+                self._source_residency_timings['admission_failure'] = type(exc).__name__
                 print(
                     "PTA GPU view render: resident upload failed "
                     f"({type(exc).__name__}: {exc}); using the CPU renderer."
@@ -1789,6 +1972,11 @@ class _GpuWorkerRenderEngine:
                 f"PTA GPU view render: processing cube resident on {self.device} "
                 f"({nbytes / GIB:.1f} GiB); TTA CUDA projection kernels active."
             )
+            if logical_t != int(shape_t[0]):
+                print(f'PTA native-T intensity active: {shape_t[0]}->{logical_t} virtual gray8 depth; '
+                      f'saved {(logical_t-int(shape_t[0]))*shape_t[1]*shape_t[2]/GIB:.3f} GiB per GPU.', flush=True)
+                print('PTA native-T Azimuthal uses the reference-linear pointer sampler: '
+                      'hardware texture would skip virtual-gray8 voxel rounding.', flush=True)
         return self._mode
 
     def release_inference_assets(self) -> Dict[str, object]:
@@ -3016,6 +3204,15 @@ class _GpuWorkerRenderEngine:
         """Render a Azimuthal native plane, preferring the direct hardware texture kernel."""
         if not azimuthal_resident_gpu_render_supported(view):
             raise RuntimeError(f'resident GPU Azimuthal rendering is disabled for {view.name!r}')
+        if bool(getattr(self, '_pta_native_t_exact', False)):
+            output = self._render_tilted_azimuthal_native_linear_resident(view, int(frame_idx))
+            if not bool(getattr(self, '_pta_native_azimuthal_announced', False)):
+                self._pta_native_azimuthal_announced = True
+                runtime_telemetry().gauge('render.azimuthal.native_backend', {
+                    'backend': 'reference_linear_pointer',
+                    'reason': 'native_t_requires_virtual_gray8_rounding',
+                })
+            return output
         if is_tilted_azimuthal_view(view):
             return self._render_tilted_azimuthal_native_resident(view, int(frame_idx))
         if (
@@ -3425,6 +3622,50 @@ class _GpuWorkerRenderEngine:
             )
         return out
 
+    def _render_tilted_azimuthal_native_linear_resident(self, view: ViewInfo, frame_idx: int) -> object:
+        """Retain Torch per-tap shear/gray8 virtual-T semantics in one CUDA launch."""
+        if not is_azimuthal_view(view):
+            raise ValueError('linear native fallback requires Azimuthal geometry')
+        volume, torch = self._volume_gpu, self.torch
+        if not bool(getattr(volume, 'is_cuda', False)) or volume.dtype != torch.uint8:
+            raise ValueError('linear native fallback requires resident CUDA uint8')
+        kernels = _azimuthal_linear_native_kernel()
+        base = {'transverse': 0, 'sagittal': 1, 'coronal': 2}[str(azimuthal_base_view_name(view))]
+        tilted = is_tilted_azimuthal_view(view)
+        direction = str(view.tilt_direction) if tilted else 'vertical'
+        if direction not in ('vertical', 'horizontal'):
+            raise ValueError('unsupported tilted Azimuthal direction')
+        rows, columns = int(view.src_h), int(view.src_w)
+        stack_length = int(azimuthal_stack_length(view))
+        taps, weights = self._azimuthal_taps_gpu(view, float(view.azimuths_deg[int(frame_idx)]))
+        centers = torch.arange(rows, dtype=torch.float32, device=self.device)
+        if rows != stack_length:
+            centers = ((centers + 0.5) * (float(stack_length) / float(rows)) - 0.5).clamp_(
+                0.0, float(max(0, stack_length - 1)))
+        owners = [taps, weights, centers]
+        virtual_t = int(volume.shape[0]) != int(self._logical_t)
+        if virtual_t:
+            owners.extend(self._native_t_indices())
+        output = torch.empty((rows, columns), dtype=torch.float32, device=self.device)
+        cp = kernels.cp
+        null = np.uint64(0)
+        lower, upper, alpha = (tuple(cp.asarray(x) for x in owners[-3:])
+                               if virtual_t else (null, null, null))
+        for tensor in (*owners, volume, output):
+            tensor.record_stream(self._stream)
+        kernels.kernel(
+            ((columns + 31) // 32, (rows + 7) // 8), (32, 8),
+            (self._fused_cupy_volume(kernels), cp.asarray(taps), cp.asarray(weights),
+             cp.asarray(centers), lower, upper, alpha,
+             *(np.int32(x) for x in (volume.shape[0], self._logical_t, volume.shape[1], volume.shape[2],
+                                    rows, columns, azimuthal_plane_shape(view)[1], stack_length,
+                                    base, direction == 'horizontal')),
+             np.float32(math.tan(math.radians(float(view.tilt_angle_deg))) if tilted else 0.0),
+             np.float32(view.center_x), np.float32(view.center_y), cp.asarray(output)),
+            stream=_cupy_external_stream(cp, self._stream),
+        )
+        return output
+
     def _render_tilted_azimuthal_native_resident(self, view: ViewInfo, frame_idx: int) -> object:
         """Render a tilted-Azimuthal plane through the texture kernel, with Torch fallback."""
         if not is_tilted_azimuthal_view(view):
@@ -3435,14 +3676,41 @@ class _GpuWorkerRenderEngine:
         )
         if native_kernel_enabled:
             try:
-                return self._render_azimuthal_native_texture(view, int(frame_idx))
+                output = self._render_azimuthal_native_texture(view, int(frame_idx))
             except Exception as exc:
                 if 'tilted_azimuthal_native' not in self._fused_warned_families:
                     self._fused_warned_families.add('tilted_azimuthal_native')
+                    runtime_telemetry().fallback('render.tilted_azimuthal.texture', exc)
                     print(
                         f'Warning: tilted-Azimuthal texture kernel unavailable ({exc}); '
-                        'using the resident Torch reconstruction path without requesting the host cube.'
+                        'trying the resident linear pointer kernel without a texture copy.'
                     )
+            else:
+                if getattr(self, '_tilted_azimuthal_native_backend', None) != 'texture':
+                    self._tilted_azimuthal_native_backend = 'texture'
+                    runtime_telemetry().gauge('render.tilted_azimuthal.native_backend', 'texture')
+                return output
+        if (_env_flag('YOLO_TTA_GPU_TILTED_AZIMUTHAL_NATIVE_KERNEL', True)
+                and not bool(getattr(self, '_azimuthal_linear_native_disabled', False))
+                and bool(getattr(self._volume_gpu, 'is_cuda', False))):
+            try:
+                output = self._render_tilted_azimuthal_native_linear_resident(view, int(frame_idx))
+            except Exception as exc:
+                self._azimuthal_linear_native_disabled = True
+                runtime_telemetry().fallback('render.tilted_azimuthal.linear_pointer', exc)
+                print(f'Warning: tilted-Azimuthal linear pointer kernel unavailable ({exc}); '
+                      'using the resident Torch reconstruction path.', flush=True)
+            else:
+                if not bool(getattr(self, '_azimuthal_linear_native_announced', False)):
+                    self._azimuthal_linear_native_announced = True
+                    self._tilted_azimuthal_native_backend = 'reference_linear_pointer'
+                    runtime_telemetry().gauge('render.tilted_azimuthal.native_backend', 'reference_linear_pointer')
+                    print('Tilted-Azimuthal reference-linear pointer kernel active; '
+                          'native gray8 quantization and per-tap shear retained.', flush=True)
+                return output
+        if getattr(self, '_tilted_azimuthal_native_backend', None) != 'torch':
+            self._tilted_azimuthal_native_backend = 'torch'
+            runtime_telemetry().gauge('render.tilted_azimuthal.native_backend', 'torch')
         return self._render_tilted_azimuthal_native_resident_torch(view, int(frame_idx))
 
 
@@ -3783,13 +4051,9 @@ class _GpuWorkerRenderEngine:
         """LRU depth for native planes reused inside one angle-local tile source."""
         return max(2, _env_int('YOLO_TTA_GPU_NATIVE_PLANE_CACHE', 8))
 
-    def _render_native_plane_cached(self, view: ViewInfo, frame_idx: int) -> object:
-        """Cache native planes for repeated reads inside one tile's inference stream.
-
- Batches and 2.5D channel formats can request the same center or neighbouring plane more
- than once. This bounded cache serves those reads without introducing cross-tile union or
- per-tile crop state. Full-frame rendering keeps its existing allocation behavior."""
-        key = (str(view.name), int(frame_idx))
+    def _native_plane_cache_key(self, view: ViewInfo, frame_idx: int) -> tuple:
+        key = (str(view.name), int(frame_idx),
+               int(getattr(view, 'src_h', 0)), int(getattr(view, 'src_w', 0)))
         if is_spherical_view(view):
             volume = self._volume_gpu
             native = bool(volume is not None and bool(getattr(volume, 'is_cuda', False))
@@ -3800,12 +4064,35 @@ class _GpuWorkerRenderEngine:
                         and spherical_fp32_shape_eligible((volume.shape[0], self._logical_t,
                                                            volume.shape[1], volume.shape[2])))
             key += ('fp32_virtual_gray8' if fp32 else ('reference_fp64' if native else 'reference_torch'),)
+        return key
+
+    def _render_native_plane_cached(self, view: ViewInfo, frame_idx: int) -> object:
+        """Cache native planes for repeated full-frame, tile and channel reads."""
+        key = self._native_plane_cache_key(view, frame_idx)
         cache = self._native_plane_cache
         plane = cache.get(key)
         if plane is not None:
             cache.move_to_end(key)
             return plane
         plane = self._render_native_plane(view, int(frame_idx))
+        cache[key] = plane
+        cache.move_to_end(key)
+        while len(cache) > self._native_plane_cache_entries():
+            cache.popitem(last=False)
+        return plane
+
+    def _render_native_u8_plane_cached(self, view: ViewInfo, frame_idx: int) -> object:
+        """Quantize each curved native plane once before PTA's item affines."""
+        key = self._native_plane_cache_key(view, frame_idx)
+        cache = self._native_u8_plane_cache
+        plane = cache.get(key)
+        if plane is not None:
+            cache.move_to_end(key)
+            return plane
+        native = self._render_native_plane_cached(view, int(frame_idx))
+        plane = native.round().clamp_(0.0, 255.0).to(self.torch.uint8).contiguous()
+        if bool(plane.is_cuda):
+            plane.record_stream(self._stream)
         cache[key] = plane
         cache.move_to_end(key)
         while len(cache) > self._native_plane_cache_entries():

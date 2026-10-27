@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import os
 import random
+import warnings
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -29,6 +30,23 @@ CLAHE_CLIP_RANGE = (1.0, 4.0)
 CLAHE_TILE_GRID = (8, 8)
 ELASTIC_RMS_FRACTION = 0.01
 
+
+
+def _inverse_affine_batch(matrices, device):
+    coefficients = np.asarray(matrices, dtype=np.float32)
+    safe_affine = False
+    if (coefficients.ndim == 3 and coefficients.shape[1:] == (3, 3)
+            and np.isfinite(coefficients).all()
+            and np.all(coefficients[:, 2] == np.asarray((0., 0., 1.), np.float32))):
+        linear = coefficients[:, :2, :2].astype(np.float64)
+        determinant = linear[:, 0, 0] * linear[:, 1, 1] - linear[:, 0, 1] * linear[:, 1, 0]
+        scale = np.abs(linear).max(axis=(1, 2))
+        safe_affine = bool(np.all(np.abs(determinant) > 64 * np.finfo(np.float32).eps * scale**2))
+    forward = torch.as_tensor(coefficients, device=device)
+    if forward.is_cuda and safe_affine:
+        # Match TTA's inverse kernel without its CPU error-check barrier; CPU coefficients prove safety.
+        return torch.linalg.inv_ex(forward, check_errors=False).inverse
+    return torch.linalg.inv(forward)
 
 
 def _subseed(seed: int, salt: int) -> int:
@@ -281,12 +299,17 @@ class GPUAugmentation:
                         _fused_pointwise,
                         fullgraph=True,
                         dynamic=False,
-                        mode="reduce-overhead",
+                        # CUDA capture conflicts with concurrent PTA publication streams.
+                        options={"triton.cudagraphs": False},
                     )
                     self._pointwise_compiled = True
-                except Exception:
+                except Exception as exc:
                     self._pointwise_kernel = _fused_pointwise
                     self._pointwise_compiled = False
+                    warnings.warn(
+                        f"GPU augmentation pointwise compilation failed ({type(exc).__name__}); using eager Torch.",
+                        RuntimeWarning, stacklevel=2,
+                    )
 
     def _pixel_grid(self, height: int, width: int) -> torch.Tensor:
         key = (int(height), int(width))
@@ -451,11 +474,15 @@ class GPUAugmentation:
         )
         try:
             result = self._pointwise_kernel(*arguments)
-        except Exception:
+        except Exception as exc:
             if not self._pointwise_compiled:
                 raise
             self._pointwise_kernel = _fused_pointwise
             self._pointwise_compiled = False
+            warnings.warn(
+                f"GPU augmentation pointwise compilation failed ({type(exc).__name__}); using eager Torch.",
+                RuntimeWarning, stacklevel=2,
+            )
             result = _fused_pointwise(*arguments)
         for index, (seed, params) in enumerate(zip(seeds, params_by_sample)):
             if seed is None or params is None:
@@ -578,17 +605,22 @@ class GPUAugmentation:
             image_float = F.interpolate(image_float, size=(out_h, out_w), mode="bilinear", align_corners=False)
             mask_float = F.interpolate(mask_float, size=(out_h, out_w), mode="nearest")
 
-        source_indices = torch.as_tensor(
-            [
-                source_index
-                for source_index, source_seeds in enumerate(seeds)
-                for _seed in source_seeds
-            ],
-            device=self.device,
-            dtype=torch.int64,
-        )
-        image_batch = image_float.index_select(0, source_indices)
-        mask_batch = mask_float.index_select(0, source_indices)
+        if len(images) == 1:
+            # grid_sample only reads its inputs; copies can share one source allocation.
+            image_batch = image_float.expand(len(flat_seeds), -1, -1, -1)
+            mask_batch = mask_float.expand(len(flat_seeds), -1, -1, -1)
+        else:
+            source_indices = torch.as_tensor(
+                [
+                    source_index
+                    for source_index, source_seeds in enumerate(seeds)
+                    for _seed in source_seeds
+                ],
+                device=self.device,
+                dtype=torch.int64,
+            )
+            image_batch = image_float.index_select(0, source_indices)
+            mask_batch = mask_float.index_select(0, source_indices)
         if all(seed is None for seed in flat_seeds):
             # ``augmentation_ratio=1`` emits originals only. The rendered
             # sources have already received any required output resize above,
@@ -610,10 +642,9 @@ class GPUAugmentation:
                 params_by_sample.append(params)
                 forward_matrices.append(self._forward_matrix(params, out_h, out_w))
 
-        forward = torch.tensor(forward_matrices, device=self.device, dtype=torch.float32)
-        inverse = torch.linalg.inv(forward)
+        inverse = _inverse_affine_batch(forward_matrices, self.device)
         pixel_grid = self._pixel_grid(out_h, out_w)
-        source = torch.stack([torch.einsum("ij,hwj->hwi", matrix, pixel_grid) for matrix in inverse])
+        source = torch.einsum("nij,hwj->nhwi", inverse, pixel_grid)
         for index, (seed, params) in enumerate(zip(flat_seeds, params_by_sample)):
             if seed is not None and params is not None and bool(params["elastic"]):
                 displacement = self._elastic_displacement(int(seed), out_h, out_w)

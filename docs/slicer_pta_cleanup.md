@@ -218,6 +218,112 @@ statistics and voxel counts are recorded in the PTA manifest and requested
 summary. Its workspace uses about four bytes per native voxel plus component
 tables; it falls back to scratch storage when RAM admission requires it.
 
+PTA now uses the selected CUDA devices for large-mask void filling and Gaussian
+smoothing. Preprocessing runs in a separate spawned process so the parent stays
+safe for its existing render-worker lifecycle. Void filling labels bounded slabs
+on multiple GPUs, reconciles their boundaries, then applies the result on the CPU.
+Gaussian smoothing uses bounded 3D tiles with full filter halos. Constant-zero
+boundaries, per-pass thresholding at 0.5, and preprocessing order are unchanged.
+Floating-point rounding can affect Gaussian voxels very near the threshold.
+
+No new CLI flags are needed. The initial volume, or each volume with
+`--pipeline_depth 1`, can use GPU preprocessing; overlapping preparation of later
+volumes stays on CPU to avoid competing with render workers. Small masks stay on
+CPU to avoid CUDA-process startup: Gaussian below 64 Mi voxels, void fill below
+1 Gi voxels with multiple devices or 2 Gi voxels with one device. These are
+conservative selection thresholds, not measured throughput guarantees.
+`YOLO_TTA_GAUSSIAN_SMOOTHING_GPU=0` keeps Gaussian on CPU. The existing
+`YOLO_TTA_GAUSSIAN_GPU_CHUNK_MIB` controls the PTA tile cap (256 MiB by default),
+further limited by free VRAM.
+
+The isolated helper needs one additional uint8 mask of host/shared memory for
+void fill, or two for Gaussian, beyond the original input. Admission checks
+available host memory and POSIX shared-memory capacity. The original mask is
+committed only after the helper succeeds; failures retain it for CPU fallback.
+Manifest preprocessing statistics record GPU backend/devices/chunks and helper
+timing when that path is selected. Telemetry now separately measures void fill,
+annotation-state scans, anchor collection, and render-array sharing.
+
+Image-sequence loading uses the allocated CPU budget, including CPU PNG decoding.
+Every volume can use the full worker budget for loading and preparation, including
+alongside rendering with `--pipeline_depth 2`. GPU owners keep their NUMA-local
+affinity and bounded thread counts. The startup log reports the shared budgets. More decode threads can
+increase per-image scratch memory and contention with concurrent classification;
+`--workers` still limits the overall budget.
+At depth 2, the prepared next volume enters the worker queue before the current
+volume's last tasks finish. Each free worker can advance independently; the old
+volume's arrays remain owned until all of its tasks have drained. Existing task
+tracing records `pta.worker_task_start` and `pta.worker_task_end` with the volume
+stem and generation, alongside parent planning/submission events.
+For unchanged transverse YOLO inputs, foreground classification reuses prepared
+foreground-support statistics instead of first scanning the entire dense mask.
+Transformed masks, semantic coverage, and other views retain the dense check.
+
+Offline augmentation with a ratio above 1 requires an original foreground/background
+decision for each selected full image and tile, even with `--background_percent 1`.
+That decision keeps genuine background copies while dropping foreground copies
+whose objects disappear during augmentation. `--fraction` selects originals before
+this classification; a fraction of 1 retains all eligible queries.
+
+For complete volumes with unrestricted backgrounds and an integer offline ratio,
+the decision can reuse the canonical source mask already rendered for publication.
+Eligible runs skip the separate classification pass, resolve all copies before
+policy mutation, and report the measured classes from worker results. Fractional
+ratios, background caps, partial inputs and unchanged YOLO polygon/ROI shortcuts
+retain upfront classification. Tiny-mask support and polygon class remain distinct.
+
+When the existing GPU-policy process pool is idle, dense classification uses its
+CUDA categorical renderers and retains the resident mask for subsequent rendering.
+GPU pixel counts reproduce the existing segmentation classifier: zero is background,
+16 or more pixels are provisionally foreground, and only 1-15-pixel masks need the
+CPU polygon check. Semantic classification intersects separately rendered foreground
+and known-coverage masks. This pass does not render intensity images or apply
+augmentations. Unsupported layouts and prelaunch memory rejection retain the CPU
+path; errors after CUDA work launches are reported rather than silently retried.
+Overlapping planning while another volume renders stays on CPU to avoid replacing
+its resident mask. The log and telemetry report GPU, CPU, and polygon-only job counts.
+
+A negative polygon classification does not prove that the binary mask is empty:
+tiny masks can contain pixels without an exportable contour. Publication checks
+actual source-mask support before augmentation, preserving such originals and
+legitimate growth of their pixels while still rejecting foreground synthesized
+from a truly empty source.
+
+Azimuthal coordinate tables and immutable sampling-policy identities are reused
+across queries. Process workers receive individual bounded tasks; the shared
+phase payload holds plans and volume handles rather than every planned output.
+The parent still constructs the complete version list. Telemetry separates
+augmentation planning, render-task construction, phase installation/submission,
+and first worker metadata decoding, and records phase-payload sizes.
+
+Resizing writes directly into the final shared arrays. Canonical uint8 NRRDs use
+bounded raw/gzip reads; other layouts retain the general reader. Unforced partial
+PNG sequences decode annotated centers and required channel context, retaining
+encoded positions and validating unused PNG dimensions. Force and overlay outputs
+retain full decoding.
+
+GPU workers reuse native uint8 planes across tiles and share exact FP64 spherical
+direction plans between intensity and categorical sampling. Augmentation batches
+fill available slots across source groups while retaining bounded shape tails.
+nvJPEG reuses bounded output buffers after copying validated compressed bytes;
+CUDA fences and native error handling remain in place. Updated external policy
+files have new content hashes, so their generated tags/seeds also change even
+when fixed-seed comparisons establish equivalent augmentation behavior.
+
+With `YOLO_TTA_PTA_GPU_NATIVE_T=1`, depth-only enlargement with unchanged X/Y
+dimensions lets CUDA intensity workers retain the smaller native-depth image and reconstruct logical gray8 voxels
+using the existing TTA kernels. Logical masks, physical-view plans and the host
+intensity cube remain available unchanged for CPU fallback. The worker requires
+a shared native uint8 source; other layouts retain the logical-cube upload.
+It is opt-in because a logical-cube hardware texture can render faster when it
+fits. Native-depth Azimuthal rendering uses the reference-linear pointer kernel
+and skips the hardware texture, preserving intermediate gray8 voxel rounding.
+`YOLO_TTA_PTA_GPU_NATIVE_T=0` retains logical-cube residency. The actual
+`pta.render.source_residency` telemetry records admission, native/logical shapes,
+upload bytes and saved GPU bytes. The geometry request record's
+`native_t_fusion: false` means intermediate virtual-gray8 rounding is preserved;
+it does not disable native-depth residency.
+
 ## Resources and validation boundary
 
 Native processing shares two disk-backed uint8 Global/union arrays: 2 bytes per

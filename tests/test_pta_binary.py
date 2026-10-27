@@ -131,6 +131,7 @@ class PtaBinaryTests(unittest.TestCase):
                 runtime={"torch": torch, "device_id": 0},
                 batch_images=FakeTensor(torch, np.zeros((2, 1, *self.mask.shape), np.uint8)),
                 batch_masks=tensor, candidates=cands, output_size=self.mask.shape,
+                source_mask_nonempty=(True, False),
                 channel_kind="gray", local_warnings=pta_workers.WarningLog(),
                 publication=Publication(),
             )
@@ -179,7 +180,7 @@ class PtaBinaryTests(unittest.TestCase):
             mock.patch.object(pta_workers, "_derive_gpu_item_source",
                               return_value=(np.zeros_like(self.mask), self.mask, self.mask.shape)),
         ):
-            written, flips, _counts, _examples = pta_workers.execute_gpu_render_task(
+            written, flips, _counts, _examples, _classification = pta_workers.execute_gpu_render_task(
                 np.zeros((1, *self.mask.shape), np.uint8), self.mask[None], [plan], task,
             )
         self.assertEqual((written, flips), (1, {}))
@@ -341,7 +342,7 @@ class PtaBinaryTests(unittest.TestCase):
                 with task.reserve(2 * (images.numel() + masks.numel())) as slot:
                     task.submit(slot, dict(runtime=runtime, batch_images=images, batch_masks=masks,
                         candidates=[cand], output_size=self.mask.shape, channel_kind="gray",
-                        local_warnings=pta_workers.WarningLog()))
+                        local_warnings=pta_workers.WarningLog(), source_mask_nonempty=(True,)))
                 masks.zero_()
                 task.close()
             self.assertEqual(results, [(1, {})])

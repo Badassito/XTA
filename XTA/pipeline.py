@@ -397,6 +397,7 @@ from .unification.tta_manifest import (
     build_tta_run_manifest,
     capture_tta_artifact_identities,
 )
+from .startup_io import capture_and_probe_tta_startup
 from .tta_lifecycle import (
     PipelineRunResources as _PipelineRunResources,
     cleanup_tta_selected_run_scratch as _cleanup_tta_selected_run_scratch_impl,
@@ -488,13 +489,26 @@ def _scheduler_wait_activity_summary(parent_futures, projection_gauges):
             counts['awaiting_components'] += 1
         else:
             counts['completed_awaiting_drain'] += 1
-    live = []
+    live, preparing, packing = [], [], []
     for key, value in projection_gauges.items():
+        if not isinstance(value, Mapping):
+            continue
         if (str(key).startswith('projection.native_destination_pull.live.')
-                and isinstance(value, Mapping) and value.get('state') == 'running'):
+                and value.get('state') == 'running'):
             live.append(dict(value))
+        elif (str(key).startswith('projection.native_prepare.live.')
+                and value.get('phase') in ('source_validation', 'native_plan',
+                                          'destination_bounds', 'cpu_warmup')):
+            preparing.append(dict(value))
+        elif (str(key).startswith('projection.native_source_pack.live.')
+                and value.get('state') == 'running'):
+            packing.append(dict(value))
     live.sort(key=lambda value: float(value.get('elapsed_seconds', 0.)), reverse=True)
-    return dict(parent_prepares=counts, active_native_projections=len(live), oldest_native_projections=live[:3])
+    preparing.sort(key=lambda value: float(value.get('elapsed_seconds', 0.)), reverse=True)
+    packing.sort(key=lambda value: float(value.get('elapsed_seconds', 0.)), reverse=True)
+    return dict(parent_prepares=counts, active_native_projections=len(live), oldest_native_projections=live[:3],
+                active_native_preparations=len(preparing), oldest_native_preparations=preparing[:3],
+                active_native_source_packs=len(packing), oldest_native_source_packs=packing[:3])
 
 
 PARENT_CONFIDENCE_CAPTURE_WORKSPACE_BYTES = 256 * 1024**2
@@ -534,6 +548,7 @@ def _parent_prepare_transient_bytes(view, processing_bytes, source_bytes, *,
     """Use one estimate for actual reservations and policy pre-dispatch planning."""
     if packed_native_source and not interpolation_enabled and cleanup_is_simple:
         from .interpolation import CTILE_INDEX_DTYPE
+        from .packed_dense_source import DENSE_PACKED_PAYLOAD_BYTES, DENSE_PACKED_CONTROL_BYTES
         from .workspace import _env_int
         native = tuple(int(value) for value in native_shape or ())
         output = tuple(int(value) for value in source_shape or ())
@@ -562,8 +577,11 @@ def _parent_prepare_transient_bytes(view, processing_bytes, source_bytes, *,
         # Row codecs normalize bounded slabs; an exceptionally wide single row
         # can exceed their usual 1 MiB target and must still be charged.
         row_codec = 6 * (max(mib, native[2]) + max(mib, output[2]))
+        # The terminal encoder borrows the dense mask but owns one bounded
+        # packed batch (at most 64 slices), including metadata and offsets.
+        source_pack = DENSE_PACKED_PAYLOAD_BYTES + DENSE_PACKED_CONTROL_BYTES
         return (max(2 * GIB, cleanup) + packed + records + states + plan + workers
-                + metadata + row_codec + int(confidence_workspace_bytes))
+                + metadata + row_codec + source_pack + int(confidence_workspace_bytes))
     name = str(view.name).lower()
     transient = 2 * GIB
     if 'tilted' in name:
@@ -601,6 +619,24 @@ def _policy_parent_prepare_transient_bytes(tasks, source_bytes, workers, *,
     return largest
 
 
+def _cpu_input_prefetch_policy(gpu_worker_count: int, worker_budget: int) -> Dict[str, int]:
+    """Bound optional CPU lookahead independently of its RAM grant/executor."""
+    devices, budget = max(1, int(gpu_worker_count)), max(1, int(worker_budget))
+    def positive_override(name, default):
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f'{name} must be a positive integer') from None
+        if parsed < 1:
+            raise ValueError(f'{name} must be a positive integer')
+        return parsed
+    return dict(max_builders=min(budget, positive_override('YOLO_TTA_CPU_INPUT_BUILDERS', devices)),
+                max_packets=positive_override('YOLO_TTA_CPU_INPUT_PACKETS', 2 * devices))
+
+
 def _execution_runtime_provenance() -> Dict[str, object]:
     """Include nonlinear geometry and scheduling sources in the run receipt."""
     import hashlib
@@ -613,16 +649,18 @@ def _execution_runtime_provenance() -> Dict[str, object]:
     package = Path(__file__).resolve().parent
     for name in ('geometry', 'cylindrical_geometry', 'spherical_sampling', 'azimuthal_coverage',
                  'unification.runtime', 'qsc', 'spherical_geometry', 'spherical_cuda', 'spherical_sampling_cuda',
-                 'cuda_backend', 'runtime', 'spherical_projection',
+                 'cuda_backend', 'runtime', 'startup_io', 'spherical_projection',
                  'spherical_projection_bounds', 'spherical_projection_cuda',
                  'spherical_preflight', 'spherical_projection_cpu', 'geometry_quality',
                  'unification.sampling', 'cylindrical_cuda_projection',
                  'tilted_azimuthal_projection', 'tilted_azimuthal_projection_cuda',
                  'tta_scheduler', 'backprojection', 'd1_orthogonal_coverage',
-                 'projection_coverage', 'projection_coverage_cpu',
-                 'native_pull_scheduling', 'native_pull_cuda', 'packed_tilted_projection',
+                 'projection_coverage', 'projection_coverage_cpu', 'azimuthal_trajectory_cpu',
+                 'sparse_projection', 'sparse_bounds_cpu', 'publication_memory',
+                 'native_pull_scheduling', 'native_pull_cuda', 'native_encoded_cuda', 'packed_tilted_projection',
+                 'packed_dense_source',
                  'confidence_evidence', 'confidence_storage',
-                 'confidence_capture', 'confidence_capture_cpu', 'confidence_native_codec',
+                 'confidence_capture', 'confidence_capture_cpu', 'confidence_native_codec', 'confidence_orchestration',
                  'confidence_storage', 'confidence_publication'):
         path = package.joinpath(*name.split('.')).with_suffix('.py')
         entry = {'path': str(path), 'loaded_in_parent': 'XTA.' + name in sys.modules}
@@ -658,6 +696,11 @@ def _execution_runtime_provenance() -> Dict[str, object]:
     result['sam_gray_capture_requested'] = _env_flag('YOLO_TTA_SAM_GRAY_CACHE', True)
     result['cpu_input_prefetch_requested'] = _env_flag('YOLO_TTA_CPU_INPUT_PREFETCH', True)
     result['tilted_cpu_input_prefetch_requested'] = _env_flag('YOLO_TTA_CPU_INPUT_TILTED', False)
+    result['terminal_confidence_score_only_requested'] = _env_flag('YOLO_TTA_TERMINAL_SCORE_ONLY', True)
+    result['cpu_input_prefetch_policy_requests'] = dict(
+        default_builders_per_gpu=1, default_packets_per_gpu=2,
+        builders_override=os.environ.get('YOLO_TTA_CPU_INPUT_BUILDERS'),
+        packets_override=os.environ.get('YOLO_TTA_CPU_INPUT_PACKETS'))
     result['cropped_upload_pipeline_requested'] = True
     result['spherical_cpu_compact_requested'] = True
     result['tilted_azimuthal_cuda_projection_requested'] = _env_flag(
@@ -1622,38 +1665,51 @@ def _main_impl() -> None:
 
     unified_launch_at_start = current_unified_launch()
     tta_artifact_identities: Optional[Dict[str, object]] = None
+    startup_source_info: Optional[Dict[str, object]] = None
     if (
         unified_launch_at_start is not None
         and str(unified_launch_at_start.mode) == 'tta'
     ):
-        runtime_trace_event('startup_artifact_identity_start')
-        with runtime_telemetry().span('startup.artifact_identity'):
-            tta_artifact_identities = capture_tta_artifact_identities(
-                input_path=input_path,
-                gpu_model_path=gpu_model_path,
-                cpu_model_path=cpu_model_path,
-            )
-        runtime_trace_event('startup_artifact_identity_done')
         # Atomically invalidate any prior successful association before this run
-        # starts creating or replacing output artifacts.
-        write_json_manifest(
-            out_dir / 'manifest.json',
-            {
-                'schema': TTA_RUN_MANIFEST_SCHEMA,
-                'status': 'in_progress',
-                'launcher': {
-                    'name': str(unified_launch_at_start.launcher),
-                    'version': str(unified_launch_at_start.version),
-                    'mode': 'tta',
-                    'command': list(unified_launch_at_start.command),
-                },
-                'inputs': tta_artifact_identities,
-                'note': (
-                    'A complete manifest replaces this record only after every '
-                    'selected output and resource-finalization stage succeeds.'
-                ),
+        # probes its source or starts creating/replacing output artifacts. Both
+        # startup readers must join before decode or model execution can begin.
+        startup_manifest = {
+            'schema': TTA_RUN_MANIFEST_SCHEMA,
+            'status': 'in_progress',
+            'launcher': {
+                'name': str(unified_launch_at_start.launcher),
+                'version': str(unified_launch_at_start.version),
+                'mode': 'tta',
+                'command': list(unified_launch_at_start.command),
             },
-        )
+            'inputs': None,
+            'note': (
+                'A complete manifest replaces this record only after every '
+                'selected output and resource-finalization stage succeeds.'
+            ),
+        }
+
+        def _capture_startup_artifacts():
+            runtime_trace_event('startup_artifact_identity_start')
+            with runtime_telemetry().span('startup.artifact_identity'):
+                identities = capture_tta_artifact_identities(
+                    input_path=input_path,
+                    gpu_model_path=gpu_model_path,
+                    cpu_model_path=cpu_model_path,
+                )
+            runtime_trace_event('startup_artifact_identity_done')
+            return identities
+
+        with runtime_telemetry().span('startup.discovery_overlap'):
+            tta_artifact_identities, startup_source_info = capture_and_probe_tta_startup(
+                input_path=input_path,
+                capture_identities=_capture_startup_artifacts,
+                probe=ffprobe_info,
+                invalidate_manifest=lambda: write_json_manifest(
+                    out_dir / 'manifest.json', startup_manifest),
+            )
+        startup_manifest['inputs'] = tta_artifact_identities
+        write_json_manifest(out_dir / 'manifest.json', startup_manifest)
 
     canonical_images_stage_root: Optional[Path] = None
     if bool(save_images_enabled):
@@ -1699,7 +1755,7 @@ def _main_impl() -> None:
             'to compare output-stage wall time fairly.'
         )
 
-    info = ffprobe_info(input_path)
+    info = startup_source_info if startup_source_info is not None else ffprobe_info(input_path)
     input_W = int(info['width'])
     input_H = int(info['height'])
     input_T = int(info['num_frames'])
@@ -2753,6 +2809,37 @@ def _main_impl() -> None:
         _parent_transient_bytes,
         'Parent view postprocess admission',
     )
+    if bool(getattr(args, 'reconciliation_retain_confidence', False)):
+        from .confidence_orchestration import terminal_capture_budget
+        from .confidence_evidence import configure_terminal_confidence_capture
+        from .packed_tilted_projection import terminal_native_source_packing_eligible
+        from .sam_resources import physical_sam_headroom
+        eligible_confidence_parents = sum(terminal_native_source_packing_eligible(candidate,
+            native_bytes=math.prod(view_processing_volume_shape(candidate, int(args.imgsz))),
+            retire_dense=component_ref_dense_retirement_active, component_layers=component_layers_needed,
+            tiled=dense_tiling_active, keep_temp=keep_temp_artifacts, prepublished=False,
+            interpolate=int(args.interpolation_distance),
+            interpolation_passes=int(args.interpolation_passes),
+            extrapolate=interpolation_settings.extrapolation_distance) for candidate in views)
+        capture_budget = terminal_capture_budget(parent_capacity=parent_transient_admission.capacity,
+            physical_headroom=physical_sam_headroom(), parent_workers=parent_postprocess_workers,
+            eligible_parents=eligible_confidence_parents,
+            capture_bytes=PARENT_CONFIDENCE_CAPTURE_WORKSPACE_BYTES)
+        capture_owner = None if not capture_budget['slots'] else configure_terminal_confidence_capture(
+                slots=capture_budget['slots'], workspace_bytes=capture_budget['capture_workspace_bytes'],
+                source_bytes=direct_union_total_dense_byte_limit)
+        if capture_owner:
+            # The independent capture promise outlives a parent prepare. Carve
+            # it out before admitting any parent, and include it in the existing
+            # future-output reserve through confidence_publication_reserve_bytes.
+            parent_transient_admission.capacity -= capture_budget['capture_workspace_bytes']
+            # Closeables retire in reverse creation order, after every parent
+            # executor joins: captures must settle before the shared CPU pool.
+            _run_resources().track_closeable(capture_owner)
+            runtime_telemetry().gauge('confidence.terminal_capture_budget', capture_budget)
+            print(f"Terminal confidence capture: slots={capture_budget['slots']}, "
+                  f"independent workspace={capture_budget['capture_workspace_bytes']/GIB:.2f}GiB, "
+                  f"numeric staging={capture_budget['numeric_stage_bytes']/GIB:.2f}GiB.")
     sam_dynamic_memory_partition_enabled = False
     if sam_context is not None:
         sam_context.configure_startup_parent_pool(parent_transient_admission)
@@ -5413,13 +5500,13 @@ def _main_impl() -> None:
         finally:
             parent_transient_admission.condition.release()
         telemetry = runtime_telemetry()
-        with telemetry.lock:
-            projection_gauges = {key: dict(value) for key, value in telemetry.gauges.items()
-                                 if str(key).startswith('projection.native_destination_pull.live.')
-                                 and isinstance(value, Mapping)}
+        projection_gauges = {key: dict(value) for key, value in telemetry.gauges_snapshot(prefixes=(
+            'projection.native_destination_pull.live.', 'projection.native_prepare.live.',
+            'projection.native_source_pack.live.')).items() if isinstance(value, Mapping)}
         activity = _scheduler_wait_activity_summary(view_processing_futures, projection_gauges)
         runtime_telemetry().gauge('scheduler.wait_activity', {
             **activity,
+            'sampled_monotonic': time.monotonic(),
             'inference_pending_tasks': len(gpu_worker_pending_task_ids),
             'inference_received_results': int(scheduler_state.gpu_worker_results_collected),
             'inference_total_tasks': int(scheduler_state.gpu_worker_total_tasks),
@@ -5458,6 +5545,10 @@ def _main_impl() -> None:
             f'inference_received={scheduler_state.gpu_worker_results_collected}/{scheduler_state.gpu_worker_total_tasks}, '
             f'native_projection_active={activity["active_native_projections"]}, '
             f'native_projection_oldest={activity["oldest_native_projections"]}, '
+            f'native_preparation_active={activity["active_native_preparations"]}, '
+            f'native_preparation_oldest={activity["oldest_native_preparations"]}, '
+            f'native_source_pack_active={activity["active_native_source_packs"]}, '
+            f'native_source_pack_oldest={activity["oldest_native_source_packs"]}, '
             f'physical_finalization={len(physical_view_finalization_futures)}, '
             f'physical_union={len(physical_view_union_futures)}, '
             f'parent_transient={parent_transient_in_use / GIB:.1f}/'
@@ -6634,12 +6725,15 @@ def _main_impl() -> None:
                             f'combined ceiling remains {(previous_dense+previous_transient)/GIB:.2f} GiB.', flush=True)
         if cpu_input_prefetch_requested:
             from .yolo_cpu_input import CpuInputPrefetch
+            cpu_input_policy = _cpu_input_prefetch_policy(len(gpu_task_queues), worker_budget)
             scheduler.cpu_input_prefetch = CpuInputPrefetch(gpu_worker_tasks_by_id.values(),
                 input_volume_rgb if native_resize_task_spec is not None else volume_rgb,
                 prediction_render_executor or prediction_volume_executor,
                 max_bytes=cpu_input_budget, headroom=available_anon_work_bytes,
-                on_capacity_change=scheduler.notify_gpu_stage_admission_change)
+                on_capacity_change=scheduler.notify_gpu_stage_admission_change,
+                **cpu_input_policy)
             cpu_input_prefetch = scheduler.cpu_input_prefetch
+            runtime_telemetry().gauge('yolo.cpu_input.policy', cpu_input_policy)
             # Cached ring slots keep two pinned gray canvases per worker until
             # detector asset retirement; retain their conservative startup debt.
             cpu_input_pinned_reserve_bytes = 2 * int(args.imgsz) ** 2 * max(
@@ -6649,7 +6743,9 @@ def _main_impl() -> None:
                               else 'Cartesian')
             print(f'YOLO CPU input prefetch: curved GPU projections first; gray {input_families} '
                 f'canvases prepared from decoded native t in bounded shared RAM '
-                f'({cpu_input_budget / GIB:.2f} GiB charged to the detector workspace budget). '
+                f'({cpu_input_budget / GIB:.2f} GiB charged to the detector workspace budget; '
+                f'{cpu_input_policy["max_builders"]} builder(s), '
+                f'{cpu_input_policy["max_packets"]} retained packet(s)). '
                 'Tilted views use resident GPU rendering unless YOLO_TTA_CPU_INPUT_TILTED=1. '
                 'Unavailable CPU inputs retain GPU rendering. YOLO_TTA_CPU_INPUT_PREFETCH=0 disables this route.', flush=True)
 
@@ -8207,6 +8303,8 @@ def _main_impl() -> None:
         else time.perf_counter()
     )
     runtime_telemetry().gauge('pipeline.phase', 'post_inference_final_assembly')
+    # Refresh the throttled activity snapshot at the actual drain boundary.
+    _log_scheduler_wait_state(force=True)
     active_layer_sink = nrrd_layer_sink()
     if active_layer_sink is not None:
         nrrd_done_at_boundary, nrrd_total_at_boundary = active_layer_sink.progress_counts()
@@ -8250,7 +8348,8 @@ def _main_impl() -> None:
         # BackgroundOutputManager owns a fixed-size executor. Settle any earlier submissions
         # before replacing it; in the current schedule none are submitted before this boundary,
         # but waiting here keeps the transition correct if an earlier output is added later.
-        output_manager.wait()
+        with runtime_telemetry().span('tta.final.output_resize_drain'):
+            output_manager.wait()
         output_manager = BackgroundOutputManager(max_workers=int(tail_output_workers))
         _run_resources().track_output_manager(output_manager)
     print(
@@ -8268,29 +8367,33 @@ def _main_impl() -> None:
                 'Ensuring streaming decode completed; deferred host cube remained unused '
                 '(native-t fast path).'
             )
-            wait_for_volume_ready(input_volume_rgb)
+            with runtime_telemetry().span('tta.final.preprocessing_barrier'):
+                wait_for_volume_ready(input_volume_rgb)
         else:
             print('Ensuring streaming preprocessing producers have completed before final output/backprojection stages.')
-            wait_for_volume_ready(volume_rgb)
+            with runtime_telemetry().span('tta.final.preprocessing_barrier'):
+                wait_for_volume_ready(volume_rgb)
 
-    for cache_name, cache_mm in list(view_frame_caches.items()):
-        cache_path = view_frame_cache_paths.get(cache_name)
-        close_memmap_array(
-            cache_mm,
-            unlink_path=(scratch_unlink_path_for_memmap(cache_mm, cache_path)
-                         if not keep_temp_artifacts else None),
-        )
-        if not keep_temp_artifacts and cache_path is not None:
-            try:
-                cache_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-    view_frame_caches.clear()
-    view_frame_cache_paths.clear()
-    cache_mm = None
+    with runtime_telemetry().span('tta.final.view_cache_retirement'):
+        for cache_name, cache_mm in list(view_frame_caches.items()):
+            cache_path = view_frame_cache_paths.get(cache_name)
+            close_memmap_array(
+                cache_mm,
+                unlink_path=(scratch_unlink_path_for_memmap(cache_mm, cache_path)
+                             if not keep_temp_artifacts else None),
+            )
+            if not keep_temp_artifacts and cache_path is not None:
+                try:
+                    cache_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        view_frame_caches.clear()
+        view_frame_cache_paths.clear()
+        cache_mm = None
 
     if not bool(keep_temp_artifacts):
-        swept_mkvs = purge_remaining_temporary_mkvs(temp_dir, keep_temp=False)
+        with runtime_telemetry().span('tta.final.legacy_mkv_sweep'):
+            swept_mkvs = purge_remaining_temporary_mkvs(temp_dir, keep_temp=False)
         if int(swept_mkvs) > 0:
             print(f'Final legacy temporary MKV sweep removed {int(swept_mkvs)} leftover file(s).')
 
@@ -8391,21 +8494,23 @@ def _main_impl() -> None:
     # the physical-view/global union. This restores the physical Cartesian keys required by
     # the terminal axis-aware assembler and retires redundant per-angle dense workspaces.
     retired_tta_volume_ids: set[int] = set()
-    view_volumes_by_model = collapse_tta_variant_volumes_to_physical_views(
-        view_volumes_by_model,
-        views,
-        workers=int(tail_slice_workers),
-        retired_volume_ids=retired_tta_volume_ids,
-    )
-    release_unretained_volume_maps(
-        (
-            native_view_support_by_model,
-            azimuthal_native_output_by_model,
-            tilted_native_output_by_model,
-        ),
-        view_volumes_by_model,
-        already_retired_ids=retired_tta_volume_ids,
-    )
+    with runtime_telemetry().span('tta.final.physical_view_collapse'):
+        view_volumes_by_model = collapse_tta_variant_volumes_to_physical_views(
+            view_volumes_by_model,
+            views,
+            workers=int(tail_slice_workers),
+            retired_volume_ids=retired_tta_volume_ids,
+        )
+    with runtime_telemetry().span('tta.final.unretained_map_release'):
+        release_unretained_volume_maps(
+            (
+                native_view_support_by_model,
+                azimuthal_native_output_by_model,
+                tilted_native_output_by_model,
+            ),
+            view_volumes_by_model,
+            already_retired_ids=retired_tta_volume_ids,
+        )
 
     print('\n=== Building final single-model view union after physical-view TTA collapse ===')
     # the union is assembled at ORIGINAL SOURCE dimensions.
@@ -8441,9 +8546,10 @@ def _main_impl() -> None:
         layer_sink = nrrd_layer_sink()
         from .reconciliation_runtime import reconcile_tta_layers, union_nrrd_exports_can_overlap
         if layer_sink is not None:
-            overlap_exports = union_nrrd_exports_can_overlap(
-                layer_sink, final_union_mm, policy=reconciliation_policy,
-                source_shape_tyx=source_output_shape_tyx)
+            with runtime_telemetry().span('tta.final.export_overlap_preflight'):
+                overlap_exports = union_nrrd_exports_can_overlap(
+                    layer_sink, final_union_mm, policy=reconciliation_policy,
+                    source_shape_tyx=source_output_shape_tyx)
             runtime_telemetry().gauge('reconciliation.overlap_component_exports', overlap_exports)
             if overlap_exports:
                 print('Union finalization continues alongside independent component NRRD exports.')

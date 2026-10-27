@@ -79,6 +79,91 @@ class RuntimeAsyncTelemetryTests(unittest.TestCase):
             self.assertEqual(counters['scheduler.step.dispatch.wall_seconds'], .125)
             telemetry.flush(final=True)
 
+    def test_parent_and_gpu_metric_producers_retire_while_observer_is_locked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            telemetry = self.telemetry(directory)
+            retired = [threading.Event() for _ in range(4)]
+            def produce(worker):
+                with telemetry.span('parent.project'):
+                    telemetry.gauge(f'projection.{worker}', {'planes': 9})
+                    telemetry.add('retired.bytes', 2**35)
+                    telemetry.gauge_many({f'gpu.{worker}': 'released', f'owner.{worker}': None})
+                    telemetry.fallback('diagnostic.test')
+                # The production analogue returns dense/compute credit here.
+                assert telemetry.gauges_snapshot(prefixes=('gpu.',))[f'gpu.{worker}'] == 'released'
+                retired[worker].set()
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                try:
+                    with telemetry.lock:
+                        futures = [pool.submit(produce, worker) for worker in range(4)]
+                        self.assertTrue(all(done.wait(1) for done in retired),
+                                        'observation blocked parent/GPU retirement')
+                    for future in futures:
+                        future.result(timeout=1)
+                finally:
+                    telemetry.flush(final=True)
+            saved = json.loads(telemetry.path.read_text().splitlines()[-1])
+            self.assertEqual(saved['counters']['retired.bytes'], 4 * 2**35)
+            self.assertEqual(saved['phases']['parent.project']['calls'], 4)
+            self.assertEqual(saved['fallbacks']['diagnostic.test'], 4)
+
+    def test_gauge_snapshots_keep_latest_updates_without_writer_or_unbounded_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            telemetry = self.telemetry(directory)
+            def publish():
+                for value in range(1000):
+                    telemetry.gauge('pack.progress', {'frame': value})
+                telemetry.set_scheduler_gauge('pack.progress', {'frame': 1001})
+                self.assertEqual(telemetry.gauges_snapshot()['pack.progress']['frame'], 1001)
+                telemetry.gauge_many({'pack.progress': {'frame': 1002}, 'other': 3})
+                self.assertEqual(telemetry.gauges_snapshot(prefixes=('pack.',)),
+                                 {'pack.progress': {'frame': 1002}})
+                self.assertEqual(len(telemetry.gauges), 2)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                with telemetry.lock:
+                    future = pool.submit(publish)
+                    future.result(timeout=2)
+            telemetry.flush(final=True)
+            telemetry.add('after.final', 1)
+            telemetry.gauge_many({'pack.progress': 9999})
+            saved = json.loads(telemetry.path.read_text().splitlines()[-1])
+            self.assertEqual(saved['gauges']['pack.progress'], {'frame': 1002})
+            self.assertNotIn('after.final', saved['counters'])
+
+    def test_writer_acknowledges_only_the_dirty_updates_captured_in_its_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            telemetry = self.telemetry(directory)
+            captured, resume = threading.Event(), threading.Event()
+            original = telemetry.snapshot
+            def paused_snapshot(*, final=False):
+                payload = original(final=final)
+                if not final and not captured.is_set():
+                    captured.set()
+                    if not resume.wait(3):
+                        raise RuntimeError('test snapshot timed out')
+                return payload
+            telemetry.snapshot = paused_snapshot
+            for _ in range(256):
+                telemetry.add('work', 1)
+            try:
+                telemetry.maybe_flush()
+                self.assertTrue(captured.wait(2))
+                telemetry.add('work', 5)
+                telemetry.gauge('progress', 'newer than snapshot')
+                resume.set()
+                deadline = time.monotonic() + 2
+                while telemetry.counters.get('telemetry.writer.write_calls', 0) < 1:
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.001)
+                with telemetry._metrics_lock:
+                    self.assertEqual(telemetry._dirty, 2)
+            finally:
+                resume.set()
+                telemetry.flush(final=True)
+            saved = json.loads(telemetry.path.read_text().splitlines()[-1])
+            self.assertEqual(saved['counters']['work'], 261)
+            self.assertEqual(saved['gauges']['progress'], 'newer than snapshot')
+
     def test_scheduler_metrics_do_not_wait_for_global_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             telemetry = self.telemetry(directory)

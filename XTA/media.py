@@ -780,6 +780,18 @@ def _cube_t_axis_slab_rows(in_w: int, workers: int) -> int:
     rows_by_memory = max(1, int((target_mib * 1024 * 1024) // max(1, bytes_per_row * max(1, workers))))
     return max(1, min(rows_by_width, rows_by_memory, 16))
 
+def _validate_processing_cube_destination(destination: Optional[np.ndarray], source: np.ndarray,
+                                          shape: Tuple[int, int, int]) -> None:
+    if destination is None:
+        return
+    if (not isinstance(destination, np.ndarray) or destination.dtype != np.uint8
+            or destination.shape != shape or not destination.flags.c_contiguous
+            or not destination.flags.writeable):
+        raise ValueError(f'Processing-cube destination must be writable C-contiguous uint8 with shape {shape}')
+    if np.shares_memory(destination, source) and destination is not source:
+        raise ValueError('Processing-cube destination must not overlap its source')
+
+
 def resize_volume_t_axis_only_gray8_slab(
     volume_gray: np.ndarray,
     out_t: int,
@@ -788,6 +800,7 @@ def resize_volume_t_axis_only_gray8_slab(
     workers: int = 1,
     prefer_memory: bool = True,
     reserve_bytes: int = 32 * GIB,
+    destination: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Resize only the first/T axis by processing independent row slabs.
 
@@ -797,10 +810,14 @@ def resize_volume_t_axis_only_gray8_slab(
  OpenCV image and resizes only its height to ``out_t``."""
     in_t, in_h, in_w = (int(volume_gray.shape[0]), int(volume_gray.shape[1]), int(volume_gray.shape[2]))
     out_t_i = int(out_t)
+    _validate_processing_cube_destination(destination, volume_gray, (out_t_i, in_h, in_w))
     if int(in_t) == out_t_i:
+        if destination is not None:
+            np.copyto(destination, volume_gray)
+            return destination
         return volume_gray
 
-    out_mm = allocate_workspace_array(
+    out_mm = destination if destination is not None else allocate_workspace_array(
         shape=(out_t_i, in_h, in_w),
         dtype=np.uint8,
         path=out_path,
@@ -869,11 +886,16 @@ def resize_volume_to_processing_cube_gray8(
     workers: int = 1,
     prefer_memory: bool = True,
     reserve_bytes: int = 32 * GIB,
+    destination: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Resample a gray8 (t,Y,X) volume to the approximately-cubic processing shape."""
     in_t, in_h, in_w = (int(volume_gray.shape[0]), int(volume_gray.shape[1]), int(volume_gray.shape[2]))
     out_t, out_h, out_w = (int(out_shape[0]), int(out_shape[1]), int(out_shape[2]))
+    _validate_processing_cube_destination(destination, volume_gray, (out_t, out_h, out_w))
     if (in_t, in_h, in_w) == (out_t, out_h, out_w):
+        if destination is not None:
+            np.copyto(destination, volume_gray)
+            return destination
         return volume_gray
 
     if in_h == out_h and in_w == out_w:
@@ -884,9 +906,10 @@ def resize_volume_to_processing_cube_gray8(
             workers=int(workers),
             prefer_memory=bool(prefer_memory),
             reserve_bytes=int(reserve_bytes),
+            destination=destination,
         )
 
-    out_mm = allocate_workspace_array(
+    out_mm = destination if destination is not None else allocate_workspace_array(
         shape=(out_t, out_h, out_w),
         dtype=np.uint8,
         path=out_path,
@@ -936,6 +959,7 @@ def resize_categorical_volume_to_processing_cube_uint8(
     workers: int = 1,
     prefer_memory: bool = True,
     reserve_bytes: int = 32 * GIB,
+    destination: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Resize a binary ``(t,Y,X)`` mask with endpoint-aligned nearest sampling.
 
@@ -976,10 +1000,14 @@ def resize_categorical_volume_to_processing_cube_uint8(
             "Categorical processing-cube resize requires positive axis lengths; "
             f"got input={(in_t, in_h, in_w)}, output={(out_t, out_h, out_w)}"
         )
+    _validate_processing_cube_destination(destination, mask_arr, (out_t, out_h, out_w))
     if (in_t, in_h, in_w) == (out_t, out_h, out_w):
+        if destination is not None:
+            np.copyto(destination, mask_u8)
+            return destination
         return mask_u8
 
-    out_mm = allocate_workspace_array(
+    out_mm = destination if destination is not None else allocate_workspace_array(
         shape=(out_t, out_h, out_w),
         dtype=np.uint8,
         path=out_path,

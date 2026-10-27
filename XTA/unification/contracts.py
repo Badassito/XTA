@@ -12,6 +12,7 @@ import json
 import math
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import cached_property
 from typing import Any, Iterator, Mapping, Sequence, Tuple
 
 
@@ -416,7 +417,7 @@ class ForwardSamplingPolicy:
             ],
         }
 
-    @property
+    @cached_property
     def digest(self) -> str:
         """Stable identity of the policy declaration used by plans and manifests."""
 

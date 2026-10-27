@@ -866,8 +866,15 @@ class ViewPrepareLeaseState:
                 or int(self.postprocess_bytes.get(key, -1)) != int(lease.nbytes)):
             raise RuntimeError(f'direct-union input {key} retired without its postprocess owner')
         released = int(nbytes)
+        # A score-only reader may outlive the original mask. Its final receipt
+        # can settle the remainder only after that same lease's mask retired.
+        final_confidence = (
+            str(token) == 'confidence'
+            and (key, id(expected_lease), 'mask') in self.retired_inputs
+        )
         if (not 0 < released <= int(lease.nbytes)
-                or released == int(lease.nbytes) and str(token) != 'mask'):
+                or released == int(lease.nbytes)
+                and str(token) != 'mask' and not final_confidence):
             raise RuntimeError(f'direct-union input {key} returned invalid dense credit {released}')
         self.retired_inputs.add(identity)
         lease.memfd_owner_proofs = tuple(proof for proof in lease.memfd_owner_proofs if proof[0] != token)

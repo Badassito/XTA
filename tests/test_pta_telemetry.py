@@ -42,6 +42,43 @@ def test_worker_finalizer_is_registered_without_initializing_telemetry():
     initialize.assert_not_called()
 
 
+@pytest.mark.parametrize('backend', ['process', 'thread'])
+@pytest.mark.parametrize('failed', [False, True])
+def test_worker_trace_identifies_volume_and_settled_task_boundary(monkeypatch, backend, failed):
+    task = object()
+    arrays = (np.zeros((1, 1, 1), np.uint8), np.ones((1, 1, 1), np.uint8), None)
+    payload = dict(gen=7, stem='validation_b', plans=['plan'], tasks=[task],
+                   volume=arrays[0], mask=arrays[1])
+    events = []
+    monkeypatch.setattr(pta_workers, 'runtime_trace_event',
+                        lambda event, **fields: events.append((event, fields)))
+    monkeypatch.setattr(pta_workers, '_worker_load_payload', lambda *_: payload)
+    monkeypatch.setattr(pta_workers, '_worker_volume_arrays', lambda _: arrays)
+    failure = ValueError('publication failed')
+    result = (3, {}, {}, {}, pta_workers.DeferredForegroundCounts())
+
+    def execute(*args):
+        assert args == (*arrays[:2], payload['plans'], task, None)
+        assert [name for name, _ in events] == ['pta.worker_task_start']
+        if failed:
+            raise failure
+        return result
+
+    monkeypatch.setattr(pta_workers, 'execute_render_task', execute)
+    call = (lambda: pta_workers._render_task_entry(('metadata', 8, task))) if backend == 'process' else (
+        lambda: pta_workers._render_task_entry_thread(payload, 0))
+    if failed:
+        with pytest.raises(ValueError) as raised:
+            call()
+        assert raised.value is failure
+    else:
+        assert call() is result
+    assert [name for name, _ in events] == ['pta.worker_task_start', 'pta.worker_task_end']
+    assert all(fields['generation'] == 7 and fields['stem'] == 'validation_b' for _, fields in events)
+    assert events[-1][1]['status'] == ('error' if failed else 'complete')
+    assert events[-1][1].get('error_type') == ('ValueError' if failed else None)
+
+
 def test_publication_snapshot_preserves_overlap_and_independent_measurements():
     resource = object.__new__(GpuPublicationResources)
     resource.lock = threading.Lock()
@@ -105,4 +142,4 @@ def test_representative_f3_training_workload_counts_without_rendering(monkeypatc
             for item_key, candidates in tasks[0].frames[0].items]
     counts = [sum(len(item.candidates) for item in batch)
               for batch in iter_compatible_work_batches(work, candidate_limit=24)]
-    assert counts == [20, 20, 20, 10]
+    assert counts == [24, 24, 22]

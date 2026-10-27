@@ -145,9 +145,13 @@ class CpuInputPrefetch:
     """Prepare bounded leases; split siblings share one original coverage owner."""
     def __init__(self, tasks, volume, executor: Executor, *, max_bytes, headroom,
                  allocate=_allocate_memfd_workspace_array, backing=_memfd_backing_path_from_array,
-                 close_array=close_memmap_array_without_flush, on_capacity_change=None):
+                 close_array=close_memmap_array_without_flush, on_capacity_change=None,
+                 max_builders=4, max_packets=8):
         self.executor, self.volume = executor, volume
         self.max_bytes, self.headroom = max(0, int(max_bytes)), headroom
+        self.max_builders, self.max_packets = int(max_builders), int(max_packets)
+        if min(self.max_builders, self.max_packets) < 1:
+            raise ValueError('CPU input builder and packet limits must be positive')
         self.capacity_bytes = self.max_bytes
         self.reclaim_target = None
         self.allocate, self.backing, self.close_array = allocate, backing, close_array
@@ -278,6 +282,8 @@ class CpuInputPrefetch:
         with self.lock:
             ready = [packet for packet in self.packets if packet.array is not None and not packet.retiring]
             return dict(maximum_bytes=self.max_bytes, capacity_bytes=self.capacity_bytes, charged_bytes=self.bytes,
+                max_builders=self.max_builders, max_packets=self.max_packets,
+                charged_packets=sum(packet.charged_bytes > 0 for packet in self.packets),
                 reserved_bytes=self.reserved_bytes, pending_packets=len(self.pending),
                 building_packets=sum(packet.building for packet in self.packets),
                 running_builders=sum(packet.running for packet in self.packets),
@@ -503,6 +509,8 @@ class CpuInputPrefetch:
                         self.pending.popleft()
                     if self.closed or not self.pending:
                         break
+                    if not self._build_slot_available():
+                        break
                     packet = self.pending[0]
                     view = packet.task['view']
                     # Native planes and NumPy lerp temporaries are live only while building.
@@ -519,6 +527,8 @@ class CpuInputPrefetch:
                 with self.lock:
                     if self.closed or self.pending[0] is not packet or packet.revoked or not packet.remaining:
                         continue
+                    if not self._build_slot_available():
+                        break
                     limit = self.capacity_bytes if self.reclaim_target is None else self.reclaim_target
                     if self.bytes + size > limit:
                         break
@@ -546,6 +556,16 @@ class CpuInputPrefetch:
             with self.lock:
                 if not self.pump_requested:
                     return
+
+    def _build_slot_available(self):
+        """Caller holds the owner lock; queued work and retiring owners keep slots.
+
+        The RAM grant is a ceiling, not a target to fill speculatively. Count
+        submitted futures as builders even before the executor starts them, and
+        retain packet credit until the same mapping/FD fence settles byte credit.
+        """
+        return (sum(packet.building for packet in self.packets) < self.max_builders
+                and sum(packet.charged_bytes > 0 for packet in self.packets) < self.max_packets)
 
     def _packet(self, task):
         if not cpu_input_eligible(task):

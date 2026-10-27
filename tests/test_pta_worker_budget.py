@@ -43,18 +43,18 @@ class PtaWorkerBudgetTests(unittest.TestCase):
         self.assertEqual(budget.gpu_render_threads_by_owner, (8, 8, 8, 8))
         self.assertEqual(budget.gpu_render_threads, 8)
         self.assertEqual(budget.gpu_cpu_sets, MASKS)
-        self.assertEqual((budget.planning_workers, budget.io_workers), (64, 16))
-        self.assertEqual((budget.bootstrap_workers, budget.bootstrap_io_workers), (64, 16))
+        self.assertEqual((budget.planning_workers, budget.io_workers), (64, 64))
+        self.assertEqual((budget.bootstrap_workers, budget.bootstrap_io_workers), (64, 64))
 
-    def test_multiple_volumes_reserve_actual_unique_affinity_not_nominal_threads(self):
+    def test_multiple_volumes_share_full_startup_budget_with_local_renderers(self):
         depth = resolve_pta_pipeline_depth(requested_depth=2, volume_count=2,
                                           resident_estimates=(10, 10), available_bytes=100)
         budget = plan(overlapping=depth.overlapping)
         self.assertTrue(budget.overlapping)
         self.assertEqual(budget.render_cpu_count, 32)
         self.assertEqual(budget.gpu_cpu_sets, MASKS)
-        self.assertEqual((budget.planning_workers, budget.io_workers), (32, 16))
-        self.assertEqual(set(budget.planning_cpu_order), set(ALLOWED) - set(LOCAL))
+        self.assertEqual((budget.planning_workers, budget.io_workers), (64, 64))
+        self.assertEqual(budget.planning_cpu_order, ALLOWED)
         self.assertEqual(budget.bootstrap_workers, 64)
 
     def test_memory_reduced_depth_and_explicit_depth_one_keep_full_planning(self):
@@ -64,20 +64,21 @@ class PtaWorkerBudgetTests(unittest.TestCase):
                     resident_estimates=estimates, available_bytes=available)
                 budget = plan(overlapping=depth.overlapping)
                 self.assertEqual(depth.effective_depth, 1)
-                self.assertEqual((budget.planning_workers, budget.io_workers), (64, 16))
+                self.assertEqual((budget.planning_workers, budget.io_workers), (64, 64))
         self.assertTrue(resolve_pta_pipeline_depth(requested_depth=2, volume_count=2,
                        resident_estimates=(40, 40), available_bytes=100).memory_limited)
 
-    def test_all_local_cpus_leave_a_real_disjoint_planning_reservation(self):
+    def test_all_local_cpus_are_available_without_a_planning_reservation(self):
         allowed = tuple(range(64))
         masks = tuple(tuple(range(rank, 64, 4)) for rank in range(4))
         budget = plan(allowed_cpus=allowed, worker_cpu_order=allowed, gpu_cpu_sets=masks, overlapping=True)
-        self.assertEqual(budget.gpu_render_threads_by_owner, (12, 12, 12, 12))
-        self.assertEqual(budget.render_cpu_count, 48)
-        self.assertEqual(budget.planning_workers, 16)
+        self.assertEqual(budget.gpu_render_threads_by_owner, (16, 16, 16, 16))
+        self.assertEqual(budget.render_cpu_count, 64)
+        self.assertEqual(budget.planning_workers, 64)
+        self.assertEqual(budget.io_workers, 64)
         for before, after in zip(masks, budget.gpu_cpu_sets):
             self.assertTrue(set(after) <= set(before))
-        self.assertFalse(set(budget.planning_cpu_order) & set().union(*map(set, budget.gpu_cpu_sets)))
+        self.assertEqual(set(budget.planning_cpu_order), set().union(*map(set, budget.gpu_cpu_sets)))
 
     def test_heterogeneous_affinity_has_per_owner_limits_without_global_narrowing(self):
         masks = (tuple(range(2)), tuple(range(2, 8)), tuple(range(8, 20)), tuple(range(20, 32)))
@@ -85,14 +86,14 @@ class PtaWorkerBudgetTests(unittest.TestCase):
                       gpu_cpu_sets=masks, overlapping=True)
         self.assertEqual(budget.gpu_render_threads_by_owner, (2, 6, 8, 8))
         self.assertEqual(budget.gpu_render_threads, 8)
-        self.assertEqual((budget.render_cpu_count, budget.planning_workers), (24, 8))
+        self.assertEqual((budget.render_cpu_count, budget.planning_workers), (32, 32))
         self.assertTrue(all(threads <= len(cpus) for threads, cpus in zip(budget.gpu_render_threads_by_owner, budget.gpu_cpu_sets)))
 
     def test_disabled_topology_budgets_threads_without_setting_any_affinity(self):
         budget = plan(topology_aware=False, overlapping=True)
         self.assertEqual(budget.gpu_cpu_sets, ((), (), (), ()))
-        self.assertEqual(budget.gpu_render_threads_by_owner, (12, 12, 12, 12))
-        self.assertEqual(budget.planning_workers, 16)
+        self.assertEqual(budget.gpu_render_threads_by_owner, (16, 16, 16, 16))
+        self.assertEqual(budget.planning_workers, 64)
         self.assertEqual(budget.planning_cpu_order, ())
         self.assertEqual(budget.bootstrap_cpu_order, ())
         self.assertEqual(budget.render_cpu_order, ())
@@ -100,22 +101,24 @@ class PtaWorkerBudgetTests(unittest.TestCase):
     def test_explicit_worker_and_frame_requests_respect_allowed_and_local_capacity(self):
         budget = plan(worker_budget=16, requested_frame_workers=128, overlapping=True)
         self.assertEqual(budget.worker_budget, 16)
-        self.assertEqual(budget.gpu_render_threads_by_owner, (3, 3, 3, 3))
-        self.assertEqual(budget.planning_workers, 4)
-        self.assertEqual(len(budget.planning_cpu_order), 4)
+        self.assertEqual(budget.gpu_render_threads_by_owner, (4, 4, 4, 4))
+        self.assertEqual(budget.planning_workers, 16)
+        self.assertEqual(budget.planning_cpu_order, ALLOWED)
         self.assertEqual(budget.bootstrap_workers, 16)
+        self.assertEqual(budget.bootstrap_io_workers, 16)
+        self.assertEqual(budget.io_workers, 16)
         self.assertTrue(set(budget.render_cpu_order) <= set(ALLOWED))
         self.assertEqual(plan(worker_budget=128).worker_budget, 64)
         self.assertEqual(plan(requested_frame_workers=8).gpu_render_threads_by_owner, (2, 2, 2, 2))
 
-    def test_too_small_concurrent_budget_disables_overlap_without_losing_owners(self):
+    def test_small_concurrent_budget_time_shares_without_losing_owners(self):
         budget = plan(worker_budget=4, overlapping=True)
-        self.assertFalse(budget.overlapping)
+        self.assertTrue(budget.overlapping)
         self.assertEqual(budget.frame_workers, 4)
         self.assertEqual(budget.gpu_render_threads_by_owner, (1, 1, 1, 1))
         self.assertEqual(budget.planning_workers, 4)
         smaller = plan(worker_budget=2, overlapping=True)
-        self.assertFalse(smaller.overlapping)
+        self.assertTrue(smaller.overlapping)
         self.assertEqual(smaller.worker_budget, 2)
         self.assertEqual(smaller.frame_workers, 4)
         self.assertEqual(smaller.gpu_render_threads_by_owner, (1, 1, 1, 1))
@@ -126,8 +129,16 @@ class PtaWorkerBudgetTests(unittest.TestCase):
         single = plan(gpu_count=0, gpu_cpu_sets=())
         overlap = plan(gpu_count=0, gpu_cpu_sets=(), overlapping=True)
         self.assertEqual((single.frame_workers, single.planning_workers), (64, 64))
-        self.assertEqual((overlap.frame_workers, overlap.planning_workers), (48, 16))
-        self.assertFalse(set(overlap.render_cpu_order[:48]) & set(overlap.planning_cpu_order))
+        self.assertEqual((overlap.frame_workers, overlap.planning_workers), (64, 64))
+        self.assertEqual(set(overlap.render_cpu_order), set(overlap.planning_cpu_order))
+        limited = plan(gpu_count=0, gpu_cpu_sets=(), worker_budget=8,
+                       requested_frame_workers=2, overlapping=True)
+        self.assertEqual((limited.frame_workers, limited.planning_workers, limited.io_workers), (2, 8, 8))
+        single_cpu = plan(gpu_count=0, gpu_cpu_sets=(), worker_budget=1,
+                          allowed_cpus=(3,), worker_cpu_order=(3,), overlapping=True)
+        self.assertTrue(single_cpu.overlapping)
+        self.assertEqual((single_cpu.frame_workers, single_cpu.planning_workers), (1, 1))
+        self.assertEqual(single_cpu.planning_cpu_order, (3,))
 
     def test_actual_planning_wrapper_selects_bootstrap_overlap_and_restored_idle_budget(self):
         budget = plan(overlapping=True)
@@ -146,18 +157,46 @@ class PtaWorkerBudgetTests(unittest.TestCase):
         self.assertEqual(wrapper(0)['budget'], (0, 64))
         self.assertEqual(affinity.call_args.args[0], ALLOWED)
         progress[0] = SimpleNamespace(pending_a=1, pending_b=0)
-        self.assertEqual(wrapper(1)['budget'], (1, 32))
+        self.assertEqual(wrapper(1)['budget'], (1, 64))
         self.assertEqual(affinity.call_args.args[0], budget.planning_cpu_order)
         progress[0].pending_a = 0
         self.assertEqual(wrapper(2)['budget'], (2, 64))
         self.assertEqual(affinity.call_args.args[0], ALLOWED)
-        self.assertEqual(called.call_args_list, [mock.call(0, 64), mock.call(1, 32), mock.call(2, 64)])
+        self.assertEqual(called.call_args_list, [mock.call(0, 64), mock.call(1, 64), mock.call(2, 64)])
         self.assertEqual(trace.call_args_list, [
             call
             for index in range(3)
             for call in (mock.call('pta.volume_plan_start', stem=f'volume_{index}'),
                          mock.call('pta.volume_plan_complete', stem=f'volume_{index}',
                                    candidates=0, versions=0))])
+
+    def test_actual_loader_receives_full_workers_and_shared_overlap_affinity(self):
+        budget = plan(overlapping=True)
+        executor = mock.Mock()
+        pending = {}
+        namespace = dict(
+            pending_specs=['first', 'second'], pending_loads=pending,
+            cpu_budget=budget, io_workers=budget.io_workers,
+            planning_cpu_order=budget.planning_cpu_order,
+            load_executor=executor, WarningLog=mock.Mock(),
+            load_source_volume_from_spec=mock.sentinel.loader,
+            channel_variants=(),
+            volume_allocator=mock.sentinel.allocator,
+            args=SimpleNamespace(topology_aware=True, jpeg_decode_backend='auto', jpeg_batch_size=64),
+            topology=SimpleNamespace(cuda_device_ids=(0, 1, 2, 3), gpu_cpu_sets=MASKS),
+        )
+        submit = extracted_function('_submit_load', namespace)
+        submit(0)
+        submit(1)
+        submit(1)
+        calls = executor.submit.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([call.kwargs['workers'] for call in calls], [64, 64])
+        self.assertEqual(calls[0].kwargs['load_cpu_order'], ALLOWED)
+        overlap_cpus = calls[1].kwargs['load_cpu_order']
+        self.assertEqual(overlap_cpus, budget.planning_cpu_order)
+        self.assertEqual(overlap_cpus, ALLOWED)
+        self.assertEqual(set(pending), {0, 1})
 
     def test_actual_affinity_scope_restores_parent_even_if_planning_fails(self):
         bind = mock.Mock(return_value=True)

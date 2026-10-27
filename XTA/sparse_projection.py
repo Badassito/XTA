@@ -484,106 +484,96 @@ def _disk_slab_axis_bounds(radius, lower, upper, cosine, sine):
     return result[0], result[1]
 
 
-def _destination_bbox_for_sparse_input(store, view, output_shape):
-    """Conservative cell coverage from original encoded component bounds.
+def _destination_bbox_for_sparse_input(store, view, output_shape, *, trajectory=None):
+    """Exact conservative cell bounds with one bounded nogil numeric traversal.
 
-    Circle/diameter slabs deliberately include extra angular ownership. They
-    can overestimate work, but cannot discard selected input support. Physical
-    tilt shear is bounded before restoring source cells, once.
+    A caller may lend the already prepared numeric trajectory. No encoded source
+    payload is read and no source/output volume or persistent cache is allocated.
     """
-    from .backprojection import (resolve_azimuthal_processing_grid,
-                                 build_azimuthal_backprojection_plan,
-                                 _azimuthal_processing_rows_for_output)
+    from .backprojection import resolve_azimuthal_processing_grid
     from .projection_coverage import effective_azimuthal_radius
+    from .azimuthal_trajectory_cpu import azimuthal_backprojection_arrays
+    from .sparse_bounds_cpu import sparse_native_bounds
 
-    probe = np.broadcast_to(np.zeros((1, 1, 1), dtype=np.uint8), tuple(store.shape))
+    shape = tuple(map(int, store.shape))
+    records = np.asarray(store.index)
+    fields = ('kind', 'y0', 'x0', 'y1', 'x1')
+    if (len(shape) != 3 or min(shape) <= 0 or records.ndim != 1
+            or len(records) != shape[0] or records.dtype.names is None
+            or any(field not in records.dtype.names or not np.issubdtype(
+                records.dtype[field], np.integer) for field in fields)):
+        raise ValueError('Sparse Azimuthal bounds require a valid source index')
+    active = records['kind'] != 0
+    # Empty records intentionally ignore their unused coordinate fields. Every
+    # nonempty record must be valid before entering unchecked native indexing.
+    if (np.any(active & (records['kind'] != 1)) or np.any(active & (
+            (records['y0'] < 0) | (records['y0'] >= records['y1'])
+            | (records['y1'] > shape[1]) | (records['x0'] < 0)
+            | (records['x0'] >= records['x1']) | (records['x1'] > shape[2])))):
+        raise ValueError('Sparse Azimuthal bounds received invalid source record bounds')
+    probe = np.broadcast_to(np.uint8(0), tuple(store.shape))
     grid = resolve_azimuthal_processing_grid(probe, view)
-    plan, _ = build_azimuthal_backprojection_plan(view)
-    by_source = {}
-    for sample in plan:
-        by_source.setdefault(int(sample.source_index), []).append(sample)
-    unique_angles = np.unique(np.asarray([float(sample.angle_deg) % 180.0 for sample in plan]))
-    angular_cosines = {}
-    for index, angle in enumerate(unique_angles):
-        previous_gap = (float(angle) - float(unique_angles[index - 1])) % 180.0
-        next_gap = (float(unique_angles[(index + 1) % len(unique_angles)]) - float(angle)) % 180.0
-        half_gap = max(previous_gap, next_gap) / 2.0 if len(unique_angles) > 1 else 90.0
-        # Include float32 angle/atan rounding before applying the strict bound.
-        angular_cosines[float(angle)] = max(0.0, math.cos(math.radians(half_gap + 1e-4)))
+    for mapping, limit in ((grid.native_row_to_processing, int(grid.processing_h)),
+                           (grid.native_u_to_processing, int(store.shape[2]))):
+        if (mapping.ndim != 1 or not mapping.size or not np.issubdtype(mapping.dtype, np.integer)
+                or int(mapping.min()) < 0 or int(mapping.max()) >= limit):
+            raise ValueError('Sparse Azimuthal bounds received an invalid native lookup')
+    raw_angles, sources, reverses = (azimuthal_backprojection_arrays(view)
+                                     if trajectory is None else trajectory)
+    raw_angles, sources, reverses = map(np.asarray, (raw_angles, sources, reverses))
+    if (raw_angles.ndim != 1 or sources.ndim != 1 or reverses.ndim != 1
+            or raw_angles.dtype != np.float64 or not np.issubdtype(sources.dtype, np.integer)
+            or reverses.dtype != np.bool_ or not len(raw_angles) == len(sources) == len(reverses)
+            or not np.isfinite(raw_angles).all()
+            or (sources.size and (int(sources.min()) < 0 or int(sources.max()) >= len(store.index)))):
+        raise ValueError('Sparse Azimuthal bounds require their exact finite numeric trajectory')
+    # Retain the original scalar modulo/trigonometric evaluation order. The
+    # per-sample coefficient lookup is prepared once, outside the record loop.
+    angles = np.asarray([float(value) % 180.0 for value in raw_angles], np.float64)
+    unique = np.unique(angles)
+    if not len(unique):
+        return None
+    cosines, sines, limits = np.empty(len(unique)), np.empty(len(unique)), np.empty(len(unique))
+    for index, angle in enumerate(unique):
+        previous_gap = (float(angle)-float(unique[index-1])) % 180.0
+        next_gap = (float(unique[(index+1) % len(unique)])-float(angle)) % 180.0
+        half_gap = max(previous_gap, next_gap)/2.0 if len(unique) > 1 else 90.0
+        limits[index] = max(0., math.cos(math.radians(half_gap+1e-4)))
+        theta = math.radians(float(angle))
+        cosines[index], sines[index] = math.cos(theta), math.sin(theta)
+    coefficient_ids = np.searchsorted(unique, angles)
     radius = effective_azimuthal_radius(view)
-    extent_radius = radius + 0.5
     diameter = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
     work = (int(view.full_t), int(view.full_h), int(view.full_w))
+    if min(work) <= 0 or len(output_shape) != 3 or min(output_shape) <= 0:
+        raise ValueError('Sparse Azimuthal bounds require positive physical/output dimensions')
     plane_h, plane_w = azimuthal_plane_shape(view)
-    base = azimuthal_base_view_name(view)
-    stack_axis = {'transverse': 0, 'sagittal': 1, 'coronal': 2}[base]
-    # Azimuthal's native raster can have fewer rows than the physical stack.
-    # Invert the same compact-row OR/expansion relation used by native pull.
-    first_physical = np.full(grid.processing_h, work[stack_axis], dtype=np.int32)
-    last_physical = np.full(grid.processing_h, -1, dtype=np.int32)
-    for physical_frame in range(work[stack_axis]):
-        mapped = _azimuthal_processing_rows_for_output(grid, work[stack_axis], physical_frame)
-        first_physical[mapped] = np.minimum(first_physical[mapped], physical_frame)
-        last_physical[mapped] = np.maximum(last_physical[mapped], physical_frame)
-    tilted = azimuthal_source_tilted_view(view) if is_tilted_azimuthal_view(view) else None
-    tangent = math.tan(math.radians(float(view.tilt_angle_deg))) if tilted is not None else 0.0
-    native_lo, native_hi = [math.inf] * 3, [-math.inf] * 3
-    for frame, record in enumerate(store.index):
-        if int(record['kind']) == 0 or frame not in by_source:
-            continue
-        y0, x0, y1, x1 = (int(record[field]) for field in ('y0', 'x0', 'y1', 'x1'))
-        columns = np.flatnonzero((grid.native_u_to_processing >= x0) & (grid.native_u_to_processing < x1))
-        row_first = int(first_physical[y0:y1].min(initial=work[stack_axis]))
-        row_last = int(last_physical[y0:y1].max(initial=-1))
-        native_rows = np.flatnonzero((grid.native_row_to_processing >= y0)
-                                     & (grid.native_row_to_processing < y1))
-        if row_last < row_first or not native_rows.size or not columns.size:
-            continue
-        row_lo, row_hi = float(row_first) - 1.0, float(row_last) + 1.0
-        # Inverse physical shear acts on the continuous native-row cell before
-        # lookup. Include that cell's full support, which may exceed the
-        # endpoint-aligned integer row map for an unusually compact raster.
-        row_lo = min(row_lo, float(native_rows[0]) * work[stack_axis] / grid.native_h - 0.5)
-        row_hi = max(row_hi, float(native_rows[-1] + 1) * work[stack_axis] / grid.native_h - 0.5)
-        u_lo, u_hi = max(0, int(columns[0]) - 1), min(diameter - 1, int(columns[-1]) + 1)
-        signed_lo = -extent_radius if u_lo == 0 else (u_lo - 0.5) * 2.0 * radius / max(1, diameter - 1) - radius
-        signed_hi = extent_radius if u_hi == diameter - 1 else (u_hi + 0.5) * 2.0 * radius / max(1, diameter - 1) - radius
-        for sample in by_source[frame]:
-            lower, upper = (-signed_hi, -signed_lo) if sample.reverse_u else (signed_lo, signed_hi)
-            theta = math.radians(float(sample.angle_deg) % 180.0)
-            cosine_limit = angular_cosines[float(sample.angle_deg) % 180.0]
-            owned_radius = (min(extent_radius, max(abs(lower), abs(upper)) / cosine_limit)
-                            if cosine_limit > 0 else extent_radius)
-            slab = _disk_slab_axis_bounds(owned_radius, lower, upper, math.cos(theta), math.sin(theta))
-            if slab is None:
-                continue
-            (dx0, dx1), (dy0, dy1) = slab
-            v0, v1 = max(0.0, float(view.center_y) + dy0 - 1.0), min(float(plane_h - 1), float(view.center_y) + dy1 + 1.0)
-            u0, u1 = max(0.0, float(view.center_x) + dx0 - 1.0), min(float(plane_w - 1), float(view.center_x) + dx1 + 1.0)
-            stack0, stack1 = row_lo, row_hi
-            if tilted is not None:
-                axis0, axis1 = (v0, v1) if str(tilted.tilt_direction) == 'vertical' else (u0, u1)
-                axis_size = plane_h if str(tilted.tilt_direction) == 'vertical' else plane_w
-                center = float(axis_size - 1) / 2.0
-                shift0, shift1 = tangent * (axis0 - center), tangent * (axis1 - center)
-                stack0 += float(tilted.tilt_frame_start) + min(shift0, shift1) - 1.0
-                stack1 += float(tilted.tilt_frame_start) + max(shift0, shift1) + 1.0
-            if base == 'transverse':
-                low, high = (stack0, v0, u0), (stack1, v1, u1)
-            elif base == 'sagittal':
-                low, high = (v0, stack0, u0), (v1, stack1, u1)
-            else:
-                low, high = (v0, u0, stack0), (v1, u1, stack1)
-            for axis in range(3):
-                native_lo[axis] = min(native_lo[axis], math.floor(low[axis]))
-                native_hi[axis] = max(native_hi[axis], math.ceil(high[axis]) + 1)
-    if not math.isfinite(native_lo[0]):
+    base = {'transverse': 0, 'sagittal': 1, 'coronal': 2}[azimuthal_base_view_name(view)]
+    stack_axis = (0, 1, 2)[base]
+    physical = azimuthal_source_tilted_view(view) if is_tilted_azimuthal_view(view) else None
+    tangent = math.tan(math.radians(float(view.tilt_angle_deg))) if physical is not None else 0.
+    if not all(math.isfinite(float(value)) for value in
+            (radius, view.center_y, view.center_x, tangent,
+             0. if physical is None else physical.tilt_frame_start)):
+        raise ValueError('Sparse Azimuthal bounds require finite physical geometry')
+    lower, upper = sparse_native_bounds(store.index, grid.native_row_to_processing,
+        grid.native_u_to_processing, grid.processing_h, sources, reverses,
+        coefficient_ids, cosines, sines, limits, radius, diameter, work[stack_axis],
+        plane_h, plane_w, float(view.center_y), float(view.center_x), base,
+        physical is not None, physical is not None and str(physical.tilt_direction) == 'vertical',
+        tangent, 0. if physical is None else float(physical.tilt_frame_start))
+    if not math.isfinite(float(lower[0])):
         return None
+    if not np.isfinite(lower).all() or not np.isfinite(upper).all():
+        raise ValueError('Sparse Azimuthal bounds exceeded finite physical geometry')
     first, stop = [], []
-    for lower, upper, inside, outside in zip(native_lo, native_hi, work, output_shape):
-        first.append(max(0, math.floor(lower * outside / inside) - 1))
-        stop.append(min(outside, math.ceil(upper * outside / inside) + 1))
-    if any(lower >= upper for lower, upper in zip(first, stop)):
+    for low, high, inside, outside in zip(lower, upper, work, output_shape):
+        # The original scalar implementation used Python integers for this
+        # multiplication; do not silently narrow large geometry to int32/64.
+        low, high = int(low), int(high)+1
+        first.append(max(0, math.floor(low*int(outside)/inside)-1))
+        stop.append(min(int(outside), math.ceil(high*int(outside)/inside)+1))
+    if any(low >= high for low, high in zip(first, stop)):
         return None
     return (*first, *stop)
 

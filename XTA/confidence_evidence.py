@@ -30,6 +30,7 @@ _ENABLED = False
 _DEFER_PROJECTION = False
 _REGISTRY: dict[tuple[str, str], 'ConfidenceEvidenceRef'] = {}
 _PUBLICATION = None
+_CAPTURE_QUEUE = None
 
 
 def configure_confidence_evidence(output_dir=None, *, enabled=False, min_conf=0.0,
@@ -45,6 +46,7 @@ def configure_confidence_evidence(output_dir=None, *, enabled=False, min_conf=0.
         if enabled and defer_projection and background_publication:
             from .confidence_publication import ConfidencePublicationQueue
             _PUBLICATION = ConfidencePublicationQueue()
+            _PUBLICATION._automatic_terminal_bounds = True
     from .confidence_tiles import reset_tile_confidence
     reset_tile_confidence()
 
@@ -52,30 +54,296 @@ def configure_confidence_evidence(output_dir=None, *, enabled=False, min_conf=0.
 def drain_confidence_publication():
     """Join all compressed publications before reconciliation or run completion."""
     with _LOCK:
-        publisher = _PUBLICATION
+        publisher, captures = _PUBLICATION, _CAPTURE_QUEUE
+    if captures is not None:
+        captures.drain()
     return {} if publisher is None else publisher.drain()
 
 
 def confidence_publication_reserve_bytes():
     """Charge numeric stage pages and bounded copy buffers, including tmpfs scratch."""
     with _LOCK:
-        return 0 if _PUBLICATION is None else _PUBLICATION.workspace_reserve_bytes
+        return ((0 if _PUBLICATION is None else _PUBLICATION.workspace_reserve_bytes)
+                + (0 if _CAPTURE_QUEUE is None else _CAPTURE_QUEUE.workspace_bytes))
 
 
 def confidence_publication_snapshot():
     """Current numeric staging/backing state without retaining an old run owner."""
     with _LOCK:
-        publisher = _PUBLICATION
-    return dict(configured=False) if publisher is None else dict(configured=True, **publisher.snapshot())
+        publisher, captures = _PUBLICATION, _CAPTURE_QUEUE
+    result = dict(configured=False) if publisher is None else dict(configured=True, **publisher.snapshot())
+    result['terminal_capture'] = None if captures is None else captures.snapshot()
+    return result
 
 
 def shutdown_confidence_publication(*, raise_errors=True):
     """Settle run-owned publishers before clearing their registry or workspaces."""
-    global _PUBLICATION
+    global _PUBLICATION, _CAPTURE_QUEUE
     with _LOCK:
-        publisher, _PUBLICATION = _PUBLICATION, None
-    if publisher is not None:
-        publisher.close(raise_errors=raise_errors)
+        publisher, captures = _PUBLICATION, _CAPTURE_QUEUE
+        _CAPTURE_QUEUE = None
+    try:
+        if captures is not None:
+            captures.close(raise_errors=raise_errors)
+    finally:
+        # Readers may still submit compressed stages until their join finishes.
+        with _LOCK:
+            _PUBLICATION = None
+        if publisher is not None:
+            publisher.close(raise_errors=raise_errors)
+
+
+def configure_terminal_confidence_capture(*, slots, workspace_bytes, source_bytes):
+    """Install a startup-funded queue before any parent/publication is submitted."""
+    global _CAPTURE_QUEUE, _PUBLICATION
+    from .confidence_orchestration import ConfidenceCaptureQueue
+    from .confidence_publication import ConfidencePublicationQueue
+    with _LOCK:
+        if not (_ENABLED and _DEFER_PROJECTION and _PUBLICATION is not None):
+            return False
+        if _CAPTURE_QUEUE is not None or _PUBLICATION.snapshot()['submitted']:
+            raise RuntimeError('Confidence capture funding must precede source admission')
+        if (not getattr(_PUBLICATION, '_automatic_terminal_bounds', False)
+                or _PUBLICATION.max_pending_bytes != 256*1024**2
+                or _PUBLICATION.stage_bytes != 64*1024**2):
+            # An explicitly supplied queue keeps its original numeric limits.
+            return False
+        previous = _PUBLICATION
+        captures = ConfidenceCaptureQueue(slots=slots, workspace_bytes=workspace_bytes,
+                                         source_bytes=source_bytes)
+        try:
+            publisher = ConfidencePublicationQueue(max_pending_bytes=int(slots)*64*1024**2)
+        except BaseException:
+            captures.close(raise_errors=False)
+            raise
+        _PUBLICATION, _CAPTURE_QUEUE = publisher, captures
+    previous.close()
+    return _CAPTURE_QUEUE
+
+
+def terminal_confidence_capture_available():
+    """Whether score preparation is enabled and an async queue is funded."""
+    from .workspace import _env_flag
+    if not _env_flag('YOLO_TTA_TERMINAL_SCORE_ONLY', True):
+        return False
+    with _LOCK:
+        return bool(_ENABLED and _DEFER_PROJECTION and _CAPTURE_QUEUE is not None)
+
+
+def try_capture_prediction_confidence(mask, scores, *, retire, **kwargs):
+    """Transfer immutable terminal sources only after bounded queue acceptance."""
+    with _LOCK:
+        queue = _CAPTURE_QUEUE
+    plan = current_confidence_capture_plan()
+    if queue is None or plan is None or scores is None or not confidence_projection_deferred():
+        return None
+    from .confidence_orchestration import RetiringConfidenceCapture
+    task = RetiringConfidenceCapture(mask, scores, plan=plan,
+        capture=capture_prediction_confidence, retire=retire, kwargs=kwargs)
+    return queue.try_submit(task)
+
+
+@dataclass(frozen=True)
+class TerminalConfidenceScores:
+    """One full score backing; the caller has transferred its sole writer."""
+    scores: np.ndarray
+    source_bytes: int
+    reader: _MaskedNativeScoreReader | None = None
+
+
+def _terminal_confidence_backing_identity(array, *, require_full=False):
+    """Prove a heap root or registered memfd, without trusting mapping names."""
+    if type(array) not in (np.ndarray, np.memmap):
+        return None
+    from .runtime import _root_memmap_for_array, capture_memfd_owner_proofs
+    root = _root_memmap_for_array(array)
+    if root is not None:
+        if type(root) is not np.memmap or (require_full and array is not root):
+            return None
+        proofs = capture_memfd_owner_proofs({'source': root})
+        if len(proofs) != 1:
+            return None
+        # The retained FD proof validates the full extent. Identity is device
+        # and inode, even when two mappings use different addresses or keys.
+        return ('mapped', int(proofs[0][2]), int(proofs[0][3]))
+    root = array
+    while type(root) is np.ndarray and root.base is not None:
+        root = root.base
+    if (type(root) is not np.ndarray or root.base is not None
+            or not root.flags.owndata or (require_full and array is not root)):
+        return None
+    return ('heap', id(root))
+
+
+def prepare_terminal_confidence_scores(mask, scores, *, known_slice_any=None,
+                                       known_slice_bboxes=None):
+    """Replace a terminal score source with its exact masked product in place.
+
+    The terminal caller must already own the only score writer, after detector
+    cleanup. Unsupported ownership returns None before any mutation. The full
+    grid is masked when support metadata is missing. Otherwise one frozen reader
+    owns the exact support domain through capture and every publication retry.
+    """
+    if not confidence_projection_deferred():
+        return None
+    plan = current_confidence_capture_plan()
+    if (not isinstance(plan, NativeConfidenceCapturePlan)
+            or type(scores) not in (np.ndarray, np.memmap)
+            or type(mask) not in (np.ndarray, np.memmap)
+            or scores.dtype != np.uint8 or scores.ndim != 3
+            or mask.dtype not in (np.dtype(np.uint8), np.dtype(bool))
+            or mask.shape != scores.shape or not mask.flags.c_contiguous
+            or not scores.flags.c_contiguous or not scores.flags.writeable
+            or plan.shape != tuple(scores.shape) or plan.consumer_bytes < 1):
+        return None
+    if plan != plan_confidence_capture(plan.shape, plan.requested_workers,
+            workspace_bytes=plan.workspace_limit_bytes, block_size=plan.block_size):
+        return None
+    score_identity = _terminal_confidence_backing_identity(scores, require_full=True)
+    mask_identity = _terminal_confidence_backing_identity(mask)
+    if score_identity is None or mask_identity is None or score_identity == mask_identity:
+        return None
+    for metadata in (known_slice_any, known_slice_bboxes):
+        if metadata is None:
+            continue
+        if (type(metadata) not in (np.ndarray, np.memmap)
+                or metadata.dtype.kind not in 'biu'):
+            return None
+        metadata_identity = _terminal_confidence_backing_identity(metadata)
+        if metadata_identity is None or metadata_identity in (mask_identity, score_identity):
+            # Capture kwargs outlive this handoff. A mask alias would keep its
+            # backing alive; a score alias would change support during masking.
+            # Unknown/container metadata keeps the existing two-source path.
+            return None
+    started = time.perf_counter()
+    reader = None
+    if known_slice_any is not None and known_slice_bboxes is not None:
+        # Validate and snapshot once, before the first source write. The plan's
+        # initialization/fixed allowance already funds these immutable arrays.
+        reader = _MaskedNativeScoreReader(mask, scores, known_slice_any, known_slice_bboxes)
+    # The ordered consumer does not exist yet. Reuse its already admitted
+    # allowance, including tiny geometries whose consumer allowance is <256 KiB.
+    scratch_size = min(256 * 1024, int(plan.consumer_bytes), int(scores.size))
+    scratch = np.empty(scratch_size, dtype=bool)
+    prepared = TerminalConfidenceScores(scores, int(scores.nbytes), reader)
+    zero = None
+    # From the first write onward, errors propagate to the parent's ownership
+    # guard. A partially transformed source must never trigger a legacy retry.
+    if reader is None:
+        flat_mask, flat_scores = mask.reshape(-1), scores.reshape(-1)
+        for first in range(0, scores.size, scratch_size):
+            stop = min(first + scratch_size, scores.size)
+            zero = scratch[:stop-first]
+            np.equal(flat_mask[first:stop], 0, out=zero)
+            np.copyto(flat_scores[first:stop], np.uint8(0), where=zero)
+        del flat_mask, flat_scores
+        visited = int(scores.size)
+    else:
+        for z in range(scores.shape[0]):
+            if not reader.active[z]:
+                continue
+            y0, y1, x0, x1 = map(int, reader.boxes[z])
+            width = x1 - x0
+            if width <= scratch_size:
+                rows = max(1, scratch_size // width)
+                for y in range(y0, y1, rows):
+                    stop = min(y + rows, y1)
+                    zero = scratch[:(stop-y)*width].reshape(stop-y, width)
+                    np.equal(mask[z, y:stop, x0:x1], 0, out=zero)
+                    np.copyto(scores[z, y:stop, x0:x1], np.uint8(0), where=zero)
+            else:
+                for y in range(y0, y1):
+                    for x in range(x0, x1, scratch_size):
+                        stop = min(x + scratch_size, x1)
+                        zero = scratch[:stop-x]
+                        np.equal(mask[z, y, x:stop], 0, out=zero)
+                        np.copyto(scores[z, y, x:stop], np.uint8(0), where=zero)
+        # All later reads are restricted by this same immutable support snapshot.
+        # No original mask alias or alternate full-plane reader may survive.
+        reader.mask = reader.scores
+        visited = int(reader.capture_metrics['bounded_input_bytes']) // 2
+    del zero, scratch
+    scores.setflags(write=False)
+    prepare_seconds = time.perf_counter() - started
+    from .runtime import runtime_telemetry
+    telemetry = runtime_telemetry()
+    telemetry.add('confidence.terminal_score_only.parents', 1)
+    telemetry.add('confidence.terminal_score_only.full_score_bytes', int(scores.nbytes))
+    telemetry.add('confidence.terminal_score_only.visited_score_bytes', visited)
+    telemetry.add('confidence.terminal_score_only.prepare_seconds', prepare_seconds)
+    return prepared
+
+
+def _capture_prepared_terminal_confidence_scores(mask, scores, *, prepared, **kwargs):
+    """Module-level queue adapter; no closure can keep a completed source alive."""
+    try:
+        if mask is not prepared.scores or scores is not prepared.scores:
+            raise ValueError('Terminal confidence capture changed its prepared score source')
+        return capture_terminal_confidence_scores(prepared, **kwargs)
+    finally:
+        mask = scores = prepared = None
+        kwargs.clear()
+
+
+def _terminal_confidence_reader_plan(prepared):
+    plan = current_confidence_capture_plan()
+    if (prepared.reader is not None
+            and (plan is None or plan != prepared.reader.capture_plan)):
+        raise ValueError('Prepared terminal confidence reader requires its original capture plan')
+    return plan
+
+
+def try_capture_terminal_confidence_scores(prepared, *, retire, **kwargs):
+    """Admit a score-only reader with an explicit single-backing source charge."""
+    if not isinstance(prepared, TerminalConfidenceScores):
+        raise TypeError('Terminal confidence capture requires prepared scores')
+    task = task_kwargs = None
+    try:
+        plan = _terminal_confidence_reader_plan(prepared)
+        with _LOCK:
+            queue = _CAPTURE_QUEUE
+        if queue is None or plan is None or not confidence_projection_deferred():
+            return None
+        if prepared.reader is not None:
+            kwargs.pop('known_slice_any', None)
+            kwargs.pop('known_slice_bboxes', None)
+        from .confidence_orchestration import RetiringConfidenceCapture
+        # The task owns its own dictionary. This caller frame can then release
+        # every carrier reference even if submission raises after enqueueing.
+        task_kwargs = dict(kwargs, prepared=prepared)
+        task = RetiringConfidenceCapture(prepared.scores, prepared.scores, plan=plan,
+            capture=_capture_prepared_terminal_confidence_scores, retire=retire,
+            kwargs=task_kwargs, score_only_source=True)
+        return queue.try_submit(task)
+    finally:
+        prepared = task = task_kwargs = None
+        kwargs.clear()
+
+
+def capture_terminal_confidence_scores(prepared, **kwargs):
+    """Keep the same masked score product when asynchronous admission declines."""
+    if not isinstance(prepared, TerminalConfidenceScores):
+        raise TypeError('Terminal confidence capture requires prepared scores')
+    reader = None
+    try:
+        _terminal_confidence_reader_plan(prepared)
+        if not confidence_projection_deferred():
+            raise RuntimeError('Prepared terminal confidence scores require deferred projection')
+        reader = prepared.reader
+        if reader is None:
+            return capture_prediction_confidence(prepared.scores, prepared.scores, **kwargs)
+        kwargs.pop('known_slice_any', None)
+        kwargs.pop('known_slice_bboxes', None)
+        return publish_confidence_scores(prepared.scores, native_reader=reader, **kwargs)
+    except BaseException as error:
+        # Match the asynchronous owner: a retained synchronous failed Future
+        # must not keep finished nested reader/writer frames' source arguments.
+        import traceback
+        traceback.clear_frames(error.__traceback__)
+        raise
+    finally:
+        prepared = reader = None
+        kwargs.clear()
 
 
 def configure_confidence_evidence_worker(*, enabled=False, min_conf=0.0):
@@ -426,36 +694,42 @@ def publish_confidence_scores(scores, *, view, model_name, temp_dir, output_shap
     metrics = {}
     read_native = native_reader if native_reader is not None else lambda z:scores[z]
     if confidence_projection_deferred():
-        def write_native(destination, limit=None):
-            result = write_block_confidence_evidence(destination,scores.shape,read_native,
-                layer_key=key,model_name=model_name,provenance=provenance,
-                coordinate_space='native_view_processing',source_shape_tyx=shape,
-                metrics=metrics,max_numeric_bytes=limit)
-            # Per-frame execution diagnostics from the writer take precedence
-            # over the reader's initialization/eligibility description.
-            for field, value in getattr(read_native, 'capture_metrics', {}).items():
-                metrics.setdefault(field, value)
-            return result
-        if publisher is not None:
-            from .confidence_publication import copy_staged_blocks
-            # The background closure owns only compressed files and scalar metadata.
-            # Neither the original score nor prediction workspace crosses this boundary.
-            def publish_staged(path, queue_wait):
-                reference = copy_staged_blocks(path, output/identity, metrics=metrics)
-                result = _register_confidence_reference(reference, metrics=metrics)
-                print(f'Confidence native publication complete {model_name}/{view.name}: '
-                      f'queue_wait_s={queue_wait:.3f}, metrics={json.dumps(metrics,sort_keys=True)}.', flush=True)
+        try:
+            def write_native(destination, limit=None):
+                result = write_block_confidence_evidence(destination,scores.shape,read_native,
+                    layer_key=key,model_name=model_name,provenance=provenance,
+                    coordinate_space='native_view_processing',source_shape_tyx=shape,
+                    metrics=metrics,max_numeric_bytes=limit)
+                # Per-frame execution diagnostics from the writer take precedence
+                # over the reader's initialization/eligibility description.
+                for field, value in getattr(read_native, 'capture_metrics', {}).items():
+                    metrics.setdefault(field, value)
                 return result
-            future = publisher.stage_and_submit(Path(temp_dir)/'confidence_publication',
-                write_native, publish_staged, metrics=metrics)
-            if future is not None:
-                print(f'Confidence native retention staged {model_name}/{view.name}: '
-                      f'elapsed_s={time.perf_counter()-started:.3f}, '
-                      f'numeric_bytes={metrics["payload_bytes"]+metrics["index_bytes"]}.', flush=True)
-                return future
-            print(f'Confidence native retention {model_name}/{view.name}: '
-                  'compressed stage exceeds its slot; using direct streaming.', flush=True)
-        reference = write_native(output/identity)
+            if publisher is not None:
+                from .confidence_publication import copy_staged_blocks
+                # The background closure owns only compressed files and scalar metadata.
+                # Neither the original score nor prediction workspace crosses this boundary.
+                def publish_staged(path, queue_wait):
+                    reference = copy_staged_blocks(path, output/identity, metrics=metrics)
+                    result = _register_confidence_reference(reference, metrics=metrics)
+                    print(f'Confidence native publication complete {model_name}/{view.name}: '
+                          f'queue_wait_s={queue_wait:.3f}, metrics={json.dumps(metrics,sort_keys=True)}.', flush=True)
+                    return result
+                future = publisher.stage_and_submit(Path(temp_dir)/'confidence_publication',
+                    write_native, publish_staged, metrics=metrics)
+                if future is not None:
+                    print(f'Confidence native retention staged {model_name}/{view.name}: '
+                          f'elapsed_s={time.perf_counter()-started:.3f}, '
+                          f'numeric_bytes={metrics["payload_bytes"]+metrics["index_bytes"]}.', flush=True)
+                    return future
+                print(f'Confidence native retention {model_name}/{view.name}: '
+                      'compressed stage exceeds its slot; using direct streaming.', flush=True)
+            reference = write_native(output/identity)
+        finally:
+            # Staging/direct encoding has joined its readers. Failed Futures can
+            # retain closure cells even after traceback frames are cleared; only
+            # compressed files and scalar metadata may survive this boundary.
+            scores = native_reader = read_native = None
     elif not any(bool(np.any(scores[index])) for index in range(scores.shape[0])):
         reference = write_block_confidence_evidence(output / identity, shape, lambda _z: None,
             layer_key=key, model_name=model_name, provenance=provenance,metrics=metrics)
@@ -659,11 +933,17 @@ def capture_prediction_confidence(mask, scores, *, view, model_name, temp_dir,
         raise ValueError('Retained confidence and prediction mask geometry differ')
     if confidence_projection_deferred():
         # Fuse eligibility with compression's plane read; avoid rewriting the dense score map.
-        reader = (lambda z:np.where(retained[z] != 0, values[z], np.uint8(0)))
-        if known_slice_any is not None and known_slice_bboxes is not None:
-            reader = _MaskedNativeScoreReader(retained,values,known_slice_any,known_slice_bboxes)
-        return publish_confidence_scores(values, view=view, model_name=model_name, temp_dir=temp_dir,
-            native_reader=reader, **kwargs)
+        reader = None
+        try:
+            reader = (lambda z:np.where(retained[z] != 0, values[z], np.uint8(0)))
+            if known_slice_any is not None and known_slice_bboxes is not None:
+                reader = _MaskedNativeScoreReader(retained,values,known_slice_any,known_slice_bboxes)
+            return publish_confidence_scores(values, view=view, model_name=model_name, temp_dir=temp_dir,
+                native_reader=reader, **kwargs)
+        finally:
+            # A failed nested writer can keep the lambda alive in a closure cycle
+            # with GC disabled. Empty its captured arrays after its last read.
+            reader = values = retained = None
     for index in range(values.shape[0]):
         values[index][np.asarray(retained[index]) == 0] = np.uint8(0)
     return publish_confidence_scores(values, view=view, model_name=model_name, temp_dir=temp_dir, **kwargs)
@@ -786,6 +1066,9 @@ __all__ = [
     'drain_confidence_publication', 'shutdown_confidence_publication',
     'confidence_publication_reserve_bytes', 'confidence_publication_snapshot',
     'capture_prediction_confidence',
+    'TerminalConfidenceScores', 'prepare_terminal_confidence_scores',
+    'try_capture_terminal_confidence_scores', 'capture_terminal_confidence_scores',
+    'terminal_confidence_capture_available',
     'publish_confidence_scores', 'lookup_confidence_evidence', 'write_confidence_evidence',
     'publish_confidence_shards',
     'write_block_confidence_evidence','publish_native_confidence_pieces',

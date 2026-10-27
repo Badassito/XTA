@@ -175,19 +175,22 @@ def publish_batches(args, runtime, resources, output, sources, count, timings):
             batch_bytes = 2 * args.ratio * args.size * args.size * (1 + 1)
             reservation_context = task.reserve(batch_bytes) if task is not None else nullcontext()
             with reservation_context as reservation:
+                source_mask_nonempty = (bool(mask.any()),) * len(candidates)
                 with timings.measure("policy_call"):
                     result = runtime["policy"].apply_batch_many(
                         images=(image,), masks=(mask,), seeds=(seeds,), output_size=(args.size, args.size))
                 if not isinstance(result, (tuple, list)) or len(result) != 2:
                     raise TypeError("Real GPU policy did not return image/mask tensors")
                 kwargs = dict(runtime=runtime, batch_images=result[0], batch_masks=result[1],
+                              source_mask_nonempty=source_mask_nonempty,
                               candidates=candidates, output_size=(args.size, args.size),
                               channel_kind="gray", channel_count=1, local_warnings=warnings)
                 if task is None:
                     merge(consume(**kwargs))
                 else:
                     kwargs["batch_masks"] = workers._validate_gpu_policy_batch(
-                        **{key: value for key, value in kwargs.items() if key != "local_warnings"})
+                        **{key: value for key, value in kwargs.items()
+                           if key not in {"local_warnings", "source_mask_nonempty"}})
                     task.submit(reservation, kwargs)
                 del result, kwargs
     totals["warnings"] = dict(counts=dict(warnings.counts), examples={

@@ -445,8 +445,48 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             for work in batch
             for candidate in work.candidates
         ]
-        self.assertEqual([sum(len(work.candidates) for work in batch) for batch in batches], [3, 4])
+        self.assertEqual([sum(len(work.candidates) for work in batch) for batch in batches], [4, 3])
         self.assertEqual(flattened, list(range(7)))
+
+    def test_multi_source_batches_fill_partial_source_version_runs(self) -> None:
+        for versions in (1, 7, 8, 35):
+            for limit in (1, 15, 24):
+                with self.subTest(versions=versions, limit=limit):
+                    sources = tuple(
+                        pta._GpuItemWork(
+                            candidates=tuple(self._candidate(source * versions + index)
+                                             for index in range(versions)),
+                            image=np.full((8, 8), source, dtype=np.uint8),
+                            mask=np.ones((8, 8), dtype=np.uint8),
+                            output_size=(8, 8), channel_kind='gray', context=str(source),
+                        ) for source in range(8)
+                    )
+                    batches = tuple(pta_scheduler.iter_compatible_work_batches(
+                        sources, candidate_limit=limit))
+                    sizes = [sum(len(item.candidates) for item in batch) for batch in batches]
+                    full, tail = divmod(8 * versions, limit)
+                    self.assertEqual(sizes, [limit] * full + ([tail] if tail else []))
+                    self.assertEqual([candidate.order for batch in batches for item in batch
+                                      for candidate in item.candidates], list(range(8 * versions)))
+                    for batch in batches:
+                        for item in batch:
+                            source = sources[int(item.context)]
+                            self.assertIs(item.image, source.image)
+                            self.assertIs(item.mask, source.mask)
+
+    def test_multi_source_batches_group_shapes_without_losing_source_order(self) -> None:
+        sources = tuple(pta._GpuItemWork(
+            candidates=tuple(self._candidate(source * 3 + index) for index in range(3)),
+            image=np.zeros((8 + source % 2, 8), dtype=np.uint8),
+            mask=np.ones((8 + source % 2, 8), dtype=np.uint8),
+            output_size=(8, 8), channel_kind='gray', context=str(source),
+        ) for source in range(4))
+        batches = tuple(pta_scheduler.iter_compatible_work_batches(sources, candidate_limit=4))
+        self.assertEqual([sum(len(item.candidates) for item in batch) for batch in batches],
+                         [4, 2, 4, 2])
+        self.assertEqual([candidate.order for batch in batches for item in batch
+                          for candidate in item.candidates], [0, 1, 2, 6, 7, 8, 3, 4, 5, 9, 10, 11])
+        self.assertTrue(all(len({item.image.shape for item in batch}) == 1 for batch in batches))
 
     def test_projection_phase_summary_reports_family_boundaries(self) -> None:
         views = {
@@ -1133,6 +1173,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 batch_images=FakeTensor((1, 1, 7, 8)),
                 batch_masks=FakeTensor((1, 8, 8)),
                 candidates=(candidate,),
+                source_mask_nonempty=(True,),
                 output_size=(8, 8),
                 channel_kind="gray",
                 local_warnings=pta.WarningLog(),
@@ -1160,6 +1201,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 batch_images=FakeTensor((1, 1, 8, 8), "cuda:0"),
                 batch_masks=FakeTensor((1, 8, 8), "cuda:1"),
                 candidates=(self._candidate(0),),
+                source_mask_nonempty=(True,),
                 output_size=(8, 8),
                 channel_kind="gray",
                 local_warnings=pta.WarningLog(),
@@ -1192,6 +1234,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 batch_images=FakeTensor((1, 1, 8, 8)),
                 batch_masks=NoReduceMask((1, 8, 8)),
                 candidates=(self._candidate(0),),
+                source_mask_nonempty=(False,),
                 output_size=(8, 8),
                 channel_kind="gray",
                 local_warnings=pta.WarningLog(),
@@ -1219,6 +1262,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
 
         class Images:
             device = "cuda:0"
+            shape = (3, 5, 8, 8)
 
             def index_select(self, _axis: int, _indices: object):
                 return Selected()
@@ -1488,6 +1532,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 "device_id": device_id,
                 "encoder": encoder,
                 "nvimgcodec": nvimgcodec,
+                "nvjpeg_code_streams": [],
             }
             gray_paths = (root / "gray-a.jpg", root / "gray-b.jpg")
             gray_batch = torch.stack((checker, 255 - checker), dim=0).unsqueeze(1)
@@ -1655,7 +1700,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 if error is not None:
                     raise error
                 self.assertIsNotNone(result)
-                written, flips, warning_counts, warning_examples = result
+                written, flips, warning_counts, warning_examples, _classification = result
                 self.assertEqual(written, 1)
                 self.assertEqual(flips, {})
                 self.assertEqual(warning_counts, {})

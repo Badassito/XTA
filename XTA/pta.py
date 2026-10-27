@@ -141,7 +141,10 @@ from .pta_dataset import (
     deterministic_augmentation_tag,
     finalize_augmentation_stats,
     finalize_background_filter_with_augmentations,
+    fraction_identity_selected,
+    fraction_sample_threshold,
     output_source_identity_text,
+    physical_source_identity_text,
     plan_augmented_versions,
     refresh_retained_original_split_stats,
     split_round_half_toward_train,
@@ -150,6 +153,7 @@ from .pta_dataset import (
     withhold_background_overage_after_flips,
 )
 from .pta_publication import (
+    MASK_POLYGON_FAST_FOREGROUND_MIN_PIXELS,
     OUTPUT_IMAGE_FORMATS,
     PtaDatasetImageSink,
     _CREATED_OUTPUT_DIRS,
@@ -162,6 +166,7 @@ from .pta_publication import (
     candidate_semantic_output_path,
     ensure_output_parent_once,
     ensure_tiff_output_available,
+    mask_has_yolo_polygon,
     mask_to_yolo_lines,
     output_image_suffix,
     parse_output_image_format,
@@ -678,7 +683,7 @@ def estimate_spec_resident_bytes(spec: object) -> Optional[int]:
             h, w = probe_image_dimensions(first_path)
         else:
             video_path = getattr(spec, "video_path")
-            info = ffprobe_info(video_path)
+            info = getattr(spec, "video_info_hint", None) or ffprobe_info(video_path)
             h, w = int(info["height"]), int(info["width"])
         target = cubic_target_shape((t_dim, h, w))
         source_pair = 2 * int(t_dim) * int(h) * int(w)
@@ -865,6 +870,28 @@ def make_channel_tag(base_tag: str, variant: ChannelVariant) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _release_failed_allocator_blocks(function):
+    """Own new shared allocations until their complete input/preparation result returns."""
+    from functools import wraps
+
+    @wraps(function)
+    def run(first, *args, allocator=None, **kwargs):
+        created = []
+        def allocate(shape):
+            array, block = allocator(shape)
+            if (block is not None and block is not getattr(first, 'volume_block', None)
+                    and all(block is not existing for existing in created)):
+                created.append(block)
+            return array, block
+        try:
+            return function(first, *args, allocator=allocate if allocator is not None else None, **kwargs)
+        except BaseException:
+            for block in created:
+                block.release()
+            raise
+    return run
+
+
 @dataclass
 class SourceVolume:
     input_dir: Path
@@ -930,9 +957,11 @@ def ffprobe_info(video_path: Path) -> Dict[str, object]:
 
 
 @runtime_telemetry_phase('pta.input.decode_video')
-def decode_video_gray8_to_memory(video_path: Path, *, warnings: WarningLog, allocator: Optional[ArrayAllocator] = None) -> Tuple[np.ndarray, float, Optional[SharedBlock]]:
+@_release_failed_allocator_blocks
+def decode_video_gray8_to_memory(video_path: Path, *, warnings: WarningLog, allocator: Optional[ArrayAllocator] = None,
+                                 probe_info: Optional[Mapping[str, object]] = None) -> Tuple[np.ndarray, float, Optional[SharedBlock]]:
     _require_bin("ffmpeg")
-    info = ffprobe_info(video_path)
+    info = ffprobe_info(video_path) if probe_info is None else probe_info
     w = int(info["width"])
     h = int(info["height"])
     t = int(info["num_frames"])
@@ -1161,6 +1190,7 @@ def _decode_jpeg_sequence_nvimgcodec(
 
 
 @runtime_telemetry_phase('pta.input.decode_sequence')
+@_release_failed_allocator_blocks
 def load_image_sequence_to_memory(
     images: Sequence[Path],
     *,
@@ -1172,16 +1202,20 @@ def load_image_sequence_to_memory(
     jpeg_device_ids: Sequence[int] = (),
     jpeg_cpu_sets: Sequence[Sequence[int]] = (),
     load_cpu_order: Sequence[int] = (),
+    required_positions: Optional[Sequence[int]] = None,
 ) -> Tuple[np.ndarray, Optional[SharedBlock]]:
     if not images:
         raise ValueError("No image sequence frames supplied")
     first_gray = _read_gray_image_opencv(images[0])
     h, w = first_gray.shape
     t = len(images)
+    positions = list(range(t)) if required_positions is None else sorted({0, *(int(i) for i in required_positions)})
+    if any(i < 0 or i >= t for i in positions):
+        raise ValueError('Required image-sequence positions are outside the source volume')
     if allocator is not None:
         volume, block = allocator((t, h, w))
     else:
-        volume = np.empty((t, h, w), dtype=np.uint8)
+        volume = np.empty((t, h, w), dtype=np.uint8) if required_positions is None else np.zeros((t, h, w), dtype=np.uint8)
         block = None
     volume[0] = first_gray
 
@@ -1213,7 +1247,25 @@ def load_image_sequence_to_memory(
     elif backend == "nvjpeg":
         raise RuntimeError("--jpeg_decode_backend nvjpeg requires at least one discovered CUDA-visible GPU")
 
-    def _read_image(i: int) -> None:
+    if required_positions is not None:
+        import struct
+        # shortcut: unused PNG payloads are not decoded; diagnostics retain full loading.
+        selected_positions = set(positions)
+        for position, path in enumerate(images):
+            if position in selected_positions:
+                continue
+            with Path(path).open('rb') as source:
+                header = source.read(24)
+            if (len(header) != 24 or header[:8] != b'\x89PNG\r\n\x1a\n'
+                    or header[12:16] != b'IHDR'):
+                raise ValueError(f'Invalid PNG image header: {path}')
+            image_width, image_height = struct.unpack('>II', header[16:24])
+            if (image_height, image_width) != (h, w):
+                raise ValueError(f'Image dimension mismatch: {path} has {(image_height, image_width)}, expected {(h, w)}')
+        warnings.add('partial_sequence_required_frames', f'decoded={len(positions)}/{t}; annotation/channel context retained')
+
+    def _read_image(job: int) -> None:
+        i = positions[job]
         if i == 0:
             return
         gray = _read_gray_image_opencv(images[i])
@@ -1222,7 +1274,7 @@ def load_image_sequence_to_memory(
         volume[i] = gray
 
     parallel_for_indices(
-        t,
+        len(positions),
         _read_image,
         workers=workers,
         desc="Reading image sequence into in-memory gray8 volume",
@@ -1267,18 +1319,11 @@ def nrrd_header_to_internal_permutation(header: Mapping[str, object]) -> Optiona
     return None
 
 
-@runtime_telemetry_phase('pta.mask.load_nrrd')
-def load_nrrd_mask_for_volume(nrrd_path: Path, expected_shape_tyx: Tuple[int, int, int], *, warnings: WarningLog) -> np.ndarray:
-    try:
-        import nrrd  # type: ignore
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError("pynrrd is required for NRRD segmentation input: pip install pynrrd") from exc
-    data, header = nrrd.read(str(nrrd_path))
-    arr = np.asarray(data)
-    if arr.ndim != 3:
-        raise ValueError(f"NRRD segmentation must be 3D, got shape {arr.shape} from {nrrd_path}")
+def _nrrd_mask_orientation(header, shape, expected_shape_tyx, nrrd_path):
+    if len(shape) != 3:
+        raise ValueError(f"NRRD segmentation must be 3D, got shape {shape} from {nrrd_path}")
     t_dim, h, w = (int(expected_shape_tyx[0]), int(expected_shape_tyx[1]), int(expected_shape_tyx[2]))
-    shape = tuple(int(x) for x in arr.shape)
+    shape = tuple(int(x) for x in shape)
     candidates: List[Tuple[str, Tuple[int, int, int]]] = []
     for name, source_shape, permutation in (
         ("already_tyx", (t_dim, h, w), (0, 1, 2)),
@@ -1314,8 +1359,65 @@ def load_nrrd_mask_for_volume(nrrd_path: Path, expected_shape_tyx: Tuple[int, in
             )
         orientation, permutation = candidates[0]
 
-    internal = arr if permutation == (0, 1, 2) else np.transpose(arr, permutation)
-    mask = np.ascontiguousarray((np.asarray(internal) > 0).astype(np.uint8))
+    return orientation, permutation
+
+
+def _read_canonical_uint8_nrrd(nrrd_path, nrrd, expected_shape_tyx):
+    """Bound gzip output in place instead of building and copying an entire bytearray."""
+    import gzip
+    with Path(nrrd_path).open('rb') as source:
+        header = nrrd.read_header(source)
+        if (header.get('type') not in {'uint8', 'uint8_t', 'uchar', 'unsigned char'}
+                or header.get('encoding') not in {'raw', 'gzip', 'gz'}
+                or header.get('datafile', header.get('data file')) is not None
+                or header.get('lineskip', header.get('line skip', 0)) != 0
+                or header.get('byteskip', header.get('byte skip', 0)) != 0):
+            return None
+        shape = tuple(int(x) for x in header['sizes'])
+        if int(header.get('dimension', 0)) != len(shape) or any(x <= 0 for x in shape):
+            raise ValueError(f'Invalid NRRD dimensions: {nrrd_path}')
+        orientation, permutation = _nrrd_mask_orientation(header, shape, expected_shape_tyx, nrrd_path)
+        if tuple(permutation) != (2, 1, 0):
+            return None
+        mask = np.empty(tuple(expected_shape_tyx), np.uint8)
+        raw = memoryview(mask).cast('B')
+        stream = gzip.GzipFile(fileobj=source, mode='rb') if header['encoding'] in {'gzip', 'gz'} else source
+        try:
+            with runtime_telemetry().span('pta.mask.nrrd_payload_read'):
+                for start in range(0, len(raw), 8 * 1024 * 1024):
+                    chunk = raw[start:min(len(raw), start + 8 * 1024 * 1024)]
+                    filled = 0
+                    while filled < len(chunk):
+                        count = stream.readinto(chunk[filled:])
+                        if not count:
+                            raise ValueError(f'Unexpected EOF in NRRD segmentation payload: {nrrd_path}')
+                        filled += int(count)
+                if stream.read(1):
+                    raise ValueError(f'NRRD segmentation payload exceeds declared dimensions: {nrrd_path}')
+        finally:
+            if stream is not source:
+                stream.close()
+        with runtime_telemetry().span('pta.mask.nrrd_normalize'):
+            np.greater(mask, 0, out=mask)
+        return mask, orientation
+
+
+@runtime_telemetry_phase('pta.mask.load_nrrd')
+def load_nrrd_mask_for_volume(nrrd_path: Path, expected_shape_tyx: Tuple[int, int, int], *, warnings: WarningLog) -> np.ndarray:
+    try:
+        import nrrd  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("pynrrd is required for NRRD segmentation input: pip install pynrrd") from exc
+    fast = _read_canonical_uint8_nrrd(nrrd_path, nrrd, expected_shape_tyx)
+    if fast is not None:
+        mask, orientation = fast
+        warnings.add('segmentation_nrrd_bounded_readinto', f'{nrrd_path.name}: {mask.nbytes} bytes, bounded 8 MiB output chunks')
+    else:
+        data, header = nrrd.read(str(nrrd_path))
+        arr = np.asarray(data)
+        orientation, permutation = _nrrd_mask_orientation(header, arr.shape, expected_shape_tyx, nrrd_path)
+        internal = arr if permutation == (0, 1, 2) else np.transpose(arr, permutation)
+        mask = np.ascontiguousarray((np.asarray(internal) > 0).astype(np.uint8))
     warnings.add("segmentation_nrrd_loaded_in_memory", f"{nrrd_path.name}: {mask.shape}, {mask.nbytes / GIB:.2f} GiB, orientation={orientation}")
     return mask
 
@@ -1370,6 +1472,7 @@ def rasterize_yolo_labels(src: SourceVolume, *, warnings: WarningLog, workers: i
     return mask, mask_block
 
 
+@runtime_telemetry_phase('pta.prepare.annotation_states')
 def derive_annotation_states(src: SourceVolume, mask_u8: np.ndarray) -> Tuple[int, ...]:
     """Return one explicit three-state annotation value per loaded image slice.
 
@@ -1387,7 +1490,7 @@ def derive_annotation_states(src: SourceVolume, mask_u8: np.ndarray) -> Tuple[in
     states = np.full((int(mask.shape[0]),), ANNOTATION_UNANNOTATED, dtype=np.uint8)
     if src.label_source == "nrrd":
         states[:] = ANNOTATION_BACKGROUND
-        states[np.any(mask > 0, axis=(1, 2))] = ANNOTATION_FOREGROUND
+        states[np.any(mask, axis=(1, 2))] = ANNOTATION_FOREGROUND
     elif src.label_source == "yolo":
         for frame_i0, label_path in src.labels_by_frame.items():
             idx = int(frame_i0)
@@ -1411,6 +1514,7 @@ def annotation_state_counts(states: Sequence[int]) -> Dict[str, int]:
 ForegroundAnchor = Tuple[int, int, int]  # source (t, y, x)
 
 
+@runtime_telemetry_phase('pta.prepare.foreground_anchors')
 def collect_foreground_slice_anchors(
     src: SourceVolume,
     mask_u8: np.ndarray,
@@ -1597,6 +1701,10 @@ def overlay_rgb(frame_gray: np.ndarray, mask_u8: np.ndarray) -> np.ndarray:
 # Gaussian smoothing and cubic volume preprocessing
 # ---------------------------------------------------------------------------
 
+# A fresh CUDA helper costs seconds; small masks retain the CPU path.
+_GAUSSIAN_GPU_MIN_VOXELS = 64 * 1024**2
+_VOID_FILL_GPU_MIN_VOXELS = 1024**3
+
 @runtime_telemetry_phase('pta.prepare.gaussian')
 def apply_gaussian_smoothing(
     mask_u8: np.ndarray,
@@ -1605,13 +1713,15 @@ def apply_gaussian_smoothing(
     passes: int,
     warnings: WarningLog,
     after_pass: Optional[Callable[[int, np.ndarray], None]] = None,
-) -> List[Dict[str, int | float]]:
+    device_ids: Sequence[int] = (),
+    work_prefix: Optional[Path] = None,
+) -> List[Dict[str, object]]:
     """Apply shared TTA Gaussian smoothing to the in-memory binary 3D mask.
 
     The mask remains binary after every pass by thresholding the smoothed probability
     volume at 0.5. Each pass consumes the complete mask before view reslicing.
     """
-    stats: List[Dict[str, int | float]] = []
+    stats: List[Dict[str, object]] = []
     sigma_f = float(sigma)
     pass_count = int(passes)
     if sigma_f <= 0.0 or pass_count <= 0:
@@ -1624,11 +1734,26 @@ def apply_gaussian_smoothing(
         # The shared primitive uses isotropic voxel
         # sigma, constant-zero boundary, truncate=4, and threshold after every
         # pass so the following pass starts from the previous binary result.
-        after = binary_gaussian_pass(
-            before,
-            sigma=sigma_f,
-            gaussian_filter=ndi.gaussian_filter,
-        )
+        accelerator: Dict[str, object] = {}
+        gpu_enabled = os.environ.get("YOLO_TTA_GAUSSIAN_SMOOTHING_GPU", "1").strip().lower() not in {"0", "false", "no", "off"}
+        if device_ids and gpu_enabled and mask_u8.size >= _GAUSSIAN_GPU_MIN_VOXELS:
+            from .pta_preprocessing import run_gpu_preprocessing
+            try:
+                with runtime_telemetry().span('pta.prepare.gaussian.gpu'):
+                    accelerator = run_gpu_preprocessing(
+                        mask_u8, operation="gaussian", device_ids=device_ids,
+                        work_prefix=work_prefix or Path.cwd()/".v18_work"/"gaussian",
+                        sigma=sigma_f,
+                    )
+            except Exception as exc:
+                runtime_telemetry().fallback('pta.prepare.gaussian.gpu', exc)
+                warnings.add("gaussian_gpu_fallback", f"{type(exc).__name__}: {exc}")
+                print(f"GPU Gaussian unavailable; using CPU: {type(exc).__name__}: {exc}")
+                accelerator = {"backend": "cpu", "gpu_fallback_reason": f"{type(exc).__name__}: {exc}"}
+        if accelerator and accelerator.get("backend") != "cpu":
+            after = mask_u8
+        else:
+            after = binary_gaussian_pass(before, sigma=sigma_f, gaussian_filter=ndi.gaussian_filter)
         after_count = int(np.count_nonzero(after))
         mask_u8[:] = after
         stats.append({
@@ -1637,6 +1762,7 @@ def apply_gaussian_smoothing(
             "foreground_before": int(before_count),
             "foreground_after": int(after_count),
             "delta_voxels": int(after_count - before_count),
+            **accelerator,
         })
         if after_pass is not None:
             after_pass(int(pass_idx), mask_u8)
@@ -1659,11 +1785,17 @@ def resize_to_approximately_cube(
     warnings: WarningLog,
     work_dir: Optional[Path] = None,
     workers: int = 1,
+    destinations: Optional[Tuple[np.ndarray, np.ndarray]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int]]:
     source_shape = tuple(int(x) for x in volume_u8.shape)
     target = shared_media.compute_cube_resize_shape(*source_shape)
     if source_shape == target:
         warnings.add("cubic_resize_skipped", f"source_shape={source_shape} already within 5% cube tolerance")
+        if destinations is not None:
+            for source, destination in zip((volume_u8, mask_u8), destinations):
+                shared_media._validate_processing_cube_destination(destination, source, target)
+                np.copyto(destination, source)
+            return destinations[0], destinations[1], target
         return np.ascontiguousarray(volume_u8, dtype=np.uint8), np.ascontiguousarray(mask_u8, dtype=np.uint8), target
     if tuple(int(x) for x in mask_u8.shape) != source_shape:
         raise ValueError(f"Image and mask volumes must have identical shape before cubic resize: image={source_shape}, mask={mask_u8.shape}")
@@ -1676,6 +1808,7 @@ def resize_to_approximately_cube(
         workers=max(1, int(workers)),
         prefer_memory=True,
         reserve_bytes=0,
+        destination=destinations[0] if destinations is not None else None,
     )
     resized_mask = shared_media.resize_categorical_volume_to_processing_cube_uint8(
         np.asarray(mask_u8, dtype=np.uint8),
@@ -1684,6 +1817,7 @@ def resize_to_approximately_cube(
         workers=max(1, int(workers)),
         prefer_memory=True,
         reserve_bytes=0,
+        destination=destinations[1] if destinations is not None else None,
     )
     warnings.add("cubic_resize_applied", f"{source_shape} -> {target}; smaller axes are within 5% of longest axis")
     return resized_volume, resized_mask, target
@@ -2315,6 +2449,7 @@ class VolumeInputSpec:
     fps_hint: Optional[float] = None
     yolo_polygons_by_index: Dict[int, YoloPolygons] = field(default_factory=dict)
     source_stem: Optional[str] = None
+    video_info_hint: Optional[Dict[str, object]] = None
 
 
 @dataclass
@@ -2332,13 +2467,13 @@ class PreparedVolume:
     mask_for_render: np.ndarray
     views: List[ViewInfo]
     plans: List[RenderPlan]
-    smoothing_stats: List[Dict[str, int | float]]
+    smoothing_stats: List[Dict[str, object]]
     nrrd_paths: List[Path]
     voxel_initial: Optional[int]
     voxel_final: Optional[int]
     foreground_preservation_stats: Dict[str, int]
     semantic_foreground: bool = False
-    void_fill_stats: Optional[Dict[str, int]] = None
+    void_fill_stats: Optional[Dict[str, object]] = None
     semantic_coverage_for_render: Optional[np.ndarray] = None
     # Blocks backing volume_for_render/mask_for_render for the
     # process pool, plus every block this volume owns (released at finalize).
@@ -2365,7 +2500,7 @@ class VolumeSummaryRecord:
     foreground_preservation_stats: Dict[str, int]
     voxel_initial: Optional[int]
     voxel_final: Optional[int]
-    smoothing_stats: List[Dict[str, int | float]]
+    smoothing_stats: List[Dict[str, object]]
     nrrd_paths: List[Path]
     views: List[ViewInfo]
     tile_configs: List[TileConfig]
@@ -2377,7 +2512,7 @@ class VolumeSummaryRecord:
     candidates_written: int = 0
     fraction: float = 1.0
     candidates_before_fraction: int = 0
-    void_fill_stats: Optional[Dict[str, int]] = None
+    void_fill_stats: Optional[Dict[str, object]] = None
 
 
 def _v18_view_manifest_record(view: ViewInfo) -> Dict[str, object]:
@@ -3003,6 +3138,7 @@ def _discover_directory_volume_specs(input_path: Path, *, force: bool, warnings:
                 encoded_indices=encoded_indices,
                 frame_count_hint=frame_count,
                 fps_hint=fps,
+                video_info_hint=dict(info),
                 yolo_polygons_by_index=yolo_polygons_by_index,
             ))
             continue
@@ -3053,7 +3189,31 @@ def _discover_directory_volume_specs(input_path: Path, *, force: bool, warnings:
     return specs
 
 
+def _required_partial_sequence_positions(
+    spec: VolumeInputSpec, channel_variants: Optional[Sequence[ChannelVariant]], *,
+    force: bool, require_all_frames: bool,
+) -> Optional[Tuple[int, ...]]:
+    if (spec.kind != 'sequence' or spec.label_source != 'yolo'
+            or spec.volume_class != 'partially_labeled' or force or require_all_frames
+            or channel_variants is None
+            or any(path.suffix.lower() != '.png' for path in spec.image_paths_by_index.values())):
+        return None
+    encoded = tuple(sorted(int(index) for index in spec.image_paths_by_index))
+    positions = {index: position for position, index in enumerate(encoded)}
+    if any(int(index) not in positions for index in spec.labels_by_index):
+        raise ValueError(f'Annotated sequence indices do not match source images: {spec.stem}')
+    centers = {positions[int(index)] for index in spec.labels_by_index}
+    required = set(centers)
+    for center in centers:
+        for variant in channel_variants:
+            context, _missing = encoded_channel_source_positions(encoded, center, variant.offsets)
+            if context is not None:
+                required.update(context)
+    return tuple(sorted(required)) if len(required) < len(encoded) else None
+
+
 @runtime_telemetry_phase('pta.input.load')
+@_release_failed_allocator_blocks
 def load_source_volume_from_spec(
     spec: VolumeInputSpec,
     *,
@@ -3065,15 +3225,38 @@ def load_source_volume_from_spec(
     jpeg_device_ids: Sequence[int] = (),
     jpeg_cpu_sets: Sequence[Sequence[int]] = (),
     load_cpu_order: Sequence[int] = (),
+    channel_variants: Optional[Sequence[ChannelVariant]] = None,
+    force: bool = False,
+    require_all_sequence_frames: bool = False,
 ) -> SourceVolume:
     if spec.kind == "video":
         if spec.video_path is None:
             raise RuntimeError(f"Internal error: video spec for {spec.stem} has no video path")
-        volume, fps, volume_block = decode_video_gray8_to_memory(spec.video_path, warnings=warnings, allocator=allocator)
+        info = getattr(spec, 'video_info_hint', None) or ffprobe_info(spec.video_path)
+        mask_volume: Optional[np.ndarray] = None
+        if spec.label_source == 'nrrd' and int(workers) >= 2:
+            if spec.segmentation_nrrd_path is None:
+                raise RuntimeError(f"Internal error: NRRD label source missing for {spec.stem}")
+            expected_shape = (int(info['num_frames']), int(info['height']), int(info['width']))
+            volume_block = None
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix='pta-input-mask') as inputs:
+                mask_future = inputs.submit(load_nrrd_mask_for_volume, spec.segmentation_nrrd_path,
+                    expected_shape, warnings=warnings)
+                try:
+                    volume, fps, volume_block = decode_video_gray8_to_memory(
+                        spec.video_path, warnings=warnings, allocator=allocator, probe_info=info)
+                    mask_volume = mask_future.result()
+                except BaseException:
+                    mask_future.cancel()
+                    if volume_block is not None:
+                        volume_block.release()
+                    raise
+        else:
+            volume, fps, volume_block = decode_video_gray8_to_memory(
+                spec.video_path, warnings=warnings, allocator=allocator, probe_info=info)
         frame_count = int(volume.shape[0])
         labels_by_frame: Dict[int, Path] = {}
         polygons_by_frame: Dict[int, YoloPolygons] = {}
-        mask_volume: Optional[np.ndarray] = None
         if spec.label_source == "yolo":
             if spec.input_start_index is None:
                 raise RuntimeError(f"Internal error: video labels for {spec.stem} have no start index")
@@ -3084,7 +3267,7 @@ def load_source_volume_from_spec(
             }
             if sorted(labels_by_frame.keys()) != list(range(frame_count)):
                 raise ValueError(f"Video label frame mapping for {spec.stem} does not cover every decoded frame")
-        elif spec.label_source == "nrrd":
+        elif spec.label_source == "nrrd" and mask_volume is None:
             if spec.segmentation_nrrd_path is None:
                 raise RuntimeError(f"Internal error: NRRD label source missing for {spec.stem}")
             mask_volume = load_nrrd_mask_for_volume(spec.segmentation_nrrd_path, tuple(volume.shape), warnings=warnings)
@@ -3109,6 +3292,9 @@ def load_source_volume_from_spec(
 
     ordered_indices = sorted(int(x) for x in spec.image_paths_by_index.keys())
     ordered_images = [spec.image_paths_by_index[int(idx)] for idx in ordered_indices]
+    required_positions = _required_partial_sequence_positions(
+        spec, channel_variants, force=bool(force), require_all_frames=bool(require_all_sequence_frames),
+    )
     volume, volume_block = load_image_sequence_to_memory(
         ordered_images,
         warnings=warnings,
@@ -3119,6 +3305,7 @@ def load_source_volume_from_spec(
         jpeg_device_ids=jpeg_device_ids,
         jpeg_cpu_sets=jpeg_cpu_sets,
         load_cpu_order=load_cpu_order,
+        required_positions=required_positions,
     )
     labels_by_frame: Dict[int, Path] = {}
     polygons_by_frame: Dict[int, YoloPolygons] = {}
@@ -3303,6 +3490,7 @@ def build_plans_for_views(
 
 
 @runtime_telemetry_phase('pta.prepare')
+@_release_failed_allocator_blocks
 def prepare_loaded_source(
     src: SourceVolume,
     *,
@@ -3314,6 +3502,7 @@ def prepare_loaded_source(
     channel_variants: Sequence[ChannelVariant],
     write_side_effects: bool,
     allocator: Optional[ArrayAllocator] = None,
+    preprocessing_device_ids: Sequence[int] = (),
 ) -> PreparedVolume:
     source_shape = tuple(int(x) for x in src.volume.shape)
     effective_volume_class = effective_class(src.volume_class, force=bool(args.force))
@@ -3427,7 +3616,7 @@ def prepare_loaded_source(
     if write_side_effects and label_enabled and bool(args.save_nrrd):
         nrrd_paths.append(write_nrrd(mask, out_dir / "nrrds" / f"{src.stem}_Pass_0.nrrd"))
 
-    void_fill_stats: Optional[Dict[str, int]] = None
+    void_fill_stats: Optional[Dict[str, object]] = None
     if bool(getattr(args, "enable_3d_void_fill", False)):
         if label_enabled and effective_volume_class == "fully_labeled" and not source_encoded_gaps:
             connectivity_text = os.environ.get("YOLO_TTA_VOIDFILL_CONNECTIVITY", "").strip()
@@ -3435,17 +3624,36 @@ def prepare_loaded_source(
                 connectivity = int(connectivity_text) if connectivity_text else 6
             except ValueError:
                 connectivity = 6  # Match the shared helper's legacy invalid-text fallback.
-            foreground_before = int(np.count_nonzero(mask))
-            fill_3d_voids_inplace_streaming(
-                mask, out_dir / ".v18_work" / src.stem / "void_fill",
-                connectivity=connectivity,
-            )
-            foreground_after = int(np.count_nonzero(mask))
+            accelerator = {}
+            with runtime_telemetry().span('pta.prepare.void_fill'):
+                foreground_before = int(np.count_nonzero(mask))
+                gpu_minimum = _VOID_FILL_GPU_MIN_VOXELS * (2 if len(preprocessing_device_ids) == 1 else 1)
+                if preprocessing_device_ids and mask.size >= gpu_minimum:
+                    from .pta_preprocessing import run_gpu_preprocessing
+                    try:
+                        accelerator = run_gpu_preprocessing(
+                            mask, operation="void_fill", device_ids=preprocessing_device_ids,
+                            work_prefix=out_dir/".v18_work"/src.stem/"void_fill",
+                            connectivity=connectivity,
+                        )
+                        if accelerator.get("fallback_reason"):
+                            warnings.add("void_fill_gpu_fallback", str(accelerator["fallback_reason"]))
+                    except Exception as exc:
+                        runtime_telemetry().fallback('pta.prepare.void_fill.gpu', exc)
+                        warnings.add("void_fill_gpu_fallback", f"{type(exc).__name__}: {exc}")
+                        print(f"GPU void fill unavailable; using CPU: {type(exc).__name__}: {exc}")
+                        accelerator = {"backend": "cpu", "gpu_fallback_reason": f"{type(exc).__name__}: {exc}"}
+                if not accelerator or "gpu_fallback_reason" in accelerator:
+                    fill_3d_voids_inplace_streaming(
+                        mask, out_dir/".v18_work"/src.stem/"void_fill", connectivity=connectivity,
+                    )
+                foreground_after = int(np.count_nonzero(mask))
             void_fill_stats = {
                 "background_connectivity": connectivity,
                 "foreground_before": foreground_before,
                 "foreground_after": foreground_after,
                 "added_voxels": foreground_after - foreground_before,
+                **accelerator,
             }
             if write_side_effects and bool(args.save_nrrd):
                 nrrd_paths.append(write_nrrd(mask, out_dir / "nrrds" / f"{src.stem}_VoidFill.nrrd"))
@@ -3456,7 +3664,7 @@ def prepare_loaded_source(
         else:
             warnings.add("3d_void_fill_disabled_for_partial_volume", f"{src.stem}: Partial volumes disable 3D label transformations unless --force is supplied")
 
-    smoothing_stats: List[Dict[str, int | float]] = []
+    smoothing_stats: List[Dict[str, object]] = []
     gaussian_requested = float(args.gaussian_smoothing) > 0.0 and int(args.gaussian_smoothing_passes) > 0
     if (
         label_enabled
@@ -3474,6 +3682,8 @@ def prepare_loaded_source(
             passes=int(args.gaussian_smoothing_passes),
             warnings=warnings,
             after_pass=_save_gaussian_pass_nrrd,
+            device_ids=preprocessing_device_ids,
+            work_prefix=out_dir/".v18_work"/src.stem/"gaussian",
         )
     elif label_enabled and source_encoded_gaps and gaussian_requested:
         warnings.add(
@@ -3491,23 +3701,47 @@ def prepare_loaded_source(
         effective_volume_class in {"fully_labeled", "unlabeled"}
         and not source_encoded_gaps
     )
+    cube_volume_block = cube_mask_block = cube_coverage_block = None
+    cube_blocks: List[SharedBlock] = []
     if cube_resize_eligible:
-        volume_for_render, mask_for_render, processing_shape = resize_to_approximately_cube(
-            src.volume,
-            mask,
-            warnings=warnings,
-            work_dir=out_dir / ".v18_work" / src.stem,
-            workers=max(1, int(workers)),
-        )
-        if semantic_coverage is not None and tuple(processing_shape) != tuple(source_shape):
-            semantic_coverage = shared_media.resize_categorical_volume_to_processing_cube_uint8(
-                semantic_coverage,
-                processing_shape,
-                out_dir / ".v18_work" / src.stem / "annotation_coverage_cube.uint8",
+        try:
+            destinations = None
+            target_shape = shared_media.compute_cube_resize_shape(*source_shape)
+            if allocator is not None and tuple(target_shape) != source_shape:
+                volume_destination, cube_volume_block = allocator(target_shape)
+                if cube_volume_block is not None:
+                    cube_blocks.append(cube_volume_block)
+                mask_destination, cube_mask_block = allocator(target_shape)
+                if cube_mask_block is not None:
+                    cube_blocks.append(cube_mask_block)
+                destinations = (volume_destination, mask_destination)
+            volume_for_render, mask_for_render, processing_shape = resize_to_approximately_cube(
+                src.volume,
+                mask,
+                warnings=warnings,
+                work_dir=out_dir / ".v18_work" / src.stem,
                 workers=max(1, int(workers)),
-                prefer_memory=True,
-                reserve_bytes=0,
+                **({'destinations': destinations} if destinations is not None else {}),
             )
+            if semantic_coverage is not None and tuple(processing_shape) != tuple(source_shape):
+                coverage_destination = None
+                if allocator is not None:
+                    coverage_destination, cube_coverage_block = allocator(processing_shape)
+                    if cube_coverage_block is not None:
+                        cube_blocks.append(cube_coverage_block)
+                semantic_coverage = shared_media.resize_categorical_volume_to_processing_cube_uint8(
+                    semantic_coverage,
+                    processing_shape,
+                    out_dir / ".v18_work" / src.stem / "annotation_coverage_cube.uint8",
+                    workers=max(1, int(workers)),
+                    prefer_memory=True,
+                    reserve_bytes=0,
+                    destination=coverage_destination,
+                )
+        except BaseException:
+            for block in cube_blocks:
+                block.release()
+            raise
     else:
         volume_for_render = src.volume
         mask_for_render = mask
@@ -3554,14 +3788,15 @@ def prepare_loaded_source(
     # The render arrays must live in shared memory for the
     # persistent process pool.  Pass-through when the loader already allocated
     # them there (no resize); copy once into fresh blocks otherwise.
-    volume_for_render, volume_render_block = ensure_shared_uint8(
-        volume_for_render, src.volume_block if volume_for_render is src.volume else None, allocator)
-    mask_for_render, mask_render_block = ensure_shared_uint8(
-        mask_for_render, mask_block if mask_for_render is mask else None, allocator)
+    with runtime_telemetry().span('pta.prepare.share_render_arrays'):
+        volume_for_render, volume_render_block = ensure_shared_uint8(
+            volume_for_render, cube_volume_block or (src.volume_block if volume_for_render is src.volume else None), allocator)
+        mask_for_render, mask_render_block = ensure_shared_uint8(
+            mask_for_render, cube_mask_block or (mask_block if mask_for_render is mask else None), allocator)
     semantic_coverage_render_block: Optional[SharedBlock] = None
     if semantic_coverage is not None:
         semantic_coverage, semantic_coverage_render_block = ensure_shared_uint8(
-            semantic_coverage, None, allocator)
+            semantic_coverage, cube_coverage_block, allocator)
     owned_blocks: List[SharedBlock] = []
     for candidate_block in (src.volume_block, mask_block, volume_render_block, mask_render_block, semantic_coverage_render_block):
         if candidate_block is not None and all(candidate_block is not existing for existing in owned_blocks):
@@ -3695,35 +3930,6 @@ def prepare_loaded_source(
         semantic_coverage_render_block=semantic_coverage_render_block,
         shm_blocks=owned_blocks,
     )
-
-
-MASK_POLYGON_FAST_FOREGROUND_MIN_PIXELS = 16
-
-
-def mask_has_yolo_polygon(mask01: np.ndarray) -> bool:
-    m = (np.asarray(mask01, dtype=np.uint8) > 0).astype(np.uint8)
-    nonzero = int(np.count_nonzero(m))
-    if nonzero == 0:
-        return False
-    # Larger masks are provisionally foreground for candidate budgeting.
-    # Publication still validates their contours; sparse or fragmented masks
-    # can be demoted there even when their total pixel count exceeds this cap.
-    # Check small masks here, where short lines often fail polygon export.
-    if nonzero >= MASK_POLYGON_FAST_FOREGROUND_MIN_PIXELS:
-        return True
-    contours, hierarchy = cv2.findContours(m * 255, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return False
-    hierarchy_arr = [None] * len(contours) if hierarchy is None else list(hierarchy[0])
-    for cnt, hrow in zip(contours, hierarchy_arr):
-        if hrow is not None and int(hrow[3]) >= 0:
-            continue
-        if cnt is None or len(cnt) < 3:
-            continue
-        approx = cv2.approxPolyDP(cnt, epsilon=1.0, closed=True)
-        if approx is not None and len(approx) >= 3:
-            return True
-    return False
 
 
 def _source_frames_for_processed_transverse(prep: PreparedVolume, frame_idx: int) -> range:
@@ -3888,6 +4094,8 @@ def classify_original_foregrounds_for_volume(
     workers: int,
     warnings: Optional[WarningLog] = None,
     selected_candidates: Optional[Sequence[OutputCandidate]] = None,
+    gpu_pool: Optional[PersistentRenderPool] = None,
+    generation: int = 0,
 ) -> Dict[Tuple[str, int, str, int], bool]:
     """Classify copy-0 (original) frames/tiles as foreground/background.
 
@@ -3926,7 +4134,22 @@ def classify_original_foregrounds_for_volume(
     # source-space intersection can be empty even when tilted categorical
     # projections overlap after each plane is rendered separately.
     coverage_volume = prep.semantic_coverage_for_render if prep.semantic_foreground else None
-    all_empty = not bool(np.any(prep.mask_for_render))
+    use_yolo_geometry = (
+        not prep.semantic_foreground
+        and prep.src.label_source == "yolo"
+        and bool(prep.src.yolo_polygons_by_frame or prep.src.labels_by_frame)
+        and not prep.smoothing_stats
+        and not getattr(prep, "void_fill_stats", None)
+    )
+    known_foreground_slices = getattr(prep, "foreground_preservation_stats", {}).get(
+        "guaranteed_output_foreground_transverse_slices"
+    )
+    # Anchors already establish actual prepared-mask support, including empty polygon rasters.
+    if (use_yolo_geometry and known_foreground_slices is not None
+            and all(plan.view.family == "transverse" for plan in prep.plans)):
+        all_empty = int(known_foreground_slices) == 0
+    else:
+        all_empty = not bool(np.any(prep.mask_for_render))
     if not all_empty and coverage_volume is not None:
         all_empty = not bool(np.any(coverage_volume))
     if selected_items is None:
@@ -3968,13 +4191,6 @@ def classify_original_foregrounds_for_volume(
     # Once preprocessing has changed mask support, polygon-only geometry
     # is no longer authoritative for the background cap.  Use the transformed
     # dense mask in that case so --background_percent retains its documented behavior.
-    use_yolo_geometry = (
-        prep.src.label_source == "yolo"
-        and bool(prep.src.yolo_polygons_by_frame or prep.src.labels_by_frame)
-        and not prep.smoothing_stats
-        and not getattr(prep, "void_fill_stats", None)
-        and not prep.semantic_foreground
-    )
     if prep.src.label_source == "yolo" and prep.smoothing_stats and warnings is not None:
         warnings.add(
             "label_geometry_fallback_after_smoothing",
@@ -4040,6 +4256,43 @@ def classify_original_foregrounds_for_volume(
             f"{prep.src.stem}: {len(geometry_jobs)} transverse plan/frame job(s) classified from predecoded YOLO polygons; "
             f"dense fallback jobs={len(dense_jobs)}",
         )
+
+    gpu_jobs = 0
+    gpu_stats: Dict[str, object] = {}
+    if gpu_pool is not None and dense_jobs:
+        requested_jobs = set(dense_jobs)
+        with runtime_telemetry().span('pta.classify.originals.gpu'):
+            gpu_foregrounds, remaining_jobs, gpu_stats = gpu_pool.classify_foregrounds(
+                prep, gen=int(generation), jobs=dense_jobs, selected_items=selected_items,
+            )
+        remaining_jobs = [tuple(job) for job in remaining_jobs]
+        remaining_set = set(remaining_jobs)
+        if len(remaining_set) != len(remaining_jobs) or not remaining_set <= requested_jobs:
+            raise RuntimeError("GPU foreground classifier returned invalid remaining source-frame jobs")
+        completed_jobs = requested_jobs - remaining_set
+        expected_keys = set()
+        for plan_index, frame_idx in completed_jobs:
+            plan = classification_plan(plan_index, frame_idx)
+            if selected_items is None or "full" in selected_items[(plan.tag, int(frame_idx))]:
+                expected_keys.add((plan.tag, int(frame_idx), "full", 0))
+            expected_keys.update((plan.tag, int(frame_idx), tile.tile_tag, 0) for tile in plan.tile_layout)
+        if set(gpu_foregrounds) != expected_keys:
+            raise RuntimeError(
+                "GPU foreground classifier did not return complete selected full/tile decisions "
+                f"for completed jobs (expected={len(expected_keys)}, actual={len(gpu_foregrounds)})"
+            )
+        foregrounds.update(gpu_foregrounds)
+        gpu_jobs = len(completed_jobs)
+        dense_jobs = remaining_jobs
+    backend = "cuda_with_cpu_fallback" if gpu_jobs and dense_jobs else ("cuda" if gpu_jobs else "cpu")
+    dispatch = {**gpu_stats, "backend": backend, "gpu_jobs": gpu_jobs,
+                "cpu_jobs": len(dense_jobs), "polygon_jobs": len(geometry_jobs)}
+    runtime_telemetry().gauge('pta.classify.originals.dispatch', dispatch)
+    print(
+        f"{prep.src.stem}: foreground classification dispatch: "
+        f"GPU jobs={gpu_jobs}, CPU jobs={len(dense_jobs)}, polygon jobs={len(geometry_jobs)}, "
+        f"backend={backend}", flush=True,
+    )
 
     def _classify_frame(job_idx: int) -> None:
         plan_idx, idx = dense_jobs[int(job_idx)]
@@ -4171,14 +4424,16 @@ def enumerate_candidates_for_volume(
     foregrounds: Optional[Dict[Tuple[str, int, str, int], bool]] = None,
     *, fraction: float = 1.0,
 ) -> List[OutputCandidate]:
-    return select_fraction_candidates(_iter_candidates_for_volume(prep, foregrounds), fraction=fraction)
+    return list(_iter_candidates_for_volume(prep, foregrounds, fraction=fraction))
 
 
 def _iter_candidates_for_volume(
     prep: PreparedVolume,
     foregrounds: Optional[Dict[Tuple[str, int, str, int], bool]],
+    *, fraction: float = 1.0,
 ) -> Iterator[OutputCandidate]:
     fg_map = foregrounds or {}
+    threshold = fraction_sample_threshold(fraction)
 
     def _fg(plan_tag: str, frame_idx: int, item_key: str) -> bool:
         if not prep.label_enabled:
@@ -4196,10 +4451,30 @@ def _iter_candidates_for_volume(
             f"{plan.channel_variant.order_name}"
         )
 
+    def _selected(plan: RenderPlan, physical_id: str, presentation_id: str,
+                  geometry_id: str, frame_idx: int, item_key: str) -> bool:
+        identity = (physical_source_identity_text(
+            prep.src.stem, physical_id, presentation_id, geometry_id, frame_idx,
+        ) if physical_id and presentation_id and geometry_id else output_source_identity_text(
+            prep.src.stem, plan.tag, item_key, frame_idx,
+        ))
+        return fraction_identity_selected(identity, threshold)
+
+    metadata = [(
+        plan, _physical_view_id(plan), _presentation_variant_id(plan),
+        str(plan.channel_variant.format_token), str(plan.channel_variant.kind),
+        bool(plan.channel_variant.reverse), tuple(int(x) for x in plan.channel_variant.offsets),
+    ) for plan in prep.plans]
+
     # Canonical order part 1: full-frame views in v3 view order.
     # Iterate only explicitly eligible centers.
-    for plan in prep.plans:
+    for (plan, physical_view_id, presentation_variant_id, channel_format,
+         channel_kind, channel_reverse, channel_offsets) in metadata:
         for frame_idx in render_plan_frame_indices(plan):
+            if threshold is not None and not _selected(
+                plan, physical_view_id, presentation_variant_id, "full", frame_idx, "full",
+            ):
+                continue
             yield OutputCandidate(
                 order=-1,
                 volume_name=prep.src.stem,
@@ -4210,20 +4485,21 @@ def _iter_candidates_for_volume(
                 is_tile=False,
                 label_enabled=bool(prep.label_enabled),
                 is_transverse=plan.view.family == "transverse",
-                physical_view_id=_physical_view_id(plan),
-                presentation_variant_id=_presentation_variant_id(plan),
+                physical_view_id=physical_view_id,
+                presentation_variant_id=presentation_variant_id,
                 geometry_item_id="full",
-                channel_format=str(plan.channel_variant.format_token),
-                channel_kind=str(plan.channel_variant.kind),
-                channel_reverse=bool(plan.channel_variant.reverse),
-                channel_offsets=tuple(int(x) for x in plan.channel_variant.offsets),
+                channel_format=channel_format,
+                channel_kind=channel_kind,
+                channel_reverse=channel_reverse,
+                channel_offsets=channel_offsets,
                 foreground=_fg(plan.tag, frame_idx, "full"),
             )
 
     # Canonical order part 2: tile variants of each view sorted by tile config;
     # inside each frame, tiles are row-major because build_render_plan creates
     # tile_layout as y-then-x for each canonical tile config.
-    for plan in prep.plans:
+    for (plan, physical_view_id, presentation_variant_id, channel_format,
+         channel_kind, channel_reverse, channel_offsets) in metadata:
         if not plan.tile_layout:
             continue
         by_cfg: Dict[str, List[RenderTileItem]] = defaultdict(list)
@@ -4242,9 +4518,16 @@ def _iter_candidates_for_volume(
             )
         )
         for cfg_id in cfg_order:
-            tiles = sorted(by_cfg[cfg_id], key=lambda t: (int(t.y), int(t.x), t.tile_tag))
+            tiles = [(
+                tile,
+                f"tile:{int(tile.cfg.tile_size)}:{int(tile.cfg.tile_stride)}:{int(tile.x)}:{int(tile.y)}",
+            ) for tile in sorted(by_cfg[cfg_id], key=lambda t: (int(t.y), int(t.x), t.tile_tag))]
             for frame_idx in render_plan_frame_indices(plan):
-                for tile in tiles:
+                for tile, geometry_item_id in tiles:
+                    if threshold is not None and not _selected(
+                        plan, physical_view_id, presentation_variant_id, geometry_item_id, frame_idx, tile.tile_tag,
+                    ):
+                        continue
                     yield OutputCandidate(
                         order=-1,
                         volume_name=prep.src.stem,
@@ -4255,16 +4538,13 @@ def _iter_candidates_for_volume(
                         is_tile=True,
                         label_enabled=bool(prep.label_enabled),
                         is_transverse=plan.view.family == "transverse",
-                        physical_view_id=_physical_view_id(plan),
-                        presentation_variant_id=_presentation_variant_id(plan),
-                        geometry_item_id=(
-                            f"tile:{int(tile.cfg.tile_size)}:{int(tile.cfg.tile_stride)}:"
-                            f"{int(tile.x)}:{int(tile.y)}"
-                        ),
-                        channel_format=str(plan.channel_variant.format_token),
-                        channel_kind=str(plan.channel_variant.kind),
-                        channel_reverse=bool(plan.channel_variant.reverse),
-                        channel_offsets=tuple(int(x) for x in plan.channel_variant.offsets),
+                        physical_view_id=physical_view_id,
+                        presentation_variant_id=presentation_variant_id,
+                        geometry_item_id=geometry_item_id,
+                        channel_format=channel_format,
+                        channel_kind=channel_kind,
+                        channel_reverse=channel_reverse,
+                        channel_offsets=channel_offsets,
                         foreground=_fg(plan.tag, frame_idx, tile.tile_tag),
                         tile_size=int(tile.cfg.tile_size),
                         tile_stride=int(tile.cfg.tile_stride),
@@ -4318,6 +4598,25 @@ def validate_foreground_transverse_candidate_invariant(
             f"input foreground slices={input_count}, {phase} output foreground slices={output_count}"
         )
     return int(output_count)
+
+
+def _finalize_deferred_classification(prep, original_count, background_stats, augmentation_stats, measured, *, fraction):
+    if measured.original_foreground + measured.original_background != original_count:
+        raise RuntimeError("Deferred classification did not measure every original candidate")
+    if measured.augmented_foreground + measured.augmented_background != augmentation_stats.planned_augmented_copies:
+        raise RuntimeError("Deferred classification did not measure every augmented candidate")
+    background_stats.foreground_before = measured.original_foreground + measured.augmented_foreground
+    background_stats.background_before = measured.original_background + measured.augmented_background
+    background_stats.background_retained = background_stats.background_before
+    augmentation_stats.planned_augmented_foreground = measured.augmented_foreground
+    augmentation_stats.planned_augmented_background = measured.augmented_background
+    if fraction == 1.0:
+        output_count = len(measured.transverse_frames)
+        input_count = int(prep.foreground_preservation_stats.get("input_foreground_transverse_slices", 0))
+        if any(plan.view.family == "transverse" for plan in prep.plans) and output_count < input_count:
+            raise RuntimeError(f"Foreground transverse invariant failed for {prep.src.stem}: input={input_count}, rendered={output_count}")
+        prep.foreground_preservation_stats["classified_output_foreground_transverse_slices"] = output_count
+        prep.foreground_preservation_stats["retained_output_foreground_transverse_slices"] = output_count
 
 
 def trim_background_overage_after_flips(
@@ -5321,9 +5620,6 @@ def main(
         gpu_count=len(topology.cuda_device_ids) if gpu_offline_active else 0,
         gpu_cpu_sets=topology.gpu_cpu_sets if gpu_offline_active else (),
         topology_aware=bool(args.topology_aware), overlapping=depth_plan.overlapping)
-    if depth_plan.overlapping and not cpu_budget.overlapping:
-        effective_pipeline_depth = 1
-        warnings.add("pipeline_depth_reduced_for_cpu_budget", "No separate CPU capacity remains for overlapping planning; using depth=1")
     workers = cpu_budget.worker_budget
     frame_workers, gpu_render_threads = cpu_budget.frame_workers, cpu_budget.gpu_render_threads
     render_cpu_order = cpu_budget.render_cpu_order
@@ -5342,6 +5638,7 @@ def main(
         f"GPU CPU-render threads/owner: {list(cpu_budget.gpu_render_threads_by_owner) if gpu_offline_active else 'N/A'}; "
         f"planning workers: {planning_workers}; "
         f"bootstrap planning workers: {cpu_budget.bootstrap_workers}; "
+        f"bootstrap I/O workers: {cpu_budget.bootstrap_io_workers}; "
         f"raw prefetch I/O workers: {io_workers}; render backend: {render_backend}; "
         f"offline augmentation backend={runtime_label}"
     )
@@ -5493,7 +5790,7 @@ def main(
         volume_allocator: Optional[ArrayAllocator] = make_volume_allocator(True) if use_shared_volumes else None
         pipeline_enabled = int(effective_pipeline_depth) >= 2 and len(pending_specs) > 1
         if pipeline_enabled and bool(args.topology_aware) and planning_cpu_order:
-            print(f"Topology plan: overlapping planning uses CPUs {list(planning_cpu_order)}; bootstrap planning may use all allocated CPUs")
+            print(f"Topology plan: loading and preparation share allocated CPUs {list(planning_cpu_order)} with rendering")
         print(
             f"Persistent render pool: backend={render_backend}, "
             f"start_method={render_pool.start_method}, "
@@ -5549,11 +5846,16 @@ def main(
                 prep_obj.mask_for_render = np.empty((0,), dtype=np.uint8)
                 prep_obj.semantic_coverage_for_render = None
                 prep_obj.shm_blocks = []
+            else:
+                source = state.get("source")
+                if isinstance(source, SourceVolume):
+                    _release_source_volume(source)
 
             gen = state.get("gen")
             if gen is not None:
                 progress_by_gen.pop(int(gen), None)
             state["prep"] = None
+            state["source"] = None
             state["handles"] = []
 
             released_ids: set[int] = set()
@@ -5579,6 +5881,9 @@ def main(
                     jpeg_device_ids=topology.cuda_device_ids,
                     jpeg_cpu_sets=topology.gpu_cpu_sets,
                     load_cpu_order=load_cpus if bool(args.topology_aware) else (),
+                    channel_variants=channel_variants,
+                    force=bool(getattr(args, 'force', False)),
+                    require_all_sequence_frames=bool(getattr(args, 'save_overlay', False)),
                 )
                 pending_loads[spec_index] = (future, load_warnings)
 
@@ -5593,6 +5898,7 @@ def main(
             future, vol_warnings = pending_loads.pop(spec_index)
             with runtime_telemetry().span('pta.input.wait'):
                 current_src = future.result()
+            states[spec_index] = {"gen": int(spec_index), "source": current_src, "prep": None, "handles": []}
             _submit_load(spec_index + 1)  # depth-1 prefetch, no fork constraint (G2)
             spec = pending_specs[spec_index]
             prep = prepare_loaded_source(
@@ -5605,7 +5911,11 @@ def main(
                 channel_variants=channel_variants,
                 write_side_effects=True,
                 allocator=volume_allocator,
+                # GPU preprocessing never competes with the previous volume's rendering.
+                preprocessing_device_ids=(topology.cuda_device_ids
+                    if spec_index == 0 or effective_pipeline_depth == 1 else ()),
             )
+            states[spec_index]["prep"] = prep
 
             cands = (enumerate_candidates_for_volume(prep, fraction=fraction)
                      if dataset_publication_selected else [])
@@ -5617,6 +5927,22 @@ def main(
                 vol_warnings.add("fraction_sampling", f"{prep.src.stem}: selected {len(cands)}/{candidates_before_fraction} original frame/tile candidates before classification (--fraction {fraction:g})")
                 print(f"{prep.src.stem}: fraction selection {len(cands)}/{candidates_before_fraction} candidates before classification/rendering", flush=True)
             foregrounds: Optional[Dict[Tuple[str, int, str, int], bool]] = None
+            classification_deferred = bool(
+                dataset_publication_selected and prep.label_enabled
+                and prep.src.volume_class == "fully_labeled"
+                and not background_filter_requested
+                and str(args.augmentation_execution) == "offline"
+                and float(args.augmentation_ratio) > 1.0
+                and float(args.augmentation_ratio).is_integer()
+                and augmentation is not None
+                and not (
+                    not prep.semantic_foreground
+                    and prep.src.label_source == "yolo"
+                    and bool(prep.src.yolo_polygons_by_frame or prep.src.labels_by_frame)
+                    and not prep.smoothing_stats
+                    and not prep.void_fill_stats
+                )
+            )
             semantic_classification_skipped = bool(
                 prep.label_enabled
                 and str(getattr(args, "task", "segment")) == "semantic"
@@ -5633,7 +5959,12 @@ def main(
                 # annotated centers so annotated foreground/background remains
                 # distinct even when --background_percent=1.0. Offline copies
                 # also need source truth when the background cap is unrestricted.
-                if semantic_classification_skipped:
+                if classification_deferred:
+                    mode = "semantic" if prep.semantic_foreground else "polygon"
+                    for candidate in cands:
+                        candidate.foreground_deferred = mode
+                    print(f"{prep.src.stem}: source foreground classification deferred to canonical source rendering", flush=True)
+                elif semantic_classification_skipped:
                     prep.foreground_preservation_stats["classification_skipped"] = 1
                     foregrounds = (classify_semantic_full_transverse_for_preservation(prep)
                                    if fraction == 1.0 else None)
@@ -5658,6 +5989,11 @@ def main(
                         workers=phase_workers,
                         warnings=vol_warnings,
                         selected_candidates=cands if fraction < 1.0 else None,
+                        gpu_pool=(render_pool if gpu_offline_active and not any(
+                            progress.pending_a or progress.pending_b
+                            for progress in progress_by_gen.values()
+                        ) else None),
+                        generation=int(spec_index),
                     )
                 if foregrounds is not None:
                     for cand in cands:
@@ -5665,7 +6001,7 @@ def main(
                         if fraction < 1.0 and not semantic_classification_skipped and key not in foregrounds:
                             raise RuntimeError(f"Missing classification for selected candidate {key}")
                         cand.foreground = bool(foregrounds.get(key, True))
-                if fraction == 1.0 and (not semantic_classification_skipped or semantic_transverse_verified):
+                if fraction == 1.0 and not classification_deferred and (not semantic_classification_skipped or semantic_transverse_verified):
                     validate_foreground_transverse_candidate_invariant(
                         prep,
                         cands,
@@ -5709,17 +6045,18 @@ def main(
                 labels_available=bool(prep.label_enabled),
                 warnings=vol_warnings,
             )
-            physical, vol_augmentation_stats = plan_augmented_versions(
-                cands,
-                augmentation=augmentation,
-                augmentation_definition=augmentation_definition,
-                execution_mode=str(args.augmentation_execution),
-                augmentation_ratio=float(args.augmentation_ratio),
-                split_active=bool(split_active),
-                augmented_foregrounds={},
-                require_augmented_foregrounds=False,
-                used_tags=used_augmentation_tags,
-            )
+            with runtime_telemetry().span('pta.plan.augmentation'):
+                physical, vol_augmentation_stats = plan_augmented_versions(
+                    cands,
+                    augmentation=augmentation,
+                    augmentation_definition=augmentation_definition,
+                    execution_mode=str(args.augmentation_execution),
+                    augmentation_ratio=float(args.augmentation_ratio),
+                    split_active=bool(split_active),
+                    augmented_foregrounds={},
+                    require_augmented_foregrounds=False,
+                    used_tags=used_augmentation_tags,
+                )
             vol_background_stats = finalize_background_filter_with_augmentations(
                 physical,
                 base_stats=base_background_stats,
@@ -5741,7 +6078,7 @@ def main(
             # enumeration, leaving ``physical`` empty even when the source has
             # foreground.  The retained-candidate invariant applies only when
             # images or labels were selected for publication.
-            if dataset_publication_selected and fraction == 1.0 and (
+            if dataset_publication_selected and fraction == 1.0 and not classification_deferred and (
                 not semantic_classification_skipped or semantic_transverse_verified
             ):
                 validate_foreground_transverse_candidate_invariant(
@@ -5779,6 +6116,7 @@ def main(
                 "split_stats": vol_split_stats,
                 "background_stats": vol_background_stats,
                 "augmentation_stats": vol_augmentation_stats,
+                "classification_deferred": classification_deferred,
                 "handles": [],
                 "progress": None,
             }
@@ -5839,12 +6177,13 @@ def main(
                     f"  {family}: candidates={family_count}, "
                     f"cumulative_end={cumulative_end}, projection={backend_note}"
                 )
-            tasks = build_phase_render_tasks(
-                prep.plans,
-                retained,
-                aug_chunk=int(args.aug_task_chunk),
-                gpu_batch_size=(int(args.gpu_batch_size) if gpu_offline_active else 0),
-            )
+            with runtime_telemetry().span('pta.plan.render_tasks'):
+                tasks = build_phase_render_tasks(
+                    prep.plans,
+                    retained,
+                    aug_chunk=int(args.aug_task_chunk),
+                    gpu_batch_size=(int(args.gpu_batch_size) if gpu_offline_active else 0),
+                )
             task_description = (
                 f"{len(tasks)} coalesced GPU work unit(s), up to "
                 f"{max(1, int(args.gpu_batch_size)) * 2} candidates each"
@@ -5933,6 +6272,9 @@ def main(
                 int(vol_augmentation_stats.planned_augmented_copies)
                 - int(vol_augmentation_stats.retained_augmented_copies),
             )
+            if state["classification_deferred"]:
+                _finalize_deferred_classification(prep, len(cands), vol_background_stats,
+                    vol_augmentation_stats, progress.foreground_counts, fraction=fraction)
             total_written += int(written_effective)
             total_flip_dropped += int(flip_dropped)
             total_background_withheld += int(withheld)
@@ -6017,12 +6359,10 @@ def main(
                 if pipeline_enabled and spec_index + 1 < len(pending_specs):
                     # G5: plan volume k+1 on the parent while volume k renders.
                     states[spec_index + 1] = _plan_volume(spec_index + 1)
+                    # Free workers can start the next volume while this one drains.
+                    _submit_phase_a(states[spec_index + 1])
                 drain_render_results(render_pool, progress_by_gen, until=lambda p=progress: p.pending_a == 0)
                 withheld = _submit_phase_b(state)
-                if pipeline_enabled and spec_index + 1 in states:
-                    # Enqueue the next volume immediately after the current
-                    # grouped phase so the persistent pool queue stays warm.
-                    _submit_phase_a(states[spec_index + 1])
                 drain_render_results(render_pool, progress_by_gen, until=lambda p=progress: p.pending_b == 0)
                 _finalize_volume(state, withheld)
                 del states[spec_index]

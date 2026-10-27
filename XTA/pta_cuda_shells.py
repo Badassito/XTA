@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from types import SimpleNamespace
 import math
+import time
 
 import numpy as np
 
@@ -19,6 +20,21 @@ _SHELL_DIRECTION_CACHE_BYTES = 256 * 1024**2
 _SHELL_DIRECTION_CACHE: "OrderedDict[tuple, tuple[object, object, int]]" = OrderedDict()
 _SHELL_DIRECTION_BYTES = 0
 _SHELL_CATEGORICAL_KERNELS = None
+_SHELL_DIRECTION_STATS = dict(
+    shared_hits=0, shared_misses=0, cache_hits=0, cache_misses=0,
+    host_build_seconds=0.0, upload_seconds=0.0, h2d_copies=0, h2d_bytes=0,
+)
+
+
+def shell_direction_cache_stats(renderer=None):
+    """Sampler snapshot without retaining temporary direction tensor owners."""
+    stats = dict(_SHELL_DIRECTION_STATS, cache_bytes=_SHELL_DIRECTION_BYTES,
+                 cache_entries=len(_SHELL_DIRECTION_CACHE))
+    if renderer is not None:
+        from .spherical_cuda import spherical_direction_cache_stats
+        stats.update(('intensity_' + key, value)
+                     for key, value in spherical_direction_cache_stats(renderer).items())
+    return stats
 
 
 _SOURCE = r'''
@@ -137,18 +153,23 @@ def clear_shell_direction_cache() -> None:
     _SHELL_DIRECTION_BYTES = 0
 
 
-def _spherical_directions(view, device, stream):
+def _spherical_directions(view, device, stream, *, direction_renderer=None):
     """Return GPU direction and validity arrays; host QSC work occurs once per patch."""
     global _SHELL_DIRECTION_BYTES
-    key = (
-        str(device), int(view.spherical_face), int(view.spherical_face_intervals),
-        int(view.src_h), int(view.src_w), int(view.spherical_u_origin),
-        int(view.spherical_v_origin), tuple(float(v) for v in view.spherical_rotation_xyz),
-    )
+    from .spherical_cuda import cached_spherical_directions, spherical_direction_key
+    key = spherical_direction_key(view, device)
+    if direction_renderer is not None:
+        shared = cached_spherical_directions(direction_renderer, key)
+        if shared is not None:
+            _SHELL_DIRECTION_STATS['shared_hits'] += 1
+            return shared
+        _SHELL_DIRECTION_STATS['shared_misses'] += 1
     hit = _SHELL_DIRECTION_CACHE.get(key)
     if hit is not None:
+        _SHELL_DIRECTION_STATS['cache_hits'] += 1
         _SHELL_DIRECTION_CACHE.move_to_end(key)
         return hit[0], hit[1]
+    _SHELL_DIRECTION_STATS['cache_misses'] += 1
 
     from .spherical_cuda import _build_host_direction_block
     import torch
@@ -160,6 +181,7 @@ def _spherical_directions(view, device, stream):
     while _SHELL_DIRECTION_CACHE and _SHELL_DIRECTION_BYTES + size > _SHELL_DIRECTION_CACHE_BYTES:
         _, (_, _, old_size) = _SHELL_DIRECTION_CACHE.popitem(last=False)
         _SHELL_DIRECTION_BYTES -= old_size
+    started = time.perf_counter()
     host_dirs = np.empty((rows, columns, 3), dtype=np.float64)
     host_valid = np.empty((rows, columns), dtype=np.uint8)
     for row0 in range(0, rows, 64):
@@ -167,9 +189,14 @@ def _spherical_directions(view, device, stream):
         block_dirs, block_valid = _build_host_direction_block(key, row0, row1)
         host_dirs[row0:row1] = block_dirs
         host_valid[row0:row1] = block_valid
+    _SHELL_DIRECTION_STATS['host_build_seconds'] += time.perf_counter() - started
+    started = time.perf_counter()
     with torch.cuda.stream(stream):
         dirs = torch.as_tensor(host_dirs, device=device)
         valid = torch.as_tensor(host_valid, device=device)
+    _SHELL_DIRECTION_STATS['upload_seconds'] += time.perf_counter() - started
+    _SHELL_DIRECTION_STATS['h2d_copies'] += 2
+    _SHELL_DIRECTION_STATS['h2d_bytes'] += host_dirs.nbytes + host_valid.nbytes
     _SHELL_DIRECTION_CACHE[key] = (dirs, valid, size)
     _SHELL_DIRECTION_BYTES += size
     return dirs, valid
@@ -203,6 +230,7 @@ def _inverse_affine(M_grid_to_src, M_src_to_out):
 def render_shell_categorical_pair(
     mask_tyx, coverage_tyx, view, frame_idx, *, M_grid_to_src=None,
     M_src_to_out=None, out_h=None, out_w=None, stream=None,
+    direction_renderer=None,
 ):
     """Fuse shell projection and categorical affine into one CUDA output pass.
 
@@ -268,7 +296,9 @@ def render_shell_categorical_pair(
     with torch.cuda.stream(stream):
         directions = valid = None
         if family == 'spherical':
-            directions, valid = _spherical_directions(view, mask_tyx.device, stream)
+            directions, valid = _spherical_directions(
+                view, mask_tyx.device, stream, direction_renderer=direction_renderer,
+            )
         output_mask = torch.empty((output_h, output_w), dtype=torch.uint8, device=mask_tyx.device)
         output_coverage = (torch.empty_like(output_mask) if coverage_tyx is not None else None)
         cp_stream = cp.cuda.ExternalStream(stream.cuda_stream)

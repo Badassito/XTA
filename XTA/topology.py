@@ -525,6 +525,16 @@ def _mark_boundary_components_from_local_labels(
     for local_lbl in border_vals.tolist():
         uf.mark_boundary(int(local_to_gid[int(local_lbl)]))
 
+@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+def _apply_void_fill_slab(mask, labels, lookup):
+    for z in range(mask.shape[0]):
+        for y in range(mask.shape[1]):
+            for x in range(mask.shape[2]):
+                if lookup[labels[z, y, x]]:
+                    mask[z, y, x] = np.uint8(1)
+
+
+@runtime_telemetry_phase('topology.void_fill')
 def fill_3d_voids_inplace_streaming(
     mask_mm: np.ndarray,
     work_prefix: Path,
@@ -532,7 +542,8 @@ def fill_3d_voids_inplace_streaming(
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
     connectivity: int = 6,
-) -> None:
+    gpu_device_ids: Sequence[int] = (),
+) -> Dict[str, object]:
     """Fill enclosed 3D background components with configurable 6, 18, or 26 connectivity.
     
     The label workspace prefers anonymous memory and falls back to a memmap when admission requires it."""
@@ -546,9 +557,10 @@ def fill_3d_voids_inplace_streaming(
     if connectivity not in (6, 18, 26):
         raise ValueError('3D void fill connectivity must be one of 6, 18, or 26')
 
+    stats: Dict[str, object] = {'backend': 'cpu', 'devices': [], 'chunks': 0, 'fallback_reason': None}
     z_dim, h, w = mask_mm.shape
     if z_dim <= 0:
-        return
+        return stats
 
     slice_connectivity = _slice_connectivity_for_3d_connectivity(connectivity)
     adjacent_offsets = _adjacent_xy_offsets_for_3d_connectivity(connectivity)
@@ -566,6 +578,35 @@ def fill_3d_voids_inplace_streaming(
         bg_gid_path.parent.mkdir(parents=True, exist_ok=True)
         bg_gid_store = np.memmap(bg_gid_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
     numa_interleave_memory(bg_gid_store, desc='3D void fill gid store')  #
+
+    if gpu_device_ids:
+        from .topology_gpu_voidfill import prepare_gpu_void_fill
+
+        try:
+            slabs, lookups, gpu_stats = prepare_gpu_void_fill(
+                mask_mm, bg_gid_store, connectivity=connectivity, device_ids=gpu_device_ids,
+            )
+        except Exception as exc:
+            stats['fallback_reason'] = f'{type(exc).__name__}: {exc}'
+            print(f"GPU 3D void fill unavailable; using CPU: {stats['fallback_reason']}")
+        else:
+            # GPU preparation never edits mask; apply starts only after the complete join.
+            try:
+                with runtime_telemetry().span('topology.void_fill.apply'):
+                    _apply_void_fill_slab(mask_mm[:0], bg_gid_store[:0], lookups[0])
+
+                    def apply_slab(index: int) -> None:
+                        z0, z1 = slabs[index]
+                        _apply_void_fill_slab(mask_mm[z0:z1], bg_gid_store[z0:z1], lookups[index])
+
+                    with ThreadPoolExecutor(max_workers=min(len(slabs), max(1, _cpu_count()))) as executor:
+                        for future in [executor.submit(apply_slab, i) for i in range(len(slabs))]:
+                            future.result()
+                return gpu_stats
+            finally:
+                del bg_gid_store
+                if bg_gid_path is not None and not keep_temp:
+                    bg_gid_path.unlink(missing_ok=True)
 
     uf = _UnionFind()
     prev_gid_slice: Optional[np.ndarray] = None
@@ -607,6 +648,8 @@ def fill_3d_voids_inplace_streaming(
             bg_gid_path.unlink(missing_ok=True)
         except Exception:
             pass
+    stats['chunks'] = int(z_dim)
+    return stats
 
 @_numba.njit(cache=True, nogil=True, parallel=True)  # type: ignore[misc]
 def _numba_compact_relabel_kernel(labels, lut_flat, lut_offsets, bboxes, counts):  # pragma: no cover - jit

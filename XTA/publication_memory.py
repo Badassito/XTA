@@ -18,7 +18,8 @@ def publication_ram_headroom():
             return max(0, int(psutil.virtual_memory().available))
         except (ImportError, OSError, ValueError, AttributeError):
             return 0
-    return max(0, min(int(info.get('MemAvailable', 0)), int(available_anon_work_bytes())))
+    return max(0, min(int(info.get('MemAvailable', 0)),
+                      int(available_anon_work_bytes(meminfo=info))))
 
 
 def policy_cpu_worker_buffer_plan(*, worker_count, cache_mib, batch_size, out_size,

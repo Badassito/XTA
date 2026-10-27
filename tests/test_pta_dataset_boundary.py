@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import unittest
+from unittest import mock
 from dataclasses import replace
 from pathlib import Path
 
@@ -70,7 +71,10 @@ class PtaDatasetBoundaryTests(unittest.TestCase):
         "deterministic_augmentation_tag",
         "finalize_augmentation_stats",
         "finalize_background_filter_with_augmentations",
+        "fraction_identity_selected",
+        "fraction_sample_threshold",
         "output_source_identity_text",
+        "physical_source_identity_text",
         "plan_augmented_versions",
         "refresh_retained_original_split_stats",
         "select_fraction_candidates",
@@ -207,6 +211,33 @@ class PtaDatasetBoundaryTests(unittest.TestCase):
         self.assertEqual(stats.planned_augmented_copies, 2)
         self.assertEqual(stats.planned_augmented_foreground, 2)
         self.assertEqual(stats.planned_augmented_background, 0)
+
+    def test_extra_copy_ranking_only_runs_when_the_ratio_leaves_a_remainder(self) -> None:
+        augmentation = LoadedAugmentation(
+            path=Path("policy.py"), content_sha256="0123456789abcdef" * 4,
+            export_name="build_augmentation", albumentations_version="2.0",
+            pipeline_builder=lambda: None,
+        )
+        for ratio, expected_count, ranked_count in ((7, 28, 0), (2, 8, 0), (1.5, 6, 4)):
+            with self.subTest(ratio=ratio):
+                base = [_candidate(i, foreground=i < 2) for i in range(4)]
+                with mock.patch.object(pta_dataset, "augmentation_digest",
+                                       wraps=pta_dataset.augmentation_digest) as digest:
+                    versions, _ = pta_dataset.plan_augmented_versions(
+                        base, augmentation=augmentation, augmentation_ratio=ratio,
+                        split_active=False, augmented_foregrounds={},
+                        require_augmented_foregrounds=False,
+                    )
+                self.assertEqual(len(versions), expected_count)
+                self.assertEqual(sum(call.kwargs["domain"] == "fractional-ratio-rank"
+                                     for call in digest.call_args_list), ranked_count)
+                self.assertEqual([cand.order for cand in versions], list(range(expected_count)))
+                if ratio == 7:
+                    self.assertEqual([(cand.source_order, cand.augmentation_index) for cand in versions],
+                                     [(source, copy) for source in range(4) for copy in range(7)])
+                else:
+                    self.assertEqual([cand.source_order for cand in versions if cand.augmentation_index],
+                                     list(range(4)) if ratio == 2 else [0, 1])
 
     def test_background_retention_and_post_flip_withholding_are_deterministic(self) -> None:
         warnings = RecordingWarnings()

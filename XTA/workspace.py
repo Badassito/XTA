@@ -174,8 +174,13 @@ def _cgroup_memory_headroom_bytes() -> Optional[int]:
     """Return tightest cgroup headroom, excluding reclaimable clean file cache."""
     return _cgroup_memory_budget(verify_enforcement=False)[0]
 
-def available_anon_work_bytes() -> int:
-    info = _read_meminfo_bytes()
+def available_anon_work_bytes(*, meminfo: Optional[Dict[str, int]] = None) -> int:
+    """Read current allocation headroom, optionally sharing this call's meminfo.
+
+    A caller already reading physical availability can supply that same snapshot
+    to avoid a duplicate proc read. Cgroup limits and usage are always read anew.
+    """
+    info = _read_meminfo_bytes() if meminfo is None else meminfo
     mem_avail = int(info.get('MemAvailable', 0))
     swap_free = int(info.get('SwapFree', 0))
     node_avail = max(0, mem_avail + swap_free)

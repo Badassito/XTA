@@ -47,26 +47,88 @@ def test_existing_projection_expands_at_inference_drain_and_keeps_order():
         scheduler.close()
 
 
-def test_completed_planes_keep_global_credit_and_new_stream_gets_fair_turn():
+def test_stalled_completed_window_does_not_hold_cpu_permits_for_other_stream():
     scheduler = NativePullScheduler(workers=2, max_workers=4)
     second_entered = threading.Event()
     first = scheduler.ordered_planes(8, lambda index: index, max_pending=4)
     second = None
     try:
         wait_for(lambda: scheduler.snapshot()['active_operations'] == 0)
-        assert scheduler.snapshot()['retained_operations'] == 2
+        assert scheduler.snapshot()['retained_operations'] == 4
+        assert scheduler.snapshot()['buffered_operations'] == 4
         second = scheduler.ordered_planes(2, lambda index: second_entered.set() or index,
                                            max_pending=4)
-        assert not second_entered.wait(.025)
+        assert second_entered.wait(5)
         assert next(first) == (0, 0)
-        assert not second_entered.is_set()  # Consumer still holds that plane.
         assert next(first) == (1, 1)
-        assert second_entered.wait(5)  # Released credit went to the new stream.
-        assert scheduler.snapshot()['retained_operations'] <= 2
+        assert scheduler.snapshot()['retained_operations'] <= 6
+        assert scheduler.snapshot()['funded_window_operations'] == 6
         first.close()
         assert list(second) == [(0, 0), (1, 1)]
-        assert scheduler.snapshot()['peak_retained_operations'] == 2
+        assert scheduler.snapshot()['peak_active_operations'] <= 2
+        assert scheduler.snapshot()['peak_retained_operations'] <= 6
     finally:
+        first.close()
+        if second is not None:
+            second.close()
+        scheduler.close()
+
+
+def test_backfill_keeps_live_arrays_within_funded_windows_and_consumer_allowances():
+    import weakref
+    import numpy as np
+
+    scheduler = NativePullScheduler(workers=2, max_workers=4)
+    release = threading.Event()
+    lock = threading.Lock()
+    references, calls = [], [0, 0]
+    peak_live = 0
+
+    def operation(lane, index):
+        nonlocal peak_live
+        if lane == 1:
+            assert release.wait(5)
+        array = np.full(1024, index, np.uint8)
+        with lock:
+            calls[lane] += 1
+            references.append(weakref.ref(array))
+            peak_live = max(peak_live, sum(ref() is not None for ref in references))
+        return array
+
+    first = scheduler.ordered_planes(100, lambda i: operation(0, i), max_pending=3)
+    second = None
+    try:
+        wait_for(lambda: scheduler.snapshot()['retained_operations'] == 3
+                 and scheduler.snapshot()['active_operations'] == 0)
+        second = scheduler.ordered_planes(100, lambda i: operation(1, i), max_pending=4,
+                                           role='confidence_capture')
+        wait_for(lambda: scheduler.snapshot()['active_operations'] == 2)
+        assert calls == [3, 0]  # A stalled first consumer does not reserve CPUs.
+        assert scheduler.snapshot()['retained_operations'] == 5
+        assert scheduler.snapshot()['queued_operations'] == 2
+        release.set()
+        wait_for(lambda: scheduler.snapshot()['retained_operations'] == 7
+                 and scheduler.snapshot()['active_operations'] == 0)
+        assert calls == [3, 4]  # No more arrays are built until consumption.
+        assert scheduler.snapshot()['buffered_operations'] == 7
+        assert scheduler.snapshot()['funded_window_operations'] == 7
+
+        # A Python consumer can still hold the previous loop value while next()
+        # refills its released slot. Each caller explicitly funds that one extra.
+        _, held_first = next(first)
+        _, current_first = next(first)
+        _, held_second = next(second)
+        _, current_second = next(second)
+        wait_for(lambda: scheduler.snapshot()['active_operations'] == 0)
+        assert calls == [4, 5]
+        assert peak_live <= 3 + 4 + 2
+        assert sum(ref() is not None for ref in references) <= 3 + 4 + 2
+        assert scheduler.snapshot()['retained_operations'] <= 7
+        assert scheduler.snapshot()['peak_active_operations'] <= 2
+        assert held_first[0] == held_second[0] == 0
+        assert current_first[0] == current_second[0] == 1
+    finally:
+        release.set()
         first.close()
         if second is not None:
             second.close()
@@ -316,7 +378,7 @@ def test_production_projection_uses_shared_budget_with_caller_one_and_keeps_work
         assert final['workers'] == 2
         assert final['worker_window'] == 3
         assert final['scheduling'] == 'shared_cpu_budget'
-        assert final['shared_scheduler']['peak_retained_operations'] <= 2
+        assert final['shared_scheduler']['peak_retained_operations'] <= final['worker_window']
         assert final['worker_window']*final['worker_workspace_bytes'] + final['consumer_plane_bytes'] <= 1024**2
         assert not (tmp_path/'unused.dat').exists()
     finally:

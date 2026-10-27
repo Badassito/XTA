@@ -315,49 +315,12 @@ def build_azimuthal_backprojection_plan(azimuthal_view: ViewInfo) -> Tuple[List[
  backprojection is densified to the full-coverage spacing and each dense angle samples the
  nearest completed azimuthal prediction frame. This keeps Azimuthal masks view-native through
  postprocessing/interpolation while preventing sparse spoke-like Cartesian backprojections."""
-    source_angles = np.asarray([float(a) for a in azimuthal_view.azimuths_deg], dtype=np.float64)
-    if source_angles.size <= 0:
-        return [], {
-            'provided_spacing_deg': 0.0,
-            'coverage_spacing_deg': azimuthal_full_coverage_angle_deg(int(azimuthal_view.diameter)),
-            'effective_spacing_deg': 0.0,
-            'source_frames': 0.0,
-            'backprojection_angles': 0.0,
-            'densified': 0.0,
-        }
-
-    provided_spacing = _azimuthal_view_nominal_spacing_deg(azimuthal_view)
-    coverage_spacing = azimuthal_full_coverage_angle_deg(int(azimuthal_view.diameter))
-    # The specification's guarantee formula is a maximum safe angular spacing. A smaller
-    # user spacing is already dense enough; a larger spacing is densified during backprojection.
-    effective_spacing = min(float(provided_spacing), float(coverage_spacing))
-
-    if float(provided_spacing) <= float(coverage_spacing) * (1.0 + 1e-9):
-        samples = [
-            AzimuthalBackprojectionSample(angle_deg=float(angle), source_index=int(idx), reverse_u=False)
-            for idx, angle in enumerate(source_angles.tolist())
-        ]
-        densified = False
-    else:
-        dense_angles = build_azimuthal_azimuths(float(effective_spacing))
-        samples = []
-        for dense_angle in dense_angles:
-            source_idx, reverse_u = _nearest_azimuthal_source_for_backprojection(float(dense_angle), source_angles)
-            samples.append(AzimuthalBackprojectionSample(
-                angle_deg=float(dense_angle),
-                source_index=int(source_idx),
-                reverse_u=bool(reverse_u),
-            ))
-        densified = True
-
-    return samples, {
-        'provided_spacing_deg': float(provided_spacing),
-        'coverage_spacing_deg': float(coverage_spacing),
-        'effective_spacing_deg': float(effective_spacing),
-        'source_frames': float(source_angles.size),
-        'backprojection_angles': float(len(samples)),
-        'densified': 1.0 if bool(densified) else 0.0,
-    }
+    from .azimuthal_trajectory_cpu import prepare_azimuthal_backprojection_arrays
+    (angles, sources, reverses), metadata = prepare_azimuthal_backprojection_arrays(azimuthal_view)
+    samples = [AzimuthalBackprojectionSample(angle_deg=float(angle), source_index=int(source),
+                                            reverse_u=bool(reverse))
+               for angle, source, reverse in zip(angles, sources, reverses)]
+    return samples, metadata
 
 def _azimuthal_plan_signature(plan: Sequence[AzimuthalBackprojectionSample]) -> Tuple[Tuple[float, int, bool], ...]:
     # Nearest ownership consumes actual float64 angles; rounding can merge
@@ -4552,6 +4515,52 @@ def _local_native_pull_ordered_planes(count, operation, workers):
         pool.shutdown(wait=True, cancel_futures=True)
 
 
+def _native_pull_gpu_ordered_planes(first, stop, operation):
+    """Overlap one GPU producer with its consumer, retaining at most two planes.
+
+    The consumer owns its returned plane until it asks for the next one. A
+    single future owns the following plane; closing joins that producer before
+    its CUDA stage or borrowed source can be retired.
+    """
+    first, stop = int(first), int(stop)
+    if first >= stop:
+        return
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='native-pull-gpu')
+    pending = None
+    try:
+        pending = pool.submit(operation, first)
+        for z in range(first, stop):
+            current, pending = pending, None
+            result = current.result()
+            current = None
+            if z + 1 < stop:
+                pending = pool.submit(operation, z + 1)
+            yield z, result
+            result = None
+    finally:
+        try:
+            if pending is not None and not pending.cancel():
+                # An unconsumed device failure is still fatal. Never hide it
+                # merely because the ordered publication failed first.
+                pending.result()
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+
+def _native_pull_gpu_ordered_blocks(first, stop, depth, operation):
+    """Keep one immutable encoded block ahead of its ordered publisher."""
+    first, stop, depth = int(first), int(stop), max(1, int(depth))
+    count = max(0, (stop - first + depth - 1) // depth)
+    stream = _native_pull_gpu_ordered_planes(0, count,
+        lambda index: operation(first + index * depth, min(depth, stop - first - index * depth)))
+    try:
+        for index, block in stream:
+            yield first + index * depth, block
+            block = None
+    finally:
+        stream.close()
+
+
 class _NativePullCudaStage:
     """Retire private CUDA storage before returning an exclusive device lease."""
 
@@ -4559,6 +4568,9 @@ class _NativePullCudaStage:
         self.session, self.lease = session, lease
         self.device_index = int(lease.device_index)
         self.max_output_voxels = int(session.max_output_voxels)
+        self.max_encoded_block_depth = int(getattr(session, 'max_encoded_block_depth', 0))
+        self.encoded_host_bytes = int(getattr(session, 'encoded_host_bytes', 0))
+        self.max_encoded_payload_bytes = int(getattr(session, 'max_encoded_payload_bytes', 0))
 
     def pull_flat_into(self, output, **kwargs):
         try:
@@ -4566,6 +4578,13 @@ class _NativePullCudaStage:
         except BaseException as exc:
             # A failed synchronization may still own device storage. Keep the
             # lease reachable even when the caller also fails during cleanup.
+            exc.stage_lease = self.lease
+            raise
+
+    def project_encoded(self, first, count, **kwargs):
+        try:
+            return self.session.project_encoded(first, count, **kwargs)
+        except BaseException as exc:
             exc.stage_lease = self.lease
             raise
 
@@ -4582,7 +4601,7 @@ class _NativePullCudaStage:
 
 
 def _try_native_pull_cuda_stage(source, view, plan, *, scalar_max=False,
-                                max_output_voxels, retry_state=None):
+                                max_output_voxels, retry_state=None, max_host_bytes=None):
     """Borrow the common native stage for a dense immutable source."""
     if source.dtype != np.uint8:
         if retry_state is not None:
@@ -4590,15 +4609,22 @@ def _try_native_pull_cuda_stage(source, view, plan, *, scalar_max=False,
         _cancel_native_pull_cuda_request(view)
         return None
     def make_session(session_type, **admission):
+        if max_host_bytes is not None:
+            admission['max_host_bytes'] = int(max_host_bytes)
         return session_type(source, plan, scalar_max=bool(scalar_max),
             packed_input=not scalar_max, max_output_voxels=int(max_output_voxels), **admission)
     return _try_admitted_native_pull_cuda_stage(view, plan, make_session, retry_state=retry_state)
 
 
 def _try_native_pull_encoded_cuda_stage(encoded, index, packed_input, plan, view, *,
-                                        max_output_voxels, retry_state=None):
+                                        max_output_voxels, retry_state=None,
+                                        encoded_output_block_depth=0, encoded_output_slots=2,
+                                        max_host_bytes=None):
     """Borrow the same stage without materializing the encoded source volume."""
     def make_session(session_type, **admission):
+        if max_host_bytes is not None or int(encoded_output_block_depth) > 0:
+            admission.update(encoded_output_block_depth=int(encoded_output_block_depth),
+                encoded_output_slots=int(encoded_output_slots), max_host_bytes=max_host_bytes)
         return session_type.from_encoded(encoded, index, packed_input=bool(packed_input),
             plan=plan, max_output_voxels=int(max_output_voxels), **admission)
     return _try_admitted_native_pull_cuda_stage(view, plan, make_session, retry_state=retry_state)
@@ -4613,9 +4639,20 @@ def _cancel_native_pull_cuda_request(view, *, failed=False):
         _native_pull_cuda_stage_purpose(view), failed=failed)
 
 
+def _native_pull_cuda_stage_enabled(view, plan):
+    """CPU-only capability/configuration check shared with workspace admission."""
+    import os
+    return bool(plan is not None and gpu_backproject_enabled()
+        and _env_flag('YOLO_TTA_NATIVE_PULL_CUDA', True)
+        and plan.backend in ('compiled_native_tilted', 'compiled_azimuthal_cached',
+                             'compiled_azimuthal_strip')
+        and not (is_azimuthal_view(view) and is_tilted_azimuthal_view(view)
+                 and not _env_flag('YOLO_TTA_GPU_TILTED_AZIMUTHAL_BACKPROJECT', True))
+        and os.environ.get('CUDA_VISIBLE_DEVICES', '').strip() != '-1')
+
+
 def _try_admitted_native_pull_cuda_stage(view, plan, make_session, *, retry_state=None):
     """Acquire exact native CUDA only after inference permits device borrowing."""
-    import os
     def admission(reason, *, retryable=False, detail=None, device=None, **metrics):
         if retry_state is not None:
             retry_state.update(retryable=bool(retryable), reason=reason)
@@ -4626,13 +4663,7 @@ def _try_admitted_native_pull_cuda_stage(view, plan, make_session, *, retry_stat
         })
     if retry_state is not None:
         retry_state['retryable'] = False
-    if (plan is None or not gpu_backproject_enabled()
-            or not _env_flag('YOLO_TTA_NATIVE_PULL_CUDA', True)
-            or plan.backend not in ('compiled_native_tilted', 'compiled_azimuthal_cached',
-                                    'compiled_azimuthal_strip')
-            or (is_azimuthal_view(view) and is_tilted_azimuthal_view(view)
-                and not _env_flag('YOLO_TTA_GPU_TILTED_AZIMUTHAL_BACKPROJECT', True))
-            or os.environ.get('CUDA_VISIBLE_DEVICES', '').strip() == '-1'):
+    if not _native_pull_cuda_stage_enabled(view, plan):
         _cancel_native_pull_cuda_request(view)
         admission('disabled_or_unsupported')
         return None
@@ -4740,6 +4771,21 @@ def _backproject_native_destination_pull(
         raise MemoryError(f'{desc}: native pull requires at least '
                           f'{per_worker + consumer_bytes} transient bytes; '
                           f'workspace allowance is {transient_budget}')
+    gpu_host_reserve = 0
+    gpu_workspace_admissible = True
+    gpu_candidate = False
+    if plan is not None and support_bbox is not None and _native_pull_cuda_stage_enabled(view, plan):
+        remaining = max(0, min(shape[0], support_bbox[3]) - max(0, support_bbox[0])) * plane_size
+        if remaining >= max(0, _env_int('YOLO_TTA_NATIVE_PULL_GPU_MIN_VOXELS', 64 * 1024**2)):
+            from .native_pull_cuda import estimate_native_pull_encoded_output
+            gpu_candidate = True
+            gpu_host = estimate_native_pull_encoded_output(plan, block_depth=0, slots=2,
+                max_upload_bytes=max(1, _env_int('YOLO_TTA_NATIVE_PULL_GPU_UPLOAD_MIB', 8)) * 1024**2,
+                encoded_input=False)
+            if int(gpu_host['host_bytes']) + per_worker + consumer_bytes <= transient_budget:
+                gpu_host_reserve = int(gpu_host['host_bytes'])
+            else:
+                gpu_workspace_admissible = False
     # Array callers retain their explicit worker count. A production run owns
     # a shared CPU allowance whose fair share changes as projections finish
     # and after inference drains. Admit a memory-safe maximum window now so
@@ -4747,7 +4793,7 @@ def _backproject_native_destination_pull(
     requested_worker_limit = (shared_scheduler.max_workers if shared_scheduler is not None
                               else int(workers))
     worker_count = max(1, min(requested_worker_limit, shape[0],
-                              max(0, transient_budget - consumer_bytes) // per_worker))
+                              max(0, transient_budget - consumer_bytes - gpu_host_reserve) // per_worker))
     destination = None
     planes = None
     cuda_stage = None
@@ -4779,6 +4825,8 @@ def _backproject_native_destination_pull(
             'plan_bytes': plan_bytes, 'worker_workspace_bytes': per_worker,
             'plan_build_peak_bytes': int(plan.workspace_bytes) if plan is not None else 0,
             'consumer_plane_bytes': consumer_bytes,
+            'gpu_host_reserve_bytes': gpu_host_reserve,
+            'gpu_constructor_workspace_admissible': gpu_workspace_admissible,
             'dtype_compatibility_fallback': dtype_fallback,
             'cuda_planes': cuda_planes, 'cuda_handoff_plane': handoff_plane,
         }
@@ -4836,6 +4884,10 @@ def _backproject_native_destination_pull(
                 # whose source dtype caused that compatibility fallback.
                 if backend != 'compiled' or support_bbox is None:
                     return None
+                if not gpu_workspace_admissible:
+                    retry['retryable'] = False
+                    _cancel_native_pull_cuda_request(view)
+                    return None
                 remaining_planes = max(0, min(shape[0], support_bbox[3])
                     - max(int(first_plane), support_bbox[0]))
                 minimum = max(0, _env_int('YOLO_TTA_NATIVE_PULL_GPU_MIN_VOXELS', 64 * 1024**2))
@@ -4845,10 +4897,11 @@ def _backproject_native_destination_pull(
                     retry['retryable'] = False
                     _cancel_native_pull_cuda_request(view)
                     return None
+                admission = {'max_host_bytes': gpu_host_reserve} if gpu_candidate else {}
                 return _try_native_pull_cuda_stage(source, view, plan,
                     scalar_max=scalar_max,
                     max_output_voxels=min(plane_size, int(plan.max_strip_voxels)),
-                    retry_state=retry)
+                    retry_state=retry, **admission)
             cuda_stage = acquire(0)
             first_gpu = 0
             if cuda_stage is None:
@@ -4871,10 +4924,16 @@ def _backproject_native_destination_pull(
                             break
             if cuda_stage is not None:
                 handoff_plane = first_gpu
-                for z in range(first_gpu, shape[0]):
-                    result = project_plane(z, cuda_stage)
-                    cuda_planes += 1
-                    yield z, result
+                result = None
+                gpu_stream = _native_pull_gpu_ordered_planes(first_gpu, shape[0],
+                    lambda z: project_plane(z, cuda_stage))
+                try:
+                    for z, result in gpu_stream:
+                        cuda_planes += 1
+                        yield z, result
+                        result = None
+                finally:
+                    gpu_stream.close()
         projection_stream = ordered_projection()
         for z, (plane, addresses) in projection_stream:
             address_count += addresses
@@ -4893,6 +4952,7 @@ def _backproject_native_destination_pull(
             if now - last_progress >= 2.:
                 progress('running')
                 last_progress = now
+            plane = None
         complete = True
         progress('complete')
         telemetry.gauge('projection.native_destination_pull', {
@@ -4919,6 +4979,8 @@ def _backproject_native_destination_pull(
             'plan_build_peak_bytes': int(plan.workspace_bytes) if plan is not None else 0,
             'worker_workspace_bytes': per_worker,
             'consumer_plane_bytes': consumer_bytes,
+            'gpu_host_reserve_bytes': gpu_host_reserve,
+            'gpu_constructor_workspace_admissible': gpu_workspace_admissible,
             'dtype_compatibility_fallback': dtype_fallback,
             'cuda_planes': cuda_planes, 'cuda_handoff_plane': handoff_plane,
         })
@@ -4928,12 +4990,16 @@ def _backproject_native_destination_pull(
         raise
     finally:
         try:
-            if projection_stream is not None:
-                projection_stream.close()
-            if planes is not None:
-                planes.close()
-            if cuda_stage is not None:
-                cuda_stage.close()
+            try:
+                if projection_stream is not None:
+                    projection_stream.close()
+            finally:
+                try:
+                    if planes is not None:
+                        planes.close()
+                finally:
+                    if cuda_stage is not None:
+                        cuda_stage.close()
         except BaseException as exc:
             complete = False
             _abort_projection_block_callback(callback, exc)

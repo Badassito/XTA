@@ -42,6 +42,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Mapping,
     Optional,
     Sequence,
     TYPE_CHECKING,
@@ -128,6 +129,11 @@ class RuntimeTelemetry:
         self.trace_enabled = _env_flag('YOLO_TTA_TASK_TRACE', False)
         self.enabled = _env_flag('YOLO_TTA_TELEMETRY', True) or self.trace_enabled
         self.lock = threading.RLock()
+        # Observation lifecycle/snapshots must not hold up compute, GPU lease
+        # retirement or memory-credit producers. Only bounded metric updates
+        # and copies use this independent lock; formatting and I/O never do.
+        self._metrics_lock = threading.RLock()
+        self._snapshot_dirty = 0
         # Scheduler timing is recorded on dispatch and credit paths. Keep its
         # short aggregation lock independent of the diagnostic writer lock.
         self._timing_lock = threading.Lock()
@@ -206,7 +212,7 @@ class RuntimeTelemetry:
             raise
         finally:
             elapsed = time.monotonic_ns() - start
-            with self.lock:
+            with self._metrics_lock:
                 if self.enabled and self._accepting:
                     self.phase_ns[str(name)] += int(elapsed)
                     self.phase_calls[str(name)] += 1
@@ -232,7 +238,7 @@ class RuntimeTelemetry:
                 return
             if not math.isfinite(amount):
                 return
-        with self.lock:
+        with self._metrics_lock:
             if not self.enabled or not self._accepting:
                 return
             try:
@@ -348,7 +354,7 @@ class RuntimeTelemetry:
         if not self.enabled:
             return
         key, serialized = str(name), _runtime_jsonable(value)
-        with self.lock:
+        with self._metrics_lock:
             if not self.enabled or not self._accepting:
                 return
             # A newer ordinary update supersedes an earlier pending scheduler
@@ -357,6 +363,33 @@ class RuntimeTelemetry:
                 self._scheduler_gauge_pending.pop(key, None)
             self.gauges[key] = serialized
             self._dirty += 1
+
+    def gauge_many(self, values: Mapping[str, object]) -> None:
+        """Publish a related sample atomically, without the observer lock."""
+        if not self.enabled:
+            return
+        serialized = {str(key): _runtime_jsonable(value) for key, value in values.items()}
+        with self._metrics_lock:
+            if not self.enabled or not self._accepting:
+                return
+            with self._scheduler_metrics_lock:
+                for key in serialized:
+                    self._scheduler_gauge_pending.pop(key, None)
+            self.gauges.update(serialized)
+            self._dirty += 1
+
+    def gauges_snapshot(self, *, prefixes=()) -> Dict[str, object]:
+        """Copy current gauges for diagnostics without waiting for the writer.
+
+        Gauge values are already detached JSON-compatible objects. Overlay the
+        latest coalesced updates without consuming their dirty/write credits.
+        """
+        with self._metrics_lock:
+            with self._scheduler_metrics_lock:
+                values = dict(self.gauges)
+                values.update(self._scheduler_gauge_pending)
+        return {key: value for key, value in values.items()
+                if not prefixes or key.startswith(prefixes)}
 
     def register_sample_provider(self, name: str, provider: Callable[[], object]) -> None:
         """Sample a lower-layer diagnostic on the existing system-sampler cadence."""
@@ -388,7 +421,7 @@ class RuntimeTelemetry:
     def fallback(self, name: str, exc: Optional[BaseException] = None) -> None:
         if not self.enabled:
             return
-        with self.lock:
+        with self._metrics_lock:
             if not self.enabled or not self._accepting:
                 return
             self.fallbacks[str(name)] += 1
@@ -399,34 +432,39 @@ class RuntimeTelemetry:
     def snapshot(self, *, final: bool = False) -> Dict[str, object]:
         now_ns = time.monotonic_ns()
         with self.lock:
-            # Lock order is always telemetry then timing. Producers take only
-            # the timing lock, so the snapshot can swap quickly and aggregate
-            # outside that short critical section.
-            with self._timing_lock:
-                timing_pending = self._timing_pending
-                timing_dirty = self._timing_dirty
-                self._timing_pending = Counter()
-                self._timing_dirty = 0
-            for name, amount in timing_pending.items():
-                self.counters[name] += amount
-            self._dirty += timing_dirty
-            with self._scheduler_metrics_lock:
-                scheduler_counters = self._scheduler_counter_pending
-                scheduler_gauges = self._scheduler_gauge_pending
-                scheduler_dirty = self._scheduler_metrics_dirty
-                self._scheduler_counter_pending = Counter()
-                self._scheduler_gauge_pending = {}
-                self._scheduler_metrics_dirty = 0
-            for name, amount in scheduler_counters.items():
-                try:
-                    total = self.counters[name] + amount
-                except OverflowError:
-                    continue
-                if isinstance(total, float) and not math.isfinite(total):
-                    continue
-                self.counters[name] = total
-            self.gauges.update(scheduler_gauges)
-            self._dirty += scheduler_dirty
+            # Observer -> metrics -> producer-channel locks. Producers never
+            # acquire the observer lock. Copy primitive state, then release
+            # metrics before formatting the snapshot or doing any I/O.
+            with self._metrics_lock:
+                with self._timing_lock:
+                    timing_pending = self._timing_pending
+                    timing_dirty = self._timing_dirty
+                    self._timing_pending = Counter()
+                    self._timing_dirty = 0
+                for name, amount in timing_pending.items():
+                    self.counters[name] += amount
+                self._dirty += timing_dirty
+                with self._scheduler_metrics_lock:
+                    scheduler_counters = self._scheduler_counter_pending
+                    scheduler_gauges = self._scheduler_gauge_pending
+                    scheduler_dirty = self._scheduler_metrics_dirty
+                    self._scheduler_counter_pending = Counter()
+                    self._scheduler_gauge_pending = {}
+                    self._scheduler_metrics_dirty = 0
+                for name, amount in scheduler_counters.items():
+                    try:
+                        total = self.counters[name] + amount
+                    except OverflowError:
+                        continue
+                    if isinstance(total, float) and not math.isfinite(total):
+                        continue
+                    self.counters[name] = total
+                self.gauges.update(scheduler_gauges)
+                self._dirty += scheduler_dirty
+                phase_ns, phase_calls = dict(self.phase_ns), dict(self.phase_calls)
+                counters, gauges = dict(self.counters), dict(self.gauges)
+                fallbacks = dict(self.fallbacks)
+                self._snapshot_dirty = self._dirty
             with self._trace_lock:
                 trace_events = list(self._trace_events[:max(1, self._trace_batch_limit)])
                 trace_dirty = self._trace_dirty
@@ -435,22 +473,20 @@ class RuntimeTelemetry:
                 trace_buffer_peak = self._trace_buffer_peak
                 self._trace_snapshot_dirty = trace_dirty
             phases: Dict[str, object] = {}
-            for name, total_ns in self.phase_ns.items():
-                calls = int(self.phase_calls.get(name, 0))
+            for name, total_ns in phase_ns.items():
+                calls = int(phase_calls.get(name, 0))
                 seconds = float(total_ns) / 1e9
                 phases[str(name)] = {
                     'calls': calls,
                     'seconds': seconds,
                     'mean_ms': (seconds * 1000.0 / calls) if calls else 0.0,
                 }
-            counters = dict(self.counters)
             if trace_buffer_peak:
                 counters['telemetry.trace_buffer_peak_events'] = max(
                     int(counters.get('telemetry.trace_buffer_peak_events', 0)), trace_buffer_peak)
             if trace_dropped:
                 counters['telemetry.trace_dropped_events'] = (
                     int(counters.get('telemetry.trace_dropped_events', 0)) + trace_dropped)
-            gauges = dict(self.gauges)
             if trace_dropped:
                 gauges['telemetry.trace_overflow'] = {
                     'capture_disabled': True, 'buffer_limit': self._trace_buffer_limit,
@@ -467,7 +503,7 @@ class RuntimeTelemetry:
                 'phases': phases,
                 'counters': counters,
                 'gauges': gauges,
-                'fallbacks': dict(self.fallbacks),
+                'fallbacks': fallbacks,
                 'events': trace_events,
                 'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES', ''),
             }
@@ -476,9 +512,14 @@ class RuntimeTelemetry:
     def maybe_flush(self) -> None:
         if not self.enabled:
             return
-        with self.lock:
+        # In particular a span's finally must not wait behind an observer.
+        if not self.lock.acquire(blocking=False):
+            return
+        try:
             if self._write_due_locked():
                 self._request_writer_locked()
+        finally:
+            self.lock.release()
 
     def _write_due_locked(self) -> bool:
         with self._timing_lock:
@@ -512,11 +553,12 @@ class RuntimeTelemetry:
         self._writer_condition.notify_all()
 
     def _disable_writer_locked(self, exc: BaseException) -> None:
-        with self._trace_lock:
-            self.enabled = False
-            self._accepting = False
-        self._writer_error = f'{type(exc).__name__}: {exc}'
-        self.gauges['telemetry.write_error'] = self._writer_error
+        with self._metrics_lock:
+            with self._trace_lock:
+                self.enabled = False
+                self._accepting = False
+            self._writer_error = f'{type(exc).__name__}: {exc}'
+            self.gauges['telemetry.write_error'] = self._writer_error
         self._writer_condition.notify_all()
 
     def _report_writer_error(self) -> None:
@@ -547,7 +589,7 @@ class RuntimeTelemetry:
                         final = (self._final_requested and
                                  len(self._trace_events) <= max(1, self._trace_batch_limit))
                     payload = self.snapshot(final=final)
-                    dirty = self._dirty
+                    dirty = self._snapshot_dirty
                     trace_dirty = self._trace_snapshot_dirty
                     generation, target_sequence = self._request_generation, self._request_sequence
                 serialization_started = time.perf_counter()
@@ -563,16 +605,18 @@ class RuntimeTelemetry:
                 with self._writer_condition:
                     # Writer-owned metrics do not dirty the state or request another write.
                     # Each record necessarily excludes its own not-yet-completed I/O.
-                    self.counters['telemetry.writer.serialization_seconds'] += serialization_seconds
-                    self.counters['telemetry.writer.file_io_seconds'] += io_seconds
-                    self.counters['telemetry.writer.write_calls'] += 1
+                    with self._metrics_lock:
+                        self.counters['telemetry.writer.serialization_seconds'] += serialization_seconds
+                        self.counters['telemetry.writer.file_io_seconds'] += io_seconds
+                        self.counters['telemetry.writer.write_calls'] += 1
+                        # Do not acknowledge updates accepted after this snapshot.
+                        self._dirty = max(0, self._dirty - dirty)
                     saved_events = payload['events']
                     with self._trace_lock:
                         del self._trace_events[:len(saved_events)]
                         self._trace_dirty = max(0, self._trace_dirty - trace_dirty)
                         if saved_events:
                             self._written_sequence = int(saved_events[-1]['sequence'])
-                    self._dirty = max(0, self._dirty - dirty)
                     self._last_flush = time.monotonic()
                     if self._written_sequence >= target_sequence:
                         self._completed_generation = max(self._completed_generation, generation)
@@ -614,13 +658,14 @@ class RuntimeTelemetry:
         thread = None
         with self._writer_condition:
             if self.enabled and not self._final_done:
-                with self._trace_lock:
-                    if final:
-                        # Fence accepted events before choosing the last sequence.
-                        self._accepting = False
-                        self._final_requested = True
-                    target_sequence = (int(self._trace_events[-1]['sequence'])
-                                       if self._trace_events else self._written_sequence)
+                with self._metrics_lock:
+                    with self._trace_lock:
+                        if final:
+                            # Fence ordinary metrics and events before the final snapshot.
+                            self._accepting = False
+                            self._final_requested = True
+                        target_sequence = (int(self._trace_events[-1]['sequence'])
+                                           if self._trace_events else self._written_sequence)
                 self._request_generation += 1
                 generation = self._request_generation
                 self._request_sequence = target_sequence
@@ -837,17 +882,13 @@ class RuntimeSystemSampler:
             # A trace flush can repeat the latest gauges many times. Publish
             # the values and acquisition interval together so readers can
             # identify real samples without guessing from changed values.
-            with self.telemetry.lock:
-                if not self.telemetry.enabled or not self.telemetry._accepting:
-                    return
-                self.telemetry.gauges.update({
+            self.telemetry.gauge_many({
                     'system.gpu_utilization': util,
                     'system.gpu_memory': memory,
                     'system.gpu_devices': devices,
                     'system.gpu_sample_started_ns': sample_started_ns,
                     'system.gpu_sample_monotonic_ns': sample_finished_ns,
-                })
-                self.telemetry._dirty += 1
+            })
         except Exception:
             pass
 
@@ -862,10 +903,11 @@ class RuntimeSystemSampler:
                 page_size = 4096
             if 'rss_pages' in now:
                 self.telemetry.gauge('system.rss_bytes', int(now['rss_pages']) * page_size)
-            with self.telemetry.lock:
-                self.telemetry.gauge('system.cgroup_memory', now['cgroup_memory'])
-                self.telemetry.gauge('system.cgroup_memory_current', now['cgroup_memory_current'])
-                self.telemetry.gauge('system.cgroup_memory_limit', now['cgroup_memory_limit'])
+            self.telemetry.gauge_many({
+                'system.cgroup_memory': now['cgroup_memory'],
+                'system.cgroup_memory_current': now['cgroup_memory_current'],
+                'system.cgroup_memory_limit': now['cgroup_memory_limit'],
+            })
             if prior is not None:
                 dt = max(1e-9, float(now['time']) - float(prior['time']))
                 try:

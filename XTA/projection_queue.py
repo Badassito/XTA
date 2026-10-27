@@ -306,6 +306,8 @@ def settle_prepared_view_components(prepared) -> bool:
             break
     if any(not child.done() for child in children):
         return False
-    prepared.nrrd_layers.extend(child.result() for child in children)
+    # Ownership-only children (for example terminal confidence readers) still
+    # gate settlement, but do not contribute a binary projection layer.
+    prepared.nrrd_layers.extend(result for child in children if (result := child.result()) is not None)
     children.clear()
     return True

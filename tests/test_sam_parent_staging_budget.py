@@ -36,6 +36,7 @@ def pipeline_drain(stage, budget, scheduler, *, sam_context=None):
         _reclaim_drained_sam_dense_capacity=lambda: None,
         parent_dense_retired_events=queues.SimpleQueue(),
         parent_confidence_retired_events=queues.SimpleQueue(),
+        parent_mask_retired_events=queues.SimpleQueue(),
         _drain_parent_mask_ready_events=lambda: None,
         _flush_ready_postprocessed_tiles=lambda: None, _flush_ready_residual_tiles=lambda: None,
         view_processing_futures={}, tile_cleanup_futures={}, tile_parent_gate_futures={},

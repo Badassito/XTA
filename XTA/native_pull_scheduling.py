@@ -2,8 +2,9 @@
 
 Each stream retains destination order and owns its output planes. The shared
 executor schedules independent planes fairly without changing Numba's global
-thread settings. Credits cover running and completed, unconsumed operations;
-this bounds buffered sink planes across streams as well as CPU concurrency.
+thread settings. CPU permits cover running operations only. Each caller funds
+its complete ordered result window separately, including completed unconsumed
+planes; a slow consumer therefore cannot reserve another stream's CPU permits.
 """
 
 from __future__ import annotations
@@ -108,6 +109,9 @@ class NativePullScheduler:
                         active_projections=sum(lane.role == 'native_projection' for lane in self._lanes),
                         active_confidence_captures=sum(lane.role == 'confidence_capture' for lane in self._lanes),
                         active_operations=self._active,
+                        buffered_operations=self._retained - self._active,
+                        queued_operations=sum(len(lane.pending) for lane in self._lanes),
+                        funded_window_operations=sum(min(lane.count, lane.window) for lane in self._lanes),
                         retained_operations=self._retained, peak_active_operations=self._peak_active,
                         peak_retained_operations=self._peak_retained,
                         cancelled=self._cancelled)
@@ -120,10 +124,20 @@ class NativePullScheduler:
                         projection_peak_retained_operations=lane.peak_retained,
                         projection_window=lane.window, job_role=lane.role,
                         job_active_operations=lane.running, job_retained_operations=lane.retained,
+                        job_buffered_operations=lane.retained - lane.running,
+                        job_queued_operations=len(lane.pending),
                         job_peak_active_operations=lane.peak_running,
                         job_peak_retained_operations=lane.peak_retained, job_window=lane.window)
 
     def ordered_planes(self, count, operation, *, max_pending, role='native_projection'):
+        """Schedule within a caller-funded result/workspace window.
+
+        The caller must retain its window reservation and borrowed inputs until
+        this iterator closes, plus its separately charged current consumer
+        result. At most ``window`` Futures exist per lane, including queued
+        placeholders, so aggregate retained results cannot exceed the sum of
+        admitted lane windows even when consumers stop making progress.
+        """
         if role not in ('native_projection', 'confidence_capture'):
             raise ValueError(f'Unsupported native CPU scheduling role: {role!r}')
         lane = _Lane(operation, max(0, int(count)),
@@ -138,7 +152,9 @@ class NativePullScheduler:
 
     def _fill_locked(self, lane):
         # Futures queued here own no plane or geometry workspace. Admission in
-        # _dispatch_locked reserves global credits before an operation runs.
+        # _dispatch_locked reserves a running CPU permit before work starts.
+        # Placeholders, running work and completed results all count against
+        # this caller's fixed funded window; no refill occurs until consumption.
         while len(lane.futures) < lane.window and lane.next_index < lane.count:
             index = lane.next_index
             lane.next_index += 1
@@ -157,7 +173,7 @@ class NativePullScheduler:
             return
         self._dispatching = True
         try:
-            while self._retained < self._workers and self._ready:
+            while self._active < self._workers and self._ready:
                 # Fairness is reconsidered on every completion/consumption and
                 # resize, including for streams that were already running.
                 share = max(1, (self._workers + len(self._lanes) - 1) // max(1, len(self._lanes)))
@@ -169,7 +185,7 @@ class NativePullScheduler:
                         if lane.stopped or not lane.pending:
                             continue
                         limit = min(lane.window, share) if enforce_share else lane.window
-                        if lane.retained >= limit:
+                        if lane.running >= limit:
                             self._enqueue_locked(lane)
                             continue
                         selected = lane
@@ -177,7 +193,7 @@ class NativePullScheduler:
                     if selected is not None:
                         break
                     # Other streams may have smaller memory windows or no
-                    # more work. Lend unused credit after every fitting fair
+                    # more work. Lend unused CPU permits after every fitting fair
                     # waiter has had priority; arrivals get first claim on
                     # credit returned by the temporarily larger stream.
                 if selected is None:

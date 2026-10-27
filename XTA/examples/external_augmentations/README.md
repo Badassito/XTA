@@ -105,8 +105,12 @@ separable horizontal/vertical passes with reflect padding, or replicate padding
 when a dimension is too small for the kernel radius.
 
 The GPU policies require CUDA-enabled PyTorch. Set `PTA_GPU_TORCH_COMPILE=0`
-to disable optional compilation of the fused pointwise kernel. Numerical tests
-run on CPU; actual CUDA policy execution is enabled with:
+to disable optional compilation of the fused pointwise kernel. Compilation keeps
+TorchInductor fusion enabled and explicitly disables CUDA graph capture so that
+augmentation can overlap PTA rendering and JPEG publication on other streams.
+Custom policies used with asynchronous PTA must also avoid CUDA stream capture;
+publication can synchronize or download tensors while the next policy call runs.
+Numerical tests run on CPU; actual CUDA policy execution is enabled with:
 
 ```text
 XTA_RUN_EXTERNAL_AUGMENTATION_CUDA=1 python -m unittest tests.test_external_augmentation_examples -v

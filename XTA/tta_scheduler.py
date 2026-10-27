@@ -35,6 +35,9 @@ from .backprojection import GpuInferenceAssetsRetired, _make_gpu_inference_asset
 
 
 _SELECTION_KEY_UNSET = object()
+# ``cast`` is a no-op, but constructing nested typing aliases inside a full
+# pending-task scan is not. Keep this static type outside the dispatch path.
+_SelectionParentKey = Optional[Tuple[str, str]]
 
 
 @dataclass(frozen=True)
@@ -2113,7 +2116,7 @@ class TtaScheduler:
     ) -> bool:
         key: Optional[Tuple[str, str]] = (
             self.direct_union_task_key(task) if precomputed_key is _SELECTION_KEY_UNSET
-            else cast(Optional[Tuple[str, str]], precomputed_key)
+            else cast(_SelectionParentKey, precomputed_key)
         )
         if key is None or not self.inputs.direct_union_sparse_retirement_active:
             return True
@@ -2560,6 +2563,10 @@ class TtaScheduler:
                 admissible = True
                 break
         self.operations._set_main_process_gpu_pending_inference(bool(admissible))
+        self.publish_gpu_worker_retirement_pressure()
+
+    def publish_gpu_worker_retirement_pressure(self) -> None:
+        """Refresh cheap ownership pressure even when inference windows are full."""
         publish_pressure = self.operations._set_main_process_gpu_spherical_retirement_pressure
         if publish_pressure is not None:
             # Only completed parents can be retired. A live Spherical projector
@@ -2766,14 +2773,29 @@ class TtaScheduler:
                 self.operations._set_main_process_gpu_spherical_retirement_pressure(False)
             return
         self._refresh_cpu_input_capacity()
-        with scheduler_step('backlog_initial'):
-            self.publish_gpu_worker_admissible_backlog()
         per_gpu = (
             max(1, min(4, self.operations._env_int('YOLO_TTA_GPU_WORKER_DISPATCH_WINDOW_PER_GPU', 2)))
             if bool(self.inputs.v1613_d1_owner_active) else max(
                 1, self.operations._env_int('YOLO_TTA_GPU_WORKER_DISPATCH_WINDOW_PER_GPU', 2),
             )
         )
+        if all(self.gpu_worker_inflight(worker_id) >= int(per_gpu) for worker_id in worker_ids):
+            # No selection can commit while every inference window is full.
+            # Conservatively protect a nonempty inference queue until compute
+            # credit returns; that refill performs a fresh admission scan before
+            # dispatch. This hint grants no task/device/storage ownership, and
+            # avoids carrying a stale false hint into batched credit retirement.
+            # Device stages remain excluded by committed inference leases here.
+            # Ownership pressure and workspace completions still run on every
+            # refill, including this path, and an empty central queue is final.
+            self.operations._set_main_process_gpu_pending_inference(
+                bool(self.state.gpu_worker_pending_task_ids))
+            self.publish_gpu_worker_retirement_pressure()
+            with scheduler_step('aux_refresh'):
+                self.refresh_gpu_aux_interpolation_leases()
+            return
+        with scheduler_step('backlog_initial'):
+            self.publish_gpu_worker_admissible_backlog()
         aux_pool = self.operations.gpu_worker_aux_interpolation_pool()
         while self.state.gpu_worker_pending_task_ids:
             candidates: List[int] = []

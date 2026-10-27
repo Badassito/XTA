@@ -1942,6 +1942,22 @@ def prepare_view_volume_after_fullframe(
             workers=slice_workers, precleaned_slice_cleanup=precleaned_slice_cleanup,
             hole_fill_done_on_device=hole_fill_done_on_device, slice_meta=slice_meta))
 
+    from .packed_tilted_projection import terminal_native_source_packing_eligible
+    terminal_packed = bool(union_owner is not None and terminal_native_source_packing_eligible(view,
+        native_bytes=int(baseline_native_volume.nbytes), retire_dense=retire_dense_after_prepare,
+        component_layers=nrrd_layers_enabled, tiled=dense_tiling_active, keep_temp=keep_temp,
+        prepublished=preinterpolation_layer_already_published,
+        interpolate=interpolate, interpolation_passes=interpolate_passes,
+        extrapolate=extrapolation_distance, mask_callback_available=mask_retired_callback is not None,
+        confidence_can_retire=(confmap_mm is None or confidence_retired_callback is not None)))
+    from functools import partial
+    from .confidence_orchestration import (retire_confidence_scores, join_failed_capture,
+                                          ConfidenceSourceRetirement)
+    retire_confidence = ConfidenceSourceRetirement(partial(retire_confidence_scores, model_name=str(model_name),
+        view_name=str(view.name), path=confmap_path, keep_temp=keep_temp,
+        retired_callback=confidence_retired_callback, carrier=confidence_owner_carrier))
+    confidence_future = None
+    terminal_confidence_scores = None
     observation_inventory = _observation_inventory
     try:
         if observation_inventory is not None:
@@ -1961,86 +1977,83 @@ def prepare_view_volume_after_fullframe(
                             limits=limits, inventory=observation_inventory)
             # The CPU prefix owns no projection/image CUDA rights before cohort admission.
             sam_context._start()
-        from .confidence_evidence import capture_prediction_confidence
+        from .confidence_evidence import (capture_prediction_confidence, try_capture_prediction_confidence,
+            prepare_terminal_confidence_scores, try_capture_terminal_confidence_scores,
+            capture_terminal_confidence_scores, terminal_confidence_capture_available)
         if not preinterpolation_layer_already_published:
-            capture_prediction_confidence(
-                baseline_native_volume, confmap_mm, view=view, model_name=model_name, temp_dir=temp_dir,
+            capture_kwargs = dict(view=view, model_name=model_name, temp_dir=temp_dir,
                 known_slice_any=(meta_slice_any if hole_metadata_valid else None),
                 known_slice_bboxes=(meta_slice_bboxes if hole_metadata_valid else None))
+            if terminal_packed:
+                # The terminal handoff has finished every score writer. Sanitizing
+                # this exclusive score backing lets confidence stop borrowing the
+                # original mask; binary packing still owns that mask below.
+                # Without a funded asynchronous queue, capture must finish before
+                # packing anyway; avoid an extra full-grid pass in that mode.
+                if terminal_confidence_capture_available():
+                    terminal_confidence_scores = prepare_terminal_confidence_scores(
+                        baseline_native_volume, confmap_mm,
+                        known_slice_any=capture_kwargs['known_slice_any'],
+                        known_slice_bboxes=capture_kwargs['known_slice_bboxes'])
+                if terminal_confidence_scores is not None:
+                    confidence_future = try_capture_terminal_confidence_scores(
+                        terminal_confidence_scores, retire=retire_confidence, **capture_kwargs)
+                    if confidence_future is None:
+                        capture_terminal_confidence_scores(terminal_confidence_scores, **capture_kwargs)
+                else:
+                    confidence_future = try_capture_prediction_confidence(
+                        baseline_native_volume, confmap_mm, retire=retire_confidence, **capture_kwargs)
+            if confidence_future is None and terminal_confidence_scores is None:
+                capture_prediction_confidence(baseline_native_volume, confmap_mm, **capture_kwargs)
     finally:
-        if confmap_mm is not None and confidence_retired_callback is not None:
-            # Runtime retirement deliberately preserves any derived live views.
-            # Return dense credit only when the underlying owner is destroyed,
-            # never just because close_memmap_array was requested. NumPy views
-            # keep their root/mmap alive until their last consumer has finished.
-            confidence_owner = confmap_mm
-            seen_owners = set()
-            while (getattr(confidence_owner, 'base', None) is not None
-                   and id(confidence_owner) not in seen_owners):
-                seen_owners.add(id(confidence_owner))
-                confidence_owner = confidence_owner.base
-            confidence_finalizer = weakref.finalize(
-                confidence_owner, confidence_retired_callback,
-                str(model_name), str(view.name), int(confmap_mm.nbytes))
-            confidence_finalizer.atexit = False
-            confidence_owner = None
-        close_memmap_array(
-            confmap_mm,
-            unlink_path=confmap_path if confmap_path is not None and not keep_temp else None,
-        )
-        if confmap_path is not None and not keep_temp:
-            try:
-                confmap_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-        if confidence_owner_carrier is not None:
-            confidence_owner_carrier.clear()
-        confmap_mm = None
+        if confidence_future is None:
+            retire_confidence(confmap_mm)
+        # A successful queue admission owns the carrier and the original score
+        # backing. This frame must not pin scores through binary projection.
+        retire_confidence = confidence_owner_carrier = confmap_mm = terminal_confidence_scores = None
 
-    from .packed_tilted_projection import terminal_native_source_packing_eligible
-    if (union_owner is not None and terminal_native_source_packing_eligible(view,
-            native_bytes=int(baseline_native_volume.nbytes), retire_dense=retire_dense_after_prepare,
-            component_layers=nrrd_layers_enabled, tiled=dense_tiling_active, keep_temp=keep_temp,
-            prepublished=preinterpolation_layer_already_published,
-            interpolate=interpolate, interpolation_passes=interpolate_passes,
-            extrapolate=extrapolation_distance,
-            mask_callback_available=mask_retired_callback is not None)):
-        # Native work is terminal. Preserve an immutable compressed continuation
-        # before detaching every dense alias; projection/retry then needs bits only.
-        from .packed_tilted_projection import pack_terminal_native_source
-        from .view_prepare import _array_lifetime_owner, scratch_unlink_path_for_memmap
-        packed_path = temp_dir / 'packed_native_parents' / str(model_name) / str(view.name)
-        packed_stats = pack_terminal_native_source(baseline_native_volume, packed_path,
-            desc=f'Packed terminal native parent {model_name}/{view.name}')
-        native_bytes = int(baseline_native_volume.nbytes)
-        retired_bytes = max(0, native_bytes - int(packed_stats['resident_bytes']))
-        if retired_bytes:
-            owner = _array_lifetime_owner(baseline_native_volume)
-            finalizer = weakref.finalize(owner, mask_retired_callback,
-                str(model_name), str(view.name), retired_bytes)
-            finalizer.atexit = False
-            owner = None
-        close_memmap_array_without_flush(baseline_native_volume,
-            unlink_path=scratch_unlink_path_for_memmap(baseline_native_volume, union_path))
-        union_owner.clear()
-        baseline_native_volume = union_mm = None
-        runtime_telemetry().add('projection.tilted_packed_parent.native_bytes_detached', native_bytes)
-        runtime_telemetry().add('projection.tilted_packed_parent.resident_packed_bytes',
-                                int(packed_stats['resident_bytes']))
+    if terminal_packed:
         try:
-            layer_ref = _materialize_terminal_packed_tilted_view_layer(packed_path,
-                view=view, model_name=str(model_name), temp_dir=temp_dir,
-                workers=int(slice_workers), has_foreground=int(packed_stats['foreground_voxels']) > 0,
-                projected_output_memory=projected_output_memory)
-            result = PreparedViewResult(model_name=str(model_name), view_name=str(view.name),
-                aug_id=str(view.tta_aug_id), angle_deg=float(view.tta_angle_deg),
-                native_support_mm=None, final_view_volume_mm=None,
-                interpolation_stats=[], nrrd_layers=[] if layer_ref is None else [layer_ref])
-            result._packed_native_source_retired = True
-            return result
-        finally:
-            release_memfd_owners_under(packed_path)
-            shutil.rmtree(packed_path, ignore_errors=True)
+            # Native work is terminal. Preserve an immutable compressed continuation
+            # before detaching every dense alias; projection/retry then needs bits only.
+            from .packed_tilted_projection import pack_terminal_native_source
+            from .view_prepare import _array_lifetime_owner, scratch_unlink_path_for_memmap
+            packed_path = temp_dir / 'packed_native_parents' / str(model_name) / str(view.name)
+            packed_stats = pack_terminal_native_source(baseline_native_volume, packed_path,
+                desc=f'Packed terminal native parent {model_name}/{view.name}')
+            native_bytes = int(baseline_native_volume.nbytes)
+            retired_bytes = max(0, native_bytes - int(packed_stats['resident_bytes']))
+            if retired_bytes:
+                owner = _array_lifetime_owner(baseline_native_volume)
+                finalizer = weakref.finalize(owner, mask_retired_callback,
+                    str(model_name), str(view.name), retired_bytes)
+                finalizer.atexit = False
+                owner = None
+            close_memmap_array_without_flush(baseline_native_volume,
+                unlink_path=scratch_unlink_path_for_memmap(baseline_native_volume, union_path))
+            union_owner.clear()
+            baseline_native_volume = union_mm = None
+            runtime_telemetry().add('projection.tilted_packed_parent.native_bytes_detached', native_bytes)
+            runtime_telemetry().add('projection.tilted_packed_parent.resident_packed_bytes',
+                                    int(packed_stats['resident_bytes']))
+            try:
+                layer_ref = _materialize_terminal_packed_tilted_view_layer(packed_path,
+                    view=view, model_name=str(model_name), temp_dir=temp_dir,
+                    workers=int(slice_workers), has_foreground=int(packed_stats['foreground_voxels']) > 0,
+                    projected_output_memory=projected_output_memory)
+                result = PreparedViewResult(model_name=str(model_name), view_name=str(view.name),
+                    aug_id=str(view.tta_aug_id), angle_deg=float(view.tta_angle_deg),
+                    native_support_mm=None, final_view_volume_mm=None,
+                    interpolation_stats=[], nrrd_layers=[] if layer_ref is None else [layer_ref],
+                    pending_component_layers=[] if confidence_future is None else [confidence_future])
+                result._packed_native_source_retired = True
+                return result
+            finally:
+                release_memfd_owners_under(packed_path)
+                shutil.rmtree(packed_path, ignore_errors=True)
+        except BaseException as error:
+            join_failed_capture(confidence_future, error)
+            raise
 
     if bool(d1_delta_only) and not bool(d1_component_refs_only):
         d1_additions_path = (

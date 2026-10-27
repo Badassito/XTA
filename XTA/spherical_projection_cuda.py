@@ -25,6 +25,45 @@ from .cylindrical_cuda_projection import (
 )
 
 
+_SPHERICAL_BLOCK_BYTES = 256 * 1024 * 1024
+
+
+def spherical_cuda_block_plan(output_shape, *, source_bytes, geometry_bytes,
+                              block_bytes=None, free_device_bytes=None,
+                              reserve_bytes=_RESERVE_BYTES):
+    """Admit both private output buffers within the observed device allowance.
+
+    Larger output slabs amortize the metadata/payload handshakes. Explicit
+    smaller caps remain exact, and memory pressure reduces depth before any
+    device or pinned output allocation. The existing setup margin also covers
+    allocator rounding and kernel/module setup outside the byte arrays.
+    """
+    shape = tuple(operator.index(value) for value in output_shape)
+    if len(shape) != 3 or min(shape) <= 0:
+        raise ValueError('Spherical CUDA output shape must be positive TYX')
+    plane_bytes = shape[1] * shape[2]
+    budget = (_SPHERICAL_BLOCK_BYTES if block_bytes is None
+              else min(operator.index(block_bytes), _SPHERICAL_BLOCK_BYTES))
+    if budget <= 0 or plane_bytes > budget or (shape[1] + 7) // 8 > 65535:
+        raise SphericalCudaProjectionUnavailable('One Spherical output plane exceeds the bounded CUDA grid')
+    fixed = (max(1, operator.index(source_bytes)) + max(0, operator.index(geometry_bytes))
+             + _SETUP_BYTES)
+    per_slice = 2 * plane_bytes + _CROP_METADATA_DTYPE.itemsize + 8
+    depth = min(shape[0], budget // plane_bytes, _MAX_ENCODED_SLICES)
+    reserve = max(0, operator.index(reserve_bytes))
+    if free_device_bytes is not None:
+        available = operator.index(free_device_bytes) - reserve - fixed - 8
+        depth = min(depth, available // per_slice)
+    if depth < 1:
+        raise SphericalCudaProjectionUnavailable('Spherical CUDA source and bounded buffers exceed available device memory')
+    output_bytes = depth * plane_bytes
+    return dict(max_block_depth=int(depth), block_budget_bytes=int(budget),
+        output_buffer_bytes=int(output_bytes), compact_buffer_bytes=int(output_bytes),
+        metadata_buffer_bytes=int(depth * _CROP_METADATA_DTYPE.itemsize),
+        offset_buffer_bytes=int((depth + 1) * 8),
+        required_device_bytes=int(fixed + depth * per_slice + 8))
+
+
 class SphericalCudaProjectionUnavailable(RuntimeError):
     """Admission failed before publication; a settled CPU fallback is safe."""
 
@@ -134,7 +173,7 @@ class SphericalCudaProjector:
     _reset_projection_stats = RadialCudaProjector._reset_projection_stats
 
     def __init__(self, source, view, output_shape, bboxes=None, device_index=0, *,
-                 block_bytes=_BLOCK_BYTES, upload_bytes=_UPLOAD_BYTES, reserve_bytes=_RESERVE_BYTES):
+                 block_bytes=None, upload_bytes=_UPLOAD_BYTES, reserve_bytes=_RESERVE_BYTES):
         from .spherical_projection import _validate_spherical_projection
         from .spherical_projection_cpu import prepare_spherical_chunk_numba
 
@@ -157,11 +196,7 @@ class SphericalCudaProjector:
                   'bboxes': np.ascontiguousarray(boxes), 'source_offsets': offsets}
         self.contract = _SphericalContract(shape, tuple(source.shape), arrays, cropped)
         self.output_bounds = spherical_output_bounds(view, shape, boxes if self.use_bboxes else None)
-        budget = min(operator.index(block_bytes), _BLOCK_BYTES)
         plane_bytes = shape[1] * shape[2]
-        if budget <= 0 or plane_bytes > budget or (shape[1] + 7) // 8 > 65535:
-            raise SphericalCudaProjectionUnavailable('One Spherical output plane exceeds the bounded CUDA grid')
-        self.max_block_depth = min(shape[0], budget // plane_bytes, _MAX_ENCODED_SLICES)
         # Preflight must have an exact CPU oracle before owning device memory.
         compiled_pull = prepare_spherical_chunk_numba(
             source, view, radii, rotation, shape, boxes if self.use_bboxes else None,
@@ -172,13 +207,13 @@ class SphericalCudaProjector:
         self.source_layout = 'bbox_u8' if cropped else 'dense_u8'
         self.source_h2d_bytes = int(offsets[-1]) if cropped else source.nbytes
         self.geometry_bytes = sum(a.nbytes for a in arrays.values())
-        self.output_buffer_bytes = self.max_block_depth * plane_bytes
-        self.compact_buffer_bytes = self.output_buffer_bytes
-        self.metadata_buffer_bytes = self.max_block_depth * _CROP_METADATA_DTYPE.itemsize
-        self.offset_buffer_bytes = (self.max_block_depth + 1) * 8
-        self.required_device_bytes = (max(1, self.source_h2d_bytes) + self.geometry_bytes + 2 * self.output_buffer_bytes
-                                      + self.metadata_buffer_bytes + self.offset_buffer_bytes + _SETUP_BYTES)
         self.reserve_bytes = max(0, operator.index(reserve_bytes))
+        # Validate the requested slab before importing CUDA. The actual free
+        # device observation below can only shrink this bounded request.
+        requested_plan = spherical_cuda_block_plan(shape, source_bytes=self.source_h2d_bytes,
+            geometry_bytes=self.geometry_bytes, block_bytes=block_bytes, reserve_bytes=self.reserve_bytes)
+        for key, value in requested_plan.items():
+            setattr(self, key, value)
         self._upload_bytes = min(operator.index(upload_bytes), _UPLOAD_BYTES)
         if self._upload_bytes <= 0 or self.device_index < 0:
             raise ValueError('Spherical CUDA upload budget/device must be positive/nonnegative')
@@ -191,6 +226,8 @@ class SphericalCudaProjector:
         self._arrays, self._events = {}, {}
         self._allocations = []
         self._closed = self._failed = False
+        self.close_seconds = self.close_sync_seconds = self.close_owner_clear_seconds = 0.0
+        self.close_device_pool_seconds = self.close_pinned_pool_seconds = 0.0
         self._skip_empty_blocks = False
         self.source_upload_seconds = self.source_pack_seconds = self.geometry_upload_seconds = self.preflight_seconds = 0.0
         self.preflight_mode = 'not_started'
@@ -198,6 +235,7 @@ class SphericalCudaProjector:
         self.source_pack_backend = 'dense_copy'
         self._reset_projection_stats()
         self.roi_projection_voxels = self.roi_skipped_blocks = 0
+        self.gpu_projection_blocks = self.projection_stream_fences = 0
         try:
             import cupy as cp
             self._cp = cp
@@ -207,8 +245,12 @@ class SphericalCudaProjector:
                 self._stream = cp.cuda.Stream(non_blocking=True)
                 self._pool, self._pinned_pool = cp.cuda.MemoryPool(), cp.cuda.PinnedMemoryPool()
                 free, _ = cp.cuda.runtime.memGetInfo()
-                if free < self.required_device_bytes + self.reserve_bytes:
-                    raise SphericalCudaProjectionUnavailable('Spherical CUDA source and bounded buffers exceed available device memory')
+                self.admission_free_bytes = int(free)
+                admitted_plan = spherical_cuda_block_plan(shape, source_bytes=self.source_h2d_bytes,
+                    geometry_bytes=self.geometry_bytes, block_bytes=block_bytes,
+                    free_device_bytes=int(free), reserve_bytes=self.reserve_bytes)
+                for key, value in admitted_plan.items():
+                    setattr(self, key, value)
                 with cp.cuda.using_allocator(self._pool.malloc), self._stream:
                     self._module = cp.RawModule(code=_CROP_KERNEL_BUNDLE + _SPHERICAL_KERNEL,
                                                 options=('--std=c++11', '--fmad=false'))
@@ -279,6 +321,7 @@ class SphericalCudaProjector:
                     self._skip_empty_blocks = True
                     self._reset_projection_stats()
                     self.roi_projection_voxels = self.roi_skipped_blocks = 0
+                    self.gpu_projection_blocks = self.projection_stream_fences = 0
             self.constructor_seconds = time.perf_counter() - started
         except SphericalCudaProjectionUnsafeFailure:
             raise
@@ -319,6 +362,7 @@ class SphericalCudaProjector:
                 np.float64(v.spherical_min_radius), np.float64(v.spherical_max_radius), np.uint64(roi_voxels),
                 np.int32(self.use_bboxes), np.int32(c.cropped_source)), stream=self._stream)
         self.roi_projection_voxels += roi_voxels
+        self.gpu_projection_blocks += 1
         self._record('kernel', 'end')
         return voxels
 
@@ -329,6 +373,7 @@ class SphericalCudaProjector:
             self._cp.cuda.runtime.memcpyDeviceToHost, int(self._stream.ptr))
         self._record('copy', 'end')
         self._stream.synchronize()
+        self.projection_stream_fences += 1
         self.kernel_seconds += self._elapsed('kernel')
         self.d2h_seconds += self._elapsed('copy')
         self.dense_d2h_bytes += voxels
@@ -375,6 +420,7 @@ class SphericalCudaProjector:
                 with self._cp.cuda.Device(self.device_index), self._cp.cuda.using_allocator(self._pool.malloc), self._stream:
                     self._launch_projection(first, count)
                     result = self._encode_current_output(first, count, bool(packed))
+                    self.projection_stream_fences += 2 if result.payload.size else 1
                     self.kernel_seconds += self._elapsed('kernel')
                     return result
             except BaseException:
@@ -382,30 +428,49 @@ class SphericalCudaProjector:
                 raise
 
     def close(self):
+        started = time.perf_counter()
         with self._lock:
             if self._closed:
                 return
-            if self._stream is not None:
-                try:
+            try:
+                if self._stream is not None:
+                    phase_started = time.perf_counter()
+                    try:
+                        with self._cp.cuda.Device(self.device_index):
+                            self._stream.synchronize()
+                    except BaseException as exc:
+                        raise SphericalCudaProjectionUnsafeFailure('Could not settle Spherical CUDA projection stream', self) from exc
+                    finally:
+                        self.close_sync_seconds = time.perf_counter() - phase_started
+                if self._cp is not None and self._stream is not None:
                     with self._cp.cuda.Device(self.device_index):
-                        self._stream.synchronize()
-                except BaseException as exc:
-                    raise SphericalCudaProjectionUnsafeFailure('Could not settle Spherical CUDA projection stream', self) from exc
-            if self._cp is not None and self._stream is not None:
-                with self._cp.cuda.Device(self.device_index):
-                    self._arrays.clear()
-                    self._allocations.clear()
-                    self._events.clear()
-                    self._source_gpu = self._output_gpu = self._compact_gpu = self._metadata_gpu = self._offsets_gpu = None
-                    self._module = self._kernel = self._reset_metadata_kernel = self._reduce_metadata_kernel = self._encode_kernel = None
-                    self._upload_stage = self._output_stage = self._metadata_stage = self._offsets_stage = None
-                    self._upload_pin = self._output_pin = self._metadata_pin = self._offsets_pin = None
-                    if self._pool is not None:
-                        self._pool.free_all_blocks()
-                    if self._pinned_pool is not None:
-                        self._pinned_pool.free_all_blocks()
-            self._stream = None
-            self._closed = True
+                        phase_started = time.perf_counter()
+                        try:
+                            self._arrays.clear()
+                            self._allocations.clear()
+                            self._events.clear()
+                            self._source_gpu = self._output_gpu = self._compact_gpu = self._metadata_gpu = self._offsets_gpu = None
+                            self._module = self._kernel = self._reset_metadata_kernel = self._reduce_metadata_kernel = self._encode_kernel = None
+                            self._upload_stage = self._output_stage = self._metadata_stage = self._offsets_stage = None
+                            self._upload_pin = self._output_pin = self._metadata_pin = self._offsets_pin = None
+                        finally:
+                            self.close_owner_clear_seconds = time.perf_counter() - phase_started
+                        phase_started = time.perf_counter()
+                        try:
+                            if self._pool is not None:
+                                self._pool.free_all_blocks()
+                        finally:
+                            self.close_device_pool_seconds = time.perf_counter() - phase_started
+                        phase_started = time.perf_counter()
+                        try:
+                            if self._pinned_pool is not None:
+                                self._pinned_pool.free_all_blocks()
+                        finally:
+                            self.close_pinned_pool_seconds = time.perf_counter() - phase_started
+                self._stream = None
+                self._closed = True
+            finally:
+                self.close_seconds = time.perf_counter() - started
 
     def __enter__(self):
         return self

@@ -24,12 +24,21 @@ import numpy as np
 
 def source_fingerprints(repo):
     paths=('XTA/native_pull_cuda.py','XTA/projection_coverage_cpu.py',
+           'XTA/native_encoded_cuda.py','XTA/cylindrical_cuda_projection.py',
+           'XTA/azimuthal_trajectory_cpu.py','XTA/sparse_bounds_cpu.py','XTA/sparse_projection.py',
            'XTA/projection_coverage.py','XTA/geometry.py','XTA/backprojection.py',
-           'tests/test_native_pull_cuda.py','tests/reference_backends/native_pull.py',
+           'tests/test_native_pull_cuda.py','tests/test_native_coarsened_plan_cuda.py',
+           'tests/reference_backends/native_pull.py',
            'XTA/packed_tilted_projection.py','XTA/assembly.py',
            'XTA/inference.py','XTA/workers.py','XTA/pipeline.py',
            'tests/test_spherical_task_hole_fill.py',
-           'tests/test_packed_tilted_cuda_integration.py','tools/qualify_native_pull_cuda.py')
+           'tests/test_packed_tilted_cuda_integration.py',
+           'tests/test_native_pull_gpu_pipeline_cuda.py','XTA/packed_dense_source.py',
+           'tests/test_native_encoded_cuda.py',
+           'XTA/packed_publication.py','XTA/interpolation.py','XTA/confidence_orchestration.py',
+           'tests/test_native_angular_trajectory.py',
+           'tests/test_sparse_native_bounds_cpu.py','tests/reference_backends/sparse_bounds.py',
+           'tools/qualify_native_pull_cuda.py')
     return {path:hashlib.sha256((repo/path).read_bytes()).hexdigest() for path in paths}
 
 
