@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import asdict, replace
-import hashlib
 import json
 import operator
 import os
@@ -20,6 +19,7 @@ from typing import Iterable, Mapping
 
 import numpy as np
 
+from .file_hashing import sha256_file as _sha256
 from .lta_tile_tracking import LtaLineageId
 
 
@@ -98,14 +98,6 @@ def _merge_ranges(ranges, *, touching: bool):
         else:
             merged.append((start, stop))
     return merged
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 class LtaCoverageBuilder:

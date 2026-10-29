@@ -10,8 +10,6 @@ Scratch/Temp/GPU_LOCK atomically before touching CUDA.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
-from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -20,6 +18,11 @@ import sys
 import threading
 import time
 from unittest import mock
+
+if __package__:
+    from .gpu_reservation import gpu_reservation
+else:
+    from gpu_reservation import gpu_reservation
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,16 +55,8 @@ def parse_args(argv=None):
     return args
 
 
-@contextmanager
 def gpu_lock():
-    lock = SCRATCH / "Temp" / "GPU_LOCK"
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    with lock.open("x", encoding="utf-8") as handle:
-        handle.write(f"task=qualify_pta_gpu_masks\npid={os.getpid()}\nstart={datetime.now(timezone.utc).isoformat()}\n")
-    try:
-        yield
-    finally:
-        lock.unlink(missing_ok=True)
+    return gpu_reservation(SCRATCH / "Temp" / "GPU_LOCK", task_name="qualify_pta_gpu_masks")
 
 
 def make_volumes(size):

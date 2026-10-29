@@ -38,7 +38,7 @@ def main():
         XTA_RUN_CUDA_RENDER_INTEGRATION='1')
     sys.dont_write_bytecode = True
     sys.path.insert(0,str(repo))
-    from tools.qualify_release import gpu_reservation
+    from tools.gpu_reservation import gpu_reservation
     report = dict(status='started',warmup_seconds=args.warmup_seconds,cases=[],
         note='Local mechanism check on a bounded 64x2048x2048 source; not target-system utilization or throughput proof.')
     files = ('XTA/cuda_backend.py','XTA/sam_gpu_rendering.py','tests/test_sam_azimuthal_native_roi.py',

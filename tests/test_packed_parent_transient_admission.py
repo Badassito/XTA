@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from XTA.geometry import _build_tilted_view_infos
+from XTA.tta_prepare_planning import _parent_prepare_transient_bytes
 from XTA.packed_tilted_projection import terminal_native_source_packing_eligible
 
 
@@ -22,17 +23,13 @@ def production(monkeypatch):
                  'YOLO_TTA_NATIVE_PULL_WORKSPACE_MIB'):
         monkeypatch.delenv(name, raising=False)
     tree = ast.parse((Path(__file__).parents[1]/'XTA'/'pipeline.py').read_text(encoding='utf-8'))
-    helper = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
-                  and node.name == '_parent_prepare_transient_bytes')
     submit = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
                   and node.name == '_submit_view_prepare')
     assignments = [node for node in submit.body if isinstance(node, ast.Assign)
         and any(isinstance(target, ast.Name) and target.id in ('packed_source_eligible', 'transient_bytes')
                 for target in node.targets)]
     assert len(assignments) == 2
-    namespace = dict(__package__='XTA', __name__='XTA.pipeline', math=math, GIB=GIB)
-    exec(compile(ast.Module(body=[helper], type_ignores=[]), '<production transient helper>', 'exec'), namespace)
-    return namespace[helper.name], assignments
+    return _parent_prepare_transient_bytes, assignments
 
 
 def shapes():

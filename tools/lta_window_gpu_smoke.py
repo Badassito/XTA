@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path: sys.path.insert(0,str(ROOT))
 
 import numpy as np
 from XTA import lta_execution as execution, lta_propagation as propagation
+from tests.reference_backends import lta_generation as reference
 from XTA.lta_outputs import write_json_atomically
 from XTA.lta_propagation import read_seed_artifact
 from XTA.lta_rendering import reference_existing_physical_view_cache
@@ -75,11 +76,12 @@ def run_case(root,*,pool,cache,view,seeds,windowed,role,device,canonical_frontie
         return original_submit(task,execution_device_id=execution_device_id)
     scheduler=LtaViewAffinityScheduler((task.work for task in tasks),(device,),helper_queue_order='head',max_relay_generation=20)
     revisions={}
-    execution._prime_authoritative_relay_destinations(scheduler,tasks[0].work.view,inventory,revisions)
+    if not canonical_frontier:
+        reference._prime_authoritative_relay_destinations(scheduler,tasks[0].work.view,inventory,revisions)
     union=np.zeros(cache.shape,dtype=np.uint8)
     trace=LtaExecutionTrace(root/'traces','coordinator')
     relay_records=[]
-    original_plan=execution._plan_relay_generation
+    original_plan=reference._plan_relay_generation
     def plan_relays(records,**kwargs):
         for record in records:
             seeds_in=read_seed_artifact(record['seed_artifact_path'],expected_sha256=record['seed_artifact_sha256'])
@@ -91,16 +93,21 @@ def run_case(root,*,pool,cache,view,seeds,windowed,role,device,canonical_frontie
                           'probability':seed.tracker_probability} for seed in seeds_in]})
         return original_plan(records,**kwargs)
     try:
-        with (mock.patch.object(pool,'submit',submit),mock.patch.object(execution,'_plan_relay_generation',plan_relays)):
-            frontier_options={'canonical_frontier':True} if canonical_frontier else {}
-            result=execution._drive_workers_to_fixed_point(scheduler=scheduler,pool=pool,initial=tasks,
-                        view_plan=view,cache_ref=cache,view_union=union,relay_mask_revisions=revisions,temp_root=root,
-                        conf=0.15,empty_frame_limit=30,worker_task_timeout=600,trace=trace,**frontier_options)
+        with (mock.patch.object(pool,'submit',submit),mock.patch.object(reference,'_plan_relay_generation',plan_relays)):
+            driver=execution._drive_workers_to_fixed_point if canonical_frontier else reference._drive_workers_to_fixed_point
+            reference_options={} if canonical_frontier else {'relay_mask_revisions':revisions}
+            result=driver(scheduler=scheduler,pool=pool,initial=tasks,
+                        view_plan=view,cache_ref=cache,view_union=union,temp_root=root,
+                        conf=0.15,empty_frame_limit=30,worker_task_timeout=600,trace=trace,**reference_options)
         summary={'status':'complete','source_fingerprint':lta_source_fingerprint(),'logical_union_sha256':hashlib.sha256(memoryview(union)).hexdigest(),
                  'canonical_frontier':bool(canonical_frontier),
                  'foreground_pixels':int(np.count_nonzero(union)),'generation':result[0],
                  'dispatches':result[2],'worker_audit':result[3],'relays':relay_records,
                  'final_queue_counts':scheduler.queue_counts()}
+        if not canonical_frontier:
+            reference_path=Path(reference.__file__).resolve(strict=True)
+            summary['reference_backend']={'path':str(reference_path),
+                                          'sha256':hashlib.sha256(reference_path.read_bytes()).hexdigest()}
         write_json_atomically(root/'summary.json',summary)
         return summary
     finally:

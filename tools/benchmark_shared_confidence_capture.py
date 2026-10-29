@@ -6,7 +6,6 @@ sanity check, not a full-cluster or scientific quality qualification.
 """
 from __future__ import annotations
 import argparse
-import ast
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import hashlib
@@ -28,12 +27,7 @@ def source_pins():
         'XTA/confidence_capture.py', 'XTA/confidence_capture_cpu.py',
         'XTA/confidence_evidence.py', 'XTA/confidence_storage.py',
         'XTA/confidence_publication.py', 'XTA/native_pull_scheduling.py',
-        'tools/benchmark_shared_confidence_capture.py')}
-    text = (ROOT/'XTA/pipeline.py').read_text()
-    node = next(node for node in ast.parse(text).body
-                if isinstance(node, ast.FunctionDef) and node.name == '_parent_confidence_capture_plan')
-    result['XTA/pipeline.py::_parent_confidence_capture_plan'] = hashlib.sha256(
-        ast.get_source_segment(text, node).encode()).hexdigest()
+        'tools/benchmark_shared_confidence_capture.py', 'XTA/tta_prepare_planning.py')}
     return result
 
 
@@ -69,7 +63,7 @@ def main():
         OPENBLAS_NUM_THREADS='1', NUMEXPR_NUM_THREADS='1', PYTHONDONTWRITEBYTECODE='1')
     import numpy as np
     import psutil
-    from XTA import confidence_evidence as evidence, geometry, pipeline
+    from XTA import confidence_evidence as evidence, geometry, tta_prepare_planning
     from XTA import confidence_storage as storage
     from XTA.confidence_capture import confidence_capture_resources
     from XTA.confidence_capture_cpu import warm_confidence_capture_kernels
@@ -147,7 +141,7 @@ def main():
                     scheduler = configure_native_pull_scheduler(workers=workers, max_workers=128)
                 storage.write_blocks = (predecessor_writer if backend == 'legacy'
                                         and predecessor_writer is not None else current_writer)
-                plan = pipeline._parent_confidence_capture_plan(shape, 1, enabled=True)
+                plan = tta_prepare_planning._parent_confidence_capture_plan(shape, 1, enabled=True)
                 if plan.workspace_bytes > 256*MIB:
                     raise RuntimeError('Capture plan exceeded unchanged per-parent admission')
                 evidence.configure_confidence_evidence(target/'out', enabled=True, defer_projection=True)

@@ -8,7 +8,6 @@ import unittest
 import numpy as np
 
 from XTA.lta_coverage import LtaCoverageBuilder, LtaCoverageLedger
-from XTA.lta_execution import _plan_relay_generation
 from XTA.lta_propagation import LtaMaskSeed, LtaSeedProvenance, read_seed_artifact, write_seed_artifact
 from XTA.lta_rendering import reference_existing_physical_view_cache
 from XTA.lta_runtime import LtaRuntimeViewPlan, LtaTileGridPlan
@@ -16,6 +15,7 @@ from XTA.lta_sam import plan_sam_sessions
 from XTA.lta_scheduler import LtaSessionWork, LtaViewAffinityScheduler, LtaViewKey
 from XTA.lta_tile_tracking import LtaLineageId
 from XTA.lta_tiles import plan_tile_grid
+from tests.reference_backends.lta_generation import _plan_relay_generation
 
 
 class LtaRelayAdmissionTests(unittest.TestCase):

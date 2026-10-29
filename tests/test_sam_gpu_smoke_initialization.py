@@ -6,6 +6,7 @@ import pytest
 from XTA import backprojection as bp
 from tools import smoke_sam_feature_dispatch as cache
 from tools import smoke_sam_gpu_handoff as handoff
+from tools import smoke_sam_extrapolation as shared
 
 
 @pytest.fixture
@@ -61,8 +62,7 @@ def test_setup_does_not_override_real_existing_owner(frontend, coordinator, kind
             lease.release()
 
 
-@pytest.mark.parametrize('frontend', [handoff, cache])
-def test_receipt_serialization_preserves_real_writer_immutable_sdk_and_scores(frontend, tmp_path):
+def test_receipt_serialization_preserves_real_writer_immutable_sdk_and_scores(tmp_path):
     import json
     import numpy as np
     from XTA.geometry import get_view_infos
@@ -79,7 +79,7 @@ def test_receipt_serialization_preserves_real_writer_immutable_sdk_and_scores(fr
     bundle = SamEvidenceBundle.open(stats['sam_evidence_path'])
     run = next(iter(bundle.runs.values()))
     path = tmp_path / 'result.json'
-    frontend.write_receipt(path, {'sdk': run['runtime_receipt'], 'raw_scores': run['tracker_scores'],
+    shared.write(path, {'sdk': run['runtime_receipt'], 'raw_scores': run['tracker_scores'],
                                 'seed_ids': run['seed_ids'], 'nullable_parent_scores': None})
     saved = json.loads(path.read_text())
     assert saved['raw_scores'] == {str(frame): .25 + frame / 100 for frame in run['expected_frames']}
@@ -87,3 +87,19 @@ def test_receipt_serialization_preserves_real_writer_immutable_sdk_and_scores(fr
     assert saved['sdk']['sam_model']['checkpoint_sha256'] == 'synthetic'
     assert saved['nullable_parent_scores'] is None
     assert saved['seed_ids'] == list(run['seed_ids'])
+
+
+def test_shared_receipt_writer_normalizes_nested_immutable_containers_without_mutation(tmp_path):
+    import json
+    from types import MappingProxyType
+
+    nested = MappingProxyType({'scores': (0.25, None), 'status': 'observed'})
+    receipt = MappingProxyType({'runs': (nested,), 'complete': True})
+    path = tmp_path / 'nested.json'
+    shared.write(path, receipt)
+    assert json.loads(path.read_text()) == {
+        'runs': [{'scores': [0.25, None], 'status': 'observed'}], 'complete': True}
+    assert receipt['runs'] == (nested,)
+    assert nested['scores'] == (0.25, None)
+    with pytest.raises(ValueError, match='Out of range float'):
+        shared.write(tmp_path / 'invalid.json', MappingProxyType({'score': float('nan')}))

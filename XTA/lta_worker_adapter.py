@@ -10,7 +10,6 @@ JSON manifest plus file-backed union and relay-seed artifacts.
 from __future__ import annotations
 
 import gc
-import hashlib
 import json
 import os
 import operator
@@ -18,6 +17,8 @@ import time
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+from .file_hashing import sha256_file as _sha256_file
 
 
 @dataclass
@@ -31,17 +32,6 @@ class LtaSamWorkerContext:
     cpu_budget: Mapping[str, object] | None = None
     trace_root: str | None = None
     enable_2D_hole_fill: bool = False
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _jsonable(value: object) -> object:
@@ -666,9 +656,9 @@ def _execute_worker_task_impl(
                     }
                 )
                 continue
-            # The production wrapper hole-fills immediately before injection.
-            # Partition on that same geometry so filling cannot introduce an
-            # overlap conflict after the planning-time check.
+            # When enabled, the production wrapper hole-fills before injection.
+            # Partition on that geometry so optional filling cannot introduce
+            # an overlap conflict after the planning-time check.
             with trace.phase("seed_partition", work_id=str(payload["work_id"]), window_index=window_index):
                 model_seeds = tuple(
                     replace(seed, mask=resize_crop_mask(seed.mask, side=crop_model_side))

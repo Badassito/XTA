@@ -8,7 +8,6 @@ the coordinator while a model is resident. No benchmark claim is made.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping
 from contextlib import ExitStack, closing
 import json
 import os
@@ -21,19 +20,6 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 from tools import smoke_sam_extrapolation as shared
 from tools import smoke_sam_image_cohorts as cohorts
-
-
-def json_receipt(value):
-    """Preserve immutable evidence values while normalizing JSON containers."""
-    if isinstance(value, Mapping):
-        return {key: json_receipt(item) for key, item in value.items()}
-    if isinstance(value, (tuple, list)):
-        return [json_receipt(item) for item in value]
-    return value
-
-
-def write_receipt(path, value):
-    shared.write(path, json_receipt(value))
 
 
 def pins():
@@ -124,7 +110,7 @@ def prepare(args):
             injected_frames=[run.expected_frames[0]], expected_frames=list(run.expected_frames),
             context_bbox_yx=list(group.context_bbox_yx))
     protocol['protocol_sha256'] = shared.identity({k: v for k, v in protocol.items() if k != 'protocol_sha256'})
-    write_receipt(path, protocol)
+    shared.write(path, protocol)
     print(json.dumps(dict(protocol=str(path), status='prepared', benchmark=False,
                           tracker_frames=30, projection_shape=list(expected.shape))), flush=True)
 
@@ -312,7 +298,7 @@ def run(args):
     from tools.diagnose_sam_interpolation import resource_monitor
     protocol = load_protocol(args.protocol)
     args.output.mkdir(parents=True, exist_ok=False)
-    write_receipt(args.output / 'protocol.json', protocol)
+    shared.write(args.output / 'protocol.json', protocol)
     baseline = np.load(protocol['baseline_path'], mmap_mode='r', allow_pickle=False)
     source = np.memmap(protocol['source_image_path'], mode='r', dtype='uint8',
                        shape=tuple(protocol['source_shape_tyx']))
@@ -389,7 +375,7 @@ def run(args):
                     arm_record.update(status='passed', persistent_runtime=True,
                                       repeat_feature_cache_hits=audit['shared_feature_cache_hits'])
                     result['arms'].append(arm_record)
-                    write_receipt(destination / 'result.json', arm_record)
+                    shared.write(destination / 'result.json', arm_record)
                     print(json.dumps(dict(arm=arm, status='passed', repeat_feature_cache_hits=
                                          audit['shared_feature_cache_hits'])), flush=True)
                 finally:
@@ -430,7 +416,7 @@ def run(args):
         raise
     finally:
         result['lease_events'] = observer.events
-        write_receipt(args.output / 'result.json', result)
+        shared.write(args.output / 'result.json', result)
 
 
 def main():

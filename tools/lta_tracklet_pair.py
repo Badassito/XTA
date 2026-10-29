@@ -727,6 +727,7 @@ def main() -> None:
                 TOOLS / "lta_full_volume.py",
                 TOOLS / "lta_gpu_smoke.py",
                 ROOT / "XTA" / "lta_sam.py",
+                ROOT / "XTA" / "sam_sdk_compat.py",
                 ROOT / "XTA" / "lta_inputs.py",
             )
         },

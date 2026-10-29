@@ -14,7 +14,7 @@ from unittest import mock
 
 import numpy as np
 
-from XTA import outputs
+from XTA import outputs, nrrd_compression
 from XTA.nrrd_spans import canonical_zero_member
 
 
@@ -49,14 +49,14 @@ class NrrdZeroBatchingTests(unittest.TestCase):
     def setUp(self):
         self.pool = ThreadPoolExecutor(max_workers=3)
         self.addCleanup(self.pool.shutdown)
-        patch = mock.patch.object(outputs, '_nrrd_gzip_executor', return_value=self.pool)
+        patch = mock.patch.object(nrrd_compression, '_nrrd_gzip_executor', return_value=self.pool)
         patch.start(); self.addCleanup(patch.stop)
         self.telemetry = SimpleNamespace(add=mock.Mock(), span=lambda *_a, **_k: nullcontext())
-        patch = mock.patch.object(outputs, 'runtime_telemetry', return_value=self.telemetry)
+        patch = mock.patch.object(nrrd_compression, 'runtime_telemetry', return_value=self.telemetry)
         patch.start(); self.addCleanup(patch.stop)
 
     def writer(self, sink=None, compressor=_compress):
-        return outputs._MemberParallelGzipPayloadWriter(
+        return nrrd_compression._MemberParallelGzipPayloadWriter(
             io.BytesIO() if sink is None else sink,
             codec_spec=('zlib', 1, compressor),
         )

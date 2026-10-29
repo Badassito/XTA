@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 
+from tools.gpu_reservation import gpu_reservation
 from XTA._deps import cv2
 from XTA.config import DEFAULT_CHANNEL_FORMAT
 from XTA.cuda_backend import CpuPreparedYoloSource, _GpuWorkerRenderEngine
@@ -28,10 +29,7 @@ def main():
     args=parser.parse_args()
     args.output_dir.mkdir(parents=True,exist_ok=True)
     lock=Path(__file__).resolve().parents[2]/'Scratch'/'Temp'/'GPU_LOCK'
-    lock.parent.mkdir(parents=True,exist_ok=True)
-    with lock.open('x',encoding='utf-8') as handle:
-        json.dump(dict(task='YOLO CPU input CUDA qualification',pid=os.getpid(),start_time=time.time()),handle)
-    try:
+    with gpu_reservation(lock, task_name='YOLO CPU input CUDA qualification'):
         import torch
         if not torch.cuda.is_available():
             raise RuntimeError('CUDA is unavailable')
@@ -119,8 +117,6 @@ def main():
             limitations='Input/H2D and numerical qualification only; no TensorRT model or H100 walltime measurement.')
         (args.output_dir/'yolo-cuda-input-qualification.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
         print(json.dumps(result,indent=2))
-    finally:
-        lock.unlink()
 
 
 if __name__=='__main__':

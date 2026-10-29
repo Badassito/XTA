@@ -11,7 +11,8 @@ from unittest import mock
 
 import numpy as np
 
-from XTA.lta_execution import _drive_workers_to_fixed_point, _plan_initial_chains, _plan_window_tasks, _prime_authoritative_relay_destinations
+from XTA import lta_execution as execution
+from XTA.lta_execution import _plan_initial_chains, _plan_window_tasks
 from XTA.lta_propagation import LtaMaskSeed, run_mask_injected_session
 from XTA.lta_rendering import LtaPhysicalViewCacheRef
 from XTA.lta_runtime import LtaTileGridPlan
@@ -22,6 +23,7 @@ from XTA.lta_tiles import plan_tile_grid
 from XTA.lta_worker_adapter import execute_worker_task
 from XTA.lta_workers import LtaWorkerResult
 from tests._lta_fake_worker_gc import batch_fake_worker_collections
+from tests.reference_backends import lta_generation as reference
 
 
 class CpuWorkerPool:
@@ -38,6 +40,7 @@ class CpuWorkerPool:
         self.maximum_active = 0
         self.parallel_directions = False
         self.corrupt_dogfood = corrupt_dogfood
+        self.packets = []
         self.context = SimpleNamespace(predictor=object(), profile={"name": "cpu_protocol_test"}, sam_runtime={"distribution_version": "fake"}, constrained_batches=None)
 
     def submit(self, task, *, execution_device_id, worker_index=0):
@@ -62,6 +65,12 @@ class CpuWorkerPool:
         output = execute_worker_task(self.context, task.kind, task.payload)
         artifact = Path(output["artifact_path"])
         manifest = json.loads(artifact.read_text())
+        self.packets.append({
+            "work_id": task.work_id,
+            "frontier_wave": task.payload.get("frontier_wave"),
+            "output_frame_range": manifest["output_frame_range"],
+            "union": manifest["union"],
+        })
         if self.corrupt_dogfood and manifest.get("dogfood_seed_artifacts"):
             path = Path(manifest["dogfood_seed_artifacts"][0]["path"])
             with path.open("ab") as handle:
@@ -84,7 +93,7 @@ class LtaWindowDagTests(unittest.TestCase):
         self.worker_collection_requests = batch_fake_worker_collections(self)
 
     def run_driver(self, root, *, windowed, order="roots_first", empty_backward=False, corrupt_dogfood=False,
-                   devices=(0, 1, 2, 3), workers_per_device=1):
+                   devices=(0, 1, 2, 3), workers_per_device=1, backend="reference"):
         root.mkdir(parents=True)
         count = 120 if empty_backward else 59
         anchors = (50,) if empty_backward else (19, 37)
@@ -107,7 +116,15 @@ class LtaWindowDagTests(unittest.TestCase):
         scheduler = LtaViewAffinityScheduler((task.work for task in tasks), devices, helper_queue_order="head", max_relay_generation=20,
                                               workers_per_device=workers_per_device)
         revisions = {}
-        _prime_authoritative_relay_destinations(scheduler, tasks[0].work.view, inventory, revisions)
+        if backend == "reference":
+            reference._prime_authoritative_relay_destinations(scheduler, tasks[0].work.view, inventory, revisions)
+            driver = reference._drive_workers_to_fixed_point
+            options = {"relay_mask_revisions": revisions}
+        elif backend == "canonical":
+            driver = execution._drive_workers_to_fixed_point
+            options = {}
+        else:
+            raise ValueError(f"unknown driver backend: {backend}")
         pool = CpuWorkerPool(order, scheduler.device_ids, corrupt_dogfood=corrupt_dogfood,
                              workers_per_device=workers_per_device)
         self.last_pool = pool
@@ -134,12 +151,81 @@ class LtaWindowDagTests(unittest.TestCase):
         # The predictor alone is synthetic. Rendering, seed artifacts, session
         # wrapper, sparse union transport, relays, scheduler and driver are real.
         with mock.patch("XTA.lta_propagation.run_mask_injected_session", side_effect=propagate), mock.patch("XTA.lta_execution.PRODUCTION_LTA_RELAY_MIN_PIXELS", 1):
-            result = _drive_workers_to_fixed_point(
+            result = driver(
                 scheduler=scheduler, pool=pool, initial=tasks, view_plan=view,
-                cache_ref=cache, view_union=union, relay_mask_revisions=revisions,
+                cache_ref=cache, view_union=union, **options,
                 temp_root=root, conf=0.15, empty_frame_limit=30, worker_task_timeout=30,
             )
         return union, result, pool, scheduler
+
+    def test_production_canonical_matches_generation_reference_and_expected_union(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            baseline, _, _, _ = self.run_driver(root / "generation-reference", windowed=False)
+            expected = np.zeros_like(baseline)
+            expected[:, 1:3, 3] = 1
+            np.testing.assert_array_equal(baseline, expected)
+            results = []
+            for order, slots in (("roots_first", 1), ("reverse", 2)):
+                with self.subTest(order=order, workers_per_device=slots):
+                    union, result, pool, scheduler = self.run_driver(
+                        root / order, windowed=True, order=order, backend="canonical",
+                        devices=(0, 1), workers_per_device=slots,
+                    )
+                    np.testing.assert_array_equal(union, baseline)
+                    np.testing.assert_array_equal(union, expected)
+                    audit = result[3]
+                    self.assertEqual(audit["relay_admission"]["policy"], "canonical_temporal_frontier/1")
+                    self.assertGreater(audit["canonical_frontier"]["tasks"], 0)
+                    self.assertEqual(audit["workers_per_gpu"], slots)
+                    self.assertEqual(audit["retained_prediction_count"], 0)
+                    self.assertEqual(scheduler.queue_counts(), {
+                        "ready": 0, "blocked": 0, "active": 0, "completed_awaiting_commit": 0,
+                    })
+                    self.assertTrue(any(packet["frontier_wave"] is not None for packet in pool.packets))
+                    for packet in pool.packets:
+                        descriptor = packet["union"]
+                        start, stop = packet["output_frame_range"]
+                        self.assertEqual(descriptor["schema"], "lta.union/2")
+                        self.assertEqual(descriptor["encoding"], "cropped-row-packbits-little")
+                        self.assertEqual(descriptor["omitted_frames"], "zero")
+                        self.assertEqual(descriptor["frame_start"], start)
+                        self.assertEqual(descriptor["shape"], [stop - start, 4, 4])
+                        self.assertLessEqual(stop - start, 30)
+                        self.assertTrue(all(start <= frame["frame_index"] < stop for frame in descriptor["frames"]))
+                    # Audit ordering is stable even when workers finish in reverse.
+                    self.assertEqual(
+                        [(record["plan_order"], record["work_id"]) for record in result[2]],
+                        sorted((record["plan_order"], record["work_id"]) for record in result[2]),
+                    )
+                    results.append(result)
+            self.assertEqual(results[0][0], results[1][0])
+            self.assertEqual(results[0][3]["canonical_frontier"]["tasks"], results[1][3]["canonical_frontier"]["tasks"])
+
+    def test_production_rejects_corrupt_frontier_union_packet_before_next_wave(self):
+        original = CpuWorkerPool.wait_result
+        corrupted_waves = []
+
+        def corrupt_frontier(pool, timeout=None):
+            result = original(pool, timeout)
+            packet = pool.packets[-1]
+            if packet["frontier_wave"] is not None and not corrupted_waves:
+                path = Path(packet["union"]["path"])
+                contents = bytearray(path.read_bytes())
+                self.assertTrue(contents)
+                contents[0] ^= 1
+                path.write_bytes(contents)
+                corrupted_waves.append(packet["frontier_wave"])
+            return result
+
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(CpuWorkerPool, "wait_result", corrupt_frontier):
+            with self.assertRaisesRegex((ValueError, RuntimeError), "(sparse union foreground count|union artifact SHA256)"):
+                self.run_driver(Path(folder) / "corrupt-frontier", windowed=True, backend="canonical")
+            self.assertEqual(len(corrupted_waves), 1)
+            self.assertTrue(all(
+                task.payload.get("frontier_wave", 0) <= corrupted_waves[0]
+                for task in self.last_pool.submitted
+            ))
 
     def test_full_driver_window_dag_matches_whole_chains_across_completion_orders(self):
         with tempfile.TemporaryDirectory() as folder:

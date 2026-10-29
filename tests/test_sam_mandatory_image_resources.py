@@ -1,4 +1,5 @@
 """Mandatory image admission must not take partial credit or spend SDK budgets."""
+from XTA import tta_prepare_planning
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
@@ -338,9 +339,9 @@ def test_future_policy_estimate_matches_submitted_task_image_debt_exactly_once(
     task = make_task(tmp_path, _ByteAdmissionPool(64*GIB, 'future-parent-estimate'), context,
         base=raw, allowance=4*GIB if interpolates else 0, view=view,
         interpolation_distance=distance, extrapolation_distance=extrapolation)
-    with mock.patch.object(pipeline, '_parent_confidence_capture_plan',
+    with mock.patch.object(tta_prepare_planning, '_parent_confidence_capture_plan',
             return_value=SimpleNamespace(workspace_bytes=workspace)), \
-            mock.patch.object(pipeline, '_view_uses_interpolation', return_value=view_interpolates):
+            mock.patch.object(tta_prepare_planning, '_view_uses_interpolation', return_value=view_interpolates):
         estimate = pipeline._policy_parent_prepare_transient_bytes(
             [dict(kind='fullframe', processing_shape=shape, view=view)], source_bytes, 32,
             interpolation_distance=distance, extrapolation_distance=extrapolation,
@@ -361,7 +362,7 @@ def test_augmented_tilted_future_parent_estimate_matches_fourteen_and_quarter_gi
     context = SimpleNamespace(mandatory_image_phase_bytes=lambda:IMAGE_PHASE)
     task = make_task(tmp_path, _ByteAdmissionPool(64*GIB, 'augmented-tilted-parent'), context,
         base=raw, allowance=0, view=view, interpolation_distance=5)
-    with mock.patch.object(pipeline, '_parent_confidence_capture_plan', return_value=None):
+    with mock.patch.object(tta_prepare_planning, '_parent_confidence_capture_plan', return_value=None):
         estimate = pipeline._policy_parent_prepare_transient_bytes(
             [dict(kind='fullframe', processing_shape=shape, view=view)], source_bytes, 32,
             interpolation_distance=5, retain_confidence=False, sam_image_phase_bytes=IMAGE_PHASE)

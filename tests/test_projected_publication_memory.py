@@ -12,7 +12,7 @@ from unittest import mock
 import numpy as np
 import pytest
 
-from XTA import assembly, geometry, outputs, publication_memory as memory, runtime
+from XTA import assembly, geometry, outputs, publication_memory as memory, runtime, nrrd_compression
 from XTA import packed_tilted_projection as packed
 from XTA.config import GIB
 from XTA.interpolation import (CVOL_FORMAT, INTERNAL_PACKED_CVOL_FORMAT,
@@ -172,7 +172,7 @@ def test_planned_ref_uses_packed_format_and_keeps_public_nrrd_payload_identical(
     # Use the real sparse NRRD payload writer, including private packed decoding.
     from XTA.nrrd_spans import stream_native_crop_spans
     sink = io.BytesIO()
-    writer = outputs._MemberParallelGzipPayloadWriter(sink, codec_spec=('zlib', 1, gzip.compress))
+    writer = nrrd_compression._MemberParallelGzipPayloadWriter(sink, codec_spec=('zlib', 1, gzip.compress))
     source = outputs._open_nrrd_layer_ref(ref)
     try:
         stream_native_crop_spans(source, writer, 0, expected.shape[0], 70)
@@ -202,7 +202,7 @@ def test_no_ram_grant_keeps_terminal_fallback_packed_and_public_nrrd_exact(tmp_p
         assert store.meta['stats']['payload_backing'] == 'disk'
         np.testing.assert_array_equal(np.stack([store.decode_slice(z) for z in range(5)]), expected)
     codec = ('zlib', 1, gzip.compress)
-    with mock.patch.object(outputs, '_require_nrrd_member_codec', return_value=codec):
+    with mock.patch.object(nrrd_compression, '_require_nrrd_member_codec', return_value=codec):
         path = outputs.write_single_layer_nrrd_from_ref(ref, target_shape,
             tmp_path / 'final.seg.nrrd', z_shards=1)
     header, payload = path.read_bytes().split(b'\n\n', 1)

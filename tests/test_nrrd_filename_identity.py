@@ -10,7 +10,7 @@ from unittest import mock
 
 import numpy as np
 
-from XTA import outputs
+from XTA import outputs, nrrd_compression
 from XTA.interpolation import NrrdLayerRef
 from XTA.reconciliation_io import read_layer_manifest
 
@@ -58,7 +58,7 @@ class NrrdFilenameIdentityTests(unittest.TestCase):
         spec = outputs.LowQualityDownbinSpec("0.5", "0p5_4x4x4", .5, (4, 4, 4))
         sink = outputs.NrrdLayerSink(nrrd_dir=root / "nrrd", stem="case", output_shape_tyx=ref.shape,
                                      max_workers=1, low_quality_specs=(spec,), low_quality_root=root / "low_quality")
-        codec = mock.patch.object(outputs, "_require_nrrd_member_codec", return_value=("zlib", 1, gzip.compress))
+        codec = mock.patch.object(nrrd_compression, "_require_nrrd_member_codec", return_value=("zlib", 1, gzip.compress))
         naming = mock.patch.object(outputs, "nrrd_layer_file_basename",
                                    side_effect=lambda stem, unique: f"{stem}_{unique}.seg.nrrd") if legacy else nullcontext()
         try:
@@ -109,7 +109,7 @@ class NrrdFilenameIdentityTests(unittest.TestCase):
             sink = outputs.NrrdLayerSink(nrrd_dir=root / "nrrd", stem="case", output_shape_tyx=mask.shape, max_workers=1)
             try:
                 with mock.patch.object(outputs, "nrrd_layer_file_basename", return_value="forced_collision.seg.nrrd"), \
-                     mock.patch.object(outputs, "_require_nrrd_member_codec", return_value=("zlib", 1, gzip.compress)):
+                     mock.patch.object(nrrd_compression, "_require_nrrd_member_codec", return_value=("zlib", 1, gzip.compress)):
                     first = sink.submit_layer(ref, "logical_a" * 30)
                     sink.wait()
                     prior_bytes = first.read_bytes()

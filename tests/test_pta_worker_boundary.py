@@ -138,6 +138,8 @@ def _representative_payload() -> dict[str, object]:
 class PtaWorkerBoundaryTests(unittest.TestCase):
     def test_each_owner_first_imports_without_pta_or_accelerator_runtime(self) -> None:
         for module_name in (
+            "XTA.pta_inputs",
+            "XTA.pta_planning",
             "XTA.pta_rendering",
             "XTA.pta_publication",
             "XTA.pta_workers",
@@ -163,50 +165,6 @@ class PtaWorkerBoundaryTests(unittest.TestCase):
                     check=False,
                 )
                 self.assertEqual(completed.returncode, 0, completed.stdout)
-
-    def test_pta_reexports_owner_objects_by_identity(self) -> None:
-        from XTA import pta
-
-        owner_names = {
-            pta_rendering: (
-                "TileConfig",
-                "ChannelFormat",
-                "ChannelVariant",
-                "ViewInfo",
-                "AffineSpec",
-                "RenderTileItem",
-                "RenderPlan",
-                "RenderFrameSource",
-                "render_plan_frame_source",
-                "render_plan_frame_mask_source",
-            ),
-            pta_publication: (
-                "OUTPUT_IMAGE_FORMATS",
-                "PtaDatasetImageSink",
-                "candidate_output_paths",
-                "write_image",
-                "write_selected_candidate_version",
-            ),
-            pta_workers: (
-                "ArrayAllocator",
-                "FrameRenderTask",
-                "GpuFrameBatchTask",
-                "PersistentRenderPool",
-                "RenderPhaseHandle",
-                "SharedBlock",
-                "VolumeRenderProgress",
-                "WarningLog",
-                "build_phase_render_tasks",
-                "drain_render_results",
-                "execute_render_task",
-                "set_worker_static_context",
-            ),
-        }
-        for owner, names in owner_names.items():
-            for name in names:
-                with self.subTest(owner=owner.__name__, name=name):
-                    self.assertIs(getattr(pta, name), getattr(owner, name))
-        self.assertIs(pta._WORKER_STATIC, pta_workers._WORKER_STATIC)
 
     def test_payload_and_worker_targets_round_trip_through_spawn(self) -> None:
         payload_blob = pickle.dumps(

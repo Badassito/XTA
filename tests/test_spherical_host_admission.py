@@ -197,6 +197,10 @@ class SharedNativeWorkspaceTests(unittest.TestCase):
         self.namespace = dict(vars(pipeline))
         self.namespace.update(temp_dir=self.root, worker_direct_union_active=True,
             sam_context=None,sam_parent_staging=None,
+            cpu_input_prefetch=None, sam_cpu_futures={'source': None},
+            input_volume_rgb=np.zeros(self.shape, np.uint8),
+            parent_transient_admission=SimpleNamespace(in_use=0),
+            gray_capture_reserve_bytes=0, cpu_input_pinned_reserve_bytes=0,
             _sam_parents_ready=lambda:True,
             sam_cpu_max_detector_parent=0,
             interpolation_settings=SimpleNamespace(backend='sdf',extrapolation_enabled=False),
@@ -218,10 +222,12 @@ class SharedNativeWorkspaceTests(unittest.TestCase):
             self.state.direct_union_backing_leases, self.state.direct_union_inference_views,
             self.state.direct_union_inference_bytes, self.state.direct_union_postprocess_views,
             self.state.direct_union_postprocess_bytes)
-        _function(Path(pipeline.__file__).read_text(encoding='utf-8'),
-                  '_sam_parent_requires_staging',self.namespace)
-        self.ensure = _function(Path(pipeline.__file__).read_text(encoding='utf-8'),
-                                '_ensure_baseline_workspaces', self.namespace)
+        source = Path(pipeline.__file__).read_text(encoding='utf-8')
+        for helper in ('_sam_parent_requires_staging', '_detector_future_ram_rights',
+                       '_plan_baseline_workspace', '_discard_baseline_bundles',
+                       '_build_baseline_workspaces', '_adopt_baseline_workspaces'):
+            _function(source, helper, self.namespace)
+        self.ensure = _function(source, '_ensure_baseline_workspaces', self.namespace)
         tree = ast.parse(Path(workers.__file__).read_text(encoding='utf-8'))
         fn = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
                   and node.name == 'run_prediction_volume_in_worker')
@@ -262,7 +268,9 @@ class SharedNativeWorkspaceTests(unittest.TestCase):
                 env.update(task=task, slice_count=2, slice_offset=start, processing_h=5, processing_w=6,
                     result_shape=(2, 5, 6), result_mask=None, result_conf=None, result_mask_full=None,
                     result_conf_full=None, azimuthal_padding_mask=None, azimuthal_padding_conf=None,
-                    source_mm=None, source=None)
+                    source_mm=None, source=None, prepared_input_mm=None,
+                    startup_source_started=None, startup_source_prepared=False,
+                    startup_device='cpu')
                 try:
                     exec(self.worker_open, env)
                     env['result_mask'][:] = start + 1

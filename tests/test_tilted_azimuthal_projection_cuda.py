@@ -140,11 +140,9 @@ def test_legacy_cuda_is_typed_unavailable_before_geometry_gpu_lease_or_allocatio
     with mock.patch.object(bp, 'build_dense_azimuthal_backprojection_map', side_effect=AssertionError('geometry allocation')):
         with pytest.raises(TiltedAzimuthalPlanUnavailable, match='native destination'):
             build_tilted_azimuthal_plan(source, view, (8, 11, 14))
-    with mock.patch.object(TiltedAzimuthalCudaProjector, '_initialize_cuda', side_effect=AssertionError('CUDA initialized')):
+    with mock.patch.object(bp, '_try_acquire_main_process_gpu_stage', side_effect=AssertionError('lease acquired')):
         with pytest.raises(TiltedAzimuthalCudaProjectionUnavailable, match='native destination'):
             TiltedAzimuthalCudaProjector(source, object())
-    with mock.patch.object(bp, '_try_acquire_main_process_gpu_stage', side_effect=AssertionError('lease acquired')):
-        assert bp._try_tilted_azimuthal_cuda_stage(source, view, (8, 11, 14)) is None
 
 
 @pytest.mark.parametrize('base', ['transverse', 'sagittal', 'coronal'])

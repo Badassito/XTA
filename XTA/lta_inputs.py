@@ -22,6 +22,7 @@ from enum import Enum, IntEnum
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Sequence, Tuple
 
+from .file_hashing import sha256_file as _sha256_path
 
 IMAGE_EXTENSIONS = frozenset(
     {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
@@ -268,17 +269,6 @@ def split_indexed_stem(path: Path) -> Tuple[str, Optional[int]]:
     if match is None or not match.group(1):
         return path.stem, None
     return match.group(1), int(match.group(2))
-
-
-def _sha256_path(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _file_identity_sha256(path: Path) -> str:

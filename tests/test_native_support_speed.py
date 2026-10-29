@@ -88,3 +88,19 @@ def test_support_handles_nonbinary_uint8_foreground():
     check = PreviewSupportCheck(native.shape, expected)
     check.observe(0, native)
     np.testing.assert_array_equal(check.seen, expected)
+
+
+@pytest.mark.parametrize('low_y', [1, 7, 13, 101])
+@pytest.mark.parametrize('dtype', [np.uint8, np.bool_])
+def test_sparse_rows_preserve_fractional_support_and_report_empty_blocks(low_y, dtype):
+    native = np.zeros((5, 101, 31), dtype=dtype)
+    native[1, [0, 14, 100], [0, 7, 30]] = 1
+    native[3, 56, 10:19] = 1
+    low = (3, low_y, 6)
+    expected = brute_support(native, low)
+    check = PreviewSupportCheck(native.shape, expected)
+    assert check.observe(0, native[:1]) is False
+    assert check.observe(1, native[1:4]) is True
+    assert check.observe(4, native[4:]) is False
+    np.testing.assert_array_equal(check.seen, expected)
+    assert check.finish()['unsupported_preview_foreground_cells'] == 0

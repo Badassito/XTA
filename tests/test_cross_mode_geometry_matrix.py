@@ -12,6 +12,7 @@ import numpy as np
 from XTA import geometry
 from XTA import pta
 from XTA import pta_publication
+from XTA import pta_rendering
 from XTA.pta_config import parse_pta_args
 from XTA.unification.contracts import (
     DataRole,
@@ -669,7 +670,7 @@ class CrossModeGeometryMatrixTests(unittest.TestCase):
             np.testing.assert_array_equal(mirrored_image, nominal_image[:, ::-1])
             np.testing.assert_array_equal(mirrored_mask, nominal_mask[:, ::-1])
             np.testing.assert_array_equal(
-                pta._shared_render_full_intensity(
+                pta_rendering._shared_render_full_intensity(
                     self.intensity,
                     view,
                     count - 1,
@@ -679,7 +680,7 @@ class CrossModeGeometryMatrixTests(unittest.TestCase):
                 mirrored_image,
             )
             np.testing.assert_array_equal(
-                pta._shared_render_full_mask(
+                pta_rendering._shared_render_full_mask(
                     self.categorical,
                     view,
                     count - 1,

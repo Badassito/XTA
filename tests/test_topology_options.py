@@ -1,4 +1,4 @@
-"""Mode boundaries for v25 topology and CPR options."""
+"""Mode boundaries for hole-filling and CPR options."""
 import contextlib
 import io
 import unittest
@@ -8,7 +8,7 @@ from XTA.lta_config import parse_lta_args
 from XTA.pta_config import parse_pta_args
 
 
-class V25ConfigTests(unittest.TestCase):
+class TopologyOptionConfigTests(unittest.TestCase):
     tta_required = ["--input", "volume", "--model", "gpu:model.engine"]
     lta_required = ["--input", "volume", "--output", "out", "--model", "sam",
                     "--device", "0", "--enable_cartesian", "transverse"]

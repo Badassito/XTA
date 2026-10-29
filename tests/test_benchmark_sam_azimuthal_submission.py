@@ -41,7 +41,7 @@ def test_dependency_outputs_are_redirected_before_gpu_reservation(monkeypatch, t
     monkeypatch.setattr(tool.sys, 'path', list(tool.sys.path))
     monkeypatch.setattr(tool.sys, 'dont_write_bytecode', tool.sys.dont_write_bytecode)
     output = tmp_path/'Scratch'/'renderer-stress'
-    helper = ModuleType('tools.qualify_release')
+    helper = ModuleType('tools.gpu_reservation')
     class ReservationIntercepted(Exception):
         pass
     @contextmanager
@@ -52,7 +52,7 @@ def test_dependency_outputs_are_redirected_before_gpu_reservation(monkeypatch, t
         raise ReservationIntercepted
         yield
     helper.gpu_reservation = intercepted
-    monkeypatch.setitem(tool.sys.modules, 'tools.qualify_release', helper)
+    monkeypatch.setitem(tool.sys.modules, 'tools.gpu_reservation', helper)
     original = builtins.__import__
     def guarded(name, *args, **kwargs):
         if name.split('.')[0] in {'torch', 'numpy', 'cupy', 'XTA'}:

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import random
+import math
+from collections import Counter
 import sys
 import unittest
 
@@ -9,7 +11,7 @@ from tools.simulate_policy_parent_admission import GIB, Group, cluster_workload,
 
 
 class PolicyParentAdmissionSimulatorTests(unittest.TestCase):
-    def test_real_geometry_matches_cluster_group_and_frame_inventory(self):
+    def test_current_geometry_inventory_for_historical_workload_preset(self):
         watched_modules = ('cv2', 'scipy', 'scipy.ndimage', 'tifffile', 'tqdm', 'numba',
                            'XTA._deps', 'XTA.geometry', 'XTA.unification.runtime')
         before = {name: sys.modules.get(name) for name in watched_modules}
@@ -17,9 +19,44 @@ class PolicyParentAdmissionSimulatorTests(unittest.TestCase):
         for name, module in before.items():
             with self.subTest(module=name):
                 self.assertIs(sys.modules.get(name), module)
-        self.assertEqual(len(groups), 110)
-        self.assertEqual(metadata['rendered_frames'], 160593)
-        self.assertEqual(metadata['group_counts_by_family']['tilted_azimuthal'], 12)
+        self.assertEqual(metadata['geometry_source'], 'current_physical_view_compiler')
+        self.assertEqual(metadata['shape_tyx'], (2911, 3064, 3022))
+        self.assertEqual(metadata['raster'], 3072)
+        # Current coverage geometry for this shape/preset, not job 144736's old
+        # sampler. Derive the inventory without importing the physical compiler.
+        # Three axes each have an upright pose and four signed 30-degree tilts.
+        diameters = (3022, 2911, 2911)
+        upright_angles = [math.ceil(math.pi * d / (4 * math.sqrt(.99 - .25))) for d in diameters]
+        conservative_angles = [math.ceil(math.pi * d / 2) for d in diameters]
+        # Radial positive-tap certificate: g²/4 + 1/4 + g/(8*r_min) <= .99,
+        # r_min=3072/(4*pi), r_max=(diameter-1)/2. Endpoint-inclusive shells
+        # retain these suffix lengths at arc origins 0,3072,6144[,9216].
+        radial_frames = [738, 595, 311, 26, 706, 563, 278, 706, 563, 278]
+        # QSC 41/50 certificate at raster 3072: eight arcsine-spaced bands,
+        # n=3070, radii counts 85,85,85,85,86,86,86,86. Each band has six
+        # faces and each face one patch, for five distinct cube poses.
+        spherical_frames = ([85] * 4 + [86] * 4) * (6 * 5)
+        expected = {
+            'orthogonal': [2911, 3064, 3022],
+            'azimuthal': upright_angles,
+            'tilted': [2911, 3064, 3022] * 4,
+            'tilted_azimuthal': conservative_angles * 4,
+            'radial': radial_frames * 5,
+            'spherical': spherical_frames,
+        }
+        self.assertEqual(
+            Counter((group.family, group.frames) for group in groups),
+            Counter((family, frames) for family, counts in expected.items() for frames in counts),
+        )
+        family_counts = {family: len(counts) for family, counts in expected.items()}
+        self.assertEqual(family_counts, dict(orthogonal=3, azimuthal=3, tilted=12,
+                                           tilted_azimuthal=12, radial=50, spherical=240))
+        self.assertEqual(metadata['group_counts_by_family'], family_counts)
+        self.assertEqual(metadata['group_count'], sum(family_counts.values()))
+        self.assertEqual(metadata['rendered_frames'], sum(map(sum, expected.values())))
+        for group in groups:
+            self.assertEqual(group.pass_bytes, math.prod(group.processing_shape))
+            self.assertEqual(group.processing_shape[0], group.frames)
         oversized = [group.pass_bytes * 4 / GIB for group in groups if group.pass_bytes * 4 > 128 * GIB]
         self.assertEqual(len(oversized), 12)
         self.assertAlmostEqual(min(oversized), 149.8642305508256)

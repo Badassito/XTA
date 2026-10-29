@@ -50,8 +50,8 @@ from .workspace import (
     _env_float,
     _env_int,
 )
+from ._prediction_cleanup import _cv2_connected_components
 from .inference import (
-    _cv2_connected_components,
     _try_import_cupy_ndimage,
 )
 from .interpolation import (

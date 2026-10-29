@@ -154,24 +154,54 @@ class TestAutoWorkflow(unittest.TestCase):
             self.assertEqual(preview.shape,(10,10,20))
             self.assertIn('auto_split',(Path(args.output)/'components.tsv').read_text())
 
-    def test_roi_cap_keeps_and_reports_without_stopping(self):
+    def test_roi_cap_preserves_diagnostics_without_publishing(self):
         with tempfile.TemporaryDirectory() as d:
             args,a,k,r=self.auto_fixture(d);args.auto_max_roi_voxels=10
-            with redirect_stdout(io.StringIO()):self.assertEqual(nf.run(args),0)
+            with redirect_stdout(io.StringIO()):self.assertEqual(nf.run(args),2)
             report=nf.load_json(Path(args.output)/'report.json')
-            self.assertEqual(report['status'],'completed_with_unresolved_components')
+            self.assertEqual(report['status'],'needs_review')
+            self.assertEqual(report['unresolved_components'],1)
+            self.assertEqual(report['auto_resolved_components'],0)
+            self.assertEqual(report['auto_removed_voxels'],0)
+            self.assertIsNone(report['pta_label_file'])
+            self.assertEqual(report['auto_parameters']['fallback'],'stop_without_publication')
             self.assertEqual(report['layers'][0]['auto_components'][0]['reason'],'roi_voxel_limit')
-            self.assertTrue(np.array_equal(nf.Nrrd(Path(args.output)/'volume.nrrd').array(),a))
+            self.assertFalse((Path(args.output)/'volume.nrrd').exists())
+            self.assertIn('conflict', (Path(args.output)/'components.tsv').read_text())
+            self.assertTrue((Path(args.output)/report['layers'][0]['review_preview_file']).is_file())
 
-    def test_broad_conflict_unattended_fallback(self):
+    def test_broad_conflict_real_cli_stops_and_leaves_sources_unchanged(self):
         with tempfile.TemporaryDirectory() as d:
             a,k,r=dumbbell(7);low=(10,10,20)
             args=fixture(d,{'component':a.astype(np.uint8)},{'component':pool(k,low)},low_shape=low)
-            args.conflicts='auto'
+            sources={p:nf.digest(p) for folder in ('full','low','bundle')
+                     for p in (Path(d)/folder).rglob('*') if p.is_file()}
+            command=[sys.executable,str(ROOT/'tools'/'xta_native_filter.py'),'--auto']
+            for attr in ('edits','low_manifest','full_manifest','output','scratch','block_mib'):
+                command += ['--'+attr.replace('_','-'),str(getattr(args,attr))]
+            result=subprocess.run(command,capture_output=True,text=True,timeout=30)
+            self.assertEqual(result.returncode,2,result.stdout+result.stderr)
+            self.assertIn('Native and edited low-resolution objects do not agree',result.stdout)
+            report=nf.load_json(Path(args.output)/'report.json')
+            self.assertEqual(report['status'],'needs_review')
+            self.assertEqual(report['unresolved_components'],1)
+            self.assertEqual(report['auto_removed_voxels'],0)
+            self.assertIsNone(report['pta_label_file'])
+            self.assertFalse((Path(args.output)/'volume.nrrd').exists())
+            self.assertEqual(sources,{p:nf.digest(p) for p in sources})
+
+    def test_only_explicit_keep_publishes_unresolved_candidate(self):
+        with tempfile.TemporaryDirectory() as d:
+            a,k,r=dumbbell(7);low=(10,10,20)
+            args=fixture(d,{'component':a.astype(np.uint8)},{'component':pool(k,low)},low_shape=low)
+            args.conflicts='keep'
             with redirect_stdout(io.StringIO()):self.assertEqual(nf.run(args),0)
             report=nf.load_json(Path(args.output)/'report.json')
             self.assertEqual(report['status'],'completed_with_unresolved_components')
-            self.assertEqual(report['auto_removed_voxels'],0)
+            self.assertEqual(report['unresolved_components'],1)
+            self.assertEqual(report['auto_parameters']['fallback'],'keep_and_report')
+            self.assertTrue(any('NOT a fully resolved transfer' in message for message in report['warnings']))
+            self.assertTrue(np.array_equal(nf.Nrrd(Path(args.output)/'volume.nrrd').array(),a))
 
     def test_auto_disabled_legacy_conflict_stops(self):
         with tempfile.TemporaryDirectory() as d:

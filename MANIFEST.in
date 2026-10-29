@@ -1,11 +1,14 @@
 include ARCHITECTURE.md
-include GPT-6-Astra-Ultra_v25.0.0_SLURM.py
+include README.md
+include .gitattributes
+include .gitignore
+include AGENTS.md
+include GPT-6-Astra-Ultra_v25.0.1_SLURM.py
 include setup.py
 include release/_package_inventory.json
 recursive-include XTA/examples *.py *.md
-recursive-include tools *.py
+recursive-include tools *.py *.md
 recursive-include docs *.md
-include tests/__init__.py
-recursive-include tests/reference_backends *.py
+recursive-include tests *.py *.json
 recursive-include native *.c *.h *.md
 recursive-include tests/native_qatzip_fake *.c *.h

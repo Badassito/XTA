@@ -22,12 +22,13 @@ import subprocess
 import sys
 import threading
 import time
-import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+from tools.gpu_reservation import GpuReservation
+
 SCRATCH = ROOT.parent / 'Scratch'
 DEFAULT_INPUT = SCRATCH / 'Experiments' / 'v24-semantic' / 'input.mkv'
 DEFAULT_OUTPUT_PARENT = SCRATCH / 'Experiments' / 'v24-semantic-ring'
@@ -122,36 +123,6 @@ def _case_spec(raw: str) -> dict[str, object]:
             'Each --engine needs SIZE>=32, BATCH=1 or 2, and an existing .engine file'
         )
     return {'size': size, 'batch': batch, 'engine': str(path)}
-
-
-def _claim_gpu_lock(wait_seconds: float) -> dict[str, object]:
-    LOCK.parent.mkdir(parents=True, exist_ok=True)
-    claim = {
-        'task': 'v24 semantic TensorRT qualification',
-        'pid': os.getpid(),
-        'start_time': datetime.now(timezone.utc).isoformat(),
-        'token': uuid.uuid4().hex,
-    }
-    deadline = time.monotonic() + float(wait_seconds)
-    while True:
-        try:
-            with LOCK.open('x', encoding='utf-8') as handle:
-                json.dump(claim, handle)
-            return claim
-        except FileExistsError:
-            if time.monotonic() >= deadline:
-                raise RuntimeError(f'GPU_LOCK is held; inspect {LOCK}')
-            print(f'Waiting for {LOCK}', flush=True)
-            time.sleep(min(15.0, max(0.1, deadline - time.monotonic())))
-
-
-def _release_gpu_lock(claim: dict[str, object]) -> None:
-    try:
-        found = json.loads(LOCK.read_text(encoding='utf-8'))
-    except (FileNotFoundError, ValueError):
-        return
-    if found.get('token') == claim.get('token') and found.get('pid') == os.getpid():
-        LOCK.unlink(missing_ok=True)
 
 
 class _GpuMemorySampler:
@@ -718,9 +689,11 @@ def main(argv: list[str] | None = None) -> int:
     }
     receipt = output / 'qualification.json'
     _write_json(receipt, report)
-    claim: dict[str, object] | None = None
+    reservation = None
     try:
-        claim = _claim_gpu_lock(float(args.lock_wait_seconds))
+        reservation = GpuReservation(LOCK, float(args.lock_wait_seconds),
+            task_name='semantic TensorRT qualification', poll_interval=15.)
+        claim = reservation.acquire()
         faulthandler.enable()
         faulthandler.dump_traceback_later(60, repeat=True)
         os.environ['CUPY_CACHE_DIR'] = str(output / 'cupy-cache')
@@ -847,8 +820,8 @@ def main(argv: list[str] | None = None) -> int:
         raise
     finally:
         faulthandler.cancel_dump_traceback_later()
-        if claim is not None:
-            _release_gpu_lock(claim)
+        if reservation is not None:
+            reservation.release()
 
 
 if __name__ == '__main__':

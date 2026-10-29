@@ -7,7 +7,7 @@ artifacts must live outside the repository. A release requires a clean Git HEAD;
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import json
 import os
@@ -15,13 +15,14 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-import uuid
 import xml.etree.ElementTree as ET
 
 if __package__:
+    from .gpu_reservation import gpu_reservation
     from .check_release_version import check_release_version
     from .verify_package_inventory import capture_source_identity
 else:
+    from gpu_reservation import gpu_reservation
     from check_release_version import check_release_version
     from verify_package_inventory import capture_source_identity
 
@@ -68,45 +69,13 @@ REQUIRED_CUDA_TESTS = (
     ('tests.test_projection_sampling_cuda.ProjectionSamplingCudaTests',
      'test_all_one_native_masks_project_to_exact_declared_domains', 1),
     ('tests.test_projection_sampling_cuda.ProjectionSamplingCudaTests',
-     'test_random_native_masks_match_cpu_for_coarse_shells_and_rescaled_outputs', 1),
+     'test_random_native_masks_match_cpu_for_shared_plans_and_rescaled_outputs', 1),
 )
 
 
 def source_identity() -> dict[str, object]:
     """Identify every tracked or unignored source, including pending deletions."""
     return capture_source_identity(ROOT)
-
-
-@contextmanager
-def gpu_reservation(path: Path, timeout: float, *, task_name: str = 'full repository release qualification'):
-    """Reserve this workspace's GPU without replacing another task's lock."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    token = uuid.uuid4().hex
-    record = {'task': str(task_name), 'pid': os.getpid(),
-              'start_time': datetime.now(timezone.utc).isoformat(), 'token': token}
-    deadline = time.monotonic() + timeout
-    announced = False
-    while True:
-        try:
-            with path.open('x', encoding='utf-8') as handle:
-                json.dump(record, handle)
-            break
-        except FileExistsError:
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f'GPU remains reserved by another task: {path}')
-            if not announced:
-                print(f'Waiting for the existing GPU reservation: {path}', flush=True)
-                announced = True
-            time.sleep(min(5.0, max(0.01, deadline - time.monotonic())))
-    try:
-        yield
-    finally:
-        try:
-            current = json.loads(path.read_text(encoding='utf-8'))
-            if current.get('token') == token:
-                path.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def _probe_cuda(env: dict[str, str]) -> dict[str, object]:

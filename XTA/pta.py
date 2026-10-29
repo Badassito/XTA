@@ -93,25 +93,53 @@ try:
 except Exception as exc:  # pragma: no cover
     raise RuntimeError("tqdm is required: pip install tqdm") from exc
 
-# Built-in physical-view planning and forward rendering use the
-# same implementation used by TTA.  PTA-owned discovery, eligibility, splitting,
-# augmentation, and dataset publication remain in this module.
+# Input decoding and render-plan construction live in pta_inputs and
+# pta_planning. This module coordinates source preparation, eligibility,
+# dataset planning, and publication over the canonical worker/render owners.
 from . import geometry as shared_geometry
+from .geometry import _affine2x3_to_3x3 as affine2x3_to_3x3
 from . import media as shared_media
-from .config import SCRIPT_BASENAME, SCRIPT_VERSION
+from .config import SCRIPT_BASENAME, SCRIPT_VERSION, ChannelFormat as CanonicalChannelFormat
 from .runtime import runtime_telemetry, runtime_telemetry_phase, runtime_trace_event
 from .gaussian import binary_gaussian_pass
 from .topology import fill_3d_voids_inplace_streaming
 from .unification.manifest import write_json_manifest
-from .unification.contracts import RasterPlan
+from .unification.contracts import RasterPlan, ChannelLayout
+from .pta_planning import (
+    make_channel_tag,
+    adapt_shared_view,
+    compile_v18_pta_views,
+    rotated_bbox_size,
+    center_scale_matrix,
+    build_affine,
+    dense_tile_positions,
+    build_render_plan,
+    render_plan_frame_indices,
+    iter_render_source_frame_jobs_round_robin,
+    build_plans_for_views,
+)
+from .pta_inputs import (
+    _require_bin,
+    probe_image_dimensions,
+    parallel_for_indices,
+    to_gray8,
+    _release_failed_allocator_blocks,
+    _polygon_area_xy,
+    ffprobe_info,
+    decode_video_gray8_to_memory,
+    contiguous_start_0_or_1,
+    describe_index_problem,
+    read_yolo_polygons_normalized,
+    load_image_sequence_to_memory,
+    nrrd_header_to_internal_permutation,
+    load_nrrd_mask_for_volume,
+)
+from .pta_inputs import YoloPolygon, YoloPolygons
 from .pta_augmentation import (
     AugmentationDefinition,
     LoadedAugmentation,
     LoadedGpuAugmentation,
     OfflineAugmentation,
-    _augmented_image_to_uint8,
-    _augmented_mask_to_binary,
-    _load_external_python_module,
     apply_augmentation_pair,
     apply_augmentation_pair_with_coverage,
     assert_augmentation_definition_unchanged,
@@ -159,10 +187,7 @@ from .pta_publication import (
     PtaDatasetImageSink,
     _CREATED_OUTPUT_DIRS,
     _CREATED_OUTPUT_DIRS_LOCK,
-    _private_image_stage_path,
-    _validate_jpeg_file,
     _validate_nonempty_regular_file,
-    _write_nvjpeg_batch_atomically,
     candidate_output_paths,
     candidate_semantic_output_path,
     ensure_output_parent_once,
@@ -194,16 +219,6 @@ from .pta_rendering import (
     TileConfig,
     TiltPlan,
     ViewInfo,
-    _AZIMUTHAL_CACHE,
-    _AZIMUTHAL_CACHE_LOCK,
-    _TILT_PLAN_CACHE,
-    _TILT_PLAN_CACHE_LOCK,
-    _require_pta_canonical_plan,
-    _shared_aug_job_for_affine,
-    _shared_render_canvas_intensity,
-    _shared_render_canvas_mask,
-    _shared_render_full_intensity,
-    _shared_render_full_mask,
     edge_clamped_view_index,
     encoded_channel_source_positions,
     extract_padded_tile,
@@ -239,40 +254,6 @@ from .pta_workers import (
     SharedBlock,
     VolumeRenderProgress,
     WarningLog,
-    _GpuItemWork,
-    _THREAD_AFFINITY_LOCK,
-    _WORKER_GEN_CACHE,
-    _WORKER_PAYLOAD_CACHE,
-    _WORKER_STATIC,
-    _WORKER_VOLUME_IDENTITY_BY_POINTER,
-    _apply_gpu_identity_batch_many,
-    _attach_shm_untracked,
-    _derive_gpu_item_source,
-    _derive_item_arrays,
-    _frame_render_candidate_count,
-    _gpu_identity_fast_path_eligible,
-    _gpu_policy_host_image,
-    _gpu_policy_source_images,
-    _gpu_projected_item_image,
-    _gpu_runtime_for_worker,
-    _initialize_spawned_worker_static_context,
-    _merge_worker_warning_payload,
-    _nvjpeg_encode_params,
-    _nvjpeg_samples_nhwc,
-    _nvjpeg_wrap_samples,
-    _publish_gpu_policy_batch,
-    _render_gpu_frame_items,
-    _render_gpu_item_group,
-    _render_task_entry,
-    _render_task_entry_thread,
-    _render_thread_initializer,
-    _render_worker_initializer,
-    _spawn_worker_static_payload,
-    _wait_for_gpu_work_ready,
-    _worker_load_payload,
-    _worker_volume_arrays,
-    _write_gpu_image_batch,
-    _zero_mask_view,
     batch_gpu_frame_tasks,
     bind_current_thread_to_cpus,
     build_phase_render_tasks,
@@ -288,16 +269,11 @@ from .pta_workers import (
     set_worker_static_context,
 )
 from .pta_scheduler import (
-    gpu_memory_candidate_limit as _gpu_memory_candidate_limit,
-    is_cuda_out_of_memory as _is_cuda_out_of_memory,
-    iter_compatible_work_batches as _gpu_multi_source_work_batches,
     plan_pta_cpu_budget,
     resolve_gpu_worker_layout,
     resolve_pta_pipeline_depth,
-    should_flush_ready_gpu_work as _should_flush_ready_gpu_work,
-    split_work_batch as _split_gpu_work_batch,
 )
-from .unification.channels import resolve_channel_variants as resolve_v18_channel_variants
+from .unification.channels import expand_channel_variants as expand_v18_channel_variants
 from .workspace import azimuthal_source_mode as _azimuthal_source_mode
 from .unification.runtime import compile_physical_views
 from .unification.tta_manifest import (
@@ -329,11 +305,6 @@ ANNOTATION_FOREGROUND = 2
 # ---------------------------------------------------------------------------
 # Warnings / small helpers
 # ---------------------------------------------------------------------------
-
-
-def _require_bin(name: str) -> None:
-    if shutil.which(name) is None:
-        raise RuntimeError(f"Required executable not found on PATH: {name}")
 
 
 def visible_cpu_count() -> int:
@@ -651,29 +622,6 @@ def available_memory_budget_bytes() -> Optional[int]:
     return min(positive) if positive else None
 
 
-def probe_image_dimensions(path: Path) -> Tuple[int, int]:
-    if shutil.which("ffprobe") is not None:
-        try:
-            proc = subprocess.run(
-                [
-                    "ffprobe", "-v", "error", "-select_streams", "v:0",
-                    "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(path),
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=True,
-                timeout=10,
-            )
-            width_text, height_text = proc.stdout.strip().split("x", 1)
-            return int(height_text), int(width_text)
-        except Exception:
-            pass
-    gray = _read_gray_image_opencv(path)
-    return int(gray.shape[0]), int(gray.shape[1])
-
-
 def estimate_spec_resident_bytes(spec: object) -> Optional[int]:
     """Conservative source+cube image/mask resident estimate for depth-2 guard."""
     try:
@@ -700,46 +648,6 @@ def estimate_spec_resident_bytes(spec: object) -> Optional[int]:
 # ---------------------------------------------------------------------------
 
 
-def parallel_for_indices(
-    count: int,
-    func: Callable[[int], None],
-    *,
-    workers: int,
-    desc: str,
-    show_progress: bool = True,
-    worker_cpu_order: Sequence[int] = (),
-) -> None:
-    total = max(0, int(count))
-    if total <= 0:
-        return
-    nworkers = max(1, min(int(workers), total))
-    if nworkers <= 1:
-        iterable: Iterable[int] = tqdm(range(total), desc=desc) if show_progress else range(total)
-        for idx in iterable:
-            func(int(idx))
-        return
-    affinity_queue: "queue.SimpleQueue[int]" = queue.SimpleQueue()
-    affinity_values = tuple(int(x) for x in worker_cpu_order)
-    for worker_index in range(nworkers):
-        if affinity_values:
-            affinity_queue.put(int(affinity_values[worker_index % len(affinity_values)]))
-
-    def _initializer() -> None:
-        if affinity_values:
-            bind_current_thread_to_cpus((affinity_queue.get(),))
-
-    with ThreadPoolExecutor(max_workers=nworkers, initializer=_initializer) as executor:
-        futures = [executor.submit(func, int(i)) for i in range(total)]
-        if show_progress:
-            with tqdm(total=total, desc=desc) as pbar:
-                for fut in as_completed(futures):
-                    fut.result()
-                    pbar.update(1)
-        else:
-            for fut in as_completed(futures):
-                fut.result()
-
-
 def parse_token_list(values: Sequence[str] | str | None) -> List[str]:
     if values is None:
         return []
@@ -759,29 +667,6 @@ def natural_index_key(path: Path) -> Tuple[str, int, str]:
     if m:
         return (m.group(1), int(m.group(2)), path.name)
     return (stem, -1, path.name)
-
-
-def to_gray8(img: np.ndarray) -> np.ndarray:
-    arr = np.asarray(img)
-    if arr.ndim == 3:
-        if arr.shape[2] == 4:
-            arr = cv2.cvtColor(arr, cv2.COLOR_BGRA2GRAY)
-        elif arr.shape[2] == 3:
-            arr = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
-        elif arr.shape[2] == 1:
-            arr = arr[:, :, 0]
-        else:
-            raise ValueError(f"Unsupported channel count: {arr.shape}")
-    if arr.dtype == np.uint8:
-        return np.ascontiguousarray(arr)
-    if arr.dtype == np.uint16:
-        return np.ascontiguousarray(np.clip(np.rint(arr.astype(np.float32) / 257.0), 0, 255).astype(np.uint8))
-    amin = float(np.nanmin(arr)) if arr.size else 0.0
-    amax = float(np.nanmax(arr)) if arr.size else 0.0
-    if not math.isfinite(amin) or not math.isfinite(amax) or amax <= amin:
-        return np.zeros(arr.shape[:2], dtype=np.uint8)
-    scaled = (arr.astype(np.float32) - amin) * (255.0 / (amax - amin))
-    return np.ascontiguousarray(np.clip(np.rint(scaled), 0, 255).astype(np.uint8))
 
 
 # ---------------------------------------------------------------------------
@@ -842,10 +727,23 @@ def resolve_channel_formats(values: Sequence[str] | str | None) -> List[ChannelF
     return formats
 
 
-def expand_channel_variants(formats: Sequence[ChannelFormat]) -> List[ChannelVariant]:
+def expand_channel_variants(formats: Sequence[ChannelFormat | CanonicalChannelFormat]) -> List[ChannelVariant]:
     variants: List[ChannelVariant] = []
     for fmt in formats:
-        for shared_variant in resolve_v18_channel_variants("pta", str(fmt.token)):
+        if isinstance(fmt, CanonicalChannelFormat):
+            offsets = tuple(fmt.offsets)
+        elif fmt.kind == "gray":
+            offsets = (0,)
+        elif fmt.kind == "rgb":
+            offsets = (0, 0, 0)
+        else:
+            radius = int(fmt.channel_count) // 2
+            offsets = tuple(position * int(fmt.stride) for position in range(-radius, radius + 1))
+        layout = ChannelLayout(
+            token=fmt.token, kind=fmt.kind, channel_count=fmt.channel_count,
+            stride=fmt.stride, offsets=offsets,
+        )
+        for shared_variant in expand_v18_channel_variants("pta", layout):
             variants.append(ChannelVariant(
                 str(shared_variant.layout.token),
                 str(shared_variant.layout.kind),
@@ -857,40 +755,9 @@ def expand_channel_variants(formats: Sequence[ChannelFormat]) -> List[ChannelVar
     return variants
 
 
-def make_channel_tag(base_tag: str, variant: ChannelVariant) -> str:
-    # Preserve v4 filenames for the default single-channel output.  Additional
-    # formats receive explicit suffixes so multiple requested formats cannot
-    # collide within one run.
-    if variant.kind == "gray":
-        return str(base_tag)
-    return f"{base_tag}_{variant.tag_token}"
-
-
 # ---------------------------------------------------------------------------
 # Input volume and label rasterization
 # ---------------------------------------------------------------------------
-
-
-def _release_failed_allocator_blocks(function):
-    """Own new shared allocations until their complete input/preparation result returns."""
-    from functools import wraps
-
-    @wraps(function)
-    def run(first, *args, allocator=None, **kwargs):
-        created = []
-        def allocate(shape):
-            array, block = allocator(shape)
-            if (block is not None and block is not getattr(first, 'volume_block', None)
-                    and all(block is not existing for existing in created)):
-                created.append(block)
-            return array, block
-        try:
-            return function(first, *args, allocator=allocate if allocator is not None else None, **kwargs)
-        except BaseException:
-            for block in created:
-                block.release()
-            raise
-    return run
 
 
 @dataclass
@@ -913,514 +780,6 @@ class SourceVolume:
     # empty tuple means an explicit background label file.
     yolo_polygons_by_frame: Dict[int, Tuple[Tuple[Tuple[float, float], ...], ...]] = field(default_factory=dict)
     volume_block: Optional[SharedBlock] = None  # backing block when the process pool is active
-
-
-def ffprobe_info(video_path: Path) -> Dict[str, object]:
-    _require_bin("ffprobe")
-    cmd = [
-        "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames",
-        "-of", "json", str(video_path),
-    ]
-    proc = subprocess.run(
-        cmd, capture_output=True, text=True, encoding="utf-8",
-        errors="replace", check=True,
-    )
-    info = json.loads(proc.stdout)
-    if not info.get("streams"):
-        raise RuntimeError(f"No video stream found in {video_path}")
-    st = info["streams"][0]
-
-    def parse_ratio(s: str) -> float:
-        if not s or s == "0/0":
-            return 0.0
-        n, d = s.split("/")
-        return float(n) / float(d) if int(d) else 0.0
-
-    width = int(st["width"])
-    height = int(st["height"])
-    fps = parse_ratio(str(st.get("avg_frame_rate", "0/0"))) or parse_ratio(str(st.get("r_frame_rate", "0/0"))) or 30.0
-    nf = st.get("nb_frames")
-    if nf is None or str(nf) in {"", "N/A"}:
-        cmd2 = [
-            "ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
-            "-show_entries", "stream=nb_read_packets", "-of", "json", str(video_path),
-        ]
-        proc2 = subprocess.run(
-            cmd2, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", check=True,
-        )
-        info2 = json.loads(proc2.stdout)
-        nf = info2["streams"][0].get("nb_read_packets")
-    if nf is None or str(nf) in {"", "N/A"}:
-        raise RuntimeError(f"Could not determine frame count for {video_path}")
-    return {"width": width, "height": height, "fps": fps, "num_frames": int(nf)}
-
-
-@runtime_telemetry_phase('pta.input.decode_video')
-@_release_failed_allocator_blocks
-def decode_video_gray8_to_memory(video_path: Path, *, warnings: WarningLog, allocator: Optional[ArrayAllocator] = None,
-                                 probe_info: Optional[Mapping[str, object]] = None) -> Tuple[np.ndarray, float, Optional[SharedBlock]]:
-    _require_bin("ffmpeg")
-    info = ffprobe_info(video_path) if probe_info is None else probe_info
-    w = int(info["width"])
-    h = int(info["height"])
-    t = int(info["num_frames"])
-    fps = float(info["fps"])
-    if allocator is not None:
-        arr, block = allocator((t, h, w))
-    else:
-        arr = np.empty((t, h, w), dtype=np.uint8)
-        block = None
-    frame_bytes = int(w) * int(h)
-    chunk_frames = max(1, min(128, (256 * 1024 * 1024) // max(1, frame_bytes)))
-    raw = memoryview(arr).cast("B")
-    cmd = ["ffmpeg", "-v", "error", "-i", str(video_path), "-f", "rawvideo", "-pix_fmt", "gray", "-vsync", "0", "-"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert proc.stdout is not None
-    try:
-        with tqdm(total=t, desc="Decoding video to in-memory gray8 volume") as pbar:
-            for start in range(0, t, chunk_frames):
-                nframes = min(chunk_frames, t - start)
-                need = nframes * frame_bytes
-                offset = start * frame_bytes
-                view = raw[offset:offset + need]
-                filled = 0
-                while filled < need:
-                    nread = proc.stdout.readinto(view[filled:])
-                    if nread is None or nread <= 0:
-                        raise RuntimeError(f"Unexpected EOF while decoding {video_path} near frame {start + 1}")
-                    filled += int(nread)
-                pbar.update(nframes)
-    finally:
-        if proc.stdout is not None:
-            proc.stdout.close()
-        _, err = proc.communicate()
-    if proc.returncode not in (0, None):
-        msg = err.decode("utf-8", errors="replace") if isinstance(err, (bytes, bytearray)) else str(err)
-        raise RuntimeError(f"ffmpeg decode failed: {msg}")
-    warnings.add("input_volume_loaded_in_memory", f"{arr.shape}, {arr.nbytes / GIB:.2f} GiB")
-    return arr, fps, block
-
-
-def contiguous_start_0_or_1(indices: Sequence[int]) -> Optional[int]:
-    idxs = sorted(int(x) for x in indices)
-    n = len(idxs)
-    if n == 0:
-        return None
-    for start in (0, 1):
-        if idxs == list(range(start, start + n)):
-            return int(start)
-    return None
-
-
-def describe_index_problem(indices: Sequence[int]) -> str:
-    idxs = sorted(int(x) for x in indices)
-    if not idxs:
-        return "no indexed files"
-    if len(idxs) <= 24:
-        return f"indices={idxs}"
-    return f"count={len(idxs)}, first={idxs[:8]}, last={idxs[-8:]}"
-
-
-YoloPolygon = Tuple[Tuple[float, float], ...]
-YoloPolygons = Tuple[YoloPolygon, ...]
-
-
-def read_yolo_polygons_normalized(path: Path, *, warnings: WarningLog) -> YoloPolygons:
-    """Parse one YOLO segmentation file without allocating an image mask."""
-    try:
-        text = Path(path).read_text().strip()
-    except Exception as exc:
-        warnings.add("label_read_error", f"{path}: {exc}")
-        return tuple()
-    if not text:
-        return tuple()
-    polygons: List[YoloPolygon] = []
-    for line_no, raw_line in enumerate(text.splitlines(), start=1):
-        parts = raw_line.strip().split()
-        if not parts:
-            continue
-        if len(parts) < 7 or (len(parts) - 1) % 2 != 0:
-            warnings.add("invalid_label_line", f"{path.name}:{line_no}")
-            continue
-        try:
-            coords = [float(value) for value in parts[1:]]
-        except Exception:
-            warnings.add("invalid_label_coordinate", f"{path.name}:{line_no}")
-            continue
-        points: List[Tuple[float, float]] = []
-        for x_n, y_n in zip(coords[0::2], coords[1::2]):
-            if not math.isfinite(x_n) or not math.isfinite(y_n):
-                points = []
-                break
-            points.append((min(1.0, max(0.0, float(x_n))), min(1.0, max(0.0, float(y_n)))))
-        if len(points) < 3 or len(set(points)) < 3 or _polygon_area_xy(points) <= 1e-12:
-            warnings.add("degenerate_input_polygon", f"{path.name}:{line_no}")
-            continue
-        polygons.append(tuple(points))
-    return tuple(polygons)
-
-
-def _read_gray_image_opencv(path: Path) -> np.ndarray:
-    # Request luminance/gray at decode time.  This avoids materializing the
-    # source RGB array and the subsequent cvtColor pass for the target command.
-    img = cv2.imread(str(path), int(cv2.IMREAD_GRAYSCALE | cv2.IMREAD_ANYDEPTH))
-    if img is None:
-        raise RuntimeError(f"Failed to read image: {path}")
-    return to_gray8(img)
-
-
-def _nvimgcodec_decoder_for_device(nvimgcodec: object, *, device_id: int, cpu_threads: int, batch_size: int) -> object:
-    backends: List[object] = []
-    backend_type = getattr(nvimgcodec, "Backend", None)
-    backend_kind = getattr(nvimgcodec, "BackendKind", None)
-    if backend_type is not None and backend_kind is not None:
-        for name in ("HW_GPU_ONLY", "GPU_ONLY", "HYBRID_CPU_GPU"):
-            kind = getattr(backend_kind, name, None)
-            if kind is not None:
-                try:
-                    backends.append(backend_type(kind))
-                except TypeError:
-                    try:
-                        backends.append(backend_type(kind=kind))
-                    except Exception:
-                        pass
-    options = (
-        f":num_cuda_streams=4 "
-        f"nvjpeg_cuda_decoder:hybrid_huffman_threshold=0 "
-        f"nvjpeg_cuda_decoder:preallocate_buffers=1 "
-        f"nvjpeg_hw_decoder:preallocate_batch_size={max(1, int(batch_size))}"
-    )
-    kwargs: Dict[str, object] = {
-        "device_id": int(device_id),
-        "max_num_cpu_threads": max(1, int(cpu_threads)),
-        "options": options,
-    }
-    if backends:
-        kwargs["backends"] = backends
-    return getattr(nvimgcodec, "Decoder")(**kwargs)
-
-
-def _nvimgcodec_gray_params(nvimgcodec: object) -> object:
-    params_type = getattr(nvimgcodec, "DecodeParams")
-    color_spec_type = getattr(nvimgcodec, "ColorSpec", None)
-    gray = getattr(color_spec_type, "GRAY", None) if color_spec_type is not None else None
-    if gray is not None:
-        return params_type(color_spec=gray, allow_any_depth=False)
-    return params_type(allow_any_depth=False)
-
-
-def _decoded_nvimgcodec_batch_to_arrays(decoded: object, expected: int) -> List[np.ndarray]:
-    if isinstance(decoded, (list, tuple)):
-        items = list(decoded)
-    else:
-        try:
-            items = list(decoded)  # nvImageCodec batch objects are iterable
-        except TypeError:
-            host = decoded.cpu() if callable(getattr(decoded, "cpu", None)) else decoded
-            batch = np.asarray(host)
-            if batch.ndim >= 3 and int(batch.shape[0]) == int(expected):
-                items = [batch[i] for i in range(int(expected))]
-            else:
-                items = [host]
-    arrays: List[np.ndarray] = []
-    for item in items:
-        host = item.cpu() if callable(getattr(item, "cpu", None)) else item
-        arr = np.asarray(host)
-        if arr.ndim == 3 and int(arr.shape[-1]) == 1:
-            arr = arr[:, :, 0]
-        arrays.append(to_gray8(arr))
-    if len(arrays) != int(expected):
-        raise RuntimeError(f"nvImageCodec returned {len(arrays)} image(s) for a batch of {expected}")
-    return arrays
-
-
-def _decode_jpeg_sequence_nvimgcodec(
-    images: Sequence[Path],
-    volume: np.ndarray,
-    *,
-    device_ids: Sequence[int],
-    cpu_sets: Sequence[Sequence[int]],
-    batch_size: int,
-    workers: int,
-) -> None:
-    try:
-        from nvidia import nvimgcodec  # type: ignore
-    except Exception as exc:
-        raise RuntimeError(
-            "nvJPEG input decoding requires NVIDIA nvImageCodec; install "
-            "nvidia-nvimgcodec-cu12[all] or nvidia-nvimgcodec-cu13[all] "
-            "to match the active CUDA major version"
-        ) from exc
-    if not device_ids:
-        raise RuntimeError("nvJPEG input decoding requested but no CUDA-visible GPU was discovered")
-    batch = max(1, int(batch_size))
-    batches = [list(range(start, min(len(images), start + batch))) for start in range(0, len(images), batch)]
-    per_device: List[List[List[int]]] = [[] for _ in device_ids]
-    for batch_index, indices in enumerate(batches):
-        per_device[batch_index % len(device_ids)].append(indices)
-
-    def _decode_device(slot: int) -> None:
-        cpus = tuple(int(x) for x in (cpu_sets[slot] if slot < len(cpu_sets) else ()))
-        bind_current_thread_to_cpus(cpus)
-        cpu_threads = max(1, min(len(cpus) if cpus else int(workers), 8))
-        decoder = _nvimgcodec_decoder_for_device(
-            nvimgcodec,
-            device_id=int(device_ids[slot]),
-            cpu_threads=cpu_threads,
-            batch_size=batch,
-        )
-        params = _nvimgcodec_gray_params(nvimgcodec)
-        for indices in per_device[slot]:
-            paths = [str(images[i]) for i in indices]
-            decoded = decoder.read(paths, params=params)
-            arrays = _decoded_nvimgcodec_batch_to_arrays(decoded, len(indices))
-            for frame_index, gray in zip(indices, arrays):
-                if gray.shape != tuple(int(x) for x in volume.shape[1:]):
-                    raise ValueError(
-                        f"Image dimension mismatch: {images[frame_index]} has {gray.shape}, "
-                        f"expected {tuple(volume.shape[1:])}"
-                    )
-                volume[frame_index] = gray
-
-    with ThreadPoolExecutor(max_workers=len(device_ids), thread_name_prefix="nvjpeg-decode") as executor:
-        futures = [executor.submit(_decode_device, slot) for slot in range(len(device_ids)) if per_device[slot]]
-        for future in futures:
-            future.result()
-
-
-@runtime_telemetry_phase('pta.input.decode_sequence')
-@_release_failed_allocator_blocks
-def load_image_sequence_to_memory(
-    images: Sequence[Path],
-    *,
-    warnings: WarningLog,
-    workers: int,
-    allocator: Optional[ArrayAllocator] = None,
-    jpeg_decode_backend: str = "auto",
-    jpeg_batch_size: int = 64,
-    jpeg_device_ids: Sequence[int] = (),
-    jpeg_cpu_sets: Sequence[Sequence[int]] = (),
-    load_cpu_order: Sequence[int] = (),
-    required_positions: Optional[Sequence[int]] = None,
-) -> Tuple[np.ndarray, Optional[SharedBlock]]:
-    if not images:
-        raise ValueError("No image sequence frames supplied")
-    first_gray = _read_gray_image_opencv(images[0])
-    h, w = first_gray.shape
-    t = len(images)
-    positions = list(range(t)) if required_positions is None else sorted({0, *(int(i) for i in required_positions)})
-    if any(i < 0 or i >= t for i in positions):
-        raise ValueError('Required image-sequence positions are outside the source volume')
-    if allocator is not None:
-        volume, block = allocator((t, h, w))
-    else:
-        volume = np.empty((t, h, w), dtype=np.uint8) if required_positions is None else np.zeros((t, h, w), dtype=np.uint8)
-        block = None
-    volume[0] = first_gray
-
-    backend = str(jpeg_decode_backend).strip().lower()
-    all_jpeg = all(path.suffix.lower() in {".jpg", ".jpeg"} for path in images)
-    if backend == "nvjpeg" and not all_jpeg:
-        raise ValueError("--jpeg_decode_backend nvjpeg requires every sequence frame to be .jpg/.jpeg")
-    try_nvjpeg = all_jpeg and backend in {"auto", "nvjpeg"} and bool(jpeg_device_ids)
-    if try_nvjpeg:
-        try:
-            _decode_jpeg_sequence_nvimgcodec(
-                images,
-                volume,
-                device_ids=jpeg_device_ids,
-                cpu_sets=jpeg_cpu_sets,
-                batch_size=int(jpeg_batch_size),
-                workers=max(1, int(workers)),
-            )
-            warnings.add(
-                "jpeg_sequence_decoded_with_nvjpeg",
-                f"frames={len(images)}, GPUs={list(jpeg_device_ids)}, batch_size={int(jpeg_batch_size)}",
-            )
-            warnings.add("input_volume_loaded_in_memory", f"{volume.shape}, {volume.nbytes / GIB:.2f} GiB")
-            return volume, block
-        except Exception as exc:
-            if backend == "nvjpeg":
-                raise
-            warnings.add("nvjpeg_fallback_to_opencv", f"{type(exc).__name__}: {exc}")
-    elif backend == "nvjpeg":
-        raise RuntimeError("--jpeg_decode_backend nvjpeg requires at least one discovered CUDA-visible GPU")
-
-    if required_positions is not None:
-        import struct
-        # shortcut: unused PNG payloads are not decoded; diagnostics retain full loading.
-        selected_positions = set(positions)
-        for position, path in enumerate(images):
-            if position in selected_positions:
-                continue
-            with Path(path).open('rb') as source:
-                header = source.read(24)
-            if (len(header) != 24 or header[:8] != b'\x89PNG\r\n\x1a\n'
-                    or header[12:16] != b'IHDR'):
-                raise ValueError(f'Invalid PNG image header: {path}')
-            image_width, image_height = struct.unpack('>II', header[16:24])
-            if (image_height, image_width) != (h, w):
-                raise ValueError(f'Image dimension mismatch: {path} has {(image_height, image_width)}, expected {(h, w)}')
-        warnings.add('partial_sequence_required_frames', f'decoded={len(positions)}/{t}; annotation/channel context retained')
-
-    def _read_image(job: int) -> None:
-        i = positions[job]
-        if i == 0:
-            return
-        gray = _read_gray_image_opencv(images[i])
-        if gray.shape != (h, w):
-            raise ValueError(f"Image dimension mismatch: {images[i]} has {gray.shape}, expected {(h, w)}")
-        volume[i] = gray
-
-    parallel_for_indices(
-        len(positions),
-        _read_image,
-        workers=workers,
-        desc="Reading image sequence into in-memory gray8 volume",
-        worker_cpu_order=load_cpu_order,
-    )
-    warnings.add("image_sequence_decoded_direct_grayscale", f"frames={len(images)}, backend=opencv")
-    warnings.add("input_volume_loaded_in_memory", f"{volume.shape}, {volume.nbytes / GIB:.2f} GiB")
-    return volume, block
-
-
-def nrrd_header_to_internal_permutation(header: Mapping[str, object]) -> Optional[Tuple[int, int, int]]:
-    """Infer the array-axis permutation required for internal ``(t,Y,X)``.
-
-    NRRD ``space directions`` contains one physical direction vector per data
-    axis.  For an axis-aligned spatial volume, map the data axes representing
-    physical Z, Y, and X into the pipeline's t/Y/X order.  This disambiguates
-    cubic volumes, for which shape alone cannot distinguish XYZ from TYX.
-    """
-    raw_directions = header.get("space directions")
-    if raw_directions is not None:
-        try:
-            directions = np.asarray(raw_directions, dtype=np.float64)
-            if directions.shape == (3, 3) and np.all(np.isfinite(directions)):
-                magnitudes = np.abs(directions)
-                dominant = tuple(int(x) for x in np.argmax(magnitudes, axis=1).tolist())
-                dominant_values = magnitudes[np.arange(3), np.asarray(dominant, dtype=np.int64)]
-                if set(dominant) == {0, 1, 2} and np.all(dominant_values > 0.0):
-                    # Physical coordinates are X=0, Y=1, Z/t=2.
-                    return (
-                        int(dominant.index(2)),
-                        int(dominant.index(1)),
-                        int(dominant.index(0)),
-                    )
-        except Exception:
-            pass
-
-    # Recognize snapshots written by this script even if a downstream tool
-    # removes the space-directions field while preserving content metadata.
-    content = str(header.get("content", ""))
-    if "exported_axes=(X,Y,t)" in content:
-        return (2, 1, 0)
-    return None
-
-
-def _nrrd_mask_orientation(header, shape, expected_shape_tyx, nrrd_path):
-    if len(shape) != 3:
-        raise ValueError(f"NRRD segmentation must be 3D, got shape {shape} from {nrrd_path}")
-    t_dim, h, w = (int(expected_shape_tyx[0]), int(expected_shape_tyx[1]), int(expected_shape_tyx[2]))
-    shape = tuple(int(x) for x in shape)
-    candidates: List[Tuple[str, Tuple[int, int, int]]] = []
-    for name, source_shape, permutation in (
-        ("already_tyx", (t_dim, h, w), (0, 1, 2)),
-        ("xyz_to_tyx", (w, h, t_dim), (2, 1, 0)),
-        ("yxt_to_tyx", (h, w, t_dim), (2, 0, 1)),
-        ("txy_to_tyx", (t_dim, w, h), (0, 2, 1)),
-    ):
-        if shape == source_shape:
-            candidates.append((name, permutation))
-    if not candidates:
-        raise ValueError(
-            f"NRRD segmentation shape {shape} does not match image volume shape (t,Y,X)=({t_dim},{h},{w}) "
-            f"or recognized spatial permutations (X,Y,t)=({w},{h},{t_dim}) / (Y,X,t)=({h},{w},{t_dim})"
-        )
-
-    header_permutation = nrrd_header_to_internal_permutation(header)
-    if header_permutation is not None:
-        internal_shape = tuple(shape[int(axis)] for axis in header_permutation)
-        if internal_shape != (t_dim, h, w):
-            raise ValueError(
-                f"NRRD header axis directions imply internal shape {internal_shape}, but image volume shape is "
-                f"(t,Y,X)=({t_dim},{h},{w}) for {nrrd_path}"
-            )
-        permutation = tuple(int(x) for x in header_permutation)
-        orientation = "header_axes_" + "".join(str(x) for x in permutation) + "_to_tyx"
-    else:
-        unique_permutations = {tuple(permutation) for _, permutation in candidates}
-        if len(unique_permutations) != 1:
-            matches = ", ".join(name for name, _ in candidates)
-            raise ValueError(
-                f"NRRD axis order is ambiguous from shape {shape} ({matches}) and the header has no usable "
-                f"space directions/content marker: {nrrd_path}. Add axis-aware NRRD metadata before import."
-            )
-        orientation, permutation = candidates[0]
-
-    return orientation, permutation
-
-
-def _read_canonical_uint8_nrrd(nrrd_path, nrrd, expected_shape_tyx):
-    """Bound gzip output in place instead of building and copying an entire bytearray."""
-    import gzip
-    with Path(nrrd_path).open('rb') as source:
-        header = nrrd.read_header(source)
-        if (header.get('type') not in {'uint8', 'uint8_t', 'uchar', 'unsigned char'}
-                or header.get('encoding') not in {'raw', 'gzip', 'gz'}
-                or header.get('datafile', header.get('data file')) is not None
-                or header.get('lineskip', header.get('line skip', 0)) != 0
-                or header.get('byteskip', header.get('byte skip', 0)) != 0):
-            return None
-        shape = tuple(int(x) for x in header['sizes'])
-        if int(header.get('dimension', 0)) != len(shape) or any(x <= 0 for x in shape):
-            raise ValueError(f'Invalid NRRD dimensions: {nrrd_path}')
-        orientation, permutation = _nrrd_mask_orientation(header, shape, expected_shape_tyx, nrrd_path)
-        if tuple(permutation) != (2, 1, 0):
-            return None
-        mask = np.empty(tuple(expected_shape_tyx), np.uint8)
-        raw = memoryview(mask).cast('B')
-        stream = gzip.GzipFile(fileobj=source, mode='rb') if header['encoding'] in {'gzip', 'gz'} else source
-        try:
-            with runtime_telemetry().span('pta.mask.nrrd_payload_read'):
-                for start in range(0, len(raw), 8 * 1024 * 1024):
-                    chunk = raw[start:min(len(raw), start + 8 * 1024 * 1024)]
-                    filled = 0
-                    while filled < len(chunk):
-                        count = stream.readinto(chunk[filled:])
-                        if not count:
-                            raise ValueError(f'Unexpected EOF in NRRD segmentation payload: {nrrd_path}')
-                        filled += int(count)
-                if stream.read(1):
-                    raise ValueError(f'NRRD segmentation payload exceeds declared dimensions: {nrrd_path}')
-        finally:
-            if stream is not source:
-                stream.close()
-        with runtime_telemetry().span('pta.mask.nrrd_normalize'):
-            np.greater(mask, 0, out=mask)
-        return mask, orientation
-
-
-@runtime_telemetry_phase('pta.mask.load_nrrd')
-def load_nrrd_mask_for_volume(nrrd_path: Path, expected_shape_tyx: Tuple[int, int, int], *, warnings: WarningLog) -> np.ndarray:
-    try:
-        import nrrd  # type: ignore
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError("pynrrd is required for NRRD segmentation input: pip install pynrrd") from exc
-    fast = _read_canonical_uint8_nrrd(nrrd_path, nrrd, expected_shape_tyx)
-    if fast is not None:
-        mask, orientation = fast
-        warnings.add('segmentation_nrrd_bounded_readinto', f'{nrrd_path.name}: {mask.nbytes} bytes, bounded 8 MiB output chunks')
-    else:
-        data, header = nrrd.read(str(nrrd_path))
-        arr = np.asarray(data)
-        orientation, permutation = _nrrd_mask_orientation(header, arr.shape, expected_shape_tyx, nrrd_path)
-        internal = arr if permutation == (0, 1, 2) else np.transpose(arr, permutation)
-        mask = np.ascontiguousarray((np.asarray(internal) > 0).astype(np.uint8))
-    warnings.add("segmentation_nrrd_loaded_in_memory", f"{nrrd_path.name}: {mask.shape}, {mask.nbytes / GIB:.2f} GiB, orientation={orientation}")
-    return mask
 
 
 @runtime_telemetry_phase('pta.mask.rasterize_yolo')
@@ -1571,9 +930,11 @@ def reassert_foreground_slice_anchors(
     """Map one anchor per input foreground slice into a transformed mask.
 
     The depth mapping is injective whenever output depth is at least source
-    depth.  Reasserting an anchor only when its small mapped neighborhood is
-    empty prevents Gaussian thresholding or interpolation from deleting an
-    input foreground slice, without retaining any background candidate.
+    depth.  Restore a bounded patch only when the entire mapped slice has lost
+    its foreground.  Existing foreground, including a thin boundary or a
+    different surviving component, must never be enlarged or supplemented.
+    Check the small anchor neighborhood first so preserved anchors avoid a
+    full-plane scan.
     """
     mask = np.asarray(mask_u8, dtype=np.uint8)
     if mask.ndim != 3:
@@ -1591,9 +952,12 @@ def reassert_foreground_slice_anchors(
         y0, y1 = max(0, y - radius), min(output_h, y + radius + 1)
         x0, x1 = max(0, x - radius), min(output_w, x + radius + 1)
         region = mask[z, y0:y1, x0:x1]
-        if not np.all(region > 0):
-            region[...] = 1
-            repaired += 1
+        if np.any(region > 0):
+            continue
+        if np.any(mask[z] > 0):
+            continue
+        region[...] = 1
+        repaired += 1
     if len(mapped_depths) < len(anchors):
         raise RuntimeError(
             "Foreground transverse preservation failed: multiple foreground input slices "
@@ -1829,190 +1193,6 @@ def resize_to_approximately_cube(
 # ---------------------------------------------------------------------------
 
 
-def adapt_shared_view(view: shared_geometry.ViewInfo) -> ViewInfo:
-    """Expose a canonical TTA view to the unchanged PTA planner vocabulary."""
-
-    physical_name = shared_geometry.physical_view_name(view)
-    if shared_geometry.is_azimuthal_view(view):
-        runtime_family = "azimuthal"
-    elif str(view.family) == "radial":
-        runtime_family = "radial"
-    elif shared_geometry.is_spherical_view(view):
-        runtime_family = "spherical"
-    elif shared_geometry.is_tilted_view(view):
-        # The old token described only transverse tilts.  It is retained solely
-        # for PTA summary/filter call sites; ``shared_view`` owns the base axes.
-        runtime_family = "tilted_transverse"
-    else:
-        runtime_family = str(physical_name)
-    return ViewInfo(
-        name=str(view.name),
-        display_name=str(shared_geometry.view_output_token(view)),
-        family=runtime_family,
-        num_slices=int(view.num_slices),
-        src_h=int(view.src_h),
-        src_w=int(view.src_w),
-        pad_mode=str(view.pad_mode),
-        full_t=int(view.full_t),
-        full_h=int(view.full_h),
-        full_w=int(view.full_w),
-        azimuths_deg=tuple(float(value) for value in view.azimuths_deg),
-        diameter=int(view.diameter),
-        center_x=float(view.center_x),
-        center_y=float(view.center_y),
-        roi_radius=float(view.roi_radius),
-        tilt_angle_deg=float(view.tilt_angle_deg),
-        tilt_direction=str(view.tilt_direction),
-        shared_view=view,
-    )
-
-
-def compile_v18_pta_views(
-    *,
-    t_dim: int,
-    h: int,
-    w: int,
-    config: object,
-    azimuthal_native_raster: int,
-) -> Tuple[List[ViewInfo], object]:
-    """Compile PTA grouped requests with the exact shared TTA view compiler."""
-
-    compiled = compile_physical_views(
-        t_dim=int(t_dim),
-        height=int(h),
-        width=int(w),
-        cartesian_views=tuple(getattr(config, "cartesian_views")),
-        azimuthal_requests=tuple(getattr(config, "azimuthal_requests")),
-        tilted_groups=tuple(getattr(config, "tilted_groups")),
-        azimuthal_native_raster=int(azimuthal_native_raster),
-        radial_requests=tuple(getattr(config, "radial_requests", ())),
-        radial_min_radius=getattr(getattr(config, "args", None), "radial_min_radius", None),
-        radial_patch_size=int(azimuthal_native_raster) if int(azimuthal_native_raster) > 0 else 3072,
-        spherical_requests=tuple(getattr(config, "spherical_requests", ())),
-        spherical_min_radius=getattr(getattr(config, "args", None), "spherical_min_radius", None),
-        spherical_patch_size=int(azimuthal_native_raster),
-        augmentation_angles=(0.0,),
-    )
-    return [adapt_shared_view(view) for view in compiled.views], compiled
-
-def rotated_bbox_size(w: int, h: int, angle_deg: float) -> Tuple[int, int]:
-    theta = math.radians(float(angle_deg) % 360.0)
-    c = abs(math.cos(theta))
-    s = abs(math.sin(theta))
-    bw = int(math.ceil(float(w) * c + float(h) * s))
-    bh = int(math.ceil(float(w) * s + float(h) * c))
-    return max(1, bw), max(1, bh)
-
-
-def affine2x3_to_3x3(M: np.ndarray) -> np.ndarray:
-    out = np.eye(3, dtype=np.float64)
-    out[:2, :3] = np.asarray(M, dtype=np.float64)
-    return out
-
-
-def center_scale_matrix(src_w: int, src_h: int, out_w: int, out_h: int) -> np.ndarray:
-    cx_s = (int(src_w) - 1) / 2.0
-    cy_s = (int(src_h) - 1) / 2.0
-    cx_o = (int(out_w) - 1) / 2.0
-    cy_o = (int(out_h) - 1) / 2.0
-    sx = float(out_w) / float(src_w)
-    sy = float(out_h) / float(src_h)
-    return np.array([[sx, 0.0, cx_o - sx * cx_s], [0.0, sy, cy_o - sy * cy_s], [0.0, 0.0, 1.0]], dtype=np.float64)
-
-
-def build_affine(
-    src_w: int,
-    src_h: int,
-    angle_deg: float,
-    pad_mode: str,
-    imgsz: int,
-    *,
-    shared_view: Optional[shared_geometry.ViewInfo] = None,
-) -> AffineSpec:
-    if shared_view is not None:
-        # TTA owns padding, rotation, center alignment, and square scaling.
-        # PTA's imgsz=0 remains a native-raster publication default; the
-        # canonical canvas matrices are still retained for grouped tiles.
-        native_output = int(imgsz) == 0
-        shared_out_size = int(imgsz) if int(imgsz) > 0 else max(int(src_w), int(src_h), 1)
-        shared_affine = shared_geometry.build_affine(
-            view=str(shared_view.name),
-            src_w=int(src_w),
-            src_h=int(src_h),
-            out_size=int(shared_out_size),
-            angle_deg=float(angle_deg),
-            pad_mode=str(pad_mode),
-        )
-        if native_output:
-            identity = np.asarray(
-                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32
-            )
-            out_w, out_h = int(src_w), int(src_h)
-            src_to_out = identity
-            out_to_src = identity
-        else:
-            out_w = out_h = int(shared_affine.out_size)
-            src_to_out = np.asarray(shared_affine.M_src_to_out, dtype=np.float32)
-            out_to_src = np.asarray(shared_affine.M_out_to_src, dtype=np.float32)
-        return AffineSpec(
-            angle_deg=float(angle_deg),
-            src_w=int(src_w),
-            src_h=int(src_h),
-            canvas_w=int(shared_affine.canvas_w),
-            canvas_h=int(shared_affine.canvas_h),
-            out_w=int(out_w),
-            out_h=int(out_h),
-            pad_off_x=float(shared_affine.pad_off_x),
-            pad_off_y=float(shared_affine.pad_off_y),
-            M_src_to_canvas=np.asarray(shared_affine.M_src_to_canvas, dtype=np.float32),
-            M_canvas_to_src=np.asarray(shared_affine.M_canvas_to_src, dtype=np.float32),
-            M_src_to_out=src_to_out,
-            M_out_to_src=out_to_src,
-            shared_affine=shared_affine,
-            native_output=bool(native_output),
-        )
-    if pad_mode not in {"clamp", "pad"}:
-        raise ValueError("pad_mode must be clamp or pad")
-    if pad_mode == "pad":
-        canvas_w, canvas_h = rotated_bbox_size(int(src_w), int(src_h), float(angle_deg))
-    else:
-        canvas_w, canvas_h = int(src_w), int(src_h)
-    off_x = (canvas_w - int(src_w)) / 2.0
-    off_y = (canvas_h - int(src_h)) / 2.0
-    cx = (canvas_w - 1) / 2.0
-    cy = (canvas_h - 1) / 2.0
-    M_pad = np.array([[1.0, 0.0, off_x], [0.0, 1.0, off_y], [0.0, 0.0, 1.0]], dtype=np.float64)
-    M_rot = affine2x3_to_3x3(cv2.getRotationMatrix2D((cx, cy), float(angle_deg), 1.0))
-    M_src_to_canvas3 = M_rot @ M_pad
-    M_canvas_to_src3 = np.linalg.inv(M_src_to_canvas3)
-    if int(imgsz) > 0:
-        out_w = out_h = int(imgsz)
-        M_scale = center_scale_matrix(canvas_w, canvas_h, out_w, out_h)
-    else:
-        out_w, out_h = int(canvas_w), int(canvas_h)
-        M_scale = np.eye(3, dtype=np.float64)
-    M_src_to_out3 = M_scale @ M_src_to_canvas3
-    M_out_to_src3 = np.linalg.inv(M_src_to_out3)
-    return AffineSpec(
-        float(angle_deg), int(src_w), int(src_h), int(canvas_w), int(canvas_h), int(out_w), int(out_h), float(off_x), float(off_y),
-        M_src_to_canvas3[:2, :].astype(np.float32), M_canvas_to_src3[:2, :].astype(np.float32),
-        M_src_to_out3[:2, :].astype(np.float32), M_out_to_src3[:2, :].astype(np.float32),
-    )
-
-
-def dense_tile_positions(length: int, tile_size: int, stride: int) -> List[int]:
-    length = int(length)
-    tile_size = int(tile_size)
-    stride = int(stride)
-    last = max(0, length - tile_size)
-    starts = list(range(0, last + 1, stride)) if last > 0 else [0]
-    if not starts:
-        starts = [0]
-    if starts[-1] != last:
-        starts.append(last)
-    return [int(x) for x in starts]
-
-
 # ---------------------------------------------------------------------------
 # YOLO polygon export
 # ---------------------------------------------------------------------------
@@ -2021,262 +1201,6 @@ def dense_tile_positions(length: int, tile_size: int, stride: int) -> List[int]:
 # ---------------------------------------------------------------------------
 # Throughput-first global render scheduler
 # ---------------------------------------------------------------------------
-
-
-def build_render_plan(
-    *,
-    view: ViewInfo,
-    aff: AffineSpec,
-    tag: str,
-    out_dir: Path,
-    stem: str,
-    tile_configs: Sequence[TileConfig],
-    save_overlay: bool,
-    imgsz: int,
-    label_enabled: bool,
-    image_format: str = "png",
-    channel_variant: ChannelVariant = DEFAULT_CHANNEL_VARIANT,
-    eligible_frame_indices: Optional[Sequence[int]] = None,
-    source_encoded_indices: Sequence[int] = (),
-    publish_images: bool = True,
-    publish_labels: bool = True,
-) -> RenderPlan:
-    from .unification.geometry_identity import geometry_recipe_metadata
-
-    images_dir = out_dir / "images"
-    labels_dir = out_dir / "labels"
-    overlays_dir = out_dir / "overlays"
-    if publish_images:
-        images_dir.mkdir(parents=True, exist_ok=True)
-    if label_enabled and publish_labels:
-        labels_dir.mkdir(parents=True, exist_ok=True)
-    if save_overlay:
-        overlays_dir.mkdir(parents=True, exist_ok=True)
-
-    image_suffix = output_image_suffix(image_format)
-    img_pattern = str(images_dir / f"{stem}_{tag}_%04d{image_suffix}")
-    lbl_pattern = str(labels_dir / f"{stem}_{tag}_%04d.txt")
-    overlay_path = overlays_dir / f"{stem}_{tag}_Overlay.mkv" if save_overlay else None
-
-    shared_aug_job: Optional[shared_geometry.AugJob] = None
-    if view.shared_view is not None and aff.shared_affine is not None:
-        shared_aug_job = shared_geometry.AugJob(
-            aug_id="a0",
-            angle_deg=0.0,
-            meta_path=out_dir / ".v18_geometry" / f"{stem}_{tag}.meta.json",
-            aff=aff.shared_affine,
-        )
-    canonical_plan: Optional[RasterPlan] = None
-    if view.shared_view is not None:
-        canonical_plan = build_forward_raster_plan(
-            mode="pta",
-            physical_view_id=shared_geometry.physical_view_name(view.shared_view),
-            angle_deg=float(aff.angle_deg),
-            channel_token=str(channel_variant.format_token),
-            channel_kind=str(channel_variant.kind),
-            channel_count=int(channel_variant.channel_count),
-            channel_stride=int(channel_variant.stride),
-            channel_offsets=tuple(int(value) for value in channel_variant.offsets),
-            channel_direction=str(channel_variant.order_name),
-            output_shape=(int(aff.out_h), int(aff.out_w)),
-            metadata={
-                "runtime_view_id": str(view.name),
-                "runtime_job_id": str(tag),
-                "runtime_kind": "fullframe",
-                **geometry_recipe_metadata(view.shared_view, aff),
-                **projection_sampling_record(view.shared_view),
-                **radial_view_plan_metadata(view.shared_view),
-                **spherical_view_plan_metadata(view.shared_view),
-            },
-        )
-
-    tile_items: List[RenderTileItem] = []
-    for cfg in tile_configs:
-        out_side = int(imgsz) if int(imgsz) > 0 else int(cfg.tile_size)
-        if view.shared_view is not None and shared_aug_job is not None:
-            shared_jobs: Sequence[Optional[shared_geometry.DenseTileJob]] = tuple(
-                shared_geometry.build_dense_tile_jobs_for_aug(
-                    view.shared_view,
-                    shared_aug_job,
-                    shared_geometry.TileConfig(
-                        tile_size=int(cfg.tile_size),
-                        tile_stride=int(cfg.tile_stride),
-                        config_id=str(cfg.config_id),
-                    ),
-                    out_size=int(out_side),
-                    temp_dir=out_dir / ".v18_geometry",
-                )
-            )
-        else:
-            shared_jobs = tuple(
-                None
-                for _y in dense_tile_positions(aff.canvas_h, cfg.tile_size, cfg.tile_stride)
-                for _x in dense_tile_positions(aff.canvas_w, cfg.tile_size, cfg.tile_stride)
-            )
-        if shared_jobs and shared_jobs[0] is not None:
-            positions = (
-                (int(job.tile_x), int(job.tile_y), job)
-                for job in shared_jobs
-                if job is not None
-            )
-        else:
-            positions = (
-                (int(x), int(y), None)
-                for y in dense_tile_positions(aff.canvas_h, cfg.tile_size, cfg.tile_stride)
-                for x in dense_tile_positions(aff.canvas_w, cfg.tile_size, cfg.tile_stride)
-            )
-        for x, y, shared_job in positions:
-            tile_tag = f"{tag}_tile_{cfg.config_id}_x{int(x):04d}_y{int(y):04d}"
-            canonical_tile_plan: Optional[RasterPlan] = None
-            if view.shared_view is not None:
-                canonical_tile_plan = build_forward_raster_plan(
-                    mode="pta",
-                    physical_view_id=shared_geometry.physical_view_name(
-                        view.shared_view
-                    ),
-                    angle_deg=float(aff.angle_deg),
-                    channel_token=str(channel_variant.format_token),
-                    channel_kind=str(channel_variant.kind),
-                    channel_count=int(channel_variant.channel_count),
-                    channel_stride=int(channel_variant.stride),
-                    channel_offsets=tuple(
-                        int(value) for value in channel_variant.offsets
-                    ),
-                    channel_direction=str(channel_variant.order_name),
-                    output_shape=(int(out_side), int(out_side)),
-                    tile_size=int(cfg.tile_size),
-                    tile_stride=int(cfg.tile_stride),
-                    metadata={
-                        "runtime_view_id": str(view.name),
-                        "runtime_job_id": str(tile_tag),
-                        "runtime_kind": "tile",
-                        "tile_config_id": str(cfg.config_id),
-                        "tile_x": int(x),
-                        "tile_y": int(y),
-                        **geometry_recipe_metadata(view.shared_view, shared_job if shared_job is not None else aff),
-                        **projection_sampling_record(view.shared_view),
-                        **radial_view_plan_metadata(view.shared_view),
-                        **spherical_view_plan_metadata(view.shared_view),
-                    },
-                )
-            tile_items.append(RenderTileItem(
-                cfg=cfg,
-                x=int(x),
-                y=int(y),
-                tile_tag=tile_tag,
-                out_w=int(out_side),
-                out_h=int(out_side),
-                img_pattern=str(images_dir / f"{stem}_{tile_tag}_%04d{image_suffix}"),
-                lbl_pattern=str(labels_dir / f"{stem}_{tile_tag}_%04d.txt"),
-                overlay_path=(overlays_dir / f"{stem}_{tile_tag}_Overlay.mkv" if save_overlay else None),
-                label_enabled=bool(label_enabled),
-                channel_kind=str(channel_variant.kind),
-                shared_job=shared_job,
-                canonical_plan=canonical_tile_plan,
-                publish_images=bool(publish_images),
-                publish_labels=bool(publish_labels),
-            ))
-
-    normalized_eligible: Optional[Tuple[int, ...]]
-    if eligible_frame_indices is None:
-        normalized_eligible = None
-        eligible_count = int(view.num_slices)
-    else:
-        normalized_eligible = tuple(sorted({int(x) for x in eligible_frame_indices}))
-        if any(x < 0 or x >= int(view.num_slices) for x in normalized_eligible):
-            raise ValueError(
-                f"Eligible center index is outside view {view.name} bounds 0..{int(view.num_slices)-1}: "
-                f"{normalized_eligible[:24]}"
-            )
-        eligible_count = len(normalized_eligible)
-    normalized_encoded = tuple(int(x) for x in source_encoded_indices)
-    if normalized_encoded and len(normalized_encoded) != int(view.num_slices):
-        raise ValueError(
-            f"Encoded-index mapping for {view.name} has {len(normalized_encoded)} entries, "
-            f"expected {int(view.num_slices)}"
-        )
-
-    stats: Dict[str, object] = {
-        "tag": tag,
-        "view": view.name,
-        "angle": float(aff.angle_deg),
-        "frames": int(eligible_count),
-        "view_frames": int(view.num_slices),
-        "skipped_center_frames": int(view.num_slices) - int(eligible_count),
-        "image_format": parse_output_image_format(image_format),
-        "channel_format": str(channel_variant.format_token),
-        "channel_kind": str(channel_variant.kind),
-        "channel_count": int(channel_variant.channel_count),
-        "channel_stride": int(channel_variant.stride),
-        "channel_order": str(channel_variant.order_name),
-        "channel_offsets": [int(x) for x in channel_variant.offsets],
-        "full_output_size": [int(aff.out_w), int(aff.out_h)],
-        "tiles": [
-            {"tag": item.tile_tag, "tile_size": int(item.cfg.tile_size), "tile_stride": int(item.cfg.tile_stride), "x": int(item.x), "y": int(item.y), "output_size": [int(item.out_w), int(item.out_h)]}
-            for item in tile_items
-        ],
-        "scheduler": "global_source_frame_and_output_frame_parallel",
-        "forward_geometry": "XTA.geometry",
-        "forward_backend": "runtime_selected_cpu_or_cuda_tta_canonical",
-        "sampling_policy_digest": forward_sampling_policy().digest,
-        "canonical_plan_digest": (
-            None if canonical_plan is None else str(canonical_plan.digest)
-        ),
-        "canonical_tile_plan_digests": [
-            str(item.canonical_plan.digest)
-            for item in tile_items
-            if item.canonical_plan is not None
-        ],
-        "label_enabled": bool(label_enabled),
-        "publish_images": bool(publish_images),
-        "publish_labels": bool(publish_labels),
-    }
-    return RenderPlan(
-        view=view,
-        aff=aff,
-        tag=tag,
-        img_pattern=img_pattern,
-        lbl_pattern=lbl_pattern,
-        overlay_path=overlay_path,
-        label_enabled=bool(label_enabled),
-        tile_layout=tuple(tile_items),
-        stats=stats,
-        channel_variant=channel_variant,
-        eligible_frame_indices=normalized_eligible,
-        source_encoded_indices=normalized_encoded,
-        shared_aug_job=shared_aug_job,
-        canonical_plan=canonical_plan,
-        publish_images=bool(publish_images),
-        publish_labels=bool(publish_labels),
-    )
-
-
-def render_plan_frame_indices(plan: RenderPlan) -> Sequence[int]:
-    if plan.eligible_frame_indices is None:
-        return range(int(plan.view.num_slices))
-    return plan.eligible_frame_indices
-
-
-def iter_render_source_frame_jobs_round_robin(plans: Sequence[RenderPlan]) -> Iterator[Tuple[int, int]]:
-    """Yield only eligible source-frame jobs, frame-major across variants.
-
-    Keep the original bounded-memory iteration pattern: eligibility is stored
-    per plan rather than materializing every (plan, frame) job in a global map.
-    """
-    if not plans:
-        return
-    eligible_sets: List[Optional[set[int]]] = [
-        None if plan.eligible_frame_indices is None else set(int(x) for x in plan.eligible_frame_indices)
-        for plan in plans
-    ]
-    max_frames = max(int(plan.view.num_slices) for plan in plans)
-    for frame_idx in range(max_frames):
-        for plan_idx, plan in enumerate(plans):
-            if frame_idx >= int(plan.view.num_slices):
-                continue
-            eligible = eligible_sets[plan_idx]
-            if eligible is None or int(frame_idx) in eligible:
-                yield int(plan_idx), int(frame_idx)
 
 
 def parallel_map_ordered_limited(count: int, func: Callable[[int], object], *, workers: int, max_pending: int, desc: str) -> Iterator[object]:
@@ -3350,154 +2274,6 @@ def load_source_volume_from_spec(
     )
 
 
-@runtime_telemetry_phase('pta.plan.geometry')
-def build_plans_for_views(
-    *,
-    views: Sequence[ViewInfo],
-    out_dir: Path,
-    stem: str,
-    tile_configs: Sequence[TileConfig],
-    save_overlay: bool,
-    imgsz: int,
-    label_enabled: bool,
-    image_format: str = "png",
-    channel_variants: Sequence[ChannelVariant] = (DEFAULT_CHANNEL_VARIANT,),
-    center_eligible_frame_indices: Optional[Sequence[int]] = None,
-    transverse_source_encoded_indices: Sequence[int] = (),
-    warnings: Optional[WarningLog] = None,
-    publish_images: bool = True,
-    publish_labels: bool = True,
-) -> List[RenderPlan]:
-    """Build plans with partial-center and continuity guards.
-
-    ``center_eligible_frame_indices`` applies only to the native transverse view
-    of an unforced Partially Labeled YOLO sequence.  Frames with no label file
-    remain resident as image context but cannot become output centers.
-
-    ``transverse_source_encoded_indices`` preserves the original numeric slice
-    coordinates for custom C...S... stacks.  Requested indices inside the true
-    [minimum, maximum] bounds must exist; requests outside those bounds retain
-    edge clamping at the actual volume boundary.
-    """
-    plans: List[RenderPlan] = []
-    normalized_base_centers = (
-        None
-        if center_eligible_frame_indices is None
-        else tuple(sorted({int(x) for x in center_eligible_frame_indices}))
-    )
-    normalized_encoded = tuple(int(x) for x in transverse_source_encoded_indices)
-    if normalized_encoded and any(
-        normalized_encoded[i] >= normalized_encoded[i + 1]
-        for i in range(len(normalized_encoded) - 1)
-    ):
-        raise ValueError(
-            f"{stem}: transverse encoded image indices must be strictly increasing; "
-            f"got {normalized_encoded[:24]}"
-        )
-    warned_discontinuity_formats: set[str] = set()
-
-    for view in views:
-        aff = build_affine(
-            view.src_w,
-            view.src_h,
-            0.0,
-            view.pad_mode,
-            int(imgsz),
-            shared_view=view.shared_view,
-        )
-        base_tag = view.display_name
-        is_transverse = view.family == "transverse"
-        if is_transverse and normalized_base_centers is not None:
-            if any(x < 0 or x >= int(view.num_slices) for x in normalized_base_centers):
-                raise ValueError(
-                    f"{stem}: annotated center index is outside transverse bounds "
-                    f"0..{int(view.num_slices)-1}: {normalized_base_centers[:24]}"
-                )
-        if is_transverse and normalized_encoded and len(normalized_encoded) != int(view.num_slices):
-            raise ValueError(
-                f"{stem}: transverse encoded-index mapping has {len(normalized_encoded)} entries, "
-                f"expected {int(view.num_slices)}"
-            )
-
-        for channel_variant in channel_variants:
-            tag = make_channel_tag(base_tag, channel_variant)
-            eligible: Optional[Tuple[int, ...]] = (
-                normalized_base_centers if is_transverse else None
-            )
-            source_indices_for_plan: Tuple[int, ...] = ()
-            skipped_discontinuous: List[Tuple[int, Tuple[int, ...]]] = []
-
-            if is_transverse and channel_variant.kind == "custom" and normalized_encoded:
-                source_indices_for_plan = normalized_encoded
-                candidate_centers: Sequence[int] = (
-                    range(int(view.num_slices)) if eligible is None else eligible
-                )
-                continuous_centers: List[int] = []
-                for frame_idx in candidate_centers:
-                    positions, missing = encoded_channel_source_positions(
-                        normalized_encoded,
-                        int(frame_idx),
-                        channel_variant.offsets,
-                    )
-                    if positions is None:
-                        skipped_discontinuous.append((int(frame_idx), tuple(int(x) for x in missing)))
-                    else:
-                        continuous_centers.append(int(frame_idx))
-                eligible = tuple(continuous_centers)
-
-                warning_key = str(channel_variant.format_token)
-                if skipped_discontinuous and warning_key not in warned_discontinuity_formats:
-                    warned_discontinuity_formats.add(warning_key)
-                    examples = [
-                        f"center={int(normalized_encoded[frame_idx])}, missing={list(missing)}"
-                        for frame_idx, missing in skipped_discontinuous[:8]
-                    ]
-                    msg = (
-                        f"{stem} {channel_variant.format_token}: skipped "
-                        f"{len(skipped_discontinuous)} annotated center slice(s) because required "
-                        f"in-volume channel indices are missing across a discontinuity; "
-                        f"examples: {'; '.join(examples)}. Requests beyond actual volume edges "
-                        f"remain edge-clamped."
-                    )
-                    if warnings is not None:
-                        warnings.add("channel_stack_discontinuity_centers_skipped", msg)
-                    print(f"WARNING: {msg}", file=sys.stderr)
-
-            plan = build_render_plan(
-                view=view,
-                aff=aff,
-                tag=tag,
-                out_dir=out_dir,
-                stem=stem,
-                tile_configs=tile_configs,
-                save_overlay=bool(save_overlay),
-                imgsz=int(imgsz),
-                label_enabled=bool(label_enabled),
-                image_format=image_format,
-                channel_variant=channel_variant,
-                eligible_frame_indices=eligible,
-                source_encoded_indices=source_indices_for_plan,
-                publish_images=bool(publish_images),
-                publish_labels=bool(publish_labels),
-            )
-            base_count = (
-                len(normalized_base_centers)
-                if is_transverse and normalized_base_centers is not None
-                else int(view.num_slices)
-            )
-            final_count = len(render_plan_frame_indices(plan))
-            plan.stats["annotated_center_frames"] = int(base_count)
-            plan.stats["skipped_unannotated_centers"] = (
-                int(view.num_slices) - int(base_count)
-                if is_transverse and normalized_base_centers is not None
-                else 0
-            )
-            plan.stats["skipped_discontinuous_centers"] = int(len(skipped_discontinuous))
-            plan.stats["eligible_center_frames"] = int(final_count)
-            plans.append(plan)
-    return plans
-
-
 @runtime_telemetry_phase('pta.prepare')
 @_release_failed_allocator_blocks
 def prepare_loaded_source(
@@ -3883,6 +2659,7 @@ def prepare_loaded_source(
 
             geometries = extract_cpr_geometries(
                 mask_for_render,
+                raster_size=int(args.imgsz),
                 warn=lambda message: warnings.add("cpr_centerline_unavailable", f"{src.stem}: {message}"),
             )
             for geometry in geometries:
@@ -3896,7 +2673,9 @@ def prepare_loaded_source(
                 ))
             print(f"{src.stem}: CPR: {len(geometries)} centerline branch(es), "
                   f"{sum(item.num_slices for item in geometries)} perpendicular cross-section images; "
-                  "native spacing approximately one processing voxel (before explicit --imgsz scaling)")
+                  "centered native patches at one processing voxel per pixel; "
+                  + (f"patch size {int(args.imgsz)} from --imgsz"
+                     if int(args.imgsz) > 0 else f"default patch size {max(processing_shape)} from longest processing axis"))
             if not geometries:
                 warnings.add("cpr_centerline_unavailable", f"{src.stem}: no usable tubular centerline; CPR produced no views")
     for request, diameter, spacing in zip(
@@ -4015,16 +2794,6 @@ def _transverse_polygons_for_processed_frame(prep: PreparedVolume, frame_idx: in
     for source_frame in _source_frames_for_processed_transverse(prep, int(frame_idx)):
         polygons.extend(prep.src.yolo_polygons_by_frame.get(int(source_frame), tuple()))
     return tuple(polygons)
-
-
-def _polygon_area_xy(points: Sequence[Tuple[float, float]]) -> float:
-    if len(points) < 3:
-        return 0.0
-    return abs(0.5 * sum(
-        float(points[i][0]) * float(points[(i + 1) % len(points)][1])
-        - float(points[(i + 1) % len(points)][0]) * float(points[i][1])
-        for i in range(len(points))
-    ))
 
 
 def _clip_polygon_to_rect(
@@ -5102,7 +3871,7 @@ def write_pta_summary(
     specs: Sequence[VolumeInputSpec],
     volume_records: Sequence[VolumeSummaryRecord],
     tile_configs: Sequence[TileConfig],
-    channel_formats: Sequence[ChannelFormat],
+    channel_formats: Sequence[ChannelFormat | CanonicalChannelFormat],
     channel_variants: Sequence[ChannelVariant],
     requested_output_format: str,
     background_stats: BackgroundFilterStats,
@@ -5511,7 +4280,12 @@ def main(
     except Exception:
         pass
 
-    channel_formats = resolve_channel_formats(args.channel_format)
+    resolved_channel_formats = getattr(args, "_pta_channel_formats", None)
+    channel_formats = (
+        list(resolved_channel_formats)
+        if resolved_channel_formats is not None
+        else resolve_channel_formats(args.channel_format)
+    )
     channel_variants = expand_channel_variants(channel_formats)
     requested_output_format = str(
         getattr(args, "_v18_requested_output_format", args.output_format)
@@ -5538,10 +4312,6 @@ def main(
         raise ValueError("--frame_workers must be >= 0")
     if int(args.max_pending_frames) < 0:
         raise ValueError("--max_pending_frames must be >= 0")
-    if int(args.tile_task_chunk) <= 0:
-        raise ValueError("--tile_task_chunk must be >= 1")
-    if int(args.aug_task_chunk) <= 0:
-        raise ValueError("--aug_task_chunk must be >= 1")
     if int(args.overlay_workers) < 0:
         raise ValueError("--overlay_workers must be >= 0")
     if int(args.overlay_pending_frames) < 0:
@@ -6229,7 +4999,7 @@ def main(
             ):
                 cuda_family = family in {
                     "cartesian", "upright-azimuthal", "tilted-cartesian", "tilted-azimuthal",
-                    "radial", "spherical",
+                    "radial", "spherical", "cpr",
                 }
                 backend_note = (
                     "resident CUDA when admitted; CPU fallback"
@@ -6244,7 +5014,6 @@ def main(
                 tasks = build_phase_render_tasks(
                     prep.plans,
                     retained,
-                    aug_chunk=int(args.aug_task_chunk),
                     gpu_batch_size=(int(args.gpu_batch_size) if gpu_offline_active else 0),
                 )
             task_description = (

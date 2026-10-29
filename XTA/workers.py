@@ -92,11 +92,11 @@ from .geometry import (
 )
 from .unification.contracts import RasterPlan
 from .unification.sampling import raster_plan_from_spawn_spec
+from ._prediction_cleanup import _cleanup_prediction_slice_inplace
 from .inference import (
     CpuRetinaMaskPayload,
     ModelInputChannelMismatchError,
     PredictConfig,
-    _cleanup_prediction_slice_inplace,
     _direct_predict_applicable,
     _ensure_predictor_for_direct_predict,
     _clip_boxes_np,

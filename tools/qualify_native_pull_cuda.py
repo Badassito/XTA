@@ -7,8 +7,6 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
-from datetime import datetime, timezone
 import json
 import hashlib
 import math
@@ -20,6 +18,11 @@ import sys
 import time
 
 import numpy as np
+
+if __package__:
+    from .gpu_reservation import gpu_reservation
+else:
+    from gpu_reservation import gpu_reservation
 
 
 def source_fingerprints(repo):
@@ -42,17 +45,8 @@ def source_fingerprints(repo):
     return {path:hashlib.sha256((repo/path).read_bytes()).hexdigest() for path in paths}
 
 
-@contextmanager
 def gpu_lock(path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-        json.dump(dict(task='exact-native-pull-cuda-qualification',pid=os.getpid(),
-                       start_time=datetime.now(timezone.utc).isoformat()),handle)
-    try:
-        yield
-    finally:
-        path.unlink()
+    return gpu_reservation(path, task_name='exact-native-pull-cuda-qualification')
 
 
 def heatsoak(seconds):

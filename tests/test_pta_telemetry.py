@@ -22,10 +22,10 @@ def test_parent_stages_record_calls_and_errors_without_starting_sampler(monkeypa
     monkeypatch.setattr(runtime, 'initialize_runtime_observability',
                         mock.Mock(side_effect=AssertionError('unexpected initialization')))
     with pytest.raises(ValueError, match='No image sequence'):
-        pta.load_image_sequence_to_memory([], warnings=pta.WarningLog(), workers=1)
+        pta.load_image_sequence_to_memory([], warnings=pta_workers.WarningLog(), workers=1)
     pta.apply_gaussian_smoothing(np.zeros((2, 2, 2), dtype=np.uint8),
-                                 sigma=0, passes=0, warnings=pta.WarningLog())
-    pta.drain_render_results(mock.Mock(), {}, until=lambda: True)
+                                 sigma=0, passes=0, warnings=pta_workers.WarningLog())
+    pta_workers.drain_render_results(mock.Mock(), {}, until=lambda: True)
     assert telemetry.phase_calls['pta.input.decode_sequence'] == 1
     assert telemetry.counters['pta.input.decode_sequence.errors'] == 1
     assert telemetry.phase_calls['pta.prepare.gaussian'] == 1
@@ -134,11 +134,11 @@ def test_representative_f3_training_workload_counts_without_rendering(monkeypatc
         augmented_foregrounds={}, require_augmented_foregrounds=False)
     assert len(originals) == 14
     assert len(versions) == 70  # Ratio includes originals: four extra versions each.
-    tasks = pta.build_phase_render_tasks(plans, versions, aug_chunk=4, gpu_batch_size=24)
+    tasks = pta_workers.build_phase_render_tasks(plans, versions, gpu_batch_size=24)
     assert len(tasks) == 1
     assert len(tasks[0].frames) == 1  # A 70-candidate source frame remains atomic.
     plane = np.broadcast_to(np.uint8(0), (2048, 2048))
-    work = [pta._GpuItemWork(candidates, plane, plane, (2048, 2048), 'gray', item_key)
+    work = [pta_workers._GpuItemWork(candidates, plane, plane, (2048, 2048), 'gray', item_key)
             for item_key, candidates in tasks[0].frames[0].items]
     counts = [sum(len(item.candidates) for item in batch)
               for batch in iter_compatible_work_batches(work, candidate_limit=24)]

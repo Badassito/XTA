@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
+from .file_hashing import sha256_file as _sha256
 import numpy as np
 
 
@@ -176,14 +177,6 @@ def _register_sam_scheduler_sample(tracker):
         # Optional diagnostics cannot change tracker success or resource ownership.
         with _LIVE_SAM_TRACKERS_LOCK:
             _LIVE_SAM_TRACKERS.discard(tracker)
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _integer(value: object, name: str) -> int:

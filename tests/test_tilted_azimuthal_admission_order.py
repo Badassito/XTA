@@ -3,6 +3,7 @@ import numpy as np
 import pytest
 
 from XTA import geometry as g, backprojection as bp, projection_coverage_cpu as cpu
+from XTA import azimuthal_trajectory_cpu as trajectory
 
 
 @pytest.fixture(autouse=True)
@@ -32,6 +33,7 @@ def test_public_rejects_before_building_trajectory(tmp_path, monkeypatch, diamet
     def forbidden(*args, **kwargs):
         raise AssertionError('trajectory built before admission')
     monkeypatch.setattr(bp, 'build_azimuthal_backprojection_plan', forbidden)
+    monkeypatch.setattr(trajectory, 'azimuthal_backprojection_arrays', forbidden)
     callbacks = []
     path = tmp_path / 'unused.raw'
     with pytest.raises(cpu.NativePullPlanUnavailable, match='initializer geometry'):
@@ -54,12 +56,17 @@ def test_public_matches_compiled_core_outputs_and_callback_order(tmp_path, monke
     def callback(target):
         return lambda first, value: target.append((first, value.copy()))
     build_counts = []
-    real_build = bp.build_azimuthal_backprojection_plan
+    real_build = trajectory.azimuthal_backprojection_arrays
     def build(view):
-        plan, stats = real_build(view)
-        build_counts.append(len(plan))
-        return plan, stats
-    monkeypatch.setattr(bp, 'build_azimuthal_backprojection_plan', build)
+        arrays = real_build(view)
+        build_counts.append(len(arrays[0]))
+        return arrays
+    def forbidden_legacy_build(*args, **kwargs):
+        raise AssertionError('native pull built a logging-only legacy trajectory')
+    # The compiled core owns numeric angular arrays, not the legacy dataclass
+    # trajectory used by other Azimuthal routes or diagnostic logging.
+    monkeypatch.setattr(trajectory, 'azimuthal_backprojection_arrays', build)
+    monkeypatch.setattr(bp, 'build_azimuthal_backprojection_plan', forbidden_legacy_build)
     bp.backproject_azimuthal_volume_to_volume(source, view, tmp_path/'public.raw', 'public',
         out_shape_tyx=work, workers=2, sink_only=True,
         projection_block_callback=callback(public_planes))

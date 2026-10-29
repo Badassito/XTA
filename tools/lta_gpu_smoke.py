@@ -34,7 +34,6 @@ from XTA.lta_sam import (
     PINNED_SAM_VERSION,
     SamPromptBox,
     SamSessionPlan,
-    _canonical_sam_package_fingerprint as _shared_sam_package_fingerprint,
     build_local_sam_predictor,
     configure_constrained_gpu_batches,
     install_sdpa_fallback,
@@ -42,6 +41,9 @@ from XTA.lta_sam import (
     resolve_local_sam_bundle,
     resolve_pinned_sam_runtime_provenance as _shared_sam_runtime_provenance,
     run_video_session,
+)
+from XTA.sam_sdk_compat import (
+    _canonical_sam_package_fingerprint as _shared_sam_package_fingerprint,
 )
 
 

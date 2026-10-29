@@ -8,27 +8,16 @@ actually requested so CLI/help imports remain lightweight.
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
+from .file_hashing import sha256_file as _sha256_file
 from .json_publication import write_json_atomic
 
 
 LTA_MANIFEST_SCHEMA = "xta.lta.manifest/1"
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 @dataclass(frozen=True)

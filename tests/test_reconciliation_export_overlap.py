@@ -18,7 +18,7 @@ from unittest import mock
 import numpy as np
 import pytest
 
-from XTA import outputs, reconciliation_runtime as runtime
+from XTA import outputs, nrrd_compression, reconciliation_runtime as runtime
 from XTA.interpolation import CVOL_FORMAT, NrrdLayerRef, write_raw_bbox_mask_store
 from XTA.reconciliation_policy import load_reconciliation_policy, resolve_reconciliation
 
@@ -31,7 +31,7 @@ def component(tmp_path, monkeypatch):
                  int(y.max() - y.min() + 1)) if len(x) else (0, 0, 0, 0))
     monkeypatch.setattr('XTA.interpolation.cv2.boundingRect', bbox)
     # Keep this CPU test independent of optional codec discovery and global probes.
-    monkeypatch.setattr(outputs, '_require_nrrd_member_codec',
+    monkeypatch.setattr(nrrd_compression, '_require_nrrd_member_codec',
                         lambda **kwargs: ('zlib', 1, lambda data: gzip.compress(data, mtime=0)))
     monkeypatch.setenv('YOLO_TTA_NRRD_LAYER_ZSHARDS', '1')
     array = np.zeros((3, 5, 7), np.uint8)

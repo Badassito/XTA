@@ -1,4 +1,5 @@
 """Tail publication and voting remain separate from paired bridge receipts."""
+from XTA import tta_prepare_planning
 import json
 import contextlib
 from types import SimpleNamespace
@@ -293,7 +294,7 @@ def test_shared_context_real_render_planner_evidence_and_publication_without_gpu
 def test_extrapolation_only_parent_memory_preflight_matches_actual_reservation():
     view = geometry.get_view_infos(5, 12, 13, cartesian_views=('transverse',))[0]
     task = dict(kind='fullframe', processing_shape=(5, 12, 13), view=view)
-    with mock.patch.object(pipeline, '_parent_confidence_capture_plan', return_value=None):
+    with mock.patch.object(tta_prepare_planning, '_parent_confidence_capture_plan', return_value=None):
         expected = pipeline._parent_prepare_transient_bytes(view, 5*12*13, 5*12*13,
             interpolation_enabled=True)
         assert pipeline._policy_parent_prepare_transient_bytes([task], 5*12*13, 1,

@@ -30,7 +30,11 @@ class ConfidenceEvidenceTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.addCleanup(configure_confidence_evidence, None, enabled=False)
-        self.addCleanup(assembly.set_final_source_output_shape, None)
+        source_shape = assembly.final_source_output_shape()
+        self.addCleanup(assembly.set_final_source_output_shape, source_shape)
+        # These fixtures use their view's native grid, independent of a prior
+        # pipeline test's final source dimensions.
+        assembly.set_final_source_output_shape(None)
         disabled = mock.patch.dict('os.environ', {
             'YOLO_TTA_GPU_AZIMUTHAL_BACKPROJECT': '0',
             'YOLO_TTA_GPU_RADIAL_BACKPROJECT': '0',
@@ -45,9 +49,6 @@ class ConfidenceEvidenceTests(unittest.TestCase):
         no_gpu = mock.patch('XTA.backprojection.gpu_backproject_enabled', return_value=False)
         no_gpu.start()
         self.addCleanup(no_gpu.stop)
-        no_tilt_gpu = mock.patch('XTA.backprojection._try_tilted_azimuthal_cuda_stage', return_value=None)
-        no_tilt_gpu.start()
-        self.addCleanup(no_tilt_gpu.stop)
 
     def test_sparse_round_trip_and_known_support(self):
         values = np.zeros((5, 7, 9), dtype=np.uint8)
@@ -84,6 +85,7 @@ class ConfidenceEvidenceTests(unittest.TestCase):
         scores[1, 0, 0] = 231  # removed prediction must not retain confidence
         ref = capture_prediction_confidence(mask, scores, view=view, model_name='m', temp_dir=self.root)
         np.testing.assert_array_equal(mask, before)
+        self.assertEqual(ref.shape, mask.shape)
         actual, known = ref.read(0, 3)
         self.assertEqual(int(actual[1, 1, 1]), 173)
         self.assertFalse(known[1, 2, 2])

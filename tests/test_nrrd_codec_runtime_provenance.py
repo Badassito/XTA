@@ -5,7 +5,7 @@ import sys
 from types import SimpleNamespace
 from unittest import mock
 
-from XTA import outputs
+from XTA import nrrd_compression
 
 
 def test_deflate_and_isal_distribution_identity():
@@ -14,10 +14,10 @@ def test_deflate_and_isal_distribution_identity():
         'isal': SimpleNamespace(__file__='/task/deps/isal/__init__.py', __version__='1.7.2'),
     }
     versions = {'deflate': '0.9.0', 'isal': '1.7.2'}
-    with mock.patch.object(outputs.importlib, 'import_module', side_effect=modules.__getitem__), \
-            mock.patch.object(outputs.importlib_metadata, 'version', side_effect=versions.__getitem__):
-        deflate = outputs._nrrd_codec_runtime_provenance('libdeflate')
-        isal = outputs._nrrd_codec_runtime_provenance('isal')
+    with mock.patch.object(nrrd_compression.importlib, 'import_module', side_effect=modules.__getitem__), \
+            mock.patch.object(nrrd_compression.importlib_metadata, 'version', side_effect=versions.__getitem__):
+        deflate = nrrd_compression._nrrd_codec_runtime_provenance('libdeflate')
+        isal = nrrd_compression._nrrd_codec_runtime_provenance('isal')
     assert deflate['python_version'] == sys.version.split()[0]
     assert deflate['codec_distribution'] == 'deflate'
     assert deflate['codec_distribution_version'] == '0.9.0'
@@ -30,9 +30,9 @@ def test_deflate_and_isal_distribution_identity():
 
 def test_zlib_records_runtime_version_without_distribution_lookup():
     module = SimpleNamespace(__file__='/python/zlib.so', ZLIB_RUNTIME_VERSION='1.3.1')
-    with mock.patch.object(outputs.importlib, 'import_module', return_value=module), \
-            mock.patch.object(outputs.importlib_metadata, 'version') as version:
-        provenance = outputs._nrrd_codec_runtime_provenance('zlib')
+    with mock.patch.object(nrrd_compression.importlib, 'import_module', return_value=module), \
+            mock.patch.object(nrrd_compression.importlib_metadata, 'version') as version:
+        provenance = nrrd_compression._nrrd_codec_runtime_provenance('zlib')
     assert provenance['codec_runtime_version'] == '1.3.1'
     assert provenance['codec_module_path'] == '/python/zlib.so'
     assert provenance['codec_distribution_version'] is None
@@ -40,9 +40,9 @@ def test_zlib_records_runtime_version_without_distribution_lookup():
 
 
 def test_missing_optional_metadata_does_not_fail_or_warn():
-    with mock.patch.object(outputs.importlib, 'import_module', side_effect=ImportError), \
-            mock.patch.object(outputs.importlib_metadata, 'version', side_effect=LookupError):
-        provenance = outputs._nrrd_codec_runtime_provenance('libdeflate')
+    with mock.patch.object(nrrd_compression.importlib, 'import_module', side_effect=ImportError), \
+            mock.patch.object(nrrd_compression.importlib_metadata, 'version', side_effect=LookupError):
+        provenance = nrrd_compression._nrrd_codec_runtime_provenance('libdeflate')
     assert provenance['codec_module_path'] is None
     assert provenance['codec_distribution_version'] is None
     assert provenance['codec_runtime_version'] is None
@@ -52,13 +52,13 @@ def test_announcement_prints_and_records_provenance_once(capsys):
     gauges = []
     telemetry = SimpleNamespace(gauge=lambda name, value: gauges.append((name, value)))
     provenance = {'python_version': '3.12.14', 'codec_distribution_version': '0.9.0'}
-    with mock.patch.object(outputs, '_NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED', False), \
-            mock.patch.object(outputs, '_nrrd_codec_runtime_provenance', return_value=provenance), \
-            mock.patch.object(outputs, 'runtime_telemetry', return_value=telemetry), \
-            mock.patch.object(outputs, 'nrrd_member_codec_requested', return_value='libdeflate'):
+    with mock.patch.object(nrrd_compression, '_NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED', False), \
+            mock.patch.object(nrrd_compression, '_nrrd_codec_runtime_provenance', return_value=provenance), \
+            mock.patch.object(nrrd_compression, 'runtime_telemetry', return_value=telemetry), \
+            mock.patch.object(nrrd_compression, 'nrrd_member_codec_requested', return_value='libdeflate'):
         codec = ('libdeflate', 3, lambda payload: payload)
-        outputs._announce_nrrd_cpu_deflate_backend('member-parallel gzip', codec_spec=codec)
-        outputs._announce_nrrd_cpu_deflate_backend('member-parallel gzip', codec_spec=codec)
+        nrrd_compression._announce_nrrd_cpu_deflate_backend('member-parallel gzip', codec_spec=codec)
+        nrrd_compression._announce_nrrd_cpu_deflate_backend('member-parallel gzip', codec_spec=codec)
     printed = capsys.readouterr().out
     assert printed.count('NRRD DEFLATE runtime provenance:') == 1
     assert ('nrrd.compression.runtime_provenance', provenance) in gauges

@@ -15,6 +15,61 @@ from xta_native_sparse import SparseLabels, run_evidence, sparse_label_stream
 
 
 class TestSparseNative(unittest.TestCase):
+    def test_empty_slab_breaks_connectivity_including_clipped_empty_slabs(self):
+        shape = (5, 7, 9)
+        expected = np.zeros(shape, np.uint8)
+        expected[:2, 3, 4] = 1
+        expected[3:, 3, 4] = 1
+        brute_labels, brute_components = ndi.label(expected, structure=nf.FACE)
+        brute_counts = np.bincount(brute_labels.ravel())[1:]
+        for clipped_empty in (False, True):
+            source = expected.copy()
+            clip = None
+            if clipped_empty:
+                source[2, 3, 4] = 1
+                clip = np.ones(shape, np.uint8)
+                clip[2] = 0
+            observed = []
+            with self.subTest(clipped_empty=clipped_empty), SparseLabels(shape) as sparse:
+                roots, counts, flags, input_n, clipped_n = sparse_label_stream(
+                    nf.array_slabs(source, 1), sparse, maximum=100,
+                    clip=clip, observer=lambda z, block: observed.append(z))
+                self.assertEqual(input_n, np.count_nonzero(source))
+                self.assertEqual(clipped_n, np.count_nonzero(expected))
+                self.assertEqual(np.count_nonzero(counts), brute_components)
+                np.testing.assert_array_equal(np.sort(counts[counts != 0]), np.sort(brute_counts))
+                labels = roots[sparse.region(tuple(slice(0, n) for n in shape))]
+                np.testing.assert_array_equal(labels != 0, expected != 0)
+                self.assertEqual(labels[0, 3, 4], labels[1, 3, 4])
+                self.assertEqual(labels[3, 3, 4], labels[4, 3, 4])
+                self.assertNotEqual(labels[1, 3, 4], labels[3, 3, 4])
+                self.assertEqual(observed, list(range(shape[0])))
+
+    def test_readonly_source_views_match_dense_with_and_without_clipping(self):
+        rng = np.random.default_rng(1703)
+        source = (rng.random((9, 15, 22)) < .22).astype(np.uint8)
+        source[:, 5:8, 7:12] = 1
+        clip = (rng.random((9, 15, 11)) > .2).astype(np.uint8)
+        # The strided view also checks that scipy receives a valid borrowed
+        # noncontiguous source when no private clipping buffer is needed.
+        for dtype in (np.uint8, np.bool_, np.int16):
+            a = source.astype(dtype)[:, :, ::2]
+            before = a.copy()
+            a.flags.writeable = False
+            for depth in (1, 4, 20):
+                for clipping in (None, clip):
+                    with self.subTest(dtype=dtype, depth=depth, clipped=clipping is not None):
+                        with SparseLabels(a.shape) as sparse:
+                            dense = np.zeros(a.shape, np.int32)
+                            kwargs = dict(maximum=100_000, clip=clipping)
+                            reference = nf.label_stream(nf.array_slabs(a, depth), dense, **kwargs)
+                            result = sparse_label_stream(nf.array_slabs(a, depth), sparse, **kwargs)
+                            for expected, actual in zip(reference, result):
+                                np.testing.assert_array_equal(actual, expected)
+                            np.testing.assert_array_equal(
+                                sparse.region(tuple(slice(0, n) for n in a.shape)), dense)
+                            np.testing.assert_array_equal(a, before)
+
     def test_random_dense_parity_with_evidence_and_clipping(self):
         rng = np.random.default_rng(351)
         for case in range(12):

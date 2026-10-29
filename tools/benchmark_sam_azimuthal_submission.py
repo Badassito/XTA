@@ -65,7 +65,7 @@ def run(args):
         # Pytest skip markers are evaluated when the renderer helper is first imported.
         os.environ['XTA_RUN_CUDA_RENDER_INTEGRATION'] = '1'
     sys.path.insert(0, str(ROOT))
-    from tools.qualify_release import gpu_reservation
+    from tools.gpu_reservation import gpu_reservation
     lock = ROOT.parent / 'Scratch/Temp/GPU_LOCK'
 
     def save(value):

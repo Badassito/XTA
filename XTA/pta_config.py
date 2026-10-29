@@ -288,7 +288,9 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         "--imgsz",
         default=0,
         type=int,
-        help="Square emitted raster size; 0 preserves the native view size",
+        help=("Square emitted raster size; CPR directly samples a same-sized patch at one "
+              "processing voxel per pixel. 0 preserves native view size; for CPR, "
+              "0 uses the largest processing-volume dimension"),
     )
     parser.add_argument(
         "--output_format",

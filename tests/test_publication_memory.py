@@ -29,7 +29,7 @@ def _cache_export_volumes():
 
 def _verify_concurrent_cached_exports(root, volumes):
     """Hold multiple cached layers through the real native/mirror NRRD writers."""
-    from XTA import outputs
+    from XTA import outputs, nrrd_compression
     refs = [interpolation.NrrdLayerRef(key=f'layer{i}', name=f'layer{i}', path=root/f'store{i}',
                 shape=a.shape, storage_format=INTERNAL_PACKED_CVOL_FORMAT)
             for i,a in enumerate(volumes)]
@@ -44,8 +44,8 @@ def _verify_concurrent_cached_exports(root, volumes):
         np.testing.assert_array_equal(np.frombuffer(result[0], np.uint8).reshape(volumes[i].shape), volumes[i])
         return result
     def software_writer(fh, **kwargs):
-        return outputs._MemberParallelGzipPayloadWriter(fh, codec_spec=('zlib',1,gzip.compress))
-    with mock.patch.object(outputs, '_open_nrrd_payload_writer', side_effect=software_writer):
+        return nrrd_compression._MemberParallelGzipPayloadWriter(fh, codec_spec=('zlib',1,gzip.compress))
+    with mock.patch.object(nrrd_compression, '_open_nrrd_payload_writer', side_effect=software_writer):
         # Independent uncached reads establish both native and mirror oracles.
         with mock.patch.object(outputs, '_open_nrrd_layer_ref',
                 side_effect=lambda ref: RawBBoxMaskStore.open(ref.path, mmap_payload=True)):

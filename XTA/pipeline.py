@@ -40,7 +40,7 @@ from typing import (
 )
 import numpy as np
 from ._deps import cv2
-from .cylindrical_owner import RADIAL_OWNER_CONTRACT, radial_owner_eligible, radial_runtime_provenance
+from .cylindrical_owner import RADIAL_OWNER_CONTRACT, radial_owner_eligible
 from .publication_memory import (
     native_fullframe_dense_reserve, plan_native_publication_memory, publication_output_reserve,
     policy_parent_memory_plan, policy_cpu_worker_buffer_plan, publication_ram_headroom,
@@ -315,6 +315,11 @@ from .backprojection import (
     _set_main_process_gpu_stage_wake_callback,
     fused_angle_variant_azimuthal_component_layer_enabled,
 )
+from .nrrd_compression import (
+    nrrd_member_gzip_window_bytes,
+    nrrd_gzip_chunk_bytes,
+    shutdown_nrrd_gzip_executors,
+)
 from .outputs import (
     BackgroundOutputManager,
     BackgroundOutputSubmission,
@@ -326,11 +331,8 @@ from .outputs import (
     nrrd_layer_output_suffix,
     nrrd_layer_sink,
     nrrd_layer_sink_workers,
-    nrrd_member_gzip_window_bytes,
-    nrrd_gzip_chunk_bytes,
     resolve_low_quality_downbin_specs,
     set_nrrd_layer_sink,
-    shutdown_nrrd_gzip_executors,
     publish_canonical_render_images,
     write_summary_file,
 )
@@ -398,6 +400,15 @@ from .unification.tta_manifest import (
     capture_tta_artifact_identities,
 )
 from .startup_io import capture_and_probe_tta_startup
+from .tta_prepare_planning import (
+    PARENT_CONFIDENCE_CAPTURE_WORKSPACE_BYTES,
+    _parent_confidence_capture_plan,
+    _prepare_parent_with_confidence_capture,
+    _parent_prepare_transient_bytes,
+    _policy_parent_prepare_transient_bytes,
+    _cpu_input_prefetch_policy,
+)
+from .tta_provenance import _execution_runtime_provenance
 from .tta_lifecycle import (
     PipelineRunResources as _PipelineRunResources,
     cleanup_tta_selected_run_scratch as _cleanup_tta_selected_run_scratch_impl,
@@ -509,216 +520,6 @@ def _scheduler_wait_activity_summary(parent_futures, projection_gauges):
     return dict(parent_prepares=counts, active_native_projections=len(live), oldest_native_projections=live[:3],
                 active_native_preparations=len(preparing), oldest_native_preparations=preparing[:3],
                 active_native_source_packs=len(packing), oldest_native_source_packs=packing[:3])
-
-
-PARENT_CONFIDENCE_CAPTURE_WORKSPACE_BYTES = 256 * 1024**2
-
-
-def _parent_confidence_capture_plan(shape, workers, *, enabled):
-    """Resolve bounded capture scratch before its parent admission is requested."""
-    if not enabled:
-        return None
-    from .confidence_evidence import plan_confidence_capture
-    from .native_pull_scheduling import get_native_pull_scheduler
-    scheduler = get_native_pull_scheduler()
-    if scheduler is not None:
-        # This is a memory window, charged before parent admission, rather than
-        # a private CPU allocation. Actual capture jobs share the run scheduler
-        # with native projection. A queued parent must not freeze this to its
-        # executor's one-slice cleanup budget, nor upgrade it after admission.
-        workers = scheduler.max_workers
-    return plan_confidence_capture(tuple(int(v) for v in shape), int(workers),
-        workspace_bytes=PARENT_CONFIDENCE_CAPTURE_WORKSPACE_BYTES)
-
-
-def _prepare_parent_with_confidence_capture(prepare, *, capture_plan, **kwargs):
-    """Enter capture's CPU budget inside AdmittedViewPrepare's live reservation."""
-    if capture_plan is None:
-        return prepare(**kwargs)
-    from .confidence_evidence import confidence_capture_resources
-    with confidence_capture_resources(capture_plan):
-        return prepare(**kwargs)
-
-
-def _parent_prepare_transient_bytes(view, processing_bytes, source_bytes, *,
-                                   interpolation_enabled, confidence_workspace_bytes=0,
-                                   packed_native_source=False, native_shape=None,
-                                   source_shape=None, cleanup_workers=1,
-                                   cleanup_is_simple=False):
-    """Use one estimate for actual reservations and policy pre-dispatch planning."""
-    if packed_native_source and not interpolation_enabled and cleanup_is_simple:
-        from .interpolation import CTILE_INDEX_DTYPE
-        from .packed_dense_source import DENSE_PACKED_PAYLOAD_BYTES, DENSE_PACKED_CONTROL_BYTES
-        from .workspace import _env_int
-        native = tuple(int(value) for value in native_shape or ())
-        output = tuple(int(value) for value in source_shape or ())
-        if (len(native) != 3 or len(output) != 3 or min((*native, *output)) <= 0
-                or math.prod(native) != int(processing_bytes)
-                or math.prod(output) != int(source_bytes)):
-            raise ValueError('Packed parent transient admission requires its actual native/source shapes')
-        mib = 1024**2
-        # The dense input remains charged to its existing lease while packing.
-        # Charge the complete worst-case cropped row-bit payload during that
-        # overlap, including padding at the end of EVERY row, not just the file.
-        packed = native[0] * native[1] * ((native[2] + 7) // 8)
-        records = 4 * (native[0] + output[0]) * int(CTILE_INDEX_DTYPE.itemsize)
-        states = native[0] + output[0]
-        # These are the same configured caps enforced by the encoded projector;
-        # large user overrides cannot silently retain the default admission.
-        plan = max(1, _env_int('YOLO_TTA_NATIVE_PULL_PLAN_MIB', 64)) * mib
-        workers = max(1, _env_int('YOLO_TTA_NATIVE_PULL_WORKSPACE_MIB', 256)) * mib
-        # Only precleaned/zero-threshold masks qualify for this estimate. Their
-        # remaining per-slice work is OpenCV u8/int32/boolean hole filling or
-        # SciPy boolean hole filling, with no EDT/radius/confidence filtering.
-        # Keep a conservative 32 B/pixel per active cleanup reader, and include
-        # the unpacked device row metadata that can coexist with publication.
-        cleanup = 32 * native[1] * native[2] * max(1, min(int(cleanup_workers), native[0]))
-        metadata = native[0] * native[1]
-        # Row codecs normalize bounded slabs; an exceptionally wide single row
-        # can exceed their usual 1 MiB target and must still be charged.
-        row_codec = 6 * (max(mib, native[2]) + max(mib, output[2]))
-        # The terminal encoder borrows the dense mask but owns one bounded
-        # packed batch (at most 64 slices), including metadata and offsets.
-        source_pack = DENSE_PACKED_PAYLOAD_BYTES + DENSE_PACKED_CONTROL_BYTES
-        return (max(2 * GIB, cleanup) + packed + records + states + plan + workers
-                + metadata + row_codec + source_pack + int(confidence_workspace_bytes))
-    name = str(view.name).lower()
-    transient = 2 * GIB
-    if 'tilted' in name:
-        transient = int(source_bytes) + 4 * GIB
-    elif interpolation_enabled:
-        transient = 2 * int(processing_bytes) + 4 * GIB
-    return transient + int(confidence_workspace_bytes)
-
-
-def _policy_parent_prepare_transient_bytes(tasks, source_bytes, workers, *,
-                                          interpolation_distance, retain_confidence,
-                                          extrapolation_distance=0, sam_image_phase_bytes=0):
-    """Charge the same capture scratch before policy parent dispatch begins."""
-    largest = 2 * GIB
-    plans = {}
-    for task in tasks:
-        if str(task['kind']) != 'fullframe':
-            continue
-        shape = tuple(int(v) for v in task['processing_shape'])
-        enabled = bool(retain_confidence) and 'd1_output_shape' not in task
-        key = (shape, enabled)
-        if key not in plans:
-            plans[key] = _parent_confidence_capture_plan(shape, workers, enabled=enabled)
-        plan = plans[key]
-        workspace = 0 if plan is None else int(plan.workspace_bytes)
-        interpolates = (int(extrapolation_distance) > 0 or
-            _view_uses_interpolation(task['view'], int(interpolation_distance)))
-        transient = _parent_prepare_transient_bytes(task['view'], math.prod(shape),
-            source_bytes, interpolation_enabled=interpolates, confidence_workspace_bytes=workspace)
-        if sam_image_phase_bytes and (int(extrapolation_distance) > 0 or int(interpolation_distance) > 0):
-            from .sam_resources import sam_parent_image_reservation_bytes
-            transient += sam_parent_image_reservation_bytes(transient,
-                4*GIB if interpolates else 0, sam_image_phase_bytes)
-        largest = max(largest, transient)
-    return largest
-
-
-def _cpu_input_prefetch_policy(gpu_worker_count: int, worker_budget: int) -> Dict[str, int]:
-    """Bound optional CPU lookahead independently of its RAM grant/executor."""
-    devices, budget = max(1, int(gpu_worker_count)), max(1, int(worker_budget))
-    def positive_override(name, default):
-        value = os.environ.get(name)
-        if value is None:
-            return default
-        try:
-            parsed = int(value)
-        except (TypeError, ValueError):
-            raise ValueError(f'{name} must be a positive integer') from None
-        if parsed < 1:
-            raise ValueError(f'{name} must be a positive integer')
-        return parsed
-    return dict(max_builders=min(budget, positive_override('YOLO_TTA_CPU_INPUT_BUILDERS', devices)),
-                max_packets=positive_override('YOLO_TTA_CPU_INPUT_PACKETS', 2 * devices))
-
-
-def _execution_runtime_provenance() -> Dict[str, object]:
-    """Include nonlinear geometry and scheduling sources in the run receipt."""
-    import hashlib
-    from .geometry_quality import geometry_quality_request_record
-    from .cuda_backend import native_trt_ring_enabled, native_trt_ring_mode
-    from .workspace import _env_flag
-
-    result = radial_runtime_provenance()
-    sources = {}
-    package = Path(__file__).resolve().parent
-    for name in ('geometry', 'cylindrical_geometry', 'spherical_sampling', 'azimuthal_coverage',
-                 'unification.runtime', 'qsc', 'spherical_geometry', 'spherical_cuda', 'spherical_sampling_cuda',
-                 'cuda_backend', 'runtime', 'startup_io', 'spherical_projection',
-                 'spherical_projection_bounds', 'spherical_projection_cuda',
-                 'spherical_preflight', 'spherical_projection_cpu', 'geometry_quality',
-                 'unification.sampling', 'cylindrical_cuda_projection',
-                 'tilted_azimuthal_projection', 'tilted_azimuthal_projection_cuda',
-                 'tta_scheduler', 'backprojection', 'd1_orthogonal_coverage',
-                 'projection_coverage', 'projection_coverage_cpu', 'azimuthal_trajectory_cpu',
-                 'sparse_projection', 'sparse_bounds_cpu', 'publication_memory',
-                 'native_pull_scheduling', 'native_pull_cuda', 'native_encoded_cuda', 'packed_tilted_projection',
-                 'packed_dense_source',
-                 'confidence_evidence', 'confidence_storage',
-                 'confidence_capture', 'confidence_capture_cpu', 'confidence_native_codec', 'confidence_orchestration',
-                 'confidence_storage', 'confidence_publication'):
-        path = package.joinpath(*name.split('.')).with_suffix('.py')
-        entry = {'path': str(path), 'loaded_in_parent': 'XTA.' + name in sys.modules}
-        try:
-            entry['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError as exc:
-            entry.update(sha256=None, read_error=type(exc).__name__)
-        sources[name] = entry
-    result['spherical_sources'] = sources
-    # A package version can describe several development snapshots. Retain the
-    # actual SAM preparation/publication bytes for next-run timing attribution
-    # without importing optional model runtimes merely to fingerprint them.
-    for name in ('assembly', 'view_prepare', 'projection_queue', 'reconciliation_runtime', 'sam_integration',
-                 'sam_sparse_shell_projection', 'sam_bridge_planning',
-                 'sam_observation_masks', 'sam_interpolation_contracts',
-                 'sam_extrapolation_planning', 'sam_gpu_rendering', 'sam_azimuthal_batch', 'workspace', 'sam_retry_attempt_bounds',
-                 'sam_interpolation', 'sam_extrapolation', 'sam_extrapolation_policy', 'sam_retry_groups',
-                 'sam_tracker_runtime', 'sam_device_pool', 'sam_resources', 'sam_image_prefetch', 'sam_crop_retry',
-                 'sam_parent_staging', 'tta_background', 'detector_workspaces', 'yolo_cpu_input', 'gray_cache', 'sam_yolo_capture', 'sam_view_geometry',
-                 'sam_policy', 'sam_mask_reader', 'sam_planning_outcomes',
-                 'sam_branch_selection', 'sam_evidence', 'sam_canvas_rendering', 'tta_outputs'):
-        path = package / (name + '.py')
-        entry = {'path': str(path), 'loaded_in_parent': 'XTA.' + name in sys.modules}
-        try:
-            entry['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError as exc:
-            entry.update(sha256=None, read_error=type(exc).__name__)
-        result['modules'][name] = entry
-    result['geometry_quality_requests'] = geometry_quality_request_record()
-    result['native_trt_ring_requested'] = native_trt_ring_enabled()
-    result['native_trt_ring_mode'] = native_trt_ring_mode()
-    result['task_trace_requested'] = _env_flag('YOLO_TTA_TASK_TRACE', False)
-    result['sam_gray_capture_requested'] = _env_flag('YOLO_TTA_SAM_GRAY_CACHE', True)
-    result['cpu_input_prefetch_requested'] = _env_flag('YOLO_TTA_CPU_INPUT_PREFETCH', True)
-    result['tilted_cpu_input_prefetch_requested'] = _env_flag('YOLO_TTA_CPU_INPUT_TILTED', False)
-    result['terminal_confidence_score_only_requested'] = _env_flag('YOLO_TTA_TERMINAL_SCORE_ONLY', True)
-    result['cpu_input_prefetch_policy_requests'] = dict(
-        default_builders_per_gpu=1, default_packets_per_gpu=2,
-        builders_override=os.environ.get('YOLO_TTA_CPU_INPUT_BUILDERS'),
-        packets_override=os.environ.get('YOLO_TTA_CPU_INPUT_PACKETS'))
-    result['cropped_upload_pipeline_requested'] = True
-    result['spherical_cpu_compact_requested'] = True
-    result['tilted_azimuthal_cuda_projection_requested'] = _env_flag(
-        'YOLO_TTA_GPU_TILTED_AZIMUTHAL_BACKPROJECT', True)
-    result['native_projection_requests'] = {
-        'packed_parent': _env_flag('YOLO_TTA_PACKED_PARENT', True),
-        'packed_parent_min_mib': max(0, _env_int('YOLO_TTA_PACKED_PARENT_MIN_MIB', 64)),
-        'exact_cuda': _env_flag('YOLO_TTA_NATIVE_PULL_CUDA', True),
-        'cuda_min_remaining_voxels': max(0, _env_int('YOLO_TTA_NATIVE_PULL_GPU_MIN_VOXELS', 64 * 1024**2)),
-        'shared_cpu_budget': True,
-    }
-    result['spherical_retirement_requests'] = {
-        'enabled': _env_flag('YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT', True),
-        'age_enabled': _env_flag('YOLO_TTA_GPU_SPHERICAL_AGE_RETIREMENT', True),
-        'continuous_wait_seconds': 30.0,
-    }
-    result['spherical_locality_requested'] = bool(_env_int('YOLO_TTA_GPU_SPHERICAL_LOCALITY', 1))
-    return result
 
 
 def _legacy_d1_model_supported(model_path: Optional[str]) -> bool:

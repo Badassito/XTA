@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 from scipy import ndimage as ndi
+from xta_native_io import gzip_backend, open_gzip_reader
 
 VERSION = '0.3.1'
 FORMAT = 'xta-slicer-edits-v1'
@@ -194,8 +195,8 @@ class Nrrd:
 @contextmanager
 def context_payload(raw, encoding):
     if encoding.lower() in ('gzip', 'gz'):
-        # GzipFile accepts XTA's concatenated gzip members and verifies their CRCs.
-        with gzip.GzipFile(fileobj=raw, mode='rb') as f:
+        # Both supported readers consume concatenated members and verify CRCs.
+        with open_gzip_reader(raw) as f:
             yield f
     else:
         yield raw
@@ -322,18 +323,31 @@ class PreviewSupportCheck:
     def observe(self, z, block):
         y0,y1 = self.y
         x0,x1 = self.x
+        occupied = False
         for offset, frame in enumerate(block):
-            if not np.any(frame):
+            rows = np.flatnonzero(np.any(frame, axis=1))
+            if not len(rows):
                 continue
-            columns = np.logical_or.reduceat(frame, x0, axis=1)
+            occupied = True
+            sparse_rows = len(rows) * 8 < frame.shape[0]
+            source = frame[rows] if sparse_rows else frame
+            columns = np.logical_or.reduceat(source, x0, axis=1)
             # Fractional cell boundaries include the first pixel of the next bin.
-            columns[:, self.x_overlap] |= frame[:, x1[self.x_overlap]-1] != 0
-            projected = np.logical_or.reduceat(columns, y0, axis=0)
-            projected[self.y_overlap] |= columns[y1[self.y_overlap]-1]
+            columns[:, self.x_overlap] |= source[:, x1[self.x_overlap]-1] != 0
+            if sparse_rows:
+                projected = np.zeros(self.original.shape[1:], dtype=bool)
+                # Only occupied native rows contribute. Both inverse endpoints
+                # preserve fractional overlap with adjacent preview cells.
+                for endpoints in self.indices[1]:
+                    np.logical_or.at(projected, endpoints[rows], columns)
+            else:
+                projected = np.logical_or.reduceat(columns, y0, axis=0)
+                projected[self.y_overlap] |= columns[y1[self.y_overlap]-1]
             zz = z + offset
             lo, hi = (int(a[zz]) for a in self.inverse)
             for target in range(lo,hi+1):
                 self.seen[target] |= projected
+        return occupied
 
     def observe_points(self, z, y, x):
         choices = [(lo[coordinates], hi[coordinates])
@@ -541,7 +555,7 @@ def run(args):
         raise ValueError('Object count, auto radius and ROI voxel limit must be positive.')
     if not 0 <= args.auto_max_keep_loss < 1 or not 0 < args.auto_min_remove_fraction <= 1:
         raise ValueError('Invalid auto evidence guard fractions.')
-    if args.conflicts == 'auto':
+    if args.conflicts == 'auto' and not getattr(args, 'validate_only', False):
         try:
             from skimage.segmentation import watershed
         except ImportError as exc:
@@ -593,17 +607,31 @@ def run(args):
                          + ', '.join(nonadditive) + '. Remove these from the Slicer working segmentation '
                          'and repeat its update steps, or explicitly use --allow-nonadditive to reproduce '
                          'the literal toolbar union of the exported layers.')
+    union_sources = None
+    receipt, pairs = getattr(args, 'union_receipt', None), getattr(args, 'union_source_pairs', None)
+    if bool(receipt) != bool(pairs):
+        raise ValueError('--union-receipt and --union-source-pairs must be supplied together.')
+    if receipt:
+        from xta_native_union import UnionSources
+        union_sources = UnionSources(receipt, pairs, low_shape, full_shape,
+                                     low_path, full_path, edits, global_edit)
     output = Path(args.output).resolve()
     ensure_disjoint(output, [bundle_dir, low_path.parent, full_path.parent])
+    if union_sources is not None:
+        ensure_disjoint(output, [p['paths'][kind].parent for p in union_sources.pairs
+                                 for kind in ('low', 'full')])
+        if union_sources.reference_dir is not None:
+            ensure_disjoint(output, [union_sources.reference_dir])
     if output.exists():
         raise ValueError('Output must be a NEW directory. Nothing will be overwritten.')
     depth = max(1, min(64, int(args.block_mib * MIB // (32 * full_shape[1] * full_shape[2]))))
     size = math.prod(full_shape)
     scratch_root = Path(args.scratch).resolve() if args.scratch else output.parent
     scratch_root.mkdir(parents=True, exist_ok=True)
-    # Two shared uint8 rasters; component labels are sparse foreground runs.
-    required = 2 * size + 256 * MIB
-    if shutil.disk_usage(scratch_root).free < required:
+    # Two shared uint8 rasters plus packed per-source Globals for mixed-source recovery.
+    global_cache_bytes = union_sources.native_global_cache_bytes if union_sources is not None else 0
+    required = 2 * size + global_cache_bytes + 256 * MIB
+    if not getattr(args, 'validate_only', False) and shutil.disk_usage(scratch_root).free < required:
         raise ValueError(f'Scratch needs at least {required / 1024**3:.2f} GiB free (plus output storage).')
     output.mkdir(parents=True)
     report = {'tool_version': VERSION, 'status': 'in_progress',
@@ -612,6 +640,9 @@ def run(args):
               'full_manifest_sha256': digest(full_path), 'shape_tyx': list(full_shape),
               'preview_shape_tyx': list(low_shape), 'slab_depth': depth,
               'scratch_array_bytes': 2 * size, 'max_provisional_components': args.max_components,
+              'native_global_cache_bytes': global_cache_bytes,
+              'native_global_cache_encoding': 'row_packed_little_bitorder' if union_sources is not None else None,
+              'native_gzip_backend': gzip_backend(),
               'label_storage': 'foreground_runs', 'workers': args.workers,
               'worker_backend': 'process' if args.workers > 1 else 'thread',
               'union_write_policy': 'foreground_only_shared',
@@ -621,14 +652,24 @@ def run(args):
                                   'max_padded_roi_voxels': args.auto_max_roi_voxels,
                                   'max_keep_evidence_loss': args.auto_max_keep_loss,
                                   'min_remove_evidence_fraction': args.auto_min_remove_fraction,
-                                  'fallback': 'keep_and_report', 'uses_intensity': False},
+                                  'fallback': ('keep_and_report' if args.conflicts == 'keep' else
+                                               'stop_without_publication'),
+                                  'uses_intensity': False},
               'layers': [], 'warnings': [], 'source_full_sha256': {}}
+    if union_sources is not None:
+        report['source_union'] = union_sources.report()
+        report['source_full_unions'] = {}
+        report['warnings'].append('Mixed-source recovery uses the explicitly declared inventory-based '
+                                  'source identification; edited-member cryptographic ancestry is unavailable.')
     save_json(output / 'report.json', report)
     print(f'Native {full_shape}; preview {low_shape}; slabs {depth} plane(s).', flush=True)
-    print(f'Shared array scratch {2*size/1024**3:.2f} GiB, plus sparse runs/output; {args.workers} layer worker(s).', flush=True)
+    print(f'Native gzip reader: {report["native_gzip_backend"]}.', flush=True)
+    print(f'Shared array scratch {2*size/1024**3:.2f} GiB, packed source Globals '
+          f'{global_cache_bytes/1024**3:.2f} GiB, plus sparse runs/output; {args.workers} layer worker(s).', flush=True)
     try:
         result = execute(args, output, scratch_root, report, global_edit, layers, le, fe,
-                         low_path, full_path, bundle_dir, full_shape, low_shape, depth, support)
+                         low_path, full_path, bundle_dir, full_shape, low_shape, depth, support,
+                         union_sources=union_sources)
         return result
     except BaseException as exc:
         if report['status'] == 'in_progress':
@@ -648,7 +689,10 @@ def initialize_native_worker(context):
     initial = np.memmap(context['tmp']/'initial-global.dat', mode='r', dtype=np.uint8, shape=shape)
     context['clip'] = initial if context.pop('clip_nonempty') else None
     context['union'] = np.memmap(context['tmp']/'union.dat', mode='r+', dtype=np.uint8, shape=shape)
-    context['low_global'] = Nrrd(context.pop('low_global_path'), context['low_shape']).array()
+    low_global_path = context.pop('low_global_path')
+    sources = context.get('union_sources')
+    context['low_global'] = (sources.low(sources.global_name) if sources is not None else
+                             Nrrd(low_global_path, context['low_shape']).array())
     context['support'] = Support(shape, context['low_shape'])
     _native_worker_context = context
 
@@ -683,20 +727,21 @@ def native_executor(workers, context):
 
 def process_native_layer(i, entry, *, args, output, tmp, low_path, full_path,
                          bundle_dir, full_shape, low_shape, depth, support,
-                         low_global, clip, union, edited_global_empty):
+                         low_global, clip, union, edited_global_empty, union_sources=None):
     from xta_native_sparse import SparseLabels, sparse_label_stream
     started = time.perf_counter()
     print(f'Started [{i+1}] {entry["name"]}', flush=True)
     key = entry['source_filename']
     low_src = Nrrd(child(low_path.parent, key), low_shape)
-    original_low = low_src.array()
+    original_low = low_src.array() if union_sources is None else union_sources.low(entry['name'])
     after = load_edit(bundle_dir, entry, low_src)
     removed = (original_low != 0) & (after == 0)
-    if np.any(low_global):
+    if union_sources is None and np.any(low_global):
         removed &= low_global != 0
-    source_check = PreviewSupportCheck(full_shape, original_low)
-    native = Nrrd(child(full_path.parent, key), full_shape)
-    source_hash = digest(native.path)
+    native = (Nrrd(child(full_path.parent, key), full_shape) if union_sources is None else
+              union_sources.native(entry['name']))
+    source_check = PreviewSupportCheck(full_shape, original_low) if union_sources is None else native
+    source_hash = digest(native.path) if union_sources is None else native.descriptor()
     row = {'name': entry['name'], 'source_filename': key,
            'preview_removed_voxels': int(np.count_nonzero(removed)),
            'rejected_components': 0, 'rejected_voxels': 0,
@@ -790,10 +835,11 @@ def process_native_layer(i, entry, *, args, output, tmp, low_path, full_path,
 
 
 def execute(args, output, scratch_root, report, global_edit, layers, le, fe,
-            low_path, full_path, bundle_dir, full_shape, low_shape, depth, support):
+            low_path, full_path, bundle_dir, full_shape, low_shape, depth, support, union_sources=None):
     key = global_edit['source_filename']
     low_global_source = Nrrd(child(low_path.parent, key), low_shape)
-    low_global = low_global_source.array()
+    low_global = (low_global_source.array() if union_sources is None else
+                  union_sources.low(global_edit['name']))
     edited_global = load_edit(bundle_dir, global_edit, low_global_source)
     low_global_nonempty = bool(np.any(low_global))
     union_low = np.zeros(low_shape, np.uint8)
@@ -802,10 +848,12 @@ def execute(args, output, scratch_root, report, global_edit, layers, le, fe,
     low_union_lock = threading.Lock()
     def validate_low_layer(e):
         src = Nrrd(child(low_path.parent, e['source_filename']), low_shape)
-        before = src.array()
-        if low_global_nonempty:
+        before = src.array() if union_sources is None else union_sources.low(e['name'])
+        if union_sources is None and low_global_nonempty:
             before &= low_global
         after = load_edit(bundle_dir, e, src)
+        if union_sources is not None:
+            union_sources.verify_edit(e['name'], after, edited_global)
         if np.any((after != 0) & (before == 0)):
             raise ValueError(f'Edited {e["name"]} adds foreground, or initial Update Nonglobal '
                              'was not performed on this preview. Deletion-only transfer refused.')
@@ -813,6 +861,10 @@ def execute(args, output, scratch_root, report, global_edit, layers, le, fe,
             np.bitwise_or(union_low, after, out=union_low)
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         list(executor.map(validate_low_layer, layers))
+    if union_sources is not None and union_sources.reference_entries is not None:
+        report['source_union']['edit_reference_audit'] = union_sources.reference_audit
+        report['source_union']['reference_deleted_segment_voxels'] = sum(
+            row['deleted_voxels'] for row in union_sources.reference_audit.values())
     if not np.array_equal(union_low, edited_global):
         raise ValueError('Exported Global differs from the union of exported nonglobal segments. '
                          'Run Update Both in Slicer and export again; export ALL working segments.')
@@ -823,15 +875,29 @@ def execute(args, output, scratch_root, report, global_edit, layers, le, fe,
     edited_global_empty = not np.any(union_low)
     report['edited_global_empty'] = bool(edited_global_empty)
     del union_low, edited_global
-    native_global_src = Nrrd(child(full_path.parent, key), full_shape)
-    report['source_full_sha256'][key] = digest(native_global_src.path)
+    if getattr(args, 'validate_only', False):
+        report['status'] = 'validated_preview_only'
+        report['native_source_validation'] = 'not_run; full-quality headers checked, payloads not read'
+        report['pta_label_file'] = None
+        save_json(output/'report.json', report)
+        print('Preview edits validated; no native payload processing or PTA publication requested.', flush=True)
+        return 0
+    native_global_src = (Nrrd(child(full_path.parent, key), full_shape) if union_sources is None else
+                         union_sources.native(global_edit['name']))
+    if union_sources is None:
+        report['source_full_sha256'][key] = digest(native_global_src.path)
+    else:
+        report['source_full_unions'][key] = native_global_src.descriptor()
     unresolved = 0
     with tempfile.TemporaryDirectory(prefix='xta-native-', dir=scratch_root) as tmp:
         tmp = Path(tmp)
+        if union_sources is not None:
+            print('Decoding and validating each original source Global once into shared packed scratch.', flush=True)
+            union_sources.prepare_native_globals(tmp, depth)
         with mapped(tmp/'initial-global.dat', full_shape) as initial, mapped(tmp/'union.dat', full_shape) as union:
             print('Loading and checking the original native Global.', flush=True)
             global_count = 0
-            source_check = PreviewSupportCheck(full_shape, low_global)
+            source_check = PreviewSupportCheck(full_shape, low_global) if union_sources is None else native_global_src
             for z, block in native_global_src.slabs(depth):
                 source_check.observe(z, block)
                 initial[z:z+len(block)] = block
@@ -843,7 +909,9 @@ def execute(args, output, scratch_root, report, global_edit, layers, le, fe,
             report['global_source_support_check'] = source_check.finish()
             del source_check
             initial.flush()
-            clip = initial if global_count else None
+            # Union native readers apply each run's own Global before OR; using
+            # the union Global here would admit cross-run foreground.
+            clip = initial if global_count and union_sources is None else None
             if not global_count:
                 report['warnings'].append('Original native Global is empty: initial native clipping was SKIPPED.')
             report['initial_global_voxels'] = global_count
@@ -854,9 +922,9 @@ def execute(args, output, scratch_root, report, global_edit, layers, le, fe,
                 context = dict(args=args, output=output, tmp=tmp,
                         low_path=low_path, full_path=full_path,
                         bundle_dir=bundle_dir, full_shape=full_shape, low_shape=low_shape,
-                        depth=depth, edited_global_empty=edited_global_empty)
+                        depth=depth, edited_global_empty=edited_global_empty, union_sources=union_sources)
                 worker_context = dict(context, low_global_path=low_global_source.path,
-                                      clip_nonempty=bool(global_count))
+                                      clip_nonempty=bool(global_count) and union_sources is None)
                 with native_executor(args.workers, worker_context) as executor:
                     if args.workers > 1:
                         futures = [executor.submit(process_native_worker, i, entry)
@@ -870,7 +938,8 @@ def execute(args, output, scratch_root, report, global_edit, layers, le, fe,
                             i, row, source_hash, component_path = future.result()
                             completed[i] = row
                             report['layers'] = [completed[k] for k in sorted(completed)]
-                            report['source_full_sha256'][row['source_filename']] = source_hash
+                            field = 'source_full_sha256' if union_sources is None else 'source_full_unions'
+                            report[field][row['source_filename']] = source_hash
                             unresolved += row['unresolved_components']
                             with open(component_path, encoding='utf-8', newline='') as part:
                                 shutil.copyfileobj(part, tsv)
@@ -882,14 +951,20 @@ def execute(args, output, scratch_root, report, global_edit, layers, le, fe,
                         for future in futures:
                             future.cancel()
                         raise
-            if unresolved and args.conflicts == 'error':
-                report['status'] = 'needs_review'
-                report['unresolved_components'] = unresolved
-                report['warnings'].append('No PTA label published. Inspect components.tsv and review_previews.')
-                save_json(output/'report.json', report)
-                print(f'{unresolved} mixed keep/remove component(s); STOPPED without publishing a PTA mask.', flush=True)
-                return 2
             report['unresolved_components'] = unresolved
+            report['auto_resolved_components'] = sum(r['auto_resolved_components'] for r in report['layers'])
+            report['auto_removed_voxels'] = sum(r['auto_removed_voxels'] for r in report['layers'])
+            if unresolved and args.conflicts != 'keep':
+                report['status'] = 'needs_review'
+                report['pta_label_file'] = None
+                message = (f'{unresolved} native component(s) still have conflicting retained/deleted '
+                           'preview evidence. Native and edited low-resolution objects do not agree; '
+                           'no PTA label was published. Inspect components.tsv and review_previews. '
+                           'Only explicit --conflicts keep permits publishing unresolved components.')
+                report['warnings'].append(message)
+                save_json(output/'report.json', report)
+                print(f'NEEDS REVIEW: {message}', flush=True)
+                return 2
             if unresolved:
                 report['warnings'].append('Unresolved components were preserved under the selected conflict policy. '
                                           'Result is a conservative candidate, NOT a fully resolved transfer.')
@@ -956,6 +1031,10 @@ def parser():
     p.add_argument('--edits', required=True, help='Directory exported by Export XTA Edits in Slicer.')
     p.add_argument('--low-manifest', required=True, help='Original low_quality/<bin>/nrrd/*_nrrd_manifest.json.')
     p.add_argument('--full-manifest', required=True, help='Matching original full-quality nrrd/*_nrrd_manifest.json.')
+    p.add_argument('--union-receipt', help='Explicit exact-name preview union manifest; requires --union-source-pairs.')
+    p.add_argument('--union-source-pairs', help='Hashed original source pairs and receipt member assignments JSON.')
+    p.add_argument('--validate-only', action='store_true',
+                   help='Validate preview identities, deletion evidence and updated Global; do not read native payloads or publish a PTA mask.')
     p.add_argument('--output', required=True, help='New, separate output directory; never overwritten.')
     p.add_argument('--scratch', help='Fast local disk for temporary disk-backed arrays.')
     p.add_argument('--block-mib', type=int, default=128, help='Approximate slab-working target, not an RSS hard cap (default: 128).')
@@ -963,9 +1042,9 @@ def parser():
     p.add_argument('--max-components', type=int, default=2000000, help='Cap on provisional slab components (default: 2 million).')
     conflict_options = p.add_mutually_exclusive_group()
     conflict_options.add_argument('--conflicts', choices=('error', 'keep', 'auto'), default='error',
-                   help='Mixed native evidence: stop (default), keep, or auto-cut thin necks and preserve/report remaining conflicts.')
+                   help='Mixed native evidence: stop (default), explicitly keep/report unresolved components, or auto-cut thin necks and stop without a PTA mask if any conflicts remain.')
     conflict_options.add_argument('--auto', dest='conflicts', action='store_const', const='auto',
-                   help='Shorthand for --conflicts auto. Use only one conflict policy option.')
+                   help='Shorthand for --conflicts auto; unresolved conflicts prevent PTA mask publication. Use only one conflict policy option.')
     p.add_argument('--auto-max-radius', type=int, default=2,
                    help='Maximum core-erosion distance, in native voxel-index units (default: 2).')
     p.add_argument('--auto-max-roi-voxels', type=int, default=8000000,

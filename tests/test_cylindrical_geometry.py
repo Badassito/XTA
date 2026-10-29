@@ -15,7 +15,7 @@ from XTA.cylindrical_geometry import radius_grid
 
 class AzimuthalRenameRegressionTests(unittest.TestCase):
     def test_pixels_match_unmodified_v19_reference(self):
-        reference = json.loads((Path(__file__).parent / 'fixtures/azimuthal_v19_reference.json').read_text())
+        reference = json.loads((Path(__file__).parent / 'fixtures/azimuthal_reference.json').read_text())
         shape = tuple(reference['source_shape'])
         a = np.indices(shape)
         src = ((a[0] * 47 + a[1] * 19 + a[2] * 7 + 3) % 251).astype(np.uint8)

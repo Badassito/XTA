@@ -352,7 +352,11 @@ def test_real_admitted_mapped_owner_retires_before_capture_completion(tmp_path, 
 
 
 @pytest.mark.parametrize('mode', ['capture', 'sam_disabled', 'sdf_disabled'])
-def test_capture_reaches_real_pipeline_gpu_task_inventory_without_sam(tmp_path, monkeypatch, mode):
+def test_capture_reaches_real_pipeline_gpu_task_inventory_without_sam(tmp_path, monkeypatch, request, mode):
+    from XTA import assembly
+    source_shape = assembly.final_source_output_shape()
+    request.addfinalizer(lambda: assembly.set_final_source_output_shape(source_shape))
+
     class StartupReached(RuntimeError):
         pass
 

@@ -22,10 +22,18 @@ after their mode has been selected.
 | Shared boundary | Owner |
 | --- | --- |
 | Immutable geometry and sampling identity | [sampling](XTA/unification/sampling.py), [physical recipes](XTA/unification/geometry_identity.py), [contracts](XTA/unification/contracts.py), [views](XTA/unification/views.py), [tiles](XTA/unification/tiles.py), [geometry](XTA/geometry.py), [render batches](XTA/render_batch.py) |
-| Source and worker resources | [workspace](XTA/workspace.py), [media](XTA/media.py), [runtime](XTA/runtime.py), [TTA workers](XTA/workers.py) |
-| Input/output identity and manifests | [launch context](XTA/unification/context.py), [manifest helpers](XTA/unification/manifest.py), [TTA manifest](XTA/unification/tta_manifest.py) |
+| Source and worker resources | [workspace](XTA/workspace.py), [media](XTA/media.py), [runtime lifecycle](XTA/runtime.py), [observability](XTA/runtime_observability.py), [TTA workers](XTA/workers.py) |
+| Input/output identity and manifests | [launch context](XTA/unification/context.py), [manifest helpers](XTA/unification/manifest.py), [TTA manifest](XTA/unification/tta_manifest.py), [execution provenance](XTA/tta_provenance.py) |
 | Image-space and source-space projection | [backprojection](XTA/backprojection.py), [sparse projection](XTA/sparse_projection.py), the `cylindrical_*`, `spherical_*`, and `tilted_azimuthal_projection*` modules |
-| Common filtering and output | [Gaussian](XTA/gaussian.py), [finalization](XTA/finalization.py), [outputs](XTA/outputs.py), [packed publication](XTA/packed_publication.py), [memory grants](XTA/publication_memory.py) |
+| Common filtering and output | [prediction cleanup](XTA/_prediction_cleanup.py), [Gaussian](XTA/gaussian.py), [finalization](XTA/finalization.py), [outputs](XTA/outputs.py), [NRRD compression](XTA/nrrd_compression.py), [packed publication](XTA/packed_publication.py), [memory grants](XTA/publication_memory.py) |
+
+Parent preparation admission is owned by
+[tta_prepare_planning](XTA/tta_prepare_planning.py); `pipeline` coordinates its
+results. Compression codec admission, ordered member streams and worker-pool
+lifetime have one owner in `nrrd_compression`, while `outputs` retains raster
+formatting and publication. `runtime_observability` owns measurement primitives;
+the `runtime` facade retains process initialization and shutdown. Importing the
+measurement owner does not start threads or open diagnostic files.
 
 TTA overlaps streaming decode with worker initialization after resolving source
 geometry. Startup telemetry separates source metadata and exact packet-count
@@ -1051,6 +1059,13 @@ confidence publication.
 
 ## PTA: deterministic dataset construction
 
+`pta_inputs` owns image/video normalization and decoding plus NRRD/YOLO annotation
+readers. `pta_planning` owns shared-view adapters, channel/output tags and render
+plan construction. Neither imports the `pta` orchestrator. Value classes retain
+their existing owners in `pta_rendering` and `pta_workers`, including their
+worker serialization identities. The channel specification resolved by
+`pta_config` is passed into execution instead of reparsing its original tokens.
+
 `--input DIR [DIR...]` flattens each directory's sorted volume inventory in
 argument order into one run. Every root keeps its existing full/partial/unlabeled
 rules; different roots may have different annotation states. Duplicate resolved
@@ -1099,8 +1114,8 @@ can be replayed for coverage. The bundled GPU policies declare this contract.
 through `pta_binary`.
 
 CPU rendering uses persistent workers and shared volume memory. Offline GPU
-augmentation uses one persistent process per selected GPU. `pta_rendering`
-prepares view plans; `pta_workers` renders and applies policies. GPU owners keep
+augmentation uses one persistent process per selected GPU. `pta_planning`
+constructs plans using `pta_rendering` value types; `pta_workers` renders and applies policies. GPU owners keep
 foreground and coverage volumes resident when VRAM admission succeeds.
 `pta_cuda_masks` coordinates their lifetime; `pta_cuda_cartesian`,
 `pta_cuda_azimuthal`, and `pta_cuda_shells` project categorical values directly
@@ -1171,6 +1186,14 @@ unopened SAM sessions. `lta_workers` owns persistent GPU processes and each
 process's model/tracker state. A live session stays on one worker. Results
 commit in plan order even when execution completes out of order.
 
+`lta_execution` selects the canonical frontier coordinator. The shared
+`lta_window_execution` engine owns bounded dispatch, packet checks, coverage
+lifetime, reduction and ordered acknowledgment. The older generation policy
+lives in `tests/reference_backends/lta_generation.py` for qualification and
+whole-chain/window comparisons; production does not import that backend. The
+reference shares the window engine, so it is a policy comparison rather than
+an independent oracle for the engine itself. See [LTA execution](docs/lta_execution.md).
+
 `lta_propagation` and `lta_windows` advance authoritative anchors through
 bounded temporal windows, with independent backward and forward branches.
 Sessions admit at most 30 frames and 128 objects. Authoritative foreground
@@ -1197,8 +1220,11 @@ the mandatory final NRRD and complete manifest after checkpoint and identity
 checks. A checkpoint can remain after a later failure; only a complete manifest
 marks run success.
 
-`lta_sam` resolves and audits the local SAM 3.1 assets; `lta_worker_adapter`
-owns model construction and tracker calls. The production feature path in
+`lta_sam` resolves the local SAM assets and model/session policy;
+`sam_sdk_compat` owns pinned SDK identity checks, local vocabulary loading,
+construction patches and exact restoration of process-global state. Construction
+and prepared-frame loader patches share one reentrant lock. `lta_worker_adapter`
+owns worker model construction and tracker calls. The production feature path in
 `lta_tracker_features` skips unused grounding detection while retaining the
 tracker's expected visual features. GPU workers divide the visible CPU
 allocation and record their process/device identities. Increasing

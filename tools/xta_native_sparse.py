@@ -187,14 +187,23 @@ def sparse_label_stream(slabs, store, *, maximum, keep=None, removed=None,
             raise ValueError('Slabs are not sequential.')
         if observer is not None:
             observer(z, block)
-        a = np.asarray(block, dtype=np.uint8).copy()
-        input_count += int(np.count_nonzero(a))
+        a = np.asarray(block, dtype=np.uint8)
+        block_input_count = int(np.count_nonzero(a))
+        input_count += block_input_count
         if clip is not None:
+            # Source slabs can be views or read-only arrays. Only clipping
+            # mutates them, so allocate a private buffer for that path alone.
+            a = a.copy()
             a &= clip[z:z+len(a)]
-        clipped_count += int(np.count_nonzero(a))
-        occupied_y = np.flatnonzero(np.any(a, axis=(0, 2)))
-        occupied_x = np.flatnonzero(np.any(a, axis=(0, 1)))
-        if len(occupied_y):
+            block_clipped_count = int(np.count_nonzero(a))
+        else:
+            block_clipped_count = block_input_count
+        clipped_count += block_clipped_count
+        # The count above already establishes whether this slab is empty.
+        # Empty slabs also break all face connections to the previous slab.
+        if block_clipped_count:
+            occupied_y = np.flatnonzero(np.any(a, axis=(0, 2)))
+            occupied_x = np.flatnonzero(np.any(a, axis=(0, 1)))
             y0, y1 = int(occupied_y[0]), int(occupied_y[-1])+1
             x0, x1 = int(occupied_x[0]), int(occupied_x[-1])+1
             local, n = ndi.label(a[:, y0:y1, x0:x1], structure=FACE)

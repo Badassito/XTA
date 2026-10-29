@@ -33,6 +33,7 @@ HAS_NUMERICAL_RUNTIME = all(
 
 from XTA import pta
 from XTA import pta_scheduler
+from XTA import pta_publication
 from XTA import pta_workers
 
 
@@ -66,7 +67,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
         *,
         augmentation: pta.OfflineAugmentation | None = None,
     ) -> None:
-        pta.set_worker_static_context(
+        pta_workers.set_worker_static_context(
             out_dir=out_dir,
             split_active=False,
             image_format="png",
@@ -82,14 +83,14 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
         )
 
     def test_auto_and_explicit_process_select_spawn_capable_backend(self) -> None:
-        self.assertEqual(pta.resolve_render_backend("auto"), "process")
-        self.assertEqual(pta.resolve_render_backend("process"), "process")
-        self.assertEqual(pta.resolve_render_backend("thread"), "thread")
+        self.assertEqual(pta_workers.resolve_render_backend("auto"), "process")
+        self.assertEqual(pta_workers.resolve_render_backend("process"), "process")
+        self.assertEqual(pta_workers.resolve_render_backend("thread"), "thread")
         self.assertEqual(multiprocessing.get_context("spawn").get_start_method(), "spawn")
 
         with tempfile.TemporaryDirectory() as temp_dir:
             self._install_static(Path(temp_dir) / "output")
-            pool = pta.PersistentRenderPool(backend="thread", workers=1)
+            pool = pta_workers.PersistentRenderPool(backend="thread", workers=1)
             try:
                 self.assertEqual(pool.start_method, "thread")
                 self.assertIsNone(pool._pool)
@@ -108,7 +109,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 pipeline_builder=lambda: object(),
             )
             self._install_static(Path(temp_dir) / "output", augmentation=loaded)
-            payload = pta._spawn_worker_static_payload()
+            payload = pta_workers._spawn_worker_static_payload()
 
         definition = payload["augmentation_definition"]
         self.assertIsInstance(definition, dict)
@@ -164,12 +165,12 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                     pta_workers, "load_augmentation_definition", return_value=loaded
                 ) as load_definition,
             ):
-                pta._initialize_spawned_worker_static_context(payload)
+                pta_workers._initialize_spawned_worker_static_context(payload)
 
         inspect_definition.assert_called_once_with(str(policy_path))
         load_definition.assert_called_once_with(str(policy_path))
-        self.assertIs(pta._WORKER_STATIC["augmentation"], loaded)
-        self.assertEqual(pta._WORKER_STATIC["out_dir"], Path(temp_dir) / "output")
+        self.assertIs(pta_workers._WORKER_STATIC["augmentation"], loaded)
+        self.assertEqual(pta_workers._WORKER_STATIC["out_dir"], Path(temp_dir) / "output")
 
     def test_spawn_initializer_rejects_policy_mutation_before_import(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -207,7 +208,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 ) as load_definition,
             ):
                 with self.assertRaisesRegex(RuntimeError, "changed after parent preflight"):
-                    pta._initialize_spawned_worker_static_context(payload)
+                    pta_workers._initialize_spawned_worker_static_context(payload)
         load_definition.assert_not_called()
 
     def test_success_manifest_gate_rejects_policy_mutation(self) -> None:
@@ -239,11 +240,11 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             ),
         )
 
-        def merged_warnings(order: tuple[int, ...]) -> pta.WarningLog:
-            warnings = pta.WarningLog()
+        def merged_warnings(order: tuple[int, ...]) -> pta_workers.WarningLog:
+            warnings = pta_workers.WarningLog()
             for payload_index in order:
                 counts, examples = payloads[payload_index]
-                pta._merge_worker_warning_payload(warnings, counts, examples)
+                pta_workers._merge_worker_warning_payload(warnings, counts, examples)
             return warnings
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -370,7 +371,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
         ):
             topology = pta.discover_topology(
                 enabled=True,
-                warnings=pta.WarningLog(),
+                warnings=pta_workers.WarningLog(),
                 device_ids=(1, 3),
             )
 
@@ -399,7 +400,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             ):
                 pta.discover_topology(
                     enabled=False,
-                    warnings=pta.WarningLog(),
+                    warnings=pta_workers.WarningLog(),
                     device_ids=(2,),
                 )
 
@@ -423,8 +424,8 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
     def test_multi_source_batches_preserve_candidate_order(self) -> None:
         candidates = [self._candidate(index) for index in range(7)]
 
-        def item(start: int, stop: int) -> pta._GpuItemWork:
-            return pta._GpuItemWork(
+        def item(start: int, stop: int) -> pta_workers._GpuItemWork:
+            return pta_workers._GpuItemWork(
                 candidates=tuple(candidates[start:stop]),
                 image=np.zeros((8, 8), dtype=np.uint8),
                 mask=np.zeros((8, 8), dtype=np.uint8),
@@ -453,7 +454,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             for limit in (1, 15, 24):
                 with self.subTest(versions=versions, limit=limit):
                     sources = tuple(
-                        pta._GpuItemWork(
+                        pta_workers._GpuItemWork(
                             candidates=tuple(self._candidate(source * versions + index)
                                              for index in range(versions)),
                             image=np.full((8, 8), source, dtype=np.uint8),
@@ -475,7 +476,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                             self.assertIs(item.mask, source.mask)
 
     def test_multi_source_batches_group_shapes_without_losing_source_order(self) -> None:
-        sources = tuple(pta._GpuItemWork(
+        sources = tuple(pta_workers._GpuItemWork(
             candidates=tuple(self._candidate(source * 3 + index) for index in range(3)),
             image=np.zeros((8 + source % 2, 8), dtype=np.uint8),
             mask=np.ones((8 + source % 2, 8), dtype=np.uint8),
@@ -498,7 +499,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
         plans = tuple(
             types.SimpleNamespace(
                 tag=tag,
-                view=types.SimpleNamespace(shared_view=view),
+                view=types.SimpleNamespace(family=view.family, shared_view=view),
             )
             for tag, view in views.items()
         )
@@ -525,7 +526,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 side_effect=lambda view: view.kind in {"tilted", "tilted_azimuthal"},
             ),
         ):
-            summary = pta.projection_phase_summary(plans, candidates)
+            summary = pta_workers.projection_phase_summary(plans, candidates)
 
         self.assertEqual(
             summary,
@@ -542,7 +543,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             is_cuda = True
             shape = (8, 8)
 
-        host = pta._GpuItemWork(
+        host = pta_workers._GpuItemWork(
             candidates=(self._candidate(0),),
             image=np.zeros((8, 8), dtype=np.uint8),
             mask=np.zeros((8, 8), dtype=np.uint8),
@@ -570,7 +571,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
     def test_original_gpu_batch_is_identity_fast_path_eligible(self) -> None:
         candidates = tuple(self._candidate(index) for index in range(2))
         work = (
-            pta._GpuItemWork(
+            pta_workers._GpuItemWork(
                 candidates=(candidates[0],),
                 image=np.zeros((8, 8), dtype=np.uint8),
                 mask=np.zeros((8, 8), dtype=np.uint8),
@@ -578,7 +579,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 channel_kind="gray",
                 context="first",
             ),
-            pta._GpuItemWork(
+            pta_workers._GpuItemWork(
                 candidates=(candidates[1],),
                 image=np.zeros((8, 8), dtype=np.uint8),
                 mask=np.zeros((8, 8), dtype=np.uint8),
@@ -588,15 +589,15 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             ),
         )
 
-        self.assertTrue(pta._gpu_identity_fast_path_eligible(work, ((None,), (None,))))
-        self.assertFalse(pta._gpu_identity_fast_path_eligible(work, ((None,), (123,))))
+        self.assertTrue(pta_workers._gpu_identity_fast_path_eligible(work, ((None,), (None,))))
+        self.assertFalse(pta_workers._gpu_identity_fast_path_eligible(work, ((None,), (123,))))
         resized = (work[0], dataclasses.replace(work[1], output_size=(4, 4)))
-        self.assertFalse(pta._gpu_identity_fast_path_eligible(resized, ((None,), (None,))))
+        self.assertFalse(pta_workers._gpu_identity_fast_path_eligible(resized, ((None,), (None,))))
 
         malformed_gray = (
             dataclasses.replace(work[0], image=np.zeros((8, 8, 1), dtype=np.uint8)),
         )
-        self.assertFalse(pta._gpu_identity_fast_path_eligible(malformed_gray, ((None,),)))
+        self.assertFalse(pta_workers._gpu_identity_fast_path_eligible(malformed_gray, ((None,),)))
         valid_rgb = dataclasses.replace(
             work[0],
             image=np.zeros((8, 8, 3), dtype=np.uint8),
@@ -606,10 +607,10 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             valid_rgb,
             image=np.zeros((8, 8, 4), dtype=np.uint8),
         )
-        self.assertTrue(pta._gpu_identity_fast_path_eligible((valid_rgb,), ((None,),)))
-        self.assertFalse(pta._gpu_identity_fast_path_eligible((invalid_rgb,), ((None,),)))
+        self.assertTrue(pta_workers._gpu_identity_fast_path_eligible((valid_rgb,), ((None,),)))
+        self.assertFalse(pta_workers._gpu_identity_fast_path_eligible((invalid_rgb,), ((None,),)))
         self.assertFalse(
-            pta._gpu_identity_fast_path_eligible((work[0], valid_rgb), ((None,), (None,)))
+            pta_workers._gpu_identity_fast_path_eligible((work[0], valid_rgb), ((None,), (None,)))
         )
         valid_custom = dataclasses.replace(
             work[0],
@@ -618,10 +619,10 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             channel_count=5,
         )
         self.assertTrue(
-            pta._gpu_identity_fast_path_eligible((valid_custom,), ((None,),))
+            pta_workers._gpu_identity_fast_path_eligible((valid_custom,), ((None,),))
         )
         self.assertFalse(
-            pta._gpu_identity_fast_path_eligible(
+            pta_workers._gpu_identity_fast_path_eligible(
                 (dataclasses.replace(valid_custom, channel_count=7),),
                 ((None,),),
             )
@@ -674,7 +675,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             zeros=zeros,
         )
         work = tuple(
-            pta._GpuItemWork(
+            pta_workers._GpuItemWork(
                 candidates=(self._candidate(index),),
                 image=np.full((8, 8), index, dtype=np.uint8),
                 mask=ExplodingMask(),
@@ -685,7 +686,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             for index in range(2)
         )
 
-        images, masks = pta._apply_gpu_identity_batch_many(
+        images, masks = pta_workers._apply_gpu_identity_batch_many(
             {"torch": fake_torch, "device_id": 0},
             work,
         )
@@ -732,7 +733,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             zeros=lambda shape, **_kwargs: DeviceTensor(tuple(shape)),
         )
         work = tuple(
-            pta._GpuItemWork(
+            pta_workers._GpuItemWork(
                 candidates=(self._candidate(index),),
                 image=DeviceTensor((8, 8)),
                 mask=np.zeros((8, 8), dtype=np.uint8),
@@ -743,7 +744,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             for index in range(2)
         )
 
-        images, masks = pta._apply_gpu_identity_batch_many(
+        images, masks = pta_workers._apply_gpu_identity_batch_many(
             {"torch": fake_torch, "device_id": 0},
             work,
         )
@@ -784,7 +785,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             stack=stack,
         )
         work = tuple(
-            pta._GpuItemWork(
+            pta_workers._GpuItemWork(
                 candidates=(dataclasses.replace(self._candidate(index), label_enabled=True),),
                 image=DeviceTensor((8, 8)),
                 mask=DeviceTensor((8, 8)),
@@ -795,7 +796,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             for index in range(2)
         )
 
-        images, masks = pta._apply_gpu_identity_batch_many(
+        images, masks = pta_workers._apply_gpu_identity_batch_many(
             {"torch": fake_torch, "device_id": 0}, work,
         )
 
@@ -819,7 +820,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             def numpy(self):
                 return expected
 
-        actual = pta._gpu_policy_host_image(DeviceTensor())
+        actual = pta_workers._gpu_policy_host_image(DeviceTensor())
         self.assertTrue(bool(actual.flags["C_CONTIGUOUS"]))
         np.testing.assert_array_equal(actual, expected)
 
@@ -832,7 +833,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
 
         images = (DeviceTensor(), DeviceTensor())
         work = tuple(
-            pta._GpuItemWork(
+            pta_workers._GpuItemWork(
                 candidates=(self._candidate(index),),
                 image=image,
                 mask=np.zeros((8, 8), dtype=np.uint8),
@@ -844,7 +845,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
         )
         policy = types.SimpleNamespace(supports_cuda_sources=True)
 
-        selected, zero_copy = pta._gpu_policy_source_images(policy, work)
+        selected, zero_copy = pta_workers._gpu_policy_source_images(policy, work)
 
         self.assertTrue(zero_copy)
         self.assertEqual(selected, images)
@@ -863,7 +864,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
         first_event = object()
         second_event = object()
         work = tuple(
-            pta._GpuItemWork(
+            pta_workers._GpuItemWork(
                 candidates=(self._candidate(index),),
                 image=DeviceTensor(),
                 mask=np.zeros((8, 8), dtype=np.uint8),
@@ -881,7 +882,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             ),
         }
 
-        pta._wait_for_gpu_work_ready(runtime, work)
+        pta_workers._wait_for_gpu_work_ready(runtime, work)
 
         self.assertEqual(waits, [first_event, second_event])
         self.assertEqual(records, [consumer, consumer])
@@ -902,7 +903,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 side_effect=AssertionError("blank source mask must not be resliced"),
             ),
         ):
-            rendered = pta._render_gpu_item_group(
+            rendered = pta_workers._render_gpu_item_group(
                 np.zeros((2, 2, 2), dtype=np.uint8),
                 np.zeros((2, 2, 2), dtype=np.uint8),
                 plan,
@@ -935,7 +936,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 side_effect=AssertionError("unlabeled masks must not be rendered"),
             ),
         ):
-            rendered = pta._render_gpu_item_group(
+            rendered = pta_workers._render_gpu_item_group(
                 np.zeros((2, 2, 2), dtype=np.uint8),
                 np.zeros((2, 2, 2), dtype=np.uint8),
                 plan,
@@ -1010,7 +1011,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             mock.patch.object(pta_workers, "_require_pta_canonical_plan"),
             mock.patch("builtins.print"),
         ):
-            actual, ready_event = pta._gpu_projected_item_image(
+            actual, ready_event = pta_workers._gpu_projected_item_image(
                 runtime,
                 np.zeros((2, 2, 2), dtype=np.uint8),
                 plan,
@@ -1092,7 +1093,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             mock.patch.object(pta_workers, "_require_pta_canonical_plan"),
             mock.patch("builtins.print"),
         ):
-            actual, ready_event = pta._gpu_projected_item_image(
+            actual, ready_event = pta_workers._gpu_projected_item_image(
                 runtime,
                 np.zeros((2, 2, 2), dtype=np.uint8),
                 plan,
@@ -1108,7 +1109,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
 
     def test_gpu_oom_split_preserves_order_and_sources(self) -> None:
         candidates = [self._candidate(index) for index in range(6)]
-        first = pta._GpuItemWork(
+        first = pta_workers._GpuItemWork(
             candidates=tuple(candidates[:4]),
             image=np.zeros((4, 4), dtype=np.uint8),
             mask=np.zeros((4, 4), dtype=np.uint8),
@@ -1116,7 +1117,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             channel_kind="gray",
             context="first",
         )
-        second = pta._GpuItemWork(
+        second = pta_workers._GpuItemWork(
             candidates=tuple(candidates[4:]),
             image=np.zeros((4, 4), dtype=np.uint8),
             mask=np.zeros((4, 4), dtype=np.uint8),
@@ -1138,7 +1139,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
     def test_vram_budget_caps_large_requested_batch(self) -> None:
         fake_cuda = types.SimpleNamespace(mem_get_info=lambda _device: (12 * pta.GIB, 16 * pta.GIB))
         runtime = {"torch": types.SimpleNamespace(cuda=fake_cuda), "device_id": 0}
-        work = pta._GpuItemWork(
+        work = pta_workers._GpuItemWork(
             candidates=tuple(self._candidate(index) for index in range(144)),
             image=np.zeros((1, 1), dtype=np.uint8),
             mask=np.zeros((1, 1), dtype=np.uint8),
@@ -1168,7 +1169,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             "device_id": 0,
         }
         with self.assertRaisesRegex(ValueError, "wrong channel/spatial shape"):
-            pta._publish_gpu_policy_batch(
+            pta_workers._publish_gpu_policy_batch(
                 runtime=runtime,
                 batch_images=FakeTensor((1, 1, 7, 8)),
                 batch_masks=FakeTensor((1, 8, 8)),
@@ -1176,7 +1177,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 source_mask_nonempty=(True,),
                 output_size=(8, 8),
                 channel_kind="gray",
-                local_warnings=pta.WarningLog(),
+                local_warnings=pta_workers.WarningLog(),
             )
 
     def test_multi_source_publisher_rejects_foreign_cuda_device(self) -> None:
@@ -1196,7 +1197,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             "device_id": 0,
         }
         with self.assertRaisesRegex(ValueError, "assigned device"):
-            pta._publish_gpu_policy_batch(
+            pta_workers._publish_gpu_policy_batch(
                 runtime=runtime,
                 batch_images=FakeTensor((1, 1, 8, 8), "cuda:0"),
                 batch_masks=FakeTensor((1, 8, 8), "cuda:1"),
@@ -1204,7 +1205,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 source_mask_nonempty=(True,),
                 output_size=(8, 8),
                 channel_kind="gray",
-                local_warnings=pta.WarningLog(),
+                local_warnings=pta_workers.WarningLog(),
             )
 
     def test_unlabeled_publisher_skips_mask_reduction(self) -> None:
@@ -1229,7 +1230,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as temp_dir:
             self._install_static(Path(temp_dir) / "output")
-            written, flips = pta._publish_gpu_policy_batch(
+            written, flips = pta_workers._publish_gpu_policy_batch(
                 runtime=runtime,
                 batch_images=FakeTensor((1, 1, 8, 8)),
                 batch_masks=NoReduceMask((1, 8, 8)),
@@ -1237,7 +1238,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 source_mask_nonempty=(False,),
                 output_size=(8, 8),
                 channel_kind="gray",
-                local_warnings=pta.WarningLog(),
+                local_warnings=pta_workers.WarningLog(),
             )
 
         self.assertEqual(written, 1)
@@ -1285,9 +1286,9 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self._install_static(root)
-            pta._WORKER_STATIC["tiff_encode_backend"] = "nvtiff"
+            pta_workers._WORKER_STATIC["tiff_encode_backend"] = "nvtiff"
             paths = (root / "first.tif", root / "second.tif")
-            fallback = pta._write_gpu_image_batch(
+            fallback = pta_workers._write_gpu_image_batch(
                 runtime={
                     "torch": fake_torch,
                     "device_id": 0,
@@ -1325,7 +1326,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             finals = (root / "a.jpg", root / "b.jpg")
             for path in finals:
                 path.write_bytes(b"OLD")
-            pta._write_nvjpeg_batch_atomically(
+            pta_publication._write_nvjpeg_batch_atomically(
                 encoder=Encoder(),
                 images=(object(), object()),
                 final_paths=finals,
@@ -1350,7 +1351,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             for path in finals:
                 path.write_bytes(b"OLD")
             with self.assertRaisesRegex(RuntimeError, "empty/truncated JPEG CodeStream"):
-                pta._write_nvjpeg_batch_atomically(
+                pta_publication._write_nvjpeg_batch_atomically(
                     encoder=Encoder(),
                     images=(object(), object()),
                     final_paths=finals,
@@ -1373,7 +1374,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             for path in finals:
                 path.write_bytes(b"OLD")
             with self.assertRaisesRegex(RuntimeError, "failed JPEG batch index 1"):
-                pta._write_nvjpeg_batch_atomically(
+                pta_publication._write_nvjpeg_batch_atomically(
                     encoder=Encoder(),
                     images=(object(), object()),
                     final_paths=finals,
@@ -1434,8 +1435,8 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self._install_static(root)
-            pta._WORKER_STATIC["image_format"] = "jpg"
-            pta._WORKER_STATIC["jpeg_encode_backend"] = "auto"
+            pta_workers._WORKER_STATIC["image_format"] = "jpg"
+            pta_workers._WORKER_STATIC["jpeg_encode_backend"] = "auto"
             path = root / "fallback.jpg"
             runtime = {
                 "torch": fake_torch,
@@ -1450,7 +1451,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                     b"\xff\xd8fallback\xff\xd9"
                 ),
             ):
-                note = pta._write_gpu_image_batch(
+                note = pta_workers._write_gpu_image_batch(
                     runtime=runtime,
                     images_nchw=Tensor(np.arange(64, dtype=np.uint8).reshape(1, 1, 8, 8)),
                     indices=(0,),
@@ -1474,7 +1475,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             images.mkdir()
             (images / "a.jpg").write_bytes(b"\xff\xd8a\xff\xd9")
             (images / "b.jpg").write_bytes(b"\xff\xd8b\xff\xd9")
-            record = pta.verify_published_image_tree(
+            record = pta_publication.verify_published_image_tree(
                 root,
                 expected_count=2,
                 image_format="jpg",
@@ -1484,14 +1485,14 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
 
             (images / "empty.jpg").write_bytes(b"")
             with self.assertRaisesRegex(RuntimeError, "integrity check failed"):
-                pta.verify_published_image_tree(
+                pta_publication.verify_published_image_tree(
                     root,
                     expected_count=3,
                     image_format="jpg",
                 )
             (images / "empty.jpg").unlink()
             with self.assertRaisesRegex(RuntimeError, "expected=3, verified=2"):
-                pta.verify_published_image_tree(
+                pta_publication.verify_published_image_tree(
                     root,
                     expected_count=3,
                     image_format="jpg",
@@ -1525,8 +1526,8 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self._install_static(root)
-            pta._WORKER_STATIC["image_format"] = "jpg"
-            pta._WORKER_STATIC["jpeg_encode_backend"] = "nvjpeg"
+            pta_workers._WORKER_STATIC["image_format"] = "jpg"
+            pta_workers._WORKER_STATIC["jpeg_encode_backend"] = "nvjpeg"
             runtime = {
                 "torch": torch,
                 "device_id": device_id,
@@ -1537,7 +1538,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             gray_paths = (root / "gray-a.jpg", root / "gray-b.jpg")
             gray_batch = torch.stack((checker, 255 - checker), dim=0).unsqueeze(1)
             self.assertIsNone(
-                pta._write_gpu_image_batch(
+                pta_workers._write_gpu_image_batch(
                     runtime=runtime,
                     images_nchw=gray_batch,
                     indices=(0, 1),
@@ -1553,7 +1554,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 (checker, torch.flip(checker, dims=(0,)), 255 - checker), dim=0,
             ).unsqueeze(0)
             self.assertIsNone(
-                pta._write_gpu_image_batch(
+                pta_workers._write_gpu_image_batch(
                     runtime=runtime,
                     images_nchw=rgb_batch,
                     indices=(0,),
@@ -1585,8 +1586,8 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             root = Path(temp_dir)
             self._install_static(root / "output")
 
-            volume_block = pta.SharedBlock(8)
-            mask_block = pta.SharedBlock(8)
+            volume_block = pta_workers.SharedBlock(8)
+            mask_block = pta_workers.SharedBlock(8)
             volume = volume_block.ndarray((2, 2, 2), np.uint8)
             mask = mask_block.ndarray((2, 2, 2), np.uint8)
             volume[...] = np.arange(8, dtype=np.uint8).reshape(2, 2, 2)
@@ -1645,7 +1646,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 is_tile=False,
                 label_enabled=False,
             )
-            task = pta.FrameRenderTask(
+            task = pta_workers.FrameRenderTask(
                 plan_idx=0,
                 frame_idx=0,
                 items=(("full", (candidate,)),),
@@ -1688,10 +1689,10 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 shm_blocks=[volume_block, mask_block],
             )
 
-            pool: pta.PersistentRenderPool | None = None
-            handle: pta.RenderPhaseHandle | None = None
+            pool: pta_workers.PersistentRenderPool | None = None
+            handle: pta_workers.RenderPhaseHandle | None = None
             try:
-                pool = pta.PersistentRenderPool(backend="process", workers=1)
+                pool = pta_workers.PersistentRenderPool(backend="process", workers=1)
                 self.assertEqual(pool.start_method, "spawn")
                 handle = pool.install_phase(gen=1, prep=prepared, tasks=(task,))
                 self.assertEqual(pool.submit_phase(handle, meta=(1, "A")), 1)
@@ -1719,7 +1720,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 volume_block.release()
                 mask_block.release()
 
-    @unittest.skipIf(pta.gpu_fork_render_backend_available(), "host supports the GPU fork exception")
+    @unittest.skipIf(pta_workers.gpu_fork_render_backend_available(), "host supports the GPU fork exception")
     def test_gpu_policy_process_path_remains_explicitly_fork_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             gpu = pta.LoadedGpuAugmentation(
@@ -1731,7 +1732,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             )
             self._install_static(Path(temp_dir) / "output", augmentation=gpu)
             with self.assertRaisesRegex(RuntimeError, "fork-capable host"):
-                pta.PersistentRenderPool(
+                pta_workers.PersistentRenderPool(
                     backend="process",
                     workers=1,
                     gpu_device_ids=(0,),

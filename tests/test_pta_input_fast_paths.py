@@ -8,7 +8,7 @@ from unittest import mock
 import numpy as np
 import pytest
 
-from XTA import pta
+from XTA import pta, pta_inputs
 from XTA.pta_config import parse_pta_args
 from XTA.pta_runtime import build_runtime_options
 
@@ -146,7 +146,7 @@ def test_failed_sequential_mask_load_releases_decoded_shared_volume():
 
 def test_failed_video_process_start_releases_its_own_allocation():
     block=SimpleNamespace(release=mock.Mock())
-    with mock.patch.object(pta,'_require_bin'), mock.patch.object(pta.subprocess,'Popen',side_effect=OSError('spawn failed')):
+    with mock.patch.object(pta_inputs,'_require_bin'), mock.patch.object(pta_inputs.subprocess,'Popen',side_effect=OSError('spawn failed')):
         with pytest.raises(OSError,match='spawn failed'):
             pta.decode_video_gray8_to_memory(Path('sample.mkv'),warnings=pta.WarningLog(),
                 allocator=lambda shape:(np.zeros(shape,np.uint8),block),probe_info=video_spec().video_info_hint)

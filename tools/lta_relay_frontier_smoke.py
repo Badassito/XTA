@@ -180,7 +180,10 @@ def main():
         for name, cache, grid, view, seeds, inputs in prepared:
             case_root = root / name
             capture = {}
-            original_driver = execution._drive_workers_to_fixed_point
+            # Current helpers select an explicit reference backend. Retained
+            # source trees still dispatch both policies through lta_execution.
+            driver_module = execution if args.canonical_frontier else getattr(helper, "reference", execution)
+            original_driver = driver_module._drive_workers_to_fixed_point
 
             def save_native_union(*driver_args, **driver_kwargs):
                 result = original_driver(*driver_args, **driver_kwargs)
@@ -222,7 +225,7 @@ def main():
                     raise RuntimeError(f"authoritative seed pixels were lost in {name}")
                 return result
 
-            with mock.patch.object(execution, "_drive_workers_to_fixed_point", save_native_union):
+            with mock.patch.object(driver_module, "_drive_workers_to_fixed_point", save_native_union):
                 # Older retained helpers and drivers do not accept this keyword.
                 # Keep their default replay call identical unless explicitly enabled.
                 frontier_options = {"canonical_frontier": True} if args.canonical_frontier else {}

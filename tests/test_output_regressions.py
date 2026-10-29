@@ -13,7 +13,7 @@ import numpy as np
 
 # Control-flow mocks belong to individual tests. Replacing required packages
 # during collection can break Numba initialization and poison later modules.
-from XTA import outputs
+from XTA import outputs, nrrd_compression
 
 
 def _serial_indices(total: int, function: object, **_kwargs: object) -> None:
@@ -127,7 +127,7 @@ class AtomicNrrdTests(unittest.TestCase):
             '_write_nrrd_ascii_header',
             side_effect=lambda file_handle, **_kwargs: file_handle.write(b'HEADER\n'),
         ))
-        stack.enter_context(mock.patch.object(outputs, '_open_nrrd_payload_writer', side_effect=_payload_writer))
+        stack.enter_context(mock.patch.object(nrrd_compression, '_open_nrrd_payload_writer', side_effect=_payload_writer))
         return stack
 
     def test_single_shard_failure_preserves_previous_nrrd_and_removes_stage(self) -> None:

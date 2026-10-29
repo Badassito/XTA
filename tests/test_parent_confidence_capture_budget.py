@@ -1,4 +1,5 @@
 """Parent confidence capture uses allocated workers and admitted bounded scratch."""
+from XTA import tta_prepare_planning
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
@@ -161,8 +162,8 @@ def test_policy_memory_preflight_uses_same_actual_charge_and_reuses_canvas_plans
     def resolve(canvas, workers, *, enabled):
         assert canvas == shape and workers == 32
         return plan if enabled else None
-    with mock.patch.object(pipeline, '_parent_confidence_capture_plan', side_effect=resolve) as planner:
-        with mock.patch.object(pipeline, '_view_uses_interpolation', return_value=False):
+    with mock.patch.object(tta_prepare_planning, '_parent_confidence_capture_plan', side_effect=resolve) as planner:
+        with mock.patch.object(tta_prepare_planning, '_view_uses_interpolation', return_value=False):
             actual = pipeline._policy_parent_prepare_transient_bytes(tasks, 123456, 32,
                 interpolation_distance=0, retain_confidence=True)
     assert actual == pipeline._parent_prepare_transient_bytes(view, 7*11*13, 123456,

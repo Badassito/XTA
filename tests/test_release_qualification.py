@@ -1,4 +1,5 @@
 """A failed or source-mutating qualification cannot produce a release bundle."""
+import ast
 import json
 import importlib.util
 import os
@@ -10,6 +11,22 @@ from types import SimpleNamespace
 import pytest
 
 from tools import qualify_release as gate
+
+
+def test_required_cuda_oracles_resolve_to_actual_test_definitions():
+    """A renamed oracle must not make every otherwise passing GPU gate fail."""
+    root = Path(__file__).resolve().parents[1]
+    for classname, name, _minimum in gate.REQUIRED_CUDA_TESTS:
+        parts = classname.split('.')
+        source = root.joinpath(*parts[:2]).with_suffix('.py')
+        scope = ast.parse(source.read_text(encoding='utf-8')).body
+        for class_name in parts[2:]:
+            matches = [node for node in scope
+                       if isinstance(node, ast.ClassDef) and node.name == class_name]
+            assert len(matches) == 1, (classname, name)
+            scope = matches[0].body
+        assert any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and node.name == name for node in scope), (classname, name)
 
 
 @pytest.fixture

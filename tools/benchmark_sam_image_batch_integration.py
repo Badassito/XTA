@@ -309,7 +309,7 @@ def run_qualification(config, initial, output, config_sha256):
         YOLO_TTA_SAM_GPU_IMAGES='1',YOLO_TTA_SAM_RENDER_MAX_BYTES=str(config['scratch_bytes']))
     sys.dont_write_bytecode=True
     if str(ROOT) not in sys.path:sys.path.insert(0,str(ROOT))
-    from tools.qualify_release import gpu_reservation
+    from tools.gpu_reservation import gpu_reservation
     interval=sys.getswitchinterval()
     try:
         free=available_host_bytes();report['available_host_bytes_before_lock']=free;save()

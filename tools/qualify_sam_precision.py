@@ -40,7 +40,7 @@ def write_json(path, value):
 
 
 def source_identity():
-    names = ("XTA/lta_sam.py", "XTA/lta_worker_adapter.py", "XTA/lta_experimental.py",
+    names = ("XTA/lta_sam.py", "XTA/sam_sdk_compat.py", "XTA/lta_worker_adapter.py", "XTA/lta_experimental.py",
              "XTA/lta_tracker_features.py", "XTA/lta_feature_cache.py",
              "XTA/sam_tracker_runtime.py", "tools/qualify_sam_precision.py")
     return {name: sha(ROOT / name) for name in names}

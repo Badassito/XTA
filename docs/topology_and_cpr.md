@@ -1,6 +1,7 @@
-# v25.0.0: Centered Views, Explicit Topology
+# Topology options and centerline views
 
-This guide describes v25.0.0, following the v24.2.2 patch checkpoint (`1df0c28`).
+These options were introduced in v25.0.0, following the v24.2.2 patch checkpoint
+(`1df0c28`). This guide describes the current checkout's behavior.
 
 ## Optional 2D hole filling
 
@@ -61,16 +62,17 @@ See the mode parsers in [TTA config](../XTA/config.py),
 Add `--enable_cpr` to generate stacks of cross sections perpendicular to each
 extracted centerline's local tangent. A tubular object appears as approximately
 circular foreground in these images. Each parent image puts its centerline
-sample at the central pixel. Ordinary PTA tiles may place that sample anywhere
+sample at the geometric center, between the central pixels for an even-sized
+patch. Ordinary PTA tiles may place that sample anywhere
 within the tile, or omit it.
 
-The native parent raster samples approximately one post-cubic-resize voxel per
-pixel in both plane directions. Successive cross sections are spaced
-approximately one voxel along the centerline. Symmetric parent coverage can
-extend outside the source volume; those samples are zero for both intensity
-and labels. Intensity uses trilinear sampling and labels use nearest-neighbor
-sampling. Explicit `--imgsz` export resizing changes the final pixel spacing;
-the one-voxel spacing describes the native CPR raster before that resizing.
+The parent raster samples approximately one post-cubic-resize voxel per pixel
+in both plane directions. `--imgsz 2048` directly selects a centered 2048-square
+patch at that spacing. Successive cross sections are spaced approximately one
+voxel along the centerline. Patches may extend outside the source volume;
+those samples are zero for both intensity and labels. Intensity uses trilinear
+sampling and labels use nearest-neighbor sampling. Explicit tile-output resizing
+can change tile pixel spacing; parent patches retain the native sampling pitch.
 
 CPR reuses TTA's embedded medial-ridge centerline extractor and generates views
 per usable branch. It requires a complete labeled volume with adjacent slices;

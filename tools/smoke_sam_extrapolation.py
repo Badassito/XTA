@@ -7,18 +7,19 @@ an unchanged protocol/source tree. Outputs stay in the requested Scratch folder.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import contextlib
-import datetime as dt
 import hashlib
 import json
 import os
 from pathlib import Path
 import sys
 import time
-import uuid
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
+
+from tools.gpu_reservation import gpu_reservation
 
 
 def sha(path):
@@ -29,8 +30,17 @@ def sha(path):
     return digest.hexdigest()
 
 
+def json_receipt(value):
+    """Preserve immutable evidence values while normalizing JSON containers."""
+    if isinstance(value, Mapping):
+        return {key: json_receipt(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [json_receipt(item) for item in value]
+    return value
+
+
 def write(path, value):
-    Path(path).write_text(json.dumps(value, indent=2, allow_nan=False), encoding='utf-8')
+    Path(path).write_text(json.dumps(json_receipt(value), indent=2, allow_nan=False), encoding='utf-8')
 
 
 def identity(value):
@@ -174,32 +184,14 @@ def load_protocol(path):
 
 @contextlib.contextmanager
 def gpu_lock(path, state, task='sam-extrapolation-real-functional-smoke'):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    owner = dict(task=task, pid=os.getpid(),
-                 start_time=dt.datetime.now(dt.timezone.utc).isoformat(), token=uuid.uuid4().hex)
-    announced = None
-    while True:
+    # CUDA workers may outlive an exception. Preserve admission until their
+    # retirement has been proven by the caller's existing residency protocol.
+    with gpu_reservation(path, task_name=task,
+                         release_when=lambda: state['contexts_settled']) as owner:
         try:
-            with path.open('x', encoding='utf-8') as handle:
-                json.dump(owner, handle)
-            break
-        except FileExistsError:
-            holder = path.read_text('utf-8')
-            if holder != announced:
-                print('Waiting for GPU_LOCK: ' + holder, flush=True)
-                announced = holder
-            time.sleep(5)
-    print('GPU_LOCK acquired', flush=True)
-    try:
-        yield owner
-    finally:
-        current = json.loads(path.read_text('utf-8')) if path.exists() else {}
-        if current.get('token') == owner['token']:
-            if state['contexts_settled']:
-                path.unlink()
-                print('GPU_LOCK released after worker/model retirement', flush=True)
-            else:
+            yield owner
+        finally:
+            if not state['contexts_settled']:
                 print('GPU_LOCK retained: worker/model retirement is unproven', flush=True)
 
 

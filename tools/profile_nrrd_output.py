@@ -24,7 +24,7 @@ from unittest import mock
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from XTA import interpolation, outputs, runtime
+from XTA import interpolation, outputs, runtime, nrrd_compression
 
 
 class OutputLoadFixture:
@@ -344,9 +344,9 @@ def _run_mode(*, mode: str, root: Path, evidence_root: Path,
         timed_lock = TimedRLock(timings) if mode == 'on' else None
         telemetry.lock = timed_lock if timed_lock is not None else threading.RLock()
         telemetry._writer_condition = threading.Condition(telemetry.lock)
-        original_member = outputs._MemberParallelGzipPayloadWriter._compress_member
+        original_member = nrrd_compression._MemberParallelGzipPayloadWriter._compress_member
         original_native = deflate_module.gzip_compress
-        original_executor = outputs._nrrd_gzip_executor
+        original_executor = nrrd_compression._nrrd_gzip_executor
 
         def measured_member(writer, payload):
             wall_started, cpu_started = time.perf_counter_ns(), time.thread_time_ns()
@@ -375,10 +375,10 @@ def _run_mode(*, mode: str, root: Path, evidence_root: Path,
         paths = []
         with mock.patch.object(runtime, '_RUNTIME_TELEMETRY', telemetry), \
                 mock.patch.object(deflate_module, 'gzip_compress', measured_native), \
-                mock.patch.object(outputs, '_nrrd_gzip_executor', measured_executor), \
-                mock.patch.object(outputs._MemberParallelGzipPayloadWriter,
+                mock.patch.object(nrrd_compression, '_nrrd_gzip_executor', measured_executor), \
+                mock.patch.object(nrrd_compression._MemberParallelGzipPayloadWriter,
                                   '_compress_member', measured_member):
-            codec = outputs._require_nrrd_member_codec()
+            codec = nrrd_compression._require_nrrd_member_codec()
             if codec[0] != 'libdeflate':
                 raise RuntimeError(f'codec fallback invalidates comparison: {codec[0]}')
             telemetry.flush()
@@ -457,6 +457,7 @@ def execute(*, output_dir: Path, deps_dir: Path, shape: tuple[int, int, int],
     source_paths = {
         'XTA/runtime.py': Path(runtime.__file__).resolve(),
         'XTA/outputs.py': Path(outputs.__file__).resolve(),
+        'XTA/nrrd_compression.py': Path(nrrd_compression.__file__).resolve(),
         'tools/profile_nrrd_output.py': Path(__file__).resolve(),
     }
     report['source_paths'] = {name: str(path) for name, path in source_paths.items()}

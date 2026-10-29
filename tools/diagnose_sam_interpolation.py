@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import datetime
 import hashlib
 import json
 import os
@@ -17,12 +16,12 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-import uuid
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 if str(REPOSITORY) not in sys.path:
     sys.path.insert(0, str(REPOSITORY))
 
+from tools.gpu_reservation import gpu_reservation
 from XTA.artifact_archive import artifact_size, iter_artifacts, reference, split_reference
 
 
@@ -84,38 +83,8 @@ def resource_monitor(output,device=0):
         write_json(output,record)
 
 
-@contextlib.contextmanager
 def gpu_lock(path, task):
-    """Atomic shared lock, removed only by its own token holder."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    record = {"task": task, "pid": os.getpid(),
-              "start_time": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-              "token": uuid.uuid4().hex}
-    announced = None
-    while True:
-        record["start_time"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        try:
-            with path.open("x", encoding="utf-8") as stream:
-                json.dump(record, stream)
-            break
-        except FileExistsError:
-            holder = path.read_text(encoding="utf-8")
-            if holder != announced:
-                print(f"Waiting for GPU_LOCK: {holder}", flush=True)
-                announced = holder
-            time.sleep(5)
-    print(f"GPU_LOCK acquired: {record}", flush=True)
-    try:
-        yield record
-    finally:
-        try:
-            current = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            current = {}
-        if current.get("token") == record["token"]:
-            path.unlink()
-            print("GPU_LOCK released", flush=True)
+    return gpu_reservation(path, task_name=task)
 
 
 def decode(args):

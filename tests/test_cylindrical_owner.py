@@ -11,7 +11,7 @@ from unittest import mock
 import numpy as np
 
 from XTA import cylindrical_owner as owner, geometry
-from XTA.inference import _fill_holes_2d_scipy
+from XTA._prediction_cleanup import _fill_holes_2d_scipy
 from tools.probe_radial_streaming_architecture import decode_words, oracle
 
 

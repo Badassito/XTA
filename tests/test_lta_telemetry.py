@@ -50,7 +50,55 @@ class LtaTelemetryTests(unittest.TestCase):
         self.assertEqual(first, lta_source_fingerprint())
         self.assertIn('lta_worker_adapter.py', first['files'])
         self.assertIn('media.py', first['files'])
+        self.assertIn('sam_hole_fill.py', first['files'])
+        self.assertIn('unification/tta_manifest.py', first['files'])
+        self.assertEqual(first['scope'], 'xta.package_python_sources/1')
         self.assertEqual(len(first['sha256']), 64)
+
+    def test_source_fingerprint_covers_shared_sam_and_new_nested_modules(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'lta_worker_adapter.py').write_text('worker = 1\n', encoding='utf-8')
+            (root / 'sam_hole_fill.py').write_text('fill = 1\n', encoding='utf-8')
+            shared = root / 'unification' / 'sampling.py'
+            shared.parent.mkdir()
+            shared.write_text('sample = 1\n', encoding='utf-8')
+            original = lta_source_fingerprint(package_root=root)
+            self.assertEqual(set(original['files']), {
+                'lta_worker_adapter.py', 'sam_hole_fill.py', 'unification/sampling.py',
+            })
+            for path in (root / 'sam_hole_fill.py', shared):
+                with self.subTest(path=path.relative_to(root)):
+                    previous = lta_source_fingerprint(package_root=root)
+                    path.write_text(path.read_text(encoding='utf-8') + '# changed\n', encoding='utf-8')
+                    current = lta_source_fingerprint(package_root=root)
+                    self.assertNotEqual(previous['sha256'], current['sha256'])
+                    self.assertEqual(current, lta_source_fingerprint(package_root=root))
+
+            # Adding a future dependency requires no update to an inventory list.
+            (root / 'unification' / 'new_helper.py').write_text('new = 1\n', encoding='utf-8')
+            added = lta_source_fingerprint(package_root=root)
+            self.assertNotEqual(current['sha256'], added['sha256'])
+            self.assertIn('unification/new_helper.py', added['files'])
+
+            # Non-source runtime artifacts do not identify a different source.
+            (root / 'preview.png').write_bytes(b'preview')
+            (root / '__pycache__').mkdir()
+            (root / '__pycache__' / 'cached.pyc').write_bytes(b'bytecode')
+            self.assertEqual(added, lta_source_fingerprint(package_root=root))
+
+    def test_source_fingerprint_distinguishes_nested_paths_with_same_basename(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for folder in ('first', 'second'):
+                (root / folder).mkdir()
+                (root / folder / 'helper.py').write_text('value = 1\n', encoding='utf-8')
+            original = lta_source_fingerprint(package_root=root)
+            self.assertEqual(set(original['files']), {'first/helper.py', 'second/helper.py'})
+            (root / 'first' / 'helper.py').rename(root / 'first' / 'renamed.py')
+            renamed = lta_source_fingerprint(package_root=root)
+            self.assertNotEqual(original['sha256'], renamed['sha256'])
+            self.assertEqual(original['files']['first/helper.py'], renamed['files']['first/renamed.py'])
 
 
 if __name__ == '__main__':

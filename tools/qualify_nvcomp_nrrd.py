@@ -27,6 +27,12 @@ DEFAULT_DEFLATE = EXPERIMENT.parent / "compression-repro" / "deps"
 SIZES = (64 << 10, 256 << 10, 1 << 20, 4 << 20, 16 << 20)
 _DLL_HANDLES: list[object] = []
 
+if __package__:
+    from .gpu_reservation import gpu_reservation
+else:
+    from gpu_reservation import gpu_reservation
+
+
 
 def prepare(source: Path, output: Path, scan_mib: int = 256) -> dict:
     """Retain varied real 16-MiB windows without decoding an entire huge NRRD."""
@@ -74,28 +80,9 @@ def prepare(source: Path, output: Path, scan_mib: int = 256) -> dict:
     return manifest
 
 
-class GpuLock:
-    def __init__(self, path: Path = LOCK) -> None:
-        self.path = path
-        self.owned = False
-
-    def __enter__(self) -> "GpuLock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        # O_EXCL gives one owner. An existing lock is never removed implicitly.
-        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(f"qualify_nvcomp_nrrd pid={os.getpid()} start={time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n")
-        except BaseException:
-            self.path.unlink(missing_ok=True)
-            raise
-        self.owned = True
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        if self.owned:
-            self.path.unlink(missing_ok=True)
-            self.owned = False
+def GpuLock(path: Path = LOCK):
+    """Compatibility entry point for the shared GPU reservation policy."""
+    return gpu_reservation(path, task_name="qualify_nvcomp_nrrd")
 
 
 def load_nvcomp(deps: Path, runtime: Path):

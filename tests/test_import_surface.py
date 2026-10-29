@@ -12,10 +12,15 @@ from XTA import __version__
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / f"GPT-6-Astra-Ultra_v{__version__}_SLURM.py"
 UNIFIED_MODULES = (
+    "_prediction_cleanup",
     "experimental_features",
     "gaussian",
+    "nrrd_compression",
+    "runtime_observability",
+    "sam_sdk_compat",
     "lta_config",
     "lta_execution",
+    "lta_window_execution",
     "lta_experimental",
     "lta_frontier",
     "lta_frontier_execution",
@@ -35,6 +40,8 @@ UNIFIED_MODULES = (
     "lta_worker_adapter",
     "lta_workers",
     "pta_config",
+    "pta_inputs",
+    "pta_planning",
     "pta_mode",
     "pta_runtime",
     "pta_scheduler",
@@ -48,6 +55,8 @@ UNIFIED_MODULES = (
     "tta_lifecycle",
     "tta_outputs",
     "tta_prediction",
+    "tta_prepare_planning",
+    "tta_provenance",
     "tta_scheduler",
     "tta_terminal",
     "cuda_finalization",

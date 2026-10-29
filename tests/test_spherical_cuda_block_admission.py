@@ -1,11 +1,10 @@
 """Spherical batching amortizes handshakes without exceeding its RAM/VRAM grant."""
-import ast
 import math
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from XTA.tta_prepare_planning import _parent_prepare_transient_bytes
 from XTA.spherical_projection_cuda import spherical_cuda_block_plan, SphericalCudaProjectionUnavailable
 from XTA.cylindrical_cuda_projection import _SETUP_BYTES, _CROP_METADATA_DTYPE, _MAX_ENCODED_SLICES
 
@@ -62,13 +61,7 @@ def test_invalid_or_subplane_explicit_cap_declines_before_cuda_import(cap):
 
 
 def test_existing_spherical_parent_transient_covers_bounded_host_window():
-    source = Path(__file__).parents[1]/'XTA'/'pipeline.py'
-    tree = ast.parse(source.read_text(encoding='utf-8'))
-    helper = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
-                  and node.name == '_parent_prepare_transient_bytes')
-    namespace = dict(GIB=GIB, math=math)
-    exec(compile(ast.Module(body=[helper], type_ignores=[]), '<Spherical parent transient>', 'exec'), namespace)
-    admitted = namespace[helper.name](SimpleNamespace(name='spherical_upright_px'),
+    admitted = _parent_prepare_transient_bytes(SimpleNamespace(name='spherical_upright_px'),
         512*MIB, math.prod(SHAPE), interpolation_enabled=False)
     # One pinned output, current result and prefetched result. The previous
     # caller result can briefly survive generator resume before reassignment.

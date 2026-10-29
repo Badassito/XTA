@@ -16,7 +16,6 @@ lets CPU tests inject small deterministic operations.
 
 from __future__ import annotations
 
-import hashlib
 import math
 import os
 import tempfile
@@ -26,6 +25,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 import numpy as np
 
+from .file_hashing import sha256_file as _sha256_path
 from .lta_outputs import (
     LtaArtifactReceipt,
     LtaCheckpointArtifact,
@@ -178,7 +178,7 @@ class LtaCompletedViewFillReceipt:
 
 def _default_binary_hole_fill(mask_bool: np.ndarray) -> np.ndarray:
     # Function-local import preserves the dependency-light LTA import boundary.
-    from .inference import _fill_holes_2d_opencv_u8_inplace
+    from ._prediction_cleanup import _fill_holes_2d_opencv_u8_inplace
 
     # Reuse TTA's foreground-bbox plus exterior-halo implementation. Labeling
     # the full tile for every small instance stalls the next tracker frame;
@@ -339,7 +339,7 @@ def fill_completed_view_holes_2d_inplace(
             input_foreground_pixels=foreground, output_foreground_pixels=foreground,
             added_pixels=0, algorithm='disabled')
     if operation is None:
-        from .inference import fill_view_volume_holes_2d_inplace
+        from ._prediction_cleanup import fill_view_volume_holes_2d_inplace
 
         operation = fill_view_volume_holes_2d_inplace
     before = int(np.count_nonzero(volume_array))
@@ -792,17 +792,6 @@ class LtaFinalNrrdArtifact:
             "source_role": self.layer.source_role,
             "shape_tyx": [int(value) for value in np.asarray(self.layer.volume).shape],
         }
-
-
-def _sha256_path(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _write_native_checkpoint_nrrd(

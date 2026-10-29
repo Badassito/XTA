@@ -127,10 +127,10 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
                 return_value=expected_mask,
             ) as mask_render,
         ):
-            actual_image = pta._shared_render_full_intensity(
+            actual_image = pta_rendering._shared_render_full_intensity(
                 intensity, view, 1, aff
             )
-            actual_mask = pta._shared_render_full_mask(
+            actual_mask = pta_rendering._shared_render_full_mask(
                 categorical, view, 1, aff
             )
 
@@ -215,10 +215,10 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
                 return_value=expected_mask,
             ) as mask_render,
         ):
-            image = pta._shared_render_full_intensity(
+            image = pta_rendering._shared_render_full_intensity(
                 np.zeros((3, 4, 5), dtype=np.uint8), view, 1, aff
             )
-            mask = pta._shared_render_full_mask(
+            mask = pta_rendering._shared_render_full_mask(
                 np.zeros((3, 4, 5), dtype=np.uint8), view, 1, aff
             )
 

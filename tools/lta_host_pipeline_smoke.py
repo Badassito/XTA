@@ -124,7 +124,8 @@ def run_case(root,*,windowed,cache,view,seed_mask,anchor,active_start,active_sto
     tasks=execution._plan_window_tasks(chains) if windowed else chains
     scheduler=LtaViewAffinityScheduler((task.work for task in tasks),(0,1,2,3),helper_queue_order='head',max_relay_generation=20)
     revisions={}
-    execution._prime_authoritative_relay_destinations(scheduler,tasks[0].work.view,inventory,revisions)
+    from tests.reference_backends import lta_generation as reference
+    reference._prime_authoritative_relay_destinations(scheduler,tasks[0].work.view,inventory,revisions)
     union_path=root/'view.sparse.raw'
     shape=(view.frame_count,view.frame_height,view.frame_width)
     sparse_file(union_path,int(np.prod(shape)))
@@ -132,13 +133,16 @@ def run_case(root,*,windowed,cache,view,seed_mask,anchor,active_start,active_sto
     pool=None
     summary={'status':'running','windowed':windowed,'initial_logical_chains':len(chains),
              'initial_dispatch_units':len(tasks),'source_fingerprint':lta_source_fingerprint()}
+    reference_path=Path(reference.__file__).resolve(strict=True)
+    summary['reference_backend']={'path':str(reference_path),
+                                  'sha256':hashlib.sha256(reference_path.read_bytes()).hexdigest()}
     started=time.perf_counter()
     try:
         pool=LtaWorkerPool((0,1,2,3),LtaWorkerInit(adapter_module='tools.lta_host_pipeline_smoke',
                     adapter_factory='build_cpu_context',adapter_execute='execute_cpu_task',adapter_shutdown='close_cpu_context',
                     adapter_config={'trace_dir':str(root/'traces'),'active_start':active_start,'active_stop':active_stop,
                                     'model_delay':model_delay}),startup_timeout=60)
-        result=execution._drive_workers_to_fixed_point(scheduler=scheduler,pool=pool,initial=tasks,
+        result=reference._drive_workers_to_fixed_point(scheduler=scheduler,pool=pool,initial=tasks,
                     view_plan=view,cache_ref=cache,view_union=union,relay_mask_revisions=revisions,
                     temp_root=root,conf=0.15,empty_frame_limit=30,worker_task_timeout=120,trace=trace)
         active=np.asarray(union[active_start:active_stop])
@@ -149,8 +153,7 @@ def run_case(root,*,windowed,cache,view,seed_mask,anchor,active_start,active_sto
                        active_foreground_pixels=int(np.count_nonzero(active)),
                        native_view_logical_bytes=union_path.stat().st_size,
                        native_view_allocated_bytes=allocated_bytes(union_path))
-        from XTA.lta_postprocessing import fill_binary_mask_holes_2d
-        expected=fill_binary_mask_holes_2d(seed_mask)
+        expected=np.asarray(seed_mask,dtype=bool)
         assert np.array_equal(active[:,:grid.tile_size,:grid.tile_size],np.broadcast_to(expected,(active_stop-active_start,*expected.shape)))
         assert summary['active_foreground_pixels']==int(np.count_nonzero(expected))*(active_stop-active_start)
         assert summary['native_view_allocated_bytes']<1024**3

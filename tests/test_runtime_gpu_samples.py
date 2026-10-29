@@ -4,7 +4,7 @@ import threading
 from types import SimpleNamespace
 from unittest import mock
 
-from XTA import runtime
+from XTA import runtime, runtime_observability
 
 
 class FakeNvml:
@@ -28,7 +28,7 @@ def telemetry(tmp_path):
 def test_unchanged_real_samples_have_new_times_but_flushes_do_not(tmp_path):
     sink=telemetry(tmp_path)
     sampler=runtime.RuntimeSystemSampler(sink)
-    with mock.patch.object(runtime,'_load_nvidia_ml_py',return_value=FakeNvml()):
+    with mock.patch.object(runtime_observability,'_load_nvidia_ml_py',return_value=FakeNvml()):
         with mock.patch.object(runtime.time,'monotonic_ns',side_effect=[100,110]):
             sampler._sample_gpu()
         sink.flush(); sink.flush()
@@ -49,7 +49,7 @@ def test_failed_partial_poll_does_not_publish_mixed_gauges_or_new_timestamp(tmp_
     sink=telemetry(tmp_path)
     sampler=runtime.RuntimeSystemSampler(sink)
     nvml=FakeNvml()
-    with mock.patch.object(runtime,'_load_nvidia_ml_py',return_value=nvml):
+    with mock.patch.object(runtime_observability,'_load_nvidia_ml_py',return_value=nvml):
         sampler._sample_gpu()
         original=sink.snapshot()['gauges']
         with mock.patch.object(nvml,'nvmlDeviceGetUtilizationRates',side_effect=[
@@ -62,7 +62,7 @@ def test_optional_identity_errors_preserve_utilization_sample(tmp_path):
     sink=telemetry(tmp_path)
     sampler=runtime.RuntimeSystemSampler(sink)
     nvml=FakeNvml()
-    with mock.patch.object(runtime,'_load_nvidia_ml_py',return_value=nvml), \
+    with mock.patch.object(runtime_observability,'_load_nvidia_ml_py',return_value=nvml), \
          mock.patch.object(nvml,'nvmlDeviceGetUUID',side_effect=NotImplementedError), \
          mock.patch.object(nvml,'nvmlDeviceGetPciInfo',side_effect=NotImplementedError):
         sampler._sample_gpu()
@@ -132,7 +132,7 @@ def test_pipeline_stage_provider_timestamps_actual_samples_not_later_snapshots(t
         and node.value.args[0].value == 'gpu.stage.live')
     exec(compile(ast.Module(body=[registration], type_ignores=[]), '<live-stage-registration>', 'exec'),
          {'runtime_telemetry': lambda: sink, '_MAIN_PROCESS_GPU_STAGE_COORDINATOR': coordinator})
-    with mock.patch.object(runtime, '_load_nvidia_ml_py') as nvml:
+    with mock.patch.object(runtime_observability, '_load_nvidia_ml_py') as nvml:
         with mock.patch.object(runtime.time, 'monotonic_ns', return_value=100):
             sink.sample_registered_providers()
         with mock.patch.object(runtime.time, 'monotonic_ns', return_value=200):

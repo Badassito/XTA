@@ -69,7 +69,7 @@ from .geometry import (
     view_processing_min_radius,
     view_processing_search_angle,
 )
-from .inference import cleanup_view_volume_after_prediction_inplace
+from ._prediction_cleanup import cleanup_view_volume_after_prediction_inplace
 from .interpolation import (
     CTILE_FORMAT,
     CTILE_INDEX_DTYPE,

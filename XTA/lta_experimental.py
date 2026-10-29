@@ -1,8 +1,9 @@
-"""Pinned private SAM tracker adapter used by the experimental LTA path.
+"""Pinned private SAM tracker adapter used by production mask propagation.
 
-This module is the single quarantine boundary for SAM 3.1 internals used to
-seed tracker state from authoritative masks.  Imports remain accelerator-light;
-NumPy and Torch are loaded only while a session is executing.
+This module quarantines SAM 3.1 session internals used by LTA and TTA to seed
+tracker state from authoritative masks. Predictor construction belongs to
+``lta_sam``. Imports remain accelerator-light; NumPy and Torch are loaded only
+while a session is executing. The module name is retained for existing callers.
 """
 
 from __future__ import annotations

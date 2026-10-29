@@ -13,14 +13,28 @@ import threading
 import time
 from typing import Iterator
 
+from .file_hashing import sha256_file
 
-def lta_source_fingerprint() -> dict[str, object]:
-    """Identify LTA modules and the shared decoder, including uncommitted edits."""
-    root = Path(__file__).resolve().parent
-    files = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-             for path in sorted((*root.glob('lta_*.py'), root / 'media.py'))}
-    encoded = json.dumps(files, sort_keys=True, separators=(',', ':')).encode()
-    return {"sha256": hashlib.sha256(encoded).hexdigest(), "files": files}
+
+_SOURCE_FINGERPRINT_SCOPE = "xta.package_python_sources/1"
+
+
+def lta_source_fingerprint(*, package_root: str | Path | None = None) -> dict[str, object]:
+    """Identify every installed XTA Python source, including uncommitted edits.
+
+    The explicit scope replaces the former LTA-only inventory: shared SAM,
+    geometry, and newly added modules affect the hash without a dependency list.
+    Keys are paths relative to the package root, including nested packages.
+    Native binaries, model weights, and external dependencies have separate
+    provenance; this scope identifies Python sources only. ``package_root``
+    allows the same inventory contract to be exercised on a source fixture.
+    """
+    root = Path(package_root).resolve() if package_root is not None else Path(__file__).resolve().parent
+    files = {path.relative_to(root).as_posix(): sha256_file(path)
+             for path in sorted(root.rglob('*.py')) if path.is_file()}
+    payload = {"scope": _SOURCE_FINGERPRINT_SCOPE, "files": files}
+    encoded = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()
+    return {"sha256": hashlib.sha256(encoded).hexdigest(), **payload}
 
 
 class LtaExecutionTrace:

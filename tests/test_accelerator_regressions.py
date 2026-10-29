@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import gzip
+import io
 import os
 import tempfile
 import threading
@@ -14,6 +15,7 @@ from unittest import mock
 os.environ['YOLO_TTA_TELEMETRY'] = '0'
 
 from tests.test_output_regressions import outputs
+from XTA import nrrd_compression
 from XTA import intel_compression
 
 # Several policy tests deliberately replace the entire environment. Initialize the
@@ -109,39 +111,39 @@ class _FakeHardwareCodec:
 
 class IntelCompressionPolicyTests(unittest.TestCase):
     def setUp(self) -> None:
-        outputs.shutdown_nrrd_gzip_executors()
+        nrrd_compression.shutdown_nrrd_gzip_executors()
         intel_compression._reset_for_tests()
 
     def tearDown(self) -> None:
-        outputs.shutdown_nrrd_gzip_executors()
+        nrrd_compression.shutdown_nrrd_gzip_executors()
         intel_compression._reset_for_tests()
 
     def test_auto_prefers_qat_and_cpu_is_the_opt_out(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(
-                outputs._nrrd_member_codec_candidates(),
+                nrrd_compression._nrrd_member_codec_candidates(),
                 ('qat', 'libdeflate', 'isal', 'zlib'),
             )
         with mock.patch.dict(
             os.environ, {'YOLO_TTA_NRRD_MEMBER_CODEC': 'cpu'}, clear=True,
         ):
             self.assertEqual(
-                outputs._nrrd_member_codec_candidates(),
+                nrrd_compression._nrrd_member_codec_candidates(),
                 ('libdeflate', 'isal', 'zlib'),
             )
         with mock.patch.dict(
             os.environ, {'YOLO_TTA_NRRD_MEMBER_CODEC': 'iaa'}, clear=True,
         ):
-            self.assertEqual(outputs._nrrd_member_codec_candidates(), ('iaa',))
+            self.assertEqual(nrrd_compression._nrrd_member_codec_candidates(), ('iaa',))
 
     def test_cpu_policy_never_probes_qat(self) -> None:
         fake = _FakeHardwareCodec()
         intel_compression._set_test_module('qat', fake)
-        zlib_spec = outputs._nrrd_member_codec_spec('zlib')
+        zlib_spec = nrrd_compression._nrrd_member_codec_spec('zlib')
         with mock.patch.dict(
             os.environ, {'YOLO_TTA_NRRD_MEMBER_CODEC': 'cpu'}, clear=True,
-        ), mock.patch.object(outputs, '_nrrd_member_codec_spec', return_value=zlib_spec) as resolve:
-            selected = outputs._require_nrrd_member_codec()
+        ), mock.patch.object(nrrd_compression, '_nrrd_member_codec_spec', return_value=zlib_spec) as resolve:
+            selected = nrrd_compression._require_nrrd_member_codec()
             self.assertEqual(selected[0], 'zlib')
             resolve.assert_called_once_with('libdeflate')
             self.assertEqual(fake.capability_calls, 0)
@@ -156,8 +158,8 @@ class IntelCompressionPolicyTests(unittest.TestCase):
 
         with mock.patch.dict(
             os.environ, {'YOLO_TTA_NRRD_MEMBER_CODEC': 'qat'}, clear=True,
-        ), mock.patch.object(outputs, '_nrrd_member_codec_spec', side_effect=fail):
-            self.assertIsNone(outputs._select_nrrd_member_codec())
+        ), mock.patch.object(nrrd_compression, '_nrrd_member_codec_spec', side_effect=fail):
+            self.assertIsNone(nrrd_compression._select_nrrd_member_codec())
         self.assertEqual(attempted, ['qat'])
 
     def test_valid_qat_runs_kat_on_every_bounded_worker(self) -> None:
@@ -172,7 +174,7 @@ class IntelCompressionPolicyTests(unittest.TestCase):
             },
             clear=True,
         ):
-            spec = outputs._require_nrrd_member_codec(expected_input_bytes=4096)
+            spec = nrrd_compression._require_nrrd_member_codec(expected_input_bytes=4096)
         self.assertEqual(spec[:2], ('qat', 1))
         self.assertEqual(len(fake.preflight_threads), 2)
         self.assertTrue(fake.compress_calls)
@@ -181,7 +183,7 @@ class IntelCompressionPolicyTests(unittest.TestCase):
         self.assertTrue(all(call['numa_id'] is None for call in fake.compress_calls))
         compression_threads = {int(call['thread']) for call in fake.compress_calls}
         self.assertTrue(fake.preflight_threads <= compression_threads)
-        outputs.shutdown_nrrd_gzip_executors()
+        nrrd_compression.shutdown_nrrd_gzip_executors()
         self.assertEqual(fake.closed_threads, fake.preflight_threads)
 
     def test_native_preflight_hook_is_followed_by_hardware_round_trip(self) -> None:
@@ -212,7 +214,7 @@ class IntelCompressionPolicyTests(unittest.TestCase):
             },
             clear=True,
         ):
-            spec = outputs._require_nrrd_member_codec(
+            spec = nrrd_compression._require_nrrd_member_codec(
                 expected_input_bytes=1024 * 1024,
             )
         self.assertEqual(spec[:2], ('qat', 1))
@@ -224,22 +226,22 @@ class IntelCompressionPolicyTests(unittest.TestCase):
     def test_corrupt_qat_falls_through_in_auto_but_forced_qat_fails(self) -> None:
         fake = _FakeHardwareCodec(corrupt=True)
         intel_compression._set_test_module('qat', fake)
-        zlib_spec = outputs._nrrd_member_codec_spec('zlib')
+        zlib_spec = nrrd_compression._nrrd_member_codec_spec('zlib')
 
         # Preserve the real function without relying on mock's synthetic __wrapped__.
-        real_spec = outputs._nrrd_member_codec_spec
+        real_spec = nrrd_compression._nrrd_member_codec_spec
 
         def resolve(name: str):
             return real_spec(name) if str(name) in {'qat', 'zlib'} else (_ for _ in ()).throw(ModuleNotFoundError(name))
 
         with mock.patch.dict(os.environ, {'YOLO_TTA_NRRD_MEMBER_CODEC': 'auto'}, clear=True), \
-                mock.patch.object(outputs, '_nrrd_member_codec_spec', side_effect=resolve):
-            selected = outputs._select_nrrd_member_codec()
+                mock.patch.object(nrrd_compression, '_nrrd_member_codec_spec', side_effect=resolve):
+            selected = nrrd_compression._select_nrrd_member_codec()
         self.assertIsNotNone(selected)
         self.assertEqual(selected[0], 'zlib')  # type: ignore[index]
         with mock.patch.dict(os.environ, {'YOLO_TTA_NRRD_MEMBER_CODEC': 'qat'}, clear=True), \
-                mock.patch.object(outputs, '_nrrd_member_codec_spec', side_effect=resolve):
-            self.assertIsNone(outputs._select_nrrd_member_codec())
+                mock.patch.object(nrrd_compression, '_nrrd_member_codec_spec', side_effect=resolve):
+            self.assertIsNone(nrrd_compression._select_nrrd_member_codec())
 
     def test_unavailable_or_software_fallback_capability_is_rejected(self) -> None:
         no_hardware = _FakeHardwareCodec()
@@ -272,11 +274,11 @@ class IntelCompressionPolicyTests(unittest.TestCase):
 
         fake.compress_gzip = fail_with_status  # type: ignore[method-assign]
         intel_compression._set_test_module('qat', fake)
-        sink = outputs.io.StringIO()
+        sink = io.StringIO()
         with mock.patch.dict(
             os.environ, {'YOLO_TTA_NRRD_MEMBER_CODEC': 'qat'}, clear=True,
         ), contextlib.redirect_stdout(sink):
-            self.assertIsNone(outputs._select_nrrd_member_codec())
+            self.assertIsNone(nrrd_compression._select_nrrd_member_codec())
         self.assertIn('QAT status=QZ_FAIL device=0000:6b:00.0', sink.getvalue())
 
     def test_qat_level_must_be_reported_supported(self) -> None:
@@ -292,21 +294,21 @@ class IntelCompressionPolicyTests(unittest.TestCase):
             clear=True,
         ):
             with self.assertRaisesRegex(ValueError, 'unsupported'):
-                outputs._nrrd_member_codec_spec('qat')
+                nrrd_compression._nrrd_member_codec_spec('qat')
         with mock.patch.dict(
             os.environ, {'YOLO_TTA_NRRD_GZIP_LEVEL': '6'}, clear=True,
         ):
             with self.assertRaisesRegex(ValueError, 'unsupported'):
-                outputs._nrrd_member_codec_spec('qat')
+                nrrd_compression._nrrd_member_codec_spec('qat')
 
 
 class CompressionLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
-        outputs.shutdown_nrrd_gzip_executors()
+        nrrd_compression.shutdown_nrrd_gzip_executors()
         intel_compression._reset_for_tests()
 
     def tearDown(self) -> None:
-        outputs.shutdown_nrrd_gzip_executors()
+        nrrd_compression.shutdown_nrrd_gzip_executors()
         intel_compression._reset_for_tests()
 
     def test_intel_fork_child_replaces_lock_and_discards_module_state(self) -> None:
@@ -331,35 +333,35 @@ class CompressionLifecycleTests(unittest.TestCase):
                 self.shutdown_calls += 1
 
         inherited = InheritedExecutor()
-        old_executor_lock = outputs._NRRD_GZIP_EXECUTOR_LOCK
-        old_zero_lock = outputs._NRRD_ZERO_MEMBER_LOCK
-        old_test_lock = outputs._NRRD_MEMBER_GZIP_TEST_LOCK
-        old_announce_lock = outputs._NRRD_CPU_DEFLATE_BACKEND_ANNOUNCE_LOCK
-        outputs._NRRD_GZIP_EXECUTORS[('qat', 1)] = inherited
-        outputs._NRRD_ZERO_MEMBER_CACHE[8] = b'parent member'
-        outputs._NRRD_MEMBER_CODEC_SETTING_WARNED = True
-        outputs._NRRD_MEMBER_GZIP_OK[('parent', 1)] = True
-        outputs._NRRD_MEMBER_GZIP_FAILURE_REASONS[('parent', 1)] = 'failure'
-        outputs._NRRD_MEMBER_GZIP_ANNOUNCED = True
-        outputs._NRRD_MEMBER_CODEC_FAILURES_ANNOUNCED.add('qat')
-        outputs._NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED = True
+        old_executor_lock = nrrd_compression._NRRD_GZIP_EXECUTOR_LOCK
+        old_zero_lock = nrrd_compression._NRRD_ZERO_MEMBER_LOCK
+        old_test_lock = nrrd_compression._NRRD_MEMBER_GZIP_TEST_LOCK
+        old_announce_lock = nrrd_compression._NRRD_CPU_DEFLATE_BACKEND_ANNOUNCE_LOCK
+        nrrd_compression._NRRD_GZIP_EXECUTORS[('qat', 1)] = inherited
+        nrrd_compression._NRRD_ZERO_MEMBER_CACHE[8] = b'parent member'
+        nrrd_compression._NRRD_MEMBER_CODEC_SETTING_WARNED = True
+        nrrd_compression._NRRD_MEMBER_GZIP_OK[('parent', 1)] = True
+        nrrd_compression._NRRD_MEMBER_GZIP_FAILURE_REASONS[('parent', 1)] = 'failure'
+        nrrd_compression._NRRD_MEMBER_GZIP_ANNOUNCED = True
+        nrrd_compression._NRRD_MEMBER_CODEC_FAILURES_ANNOUNCED.add('qat')
+        nrrd_compression._NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED = True
 
-        outputs._after_nrrd_compression_fork_child()
+        nrrd_compression._after_nrrd_compression_fork_child()
 
         self.assertEqual(inherited.shutdown_calls, 0)
-        self.assertEqual(outputs._NRRD_GZIP_EXECUTORS, {})
-        self.assertEqual(outputs._NRRD_ZERO_MEMBER_CACHE, {})
-        self.assertEqual(outputs._NRRD_MEMBER_GZIP_OK, {})
-        self.assertEqual(outputs._NRRD_MEMBER_GZIP_FAILURE_REASONS, {})
-        self.assertEqual(outputs._NRRD_MEMBER_CODEC_FAILURES_ANNOUNCED, set())
-        self.assertFalse(outputs._NRRD_MEMBER_CODEC_SETTING_WARNED)
-        self.assertFalse(outputs._NRRD_MEMBER_GZIP_ANNOUNCED)
-        self.assertFalse(outputs._NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED)
-        self.assertIsNot(outputs._NRRD_GZIP_EXECUTOR_LOCK, old_executor_lock)
-        self.assertIsNot(outputs._NRRD_ZERO_MEMBER_LOCK, old_zero_lock)
-        self.assertIsNot(outputs._NRRD_MEMBER_GZIP_TEST_LOCK, old_test_lock)
+        self.assertEqual(nrrd_compression._NRRD_GZIP_EXECUTORS, {})
+        self.assertEqual(nrrd_compression._NRRD_ZERO_MEMBER_CACHE, {})
+        self.assertEqual(nrrd_compression._NRRD_MEMBER_GZIP_OK, {})
+        self.assertEqual(nrrd_compression._NRRD_MEMBER_GZIP_FAILURE_REASONS, {})
+        self.assertEqual(nrrd_compression._NRRD_MEMBER_CODEC_FAILURES_ANNOUNCED, set())
+        self.assertFalse(nrrd_compression._NRRD_MEMBER_CODEC_SETTING_WARNED)
+        self.assertFalse(nrrd_compression._NRRD_MEMBER_GZIP_ANNOUNCED)
+        self.assertFalse(nrrd_compression._NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED)
+        self.assertIsNot(nrrd_compression._NRRD_GZIP_EXECUTOR_LOCK, old_executor_lock)
+        self.assertIsNot(nrrd_compression._NRRD_ZERO_MEMBER_LOCK, old_zero_lock)
+        self.assertIsNot(nrrd_compression._NRRD_MEMBER_GZIP_TEST_LOCK, old_test_lock)
         self.assertIsNot(
-            outputs._NRRD_CPU_DEFLATE_BACKEND_ANNOUNCE_LOCK,
+            nrrd_compression._NRRD_CPU_DEFLATE_BACKEND_ANNOUNCE_LOCK,
             old_announce_lock,
         )
 
@@ -378,18 +380,18 @@ class CompressionLifecycleTests(unittest.TestCase):
 
         executor = BrokenExecutor()
         with mock.patch.object(
-            outputs, 'runtime_telemetry', side_effect=RuntimeError('telemetry sentinel'),
+            nrrd_compression, 'runtime_telemetry', side_effect=RuntimeError('telemetry sentinel'),
         ), mock.patch('builtins.print', side_effect=OSError('stdout sentinel')):
-            outputs._close_nrrd_gzip_executor_entry('qat', 1, executor)
+            nrrd_compression._close_nrrd_gzip_executor_entry('qat', 1, executor)
         self.assertEqual(executor.shutdown_calls, 2)
 
 
 class MemberWriterHardwareTests(unittest.TestCase):
     def setUp(self) -> None:
-        outputs.shutdown_nrrd_gzip_executors()
+        nrrd_compression.shutdown_nrrd_gzip_executors()
 
     def tearDown(self) -> None:
-        outputs.shutdown_nrrd_gzip_executors()
+        nrrd_compression.shutdown_nrrd_gzip_executors()
 
     def test_concatenated_native_members_and_cached_zeros_round_trip(self) -> None:
         calls: list[bytes] = []
@@ -400,8 +402,8 @@ class MemberWriterHardwareTests(unittest.TestCase):
             split = max(1, len(data) // 2)
             return gzip.compress(data[:split], mtime=0) + gzip.compress(data[split:], mtime=0)
 
-        sink = outputs.io.BytesIO()
-        writer = outputs._MemberParallelGzipPayloadWriter(
+        sink = io.BytesIO()
+        writer = nrrd_compression._MemberParallelGzipPayloadWriter(
             sink, chunk_bytes=16, codec_spec=('qat-test', 1, compress),
         )
         writer.write(b'abcdefghijk')
@@ -425,8 +427,8 @@ class MemberWriterHardwareTests(unittest.TestCase):
                 return gzip.compress(data, mtime=0)
 
         payload = bytes(range(100)) * 3
-        sink = outputs.io.BytesIO()
-        writer = outputs._MemberParallelGzipPayloadWriter(
+        sink = io.BytesIO()
+        writer = nrrd_compression._MemberParallelGzipPayloadWriter(
             sink, chunk_bytes=256, codec_spec=('qat-test', 1, Compressor()),
         )
         writer.write(payload)
@@ -449,8 +451,8 @@ class MemberWriterHardwareTests(unittest.TestCase):
 
         first = bytes(range(128)) * 2
         tail = b'separate tiny tail'
-        sink = outputs.io.BytesIO()
-        writer = outputs._MemberParallelGzipPayloadWriter(
+        sink = io.BytesIO()
+        writer = nrrd_compression._MemberParallelGzipPayloadWriter(
             sink, chunk_bytes=256, codec_spec=('qat-test', 1, Compressor()),
         )
 
@@ -475,8 +477,8 @@ class MemberWriterHardwareTests(unittest.TestCase):
                 return gzip.compress(data, mtime=0)
 
         tail = b'final sparse crop'
-        sink = outputs.io.BytesIO()
-        writer = outputs._MemberParallelGzipPayloadWriter(
+        sink = io.BytesIO()
+        writer = nrrd_compression._MemberParallelGzipPayloadWriter(
             sink, chunk_bytes=256, codec_spec=('qat-test', 1, Compressor()),
         )
 
@@ -502,8 +504,8 @@ class MemberWriterHardwareTests(unittest.TestCase):
 
         first = bytes(range(128)) * 2
         tail = b'final sparse crop'
-        sink = outputs.io.BytesIO()
-        writer = outputs._MemberParallelGzipPayloadWriter(
+        sink = io.BytesIO()
+        writer = nrrd_compression._MemberParallelGzipPayloadWriter(
             sink, chunk_bytes=256, codec_spec=('qat-test', 1, Compressor()),
         )
 
@@ -529,8 +531,8 @@ class MemberWriterHardwareTests(unittest.TestCase):
                 return gzip.compress(bytes(memoryview(payload).cast('B')), mtime=0)  # type: ignore[arg-type]
 
         compressor = Compressor()
-        sink = outputs.io.BytesIO()
-        writer = outputs._MemberParallelGzipPayloadWriter(
+        sink = io.BytesIO()
+        writer = nrrd_compression._MemberParallelGzipPayloadWriter(
             sink, chunk_bytes=256, codec_spec=('qat-test', 1, compressor),
         )
 
@@ -554,8 +556,8 @@ class MemberWriterHardwareTests(unittest.TestCase):
                 raise TypeError('native status conversion failed after request')
 
         compressor = Compressor()
-        writer = outputs._MemberParallelGzipPayloadWriter(
-            outputs.io.BytesIO(), codec_spec=('qat-test', 1, compressor),
+        writer = nrrd_compression._MemberParallelGzipPayloadWriter(
+            io.BytesIO(), codec_spec=('qat-test', 1, compressor),
         )
 
         def finish() -> None:
@@ -585,9 +587,9 @@ class MemberWriterHardwareTests(unittest.TestCase):
             second_finished.set()
             return gzip.compress(bytes(memoryview(payload).cast('B')), mtime=0)  # type: ignore[arg-type]
 
-        sink = outputs.io.BytesIO()
+        sink = io.BytesIO()
         with mock.patch.dict(os.environ, {'YOLO_TTA_NRRD_GZIP_WORKERS': '2'}, clear=False):
-            writer = outputs._MemberParallelGzipPayloadWriter(
+            writer = nrrd_compression._MemberParallelGzipPayloadWriter(
                 sink, chunk_bytes=4, codec_spec=('failure-test', 1, compress),
             )
             def finish_writer() -> None:
@@ -644,8 +646,8 @@ class LogicalNrrdCodecPinningTests(unittest.TestCase):
                     mock.patch.object(outputs, '_nrrd_full_slice_z_chunk', return_value=1), \
                     mock.patch.object(outputs, '_nrrd_zshard_capacity', return_value=2), \
                     mock.patch.object(outputs, '_nrrd_layer_zshard_bands', return_value=([(0, 1), (1, 2)], None)), \
-                    mock.patch.object(outputs, '_require_nrrd_member_codec', side_effect=select), \
-                    mock.patch.object(outputs, '_open_nrrd_payload_writer', side_effect=open_writer), \
+                    mock.patch.object(nrrd_compression, '_require_nrrd_member_codec', side_effect=select), \
+                    mock.patch.object(nrrd_compression, '_open_nrrd_payload_writer', side_effect=open_writer), \
                     mock.patch.object(outputs, '_write_one_decomposed_nrrd_layer_payload', side_effect=payload_writer), \
                     mock.patch.object(outputs, '_write_nrrd_ascii_header', side_effect=lambda fh, **_kwargs: fh.write(b'H')):
                 outputs.write_single_layer_nrrd_from_ref(
@@ -658,7 +660,7 @@ class LogicalNrrdCodecPinningTests(unittest.TestCase):
 
 class AtomicHardwareFailureTests(unittest.TestCase):
     def tearDown(self) -> None:
-        outputs.shutdown_nrrd_gzip_executors()
+        nrrd_compression.shutdown_nrrd_gzip_executors()
 
     def test_midstream_hardware_error_preserves_previous_nrrd(self) -> None:
         class FailingCompressor:
@@ -695,7 +697,7 @@ class AtomicHardwareFailureTests(unittest.TestCase):
             ), mock.patch.object(
                 outputs, '_nrrd_full_slice_z_chunk', return_value=1,
             ), mock.patch.object(
-                outputs, '_require_nrrd_member_codec', return_value=spec,
+                nrrd_compression, '_require_nrrd_member_codec', return_value=spec,
             ), mock.patch.object(
                 outputs, '_write_nrrd_ascii_header',
                 side_effect=lambda fh, **_kwargs: fh.write(b'HEADER\n'),

@@ -1,6 +1,6 @@
 """Isolated packed-input publication proof; production ownership is unchanged.
 
-Caller owns GPU_LOCK and heatsoak. Compare shipping tilted unpack/shared dense
+Caller owns GPU_LOCK and heatsoak. Compare a local baseline unpack/shared dense
 codec with a packed-input metadata scan and crop extractor. Preallocated dense
 storage remains present for A/B comparison; no realized admission saving claimed.
 """
@@ -20,6 +20,23 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+# The historical unpack remains an experiment baseline, not a production backend.
+BASELINE_UNPACK_SOURCE = r'''
+extern "C" __global__ void unpack_baseline_packed(
+    const unsigned char* packed, unsigned char* output, int first_z,
+    int out_h, int out_w, unsigned long long voxel_count) {
+    unsigned long long q = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= voxel_count) return;
+    unsigned long long plane = (unsigned long long)out_h * out_w;
+    unsigned long long z = first_z + q / plane, rest = q % plane;
+    unsigned long long y = rest / out_w, x = rest % out_w;
+    unsigned long long packed_w = ((unsigned long long)out_w + 7) / 8;
+    unsigned long long byte_at = (z * out_h + y) * packed_w + (x >> 3);
+    output[q] = (packed[byte_at] >> (7 - (x & 7))) & 1;
+}
+'''
+
 
 DIRECT_SOURCE = r'''
 extern "C" __global__ void metadata_from_packed(
@@ -180,7 +197,7 @@ def run_case(cp, stream, funcs, dtype, encoded_records, volume, first, packed, a
 
     def metadata(key):
         if key == 'baseline':
-            funcs['unpack_tilted_azimuthal'](((dense_host.size + 255) // 256,), (256,),
+            funcs['unpack_baseline_packed'](((dense_host.size + 255) // 256,), (256,),
                 (bits, dense, np.int32(first), np.int32(height), np.int32(width), np.uint64(dense_host.size)), stream=stream)
         funcs['reset_radial_crop_metadata'](((count + 255) // 256,), (256,),
             (metas[key], np.int32(count), np.int32(height), np.int32(width)), stream=stream)
@@ -281,8 +298,8 @@ def main():
     cache.mkdir(exist_ok=True)
     os.environ['CUPY_CACHE_DIR'] = str(cache)
     os.environ['CUPY_CACHE_SAVE_CUDA_SOURCE'] = '1'
-    paths = [ROOT / 'XTA' / name for name in ('cylindrical_cuda_projection.py', 'tilted_azimuthal_projection_cuda.py')]
-    source = '\n'.join(literal_source(path) for path in paths) + DIRECT_SOURCE
+    paths = [ROOT / 'XTA' / 'cylindrical_cuda_projection.py']
+    source = '\n'.join(literal_source(path) for path in paths) + BASELINE_UNPACK_SOURCE + DIRECT_SOURCE
     (artifacts / 'packed-publication.cu').write_text(source, encoding='utf-8')
     report = {'status': 'running', 'scope': __doc__, 'seed': args.seed,
               'sources': {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths},
@@ -310,7 +327,7 @@ def main():
             if props['major'] < 8:
                 raise RuntimeError('This packed metadata prototype requires SM80 or newer')
             module = cp.RawModule(code=source, options=('--std=c++11', '--fmad=false'))
-            names = ('unpack_tilted_azimuthal', 'reset_radial_crop_metadata', 'reduce_radial_crop_metadata',
+            names = ('unpack_baseline_packed', 'reset_radial_crop_metadata', 'reduce_radial_crop_metadata',
                      'encode_radial_crops', 'metadata_from_packed', 'encode_from_packed')
             funcs = {name: module.get_function(name) for name in names}
             report['kernel_attributes'] = {name: dict(fn.attributes) for name, fn in funcs.items()}

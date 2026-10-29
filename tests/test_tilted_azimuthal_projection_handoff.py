@@ -71,18 +71,3 @@ def test_sink_failure_preserves_original_exception_without_cuda_replay(tmp_path)
     assert caught.value is failure
     np.testing.assert_array_equal(source,original)
     assert not (tmp_path/'sink.dat').exists()
-
-
-def test_direct_retired_sink_entry_uses_actual_source_not_rounded_scatter_callback(tmp_path):
-    view,source=view_and_source()
-    actual=np.zeros((8,11,14),np.uint8)
-    def publish(z,block): actual[z:z+len(block)]=block
-    result=bp._project_tilted_azimuthal_sink(source,view,actual.shape,
-        lambda frame: (_ for _ in ()).throw(AssertionError('old scatter callback')),
-        5,tmp_path/'sink.dat','sink',workers=1,prefer_memory=True,reserve_bytes=0,
-        known_row_occupancy=None,known_slice_bboxes=None,callback=publish)
-    expected=bp.backproject_azimuthal_volume_to_volume(source,view,tmp_path/'dense.dat','dense',
-        out_shape_tyx=actual.shape,reserve_bytes=0)
-    np.testing.assert_array_equal(actual,expected)
-    assert result.shape==actual.shape
-    runtime.close_memmap_array(expected)

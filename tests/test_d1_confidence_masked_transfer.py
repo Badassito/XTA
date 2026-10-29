@@ -9,7 +9,7 @@ from unittest import mock
 import numpy as np
 import pytest
 
-from XTA import cuda_d1, cylindrical_owner, outputs
+from XTA import cuda_d1, cylindrical_owner, outputs, nrrd_compression
 from XTA import inference
 from XTA.d1_confidence_retirement import HostPublicationPool
 from XTA.geometry import ViewInfo
@@ -66,7 +66,7 @@ def test_confidence_gpu_mask_controls_are_recorded_in_run_provenance(
             mock.patch.object(outputs, 'nrrd_layer_sink',
                               return_value=SimpleNamespace(max_workers=12)), \
             mock.patch.object(outputs, 'nrrd_layer_sink_workers', return_value=12), \
-            mock.patch.object(outputs, 'nrrd_gzip_workers', return_value=8), \
+            mock.patch.object(nrrd_compression, 'nrrd_gzip_workers', return_value=8), \
             mock.patch.object(outputs, 'nrrd_fill_workers', return_value=4):
         for name, value in (('YOLO_TTA_D1_GPU_MASK_CONFIDENCE', enabled),
                             ('YOLO_TTA_D1_GPU_MASK_MIN_PIXELS', threshold)):

@@ -17,12 +17,12 @@ import os
 import shutil
 import time
 import uuid
-from contextlib import ExitStack, nullcontext
 from dataclasses import asdict, dataclass, replace
 from types import SimpleNamespace
 from pathlib import Path, PurePath, PureWindowsPath
-from typing import Any, Mapping, Sequence
+from typing import Mapping, Sequence
 
+from .file_hashing import sha256_file as _sha256_file
 from .lta_cpu import bounded_lta_host_threads, host_native_thread_counts
 from .lta_outputs import (
     LtaArtifactReceipt,
@@ -56,7 +56,6 @@ from .lta_runtime import LtaRunPlan, LtaRuntimeViewPlan, LtaTileGridPlan
 from .lta_sam import LTA_SESSION_FRAMES, revalidate_local_sam_bundle
 from .lta_scheduler import (
     LtaSessionWork,
-    LtaSpatialRelayKey,
     LtaViewAffinityScheduler,
     LtaViewKey,
 )
@@ -73,7 +72,6 @@ from .lta_windows import (
     AnchorDomain,
     WindowPlan,
     owned_frame_range,
-    plan_directional_windows,
     plan_domain_windows,
 )
 from .lta_workers import LtaWorkerInit, LtaWorkerPool, LtaWorkerResult, LtaWorkerTask
@@ -222,113 +220,6 @@ def _preflight_lta_storage(
 
 
 @dataclass(frozen=True)
-class _RelayMaskRevision:
-    shape_hw: tuple[int, int]
-    packed_mask: Any
-    revision_sha256: str
-    visited_tile_indices: tuple[int, ...]
-    tracker_probability: float
-
-
-def _relay_mask_revision(mask: object) -> tuple[tuple[int, int], object, str]:
-    import numpy as np
-
-    binary = np.ascontiguousarray(np.asarray(mask, dtype=np.bool_))
-    if binary.ndim != 2 or not bool(binary.any()):
-        raise ValueError("a relay mask revision must contain 2D foreground")
-    shape = tuple(int(value) for value in binary.shape)
-    packed = np.ascontiguousarray(np.packbits(binary.reshape(-1)), dtype=np.uint8)
-    digest = hashlib.sha256()
-    digest.update(f"{shape[0]}x{shape[1]}:".encode("ascii"))
-    digest.update(memoryview(packed).cast("B"))
-    packed.setflags(write=False)
-    return shape, packed, digest.hexdigest()
-
-
-def _accumulate_relay_seed_revision(
-    event_key: LtaSpatialRelayKey,
-    seed: LtaMaskSeed,
-    revisions: dict[LtaSpatialRelayKey, _RelayMaskRevision],
-    *, enable_2D_hole_fill: bool = False,
-) -> tuple[LtaMaskSeed, str] | None:
-    """Admit only new foreground and return the accumulated event seed."""
-
-    import numpy as np
-
-    if event_key.mask_revision_sha256 != "0" * 64:
-        raise ValueError("relay event keys must use the zero revision placeholder")
-    shape, current_packed, _current_digest = _relay_mask_revision(seed.mask)
-    previous = revisions.get(event_key)
-    previous_digest = None
-    if previous is None:
-        accumulated_packed = np.asarray(current_packed, dtype=np.uint8).copy()
-        delta_pixels = int(np.unpackbits(accumulated_packed).sum())
-        visited = seed.visited_tile_indices
-        probability = seed.tracker_probability
-    else:
-        if previous.shape_hw != shape or previous.packed_mask.shape != current_packed.shape:
-            raise RuntimeError("one relay event changed mask shape across generations")
-        current_array = np.asarray(current_packed, dtype=np.uint8)
-        previous_array = np.asarray(previous.packed_mask, dtype=np.uint8)
-        delta = np.bitwise_and(current_array, np.bitwise_not(previous_array))
-        delta_pixels = int(np.unpackbits(delta).sum())
-        if delta_pixels == 0:
-            return None
-        accumulated_packed = np.bitwise_or(previous_array, current_array)
-        previous_digest = previous.revision_sha256
-        visited = tuple(
-            sorted(set(previous.visited_tile_indices) | set(seed.visited_tile_indices))
-        )
-        probability = max(previous.tracker_probability, seed.tracker_probability)
-
-    accumulated_mask = np.unpackbits(
-        accumulated_packed,
-        count=shape[0] * shape[1],
-    ).reshape(shape)
-    filled = fill_merged_seed_mask_holes_2d(
-        accumulated_mask,
-        enabled=enable_2D_hole_fill,
-        context={
-            "destination_tile_index": event_key.destination_tile_index,
-            "temporal_direction": event_key.temporal_direction,
-            "frame_index": event_key.frame_index,
-            "relay_generation": seed.relay_generation,
-            "accumulated_revision": True,
-        },
-    )
-    shape, packed, digest = _relay_mask_revision(filled.mask)
-    revisions[event_key] = _RelayMaskRevision(
-        shape_hw=shape,
-        packed_mask=packed,
-        revision_sha256=digest,
-        visited_tile_indices=tuple(visited),
-        tracker_probability=float(probability),
-    )
-    accumulated_pixels = int(np.unpackbits(np.asarray(packed, dtype=np.uint8)).sum())
-    return (
-        LtaMaskSeed(
-            lineage=seed.lineage,
-            frame_index=seed.frame_index,
-            object_id=seed.object_id,
-            mask=filled.mask,
-            provenance=seed.provenance,
-            tracker_probability=float(probability),
-            relay_generation=seed.relay_generation,
-            visited_tile_indices=tuple(visited),
-            source_receipt={
-                **dict(seed.source_receipt),
-                "relay_mask_revision_sha256": digest,
-                "previous_relay_mask_revision_sha256": previous_digest,
-                "new_foreground_pixels": delta_pixels,
-                "accumulated_foreground_pixels": accumulated_pixels,
-                "accumulated_hole_fill": filled.receipt.manifest_record(),
-            },
-        ),
-        digest,
-    )
-
-
-@dataclass(frozen=True)
 class LtaProductionResult:
     plan: LtaRunPlan
     manifest_path: Path
@@ -342,17 +233,6 @@ class LtaProductionResult:
 class _PlannedChain:
     work: LtaSessionWork
     payload: Mapping[str, object]
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _verified_artifact_path(
@@ -1132,39 +1012,6 @@ def _authoritative_seed_audit(
     }
 
 
-def _prime_authoritative_relay_destinations(
-    scheduler: LtaViewAffinityScheduler,
-    view: LtaViewKey,
-    seed_inventory: Mapping[tuple[str, int, int], Sequence[LtaMaskSeed]],
-    relay_mask_revisions: dict[LtaSpatialRelayKey, _RelayMaskRevision],
-) -> None:
-    """Prime event masks so identical relays cannot reopen authoritative seeds."""
-
-    for (config_id, tile_index, _frame), seeds in seed_inventory.items():
-        for seed in seeds:
-            for direction in ("forward", "backward"):
-                event_key = LtaSpatialRelayKey(
-                    view=view,
-                    runtime_view_id=seed.lineage.runtime_view_id,
-                    tile_config_id=config_id,
-                    lineage_id=seed.lineage.lineage_id,
-                    destination_tile_index=tile_index,
-                    frame_index=seed.frame_index,
-                    temporal_direction=direction,
-                )
-                shape, packed, revision = _relay_mask_revision(seed.mask)
-                relay_mask_revisions[event_key] = _RelayMaskRevision(
-                    shape_hw=shape,
-                    packed_mask=packed,
-                    revision_sha256=revision,
-                    visited_tile_indices=seed.visited_tile_indices,
-                    tracker_probability=seed.tracker_probability,
-                )
-                scheduler.admit_spatial_relay(
-                    replace(event_key, mask_revision_sha256=revision)
-                )
-
-
 def _allocate_view_union(view_plan: LtaRuntimeViewPlan, path: Path):
     import numpy as np
 
@@ -1539,187 +1386,6 @@ def _verified_relay_artifact_paths(
     )
 
 
-def _plan_relay_generation(
-    records: Sequence[Mapping[str, object]],
-    *,
-    generation: int,
-    view_plan: LtaRuntimeViewPlan,
-    cache_ref: LtaPhysicalViewCacheRef,
-    scheduler: LtaViewAffinityScheduler,
-    relay_mask_revisions: dict[LtaSpatialRelayKey, _RelayMaskRevision],
-    temp_root: Path,
-    conf: float,
-    empty_frame_limit: int | None,
-    first_plan_order: int,
-    coverage_ledger: object | None = None,
-    admission_audit: dict[str, object] | None = None,
-    enable_2D_hole_fill: bool = False,
-) -> tuple[_PlannedChain, ...]:
-    # Validate every emitted relay, including arrivals that an idempotency key
-    # will deliberately discard.  Cleanup below is therefore restricted to
-    # exact artifacts whose worker receipts have been proven.
-    relay_artifacts = _verified_relay_artifact_paths(records)
-    grid_by_id = {grid.config_id: grid for grid in view_plan.tile_grids}
-    by_relay_key: dict[LtaSpatialRelayKey, list[Mapping[str, object]]] = {}
-    view_key = LtaViewKey(view_plan.volume_id, view_plan.physical_view_id)
-    for record in records:
-        lineage = _lineage_from_record(record["lineage"])  # type: ignore[arg-type]
-        destination_tile_index = int(record["destination_tile_index"])
-        frame_index = int(record["frame_index"])
-        key = LtaSpatialRelayKey(
-            view=view_key,
-            runtime_view_id=lineage.runtime_view_id,
-            tile_config_id=lineage.tile_config_id,
-            lineage_id=lineage.lineage_id,
-            destination_tile_index=destination_tile_index,
-            frame_index=frame_index,
-            temporal_direction=str(record["temporal_direction"]),
-        )
-        by_relay_key.setdefault(key, []).append(record)
-
-    accepted: list[tuple[LtaSpatialRelayKey, LtaMaskSeed]] = []
-    for event_key in sorted(by_relay_key):
-        seed = _select_and_merge_relay_group(
-            by_relay_key[event_key],
-            direction=event_key.temporal_direction,
-            destination_tile_index=event_key.destination_tile_index,
-            generation=generation,
-            enable_2D_hole_fill=enable_2D_hole_fill,
-        )
-        if admission_audit is not None:
-            admission_audit["spatial_seed_candidates"] = int(admission_audit.get("spatial_seed_candidates", 0)) + 1
-        if coverage_ledger is not None and coverage_ledger.can_handoff(
-            seed, tile_index=event_key.destination_tile_index,
-            direction=event_key.temporal_direction,
-        ):
-            if admission_audit is not None:
-                admission_audit["spatial_seed_handoffs"] = int(admission_audit.get("spatial_seed_handoffs", 0)) + 1
-            continue
-        accumulated = _accumulate_relay_seed_revision(
-            event_key,
-            seed,
-            relay_mask_revisions,
-            enable_2D_hole_fill=enable_2D_hole_fill,
-        )
-        if accumulated is None:
-            if admission_audit is not None:
-                admission_audit["repeated_seed_revisions"] = int(admission_audit.get("repeated_seed_revisions", 0)) + 1
-            continue
-        accumulated_seed, revision = accumulated
-        key = replace(event_key, mask_revision_sha256=revision)
-        if not scheduler.admit_spatial_relay(key):
-            raise RuntimeError("a new monotone relay revision reused an admitted digest")
-        accepted.append((key, accumulated_seed))
-
-    # Multiplex lineages that share a destination, prompt, and direction.
-    grouped: dict[tuple[str, int, int, str], list[tuple[LtaSpatialRelayKey, LtaMaskSeed]]] = {}
-    for key, seed in accepted:
-        group_key = (
-            key.tile_config_id,
-            key.destination_tile_index,
-            seed.frame_index,
-            key.temporal_direction,
-        )
-        grouped.setdefault(group_key, []).append((key, seed))
-
-    planned: list[_PlannedChain] = []
-    plan_order = int(first_plan_order)
-    for (config_id, tile_index, prompt_frame, direction), values in sorted(grouped.items()):
-        grid = grid_by_id.get(config_id)
-        if grid is None:
-            raise RuntimeError(f"relay references unknown tile configuration {config_id}")
-        windows = plan_directional_windows(
-            frame_start=0,
-            frame_stop=view_plan.frame_count,
-            prompt_frame=prompt_frame,
-            direction=direction,
-        )
-        work_id_prefix = (
-            f"{view_plan.volume_id}::{view_plan.runtime_view_id}::{config_id}::"
-            f"tile-{tile_index:04d}::relay-{generation:04d}::{direction}::"
-            f"frame-{prompt_frame:06d}"
-        )
-        output_start = prompt_frame if direction == "forward" else 0
-        output_stop = view_plan.frame_count if direction == "forward" else prompt_frame + 1
-        tile = grid.tiles[tile_index]
-        ordered_values = tuple(sorted(values, key=lambda item: item[0].lineage_id))
-        relay_key_by_seed_identity = {
-            id(seed): key for key, seed in ordered_values
-        }
-        if len(relay_key_by_seed_identity) != len(ordered_values):
-            raise RuntimeError("one relay seed object was associated with multiple relay keys")
-        value_batches = tuple(
-            tuple(
-                (relay_key_by_seed_identity[id(seed)], seed)
-                for seed in seed_batch
-            )
-            for seed_batch in partition_mask_seed_sessions(
-                tuple(seed for _key, seed in ordered_values)
-            )
-        )
-        batch_count = len(value_batches)
-        for batch_index, batch in enumerate(value_batches):
-            normalized_seeds = tuple(
-                LtaMaskSeed(
-                    lineage=seed.lineage,
-                    frame_index=seed.frame_index,
-                    object_id=object_id,
-                    mask=seed.mask,
-                    provenance=seed.provenance,
-                    tracker_probability=seed.tracker_probability,
-                    relay_generation=seed.relay_generation,
-                    visited_tile_indices=seed.visited_tile_indices,
-                    source_receipt=seed.source_receipt,
-                )
-                for object_id, (_key, seed) in enumerate(batch)
-            )
-            work_id = (
-                f"{work_id_prefix}::"
-                f"batch-{batch_index:04d}-of-{batch_count:04d}"
-            )
-            seed_artifact = write_seed_artifact(
-                temp_root
-                / "seeds"
-                / f"generation-{generation:04d}"
-                / f"{hashlib.sha256(work_id.encode()).hexdigest()[:20]}.npz",
-                normalized_seeds,
-            )
-            work = LtaSessionWork(
-                work_id=work_id,
-                view=view_key,
-                runtime_view_id=view_plan.runtime_view_id,
-                session_index=plan_order,
-                frame_start=output_start,
-                frame_stop=output_stop,
-                plan_order=plan_order,
-                estimated_cost=float((output_stop - output_start) * tile.size * tile.size),
-                projection_key=cache_ref.identity_sha256,
-                tile_index=tile_index,
-                tile_config_id=config_id,
-                tail_eligible=True,
-                relay_generation=generation,
-            )
-            payload = _base_chain_payload(
-                work_id=work_id,
-                view_plan=view_plan,
-                grid=grid,
-                tile_index=tile_index,
-                cache_ref=cache_ref,
-                seed_path=seed_artifact.path,
-                seed_sha256=seed_artifact.sha256,
-                windows=windows,
-                output_frame_start=output_start,
-                output_frame_stop=output_stop,
-                conf=conf,
-                empty_frame_limit=empty_frame_limit,
-                relay_generation=generation,
-            )
-            planned.append(_PlannedChain(work=work, payload=payload))
-            plan_order += 1
-    _unlink_consumed_temp_artifacts(relay_artifacts, temp_root=temp_root)
-    return tuple(planned)
-
-
 def _dispatch_available(
     scheduler: LtaViewAffinityScheduler,
     pool: LtaWorkerPool,
@@ -1868,6 +1534,32 @@ def _ingest_lineage_coverage(
     _unlink_consumed_temp_artifacts((path,), temp_root=temp_root)
 
 
+def _continue_canonical_frontier(execution, settled):
+    from .lta_frontier_execution import _drive_canonical_relay_frontier
+    from .lta_window_execution import RelayContinuation
+
+    if not settled.windowed or settled.generation != 0:
+        raise RuntimeError("canonical frontier requires the initial bounded window graph")
+    settled.snapshots.close()
+    _unlink_consumed_temp_artifacts(
+        (settled.prior_coverage_path,), temp_root=execution.temp_root)
+    generation = _drive_canonical_relay_frontier(
+        settled.records, pool=execution.pool, view_plan=execution.view_plan,
+        enable_2D_hole_fill=execution.enable_2D_hole_fill,
+        cache_ref=execution.cache_ref, view_union=execution.view_union,
+        coverage=settled.coverage, temp_root=execution.temp_root,
+        conf=execution.conf, empty_frame_limit=execution.empty_frame_limit,
+        worker_task_timeout=execution.worker_task_timeout, trace=execution.trace,
+        worker_audit=settled.worker_audit, dispatched=settled.dispatched,
+        first_plan_order=settled.first_plan_order,
+        max_relay_generations=execution.scheduler.max_relay_generation,
+        device_ids=execution.scheduler.device_ids,
+        workers_per_device=execution.scheduler.workers_per_device,
+    )
+    settled.admission_audit["policy"] = "canonical_temporal_frontier/1"
+    return RelayContinuation(generation)
+
+
 def _drive_workers_to_fixed_point(
     *,
     scheduler: LtaViewAffinityScheduler,
@@ -1876,510 +1568,26 @@ def _drive_workers_to_fixed_point(
     view_plan: LtaRuntimeViewPlan,
     cache_ref: LtaPhysicalViewCacheRef,
     view_union: object,
-    relay_mask_revisions: dict[LtaSpatialRelayKey, _RelayMaskRevision],
     temp_root: Path,
     conf: float,
     empty_frame_limit: int | None,
     worker_task_timeout: float,
     trace: object | None = None,
-    canonical_frontier: bool = False,
     enable_2D_hole_fill: bool = False,
 ):
-    from .lta_coverage import LtaCoverageLedger
+    """Execute the production bounded-window graph and canonical relay frontier."""
+    from .lta_window_execution import WindowExecution, drive_window_generations
 
-    if scheduler.helper_queue_order != "head":
-        raise ValueError("bounded production dispatch requires helper_queue_order='head'")
-    with ExitStack() as resources:
-        coverage = LtaCoverageLedger(Path(temp_root) / "lineage_coverage.sqlite3", frame_count=view_plan.frame_count)
-        resources.callback(coverage.close)
-        snapshots = resources.enter_context(ExitStack())
-        return _drive_workers_with_coverage(
-            scheduler=scheduler, pool=pool, initial=initial, view_plan=view_plan,
-            cache_ref=cache_ref, view_union=view_union, relay_mask_revisions=relay_mask_revisions,
-            temp_root=temp_root, conf=conf, empty_frame_limit=empty_frame_limit,
-            worker_task_timeout=worker_task_timeout, trace=trace,
-            coverage=coverage, snapshots=snapshots,
-            canonical_frontier=canonical_frontier,
-            enable_2D_hole_fill=enable_2D_hole_fill,
-        )
-
-
-def _drive_workers_with_coverage(
-    *,
-    scheduler: LtaViewAffinityScheduler,
-    pool: LtaWorkerPool,
-    initial: Sequence[_PlannedChain],
-    view_plan: LtaRuntimeViewPlan,
-    cache_ref: LtaPhysicalViewCacheRef,
-    view_union: object,
-    relay_mask_revisions: dict[LtaSpatialRelayKey, _RelayMaskRevision],
-    temp_root: Path,
-    conf: float,
-    empty_frame_limit: int | None,
-    worker_task_timeout: float,
-    trace: object | None = None,
-    coverage: object,
-    snapshots: ExitStack,
-    canonical_frontier: bool = False,
-    enable_2D_hole_fill: bool = False,
-) -> tuple[
-    int,
-    Mapping[int, int],
-    tuple[Mapping[str, object], ...],
-    Mapping[str, object],
-]:
-    if scheduler.helper_queue_order != "head":
-        raise ValueError("bounded production dispatch requires helper_queue_order='head'")
-    payload_by_work: dict[str, Mapping[str, object]] = {
-        chain.work.work_id: chain.payload for chain in initial
-    }
-    work_by_id: dict[str, LtaSessionWork] = {}
-    children: dict[str, list[str]] = {}
-    chain_state: dict[str, dict[str, object]] = {}
-    windowed = bool(initial and "chain_work_id" in initial[0].payload)
-
-    def register_tasks(tasks: Sequence[_PlannedChain]) -> None:
-        for task in tasks:
-            work_by_id[task.work.work_id] = task.work
-            payload_by_work[task.work.work_id] = dict(task.payload)
-            trace_path = getattr(trace, "path", None)
-            if trace_path is not None:
-                payload_by_work[task.work.work_id]["worker_trace_root"] = str(Path(trace_path).parent)
-            chain_id = str(task.payload.get("chain_work_id", task.work.work_id))
-            state = chain_state.setdefault(chain_id, {
-                "remaining": 0, "observations": {}, "legacy_relays": [],
-                "windowed": "chain_work_id" in task.payload,
-            })
-            state["remaining"] = int(state["remaining"]) + 1
-            for predecessor in task.work.dependency_work_ids:
-                children.setdefault(predecessor, []).append(task.work.work_id)
-
-    register_tasks(initial)
-    active: dict[str, object] = {}
-    active_started: dict[str, float] = {}
-    reduced_work_ids: set[str] = set()
-    dispatched: list[dict[str, object]] = []
-    worker_audit = _new_worker_audit()
-    worker_audit["task_count"] = 0
-    worker_audit["skipped_window_count"] = 0
-    worker_audit["workers_per_gpu"] = scheduler.workers_per_device
-    admission_audit: dict[str, object] = {
-        "policy": "canonical_temporal_frontier/1" if canonical_frontier else "same_lineage_directional_coverage/1",
-        "spatial_seed_candidates": 0, "spatial_seed_handoffs": 0,
-        "repeated_seed_revisions": 0, "temporal_seed_handoffs": 0,
-        "temporal_window_handoffs": 0, "coalesced_generations": [],
-    }
-    worker_audit["relay_admission"] = admission_audit
-    for ready in tuple(getattr(pool, "ready_events", ())):
-        _accumulate_worker_ready_audit(worker_audit, ready)
-    authoritative_active_coverage: dict[
-        tuple[str, int, str], tuple[tuple[int, int], ...]
-    ] = {}
-    relay_records: dict[int, list[dict[str, object]]] = {0: []}
-    generation_observations: dict[tuple[str, int], dict[tuple[str, int], dict[str, object]]] = {}
-    raw_relay_endpoints = 0
-    prior_coverage_path = Path(temp_root) / "lineage_coverage_prior.sqlite3"
-    prior_coverage = coverage.snapshot(prior_coverage_path)
-    snapshots.callback(prior_coverage.close)
-    generation = 0
-    next_plan_order = max(chain.work.plan_order for chain in initial) + 1
-    view_key = initial[0].work.view
-    scheduler.mark_projection_ready(
-        view_key,
-        device_id=scheduler.owner_for_view(view_key),
-    )
-    tasks_root = temp_root / "tasks"
-    last_progress = time.monotonic()
-
-    def progress(*, force: bool = False) -> None:
-        nonlocal last_progress
-        now = time.monotonic()
-        if not force and now - last_progress < 10.0:
-            return
-        counts = scheduler.queue_counts()
-        reason = "waiting_for_window_results" if counts["active"] else "ready_work" if counts["ready"] else "generation_fan_in"
-        if trace is not None:
-            trace.event("scheduler_state", generation=generation, reason=reason, **counts)
-            trace.flush()
-            print(f"LTA window DAG: generation={generation} ready={counts['ready']} blocked={counts['blocked']} active={counts['active']} reason={reason}", flush=True)
-        last_progress = now
-
-    def skip_branch(work_id: str, *, reason: str = "empty_dogfood_boundary") -> None:
-        pending = [work_id]
-        while pending:
-            skipped_id = pending.pop()
-            scheduler.skip_pending(skipped_id, _SkippedWindow(reason=reason))
-            if reason == "covered_continuation":
-                admission_audit["temporal_window_handoffs"] = int(admission_audit["temporal_window_handoffs"]) + 1
-            if trace is not None:
-                trace.event("window_skipped", work_id=skipped_id, reason=reason)
-            pending.extend(children.get(skipped_id, ()))
-
-    def complete_chain_window(work: LtaSessionWork) -> None:
-        nonlocal raw_relay_endpoints
-        payload = payload_by_work[work.work_id]
-        chain_id = str(payload.get("chain_work_id", work.work_id))
-        state = chain_state[chain_id]
-        state["remaining"] = int(state["remaining"]) - 1
-        if state["remaining"]:
-            return
-        from .lta_relay_episodes import merge_relay_observations_across_chains
-        phase = trace.phase("chain_relay_coalescing", chain_work_id=chain_id) if trace is not None else nullcontext()
-        with phase:
-            target = generation_observations.setdefault((work.tile_config_id, int(work.tile_index)), {})
-            merge_relay_observations_across_chains(target, state["observations"])
-        raw_count = 2 * sum(len(record.get("episodes", ())) for record in state["observations"].values())
-        raw_relay_endpoints += raw_count
-        relay_records.setdefault(work.relay_generation, []).extend(state["legacy_relays"])
-        if state["windowed"]:
-            worker_audit["chain_count"] = int(worker_audit["chain_count"]) + 1
-        if trace is not None:
-            trace.event("chain_settled", chain_work_id=chain_id, relay_count=0,
-                        raw_relay_endpoint_count=raw_count, relay_emission_deferred=True)
-        del chain_state[chain_id]
-
-    def plan_relays(records, **kwargs):
-        phase = trace.phase("relay_planning", generation=kwargs["generation"], relay_record_count=len(records)) if trace is not None else nullcontext()
-        with phase:
-            return _plan_relay_generation(
-                records, **kwargs, coverage_ledger=coverage, admission_audit=admission_audit,
-                enable_2D_hole_fill=enable_2D_hole_fill,
-            )
-
-    def emit_generation_relays() -> None:
-        from .lta_worker_adapter import _write_relay_artifacts
-
-        emitted_count = 0
-        phase = trace.phase("generation_relay_emission", generation=generation,
-                            raw_endpoint_count=raw_relay_endpoints) if trace is not None else nullcontext()
-        with phase:
-            for (config_id, tile_index), observations in sorted(generation_observations.items()):
-                emitted = _write_relay_artifacts(
-                    observations,
-                    output_dir=Path(temp_root) / "generation-relays" / f"generation-{generation:04d}" / _safe_token(config_id) / f"tile-{tile_index:04d}",
-                    source_tile_index=tile_index, generation=generation,
-                )
-                relay_records.setdefault(generation, []).extend(emitted)
-                emitted_count += len(emitted)
-        worker_audit["relay_artifact_count"] = int(worker_audit["relay_artifact_count"]) + emitted_count
-        summary = {"generation": generation, "raw_endpoint_count": raw_relay_endpoints,
-                   "coalesced_endpoint_count": emitted_count,
-                   "coalesced_episode_count": sum(len(record.get("episodes", ()))
-                       for observations in generation_observations.values() for record in observations.values()),
-                   "coverage": coverage.stats()}
-        admission_audit["coalesced_generations"].append(summary)
-        generation_observations.clear()
-        if trace is not None:
-            trace.event("generation_relay_summary", **summary)
-            trace.flush()
-
-    while True:
-        progress()
-        _dispatch_available(
-            scheduler,
-            pool,
-            payload_by_work,
-            active,
-            active_started,
-            dispatched,
-            tasks_root=tasks_root,
-            trace=trace,
-        )
-        if active:
-            oldest_work_id = min(
-                active_started,
-                key=lambda work_id: active_started[work_id],
-            )
-            remaining = (
-                float(worker_task_timeout)
-                - (time.monotonic() - active_started[oldest_work_id])
-            )
-            if remaining <= 0.0:
-                raise TimeoutError(
-                    f"LTA worker task {oldest_work_id!r} exceeded its "
-                    f"{float(worker_task_timeout):.1f}-second lease"
-                )
-            wait_phase = trace.phase("wait_for_window_result", **scheduler.queue_counts()) if trace is not None else nullcontext({})
-            with wait_phase as wait_details:
-                try:
-                    worker_result = pool.wait_result(timeout=min(remaining, 10.0))
-                except TimeoutError:
-                    worker_result = None
-                    wait_details["poll_timeout"] = True
-            if worker_result is None:
-                progress(force=True)
-                if time.monotonic() - active_started[oldest_work_id] >= float(worker_task_timeout):
-                    raise TimeoutError(f"LTA worker task {oldest_work_id!r} exceeded its {float(worker_task_timeout):.1f}-second lease")
-                continue
-            claim = active.pop(worker_result.work_id, None)
-            active_started.pop(worker_result.work_id, None)
-            if claim is None:
-                raise RuntimeError(
-                    f"worker returned unclaimed LTA work {worker_result.work_id}"
-                )
-            if (
-                int(worker_result.execution_device_id) != int(claim.execution_device_id)
-                or int(getattr(worker_result, "worker_index", 0)) != int(claim.worker_index)
-            ):
-                raise RuntimeError("worker result does not match the claimed GPU and worker slot")
-            # Dense OR into the private view is associative and commutative.
-            # Reduce completed work immediately so a slow earlier chain cannot
-            # hold every helper idle or retain a full-view file per later task.
-            # Audit/relay acknowledgment remains in deterministic plan order.
-            phase = trace.phase("window_result_reduction", work_id=worker_result.work_id) if trace is not None else nullcontext()
-            with phase:
-                manifest = _load_chain_manifest(worker_result)
-                parent_payload = payload_by_work[worker_result.work_id]
-                if list(manifest["output_frame_range"]) != [parent_payload["output_frame_start"], parent_payload["output_frame_stop"]]:
-                    raise RuntimeError("worker result changed its owned window frame range")
-                _relays, union_artifact = _consume_chain_manifest(manifest, view_union=view_union)
-                outgoing = _verified_dogfood_artifacts(manifest, parent_payload)
-            _unlink_consumed_temp_artifacts((union_artifact,), temp_root=temp_root)
-            reduced_work_ids.add(worker_result.work_id)
-            empty_children: list[str] = []
-            covered_children: list[str] = []
-            used_seed_paths: set[str] = set()
-            for child_id in children.get(worker_result.work_id, ()):
-                child_payload = dict(payload_by_work[child_id])
-                prompt = int(child_payload["window"]["prompt_frame"])
-                artifact = outgoing.get(prompt)
-                if artifact is None:
-                    empty_children.append(child_id)
-                    continue
-                child_seeds = read_seed_artifact(str(artifact["path"]), expected_sha256=str(artifact["sha256"]))
-                remaining_seeds = tuple(
-                    seed for seed in child_seeds
-                    if not prior_coverage.can_handoff(
-                        seed, tile_index=int(child_payload["tile_index"]),
-                        direction=str(child_payload["window"]["direction"]),
-                    )
-                )
-                handed_off = len(child_seeds) - len(remaining_seeds)
-                admission_audit["temporal_seed_handoffs"] = int(admission_audit["temporal_seed_handoffs"]) + handed_off
-                if not remaining_seeds:
-                    covered_children.append(child_id)
-                    continue
-                if handed_off:
-                    replacement = write_seed_artifact(
-                        Path(worker_result.artifact_path).parent / "continuations" / f"{hashlib.sha256(child_id.encode()).hexdigest()[:20]}.npz",
-                        remaining_seeds,
-                    )
-                    artifact = {"path": str(replacement.path), "sha256": replacement.sha256}
-                child_payload["seed_artifact_path"] = str(artifact["path"])
-                child_payload["seed_artifact_sha256"] = str(artifact["sha256"])
-                payload_by_work[child_id] = child_payload
-                used_seed_paths.add(str(artifact["path"]))
-            coverage_phase = trace.phase("lineage_coverage_ingest", work_id=worker_result.work_id) if trace is not None else nullcontext()
-            with coverage_phase:
-                _ingest_lineage_coverage(manifest, parent_payload, coverage, temp_root=temp_root)
-            scheduler.complete(claim, worker_result)
-            for child_id in empty_children:
-                skip_branch(child_id)
-            for child_id in covered_children:
-                skip_branch(child_id, reason="covered_continuation")
-            unused_seeds = [str(record["path"]) for record in outgoing.values() if str(record["path"]) not in used_seed_paths]
-            _unlink_consumed_temp_artifacts(unused_seeds, temp_root=temp_root)
-            # Overlap ordered receipt work with the next GPU session instead
-            # of waiting until all committable manifests have been processed.
-            _dispatch_available(
-                scheduler, pool, payload_by_work, active, active_started,
-                dispatched, tasks_root=tasks_root, trace=trace,
-            )
-
-        while True:
-            commit = scheduler.claim_committable()
-            if commit is None:
-                break
-            consumed_artifacts: list[Path] = []
-            try:
-                for _work, result in commit.entries:
-                    task_payload = payload_by_work[_work.work_id]
-                    if isinstance(result, _SkippedWindow):
-                        worker_audit["skipped_window_count"] = int(worker_audit["skipped_window_count"]) + 1
-                        worker_audit["planned_window_count"] = int(worker_audit["planned_window_count"]) + 1
-                        worker_audit["halted_window_count"] = int(worker_audit["halted_window_count"]) + 1
-                        complete_chain_window(_work)
-                        continue
-                    if _work.work_id not in reduced_work_ids:
-                        raise RuntimeError("LTA work reached commit before dense union reduction")
-                    manifest = _load_chain_manifest(result)
-                    if "chain_work_id" in task_payload:
-                        manifest = {**manifest, "task_granularity": "window"}
-                    _accumulate_worker_audit(worker_audit, manifest, result)
-                    _accumulate_authoritative_active_coverage(
-                        authoritative_active_coverage,
-                        _work,
-                        manifest,
-                    )
-                    chain_id = str(task_payload.get("chain_work_id", _work.work_id))
-                    state = chain_state[chain_id]
-                    observation_artifact = manifest.get("relay_observation_artifact")
-                    if observation_artifact is not None:
-                        from .lta_relay_episodes import read_relay_observations, merge_relay_observations
-                        phase = trace.phase("relay_episode_merge", work_id=_work.work_id) if trace is not None else nullcontext()
-                        with phase:
-                            observations = read_relay_observations(observation_artifact)
-                            merge_relay_observations(state["observations"], observations)
-                        consumed_artifacts.append(Path(observation_artifact["path"]))
-                        # Legacy chain workers also emit standalone relay files.
-                        # Their observation packet is authoritative for global
-                        # coalescing, so verify and retire the duplicate files.
-                        consumed_artifacts.extend(_verified_relay_artifact_paths(tuple(manifest.get("relays", ()))))
-                    else:
-                        state["legacy_relays"].extend(dict(item) for item in manifest.get("relays", ()))
-                    input_seed = _verified_artifact_path(
-                        str(task_payload["seed_artifact_path"]),
-                        expected_sha256=task_payload["seed_artifact_sha256"],
-                        description="consumed worker input-seed artifact",
-                    )
-                    consumed_artifacts.extend(
-                        (
-                            Path(result.artifact_path).resolve(strict=True),
-                            input_seed,
-                        )
-                    )
-                    complete_chain_window(_work)
-            except BaseException:
-                scheduler.fail_commit(commit)
-                raise
-            scheduler.complete_commit(commit)
-            _unlink_consumed_temp_artifacts(
-                consumed_artifacts,
-                temp_root=temp_root,
-            )
-            reduced_work_ids.difference_update(work.work_id for work, _result in commit.entries)
-
-        if not scheduler.generation_settled(view_key, generation):
-            if not active:
-                pool.check_liveness()
-                counts = scheduler.queue_counts()
-                if counts["ready"] == 0:
-                    if trace is not None:
-                        trace.event("scheduler_stalled", generation=generation, **counts)
-                    raise RuntimeError(
-                        f"LTA relay generation {generation} stalled before settlement: "
-                        f"no active or ready windows; blocked={counts['blocked']}, "
-                        f"completed_awaiting_commit={counts['completed_awaiting_commit']}"
-                    )
-            continue
-
-        emit_generation_relays()
-        if canonical_frontier:
-            if not windowed or generation != 0:
-                raise RuntimeError("canonical frontier requires the initial bounded window graph")
-            from .lta_frontier_execution import _drive_canonical_relay_frontier
-
-            snapshots.close()
-            _unlink_consumed_temp_artifacts((prior_coverage_path,), temp_root=temp_root)
-            generation = _drive_canonical_relay_frontier(
-                relay_records.get(0, ()), pool=pool, view_plan=view_plan,
-                enable_2D_hole_fill=enable_2D_hole_fill,
-                cache_ref=cache_ref, view_union=view_union, coverage=coverage,
-                temp_root=temp_root, conf=conf, empty_frame_limit=empty_frame_limit,
-                worker_task_timeout=worker_task_timeout, trace=trace,
-                worker_audit=worker_audit, dispatched=dispatched,
-                first_plan_order=next_plan_order, max_relay_generations=scheduler.max_relay_generation,
-                device_ids=scheduler.device_ids, workers_per_device=scheduler.workers_per_device,
-            )
-            admission_audit["policy"] = "canonical_temporal_frontier/1"
-            scheduler.seal_view(view_key)
-            break
-        if generation >= scheduler.max_relay_generation:
-            overflow = plan_relays(
-                relay_records.get(generation, ()),
-                generation=generation + 1,
-                view_plan=view_plan,
-                cache_ref=cache_ref,
-                scheduler=scheduler,
-                relay_mask_revisions=relay_mask_revisions,
-                temp_root=temp_root,
-                conf=conf,
-                empty_frame_limit=empty_frame_limit,
-                first_plan_order=next_plan_order,
-            )
-            if overflow:
-                raise RuntimeError(
-                    "LTA spatial relay did not reach a mask fixed point within "
-                    f"the safety bound of {scheduler.max_relay_generation} generations"
-                )
-            scheduler.seal_view(view_key)
-            break
-        next_generation = generation + 1
-        planned = plan_relays(
-            relay_records.get(generation, ()),
-            generation=next_generation,
-            view_plan=view_plan,
-            cache_ref=cache_ref,
-            scheduler=scheduler,
-            relay_mask_revisions=relay_mask_revisions,
-            temp_root=temp_root,
-            conf=conf,
-            empty_frame_limit=empty_frame_limit,
-            first_plan_order=next_plan_order,
-        )
-        accepted_chain_count = len(planned)
-        if not planned:
-            if trace is not None:
-                trace.event("relay_generation_planned", generation=next_generation,
-                            accepted_chains=0, planned_windows=0, coverage=coverage.stats())
-                trace.flush()
-            print(f"LTA relay fixed point: generation={generation} accepted_next_chains=0", flush=True)
-            scheduler.seal_view(view_key)
-            break
-        snapshots.close()
-        _unlink_consumed_temp_artifacts((prior_coverage_path,), temp_root=temp_root)
-        prior_coverage = coverage.snapshot(prior_coverage_path)
-        snapshots.callback(prior_coverage.close)
-        generation_observations.clear()
-        raw_relay_endpoints = 0
-        graph_phase = trace.phase("relay_window_graph", generation=next_generation,
-                                  accepted_chains=accepted_chain_count) if trace is not None else nullcontext()
-        with graph_phase:
-            if windowed:
-                planned = _plan_window_tasks(planned, first_plan_order=next_plan_order)
-            scheduler.register_generation(
-                view_key,
-                next_generation,
-                (chain.work for chain in planned),
-            )
-            scheduler.seal_generation(view_key, next_generation)
-            register_tasks(planned)
-        if trace is not None:
-            trace.event("relay_generation_planned", generation=next_generation,
-                        accepted_chains=accepted_chain_count, planned_windows=len(planned),
-                        coverage=coverage.stats())
-            trace.flush()
-        print(f"LTA relay plan: generation={next_generation} accepted_chains={accepted_chain_count} planned_windows={len(planned)}", flush=True)
-        relay_records[next_generation] = []
-        next_plan_order += len(planned)
-        generation = next_generation
-
-    if active:
-        raise RuntimeError("LTA fixed point sealed with active worker claims")
-    admission_audit["coverage"] = coverage.stats()
-    worker_audit["authoritative_active_lineage_tile_count"] = len(
-        authoritative_active_coverage
-    )
-    worker_audit["authoritative_active_range_count"] = sum(
-        len(ranges) for ranges in authoritative_active_coverage.values()
-    )
-    worker_audit["window_graph"] = {
-        "planned_work_count": len(scheduler.work) + int(worker_audit.get("canonical_frontier", {}).get("tasks", 0)),
-        "dispatched_work_count": len(dispatched),
-        "skipped_work_count": int(worker_audit["skipped_window_count"]),
-        "dependency_readiness": "verified_window_completion",
-        "relay_fan_in": "canonical_waves_then_generation" if canonical_frontier else "original_chain_then_generation",
-    }
-    return (
-        generation,
-        dict(pool.pids),
-        tuple(
-            sorted(
-                dispatched,
-                key=lambda item: (int(item["plan_order"]), str(item["work_id"])),
-            )
+    return drive_window_generations(
+        execution=WindowExecution(
+            scheduler=scheduler, pool=pool, view_plan=view_plan, cache_ref=cache_ref,
+            view_union=view_union, temp_root=temp_root, conf=conf,
+            empty_frame_limit=empty_frame_limit, worker_task_timeout=worker_task_timeout,
+            trace=trace, enable_2D_hole_fill=enable_2D_hole_fill,
         ),
-        worker_audit,
+        initial=initial, continue_relays=_continue_canonical_frontier,
+        admission_policy="canonical_temporal_frontier/1",
+        relay_fan_in="canonical_waves_then_generation",
     )
 
 
@@ -2630,10 +1838,6 @@ def execute_lta_plan(
                 (chain.work for chain in initial), plan.device_ids, helper_queue_order="head",
                 max_relay_generation=_relay_generation_bound(view_plan),
                 workers_per_device=plan.workers_per_gpu)
-        relay_mask_revisions: dict[LtaSpatialRelayKey, _RelayMaskRevision] = {}
-        if not dynamic_crops:
-            _prime_authoritative_relay_destinations(
-                scheduler, initial[0].work.view, seed_inventory, relay_mask_revisions)
         view_union = _allocate_view_union(
             view_plan,
             plan.temp_root / "views" / "transverse_union.uint8.raw",
@@ -2672,13 +1876,11 @@ def execute_lta_plan(
                     view_plan=view_plan,
                     cache_ref=cache_ref,
                     view_union=view_union,
-                    relay_mask_revisions=relay_mask_revisions,
                     temp_root=plan.temp_root,
                     conf=plan.conf,
                     empty_frame_limit=empty_frame_limit,
                     worker_task_timeout=float(worker_task_timeout),
                     trace=trace,
-                    canonical_frontier=True,
                 )
             worker_audit = {
                 **worker_audit,

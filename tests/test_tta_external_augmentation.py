@@ -481,7 +481,7 @@ def test_augmented_cleanup_does_not_fill_unknown_holes(monkeypatch):
     import XTA.inference as inference
     view=ViewInfo('x',1,8,8,'clamp',augmentation_pass=1)
     mask=np.ones((1,8,8),np.uint8);mask[0,3:5,3:5]=0
-    monkeypatch.setattr(inference,'fill_view_volume_holes_2d_inplace',lambda *a,**kw:pytest.fail('filled unknown support'))
+    monkeypatch.setattr(inference._prediction_cleanup,'fill_view_volume_holes_2d_inplace',lambda *a,**kw:pytest.fail('filled unknown support'))
     inference.cleanup_view_volume_after_prediction_inplace(mask,None,view,0,0,precleaned_slice_cleanup=True)
     assert not mask[0,3:5,3:5].any()
 

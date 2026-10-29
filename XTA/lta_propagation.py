@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import math
 import operator
-import hashlib
 import json
 import os
 from dataclasses import dataclass, field
@@ -18,6 +17,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from .file_hashing import sha256_file as _sha256_file
 from .lta_experimental import (
     MASK_SEED_MIN_EXCLUSIVE_FRACTION,
     resolve_mask_seed_capacity,
@@ -327,7 +327,7 @@ class LtaPropagationRequest:
 
 @dataclass(frozen=True)
 class LtaObjectPrediction:
-    """One filled SAM prediction retaining its global lineage identity."""
+    """One SAM prediction retaining its global lineage and optional hole fill."""
 
     lineage: LtaLineageId
     prediction: SamFramePrediction
@@ -363,17 +363,6 @@ class LtaSeedArtifact:
     sha256: str
     seed_count: int
     mask_shape: tuple[int, int]
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def write_seed_artifact(path: str | Path, seeds: Sequence[LtaMaskSeed]) -> LtaSeedArtifact:

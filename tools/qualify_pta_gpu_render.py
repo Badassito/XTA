@@ -137,7 +137,7 @@ def make_plan_and_tasks(args, root, frame_indices):
                 label_enabled=True, foreground=True, channel_kind="gray",
             ))
     tasks = pta_workers.build_phase_render_tasks(
-        (plan,), candidates, aug_chunk=1, gpu_batch_size=args.gpu_batch_size,
+        (plan,), candidates, gpu_batch_size=args.gpu_batch_size,
     )
     if not tasks or not all(isinstance(task, pta_workers.GpuFrameBatchTask) for task in tasks):
         raise RuntimeError("Expected real grouped GPU frame tasks")

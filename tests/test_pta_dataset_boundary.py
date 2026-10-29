@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import os
 import subprocess
 import sys
@@ -14,7 +13,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 from XTA import pta_dataset
-from XTA import pta
 from XTA.pta_augmentation import LoadedAugmentation
 
 
@@ -51,59 +49,6 @@ def _candidate(
 
 
 class PtaDatasetBoundaryTests(unittest.TestCase):
-    COMPAT_NAMES = (
-        "AUGMENTATION_TAG_ALPHABET",
-        "AUGMENTATION_TAG_LENGTH",
-        "AugmentationStats",
-        "BackgroundFilterStats",
-        "OutputCandidate",
-        "SplitStats",
-        "apply_background_filter",
-        "apply_dataset_split",
-        "assign_volume_split_by_stem",
-        "augmentation_digest",
-        "augmentation_seed_for_identity",
-        "background_limit_from_foreground",
-        "base62_tag_from_digest",
-        "candidate_atomic_key",
-        "candidate_background_rank",
-        "candidate_source_identity",
-        "deterministic_augmentation_tag",
-        "finalize_augmentation_stats",
-        "finalize_background_filter_with_augmentations",
-        "fraction_identity_selected",
-        "fraction_sample_threshold",
-        "output_source_identity_text",
-        "physical_source_identity_text",
-        "plan_augmented_versions",
-        "refresh_retained_original_split_stats",
-        "select_fraction_candidates",
-        "split_round_half_toward_train",
-        "stable_digest_rank",
-        "withhold_background_overage_after_flips",
-    )
-
-    def test_pta_reexports_dataset_owner_objects_by_identity(self) -> None:
-        self.assertEqual(
-            tuple(pta_dataset.__all__),
-            (
-                "AUGMENTATION_TAG_ALPHABET",
-                "AUGMENTATION_TAG_LENGTH",
-                "AugmentationStats",
-                "BackgroundFilterStats",
-                "OutputCandidate",
-                "SplitStats",
-                "WarningSink",
-                *self.COMPAT_NAMES[6:],
-            ),
-        )
-        for name in self.COMPAT_NAMES:
-            with self.subTest(name=name):
-                owned = getattr(pta_dataset, name)
-                self.assertIs(getattr(pta, name), owned)
-                if inspect.isfunction(owned) or inspect.isclass(owned):
-                    self.assertEqual(owned.__module__, "XTA.pta_dataset")
-
     def test_owner_import_does_not_pull_pta_geometry_or_worker_state(self) -> None:
         program = (
             "from tools.smoke_import import install_stubs; install_stubs(); "

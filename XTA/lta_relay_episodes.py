@@ -8,7 +8,6 @@ first/last endpoint policy instead of inventing new seeds at every seam.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import hashlib
 import json
 import os
 import operator
@@ -16,6 +15,7 @@ from pathlib import Path
 import tempfile
 from typing import Any, Mapping, MutableMapping
 
+from .file_hashing import sha256_file as _sha256
 from .lta_tile_tracking import LtaLineageId
 
 
@@ -26,14 +26,6 @@ RELAY_OBSERVATION_SCHEMA = "lta.relay-observations/1"
 class _RelaySource:
     object_id: int
     visited_tile_indices: tuple[int, ...]
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _checked_value(value: tuple[object, ...]) -> tuple[object, ...]:

@@ -74,7 +74,7 @@ def radial_gpu_bitset_compaction_enabled():
 
 
 def radial_runtime_provenance():
-    from . import outputs
+    from . import outputs, nrrd_compression
     from .cuda_d1 import (
         d1_confidence_gpu_mask_enabled,
         d1_confidence_gpu_mask_min_pixels,
@@ -98,7 +98,7 @@ def radial_runtime_provenance():
         'd1_confidence_gpu_mask_min_pixels': d1_confidence_gpu_mask_min_pixels(),
         'nrrd_sink_workers_effective': outputs.nrrd_layer_sink_workers(),
         'nrrd_sink_workers_constructed': getattr(sink, 'max_workers', None),
-        'nrrd_gzip_workers_effective': outputs.nrrd_gzip_workers(),
+        'nrrd_gzip_workers_effective': nrrd_compression.nrrd_gzip_workers(),
         'nrrd_fill_workers_effective': outputs.nrrd_fill_workers(), 'modules': modules}
 
 

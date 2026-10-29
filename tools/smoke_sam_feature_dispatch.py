@@ -20,7 +20,7 @@ from unittest import mock
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 from tools import smoke_sam_extrapolation as shared
-from tools.smoke_sam_gpu_handoff import initialize_standalone_coordinator, write_receipt
+from tools.smoke_sam_gpu_handoff import initialize_standalone_coordinator
 
 
 def pins():
@@ -145,7 +145,7 @@ def prepare(args):
         claim='Functional parity/cache counters on a scoped real-video continuation; no biological-quality, '
               'timing or multi-GPU performance claim')
     protocol['protocol_sha256'] = shared.identity(protocol)
-    write_receipt(args.output / 'protocol.json', protocol)
+    shared.write(args.output / 'protocol.json', protocol)
     print(json.dumps(dict(status='prepared', protocol=str(args.output / 'protocol.json'),
         arms=protocol['arms'], session_frames=[31, 32], canonical_overlap_exact=True,
         synthetic_continuation=False)), flush=True)
@@ -233,7 +233,7 @@ def run(args):
     from tools.diagnose_sam_interpolation import resource_monitor
     protocol = load_protocol(args.protocol)
     args.output.mkdir(parents=True, exist_ok=False)
-    write_receipt(args.output / 'protocol.json', protocol)
+    shared.write(args.output / 'protocol.json', protocol)
     baseline = np.load(protocol['baseline_path'], mmap_mode='r', allow_pickle=False)
     source = np.memmap(protocol['source_image_path'], mode='r', dtype='uint8',
                        shape=tuple(protocol['source_shape_tyx']))
@@ -305,7 +305,7 @@ def run(args):
                             'max_bytes', 'entries', 'resident_bytes', 'live_bytes', 'peak_live_bytes',
                             'headroom_bytes', 'rejected_headroom', 'rejected_active_bytes')})
                     result['arms'].append(row)
-                    write_receipt(destination / 'result.json', row)
+                    shared.write(destination / 'result.json', row)
                     print(json.dumps(dict(arm=label, status='passed', cache_counters=row['cache_counters'])), flush=True)
                 finally:
                     context.close()
@@ -327,7 +327,7 @@ def run(args):
                       owners_retired=state['contexts_settled'])
         raise
     finally:
-        write_receipt(args.output / 'result.json', result)
+        shared.write(args.output / 'result.json', result)
 
 
 def main():

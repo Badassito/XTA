@@ -290,6 +290,8 @@ class PolicyParentWorkspaceIntegrationTests(unittest.TestCase):
                 angle_variant_streaming_cleanup_active=False,
                 angle_variant_gpu_fastpath_active=False,
                 component_ref_dense_retirement_active=True,
+                projected_parent_output_memory={},
+                parent_mask_retired_events=queue.SimpleQueue(), scheduler_state=state,
                 _publish_parent_mask_ready=mock.Mock(),
                 _publish_parent_confidence_retired=mock.Mock(),
                 _submit_component_projection=mock.Mock(),
@@ -315,6 +317,7 @@ class PolicyParentWorkspaceIntegrationTests(unittest.TestCase):
                 _function(source, helper, namespace)
             ensure = _function(source, '_ensure_baseline_workspaces', namespace)
             _function(source, '_merge_pending_azimuthal_padding_for_parent', namespace)
+            _function(source, '_publish_parent_mask_retired', namespace)
             _function(source, '_submit_view_prepare', namespace)
             _function(source, '_finalize_fullframe_view_after_worker', namespace)
             handler = next(node for node in ast.walk(ast.parse(source))

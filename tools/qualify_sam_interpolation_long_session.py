@@ -7,7 +7,6 @@ The executing helper owns GPU_LOCK; do not wrap it in another GPU reservation.
 from __future__ import annotations
 
 import argparse
-import datetime
 import hashlib
 import json
 import math
@@ -22,6 +21,8 @@ import numpy as np
 REPOSITORY = Path(__file__).resolve().parents[1]
 if str(REPOSITORY) not in sys.path:
     sys.path.insert(0, str(REPOSITORY))
+from tools.gpu_reservation import GpuReservation as SharedGpuReservation
+
 SCHEMA = "xta.sam_long_session_qualification/1"
 FIXTURE_SCHEMA = "xta.sam_static_repeated_real_frame/1"
 
@@ -177,25 +178,16 @@ def prepare(args):
     return record
 
 
-class GpuReservation:
-    """Fail fast on another owner; retain our lock if worker exit is unproven."""
+class GpuReservation(SharedGpuReservation):
+    """Retain admission when worker exit is unproven."""
     def __init__(self, path):
-        self.path = Path(path)
-        self.token = uuid.uuid4().hex
-
-    def acquire(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("x", encoding="utf-8") as stream:
-            json.dump(dict(task="sam_interpolation_long_session_qualification", pid=os.getpid(),
-                start_time=datetime.datetime.now(datetime.timezone.utc).isoformat(), token=self.token), stream)
+        super().__init__(path, task_name="sam_interpolation_long_session_qualification")
 
     def release(self, *, residency_released):
         if not residency_released:
             return False
-        current = json.loads(self.path.read_text(encoding="utf-8"))
-        if current.get("token") != self.token:
+        if not super().release():
             raise RuntimeError("GPU_LOCK ownership changed during qualification")
-        self.path.unlink()
         return True
 
 
@@ -245,7 +237,7 @@ def execute(args, prepared, *, runtime_factory=None, monitor_factory=None):
         images._mmap.close()
     seed = np.load(prepared["seed_path"], allow_pickle=False)
     source_files = [Path(__file__), *(REPOSITORY/"XTA"/name for name in
-        ("sam_tracker_runtime.py", "sam_resources.py", "lta_sam.py", "lta_experimental.py", "lta_worker_adapter.py",
+        ("sam_tracker_runtime.py", "sam_resources.py", "lta_sam.py", "sam_sdk_compat.py", "lta_experimental.py", "lta_worker_adapter.py",
          "lta_workers.py", "lta_tracker_features.py", "lta_feature_cache.py"))]
     source_hashes = {str(path.resolve()): file_sha(path) for path in source_files}
     report = dict(schema=SCHEMA, status="running", fixture=prepared, source_sha256=source_hashes,

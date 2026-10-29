@@ -1,7 +1,9 @@
 """CPU-only event model for bounded policy-group admission fairness.
 
-Geometry and group identity can be checked against the 144736 cluster log. Work
-costs are deliberately abstract: results compare assumptions, not cluster time.
+Uses current geometry for the historical job 144736 shape and workload preset,
+not a replay of that job's original sampling geometry. An optional log must
+match the current compiler's group names and frame inventory. Work costs are
+deliberately abstract: results compare assumptions, not cluster time.
 This development prototype does not modify or invoke the production scheduler.
 """
 from __future__ import annotations
@@ -36,7 +38,7 @@ class Group:
 
 
 def cluster_workload(log: Path | None = None) -> tuple[list[Group], dict]:
-    """Compile the recorded geometry in a process that owns its dependency stubs."""
+    """Compile current geometry in a process that owns its dependency stubs."""
     command = [sys.executable, '-B', str(Path(__file__).resolve()), '--_cluster-workload-child']
     if log is not None:
         command.append(str(log))
@@ -86,12 +88,13 @@ def _cluster_workload_child(log: Path | None = None) -> tuple[list[Group], dict]
         order = list(dict.fromkeys(name.split('__tta')[0] for name in re.findall(
             r'best/(\S+) baseline union workspace:', text)))
         if set(order) != set(by_name):
-            raise ValueError('Log groups differ from the supported all-family, 30-degree coverage preset')
+            raise ValueError('Log groups differ from current geometry for the all-family, 30-degree coverage preset; historical geometry is not replayed')
         frame_match = re.search(r'(\d+) source frame\(s\)/--angle', text)
         if frame_match is None or int(frame_match.group(1)) != sum(group.frames for group in groups):
             raise ValueError('Compiled source-frame count does not match the log')
         groups = [by_name[name] for name in order]
-    return groups, dict(preset='all_families_30_degree_coverage', shape_tyx=shape, raster=raster,
+    return groups, dict(preset='all_families_30_degree_coverage',
+        geometry_source='current_physical_view_compiler', shape_tyx=shape, raster=raster,
         group_count=len(groups), rendered_frames=sum(group.frames for group in groups),
         group_counts_by_family=dict(Counter(group.family for group in groups)),
         order=('observed first-admission order; log ordering is not elapsed time' if log else 'geometry compiler order'),
@@ -288,7 +291,8 @@ def simulate(groups: list[Group], *, policy: str, ratio: int = 4, total_bytes: i
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--log', type=Path)
+    parser.add_argument('--log', type=Path,
+        help='Use its shape and admission order only if group names and frame count match current geometry; does not replay historical sampling')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--ratios', type=int, nargs='+', default=[1, 2, 4])
     parser.add_argument('--total-gib', type=float, nargs='+', default=[384])

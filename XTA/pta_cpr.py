@@ -24,6 +24,10 @@ class CprGeometry:
     half_width: int
     branch_id: int = 0
     extraction_backend: str = "embedded_exact_edt_medial_ridge"
+    # Appended fields preserve the positional constructor used by older callers.
+    # A positive size permits even rasters; half_width is legacy compatibility.
+    raster_size: int = 0
+    raster_size_policy: str = "legacy_odd_radius"
 
     @property
     def height(self) -> int:
@@ -35,7 +39,11 @@ class CprGeometry:
 
     @property
     def width(self) -> int:
-        return 2 * int(self.half_width) + 1
+        return int(self.raster_size) if int(self.raster_size) > 0 else 2 * int(self.half_width) + 1
+
+    @property
+    def center_coordinate(self) -> float:
+        return (self.width - 1) / 2.0
 
     def manifest(self) -> dict[str, object]:
         digest = hashlib.sha256()
@@ -47,8 +55,11 @@ class CprGeometry:
             "centerline_sha256": digest.hexdigest(),
             "centerline_samples": self.num_slices,
             "source_raster_h_w": [self.height, self.width],
-            "center_column": int(self.half_width),
-            "center_row": int(self.half_width),
+            "center_column": self.center_coordinate,
+            "center_row": self.center_coordinate,
+            "parent_sizing": str(self.raster_size_policy),
+            "patch_size": self.width,
+            "patch_extent_processing_voxels": [self.height, self.width],
             "spacing_processing_voxels": [1.0, 1.0, float(np.mean(np.linalg.norm(np.diff(self.points_tyx, axis=0), axis=1)))],
             "plane_orientation": "perpendicular_to_centerline_tangent",
             "outside_source": "constant_zero",
@@ -108,14 +119,21 @@ def build_cpr_geometry(
     *,
     branch_id: int = 0,
     extraction_backend: str = "embedded_exact_edt_medial_ridge",
+    raster_size: int = 0,
 ) -> CprGeometry:
     points, normals, binormals = resample_centerline(points_tyx)
-    # Symmetric coverage keeps the centerline at the central pixel even for an
-    # off-center vessel. Coordinates outside the input are intentionally zero.
-    corners = np.asarray(np.meshgrid(*[(0, int(size) - 1) for size in source_shape], indexing="ij")).reshape(3, -1).T
-    radius = max(float(np.max(np.linalg.norm(corners - point, axis=1))) for point in points)
-    half_width = max(1, int(math.ceil(radius)))
-    return CprGeometry(points, normals, binormals, half_width, int(branch_id), extraction_backend)
+    if len(source_shape) != 3 or any(int(size) < 1 for size in source_shape):
+        raise ValueError("CPR source shape must contain three positive dimensions")
+    requested_size = int(raster_size)
+    if requested_size < 0:
+        raise ValueError("CPR raster size must be non-negative")
+    # The parent is a local native-spacing patch, not a projection of the entire
+    # cube. An explicit imgsz is its exact size; imgsz=0 uses the longest source
+    # axis. Offsets stay centered even when the center lies between four pixels.
+    size = requested_size if requested_size > 0 else max(int(value) for value in source_shape)
+    policy = "explicit_imgsz_native_patch" if requested_size > 0 else "longest_source_axis_native_patch"
+    return CprGeometry(points, normals, binormals, (size - 1) // 2,
+                       int(branch_id), extraction_backend, size, policy)
 
 
 def render_cpr_frame(volume: np.ndarray, geometry: CprGeometry, index: int, *, categorical: bool = False) -> np.ndarray:
@@ -125,7 +143,7 @@ def render_cpr_frame(volume: np.ndarray, geometry: CprGeometry, index: int, *, c
     center = geometry.points_tyx[int(index)]
     normal = geometry.normals_tyx[int(index)]
     binormal = geometry.binormals_tyx[int(index)]
-    offsets = np.arange(-geometry.half_width, geometry.half_width + 1, dtype=np.float32)
+    offsets = np.arange(geometry.width, dtype=np.float32) - np.float32(geometry.center_coordinate)
     output = np.empty((geometry.height, geometry.width), dtype=np.uint8)
     # Bound coordinate scratch independently of both curve length and parent
     # dimensions; large parents continue through the ordinary tiled PTA path.
@@ -201,6 +219,7 @@ def _refine_source_centerline(mask: np.ndarray, points_tyx: np.ndarray, radii: n
 
 def extract_cpr_geometries(
     mask: np.ndarray, *, max_dim: int = 256,
+    raster_size: int = 0,
     warn: Callable[[str], None] | None = None,
 ) -> list[CprGeometry]:
     """Reuse TTA's embedded extractor separately for every connected object.
@@ -234,6 +253,7 @@ def extract_cpr_geometries(
                     points = _refine_source_centerline(mask, points, arrays["radii"][selected][order], factor)
                     results.append(build_cpr_geometry(
                         points, tuple(int(size) for size in mask.shape), branch_id=len(results),
+                        raster_size=int(raster_size),
                     ))
         except (RuntimeError, ValueError) as exc:
             if warn is not None:

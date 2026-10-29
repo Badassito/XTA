@@ -592,11 +592,9 @@ def build_phase_render_tasks(
     plans: Sequence[RenderPlan],
     candidates: Sequence[OutputCandidate],
     *,
-    aug_chunk: int,
     gpu_batch_size: int = 0,
 ) -> List[object]:
     """Group all work by source frame so a reslice/canvas is produced once."""
-    _ = aug_chunk  # retained as a deprecated CLI/API compatibility parameter
     plan_index_by_tag = {plan.tag: int(i) for i, plan in enumerate(plans)}
     grouped: Dict[Tuple[int, int], Dict[str, List[OutputCandidate]]] = defaultdict(lambda: defaultdict(list))
     for cand in candidates:
@@ -620,6 +618,22 @@ def build_phase_render_tasks(
         ),
     )
     if int(gpu_batch_size) > 0:
+        cpr_tasks = [task for task in ordered if plans[task.plan_idx].view.family == "cpr"]
+        ordinary_tasks = [task for task in ordered if plans[task.plan_idx].view.family != "cpr"]
+        if cpr_tasks and any(plans[task.plan_idx].view.shared_view is not None for task in ordinary_tasks):
+            # Centerlines are already prepared after native-mask preprocessing.
+            # Spread CPR through ordinary projection work so a bounded CPU
+            # fallback can overlap admitted CUDA work if residency is declined.
+            # Keep
+            # source frames atomic and each group's longest-first order intact;
+            # publication identities and dataset policy have already been set.
+            ordered = []
+            cpr_index = 0
+            for index, task in enumerate(ordinary_tasks):
+                ordered.append(task)
+                target = ((index + 1) * len(cpr_tasks) + len(ordinary_tasks) - 1) // len(ordinary_tasks)
+                ordered.extend(cpr_tasks[cpr_index:target])
+                cpr_index = target
         return list(
             batch_gpu_frame_tasks(
                 ordered,
@@ -959,6 +973,7 @@ def _prepare_gpu_volume_task(
 
     runtime["gpu_volume_task_key"] = key
     runtime.pop("source_residency_telemetry_key", None)
+    runtime.pop("cpr_geometry_keys", None)
     after = _gpu_volume_memory_snapshot(runtime)
     fields = dict(device_id=int(runtime["device_id"]), generation=int(generation),
                   previous_generation=None if previous is None else int(previous[0]),
@@ -1615,6 +1630,107 @@ def _gpu_source_mask_nonempty(
     return tuple(values)
 
 
+def _cpr_projection_fallback(runtime, reason):
+    """Record a capability fallback without describing CPU work as CUDA."""
+    if isinstance(runtime, dict):
+        reasons = runtime.setdefault("cpr_projection_fallback_reasons", set())
+        if str(reason) not in reasons:
+            reasons.add(str(reason))
+            runtime_telemetry().fallback("pta.render.cpr")
+            print(f"Warning: PTA CPR CUDA projection unavailable ({reason}); using CPU reslicing.")
+
+
+def _gpu_projected_cpr_item_image(runtime, volume, plan, frame_idx, item_key):
+    """Reuse the ordinary resident source and bounded native-plane cache."""
+    if os.environ.get("YOLO_TTA_PTA_GPU_CPR_RENDER", "1").strip().lower() in {
+        "0", "false", "no", "off", "disabled",
+    }:
+        _cpr_projection_fallback(runtime, "disabled by YOLO_TTA_PTA_GPU_CPR_RENDER")
+        return None
+    if "cpr" in runtime.get("cuda_projection_disabled_families", set()):
+        return None
+    renderer, lock = runtime.get("azimuthal_renderer"), runtime.get("azimuthal_render_lock")
+    if renderer is None or lock is None:
+        _cpr_projection_fallback(runtime, runtime.get("azimuthal_renderer_error") or "no resident renderer")
+        return None
+    if str(plan.channel_variant.kind) not in {"gray", "rgb", "custom"}:
+        _cpr_projection_fallback(runtime, "unsupported channel layout")
+        return None
+    geometry = plan.view.cpr_geometry
+    if geometry is None:
+        return None
+    from .pta_cuda_masks import _cpr_native_cuda, _cpr_item_from_native
+
+    try:
+        with runtime_telemetry().span("pta.render.intensity.cpr"), lock:
+            pointer = int(volume.__array_interface__["data"][0])
+            identity = _WORKER_VOLUME_IDENTITY_BY_POINTER.get(pointer, f"array:{pointer}")
+            native = _WORKER_NATIVE_INTENSITY_BY_POINTER.get(pointer)
+            source, logical_t = native if native is not None else (volume, None)
+            mode = renderer.ensure_volume_array(
+                source, identity=identity,
+                **({"resize_to_t": logical_t} if logical_t is not None else {}),
+                require_azimuthal_texture=bool(runtime.get("azimuthal_texture_required", False)),
+            )
+            if str(mode) != "resident":
+                _cpr_projection_fallback(runtime, "source residency not admitted")
+                return None
+            torch = runtime["torch"]
+            geometry_keys = runtime.setdefault("cpr_geometry_keys", {})
+            entry = geometry_keys.get(id(geometry))
+            if entry is None or entry[0] is not geometry:
+                entry = (geometry, str(geometry.manifest()["centerline_sha256"]))
+                geometry_keys[id(geometry)] = entry
+            channel_kind = str(plan.channel_variant.kind)
+            addresses = (tuple(max(0, min(geometry.num_slices - 1, int(frame_idx) + int(offset)))
+                               for offset in plan.channel_variant.offsets)
+                         if channel_kind == "custom" else (int(frame_idx),))
+            cache = renderer._native_u8_plane_cache
+            planes = {}
+            with torch.cuda.device(int(runtime["device_id"])), torch.cuda.stream(renderer._stream):
+                for index in dict.fromkeys(addresses):
+                    key = ("pta_cpr", entry[1], int(geometry.width), int(index))
+                    plane = cache.get(key)
+                    if plane is None:
+                        plane = _cpr_native_cuda(
+                            renderer._volume_gpu, geometry, index, torch=torch, stream=renderer._stream,
+                            resize_to_t=logical_t,
+                        )
+                        cache[key] = plane
+                        while len(cache) > renderer._native_plane_cache_entries():
+                            cache.popitem(last=False)
+                    cache.move_to_end(key)
+                    planes[index] = _cpr_item_from_native(
+                        plane, plan, item_key, torch=torch, categorical=False)
+                first = planes[addresses[0]]
+                image = (first if channel_kind == "gray" else
+                         first.unsqueeze(2).expand(-1, -1, 3).contiguous() if channel_kind == "rgb" else
+                         torch.stack([planes[index] for index in addresses], dim=2).contiguous())
+                ready = torch.cuda.Event()
+                ready.record(renderer._stream)
+            runtime_telemetry().gauge("pta.render.cpr.cuda", {
+                "device_id": int(runtime["device_id"]), "native_t_active": native is not None,
+                "resident_source_bytes": int(source.nbytes), "logical_source_bytes": int(volume.nbytes),
+                "parent_shape": [int(geometry.height), int(geometry.width)],
+                "shared_source_owner": True,
+            })
+            if not bool(runtime.get("cpr_renderer_announced")):
+                runtime["cpr_renderer_announced"] = True
+                print("PTA CPR intensity projection: resident CUDA sampler active; native uint8 patches "
+                      "remain on device through policy/publication; source allocation shared with ordinary views.")
+            return image, ready
+    except Exception as exc:
+        if getattr(renderer, "_array_source_fence_error", None):
+            raise
+        try:
+            renderer._stream.synchronize()
+        except Exception as fence_error:
+            raise RuntimeError("PTA CPR CUDA work could not be safely fenced before fallback") from fence_error
+        runtime.setdefault("cuda_projection_disabled_families", set()).add("cpr")
+        _cpr_projection_fallback(runtime, f"{type(exc).__name__}: {exc}")
+        return None
+
+
 @runtime_telemetry_phase('pta.render.intensity')
 def _gpu_projected_item_image(
     runtime: Mapping[str, object],
@@ -1625,6 +1741,8 @@ def _gpu_projected_item_image(
 ) -> Optional[Tuple[object, object]]:
     """Render one canonical physical-view intensity item on CUDA."""
 
+    if getattr(plan.view, "family", None) == "cpr":
+        return _gpu_projected_cpr_item_image(runtime, volume, plan, frame_idx, item_key)
     shared_view = plan.view.shared_view
     radial_view = bool(
         shared_view is not None and shared_geometry.is_radial_view(shared_view)
@@ -1923,9 +2041,12 @@ def _render_gpu_item_group(
     items: Sequence[Tuple[str, Tuple[OutputCandidate, ...]]],
     runtime: Optional[Mapping[str, object]] = None,
     semantic_coverage: Optional[np.ndarray] = None,
+    *,
+    _preprojected_image=None,
 ) -> Tuple[_GpuItemWork, ...]:
-    """Render an independently schedulable full/tile item group on the CPU."""
+    """Render a source group on CUDA where admitted, preserving CPU fallbacks."""
 
+    is_cpr = getattr(getattr(plan, "view", None), "family", None) == "cpr"
     tile_by_tag = {str(tile.tile_tag): tile for tile in plan.tile_layout}
     plan_channel_count = max(
         1,
@@ -1936,9 +2057,24 @@ def _render_gpu_item_group(
         for _item_key, candidates in items
         for candidate in candidates
     )
+    if runtime is not None and is_cpr and len(items) > 1:
+        projections = []
+        for item_key, _candidates in items:
+            projection = _gpu_projected_item_image(runtime, volume, plan, frame_idx, str(item_key))
+            if projection is None:
+                break
+            projections.append(projection)
+        else:
+            return tuple(
+                work for item, projection in zip(items, projections)
+                for work in _render_gpu_item_group(
+                    volume, mask, plan, frame_idx, (item,), runtime, semantic_coverage,
+                    _preprojected_image=projection,
+                )
+            )
     if runtime is not None and len(items) == 1:
         item_key, candidates = items[0]
-        gpu_projection = _gpu_projected_item_image(
+        gpu_projection = _preprojected_image or _gpu_projected_item_image(
             runtime,
             volume,
             plan,
@@ -1961,7 +2097,7 @@ def _render_gpu_item_group(
                     ),
                     None,
                 )
-                if tile is None or tile.shared_job is None:
+                if tile is None or (tile.shared_job is None and not is_cpr):
                     raise RuntimeError(
                         f"CUDA-rendered PTA tile {plan.tag}/{item_key} has no canonical tile job"
                     )
@@ -1990,6 +2126,8 @@ def _render_gpu_item_group(
                 item_mask, item_coverage, categorical_ready_event = categorical_projection
             else:
                 categorical_ready_event = None
+                if is_cpr and source_mask_required:
+                    _cpr_projection_fallback(runtime, "categorical source residency not admitted")
                 if source_mask_required:
                     if str(item_key) == "full":
                         item_mask, _mask_canvas = render_plan_frame_mask_source(
@@ -1998,6 +2136,13 @@ def _render_gpu_item_group(
                             idx=int(frame_idx),
                             need_canvas=False,
                         )
+                    elif is_cpr:
+                        _full, canvas = render_plan_frame_mask_source(
+                            mask=mask, plan=plan, idx=int(frame_idx), need_canvas=True)
+                        if canvas is None:
+                            raise RuntimeError("CPR categorical fallback has no parent canvas")
+                        cropped = extract_padded_tile(canvas, tile.x, tile.y, tile.cfg.tile_size)
+                        item_mask = resize_centered(cropped, tile.out_w, tile.out_h, cv2.INTER_NEAREST)
                     else:
                         item_mask = shared_geometry.render_categorical_dense_tile_for_job(
                             mask,
@@ -2013,6 +2158,9 @@ def _render_gpu_item_group(
                 item_coverage = _render_semantic_coverage_item(
                     semantic_coverage, plan, int(frame_idx), str(item_key), gpu_source=True,
                 )
+                if item_coverage is not None and is_cpr:
+                    item_coverage = resize_centered(
+                        item_coverage, int(output_size[1]), int(output_size[0]), cv2.INTER_NEAREST)
             return (
                 _GpuItemWork(
                     candidates=tuple(candidates),
@@ -2589,7 +2737,7 @@ def execute_gpu_frame_batch_task(
                                 ):
                                     local_warnings.add(
                                         "gpu_policy_cuda_source_fallback",
-                                        "external policy lacks supports_cuda_sources; projected images cross CUDA->CPU->CUDA",
+                                        "policy/source capabilities require host staging; projected images cross CUDA->CPU->CUDA",
                                     )
                                     if isinstance(runtime, dict):
                                         runtime["cuda_source_policy_fallback_announced"] = True
@@ -2778,6 +2926,16 @@ def execute_gpu_frame_batch_task(
                             retained.extend(batch)
                     ready = retained
 
+    if (
+        bool(runtime.get("cpr_renderer_announced"))
+        and not bool(runtime.get("cpr_renderer_manifest_announced"))
+    ):
+        local_warnings.add(
+            "pta_cuda_cpr_projection_active",
+            "Resident CUDA CPR intensity sampler active; ordinary-view source allocation reused",
+        )
+        if isinstance(runtime, dict):
+            runtime["cpr_renderer_manifest_announced"] = True
     if (
         bool(runtime.get("cartesian_renderer_announced"))
         and not bool(runtime.get("cartesian_renderer_manifest_announced"))

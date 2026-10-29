@@ -6,6 +6,7 @@ All models, logs, caches and decoded validation artifacts stay under --output.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import gzip
 import hashlib
 import json
@@ -18,6 +19,8 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from tools.gpu_reservation import gpu_reservation
 POLICIES = ROOT / 'XTA/examples/external_reconciliation'
 CASES = ('cpu_off', 'cpu_union', 'gpu_off', 'gpu_union', 'cpu_confidence',
          'gpu_confidence', 'hybrid_augmented_tiles', 'hybrid_augmented_tiles_union',
@@ -333,18 +336,9 @@ def main():
         parser.error('Use a fresh directory outside the repository, or --reuse-fixtures')
     root.mkdir(parents=True, exist_ok=True)
     lock = args.gpu_lock.resolve() if needs_gpu else None
-    if lock is not None:
-        lock.parent.mkdir(parents=True, exist_ok=True)
-    while lock is not None:
-        try:
-            with lock.open('x') as stream:
-                json.dump(dict(task='reconciliation pipeline qualification', pid=os.getpid(),
-                    start_time=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())), stream)
-            break
-        except FileExistsError:
-            print('Waiting for GPU_LOCK', flush=True)
-            time.sleep(5)
-    try:
+    reservation = (gpu_reservation(lock, task_name='reconciliation pipeline qualification')
+                   if lock is not None else nullcontext())
+    with reservation:
         os.environ.update(runtime_environment(root))
         if needs_gpu and not (root / 'model.engine').exists():
             from tools.qualify_tta_hybrid_augmentation import fixtures
@@ -367,9 +361,6 @@ def main():
                 parity['cpu_bridges'] = verify_parity(*(json.loads(path.read_text()) for path in paths))
         (root / 'parity.json').write_text(json.dumps(parity, indent=2))
         print(json.dumps(dict(parity=parity), indent=2), flush=True)
-    finally:
-        if lock is not None:
-            lock.unlink(missing_ok=True)
 
 
 if __name__ == '__main__':

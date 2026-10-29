@@ -37,7 +37,8 @@ class RadialOwnerGpuExportRoutingTests(unittest.TestCase):
         self.root = Path(self.temp.name)
 
     def _run(self, *, nonempty=(True,), compaction='1', packed='1',
-             preflight_error=None, export_error=None, mutate_on_submit=False):
+             preflight_error=None, export_error=None, mutate_on_submit=False,
+             enable_hole_fill=False):
         view = SimpleNamespace(name='radial_fixture__tta_a0', family='radial',
                                num_slices=2, tta_angle_deg=0.)
         output_shape = (2, 4, 5)
@@ -49,7 +50,8 @@ class RadialOwnerGpuExportRoutingTests(unittest.TestCase):
         class FakeOwner:
             proven_empty_output = RealOwner.proven_empty_output
 
-            def __init__(self, view, mask_shape, output_shape):
+            def __init__(self, view, mask_shape, output_shape, *, enable_hole_fill=True):
+                self.enable_hole_fill = bool(enable_hole_fill)
                 self.view = view
                 self.mask_shape = tuple(mask_shape)
                 self.output_shape = tuple(output_shape)
@@ -114,6 +116,8 @@ class RadialOwnerGpuExportRoutingTests(unittest.TestCase):
                     'YOLO_TTA_RADIAL_GPU_BITSET_COMPACTION': compaction,
                     'YOLO_TTA_PACKED_OWNER_PUBLICATION': packed,
                 }), mock.patch.object(owner_module, 'RadialOwner', FakeOwner), \
+                mock.patch.object(owner_module, 'yolo_hole_fill_enabled',
+                                  return_value=enable_hole_fill), \
                 mock.patch.object(owner_module, '_RADIAL_OWNER_STATES', states), \
                 mock.patch.object(owner_module, '_RADIAL_COMPACTION_PREFLIGHT_ERROR', preflight_error), \
                 mock.patch.object(cuda_d1, '_D1_WORKER_VIEW_STATES', {}), \
@@ -132,6 +136,8 @@ class RadialOwnerGpuExportRoutingTests(unittest.TestCase):
     def test_nonempty_selects_gpu_export_and_closes_before_async_submit(self):
         run = self._run(mutate_on_submit=True)
         result = run.results[-1]
+        self.assertFalse(run.owner.enable_hole_fill)
+        self.assertEqual(result['device_hole_filled_frames'], 0)
         self.assertEqual(run.events, ['consume', 'gpu_pack', 'close', 'submit'])
         self.assertTrue(result['d1_view_complete'])
         self.assertEqual(result['d1_bitset_export_kind'], 'gpu_packed')
@@ -143,6 +149,18 @@ class RadialOwnerGpuExportRoutingTests(unittest.TestCase):
         self.assertIn('export_kind=gpu_packed', run.output)
         self.assertIn('host_bitset_bytes=0, packed_payload_bytes=1, host_transfer_bytes=17',
                       run.output)
+
+    def test_resolved_hole_fill_flag_reaches_owner_and_result_telemetry(self):
+        for enabled in (False, True):
+            with self.subTest(enable_hole_fill=enabled):
+                run = self._run(nonempty=(True, False), enable_hole_fill=enabled)
+                self.assertIs(run.owner.enable_hole_fill, enabled)
+                self.assertEqual([result['device_hole_filled_frames'] for result in run.results],
+                                 [int(enabled), int(enabled)])
+                self.assertEqual([result['proto_hole_treated_frames'] for result in run.results],
+                                 [0, 0])
+                self.assertEqual(run.events, ['consume', 'consume', 'gpu_pack', 'close', 'submit'])
+                self.assertEqual(run.results[-1]['d1_bitset_export_kind'], 'gpu_packed')
 
     def test_completion_and_proven_emptiness_are_independent(self):
         empty = self._run(nonempty=(False, False))
@@ -200,7 +218,8 @@ class RadialOwnerGpuExportRoutingTests(unittest.TestCase):
                 class FailingOwner:
                     proven_empty_output = owner_module.RadialOwner.proven_empty_output
 
-                    def __init__(self, view, mask_shape, output_shape):
+                    def __init__(self, view, mask_shape, output_shape, *, enable_hole_fill=True):
+                        self.enable_hole_fill = bool(enable_hole_fill)
                         self.coverage = np.zeros(2, bool)
                         self.native_any = False
                         self._closed = self._failed = False
@@ -230,15 +249,17 @@ class RadialOwnerGpuExportRoutingTests(unittest.TestCase):
                             'YOLO_TTA_RADIAL_GPU_BITSET_COMPACTION': '1',
                             'YOLO_TTA_PACKED_OWNER_PUBLICATION': '1'}), \
                         mock.patch.object(owner_module, 'RadialOwner', FailingOwner), \
+                        mock.patch.object(owner_module, 'yolo_hole_fill_enabled', return_value=False), \
                         mock.patch.object(owner_module, '_RADIAL_OWNER_STATES', states), \
                         mock.patch.object(owner_module, '_RADIAL_COMPACTION_PREFLIGHT_ERROR', None), \
                         mock.patch.object(cuda_d1, '_D1_WORKER_VIEW_STATES', {}), \
                         mock.patch.object(cuda_d1, '_d1_submit_publication') as submit, \
                         redirect_stdout(io.StringIO()):
-                    with self.assertRaises(type(error)):
+                    with self.assertRaises(type(error)) as caught:
                         owner_module.consume_radial_device_union(
                             task, SimpleNamespace(union_dev=np.zeros((2, 2, 2), np.uint8),
                                                   host_written=False))
+                self.assertIs(caught.exception, error)
                 self.assertEqual(events, ['consume', 'gpu_pack'])
                 self.assertEqual(len(states), 1)
                 submit.assert_not_called()
@@ -281,8 +302,10 @@ class RadialOwnerGpuExportFunctionalTests(unittest.TestCase):
                             'YOLO_TTA_RADIAL_GPU_BITSET_COMPACTION': '1',
                             'YOLO_TTA_PACKED_OWNER_PUBLICATION': '1'}), \
                         mock.patch.object(owner_module, 'RadialOwner',
-                                          side_effect=lambda v, m, o: RealOwner(
-                                              v, m, o, reserve_bytes=0)), \
+                                          side_effect=lambda v, m, o, *, enable_hole_fill: RealOwner(
+                                              v, m, o, reserve_bytes=0,
+                                              enable_hole_fill=enable_hole_fill)), \
+                        mock.patch.object(owner_module, 'yolo_hole_fill_enabled', return_value=True), \
                         mock.patch.object(owner_module, '_RADIAL_OWNER_STATES', states), \
                         mock.patch.object(owner_module, '_RADIAL_COMPACTION_PREFLIGHT_ERROR', None), \
                         mock.patch.object(cuda_d1, '_D1_WORKER_VIEW_STATES', {}), \

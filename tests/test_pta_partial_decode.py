@@ -6,7 +6,7 @@ from unittest import mock
 import numpy as np
 import pytest
 
-from XTA import pta
+from XTA import pta, pta_inputs
 from tests.test_pta_multi_input import cpu_only, run, artifacts
 
 
@@ -37,11 +37,11 @@ def test_partial_output_pixels_labels_tiles_and_context_match_full_decode(tmp_pa
     with mock.patch.object(pta,'_required_partial_sequence_positions',return_value=None):
         full=run([source],tmp_path/'full',extra=extra)
     reads=[]
-    original=pta._read_gray_image_opencv
+    original=pta_inputs._read_gray_image_opencv
     def read(path):
         reads.append(path)
         return original(path)
-    monkeypatch.setattr(pta,'_read_gray_image_opencv',read)
+    monkeypatch.setattr(pta_inputs,'_read_gray_image_opencv',read)
     partial=run([source],tmp_path/'partial',extra=extra)
     for folder in ('images','labels'):
         assert artifacts(tmp_path/'partial',folder)==artifacts(tmp_path/'full',folder)

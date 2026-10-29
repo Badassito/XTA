@@ -55,18 +55,20 @@ class LtaWindowGpuSmokeControlsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            with mock.patch.object(smoke.execution, "_drive_workers_to_fixed_point", legacy_driver):
+            with mock.patch.object(smoke.reference, "_drive_workers_to_fixed_point", legacy_driver):
                 summary = smoke.run_case(root / "default", **self.fixture(root))
             self.assertEqual(calls, [1])
             self.assertFalse(summary["canonical_frontier"])
             self.assertEqual(summary["foreground_pixels"], 4)
             self.assertEqual(summary["worker_audit"], {"mode": "retained"})
 
-    def test_opt_in_reaches_driver_and_preserves_union_and_work_audit(self):
-        modes = []
+    def test_opt_in_selects_production_driver_and_preserves_union_and_work_audit(self):
+        calls = []
 
-        def candidate_driver(*, canonical_frontier=False, **kwargs):
-            modes.append(canonical_frontier)
+        def candidate_driver(**kwargs):
+            self.assertNotIn("canonical_frontier", kwargs)
+            self.assertNotIn("relay_mask_revisions", kwargs)
+            calls.append(len(kwargs["initial"]))
             kwargs["view_union"][1, 1:3, 1:3] = 1
             return 2, {}, ({"work_id": "frontier-task"},), {"canonical_work_count": 1}
 
@@ -74,7 +76,7 @@ class LtaWindowGpuSmokeControlsTests(unittest.TestCase):
             root = Path(folder)
             with mock.patch.object(smoke.execution, "_drive_workers_to_fixed_point", candidate_driver):
                 summary = smoke.run_case(root / "candidate", canonical_frontier=True, **self.fixture(root))
-            self.assertEqual(modes, [True])
+            self.assertEqual(calls, [1])
             self.assertTrue(summary["canonical_frontier"])
             self.assertEqual(summary["foreground_pixels"], 4)
             self.assertEqual(summary["generation"], 2)

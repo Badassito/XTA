@@ -12,7 +12,8 @@ from PIL import Image
 import pytest
 
 from XTA.lta_sam import (patch_sam_init_state_signature, prepare_sam_video_frames,
-    _resize_sam_rgb_u8, _preserve_torch_tf32)
+    _resize_sam_rgb_u8)
+from XTA.sam_sdk_compat import _preserve_torch_tf32
 
 
 class Frames(list):

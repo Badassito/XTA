@@ -12,6 +12,8 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from tools.gpu_reservation import gpu_reservation
+
 
 def fixtures(case: Path):
     import cv2
@@ -122,22 +124,11 @@ def main():
         parser.error('Use a fresh output directory in Scratch')
     case.mkdir(parents=True)
     lock = args.gpu_lock.resolve()
-    while True:
-        try:
-            with lock.open('x') as stream:
-                stream.write(json.dumps({'task': 'v22.2.0 TensorRT and hybrid qualification', 'pid': os.getpid(),
-                    'start_time': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}))
-            break
-        except FileExistsError:
-            print('Waiting for GPU_LOCK', flush=True)
-            time.sleep(5)
-    try:
+    with gpu_reservation(lock, task_name='TensorRT and hybrid qualification'):
         fixtures(case)
         print('Real TensorRT and OpenVINO fixtures built.', flush=True)
         run_case(case, hybrid=False)
         run_case(case, hybrid=True)
-    finally:
-        lock.unlink()
 
 
 if __name__ == '__main__':

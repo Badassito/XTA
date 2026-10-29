@@ -1452,7 +1452,7 @@ class TtaScheduler:
         if active_parent not in self.state.hybrid_stealback_announced_parents:
             self.state.hybrid_stealback_announced_parents.add(active_parent)
             print(
-                'v17.0.3 active-view ETA GPU assist enabled for '
+                'Active-view ETA GPU assist enabled for '
                 f'{active_parent[0]}/{active_parent[1]}: active CPU ETA={cpu_eta:.1f}s, '
                 f'mandatory-GPU ETA={gpu_horizon:.1f}s, '
                 f'estimated GPU assist={gpu_seconds_needed:.1f}s, '
@@ -1988,7 +1988,7 @@ class TtaScheduler:
             self.state.fullframe_remaining[parent_key] = int(self.state.fullframe_remaining.get(parent_key, 0)) + 1
             self.state.fullframe_task_ids_by_parent.setdefault(parent_key, []).append(int(child_id))
         print(
-            f'v13.3.18 (C11): dispatch tail split task {original_id} '
+            f'Dispatch tail split task {original_id} '
             f'[{original_start}:{original_stop}] -> [{original_start}:{midpoint}] + '
             f'[{midpoint}:{original_stop}] as task {child_id}.'
         )

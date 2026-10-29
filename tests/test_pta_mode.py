@@ -99,8 +99,6 @@ class PtaModeBoundaryTests(unittest.TestCase):
         self.assertTrue(options.voxel_volume)
         self.assertTrue(options.save_summary)
         self.assertEqual(options.max_pending_frames, 0)
-        self.assertEqual(options.tile_task_chunk, 1)
-        self.assertEqual(options.aug_task_chunk, 4)
         self.assertIs(options._v18_config, config)
 
     def test_png_compression_bounds_apply_to_every_output_format(self) -> None:

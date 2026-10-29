@@ -9,7 +9,7 @@ from unittest import mock
 
 import pytest
 
-from XTA import outputs
+from XTA import nrrd_compression
 
 
 @pytest.mark.parametrize(('version', 'old'), [
@@ -18,7 +18,7 @@ from XTA import outputs
 ])
 def test_imported_binding_version_gate_is_conservative(version, old):
     module = SimpleNamespace(__version__=version, __file__='/custom/deflate/__init__.py')
-    assert outputs._old_nrrd_libdeflate_binding_version(module) == old
+    assert nrrd_compression._old_nrrd_libdeflate_binding_version(module) == old
 
 
 def test_metadata_fallback_requires_selected_module_in_distribution_record():
@@ -27,18 +27,18 @@ def test_metadata_fallback_requires_selected_module_in_distribution_record():
         version='0.8.1', files=[Path('deflate/__init__.py')],
         locate_file=lambda _file: '/task/deps/deflate/__init__.py',
     )
-    with mock.patch.object(outputs.importlib_metadata, 'distribution', return_value=distribution):
-        assert outputs._old_nrrd_libdeflate_binding_version(module) == '0.8.1'
+    with mock.patch.object(nrrd_compression.importlib_metadata, 'distribution', return_value=distribution):
+        assert nrrd_compression._old_nrrd_libdeflate_binding_version(module) == '0.8.1'
 
     custom = SimpleNamespace(__file__='/custom/deflate/__init__.py')
-    with mock.patch.object(outputs.importlib_metadata, 'distribution', return_value=distribution):
-        assert outputs._old_nrrd_libdeflate_binding_version(custom) is None
+    with mock.patch.object(nrrd_compression.importlib_metadata, 'distribution', return_value=distribution):
+        assert nrrd_compression._old_nrrd_libdeflate_binding_version(custom) is None
 
 
 def test_missing_metadata_never_claims_old_binding():
     custom = SimpleNamespace(__file__='/custom/deflate/__init__.py')
-    with mock.patch.object(outputs.importlib_metadata, 'distribution', side_effect=LookupError):
-        assert outputs._old_nrrd_libdeflate_binding_version(custom) is None
+    with mock.patch.object(nrrd_compression.importlib_metadata, 'distribution', side_effect=LookupError):
+        assert nrrd_compression._old_nrrd_libdeflate_binding_version(custom) is None
 
 
 def _old_module():
@@ -56,7 +56,7 @@ def _telemetry():
     ('auto', True), ('cpu', True), ('cpu', False),
 ])
 def test_policy_chain_skips_old_binding_for_next_validated_codec(policy, isal_available, capsys):
-    actual_spec = outputs._nrrd_member_codec_spec
+    actual_spec = nrrd_compression._nrrd_member_codec_spec
     attempted = []
 
     def spec(name):
@@ -74,12 +74,12 @@ def test_policy_chain_skips_old_binding_for_next_validated_codec(policy, isal_av
         raise AssertionError('unexpected codec tier')
 
     with mock.patch.dict(sys.modules, {'deflate': _old_module()}), \
-            mock.patch.object(outputs, 'nrrd_member_codec_requested', return_value=policy), \
-            mock.patch.object(outputs, '_nrrd_member_codec_spec', side_effect=spec), \
-            mock.patch.object(outputs, '_nrrd_member_codec_self_test', return_value=True), \
-            mock.patch.object(outputs, 'runtime_telemetry', return_value=_telemetry()), \
-            mock.patch.object(outputs, '_NRRD_MEMBER_CODEC_FAILURES_ANNOUNCED', set()):
-        selected = outputs._select_nrrd_member_codec()
+            mock.patch.object(nrrd_compression, 'nrrd_member_codec_requested', return_value=policy), \
+            mock.patch.object(nrrd_compression, '_nrrd_member_codec_spec', side_effect=spec), \
+            mock.patch.object(nrrd_compression, '_nrrd_member_codec_self_test', return_value=True), \
+            mock.patch.object(nrrd_compression, 'runtime_telemetry', return_value=_telemetry()), \
+            mock.patch.object(nrrd_compression, '_NRRD_MEMBER_CODEC_FAILURES_ANNOUNCED', set()):
+        selected = nrrd_compression._select_nrrd_member_codec()
     assert selected[0] == ('isal' if isal_available else 'zlib')
     assert attempted[-2:] == (['libdeflate', 'isal'] if isal_available else ['isal', 'zlib'])
     assert 'deflate>=0.9.0' in capsys.readouterr().out
@@ -87,10 +87,10 @@ def test_policy_chain_skips_old_binding_for_next_validated_codec(policy, isal_av
 
 def test_explicit_old_libdeflate_fails_with_upgrade_path():
     with mock.patch.dict(sys.modules, {'deflate': _old_module()}), \
-            mock.patch.object(outputs, 'nrrd_member_codec_requested', return_value='libdeflate'), \
-            mock.patch.object(outputs, 'runtime_telemetry', return_value=_telemetry()):
+            mock.patch.object(nrrd_compression, 'nrrd_member_codec_requested', return_value='libdeflate'), \
+            mock.patch.object(nrrd_compression, 'runtime_telemetry', return_value=_telemetry()):
         with pytest.raises(RuntimeError, match=r'Explicit.*deflate>=0\.9\.0'):
-            outputs._require_nrrd_member_codec()
+            nrrd_compression._require_nrrd_member_codec()
 
 
 def test_unknown_custom_binding_is_not_rejected_by_version_check():
@@ -99,8 +99,8 @@ def test_unknown_custom_binding_is_not_rejected_by_version_check():
         gzip_compress=lambda payload, level: bytes(payload),
     )
     with mock.patch.dict(sys.modules, {'deflate': custom}), \
-            mock.patch.object(outputs.importlib_metadata, 'distribution', side_effect=LookupError):
-        spec = outputs._nrrd_member_codec_spec('libdeflate')
+            mock.patch.object(nrrd_compression.importlib_metadata, 'distribution', side_effect=LookupError):
+        spec = nrrd_compression._nrrd_member_codec_spec('libdeflate')
     assert spec[0] == 'libdeflate'
     assert spec[2](b'abc') == b'abc'
 

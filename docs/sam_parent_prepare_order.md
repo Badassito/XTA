@@ -1,5 +1,12 @@
 # SAM parent preparation order
 
+This is the current parent-admission ordering contract. See the
+[SAM guide](sam_interpolation.md) for scientific behavior and the
+[runtime and SDK guide](sam_sdk.md#parent-admission-and-image-funding) for
+resource ownership and parent funding.
+
+## Ordering and fairness
+
 The bounded parent queue mixes long input preparation with older suppliers.
 Among expensive parents, one successful admission selects the largest recorded
 native dense-input footprint, followed by three successful admissions in
@@ -29,6 +36,8 @@ or task inventory change.
 Terminal cancellation clears queue ordinals, scan cohorts, denial progress and
 policy cursors; the existing resource cancellation and ownership cleanup still
 settle the actual work.
+
+## Admission diagnostics
 
 Each successful handoff emits one `sam_parent_prepare_admitted` event containing
 the policy turn, cost, immutable queue ordinal/age, age and size ranks, worker

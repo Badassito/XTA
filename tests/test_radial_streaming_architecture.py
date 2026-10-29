@@ -15,7 +15,7 @@ class RadialStreamingArchitectureTests(unittest.TestCase):
         # Isolate this numerical law so it always exercises real SciPy.
         code = """
 import numpy as np
-from XTA.inference import _fill_holes_2d_scipy as fill
+from XTA._prediction_cleanup import _fill_holes_2d_scipy as fill
 ring = np.zeros((7, 7), np.uint8)
 ring[1, 1:6] = ring[5, 1:6] = 1
 ring[1:6, 1] = ring[1:6, 5] = 1

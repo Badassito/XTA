@@ -6,7 +6,7 @@ from unittest import TestCase, mock, skipUnless
 
 import numpy as np
 
-from XTA import backprojection, inference, workspace
+from XTA import backprojection, inference, workspace, _prediction_cleanup
 from XTA.geometry import ViewInfo
 
 
@@ -33,9 +33,9 @@ class YoloHoleFillOptInTests(TestCase):
         self.configure()
         mask = self.ring()
         expected = mask.copy()
-        with (mock.patch.object(inference, 'fill_view_volume_holes_2d_inplace',
+        with (mock.patch.object(_prediction_cleanup, 'fill_view_volume_holes_2d_inplace',
                                 side_effect=AssertionError('disabled fill scanned the view')),
-              mock.patch.object(inference, 'fused_slice_cleanup_inplace',
+              mock.patch.object(_prediction_cleanup, 'fused_slice_cleanup_inplace',
                                 side_effect=AssertionError('zero thresholds scanned the view'))):
             self.clean(mask)
         np.testing.assert_array_equal(mask, expected)
@@ -60,7 +60,7 @@ class YoloHoleFillOptInTests(TestCase):
 
     def test_completed_device_fill_does_not_repeat_on_cpu(self):
         self.configure(True)
-        with mock.patch.object(inference, 'fill_view_volume_holes_2d_inplace',
+        with mock.patch.object(_prediction_cleanup, 'fill_view_volume_holes_2d_inplace',
                                side_effect=AssertionError('duplicate fill')):
             self.clean(self.ring(), skip_hole_fill=True)
 

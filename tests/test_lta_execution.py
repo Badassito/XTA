@@ -17,7 +17,6 @@ import numpy as np
 from XTA.geometry import expand_views_into_tta_variants, get_view_infos
 from XTA.lta_coverage import LtaCoverageBuilder
 from XTA.lta_execution import (
-    _accumulate_relay_seed_revision,
     _accumulate_worker_ready_audit,
     _accumulate_worker_audit,
     _aligned_annotations,
@@ -33,10 +32,13 @@ from XTA.lta_execution import (
     _materialize_source_volume,
     _plan_initial_chains,
     _preflight_lta_storage,
-    _plan_relay_generation,
     _relay_generation_bound,
     _seeds_for_tile,
     execute_lta_plan,
+)
+from tests.reference_backends.lta_generation import (
+    _accumulate_relay_seed_revision,
+    _plan_relay_generation,
 )
 from XTA.lta_inputs import (
     AnnotationState,
@@ -960,7 +962,7 @@ class LtaProductionExecutionTests(unittest.TestCase):
         driver_calls = []
 
         def drive_and_record(*args, **kwargs):
-            driver_calls.append(kwargs['canonical_frontier'])
+            driver_calls.append(frozenset(kwargs))
             return _drive_workers_to_fixed_point(*args, **kwargs)
 
         with tempfile.TemporaryDirectory() as temp_dir, mock.patch(
@@ -976,7 +978,9 @@ class LtaProductionExecutionTests(unittest.TestCase):
                 for line in path.read_text().splitlines()
             ]
 
-        self.assertEqual(driver_calls, [True])
+        self.assertEqual(len(driver_calls), 1)
+        self.assertNotIn('canonical_frontier', driver_calls[0])
+        self.assertNotIn('relay_mask_revisions', driver_calls[0])
         self.assertEqual(identity["contract"], "lta.window_dag/1")
         self.assertEqual(identity["requested_devices"], [0, 1, 2, 3])
         self.assertEqual(identity["scratch_root"], manifest["run_plan"]["temp_root"])
@@ -1156,7 +1160,7 @@ class LtaProductionExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires helper_queue_order='head'"):
             _drive_workers_to_fixed_point(
                 scheduler=scheduler, pool=None, initial=(), view_plan=None,
-                cache_ref=None, view_union=None, relay_mask_revisions={},
+                cache_ref=None, view_union=None,
                 temp_root=Path("unused"), conf=0.15, empty_frame_limit=30,
                 worker_task_timeout=30.0,
             )

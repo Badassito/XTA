@@ -28,6 +28,9 @@ def build_runtime_options(config: PtaConfig) -> argparse.Namespace:
         imgsz=public.imgsz,
         output_format=str(config.effective_output_format),
         channel_format=[str(config.channel_format.token)],
+        # The public token list remains available to direct engine callers.
+        # Normal runs consume the canonical layout without parsing it again.
+        _pta_channel_formats=(config.channel_format,),
         force=public.force,
         task=public.task,
         enable_cpr=bool(getattr(public, "enable_cpr", False)),
@@ -76,8 +79,6 @@ def build_runtime_options(config: PtaConfig) -> argparse.Namespace:
         topology_aware=public.topology_aware,
         # Internal scheduler settings are not public flags.
         max_pending_frames=0,
-        tile_task_chunk=1,
-        aug_task_chunk=4,
         _v18_requested_output_format=str(config.requested_output_format),
         _v18_config=config,
     )

@@ -26,7 +26,7 @@ def main():
     if not output.is_relative_to(scratch) or args.heat_seconds < 30 or min(args.frames, args.repeats) < 1:
         parser.error('Use a Scratch output, >=30s heatsoak and positive frame/repeat counts')
     output.mkdir(parents=True, exist_ok=True)
-    from tools.qualify_release import gpu_reservation
+    from tools.gpu_reservation import gpu_reservation
     lock = scratch/'Temp/GPU_LOCK'
     with gpu_reservation(lock, 300., task_name='SAM155646 image renderer GPU probe'):
         import numpy as np

@@ -92,7 +92,8 @@ def classify_task(runtime, mask, plans, task, *, identity, coverage=None):
                 grids = [_item_grid(plan, key) for key in keys]
                 sizes = [0 if grid is None else grid.height * grid.width * (1 + (coverage is not None))
                          for grid in grids]
-                if (_family(getattr(plan.view, 'shared_view', None)) is None
+                physical = plan.view if getattr(plan.view, 'family', None) == 'cpr' else getattr(plan.view, 'shared_view', None)
+                if (_family(physical) is None
                         or any(grid is None for grid in grids)
                         or any(size > MAX_PROJECTED_BYTES for size in sizes)):
                     remaining.append(job)

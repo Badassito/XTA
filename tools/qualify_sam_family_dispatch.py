@@ -20,7 +20,7 @@ import time
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 SOURCES=('XTA/sam_tracker_runtime.py','XTA/sam_interpolation.py','XTA/lta_feature_cache.py',
-    'XTA/lta_tracker_features.py','XTA/lta_experimental.py','XTA/lta_sam.py',
+    'XTA/lta_tracker_features.py','XTA/lta_experimental.py','XTA/lta_sam.py','XTA/sam_sdk_compat.py',
     'XTA/lta_worker_adapter.py','XTA/lta_workers.py','XTA/lta_rendering.py',
     'XTA/sam_resources.py','tools/qualify_release.py','tools/qualify_sam_family_dispatch.py')
 TRIALS=(('A1','flat'),('B1','fifo'),('B2','fifo'),('A2','flat'))

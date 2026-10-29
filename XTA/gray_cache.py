@@ -221,7 +221,7 @@ def _resolve_gray_encoder(codec):
     if codec == 'auto':
         try:
             import deflate
-            from .outputs import _known_nrrd_libdeflate_version
+            from .nrrd_compression import _known_nrrd_libdeflate_version
             version = _known_nrrd_libdeflate_version(deflate)
             match = re.fullmatch(r'(\d+)\.(\d+)(?:\.\d+)?(?:\+[A-Za-z0-9_.+-]+)?',version or '')
             if match is None or (int(match.group(1)),int(match.group(2))) < (0,9):
