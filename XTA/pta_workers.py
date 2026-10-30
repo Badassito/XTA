@@ -308,6 +308,10 @@ def _render_worker_initializer(
         from .pta_cuda_masks import retire_gpu_categorical_volume
 
         retire_gpu_categorical_volume(_WORKER_GPU_RUNTIME)
+    if _WORKER_GPU_RUNTIME is not None:
+        from .spherical_host_cache import close_spherical_host_cache
+
+        close_spherical_host_cache(_WORKER_GPU_RUNTIME.get("azimuthal_renderer"))
     _WORKER_GPU_DEVICE_ID = None
     _WORKER_GPU_RUNTIME = None
     _WORKER_GPU_CODEC_WARNING_EMITTED = False
@@ -900,6 +904,25 @@ def _gpu_runtime_for_worker() -> Dict[str, object]:
         "tilted_renderer_fallback_announced": False,
         "cuda_projection_disabled_families": set(),
     }
+    from .spherical_host_cache import (
+        close_spherical_host_cache_reference, install_spherical_host_cache,
+    )
+    host_cache = install_spherical_host_cache(
+        azimuthal_renderer,
+        owner_count=max(1, len(_WORKER_STATIC.get("gpu_device_ids", ()))),
+    )
+    if host_cache is not None:
+        import weakref
+        from multiprocessing.util import Finalize
+
+        _WORKER_GPU_RUNTIME["spherical_host_cache"] = host_cache
+        runtime_telemetry().register_sample_provider('pta.cuda.spherical_host_cache', host_cache.snapshot)
+        # Host-only owners retire after publication (15) and categorical CUDA
+        # ownership (14), without keeping an otherwise unused engine alive.
+        _WORKER_GPU_RUNTIME["spherical_host_cache_finalizer"] = Finalize(
+            None, close_spherical_host_cache_reference,
+            args=(weakref.ref(host_cache),), exitpriority=13,
+        )
     return _WORKER_GPU_RUNTIME
 
 
@@ -966,6 +989,9 @@ def _prepare_gpu_volume_task(
                 retire_gpu_categorical_volume(runtime)
                 if renderer is not None:
                     renderer.retire_volume_array()
+                from .spherical_host_cache import reset_spherical_host_cache
+
+                reset_spherical_host_cache(renderer)
     except BaseException as exc:
         runtime["gpu_volume_handoff_error"] = f"{type(exc).__name__}: {exc}"
         # Pool transports Exceptions; a BaseException could strand the task.
@@ -2406,6 +2432,11 @@ def _publish_gpu_policy_batch(
         mask_indices = [
             index for index, candidate in enumerate(candidates)
             if (save_labels or save_binary or save_semantic) and bool(candidate.label_enabled)
+            # Known-empty sources already produce empty polygon labels. Keep
+            # the output occupancy reduction above to reject synthesized masks,
+            # and retain full planes for binary/semantic/coverage contracts.
+            and (save_binary or save_semantic or semantic_coverage_masks is not None
+                 or bool(source_mask_nonempty[index]))
         ]
         host_label_masks: Dict[int, np.ndarray] = {}
         host_semantic_masks: Dict[int, np.ndarray] = {}
@@ -2456,6 +2487,8 @@ def _publish_gpu_policy_batch(
             }
     def labels_for(index):
         candidate = candidates[index]
+        if not bool(source_mask_nonempty[index]):
+            return []
         mask_for_label = host_label_masks[index]
         if index in host_coverage_masks:
             mask_for_label = np.where(host_coverage_masks[index] > 0, mask_for_label, 0)

@@ -149,10 +149,11 @@ def test_real_parent_planner_uses_gpu_pool_only_when_idle(gpu_active, pending_a,
         body=[ast.Assign(targets=[ast.Name(id='order_counter',ctx=ast.Store())],value=ast.Constant(0)),
               node, ast.Return(value=ast.Name(id=node.name,ctx=ast.Load()))], decorator_list=[])
     module = ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),wrapper],type_ignores=[])
-    prep = SimpleNamespace(label_enabled=True, src=SimpleNamespace(volume_class='fully_labeled'), plans=[])
+    prep = SimpleNamespace(label_enabled=True, src=SimpleNamespace(
+        volume_class='fully_labeled', mask_volume=np.ones((1,1,1),np.uint8)), plans=[])
     classify = mock.Mock(side_effect=StopAtClassification)
     pool = object()
-    namespace = dict(pending_loads={3:(SimpleNamespace(result=lambda:object()),object())},
+    namespace = dict(pending_loads={3:(SimpleNamespace(result=lambda:prep.src),object())},
         runtime_telemetry=lambda:SimpleNamespace(span=lambda *a:nullcontext()),
         _submit_load=lambda *a:None, pending_specs={3:object()}, prepare_loaded_source=lambda *a,**kw:prep,
         args=SimpleNamespace(force=False,enable_3d_void_fill=True,augmentation_execution='offline',
@@ -165,6 +166,7 @@ def test_real_parent_planner_uses_gpu_pool_only_when_idle(gpu_active, pending_a,
     exec(compile(ast.fix_missing_locations(module),'<actual PTA classification dispatch>','exec'),namespace)
     with pytest.raises(StopAtClassification):
         namespace['build']()(3, 4)
+    assert prep.src.mask_volume is None
     assert classify.call_args.kwargs['gpu_pool'] is (pool if expected_pool else None)
     assert classify.call_args.kwargs['generation'] == 3
 

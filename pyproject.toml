@@ -45,7 +45,7 @@ version = {attr = "XTA.__version__"}
 "share/xta" = [
   "README.md",
   "ARCHITECTURE.md",
-  "GPT-6-Astra-Ultra_v25.0.1_SLURM.py",
+  "GPT-6-Astra-Ultra_v25.0.2_SLURM.py",
 ]
 "share/xta/docs" = ["docs/*.md"]
 "share/xta/tools/slicer" = ["tools/slicer/*.py"]

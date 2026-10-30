@@ -22,6 +22,30 @@ python -m XTA --mode pta --input INPUT_DIRECTORY --output OUTPUT_DIRECTORY --aug
 python -m XTA --mode tta --input INPUT_VIDEO --model gpu:MODEL.engine --augmentation gpu:XTA/examples/external_augmentations/GPU_baseline.py --augmentation_ratio 4
 ```
 
+## Sweep profiles
+
+`CPU_sweep.py` and `GPU_sweep.py` choose a strength independently for each
+augmented output: **40% light, 30% baseline, 20% heavy, and 10% superheavy**.
+These are sampling probabilities, so aggregate proportions are approximate;
+unaugmented originals are excluded from the mixture.
+
+Both files are self-contained and embed all four preset settings. An independent
+seed stream selects the same strength on CPU and GPU without changing that
+preset's transform draws. Selection is invariant to batch order and splitting.
+CPU/GPU pixel differences remain as described below. GPU original markers stay
+unaugmented.
+
+```text
+--augmentation gpu:XTA/examples/external_augmentations/GPU_sweep.py
+--augmentation cpu:XTA/examples/external_augmentations/CPU_sweep.py
+```
+
+A single offline PTA invocation can use a sweep policy to reuse each rendered
+base across mixed-strength copies. For example, ratio 28 plans the original plus
+27 augmented copies per retained base candidate, subject to background filtering
+and foreground-loss drops. This is one combined background budget rather than
+separate budgets for each strength.
+
 ## Profile settings
 
 | Parameter | Light | Baseline | Heavy | Superheavy |

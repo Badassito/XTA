@@ -1970,26 +1970,86 @@ _GPU_UNION_RETIREMENT_MANAGER_LOCK = threading.Lock()
 
 _GPU_UNION_RETIREMENT_FALLBACK_EXECUTOR: Optional[ThreadPoolExecutor] = None
 
-def _init_gpu_union_retirement_manager(device_str: str, max_plane_side: int) -> Optional[_GpuUnionRetirementManager]:
+_GPU_UNION_RETIREMENT_WORKER_CONFIG: Optional[Tuple[str, int]] = None
+_GPU_UNION_RETIREMENT_WORKER_ATTEMPTED = False
+_GPU_UNION_RETIREMENT_WORKER_RELEASED = False
+
+def _init_gpu_union_retirement_manager_locked(device_str: str, max_plane_side: int) -> _GpuUnionRetirementManager:
+    """Construct under the existing manager lock; caller owns that lock."""
     global _GPU_UNION_RETIREMENT_MANAGER
+    if _GPU_UNION_RETIREMENT_MANAGER is not None:
+        return _GPU_UNION_RETIREMENT_MANAGER
+    import torch  # type: ignore
+    device = torch.device(str(device_str))
+    manager = _GpuUnionRetirementManager(
+        torch, device, max(1, int(max_plane_side)) * max(1, int(max_plane_side)),
+    )
+    _GPU_UNION_RETIREMENT_MANAGER = manager
+    print(
+        f'Event-driven GPU union retirement initialized: '
+        f'{manager.capacity} persistent lane(s), '
+        f'{gpu_union_retirement_chunk_slices()} slice(s)/D2H chunk, '
+        f'{gpu_union_retirement_event_capacity()} producer event(s)/lane.'
+    )
+    return manager
+
+def _init_gpu_union_retirement_manager(device_str: str, max_plane_side: int) -> Optional[_GpuUnionRetirementManager]:
     if not gpu_union_flush_overlap_enabled():
         return None
     with _GPU_UNION_RETIREMENT_MANAGER_LOCK:
+        return _init_gpu_union_retirement_manager_locked(device_str, max_plane_side)
+
+def _arm_worker_gpu_union_retirement_manager(device_str: str, max_plane_side: int) -> None:
+    """Record one worker lifetime's capacity without importing torch or allocating."""
+    global _GPU_UNION_RETIREMENT_WORKER_CONFIG, _GPU_UNION_RETIREMENT_WORKER_ATTEMPTED
+    global _GPU_UNION_RETIREMENT_WORKER_RELEASED
+    config = (str(device_str), max(1, int(max_plane_side)))
+    with _GPU_UNION_RETIREMENT_MANAGER_LOCK:
+        manager = _GPU_UNION_RETIREMENT_MANAGER
+        if manager is not None and (
+            manager.closed or str(manager.device) != config[0] or not manager.lanes
+            or any(lane.max_plane_pixels != config[1] ** 2 for lane in manager.lanes)
+        ):
+            raise RuntimeError('Cannot arm GPU union retirement with a different live manager contract')
+        _GPU_UNION_RETIREMENT_WORKER_CONFIG = config
+        _GPU_UNION_RETIREMENT_WORKER_ATTEMPTED = False
+        _GPU_UNION_RETIREMENT_WORKER_RELEASED = False
+
+def _seal_worker_gpu_union_retirement_manager() -> None:
+    """Forbid lazy creation once destructive asset release starts; retain live owners."""
+    global _GPU_UNION_RETIREMENT_WORKER_CONFIG, _GPU_UNION_RETIREMENT_WORKER_RELEASED
+    with _GPU_UNION_RETIREMENT_MANAGER_LOCK:
+        _GPU_UNION_RETIREMENT_WORKER_CONFIG = None
+        _GPU_UNION_RETIREMENT_WORKER_RELEASED = True
+
+def _ensure_worker_gpu_union_retirement_manager() -> Optional[_GpuUnionRetirementManager]:
+    """Allocate only at an armed worker's first ordinary union retirement."""
+    global _GPU_UNION_RETIREMENT_WORKER_ATTEMPTED
+    with _GPU_UNION_RETIREMENT_MANAGER_LOCK:
         if _GPU_UNION_RETIREMENT_MANAGER is not None:
             return _GPU_UNION_RETIREMENT_MANAGER
-        import torch  # type: ignore
-        device = torch.device(str(device_str))
-        manager = _GpuUnionRetirementManager(
-            torch, device, max(1, int(max_plane_side)) * max(1, int(max_plane_side)),
-        )
-        _GPU_UNION_RETIREMENT_MANAGER = manager
-        print(
-            f'Event-driven GPU union retirement initialized: '
-            f'{manager.capacity} persistent lane(s), '
-            f'{gpu_union_retirement_chunk_slices()} slice(s)/D2H chunk, '
-            f'{gpu_union_retirement_event_capacity()} producer event(s)/lane.'
-        )
-        return manager
+        if (_GPU_UNION_RETIREMENT_WORKER_CONFIG is None
+                or _GPU_UNION_RETIREMENT_WORKER_RELEASED
+                or _GPU_UNION_RETIREMENT_WORKER_ATTEMPTED):
+            return None
+        _GPU_UNION_RETIREMENT_WORKER_ATTEMPTED = True
+        if not gpu_union_flush_overlap_enabled():
+            return None
+        try:
+            return _init_gpu_union_retirement_manager_locked(*_GPU_UNION_RETIREMENT_WORKER_CONFIG)
+        except Exception as exc:
+            # The explicit initializer publishes its manager before logging.
+            # A diagnostic failure must not strand that successfully owned manager.
+            if _GPU_UNION_RETIREMENT_MANAGER is not None:
+                return _GPU_UNION_RETIREMENT_MANAGER
+            try:
+                print(
+                    f'Warning: persistent GPU retirement lanes unavailable ({exc}); '
+                    'using the event-compatible fallback retirement executor.'
+                )
+            except Exception:
+                pass
+            return None
 
 def _gpu_union_retirement_manager() -> Optional[_GpuUnionRetirementManager]:
     return _GPU_UNION_RETIREMENT_MANAGER
@@ -2005,11 +2065,16 @@ def _gpu_union_retirement_fallback_executor() -> ThreadPoolExecutor:
 
 def _shutdown_gpu_union_retirement_manager() -> None:
     global _GPU_UNION_RETIREMENT_MANAGER, _GPU_UNION_RETIREMENT_FALLBACK_EXECUTOR
+    global _GPU_UNION_RETIREMENT_WORKER_CONFIG, _GPU_UNION_RETIREMENT_WORKER_ATTEMPTED
+    global _GPU_UNION_RETIREMENT_WORKER_RELEASED
     with _GPU_UNION_RETIREMENT_MANAGER_LOCK:
         manager = _GPU_UNION_RETIREMENT_MANAGER
         fallback = _GPU_UNION_RETIREMENT_FALLBACK_EXECUTOR
         _GPU_UNION_RETIREMENT_MANAGER = None
         _GPU_UNION_RETIREMENT_FALLBACK_EXECUTOR = None
+        _GPU_UNION_RETIREMENT_WORKER_CONFIG = None
+        _GPU_UNION_RETIREMENT_WORKER_ATTEMPTED = False
+        _GPU_UNION_RETIREMENT_WORKER_RELEASED = True
     if manager is not None:
         manager.close()
     if fallback is not None:
@@ -4609,7 +4674,7 @@ def predict_source_and_accumulate(
         device_union_flush_future: Optional[Future] = None
         slice_meta: Optional[Dict[str, np.ndarray]] = None
         if device_union is not None:
-            retirement_manager = _gpu_union_retirement_manager()
+            retirement_manager = _ensure_worker_gpu_union_retirement_manager()
             retirement_lane: Optional[_GpuUnionRetirementLane] = (
                 retirement_manager.acquire() if retirement_manager is not None else None
             )

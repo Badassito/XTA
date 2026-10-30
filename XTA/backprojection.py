@@ -4265,30 +4265,69 @@ def _backproject_cartesian_azimuthal_generic(
     # volume, transposed copy, or second source-space scan is created.
     t_dim, out_h, out_w = (int(v) for v in target_shape)
     t_block = max(1, _env_int('YOLO_TTA_PROJECTION_CALLBACK_BLOCK', 64))
+    # A singleton processing row can be gathered directly from each map band.
+    # Keep contraction's whole-cross OR: repeated indirect row gathers can cost
+    # more than its contiguous reduction. Numeric compatibility and single-band
+    # calls retain their established path as well.
+    source = np.asarray(azimuthal_mask_mm)
+    single_rows = None
+    if source.dtype == np.uint8 and t_dim > t_block:
+        selected = np.empty(int(stack_len), dtype=np.int32)
+        for stack_idx in range(int(stack_len)):
+            rows = _rows(stack_idx)
+            if len(rows) != 1:
+                break
+            selected[stack_idx] = rows[0]
+        else:
+            single_rows = selected
+    if single_rows is not None:
+        occupied_rows = np.any(source, axis=(0, 2))
+        nonempty_stack = occupied_rows[single_rows]
+        any_stack_nonempty = bool(np.any(nonempty_stack))
     for t0 in range(0, t_dim, t_block):
         t1 = min(t_dim, t0 + t_block)
         block_out = np.zeros((t1 - t0, out_h, out_w), dtype=np.uint8)
 
-        def _fill_stack(stack_idx: int) -> None:
-            plane_band = _azimuthal_backproject_plane(
-                azimuthal_mask_mm,
-                dense_map,
-                _rows(int(stack_idx)),
-                plane_row_slice=slice(int(t0), int(t1)),
-            )
-            if base == 'sagittal':
-                block_out[:, int(stack_idx), :] = plane_band
-            else:
-                block_out[:, :, int(stack_idx)] = plane_band
+        if single_rows is not None:
+            valid_band = dense_map.valid_mask[t0:t1]
+            positions = np.flatnonzero(valid_band.reshape(-1))
+            if any_stack_nonempty and positions.size:
+                source_indices = dense_map.source_idx_map[t0:t1].reshape(-1)[positions]
+                u_indices = dense_map.u_idx_map[t0:t1].reshape(-1)[positions]
 
-        parallel_for_indices_chunked(
-            int(stack_len),
-            _fill_stack,
-            max_workers=worker_count,
-            desc=f'{desc} [t={t0}:{t1}]',
-            show_progress=False,
-            target_chunks_per_worker=4,
-        )
+                def _fill_single_row(stack_idx: int) -> None:
+                    if not nonempty_stack[stack_idx]:
+                        return
+                    plane = np.zeros(valid_band.size, dtype=np.uint8)
+                    plane[positions] = source[source_indices, int(single_rows[stack_idx]), u_indices]
+                    if base == 'sagittal':
+                        block_out[:, int(stack_idx), :] = plane.reshape(valid_band.shape)
+                    else:
+                        block_out[:, :, int(stack_idx)] = plane.reshape(valid_band.shape)
+
+                parallel_for_indices_chunked(
+                    int(stack_len), _fill_single_row, max_workers=worker_count,
+                    desc=f'{desc} [t={t0}:{t1}]', show_progress=False,
+                    target_chunks_per_worker=4,
+                )
+        else:
+            def _fill_stack(stack_idx: int) -> None:
+                plane_band = _azimuthal_backproject_plane(
+                    azimuthal_mask_mm,
+                    dense_map,
+                    _rows(int(stack_idx)),
+                    plane_row_slice=slice(int(t0), int(t1)),
+                )
+                if base == 'sagittal':
+                    block_out[:, int(stack_idx), :] = plane_band
+                else:
+                    block_out[:, :, int(stack_idx)] = plane_band
+
+            parallel_for_indices_chunked(
+                int(stack_len), _fill_stack, max_workers=worker_count,
+                desc=f'{desc} [t={t0}:{t1}]', show_progress=False,
+                target_chunks_per_worker=4,
+            )
         _emit_projection_block_callback(
             projection_block_callback,
             int(t0),

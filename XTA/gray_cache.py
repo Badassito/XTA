@@ -570,11 +570,11 @@ class GrayCacheReader:
             for y in range(y0//TILE*TILE,y1,TILE):
                 for x in range(x0//TILE*TILE,x1,TILE):
                     key = packet,y,x
-                    row = self._connection.execute('SELECT h,w,raw_size,codec,sha,length(data) FROM chunks WHERE packet=? AND y=? AND x=?',key).fetchone()
-                    if row is None or not 0 < row[2] <= MAX_CHUNK_BYTES or not 0 < row[5] <= row[2]:
-                        raise GrayCacheError('Missing or oversized gray chunk')
                     values = self._cache.pop(key,None)
                     if values is None:
+                        row = self._connection.execute('SELECT h,w,raw_size,codec,sha,length(data) FROM chunks WHERE packet=? AND y=? AND x=?',key).fetchone()
+                        if row is None or not 0 < row[2] <= MAX_CHUNK_BYTES or not 0 < row[5] <= row[2]:
+                            raise GrayCacheError('Missing or oversized gray chunk')
                         payload = self._connection.execute('SELECT data FROM chunks WHERE packet=? AND y=? AND x=?',key).fetchone()[0]
                         decode_started = time.perf_counter()
                         raw = _decode(payload,row[3],row[2],row[4])
@@ -593,7 +593,8 @@ class GrayCacheReader:
                         self._cache[key] = values
                     if not 0 <= plane < values.shape[0]:
                         raise GrayCacheError('Gray frame offset exceeds its chunk')
-                    top,left,bottom,right = max(y,y0),max(x,x0),min(y+row[0],y1),min(x+row[1],x1)
+                    # Cached shape was authenticated on insertion; both sealed checks still apply.
+                    top,left,bottom,right = max(y,y0),max(x,x0),min(y+values.shape[1],y1),min(x+values.shape[2],x1)
                     output[top-y0:bottom-y0,left-x0:right-x0] = values[plane,top-y:bottom-y,left-x:right-x]
                     values = raw = payload = None
             self._check()

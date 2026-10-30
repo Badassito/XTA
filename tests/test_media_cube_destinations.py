@@ -46,3 +46,24 @@ def test_identity_source_can_be_its_own_destination(tmp_path):
     source=np.ones((3,4,5),np.uint8)
     assert media.resize_volume_to_processing_cube_gray8(source,source.shape,tmp_path/'unused',destination=source) is source
     assert media.resize_categorical_volume_to_processing_cube_uint8(source,source.shape,tmp_path/'unused',destination=source) is source
+
+
+@pytest.mark.parametrize('out_t', [1, 7, 11])
+@pytest.mark.parametrize('workers', [1, 4])
+@pytest.mark.parametrize('strided', [False, True])
+def test_categorical_depth_only_matches_endpoint_reference_and_preserves_source(
+        tmp_path, out_t, workers, strided):
+    source = np.random.default_rng(872).choice(
+        np.array([0, 1, 7, 255], np.uint8), size=(4, 5, 12))
+    if strided:
+        source = source[:, :, ::2]
+    before = source.copy()
+    shape = (out_t, *source.shape[1:])
+    destination = np.full(shape, 99, np.uint8)
+    indices = [0] if out_t == 1 else [round(i * 3 / (out_t - 1)) for i in range(out_t)]
+    expected = (source[indices] != 0).astype(np.uint8)
+    result = media.resize_categorical_volume_to_processing_cube_uint8(
+        source, shape, tmp_path / 'unused', workers=workers, destination=destination)
+    assert result is destination
+    np.testing.assert_array_equal(result, expected)
+    np.testing.assert_array_equal(source, before)

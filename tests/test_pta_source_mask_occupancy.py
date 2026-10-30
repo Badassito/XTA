@@ -1,6 +1,7 @@
 """YOLO polygon eligibility must never masquerade as proof of a zero source mask."""
 from types import SimpleNamespace
 from unittest import mock
+from dataclasses import replace
 import os
 
 import numpy as np
@@ -69,6 +70,123 @@ def test_foreground_copy_that_becomes_empty_still_drops(tmp_path):
 def test_true_background_copy_is_kept(tmp_path):
     assert publish(tmp_path,np.zeros((8,8),np.uint8),
         candidate(augmentation_index=1),source_nonempty=False)==(1,{})
+
+
+def test_known_empty_label_only_keeps_output_check_without_mask_download(tmp_path):
+    transfers = []
+    original_to = FakeTensor.to
+
+    def record_to(tensor, device):
+        transfers.append(tuple(tensor.shape))
+        return original_to(tensor, device)
+
+    with mock.patch.object(FakeTensor, 'to', record_to):
+        assert publish(tmp_path, np.zeros((8, 8), np.uint8),
+            candidate(augmentation_index=1), source_nonempty=False) == (1, {})
+    assert transfers == [(1,)]  # Output occupancy still crosses; full mask does not.
+    assert next((tmp_path / 'labels').glob('*.txt')).read_text() == ''
+
+
+def test_known_empty_binary_still_downloads_and_preserves_exact_mask(tmp_path):
+    transfers = []
+    original_to = FakeTensor.to
+
+    def record_to(tensor, device):
+        transfers.append(tuple(tensor.shape))
+        return original_to(tensor, device)
+
+    with mock.patch.object(FakeTensor, 'to', record_to):
+        assert publish(tmp_path, np.zeros((8, 8), np.uint8), candidate(),
+            source_nonempty=False, save_binary=True) == (1, {})
+    assert transfers == [(1,), (1, 8, 8)]
+    from XTA.pta_binary import candidate_binary_output_path
+    from XTA import pta
+    output = candidate_binary_output_path(tmp_path, candidate(), split_active=False)
+    np.testing.assert_array_equal(pta.cv2.imread(str(output), pta.cv2.IMREAD_UNCHANGED),
+        np.zeros((8, 8), np.uint8))
+
+
+@pytest.mark.parametrize('save_semantic,with_coverage', [(True, False), (False, True), (True, True)])
+def test_known_empty_semantic_or_coverage_still_downloads_masks(tmp_path, save_semantic, with_coverage):
+    torch = FakeTorch()
+
+    class MaskTensor(FakeTensor):
+        def __gt__(self, value):
+            return MaskTensor(self.torch, self.array > value)
+
+        def __mul__(self, other):
+            return MaskTensor(self.torch, self.array * other.array)
+
+    coverage = np.ones((1, 8, 8), np.uint8)
+    coverage[:, 4:] = 0
+    transfers = []
+    original_to = FakeTensor.to
+
+    def record_to(tensor, device):
+        transfers.append(tuple(tensor.shape))
+        return original_to(tensor, device)
+
+    with mock.patch.dict(workers._WORKER_STATIC, dict(
+        out_dir=tmp_path, split_active=False, image_format='png', save_images=False,
+        save_labels=True, save_binary=False, save_semantic=save_semantic,
+    ), clear=True), mock.patch.object(FakeTensor, 'to', record_to):
+        assert workers._publish_gpu_policy_batch(
+            runtime={'torch': torch, 'device_id': 0},
+            batch_images=FakeTensor(torch, np.zeros((1, 1, 8, 8), np.uint8)),
+            batch_masks=MaskTensor(torch, np.zeros((1, 8, 8), np.uint8)),
+            semantic_coverage_masks=MaskTensor(torch, coverage) if with_coverage else None,
+            candidates=[candidate()], output_size=(8, 8), channel_kind='gray',
+            local_warnings=workers.WarningLog(), source_mask_nonempty=(False,),
+        ) == (1, {})
+    assert transfers.count((1, 8, 8)) == (2 if save_semantic and with_coverage else 1)
+    assert next((tmp_path / 'labels').glob('*.txt')).read_text() == ''
+    if save_semantic:
+        from XTA.pta_publication import candidate_semantic_output_path
+        from XTA import pta
+        expected = np.zeros((8, 8), np.uint8)
+        if with_coverage:
+            expected[4:] = 255
+        path = candidate_semantic_output_path(tmp_path, candidate(), split_active=False)
+        np.testing.assert_array_equal(pta.cv2.imread(str(path), pta.cv2.IMREAD_UNCHANGED), expected)
+
+
+def test_mixed_labels_download_only_nonempty_source_planes(tmp_path):
+    torch = FakeTorch()
+    masks = np.zeros((4, 8, 8), np.uint8)
+    masks[1, 1:7, 1:7] = 1
+    masks[2, 3, 3] = 1  # Nonzero source remains eligible despite no exportable polygon.
+    candidates = [replace(candidate(), frame_idx=index, order=index) for index in range(4)]
+    candidates[1].foreground = True
+    candidates[3].label_enabled = False
+    candidates[3].foreground = True
+    downloads = []
+    original_to = FakeTensor.to
+
+    def record_to(tensor, device):
+        if tensor.ndim == 3:
+            downloads.append(tensor.array.copy())
+        return original_to(tensor, device)
+
+    with mock.patch.dict(workers._WORKER_STATIC, dict(
+        out_dir=tmp_path, split_active=False, image_format='png', save_images=False,
+        save_labels=True, save_binary=False, save_semantic=False,
+    ), clear=True), mock.patch.object(FakeTensor, 'to', record_to):
+        assert workers._publish_gpu_policy_batch(
+            runtime={'torch': torch, 'device_id': 0},
+            batch_images=FakeTensor(torch, np.zeros((4, 1, 8, 8), np.uint8)),
+            batch_masks=FakeTensor(torch, masks), candidates=candidates,
+            output_size=(8, 8), channel_kind='gray', local_warnings=workers.WarningLog(),
+            source_mask_nonempty=(False, True, True, False),
+        ) == (4, {})
+    assert len(downloads) == 1
+    np.testing.assert_array_equal(downloads[0], masks[[1, 2]])
+    from XTA.pta_publication import candidate_output_paths
+    label_paths = [candidate_output_paths(tmp_path, cand, split_active=False,
+        image_format='png')[1] for cand in candidates]
+    assert label_paths[0].read_text() == ''
+    assert label_paths[1].read_text().strip()
+    assert label_paths[2].read_text() == ''
+    assert label_paths[3] is None
 
 
 def test_source_occupancy_snapshot_precedes_mutation_and_respects_semantic_unknowns():

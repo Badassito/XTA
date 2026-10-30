@@ -148,7 +148,7 @@ def _build_host_direction_block(key, row0, row1):
     return np.ascontiguousarray(directions), np.ascontiguousarray(valid)
 
 
-def _upload_direction_arrays(engine, host_directions, host_valid):
+def _upload_direction_arrays(engine, host_directions, host_valid, *, owned_host_copy=False):
     stats = _direction_cache_stats(engine)
     started = time.perf_counter()
     on_cuda = str(engine.device).startswith('cuda')
@@ -158,7 +158,8 @@ def _upload_direction_arrays(engine, host_directions, host_valid):
         for host, dtype in ((host_directions, ray_dtype), (host_valid, engine.torch.bool)):
             # Blocking transfers complete before the temporary host owners leave
             # scope. The caller's active render stream remains authoritative.
-            results.append(engine.torch.as_tensor(host, dtype=dtype, device=engine.device))
+            upload = engine.torch.tensor if owned_host_copy else engine.torch.as_tensor
+            results.append(upload(host, dtype=dtype, device=engine.device))
             stats['upload_calls'] += 1
             if on_cuda:
                 stats['h2d_copies'] += 1
@@ -178,20 +179,42 @@ def _build_direction_block(engine, key, row0, row1, dtype=np.float64):
     return _upload_direction_arrays(engine, host_directions, host_valid)
 
 
-def _build_cached_directions(engine, key, dtype=np.float64):
-    """Build at most one cache-budget host entry, then transfer its two arrays."""
-    rows, columns = key[3:5]
-    started = time.perf_counter()
-    host_directions = np.empty((rows, columns, 3), dtype=dtype)
-    host_valid = np.empty((rows, columns), dtype=np.bool_)
-    stats = _direction_cache_stats(engine)
+def _fill_host_direction_arrays(key, host_directions, host_valid, stats=None):
+    """Fill the existing exact QSC plan in bounded, unchanged FP64 strips."""
+    rows = key[3]
     for row0 in range(0, rows, _ROW_BLOCK):
         row1 = min(rows, row0 + _ROW_BLOCK)
         block_directions, block_valid = _build_host_direction_block(key, row0, row1)
         host_directions[row0:row1] = block_directions
         host_valid[row0:row1] = block_valid
-        stats['host_build_blocks'] += 1
+        if stats is not None:
+            stats['host_build_blocks'] += 1
         del block_directions, block_valid
+
+
+def _build_cached_directions(engine, key, dtype=np.float64):
+    """Reuse exact host geometry while keeping the device cache budget intact."""
+    from .spherical_host_cache import borrow_spherical_host_directions
+    stats = _direction_cache_stats(engine)
+
+    def fill(directions, valid):
+        started = time.perf_counter()
+        try:
+            _fill_host_direction_arrays(key, directions, valid, stats)
+        finally:
+            stats['host_build_seconds'] += time.perf_counter() - started
+
+    with borrow_spherical_host_directions(engine, key, dtype, fill) as arrays:
+        if arrays is not None:
+            # tensor() performs the blocking CUDA copy without a CPU alias to
+            # the read-only memo. The lease remains live through both uploads.
+            return _upload_direction_arrays(engine, *arrays, owned_host_copy=True)
+
+    rows, columns = key[3:5]
+    started = time.perf_counter()
+    host_directions = np.empty((rows, columns, 3), dtype=dtype)
+    host_valid = np.empty((rows, columns), dtype=np.bool_)
+    _fill_host_direction_arrays(key, host_directions, host_valid, stats)
     stats['host_build_seconds'] += time.perf_counter() - started
     return _upload_direction_arrays(engine, host_directions, host_valid)
 

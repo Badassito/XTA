@@ -4748,6 +4748,9 @@ def main(
                     if spec_index == 0 or effective_pipeline_depth == 1 else ()),
             )
             states[spec_index]["prep"] = prep
+            # The prepared mask now owns rendering/fallback storage. Drop the
+            # obsolete NRRD input reference; an aliased render mask stays alive.
+            current_src.mask_volume = None
 
             cands = (enumerate_candidates_for_volume(prep, fraction=fraction)
                      if dataset_publication_selected else [])

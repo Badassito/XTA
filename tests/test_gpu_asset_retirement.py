@@ -120,6 +120,12 @@ class GpuAssetRetirementTests(unittest.TestCase):
         self.stack.enter_context(mock.patch.dict(cuda_d1._D1_WORKER_VIEW_STATES, {}, clear=True))
         self.stack.enter_context(mock.patch.dict(backprojection._RESIDENT_TRT_PIPELINE_CACHE, {}, clear=True))
         self.stack.enter_context(mock.patch.dict(inference._AFFINE_GRID_CACHE, {}, clear=True))
+        for name, value in (
+            ('_GPU_UNION_RETIREMENT_WORKER_CONFIG', None),
+            ('_GPU_UNION_RETIREMENT_WORKER_ATTEMPTED', False),
+            ('_GPU_UNION_RETIREMENT_WORKER_RELEASED', False),
+        ):
+            self.stack.enter_context(mock.patch.object(inference, name, value))
 
     def test_owned_trim_keeps_pre_allocator_collection_and_generic_trim_keeps_both(self):
         for repeat in (False, True):
@@ -295,12 +301,29 @@ class GpuAssetRetirementTests(unittest.TestCase):
 
     def test_preflight_stream_failure_preserves_inference_owners(self):
         assets, engine, model, references, events, cuda = self._worker_context(fail_fence=True)
+        inference._arm_worker_gpu_union_retirement_manager('cuda:0', 16)
         with self.assertRaisesRegex(RuntimeError, 'fence failed'):
             workers._release_gpu_worker_inference_assets(assets, inference_drained=True, wait_for_publications=lambda: None)
         self.assertIs(assets.model, model)
         self.assertFalse(assets.release_started)
         self.assertTrue(assets.release_stats['assets_intact'])
         self.assertTrue(all(reference() is not None for reference in references))
+        self.assertEqual(inference._GPU_UNION_RETIREMENT_WORKER_CONFIG, ('cuda:0', 16))
+        self.assertFalse(inference._GPU_UNION_RETIREMENT_WORKER_RELEASED)
+
+    def test_destructive_release_failure_seals_unused_lazy_lanes(self):
+        assets, _engine, _model, _references, _events, _cuda = self._worker_context()
+        inference._arm_worker_gpu_union_retirement_manager('cuda:0', 16)
+        with mock.patch.object(workers, '_release_resident_trt_pipeline_cache',
+                               side_effect=RuntimeError('ring teardown failed')):
+            with self.assertRaisesRegex(RuntimeError, 'ring teardown failed'):
+                workers._release_gpu_worker_inference_assets(
+                    assets, inference_drained=True, wait_for_publications=lambda: None)
+        self.assertTrue(assets.release_started)
+        self.assertIsNone(inference._GPU_UNION_RETIREMENT_WORKER_CONFIG)
+        with mock.patch.object(inference, '_init_gpu_union_retirement_manager_locked') as create:
+            self.assertIsNone(inference._ensure_worker_gpu_union_retirement_manager())
+            create.assert_not_called()
 
     def test_no_gpu_queries_when_context_was_not_initialized(self):
         assets, engine, model, references, events, cuda = self._worker_context(initialized=False)
@@ -325,7 +348,7 @@ class GpuAssetRetirementTests(unittest.TestCase):
             'set_retina_mask_processor': None, 'set_gpu_worker_fused_preflight_specs': None,
             'set_angle_variant_gpu_fastpath': None, 'ensure_yolo_ready_for_predict': None,
             'validate_yolo_model_input_channels': None, 'require_channel_aware_yolo_preprocess_patch': None,
-            '_init_gpu_union_retirement_manager': None,
+            '_arm_worker_gpu_union_retirement_manager': None,
             '_init_worker_gpu_render_engine': engine, 'load_ultralytics_model': model,
             'cpu_retina_masks_enabled': True, 'd1_owner_pipeline_enabled': False,
         }
@@ -363,7 +386,7 @@ class GpuAssetRetirementTests(unittest.TestCase):
             'set_retina_mask_processor': None, 'set_gpu_worker_fused_preflight_specs': None,
             'set_angle_variant_gpu_fastpath': None, 'ensure_yolo_ready_for_predict': None,
             'validate_yolo_model_input_channels': None, 'require_channel_aware_yolo_preprocess_patch': None,
-            'ensure_cpu_retina_mask_predictor_patch': True, '_init_gpu_union_retirement_manager': None,
+            'ensure_cpu_retina_mask_predictor_patch': True, '_arm_worker_gpu_union_retirement_manager': None,
             '_init_worker_gpu_render_engine': engine, 'load_ultralytics_model': model,
             'cpu_retina_masks_enabled': True, 'd1_owner_pipeline_enabled': False,
             '_interpolation_process_entry': {'auxiliary_ok': True},

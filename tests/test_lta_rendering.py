@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gc
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 from unittest import mock
 
@@ -67,6 +69,13 @@ class LtaRenderingTests(unittest.TestCase):
 
     def test_render_failure_keeps_retained_cache_view_readable(self) -> None:
         retained = []
+        mappings = []
+        original_open = LtaPhysicalViewCacheRef.open
+
+        def observe_open(reference, **kwargs):
+            array = original_open(reference, **kwargs)
+            mappings.append(weakref.ref(array._mmap))
+            return array
 
         def retain_then_fail(frame):
             retained.append(frame)
@@ -89,17 +98,101 @@ class LtaRenderingTests(unittest.TestCase):
                 mtime_ns=stat.st_mtime_ns,
             )
 
-            with mock.patch("XTA.lta_rendering.implicit_rgb", new=retain_then_fail):
-                with self.assertRaisesRegex(RuntimeError, "intentional renderer failure"):
+            failure = None
+            with (mock.patch.object(LtaPhysicalViewCacheRef, "open", new=observe_open),
+                  mock.patch("XTA.lta_rendering._detach_gray_rgb_image", new=retain_then_fail)):
+                try:
                     render_native_tile_window(
                         cache, frame_start=0, frame_stop=1, tile_xyxy=(0, 0, 4, 3)
                     )
+                except RuntimeError as error:
+                    failure = error
+            self.assertIsInstance(failure, RuntimeError)
+            self.assertIn("intentional renderer failure", str(failure))
             self.assertEqual(int(retained[0][2, 3]), 11)
+            self.assertIsNotNone(mappings[0]())
             retained.clear()
+            # The exception traceback still owns the converter's input view.
+            gc.collect()
+            self.assertIsNotNone(mappings[0]())
+            failure = None
+            gc.collect()
+            self.assertIsNone(mappings[0]())
+
+    def test_pillow_conversion_failure_keeps_borrowed_gray_image_readable(self) -> None:
+        from PIL import Image
+        from XTA.lta_rendering import reference_existing_physical_view_cache
+
+        retained = []
+        mappings = []
+        original_open = LtaPhysicalViewCacheRef.open
+
+        def observe_open(reference, **kwargs):
+            array = original_open(reference, **kwargs)
+            mappings.append(weakref.ref(array._mmap))
+            return array
+
+        def retain_then_fail(image, mode=None, *args, **kwargs):
+            retained.append(image)
+            raise RuntimeError("intentional Pillow conversion failure")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "cache.gray8.dat"
+            path.write_bytes(bytes(range(12)))
+            cache = reference_existing_physical_view_cache(path, shape=(1, 3, 4),
+                physical_view_id="transverse", source_identity="conversion-failure")
+            failure = None
+            with (mock.patch.object(LtaPhysicalViewCacheRef, "open", new=observe_open),
+                  mock.patch.object(Image.Image, "convert", new=retain_then_fail)):
+                try:
+                    render_native_tile_window(cache, frame_start=0, frame_stop=1,
+                        tile_xyxy=(0, 0, 4, 3))
+                except RuntimeError as error:
+                    failure = error
+            self.assertIsInstance(failure, RuntimeError)
+            self.assertIn("intentional Pillow conversion failure", str(failure))
+            self.assertEqual(retained[0].mode, "L")
+            self.assertEqual(retained[0].getpixel((3, 2)), 11)
+            failure = None
+            gc.collect()
+            self.assertIsNotNone(mappings[0]())
+            self.assertEqual(retained[0].getpixel((3, 2)), 11)
+            retained.clear()
+            gc.collect()
+            self.assertIsNone(mappings[0]())
+
+    def test_native_rgb_images_are_exact_and_detached_from_contiguous_and_strided_crops(self) -> None:
+        from XTA.lta_rendering import reference_existing_physical_view_cache
+
+        gray = np.arange(3 * 5 * 7, dtype=np.uint8).reshape(3, 5, 7)
+        gray[1, 0, 0] = 255
+        gray[2, 2, 3] = 0
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "cache.gray8.dat"
+            path.write_bytes(gray.tobytes())
+            cache = reference_existing_physical_view_cache(path, shape=gray.shape,
+                physical_view_id="transverse", source_identity="detached-pixels")
+            rendered = []
+            for tile in ((0, 0, 7, 5), (2, 1, 6, 4)):
+                frames = render_native_tile_window(cache, frame_start=1, frame_stop=3,
+                    tile_xyxy=tile)
+                self.assertTrue(frames.source_cache_mapping_retired)
+                rendered.append((tile, frames))
+            # Windows can replace/remove the source only after its mapping has
+            # retired. Returned PIL frames must also retain their original bytes.
+            path.write_bytes(bytes(gray.size))
+            path.unlink()
+            for tile, frames in rendered:
+                x0, y0, x1, y1 = tile
+                for index, frame in enumerate(frames, start=1):
+                    self.assertEqual(frame.mode, "RGB")
+                    self.assertEqual(frame.size, (x1 - x0, y1 - y0))
+                    expected = np.repeat(gray[index, y0:y1, x0:x1, None], 3, axis=2)
+                    np.testing.assert_array_equal(np.asarray(frame), expected)
 
     def test_scaled_window_matches_rgb_area_resize_and_expands_only_model_frames(self) -> None:
         from XTA.lta_dynamic_crops import resize_crop_frame
-        from XTA.lta_rendering import reference_existing_physical_view_cache
+        from XTA.lta_rendering import _detach_gray_rgb_image, reference_existing_physical_view_cache
 
         gray = np.random.default_rng(71).integers(0, 256, (3, 20, 22), dtype=np.uint8)
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -115,8 +208,8 @@ class LtaRenderingTests(unittest.TestCase):
                     expanded_shapes = []
                     def observe_rgb(frame):
                         expanded_shapes.append(frame.shape)
-                        return implicit_rgb(frame)
-                    with mock.patch("XTA.lta_rendering.implicit_rgb", side_effect=observe_rgb):
+                        return _detach_gray_rgb_image(frame)
+                    with mock.patch("XTA.lta_rendering._detach_gray_rgb_image", side_effect=observe_rgb):
                         frames = render_native_tile_window(cache, frame_start=1, frame_stop=3,
                             tile_xyxy=tile, model_side=side)
                     self.assertEqual(expanded_shapes, [(side, side)] * 2)
@@ -143,6 +236,37 @@ class LtaRenderingTests(unittest.TestCase):
             reference = resize_crop_frame(implicit_rgb(gray[3:11, 2:12]), side=5)
             np.testing.assert_array_equal(np.asarray(frames[0]), reference)
             self.assertTrue(frames.source_cache_mapping_retired)
+
+    def test_compact_windows_preserve_distinct_record_offsets_and_demand_bounds(self) -> None:
+        from XTA.lta_dynamic_crops import resize_crop_frame
+
+        gray = np.random.default_rng(31).integers(0, 256, (5, 30, 40), dtype=np.uint8)
+        first = gray[1, 3:14, 4:17]
+        second = gray[3, 5:19, 7:23]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "cache.compact.dat"
+            path.write_bytes(first.tobytes() + second.tobytes())
+            cache = LtaPhysicalViewCacheRef(path=path, shape=gray.shape, dtype="uint8",
+                physical_view_id="transverse", identity_sha256="a" * 64,
+                size_bytes=first.size + second.size, mtime_ns=path.stat().st_mtime_ns,
+                frame_crops=((1, 3, 4, 14, 17, 0), (3, 5, 7, 19, 23, first.size)))
+            for index, tile in ((1, (6, 5, 15, 12)), (3, (9, 8, 20, 17))):
+                for side in (None, 5):
+                    with self.subTest(frame=index, tile=tile, side=side):
+                        frames = render_native_tile_window(cache, frame_start=index,
+                            frame_stop=index + 1, tile_xyxy=tile, model_side=side)
+                        x0, y0, x1, y1 = tile
+                        expected = implicit_rgb(gray[index, y0:y1, x0:x1])
+                        if side is not None:
+                            expected = resize_crop_frame(expected, side=side)
+                        np.testing.assert_array_equal(np.asarray(frames[0]), expected)
+                        self.assertTrue(frames.source_cache_mapping_retired)
+            with self.assertRaisesRegex(ValueError, "tracking frame"):
+                render_native_tile_window(cache, frame_start=2, frame_stop=3,
+                    tile_xyxy=(9, 8, 20, 17))
+            with self.assertRaisesRegex(ValueError, "immutable image demand"):
+                render_native_tile_window(cache, frame_start=3, frame_stop=4,
+                    tile_xyxy=(6, 8, 20, 17))
 
     def test_tile_chunk_union_uses_global_frame_and_xy_offsets(self) -> None:
         destination = np.zeros((4, 6, 7), dtype=np.uint8)

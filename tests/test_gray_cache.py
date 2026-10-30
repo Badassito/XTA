@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 import sqlite3
@@ -426,3 +427,86 @@ def test_reader_unsealed_probe_is_nonblocking_under_exclusive_writer(tmp_path,mo
         holder.rollback()
     assert timeouts==[0]
     path.unlink()
+
+
+def test_cached_edge_tiles_use_their_own_geometry_and_return_independent_outputs(tmp_path, monkeypatch):
+    # Four spatial shapes (256x256, 256x3, 1x256, 1x3), and packet depths 8/2.
+    record = spec((10, 257, 259))
+    path = gray_cache_path(tmp_path, record)
+    data = create(path, record, 'raw')
+    metrics = []
+    monkeypatch.setattr(gray_cache, '_metrics', lambda **row: metrics.append(row))
+    with GrayCacheReader(path, record, max_cache_bytes=data.nbytes) as reader:
+        for frame in (0, 8):
+            np.testing.assert_array_equal(reader.read_crop(frame, (0, 0, 257, 259)), data[frame])
+        for frame in (7, 9, 0, 8):
+            metrics.clear()
+            output = reader.read_crop(frame, (254, 253, 257, 259))
+            np.testing.assert_array_equal(output, data[frame, 254:257, 253:259])
+            assert metrics[-1]['cache_hits'] == 4
+            assert metrics[-1]['decode_chunks'] == 0
+            assert metrics[-1]['decoded_bytes'] == 0
+            assert output.flags.writeable
+            output[:] = 0
+            np.testing.assert_array_equal(
+                reader.read_crop(frame, (254, 253, 257, 259)), data[frame, 254:257, 253:259])
+        assert reader._cached_bytes <= data.nbytes
+
+
+@pytest.mark.parametrize('mutation_timing', ['before', 'during'])
+def test_cached_hit_rejects_sealed_file_mutation_before_return(tmp_path, monkeypatch, mutation_timing):
+    record = spec((2, 10, 11))
+    path = gray_cache_path(tmp_path, record)
+    data = create(path, record, 'raw')
+    with GrayCacheWriter(path, record, 'raw', min_free_bytes=0) as writer, \
+            GrayCacheReader(path, record, max_cache_bytes=data.nbytes) as reader:
+        np.testing.assert_array_equal(reader.read_crop(0, (0, 0, 10, 11)), data[0])
+        # Confirm the second packet plane comes from the warmed decoded chunk.
+        metrics = []
+        monkeypatch.setattr(gray_cache, '_metrics', lambda **row: metrics.append(row))
+        np.testing.assert_array_equal(reader.read_crop(1, (0, 0, 10, 11)), data[1])
+        assert metrics[-1]['cache_hits'] == 1 and metrics[-1]['decode_chunks'] == 0
+        mutated = False
+        def mutate():
+            nonlocal mutated
+            with writer._connection:
+                writer._connection.execute('UPDATE chunks SET data=zeroblob(raw_size)')
+            mutated = True
+        if mutation_timing == 'before':
+            mutate()
+        else:
+            # Return authenticated cached pixels, then commit a real mutation
+            # after admission. The exit check must reject the read despite its
+            # using only cached tiles. Reuse the already-open distinct writer.
+            class MutatingCache(OrderedDict):
+                def pop(self, key, default=None):
+                    cached = super().pop(key, default)
+                    if cached is not None and not mutated:
+                        mutate()
+                    return cached
+            reader._cache = MutatingCache(reader._cache)
+        with pytest.raises(GrayCacheError, match='modified|changed'):
+            reader.read_crop(1, (0, 0, 10, 11))
+        assert mutated
+
+
+def test_cached_hit_refreshes_lru_without_exceeding_byte_limit(tmp_path, monkeypatch):
+    record = spec((1, 256, 768))
+    path = gray_cache_path(tmp_path, record)
+    data = create(path, record, 'raw')
+    tile_bytes = 256 * 256
+    metrics = []
+    monkeypatch.setattr(gray_cache, '_metrics', lambda **row: metrics.append(row))
+    with GrayCacheReader(path, record, max_cache_bytes=2 * tile_bytes) as reader:
+        def read(tile):
+            start = tile * 256
+            output = reader.read_crop(0, (0, start, 256, start + 256))
+            np.testing.assert_array_equal(output, data[0, :, start:start + 256])
+            assert reader._cached_bytes <= 2 * tile_bytes
+            return metrics[-1]
+        read(0)
+        read(1)
+        assert read(0)['cache_hits'] == 1  # Tile 1 is now least recently used.
+        assert read(2)['decode_chunks'] == 1
+        assert read(0)['cache_hits'] == 1
+        assert read(1)['decode_chunks'] == 1

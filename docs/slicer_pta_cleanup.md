@@ -323,6 +323,22 @@ CUDA fences and native error handling remain in place. Updated external policy
 files have new content hashes, so their generated tags/seeds also change even
 when fixed-seed comparisons establish equivalent augmentation behavior.
 
+PTA FP64 CUDA spherical views also reuse exact QSC geometry in a bounded host
+memo. `YOLO_TTA_PTA_SPHERICAL_HOST_CACHE_MIB` caps host tables per GPU owner
+(default `3072` MiB; `0` disables the memo). Admission further limits that cap
+using physical/cgroup RAM headroom and the configured GPU-owner count; swap is
+excluded. Unknown or insufficient headroom keeps the existing uncached builder.
+At 2048², each direction/validity table is 100 MiB. Construction scratch and
+tables still held by borrowers remain charged beside cached entries.
+
+The host memo shares geometry between categorical classification and intensity
+rendering while retaining both 256 MiB GPU direction-cache budgets and the
+existing FP64 QSC math. CPU reference and FP32 sampling retain their existing
+paths. Classification-warmed tables survive first intensity source admission,
+then retire at the successful fenced source-generation handoff.
+`pta.cuda.spherical_host_cache` telemetry reports limits, hits/builds/waits, and
+current/peak owned host bytes. Existing Foundation environment names are unchanged.
+
 With `YOLO_TTA_PTA_GPU_NATIVE_T=1`, depth-only enlargement with unchanged X/Y
 dimensions lets CUDA intensity workers retain the smaller native-depth image and reconstruct logical gray8 voxels
 using the existing TTA kernels. Logical masks, physical-view plans and the host

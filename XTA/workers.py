@@ -101,10 +101,11 @@ from .inference import (
     _ensure_predictor_for_direct_predict,
     _clip_boxes_np,
     _gpu_union_retirement_manager,
-    _init_gpu_union_retirement_manager,
+    _arm_worker_gpu_union_retirement_manager,
     _process_cpu_retina_prediction_frame,
     _prediction_accumulation_target,
     _shutdown_gpu_union_retirement_manager,
+    _seal_worker_gpu_union_retirement_manager,
     cpu_retina_masks_enabled,
     ensure_cpu_retina_mask_predictor_patch,
     ensure_gpu_retina_proto_union_predictor_patch,
@@ -771,24 +772,24 @@ class _OpenVinoCpuSegmenter:
             raise RuntimeError(
                 f'OpenVINO CPU source produced batch {len(frames)}, but model batch is {self.batch}'
             )
-        batch_hwc = np.stack(frames, axis=0)
         if self.input_layout == 'NCHW':
-            batch_value = np.moveaxis(batch_hwc, -1, 1)
-        else:
-            batch_value = batch_hwc
+            frames = [np.moveaxis(frame, -1, 0) for frame in frames]
         # Ordinary Ultralytics IRs expose normalized floating-point input. Exports with
         # embedded preprocessing may expose uint8 and must receive the original 0..255 bytes.
         input_type = str(self.input_element_type).lower()
-        if input_type in {'u8', 'uint8'}:
-            return np.ascontiguousarray(batch_value, dtype=np.uint8)
-        if input_type in {'f16', 'float16'}:
-            return (
-                np.ascontiguousarray(batch_value, dtype=np.float16)
-                / np.float16(255.0)
-            )
         # BF16 has no native NumPy storage type. start_async safely converts this contiguous
         # FP32 input into a BF16 input tensor when the IR itself exposes BF16.
-        return np.ascontiguousarray(batch_value, dtype=np.float32) / np.float32(255.0)
+        dtype = (np.uint8 if input_type in {'u8', 'uint8'} else
+                 np.float16 if input_type in {'f16', 'float16'} else np.float32)
+        if not frames:
+            return np.stack(frames, axis=0)
+        # Stack directly into the final contiguous layout and dtype. Every async
+        # submission still owns a new array; no source or preceding request is reused.
+        batch_value = np.empty((len(frames), *frames[0].shape), dtype=dtype)
+        np.stack(frames, axis=0, out=batch_value)
+        if dtype != np.uint8:
+            batch_value /= dtype(255.0)
+        return batch_value
 
     def infer_source_to_union(
         self,
@@ -2120,6 +2121,7 @@ def _release_gpu_worker_inference_assets(
     if engine is not None:
         engine._stream.synchronize()
     assets.release_started = True
+    _seal_worker_gpu_union_retirement_manager()
     stats['assets_intact'] = False
     started = time.perf_counter()
     stats['phase'] = 'release_rings_and_retirement_lanes'
@@ -2294,14 +2296,9 @@ def _gpu_inference_worker_main(
                 _init_worker_gpu_render_engine('cuda:0')
         except Exception as _render_engine_exc:
             print(f'Warning: GPU render engine init failed ({_render_engine_exc}); worker uses CPU rendering.')
-        try:
-            with runtime_telemetry().span('startup.worker.retirement_lanes'):
-                _init_gpu_union_retirement_manager('cuda:0', int(cfg.imgsz))
-        except Exception as _retirement_exc:
-            print(
-                f'Warning: persistent GPU retirement lanes unavailable ({_retirement_exc}); '
-                'using the event-compatible fallback retirement executor.'
-            )
+        # D1 consumes device unions directly and never needs ordinary D2H lanes.
+        # Retain their configured capacity, but allocate only if an ordinary flush occurs.
+        _arm_worker_gpu_union_retirement_manager('cuda:0', int(cfg.imgsz))
         cuda_device_uuid = None
         try:
             torch_mod = _worker_initialized_torch()
@@ -2316,6 +2313,7 @@ def _gpu_inference_worker_main(
         result_queue.put({'type': 'ready', 'gpu_index': int(gpu_index), 'pid': int(os.getpid()),
                           'device': f'cuda:{gpu_index}', 'cuda_device_uuid': cuda_device_uuid})
     except Exception as exc:  # pragma: no cover - worker init failure surfaced to main
+        _seal_worker_gpu_union_retirement_manager()
         import traceback
         runtime_trace_event('worker_startup_failed', device=f'cuda:{gpu_index}', failed=True,
                             error=repr(exc))

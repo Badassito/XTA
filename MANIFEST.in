@@ -3,7 +3,7 @@ include README.md
 include .gitattributes
 include .gitignore
 include AGENTS.md
-include GPT-6-Astra-Ultra_v25.0.1_SLURM.py
+include GPT-6-Astra-Ultra_v25.0.2_SLURM.py
 include setup.py
 include release/_package_inventory.json
 recursive-include XTA/examples *.py *.md

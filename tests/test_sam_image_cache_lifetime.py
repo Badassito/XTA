@@ -41,7 +41,7 @@ def test_failed_rgb_conversion_keeps_actual_gray_alias_readable_until_released(t
     def fail(value):
         aliases.append(value)
         raise RuntimeError('RGB conversion failed')
-    monkeypatch.setattr(lta_rendering, 'implicit_rgb', fail)
+    monkeypatch.setattr(lta_rendering, '_detach_gray_rgb_image', fail)
     with pytest.raises(RuntimeError, match='RGB conversion failed'):
         lta_rendering.render_native_tile_window(ref, frame_start=0, frame_stop=1,
             tile_xyxy=(0, 0, 5, 4))

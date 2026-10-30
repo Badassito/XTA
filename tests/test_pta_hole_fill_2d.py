@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from unittest import mock
+import weakref
 
 import numpy as np
 import pytest
@@ -10,6 +11,7 @@ from scipy import ndimage
 from XTA import pta
 from XTA.pta_config import parse_pta_args
 from XTA.pta_preprocessing import fill_orthogonal_mask_holes_2d_inplace
+from XTA import pta_preprocessing
 from XTA.pta_runtime import build_runtime_options
 
 
@@ -78,6 +80,89 @@ def test_background_slit_and_foreground_at_corner_preserve_exterior():
     before = mask.copy()
     assert fill_orthogonal_mask_holes_2d_inplace(mask)["added_voxels"] == 0
     np.testing.assert_array_equal(mask, before)
+
+
+def _scipy_ordered_fill(source):
+    expected = source.copy()
+    counts = []
+    for axis in range(3):
+        added = changed = 0
+        for plane in np.moveaxis(expected, axis, 0):
+            holes = ndimage.binary_fill_holes(plane != 0) & (plane == 0)
+            count = int(np.count_nonzero(holes))
+            plane[holes] = 1
+            added += count
+            changed += bool(count)
+        counts.append((added, changed))
+    return expected, counts
+
+
+@pytest.mark.parametrize("strided", [False, True])
+def test_blocked_yz_matches_ordered_reference_across_block_boundaries(strided):
+    source = np.random.default_rng(471).choice(
+        np.array([0, 7, 255], np.uint8), size=(9, 11, 131), p=[.4, .4, .2])
+    expected, counts = _scipy_ordered_fill(source)
+    if strided:
+        backing = np.zeros((9, 11, 262), np.uint8)
+        actual = backing[:, :, ::2]
+        actual[:] = source
+    else:
+        actual = source.copy()
+    stats = fill_orthogonal_mask_holes_2d_inplace(actual)
+    np.testing.assert_array_equal(actual, expected)
+    assert [(row['added_voxels'], row['changed_planes']) for row in stats['axes']] == counts
+    if strided:
+        assert not np.any(backing[:, :, 1::2])
+
+
+@pytest.mark.parametrize('block_width', [2, 64])
+def test_yz_staging_retires_previous_block_and_preserves_open_tunnel(monkeypatch, block_width):
+    source = np.zeros((9, 11, 131), np.uint8)
+    source[1:8, 1:10] = 7
+    source[3:6, 4:7] = 0  # Open along X; only YZ closure fills it.
+    expected, counts = _scipy_ordered_fill(source)
+    original = np.ascontiguousarray
+    previous = []
+    block_bytes = source.shape[0] * source.shape[1] * block_width
+    monkeypatch.setattr(pta_preprocessing, '_ORTHOGONAL_HOLE_FILL_BLOCK_BYTES', block_bytes)
+
+    def stage(array):
+        assert not previous or previous[-1]() is None
+        staged = original(array)
+        assert staged.nbytes <= block_bytes
+        previous.append(weakref.ref(staged))
+        return staged
+
+    monkeypatch.setattr(pta_preprocessing.np, 'ascontiguousarray', stage)
+    stats = fill_orthogonal_mask_holes_2d_inplace(source)
+    assert len(previous) == (source.shape[2] + block_width - 1) // block_width
+    assert all(ref() is None for ref in previous)
+    np.testing.assert_array_equal(source, expected)
+    assert counts[:2] == [(0, 0), (0, 0)]
+    assert [(row['added_voxels'], row['changed_planes']) for row in stats['axes']] == counts
+
+
+@pytest.mark.parametrize('successful_blocks', [0, 1])
+def test_yz_staging_allocation_failure_keeps_plane_fallback(monkeypatch, successful_blocks):
+    source = np.zeros((9, 11, 131), np.uint8)
+    source[1:8, 1:10] = 255
+    source[3:6, 4:7] = 0
+    expected, counts = _scipy_ordered_fill(source)
+
+    original = np.ascontiguousarray
+    calls = 0
+
+    def exhausted(array):
+        nonlocal calls
+        calls += 1
+        if calls <= successful_blocks:
+            return original(array)
+        raise MemoryError('no optional staging headroom')
+
+    monkeypatch.setattr(pta_preprocessing.np, 'ascontiguousarray', exhausted)
+    stats = fill_orthogonal_mask_holes_2d_inplace(source)
+    np.testing.assert_array_equal(source, expected)
+    assert [(row['added_voxels'], row['changed_planes']) for row in stats['axes']] == counts
 
 
 @pytest.mark.parametrize("mask", [

@@ -215,6 +215,17 @@ def reference_existing_physical_view_cache(
     )
 
 
+def _detach_gray_rgb_image(crop: np.ndarray) -> object:
+    """Expand gray bytes directly into an independently owned RGB PIL image."""
+
+    from PIL import Image
+
+    # L-mode fromarray may borrow a contiguous gray crop. Conversion owns its
+    # RGB storage, so the returned image never keeps the source mapping alive.
+    # Exceptional aliases retain their original backing until they retire.
+    return Image.fromarray(np.ascontiguousarray(crop), mode="L").convert("RGB")
+
+
 def render_native_tile_window(
     cache_ref: LtaPhysicalViewCacheRef,
     *,
@@ -230,8 +241,6 @@ def render_native_tile_window(
     entire window of larger RGB frames that would immediately be discarded.
     Native crop coordinates and the shared cache remain unchanged.
     """
-
-    from PIL import Image
 
     start = int(frame_start)
     stop = int(frame_stop)
@@ -270,9 +279,9 @@ def render_native_tile_window(
                 crop = cache[index, y0:y1, x0:x1]
             if model_side is not None:
                 crop = resize_crop_frame(crop, side=model_side)
-            # A gray cache is always 2D here. implicit_rgb repeats into a new
-            # RGB allocation, so PIL/model images never borrow this gray mmap.
-            images.append(Image.fromarray(implicit_rgb(np.ascontiguousarray(crop)), mode='RGB'))
+            # The cache crop is uint8 gray. PIL expands directly into detached
+            # RGB storage without an intermediate three-channel NumPy copy.
+            images.append(_detach_gray_rgb_image(crop))
     finally:
         frame = crop = None
         close_memmap_array_without_flush(cache)

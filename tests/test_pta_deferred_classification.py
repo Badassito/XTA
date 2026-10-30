@@ -51,11 +51,12 @@ def test_real_parent_skips_projection_only_when_membership_is_class_independent(
     cand = candidate()
     prep = SimpleNamespace(label_enabled=True, semantic_foreground=change.get('semantic',False),
         src=SimpleNamespace(stem='sample', volume_class=change.get('volume_class','fully_labeled'),
-            label_source=change.get('label_source','nrrd'), yolo_polygons_by_frame=change.get('polygons',{}), labels_by_frame={}),
+            label_source=change.get('label_source','nrrd'), yolo_polygons_by_frame=change.get('polygons',{}),
+            labels_by_frame={}, mask_volume=np.ones((1,1,1),np.uint8)),
         plans=[], smoothing_stats=[], void_fill_stats=None, foreground_preservation_stats={})
     classify = mock.Mock(side_effect=StopPlanning)
     budget = mock.Mock(side_effect=StopPlanning)
-    namespace = dict(pending_loads={0:(SimpleNamespace(result=lambda: object()),workers.WarningLog())},
+    namespace = dict(pending_loads={0:(SimpleNamespace(result=lambda: prep.src),workers.WarningLog())},
         runtime_telemetry=lambda:SimpleNamespace(span=lambda *args:nullcontext()),
         _submit_load=lambda *args:None, pending_specs=[object()], prepare_loaded_source=lambda *args,**kwargs:prep,
         args=SimpleNamespace(augmentation_execution='offline',augmentation_ratio=change.get('ratio',7.),task='segment',save_semantic=False,background_percent=1.),
@@ -67,6 +68,7 @@ def test_real_parent_skips_projection_only_when_membership_is_class_independent(
         split_active=False,train_split=None,split_method=None,SplitStats=pta.SplitStats,apply_background_filter=budget)
     with pytest.raises(StopPlanning):
         parent_planner(namespace)(0,1)
+    assert prep.src.mask_volume is None
     assert classify.call_count == int(not deferred)
     assert budget.call_count == int(deferred)
     assert cand.foreground_deferred == ('semantic' if change.get('semantic') else 'polygon') if deferred else not cand.foreground_deferred

@@ -114,7 +114,7 @@ def primed_worker(monkeypatch, diagnostics):
         set_angle_variant_gpu_fastpath=None, ensure_yolo_ready_for_predict=None,
         validate_yolo_model_input_channels=None, require_channel_aware_yolo_preprocess_patch=None,
         ensure_gpu_retina_proto_union_predictor_patch=True, cpu_retina_masks_enabled=False,
-        _init_gpu_union_retirement_manager=None, _init_worker_gpu_render_engine=None,
+        _arm_worker_gpu_union_retirement_manager=None, _init_worker_gpu_render_engine=None,
         d1_owner_pipeline_enabled=False, _shutdown_d1_worker_pipeline=None,
         shutdown_radial_owners=None, _shutdown_resident_trt_pipeline_cache=None,
         _shutdown_gpu_union_retirement_manager=None, flush_runtime_task_trace=None,
@@ -315,7 +315,7 @@ def test_worker_ready_is_traced_before_send_and_never_sent_after_failed_initiali
         set_retina_mask_processor=None, set_gpu_worker_fused_preflight_specs=None,
         set_angle_variant_gpu_fastpath=None, ensure_yolo_ready_for_predict=None,
         validate_yolo_model_input_channels=None, require_channel_aware_yolo_preprocess_patch=None,
-        _init_gpu_union_retirement_manager=None, _init_worker_gpu_render_engine=None,
+        _arm_worker_gpu_union_retirement_manager=None, _init_worker_gpu_render_engine=None,
         d1_owner_pipeline_enabled=False, _shutdown_d1_worker_pipeline=None,
         shutdown_radial_owners=None, _shutdown_resident_trt_pipeline_cache=None,
         _shutdown_gpu_union_retirement_manager=None, flush_runtime_task_trace=None)

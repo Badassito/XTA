@@ -17,6 +17,30 @@ from .pta_workers import SharedBlock
 from .workspace import available_anon_work_bytes
 
 
+_ORTHOGONAL_HOLE_FILL_BLOCK_BYTES = 128 << 20
+
+
+def _fill_mask_hole_planes(planes, exterior):
+    """Fill independent planes while retaining no views after this call."""
+    import cv2
+
+    added = changed_planes = 0
+    for plane in planes:
+        exterior.fill(0)
+        interior = exterior[1:-1, 1:-1]
+        np.not_equal(plane, 0, out=interior)
+        if not np.any(interior):
+            continue
+        cv2.floodFill(exterior, None, (0, 0), 2, flags=4)
+        holes = interior == 0
+        count = int(np.count_nonzero(holes))
+        if count:
+            plane[holes] = 1
+            added += count
+            changed_planes += 1
+    return added, changed_planes
+
+
 def fill_orthogonal_mask_holes_2d_inplace(mask: np.ndarray) -> dict:
     """Close 2D holes on native XY, XZ, and YZ slices before 3D void filling.
 
@@ -24,8 +48,9 @@ def fill_orthogonal_mask_holes_2d_inplace(mask: np.ndarray) -> dict:
     array views, so each closure can be committed directly to its source plane.
     One deterministic XY/XZ/YZ sweep seals tunnels that are exterior-connected
     in 3D but enclosed in a cross section. Each sweep sees prior closures and
-    only adds foreground. Temporary storage is proportional to one plane, not
-    the volume; intensity data and separate semantic coverage are untouched.
+    only adds foreground. Temporary storage is proportional to one plane plus
+    at most 128 MiB of adjacent-column staging, not the volume; intensity data
+    and separate semantic coverage are untouched.
 
     Background uses four-neighbor connectivity, matching the shared 2D fill.
     PTA masks are binary, but existing nonzero values are preserved verbatim.
@@ -33,8 +58,6 @@ def fill_orthogonal_mask_holes_2d_inplace(mask: np.ndarray) -> dict:
     if (not isinstance(mask, np.ndarray) or mask.dtype != np.uint8 or mask.ndim != 3
             or not mask.flags.writeable or any(dim <= 0 for dim in mask.shape)):
         raise ValueError("2D hole filling requires a writable nonempty 3-D uint8 mask")
-    import cv2
-
     started = time.perf_counter()
     axes = []
     for axis, family in ((0, "xy"), (1, "xz"), (2, "yz")):
@@ -43,21 +66,36 @@ def fill_orthogonal_mask_holes_2d_inplace(mask: np.ndarray) -> dict:
         # The zero border provides an exterior seed even when a corner or
         # every edge of the source slice contains foreground.
         exterior = np.zeros((height + 2, width + 2), dtype=np.uint8)
-        added = 0
-        changed_planes = 0
-        for plane in planes:
-            exterior.fill(0)
-            interior = exterior[1:-1, 1:-1]
-            np.not_equal(plane, 0, out=interior)
-            if not np.any(interior):
-                continue
-            cv2.floodFill(exterior, None, (0, 0), 2, flags=4)
-            holes = interior == 0
-            count = int(np.count_nonzero(holes))
-            if count:
-                plane[holes] = 1
+        block_width = (
+            min(64, _ORTHOGONAL_HOLE_FILL_BLOCK_BYTES // (height * width))
+            if axis == 2 and mask.flags.c_contiguous else 1
+        )
+        if block_width <= 1 or mask.shape[2] <= block_width:
+            added, changed_planes = _fill_mask_hole_planes(planes, exterior)
+        else:
+            # Pack adjacent X columns in TYX order before walking YZ planes.
+            # This amortizes native-stride cache-line/page reads. Planes within
+            # an axis are disjoint; the enclosing loop retains XY/XZ/YZ order.
+            added = changed_planes = 0
+            for start in range(0, mask.shape[2], block_width):
+                source = mask[:, :, start:start + block_width]
+                try:
+                    staged = np.ascontiguousarray(source)
+                except MemoryError:
+                    # Staging is optional; preserve the plane-streaming path
+                    # when the additional bounded allocation is not admitted.
+                    count, changed = _fill_mask_hole_planes(
+                        planes[start:start + block_width], exterior)
+                else:
+                    count, changed = _fill_mask_hole_planes(
+                        np.moveaxis(staged, 2, 0), exterior)
+                    if changed:
+                        np.copyto(source, staged)
+                    # No plane views escape the helper. Retire this block
+                    # before allocating the next one rather than peaking at 2x.
+                    del staged
                 added += count
-                changed_planes += 1
+                changed_planes += changed
         axes.append({"family": family, "axis": axis, "planes": len(planes),
                      "changed_planes": changed_planes, "added_voxels": added})
     return {"backend": "opencv_cpu_plane_streaming", "background_connectivity": 4,

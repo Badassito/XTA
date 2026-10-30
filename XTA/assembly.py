@@ -2467,14 +2467,34 @@ def prepare_view_volume_after_fullframe(
 
         if bool(dense_tiling_active) and parent_mask_support_mm is not None:
             parent_bridge_support_path = temp_dir / 'tile_support' / model_name / view.name / 'fullframe_bridge_support.cvol'
-            bridge_stats = subtract_volume_to_raw_bbox_store(
-                baseline_native_volume,
-                parent_mask_support_mm,
-                parent_bridge_support_path,
-                desc=f'NRRD support fullframe bridges {model_name}/{view.name}',
-                workers=int(slice_workers),
-                format_name=CVOL_FORMAT,
-            )
+            bridge_desc = f'NRRD support fullframe bridges {model_name}/{view.name}'
+            if interpolation_stats:
+                bridge_stats = subtract_volume_to_raw_bbox_store(
+                    baseline_native_volume,
+                    parent_mask_support_mm,
+                    parent_bridge_support_path,
+                    desc=bridge_desc,
+                    workers=int(slice_workers),
+                    format_name=CVOL_FORMAT,
+                )
+            else:
+                # No interpolation invocation occurred after the immutable parent
+                # snapshot. Retention copies preserve its pixels, and extrapolation
+                # starts below, so this delta is empty without rereading the volume.
+                # An actual pass always takes subtraction, even with zero-added stats.
+                bridge_shape = _volume_shape_tuple(baseline_native_volume)
+                parent_shape = _volume_shape_tuple(parent_mask_support_mm)
+                if bridge_shape != parent_shape:
+                    raise ValueError(f'{bridge_desc}: shape mismatch {bridge_shape} vs {parent_shape}')
+                bridge_stats = _write_raw_bbox_payload_store(
+                    shape=bridge_shape,
+                    store_dir=parent_bridge_support_path,
+                    encode_slice=lambda idx: RawBBoxSlicePayload(idx=int(idx), is_empty=True),
+                    desc=bridge_desc,
+                    workers=int(slice_workers),
+                    format_name=CVOL_FORMAT,
+                    extra_meta={'operation': 'after_and_not_before'},
+                )
             if backend == 'sam':
                 from .sam_integration import publish_sam_gate_identity
                 last_stats = interpolation_stats[-1] if interpolation_stats else {}

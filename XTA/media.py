@@ -1033,6 +1033,11 @@ def resize_categorical_volume_to_processing_cube_uint8(
 
     def _render_target_slice(out_z: int) -> None:
         source_frame = mask_arr[int(source_t[int(out_z)])]
+        if in_h == out_h and in_w == out_w:
+            # T-only cube resizing retains the exact XY grid. Normalize into
+            # the destination directly instead of gathering an identical plane.
+            np.not_equal(source_frame, 0, out=out_mm[int(out_z)])
+            return
         sampled = source_frame[source_y_grid, source_x_grid]
         out_mm[int(out_z), :, :] = sampled != 0
 

@@ -171,7 +171,8 @@ def _spherical_directions(view, device, stream, *, direction_renderer=None):
         return hit[0], hit[1]
     _SHELL_DIRECTION_STATS['cache_misses'] += 1
 
-    from .spherical_cuda import _build_host_direction_block
+    from .spherical_cuda import _fill_host_direction_arrays
+    from .spherical_host_cache import borrow_spherical_host_directions
     import torch
 
     rows, columns = int(view.src_h), int(view.src_w)
@@ -181,22 +182,31 @@ def _spherical_directions(view, device, stream, *, direction_renderer=None):
     while _SHELL_DIRECTION_CACHE and _SHELL_DIRECTION_BYTES + size > _SHELL_DIRECTION_CACHE_BYTES:
         _, (_, _, old_size) = _SHELL_DIRECTION_CACHE.popitem(last=False)
         _SHELL_DIRECTION_BYTES -= old_size
-    started = time.perf_counter()
-    host_dirs = np.empty((rows, columns, 3), dtype=np.float64)
-    host_valid = np.empty((rows, columns), dtype=np.uint8)
-    for row0 in range(0, rows, 64):
-        row1 = min(rows, row0 + 64)
-        block_dirs, block_valid = _build_host_direction_block(key, row0, row1)
-        host_dirs[row0:row1] = block_dirs
-        host_valid[row0:row1] = block_valid
-    _SHELL_DIRECTION_STATS['host_build_seconds'] += time.perf_counter() - started
-    started = time.perf_counter()
-    with torch.cuda.stream(stream):
-        dirs = torch.as_tensor(host_dirs, device=device)
-        valid = torch.as_tensor(host_valid, device=device)
-    _SHELL_DIRECTION_STATS['upload_seconds'] += time.perf_counter() - started
-    _SHELL_DIRECTION_STATS['h2d_copies'] += 2
-    _SHELL_DIRECTION_STATS['h2d_bytes'] += host_dirs.nbytes + host_valid.nbytes
+    def fill(directions, valid):
+        started = time.perf_counter()
+        try:
+            _fill_host_direction_arrays(key, directions, valid)
+        finally:
+            _SHELL_DIRECTION_STATS['host_build_seconds'] += time.perf_counter() - started
+
+    with borrow_spherical_host_directions(direction_renderer, key, np.float64, fill) as arrays:
+        if arrays is None:
+            started = time.perf_counter()
+            host_dirs = np.empty((rows, columns, 3), dtype=np.float64)
+            host_valid = np.empty((rows, columns), dtype=np.uint8)
+            _fill_host_direction_arrays(key, host_dirs, host_valid)
+            _SHELL_DIRECTION_STATS['host_build_seconds'] += time.perf_counter() - started
+            upload = torch.as_tensor
+        else:
+            host_dirs, host_valid = arrays
+            upload = torch.tensor
+        started = time.perf_counter()
+        with torch.cuda.stream(stream):
+            dirs = upload(host_dirs, dtype=torch.float64, device=device)
+            valid = upload(host_valid, dtype=torch.uint8, device=device)
+        _SHELL_DIRECTION_STATS['upload_seconds'] += time.perf_counter() - started
+        _SHELL_DIRECTION_STATS['h2d_copies'] += 2
+        _SHELL_DIRECTION_STATS['h2d_bytes'] += host_dirs.nbytes + host_valid.nbytes
     _SHELL_DIRECTION_CACHE[key] = (dirs, valid, size)
     _SHELL_DIRECTION_BYTES += size
     return dirs, valid
