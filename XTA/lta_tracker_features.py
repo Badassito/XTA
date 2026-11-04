@@ -14,12 +14,126 @@ from __future__ import annotations
 from collections.abc import Mapping, MutableMapping
 import math
 import operator
+import threading
 from typing import Any
 
 
 TRACKER_FEATURE_POLICY = "sam3_1_visual_backbone_only_exact_bf16"
 TRACKER_FEATURE_AUDIT_KEY = "lta_tracker_feature_preparation"
 _FRAME_REUSE_KEY = "_lta_tracker_prepared_frame_identity"
+_IMAGE_ID_CACHE_KEY = "_lta_tracker_verified_image_ids"
+_STAGING_SLOTS = 2
+_STAGING = threading.local()
+
+
+def async_frame_io_enabled() -> bool:
+    """``YOLO_TTA_SAM_ASYNC_FRAME_IO=0`` restores the original synchronous per-frame transfers."""
+    import os
+    return os.environ.get("YOLO_TTA_SAM_ASYNC_FRAME_IO", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _tensor_version(tensor: Any) -> int | None:
+    """In-place version counter, or None for inference tensors (which do not track one)."""
+    return None if tensor.is_inference() else int(tensor._version)
+
+
+def _cache_entry_current(entry: Any, tensor: Any) -> bool:
+    return entry is not None and entry[0] is tensor and entry[1] == _tensor_version(tensor)
+
+
+def _frame_image_id(state: MutableMapping[str, Any], find_inputs: Any, frame_index: int) -> int:
+    """Return one frame's ``img_ids`` value without a per-frame device sync.
+
+    The SDK moves every ``FindStage.img_ids`` to CUDA, so ``.item()`` blocks the
+    host until all queued GPU work drains, once per tracked frame. All of a
+    session's ids are read with one transfer instead. Each cached value is bound
+    to its exact tensor object and, where tracked, its in-place version counter;
+    a replaced or mutated tensor is read again directly. The SDK creates these
+    ids as inference tensors, which have no version counter, so
+    ``verify_cached_frame_image_ids`` re-reads them together before the session's
+    results are returned; a changed id still fails the session.
+    """
+    tensor = find_inputs[frame_index].img_ids
+    if not async_frame_io_enabled():
+        return int(tensor.reshape(-1)[0].item())
+    cache = state.get(_IMAGE_ID_CACHE_KEY)
+    entry = None if not isinstance(cache, dict) else cache.get(frame_index)
+    if _cache_entry_current(entry, tensor):
+        return entry[2]
+    import torch
+
+    if not isinstance(cache, dict):
+        cache = {}
+        state[_IMAGE_ID_CACHE_KEY] = cache
+        singles = [(index, stage.img_ids) for index, stage in enumerate(find_inputs)
+                   if isinstance(getattr(stage, "img_ids", None), torch.Tensor) and stage.img_ids.numel() == 1
+                   and stage.img_ids.device == tensor.device and stage.img_ids.dtype == tensor.dtype]
+        if singles:
+            values = torch.cat([ids.reshape(-1) for _index, ids in singles]).cpu().tolist()
+            for (index, ids), value in zip(singles, values):
+                cache[index] = (ids, _tensor_version(ids), int(value))
+        entry = cache.get(frame_index)
+        if _cache_entry_current(entry, tensor):
+            return entry[2]
+    value = int(tensor.reshape(-1)[0].item())
+    cache[frame_index] = (tensor, _tensor_version(tensor), value)
+    return value
+
+
+def verify_cached_frame_image_ids(state: MutableMapping[str, Any]) -> None:
+    """Re-read every cached frame id with one transfer; raise if any changed."""
+    cache = state.get(_IMAGE_ID_CACHE_KEY)
+    if not isinstance(cache, dict) or not cache:
+        return
+    import torch
+
+    items = sorted(cache.items())
+    groups: dict[tuple[object, object], list[tuple[int, tuple[Any, Any, int]]]] = {}
+    for index, entry in items:
+        groups.setdefault((entry[0].device, entry[0].dtype), []).append((index, entry))
+    for members in groups.values():
+        values = torch.cat([entry[0].reshape(-1)[:1] for _index, entry in members]).cpu().tolist()
+        for (index, entry), value in zip(members, values):
+            if int(value) != entry[2] or entry[0].numel() != 1:
+                raise RuntimeError("pinned SAM frame identity differs from the requested local frame")
+
+
+def _upload_frame_image(original_image: Any, device: Any, torch: Any) -> Any:
+    """Copy one CPU-offloaded frame to ``device`` as float32 without draining the GPU.
+
+    A pageable host-to-device copy first waits for all queued GPU work. The frame
+    is instead copied into one of two per-process pinned staging buffers and sent
+    asynchronously; the fp16-to-fp32 conversion then runs on the device. That
+    conversion is exact, so the backbone input is bit-identical to
+    ``original_image.to(dtype=float32, device=device)``. A staging slot is reused
+    only after its previous transfer's event completes.
+    """
+    target = torch.device(device)
+    if (not async_frame_io_enabled() or original_image.device.type != "cpu" or target.type != "cuda"
+            or not original_image.is_contiguous() or not torch.cuda.is_available()):
+        return original_image.to(dtype=torch.float32, device=target)
+    key = (tuple(original_image.shape), original_image.dtype, str(target))
+    buffers = getattr(_STAGING, "buffers", None)
+    if buffers is None:
+        buffers = _STAGING.buffers = {}
+    slots = buffers.get(key)
+    if slots is None:
+        slots = [[torch.empty(original_image.shape, dtype=original_image.dtype, pin_memory=True), None]
+                 for _ in range(_STAGING_SLOTS)]
+        slots.append(0)  # next slot index
+        buffers[key] = slots
+    index = slots[-1]
+    slots[-1] = (index + 1) % _STAGING_SLOTS
+    slot = slots[index]
+    if slot[1] is not None:
+        slot[1].synchronize()
+    slot[0].copy_(original_image)
+    on_device = torch.empty(original_image.shape, dtype=original_image.dtype, device=target)
+    on_device.copy_(slot[0], non_blocking=True)
+    event = torch.cuda.Event()
+    event.record(torch.cuda.current_stream(target))
+    slot[1] = event
+    return on_device.to(dtype=torch.float32)
 
 
 def _class_identity(value: object) -> tuple[str, str]:
@@ -217,7 +331,7 @@ def prepare_tracker_frame_features(
     # another image when this adapter is active.
     find_input = input_batch.find_inputs[frame_index]
     image_ids = find_input.img_ids
-    if image_ids.numel() != 1 or int(image_ids.reshape(-1)[0].item()) != frame_index:
+    if image_ids.numel() != 1 or _frame_image_id(state, input_batch.find_inputs, frame_index) != frame_index:
         raise RuntimeError("pinned SAM frame identity differs from the requested local frame")
     original_image = image_batch.tensors[frame_index]
     if not isinstance(original_image, torch.Tensor) or original_image.ndim != 3:
@@ -266,7 +380,7 @@ def prepare_tracker_frame_features(
         prepared = feature_cache.get(shared_key, model=model)
     shared_hit = prepared is not None
     if not shared_hit:
-        image = original_image.unsqueeze(0).to(dtype=torch.float32, device=detector.device)
+        image = _upload_frame_image(original_image, detector.device, torch).unsqueeze(0)
         features = backbone.forward_image(
             image,
             need_sam3_out=False,

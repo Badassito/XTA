@@ -346,8 +346,11 @@ state between independent endpoint sessions or relax proposal quality.
 
 | Control | Default | Scope |
 | --- | --- | --- |
-| `YOLO_TTA_SAM_IMAGE_CACHE_MAX_BYTES` | 1 GiB | Each immutable image-demand cache; not a total process budget. Aliased canonical backing adds no cache storage |
+| `YOLO_TTA_SAM_IMAGE_CACHE_MAX_BYTES` | 1 GiB | Each immutable image-demand cache; not a total process budget. Aliased canonical backing adds no cache storage. An interpolation pass above it is tracked in complete-group image cohorts (packed at the parent-funded cap; a larger group gets its own cohort under this cap); a single group above its admissible cap is an `image_cache_group_over_cap` planning refusal (see [SAM image cohorts](sam_sdk.md#sam-image-cohorts)) |
 | `YOLO_TTA_SAM_RENDER_MAX_BYTES` | 256 MiB | Bounded native sampling and remap workspace |
+| `YOLO_TTA_SAM_EVIDENCE_INDEX_MAX_BYTES` | 1 GiB | Each SAM pass's evidence `index.json` and selection receipt; the reader decodes it whole (about 10× in memory) |
+| `YOLO_TTA_SAM_STARTUP_WAIT_SEC` | 300 s | Each SAM device-startup wait for host RAM and a GPU-stage lease, including the end-of-inference wait for all configured devices |
+| `YOLO_TTA_SAM_PASS_FAILURE_POLICY` | `abort` | `degrade` keeps a failed pass's input masks and records a `failed` omission instead of ending the run |
 | `--sam_feature_cache_mib` | `1024` MiB | Requested retained feature budget per admitted predictor; zero disables retention |
 | `YOLO_TTA_SAM_FAMILY_SCHEDULE` | Automatic whole-crop scheduling | Balanced supported FIFO, otherwise recorded flat fallback; explicit `flat` backout or `fifo`; tiled stays flat |
 | Proposal reader `max_cache_bytes` Python argument | Automatic with live credit; otherwise 32 MiB | One evidence-reader transaction; explicit budgets remain explicit, zero disables retention |
@@ -497,8 +500,17 @@ is unavailable, endpoint identity is explicitly based on connected components.
 A bounded family group can contain multiple observed daughter endpoints and
 relevant continuations, including siblings that need no repair.
 
-The planner bounds each group to 1,024 endpoints, 1,024 observations, 256 edges,
-and 4,194,304 crop pixels. Explicit lower caller limits remain authoritative.
+The planner bounds each group to 1,024 endpoints, 256 edges, and 4,194,304 crop
+pixels. There is no default cap on observations per group: the per-group and
+resident contract byte limits below bound a large family instead. Streamed
+contracts charge 80 bytes per candidate corridor actually retained (endpoint
+pairs linked in the planning graph), not per possible observation pair.
+Explicit lower caller limits, including `max_observations_per_group`, remain
+authoritative. Planning also applies selection's topology-workspace budget
+(32 bytes per voxel plus 2 MiB for branch-aware selection, otherwise 16 bytes per
+voxel, over frames x crop pixels), so a group that selection could not hold is
+refused at planning with `topology_workspace_memory_limit` instead of stopping
+the run during preparation. That budget does not change group identities.
 Production planning retains immutable family recipes. The native evidence writer
 can generate exact contract planes with a bounded last-frame cache instead of
 retaining every edge's complete frame stack. It retains the dense route where
@@ -510,6 +522,19 @@ later families after earlier families consume a cumulative allowance. Explicit
 eager/research calls retain their declared memory limits; baseline limits are
 256 MiB per group and 512 MiB for retained contracts. A genuine per-family or
 structural refusal remains explicit instead of silently omitting a sibling.
+A run with refused groups still finishes and exits normally: it prints a final
+warning with the affected scope and group counts, and its manifest records
+`status: incomplete` with the planning omissions. Set
+`YOLO_TTA_SAM_REQUIRE_COMPLETE=1` to make refused SAM work fail the run instead.
+
+A SAM pass that raises (for example on a fixed size limit) ends the run by
+default. With `YOLO_TTA_SAM_PASS_FAILURE_POLICY=degrade`, that view keeps its
+unmodified input masks for the failed interpolation or extrapolation pass,
+the traceback is printed, the pass's incomplete evidence and `failure.json`
+stay in place, and the pass is recorded as a `failed` planning omission with
+reason `sam_pass_failed:<ErrorType>`. The run then finishes as incomplete, as
+above; the manifest records the policy as `sam_pass_failure_policy`. A
+scheduler cancel or a closed SAM runtime still ends the run.
 Physical spacing participates in geometric search; crop coordinates remain
 view-native pixels.
 

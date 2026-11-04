@@ -7,8 +7,10 @@ contributors before any additive volume or parent-gate support is published.
 
 from __future__ import annotations
 
+import dataclasses
+
 from collections.abc import Mapping
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 import hashlib
 import heapq
@@ -31,6 +33,20 @@ from .json_publication import write_json_atomic
 
 class SamInterpolationInfrastructureError(RuntimeError):
     """A generation failure, which must never become an empty successful bridge."""
+
+
+class SamImageCohortAdmissionError(SamInterpolationInfrastructureError):
+    """The first image cohort could not be staged; no tracker work started.
+
+    Raised before the evidence scope exists, so the caller records it as an
+    image-admission (preparation) failure. A resource ``receipt`` is kept.
+    """
+
+    def __init__(self, error):
+        super().__init__(f"SAM interpolation image cohort 0 could not be staged: {error}")
+        receipt = getattr(error, "receipt", None)
+        if isinstance(receipt, Mapping):
+            self.receipt = dict(receipt)
 
 
 @contextmanager
@@ -288,6 +304,25 @@ def prepare_sam_interpolation_pass(
     mode = resolve_sam_crop_mode(crop_mode if crop_mode is not None else metadata.get("sam_crop_mode"))
     metadata["sam_crop_mode"] = mode
     _validate_view(view, wrap_axis, metadata)
+    # Selection charges each tracked group's topology workspace against its own
+    # budget. Give the planner the same rule so a too-large group is refused with
+    # a planning reason (warned, manifest incomplete) instead of failing the run.
+    from .sam_policy import resolve_sam_bridge_policy, _selection_resources
+    topology_source_policy = policy or {}
+    if "kind" in topology_source_policy and "mode" not in topology_source_policy:
+        topology_source_policy = {"sam_bridge_policy": topology_source_policy}
+    topology_policy = resolve_sam_bridge_policy(topology_source_policy, generation_mode=mode)
+    topology_operative, _ = _selection_resources(topology_source_policy, topology_policy, resource_profile)
+    topology_limit = int(topology_operative['max_group_bytes'])
+    from .sam_bridge_planning import SamPlanningLimits
+    from .sam_branch_selection import BRANCH_WORKSPACE_BYTES_PER_VOXEL, BRANCH_WORKSPACE_FIXED_BYTES
+    branch_aware = bool(topology_policy.get('branch_aware_selection', False))
+    # Only the planner sees the derived budget; the pinned settings identity keeps
+    # the caller's limits so execution can re-derive and compare it.
+    planning_limits = dataclasses.replace(planner_limits if planner_limits is not None else SamPlanningLimits(),
+        max_topology_workspace_bytes=topology_limit,
+        topology_bytes_per_voxel=BRANCH_WORKSPACE_BYTES_PER_VOXEL if branch_aware else 16,
+        topology_fixed_bytes=BRANCH_WORKSPACE_FIXED_BYTES if branch_aware else 0)
     settings_sha256 = _planning_identity(scope=metadata, view=view, pass_index=pass_index,
         gap_distance=gap_distance, min_radius=min_radius, search_angle_deg=search_angle_deg,
         interpolation_walk_back=interpolation_walk_back, interpolation_candidates=interpolation_candidates,
@@ -301,7 +336,7 @@ def prepare_sam_interpolation_pass(
         interpolation_min_radius=float(min_radius), interpolation_search_angle=float(search_angle_deg),
         scope_id=str(metadata.get("scope_id", "sam")), spacing_zyx=spacing_zyx,
         canonical_labels=canonical_labels, observation_lineage=upstream_lineage,
-        limits=planner_limits, planning_pass_index=int(pass_index), wrap_axis=bool(wrap_axis), lazy_contracts=True,
+        limits=planning_limits, planning_pass_index=int(pass_index), wrap_axis=bool(wrap_axis), lazy_contracts=True,
         _stream_contracts=(resource_details is None or
                            int(resource_details.get('assigned_contract_metadata_bytes', 0)) > 0),
         _observation_inventory=_observation_inventory)
@@ -321,13 +356,8 @@ def prepare_sam_interpolation_pass(
             except (TypeError, ValueError) as error:
                 raise SamInterpolationInfrastructureError(
                     f"SAM planned run {run.run_id} is outside the bounded tracker session contract: {error}") from error
-        from .sam_policy import resolve_sam_bridge_policy, _selection_resources
-        source_policy = policy or {}
-        if "kind" in source_policy and "mode" not in source_policy:
-            source_policy = {"sam_bridge_policy": source_policy}
-        topology_policy = resolve_sam_bridge_policy(source_policy, generation_mode=mode)
-        topology_operative, _ = _selection_resources(source_policy, topology_policy, resource_profile)
-        topology_limit = int(topology_operative['max_group_bytes'])
+        # Planning already refused groups over the topology budget; this check
+        # remains an invariant guard, not a scheduling decision.
         tracked_group_ids = {str(run.group_id) for run in runs}
         for group in plan.groups:
             if str(group.group_id) not in tracked_group_ids:
@@ -415,6 +445,78 @@ def prepare_sam_interpolation_pass(
         crop_mode=mode, tracker_jobs=tracker_jobs, tile_inventory=tile_inventory,
         tiling_sha256=tiling_sha256, tiled_assembly_bytes=assembly_bytes,
         cpu_wave_admission=MappingProxyType(wave_details))
+
+
+SAM_IMAGE_CACHE_GROUP_REFUSAL = "image_cache_group_over_cap"
+
+
+def refuse_sam_interpolation_image_groups(prepared, refused, *, configured_cache_bytes,
+                                          effective_cache_bytes):
+    """Record complete groups whose own image demand exceeds the cache cap.
+
+    A refused group is never split, cropped or shortened. It becomes an
+    unresolved planning group with no runs, exactly like a planner refusal, and
+    keeps its bounds/reasons in evidence. Every other sealed group, run and
+    planning identity is retained unchanged, in its original order.
+    """
+    refused = {str(group_id): int(size) for group_id, size in dict(refused).items()}
+    if not refused:
+        return prepared
+    if prepared.plan is None or prepared.disabled:
+        raise ValueError("SAM image refusal requires an active prepared interpolation plan")
+    tracked = {str(run.group_id) for run in prepared.runs}
+    if not set(refused) <= tracked:
+        raise ValueError("SAM image refusal names a group without planned runs")
+    from .sam_bridge_planning import _empty_contracts
+    plan = prepared.plan
+    groups = []
+    for group in plan.groups:
+        payload = refused.get(str(group.group_id))
+        if payload is None:
+            groups.append(group)
+            continue
+        empty = _empty_contracts()
+        crop_contract = dict(group.crop_contract or {})
+        crop_contract["image_cache_refusal"] = dict(reason=SAM_IMAGE_CACHE_GROUP_REFUSAL,
+            payload_bytes=int(payload), configured_cache_bytes=int(configured_cache_bytes),
+            effective_cache_bytes=int(effective_cache_bytes))
+        groups.append(replace(group, acceptance_masks=empty, write_masks=empty,
+            branch_evaluation_masks=MappingProxyType({}), edge_write_masks=MappingProxyType({}),
+            known_foreground_masks=empty, unrelated_masks=empty,
+            branch_permitted_masks=MappingProxyType({}), edge_contract_masks=MappingProxyType({}),
+            status="unresolved",
+            reasons=tuple(sorted(set(map(str, group.reasons)) | {SAM_IMAGE_CACHE_GROUP_REFUSAL})),
+            contract_recipe=None, crop_contract=MappingProxyType(crop_contract)))
+    groups = tuple(groups)
+    kept_runs = tuple(run for run in prepared.runs if str(run.group_id) not in refused)
+    plan_runs = tuple(run for run in plan.runs if str(run.group_id) not in refused)
+    status = ("unresolved" if groups and all(str(group.status) == "unresolved" for group in groups)
+              else plan.status)
+    plan = replace(plan, groups=groups, runs=plan_runs, status=status)
+    tracker_jobs, tile_inventory = prepared.tracker_jobs, prepared.tile_inventory
+    tiling_sha256, assembly_bytes = prepared.tiling_sha256, prepared.tiled_assembly_bytes
+    needed_frames, frame_crop_bounds = plan.needed_frames, plan.frame_crop_bounds
+    if prepared.crop_mode == "tiled":
+        from .sam_crop_tiling import prepare_tiled_jobs
+        try:
+            tracker_jobs, tile_inventory, tiling_sha256, assembly_bytes = prepare_tiled_jobs(kept_runs,
+                {str(group.group_id): group for group in groups}, plan.by_id)
+        except (MemoryError, ValueError) as error:
+            raise SamInterpolationInfrastructureError(f"SAM tiled generation preflight failed: {error}") from error
+        needed_frames = tuple(sorted({int(frame) for job in tracker_jobs for frame in job.original_run.expected_frames}))
+        demand = {}
+        for job in tracker_jobs:
+            crop = job.tile.crop_bbox_yx
+            for frame in job.original_run.expected_frames:
+                old = demand.get(int(frame))
+                demand[int(frame)] = crop if old is None else (
+                    min(old[0], crop[0]), min(old[1], crop[1]), max(old[2], crop[2]), max(old[3], crop[3]))
+        frame_crop_bounds = MappingProxyType(demand)
+    # Settings, buffer identities and the CPU wave admission (an upper bound for
+    # the remaining jobs) are inherited from the sealed preparation.
+    return replace(prepared, plan=plan, runs=kept_runs, needed_frames=needed_frames,
+        frame_crop_bounds=frame_crop_bounds, tracker_jobs=tracker_jobs, tile_inventory=tile_inventory,
+        tiling_sha256=tiling_sha256, tiled_assembly_bytes=assembly_bytes)
 
 
 def _tracker_requests(runs: tuple[object, ...], groups: Mapping[str, object],
@@ -615,6 +717,73 @@ def _tracker_scope_admission(runtime,prepared,cache_ref,resource_profile,max_in_
         yield permit
 
 
+class _SamImageCohortLeases:
+    """One entered image cohort at a time, plus at most one lookahead.
+
+    Leaving a cohort lease is the worker source-cache retirement barrier of the
+    lifetime-managed provider. ``close`` is idempotent and also closes an
+    unconsumed lookahead, mirroring extrapolation's image cohort loop.
+    """
+
+    def __init__(self, cohorts, provider, prefetch=None, *, runtime=None, cancel_event=None):
+        self.cohorts = tuple(cohorts)
+        self._provider, self._prefetch = provider, prefetch
+        self._runtime, self._cancel_event = runtime, cancel_event
+        self.index, self.current = -1, None
+        self._stack = self._prefetched = None
+        self._closed = False
+
+    def enter(self, index):
+        index = int(index)
+        if self._closed or self._stack is not None or index != self.index + 1 or index >= len(self.cohorts):
+            raise SamInterpolationInfrastructureError("SAM image cohort leases must be entered once, in order")
+        from .sam_extrapolation import _cancelled
+        if _cancelled(self._runtime, self._cancel_event):
+            raise SamInterpolationInfrastructureError("SAM interpolation cancelled before image cohort generation")
+        lease, self._prefetched = self._prefetched, None
+        if lease is None:
+            lease = self._provider(self.cohorts[index].prepared)
+        stack = ExitStack()
+        try:
+            if self._prefetch is not None and index + 1 < len(self.cohorts):
+                self._prefetched = self._prefetch(self.cohorts[index + 1].prepared)
+            provider = stack.enter_context(lease)
+        except BaseException as error:
+            close = getattr(lease, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except BaseException as cleanup_error:
+                    # A lease whose own __enter__ already unwound may refuse a
+                    # second close; keep the original admission/build cause.
+                    error.add_note(f"SAM image cohort lease cleanup also failed: {cleanup_error!r}")
+            raise
+        self._stack, self.index, self.current = stack, index, provider
+        return provider
+
+    def release_current(self):
+        stack, self._stack, self.current = self._stack, None, None
+        if stack is not None:
+            stack.__exit__(None, None, None)
+
+    def close(self, error=None):
+        if self._closed:
+            return
+        self._closed = True
+        stack, self._stack, self.current = self._stack, None, None
+        prefetched, self._prefetched = self._prefetched, None
+        try:
+            if stack is not None:
+                if error is None:
+                    stack.__exit__(None, None, None)
+                else:
+                    stack.__exit__(type(error), error, error.__traceback__)
+        finally:
+            close = getattr(prefetched, "close", None)
+            if callable(close):
+                close()
+
+
 def _iterate_tracker_results(runtime: object, requests: object, cache_ref: object, cpu_wave=None,*,scope_admission=None):
     if hasattr(runtime, "iter_results"):
         options = {} if not cpu_wave else dict(max_in_flight=int(cpu_wave['max_in_flight']),
@@ -651,10 +820,11 @@ def _iterate_tiled_tracker_results(runtime, prepared, worker_count, groups, obse
 
 
 def _store_generated_parent_run(writer, run, result, group, observation_by_id,
-                                metadata, upstream_lineage, availability_masks=None):
+                                metadata, upstream_lineage, availability_masks=None, *,
+                                image_snapshot_sha256=None):
     descriptor = _run_descriptor(run, result)
-    descriptor['image_snapshot_sha256'] = metadata.get('retry_image_snapshot_sha256',
-        metadata.get('image_snapshot_sha256', ''))
+    descriptor['image_snapshot_sha256'] = (image_snapshot_sha256 if image_snapshot_sha256 is not None else
+        metadata.get('retry_image_snapshot_sha256', metadata.get('image_snapshot_sha256', '')))
     for identity_key in ("sam_model", "sam_runtime"):
         actual_identity = descriptor["runtime_receipt"].get(identity_key)
         if actual_identity is not None:
@@ -993,8 +1163,12 @@ def _regenerate_sam_group_retry(prepared, *, destination, metadata, image_provid
 
 def _apply_sam_crop_retries(bundle, prepared, *, destination, metadata, runtime,
         retry_policy, retry_image_provider, policy, resource_profile, min_radius,
-        upstream_lineage, cancel_event):
-    """Resolve outer crop censoring with complete original-seed family replays."""
+        upstream_lineage, cancel_event, original_image_identities=None):
+    """Resolve outer crop censoring with complete original-seed family replays.
+
+    ``original_image_identities`` (image-cohort passes only) maps each original
+    run to the cohort image it was tracked with; a retry pins that image.
+    """
     if retry_policy is None or not retry_policy.enabled or not prepared.runs:
         return bundle, destination, None
     from .sam_crop_retry import SamCropRetryController, SamCropRetryAdmissionError
@@ -1102,6 +1276,13 @@ def _apply_sam_crop_retries(bundle, prepared, *, destination, metadata, runtime,
                                     cache.revalidate()
                                 image_identity = str(getattr(cache, 'identity_sha256', ''))
                                 pinned_image_identity = str(metadata.get('image_snapshot_sha256', ''))
+                                if original_image_identities is not None:
+                                    pinned = {str(original_image_identities.get(str(run.run_id), '') or '')
+                                              for run in original_runs}
+                                    if len(pinned) != 1:
+                                        raise SamInterpolationInfrastructureError(
+                                            'SAM crop retry group was tracked with several image cohorts')
+                                    pinned_image_identity = pinned.pop()
                                 if image_identity and pinned_image_identity and image_identity != pinned_image_identity:
                                     from .sam_gpu_rendering import same_live_image_geometry
                                     if not same_live_image_geometry(pinned_image_identity, cache):
@@ -1410,6 +1591,26 @@ _PUBLICATION_LOOKUP_FIXED_BYTES = 4096
 _PUBLICATION_LOOKUP_OWNER_BYTES = 512
 
 
+def _publication_reader_allowance(bundle, resource_profile) -> int:
+    """Total publication reader allowance (mask cache plus frame lookup).
+
+    Publication starts after selection's reader has closed, on the same thread and
+    live SAM credit, so it may use the cache size selection is granted from that
+    credit (unused credit only, capped at 2 GiB). The legacy 32 MiB is both the
+    floor and the fallback without a live profile. The cache memoizes decoded
+    masks and filter results only; published planes are identical at any size.
+    Set YOLO_TTA_SAM_PUBLICATION_READER_LIVE_CREDIT=0 to keep the legacy size.
+    """
+    if resource_profile is None or os.environ.get(
+            'YOLO_TTA_SAM_PUBLICATION_READER_LIVE_CREDIT', '1').strip().lower() in {'0', 'false', 'no', 'off'}:
+        return _PUBLICATION_READER_BYTES
+    from .sam_evidence import SamEvidenceBundle
+    if type(bundle) is not SamEvidenceBundle:
+        return _PUBLICATION_READER_BYTES
+    from .sam_policy import _selection_reader_cache_bytes
+    return max(_PUBLICATION_READER_BYTES, int(_selection_reader_cache_bytes(bundle, resource_profile)))
+
+
 def _publication_lookup_sources(reader):
     """Accept only the original deeply frozen metadata of an active reader."""
     from .sam_evidence import SamEvidenceBundle
@@ -1476,9 +1677,8 @@ class _PublicationFrameLookup:
     def owner_frames(self, frame, direction):
         frame = int(frame)
         direction = None if direction is None else int(direction)
-        if self.cyclic_signs and (direction is None or direction in self.cyclic_signs):
-            from .sam_cyclic import assert_cyclic_implementation_unchanged
-            assert_cyclic_implementation_unchanged()
+        # Per-frame lookups perform no file I/O. Publication checks the cyclic
+        # helper source when each cyclic direction starts and before finalizing.
         for run_id, group, frames, sign, addresses, native_shape in self.owners:
             if direction is not None and sign != direction:
                 continue
@@ -1498,7 +1698,8 @@ class _PublicationFrameLookup:
                     yield run_id, stored_frame, group, addresses[stored_frame], native_shape
 
 
-def _build_publication_frame_lookup(reader, view, shape_yx, *, reserved_bytes):
+def _build_publication_frame_lookup(reader, view, shape_yx, *, reserved_bytes,
+                                    allowance=_PUBLICATION_READER_BYTES):
     """Bound descriptor storage inside the existing publication reader allowance.
 
     Each owner adds one six-reference tuple plus one tuple slot and borrowed
@@ -1511,7 +1712,7 @@ def _build_publication_frame_lookup(reader, view, shape_yx, *, reserved_bytes):
     selected, snapshot = view.get('selected_run_ids'), view.get('mask_filter')
     charge = _publication_lookup_reservation(view)
     if (sources is None or not charge or charge > int(reserved_bytes)
-            or reader.max_cache_bytes+int(reserved_bytes) > _PUBLICATION_READER_BYTES
+            or reader.max_cache_bytes+int(reserved_bytes) > int(allowance)
             or type(selected) is not tuple or type(snapshot) is not _FilterSnapshot
             or snapshot.owner is not reader._identity or 'branch_selection' in view):
         return None
@@ -1567,8 +1768,13 @@ def _unindexed_publication_owner_frames(bundle, receipt, frame, shape_yx, direct
 
 def selected_sam_plane(bundle: object, receipt: Mapping[str, object], frame: int,
                        shape_yx: tuple[int, int], *, direction: int | None = None,
-                       _records=None, _lookup=None) -> np.ndarray:
-    """Rebuild a selected native plane from owners, preserving shared voxels."""
+                       _records=None, _lookup=None, _cyclic_source_checked=False) -> np.ndarray:
+    """Rebuild a selected native plane from owners, preserving shared voxels.
+
+    A public call checks the cyclic helper source once before its first folded
+    crop. Publication passes ``_cyclic_source_checked`` because it checks at its
+    own direction boundaries instead of once per frame.
+    """
     from .sam_mask_reader import effective_candidate_mask
     groups, runs = ((_records_by_id(bundle.groups, "group_id"), _records_by_id(bundle.runs, "run_id"))
                     if _records is None else _records)
@@ -1586,6 +1792,10 @@ def selected_sam_plane(bundle: object, receipt: Mapping[str, object], frame: int
         bbox = tuple(map(int, group['context_bbox_yx']))
         if address is not None:
             from .sam_cyclic import address_for_unfolded_index, transform_crop_between_frame_addresses
+            if not _cyclic_source_checked:
+                from .sam_cyclic import assert_cyclic_implementation_unchanged
+                assert_cyclic_implementation_unchanged()
+                _cyclic_source_checked = True
             target = address_for_unfolded_index(int(frame), native_shape[0],
                 period_degrees=group['frame_addressing']['period_degrees'])
             crop, bbox = transform_crop_between_frame_addresses(crop, bbox, address, target, shape_yx[1])
@@ -1601,11 +1811,13 @@ def selected_sam_plane(bundle: object, receipt: Mapping[str, object], frame: int
 def _publish_directions(bundle: object, receipt: Mapping[str, object], observations: np.ndarray,
                         destination: Path, metadata: Mapping[str, object],
                         pass_index: int, merged_work_dir: Path,
-                        cancel_event: object = None) -> tuple[np.ndarray, list[dict[str, object]], int, dict[str, object]]:
+                        cancel_event: object = None,
+                        resource_profile: object = None) -> tuple[np.ndarray, list[dict[str, object]], int, dict[str, object]]:
     merged = None
     try:
         lookup_bytes = _publication_lookup_reservation(receipt)
-        with bundle.reader(max_cache_bytes=_PUBLICATION_READER_BYTES-lookup_bytes) as reader:
+        allowance = _publication_reader_allowance(bundle, resource_profile)
+        with bundle.reader(max_cache_bytes=allowance-lookup_bytes) as reader:
             selection_view = {**receipt, "mask_filter": reader.filter_snapshot(receipt)}
             selection_view.pop('branch_selection', None)
             if lookup_bytes:
@@ -1616,7 +1828,7 @@ def _publish_directions(bundle: object, receipt: Mapping[str, object], observati
                 if len(frozen_ids) == count and len(selected) == count:
                     selection_view['selected_run_ids'] = frozen_ids
             lookup = _build_publication_frame_lookup(reader, selection_view, observations.shape[1:],
-                reserved_bytes=lookup_bytes)
+                reserved_bytes=lookup_bytes, allowance=allowance)
             if lookup is None and lookup_bytes:
                 selection_view['selected_run_ids'] = receipt.get('selected_run_ids', ())
             merged, components, added = _publish_directions_with_reader(reader, receipt,
@@ -1653,10 +1865,16 @@ def _publish_directions_with_reader(bundle: object, receipt: Mapping[str, object
             directional_run_ids = [str(identifier) for identifier in (selection_view or receipt).get("selected_run_ids", ())
                                    if runs[str(identifier)]["direction"] in (sign, direction)]
             active_frames_set = set()
+            cyclic_direction = False
             for identifier in directional_run_ids:
                 group = groups[str(runs[identifier]["group_id"])]
                 addresses = None
                 if group.get("frame_addressing"):
+                    if not cyclic_direction:
+                        # Direction-start boundary for every folded crop below.
+                        from .sam_cyclic import assert_cyclic_implementation_unchanged
+                        assert_cyclic_implementation_unchanged()
+                        cyclic_direction = True
                     addresses = _publication_frame_addresses(bundle, group)
                 branch = receipt.get('branch_selection')
                 if branch is not None:
@@ -1693,7 +1911,7 @@ def _publish_directions_with_reader(bundle: object, receipt: Mapping[str, object
                             writer.consume_empty_range(next_unwritten, frame - next_unwritten)
                         plane = selected_sam_plane(bundle, selection_view or receipt, frame, shape[1:],
                             direction=sign, _records=((bundle.groups, bundle.runs) if _lookup is not None else (groups, runs)),
-                            _lookup=_lookup)
+                            _lookup=_lookup, _cyclic_source_checked=cyclic_direction)
                         # The write contract is additive. Guard this invariant again
                         # at publication in case a corrupt/custom evidence writer errs.
                         if np.any(plane & (np.asarray(observations[frame]) != 0)):
@@ -1718,6 +1936,10 @@ def _publish_directions_with_reader(bundle: object, receipt: Mapping[str, object
                     if next_unwritten < shape[0]:
                         writer.consume_empty_range(next_unwritten, shape[0] - next_unwritten)
                     _check_cancelled(cancel_event)
+                    if cyclic_direction:
+                        # Closing boundary: no folded store finalizes after a change.
+                        from .sam_cyclic import assert_cyclic_implementation_unchanged
+                        assert_cyclic_implementation_unchanged()
                     store_meta = writer.finalize()
                     store_meta.update(sam_selection_identity=str(receipt.get('selection_identity', '')),
                         sam_selection_resources=_plain(receipt.get('selection_resources', {})))
@@ -1793,6 +2015,9 @@ def interpolate_sam_view_volume_pass(
     crop_retry_policy: object = None,
     retry_image_provider: object = None,
     _observation_inventory: object = None,
+    image_cohorts: object = None,
+    image_cohort_provider: object = None,
+    image_cohort_prefetch: object = None,
 ) -> tuple[np.ndarray, dict[str, object], list[dict[str, object]]]:
     """Generate one SAM planning round from immutable detector observations.
 
@@ -1800,7 +2025,74 @@ def interpolate_sam_view_volume_pass(
     caller-owned immutable native uint8 cache reference; no images survive in
     this function after a bounded independent run. Never pass a bridge-mutated
     volume as ``observation_volume``. The returned merged mmap is caller-owned.
+
+    ``image_cohorts`` (two or more complete-group cohorts of ``prepared_plan``)
+    replace ``image_provider`` when the whole pass exceeds its image cache cap.
+    Only tracking is split: one writer, selection and publication cover the
+    pass, and each cohort lease is retired before the next one is entered.
     """
+    options = dict(image_provider=image_provider, view=view, work_dir=work_dir,
+        pass_index=pass_index, gap_distance=gap_distance, min_radius=min_radius,
+        search_angle_deg=search_angle_deg, interpolation_walk_back=interpolation_walk_back,
+        interpolation_candidates=interpolation_candidates, workers=workers, wrap_axis=wrap_axis,
+        runtime=runtime, scope=scope, upstream_lineage=upstream_lineage,
+        return_bridge_components=return_bridge_components, interpolation_passes=interpolation_passes,
+        policy=policy, spacing_zyx=spacing_zyx, planner_limits=planner_limits,
+        canonical_labels=canonical_labels, runtime_work_dir=runtime_work_dir,
+        cancel_event=cancel_event, prepared_plan=prepared_plan, crop_mode=crop_mode,
+        resource_profile=resource_profile, crop_retry_policy=crop_retry_policy,
+        retry_image_provider=retry_image_provider, _observation_inventory=_observation_inventory)
+    if image_cohorts is None:
+        if image_cohort_provider is not None or image_cohort_prefetch is not None:
+            raise ValueError("SAM image cohort providers require explicit image cohorts")
+        return _interpolate_sam_view_volume_pass(observation_volume, **options)
+    cohorts = tuple(image_cohorts)
+    if prepared_plan is None or not prepared_plan.needs_tracking or int(gap_distance) <= 0:
+        raise ValueError("SAM interpolation image cohorts require an active prepared plan")
+    if image_provider is not None:
+        raise ValueError("SAM interpolation image cohorts replace the single image provider")
+    if not callable(image_cohort_provider):
+        raise ValueError("SAM image cohorts require a lifetime-managed image provider")
+    if image_cohort_prefetch is not None and not callable(image_cohort_prefetch):
+        raise ValueError("SAM image cohort prefetch must be callable")
+    if len(cohorts) < 2:
+        raise ValueError("SAM interpolation uses its ordinary single image provider for one cohort")
+    if not callable(getattr(runtime, "release_source_cache", None)):
+        raise RuntimeError("Multiple SAM image cohorts require a worker source-cache retirement barrier")
+    from .sam_extrapolation import _validate_image_cohorts
+    _validate_image_cohorts(prepared_plan, cohorts)
+    leases = _SamImageCohortLeases(cohorts, image_cohort_provider, image_cohort_prefetch,
+        runtime=runtime, cancel_event=cancel_event)
+    try:
+        try:
+            options["image_provider"] = leases.enter(0)
+        except Exception as error:
+            raise SamImageCohortAdmissionError(error) from error
+        return _interpolate_sam_view_volume_pass(observation_volume, **options,
+            _image_cohort_leases=leases)
+    finally:
+        leases.close(sys.exc_info()[1])
+
+
+def _interpolate_sam_view_volume_pass(
+    observation_volume: np.ndarray, *, image_provider: object = None, view: object = None,
+    work_dir: Path, pass_index: int = 1, gap_distance: int = 15, min_radius: float = 3.0,
+    search_angle_deg: float = 15.0, interpolation_walk_back: int = 1,
+    interpolation_candidates: int = 1, workers: int = 1, wrap_axis: bool = False,
+    runtime: object = None, scope: object = "sam", upstream_lineage: object = None,
+    return_bridge_components: bool = False, interpolation_passes: int = 1,
+    policy: object = None, spacing_zyx: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    planner_limits: object = None, canonical_labels: np.ndarray | None = None,
+    runtime_work_dir: Path | None = None,
+    cancel_event: object = None,
+    prepared_plan: SamPreparedInterpolationPass | None = None,
+    crop_mode: str | None = None,
+    resource_profile: object = None,
+    crop_retry_policy: object = None,
+    retry_image_provider: object = None,
+    _observation_inventory: object = None,
+    _image_cohort_leases: _SamImageCohortLeases | None = None,
+) -> tuple[np.ndarray, dict[str, object], list[dict[str, object]]]:
     # Tracking remains owned by the runtime; this hint bounds authenticated
     # independent CPU measurements after all raw proposals have completed.
     started = time.perf_counter()
@@ -1970,6 +2262,15 @@ def interpolate_sam_view_volume_pass(
         if gate_identity:
             metadata.setdefault("gate_support_fingerprints", {})[
                 str(upstream_lineage.get("parent_scope", "parent_bridge"))] = gate_identity
+    if _image_cohort_leases is not None:
+        # The pass-level image_snapshot_sha256 is the first cohort's image; the
+        # complete-group partition (each cohort's demand identity) is part of
+        # the scope, and every cohort image is recorded before commit.
+        metadata["image_cohort_plan"] = [dict(cohort_id=str(cohort.cohort_id),
+            group_ids=list(map(str, cohort.group_ids)), payload_bytes=int(cohort.payload_bytes))
+            for cohort in _image_cohort_leases.cohorts]
+        metadata["input_fingerprints"]["image_cohort_plan"] = hashlib.sha256(json.dumps(
+            [item["cohort_id"] for item in metadata["image_cohort_plan"]]).encode("utf-8")).hexdigest()
     scope_hash = hashlib.sha256(json.dumps(_plain(metadata), sort_keys=True).encode("utf-8")).hexdigest()[:20]
     family_configuration = os.environ.get('YOLO_TTA_SAM_FAMILY_SCHEDULE')
     family_setting = ('fifo' if family_configuration is None else family_configuration).strip().lower()
@@ -2080,9 +2381,150 @@ def interpolate_sam_view_volume_pass(
     assembly_root = ((Path(runtime_work_dir) / scope_hash) if runtime_work_dir is not None else
                      destination / "_runtime") / "tile_assemblies"
     result_stream = None
-    with _tracker_scope_admission(runtime,prepared_plan,cache_ref,
+    cohort_run_images = {}
+    cohort_submission_order = []
+    if _image_cohort_leases is not None:
+        stats['image_cohort_receipts'] = []
+
+    def _cohort_results():
+        """Track complete-group image cohorts; yield the consumer's global indices."""
+        from .sam_extrapolation import _cancelled, _bind_image_cache
+        leases = _image_cohort_leases
+        global_work = {str(item.run_id): index for index, item in enumerate(tracking_work)}
+        inverse_order = {work: position for position, work in enumerate(execution_order)}
+        stream = None
+        try:
+            for cohort_index, cohort in enumerate(leases.cohorts):
+                _check_cancelled(cancel_event)
+                if _cancelled(runtime, cancel_event):
+                    raise SamInterpolationInfrastructureError(
+                        "SAM interpolation cancelled before image cohort generation")
+                subset = cohort.prepared
+                if cohort_index:
+                    provider = leases.enter(cohort_index)
+                    cohort_cache = getattr(provider, "cache_ref", provider)
+                else:
+                    cohort_cache = cache_ref
+                _bind_image_cache(metadata, cohort_cache, subset, writer, operation="interpolation")
+                if (cohort_index and cohort_cache is not None and not hasattr(runtime, "iter_results")
+                        and hasattr(runtime, "set_source_cache")):
+                    runtime.set_source_cache(cohort_cache)
+                cohort_identity = str(getattr(cohort_cache, "identity_sha256", "") or "")
+                cohort_work = subset.tracker_jobs if resolved_mode == "tiled" else subset.runs
+                local_to_global = tuple(global_work[str(item.run_id)] for item in cohort_work)
+                local_order = subset.execution_order(worker_count)
+                local_requested = []
+                local_receipt = []
+                requires_local_receipt = False
+                with _tracker_scope_admission(runtime, subset, cohort_cache,
+                        None if resolved_mode == "tiled" else resource_profile, worker_count,
+                        family=family_dispatch) as cohort_permit:
+                    if family_dispatch:
+                        from .sam_tracker_runtime import SamTrackerFamily
+                        local_runs = subset.runs
+                        local_families = {}
+                        for index, run in enumerate(local_runs):
+                            local_families.setdefault(str(run.group_id), []).append(index)
+                        def local_request(index, _runs=local_runs, _requested=local_requested):
+                            if (isinstance(index, bool) or not isinstance(index, (int, np.integer))
+                                    or not 0 <= int(index) < len(_runs)):
+                                raise SamInterpolationInfrastructureError(
+                                    "SAM family factory requested an invalid original job index")
+                            source = _tracker_requests((_runs[int(index)],), groups, observation_by_id,
+                                cancel_event, resource_profile)
+                            try:
+                                request = next(source)
+                                _requested.append(int(index))
+                                return request
+                            finally:
+                                source.close()
+                        def local_submission_order(order, _receipt=local_receipt):
+                            if (_receipt or not isinstance(order, tuple) or any(isinstance(index, bool)
+                                    or not isinstance(index, (int, np.integer)) for index in order)):
+                                raise SamInterpolationInfrastructureError(
+                                    "SAM family submission order receipt is malformed or repeated")
+                            _receipt.append(tuple(int(index) for index in order))
+                        families = tuple(SamTrackerFamily(
+                            family_id=identity, input_indices=tuple(indices),
+                            run_ids=tuple(str(local_runs[index].run_id) for index in indices),
+                            request_factory=local_request,
+                            frame_work_proxy=sum(len(local_runs[index].expected_frames) for index in indices))
+                            for identity, indices in local_families.items())
+                        try:
+                            parameters = inspect.signature(runtime.iter_family_results).parameters
+                        except (TypeError, ValueError):
+                            parameters = {}
+                        declared_receipt = parameters.get("execution_order_callback")
+                        requires_local_receipt = (declared_receipt is not None
+                            and declared_receipt.kind != inspect.Parameter.POSITIONAL_ONLY)
+                        options = ({"execution_order_callback": local_submission_order}
+                            if requires_local_receipt or any(parameter.kind == inspect.Parameter.VAR_KEYWORD
+                                for parameter in parameters.values()) else {})
+                        if cohort_permit is not None:
+                            options["scope_admission"] = cohort_permit
+                        options.update(_family_preparation_options(runtime, subset, local_runs, groups,
+                            observation_by_id, cancel_event, resource_profile, cohort_permit, local_requested))
+                        stream = runtime.iter_family_results(families, source_cache_ref=cohort_cache,
+                            max_in_flight=min(worker_count, sam_worker_count(runtime, legacy=cohort_permit is None)),
+                            defer_refill_until_consumed=bool(subset.cpu_wave_admission.get(
+                                "defer_refill_until_consumed", False)),
+                            **options)
+                    elif resolved_mode == "tiled":
+                        cohort_submission_order.extend(local_to_global[index] for index in local_order)
+                        stream = _iterate_tiled_tracker_results(runtime, subset, worker_count, groups,
+                            observation_by_id, cohort_cache, cancel_event, resource_profile)
+                    else:
+                        cohort_submission_order.extend(local_to_global[index] for index in local_order)
+                        stream = _iterate_tracker_results(runtime, _tracker_request_stream(subset,
+                            tuple(cohort_work[index] for index in local_order), groups, observation_by_id,
+                            cancel_event, resource_profile, cohort_permit), cohort_cache,
+                            subset.cpu_wave_admission, scope_admission=cohort_permit)
+                    try:
+                        for local_index, result in stream:
+                            valid = (not isinstance(local_index, (bool, np.bool_))
+                                and isinstance(local_index, (int, np.integer))
+                                and 0 <= int(local_index) < len(cohort_work))
+                            if not valid:
+                                yield -1, result
+                                continue
+                            position = int(local_index) if family_dispatch else local_order[int(local_index)]
+                            global_index = local_to_global[position]
+                            item = tracking_work[global_index]
+                            parent = item.original_run if resolved_mode == "tiled" else item
+                            cohort_run_images[str(parent.run_id)] = cohort_identity
+                            yield (global_index if family_dispatch else inverse_order[global_index]), result
+                            del result
+                    finally:
+                        if stream is not None:
+                            stream.close()
+                        stream = None
+                    if assemblies:
+                        raise SamInterpolationInfrastructureError(
+                            "SAM image cohort omitted a declared tiled child")
+                    if family_dispatch:
+                        scoped = local_receipt[0] if local_receipt else tuple(local_requested)
+                        if (requires_local_receipt and not local_receipt
+                                or len(scoped) != len(local_runs) or set(scoped) != set(range(len(local_runs)))
+                                or scoped != tuple(local_requested)):
+                            raise SamInterpolationInfrastructureError(
+                                "SAM family submission order differs from original job ownership")
+                        family_requested_order.extend(local_to_global[index] for index in scoped)
+                        cohort_submission_order.extend(local_to_global[index] for index in scoped)
+                stats['image_cohort_receipts'].append(dict(cohort_id=cohort.cohort_id,
+                    group_ids=list(cohort.group_ids), payload_bytes=int(cohort.payload_bytes),
+                    generated_jobs=len(cohort_work), consumer_barrier_complete=True,
+                    image_snapshot_sha256=cohort_identity,
+                    image_sampling_backend=metadata.get("image_sampling_sources", {}).get(cohort_identity)))
+                # Retire this cohort's descriptor before staging the next one.
+                leases.release_current()
+        finally:
+            if stream is not None:
+                stream.close()
+
+    with (nullcontext(None) if _image_cohort_leases is not None else
+          _tracker_scope_admission(runtime,prepared_plan,cache_ref,
             None if resolved_mode=='tiled' else resource_profile,worker_count,
-            family=family_dispatch) as permit:
+            family=family_dispatch)) as permit:
         writer = SamEvidenceWriter(destination / "evidence", metadata)
         try:
             def write_group(group):
@@ -2106,7 +2548,9 @@ def interpolate_sam_view_volume_pass(
                     for parent_index in prepared_plan.tile_inventory:
                         write_empty_tiles(parent_index)
             tracker_started = time.perf_counter()
-            if family_dispatch:
+            if _image_cohort_leases is not None:
+                result_stream = _cohort_results()
+            elif family_dispatch:
                 try:
                     parameters = inspect.signature(runtime.iter_family_results).parameters
                 except (TypeError, ValueError):
@@ -2152,7 +2596,8 @@ def interpolate_sam_view_volume_pass(
                         write_group(group)
                         if resolved_mode == "whole":
                             generated_by_index[run_index] = _store_generated_parent_run(writer, run, result,
-                                group, observation_by_id, metadata, upstream_lineage)
+                                group, observation_by_id, metadata, upstream_lineage,
+                                image_snapshot_sha256=cohort_run_images.get(str(run.run_id)))
                         else:
                             write_empty_tiles(run_index)
                             for identity_key in ("sam_model", "sam_runtime"):
@@ -2179,7 +2624,8 @@ def interpolate_sam_view_volume_pass(
                                     if identity_key in metadata:
                                         assembled_result.receipt[identity_key] = metadata[identity_key]
                                 generated_by_index[run_index] = _store_generated_parent_run(writer, run, assembled_result,
-                                    group, observation_by_id, metadata, upstream_lineage, assembly.availability())
+                                    group, observation_by_id, metadata, upstream_lineage, assembly.availability(),
+                                    image_snapshot_sha256=cohort_run_images.get(str(run.run_id)))
                                 del assembled_result
                                 assembly.close()
                                 del assemblies[run_index]
@@ -2204,6 +2650,19 @@ def interpolate_sam_view_volume_pass(
                 stats['sam_execution_order'] = list(scoped_order)
                 stats['sam_execution_order_provenance'] = ('scope_owned_request_factory'
                     if family_submission_receipt is None else 'completed_iterator_submission_receipt')
+            if _image_cohort_leases is not None:
+                cohorts = _image_cohort_leases.cohorts
+                stats['sam_execution_order'] = list(cohort_submission_order)
+                stats['sam_execution_order_provenance'] = 'image_cohort_submission_receipts'
+                stats.update(image_cohort_count=len(cohorts),
+                    image_cohort_max_bytes=max(int(cohort.payload_bytes) for cohort in cohorts),
+                    image_cohort_total_bytes=sum(int(cohort.payload_bytes) for cohort in cohorts))
+                cohort_images = [str(receipt.get("image_snapshot_sha256", "") or "")
+                                 for receipt in stats['image_cohort_receipts']]
+                aggregate = hashlib.sha256(json.dumps(cohort_images).encode("utf-8")).hexdigest()
+                for record in (metadata, writer.scope):
+                    record["image_cohort_snapshot_sha256s"] = list(cohort_images)
+                    record.setdefault("input_fingerprints", {})["image_cohort_snapshots"] = aggregate
             if resolved_mode == "tiled":
                 stats["sam_tiled_child_jobs_generated"] = len(completed_jobs)
                 stats["sam_tiled_parent_runs_generated"] = len(generated_by_index)
@@ -2268,7 +2727,9 @@ def interpolate_sam_view_volume_pass(
                 destination=destination, metadata=metadata, runtime=runtime,
                 retry_policy=crop_retry_policy, retry_image_provider=retry_image_provider,
                 policy=policy, resource_profile=resource_profile, min_radius=float(min_radius),
-                upstream_lineage=upstream_lineage, cancel_event=cancel_event)
+                upstream_lineage=upstream_lineage, cancel_event=cancel_event,
+                original_image_identities=(dict(cohort_run_images)
+                    if _image_cohort_leases is not None else None))
         stats['sam_crop_retry'] = retry_receipt
         stats['sam_crop_retry_wall_seconds'] = time.perf_counter()-retry_started
         generated = [dict(run) for run in bundle.runs.values()]
@@ -2287,7 +2748,8 @@ def interpolate_sam_view_volume_pass(
         write_json_atomic(destination / "selection.json", _plain(receipt))
         with _trace_sam_phase('publication', metadata.get('scope_id', ''), operation='interpolation'):
             merged, components, added, publication_cache_stats = _publish_directions(bundle, receipt, observations,
-                destination, metadata, int(pass_index), merged_directory, cancel_event)
+                destination, metadata, int(pass_index), merged_directory, cancel_event,
+                resource_profile=resource_profile)
         stats["sam_publication_mask_reader"] = publication_cache_stats
         if not added:
             if (observations.flags.writeable and prepared_plan.observation_snapshot_sha256
@@ -2347,4 +2809,6 @@ def interpolate_sam_view_volume_pass(
 
 __all__ = ["SamInterpolationInfrastructureError", "SamPreparedInterpolationPass",
            "prepare_sam_interpolation_pass", "interpolate_sam_view_volume_pass",
+           "refuse_sam_interpolation_image_groups", "SAM_IMAGE_CACHE_GROUP_REFUSAL",
+           "SamImageCohortAdmissionError",
            "observation_snapshot_sha256", "selected_sam_plane"]

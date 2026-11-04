@@ -596,14 +596,26 @@ def _publish_incomplete_tta_manifest(*, path, manifest, artifact_identities):
         assert_artifacts_unchanged=assert_tta_artifacts_unchanged, write_manifest=write_json_manifest)
 
 
-def _require_sam_requested_work_complete(omissions):
-    if omissions:
-        runtime_telemetry().gauge('pipeline.phase', 'incomplete')
-        raise RuntimeError(f'Requested SAM work incomplete: {len(omissions)} affected scopes, '
-            f"{sum(bool(item['unresolved_plan']) for item in omissions)} unresolved plans, "
-            f"{sum(int(item['unresolved_group_count']) for item in omissions)} unresolved groups; "
-            f"reasons={','.join(sorted({reason for item in omissions for reason in item['reasons']}))}; "
-            'valid outputs were preserved.')
+def _report_sam_requested_work_status(omissions):
+    """Finish a run whose requested SAM work was partly skipped.
+
+    Skipped SAM groups are recorded in the manifest (status=incomplete) and the
+    summary, and the run exits normally. Set YOLO_TTA_SAM_REQUIRE_COMPLETE=1 to
+    fail the run instead.
+    """
+    if not omissions:
+        runtime_telemetry().gauge('pipeline.phase', 'complete')
+        return
+    runtime_telemetry().gauge('pipeline.phase', 'incomplete')
+    message = (f'Requested SAM work incomplete: {len(omissions)} affected scopes, '
+        f"{sum(bool(item['unresolved_plan']) for item in omissions)} unresolved plans, "
+        f"{sum(int(item['unresolved_group_count']) for item in omissions)} unresolved groups; "
+        f"reasons={','.join(sorted({reason for item in omissions for reason in item['reasons']}))}; "
+        'valid outputs were preserved.')
+    if os.environ.get('YOLO_TTA_SAM_REQUIRE_COMPLETE', '0').strip().lower() in {'1', 'true', 'yes', 'on'}:
+        raise RuntimeError(message)
+    print(f'WARNING: {message} The manifest records this run as incomplete '
+          '(YOLO_TTA_SAM_REQUIRE_COMPLETE=1 makes this an error).', flush=True)
 
 def _create_tracked_thread_pool(
     *,
@@ -2444,6 +2456,8 @@ def _main_impl() -> None:
             progressive_startup=True,
             startup_pending_host_bytes=_sam_startup_checkpoint_promises,
             gray_cache_root=sam_gray_cache_root,
+            gpu_image_source_resident=any(str(view.family) == 'azimuthal' and not is_tilted_azimuthal_view(view)
+                                          for view in views),
             interpolation_policy_enabled=(interpolation_settings.enabled and
                                           interpolation_settings.backend == 'sam'),
             source_resize_semantics=('native' if not cube_resize_will_apply else
@@ -2640,9 +2654,31 @@ def _main_impl() -> None:
             # executor joins: captures must settle before the shared CPU pool.
             _run_resources().track_closeable(capture_owner)
             runtime_telemetry().gauge('confidence.terminal_capture_budget', capture_budget)
+            # Compile score masking now, before inference threads contend for the GIL.
+            from .confidence_capture_cpu import warm_terminal_score_kernels
+            runtime_telemetry().gauge('confidence.terminal_score_only.kernel_warmup',
+                                      warm_terminal_score_kernels())
             print(f"Terminal confidence capture: slots={capture_budget['slots']}, "
                   f"independent workspace={capture_budget['capture_workspace_bytes']/GIB:.2f}GiB, "
                   f"numeric staging={capture_budget['numeric_stage_bytes']/GIB:.2f}GiB.")
+    # Compile the nogil GIL-hot-spot kernels while this process is still quiet.
+    # A first call under inference/post-processing thread load can take minutes.
+    # Serial on purpose: PTA can fork, and a fork during a background compile
+    # would copy numba's held compiler lock into the child.
+    from .nrrd_sparse_kernels import warm_nrrd_producer_kernels
+    from .interpolation import warm_encoded_block_kernels
+    from .confidence_native_inflate import warm_confidence_inflate_kernels
+    kernel_warmups = [('nrrd_producer', warm_nrrd_producer_kernels),
+                      ('encoded_block', warm_encoded_block_kernels),
+                      ('confidence_inflate', warm_confidence_inflate_kernels)]
+    if any(is_azimuthal_view(candidate) for candidate in views):
+        from .projection_coverage_cpu import warm_angular_key_kernels
+        kernel_warmups.append(('angular_keys', warm_angular_key_kernels))
+    for warm_name, warm in kernel_warmups:
+        warm_started = time.perf_counter()
+        warm_receipt = dict(warm())
+        warm_receipt['wall_seconds'] = time.perf_counter() - warm_started
+        runtime_telemetry().gauge(f'gil_kernels.warmup.{warm_name}', warm_receipt)
     sam_dynamic_memory_partition_enabled = False
     if sam_context is not None:
         sam_context.configure_startup_parent_pool(parent_transient_admission)
@@ -3016,6 +3052,21 @@ def _main_impl() -> None:
             # guards still account for checkpoint codecs and other live work.
             sam_cpu_futures['runtime'] = sam_cpu_prepare_executor.submit(
                 sam_context.prepare_runtime, parent_transient_admission)
+
+    sam_checkpoint_digest_state = {'started': False}
+
+    def _maybe_start_sam_checkpoint_digest():
+        # Opt-in (YOLO_TTA_SAM_CHECKPOINT_DIGEST_PREFETCH): wait for every
+        # detector worker's ready ACK so the read overlaps inference, not
+        # detector model loading. A retired detector no longer needs to wait.
+        if sam_context is None or sam_checkpoint_digest_state['started']:
+            return
+        if (gpu_worker_process_active and not sam_context.detector_retirement_ready
+                and (not gpu_task_queues
+                     or not set(gpu_task_queues) <= set(scheduler_state.gpu_worker_ready_details_by_id))):
+            return
+        sam_checkpoint_digest_state['started'] = True
+        sam_context.start_checkpoint_digest_prefetch()
 
     @scheduler_operation('sam_cpu_source_poll')
     def _maybe_prepare_sam_cpu_source():
@@ -4953,6 +5004,7 @@ def _main_impl() -> None:
             or (inference_worker_process_active and scheduler.process_inference_outstanding())))
         _maybe_prepare_sam_runtime()
         _maybe_prepare_sam_cpu_source()
+        _maybe_start_sam_checkpoint_digest()
         direct_union_capacity_released = False
         while True:
             try:
@@ -8882,6 +8934,7 @@ def _main_impl() -> None:
                 'interpolation': {
                     'requested_work_complete': not any(item['operation'] == 'interpolation' for item in sam_planning_omissions),
                     'planning_omissions': [item for item in sam_planning_omissions if item['operation'] == 'interpolation'],
+                    'sam_pass_failure_policy': getattr(sam_context, 'pass_failure_policy', None),
                     'backend': interpolation_settings.backend,
                     'enabled': interpolation_settings.enabled,
                     'sam_model': str(interpolation_settings.sam_model or ''),
@@ -9042,8 +9095,7 @@ def _main_impl() -> None:
     pipeline_wall_seconds = float(time.perf_counter() - pipeline_wall_started)
     runtime_telemetry().gauge('post_inference_tail.seconds', post_inference_tail_seconds)
     runtime_telemetry().gauge('pipeline.wall_seconds', pipeline_wall_seconds)
-    _require_sam_requested_work_complete(sam_planning_omissions)
-    runtime_telemetry().gauge('pipeline.phase', 'complete')
+    _report_sam_requested_work_status(sam_planning_omissions)
     print(f'\nPost-inference final assembly/output tail: {post_inference_tail_seconds:.1f}s.')
     print(f'End-to-end pipeline walltime: {pipeline_wall_seconds:.1f}s.')
     print('\nDone.')

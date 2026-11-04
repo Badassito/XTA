@@ -300,13 +300,34 @@ class ArrayCheckpoint:
                 reference = ConfidenceEvidenceRef.open(self.path)
                 if tuple(reference.storage_shape) != tuple(self.shape):
                     raise RuntimeError('SAM score checkpoint grid differs from its native owner')
-                with reference.native_reader() as reader:
-                    for z in range(self.shape[0]):
+                from .confidence_storage import BLOCK_LAYOUT, BLOCK_SCHEMA, BlockScoreReader
+                if (reference.metadata.get('schema') == BLOCK_SCHEMA
+                        and reference.metadata.get('layout') == BLOCK_LAYOUT):
+                    # The same reader native_reader() delegates to for this
+                    # layout. Decode whole frames per GIL-free native call and
+                    # assign straight into the restore array: per-block Python
+                    # zlib convoys on the busy main process's GIL.
+                    def check_stop():
                         if stop is not None and stop.is_set():
                             raise RuntimeError('SAM compact parent restore cancelled')
-                        for y0,y1,x0,x1,crop in reader.iter_crops(z):
-                            output[z,y0:y1,x0:x1] = crop
-                            decoded_bytes += int(crop.nbytes)
+                    progress = {}
+                    reader = BlockScoreReader(reference)
+                    try:
+                        reader.scatter_into(output, before_batch=check_stop, progress=progress)
+                    finally:
+                        reader.close()
+                        decoded_bytes += int(progress.get('decoded_bytes', 0))
+                        if metrics is not None:
+                            metrics.update(decode_backend=progress.get('decode_backend'),
+                                           decode_batches=int(progress.get('decode_batches', 0)))
+                else:
+                    with reference.native_reader() as reader:
+                        for z in range(self.shape[0]):
+                            if stop is not None and stop.is_set():
+                                raise RuntimeError('SAM compact parent restore cancelled')
+                            for y0,y1,x0,x1,crop in reader.iter_crops(z):
+                                output[z,y0:y1,x0:x1] = crop
+                                decoded_bytes += int(crop.nbytes)
             else:
                 raise ValueError('Unknown SAM checkpoint encoding')
             return output
@@ -592,6 +613,12 @@ def checkpoint_parent(task, root, source_root, required_bytes, stop, *, owned_in
         raise
 
 
+def _cheap_overflow_shares_turns():
+    """YOLO_TTA_SAM_PARENT_CHEAP_OVERFLOW_LAST=1 restores queueing them last."""
+    return os.environ.get('YOLO_TTA_SAM_PARENT_CHEAP_OVERFLOW_LAST', '0').strip().lower() not in {
+        '1', 'true', 'yes', 'on'}
+
+
 class DeferredSamParentQueue:
     """Scheduler-thread queue with a bounded RAM backlog and no SAM waits."""
 
@@ -746,8 +773,26 @@ class DeferredSamParentQueue:
         # scheduler slice permits only one costly denial probe.
         expensive = self._prepare_scan_order
         cpu = self._prepare_cpu_scan_order
-        selected = [saved[0] for saved in self._selected_cpu_prepares(cpu_active) if saved[0] in cpu]
+        selected_saved = self._selected_cpu_prepares(cpu_active)
+        selected = [saved[0] for saved in selected_saved if saved[0] in cpu]
         unselected = [key for key in cpu if key not in selected]
+        if unselected and expensive and _cheap_overflow_shares_turns():
+            # Cheap parents left out only because both protected lanes are
+            # busy compete in the same size/age turns instead of waiting behind
+            # every expensive parent; a large Cartesian view queued last
+            # otherwise starts its whole SAM chain at the end of the run.
+            # Parents that do not fit free dense memory keep the old last
+            # place, so an oversize owner cannot take an emergency grant first.
+            free = (max(0, self.dense_limit-sum(self.leases.inference_bytes.values())
+                        -sum(self.leases.postprocess_bytes.values()))
+                    -sum(saved[2] for saved in selected_saved))
+            required = {saved[0]: saved[2] for saved in self._waiting_cpu_prepares()}
+            overflow = [key for key in unselected if required.get(key, 0) <= free]
+            if overflow:
+                turn = (lambda key: (-self._prepare_arrivals[key]['cost_bytes'] if size_turn else 0,
+                                     self._prepare_arrivals[key]['sequence']))
+                expensive = sorted(expensive+overflow, key=turn)
+                unselected = [key for key in unselected if key not in overflow]
         # Start GPU work, then fill the CPU lanes before the rest of the GPU wave.
         if cpu_first:
             order = selected+expensive+unselected
@@ -1354,7 +1399,8 @@ class DeferredSamParentQueue:
                             record[kind+'_restore_seconds'] = max(0., time.perf_counter()-restore_started-allocation)
                             record[kind+'_decoded_bytes'] = metrics.get('decoded_bytes', 0)
                             for field in ('startup_ram_admitted', 'startup_headroom_bytes',
-                                          'startup_required_host_bytes'):
+                                          'startup_required_host_bytes', 'decode_backend',
+                                          'decode_batches'):
                                 if field in metrics:
                                     record[kind+'_'+field] = metrics[field]
                         setattr(task, name, array)

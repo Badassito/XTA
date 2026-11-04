@@ -3568,6 +3568,141 @@ class RawBBoxSlicePayload:
     payload: bytes = b''
     foreground_voxels: int = 0
 
+_ENCODED_RECORD_FIELDS = ('z', 'y0', 'y1', 'x0', 'x1', 'foreground', 'offset', 'size')
+_encoded_record_getter = operator.attrgetter(*_ENCODED_RECORD_FIELDS)
+# Kernel status -> the exact ValueError text of the original per-record validator.
+_ENCODED_BLOCK_ERRORS = {
+    1: 'encoded slice coordinates are invalid',
+    2: 'encoded crop size/count/offset is invalid',
+    3: 'encoded payload ends inside a slice',
+    4: 'encoded row padding bits must be zero',
+    5: 'encoded payload has unclaimed bytes',
+}
+
+
+@_numba.njit(nogil=True, cache=False)  # type: ignore[misc]
+def _encoded_block_validate_kernel(fields, data, first, height, width, packed):
+    """Check an encoded block's addressing contract in record order.
+
+    ``fields`` rows are (z, y0, y1, x0, x1, foreground, offset, size). Returns
+    0 or the first failing check's status, in the order the scalar validator
+    raised them. Every value fits int64 and is bounded by the store geometry
+    before it enters arithmetic, so no step can overflow.
+    """
+    cursor = np.int64(0)
+    total = np.int64(data.size)
+    for i in range(fields.shape[0]):
+        z, y0, y1, x0, x1 = fields[i, 0], fields[i, 1], fields[i, 2], fields[i, 3], fields[i, 4]
+        foreground, offset, size = fields[i, 5], fields[i, 6], fields[i, 7]
+        if (z != first + i or not (0 <= y0 and y0 <= y1 and y1 <= height)
+                or not (0 <= x0 and x0 <= x1 and x1 <= width)):
+            return 1
+        area = (y1 - y0) * (x1 - x0)
+        row_bytes = ((x1 - x0 + 7) // 8) if packed else (x1 - x0)
+        expected_size = (y1 - y0) * row_bytes
+        if (offset != cursor or size != expected_size or foreground < 0 or foreground > area
+                or (foreground == 0 and (area != 0 or y0 != 0 or y1 != 0 or x0 != 0 or x1 != 0))
+                or (foreground > 0 and area == 0)):
+            return 2
+        cursor += size
+        if cursor > total:
+            return 3
+        tail = (x1 - x0) % 8
+        if packed and size != 0 and tail != 0:
+            tail_mask = np.uint8((0xff << tail) & 0xff)
+            last = offset + row_bytes - 1
+            for _row in range(y1 - y0):
+                if data[last] & tail_mask:
+                    return 4
+                last += row_bytes
+    if cursor != total:
+        return 5
+    return 0
+
+
+@_numba.njit(nogil=True, cache=False)  # type: ignore[misc]
+def _encoded_block_commit_kernel(fields, index, slice_state, base_offset):
+    """Publish validated records into CTILE_INDEX_DTYPE rows and slice states.
+
+    Returns (nonempty, foreground, min_t, max_t, min_y, max_y, min_x, max_x)
+    for the block; the extents are meaningful only when nonempty > 0.
+    """
+    stats = np.empty(8, np.int64)
+    stats[0] = 0
+    stats[1] = 0
+    stats[2] = np.iinfo(np.int64).max
+    stats[3] = -1
+    stats[4] = np.iinfo(np.int64).max
+    stats[5] = -1
+    stats[6] = np.iinfo(np.int64).max
+    stats[7] = -1
+    for i in range(fields.shape[0]):
+        z, y0, y1, x0, x1 = fields[i, 0], fields[i, 1], fields[i, 2], fields[i, 3], fields[i, 4]
+        foreground, offset, size = fields[i, 5], fields[i, 6], fields[i, 7]
+        if foreground != 0:
+            index[z].kind = np.uint8(1)
+            index[z].offset = np.uint64(base_offset + offset)
+            index[z].payload_size = np.uint64(size)
+            index[z].y0 = np.uint32(y0)
+            index[z].y1 = np.uint32(y1)
+            index[z].x0 = np.uint32(x0)
+            index[z].x1 = np.uint32(x1)
+            index[z].payload_nbytes = np.uint64((y1 - y0) * (x1 - x0))
+            stats[0] += 1
+            stats[1] += foreground
+            stats[2] = min(stats[2], z)
+            stats[3] = max(stats[3], z)
+            stats[4] = min(stats[4], y0)
+            stats[5] = max(stats[5], y1 - 1)
+            stats[6] = min(stats[6], x0)
+            stats[7] = max(stats[7], x1 - 1)
+        slice_state[z] = np.uint8(2)
+    return stats
+
+
+def _encoded_record_fields(records, count: int) -> Optional[np.ndarray]:
+    """Gather record integers into one int64 (count, 8) array, or None.
+
+    None (any attribute/index failure, a value outside int64, or a sequence
+    whose iteration disagrees with ``len``) sends the caller to the scalar
+    validator, which reproduces the original per-record error order exactly.
+    """
+    try:
+        flat: List[int] = []
+        extend, get, as_index = flat.extend, _encoded_record_getter, operator.index
+        for record in records:
+            extend(map(as_index, get(record)))
+        fields = np.array(flat, dtype=np.int64)
+    except Exception:
+        return None
+    if fields.size != int(count) * 8:
+        return None
+    return fields.reshape(int(count), 8)
+
+
+def warm_encoded_block_kernels() -> Dict[str, object]:
+    """Compile every encoded-block writer signature before the main process is busy.
+
+    Production passes a freshly built writable int64 field array, a writable
+    or readonly contiguous uint8 payload (borrowed slots and GPU pull buffers),
+    and the writer's own writable CTILE_INDEX_DTYPE index and uint8 states.
+    Packed and unpacked validation share one bool signature.
+    """
+    started = time.perf_counter()
+    fields = np.asarray([[0, 0, 1, 0, 3, 2, 0, 1]], np.int64)
+    for readonly in (False, True):
+        data = np.ones(1, np.uint8)
+        if readonly:
+            data.setflags(write=False)
+        _encoded_block_validate_kernel(fields, data, 0, 1, 3, True)
+        _encoded_block_validate_kernel(fields, data, 0, 1, 3, False)
+    index = np.zeros(1, CTILE_INDEX_DTYPE)
+    _encoded_block_commit_kernel(fields, index, np.zeros(1, np.uint8), 0)
+    return dict(seconds=time.perf_counter() - started,
+                validate_signatures=len(_encoded_block_validate_kernel.nopython_signatures),
+                commit_signatures=len(_encoded_block_commit_kernel.nopython_signatures))
+
+
 class IncrementalRawBBoxMaskStoreWriter:
     """Thread-safe raw-bbox writer fed by completed projection blocks.
 
@@ -3723,6 +3858,64 @@ class IncrementalRawBBoxMaskStoreWriter:
         data = np.asarray(payload)
         if data.dtype != np.uint8 or data.ndim != 1 or not data.flags.c_contiguous:
             raise ValueError(f'{self.desc}: encoded payload must be contiguous uint8 bytes')
+        fields = _encoded_record_fields(records, count)
+        if fields is None:
+            fields = self._encoded_fields_scalar(first, records, data, packed)
+        else:
+            # One nogil call replaces per-record Python validation and the
+            # per-frame padding scans; statuses map to the original messages.
+            status = int(_encoded_block_validate_kernel(fields, data, first, int(self.shape[1]),
+                                                        int(self.shape[2]), bool(packed)))
+            if status:
+                raise ValueError(f'{self.desc}: {_ENCODED_BLOCK_ERRORS[status]}')
+        with self._lock:
+            if self._failed_reason is not None:
+                return
+            if self._finalized or self._fd is None:
+                raise RuntimeError(f'{self.desc}: encoded block arrived after store closure')
+            if np.any(self._slice_state[first:first + count] != 0):
+                raise ValueError(f'{self.desc}: encoded slices were delivered more than once')
+            fd, base_offset = self._fd, self._next_offset
+            self._next_offset += int(data.size)
+            self._slice_state[first:first + count] = np.uint8(1)
+            self._active_callbacks += 1
+        try:
+            if data.size:
+                self._pwrite_all(fd, memoryview(data).cast('B'), int(base_offset))
+            with self._lock:
+                if self._failed_reason is not None:
+                    return
+                if int(fields.shape[0]) != count:
+                    # A sequence whose iteration disagrees with len() can name
+                    # slices past the reserved range, even past the index end.
+                    # The original Python loop raises the same IndexError there
+                    # after publishing the earlier records; the unchecked kernel
+                    # must never see such rows.
+                    self._encoded_commit_python(fields, int(base_offset))
+                    return
+                stats = _encoded_block_commit_kernel(fields, self.index, self._slice_state,
+                                                     int(base_offset))
+                nonempty, foreground, min_t, max_t, min_y, max_y, min_x, max_x = (int(v) for v in stats)
+                if nonempty:
+                    self._nonempty_slices += nonempty
+                    self._foreground_voxels += foreground
+                    self._min_t, self._max_t = min(self._min_t, min_t), max(self._max_t, max_t)
+                    self._min_y, self._max_y = min(self._min_y, min_y), max(self._max_y, max_y)
+                    self._min_x, self._max_x = min(self._min_x, min_x), max(self._max_x, max_x)
+        except BaseException as exc:
+            self.abort(exc)
+            raise
+        finally:
+            with self._lock:
+                self._active_callbacks -= 1
+
+    def _encoded_fields_scalar(self, first: int, records: Sequence[object], data: np.ndarray,
+                               packed: bool) -> np.ndarray:
+        """Original per-record validator, kept for records the fast gather rejects.
+
+        It preserves the exact attribute/index/overflow error order for unusual
+        record objects. Accepted values are bounded by the store geometry.
+        """
         entries = []
         cursor = 0
         for index, record in enumerate(records):
@@ -3747,47 +3940,31 @@ class IncrementalRawBBoxMaskStoreWriter:
                 tail_bytes = data[offset:cursor].reshape(y1 - y0, row_bytes)[:, -1]
                 if np.any(tail_bytes & tail_mask):
                     raise ValueError(f'{self.desc}: encoded row padding bits must be zero')
-            entries.append((z, y0, y1, x0, x1, foreground, offset, size, area))
+            entries.append((z, y0, y1, x0, x1, foreground, offset, size))
         if cursor != data.size:
             raise ValueError(f'{self.desc}: encoded payload has unclaimed bytes')
-        with self._lock:
-            if self._failed_reason is not None:
-                return
-            if self._finalized or self._fd is None:
-                raise RuntimeError(f'{self.desc}: encoded block arrived after store closure')
-            if np.any(self._slice_state[first:first + count] != 0):
-                raise ValueError(f'{self.desc}: encoded slices were delivered more than once')
-            fd, base_offset = self._fd, self._next_offset
-            self._next_offset += int(data.size)
-            self._slice_state[first:first + count] = np.uint8(1)
-            self._active_callbacks += 1
-        try:
-            if data.size:
-                self._pwrite_all(fd, memoryview(data).cast('B'), int(base_offset))
-            with self._lock:
-                if self._failed_reason is not None:
-                    return
-                for z, y0, y1, x0, x1, foreground, offset, size, area in entries:
-                    rec = self.index[z]
-                    if foreground:
-                        rec['kind'] = np.uint8(1)
-                        rec['offset'] = np.uint64(base_offset + offset)
-                        rec['payload_size'] = np.uint64(size)
-                        rec['y0'], rec['y1'] = np.uint32(y0), np.uint32(y1)
-                        rec['x0'], rec['x1'] = np.uint32(x0), np.uint32(x1)
-                        rec['payload_nbytes'] = np.uint64(area)
-                        self._nonempty_slices += 1
-                        self._foreground_voxels += foreground
-                        self._min_t, self._max_t = min(self._min_t, z), max(self._max_t, z)
-                        self._min_y, self._max_y = min(self._min_y, y0), max(self._max_y, y1 - 1)
-                        self._min_x, self._max_x = min(self._min_x, x0), max(self._max_x, x1 - 1)
-                    self._slice_state[z] = np.uint8(2)
-        except BaseException as exc:
-            self.abort(exc)
-            raise
-        finally:
-            with self._lock:
-                self._active_callbacks -= 1
+        return np.array(entries, dtype=np.int64).reshape(len(entries), 8)
+
+    def _encoded_commit_python(self, fields: np.ndarray, base_offset: int) -> None:
+        """Original per-record commit loop (caller holds the lock), for blocks
+        whose record count differs from ``len(records)``; numpy bounds checks
+        raise exactly where the original did."""
+        for z, y0, y1, x0, x1, foreground, offset, size in fields.tolist():
+            area = (y1 - y0) * (x1 - x0)
+            rec = self.index[z]
+            if foreground:
+                rec['kind'] = np.uint8(1)
+                rec['offset'] = np.uint64(base_offset + offset)
+                rec['payload_size'] = np.uint64(size)
+                rec['y0'], rec['y1'] = np.uint32(y0), np.uint32(y1)
+                rec['x0'], rec['x1'] = np.uint32(x0), np.uint32(x1)
+                rec['payload_nbytes'] = np.uint64(area)
+                self._nonempty_slices += 1
+                self._foreground_voxels += foreground
+                self._min_t, self._max_t = min(self._min_t, z), max(self._max_t, z)
+                self._min_y, self._max_y = min(self._min_y, y0), max(self._max_y, y1 - 1)
+                self._min_x, self._max_x = min(self._min_x, x0), max(self._max_x, x1 - 1)
+            self._slice_state[z] = np.uint8(2)
 
     def consume_empty_range(self, z0: int, count: int) -> None:
         """Register a proven-empty contiguous slice range without scanning dense planes."""
@@ -4449,6 +4626,17 @@ class RawBBoxMaskStore:
         slice_bytes = int(h) * int(w)
         slices_per_member = max(1, int(member_bytes) // max(1, int(slice_bytes)))
 
+        # Fused path: one nogil decode/assembly (+ mirror tee) call per member group.
+        # Inputs the reference path would reject fall through so it raises unchanged.
+        from .nrrd_sparse_kernels import fused_store_view, iter_native_member_groups
+        view = fused_store_view(self)
+        if view is not None and view.valid(np.arange(int(z0), int(z1), dtype=np.int64)):
+            yield from iter_native_member_groups(
+                view, int(z0), int(z1), int(slices_per_member), int(slice_bytes), sparse_consumer,
+            )
+            return
+        view = None
+
         for first_z in range(int(z0), int(z1), int(slices_per_member)):
             last_z_exclusive = min(int(z1), int(first_z) + int(slices_per_member))
             ln = int(last_z_exclusive - first_z) * int(slice_bytes)
@@ -4521,6 +4709,24 @@ class RawBBoxMaskStore:
         z1 = int(np.clip(int(z_stop), z0, out_t))
         slice_bytes = int(out_h) * int(out_w)
         slices_per_member = max(1, int(member_bytes) // max(1, int(slice_bytes)))
+
+        # Fused path: one nogil decode/restore/OR (+ mirror tee) call per member group.
+        # Inputs the reference path would reject fall through so it raises unchanged.
+        from .nrrd_sparse_kernels import (
+            fused_store_view, iter_restored_member_groups, restore_source_csr,
+        )
+        view = fused_store_view(self)
+        if view is not None and int(out_t) > 0:
+            source_ptr, source_index = restore_source_csr(int(in_t), int(out_t))
+            used = source_index[int(source_ptr[int(z0)]):int(source_ptr[int(z1)])]
+            if view.valid(used):
+                yield from iter_restored_member_groups(
+                    view, (int(out_t), int(out_h), int(out_w)), int(z0), int(z1),
+                    int(slices_per_member), int(slice_bytes),
+                    source_ptr, source_index, sparse_consumer,
+                )
+                return
+        view = None
 
         for first_z in range(int(z0), int(z1), int(slices_per_member)):
             last_z_exclusive = min(int(z1), int(first_z) + int(slices_per_member))
@@ -4611,6 +4817,10 @@ class RawBBoxMaskStore:
         _invalidate_raw_store_chunks_ram_cache(self.chunks_path)
         release_memfd_owners_under(self.root)
         shutil.rmtree(self.root, ignore_errors=True)
+
+# The fused NRRD producer (nrrd_sparse_kernels) reproduces exactly this decode. A
+# replaced or overriding decode_slice_crop lacks the marker and keeps the reference path.
+RawBBoxMaskStore.decode_slice_crop._xta_fused_decode_equivalent = True  # type: ignore[attr-defined]
 
 def materialize_raw_bbox_mask_store_workspace(
     store_path: Path,

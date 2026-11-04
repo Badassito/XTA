@@ -12,7 +12,7 @@ from . import __version__
 
 
 SCRIPT_VERSION = __version__
-SCRIPT_BASENAME = f"GPT-6-Astra-Ultra_v{SCRIPT_VERSION}_SLURM.py"
+SCRIPT_BASENAME = f"Opus-5.5_v{SCRIPT_VERSION}_SLURM.py"
 MODE_CHOICES = ("tta", "pta", "lta")
 
 

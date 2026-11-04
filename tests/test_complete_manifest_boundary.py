@@ -71,8 +71,9 @@ class CompleteManifestBoundaryTests(unittest.TestCase):
         omission = dict(operation='interpolation', scope_id='model/azimuthal/fullframe', view='azimuthal',
                         pass_index=1, status='unresolved', reasons=['observation_inventory_memory_limit'],
                         unresolved_plan=True, unresolved_group_count=0, group_refusal_reasons={})
-        for omissions in ([omission], []):
-            with self.subTest(incomplete=bool(omissions)):
+        cases = (([omission], None), ([omission], '1'), ([], None), ([], '1'))
+        for omissions, strict in cases:
+            with self.subTest(incomplete=bool(omissions), strict=strict):
                 events = []
                 telemetry = mock.MagicMock()
                 telemetry.gauge.side_effect = lambda name, value: events.append((name, value))
@@ -81,22 +82,30 @@ class CompleteManifestBoundaryTests(unittest.TestCase):
                     kwargs['after_close']()
                 namespace = dict(_close_tta_output_artifacts=retire,
                     _finalize_selected_run_after_output_close=lambda: events.append('finalized'),
-                    _require_sam_requested_work_complete=pipeline._require_sam_requested_work_complete,
+                    _report_sam_requested_work_status=pipeline._report_sam_requested_work_status,
                     runtime_telemetry=lambda: telemetry, output_artifacts=None, keep_temp_artifacts=False,
                     tail_tile_slice_workers=1, sam_planning_omissions=omissions,
                     time=SimpleNamespace(perf_counter=lambda: 1.), post_inference_tail_started=0.,
                     pipeline_wall_started=0., out_dir=Path('out'), temp_dir=Path('temp'),
                     final_paths={}, summary_path=None, run_manifest_path=None)
                 text = io.StringIO()
-                with mock.patch.object(pipeline, 'runtime_telemetry', return_value=telemetry), contextlib.redirect_stdout(text):
-                    if omissions:
+                env = {} if strict is None else {'YOLO_TTA_SAM_REQUIRE_COMPLETE': strict}
+                with (mock.patch.object(pipeline, 'runtime_telemetry', return_value=telemetry),
+                      mock.patch.dict(pipeline.os.environ, env), contextlib.redirect_stdout(text)):
+                    if strict is None:
+                        pipeline.os.environ.pop('YOLO_TTA_SAM_REQUIRE_COMPLETE', None)
+                    if omissions and strict:
                         with self.assertRaisesRegex(RuntimeError, 'valid outputs were preserved'):
                             exec(code, namespace)
                     else:
                         exec(code, namespace)
                 self.assertEqual(events[:2], ['retired', 'finalized'])
-                self.assertIn(('pipeline.phase', 'incomplete' if omissions else 'complete'), events)
-                self.assertEqual('Done.' in text.getvalue(), not bool(omissions))
+                phases = [event[1] for event in events if isinstance(event, tuple) and event[0] == 'pipeline.phase']
+                self.assertEqual(phases, ['incomplete' if omissions else 'complete'])
+                failed = bool(omissions and strict)
+                self.assertEqual('Done.' in text.getvalue(), not failed)
+                self.assertEqual('WARNING: Requested SAM work incomplete' in text.getvalue(),
+                                 bool(omissions and not strict))
 
     def test_tta_finalize_facade_preserves_private_callback_patch_seams(self) -> None:
         manifest_path = Path("manifest.json")

@@ -99,6 +99,7 @@ from .inference import (
 from .cuda_backend import (
     GpuRenderedYoloSource,
     GpuTileRenderedYoloSource,
+    gpu_projection_overlap_reserve_bytes,
     gpu_worker_fused_preflight_specs,
 )
 
@@ -450,6 +451,55 @@ class _MainProcessGpuStageLease:
         except Exception:
             pass
 
+class _MainProcessGpuOverlapLease:
+    """Shared main-process lease: one bounded source projection beside inference.
+
+    The holder may own at most ``budget_bytes`` of device memory. Elastic
+    inference-side sizing excludes that slice (``gpu_sizing_free_bytes``), and
+    the lease is granted only when the slice plus a margin is live-free.
+    Inference dispatch continues on the device while this lease is held.
+    """
+
+    overlap = True
+
+    def __init__(self, coordinator: '_MainProcessGpuStageCoordinator', device_index: int,
+                 purpose: str, token: object, budget_bytes: int) -> None:
+        self._coordinator = coordinator
+        self.device_index = int(device_index)
+        self.purpose = str(purpose)
+        self.budget_bytes = int(budget_bytes)
+        self._token = token
+        self._released = False
+        runtime_trace_event('gpu_stage_acquired', device=f'cuda:{self.device_index}',
+                            purpose=self.purpose, overlap=True, budget_bytes=self.budget_bytes)
+
+    def torch_device(self, torch_mod: object) -> object:
+        return torch_mod.device(f'cuda:{int(self.device_index)}')
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._coordinator.release_overlap_stage(self.device_index, self.purpose, token=self._token)
+        runtime_trace_event('gpu_stage_released', device=f'cuda:{self.device_index}',
+                            purpose=self.purpose, overlap=True)
+
+    def promote_residency(self):
+        raise RuntimeError('A shared overlap lease cannot become model residency')
+
+    def __enter__(self) -> '_MainProcessGpuOverlapLease':
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.release()
+
+    def __del__(self) -> None:  # pragma: no cover - final safety net
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
 class _MainProcessGpuResidencyLease:
     """A live model's allocator fence; garbage collection cannot release it."""
     def __init__(self, coordinator, device_index, purpose, token):
@@ -514,6 +564,11 @@ class _MainProcessGpuStageCoordinator:
         self._worker_devices: set[int] = set()
         self._inference_inflight: Counter[int] = Counter()
         self._stage_leases: Dict[int, str] = {}
+        # Shared source-projection leases beside inference: device -> (purpose, token).
+        self._overlap_leases: Dict[int, Tuple[str, object]] = {}
+        self._overlap_declined: set = set()
+        self._overlap_acquisitions = 0
+        self._overlap_budget_declines = 0
         self._resident_owners = {}
         self._stage_tokens: Dict[int, object] = {}
         self._stage_claims: Dict[int, Tuple[object, object]] = {}
@@ -552,6 +607,8 @@ class _MainProcessGpuStageCoordinator:
             self._worker_devices = {int(v) for v in worker_devices}
             self._inference_inflight.clear()
             self._stage_leases.clear()
+            self._overlap_leases.clear()
+            self._overlap_declined.clear()
             self._pending_inference_backlog = False
             self._spherical_retirement_pressure = False
             self._spherical_retirement_requests.clear()
@@ -823,6 +880,8 @@ class _MainProcessGpuStageCoordinator:
             self._worker_devices.clear()
             self._inference_inflight.clear()
             self._stage_leases.clear()
+            self._overlap_leases.clear()
+            self._overlap_declined.clear()
             self._inference_priority_active = False
             self._inference_asset_retirement_pending = False
             self._retired_inference_devices.clear()
@@ -926,7 +985,7 @@ class _MainProcessGpuStageCoordinator:
                     return False
             elif not (resident['lendable'] and self._is_spherical_retirement(purpose)):
                 return False
-        if (device in self._stage_leases
+        if (device in self._stage_leases or device in self._overlap_leases
                 or (device in self._provisional_stages
                     and self._provisional_stages[device] is not provisional)
                 or (resident_token is None and self._priority_blocks_stage_locked(device, purpose))):
@@ -1058,6 +1117,104 @@ class _MainProcessGpuStageCoordinator:
         runtime_trace_event('gpu_residency_released', device=f'cuda:{device}')
         return True
 
+    def _overlap_device_eligible_locked(self, device: int) -> bool:
+        return (device in self._worker_devices
+                and device not in self._stage_leases
+                and device not in self._overlap_leases
+                and device not in self._resident_owners
+                and device not in self._provisional_stages
+                and device not in self._retired_inference_devices)
+
+    def try_acquire_overlap_stage(self, torch_mod: object, purpose: str,
+                                  budget_bytes: int) -> Optional[_MainProcessGpuOverlapLease]:
+        """Share a busy inference GPU with one bounded source projection.
+
+        Only source projections (the retirement purposes) qualify, only while
+        inference is queued or running (idle GPUs keep the exclusive path, which
+        may use all free memory), and at most one per device. The holder must stay
+        within ``budget_bytes``; inference-side sizing already excludes that slice.
+        Returns None without waiting or touching the exclusive retirement queue.
+        """
+        purpose = str(purpose)
+        budget = int(budget_bytes)
+        if budget <= 0 or not self._is_spherical_retirement(purpose):
+            return None
+        with self._lock:
+            if (purpose in self._overlap_declined or self._inference_asset_retirement_pending
+                    or not (self._pending_inference_backlog or any(self._inference_inflight.values()))):
+                return None
+            epoch = self._epoch
+            candidates = [device for device in sorted(self._worker_devices)
+                          if self._overlap_device_eligible_locked(device)]
+        if not candidates:
+            return None
+        try:
+            count = int(torch_mod.cuda.device_count())
+        except Exception:
+            return None
+        # Measure outside the lock: CUDA may wait on another context.
+        margin = int(max(0.0, _env_float('YOLO_TTA_GPU_PROJECTION_OVERLAP_MARGIN_GIB', 1.0)) * GIB)
+        estimates: List[Tuple[int, int]] = []
+        for device in candidates:
+            if not 0 <= device < count:
+                continue
+            try:
+                free_bytes, _total = torch_mod.cuda.mem_get_info(torch_mod.device(f'cuda:{int(device)}'))
+            except Exception:
+                continue
+            if int(free_bytes) >= budget + margin:
+                estimates.append((int(free_bytes), int(device)))
+        callback: Optional[Callable[[], None]] = None
+        claimed: Optional[Tuple[int, object]] = None
+        with self._lock:
+            if self._epoch != epoch:
+                return None
+            for _free, device in sorted(estimates, key=lambda item: (-item[0], item[1])):
+                if not self._overlap_device_eligible_locked(device):
+                    continue
+                token = object()
+                self._overlap_leases[device] = (purpose, token)
+                self._overlap_acquisitions += 1
+                # This projection no longer needs an exclusive retirement turn.
+                self._spherical_retirement_requests.pop(purpose, None)
+                self._reserved_spherical_device_locked()
+                callback = self._wake_callback
+                claimed = (device, token)
+                break
+        if claimed is None:
+            return None
+        # Like exclusive leases, build (and trace) the lease outside the lock.
+        try:
+            lease = _MainProcessGpuOverlapLease(self, claimed[0], purpose, claimed[1], budget)
+        except BaseException:
+            self.release_overlap_stage(claimed[0], purpose, token=claimed[1])
+            raise
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
+        return lease
+
+    def release_overlap_stage(self, device_index: int, purpose: str, *, token: object) -> None:
+        callback: Optional[Callable[[], None]] = None
+        with self._lock:
+            current = self._overlap_leases.get(int(device_index))
+            if current is not None and current[0] == str(purpose) and current[1] is token:
+                self._overlap_leases.pop(int(device_index), None)
+                callback = self._wake_callback
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def decline_overlap(self, purpose: str) -> None:
+        """This projection needs more than the shared slice; use the exclusive path."""
+        with self._lock:
+            self._overlap_declined.add(str(purpose))
+            self._overlap_budget_declines += 1
+
     def try_acquire_specific_stage(
         self,
         torch_mod: object,
@@ -1183,6 +1340,9 @@ class _MainProcessGpuStageCoordinator:
                 'retired_inference_devices': sorted(self._retired_inference_devices),
                 'inference_inflight': dict(self._inference_inflight),
                 'stage_leases': dict(self._stage_leases),
+                'overlap_leases': {device: lease[0] for device, lease in self._overlap_leases.items()},
+                'overlap_acquisitions': int(self._overlap_acquisitions),
+                'overlap_budget_declines': int(self._overlap_budget_declines),
                 'resident_owners': {device: {key: owner[key] for key in ('purpose', 'lendable', 'quarantined', 'reason')}
                     for device, owner in self._resident_owners.items()},
                 'provisional_stage_devices': sorted(self._provisional_stages),
@@ -1231,6 +1391,31 @@ def _set_main_process_gpu_pending_inference(active: bool) -> None:
 def _set_main_process_gpu_spherical_retirement_pressure(active: bool) -> None:
     _MAIN_PROCESS_GPU_STAGE_COORDINATOR.set_spherical_retirement_pressure(bool(active))
 
+
+def _try_acquire_main_process_overlap_gpu_stage(
+    torch_mod: object,
+    purpose: str,
+) -> Optional[_MainProcessGpuOverlapLease]:
+    """A shared lease within the reserved overlap slice, or None (use the exclusive path)."""
+    budget = gpu_projection_overlap_reserve_bytes()
+    if budget <= 0:
+        return None
+    lease = _MAIN_PROCESS_GPU_STAGE_COORDINATOR.try_acquire_overlap_stage(torch_mod, str(purpose), budget)
+    if lease is not None:
+        _overlap_telemetry('gpu.projection_overlap.acquired', 1)
+    return lease
+
+def _overlap_telemetry(name: str, value: int) -> None:
+    try:
+        runtime_telemetry().add(name, int(value))
+    except Exception:
+        pass  # Diagnostics never decide device ownership.
+
+def _decline_main_process_overlap(purpose: str, required_bytes: Optional[int] = None) -> None:
+    _MAIN_PROCESS_GPU_STAGE_COORDINATOR.decline_overlap(str(purpose))
+    _overlap_telemetry('gpu.projection_overlap.budget_declines', 1)
+    if required_bytes is not None:
+        _overlap_telemetry('gpu.projection_overlap.declined_required_bytes', int(required_bytes))
 
 def _cancel_main_process_spherical_retirement_request(purpose: str, *, failed: bool = False) -> None:
     _MAIN_PROCESS_GPU_STAGE_COORDINATOR.cancel_spherical_retirement_request(str(purpose), failed=failed)
@@ -4507,6 +4692,46 @@ def _native_pull_cuda_stage_enabled(view, plan):
         and os.environ.get('CUDA_VISIBLE_DEVICES', '').strip() != '-1')
 
 
+def _try_native_pull_overlap_stage(view, plan, make_session, purpose, admission):
+    """Run beside inference inside the reserved slice when the session fits it."""
+    if gpu_projection_overlap_reserve_bytes() <= 0:
+        return None
+    try:
+        import torch
+    except ImportError:
+        return None
+    from .native_pull_cuda import NativePullCudaSession, NativePullCudaUnavailable, NativePullCudaUnsafeFailure
+    lease = _try_acquire_main_process_overlap_gpu_stage(torch, purpose)
+    if lease is None:
+        return None
+    try:
+        session = make_session(NativePullCudaSession, device_index=lease.device_index,
+            max_device_bytes=int(lease.budget_bytes),
+            max_upload_bytes=max(1, _env_int('YOLO_TTA_NATIVE_PULL_GPU_UPLOAD_MIB', 8)) * 1024**2)
+        stage = _NativePullCudaStage(session, lease)
+        admission('admitted_overlap', device=int(lease.device_index),
+                  allowed_device_bytes=int(lease.budget_bytes),
+                  required_device_bytes=int(getattr(session, 'device_bytes', 0)))
+        return stage
+    except NativePullCudaUnsafeFailure as exc:
+        exc.stage_lease = lease
+        admission('unsafe_cuda_failure', detail=str(exc), device=int(lease.device_index))
+        raise
+    except NativePullCudaUnavailable as exc:
+        # Declared admission refusal before any device ownership: the exclusive
+        # path (which may use all free memory) remains available for this view.
+        lease.release()
+        required = (getattr(exc, 'details', None) or {}).get('required_device_bytes')
+        _decline_main_process_overlap(purpose, required)
+        runtime_telemetry().gauge('projection.native_cuda_overlap_decline.' + str(view.name), {
+            'reason': getattr(exc, 'reason_code', 'unavailable'), 'required_device_bytes': required,
+            'allowed_device_bytes': int(lease.budget_bytes)})
+        return None
+    except BaseException:
+        lease.release()
+        raise
+
+
 def _try_admitted_native_pull_cuda_stage(view, plan, make_session, *, retry_state=None):
     """Acquire exact native CUDA only after inference permits device borrowing."""
     def admission(reason, *, retryable=False, detail=None, device=None, **metrics):
@@ -4524,6 +4749,9 @@ def _try_admitted_native_pull_cuda_stage(view, plan, make_session, *, retry_stat
         admission('disabled_or_unsupported')
         return None
     purpose = _native_pull_cuda_stage_purpose(view)
+    overlap = _try_native_pull_overlap_stage(view, plan, make_session, purpose, admission)
+    if overlap is not None:
+        return overlap
     # Queue/eligibility accounting performs no CUDA calls. The exclusive lease
     # below remains authoritative if dispatch changes during runtime imports.
     if not _MAIN_PROCESS_GPU_STAGE_COORDINATOR.can_attempt_source_projection(purpose):

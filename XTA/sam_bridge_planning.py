@@ -42,13 +42,21 @@ def _identity(kind: str, *values: object) -> str:
     return f"{kind}_{hashlib.sha256(payload).hexdigest()[:24]}"
 
 
+_TOPOLOGY_BUDGET_DEFAULTS = {'max_topology_workspace_bytes': None, 'topology_bytes_per_voxel': 16,
+                             'topology_fixed_bytes': 0}
+_GROUP_IDENTITY_EXCLUDED_BOUNDS = frozenset({
+    'max_contract_metadata_bytes', 'max_topology_workspace_bytes',
+    'topology_bytes_per_voxel', 'topology_fixed_bytes'})
+
+
 @dataclass(frozen=True)
 class SamPlanningLimits:
     max_observations: int = 200_000
     max_observation_bytes: int = 512 * 1024 * 1024
     max_slice_pixels: int = 16_777_216
     max_endpoints_per_group: int = 1024
-    max_observations_per_group: int = 1024
+    # None: no count cap; the contract byte limits bound family memory.
+    max_observations_per_group: int | None = None
     max_edges_per_group: int = 256
     max_proposed_edges: int = 100_000
     max_frame_address_records: int = 100_000
@@ -60,12 +68,19 @@ class SamPlanningLimits:
     context_margin_px: int = 24
     acceptance_margin_px: int = 8
     curvature_margin_px: int = 8
+    # Selection's topology workspace budget, so planning refuses (with a reason)
+    # any group that selection would reject. None keeps only the 16 B/voxel
+    # contract-budget check. Excluded from group identities.
+    max_topology_workspace_bytes: int | None = None
+    topology_bytes_per_voxel: int = 16
+    topology_fixed_bytes: int = 0
 
     def __post_init__(self) -> None:
         for key, value in vars(self).items():
-            if key == "max_frames_per_group" and value is None:
+            if key in ("max_frames_per_group", "max_observations_per_group",
+                       "max_topology_workspace_bytes") and value is None:
                 continue
-            if int(value) < (0 if key.endswith("margin_px") else 1):
+            if int(value) < (0 if key.endswith(("margin_px", "fixed_bytes")) else 1):
                 raise ValueError(f"{key} has an invalid planning bound")
 
 
@@ -707,13 +722,20 @@ def _empty_contracts() -> np.ndarray:
     return _readonly(np.empty((0, 0, 0), dtype=bool))
 
 
-def _contract_materialization(pixels, frames, edges, endpoints, observations, streamed):
+def _candidate_edge_count(endpoints, graph) -> int:
+    """Endpoint pairs the streamed contracts retain as candidate corridors."""
+    return sum(1 for source in endpoints for target in graph.get(source, ())
+               if target in endpoints and source < target)
+
+
+def _contract_materialization(pixels, frames, edges, endpoints, observations, streamed,
+                              candidate_edges=None):
     dense = pixels * (2 * frames * (5 + 2 * edges) + 4 * endpoints + 16)
     details = dict(dense_contract_peak_bytes=dense, charged_contract_bytes=dense,
                    contract_materialization='dense')
     if streamed:
         from .sam_interpolation_contracts import streaming_sam_contract_peak_bytes
-        peak = streaming_sam_contract_peak_bytes(pixels, frames, edges, observations)
+        peak = streaming_sam_contract_peak_bytes(pixels, frames, edges, observations, candidate_edges)
         details['streamed_contract_peak_bytes'] = peak
         if peak < dense:
             details.update(charged_contract_bytes=peak, contract_materialization='streamed_planes')
@@ -965,7 +987,8 @@ def expand_sam_bridge_group_context(group: SamBridgeGroup, crop_bbox_yx: BBoxYX,
         raise MemoryError('SAM retry crop exceeds its explicit pixel cap')
     materialization = _contract_materialization(pixels, len(group.frame_indices), len(group.edges),
         len(group.endpoint_ids), len(group.observation_ids),
-        'streamed_contract_peak_bytes' in group.crop_contract)
+        'streamed_contract_peak_bytes' in group.crop_contract,
+        _candidate_edge_count(recipe.endpoints, recipe.graph))
     charge = materialization['charged_contract_bytes']
     if (charge > recipe.bounds.max_group_bytes
             or charge > recipe.lease_budget.maximum_bytes):
@@ -1089,15 +1112,20 @@ def plan_sam_bridges(
             frame_addressing.get("alias_frames", 0), cyclic_implementation_sha256,
             SAM_CONTRACT_STORAGE_VERSION if lazy_contracts else "eager", *storage)
     limit_items = tuple((key, value) for key, value in vars(bounds).items()
-                       if _stream_contracts or key != 'max_contract_metadata_bytes')
+                       if (_stream_contracts or key != 'max_contract_metadata_bytes')
+                       and not (key in _TOPOLOGY_BUDGET_DEFAULTS and value == _TOPOLOGY_BUDGET_DEFAULTS[key]))
     planning_fingerprint = planning_identity(limit_items, *(('streamed_planes',) if _stream_contracts else ()))
-    group_identity_fingerprint = planning_fingerprint
+    # The derived topology budget is resource-only: group identities never see it.
+    group_identity_fingerprint = planning_identity(
+        tuple(item for item in limit_items if item[0] not in _TOPOLOGY_BUDGET_DEFAULTS),
+        *(('streamed_planes',) if _stream_contracts else ()))
     legacy_caps = dict(max_endpoints_per_group=64, max_observations_per_group=512, max_edges_per_group=128)
     if _stream_contracts:
         # Resource-only changes must not reshuffle policy tie breaks for existing work.
         group_identity_fingerprint = planning_identity(tuple(
-            (key, min(value, legacy_caps[key]) if key in legacy_caps else value)
-            for key, value in vars(bounds).items() if key != 'max_contract_metadata_bytes'))
+            (key, (legacy_caps[key] if value is None else min(value, legacy_caps[key]))
+             if key in legacy_caps else value)
+            for key, value in vars(bounds).items() if key not in _GROUP_IDENTITY_EXCLUDED_BOUNDS))
     legacy_inventory_bytes = sum(item.mask_crop.size + 1024 for item in observations) if _stream_contracts else 0
     # Required edges use the bounded nearest-candidate flag. Family inventory also
     # retains other compatible endpoints, so legitimate sibling support is measured
@@ -1233,15 +1261,22 @@ def plan_sam_bridges(
             max(observations[item].bbox_yx[3] for item in family),
         )
         sibling_pad = bounds.curvature_margin_px + bounds.acceptance_margin_px
+        # No count cap by default: the contract byte limits below bound each
+        # family's memory. An explicit cap still refuses the whole family.
+        observation_cap = bounds.max_observations_per_group
+
+        def over_observation_cap() -> bool:
+            return observation_cap is not None and len(family) > observation_cap
+
         for frame in range(lo, hi + 1):
             for item in by_frame.get(frame, ()):
                 record = observations[item]
                 if (record.canonical_label in family_labels
                         and _intersects(record.bbox_yx, family_envelope, sibling_pad)):
                     family.add(item)
-                    if len(family) > bounds.max_observations_per_group:
+                    if over_observation_cap():
                         break
-            if len(family) > bounds.max_observations_per_group:
+            if over_observation_cap():
                 reasons.append("family_observation_limit")
                 break
         pending = list(family)
@@ -1251,7 +1286,7 @@ def plan_sam_bridges(
                 if nearby not in family and lo <= observations[nearby].frame_index <= hi:
                     family.add(nearby)
                     pending.append(nearby)
-            if len(family) > bounds.max_observations_per_group:
+            if over_observation_cap():
                 reasons.append("family_observation_limit")
                 break
         frames = tuple(range(lo, hi + 1))
@@ -1286,8 +1321,9 @@ def plan_sam_bridges(
         if pixels > bounds.max_crop_pixels:
             reasons.append("context_crop_pixel_limit")
         # Charge retained Boolean masks plus one float64 distance/geometry workspace.
+        candidate_edges = _candidate_edge_count(endpoints, graph)
         materialization = _contract_materialization(pixels, len(frames), len(pairs), len(endpoints),
-                                                    len(family), _stream_contracts)
+                                                    len(family), _stream_contracts, candidate_edges)
         charge = materialization['charged_contract_bytes']
         legacy_pixels = (legacy_crop[2] - legacy_crop[0]) * (legacy_crop[3] - legacy_crop[1])
         clamped_sides = tuple(side for side, changed in (
@@ -1316,7 +1352,9 @@ def plan_sam_bridges(
             "crop_pixels": pixels,
             **materialization,
             "legacy_charged_contract_bytes": _contract_materialization(legacy_pixels, len(frames),
-                len(pairs), len(endpoints), len(family), _stream_contracts)['charged_contract_bytes'],
+                len(pairs), len(endpoints), len(family), _stream_contracts,
+                candidate_edges)['charged_contract_bytes'],
+            "candidate_edge_count": candidate_edges,
             "contract_storage_version": SAM_CONTRACT_STORAGE_VERSION if lazy_contracts else "eager",
             "contract_resident_budget_bytes": bounds.max_total_contract_bytes,
         })
@@ -1325,6 +1363,12 @@ def plan_sam_bridges(
         if (charge if lazy_contracts else total_bytes + charge) > bounds.max_total_contract_bytes:
             reasons.append("total_contract_memory_limit")
         if lazy_contracts and len(frames) * pixels * 16 > bounds.max_group_bytes:
+            reasons.append("topology_workspace_memory_limit")
+        elif (bounds.max_topology_workspace_bytes is not None
+                and len(frames) * pixels * bounds.topology_bytes_per_voxel + bounds.topology_fixed_bytes
+                > bounds.max_topology_workspace_bytes):
+            # Same bytes selection will charge; refusing here keeps a too-large
+            # group an unresolved (warned) group instead of a later hard error.
             reasons.append("topology_workspace_memory_limit")
         observation_ids = tuple(observations[item].observation_id for item in sorted(family))
         edge_records = tuple(SamBridgeEdge(_identity("sam_edge", scope_id, observations[a].observation_id,
@@ -1337,7 +1381,8 @@ def plan_sam_bridges(
             legacy_admissible = (
                 legacy_inventory_bytes <= bounds.max_observation_bytes
                 and family_counts[first] <= min(bounds.max_endpoints_per_group, 64)
-                and len(family) <= min(bounds.max_observations_per_group, 512)
+                and len(family) <= (512 if bounds.max_observations_per_group is None
+                                    else min(bounds.max_observations_per_group, 512))
                 and len(pairs) <= min(bounds.max_edges_per_group, 128)
                 and materialization['dense_contract_peak_bytes'] <= min(
                     bounds.max_group_bytes, bounds.max_total_contract_bytes)

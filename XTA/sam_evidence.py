@@ -59,7 +59,29 @@ from .artifact_archive import (artifact_exists, artifact_size, open_artifact,
 
 SCHEMA = "xta.sam_proposals/1"
 TILE_EVIDENCE_SCHEMA = "xta.sam_run_tiles/1"
-INDEX_MAX_BYTES = 128 * 1024**2
+
+
+def _index_max_bytes():
+    """Index JSON bound. The reader decodes it whole (~10x in Python objects).
+
+    128 MiB aborted job 164882 on a sagittal pass; large views need more on big
+    nodes. Not part of any identity: it only bounds metadata size.
+    """
+    raw = os.environ.get('YOLO_TTA_SAM_EVIDENCE_INDEX_MAX_BYTES', '').strip()
+    try:
+        value = int(raw) if raw else 1024**3
+    except ValueError:
+        value = 1024**3
+    return max(1, value)
+
+
+INDEX_MAX_BYTES = _index_max_bytes()
+
+
+def _index_budget_error(size_bytes=None):
+    detail = '' if size_bytes is None else f' ({int(size_bytes)} bytes)'
+    return MemoryError(f'SAM evidence index exceeds bounded metadata budget{detail}: '
+                       f'limit {INDEX_MAX_BYTES} bytes; raise YOLO_TTA_SAM_EVIDENCE_INDEX_MAX_BYTES')
 
 
 def _plain(value):
@@ -109,7 +131,7 @@ def _write_index(path, index):
         for chunk in encoder.iterencode(index):
             # ensure_ascii=True makes character and UTF-8 byte counts equal.
             if written + len(chunk) > INDEX_MAX_BYTES:
-                raise MemoryError('SAM evidence index exceeds bounded metadata budget')
+                raise _index_budget_error()
             encoded = chunk.encode('utf-8')
             stream.write(encoded)
             written += len(encoded)
@@ -277,12 +299,22 @@ def _evidence_frame_geometry(scope, groups, runs):
     return geometry
 
 
-def evidence_frame_geometry(bundle):
-    """Return validated immutable native closure for a bundle or active reader."""
+def _assert_cyclic_source_unchanged(bundle):
+    """Boundary-only cyclic helper source check for cyclic evidence owners."""
     owner = getattr(bundle, 'bundle', bundle)
     if owner.scope.get('frame_addressing'):
         from .sam_cyclic import assert_cyclic_implementation_unchanged
         assert_cyclic_implementation_unchanged()
+
+
+def evidence_frame_geometry(bundle):
+    """Return validated immutable native closure for a bundle or active reader.
+
+    This accessor sits on per-pair/per-frame paths, so it performs no file I/O.
+    The cyclic helper source is checked at bundle open/commit and at the
+    selection, publication and traversal boundaries that consume it.
+    """
+    owner = getattr(bundle, 'bundle', bundle)
     geometry = getattr(owner, '_frame_geometry', None)
     if geometry is None:
         geometry = _freeze(_evidence_frame_geometry(owner.scope, owner.groups, owner.runs))
@@ -334,6 +366,7 @@ class SamEvidenceWriter:
             from .sam_cyclic import IMPLEMENTATION_SHA256
             self.scope.setdefault('cyclic_implementation_sha256', IMPLEMENTATION_SHA256)
         try:
+            _assert_cyclic_source_unchanged(self)
             self._scope_frame_geometry = _scope_frame_geometry(self.scope)
         except BaseException:
             self.abort()
@@ -1073,6 +1106,7 @@ class SamEvidenceWriter:
         self._drain_packing()
         if self._import_source is not None:
             raise RuntimeError("SAM evidence import transaction must finish before publication")
+        _assert_cyclic_source_unchanged(self)
         _evidence_frame_geometry(self.scope, self.groups, self.runs)
         if self._closed:
             raise RuntimeError("SAM evidence writer is already closed")
@@ -1253,7 +1287,7 @@ class SamEvidenceBundle:
             if verify and _file_hash(path) != entry["sha256"]:
                 raise ValueError("SAM evidence file checksum mismatch")
         if manifest["files"]["index.json"]["bytes"] > INDEX_MAX_BYTES:
-            raise MemoryError("SAM evidence index exceeds bounded metadata budget")
+            raise _index_budget_error(manifest["files"]["index.json"]["bytes"])
         encoded_index = read_artifact(self.directory / "index.json", max_bytes=INDEX_MAX_BYTES)
         text = encoded_index.decode(json.detect_encoding(encoded_index), 'surrogatepass')
         del encoded_index
@@ -1270,6 +1304,7 @@ class SamEvidenceBundle:
                 raise ValueError(f"Invalid SAM evidence payload bounds: {key}")
         if (len(self.groups), len(self.runs), len(self.records)) != (manifest["group_count"], manifest["run_count"], manifest["mask_count"]):
             raise ValueError("SAM evidence record counts disagree with manifest")
+        _assert_cyclic_source_unchanged(self)
         self._frame_geometry = _freeze(_evidence_frame_geometry(self.scope, self.groups, self.runs))
         self._frame_geometry_source = self._frame_geometry
         self._frame_geometry_sources = (self.scope, self.groups, self.runs)
@@ -1393,6 +1428,7 @@ def iter_selected_planes(bundle, selection, *, direction=None, pass_index=None):
 
 def _iter_selected_planes(bundle, selection, *, direction=None, pass_index=None):
     from .sam_mask_reader import effective_candidate_mask
+    _assert_cyclic_source_unchanged(bundle)
     evidence_frame_geometry(bundle)
     if selection.get('resolved_policy', {}).get('version') in (4,5) and 'mask_filter' not in selection:
         raise ValueError('Guarded SAM support requires its retained mask filter specification')
@@ -1422,8 +1458,12 @@ def iter_selected_native_crops(bundle, selection, *, direction=None, pass_index=
     by its saved address; spatial/temporal overlaps collapse only when the
     native publication consumer explicitly ORs these crops.
     """
-    from .sam_cyclic import address_for_unfolded_index, transform_crop_between_frame_addresses
+    from .sam_cyclic import (address_for_unfolded_index, transform_crop_between_frame_addresses,
+        assert_cyclic_implementation_unchanged)
     geometry = evidence_frame_geometry(bundle)
+    folded = False
+    # iter_selected_planes checks the cyclic source before the first plane;
+    # the final check below closes the traversal after the last folded crop.
     for group_id, stored_frame, mask in iter_selected_planes(bundle, selection,
             direction=direction, pass_index=pass_index):
         group_geometry = geometry['groups'][str(group_id)]
@@ -1437,8 +1477,11 @@ def iter_selected_native_crops(bundle, selection, *, direction=None, pass_index=
                 period_degrees=geometry['addressing']['period_degrees'])
             mask, bbox = transform_crop_between_frame_addresses(mask, bbox, address, target,
                 geometry['native_shape_tyx'][2])
+            folded = True
         mask.setflags(write=False)
         yield group_id, stored_frame, native_frame, tuple(bbox), mask
+    if folded:
+        assert_cyclic_implementation_unchanged()
 
 
 def selected_native_plane(bundle, selection, frame, *, direction=None, pass_index=None, shape_yx=None):
@@ -1449,6 +1492,8 @@ def selected_native_plane(bundle, selection, frame, *, direction=None, pass_inde
         with bundle.reader() as reader:
             return selected_native_plane(reader, selection, frame, direction=direction,
                 pass_index=pass_index, shape_yx=shape_yx)
+    # One boundary check per public native-plane rebuild, never per folded crop.
+    _assert_cyclic_source_unchanged(bundle)
     geometry = evidence_frame_geometry(bundle)
     native_shape = geometry['native_shape_tyx']
     frame = _frame_integer(frame, 'SAM native output frame')
@@ -1493,13 +1538,16 @@ def selected_native_plane(bundle, selection, frame, *, direction=None, pass_inde
 
 
 def load_sam_online_selection(bundle, *, policy_hash=None, selected_run_ids=None,
-                              max_receipt_bytes=64 * 1024 * 1024):
+                              max_receipt_bytes=None):
     """Read the immutable online selection used by published contributors.
 
     A legacy bundle with no retained receipt has explicitly unfiltered semantics.
     New generator scopes declare that their receipt is required; losing it cannot
     silently turn filtered published support back into raw candidate support.
     """
+    # Same bound as the evidence index it summarizes (was a fixed 64 MiB).
+    if max_receipt_bytes is None:
+        max_receipt_bytes = INDEX_MAX_BYTES
     if not isinstance(bundle, SamEvidenceBundle):
         bundle = SamEvidenceBundle.open(bundle)
     path = bundle.directory / "online_selection.json"

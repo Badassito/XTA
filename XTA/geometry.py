@@ -1191,6 +1191,82 @@ def _azimuthal_sampler_flat_taps(sampler: AzimuthalSampler, image_w: int) -> Tup
     ).reshape(u_len, -1)
     return flat_idx, w2d
 
+_AZIMUTHAL_FANCY_LAYOUT_LOCK = threading.Lock()
+_AZIMUTHAL_FANCY_LAYOUTS: Dict[Tuple[str, str], Optional[Tuple[int, int, int]]] = {}
+
+
+def _mixed_fancy_result_axis_order(dtype, index_dtype) -> Optional[Tuple[int, int, int]]:
+    """Memory axis order (outermost first) of this numpy build's ``a[:, idx2d]`` result.
+
+    A one-time probe with distinct extents fixes the layout instead of assuming
+    numpy's mixed slice/advanced-index allocation policy. ``None`` disables the
+    cache-friendly gather when the probe is not a plain axis permutation.
+    """
+    key = (np.dtype(dtype).str, np.dtype(index_dtype).str)
+    with _AZIMUTHAL_FANCY_LAYOUT_LOCK:
+        if key in _AZIMUTHAL_FANCY_LAYOUTS:
+            return _AZIMUTHAL_FANCY_LAYOUTS[key]
+    probe = np.zeros((2, 64), dtype=dtype)[:, np.zeros((3, 5), dtype=index_dtype)]
+    order: Optional[Tuple[int, int, int]] = tuple(
+        sorted(range(3), key=lambda axis: -int(probe.strides[axis]))
+    )
+    expected = np.empty(tuple(probe.shape[axis] for axis in order), dtype=probe.dtype)
+    if (
+        tuple(probe.shape) != (2, 3, 5)
+        or tuple(expected.transpose(np.argsort(order)).strides) != tuple(probe.strides)
+    ):
+        order = None
+    with _AZIMUTHAL_FANCY_LAYOUT_LOCK:
+        _AZIMUTHAL_FANCY_LAYOUTS[key] = order
+    return order
+
+
+_AZIMUTHAL_TAKE_GATHER_ALIGNMENT_BYTES = 16384
+
+
+def _azimuthal_take_gather_selected(row_stride_bytes: int) -> bool:
+    """``auto`` uses the row-major gather only for set-aliasing plane strides.
+
+    numpy's mixed slice/advanced gather visits every stack row for each tap.
+    When the plane stride is a multiple of 16 KiB those accesses alias the same
+    cache sets/TLB pages (measured 5-10x slower at 512^2, 768^2 and 3072^2);
+    for other strides numpy's own order is already as fast or faster.
+    """
+    mode = str(os.environ.get('YOLO_TTA_AZIMUTHAL_TAKE_GATHER', 'auto')).strip().lower()
+    if mode in {'0', 'false', 'no', 'off'}:
+        return False
+    if mode in {'1', 'true', 'yes', 'on'}:
+        return True
+    return int(row_stride_bytes) % _AZIMUTHAL_TAKE_GATHER_ALIGNMENT_BYTES == 0
+
+
+def _azimuthal_gather_contiguous_block(block2d: np.ndarray, flat_idx: np.ndarray) -> np.ndarray:
+    """Return ``block2d[:, flat_idx]`` with identical values, shape and strides.
+
+    ``np.take`` walks taps inside each stack row. The result is then copied into
+    numpy's advanced-index memory layout so the downstream float conversion
+    and einsum reduction see byte-identical operands (einsum's float reduction
+    order depends on operand strides; a C-contiguous gather changes bits).
+    """
+    if (block2d.ndim != 2 or flat_idx.ndim != 2 or int(block2d.shape[0]) <= 0
+            or not _azimuthal_take_gather_selected(int(block2d.strides[0]))):
+        return block2d[:, flat_idx]
+    order = _mixed_fancy_result_axis_order(block2d.dtype, flat_idx.dtype)
+    if order is None:
+        return block2d[:, flat_idx]
+    rows, u_len, taps = int(block2d.shape[0]), int(flat_idx.shape[0]), int(flat_idx.shape[1])
+    gathered = np.take(block2d, flat_idx, axis=1)
+    if order == (1, 2, 0) and block2d.dtype == np.uint8:
+        # Advanced dimensions outermost, stack rows innermost: one exact byte transpose.
+        base = cv2.transpose(np.ascontiguousarray(gathered).reshape(rows, u_len*taps))
+        return base.reshape(u_len, taps, rows).transpose(2, 0, 1)
+    shape = (rows, u_len, taps)
+    base = np.empty(tuple(shape[axis] for axis in order), dtype=block2d.dtype)
+    out = base.transpose(np.argsort(order))
+    out[...] = gathered
+    return out
+
+
 def azimuthal_oriented_stack_view(volume_rgb: np.ndarray, view: ViewInfo) -> np.ndarray:
     """Return a logical ``(stack, plane_v, plane_u)`` view for a Cartesian Azimuthal base."""
     arr = np.asarray(volume_rgb)
@@ -1263,7 +1339,7 @@ def extract_azimuthal_slice_frame(
         block = volume_rgb[start_idx:stop_idx]
         if contiguous_stack:
             block2d = np.asarray(block).reshape(stop_idx - start_idx, plane_len)
-            selected = block2d[:, flat_idx]
+            selected = _azimuthal_gather_contiguous_block(block2d, flat_idx)
         else:
             # A sagittal/coronal logical stack is a transposed view. Copying
             # the full block here makes each azimuth scan the entire volume;

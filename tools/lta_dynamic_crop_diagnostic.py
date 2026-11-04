@@ -76,7 +76,7 @@ def main():
     label = exemplar_root / (stem + ".txt")
     original_rows = args.label.read_text(encoding="utf-8").splitlines()
     label.write_text(original_rows[selected.row_index] + "\n", encoding="utf-8")
-    launchers = sorted(ROOT.glob("GPT-6-Astra-Ultra_v*_SLURM.py"))
+    launchers = sorted(ROOT.glob("Opus-5.5_v*_SLURM.py"))
     if len(launchers) != 1:
         parser.error("repository must contain one versioned launcher")
     commands = {}

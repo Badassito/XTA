@@ -184,10 +184,12 @@ def radial_source_t_window(view, source_shape, logical_t, frames):
 
 class SamGpuCropRenderer:
     def __init__(self, context, view, source, logical_t, lease, torch, scratch_bytes, *, required_gpu=0,
-                 source_t_window=None, source_frames=(), opportunistic=False):
+                 source_t_window=None, source_frames=(), opportunistic=False, device_scratch_bytes=None):
         self.context, self.view, self.source = context, view, source
         self.logical_t, self.lease, self.torch = int(logical_t), lease, torch
         self.scratch_bytes = int(scratch_bytes)
+        # GPU-only batch workspace; the host scratch/credit charge stays scratch_bytes.
+        self.device_scratch_bytes = max(self.scratch_bytes, int(device_scratch_bytes or 0))
         self.required_gpu = int(required_gpu)
         self.opportunistic = bool(opportunistic)
         self.engine = None
@@ -266,7 +268,7 @@ class SamGpuCropRenderer:
                 free, _total = self.torch.cuda.mem_get_info(self.device_index)
             except RuntimeError:
                 free = 0
-            if int(free) < self.required_gpu:
+            if int(free)+self._parked_source_credit(self.device_index) < self.required_gpu:
                 self.lease.release()
                 self.lease = None
                 raise SamGpuRenderingUnavailable('Idle GPU lacks admitted SAM source/render headroom')
@@ -293,7 +295,8 @@ class SamGpuCropRenderer:
                         admitted = False
                         try:
                             free, _total = self.torch.cuda.mem_get_info(self.device_index)
-                            admitted = int(free) >= self.required_gpu
+                            admitted = (int(free)+self._parked_source_credit(self.device_index)
+                                        >= self.required_gpu)
                         except RuntimeError:
                             pass
                         finally:
@@ -333,6 +336,16 @@ class SamGpuCropRenderer:
             self._compute_service_started = time.monotonic()
             self._resume_gpu_after_yield = False
             return self.engine
+        parked = self._take_parked_source()
+        if parked is not None:
+            self.engine = parked
+            self._uploaded_source_key = self._source_handoff_key()
+            from .runtime import runtime_telemetry
+            runtime_telemetry().add('sam.gpu_images.gpu_admissions', 1)
+            runtime_telemetry().add('sam.gpu_images.source_upload_bytes_avoided', self.source_resident_bytes)
+            self._compute_service_started = time.monotonic()
+            self._resume_gpu_after_yield = False
+            return parked
         started = time.monotonic()
         _record_image_phase(self, 'renderer_init')
         engine = self.engine = _GpuWorkerRenderEngine(f'cuda:{self.device_index}')
@@ -478,14 +491,19 @@ class SamGpuCropRenderer:
         import operator
         from .workspace import _env_flag
         from .sam_azimuthal_batch import (BatchDeclined, choose_batch_prefix,
-            render_compatible_batch, retained_cache_snapshot)
+            render_compatible_batch, retained_cache_snapshot, queued_frame_limit,
+            render_compatible_chunks)
         from .runtime import runtime_telemetry
         self.context._check_image_lifetime()
         if not _env_flag('YOLO_TTA_SAM_AZIMUTHAL_BATCH', True):
             raise BatchDeclined('disabled')
         if not callable(consume):
             raise TypeError('SAM image batch requires a private-cache sink')
-        frames = tuple(islice(frames, 4))
+        frames = tuple(islice(frames, max(4, queued_frame_limit())))
+        if len(frames) > 4 and _env_flag('YOLO_TTA_SAM_GPU_IMAGE_QUEUE', True):
+            return self._render_queued_prefix(view, frames, inverse, output_origin_yx=output_origin_yx,
+                output_height=output_height, output_width=output_width, consume=consume)
+        frames = frames[:4]
         inverse = np.asarray(inverse, dtype=np.float32).reshape(2, 3).copy()
         crop = dict(output_origin_yx=tuple(output_origin_yx),
                     output_height=output_height, output_width=output_width)
@@ -567,6 +585,66 @@ class SamGpuCropRenderer:
             pass
         return receipt
 
+    def _render_queued_prefix(self, view, frames, inverse, *, output_origin_yx,
+                              output_height, output_width, consume):
+        """More than four compatible frames: queued qualified chunks, one sink order."""
+        import operator
+        from .sam_azimuthal_batch import BatchDeclined, choose_batch_prefix, render_compatible_chunks
+        from .runtime import runtime_telemetry
+        inverse = np.asarray(inverse, dtype=np.float32).reshape(2, 3).copy()
+        crop = dict(output_origin_yx=tuple(output_origin_yx),
+                    output_height=output_height, output_width=output_width)
+        # Same cold impossibility check as the single-batch path, before any CUDA work.
+        cold = choose_batch_prefix(self, view, frames[:4], inverse, retained_cache_bytes=0, **crop)
+        if not cold.eligible:
+            raise BatchDeclined('no_eligible_prefix')
+        delivered = 0
+        telemetry = runtime_telemetry()
+        telemetry.add('sam.gpu_images.batch_attempts', 1)
+        _record_image_phase(self, 'batch_render', frame=int(frames[0]),
+                            crop_shape=(int(output_height), int(output_width)))
+
+        def ordered_sink(position, image):
+            nonlocal delivered
+            if (isinstance(position, (bool, np.bool_))
+                    or operator.index(position) != delivered or delivered >= len(frames)):
+                raise RuntimeError('SAM GPU batch returned an unordered or duplicate image')
+            if (not isinstance(image, np.ndarray) or image.dtype != np.uint8
+                    or image.shape != (int(output_height), int(output_width))):
+                raise ValueError('SAM GPU batch returned a mismatched detector canvas')
+            self.context._check_image_lifetime()
+            telemetry.add('sam.gpu_images.frames', 1)
+            telemetry.add('sam.gpu_images.pixels', int(image.size))
+            telemetry.add('sam.gpu_images.batch_frames', 1)
+            _record_image_phase(self, 'batch_host_cache_copy', frame=int(frames[position]),
+                                crop_shape=image.shape)
+            consume(position, image)
+            delivered += 1
+
+        result = render_compatible_chunks(self, view, frames, inverse, consume=ordered_sink, **crop)
+        receipt = dict(result.receipt)
+        try:
+            count = operator.index(receipt.get('completed_images'))
+            effective = operator.index(receipt.get('effective_batch_size'))
+        except TypeError as error:
+            raise RuntimeError('SAM GPU batch has an invalid completion count') from error
+        if (isinstance(receipt.get('completed_images'), (bool, np.bool_))
+                or not 2 <= count <= len(frames) or count != delivered or effective != count
+                or receipt.get('batch_path_used') is not True or receipt.get('host_result_mode') != 'sink'
+                or result.images):
+            raise RuntimeError('SAM GPU batch did not complete its exact queued prefix')
+        for size in receipt.get('chunk_sizes', ()):
+            telemetry.add('sam.gpu_images.batches', 1)
+            telemetry.add(f'sam.gpu_images.batches_size_{int(size)}', 1)
+        telemetry.add('sam.gpu_images.queued_calls', 1)
+        telemetry.add('sam.gpu_images.queued_frames', count)
+        _record_image_timings(render_enqueue_host_seconds=receipt['enqueue_host_seconds'],
+            batch_render_enqueue_host_seconds=receipt['enqueue_host_seconds'],
+            batch_copy_and_sink_host_seconds=receipt['copy_and_sink_host_seconds'])
+        _record_image_phase(self, 'batch_complete', frame=int(frames[count-1]),
+                            crop_shape=(int(output_height), int(output_width)))
+        return receipt
+
     def yield_compute_if_due(self):
         """Lend compute only after the caller has copied a completed crop/batch.
 
@@ -597,6 +675,9 @@ class SamGpuCropRenderer:
             if (allow_handoff and self.engine is not None and not self._render_failed
                     and sys.exc_info()[1] is None and self._try_handoff()):
                 return
+            # No waiting owner: keep the source on this GPU for the next lease
+            # (only where SAM session caps reserved room for it).
+            self._try_park()
             _record_image_phase(self, 'retirement')
             started = time.monotonic()
             real_engine = False
@@ -641,6 +722,64 @@ class SamGpuCropRenderer:
         with self.context._idle:
             if self in self.context._unsettled_image_renderers:
                 self.context._unsettled_image_renderers.remove(self)
+
+    def _full_window(self):
+        return self.source_t_window == (0, int(self.source.shape[0]))
+
+    def _parked_source_credit(self, device):
+        """Bytes already resident on `device` for exactly this source (no upload needed)."""
+        credit = getattr(self.context, '_parked_gpu_source_bytes', None)
+        if not callable(credit) or not self._full_window():
+            return 0
+        try:
+            return int(credit(int(device), self._source_handoff_key()))
+        except (OSError, ValueError):
+            return 0
+
+    def _take_parked_source(self):
+        take = getattr(self.context, '_take_parked_gpu_source', None)
+        if not callable(take) or not self._full_window():
+            return None
+        try:
+            key = self._source_handoff_key()
+        except (OSError, ValueError):
+            return None
+        return take(int(self.device_index), key)
+
+    def _try_park(self):
+        """Strip view workspaces and park the source-only engine on its GPU."""
+        engine = self.engine
+        park = getattr(self.context, '_park_gpu_source', None)
+        if (engine is None or not callable(park) or self._render_failed or sys.exc_info()[1] is not None
+                or self.context._cancel.is_set() or self in self.context._unsettled_image_renderers
+                or not self._full_window() or self._uploaded_source_key is None
+                or getattr(engine, '_volume_gpu', None) is None
+                or getattr(engine, '_azimuthal_texture_ref', None) is not None):
+            return False
+        from .cuda_backend import _GpuWorkerRenderEngine
+        if type(engine) is not _GpuWorkerRenderEngine:
+            return False
+        try:
+            if self._source_handoff_key() != self._uploaded_source_key:
+                return False
+        except (OSError, ValueError):
+            return False
+        _record_image_phase(self, 'park_cleanup')
+        # Same workspace stripping as a handoff: only source and its T maps stay.
+        engine._stream.synchronize()
+        engine.clear_native_plane_cache()
+        from .spherical_cuda import clear_spherical_render_cache
+        clear_spherical_render_cache(engine)
+        for name in ('_tilted_plans', '_fold_cache', '_fused_azimuthal_taps'):
+            getattr(engine, name).clear()
+        engine._fused_volume_ref = None
+        engine._standalone_render_meta = engine._standalone_render_meta_ref = None
+        if not park(int(self.device_index), self._uploaded_source_key, engine,
+                    self.source_resident_bytes, self.torch):
+            return False
+        self.engine = None
+        self._uploaded_source_key = None
+        return True
 
     def _try_handoff(self):
         """Share one upload with an already-ready FIFO head, never idle cache it."""
@@ -821,8 +960,19 @@ def try_gpu_crop_renderer(context, view, shape, prepared_plan, *, opportunistic=
     required_gpu = source_bytes+256*int(view.src_h)*int(view.src_w)+96*max(
         (int(box[2])-int(box[0]))*(int(box[3])-int(box[1])) for box in required.values())
     required_gpu += gpu_render_reserve_bytes()
+    # Queued Azimuthal batches may use a larger GPU-only workspace (spare VRAM);
+    # admit only the part beyond the allowance already counted above.
+    # Only queued Azimuthal batches use it, so other families keep their admission bytes.
+    from .geometry import is_tilted_azimuthal_view
+    device_scratch = scratch
+    if str(view.family) == 'azimuthal' and not is_tilted_azimuthal_view(view):
+        device_scratch = max(scratch, _env_int('YOLO_TTA_SAM_GPU_RENDER_DEVICE_BYTES', 1024**3))
+    allowance = 256*int(view.src_h)*int(view.src_w)+96*max(
+        (int(box[2])-int(box[0]))*(int(box[3])-int(box[1])) for box in required.values())
+    if device_scratch > scratch:
+        required_gpu += max(0, device_scratch-allowance)
     # No compute ownership while waiting for an image ticket or CPU credit.
     # The first missing crop waits for compute without holding a CUDA allocation.
     return SamGpuCropRenderer(context, view, source, logical_t, None, torch, scratch,
         required_gpu=required_gpu, source_t_window=source_window, source_frames=required,
-        opportunistic=opportunistic)
+        opportunistic=opportunistic, device_scratch_bytes=device_scratch)

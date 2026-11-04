@@ -31,7 +31,15 @@ class RunTransportTests(unittest.TestCase):
         self.run = self.root / "run"
         self.run.mkdir()
         (self.run / "manifest.json").write_text(json.dumps({"status": "failed", "launcher":
-            {"command": ["GPT-6-Astra-Ultra_v25.1.0_SLURM.py"]}}), encoding="utf-8")
+            {"command": ["Opus-5.5_v25.1.0_SLURM.py"]}}), encoding="utf-8")
+
+    def test_runs_from_current_and_previous_launcher_names_are_owned(self):
+        for launcher, owned in (("Opus-5.5_v25.0.3_SLURM.py", True),
+                                ("GPT-6-Astra-Ultra_v25.0.2_SLURM.py", True),
+                                ("other_tool.py", False)):
+            (self.run / "manifest.json").write_text(json.dumps({"status": "complete", "launcher":
+                {"command": [launcher]}}), encoding="utf-8")
+            self.assertIs(transport._run_metadata(self.run, "unknown")[1], owned, launcher)
 
     def write(self, relative, data):
         path = self.run.joinpath(*relative.split("/"))

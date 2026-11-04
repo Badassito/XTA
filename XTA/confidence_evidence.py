@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, is_dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import threading
 import time
@@ -221,48 +222,27 @@ def prepare_terminal_confidence_scores(mask, scores, *, known_slice_any=None,
         # Validate and snapshot once, before the first source write. The plan's
         # initialization/fixed allowance already funds these immutable arrays.
         reader = _MaskedNativeScoreReader(mask, scores, known_slice_any, known_slice_bboxes)
-    # The ordered consumer does not exist yet. Reuse its already admitted
-    # allowance, including tiny geometries whose consumer allowance is <256 KiB.
-    scratch_size = min(256 * 1024, int(plan.consumer_bytes), int(scores.size))
-    scratch = np.empty(scratch_size, dtype=bool)
     prepared = TerminalConfidenceScores(scores, int(scores.nbytes), reader)
-    zero = None
+    from .confidence_capture_cpu import zero_unmasked_scores_boxes, zero_unmasked_scores_flat
+    threads = _terminal_score_prepare_threads()
     # From the first write onward, errors propagate to the parent's ownership
     # guard. A partially transformed source must never trigger a legacy retry.
+    # Compiled nogil kernels need no scratch and write disjoint ranges.
     if reader is None:
         flat_mask, flat_scores = mask.reshape(-1), scores.reshape(-1)
-        for first in range(0, scores.size, scratch_size):
-            stop = min(first + scratch_size, scores.size)
-            zero = scratch[:stop-first]
-            np.equal(flat_mask[first:stop], 0, out=zero)
-            np.copyto(flat_scores[first:stop], np.uint8(0), where=zero)
+        _run_terminal_score_masking(zero_unmasked_scores_flat, (flat_mask, flat_scores),
+                                    int(scores.size), threads)
         del flat_mask, flat_scores
         visited = int(scores.size)
     else:
-        for z in range(scores.shape[0]):
-            if not reader.active[z]:
-                continue
-            y0, y1, x0, x1 = map(int, reader.boxes[z])
-            width = x1 - x0
-            if width <= scratch_size:
-                rows = max(1, scratch_size // width)
-                for y in range(y0, y1, rows):
-                    stop = min(y + rows, y1)
-                    zero = scratch[:(stop-y)*width].reshape(stop-y, width)
-                    np.equal(mask[z, y:stop, x0:x1], 0, out=zero)
-                    np.copyto(scores[z, y:stop, x0:x1], np.uint8(0), where=zero)
-            else:
-                for y in range(y0, y1):
-                    for x in range(x0, x1, scratch_size):
-                        stop = min(x + scratch_size, x1)
-                        zero = scratch[:stop-x]
-                        np.equal(mask[z, y, x:stop], 0, out=zero)
-                        np.copyto(scores[z, y, x:stop], np.uint8(0), where=zero)
+        active, boxes = reader.active, reader.boxes
+        _run_terminal_score_masking(zero_unmasked_scores_boxes, (mask, scores, active, boxes),
+                                    int(scores.shape[0]), threads)
+        del active, boxes
         # All later reads are restricted by this same immutable support snapshot.
         # No original mask alias or alternate full-plane reader may survive.
         reader.mask = reader.scores
         visited = int(reader.capture_metrics['bounded_input_bytes']) // 2
-    del zero, scratch
     scores.setflags(write=False)
     prepare_seconds = time.perf_counter() - started
     from .runtime import runtime_telemetry
@@ -271,7 +251,46 @@ def prepare_terminal_confidence_scores(mask, scores, *, known_slice_any=None,
     telemetry.add('confidence.terminal_score_only.full_score_bytes', int(scores.nbytes))
     telemetry.add('confidence.terminal_score_only.visited_score_bytes', visited)
     telemetry.add('confidence.terminal_score_only.prepare_seconds', prepare_seconds)
+    telemetry.add('confidence.terminal_score_only.prepare_threads', threads)
     return prepared
+
+
+def _terminal_score_prepare_threads():
+    """Threads for terminal score masking (YOLO_TTA_TERMINAL_SCORE_PREPARE_THREADS).
+
+    The default is one compiled nogil call: it needs the GIL once. Each extra
+    thread must win the GIL to start and finish, which costs more than it saves
+    while the main process's other threads are busy.
+    """
+    try:
+        requested = int(os.environ.get('YOLO_TTA_TERMINAL_SCORE_PREPARE_THREADS', '1'))
+    except ValueError:
+        requested = 1
+    return max(1, min(64, requested))
+
+
+def _run_terminal_score_masking(kernel, arrays, count, threads):
+    """Run kernel(*arrays, first, stop) over [0, count); return after every piece ends.
+
+    Arrays travel as arguments, not closures, so a failure's cleared traceback
+    frames release every dense alias.
+    """
+    pieces = max(1, min(count, threads))  # one piece per thread: fewest GIL handoffs
+    bounds = [count * piece // pieces for piece in range(pieces + 1)]
+    ranges = [(first, stop) for first, stop in zip(bounds, bounds[1:]) if stop > first]
+    if threads <= 1 or len(ranges) <= 1:
+        for first, stop in ranges:
+            kernel(*arrays, first, stop)
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    # Leaving the block waits for every piece, so no write outlives a failure.
+    with ThreadPoolExecutor(max_workers=min(threads, len(ranges)),
+                            thread_name_prefix='terminal-score-mask') as pool:
+        futures = [pool.submit(kernel, *arrays, first, stop) for first, stop in ranges]
+        errors = [future.exception() for future in futures]
+    for error in errors:
+        if error is not None:
+            raise error
 
 
 def _capture_prepared_terminal_confidence_scores(mask, scores, *, prepared, **kwargs):

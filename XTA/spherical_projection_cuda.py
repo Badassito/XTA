@@ -173,7 +173,8 @@ class SphericalCudaProjector:
     _reset_projection_stats = RadialCudaProjector._reset_projection_stats
 
     def __init__(self, source, view, output_shape, bboxes=None, device_index=0, *,
-                 block_bytes=None, upload_bytes=_UPLOAD_BYTES, reserve_bytes=_RESERVE_BYTES):
+                 block_bytes=None, upload_bytes=_UPLOAD_BYTES, reserve_bytes=_RESERVE_BYTES,
+                 max_device_bytes=None):
         from .spherical_projection import _validate_spherical_projection
         from .spherical_projection_cpu import prepare_spherical_chunk_numba
 
@@ -246,6 +247,11 @@ class SphericalCudaProjector:
                 self._pool, self._pinned_pool = cp.cuda.MemoryPool(), cp.cuda.PinnedMemoryPool()
                 free, _ = cp.cuda.runtime.memGetInfo()
                 self.admission_free_bytes = int(free)
+                if max_device_bytes is not None:
+                    # A shared (overlap) lease owns at most its slice; the plan
+                    # subtracts the reserve, so add it back to the cap.
+                    free = min(int(free), int(max_device_bytes) + int(self.reserve_bytes))
+                    self.admission_budget_bytes = int(max_device_bytes)
                 admitted_plan = spherical_cuda_block_plan(shape, source_bytes=self.source_h2d_bytes,
                     geometry_bytes=self.geometry_bytes, block_bytes=block_bytes,
                     free_device_bytes=int(free), reserve_bytes=self.reserve_bytes)

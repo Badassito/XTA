@@ -2159,6 +2159,14 @@ def write_layer_nrrd_with_low_quality_mirrors(
             except Exception:
                 job['failed'] = True
 
+    if bool(sparse_mirror_tee) and gpu_tee is None:
+        # Fused producers fold a whole z-range of crops per job in one nogil resize
+        # call and one locked OR call, with _tee_sparse's per-job failure semantics.
+        from .nrrd_sparse_kernels import FusedSparseMirrorTee
+        _tee_sparse.fused_sparse_mirror_tee = FusedSparseMirrorTee(  # type: ignore[attr-defined]
+            mirror_jobs, (int(output_shape[1]), int(output_shape[2])),
+        )
+
     # shard consumers can arrive concurrently. CPU mirror updates use
     # per-output-z stripe locks; the GPU tee owns one stream and tensor set, so
     # serialize only its tee calls while member compression remains parallel.

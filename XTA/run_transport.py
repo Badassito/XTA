@@ -91,12 +91,17 @@ def _json_file(path):
         return {}
 
 
+# Launcher names of this pipeline, current first; older runs keep their original name.
+_LAUNCHER_PREFIXES = ("Opus-5.5", "GPT-6-Astra-Ultra")
+
+
 def _run_metadata(root, requested_status):
     metadata = _json_file(root / "manifest.json")
     lta = _json_file(root / "lta_execution_identity.json")
     command = metadata.get("launcher", {}).get("command", ()) if isinstance(metadata.get("launcher"), dict) else ()
     owned = bool(lta.get("schema") == "lta.execution-identity/1" or
-                 (command and any("GPT-6-Astra-Ultra" in str(token) or str(token) == "xta" for token in command[:1])))
+                 (command and any(any(prefix in str(token) for prefix in _LAUNCHER_PREFIXES) or str(token) == "xta"
+                                 for token in command[:1])))
     if requested_status != "unknown":
         return {"status": requested_status, "origin": "caller", "partial": requested_status != "complete"}, owned
     status = metadata.get("status")

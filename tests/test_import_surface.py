@@ -10,7 +10,7 @@ from XTA import __version__
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WRAPPER = ROOT / f"GPT-6-Astra-Ultra_v{__version__}_SLURM.py"
+WRAPPER = ROOT / f"Opus-5.5_v{__version__}_SLURM.py"
 UNIFIED_MODULES = (
     "_prediction_cleanup",
     "experimental_features",

@@ -103,7 +103,7 @@ def main():
                     module_index = command.index('-m')
                     command = [*command[:module_index], '-m', 'tools.profile_tta_scheduler_lines',
                                '--output', str(case / 'scheduler-lines.json'),
-                               '--script', str(ROOT / f'GPT-6-Astra-Ultra_v{__version__}_SLURM.py'),
+                               '--script', str(ROOT / f'Opus-5.5_v{__version__}_SLURM.py'),
                                '--', *command[module_index + 2:]]
                 child_env = dict(environment)
                 child_env.update(YOLO_TTA_TELEMETRY_DIR=str(case / 'telemetry'),

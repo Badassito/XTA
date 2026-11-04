@@ -17,7 +17,8 @@ from XTA import cli, config
 
 ROOT = Path(__file__).resolve().parents[1]
 CURRENT_VERSION = XTA.__version__
-CURRENT_LAUNCHER = f"GPT-6-Astra-Ultra_v{CURRENT_VERSION}_SLURM.py"
+CURRENT_LAUNCHER = f"Opus-5.5_v{CURRENT_VERSION}_SLURM.py"
+RENAMED_LAUNCHER = "GPT-6-Astra-Ultra_v25.0.2_SLURM.py"
 PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v24.1.1_SLURM.py"
 SCRATCH_REPORTS = (
     "TTA_EXTERNAL_AUGMENTATION.md",
@@ -87,6 +88,7 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertNotIn('GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py', data_files)
         self.assertNotIn('GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py', data_files)
         self.assertNotIn(PREVIOUS_LAUNCHER, data_files)
+        self.assertNotIn(RENAMED_LAUNCHER, data_files)
 
     def test_source_distribution_has_one_versioned_launcher(self) -> None:
         manifest_lines = {
@@ -97,6 +99,7 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertNotIn("include GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py", manifest_lines)
         self.assertNotIn("include GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py", manifest_lines)
         self.assertNotIn(f"include {PREVIOUS_LAUNCHER}", manifest_lines)
+        self.assertNotIn(f"include {RENAMED_LAUNCHER}", manifest_lines)
         self.assertIn("include release/_package_inventory.json", manifest_lines)
         self.assertNotIn("include release/README.md", manifest_lines)
         self.assertNotIn("include release/version_migrations.json", manifest_lines)
@@ -141,6 +144,7 @@ class PackageMetadataTests(unittest.TestCase):
             [CURRENT_LAUNCHER],
         )
         self.assertFalse((ROOT / PREVIOUS_LAUNCHER).exists())
+        self.assertFalse((ROOT / RENAMED_LAUNCHER).exists())
         self.assertFalse((ROOT / "GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py").exists())
         self.assertFalse((ROOT / "GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py").exists())
         self.assertFalse((ROOT / "GPT-5.6-Sol-Ultra_v18.0.1_SLURM.py").exists())

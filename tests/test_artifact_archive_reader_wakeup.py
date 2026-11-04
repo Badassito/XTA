@@ -8,6 +8,13 @@ import pytest
 from XTA import artifact_archive as artifacts
 
 
+@pytest.fixture(autouse=True)
+def locked_reader_path(monkeypatch):
+    """These tests exercise the queued/locked reader path. Committed members of an
+    unchanged archive are read lock-free by default (tests/test_artifact_archive_lock_free_reads.py)."""
+    monkeypatch.setenv('YOLO_TTA_ARCHIVE_LOCK_FREE_READS', '0')
+
+
 @pytest.mark.parametrize('fail_append', [False, True])
 def test_queued_readers_recheck_published_prefix_without_exposing_new_members(tmp_path, monkeypatch, fail_append):
     archive = tmp_path/'sam-artifacts.tar'

@@ -52,6 +52,51 @@ returns the device to inference. The global inference-active flag alone does not
 block a native gather. Admission reasons and current device leases are recorded.
 Local numerical and performance checks do not establish full-cluster wall time.
 
+### Projection beside inference
+
+A Spherical or Native source projection no longer needs a drained GPU when it
+fits a reserved per-GPU slice. (Main-process Radial retirement keeps the
+exclusive turn; owner-routed Radial projection already runs in the workers.) While inference is queued or
+running, the projection first asks for a shared lease: inference keeps
+dispatching on that GPU, and the projection may own at most the slice.
+Inference-side sizing that grows to fill free memory or falls back when refused
+(streamed Azimuthal prerender, hole fill, device union) subtracts the slice from
+the free-memory reading, so those decisions never size into the same bytes.
+One-time fixed admissions (resident source, Azimuthal texture, D1 bitset) keep
+their existing headroom, which is larger than the slice, so their outcomes are
+unchanged; a shared lease is granted only when the slice plus a margin is free. At most one shared projection runs per GPU, and never on a GPU with an
+exclusive stage, model residency (persistent SAM) or terminal asset retirement.
+
+Spherical projection shrinks its output block depth to fit the slice. A native
+gather whose fixed source and scratch exceed the slice declines the shared
+lease (`projection.native_cuda_overlap_decline.<view>` records the required
+bytes) and uses the exclusive retirement turn above, which may use all free
+memory. Idle GPUs keep the exclusive path directly. Counters
+`gpu.projection_overlap.acquired` and `.budget_declines` and the coordinator
+snapshot's `overlap_leases` show the split; overlap lease trace events carry
+`overlap=true`.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `YOLO_TTA_GPU_PROJECTION_OVERLAP` | `1` | `0` restores the exclusive-only path and unchanged inference sizing |
+| `YOLO_TTA_GPU_PROJECTION_OVERLAP_GIB` | `4` | Per-GPU slice owned by one shared projection |
+| `YOLO_TTA_GPU_PROJECTION_OVERLAP_MARGIN_GIB` | `1` | Live free memory required beyond the slice before sharing |
+
+### Spherical pacing
+
+GPU dispatch otherwise prefers the parent with the most predicted inference
+time left, which leaves every small Spherical patch view to the end. Their
+post-processing (projection, confidence capture, NRRD) then arrives in one burst,
+holds the dense RAM window and stops new parents from opening, so one large view
+infers alone while the GPUs idle. Pacing opens a new Spherical parent whenever
+the fraction of Spherical parents opened falls behind the fraction of inference
+frames dispatched, and finishes an opened Spherical parent before others of its
+kind, so their post-processing spreads across the run. It ranks after admission,
+in-progress direct-union views and CPU-input readiness, and before the
+largest-remaining rule; it never admits work the scheduler would refuse.
+`yolo.spherical_pacing.parents_opened` counts paced openings, and
+`YOLO_TTA_SPHERICAL_PACING=0` restores the previous order exactly.
+
 ## Compact upright Azimuthal sampling
 
 Automatic upright Azimuthal requests can use fewer angles at the existing
@@ -230,6 +275,24 @@ execution; source metadata is checked across discovery and the final artifact
 identity checks remain in place. A failed discovery leaves an in-progress
 manifest rather than a prior successful association.
 
+Matroska inputs store no frame count. For a constant-rate stream whose
+timestamps start at zero, the probe seeks to the end of the file and derives the
+exact count from the last packet timestamp, which must agree with the container
+duration; anything else (variable rate, offset start, disagreement, probe error)
+counts every packet as before. Counting every packet reads the whole input, which
+took 9-17 s for a 3.5 GB FFV1 input on cluster NFS and delayed the decode, and so
+the first YOLO task. The decoder still fails loudly if the real frame count
+differs. `YOLO_TTA_FRAME_COUNT_FULL_SCAN=1` always counts every packet.
+
+On Linux the decode pipe is raised from the 64 KiB default to the system maximum
+(`/proc/sys/fs/pipe-max-size`, capped at 16 MiB), matching the 1 MiB pipe the
+Windows path already uses; `YOLO_TTA_DECODE_PIPE_RESIZE=0` keeps the default. The
+`startup_decode_frames_read` trace event and one log line report decode wall
+time, time the reader spent blocked, ffmpeg CPU cores (ffmpeg is a child process,
+so `system.process_cpu_cores` never includes it) and the pipe size. Many cores
+with little blocked time means decode is CPU-bound; few cores with the reader
+blocked means the pipe or input read is the limit.
+
 The scheduler skips pending-task scans while every GPU dispatch window is full.
 It still drains completed workspaces, refreshes retirement pressure and services
 auxiliary coordination. A returned compute credit triggers fresh admission
@@ -291,9 +354,22 @@ Preparation requires a full writable contiguous score owner and distinct,
 authoritatively identified source backing. Uncertain mappings, unsafe layouts
 and metadata aliases retain the existing two-source path. A configured terminal
 capture queue is required before adding preparation work; synchronous-only runs
-retain their original path. The existing capture plan funds metadata and bounded
-masking scratch before encoding workers start. No new codec or worker pool is
-introduced.
+retain their original path. The existing capture plan funds metadata before
+encoding workers start. No new codec or worker pool is introduced.
+
+Masking runs as one compiled, GIL-free numba call (`zero_unmasked_scores_flat`
+or `zero_unmasked_scores_boxes` in `confidence_capture_cpu.py`), branch-free and
+without scratch. The earlier loop made about 12,000 numpy calls per large
+view, and each one had to win the GIL back from the main process's other
+threads. On the cluster that cost 26-72 s per view (locally, 1.25 s became
+310 s with six busy Python threads, against 0.27 s for the compiled call). Every
+argument signature is compiled at startup, when the terminal capture queue is
+configured (`confidence.terminal_score_only.kernel_warmup`, about 1 s), because
+an in-process compile under the same contention can take minutes.
+`YOLO_TTA_TERMINAL_SCORE_PREPARE_THREADS` (default 1) splits the work across
+threads, one piece each. Each extra thread must win the GIL to start and
+finish, so it helps only when the main process is otherwise idle. Results are
+byte-identical for any thread count.
 
 Mask credit returns only when its actual last owner dies, after its packed
 continuation is ready; any external mask alias still prevents that refund.
@@ -302,7 +378,7 @@ Either retirement order is supported, with lease identity and per-input tokens
 rejecting stale or duplicate credit. Projection failure cancels or joins capture
 before cleanup, and failed producer closures drop source references only after
 their readers join. Aggregate `confidence.terminal_score_only` counters record
-prepared parents, full/visited score bytes and preparation time.
+prepared parents, full/visited score bytes, preparation time and threads.
 `YOLO_TTA_TERMINAL_SCORE_ONLY=0` retains asynchronous capture with both original
 sources for controlled same-source comparisons. The default is enabled; the
 requested mode is recorded in execution provenance.

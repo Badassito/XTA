@@ -25,6 +25,8 @@ def native_job(monkeypatch):
         lambda *args: (0, 0, 0, *shape))
     monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_BACKEND', 'compiled')
     monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_GPU_MIN_VOXELS', '0')
+    # These cases pin the exclusive retirement turn; overlap has its own tests.
+    monkeypatch.setenv('YOLO_TTA_GPU_PROJECTION_OVERLAP', '0')
     monkeypatch.setattr(bp, 'allocate_workspace_array', lambda **kwargs: np.empty(shape, np.uint8))
     monkeypatch.setitem(sys.modules, 'XTA.projection_coverage_cpu', SimpleNamespace(
         prepare_native_pull_plan=lambda *args, **kwargs: plan))

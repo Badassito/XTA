@@ -27,6 +27,12 @@ _ARCHIVE_INDEX_CACHE = {}
 _APPEND_SNAPSHOTS = {}
 _GUARD = threading.Lock()
 _READERS_CHANGED = threading.Condition(_GUARD)
+# Reader handles: one read-only descriptor per (thread, archive), positional reads.
+_THREAD_HANDLES = threading.local()
+_STATS_GUARD = threading.Lock()
+_STATS = dict(fast_reads=0, fast_misses=0, locked_reads=0, snapshot_reads=0,
+              reader_lock_wait_seconds=0., writer_lock_acquisitions=0,
+              writer_lock_wait_seconds=0., writer_lock_hold_seconds=0.)
 
 
 class ArchiveError(ValueError):
@@ -35,8 +41,161 @@ class ArchiveError(ValueError):
 
 def _after_fork():
     global _LOCKS, _ARCHIVE_INDEX_CACHE, _APPEND_SNAPSHOTS, _GUARD, _READERS_CHANGED
+    global _THREAD_HANDLES, _STATS_GUARD
     _LOCKS, _ARCHIVE_INDEX_CACHE, _APPEND_SNAPSHOTS, _GUARD = {}, {}, {}, threading.Lock()
     _READERS_CHANGED = threading.Condition(_GUARD)
+    # Inherited descriptors belong to the parent's threads; never reuse them.
+    _THREAD_HANDLES, _STATS_GUARD = threading.local(), threading.Lock()
+
+
+def _count(**increments):
+    with _STATS_GUARD:
+        for key, value in increments.items():
+            _STATS[key] += value
+    try:
+        from .runtime import runtime_telemetry
+        telemetry = runtime_telemetry()
+        for key, value in increments.items():
+            telemetry.add('artifact_archive.' + key, value)
+    except Exception:
+        pass  # Diagnostics never change archive ownership or reads.
+
+
+def archive_read_stats():
+    """Process-wide read/lock counters (for receipts and diagnostics)."""
+    with _STATS_GUARD:
+        return dict(_STATS)
+
+
+def _lock_free_reads_enabled():
+    return os.environ.get('YOLO_TTA_ARCHIVE_LOCK_FREE_READS', '1').strip().lower() not in {
+        '0', 'false', 'no', 'off'}
+
+
+class _ThreadHandles(dict):
+    """A thread's archive descriptors; closed when the thread's locals are released.
+
+    Measurement pools create short-lived threads per group, so descriptors must
+    not outlive their thread (that would leak one descriptor per thread).
+    """
+
+    def close_all(self):
+        for fd in tuple(self.values()):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.clear()
+
+    def __del__(self):
+        self.close_all()
+
+
+class _PositionalStream:
+    """Private cursor over a shared read-only descriptor (os.pread; no shared offset)."""
+
+    def __init__(self, fd):
+        self._fd, self._position, self.closed = fd, 0, False
+
+    def seek(self, offset, whence=os.SEEK_SET):
+        if whence != os.SEEK_SET:
+            raise ValueError('Positional archive streams seek absolutely')
+        self._position = int(offset)
+        return self._position
+
+    def tell(self):
+        return self._position
+
+    def read(self, size):
+        chunks, remaining = [], int(size)
+        while remaining > 0:
+            data = os.pread(self._fd, min(remaining, 64 * 1024**2), self._position)
+            if not data:
+                break
+            chunks.append(data)
+            self._position += len(data)
+            remaining -= len(data)
+        return b''.join(chunks)
+
+    def close(self):
+        self.closed = True  # The descriptor stays owned by its thread cache.
+
+
+def _fast_stream(path, cached_stamp):
+    """A stream over the archive iff it is still exactly the indexed file, else None."""
+    if hasattr(os, 'pread'):
+        handles = getattr(_THREAD_HANDLES, 'handles', None)
+        if handles is None:
+            handles = _THREAD_HANDLES.handles = _ThreadHandles()
+        key = str(path)
+        fd = handles.get(key)
+        if fd is None:
+            try:
+                fd = os.open(_api_path(path), os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_BINARY', 0))
+            except OSError:
+                return None
+            handles[key] = fd
+        try:
+            info = os.fstat(fd)
+            # The path must still name this same file: a replaced archive keeps
+            # the old inode open here, so compare the path's identity too.
+            current = os.stat(_api_path(path))
+        except OSError:
+            handles.pop(key, None)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            return None
+        if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+            handles.pop(key, None)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            return None
+        if not stat.S_ISREG(info.st_mode) or _stamp(info) != cached_stamp:
+            if (info.st_dev, info.st_ino) != tuple(cached_stamp[:2]):
+                # A different file now: drop this descriptor (reopened next time).
+                handles.pop(key, None)
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            return None
+        return _PositionalStream(fd)
+    try:
+        stream = open(_api_path(path), "rb")
+    except OSError:
+        return None
+    try:
+        info = os.fstat(stream.fileno())
+        if stat.S_ISREG(info.st_mode) and _stamp(info) == cached_stamp:
+            result, stream = stream, None
+            return result
+        return None
+    finally:
+        if stream is not None:
+            stream.close()
+
+
+def _fast_index(path):
+    """Cached entries when the archive is unchanged since indexing (no lock), else None.
+
+    Committed members are immutable: appends only write beyond the committed end,
+    and a matching (device, inode, size, mtime, ctime) stamp proves nothing was
+    appended since this process indexed the file. Any mismatch uses the locked path.
+    """
+    if not _lock_free_reads_enabled():
+        return None
+    cached = _ARCHIVE_INDEX_CACHE.get(str(path))
+    if cached is None:
+        return None
+    stream = _fast_stream(path, cached[0])
+    if stream is None:
+        _count(fast_misses=1)
+        return None
+    return cached, stream
 
 
 if hasattr(os, "register_at_fork"):
@@ -83,6 +242,8 @@ def _writer_lock(path):
     _plain_ancestors(lock_path)
     if os.path.exists(_api_path(lock_path)) and not stat.S_ISREG(os.stat(_api_path(lock_path)).st_mode):
         raise ArchiveError("Artifact lock must be a regular file")
+    requested = time.perf_counter()
+    acquired_at = None
     try:
         with _lock_for(path), open(_api_path(lock_path), "a+b") as handle:
             if os.fstat(handle.fileno()).st_size == 0:
@@ -102,6 +263,7 @@ def _writer_lock(path):
             else:
                 import fcntl
                 fcntl.flock(handle, fcntl.LOCK_EX)
+            acquired_at = time.perf_counter()
             try:
                 yield
             finally:
@@ -111,6 +273,9 @@ def _writer_lock(path):
                 else:
                     fcntl.flock(handle, fcntl.LOCK_UN)
     finally:
+        if acquired_at is not None:
+            _count(writer_lock_acquisitions=1, writer_lock_wait_seconds=acquired_at-requested,
+                   writer_lock_hold_seconds=time.perf_counter()-acquired_at)
         with _READERS_CHANGED:
             _READERS_CHANGED.notify_all()
 
@@ -119,6 +284,7 @@ def _writer_lock(path):
 def _reader_lock(path, snapshot_result):
     """Recheck a verified old prefix when an in-process writer publishes it."""
     lock, result, acquired = _lock_for(path), None, False
+    waited = time.perf_counter()
     try:
         with _READERS_CHANGED:
             while True:
@@ -132,9 +298,11 @@ def _reader_lock(path, snapshot_result):
                     break
                 _READERS_CHANGED.wait()
         if result is not None:
+            _count(snapshot_reads=1, reader_lock_wait_seconds=time.perf_counter()-waited)
             yield result
             return
         with _writer_lock(path):
+            _count(locked_reads=1, reader_lock_wait_seconds=time.perf_counter()-waited)
             yield None
     finally:
         if acquired:
@@ -406,6 +574,16 @@ def _entry(value, *, open_payload=False):
     if parsed is None or not parsed[1]:
         raise ArchiveError("Expected an artifact archive member reference")
     path, name = parsed
+    fast = _fast_index(path)
+    if fast is not None:
+        (_stamp_value, entries, _end), stream = fast
+        if name in entries:
+            _count(fast_reads=1)
+            if open_payload:
+                return path, dict(entries[name]), stream
+            stream.close()
+            return path, dict(entries[name]), None
+        stream.close()  # Unknown name: the locked path keeps FileNotFoundError semantics.
     def lookup(snapshot):
         if name in snapshot[1]:
             stream = _open_append_prefix(path, snapshot)
@@ -443,6 +621,16 @@ def member_exists(value):
 def list_members(archive, prefix=""):
     path = _canonical_path(archive)
     prefix = _name(prefix.rstrip("/\\")) if prefix else ""
+    # Like the append snapshot: only an existing, non-empty prefix may answer
+    # without waiting; full inventories and missing prefixes still wait.
+    fast = _fast_index(path) if prefix else None
+    if fast is not None:
+        (_stamp_value, entries, _end), stream = fast
+        stream.close()
+        names = sorted(name for name in entries if name == prefix or name.startswith(prefix + "/"))
+        if names:
+            _count(fast_reads=1)
+            return names
     def lookup(snapshot):
         if prefix:
             names = sorted(name for name in snapshot[1] if name == prefix or name.startswith(prefix + "/"))

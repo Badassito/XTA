@@ -70,7 +70,11 @@ EXECUTION_FIELDS = frozenset(('schema', 'requested_workers', 'parallel_credit_by
     'lane_cache_bytes', 'workspace_rule', 'fallback_reason', 'peak_pending_runs',
     'peak_charged_bytes', 'parallel_group_count', 'serial_group_count', 'parallel_run_count',
     'oversized_serial_runs', 'maximum_run_charge_bytes', 'wall_seconds', 'serial_reasons',
-    'reader_totals', 'branch_metadata'))
+    'reader_totals', 'branch_metadata', 'selection_wall_seconds', 'archive_reads_process_wide'))
+# Process-wide evidence-archive counters recorded per selection (diagnostics only).
+ARCHIVE_READ_FIELDS = frozenset(('fast_reads', 'fast_misses', 'locked_reads', 'snapshot_reads',
+    'reader_lock_wait_seconds', 'writer_lock_acquisitions', 'writer_lock_wait_seconds',
+    'writer_lock_hold_seconds'))
 BRANCH_METADATA_FIELDS = frozenset(('index_admission', 'parallel_credit_rule',
     'peak_retained_index_bytes', 'peak_simultaneous_index_bytes',
     'minimum_effective_parallel_credit_bytes', 'overlay_snapshot_count', 'full_merge_fallback_count'))
@@ -102,6 +106,7 @@ def _sha(value):
 def _valid_execution(value):
     return (isinstance(value, dict) and set(value) <= EXECUTION_FIELDS
         and set(value.get('reader_totals', {})) <= READER_COUNTERS
+        and set(value.get('archive_reads_process_wide', {})) <= ARCHIVE_READ_FIELDS
         and set(value.get('serial_reasons', {})) <= {
             'worker_hint_serial', 'single_run_group', 'insufficient_parallel_credit'}
         and ('branch_metadata' not in value or _valid_branch_metadata(value['branch_metadata'])))
@@ -144,6 +149,8 @@ def allowed_difference(path, before, after, allow_implementation_changes=True):
                                          for value in (before, after))
         if path[2] == 'reader_totals':
             return len(path) == 4 and path[3] in READER_COUNTERS
+        if path[2] == 'archive_reads_process_wide':
+            return len(path) == 3 or len(path) == 4 and path[3] in ARCHIVE_READ_FIELDS
         if path[2] == 'serial_reasons':
             return len(path) == 4 and path[3] in {
                 'worker_hint_serial', 'single_run_group', 'insufficient_parallel_credit'}

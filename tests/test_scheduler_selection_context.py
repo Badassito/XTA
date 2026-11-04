@@ -14,6 +14,18 @@ from XTA.tta_scheduler import D1ParentGroup
 from tests._scheduler_selection_reference import reference_select
 from tests.test_tta_scheduler_boundary import _scheduler, _state, _view
 
+# The frozen oracle predates Spherical pacing; these differential checks cover
+# per-selection reuse, so pin the historical order (pacing has its own tests).
+_PACING = mock.patch.dict('os.environ', {'YOLO_TTA_SPHERICAL_PACING': '0'})
+
+
+def setUpModule():
+    _PACING.start()
+
+
+def tearDownModule():
+    _PACING.stop()
+
 
 def random_scheduler(seed):
     rng = random.Random(seed)

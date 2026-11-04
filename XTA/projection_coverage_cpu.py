@@ -209,26 +209,301 @@ def estimate_native_pull_plan_bytes(view, source_shape, output_shape):
                 **estimates)
 
 
-def _angular_keys(plan, vertical_indices, horizontal_indices):
-    """Exact frozen sampler operation order, bounded to one admitted strip."""
-    from .projection_coverage import azimuthal_plane_samples
+# Actual peak bytes per point of the hybrid angular-key build below: float32
+# dy/dx (8 B) and the arctan2/degrees results (8 B). ROI-boundary points
+# re-measured by np.hypot are resolved in rounds of at most
+# _AMBIGUOUS_CAPACITY points, _AMBIGUOUS_POINT_BYTES each (index, dy/dx,
+# distance). The admitted plan still declares _POINT_BYTES per strip point;
+# the cached build only groups strips so its real peak stays below that bound.
+_HYBRID_POINT_BYTES = 16
+_AMBIGUOUS_POINT_BYTES = 32
+# Relative half-width of the interval certified to contain np.hypot(dx, dy).
+# The in-kernel sqrt(dx*dx + dy*dy) is within ~2 ulp of the exact distance and
+# any libm/SIMD hypot within a few ulp; 1e-12 is ~4500 ulp of slack.
+_ROI_MARGIN = 1e-12
+_AMBIGUOUS_CAPACITY = 4096
+_NO_INDICES = np.empty(0, np.int64)
+
+
+@_numba.njit(nogil=True, cache=False, inline='always')
+def _angular_index(i, first, width, vertical, horizontal, indexed):
+    if indexed:
+        return float(vertical[i]), float(horizontal[i])
+    at = first + i
+    return float(at // width), float(at % width)
+
+
+@_numba.njit(nogil=True, cache=False, inline='always')
+def _roi_offsets(v, h, work_h, work_w, out_h, out_w, center_y, center_x):
+    """``azimuthal_plane_samples`` centered float64 ROI offsets, exact order."""
+    dy = ((2.0 * v + 1.0 - out_h) * work_h / (2.0 * out_h)
+          + ((work_h - 1.0) * .5 - center_y))
+    dx = ((2.0 * h + 1.0 - out_w) * work_w / (2.0 * out_w)
+          + ((work_w - 1.0) * .5 - center_x))
+    return dy, dx
+
+
+@_numba.njit(nogil=True, cache=False, inline='always')
+def _roi_bound(distance, limit, abs_limit):
+    # limit + (8 * float64 eps) * np.maximum(distance, abs(limit)); 8*eps exact.
+    return limit + 1.7763568394002505e-15 * max(distance, abs_limit)
+
+
+@_numba.njit(nogil=True, cache=False)
+def _angular_coordinates(first, width, vertical, horizontal, indexed, work_h, work_w,
+                         out_h, out_w, center_y, center_x, dy32, dx32):
+    """float32 angular offsets: float64 address rounded to float32, then a
+    float32 subtraction of the (weak Python float -> float32) center, i.e.
+    NumPy's ``(...).astype(np.float32) - float(center)``."""
+    scale_h = work_h / out_h
+    scale_w = work_w / out_w
+    center_y32 = np.float32(center_y)
+    center_x32 = np.float32(center_x)
+    for i in range(dy32.size):
+        v, h = _angular_index(i, first, width, vertical, horizontal, indexed)
+        dy32[i] = np.float32((v + .5) * scale_h - .5) - center_y32
+        dx32[i] = np.float32((h + .5) * scale_w - .5) - center_x32
+
+
+@_numba.njit(nogil=True, cache=False, inline='always')
+def _numpy_remainder(a, b):
+    """NumPy/Python float64 ``a % b`` (npy_divmod): fmod, sign fix, signed zero."""
+    mod = np.fmod(a, b)  # exact (LLVM frem == C fmod)
+    if mod != 0.0:
+        if (b < 0.0) != (mod < 0.0):
+            mod += b
+    else:
+        mod = math.copysign(0.0, b)
+    return mod
+
+
+@_numba.njit(nogil=True, cache=False, inline='always')
+def _owner_key(theta, dy32, dx32, radius, diameter, sorted_angles, owner_order,
+               plan_sources, plan_reverses, cos_table, sin_table, column_lookup, source_width):
+    """Nearest owner, signed float32 column and key, in NumPy operation order."""
+    t = np.float64(theta)
+    count = sorted_angles.size
+    # np.searchsorted(side='left'): first index whose value is not < t.
+    low, high = 0, count
+    while low < high:
+        middle = (low + high) >> 1
+        if sorted_angles[middle] < t:
+            low = middle + 1
+        else:
+            high = middle
+    right = low % count
+    left = right - 1 if right > 0 else count - 1
+    dl = abs(_numpy_remainder(t - sorted_angles[left] + 90.0, 180.0) - 90.0)
+    dr = abs(_numpy_remainder(t - sorted_angles[right] + 90.0, 180.0) - 90.0)
+    ol, orr = owner_order[left], owner_order[right]
+    nearest = ol if (dl < dr or (dl == dr and ol < orr)) else orr
+    signed = np.float32(dx32 * cos_table[nearest]) + np.float32(dy32 * sin_table[nearest])
+    if plan_reverses[nearest]:
+        signed = -signed
+    if diameter == 1:
+        column = 0
+    else:
+        last = np.float32(diameter - 1)
+        q = np.rint(np.float32(np.float32(np.float32(signed + np.float32(radius))
+                                          / np.float32(max(1e-6, 2 * radius))) * last))
+        column = int(min(max(q, np.float32(0.)), last))
+    # A radius or center beyond float32 range yields NaN here; NumPy's
+    # column_lookup[...] raised IndexError, so keep that instead of an unchecked read.
+    if column < 0 or column >= column_lookup.size:
+        raise IndexError('Angular key column is out of bounds for the column lookup')
+    # Sources/columns are bound below source_shape[0]/[2], so the int64 value
+    # equals NumPy's unsigned key arithmetic and fits the key dtype.
+    return plan_sources[nearest] * source_width + column_lookup[column]
+
+
+@_numba.njit(nogil=True, cache=False)
+def _angular_keys_kernel(first, width, vertical, horizontal, indexed, work_h, work_w,
+                         out_h, out_w, center_y, center_x, margin, radius, diameter,
+                         theta, dy32, dx32, sorted_angles, owner_order, plan_sources,
+                         plan_reverses, cos_table, sin_table, column_lookup, source_width,
+                         invalid, keys, ambiguous, start):
+    """Exact scalar replay of the NumPy ROI/owner/column/key operations.
+
+    ``theta`` is NumPy's float32 ``degrees(arctan2) % 180`` and the cos/sin
+    tables are ``np.cos/np.sin(np.deg2rad(plan_angles))``; only IEEE-exact
+    arithmetic, comparisons and lookups run here (no fastmath/contraction).
+    ROI validity is decided here only when it holds/fails over the certified
+    interval around np.hypot's value; other points are recorded for an exact
+    NumPy hypot pass. Returns ``(recorded, stop)``: processing stops before
+    the first undecided point that no longer fits ``ambiguous`` (needs size>0).
+    """
+    limit = radius + .5
+    abs_limit = abs(limit)
+    pending = 0
+    for i in range(start, keys.size):
+        v, h = _angular_index(i, first, width, vertical, horizontal, indexed)
+        dy, dx = _roi_offsets(v, h, work_h, work_w, out_h, out_w, center_y, center_x)
+        approx = math.sqrt(dx * dx + dy * dy)
+        lower = approx * (1.0 - margin)
+        upper = approx * (1.0 + margin)
+        if approx != 0.0 and not (1e-100 < approx < 1e100):
+            decided = False
+        elif upper <= _roi_bound(lower, limit, abs_limit):
+            decided = True
+        elif lower > _roi_bound(upper, limit, abs_limit):
+            keys[i] = invalid
+            continue
+        else:
+            decided = False
+        if not decided:
+            if pending == ambiguous.size:
+                return pending, i
+            ambiguous[pending] = i
+            pending += 1
+            continue
+        keys[i] = _owner_key(theta[i], dy32[i], dx32[i], radius, diameter, sorted_angles,
+                             owner_order, plan_sources, plan_reverses, cos_table, sin_table,
+                             column_lookup, source_width)
+    return pending, keys.size
+
+
+@_numba.njit(nogil=True, cache=False)
+def _ambiguous_offsets(indices, first, width, vertical, horizontal, indexed, work_h, work_w,
+                       out_h, out_w, center_y, center_x, dy, dx):
+    for j in range(indices.size):
+        v, h = _angular_index(indices[j], first, width, vertical, horizontal, indexed)
+        dy[j], dx[j] = _roi_offsets(v, h, work_h, work_w, out_h, out_w, center_y, center_x)
+
+
+@_numba.njit(nogil=True, cache=False)
+def _ambiguous_keys(indices, distance, radius, diameter, theta, dy32, dx32, sorted_angles,
+                    owner_order, plan_sources, plan_reverses, cos_table, sin_table,
+                    column_lookup, source_width, invalid, keys):
+    limit = radius + .5
+    abs_limit = abs(limit)
+    for j in range(indices.size):
+        i = indices[j]
+        d = distance[j]
+        if not d <= _roi_bound(d, limit, abs_limit):
+            keys[i] = invalid
+        else:
+            keys[i] = _owner_key(theta[i], dy32[i], dx32[i], radius, diameter, sorted_angles,
+                                 owner_order, plan_sources, plan_reverses, cos_table, sin_table,
+                                 column_lookup, source_width)
+
+
+def _angular_tables(plan):
+    """Small fixed-dtype per-angle tables (one compiled signature).
+
+    cos/sin are the exact NumPy float32 values the frozen sampler computes per
+    point (``np.cos(np.deg2rad(angle))``); elementwise ufuncs on contiguous
+    float32 input are position-independent, as the strip/cached split assumes.
+    """
+    angles = np.array(plan.plan_angles, np.float32)
+    return (np.array(plan.sorted_angles, np.float64), np.array(plan.owner_order, np.int64),
+            np.array(plan.plan_sources, np.int64), np.array(plan.plan_reverses, np.bool_),
+            np.cos(np.deg2rad(angles)), np.sin(np.deg2rad(angles)),
+            np.array(plan.column_lookup, np.int64))
+
+
+def _angular_geometry(plan):
     base = int(plan.integers[0])
     va, ua = ((1, 2), (0, 2), (0, 1))[base]
-    radius = float(plan.coefficients[12])
-    native_w = int(plan.integers[9])
     work = plan.integers[2:5]
     output = plan.integers[5:8]
-    valid, sources, native_u = azimuthal_plane_samples(
-        vertical_indices, horizontal_indices, (work[va], work[ua]),
-        (output[va], output[ua]), plan.coefficients[13], plan.coefficients[14],
-        radius, native_w, plan.plan_angles, plan.plan_sources, plan.plan_reverses,
-        plan.sorted_angles, plan.owner_order)
-    columns = plan.column_lookup[native_u]
-    key_dtype = np.uint32 if plan.invalid_key <= np.iinfo(np.uint32).max else np.uint64
-    keys = (sources.astype(key_dtype) * plan.source_shape[2]
-            + columns.astype(key_dtype))
-    keys[~valid] = key_dtype(plan.invalid_key)
+    return (float(int(work[va])), float(int(work[ua])), float(int(output[va])),
+            float(int(output[ua])), float(plan.coefficients[13]), float(plan.coefficients[14]))
+
+
+def _key_dtype(plan):
+    return np.uint32 if plan.invalid_key <= np.iinfo(np.uint32).max else np.uint64
+
+
+def _angular_keys_into(plan, tables, keys, first, width, vertical, horizontal, indexed):
+    """Fill one 1-D C key span: nogil coordinates, NumPy arctan2/degrees/% on
+    contiguous float32 strips (as the frozen sampler calls them), one nogil key
+    kernel, and an exact np.hypot pass for the rare ROI-boundary points."""
+    geometry = _angular_geometry(plan)
+    index = (first, width, vertical, horizontal, indexed)
+    size = keys.size
+    dy32, dx32 = np.empty(size, np.float32), np.empty(size, np.float32)
+    _angular_coordinates(*index, *geometry, dy32, dx32)
+    theta = np.degrees(np.arctan2(dy32, dx32))
+    theta %= np.float32(180.)
+    point = (float(plan.coefficients[12]), int(plan.integers[9]), theta, dy32, dx32, *tables,
+             np.int64(plan.source_shape[2]), keys.dtype.type(plan.invalid_key))
+    ambiguous = np.empty(min(size, max(1, int(_AMBIGUOUS_CAPACITY))), np.int64)
+    start = total = 0
+    while start < size:
+        pending, start = _angular_keys_kernel(*index, *geometry, float(_ROI_MARGIN), *point,
+                                              keys, ambiguous, start)
+        if pending:
+            indices = ambiguous[:pending]
+            dy, dx = np.empty(pending, np.float64), np.empty(pending, np.float64)
+            _ambiguous_offsets(indices, *index, *geometry, dy, dx)
+            _ambiguous_keys(indices, np.hypot(dx, dy), *point, keys)
+            total += pending
+            del indices, dy, dx
+    return total
+
+
+def _angular_keys(plan, vertical_indices, horizontal_indices, *, tables=None):
+    """Exact frozen sampler result, bounded to one admitted strip.
+
+    Bit-identical to the keys from ``projection_coverage.azimuthal_plane_samples``
+    with a handful of NumPy calls and nogil kernels instead of ~270 short
+    GIL-releasing NumPy calls per strip.
+    """
+    vertical = np.array(vertical_indices, np.int64, copy=True).reshape(-1)
+    horizontal = np.array(horizontal_indices, np.int64, copy=True).reshape(-1)
+    if vertical.shape != horizontal.shape:
+        raise ValueError('Angular key vertical/horizontal indices must have equal size')
+    keys = np.empty(vertical.size, _key_dtype(plan))
+    _angular_keys_into(plan, _angular_tables(plan) if tables is None else tables, keys,
+                       0, 1, vertical, horizontal, True)
     return keys
+
+
+def _fill_angular_key_plane(plan, flat, width, strip_points):
+    """Fill the flat cached key plane within the admitted strip temporary bound."""
+    declared = int(strip_points) * _POINT_BYTES
+    chunk = max(int(strip_points), (declared - max(1, _AMBIGUOUS_CAPACITY) * _AMBIGUOUS_POINT_BYTES)
+                // _HYBRID_POINT_BYTES)
+    tables = _angular_tables(plan)
+    for first in range(0, flat.size, chunk):
+        _angular_keys_into(plan, tables, flat[first:first + chunk], first, int(width),
+                           _NO_INDICES, _NO_INDICES, False)
+
+
+def warm_angular_key_kernels():
+    """Compile every angular-key kernel signature production passes.
+
+    Production passes only fresh writable C-contiguous arrays (index arrays and
+    per-angle tables are normalized copies), so one signature per key dtype
+    (uint32/uint64) per kernel suffices; the flat and indexed modes and the
+    ambiguous ROI path share it.
+    """
+    import time
+    started = time.perf_counter()
+    tables = (np.asarray((0., 90.), np.float64), np.asarray((0, 1), np.int64),
+              np.asarray((0, 1), np.int64), np.asarray((False, True), np.bool_),
+              np.ones(2, np.float32), np.zeros(2, np.float32), np.asarray((0, 1), np.int64))
+    geometry = (2., 2., 2., 2., .5, .5)
+    index = (0, 2, _NO_INDICES, _NO_INDICES, False)
+    dy32, dx32 = np.zeros(4, np.float32), np.zeros(4, np.float32)
+    _angular_coordinates(*index, *geometry, dy32, dx32)
+    theta = np.zeros(4, np.float32)
+    indices = np.arange(2, dtype=np.int64)
+    _ambiguous_offsets(indices[:1], *index, *geometry, np.empty(1), np.empty(1))
+    for key_dtype in (np.uint32, np.uint64):
+        point = (1., 2, theta, dy32, dx32, *tables, np.int64(2),
+                 key_dtype(np.iinfo(key_dtype).max))
+        keys = np.empty(4, key_dtype)
+        _angular_keys_kernel(*index, *geometry, float(_ROI_MARGIN), *point, keys,
+                             np.empty(4, np.int64), 0)
+        # A span of the flat cached key buffer has the same C layout.
+        _angular_keys_kernel(*index, *geometry, float(_ROI_MARGIN), *point,
+                             np.empty((2, 4), key_dtype).reshape(-1)[2:6], np.empty(4, np.int64), 0)
+        _ambiguous_keys(indices[:1], np.zeros(1), *point, keys)
+    kernels = (_angular_coordinates, _angular_keys_kernel, _ambiguous_offsets, _ambiguous_keys)
+    return dict(scope='angular key kernels; no scientific input',
+                elapsed_seconds=time.perf_counter() - started,
+                signatures={kernel.__name__: len(kernel.nopython_signatures) for kernel in kernels})
 
 
 def prepare_native_pull_plan(view, source_shape, output_shape, *, max_plan_bytes,
@@ -271,11 +546,7 @@ def prepare_native_pull_plan(view, source_shape, output_shape, *, max_plan_bytes
                           angles, sources, reverses, sorted_angles, order, rows, columns, raw_angles)
     if cached:
         keys = np.empty(plane_shape, key_dtype)
-        flat = keys.reshape(-1)
-        width = plane_shape[1]
-        for first in range(0, flat.size, strip_points):
-            indices = np.arange(first, min(flat.size, first + strip_points), dtype=np.int64)
-            flat[first:first + indices.size] = _angular_keys(plan, indices // width, indices % width)
+        _fill_angular_key_plane(plan, keys.reshape(-1), plane_shape[1], strip_points)
         _readonly(keys)
         plan = NativePullPlan(source_shape, output_shape, backend, persistent, workspace, 0,
                               math.prod(output_shape), integers, coefficients, keys, invalid,

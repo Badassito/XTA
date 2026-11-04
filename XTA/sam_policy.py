@@ -1783,6 +1783,10 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
             "effective_candidate_computations", "cache_hits", "cache_misses", "cache_evictions",
             "compact_filter_expansions", "compact_filter_parent_hits", "compact_filter_parent_exports")})
     selection_resources["intrinsic_measurements"] = execution
+    # Diagnostics only (not identity): selection wall time and process-wide SAM
+    # evidence archive reads/lock waits while this selection ran.
+    from .artifact_archive import archive_read_stats
+    archive_before, selection_started = archive_read_stats(), time.perf_counter()
     if resolved["branch_aware_selection"]:
         execution["branch_metadata"] = dict(
             index_admission="simultaneous_prefix_chunk_candidate_indexes_within_unused_topology_credit",
@@ -2084,6 +2088,10 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
                 for record in group_receipts.values()),
             connection_claim="Certified local original-endpoint gap connection",
             object_extent_claim="Unknown outside fixed context for extent-censored edges")
+    archive_after = archive_read_stats()
+    execution["selection_wall_seconds"] = time.perf_counter()-selection_started
+    execution["archive_reads_process_wide"] = {key: archive_after[key]-archive_before[key]
+                                               for key in archive_after}
     result["selection_identity"]=fingerprint(dict(evidence_fingerprint=result["evidence_fingerprint"],
         policy_hash=policy_hash,selected_run_ids=result["selected_run_ids"],
         effective_resource_identity=selection_resources["effective_resource_identity"],

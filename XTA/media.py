@@ -16,6 +16,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    Mapping,
     Optional,
     Sequence,
     TYPE_CHECKING,
@@ -87,9 +88,51 @@ def _spawn_subprocess_with_retry(spawn: Callable[[], object], desc: str) -> obje
         f'continuing without it: {last_exc}'
     ) from last_exc
 
+def _enlarge_decode_pipe(stream) -> int:
+    """Raise a Linux decode pipe from the 64 KiB default to the system maximum.
+
+    Raw gray frames are ~9 MB each; a 64 KiB pipe forces many small handoffs
+    between ffmpeg and the reader. The Windows path already uses a 1 MiB pipe for
+    the same reason. YOLO_TTA_DECODE_PIPE_RESIZE=0 keeps the default. Returns the
+    resulting pipe size in bytes, or 0 when unknown.
+    """
+    try:
+        import fcntl
+        fd = stream.fileno()
+        get_size = getattr(fcntl, 'F_GETPIPE_SZ', 1032)
+        if os.environ.get('YOLO_TTA_DECODE_PIPE_RESIZE', '1').strip().lower() not in {
+                '0', 'false', 'no', 'off'}:
+            try:
+                limit = int(Path('/proc/sys/fs/pipe-max-size').read_text().strip())
+            except Exception:
+                limit = 1024 * 1024
+            target = max(64 * 1024, min(int(limit), 16 * 1024 * 1024))
+            try:
+                fcntl.fcntl(fd, getattr(fcntl, 'F_SETPIPE_SZ', 1031), target)
+            except OSError:
+                pass  # Busy or limited pipes keep their current size.
+        return int(fcntl.fcntl(fd, get_size))
+    except Exception:
+        return 0
+
+
+def _process_cpu_seconds(pid: int) -> float:
+    """CPU seconds (all threads) of a live Linux child; -1 when unavailable."""
+    try:
+        text = Path(f'/proc/{int(pid)}/stat').read_text()
+        fields = text[text.rindex(')') + 2:].split()
+        ticks = float(os.sysconf('SC_CLK_TCK'))
+        return (int(fields[11]) + int(fields[12])) / ticks
+    except Exception:
+        return -1.0
+
+
 def _spawn_decode_process(cmd: Sequence[str]) -> subprocess.Popen:
     if os.name != 'nt':
-        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if proc.stdout is not None:
+            proc._xta_pipe_bytes = _enlarge_decode_pipe(proc.stdout)
+        return proc
     import _winapi
     import msvcrt
     from contextlib import ExitStack
@@ -111,6 +154,7 @@ def _spawn_decode_process(cmd: Sequence[str]) -> subprocess.Popen:
         writer = None
         proc.stdout = reader
         reader = None
+        proc._xta_pipe_bytes = 1024 * 1024
         return proc
     except BaseException:
         if proc is not None:
@@ -345,6 +389,72 @@ def wait_for_volume_ready(arr: object) -> None:
     if readiness is not None:
         readiness.wait_all()
 
+def _tail_frame_count_enabled() -> bool:
+    """YOLO_TTA_FRAME_COUNT_FULL_SCAN=1 always counts every packet."""
+    return os.environ.get('YOLO_TTA_FRAME_COUNT_FULL_SCAN', '0').strip().lower() not in {
+        '1', 'true', 'yes', 'on'}
+
+
+def _tail_timestamp_frame_count(video_path: Path, stream: Mapping[str, object],
+                                container: Mapping[str, object], fps: float) -> Optional[int]:
+    """Exact frame count of a constant-rate stream from its last packet timestamp.
+
+    Matroska stores no frame count, and counting packets reads the whole file
+    (9-17 s for a 3.5 GB FFV1 input on the cluster's NFS) before decoding can
+    start. For a constant-rate stream that starts at zero, the last packet's
+    timestamp gives the count after a seek to the end of the file, and the
+    container duration must agree with it. Anything else returns None so the
+    caller counts every packet. Decoding still fails loudly if the actual frame
+    count differs (short read or an ffmpeg write error), so a wrong count cannot
+    silently truncate or pad the volume.
+    """
+    try:
+        rate = str(stream.get("r_frame_rate") or "")
+        if not rate or rate == "0/0" or rate != str(stream.get("avg_frame_rate") or "") or fps <= 0:
+            return None
+        start = float(stream.get("start_time"))
+        duration = float(container.get("duration"))
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(start) and abs(start) < 1e-6 and math.isfinite(duration) and duration > 0):
+        return None
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-read_intervals", f"{max(0.0, duration - 2.0):.3f}%",
+        "-show_entries", "packet=pts_time", "-of", "csv=p=0",
+        str(video_path),
+    ]
+    runtime_trace_event('startup_source_probe_start', phase='tail_timestamp')
+    failed = True
+    frames = None
+    try:
+        with runtime_telemetry().span('startup.source_probe.tail_timestamp'):
+            probe = _spawn_subprocess_with_retry(
+                lambda: subprocess.run(
+                    cmd, capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", check=True,
+                ),
+                'ffprobe tail timestamp probe',
+            )
+        times = []
+        for line in str(probe.stdout).split():
+            value = line.strip().strip(',')
+            if value and value != 'N/A':
+                times.append(float(value))
+        if times:
+            last = max(times) * float(fps)
+            candidate = int(round(last)) + 1
+            if abs(last - round(last)) <= 0.25 and abs(duration * float(fps) - candidate) <= 0.5:
+                frames = candidate
+        failed = False
+    except Exception:
+        frames = None  # Any probe problem falls back to the exact packet count.
+    finally:
+        runtime_trace_event('startup_source_probe_done', phase='tail_timestamp', failed=failed,
+                            frames=-1 if frames is None else int(frames))
+    return frames
+
+
 @runtime_telemetry_phase('startup.source_probe')
 def ffprobe_info(video_path: Path) -> Dict[str, object]:
     """Return dict with width, height, fps, num_frames."""
@@ -353,7 +463,8 @@ def ffprobe_info(video_path: Path) -> Dict[str, object]:
         "ffprobe",
         "-v", "error",
         "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames",
+        "-show_entries",
+        "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,start_time:format=duration",
         "-of", "json",
         str(video_path),
     ]
@@ -393,6 +504,8 @@ def ffprobe_info(video_path: Path) -> Dict[str, object]:
         fps = 30.0
 
     nf = st.get("nb_frames", None)
+    if (nf is None or str(nf).strip() == "" or str(nf) == "N/A") and _tail_frame_count_enabled():
+        nf = _tail_timestamp_frame_count(video_path, st, info.get("format") or {}, fps)
     if nf is None or str(nf).strip() == "" or str(nf) == "N/A":
         # Fast fallback: count packets without decoding
         fallback_cmd = [
@@ -526,7 +639,8 @@ def decode_video_to_memmap_gray8(
                 while filled < need:
                     nread = proc.stdout.readinto(view[filled:])
                     if nread is None or nread <= 0:
-                        raise RuntimeError(f'Unexpected EOF while decoding frames starting at {start}/{num_frames}')
+                        raise RuntimeError(f'Unexpected EOF while decoding frames starting at {start}/{num_frames}; the input '
+                                               'has fewer frames than probed (YOLO_TTA_FRAME_COUNT_FULL_SCAN=1 counts every packet)')
                     filled += int(nread)
                 pbar.update(int(nframes))
         if strict_frame_count and proc.stdout.read(1):
@@ -629,6 +743,8 @@ def decode_video_to_memmap_gray8_streaming(
             )
             _register_streaming_subprocess(proc)
             assert proc.stdout is not None
+            decode_started = time.monotonic()
+            read_seconds = 0.0
             with tqdm(total=num_frames, desc='Streaming decode input volume (gray8)') as pbar:
                 for start in range(0, int(num_frames), int(chunk_frames)):
                     if streaming_producers_aborted():
@@ -639,15 +755,33 @@ def decode_video_to_memmap_gray8_streaming(
                     view = raw_bytes[offset:offset + need]
                     filled = 0
                     while filled < need:
+                        read_started = time.monotonic()
                         nread = proc.stdout.readinto(view[filled:])
+                        read_seconds += time.monotonic() - read_started
                         if nread is None or nread <= 0:
-                            raise RuntimeError(f'Unexpected EOF while decoding frames starting at {start}/{num_frames}')
+                            raise RuntimeError(f'Unexpected EOF while decoding frames starting at {start}/{num_frames}; the input '
+                                               'has fewer frames than probed (YOLO_TTA_FRAME_COUNT_FULL_SCAN=1 counts every packet)')
                         filled += int(nread)
                     for frame_idx in range(int(start), int(start) + int(nframes)):
                         readiness.mark_slice_ready(int(frame_idx))
                     pbar.update(int(nframes))
             readiness.mark_all_ready()
-            runtime_trace_event('startup_decode_frames_read', streaming=True, frames=int(num_frames))
+            # ffmpeg CPU is a child process, so the process CPU gauge never sees it.
+            # cores = ffmpeg_cpu / wall shows whether decode was CPU-bound; read
+            # time close to wall with few cores means the pipe or input was the limit.
+            decode_wall = time.monotonic() - decode_started
+            ffmpeg_cpu = _process_cpu_seconds(proc.pid)
+            runtime_trace_event('startup_decode_frames_read', streaming=True, frames=int(num_frames),
+                                wall_seconds=round(decode_wall, 3), read_seconds=round(read_seconds, 3),
+                                ffmpeg_cpu_seconds=round(ffmpeg_cpu, 3),
+                                ffmpeg_cores=(round(ffmpeg_cpu / decode_wall, 2)
+                                              if ffmpeg_cpu >= 0 and decode_wall > 0 else -1.0),
+                                pipe_bytes=int(getattr(proc, '_xta_pipe_bytes', 0)),
+                                decode_threads=int(ffmpeg_decode_threads()))
+            print(f'Streaming decode read {int(num_frames)} frames in {decode_wall:.1f}s '
+                  f'(reader blocked {read_seconds:.1f}s; ffmpeg CPU '
+                  f'{(ffmpeg_cpu / decode_wall) if ffmpeg_cpu >= 0 and decode_wall > 0 else float("nan"):.1f} cores; '
+                  f'pipe {int(getattr(proc, "_xta_pipe_bytes", 0)) // 1024} KiB).', flush=True)
         except BaseException as exc:
             # Loud failure: waking every waiter with the root cause is what turns a silent
             # consumer hang into an immediate pipeline abort.

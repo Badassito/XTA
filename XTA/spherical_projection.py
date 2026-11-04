@@ -121,10 +121,32 @@ def _try_spherical_cuda_stage(source, view, shape, bboxes, *, quiet=False):
         if not quiet:
             print(f'Spherical CUDA fallback {view.name}: runtime unavailable ({exc}); using CPU.', flush=True)
         return None
-    from .backprojection import _try_acquire_main_process_gpu_stage, _cancel_main_process_spherical_retirement_request
+    from .backprojection import (_try_acquire_main_process_gpu_stage, _cancel_main_process_spherical_retirement_request,
+                                 _try_acquire_main_process_overlap_gpu_stage, _decline_main_process_overlap)
     from .spherical_projection_cuda import SphericalCudaProjector
 
-    lease = _try_acquire_main_process_gpu_stage(torch, f'Spherical source projection {view.name}')
+    purpose = f'Spherical source projection {view.name}'
+    lease = _try_acquire_main_process_overlap_gpu_stage(torch, purpose)
+    if lease is not None:
+        # Shared with inference: the projector must fit the reserved slice.
+        projector = None
+        try:
+            projector = SphericalCudaProjector(source, view, shape, bboxes, int(lease.device_index),
+                                               max_device_bytes=int(lease.budget_bytes))
+            return _SphericalCudaStage(projector, lease)
+        except SphericalCudaProjectionUnsafeFailure as exc:
+            exc.stage_lease = lease
+            raise
+        except Exception as exc:
+            _close_spherical_cuda_resources(projector, lease)
+            _decline_main_process_overlap(purpose)
+            if not quiet:
+                print(f'Spherical CUDA overlap declined {view.name} ({exc}); trying an exclusive GPU turn.', flush=True)
+        except BaseException:
+            _close_spherical_cuda_resources(projector, lease)
+            raise
+
+    lease = _try_acquire_main_process_gpu_stage(torch, purpose)
     if lease is None:
         if not quiet:
             print(f'Spherical CUDA fallback {view.name}: eligible devices are busy or retiring; using CPU.', flush=True)

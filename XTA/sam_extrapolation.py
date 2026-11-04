@@ -50,6 +50,10 @@ class SamExtrapolationImageCohort:
     group_ids: tuple[str, ...]
 
 
+# Interpolation reuses the same complete-group descriptor and partition rule.
+SamImageCohort = SamExtrapolationImageCohort
+
+
 class SamExtrapolationImageAdmissionError(RuntimeError):
     def __init__(self, cap, oversized):
         self.receipt = dict(configured_cache_bytes=cap, complete_group_required=True,
@@ -92,28 +96,45 @@ def _cohort_prepared(prepared, group_ids, _index=None):
         frame_crop_bounds=demand,tracker_jobs=jobs,tile_inventory=inventory)
 
 
-def plan_sam_extrapolation_image_cohorts(prepared, max_image_bytes):
+def plan_sam_extrapolation_image_cohorts(prepared, max_image_bytes, *, singleton_image_bytes=None):
     """Preflight every complete group, then greedily bound per-frame image unions.
 
     The full immutable observation inventory and original run identities survive
     each subset. A group cannot be split across caches or shortened to fit.
+    ``singleton_image_bytes`` (interpolation only) admits a group above
+    ``max_image_bytes`` but within that larger cap as its own cohort, in plan
+    order; omitted, the partition is exactly the extrapolation rule.
     """
     if isinstance(max_image_bytes,(bool,np.bool_)) or not isinstance(max_image_bytes,(int,np.integer)) or max_image_bytes<1:
         raise ValueError('SAM image cohort budget must be a positive integer')
     cap=int(max_image_bytes)
+    if singleton_image_bytes is not None:
+        if (isinstance(singleton_image_bytes,(bool,np.bool_)) or not isinstance(singleton_image_bytes,(int,np.integer))
+                or singleton_image_bytes<cap):
+            raise ValueError('SAM singleton image cohort budget must be an integer at least the cohort budget')
+        singleton_image_bytes=int(singleton_image_bytes)
     group_ids=tuple(dict.fromkeys(run.group_id for run in prepared.runs))
     index=_cohort_index(prepared)
     single={gid:_cohort_prepared(prepared,(gid,),index) for gid in group_ids}
     def size(subset):
         return sum((b[2]-b[0])*(b[3]-b[1]) for b in subset.frame_crop_bounds.values())
-    oversized=tuple((gid,size(subset)) for gid,subset in single.items() if size(subset)>cap)
+    limit=cap if singleton_image_bytes is None else singleton_image_bytes
+    oversized=tuple((gid,size(subset)) for gid,subset in single.items() if size(subset)>limit)
     if oversized:
-        raise SamExtrapolationImageAdmissionError(cap,oversized)
+        raise SamExtrapolationImageAdmissionError(limit,oversized)
     cohorts=[]
     current=[]
     current_demand={}
     current_bytes=0
     for gid in group_ids:
+        if singleton_image_bytes is not None and size(single[gid])>cap:
+            # Its own separately admitted descriptor; neighbours keep the
+            # ordinary (funded) cap and the original group order.
+            if current:
+                cohorts.append(_cohort_prepared(prepared,current,index))
+            cohorts.append(single[gid])
+            current,current_demand,current_bytes=[],{},0
+            continue
         proposed=dict(current_demand)
         proposed_bytes=current_bytes
         for frame,box in single[gid].frame_crop_bounds.items():
@@ -142,6 +163,20 @@ def plan_sam_extrapolation_image_cohorts(prepared, max_image_bytes):
         tuple(g.group_id for g in subset.groups)) for subset in cohorts)
 
 
+# Shared complete-group partition. Interpolation removes intrinsically
+# oversized groups (recorded refusals) before calling it.
+plan_sam_image_cohorts = plan_sam_extrapolation_image_cohorts
+
+
+def sam_image_group_demands(prepared):
+    """Per complete original group, the planner's per-frame union crop bytes."""
+    index=_cohort_index(prepared)
+    group_ids=tuple(dict.fromkeys(run.group_id for run in prepared.runs))
+    return {gid:sum((b[2]-b[0])*(b[3]-b[1]) for b in
+                    _cohort_prepared(prepared,(gid,),index).frame_crop_bounds.values())
+            for gid in group_ids}
+
+
 def _image_cohort_identity(prepared):
     return hashlib.sha256(json.dumps(dict(settings=prepared.settings_sha256,
         observation_snapshot_sha256=prepared.observation_snapshot_sha256,
@@ -149,11 +184,11 @@ def _image_cohort_identity(prepared):
         sort_keys=True).encode()).hexdigest()
 
 
-def _bind_image_cache(metadata, cache_ref, prepared, writer=None):
+def _bind_image_cache(metadata, cache_ref, prepared, writer=None, *, operation='extrapolation'):
     if cache_ref is None:
         return
-    if tuple(cache_ref.shape)!=prepared.plan.virtual_shape_tyx:
-        raise ValueError('SAM extrapolation image cache differs from its native frame geometry')
+    if tuple(cache_ref.shape)!=tuple(prepared.plan.virtual_shape_tyx or prepared.native_shape):
+        raise ValueError(f'SAM {operation} image cache differs from its native frame geometry')
     if hasattr(cache_ref,'revalidate'):
         cache_ref.revalidate()
     crops=getattr(cache_ref,'frame_crops',())
@@ -163,13 +198,13 @@ def _bind_image_cache(metadata, cache_ref, prepared, writer=None):
             actual=coverage.get(frame)
             if actual is None or not (actual[0]<=needed[0] and actual[1]<=needed[1]
                                       and actual[2]>=needed[2] and actual[3]>=needed[3]):
-                raise ValueError('SAM extrapolation image cache does not cover its planned crop demand')
+                raise ValueError(f'SAM {operation} image cache does not cover its planned crop demand')
     actual=str(getattr(cache_ref,'identity_sha256','') or '')
     frozen=str(metadata.get('image_snapshot_sha256','') or '')
     if frozen and actual and frozen!=actual:
         from .sam_gpu_rendering import same_live_image_geometry
         if not same_live_image_geometry(frozen,cache_ref):
-            raise ValueError('SAM extrapolation retry source image identity changed')
+            raise ValueError(f'SAM {operation} retry source image identity changed')
     if actual:
         metadata.setdefault('image_snapshot_sha256',actual)
         from .sam_gpu_rendering import record_live_image
@@ -194,7 +229,7 @@ def _validate_image_cohorts(prepared, cohorts, *, verify_cohort_ids=True):
     for cohort in cohorts:
         subset=cohort.prepared
         if (subset.plan.observations is not prepared.plan.observations
-                or subset.plan.observations_by_frame is not prepared.plan.observations_by_frame
+                or getattr(subset.plan,'observations_by_frame',None) is not getattr(prepared.plan,'observations_by_frame',None)
                 or subset.observation_buffer_identity!=prepared.observation_buffer_identity
                 or subset.observation_snapshot_sha256!=prepared.observation_snapshot_sha256
                 or subset.settings_sha256!=prepared.settings_sha256
@@ -559,7 +594,9 @@ def _publish(bundle,receipt,destination,metadata,*,cancel_event=None,resource_pr
                     roots=index.roots_by_direction
                     active=(set(frame for frame,owners in index.owners_by_frame.items() if owners[0]),
                             set(frame for frame,owners in index.owners_by_frame.items() if owners[1]))
+                    uses_cyclic=bool(index.uses_cyclic)
                 else:
+                    uses_cyclic=False
                     identity=receipt['selection_identity']
                     policy_hash=receipt['policy_hash']
                     ids=tuple(tuple(rid for rid in receipt['selected_run_ids']
@@ -570,12 +607,17 @@ def _publish(bundle,receipt,destination,metadata,*,cancel_event=None,resource_pr
                     for direction,direction_ids in enumerate(ids):
                         for rid in direction_ids:
                             group=bundle.groups[bundle.runs[rid]['group_id']]
+                            uses_cyclic=uses_cyclic or bool(group.get('frame_addressing'))
                             for frame in receipt['selected_frames_by_run'][rid]:
                                 native=(int(group['frame_addresses'][str(frame)]['native_index'])
                                     if group.get('frame_addressing') else int(frame))
                                 if not 0<=native<shape[0]:
                                     raise ValueError('SAM extrapolation selected frame is outside its native canvas')
                                 active[direction].add(native)
+                if uses_cyclic:
+                    # Start boundary: per-crop cyclic folds perform no file I/O.
+                    from .sam_cyclic import assert_cyclic_implementation_unchanged
+                    assert_cyclic_implementation_unchanged()
                 for name,path in zip(names,paths):
                     store_dir=stages.enter_context(artifact_directory(path,temp_root=runtime_work_dir))
                     outputs.append(IncrementalRawBBoxMaskStoreWriter(shape=shape,store_dir=store_dir,
@@ -642,7 +684,8 @@ def _publish(bundle,receipt,destination,metadata,*,cancel_event=None,resource_pr
             _validate_receipt(bundle,receipt)
             if receipt['selection_identity']!=identity:
                 raise ValueError('SAM extrapolation selection changed during publication')
-            if index is not None and index.uses_cyclic:
+            if uses_cyclic:
+                # Closing boundary for both indexed and unindexed folded owners.
                 from .sam_cyclic import assert_cyclic_implementation_unchanged
                 assert_cyclic_implementation_unchanged()
             for output in outputs:

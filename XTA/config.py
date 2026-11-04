@@ -27,7 +27,7 @@ SCRIPT_VERSION = __version__
 
 SCRIPT_VERSION_COMPACT = ''.join(SCRIPT_VERSION.split('.'))
 
-SCRIPT_BASENAME = f'GPT-6-Astra-Ultra_v{SCRIPT_VERSION}_SLURM.py'
+SCRIPT_BASENAME = f'Opus-5.5_v{SCRIPT_VERSION}_SLURM.py'
 
 def _parse_angles(
     values: Sequence[str] | str | float | int | None,

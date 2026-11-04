@@ -33,6 +33,7 @@ def pipeline_drain(stage, budget, scheduler, *, sam_context=None):
         detector_workspace_preparation=None,
         background_drain_budget=budget, sam_parent_staging=stage, sam_context=sam_context,
         _maybe_prepare_sam_runtime=lambda: None, _maybe_prepare_sam_cpu_source=lambda: None,
+        _maybe_start_sam_checkpoint_digest=lambda: None,
         _reclaim_drained_sam_dense_capacity=lambda: None,
         parent_dense_retired_events=queues.SimpleQueue(),
         parent_confidence_retired_events=queues.SimpleQueue(),

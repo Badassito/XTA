@@ -102,7 +102,7 @@ def test_oversized_index_never_publishes_complete_evidence(tmp_path, monkeypatch
 
 
 def test_index_limit_is_separate_from_manifest_and_mask_bounds(tmp_path, monkeypatch):
-    assert evidence.INDEX_MAX_BYTES == 128 * 1024**2
+    assert evidence.INDEX_MAX_BYTES == evidence._index_max_bytes()
     calls = []
     original = evidence.read_artifact
     def bounded(path, **kwargs):
@@ -113,7 +113,7 @@ def test_index_limit_is_separate_from_manifest_and_mask_bounds(tmp_path, monkeyp
         populate(writer, tmp_path)
         bundle = writer.commit()
     limits = dict(calls)
-    assert limits['index.json'] == 128 * 1024**2
+    assert limits['index.json'] == evidence.INDEX_MAX_BYTES
     assert limits['manifest.json'] == bundle.max_mask_bytes == 64 * 1024**2
 
 
@@ -224,3 +224,12 @@ def test_encoded_bytes_and_decoded_text_leave_scope_before_next_large_allocation
     monkeypatch.setattr(evidence, '_freeze_owned', freeze)
     evidence.SamEvidenceBundle.open(bundle.directory)
     assert events == ['decode', 'bytes_released', 'parse', 'text_released', 'freeze']
+
+
+def test_index_limit_defaults_to_one_gib_and_reads_env(monkeypatch):
+    monkeypatch.delenv('YOLO_TTA_SAM_EVIDENCE_INDEX_MAX_BYTES', raising=False)
+    assert evidence._index_max_bytes() == 1024**3
+    monkeypatch.setenv('YOLO_TTA_SAM_EVIDENCE_INDEX_MAX_BYTES', str(4 * 1024**3))
+    assert evidence._index_max_bytes() == 4 * 1024**3
+    monkeypatch.setenv('YOLO_TTA_SAM_EVIDENCE_INDEX_MAX_BYTES', 'bogus')
+    assert evidence._index_max_bytes() == 1024**3

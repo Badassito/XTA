@@ -313,6 +313,32 @@ def gpu_render_reserve_bytes() -> int:
     """VRAM headroom that must remain free AFTER a resident source-volume upload."""
     return int(max(1.0, _env_float('YOLO_TTA_GPU_RENDER_RESERVE_GIB', 12.0)) * GIB)
 
+def gpu_projection_overlap_enabled() -> bool:
+    """Whether small main-process source projections may share a GPU with inference."""
+    return _env_flag('YOLO_TTA_GPU_PROJECTION_OVERLAP', True)
+
+def gpu_projection_overlap_reserve_bytes() -> int:
+    """Per-GPU VRAM slice that inference-side sizing never counts as free.
+
+    One overlapping main-process source projection may own at most this many
+    device bytes while inference keeps running on the same GPU. Zero when the
+    overlap is disabled, so sizing is then exactly the historical behavior.
+    """
+    if not gpu_projection_overlap_enabled():
+        return 0
+    return int(max(0.0, _env_float('YOLO_TTA_GPU_PROJECTION_OVERLAP_GIB', 4.0)) * GIB)
+
+def gpu_sizing_free_bytes(free_bytes: int) -> int:
+    """Free device bytes for elastic or fallback-capable inference-side sizing.
+
+    Used where an allocation grows to fill free memory (streamed prerender, hole
+    fill) or degrades gracefully when refused (device union). One-time fixed
+    admissions (resident source, Azimuthal texture, D1 bitset) keep their own
+    headroom, which already exceeds the slice; an overlap lease additionally
+    requires the slice plus a margin to be free before it is granted.
+    """
+    return max(0, int(free_bytes) - gpu_projection_overlap_reserve_bytes())
+
 def gpu_render_tblock_slices() -> int:
     """Transient source t-block size for streaming-mode GPU azimuthal prerendering."""
     return max(16, _env_int('YOLO_TTA_GPU_RENDER_TBLOCK_SLICES', 256))
@@ -3789,6 +3815,7 @@ class _GpuWorkerRenderEngine:
         with torch.cuda.stream(self._stream):
             try:
                 free_bytes, _total = torch.cuda.mem_get_info(self.device)
+                free_bytes = gpu_sizing_free_bytes(free_bytes)
             except Exception:
                 free_bytes = 8 * GIB
             source_block_bytes = int(stack_block) * int(plane_h) * int(plane_w)

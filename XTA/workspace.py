@@ -4,17 +4,120 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
+from time import perf_counter as _perf_counter
 from typing import (
     Dict,
     Optional,
 )
 import numpy as np
 
+# RAM headroom probe reads (/proc/meminfo, /proc/self/{cgroup,mountinfo} and
+# each cgroup level's limit/usage/memory.stat). Path.read_text releases the GIL
+# around open/fstat/read/close; in the busy main process (hundreds of threads,
+# few cores) each release costs about one switch interval, so one probe took
+# 12-131 ms (seconds with 6 busy Python threads) and ~1,600 probes per run add
+# up to minutes. On Linux the probe reads these kernel-generated files through
+# libc with the GIL held (_gil_holding_text_reader): same text and errors, no
+# convoy. Every probe stays fresh: it starts after its caller's call, which
+# memfd_ram_headroom's "block sample before headroom" rule and every admission
+# check rely on. No value is cached.
+#
+# Kernel-side waits. /proc/meminfo and the cgroup page-counter files only load
+# counters. Three files can wait on kernel locks: /proc/self/cgroup
+# (cgroup_mutex before Linux 6.8, held across cgroup create/destroy/attach),
+# /proc/self/mountinfo (namespace_sem, O(mounts)) and memory.stat (rstat
+# flush). With the GIL held such a wait stalls every Python thread, so each read
+# class is timed: once one GIL-held read of a class takes longer than the hold
+# limit (default: the interpreter switch interval, the time any thread may
+# already hold the GIL between forced switches), that class is demoted to the
+# GIL-releasing Path.read_text for the rest of the process. A process therefore
+# sees at most one over-limit stall per class. YOLO_TTA_RAM_PROBE_GIL_READS=
+# counters never holds the GIL for the three lock-prone classes; =0 never holds
+# it at all. Releasing every lock-prone read costs ~3 s per two probes with 6
+# busy threads (measured), so it is not the default.
+_GIL_READER_UNRESOLVED = object()
+# The reader in use, None for Path.read_text, or _GIL_READER_UNRESOLVED.
+_GIL_READER = _GIL_READER_UNRESOLVED
+_PATH_READ_TEXT_ORIGINAL = Path.read_text
+_CGROUP_FS_PREFIX = '/sys/fs/cgroup/'
+# Counter files whose read handlers only load page_counter/flag fields.
+_CGROUP_COUNTER_NAMES = frozenset((
+    'memory.max', 'memory.current', 'memory.limit_in_bytes', 'memory.usage_in_bytes',
+    'memory.use_hierarchy'))
+_LOCK_FREE_PROBE_CLASSES = frozenset(('meminfo', 'cgroup_counter'))
+_LOCK_PRONE_PROBE_CLASSES = frozenset(('cgroup_membership', 'mountinfo', 'memory_stat'))
+# Classes still read with the GIL held (demotion removes one; set when resolved).
+_GIL_HELD_CLASSES = set(_LOCK_FREE_PROBE_CLASSES | _LOCK_PRONE_PROBE_CLASSES)
+_GIL_HOLD_LIMIT_SECONDS = 0.005
+# Per class: GIL-held read count and longest duration (updated under the GIL;
+# a racy max is benign), and the classes demoted in this process.
+_GIL_HELD_READ_CALLS: Dict[str, int] = {}
+_GIL_HELD_READ_MAX_SECONDS: Dict[str, float] = {}
+_GIL_HELD_DEMOTED: Dict[str, float] = {}
+
+
+def _probe_read_class(posix: str) -> Optional[str]:
+    """Classify a probe pseudo-file; None means never read with the GIL held."""
+    if posix == '/proc/meminfo':
+        return 'meminfo'
+    if posix == '/proc/self/cgroup':
+        return 'cgroup_membership'
+    if posix == '/proc/self/mountinfo':
+        return 'mountinfo'
+    if posix.startswith(_CGROUP_FS_PREFIX):
+        name = posix.rpartition('/')[2]
+        if name == 'memory.stat':
+            return 'memory_stat'
+        if name in _CGROUP_COUNTER_NAMES:
+            return 'cgroup_counter'
+    return None
+
+
+def _gil_releasing_read_text(path: Path) -> str:
+    """Plain Path.read_text (releases the GIL); a module hook for tests."""
+    return path.read_text()
+
+
+def ram_probe_gil_read_stats() -> Dict[str, object]:
+    """Process-wide GIL-held probe read counts, longest reads and demotions."""
+    calls, longest = dict(_GIL_HELD_READ_CALLS), dict(_GIL_HELD_READ_MAX_SECONDS)
+    return {'ram_probe_gil_held_reads': int(sum(calls.values())),
+            'ram_probe_gil_held_max_seconds': float(max(longest.values(), default=0.0)),
+            'ram_probe_gil_held_reads_by_class': calls,
+            'ram_probe_gil_held_max_seconds_by_class': longest,
+            'ram_probe_gil_held_demoted': dict(_GIL_HELD_DEMOTED),
+            'ram_probe_gil_hold_limit_seconds': float(_GIL_HOLD_LIMIT_SECONDS)}
+
+
+def _probe_read_text(path: Path) -> str:
+    # A replaced Path.read_text (tests) always wins over the reader.
+    if Path.read_text is _PATH_READ_TEXT_ORIGINAL:
+        reader = _GIL_READER
+        if reader is _GIL_READER_UNRESOLVED:
+            reader = _resolve_gil_holding_reader()
+        kind = _probe_read_class(path.as_posix()) if reader is not None else None
+        if kind is not None and kind in _GIL_HELD_CLASSES:
+            started = _perf_counter()
+            try:
+                return reader(path)
+            finally:
+                elapsed = _perf_counter() - started
+                _GIL_HELD_READ_CALLS[kind] = _GIL_HELD_READ_CALLS.get(kind, 0) + 1
+                if elapsed > _GIL_HELD_READ_MAX_SECONDS.get(kind, 0.0):
+                    _GIL_HELD_READ_MAX_SECONDS[kind] = elapsed
+                if elapsed > _GIL_HOLD_LIMIT_SECONDS:
+                    _GIL_HELD_CLASSES.discard(kind)
+                    _GIL_HELD_DEMOTED.setdefault(kind, elapsed)
+        return _gil_releasing_read_text(path)
+    return path.read_text()
+
+
 def _read_meminfo_bytes() -> Dict[str, int]:
     info: Dict[str, int] = {}
     try:
-        for line in Path('/proc/meminfo').read_text().splitlines():
+        for line in _probe_read_text(Path('/proc/meminfo')).splitlines():
             parts = line.split(':', 1)
             if len(parts) != 2:
                 continue
@@ -28,7 +131,7 @@ def _read_meminfo_bytes() -> Dict[str, int]:
 def _cgroup_read_int(path: Path) -> Optional[int]:
     """Read a nonnegative counter; zero differs from an unreadable counter."""
     try:
-        raw = path.read_text().strip()
+        raw = _probe_read_text(path).strip()
     except Exception:
         return None
     if not raw.isascii() or not raw.isdigit():
@@ -46,7 +149,7 @@ def _cgroup_reclaimable_file_bytes(node: Path, *, v2: bool) -> int:
         keys = ('total_inactive_file', 'total_dirty', 'total_writeback')
     found: Dict[str, int] = {}
     try:
-        for line in (node / 'memory.stat').read_text().splitlines():
+        for line in _probe_read_text(node / 'memory.stat').splitlines():
             parts = line.split()
             if len(parts) == 2 and parts[0] in keys:
                 if (parts[0] in found or not parts[1].isascii()
@@ -97,13 +200,13 @@ def _cgroup_memory_budget(*, verify_enforcement: bool = True) -> tuple[Optional[
     Headroom-only callers skip mount discovery and never receive a cap proof.
     """
     try:
-        cgroup_text = Path('/proc/self/cgroup').read_text()
+        cgroup_text = _probe_read_text(Path('/proc/self/cgroup'))
     except Exception:
         return None, None
     mountinfo = ''
     if verify_enforcement:
         try:
-            mountinfo = Path('/proc/self/mountinfo').read_text()
+            mountinfo = _probe_read_text(Path('/proc/self/mountinfo'))
         except Exception:
             pass
     headroom: Optional[int] = None
@@ -134,7 +237,7 @@ def _cgroup_memory_budget(*, verify_enforcement: bool = True) -> tuple[Optional[
         node = base / cg_path.lstrip('/')
         while node == base or base in node.parents:
             try:
-                raw_limit = (node / limit_name).read_text().strip()
+                raw_limit = _probe_read_text(node / limit_name).strip()
             except FileNotFoundError:
                 # A controller need not expose a limit at every ancestry level.
                 raw_limit = None
@@ -192,6 +295,121 @@ def available_anon_work_bytes(*, meminfo: Optional[Dict[str, int]] = None) -> in
     # is an uncatchable SIGKILL that bypasses the MemoryError -> disk-memmap fallback, so err on
     # the tight side.
     return min(node_avail, int(cgroup_headroom))
+
+
+# In-kernel pseudo filesystems whose reads never wait on storage or a daemon.
+_KERNEL_PSEUDO_FSTYPES = frozenset((
+    'proc', 'sysfs', 'cgroup', 'cgroup2', 'tmpfs', 'devtmpfs', 'devpts', 'binfmt_misc',
+    'securityfs', 'debugfs', 'tracefs', 'bpf', 'pstore', 'configfs', 'fusectl', 'efivarfs',
+    'hugetlbfs', 'mqueue', 'autofs', 'rpc_pipefs', 'nsfs', 'selinuxfs'))
+
+
+def _probe_mounts_kernel_backed(mountinfo: str) -> bool:
+    """True when /proc and /sys carry only in-kernel filesystems.
+
+    lxcfs (FUSE) commonly overlays /proc/meminfo in containers; a read there
+    waits on a userspace daemon, so it must not run with the GIL held.
+    """
+    found_proc = False
+    for line in mountinfo.splitlines():
+        before, separator, after = line.partition(' - ')
+        fields, filesystem = before.split(), after.split()
+        if not separator or len(fields) < 5 or not filesystem:
+            continue
+        mountpoint = re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), fields[4])
+        if mountpoint in ('/proc', '/sys') or mountpoint.startswith(('/proc/', '/sys/')):
+            if filesystem[0] not in _KERNEL_PSEUDO_FSTYPES:
+                return False
+            found_proc = found_proc or (mountpoint == '/proc' and filesystem[0] == 'proc')
+    return found_proc
+
+
+def _gil_holding_text_reader(libc=None):
+    """Return a Linux reader for small /proc and cgroupfs files that keeps the GIL.
+
+    _probe_read_text uses it only for _gil_held_read_allowed files. These
+    pseudo-files are generated in memory and never wait on storage, so
+    the reader calls libc through ctypes.PyDLL (which does not release the
+    GIL). The text and errors match Path.read_text: locale encoding with strict
+    decoding, universal newlines, and the errno-specific OSError subclass. It is
+    reentrant (one buffer per call), so any thread may use it. Returns None (use
+    Path.read_text) when unavailable or disabled by YOLO_TTA_RAM_PROBE_GIL_READS=0
+    or when /proc or /sys carries a non-kernel (e.g. lxcfs/FUSE) mount. ``libc``
+    is a test hook for a GIL-holding C runtime on other platforms.
+    """
+    if libc is None and (not sys.platform.startswith('linux')
+                         or not _env_flag('YOLO_TTA_RAM_PROBE_GIL_READS', True)):
+        return None
+    if libc is None:
+        try:
+            mountinfo = Path('/proc/self/mountinfo').read_text()
+        except Exception:
+            return None
+        if not _probe_mounts_kernel_backed(mountinfo):
+            return None
+    try:
+        import ctypes
+        import errno
+        import io
+        import locale
+        if libc is None:
+            libc = ctypes.PyDLL(None, use_errno=True)
+        c_open, c_read, c_close = libc.open, libc.read, libc.close
+        c_open.argtypes, c_open.restype = (ctypes.c_char_p, ctypes.c_int), ctypes.c_int
+        c_read.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t)
+        c_read.restype = ctypes.c_ssize_t
+        c_close.argtypes, c_close.restype = (ctypes.c_int,), ctypes.c_int
+        encoding = io.text_encoding(None)
+        if encoding == 'locale':
+            encoding = (locale.getencoding() if hasattr(locale, 'getencoding')
+                        else locale.getpreferredencoding(False))
+        ''.encode(encoding)  # validate the codec once
+    except Exception:
+        return None
+    flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_BINARY', 0)
+    size = 65536
+    create_buffer, string_at, get_errno = ctypes.create_string_buffer, ctypes.string_at, ctypes.get_errno
+
+    def read(path: Path) -> str:
+        fd = c_open(os.fsencode(path), flags)
+        if fd < 0:
+            err = get_errno()
+            raise OSError(err, os.strerror(err), str(path))
+        try:
+            buffer = create_buffer(size)
+            chunks = []
+            while True:
+                count = c_read(fd, buffer, size)
+                if count < 0:
+                    err = get_errno()
+                    if err == errno.EINTR:
+                        continue
+                    raise OSError(err, os.strerror(err), str(path))
+                if count == 0:
+                    break
+                chunks.append(string_at(buffer, count))
+        finally:
+            c_close(fd)
+        text = b''.join(chunks).decode(encoding)
+        return text.replace('\r\n', '\n').replace('\r', '\n') if '\r' in text else text
+    return read
+
+
+def _resolve_gil_holding_reader():
+    """Pick the probe reader once per process (a benign race may build it twice)."""
+    global _GIL_READER, _GIL_HOLD_LIMIT_SECONDS
+    reader = _GIL_READER
+    if reader is _GIL_READER_UNRESOLVED:
+        reader = _gil_holding_text_reader()
+        if reader is not None:
+            limit_ms = _env_float('YOLO_TTA_RAM_PROBE_GIL_HOLD_LIMIT_MS', 0.0)
+            _GIL_HOLD_LIMIT_SECONDS = (limit_ms / 1e3 if limit_ms > 0
+                                       else float(sys.getswitchinterval()))
+            if os.environ.get('YOLO_TTA_RAM_PROBE_GIL_READS', '').strip().lower() == 'counters':
+                _GIL_HELD_CLASSES.difference_update(_LOCK_PRONE_PROBE_CLASSES)
+        _GIL_READER = reader
+    return reader
+
 
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)

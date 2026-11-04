@@ -107,7 +107,7 @@ def build(*, root: Path, output: Path, readme: Path | None = None,
     if version_check['target_version'] != version or (
             not snapshot and version_check['head_commit'] != source):
         raise ValueError('Source identity changed during the release-version check; retry from a stable checkout')
-    launcher = f'GPT-6-Astra-Ultra_v{version}_SLURM.py'
+    launcher = f'Opus-5.5_v{version}_SLURM.py'
     if launcher not in payloads:
         raise ValueError(f'Expected versioned launcher is absent: {launcher}')
     launchers = [name for name in payloads if name.endswith('_SLURM.py')]

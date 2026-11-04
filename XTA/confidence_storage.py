@@ -1,10 +1,13 @@
 """Sparse numeric confidence blocks with explicit payload coordinates."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import os
 from pathlib import Path
 import struct
+import threading
 import time
 import zlib
 from collections import deque
@@ -20,6 +23,13 @@ BLOCK_DTYPE = np.dtype([('z','<u4'), ('y','<u4'), ('x','<u4'), ('h','<u2'),
                        ('w','<u2'), ('offset','<u8'), ('length','<u4')])
 _RECORD = struct.Struct('<IIIHHQI')
 _CROP_OCCUPANCY_BAND_BYTES = 8 * 1024 * 1024
+# Native score-block decode batches. iter_crops keeps at most one bounded
+# decoded batch of one frame live; whole-volume scatter batches whole frames by
+# stored bytes so cancellation and the failure fallback stay frame-granular.
+_INFLATE_DECODED_BATCH_BYTES = 8 * 1024 * 1024
+_INFLATE_SCATTER_BATCH_BYTES = 8 * 1024 * 1024
+# One positioned read per batch where the platform has it (no seek+read pair).
+_PREADV = getattr(os, 'preadv', None)
 
 
 class ConfidenceStageLimit(RuntimeError):
@@ -414,6 +424,14 @@ class BlockScoreReader:
     """Read small independent score crops; index mappings are explicitly closable."""
     def __init__(self, reference):
         self._closed=False
+        self._payload=None
+        self._payload_lock=threading.Lock()
+        # Index readers in flight (GIL-free kernels included); close() defers
+        # unmapping the index until the last one leaves.
+        self._index_pins=0
+        self._inflater=None
+        self._frame_bounds=None
+        self.decode_backend=None
         self.reference = reference
         self.shape = reference.storage_shape
         metadata = reference.metadata
@@ -454,13 +472,85 @@ class BlockScoreReader:
         z = int(z)
         if not 0 <= z < self.shape[0]:
             raise IndexError('Confidence crop is outside its payload grid')
-        first,stop = np.searchsorted(self.index['z'],(z,z+1))
+        first,stop = self._frame_records(z)
+        inflater = self._native_inflater() if stop > first else None
+        if inflater is None:
+            yield from self._python_crops(first,stop)
+            return
+        number = first
+        while number < stop:
+            if self._closed:
+                raise RuntimeError('Confidence block reader is closed')
+            # The pin keeps the index mapped while the GIL-free kernel reads it
+            # (a concurrent close() would otherwise unmap it under the kernel);
+            # it is never held across a yield.
+            with self._index_pin():
+                # Plan the batch with GIL-held Python on the frame's index rows:
+                # at least one block, then whole blocks up to the decoded budget.
+                rows,starts,total = [],[],0
+                for row in self.index[number:stop].tolist():
+                    area = row[3]*row[4]
+                    if rows and total+area > _INFLATE_DECODED_BATCH_BYTES:
+                        break
+                    rows.append(row)
+                    starts.append(total)
+                    total += area
+                count = len(rows)
+                base = rows[0][5]
+                payload = self._read_payload(base,rows[-1][5]+rows[-1][6]-base)
+                if payload is not None:
+                    decoded,done,status = inflater.inflate_blocks(payload,self.index[number:number+count],
+                                                                  base,np.array(starts,np.int64),total)
+            if payload is None:
+                # Short read: the original decoder owns the exact failure.
+                yield from self._python_crops(number,stop)
+                return
+            payload = None
+            decoded.setflags(write=False)
+            for (_,y,x,h,w,_,_),start in zip(rows[:done],starts):
+                if self._closed:
+                    raise RuntimeError('Confidence block reader is closed')
+                yield y,y+h,x,x+w,decoded[start:start+h*w].reshape(h,w)
+            decoded = None
+            if status:
+                # Any native rejection re-runs Python zlib from that block so the
+                # exception type, message and preceding yields stay identical.
+                yield from self._python_crops(number+done,stop)
+                return
+            number += count
+
+    def _frame_records(self,z):
+        """Index row range of frame z (the index is z-sorted; computed once)."""
+        bounds = self._frame_bounds
+        if bounds is None:
+            with self._index_pin():
+                bounds = np.searchsorted(self.index['z'],np.arange(self.shape[0]+1)).tolist()
+            self._frame_bounds = bounds
+        return bounds[z],bounds[z+1]
+
+    def iter_python_crops(self,z):
+        """The original per-block reader for one frame (fallback and oracle)."""
+        if self._closed:
+            raise RuntimeError('Confidence block reader is closed')
+        z = int(z)
+        if not 0 <= z < self.shape[0]:
+            raise IndexError('Confidence crop is outside its payload grid')
+        with self._index_pin():
+            first,stop = np.searchsorted(self.index['z'],(z,z+1))
+        yield from self._python_crops(int(first),int(stop))
+
+    def _python_crops(self,first,stop):
+        """Original per-block Python zlib decode; authoritative for every failure."""
+        if first >= stop:
+            return
         with (self.reference.path/'scores.u8.zlib').open('rb') as stream:
             for number in range(int(first),int(stop)):
                 if self._closed:
                     raise RuntimeError('Confidence block reader is closed')
-                record=self.index[number]
-                y,x,h,w,offset,length = (int(record[k]) for k in ('y','x','h','w','offset','length'))
+                with self._index_pin():
+                    record=self.index[number]
+                    y,x,h,w,offset,length = (int(record[k]) for k in ('y','x','h','w','offset','length'))
+                    record=None
                 stream.seek(offset)
                 encoded = stream.read(length)
                 decoder = zlib.decompressobj()
@@ -469,12 +559,162 @@ class BlockScoreReader:
                     raise ValueError('Confidence score block is truncated or malformed')
                 yield y,y+h,x,x+w,np.frombuffer(raw,np.uint8).reshape(h,w)
 
-    def close(self):
-        self._closed=True
+    def _native_inflater(self):
+        if self._inflater is None:
+            from .confidence_native_inflate import native_confidence_inflater
+            inflater,receipt = native_confidence_inflater()
+            self._inflater = inflater if inflater is not None else False
+            self.decode_backend = receipt['backend']
+        return self._inflater or None
+
+    def _read_payload(self,base,size):
+        """Read one contiguous stored range; the payload is opened once per reader.
+
+        Returns None on a short read so the caller can let the original decoder
+        report that failure.
+        """
+        payload = np.empty(size,np.uint8)
+        view = memoryview(payload)
+        with self._payload_lock:
+            if self._closed:
+                raise RuntimeError('Confidence block reader is closed')
+            if self._payload is None:
+                self._payload = (self.reference.path/'scores.u8.zlib').open('rb',buffering=0)
+            stream = self._payload
+            filled = 0
+            if _PREADV is not None:
+                while filled < size:
+                    read = _PREADV(stream.fileno(),[view[filled:]],base+filled)
+                    if not read:
+                        return None
+                    filled += read
+                return payload
+            stream.seek(base)
+            while filled < size:
+                read = stream.readinto(view[filled:])
+                if not read:
+                    return None
+                filled += read
+        return payload
+
+    def scatter_into(self,output,*,before_batch=None,progress=None):
+        """Assign every stored crop into a full-grid array in record order.
+
+        Equivalent to ``output[z,y0:y1,x0:x1] = crop`` for each item of
+        ``iter_crops(z)`` over all z. ``before_batch`` runs before each decode
+        batch (at least once when the grid has frames). ``progress`` receives
+        ``decoded_bytes`` exactly as that loop would count them, also when a
+        failure interrupts it, plus ``decode_batches`` and ``decode_backend``.
+        """
+        progress = {} if progress is None else progress
+        progress.setdefault('decoded_bytes',0)
+        progress.setdefault('decode_batches',0)
+        if self._closed:
+            raise RuntimeError('Confidence block reader is closed')
+        count = len(self.index)
+        inflater = self._native_inflater() if count else None
+        if (inflater is None or not isinstance(output,np.ndarray) or output.dtype != np.uint8
+                or tuple(output.shape) != tuple(self.shape) or not output.flags.c_contiguous
+                or not output.flags.writeable):
+            progress['decode_backend'] = 'python_zlib'
+            for z in range(self.shape[0]):
+                if before_batch is not None:
+                    before_batch()
+                for y0,y1,x0,x1,crop in self.iter_crops(z):
+                    output[z,y0:y1,x0:x1] = crop
+                    progress['decoded_bytes'] += int(crop.nbytes)
+            return output
+        progress['decode_backend'] = self.decode_backend
+        with self._index_pin():
+            zs = np.asarray(self.index['z'],np.int64)
+            offsets = np.asarray(self.index['offset'],np.int64)
+            ends = offsets+np.asarray(self.index['length'],np.int64)
+        frame_starts = np.concatenate(([0],np.flatnonzero(zs[1:]!=zs[:-1])+1,[count])).tolist()
+        frames = len(frame_starts)-1
+        frame = 0
+        while frame < frames:
+            if before_batch is not None:
+                before_batch()
+            if self._closed:
+                raise RuntimeError('Confidence block reader is closed')
+            first = frame_starts[frame]
+            base = int(offsets[first])
+            last = frame+1
+            while (last < frames and int(ends[frame_starts[last+1]-1])-base
+                   <= _INFLATE_SCATTER_BATCH_BYTES):
+                last += 1
+            stop = frame_starts[last]
+            # The pin keeps the index mapped while the GIL-free kernel reads
+            # ``records`` (see iter_crops).
+            with self._index_pin():
+                payload = self._read_payload(base,int(ends[stop-1])-base)
+                records = self.index[first:stop]
+                if payload is None:
+                    done,status,decoded = 0,-1,0
+                else:
+                    done,status,decoded = inflater.inflate_scatter(payload,records,base,output)
+                payload = None
+                progress['decode_batches'] += 1
+                if not status:
+                    records = None
+                    progress['decoded_bytes'] += decoded
+                    frame = last
+                    continue
+                # Count only the whole frames the per-crop loop would have finished,
+                # then re-run Python zlib from the failing frame's first block. Its
+                # earlier native assignments repeat identically and in order.
+                failed_z,last_z = int(zs[first+done]),int(zs[stop-1])
+                finished = records[:int(np.searchsorted(zs,failed_z))-first]
+                progress['decoded_bytes'] += int((finished['h'].astype(np.int64)*finished['w']).sum())
+                records = finished = None
+            for z in range(failed_z,last_z+1):
+                if z != failed_z and before_batch is not None:
+                    before_batch()
+                for y0,y1,x0,x1,crop in self.iter_python_crops(z):
+                    output[z,y0:y1,x0:x1] = crop
+                    progress['decoded_bytes'] += int(crop.nbytes)
+            frame = last
+        return output
+
+    @contextlib.contextmanager
+    def _index_pin(self):
+        """Keep the index mapping open for a bounded index read or kernel call.
+
+        Raises the closed-reader error if close() already ran. Never hold a pin
+        across a generator yield: close() would defer the unmap until resumed.
+        """
+        with self._payload_lock:
+            if self._closed:
+                raise RuntimeError('Confidence block reader is closed')
+            self._index_pins += 1
+        try:
+            yield
+        finally:
+            with self._payload_lock:
+                self._index_pins -= 1
+                if self._closed and not self._index_pins:
+                    self._release_index()
+
+    def _release_index(self):
         array = getattr(self,'index',None)
         mapping = getattr(array,'_mmap',None)
         if mapping is not None and not mapping.closed:
             mapping.close()
+
+    def close(self):
+        self._closed=True
+        lock = getattr(self,'_payload_lock',None)
+        if lock is None:
+            self._release_index()
+            return
+        with lock:
+            payload, self._payload = self._payload, None
+            # A pinned GIL-free kernel may still read the index: the last pin
+            # to leave unmaps it instead (see _index_pin).
+            if not getattr(self,'_index_pins',0):
+                self._release_index()
+        if payload is not None:
+            payload.close()
 
     def __del__(self):
         self.close()

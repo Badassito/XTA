@@ -60,10 +60,14 @@ def test_tta_interval_longer_than_lta_partition_retains_all_requested_frames():
     assert all(len(run.expected_frames) == 36 for run in prepared.runs)
 
 
-def test_declared_topology_budget_fails_before_image_or_tracker_admission():
-    with pytest.raises(SamInterpolationInfrastructureError, match='topology.*before tracker admission'):
-        prepare_sam_interpolation_pass(_observations(),
-            policy={'sam_bridge_policy': {'max_group_bytes': 1}}, **options())
+def test_declared_topology_budget_refuses_group_before_image_or_tracker_admission():
+    # A group over the declared topology budget is refused by planning (a warned,
+    # incomplete scope) rather than raising and stopping the whole run.
+    prepared = prepare_sam_interpolation_pass(_observations(),
+        policy={'sam_bridge_policy': {'max_group_bytes': 1}}, **options())
+    assert prepared.runs == ()
+    assert prepared.plan.groups and all(
+        'topology_workspace_memory_limit' in group.reasons for group in prepared.plan.groups)
 
 
 def test_prepared_plan_rejects_replaced_buffer_changed_flags_and_mutated_original(tmp_path):

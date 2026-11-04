@@ -162,6 +162,19 @@ def _sam_scheduler_sample():
         **{key: sum(row[key] for row in snapshots) for key in _SAM_SNAPSHOT_COUNTS})
 
 
+def _largest_view_first_enabled():
+    """YOLO_TTA_SAM_LARGEST_VIEW_FIRST=0 restores plain scope round-robin."""
+    return os.environ.get('YOLO_TTA_SAM_LARGEST_VIEW_FIRST', '1').strip().lower() not in {
+        '0', 'false', 'no', 'off'}
+
+
+def _cache_work_volume(cache_ref):
+    try:
+        return max(0, int(np.prod([int(value) for value in cache_ref.shape], dtype=np.int64)))
+    except Exception:
+        return 0  # Diagnostics-only priority; an unusual reference keeps round-robin.
+
+
 def _register_sam_scheduler_sample(tracker):
     """Use existing sampling only; a module provider retains no tracker."""
     try:
@@ -548,7 +561,8 @@ def _execute_interpolation_tracker_task(context, kind, payload):
     receipt = {key: result[key] for key in receipt_keys}
     sam_runtime = dict(_jsonable(context.sam_runtime))
     worker_startup = {key: sam_runtime.pop(key) for key in (
-        'startup_cuda_quiescence', 'cuda_allocator_quota', 'resident_cpu_bytes') if key in sam_runtime}
+        'startup_cuda_quiescence', 'cuda_allocator_quota', 'resident_cpu_bytes', 'gc_freeze',
+        'checkpoint_digest_basis') if key in sam_runtime}
     manifest = {
         "schema": "xta.sam-raw-tracker-run/1", "run_id": str(payload["run_id"]),
         "status": "invalid_removed_object" if bool(removed.any()) else "complete",
@@ -774,6 +788,9 @@ class _TrackerScope:
     producer_state: str | None = None
     preparation_thread_id: int | None = None
     independent_preparation: bool = False
+    # Native view voxels (T*Y*X of the image cache): the dispatch-order proxy
+    # for how much SAM and post-SAM serial work this view still carries.
+    work_volume: int = 0
 
     @property
     def window(self):
@@ -823,6 +840,8 @@ class _PoolScheduler:
             tracker._capture_worker_inventory()
         self._round_robin = deque(tracker._scopes)
         self._curved_since_cheap = 0
+        self._largest_view_first = _largest_view_first_enabled()
+        self._largest_view_turns = 0
         self._error = None
         self._stopping = False
         self._thread = threading.Thread(target=self._run, name='sam-pool-scheduler', daemon=True)
@@ -881,10 +900,12 @@ class _PoolScheduler:
         if classes == {'curved', 'cheap'}:
             # Three expensive-view turns leave a bounded turn for CPU-ready work.
             preferred = 'cheap' if self._curved_since_cheap >= 3 else 'curved'
-            selected = next(scope for scope in ready if scope.view_class == preferred)
+            candidates = [scope for scope in ready if scope.view_class == preferred]
         else:
-            selected = ready[0]
-        if classes <= {'curved', 'cheap'}:
+            candidates = ready
+        selected = self._largest_view_pick(candidates)
+        if classes <= {'curved', 'cheap'} or selected is not candidates[0]:
+            # A largest-view pick moves only itself, so peers keep their turns.
             self._round_robin.remove(selected.token)
             self._round_robin.append(selected.token)
         else:
@@ -892,6 +913,29 @@ class _PoolScheduler:
                 self._round_robin.rotate(-1)
             self._round_robin.rotate(-1)
         return selected
+
+    def _largest_view_pick(self, candidates):
+        """Favour the largest native view on three of every four contested turns.
+
+        Large views (Azimuthal, Cartesian) carry the longest chains: their SAM
+        stages are followed by long serial selection/publication/extrapolation
+        planning. Round-robin by scope gave them the same share as a small patch,
+        so their chains finished last and left GPUs idle. The fourth turn keeps
+        the original round-robin pick, so no continuously ready scope starves.
+        Equal volumes, or the switch off, reproduce the original choice exactly.
+        """
+        first = candidates[0]
+        if not getattr(self, '_largest_view_first', False):
+            return first
+        largest = max(candidates, key=lambda scope: getattr(scope, 'work_volume', 0))
+        if largest is first or getattr(largest, 'work_volume', 0) <= getattr(first, 'work_volume', 0):
+            return first
+        turns = getattr(self, '_largest_view_turns', 0)
+        if turns >= 3:
+            self._largest_view_turns = 0
+            return first
+        self._largest_view_turns = turns + 1
+        return largest
 
     def _dispatch(self, scope):
         from .lta_workers import LtaWorkerTask
@@ -1232,7 +1276,7 @@ class SamInterpolationTracker:
                 consumer_held_jobs=sum(scope.transfer_held for scope in scopes),
                 scope_consumers=[dict(scope_token=scope.token,
                     parent_scope_id=getattr(getattr(scope.admission, '_profile', None), 'scope_id', None),
-                    view_class=scope.view_class,
+                    view_class=scope.view_class, work_volume=scope.work_volume,
                     producer_thread_id=scope.producer_thread_id, held_run_id=scope.held_run_id,
                     held_seconds=max(0., time.perf_counter()-scope.transfer_received_perf_counter)
                         if scope.transfer_held else 0.,
@@ -1379,6 +1423,9 @@ class SamInterpolationTracker:
         from .lta_cpu import resolve_worker_cpu_budget
         fractions = (self.cuda_allocator_fractions if cuda_allocator_fractions is None
             and self._progressive_pool is None else cuda_allocator_fractions)
+        from .sam_checkpoint_digest import checkpoint_digest_receipt
+        # Non-blocking: an unfinished/absent prefetch leaves worker hashing as before.
+        digest_receipt = checkpoint_digest_receipt(self.model_path)
         return LtaWorkerInit(adapter_module='XTA.sam_tracker_runtime',
             adapter_factory='build_interpolation_predictor', adapter_execute='execute_interpolation_tracker_task',
             adapter_shutdown='close_interpolation_predictor', adapter_config=dict(
@@ -1388,7 +1435,8 @@ class SamInterpolationTracker:
                 feature_cache_headroom_bytes=self.feature_cache_headroom_bytes,
                 sam_global_cpu_budget=resolve_worker_cpu_budget(self.worker_count),
                 sam_workers_per_device=self.workers_per_device if fractions is not None else 1,
-                **({'cuda_allocator_fractions': fractions} if fractions is not None else {})))
+                **({'cuda_allocator_fractions': fractions} if fractions is not None else {}),
+                **({'checkpoint_digest': digest_receipt} if digest_receipt is not None else {})))
 
     def register_device_pool(self, device_id, pool, *, cuda_allocator_fraction=None, admission_callback=None):
         """Publish a proven ready cohort only after its residency is promoted."""
@@ -1648,7 +1696,8 @@ class SamInterpolationTracker:
                 scope = _TrackerScope(uuid.uuid4().hex, cache_ref, key, capacity,
                     lookahead, deferred, admission, limits if admission is not None else None,
                     family_dispatch, getattr(_SAM_VIEW_PRODUCER, 'view_class', None),
-                    view_family=getattr(_SAM_VIEW_PRODUCER, 'view_family', 'unknown'))
+                    view_family=getattr(_SAM_VIEW_PRODUCER, 'view_family', 'unknown'),
+                    work_volume=_cache_work_volume(cache_ref))
                 proof = self._source_cache_retirement_proofs.setdefault(key, dict(
                     complete=False, all_gray_mappings_retired=True, completed_runs=0,
                     active_scopes=0, failed_scopes=0))
@@ -2191,9 +2240,16 @@ def build_interpolation_predictor(config: Mapping[str, object]):
         if getattr(tracker, "fill_hole_area", None) != 0:
             raise RuntimeError("raw SAM interpolation requires SDK output hole filling disabled")
         bundle = resolve_local_sam_bundle(str(config["model_path"]))
+        from .sam_checkpoint_digest import validated_digest
+        # Same post-load point as the local hash; reuse needs an unchanged identity.
+        checkpoint_sha256 = validated_digest(config.get("checkpoint_digest"), bundle.checkpoint_path)
+        digest_basis = "coordinator_prefetch_identity_verified"
+        if checkpoint_sha256 is None:
+            checkpoint_sha256 = _sha256(bundle.checkpoint_path)
+            digest_basis = "worker_hash"
         context.sam_model = {
             "checkpoint_path": str(bundle.checkpoint_path),
-            "checkpoint_sha256": _sha256(bundle.checkpoint_path),
+            "checkpoint_sha256": checkpoint_sha256,
             "checkpoint_identity_sha256": bundle.checkpoint_identity_sha256,
             "model_version": bundle.model_version,
             "bpe_path": None if bundle.bpe_path is None else str(bundle.bpe_path),
@@ -2245,15 +2301,43 @@ def build_interpolation_predictor(config: Mapping[str, object]):
                 worker_index=int(os.environ.get('LTA_WORKER_INDEX', '0')),
                 execution_device_id=int(os.environ.get('LTA_EXECUTION_DEVICE_ID', '0')),
                 enforcement='torch_caching_allocator_fraction')
+        if config.get("checkpoint_digest") is not None:
+            # Startup receipt only: removed from sam_runtime before identity use.
+            context.sam_runtime['checkpoint_digest_basis'] = digest_basis
         try:
             import psutil
             context.sam_runtime['resident_cpu_bytes'] = int(psutil.Process().memory_info().rss)
         except (ImportError, OSError):
             context.sam_runtime['resident_cpu_bytes'] = None
+        context.sam_runtime['gc_freeze'] = _freeze_worker_startup_heap()
     except BaseException:
         close_worker_predictor(context)
         raise
     return context
+
+
+def _freeze_worker_startup_heap():
+    """Move the loaded model/library heap out of later full GC scans.
+
+    The pinned SDK runs ``gc.collect()`` on every ``close_session``. Without this,
+    each collection traverses the ~400k objects of the resident model, Torch and
+    imported modules (~130 ms per session on a Ryzen 8845HS), during which this
+    worker submits no GPU work. Objects created after the freeze (session state,
+    tensors, cycles) are still tracked and collected normally, so session cleanup
+    and CUDA retirement are unchanged. Startup garbage is collected first so it
+    is not frozen. ``YOLO_TTA_SAM_GC_FREEZE=0`` keeps the previous behavior.
+    """
+    import gc
+    from .runtime import _env_flag
+
+    if not _env_flag('YOLO_TTA_SAM_GC_FREEZE', True):
+        return dict(schema='xta.sam_worker_gc_freeze/1', enabled=False)
+    started = time.perf_counter()
+    gc.collect()
+    gc.freeze()
+    return dict(schema='xta.sam_worker_gc_freeze/1', enabled=True,
+                frozen_objects=int(gc.get_freeze_count()),
+                seconds=time.perf_counter() - started)
 
 
 def close_interpolation_predictor(context: object) -> None:

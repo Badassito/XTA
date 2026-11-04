@@ -10,7 +10,12 @@ from .workspace import _env_flag, _env_float, _read_meminfo_bytes, available_ano
 
 
 def publication_ram_headroom():
-    """Use physical/cgroup headroom only; spare swap is not a RAM cache budget."""
+    """Use physical/cgroup headroom only; spare swap is not a RAM cache budget.
+
+    Always a fresh probe that starts after this call (memfd_ram_headroom relies
+    on that ordering). On Linux its /proc and cgroupfs reads keep the GIL (see
+    ``workspace._probe_read_text``), so the probe stays cheap under contention.
+    """
     info = _read_meminfo_bytes()
     if 'MemAvailable' not in info and os.name == 'nt':
         try:

@@ -130,7 +130,8 @@ def test_curved_family_including_tilted_variants_respects_ready_sdk_work(tmp_pat
                 reference = context.image_provider(view, shape, demand(shape, {0:(2, 3, 14, 15)}))
                 assert select.call_count == int(gpu_expected)
                 if gpu_expected:
-                    assert select.call_args.kwargs == {}
+                    # Ready tracker work: take only an already-idle GPU (no drain).
+                    assert select.call_args.kwargs == ({'opportunistic': True} if sdk_ready else {})
                 assert live_image_sampling(reference)['backend'] == ('cuda' if gpu_expected else 'cpu')
         assert renderer.calls == int(gpu_expected)
         assert renderer.closed == gpu_expected

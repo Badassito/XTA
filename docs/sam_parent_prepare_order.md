@@ -17,6 +17,13 @@ enters the queue; it does not read or modify image/mask data to set priority.
 
 Orthogonal and tilted parents keep their existing protected cheap lanes, dense
 capacity, and transient protections. They do not advance the expensive turn.
+A cheap parent left out only because both protected lanes are busy, and which
+fits free dense memory, joins the expensive scan in the same size/age order
+rather than after every expensive parent (one that does not fit keeps the old
+last place, so an oversize owner cannot take an emergency grant first); otherwise a
+third large Cartesian view can wait for the whole Radial/Spherical queue and
+start its SAM chain at the end of the run. Setting
+`YOLO_TTA_SAM_PARENT_CHEAP_OVERFLOW_LAST=1` restores the previous order.
 The configured parent worker limit is unchanged: a task still owns its lane
 through preparation, retries, selection, and publication. Existing dense,
 startup, physical-memory, transient, and cancellation checks remain in force.

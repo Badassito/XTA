@@ -59,7 +59,8 @@ class BatchResult:
 
 def batch_workspace_ledger(*, batch_size, native_shape_yx, logical_t,
                           roi_shape_yx, output_shape_yx, selected_rows,
-                          scalar_row_block, scratch_bytes, retained_cache_bytes):
+                          scalar_row_block, scratch_bytes, retained_cache_bytes,
+                          device_scratch_bytes=None):
     """Pure integer ledger; no XTA, Torch, device, tensor or allocator access.
 
     A caller must explicitly supply retained bytes, including zero for a stated
@@ -72,12 +73,18 @@ def batch_workspace_ledger(*, batch_size, native_shape_yx, logical_t,
     logical_t, selected_rows, scalar_row_block, scratch = map(operator.index,
         (logical_t, selected_rows, scalar_row_block, scratch_bytes))
     retained = operator.index(retained_cache_bytes)
+    # The GPU workspace may exceed the host scratch charge; row blocks are
+    # independent rows, so a larger block changes iteration count, not pixels.
+    device_scratch = scratch if device_scratch_bytes is None else max(scratch, operator.index(device_scratch_bytes))
     if (not 1 <= size <= 4 or min(native_h,native_w,roi_h,roi_w,height,width,
             logical_t,selected_rows,scalar_row_block,scratch) < 1 or retained < 0):
         raise ValueError('Invalid integer batch workspace dimensions or cache bytes')
     area, pixels, roi_area = native_h*native_w, height*width, roi_h*roi_w
     allowance = 256*area+96*pixels
-    device_cap = min(scratch, max(0,allowance-retained))
+    if device_scratch_bytes is not None:
+        # The renderer admitted this larger GPU workspace on top of its allowance.
+        allowance = max(allowance, device_scratch)
+    device_cap = min(device_scratch, max(0,allowance-retained))
     fixed = 4*native_w+20*logical_t+32*native_h
     projection_fixed = fixed+256*size*native_w+size*area+32*size*roi_area
     warp_bytes = fixed+6*size*area+16*size*pixels+32*pixels
@@ -168,6 +175,13 @@ def retained_cache_snapshot(engine):
         cache_baseline_source='actual_engine_after_start')
 
 
+def _admitted_device_scratch(renderer):
+    """A larger GPU-only workspace the renderer admitted, else None (legacy ledger)."""
+    host = int(renderer.scratch_bytes)
+    device = int(getattr(renderer, 'device_scratch_bytes', host) or host)
+    return device if device > host else None
+
+
 def plan_batch(renderer, view, frames, inverse, *, output_origin_yx,
                output_height, output_width, retained_cache_bytes=None):
     """Metadata-only validation and stage-wise ledger; no source/GPU allocation."""
@@ -229,6 +243,7 @@ def plan_batch(renderer, view, frames, inverse, *, output_origin_yx,
         logical_t=logical_t,roi_shape_yx=(roi_h,roi_w),output_shape_yx=(height,width),
         selected_rows=selected_rows,scalar_row_block=scalar_block,
         scratch_bytes=int(renderer.scratch_bytes),
+        device_scratch_bytes=_admitted_device_scratch(renderer),
         retained_cache_bytes=0 if retained_cache_bytes is None else retained_cache_bytes)
     if retained_cache_bytes is None:
         # Zero is only a lower bound used to prove impossibility, never admission.
@@ -451,3 +466,163 @@ def render_compatible_batch(renderer, view, frames, inverse, *, output_origin_yx
         raise SamGpuRenderingUnavailable(str(error)) from error
     finally:
         native = patch = pixels = None
+
+
+def queued_frame_limit():
+    """Compatible frames one queued call may render (YOLO_TTA_SAM_GPU_IMAGE_QUEUE_FRAMES)."""
+    import os
+    try:
+        value = int(os.environ.get('YOLO_TTA_SAM_GPU_IMAGE_QUEUE_FRAMES', '32'))
+    except ValueError:
+        value = 32
+    return max(2, min(256, value))
+
+
+def chunk_sizes(count):
+    """Cover count >= 2 frames with the qualified 2-4 frame batch operator."""
+    count = operator.index(count)
+    if count < 2:
+        raise ValueError('A queued Azimuthal batch needs at least two frames')
+    sizes = []
+    while count:
+        if count <= 4:
+            sizes.append(count)
+            break
+        if count == 5:
+            sizes.extend((3, 2))
+            break
+        sizes.append(4)
+        count -= 4
+    return tuple(sizes)
+
+
+def render_compatible_chunks(renderer, view, frames, inverse, *, output_origin_yx,
+                             output_height, output_width, consume, pipeline_depth=2):
+    """Queue consecutive qualified 2-4 frame batches without a host sync between them.
+
+    Each chunk uses the unchanged project_native_batch/warp_native_batch operator,
+    so pixels are identical to render_compatible_batch. Results copy
+    asynchronously into pinned host buffers; chunk k is copied into the caller's
+    sink while chunk k+1 renders. Planning happens before any sink write: an
+    ineligible first chunk declines, a later one ends the queue early (the
+    receipt reports how many frames completed, always >= 2).
+    """
+    from XTA.sam_gpu_rendering import crop_inverse, SamGpuRenderingUnavailable
+    if not callable(consume):
+        raise TypeError('Queued Azimuthal batches require an ordered private-cache sink')
+    frames = tuple(islice(frames, queued_frame_limit()))
+    if len(frames) < 2:
+        raise ValueError('A queued Azimuthal batch needs at least two frames')
+    renderer.context._check_image_lifetime()
+    inverse = np.asarray(inverse, dtype=np.float32).reshape(2, 3).copy()
+    output_origin_yx = tuple(output_origin_yx)
+    crop = dict(output_origin_yx=output_origin_yx, output_height=output_height, output_width=output_width)
+    sink_error = False
+    in_flight = []
+    try:
+        engine = renderer._start()
+        if (tuple(engine._volume_gpu.shape) != tuple(renderer.source.shape)
+                or int(engine._logical_t) != int(renderer.logical_t)):
+            raise BatchDeclined('actual_source_geometry_changed')
+        cache = retained_cache_snapshot(engine)
+        retained = int(cache['retained_cache_bytes'])
+        plans = []
+        position = 0
+        for size in chunk_sizes(len(frames)):
+            chunk = frames[position:position+size]
+            plan = plan_batch(renderer, view, chunk, inverse, retained_cache_bytes=retained, **crop)
+            if not plan.eligible:
+                if not plans:
+                    receipt = asdict(plan)
+                    receipt.update(cache, requested_batch_size=len(frames), effective_batch_size=0,
+                                   batch_path_used=False, fallback_reason=plan.reason)
+                    raise BatchDeclined(plan.reason, receipt)
+                break
+            plans.append((position, chunk, plan))
+            # Later chunks may grow per-angle/affine caches; charge that growth.
+            retained += int(plan.cold_cache_growth_bound_bytes)
+            position += size
+        host_peak = sum(plan.host_bytes for _position, _chunk, plan in plans[:max(1, int(pipeline_depth))])
+        depth = max(1, int(pipeline_depth)) if host_peak <= int(renderer.scratch_bytes) else 1
+        matrix = crop_inverse(inverse, output_origin_yx)
+        torch = renderer.torch
+        on_cuda = getattr(getattr(engine, 'device', None), 'type', 'cuda') == 'cuda'
+        delivered = 0
+        enqueue_seconds = sink_seconds = 0.
+
+        def drain_one():
+            nonlocal delivered, sink_error, sink_seconds
+            start, chunk, host, event = in_flight.pop(0)
+            waited = time.monotonic()
+            if event is not None:
+                event.synchronize()
+            images = host.numpy() if hasattr(host, 'numpy') else np.asarray(host)
+            for offset in range(len(chunk)):
+                renderer.context._check_image_lifetime()
+                image = images[offset]
+                try:
+                    consume(start+offset, image)
+                except BaseException:
+                    sink_error = True
+                    raise
+                finally:
+                    image = None
+                delivered += 1
+            images = host = None
+            sink_seconds += time.monotonic()-waited
+
+        with torch.cuda.device(engine.device), torch.cuda.stream(engine._stream):
+            for start, chunk, plan in plans:
+                started = time.monotonic()
+                patch = project_native_batch(engine, view, chunk, plan.bbox_yx, plan.row_block)
+                native = torch.zeros((len(chunk), int(view.src_h), int(view.src_w)),
+                                     dtype=torch.uint8, device=engine.device)
+                y0, x0, y1, x1 = plan.bbox_yx
+                native[:, y0:y1, x0:x1] = patch.round().clamp_(0, 255).to(torch.uint8)
+                patch = None
+                pixels = warp_native_batch(engine, native, matrix, output_height, output_width)
+                native = None
+                if on_cuda:
+                    # Pinned staging lets the copy run asynchronously; the event
+                    # marks this chunk's pixels as safe to read on the host.
+                    host = torch.empty(tuple(pixels.shape), dtype=torch.uint8, pin_memory=True)
+                    host.copy_(pixels, non_blocking=True)
+                    event = torch.cuda.Event()
+                    event.record(engine._stream)
+                else:
+                    host, event = pixels.detach().to('cpu').clone(), None
+                pixels = None
+                in_flight.append((start, chunk, host, event))
+                host = event = None
+                enqueue_seconds += time.monotonic()-started
+                if len(in_flight) > depth:
+                    drain_one()
+            while in_flight:
+                drain_one()
+        engine.clear_native_plane_cache()
+        renderer.context._check_image_lifetime()
+        last = plans[-1]
+        receipt = asdict(last[2])
+        receipt.update(cache, requested_batch_size=len(frames), effective_batch_size=delivered,
+            completed_images=delivered, batch_path_used=True, fallback_reason=None,
+            host_result_mode='sink', queued_chunks=len(plans), pipeline_depth=depth,
+            chunk_sizes=[len(chunk) for _start, chunk, _plan in plans],
+            planned_device_scratch_peak_bytes=max(max(plan.projection_bytes, plan.warp_bytes)
+                                                  for _start, _chunk, plan in plans),
+            planned_host_scratch_peak_bytes=host_peak if depth > 1 else max(
+                plan.host_bytes for _start, _chunk, plan in plans),
+            enqueue_host_seconds=enqueue_seconds, copy_and_sink_host_seconds=sink_seconds,
+            copy_wait_host_seconds=None)
+        return BatchResult((), receipt)
+    except BatchDeclined:
+        raise
+    except (RuntimeError, MemoryError) as error:
+        if sink_error:
+            raise  # A private-cache write error is not a CUDA capability miss.
+        renderer._render_failed = True
+        renderer.context._check_image_lifetime()
+        if isinstance(error, SamGpuRenderingUnavailable):
+            raise
+        raise SamGpuRenderingUnavailable(str(error)) from error
+    finally:
+        in_flight.clear()

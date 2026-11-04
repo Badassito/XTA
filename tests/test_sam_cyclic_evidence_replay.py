@@ -171,14 +171,27 @@ def test_valid_bundle_checksums_cannot_hide_mask_frame_alias_corruption(tmp_path
         SamEvidenceBundle.open(bundle.directory)
 
 
-def test_cached_cyclic_geometry_still_checks_loaded_helper_source(tmp_path,monkeypatch):
+def test_cached_cyclic_geometry_checks_loaded_helper_source_at_boundaries(tmp_path,monkeypatch):
+    # The cached geometry accessor is I/O free (it sits on per-pair paths);
+    # opening, selecting, traversing and rebuilding planes are the boundaries.
     from XTA import sam_cyclic
     bundle = bundle_at(tmp_path)
+    receipt = select_sam_proposals(bundle,policy={'sam_bridge_policy':'permissive'})
     changed = tmp_path/'changed_helper.py'
     changed.write_bytes(sam_cyclic._SOURCE_PATH.read_bytes()+b'\n# changed after import\n')
     monkeypatch.setattr(sam_cyclic,'_SOURCE_PATH',changed)
-    with pytest.raises(RuntimeError,match='cyclic.*changed|Cyclic.*changed'):
-        native_output_shape_tyx(bundle)
+    assert native_output_shape_tyx(bundle)==(4,12,16)
+    message = 'cyclic.*changed|Cyclic.*changed'
+    with pytest.raises(RuntimeError,match=message):
+        SamEvidenceBundle.open(bundle.directory)
+    with pytest.raises(RuntimeError,match=message):
+        list(iter_selected_planes(bundle,receipt))
+    with pytest.raises(RuntimeError,match=message):
+        list(iter_selected_native_crops(bundle,receipt))
+    with pytest.raises(RuntimeError,match=message):
+        selected_native_plane(bundle,receipt,0)
+    with pytest.raises(RuntimeError,match=message):
+        bundle_at(tmp_path/'fresh')
 
 
 def test_saved_helper_identity_cannot_silently_reinterpret_addresses(tmp_path):

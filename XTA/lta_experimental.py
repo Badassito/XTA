@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import operator
+from collections import deque
 import gc
 import threading
 import time
@@ -238,7 +239,14 @@ def _sigmoid_tracker_score_logits(
     not be converted to, or exposed as, a probability. Other finite logits
     retain their ordinary sigmoid interpretation.
     """
+    device_values = _tracker_score_device_values(
+        scores, expected_count=expected_count, torch_module=torch_module)
+    return _normalize_tracker_score_host_values(
+        device_values.cpu().tolist(), expected_count=expected_count)
 
+
+def _tracker_score_device_values(scores: Any, *, expected_count: int, torch_module: Any) -> Any:
+    """Validate tracker logits; compute probability, sentinel and finite rows on their device."""
     if not isinstance(scores, torch_module.Tensor):
         raise RuntimeError(
             "tracker-only propagation returned non-tensor object_score_logits: "
@@ -265,11 +273,15 @@ def _sigmoid_tracker_score_logits(
     # Preserve the exact GPU float64 sigmoid and sentinel checks while
     # transferring the three small vectors together. An early .item() plus
     # two separate .cpu() calls serializes three host/device boundaries.
-    host_values = torch_module.stack((
+    return torch_module.stack((
         probabilities,
         removed.to(dtype=torch_module.float64),
         torch_module.isfinite(flattened).to(dtype=torch_module.float64),
-    )).detach().cpu().tolist()
+    )).detach()
+
+
+def _normalize_tracker_score_host_values(host_values: Any, *, expected_count: int) -> tuple[float | None, ...]:
+    """Host half of tracker score normalization (see ``_sigmoid_tracker_score_logits``)."""
     if not all(bool(value) for value in host_values[2]):
         raise RuntimeError("tracker-only object_score_logits contains a non-finite value")
     probability_values = tuple(
@@ -294,6 +306,12 @@ def _sigmoid_tracker_score_logits(
 
 def _binary_mask_batch_to_host(masks: Any, *, expected_count: int) -> tuple[Any, ...]:
     """Threshold and transfer one object batch, retaining independent CPU masks."""
+    return _split_host_mask_batch(
+        _binary_mask_batch_device(masks, expected_count=expected_count).cpu().numpy(),
+        expected_count=expected_count)
+
+
+def _binary_mask_batch_device(masks: Any, *, expected_count: int) -> Any:
     shape = tuple(int(value) for value in masks.shape)
     if (
         len(shape) not in (3, 4)
@@ -302,12 +320,62 @@ def _binary_mask_batch_to_host(masks: Any, *, expected_count: int) -> tuple[Any,
         or (len(shape) == 4 and shape[1] != 1)
     ):
         raise RuntimeError(f"tracker mask batch has incompatible shape {shape}")
-    host = (masks[:int(expected_count)] > 0).detach().cpu().numpy()
+    return (masks[:int(expected_count)] > 0).detach()
+
+
+def _split_host_mask_batch(host: Any, *, expected_count: int) -> tuple[Any, ...]:
     if host.ndim == 4:
         host = host[:, 0]
     # Independent copies preserve the retained diagnostic path's ownership:
     # keeping one active object must not pin all suppressed objects' masks.
     return tuple(host[index].copy() for index in range(int(expected_count)))
+
+
+_DEFERRED_FRAME_DEPTH = 2
+
+
+class _DeferredFrameTransfer:
+    """One frame's score rows and binary masks, copied to pinned host memory asynchronously.
+
+    Device-side values are computed exactly as in the synchronous helpers; only
+    the host wait moves later, so the next frame's propagation is queued before
+    this frame's results are read. Source tensors stay referenced until the copy
+    event completes.
+    """
+
+    __slots__ = ("local_frame", "_sources", "_scores", "_masks", "_event")
+
+    def __init__(self, local_frame, scores, masks, *, expected_count, torch_module):
+        device_scores = _tracker_score_device_values(
+            scores, expected_count=expected_count, torch_module=torch_module)
+        device_masks = _binary_mask_batch_device(masks, expected_count=expected_count)
+        self.local_frame = int(local_frame)
+        self._scores = torch_module.empty(device_scores.shape, dtype=device_scores.dtype, pin_memory=True)
+        self._masks = torch_module.empty(device_masks.shape, dtype=device_masks.dtype, pin_memory=True)
+        self._scores.copy_(device_scores, non_blocking=True)
+        self._masks.copy_(device_masks, non_blocking=True)
+        self._event = torch_module.cuda.Event()
+        self._event.record()
+        self._sources = (device_scores, device_masks)
+
+    def finish(self, *, expected_count, host_timings):
+        with host_timings.measure("frame_score_d2h"):
+            self._event.synchronize()
+            self._sources = None
+            scores = _normalize_tracker_score_host_values(
+                self._scores.tolist(), expected_count=expected_count)
+        with host_timings.measure("frame_mask_d2h"):
+            masks = _split_host_mask_batch(self._masks.numpy(), expected_count=expected_count)
+        self._scores = self._masks = None
+        return scores, masks
+
+
+def _defer_frame_transfers(scores: Any, masks: Any, *, empty_frame_limit: int | None, torch_module: Any) -> bool:
+    """Defer only when no per-frame host decision (early termination) is needed."""
+    from .lta_tracker_features import async_frame_io_enabled
+    return (empty_frame_limit is None and async_frame_io_enabled()
+            and isinstance(scores, torch_module.Tensor) and isinstance(masks, torch_module.Tensor)
+            and bool(scores.is_cuda) and bool(masks.is_cuda))
 
 
 def run_mask_seed_session(
@@ -369,6 +437,7 @@ def run_mask_seed_session(
     from .lta_tracker_features import (
         TRACKER_FEATURE_AUDIT_KEY,
         prepare_tracker_frame_features,
+        verify_cached_frame_image_ids,
     )
 
     raw_shape = None
@@ -428,6 +497,7 @@ def run_mask_seed_session(
     tracker_feature_preparation: dict[str, object] = {}
     feature = None
     video_masks = None
+    deferred_transfers = None
     active_error: BaseException | None = None
 
     def publish_prediction(prediction: SamFramePrediction) -> None:
@@ -697,63 +767,95 @@ def run_mask_seed_session(
                 for item in all_orders
                 if direction == "both" or item[0] == direction
             )
+            # With no per-frame host decision, a frame's score/mask transfer is
+            # finished after up to _DEFERRED_FRAME_DEPTH later frames are queued.
+            # Trailing None markers drain the remaining frames in order through
+            # the unchanged observation code below.
+            drain_markers = (None,) * _DEFERRED_FRAME_DEPTH
             for propagation_leg, reverse, order in orders:
                 consecutive_empty = 0
                 empty_streak_start = None
-                for requested_frame in order:
-                    with torch.inference_mode():
-                        with host_timings.measure("frame_feature_prepare"):
-                            prepare_tracker_frame_features(
-                                model, inference_state, requested_frame, reverse=reverse,
-                                **feature_options,
-                            )
-                        feature = inference_state["feature_cache"].get(requested_frame)
-                        if feature is None:
+                for requested_frame in (*order, *drain_markers):
+                    if requested_frame is None:
+                        if not deferred_transfers:
+                            continue
+                        pending_transfer = deferred_transfers.popleft()
+                        local_frame = pending_transfer.local_frame
+                        tracker_scores, frame_masks = pending_transfer.finish(
+                            expected_count=len(expected_ids), host_timings=host_timings)
+                        pending_transfer = None
+                    else:
+                        with torch.inference_mode():
+                            with host_timings.measure("frame_feature_prepare"):
+                                prepare_tracker_frame_features(
+                                    model, inference_state, requested_frame, reverse=reverse,
+                                    **feature_options,
+                                )
+                            feature = inference_state["feature_cache"].get(requested_frame)
+                            if feature is None:
+                                raise RuntimeError(
+                                    f"shared SAM feature was not cached for frame {requested_frame}"
+                                )
+                            tracker_state["cached_features"] = {requested_frame: feature}
+                            with host_timings.measure("frame_propagation"):
+                                one_frame = propagate(
+                                    tracker_state,
+                                    start_frame_idx=requested_frame,
+                                    max_frame_num_to_track=0,
+                                    reverse=reverse,
+                                    tqdm_disable=True,
+                                    run_mem_encoder=True,
+                                )
+                                outputs = tuple(one_frame)
+                        if len(outputs) != 1:
                             raise RuntimeError(
-                                f"shared SAM feature was not cached for frame {requested_frame}"
+                                f"tracker-only one-frame bridge returned {len(outputs)} frames"
                             )
-                        tracker_state["cached_features"] = {requested_frame: feature}
-                        with host_timings.measure("frame_propagation"):
-                            one_frame = propagate(
-                                tracker_state,
-                                start_frame_idx=requested_frame,
-                                max_frame_num_to_track=0,
-                                reverse=reverse,
-                                tqdm_disable=True,
-                                run_mem_encoder=True,
+                        local_frame, object_ids, _low_res, video_masks, _scores = outputs[0]
+                        local_frame = int(local_frame)
+                        if local_frame != requested_frame or local_frame in seen:
+                            raise RuntimeError(
+                                f"tracker-only propagation yielded invalid frame {local_frame}"
                             )
-                            outputs = tuple(one_frame)
-                    if len(outputs) != 1:
-                        raise RuntimeError(
-                            f"tracker-only one-frame bridge returned {len(outputs)} frames"
-                        )
-                    local_frame, object_ids, _low_res, video_masks, _scores = outputs[0]
-                    local_frame = int(local_frame)
-                    if local_frame != requested_frame or local_frame in seen:
-                        raise RuntimeError(
-                            f"tracker-only propagation yielded invalid frame {local_frame}"
-                        )
-                    seen.add(local_frame)
-                    ids = tuple(int(value) for value in object_ids)
-                    if (
-                        ids != expected_ids
-                        or video_masks is None
-                        or len(video_masks) < len(expected_ids)
-                    ):
-                        raise RuntimeError(
-                            "tracker-only propagation returned "
-                            f"ids={ids}, masks={getattr(video_masks, 'shape', None)}"
-                        )
-                    with host_timings.measure("frame_score_d2h"):
-                        tracker_scores = _sigmoid_tracker_score_logits(
-                            _scores,
-                            expected_count=len(expected_ids),
-                            torch_module=torch,
-                        )
-                    with host_timings.measure("frame_mask_d2h"):
-                        frame_masks = _binary_mask_batch_to_host(
-                            video_masks, expected_count=len(expected_ids),
-                        )
+                        seen.add(local_frame)
+                        ids = tuple(int(value) for value in object_ids)
+                        if (
+                            ids != expected_ids
+                            or video_masks is None
+                            or len(video_masks) < len(expected_ids)
+                        ):
+                            raise RuntimeError(
+                                "tracker-only propagation returned "
+                                f"ids={ids}, masks={getattr(video_masks, 'shape', None)}"
+                            )
+                        if deferred_transfers is None and _defer_frame_transfers(
+                                _scores, video_masks, empty_frame_limit=resolved_empty_frame_limit,
+                                torch_module=torch):
+                            deferred_transfers = deque()
+                        if deferred_transfers is not None:
+                            with host_timings.measure("frame_score_d2h"):
+                                deferred_transfers.append(_DeferredFrameTransfer(
+                                    local_frame, _scores, video_masks,
+                                    expected_count=len(expected_ids), torch_module=torch))
+                            one_frame = outputs = _low_res = video_masks = _scores = None
+                            if len(deferred_transfers) <= _DEFERRED_FRAME_DEPTH:
+                                continue
+                            pending_transfer = deferred_transfers.popleft()
+                            local_frame = pending_transfer.local_frame
+                            tracker_scores, frame_masks = pending_transfer.finish(
+                                expected_count=len(expected_ids), host_timings=host_timings)
+                            pending_transfer = None
+                        else:
+                            with host_timings.measure("frame_score_d2h"):
+                                tracker_scores = _sigmoid_tracker_score_logits(
+                                    _scores,
+                                    expected_count=len(expected_ids),
+                                    torch_module=torch,
+                                )
+                            with host_timings.measure("frame_mask_d2h"):
+                                frame_masks = _binary_mask_batch_to_host(
+                                    video_masks, expected_count=len(expected_ids),
+                                )
                     with host_timings.measure("frame_observation"):
                         removed_ids = tuple(
                             object_id
@@ -877,6 +979,8 @@ def run_mask_seed_session(
                                 }
                             )
                             break
+            # One batched re-read replaces the per-frame image-id syncs.
+            verify_cached_frame_image_ids(inference_state)
         else:
             raise ValueError(f"unknown propagation_mode: {propagation_mode}")
         expected = (
@@ -903,6 +1007,7 @@ def run_mask_seed_session(
         anchor_masks_by_object.clear()
         raise
     finally:
+        deferred_transfers = None
         if isinstance(inference_state, dict):
             tracker_feature_preparation = dict(
                 inference_state.get(TRACKER_FEATURE_AUDIT_KEY, {})

@@ -1,6 +1,8 @@
 """Exact fused masked-score cell bounds and copies; no JIT disk cache or GPU."""
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from ._deps import _numba
@@ -74,6 +76,54 @@ def copy_masked_cells_batch(mask, scores, z, bounds, max_bytes=COPY_BATCH_MAX_BY
                 output[at] = scores[z, row, column] if mask[z, row, column] != 0 else 0
                 at += 1
     return output, offsets
+
+
+@_numba.njit(nogil=True, cache=False)
+def zero_unmasked_scores_flat(mask, scores, first, stop):
+    """Zero scores where the mask is empty over one flat range, in place.
+
+    Branch-free AND with 0xFF or 0 vectorizes; it leaves kept scores unchanged.
+    """
+    for index in range(first, stop):
+        scores[index] &= np.uint8(0) - np.uint8(mask[index] != 0)
+
+
+@_numba.njit(nogil=True, cache=False)
+def zero_unmasked_scores_boxes(mask, scores, active, boxes, z0, z1):
+    """Zero unmasked scores inside each active frame's validated support box."""
+    for z in range(z0, z1):
+        if not active[z]:
+            continue
+        y0, y1, x0, x1 = boxes[z, 0], boxes[z, 1], boxes[z, 2], boxes[z, 3]
+        for row in range(y0, y1):
+            for column in range(x0, x1):
+                scores[z, row, column] &= np.uint8(0) - np.uint8(mask[z, row, column] != 0)
+
+
+def warm_terminal_score_kernels():
+    """Compile every terminal score-masking signature before the main process is busy.
+
+    Compiling in-process needs the GIL thousands of times; under the main
+    process's later thread load, a first call could take minutes. Production
+    passes uint8 or bool masks, writable or readonly, with readonly reader
+    support arrays; np.memmap types the same as ndarray.
+    """
+    started = time.perf_counter()
+    active = np.ones(1, np.bool_)
+    boxes = np.asarray([[0, 2, 0, 3]], np.int64)
+    active.setflags(write=False)
+    boxes.setflags(write=False)
+    for dtype in (np.uint8, np.bool_):
+        for readonly in (False, True):
+            mask = np.ones((1, 2, 3), dtype)
+            if readonly:
+                mask.setflags(write=False)
+            scores = np.full(mask.shape, 173, np.uint8)
+            zero_unmasked_scores_boxes(mask, scores, active, boxes, 0, 1)
+            zero_unmasked_scores_flat(mask.reshape(-1), scores.reshape(-1), 0, mask.size)
+    return dict(seconds=time.perf_counter() - started,
+                boxes_signatures=len(zero_unmasked_scores_boxes.nopython_signatures),
+                flat_signatures=len(zero_unmasked_scores_flat.nopython_signatures))
 
 
 def warm_confidence_capture_kernels():

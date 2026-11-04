@@ -805,7 +805,13 @@ def project_azimuthal_sparse_store(
                     flat = None
                     close_memmap_array_without_flush(packed, unlink_path=temporary/'source.bits')
                     packed = None
-                    wait_for_retired_memmap_unlinks(path=temporary/'source.bits')
+                    try:
+                        wait_for_retired_memmap_unlinks(path=temporary/'source.bits', timeout_s=60.)
+                    except TimeoutError as unlink_error:
+                        # source.bits is scratch outside the published store; the
+                        # finally below defers whatever cleanup is still pending.
+                        print(f'Warning: sparse Azimuthal projection {target.name}: {unlink_error}; '
+                              'publishing and deferring scratch cleanup.', flush=True)
                 if target.exists():
                     raise FileExistsError(f'Projected store appeared during publication: {target}')
                 staging.rename(target)

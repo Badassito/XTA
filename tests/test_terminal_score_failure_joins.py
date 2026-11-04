@@ -349,19 +349,21 @@ def test_partial_inplace_mask_failure_aborts_without_original_score_retry(tmp_pa
     if use_roi:
         # Keep the real bbox unchanged but include an unknown score inside it.
         expected[:, 2, 2] = task.union_mm[:, 2, 2] = 0
-    original_copy = evidence.np.copyto
+    from XTA import confidence_capture_cpu as cpu
+    original_flat, original_boxes = cpu.zero_unmasked_scores_flat, cpu.zero_unmasked_scores_boxes
     original_prepare = evidence.prepare_terminal_confidence_scores
     observed, writes = [], []
+    # One thread runs one compiled piece; the injected failure seals one plane first.
+    monkeypatch.setenv('YOLO_TTA_TERMINAL_SCORE_PREPARE_THREADS', '1')
 
-    def partial_copy(destination, source, *args, **kwargs):
-        if not np.shares_memory(destination, roots[1]()):
-            return original_copy(destination, source, *args, **kwargs)
+    def partial_flat(mask, scores, first, stop):
         writes.append(1)
-        if use_roi and len(writes) == 1:
-            return original_copy(destination, source, *args, **kwargs)
-        where = kwargs['where']
-        halfway = max(1, len(destination)//2)
-        original_copy(destination[:halfway], source, where=where[:halfway])
+        original_flat(mask, scores, first, first + max(1, (stop - first)//2))
+        raise ValueError('partial terminal score mutation failure')
+
+    def partial_boxes(mask, scores, active, boxes, first, stop):
+        writes.append(1)
+        original_boxes(mask, scores, active, boxes, first, first + 1)
         raise ValueError('partial terminal score mutation failure')
 
     def prepare(mask, scores, **kwargs):
@@ -375,7 +377,8 @@ def test_partial_inplace_mask_failure_aborts_without_original_score_retry(tmp_pa
     def no_retry(*args, **kwargs):
         pytest.fail('partially transformed scores were retried as a legacy source')
 
-    monkeypatch.setattr(evidence.np, 'copyto', partial_copy)
+    monkeypatch.setattr(cpu, 'zero_unmasked_scores_flat', partial_flat)
+    monkeypatch.setattr(cpu, 'zero_unmasked_scores_boxes', partial_boxes)
     monkeypatch.setattr(evidence, 'prepare_terminal_confidence_scores', prepare)
     monkeypatch.setattr(evidence, 'try_capture_prediction_confidence', no_retry)
     monkeypatch.setattr(evidence, 'capture_prediction_confidence', no_retry)
@@ -386,7 +389,7 @@ def test_partial_inplace_mask_failure_aborts_without_original_score_retry(tmp_pa
     assert failed_parent.done() and caught.value.__traceback__ is not None
     assert len(observed) == 1 and np.any(observed[0] == 0) and np.any(observed[0] == 143)
     if use_roi:
-        assert len(writes) == 2  # One ROI plane sealed before the next partial write failed.
+        assert len(writes) == 1  # One ROI plane sealed before the same piece failed.
     assert roots[0]() is roots[1]() is None and len(retired) == 1
     assert not evidence._REGISTRY
     _assert_empty(queue)

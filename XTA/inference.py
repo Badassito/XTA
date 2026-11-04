@@ -2246,6 +2246,8 @@ class _DeviceUnionAccumulator:
                 while block > 1:
                     need = int(block) * h * w * 6 + 512 * 1024 * 1024
                     free_bytes, _total = torch.cuda.mem_get_info(self.device)
+                    from .cuda_backend import gpu_sizing_free_bytes
+                    free_bytes = gpu_sizing_free_bytes(free_bytes)
                     if int(free_bytes) >= int(need):
                         break
                     block //= 2
@@ -2580,6 +2582,8 @@ def _try_create_device_union_accumulator(
             + (int(num_frames) * 4 * 4 if bool(collect_slice_bboxes) else 0)
         )
         free_bytes, _total = torch.cuda.mem_get_info(device)
+        from .cuda_backend import gpu_sizing_free_bytes
+        free_bytes = gpu_sizing_free_bytes(free_bytes)
         if int(free_bytes) < int(need) + 2 * GIB:
             return None
         return _DeviceUnionAccumulator(

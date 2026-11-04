@@ -102,3 +102,34 @@ fragmented adjacency, constrained hash spills, graph unions, and interpolation
 candidate searches. They do not cover full pipeline wall time, production model
 quality, cold compiler/setup costs, or process-wide peak memory. Benchmark receipts
 identify source hashes, work sizes, and shared setup/canonicalization costs.
+
+## GIL-free CPU hot spots
+
+The TTA main process runs many threads at once. A loop of short NumPy, zlib,
+file or hashing calls releases and re-takes the GIL on every call, and each
+re-take can wait a full switch interval (5 ms) behind busy threads. The paths
+below therefore run as single nogil numba kernels or GIL-held reads instead.
+Each one matches the previous result byte for byte.
+
+- NRRD layer producer (`XTA/nrrd_sparse_kernels.py`): fused batch kernels.
+  `YOLO_TTA_NRRD_PRODUCER_BATCH_MIB` (default 64) sets the per-thread batch
+  buffer; 16 lowers peak memory at some speed cost.
+- Azimuthal angular key plane (`XTA/projection_coverage_cpu.py`).
+- SAM parent score restore (`XTA/confidence_native_inflate.py`): native inflate
+  and scatter. `YOLO_TTA_CONFIDENCE_NATIVE_INFLATE=off` restores the Python path.
+  On Windows it stays off unless the qualified native zlib is configured, as for
+  the encoder.
+- Encoded block publication (`consume_encoded_block` in `XTA/interpolation.py`).
+- Terminal score masking (`XTA/confidence_capture_cpu.py`).
+- RAM headroom probe (`XTA/workspace.py`): `/proc/meminfo` and cgroup files are
+  read through libc with the GIL held. A file class whose read takes longer than
+  `YOLO_TTA_RAM_PROBE_GIL_HOLD_LIMIT_MS` (default: the switch interval) switches
+  permanently to normal reads. `YOLO_TTA_RAM_PROBE_GIL_READS=counters` never
+  holds the GIL for lock-prone files; `=0` disables GIL-held reads.
+- SAM cyclic and filter source checks run at plan, writer and selection
+  boundaries instead of on every address or mask call.
+
+The pipeline compiles these kernels serially at startup, before inference
+threads start, and records each as `gil_kernels.warmup.<name>`. A first compile
+under load can take minutes. The warm-up is serial because PTA can fork, and a
+background compile would copy numba's held compiler lock into the child.

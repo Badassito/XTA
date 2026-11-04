@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPT-6 Astra v25.0.2 launcher for the unified TTA/PTA/LTA pipeline."""
+"""Opus 5.5 v25.0.3 launcher for the unified TTA/PTA/LTA pipeline."""
 
 from XTA.cli import run
 

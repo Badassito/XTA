@@ -1693,7 +1693,7 @@ def assemble_current_view_union_volume(
     uses source geometry when requested."""
     if len(view_volumes_by_model) != 1:
         raise ValueError(
-            f'GPT-6-Astra-Ultra v{SCRIPT_VERSION} expected one logical GPU/CPU model pair; '
+            f'Opus-5.5 v{SCRIPT_VERSION} expected one logical GPU/CPU model pair; '
             f'found {len(view_volumes_by_model)} result namespaces'
         )
 

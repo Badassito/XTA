@@ -24,6 +24,13 @@ IMPLEMENTATION_SHA256 = hashlib.sha256(_SOURCE_PATH.read_bytes()).hexdigest()
 
 
 def assert_cyclic_implementation_unchanged():
+    """Boundary check: re-hash this module's source against its loaded identity.
+
+    Callers run it at well-defined boundaries (plan construction, evidence
+    open/commit, selection start/end, publication start/finalize, first/last
+    folded crop of a public traversal). Per-address helpers below never touch
+    the file system; a per-call hash convoyed the GIL in busy processes.
+    """
     if hashlib.sha256(_SOURCE_PATH.read_bytes()).hexdigest() != IMPLEMENTATION_SHA256:
         raise RuntimeError("SAM cyclic address implementation changed after loading")
 
@@ -70,7 +77,6 @@ def _integer(value: object, name: str) -> int:
 def address_for_unfolded_index(index: int, native_frame_count: int, *,
                                period_degrees: float = 180.0) -> Mapping[str, object]:
     """Address positive or negative neighbors outside a stored frame map."""
-    assert_cyclic_implementation_unchanged()
     frame, count = _integer(index, "unfolded frame"), _integer(native_frame_count, "native frame count")
     if count < 1 or isinstance(period_degrees, bool) or period_degrees not in (180.0, 360.0):
         raise ValueError("Cyclic frame count must be positive and its period must be 180 or 360 degrees")
@@ -90,7 +96,6 @@ def mirror_bbox_yx(bbox_yx, canvas_width: int):
 def transform_crop_between_frame_addresses(mask, bbox_yx, source_address, target_address,
                                            canvas_width: int):
     """Transform one exact cropped mask by the two unfolded phases' parity XOR."""
-    assert_cyclic_implementation_unchanged()
     array = np.asarray(mask)
     bbox = tuple(_integer(value, "crop bound") for value in bbox_yx)
     mirrored_bbox = mirror_bbox_yx(bbox, canvas_width)
@@ -104,6 +109,7 @@ def transform_crop_between_frame_addresses(mask, bbox_yx, source_address, target
 
 
 def build_cyclic_frame_addressing(native_shape_tyx, alias_frames: int, *, period_degrees=180.0):
+    assert_cyclic_implementation_unchanged()
     shape = tuple(_integer(value, "native shape") for value in native_shape_tyx)
     aliases = _integer(alias_frames, "alias frame count")
     if len(shape) != 3 or any(value < 1 for value in shape) or not 0 <= aliases < shape[0]:
@@ -116,7 +122,6 @@ def build_cyclic_frame_addressing(native_shape_tyx, alias_frames: int, *, period
 
 def validate_cyclic_frame_addressing(metadata, *, expected_frames=None):
     """Check shape, bounded closure, frame identity and mirror parity on reading."""
-    assert_cyclic_implementation_unchanged()
     if not isinstance(metadata, Mapping) or metadata.get("schema") not in {CYCLIC_FRAME_ADDRESSING_SCHEMA,CYCLIC_EXTRAPOLATION_ADDRESSING_SCHEMA}:
         raise ValueError("Unsupported cyclic SAM frame-address schema")
     native = tuple(_integer(value, "native shape") for value in metadata["native_shape_tyx"])
@@ -183,6 +188,7 @@ class CyclicObservationVolume:
 class ExtrapolationCyclicObservationVolume(CyclicObservationVolume):
     """Tail-scoped extra aliases preserve both inward seeds and full tail horizon."""
     def __init__(self,original,alias_frames,*,period_degrees=180.):
+        assert_cyclic_implementation_unchanged()
         shape=tuple(_integer(v,'native shape') for v in original.shape)
         aliases=_integer(alias_frames,'alias frame count')
         if len(shape)!=3 or any(v<1 for v in shape) or not 0<=aliases<=2*(shape[0]-1):

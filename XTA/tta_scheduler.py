@@ -34,6 +34,12 @@ from .scheduler_diagnostics import scheduler_operation, scheduler_step
 from .backprojection import GpuInferenceAssetsRetired, _make_gpu_inference_assets_retired_proof
 
 
+def _spherical_pacing_enabled() -> bool:
+    """YOLO_TTA_SPHERICAL_PACING=0 restores largest-remaining-first exactly."""
+    return os.environ.get('YOLO_TTA_SPHERICAL_PACING', '1').strip().lower() not in (
+        '0', 'false', 'no', 'off')
+
+
 _SELECTION_KEY_UNSET = object()
 # ``cast`` is a no-op, but constructing nested typing aliases inside a full
 # pending-task scan is not. Keep this static type outside the dispatch path.
@@ -51,6 +57,69 @@ class _SelectionTaskDescriptor:
     hybrid_parent: Optional[Tuple[str, str]]
     mode: str
     hybrid_origin: bool
+
+
+# Selection scans evaluate these per pending task on every pick. Each memo entry
+# keeps only immutable inputs (tuples/strings), a weak view reference and the
+# producing function, and is reused only when every input it read is unchanged,
+# so a hit returns exactly what recomputation would. Schedulers without the
+# tables (unbound callers) and injected functions always compute directly.
+
+def _memoized_task_cost_key(scheduler, task: Dict[str, object]) -> Tuple[object, ...]:
+    """``operations.gpu_worker_task_cost_key``; the production key reads only kind,
+    result mode, out_size and the frozen ViewInfo."""
+    from .runtime import gpu_worker_task_cost_key as production_cost_key
+    compute = scheduler.operations.gpu_worker_task_cost_key
+    view = task.get('view')
+    memo = getattr(scheduler, '_selection_cost_keys', None)
+    if memo is None or compute is not production_cost_key or not isinstance(view, ViewInfo):
+        return compute(task)
+    kind, mode, out_size = task.get('kind', 'unknown'), task.get('result_mode', 'file'), task.get('out_size', 0)
+    cached = memo.get(id(task))
+    if (cached is not None and cached[3]() is view
+            and type(cached[0]) is type(kind) and cached[0] == kind
+            and type(cached[1]) is type(mode) and cached[1] == mode
+            and type(cached[2]) is type(out_size) and cached[2] == out_size):
+        return cached[4]
+    key = compute(task)
+    try:
+        view_ref = weakref.ref(view)
+    except TypeError:
+        return key
+    memo[id(task)] = (kind, mode, out_size, view_ref, key)
+    return key
+
+
+def _integral_three_shape(scheduler, shape: object) -> bool:
+    """Whether ``shape`` is a length-3 tuple/list of integers (tuples memoized by identity)."""
+    memo = getattr(scheduler, '_selection_shape_checks', None)
+    cacheable = memo is not None and type(shape) is tuple
+    if cacheable:
+        cached = memo.get(id(shape))
+        if cached is not None and cached[0] is shape:
+            return cached[1]
+    result = bool(isinstance(shape, (tuple, list)) and len(shape) == 3
+                  and all(isinstance(value, (int, np.integer)) for value in shape))
+    if cacheable:
+        memo[id(shape)] = (shape, result)
+    return result
+
+
+def _shape_uint8_bytes(scheduler, raw_shape: object) -> Tuple[Tuple[int, ...], int]:
+    """``tuple(int(v) ...)`` and its uint8 size (-1 unless 3-D); memoized for immutable int tuples."""
+    array_nbytes = scheduler.operations.array_nbytes
+    memo = getattr(scheduler, '_selection_shape_bytes', None)
+    cacheable = (memo is not None and type(raw_shape) is tuple
+                 and all(type(value) is int for value in raw_shape))
+    if cacheable:
+        cached = memo.get(id(raw_shape))
+        if cached is not None and cached[0] is raw_shape and cached[3] is array_nbytes:
+            return cached[1], cached[2]
+    shape = tuple(int(v) for v in raw_shape)
+    nbytes = int(array_nbytes(shape, np.uint8)) if len(shape) == 3 else -1
+    if cacheable:
+        memo[id(raw_shape)] = (raw_shape, shape, nbytes, array_nbytes)
+    return shape, nbytes
 
 
 @dataclass
@@ -267,6 +336,10 @@ class TtaSchedulerState:
     # It owns no task, geometry arrays, or additional inference admission lease.
     spherical_render_parent_by_worker: Dict[int, Tuple[str, str]] = field(default_factory=dict)
     spherical_retirement_pressure_active: bool = False
+    # Spherical pacing: (total frames, total Spherical parents) fixed at the first
+    # GPU selection, and the Spherical parents that have dispatched any lease.
+    spherical_pacing_totals: Optional[Tuple[int, int]] = None
+    spherical_paced_parents: set = field(default_factory=set)
     gpu_worker_next_dynamic_task_id: int = 0
     gpu_worker_pending_task_ids: deque[int] = field(default_factory=deque)
 
@@ -412,6 +485,11 @@ class TtaScheduler:
         self._result_processing_depth = 0
         self._credit_checkpoint_active = False
         self._selection_task_descriptors: Dict[int, _SelectionTaskDescriptor] = {}
+        # Value-validated memo tables for the per-pending-task selection scans
+        # (see _memoized_task_cost_key/_integral_three_shape/_shape_uint8_bytes).
+        self._selection_cost_keys: Dict[int, Tuple[object, ...]] = {}
+        self._selection_shape_checks: Dict[int, Tuple[object, bool]] = {}
+        self._selection_shape_bytes: Dict[int, Tuple[object, ...]] = {}
 
     def _telemetry_add(self, name: str, value: object = 1) -> None:
         telemetry = self.operations.runtime_telemetry()
@@ -925,7 +1003,7 @@ class TtaScheduler:
     def gpu_worker_task_seconds(self, task: Dict[str, object]) -> float:
         view_obj = task.get('view')
         count = max(1, int(task.get('slice_count', 1)))
-        key = self.operations.gpu_worker_task_cost_key(task)
+        key = _memoized_task_cost_key(self, task)
         sec_per_frame = self.state.gpu_worker_seconds_per_frame_ewma.get(key)
         if sec_per_frame is None:
             sec_per_frame = (
@@ -2031,8 +2109,7 @@ class TtaScheduler:
         """Share scan-local decisions only for identical explicit parent contracts."""
         if not task.get('bounded_parent_admission', False):
             shape = task.get('processing_shape', ())
-            if (isinstance(shape, (tuple, list)) and len(shape) == 3
-                    and all(isinstance(value, (int, np.integer)) for value in shape)):
+            if _integral_three_shape(self, shape):
                 return parent, str(task.get('result_mode', 'file')), tuple(shape)
             return None
         members = (task, *task.get('augmentation_pass_tasks', ()))
@@ -2049,7 +2126,7 @@ class TtaScheduler:
         return tuple(contract)
 
     def _direct_union_parent_bytes(self, task: Dict[str, object]) -> int:
-        shape = tuple(int(v) for v in task.get('processing_shape', ()))
+        shape, shape_nbytes = _shape_uint8_bytes(self, task.get('processing_shape', ()))
         if len(shape) != 3:
             view_obj = task['view']
             shape = self.operations.view_processing_volume_shape(view_obj, int(task.get('out_size', self.inputs.imgsz)))
@@ -2059,7 +2136,9 @@ class TtaScheduler:
             dense_volume_count += 1
             if bool(self.inputs.nrrd_layers_needed):
                 dense_volume_count += 2
-        return int(self.operations.array_nbytes(shape, np.uint8)) * int(dense_volume_count)
+        if shape_nbytes < 0:
+            shape_nbytes = int(self.operations.array_nbytes(shape, np.uint8))
+        return int(shape_nbytes) * int(dense_volume_count)
 
     def direct_union_task_bytes(self, task: Dict[str, object]) -> int:
         return sum(self._direct_union_parent_bytes(member)
@@ -2290,6 +2369,60 @@ class TtaScheduler:
         return pool, feasible
 
     @scheduler_operation('selection')
+    def _spherical_pacing_due(self, pending_ids: Sequence[int]) -> bool:
+        """Whether opening a new Spherical parent is behind overall inference progress.
+
+        Largest-remaining-first otherwise leaves every small Spherical patch view to
+        the end, where their post-processing bunches up and holds the dense window
+        while one large view infers alone. Pacing opens Spherical parents in
+        proportion to dispatched frames so their post-processing spreads over the
+        run. It only reorders admissible work; ``YOLO_TTA_SPHERICAL_PACING=0``
+        restores the previous order exactly.
+        """
+        if not _spherical_pacing_enabled():
+            return False
+        tasks = self.state.gpu_worker_tasks_by_id
+        totals = self.state.spherical_pacing_totals
+        if totals is None:
+            frames = 0
+            parents = set()
+            for task in tasks.values():
+                frames += max(0, int(task.get('slice_count', 0)))
+                if str(getattr(task.get('view'), 'family', '')) == 'spherical':
+                    parent = self.gpu_worker_fullframe_parent_key(task)
+                    if parent is not None:
+                        parents.add(parent)
+            totals = self.state.spherical_pacing_totals = (int(frames), len(parents))
+        total_frames, total_parents = totals
+        opened = len(self.state.spherical_paced_parents)
+        if total_frames <= 0 or total_parents <= 0 or opened >= total_parents:
+            return False
+        pending_frames = sum(max(0, int(tasks[int(task_id)].get('slice_count', 0)))
+                             for task_id in pending_ids)
+        dispatched = max(0, int(total_frames) - int(pending_frames))
+        # opened / total_parents < dispatched / total_frames, in integers.
+        return int(opened) * int(total_frames) < int(dispatched) * int(total_parents)
+
+    def _spherical_pacing_new_parent(self, task: Dict[str, object],
+                                     parent: Optional[Tuple[str, str]]) -> bool:
+        return (parent is not None and parent not in self.state.spherical_paced_parents
+                and str(getattr(task.get('view'), 'family', '')) == 'spherical')
+
+    def _spherical_pacing_rank(self, task: Dict[str, object], parent: Optional[Tuple[str, str]],
+                               pace_due: bool) -> int:
+        """0: finish a paced Spherical parent; 1: open one when due; 2: otherwise.
+
+        A paced parent must finish promptly or its remaining leases fall back to
+        largest-first and land at the end anyway.
+        """
+        if not _spherical_pacing_enabled():
+            return 2
+        if parent is not None and parent in self.state.spherical_paced_parents:
+            return 0
+        if pace_due and self._spherical_pacing_new_parent(task, parent):
+            return 1
+        return 2
+
     def pop_gpu_worker_pending_task_id(self,
         preferred_parent: Optional[Tuple[str, str]] = None,
         candidate_workers: Optional[Sequence[int]] = None,
@@ -2324,7 +2457,7 @@ class TtaScheduler:
                 # The injected key still sees every task: it may classify on more
                 # than parent/view fields. Only the immutable ViewInfo cold prior
                 # is shared, never a task's frame count or measured cost-key state.
-                key = self.operations.gpu_worker_task_cost_key(task)
+                key = _memoized_task_cost_key(self, task)
                 per_frame = self.state.gpu_worker_seconds_per_frame_ewma.get(key)
                 if per_frame is None:
                     view = task.get('view')
@@ -2507,6 +2640,7 @@ class TtaScheduler:
                 task_i = tasks[task_id_i]
                 parent_i = parents[task_id_i]
                 parent_seconds[parent_i] = float(parent_seconds.get(parent_i, 0.0)) + seconds(task_i)
+            pace_spherical = self._spherical_pacing_due(pending_ids)
             selected_id = min(
                 selected_pool,
                 key=lambda pair: (
@@ -2516,12 +2650,18 @@ class TtaScheduler:
                     0 if d1_parents[int(pair[1])] in self.state.d1_owner_by_parent else 1,
                     0 if direct_parents[int(pair[1])] in self.state.direct_union_inference_views else 1,
                     (0 if self.cpu_input_prefetch is None or self.cpu_input_prefetch.ready(tasks[int(pair[1])]) else 1),
+                    self._spherical_pacing_rank(tasks[int(pair[1])], parents[int(pair[1])],
+                                                pace_spherical),
                     -float(parent_seconds.get(parents[int(pair[1])], 0.0)),
                     -float(seconds(tasks[int(pair[1])])),
                     int(pair[0]),
                 ),
             )[1]
         selected_task = tasks[int(selected_id)]
+        if (_spherical_pacing_enabled()
+                and self._spherical_pacing_new_parent(selected_task, parents.get(int(selected_id)))):
+            self.state.spherical_paced_parents.add(parents[int(selected_id)])
+            self._telemetry_add('yolo.spherical_pacing.parents_opened', 1)
         if int(selected_id) in early_cheap_workers:
             self._telemetry_add('yolo.cpu_input.early_overlap_selections', 1)
         selected_task['hybrid_gpu_assist_dispatch'] = bool(int(selected_id) in assist_ids)

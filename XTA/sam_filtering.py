@@ -12,6 +12,7 @@ import hashlib
 import inspect
 import json
 from pathlib import Path
+import threading
 
 import numpy as np
 from scipy import ndimage
@@ -26,12 +27,42 @@ _QUALIFIED_LEGACY_IMPLEMENTATION = "bac0f301626e20500c3b8beab261b1f9ea64289de2af
 _QUALIFIED_PREVIOUS_IMPLEMENTATION = "96278bbc549acb81c54f1e6f8124faa1d091ffbca378e98cd73d09040f44368c"
 _QUALIFIED_RADIUS_ONLY_IMPLEMENTATION = "c67e0fed11962aba7b106cb7dce3f60b5eb6ce44b042159cb73cc99767c78cf7"
 _QUALIFIED_PRE_BOOLEAN_IMPLEMENTATION = "dc97330222b3ca987787cff5451525d8917a43ece38058221d091c99a789c10b"
+# Module source from v24.1.3 through v25.0.2; only the source guard changed after it.
+_QUALIFIED_V25_SOURCE_GUARD_IMPLEMENTATION = "82daefcb1b6739044fbae4e4c23686b7dbf78496531ef498e70655e5337c1ea2"
 _QUALIFIED_NUMERICAL_SOURCE = "20944399631c47bbb1ecab1999ebf40ba7141ca7a60f36fa4750614ccfa86d84"
+# Set only while ``measure_effective_raw_mask`` filters for an active SamMaskReader
+# transaction. That transaction's root re-hashes this source on entry and on close
+# (sam_mask_reader._assert_source_unchanged), so the per-mask re-read is redundant.
+_TRANSACTION_GUARDED = threading.local()
 
 
 def assert_filter_implementation_unchanged():
+    if getattr(_TRANSACTION_GUARDED, "active", False):
+        return
     if hashlib.sha256(_SOURCE_PATH.read_bytes()).hexdigest() != IMPLEMENTATION_SHA256:
         raise RuntimeError("SAM component filter implementation changed after loading")
+
+
+def _source_checked_transaction(bundle):
+    """True for a reader inside a root transaction that checks this source on close."""
+    from .sam_mask_reader import SamMaskReader
+    reader = bundle
+    while isinstance(reader, SamMaskReader):
+        if not reader._active or reader._closed:
+            return False
+        if reader._integrity_parent is None:
+            return True
+        reader = reader._integrity_parent
+    return False
+
+
+def _filter_in_checked_transaction(raw, threshold, enabled):
+    previous = getattr(_TRANSACTION_GUARDED, "active", False)
+    _TRANSACTION_GUARDED.active = True
+    try:
+        return filter_sam_components(raw, threshold, enabled=enabled)
+    finally:
+        _TRANSACTION_GUARDED.active = previous
 
 
 def _fingerprint(value):
@@ -67,7 +98,8 @@ def _compatible_filter_implementation(identifier):
     if identifier == IMPLEMENTATION_SHA256:
         return True
     if identifier not in (_QUALIFIED_LEGACY_IMPLEMENTATION, _QUALIFIED_PREVIOUS_IMPLEMENTATION,
-                          _QUALIFIED_RADIUS_ONLY_IMPLEMENTATION, _QUALIFIED_PRE_BOOLEAN_IMPLEMENTATION):
+                          _QUALIFIED_RADIUS_ONLY_IMPLEMENTATION, _QUALIFIED_PRE_BOOLEAN_IMPLEMENTATION,
+                          _QUALIFIED_V25_SOURCE_GUARD_IMPLEMENTATION):
         return False
     # The bounded radius implementation preserves the original padded EDT and
     # complete-component decision. Bind historical receipts to every numerical
@@ -220,11 +252,14 @@ def measure_effective_raw_mask(bundle, run_id, frame, receipt_or_filter=None):
     run = bundle.runs[str(run_id)]
     raw = bundle.raw_mask(run_id, frame)
     if spec is None:
-        return filter_sam_components(raw, 0., enabled=False)
-    if str(run["group_id"]) not in spec.get("thresholds_by_group", {}):
-        raise ValueError("SAM component filter lacks the selected run's group threshold")
-    threshold = float(spec["thresholds_by_group"][str(run["group_id"])])
-    return filter_sam_components(raw, threshold, enabled=spec["enabled"])
+        threshold, enabled = 0., False
+    else:
+        if str(run["group_id"]) not in spec.get("thresholds_by_group", {}):
+            raise ValueError("SAM component filter lacks the selected run's group threshold")
+        threshold, enabled = float(spec["thresholds_by_group"][str(run["group_id"])]), spec["enabled"]
+    if _source_checked_transaction(bundle):
+        return _filter_in_checked_transaction(raw, threshold, enabled)
+    return filter_sam_components(raw, threshold, enabled=enabled)
 
 
 def effective_raw_mask(bundle, run_id, frame, receipt_or_filter=None):

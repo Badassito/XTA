@@ -28,10 +28,14 @@ def test_explicit_pretracker_topology_cap_is_preserved_with_live_extra_credit(tm
     observations[[0,2],3,4]=1
     with admit_sam_parent_resources(Pool(),GIB,'explicit-preflight',headroom_probe=lambda:64*GIB) as profile:
         assert profile.has_extra_credit and profile.assigned_topology_bytes>1024
-        with pytest.raises(SamInterpolationInfrastructureError,match='topology exceeds'):
-            prepare_sam_interpolation_pass(observations,gap_distance=5,min_radius=0,
-                interpolation_walk_back=0,resource_profile=profile,
-                policy={'sam_bridge_policy':{'max_group_bytes':1024}})
+        # The explicit cap still wins over live credit, but a group over it is now
+        # refused by planning (warned, manifest incomplete) instead of failing the run.
+        prepared=prepare_sam_interpolation_pass(observations,gap_distance=5,min_radius=0,
+            interpolation_walk_back=0,resource_profile=profile,
+            policy={'sam_bridge_policy':{'max_group_bytes':1024}})
+    assert prepared.runs==()
+    assert any('topology_workspace_memory_limit' in group.reasons for group in prepared.plan.groups)
+    assert all(group.status!='planned' for group in prepared.plan.groups)
 
 
 def test_inherited_pretracker_topology_cap_can_use_live_extra_credit(tmp_path):

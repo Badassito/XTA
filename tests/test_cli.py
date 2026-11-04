@@ -16,7 +16,7 @@ from XTA.unification.context import current_unified_launch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LAUNCHER = ROOT / f"GPT-6-Astra-Ultra_v{__version__}_SLURM.py"
+LAUNCHER = ROOT / f"Opus-5.5_v{__version__}_SLURM.py"
 
 
 class CliTests(unittest.TestCase):

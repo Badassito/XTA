@@ -1,6 +1,7 @@
 """Exact interpolation contract planes without retaining frame/edge stacks."""
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Mapping
 
 import numpy as np
@@ -8,8 +9,13 @@ import numpy as np
 from ._deps import ndi
 from .sam_bridge_planning import _corridor, _intersects, _readonly
 
+# Same-frame role planes reuse one edge corridor (for example write, edge_write
+# and edge_contract of one edge). Two immutable crop planes bound the cache.
+_CORRIDOR_CACHE_PLANES = 2
 
-def streaming_sam_contract_peak_bytes(crop_pixels, frame_count, edge_count, observation_count):
+
+def streaming_sam_contract_peak_bytes(crop_pixels, frame_count, edge_count, observation_count,
+                                      candidate_edge_count=None):
     """Producer scratch plus per-role metadata; inventory/packing are separate owners.
 
     96 bytes/pixel covers paint's ~49-byte coordinate peak, EDT float/int
@@ -17,15 +23,22 @@ def streaming_sam_contract_peak_bytes(crop_pixels, frame_count, edge_count, obse
     The permitted-support cache holds two integer planes (normally 8 bytes/pixel,
     at most 16); its construction never retains a corridor or sibling stack.
     The 2-KiB/role allowance covers generated names, evidence records and indexes.
-    Retained candidate tuples charge 80 bytes per possible observation pair;
-    construction pointer growth uses the metadata allowance. Source masks and
-    the bounded packing queue remain separate owners.
+    Retained candidate tuples (one per endpoint pair linked in the planning
+    graph) charge 80 bytes each. Planners pass that exact count; without it,
+    every possible observation pair is charged. Construction pointer growth uses
+    the metadata allowance. Source masks and the bounded packing queue remain
+    separate owners.
     """
     pixels, frames, edges, observations = map(int, (crop_pixels, frame_count, edge_count, observation_count))
     if min(pixels, frames, observations) < 1 or edges < 0:
         raise ValueError('Streaming SAM contracts require positive crop/frame/observation counts')
+    pairs = observations * (observations - 1) // 2
+    if candidate_edge_count is not None:
+        if int(candidate_edge_count) < 0:
+            raise ValueError('Streaming SAM contracts require a non-negative candidate edge count')
+        pairs = min(pairs, int(candidate_edge_count))
     roles = (4 + 2 * edges) * frames + 3 * observations
-    return 96 * pixels + 2048 * roles + 80 * observations * (observations - 1) // 2
+    return 96 * pixels + 2048 * roles + 80 * pairs
 
 
 def _include_permitted_support(first, second, plane, owner_a, owner_b=-2):
@@ -81,6 +94,8 @@ class StreamingSamGroupMasks(Mapping):
         self._candidate_edge_inventory = tuple(self._candidate_edges())
         self._cached_frame = None
         self._cache = {}
+        self._corridor_frame = None
+        self._corridor_cache = OrderedDict()
         self._empty_plane = _readonly(np.zeros(self.shape, bool))
 
     def __len__(self):
@@ -139,7 +154,26 @@ class StreamingSamGroupMasks(Mapping):
                     yield source, target, a, b
 
     def _corridor(self, a, b, frame, margin):
-        return _corridor(a, b, frame, self.crop, margin, raster_origin_yx=self.origin)
+        """Return one immutable corridor; callers never modify the shared plane.
+
+        A corridor is a pure function of its two observations, frame, margin,
+        crop and raster origin. Only the current frame's most recent planes are
+        retained, so peak residency grows by at most two crop planes.
+        """
+        if frame != self._corridor_frame:
+            self._corridor_cache.clear()
+            self._corridor_frame = frame
+        key = (a.observation_id, b.observation_id, int(margin))
+        plane = self._corridor_cache.get(key)
+        if plane is not None:
+            self._corridor_cache.move_to_end(key)
+            return plane
+        plane = _corridor(a, b, frame, self.crop, margin, raster_origin_yx=self.origin)
+        plane.setflags(write=False)
+        self._corridor_cache[key] = plane
+        while len(self._corridor_cache) > _CORRIDOR_CACHE_PLANES:
+            self._corridor_cache.popitem(last=False)
+        return plane
 
     def _corridor_union(self, edges, frame, margin):
         """Dilate shared-margin support once, retaining the single-edge ROI path.
@@ -187,14 +221,14 @@ class StreamingSamGroupMasks(Mapping):
             if role == 'write':
                 plane = self._corridor_union(((a, b) for a, b in self.edges.values()
                     if a.frame_index < frame < b.frame_index), frame, bounds.curvature_margin_px)
-                plane &= ~self._cache['original']
+                plane = plane & ~self._cache['original']
             elif role == 'acceptance':
                 plane = self._corridor_union(((a, b) for _source, _target, a, b in self._candidate_edge_inventory
                     if a.frame_index <= frame <= b.frame_index), frame,
                     bounds.curvature_margin_px + bounds.acceptance_margin_px)
                 known = self._cache['known']
-                plane |= (ndi.binary_dilation(known, iterations=bounds.acceptance_margin_px)
-                          if bounds.acceptance_margin_px else known)
+                plane = plane | (ndi.binary_dilation(known, iterations=bounds.acceptance_margin_px)
+                                 if bounds.acceptance_margin_px else known)
             else:
                 raise KeyError(role)
             self._cache[role] = _readonly(plane)
@@ -207,7 +241,7 @@ class StreamingSamGroupMasks(Mapping):
             return self._empty_plane
         plane = self._corridor(a, b, frame, self.recipe.bounds.curvature_margin_px)
         if writable:
-            plane &= ~self._frame_plane(frame, 'original')
+            plane = plane & ~self._frame_plane(frame, 'original')
         return _readonly(plane)
 
     def _endpoint_role(self, observation, role):

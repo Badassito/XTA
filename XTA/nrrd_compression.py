@@ -607,6 +607,22 @@ def _unregister_nrrd_live_writer(writer: '_MemberParallelGzipPayloadWriter') -> 
         writer._diag_enabled = False
 
 
+def canonical_zero_run_bytes(nbytes: int) -> bytes:
+    """Exact bytes ``write_canonical_zeros(nbytes)`` emits for a software codec."""
+    full_members, remaining = divmod(int(nbytes), 1024 * 1024)
+    parts = [canonical_zero_member(1024 * 1024) * full_members] if full_members else []
+    while remaining:
+        size = 1 << (remaining.bit_length() - 1)
+        parts.append(canonical_zero_member(size))
+        remaining -= size
+    return b''.join(parts)
+
+
+def canonical_zero_run_member_count(nbytes: int) -> int:
+    full_members, remaining = divmod(int(nbytes), 1024 * 1024)
+    return int(full_members) + bin(int(remaining)).count('1')
+
+
 class _MemberParallelGzipPayloadWriter:
     """Pipelined encoder emitting one complete gzip member sequence per chunk.
 
@@ -656,6 +672,8 @@ class _MemberParallelGzipPayloadWriter:
             'window_wait_seconds': 0.0,
             'zero_descriptor_wait_seconds': 0.0,
             'close_wait_seconds': 0.0,
+            'owned_member_batches': 0, 'owned_member_batch_members': 0,
+            'batched_canonical_zero_runs': 0,
         }
         self._writer_stats_published = False
         self._diag_enabled = False
@@ -696,6 +714,48 @@ class _MemberParallelGzipPayloadWriter:
         telemetry.add(f'nrrd.compression.{self.backend}.output_bytes', len(member_sequence))
         telemetry.add(f'nrrd.compression.{self.backend}.logical_requests', 1)
         return member_sequence, int(ln)
+
+    def _compress_member_batch(self, payload: object,
+                               segments: Tuple[Tuple[int, int, int], ...]) -> Tuple[bytes, int]:
+        """Encode one batch: per segment, canonical zeros then one complete member.
+
+ Each nonempty range is compressed by its own codec call, so the concatenation is
+ byte-identical to the member sequence ``write_canonical_zeros`` and
+ ``write_owned_known_nonzero`` produce, with one pool job and one completion for
+ the whole batch."""
+        mv = payload if isinstance(payload, memoryview) else memoryview(payload)  # type: ignore[arg-type]
+        mv = mv.cast('B')
+        telemetry = runtime_telemetry()
+        parts = []
+        total_in = 0
+        total_out = 0
+        members = 0
+        try:
+            with telemetry.span(f'nrrd.compression.{self.backend}.compress'):
+                for zeros, start, stop in segments:
+                    if zeros:
+                        parts.append(canonical_zero_run_bytes(int(zeros)))
+                    if int(stop) <= int(start):
+                        continue
+                    piece = mv[int(start):int(stop)]
+                    try:
+                        member_sequence = bytes(self.member_compress(piece))
+                    except TypeError:
+                        if bool(getattr(self.member_compress, 'hardware_backend', False)):
+                            raise
+                        member_sequence = bytes(self.member_compress(bytes(piece)))
+                    parts.append(member_sequence)
+                    total_in += int(len(piece))
+                    total_out += int(len(member_sequence))
+                    members += 1
+        except Exception:
+            telemetry.add(f'nrrd.compression.{self.backend}.failures', 1)
+            raise
+        telemetry.add(f'nrrd.compression.{self.backend}.input_bytes', int(total_in))
+        telemetry.add(f'nrrd.compression.{self.backend}.output_bytes', int(total_out))
+        telemetry.add(f'nrrd.compression.{self.backend}.logical_requests', int(members))
+        telemetry.add(f'nrrd.compression.{self.backend}.batched_jobs', 1)
+        return b''.join(parts), int(total_in)
 
     def _enqueue_completed(self, member: bytes) -> None:
         seq = int(self._next_sequence)
@@ -997,6 +1057,69 @@ class _MemberParallelGzipPayloadWriter:
             self._abandon_and_settle()
             raise
         return int(len(mv))
+
+    def write_owned_member_batch(self, data: object, segments: object) -> int:
+        """Queue ``(zero_bytes, start, stop)`` segments of one owned buffer as one job.
+
+ Equivalent to, per segment, ``write_canonical_zeros(zero_bytes)`` then
+ ``write_owned_known_nonzero(data[start:stop])``. The software path emits the same
+ gzip bytes with one compression job, Future and completion per batch; writers
+ with pending sub-minimum bytes or a hardware minimum replay the per-segment calls."""
+        if self.closed:
+            raise RuntimeError('Cannot write to a closed gzip payload stream')
+        mv = data if isinstance(data, memoryview) else memoryview(data)  # type: ignore[arg-type]
+        mv = mv.cast('B')
+        items = tuple((int(z), int(a), int(b)) for z, a, b in segments)  # type: ignore[union-attr]
+        for zeros, start, stop in items:
+            if zeros < 0:
+                raise ValueError('A zero run cannot have negative length')
+            if start < 0 or stop < start or stop > len(mv):
+                raise ValueError('Member batch segment lies outside its buffer')
+        if (self._small_pending or int(self.minimum_input_bytes) > 1
+                or self._hardware_lookbehind_enabled()):
+            written = 0
+            for zeros, start, stop in items:
+                if zeros:
+                    written += int(self.write_canonical_zeros(zeros))
+                if stop > start:
+                    written += int(self.write_owned_known_nonzero(mv[start:stop]))
+            return int(written)
+        try:
+            zero_total = 0
+            zero_members = 0
+            zero_runs = 0
+            charged = 0
+            members = 0
+            for zeros, start, stop in items:
+                if zeros:
+                    zero_total += zeros
+                    zero_members += canonical_zero_run_member_count(zeros)
+                    zero_runs += 1
+                if stop > start:
+                    charged += stop - start
+                    members += 1
+            if zero_total == 0 and charged == 0:
+                return 0
+            self._writer_stats['canonical_zero_logical_bytes'] += int(zero_total)
+            self._writer_stats['canonical_zero_members'] += int(zero_members)
+            self._writer_stats['batched_canonical_zero_runs'] += int(zero_runs)
+            self._writer_stats['owned_member_batches'] += 1
+            self._writer_stats['owned_member_batch_members'] += int(members)
+            seq = int(self._next_sequence)
+            self._next_sequence += 1
+            fut = _nrrd_gzip_executor(self.codec_spec).submit(
+                self._compress_member_batch, mv, items,
+            )
+            self._pending[fut] = (int(seq), int(charged))
+            self._inflight_bytes += int(charged)
+            if self._diag_enabled:
+                self._diag_pending[int(seq)] = (fut, time.monotonic_ns())
+            self._drain(block=False)
+        except BaseException:
+            self.closed = True
+            self._abandon_and_settle()
+            raise
+        return int(zero_total + charged)
 
     def write_canonical_zeros(self, nbytes: int) -> int:
         """Use at most 21 reusable zero-member sizes for arbitrary sparse gaps.

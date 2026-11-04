@@ -6,7 +6,7 @@ import weakref
 import numpy as np
 import pytest
 
-from XTA.sam_bridge_planning import (SamPlanningLimits, _contract_materialization,
+from XTA.sam_bridge_planning import (SamPlanningLimits, _candidate_edge_count, _contract_materialization,
     expand_sam_bridge_group_context, plan_sam_bridges)
 from XTA.sam_evidence import SamEvidenceWriter
 from XTA.sam_interpolation import _write_group
@@ -128,7 +128,8 @@ def test_retry_recomputes_nonproportional_stream_metadata_charge():
         max_crop_pixels=source.shape[1] * source.shape[2])
     expected = _contract_materialization(source.shape[1] * source.shape[2],
         len(group.frame_indices), len(group.edges), len(group.endpoint_ids),
-        len(group.observation_ids), True)
+        len(group.observation_ids), True,
+        _candidate_edge_count(group.contract_recipe.endpoints, group.contract_recipe.graph))
     for key, value in expected.items():
         assert expanded.crop_contract[key] == value
     assert expanded.crop_contract['legacy_raster_origin_yx'] == group.crop_contract['legacy_raster_origin_yx']

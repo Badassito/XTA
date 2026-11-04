@@ -43,6 +43,47 @@ class _SamImageCreditRequired(RuntimeError):
                          'a separate image-only grant is required')
 
 
+def sam_startup_wait_seconds():
+    """Per-wait bound for SAM device startup (host RAM and GPU-stage lease).
+
+    ``YOLO_TTA_SAM_STARTUP_WAIT_SEC``, default 300. The waits poll and stop on
+    cancel, so a larger value only matters when GPUs stay busy for longer.
+    """
+    raw = os.environ.get('YOLO_TTA_SAM_STARTUP_WAIT_SEC', '').strip()
+    try:
+        value = float(raw) if raw else 300.
+    except ValueError:
+        raise ValueError(f'YOLO_TTA_SAM_STARTUP_WAIT_SEC must be a number of seconds, got {raw!r}') from None
+    if not value > 0:
+        raise ValueError('YOLO_TTA_SAM_STARTUP_WAIT_SEC must be positive')
+    return value
+
+
+SAM_PASS_FAILURE_POLICIES = ('abort', 'degrade')
+
+
+def sam_pass_failure_policy():
+    """How one failed SAM pass is handled (``YOLO_TTA_SAM_PASS_FAILURE_POLICY``).
+
+    ``abort`` (default) ends the run. ``degrade`` keeps that view's unmodified
+    input masks for the failed pass, records a ``failed`` omission and lets the
+    run finish with ``status: incomplete``. A scheduler cancel always aborts.
+    """
+    raw = os.environ.get('YOLO_TTA_SAM_PASS_FAILURE_POLICY', '').strip().lower() or 'abort'
+    if raw not in SAM_PASS_FAILURE_POLICIES:
+        raise ValueError(f'YOLO_TTA_SAM_PASS_FAILURE_POLICY must be one of {SAM_PASS_FAILURE_POLICIES}, got {raw!r}')
+    return raw
+
+
+class SamImageCacheBudgetExceeded(RuntimeError):
+    """A planned image descriptor exceeds its cache cap before any build or claim."""
+    def __init__(self, payload_bytes, cache_budget, pinned_cap=None):
+        self.payload_bytes = int(payload_bytes)
+        self.cache_budget = int(cache_budget)
+        self.pinned_cap = None if pinned_cap is None else int(pinned_cap)
+        super().__init__(f'SAM planned image demand {self.payload_bytes} bytes exceeds cache budget {self.cache_budget}')
+
+
 def _image_mapping_live(reference):
     mapping = None if reference is None else reference()
     return mapping is not None and not mapping.closed
@@ -164,6 +205,13 @@ def _write_context_preparation_failure(destination, receipt, error):
             error.add_note(f'SAM context failure receipt could not be written: {receipt_error}')
 
 
+def _count_image_event(name):
+    try:
+        runtime_telemetry().add(name, 1)
+    except Exception:
+        pass  # Diagnostics never change image routing or memory ownership.
+
+
 class SamInterpolationContext:
     """One run's persistent predictor, immutable image caches, and device leases."""
 
@@ -174,8 +222,12 @@ class SamInterpolationContext:
                  feature_cache_mib=1024, crop_mode='whole', delayed_native_expansion=None,
                  interpolation_policy_enabled=True, extrapolation_evidence_root=None,
                  adaptive_crop=False, progressive_startup=False, startup_pending_host_bytes=None,
-                 gray_cache_root=None, gray_cache_specs=None, enable_2D_hole_fill=False):
+                 gray_cache_root=None, gray_cache_specs=None, enable_2D_hole_fill=False,
+                 gpu_image_source_resident=False):
         self.model_path = str(model_path)
+        # The run renders SAM images from the full source on GPU (Azimuthal views):
+        # size session caps so that source can stay resident between image leases.
+        self.gpu_image_source_resident = bool(gpu_image_source_resident)
         self.enable_2D_hole_fill = bool(enable_2D_hole_fill)
         self.crop_mode = str(crop_mode).strip().lower()
         if self.crop_mode not in {'whole', 'tiled'}:
@@ -275,7 +327,7 @@ class SamInterpolationContext:
         self._startup_funding_lock = threading.Lock()
         self._startup_diagnostics_lock = threading.Lock()
         self._startup_progress = {}
-        self._startup_wait_timeout = 300.
+        self._startup_wait_timeout = sam_startup_wait_seconds()
         self._startup_future_peaks = {}
         self._progressive_bundle = None
         self._startup_host_plan = None
@@ -291,6 +343,10 @@ class SamInterpolationContext:
         self._gpu_image_cursor = 0
         self._gpu_image_owners = {}
         self._gpu_image_sdk_owed = set()
+        # Full-window image sources kept on a GPU between leases (device -> holder),
+        # only on devices whose SAM session caps were sized with this reserve.
+        self._parked_gpu_sources = {}
+        self._gpu_source_park_devices = set()
         self._caches = {}
         self._cache_transforms = {}
         self._cache_entries = []
@@ -324,6 +380,8 @@ class SamInterpolationContext:
         self.no_job_passes = 0
         self.planning_omissions = []
         self.unresolved_plan_passes = 0
+        self.pass_failure_policy = sam_pass_failure_policy()
+        self.pass_failures = []
         self.dispatch_summary = {}
         self.shared_detector_devices = tuple(self.device_ids if detector_device_ids is None else
             sorted(set(self.device_ids) & {f'cuda:{int(str(value).split(":")[-1])}' for value in detector_device_ids}))
@@ -337,6 +395,28 @@ class SamInterpolationContext:
             self._progressive_bundle = resolve_local_sam_bundle(self.model_path)
             peak = 2*int(Path(self._progressive_bundle.checkpoint_path).stat().st_size)*self.sessions_per_gpu+2*GIB
             self._startup_future_peaks = {int(device.split(':')[-1]):peak for device in self.device_ids}
+        self._checkpoint_digest_prefetch = None
+
+    def start_checkpoint_digest_prefetch(self):
+        """Start the opt-in host-only checkpoint hash once; never raises.
+
+        The pipeline calls this after detector workers are ready, so the read
+        overlaps detector inference rather than detector model loading. It
+        uses no model, CUDA context, GPU lease or held allocation.
+        """
+        from .sam_checkpoint_digest import prefetch_enabled, start_checkpoint_digest_prefetch
+        if (self._checkpoint_digest_prefetch is not None or not prefetch_enabled()
+                or self._closed or self._cancel.is_set()):
+            return self._checkpoint_digest_prefetch
+        try:
+            from .lta_sam import resolve_local_sam_bundle
+            bundle = self._progressive_bundle or resolve_local_sam_bundle(self.model_path)
+            self._checkpoint_digest_prefetch = start_checkpoint_digest_prefetch(
+                self.model_path, bundle.checkpoint_path)
+        except Exception:
+            # Startup reports bundle errors itself; workers then hash locally.
+            return None
+        return self._checkpoint_digest_prefetch
 
     def detector_assets_retired(self) -> None:
         if self.progressive_startup:
@@ -386,18 +466,19 @@ class SamInterpolationContext:
         if self._cancel.is_set() and not self._closed:
             raise RuntimeError(self._failure or 'SAM startup cancelled')
 
-    def ensure_all_devices(self, timeout=300.):
+    def ensure_all_devices(self, timeout=None):
         if not self.progressive_startup:
             self._start()
             return
         self._start_progressive()
-        deadline = time.monotonic()+float(timeout)
+        deadline = time.monotonic()+float(self._startup_wait_timeout if timeout is None else timeout)
         configured = {int(device.split(':')[-1]) for device in self.device_ids}
         while (set(self._progressive_pool.device_ids) != configured
                 or any(thread.is_alive() for thread in self._progressive_threads.values())):
             self.check_startup()
             if time.monotonic() >= deadline:
-                raise RuntimeError('SAM configured device startup did not complete')
+                raise RuntimeError('SAM configured device startup did not complete '
+                    f'within {self._startup_wait_timeout:.0f} s; raise YOLO_TTA_SAM_STARTUP_WAIT_SEC')
             self._cancel.wait(.05)
 
     @property
@@ -892,7 +973,11 @@ class SamInterpolationContext:
                         runtime_telemetry().add(shell_counter, 1)
                 renderer = None
                 if not cheap_cpu and not shell_cpu:
-                    renderer = try_gpu_crop_renderer(self, view, shape, prepared_plan)
+                    # While SAM tracking has ready jobs, take only an already-idle
+                    # GPU; otherwise render on CPU. Draining a busy GPU for image
+                    # preparation left it at ~0% for 30-45 s per lease.
+                    renderer = try_gpu_crop_renderer(self, view, shape, prepared_plan,
+                        **({'opportunistic': True} if self._image_cpu_route_when_sam_busy() else {}))
                 cpu_started = time.perf_counter() if cpu_prefetch and renderer is None else None
                 if cpu_started is not None:
                     runtime_telemetry().add('sam.cpu_images.prefetch_admissions', 1)
@@ -1307,7 +1392,7 @@ class SamInterpolationContext:
                         reference = ticket['reference']
                         if (pinned_cap is not None and self._cache_owners[str(reference.path)]['owned']
                                 and reference.size_bytes > cache_budget):
-                            raise RuntimeError(f'SAM planned image demand {reference.size_bytes} bytes exceeds cache budget {cache_budget}')
+                            raise SamImageCacheBudgetExceeded(reference.size_bytes, cache_budget, pinned_cap)
                         reference.revalidate()
                         self.image_cache_hits += 1
                         return self._claim_image_reference(reference)
@@ -1327,7 +1412,7 @@ class SamInterpolationContext:
                     and np.array_equal(affine, np.array([[1., 0., 0.], [0., 1., 0.]], np.float32))
                     and Path(backing).is_file() and Path(backing).stat().st_size == int(np.prod(shape)))
                 if payload_bytes > cache_budget and not borrow_backing:
-                    raise RuntimeError(f'SAM planned image demand {payload_bytes} bytes exceeds cache budget {cache_budget}')
+                    raise SamImageCacheBudgetExceeded(payload_bytes, cache_budget, pinned_cap)
                 ticket = dict(done=False, error=None, reference=None, waiters=0, admitted=False)
                 self._image_builds[key] = ticket
                 try:
@@ -1397,9 +1482,10 @@ class SamInterpolationContext:
                 path.unlink(missing_ok=True)
                 raise
             completed = {}
-            target = physical_target = done = native_frame_cache = native_plane = None
+            target = physical_target = done = native_frame_cache = native_plane = prepared_rects = None
             batch_iterator = None
             native_iterator = None
+            azimuthal_iterator = azimuthal_jobs = None
             native_rois = {}
             batch_images = {}
             try:
@@ -1449,6 +1535,9 @@ class SamInterpolationContext:
                                 check_cancel=check_native_preparation,
                                 native_crop_bounds=native_rois)
                             runtime_telemetry().add('sam.cpu_images.native_prefetch_cohorts', 1)
+                    if native_iterator is None and batch_iterator is None and str(view.family) == 'azimuthal':
+                        azimuthal_iterator, azimuthal_jobs = self._azimuthal_crop_prefetch(
+                            view, shape, records, addresses, affine, inverse, scratch_bytes, donor_entries)
                 from .workspace import _env_flag
                 from .geometry import is_tilted_azimuthal_view
                 from .sam_azimuthal_batch import BatchDeclined
@@ -1458,6 +1547,9 @@ class SamInterpolationContext:
                     and not donor_entries and str(view.family) == 'azimuthal'
                     and not is_tilted_azimuthal_view(view)
                     and _env_flag('YOLO_TTA_SAM_AZIMUTHAL_BATCH', True))
+                from .sam_azimuthal_batch import queued_frame_limit
+                gpu_batch_lookahead = (max(4, queued_frame_limit())
+                    if _env_flag('YOLO_TTA_SAM_GPU_IMAGE_QUEUE', True) else 4)
                 record_position = 0
                 while record_position < len(records):
                     # The preceding scalar crop or batch has reached its private
@@ -1471,7 +1563,9 @@ class SamInterpolationContext:
                         # Existing ordered metadata is the only lookahead. Aliases,
                         # donors and fragmented reuse keep their scalar path below.
                         batch_records = []
-                        for candidate in records[record_position:record_position+4]:
+                        # Longer compatible runs are rendered as queued 2-4 frame
+                        # chunks (YOLO_TTA_SAM_GPU_IMAGE_QUEUE_FRAMES; 4 restores old).
+                        for candidate in records[record_position:record_position+gpu_batch_lookahead]:
                             frame, by0, bx0, by1, bx1, _boffset = candidate
                             candidate_address = addresses[frame]
                             if (candidate_address.get('cycle_index') != 0
@@ -1597,6 +1691,24 @@ class SamInterpolationContext:
                             remainder.extend(_subtract_bbox(remaining, intersection))
                         missing = tuple(remainder)
                         del done
+                    prepared_rects = None
+                    if azimuthal_iterator is not None and record_position in azimuthal_jobs:
+                        waiting_started = time.perf_counter()
+                        prepared_frame, prepared_images, plane_pixels, sampled_pixels = next(azimuthal_iterator)
+                        runtime_telemetry().add('sam.cpu_images.azimuthal_prefetch_wait_seconds',
+                            time.perf_counter()-waiting_started)
+                        if (prepared_frame != int(address['native_index'])
+                                or azimuthal_jobs[record_position] != tuple(missing)
+                                or len(prepared_images) != len(missing)):
+                            raise RuntimeError('SAM Azimuthal prefetch returned an unplanned record')
+                        prepared_rects = dict(zip(missing, prepared_images))
+                        prepared_images = None
+                        # Same counters as one serial native plane plus its canonical remaps.
+                        self._add_image_metrics(native_sampling_calls=1, native_sampling_pixels=plane_pixels,
+                            canonical_sampling_pixels=sampled_pixels)
+                        runtime_telemetry().add('sam.cpu_images.azimuthal_prefetch_records', 1)
+                    elif azimuthal_iterator is not None and missing:
+                        raise RuntimeError('SAM Azimuthal prefetch omitted a record with missing pixels')
                     for cy0, cx0, cy1, cx1 in missing:
                         self._check_image_lifetime()
                         image = (gray_reader.read_crop(int(address['native_index']), (cy0, cx0, cy1, cx1))
@@ -1604,6 +1716,8 @@ class SamInterpolationContext:
                             pre_rendered[cy0-physical_bbox[0]:cy1-physical_bbox[0],
                                               cx0-physical_bbox[1]:cx1-physical_bbox[1]]
                             if pre_rendered is not None else
+                            prepared_rects.pop((cy0, cx0, cy1, cx1))
+                            if prepared_rects is not None else
                             self._render_demand_crop(view, int(address['native_index']), affine, inverse,
                                 output_height=cy1-cy0, output_width=cx1-cx0,
                                 output_origin_yx=(cy0, cx0), output_canvas_width=shape[2],
@@ -1624,7 +1738,7 @@ class SamInterpolationContext:
                         del image
                     completed.setdefault(int(address['native_index']), []).append((
                         physical_bbox, bool(address['mirror_u']), offset))
-                    del target, physical_target, native_frame_cache, pre_rendered
+                    del target, physical_target, native_frame_cache, pre_rendered, prepared_rects
                     record_position += 1
                 if gpu_renderer is not None:
                     # Last D2H is complete; disk finalization needs no GPU source or compute lease.
@@ -1637,15 +1751,19 @@ class SamInterpolationContext:
                         time.perf_counter()-flush_started)
             except BaseException:
                 from .runtime import close_memmap_array_without_flush
-                target = physical_target = done = native_frame_cache = native_plane = None
+                target = physical_target = done = native_frame_cache = native_plane = prepared_rects = None
                 close_memmap_array_without_flush(cache, unlink_path=path)
                 cache = None
                 raise
             finally:
                 try:
                     try:
-                        if native_iterator is not None:
-                            native_iterator.close()
+                        try:
+                            if native_iterator is not None:
+                                native_iterator.close()
+                        finally:
+                            if azimuthal_iterator is not None:
+                                azimuthal_iterator.close()
                     finally:
                         if batch_iterator is not None:
                             batch_iterator.close()
@@ -1787,6 +1905,112 @@ class SamInterpolationContext:
             [(frame,(y0,x0,y1,x1)) for frame,y0,x0,y1,x1,_offset in records],
             affine=affine,inverse=inverse,canvas_width=shape[2],max_workspace_bytes=cap,
             cancel_event=self._cancel)
+
+    def _azimuthal_crop_prefetch(self, view, shape, records, addresses, affine, inverse,
+                                 scratch_bytes, donor_entries):
+        """Prepare independent Azimuthal records on a bounded pool within the build's scratch credit.
+
+        Returns ``(iterator, {record_position: missing_rects})`` or ``(None, None)``
+        for the unchanged serial route. Workers run the serial native sampler and
+        canonical remap on the same ready source the serial renderer would
+        materialize; the owner keeps plan order, private-cache writes and reuse.
+        """
+        from .workspace import _env_flag, _env_int, _cpu_count
+        from .sam_cyclic import mirror_bbox_yx
+        if (not _env_flag('YOLO_TTA_SAM_AZIMUTHAL_CPU_PREFETCH', True) or donor_entries
+                or len(records) < 2 or str(view.family) != 'azimuthal'):
+            return None, None
+        if bool(view.azimuthal_tilted_source) and int(view.src_w) < max(1, _env_int(
+                'YOLO_TTA_SAM_TILTED_AZIMUTHAL_PREFETCH_MIN_WIDTH', 1024)):
+            # The tilted extractor issues many small numpy calls per 16-row block;
+            # narrow rasters are GIL-bound and measured slower with workers.
+            return None, None
+        # Without donors the loop's missing rectangles are a pure function of the
+        # ordered plan: earlier same-native records cover later aliases first.
+        jobs, finished = {}, {}
+        for position, (index, y0, x0, y1, x1, _offset) in enumerate(records):
+            address = addresses[index]
+            native = int(address['native_index'])
+            bbox = tuple(int(value) for value in (mirror_bbox_yx((y0, x0, y1, x1), shape[2])
+                if address['mirror_u'] else (y0, x0, y1, x1)))
+            missing = [bbox]
+            for done in finished.get(native, ()):
+                remainder = []
+                for remaining in missing:
+                    intersection = _intersect_bbox(remaining, done)
+                    if intersection is None:
+                        remainder.append(remaining)
+                    else:
+                        remainder.extend(_subtract_bbox(remaining, intersection))
+                missing = remainder
+            finished.setdefault(native, []).append(bbox)
+            if missing:
+                jobs[position] = tuple(tuple(int(value) for value in rect) for rect in missing)
+        if len(jobs) < 2:
+            return None, None
+        from .sam_azimuthal_cpu_prefetch import (azimuthal_native_workspace_bytes,
+            canonical_remap_workspace_bytes, iter_prefetched_azimuthal_records)
+        native_bytes = int(view.src_h)*int(view.src_w)
+        render_budget = max(1, _env_int('YOLO_TTA_SAM_RENDER_MAX_BYTES', 256*1024**2))
+        # The serial uncached renderer refuses these planes before sampling.
+        if any(native_bytes+(rect[2]-rect[0])*(rect[3]-rect[1])+64*((rect[3]-rect[1])+16) > render_budget
+               for rects in jobs.values() for rect in rects):
+            return None, None
+        native_job = azimuthal_native_workspace_bytes(view)
+        record_outputs = max(sum((rect[2]-rect[0])*(rect[3]-rect[1]) for rect in rects)
+            for rects in jobs.values())
+        remap_peak = max(canonical_remap_workspace_bytes(rect[2]-rect[0], rect[3]-rect[1], rect[1], shape[2])
+            for rects in jobs.values() for rect in rects)
+        job_bytes = native_job+record_outputs+remap_peak
+        # The owner holds one yielded record while copying it into the private cache.
+        slots = (int(scratch_bytes)-record_outputs)//max(1, job_bytes)
+        from .runtime import choose_slice_parallel_workers
+        # Default eight lanes, like the native shell prefetch; scratch bounds any override.
+        workers = choose_slice_parallel_workers(min(max(1, _env_int(
+            'YOLO_TTA_SAM_AZIMUTHAL_CPU_PREFETCH_WORKERS', 8)), max(1, int(_cpu_count())), slots), len(jobs))
+        if slots < 2 or workers < 2:
+            runtime_telemetry().add('sam.cpu_images.azimuthal_prefetch_declines', 1)
+            return None, None
+        from .media import wait_for_volume_ready
+        source = self.source_volume
+        if bool(getattr(source, '_is_lazy_processing_cube', False)):
+            # The serial renderer performs this one shared materialization on
+            # its first plane; record it under the same lock and metrics.
+            with self._source_materialization_lock:
+                if not source.materialized:
+                    started = time.perf_counter()
+                    wait_for_volume_ready(source)
+                    self._add_image_metrics(source_materializations=1,
+                        source_materialization_seconds=time.perf_counter()-started)
+            source = source._array
+        else:
+            wait_for_volume_ready(source)
+        if (not isinstance(source, np.ndarray) or source.ndim != 3 or source.dtype != np.uint8
+                or tuple(source.shape) != (int(view.full_t), int(view.full_h), int(view.full_w))):
+            return None, None
+        prefetch_cancel = getattr(self._resource_local, 'image_prefetch_cancel', None)
+
+        def check_cancel():
+            with self._idle:
+                self._check_image_lifetime()
+                if prefetch_cancel is not None and prefetch_cancel.is_set():
+                    raise RuntimeError('SAM image prefetch was abandoned')
+                if any(owner.get('retirement_unproven') for owner in self._cache_owners.values()):
+                    raise RuntimeError('SAM image cache retirement is unproven')
+
+        ordered = sorted(jobs)
+        iterator = iter_prefetched_azimuthal_records(source, view,
+            [(int(addresses[records[position][0]]['native_index']), jobs[position]) for position in ordered],
+            workers=workers, affine=affine, inverse=inverse, canvas_width=int(shape[2]),
+            check_cancel=check_cancel)
+        telemetry = runtime_telemetry()
+        telemetry.add('sam.cpu_images.azimuthal_prefetch_cohorts', 1)
+        telemetry.add('sam.cpu_images.azimuthal_prefetch_planned_records', len(jobs))
+        telemetry.gauge('sam.cpu_images.last_azimuthal_prefetch', dict(workers=workers,
+            records=len(records), prepared_records=len(jobs), native_plane_bytes=native_bytes,
+            native_job_bound_bytes=native_job, job_bound_bytes=job_bytes,
+            admitted_workspace_bytes=int(scratch_bytes), tilted=bool(view.azimuthal_tilted_source)))
+        return iterator, jobs
 
     def _copy_cached_pixels(self, target, bbox, native_frame, geometry_identity, *, cache_entries=None):
         """Copy intersections in physical working coordinates; return holes."""
@@ -2010,6 +2234,105 @@ class SamInterpolationContext:
             self._gpu_image_waiters.append(renderer)
             if self._gpu_image_target is None:
                 self._gpu_image_target = self._next_gpu_image_target()
+
+    def _gpu_source_park_reserve(self, device, free, headroom, sessions):
+        """GPU bytes held back from SAM sessions so an image source can stay resident.
+
+        The 25 GiB processing volume was re-uploaded for every image lease. Keeping
+        it on the GPU is safe only if the per-session allocator caps leave room for
+        it. A device parks only when each capped session keeps at least
+        YOLO_TTA_SAM_GPU_SOURCE_RESIDENT_MIN_SESSION_GIB (default 9; the observed SAM
+        worker peak is ~7 GB). YOLO_TTA_SAM_GPU_SOURCE_RESIDENT=0 disables it.
+        """
+        from .sam_resources import GIB
+        from .workspace import _env_flag
+        if (int(sessions) <= 1 or not getattr(self, 'gpu_image_source_resident', False)
+                or not _env_flag('YOLO_TTA_SAM_GPU_SOURCE_RESIDENT', True)):
+            return 0
+        try:
+            source = int(np.prod([int(value) for value in self.source_volume.shape], dtype=np.int64))
+        except Exception:
+            return 0
+        reserve = source+GIB
+        try:
+            floor = float(os.environ.get('YOLO_TTA_SAM_GPU_SOURCE_RESIDENT_MIN_SESSION_GIB', '9'))
+        except ValueError:
+            floor = 9.
+        if source <= 0 or (int(free)-int(headroom)-reserve)//int(sessions) < floor*GIB:
+            _count_image_event('sam.gpu_images.source_park_declined_devices')
+            return 0
+        with self._gpu_lease_lock:
+            self._gpu_source_park_devices.add(int(device))
+        _count_image_event('sam.gpu_images.source_park_devices')
+        return reserve
+
+    def _parked_gpu_source_bytes(self, device, key):
+        """Resident bytes a renderer for `key` on `device` would not need to upload."""
+        with self._gpu_lease_lock:
+            holder = self._parked_gpu_sources.get(int(device))
+            return int(holder['bytes']) if holder is not None and holder['key'] == key else 0
+
+    def _take_parked_gpu_source(self, device, key):
+        """Hand a matching parked engine to the device's new lease holder."""
+        with self._gpu_lease_lock:
+            holder = self._parked_gpu_sources.get(int(device))
+            if holder is None:
+                return None
+            holder = self._parked_gpu_sources.pop(int(device))
+        if holder['key'] == key:
+            _count_image_event('sam.gpu_images.source_park_reuses')
+            return holder['engine']
+        self._retire_parked_gpu_source(int(device), holder)
+        return None
+
+    def _park_gpu_source(self, device, key, engine, nbytes, torch_module):
+        """Keep a stripped engine (source only) on its GPU after the lease ends."""
+        if self._closed or self._cancel.is_set():
+            return False
+        with self._gpu_lease_lock:
+            if int(device) not in self._gpu_source_park_devices:
+                return False
+            stale = self._parked_gpu_sources.pop(int(device), None)
+            self._parked_gpu_sources[int(device)] = dict(key=key, engine=engine, bytes=int(nbytes),
+                                                         torch=torch_module)
+        if stale is not None:
+            self._retire_parked_gpu_source(int(device), stale)
+        _count_image_event('sam.gpu_images.source_parks')
+        return True
+
+    def _retire_parked_gpu_source(self, device, holder):
+        engine, torch_module = holder['engine'], holder['torch']
+        engine.release_inference_assets()
+        mapping = getattr(engine, '_volume_mm', None)
+        if isinstance(mapping, np.memmap):
+            mapping._mmap.close()
+        engine._volume_mm = None
+        from .inference import _AFFINE_GRID_CACHE, _AFFINE_GRID_CACHE_LOCK
+        with _AFFINE_GRID_CACHE_LOCK:
+            for cache_key in tuple(_AFFINE_GRID_CACHE):
+                if cache_key[0] == f'cuda:{int(device)}':
+                    _AFFINE_GRID_CACHE.pop(cache_key)
+        from .backprojection import _trim_main_process_cuda_device
+        _trim_main_process_cuda_device(torch_module, torch_module.device(f'cuda:{int(device)}'),
+            desc='SAM parked image source release', repeat_garbage_collection=False)
+        _count_image_event('sam.gpu_images.source_park_releases')
+
+    def _release_parked_gpu_sources(self):
+        with self._gpu_lease_lock:
+            parked = list(self._parked_gpu_sources.items())
+            self._parked_gpu_sources.clear()
+        for device, holder in parked:
+            self._retire_parked_gpu_source(device, holder)
+
+    def _image_cpu_route_when_sam_busy(self):
+        """YOLO_TTA_SAM_IMAGE_CPU_WHEN_BUSY=0 restores draining a GPU for images."""
+        from .workspace import _env_flag
+        if not _env_flag('YOLO_TTA_SAM_IMAGE_CPU_WHEN_BUSY', True):
+            return False
+        busy = self._sam_sdk_ready()
+        if busy:
+            _count_image_event('sam.gpu_images.busy_sam_opportunistic_requests')
+        return busy
 
     def _sam_sdk_ready(self):
         # Never take the scheduler condition while holding the GPU lock.
@@ -2569,11 +2892,13 @@ class SamInterpolationContext:
                         self._leases.append(lease)
                     free, total = map(int, torch.cuda.mem_get_info(device))
                     headroom = max(2*GIB, int(total*.15))
-                    fraction = (max(0, free-headroom)//sessions)/total if sessions > 1 and total > 0 else None
+                    source_reserve = self._gpu_source_park_reserve(device, free, headroom, sessions)
+                    fraction = ((max(0, free-headroom-source_reserve)//sessions)/total
+                                if sessions > 1 and total > 0 else None)
                     if sessions > 1 and (fraction is None or fraction <= 0):
                         raise SamConcurrentStartupResourceError('SAM cohort cannot preserve mandatory GPU headroom')
                     attempt['devices_before'] = [dict(device_index=device, free_bytes=free,
-                        total_bytes=total, headroom_bytes=headroom)]
+                        total_bytes=total, headroom_bytes=headroom, gpu_source_reserve_bytes=source_reserve)]
                     fractions = None if fraction is None else {str(device):fraction}
                     self._publish_startup_progress(device, 'loading_model')
                     try:
@@ -2707,9 +3032,11 @@ class SamInterpolationContext:
             index = int(device.split(':')[-1])
             free, total = map(int, torch.cuda.mem_get_info(index))
             headroom = max(2*GIB, int(total*.15))
-            quota = max(0, free-headroom)//self.sessions_per_gpu
+            source_reserve = self._gpu_source_park_reserve(index, free, headroom, self.sessions_per_gpu)
+            quota = max(0, free-headroom-source_reserve)//self.sessions_per_gpu
             attempt['devices_before'].append(dict(device_index=index, free_bytes=free,
-                total_bytes=total, headroom_bytes=headroom, allocator_bytes_per_worker=quota))
+                total_bytes=total, headroom_bytes=headroom, allocator_bytes_per_worker=quota,
+                gpu_source_reserve_bytes=source_reserve))
             if total <= 0 or quota <= 0:
                 raise SamConcurrentStartupResourceError(
                     f'{self.sessions_per_gpu} SAM sessions cannot retain mandatory CUDA headroom on {device}')
@@ -2877,17 +3204,26 @@ class SamInterpolationContext:
             except Exception:
                 pass  # Diagnostics must not replace startup or cleanup results.
 
-    def _record_planning_outcome(self, plan, metadata, operation, pass_index=1):
+    def _record_planning_outcome(self, plan, metadata, operation, pass_index=1, *, replaces=None):
+        """Record one pass's omission; ``replaces`` updates that pass's earlier record."""
         from .sam_planning_outcomes import sam_planning_omission
         omission = sam_planning_omission(dict(planning_status=plan.status,
             planning_reasons=plan.reasons, pass_index=pass_index,
             group_planning_receipts=[dict(status=group.status, reasons=group.reasons)
                 for group in plan.groups]), operation=operation,
             scope_id=metadata['scope_id'], view_name=metadata['view_name'])
-        if omission is not None:
+        if replaces is not None:
             with self._lock:
-                self.planning_omissions.append(omission)
-                self.unresolved_plan_passes += int(omission['unresolved_plan'])
+                self.planning_omissions[:] = [item for item in self.planning_omissions if item is not replaces]
+                if omission is not None:
+                    self.planning_omissions.append(omission)
+                self.unresolved_plan_passes += (int(omission['unresolved_plan']) if omission is not None else 0
+                    ) - int(replaces['unresolved_plan'])
+        if omission is not None:
+            if replaces is None:
+                with self._lock:
+                    self.planning_omissions.append(omission)
+                    self.unresolved_plan_passes += int(omission['unresolved_plan'])
             print(f"Warning: requested SAM {operation} is incomplete for {omission['view']} "
                 f"({omission['scope_id']}, pass {omission['pass_index']}): "
                 f"{', '.join(omission['reasons']) or omission['status']}; "
@@ -2896,16 +3232,148 @@ class SamInterpolationContext:
                 file=sys.stderr, flush=True)
             try:
                 telemetry = runtime_telemetry()
-                telemetry.add('sam.planning_incomplete_passes')
-                telemetry.add('sam.unresolved_plan_passes', int(omission['unresolved_plan']))
+                if replaces is None:
+                    telemetry.add('sam.planning_incomplete_passes')
+                    telemetry.add('sam.unresolved_plan_passes', int(omission['unresolved_plan']))
+                else:
+                    telemetry.add('sam.unresolved_plan_passes',
+                        int(omission['unresolved_plan'])-int(replaces['unresolved_plan']))
                 telemetry.trace_event('sam_planning_incomplete', **omission)
             except Exception:
                 pass  # Diagnostics must not discard valid detector or completed SAM output.
         return omission
 
+    def _image_cohort_caps(self, profile):
+        """Configured payload cap, the parent-funded cap actually used, and scratch."""
+        from .workspace import _env_int
+        cap = max(1, _env_int('YOLO_TTA_SAM_IMAGE_CACHE_MAX_BYTES', 1024**3))
+        configured_cap = cap
+        scratch = max(1, _env_int('YOLO_TTA_SAM_RENDER_MAX_BYTES', 256*1024**2))
+        funded_cap = (None if profile is None else
+            max(0, (int(profile.assigned_image_bytes)-scratch)
+                // (2 if profile.mandatory_image_bytes else 1)))
+        if funded_cap is not None and 0 < funded_cap < cap:
+            # The cache limit covers payload only, whereas the live
+            # parent allowance must also fund rendering scratch.
+            # Keep complete original groups inside that existing
+            # allowance so mandatory current images do not depend
+            # on an opportunistic next-image grant being available.
+            cap = funded_cap
+        return configured_cap, cap, scratch
+
+    def _plan_interpolation_image_cohorts(self, prepared, profile, trigger):
+        """Split a whole-pass cache refusal into complete-group image cohorts.
+
+        Groups within the parent-funded cap are packed at that cap. A group
+        above it but within the configured cap is its own singleton cohort
+        under the configured cap (for a guaranteed parent image, also within
+        the parent's whole image allowance less renderer scratch), so its
+        neighbours never borrow that larger grant. A group whose own demand
+        exceeds its admissible cap is recorded as an unresolved planning
+        refusal; it is never split, cropped or shortened.
+        Returns the refused plan, cohorts, ``{cohort_id: cache cap}`` and record.
+        """
+        from .sam_extrapolation import plan_sam_image_cohorts, sam_image_group_demands
+        from .sam_interpolation import (refuse_sam_interpolation_image_groups,
+                                        SAM_IMAGE_CACHE_GROUP_REFUSAL)
+        configured_cap, cap, scratch = self._image_cohort_caps(profile)
+        demands = sam_image_group_demands(prepared)
+        singleton_cap = cap
+        if cap < configured_cap and any(size > cap for size in demands.values()):
+            # As for extrapolation: an intrinsically larger group still needs
+            # its separate validated image grant under the configured cap.
+            singleton_cap = configured_cap
+            if profile is not None and profile.mandatory_image_bytes:
+                # A guaranteed parent image has no image-only fallback; it is
+                # admitted only within the parent's own allowance (its previous
+                # cohort is retired first), else refused before tracking.
+                singleton_cap = max(cap, min(configured_cap,
+                    int(profile.assigned_image_bytes)-scratch))
+        refused = {group_id: size for group_id, size in demands.items() if size > singleton_cap}
+        if refused:
+            prepared = refuse_sam_interpolation_image_groups(prepared, refused,
+                configured_cache_bytes=configured_cap, effective_cache_bytes=singleton_cap)
+        cohorts = (plan_sam_image_cohorts(prepared, cap,
+            singleton_image_bytes=singleton_cap if singleton_cap > cap else None)
+            if prepared.needs_tracking else ())
+        caps = {item.cohort_id: (cap if item.payload_bytes <= cap else singleton_cap) for item in cohorts}
+        record = dict(configured_cache_bytes=configured_cap, effective_cache_bytes=cap,
+            renderer_scratch_bytes=scratch,
+            parent_image_allowance_bytes=(None if profile is None else int(profile.assigned_image_bytes)),
+            complete_original_groups=True,
+            trigger=dict(payload_bytes=int(trigger.payload_bytes), cache_budget=int(trigger.cache_budget)),
+            cohorts=[dict(cohort_id=item.cohort_id, group_ids=list(item.group_ids),
+                payload_bytes=int(item.payload_bytes), cache_bytes=int(caps[item.cohort_id]))
+                for item in cohorts],
+            refused_groups=[dict(group_id=group_id, payload_bytes=int(size),
+                configured_cache_bytes=configured_cap, effective_cache_bytes=singleton_cap,
+                reason=SAM_IMAGE_CACHE_GROUP_REFUSAL) for group_id, size in refused.items()])
+        if singleton_cap > cap:
+            record['singleton_cache_bytes'] = singleton_cap
+        return prepared, cohorts, caps, record
+
     def interpolate(self, observation_volume, *, view, scope, **kwargs):
+        try:
+            return self._interpolate_strict(observation_volume, view=view, scope=scope, **kwargs)
+        except Exception as error:
+            degraded = self._degrade_failed_pass('interpolation', error, observation_volume, view=view,
+                scope=scope, pass_index=kwargs.get('pass_index', 1),
+                requested_passes=kwargs.get('interpolation_passes', 1))
+            if degraded is None:
+                raise
+            return degraded
+
+    def extrapolate(self, observation_volume, *, view, scope, **kwargs):
+        try:
+            return self._extrapolate_strict(observation_volume, view=view, scope=scope, **kwargs)
+        except Exception as error:
+            degraded = self._degrade_failed_pass('extrapolation', error, observation_volume, view=view,
+                scope=scope, pass_index=1, requested_passes=1)
+            if degraded is None:
+                raise
+            return degraded
+
+    def _degrade_failed_pass(self, operation, error, observation_volume, *, view, scope,
+                             pass_index, requested_passes):
+        """Return a skipped-pass result for ``error``, or None to re-raise it.
+
+        The strict pass only reads ``observation_volume`` and has already
+        written its incomplete evidence and failure receipt.
+        """
+        if self.pass_failure_policy != 'degrade' or self._cancel.is_set() or self._closed:
+            return None
+        import traceback
+        from .sam_interpolation import _base_stats
+        view_name = str(getattr(view, 'name', ''))
+        message = f'{type(error).__name__}: {error}'
+        omission = dict(operation=str(operation), scope_id=str(scope), view=view_name,
+            pass_index=int(pass_index), status='failed',
+            reasons=[f'sam_pass_failed:{type(error).__name__}'], unresolved_plan=True,
+            unresolved_group_count=0, group_refusal_reasons={}, error=message[:4000])
+        with self._lock:
+            self.planning_omissions.append(omission)
+            self.unresolved_plan_passes += 1
+            self.pass_failures.append(omission)
+            failures = len(self.pass_failures)
+        print(f'WARNING: SAM {operation} pass failed for {view_name} ({scope}, pass {int(pass_index)}); '
+              'YOLO_TTA_SAM_PASS_FAILURE_POLICY=degrade keeps the view input masks for this pass and '
+              f'the run will finish as incomplete (SAM pass failures so far: {failures}). '
+              + ''.join(traceback.format_exception(error)), flush=True)
+        try:
+            runtime_telemetry().gauge('sam.pass_failures', failures)
+        except Exception:
+            pass  # Diagnostics must not replace the degraded result.
+        stats = _base_stats(int(pass_index), int(requested_passes))
+        stats.update(skipped=True, skip_reason='sam_pass_failed', sam_planning_status='failed',
+            sam_requested_work_complete=False, sam_planning_omission=omission,
+            sam_pass_failure=dict(policy='degrade', error_type=type(error).__name__, error=message[:4000]),
+            scope_id=str(scope), view=view_name)
+        return observation_volume, stats, []
+
+    def _interpolate_strict(self, observation_volume, *, view, scope, **kwargs):
         from .sam_interpolation import (interpolate_sam_view_volume_pass,
-                                        prepare_sam_interpolation_pass, _trace_sam_phase)
+                                        prepare_sam_interpolation_pass, _trace_sam_phase,
+                                        SamImageCohortAdmissionError)
         with self._lock:
             if self._closed:
                 raise RuntimeError('SAM interpolation runtime is closed')
@@ -2989,28 +3457,63 @@ class SamInterpolationContext:
             planning_omission = self._record_planning_outcome(prepared.plan, scope_metadata,
                 'interpolation', kwargs.get('pass_index', 1))
             preparation_phase = 'image_or_gpu_admission'
-            tracked_group_ids = {str(run.group_id) for run in prepared.runs}
-            oversized_groups = [group for group in prepared.groups if str(group.group_id) in tracked_group_ids
-                and max(group.context_bbox_yx[2]-group.context_bbox_yx[0],
-                        group.context_bbox_yx[3]-group.context_bbox_yx[1]) > 1008]
-            group_tile_crops = {}
-            for job in getattr(prepared, 'tracker_jobs', ()):
-                group_tile_crops.setdefault(str(job.original_run.group_id), set()).add(tuple(job.tile.crop_bbox_yx))
-            multi_tile_groups = sum(len(crops)>1 for crops in group_tile_crops.values())
+            def tracked_group_counts(current):
+                tracked_group_ids = {str(run.group_id) for run in current.runs}
+                oversized = sum(1 for group in current.groups if str(group.group_id) in tracked_group_ids
+                    and max(group.context_bbox_yx[2]-group.context_bbox_yx[0],
+                            group.context_bbox_yx[3]-group.context_bbox_yx[1]) > 1008)
+                group_tile_crops = {}
+                for job in getattr(current, 'tracker_jobs', ()):
+                    group_tile_crops.setdefault(str(job.original_run.group_id), set()).add(tuple(job.tile.crop_bbox_yx))
+                return oversized, sum(len(crops)>1 for crops in group_tile_crops.values())
+            oversized_group_count, multi_tile_groups = tracked_group_counts(prepared)
             with self._lock:
                 self.planning_seconds += prepared.planner_wall_seconds + prepared.snapshot_wall_seconds
             provider = None
             runtime = None
-            if prepared.needs_tracking:
+            cohort_kwargs = {}
+            cohort_record = None
+            def select_provider(current):
                 if profile is not None and profile.mandatory_image_bytes:
-                    provider = image_lifetime.enter_context(self.image_cohort_provider(view, shape, prepared))
-                else:
-                    try:
-                        provider = self.image_provider(view, shape, prepared_plan=prepared)
-                    except _SamImageCreditRequired:
-                        provider = image_lifetime.enter_context(self.image_cohort_provider(view, shape, prepared))
+                    return image_lifetime.enter_context(self.image_cohort_provider(view, shape, current))
+                try:
+                    return self.image_provider(view, shape, prepared_plan=current)
+                except _SamImageCreditRequired:
+                    return image_lifetime.enter_context(self.image_cohort_provider(view, shape, current))
+            if prepared.needs_tracking:
+                try:
+                    provider = select_provider(prepared)
+                except SamImageCacheBudgetExceeded as exceeded:
+                    # Only a whole-pass cache refusal (raised before any image
+                    # build, ticket or claim) changes to complete-group cohorts.
+                    if exceeded.pinned_cap is not None:
+                        raise
+                    prepared, cohorts, cohort_caps, cohort_record = self._plan_interpolation_image_cohorts(
+                        prepared, profile, exceeded)
+                    if cohort_record['refused_groups']:
+                        # Refused groups are never tracked; count only tracked groups.
+                        oversized_group_count, multi_tile_groups = tracked_group_counts(prepared)
+                        planning_omission = self._record_planning_outcome(prepared.plan, scope_metadata,
+                            'interpolation', kwargs.get('pass_index', 1), replaces=planning_omission)
+                        try:
+                            runtime_telemetry().add('sam.image_cache_group_omissions',
+                                len(cohort_record['refused_groups']))
+                        except Exception:
+                            pass  # Diagnostics must not discard valid SAM work.
+                    if len(cohorts) == 1:
+                        provider = select_provider(prepared)
+                    elif cohorts:
+                        subset_caps = {id(item.prepared): cohort_caps[item.cohort_id] for item in cohorts}
+                        cohort_kwargs = dict(image_cohorts=cohorts,
+                            image_cohort_provider=lambda subset: self._prepare_image_cohort(
+                                view, shape, subset, max_cache_bytes=subset_caps[id(subset)]),
+                            image_cohort_prefetch=lambda subset: self.prefetch_image_cohort(
+                                view, shape, subset, max_cache_bytes=subset_caps[id(subset)]))
+            if prepared.needs_tracking:
                 self._start()
                 runtime = self._runtime
+                if cohort_kwargs and not callable(getattr(runtime, 'release_source_cache', None)):
+                    raise RuntimeError('Multiple SAM image cohorts require a worker source-cache retirement barrier')
             else:
                 with self._lock:
                     self.no_job_passes += 1
@@ -3032,7 +3535,7 @@ class SamInterpolationContext:
                     **profile_kwargs,
                     prepared_plan=prepared,
                     runtime_work_dir=self.temp_dir / 'sam_merged' / hashlib.sha256(str(scope).encode()).hexdigest()[:20],
-                    **kwargs)
+                    **cohort_kwargs, **kwargs)
             if merged is observed:
                 merged = observation_volume
             stats = dict(stats)
@@ -3041,9 +3544,12 @@ class SamInterpolationContext:
                 stats['sam_planning_omission'] = planning_omission
             if kwargs.get('_observation_inventory') is not None:
                 stats['sam_observation_inventory'] = kwargs['_observation_inventory'].snapshot()
+            if cohort_record is not None:
+                stats['sam_image_cache_cohorts'] = cohort_record
+                stats['sam_image_cache_lifetime'] = self.image_cache_lifetime_snapshot()
             stats.setdefault('sam_crop_mode', self.crop_mode)
             stats.setdefault('sam_tight_crop_guard', self.tight_crop_guard)
-            stats.setdefault('sam_oversized_group_count', len(oversized_groups))
+            stats.setdefault('sam_oversized_group_count', oversized_group_count)
             stats.setdefault('sam_multi_tile_group_count', multi_tile_groups)
             stats.setdefault('sam_working_canvas_kind', scope_metadata['sam_working_canvas_kind'])
             stats.setdefault('sam_working_canvas_shape_tyx', list(shape))
@@ -3053,7 +3559,10 @@ class SamInterpolationContext:
             stats.setdefault('sam_resource_profile', dict(scope_metadata['sam_resource_profile']))
             return merged, stats, components
         except BaseException as error:
-            if not execution_started:
+            # Cohort 0 is staged inside the pass before its evidence scope exists;
+            # like the single provider, record it as an image-admission failure.
+            cohort_admission = isinstance(error, SamImageCohortAdmissionError)
+            if not execution_started or cohort_admission:
                 destination = kwargs.get('work_dir', self.evidence_root/hashlib.sha256(str(scope).encode()).hexdigest()[:20])
                 receipt = {
                     'schema': 'xta.sam-context-preparation-failure/1', 'complete': False,
@@ -3074,6 +3583,11 @@ class SamInterpolationContext:
                 }
                 if isinstance(getattr(error, 'receipt', None), Mapping):
                     receipt['resource_admission'] = dict(error.receipt)
+                if cohort_admission:
+                    cause = error.__cause__
+                    receipt.update(phase='image_or_gpu_admission', image_cohort_index=0,
+                        image_cohort_error_type=type(cause).__name__ if cause is not None else None,
+                        sam_image_cache_cohorts=cohort_record)
                 _write_context_preparation_failure(destination, receipt, error)
             raise
         finally:
@@ -3085,7 +3599,7 @@ class SamInterpolationContext:
                     self._active_passes -= 1
                     self._idle.notify_all()
 
-    def extrapolate(self, observation_volume, *, view, scope, **kwargs):
+    def _extrapolate_strict(self, observation_volume, *, view, scope, **kwargs):
         """Track original terminals with the same admitted image/model owners."""
         from .sam_extrapolation import (prepare_sam_extrapolation_pass,
                                         extrapolate_sam_view_volume_pass,
@@ -3164,20 +3678,7 @@ class SamInterpolationContext:
             provider = runtime = None
             cohort_record = None
             if prepared.needs_tracking:
-                from .workspace import _env_int
-                cap = max(1, _env_int('YOLO_TTA_SAM_IMAGE_CACHE_MAX_BYTES', 1024**3))
-                configured_cap = cap
-                scratch = max(1, _env_int('YOLO_TTA_SAM_RENDER_MAX_BYTES', 256*1024**2))
-                funded_cap = (None if profile is None else
-                    max(0, (int(profile.assigned_image_bytes)-scratch)
-                        // (2 if profile.mandatory_image_bytes else 1)))
-                if funded_cap is not None and 0 < funded_cap < cap:
-                    # The cache limit covers payload only, whereas the live
-                    # parent allowance must also fund rendering scratch.
-                    # Keep complete original groups inside that existing
-                    # allowance so mandatory current images do not depend
-                    # on an opportunistic next-image grant being available.
-                    cap = funded_cap
+                configured_cap, cap, scratch = self._image_cohort_caps(profile)
                 try:
                     cohorts = plan_sam_extrapolation_image_cohorts(prepared, cap)
                 except SamExtrapolationImageAdmissionError:
@@ -3276,6 +3777,9 @@ class SamInterpolationContext:
 
     def close(self):
         self.cancel('SAM interpolation runtime is closing')
+        if getattr(self, '_checkpoint_digest_prefetch', None) is not None:
+            from .sam_checkpoint_digest import cancel_checkpoint_digest_prefetch
+            cancel_checkpoint_digest_prefetch(self.model_path)
         if self.progressive_startup:
             self._join_progressive_startup()
             if self._runtime is None:
@@ -3299,6 +3803,7 @@ class SamInterpolationContext:
             try:
                 for renderer in tuple(self._unsettled_image_renderers):
                     renderer.close()
+                self._release_parked_gpu_sources()
                 if self._runtime is not None:
                     dispatch = getattr(self._runtime, 'dispatch_stats', {})
                     self.dispatch_summary = dict(dispatch) if isinstance(dispatch, Mapping) else {}

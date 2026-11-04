@@ -62,14 +62,18 @@ transient admission with a protection token. Late parents with existing dense
 ownership join this wave without checkpointing or being charged again. No
 all-curved-finished barrier prevents ready work from using an available GPU.
 Within the expensive-parent class, one size-priority admission alternates with
-three admissions in original arrival order. The size proxy uses recorded native
-input bytes. Fit checks, protected cheap lanes and the configured worker cap
+three admissions in original arrival order. Cheap parents beyond the protected
+lanes that fit free dense memory take part in those same size/age turns instead
+of waiting behind every expensive parent (`YOLO_TTA_SAM_PARENT_CHEAP_OVERFLOW_LAST=1` restores the old
+last-place order). The size proxy uses recorded native input bytes. Fit checks, protected cheap lanes and the configured worker cap
 remain authoritative. Failed probes preserve scan progress across short pump
 budgets. See [parent preparation order](sam_parent_prepare_order.md) for the
 fairness rules and bounded admission diagnostics.
 
-Multi-cohort extrapolation admits eligible first/current image cohorts through
-the same producer wrapper as next-cohort prefetch. Interpolation and extrapolation
+Multi-cohort extrapolation and multi-cohort interpolation admit eligible
+first/current image cohorts through the same producer wrapper as next-cohort
+prefetch, with the same one-cohort lookahead inside the parent's
+2 x cap + scratch image phase. Interpolation and extrapolation
 retry callbacks use that wrapper for ephemeral crops. At most two wrappers per
 original funded parent are retained, including a current and next builder; one
 slow image build does not impose a global prefetch limit on other parents.
@@ -358,15 +362,37 @@ Successful startup does not prove that every future full history fits a quota;
 later OOM fails explicitly without shortening histories or publishing partial
 support. Serial mode retains the previous allocator behavior.
 
+Each predictor records the checkpoint SHA-256 after loading its model. With
+`YOLO_TTA_SAM_CHECKPOINT_DIGEST_PREFETCH=1`, the coordinator hashes the
+checkpoint once on a host thread after every detector worker reports ready,
+while detector inference still owns the GPUs. Waiting for readiness keeps the
+read from competing with detector model loading; an already retired detector
+starts it immediately. This sequential read also leaves the file in
+reclaimable page cache for the workers' memory-mapped load. It uses no CUDA,
+GPU lease, model or held allocation beyond one 8 MiB read buffer, so startup
+admission is unchanged. A worker started after the hash completes reuses the
+digest only if its own post-load device/inode/size/mtime/ctime identity matches
+the identity recorded before and after that hash. Otherwise, including an
+unfinished prefetch, it hashes the file as before. The recorded digest and all
+evidence identities are unchanged. `worker_startup_receipt` records
+`checkpoint_digest_basis` when a prefetched digest was offered. The default is
+off.
+
 ## Tracker dispatch and evidence consumption
 
 Resource-grant eligibility and per-session acceptance keep their physical-device
 policy. Separate authenticated `execution_slots` can increase concurrency only
 within the same owned CPU-wave bytes; uncredited legacy calls retain their old
 physical-device cap. When both view classes are ready, the scheduler gives curved
-scopes three submissions per cheap-view submission, with round robin inside each
-class. If only one class can run it proceeds immediately; unclassified callers
-retain ordinary round robin. Actual geometry family comes from the producer
+scopes three submissions per cheap-view submission. Inside the chosen class,
+three of every four contested submissions go to the ready scope with the largest
+native view (T*Y*X of its image cache); the fourth keeps the round-robin pick, so
+no continuously ready scope starves. Large Azimuthal and Cartesian views carry
+the longest serial selection, publication and extrapolation chains, so starting
+their SAM work early keeps those chains from running after every GPU job is done.
+Equal sizes keep plain round robin. `YOLO_TTA_SAM_LARGEST_VIEW_FIRST=0` restores
+round robin inside each class. If only one class can run it proceeds immediately;
+unclassified callers retain ordinary round robin. Actual geometry family comes from the producer
 context, without changing scientific request metadata or run IDs. Dispatch fills idle
 physical GPUs before second slots, then uses advisory slot-local crop affinity.
 Slot index, PID and attempt are checked independently of scientific model identity.
@@ -408,6 +434,16 @@ Private evidence reads reuse one unbuffered staging handle. Every read still
 flushes pending writes, verifies file identity and authenticates the complete
 mask record. Commit and abort close the handle before publishing or removing
 staging; no decoded-mask cache is added.
+
+Interpolation publication opens its mask reader after selection's reader has
+closed, on the same thread and live SAM credit. With a live resource profile it
+uses the reader size selection is granted from that credit (unused credit only,
+at most 2 GiB, never below the legacy 32 MiB), and the frame lookup reservation
+stays inside that allowance. Without a profile, or with
+`YOLO_TTA_SAM_PUBLICATION_READER_LIVE_CREDIT=0`, the legacy 32 MiB applies. The
+reader caches decoded masks and filter results only, so published planes are
+identical at any size; `sam_publication_mask_reader` in the generation stats
+records the size and hit/eviction counts.
 
 ## Runtime trace interpretation
 
@@ -604,6 +640,24 @@ accounting to bound up to eight workers by CPU count, frame count and remaining
 scratch. Results yield in original order. One owner remaps, copies
 and publishes the crops; cancellation joins outstanding jobs before releasing
 source ownership. Tight budgets use the serial CPU path.
+CPU Azimuthal and tilted-Azimuthal cohorts (for example after
+`streamed_endpoint_processing_cube_not_materialized`) without donor caches
+prepare records on the same bounded pool. Each job runs the serial route's
+full native plane sampler and unchanged canonical remap (default remap budget)
+for exactly the rectangles the ordered plan leaves missing after earlier
+same-native aliases; fully reused aliases sample nothing. The owner checks each
+result against that plan and copies crops in record order, so cache bytes,
+image identity and sampling counters equal the serial route. Job accounting
+covers the plane, extractor temporaries, crop outputs and remap blocks within
+the render-scratch credit; fewer than two lanes use the serial path. Tilted
+Azimuthal rasters narrower than `YOLO_TTA_SAM_TILTED_AZIMUTHAL_PREFETCH_MIN_WIDTH`
+(default 1024) stay serial because their many small NumPy calls are GIL-bound.
+`YOLO_TTA_SAM_AZIMUTHAL_CPU_PREFETCH=0` restores the serial route and
+`YOLO_TTA_SAM_AZIMUTHAL_CPU_PREFETCH_WORKERS` (default 8) caps lanes. The
+non-tilted Azimuthal extractor gathers taps row-major with `np.take` when the
+plane stride is a multiple of 16 KiB (`YOLO_TTA_AZIMUTHAL_TAKE_GATHER=auto|1|0`),
+then restores NumPy's advanced-index layout so the einsum reduction is
+bit-identical; other strides keep advanced indexing, which is already faster.
 SAM's uint8 Radial and Spherical ROI preparation uses compiled, GIL-releasing
 CPU kernels with float64 coordinates and ordered float32 trilinear accumulation.
 Radial arc coordinates are calculated once per ROI column, including tilted
@@ -641,6 +695,27 @@ separate from the image sampling identity and existing crop completion phases.
 
 ## GPU image turns and source residency
 
+Image leases are exclusive and SAM tracking cannot use that GPU meanwhile, so
+three rules keep a GPU from idling for image preparation (cluster Runs A/B showed
+23-45 s leases at 0-7% utilization while ~60 SAM jobs waited):
+
+- While tracker work is ready, a new image build takes only an already-idle GPU
+  (no drain); otherwise it uses the CPU route (`YOLO_TTA_SAM_IMAGE_CPU_WHEN_BUSY=0`
+  restores draining). CPU and GPU pixels may differ slightly; identities stay separate.
+- Longer compatible Azimuthal runs are rendered as queued 2-4 frame chunks of the
+  qualified batch operator, with pinned asynchronous copies so the host writes
+  chunk k while chunk k+1 renders (`YOLO_TTA_SAM_GPU_IMAGE_QUEUE_FRAMES`, default
+  32; `YOLO_TTA_SAM_GPU_IMAGE_QUEUE=0` keeps single 2-4 frame calls). Pixels are
+  identical. Batches may use a GPU-only workspace of
+  `YOLO_TTA_SAM_GPU_RENDER_DEVICE_BYTES` (default 1 GiB) beyond the host scratch.
+- A full-window source can stay resident on its GPU after the lease ends, stripped
+  to source and T maps, and is reused by the next same-source lease without a
+  re-upload. This happens only on GPUs whose SAM sessions are capped (more than
+  one per GPU) and whose caps were computed with the source plus 1 GiB held back,
+  leaving each session at least `YOLO_TTA_SAM_GPU_SOURCE_RESIDENT_MIN_SESSION_GIB`
+  (default 9; observed worker peak ~7 GB). Other sources on that GPU, cancellation
+  and context close release it. `YOLO_TTA_SAM_GPU_SOURCE_RESIDENT=0` disables it.
+
 A complete existing CPU
 cache takes precedence. Otherwise a producer wins its host-memory credit and
 cache-build ticket before requesting a GPU. Concrete GPU-ready requests use FIFO
@@ -658,8 +733,8 @@ hand its source and exact compute lease to one already-ready same-source request
 after fencing and clearing view scratch and rechecking recipient headroom. At
 most two builds share that upload while SDK work is ready; additional compatible
 handoffs require a scheduler-locked check that no SDK work is runnable. The next
-turn belongs to ready SDK work, and no source
-is retained idle outside the compute lease or predictor quotas. Missing capacity,
+turn belongs to ready SDK work; a source is retained idle only as the reserved
+resident source described above. Missing capacity,
 unfinished source decode or unsupported source geometry keeps the CPU path.
 Within a large image build, a completed crop/batch boundary can yield to
 dispatchable tracker work after 30 seconds of render service. Source upload
@@ -760,7 +835,9 @@ already materialized by another view, cached partial pixels, unsupported geometr
 or insufficient capacity retains the ordinary rendering path. The
 `sam.transverse_cache.*` counters identify which route ran.
 
-## Extrapolation image cohorts
+## SAM image cohorts
+
+### Extrapolation image cohorts
 
 Extrapolation freezes its complete plan and baseline, then groups whole original
 terminal groups into image cohorts that fit `YOLO_TTA_SAM_IMAGE_CACHE_MAX_BYTES`.
@@ -779,6 +856,73 @@ completed worker streams and raw-result packing/release have been verified.
 Borrowed source backing and protected shared caches retain their owners.
 Predictors and encoded feature caches survive cohort transitions. A scope that
 already fits one cache retains its ordinary cache-reuse behavior.
+
+### Interpolation image cohorts
+
+Interpolation keeps its ordinary single image provider. It changes to image
+cohorts only when that provider refuses the whole pass because its per-frame
+crop union exceeds the cache cap (`SamImageCacheBudgetExceeded`, raised before
+any image build, ticket or claim). A pass that fits takes exactly the previous
+path, with no new statistics or identities.
+
+On that refusal the context starts from the extrapolation cap rule. The cohort
+cap is the parent-funded cap when it is smaller than
+`YOLO_TTA_SAM_IMAGE_CACHE_MAX_BYTES`. Complete original groups within that cap
+are packed with the shared partition (`plan_sam_image_cohorts`) at that cap. A
+group above the funded cap but within the configured cap becomes its own
+singleton cohort under the configured cap, at its place in group order, so its
+neighbours never borrow that larger grant. With a guaranteed parent image
+phase (`mandatory_image_bytes`) the singleton cap is also limited to the
+parent's whole image allowance less renderer scratch, because such a cohort is
+admitted on the parent's own credit after the previous cohort is retired. Each
+cohort's cap is recorded as `cache_bytes` in `sam_image_cache_cohorts`, and
+`singleton_cache_bytes` appears when singletons were allowed. Runs, tiled
+children, crops and tracking intervals are never split, shortened or replanned.
+Results map back to the pass's global run indices, so one evidence writer, one
+selection and one publication cover the whole pass. Merge order is keyed by
+the global index and does not depend on cohort order. Each cohort opens its own
+tracker scope admission. Leaving its lease is the worker source-cache
+retirement barrier (`release_source_cache`), so the last cohort is retired
+before crop retries begin; retries use their own leases as before.
+Cancellation or failure closes the current lease and any pending lookahead.
+When cohort 0 cannot be staged, the pass raises `SamImageCohortAdmissionError`
+(a `SamInterpolationInfrastructureError`) before any evidence scope exists, and
+the context writes its `context_preparation_failure.json` receipt with phase
+`image_or_gpu_admission`, as for the single provider.
+
+Only on the cohort path, the scope records `image_cohort_plan` (each cohort's
+demand identity, groups and bytes) and, before commit,
+`image_cohort_snapshot_sha256s` (the image each cohort actually used), with
+`input_fingerprints.image_cohort_plan` and `input_fingerprints.image_cohort_snapshots`.
+The pass-level `image_snapshot_sha256` is cohort 0's image. Each run descriptor
+records its own cohort image, and a crop retry pins
+`crop_retry_original_image_snapshot_sha256` to its group's cohort image.
+Because these fields are part of the scope, the evidence directory and the
+selection identity differ from a single-cache run of the same pass; the merged
+volume, raw masks and selected runs do not.
+
+A group whose own demand exceeds its admissible cap is recorded as an
+unresolved planning group with reason `image_cache_group_over_cap`. Its crop
+contract records the demand and both caps, and it has no runs. The rest of the
+view continues, the pass reports `sam_requested_work_complete=False`, and the
+context replaces that pass's planning omission instead of counting it twice.
+Each such group also adds one to the `sam.image_cache_group_omissions`
+telemetry counter. `sam_oversized_group_count` and `sam_multi_tile_group_count`
+count only the groups that are still tracked. If the remaining groups fit one
+cohort (after refusals), that cohort uses the ordinary single provider; if no
+group remains, the pass records `planning_no_jobs`. Extrapolation still raises
+`SamExtrapolationImageAdmissionError` for an oversized group, and still packs
+every cohort at the configured cap when one group exceeds its funded cap.
+
+Multi-cohort statistics add `image_cohort_count`, `image_cohort_max_bytes`,
+`image_cohort_total_bytes`, `image_cohort_receipts` and
+`sam_execution_order_provenance='image_cohort_submission_receipts'`. Context
+statistics add `sam_image_cache_cohorts` (caps, trigger, cohorts and refused
+groups) and `sam_image_cache_lifetime`. Each run records the image identity of
+its own cohort. Demand-dependent samplers (CUDA crops and the native radial,
+spherical and tilted CPU samplers) may differ from a single larger cache by
+their recorded sampling tolerance. With several crop-wave workers, the evidence
+fingerprint records the per-cohort completion order.
 
 ## Concurrent pressure checks and partial-run diagnostics
 
