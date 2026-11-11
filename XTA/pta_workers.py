@@ -65,6 +65,7 @@ from .pta_publication import (
     write_semantic_index_mask,
     write_semantic_mask,
     write_yolo_lines,
+    yolo_label_window,
 )
 from .pta_rendering import (
     RenderFrameSource,
@@ -279,12 +280,19 @@ def ensure_shared_uint8(arr: np.ndarray, block: Optional[SharedBlock], allocator
 
 _WORKER_STATIC: Dict[str, object] = {}
 
-# CUDA state is deliberately child-local and lazy.  The GPU-policy exception
-# forks the persistent pool before source decode or any CUDA context exists.
+# CUDA state is deliberately child-local.  The GPU-policy exception forks the
+# persistent pool before source decode or any CUDA context exists; each owner
+# then builds its runtime in the initializer while the parent prepares.
 _WORKER_GPU_DEVICE_ID: Optional[int] = None
 _WORKER_GPU_RUNTIME: Optional[Dict[str, object]] = None
+_WORKER_GPU_RUNTIME_ERROR: Optional[Exception] = None
 _WORKER_GPU_CODEC_WARNING_EMITTED = False
 _WORKER_GPU_BATCH_CAP_WARNING_EMITTED = False
+
+
+def _owner_option_enabled(name: str) -> bool:
+    """Default-on GPU-owner start-up overlap; 0 restores first-task behavior."""
+    return os.environ.get(name, "1").strip().lower() not in {"0", "false", "no", "off", "disabled"}
 
 
 _THREAD_AFFINITY_LOCK = threading.Lock()
@@ -297,13 +305,15 @@ def _render_worker_initializer(
     gpu_cpu_sets: Sequence[Sequence[int]] = (),
     worker_static_payload: Optional[Mapping[str, object]] = None,
 ) -> None:
-    global _WORKER_GPU_DEVICE_ID, _WORKER_GPU_RUNTIME
+    global _WORKER_GPU_DEVICE_ID, _WORKER_GPU_RUNTIME, _WORKER_GPU_RUNTIME_ERROR
     global _WORKER_GPU_CODEC_WARNING_EMITTED, _WORKER_GPU_BATCH_CAP_WARNING_EMITTED
     # Pool exit skips atexit; sample after the GPU publication finalizer (15).
     from multiprocessing.util import Finalize
     Finalize(None, shutdown_runtime_observability, exitpriority=10)
     if worker_static_payload is not None:
         _initialize_spawned_worker_static_context(worker_static_payload)
+    if _WORKER_GPU_RUNTIME is not None:
+        _join_intensity_prestage(_WORKER_GPU_RUNTIME)
     if _WORKER_GPU_RUNTIME is not None and _WORKER_GPU_RUNTIME.get("categorical_volume_owner") is not None:
         from .pta_cuda_masks import retire_gpu_categorical_volume
 
@@ -314,6 +324,7 @@ def _render_worker_initializer(
         close_spherical_host_cache(_WORKER_GPU_RUNTIME.get("azimuthal_renderer"))
     _WORKER_GPU_DEVICE_ID = None
     _WORKER_GPU_RUNTIME = None
+    _WORKER_GPU_RUNTIME_ERROR = None
     _WORKER_GPU_CODEC_WARNING_EMITTED = False
     _WORKER_GPU_BATCH_CAP_WARNING_EMITTED = False
     # A module can be imported and used by more than one pool over the life of
@@ -346,6 +357,19 @@ def _render_worker_initializer(
                 1, min(int(_WORKER_STATIC.get('gpu_render_threads', 1)), len(local_cpus)))
         elif worker_cpu_order:
             bind_current_thread_to_cpus((int(worker_cpu_order[rank % len(worker_cpu_order)]),))
+        if _owner_option_enabled("YOLO_TTA_PTA_GPU_OWNER_PREWARM"):
+            # The pool does not wait for initializers, so this overlaps the
+            # parent's load and preparation; the parent stays CUDA-cold.  Pool
+            # respawns a worker whose initializer raises, so the first task
+            # handles a failure instead.
+            try:
+                with runtime_telemetry().span('pta.worker.gpu_runtime_prewarm'):
+                    _gpu_runtime_for_worker()
+            except Exception as exc:
+                _WORKER_GPU_RUNTIME_ERROR = exc
+                runtime_telemetry().fallback('pta.worker.gpu_runtime_prewarm', exc)
+                print(f"Warning: PTA GPU owner warm-up failed on cuda:{_WORKER_GPU_DEVICE_ID} "
+                      f"({type(exc).__name__}: {exc}); the first task handles it.", flush=True)
     elif worker_cpu_order:
         bind_current_thread_to_cpus((int(worker_cpu_order[worker_index % len(worker_cpu_order)]),))
 
@@ -783,7 +807,14 @@ def _derive_gpu_item_source(
 
 def _gpu_runtime_for_worker() -> Dict[str, object]:
     """Initialize one policy and optional nvJPEG encoder per persistent rank."""
-    global _WORKER_GPU_RUNTIME
+    global _WORKER_GPU_RUNTIME, _WORKER_GPU_RUNTIME_ERROR
+    if _WORKER_GPU_RUNTIME_ERROR is not None:
+        # The first task sees a failed warm-up as it would a lazy build: an
+        # error after the runtime was published is raised once; otherwise this
+        # task builds it again and raises any failure itself.
+        error, _WORKER_GPU_RUNTIME_ERROR = _WORKER_GPU_RUNTIME_ERROR, None
+        if _WORKER_GPU_RUNTIME is not None:
+            raise error
     if _WORKER_GPU_RUNTIME is not None:
         return _WORKER_GPU_RUNTIME
     augmentation = _WORKER_STATIC.get("augmentation")
@@ -952,12 +983,15 @@ def _gpu_volume_memory_snapshot(runtime: Mapping[str, object]) -> Dict[str, obje
 
 def _prepare_gpu_volume_task(
     runtime: Dict[str, object], *, identity: object, generation: int,
+    wait_prestage: bool = True,
 ) -> None:
     """Switch source owners at a drained, serial process-worker task boundary.
 
     The previous task has joined its render futures and publication queues.
     Classification tasks share these owners and must use the same boundary.
     This is deliberately not called by the concurrent CPU thread backend.
+    An early intensity upload is joined here, except that a same-source
+    classification task may run while it continues.
     """
     if runtime.get("gpu_volume_handoff_error"):
         raise RuntimeError(f"PTA GPU volume handoff previously failed: {runtime['gpu_volume_handoff_error']}")
@@ -968,8 +1002,14 @@ def _prepare_gpu_volume_task(
         raise RuntimeError("PTA GPU volume handoff requires a healthy publication worker")
     key = (int(generation), identity)
     renderer = runtime.get("azimuthal_renderer")
+    prestage = runtime.get("intensity_prestage")
+    if prestage is not None and (wait_prestage or runtime.get("gpu_volume_task_key") != key
+                                 or not prestage.is_alive()):
+        with runtime_telemetry().span('pta.worker.intensity_prestage_wait'):
+            _join_intensity_prestage(runtime)
     if runtime.get("gpu_volume_task_key") == key:
-        if renderer is not None:
+        # A running early upload is this source's admission attempt.
+        if renderer is not None and "intensity_prestage" not in runtime:
             renderer.arm_residency_retry()
         owner = runtime.get("categorical_volume_owner")
         if owner is not None:
@@ -1000,6 +1040,7 @@ def _prepare_gpu_volume_task(
     runtime["gpu_volume_task_key"] = key
     runtime.pop("source_residency_telemetry_key", None)
     runtime.pop("cpr_geometry_keys", None)
+    runtime.pop("intensity_prestage_key", None)
     after = _gpu_volume_memory_snapshot(runtime)
     fields = dict(device_id=int(runtime["device_id"]), generation=int(generation),
                   previous_generation=None if previous is None else int(previous[0]),
@@ -1008,14 +1049,116 @@ def _prepare_gpu_volume_task(
     runtime_trace_event('pta.gpu_volume_transition', **fields)
 
 
-def _prepare_gpu_payload_task(payload: Mapping[str, object]) -> None:
+def _prepare_gpu_payload_task(payload: Mapping[str, object], *, wait_prestage: bool = True) -> None:
     """Retire device owners before attaching or evicting shared host mappings."""
     if _WORKER_GPU_DEVICE_ID is None:
         return
     identity = tuple(payload.get(name) for name in (
         "volume_shm", "mask_shm", "semantic_coverage_shm", "native_intensity_shm"))
     _prepare_gpu_volume_task(
-        _gpu_runtime_for_worker(), identity=identity, generation=int(payload["gen"]))
+        _gpu_runtime_for_worker(), identity=identity, generation=int(payload["gen"]),
+        wait_prestage=wait_prestage)
+
+
+def _join_intensity_prestage(runtime: Mapping[str, object]) -> None:
+    """Wait for an early intensity upload; the upload thread never raises."""
+    thread = runtime.pop("intensity_prestage", None) if isinstance(runtime, dict) else None
+    if thread is not None:
+        thread.join()
+
+
+def _render_uses_cuda_intensity(runtime: Mapping[str, object], plans: Sequence[RenderPlan]) -> bool:
+    """Static gates of the CUDA intensity paths below; a miss only skips an early upload."""
+    disabled = runtime.get("cuda_projection_disabled_families", set())
+    for plan in plans:
+        view = getattr(plan.view, "shared_view", None)
+        if str(plan.channel_variant.kind) not in {"gray", "rgb", "custom"}:
+            continue
+        if getattr(plan.view, "family", None) == "cpr":
+            family = "cpr" if getattr(plan.view, "cpr_geometry", None) is not None else None
+        elif view is None:
+            family = None
+        elif shared_geometry.is_spherical_view(view):
+            family = "spherical"
+        elif shared_geometry.is_radial_view(view):
+            family = "radial"
+        elif shared_geometry.is_azimuthal_view(view):
+            family = "azimuthal" if _azimuthal_source_mode() == "texture_linear" else None
+        elif shared_geometry.is_tilted_view(view):
+            family = "tilted"
+        elif shared_geometry.physical_view_name(view) in {"transverse", "sagittal", "coronal"}:
+            family = "cartesian"
+        else:
+            family = None
+        if family is not None and family not in disabled and _owner_option_enabled(
+                f"YOLO_TTA_PTA_GPU_{family.upper()}_RENDER"):
+            return True
+    return False
+
+
+def _maybe_prestage_render_intensity(
+    runtime: Dict[str, object], plans: Sequence[RenderPlan], volume: np.ndarray,
+) -> None:
+    """Start the first render task's native-T upload once classification owns the GPU.
+
+    It runs after this generation's categorical source was admitted, so the
+    admission order and arguments match the render path's first call.  The
+    parent's remaining classification and planning then hide the upload.
+    """
+    key = runtime.get("gpu_volume_task_key")
+    renderer, lock = runtime.get("azimuthal_renderer"), runtime.get("azimuthal_render_lock")
+    pointer = int(volume.__array_interface__["data"][0])
+    native = _WORKER_NATIVE_INTENSITY_BY_POINTER.get(pointer)
+    if (key is None or native is None or renderer is None or lock is None
+            or runtime.get("intensity_prestage_key") == key or "intensity_prestage" in runtime
+            or getattr(runtime.get("categorical_volume_owner"), "mask_gpu", None) is None
+            or getattr(renderer, "_volume_key", None) is not None
+            or not _owner_option_enabled("YOLO_TTA_PTA_GPU_INTENSITY_PRESTAGE")
+            or not _render_uses_cuda_intensity(runtime, plans)):
+        return
+    runtime["intensity_prestage_key"] = key
+    identity = _WORKER_VOLUME_IDENTITY_BY_POINTER.get(pointer, f"array:{pointer}")
+    if "intensity_prestage_finalizer" not in runtime:
+        from multiprocessing.util import Finalize
+
+        # Join before publication (15) and categorical (14) owners retire.
+        runtime["intensity_prestage_finalizer"] = Finalize(
+            None, _join_intensity_prestage, args=(runtime,), exitpriority=16)
+    thread = threading.Thread(target=_prestage_render_intensity, name="pta-intensity-prestage",
+                              args=(runtime, renderer, lock, native, identity, key), daemon=True)
+    thread.start()  # Registered only once started, so every boundary can join it.
+    runtime["intensity_prestage"] = thread
+
+
+def _prestage_render_intensity(runtime, renderer, lock, native, identity, key) -> None:
+    """Background upload; any failure leaves the upload to the first render task."""
+    source, logical_t = native
+    torch, device_id = runtime["torch"], int(runtime["device_id"])
+    fields: Dict[str, object] = dict(device_id=device_id, generation=int(key[0]),
+                                     source_bytes=int(source.nbytes), mode="skipped")
+    try:
+        from .cuda_backend import gpu_render_reserve_bytes
+        from .pta_cuda_masks import _reserve_bytes as categorical_reserve_bytes
+
+        with runtime_telemetry().span('pta.worker.intensity_prestage'), lock, torch.cuda.device(device_id):
+            free_bytes, _total = torch.cuda.mem_get_info(device_id)
+            fields["free_bytes"] = int(free_bytes)
+            # Tight admission, and its cache flush, stay with the first render
+            # task; classification still running keeps its categorical reserve.
+            if (renderer._volume_key is None and int(free_bytes) >= int(source.nbytes) + max(
+                    gpu_render_reserve_bytes(), categorical_reserve_bytes())):
+                # Native-T never uses the texture reserve, so this is the render path's call.
+                fields["mode"] = str(renderer.ensure_volume_array(
+                    source, identity=identity, resize_to_t=logical_t,
+                    require_azimuthal_texture=False))
+                if fields["mode"] != "resident":
+                    # Leave a fresh admission to the first render task, as before.
+                    renderer.retire_volume_array()
+        runtime_telemetry().gauge('pta.worker.intensity_prestage', fields)
+    except Exception as exc:
+        runtime_telemetry().fallback('pta.worker.intensity_prestage', exc)
+        print(f"Warning: PTA early intensity upload skipped ({type(exc).__name__}: {exc}); "
+              "the first render task performs it.", flush=True)
 
 
 def _nvjpeg_encode_params(nvimgcodec: object, *, quality: int, channel_kind: str) -> object:
@@ -2356,6 +2499,35 @@ def _validate_gpu_policy_batch(
     return batch_masks
 
 
+def _gpu_mask_bounds(torch, masks):
+    """Return each NHW mask's inclusive [y0, y1, x0, x1]; empty masks have y1 = x1 = -1."""
+    bounds = []
+    for flags in (masks.any(dim=2), masks.any(dim=1)):
+        length = int(flags.shape[1])
+        bounds.append(length - (flags * torch.arange(length, 0, -1, device=flags.device)).amax(dim=1))
+        bounds.append((flags * torch.arange(1, length + 1, device=flags.device)).amax(dim=1) - 1)
+    return torch.stack(bounds, dim=1)
+
+
+def _download_gpu_mask_windows(torch, masks, windows):
+    """Pack (index, y0, y1, x0, x1) windows of NHW masks on device; download once."""
+    sizes = [(y1 - y0) * (x1 - x0) for _index, y0, y1, x0, x1 in windows]
+    frame_pixels = len(windows) * int(masks.shape[1]) * int(masks.shape[2])
+    with runtime_telemetry().span('pta.publish.label_window_download', windows=len(windows),
+                                  window_pixels=sum(sizes), frame_pixels=frame_pixels):
+        packed = torch.empty(sum(sizes), dtype=masks.dtype, device=masks.device)
+        offset = 0
+        for (index, y0, y1, x0, x1), size in zip(windows, sizes):
+            packed[offset:offset + size].view(y1 - y0, x1 - x0).copy_(masks[index, y0:y1, x0:x1])
+            offset += size
+        host = packed.to("cpu").numpy()
+    crops, offset = [], 0
+    for (_index, y0, y1, x0, x1), size in zip(windows, sizes):
+        crops.append(host[offset:offset + size].reshape(y1 - y0, x1 - x0))
+        offset += size
+    return crops
+
+
 def _publish_gpu_policy_batch(
     *,
     runtime: Mapping[str, object],
@@ -2413,13 +2585,10 @@ def _publish_gpu_policy_batch(
                 if int(coverage_for_decision.ndim) == 4 and int(coverage_for_decision.shape[1]) == 1:
                     coverage_for_decision = coverage_for_decision[:, 0]
                 decision_masks = batch_masks * (coverage_for_decision > 0)
-            mask_nonempty = (
-                decision_masks.reshape(expected, -1)
-                .any(dim=1)
-                .detach()
-                .to("cpu")
-                .tolist()
-            )
+            # Foreground bounds also crop polygon-only downloads below.
+            with runtime_telemetry().span('pta.publish.mask_bounds'):
+                mask_bounds = _gpu_mask_bounds(torch, decision_masks.detach()).to("cpu").tolist()
+            mask_nonempty = [bounds[1] >= 0 for bounds in mask_bounds]
         else:
             # Unlabeled candidates carry no mask-dependent keep/drop semantics.
             # Avoid launching a reduction over the expanded zero-mask view.
@@ -2439,9 +2608,26 @@ def _publish_gpu_policy_batch(
                  or bool(source_mask_nonempty[index]))
         ]
         host_label_masks: Dict[int, np.ndarray] = {}
+        label_origins: Dict[int, Tuple[int, int]] = {}
         host_semantic_masks: Dict[int, np.ndarray] = {}
         all_masks_selected = len(mask_indices) == expected
-        if mask_indices:
+        frame_shape = (int(batch_masks.shape[1]), int(batch_masks.shape[2]))
+        # Polygon-only exports need just each foreground window. Without
+        # coverage the bounds above are those of each validated uint8 label mask.
+        if mask_indices and not (save_binary or save_semantic) and semantic_coverage_masks is None:
+            windows = []
+            for index in mask_indices:
+                window = yolo_label_window(mask_bounds[index], frame_shape)
+                if window is None:
+                    host_label_masks[index] = np.zeros((0, 0), np.uint8)
+                else:
+                    windows.append((index, *window))
+            if windows:
+                crops = _download_gpu_mask_windows(torch, batch_masks.detach(), windows)
+                for (index, y0, _y1, x0, _x1), crop in zip(windows, crops):
+                    host_label_masks[index] = crop
+                    label_origins[index] = (x0, y0)
+        elif mask_indices:
             device_indices = None if all_masks_selected else torch.as_tensor(
                 mask_indices,
                 device=batch_masks.device,
@@ -2492,10 +2678,12 @@ def _publish_gpu_policy_batch(
         mask_for_label = host_label_masks[index]
         if index in host_coverage_masks:
             mask_for_label = np.where(host_coverage_masks[index] > 0, mask_for_label, 0)
+        origin = label_origins.get(index)
         return mask_to_yolo_lines(
             mask_for_label, warnings=local_warnings,
             context=f'{candidate.volume_name} {candidate.output_tag} frame {int(candidate.frame_idx) + 1:04d}',
-            known_empty=not bool(source_mask_nonempty[index]))
+            known_empty=not bool(source_mask_nonempty[index]),
+            frame_shape=None if origin is None else frame_shape, origin=origin or (0, 0))
 
     label_lines_by_index = None
     if publication is not None and label_indices:
@@ -3481,12 +3669,19 @@ def _classification_task_entry(job: Tuple[str, int, object]):
 
     payload_name, payload_nbytes, task = str(job[0]), int(job[1]), job[2]
     payload = _worker_load_payload(payload_name, payload_nbytes)
-    _prepare_gpu_payload_task(payload)
+    _prepare_gpu_payload_task(payload, wait_prestage=False)
     volume, mask, coverage = _worker_volume_arrays(payload)
     volume_identity = _WORKER_VOLUME_IDENTITY_BY_POINTER[int(volume.__array_interface__['data'][0])]
     identity = f"{volume_identity}:mask:{int(mask.__array_interface__['data'][0])}"
-    return classify_task(_gpu_runtime_for_worker(), mask, payload['plans'],
-                         task, identity=identity, coverage=coverage)
+    runtime = _gpu_runtime_for_worker()
+    result = classify_task(runtime, mask, payload['plans'],
+                           task, identity=identity, coverage=coverage)
+    try:
+        _maybe_prestage_render_intensity(runtime, payload['plans'], volume)
+    except Exception as exc:
+        # Optional overlap: the first render task still uploads, as before.
+        runtime_telemetry().fallback('pta.worker.intensity_prestage', exc)
+    return result
 
 
 def _render_task_entry_thread(payload: Mapping[str, object], task_idx: int) -> Tuple[int, Dict[str, int], Dict[str, int], Dict[str, List[str]], DeferredForegroundCounts]:
@@ -3693,7 +3888,11 @@ class PersistentRenderPool:
         return len(handle.tasks)
 
     def classify_foregrounds(self, prep, *, gen: int, jobs, selected_items=None):
-        """Use idle CUDA owners and a dedicated result stream; parent stays CUDA-cold."""
+        """Classify on the CUDA owners through a dedicated result stream; parent stays CUDA-cold.
+
+        Tasks queue FIFO behind any render tasks already submitted, so an owner
+        switches volumes only at a drained task boundary.
+        """
         from .pta_gpu_classification import build_classification_tasks, classification_stats
 
         jobs = list(jobs)
@@ -3713,9 +3912,12 @@ class PersistentRenderPool:
                 results = self._pool.imap_unordered(_classification_task_entry,
                     ((handle.payload_name, handle.payload_nbytes, task) for task in tasks),
                     chunksize=1)
-                for _ in tasks:
+                for index in range(len(tasks)):
                     try:
-                        foregrounds, declined, measured = next(results)
+                        # Behind a rendering volume the first wait includes its FIFO queue tail.
+                        with (runtime_telemetry().span('pta.classify.gpu.first_result')
+                              if index == 0 else nullcontext()):
+                            foregrounds, declined, measured = next(results)
                     except Exception as exc:
                         # Settle every submitted task before releasing its shared payload.
                         if error is None:

@@ -52,8 +52,29 @@ Canonical direct tile paths avoid generating the unused full output. Requested
 full-volume diagnostics such as NRRD snapshots and overlay videos remain complete
 and are outside dataset sampling; omit them when minimizing work/disk usage.
 
+## Per-input overrides
+
+An input directory may contain `pta_input_options.json`, a JSON object with only
+`fraction` (a number, `0 < fraction <= 1`) and `enable_cpr` (`true` or `false`):
+
+```json
+{"fraction": 0.016, "enable_cpr": true}
+```
+
+The values apply to every volume in that directory. The command line supplies
+the default for directories without the file or without a key. Unknown keys,
+wrong types and out-of-range values stop the run during discovery, before any
+volume is probed. Discovery never treats the file as input data. Selection
+remains per-candidate identity, so one volume's fraction cannot change another
+volume's selection, filenames or seeds. This lets one `--pipeline_depth 2` call
+process volumes that need different fractions or CPR settings.
+
 The summary and manifest record the requested fraction, the candidate population
-before sampling and the selected count before background filtering. Full
+before sampling and the selected count before background filtering. Each volume
+record holds its effective `fraction` and `enable_cpr` plus any
+`input_option_overrides`; the manifest input records hold the options file's
+identity and SHA-256. The manifest's resolved configuration keeps the command-line
+values. Full
 foreground-slice retention is intentionally not guaranteed when sampling is on;
 the underlying preprocessing/anchor behavior remains unchanged.
 

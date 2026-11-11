@@ -3,7 +3,7 @@ include README.md
 include .gitattributes
 include .gitignore
 include AGENTS.md
-include Opus-5.5_v25.0.3_SLURM.py
+include Opus-5.5_v25.0.4_SLURM.py
 include setup.py
 include release/_package_inventory.json
 recursive-include XTA/examples *.py *.md

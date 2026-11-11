@@ -1,7 +1,9 @@
 # XTA Slicer startup tools (based on slicerrc v1.1.5 draft).
 # - Reversible native intensity alignment; no segmentation or intensity resampling.
 # - Export XTA Edits: read-only low-resolution snapshot for native component transfer.
-# - Hide All / Show All for every segmentation node.
+# - One Show All / Hide All toggle for every segmentation node.
+# - Highlight: model silhouette outline in the 3D views.
+# - Build Video: cumulative segment-reveal video export (needs FFmpeg).
 # - Empty Global masks never clear nonglobal segments.
 # - Fewer labelmap copies, lazy geometry lookup, and a reused union worker pool.
 
@@ -2036,6 +2038,58 @@ def ShowAll():
     _set_all_segments_visibility(True)
 
 
+def _segmentation_visibility_states():
+    """Return one shown/hidden flag per segmentation node that has segments."""
+    states = []
+    for segmentation_node in slicer.util.getNodesByClass("vtkMRMLSegmentationNode"):
+        segment_ids = _segment_ids(segmentation_node.GetSegmentation())
+        if not segment_ids:
+            continue
+        shown = False
+        for display_index in range(segmentation_node.GetNumberOfDisplayNodes()):
+            display_node = segmentation_node.GetNthDisplayNode(display_index)
+            if display_node is None or not display_node.IsA("vtkMRMLSegmentationDisplayNode"):
+                continue
+            if display_node.GetVisibility() and any(
+                display_node.GetSegmentVisibility(segment_id) for segment_id in segment_ids
+            ):
+                shown = True
+                break
+        states.append(shown)
+    return states
+
+
+def _toggle_should_show(states, label_says_show):
+    """All hidden: show. All shown: hide. Mixed: do what the button says."""
+    if states and not any(states):
+        return True
+    if states and all(states):
+        return False
+    return bool(label_says_show)
+
+
+_TOGGLE_SHOW_LABEL = "Show All"
+_TOGGLE_HIDE_LABEL = "Hide All"
+_toggle_all_action = None
+
+
+def ToggleAll():
+    """Show or hide every segmentation node; the button names the next action."""
+    label_says_show = (
+        _toggle_all_action is not None
+        and _toggle_all_action.text == _TOGGLE_SHOW_LABEL
+    )
+    visible = _toggle_should_show(_segmentation_visibility_states(), label_says_show)
+    _set_all_segments_visibility(visible)
+    if _toggle_all_action is not None:
+        # Label from the resulting scene, so an empty scene does not flip it.
+        states = _segmentation_visibility_states()
+        _toggle_all_action.setText(
+            _TOGGLE_SHOW_LABEL if states and not any(states) else _TOGGLE_HIDE_LABEL
+        )
+    return visible
+
+
 # ── XTA native-resolution edit export ─────────────────────────────────
 
 """Read-only Slicer snapshot exporter for xta_native_filter.py.
@@ -2295,15 +2349,11 @@ def _xta_alignment_choose_volume(volumes, title):
     if len(volumes) == 1:
         return volumes[0]
     names = [f'{v.GetName()} [{v.GetID()}]' for v in volumes]
-    selection = qt.QInputDialog.getItem(slicer.util.mainWindow(), title,
-                                        'Intensity volume:', names, 0, False)
-    if isinstance(selection, tuple):
-        selection, accepted = selection
-        if not accepted:
-            return None
-    if not selection:
+    # _choose_item (Highlight section) reports Cancel; static getItem cannot.
+    selection = _choose_item(title, 'Intensity volume:', names)
+    if selection is None:
         return None
-    return volumes[names.index(str(selection))]
+    return volumes[names.index(selection)]
 
 
 def _xta_alignment_real_volumes():
@@ -2509,6 +2559,887 @@ def ResetNativeIntensityAlignment(volume_node=None):
     return volume_node.GetID()
 
 
+# ── Model outline highlight ───────────────────────────────────────────
+
+
+# Keep outlines across a re-exec in the same Python namespace.
+_HIGHLIGHT_OUTLINES = globals().get("_HIGHLIGHT_OUTLINES", {})
+_HIGHLIGHT_SCENE_OBSERVERS = globals().get("_HIGHLIGHT_SCENE_OBSERVERS", [])
+_HIGHLIGHT_COLOR = (1.0, 0.0, 0.0)
+_HIGHLIGHT_LINE_WIDTH = 1
+
+
+def _choose_item(title, prompt, names):
+    """Ask the user to pick one name; None if cancelled.
+
+    PythonQt's static QInputDialog.getItem cannot report Cancel (it returns the
+    default item), so use a dialog instance and check its exec() result.
+    """
+    dialog = qt.QInputDialog(slicer.util.mainWindow())
+    dialog.setWindowTitle(title)
+    dialog.setLabelText(prompt)
+    dialog.setComboBoxItems(list(names))
+    dialog.setComboBoxEditable(False)
+    run = getattr(dialog, "exec_", None) or getattr(dialog, "exec")
+    try:
+        if not run():
+            return None
+        selection = str(dialog.textValue())
+    finally:
+        dialog.deleteLater()
+    return selection if selection in names else None
+
+
+def _choose_node(nodes, title, prompt, suffix=None):
+    """Return the only node, or ask the user to pick one; None if cancelled."""
+    if len(nodes) == 1:
+        return nodes[0]
+    names = [
+        f"{node.GetName()} [{node.GetID()}]" + (suffix(node) if suffix else "")
+        for node in nodes
+    ]
+    selection = _choose_item(title, prompt, names)
+    if selection is None:
+        return None
+    return nodes[names.index(selection)]
+
+
+def _highlight_candidate_models():
+    """User-visible surface models; Slicer's internal slice models are hidden."""
+    models = []
+    for node in slicer.util.getNodesByClass("vtkMRMLModelNode"):
+        if node.GetHideFromEditors():
+            continue
+        polydata = node.GetPolyData()
+        if polydata is None or polydata.GetNumberOfPoints() == 0:
+            continue
+        models.append(node)
+    return models
+
+
+def _highlight_views():
+    layout = slicer.app.layoutManager()
+    views = []
+    if layout is None:
+        return views
+    for index in range(layout.threeDViewCount):
+        view = layout.threeDWidget(index).threeDView()
+        renderer = view.renderWindow().GetRenderers().GetFirstRenderer()
+        if renderer is not None:
+            views.append((view, renderer))
+    return views
+
+
+def _highlight_world_transform(model):
+    # Full parent chain, including nonlinear transforms.
+    transform = vtk.vtkGeneralTransform()
+    slicer.vtkMRMLTransformNode.GetTransformBetweenNodes(
+        model.GetParentTransformNode(), None, transform
+    )
+    return transform
+
+
+def _highlight_visible_in_view(model, view):
+    display = model.GetDisplayNode()
+    if display is None or not display.GetVisibility():
+        return False
+    if hasattr(display, "GetVisibility3D") and not display.GetVisibility3D():
+        return False
+    view_node = view.mrmlViewNode()
+    if view_node is not None and not display.IsDisplayableInView(view_node.GetID()):
+        return False
+    return True
+
+
+def _highlight_render(views):
+    for view in views:
+        try:
+            view.scheduleRender()
+        except (AttributeError, RuntimeError, ValueError):
+            pass  # The view widget was deleted by a layout change.
+
+
+def _highlight_sync(model_id):
+    entry = _HIGHLIGHT_OUTLINES.get(model_id)
+    if entry is None:
+        return
+    for view, _renderer, actor in entry["views"]:
+        actor.SetVisibility(_highlight_visible_in_view(entry["model"], view))
+    _highlight_render(view for view, _renderer, _actor in entry["views"])
+
+
+def _highlight_retransform(model_id):
+    entry = _HIGHLIGHT_OUTLINES.get(model_id)
+    if entry is None:
+        return
+    entry["filter"].SetTransform(_highlight_world_transform(entry["model"]))
+    _highlight_render(view for view, _renderer, _actor in entry["views"])
+
+
+def _highlight_remove(model_id):
+    entry = _HIGHLIGHT_OUTLINES.pop(model_id, None)
+    if entry is None:
+        return False
+    for observed, tag in entry["observers"]:
+        observed.RemoveObserver(tag)
+    for _view, renderer, actor in entry["views"]:
+        renderer.RemoveActor(actor)
+    _highlight_render(view for view, _renderer, _actor in entry["views"])
+    if not _HIGHLIGHT_OUTLINES:
+        while _HIGHLIGHT_SCENE_OBSERVERS:
+            slicer.mrmlScene.RemoveObserver(_HIGHLIGHT_SCENE_OBSERVERS.pop())
+    return True
+
+
+def _highlight_remove_all(*_args):
+    for model_id in list(_HIGHLIGHT_OUTLINES):
+        _highlight_remove(model_id)
+
+
+@vtk.calldata_type(vtk.VTK_OBJECT)
+def _highlight_on_node_removed(_caller, _event, node):
+    if node is not None and node.GetID() in _HIGHLIGHT_OUTLINES:
+        _highlight_remove(node.GetID())
+
+
+def _highlight_add(model, views):
+    world = vtk.vtkTransformPolyDataFilter()
+    world.SetTransform(_highlight_world_transform(model))
+    world.SetInputConnection(model.GetPolyDataConnection())
+    entry = {"model": model, "filter": world, "views": [], "observers": []}
+    for view, renderer in views:
+        # Each view has its own camera, so each needs its own silhouette.
+        silhouette = vtk.vtkPolyDataSilhouette()
+        silhouette.SetInputConnection(world.GetOutputPort())
+        silhouette.SetCamera(renderer.GetActiveCamera())
+        silhouette.SetEnableFeatureAngle(0)  # Outline only: no interior mesh edges.
+        silhouette.SetBorderEdges(0)
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(silhouette.GetOutputPort())
+        mapper.ScalarVisibilityOff()  # Keep the outline color, not model scalars.
+
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.PickableOff()
+        actor.GetProperty().SetColor(*_HIGHLIGHT_COLOR)
+        actor.GetProperty().SetLineWidth(_HIGHLIGHT_LINE_WIDTH)
+        actor.GetProperty().LightingOff()
+        actor.SetVisibility(_highlight_visible_in_view(model, view))
+        renderer.AddActor(actor)
+        entry["views"].append((view, renderer, actor))
+
+    model_id = model.GetID()
+    entry["observers"] = [
+        (model, model.AddObserver(
+            slicer.vtkMRMLDisplayableNode.DisplayModifiedEvent,
+            lambda *_args, model_id=model_id: _highlight_sync(model_id))),
+        (model, model.AddObserver(
+            slicer.vtkMRMLTransformableNode.TransformModifiedEvent,
+            lambda *_args, model_id=model_id: _highlight_retransform(model_id))),
+    ]
+    _HIGHLIGHT_OUTLINES[model_id] = entry
+    if not _HIGHLIGHT_SCENE_OBSERVERS:
+        _HIGHLIGHT_SCENE_OBSERVERS.append(slicer.mrmlScene.AddObserver(
+            slicer.vtkMRMLScene.NodeRemovedEvent, _highlight_on_node_removed))
+        _HIGHLIGHT_SCENE_OBSERVERS.append(slicer.mrmlScene.AddObserver(
+            slicer.vtkMRMLScene.EndCloseEvent, _highlight_remove_all))
+    _highlight_render(view for view, _renderer in views)
+
+
+def Highlight(model_node=None):
+    """Outline a model in every 3D view; on an outlined model, remove it.
+
+    With one model it is used directly; with several, the user picks one.
+    """
+    if model_node is None:
+        models = _highlight_candidate_models()
+        if not models:
+            raise RuntimeError(
+                "Highlight: no model is loaded. Load or create a 3D surface model first."
+            )
+        model_node = _choose_node(
+            models, "Highlight", "Model to outline:",
+            lambda node: " (outlined)" if node.GetID() in _HIGHLIGHT_OUTLINES else "",
+        )
+        if model_node is None:
+            return None
+
+    name = model_node.GetName()
+    if _highlight_remove(model_node.GetID()):
+        slicer.util.showStatusMessage(f'Highlight: removed the outline of "{name}".', 4000)
+        return False
+
+    views = _highlight_views()
+    if not views:
+        raise RuntimeError("Highlight: show a 3D view in the Slicer layout first.")
+    _highlight_add(model_node, views)
+    slicer.util.showStatusMessage(
+        f'Highlight: outlined "{name}". Click Highlight again to remove it.', 5000
+    )
+    return True
+
+
+# ── Cumulative build video ────────────────────────────────────────────
+
+"""Cumulative segment-reveal video export (Build Video button).
+
+Default: 3840 x 2160, 30 fps, RGB-lossless FFV1/MKV plus lossless PNG states.
+Run Importer first so the view segments are organized. FFmpeg must be on PATH
+or configured in Slicer's Screen Capture module; nothing is installed.
+
+A private VTK renderer uses copies of the segment surfaces, world transforms,
+colors, opacity, lights, and the first 3D view's camera. Your existing
+visibility and camera are NOT changed. This is a clean surface rendering, not
+a recording of the UI: slice planes, volumes, markups, rulers, orientation
+labels, clipping and custom render passes are not copied. Missing closed
+surfaces are generated with the segmentation's existing conversion parameters.
+
+The output contains one PNG per cumulative state, NOT 30 separately rendered
+PNGs per second. FFmpeg holds each state for an exact integer number of frames.
+"""
+from datetime import datetime
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import time
+from typing import Optional
+
+_VIDEO_BASE_ORDER = ("Transverse", "Sagittal", "Coronal")
+
+
+class _VideoExportCancelled(RuntimeError):
+    """Export was cancelled; completed PNG states are retained."""
+
+
+def _video_view_name(segment_name: str, stem: str) -> Optional[str]:
+    """Strict stem matching, with optional original file extensions removed."""
+    name = str(segment_name or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if not name.startswith(stem):
+        return None
+    name = name[len(stem):]
+    name = re.sub(r"(?:\.seg)?\.nrrd$|\.seg$", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"_TTA_a0_fullframe_yolo$", "", name)
+    return name or None
+
+
+def _video_natural_key(text: str):
+    # Tagged components avoid comparing an integer with a string.
+    return tuple((1, int(p)) if p.isdigit() else (0, p.casefold())
+                 for p in re.split(r"(\d+)", text))
+
+
+def _video_discover(stem: str, segmentation_node_id: Optional[str] = None):
+    import slicer
+
+    nodes = slicer.util.getNodesByClass("vtkMRMLSegmentationNode")
+    if segmentation_node_id:
+        nodes = [n for n in nodes if n.GetID() == segmentation_node_id]
+        if not nodes:
+            raise ValueError(f"Segmentation node ID not found: {segmentation_node_id}")
+    entries, available = [], []
+    for node in nodes:
+        segmentation = node.GetSegmentation()
+        for index in range(segmentation.GetNumberOfSegments()):
+            sid = segmentation.GetNthSegmentID(index)
+            name = segmentation.GetSegment(sid).GetName() or ""
+            available.append(f"{node.GetName()}: {name}")
+            key = _video_view_name(name, stem)
+            if key is None or key.startswith("Global_final_output"):
+                continue
+            entries.append({"node": node, "segment_id": sid,
+                            "segment_name": name, "view_name": key})
+
+    by_name = {}
+    for entry in entries:
+        by_name.setdefault(entry["view_name"], []).append(entry)
+    missing = [base for base in _VIDEO_BASE_ORDER if base not in by_name]
+    if missing:
+        sample = "\n".join(available[:30]) or "(No loaded segments.)"
+        raise ValueError(
+            "Missing exact base segment(s): " + ", ".join(missing) +
+            f"\nExpected names beginning with {stem!r}.\n"
+            "The exporter matches SEGMENT names, not the merged node's name.\n"
+            "It will not substitute tilted, radial, or azimuthal variants.\n"
+            "First loaded segment names:\n" + sample)
+    duplicates = [name for name, values in by_name.items() if len(values) > 1]
+    if duplicates:
+        raise ValueError(
+            "Duplicate view names were found: " + ", ".join(duplicates[:15]) +
+            ". Remove duplicate imports, or pass segmentation_node_id to select "
+            "one segmentation node. No scene visibility has been changed.")
+    ordered = [by_name[base][0] for base in _VIDEO_BASE_ORDER]
+    ordered += sorted((e for e in entries if e["view_name"] not in _VIDEO_BASE_ORDER),
+                      key=lambda e: _video_natural_key(e["view_name"]))
+    return ordered
+
+
+def _video_frame_counts(count: int, fps: int, initial_hold_s: float,
+                  ramp_seconds: float, max_views_per_second: float,
+                  final_hold_s: float):
+    """Smoothstep rate ramp, sampled at reveal events; frame-quantized holds.
+
+    Transverse begins at frame 0; Sagittal and Coronal follow at one initial
+    hold interval each. The ramp starts with Coronal, at 1/initial_hold_s views
+    per second, and reaches its plateau after ramp_seconds of movie time.
+    The final state has a separate final_hold_s hold.
+    """
+    if count < 3:
+        raise ValueError("At least the three base views are required.")
+    minimum_frames = max(1, math.ceil(fps / max_views_per_second - 1e-10))
+    initial_frames = max(minimum_frames, int(math.floor(fps * initial_hold_s + 0.5)))
+    final_frames = max(1, int(math.floor(fps * final_hold_s + 0.5)))
+    ramp_elapsed = 0
+    holds = []
+    start_rate = 1.0 / initial_hold_s
+    for index in range(count):
+        if index == count - 1:
+            frames = final_frames
+        elif index < 2:
+            frames = initial_frames
+        else:
+            u = 1.0 if ramp_seconds == 0 else min(1.0, ramp_elapsed / (fps * ramp_seconds))
+            eased = u * u * (3.0 - 2.0 * u)
+            rate = start_rate + (max_views_per_second - start_rate) * eased
+            frames = max(minimum_frames, int(math.floor(fps / rate + 0.5)))
+            ramp_elapsed += frames
+        holds.append(frames)
+    return holds
+
+
+def _video_process_environment():
+    """Use the startup environment so Slicer-specific library paths don't leak."""
+    try:
+        import slicer
+        if hasattr(slicer.util, "startupEnvironment"):
+            return dict(slicer.util.startupEnvironment())
+    except (ImportError, AttributeError):
+        pass
+    return os.environ.copy()
+
+
+def _video_subprocess_options():
+    options = {"env": _video_process_environment()}
+    if os.name == "nt":
+        options["creationflags"] = subprocess.CREATE_NO_WINDOW
+    return options
+
+
+def _video_find_ffmpeg(explicit: Optional[str] = None) -> str:
+    candidates = []
+    if explicit:
+        candidates.append(str(explicit))
+    else:
+        try:
+            import ScreenCapture
+            candidates.append(ScreenCapture.ScreenCaptureLogic().getFfmpegPath())
+        except (ImportError, AttributeError):
+            pass
+        candidates.append(shutil.which("ffmpeg") or "")
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate = os.path.expandvars(os.path.expanduser(candidate))
+        resolved = shutil.which(candidate) or candidate
+        if Path(resolved).is_file():
+            return str(Path(resolved).resolve())
+    raise RuntimeError(
+        "FFmpeg was not found. Configure 'ffmpeg executable' in Slicer's Screen "
+        "Capture > Advanced, put ffmpeg on PATH, or pass "
+        "ffmpeg_path=r'C:/path/to/ffmpeg.exe'. Nothing has been exported or installed.")
+
+
+def _video_check_encoders(ffmpeg: str, make_mp4: bool):
+    result = subprocess.run([ffmpeg, "-hide_banner", "-encoders"],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, errors="replace", timeout=20,
+                            **_video_subprocess_options())
+    required = ["ffv1"] + (["libx264"] if make_mp4 else [])
+    missing = [codec for codec in required
+               if not re.search(r"\b" + re.escape(codec) + r"\b", result.stdout)]
+    if result.returncode or missing:
+        raise RuntimeError("FFmpeg cannot supply the requested encoders: " +
+                           ", ".join(missing) + "\n" + result.stdout[-2000:])
+
+
+def _video_tick(progress, label: Optional[str] = None, value: Optional[int] = None):
+    import slicer
+    if label is not None:
+        progress.setLabelText(label)
+    if value is not None:
+        progress.setValue(value)
+    slicer.app.processEvents()
+    cancelled = progress.wasCanceled
+    if callable(cancelled):
+        cancelled = cancelled()
+    if cancelled:
+        raise _VideoExportCancelled("Export cancelled. Completed files have been retained.")
+
+
+def _video_display_properties(node, segment_id: str, actor, opacity_override):
+    """Follow Slicer's normal surface color/material/opacity calculation."""
+    import slicer
+    display = node.GetDisplayNode()
+    segment = node.GetSegmentation().GetSegment(segment_id)
+    prop = actor.GetProperty()
+    color = list(segment.GetColor())
+    opacity = 1.0
+    generic = display
+    hierarchy_opacity = 1.0
+    if display:
+        folder_class = getattr(slicer, "vtkMRMLFolderDisplayNode", None)
+        if (folder_class and hasattr(display, "GetFolderDisplayOverrideAllowed")
+                and display.GetFolderDisplayOverrideAllowed()):
+            overriding = folder_class.GetOverridingHierarchyDisplayNode(node)
+            hierarchy_opacity = folder_class.GetHierarchyOpacity(node)
+            if overriding:
+                generic = overriding
+                color = list(generic.GetColor())
+            else:
+                display.GetSegmentColor(segment_id, color)
+        else:
+            display.GetSegmentColor(segment_id, color)
+        opacity = (hierarchy_opacity * display.GetSegmentOpacity3D(segment_id)
+                   * display.GetOpacity3D() * generic.GetOpacity())
+        pairs = (
+            ("Representation", "Representation"), ("PointSize", "PointSize"),
+            ("LineWidth", "LineWidth"), ("Lighting", "Lighting"),
+            ("Interpolation", "Interpolation"), ("Shading", "Shading"),
+            ("FrontfaceCulling", "FrontfaceCulling"),
+            ("BackfaceCulling", "BackfaceCulling"),
+            ("Ambient", "Ambient"), ("Diffuse", "Diffuse"),
+            ("Specular", "Specular"), ("SpecularPower", "Power"),
+            ("Metallic", "Metallic"), ("Roughness", "Roughness"),
+            ("EdgeVisibility", "EdgeVisibility"), ("EdgeColor", "EdgeColor"))
+        for target, source in pairs:
+            getter = getattr(generic, "Get" + source, None)
+            setter = getattr(prop, "Set" + target, None)
+            if getter and setter:
+                setter(getter())
+        if generic.GetSelected():
+            prop.SetAmbient(generic.GetSelectedAmbient())
+            prop.SetSpecular(generic.GetSelectedSpecular())
+    if opacity_override is not None:
+        opacity = float(opacity_override)
+    if not math.isfinite(opacity) or not 0.0 < opacity <= 1.0:
+        raise ValueError(
+            f"Segment {segment.GetName()!r} has effective opacity {opacity}. "
+            "Set a positive opacity in Slicer, or pass opacity_override=1.0.")
+    prop.SetColor(color)
+    prop.SetOpacity(opacity)
+
+
+def _video_make_actors(entries, progress, skip_empty: bool, opacity_override):
+    import slicer
+    import vtk
+
+    surface_name = slicer.vtkSegmentationConverter.GetSegmentationClosedSurfaceRepresentationName()
+    prepared, transforms, actors, kept, skipped = set(), {}, [], [], []
+    for index, entry in enumerate(entries):
+        _video_tick(progress, f"Preparing {index + 1}/{len(entries)}: {entry['view_name']}", 0)
+        node = entry["node"]
+        node_id = node.GetID()
+        if node_id not in prepared:
+            if not node.GetSegmentation().ContainsRepresentation(surface_name):
+                if not node.CreateClosedSurfaceRepresentation():
+                    raise RuntimeError(f"Could not create surfaces for {node.GetName()!r}.")
+            transform = vtk.vtkGeneralTransform()
+            slicer.vtkMRMLTransformNode.GetTransformBetweenNodes(
+                node.GetParentTransformNode(), None, transform)
+            transforms[node_id] = transform
+            prepared.add(node_id)
+            display = node.GetDisplayNode()
+            if display and hasattr(display, "GetClipping") and display.GetClipping():
+                print(f"NOTE: {node.GetName()}: display clipping is not copied; full surfaces are exported.")
+
+        surface = vtk.vtkPolyData()
+        if not node.GetClosedSurfaceRepresentation(entry["segment_id"], surface):
+            raise RuntimeError(f"Could not obtain surface: {entry['segment_name']}")
+        if surface.GetNumberOfPoints() == 0 or surface.GetNumberOfCells() == 0:
+            if skip_empty and entry["view_name"] not in _VIDEO_BASE_ORDER:
+                skipped.append(entry["segment_name"])
+                print("Skipping empty surface:", entry["segment_name"])
+                continue
+            raise RuntimeError(f"Empty surface: {entry['segment_name']}")
+
+        # Apply the full parent transform chain, including nonlinear transforms.
+        transform_filter = vtk.vtkTransformPolyDataFilter()
+        transform_filter.SetTransform(transforms[node_id])
+        transform_filter.SetInputData(surface)
+        transform_filter.Update()
+        world_surface = vtk.vtkPolyData()
+        world_surface.ShallowCopy(transform_filter.GetOutput())
+        bounds = world_surface.GetBounds()
+        if not all(math.isfinite(x) for x in bounds) or any(bounds[i] > bounds[i + 1] for i in (0, 2, 4)):
+            raise RuntimeError(f"Invalid transformed surface bounds: {entry['segment_name']}")
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(world_surface)
+        mapper.ScalarVisibilityOff()
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        _video_display_properties(node, entry["segment_id"], actor, opacity_override)
+        actor.VisibilityOff()
+        actors.append(actor)
+        kept.append(entry)
+    return actors, kept, skipped
+
+
+def _video_make_renderer(source_renderer, actors, width: int, height: int,
+                   fit_all: bool, padding: float):
+    import vtk
+    renderer = vtk.vtkRenderer()
+    renderer.SetBackground(source_renderer.GetBackground())
+    renderer.SetBackground2(source_renderer.GetBackground2())
+    renderer.SetGradientBackground(source_renderer.GetGradientBackground())
+    renderer.SetTwoSidedLighting(source_renderer.GetTwoSidedLighting())
+    renderer.SetLightFollowCamera(source_renderer.GetLightFollowCamera())
+    if hasattr(renderer, "UseFXAAOn"):
+        renderer.UseFXAAOn()
+    camera = vtk.vtkCamera()
+    camera.DeepCopy(source_renderer.GetActiveCamera())
+    renderer.SetActiveCamera(camera)
+    lights = source_renderer.GetLights()
+    for index in range(lights.GetNumberOfItems()):
+        light = vtk.vtkLight()
+        light.DeepCopy(lights.GetItemAsObject(index))
+        renderer.AddLight(light)
+
+    window = vtk.vtkRenderWindow()
+    window.SetOffScreenRendering(1)
+    window.SetMultiSamples(0)
+    window.SetAlphaBitPlanes(1)
+    window.SetSize(width, height)
+    window.AddRenderer(renderer)
+    if any(actor.GetProperty().GetOpacity() < 1.0 for actor in actors):
+        renderer.SetUseDepthPeeling(1)
+        renderer.SetMaximumNumberOfPeels(100)
+        renderer.SetOcclusionRatio(0.0)
+
+    bounds = [math.inf, -math.inf, math.inf, -math.inf, math.inf, -math.inf]
+    for actor in actors:
+        renderer.AddActor(actor)
+        b = actor.GetBounds()
+        for axis in (0, 2, 4):
+            bounds[axis] = min(bounds[axis], b[axis])
+            bounds[axis + 1] = max(bounds[axis + 1], b[axis + 1])
+    if fit_all:
+        # Fit ONCE using all future geometry; never refit during the reveal.
+        renderer.ResetCamera(bounds)
+        camera.Zoom(1.0 / padding)
+    renderer.ResetCameraClippingRange(bounds)
+    return window, renderer
+
+
+def _video_write_png(window, destination: Path, width: int, height: int):
+    import vtk
+    window.Render()
+    capture = vtk.vtkWindowToImageFilter()
+    capture.SetInput(window)
+    capture.SetInputBufferTypeToRGB()
+    capture.ReadFrontBufferOff()
+    capture.ShouldRerenderOff()
+    capture.Modified()
+    capture.Update()
+    image = capture.GetOutput()
+    if tuple(image.GetDimensions()) != (width, height, 1):
+        raise RuntimeError(f"Unexpected render size {image.GetDimensions()}; expected {(width, height, 1)}.")
+    writer = vtk.vtkPNGWriter()
+    writer.SetFileName(str(destination))
+    writer.SetInputData(image)
+    writer.SetCompressionLevel(3)  # All PNG compression levels are lossless.
+    writer.Write()
+    if writer.GetErrorCode() or not destination.is_file() or destination.stat().st_size == 0:
+        raise RuntimeError(f"Could not write PNG: {destination}")
+
+
+def _video_write_concat(destination: Path, frame_counts, fps: int):
+    # Each image's input timebase must be 1/fps, NOT image2's default 1/25.
+    # The terminal repeated file makes the preceding final duration explicit.
+    lines = ["ffconcat version 1.0"]
+    for index, frames in enumerate(frame_counts):
+        lines += [f"file 'states/state_{index:04d}.png'", f"option framerate {fps}",
+                  f"duration {frames / fps:.12f}"]
+    lines += [f"file 'states/state_{len(frame_counts) - 1:04d}.png'", f"option framerate {fps}"]
+    destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _video_encoder_command(ffmpeg: str, fps: int, total_frames: int, preview: bool):
+    command = [ffmpeg, "-nostdin", "-hide_banner", "-y", "-loglevel", "warning",
+               "-f", "concat", "-safe", "0", "-i", "timeline.ffconcat",
+               "-vf", f"fps={fps}", "-frames:v", str(total_frames), "-an"]
+    if preview:
+        command += ["-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart", "preview.partial.mp4"]
+    else:
+        # Packed BGR with unused padding preserves RGB sample values, unlike
+        # conversion to subsampled YUV. FFV1 encoding itself is lossless.
+        command += ["-c:v", "ffv1", "-level", "3", "-coder", "1", "-context", "1",
+                    "-g", "1", "-slicecrc", "1", "-pix_fmt", "bgr0", "build_lossless.partial.mkv"]
+    return command
+
+
+def _video_encode(command, output: Path, progress, label: str, log_name: str):
+    process = None
+    with (output / log_name).open("w", encoding="utf-8") as log:
+        try:
+            _video_tick(progress, label)
+            process = subprocess.Popen(command, cwd=str(output), stdin=subprocess.DEVNULL,
+                                       stdout=log, stderr=subprocess.STDOUT,
+                                       **_video_subprocess_options())
+            while process.poll() is None:
+                _video_tick(progress)
+                time.sleep(0.05)  # Only services the encoder; NOT animation timing.
+            if process.returncode:
+                log.flush()
+                tail = (output / log_name).read_text(encoding="utf-8", errors="replace")[-4000:]
+                raise RuntimeError(f"FFmpeg failed. PNGs and timeline are retained in {output}.\n{tail}")
+        except BaseException:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            raise
+    partial = output / command[-1]
+    if not partial.is_file() or partial.stat().st_size == 0:
+        raise RuntimeError(f"FFmpeg did not create a usable output: {partial}")
+    complete = partial.with_name(partial.name.replace(".partial", ""))
+    partial.replace(complete)
+    return complete
+
+
+def _video_export(
+    output_dir: Optional[str] = None,
+    *,
+    stem: str,
+    width: int = 3840,
+    height: int = 2160,
+    fps: int = 30,
+    initial_hold_s: float = 1.0,
+    ramp_seconds: float = 8.0,
+    max_views_per_second: float = 5.0,
+    final_hold_s: float = 2.0,
+    fit_all: bool = True,
+    padding: float = 1.05,
+    opacity_override: Optional[float] = None,
+    skip_empty: bool = True,
+    make_mp4: bool = False,
+    ffmpeg_path: Optional[str] = None,
+    view_index: int = 0,
+    segmentation_node_id: Optional[str] = None,
+):
+    """Export a cumulative reveal; return the new output subfolder as a string.
+
+    output_dir=None opens a folder chooser. Every export creates a new dated
+    subfolder, preserving previous exports. One named segment is one addition;
+    radial PatchU0/PatchU1/... segments are therefore separate additions.
+
+    fit_all=True preserves current camera direction/projection, then centers
+    and fits ALL included surfaces once at the output aspect ratio. False
+    retains the current camera position, focal point and zoom; a different
+    output aspect ratio may still change framing.
+
+    make_mp4=True ALSO writes a conventional, lossy H.264 preview. The MKV is
+    always the lossless master. Opacity is preserved unless overridden.
+    Empty nonglobal/nonbase surfaces are skipped and logged by default.
+    """
+    import slicer
+    if not hasattr(slicer, "mrmlScene"):
+        raise RuntimeError("Run this script in 3D Slicer's Python console, not ordinary Python.")
+    import qt
+
+    for name, number in (("width", width), ("height", height), ("fps", fps)):
+        if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+            raise ValueError(f"{name} must be a positive integer.")
+    if min(width, height) < 16:
+        raise ValueError("Output dimensions must be at least 16 pixels.")
+    if make_mp4 and (width % 2 or height % 2):
+        raise ValueError("Use even width and height for the optional yuv420p MP4.")
+    if not stem:
+        raise ValueError("A nonempty stem is required to avoid selecting unrelated data.")
+    for name, value in (("initial_hold_s", initial_hold_s), ("ramp_seconds", ramp_seconds),
+                        ("max_views_per_second", max_views_per_second),
+                        ("final_hold_s", final_hold_s), ("padding", padding)):
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be finite.")
+    if initial_hold_s <= 0 or final_hold_s <= 0 or ramp_seconds < 0 or padding < 1:
+        raise ValueError("Holds must be positive, ramp_seconds >= 0, and padding >= 1.")
+    if not 1.0 / initial_hold_s <= max_views_per_second <= fps:
+        raise ValueError("The maximum addition rate must be between 1/initial_hold_s and fps.")
+    if opacity_override is not None and not 0.0 < opacity_override <= 1.0:
+        raise ValueError("opacity_override must be in (0, 1], or None.")
+
+    entries = _video_discover(stem, segmentation_node_id)
+    layout = slicer.app.layoutManager()
+    if layout is None or view_index < 0 or view_index >= layout.threeDViewCount:
+        raise RuntimeError("Show a 3D view in the Slicer layout before exporting.")
+    view = layout.threeDWidget(view_index).threeDView()
+    view.forceRender()
+    source_renderer = view.renderWindow().GetRenderers().GetItemAsObject(0)
+    ffmpeg = _video_find_ffmpeg(ffmpeg_path)
+    _video_check_encoders(ffmpeg, make_mp4)
+    if output_dir is None:
+        output_dir = qt.QFileDialog.getExistingDirectory(
+            slicer.util.mainWindow(), "Choose parent folder for the video export", str(Path.home()))
+        if not output_dir:
+            return None
+    parent = Path(output_dir).expanduser().resolve()
+    output = parent / ("SlicerBuild_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+    (output / "states").mkdir(parents=True, exist_ok=False)
+
+    progress = qt.QProgressDialog("Preparing surfaces...", "Cancel", 0,
+                                 len(entries) + 3, slicer.util.mainWindow())
+    progress.setWindowTitle("Export cumulative segment video")
+    progress.setWindowModality(qt.Qt.ApplicationModal)
+    progress.setMinimumDuration(0)
+    progress.setAutoClose(False)
+    progress.setAutoReset(False)
+    progress.show()
+    window = None
+    print("Video export folder:", output)
+    try:
+        actors, entries, skipped = _video_make_actors(entries, progress, skip_empty, opacity_override)
+        holds = _video_frame_counts(len(entries), fps, initial_hold_s, ramp_seconds,
+                              max_views_per_second, final_hold_s)
+        total_frames = sum(holds)
+        window, renderer = _video_make_renderer(source_renderer, actors, width, height, fit_all, padding)
+        camera = renderer.GetActiveCamera()
+        metadata = {
+            "stem": stem, "width": width, "height": height, "fps": fps,
+            "total_frames": total_frames, "duration_seconds": total_frames / fps,
+            "ramp_seconds": ramp_seconds, "max_views_per_second": max_views_per_second,
+            "initial_hold_s": initial_hold_s, "final_hold_s": final_hold_s,
+            "fit_all": fit_all, "padding": padding, "opacity_override": opacity_override,
+            "camera": {"position": list(camera.GetPosition()),
+                       "focal_point": list(camera.GetFocalPoint()),
+                       "view_up": list(camera.GetViewUp()),
+                       "parallel_projection": bool(camera.GetParallelProjection()),
+                       "parallel_scale": camera.GetParallelScale(),
+                       "view_angle": camera.GetViewAngle()},
+            "skipped_empty_segments": skipped, "states": [],
+        }
+        start_frame = 0
+        for index, (entry, frames) in enumerate(zip(entries, holds)):
+            metadata["states"].append({
+                "index": index, "png": f"states/state_{index:04d}.png",
+                "view_name": entry["view_name"], "segment_name": entry["segment_name"],
+                "segmentation_node_id": entry["node"].GetID(), "segment_id": entry["segment_id"],
+                "start_frame": start_frame, "start_seconds": start_frame / fps,
+                "hold_frames": frames, "hold_seconds": frames / fps,
+            })
+            start_frame += frames
+        (output / "timeline.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        _video_write_concat(output / "timeline.ffconcat", holds, fps)
+        commands = {"lossless": _video_encoder_command(ffmpeg, fps, total_frames, False)}
+        if make_mp4:
+            commands["preview"] = _video_encoder_command(ffmpeg, fps, total_frames, True)
+        (output / "encoder_commands.json").write_text(json.dumps(commands, indent=2), encoding="utf-8")
+        print(f"{len(entries)} additions; {width} x {height}; {fps} fps; {total_frames / fps:.3f} s video.")
+        for state in metadata["states"]:
+            print(f"  {state['start_seconds']:8.3f} s  + {state['view_name']}"
+                  f"  [{state['hold_frames']} frames]")
+
+        for index, (actor, entry) in enumerate(zip(actors, entries)):
+            _video_tick(progress, f"Rendering {index + 1}/{len(entries)}: {entry['view_name']}", index + 1)
+            actor.VisibilityOn()  # Earlier actors remain visible: cumulative reveal.
+            _video_write_png(window, output / f"states/state_{index:04d}.png", width, height)
+        window.Finalize()
+        window = None
+        _video_tick(progress, "Encoding RGB-lossless FFV1/MKV...", len(entries) + 1)
+        master = _video_encode(commands["lossless"], output, progress,
+                         "Encoding RGB-lossless FFV1/MKV...", "ffmpeg_lossless.log")
+        print("Lossless master:", master)
+        if make_mp4:
+            _video_tick(progress, "Encoding optional H.264 preview...", len(entries) + 2)
+            preview = _video_encode(commands["preview"], output, progress,
+                              "Encoding optional H.264 preview...", "ffmpeg_preview.log")
+            print("Lossy sharing preview:", preview)
+        (output / "EXPORT_COMPLETE.txt").write_text(
+            f"Completed.\nLossless master: {master.name}\n"
+            f"Resolution: {width} x {height}\nFrame rate: {fps}\n"
+            f"Total frames: {total_frames}\nDuration: {total_frames / fps:.6f} seconds\n"
+            "PNGs contain one cumulative state each; timing is in timeline.json.\n",
+            encoding="utf-8")
+        print("Export complete. Original scene visibility and camera were not changed.")
+        slicer.util.showStatusMessage(f"Video export complete: {master}", 10000)
+        return str(output)
+    except BaseException as exc:
+        (output / "EXPORT_INCOMPLETE.txt").write_text(str(exc), encoding="utf-8")
+        print("Export did not complete. Existing files were retained in:", output)
+        raise
+    finally:
+        if window is not None:
+            window.Finalize()
+        progress.close()
+        progress.deleteLater()
+        view.forceRender()
+
+
+def _video_normalized_segment_name(segment_name):
+    """Basename without the importer's file extension or TTA suffix."""
+    name = str(segment_name or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
+    name = re.sub(r"(?:\.seg)?\.nrrd$|\.seg$", "", name, flags=re.IGNORECASE)
+    return re.sub(r"_TTA_a0_fullframe_yolo$", "", name)
+
+
+def _video_candidate_stems(segment_names):
+    """Name prefixes that have all three exact base views."""
+    bases_by_stem = {}
+    for segment_name in segment_names:
+        name = _video_normalized_segment_name(segment_name)
+        for base in _VIDEO_BASE_ORDER:
+            if name.endswith(base) and len(name) > len(base):
+                bases_by_stem.setdefault(name[:-len(base)], set()).add(base)
+    return sorted(
+        (stem for stem, bases in bases_by_stem.items()
+         if bases.issuperset(_VIDEO_BASE_ORDER)),
+        key=_video_natural_key,
+    )
+
+
+def _video_choose_stem():
+    segment_names = []
+    for node in slicer.util.getNodesByClass("vtkMRMLSegmentationNode"):
+        segmentation = node.GetSegmentation()
+        for segment_id in _segment_ids(segmentation):
+            segment_names.append(segmentation.GetSegment(segment_id).GetName() or "")
+    if not segment_names:
+        raise RuntimeError("Build Video: no segmentation is loaded. Run Importer first.")
+    stems = _video_candidate_stems(segment_names)
+    if not stems:
+        raise RuntimeError(
+            "Build Video: no Transverse, Sagittal and Coronal segments share one "
+            "name prefix. Load the view segments and run Importer first."
+        )
+    if len(stems) == 1:
+        return stems[0]
+    return _choose_item("Build Video", "Dataset name prefix:", stems)
+
+
+def BuildVideo(output_dir=None, *, stem=None, **options):
+    """Export the cumulative build video; return its folder, or None if cancelled.
+
+    The dataset prefix is detected from the Transverse/Sagittal/Coronal segment
+    names. output_dir=None opens a folder chooser. Other keyword options (fps,
+    width, height, make_mp4, ...) are passed to _video_export.
+    """
+    if stem is None:
+        stem = _video_choose_stem()
+        if stem is None:
+            return None
+    try:
+        return _video_export(output_dir, stem=stem, **options)
+    except _VideoExportCancelled as exc:
+        slicer.util.showStatusMessage(str(exc), 8000)
+        return None
+
+
 # ── Toolbar ───────────────────────────────────────────────────────────
 
 
@@ -2546,8 +3477,9 @@ main_window.addToolBar(toolbar)
 
 _TOOLBAR_ACTIONS = [
     ("Importer", BryanImporter),
-    ("Show All", ShowAll),
-    ("Hide All", HideAll),
+    (_TOGGLE_HIDE_LABEL, ToggleAll),
+    ("Highlight", Highlight),
+    ("Build Video", BuildVideo),
     ("Update Global", UpdateGlobal),
     ("Update Nonglobal", UpdateNonGlobal),
     ("Update Both", UpdateBoth),
@@ -2567,10 +3499,23 @@ toolbar_actions = []
 toolbar_buttons = []
 for index, (label, function) in enumerate(_TOOLBAR_ACTIONS):
     action = qt.QAction(label, main_window)
-    if function in (HideAll, ShowAll):
+    if function == ToggleAll:
         action.setToolTip(
-            f"{label}: toggle all segments, including Global, in every segmentation "
-            "node. Preserve 2D/3D display styles; leave volumes and markers alone."
+            "Show or hide all segments, including Global, in every segmentation "
+            "node; the label names the next action. Preserve 2D/3D display "
+            "styles; leave volumes and markers alone."
+        )
+        _toggle_all_action = action
+    elif function == Highlight:
+        action.setToolTip(
+            "Outline a model's silhouette in every 3D view. With several models, "
+            "choose one. Click again on an outlined model to remove its outline."
+        )
+    elif function == BuildVideo:
+        action.setToolTip(
+            "Export a cumulative Transverse, Sagittal, Coronal, ... segment-reveal "
+            "video (4K, 30 fps, lossless FFV1/MKV plus PNG states). Requires FFmpeg. "
+            "Scene visibility and camera are not changed."
         )
     elif function == RemoveSlices:
         action.setToolTip(

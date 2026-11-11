@@ -46,10 +46,30 @@ a full payload validation.
 
 `--output-dir` selects a separate destination for one volume. It allows an edited
 reconstruction to be inspected without replacing an existing native-recovery
-input. The filtered source still comes from the requested training generation.
+input. `--bundle-dir` selects an explicit filtered bundle for validation or
+preparation; otherwise the legacy generation/stem layout remains available.
 Input and output identities, helper hashes, written-mask audits, and the explicit
 `edited_preview_global` authority are recorded in `preparation.json`.
 `--intensity-mode copy` retains the verified independent video-copy workflow.
+
+For the separate training directories, `tools/prepper.sh` uses
+`images/<dataset>/<video>.mkv`, `filtered/<generation>/<dataset>/`, and
+`labels/<generation>/<dataset>/`. It defaults to generation `v1.1`, dataset
+`F3_20_2_3_2026`, and video `F3_20_2_3_2026_S1S0.mkv`. The source identity stem
+remains `F3_20_2_3_2026_S1S0_8bit_Y`, while `--output-stem F3_20_2_3_2026`
+names the label. `--intensity-mode reference` leaves the video in `images/`
+and publishes only the NRRD and `preparation.json` under `labels/`; the receipt
+records and validates the original video reference. With `--smoke --smoke-script
+/path/to/pta_launcher.py`, the video and prepared NRRD are copied into
+`/tmp/pta-smoke` with matching basenames, and PTA uses that directory as input.
+The copies remain there between runs; no job ID is added to the directory name.
+
+Keep `prepper.sh`, `prepare_pta_input.py`, and `xta_edited_shape.py` together when
+copying them to the cluster. Submit `sbatch prepper.sh --validate-only` to check
+the bundle and video dimensions, then `sbatch prepper.sh` to prepare the label.
+The cluster root defaults to `/project/community/sanghyus`; `ROOT`,
+`TRAINING_ROOT`, and the path variables documented in the script can override it.
+NumPy, SciPy, and ffprobe are required; ISA-L is optional.
 
 This reconstruction is separate from PTA preprocessing. Passing
 `--enable_2D_hole_fill` to PTA deliberately closes enclosed native-plane holes

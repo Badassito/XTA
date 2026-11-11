@@ -123,6 +123,34 @@ def test_all_empty_shortcut_never_enters_gpu(tmp_path):
     assert result and not any(result.values())
 
 
+@pytest.mark.parametrize('change', ['nrrd', 'void_fill', 'gaussian', 'semantic', 'selected'])
+def test_reasserted_anchor_support_skips_full_render_mask_scan(tmp_path, change):
+    prep = prepared(tmp_path, semantic=change == 'semantic')
+    if change == 'void_fill':
+        prep.void_fill_stats = {'added_voxels': 0, 'reason': 'skipped_proven_noop_after_2d_hole_fill'}
+    elif change == 'gaussian':
+        prep.smoothing_stats = [{'sigma': 1.}]
+    plan = prep.plans[0]
+    selected = [pta.OutputCandidate(order=0, volume_name='sample', parent_view_tag=plan.tag,
+        output_tag=plan.tag, item_key='full', frame_idx=2, is_tile=False,
+        label_enabled=True)] if change == 'selected' else None
+    expected = pta.classify_original_foregrounds_for_volume(prep, workers=1, selected_candidates=selected)
+    prep.foreground_preservation_stats['guaranteed_output_foreground_transverse_slices'] = 3
+    real = {'any': np.any, 'count_nonzero': np.count_nonzero}
+
+    def guarded(name):
+        def scan(value, *args, **kwargs):
+            assert value is not prep.mask_for_render, 'scanned the full render mask'
+            return real[name](value, *args, **kwargs)
+        return scan
+
+    with mock.patch.object(pta.np, 'any', side_effect=guarded('any')), \
+            mock.patch.object(pta.np, 'count_nonzero', side_effect=guarded('count_nonzero')):
+        actual = pta.classify_original_foregrounds_for_volume(prep, workers=1, selected_candidates=selected)
+    assert actual == expected
+    assert any(actual.values())
+
+
 def test_predecoded_polygon_jobs_stay_on_geometry_shortcut(tmp_path):
     prep = prepared(tmp_path)
     prep.src.label_source = 'yolo'
@@ -138,9 +166,10 @@ class StopAtClassification(Exception):
 
 
 @pytest.mark.parametrize('gpu_active,pending_a,pending_b,expected_pool', [
-    (True, 0, 0, True), (True, 1, 0, False), (True, 0, 1, False), (False, 0, 0, False),
+    (True, 0, 0, True), (True, 1, 0, True), (True, 0, 1, True), (False, 0, 0, False), (False, 1, 0, False),
 ])
-def test_real_parent_planner_uses_gpu_pool_only_when_idle(gpu_active, pending_a, pending_b, expected_pool):
+def test_real_parent_planner_uses_gpu_pool_even_while_a_volume_renders(gpu_active, pending_a, pending_b, expected_pool):
+    # A pipelined volume queues behind the rendering one instead of using CPU.
     source = (Path(pta.__file__)).read_text(encoding='utf-8')
     node = next(n for n in ast.walk(ast.parse(source))
         if isinstance(n, ast.FunctionDef) and n.name == '_plan_volume_with_budget')
@@ -162,7 +191,8 @@ def test_real_parent_planner_uses_gpu_pool_only_when_idle(gpu_active, pending_a,
         effective_pipeline_depth=2, dataset_publication_selected=True, fraction=1.,
         enumerate_candidates_for_volume=lambda *a,**kw:[], background_filter_requested=False,
         classify_original_foregrounds_for_volume=classify, augmentation=None, gpu_offline_active=gpu_active,
-        render_pool=pool, states={}, progress_by_gen={0:SimpleNamespace(pending_a=pending_a,pending_b=pending_b)})
+        render_pool=pool, states={}, progress_by_gen={0:SimpleNamespace(pending_a=pending_a,pending_b=pending_b)},
+        resolve_volume_options=pta.resolve_volume_options)
     exec(compile(ast.fix_missing_locations(module),'<actual PTA classification dispatch>','exec'),namespace)
     with pytest.raises(StopAtClassification):
         namespace['build']()(3, 4)

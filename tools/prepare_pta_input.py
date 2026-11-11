@@ -8,6 +8,7 @@ is separate from optional strict native evidence transfer and edited-shape mode.
 from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
+from fractions import Fraction
 import gzip
 import hashlib
 import importlib.util
@@ -63,16 +64,62 @@ def child(directory, filename):
         raise ValueError(f'Missing/nonregular bundle member: {p}')
     return p
 
-def load_bundle(bundle_dir, stem, mask_source='global'):
+def preview_cut_columns(marker_ras, low_xyz, native_xyz):
+    """First voxel centers strictly to the right in a standard axial XTA view."""
+    r, a, s = marker_ras
+    half = Fraction(1, 2)
+    for index, size in zip((-r, -a, s), low_xyz):
+        if not -half <= index < size - half:
+            raise ValueError(f"Marker RAS lies outside the original preview (XYZ {low_xyz}).")
+    native_i = (-r + half) * native_xyz[0] / low_xyz[0] - half
+    return math.floor(-r) + 1, math.floor(native_i) + 1
+
+
+def axial_crop_geometry(edits, manifest, low, full):
+    """Validate a derived crop while retaining the original sampling lattice."""
+    crop=edits.get('axial_crop')
+    if not isinstance(crop,dict):raise ValueError('Cropped edit bundle needs axial_crop geometry.')
+    original_low=shape3(crop.get('original_preview_shape_tyx'))
+    original_full=shape3(crop.get('original_full_quality_shape_tyx'))
+    if (original_low!=shape3(manifest['output_shape_tyx'])
+            or original_full!=shape3(manifest['full_quality_output_shape_tyx'])
+            or any(l>f for l,f in zip(original_low,original_full))):
+        raise ValueError('Cropped bundle original geometry differs from its source manifest.')
+    preview_i=crop.get('first_removed_preview_i');native_i=crop.get('first_removed_native_i')
+    if (type(preview_i) is not int or type(native_i) is not int
+            or not 0<preview_i<=original_low[2] or not 0<native_i<original_full[2]
+            or low!=(*original_low[:2],preview_i) or full!=(*original_full[:2],native_i)):
+        raise ValueError('Cropped bundle widths disagree with its declared cut columns.')
+    marker=crop.get('marker_preview_ras')
+    if (not isinstance(marker,list) or len(marker)!=3
+            or any(type(v) not in (int,float) or not math.isfinite(v) for v in marker)):
+        raise ValueError('Cropped bundle needs three finite marker RAS coordinates.')
+    exact=crop.get('marker_preview_ras_exact')
+    if exact is not None:
+        if not isinstance(exact,list) or len(exact)!=3 or any(not isinstance(v,str) for v in exact):
+            raise ValueError('Exact crop marker RAS needs three rational strings.')
+        coordinates=tuple(Fraction(v) for v in exact)
+        if not np.allclose([float(v) for v in coordinates],marker,rtol=1e-12,atol=0):
+            raise ValueError('Exact crop marker RAS differs from its numeric coordinates.')
+    else:coordinates=tuple(Fraction(str(v)) for v in marker)
+    if preview_cut_columns(coordinates, original_low[::-1], original_full[::-1]) != (preview_i, native_i):
+        raise ValueError('Crop columns do not match the marker plane on the original lattice.')
+    if not isinstance(crop.get('source_edits_sha256'),str) or not re.fullmatch(r'[0-9a-f]{64}',crop['source_edits_sha256']):
+        raise ValueError('Cropped bundle needs its original edits.json SHA256.')
+    return crop
+
+def load_bundle(bundle_dir, stem, mask_source='global', *, allow_empty_global=False):
     edits_path = child(bundle_dir, 'edits.json')
     manifest_path = child(bundle_dir, 'source_manifest.json')
     e, m = read_json(edits_path), read_json(manifest_path)
-    if e.get('format') != 'xta-slicer-edits-v1' or m.get('quality') != 'low_quality':
+    bundle_format=e.get('format')
+    if bundle_format not in {'xta-slicer-edits-v1','xta-slicer-edits-axial-crop-v1'} or m.get('quality') != 'low_quality':
         raise ValueError('Expected a Slicer edit bundle and its low_quality source manifest.')
     if digest(manifest_path) != e.get('source_manifest_sha256'):
         raise ValueError('Source-manifest hash does not match edits.json.')
     low, full = shape3(e['preview_shape_tyx']), shape3(e['full_quality_shape_tyx'])
-    if low != shape3(m['output_shape_tyx']) or full != shape3(m['full_quality_output_shape_tyx']):
+    crop=axial_crop_geometry(e,m,low,full) if bundle_format=='xta-slicer-edits-axial-crop-v1' else None
+    if crop is None and (low != shape3(m['output_shape_tyx']) or full != shape3(m['full_quality_output_shape_tyx'])):
         raise ValueError('Bundle and manifest shapes disagree.')
     if any(l > f for l, f in zip(low, full)):
         raise ValueError('Preview exceeds the requested source dimensions.')
@@ -106,7 +153,7 @@ def load_bundle(bundle_dir, stem, mask_source='global'):
     if len(globals_) != 1:raise ValueError('Expected exactly one Global_final_output in the edited bundle.')
     if mask_source == 'global':
         selected=globals_
-        if not globals_[0].get('foreground_voxels',0):
+        if not allow_empty_global and not globals_[0].get('foreground_voxels',0):
             raise ValueError('Global is empty: update Global from the intended edited layers in Slicer, inspect it, and re-export the bundle. Components mode is explicit, never an automatic fallback.')
         excluded += [{'name':s['name'],'reason':'Global selected; component snapshots are provenance only'} for s in components]
     else:
@@ -118,9 +165,15 @@ def load_bundle(bundle_dir, stem, mask_source='global'):
                   'preview_shape_tyx': list(low), 'source_shape_tyx': list(full),
                   'snapshots': snapshots, 'excluded_segments': excluded,
                   'selected_segment_names': [s['name'] for s in selected]}
+    if crop is not None:provenance.update(bundle_format=bundle_format,axial_crop=crop)
     return low, full, selected, provenance
 
-def insert_snapshot(target, path, entry, max_snapshot_bytes):
+def read_snapshot(path, entry, preview_shape_tyx, max_snapshot_bytes=512*MIB):
+    """Read a validated mask and its extent on the original preview lattice.
+
+    Background padding outside the preview is discarded. Any foreground outside
+    that field of view is rejected before a caller can mutate its target.
+    """
     # Check decompressed member sizes before NumPy allocates an NPZ member.
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
@@ -131,42 +184,60 @@ def insert_snapshot(target, path, entry, max_snapshot_bytes):
         if any(archive.getinfo(k).file_size > MIB for k in ('extent_xyz.npy','ijk_to_ras.npy')):
             raise ValueError('Oversized geometry metadata.')
     with np.load(path, allow_pickle=False) as z:
-        a, extent, affine = z['mask'], z['extent_xyz'], z['ijk_to_ras']
-        if a.dtype != np.uint8 or a.ndim != 3 or a.nbytes > max_snapshot_bytes:
-            raise ValueError('Snapshot must be a bounded 3D uint8 binary mask.')
-        count = 0
-        for plane in a:
-            if np.any(plane > 1): raise ValueError('Snapshot is not binary.')
-            count += int(np.count_nonzero(plane))
-        if count != entry.get('foreground_voxels'):
-            raise ValueError('Snapshot foreground count differs from edits.json.')
-        if a.size == 0:
-            if count != 0: raise ValueError('Invalid empty snapshot.')
-            return 0
-        if extent.shape != (6,) or extent.dtype.kind not in 'iu':
-            raise ValueError('Extent must have six integer XYZ entries.')
-        if tuple((extent[1::2]-extent[::2]+1)[::-1]) != a.shape:
-            raise ValueError('Snapshot extent/array shape mismatch.')
-        if affine.shape != (4,4) or not np.isfinite(affine).all():
-            raise ValueError('Invalid snapshot affine.')
-        rel = REFERENCE_RAS @ affine
-        if not np.allclose(rel[:3,:3],np.eye(3),rtol=0,atol=1e-5) or not np.allclose(rel[3],[0,0,0,1],rtol=0,atol=1e-7):
-            raise ValueError('Edited lattice was rotated/resampled; expected XTA unit-LPS preview lattice.')
-        offset = np.rint(rel[:3,3])
-        if not np.allclose(offset,rel[:3,3],rtol=0,atol=1e-5) or np.max(np.abs(offset)) > 2**40:
-            raise ValueError('Edited origin is not an integer preview-lattice offset.')
-        start = (extent[::2]+offset.astype(np.int64))[::-1]
-        lo, hi = np.maximum(start,0), np.minimum(start+np.array(a.shape),target.shape)
-        inside_count = 0
-        if np.all(hi > lo):
-            src = tuple(slice(int(l-s),int(h-s)) for l,h,s in zip(lo,hi,start))
-            dst = tuple(slice(int(l),int(h)) for l,h in zip(lo,hi))
-            view=a[src]
-            inside_count=int(np.count_nonzero(view))
-            np.bitwise_or(target[dst],view,out=target[dst])
-        if inside_count != count:
+        mask, extent, affine = z['mask'], z['extent_xyz'], z['ijk_to_ras']
+    if mask.dtype != np.uint8 or mask.ndim != 3 or mask.nbytes > max_snapshot_bytes:
+        raise ValueError('Snapshot must be a bounded 3D uint8 binary mask.')
+    count = 0
+    for plane in mask:
+        if np.any(plane > 1):
+            raise ValueError('Snapshot is not binary.')
+        count += int(np.count_nonzero(plane))
+    if count != entry.get('foreground_voxels'):
+        raise ValueError('Snapshot foreground count differs from edits.json.')
+    empty_extent = np.asarray([0, -1, 0, -1, 0, -1], dtype=np.int64)
+    # Slicer may give an empty segment an arbitrary image geometry.
+    if mask.size == 0:
+        return np.empty((0, 0, 0), dtype=np.uint8), empty_extent
+    if extent.shape != (6,) or extent.dtype.kind not in 'iu':
+        raise ValueError('Extent must have six integer XYZ entries.')
+    limits = tuple(int(value) for value in extent)
+    if any(abs(value) > 2**40 for value in limits):
+        raise ValueError('Snapshot extent is outside the supported preview lattice.')
+    lengths = tuple(limits[i + 1] - limits[i] + 1 for i in (0, 2, 4))
+    if lengths[::-1] != mask.shape:
+        raise ValueError('Snapshot extent/array shape mismatch.')
+    if affine.shape != (4, 4) or affine.dtype.kind not in 'iuf' or not np.isfinite(affine).all():
+        raise ValueError('Invalid snapshot affine.')
+    relation = REFERENCE_RAS @ affine
+    if (not np.allclose(relation[:3, :3], np.eye(3), rtol=0, atol=1e-5)
+            or not np.allclose(relation[3], [0, 0, 0, 1], rtol=0, atol=1e-7)):
+        raise ValueError('Edited lattice was rotated/resampled; expected XTA unit-LPS preview lattice.')
+    offset = np.rint(relation[:3, 3])
+    if not np.allclose(offset, relation[:3, 3], rtol=0, atol=1e-5) or np.max(np.abs(offset)) > 2**40:
+        raise ValueError('Edited origin is not an integer preview-lattice offset.')
+    start = (np.asarray(limits[::2], dtype=np.int64) + offset.astype(np.int64))[::-1]
+    low = np.maximum(start, 0)
+    high = np.minimum(start + np.asarray(mask.shape), preview_shape_tyx)
+    if np.any(high <= low):
+        if count:
             raise ValueError('Edited foreground lies outside the declared preview FOV; no clipping allowed.')
-        return count
+        return np.empty((0, 0, 0), dtype=np.uint8), empty_extent
+    region = tuple(slice(int(lo - origin), int(hi - origin)) for lo, hi, origin in zip(low, high, start))
+    inside = mask[region]
+    if int(np.count_nonzero(inside)) != count:
+        raise ValueError('Edited foreground lies outside the declared preview FOV; no clipping allowed.')
+    world_extent = np.empty(6, dtype=np.int64)
+    world_extent[::2] = low[::-1]
+    world_extent[1::2] = high[::-1] - 1
+    return inside, world_extent
+
+
+def insert_snapshot(target, path, entry, max_snapshot_bytes):
+    mask, extent = read_snapshot(path, entry, target.shape, max_snapshot_bytes)
+    if mask.size:
+        region = tuple(slice(int(lo), int(hi) + 1) for lo, hi in zip(extent[::2][::-1], extent[1::2][::-1]))
+        np.bitwise_or(target[region], mask, out=target[region])
+    return entry['foreground_voxels']
 
 def cubic_axis(low, full):
     """Keys/Catmull-Rom cubic weights (a=-0.5), zero outside input FOV."""
@@ -253,6 +324,45 @@ def validate_nrrd(path, full, expected=None):
         raise ValueError('Prepared NRRD length/count/hash validation failed.')
     return actual
 
+def crop_reconstructed_nrrd(source, destination, original_full, full, original_mask, crop, block_mib):
+    """Crop validated native rows without changing their original sample positions."""
+    original_width=original_full[2];width=full[2]
+    header=(f'NRRD0005\n# Native-grid axial crop after original-lattice reconstruction\n'
+            f'type: unsigned char\ndimension: 3\nspace: left-posterior-superior\n'
+            f'sizes: {width} {full[1]} {full[0]}\nspace directions: (1,0,0) (0,1,0) (0,0,1)\n'
+            f'kinds: domain domain domain\nencoding: gzip\nspace origin: (0,0,0)\n\n')
+    verify_compressed_identity(source,original_mask)
+    rows=max(1,int(min(8, block_mib)*MIB//original_width))
+    remaining=original_full[0]*original_full[1]
+    input_hash=hashlib.sha256();output_hash=hashlib.sha256();count=0
+    with source.open('rb') as raw, destination.open('xb') as output:
+        header_bytes=0
+        while True:
+            line=raw.readline();header_bytes+=len(line)
+            if not line or header_bytes>65536:raise ValueError('Invalid reconstruction header during crop.')
+            if line in (b'\n',b'\r\n'):break
+        output.write(header.encode('ascii'))
+        with gzip.GzipFile(fileobj=raw,mode='rb') as decoded, gzip.GzipFile(filename='',fileobj=output,mode='wb',compresslevel=1,mtime=0) as encoded:
+            while remaining:
+                n=min(rows,remaining);data=decoded.read(n*original_width)
+                if len(data)!=n*original_width:raise ValueError('Truncated reconstruction during crop.')
+                input_hash.update(data)
+                retained=np.frombuffer(data,np.uint8).reshape(n,original_width)[:,:width]
+                written=retained.tobytes();encoded.write(written);output_hash.update(written)
+                count+=int(np.count_nonzero(retained));remaining-=n
+            if decoded.read(1):raise ValueError('Reconstruction exceeds its original shape during crop.')
+    if input_hash.hexdigest()!=original_mask['binary_payload_sha256']:
+        raise ValueError('Reconstruction changed while its cropped payload was written.')
+    result={'shape_tyx':list(full),'foreground_voxels':count,'binary_payload_sha256':output_hash.hexdigest(),
+            'sha256':digest(destination),'bytes':destination.stat().st_size}
+    validate_nrrd(destination,full,result)
+    result.update(axial_crop=crop,pre_crop_mask=original_mask,
+                  crop_audit={'sampling':'unchanged native voxel values; high-X columns removed',
+                              'original_shape_tyx':list(original_full),'retained_width':width,
+                              'written_payload_verified':True})
+    source.unlink()
+    return result
+
 def probe_source(path, ffprobe):
     cmd=[ffprobe,'-v','error','-select_streams','v:0','-show_entries','stream=width,height,nb_frames','-of','json',str(path)]
     result=json.loads(subprocess.check_output(cmd,text=True))
@@ -286,6 +396,9 @@ def source_identity(path, *, hashed=False):
     return result
 
 def publish_intensity(source, destination, mode, identity):
+    if mode=='reference':
+        return {'method':'reference','source':str(source),
+                'bytes':identity['bytes'],'sha256':identity['sha256']}
     if mode=='symlink':
         destination.symlink_to(source)
         return {'method':'symlink','source':str(source)}
@@ -364,13 +477,24 @@ def native_quality(report):
              'auto_removed_voxels','final_global_voxels','warnings') if key in report}
 
 
-def edited_shape_quality(mask, low, full, foreground, contract):
+def edited_shape_quality(mask, low, full, foreground, contract, crop=None):
     """Require the known writer's actual-byte audit before trusting its result.
 
     This checks the writer/receipt contract, not a second numerical audit. The
     in-process helper already rereads every native payload byte and checks its
     hash, binary values, edited centers, background cells and 6-components.
     """
+    if crop is not None:
+        original_low=shape3(crop['original_preview_shape_tyx'])
+        original_full=shape3(crop['original_full_quality_shape_tyx'])
+        audit=mask.get('crop_audit',{})
+        if (mask.get('axial_crop')!=crop or mask.get('shape_tyx')!=list(full)
+                or audit.get('original_shape_tyx')!=list(original_full)
+                or audit.get('retained_width')!=full[2] or audit.get('written_payload_verified') is not True
+                or 'reconstruction' in mask):
+            raise ValueError('Cropped edited-shape result lacks its native-grid crop audit.')
+        edited_shape_quality(mask.get('pre_crop_mask',{}),original_low,original_full,foreground,contract)
+        return
     reconstruction=mask.get('reconstruction',{})
     centers=reconstruction.get('center_roundtrip',{})
     separation=reconstruction.get('separation_audit',{})
@@ -410,10 +534,19 @@ def output_path(args,stem,base):
         return path.parent.resolve()/path.name
     return base/(stem+'_Input')
 
+def bundle_path(args,stem,base):
+    # Preserve the final component so an explicit symlink cannot hide a bundle.
+    if args.bundle_dir:
+        path=Path(args.bundle_dir).absolute()
+        return path.parent.resolve()/path.name
+    return base/(stem+'_Filtered')
+
 def prepare(args, stem, log_dir):
     safe_name(stem)
     root=Path(args.root).resolve();base=Path(args.training_root).resolve()/safe_name(args.generation)
-    bundle=base/(stem+'_Filtered'); output=output_path(args,stem,base)
+    bundle=bundle_path(args,stem,base); output=output_path(args,stem,base)
+    label_stem=safe_name(args.output_stem) if args.output_stem else stem
+    hashed_source=args.intensity_mode in {'copy','reference'}
     source=Path(args.source_video).resolve() if args.source_video else root/(stem+'.mkv')
     if not source.is_file():raise ValueError(f'Missing original intensity: {source}')
     if bundle.is_symlink() or not bundle.is_dir():raise ValueError(f'Missing regular filtered bundle: {bundle}')
@@ -425,8 +558,13 @@ def prepare(args, stem, log_dir):
     preserve_completed_stage=False
     try:
         low,full,selected,bundle_prov=load_bundle(bundle,stem,args.mask_source)
-        if math.prod(low)>args.max_preview_mib*MIB:raise ValueError('Preview exceeds configured union allocation budget.')
-        source_stat=source_identity(source,hashed=args.intensity_mode=='copy')
+        crop=bundle_prov.get('axial_crop')
+        if crop is not None and args.mode=='native':
+            raise ValueError('Derived cropped edit bundles support edited_shape or upscale preparation.')
+        reconstruction_low=shape3(crop['original_preview_shape_tyx']) if crop else low
+        reconstruction_full=shape3(crop['original_full_quality_shape_tyx']) if crop else full
+        if math.prod(reconstruction_low)>args.max_preview_mib*MIB:raise ValueError('Preview exceeds configured union allocation budget.')
+        source_stat=source_identity(source,hashed=hashed_source)
         probe=probe_source(source,args.ffprobe)
         if tuple(probe['shape_tyx'])!=full:raise ValueError(f'Original intensity dimensions differ from bundle: {probe["shape_tyx"]} != {full}')
         native=native_contract(args,stem,bundle) if args.mode=='native' else None
@@ -436,6 +574,7 @@ def prepare(args, stem, log_dir):
                   'preparation_algorithm_version':VERSION,'generation':args.generation,'bundle':bundle_prov,'intensity':source_stat,'native':native}
         if shape_contract:identity['edited_shape']=shape_contract
         if args.intensity_mode!='symlink':identity['intensity_mode']=args.intensity_mode
+        if args.output_stem:identity['output_stem']=label_stem
         if output.exists() or output.is_symlink():
             if output.is_symlink() or not output.is_dir():raise ValueError('Existing Input must be a regular directory.')
             receipt=read_json(output/'preparation.json')
@@ -443,18 +582,24 @@ def prepare(args, stem, log_dir):
                 raise ValueError('Existing input provenance differs; nothing overwritten. Use a new generation or inspect it.')
             if args.mode=='native':native_quality(receipt.get('native_quality',{}))
             if shape_contract:
-                edited_shape_quality(receipt['mask'],low,full,selected[0]['foreground_voxels'],shape_contract)
-            if {p.name for p in output.iterdir()}!={stem+'.mkv',stem+'.nrrd','preparation.json'}:
+                edited_shape_quality(receipt['mask'],low,full,selected[0]['foreground_voxels'],shape_contract,crop)
+            expected_files={label_stem+'.nrrd','preparation.json'}
+            if args.intensity_mode!='reference':expected_files.add(label_stem+'.mkv')
+            if {p.name for p in output.iterdir()}!=expected_files:
                 raise ValueError('Existing Input contains unexpected files; refuse ambiguous PTA discovery.')
-            intensity=output/(stem+'.mkv')
+            intensity=output/(label_stem+'.mkv')
             if args.intensity_mode=='symlink':
                 if not intensity.is_symlink() or intensity.resolve()!=source.resolve():raise ValueError('Existing intensity link has changed.')
+            elif args.intensity_mode=='reference':
+                if receipt.get('intensity_publication')!={'method':'reference','source':str(source),
+                        'bytes':source_stat['bytes'],'sha256':source_stat['sha256']}:
+                    raise ValueError('Existing referenced intensity identity has changed.')
             elif (intensity.is_symlink() or not intensity.is_file() or intensity.stat().st_size!=source_stat['bytes']
                   or digest(intensity)!=source_stat['sha256'] or receipt.get('intensity_publication')!=
                   {'method':'copy','source':str(source),'bytes':source_stat['bytes'],'sha256':source_stat['sha256']}):
                 raise ValueError('Existing copied intensity identity has changed.')
-            validate_nrrd(output/(stem+'.nrrd'),full,receipt['mask'])
-            if source_identity(source,hashed=args.intensity_mode=='copy')!=source_stat:
+            validate_nrrd(output/(label_stem+'.nrrd'),full,receipt['mask'])
+            if source_identity(source,hashed=hashed_source)!=source_stat:
                 raise ValueError('Inputs changed during existing-input verification.')
             _,_,_,after=load_bundle(bundle,stem,args.mask_source)
             if (after!=bundle_prov or (args.mode=='native' and native_contract(args,stem,bundle)!=native)
@@ -466,20 +611,25 @@ def prepare(args, stem, log_dir):
         count=None
         quality=None
         if args.mode in {'upscale','edited_shape'}:
-            preview=np.zeros(low,np.uint8)
+            preview=np.zeros(reconstruction_low,np.uint8)
             for i,entry in enumerate(selected,1):
-                insert_snapshot(preview,child(bundle,entry['file']),entry,args.max_snapshot_mib*MIB)
+                insert_snapshot(preview[:,:,:low[2]],child(bundle,entry['file']),entry,args.max_snapshot_mib*MIB)
                 print(f'{stem}: selected snapshot {i}/{len(selected)} {entry["name"]}',flush=True)
             count=int(np.count_nonzero(preview))
             if not count:raise ValueError('Selected preview is empty; no output published.')
-            mask=(shape_module.write_edited_shape(stage/(stem+'.nrrd'),preview,full,
+            reconstructed_path=stage/(label_stem+('.uncropped.nrrd' if crop else '.nrrd'))
+            mask=(shape_module.write_edited_shape(reconstructed_path,preview,reconstruction_full,
                     block_mib=args.block_mib,workers=args.workers) if shape_module else
-                  write_upscaled(stage/(stem+'.nrrd'),preview,full,args.block_mib))
+                  write_upscaled(reconstructed_path,preview,reconstruction_full,args.block_mib))
             del preview
             if shape_contract:
-                edited_shape_quality(mask,low,full,count,shape_contract)
+                edited_shape_quality(mask,reconstruction_low,reconstruction_full,count,shape_contract)
             else:
-                validate_nrrd(stage/(stem+'.nrrd'),full,mask)
+                validate_nrrd(reconstructed_path,reconstruction_full,mask)
+            if crop:
+                mask=crop_reconstructed_nrrd(reconstructed_path,stage/(label_stem+'.nrrd'),
+                                            reconstruction_full,full,mask,crop,args.block_mib)
+                if shape_contract:edited_shape_quality(mask,low,full,count,shape_contract,crop)
         else:
             native_out=stage/'native-output'
             scratch_root=Path(args.scratch_root).resolve();scratch_root.mkdir(parents=True,exist_ok=True)
@@ -498,7 +648,7 @@ def prepare(args, stem, log_dir):
                 quality=native_quality(read_json(native_out/'report.json'))
                 mask=validate_nrrd(native_out/(stem+'.nrrd'),full)
                 if not mask['foreground_voxels']:raise ValueError('Native output is empty; diagnostics retained, no PTA input published.')
-                shutil.move(str(native_out/(stem+'.nrrd')),str(stage/(stem+'.nrrd')))
+                shutil.move(str(native_out/(stem+'.nrrd')),str(stage/(label_stem+'.nrrd')))
                 native_success=True
             except BaseException:
                 if (native_out/'report.json').is_file():shutil.copyfile(native_out/'report.json',log_dir/(stem+'.native-report.json'))
@@ -510,14 +660,14 @@ def prepare(args, stem, log_dir):
                 if native_success and scratch.parent==scratch_root and scratch.name.startswith('pta-native-'+stem+'-'):shutil.rmtree(scratch)
             shutil.move(str(native_out),str(log_dir/(stem+'.native-diagnostics')))
         if not mask['foreground_voxels']:raise ValueError('Prepared mask is empty; no PTA input published.')
-        intensity_publication=publish_intensity(source,stage/(stem+'.mkv'),args.intensity_mode,source_stat)
+        intensity_publication=publish_intensity(source,stage/(label_stem+'.mkv'),args.intensity_mode,source_stat)
         # Detect source and bundle changes before making output visible.
         _,_,_,after=load_bundle(bundle,stem,args.mask_source)
-        if (after!=bundle_prov or source_identity(source,hashed=args.intensity_mode=='copy')!=source_stat
+        if (after!=bundle_prov or source_identity(source,hashed=hashed_source)!=source_stat
                 or (args.mode=='native' and native_contract(args,stem,bundle)!=native)
                 or (shape_contract and edited_shape_contract()[1]!=shape_contract)):
             raise ValueError('Inputs changed during preparation; output not published.')
-        if shape_contract:verify_compressed_identity(stage/(stem+'.nrrd'),mask)
+        if shape_contract:verify_compressed_identity(stage/(label_stem+'.nrrd'),mask)
         receipt={'format':SCHEMA,'tool_version':VERSION,'status':'complete','created_utc':datetime.now(timezone.utc).isoformat(),
                  'identity':identity,'source_probe':probe,'mask':mask,'preview_union_foreground_voxels':count,
                  'algorithm':('Selected preview mask; separable Keys cubic a=-0.5, zero exterior, coordinate (j+.5)*L/H-.5; float32 output >=0.5' if args.mode=='upscale' else
@@ -537,6 +687,9 @@ def prepare(args, stem, log_dir):
             receipt['notes']=['The selected edited Global is authoritative for shape and separation.',
                               'Signed-distance reconstruction samples the source-grid cell centers; original prediction NRRDs are not read or restored.',
                               'Output uses uncalibrated XTA source-grid unit LPS, not physical millimetre calibration.']
+        if crop:
+            receipt['axial_crop']=crop
+            receipt['notes'].append('Reconstruction uses the original preview/native lattice, padded with zero beyond the cropped preview; final native high-X columns are removed after reconstruction. The pre_crop_mask reconstruction audits apply before that final crop.')
         if quality is not None:receipt['native_quality']=quality
         save_json(stage/'preparation.json',receipt)
         preserve_completed_stage=True
@@ -558,9 +711,14 @@ def prepare(args, stem, log_dir):
         lock.unlink()
 
 def validate_only(args,stem,log_dir):
-    bundle=Path(args.bundle_dir).resolve() if args.bundle_dir else Path(args.training_root).resolve()/safe_name(args.generation)/(stem+'_Filtered')
+    bundle=bundle_path(args,stem,Path(args.training_root).resolve()/safe_name(args.generation))
+    if bundle.is_symlink() or not bundle.is_dir():raise ValueError(f'Missing regular filtered bundle: {bundle}')
     low,full,selected,provenance=load_bundle(bundle,stem,args.mask_source)
-    if math.prod(low)>args.max_preview_mib*MIB:raise ValueError('Preview exceeds union allocation budget.')
+    crop=provenance.get('axial_crop')
+    if crop is not None and args.mode=='native':
+        raise ValueError('Derived cropped edit bundles support edited_shape or upscale preparation.')
+    allocation_shape=shape3(crop['original_preview_shape_tyx']) if crop else low
+    if math.prod(allocation_shape)>args.max_preview_mib*MIB:raise ValueError('Preview exceeds union allocation budget.')
     preview=np.zeros(low,np.uint8)
     for entry in selected:insert_snapshot(preview,child(bundle,entry['file']),entry,args.max_snapshot_mib*MIB)
     report={'status':'validated_only','bundle':str(bundle),'provenance':provenance,
@@ -578,8 +736,15 @@ def validate_only(args,stem,log_dir):
 
 def smoke(args,inputs,log_dir):
     if not args.smoke_script or not Path(args.smoke_script).is_file():raise ValueError('--smoke requires an existing --smoke-script entrypoint.')
+    smoke_input=Path('/tmp/pta-smoke')
+    smoke_input.mkdir(parents=True,exist_ok=True)
+    for prepared in map(Path,inputs):
+        identity=read_json(prepared/'preparation.json')['identity']
+        stem=identity.get('output_stem',identity['stem'])
+        shutil.copy2(identity['intensity']['path'],smoke_input/(stem+'.mkv'))
+        shutil.copy2(prepared/(stem+'.nrrd'),smoke_input/(stem+'.nrrd'))
     command=[args.python,str(Path(args.smoke_script).resolve()),'--mode','pta','--task','segment',
-             '--input',*inputs,'--output',str(log_dir/'pta-smoke'),'--imgsz',str(args.smoke_imgsz),
+             '--input',str(smoke_input),'--output',str(log_dir/'pta-smoke'),'--imgsz',str(args.smoke_imgsz),
              '--background_percent','1','--channel_format','gray','--output_format','png',
              '--worker_backend','thread','--enable_cartesian','transverse',
              '--fraction',str(args.smoke_fraction),'--save','images','labels','summary']
@@ -596,13 +761,14 @@ def main(argv=None):
     p.add_argument('--root',default='/project/community/sanghyus')
     p.add_argument('--source-video',type=Path,help='Explicit original intensity path for exactly one volume; default root/stem.mkv remains')
     p.add_argument('--output-dir',type=Path,help='Explicit prepared-input directory for exactly one volume; existing incompatible data is never overwritten')
-    p.add_argument('--intensity-mode',choices=['symlink','copy'],default='symlink',help='Publish intensity as an original-source link (default) or a verified independent copy')
+    p.add_argument('--output-stem',help='Explicit output basename for exactly one volume; the positional stem still identifies source segments')
+    p.add_argument('--intensity-mode',choices=['symlink','copy','reference'],default='symlink',help='Publish an intensity link (default), verified copy, or a hashed source reference with labels only')
     p.add_argument('--training-root',default='/project/community/sanghyus/XTA_TRAINING')
     p.add_argument('--generation',default='v1')
     p.add_argument('--mode',choices=['upscale','native','edited_shape'],default='upscale')
     p.add_argument('--mask-source',choices=['global','components'],default='global')
     p.add_argument('--validate-only',action='store_true')
-    p.add_argument('--bundle-dir',type=Path,help='Explicit bundle for single-volume validation only')
+    p.add_argument('--bundle-dir',type=Path,help='Explicit edited bundle for single-volume preparation or validation')
     p.add_argument('--skip-source-probe',action='store_true',help='Bundle-only validation; forbidden for preparation')
     p.add_argument('--native-filter')
     p.add_argument('--native-low-template',help='Explicit original low manifest path; {stem} substitution allowed')
@@ -626,7 +792,7 @@ def main(argv=None):
     if a.workers<1:p.error('workers must be positive')
     if a.smoke and a.validate_only:p.error('smoke cannot be combined with validate-only')
     if not 0<a.smoke_fraction<=1 or a.smoke_imgsz<1:p.error('Invalid smoke sampling/image size')
-    if (a.bundle_dir or a.skip_source_probe) and not a.validate_only:p.error('bundle-dir/skip-source-probe are validation-only options')
+    if a.skip_source_probe and not a.validate_only:p.error('skip-source-probe is a validation-only option')
     if a.mode=='native' and a.mask_source!='global':p.error('Native mode uses the full strict edit-evidence contract; mask-source must remain global')
     if a.mode=='edited_shape' and a.mask_source!='global':p.error('Edited-shape mode requires mask-source global: the edited Global is authoritative')
     if bool(a.native_union_receipt)!=bool(a.native_union_source_pairs):p.error('native-union-receipt and native-union-source-pairs must be supplied together')
@@ -641,12 +807,14 @@ def main(argv=None):
     if a.bundle_dir and len(stems)!=1:p.error('bundle-dir requires exactly one volume')
     if a.source_video and len(stems)!=1:p.error('source-video requires exactly one volume')
     if a.output_dir and len(stems)!=1:p.error('output-dir requires exactly one volume')
+    if a.output_stem and len(stems)!=1:p.error('output-stem requires exactly one volume')
+    if a.output_stem:safe_name(a.output_stem)
     for s in stems:safe_name(s)
     safe_name(a.generation)
     log_resolved=a.log_dir.resolve()
     for s in stems:
         base=Path(a.training_root).resolve()/a.generation
-        bundle=Path(a.bundle_dir).resolve() if a.bundle_dir else base/(s+'_Filtered')
+        bundle=bundle_path(a,s,base).resolve()
         output=output_path(a,s,base)
         source=Path(a.source_video).resolve() if a.source_video else (Path(a.root)/(s+'.mkv')).resolve()
         if output==bundle or output.is_relative_to(bundle) or bundle.is_relative_to(output):

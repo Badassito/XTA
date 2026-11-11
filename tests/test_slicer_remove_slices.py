@@ -148,19 +148,22 @@ def test_toolbar_grid_retains_actions_and_dispatches_callbacks(functions):
     namespace = {"qt": SimpleNamespace(QWidget=Widget, QGridLayout=Widget, QAction=Widget,
                                         QToolButton=Widget, Qt=SimpleNamespace(ToolButtonTextOnly=0)),
                  "toolbar": Widget(), "main_window": Widget(),
-                 "_run_toolbar_action": calls.append}
-    for name in ("BryanImporter", "ShowAll", "HideAll", "UpdateGlobal", "UpdateNonGlobal",
-                 "UpdateBoth", "RemoveIslands", "RemoveSlices", "RemoveMarkers",
-                 "ExportXTAEdits", "AlignNativeIntensity", "ResetNativeIntensityAlignment"):
+                 "_run_toolbar_action": calls.append, "_TOGGLE_HIDE_LABEL": "Hide All"}
+    for name in ("BryanImporter", "ToggleAll", "Highlight", "BuildVideo", "UpdateGlobal",
+                 "UpdateNonGlobal", "UpdateBoth", "RemoveIslands", "RemoveSlices",
+                 "RemoveMarkers", "ExportXTAEdits", "AlignNativeIntensity",
+                 "ResetNativeIntensityAlignment"):
         namespace[name] = lambda name=name: name
     exec(compile(ast.Module(body=tree.body[start:], type_ignores=[]), str(SOURCE), "exec"), namespace)
     actions = namespace["toolbar_actions"]
     buttons = namespace["toolbar_buttons"]
-    assert len(actions) == len(buttons) == 12
+    assert len(actions) == len(buttons) == 13
     assert [(row, column) for _, row, column in placements[:-1]] == [
-        (row, column) for row in range(2) for column in range(6)]
+        (row, column) for row in range(2) for column in range(7)][:13]
     names = [name for name, _ in namespace["_TOOLBAR_ACTIONS"]]
-    assert names[1:3] == ["Show All", "Hide All"]
-    assert names[6:9] == ["Remove Islands", "Remove Slices", "Remove Markers"]
-    buttons[7].action.callback()
-    assert calls == [namespace["RemoveSlices"]]
+    assert names[1:4] == ["Hide All", "Highlight", "Build Video"]
+    assert names[7:10] == ["Remove Islands", "Remove Slices", "Remove Markers"]
+    assert namespace["_toggle_all_action"] is actions[1]
+    buttons[8].action.callback()
+    buttons[1].action.callback()
+    assert calls == [namespace["RemoveSlices"], namespace["ToggleAll"]]

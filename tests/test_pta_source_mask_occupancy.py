@@ -83,7 +83,7 @@ def test_known_empty_label_only_keeps_output_check_without_mask_download(tmp_pat
     with mock.patch.object(FakeTensor, 'to', record_to):
         assert publish(tmp_path, np.zeros((8, 8), np.uint8),
             candidate(augmentation_index=1), source_nonempty=False) == (1, {})
-    assert transfers == [(1,)]  # Output occupancy still crosses; full mask does not.
+    assert transfers == [(1, 4)]  # Output bounds still cross; no mask window does.
     assert next((tmp_path / 'labels').glob('*.txt')).read_text() == ''
 
 
@@ -98,7 +98,7 @@ def test_known_empty_binary_still_downloads_and_preserves_exact_mask(tmp_path):
     with mock.patch.object(FakeTensor, 'to', record_to):
         assert publish(tmp_path, np.zeros((8, 8), np.uint8), candidate(),
             source_nonempty=False, save_binary=True) == (1, {})
-    assert transfers == [(1,), (1, 8, 8)]
+    assert transfers == [(1, 4), (1, 8, 8)]
     from XTA.pta_binary import candidate_binary_output_path
     from XTA import pta
     output = candidate_binary_output_path(tmp_path, candidate(), split_active=False)
@@ -150,7 +150,7 @@ def test_known_empty_semantic_or_coverage_still_downloads_masks(tmp_path, save_s
         np.testing.assert_array_equal(pta.cv2.imread(str(path), pta.cv2.IMREAD_UNCHANGED), expected)
 
 
-def test_mixed_labels_download_only_nonempty_source_planes(tmp_path):
+def test_mixed_labels_download_only_nonempty_source_windows(tmp_path):
     torch = FakeTorch()
     masks = np.zeros((4, 8, 8), np.uint8)
     masks[1, 1:7, 1:7] = 1
@@ -163,7 +163,7 @@ def test_mixed_labels_download_only_nonempty_source_planes(tmp_path):
     original_to = FakeTensor.to
 
     def record_to(tensor, device):
-        if tensor.ndim == 3:
+        if tensor.ndim != 2:
             downloads.append(tensor.array.copy())
         return original_to(tensor, device)
 
@@ -178,8 +178,11 @@ def test_mixed_labels_download_only_nonempty_source_planes(tmp_path):
             output_size=(8, 8), channel_kind='gray', local_warnings=workers.WarningLog(),
             source_mask_nonempty=(False, True, True, False),
         ) == (4, {})
+    # One packed download: frame 1's 1-px margin reaches the frame edges, and
+    # frame 2's single pixel crosses with its 3x3 margin.
     assert len(downloads) == 1
-    np.testing.assert_array_equal(downloads[0], masks[[1, 2]])
+    np.testing.assert_array_equal(downloads[0], np.concatenate(
+        (masks[1].ravel(), masks[2, 2:5, 2:5].ravel())))
     from XTA.pta_publication import candidate_output_paths
     label_paths = [candidate_output_paths(tmp_path, cand, split_active=False,
         image_format='png')[1] for cand in candidates]

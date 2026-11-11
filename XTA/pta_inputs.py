@@ -14,7 +14,7 @@ import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -35,6 +35,17 @@ from .pta_workers import ArrayAllocator, SharedBlock, WarningLog, bind_current_t
 GIB = 1024 ** 3
 YoloPolygon = Tuple[Tuple[float, float], ...]
 YoloPolygons = Tuple[YoloPolygon, ...]
+
+
+class MaskPlaneSummary(NamedTuple):
+    """Per-t-plane facts of a 0/1 mask, recorded while the NRRD reader wrote it.
+
+    Valid only for that unmodified array: has_foreground equals
+    np.any(mask, axis=(1, 2)) and first_foreground equals np.argmax(mask[t])
+    (0 for an empty plane).
+    """
+    has_foreground: np.ndarray
+    first_foreground: np.ndarray
 
 
 
@@ -171,7 +182,7 @@ def ffprobe_info(video_path: Path) -> Dict[str, object]:
     _require_bin("ffprobe")
     cmd = [
         "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames",
+        "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,start_time:format=duration",
         "-of", "json", str(video_path),
     ]
     proc = subprocess.run(
@@ -194,14 +205,21 @@ def ffprobe_info(video_path: Path) -> Dict[str, object]:
     fps = parse_ratio(str(st.get("avg_frame_rate", "0/0"))) or parse_ratio(str(st.get("r_frame_rate", "0/0"))) or 30.0
     nf = st.get("nb_frames")
     if nf is None or str(nf) in {"", "N/A"}:
+        # Matroska has no frame count. TTA's exact tail-timestamp count avoids
+        # reading the whole file; YOLO_TTA_FRAME_COUNT_FULL_SCAN=1 disables it.
+        from .media import _tail_frame_count_enabled, _tail_timestamp_frame_count
+        if _tail_frame_count_enabled():
+            nf = _tail_timestamp_frame_count(video_path, st, info.get("format") or {}, fps)
+    if nf is None or str(nf) in {"", "N/A"}:
         cmd2 = [
             "ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
             "-show_entries", "stream=nb_read_packets", "-of", "json", str(video_path),
         ]
-        proc2 = subprocess.run(
-            cmd2, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", check=True,
-        )
+        with runtime_telemetry().span('startup.source_probe.packet_count'):
+            proc2 = subprocess.run(
+                cmd2, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", check=True,
+            )
         info2 = json.loads(proc2.stdout)
         nf = info2["streams"][0].get("nb_read_packets")
     if nf is None or str(nf) in {"", "N/A"}:
@@ -248,6 +266,8 @@ def decode_video_gray8_to_memory(video_path: Path, *, warnings: WarningLog, allo
     finally:
         if proc.stdout is not None:
             proc.stdout.close()
+            # The frame reader owns stdout. communicate() only needs to drain stderr.
+            proc.stdout = None
         _, err = proc.communicate()
     if proc.returncode not in (0, None):
         msg = err.decode("utf-8", errors="replace") if isinstance(err, (bytes, bytearray)) else str(err)
@@ -580,37 +600,93 @@ def nrrd_header_to_internal_permutation(header: Mapping[str, object]) -> Optiona
 
 
 
-def _nrrd_mask_orientation(header, shape, expected_shape_tyx, nrrd_path):
+def _nrrd_mask_source_planes(
+    shape_tyx, expected_shape_tyx, nrrd_path, *, force=False,
+    source_contiguous=True, source_plane_indices=None,
+):
+    """Validate geometry and map each target frame to one source mask plane."""
+    source_t, source_h, source_w = (int(value) for value in shape_tyx)
+    target_t, target_h, target_w = (int(value) for value in expected_shape_tyx)
+    tolerance = 3 if force else 0
+    if abs(source_h - target_h) > tolerance or abs(source_w - target_w) > tolerance:
+        raise ValueError(
+            f"NRRD segmentation XY shape {(source_h, source_w)} does not match image XY shape "
+            f"{(target_h, target_w)} within the {tolerance}-voxel per-axis tolerance: {nrrd_path}"
+        )
+    if source_plane_indices is not None:
+        if len(source_plane_indices) != target_t:
+            raise ValueError("NRRD source-plane mapping must contain one index per image frame")
+        indices = np.asarray(source_plane_indices, dtype=np.intp)
+        if not np.any((indices >= 0) & (indices < source_t)):
+            raise ValueError(f"NRRD source-plane mapping has no matched image slices: {nrrd_path}")
+        return indices
+    if source_t != target_t and (not force or not source_contiguous or abs(source_t - target_t) > 3):
+        raise ValueError(
+            f"NRRD segmentation depth {source_t} does not match image depth {target_t}: {nrrd_path}. "
+            "--force permits XYZ resizing within 3 voxels per axis for contiguous sources; "
+            "2D correspondence requires --nrrd_z_start_index to establish a source-plane mapping."
+        )
+    if source_t == target_t:
+        return np.arange(target_t, dtype=np.intp)
+    from .media import _endpoint_aligned_nearest_source_indices
+    return _endpoint_aligned_nearest_source_indices(source_t, target_t)
+
+
+
+def _nrrd_mask_orientation(
+    header, shape, expected_shape_tyx, nrrd_path, *, force=False,
+    source_contiguous=True, source_plane_indices=None,
+):
     if len(shape) != 3:
         raise ValueError(f"NRRD segmentation must be 3D, got shape {shape} from {nrrd_path}")
     t_dim, h, w = (int(expected_shape_tyx[0]), int(expected_shape_tyx[1]), int(expected_shape_tyx[2]))
     shape = tuple(int(x) for x in shape)
-    candidates: List[Tuple[str, Tuple[int, int, int]]] = []
-    for name, source_shape, permutation in (
-        ("already_tyx", (t_dim, h, w), (0, 1, 2)),
-        ("xyz_to_tyx", (w, h, t_dim), (2, 1, 0)),
-        ("yxt_to_tyx", (h, w, t_dim), (2, 0, 1)),
-        ("txy_to_tyx", (t_dim, w, h), (0, 2, 1)),
-    ):
-        if shape == source_shape:
-            candidates.append((name, permutation))
-    if not candidates:
+    permutations = (
+        ("already_tyx", (0, 1, 2)),
+        ("xyz_to_tyx", (2, 1, 0)),
+        ("yxt_to_tyx", (2, 0, 1)),
+        ("txy_to_tyx", (0, 2, 1)),
+    )
+    candidates = [
+        (name, permutation) for name, permutation in permutations
+        if tuple(shape[axis] for axis in permutation) == (t_dim, h, w)
+    ]
+    if not candidates and not force and source_plane_indices is None:
         raise ValueError(
             f"NRRD segmentation shape {shape} does not match image volume shape (t,Y,X)=({t_dim},{h},{w}) "
             f"or recognized spatial permutations (X,Y,t)=({w},{h},{t_dim}) / (Y,X,t)=({h},{w},{t_dim})"
         )
-
     header_permutation = nrrd_header_to_internal_permutation(header)
     if header_permutation is not None:
         internal_shape = tuple(shape[int(axis)] for axis in header_permutation)
-        if internal_shape != (t_dim, h, w):
+        if not force and source_plane_indices is None and internal_shape != (t_dim, h, w):
             raise ValueError(
                 f"NRRD header axis directions imply internal shape {internal_shape}, but image volume shape is "
                 f"(t,Y,X)=({t_dim},{h},{w}) for {nrrd_path}"
             )
+        _nrrd_mask_source_planes(
+            internal_shape, expected_shape_tyx, nrrd_path, force=force,
+            source_contiguous=source_contiguous, source_plane_indices=source_plane_indices,
+        )
         permutation = tuple(int(x) for x in header_permutation)
         orientation = "header_axes_" + "".join(str(x) for x in permutation) + "_to_tyx"
     else:
+        if not candidates and (force or source_plane_indices is not None):
+            for name, permutation in permutations:
+                internal_shape = tuple(shape[axis] for axis in permutation)
+                try:
+                    _nrrd_mask_source_planes(
+                        internal_shape, expected_shape_tyx, nrrd_path, force=force,
+                        source_contiguous=source_contiguous, source_plane_indices=source_plane_indices,
+                    )
+                except ValueError:
+                    continue
+                candidates.append((name, permutation))
+        if not candidates:
+            raise ValueError(
+                f"NRRD segmentation shape {shape} does not match image volume shape (t,Y,X)=({t_dim},{h},{w}) "
+                f"or recognized spatial permutations (X,Y,t)=({w},{h},{t_dim}) / (Y,X,t)=({h},{w},{t_dim})"
+            )
         unique_permutations = {tuple(permutation) for _, permutation in candidates}
         if len(unique_permutations) != 1:
             matches = ", ".join(name for name, _ in candidates)
@@ -624,7 +700,10 @@ def _nrrd_mask_orientation(header, shape, expected_shape_tyx, nrrd_path):
 
 
 
-def _read_canonical_uint8_nrrd(nrrd_path, nrrd, expected_shape_tyx):
+def _read_canonical_uint8_nrrd(
+    nrrd_path, nrrd, expected_shape_tyx, *, force=False,
+    source_contiguous=True, source_plane_indices=None,
+):
     """Bound gzip output in place instead of building and copying an entire bytearray."""
     import gzip
     with Path(nrrd_path).open('rb') as source:
@@ -638,48 +717,218 @@ def _read_canonical_uint8_nrrd(nrrd_path, nrrd, expected_shape_tyx):
         shape = tuple(int(x) for x in header['sizes'])
         if int(header.get('dimension', 0)) != len(shape) or any(x <= 0 for x in shape):
             raise ValueError(f'Invalid NRRD dimensions: {nrrd_path}')
-        orientation, permutation = _nrrd_mask_orientation(header, shape, expected_shape_tyx, nrrd_path)
+        orientation, permutation = _nrrd_mask_orientation(
+            header, shape, expected_shape_tyx, nrrd_path, force=force,
+            source_contiguous=source_contiguous, source_plane_indices=source_plane_indices,
+        )
         if tuple(permutation) != (2, 1, 0):
             return None
+        source_shape = tuple(shape[axis] for axis in permutation)
+        source_planes = _nrrd_mask_source_planes(
+            source_shape, expected_shape_tyx, nrrd_path, force=force,
+            source_contiguous=source_contiguous, source_plane_indices=source_plane_indices,
+        )
         mask = np.empty(tuple(expected_shape_tyx), np.uint8)
-        raw = memoryview(mask).cast('B')
+        summary = MaskPlaneSummary(np.zeros(len(mask), bool), np.zeros(len(mask), np.intp))
+        for target_z, source_z in enumerate(source_planes):
+            if source_z < 0 or source_z >= source_shape[0]:
+                mask[target_z] = 0
         stream = gzip.GzipFile(fileobj=source, mode='rb') if header['encoding'] in {'gzip', 'gz'} else source
+        direct_read = source_shape == tuple(expected_shape_tyx) and source_plane_indices is None
+        telemetry = runtime_telemetry()
         try:
-            with runtime_telemetry().span('pta.mask.nrrd_payload_read'):
-                for start in range(0, len(raw), 8 * 1024 * 1024):
-                    chunk = raw[start:min(len(raw), start + 8 * 1024 * 1024)]
-                    filled = 0
-                    while filled < len(chunk):
-                        count = stream.readinto(chunk[filled:])
-                        if not count:
-                            raise ValueError(f'Unexpected EOF in NRRD segmentation payload: {nrrd_path}')
-                        filled += int(count)
+            with telemetry.span('pta.mask.nrrd_payload_read'):
+                if direct_read:
+                    # Normalize and summarize whole planes while they are still in cache.
+                    step = max(1, (8 * 1024 * 1024) // mask[0].nbytes)
+                    for start in range(0, len(mask), step):
+                        planes = mask[start:start + step]
+                        _read_nrrd_bytes_into(stream, memoryview(planes).cast('B'), nrrd_path)
+                        with telemetry.span('pta.mask.nrrd_normalize'):
+                            # A bool view writes the same 0/1 bytes without a cast loop.
+                            np.greater(planes, 0, out=planes.view(np.bool_))
+                            _record_plane_foreground(planes, summary, start)
+                else:
+                    xy_indices = _nrrd_mask_xy_indices(source_shape, expected_shape_tyx)
+                    target_planes_by_source: Dict[int, List[int]] = {}
+                    for target_z, source_z in enumerate(source_planes):
+                        target_planes_by_source.setdefault(int(source_z), []).append(target_z)
+                    plane = np.empty(source_shape[1:], dtype=np.uint8)
+                    for source_z in range(source_shape[0]):
+                        _read_nrrd_bytes_into(stream, memoryview(plane).cast('B'), nrrd_path)
+                        for target_z in target_planes_by_source.get(source_z, ()):
+                            with telemetry.span('pta.mask.nrrd_resample'):
+                                _write_nrrd_mask_plane(plane, mask[target_z], xy_indices)
+                                _record_plane_foreground(mask[target_z:target_z + 1], summary, target_z)
                 if stream.read(1):
                     raise ValueError(f'NRRD segmentation payload exceeds declared dimensions: {nrrd_path}')
         finally:
             if stream is not source:
                 stream.close()
-        with runtime_telemetry().span('pta.mask.nrrd_normalize'):
-            np.greater(mask, 0, out=mask)
-        return mask, orientation
+        return mask, orientation, source_shape, source_planes, summary
+
+
+
+def _record_plane_foreground(planes, summary, start):
+    """Record any() and the first foreground flat index of consecutive 0/1 planes."""
+    rows = planes.reshape(len(planes), -1).view(np.bool_)
+    first = rows.argmax(axis=1)  # stops at the first True of each plane
+    summary.first_foreground[start:start + len(rows)] = first
+    summary.has_foreground[start:start + len(rows)] = rows[np.arange(len(rows)), first]
+
+
+
+def _read_nrrd_bytes_into(stream, raw, nrrd_path):
+    for start in range(0, len(raw), 8 * 1024 * 1024):
+        chunk = raw[start:min(len(raw), start + 8 * 1024 * 1024)]
+        filled = 0
+        while filled < len(chunk):
+            count = stream.readinto(chunk[filled:])
+            if not count:
+                raise ValueError(f'Unexpected EOF in NRRD segmentation payload: {nrrd_path}')
+            filled += int(count)
+
+
+
+# Each (Y run, X run) block costs one ufunc call. Near-unity scales (the usual --force
+# case, a few pixels off) give a handful of blocks; a 2x rescale gives millions, where the
+# single np.ix_ gather is hundreds of times faster.
+_MAX_NRRD_RUN_BLOCKS = 64
+
+
+
+def _nrrd_mask_xy_indices(source_shape, target_shape):
+    """None for equal XY. Else ('runs', y_runs, x_runs) of (target start, target stop, source
+    start) when few blocks cover a plane, or ('gather', np.ix_ index) otherwise."""
+    if source_shape[1:] == target_shape[1:]:
+        return None
+    from .media import _endpoint_aligned_nearest_source_indices
+    axes = [_endpoint_aligned_nearest_source_indices(source_size, target_size)
+            for source_size, target_size in zip(source_shape[1:], target_shape[1:])]
+    # A run continues while each target step advances the source by exactly one.
+    breaks = [np.flatnonzero(np.diff(index) != 1) + 1 for index in axes]
+    if (len(breaks[0]) + 1) * (len(breaks[1]) + 1) > _MAX_NRRD_RUN_BLOCKS:
+        return ('gather', np.ix_(*axes))
+    runs = []
+    for index, cuts in zip(axes, breaks):
+        starts, stops = np.concatenate(([0], cuts)), np.concatenate((cuts, [len(index)]))
+        runs.append(tuple((int(a), int(b), int(index[a])) for a, b in zip(starts, stops)))
+    return ('runs', *runs)
+
+
+
+def _write_nrrd_mask_plane(source, destination, xy_indices):
+    """Write source > 0 as 0/1 bytes; near-unity resizes copy each nearest-neighbour run as a view."""
+    out = destination.view(np.bool_)
+    if xy_indices is None:
+        np.greater(source, 0, out=out)
+        return
+    if xy_indices[0] == 'gather':
+        np.greater(source[xy_indices[1]], 0, out=out)
+        return
+    _, y_runs, x_runs = xy_indices
+    for y0, y1, source_y in y_runs:
+        for x0, x1, source_x in x_runs:
+            np.greater(source[source_y:source_y + y1 - y0, source_x:source_x + x1 - x0], 0,
+                       out=out[y0:y1, x0:x1])
+
+
+
+def load_nrrd_mask_for_volume(
+    nrrd_path: Path, expected_shape_tyx: Tuple[int, int, int], *, warnings: WarningLog,
+    force: bool = False, source_contiguous: bool = True,
+    source_plane_indices: Optional[Sequence[int]] = None,
+    plane_summary_out: Optional[List[MaskPlaneSummary]] = None,
+) -> np.ndarray:
+    """plane_summary_out, when given, receives the reader's MaskPlaneSummary if it made one."""
+    mask, _ = _load_nrrd_mask_for_volume(
+        nrrd_path, expected_shape_tyx, warnings=warnings, force=force,
+        source_contiguous=source_contiguous, source_plane_indices=source_plane_indices,
+        plane_summary_out=plane_summary_out,
+    )
+    return mask
+
+
+
+def load_indexed_nrrd_mask_for_volume(
+    nrrd_path: Path, expected_shape_tyx: Tuple[int, int, int], *, warnings: WarningLog,
+    source_plane_indices: Sequence[int], force: bool = False,
+    plane_summary_out: Optional[List[MaskPlaneSummary]] = None,
+) -> Tuple[np.ndarray, Tuple[int, ...]]:
+    """Load known 2D correspondences and return the annotated target positions."""
+    return _load_nrrd_mask_for_volume(
+        nrrd_path, expected_shape_tyx, warnings=warnings, force=force,
+        source_contiguous=False, source_plane_indices=source_plane_indices,
+        plane_summary_out=plane_summary_out,
+    )
 
 
 
 @runtime_telemetry_phase('pta.mask.load_nrrd')
-def load_nrrd_mask_for_volume(nrrd_path: Path, expected_shape_tyx: Tuple[int, int, int], *, warnings: WarningLog) -> np.ndarray:
+def _load_nrrd_mask_for_volume(
+    nrrd_path, expected_shape_tyx, *, warnings, force,
+    source_contiguous, source_plane_indices, plane_summary_out=None,
+):
     try:
         import nrrd  # type: ignore
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("pynrrd is required for NRRD segmentation input: pip install pynrrd") from exc
-    fast = _read_canonical_uint8_nrrd(nrrd_path, nrrd, expected_shape_tyx)
+    expected_shape_tyx = tuple(int(value) for value in expected_shape_tyx)
+    if len(expected_shape_tyx) != 3 or any(value <= 0 for value in expected_shape_tyx):
+        raise ValueError(f"Image volume shape must contain three positive axes: {expected_shape_tyx}")
+    if source_plane_indices is not None:
+        source_plane_indices = tuple(int(value) for value in source_plane_indices)
+        if len(source_plane_indices) != expected_shape_tyx[0]:
+            raise ValueError("NRRD source-plane mapping must contain one index per image frame")
+    fast = _read_canonical_uint8_nrrd(
+        nrrd_path, nrrd, expected_shape_tyx, force=force,
+        source_contiguous=source_contiguous, source_plane_indices=source_plane_indices,
+    )
     if fast is not None:
-        mask, orientation = fast
+        mask, orientation, source_shape, source_planes, plane_summary = fast
+        if plane_summary_out is not None:
+            plane_summary_out.append(plane_summary)
         warnings.add('segmentation_nrrd_bounded_readinto', f'{nrrd_path.name}: {mask.nbytes} bytes, bounded 8 MiB output chunks')
     else:
         data, header = nrrd.read(str(nrrd_path))
         arr = np.asarray(data)
-        orientation, permutation = _nrrd_mask_orientation(header, arr.shape, expected_shape_tyx, nrrd_path)
+        orientation, permutation = _nrrd_mask_orientation(
+            header, arr.shape, expected_shape_tyx, nrrd_path, force=force,
+            source_contiguous=source_contiguous, source_plane_indices=source_plane_indices,
+        )
         internal = arr if permutation == (0, 1, 2) else np.transpose(arr, permutation)
-        mask = np.ascontiguousarray((np.asarray(internal) > 0).astype(np.uint8))
+        source_shape = tuple(int(value) for value in internal.shape)
+        source_planes = _nrrd_mask_source_planes(
+            source_shape, expected_shape_tyx, nrrd_path, force=force,
+            source_contiguous=source_contiguous, source_plane_indices=source_plane_indices,
+        )
+        if source_shape == expected_shape_tyx and source_plane_indices is None:
+            mask = np.ascontiguousarray((np.asarray(internal) > 0).astype(np.uint8))
+        else:
+            xy_indices = _nrrd_mask_xy_indices(source_shape, expected_shape_tyx)
+            mask = np.empty(expected_shape_tyx, dtype=np.uint8)
+            for target_z, source_z in enumerate(source_planes):
+                if 0 <= source_z < source_shape[0]:
+                    _write_nrrd_mask_plane(internal[int(source_z)], mask[target_z], xy_indices)
+                else:
+                    mask[target_z] = 0
+    matched_positions = tuple(
+        target_z for target_z, source_z in enumerate(source_planes)
+        if 0 <= source_z < source_shape[0]
+    )
+    if source_shape[1:] != expected_shape_tyx[1:] or (
+        source_plane_indices is None and source_shape[0] != expected_shape_tyx[0]
+    ):
+        axes = "XY" if source_plane_indices is not None or not source_contiguous else "XYZ"
+        message = (f"{nrrd_path.name}: source(t,Y,X)={source_shape}, target={expected_shape_tyx}, "
+                   f"axes={axes}, tolerance=3 per axis inclusive, endpoint-aligned nearest sampling")
+        warnings.add("segmentation_nrrd_forced_resize", message)
+        print(f"Resized NRRD labels: {message}")
+    if source_plane_indices is not None:
+        warnings.add(
+            "segmentation_nrrd_indexed_2d_mapping",
+            f"{nrrd_path.name}: matched={len(matched_positions)}/{expected_shape_tyx[0]}; "
+            "source-plane indices preserved",
+        )
     warnings.add("segmentation_nrrd_loaded_in_memory", f"{nrrd_path.name}: {mask.shape}, {mask.nbytes / GIB:.2f} GiB, orientation={orientation}")
-    return mask
+    return mask, matched_positions

@@ -32,7 +32,26 @@ This replaces the My Tools toolbar. It does not run Importer or change voxel
 arrays on load. The script is self-contained in Slicer. Keep a copy of an
 existing startup script before choosing to replace it permanently.
 
-The My Tools panel uses two rows, with Show All before Hide All. **Remove
+The My Tools panel uses two rows. One **Show All / Hide All** button toggles
+every segmentation node. Its label names the next action. When the scene is
+entirely shown or entirely hidden, the button follows the scene instead.
+
+**Highlight** draws a red silhouette outline of a surface model in every 3D
+view. With one model, it uses that model; with several, it asks which one;
+with none, it reports an error. Click Highlight on an outlined model to remove
+its outline. The outline follows the model's visibility and transform.
+
+**Build Video** exports a cumulative reveal: Transverse, Sagittal and Coronal,
+then the other view segments in natural name order. It detects the dataset name
+prefix from the segment names, asking when several datasets are loaded, and
+asks for a parent folder. Each export writes a new `SlicerBuild_<timestamp>`
+folder with one PNG per state, `timeline.json` and a lossless 3840 x 2160,
+30 fps FFV1/MKV. FFmpeg must be on `PATH` or set in Screen Capture > Advanced.
+It renders privately from the first 3D view's camera; scene visibility and the
+camera are not changed. For other settings, call it from the console, for
+example `BuildVideo(make_mp4=True, fps=60)`.
+
+**Remove
 Slices**, between Remove Islands and Remove Markers, provides a more precise
 deletion tool: each marker removes the XY, YZ and XZ cross sections of its
 6-connected foreground island through the marker's voxel position. These are
@@ -285,16 +304,21 @@ policy mutation, and report the measured classes from worker results. Fractional
 ratios, background caps, partial inputs and unchanged YOLO polygon/ROI shortcuts
 retain upfront classification. Tiny-mask support and polygon class remain distinct.
 
-When the existing GPU-policy process pool is idle, dense classification uses its
-CUDA categorical renderers and retains the resident mask for subsequent rendering.
+With a GPU policy, dense classification uses the process pool's CUDA categorical
+renderers and retains the resident mask for subsequent rendering.
 GPU pixel counts reproduce the existing segmentation classifier: zero is background,
 16 or more pixels are provisionally foreground, and only 1-15-pixel masks need the
 CPU polygon check. Semantic classification intersects separately rendered foreground
 and known-coverage masks. This pass does not render intensity images or apply
 augmentations. Unsupported layouts and prelaunch memory rejection retain the CPU
 path; errors after CUDA work launches are reported rather than silently retried.
-Overlapping planning while another volume renders stays on CPU to avoid replacing
-its resident mask. The log and telemetry report GPU, CPU, and polygon-only job counts.
+With `--pipeline_depth 2`, the next volume's classification tasks queue behind the
+rendering volume's tasks in the pool's FIFO queue. Each owner switches volumes only
+after its last task of the previous volume, at the usual drained handoff, so no
+owner holds two volumes and the next volume is not sent to the CPU just because
+another volume is rendering; owner-declined jobs keep the CPU path above.
+`pta.classify.gpu.first_result` includes that wait. The log and telemetry report
+GPU, CPU, and polygon-only job counts.
 
 A negative polygon classification does not prove that the binary mask is empty:
 tiny masks can contain pixels without an exportable contour. Publication checks
@@ -352,6 +376,21 @@ and skips the hardware texture, preserving intermediate gray8 voxel rounding.
 upload bytes and saved GPU bytes. The geometry request record's
 `native_t_fusion: false` means intermediate virtual-gray8 rounding is preserved;
 it does not disable native-depth residency.
+
+Each forked GPU owner builds its CUDA runtime (policy, render engine and
+nvImageCodec encoder) in the pool initializer, while the parent loads and
+prepares the volume; the parent forks the owners before any CUDA use, and this
+assumes the Default GPU compute mode. A failed warm-up is
+logged and the owner's first task then behaves as the lazy build did: it builds
+the runtime itself and raises any failure. With native-depth
+residency, an owner starts its first render task's intensity upload in the
+background once classification has admitted the categorical source, using the
+same admission and arguments; the first render task joins it. A declined or
+failed early upload leaves the decision to that task. Set
+`YOLO_TTA_PTA_GPU_OWNER_PREWARM=0` or `YOLO_TTA_PTA_GPU_INTENSITY_PRESTAGE=0`
+to restore first-task construction or upload. Telemetry spans:
+`pta.worker.gpu_runtime_prewarm`, `pta.worker.intensity_prestage` (also a gauge)
+and `pta.worker.intensity_prestage_wait`.
 
 ## Resources and validation boundary
 

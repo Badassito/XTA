@@ -132,9 +132,11 @@ from .pta_inputs import (
     read_yolo_polygons_normalized,
     load_image_sequence_to_memory,
     nrrd_header_to_internal_permutation,
+    load_indexed_nrrd_mask_for_volume,
     load_nrrd_mask_for_volume,
 )
-from .pta_inputs import YoloPolygon, YoloPolygons
+from .pta_inputs import MaskPlaneSummary, YoloPolygon, YoloPolygons
+from .pta_input_options import PtaInputOptions, read_pta_input_options, resolve_volume_options
 from .pta_augmentation import (
     AugmentationDefinition,
     LoadedAugmentation,
@@ -275,6 +277,7 @@ from .pta_scheduler import (
 )
 from .unification.channels import expand_channel_variants as expand_v18_channel_variants
 from .workspace import azimuthal_source_mode as _azimuthal_source_mode
+from .workspace import _cgroup_memory_headroom_bytes, _read_meminfo_bytes
 from .unification.runtime import compile_physical_views
 from .unification.tta_manifest import (
     projection_sampling_record,
@@ -596,30 +599,24 @@ def _planning_phase_affinity(cpus: Sequence[int]):
 
 
 def available_memory_budget_bytes() -> Optional[int]:
-    candidates: List[int] = []
-    cgroup_pairs = [
-        (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")),
-        (Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"), Path("/sys/fs/cgroup/memory/memory.usage_in_bytes")),
-    ]
-    for limit_path, used_path in cgroup_pairs:
-        try:
-            limit_text = limit_path.read_text().strip()
-            if limit_text != "max":
-                limit = int(limit_text)
-                used = int(used_path.read_text().strip())
-                if 0 < limit < (1 << 60):
-                    candidates.append(max(0, limit - used))
-        except Exception:
-            pass
-    try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            if line.startswith("MemAvailable:"):
-                candidates.append(int(line.split()[1]) * 1024)
-                break
-    except Exception:
-        pass
-    positive = [value for value in candidates if value > 0]
-    return min(positive) if positive else None
+    """Return the tighter of cgroup headroom and MemAvailable, or None if both are unknown.
+
+    Cgroup headroom walks this process's cgroup ancestry and treats clean
+    inactive file cache (for example earlier published outputs) as reclaimable.
+    Without complete memory.stat counters that cache stays counted as used.
+    """
+    cgroup_headroom = _cgroup_memory_headroom_bytes()
+    mem_available = _read_meminfo_bytes().get("MemAvailable")
+    known = [int(value) for value in (cgroup_headroom, mem_available) if value is not None]
+    budget = min(known) if known else None
+    fields = {"cgroup_headroom_bytes": cgroup_headroom, "mem_available_bytes": mem_available,
+              "budget_bytes": budget}
+    runtime_telemetry().gauge('pta.pipeline_memory_budget', fields)
+    print("PTA pipeline memory budget: " + ", ".join(
+        f"{name}={'unavailable' if value is None else f'{int(value) / GIB:.1f} GiB'}"
+        for name, value in (("cgroup_headroom_excluding_clean_inactive_file_cache", cgroup_headroom),
+                            ("MemAvailable", mem_available), ("budget", budget))))
+    return budget
 
 
 def estimate_spec_resident_bytes(spec: object) -> Optional[int]:
@@ -780,6 +777,10 @@ class SourceVolume:
     # empty tuple means an explicit background label file.
     yolo_polygons_by_frame: Dict[int, Tuple[Tuple[Tuple[float, float], ...], ...]] = field(default_factory=dict)
     volume_block: Optional[SharedBlock] = None  # backing block when the process pool is active
+    # Explicitly paired Z planes use native transverse geometry only.
+    matched_frame_indices: Optional[Tuple[int, ...]] = None
+    # Recorded by the NRRD reader for mask_volume as read; None means scan the mask.
+    mask_plane_summary: Optional[MaskPlaneSummary] = None
 
 
 @runtime_telemetry_phase('pta.mask.rasterize_yolo')
@@ -833,13 +834,16 @@ def rasterize_yolo_labels(src: SourceVolume, *, warnings: WarningLog, workers: i
 
 
 @runtime_telemetry_phase('pta.prepare.annotation_states')
-def derive_annotation_states(src: SourceVolume, mask_u8: np.ndarray) -> Tuple[int, ...]:
+def derive_annotation_states(src: SourceVolume, mask_u8: np.ndarray, *,
+                             plane_summary: Optional[MaskPlaneSummary] = None) -> Tuple[int, ...]:
     """Return one explicit three-state annotation value per loaded image slice.
 
     A YOLO file that exists but rasterizes empty is annotated background.  A
     YOLO file with a nonempty rasterized mask is annotated foreground.  An image
     with no YOLO file is unannotated and may be used only as image-channel
-    context in an unforced partial volume.  NRRD masks annotate every frame.
+    context in an unforced partial volume. An explicitly placed NRRD annotates
+    only the image frames covered by its source planes. plane_summary, when
+    given, must describe mask_u8 unmodified since the NRRD read.
     """
     mask = np.asarray(mask_u8, dtype=np.uint8)
     if mask.ndim != 3 or int(mask.shape[0]) != int(src.volume.shape[0]):
@@ -849,8 +853,11 @@ def derive_annotation_states(src: SourceVolume, mask_u8: np.ndarray) -> Tuple[in
         )
     states = np.full((int(mask.shape[0]),), ANNOTATION_UNANNOTATED, dtype=np.uint8)
     if src.label_source == "nrrd":
-        states[:] = ANNOTATION_BACKGROUND
-        states[np.any(mask, axis=(1, 2))] = ANNOTATION_FOREGROUND
+        known = (slice(None) if src.matched_frame_indices is None
+                 else np.asarray(src.matched_frame_indices, dtype=np.intp))
+        has_foreground = (plane_summary.has_foreground if plane_summary is not None
+                          else np.any(mask, axis=(1, 2)))
+        states[known] = np.where(has_foreground[known], ANNOTATION_FOREGROUND, ANNOTATION_BACKGROUND)
     elif src.label_source == "yolo":
         for frame_i0, label_path in src.labels_by_frame.items():
             idx = int(frame_i0)
@@ -881,6 +888,7 @@ def collect_foreground_slice_anchors(
     annotation_states: Sequence[int],
     *,
     warnings: WarningLog,
+    plane_summary: Optional[MaskPlaneSummary] = None,
 ) -> Tuple[Tuple[ForegroundAnchor, ...], int]:
     """Keep one compact mask anchor for every foreground input slice."""
     mask = np.asarray(mask_u8, dtype=np.uint8)
@@ -890,7 +898,10 @@ def collect_foreground_slice_anchors(
         if int(state) != ANNOTATION_FOREGROUND:
             continue
         frame = mask[int(frame_idx)]
-        flat_index = int(np.argmax(frame)) if frame.size else 0
+        if plane_summary is not None and plane_summary.has_foreground[int(frame_idx)]:
+            flat_index = int(plane_summary.first_foreground[int(frame_idx)])
+        else:
+            flat_index = int(np.argmax(frame)) if frame.size else 0
         if frame.size and int(frame.reshape(-1)[flat_index]) > 0:
             y, x = divmod(flat_index, int(frame.shape[1]))
         else:
@@ -1069,6 +1080,26 @@ def overlay_rgb(frame_gray: np.ndarray, mask_u8: np.ndarray) -> np.ndarray:
 # A fresh CUDA helper costs seconds; small masks retain the CPU path.
 _GAUSSIAN_GPU_MIN_VOXELS = 64 * 1024**2
 _VOID_FILL_GPU_MIN_VOXELS = 1024**3
+
+
+def _void_fill_proven_noop(hole_fill_2d_stats: Optional[Dict[str, object]], mask: np.ndarray) -> bool:
+    """Whether the 2D hole fill's own stats prove 3D void fill adds nothing.
+
+    A complete final YZ pass with 4-connected background leaves every
+    background voxel connected in its (T, Y) plane to that plane's edge,
+    which lies on a volume face. Void fill treats such background as exterior.
+    """
+    if not hole_fill_2d_stats:
+        return False
+    axes = hole_fill_2d_stats.get("axes") or ()
+    last = axes[-1] if axes else {}
+    return (
+        list(hole_fill_2d_stats.get("execution_order") or ())[-1:] == ["yz"]
+        and hole_fill_2d_stats.get("background_connectivity") == 4
+        and last.get("family") == "yz" and last.get("axis") == 2
+        and last.get("planes") == last.get("examined_planes") == int(mask.shape[2])
+    )
+
 
 @runtime_telemetry_phase('pta.prepare.gaussian')
 def apply_gaussian_smoothing(
@@ -1375,6 +1406,35 @@ class VolumeInputSpec:
     yolo_polygons_by_index: Dict[int, YoloPolygons] = field(default_factory=dict)
     source_stem: Optional[str] = None
     video_info_hint: Optional[Dict[str, object]] = None
+    indexed_yolo_fallback: bool = False
+    input_options: Optional[PtaInputOptions] = None
+
+
+@dataclass
+class PendingCprViews:
+    """Deferred CPR centerline extraction of a prepared volume.
+
+    The volume holds every other view and plan meanwhile. complete_cpr_views()
+    appends CPR views and plans after all of them, as inline extraction orders
+    them, running the extraction inline unless start() moved it to a thread.
+    """
+    extract: Callable[[], List[ViewInfo]]
+    cancel: threading.Event
+    build_plans: Callable[..., List[RenderPlan]]
+    future: Optional[Future] = None
+
+    def start(self) -> None:
+        """Extract on one background thread, with the same worker budget."""
+        if self.future is None:
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pta-cpr-extract")
+            self.future = executor.submit(self.extract)
+            executor.shutdown(wait=False)
+
+    def abandon(self) -> None:
+        """Stop a started extraction and wait for its thread; its result or error is discarded."""
+        self.cancel.set()
+        if self.future is not None:
+            self.future.exception()
 
 
 @dataclass
@@ -1407,6 +1467,8 @@ class PreparedVolume:
     mask_render_block: Optional[SharedBlock] = None
     semantic_coverage_render_block: Optional[SharedBlock] = None
     shm_blocks: List[SharedBlock] = field(default_factory=list)
+    # Set only by prepare_loaded_source(defer_cpr=True) until complete_cpr_views().
+    cpr_pending: Optional[PendingCprViews] = None
 
 
 @dataclass
@@ -1440,6 +1502,8 @@ class VolumeSummaryRecord:
     candidates_before_fraction: int = 0
     void_fill_stats: Optional[Dict[str, object]] = None
     hole_fill_2d_stats: Optional[Dict[str, object]] = None
+    enable_cpr: bool = False
+    input_option_overrides: Dict[str, object] = field(default_factory=dict)
 
 
 def _v18_view_manifest_record(view: ViewInfo) -> Dict[str, object]:
@@ -1539,6 +1603,11 @@ def capture_v18_pta_input_identities(
                 allow_missing=allow_missing,
             ),
             "encoded_indices": [int(value) for value in spec.encoded_indices],
+            "input_options": None if spec.input_options is None else {
+                **(_v18_input_file_identity(spec.input_options.path, allow_missing=allow_missing) or {}),
+                "sha256": spec.input_options.sha256,
+                "overrides": spec.input_options.overrides(),
+            },
         })
     return records
 
@@ -1550,7 +1619,7 @@ def assert_v18_pta_inputs_unchanged(
 
     for source in records:
         identities: List[Mapping[str, object]] = []
-        for key in ("video", "segmentation_nrrd"):
+        for key in ("video", "segmentation_nrrd", "input_options"):
             identity = source.get(key)
             if isinstance(identity, Mapping):
                 identities.append(identity)
@@ -1620,6 +1689,7 @@ def write_v18_pta_manifest(
             "source_shape_t_y_x": [int(value) for value in record.source_shape],
             "processing_shape_t_y_x": [int(value) for value in record.processing_shape],
             "effective_volume_class": str(record.effective_volume_class),
+            "annotation_state_counts": dict(record.annotation_state_counts),
             "views": [_v18_view_manifest_record(view) for view in record.views],
             "render_plans": [dict(stats) for stats in record.render_stats],
             "gaussian_preprocessing": [dict(stats) for stats in record.smoothing_stats],
@@ -1628,6 +1698,8 @@ def write_v18_pta_manifest(
             "foreground_anchor_repair": dict(record.foreground_preservation_stats),
             "candidates_total": int(record.candidates_total),
             "fraction": float(record.fraction),
+            "enable_cpr": bool(record.enable_cpr),
+            "input_option_overrides": dict(record.input_option_overrides),
             "candidates_before_fraction": int(record.candidates_before_fraction),
             "candidates_retained": int(record.candidates_retained),
             "candidates_processed": int(record.candidates_written),
@@ -1912,7 +1984,10 @@ def effective_class(volume_class: str, *, force: bool) -> str:
     return volume_class
 
 
-def classify_sequence_spec(image_indices: Sequence[int], labels_by_index: Dict[int, Path], has_nrrd: bool) -> Tuple[str, Optional[int]]:
+def classify_sequence_spec(
+    image_indices: Sequence[int], labels_by_index: Dict[int, Path], has_nrrd: bool,
+    *, force: bool = False,
+) -> Tuple[str, Optional[int]]:
     image_idxs = sorted(int(x) for x in image_indices)
     image_start = contiguous_start_0_or_1(image_idxs)
     if labels_by_index:
@@ -1920,12 +1995,14 @@ def classify_sequence_spec(image_indices: Sequence[int], labels_by_index: Dict[i
         image_set = set(image_idxs)
         label_set = set(label_idxs)
         orphan_labels = sorted(label_set - image_set)
-        if orphan_labels:
+        if orphan_labels and not force:
             raise ValueError(
                 "Every YOLO label index must have a matching image index; "
                 f"orphan label indices={orphan_labels[:24]}, "
                 f"image {describe_index_problem(image_idxs)}, label {describe_index_problem(label_idxs)}"
             )
+        if orphan_labels and not image_set.intersection(label_set):
+            raise ValueError("Forced YOLO slice matching requires at least one shared image/label index")
         if image_start is not None and label_set == image_set:
             return "fully_labeled", image_start
         return "partially_labeled", image_start
@@ -1959,9 +2036,11 @@ def resolve_pta_input_dirs(input_arg: str | Path | Sequence[str | Path]) -> List
 def discover_volume_specs(
     input_arg: str | Path | Sequence[str | Path], *, force: bool, warnings: WarningLog,
 ) -> List[VolumeInputSpec]:
+    # Validate every options file before any directory is probed.
+    roots = [(root, read_pta_input_options(root)) for root in resolve_pta_input_dirs(input_arg)]
     specs = [
-        spec
-        for root in resolve_pta_input_dirs(input_arg)
+        spec if options is None else replace(spec, input_options=options)
+        for root, options in roots
         for spec in _discover_directory_volume_specs(root, force=force, warnings=warnings)
     ]
     counts = Counter(spec.stem.casefold() for spec in specs)
@@ -2079,7 +2158,18 @@ def _discover_directory_volume_specs(input_path: Path, *, force: bool, warnings:
         image_indices = sorted(int(x) for x in image_map.keys())
         if not image_indices:
             raise ValueError(f"Volume {stem} has no indexed image frames")
-        volume_class, input_start_index = classify_sequence_spec(image_indices, labels_by_index, nrrd_path is not None)
+        volume_class, input_start_index = classify_sequence_spec(
+            image_indices, labels_by_index, nrrd_path is not None, force=force,
+        )
+        skipped_label_indices = sorted(set(labels_by_index) - set(image_indices))
+        indexed_yolo_fallback = bool(skipped_label_indices)
+        if indexed_yolo_fallback:
+            warnings.add(
+                "forced_yolo_index_intersection",
+                f"{stem}: --force uses matched slice indices in 2D; skipped "
+                f"{len(skipped_label_indices)} label slice(s) without images, "
+                f"indices={skipped_label_indices[:24]}",
+            )
         if volume_class == "partially_labeled":
             reasons: List[str] = []
             if input_start_index is None:
@@ -2107,6 +2197,7 @@ def _discover_directory_volume_specs(input_path: Path, *, force: bool, warnings:
             frame_count_hint=len(image_indices),
             fps_hint=1.0,
             yolo_polygons_by_index=yolo_polygons_by_index,
+            indexed_yolo_fallback=indexed_yolo_fallback,
         ))
 
     raw_classes = {spec.volume_class for spec in specs}
@@ -2145,6 +2236,35 @@ def _required_partial_sequence_positions(
     return tuple(sorted(required)) if len(required) < len(encoded) else None
 
 
+def _sequence_has_index_gaps(kind: str, indices: Sequence[int]) -> bool:
+    return kind == "sequence" and any(right != left + 1 for left, right in zip(indices, indices[1:]))
+
+
+def _load_source_nrrd(
+    spec: VolumeInputSpec, image_shape: Tuple[int, int, int], *,
+    warnings: WarningLog, force: bool, nrrd_z_start_index: Optional[int],
+) -> Tuple[np.ndarray, Optional[Tuple[int, ...]], Optional[MaskPlaneSummary]]:
+    path = spec.segmentation_nrrd_path
+    if path is None:
+        raise RuntimeError(f"Internal error: NRRD label source missing for {spec.stem}")
+    summaries: List[MaskPlaneSummary] = []
+    if nrrd_z_start_index is not None:
+        if not force:
+            raise ValueError("--nrrd_z_start_index requires --force")
+        image_indices = range(image_shape[0]) if spec.kind == "video" else spec.encoded_indices
+        planes = tuple(index - nrrd_z_start_index for index in image_indices)
+        mask, matched = load_indexed_nrrd_mask_for_volume(
+            path, image_shape, source_plane_indices=planes, warnings=warnings, force=force,
+            plane_summary_out=summaries)
+        return mask, matched, (summaries[0] if summaries else None)
+    mask = load_nrrd_mask_for_volume(
+        path, image_shape, warnings=warnings, force=force,
+        source_contiguous=not _sequence_has_index_gaps(spec.kind, spec.encoded_indices),
+        plane_summary_out=summaries,
+    )
+    return mask, None, (summaries[0] if summaries else None)
+
+
 @runtime_telemetry_phase('pta.input.load')
 @_release_failed_allocator_blocks
 def load_source_volume_from_spec(
@@ -2160,25 +2280,26 @@ def load_source_volume_from_spec(
     load_cpu_order: Sequence[int] = (),
     channel_variants: Optional[Sequence[ChannelVariant]] = None,
     force: bool = False,
+    nrrd_z_start_index: Optional[int] = None,
     require_all_sequence_frames: bool = False,
 ) -> SourceVolume:
+    matched_frames: Optional[Tuple[int, ...]] = None
+    mask_summary: Optional[MaskPlaneSummary] = None
     if spec.kind == "video":
         if spec.video_path is None:
             raise RuntimeError(f"Internal error: video spec for {spec.stem} has no video path")
         info = getattr(spec, 'video_info_hint', None) or ffprobe_info(spec.video_path)
         mask_volume: Optional[np.ndarray] = None
         if spec.label_source == 'nrrd' and int(workers) >= 2:
-            if spec.segmentation_nrrd_path is None:
-                raise RuntimeError(f"Internal error: NRRD label source missing for {spec.stem}")
             expected_shape = (int(info['num_frames']), int(info['height']), int(info['width']))
             volume_block = None
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix='pta-input-mask') as inputs:
-                mask_future = inputs.submit(load_nrrd_mask_for_volume, spec.segmentation_nrrd_path,
-                    expected_shape, warnings=warnings)
+                mask_future = inputs.submit(_load_source_nrrd, spec, expected_shape,
+                    warnings=warnings, force=force, nrrd_z_start_index=nrrd_z_start_index)
                 try:
                     volume, fps, volume_block = decode_video_gray8_to_memory(
                         spec.video_path, warnings=warnings, allocator=allocator, probe_info=info)
-                    mask_volume = mask_future.result()
+                    mask_volume, matched_frames, mask_summary = mask_future.result()
                 except BaseException:
                     mask_future.cancel()
                     if volume_block is not None:
@@ -2201,9 +2322,8 @@ def load_source_volume_from_spec(
             if sorted(labels_by_frame.keys()) != list(range(frame_count)):
                 raise ValueError(f"Video label frame mapping for {spec.stem} does not cover every decoded frame")
         elif spec.label_source == "nrrd" and mask_volume is None:
-            if spec.segmentation_nrrd_path is None:
-                raise RuntimeError(f"Internal error: NRRD label source missing for {spec.stem}")
-            mask_volume = load_nrrd_mask_for_volume(spec.segmentation_nrrd_path, tuple(volume.shape), warnings=warnings)
+            mask_volume, matched_frames, mask_summary = _load_source_nrrd(spec, tuple(volume.shape),
+                warnings=warnings, force=force, nrrd_z_start_index=nrrd_z_start_index)
         return SourceVolume(
             input_dir=spec.input_dir,
             stem=spec.stem,
@@ -2213,7 +2333,8 @@ def load_source_volume_from_spec(
             labels_by_frame=labels_by_frame,
             segmentation_nrrd_path=spec.segmentation_nrrd_path,
             mask_volume=mask_volume,
-            volume_class=spec.volume_class,
+            volume_class=("partially_labeled" if matched_frames is not None and len(matched_frames) < frame_count
+                          else spec.volume_class),
             label_source=spec.label_source,
             input_start_index=spec.input_start_index,
             encoded_indices=spec.encoded_indices,
@@ -2221,6 +2342,8 @@ def load_source_volume_from_spec(
             fps=fps,
             yolo_polygons_by_frame=polygons_by_frame,
             volume_block=volume_block,
+            matched_frame_indices=matched_frames,
+            mask_plane_summary=mask_summary,
         )
 
     ordered_indices = sorted(int(x) for x in spec.image_paths_by_index.keys())
@@ -2245,15 +2368,16 @@ def load_source_volume_from_spec(
     mask_volume: Optional[np.ndarray] = None
     if spec.label_source == "yolo":
         labels_by_frame = map_sequence_labels_by_frame(ordered_indices, spec.labels_by_index)
+        if spec.indexed_yolo_fallback:
+            matched_frames = tuple(labels_by_frame)
         polygons_by_frame = {
             frame_i0: spec.yolo_polygons_by_index.get(int(encoded_idx), tuple())
             for frame_i0, encoded_idx in enumerate(ordered_indices)
             if int(encoded_idx) in spec.labels_by_index
         }
     elif spec.label_source == "nrrd":
-        if spec.segmentation_nrrd_path is None:
-            raise RuntimeError(f"Internal error: NRRD label source missing for {spec.stem}")
-        mask_volume = load_nrrd_mask_for_volume(spec.segmentation_nrrd_path, tuple(volume.shape), warnings=warnings)
+        mask_volume, matched_frames, mask_summary = _load_source_nrrd(spec, tuple(volume.shape),
+            warnings=warnings, force=force, nrrd_z_start_index=nrrd_z_start_index)
     return SourceVolume(
         input_dir=spec.input_dir,
         stem=spec.stem,
@@ -2263,7 +2387,8 @@ def load_source_volume_from_spec(
         labels_by_frame=labels_by_frame,
         segmentation_nrrd_path=spec.segmentation_nrrd_path,
         mask_volume=mask_volume,
-        volume_class=spec.volume_class,
+        volume_class=("partially_labeled" if matched_frames is not None and len(matched_frames) < len(ordered_indices)
+                      else spec.volume_class),
         label_source=spec.label_source,
         input_start_index=spec.input_start_index,
         encoded_indices=spec.encoded_indices,
@@ -2271,6 +2396,8 @@ def load_source_volume_from_spec(
         fps=1.0,
         yolo_polygons_by_frame=polygons_by_frame,
         volume_block=volume_block,
+        matched_frame_indices=matched_frames,
+        mask_plane_summary=mask_summary,
     )
 
 
@@ -2288,18 +2415,21 @@ def prepare_loaded_source(
     write_side_effects: bool,
     allocator: Optional[ArrayAllocator] = None,
     preprocessing_device_ids: Sequence[int] = (),
+    defer_cpr: bool = False,
 ) -> PreparedVolume:
+    """Preprocess one loaded source and plan its views.
+
+    With ``defer_cpr`` CPR centerline extraction is returned as ``cpr_pending``
+    instead of run; complete_cpr_views() must append its views and plans (or
+    _release_render_state() abandon it) before the volume's plans are final.
+    """
     source_shape = tuple(int(x) for x in src.volume.shape)
-    effective_volume_class = effective_class(src.volume_class, force=bool(args.force))
-    source_encoded_gaps = bool(
-        src.kind == "sequence"
-        and len(src.encoded_indices) > 1
-        and any(
-            int(src.encoded_indices[index + 1]) != int(src.encoded_indices[index]) + 1
-            for index in range(len(src.encoded_indices) - 1)
-        )
-    )
-    if src.volume_class == "partially_labeled" and bool(args.force):
+    source_encoded_gaps = _sequence_has_index_gaps(src.kind, src.encoded_indices)
+    slice_matched = src.matched_frame_indices is not None
+    contiguous_volume = not source_encoded_gaps and not slice_matched
+    effective_volume_class = effective_class(src.volume_class, force=bool(args.force) and contiguous_volume)
+    native_only = not contiguous_volume or effective_volume_class == "partially_labeled"
+    if src.volume_class == "partially_labeled" and effective_volume_class == "fully_labeled":
         warnings.add(
             "partial_volume_forced_as_fully_labeled",
             f"{src.stem}: --force supplied; complete contiguous volumes may use 3D views, "
@@ -2319,6 +2449,7 @@ def prepare_loaded_source(
         warnings.add("binary_disabled_for_unlabeled_volume", f"{src.stem}: --save binary requires labels or an NRRD segmentation")
 
     mask_block: Optional[SharedBlock] = None
+    plane_summary: Optional[MaskPlaneSummary] = None
     if src.label_source == "yolo":
         print(f"Rasterizing YOLO labels for {src.stem} (t,Y,X)={source_shape}")
         mask, mask_block = rasterize_yolo_labels(src, warnings=warnings, workers=workers, allocator=allocator)
@@ -2326,6 +2457,10 @@ def prepare_loaded_source(
         if src.mask_volume is None:
             raise RuntimeError("Internal error: SourceVolume label_source is nrrd but mask_volume is missing")
         mask = np.ascontiguousarray(src.mask_volume, dtype=np.uint8)
+        # The reader's summary describes only that array as read. Nothing writes it before the
+        # anchors below, but later preprocessing does, so the summary is used once.
+        plane_summary = src.mask_plane_summary if mask is src.mask_volume else None
+        src.mask_plane_summary = None
         warnings.add("mask_volume_loaded_in_memory", f"{src.stem}: {mask.shape}, {mask.nbytes / GIB:.2f} GiB")
     else:
         if allocator is not None:
@@ -2337,13 +2472,13 @@ def prepare_loaded_source(
     if tuple(int(x) for x in mask.shape) != source_shape:
         raise ValueError(f"Image and mask volumes must match before preprocessing for {src.stem}: image={source_shape}, mask={mask.shape}")
 
-    annotation_states = derive_annotation_states(src, mask)
+    annotation_states = derive_annotation_states(src, mask, plane_summary=plane_summary)
     semantic_coverage: Optional[np.ndarray] = None
     if (
         bool(getattr(args, "save_semantic", False))
         and src.label_source == "yolo"
         and src.volume_class == "partially_labeled"
-        and bool(args.force)
+        and not native_only
     ):
         # Missing YOLO files carry unknown labels. Keep this separate from the
         # binary foreground mask through smoothing, resize, and view geometry.
@@ -2353,16 +2488,10 @@ def prepare_loaded_source(
                 semantic_coverage[frame_index] = 1
     state_counts = annotation_state_counts(annotation_states)
     unannotated_count = int(state_counts["unannotated"])
-    if (
-        src.volume_class == "partially_labeled"
-        and src.label_source == "yolo"
-        and unannotated_count > 0
-        and effective_volume_class == "partially_labeled"
-    ):
+    if label_enabled and native_only and unannotated_count:
         message = (
-            f"{src.stem}: {unannotated_count} image slice(s) have no matching YOLO label file. "
-            "They may be used as non-center image channels, but they will never be emitted as "
-            "foreground/background center samples."
+            f"{src.stem}: {unannotated_count} image slice(s) have no matching annotation. "
+            "Only matched slices are eligible as training centers."
         )
         warnings.add("unannotated_center_slices_excluded", message)
         print(f"WARNING: {message}", file=sys.stderr)
@@ -2384,7 +2513,9 @@ def prepare_loaded_source(
         mask,
         annotation_states,
         warnings=warnings,
+        plane_summary=plane_summary,
     ) if label_enabled else (tuple(), 0)
+    plane_summary = None  # Preprocessing below writes the mask in place.
     foreground_preservation_stats: Dict[str, int] = {
         "input_foreground_transverse_slices": int(len(foreground_anchors)),
         "source_polygon_anchor_seeds": int(source_anchor_seeds),
@@ -2399,15 +2530,23 @@ def prepare_loaded_source(
 
     nrrd_paths: List[Path] = []
     if write_side_effects and label_enabled and bool(args.save_nrrd):
-        nrrd_paths.append(write_nrrd(mask, out_dir / "nrrds" / f"{src.stem}_Pass_0.nrrd"))
+        if args.force and native_only and unannotated_count:
+            message = (
+                f"{src.stem}: skipped the dense binary NRRD snapshot. Its background value would "
+                f"mark {unannotated_count} unmatched image planes as annotated."
+            )
+            warnings.add("nrrd_snapshot_skipped_for_unmatched_planes", message)
+            print(f"WARNING: {message}", file=sys.stderr)
+        else:
+            nrrd_paths.append(write_nrrd(mask, out_dir / "nrrds" / f"{src.stem}_Pass_0.nrrd"))
 
     hole_fill_2d_stats: Optional[Dict[str, object]] = None
     if bool(getattr(args, "enable_2D_hole_fill", False)):
-        if label_enabled and effective_volume_class == "fully_labeled" and not source_encoded_gaps:
+        if label_enabled and not native_only:
             from .pta_preprocessing import fill_orthogonal_mask_holes_2d_inplace
 
             with runtime_telemetry().span('pta.prepare.hole_fill_2d'):
-                hole_fill_2d_stats = fill_orthogonal_mask_holes_2d_inplace(mask)
+                hole_fill_2d_stats = fill_orthogonal_mask_holes_2d_inplace(mask, workers=max(1, int(workers)))
             if write_side_effects and bool(args.save_nrrd):
                 nrrd_paths.append(write_nrrd(mask, out_dir / "nrrds" / f"{src.stem}_HoleFill2D.nrrd"))
         elif not label_enabled:
@@ -2415,47 +2554,69 @@ def prepare_loaded_source(
         elif source_encoded_gaps:
             warnings.add("2d_hole_fill_disabled_for_encoded_gaps", f"{src.stem}: numeric source-index gaps do not define adjacent 3D samples")
         else:
-            warnings.add("2d_hole_fill_disabled_for_partial_volume", f"{src.stem}: Partial volumes disable 3D label transformations unless --force is supplied")
+            warnings.add("2d_hole_fill_disabled_for_partial_volume", f"{src.stem}: transverse-only inputs preserve native label planes")
 
     void_fill_stats: Optional[Dict[str, object]] = None
     if bool(getattr(args, "enable_3d_void_fill", False)):
-        if label_enabled and effective_volume_class == "fully_labeled" and not source_encoded_gaps:
+        if label_enabled and not native_only:
             connectivity_text = os.environ.get("YOLO_TTA_VOIDFILL_CONNECTIVITY", "").strip()
             try:
                 connectivity = int(connectivity_text) if connectivity_text else 6
             except ValueError:
                 connectivity = 6  # Match the shared helper's legacy invalid-text fallback.
-            accelerator = {}
-            with runtime_telemetry().span('pta.prepare.void_fill'):
-                foreground_before = int(np.count_nonzero(mask))
-                gpu_minimum = _VOID_FILL_GPU_MIN_VOXELS * (2 if len(preprocessing_device_ids) == 1 else 1)
-                if preprocessing_device_ids and mask.size >= gpu_minimum:
-                    from .pta_preprocessing import run_gpu_preprocessing
-                    try:
-                        accelerator = run_gpu_preprocessing(
-                            mask, operation="void_fill", device_ids=preprocessing_device_ids,
-                            work_prefix=out_dir/".v18_work"/src.stem/"void_fill",
-                            connectivity=connectivity,
+            if _void_fill_proven_noop(hole_fill_2d_stats, mask):
+                # Proven no-op: the final YZ hole-fill pass leaves every background
+                # voxel 4-connected in its (T, Y) plane to the plane edge, which lies
+                # on a volume face. Void fill treats face-touching background as
+                # exterior at connectivity 6/18/26, so it cannot add voxels.
+                # To restore the fill, remove this branch so the original GPU/CPU
+                # dispatch below runs again; its CPU invocation is:
+                # fill_3d_voids_inplace_streaming(
+                #     mask, out_dir/".v18_work"/src.stem/"void_fill", connectivity=connectivity,
+                # )
+                if connectivity not in (6, 18, 26):
+                    raise ValueError("3D void fill connectivity must be one of 6, 18, or 26")
+                runtime_telemetry().add('pta.prepare.void_fill.skipped_proven_noop')
+                print(f"{src.stem}: 3D void fill skipped; the complete 2D hole fill proves it adds no voxels", flush=True)
+                void_fill_stats = {"background_connectivity": connectivity, "added_voxels": 0,
+                                   "backend": "skipped",
+                                   "reason": "skipped_proven_noop_after_2d_hole_fill"}
+                if voxel_initial is not None:
+                    # Hole filling only sets background voxels, so this count is exact.
+                    foreground = int(voxel_initial) + int(hole_fill_2d_stats["added_voxels"])
+                    void_fill_stats.update(foreground_before=foreground, foreground_after=foreground)
+            else:
+                accelerator = {}
+                with runtime_telemetry().span('pta.prepare.void_fill'):
+                    foreground_before = int(np.count_nonzero(mask))
+                    gpu_minimum = _VOID_FILL_GPU_MIN_VOXELS * (2 if len(preprocessing_device_ids) == 1 else 1)
+                    if preprocessing_device_ids and mask.size >= gpu_minimum:
+                        from .pta_preprocessing import run_gpu_preprocessing
+                        try:
+                            accelerator = run_gpu_preprocessing(
+                                mask, operation="void_fill", device_ids=preprocessing_device_ids,
+                                work_prefix=out_dir/".v18_work"/src.stem/"void_fill",
+                                connectivity=connectivity,
+                            )
+                            if accelerator.get("fallback_reason"):
+                                warnings.add("void_fill_gpu_fallback", str(accelerator["fallback_reason"]))
+                        except Exception as exc:
+                            runtime_telemetry().fallback('pta.prepare.void_fill.gpu', exc)
+                            warnings.add("void_fill_gpu_fallback", f"{type(exc).__name__}: {exc}")
+                            print(f"GPU void fill unavailable; using CPU: {type(exc).__name__}: {exc}")
+                            accelerator = {"backend": "cpu", "gpu_fallback_reason": f"{type(exc).__name__}: {exc}"}
+                    if not accelerator or "gpu_fallback_reason" in accelerator:
+                        fill_3d_voids_inplace_streaming(
+                            mask, out_dir/".v18_work"/src.stem/"void_fill", connectivity=connectivity,
                         )
-                        if accelerator.get("fallback_reason"):
-                            warnings.add("void_fill_gpu_fallback", str(accelerator["fallback_reason"]))
-                    except Exception as exc:
-                        runtime_telemetry().fallback('pta.prepare.void_fill.gpu', exc)
-                        warnings.add("void_fill_gpu_fallback", f"{type(exc).__name__}: {exc}")
-                        print(f"GPU void fill unavailable; using CPU: {type(exc).__name__}: {exc}")
-                        accelerator = {"backend": "cpu", "gpu_fallback_reason": f"{type(exc).__name__}: {exc}"}
-                if not accelerator or "gpu_fallback_reason" in accelerator:
-                    fill_3d_voids_inplace_streaming(
-                        mask, out_dir/".v18_work"/src.stem/"void_fill", connectivity=connectivity,
-                    )
-                foreground_after = int(np.count_nonzero(mask))
-            void_fill_stats = {
-                "background_connectivity": connectivity,
-                "foreground_before": foreground_before,
-                "foreground_after": foreground_after,
-                "added_voxels": foreground_after - foreground_before,
-                **accelerator,
-            }
+                    foreground_after = int(np.count_nonzero(mask))
+                void_fill_stats = {
+                    "background_connectivity": connectivity,
+                    "foreground_before": foreground_before,
+                    "foreground_after": foreground_after,
+                    "added_voxels": foreground_after - foreground_before,
+                    **accelerator,
+                }
             if write_side_effects and bool(args.save_nrrd):
                 nrrd_paths.append(write_nrrd(mask, out_dir / "nrrds" / f"{src.stem}_VoidFill.nrrd"))
         elif not label_enabled:
@@ -2463,16 +2624,11 @@ def prepare_loaded_source(
         elif source_encoded_gaps:
             warnings.add("3d_void_fill_disabled_for_encoded_gaps", f"{src.stem}: numeric source-index gaps do not define adjacent 3D samples")
         else:
-            warnings.add("3d_void_fill_disabled_for_partial_volume", f"{src.stem}: Partial volumes disable 3D label transformations unless --force is supplied")
+            warnings.add("3d_void_fill_disabled_for_partial_volume", f"{src.stem}: transverse-only inputs preserve native label planes")
 
     smoothing_stats: List[Dict[str, object]] = []
     gaussian_requested = float(args.gaussian_smoothing) > 0.0 and int(args.gaussian_smoothing_passes) > 0
-    if (
-        label_enabled
-        and effective_volume_class == "fully_labeled"
-        and gaussian_requested
-        and not source_encoded_gaps
-    ):
+    if label_enabled and not native_only and gaussian_requested:
         def _save_gaussian_pass_nrrd(pass_idx: int, current_mask: np.ndarray) -> None:
             if write_side_effects and bool(args.save_nrrd):
                 nrrd_paths.append(write_nrrd(current_mask, out_dir / "nrrds" / f"{src.stem}_Pass_{int(pass_idx)}.nrrd"))
@@ -2491,20 +2647,16 @@ def prepare_loaded_source(
             "gaussian_smoothing_disabled_for_encoded_gaps",
             f"{src.stem}: numeric source-index gaps do not define adjacent 3D samples",
         )
-    elif label_enabled and effective_volume_class == "partially_labeled" and gaussian_requested:
-        warnings.add("gaussian_smoothing_disabled_for_partial_volume", f"{src.stem}: Partial volumes disable 3D label transformations unless --force is supplied")
+    elif label_enabled and native_only and gaussian_requested:
+        warnings.add("gaussian_smoothing_disabled_for_partial_volume", f"{src.stem}: transverse-only inputs preserve native label planes")
     elif not label_enabled and gaussian_requested:
         warnings.add("gaussian_smoothing_disabled_for_unlabeled_volume", f"{src.stem}: Unlabeled volumes disable label operations")
 
     voxel_final = int(np.count_nonzero(mask)) if (label_enabled and bool(args.voxel_volume)) else None
 
-    cube_resize_eligible = bool(
-        effective_volume_class in {"fully_labeled", "unlabeled"}
-        and not source_encoded_gaps
-    )
     cube_volume_block = cube_mask_block = cube_coverage_block = None
     cube_blocks: List[SharedBlock] = []
-    if cube_resize_eligible:
+    if not native_only:
         try:
             destinations = None
             target_shape = shared_media.compute_cube_resize_shape(*source_shape)
@@ -2553,6 +2705,9 @@ def prepare_loaded_source(
                 f"{src.stem}: numeric source-index gaps retain native depth; only explicitly "
                 "enabled transverse/tiled-transverse outputs are eligible",
             )
+        elif slice_matched:
+            warnings.add("cubic_resize_disabled_for_slice_matching",
+                         f"{src.stem}: explicitly matched planes retain their source Z positions")
         else:
             warnings.add(
                 "cubic_resize_disabled_for_partial_volume",
@@ -2560,7 +2715,7 @@ def prepare_loaded_source(
                 "transverse/tiled-transverse outputs are eligible unless --force is supplied",
             )
 
-    if cube_resize_eligible and int(processing_shape[0]) < int(source_shape[0]):
+    if not native_only and int(processing_shape[0]) < int(source_shape[0]):
         raise RuntimeError(
             f"C1 preservation invariant failed for {src.stem}: processed transverse depth "
             f"{processing_shape[0]} is smaller than input depth {source_shape[0]}"
@@ -2608,8 +2763,6 @@ def prepare_loaded_source(
     v18_config = getattr(args, "_v18_config", None)
     if v18_config is None:
         raise RuntimeError("PTA volume preparation requires a resolved configuration")
-    encoded_gaps = bool(source_encoded_gaps)
-    native_only = bool(effective_volume_class == "partially_labeled" or encoded_gaps)
     effective_config = v18_config
     if native_only:
         allowed_cartesian = tuple(
@@ -2623,11 +2776,8 @@ def prepare_loaded_source(
             *(f"tilted:{','.join(group.views)}" for group in v18_config.tilted_groups),
         ]
         if disabled:
-            reason = (
-                "unforced partial-label eligibility"
-                if effective_volume_class == "partially_labeled"
-                else "encoded slice gaps that cannot define adjacent 3D samples"
-            )
+            reason = "transverse-only slice matching" if slice_matched else (
+                "encoded slice gaps" if source_encoded_gaps else "partial annotation coverage")
             warnings.add(
                 "partial_volume_3d_views_disabled",
                 f"{src.stem}: {reason}; disabled {', '.join(disabled)}",
@@ -2647,37 +2797,6 @@ def prepare_loaded_source(
         config=effective_config,
         azimuthal_native_raster=int(args.imgsz),
     )
-    if bool(getattr(args, "enable_cpr", False)):
-        if not label_enabled or effective_volume_class == "partially_labeled" or source_encoded_gaps:
-            warnings.add(
-                "cpr_disabled_without_complete_ground_truth",
-                f"{src.stem}: CPR requires a complete labeled volume with adjacent source slices; "
-                "--force can enable complete-volume treatment of partial labels",
-            )
-        else:
-            from .pta_cpr import extract_cpr_geometries
-
-            geometries = extract_cpr_geometries(
-                mask_for_render,
-                raster_size=int(args.imgsz),
-                warn=lambda message: warnings.add("cpr_centerline_unavailable", f"{src.stem}: {message}"),
-            )
-            for geometry in geometries:
-                views.append(ViewInfo(
-                    name=f"cpr_branch{geometry.branch_id:04d}",
-                    display_name=f"CPR_branch{geometry.branch_id:04d}",
-                    family="cpr", num_slices=geometry.num_slices,
-                    src_h=geometry.height, src_w=geometry.width, pad_mode="clamp",
-                    full_t=int(t_dim), full_h=int(h), full_w=int(w),
-                    cpr_geometry=geometry,
-                ))
-            print(f"{src.stem}: CPR: {len(geometries)} centerline branch(es), "
-                  f"{sum(item.num_slices for item in geometries)} perpendicular cross-section images; "
-                  "centered native patches at one processing voxel per pixel; "
-                  + (f"patch size {int(args.imgsz)} from --imgsz"
-                     if int(args.imgsz) > 0 else f"default patch size {max(processing_shape)} from longest processing axis"))
-            if not geometries:
-                warnings.add("cpr_centerline_unavailable", f"{src.stem}: no usable tubular centerline; CPR produced no views")
     for request, diameter, spacing in zip(
         effective_config.azimuthal_requests,
         compiled_views.azimuthal_diameters,
@@ -2709,33 +2828,74 @@ def prepare_loaded_source(
         warnings.add("custom_channel_continuity_unavailable_after_forced_depth_resize", continuity_message)
         print(f"WARNING: {continuity_message}", file=sys.stderr)
 
-    plans = build_plans_for_views(
-        views=views,
-        out_dir=out_dir,
-        stem=src.stem,
-        tile_configs=tile_configs,
-        save_overlay=save_overlay,
-        imgsz=int(args.imgsz),
-        label_enabled=bool(label_enabled),
-        image_format=str(args.output_format),
-        channel_variants=channel_variants,
-        center_eligible_frame_indices=(
-            tuple(
-                idx for idx, state in enumerate(annotation_states)
-                if int(state) != ANNOTATION_UNANNOTATED
+    def build_plans(plan_views: Sequence[ViewInfo]) -> List[RenderPlan]:
+        return build_plans_for_views(
+            views=plan_views,
+            out_dir=out_dir,
+            stem=src.stem,
+            tile_configs=tile_configs,
+            save_overlay=save_overlay,
+            imgsz=int(args.imgsz),
+            label_enabled=bool(label_enabled),
+            image_format=str(args.output_format),
+            channel_variants=channel_variants,
+            center_eligible_frame_indices=(
+                tuple(
+                    idx for idx, state in enumerate(annotation_states)
+                    if int(state) != ANNOTATION_UNANNOTATED
+                )
+                if label_enabled and native_only and unannotated_count
+                else None
+            ),
+            transverse_source_encoded_indices=native_partial_encoded_indices,
+            warnings=warnings,
+            publish_images=bool(getattr(args, "save_images", True)),
+            publish_labels=bool(getattr(args, "save_labels", True)),
+        )
+
+    cpr_pending: Optional[PendingCprViews] = None
+    if bool(getattr(args, "enable_cpr", False)):
+        if not label_enabled or native_only:
+            warnings.add(
+                "cpr_disabled_without_complete_ground_truth",
+                f"{src.stem}: CPR requires full-volume geometry with adjacent labeled planes",
             )
-            if (
-                src.volume_class == "partially_labeled"
-                and effective_volume_class == "partially_labeled"
-                and src.label_source == "yolo"
-            )
-            else None
-        ),
-        transverse_source_encoded_indices=native_partial_encoded_indices,
-        warnings=warnings,
-        publish_images=bool(getattr(args, "save_images", True)),
-        publish_labels=bool(getattr(args, "save_labels", True)),
-    )
+        else:
+            from .pta_cpr import extract_cpr_geometries
+
+            cpr_cancel = threading.Event()
+
+            def extract_cpr_views() -> List[ViewInfo]:
+                with runtime_telemetry().span('pta.prepare.cpr_extract'):
+                    geometries = extract_cpr_geometries(
+                        mask_for_render,
+                        raster_size=int(args.imgsz),
+                        warn=lambda message: warnings.add("cpr_centerline_unavailable", f"{src.stem}: {message}"),
+                        workers=max(1, int(workers)),
+                        cancel=cpr_cancel,
+                    )
+                print(f"{src.stem}: CPR: {len(geometries)} centerline branch(es), "
+                      f"{sum(item.num_slices for item in geometries)} perpendicular cross-section images; "
+                      "centered native patches at one processing voxel per pixel; "
+                      + (f"patch size {int(args.imgsz)} from --imgsz"
+                         if int(args.imgsz) > 0 else f"default patch size {max(processing_shape)} from longest processing axis"))
+                if not geometries:
+                    warnings.add("cpr_centerline_unavailable", f"{src.stem}: no usable tubular centerline; CPR produced no views")
+                return [ViewInfo(
+                    name=f"cpr_branch{geometry.branch_id:04d}",
+                    display_name=f"CPR_branch{geometry.branch_id:04d}",
+                    family="cpr", num_slices=geometry.num_slices,
+                    src_h=geometry.height, src_w=geometry.width, pad_mode="clamp",
+                    full_t=int(t_dim), full_h=int(h), full_w=int(w),
+                    cpr_geometry=geometry,
+                ) for geometry in geometries]
+
+            if defer_cpr:
+                # The mask is final here; nothing below changes it.
+                cpr_pending = PendingCprViews(extract_cpr_views, cpr_cancel, build_plans)
+            else:
+                views.extend(extract_cpr_views())
+    plans = build_plans(views)
 
     return PreparedVolume(
         src=src,
@@ -2762,7 +2922,30 @@ def prepare_loaded_source(
         mask_render_block=mask_render_block,
         semantic_coverage_render_block=semantic_coverage_render_block,
         shm_blocks=owned_blocks,
+        cpr_pending=cpr_pending,
     )
+
+
+def complete_cpr_views(prep: PreparedVolume) -> List[RenderPlan]:
+    """Finish deferred CPR extraction and append its views and plans.
+
+    They follow every other view and plan, as with inline extraction, so plan
+    indices, candidate order and identities are unchanged. An extraction error
+    propagates here unchanged.
+    """
+    pending = prep.cpr_pending
+    if pending is None:
+        return []
+    if pending.future is None:
+        cpr_views = pending.extract()
+    else:
+        with runtime_telemetry().span('pta.prepare.cpr_wait'):
+            cpr_views = pending.future.result()
+    prep.cpr_pending = None
+    cpr_plans = pending.build_plans(cpr_views)
+    prep.views.extend(cpr_views)
+    prep.plans.extend(cpr_plans)
+    return cpr_plans
 
 
 def _source_frames_for_processed_transverse(prep: PreparedVolume, frame_idx: int) -> range:
@@ -2910,6 +3093,79 @@ def classify_semantic_full_transverse_for_preservation(
     return foregrounds
 
 
+def _selected_classification_items(selected_candidates):
+    if selected_candidates is None:
+        return None
+    selected_items = defaultdict(set)
+    for candidate in selected_candidates:
+        selected_items[(candidate.parent_view_tag, int(candidate.frame_idx))].add(candidate.item_key)
+    return selected_items
+
+
+def _uses_yolo_classification_geometry(prep: PreparedVolume) -> bool:
+    return bool(
+        not prep.semantic_foreground
+        and prep.src.label_source == "yolo"
+        and bool(prep.src.yolo_polygons_by_frame or prep.src.labels_by_frame)
+        and not prep.smoothing_stats
+        and not getattr(prep, "void_fill_stats", None)
+        and not getattr(prep, "hole_fill_2d_stats", None)
+    )
+
+
+def _classification_jobs(prep: PreparedVolume, selected_items) -> List[Tuple[int, int]]:
+    if selected_items is None:
+        return list(iter_render_source_frame_jobs_round_robin(prep.plans))
+    plan_indices = {plan.tag: index for index, plan in enumerate(prep.plans)}
+    return [(plan_indices[tag], frame_idx) for tag, frame_idx in selected_items]
+
+
+@dataclass
+class GpuClassificationPrefetch:
+    """CUDA owner decisions for the dense jobs of a prefix of a volume's plans."""
+    plans: Tuple[RenderPlan, ...]
+    jobs: List[Tuple[int, int]]
+    foregrounds: Dict[Tuple[str, int, str, int], bool]
+    remaining: List[Tuple[int, int]]
+    stats: Dict[str, object]
+
+
+def prefetch_original_foregrounds_on_gpu(
+    prep: PreparedVolume,
+    *,
+    gpu_pool: PersistentRenderPool,
+    selected_candidates: Optional[Sequence[OutputCandidate]] = None,
+    generation: int = 0,
+) -> Optional[GpuClassificationPrefetch]:
+    """Classify the current plans' dense jobs on the CUDA owners ahead of the full call.
+
+    It runs while CPR plans are still being extracted; the full call then sends
+    only the other jobs. It is skipped (None) unless the prepared anchors prove
+    the mask nonempty and no coverage scan applies, so that the full call
+    certainly sends these same jobs to the GPU.
+    """
+    known_foreground_slices = getattr(prep, "foreground_preservation_stats", {}).get(
+        "guaranteed_output_foreground_transverse_slices"
+    )
+    if (not prep.label_enabled or known_foreground_slices is None or int(known_foreground_slices) <= 0
+            or (prep.semantic_foreground and prep.semantic_coverage_for_render is not None)):
+        return None
+    selected_items = _selected_classification_items(selected_candidates)
+    use_yolo_geometry = _uses_yolo_classification_geometry(prep)
+    jobs = sorted(
+        (int(plan_idx), int(frame_idx)) for plan_idx, frame_idx in _classification_jobs(prep, selected_items)
+        if not (use_yolo_geometry and prep.plans[int(plan_idx)].view.family == "transverse")
+    )
+    if not jobs:
+        return None
+    with runtime_telemetry().span('pta.classify.originals.gpu_prefetch'):
+        foregrounds, remaining, stats = gpu_pool.classify_foregrounds(
+            prep, gen=int(generation), jobs=jobs, selected_items=selected_items,
+        )
+    return GpuClassificationPrefetch(tuple(prep.plans), jobs, dict(foregrounds),
+                                     [tuple(job) for job in remaining], dict(stats))
+
+
 @runtime_telemetry_phase('pta.classify.originals')
 def classify_original_foregrounds_for_volume(
     prep: PreparedVolume,
@@ -2919,6 +3175,7 @@ def classify_original_foregrounds_for_volume(
     selected_candidates: Optional[Sequence[OutputCandidate]] = None,
     gpu_pool: Optional[PersistentRenderPool] = None,
     generation: int = 0,
+    gpu_prefetch: Optional[GpuClassificationPrefetch] = None,
 ) -> Dict[Tuple[str, int, str, int], bool]:
     """Classify copy-0 (original) frames/tiles as foreground/background.
 
@@ -2927,17 +3184,14 @@ def classify_original_foregrounds_for_volume(
     invariant enforced at render time; copies of a foreground original are
     presumed foreground for budgeting and reconciled when the render pass
     replays them (a copy that renders background is dropped).
+    ``gpu_prefetch`` supplies GPU decisions already made for some dense jobs.
     """
     foregrounds: Dict[Tuple[str, int, str, int], bool] = {}
     if not prep.label_enabled:
         return foregrounds
-    selected_items = None
-    if selected_candidates is not None:
-        selected_items = defaultdict(set)
-        for candidate in selected_candidates:
-            selected_items[(candidate.parent_view_tag, int(candidate.frame_idx))].add(candidate.item_key)
-        if not selected_items:
-            return foregrounds
+    selected_items = _selected_classification_items(selected_candidates)
+    if selected_items is not None and not selected_items:
+        return foregrounds
 
     def classification_plan(plan_index: int, frame_idx: int) -> RenderPlan:
         plan = prep.plans[int(plan_index)]
@@ -2957,14 +3211,7 @@ def classify_original_foregrounds_for_volume(
     # source-space intersection can be empty even when tilted categorical
     # projections overlap after each plane is rendered separately.
     coverage_volume = prep.semantic_coverage_for_render if prep.semantic_foreground else None
-    use_yolo_geometry = (
-        not prep.semantic_foreground
-        and prep.src.label_source == "yolo"
-        and bool(prep.src.yolo_polygons_by_frame or prep.src.labels_by_frame)
-        and not prep.smoothing_stats
-        and not getattr(prep, "void_fill_stats", None)
-        and not getattr(prep, "hole_fill_2d_stats", None)
-    )
+    use_yolo_geometry = _uses_yolo_classification_geometry(prep)
     known_foreground_slices = getattr(prep, "foreground_preservation_stats", {}).get(
         "guaranteed_output_foreground_transverse_slices"
     )
@@ -2972,15 +3219,16 @@ def classify_original_foregrounds_for_volume(
     if (use_yolo_geometry and known_foreground_slices is not None
             and all(plan.view.family == "transverse" for plan in prep.plans)):
         all_empty = int(known_foreground_slices) == 0
+    elif known_foreground_slices is not None and int(known_foreground_slices) > 0:
+        # Preparation reasserted those anchors on this render mask after its
+        # last change and verified each guaranteed slice holds foreground.
+        all_empty = False
     else:
-        all_empty = not bool(np.any(prep.mask_for_render))
+        # count_nonzero streams uint8 far faster than np.any's reduction.
+        all_empty = np.count_nonzero(prep.mask_for_render) == 0
     if not all_empty and coverage_volume is not None:
-        all_empty = not bool(np.any(coverage_volume))
-    if selected_items is None:
-        jobs = list(iter_render_source_frame_jobs_round_robin(prep.plans))
-    else:
-        plan_indices = {plan.tag: index for index, plan in enumerate(prep.plans)}
-        jobs = [(plan_indices[tag], frame_idx) for tag, frame_idx in selected_items]
+        all_empty = np.count_nonzero(coverage_volume) == 0
+    jobs = _classification_jobs(prep, selected_items)
     if not jobs:
         return foregrounds
     if all_empty:
@@ -3089,30 +3337,50 @@ def classify_original_foregrounds_for_volume(
     gpu_jobs = 0
     gpu_stats: Dict[str, object] = {}
     if gpu_pool is not None and dense_jobs:
-        requested_jobs = set(dense_jobs)
-        with runtime_telemetry().span('pta.classify.originals.gpu'):
-            gpu_foregrounds, remaining_jobs, gpu_stats = gpu_pool.classify_foregrounds(
-                prep, gen=int(generation), jobs=dense_jobs, selected_items=selected_items,
-            )
-        remaining_jobs = [tuple(job) for job in remaining_jobs]
-        remaining_set = set(remaining_jobs)
-        if len(remaining_set) != len(remaining_jobs) or not remaining_set <= requested_jobs:
-            raise RuntimeError("GPU foreground classifier returned invalid remaining source-frame jobs")
-        completed_jobs = requested_jobs - remaining_set
-        expected_keys = set()
-        for plan_index, frame_idx in completed_jobs:
-            plan = classification_plan(plan_index, frame_idx)
-            if selected_items is None or "full" in selected_items[(plan.tag, int(frame_idx))]:
-                expected_keys.add((plan.tag, int(frame_idx), "full", 0))
-            expected_keys.update((plan.tag, int(frame_idx), tile.tile_tag, 0) for tile in plan.tile_layout)
-        if set(gpu_foregrounds) != expected_keys:
-            raise RuntimeError(
-                "GPU foreground classifier did not return complete selected full/tile decisions "
-                f"for completed jobs (expected={len(expected_keys)}, actual={len(gpu_foregrounds)})"
-            )
-        foregrounds.update(gpu_foregrounds)
-        gpu_jobs = len(completed_jobs)
-        dense_jobs = remaining_jobs
+        # One part per GPU call: (requested jobs, decisions, declined jobs, stats).
+        parts: List[Tuple[Sequence[Tuple[int, int]], Mapping, Sequence, Mapping[str, object]]] = []
+        pending_jobs = dense_jobs
+        if gpu_prefetch is not None:
+            prefix = gpu_prefetch.plans
+            if (len(prep.plans) < len(prefix) or any(a is not b for a, b in zip(prep.plans, prefix))
+                    or not set(gpu_prefetch.jobs) <= set(dense_jobs)):
+                raise RuntimeError("GPU foreground prefetch does not match this volume's classification jobs")
+            parts.append((gpu_prefetch.jobs, gpu_prefetch.foregrounds, gpu_prefetch.remaining, gpu_prefetch.stats))
+            prefetched = set(gpu_prefetch.jobs)
+            pending_jobs = [job for job in dense_jobs if job not in prefetched]
+        if pending_jobs:
+            with runtime_telemetry().span('pta.classify.originals.gpu'):
+                parts.append((pending_jobs, *gpu_pool.classify_foregrounds(
+                    prep, gen=int(generation), jobs=pending_jobs, selected_items=selected_items,
+                )))
+        remaining_set: set[Tuple[int, int]] = set()
+        for requested, gpu_foregrounds, remaining_jobs, part_stats in parts:
+            requested_jobs = set(requested)
+            remaining_jobs = [tuple(job) for job in remaining_jobs]
+            part_remaining = set(remaining_jobs)
+            if len(part_remaining) != len(remaining_jobs) or not part_remaining <= requested_jobs:
+                raise RuntimeError("GPU foreground classifier returned invalid remaining source-frame jobs")
+            completed_jobs = requested_jobs - part_remaining
+            expected_keys = set()
+            for plan_index, frame_idx in completed_jobs:
+                plan = classification_plan(plan_index, frame_idx)
+                if selected_items is None or "full" in selected_items[(plan.tag, int(frame_idx))]:
+                    expected_keys.add((plan.tag, int(frame_idx), "full", 0))
+                expected_keys.update((plan.tag, int(frame_idx), tile.tile_tag, 0) for tile in plan.tile_layout)
+            if set(gpu_foregrounds) != expected_keys:
+                raise RuntimeError(
+                    "GPU foreground classifier did not return complete selected full/tile decisions "
+                    f"for completed jobs (expected={len(expected_keys)}, actual={len(gpu_foregrounds)})"
+                )
+            foregrounds.update(gpu_foregrounds)
+            gpu_jobs += len(completed_jobs)
+            remaining_set |= part_remaining
+            for name, value in part_stats.items():
+                if isinstance(value, int) and isinstance(gpu_stats.get(name), int):
+                    gpu_stats[name] = int(gpu_stats[name]) + value
+                else:
+                    gpu_stats.setdefault(name, value)
+        dense_jobs = [job for job in dense_jobs if job in remaining_set]
     backend = "cuda_with_cpu_fallback" if gpu_jobs and dense_jobs else ("cuda" if gpu_jobs else "cpu")
     dispatch = {**gpu_stats, "backend": backend, "gpu_jobs": gpu_jobs,
                 "cpu_jobs": len(dense_jobs), "polygon_jobs": len(geometry_jobs)}
@@ -3252,14 +3520,30 @@ def enumerate_candidates_for_volume(
     prep: PreparedVolume,
     foregrounds: Optional[Dict[Tuple[str, int, str, int], bool]] = None,
     *, fraction: float = 1.0,
+    plans: Optional[Sequence[RenderPlan]] = None,
 ) -> List[OutputCandidate]:
-    return list(_iter_candidates_for_volume(prep, foregrounds, fraction=fraction))
+    """Canonical candidates of ``plans`` (default: all of the volume's plans)."""
+    return list(_iter_candidates_for_volume(prep, foregrounds, fraction=fraction, plans=plans))
+
+
+def merge_candidate_enumerations(
+    first: Sequence[OutputCandidate], second: Sequence[OutputCandidate],
+) -> List[OutputCandidate]:
+    """Canonical order of plans A + B from the enumerations of A and of B.
+
+    Every full frame of every plan precedes every tile, each in plan order.
+    """
+    return ([candidate for candidate in first if not candidate.is_tile]
+            + [candidate for candidate in second if not candidate.is_tile]
+            + [candidate for candidate in first if candidate.is_tile]
+            + [candidate for candidate in second if candidate.is_tile])
 
 
 def _iter_candidates_for_volume(
     prep: PreparedVolume,
     foregrounds: Optional[Dict[Tuple[str, int, str, int], bool]],
     *, fraction: float = 1.0,
+    plans: Optional[Sequence[RenderPlan]] = None,
 ) -> Iterator[OutputCandidate]:
     fg_map = foregrounds or {}
     threshold = fraction_sample_threshold(fraction)
@@ -3293,7 +3577,7 @@ def _iter_candidates_for_volume(
         plan, _physical_view_id(plan), _presentation_variant_id(plan),
         str(plan.channel_variant.format_token), str(plan.channel_variant.kind),
         bool(plan.channel_variant.reverse), tuple(int(x) for x in plan.channel_variant.offsets),
-    ) for plan in prep.plans]
+    ) for plan in (prep.plans if plans is None else plans)]
 
     # Canonical order part 1: full-frame views in v3 view order.
     # Iterate only explicitly eligible centers.
@@ -4025,6 +4309,9 @@ def write_pta_summary(
         lines.append(f"      smoothing_anchor_repairs: {int(rec.foreground_preservation_stats.get('smoothing_anchor_repairs', 0))}")
         lines.append(f"      processed_anchor_repairs: {int(rec.foreground_preservation_stats.get('processed_anchor_repairs', 0))}")
         lines.append(f"    fraction: {rec.fraction:g}")
+        lines.append(f"    enable_cpr: {bool(rec.enable_cpr)}")
+        if rec.input_option_overrides:
+            lines.append(f"    input_option_overrides: {dict(rec.input_option_overrides)}")
         lines.append(f"    original_candidates_before_fraction: {int(rec.candidates_before_fraction)}")
         lines.append(f"    original_candidates_total_before_filtering: {int(rec.candidates_total)}")
         lines.append(f"    original_candidates_retained_after_filtering: {int(rec.candidates_retained)}")
@@ -4442,7 +4729,8 @@ def main(
     if depth_plan.memory_limited:
         message = (
             f"requested depth=2 estimated adjacent resident/scratch={depth_plan.worst_pair_bytes / GIB:.1f} GiB "
-            f"exceeds 70% of currently available/cgroup memory={available_bytes / GIB:.1f} GiB; using depth=1"
+            f"exceeds 70% of currently available/cgroup memory={available_bytes / GIB:.1f} GiB "
+            "(clean inactive file cache counted as available); using depth=1"
         )
         warnings.add("pipeline_depth_reduced_for_memory", message)
         print(f"WARNING: {message}", file=sys.stderr)
@@ -4670,6 +4958,10 @@ def main(
 
             prep_obj = state.get("prep")
             if isinstance(prep_obj, PreparedVolume):
+                if prep_obj.cpr_pending is not None:
+                    # A started CPR extraction reads the mask; stop and join it first.
+                    prep_obj.cpr_pending.abandon()
+                    prep_obj.cpr_pending = None
                 blocks.extend(prep_obj.shm_blocks)
                 prep_obj.src.volume = np.empty((0,), dtype=np.uint8)
                 prep_obj.src.mask_volume = None
@@ -4715,6 +5007,7 @@ def main(
                     load_cpu_order=load_cpus if bool(args.topology_aware) else (),
                     channel_variants=channel_variants,
                     force=bool(getattr(args, 'force', False)),
+                    nrrd_z_start_index=getattr(args, 'nrrd_z_start_index', None),
                     require_all_sequence_frames=bool(getattr(args, 'save_overlay', False)),
                 )
                 pending_loads[spec_index] = (future, load_warnings)
@@ -4733,9 +5026,11 @@ def main(
             states[spec_index] = {"gen": int(spec_index), "source": current_src, "prep": None, "handles": []}
             _submit_load(spec_index + 1)  # depth-1 prefetch, no fork constraint (G2)
             spec = pending_specs[spec_index]
+            # pta_input_options.json overrides; the CLI values are the defaults.
+            volume_fraction, volume_cpr, volume_args = resolve_volume_options(spec, args, fraction=fraction)
             prep = prepare_loaded_source(
                 current_src,
-                args=args,
+                args=volume_args,
                 warnings=vol_warnings,
                 workers=phase_workers,
                 out_dir=out_dir,
@@ -4746,21 +5041,18 @@ def main(
                 # GPU preprocessing never competes with the previous volume's rendering.
                 preprocessing_device_ids=(topology.cuda_device_ids
                     if spec_index == 0 or effective_pipeline_depth == 1 else ()),
+                defer_cpr=True,
             )
             states[spec_index]["prep"] = prep
             # The prepared mask now owns rendering/fallback storage. Drop the
             # obsolete NRRD input reference; an aliased render mask stays alive.
             current_src.mask_volume = None
 
-            cands = (enumerate_candidates_for_volume(prep, fraction=fraction)
+            # CPR extraction is deferred. Its plans follow every other plan, so
+            # these candidates stay a canonical prefix. On any error,
+            # _release_render_state() stops and joins a started extraction.
+            cands = (enumerate_candidates_for_volume(prep, fraction=volume_fraction)
                      if dataset_publication_selected else [])
-            candidates_before_fraction = (sum(
-                len(render_plan_frame_indices(plan)) * (1 + len(plan.tile_layout))
-                for plan in prep.plans
-            ) if dataset_publication_selected and fraction < 1.0 else len(cands))
-            if fraction < 1.0 and dataset_publication_selected:
-                vol_warnings.add("fraction_sampling", f"{prep.src.stem}: selected {len(cands)}/{candidates_before_fraction} original frame/tile candidates before classification (--fraction {fraction:g})")
-                print(f"{prep.src.stem}: fraction selection {len(cands)}/{candidates_before_fraction} candidates before classification/rendering", flush=True)
             foregrounds: Optional[Dict[Tuple[str, int, str, int], bool]] = None
             classification_deferred = bool(
                 dataset_publication_selected and prep.label_enabled
@@ -4789,12 +5081,56 @@ def main(
                     and float(args.augmentation_ratio) > 1.0
                 )
             )
+            # Partial volumes are always classified on their eligible
+            # annotated centers so annotated foreground/background remains
+            # distinct even when --background_percent=1.0. Offline copies
+            # also need source truth when the background cap is unrestricted.
+            classify_originals = bool(
+                dataset_publication_selected
+                and not classification_deferred
+                and not semantic_classification_skipped
+                and prep.label_enabled and (
+                    background_filter_requested
+                    or prep.src.volume_class == "partially_labeled"
+                    or (
+                        str(args.augmentation_execution) == "offline"
+                        and float(args.augmentation_ratio) > 1.0
+                    )
+                )
+            )
+            gpu_prefetch = None
+            if getattr(prep, "cpr_pending", None) is not None:
+                if classify_originals and gpu_offline_active:
+                    # Extract on a thread while the parent waits for the CUDA owners
+                    # to classify the other views. Inline otherwise: beside other
+                    # parent work the GIL-bound extraction gains nothing.
+                    prep.cpr_pending.start()
+                    try:
+                        gpu_prefetch = prefetch_original_foregrounds_on_gpu(
+                            prep, gpu_pool=render_pool, generation=int(spec_index),
+                            selected_candidates=cands if volume_fraction < 1.0 else None,
+                        )
+                    except Exception:
+                        # Inline extraction failed before classification began, so an
+                        # extraction that already failed still reports first. A running
+                        # one is not waited for: the volume cleanup cancels it.
+                        extraction = prep.cpr_pending.future
+                        if extraction.done() and extraction.exception() is not None:
+                            raise extraction.exception()
+                        raise
+                cpr_plans = complete_cpr_views(prep)
+                if dataset_publication_selected:
+                    cands = merge_candidate_enumerations(cands, enumerate_candidates_for_volume(
+                        prep, fraction=volume_fraction, plans=cpr_plans))
+            candidates_before_fraction = (sum(
+                len(render_plan_frame_indices(plan)) * (1 + len(plan.tile_layout))
+                for plan in prep.plans
+            ) if dataset_publication_selected and volume_fraction < 1.0 else len(cands))
+            if volume_fraction < 1.0 and dataset_publication_selected:
+                vol_warnings.add("fraction_sampling", f"{prep.src.stem}: selected {len(cands)}/{candidates_before_fraction} original frame/tile candidates before classification (--fraction {volume_fraction:g})")
+                print(f"{prep.src.stem}: fraction selection {len(cands)}/{candidates_before_fraction} candidates before classification/rendering", flush=True)
             semantic_transverse_verified = False
             if dataset_publication_selected:
-                # Partial volumes are always classified on their eligible
-                # annotated centers so annotated foreground/background remains
-                # distinct even when --background_percent=1.0. Offline copies
-                # also need source truth when the background cap is unrestricted.
                 if classification_deferred:
                     mode = "semantic" if prep.semantic_foreground else "polygon"
                     for candidate in cands:
@@ -4803,7 +5139,7 @@ def main(
                 elif semantic_classification_skipped:
                     prep.foreground_preservation_stats["classification_skipped"] = 1
                     foregrounds = (classify_semantic_full_transverse_for_preservation(prep)
-                                   if fraction == 1.0 else None)
+                                   if volume_fraction == 1.0 else None)
                     semantic_transverse_verified = bool(foregrounds)
                     if semantic_transverse_verified:
                         prep.foreground_preservation_stats["full_transverse_verified"] = 1
@@ -4812,32 +5148,28 @@ def main(
                         f"{prep.src.stem}: --background_percent=1 and no offline copies; "
                         "foreground/background candidate counts are not measured",
                     )
-                elif prep.label_enabled and (
-                    background_filter_requested
-                    or prep.src.volume_class == "partially_labeled"
-                    or (
-                        str(args.augmentation_execution) == "offline"
-                        and float(args.augmentation_ratio) > 1.0
-                    )
-                ):
+                elif classify_originals:
+                    # Pipelined volumes also classify on the CUDA owners. The pool
+                    # queue is FIFO, so each owner takes these tasks only after its
+                    # last task of the volume still rendering; it then retires that
+                    # volume's sources at the drained generation handoff before
+                    # admitting this one by free VRAM. Owners never hold two volumes.
                     foregrounds = classify_original_foregrounds_for_volume(
                         prep,
                         workers=phase_workers,
                         warnings=vol_warnings,
-                        selected_candidates=cands if fraction < 1.0 else None,
-                        gpu_pool=(render_pool if gpu_offline_active and not any(
-                            progress.pending_a or progress.pending_b
-                            for progress in progress_by_gen.values()
-                        ) else None),
+                        selected_candidates=cands if volume_fraction < 1.0 else None,
+                        gpu_pool=render_pool if gpu_offline_active else None,
                         generation=int(spec_index),
+                        gpu_prefetch=gpu_prefetch,
                     )
                 if foregrounds is not None:
                     for cand in cands:
                         key = (cand.parent_view_tag, int(cand.frame_idx), cand.item_key, 0)
-                        if fraction < 1.0 and not semantic_classification_skipped and key not in foregrounds:
+                        if volume_fraction < 1.0 and not semantic_classification_skipped and key not in foregrounds:
                             raise RuntimeError(f"Missing classification for selected candidate {key}")
                         cand.foreground = bool(foregrounds.get(key, True))
-                if fraction == 1.0 and not classification_deferred and (not semantic_classification_skipped or semantic_transverse_verified):
+                if volume_fraction == 1.0 and not classification_deferred and (not semantic_classification_skipped or semantic_transverse_verified):
                     validate_foreground_transverse_candidate_invariant(
                         prep,
                         cands,
@@ -4914,7 +5246,7 @@ def main(
             # enumeration, leaving ``physical`` empty even when the source has
             # foreground.  The retained-candidate invariant applies only when
             # images or labels were selected for publication.
-            if dataset_publication_selected and fraction == 1.0 and not classification_deferred and (
+            if dataset_publication_selected and volume_fraction == 1.0 and not classification_deferred and (
                 not semantic_classification_skipped or semantic_transverse_verified
             ):
                 validate_foreground_transverse_candidate_invariant(
@@ -4947,6 +5279,8 @@ def main(
                 "warnings": vol_warnings,
                 "prep": prep,
                 "cands": cands,
+                "fraction": volume_fraction,
+                "enable_cpr": volume_cpr,
                 "candidates_before_fraction": candidates_before_fraction,
                 "physical": physical,
                 "split_stats": vol_split_stats,
@@ -5109,7 +5443,7 @@ def main(
             )
             if state["classification_deferred"]:
                 _finalize_deferred_classification(prep, len(cands), vol_background_stats,
-                    vol_augmentation_stats, progress.foreground_counts, fraction=fraction)
+                    vol_augmentation_stats, progress.foreground_counts, fraction=float(state["fraction"]))
             total_written += int(written_effective)
             total_flip_dropped += int(flip_dropped)
             total_background_withheld += int(withheld)
@@ -5162,8 +5496,10 @@ def main(
                 augmented_candidates_planned=sum(1 for c in physical if int(c.augmentation_index) > 0),
                 augmented_candidates_retained=sum(1 for c in physical if int(c.augmentation_index) > 0 and c.keep),
                 candidates_written=int(written_effective),
-                fraction=fraction,
+                fraction=float(state["fraction"]),
                 candidates_before_fraction=int(state["candidates_before_fraction"]),
+                enable_cpr=bool(state["enable_cpr"]),
+                input_option_overrides=({} if spec.input_options is None else spec.input_options.overrides()),
             )
             volume_records.append(rec)
 

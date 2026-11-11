@@ -35,8 +35,26 @@ centering; the original mask and rendered categorical holes are preserved.
 One plane is rendered at a time, without allocating a dense straightened volume.
 
 Centerline extraction remains a CPU preparation step after requested 3D void
-filling, Gaussian preprocessing and cubic resizing. All centerlines are available
-before candidate planning. For GPU offline execution, CPR intensity, categorical
+filling, Gaussian preprocessing and cubic resizing. The parent first plans and
+enumerates the other views. When their originals are classified on the CUDA
+owners (GPU offline execution), extraction runs on a background thread while
+the parent waits for that classification; otherwise it runs inline, because
+beside other parent work the mostly GIL-bound extraction gains nothing. CPR
+plans are then appended after every other plan, as before, so plan order,
+fraction selection, candidate identities and outputs are unchanged; only CPR
+jobs are classified after extraction. An extraction error still fails the
+volume, and an extraction that already failed is reported ahead of a GPU
+classification error. Any other error stops a running extraction at its next
+block, component or branch and joins its thread before the volume's arrays are
+released.
+
+Telemetry: `pta.prepare.cpr_extract` times the extraction and
+`pta.prepare.cpr_wait` the part left exposed after the overlap; both sit outside
+`pta.prepare` on every route, so `pta.prepare` alone is no longer comparable with
+runs before this change. A CPR volume classified on the CUDA owners makes two
+classification calls (the other views, then CPR), so the last-value
+`pta.classification.gpu` gauge shows only the CPR call; use the
+`pta.classify.originals.dispatch` gauge for per-volume totals. For GPU offline execution, CPR intensity, categorical
 masks and annotation coverage use a resident CUDA sampler when the source volumes
 are admitted. CPR reuses the ordinary view renderer's source allocation and the
 categorical volume owner; it does not upload another cube for each branch or frame.

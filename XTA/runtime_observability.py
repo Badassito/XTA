@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import weakref
 from collections import Counter
 from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, Iterator, List, Mapping, Optional, Tuple
@@ -152,6 +153,28 @@ class RuntimeTelemetry:
                 f'gpt6-astra-ultra-v{SCRIPT_VERSION_COMPACT}-'
                 f'telemetry-{base}-{os.getpid()}.jsonl'
             )
+        _LIVE_TELEMETRY.add(self)
+
+    def _reset_after_fork_in_child(self) -> None:
+        """Give a forked child its own locks, writer, metrics and per-PID file.
+
+        fork() copies only the calling thread. The parent's writer thread, and
+        any lock another parent thread held at that instant, do not exist in the
+        child, so the child's final flush would wait forever for a writer that
+        never runs (job 166951: every GPU owner hung at exit and PTA never
+        returned from its render pool). From here on the child records only its
+        own work, so its snapshots do not repeat the parent's totals.
+        """
+        was_enabled = self.enabled
+        providers = dict(self._sample_providers)
+        self.__init__()
+        self._sample_providers.update(providers)
+        if not was_enabled:
+            # A parent that already lost its destination does not retry per child.
+            self.enabled = self._accepting = False
+        else:
+            # Plain assignment: a fork hook must not start the writer thread.
+            self.gauges['telemetry.forked_from_pid'] = os.getppid()
 
     @contextlib.contextmanager
     def span(self, name: str, **fields: object) -> Iterator[None]:
@@ -481,7 +504,9 @@ class RuntimeTelemetry:
     def _request_writer_locked(self) -> None:
         if not self.enabled:
             return
-        if self._writer_thread is None:
+        # A thread object can outlive its thread: after fork() the child keeps
+        # the parent's writer object although no such thread runs there.
+        if self._writer_thread is None or not self._writer_thread.is_alive():
             writer = threading.Thread(target=self._writer_main,
                 name='runtime-telemetry-writer', daemon=True)
             self._writer_thread = writer
@@ -614,7 +639,10 @@ class RuntimeTelemetry:
                 thread = self._writer_thread
                 if thread is not threading.current_thread():
                     while self.enabled and self._completed_generation < generation:
-                        self._writer_condition.wait()
+                        # On a quiet second, re-request: a writer that ended
+                        # without acknowledging is replaced instead of awaited.
+                        if not self._writer_condition.wait(timeout=1.0):
+                            self._request_writer_locked()
                 if final:
                     thread = self._writer_thread or thread
             elif final:
@@ -622,6 +650,22 @@ class RuntimeTelemetry:
         if final and thread is not None and thread is not threading.current_thread():
             thread.join()
         self._report_writer_error()
+
+
+_LIVE_TELEMETRY: 'weakref.WeakSet[RuntimeTelemetry]' = weakref.WeakSet()
+
+
+def _reset_live_telemetry_after_fork() -> None:
+    for telemetry in list(_LIVE_TELEMETRY):
+        try:
+            telemetry._reset_after_fork_in_child()
+        except Exception:
+            # Diagnostics must never break the forked worker itself.
+            telemetry.enabled = telemetry._accepting = False
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_reset_live_telemetry_after_fork)
 
 class RuntimeSystemSampler:
     def __init__(self, telemetry: RuntimeTelemetry) -> None:

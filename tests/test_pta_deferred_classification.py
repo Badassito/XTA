@@ -65,7 +65,8 @@ def test_real_parent_skips_projection_only_when_membership_is_class_independent(
         fraction=change.get('fraction',1.),enumerate_candidates_for_volume=lambda *args,**kwargs:[cand],
         background_filter_requested=change.get('background_filter',False),augmentation=object(),
         classify_original_foregrounds_for_volume=classify,gpu_offline_active=False,render_pool=None,progress_by_gen={},states={},
-        split_active=False,train_split=None,split_method=None,SplitStats=pta.SplitStats,apply_background_filter=budget)
+        split_active=False,train_split=None,split_method=None,SplitStats=pta.SplitStats,apply_background_filter=budget,
+        resolve_volume_options=pta.resolve_volume_options)
     with pytest.raises(StopPlanning):
         parent_planner(namespace)(0,1)
     assert prep.src.mask_volume is None
@@ -232,7 +233,7 @@ def test_failed_planning_retains_source_and_prepared_blocks_for_outer_cleanup(tm
         args=SimpleNamespace(),out_dir=tmp_path,tile_configs=[],channel_variants=[],volume_allocator=None,
         topology=SimpleNamespace(cuda_device_ids=()),effective_pipeline_depth=1,
         enumerate_candidates_for_volume=mock.Mock(side_effect=StopPlanning),dataset_publication_selected=True,
-        fraction=1.,states=states)
+        fraction=1.,states=states,resolve_volume_options=pta.resolve_volume_options)
     with pytest.raises(StopPlanning):
         parent_planner(namespace)(0,1)
     state=states[0]

@@ -86,6 +86,16 @@ from .runtime_observability import (
 
 _RUNTIME_OBSERVABILITY_LOCK = threading.Lock()
 
+
+def _reset_runtime_observability_lock_after_fork() -> None:
+    # A parent thread inside init/shutdown at fork time would leave this held.
+    global _RUNTIME_OBSERVABILITY_LOCK
+    _RUNTIME_OBSERVABILITY_LOCK = threading.Lock()
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_reset_runtime_observability_lock_after_fork)
+
 _RUNTIME_TELEMETRY: Optional[RuntimeTelemetry] = None
 
 _RUNTIME_SYSTEM_SAMPLER: Optional[RuntimeSystemSampler] = None

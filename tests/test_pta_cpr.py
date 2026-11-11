@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
+from scipy import ndimage as ndi
 
 from XTA.pta_cpr import build_cpr_geometry, extract_cpr_geometries, render_cpr_frame, resample_centerline
 
@@ -427,3 +430,259 @@ def test_preparation_threads_imgsz_into_native_patch_geometry(tmp_path, imgsz):
         assert view.src_h == view.src_w == expected
         assert plan.aff.out_h == plan.aff.out_w == expected
         np.testing.assert_array_equal(plan.aff.M_src_to_out, [[1, 0, 0], [0, 1, 0]])
+
+
+def _reference_block_max(mask, max_dim):
+    """Whole-plane block maxima as in v25.0.3."""
+    factor = max(1, int(math.ceil(max(mask.shape) / max(16, int(max_dim)))))
+    shape = tuple(int(math.ceil(size / factor)) for size in mask.shape)
+    coarse = np.zeros(tuple(size + 2 for size in shape), dtype=np.uint8)
+    ys = np.arange(0, mask.shape[1], factor)
+    xs = np.arange(0, mask.shape[2], factor)
+    for target in range(shape[0]):
+        plane = np.zeros(mask.shape[1:], dtype=np.uint8)
+        for source in range(target * factor, min(mask.shape[0], (target + 1) * factor)):
+            np.maximum(plane, mask[source], out=plane)
+        coarse[target + 1, 1:-1, 1:-1] = np.maximum.reduceat(np.maximum.reduceat(plane, ys, axis=0), xs, axis=1)
+    return coarse, factor
+
+
+def _reference_refine(mask, points_tyx, radii, factor):
+    """Whole-plane hole filling and centroid as in v25.0.3."""
+    points = np.array(points_tyx, dtype=np.float64, copy=True)
+    for _ in range(2):
+        tangents = np.gradient(points, axis=0)
+        for index, tangent in enumerate(tangents):
+            length = float(np.linalg.norm(tangent))
+            if length <= 1e-8:
+                continue
+            tangent = tangent / length
+            reference = np.eye(3)[int(np.argmin(np.abs(tangent)))]
+            normal = reference - np.dot(reference, tangent) * tangent
+            normal /= np.linalg.norm(normal)
+            binormal = np.cross(tangent, normal)
+            radius = max(4.0, float(radii[index]) * 2.0 + 2.0 * factor)
+            step = max(1.0, radius / 128.0)
+            half = min(128, int(math.ceil(radius / step)))
+            offsets = np.arange(-half, half + 1, dtype=np.float64) * step
+            coordinates = (points[index][None, None, :]
+                           + offsets[None, :, None] * normal[None, None, :]
+                           + offsets[:, None, None] * binormal[None, None, :])
+            plane = ndi.map_coordinates(mask, np.moveaxis(coordinates, -1, 0), order=0,
+                                        mode="constant", cval=0, prefilter=False) != 0
+            labels, count = ndi.label(plane)
+            if not count:
+                continue
+            yy, xx = np.nonzero(labels)
+            nearest = int(np.argmin((yy - half) ** 2 + (xx - half) ** 2))
+            component = ndi.binary_fill_holes(labels == labels[yy[nearest], xx[nearest]])
+            cy, cx = ndi.center_of_mass(component)
+            points[index] += normal * ((float(cx) - half) * step) + binormal * ((float(cy) - half) * step)
+    return points
+
+
+def _tube_mask(shape, segments, *, hollow=False):
+    mask = np.zeros(shape, dtype=np.uint8)
+    grid = np.ogrid[tuple(slice(0, size) for size in shape)]
+    for start, stop, radius, value in segments:
+        start, stop = np.asarray(start, float), np.asarray(stop, float)
+        for fraction in np.linspace(0, 1, int(np.linalg.norm(stop - start)) + 2):
+            center = start + (stop - start) * fraction
+            distance = sum((axis - c) ** 2 for axis, c in zip(grid, center))
+            inside = distance <= radius ** 2
+            if hollow:
+                inside &= distance >= (0.45 * radius) ** 2
+            mask[inside] = value
+    return mask
+
+
+def _assert_same_geometries(left, right):
+    assert len(left) == len(right)
+    for a, b in zip(left, right):
+        for name in ("points_tyx", "normals_tyx", "binormals_tyx"):
+            assert getattr(a, name).tobytes() == getattr(b, name).tobytes()
+        assert (a.half_width, a.branch_id, a.raster_size, a.raster_size_policy) == (
+            b.half_width, b.branch_id, b.raster_size, b.raster_size_policy)
+        assert a.manifest() == b.manifest()
+
+
+@pytest.mark.parametrize("shape", [(0, 4, 5), (5, 0, 4), (5, 4, 0), (1, 1, 1), (17, 33, 65),
+                                   (40, 7, 300), (13, 257, 129), (4, 13, 50000)])
+def test_banded_threaded_block_max_matches_whole_plane_reference(shape):
+    from XTA.pta_cpr import _block_max_mask
+
+    rng = np.random.default_rng(sum(shape))
+    sparse = ((rng.random(shape) < 0.003) * rng.integers(1, 256, shape)).astype(np.uint8)
+    masks = [np.zeros(shape, np.uint8), np.full(shape, 255, np.uint8), sparse,
+             np.asfortranarray(sparse), np.repeat(sparse, 2, axis=2)[:, :, ::2], sparse != 0]
+    for mask in masks:
+        for max_dim in (1, 20, 256):
+            expected, expected_factor = _reference_block_max(mask, max_dim)
+            for workers in (1, 3, 4):
+                coarse, factor = _block_max_mask(mask, max_dim, workers)
+                assert factor == expected_factor
+                assert coarse.dtype == np.uint8 and np.array_equal(coarse, expected)
+
+
+def test_cropped_hole_fill_centroid_matches_whole_plane_fill():
+    from XTA.pta_cpr import _filled_center
+
+    rng = np.random.default_rng(11)
+    yy, xx = np.indices((41, 37))
+    ring = np.hypot(yy - 20, xx - 1)
+    planes = [rng.random((41, 37)) < density for density in (0.1, 0.45, 0.6, 0.9)]
+    planes += [np.ones((41, 37), bool), (ring <= 15) & (ring >= 5),
+               np.maximum(abs(yy - 20), abs(xx - 18)) % 4 == 0,
+               np.ones((1, 9), bool), np.ones((9, 1), bool), np.ones((1, 1), bool)]
+    for plane in planes:
+        labels, count = ndi.label(plane)
+        for label in range(1, count + 1):
+            expected = ndi.center_of_mass(ndi.binary_fill_holes(labels == label))
+            assert _filled_center(labels, label) == tuple(float(value) for value in expected)
+
+
+def test_refinement_matches_whole_plane_reference_on_adversarial_seeds():
+    from XTA.pta_cpr import _refine_source_centerline
+
+    rng = np.random.default_rng(3)
+    mask = _tube_mask((60, 50, 70), [((0, 0, 35), (59, 49, 35), 6, 1), ((15, 25, 0), (45, 25, 69), 4, 3)],
+                      hollow=True)
+    seeds = [np.array([[0, 0, 35], [8, 7, 35], [8, 7, 35], [25, 21, 35], [59, 49, 35]], float),
+             np.array([[-20, -20, -20], [-10, -10, -10]], float),
+             np.column_stack([np.full(25, 30.0), np.full(25, 25.0), np.linspace(0, 69, 25)])
+             + rng.normal(0, 2, (25, 3))]
+    for points in seeds:
+        radii = rng.uniform(0.5, 6, len(points))
+        for factor in (1, 3, 12, 70):
+            expected = _reference_refine(mask, points, radii, factor)
+            assert _refine_source_centerline(mask, points, radii, factor).tobytes() == expected.tobytes()
+
+
+def _branched_two_component_mask():
+    return _tube_mask((64, 72, 72), [
+        ((4, 36, 36), (60, 36, 36), 4, 1), ((28, 36, 36), (56, 12, 60), 3, 1),
+        ((20, 36, 36), (6, 62, 14), 2.5, 1), ((10, 8, 8), (50, 14, 20), 2.5, 9),
+    ])
+
+
+def test_threaded_extraction_is_identical_to_serial():
+    mask = _branched_two_component_mask()
+    before = mask.copy()
+    serial_warnings, threaded_warnings = [], []
+    serial = extract_cpr_geometries(mask, warn=serial_warnings.append)
+    assert len(serial) >= 3
+    for workers in (2, 3, 4):
+        threaded_warnings.clear()
+        threaded = extract_cpr_geometries(mask, warn=threaded_warnings.append, workers=workers)
+        _assert_same_geometries(serial, threaded)
+        assert threaded_warnings == serial_warnings
+    assert np.array_equal(mask, before)
+
+
+def test_threaded_extraction_stops_failed_component_at_the_same_branch(monkeypatch):
+    from XTA import pta_cpr
+
+    mask = _branched_two_component_mask()
+    complete = extract_cpr_geometries(mask)
+    original = pta_cpr.build_cpr_geometry
+    results = {}
+    for workers in (1, 4):
+        calls = []
+
+        def failing_build(points, *args, **kwargs):
+            calls.append(len(points))
+            if len(calls) == 2:
+                raise ValueError("synthetic branch failure")
+            return original(points, *args, **kwargs)
+
+        monkeypatch.setattr(pta_cpr, "build_cpr_geometry", failing_build)
+        warnings = []
+        results[workers] = (extract_cpr_geometries(mask, warn=warnings.append, workers=workers), warnings, calls)
+    _assert_same_geometries(results[1][0], results[4][0])
+    assert results[1][1:] == results[4][1:]
+    assert len(results[1][1]) == 1 and "synthetic branch failure" in results[1][1][0]
+    assert len(results[1][0]) < len(complete)
+
+
+def test_threaded_refine_failure_keeps_earlier_branches_only(monkeypatch):
+    from XTA import pta_cpr
+
+    mask = _branched_two_component_mask()
+    original = pta_cpr._refine_source_centerline
+    seen = []
+
+    def recording(mask_, points, *args):
+        seen.append(points.tobytes())
+        return original(mask_, points, *args)
+
+    monkeypatch.setattr(pta_cpr, "_refine_source_centerline", recording)
+    complete = extract_cpr_geometries(mask)
+    assert len(seen) == len(complete) >= 3
+    failing = seen[1]
+
+    def failing_refine(mask_, points, *args):
+        if points.tobytes() == failing:
+            raise RuntimeError("synthetic refine failure")
+        return original(mask_, points, *args)
+
+    monkeypatch.setattr(pta_cpr, "_refine_source_centerline", failing_refine)
+    results = []
+    for workers in (1, 2, 4):
+        warnings = []
+        results.append((extract_cpr_geometries(mask, warn=warnings.append, workers=workers), warnings))
+    for geometries, warnings in results[1:]:
+        _assert_same_geometries(results[0][0], geometries)
+        assert warnings == results[0][1]
+    geometries, warnings = results[0]
+    assert len(warnings) == 1 and "synthetic refine failure" in warnings[0]
+    assert len(geometries) < len(complete)
+    np.testing.assert_array_equal(geometries[0].points_tyx, complete[0].points_tyx)
+
+
+def test_preparation_times_cpr_extraction_with_the_worker_budget(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from XTA import pta, pta_cpr
+    from XTA.pta_config import parse_pta_args
+    from XTA.pta_runtime import build_runtime_options
+
+    spans, budgets = [], []
+
+    @contextmanager
+    def span(name, *args, **kwargs):
+        spans.append(name)
+        yield
+
+    original = pta_cpr.extract_cpr_geometries
+
+    def recording_extract(*args, **kwargs):
+        budgets.append(kwargs.get("workers"))
+        return original(*args, **kwargs)
+
+    real = pta.runtime_telemetry()
+
+    class RecordingTelemetry:
+        # Forward every other telemetry call so preparation can use counters and gauges.
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def span(self, name, *args, **kwargs):
+            return span(name, *args, **kwargs)
+
+    monkeypatch.setattr(pta, "runtime_telemetry", RecordingTelemetry)
+    monkeypatch.setattr(pta_cpr, "extract_cpr_geometries", recording_extract)
+    zz, yy, xx = np.indices((32, 32, 32))
+    mask = (((yy - 16) ** 2 + (xx - 14) ** 2 < 4 ** 2) & (zz > 2) & (zz < 29)).astype(np.uint8)
+    source = pta.SourceVolume(
+        input_dir=tmp_path, stem="tube", kind="sequence", image_paths=[], video_path=None,
+        labels_by_frame={}, segmentation_nrrd_path=tmp_path / "tube.nrrd", mask_volume=mask,
+        volume_class="fully_labeled", label_source="nrrd", input_start_index=0,
+        encoded_indices=tuple(range(32)), volume=mask * 100, fps=1.0,
+    )
+    args = build_runtime_options(parse_pta_args(["--input", str(tmp_path), "--enable_cpr"]))
+    prepared = pta.prepare_loaded_source(
+        source, args=args, warnings=pta.WarningLog(), workers=3, out_dir=tmp_path,
+        tile_configs=(), channel_variants=(pta.DEFAULT_CHANNEL_VARIANT,), write_side_effects=False,
+    )
+    assert spans.count("pta.prepare.cpr_extract") == 1
+    assert budgets == [3]
+    assert [view for view in prepared.views if view.family == "cpr"]

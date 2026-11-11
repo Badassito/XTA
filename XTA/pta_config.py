@@ -315,7 +315,24 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Apply PTA full-volume eligibility rules to partial inputs",
+        help=(
+            "Apply full-volume eligibility rules to partial inputs and allow NRRD "
+            "label resizing within 3 voxels per axis, inclusive. Contiguous volumes "
+            "use nearest-neighbor XYZ resizing. 2D inputs resize XY while preserving "
+            "known slice correspondence. Resized axes must cover the same field of view"
+        ),
+    )
+    parser.add_argument(
+        "--nrrd_z_start_index",
+        type=int,
+        default=None,
+        metavar="INDEX",
+        help=(
+            "With --force, assert that NRRD plane 0 maps to this encoded image "
+            "slice index or zero-based video frame, with consecutive planes one "
+            "slice apart. Applies to every paired NRRD in the run and limits "
+            "processing to matched transverse slices"
+        ),
     )
     parser.add_argument(
         "--task", default="segment", choices=("segment", "semantic"),
@@ -329,7 +346,8 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
     parser.add_argument(
         "--enable_cpr", action="store_true",
         help=("Generate curved planar reformations centered on extracted centerlines, "
-              "sampled at approximately one post-cubic-resize voxel per pixel"),
+              "sampled at approximately one post-cubic-resize voxel per pixel; "
+              "an input directory's pta_input_options.json may override it"),
     )
     parser.add_argument(
         "--preprocessing",
@@ -363,7 +381,8 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
     parser.add_argument("--background_percent", default=1.0, type=float)
     parser.add_argument(
         "--fraction", default=1.0, type=float,
-        help="Deterministic fraction of original frame/tile candidates selected before classification and rendering (0 < fraction <= 1)",
+        help=("Deterministic fraction of original frame/tile candidates selected before classification "
+              "and rendering (0 < fraction <= 1); an input directory's pta_input_options.json may override it"),
     )
 
     from .tta_augmentation_config import add_augmentation_arguments
@@ -473,6 +492,8 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
 def resolve_pta_config(args: argparse.Namespace) -> PtaConfig:
     if isinstance(args.input, list) and len(args.input) == 1:
         args.input = args.input[0]
+    if getattr(args, "nrrd_z_start_index", None) is not None and not bool(args.force):
+        raise ValueError("--nrrd_z_start_index requires --force")
     if int(args.imgsz) < 0:
         raise ValueError("--imgsz must be >= 0 in PTA mode")
     radial_requests = tuple(resolve_radial_view_requests(args.enable_radial))

@@ -1075,12 +1075,19 @@ of their resolved input root, with the original stem/root retained as provenance
 Moving a colliding root changes that qualified identity and its seeds. Output
 safety checks protect every input root and source file. Without `--output`, the
 existing default uses the first root's basename under the working directory.
+A root may hold `pta_input_options.json` with only `fraction` and `enable_cpr`;
+these override the command line for that root's volumes and are validated before
+any root is probed. Volume records report the effective values.
 
 `--pipeline_depth 2` applies to the flattened volume list, including one volume
 in each of several directories. It overlaps adjacent-volume planning/loading
-with rendering and reuses persistent workers. It does not overlap two stages
-inside a single volume. Existing 70%-of-available-memory and separate-CPU-budget
-checks can reduce effective depth to one. Background filtering and label writes
+with rendering and reuses persistent workers. Inside a single volume, only CPR
+centerline extraction overlaps another stage: the other views' GPU
+classification. Existing 70%-of-available-memory and separate-CPU-budget
+checks can reduce effective depth to one. Available memory is the tighter of
+MemAvailable and this process's cgroup headroom, with clean inactive file cache
+counted as reclaimable. Pipelined volumes still classify on the CUDA owners,
+queued behind the rendering volume's tasks. Background filtering and label writes
 use each volume's annotation state, not a run-wide label flag.
 
 PTA uses the same coverage planner as TTA's native angle-zero geometry. Spherical

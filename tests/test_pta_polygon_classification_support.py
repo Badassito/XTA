@@ -24,7 +24,7 @@ def test_prepared_partial_polygons_match_dense_support_without_cube_scan(
     source = sequence(tmp_path / 'source', labels={1, 3})
     (source / 'sample_0001.txt').write_text(polygon)
     original = pta.classify_original_foregrounds_for_volume
-    np_any = np.any
+    np_any, np_count = np.any, np.count_nonzero
     compared = []
 
     def classify(prep, **kwargs):
@@ -34,11 +34,14 @@ def test_prepared_partial_polygons_match_dense_support_without_cube_scan(
         finally:
             prep.foreground_preservation_stats[SUPPORT] = support
 
-        def no_cube_read(value, *args, **kw):
-            assert value is not prep.mask_for_render, 'reread the full prepared mask'
-            return np_any(value, *args, **kw)
+        def no_cube_read(scan):
+            def checked(value, *args, **kw):
+                assert value is not prep.mask_for_render, 'reread the full prepared mask'
+                return scan(value, *args, **kw)
+            return checked
 
-        with mock.patch.object(pta.np, 'any', side_effect=no_cube_read):
+        with mock.patch.object(pta.np, 'any', side_effect=no_cube_read(np_any)), \
+                mock.patch.object(pta.np, 'count_nonzero', side_effect=no_cube_read(np_count)):
             actual = original(prep, **kwargs)
         assert actual == expected
         assert set(key[1] for key in actual).issubset({0, 2})
@@ -55,6 +58,8 @@ def test_prepared_partial_polygons_match_dense_support_without_cube_scan(
 
 @pytest.mark.parametrize('change', ['missing_count', 'gaussian', 'void_fill', 'semantic', 'other_view'])
 def test_ineligible_or_unknown_cached_support_keeps_dense_empty_check(change):
+    # An empty prepared mask has no reasserted anchors. A positive count
+    # proves render-mask foreground and is covered with real plans elsewhere.
     mask = np.zeros((2, 3, 4), np.uint8)
     prep = SimpleNamespace(
         label_enabled=True, semantic_foreground=False, semantic_coverage_for_render=None,
@@ -62,7 +67,7 @@ def test_ineligible_or_unknown_cached_support_keeps_dense_empty_check(change):
             tag='Transverse', view=SimpleNamespace(family='transverse', num_slices=2),
             eligible_frame_indices=None, tile_layout=())],
         smoothing_stats=[], void_fill_stats=None,
-        foreground_preservation_stats={SUPPORT: 1},
+        foreground_preservation_stats={SUPPORT: 0},
         src=SimpleNamespace(stem='sample', label_source='yolo',
                             yolo_polygons_by_frame={0: ()}, labels_by_frame={0: 'sample.txt'}),
     )
@@ -76,7 +81,7 @@ def test_ineligible_or_unknown_cached_support_keeps_dense_empty_check(change):
         prep.semantic_foreground = True
     else:
         prep.plans[0].view.family = 'sagittal'
-    with mock.patch.object(pta.np, 'any', wraps=np.any) as scan:
+    with mock.patch.object(pta.np, 'count_nonzero', wraps=np.count_nonzero) as scan:
         result = pta.classify_original_foregrounds_for_volume(prep, workers=1)
     assert scan.call_count == 1
     assert scan.call_args.args[0] is mask

@@ -25,6 +25,7 @@ import numpy as np
 
 from XTA import pta_gpu_publication as publication
 from XTA import pta_scheduler
+from XTA.pta_publication import yolo_label_window
 
 
 class FakeStream:
@@ -97,6 +98,15 @@ class FakeTorch:
     def as_tensor(self, value, **kwargs):
         return np.asarray(value)
 
+    def arange(self, *args, device=None):
+        return FakeTensor(self, np.arange(*args), 'arange')
+
+    def stack(self, tensors, *, dim):
+        return FakeTensor(self, np.stack([tensor.array for tensor in tensors], axis=dim), 'stack')
+
+    def empty(self, size, *, dtype, device):
+        return FakeTensor(self, np.full(size, 0xA5, dtype), 'empty')
+
 
 class FakeTensor:
     is_cuda = True
@@ -139,6 +149,27 @@ class FakeTensor:
     def any(self, *, dim):
         return FakeTensor(self.torch, self.array.any(axis=dim), self.name)
 
+    def amax(self, *, dim):
+        return FakeTensor(self.torch, self.array.max(axis=dim), self.name)
+
+    def __mul__(self, other):
+        return FakeTensor(self.torch, self.array * other.array, self.name)
+
+    def __sub__(self, value):
+        return FakeTensor(self.torch, self.array - value, self.name)
+
+    def __rsub__(self, value):
+        return FakeTensor(self.torch, value - self.array, self.name)
+
+    def view(self, *shape):
+        values = self.array.reshape(shape)
+        assert np.shares_memory(values, self.array), 'torch.view never copies'
+        return FakeTensor(self.torch, values, self.name)
+
+    def copy_(self, source):
+        np.copyto(self.array, source.array)
+        return self
+
     def detach(self):
         return self
 
@@ -164,9 +195,12 @@ def extract_worker_functions(namespace):
     namespace.setdefault('_resolve_gpu_source_foregrounds', lambda *_args: None)
     namespace.setdefault('resolve_deferred_foregrounds', lambda *_args: None)
     namespace.setdefault('_WARNING_EXAMPLE_LIMIT', 12)
+    namespace.setdefault('runtime_telemetry', lambda: SimpleNamespace(span=lambda *_a, **_k: nullcontext()))
+    namespace.setdefault('yolo_label_window', yolo_label_window)
     path = Path(__file__).resolve().parents[1] / 'XTA' / 'pta_workers.py'
     selected = {'WarningLog', '_retain_deterministic_warning_examples',
                 '_gpu_source_mask_nonempty', '_validate_gpu_policy_batch', '_publish_gpu_policy_batch',
+                '_gpu_mask_bounds', '_download_gpu_mask_windows',
                 '_label_payload_bytes', '_publish_label_payloads', 'execute_gpu_frame_batch_task',
                 'execute_gpu_render_task'}
     nodes = [node for node in ast.parse(path.read_text(encoding='utf-8')).body

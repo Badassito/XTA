@@ -32,6 +32,7 @@ def build_runtime_options(config: PtaConfig) -> argparse.Namespace:
         # Normal runs consume the canonical layout without parsing it again.
         _pta_channel_formats=(config.channel_format,),
         force=public.force,
+        nrrd_z_start_index=getattr(public, "nrrd_z_start_index", None),
         task=public.task,
         enable_cpr=bool(getattr(public, "enable_cpr", False)),
         enable_2D_hole_fill=bool(preprocessing.enable_2d_hole_fill),

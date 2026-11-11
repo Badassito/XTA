@@ -16,6 +16,7 @@ import uuid
 import zlib
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import BinaryIO, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -102,14 +103,43 @@ def output_image_suffix(image_format: str) -> str:
     normalized = parse_output_image_format(image_format)
     return f".{normalized}"
 
-def mask_to_yolo_lines(mask01: np.ndarray, *, warnings: WarningSink, context: str, known_empty: bool = False) -> List[str]:
+@lru_cache(maxsize=32)
+def _yolo_coordinate_text(size: int) -> np.ndarray:
+    """Normalized label text for every pixel coordinate of one frame axis."""
+    scale = float(max(1, size))
+    text = np.array([f"{min(1.0, max(0.0, float(value) / scale)):.6f}" for value in range(size)],
+                    dtype=object)
+    text.flags.writeable = False  # Shared across polygon threads.
+    return text
+
+
+def yolo_label_window(bounds: Sequence[int], shape: Tuple[int, int]) -> Optional[Tuple[int, int, int, int]]:
+    """Return the (y0, y1, x0, x1) crop for inclusive mask bounds, or None if empty.
+
+    The crop keeps a clear 1-px margin on sides inside the frame and stops at
+    frame edges. findContours zero-pads its input, so the crop with its origin
+    as offset gives the full frame's contours, order and hierarchy.
+    """
+    y0, y1, x0, x1 = (int(value) for value in bounds)
+    if y1 < y0 or x1 < x0:
+        return None
+    return max(0, y0 - 1), min(int(shape[0]), y1 + 2), max(0, x0 - 1), min(int(shape[1]), x1 + 2)
+
+
+def mask_to_yolo_lines(mask01: np.ndarray, *, warnings: WarningSink, context: str, known_empty: bool = False,
+                       frame_shape: Optional[Tuple[int, int]] = None,
+                       origin: Tuple[int, int] = (0, 0)) -> List[str]:
+    """Export outer polygons; ``mask01`` may be a yolo_label_window crop at ``origin`` (x, y)."""
     if known_empty:
         return []
     m = np.asarray(mask01, dtype=np.uint8)
     if not m.size:
         return []
-    h, w = m.shape
-    contours, hierarchy = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    h, w = m.shape if frame_shape is None else (int(frame_shape[0]), int(frame_shape[1]))
+    x0, y0 = int(origin[0]), int(origin[1])
+    if x0 < 0 or y0 < 0 or x0 + m.shape[1] > w or y0 + m.shape[0] > h:
+        raise ValueError(f"Label crop {m.shape} at {(x0, y0)} lies outside frame {(h, w)}")
+    contours, hierarchy = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE, offset=(x0, y0))
     if hierarchy is not None:
         hinfo = hierarchy[0]
         if np.any(hinfo[:, 3] >= 0):
@@ -129,13 +159,10 @@ def mask_to_yolo_lines(mask01: np.ndarray, *, warnings: WarningSink, context: st
         if pts.shape[0] < 3:
             warnings.add("degenerate_export_polygon", context)
             continue
-        coords: List[str] = []
-        for x, y in pts:
-            xn = min(1.0, max(0.0, float(x) / float(max(1, w))))
-            yn = min(1.0, max(0.0, float(y) / float(max(1, h))))
-            coords.append(f"{xn:.6f}")
-            coords.append(f"{yn:.6f}")
-        lines.append("0 " + " ".join(coords))
+        # Contour points lie inside the frame, so cached per-axis text is exact.
+        xs = _yolo_coordinate_text(w)
+        text = xs[pts] if w == h else np.stack((xs[pts[:, 0]], _yolo_coordinate_text(h)[pts[:, 1]]), axis=1)
+        lines.append("0 " + " ".join(text.ravel().tolist()))
     return lines
 
 
@@ -934,4 +961,5 @@ __all__ = [
     "write_semantic_index_mask",
     "write_semantic_mask",
     "write_yolo_lines",
+    "yolo_label_window",
 ]

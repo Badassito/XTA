@@ -29,7 +29,7 @@ if Path(__file__).with_suffix('.needs_review').exists():
 (output/'report.json').write_text(json.dumps(quality))
 if Path(__file__).with_suffix('.fail').exists():
     print('explicit native failure diagnostic',flush=True);raise SystemExit(7)
-stem=Path(option('--edits')).name.removesuffix('_Filtered')
+stem=json.loads((Path(option('--edits'))/'edits.json').read_text())['segments'][0]['name'].removesuffix('_Global')
 header=b'NRRD0005\\ntype: unsigned char\\ndimension: 3\\nspace: left-posterior-superior\\nsizes: 2 2 2\\nspace directions: (1,0,0) (0,1,0) (0,0,1)\\nencoding: gzip\\nspace origin: (0,0,0)\\n\\n'
 (output/(stem+'.nrrd')).write_bytes(header+gzip.compress(bytes([1]*8),mtime=0))
 '''
@@ -100,6 +100,76 @@ class PreparationTests(unittest.TestCase):
             self.run_cli()
         self.assertEqual(self.video.read_bytes(),b'original intensity bytes')
         self.assertEqual(intensity.read_bytes(),b'corrupt copied intensity')
+
+    def split_layout(self):
+        target=self.root/'training'/'filtered'/'v1.1'/'dataset'
+        self.assertTrue(target.resolve().is_relative_to(self.root.resolve()))
+        target.parent.mkdir(parents=True)
+        self.bundle.rename(target);self.bundle=target
+        self.low=self.bundle/'source_manifest.json'
+        image=self.root/'training'/'images'/'dataset'/'sample_S1S0.mkv'
+        image.parent.mkdir(parents=True);image.write_bytes(self.video.read_bytes());self.video=image
+        self.output=self.root/'training'/'labels'/'v1.1'/'dataset'
+        return ['--bundle-dir',str(self.bundle),'--output-dir',str(self.output),
+                '--output-stem','dataset','--intensity-mode','reference']
+
+    def test_split_layout_edited_shape_reference_reuse_and_source_change(self):
+        options=self.split_layout()
+        self.run_cli(*options,'--mode','edited_shape')
+        self.assertEqual({p.name for p in self.output.iterdir()},{'dataset.nrrd','preparation.json'})
+        receipt=prep.read_json(self.output/'preparation.json')
+        self.assertEqual(receipt['identity']['stem'],'sample')
+        self.assertEqual(receipt['identity']['output_stem'],'dataset')
+        self.assertEqual(receipt['identity']['intensity_mode'],'reference')
+        self.assertEqual(receipt['label_authority'],'edited_preview_global')
+        self.assertEqual(receipt['intensity_publication'],{'method':'reference','source':str(self.video),
+                         'bytes':self.video.stat().st_size,'sha256':prep.digest(self.video)})
+        original_mask=(self.output/'dataset.nrrd').read_bytes()
+        again=self.run_cli(*options,'--mode','edited_shape')
+        self.assertEqual(prep.read_json(again/'sample.result.json')['status'],'validated_existing')
+        before=self.video.stat();self.video.write_bytes(b'x'*before.st_size)
+        os.utime(self.video,ns=(before.st_atime_ns,before.st_mtime_ns))
+        with self.assertRaisesRegex(ValueError,'provenance differs'):
+            self.run_cli(*options,'--mode','edited_shape')
+        self.assertEqual((self.output/'dataset.nrrd').read_bytes(),original_mask)
+
+    def test_split_layout_native_output_rename_and_reference_reuse(self):
+        options=self.split_layout()
+        self.run_cli(*options,native=True)
+        self.assertEqual({p.name for p in self.output.iterdir()},{'dataset.nrrd','preparation.json'})
+        receipt=prep.read_json(self.output/'preparation.json')
+        self.assertTrue(receipt['native_component_recovery'])
+        again=self.run_cli(*options,native=True)
+        self.assertEqual(prep.read_json(again/'sample.result.json')['status'],'validated_existing')
+
+    def test_explicit_bundle_validation_and_path_guards(self):
+        options=self.split_layout()
+        validated=self.run_cli(*options,'--validate-only')
+        self.assertEqual(prep.read_json(validated/'sample.result.json')['bundle'],str(self.bundle))
+        self.assertFalse(self.output.exists())
+        for destination in (self.bundle,self.bundle/'inside',self.bundle.parent,self.video.parent):
+            with self.subTest(destination=destination),self.assertRaises(SystemExit):
+                self.run_cli(*options,'--output-dir',str(destination))
+        with self.assertRaises(SystemExit):
+            self.run_cli(*options,'--log-dir',str(self.bundle/'logs'))
+        for flag,value in (('--bundle-dir',str(self.bundle)),('--output-stem','dataset')):
+            with self.subTest(flag=flag),self.assertRaises(SystemExit):
+                prep.main(['sample','other',flag,value,'--log-dir',str(self.root/'multi-log')])
+        with self.assertRaises(SystemExit):
+            self.run_cli(*options,'--skip-source-probe')
+        self.assertFalse(self.output.exists())
+
+    def test_explicit_bundle_symlink_is_rejected(self):
+        options=self.split_layout()
+        link=self.root/'bundle-link'
+        try:
+            link.symlink_to(self.bundle,target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f'Symlinks unavailable: {exc}')
+        for extra in ([],['--validate-only']):
+            with self.subTest(extra=extra),self.assertRaisesRegex(ValueError,'regular filtered bundle'):
+                self.run_cli(*options,'--bundle-dir',str(link),*extra)
+        self.assertFalse(self.output.exists())
 
     def test_native_union_forwarding_and_reuse_identity(self):
         log=self.run_cli(native=True,union=True)

@@ -45,8 +45,16 @@ It automatically enables 3D void filling; adding
 `--preprocessing 3d_void_fill` separately is unnecessary. Orthogonal slicing
 and backprojection are exact array views, so the implementation writes filled
 cross sections directly into the native mask. A deterministic XY, XZ, YZ sweep
-can seal tunnels that otherwise connect a cavity to the volume exterior,
-allowing the subsequent 3D fill to close it. These operations add foreground;
+can seal tunnels that otherwise connect a cavity to the volume exterior.
+Planes within each axis are filled by the preparation worker threads, bounded
+by memory headroom; each axis finishes before the next starts, so the result
+is identical to a serial sweep.
+After a complete final YZ pass, every background voxel is connected within
+its plane to a volume face, so the implied 3D void fill cannot add voxels.
+PTA then skips it and records `backend: skipped` with reason
+`skipped_proven_noop_after_2d_hole_fill` in the manifest. Foreground counts appear
+only when already known (`--save voxel_volume`), so the skip never scans the mask.
+Without that proof the void fill runs. These operations add foreground;
 they do not modify intensity data. Existing Gaussian preprocessing, if selected,
 runs after these fills. Use a complete labeled volume with adjacent source
 slices. Existing partial-volume restrictions apply: `--force` can treat partial

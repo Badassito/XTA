@@ -282,7 +282,8 @@ duration; anything else (variable rate, offset start, disagreement, probe error)
 counts every packet as before. Counting every packet reads the whole input, which
 took 9-17 s for a 3.5 GB FFV1 input on cluster NFS and delayed the decode, and so
 the first YOLO task. The decoder still fails loudly if the real frame count
-differs. `YOLO_TTA_FRAME_COUNT_FULL_SCAN=1` always counts every packet.
+differs. `YOLO_TTA_FRAME_COUNT_FULL_SCAN=1` always counts every packet. PTA
+video discovery uses the same count.
 
 On Linux the decode pipe is raised from the 64 KiB default to the system maximum
 (`/proc/sys/fs/pipe-max-size`, capped at 16 MiB), matching the 1 MiB pipe the
