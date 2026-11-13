@@ -220,7 +220,11 @@ class FileLayer:
         try:
             self._source = self.path.open("rb")
             self._source.seek(self._payload_offset)
-            self._payload = gzip.GzipFile(fileobj=self._source, mode="rb") if self._encoding in {"gzip", "gz"} else self._source
+            if self._encoding in {"gzip", "gz"}:
+                reader = self._owner._fast_gzip_reader or gzip.GzipFile
+                self._payload = reader(fileobj=self._source, mode="rb")
+            else:
+                self._payload = self._source
         except OSError as exc:
             if self._source is not None:
                 self._source.close()
@@ -230,23 +234,29 @@ class FileLayer:
         self._eof_validated = False
         self._owner._open_count += 1
 
+    def _read_binary_block(self, size: int) -> bytes:
+        block = self._payload.read(size)
+        if len(block) != size:
+            raise ValueError(f"NRRD payload is shorter than declared shape: {self.path}")
+        # Readers are buffered regular files or GzipFile. Validate once per
+        # contiguous block, including bytes skipped ahead of the requested slab.
+        maximum = np.frombuffer(block, dtype=np.uint8).max()
+        if maximum > 1:
+            raise ValueError(f"NRRD payload is not binary 0/1: {self.path}")
+        if self._empty and maximum:
+            raise ValueError(f"NRRD empty segment contains foreground: {self.path}")
+        self._position += size
+        return block
+
     def _consume(self, stop: int, target: memoryview | None = None) -> None:
         self._open()
         assert self._owner is not None
         target_offset = 0
         while self._position < stop:
-            block = self._payload.read(min(self._owner._chunk_bytes, stop - self._position))
-            if not block:
-                raise ValueError(f"NRRD payload is shorter than declared shape: {self.path}")
-            values = np.frombuffer(block, dtype=np.uint8)
-            if np.any(values > 1):
-                raise ValueError(f"NRRD payload is not binary 0/1: {self.path}")
-            if self._empty and np.any(values):
-                raise ValueError(f"NRRD empty segment contains foreground: {self.path}")
+            block = self._read_binary_block(min(self._owner._chunk_bytes, stop - self._position))
             if target is not None:
                 target[target_offset:target_offset + len(block)] = block
                 target_offset += len(block)
-            self._position += len(block)
 
     def _validate_eof(self) -> None:
         expected = math.prod(self.stored_shape_tyx)
@@ -284,10 +294,16 @@ class FileLayer:
                     target = memoryview(result[lo-z0:hi-z0]).cast("B")
                     self._consume((hi - dz) * sy * sx, target)
                 else:
+                    rows_per_block = max(1, self._owner._chunk_bytes // sx)
                     for z in range(lo, hi):
-                        for y in range(sy):
-                            target = memoryview(result[z-z0, dy+y, dx:dx+sx]).cast("B")
-                            self._consume(self._position + sx, target)
+                        for y in range(0, sy, rows_per_block):
+                            rows = min(rows_per_block, sy-y)
+                            target = result[z-z0, dy+y:dy+y+rows, dx:dx+sx]
+                            if sx > self._owner._chunk_bytes:
+                                self._consume(self._position + sx, memoryview(target).cast("B"))
+                                continue
+                            block = self._read_binary_block(rows * sx)
+                            target[:] = np.frombuffer(block, dtype=np.uint8).reshape(rows, sx)
             if z1 >= dz + sz and not self._eof_validated:
                 self._validate_eof()
         except BaseException:
@@ -311,7 +327,8 @@ class FileLayer:
 
 class LayerCollection(Sequence[FileLayer]):
     def __init__(self, manifest: dict[str, Any], layers: list[FileLayer], geometry: ReferenceGeometry,
-                 workspace: Path, budget_bytes: int, max_open: int, *, manifest_path: Path | None = None) -> None:
+                 workspace: Path, budget_bytes: int, max_open: int, *, manifest_path: Path | None = None,
+                 fast_gzip_reader=None) -> None:
         self.manifest = manifest
         self.layers = tuple(layers)
         self.geometry = geometry
@@ -322,6 +339,7 @@ class LayerCollection(Sequence[FileLayer]):
         self._chunk_bytes = min(_MIB, max(1024, budget_bytes // 4))
         self.max_open = max_open
         self._open_count = 0
+        self._fast_gzip_reader = fast_gzip_reader
         self._closed = False
         for layer in self.layers:
             layer._owner = self
@@ -349,8 +367,9 @@ class LayerCollection(Sequence[FileLayer]):
 
 
 def read_layer_manifest(path: str | Path, *, workspace: str | Path, memory_mib: float = 256,
-                        max_open: int = 512) -> LayerCollection:
-    """Read additive union descriptors and validate their common reference grid.
+                        max_open: int = 512, include_all_layers: bool = False,
+                        manifest_bytes: bytes | None = None, prefer_fast_gzip: bool = False) -> LayerCollection:
+    """Read additive union descriptors, or all exported layers for review.
 
     Confidence is never synthesized from run thresholds. Missing files are errors,
     except entries explicitly marked empty; unlisted views are not added.
@@ -359,7 +378,7 @@ def read_layer_manifest(path: str | Path, *, workspace: str | Path, memory_mib: 
     if isinstance(max_open, bool) or not isinstance(max_open, int) or max_open <= 0:
         raise ValueError("max_open must be a positive integer")
     path = Path(path).resolve()
-    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest = json.loads(path.read_bytes() if manifest_bytes is None else manifest_bytes)
     if not isinstance(manifest, dict) or not isinstance(manifest.get("layers"), list):
         raise ValueError("Expected a NRRD layer manifest with a layers list")
     reference_shape = _shape(manifest.get("output_shape_tyx"), "output_shape_tyx")
@@ -377,7 +396,9 @@ def read_layer_manifest(path: str | Path, *, workspace: str | Path, memory_mib: 
         if not isinstance(filename, str) or not filename or filename in filenames:
             raise ValueError("Manifest filenames must be nonempty and unique")
         filenames.add(filename)
-        if metadata.get("layer_role") != "additive_component" or metadata.get("recomposition_op") != "union":
+        if not include_all_layers and (
+            metadata.get("layer_role") != "additive_component" or metadata.get("recomposition_op") != "union"
+        ):
             continue
         if metadata.get('interpolation_backend') == 'sam' and metadata.get('mask_kind') == 'bridge':
             if metadata.get('interpolation_direction') not in {'forward', 'backward'}:
@@ -409,8 +430,17 @@ def read_layer_manifest(path: str | Path, *, workspace: str | Path, memory_mib: 
             layer = FileLayer(filename, dict(metadata), reference_shape, layer_path, header, stored, crop, offset, encoding, empty)
         layers.append(layer)
     if common_geometry is None:
-        raise ValueError("No additive layer has a readable spatial reference")
-    return LayerCollection(manifest, layers, common_geometry, Path(workspace), budget, max_open, manifest_path=path)
+        raise ValueError("No selected layer has a readable spatial reference")
+    fast_reader = None
+    if prefer_fast_gzip:
+        try:
+            from isal.igzip import IGzipFile
+        except (ImportError, OSError):
+            pass
+        else:
+            fast_reader = IGzipFile
+    return LayerCollection(manifest, layers, common_geometry, Path(workspace), budget, max_open,
+                           manifest_path=path, fast_gzip_reader=fast_reader)
 
 
 def write_seg_nrrd(path: str | Path, *, shape_tyx: tuple[int, int, int],

@@ -87,6 +87,7 @@ from .inference import (
     _affine_theta_for_grid_sample,
     _cuda_graph_capture_context,
     _get_cached_affine_grid,
+    _native_fanout_for_source,
     _resident_mask_kernels,
     _split_segmentation_backend_outputs,
     _tiled_f16_proto_union_applicable,
@@ -752,8 +753,11 @@ class _MainProcessGpuStageCoordinator:
             if prior is None:
                 # The oldest demand with an eligible worker chooses the next
                 # drain. A specific-device caller cannot steal an older turn.
+                # A device holding a shared overlap lease is never granted an
+                # exclusive stage, so draining it would only park inference.
                 available = set(device for device in self._worker_devices
                                 if device not in self._stage_leases
+                                and device not in self._overlap_leases
                                 and self._spherical_retirement_burst_counts.get(device, 0) < 2)
                 allow_age = _env_flag('YOLO_TTA_GPU_SPHERICAL_AGE_RETIREMENT', True)
                 devices = next(([device for device in request_devices if device in available]
@@ -1310,6 +1314,7 @@ class _MainProcessGpuStageCoordinator:
                 reserved = self._reserved_spherical_device_locked()
                 if (self._is_spherical_retirement(current)
                         and reserved is None
+                        and int(device_index) not in self._overlap_leases
                         and self._pending_inference_backlog
                         and not self._inference_asset_retirement_pending
                         and time.monotonic() >= self._spherical_retirement_retry_after
@@ -1687,6 +1692,34 @@ def _trt_binding_layout_for_backend(
     if set(output_names) | {input_name} != set(names):
         raise RuntimeError('TensorRT engine has auxiliary bindings unsupported by the resident ring')
     return names, input_name, output_names, indices
+
+def _ring_native_cutoff_counts(head, floor_threshold, cutoffs):
+    """Count nested FP32 gate sets with O(anchors + cutoffs) device memory.
+
+    One fixed-size histogram and one K-value host transfer replace repeated
+    count synchronizations. Two-cut runs keep their original scalar schedule.
+    """
+    if len(cutoffs) < 2 or getattr(head, 'ndim', 0) != 3 or int(head.shape[0]) != 1:
+        return None
+    gates = (float(floor_threshold), *(float(value) / 100. for value in cutoffs))
+    if any(not math.isfinite(value) for value in gates) or any(b <= a for a, b in zip(gates, gates[1:])):
+        return None
+    import torch
+    if not isinstance(head, torch.Tensor) or head.dtype not in (torch.float16, torch.float32):
+        return None
+    try:
+        scores = head[0, 4].to(torch.float32)
+        boundaries = torch.tensor(gates, dtype=torch.float32, device=scores.device)
+        buckets = torch.bucketize(scores, boundaries, right=True)
+        # CUDA's >= rejects NaN. bucketize otherwise places NaN above every gate.
+        buckets = torch.where(torch.isnan(scores), 0, buckets)
+        histogram = torch.zeros(len(gates) + 1, dtype=torch.int64, device=scores.device)
+        histogram.scatter_add_(0, buckets, torch.ones_like(buckets, dtype=torch.int64))
+        counts = histogram.flip(0).cumsum(0).flip(0)[1:]
+        return tuple(int(value) for value in counts.cpu().tolist())
+    except torch.OutOfMemoryError:
+        return None
+
 
 class _ResidentTensorRTRingFatalError(RuntimeError):
     """Ring teardown could not prove the borrowed backend/buffers safe for fallback."""
@@ -2494,7 +2527,10 @@ class _ResidentTensorRTRingExecutor:
                             f'for ring slot {slot.slot_id}'
                         ) from sync_exc
 
-    def enqueue_inference(self, slot: _ResidentGpuPipelineSlot) -> None:
+    def enqueue_inference(
+        self, slot: _ResidentGpuPipelineSlot, *, replay_cache: Optional[object] = None,
+        source: Optional[object] = None, batch_index: int = 0,
+    ) -> None:
         torch = self.torch
         with torch.cuda.stream(slot.infer_stream):
             slot.infer_stream.wait_event(slot.render_done)
@@ -2502,10 +2538,28 @@ class _ResidentTensorRTRingExecutor:
                 # The preceding frame's mask kernel still reads this context's static
                 # output buffers. Do not let the next enqueue overwrite them early.
                 slot.infer_stream.wait_event(slot.post_done)
-            if slot.infer_graph is not None:
-                slot.infer_graph.replay()
+            replay_key = (None if replay_cache is None else replay_cache.input_key(
+                slot.input, source=source, batch_index=int(batch_index)))
+            replayed = (None if replay_key is None else replay_cache.load_tensors(
+                replay_key, device=slot.input.device))
+            if replayed is None:
+                if slot.infer_graph is not None:
+                    slot.infer_graph.replay()
+                else:
+                    self._execute_context(slot)
+                if replay_key is not None:
+                    replay_cache.store_instance(replay_key, (slot.head, slot.proto),
+                        input_shape_hw=tuple(int(v) for v in slot.input.shape[-2:]),
+                        proto_support='candidate_boxes')
             else:
-                self._execute_context(slot)
+                if len(replayed) != 2:
+                    raise _ResidentTensorRTRingFatalError('TensorRT segmentation replay requires head and proto tensors')
+                for name, value, binding in zip(('head', 'proto'), replayed, (slot.head, slot.proto)):
+                    if (tuple(value.shape) != tuple(binding.shape) or value.dtype != binding.dtype
+                            or value.device != binding.device):
+                        raise _ResidentTensorRTRingFatalError(f'TensorRT replay {name} differs from its static binding')
+                    # Preserve addresses already captured by TensorRT/CuPy graphs.
+                    binding.copy_(value, non_blocking=True)
             slot.infer_done.record(slot.infer_stream)
         slot.infer_valid = True
 
@@ -2516,6 +2570,7 @@ class _ResidentTensorRTRingExecutor:
         descriptor: ResidentRingUnitDescriptor,
         device_union: '_DeviceUnionAccumulator',
         frame_counts_dev: object,
+        native_fanout: Optional[object] = None,
     ) -> None:
         self._set_slot_unit_descriptor(slot, descriptor)
         unit_index = int(descriptor.unit_index)
@@ -2533,6 +2588,8 @@ class _ResidentTensorRTRingExecutor:
                 slot.post_graph.replay()
             else:
                 self._launch_post(slot)
+            if native_fanout is not None:
+                native_fanout.record_detector_work(mask_decodes=1)
             # The static slot output is copied into the task-resident destination before
             # the slot is released. No payload/result object or per-frame Future exists.
             device_union.union_dev[destination_index].copy_(slot.native_union, non_blocking=True)
@@ -2541,6 +2598,56 @@ class _ResidentTensorRTRingExecutor:
             if bbox_collection_requested:
                 device_union.write_slice_bbox(destination_index, slot.native_bbox)
             frame_counts_dev[unit_index].copy_(slot.compact_count[0], non_blocking=True)
+            if native_fanout is not None:
+                floor_threshold = self.confidence_threshold
+                proto_treated = bool(self.proto_hole_treatment_active)
+                try:
+                    cutoffs = tuple(native_fanout.cutoffs)
+                    same_result = getattr(native_fanout, 'consume_same_result', None)
+                    counts = (_ring_native_cutoff_counts(getattr(slot, 'head', None), floor_threshold, cutoffs)
+                              if callable(same_result) else None)
+                    previous_cutoff = int(native_fanout.floor_cent)
+                    scalar_owned_floor = bool(getattr(native_fanout, 'scalar_owned_floor', False))
+                    previous_count = counts[0] if counts is not None else None
+                    if previous_count is None and not scalar_owned_floor:
+                        previous_count = int(slot.compact_count[0].item())
+                    native_fanout.consume_native(
+                        unit_index, previous_cutoff, slot.native_union, slot.native_conf,
+                        previous_count if scalar_owned_floor and previous_count is not None else slot.compact_count[0],
+                        proto_treated=proto_treated)
+                    blank = previous_count == 0
+                    for index, cutoff in enumerate(cutoffs):
+                        count = counts[index + 1] if counts is not None else None
+                        if (count is not None and count == previous_count
+                                and same_result(unit_index, int(cutoff), previous_cutoff)):
+                            previous_cutoff = int(cutoff)
+                            continue
+                        equal_live_floor = (scalar_owned_floor and previous_cutoff == native_fanout.floor_cent
+                                            and count is not None and count == previous_count)
+                        known_empty = blank or (scalar_owned_floor and count == 0)
+                        if not known_empty and not equal_live_floor:
+                            self.confidence_threshold = float(cutoff) / 100.
+                            # A captured post graph has its floor gate baked in. Siblings
+                            # use the same scalar kernels with their own exact gate.
+                            self._launch_post(slot)
+                            native_fanout.record_detector_work(mask_decodes=1)
+                        if scalar_owned_floor and known_empty:
+                            native_fanout.consume_empty(unit_index, int(cutoff), 0)
+                        else:
+                            # A floor-equivalent sibling owns the first durable
+                            # copy of the still-live slot. Subsequent equal cuts
+                            # can refer to that sibling's stored packet.
+                            native_fanout.consume_native(
+                                unit_index, int(cutoff), slot.native_union, slot.native_conf,
+                                slot.compact_count[0], proto_treated=proto_treated)
+                        previous_count = count
+                        if previous_count is None and index+1 < len(cutoffs):
+                            previous_count = int(slot.compact_count[0].item())
+                        previous_cutoff = int(cutoff)
+                        # Once a cutoff has no anchors, all larger gates stay empty.
+                        blank = previous_count == 0
+                finally:
+                    self.confidence_threshold = floor_threshold
             slot.post_done.record(slot.post_stream)
         device_union.written[destination_index] = True
         slot.post_valid = True
@@ -3217,6 +3324,20 @@ def _try_resident_trt_ring_accumulate(
     )
     pending: 'deque[Tuple[int, _ResidentGpuPipelineSlot]]' = deque()
     try:
+        from .forward_replay import torch_replay_for_predictor
+        native_fanout = _native_fanout_for_source(source)
+        replay_cache = (None if native_fanout is not None else
+                        torch_replay_for_predictor(predictor, cfg, 'gpu-segmentation-trt-ring'))
+
+        def enqueue_data(slot, unit_index):
+            if replay_cache is None:
+                executor.enqueue_inference(slot)
+            else:
+                executor.enqueue_inference(
+                    slot, replay_cache=replay_cache, source=source, batch_index=int(unit_index))
+            if native_fanout is not None:
+                native_fanout.record_detector_work(rendered_frames=1, render_batches=1, forward_calls=1)
+
         frame_counts_dev = torch.zeros(
             (int(num_frames),), dtype=torch.int32, device=device_union.device,
         )
@@ -3225,12 +3346,12 @@ def _try_resident_trt_ring_accumulate(
             if item is None:
                 break
             unit_index, slot = item
-            if post_policy == 'native_mask':
+            if post_policy == 'native_mask' or native_fanout is not None:
                 # Mark before enqueue: a failing asynchronous API may already
                 # have submitted a forward. Later cleanup/publication errors
                 # must not send this source through the worker's CPU retry.
                 source._native_trt_data_consumed = True
-            executor.enqueue_inference(slot)
+            enqueue_data(slot, unit_index)
             pending.append((int(unit_index), slot))
         submitted = len(pending)
         while pending:
@@ -3240,6 +3361,7 @@ def _try_resident_trt_ring_accumulate(
                 descriptor=descriptors[int(unit_index)],
                 device_union=device_union,
                 frame_counts_dev=frame_counts_dev,
+                **({} if native_fanout is None else {'native_fanout': native_fanout}),
             )
             if submitted < int(num_frames):
                 item = next_slot()
@@ -3248,7 +3370,7 @@ def _try_resident_trt_ring_accumulate(
                         f'resident TensorRT ring source ended at {submitted}/{int(num_frames)} units'
                     )
                 next_index, next_pipeline_slot = item
-                executor.enqueue_inference(next_pipeline_slot)
+                enqueue_data(next_pipeline_slot, next_index)
                 pending.append((int(next_index), next_pipeline_slot))
                 submitted += 1
         executor.synchronize()
@@ -3257,9 +3379,9 @@ def _try_resident_trt_ring_accumulate(
     except Exception as exc:
         source._direct_ring = None
         _resident_trt_pipeline_invalidate(backend, exc)
-        if post_policy == 'native_mask':
+        if post_policy == 'native_mask' or native_fanout is not None:
             raise _ResidentTensorRTRingFatalError(
-                'Native-mask TensorRT task failed after source consumption began; '
+                'Native-mask/fanout TensorRT task failed after source consumption began; '
                 'replaying its forward passes is forbidden'
             ) from exc
         raise
@@ -3267,7 +3389,7 @@ def _try_resident_trt_ring_accumulate(
         try:
             _resident_trt_pipeline_release(backend, executor, source)
         except Exception as exc:
-            if post_policy == 'native_mask':
+            if post_policy == 'native_mask' or native_fanout is not None:
                 source._direct_ring = None
                 _resident_trt_pipeline_invalidate(backend, exc)
                 raise _ResidentTensorRTRingFatalError(

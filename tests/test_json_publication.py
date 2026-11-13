@@ -110,6 +110,35 @@ class JsonPublicationTests(unittest.TestCase):
             self.assertEqual(list(Path(temp_dir).glob(".*")), [])
             self.assertEqual(json_publication._REPLACE_LOCKS, {})
 
+    @unittest.skipUnless(os.name == "nt", "requires Windows delete-sharing semantics")
+    def test_short_lived_reader_can_observe_previous_manifest_during_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "manifest.json"
+            destination.write_bytes(b"previous")
+            with destination.open("rb") as reader:
+                def release_reader(_delay):
+                    self.assertEqual(reader.read(), b"previous")
+                    reader.close()
+
+                with mock.patch.object(json_publication.time, "sleep", side_effect=release_reader) as delay:
+                    json_publication.write_json_atomic(destination, {"new": True})
+                delay.assert_called_once()
+            self.assertEqual(json.loads(destination.read_bytes()), {"new": True})
+
+    def test_persistent_windows_sharing_failure_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "manifest.json"
+            destination.write_bytes(b"previous")
+            error = PermissionError(errno.EACCES, "still in use")
+            error.winerror = 32
+            with mock.patch.object(json_publication.os, "replace", side_effect=error) as replace:
+                with mock.patch.object(json_publication.time, "sleep"):
+                    with self.assertRaises(PermissionError):
+                        json_publication.write_json_atomic(destination, {"new": True})
+            self.assertEqual(replace.call_count, 5)
+            self.assertEqual(destination.read_bytes(), b"previous")
+            self.assertEqual(list(Path(temp_dir).glob(".*")), [])
+
     def test_different_destinations_can_sync_in_parallel(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             barrier = threading.Barrier(2, timeout=5)

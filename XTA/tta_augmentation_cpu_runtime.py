@@ -100,7 +100,10 @@ def predict_cpu_policy_source(runner: Any, source: Any, *, task: dict[str, Any],
                             'azimuthal_padding_processed'):
                     stats[i][key] += int(result.get(key, 0))
                 for key, value in result.items():
-                    if key.startswith('openvino_'):
+                    if key in {'openvino_output_copy_count', 'openvino_output_copy_bytes',
+                               'openvino_forward_replay_hits', 'openvino_forward_replay_misses'}:
+                        stats[i][key] = int(stats[i].get(key, 0)) + int(value)
+                    elif key.startswith('openvino_'):
                         stats[i][key] = value
                 metadata[i].merge(result.get('slice_meta'), batch_start, real_count)
             batch_start += len(paths)

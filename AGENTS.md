@@ -1,3 +1,8 @@
+# Naming
+
+Use descriptive names for project functions and files. Keep personal names
+out of those identifiers and filenames.
+
 # Release numbering
 
 Before changing an actual release version, creating a release commit/tag, or
@@ -37,7 +42,7 @@ Before interpreting History, Results, old qualification reports, or release
 baselines, read the [version/commit map](../Scratch/Data/XTA/History/release/version_migrations.json)
 and [interpretation rules](../Scratch/Data/XTA/History/release/README.md#historical-release-identities).
 In a worktree, resolve these from the canonical History directory:
-`C:\Users\Bry\Documents\ChatGPT\Scratch\Data\XTA\History`.
+`%USERPROFILE%\Documents\ChatGPT\Scratch\Data\XTA\History`.
 
 On 2026-10-05, the listed old v24 releases became v23 and old v25 releases became
 v24. Old evidence retains its original labels, paths, bytes, and hashes. A bare

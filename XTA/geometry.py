@@ -3315,7 +3315,7 @@ def make_prediction_ref_yolo_source(
         return source
     if prediction_volume.array is None:
         raise ValueError(f'Prediction input {prediction_volume.name} has neither source nor array')
-    return make_in_memory_yolo_source(
+    result = make_in_memory_yolo_source(
         prediction_volume.array,
         prediction_volume.name,
         batch_size=max(1, int(batch_size)),
@@ -3329,6 +3329,9 @@ def make_prediction_ref_yolo_source(
         render_batch_sink=prediction_volume.render_batch_sink,
         raster_plan=prediction_volume.raster_plan,
     )
+    if getattr(prediction_volume, "_xta_forward_identity", None):
+        result._xta_forward_identity = prediction_volume._xta_forward_identity
+    return result
 
 def _center_preserving_scale_matrix(src_w: int, src_h: int, out_w: int, out_h: int) -> np.ndarray:
     cx_src = (int(src_w) - 1) / 2.0

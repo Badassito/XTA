@@ -15,6 +15,7 @@ import queue
 import threading
 import time
 import weakref
+import zlib
 from collections import Counter, deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -44,6 +45,20 @@ _SELECTION_KEY_UNSET = object()
 # ``cast`` is a no-op, but constructing nested typing aliases inside a full
 # pending-task scan is not. Keep this static type outside the dispatch path.
 _SelectionParentKey = Optional[Tuple[str, str]]
+
+
+def _sweep_gpu_tiebreak(task, all_workers, positions):
+    """Keep stable worker ties for a shared sweep, with no waiting or cross-device replay."""
+    if len(positions) < 2 or not task.get("sweep_source_stamp") or task.get("augmentation_pass_tasks"):
+        return
+    identity = (str(task.get("model_name", "")), str(getattr(task.get("view"), "name", "")),
+                str(task.get("kind", "")), str(task.get("job_id", "")), str(task.get("slice_start", 0)))
+    ordered = sorted(all_workers)
+    preferred = ordered[zlib.crc32("\0".join(identity).encode()) % len(ordered)]
+    if preferred in positions:
+        # Predicted load, inflight count and all existing feasibility/ownership
+        # checks still take precedence over this final round-robin tie breaker.
+        positions[preferred] -= len(ordered)
 
 
 @dataclass(frozen=True)
@@ -2989,6 +3004,8 @@ class TtaScheduler:
                 worker_id: (worker_ids.index(worker_id) - start_rank) % len(worker_ids)
                 for worker_id in feasible_workers
             }
+            if len(position) > 1 and task_to_dispatch.get("sweep_source_stamp"):
+                _sweep_gpu_tiebreak(task_to_dispatch, worker_ids, position)
             predicted_seconds = float(self.gpu_worker_task_seconds(task_to_dispatch))
             worker_id = min(
                 feasible_workers,

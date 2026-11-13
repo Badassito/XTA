@@ -179,6 +179,8 @@ def export_compact_evidence(run_manifest, compact_manifest, output, *, memory_mi
     plan = export_memory_plan(source_shape, target_shape, memory_mib)
     evidence_manifest = run_manifest.parent / "reconciliation_evidence" / "manifest.json"
     evidence = json.loads(evidence_manifest.read_text(encoding="utf-8"))
+    if compact.get("run_id") != run.get("run_id") or evidence.get("run_id") != run.get("run_id"):
+        raise ValueError("The compact masks, confidence evidence and run manifest come from different runs")
     if evidence.get("schema") not in SUPPORTED_EVIDENCE_SCHEMAS or not isinstance(evidence.get("layers"), list):
         raise ValueError("Unsupported confidence evidence manifest")
     if output.is_relative_to(compact_manifest.parent) or output.is_relative_to(evidence_manifest.parent):
@@ -310,9 +312,12 @@ def export_compact_evidence(run_manifest, compact_manifest, output, *, memory_mi
                                 "native_projection_applied": native, "source_run_sha256": watched[run_manifest]["sha256"],
                                 "compact_mask_sha256": _fingerprint(destination)["sha256"],
                                 "aggregation": "maximum over source-to-compact categorical footprints, intersected with compact mask",
+                                "observed_confidence": (ref.metadata.get("provenance", {}).get("observed_confidence")
+                                                        if ref else None),
                                 "source_confidence_metadata": dict(ref.metadata) if ref else None})
                     result["confidence_layers"].append({"model_name":key[0],"layer_key":key[1],"directory":identity,
                         "output_shape_tyx":list(target_shape),"score_semantics":written.metadata["score_semantics"],
+                        "observed_confidence": written.metadata["provenance"].get("observed_confidence"),
                         "unknown":"score_zero","coordinate_space":"source"})
                     result["layers"].append({"filename":metadata["filename"],"known_voxels":written.metadata["known_voxels"],
                                              "native_projection_applied":native,"model_name":key[0],"layer_key":key[1]})
@@ -327,7 +332,10 @@ def export_compact_evidence(run_manifest, compact_manifest, output, *, memory_mi
                     progress("layers", index+1, len(collection))
             portable_manifest = {**compact,"layer_count":len(portable_layers),"layers":portable_layers}
             (mask_output / compact_manifest.name).write_text(json.dumps(portable_manifest,indent=2)+"\n",encoding="utf-8")
-        (score_output / "manifest.json").write_text(json.dumps({"schema":SOURCE_SCHEMA,"layers":result["confidence_layers"]},indent=2)+"\n",encoding="utf-8")
+        score_catalog = {"schema":SOURCE_SCHEMA, "layers":result["confidence_layers"]}
+        if "run_id" in run:
+            score_catalog["run_id"] = run["run_id"]
+        (score_output / "manifest.json").write_text(json.dumps(score_catalog,indent=2)+"\n",encoding="utf-8")
         shutil.copyfile(run_manifest, provenance_output / "original_run_manifest.json")
         shutil.copyfile(compact_manifest, provenance_output / "original_compact_manifest.json")
         portable_run = {**run,"outputs":{"requested":["nrrd","confidence_evidence"],"paths":{

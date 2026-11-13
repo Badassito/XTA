@@ -17,6 +17,19 @@ python -m XTA --mode lta --help
 The versioned launcher and the installed `xta` command use the same dispatcher.
 Runtime dependencies and optional backends are declared in [pyproject.toml](pyproject.toml).
 
+## TTA confidence sweeps
+
+Use `--conf 0.50:0.10:1.00` for six operating points or
+`--conf 0.50:0.01:1.00` for 51. On eligible full-frame runs, the worker
+renders each batch once and evaluates the cutoffs from one YOLO forward. With
+interpolation off, compatible view masks are backprojected together and their
+NRRDs can appear across cutoff directories as each view finishes. With SDF or
+SAM, each cutoff runs its own interpolation from its own masks.
+With `--save nrrd low_quality:0.20`, the sweep also publishes a Slicer review:
+complete editable segments for smoothed 3D surfaces and one coverage-colored
+overlay over intensity in the slice views. One marker action applies to the
+usual visible masks across cutoffs. See the [confidence sweep guide](docs/confidence_sweeps.md).
+
 ## PTA label geometry
 
 `--force` allows NRRD labels to differ from the image by up to three voxels

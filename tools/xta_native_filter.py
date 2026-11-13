@@ -567,6 +567,10 @@ def run(args):
         raise ValueError('Unsupported Slicer edit-bundle format.')
     low_path = Path(args.low_manifest).resolve()
     full_path = Path(args.full_manifest).resolve()
+    sweep_binding = None
+    if 'sweep_context' in bundle:
+        from xta_sweep_edits import validate_sweep_source_pair
+        sweep_binding = validate_sweep_source_pair(bundle_dir, bundle, low_path, full_path)
     if digest(low_path) != bundle['source_manifest_sha256']:
         raise ValueError('This is not the original preview manifest selected during export.')
     low, full = load_json(low_path), load_json(full_path)
@@ -656,6 +660,8 @@ def run(args):
                                                'stop_without_publication'),
                                   'uses_intensity': False},
               'layers': [], 'warnings': [], 'source_full_sha256': {}}
+    if sweep_binding is not None:
+        report['sweep_edit_binding'] = sweep_binding
     if union_sources is not None:
         report['source_union'] = union_sources.report()
         report['source_full_unions'] = {}

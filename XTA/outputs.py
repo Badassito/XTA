@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import colorsys
 import contextlib
+import copy
 import gc
 import json
 import math
@@ -1950,6 +1951,28 @@ class _GpuMirrorTee:
         except Exception:
             pass
 
+def _acquire_output_gpu_stage(torch_mod: object, purpose: str) -> Optional[_MainProcessGpuStageLease]:
+    """Take an output-stage GPU lease; a later-cut sweep child waits for a busy one.
+
+    Inference-owning processes keep the non-blocking admission. A later-cut
+    confidence-sweep child has no inference to protect, and a busy lease there
+    belongs to another of its own short output stages. Falling back to the CPU
+    operator would change low-quality rounding relative to the GPU route a
+    scalar run's idle tail takes, so wait (bounded) instead.
+    """
+    lease = _try_acquire_main_process_gpu_stage(torch_mod, purpose)
+    if lease is not None or os.environ.get('XTA_YOLO_SWEEP_NATIVE_ROLE') != 'consume':
+        return lease
+    deadline = time.monotonic() + max(0.0, _env_float('XTA_YOLO_SWEEP_OUTPUT_STAGE_WAIT_SECONDS', 300.0))
+    delay = 0.05
+    while time.monotonic() < deadline:
+        time.sleep(delay)
+        delay = min(1.0, delay * 2)
+        lease = _try_acquire_main_process_gpu_stage(torch_mod, purpose)
+        if lease is not None:
+            return lease
+    return None
+
 def _try_create_gpu_mirror_tee(
     mirror_jobs: List[Dict[str, object]],
     out_t: int,
@@ -1961,7 +1984,7 @@ def _try_create_gpu_mirror_tee(
         import torch  # type: ignore
         if not bool(torch.cuda.is_available()):
             return None
-        lease = _try_acquire_main_process_gpu_stage(torch, 'NRRD low-quality GPU mirror tee')
+        lease = _acquire_output_gpu_stage(torch, 'NRRD low-quality GPU mirror tee')
         if lease is None:
             _announce_main_gpu_stage_skip_once(
                 'nrrd-mirror-tee-inference-busy',
@@ -2331,8 +2354,11 @@ class NrrdLayerSink:
         max_workers: int,
         low_quality_specs: Optional[Sequence['LowQualityDownbinSpec']] = None,
         low_quality_root: Optional[Path] = None,
+        run_id: str | None = None,
+        executor: Optional[ThreadPoolExecutor] = None,
     ) -> None:
         self.nrrd_dir = Path(nrrd_dir)
+        self.run_id = run_id
         self.nrrd_dir.mkdir(parents=True, exist_ok=True)
         self.stem = str(stem)
         self.output_shape = (int(output_shape_tyx[0]), int(output_shape_tyx[1]), int(output_shape_tyx[2]))
@@ -2340,6 +2366,11 @@ class NrrdLayerSink:
         self._lock = threading.Lock()
         self._futures: List[Future] = []
         self._source_refs: Dict[Future, NrrdLayerRef] = {}
+        self._layer_publication_observer: Optional[Callable[[NrrdLayerRef], object]] = None
+        # Keep completion/manifest identity without retaining immutable live arrays
+        # after their writer settles. View-major sweeps transfer these exact scalar
+        # rows into a later scalar tail rather than encoding the layer again.
+        self._publication_records: Dict[Tuple[str, str], List[Tuple[Future, Dict[str, object]]]] = {}
         self._manifest: List[Dict[str, object]] = []
         self._suffix_counts: Dict[str, int] = {}
         self._physical_names: Dict[str, str] = {}
@@ -2364,7 +2395,8 @@ class NrrdLayerSink:
         # Construct the executor only after every validating/construction-time filesystem
         # operation has succeeded. A failed mkdir can therefore never strand worker threads
         # in an object that the pipeline did not receive and cannot shut down.
-        self.executor = ThreadPoolExecutor(
+        self._owns_executor = executor is None
+        self.executor = executor if executor is not None else ThreadPoolExecutor(
             max_workers=self.max_workers,
             thread_name_prefix='nrrd-layer',
         )
@@ -2394,6 +2426,7 @@ class NrrdLayerSink:
     def submit_layer(self, ref: Optional['NrrdLayerRef'], suffix: str) -> Optional[Path]:
         if ref is None:
             return None
+        requested_suffix = str(suffix)
         provenance = interpolation_layer_provenance(ref, relative_to=self.nrrd_dir)
         if ref.mask_kind == 'extrapolation':
             tail = dict(getattr(ref, 'extrapolation_provenance', {}) or {})
@@ -2560,22 +2593,39 @@ class NrrdLayerSink:
                         lq_entry['stored_shape_tyx'] = [int(v) for v in lq_plan.stored_shape_tyx]
                         lq_entry['empty_segment'] = bool(lq_plan.empty_segment)
                 if lq_mirror_args:
-                    return write_layer_nrrd_with_low_quality_mirrors(
+                    result = write_layer_nrrd_with_low_quality_mirrors(
                         resolved_ref, self.output_shape, out_path, lq_mirror_args,
                         segment_name=segment_name,
                         segment_color=segment_color,
                         z_shards=int(executed_z_shards),
                     )
-                return write_single_layer_nrrd_from_ref(
-                    resolved_ref, self.output_shape, out_path,
-                    segment_name=segment_name,
-                    segment_color=segment_color,
-                    z_shards=int(executed_z_shards),
-                )
+                else:
+                    result = write_single_layer_nrrd_from_ref(
+                        resolved_ref, self.output_shape, out_path,
+                        segment_name=segment_name,
+                        segment_color=segment_color,
+                        z_shards=int(executed_z_shards),
+                    )
+                self.observe_published_layer(ref)
+                return result
 
             fut = self.executor.submit(_execute_layer_write)
             self._futures.append(fut)
             self._source_refs[fut] = ref
+            self._publication_records.setdefault((str(ref.key), requested_suffix), []).append((fut, {
+                'schema': 'xta.nrrd_layer_publication/1',
+                'stem': self.stem,
+                'run_id': self.run_id,
+                'output_shape_tyx': list(self.output_shape),
+                'native': manifest_entry,
+                'low_quality': {str(entry['downbin_token']): entry
+                                for _shape, entry in lq_manifest_entries},
+                'allocator': {
+                    'requested_suffix': str(suffix),
+                    'occurrence': seen + 1,
+                    'color_rgb': list(segment_color),
+                },
+            }))
         # add_done_callback runs immediately when the task already finished.
         # Register outside the source-map lock; the callback captures no layer.
         fut.add_done_callback(self._release_completed_source)
@@ -2584,6 +2634,25 @@ class NrrdLayerSink:
     def _release_completed_source(self, future: Future) -> None:
         with self._lock:
             self._source_refs.pop(future, None)
+
+    def set_layer_publication_observer(
+        self, observer: Optional[Callable[['NrrdLayerRef'], object]],
+    ) -> None:
+        """Observe successful final-path publication without resubmitting layers.
+
+        The callback runs on the layer writer before its Future resolves. It must
+        not wait for that same layer. Callback errors fail the writer transaction
+        and remain visible to the normal sink drain.
+        """
+        with self._lock:
+            self._layer_publication_observer = observer
+
+    def observe_published_layer(self, ref: 'NrrdLayerRef') -> None:
+        """Notify the current observer after native and every LQ mirror succeed."""
+        with self._lock:
+            observer = self._layer_publication_observer
+        if observer is not None:
+            observer(ref)
 
     def pending_layer_refs(self) -> Tuple[NrrdLayerRef, ...]:
         """Snapshot every unfinished export's source without opening its payload."""
@@ -2594,9 +2663,71 @@ class NrrdLayerSink:
             }
             return tuple(self._source_refs.values())
 
+    def published_layer_record(
+        self,
+        ref: Optional['NrrdLayerRef'],
+        suffix: str,
+        *,
+        output_path: Optional[Path] = None,
+        wait_for_completion: bool = False,
+    ) -> Optional[Dict[str, object]]:
+        """Snapshot one completed scalar native/LQ publication for later adoption.
+
+        The caller drains its view first. This never waits while holding the sink
+        lock, opens layer sources, or invents rows from submit-time geometry. A
+        repeated key/suffix requires the actual returned path to disambiguate it.
+        """
+        if ref is None:
+            return None
+        with self._lock:
+            matches = list(self._publication_records.get((str(ref.key), str(suffix)), ()))
+            if output_path is not None:
+                path = Path(output_path)
+                matches = [(future, record) for future, record in matches
+                           if path == self.nrrd_dir / str(record['native']['filename'])]
+        if len(matches) != 1:
+            raise ValueError('Published layer identity is unavailable or ambiguous')
+        future, record = matches[0]
+        if not wait_for_completion and not future.done():
+            raise RuntimeError('Layer publication is still pending; drain the sink first')
+        future.result()
+        with self._lock:
+            snapshot = copy.deepcopy(record)
+        def file_identity(path: Path) -> Dict[str, int]:
+            stat = path.stat()
+            return dict(size_bytes=int(stat.st_size), modified_time_ns=int(stat.st_mtime_ns),
+                        device=int(stat.st_dev), file_id=int(stat.st_ino))
+        specs = {str(spec.token): spec for spec in self.low_quality_specs}
+        snapshot['files'] = {
+            'native': file_identity(self.nrrd_dir / str(snapshot['native']['filename'])),
+            'low_quality': {
+                token: file_identity(self._lq_nrrd_dir(specs[token]) / str(row['filename']))
+                for token, row in snapshot['low_quality'].items()
+            },
+        }
+        return snapshot
+
+    def wait_published_layer(
+        self,
+        ref: Optional['NrrdLayerRef'],
+        suffix: str,
+        *,
+        output_path: Optional[Path] = None,
+    ) -> Optional[Dict[str, object]]:
+        """Quietly fence one combined native/LQ writer and snapshot its rows."""
+        return self.published_layer_record(ref, suffix, output_path=output_path,
+                                          wait_for_completion=True)
+
     def layer_count(self) -> int:
         with self._lock:
             return len(self._manifest)
+
+    def adopt_published_layer(self, ref, record) -> Optional[Path]:
+        """Register an existing cutoff detector publication without rewriting it."""
+        from .tta_sweep_branch_manifest import adopt_published_layer
+        return adopt_published_layer(self,ref,record,
+            basename_for_suffix=nrrd_layer_file_basename,
+            provenance_for_directory=interpolation_layer_provenance)
 
     def centerline_audit_layer_count(self) -> int:
         with self._lock:
@@ -2674,9 +2805,17 @@ class NrrdLayerSink:
             raise RuntimeError('Single-layer NRRD writing failed') from first_error
 
     def shutdown(self) -> None:
-        self.executor.shutdown(wait=True)
-        with self._lock:
-            self._source_refs.clear()
+        try:
+            if self._owns_executor:
+                self.executor.shutdown(wait=True)
+            else:
+                # Several branch sinks may share one bounded encoder pool. Its
+                # coordinator owns pool shutdown; this sink still fences every
+                # reader and reports failures before releasing source references.
+                self.wait()
+        finally:
+            with self._lock:
+                self._source_refs.clear()
 
     def record_final_bridge_survival(self, receipts: Sequence[Dict[str, object]]) -> None:
         """Attach the final output transaction without reusing native topology claims."""
@@ -2716,6 +2855,7 @@ class NrrdLayerSink:
                 lq_manifest_path = self._lq_nrrd_dir(spec) / f'{self.stem}_nrrd_manifest.json'
                 _write_json_atomically(lq_manifest_path, {
                     'layout': 'one_single_layer_nrrd_per_component',
+                    **({'run_id': self.run_id} if self.run_id is not None else {}),
                     'quality': 'low_quality',
                     'downbin_value': str(spec.raw_value),
                     'downbin_token': str(spec.token),
@@ -2739,6 +2879,7 @@ class NrrdLayerSink:
         manifest_path = self.nrrd_dir / f'{self.stem}_nrrd_manifest.json'
         manifest = {
             'layout': 'one_single_layer_nrrd_per_component',
+            **({'run_id': self.run_id} if self.run_id is not None else {}),
             'exported_axes': '(X, Y, t)',
             'output_shape_tyx': [int(v) for v in self.output_shape],
             'layer_count': len(manifest_layers),
@@ -3614,7 +3755,7 @@ def _try_gpu_downbin_volume(src_vol: np.ndarray, out_mm: np.ndarray, mode: str) 
             return False
     except Exception:
         return False
-    lease = _try_acquire_main_process_gpu_stage(torch, f'low-quality {mode} GPU downbin')
+    lease = _acquire_output_gpu_stage(torch, f'low-quality {mode} GPU downbin')
     if lease is None:
         _announce_main_gpu_stage_skip_once(
             'low-quality-downbin-inference-busy',

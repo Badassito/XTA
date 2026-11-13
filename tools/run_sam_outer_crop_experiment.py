@@ -197,7 +197,7 @@ def infer(args):
     diagnostic=helper()
     assemblies={}
     receipts=[]
-    with diagnostic.gpu_lock(Path(r"C:\Users\Bry\Documents\ChatGPT\Scratch\Temp\GPU_LOCK"),"outer_crop_frozen_research_models"),diagnostic.resource_monitor(runroot/"resources.json",0):
+    with diagnostic.gpu_lock(Path.home() / "Documents/ChatGPT/Scratch/Temp/GPU_LOCK","outer_crop_frozen_research_models"),diagnostic.resource_monitor(runroot/"resources.json",0):
         with SamInterpolationTracker(model_path=args.model,device_ids=(0,),artifact_root=runroot/"temporary",
             source_cache_ref=cache,feature_cache_bytes=512*1024**2,profile="egpu") as runtime:
             started=time.perf_counter()

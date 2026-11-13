@@ -87,6 +87,9 @@ class _SphericalCudaStage:
     def project_encoded(self, first, count, packed=False):
         return self.projector.project_encoded(first, count, packed=packed)
 
+    def project_rank_crops(self, first, count):
+        return self.projector.project_rank_crops(first, count)
+
     def close(self):
         if self.lease is None:
             return
@@ -106,7 +109,8 @@ class _SphericalCudaStage:
             self.close_lease_release_seconds = timings.get('close_lease_release_seconds', 0.0)
 
 
-def _try_spherical_cuda_stage(source, view, shape, bboxes, *, quiet=False):
+def _try_spherical_cuda_stage(source, view, shape, bboxes, *, quiet=False,
+                              scalar_max=False, block_bytes=None, upload_bytes=None):
     if not spherical_cuda_backproject_enabled():
         if not quiet:
             print(f'Spherical CUDA disabled {view.name}: using bounded CPU projection.', flush=True)
@@ -124,7 +128,13 @@ def _try_spherical_cuda_stage(source, view, shape, bboxes, *, quiet=False):
     from .backprojection import (_try_acquire_main_process_gpu_stage, _cancel_main_process_spherical_retirement_request,
                                  _try_acquire_main_process_overlap_gpu_stage, _decline_main_process_overlap)
     from .spherical_projection_cuda import SphericalCudaProjector
-
+    options = {}
+    if scalar_max:
+        options['scalar_max'] = True
+    if block_bytes is not None:
+        options['block_bytes'] = int(block_bytes)
+    if upload_bytes is not None:
+        options['upload_bytes'] = int(upload_bytes)
     purpose = f'Spherical source projection {view.name}'
     lease = _try_acquire_main_process_overlap_gpu_stage(torch, purpose)
     if lease is not None:
@@ -132,7 +142,7 @@ def _try_spherical_cuda_stage(source, view, shape, bboxes, *, quiet=False):
         projector = None
         try:
             projector = SphericalCudaProjector(source, view, shape, bboxes, int(lease.device_index),
-                                               max_device_bytes=int(lease.budget_bytes))
+                                               max_device_bytes=int(lease.budget_bytes), **options)
             return _SphericalCudaStage(projector, lease)
         except SphericalCudaProjectionUnsafeFailure as exc:
             exc.stage_lease = lease
@@ -153,7 +163,7 @@ def _try_spherical_cuda_stage(source, view, shape, bboxes, *, quiet=False):
         return None
     projector = None
     try:
-        projector = SphericalCudaProjector(source, view, shape, bboxes, int(lease.device_index))
+        projector = SphericalCudaProjector(source, view, shape, bboxes, int(lease.device_index), **options)
         return _SphericalCudaStage(projector, lease)
     except SphericalCudaProjectionUnsafeFailure as exc:
         exc.stage_lease = lease

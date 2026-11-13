@@ -1,0 +1,484 @@
+"""Explicit per-cutoff observed-confidence publication for shared view inference."""
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+import threading
+import time
+import zlib
+
+import numpy as np
+
+from ._deps import _numba
+from .confidence_evidence import (
+    SCHEMA,
+    _json_value,
+    _write_json_atomic,
+    write_block_confidence_evidence,
+)
+from .confidence_retention import observed_confidence_contract
+from .confidence_storage import BLOCK_DTYPE, checked_shape
+
+
+_CROP_GRID_ERROR = 'Sweep confidence native crop differs from its grid'
+_NO_RECORDS = np.empty(0, BLOCK_DTYPE)
+_NO_RECORDS.setflags(write=False)
+
+
+# Kernel loops index zero-based slice views: an offset index (``row[x0+c]``)
+# carries Numba's negative-index wraparound and stops LLVM vectorizing, which
+# measured ~10x slower on detector bounding boxes much larger than support.
+
+@_numba.njit(nogil=True, cache=True)
+def _merge_masked_crop(plane, touched, mask, scores, y0, x0, block):
+    """Max-merge one strip's masked scores into the frame plane; mark its grid cells.
+
+    ``plane[y0+r, x0+c] = max(plane, scores[r, c] if mask[r, c] else 0)``.
+    Cells overlapped by the strip are marked even when it contributes nothing:
+    an all-zero cell later yields no block, exactly like the per-cell scan.
+    """
+    rows, columns = mask.shape
+    for row in range(rows):
+        target = plane[y0 + row, x0:x0 + columns]
+        support = mask[row]
+        source = scores[row]
+        for column in range(columns):
+            value = source[column] & (np.uint8(0) - np.uint8(support[column] != 0))
+            target[column] = max(value, target[column])
+    for cell_row in range(y0 // block, (y0 + rows - 1) // block + 1):
+        for cell_column in range(x0 // block, (x0 + columns - 1) // block + 1):
+            touched[cell_row, cell_column] = 1
+
+
+@_numba.njit(nogil=True, cache=True)
+def _take_frame_cells(plane, touched, block):
+    """Pop every marked grid cell in row-major order as an exact tight crop.
+
+    Returns ``(table, raw)``: one ``(y, x, h, w, known, start)`` row per cell
+    with a nonzero score, trimmed to its nonzero bounding box, and the crops'
+    C-order bytes concatenated in ``raw``. The marks and every popped crop are
+    zeroed so the plane and marks are clean for the next frame.
+    """
+    height, width = plane.shape
+    cell_rows, cell_columns = touched.shape
+    marked = 0
+    for cell_row in range(cell_rows):
+        for cell_column in range(cell_columns):
+            marked += touched[cell_row, cell_column] != 0
+    table = np.empty((marked, 6), np.int64)
+    count = 0
+    total = 0
+    for cell_row in range(cell_rows):
+        for cell_column in range(cell_columns):
+            if touched[cell_row, cell_column] == 0:
+                continue
+            touched[cell_row, cell_column] = 0
+            a = cell_row * block
+            b = min(a + block, height)
+            c = cell_column * block
+            d = min(c + block, width)
+            top = bottom = -1
+            left, right = d, c
+            known = 0
+            for row in range(a, b):
+                values = plane[row, c:d]
+                seen = np.uint8(0)
+                for column in range(values.size):
+                    seen |= values[column]
+                if seen == 0:
+                    continue
+                first = 0
+                while values[first] == 0:
+                    first += 1
+                last = values.size - 1
+                while values[last] == 0:
+                    last -= 1
+                occupied = 0
+                segment = values[first:last + 1]
+                for column in range(segment.size):
+                    occupied += segment[column] != 0
+                known += occupied
+                if top < 0:
+                    top = row
+                bottom = row + 1
+                left = min(left, c + first)
+                right = max(right, c + last + 1)
+            if known:
+                table[count, 0] = top
+                table[count, 1] = left
+                table[count, 2] = bottom - top
+                table[count, 3] = right - left
+                table[count, 4] = known
+                table[count, 5] = total
+                total += (bottom - top) * (right - left)
+                count += 1
+    raw = np.empty(total, np.uint8)
+    for item in range(count):
+        y, x, h, w, start = table[item, 0], table[item, 1], table[item, 2], table[item, 3], table[item, 5]
+        for row in range(h):
+            values = plane[y + row, x:x + w]
+            output = raw[start + row * w:start + (row + 1) * w]
+            for column in range(w):
+                output[column] = values[column]
+                values[column] = 0
+    return table[:count], raw
+
+
+def _make_cell_compressor(compressor, ulong_dtype):
+    """One nogil call compresses a frame's cells with zlib ``compress2`` (level 3).
+
+    ``compress2`` is ``deflateInit(level)`` + ``deflate(Z_FINISH)``, the same
+    stream parameters as ``zlib.compress(data, 3)``; the library itself is
+    accepted only when it is Python's own zlib (see ``_native_cell_compressor``).
+    Returns ``(payload, lengths, done, status)``; a nonzero status leaves the
+    frame to the Python zlib path.
+    """
+    from .confidence_native_codec import _void_pointer
+
+    @_numba.njit(nogil=True, cache=False)
+    def compress_cells(raw, table):
+        count = table.shape[0]
+        capacity = 0
+        for item in range(count):
+            size = table[item, 2] * table[item, 3]
+            capacity += size + (size >> 12) + (size >> 14) + (size >> 25) + 13
+        payload = np.empty(max(1, capacity), np.uint8)
+        lengths = np.zeros(count, np.int64)
+        length = np.empty(1, ulong_dtype)
+        used = 0
+        for item in range(count):
+            size = table[item, 2] * table[item, 3]
+            length[0] = size + (size >> 12) + (size >> 14) + (size >> 25) + 13
+            status = compressor(_void_pointer(payload.ctypes.data + np.uintp(used)),
+                                _void_pointer(length.ctypes.data),
+                                _void_pointer(raw.ctypes.data + np.uintp(table[item, 5])), size, 3)
+            if status != 0:
+                return payload[:used], lengths, item, int(status)
+            # int(): an unsigned 64-bit c_ulong must not promote ``used`` to float.
+            written = int(length[0])
+            lengths[item] = written
+            used += written
+        return payload[:used], lengths, count, 0
+    return compress_cells
+
+
+_NATIVE_LOCK = threading.Lock()
+_NATIVE_COMPRESSORS = {}
+_NATIVE_MAX_BLOCK = 128
+
+
+def _probe_cell_compressor(kernel):
+    """Exact-bytes qualification against ``zlib.compress(level=3)`` on varied cells."""
+    rng = np.random.default_rng(20261112)
+    cells = [np.zeros((1, 1), np.uint8) + 1, np.zeros((128, 128), np.uint8) + 255,
+             rng.integers(0, 256, (128, 128), dtype=np.uint8),
+             rng.integers(0, 256, (97, 113), dtype=np.uint8) * (rng.random((97, 113)) < 0.2),
+             np.repeat(rng.integers(128, 256, (1, 128), dtype=np.uint8), 64, axis=0)]
+    raw = np.concatenate([cell.astype(np.uint8).reshape(-1) for cell in cells])
+    table = np.zeros((len(cells), 6), np.int64)
+    start = 0
+    for item, cell in enumerate(cells):
+        table[item, 2:4] = cell.shape
+        table[item, 5] = start
+        start += cell.size
+    payload, lengths, done, status = kernel(raw, table)
+    expected = [zlib.compress(cell.astype(np.uint8).tobytes(), 3) for cell in cells]
+    return (status == 0 and done == len(cells) and lengths.tolist() == [len(e) for e in expected]
+            and payload.tobytes() == b''.join(expected))
+
+
+def _native_cell_compressor():
+    """Return ``(kernel, backend)`` for exact nogil cell compression.
+
+    Uses the run's probed native codec only when it is Python's own zlib
+    extension (or an explicit qualification library) at Python's zlib runtime
+    version and reproduces ``zlib.compress`` bytes on probe cells; otherwise
+    ``(None, 'python_zlib')`` keeps one Python zlib call per cell. The codec's
+    configuration switch (YOLO_TTA_CONFIDENCE_NATIVE_CODEC) disables both.
+    """
+    import ctypes
+    from .confidence_native_codec import native_confidence_codec
+    codec, receipt = native_confidence_codec()
+    if (codec is None or codec.version != zlib.ZLIB_RUNTIME_VERSION
+            or receipt.get('library_source') not in ('python_zlib_extension', 'explicit_qualification')):
+        return None, 'python_zlib'
+    with _NATIVE_LOCK:
+        entry = _NATIVE_COMPRESSORS.get(id(codec))
+        if entry is None or entry[0] is not codec:
+            kernel = _make_cell_compressor(codec._compressor,
+                np.uint32 if ctypes.sizeof(ctypes.c_ulong) == 4 else np.uint64)
+            try:
+                qualified = _probe_cell_compressor(kernel)
+            except Exception:
+                qualified = False
+            entry = (codec, kernel if qualified else None)
+            _NATIVE_COMPRESSORS[id(codec)] = entry
+            print(f'Sweep confidence cell compression: '
+                  f'{"native_compress2" if qualified else "python_zlib"} '
+                  f'(library_source={receipt.get("library_source")}, version={codec.version}).', flush=True)
+    return (entry[1], 'native_compress2') if entry[1] is not None else (None, 'python_zlib')
+
+
+_WARM_LOCK = threading.Lock()
+_WARMED = False
+
+
+def warm_sweep_confidence_kernels():
+    """Compile (or load) every production signature before publishers are busy.
+
+    Production strips are C-contiguous uint8 masks (bool masks are viewed as
+    uint8) and uint8 scores, each either writable or read-only (journal
+    decodes are read-only). Compiling under later thread load needs the GIL.
+    The native cell compressor (when qualified) is compiled by its probe.
+    """
+    global _WARMED
+    with _WARM_LOCK:
+        if not _WARMED:
+            plane = np.zeros((3, 5), np.uint8)
+            touched = np.zeros((1, 1), np.uint8)
+            for mask_readonly in (False, True):
+                for scores_readonly in (False, True):
+                    mask = np.ones((2, 3), np.uint8)
+                    scores = np.full((2, 3), 7, np.uint8)
+                    mask.setflags(write=not mask_readonly)
+                    scores.setflags(write=not scores_readonly)
+                    _merge_masked_crop(plane, touched, mask, scores, 1, 1, 128)
+                    _take_frame_cells(plane, touched, 128)
+            _WARMED = True
+    _native_cell_compressor()
+
+
+class _MaskedScorePlanes:
+    """Read at most one native score plane and its exact surviving support."""
+
+    def __init__(self, shape, read_mask, read_scores):
+        if not callable(read_mask) or not callable(read_scores):
+            raise TypeError('Observed confidence requires mask and score plane readers')
+        self.shape = checked_shape(shape)
+        self.read_mask, self.read_scores = read_mask, read_scores
+
+    def iter_crops(self, z):
+        """Yield the whole plane as one native strip (or nothing for empty support)."""
+        mask = self.read_mask(z)
+        if mask is None:
+            return
+        mask = np.asarray(mask)
+        if mask.shape != self.shape[1:] or mask.dtype not in (np.dtype(bool), np.dtype(np.uint8)):
+            raise ValueError('Sweep confidence mask plane differs from its native grid')
+        if not np.any(mask):
+            return
+        values = self.read_scores(z)
+        if values is None:
+            return
+        values = np.asarray(values)
+        if values.dtype != np.uint8 or values.shape != self.shape[1:]:
+            raise ValueError('Sweep confidence score plane differs from its native grid')
+        yield 0, self.shape[1], 0, self.shape[2], mask, values
+
+
+class _MaskedCropFrameEncoder:
+    """Encode each frame's native strips as exact sparse scalar-confidence blocks.
+
+    The strips are max-merged on their mask support into one reusable frame
+    plane, then a single compiled call pops every nonempty global-grid cell in
+    row-major order, trimmed to its nonzero box with its known-voxel count.
+    Merge, scan and copy run without the GIL. Compression is one nogil call per
+    frame when Python's own zlib library is exposed natively (Linux); otherwise
+    one ``zlib.compress`` per cell, which releases the GIL while it deflates.
+    The payload, index and metadata equal the generic ``iter_crops`` ->
+    ``crop_blocks`` route of ``write_blocks``. One instance belongs to one
+    ``write_blocks`` call (H x W plane plus one frame's cells live).
+    """
+
+    def __init__(self, shape, read_native_crops, block_size=128):
+        if not callable(read_native_crops):
+            raise TypeError('Observed confidence needs a native crop reader')
+        self.shape = checked_shape(shape)
+        self.read_native_crops = read_native_crops
+        self.block_size = int(block_size)
+        if not 1 <= self.block_size <= 65535:
+            raise ValueError('Confidence block size must be in [1,65535]')
+        height, width = self.shape[1:]
+        block = self.block_size
+        self._plane = np.zeros((height, width), np.uint8)
+        self._touched = np.zeros(((height + block - 1) // block, (width + block - 1) // block), np.uint8)
+        warm_sweep_confidence_kernels()
+        self._compress_cells, self.codec_backend = (
+            _native_cell_compressor() if block <= _NATIVE_MAX_BLOCK else (None, 'python_zlib'))
+        self.native_fallback_frames = 0
+
+    def encode_caller_frame(self, z, block_size):
+        """Return ``(records, payload, known_voxels, phase_metrics)`` for frame z.
+
+        ``records`` are BLOCK_DTYPE index rows in global grid order whose
+        offsets are relative to this frame's concatenated zlib ``payload``.
+        """
+        if int(block_size) != self.block_size:
+            raise ValueError('Sweep confidence writer grid differs from its crop encoder')
+        height, width = self.shape[1:]
+        block = self.block_size
+        plane, touched = self._plane, self._touched
+        read_seconds = merge_seconds = 0.
+        merged = False
+        started = time.perf_counter()
+        for y0, y1, x0, x1, mask, scores in self.read_native_crops(z):
+            phase_started = time.perf_counter()
+            read_seconds += phase_started - started
+            if scores is not None:
+                y0, y1, x0, x1 = map(int, (y0, y1, x0, x1))
+                mask, scores = np.asarray(mask), np.asarray(scores)
+                if (not 0 <= y0 < y1 <= height or not 0 <= x0 < x1 <= width
+                        or mask.shape != (y1-y0, x1-x0) or scores.shape != mask.shape
+                        or mask.dtype not in (np.dtype(bool), np.dtype(np.uint8))
+                        or scores.dtype != np.uint8):
+                    raise ValueError(_CROP_GRID_ERROR)
+                if mask.dtype == np.dtype(bool):
+                    mask = mask.view(np.uint8)
+                if not mask.flags.c_contiguous:
+                    mask = np.ascontiguousarray(mask)
+                if not scores.flags.c_contiguous:
+                    scores = np.ascontiguousarray(scores)
+                _merge_masked_crop(plane, touched, mask, scores, y0, x0, block)
+                merged = True
+            mask = scores = None
+            started = time.perf_counter()
+            merge_seconds += started - phase_started
+        read_seconds += time.perf_counter() - started
+        if not merged:
+            return _NO_RECORDS, b'', 0, dict(read_seconds=read_seconds, scan_seconds=merge_seconds,
+                                             compression_seconds=0.)
+        started = time.perf_counter()
+        table, raw = _take_frame_cells(plane, touched, block)
+        count = len(table)
+        records = np.empty(count, BLOCK_DTYPE)
+        records['z'] = z
+        records['y'], records['x'] = table[:, 0], table[:, 1]
+        records['h'], records['w'] = table[:, 2], table[:, 3]
+        starts = table[:, 5]
+        ends = starts + table[:, 2] * table[:, 3]
+        known = int(table[:, 4].sum())
+        scan_seconds = merge_seconds + time.perf_counter() - started
+        started = time.perf_counter()
+        payload = None
+        if self._compress_cells is not None and count:
+            # One GIL release for the whole frame's cells.
+            compressed, lengths, done, status = self._compress_cells(raw, table)
+            if status == 0 and done == count:
+                payload = compressed.data
+            else:
+                self.native_fallback_frames += 1
+        if payload is None:
+            view = memoryview(raw)
+            try:
+                # Identical to zlib.compress(crop.tobytes(), level=3) per cell;
+                # each call releases the GIL while it deflates.
+                encoded = [zlib.compress(view[start:end], 3)
+                           for start, end in zip(starts.tolist(), ends.tolist())]
+            finally:
+                view.release()
+            lengths = np.fromiter(map(len, encoded), np.int64, count)
+            payload = b''.join(encoded)
+        if count and int(lengths.max()) > 0xFFFFFFFF:
+            raise ValueError('Confidence block exceeds its uint32 compressed length field')
+        records['length'] = lengths
+        records['offset'] = np.cumsum(lengths) - lengths
+        return records, payload, known, dict(read_seconds=read_seconds, scan_seconds=scan_seconds,
+                                             compression_seconds=time.perf_counter() - started)
+
+
+class SweepObservedConfidenceWriter:
+    """Retain each branch's numeric observations without the scalar singleton.
+
+    Readers supplied to ``publish_view`` are already bound to this cutoff and
+    return uint8 native-view planes after the ordinary scalar cleanup. ``None``
+    denotes a declared empty plane. This writer is for deferred native evidence;
+    confidence-reconciliation source projection keeps the existing scalar path.
+    """
+
+    def __init__(self, output_dir, *, cutoff_hundredths, source_shape_tyx, run_id,
+                 task='segment', min_conf=0.0, confidence_floor_by_backend=None,
+                 defer_projection=True):
+        if type(cutoff_hundredths) is not int or not 0 <= cutoff_hundredths <= 100:
+            raise ValueError('Sweep confidence cutoff must be an integer hundredth in [0,100]')
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError('Sweep confidence needs its scalar branch run ID')
+        if not defer_projection:
+            raise ValueError('Source-projected confidence uses the ordinary scalar publication path')
+        self.output = Path(output_dir) / 'reconciliation_evidence'
+        self.source_shape = checked_shape(source_shape_tyx)
+        self.cutoff, self.run_id = cutoff_hundredths, run_id
+        self.contract = observed_confidence_contract(prediction_task=task,
+            confidence_floor=cutoff_hundredths / 100., min_conf=min_conf,
+            confidence_floor_by_backend=confidence_floor_by_backend)
+        self._references, self._pending = {}, set()
+        self._lock = threading.Lock()
+        if self.manifest_path.exists():
+            raise FileExistsError(f'Confidence catalogue already exists: {self.manifest_path}')
+        # Writers start with the sweep, before publishers compete for the GIL.
+        warm_sweep_confidence_kernels()
+
+    @property
+    def manifest_path(self):
+        return self.output / 'manifest.json'
+
+    def _publish_catalogue(self, references):
+        layers = []
+        for (model_name, layer_key), ref in sorted(references.items()):
+            layers.append(dict(model_name=model_name, layer_key=layer_key,
+                directory=ref.path.name, output_shape_tyx=list(ref.shape),
+                storage_schema=ref.metadata['schema'], coordinate_space=ref.coordinate_space,
+                stored_shape_tyx=list(ref.storage_shape), score_semantics=ref.metadata['score_semantics'],
+                observed_confidence=ref.metadata['provenance']['observed_confidence'], unknown='score_zero'))
+        _write_json_atomic(self.manifest_path, dict(schema=SCHEMA, run_id=self.run_id,
+            purpose='observed_prediction_confidence', observed_confidence=self.contract, layers=layers))
+
+    def publish_view(self, view, model_name, *, native_shape, read_scores=None, read_mask=None,
+                     layer_key=None, source='fullframe', stage='pre_interpolation',
+                     tile_config_id='', tile_acceptance='', read_native_crops=None,
+                     metrics=None):
+        """Write one layer; ``metrics`` (optional dict) receives the writer's phase timings."""
+        from .cuda_d1 import _nrrd_layer_key
+
+        shape = checked_shape(native_shape)
+        key = str(layer_key or _nrrd_layer_key(view_name=view.name, source=source,
+            mask_kind='yolo', pass_index=0, tile_config_id=tile_config_id,
+            tile_acceptance=tile_acceptance, stage=stage))
+        token = (str(model_name), key)
+        identity = hashlib.sha256((token[0] + '\0' + key).encode('utf-8')).hexdigest()
+        with self._lock:
+            if token in self._references or token in self._pending:
+                raise RuntimeError(f'Duplicate sweep confidence layer {token!r}')
+            self._pending.add(token)
+        reader = None
+        try:
+            crops = (read_native_crops if read_native_crops is not None
+                     else _MaskedScorePlanes(shape, read_mask, read_scores).iter_crops)
+            reader = _MaskedCropFrameEncoder(shape, crops)
+            provenance = dict(view=_json_value(view), processing_shape_tyx=list(shape),
+                source=source, mask_kind='yolo', stage=stage,
+                tile_config_id=tile_config_id, tile_acceptance=tile_acceptance,
+                confidence_scope='surviving observed prediction support before interpolation',
+                observed_confidence=self.contract, run_id=self.run_id,
+                confidence_sweep=dict(cutoff_hundredths=self.cutoff))
+            reference = write_block_confidence_evidence(self.output / identity, shape, reader,
+                layer_key=key, model_name=str(model_name), provenance=provenance,
+                coordinate_space='native_view_processing', source_shape_tyx=self.source_shape,
+                metrics=metrics)
+            with self._lock:
+                updated = {**self._references, token: reference}
+                self._publish_catalogue(updated)
+                self._references = updated
+            return reference
+        finally:
+            # The encoder's frame plane is this call's only dense workspace.
+            reader = crops = None
+            with self._lock:
+                self._pending.remove(token)
+
+    def finish(self):
+        """Publish an empty catalogue too when no observed view was requested."""
+        with self._lock:
+            if self._pending:
+                raise RuntimeError('Sweep confidence publication still has unfinished views')
+            self._publish_catalogue(self._references)
+        return self.manifest_path

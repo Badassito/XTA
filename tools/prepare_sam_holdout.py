@@ -26,14 +26,14 @@ def main():
     spec=importlib.util.spec_from_file_location("diagnostic",Path(__file__).parent/"diagnose_sam_interpolation.py")
     diagnostic=importlib.util.module_from_spec(spec)
     spec.loader.exec_module(diagnostic)
-    tools=Path(r"C:\Users\Bry\Documents\ChatGPT\Scratch\Environment\tools")
+    tools=Path.home() / "Documents/ChatGPT/Scratch/Environment/tools"
     probe=json.loads(subprocess.run([str(tools/"ffprobe.exe"),"-v","error","-select_streams","v:0","-show_entries","stream=width,height","-of","json",str(args.input)],capture_output=True,text=True,check=True).stdout)["streams"][0]
     width,height=int(probe["width"]),int(probe["height"])
     full=args.output/"source_frames.uint8.dat"
     with full.open("wb") as out:
         subprocess.run([str(tools/"ffmpeg.exe"),"-v","error","-i",str(args.input),"-vf",f"select=between(n\\,{args.start}\\,{args.stop-1})","-fps_mode","passthrough","-f","rawvideo","-pix_fmt","gray","-"],stdout=out,check=True)
     images=np.memmap(full,dtype=np.uint8,mode="r",shape=(args.stop-args.start,height,width))
-    with diagnostic.gpu_lock(Path(r"C:\Users\Bry\Documents\ChatGPT\Scratch\Temp\GPU_LOCK"),"sam_improvements_blind_detector_holdout"),diagnostic.resource_monitor(args.output/"resources.json",0):
+    with diagnostic.gpu_lock(Path.home() / "Documents/ChatGPT/Scratch/Temp/GPU_LOCK","sam_improvements_blind_detector_holdout"),diagnostic.resource_monitor(args.output/"resources.json",0):
         import torch
         from ultralytics import YOLO
         detector=YOLO(str(args.detector))

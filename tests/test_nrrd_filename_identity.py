@@ -35,7 +35,7 @@ class NrrdFilenameIdentityTests(unittest.TestCase):
         suffix = ("AzimuthalTiltedTransverse_Vertical_p30_TTA_a0_fullframe_sam_bridge_pass01_backward_"
                   "detector739a8cd98d07_bundle51f2662c0c38_policye7859fb5f5d6")
         basename = outputs.nrrd_layer_file_basename(stem, suffix)
-        root = Path(r"C:\Users\Bry\Documents\ChatGPT\Scratch\Experiments\Results\F3_10_4_30_2026_8bit_Y_151147")
+        root = Path(r"C:\Users\dev\Documents\ChatGPT\Scratch\Experiments\Results\F3_10_4_30_2026_8bit_Y_151147")
         before = root / "low_quality" / "0p20_604x612x388" / "nrrd" / f"{stem}_{suffix}.seg.nrrd"
         after = before.parent / basename
         self.assertEqual(len(basename), 120)

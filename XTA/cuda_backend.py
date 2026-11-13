@@ -323,10 +323,19 @@ def gpu_projection_overlap_reserve_bytes() -> int:
     One overlapping main-process source projection may own at most this many
     device bytes while inference keeps running on the same GPU. Zero when the
     overlap is disabled, so sizing is then exactly the historical behavior.
+    The default is 4 GiB. A confidence-sweep producer (main process and the
+    GPU workers inheriting ``XTA_YOLO_SWEEP_NATIVE_ROLE=produce``) defaults to
+    6 GiB so its largest sibling rank sessions (tilted Azimuthal, ~4.1-4.25
+    GiB at cluster scale) fit the slice inference sizing already excludes.
+    An explicit ``YOLO_TTA_GPU_PROJECTION_OVERLAP_GIB`` always wins.
     """
     if not gpu_projection_overlap_enabled():
         return 0
-    return int(max(0.0, _env_float('YOLO_TTA_GPU_PROJECTION_OVERLAP_GIB', 4.0)) * GIB)
+    default = 4.0
+    if (os.environ.get('XTA_YOLO_SWEEP_NATIVE_ROLE') == 'produce'
+            and not os.environ.get('YOLO_TTA_GPU_PROJECTION_OVERLAP_GIB', '').strip()):
+        default = 6.0
+    return int(max(0.0, _env_float('YOLO_TTA_GPU_PROJECTION_OVERLAP_GIB', default)) * GIB)
 
 def gpu_sizing_free_bytes(free_bytes: int) -> int:
     """Free device bytes for elastic or fallback-capable inference-side sizing.

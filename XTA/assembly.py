@@ -29,6 +29,7 @@ from typing import (
 import numpy as np
 from ._deps import _numba, cv2, ndi, tqdm
 from .gaussian import binary_gaussian_pass
+from .sweep_backprojection import project_sweep_view
 from .artifact_archive import artifact_directory, artifact_size, open_artifact, split_reference
 
 from .config import (
@@ -1592,13 +1593,16 @@ def materialize_nrrd_global_layer(
     recomposition_op: str = 'select',
     low_quality_recomposition_op: str = 'select',
     mirror_low_quality: bool = True,
+    include_empty: bool = False,
 ) -> Optional[NrrdLayerRef]:
-    # see materialize_nrrd_view_layer.
-    if known_has_foreground is not None:
-        if not bool(known_has_foreground):
+    # Optional intermediate layers can disappear; a requested final Global
+    # must identify the completed cutoff and its native/preview grids even
+    # when every voxel is zero. Its normal writer computes the exact extent.
+    if not include_empty:
+        if known_has_foreground is None:
+            known_has_foreground = _volume_has_foreground(volume_mm)
+        if not known_has_foreground:
             return None
-    elif not _volume_has_foreground(volume_mm):
-        return None
     view_name = 'global'
     key = _nrrd_layer_key(
         view_name=view_name,

@@ -234,6 +234,34 @@ def test_cpu_runtime_renders_once_and_keeps_independent_pass_outputs(tmp_path, m
     assert result['prediction_count'] == 3
 
 
+def test_cpu_runtime_sums_replay_and_copy_counters_across_batches(tmp_path, monkeypatch):
+    from XTA import workers
+
+    class Runner:
+        def infer_source_to_union(self, source, **kwargs):
+            for _paths, images, _info in source:
+                for i, image in enumerate(images):
+                    spec = source.result_frame_spec(i)
+                    if spec is not None:
+                        planes = source.restore_prediction_planes(spec, [(image > 0).astype(np.uint8)])
+                        kwargs['view_union_mm'][spec.task_index] |= planes[0]
+            frames = kwargs['num_frames']
+            return dict(prediction_count=frames, frames_with_predictions=frames,
+                        slice_meta=workers._binary_slice_metadata_from_array(kwargs['view_union_mm']),
+                        openvino_output_copy_count=2, openvino_output_copy_bytes=64 * frames,
+                        openvino_forward_replay_hits=frames, openvino_forward_replay_misses=1,
+                        openvino_request_count=2, openvino_precision='fp32')
+
+    result = _exercise_cpu_runtime(tmp_path, monkeypatch, Runner())
+    for record in (result, *result['augmentation_results']):
+        assert record['openvino_output_copy_count'] == 4
+        assert record['openvino_output_copy_bytes'] == 192
+        assert record['openvino_forward_replay_hits'] == 3
+        assert record['openvino_forward_replay_misses'] == 2
+        assert record['openvino_request_count'] == 2
+        assert record['openvino_precision'] == 'fp32'
+
+
 def test_real_openvino_cpu_augmented_inference(tmp_path, monkeypatch):
     ov = pytest.importorskip('openvino')
     from openvino import opset13 as ops

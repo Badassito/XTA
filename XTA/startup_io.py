@@ -3,10 +3,42 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import json
+import os
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .unification.tta_manifest import _file_identity
+from .unification.tta_manifest import (
+    _file_identity,
+    _sweep_startup_cache_path,
+    _write_sweep_startup_cache,
+)
+
+
+def _probe_source(
+    input_path: Path,
+    source_identity: Mapping[str, Any],
+    probe: Callable[[Path], dict[str, Any]],
+) -> dict[str, Any]:
+    cache_path = _sweep_startup_cache_path("source", Path(source_identity["path"]))
+    if cache_path is None:
+        return probe(input_path)
+    cached = None
+    if cache_path.exists():
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+    if cached is not None and cached.get("source") != dict(source_identity):
+        raise RuntimeError(f"TTA source artifact changed within confidence sweep: {input_path}")
+    # This setting selects tail-timestamp discovery versus a complete packet scan.
+    mode = os.environ.get("YOLO_TTA_FRAME_COUNT_FULL_SCAN", "0").strip().lower()
+    probes = {} if cached is None else cached["probes"]
+    if mode in probes:
+        return dict(probes[mode])
+    info = probe(input_path)
+    if _file_identity(input_path) != dict(source_identity):
+        raise RuntimeError(f"TTA source artifact changed during startup discovery: {input_path}")
+    probes[mode] = info
+    _write_sweep_startup_cache(cache_path, {"source": dict(source_identity), "probes": probes})
+    return info
 
 
 def capture_and_probe_tta_startup(
@@ -28,7 +60,7 @@ def capture_and_probe_tta_startup(
     source_before = _file_identity(input_path)
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix='tta-startup-identity') as executor:
         identity_future = executor.submit(capture_identities)
-        source_info = probe(input_path)
+        source_info = _probe_source(input_path, source_before, probe)
         identities = identity_future.result()
     source_after = _file_identity(input_path)
     captured_source: Mapping[str, Any] = identities['source']

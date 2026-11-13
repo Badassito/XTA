@@ -234,7 +234,10 @@ class SemanticTrtRingExecutor:
         for slot in self.slots:
             slot.infer_stream.synchronize()
 
-    def enqueue(self, slot: object, *, input_tensor: Optional[object], ready_event: Optional[object]) -> None:
+    def enqueue(
+        self, slot: object, *, input_tensor: Optional[object], ready_event: Optional[object],
+        replay_cache: Optional[object] = None, source: Optional[object] = None, batch_index: int = 0,
+    ) -> None:
         with self.torch.cuda.stream(slot.infer_stream):
             if slot.post_valid:
                 slot.infer_stream.wait_event(slot.post_done)
@@ -247,10 +250,25 @@ class SemanticTrtRingExecutor:
                 record_stream = getattr(input_tensor, 'record_stream', None)
                 if callable(record_stream):
                     record_stream(slot.infer_stream)
-            if slot.infer_graph is None:
-                self._execute(slot)
+            replay_key = (None if replay_cache is None else replay_cache.input_key(
+                slot.input, source=source, batch_index=int(batch_index)))
+            replayed = (None if replay_key is None else replay_cache.load_tensors(
+                replay_key, device=slot.input.device))
+            if replayed is None:
+                if slot.infer_graph is None:
+                    self._execute(slot)
+                else:
+                    slot.infer_graph.replay()
+                if replay_key is not None:
+                    replay_cache.store(replay_key, (slot.output,))
             else:
-                slot.infer_graph.replay()
+                if len(replayed) != 1:
+                    raise RuntimeError('TensorRT semantic replay requires one raw logits tensor')
+                value = replayed[0]
+                if (tuple(value.shape) != tuple(slot.output.shape) or value.dtype != slot.output.dtype
+                        or value.device != slot.output.device):
+                    raise RuntimeError('TensorRT semantic replay differs from its static logits binding')
+                slot.output.copy_(value, non_blocking=True)
             slot.infer_done.record(slot.infer_stream)
         slot.infer_valid = True
 
@@ -518,6 +536,14 @@ def try_semantic_trt_ring(
     batches = 0
     real_frames = 0
     try:
+        from .forward_replay import torch_replay_for_predictor
+        replay_cache = torch_replay_for_predictor(predictor, cfg, 'gpu-semantic-trt-ring')
+
+        def enqueue_data(slot, input_tensor, ready_event, batch_index):
+            replay_options = ({} if replay_cache is None else dict(
+                replay_cache=replay_cache, source=source, batch_index=int(batch_index)))
+            executor.enqueue(slot, input_tensor=input_tensor, ready_event=ready_event, **replay_options)
+
         if direct:
             for batch_index in range(int(num_frames)):
                 consumed = True
@@ -528,7 +554,7 @@ def try_semantic_trt_ring(
                 frame_index, slot = item
                 source._native_trt_data_consumed = True
                 spec = prediction_result_frame_spec(source, int(frame_index), num_frames=int(num_frames))
-                executor.enqueue(slot, input_tensor=None, ready_event=None)
+                enqueue_data(slot, None, None, batch_index)
                 pending.append((slot, (spec,)))
                 batches += 1
                 real_frames += int(spec is not None and not bool(spec.is_azimuthal_padding))
@@ -564,7 +590,7 @@ def try_semantic_trt_ring(
                 ):
                     raise RuntimeError('Semantic TensorRT source did not yield normalized CUDA BCHW input')
                 source._native_trt_data_consumed = True
-                executor.enqueue(slot, input_tensor=input_tensor, ready_event=ready_event)
+                enqueue_data(slot, input_tensor, ready_event, batches)
                 if ready_event is not None and getattr(images, '_tta_cpu_tensor_ref', None) is not None:
                     executor.retain_input_owner(images, ready_event)
                 pending.append((slot, specs))

@@ -239,9 +239,18 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
     if capture_plan is None and typed_capture:
         from .confidence_capture import plan_confidence_capture
         capture_plan = plan_confidence_capture(shape, 1, block_size=block_size)
+    # A reader that encodes whole frames on this writer's thread (sweep sibling
+    # crops) returns one frame's index records (BLOCK_DTYPE, offsets relative
+    # to the frame) and its concatenated zlib payload, in global grid order:
+    # one write pair per frame, no per-block Python here. It takes no capture
+    # plan, worker pool or scheduler lane.
+    caller_encoder = (getattr(slice_reader, 'encode_caller_frame', None)
+                      if capture_plan is None else None)
     if capture_plan is not None:
         encoded_frames = _ordered_encoded_frames(slice_reader, first, stop, block_size,
                                                   capture_plan.workers, metrics=metrics)
+    elif caller_encoder is not None:
+        encoded_frames = ((z, caller_encoder(z, block_size)) for z in range(first, stop))
     # The consumer's already admitted frame allowance also bounds this transient
     # copy. Leave a factor of two plus control space for bytearray overallocation.
     # Generic readers retain their existing cell-at-a-time memory contract.
@@ -275,6 +284,35 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
                           f'blocks={blocks}, payload_bytes={payload_offset}, elapsed_s={now-started:.1f}.',
                           flush=True)
                     next_progress = now + 30.0
+                if caller_encoder is not None:
+                    records, frame_payload, frame_known, phase_metrics = encoded_result
+                    read_seconds += phase_metrics['read_seconds']
+                    scan_seconds += phase_metrics['scan_seconds']
+                    compression_seconds += phase_metrics['compression_seconds']
+                    count = len(records)
+                    if not count:
+                        continue
+                    if (records.dtype != BLOCK_DTYPE or records.ndim != 1
+                            or int(records['offset'][-1])+int(records['length'][-1]) != len(frame_payload)):
+                        raise ValueError('Confidence frame encoder returned inconsistent records')
+                    # Cumulative sizes only grow, so the frame total exceeds the
+                    # reservation exactly when some per-block prefix would.
+                    if (max_numeric_bytes is not None
+                            and payload_offset+len(frame_payload)+(blocks+count)*_RECORD.size > int(max_numeric_bytes)):
+                        raise ConfidenceStageLimit('Compressed confidence exceeds its local staging reservation')
+                    phase_started = time.perf_counter()
+                    records['offset'] += np.uint64(payload_offset)
+                    index_bytes = records.tobytes()
+                    index.write(index_bytes); index_digest.update(index_bytes)
+                    payload.write(frame_payload); digest.update(frame_payload)
+                    index_write_calls += 1
+                    payload_write_calls += 1
+                    storage_seconds += time.perf_counter() - phase_started
+                    payload_offset += len(frame_payload)
+                    blocks += count
+                    known += frame_known
+                    records = frame_payload = index_bytes = None
+                    continue
                 if encoded_result is not None:
                     encoded_rows, phase_metrics = encoded_result
                     scan_seconds += phase_metrics['scan_seconds']
@@ -386,6 +424,10 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
                 storage_batch_reserved_bytes=0 if not batch_limit else 2*batch_limit+128,
                 storage_payload_write_calls=payload_write_calls,
                 storage_index_write_calls=index_write_calls)
+            if caller_encoder is not None:
+                metrics.update(frame_encoder='caller_compiled_cells',
+                    frame_encoder_codec=getattr(slice_reader, 'codec_backend', None),
+                    frame_encoder_codec_fallback_frames=getattr(slice_reader, 'native_fallback_frames', 0))
             if codec_diagnostics:
                 metrics.update(capture_codec_frame_counts=dict(codec_frame_counts),
                     capture_copy_kernel_calls=copy_kernel_calls,
@@ -415,7 +457,7 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
         # keep completed numeric windows or borrowed reader aliases alive after
         # every producer has been joined by close().
         encoded_frames = measured_frames = frames = iterator = None
-        encoded_result = encoded_rows = slice_reader = None
+        encoded_result = encoded_rows = slice_reader = caller_encoder = None
         payload_tmp.unlink(missing_ok=True)
         index_tmp.unlink(missing_ok=True)
 

@@ -25,14 +25,81 @@ small handoff back to the machine holding FQ data.
 In Slicer's Python console, execute the maintained script, adjusting its path:
 
 ```python
-exec(open(r"C:\Users\Bry\Documents\ChatGPT\Test\tools\slicer\xta_slicerrc.py", encoding="utf-8").read())
+exec(open(r"C:\path\to\XTA\tools\slicer\xta_slicerrc.py", encoding="utf-8").read())
 ```
 
 This replaces the My Tools toolbar. It does not run Importer or change voxel
 arrays on load. The script is self-contained in Slicer. Keep a copy of an
 existing startup script before choosing to replace it permanently.
 
-The My Tools panel uses two rows. One **Show All / Hide All** button toggles
+### Multi-cutoff review
+
+Load the matching intensity in Slicer. In a fresh scene click **Importer** and
+select the sweep's `review/manifest.json`. Importer offers grouped review grids
+only, smallest low-quality grid first. When the sweep has a low-quality tier,
+its native grid is reference-only: it binds exported edits to the native branch
+NRRDs and is never loaded. Importer then asks which cutoffs to load as editable
+masks, with the review default first, or all of them. Click **Importer** again
+later to add cutoffs; loaded cutoffs stay. Alternatively, load grouped
+`.seg.nrrd` files through **Add Data** and click **Importer**; each group holds
+one cutoff. Importer recognizes the published segment IDs, completes each
+loaded cutoff, creates the normal smoothed surfaces from complete branch masks,
+and installs one slice overlay. Source colors and logical IDs are preserved.
+Use the matching LQ intensity or confirm **Align Native Intensity** when pairing
+a full-size intensity stack with an LQ grid. Programmatic entry supports
+`ImportXTASegments(manifest_path, grid_id="low_quality/half",
+volume_node=intensity_node, cutoff_cents=[50, 70])` with an actual grid ID from
+the package; `cutoff_cents="all"` loads every cutoff.
+
+**2D Cutoff** selects the confidence cutoff shown over the intensity, or
+restores the original segment display. Its colors encode how many direct
+prediction layers at that cutoff cover the pixel. The count starts at one,
+including a single weakly supported location. Foreground supplied only by an
+accepted interpolation or extrapolation, and remaining Global-only foreground,
+have separate colors. Global and generated masks do not add direct votes.
+A cutoff that is not loaded is shown from its published direct-count labelmap,
+read-only and without those accents. Switching the displayed cutoff does not
+change segment eyes. By default the 3D view shows only the displayed cutoff's
+surfaces; **3D: Show All Cutoffs** shows every loaded cutoff, and the button
+then offers **3D: Show Displayed Only**.
+
+The working label values remain the actual direct-layer counts. Colors group
+counts into 1, 2–3, 4–7, 8–15 and 16+. The display refreshes from source-mask
+edits, while ordinary slice navigation reads the existing label volume.
+Managed snips update the bounding region containing the old and new support.
+`XTA_SWEEP_DISPLAY_CACHE_MIB` controls the optional packed contribution cache
+(256 MiB by default). With less cache, the controller can recompute the affected
+region from current sources. The array sizes depend on the selected grid and
+maximum possible layer counts. An explicit `ImportXTASegments(...,
+max_working_mib=...)` or `XTA_SWEEP_DISPLAY_MAX_WORKING_MIB` sets a working
+memory limit for that workstation.
+
+Place normal **F**, **L** or **C/CC** markers over the desired structure and
+use **Remove Islands** or **Remove Slices** once. Each visible source segment in
+the edit scope receives the operation on its own complete mask and geometry.
+The scope button next to **2D Cutoff** names the current scope:
+**Scope: Displayed** (default) edits only masks at the displayed cutoff,
+**Scope: Displayed+Stricter** also edits higher cutoffs, and **Scope: All
+Cutoffs** edits every visible cutoff. Nested masks connect more widely at lower
+cutoffs, so the island holding a marker can be far larger there. Ordinary
+segments ignore the scope. The status message reports the scope and how many
+visible masks it left unchanged. Changed data refresh the 2D display and
+existing closed surfaces. **Update Global** rebuilds
+each cutoff from that cutoff's additive layers, preserving the existing
+largest-island rule. **Update Nonglobal** clips those same layers to their own
+nonempty Global. **Update Both** runs the two operations in that order. As in
+a normal scene, hidden contributors participate in recomposition, so a
+Global-only deletion can be restored from retained source masks.
+
+For native transfer work on an LQ grid, run **Update Both** and **Export XTA
+Edits**. The toolbar button exports the displayed cutoff, which must be loaded;
+`ExportXTAEdits(review_manifest)` in the console exports every loaded cutoff.
+The output includes a sweep index and independently bound per-cutoff child
+edit bundles. Use the chosen child with the corresponding original LQ
+and FQ manifests. Keep the original branch data and sweep review manifest
+available for export and transfer.
+
+The My Tools panel uses two rows of eight buttons. One **Show All / Hide All** button toggles
 every segmentation node. Its label names the next action. When the scene is
 entirely shown or entirely hidden, the button follows the scene instead.
 
@@ -100,7 +167,7 @@ For a separate, simple upscaling comparison, use the original full-resolution
 source volume in Segment Editor, then run:
 
 ```python
-exec(open(r"C:\Users\Bry\Documents\ChatGPT\Test\tools\slicer\xta_upscale_preview.py", encoding="utf-8").read())
+exec(open(r"C:\path\to\XTA\tools\slicer\xta_upscale_preview.py", encoding="utf-8").read())
 ```
 
 On the Ubuntu Slicer workstation, copy just `xta_upscale_preview.py` there and

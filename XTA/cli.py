@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import sys
 from collections.abc import Iterator, Sequence
+from pathlib import Path
 
 from .unification.context import activate_unified_launch
 from . import __version__
@@ -96,6 +97,7 @@ def _run_tta(arguments: Sequence[str]) -> None:
         parser.error("--channel_format may be provided only once")
     parsed = parser.parse_args(mode_arguments)
     from .config import (
+        parse_confidence_sweep_options,
         resolve_backend_devices,
         resolve_backend_models,
         resolve_interpolation_settings,
@@ -106,6 +108,7 @@ def _run_tta(arguments: Sequence[str]) -> None:
     from .tta_augmentation_config import resolve_tta_augmentation
     from .reconciliation_policy import resolve_reconciliation
     try:
+        parse_confidence_sweep_options(parser, parsed, mode_arguments)
         devices = resolve_backend_devices(parsed.device)
         models = resolve_backend_models(parsed.model)
         interpolation = resolve_interpolation_settings(parsed, models, devices)
@@ -113,6 +116,19 @@ def _run_tta(arguments: Sequence[str]) -> None:
         resolve_reconciliation(parsed)
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
+
+    if parsed.conf_sweep is not None:
+        from .confidence_sweep import run_confidence_sweep
+
+        output = Path(parsed.output) if parsed.output else Path.cwd() / Path(parsed.input).expanduser().resolve().stem
+        run_confidence_sweep(
+            mode_arguments,
+            cutoffs_hundredths=parsed.conf_sweep.levels_hundredths,
+            output_root=output,
+            temp_root=Path(parsed.temp) if parsed.temp else None,
+            min_conf=parsed.min_conf,
+        )
+        return
 
     # The established entry point and pipeline consume sys.argv. Remove the unified mode
     # selector for the duration of the call rather than teaching the TTA parser a new flag.

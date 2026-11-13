@@ -11,6 +11,8 @@ test oracles, model bundles, retained evidence, or specific hardware.
 | Tool | Purpose |
 | --- | --- |
 | `xta_native_filter.py` | Transfer Slicer cleanup evidence to native-resolution labels |
+| `pack_confidence_sweep.py` | Assemble completed scalar TTA runs into a Slicer review: grouped preview grids (one cutoff per group) with per-cutoff direct-layer coverage; native is reference-only when a preview tier exists |
+| `export_observed_score.py` | Export one retained model/layer's numeric score on the source or portable compact grid as an ordinary scalar NRRD |
 | `xta_auto.py` | Assist the native cleanup workflow |
 | `run_transport.py` | Pack, verify, and recover stopped-run evidence |
 | `prepare_pta_input.py` | Validate and publish a PTA input pair from authoritative edited shape or strict native recovery |
@@ -23,6 +25,50 @@ See [Slicer cleanup](../docs/slicer_pta_cleanup.md) and
 [run transport](../docs/run_transport.md) for workflows and required inputs.
 Mixed-confidence native transfer is described in
 [native union recovery](../docs/native_union_recovery.md).
+
+### Package existing scalar confidence runs
+
+For independently completed scalar TTA runs under a common study directory:
+
+```text
+python tools/pack_confidence_sweep.py --root STUDY --name review --branch 0.50 run_a --branch 0.80 run_b
+```
+
+Each branch argument supplies a cutoff in hundredths and its original run
+directory, relative to `--root` or absolute. The tool checks each completed
+TTA manifest's recorded `resolved_configuration.conf`, source identity, input
+dimensions and model artifact digests. The branches must have matching review
+grids and spatial geometry. The review records other differing configuration
+keys, so runs with different processing options remain identifiable. Legacy
+runs missing the required recorded identities cannot be packed by this tool.
+
+Open `STUDY/review/manifest.json` with the XTA Slicer importer. Each ordinary
+grouped segmentation retains an individual binary mask and original color for
+each contributing source layer and cutoff. A separate count overlay on each
+grid includes only the direct prediction layers for its cutoff. Existing
+numeric confidence sidecars are linked when available. Original run directories
+supply the scalar sources for edit transfer. Move the common study tree together
+to preserve those relative references. Choose a fresh `--name` for another
+review. Packaging reads the source NRRDs and their recorded metadata, and
+performs no new detector or interpolation runs. On shared-storage systems,
+`--temp LOCAL_SCRATCH` places seek-heavy coverage spools and intermediate
+compression on the selected temporary filesystem. The assembled review
+stages adjacent to its final destination for atomic publication.
+
+For independent inspection, select a recorded `model_name` and `layer_key` in
+the run's `reconciliation_evidence/manifest.json`. For example:
+
+```text
+python tools/export_observed_score.py --run-manifest RUN/manifest.json --model best --layer transverse__tta_a0__fullframe__yolo__pre_interpolation --output transverse_score.nrrd --allow-native-projection --temp LOCAL_SCRATCH --max-staging-mib 4096
+```
+
+The ordinary scalar file uses XTA's unit-LPS source lattice, or the compact
+lattice if the supplied manifest comes from `export_reconciliation_evidence.py`.
+Its uint8 codes retain the saved quantization: divide positive codes by 255
+for the reported score and treat zero as unknown, including generated-only
+support. The NRRD's `xta_observed_score` field records the model, layer and
+score semantics. Deferred native-view evidence uses the explicit projection
+switch and bounded disk staging. Source-aligned scores need no projection.
 
 For a marker placed on an XTA low-quality preview, check that the axial view
 has **L** on its right edge. After **Export XTA Edits**, give the cutter the

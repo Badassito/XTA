@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import (
     Dict,
     List,
@@ -102,6 +103,7 @@ SAVE_OPTION_TOKENS: Tuple[str, ...] = (
     'labels',
     'binary',
     'semantic',
+    'confidence',
     'low_quality',
     'nrrd',
     'voxel_volume',
@@ -1117,6 +1119,123 @@ def _bounded_number(number_type, *, minimum=None, maximum=None, exclusive=False)
     return parse
 
 
+@dataclass(frozen=True)
+class ConfidenceSweepSpec:
+    """Inclusive detector cutoffs on an exact integer-hundredth grid."""
+
+    start_hundredths: int
+    step_hundredths: int
+    end_hundredths: int
+
+    def __post_init__(self):
+        values = (self.start_hundredths, self.step_hundredths, self.end_hundredths)
+        if any(type(value) is not int for value in values):
+            raise ValueError("confidence sweep bounds and step must be integer hundredths")
+        if not 0 <= self.start_hundredths <= self.end_hundredths <= 100:
+            raise ValueError("confidence sweep requires 0 <= START <= END <= 1")
+        if not 1 <= self.step_hundredths <= 100:
+            raise ValueError("confidence sweep STEP must be positive hundredths in (0,1]")
+        if (self.end_hundredths - self.start_hundredths) % self.step_hundredths:
+            raise ValueError("confidence sweep END must be reached exactly by START + n * STEP")
+
+    @property
+    def levels_hundredths(self) -> Tuple[int, ...]:
+        return tuple(range(self.start_hundredths, self.end_hundredths + 1, self.step_hundredths))
+
+    @property
+    def values(self) -> Tuple[float, ...]:
+        return tuple(value / 100.0 for value in self.levels_hundredths)
+
+    @property
+    def floor(self) -> float:
+        return self.start_hundredths / 100.0
+
+    @property
+    def highest(self) -> float:
+        return self.end_hundredths / 100.0
+
+
+def _confidence_hundredths(value: str, field: str) -> int:
+    try:
+        number = Decimal(value)
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"confidence sweep {field} must be a valid number") from exc
+    if not number.is_finite():
+        raise ValueError(f"confidence sweep {field} must be finite")
+    if not 0 <= number <= 1:
+        raise ValueError(f"confidence sweep {field} must be in [0,1]")
+    if number == 0:
+        return 0
+    # Inspect Decimal's exact coefficient rather than multiplying under its
+    # precision context: a tiny nonzero tail must never round onto the grid.
+    _, digits, exponent = number.as_tuple()
+    shift = exponent + 2
+    if shift < 0:
+        discarded = -shift
+        if discarded >= len(digits) or any(digits[-discarded:]):
+            raise ValueError(f"confidence sweep {field} must be an exact multiple of 0.01")
+        digits = digits[:-discarded]
+        shift = 0
+    coefficient = int(''.join(str(digit) for digit in digits))
+    return coefficient * 10 ** shift
+
+
+class _ConfidenceArgument(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        text = str(values)
+        try:
+            if ':' in text:
+                parts = text.split(':')
+                if len(parts) != 3 or any(not part.strip() for part in parts):
+                    raise ValueError("confidence sweep must be START:STEP:END")
+                spec = ConfidenceSweepSpec(*(
+                    _confidence_hundredths(part, field)
+                    for part, field in zip(parts, ('START', 'STEP', 'END'))
+                ))
+                confidence = spec.floor
+            else:
+                confidence = _bounded_number(float, minimum=0, maximum=1)(text)
+                spec = None
+        except (argparse.ArgumentTypeError, ValueError) as exc:
+            raise argparse.ArgumentError(self, str(exc)) from exc
+        setattr(namespace, self.dest, confidence)
+        # Every occurrence resets both fields, preserving argparse's scalar
+        # last-value-wins behavior even when range and scalar forms are mixed.
+        namespace.conf_sweep = spec
+
+
+def parse_confidence_sweep_options(parser, parsed, mode_arguments: Sequence[str]):
+    """Resolve sweep-only defaults after parsing; scalar requests stay unchanged.
+
+    Explicit --min_conf remains fixed across all cutoffs. Without that option,
+    a sweep disables the independent component/instance gate instead of silently
+    applying the scalar default of 0.30. Call after each mode-local reparse.
+    """
+    if not isinstance(getattr(parsed, 'conf_sweep', None), ConfidenceSweepSpec):
+        return parsed
+    explicit = any(
+        str(token) == '--min_conf' or str(token).startswith('--min_conf=')
+        for token in mode_arguments
+    )
+    if not explicit:
+        parsed.min_conf = 0.0
+    parsed.conf_sweep_min_conf_implicit = not explicit
+    return parsed
+
+
+def confidence_sweep_branch_cutoff() -> Optional[int]:
+    """Return an internal branch's strict ASCII integer cutoff, when present."""
+    value = os.environ.get('XTA_YOLO_SWEEP_CUTOFF_HUNDREDTHS')
+    if value is None:
+        return None
+    if re.fullmatch(r'[0-9]+', value) is None:
+        raise ValueError('XTA_YOLO_SWEEP_CUTOFF_HUNDREDTHS must be an ASCII integer in [0,100]')
+    significant = value.lstrip('0') or '0'
+    if len(significant) > 3 or int(significant) > 100:
+        raise ValueError('XTA_YOLO_SWEEP_CUTOFF_HUNDREDTHS must be an ASCII integer in [0,100]')
+    return int(significant)
+
+
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="YOLO segmentation TTA for large cylindrical video volumes.",
@@ -1212,10 +1331,23 @@ def build_argparser() -> argparse.ArgumentParser:
             "after odd seam crossings, and merge each prediction into its wrapped destination"
         ),
     )
-    p.add_argument("--conf", default=0.15, type=_bounded_number(float, minimum=0, maximum=1),
-                   help="Prediction confidence threshold in [0,1]; semantic uses foreground pixel probabilities")
-    p.add_argument("--min_conf", default=0.30, type=_bounded_number(float, minimum=0, maximum=1),
-                   help="Remove prediction-set objects whose combined confidence is below this threshold. Semantic uses the same component check with foreground pixel probabilities. 0 disables the check")
+    p.set_defaults(conf_sweep=None)
+    p.add_argument(
+        "--conf", default=0.15, action=_ConfidenceArgument, metavar="SCALAR|START:STEP:END",
+        help=(
+            "Detector confidence, or semantic foreground pixel probability, in [0,1]. "
+            "START:STEP:END runs independent cutoffs in exact hundredths, including both endpoints "
+            "(for example 0.50:0.10:0.70). Sweep defaults --min_conf to 0 unless explicitly supplied."
+        ),
+    )
+    p.add_argument(
+        "--min_conf", default=0.30, type=_bounded_number(float, minimum=0, maximum=1),
+        help=(
+            "Secondary cutoff for the maximum observed confidence of a prediction component. "
+            "The angle-variant fast path applies the gate to individual instances before union. "
+            "An explicit value applies at every sweep cutoff. 0 disables this gate."
+        ),
+    )
     p.add_argument(
         "--quantize", nargs="+", default=None, type=str, metavar="[{gpu,cpu}:]PRECISION",
         help=(
@@ -1371,6 +1503,8 @@ def build_argparser() -> argparse.ArgumentParser:
             "formats with at least five channels use one grayscale page per channel in multi-page TIFF), labels "
             "(final YOLO segmentation labels), binary (final TIFF sequence plus FFV1 MKV), "
             "semantic (final source-frame PNG masks, 0 background and 1 foreground), "
+            "confidence (observed numeric prediction scores and support metadata; "
+            "generated-only support remains unknown), "
             "low_quality[:LOW_QUALITY_DOWNBIN] (one or more isotropic presentation resolutions; "
             "for example low_quality:0.5,1024), nrrd "
             "(single-layer Slicer decomposition plus manifest), voxel_volume (native-space "

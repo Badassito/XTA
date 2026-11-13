@@ -693,6 +693,7 @@ def decode_video_to_memmap_gray8_streaming(
     prefer_memory: bool = True,
     prefer_memfd: bool = False,
     reserve_bytes: int = 32 * GIB,
+    on_verified: Optional[Callable[[], None]] = None,
 ) -> np.ndarray:
     """Start ffmpeg gray8 decode in the background and return its destination array immediately."""
     _require_bin("ffmpeg")
@@ -713,6 +714,8 @@ def decode_video_to_memmap_gray8_streaming(
     register_volume_readiness(arr, readiness)
     if reuse_existing and isinstance(arr, np.memmap):
         readiness.mark_all_ready()
+        if on_verified is not None:
+            on_verified()
         return arr
 
     raw_bytes = memoryview(np.ascontiguousarray(arr) if not arr.flags['C_CONTIGUOUS'] else arr).cast('B')
@@ -814,6 +817,12 @@ def decode_video_to_memmap_gray8_streaming(
             finally:
                 runtime_trace_event('startup_decode_done', streaming=True,
                                     failed=not process_verified, frames=int(num_frames))
+        if process_verified and on_verified is not None:
+            try:
+                on_verified()
+            except BaseException as exc:
+                readiness.mark_failed(exc)
+                raise
 
     # daemon=True: if main dies without reaching abort_streaming_producers,
     # interpreter shutdown must not join a producer that may have hours of decode left.
@@ -1192,6 +1201,7 @@ def resize_volume_to_processing_cube_gray8_streaming(
     workers: int = 1,
     prefer_memory: bool = True,
     reserve_bytes: int = 32 * GIB,
+    on_verified: Optional[Callable[[], None]] = None,
 ) -> np.ndarray:
     """Start cubic gray8 preprocessing in the background and return its output array immediately."""
     in_t, in_h, in_w = (int(volume_gray.shape[0]), int(volume_gray.shape[1]), int(volume_gray.shape[2]))
@@ -1241,6 +1251,8 @@ def resize_volume_to_processing_cube_gray8_streaming(
                 int(out_t), _render_target_slice, max_workers=worker_count,
                 desc='Streaming resize orthogonal volume to cubic shape', chunk_size=chunk_size,
             )
+            if on_verified is not None:
+                on_verified()
             readiness.mark_all_ready()
         except BaseException as exc:
             readiness.mark_failed(exc)

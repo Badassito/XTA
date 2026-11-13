@@ -169,7 +169,8 @@ def _build_radial_plane_plan_reference(view, radii, output_shape):
     return RadialPlanePlan(base, tuple(plane), shells, offsets, columns)
 
 
-def _build_radial_plane_plan(view, radii, output_shape):
+def _build_radial_plane_plan(view, radii, output_shape, *, max_plan_bytes=None,
+                             build_chunk_pixels=None):
     """Evaluate exact NumPy geometry once, assembling CSR in bounded strips.
 
     The reference evaluates every transcendental twice. Reusing one strip's
@@ -179,24 +180,30 @@ def _build_radial_plane_plan(view, radii, output_shape):
     """
     base, _, plane = _plane_geometry(view, output_shape)
     pixels = math.prod(plane)
-    if pixels > np.iinfo(np.uint32).max or pixels * 12 > _PLANE_PLAN_MAX_BYTES:
+    plan_limit = (_PLANE_PLAN_MAX_BYTES if max_plan_bytes is None
+                  else min(_PLANE_PLAN_MAX_BYTES, int(max_plan_bytes)))
+    chunk_pixels = (_PLANE_BUILD_CHUNK_PIXELS if build_chunk_pixels is None
+                    else min(_PLANE_BUILD_CHUNK_PIXELS, int(build_chunk_pixels)))
+    if plan_limit <= 0 or chunk_pixels <= 0:
+        raise ValueError('Radial plan and build-strip budgets must be positive')
+    if pixels > np.iinfo(np.uint32).max or pixels * 12 > plan_limit:
         raise _RadialPlanePlanTooLarge('Radial plane ownership exceeds the bounded plan budget')
     shells = np.full(pixels, -1, np.int32)
     offsets = np.empty(pixels + 1, np.uint32)
     offsets[0] = 0
     parts = []
     total = 0
-    for first in range(0, pixels, _PLANE_BUILD_CHUNK_PIXELS):
-        stop = min(pixels, first + _PLANE_BUILD_CHUNK_PIXELS)
+    for first in range(0, pixels, chunk_pixels):
+        stop = min(pixels, first + chunk_pixels)
         counts = np.zeros(stop - first, np.uint32)
         occurrences = []
         strip_total = 0
         for positions, local_shell, columns in _plane_occurrence_strips(
                 view, radii, output_shape, first_pixel=first, stop_pixel=stop,
-                chunk_pixels=_PLANE_BUILD_CHUNK_PIXELS):
+                chunk_pixels=chunk_pixels):
             strip_total += int(columns.size)
             if (total + strip_total > np.iinfo(np.uint32).max or
-                    pixels * 8 + 4 + (total + strip_total) * 4 > _PLANE_PLAN_MAX_BYTES):
+                    pixels * 8 + 4 + (total + strip_total) * 4 > plan_limit):
                 raise _RadialPlanePlanTooLarge('Radial periodic occurrences exceed the bounded plan budget')
             shells[positions] = local_shell
             local = (positions - first).astype(np.int32)
@@ -271,7 +278,7 @@ def _radial_plane_plan(view, radii, output_shape):
                     _PLANE_PLAN_INFLIGHT.pop(key)
 
 
-def _radial_projection_metadata(view, source_shape, output_shape, plan):
+def _radial_projection_metadata(view, source_shape, output_shape, plan, *, chunk_values=None):
     stack_axis = (0, 1, 2)[plan.base_id]
     work = (int(view.full_t), int(view.full_h), int(view.full_w))
     stack_length = work[stack_axis]
@@ -291,7 +298,10 @@ def _radial_projection_metadata(view, source_shape, output_shape, plan):
         radii = np.asarray(view.radial_radii, dtype=np.float64)
         # Preserve NumPy's exact operations, but do not reacquire the interpreter
         # between a handful of small ufuncs for each of thousands of shells.
-        rows = max(1, _RADIAL_METADATA_CHUNK_VALUES // max(1, int(view.src_w)))
+        metadata_chunk = _RADIAL_METADATA_CHUNK_VALUES if chunk_values is None else int(chunk_values)
+        if metadata_chunk <= 0:
+            raise ValueError('Radial metadata strip budget must be positive')
+        rows = max(1, metadata_chunk // max(1, int(view.src_w)))
         for first in range(0, len(radii), rows):
             radius = radii[first:first + rows, None]
             theta = np.remainder(arc[None, :] / radius, 2.0 * math.pi)
@@ -370,7 +380,7 @@ def _pull_radial_range_into(
         work_t, work_h, work_w, base_id, center_x, center_y,
         min_radius, max_radius, shell_start, arc_origin, native_width,
         native_height, height_origin, tilted, tangent, vertical,
-        bboxes, use_bboxes, scalar_max):
+        bboxes, use_bboxes, scalar_max, rectangle_width=0, rectangle_x=0, rectangle_y=0):
     """Evaluate exact shell/wrap coordinates into one caller-owned flat strip."""
     stack_length = work_t if base_id == 0 else (work_h if base_id == 1 else work_w)
     two_pi = 2.0 * math.pi
@@ -378,6 +388,8 @@ def _pull_radial_range_into(
     for offset in range(result.size):
         pixel = first + offset
         y, x = pixel // out_w, pixel % out_w
+        if rectangle_width:
+            y, x = pixel // rectangle_width + rectangle_y, pixel % rectangle_width + rectangle_x
         wy = ((2.0*y + 1.0 - out_h)*work_h)/(2.0*out_h) + (work_h-1.0)*.5
         wx = ((2.0*x + 1.0 - out_w)*work_w)/(2.0*out_w) + (work_w-1.0)*.5
         if base_id == 0:
@@ -495,6 +507,22 @@ def _pull_radial_chunk_compiled(source, view, radii, output_shape, z, first, sto
     return result
 
 
+
+def _pull_radial_rectangle_compiled(source, view, radii, output_shape, z, first, stop,
+                                    *, bounds_yx, scalar_max=False, bboxes=None):
+    """Evaluate bounded ROI-local strips with the existing exact global geometry."""
+    y0, y1, x0, x1 = map(int, bounds_yx)
+    first, stop = int(first), int(stop)
+    if (not (0 <= y0 < y1 <= int(output_shape[1]) and 0 <= x0 < x1 <= int(output_shape[2]))
+            or not 0 <= first <= stop <= (y1-y0)*(x1-x0)):
+        raise ValueError('Radial rectangle lies outside the output plane')
+    args = _radial_planfree_arguments(source, view, radii, output_shape, bboxes)
+    dtype = np.asarray(source).dtype if scalar_max else np.uint8
+    result = np.zeros(stop-first, dtype=dtype)
+    _pull_radial_range_into(result, args[0], args[1], int(z), first, *args[2:],
+                            bool(scalar_max), x1-x0, x0, y0)
+    return result
+
 def _radial_block_schedule(depth, plane_bytes, workers):
     block_depth = max(1, min(depth, _OUTPUT_BLOCK_BYTES // max(1, plane_bytes)))
     block_bytes = plane_bytes * block_depth
@@ -562,6 +590,9 @@ class _RadialCudaStage:
     def project_encoded(self, first, count, packed=False):
         return self.projector.project_encoded(first, count, packed=packed)
 
+    def project_rank_crops(self, first, count):
+        return self.projector.project_rank_crops(first, count)
+
     def close(self):
         if self.lease is None:
             return
@@ -594,8 +625,17 @@ def _close_radial_cuda_resources(projector, lease):
 
 
 def _try_radial_cuda_stage(source, plan, metadata, view, shape, bboxes, use_bboxes,
-                           *, quiet=False, retry_state=None):
-    """Admit before publication; unavailable/busy/undersized GPUs retain CPU progress."""
+                           *, quiet=False, retry_state=None, scalar_max=False,
+                           block_bytes=None, upload_bytes=None, overlap_lease=None,
+                           exclusive=True, purpose=None):
+    """Admit before publication; unavailable/busy/undersized GPUs retain CPU progress.
+
+    ``overlap_lease`` (sibling rank projection only) is a callable returning a
+    shared lease beside live inference, or None. The projector must then fit the
+    lease's ``budget_bytes``; a refusal releases that lease before anything else.
+    ``exclusive=False`` skips the exclusive idle-device turn entirely, so a caller
+    never parks a busy inference GPU. Defaults keep the historical behaviour.
+    """
     if retry_state is not None:
         retry_state['retryable'] = False
     if not radial_cuda_backproject_enabled():
@@ -607,10 +647,45 @@ def _try_radial_cuda_stage(source, plan, metadata, view, shape, bboxes, use_bbox
     except Exception:
         return None
     from .backprojection import _try_acquire_main_process_gpu_stage, _cancel_main_process_spherical_retirement_request
+    purpose = f'Radial source projection {view.name}' if purpose is None else str(purpose)
+    options = {}
+    if scalar_max:
+        options['scalar_max'] = True
+    if block_bytes is not None:
+        options['block_bytes'] = int(block_bytes)
+    if upload_bytes is not None:
+        options['upload_bytes'] = int(upload_bytes)
+
+    lease = overlap_lease() if overlap_lease is not None else None
+    if lease is not None:
+        # Shared with inference: private residency must fit the leased slice.
+        projector = None
+        try:
+            from .cylindrical_cuda_projection import RadialCudaProjector
+            projector = RadialCudaProjector(
+                source, plan, metadata, view, shape, bboxes, use_bboxes, int(lease.device_index),
+                max_device_bytes=int(lease.budget_bytes), **options,
+            )
+            return _RadialCudaStage(projector, lease)
+        except RadialCudaProjectionUnsafeFailure as exc:
+            exc.stage_lease = lease
+            raise
+        except Exception as exc:
+            _close_radial_cuda_resources(projector, lease)
+            if retry_state is not None:
+                retry_state.update(reason='overlap_admission_declined', detail=str(exc))
+            if not quiet:
+                print(f'Radial CUDA overlap declined {view.name} ({exc}).', flush=True)
+        except BaseException:
+            _close_radial_cuda_resources(projector, lease)
+            raise
+    # A declined overlap callable records its own reason/retryability.
+    if not exclusive:
+        return None
 
     # Completed native parents participate in bounded retirement admission,
     # allowing an idle GPU to release the memory blocking subsequent inference.
-    lease = _try_acquire_main_process_gpu_stage(torch, f'Radial source projection {view.name}')
+    lease = _try_acquire_main_process_gpu_stage(torch, purpose)
     if lease is None:
         if retry_state is not None:
             retry_state['retryable'] = True
@@ -620,17 +695,19 @@ def _try_radial_cuda_stage(source, plan, metadata, view, shape, bboxes, use_bbox
     projector = None
     try:
         from .cylindrical_cuda_projection import RadialCudaProjector
-
         projector = RadialCudaProjector(
             source, plan, metadata, view, shape, bboxes, use_bboxes, int(lease.device_index),
+            **options,
         )
         return _RadialCudaStage(projector, lease)
     except RadialCudaProjectionUnsafeFailure as exc:
         exc.stage_lease = lease
         raise
     except Exception as exc:
-        _cancel_main_process_spherical_retirement_request(f'Radial source projection {view.name}', failed=True)
+        _cancel_main_process_spherical_retirement_request(purpose, failed=True)
         _close_radial_cuda_resources(projector, lease)
+        if retry_state is not None:
+            retry_state.update(reason='exclusive_admission_declined', detail=str(exc))
         print(f'Radial CUDA fallback {view.name}: device admission/preflight failed ({exc}); using CPU.', flush=True)
         return None
     except BaseException:

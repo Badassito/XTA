@@ -106,6 +106,51 @@ def make_run(tmp_path):
     return run,manifest,native,masks
 
 
+def test_selected_observed_score_scalar_roundtrip_on_source_and_compact_grid(tmp_path):
+    nrrd = pytest.importorskip("nrrd")
+    from tools.export_observed_score import export_score
+    run, mask_manifest, native, masks = make_run(tmp_path)
+    for identity in (run, mask_manifest, run.parent / "reconciliation_evidence/manifest.json"):
+        document=json.loads(identity.read_bytes())
+        document["run_id"]="score-test"
+        identity.write_text(json.dumps(document))
+    out = tmp_path / "one-score.nrrd"
+    details = export_score(run, "model_1", "shared_layer_key", out, memory_mib=8)
+    scores, header = nrrd.read(str(out),index_order="C")
+    np.testing.assert_array_equal(scores, native[1])
+    assert scores.dtype == np.uint8 and "Segment0_ID" not in header
+    np.testing.assert_array_equal(header["space directions"],np.eye(3))
+    np.testing.assert_array_equal(header["space origin"],[0,0,0])
+    assert header["space"] == "left-posterior-superior"
+    assert json.loads(header["xta_observed_score"])["unknown"] == "score_zero"
+    assert details["run_id"]=="score-test" and details["grid"]=="source"
+    with pytest.raises(FileExistsError):
+        export_score(run, "model_1","shared_layer_key",out)
+    with pytest.raises(ValueError,match="found 0"):
+        export_score(run,"other","shared_layer_key",tmp_path/"missing.nrrd")
+    with pytest.raises(ValueError,match="memory_mib"):
+        export_score(run,"model_1","shared_layer_key",tmp_path/"small.nrrd",memory_mib=0.0001)
+    portable=tmp_path/"portable"
+    export_compact_evidence(run,mask_manifest,portable,memory_mib=8)
+    compact_nrrd=tmp_path/"compact.nrrd"
+    compact=export_score(portable/"manifest.json","model_0","shared_layer_key",compact_nrrd,memory_mib=8)
+    np.testing.assert_array_equal(nrrd.read(str(compact_nrrd),index_order="C")[0],
+                                  brute_pool(native[0],masks[0],masks[0].shape))
+    assert compact["grid"]=="compact_source" and compact["run_id"]=="score-test"
+
+
+def test_compact_export_rejects_cross_run_masks_with_identical_grid(tmp_path):
+    run, compact, _, _ = make_run(tmp_path)
+    evidence = run.parent / 'reconciliation_evidence' / 'manifest.json'
+    for path, identity in ((run, 'run-a'), (compact, 'run-b'), (evidence, 'run-a')):
+        record = json.loads(path.read_text())
+        record['run_id'] = identity
+        path.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match='different runs'):
+        export_compact_evidence(run, compact, tmp_path / 'export')
+    assert not (tmp_path / 'export').exists()
+
+
 def test_legacy_export_uses_crops_and_remains_portable_after_move(tmp_path,monkeypatch):
     run,manifest,native,masks = make_run(tmp_path)
     before = {p:p.read_bytes() for p in run.parent.rglob("*") if p.is_file()}
@@ -135,6 +180,24 @@ def test_legacy_export_uses_crops_and_remains_portable_after_move(tmp_path,monke
     paths=json.loads((moved/"manifest.json").read_text())["outputs"]["paths"]
     assert all(not Path(value).is_absolute() for value in paths.values())
     assert not list(tmp_path.glob(".export.export-*"))
+
+
+def test_export_preserves_semantic_observed_contract_and_actual_capture_floor(tmp_path):
+    from XTA.confidence_retention import observed_confidence_contract
+    run, manifest, _, _ = make_run(tmp_path)
+    contract = observed_confidence_contract(prediction_task='semantic', confidence_floor=.17,
+        min_conf=.30, confidence_floor_by_backend={'cpu': .17})
+    for metadata_path in (run.parent / 'reconciliation_evidence').glob('*/metadata.json'):
+        metadata = json.loads(metadata_path.read_text())
+        metadata['provenance']['observed_confidence'] = contract
+        metadata_path.write_text(json.dumps(metadata))
+    output = tmp_path / 'export'
+    export_compact_evidence(run, manifest, output, memory_mib=8)
+    published = json.loads((output / 'reconciliation_evidence' / 'manifest.json').read_text())
+    for row in published['layers']:
+        assert row['observed_confidence'] == contract
+        ref = ConfidenceEvidenceRef.open(output / 'reconciliation_evidence' / row['directory'])
+        assert ref.metadata['provenance']['observed_confidence'] == contract
 
 
 @pytest.mark.parametrize("mutation",["incomplete","source_grid","scale","missing_model"])
@@ -266,3 +329,21 @@ def test_native_staging_limit_is_enforced(tmp_path):
         export_compact_evidence(run,manifest,tmp_path/"export",memory_mib=8,
                                 allow_native_projection=True,max_staging_mib=.0001)
     assert not (tmp_path/"export").exists() and not list(tmp_path.glob(".export.export-*"))
+
+
+def test_selected_native_scalar_requests_explicit_bounded_source_projection(tmp_path):
+    nrrd = pytest.importorskip("nrrd")
+    from tools.export_observed_score import export_score
+    run, manifest, native, _ = make_run(tmp_path)
+    replace_with_block_evidence(run, manifest, native, native_coordinates=True)
+    destination = tmp_path/"projected.nrrd"
+    args = run, "model_1", "shared_layer_key", destination
+    with pytest.raises(ValueError, match="allow-native-projection"):
+        export_score(*args)
+    with pytest.raises(MemoryError, match="staging bytes"):
+        export_score(*args, allow_native_projection=True, max_staging_mib=.0001, temp_dir=tmp_path/"work")
+    assert not destination.exists() and not list((tmp_path/"work").iterdir())
+    result = export_score(*args, allow_native_projection=True, memory_mib=32, max_staging_mib=1,
+                          temp_dir=tmp_path/"work")
+    assert result["stored_coordinate_space"] == "native_view_processing" and result["native_projection_applied"]
+    np.testing.assert_array_equal(nrrd.read(str(destination),index_order="C")[0], native[1])

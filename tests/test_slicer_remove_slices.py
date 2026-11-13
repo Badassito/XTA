@@ -148,22 +148,37 @@ def test_toolbar_grid_retains_actions_and_dispatches_callbacks(functions):
     namespace = {"qt": SimpleNamespace(QWidget=Widget, QGridLayout=Widget, QAction=Widget,
                                         QToolButton=Widget, Qt=SimpleNamespace(ToolButtonTextOnly=0)),
                  "toolbar": Widget(), "main_window": Widget(),
-                 "_run_toolbar_action": calls.append, "_TOGGLE_HIDE_LABEL": "Hide All"}
-    for name in ("BryanImporter", "ToggleAll", "Highlight", "BuildVideo", "UpdateGlobal",
+                 "_run_toolbar_action": calls.append, "_TOGGLE_HIDE_LABEL": "Hide All",
+                 "_xta_edit_scope_button_text": lambda: "Scope: Displayed",
+                 "_xta_surfaces_button_text": lambda: "3D: Show All Cutoffs"}
+    for name in ("ImportXTASegments", "ToggleAll", "Highlight", "BuildVideo", "UpdateGlobal",
                  "UpdateNonGlobal", "UpdateBoth", "RemoveIslands", "RemoveSlices",
-                 "RemoveMarkers", "ExportXTAEdits", "AlignNativeIntensity",
-                 "ResetNativeIntensityAlignment"):
+                 "RemoveMarkers", "ExportDisplayedXTAEdits", "AlignNativeIntensity",
+                 "ResetNativeIntensityAlignment", "SelectReviewCutoff", "SelectEditScope",
+                 "ToggleReviewSurfaces3D"):
         namespace[name] = lambda name=name: name
     exec(compile(ast.Module(body=tree.body[start:], type_ignores=[]), str(SOURCE), "exec"), namespace)
     actions = namespace["toolbar_actions"]
     buttons = namespace["toolbar_buttons"]
-    assert len(actions) == len(buttons) == 13
+    assert len(actions) == len(buttons) == 16
     assert [(row, column) for _, row, column in placements[:-1]] == [
-        (row, column) for row in range(2) for column in range(7)][:13]
+        (row, column) for row in range(2) for column in range(8)]
     names = [name for name, _ in namespace["_TOOLBAR_ACTIONS"]]
+    assert names[0] == "Importer"
     assert names[1:4] == ["Hide All", "Highlight", "Build Video"]
     assert names[7:10] == ["Remove Islands", "Remove Slices", "Remove Markers"]
+    # Review controls sit together: 2D Cutoff, then the edit scope and the 3D surface toggle.
+    assert names[13:] == ["2D Cutoff", "Scope: Displayed", "3D: Show All Cutoffs"]
     assert namespace["_toggle_all_action"] is actions[1]
+    assert namespace["_edit_scope_action"] is actions[14]
+    assert namespace["_surfaces_3d_action"] is actions[15]
+    assert "displayed 2D cutoff" in actions[10].tooltip
+    buttons[0].action.callback()
     buttons[8].action.callback()
     buttons[1].action.callback()
-    assert calls == [namespace["RemoveSlices"], namespace["ToggleAll"]]
+    buttons[10].action.callback()
+    buttons[14].action.callback()
+    buttons[15].action.callback()
+    assert calls == [namespace["ImportXTASegments"], namespace["RemoveSlices"], namespace["ToggleAll"],
+                     namespace["ExportDisplayedXTAEdits"], namespace["SelectEditScope"],
+                     namespace["ToggleReviewSurfaces3D"]]

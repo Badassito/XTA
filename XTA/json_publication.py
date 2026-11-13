@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -77,6 +78,21 @@ def _fsync_parent_directory(parent: Path) -> None:
         os.close(descriptor)
 
 
+def _replace_published_json(stage: Path, destination: Path) -> None:
+    """Let a short Windows manifest read finish without restarting the job."""
+    for delay in (0.01, 0.03, 0.08, 0.20):
+        try:
+            os.replace(stage, destination)
+            return
+        except PermissionError as exc:
+            # A reader opened without FILE_SHARE_DELETE can produce either
+            # ERROR_ACCESS_DENIED or ERROR_SHARING_VIOLATION during the rename.
+            if getattr(exc, "winerror", None) not in (5, 32):
+                raise
+            time.sleep(delay)
+    os.replace(stage, destination)
+
+
 def write_json_atomic(
     path: str | Path,
     payload: object,
@@ -121,7 +137,7 @@ def write_json_atomic(
         # Windows can reject simultaneous replacements of one destination.
         # Independent artifacts remain free to publish concurrently.
         with _destination_lock(destination):
-            os.replace(stage, destination)
+            _replace_published_json(stage, destination)
             _fsync_parent_directory(destination.parent)
     finally:
         stage.unlink(missing_ok=True)

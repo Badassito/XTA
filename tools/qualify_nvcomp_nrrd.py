@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import zlib
 
 
-SCRATCH = Path(r"C:\Users\Bry\Documents\ChatGPT\Scratch")
+SCRATCH = Path.home() / "Documents/ChatGPT/Scratch"
 LOCK = SCRATCH / "Temp" / "GPU_LOCK"
 EXPERIMENT = SCRATCH / "Experiments" / "gpu-utilization-148334" / "nvcomp"
 DEFAULT_DEFLATE = EXPERIMENT.parent / "compression-repro" / "deps"

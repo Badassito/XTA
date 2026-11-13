@@ -22,6 +22,7 @@ from .cylindrical_cuda_projection import (
     RadialCudaProjector, RadialEncodedBlock, RadialEncodedSlice, RadialCudaProjectionUnsafeFailure,
     _BLOCK_BYTES, _UPLOAD_BYTES, _RESERVE_BYTES, _SETUP_BYTES, _MAX_ENCODED_SLICES,
     _CROP_METADATA_DTYPE, _KERNEL_SOURCE as _CROP_KERNEL_BUNDLE,
+    rank_source_probe_planes, validate_rank_crop_samples,
 )
 
 
@@ -154,7 +155,11 @@ extern "C" __global__ void project_spherical_qsc(
     if (use_boxes && (pr < boxes[box] || pr >= boxes[box + 1] || pc < boxes[box + 2] || pc >= boxes[box + 3])) return;
     unsigned long long source_at = ((unsigned long long)shell * source_h + pr) * source_w + pc;
     if (cropped) source_at = offsets[shell] + (unsigned long long)(pr - boxes[box]) * (boxes[box + 3] - boxes[box + 2]) + (pc - boxes[box + 2]);
+#if XTA_PROJECTION_SCALAR_MAX
+    out[output_at] = source[source_at];
+#else
     out[output_at] = source[source_at] != 0;
+#endif
 }
 '''.replace('SPHERICAL_RADIUS_ROUNDOFF_RELATIVE', format(SPHERICAL_RADIUS_ROUNDOFF_RELATIVE, '.17g'))
 
@@ -174,11 +179,14 @@ class SphericalCudaProjector:
 
     def __init__(self, source, view, output_shape, bboxes=None, device_index=0, *,
                  block_bytes=None, upload_bytes=_UPLOAD_BYTES, reserve_bytes=_RESERVE_BYTES,
-                 max_device_bytes=None):
+                 max_device_bytes=None, scalar_max=False):
         from .spherical_projection import _validate_spherical_projection
         from .spherical_projection_cpu import prepare_spherical_chunk_numba
 
         started = time.perf_counter()
+        self.scalar_max = bool(scalar_max)
+        self.numeric_sample_checks = self.numeric_observed_samples = 0
+        self.source_probe_planes = ()
         source = np.asarray(source)
         if source.dtype != np.uint8 or not source.flags.c_contiguous:
             raise SphericalCudaProjectionUnavailable('Spherical CUDA requires a contiguous uint8 mask')
@@ -258,8 +266,11 @@ class SphericalCudaProjector:
                 for key, value in admitted_plan.items():
                     setattr(self, key, value)
                 with cp.cuda.using_allocator(self._pool.malloc), self._stream:
+                    options = ('--std=c++11', '--fmad=false')
+                    if self.scalar_max:
+                        options += ('-DXTA_PROJECTION_SCALAR_MAX=1',)
                     self._module = cp.RawModule(code=_CROP_KERNEL_BUNDLE + _SPHERICAL_KERNEL,
-                                                options=('--std=c++11', '--fmad=false'))
+                                                options=options)
                     self._kernel = self._module.get_function('project_spherical_qsc')
                     self._reset_metadata_kernel = self._module.get_function('reset_radial_crop_metadata')
                     self._reduce_metadata_kernel = self._module.get_function('reduce_radial_crop_metadata')
@@ -316,13 +327,26 @@ class SphericalCudaProjector:
                             checked[0],
                             lambda first, stop: compiled_pull(
                                 source, view, radii, rotation, shape, checked_z, first, stop,
-                                boxes if self.use_bboxes else None),
+                                boxes if self.use_bboxes else None, scalar_max=self.scalar_max),
                             self.output_bounds, foreground_bounds, z=checked_z, full=full_math_preflight,
                         )
                         self.preflight_mode = mode
                         self.preflight_pixels += pixels
-                    for packed in (False, True):
-                        self._validate_encoded_preflight(checked, self._encode_current_output(checked_z, 1, packed))
+                    if not self.scalar_max:
+                        for packed in (False, True):
+                            self._validate_encoded_preflight(checked, self._encode_current_output(checked_z, 1, packed))
+                    else:
+                        self._validate_encoded_preflight(checked, self._encode_current_output(checked_z, 1, False))
+                        self.source_probe_planes = rank_source_probe_planes(source, view, shape,
+                            boxes if self.use_bboxes else None)
+                        def numeric_oracle(z, first, stop):
+                            return compiled_pull(source, view, radii, rotation, shape, z, first, stop,
+                                boxes if self.use_bboxes else None, scalar_max=True)
+                        for probe_z in self.source_probe_planes:
+                            packet = self.project_rank_crops(probe_z, 1)
+                            checks, observed = validate_rank_crop_samples(packet, numeric_oracle, shape[2])
+                            self.numeric_sample_checks += checks
+                            self.numeric_observed_samples += observed
                     self.preflight_seconds = time.perf_counter() - then
                     self._skip_empty_blocks = True
                     self._reset_projection_stats()
@@ -406,6 +430,17 @@ class SphericalCudaProjector:
                 raise
 
     def project_encoded(self, first, count, packed=False):
+        if getattr(self, 'scalar_max', False):
+            raise ValueError('Numeric Spherical ranks require project_rank_crops(), never Boolean encoding')
+        return self._project_crop_block(first, count, packed)
+
+    def project_rank_crops(self, first, count):
+        """Publish raw rank crops without transferring or Booleanizing a dense slab."""
+        if not getattr(self, 'scalar_max', False):
+            raise ValueError('Rank crops require scalar_max=True')
+        return self._project_crop_block(first, count, False)
+
+    def _project_crop_block(self, first, count, packed=False):
         with self._lock:
             first, count = self._validate_block(first, count)
             if count == 0:

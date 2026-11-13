@@ -24,7 +24,8 @@ from .confidence_capture import (NativeConfidenceCapturePlan, plan_confidence_ca
 
 
 SCHEMA = 'xta.confidence_evidence/1'
-SCORE_SEMANTICS = 'maximum_surviving_instance_confidence_u8'
+SCORE_SEMANTICS = 'maximum_surviving_observed_prediction_score_u8'
+_LEGACY_SCORE_SEMANTICS = 'maximum_surviving_instance_confidence_u8'
 _LOCK = threading.RLock()
 _OUTPUT_DIR: Path | None = None
 _ENABLED = False
@@ -32,18 +33,40 @@ _DEFER_PROJECTION = False
 _REGISTRY: dict[tuple[str, str], 'ConfidenceEvidenceRef'] = {}
 _PUBLICATION = None
 _CAPTURE_QUEUE = None
+_OBSERVED_CONFIDENCE = None
+_RUN_ID = None
+_ADOPTED_KEYS: set[tuple[str, str]] = set()
 
 
 def configure_confidence_evidence(output_dir=None, *, enabled=False, min_conf=0.0,
-                                  defer_projection=False, background_publication=False):
+                                  defer_projection=False, background_publication=False,
+                                  prediction_task=None, confidence_floor=None,
+                                  confidence_floor_by_backend=None, run_id=None,
+                                  adopt_existing=False):
     """Start a run-owned collection; output_dir is the run's output directory."""
-    global _OUTPUT_DIR, _ENABLED, _DEFER_PROJECTION, _PUBLICATION
+    from .confidence_retention import observed_confidence_contract
+    contract = observed_confidence_contract(prediction_task=prediction_task,
+        confidence_floor=confidence_floor, min_conf=min_conf,
+        confidence_floor_by_backend=confidence_floor_by_backend)
+    global _OUTPUT_DIR, _ENABLED, _DEFER_PROJECTION, _PUBLICATION, _OBSERVED_CONFIDENCE, _RUN_ID
     shutdown_confidence_publication()
     with _LOCK:
         _ENABLED = bool(enabled)
         _DEFER_PROJECTION = bool(defer_projection)
         _OUTPUT_DIR = None if output_dir is None else Path(output_dir) / 'reconciliation_evidence'
+        _OBSERVED_CONFIDENCE = contract
+        _RUN_ID = run_id
         _REGISTRY.clear()
+        _ADOPTED_KEYS.clear()
+        if enabled and _OUTPUT_DIR is not None:
+            manifest_path = _OUTPUT_DIR / 'manifest.json'
+            if adopt_existing and manifest_path.is_file():
+                _REGISTRY.update(_read_adopted_confidence(_OUTPUT_DIR, run_id, contract))
+                _ADOPTED_KEYS.update(_REGISTRY)
+            else:
+                # Ordinary scalar runs begin a new collection. Shared inference
+                # consumers explicitly adopt only their matching branch catalogue.
+                manifest_path.unlink(missing_ok=True)
         if enabled and defer_projection and background_publication:
             from .confidence_publication import ConfidencePublicationQueue
             _PUBLICATION = ConfidencePublicationQueue()
@@ -379,6 +402,20 @@ def confidence_projection_deferred():
     return bool(_ENABLED and _DEFER_PROJECTION)
 
 
+def _confidence_provenance(provenance):
+    result = dict(provenance or {})
+    with _LOCK:
+        run_id = _RUN_ID
+    if run_id is not None:
+        result.setdefault('run_id', run_id)
+    if 'observed_confidence' not in result:
+        from .confidence_retention import observed_confidence_contract
+        with _LOCK:
+            contract = _OBSERVED_CONFIDENCE
+        result['observed_confidence'] = contract or observed_confidence_contract()
+    return result
+
+
 def _json_value(value):
     if isinstance(value, Path):
         return str(value)
@@ -397,6 +434,47 @@ def _json_value(value):
 
 def _write_json_atomic(path, value):
     write_json_atomic(path, _json_value(value), sort_keys=True, trailing_newline=True)
+
+
+def _read_adopted_confidence(output, run_id, contract):
+    catalogue = json.loads((output / 'manifest.json').read_text(encoding='utf-8'))
+    if (catalogue.get('schema') != SCHEMA or not run_id or catalogue.get('run_id') != run_id
+            or catalogue.get('purpose') != 'observed_prediction_confidence'
+            or catalogue.get('observed_confidence') != contract
+            or not isinstance(catalogue.get('layers'), list)):
+        raise ValueError('Prepublished confidence differs from the scalar branch identity or score contract')
+    references = {}
+    for row in catalogue['layers']:
+        directory = (output / row['directory']).resolve()
+        if not directory.is_relative_to(output.resolve()):
+            raise ValueError('Prepublished confidence directory escapes its scalar branch')
+        ref = ConfidenceEvidenceRef.open(directory)
+        token = (ref.model_name, ref.layer_key)
+        if (token in references or token != (str(row['model_name']), str(row['layer_key']))
+                or ref.shape != tuple(row['output_shape_tyx'])
+                or ref.storage_shape != tuple(row['stored_shape_tyx'])
+                or ref.coordinate_space != row['coordinate_space']
+                or ref.metadata.get('provenance', {}).get('run_id') != run_id
+                or ref.metadata['provenance'].get('observed_confidence') != contract):
+            raise ValueError('Prepublished confidence layer differs from its branch catalogue')
+        references[token] = ref
+    return references
+
+
+def _adopted_confidence_reference(view, model_name, *, native_shape=None,
+                                  source='fullframe', tile_config_id='', tile_acceptance='',
+                                  stage='pre_interpolation', layer_key=None):
+    from .cuda_d1 import _nrrd_layer_key
+    key = str(layer_key or _nrrd_layer_key(view_name=view.name, source=source,
+        mask_kind='yolo', pass_index=0, tile_config_id=tile_config_id,
+        tile_acceptance=tile_acceptance, stage=stage))
+    token = (str(model_name), key)
+    with _LOCK:
+        reference = _REGISTRY.get(token) if token in _ADOPTED_KEYS else None
+    if (reference is not None and native_shape is not None
+            and reference.storage_shape != tuple(native_shape)):
+        raise ValueError('Adopted confidence differs from the native prediction grid')
+    return reference
 
 
 @dataclass(frozen=True)
@@ -451,7 +529,8 @@ class ConfidenceEvidenceRef:
         shape = checked_shape(raw_shape)
         if data.get('unknown') != 'score_zero':
             raise ValueError('Invalid confidence evidence geometry or support semantics')
-        if data.get('dtype') != 'uint8' or data.get('score_semantics') != SCORE_SEMANTICS:
+        if data.get('dtype') != 'uint8' or data.get('score_semantics') not in (
+                SCORE_SEMANTICS, _LEGACY_SCORE_SEMANTICS):
             raise ValueError('Invalid confidence evidence score semantics')
         result = cls(directory, shape, str(data['layer_key']), str(data['model_name']), data)
         if result.coordinate_space not in ('source','native_view_processing'):
@@ -577,6 +656,7 @@ class ConfidenceEvidenceReader:
 def write_confidence_evidence(path, shape, slice_reader: Callable, *, layer_key, model_name,
                               provenance=None):
     """Write one source-space score sidecar using a single XY plane at a time."""
+    provenance = _confidence_provenance(provenance)
     directory = Path(path)
     shape = tuple(map(int, shape))
     if len(shape) != 3 or min(shape) <= 0:
@@ -639,7 +719,7 @@ def write_block_confidence_evidence(path, shape, slice_reader: Callable, *, laye
                                     block_size=128, metrics=None, max_numeric_bytes=None):
     """Write schema2 numeric blocks without a whole-plane bounding rectangle."""
     from .confidence_storage import write_blocks
-    provenance = provenance or {}
+    provenance = _confidence_provenance(provenance)
     space = coordinate_space or provenance.get('coordinate_space','source')
     if space == 'tile_native_processing':
         space = 'native_view_processing'
@@ -660,10 +740,12 @@ def _register_confidence_reference(reference, *, metrics=None):
         if token in _REGISTRY:
             raise RuntimeError(f'Duplicate confidence evidence for {token!r}')
         updated = {**_REGISTRY, token: reference}
-        _write_json_atomic(output/'manifest.json',dict(schema=SCHEMA,layers=[
+        _write_json_atomic(output/'manifest.json',dict(schema=SCHEMA, run_id=_RUN_ID,
+            purpose='observed_prediction_confidence', observed_confidence=_OBSERVED_CONFIDENCE, layers=[
             dict(model_name=m,layer_key=k,directory=ref.path.name,output_shape_tyx=list(ref.shape),
                  storage_schema=ref.metadata['schema'],coordinate_space=ref.coordinate_space,
-                 stored_shape_tyx=list(ref.storage_shape),score_semantics=SCORE_SEMANTICS,
+                 stored_shape_tyx=list(ref.storage_shape),score_semantics=ref.metadata['score_semantics'],
+                 observed_confidence=ref.metadata.get('provenance', {}).get('observed_confidence'),
                  unknown='score_zero') for (m,k),ref in sorted(updated.items())]))
         _REGISTRY[token] = reference
     if metrics is not None:
@@ -690,6 +772,12 @@ def publish_confidence_scores(scores, *, view, model_name, temp_dir, output_shap
     from .cuda_d1 import _nrrd_layer_key
     if not confidence_evidence_enabled():
         return None
+    adopted = _adopted_confidence_reference(view, model_name,
+        native_shape=getattr(scores, 'shape', None), source=source,
+        tile_config_id=tile_config_id, tile_acceptance=tile_acceptance,
+        stage=stage, layer_key=layer_key)
+    if adopted is not None:
+        return adopted
     with _LOCK:
         output = _OUTPUT_DIR
         publisher = _PUBLICATION
@@ -945,6 +1033,12 @@ def capture_prediction_confidence(mask, scores, *, view, model_name, temp_dir,
     """Mask a retiring score workspace, then publish before it is closed/deleted."""
     if not confidence_evidence_enabled():
         return None
+    adopted = _adopted_confidence_reference(view, model_name,
+        native_shape=getattr(mask, 'shape', None), **{
+            key: kwargs[key] for key in ('source', 'tile_config_id', 'tile_acceptance', 'stage', 'layer_key')
+            if key in kwargs})
+    if adopted is not None:
+        return adopted
     if scores is None:
         raise RuntimeError(f'Missing retained confidence for {model_name}/{view.name}')
     values, retained = np.asarray(scores), np.asarray(mask)
@@ -990,12 +1084,17 @@ def publish_native_confidence_pieces(pieces, *, native_shape, view, model_name, 
     from .assembly import final_source_output_shape
     from .cuda_d1 import _nrrd_layer_key
     from .confidence_native import write_native_pieces, write_native_disjoint_leases
+    adopted = _adopted_confidence_reference(view, model_name, native_shape=native_shape,
+        source=source, tile_config_id=tile_config_id, tile_acceptance=tile_acceptance,
+        stage=stage, layer_key=layer_key)
+    if adopted is not None:
+        return adopted
     key=str(layer_key or _nrrd_layer_key(view_name=view.name,source=source,mask_kind='yolo',
         pass_index=0,tile_config_id=tile_config_id,tile_acceptance=tile_acceptance,stage=stage))
     shape=tuple(output_shape or final_source_output_shape() or (view.full_t,view.full_h,view.full_w))
-    provenance=dict(view=_json_value(view),processing_shape_tyx=list(native_shape),source=source,
+    provenance=_confidence_provenance(dict(view=_json_value(view),processing_shape_tyx=list(native_shape),source=source,
         mask_kind='yolo',stage=stage,tile_config_id=tile_config_id,tile_acceptance=tile_acceptance,
-        confidence_scope='surviving observed prediction support before interpolation')
+        confidence_scope='surviving observed prediction support before interpolation'))
     started = time.perf_counter()
     if disjoint:
         ref=write_native_disjoint_leases(_confidence_destination(model_name,key),pieces,native_shape=native_shape,

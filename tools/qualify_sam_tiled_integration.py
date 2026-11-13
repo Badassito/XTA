@@ -157,7 +157,7 @@ def seam(args):
         processing_cli_cube_stage_executed=False, original_observation_source=fixture["observation_source"],
         image_sha256=fixture["image_sha256"], original_input_sha256=fixture["parent_observations_sha256"],
         labels_used=False, outer_crop_rules_changed=False)
-    with diagnostic.gpu_lock(Path(r"C:\Users\Bry\Documents\ChatGPT\Scratch\Temp\GPU_LOCK"),
+    with diagnostic.gpu_lock(Path.home() / "Documents/ChatGPT/Scratch/Temp/GPU_LOCK",
             "sam_tiled_real_native_assembly"), diagnostic.resource_monitor(runroot / "resources.json", 0):
         backprojection._configure_main_process_gpu_stage_workers((0,))
         backprojection._set_main_process_gpu_inference_priority_active(False)

@@ -224,6 +224,7 @@ def test_pipeline_invalidates_manifest_and_joins_before_processing(tmp_path, pro
         current_unified_launch=lambda: SimpleNamespace(
             mode='tta', launcher='xta', version='development', command=('tta',)),
         input_path=source, gpu_model_path=None, cpu_model_path=None, out_dir=tmp_path,
+        sweep_branch=None, scalar_run_id='fixture-run',
         capture_tta_artifact_identities=capture, ffprobe_info=probe,
         runtime_trace_event=lambda *args, **kwargs: None,
         runtime_telemetry=lambda: SimpleNamespace(span=lambda *args: nullcontext()),

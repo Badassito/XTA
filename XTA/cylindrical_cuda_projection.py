@@ -245,6 +245,9 @@ def _validate_projection_contract(source, plan, metadata, view, output_shape,
 
 
 _KERNEL_SOURCE = r'''
+#ifndef XTA_PROJECTION_SCALAR_MAX
+#define XTA_PROJECTION_SCALAR_MAX 0
+#endif
 extern "C" __global__ void project_radial_plan(
     const unsigned char* source, const int* shells,
     const unsigned int* offsets, const int* columns,
@@ -299,7 +302,11 @@ extern "C" __global__ void project_radial_plan(
                 (unsigned long long)(pr - bboxes[box]) * (bboxes[box + 3] - bboxes[box + 2]) +
                 (unsigned long long)(pc - bboxes[box + 2]);
         }
+#if XTA_PROJECTION_SCALAR_MAX
+        out[q] = max(out[q], source[source_at]);
+#else
         if (source[source_at] != 0) { out[q] = 1; return; }
+#endif
     }
 }
 
@@ -378,11 +385,106 @@ extern "C" __global__ void encode_radial_crops(
                 result |= (unsigned char)(1u << bit);
         }
     } else {
+#if XTA_PROJECTION_SCALAR_MAX
+        result = source[source_row + box.x0 + byte_x];
+#else
         result = source[source_row + box.x0 + byte_x] != 0 ? 1 : 0;
+#endif
     }
     payload[offsets[slice] + q] = result;
 }
 '''
+
+
+def _radial_rank_oracle(source, view, output_shape, bboxes=None):
+    from .geometry import radial_global_radii
+    from .cylindrical_projection import _radial_planfree_arguments, _pull_radial_range_into
+    arguments = _radial_planfree_arguments(source, view,
+        np.asarray(radial_global_radii(view), np.float64), output_shape, bboxes)
+    def oracle(z, first, stop):
+        # The shared pull deliberately leaves invalid-address cells untouched.
+        result = np.zeros(stop - first, np.uint8)
+        _pull_radial_range_into(result, arguments[0], arguments[1], int(z), int(first),
+                                *arguments[2:], True)
+        return result
+    return oracle
+
+
+def validate_radial_numeric_preflight(plane, source, view, output_shape, bboxes=None, *, z=0):
+    """Bounded exact CPU rank checks before a numeric CUDA stage can publish."""
+    from types import SimpleNamespace
+    from .spherical_preflight import validate_spherical_preflight_plane
+    checked = np.asarray(plane)
+    if checked.dtype != np.uint8 or checked.shape != tuple(output_shape[1:]):
+        raise ValueError('Radial numeric preflight requires an output-shaped uint8 plane')
+    oracle = _radial_rank_oracle(source, view, output_shape, bboxes)
+
+    bounds = SimpleNamespace(y0=0, y1=checked.shape[0], x0=0, x1=checked.shape[1])
+    try:
+        return validate_spherical_preflight_plane(checked, lambda first, stop: oracle(z, first, stop), bounds, z=z)
+    except ValueError as exc:
+        raise ValueError(f'Radial numeric CUDA preflight failed: {exc}') from exc
+
+
+def rank_source_probe_planes(source, view, shape, boxes):
+    """Choose bounded probes from actual nonzero source rows, never scan a view."""
+    if boxes is None:
+        return ()
+    active = np.flatnonzero((boxes[:, 1] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 2]))
+    probes = set()
+    for shell in (() if not len(active) else tuple(dict.fromkeys((int(active[0]), int(active[-1]))))):
+        row = int(boxes[shell, 0])
+        x0, x1 = map(int, boxes[shell, 2:4])
+        values = source[shell, row, x0:x1]
+        if not values.size:
+            continue
+        column = x0 + int(np.argmax(values))
+        if source[shell, row, column] == 0:
+            continue
+        native_row = (row + .5) * int(view.src_h) / source.shape[1] - .5
+        native_column = (column + .5) * int(view.src_w) / source.shape[2] - .5
+        native_row = min(max(native_row, 0.), int(view.src_h)-1.)
+        native_column = min(max(native_column, 0.), int(view.src_w)-1.)
+        if str(view.family) == 'radial':
+            radius = float(view.radial_radii[shell])
+            angle = (float(view.radial_arc_origin) + native_column) / radius
+            dx, dy = radius * math.cos(angle), radius * math.sin(angle)
+            if str(view.radial_base_view) == 'transverse':
+                shear = (math.tan(math.radians(float(view.tilt_angle_deg)))
+                         * (dy if view.tilt_direction == 'vertical' else dx)
+                         if view.radial_tilted_source else 0.)
+                work_z = native_row + int(view.radial_height_origin) + shear
+            else:
+                work_z = float(view.center_y) + dy
+        else:
+            from .qsc import qsc_inverse
+            u = 2. * (float(view.spherical_u_origin) + native_column) / int(view.spherical_face_intervals) - 1.
+            v = 1. - 2. * (float(view.spherical_v_origin) + native_row) / int(view.spherical_face_intervals)
+            point = np.asarray(view.spherical_rotation_xyz).reshape(3, 3) @ qsc_inverse(int(view.spherical_face), u, v)
+            work_z = (int(view.full_t) - 1) / 2. + float(view.spherical_radii[shell]) * float(point[2])
+        center = int(round((work_z + .5) * shape[0] / int(view.full_t) - .5))
+        probes.update(z for z in (center-1, center, center+1) if 0 <= z < shape[0])
+    return tuple(sorted(probes))
+
+
+def validate_rank_crop_samples(block, oracle, output_width):
+    """Check real nonzero raw rank samples against the scalar CPU addresses."""
+    checks = observed = 0
+    for record in block.records:
+        if not record.size:
+            continue
+        crop = block.payload[record.offset:record.offset + record.size]
+        width = record.x1 - record.x0
+        for position in tuple(dict.fromkeys((0, int(np.argmax(crop)), crop.size-1))):
+            y, x = divmod(position, width)
+            first = (record.y0 + y) * output_width + record.x0 + x
+            expected = int(oracle(record.z, first, first+1)[0])
+            if int(crop[position]) != expected:
+                raise ValueError(f'Numeric CUDA source-sample preflight differs on Z={record.z}, '
+                                 f'YX={(record.y0+y, record.x0+x)}')
+            checks += 1
+            observed += int(expected > 0)
+    return checks, observed
 
 
 class RadialCudaProjector:
@@ -397,8 +499,14 @@ class RadialCudaProjector:
     def __init__(self, source, plan, metadata_tuple, view, output_shape,
                  bboxes=None, use_bboxes=False, device_index=0, *,
                  block_bytes=_BLOCK_BYTES, upload_bytes=_UPLOAD_BYTES, reserve_bytes=_RESERVE_BYTES,
-                 use_graphs=False, skip_empty_blocks=False):
+                 use_graphs=False, skip_empty_blocks=False, scalar_max=False, max_device_bytes=None):
         started = time.perf_counter()
+        self.scalar_max = bool(scalar_max)
+        if self.scalar_max and use_graphs:
+            raise ValueError('Numeric Radial projection requires the dense non-graph interface')
+        self.preflight_mode, self.preflight_pixels = 'binary_encoded_roundtrip', 0
+        self.numeric_sample_checks = self.numeric_observed_samples = 0
+        self.source_probe_planes = ()
         self.source_upload_seconds = self.geometry_upload_seconds = self.preflight_seconds = 0.0
         self.source_pack_seconds = self.module_setup_seconds = self.buffer_setup_seconds = 0.0
         self.source_pack_backend = 'dense_copy'
@@ -426,6 +534,14 @@ class RadialCudaProjector:
         self.required_device_bytes = (max(1, self.source_h2d_bytes) + self.geometry_bytes + self.output_buffer_bytes
             + self.compact_buffer_bytes + self.metadata_buffer_bytes + self.offset_buffer_bytes + 4 + _SETUP_BYTES)
         self.reserve_bytes = max(0, operator.index(reserve_bytes))
+        # A shared (overlap) lease owns at most its slice. Like the Spherical
+        # projector, admission then needs the slice to cover the whole private
+        # residency and the device to keep the ordinary reserve free.
+        self.admission_budget_bytes = None if max_device_bytes is None else max(0, operator.index(max_device_bytes))
+        if self.admission_budget_bytes is not None and self.required_device_bytes > self.admission_budget_bytes:
+            raise RadialCudaProjectionUnavailable(
+                f'Radial CUDA projection needs {self.required_device_bytes / 1024**3:.2f} GiB; '
+                f'its shared device slice is {self.admission_budget_bytes / 1024**3:.2f} GiB')
         self._upload_bytes = operator.index(upload_bytes)
         if self._upload_bytes <= 0 or self.device_index < 0:
             raise ValueError('Radial CUDA upload budget/device must be positive/nonnegative')
@@ -459,7 +575,10 @@ class RadialCudaProjector:
                         f'{int(free_bytes) / 1024**3:.2f} GiB is free')
                 with cp.cuda.using_allocator(self._pool.malloc), self._stream:
                     module_started = time.perf_counter()
-                    self._module = cp.RawModule(code=_KERNEL_SOURCE, options=('--std=c++11', '--fmad=false'))
+                    options = ('--std=c++11', '--fmad=false')
+                    if self.scalar_max:
+                        options += ('-DXTA_PROJECTION_SCALAR_MAX=1',)
+                    self._module = cp.RawModule(code=_KERNEL_SOURCE, options=options)
                     self._kernel = self._module.get_function('project_radial_plan')
                     self._reset_metadata_kernel = self._module.get_function('reset_radial_crop_metadata')
                     self._reduce_metadata_kernel = self._module.get_function('reduce_radial_crop_metadata')
@@ -507,11 +626,26 @@ class RadialCudaProjector:
                     # publish a slice, surfacing launch/copy errors at admission.
                     preflight_started = time.perf_counter()
                     checked = self._run_block(0, 1)
-                    if np.any(checked > 1):
-                        raise RuntimeError('Radial CUDA preflight did not produce a binary mask')
-                    for packed in (False, True):
-                        encoded = self._encode_current_output(0, 1, packed)
-                        self._validate_encoded_preflight(checked, encoded)
+                    if self.scalar_max:
+                        self.preflight_mode, self.preflight_pixels = validate_radial_numeric_preflight(
+                            checked[0], np.asarray(source), view, self.contract.output_shape,
+                            self.contract.arrays['bboxes'] if use_bboxes else None)
+                        self._validate_encoded_preflight(checked, self._encode_current_output(0, 1, False))
+                        self.source_probe_planes = rank_source_probe_planes(np.asarray(source), view,
+                            self.contract.output_shape, self.contract.arrays['bboxes'] if use_bboxes else None)
+                        oracle = _radial_rank_oracle(np.asarray(source), view, self.contract.output_shape,
+                            self.contract.arrays['bboxes'] if use_bboxes else None)
+                        for probe_z in self.source_probe_planes:
+                            packet = self.project_rank_crops(probe_z, 1)
+                            checks, observed = validate_rank_crop_samples(packet, oracle, self.contract.output_shape[2])
+                            self.numeric_sample_checks += checks
+                            self.numeric_observed_samples += observed
+                    else:
+                        if np.any(checked > 1):
+                            raise RuntimeError('Radial CUDA preflight did not produce a binary mask')
+                        for packed in (False, True):
+                            encoded = self._encode_current_output(0, 1, packed)
+                            self._validate_encoded_preflight(checked, encoded)
                     if use_graphs:
                         graph_started = time.perf_counter()
                         self._prepare_projection_graphs()
@@ -789,6 +923,17 @@ class RadialCudaProjector:
                 raise RuntimeError('Radial CUDA encoded preflight payload differs from dense output')
 
     def project_encoded(self, first_z, count, packed=False):
+        if getattr(self, 'scalar_max', False):
+            raise ValueError('Numeric Radial ranks require project_rank_crops(), never Boolean encoding')
+        return self._project_crop_block(first_z, count, packed)
+
+    def project_rank_crops(self, first_z, count):
+        """Return owned, nonzero-bounded raw rank bytes with the existing wire geometry."""
+        if not getattr(self, 'scalar_max', False):
+            raise ValueError('Rank crops require scalar_max=True')
+        return self._project_crop_block(first_z, count, False)
+
+    def _project_crop_block(self, first_z, count, packed=False):
         first_z, count = operator.index(first_z), operator.index(count)
         with self._lock:
             if self._closed or self._failed:

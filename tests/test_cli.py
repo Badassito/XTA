@@ -175,6 +175,23 @@ class CliTests(unittest.TestCase):
         parser.parse_args.assert_called_once_with(arguments)
         self.assertEqual(observed, arguments)
 
+    def test_detector_and_semantic_sweeps_dispatch_before_scalar_pipeline(self) -> None:
+        for task in ("segment", "semantic"):
+            with self.subTest(task=task):
+                arguments = [
+                    "--task", task, "--input", "volume.mkv", "--device", "cpu",
+                    "--model", "cpu:detector.xml", "--output", "review",
+                    "--temp", "work", "--conf=0.50:0.10:0.70", "--min_conf=0.20",
+                ]
+                with mock.patch("XTA.confidence_sweep.run_confidence_sweep") as sweep:
+                    with mock.patch("XTA.tta_mode.run") as scalar:
+                        cli.run(["--mode", "tta", *arguments])
+                sweep.assert_called_once_with(
+                    arguments, cutoffs_hundredths=(50, 60, 70),
+                    output_root=Path("review"), temp_root=Path("work"), min_conf=0.2,
+                )
+                scalar.assert_not_called()
+
     def test_pta_module_is_imported_only_by_pta_delegate(self) -> None:
         fake_module = types.ModuleType("XTA.pta_mode")
         fake_run = mock.Mock()

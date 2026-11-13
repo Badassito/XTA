@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import platform
 import queue
 import re
 import sys
@@ -760,6 +761,46 @@ class _OpenVinoCpuSegmenter:
             request_count = int(infer_requests)
         self.request_count = max(1, int(request_count))
         self.infer_queue = ov.AsyncInferQueue(self.compiled_model, int(self.request_count))
+        self.forward_replay = self._create_forward_replay()
+
+    def _create_forward_replay(self):
+        """Bind raw outputs to model bytes and resolved execution, never cutoffs."""
+        from .forward_replay import replay_for_model
+        from .unification.tta_manifest import _resolve_openvino_artifacts
+
+        if self.input_element_type not in {
+            'u8', 'uint8', 'f16', 'float16', 'f32', 'float32', 'bf16', 'bfloat16',
+        }:
+            return None
+        try:
+            model_files = _resolve_openvino_artifacts(self.model_xml)
+            version = str(self.ov.get_version())
+            if not version:
+                return None
+            settings = {
+                'openvino_version': version,
+                'task': str(self.task),
+                'precision': str(self.resolved_precision),
+                'input_element_type': str(self.input_element_type),
+                'input_layout': str(self.input_layout),
+                'batch': int(self.batch),
+                'input_channels': int(self.input_channels),
+                'imgsz': int(self.imgsz),
+                'expected_class_count': self.expected_class_count,
+                'output_adapter': ('semantic_logits' if self.task == 'semantic'
+                                   else 'raw_yolo_head_and_prototypes'),
+                'compile_config': {
+                    str(key): value if isinstance(value, (str, int, float, bool)) else str(value)
+                    for key, value in self.compile_config.items()
+                },
+                'cpu_architecture': platform.machine(),
+                'cpu_processor': platform.processor(),
+                'cpu_flags': sorted(self.cpu_flags),
+                'capabilities': sorted(self.capabilities),
+            }
+        except (OSError, ValueError, AttributeError, TypeError):
+            return None
+        return replay_for_model(model_files, backend='openvino_cpu', settings=settings)
 
     def _prepare_input(self, images: Sequence[np.ndarray]) -> np.ndarray:
         frames = [
@@ -791,6 +832,82 @@ class _OpenVinoCpuSegmenter:
             batch_value /= dtype(255.0)
         return batch_value
 
+    @staticmethod
+    def _raise_native_fanout_integrity_error(error):
+        try:
+            from .native_fanout import native_integrity_failure
+            integrity_error = native_integrity_failure(error)
+        except ImportError:
+            return
+        if integrity_error:
+            raise error
+
+    @staticmethod
+    def _disable_native_fanout(writer, error):
+        """Optional sibling publication must not invalidate a scalar result."""
+        _OpenVinoCpuSegmenter._raise_native_fanout_integrity_error(error)
+        try:
+            writer.disable(f'{type(error).__name__}: {error}')
+        except Exception as exc:
+            _OpenVinoCpuSegmenter._raise_native_fanout_integrity_error(exc)
+
+    @staticmethod
+    def _record_native_fanout_work(writer, **counts):
+        try:
+            writer.record_detector_work(**counts)
+        except Exception as exc:
+            _OpenVinoCpuSegmenter._disable_native_fanout(writer, exc)
+
+    def _emit_native_fanout_batch(
+        self, outputs, frame_specs, submitted_batch, writer, *, source, out_size,
+        M_out_to_native, native_h, native_w, has_scores, probabilities=None,
+    ):
+        """Decode siblings through scalar CPU operations, one native plane at a time."""
+        restore = getattr(source, 'restore_prediction_planes', None)
+        for cent in writer.cutoffs:
+            threshold = int(cent) / 100.
+            payloads = None
+            if getattr(self, 'task', 'segment') != 'semantic':
+                payloads = _openvino_cpu_payloads_from_outputs(
+                    outputs, batch_size=int(submitted_batch), conf_threshold=threshold,
+                    out_size=int(out_size), expected_class_count=self.expected_class_count,
+                )
+            for local_index, spec in enumerate(frame_specs):
+                if spec is None:
+                    continue  # Discard the ordinary fixed-batch synthetic extension.
+                if not isinstance(spec, BatchResultFrameSpec) or spec.is_azimuthal_padding:
+                    raise ValueError('CPU native fanout requires ordinary frame destinations')
+                mask = np.zeros((1, int(native_h), int(native_w)), dtype=np.uint8)
+                scores = np.zeros_like(mask) if has_scores else None
+                restore_planes = ((lambda planes, active_spec=spec: restore(active_spec, planes))
+                                  if callable(restore) else None)
+                if (getattr(self, 'task', 'segment') == 'semantic'
+                        or int(payloads[int(local_index)].confs.size) > 0):
+                    self._record_native_fanout_work(writer, mask_decodes=1)
+                if getattr(self, 'task', 'segment') == 'semantic':
+                    instance_count, frame_count = accumulate_semantic_probability_frame(
+                        probabilities[int(local_index)], frame_index=0, conf_threshold=threshold,
+                        view_union_mm=mask, view_confmap_mm=scores,
+                        M_out_to_native=M_out_to_native, native_h=int(native_h),
+                        native_w=int(native_w), restore_planes=restore_planes,
+                    )
+                else:
+                    instance_count, frame_count = _process_cpu_retina_prediction_frame(
+                        0, payloads[int(local_index)], int(out_size), mask, scores,
+                        M_out_to_native, int(native_h), int(native_w),
+                        slice_lock=None, restore_planes=restore_planes,
+                    )
+                has_foreground = _cleanup_prediction_slice_inplace(
+                    mask, scores, 0, min_conf=0., min_radius=0.,
+                )
+                writer.put(
+                    int(cent), int(spec.task_index), mask[0],
+                    None if scores is None else scores[0],
+                    prediction_count=int(instance_count),
+                    frames_with_predictions=int(bool(frame_count) and bool(has_foreground)),
+                    proto_treated=False,
+                )
+
     def infer_source_to_union(
         self,
         source: object,
@@ -807,8 +924,16 @@ class _OpenVinoCpuSegmenter:
         min_radius: float,
         azimuthal_padding_union_mm: Optional[np.ndarray] = None,
         azimuthal_padding_confmap_mm: Optional[np.ndarray] = None,
+        native_fanout: Optional[object] = None,
     ) -> Dict[str, object]:
         """Run a bounded async request queue with concurrent output postprocessing."""
+        if native_fanout is not None and (
+            float(min_conf) != 0. or float(min_radius) != 0. or yolo_hole_fill_enabled()
+            or int(getattr(source, 'azimuthal_padding_count', 0)) != 0
+            or azimuthal_padding_union_mm is not None or azimuthal_padding_confmap_mm is not None
+        ):
+            self._disable_native_fanout(native_fanout, ValueError('Unsupported CPU native fanout cleanup'))
+            native_fanout = None
         output_queue: 'queue.Queue[object]' = queue.Queue(
             maxsize=max(2, int(self.request_count)),
         )
@@ -818,7 +943,14 @@ class _OpenVinoCpuSegmenter:
         stats_lock = threading.Lock()
         slice_locks: Dict[Tuple[int, int], threading.Lock] = {}
         slice_locks_lock = threading.Lock()
-        stats = {'prediction_count': 0, 'frames_with_predictions': 0}
+        stats = {
+            'prediction_count': 0, 'frames_with_predictions': 0,
+            'openvino_output_copy_count': 0, 'openvino_output_copy_bytes': 0,
+            'openvino_forward_replay_hits': 0, 'openvino_forward_replay_misses': 0,
+        }
+        # An admitted native producer already journals every requested cutoff.
+        # Do not duplicate those products with raw reads, hashes or writes.
+        forward_replay = None if native_fanout is not None else getattr(self, 'forward_replay', None)
         submitted_real = 0
         submitted_results = 0
         submitted_batches = 0
@@ -831,6 +963,9 @@ class _OpenVinoCpuSegmenter:
                     np.array(request.get_output_tensor(index).data, copy=True)
                     for index in range(len(self.output_ports))
                 ]
+                with stats_lock:
+                    stats['openvino_output_copy_count'] += len(copied)
+                    stats['openvino_output_copy_bytes'] += sum(value.nbytes for value in copied)
                 output_queue.put(('result', userdata, copied))
             except BaseException as exc:
                 output_queue.put(('error', submission_index, exc))
@@ -861,8 +996,12 @@ class _OpenVinoCpuSegmenter:
                 if kind == 'error':
                     _record_consumer_error(int(userdata), payload)
                     continue
-                submission_index, frame_specs, submitted_batch = userdata
+                submission_index, frame_specs, submitted_batch, replay_key = userdata
                 try:
+                    # The callback's copies are owned and the queue/consumer counts bound
+                    # their lifetime. Persist before any threshold-dependent adapter.
+                    if forward_replay is not None and replay_key is not None:
+                        forward_replay.store(replay_key, tuple(payload))
                     if getattr(self, 'task', 'segment') == 'semantic':
                         probabilities = semantic_foreground_probability_numpy(
                             payload, batch_size=int(submitted_batch), output_size=int(out_size),
@@ -903,6 +1042,11 @@ class _OpenVinoCpuSegmenter:
                         target_lock = _target_slice_lock(target_union, int(frame_index))
                         restore = getattr(source, 'restore_prediction_planes', None)
                         with target_lock:
+                            if native_fanout is not None and (
+                                getattr(self, 'task', 'segment') == 'semantic'
+                                or int(payloads[int(local_index)].confs.size) > 0
+                            ):
+                                self._record_native_fanout_work(native_fanout, mask_decodes=1)
                             if getattr(self, 'task', 'segment') == 'semantic':
                                 instance_count, frame_count = accumulate_semantic_probability_frame(
                                     probabilities[int(local_index)],
@@ -938,6 +1082,19 @@ class _OpenVinoCpuSegmenter:
                                 min_conf=float(min_conf),
                                 min_radius=float(min_radius),
                             )
+                            if native_fanout is not None:
+                                try:
+                                    native_fanout.put(
+                                        int(native_fanout.floor_cent), int(spec.task_index),
+                                        target_union[int(frame_index)],
+                                        None if target_conf is None else target_conf[int(frame_index)],
+                                        prediction_count=int(instance_count) if count_stats else 0,
+                                        frames_with_predictions=int(
+                                            bool(count_stats) and bool(frame_count) and bool(has_foreground)),
+                                        proto_treated=False,
+                                    )
+                                except Exception as exc:
+                                    self._disable_native_fanout(native_fanout, exc)
                         if bool(count_stats):
                             batch_prediction_count += int(instance_count)
                         if bool(count_stats) and bool(frame_count) and bool(has_foreground):
@@ -950,6 +1107,18 @@ class _OpenVinoCpuSegmenter:
                             int(stats['frames_with_predictions'])
                             + int(batch_frames_with_predictions)
                         )
+                    if native_fanout is not None:
+                        try:
+                            self._emit_native_fanout_batch(
+                                payload, frame_specs, submitted_batch, native_fanout,
+                                source=source, out_size=out_size, M_out_to_native=M_out_to_native,
+                                native_h=native_h, native_w=native_w,
+                                has_scores=view_confmap_mm is not None,
+                                probabilities=(probabilities if getattr(self, 'task', 'segment')
+                                               == 'semantic' else None),
+                            )
+                        except Exception as exc:
+                            self._disable_native_fanout(native_fanout, exc)
                 except BaseException as exc:
                     _record_consumer_error(int(submission_index), exc)
 
@@ -998,13 +1167,37 @@ class _OpenVinoCpuSegmenter:
                     1 for spec in frame_specs
                     if spec is not None and bool(spec.is_azimuthal_padding)
                 )
+                if native_fanout is not None:
+                    self._record_native_fanout_work(
+                        native_fanout, rendered_frames=int(real_count), render_batches=1,
+                    )
                 input_value = self._prepare_input(images)
+                replay_key = None
+                replayed = None
+                if forward_replay is not None:
+                    replay_key = forward_replay.input_key(
+                        input_value, source=source, batch_index=int(submitted_batches),
+                    )
+                    if replay_key is not None:
+                        replayed = forward_replay.load(replay_key)
+                        if replayed is not None and len(replayed) != len(self.output_ports):
+                            replayed = None
                 userdata = (
                     int(submitted_batches),
                     tuple(frame_specs),
                     int(input_value.shape[0]),
+                    replay_key if replayed is None else None,
                 )
-                self.infer_queue.start_async({self.input_name: input_value}, userdata=userdata)
+                if replayed is None:
+                    self.infer_queue.start_async({self.input_name: input_value}, userdata=userdata)
+                    if native_fanout is not None:
+                        self._record_native_fanout_work(native_fanout, forward_calls=1)
+                else:
+                    output_queue.put(('result', userdata, replayed))
+                if forward_replay is not None:
+                    with stats_lock:
+                        stats['openvino_forward_replay_hits' if replayed is not None
+                              else 'openvino_forward_replay_misses'] += 1
                 submitted_real += int(real_count)
                 submitted_results += int(len(images))
                 submitted_batches += 1
@@ -1101,6 +1294,8 @@ def run_prediction_volume_in_openvino_worker(
     result_mask_full: Optional[np.memmap] = None
     result_conf_full: Optional[np.memmap] = None
     source: Optional[object] = None
+    native_fanout = None
+    fanout_setup_error = None
     raster_plan = _canonical_raster_plan_for_task(task)
     render_batch_sink = _canonical_image_sink_for_task(task, backend='openvino_cpu')
     try:
@@ -1128,6 +1323,19 @@ def run_prediction_volume_in_openvino_worker(
                 result_conf = np.memmap(
                     Path(str(task['result_conf_path'])), dtype=np.uint8, mode=open_mode, shape=result_shape,
                 )
+        try:
+            from .native_fanout import open_worker_fanout
+            if yolo_hole_fill_enabled():
+                if os.environ.get('XTA_YOLO_SWEEP_NATIVE_ROLE') == 'produce':
+                    task['_sweep_native_decline_reason'] = 'CPU native fanout excludes YOLO hole filling'
+            else:
+                native_fanout = open_worker_fanout(
+                    task, cfg, backend='openvino_cpu', shape=result_shape,
+                    has_scores=result_conf is not None, padding_count=0,
+                )
+        except Exception as exc:
+            _OpenVinoCpuSegmenter._raise_native_fanout_integrity_error(exc)
+            fanout_setup_error = f'{type(exc).__name__}: {exc}'
         if native_resize is not None:
             _wait_for_cube_ready_sentinel(
                 str(native_resize['sentinel']),
@@ -1161,6 +1369,8 @@ def run_prediction_volume_in_openvino_worker(
             render_batch_sink=render_batch_sink,
             raster_plan=raster_plan,
         )
+        from .forward_replay import bind_worker_replay_source
+        bind_worker_replay_source(source, task, 'openvino_cpu')
         task_affine = np.asarray(
             task.get('M_out_to_processing')
             if task.get('M_out_to_processing') is not None
@@ -1178,9 +1388,39 @@ def run_prediction_volume_in_openvino_worker(
         )
         if task.get('augmentation_pass_tasks'):
             from .tta_augmentation_cpu_runtime import predict_cpu_policy_source
-            return predict_cpu_policy_source(runner, source, task=task, cfg=cfg,
-                                             predict_kwargs=prediction_kwargs)
-        return runner.infer_source_to_union(source, **prediction_kwargs)
+            stats = predict_cpu_policy_source(runner, source, task=task, cfg=cfg,
+                                              predict_kwargs=prediction_kwargs)
+        else:
+            if native_fanout is not None:
+                prediction_kwargs['native_fanout'] = native_fanout
+            stats = runner.infer_source_to_union(source, **prediction_kwargs)
+        if fanout_setup_error is not None:
+            stats['sweep_native_fanout'] = {'status': 'unsupported', 'reason': fanout_setup_error}
+        if native_fanout is not None:
+            try:
+                receipt = native_fanout.finish()
+            except Exception as exc:
+                runner._disable_native_fanout(native_fanout, exc)
+                receipt = {'status': 'unsupported', 'reason': f'{type(exc).__name__}: {exc}'}
+            if isinstance(receipt, dict):
+                stats['sweep_native_fanout'] = receipt
+            native_fanout = None
+        elif task.get('_sweep_native_decline_reason'):
+            try:
+                from .native_fanout import unsupported_worker_fanout
+                stats['sweep_native_fanout'] = unsupported_worker_fanout(task, result_shape)
+            except Exception as exc:
+                stats['sweep_native_fanout'] = {
+                    'status': 'unsupported', 'reason': f'{type(exc).__name__}: {exc}',
+                }
+        return stats
+    except BaseException as exc:
+        if native_fanout is not None:
+            try:
+                native_fanout.abort(f'{type(exc).__name__}: {exc}')
+            except Exception:
+                pass
+        raise
     finally:
         if source is not None:
             try:
@@ -1754,11 +1994,41 @@ def run_prediction_volume_in_worker(
             )
 
         def _predict(active_source: object) -> Dict[str, object]:
+            if task.get('sweep_source_stamp'):
+                from .forward_replay import bind_worker_replay_source
+                bind_worker_replay_source(active_source, task, render_path)
+            native_fanout = None
+            if os.environ.get('XTA_YOLO_SWEEP_NATIVE_ROLE') == 'produce':
+                from .confidence_evidence import confidence_evidence_enabled
+                from .native_fanout import open_worker_fanout
+                native_fanout = open_worker_fanout(task, cfg, backend='cuda', shape=result_shape,
+                    has_scores=(result_conf is not None or confidence_evidence_enabled()),
+                    padding_count=azimuthal_padding_count)
+                if native_fanout is not None:
+                    native_fanout.configure_warp(out_size, task_affine, result_shape[-2:])
+                    active_source._xta_native_fanout = native_fanout
             prediction = predict_source_and_accumulate
             if task.get('augmentation_pass_tasks'):
                 from .tta_augmentation_runtime import predict_policy_source
                 def prediction(model_obj, source_obj, **kwargs):
                     return predict_policy_source(model_obj, source_obj, task=task, cfg=cfg, predict_kwargs=kwargs)
+            try:
+                scalar_stats = run_scalar_prediction(prediction, active_source)
+                if native_fanout is not None:
+                    scalar_stats['sweep_native_fanout'] = native_fanout.finish()
+                elif task.get('_sweep_native_decline_reason'):
+                    from .native_fanout import unsupported_worker_fanout
+                    scalar_stats['sweep_native_fanout'] = unsupported_worker_fanout(task, result_shape)
+                return scalar_stats
+            except BaseException:
+                if native_fanout is not None:
+                    native_fanout.abort('upstream worker prediction failed')
+                raise
+            finally:
+                if native_fanout is not None:
+                    active_source._xta_native_fanout = None
+
+        def run_scalar_prediction(prediction, active_source):
             return prediction(
                 model,
                 active_source,
@@ -1869,6 +2139,8 @@ def run_prediction_volume_in_worker(
             'slice_meta': stats.get('slice_meta'),
             'azimuthal_padding_processed': int(stats.get('azimuthal_padding_processed', 0)),
         }
+        if 'sweep_native_fanout' in stats:
+            public_stats['sweep_native_fanout'] = stats['sweep_native_fanout']
         if isinstance(source, CpuPreparedYoloSource):
             source.finish_cpu_copies()
             public_stats.update(cpu_input_frames=int(num_frames), cpu_input_copy_bytes=int(source.copy_bytes),

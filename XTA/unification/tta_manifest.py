@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 from pathlib import Path
+import tempfile
+import threading
 from typing import Any, Mapping, Sequence
 
 from .context import UnifiedLaunchContext
@@ -11,6 +15,36 @@ from .context import UnifiedLaunchContext
 
 TTA_RUN_MANIFEST_SCHEMA = "xta.v21.run_manifest/1"
 TTA_VOXEL_COUNT_SCHEMA = "xta.v18.voxel_count/1"
+
+_ARTIFACT_DIGESTS: dict[tuple[object, ...], str] = {}
+_ARTIFACT_DIGEST_LOCK = threading.Lock()
+
+
+def _sweep_startup_cache_path(kind: str, path: Path) -> Path | None:
+    """Locate a tiny record in the coordinator's private, sequential workspace."""
+    root = os.environ.get("XTA_YOLO_SWEEP_WORK_DIR")
+    if (not root or not Path(root).is_absolute()
+            or not os.environ.get("XTA_YOLO_SWEEP_ID")
+            or os.environ.get("XTA_YOLO_SWEEP_CUTOFF_HUNDREDTHS") is None):
+        return None
+    directory = Path(root).expanduser().resolve() / "startup"
+    directory.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha256(str(path).encode("utf-8")).hexdigest()
+    return directory / f"{kind}-{key}.json"
+
+
+def _write_sweep_startup_cache(path: Path, record: Mapping[str, Any]) -> None:
+    """Publish completed metadata; large model and video bytes stay elsewhere."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=path.name + ".", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(record, stream, separators=(",", ":"))
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def projection_sampling_record(view: Any) -> dict[str, Any]:
@@ -178,6 +212,7 @@ def _file_identity(
     path: str | Path,
     *,
     content_digest: bool = False,
+    use_sweep_cache: bool = True,
 ) -> dict[str, Any]:
     resolved = Path(path).expanduser().resolve()
     stat = resolved.stat()
@@ -192,7 +227,28 @@ def _file_identity(
     if content_digest:
         if not resolved.is_file():
             raise ValueError(f"content identity requires a regular file: {resolved}")
-        identity["sha256"] = _sha256_file(resolved)
+        # Repeated finalization boundaries need only a stat comparison once the
+        # same ordinary filesystem version has already been read in this run.
+        key = tuple(identity.values())
+        cache_path = _sweep_startup_cache_path("artifact", resolved) if use_sweep_cache else None
+        with _ARTIFACT_DIGEST_LOCK:
+            cached = None
+            if cache_path is not None and cache_path.exists():
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if cached is not None:
+                if cached.get("identity") != identity:
+                    raise RuntimeError(f"TTA model artifact changed within confidence sweep: {resolved}")
+                digest = cached["sha256"]
+            else:
+                digest = _ARTIFACT_DIGESTS.get(key)
+                if digest is None:
+                    digest = _sha256_file(resolved)
+                    if _file_identity(resolved) != identity:
+                        raise RuntimeError(f"TTA model artifact changed while reading its identity: {resolved}")
+                    _ARTIFACT_DIGESTS[key] = digest
+                if cache_path is not None:
+                    _write_sweep_startup_cache(cache_path, {"identity": identity, "sha256": digest})
+        identity["sha256"] = digest
     return identity
 
 
@@ -280,14 +336,23 @@ def capture_tta_artifact_identities(
                 for artifact in _resolve_openvino_artifacts(cpu_path)
             ],
         }
-    return {
+    result = {
         "captured_before_execution": True,
         "source": _file_identity(input_path, content_digest=False),
         "models": models,
     }
+    cache_path = _sweep_startup_cache_path("inputs", Path(result["source"]["path"]))
+    if cache_path is not None:
+        if cache_path.exists():
+            previous = json.loads(cache_path.read_text(encoding="utf-8"))
+            if previous != result:
+                raise RuntimeError("TTA input/model artifact set changed within confidence sweep")
+        else:
+            _write_sweep_startup_cache(cache_path, result)
+    return result
 
 
-def assert_tta_artifacts_unchanged(identities: Mapping[str, Any]) -> None:
+def assert_tta_artifacts_unchanged(identities: Mapping[str, Any], *, use_sweep_cache: bool = True) -> None:
     """Reject a success manifest when an input changed after its initial snapshot."""
 
     records: list[Mapping[str, Any]] = [identities["source"]]
@@ -305,6 +370,7 @@ def assert_tta_artifacts_unchanged(identities: Mapping[str, Any]) -> None:
         current = _file_identity(
             record["path"],
             content_digest="sha256" in record,
+            use_sweep_cache=use_sweep_cache,
         )
         changed = [
             field for field in compared_fields

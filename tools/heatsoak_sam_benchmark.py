@@ -20,7 +20,7 @@ def main():
     spec.loader.exec_module(diagnostic)
     stop=threading.Event()
     counts={"cpu_matmuls":0,"gpu_matmuls":0}
-    with diagnostic.gpu_lock(Path(r"C:\Users\Bry\Documents\ChatGPT\Scratch\Temp\GPU_LOCK"),"sam_improvements_heatsoak"),diagnostic.resource_monitor(args.output/"resources.json",args.device):
+    with diagnostic.gpu_lock(Path.home() / "Documents/ChatGPT/Scratch/Temp/GPU_LOCK","sam_improvements_heatsoak"),diagnostic.resource_monitor(args.output/"resources.json",args.device):
         os.environ["OPENBLAS_NUM_THREADS"]="8"
         os.environ["MKL_NUM_THREADS"]="8"
         os.environ["OMP_NUM_THREADS"]="8"

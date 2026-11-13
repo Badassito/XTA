@@ -1,4 +1,5 @@
 """Parent resume batches return the owner thread to late detector ACKs."""
+from collections import deque
 from concurrent.futures import Future, wait
 import ast
 from pathlib import Path
@@ -300,6 +301,7 @@ def test_locked_parent_drain_reaches_wakeable_wait_and_independent_completion(tm
     expected_timeout = .1 if detector_active else .002
     namespace = drain.__globals__
     namespace.update(inference_worker_process_active=detector_active,
+        fanout_consumers=deque(),
         _test_drain=drain, _check_loop_limit=check_loop_limit,
         pending_prediction_volume_futures=[] if wait_mode == 'future_free' else [unrelated],
         sam_cpu_futures={'source': None, 'runtime': None},

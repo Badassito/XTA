@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import gc
 import inspect
 import math
@@ -99,7 +100,9 @@ def load_ultralytics_model(path: str, task: str = 'segment'):
             "Ultralytics is required. Install with: pip install ultralytics\n"
             f"Import error: {e}"
         ) from e
-    return YOLO(path, task=task)
+    model = YOLO(path, task=task)
+    model._xta_forward_model_path = os.path.abspath(path)
+    return model
 
 def canonical_single_device(device: str) -> str:
     raw = str(device or '').strip()
@@ -620,6 +623,7 @@ class GpuFlattenedRetinaPayload:
     # consumer. CuPy launches are invisible to torch's allocator stream tracking by themselves.
     device_refs: Optional[Tuple[object, ...]] = field(default=None, repr=False)
     compaction_kernel: str = ''
+    sweep_fanout_capture: Optional[Tuple[object, int]] = field(default=None, repr=False)
 
 @dataclass(frozen=True)
 class DeferredCpuRetinaMaskPayload:
@@ -1450,7 +1454,8 @@ def _get_cached_affine_grid(theta_np: np.ndarray, dst_h: int, dst_w: int, device
     # The grid is built once on the creating thread's stream but read from arbitrary streams
     # afterwards; synchronize the producing stream once so later cross-stream reads are ordered.
     try:
-        torch.cuda.current_stream(grid.device).synchronize()
+        if grid.is_cuda:
+            torch.cuda.current_stream(grid.device).synchronize()
     except Exception:
         pass
     with _AFFINE_GRID_CACHE_LOCK:
@@ -2599,6 +2604,22 @@ def _try_create_device_union_accumulator(
     except Exception:
         return None
 
+def _warp_flattened_native_planes(payload, matrix, out_size, native_h, native_w, track_conf):
+    """Apply the scalar view warp and preserve its observed-score rounding on foreground."""
+    import torch
+    warp_conf = bool(track_conf and payload.conf_gpu is not None)
+    warped = _torch_warp_planes_to_native(
+        [payload.union_gpu, payload.conf_gpu] if warp_conf else [payload.union_gpu],
+        matrix, int(out_size), int(native_h), int(native_w))
+    mask = warped[0] > 0.5
+    score = None
+    if warp_conf:
+        value = warped[1]
+        score = torch.where(mask, (value.clamp(0.0, 1.0) * float(CONF_U8_MAX)).round(),
+                            torch.zeros((), dtype=value.dtype, device=value.device)).clamp(0.0,255.0).to(torch.uint8)
+    return mask, score
+
+
 def _process_gpu_flattened_prediction_frame(
     idx: int,
     payload: GpuFlattenedRetinaPayload,
@@ -2616,7 +2637,11 @@ def _process_gpu_flattened_prediction_frame(
     Union and confidence planes stay on a side CUDA stream through warp and optional radius cleanup. Eligible tasks write directly into the device union; host fallback preserves output on any GPU-path failure. Hole filling remains a completed-view or task-end operation."""
     instance_count = max(0, int(payload.instance_count))
     union_gpu = payload.union_gpu
+    fanout = getattr(payload, 'sweep_fanout_capture', None)
     if union_gpu is None:
+        if fanout is not None:
+            owner, ordinal = fanout
+            owner.consume_empty(ordinal, owner.floor_cent, instance_count, frames=0)
         return int(instance_count), 0
 
     track_conf = view_confmap_mm is not None or bool(getattr(device_union, 'retain_confidence', False))
@@ -2657,23 +2682,8 @@ def _process_gpu_flattened_prediction_frame(
             # Warp union (and conf) to view-native space on the GPU (nearest, zero-padded). Both
             # planes share one grid_sample; identity warps skip it entirely and non-identity
             # warps reuse a cached grid.
-            warp_conf = bool(track_conf and payload.conf_gpu is not None)
-            warped = _torch_warp_planes_to_native(
-                [union_gpu, payload.conf_gpu] if warp_conf else [union_gpu],
-                M_out_to_native, int(out_size), int(native_h), int(native_w),
-            )
-            native_union_t = warped[0]
-            native_union_bool_t = native_union_t > 0.5
-
-            native_conf_t = None
-            if warp_conf:
-                native_conf_f = warped[1]
-                # Quantize to u8 (round-half-even) only where the union is foreground.
-                native_conf_t = torch.where(
-                    native_union_bool_t,
-                    (native_conf_f.clamp(0.0, 1.0) * float(CONF_U8_MAX)).round(),
-                    torch.zeros((), dtype=native_conf_f.dtype, device=native_conf_f.device),
-                ).clamp(0.0, 255.0).to(torch.uint8)
+            native_union_bool_t, native_conf_t = _warp_flattened_native_planes(
+                payload, M_out_to_native, out_size, native_h, native_w, track_conf)
 
             if int(payload.semantic_min_conf_u8) > 0:
                 from .semantic_cuda import filter_semantic_components_cuda
@@ -2694,6 +2704,10 @@ def _process_gpu_flattened_prediction_frame(
             if device_union is not None and not (
                 bool(payload.run_gpu_cleanup) and float(payload.gpu_min_radius) > 0.0
             ):
+                if fanout is not None:
+                    owner, ordinal = fanout
+                    count = payload.instance_count_device if payload.instance_count_device is not None else instance_count
+                    owner.consume_native(ordinal, owner.floor_cent, native_union_bool_t, native_conf_t, count)
                 device_union.write_frame(
                     int(idx), native_union_bool_t, native_conf_t,
                     prediction_count_dev=payload.instance_count_device,
@@ -2792,7 +2806,15 @@ def _process_gpu_flattened_prediction_frame(
         # Empty after warp/cleanup: nothing written, so report no contributing frame (matches the
         # CPU retina path). Still record whether the GPU cleanup ran so the CPU cleanup stays skipped.
         payload.cleanup_done_on_gpu = bool(cleaned_on_gpu)
+        if fanout is not None:
+            owner, ordinal = fanout
+            owner.consume_empty(ordinal, owner.floor_cent, instance_count, frames=0)
         return int(instance_count), 0
+
+    if fanout is not None:
+        owner, ordinal = fanout
+        owner.put(owner.floor_cent, ordinal, native_union_np, native_conf_np,
+                  prediction_count=instance_count, frames_with_predictions=1)
 
     def _write_native_outputs() -> None:
         view_union_mm[int(idx), :, :] |= native_union_np.astype(np.uint8, copy=False)
@@ -3676,15 +3698,27 @@ def _semantic_predict_stream(
     backend = getattr(predictor, 'model', None)
     if backend is None:
         raise RuntimeError(f'{source_label}: semantic predictor has no backend')
+    from .forward_replay import torch_replay_for_predictor
+    replay_cache = torch_replay_for_predictor(predictor, cfg, 'gpu-semantic-direct')
     start = getattr(source, 'start', None)
     if callable(start):
         start()
     with torch.inference_mode():
-        for _paths, images, _info in iter(source):
+        for batch_index, (_paths, images, _info) in enumerate(iter(source)):
             model_input = predictor.preprocess(images)
+            replay_key = (None if replay_cache is None else replay_cache.input_key(
+                model_input, source=source, batch_index=int(batch_index)))
+            replayed = (None if replay_key is None else replay_cache.load_tensors(
+                replay_key, device=model_input.device))
+            if replayed is not None and len(replayed) != 1:
+                raise RuntimeError('Semantic forward replay requires one raw logits tensor')
+            raw_output = backend(model_input) if replayed is None else replayed[0]
             probability = semantic_foreground_probability(
-                backend(model_input), output_size=int(model_input.shape[-1]),
+                raw_output, output_size=int(model_input.shape[-1]),
             )
+            if replay_key is not None and replayed is None:
+                logits = raw_output[0] if isinstance(raw_output, (tuple, list)) else raw_output
+                replay_cache.store(replay_key, (logits,))
             if int(probability.shape[0]) != len(images):
                 raise RuntimeError(
                     f'{source_label}: semantic output batch {int(probability.shape[0])} '
@@ -3774,6 +3808,8 @@ def _ensure_predictor_for_direct_predict(model: object, cfg: 'PredictConfig') ->
             predictor = getattr(model, 'predictor', None)
         if predictor is None or getattr(predictor, 'model', None) is None:
             return None
+        if getattr(model, '_xta_forward_model_path', None):
+            predictor._xta_forward_model_path = model._xta_forward_model_path
         ensure_yolo_ready_for_predict(model, cfg)
         validate_yolo_model_input_channels(
             model,
@@ -3820,6 +3856,71 @@ def _split_segmentation_backend_outputs(preds: object) -> Optional[Tuple[object,
 
 _DIRECT_DEVICE_COMPACTION_ANNOUNCED = False
 
+_STOCK_REPLAY = contextvars.ContextVar("xta_stock_forward_replay", default=None)
+_STOCK_REPLAY_INSTALL_LOCK = threading.Lock()
+
+
+def _stock_results_with_forward_replay(results, model, source, cfg):
+    """Share the stock predictor's detector forward, preserving its own NMS and retina path."""
+    from .forward_replay import replay_enabled, torch_replay_for_predictor
+    if not replay_enabled():
+        return results
+    predictor = getattr(model, "predictor", None)
+    if predictor is None or not callable(getattr(predictor, "inference", None)):
+        return results
+    args = getattr(predictor, "args", None)
+    if (getattr(args, "visualize", False) or getattr(args, "augment", False)
+            or getattr(args, "embed", None) or getattr(predictor, "_feats", None) is not None):
+        return results
+    if getattr(model, "_xta_forward_model_path", None):
+        predictor._xta_forward_model_path = model._xta_forward_model_path
+    cache = torch_replay_for_predictor(predictor, cfg, "ultralytics-segment-nms")
+    if cache is None:
+        return results
+    with _STOCK_REPLAY_INSTALL_LOCK:
+        if not getattr(predictor, "_xta_forward_replay_installed", False):
+            original = predictor.inference
+
+            def inference(image, *args, **kwargs):
+                active = _STOCK_REPLAY.get()
+                if active is None or active[0] is not predictor or args or kwargs:
+                    return original(image, *args, **kwargs)
+                _, active_cache, active_source, ordinal = active
+                key = active_cache.input_key(image, source=active_source, batch_index=next(ordinal))
+                saved = active_cache.load_tensors(key, device=image.device)
+                if saved is not None and len(saved) == 2:
+                    # SegmentationPredictor.postprocess consumes the same head and proto
+                    # for both its exported pair and the PyTorch auxiliary tuple.
+                    return saved
+                raw = original(image)
+                pair = _split_segmentation_backend_outputs(raw)
+                if pair is not None:
+                    active_cache.store(key, pair)
+                return raw
+
+            predictor.inference = inference
+            predictor._xta_forward_replay_installed = True
+
+    def iterate():
+        from itertools import count
+        state = (predictor, cache, source, count())
+        iterator = iter(results)
+        try:
+            while True:
+                token = _STOCK_REPLAY.set(state)
+                try:
+                    value = next(iterator)
+                except StopIteration:
+                    return
+                finally:
+                    _STOCK_REPLAY.reset(token)
+                yield value
+        finally:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                close()
+    return iterate()
+
 _DIRECT_DEVICE_COMPACTION_FALLBACK_WARNED = False
 _DIRECT_COMPACTION_LAYOUTS: set[Tuple[object, ...]] = set()
 _DIRECT_COMPACTION_LAYOUT_LOCK = threading.Lock()
@@ -3858,16 +3959,16 @@ def direct_device_compaction_enabled() -> bool:
     """Fuse the generic direct loop's confidence gate + proto union without host counts."""
     return _env_flag('YOLO_TTA_DIRECT_DEVICE_COMPACTION', True)
 
-def _build_direct_device_compacted_payload(
+def _reduce_direct_prototypes(
     head_frame: object,
     proto_frame: object,
     im: object,
     confidence_threshold: float,
-    min_conf_applied: bool = False,
     *,
     allow_tiled: bool = True,
-) -> Optional[GpuFlattenedRetinaPayload]:
-    """Build one flattened mask using the resident kernels on the current CUDA stream.
+    own_inputs: bool = True,
+):
+    """Run the native score gate and prototype reduction on the current CUDA stream.
 
  Unlike the legacy direct path this never evaluates a data-dependent tensor shape on the
  host. ``compact_count`` is consumed by the proto kernel in device memory and travels with
@@ -3876,7 +3977,6 @@ def _build_direct_device_compacted_payload(
         return None
     try:
         import torch  # type: ignore
-        import torch.nn.functional as F  # type: ignore
 
         kernels = _resident_mask_kernels()
         if kernels is None:
@@ -3884,8 +3984,11 @@ def _build_direct_device_compacted_payload(
         # AutoBackend/TensorRT may reuse static output bindings on the next enqueue while this
         # payload is queued to a postprocess worker. Snapshot the compact head/proto tensors;
         # this is still orders of magnitude smaller than materializing an instance-mask stack.
-        head = head_frame.contiguous().clone()
-        proto = proto_frame.contiguous().clone()
+        head = head_frame.contiguous()
+        proto = proto_frame.contiguous()
+        if own_inputs:
+            head = head.clone()
+            proto = proto.clone()
         if int(head.ndim) != 2 or int(proto.ndim) != 3:
             return None
         if head.dtype not in (torch.float16, torch.float32):
@@ -3979,45 +4082,108 @@ def _build_direct_device_compacted_payload(
                  cp_conf_proto if cp_conf_proto is not None else np.uintp(0)), stream=external,
             )
 
-        # One plane, not one plane per instance. The terminal view warp remains in the existing
-        # post path; the resident-ring specialization fuses this upsample with that warp.
-        union_gpu = (
-            F.interpolate(
-                max_logit.reshape(1, 1, ph, pw),
-                size=(img_h, img_w), mode='bilinear', align_corners=False,
-            ).reshape(img_h, img_w) > 0.0
-        ).to(torch.float32)
-        conf_gpu = None
-        if conf_proto is not None:
-            conf_gpu = F.interpolate(
-                conf_proto.reshape(1, 1, ph, pw),
-                size=(img_h, img_w), mode='nearest',
-            ).reshape(img_h, img_w)
-
-        ready_event = torch.cuda.Event()
-        ready_event.record(stream)
-        fastpath = angle_variant_gpu_fastpath()
-        fastpath_radius = 0.0 if fastpath is None else float(fastpath[1])
-        payload = GpuFlattenedRetinaPayload(
-            union_gpu=union_gpu,
-            conf_gpu=conf_gpu,
-            instance_count=-1,
-            instance_count_device=count,
-            min_conf_applied=bool(min_conf_applied),
-            run_gpu_cleanup=bool(
-                fastpath is not None and gpu_retina_cleanup_enabled() and fastpath_radius > 0.0
-            ),
-            gpu_min_radius=float(fastpath_radius),
-            ready_event=ready_event,
-            compaction_kernel=kernel_name,
-            device_refs=(
-                head, proto, indices, count, max_logit, conf_proto,
-                cp_head, cp_proto, cp_indices, cp_count, cp_max_logit, cp_conf_proto,
-            ) + packed_refs,
-        )
-        return payload
+        refs = (head, proto, indices, count, max_logit, conf_proto,
+                cp_head, cp_proto, cp_indices, cp_count, cp_max_logit, cp_conf_proto) + packed_refs
+        return max_logit, conf_proto, count, kernel_name, refs
     except Exception:
         return None
+
+
+def _direct_payload_from_planes(max_logit, conf_proto, image_hw, *, count, count_device=None,
+                                kernel_name, min_conf_applied=False, refs=()):
+    import torch
+    import torch.nn.functional as F
+
+    union = F.interpolate(max_logit[None, None], size=image_hw, mode='bilinear',
+                          align_corners=False)[0, 0].gt(0).to(torch.float32)
+    confidence = (None if conf_proto is None else
+                  F.interpolate(conf_proto[None, None], size=image_hw, mode='nearest')[0, 0])
+    event = torch.cuda.Event()
+    event.record(torch.cuda.current_stream(max_logit.device))
+    fastpath = angle_variant_gpu_fastpath()
+    radius = 0.0 if fastpath is None else float(fastpath[1])
+    return GpuFlattenedRetinaPayload(
+        union_gpu=union, conf_gpu=confidence, instance_count=count, instance_count_device=count_device,
+        min_conf_applied=bool(min_conf_applied), run_gpu_cleanup=bool(
+            fastpath is not None and gpu_retina_cleanup_enabled() and radius > 0.0),
+        gpu_min_radius=radius, ready_event=event, compaction_kernel=kernel_name, device_refs=refs,
+    )
+
+
+def _build_direct_device_compacted_payload(
+    head_frame: object, proto_frame: object, im: object, confidence_threshold: float,
+    min_conf_applied: bool = False, *, allow_tiled: bool = True,
+) -> Optional[GpuFlattenedRetinaPayload]:
+    planes = _reduce_direct_prototypes(head_frame, proto_frame, im, confidence_threshold, allow_tiled=allow_tiled)
+    if planes is None:
+        return None
+    logits, scores, count, name, refs = planes
+    try:
+        return _direct_payload_from_planes(logits, scores, tuple(im.shape[-2:]), count=-1,
+            count_device=count, kernel_name=name, min_conf_applied=min_conf_applied, refs=refs)
+    except Exception:
+        return None
+
+def _native_fanout_for_source(source):
+    """Find the task-owned native fanout across ordinary staging wrappers."""
+    seen = set()
+    while source is not None and id(source) not in seen:
+        seen.add(id(source))
+        sink = getattr(source, '_xta_native_fanout', None)
+        if sink is not None:
+            return sink
+        source = getattr(source, 'base_source', None)
+    return None
+
+
+def _mark_native_fanout_consumed(source):
+    seen = set()
+    while source is not None and id(source) not in seen:
+        seen.add(id(source))
+        source._native_trt_data_consumed = True
+        source = getattr(source, 'base_source', None)
+
+
+def _direct_native_fanout_siblings(sink, result_index, head, proto, image, *, allow_tiled):
+    """Decode sibling cutoffs from one live raw frame, retaining one extra plane."""
+    cutoffs = tuple(sink.cutoffs)
+    if not cutoffs:
+        return True
+    from .sweep_proto import consume_tiled_siblings
+    if consume_tiled_siblings(sink, result_index, head, proto, image, allow_tiled=allow_tiled):
+        return True
+    # One bounded scalar read can eliminate every higher-cut decode on blank frames.
+    # CUDA compaction compares fp32 scores/gates, including heads stored in fp16.
+    max_score = float(head[4].max().item())
+    unavailable = []
+
+    def sibling_payloads():
+        for cutoff in cutoffs:
+            threshold = float(cutoff) / 100.
+            if max_score < float(np.float32(threshold)):
+                payload = GpuFlattenedRetinaPayload(union_gpu=None, conf_gpu=None, instance_count=0)
+            else:
+                payload = _build_direct_device_compacted_payload(
+                    head, proto, image, threshold, min_conf_applied=False, allow_tiled=allow_tiled)
+                if payload is None:
+                    unavailable.append(cutoff)
+                    return
+                sink.record_detector_work(mask_decodes=1)
+            yield int(cutoff), payload
+
+    consume_results = getattr(sink, 'consume_results', None)
+    if callable(consume_results):
+        # Decodes stay lazy and in cutoff order; the sink reads all sibling bounds
+        # in one device-to-host copy and all nonempty crops in a second one.
+        consume_results(int(result_index), sibling_payloads())
+    else:
+        for cutoff, payload in sibling_payloads():
+            sink.consume_result(int(result_index), cutoff, payload)
+    if unavailable:
+        sink.disable('GPU native fanout sibling compaction is unavailable')
+        return False
+    return True
+
 
 @runtime_telemetry_phase('inference.direct_stream_host')
 def _direct_predict_stream(
@@ -4034,10 +4200,18 @@ def _direct_predict_stream(
     backend = getattr(predictor, 'model', None)
     if backend is None:
         raise RuntimeError('direct predict: predictor has no backend model')
+    from .forward_replay import torch_replay_for_predictor
     names = getattr(backend, 'names', None) or {}
     nc = max(1, len(names))
     conf_thres = float(cfg.conf)
     device_compaction_active = bool(direct_device_compaction_enabled())
+    native_fanout = _native_fanout_for_source(source)
+    if native_fanout is not None and (nc != 1 or not device_compaction_active):
+        native_fanout.disable('GPU native fanout requires one-class direct device compaction')
+        native_fanout = None
+    replay_cache = (None if native_fanout is not None else
+                    torch_replay_for_predictor(predictor, cfg, 'gpu-segmentation-direct'))
+    result_ordinal = 0
     tiled_compaction_active = True
     kernel_counts = {'tiled_f16': 0, 'tiled_f32': 0, 'scalar': 0, 'scalar_workspace_fallback': 0, 'synchronized': 0}
     failed_probes = 0
@@ -4059,9 +4233,18 @@ def _direct_predict_stream(
             pass
 
     with torch.inference_mode():
-        for _paths, im0s, _info in iter(source):
+        for batch_index, (_paths, im0s, _info) in enumerate(iter(source)):
             im = predictor.preprocess(im0s)
-            preds = backend(im)
+            replay_key = (None if replay_cache is None else replay_cache.input_key(
+                im, source=source, batch_index=int(batch_index)))
+            replayed = (None if replay_key is None else replay_cache.load_tensors(
+                replay_key, device=im.device))
+            if native_fanout is not None:
+                _mark_native_fanout_consumed(source)
+                native_fanout.record_detector_work(rendered_frames=int(im.shape[0]), render_batches=1)
+            preds = backend(im) if replayed is None else replayed
+            if native_fanout is not None and replayed is None:
+                native_fanout.record_detector_work(forward_calls=1)
             split = _split_segmentation_backend_outputs(preds)
             if split is None:
                 raise RuntimeError(
@@ -4078,6 +4261,11 @@ def _direct_predict_stream(
                     f'(head channels {no}, nc {nc}, protos {nm}); '
                     'set YOLO_TTA_DIRECT_PREDICT=0 to use model.predict'
                 )
+            if native_fanout is None and replay_key is not None and replayed is None:
+                # Own the raw values before a later TensorRT enqueue can reuse bindings.
+                # Confidence compaction and mask decoding remain branch-local below.
+                replay_cache.store_instance(replay_key, (head, protos),
+                    input_shape_hw=tuple(int(v) for v in im.shape[-2:]), proto_support='candidate_boxes')
             if nc == 1 and device_compaction_active:
                 _direct_fastpath = angle_variant_gpu_fastpath()
                 _direct_effective_threshold = max(
@@ -4095,6 +4283,8 @@ def _direct_predict_stream(
                     for i in range(int(bsz))
                 ]
                 if all(payload is not None for payload in compacted_payloads):
+                    if native_fanout is not None:
+                        native_fanout.record_detector_work(mask_decodes=int(bsz))
                     if not _DIRECT_DEVICE_COMPACTION_ANNOUNCED:
                         _DIRECT_DEVICE_COMPACTION_ANNOUNCED = True
                         print(
@@ -4102,11 +4292,23 @@ def _direct_predict_stream(
                             'proto dot/crop union, and instance counts remain on device; '
                             'YOLO_TTA_DIRECT_DEVICE_COMPACTION=0 restores the synchronized fallback.'
                         )
-                    for payload in compacted_payloads:
+                    for frame_index, payload in enumerate(compacted_payloads):
+                        ordinal = int(result_ordinal)
+                        result_ordinal += 1
+                        if native_fanout is not None:
+                            payload.sweep_fanout_capture = (native_fanout, ordinal)
                         if payload.compaction_kernel == 'scalar_workspace_fallback':
                             tiled_compaction_active = False
                         kernel_counts[payload.compaction_kernel or 'scalar'] += 1
                         yield _DirectPredictResult(payload)  # type: ignore[arg-type]
+                        if native_fanout is not None and not _direct_native_fanout_siblings(
+                                native_fanout, ordinal, head[frame_index], protos[frame_index],
+                                im, allow_tiled=tiled_compaction_active):
+                            native_fanout = None
+                            if replay_key is not None and replayed is None:
+                                replay_cache.store_instance(replay_key, (head, protos),
+                                    input_shape_hw=tuple(int(v) for v in im.shape[-2:]),
+                                    proto_support='candidate_boxes')
                     continue
                 if not _DIRECT_DEVICE_COMPACTION_FALLBACK_WARNED:
                     _DIRECT_DEVICE_COMPACTION_FALLBACK_WARNED = True
@@ -4118,6 +4320,13 @@ def _direct_predict_stream(
                 # clone/allocation/probe on every remaining batch in this source.
                 device_compaction_active = False
                 failed_probes += 1
+                if native_fanout is not None:
+                    native_fanout.disable('GPU native fanout floor compaction is unavailable')
+                    native_fanout = None
+                    if replay_key is not None and replayed is None:
+                        replay_cache.store_instance(replay_key, (head, protos),
+                            input_shape_hw=tuple(int(v) for v in im.shape[-2:]),
+                            proto_support='candidate_boxes')
             kernel_counts['synchronized'] += bsz
             scores = head[:, 4:4 + nc, :]
             if nc == 1:
@@ -4156,6 +4365,7 @@ def _direct_predict_stream(
                         f'direct predict: payload construction failed for {source_label}; '
                         'set YOLO_TTA_DIRECT_PREDICT=0 to use model.predict'
                     )
+                result_ordinal += 1
                 yield _DirectPredictResult(payload)
     if (getattr(source, '_tta_announce_prediction', True) or failed_probes
             or kernel_counts['synchronized'] or kernel_counts['scalar_workspace_fallback']):
@@ -4317,6 +4527,7 @@ def predict_source_and_accumulate(
                 channel_token=str(cfg.channel_token),
                 context=f'initialized prediction backend for {source_label}',
             )
+            results = _stock_results_with_forward_replay(results, model, source, cfg)
 
         worker_count = max(1, min(int(postprocess_workers), int(num_frames)))
         pending_limit = cpu_mask_postprocess_pending_limit(worker_count, int(num_frames))
@@ -4365,6 +4576,9 @@ def predict_source_and_accumulate(
                 f'{source_label}: the D1 fast path requires a task-local device union; '
                 'disable YOLO_TTA_V1613_FAST_BUNDLE to use host-dense compatibility'
             )
+        producer_sink = _native_fanout_for_source(source)
+        if producer_sink is not None:
+            producer_sink.device_counts = device_union is not None
 
         # A capable resident batch-1 TensorRT source runs render, inference, confidence
         # compaction, proto union, and destination warping as one device pipeline. Every
@@ -4885,6 +5099,7 @@ def predict_source_and_submit_accumulation(
                 channel_token=str(cfg.channel_token),
                 context=f'initialized prediction backend for {source_label}',
             )
+            results = _stock_results_with_forward_replay(results, model, source, cfg)
 
         stream_cleanup = bool(streaming_cleanup_enabled)
         stream_backend = _prediction_cleanup.cleanup_backend() if stream_cleanup else ''

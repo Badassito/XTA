@@ -40,7 +40,7 @@ def prepare_endpoints(args):
         "detector_sha256":hashlib.sha256(args.detector.read_bytes()).hexdigest(),"imgsz":args.imgsz,"conf":args.conf,
         "labels_used":False,"coordinate_contract":"Native fullimageTYX; squareletterbox detector then exactdeclared nearest mask restoration","frames":{}}
     diagnostic=helper()
-    with diagnostic.gpu_lock(Path(r"C:\Users\Bry\Documents\ChatGPT\Scratch\Temp\GPU_LOCK"),"sam_crop_strategies_native_endpoints"),diagnostic.resource_monitor(args.output/"endpoint_resources.json",args.device):
+    with diagnostic.gpu_lock(Path.home() / "Documents/ChatGPT/Scratch/Temp/GPU_LOCK","sam_crop_strategies_native_endpoints"),diagnostic.resource_monitor(args.output/"endpoint_resources.json",args.device):
         import torch
         from ultralytics import YOLO
         start=time.perf_counter()
@@ -173,7 +173,7 @@ def run_strategies(args):
             "command":sys.argv}
     # Whole/tile run requests stay in fixed crop groups, preserving normal
     # prompt-independent feature reuse without sharing object/session state.
-    with diagnostic.gpu_lock(Path(r"C:\Users\Bry\Documents\ChatGPT\Scratch\Temp\GPU_LOCK"),"sam_crop_strategies_paired_real_model"),diagnostic.resource_monitor(args.output/"sam_resources.json",args.device):
+    with diagnostic.gpu_lock(Path.home() / "Documents/ChatGPT/Scratch/Temp/GPU_LOCK","sam_crop_strategies_paired_real_model"),diagnostic.resource_monitor(args.output/"sam_resources.json",args.device):
         for repeat in range(args.repeats):
             families=selected_families(plan, repeat, args.family)
             if not families:

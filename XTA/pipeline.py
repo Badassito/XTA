@@ -29,6 +29,7 @@ from concurrent.futures import (
     wait,
 )
 from pathlib import Path
+from uuid import uuid4
 from typing import (
     Callable,
     Dict,
@@ -51,6 +52,7 @@ from .config import (
     GIB,
     SCRIPT_VERSION,
     build_argparser,
+    confidence_sweep_branch_cutoff,
     quantize_display,
     resolve_auto_positive_int,
     resolve_backend_batches,
@@ -71,6 +73,7 @@ from .config import (
     tilted_group_base_views,
 )
 from .experimental_features import experimental_features_snapshot
+from .sweep_view_schedule import SweepViewSchedule
 from .workspace import (
     _cpu_count,
     _env_flag,
@@ -858,6 +861,18 @@ def _main_impl() -> None:
     runtime_trace_event('startup_pipeline_begin')
     parser = build_argparser()
     args = parser.parse_args()
+    if args.conf_sweep is not None:
+        # Embedded callers may enter through pipeline.main() directly.
+        from .cli import _run_tta
+        _run_tta(sys.argv[1:])
+        return
+    sweep_cutoff = confidence_sweep_branch_cutoff()
+    sweep_branch = None
+    if sweep_cutoff is not None:
+        sweep_id = os.environ.get('XTA_YOLO_SWEEP_ID', '')
+        if not sweep_id or args.conf != sweep_cutoff / 100:
+            raise ValueError('Confidence sweep branch identity disagrees with its scalar --conf')
+        sweep_branch = {'sweep_id': sweep_id, 'cutoff_hundredths': sweep_cutoff}
     configure_component_replay_capture(
         args.capture_component_replay,
         view_names=args.capture_component_views or (
@@ -937,6 +952,8 @@ def _main_impl() -> None:
     input_path = Path(args.input).expanduser().resolve()
     if not input_path.exists():
         raise FileNotFoundError(input_path)
+    from .forward_replay import bind_main_replay_source, sweep_source_stamp
+    forward_source_stamp = sweep_source_stamp(input_path)
 
     try:
         backend_models = resolve_backend_models(args.model)
@@ -996,7 +1013,12 @@ def _main_impl() -> None:
             from .sam_policy import resolve_sam_bridge_policy
             resolve_sam_bridge_policy(reconciliation_policy,
                 generation_mode=interpolation_settings.sam_crop_mode)
-        args.reconciliation_retain_confidence = reconciliation_settings.enabled
+        from .confidence_retention import confidence_retention_requested
+        args.retain_observed_confidence = confidence_retention_requested(
+            save_option_set, reconciliation_enabled=reconciliation_settings.enabled,
+            sweep_cutoff=sweep_cutoff)
+        # Existing worker/allocation/retirement paths share this internal flag.
+        args.reconciliation_retain_confidence = args.retain_observed_confidence
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
     augmentation_support_records: List[Dict[str, object]] = []
@@ -1432,7 +1454,7 @@ def _main_impl() -> None:
         v1613_bundle_reasons.append('requires task-local GPU device unions')
 
 
-    if args.min_conf > 0 and args.min_conf < args.conf:
+    if sweep_branch is None and args.min_conf > 0 and args.min_conf < args.conf:
         raise ValueError('--min_conf must be equal to or greater than --conf')
     if int(args.interpolation_distance) < 0:
         raise ValueError('--interpolation_distance must be >= 0')
@@ -1469,12 +1491,34 @@ def _main_impl() -> None:
 
     out_dir = Path(args.output).expanduser().resolve() if args.output else (Path.cwd() / input_path.stem)
     out_dir.mkdir(parents=True, exist_ok=True)
+    sweep_fanout_plan = SweepViewSchedule(args, cutoff=sweep_cutoff, tiles=tile_configs,
+        save_options=save_option_set, interpolation=interpolation_settings,
+        gpu=gpu_worker_process_active, cpu=cpu_worker_process_active,
+        reconciliation_mode=reconciliation_policy['mode'] if reconciliation_policy else None)
+    sweep_fanout_progress = sweep_fanout_plan.progress
+    if sweep_fanout_plan.role is not None:
+        from .tta_sweep_view_publication import branch_run_id
+        scalar_run_id = branch_run_id(sweep_branch['sweep_id'], sweep_cutoff)
+    else:
+        scalar_run_id = uuid4().hex
     from .confidence_evidence import configure_confidence_evidence
+    confidence_floor_by_backend = {}
+    if cpu_worker_process_active:
+        # OpenVINO instance decoding gates before union; semantic logits use --conf.
+        confidence_floor_by_backend['cpu'] = max(float(args.conf),
+            float(args.min_conf) if str(args.task) == 'segment' else 0.0)
+    if gpu_worker_process_active:
+        confidence_floor_by_backend['gpu'] = max(float(args.conf),
+            float(angle_variant_gpu_fastpath_min_conf_value or 0.0))
     configure_confidence_evidence(out_dir, enabled=args.reconciliation_retain_confidence,
+                                  run_id=scalar_run_id,
+                                  adopt_existing=os.environ.get('XTA_YOLO_SWEEP_NATIVE_ROLE') == 'consume',
                                   min_conf=float(args.min_conf),
+                                  prediction_task=str(args.task), confidence_floor=float(args.conf),
+                                  confidence_floor_by_backend=confidence_floor_by_backend,
                                   background_publication=True,
-                                  defer_projection=bool(reconciliation_settings.enabled
-                                      and reconciliation_policy['mode'] != 'confidence'))
+                                  defer_projection=not (reconciliation_settings.enabled
+                                      and reconciliation_policy['mode'] == 'confidence'))
 
     unified_launch_at_start = current_unified_launch()
     tta_artifact_identities: Optional[Dict[str, object]] = None
@@ -1488,6 +1532,7 @@ def _main_impl() -> None:
         # startup readers must join before decode or model execution can begin.
         startup_manifest = {
             'schema': TTA_RUN_MANIFEST_SCHEMA,
+            'run_id': scalar_run_id,
             'status': 'in_progress',
             'launcher': {
                 'name': str(unified_launch_at_start.launcher),
@@ -1501,6 +1546,13 @@ def _main_impl() -> None:
                 'selected output and resource-finalization stage succeeds.'
             ),
         }
+        if sweep_branch is not None:
+            sweep_branch.update(
+                sam_checkpoint_identity_sha256=sam_bundle.checkpoint_identity_sha256 if sam_bundle else None,
+                augmentation_policy_sha256=policy_settings.content_sha256 or None,
+                reconciliation_policy_sha256=reconciliation_settings.sha256 or None,
+            )
+            startup_manifest['confidence_sweep'] = sweep_branch
 
         def _capture_startup_artifacts():
             runtime_trace_event('startup_artifact_identity_start')
@@ -1602,6 +1654,7 @@ def _main_impl() -> None:
         layer_sink_for_run = NrrdLayerSink(
             nrrd_dir=nrrd_dir,
             stem=input_path.stem,
+            run_id=scalar_run_id,
             output_shape_tyx=(input_T, input_H, input_W),
             max_workers=nrrd_layer_sink_workers(),
             low_quality_specs=sink_low_quality_specs,
@@ -1611,6 +1664,20 @@ def _main_impl() -> None:
         set_nrrd_layer_sink(layer_sink_for_run)
     else:
         set_nrrd_layer_sink(None)
+
+    sweep_view_publication = None
+    if sweep_fanout_plan.eager_projection:
+        from .tta_sweep_view_publication import ViewMajorPublication
+        sweep_view_publication = ViewMajorPublication(
+            family_root=os.environ['XTA_YOLO_SWEEP_OUTPUT_ROOT'],
+            workspace=os.environ['XTA_YOLO_SWEEP_WORK_DIR'],
+            sweep_id=sweep_branch['sweep_id'], cutoffs_hundredths=sweep_fanout_plan.cutoffs,
+            current_cutoff=sweep_cutoff, scalar_sink=layer_sink_for_run,
+            source_shape_tyx=(input_T, input_H, input_W), model_name=model_name,
+            task=args.task, min_conf=args.min_conf,
+            confidence_floor_by_backend=confidence_floor_by_backend,
+            progress=sweep_fanout_progress)
+        _run_resources().track_closeable(sweep_view_publication)
 
     preprocess_streaming_active = bool(streaming_preprocess_enabled())
     vol_path = temp_dir / 'input_volume.gray8.dat'
@@ -1626,23 +1693,22 @@ def _main_impl() -> None:
     # workers can resident-upload the NATIVE decoded volume (t-resizing on device) without
     # a copy pass first.
     decode_prefer_memory = not bool(inference_worker_process_active)
+    decoder = decode_video_to_memmap_gray8_streaming if preprocess_streaming_active else decode_video_to_memmap_gray8
+    sweep_work = os.environ.get('XTA_YOLO_SWEEP_WORK_DIR') if sweep_branch is not None else None
+    input_volume_rgb = None
+    if sweep_work:
+        from .sweep_input import open_or_decode_sweep_input
+        input_volume_rgb = open_or_decode_sweep_input(
+            Path(sweep_work), input_path, input_processing_shape,
+            streaming=preprocess_streaming_active, decoder=decoder,
+        )
     if preprocess_streaming_active:
         print(
             'Streaming preprocessing active: ffmpeg decode returns its destination array immediately; '
             'Transverse/native consumers wait only for the needed decoded slice. Legacy cube resize, if explicitly enabled, also streams.'
         )
-        input_volume_rgb = decode_video_to_memmap_gray8_streaming(
-            input_video=input_path,
-            out_dat=vol_path,
-            num_frames=input_T,
-            width=input_W,
-            height=input_H,
-            overwrite=False,
-            prefer_memory=decode_prefer_memory,
-            prefer_memfd=bool(inference_worker_process_active and not decode_prefer_memory),
-        )
-    else:
-        input_volume_rgb = decode_video_to_memmap_gray8(
+    if input_volume_rgb is None:
+        input_volume_rgb = decoder(
             input_video=input_path,
             out_dat=vol_path,
             num_frames=input_T,
@@ -1701,22 +1767,22 @@ def _main_impl() -> None:
                 f'will avoid {volume_rgb.nbytes / GIB:.2f} GiB of host construction unless '
                 'a file-backed fallback requests it.'
             )
-        elif preprocess_streaming_active:
-            volume_rgb = resize_volume_to_processing_cube_gray8_streaming(
-                input_volume_rgb,
-                processing_shape,
-                temp_dir / 'input_volume.v950_cube.gray8.dat',
-                workers=max(1, default_worker_budget()),
-                prefer_memory=not bool(inference_worker_process_active),
-            )
         else:
-            volume_rgb = resize_volume_to_processing_cube_gray8(
-                input_volume_rgb,
-                processing_shape,
-                temp_dir / 'input_volume.v950_cube.gray8.dat',
-                workers=max(1, default_worker_budget()),
-                prefer_memory=not bool(inference_worker_process_active),
-            )
+            resize = (resize_volume_to_processing_cube_gray8_streaming if preprocess_streaming_active
+                      else resize_volume_to_processing_cube_gray8)
+            cube_workers = max(1, default_worker_budget())
+            volume_rgb = None
+            if sweep_work:
+                from .sweep_input import open_or_resize_sweep_cube
+                volume_rgb = open_or_resize_sweep_cube(
+                    Path(sweep_work), input_path, input_volume_rgb, processing_shape,
+                    streaming=preprocess_streaming_active, resize=resize, workers=cube_workers,
+                )
+            if volume_rgb is None:
+                volume_rgb = resize(
+                    input_volume_rgb, processing_shape, temp_dir / 'input_volume.v950_cube.gray8.dat',
+                    workers=cube_workers, prefer_memory=not bool(inference_worker_process_active),
+                )
     else:
         processing_shape = input_processing_shape
         volume_rgb = input_volume_rgb
@@ -1960,6 +2026,10 @@ def _main_impl() -> None:
     )
     cartesian_views = orthogonal_views_only(physical_views)
     inference_views = list(views)
+    sweep_fanout_plan.bind_views(inference_views, tta_artifact_identities, args)
+    scheduled_inference_views, fanout_consumers, fully_preprojected = sweep_fanout_plan.partition(
+        model_name, inference_views, lambda v: view_processing_volume_shape(v, int(args.imgsz)),
+        sweep_view_publication)
     from .d1_orthogonal_coverage import orthogonal_coverage_supported, ORTHOGONAL_COVERAGE_CONTRACT
     d1_categorical_coverage_eligible_by_view = {
         view.name: (orthogonal_coverage_supported(
@@ -2430,7 +2500,6 @@ def _main_impl() -> None:
             print('SAM gray capture disabled (YOLO_TTA_SAM_GRAY_CACHE=0); using source rendering.', flush=True)
         if gray_capture_enabled and gpu_worker_process_active and not path_is_memory_backed(temp_dir):
             from .gray_cache import gray_encoder_info
-            from uuid import uuid4
             gray_codec = gray_encoder_info()
             print(f"SAM gray capture codec: {gray_codec['backend']} "
                   f"({gray_codec['codec']}, level={gray_codec['level']}, "
@@ -2626,7 +2695,7 @@ def _main_impl() -> None:
         _parent_transient_bytes,
         'Parent view postprocess admission',
     )
-    if bool(getattr(args, 'reconciliation_retain_confidence', False)):
+    if not fully_preprojected and bool(getattr(args, 'reconciliation_retain_confidence', False)):
         from .confidence_orchestration import terminal_capture_budget
         from .confidence_evidence import configure_terminal_confidence_capture
         from .packed_tilted_projection import terminal_native_source_packing_eligible
@@ -2665,15 +2734,20 @@ def _main_impl() -> None:
     # A first call under inference/post-processing thread load can take minutes.
     # Serial on purpose: PTA can fork, and a fork during a background compile
     # would copy numba's held compiler lock into the child.
-    from .nrrd_sparse_kernels import warm_nrrd_producer_kernels
-    from .interpolation import warm_encoded_block_kernels
-    from .confidence_native_inflate import warm_confidence_inflate_kernels
-    kernel_warmups = [('nrrd_producer', warm_nrrd_producer_kernels),
-                      ('encoded_block', warm_encoded_block_kernels),
-                      ('confidence_inflate', warm_confidence_inflate_kernels)]
-    if any(is_azimuthal_view(candidate) for candidate in views):
-        from .projection_coverage_cpu import warm_angular_key_kernels
-        kernel_warmups.append(('angular_keys', warm_angular_key_kernels))
+    kernel_warmups = []
+    if not fully_preprojected:
+        from .nrrd_sparse_kernels import warm_nrrd_producer_kernels
+        from .interpolation import warm_encoded_block_kernels
+        from .confidence_native_inflate import warm_confidence_inflate_kernels
+        kernel_warmups = [('nrrd_producer', warm_nrrd_producer_kernels),
+                          ('encoded_block', warm_encoded_block_kernels),
+                          ('confidence_inflate', warm_confidence_inflate_kernels)]
+        if any(is_azimuthal_view(candidate) for candidate in views):
+            from .projection_coverage_cpu import warm_angular_key_kernels
+            kernel_warmups.append(('angular_keys', warm_angular_key_kernels))
+    else:
+        runtime_telemetry().gauge('sweep.prepublished_consumer.skipped_kernel_warmups', True)
+        print('Using prepublished views; final output kernels initialize on demand.', flush=True)
     for warm_name, warm in kernel_warmups:
         warm_started = time.perf_counter()
         warm_receipt = dict(warm())
@@ -2936,7 +3010,9 @@ def _main_impl() -> None:
     physical_view_finalization_stop = threading.Event()
 
     pending_prediction_build_jobs: deque[Tuple[str, ViewInfo, object]] = deque()
-    scheduled_inference_views = [view for view in inference_views if int(view.augmentation_pass) == 0]
+    if sweep_fanout_plan.role is not None:
+        # Join pending cross-cutoff writers before their sink/reader owners close.
+        _run_resources().track_closeable(sweep_fanout_plan)
     for view, aug_job in iter_aug_jobs_round_robin(scheduled_inference_views, aug_jobs_by_view):
         pending_prediction_build_jobs.append(('fullframe', view, aug_job))
         if dense_tiling_active:
@@ -5643,7 +5719,7 @@ def _main_impl() -> None:
             raise RuntimeError('inference-worker shared source volume has no reopenable backing path')
         return str(shared_backing), shape, str(np.asarray(shared_mm).dtype)
 
-    if inference_worker_process_active:
+    if inference_worker_process_active and scheduled_inference_views:
         gpu_worker_result_dir.mkdir(parents=True, exist_ok=True)
         # CUDA workers drive render/postprocess parallelism through their own thread pools.
         # so OpenCV must run each call
@@ -6131,6 +6207,8 @@ def _main_impl() -> None:
                     result_mode = 'file'
                 task = {
                     'task_id': int(next_task_id), 'kind': str(kind), 'model_name': str(model_name),
+                    'sweep_fanout_eligible': bool(sweep_fanout_plan.producer and kind == 'fullframe'),
+                    'sweep_fanout_identity': sweep_fanout_plan.identities.get(str(view.name)),
                     'cpu_eligible': bool(cpu_eligible), 'gpu_eligible': bool(gpu_eligible),
                     'view': view, 'job': job_obj, 'job_id': job_id, 'out_size': int(out_size),
                     'channel_format': channel_format,
@@ -6164,6 +6242,7 @@ def _main_impl() -> None:
                     ),
                     'slice_start': int(s0), 'slice_count': int(count),
                     'source_volume_path': source_volume_path, 'source_shape': list(source_volume_shape),
+                    'sweep_source_stamp': forward_source_stamp,
                     'source_dtype': source_volume_dtype,
                     'azimuthal_texture_required': bool(azimuthal_texture_required),
                     # native-volume residency spec + cube-ready sentinel
@@ -6959,6 +7038,12 @@ def _main_impl() -> None:
         _consume_policy_result_records(task, stats, _handle_fullframe_worker_result)
         view = task['view']
         model_name_s = str(task['model_name'])
+        if sweep_fanout_plan.producer:
+            sweep_fanout_plan.record_task(model_name_s, view, stats)
+            if fullframe_remaining[(model_name_s, str(view.name))] == 1:
+                sweep_fanout_plan.producer_view_ready(model_name_s, view,
+                    view_processing_volume_shape(view, int(args.imgsz)), sweep_view_publication,
+                    retain_empty_orthogonal=(task.get('result_mode') == 'd1_owner' and view.family == 'orthogonal'))
         view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(stats.get('prediction_count', 0))
         # accumulate device-side hole-filled slice counts toward the per-view skip.
         _filled = int(stats.get('device_hole_filled_frames', 0))
@@ -7416,6 +7501,10 @@ def _main_impl() -> None:
     _shutdown_inference_worker_processes = scheduler.shutdown_inference_worker_processes
 
     try:
+        if fanout_consumers and not scheduled_inference_views:
+            # All detector products are already published. SAM can independently
+            # claim its assigned devices without waiting on nonexistent workers.
+            _announce_process_inference_drain_if_complete()
         _pump_prediction_volume_build_queue()
         while True:
             if inference_worker_process_active:
@@ -7425,6 +7514,38 @@ def _main_impl() -> None:
             _drain_completed_prediction_volume_futures()
             _drain_completed_prediction_accumulation_futures()
             _drain_completed_background_futures()
+            if (fanout_consumers and not _process_inference_outstanding()
+                    and not view_processing_futures and not physical_view_finalization_futures
+                    and not physical_view_union_futures):
+                view, source = fanout_consumers.popleft()
+                key = (model_name, str(view.name))
+                fullframe_remaining[key] = 0
+                if source == 'projected':
+                    ref, predictions = sweep_view_publication.adopt_view(view)
+                    if ref is not None:
+                        nrrd_layer_refs.append(ref)
+                    view_processing_submitted.add(key)
+                    _mark_view_variant_terminal(*key)
+                else:
+                    from .sweep_views import hydrate
+                    _ensure_baseline_workspaces(model_name, view)
+                    metadata = hydrate(model_name, str(view.name), sweep_cutoff,
+                        baseline_union_by_model_view[key], baseline_confmap_by_model_view.get(key),
+                        identity=sweep_fanout_plan.identities.get(str(view.name)))
+                    predictions = metadata['prediction_count']
+                    view_slice_meta[key] = dict(valid=True, slice_any=metadata['slice_any'],
+                        slice_bboxes=metadata['slice_bboxes'], row_metadata_complete=False)
+                    # Concurrent later-cut children may still read these shared
+                    # payloads; the family owner then removes the workspace.
+                    if (sweep_cutoff == sweep_fanout_plan.cutoffs[-1]
+                            and os.environ.get('XTA_YOLO_SWEEP_DEFER_NATIVE_RETIREMENT') != '1'):
+                        from .sweep_views import retire_view_payloads
+                        retire_view_payloads(model_name, str(view.name), sweep_fanout_plan.cutoffs,
+                            identity=sweep_fanout_plan.identities.get(str(view.name)), terminal_state='consumed')
+                    _submit_view_prepare(model_name, view)
+                view_prediction_stats[str(view.summary_family)] += int(predictions)
+                sweep_fanout_plan.consumed += 1
+                continue
             _pump_prediction_volume_build_queue()
             _warmup_ready_prediction_sources()
 
@@ -7436,6 +7557,8 @@ def _main_impl() -> None:
 
             if (not inference_worker_process_active) and ready_fullframe:
                 view, job, prediction_ref = ready_fullframe.popleft()
+                if forward_source_stamp:
+                    bind_main_replay_source(prediction_ref, forward_source_stamp, view, job, args.imgsz)
                 print(f"Inferencing full-frame in-memory volume: {view.name}/{job.aug_id}")
                 view_mask_shape = view_processing_volume_shape(view, int(args.imgsz))
                 processing_affine = output_to_view_processing_affine(
@@ -7528,6 +7651,8 @@ def _main_impl() -> None:
                     prediction_ref = _maybe_eager_stage_prediction_ref(
                         _make_streaming_tile_ref(view, tile_job)
                     )
+                if forward_source_stamp:
+                    bind_main_replay_source(prediction_ref, forward_source_stamp, view, tile_job, args.imgsz)
 
                 print(f"Inferencing tile in-memory volume: {model_name}/{view.name}/{tile_job.tile_id}")
                 parent_processing_shape = view_processing_volume_shape(view, int(args.imgsz))
@@ -7857,6 +7982,7 @@ def _main_impl() -> None:
                     _check_inference_workers_alive()
                     continue
                 scheduler_quiescent = bool(
+                    not fanout_consumers and
                     not (detector_workspace_preparation is not None and detector_workspace_preparation.pending) and
                     not pending_prediction_build_jobs and
                     not pending_prediction_volume_futures and
@@ -8137,6 +8263,16 @@ def _main_impl() -> None:
     from .confidence_evidence import drain_confidence_publication
     runtime_telemetry().gauge('confidence.publication', drain_confidence_publication())
 
+    sweep_fanout_plan.close()
+    if sweep_view_publication is not None:
+        sweep_view_publication.finish_floor()
+        sweep_fanout_plan.failures.update(sweep_view_publication.geometry_fallbacks)
+    if sweep_fanout_plan.role is not None:
+        sweep_branch['upstream_fanout'] = sweep_fanout_plan.summary(len(inference_views))
+        if sweep_view_publication is not None and sweep_view_publication.geometry_fallbacks:
+            sweep_branch['upstream_fanout']['projection_fallbacks'] = dict(sweep_view_publication.geometry_fallbacks)
+        if sweep_fanout_progress is not None:
+            sweep_fanout_progress.finish('producer_complete', **sweep_branch['upstream_fanout'])
     scheduler_result = scheduler.result()
     if scheduler.d1_owner_groups_requested():
         d1_summary = scheduler.d1_group_summary()
@@ -8575,6 +8711,7 @@ def _main_impl() -> None:
             pass_index=0,
             stage='final_output_after_all_postprocessing',
             description='Final binary output after view/tile union, optional smoothing, optional keep_objects, and geometry restoration. Not intended for recomposition.',
+            include_empty=True,
             temp_dir=temp_dir,
             workers=int(tail_slice_workers),
             # nothing mutates the final volume after this point (overlay/video
@@ -8590,9 +8727,11 @@ def _main_impl() -> None:
     final_paths: Dict[str, Path] = {}
     if reconciliation_report is not None:
         final_paths['reconciliation_manifest'] = out_dir / 'reconciliation' / 'manifest.json'
-        confidence_manifest = out_dir / 'reconciliation_evidence' / 'manifest.json'
-        if confidence_manifest.is_file():
-            final_paths['confidence_evidence_manifest'] = confidence_manifest
+    from .confidence_retention import published_confidence_manifest
+    confidence_manifest = (published_confidence_manifest(out_dir)
+                           if args.retain_observed_confidence else None)
+    if confidence_manifest is not None:
+        final_paths['confidence_evidence_manifest'] = confidence_manifest
 
 
     native_final_outputs_requested = bool(
@@ -8925,6 +9064,14 @@ def _main_impl() -> None:
             },
             prediction_processing={
                 'owner': 'tta_only',
+                'observed_confidence': (
+                    {'retained': True, 'generated_only_support': 'unknown',
+                     'prediction_confidence_threshold': float(args.conf),
+                     'capture_confidence_floor_by_backend': confidence_floor_by_backend,
+                     'component_min_conf': float(args.min_conf),
+                     'prediction_task': str(args.task),
+                     'manifest': str(confidence_manifest) if confidence_manifest is not None else None}
+                    if args.retain_observed_confidence else None),
                 'reconciliation': (
                     {'policy_path': reconciliation_settings.path, 'policy_sha256': reconciliation_settings.sha256,
                      'name': reconciliation_report['policy']['name'],
@@ -9018,6 +9165,9 @@ def _main_impl() -> None:
 
 
     if run_manifest is not None:
+        run_manifest['run_id'] = scalar_run_id
+        if sweep_branch is not None:
+            run_manifest['confidence_sweep'] = sweep_branch
         run_manifest['status'] = 'incomplete' if sam_planning_omissions else 'complete'
         run_manifest['sam_requested_work_complete'] = not bool(sam_planning_omissions)
         run_manifest['sam_planning_omissions'] = sam_planning_omissions

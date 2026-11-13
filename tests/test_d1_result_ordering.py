@@ -58,6 +58,8 @@ class _HandlerHarness:
             _submit_view_prepare=self.prepare, view_processing_submitted=set(),
             view_slice_meta={self.key: {'pending': True}},
             _mark_view_variant_terminal=self.terminal,
+            # Scalar (non-sweep) run: the confidence-sweep producer hooks are inert.
+            sweep_fanout_plan=SimpleNamespace(producer=False), sweep_view_publication=None,
         )
         exec(_handler_program(source_text or inspect.getsource(pipeline._main_impl)), self.env)
         self.handle = self.env['_handle_fullframe_worker_result']
