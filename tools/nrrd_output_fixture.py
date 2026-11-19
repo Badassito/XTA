@@ -2,6 +2,8 @@
 
 The converter holds one decoded TYX plane at a time. It refuses to replace an
 existing fixture and verifies the CVOL by decoding one plane at a time again.
+A cropped layer (segment bounding box placed by Slicer's reference-extent offset)
+is expanded onto its reference grid, so both stored layouts give the same fixture.
 """
 from __future__ import annotations
 
@@ -23,8 +25,10 @@ from XTA.interpolation import (  # noqa: E402
     IncrementalRawBBoxMaskStoreWriter,
     RawBBoxMaskStore,
 )
+from tools.nrrd_reference_grid import iter_reference_slabs, raster_from_fields  # noqa: E402
 
-SCRATCH = Path.home() / 'Documents' / 'ChatGPT' / 'Scratch'
+# Generated fixtures stay in the repository's sibling Scratch workspace, like the other tools' evidence.
+SCRATCH = ROOT.parent / 'Scratch'
 MAX_HEADER_BYTES = 1024 * 1024
 
 
@@ -81,45 +85,37 @@ def convert(source_path: Path, output_dir: Path) -> dict[str, object]:
     store_dir = output_dir / 'fixture.cvol'
     receipt_path = output_dir / 'receipt.json'
 
-    writer = None
     with source_path.open('rb') as handle:
         fields, payload_offset = read_header(handle)
-        x, y, t = (int(value) for value in fields['sizes'].split())
-        shape_tyx = (t, y, x)
-        plane_bytes = x * y
-        decoded_plane = bytearray(plane_bytes)
-        plane_view = memoryview(decoded_plane)
-        plane_array = np.frombuffer(decoded_plane, dtype=np.uint8).reshape((y, x))
-        decoded_hash = hashlib.sha256()
-        writer = IncrementalRawBBoxMaskStoreWriter(
-            shape=shape_tyx,
-            store_dir=store_dir,
-            format_name=INTERNAL_PACKED_CVOL_FORMAT,
-            desc=f'production NRRD fixture {source_path.name}',
-            extra_meta={'fixture_source_name': source_path.name},
-        )
-        started = time.perf_counter()
-        try:
-            with gzip.GzipFile(fileobj=handle, mode='rb') as payload:
-                for z in range(t):
-                    read_exact_into(payload, plane_view)
-                    decoded_hash.update(plane_view)
-                    if int(plane_array.max()) > 1:
-                        raise ValueError(f'NRRD plane {z} contains values outside binary 0/1')
-                    writer.consume(z, plane_array[np.newaxis, :, :])
-                if payload.read(1):
-                    raise ValueError('NRRD gzip payload contains more voxels than its header declares')
-            stats = writer.finalize()
-        except BaseException:
-            writer.discard()
-            raise
-        decode_write_seconds = time.perf_counter() - started
-
-    source_extent = fields.get('Segment0_Extent')
-    parsed_source_extent = (
-        [int(value) for value in source_extent.split()]
-        if source_extent is not None else None
+    # Cropped layers store their segment box; planes are expanded onto the reference grid.
+    raster = raster_from_fields(source_path, fields, payload_offset)
+    t, y, x = raster.reference_shape
+    shape_tyx = (t, y, x)
+    plane_bytes = x * y
+    decoded_hash = hashlib.sha256()
+    writer = IncrementalRawBBoxMaskStoreWriter(
+        shape=shape_tyx,
+        store_dir=store_dir,
+        format_name=INTERNAL_PACKED_CVOL_FORMAT,
+        desc=f'production NRRD fixture {source_path.name}',
+        extra_meta={'fixture_source_name': source_path.name},
     )
+    started = time.perf_counter()
+    try:
+        # One reference plane at a time; the iterator also rejects trailing payload bytes.
+        for z, plane in iter_reference_slabs(raster, 1):
+            decoded_hash.update(memoryview(plane).cast('B'))
+            if int(plane.max()) > 1:
+                raise ValueError(f'NRRD plane {z} contains values outside binary 0/1')
+            writer.consume(z, plane)
+        stats = writer.finalize()
+    except BaseException:
+        writer.discard()
+        raise
+    decode_write_seconds = time.perf_counter() - started
+
+    source_extent = raster.reference_segment_extent()
+    parsed_source_extent = list(source_extent) if source_extent is not None else None
     produced_extent = [int(value) for value in stats['segment_extent_ijk']]
     if parsed_source_extent is not None and parsed_source_extent != produced_extent:
         raise ValueError(
@@ -147,6 +143,8 @@ def convert(source_path: Path, output_dir: Path) -> dict[str, object]:
         'source_name': source_path.name,
         'source_bytes': source_path.stat().st_size,
         'source_header_bytes': payload_offset,
+        'source_stored_shape_tyx': list(raster.stored_shape),
+        'source_stored_offset_tyx': list(raster.offset_tyx),
         'shape_tyx': list(shape_tyx),
         'logical_bytes': t * plane_bytes,
         'segment_extent_ijk': produced_extent,
@@ -167,7 +165,8 @@ def convert(source_path: Path, output_dir: Path) -> dict[str, object]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--source', required=True, type=Path, help='Saved full-quality uint8 gzip NRRD')
+    parser.add_argument('--source', required=True, type=Path,
+                        help='Saved full-quality uint8 gzip NRRD (full or cropped layer layout)')
     parser.add_argument('--output-dir', required=True, type=Path, help='New task-specific Scratch directory')
     args = parser.parse_args()
     print(json.dumps(convert(args.source, args.output_dir), sort_keys=True), flush=True)

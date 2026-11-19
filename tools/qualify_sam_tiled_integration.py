@@ -157,7 +157,7 @@ def seam(args):
         processing_cli_cube_stage_executed=False, original_observation_source=fixture["observation_source"],
         image_sha256=fixture["image_sha256"], original_input_sha256=fixture["parent_observations_sha256"],
         labels_used=False, outer_crop_rules_changed=False)
-    with diagnostic.gpu_lock(Path.home() / "Documents/ChatGPT/Scratch/Temp/GPU_LOCK",
+    with diagnostic.gpu_lock(args.gpu_lock,
             "sam_tiled_real_native_assembly"), diagnostic.resource_monitor(runroot / "resources.json", 0):
         backprojection._configure_main_process_gpu_stage_workers((0,))
         backprojection._set_main_process_gpu_inference_priority_active(False)
@@ -306,7 +306,10 @@ def main():
     p.add_argument("--crop-mode", choices=("whole","tiled"), default="whole")
     p.add_argument("--policy", choices=("stock","raw"), default="stock")
     p.add_argument("--run-label", help="Fresh artifact directory name; preserves prior attempts")
+    p.add_argument("--gpu-lock", type=Path, help="Shared GPU reservation file; required by the seam stage")
     args = p.parse_args()
+    if args.stage == "seam" and args.gpu_lock is None:
+        p.error("--gpu-lock is required for the seam stage")
     if args.stage == "prepare":
         prepare(args)
     elif args.stage == "derive":

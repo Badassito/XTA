@@ -20,6 +20,7 @@ def main():
     p.add_argument("--cache-mib",nargs="+",type=int,default=(0,512,192))
     p.add_argument("--rounds",type=int,default=2)
     p.add_argument("--order",choices=("stored","group"),default="group")
+    p.add_argument("--gpu-lock",type=Path,required=True,help="Shared GPU reservation file")
     args=p.parse_args()
     source=args.source_root.resolve()
     sys.path.insert(0,str(source))
@@ -60,7 +61,7 @@ def main():
     assert Path(tracker_module.__file__).resolve().is_relative_to(source)
     result={"source":source_proof,"request_count":len(requests),"inventory":str(args.inventory),"request_order":args.order,"configs":[],
             "claim":"Heatsoaked local sanity timings; fixed complete jobs, masks/scores must exactly match frozen baseline; not target H100 performance"}
-    with diagnostic.gpu_lock(Path.home() / "Documents/ChatGPT/Scratch/Temp/GPU_LOCK","sam_improvements_cache_exact_and_warm"),diagnostic.resource_monitor(args.output/"resources.json",0):
+    with diagnostic.gpu_lock(args.gpu_lock,"sam_improvements_cache_exact_and_warm"),diagnostic.resource_monitor(args.output/"resources.json",0):
         for mib in args.cache_mib:
             kwargs=dict(model_path=args.model,device_ids=(0,),artifact_root=args.output/f"cache{mib}_runs",
                         source_cache_ref=cache,profile="egpu")

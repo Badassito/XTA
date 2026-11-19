@@ -11,6 +11,11 @@ import numpy as np
 
 
 def open_payload(path):
+    """Open a full-raster gzip NRRD's payload stream (e.g. the diagnostic written here).
+
+    Published TTA layers may store only their segment bounding box; read those through
+    the manifest reader in ``main`` (``open_manifest_layers`` + ``read_slab``) instead.
+    """
     stream = path.open('rb')
     fields = {}
     while line := stream.readline():
@@ -18,9 +23,17 @@ def open_payload(path):
             break
         if b':' in line and not line.startswith(b'#'):
             key, value = line.decode('ascii').split(':', 1)
-            fields[key] = value.strip()
-    assert fields['encoding'] == 'gzip', fields
+            fields[key] = value.strip().removeprefix('=').strip()
+    if fields.get('encoding') != 'gzip':
+        stream.close()
+        raise AssertionError(fields)
     shape = tuple(reversed(tuple(map(int, fields['sizes'].split()))))
+    if 'Segmentation_ReferenceImageExtentOffset' in fields:
+        extent = [int(value) for value in fields.get('Segmentation_ReferenceImageExtent', '').split()]
+        if fields['Segmentation_ReferenceImageExtentOffset'].split() != ['0', '0', '0'] or (
+                len(extent) != 6 or tuple(extent[2 * axis + 1] - extent[2 * axis] + 1 for axis in (2, 1, 0)) != shape):
+            stream.close()
+            raise ValueError(f'{path} stores a cropped box; decode it on its reference grid instead')
     return stream, gzip.GzipFile(fileobj=stream), shape
 
 
@@ -136,9 +149,12 @@ def main():
                         cache.popitem(last=False)
                 output |= _resize_binary_mask_frame_to_output_shape(cache[index], *shape[1:])
             return output != 0
-    owners = [open_payload(root / 'nrrd' / name) for name in names]
-    shape = owners[0][2]
-    assert all(owner[2] == shape for owner in owners)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from tools.nrrd_reference_grid import open_manifest_layers
+    # Offset-aware reader: cropped and full-raster layers yield identical reference planes.
+    collection = open_manifest_layers(manifest_path, filenames=names)
+    owners = list(collection)
+    shape = tuple(collection.shape_tyx)
     diagnostic = NewVoxelDiagnostic(args.new_voxels_output, shape) if args.new_voxels_output else None
     count = shape[1] * shape[2]
     totals = dict(detector_voxels=0, bridge_union_voxels=0, overlap_union_voxels=0,
@@ -146,7 +162,7 @@ def main():
     rows = []
     started = time.monotonic()
     for frame in range(shape[0]):
-        planes = [np.frombuffer(owner[1].read(count), dtype=np.uint8) for owner in owners]
+        planes = [owner.read_slab(frame, frame + 1).reshape(-1) for owner in owners]
         assert all(plane.size == count for plane in planes), frame
         original = planes[0] != 0
         bridges = [plane != 0 for plane in planes[1:]]
@@ -171,9 +187,7 @@ def main():
             rows.append(dict(frame=frame, detector=detector_count, bridge=bridge_count, overlap=overlap_count))
         if frame % 100 == 0:
             print(json.dumps(dict(frame=frame, seconds=round(time.monotonic()-started, 2))), flush=True)
-    for stream, payload, _ in owners:
-        payload.close()
-        stream.close()
+    collection.close()
     for owner in native_owners:
         owner.close()
     if native_reader is not None:

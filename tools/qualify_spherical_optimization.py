@@ -7,7 +7,6 @@ estimate of cluster throughput. All outputs and runtime files belong in Scratch.
 from __future__ import annotations
 
 import argparse
-import gzip
 import hashlib
 import json
 import os
@@ -41,39 +40,32 @@ def normalize(value):
 
 
 def decoded_layers(output):
-    """Read the pipeline's inline uint8 NRRDs without an optional PTA dependency."""
+    """Decode the pipeline's inline uint8 NRRDs on their reference grids.
+
+    Cropped (segment bounding box) and full-raster layers give identical records:
+    shape, SHA-256 and foreground describe reference-grid data, and the spatial
+    header's ``sizes``/``space origin`` are those of the reference grid (canonical
+    text), so A/B runs compare equal across stored layouts.
+    """
+    from tools.nrrd_reference_grid import inspect_reference_raster, read_reference_volume
+
     result = {}
     spatial_keys = ('space', 'space directions', 'space origin', 'sizes',
                     'kinds', 'space units', 'measurement frame', 'centers')
     for path in sorted((output / 'nrrd').glob('*.nrrd')):
-        raw = path.read_bytes()
-        boundary = re.search(b'\r?\n\r?\n', raw)
-        if boundary is None or not raw.startswith(b'NRRD'):
-            raise ValueError(f'Missing NRRD header: {path}')
-        header = {}
-        for line in raw[:boundary.start()].decode('ascii').splitlines():
-            if line.startswith('#') or ':' not in line:
-                continue
-            key, value = line.split(':', 1)
-            header[key.strip()] = value.strip()
-        if header.get('type') not in ('unsigned char', 'uchar', 'uint8', 'uint8_t'):
-            raise ValueError(f'Qualification expects uint8 NRRD: {path}')
-        if 'data file' in header or 'byte skip' in header or 'line skip' in header:
-            raise ValueError(f'Qualification expects inline NRRD payload: {path}')
-        sizes = tuple(map(int, header['sizes'].split()))
-        if len(sizes) != int(header['dimension']) or min(sizes) <= 0:
+        raster = inspect_reference_raster(path)
+        if raster.stored_shape is None:
             raise ValueError(f'Invalid NRRD sizes: {path}')
-        payload = raw[boundary.end():]
-        if header.get('encoding') in ('gzip', 'gz'):
-            payload = gzip.decompress(payload)
-        elif header.get('encoding') != 'raw':
-            raise ValueError(f'Unsupported NRRD encoding: {path}')
-        data = np.frombuffer(payload, dtype=np.uint8).reshape(sizes[::-1])
+        data = read_reference_volume(raster)
+        header = raster.fields
+        spatial = {key: normalize(header[key]) for key in spatial_keys if key in header}
+        spatial.update({key: value for key, value in raster.reference_spatial_fields().items()
+                        if key in spatial})
         result[path.name] = {
             'shape': list(data.shape), 'dtype': str(data.dtype),
             'sha256': hashlib.sha256(memoryview(data).cast('B')).hexdigest(),
             'foreground': int(np.count_nonzero(data)),
-            'spatial_header': {key: normalize(header[key]) for key in spatial_keys if key in header},
+            'spatial_header': spatial,
         }
     if not result or not any(item['foreground'] for item in result.values()):
         raise RuntimeError('Qualification requires nonempty decoded NRRD output')
@@ -81,15 +73,10 @@ def decoded_layers(output):
 
 
 def read_mask(path):
-    """Decode a validated inline uint8 output for a bounded difference audit."""
-    raw = path.read_bytes()
-    boundary = re.search(b'\r?\n\r?\n', raw)
-    header = raw[:boundary.start()].decode('ascii')
-    sizes = tuple(map(int, re.search(r'^sizes:\s*(.+)$', header, re.M)[1].split()))
-    payload = raw[boundary.end():]
-    if re.search(r'^encoding:\s*(gzip|gz)\s*$', header, re.M):
-        payload = gzip.decompress(payload)
-    return np.frombuffer(payload, np.uint8).reshape(sizes[::-1]) != 0
+    """Decode a validated inline uint8 output on its reference grid for a difference audit."""
+    from tools.nrrd_reference_grid import read_reference_volume
+
+    return read_reference_volume(path) != 0
 
 
 def compare_masks(reference_dir, candidate_dir, reference, candidate):

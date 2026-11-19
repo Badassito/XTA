@@ -347,3 +347,80 @@ def test_selected_native_scalar_requests_explicit_bounded_source_projection(tmp_
                           temp_dir=tmp_path/"work")
     assert result["stored_coordinate_space"] == "native_view_processing" and result["native_projection_applied"]
     np.testing.assert_array_equal(nrrd.read(str(destination),index_order="C")[0], native[1])
+
+
+def _layer_layout_run(root, layout):
+    """make_run whose compact masks are stock single-layer NRRDs in the given storage layout."""
+    import contextlib, io
+    from XTA import outputs
+    from XTA.interpolation import NrrdLayerRef
+    run, manifest, native, masks = make_run(root)
+    data = json.loads(manifest.read_text())
+    target = tuple(data["output_shape_tyx"])
+    boxes = ((slice(1, 3), slice(2, 7), slice(1, 6)), (slice(0, 4), slice(5, 8), slice(4, 8)))
+    for index, (row, box) in enumerate(zip(data["layers"], boxes)):
+        mask = np.zeros(target, np.uint8)
+        mask[box] = np.random.default_rng(index).random(mask[box].shape) < .7
+        mask[box][0, 0, 0] = mask[box][-1, -1, -1] = 1
+        masks[index] = mask
+        path = manifest.parent / row["filename"]
+        path.unlink()
+        ref = NrrdLayerRef(key=row["layer_key"], name=row["filename"], path=path.with_suffix(".live"), shape=target,
+                           storage_format="live_u8", live_array=mask)
+        with contextlib.redirect_stdout(io.StringIO()):
+            outputs.write_single_layer_nrrd_from_ref(ref, target, path, segment_name=row["filename"], layout=layout)
+        fields = dict(line.split(":=" if ":=" in line else ": ", 1) for line in
+                      path.read_bytes().split(b"\n\n", 1)[0].decode().splitlines()[1:] if not line.startswith("#"))
+        row["stored_shape_tyx"] = [int(v) for v in reversed(fields["sizes"].split())]
+        if layout == "cropped":
+            row["stored_offset_tyx"] = [int(v) for v in reversed(fields["Segmentation_ReferenceImageExtentOffset"].split())]
+            row["stored_layout"] = "segment_bounding_box"
+            assert row["stored_shape_tyx"] != list(target)
+    # An empty detector layer may be listed without a file; export writes it on the full grid.
+    missing = {**data["layers"][0], "filename": "missing_empty.seg.nrrd", "layer_key": "missing_empty",
+               "model_name": "model_absent", "empty_segment": True, "stored_shape_tyx": [1, 1, 1]}
+    if layout == "cropped":
+        missing.update(stored_offset_tyx=[0, 0, 0], stored_layout="segment_bounding_box")
+    data["layers"].append(missing)
+    data["layer_count"] = len(data["layers"])
+    manifest.write_text(json.dumps(data))
+    return run, manifest, native, masks
+
+
+def test_cropped_compact_masks_export_identically_to_full_grid_masks(tmp_path):
+    from XTA.reconciliation_io import read_layer_manifest
+    results = {}
+    for layout in ("full", "cropped"):
+        run, manifest, native, masks = _layer_layout_run(tmp_path / layout, layout)
+        output = tmp_path / f"export_{layout}"
+        report = export_compact_evidence(run, manifest, output, memory_mib=8)
+        portable = json.loads((output / "nrrd" / manifest.name).read_text())
+        rows = {row["filename"]: row for row in portable["layers"]}
+        scores = {}
+        for entry in json.loads((output / "reconciliation_evidence/manifest.json").read_text())["layers"]:
+            ref = ConfidenceEvidenceRef.open(output / "reconciliation_evidence" / entry["directory"])
+            scores[(entry["model_name"], entry["layer_key"])] = ref.reader()(0, masks[0].shape[0])
+        with read_layer_manifest(output / "nrrd" / manifest.name, workspace=tmp_path / f"work_{layout}",
+                                 include_all_layers=True) as collection:
+            decoded = {layer.metadata["filename"]: layer.read_slab(0, collection.shape_tyx[0]) for layer in collection}
+        results[layout] = report, rows, scores, decoded, masks, native
+    full_report, full_rows, full_scores, full_decoded, masks, native = results["full"]
+    report, rows, scores, decoded, cropped_masks, _ = results["cropped"]
+    assert [layer["known_voxels"] for layer in report["layers"]] == [
+        layer["known_voxels"] for layer in full_report["layers"]]
+    assert scores.keys() == full_scores.keys() and len(scores) == 3
+    for key, (values, known) in scores.items():
+        np.testing.assert_array_equal(values, full_scores[key][0])
+        np.testing.assert_array_equal(known, full_scores[key][1])
+    for index, mask in enumerate(masks):
+        np.testing.assert_array_equal(cropped_masks[index], mask)
+        np.testing.assert_array_equal(scores[(f"model_{index}", "shared_layer_key")][0], brute_pool(native[index], mask, mask.shape))
+    assert decoded.keys() == full_decoded.keys()
+    for filename, array in decoded.items():
+        np.testing.assert_array_equal(array, full_decoded[filename])
+    target = list(masks[0].shape)
+    rewritten, full_rewritten = rows["missing_empty.seg.nrrd"], full_rows["missing_empty.seg.nrrd"]
+    assert rewritten["stored_shape_tyx"] == full_rewritten["stored_shape_tyx"] == target
+    assert rewritten["stored_offset_tyx"] == [0, 0, 0] and rewritten["stored_layout"] == "full_reference"
+    assert "stored_offset_tyx" not in full_rewritten and "stored_layout" not in full_rewritten
+    assert rows["prediction_0.seg.nrrd"]["stored_layout"] == "segment_bounding_box"

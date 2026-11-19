@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import shutil
@@ -225,6 +226,21 @@ class SlicerEditsCutTests(unittest.TestCase):
         cut_preview[:, :, 2:] = 0
         reference = self.root / "original_grid.nrrd"
         prepare_pta_input.write_upscaled(reference, cut_preview, self.full_shape, 1)
+        actual = read_nrrd(self.root / "native_labels" / f"{self.video.stem}.nrrd")
+        np.testing.assert_array_equal(actual, read_nrrd(reference)[:, :, :6])
+
+    @unittest.skipUnless(importlib.util.find_spec("scipy") and importlib.util.find_spec("skimage"),
+                         "continuous_field requires SciPy and scikit-image")
+    def test_continuous_field_uses_original_lattice_for_cropped_bundle(self):
+        self.cut_successfully()
+        result, _ = self.run_prepare("continuous_field")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        cut_preview = self.canvases["sample_Global_final_output"].copy()
+        cut_preview[:, :, 2:] = 0
+        module, _ = prepare_pta_input.continuous_field_contract()
+        field, reference = self.root / "original_grid.field", self.root / "original_grid.nrrd"
+        module.build_field_reference(cut_preview, self.full_shape, field)
+        module.write_upscaled_nrrd(field, reference, native_shape_tyx=self.full_shape, block_mib=1)
         actual = read_nrrd(self.root / "native_labels" / f"{self.video.stem}.nrrd")
         np.testing.assert_array_equal(actual, read_nrrd(reference)[:, :, :6])
 

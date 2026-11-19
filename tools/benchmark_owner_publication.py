@@ -77,8 +77,11 @@ def main():
                               store_dir=work/'layer', model_name='fixture', view=view)
                     publication_s = time.perf_counter()-started
                     started = time.perf_counter()
+                    # Full-raster layout on purpose: payload digests/bytes stay comparable
+                    # with earlier receipts of this direct-writer benchmark.
                     outputs.write_layer_nrrd_with_low_quality_mirrors(result['d1_layer_ref'], shape,
-                              work/'native.nrrd', [(mirror, work/'mirror.nrrd')])
+                              work/'native.nrrd', [(mirror, work/'mirror.nrrd')],
+                              layout=outputs.NRRD_LAYER_LAYOUT_FULL)
                     nrrd_s = time.perf_counter()-started
                 hashes = {name: nrrd_payload_digest(work/f'{name}.nrrd') for name in ('native','mirror')}
                 if baseline is None:

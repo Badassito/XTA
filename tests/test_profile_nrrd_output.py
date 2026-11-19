@@ -47,12 +47,14 @@ def test_encoded_identity_reuses_exact_decoded_proof(tmp_path):
     assert decoded[first.name] == decoded[second.name] != decoded[different.name]
 
 
-def test_small_real_sink_path_decodes_exactly_in_both_modes(tmp_path):
+def test_small_real_sink_path_decodes_exactly_in_both_modes(tmp_path, monkeypatch):
     fake = ModuleType('deflate')
     fake.gzip_compress = lambda payload, level: gzip.compress(bytes(payload),
         compresslevel=min(9, max(1, int(level))), mtime=0)
-    with mock.patch.dict(sys.modules, {'deflate': fake}), \
-            mock.patch.dict('os.environ', {
+    # Replace only this key: patch.dict(sys.modules) would also evict modules first
+    # imported inside the block (e.g. numba), breaking later tests that re-import them.
+    monkeypatch.setitem(sys.modules, 'deflate', fake)
+    with mock.patch.dict('os.environ', {
                 'YOLO_TTA_NRRD_MEMBER_CODEC': 'libdeflate',
                 'YOLO_TTA_NRRD_GZIP_WORKERS': '2',
                 'YOLO_TTA_NRRD_FILL_WORKERS': '2',

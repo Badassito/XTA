@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import queue
+import re
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -700,6 +701,164 @@ def _nrrd_mask_orientation(
 
 
 
+_NRRD_REFERENCE_OFFSET_KEY = 'Segmentation_ReferenceImageExtentOffset'
+_NRRD_REFERENCE_EXTENT_KEY = 'Segmentation_ReferenceImageExtent'
+
+
+
+def _nrrd_header_integers(header, key, count, nrrd_path):
+    raw = header.get(key)
+    if raw is None:
+        return None
+    parts = str(raw).split()
+    if len(parts) != count or any(re.fullmatch(r'-?[0-9]+', part) is None for part in parts):
+        raise ValueError(f"Invalid NRRD {key} {raw!r}: {nrrd_path}")
+    return tuple(int(part) for part in parts)
+
+
+
+def _slicer_conversion_parameters(header):
+    """Slicer ``Segmentation_ConversionParameters`` as {name: value} (``name|value|help&...``)."""
+    raw = header.get('Segmentation_ConversionParameters')
+    parameters = {}
+    for entry in str(raw or '').split('&'):
+        name, _, rest = entry.partition('|')
+        if name.strip():
+            parameters[name.strip()] = rest.partition('|')[0].strip()
+    return parameters
+
+
+
+def _slicer_reference_geometry_shape(parameters, nrrd_path):
+    """Per-data-axis sizes of Slicer's saved reference image geometry, or None when unset.
+
+    The value is the IJK-to-RAS matrix (16 numbers) followed by the reference extent
+    ``0 X-1 0 Y-1 0 Z-1`` in the stored labelmap's axis order."""
+    value = parameters.get('Reference image geometry', '')
+    if not value:
+        return None
+    parts = [part for part in value.split(';') if part.strip()]
+    try:
+        numbers = [float(part) for part in parts]
+    except ValueError:
+        numbers = []
+    if (len(numbers) != 22 or not all(math.isfinite(number) for number in numbers)
+            or not all(number.is_integer() for number in numbers[16:])):
+        raise ValueError(f"Invalid Slicer reference image geometry {value!r}: {nrrd_path}")
+    extent = [int(number) for number in numbers[16:]]
+    if extent[0::2] != [0, 0, 0] or any(high < 0 for high in extent[1::2]):
+        raise ValueError(f"Slicer reference image geometry must start at voxel zero: {value!r}: {nrrd_path}")
+    return tuple(high + 1 for high in extent[1::2])
+
+
+
+def _nrrd_reference_crop(header, stored_shape, expected_shape_tyx, nrrd_path, *, indexed=False):
+    """Place a cropped segmentation raster inside its reference grid.
+
+    Returns None for a raster that already is its reference grid. Otherwise returns
+    ``(reference_shape, offset)`` in NRRD data-axis order. Cropped TTA layers and
+    Slicer's own seg.nrrd saves store only a box at
+    ``Segmentation_ReferenceImageExtentOffset``. The reference grid comes from XTA's
+    ``Segmentation_ReferenceImageExtent``, else Slicer's saved reference image
+    geometry, else the expected image grid mapped through the header axis directions
+    (an offset-only box is then pasted without --force resampling). Indexed 2D
+    correspondence needs a declared reference depth. A zero offset that cannot describe
+    a crop of the image grid (indexed mode, no axis directions, or a box larger than the
+    grid) is read as a complete raster, as before cropped layers existed.
+    """
+    stored_shape = tuple(int(value) for value in stored_shape)
+    offset = _nrrd_header_integers(header, _NRRD_REFERENCE_OFFSET_KEY, 3, nrrd_path)
+    extent = _nrrd_header_integers(header, _NRRD_REFERENCE_EXTENT_KEY, 6, nrrd_path)
+    if (offset is None and extent is None) or len(stored_shape) != 3:
+        return None
+    offset = (0, 0, 0) if offset is None else offset
+    parameters = _slicer_conversion_parameters(header)
+    if extent is not None:
+        if extent[0::2] != (0, 0, 0) or any(high < 0 for high in extent[1::2]):
+            raise ValueError(f"NRRD reference extent must start at voxel zero: {extent}: {nrrd_path}")
+        reference = tuple(high + 1 for high in extent[1::2])
+    else:
+        reference = _slicer_reference_geometry_shape(parameters, nrrd_path)
+    if reference is None:
+        complete_raster_if_zero = offset == (0, 0, 0)
+        if indexed:
+            if complete_raster_if_zero:
+                return None
+            raise ValueError(
+                f"A cropped NRRD segmentation without Segmentation_ReferenceImageExtent or a Slicer reference "
+                f"image geometry has no source depth for --nrrd_z_start_index: {nrrd_path}"
+            )
+        permutation = nrrd_header_to_internal_permutation(header)
+        if permutation is None:
+            if complete_raster_if_zero:
+                return None
+            raise ValueError(
+                f"Cropped NRRD segmentation has a reference offset but neither a reference extent nor "
+                f"axis directions to place it in the image grid: {nrrd_path}"
+            )
+        placed = [0, 0, 0]
+        for internal_axis, data_axis in enumerate(permutation):
+            placed[int(data_axis)] = int(expected_shape_tyx[internal_axis])
+        if complete_raster_if_zero and any(size > bound for size, bound in zip(stored_shape, placed)):
+            return None
+        reference = tuple(placed)
+    if any(start < 0 or start + size > bound for start, size, bound in zip(offset, stored_shape, reference)):
+        raise ValueError(
+            f"NRRD segmentation box {stored_shape} at reference offset {offset} lies outside its reference "
+            f"grid {reference} (NRRD axis order): {nrrd_path}"
+        )
+    if reference == stored_shape and offset == (0, 0, 0):
+        return None
+    if parameters.get('Oversampling factor', '1') not in ('1', '1.0'):
+        raise ValueError(f"Oversampled Slicer segmentation geometry is not a PTA mask grid: {nrrd_path}")
+    return reference, offset
+
+
+
+def _read_cropped_nrrd_planes(
+    stream, mask, summary, box_tyx, source_shape, source_planes, direct_read, nrrd_path,
+):
+    """Decode a stored box as if streaming its zero-filled reference grid.
+
+    ``box_tyx`` is ``(offset_tyx, stored_shape_tyx)`` in the internal reference grid.
+    Only box planes are read; all other reference voxels are zero."""
+    (box_t, box_y, box_x), (stored_t, stored_h, stored_w) = box_tyx
+    telemetry = runtime_telemetry()
+    if direct_read:
+        mask[:box_t] = 0
+        mask[box_t + stored_t:] = 0
+        step = max(1, (8 * 1024 * 1024) // max(1, stored_h * stored_w))
+        block = np.empty((min(step, stored_t), stored_h, stored_w), np.uint8)
+        for start in range(0, stored_t, step):
+            count = min(step, stored_t - start)
+            stored = block[:count]
+            _read_nrrd_bytes_into(stream, memoryview(stored).cast('B'), nrrd_path)
+            planes = mask[box_t + start:box_t + start + count]
+            with telemetry.span('pta.mask.nrrd_normalize'):
+                planes.fill(0)
+                np.greater(stored, 0, out=planes[:, box_y:box_y + stored_h, box_x:box_x + stored_w].view(np.bool_))
+                _record_plane_foreground(planes, summary, box_t + start)
+        return
+    xy_indices = _nrrd_mask_xy_indices(source_shape, mask.shape)
+    target_planes_by_source: Dict[int, List[int]] = {}
+    for target_z, source_z in enumerate(source_planes):
+        target_planes_by_source.setdefault(int(source_z), []).append(target_z)
+    plane = np.zeros(source_shape[1:], dtype=np.uint8)
+    window = plane[box_y:box_y + stored_h, box_x:box_x + stored_w]
+    stored_plane = np.empty((stored_h, stored_w), dtype=np.uint8)
+    for source_z in range(source_shape[0]):
+        if box_t <= source_z < box_t + stored_t:
+            _read_nrrd_bytes_into(stream, memoryview(stored_plane).cast('B'), nrrd_path)
+            window[:] = stored_plane
+        elif source_z == box_t + stored_t:
+            window[:] = 0
+        for target_z in target_planes_by_source.get(source_z, ()):
+            with telemetry.span('pta.mask.nrrd_resample'):
+                _write_nrrd_mask_plane(plane, mask[target_z], xy_indices)
+                _record_plane_foreground(mask[target_z:target_z + 1], summary, target_z)
+
+
+
 def _read_canonical_uint8_nrrd(
     nrrd_path, nrrd, expected_shape_tyx, *, force=False,
     source_contiguous=True, source_plane_indices=None,
@@ -717,6 +876,10 @@ def _read_canonical_uint8_nrrd(
         shape = tuple(int(x) for x in header['sizes'])
         if int(header.get('dimension', 0)) != len(shape) or any(x <= 0 for x in shape):
             raise ValueError(f'Invalid NRRD dimensions: {nrrd_path}')
+        # A cropped raster is oriented, resampled and summarized on its reference grid.
+        crop = _nrrd_reference_crop(header, shape, expected_shape_tyx, nrrd_path,
+                                    indexed=source_plane_indices is not None)
+        stored_shape, shape = shape, (shape if crop is None else crop[0])
         orientation, permutation = _nrrd_mask_orientation(
             header, shape, expected_shape_tyx, nrrd_path, force=force,
             source_contiguous=source_contiguous, source_plane_indices=source_plane_indices,
@@ -724,6 +887,10 @@ def _read_canonical_uint8_nrrd(
         if tuple(permutation) != (2, 1, 0):
             return None
         source_shape = tuple(shape[axis] for axis in permutation)
+        box_tyx = None if crop is None else (
+            tuple(int(crop[1][axis]) for axis in permutation),
+            tuple(int(stored_shape[axis]) for axis in permutation),
+        )
         source_planes = _nrrd_mask_source_planes(
             source_shape, expected_shape_tyx, nrrd_path, force=force,
             source_contiguous=source_contiguous, source_plane_indices=source_plane_indices,
@@ -738,7 +905,11 @@ def _read_canonical_uint8_nrrd(
         telemetry = runtime_telemetry()
         try:
             with telemetry.span('pta.mask.nrrd_payload_read'):
-                if direct_read:
+                if box_tyx is not None:
+                    _read_cropped_nrrd_planes(
+                        stream, mask, summary, box_tyx, source_shape, source_planes, direct_read, nrrd_path,
+                    )
+                elif direct_read:
                     # Normalize and summarize whole planes while they are still in cache.
                     step = max(1, (8 * 1024 * 1024) // mask[0].nbytes)
                     for start in range(0, len(mask), step):
@@ -892,6 +1063,13 @@ def _load_nrrd_mask_for_volume(
     else:
         data, header = nrrd.read(str(nrrd_path))
         arr = np.asarray(data)
+        crop = _nrrd_reference_crop(header, arr.shape, expected_shape_tyx, nrrd_path,
+                                    indexed=source_plane_indices is not None)
+        if crop is not None:
+            reference_shape, offset = crop
+            placed = np.zeros(reference_shape, dtype=arr.dtype)
+            placed[tuple(slice(start, start + size) for start, size in zip(offset, arr.shape))] = arr
+            arr = placed
         orientation, permutation = _nrrd_mask_orientation(
             header, arr.shape, expected_shape_tyx, nrrd_path, force=force,
             source_contiguous=source_contiguous, source_plane_indices=source_plane_indices,

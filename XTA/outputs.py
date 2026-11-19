@@ -1021,27 +1021,117 @@ def _nrrd_output_z_extent_for_source_extent(
     source_hi = max(0, min(int(source_z1), in_t_i - 1))
     if source_hi < source_lo:
         return None
-    first = -1
-    last = -1
-    for out_z in range(int(out_t_i)):
-        source_indices = _restore_source_indices_for_output_z(
-            int(in_t_i), int(out_t_i), int(out_z),
-        )
-        if not source_indices:
-            continue
-        if int(source_indices[-1]) < int(source_lo) or int(source_indices[0]) > int(source_hi):
-            continue
-        if first < 0:
-            first = int(out_z)
-        last = int(out_z)
-    return None if first < 0 else (int(first), int(last))
+    # Every output z reads a nonempty source interval; the cached per-z bounds are the
+    # restore map itself, so this mask selects exactly the z whose interval meets the
+    # extent. Each sink layer plans several extents; the per-z Python walk held the
+    # GIL for ~70 ms per full-resolution plan.
+    first_source, last_source = _nrrd_restore_source_bounds(int(in_t_i), int(out_t_i))
+    hits = np.flatnonzero((last_source >= int(source_lo)) & (first_source <= int(source_hi)))
+    return None if hits.size == 0 else (int(hits[0]), int(hits[-1]))
+
+@lru_cache(maxsize=64)
+def _nrrd_restore_source_bounds(in_t: int, out_t: int) -> Tuple[np.ndarray, np.ndarray]:
+    """First and last source z that ``_restore_source_indices_for_output_z`` reads per output z."""
+    first = np.empty(int(out_t), dtype=np.int64)
+    last = np.empty(int(out_t), dtype=np.int64)
+    for out_z in range(int(out_t)):
+        source_indices = _restore_source_indices_for_output_z(int(in_t), int(out_t), int(out_z))
+        first[out_z] = int(source_indices[0])
+        last[out_z] = int(source_indices[-1])
+    first.setflags(write=False)
+    last.setflags(write=False)
+    return first, last
+
+@lru_cache(maxsize=32)
+def _nrrd_mirror_targets_by_source(out_t: int, mirror_t: int) -> Tuple[Tuple[int, ...], ...]:
+    """For each full-quality output z, the mirror slices whose restore interval contains it."""
+    targets: List[List[int]] = [[] for _ in range(int(out_t))]
+    for mz in range(int(mirror_t)):
+        for sz in _restore_source_indices_for_output_z(int(out_t), int(mirror_t), int(mz)):
+            if 0 <= int(sz) < int(out_t):
+                targets[int(sz)].append(int(mz))
+    return tuple(tuple(v) for v in targets)
+
+NRRD_LAYER_LAYOUT_FULL = 'full'
+
+NRRD_LAYER_LAYOUT_CROPPED = 'cropped'
+
+def _normalized_nrrd_layer_layout(value: Optional[str]) -> str:
+    """Validate a per-layer NRRD storage layout; ``None`` keeps the historical full raster."""
+    if value is None:
+        return NRRD_LAYER_LAYOUT_FULL
+    text = str(value).strip().lower()
+    if text in (NRRD_LAYER_LAYOUT_FULL, NRRD_LAYER_LAYOUT_CROPPED):
+        return text
+    raise ValueError(
+        f'Unsupported NRRD layer layout {value!r}; expected '
+        f'{NRRD_LAYER_LAYOUT_CROPPED!r} or {NRRD_LAYER_LAYOUT_FULL!r}.'
+    )
+
+@dataclass(frozen=True)
+class NrrdStoredRasterPlan(NrrdRasterPlan):
+    """Raster plan whose stored box is placed inside its reference grid.
+
+    ``stored_offset_tyx`` is the reference index of the first stored voxel; it is
+    (0, 0, 0) for the full layout. ``segment_extent_xyt`` is relative to the stored
+    raster, matching Slicer's SegmentN_Extent convention for cropped files."""
+
+    stored_offset_tyx: Tuple[int, int, int] = (0, 0, 0)
+    reference_shape_tyx: Tuple[int, int, int] = (0, 0, 0)
+    layout: str = NRRD_LAYER_LAYOUT_FULL
+
+def _nrrd_plan_layout(plan: object) -> str:
+    return str(getattr(plan, 'layout', NRRD_LAYER_LAYOUT_FULL))
+
+def _nrrd_plan_offset(plan: object) -> Tuple[int, int, int]:
+    offset = getattr(plan, 'stored_offset_tyx', (0, 0, 0))
+    return (int(offset[0]), int(offset[1]), int(offset[2]))
+
+def _nrrd_cropped_box_for_extent(
+    segment_extent_xyt: NrrdSegmentExtent,
+    reference_shape_tyx: Tuple[int, int, int],
+) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+    """Return ``(stored_shape_tyx, offset_tyx)`` for one nonempty reference extent.
+
+    Slicer 5.12 aborts while loading a nonempty 1x1x1 cropped segmentation (a one-voxel
+    image is its empty-segmentation convention), so an all-singleton box is widened by one
+    neighbour voxel exactly like grouped_seg_nrrd._union_crop."""
+    ref_t, ref_h, ref_w = (int(v) for v in reference_shape_tyx)
+    sizes_xyt = (ref_w, ref_h, ref_t)
+    lo = [int(segment_extent_xyt[2 * axis]) for axis in range(3)]
+    hi = [int(segment_extent_xyt[2 * axis + 1]) for axis in range(3)]
+    for axis in range(3):
+        if not 0 <= lo[axis] <= hi[axis] < sizes_xyt[axis]:
+            raise ValueError(
+                f'NRRD segment extent {tuple(segment_extent_xyt)} lies outside the reference '
+                f'grid (t,Y,X)={tuple(reference_shape_tyx)}'
+            )
+    if lo == hi:
+        for axis, size in enumerate(sizes_xyt):
+            if size > 1:
+                if hi[axis] + 1 < size:
+                    hi[axis] += 1
+                else:
+                    lo[axis] -= 1
+                break
+    stored_shape_tyx = (hi[2] - lo[2] + 1, hi[1] - lo[1] + 1, hi[0] - lo[0] + 1)
+    return stored_shape_tyx, (lo[2], lo[1], lo[0])
 
 def _nrrd_raster_plan(
     ref: 'NrrdLayerRef',
     output_shape_tyx: Tuple[int, int, int],
+    *,
+    layout: Optional[str] = None,
 ) -> NrrdRasterPlan:
-    """Map a layer extent into an always-full output reference raster."""
+    """Map a layer extent into its stored raster within the output reference grid.
+
+    The full layout (default) stores the complete reference raster. The cropped layout
+    stores the mapped Slicer segment extent, which bounds every payload voxel (the
+    writer verifies this while streaming); an empty layer stores one zero voxel and an
+    unknown extent stores the full grid."""
     out_t, out_h, out_w = (int(v) for v in output_shape_tyx)
+    reference = (out_t, out_h, out_w)
+    resolved_layout = _normalized_nrrd_layer_layout(layout)
     raw_extent = _coerce_segment_extent(getattr(ref, 'segment_extent_ijk', None))
     empty = bool(
         raw_extent is not None
@@ -1056,11 +1146,435 @@ def _nrrd_raster_plan(
         if bool(empty)
         else _slicer_segment_extent_for_output(ref, output_shape_tyx)
     )
-    return NrrdRasterPlan(
-        stored_shape_tyx=(out_t, out_h, out_w),
-        segment_extent_xyt=segment_extent,
-        empty_segment=bool(empty),
+    if resolved_layout == NRRD_LAYER_LAYOUT_FULL:
+        return NrrdStoredRasterPlan(
+            stored_shape_tyx=reference,
+            segment_extent_xyt=segment_extent,
+            empty_segment=bool(empty),
+            stored_offset_tyx=(0, 0, 0),
+            reference_shape_tyx=reference,
+            layout=NRRD_LAYER_LAYOUT_FULL,
+        )
+    if bool(empty):
+        return NrrdStoredRasterPlan(
+            stored_shape_tyx=(1, 1, 1),
+            segment_extent_xyt=_nrrd_empty_segment_extent(),
+            empty_segment=True,
+            stored_offset_tyx=(0, 0, 0),
+            reference_shape_tyx=reference,
+            layout=NRRD_LAYER_LAYOUT_CROPPED,
+        )
+    stored_shape, offset_tyx = _nrrd_cropped_box_for_extent(segment_extent, reference)
+    off_t, off_y, off_x = offset_tyx
+    local_extent: NrrdSegmentExtent = (
+        int(segment_extent[0]) - off_x, int(segment_extent[1]) - off_x,
+        int(segment_extent[2]) - off_y, int(segment_extent[3]) - off_y,
+        int(segment_extent[4]) - off_t, int(segment_extent[5]) - off_t,
     )
+    return NrrdStoredRasterPlan(
+        stored_shape_tyx=stored_shape,
+        segment_extent_xyt=local_extent,
+        empty_segment=False,
+        stored_offset_tyx=offset_tyx,
+        reference_shape_tyx=reference,
+        layout=NRRD_LAYER_LAYOUT_CROPPED,
+    )
+
+def _nrrd_layer_header(
+    plan: object,
+    reference_shape_tyx: Tuple[int, int, int],
+    *,
+    segment_name: str,
+    color_rgb: Tuple[float, float, float],
+) -> Dict[str, object]:
+    """Complete single-layer Slicer header for one raster plan.
+
+    Full-layout headers are byte-identical to the historical writer. Cropped headers
+    place ``space origin`` at the first stored voxel and record Slicer's
+    ``Segmentation_ReferenceImageExtentOffset`` plus the full reference extent."""
+    ref_t, ref_h, ref_w = (int(v) for v in reference_shape_tyx)
+    stored_t, stored_h, stored_w = (int(v) for v in getattr(plan, 'stored_shape_tyx'))
+    cropped = _nrrd_plan_layout(plan) == NRRD_LAYER_LAYOUT_CROPPED
+    off_t, off_y, off_x = _nrrd_plan_offset(plan)
+    header = nrrd_slicer_header((stored_t, stored_h, stored_w))
+    offset_note = f'stored_offset_tyx=({off_t},{off_y},{off_x}); ' if cropped else ''
+    header['content'] = (
+        'binary segmentation mask; '
+        f'reference_shape_tyx=({ref_t},{ref_h},{ref_w}); '
+        f'stored_shape_tyx=({stored_t},{stored_h},{stored_w}); '
+        f'{offset_note}exported_axes=(X,Y,t)'
+    )
+    if cropped:
+        directions = np.asarray(header['space directions'], dtype=np.float64)
+        reference_origin = np.asarray(header['space origin'], dtype=np.float64)
+        header['space origin'] = (
+            reference_origin
+            + np.asarray((off_x, off_y, off_t), dtype=np.float64) @ directions
+        )
+    header.update(slicer_segmentation_header_fields(
+        segment_name=segment_name,
+        color_rgb=color_rgb,
+        extent_xyt=getattr(plan, 'segment_extent_xyt'),
+    ))
+    if cropped:
+        header['Segmentation_ReferenceImageExtentOffset'] = f'{off_x} {off_y} {off_t}'
+        header['Segmentation_ReferenceImageExtent'] = (
+            f'0 {ref_w - 1} 0 {ref_h - 1} 0 {ref_t - 1}'
+        )
+    return header
+
+class NrrdCropExtentViolation(RuntimeError):
+    """Nonzero layer payload was found outside the planned stored box."""
+
+_NRRD_CROP_SMALL_ZERO_RUN_BYTES = 64 * 1024
+
+class _CroppedNrrdPayloadWriter:
+    """Forward one stored box of a reference-geometry C-order ``(t,Y,X)`` uint8 stream.
+
+    Producers keep emitting the reference stream (data, cached zero runs and
+    whole-slice members) exactly as for the full layout. Every byte position is mapped
+    into the box: zero runs collapse to their in-box length in O(1), data contributes
+    only its in-box rows/columns, and any nonzero byte outside the box raises
+    NrrdCropExtentViolation so the caller can republish the historical full raster.
+    The stream must be consumed by one writer thread at a time, like the inner writer."""
+
+    def __init__(
+        self,
+        inner: object,
+        reference_shape_tyx: Tuple[int, int, int],
+        offset_tyx: Tuple[int, int, int],
+        stored_shape_tyx: Tuple[int, int, int],
+        *,
+        logical_start: int = 0,
+        logical_stop: Optional[int] = None,
+        label: str = '',
+    ) -> None:
+        ref_t, ref_h, ref_w = (int(v) for v in reference_shape_tyx)
+        off_t, off_y, off_x = (int(v) for v in offset_tyx)
+        stored_t, stored_h, stored_w = (int(v) for v in stored_shape_tyx)
+        if (
+            min(ref_t, ref_h, ref_w, stored_t, stored_h, stored_w) <= 0
+            or min(off_t, off_y, off_x) < 0
+            or off_t + stored_t > ref_t or off_y + stored_h > ref_h or off_x + stored_w > ref_w
+        ):
+            raise ValueError(
+                f'Stored box offset={tuple(offset_tyx)} shape={tuple(stored_shape_tyx)} lies '
+                f'outside reference {tuple(reference_shape_tyx)}'
+            )
+        self.inner = inner
+        self.label = str(label)
+        self.minimum_input_bytes = max(1, int(getattr(inner, 'minimum_input_bytes', 1)))
+        self._height, self._width = ref_h, ref_w
+        self._plane = ref_h * ref_w
+        self._t0, self._t1 = off_t, off_t + stored_t
+        self._y0, self._y1 = off_y, off_y + stored_h
+        self._x0, self._x1 = off_x, off_x + stored_w
+        self._box_plane = stored_h * stored_w
+        total = ref_t * self._plane
+        self._start = int(logical_start)
+        self._stop = total if logical_stop is None else int(logical_stop)
+        if not 0 <= self._start <= self._stop <= total:
+            raise ValueError('Cropped NRRD stream range lies outside the reference payload')
+        self._position = self._start
+        self._expected_stored = self._box_bytes_before(self._stop) - self._box_bytes_before(self._start)
+        self._stored = 0
+        self._zero_pending = 0
+        # Pending in-box data as owned contiguous pieces; flushed as one owned member.
+        self._data_parts: List[np.ndarray] = []
+        self._data_bytes = 0
+        self._queued_nonzero = 0
+        self._source_owned = False
+        chunk = int(getattr(inner, 'chunk_bytes', 0) or nrrd_compression.nrrd_gzip_chunk_bytes())
+        self._buffer_limit = int(np.clip(chunk, 1024 * 1024, 16 * 1024 * 1024))
+        canonical = getattr(inner, 'write_canonical_zeros', None)
+        plain_zeros = getattr(inner, 'write_zeros', None)
+        if callable(canonical) and self.minimum_input_bytes == 1:
+            self._inner_zeros = canonical
+        elif callable(plain_zeros):
+            self._inner_zeros = plain_zeros
+        else:
+            self._inner_zeros = self._write_literal_zeros
+        self._finished = False
+
+    def _write_literal_zeros(self, nbytes: int) -> int:
+        remaining = int(nbytes)
+        block = bytes(min(remaining, 1024 * 1024))
+        while remaining > 0:
+            step = min(remaining, len(block))
+            self.inner.write(memoryview(block)[:step])
+            remaining -= step
+        return int(nbytes)
+
+    def _box_bytes_before(self, position: int) -> int:
+        """Number of stored-box bytes at reference stream positions below ``position``."""
+        t, rest = divmod(int(position), self._plane)
+        if t < self._t0:
+            return 0
+        if t >= self._t1:
+            return (self._t1 - self._t0) * self._box_plane
+        count = (t - self._t0) * self._box_plane
+        y, x = divmod(rest, self._width)
+        if y < self._y0:
+            return count
+        box_w = self._x1 - self._x0
+        if y >= self._y1:
+            return count + self._box_plane
+        return count + (y - self._y0) * box_w + min(max(x - self._x0, 0), box_w)
+
+    def _raise_outside_foreground(self) -> None:
+        raise NrrdCropExtentViolation(
+            f'NRRD layer {self.label or "<unnamed>"} has foreground outside its planned '
+            f'box t[{self._t0},{self._t1}) y[{self._y0},{self._y1}) x[{self._x0},{self._x1})'
+        )
+
+    def _write_owned(self, owned: np.ndarray) -> None:
+        """Hand one exclusively owned contiguous 1-D buffer to the inner writer.
+
+        Ownership transfer avoids a second detachment copy; pieces stay at most one
+        buffer limit so large in-box blocks still spread across compressor workers."""
+        owned_writer = getattr(self.inner, 'write_owned_known_nonzero', None)
+        step = int(self._buffer_limit)
+        for start in range(0, int(owned.size), step):
+            piece = owned[start:start + step]
+            if callable(owned_writer):
+                owned_writer(piece)
+            else:
+                self.inner.write(memoryview(piece))
+
+    def _flush_data(self) -> None:
+        if self._data_parts:
+            parts, self._data_parts, self._data_bytes = self._data_parts, [], 0
+            self._write_owned(parts[0] if len(parts) == 1 else np.concatenate(parts))
+
+    def _flush_zeros(self) -> None:
+        if self._zero_pending:
+            pending, self._zero_pending = self._zero_pending, 0
+            self._inner_zeros(int(pending))
+
+    def _queue_zeros(self, nbytes: int) -> None:
+        count = int(nbytes)
+        if count <= 0:
+            return
+        self._stored += count
+        if self._data_parts and count <= _NRRD_CROP_SMALL_ZERO_RUN_BYTES:
+            # A short in-box gap between data rows compresses inline more cheaply than
+            # an extra complete gzip member.
+            self._data_parts.append(np.zeros(count, dtype=np.uint8))
+            self._data_bytes += count
+            if self._data_bytes >= self._buffer_limit:
+                self._flush_data()
+            return
+        self._flush_data()
+        self._zero_pending += count
+
+    def _queue_data(self, values: np.ndarray) -> None:
+        count = int(values.size)
+        if count <= 0:
+            return
+        self._stored += count
+        self._flush_zeros()
+        if self._source_owned and values.flags.c_contiguous:
+            # The producer transferred this buffer (write_owned_known_nonzero) and the
+            # in-box piece is contiguous: hand the view on without copying.
+            owned = values.reshape(-1)
+        else:
+            # Exactly one copy: an ordinary writer may reuse its block, and the box is
+            # usually a strided view, so the compressor retains an owned contiguous copy.
+            owned = np.array(values, dtype=np.uint8, order='C', copy=True).reshape(-1)
+        self._queued_nonzero += int(np.count_nonzero(owned))
+        if count >= self._buffer_limit:
+            self._flush_data()
+            self._write_owned(owned)
+            return
+        self._data_parts.append(owned)
+        self._data_bytes += count
+        if self._data_bytes >= self._buffer_limit:
+            self._flush_data()
+
+    # Routing only extracts in-box pieces. write() proves nothing was dropped by
+    # comparing two fast contiguous nonzero counts instead of scanning strided
+    # out-of-box strips.
+    def _route_row_piece(self, y: int, x: int, piece: np.ndarray) -> None:
+        if y < self._y0 or y >= self._y1:
+            return
+        lo, hi = max(int(x), self._x0), min(int(x) + int(piece.size), self._x1)
+        if hi > lo:
+            self._queue_data(piece[lo - int(x):hi - int(x)])
+
+    def _route_rows(self, y: int, rows: np.ndarray) -> None:
+        lo, hi = max(int(y), self._y0), min(int(y) + int(rows.shape[0]), self._y1)
+        if hi > lo:
+            self._queue_data(rows[lo - int(y):hi - int(y), self._x0:self._x1])
+
+    def _route_planes(self, t: int, planes: np.ndarray) -> None:
+        lo, hi = max(int(t), self._t0), min(int(t) + int(planes.shape[0]), self._t1)
+        if hi > lo:
+            self._queue_data(planes[lo - int(t):hi - int(t), self._y0:self._y1, self._x0:self._x1])
+
+    def _route_partial_plane(self, t: int, rest: int, values: np.ndarray) -> None:
+        if t < self._t0 or t >= self._t1:
+            return
+        width = self._width
+        y, x = divmod(int(rest), width)
+        index = 0
+        total = int(values.size)
+        if x:
+            take = min(total, width - x)
+            self._route_row_piece(y, x, values[:take])
+            index, y = take, y + 1
+        rows = (total - index) // width
+        if rows:
+            self._route_rows(y, values[index:index + rows * width].reshape(rows, width))
+            index += rows * width
+            y += rows
+        if index < total:
+            self._route_row_piece(y, 0, values[index:])
+
+    def write(self, data: object) -> int:
+        return self._write_reference_bytes(data, owned=False)
+
+    def _write_reference_bytes(self, data: object, *, owned: bool) -> int:
+        if self._finished:
+            raise RuntimeError('Cannot write to a finished cropped NRRD payload stream')
+        self._source_owned = bool(owned)
+        if isinstance(data, np.ndarray):
+            values = np.ascontiguousarray(data).reshape(-1).view(np.uint8)
+        else:
+            values = np.frombuffer(memoryview(data).cast('B'), dtype=np.uint8)
+        total = int(values.size)
+        start = int(self._position)
+        if start + total > self._stop:
+            raise ValueError('Cropped NRRD payload stream received bytes beyond its declared range')
+        plane = self._plane
+        queued_before = int(self._queued_nonzero)
+        index = 0
+        while index < total:
+            t, rest = divmod(start + index, plane)
+            if rest == 0 and total - index >= plane:
+                count = (total - index) // plane
+                self._route_planes(
+                    t, values[index:index + count * plane].reshape(count, self._height, self._width),
+                )
+                index += count * plane
+                continue
+            take = min(total - index, plane - rest)
+            self._route_partial_plane(t, rest, values[index:index + take])
+            index += take
+        if int(np.count_nonzero(values)) != int(self._queued_nonzero) - queued_before:
+            self._raise_outside_foreground()
+        self._position = start + total
+        return total
+
+    def write_known_nonzero(self, data: object) -> int:
+        return self.write(data)
+
+    def write_owned_known_nonzero(self, data: object) -> int:
+        return self._write_reference_bytes(data, owned=True)
+
+    def write_zeros(self, nbytes: int) -> int:
+        if self._finished:
+            raise RuntimeError('Cannot write to a finished cropped NRRD payload stream')
+        count = int(nbytes)
+        if count < 0:
+            raise ValueError('A zero run cannot have negative length')
+        start = int(self._position)
+        if start + count > self._stop:
+            raise ValueError('Cropped NRRD payload stream received zeros beyond its declared range')
+        self._queue_zeros(self._box_bytes_before(start + count) - self._box_bytes_before(start))
+        self._position = start + count
+        return count
+
+    def write_aligned_zeros(self, nbytes: int) -> int:
+        return self.write_zeros(nbytes)
+
+    def write_canonical_zeros(self, nbytes: int) -> int:
+        return self.write_zeros(nbytes)
+
+    def finish(self) -> int:
+        """Flush pending bytes and prove the whole declared reference range arrived."""
+        if self._finished:
+            return int(self._stored)
+        if int(self._position) != int(self._stop) or int(self._stored) != int(self._expected_stored):
+            raise RuntimeError(
+                f'Cropped NRRD payload {self.label or "<unnamed>"} is incomplete: '
+                f'{self._position - self._start} of {self._stop - self._start} reference bytes, '
+                f'{self._stored} of {self._expected_stored} stored bytes'
+            )
+        self._flush_data()
+        self._flush_zeros()
+        self._finished = True
+        telemetry = runtime_telemetry()
+        telemetry.add('nrrd.layer_crop.reference_bytes', int(self._stop - self._start))
+        telemetry.add('nrrd.layer_crop.stored_bytes', int(self._stored))
+        return int(self._stored)
+
+def _nrrd_payload_writer_for_plan(
+    payload_writer: object,
+    plan: object,
+    reference_shape_tyx: Tuple[int, int, int],
+    z_start: int,
+    z_stop: int,
+    *,
+    label: str = '',
+) -> object:
+    """Return the inner writer for full plans, or a box-cropping adapter for cropped plans."""
+    if _nrrd_plan_layout(plan) != NRRD_LAYER_LAYOUT_CROPPED:
+        return payload_writer
+    ref_t, ref_h, ref_w = (int(v) for v in reference_shape_tyx)
+    plane = ref_h * ref_w
+    return _CroppedNrrdPayloadWriter(
+        payload_writer,
+        (ref_t, ref_h, ref_w),
+        _nrrd_plan_offset(plan),
+        tuple(int(v) for v in getattr(plan, 'stored_shape_tyx')),
+        logical_start=int(z_start) * plane,
+        logical_stop=int(z_stop) * plane,
+        label=label,
+    )
+
+def _record_nrrd_stored_plan(entry: Dict[str, object], plan: object, sink_layout: str) -> None:
+    """Write one plan's stored-raster fields into a manifest row.
+
+    Full-layout sinks keep the historical row keys exactly. Cropped sinks also record
+    ``stored_offset_tyx`` (reference index of the first stored voxel) so XTA readers can
+    place the box without parsing headers, plus the per-file ``stored_layout``."""
+    entry['stored_shape_tyx'] = [int(v) for v in getattr(plan, 'stored_shape_tyx')]
+    entry['empty_segment'] = bool(getattr(plan, 'empty_segment', False))
+    if str(sink_layout) == NRRD_LAYER_LAYOUT_CROPPED:
+        entry['stored_offset_tyx'] = [int(v) for v in _nrrd_plan_offset(plan)]
+        entry['stored_layout'] = (
+            'segment_bounding_box'
+            if _nrrd_plan_layout(plan) == NRRD_LAYER_LAYOUT_CROPPED else 'full_reference'
+        )
+
+def _finish_nrrd_payload_writer(writer: object) -> None:
+    if isinstance(writer, _CroppedNrrdPayloadWriter):
+        writer.finish()
+
+def _nrrd_cropped_zshard_bands(
+    ref: 'NrrdLayerRef',
+    out_t: int,
+    box_t0: int,
+    box_t1: int,
+    shard_count: int,
+) -> Tuple[List[Tuple[int, int]], Optional[List[int]]]:
+    """Partition the reference depth so every band owns part of the stored box.
+
+    Indexed cvol weights already ignore empty slices. Other sources split the box depth
+    evenly; the first/last bands absorb the (zero-skipped) slices outside the box."""
+    depth = max(0, int(out_t))
+    box_depth = max(1, int(box_t1) - int(box_t0))
+    count = max(1, min(int(shard_count), box_depth))
+    weighted, weights = _nrrd_layer_zshard_bands(ref, depth, count)
+    if weights is not None and sum(int(w) for w in weights) > 0:
+        return weighted, weights
+    bands = [
+        (int(box_t0) + i * box_depth // count, int(box_t0) + (i + 1) * box_depth // count)
+        for i in range(count)
+    ]
+    bands[0] = (0, bands[0][1])
+    bands[-1] = (bands[-1][0], depth)
+    return bands, None
 
 def _nrrd_mapped_extent_preserve_empty(
     ref: 'NrrdLayerRef', output_shape_tyx: Tuple[int, int, int],
@@ -1555,6 +2069,9 @@ def write_single_layer_nrrd_from_ref(
     block_consumer: Optional[Callable[[int, np.ndarray], None]] = None,
     sparse_consumer: Optional[Callable[[int, int, int, np.ndarray], None]] = None,
     z_shards: Optional[int] = None,
+    layout: Optional[str] = None,
+    raster_plan: Optional[NrrdRasterPlan] = None,
+    plan_receipt: Optional[Dict[str, NrrdRasterPlan]] = None,
 ) -> Path:
     """Write one component layer as its own single-layer 3D Slicer segmentation NRRD (X, Y, t).
 
@@ -1565,7 +2082,12 @@ def write_single_layer_nrrd_from_ref(
  libdeflate, ISA-L, or stdlib zlib; ``cpu`` opts out of QAT and IAA remains
  explicit-only. The Slicer segmentation fields make the file import as a Segmentation
  node; segment_name defaults to the output filename stem and segment_color to
- the deterministic palette pick for that name."""
+ the deterministic palette pick for that name.
+
+ ``layout`` selects the stored raster (``None``/``full``: the historical full reference
+ raster; ``cropped``: the segment bounding box). ``raster_plan`` pins a precomputed plan.
+ A cropped write that meets foreground outside its box is republished with the full
+ layout; ``plan_receipt[str(out_path)]`` records the plan actually written."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
     seg_name = str(segment_name) if segment_name else _slicer_segment_name_for_out_path(out_path)
@@ -1573,20 +2095,66 @@ def write_single_layer_nrrd_from_ref(
     # live-volume layers defer the segment-extent scan to THIS (background
     # sink) worker instead of blocking the producing thread with a store-encode pass.
     ref = _resolve_live_ref_extent(ref)
-    raster_plan = _nrrd_raster_plan(ref, (out_t, out_h, out_w))
-    stored_t, stored_h, stored_w = (int(v) for v in raster_plan.stored_shape_tyx)
-    header = nrrd_slicer_header((stored_t, stored_h, stored_w))
-    header['content'] = (
-        'binary segmentation mask; '
-        f'reference_shape_tyx=({out_t},{out_h},{out_w}); '
-        f'stored_shape_tyx=({stored_t},{stored_h},{stored_w}); exported_axes=(X,Y,t)'
+    plan = raster_plan if raster_plan is not None else _nrrd_raster_plan(
+        ref, (out_t, out_h, out_w), layout=layout,
     )
-    header.update(slicer_segmentation_header_fields(
-        segment_name=seg_name,
-        color_rgb=seg_color,
-        extent_xyt=raster_plan.segment_extent_xyt,
-    ))
-    z_chunk = _nrrd_full_slice_z_chunk(1, stored_w, stored_h, stored_t)
+    try:
+        _write_single_layer_nrrd_file(
+            ref, (out_t, out_h, out_w), out_path, plan,
+            segment_name=seg_name, segment_color=seg_color,
+            block_consumer=block_consumer, sparse_consumer=sparse_consumer,
+            z_shards=z_shards,
+        )
+    except NrrdCropExtentViolation as exc:
+        if _nrrd_plan_layout(plan) != NRRD_LAYER_LAYOUT_CROPPED:
+            raise
+        _announce_nrrd_crop_violation(out_path, exc)
+        # Mirror consumers fold with OR/max, so replaying the producer is idempotent.
+        plan = _nrrd_raster_plan(ref, (out_t, out_h, out_w), layout=NRRD_LAYER_LAYOUT_FULL)
+        _write_single_layer_nrrd_file(
+            ref, (out_t, out_h, out_w), out_path, plan,
+            segment_name=seg_name, segment_color=seg_color,
+            block_consumer=block_consumer, sparse_consumer=sparse_consumer,
+            z_shards=z_shards,
+        )
+    if plan_receipt is not None:
+        plan_receipt[str(out_path)] = plan
+    return out_path
+
+def _announce_nrrd_crop_violation(out_path: Path, exc: BaseException) -> None:
+    runtime_telemetry().add('nrrd.layer_crop.extent_violations', 1)
+    print(
+        f'Warning: {Path(out_path).name} has foreground outside its recorded segment '
+        f'extent ({exc}); republishing that layer on the full reference raster.',
+        flush=True,
+    )
+
+def _write_single_layer_nrrd_file(
+    ref: 'NrrdLayerRef',
+    output_shape: Tuple[int, int, int],
+    out_path: Path,
+    raster_plan: object,
+    *,
+    segment_name: str,
+    segment_color: Tuple[float, float, float],
+    block_consumer: Optional[Callable[[int, np.ndarray], None]],
+    sparse_consumer: Optional[Callable[[int, int, int, np.ndarray], None]],
+    z_shards: Optional[int],
+) -> Path:
+    out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
+    stored_t, stored_h, stored_w = (int(v) for v in raster_plan.stored_shape_tyx)
+    cropped = _nrrd_plan_layout(raster_plan) == NRRD_LAYER_LAYOUT_CROPPED
+    box_t0 = _nrrd_plan_offset(raster_plan)[0]
+    header = _nrrd_layer_header(
+        raster_plan, (out_t, out_h, out_w),
+        segment_name=segment_name, color_rgb=segment_color,
+    )
+    # Producers emit reference-geometry blocks, so a cropped plan sizes them by the
+    # reference slice; the full layout keeps its historical (identical) stored sizing.
+    z_chunk = (
+        _nrrd_full_slice_z_chunk(1, out_w, out_h, out_t)
+        if cropped else _nrrd_full_slice_z_chunk(1, stored_w, stored_h, stored_t)
+    )
     # resolve auto-sharding only after this sink task starts executing. Queue
     # occupancy at submit time says nothing about the child-band capacity by the time a
     # late global layer reaches the head of the sink pool. The shared semaphore remains
@@ -1602,11 +2170,18 @@ def write_single_layer_nrrd_from_ref(
     band_weights: Optional[List[int]] = None
     expected_codec_request_bytes = int(stored_t) * int(stored_h) * int(stored_w)
     if shard_count > 1:
-        bands, band_weights = _nrrd_layer_zshard_bands(ref, int(out_t), int(shard_count))
-        expected_codec_request_bytes = min(
-            max(0, int(z1) - int(z0)) * int(stored_h) * int(stored_w)
+        if cropped:
+            bands, band_weights = _nrrd_cropped_zshard_bands(
+                ref, int(out_t), int(box_t0), int(box_t0) + int(stored_t), int(shard_count),
+            )
+            shard_count = len(bands)
+        else:
+            bands, band_weights = _nrrd_layer_zshard_bands(ref, int(out_t), int(shard_count))
+        expected_codec_request_bytes = max(1, min(
+            max(0, min(int(z1), int(box_t0) + int(stored_t)) - max(int(z0), int(box_t0)))
+            * int(stored_h) * int(stored_w)
             for z0, z1 in bands
-        )
+        ))
     # Resolve, preflight, and KAT exactly once before a staging file/spool is opened.
     # Every z shard of this logical NRRD is pinned to this immutable codec spec.
     member_codec = nrrd_compression._require_nrrd_member_codec(
@@ -1624,14 +2199,19 @@ def write_single_layer_nrrd_from_ref(
                     encoding='gzip',
                 )
                 with nrrd_compression._open_nrrd_payload_writer(fh, codec_spec=member_codec) as payload_writer:
+                    stream_writer = _nrrd_payload_writer_for_plan(
+                        payload_writer, raster_plan, (out_t, out_h, out_w), 0, out_t,
+                        label=out_path.name,
+                    )
                     _write_one_decomposed_nrrd_layer_payload(
                         ref,
                         (out_t, out_h, out_w),
-                        payload_writer,
+                        stream_writer,
                         z_chunk=int(z_chunk),
                         block_consumer=block_consumer,
                         sparse_consumer=sparse_consumer,
                     )
+                    _finish_nrrd_payload_writer(stream_writer)
         return out_path
 
     # each z band compresses into an independent anonymous memory-backed chunk.
@@ -1671,10 +2251,14 @@ def write_single_layer_nrrd_from_ref(
                 f'{out_path.stem}.nrrd.z{int(z0):06d}-{int(z1):06d}.gz',
             )
             with nrrd_compression._open_nrrd_payload_writer(spool, codec_spec=member_codec) as payload_writer:
+                stream_writer = _nrrd_payload_writer_for_plan(
+                    payload_writer, raster_plan, (out_t, out_h, out_w), int(z0), int(z1),
+                    label=out_path.name,
+                )
                 _write_one_decomposed_nrrd_layer_payload(
                     ref,
                     (out_t, out_h, out_w),
-                    payload_writer,
+                    stream_writer,
                     z_chunk=shard_z_chunk,
                     block_consumer=block_consumer,
                     sparse_consumer=sparse_consumer,
@@ -1682,6 +2266,7 @@ def write_single_layer_nrrd_from_ref(
                     z_stop=int(z1),
                     fill_workers_override=shard_fill_workers,
                 )
+                _finish_nrrd_payload_writer(stream_writer)
             spool.flush()
             spool.seek(0, os.SEEK_END)
             compressed_size = int(spool.tell())
@@ -2027,11 +2612,19 @@ def write_layer_nrrd_with_low_quality_mirrors(
     segment_name: Optional[str] = None,
     segment_color: Optional[Tuple[float, float, float]] = None,
     z_shards: Optional[int] = None,
+    layout: Optional[str] = None,
+    raster_plan: Optional[NrrdRasterPlan] = None,
+    mirror_raster_plans: Optional[Dict[str, NrrdRasterPlan]] = None,
+    plan_receipt: Optional[Dict[str, NrrdRasterPlan]] = None,
 ) -> Path:
     """Write a full-quality layer and all low-quality mirrors in one source pass.
-    
-    Independent mirror encoders may run concurrently while sharing the streamed layer data."""
+
+    Independent mirror encoders may run concurrently while sharing the streamed layer data.
+    ``layout``/``raster_plan`` select the full-quality stored raster as in
+    write_single_layer_nrrd_from_ref; ``mirror_raster_plans`` maps ``str(mirror_path)`` to
+    a pinned mirror plan, and ``plan_receipt`` records every plan actually written."""
     out_t = int(output_shape[0])
+    resolved_layout = _normalized_nrrd_layer_layout(layout)
     # Resolve a live layer's deferred extent once so full-quality and mirror headers agree.
     ref = _resolve_live_ref_extent(ref)
     # mirror payloads are composed in two geometry steps (backing -> full output ->
@@ -2043,6 +2636,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
         segment_extent_shape_tyx=tuple(int(v) for v in output_shape),
         segment_extent_source='composed_full_output_extent_for_low_quality_mirror',
     )
+    pinned_mirror_plans: Dict[str, NrrdRasterPlan] = dict(mirror_raster_plans or {})
     # this function itself is the queued sink task, so this is execution-time—not
     # submission-time—resolution. Reuse the result for tee scheduling and the full writer.
     if z_shards is None or int(z_shards) <= 0:
@@ -2055,18 +2649,14 @@ def write_layer_nrrd_with_low_quality_mirrors(
     mirror_jobs: List[Dict[str, object]] = []
     for m_shape, m_path in mirrors:
         m_t, m_h, m_w = (int(m_shape[0]), int(m_shape[1]), int(m_shape[2]))
-        # Invert the mirror's t mapping once: for each full-quality output z, the mirror
-        # slice(s) whose source range contains it (matches _restore_source_indices_for_output_z).
-        tmp: List[List[int]] = [[] for _ in range(out_t)]
-        for mz in range(m_t):
-            for sz in _restore_source_indices_for_output_z(out_t, m_t, int(mz)):
-                if 0 <= int(sz) < out_t:
-                    tmp[int(sz)].append(int(mz))
+        # Invert the mirror's t mapping once per geometry: for each full-quality output z,
+        # the mirror slice(s) whose source range contains it (matches
+        # _restore_source_indices_for_output_z). The per-layer list stays private.
         mirror_jobs.append({
             'shape': (m_t, m_h, m_w),
             'path': Path(m_path),
             'volume': None,  # allocated below only when the CPU tee runs
-            'src_to_m': [tuple(v) for v in tmp],
+            'src_to_m': list(_nrrd_mirror_targets_by_source(int(out_t), int(m_t))),
             'locks': [threading.Lock() for _ in range(16)],
             'failed': False,
         })
@@ -2216,6 +2806,9 @@ def write_layer_nrrd_with_low_quality_mirrors(
         block_consumer=(_consume_block if mirror_jobs and not sparse_mirror_tee else None),
         sparse_consumer=(_tee_sparse if sparse_mirror_tee else None),
         z_shards=int(resolved_z_shards),
+        layout=resolved_layout,
+        raster_plan=raster_plan,
+        plan_receipt=plan_receipt,
     )
 
     # one small D2H per mirror replaces the per-block CPU resize/OR work.
@@ -2223,56 +2816,89 @@ def write_layer_nrrd_with_low_quality_mirrors(
         for job in mirror_jobs:
             job['failed'] = True
 
+    def _encode_mirror_volume(
+        vol: np.ndarray,
+        m_path: Path,
+        mirror_shape: Tuple[int, int, int],
+        mirror_plan: object,
+        seg_name: str,
+        seg_color: Tuple[float, float, float],
+    ) -> None:
+        m_t, m_h, m_w = (int(v) for v in mirror_shape)
+        stored_t, stored_h, stored_w = (int(v) for v in mirror_plan.stored_shape_tyx)
+        cropped = _nrrd_plan_layout(mirror_plan) == NRRD_LAYER_LAYOUT_CROPPED
+        header = _nrrd_layer_header(
+            mirror_plan, (m_t, m_h, m_w), segment_name=seg_name, color_rgb=seg_color,
+        )
+        # A cropped plan streams the whole in-memory mirror through the box adapter,
+        # which also proves that no mirror foreground falls outside the stored box.
+        step = max(1, int(
+            _nrrd_full_slice_z_chunk(1, m_w, m_h, m_t)
+            if cropped else _nrrd_full_slice_z_chunk(1, stored_w, stored_h, stored_t)
+        ))
+        source_depth = int(m_t) if cropped else int(stored_t)
+        member_codec = nrrd_compression._require_nrrd_member_codec(
+            expected_input_bytes=int(stored_t) * int(stored_h) * int(stored_w),
+        )
+        with _same_directory_atomic_output(m_path) as stage_path:
+            with open(stage_path, 'wb') as fh:
+                _write_nrrd_ascii_header(
+                    fh, header=header, sizes=(stored_w, stored_h, stored_t),
+                    dimension=3, data_type='unsigned char', encoding='gzip',
+                )
+                with nrrd_compression._open_nrrd_payload_writer(fh, codec_spec=member_codec) as payload_writer:
+                    stream_writer = _nrrd_payload_writer_for_plan(
+                        payload_writer, mirror_plan, (m_t, m_h, m_w), 0, m_t, label=m_path.name,
+                    )
+                    for z0 in range(0, source_depth, step):
+                        z1 = min(source_depth, int(z0) + step)
+                        stream_writer.write(memoryview(vol[z0:z1]).cast('B'))  # type: ignore[index]
+                    _finish_nrrd_payload_writer(stream_writer)
+
     def _encode_mirror(job: Dict[str, object]) -> None:
         m_t, m_h, m_w = job['shape']  # type: ignore[misc]
         m_path: Path = job['path']  # type: ignore[assignment]
+        mirror_shape = (int(m_t), int(m_h), int(m_w))
+        mirror_plan = pinned_mirror_plans.get(str(m_path))
+        if mirror_plan is None:
+            mirror_plan = _nrrd_raster_plan(mirror_extent_ref, mirror_shape, layout=resolved_layout)
         try:
             if bool(job['failed']):
                 raise RuntimeError('mirror tee failed during full-quality streaming')
             m_path.parent.mkdir(parents=True, exist_ok=True)
-            mirror_plan = _nrrd_raster_plan(
-                mirror_extent_ref,
-                (int(m_t), int(m_h), int(m_w)),
-            )
-            stored_t, stored_h, stored_w = (int(v) for v in mirror_plan.stored_shape_tyx)
-            header = nrrd_slicer_header((stored_t, stored_h, stored_w))
-            header['content'] = (
-                'binary segmentation mask; '
-                f'reference_shape_tyx=({int(m_t)},{int(m_h)},{int(m_w)}); '
-                f'stored_shape_tyx=({stored_t},{stored_h},{stored_w}); exported_axes=(X,Y,t)'
-            )
             seg_name = str(segment_name) if segment_name else _slicer_segment_name_for_out_path(m_path)
             seg_color = segment_color if segment_color is not None else slicer_segment_palette_color(seg_name)
-            header.update(slicer_segmentation_header_fields(
-                segment_name=seg_name,
-                color_rgb=seg_color,
-                extent_xyt=mirror_plan.segment_extent_xyt,
-            ))
             vol: Optional[np.ndarray] = job.get('volume')  # type: ignore[assignment]
             if vol is None:
                 raise RuntimeError('mirror tee produced no host payload')
-            step = max(1, int(_nrrd_full_slice_z_chunk(1, stored_w, stored_h, stored_t)))
-            member_codec = nrrd_compression._require_nrrd_member_codec(
-                expected_input_bytes=int(stored_t) * int(stored_h) * int(stored_w),
-            )
-            with _same_directory_atomic_output(m_path) as stage_path:
-                with open(stage_path, 'wb') as fh:
-                    _write_nrrd_ascii_header(
-                        fh, header=header, sizes=(stored_w, stored_h, stored_t),
-                        dimension=3, data_type='unsigned char', encoding='gzip',
-                    )
-                    with nrrd_compression._open_nrrd_payload_writer(fh, codec_spec=member_codec) as payload_writer:
-                        for z0 in range(0, int(stored_t), step):
-                            z1 = min(int(stored_t), int(z0) + step)
-                            payload_writer.write(memoryview(vol[z0:z1]).cast('B'))  # type: ignore[index]
+            try:
+                _encode_mirror_volume(vol, m_path, mirror_shape, mirror_plan, seg_name, seg_color)
+            except NrrdCropExtentViolation as exc:
+                if _nrrd_plan_layout(mirror_plan) != NRRD_LAYER_LAYOUT_CROPPED:
+                    raise
+                _announce_nrrd_crop_violation(m_path, exc)
+                mirror_plan = _nrrd_raster_plan(
+                    mirror_extent_ref, mirror_shape, layout=NRRD_LAYER_LAYOUT_FULL,
+                )
+                _encode_mirror_volume(vol, m_path, mirror_shape, mirror_plan, seg_name, seg_color)
+            if plan_receipt is not None:
+                plan_receipt[str(m_path)] = mirror_plan
         except Exception as exc:
             print(
                 f'Warning: low-quality NRRD mirror tee failed for {m_path.name} ({exc}); '
                 're-encoding that mirror from the layer store.'
             )
+            # The cropped fallback keeps the manifest's composed box; the full layout keeps
+            # its historical direct-extent header byte for byte.
             write_single_layer_nrrd_from_ref(
-                ref, (int(m_t), int(m_h), int(m_w)), m_path,
+                ref, mirror_shape, m_path,
                 segment_name=segment_name, segment_color=segment_color,
+                layout=resolved_layout,
+                raster_plan=(
+                    mirror_plan
+                    if _nrrd_plan_layout(mirror_plan) == NRRD_LAYER_LAYOUT_CROPPED else None
+                ),
+                plan_receipt=plan_receipt,
             )
         finally:
             job['volume'] = None
@@ -2301,6 +2927,45 @@ def write_layer_nrrd_with_low_quality_mirrors(
         for job in mirror_jobs:
             _encode_mirror(job)
     return result
+
+def write_sink_layer_files(
+    ref: 'NrrdLayerRef',
+    output_shape: Tuple[int, int, int],
+    out_path: Path,
+    mirrors: Sequence[Tuple[Tuple[int, int, int], Path]],
+    *,
+    segment_name: str,
+    segment_color: Tuple[float, float, float],
+    z_shards: int,
+    layout: str,
+    raster_plan: NrrdRasterPlan,
+    mirror_raster_plans: Dict[str, NrrdRasterPlan],
+    plan_receipt: Dict[str, NrrdRasterPlan],
+) -> Path:
+    """Write one NrrdLayerSink layer: its native file and every low-quality mirror.
+
+    The sink's writer thread and a sweep NRRD worker process run this same call, so
+    both write identical bytes; ``plan_receipt`` records each plan actually written."""
+    if mirrors:
+        return write_layer_nrrd_with_low_quality_mirrors(
+            ref, output_shape, Path(out_path), list(mirrors),
+            segment_name=segment_name,
+            segment_color=segment_color,
+            z_shards=int(z_shards),
+            layout=layout,
+            raster_plan=raster_plan,
+            mirror_raster_plans=mirror_raster_plans,
+            plan_receipt=plan_receipt,
+        )
+    return write_single_layer_nrrd_from_ref(
+        ref, output_shape, Path(out_path),
+        segment_name=segment_name,
+        segment_color=segment_color,
+        z_shards=int(z_shards),
+        layout=layout,
+        raster_plan=raster_plan,
+        plan_receipt=plan_receipt,
+    )
 
 _INTERPOLATION_PROVENANCE_FIELDS = (
     'interpolation_backend', 'interpolation_direction', 'seed_detector_identity',
@@ -2356,12 +3021,23 @@ class NrrdLayerSink:
         low_quality_root: Optional[Path] = None,
         run_id: str | None = None,
         executor: Optional[ThreadPoolExecutor] = None,
+        layer_file_processes: Optional[object] = None,
+        layer_layout: str = NRRD_LAYER_LAYOUT_CROPPED,
     ) -> None:
         self.nrrd_dir = Path(nrrd_dir)
         self.run_id = run_id
+        # Optional sweep_nrrd_processes.SweepNrrdProcessPool owned by the caller: it
+        # writes eligible layer files outside this process's GIL. This sink keeps every
+        # name, colour, manifest row and publication record either way.
+        self.layer_file_processes = layer_file_processes
         self.nrrd_dir.mkdir(parents=True, exist_ok=True)
         self.stem = str(stem)
         self.output_shape = (int(output_shape_tyx[0]), int(output_shape_tyx[1]), int(output_shape_tyx[2]))
+        # ``cropped`` stores each layer's segment bounding box with a Slicer reference-extent
+        # offset; ``full`` writes the historical full-reference raster byte for byte (tests
+        # and profiling tools compare the two). Fixed per sink so a run never mixes layouts;
+        # an invalid value fails here, before any layer is queued.
+        self.layer_layout = _normalized_nrrd_layer_layout(layer_layout)
         self.max_workers = max(1, int(max_workers))
         self._lock = threading.Lock()
         self._futures: List[Future] = []
@@ -2502,6 +3178,8 @@ class NrrdLayerSink:
                 'backing_shape_tyx': [int(v) for v in getattr(ref, 'shape', (0, 0, 0))],
                 'output_shape_tyx': [int(v) for v in self.output_shape],
                 'stored_shape_tyx': None,
+                **({'stored_offset_tyx': None, 'stored_layout': None}
+                   if self.layer_layout == NRRD_LAYER_LAYOUT_CROPPED else {}),
                 'empty_segment': None,
                 'exported_axes': '(X, Y, t)',
                 'segment_name': segment_name,
@@ -2556,6 +3234,8 @@ class NrrdLayerSink:
                     'backing_shape_tyx': [int(v) for v in getattr(ref, 'shape', (0, 0, 0))],
                     'output_shape_tyx': [int(v) for v in lq_shape],
                     'stored_shape_tyx': None,
+                    **({'stored_offset_tyx': None, 'stored_layout': None}
+                       if self.layer_layout == NRRD_LAYER_LAYOUT_CROPPED else {}),
                     'empty_segment': None,
                     'downbin_value': str(spec.raw_value),
                     'downbin_token': str(spec.token),
@@ -2572,14 +3252,15 @@ class NrrdLayerSink:
                 # time rather than submission-time queue occupancy. Record that exact value
                 # and pass it through to the mirror/full writer as one immutable decision.
                 resolved_ref = _resolve_live_ref_extent(ref)
-                full_plan = _nrrd_raster_plan(resolved_ref, self.output_shape)
+                layout = self.layer_layout
+                full_plan = _nrrd_raster_plan(resolved_ref, self.output_shape, layout=layout)
                 executed_z_shards = int(_nrrd_layer_zshard_count(
                     resolved_ref, int(full_plan.stored_shape_tyx[0]),
                 ))
+                lq_plans: Dict[str, NrrdRasterPlan] = {}
                 with self._lock:
                     manifest_entry['z_shards'] = int(executed_z_shards)
-                    manifest_entry['stored_shape_tyx'] = [int(v) for v in full_plan.stored_shape_tyx]
-                    manifest_entry['empty_segment'] = bool(full_plan.empty_segment)
+                    _record_nrrd_stored_plan(manifest_entry, full_plan, layout)
                     composed_mirror_ref = dataclasses_replace(
                         resolved_ref,
                         segment_extent_ijk=_nrrd_mapped_extent_preserve_empty(
@@ -2588,24 +3269,46 @@ class NrrdLayerSink:
                         segment_extent_shape_tyx=tuple(int(v) for v in self.output_shape),
                         segment_extent_source='composed_full_output_extent_for_low_quality_mirror',
                     )
-                    for lq_shape, lq_entry in lq_manifest_entries:
-                        lq_plan = _nrrd_raster_plan(composed_mirror_ref, lq_shape)
-                        lq_entry['stored_shape_tyx'] = [int(v) for v in lq_plan.stored_shape_tyx]
-                        lq_entry['empty_segment'] = bool(lq_plan.empty_segment)
-                if lq_mirror_args:
-                    result = write_layer_nrrd_with_low_quality_mirrors(
-                        resolved_ref, self.output_shape, out_path, lq_mirror_args,
-                        segment_name=segment_name,
-                        segment_color=segment_color,
-                        z_shards=int(executed_z_shards),
-                    )
+                    for (lq_shape, lq_entry), (_mirror_shape, lq_path) in zip(
+                        lq_manifest_entries, lq_mirror_args,
+                    ):
+                        lq_plan = _nrrd_raster_plan(composed_mirror_ref, lq_shape, layout=layout)
+                        _record_nrrd_stored_plan(lq_entry, lq_plan, layout)
+                        lq_plans[str(lq_path)] = lq_plan
+                written_plans: Dict[str, NrrdRasterPlan] = {}
+                write_args = dict(
+                    ref=resolved_ref, output_shape=self.output_shape, out_path=out_path,
+                    mirrors=tuple(lq_mirror_args), segment_name=segment_name,
+                    segment_color=segment_color, z_shards=int(executed_z_shards),
+                    layout=layout, raster_plan=full_plan, mirror_raster_plans=lq_plans,
+                )
+                # A worker process writes eligible files with identical bytes and returns
+                # the plans it wrote; None (pool absent, broken, or layer ineligible)
+                # writes them here.
+                processes = self.layer_file_processes
+                remote_plans = (
+                    processes.write_layer_files(write_args)
+                    if processes is not None and processes.accepts(resolved_ref, executed_z_shards)
+                    else None
+                )
+                if remote_plans is not None:
+                    written_plans.update(remote_plans)
+                    result = out_path
                 else:
-                    result = write_single_layer_nrrd_from_ref(
-                        resolved_ref, self.output_shape, out_path,
-                        segment_name=segment_name,
-                        segment_color=segment_color,
-                        z_shards=int(executed_z_shards),
-                    )
+                    result = write_sink_layer_files(**write_args, plan_receipt=written_plans)
+                if layout == NRRD_LAYER_LAYOUT_CROPPED:
+                    # An extent-violation fallback republished the full raster; the rows must
+                    # describe the files actually on disk.
+                    with self._lock:
+                        actual = written_plans.get(str(out_path))
+                        if actual is not None:
+                            _record_nrrd_stored_plan(manifest_entry, actual, layout)
+                        for (_lq_shape, lq_entry), (_mirror_shape, lq_path) in zip(
+                            lq_manifest_entries, lq_mirror_args,
+                        ):
+                            actual = written_plans.get(str(lq_path))
+                            if actual is not None:
+                                _record_nrrd_stored_plan(lq_entry, actual, layout)
                 self.observe_published_layer(ref)
                 return result
 
@@ -2836,6 +3539,24 @@ class NrrdLayerSink:
                         entry['full_quality_final_output_survival'] = receipt
                         entry['final_connection_survival'] = 'not_assessed_after_downbin'
 
+    def _stored_layout_manifest_fields(self) -> Dict[str, object]:
+        """Top-level layout field; empty for the full layout so its manifests stay unchanged."""
+        if self.layer_layout != NRRD_LAYER_LAYOUT_CROPPED:
+            return {}
+        return {'stored_layout': 'segment_bounding_box'}
+
+    def _stored_layout_manifest_notes(self) -> List[str]:
+        if self.layer_layout != NRRD_LAYER_LAYOUT_CROPPED:
+            return []
+        return [
+            'Each file stores only its layer\'s segment bounding box (stored_shape_tyx) placed at '
+            'stored_offset_tyx (t, Y, X) in output_shape_tyx: the header space origin is that '
+            'voxel\'s position, Segmentation_ReferenceImageExtentOffset/Segmentation_ReferenceImageExtent '
+            'give the Slicer reference extent, and Segment0_Extent is relative to the stored box. '
+            'Voxels outside the box are zero. Empty layers store one zero voxel at offset (0, 0, 0). '
+            'Rows whose stored_layout is full_reference store the complete output grid.',
+        ]
+
     def write_manifest(self) -> Optional[Path]:
         with self._lock:
             manifest_layers = list(self._manifest)
@@ -2856,6 +3577,7 @@ class NrrdLayerSink:
                 _write_json_atomically(lq_manifest_path, {
                     'layout': 'one_single_layer_nrrd_per_component',
                     **({'run_id': self.run_id} if self.run_id is not None else {}),
+                    **self._stored_layout_manifest_fields(),
                     'quality': 'low_quality',
                     'downbin_value': str(spec.raw_value),
                     'downbin_token': str(spec.token),
@@ -2872,6 +3594,7 @@ class NrrdLayerSink:
                         'Each file is a 3D Slicer segmentation (.seg.nrrd) sharing its full-quality layer\'s logical segment name and color; physical basenames longer than 120 characters are shortened.',
                         'Layer suffixes match the corresponding full-quality layers. Centerline removed-component and watershed-candidate audit layers are mirrored as non-recomposable downbins (diagnostic_only and none, respectively).',
                         'Use each layer\'s recomposition_op. Only union entries marked union; select entries are complete checkpoints.',
+                        *self._stored_layout_manifest_notes(),
                     ],
                 })
         if not manifest_layers:
@@ -2880,6 +3603,7 @@ class NrrdLayerSink:
         manifest = {
             'layout': 'one_single_layer_nrrd_per_component',
             **({'run_id': self.run_id} if self.run_id is not None else {}),
+            **self._stored_layout_manifest_fields(),
             'exported_axes': '(X, Y, t)',
             'output_shape_tyx': [int(v) for v in self.output_shape],
             'layer_count': len(manifest_layers),
@@ -2891,6 +3615,7 @@ class NrrdLayerSink:
                 'YOLO layers are cleaned masks before interpolation bridges; bridge layers contain only voxels added by that pass.',
                 'Global checkpoints, including centerline pass00_input/result and Global_final_output, are complete alternatives and must never be unioned with component or audit layers.',
                 'The manifest lists only this run. In a reused output directory, similarly named files absent from this manifest are stale and must be ignored.',
+                *self._stored_layout_manifest_notes(),
             ],
         }
         _write_json_atomically(manifest_path, manifest)

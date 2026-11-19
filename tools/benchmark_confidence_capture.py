@@ -33,11 +33,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 SCRATCH = ROOT.parent / 'Scratch'
 from tools.source_archive_history import history_archive_path
-TASK = SCRATCH / 'Experiments/Job150790_150798_Performance_20261002/confidence_benchmark'
 ARCHIVE = history_archive_path('throughput')
 ARCHIVE_SHA256 = '3cf2d7b0e759e873350c944297aa97d441fec3f4d617522f38df809a4e287e6d'
-REAL_MANIFEST = SCRATCH / ('Experiments/Results/F3_10_4_30_2026_8bit_Y_150790/'
-                           'reconciliation_evidence/manifest.json')
 ARTIFACTS = ('scores.u8.zlib', 'index.bin', 'metadata.json')
 BACKENDS = ('archived_serial', 'new_serial', 'new_parallel')
 MIB = 1024**2
@@ -542,7 +539,7 @@ def cpu_heatsoak(seconds, workers):
 
 def parse_args(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output-dir',type=Path,default=TASK/'plan')
+    parser.add_argument('--output-dir',type=Path,help='Fresh task directory under sibling Scratch (required)')
     mode=parser.add_mutually_exclusive_group()
     mode.add_argument('--check-only',action='store_true')
     mode.add_argument('--execute',action='store_true')
@@ -559,14 +556,18 @@ def parse_args(argv=None):
     parser.add_argument('--repetitions',type=int,default=3)
     parser.add_argument('--warmups',type=int,default=1)
     parser.add_argument('--seed',type=int,default=150790)
-    parser.add_argument('--real-manifest',type=Path,default=REAL_MANIFEST)
-    parser.add_argument('--no-real',action='store_true')
+    parser.add_argument('--real-manifest',type=Path,
+                        help='Retained reconciliation_evidence/manifest.json for the real-evidence case; '
+                             'without it only synthetic cases run')
+    parser.add_argument('--no-real',action='store_true',help='Skip the real-evidence case even if --real-manifest is given')
     parser.add_argument('--heatsoak-seconds',type=float,default=60.)
     parser.add_argument('--quiet-window-authorized',help='Record root authorization and planned quiet window; required only for --execute')
     parser.add_argument('--child-spec',type=Path,help=argparse.SUPPRESS)
     args=parser.parse_args(argv)
     if args.child_spec:
         return args
+    if args.output_dir is None:
+        parser.error('--output-dir is required: a fresh task directory under sibling Scratch')
     if (min(args.frames,args.height,args.width,args.workers,args.workspace_mib,args.repetitions,
             args.max_input_mib,args.block_size)<1 or args.warmups<0 or args.block_size>65535):
         parser.error('Require positive shape/budgets/workers/repetitions, bounded block, nonnegative warmups')
@@ -616,7 +617,9 @@ def main(argv=None):
         cases=[dict(name=pattern,kind='synthetic',shape=[args.frames,args.height,args.width])
                for pattern in dict.fromkeys(args.patterns)]
         if not args.no_real:
-            if args.real_manifest.is_file():
+            if args.real_manifest is None:
+                receipt['real_unavailable']='no --real-manifest supplied'
+            elif args.real_manifest.is_file():
                 cases.append(real_evidence_plan(args.real_manifest,args.frames,args.max_input_mib*MIB))
             else:
                 receipt['real_unavailable']=str(args.real_manifest)

@@ -508,3 +508,17 @@ def test_producer_early_publication_record_reaches_the_family_summary():
     receipt['confidence_sweep']['upstream_fanout']['early_publication'] = {'backlog_peak': -1}
     with pytest.raises(ValueError, match='early_publication'):
         sweep._fanout_evidence(receipt, role='produce', target_count=2)
+
+
+def test_sweep_work_storage_records_whether_temp_is_memory_backed(monkeypatch, tmp_path):
+    from XTA import confidence_sweep as sweep, runtime
+    shm = tmp_path / 'shm'
+    monkeypatch.setattr(runtime, 'path_is_memory_backed', lambda path: sweep.Path(path) == shm)
+    assert sweep._work_storage(shm) == {'root': str(shm), 'memory_backed': True}
+    assert sweep._work_storage(tmp_path) == {'root': str(tmp_path), 'memory_backed': False}
+
+    def unknown(path):
+        raise OSError('no mount table')
+
+    monkeypatch.setattr(runtime, 'path_is_memory_backed', unknown)
+    assert sweep._work_storage(tmp_path)['memory_backed'] is None

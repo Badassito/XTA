@@ -153,6 +153,12 @@ def _inspect_layer(path: Path, metadata: dict[str, Any], reference_shape: tuple[
         raise ValueError(f"Stored crop lies outside the reference grid: {path}")
     if stored_shape != reference_shape and "Segmentation_ReferenceImageExtentOffset" not in header:
         raise ValueError(f"Cropped data require an explicit reference offset: {path}")
+    declared_offset = metadata.get("stored_offset_tyx")
+    if declared_offset is not None and (
+            not isinstance(declared_offset, (list, tuple)) or len(declared_offset) != 3
+            or any(isinstance(v, bool) or not isinstance(v, (int, np.integer)) for v in declared_offset)
+            or tuple(int(v) for v in declared_offset) != offset_tyx):
+        raise ValueError(f"Manifest stored offset disagrees with NRRD: {path}")
     if "Segmentation_ReferenceImageExtent" in header:
         reference_extent = _ints(header["Segmentation_ReferenceImageExtent"], 6, "reference extent")
         expected = tuple(v for size in reversed(reference_shape) for v in (0, size - 1))

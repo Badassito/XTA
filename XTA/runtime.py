@@ -87,14 +87,19 @@ from .runtime_observability import (
 _RUNTIME_OBSERVABILITY_LOCK = threading.Lock()
 
 
-def _reset_runtime_observability_lock_after_fork() -> None:
+def _reset_runtime_observability_after_fork() -> None:
     # A parent thread inside init/shutdown at fork time would leave this held.
     global _RUNTIME_OBSERVABILITY_LOCK
     _RUNTIME_OBSERVABILITY_LOCK = threading.Lock()
+    # The inherited sampler's NVML session belongs to the parent; the child's
+    # exit (pool workers run shutdown_runtime_observability) must not end it.
+    sampler = _RUNTIME_SYSTEM_SAMPLER
+    if sampler is not None:
+        sampler._forget_after_fork_in_child()
 
 
 if hasattr(os, 'register_at_fork'):
-    os.register_at_fork(after_in_child=_reset_runtime_observability_lock_after_fork)
+    os.register_at_fork(after_in_child=_reset_runtime_observability_after_fork)
 
 _RUNTIME_TELEMETRY: Optional[RuntimeTelemetry] = None
 

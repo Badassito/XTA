@@ -190,7 +190,9 @@ def test_scalar_d1_empty_cartesian_slot_is_published_then_adopted_without_rewrit
         manifest = json.loads(sink.write_manifest().read_text())
         row, = manifest["layers"]
         assert row["empty_segment"] and row["view_name"]==view.name
-        assert row["stored_shape_tyx"]==list(SHAPE)
+        # Cropped default: an empty layer stores one zero voxel at the grid origin.
+        assert row["stored_shape_tyx"]==[1,1,1] and row["stored_offset_tyx"]==[0,0,0]
+        assert row["output_shape_tyx"]==list(SHAPE)
         assert row["suffix"]=="Transverse_TTA_a0_fullframe_yolo"
         for p in files:
             assert p.stat().st_mtime_ns==before[p]

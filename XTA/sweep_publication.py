@@ -324,6 +324,24 @@ def _publish_grid(grid_id, branches, stage, review, scratch, sweep_id, memory_mi
     return _grid_record(grid_id, geometry, GROUPED, origins, groups, overlays)
 
 
+def _copy_index_to_grid_folders(stage, products):
+    """Copy the staged review index, byte for byte, into each grouped grid folder.
+
+    The grid folder then opens in Slicer on its own. The importer recognizes
+    the copy by its grid's group paths and uses the review's own manifest when
+    the copy still sits inside its review.
+    """
+    content = (stage / "manifest.json").read_bytes()
+    for product in products:
+        if product["payload"] != GROUPED:
+            continue
+        destination = stage.joinpath(*product["grid_id"].split("/")) / "manifest.json"
+        with open(destination, "xb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
 def _independent_identity(run, cutoff, branch):
     from .config import _confidence_hundredths
 
@@ -370,7 +388,9 @@ def publish_sweep_review(output_dir, branches, *, sweep_id, memory_mib=128,
 
     Each (hundredth, branch output directory) must designate a completed scalar
     run below output_dir. With no requested scalar NRRDs there is nothing to package.
-    Paths in review/manifest.json are relative to that manifest.
+    Paths in review/manifest.json are relative to that manifest. Each grouped
+    grid folder also holds a byte-identical copy of it, so that folder can be
+    dropped into Slicer on its own.
     Seek-heavy coverage spools and intermediate compression use temp_dir or the
     system temporary filesystem. Complete review assets stage beside their destination.
 
@@ -474,5 +494,6 @@ def publish_sweep_review(output_dir, branches, *, sweep_id, memory_mib=128,
             "grid_payloads":"A grouped grid has stock .seg.nrrd groups, each holding one cutoff, and per-cutoff direct coverage labelmaps. A reference_only grid lists its segment identities and branch origins but no review payload; open its scalar branch NRRDs directly.",
             "source_retention":"Scalar branch NRRDs remain in their original directories. Review groups carry the same binary masks, original colors and per-cutoff identities."
         })
+        _copy_index_to_grid_folders(stage, products)
         stage.rename(review)
     return review / "manifest.json"

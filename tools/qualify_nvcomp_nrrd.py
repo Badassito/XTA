@@ -1,8 +1,10 @@
 """Qualify nvCOMP 5.3 RAW Gzip members for the hybrid NRRD writer.
 
 Preparation only reads an existing NRRD and writes small raw samples. Benchmark
-mode owns Scratch/Temp/GPU_LOCK before importing CUDA libraries. All outputs go
-to a task-specific Scratch directory; nothing is installed in the project venv.
+modes hold the explicit --gpu-lock reservation before importing CUDA libraries
+and load nvCOMP/deflate from the explicit task-scoped --deps, --runtime and
+--deflate-deps directories. All outputs go to the explicit --output directory;
+nothing is installed in the project venv.
 """
 
 from __future__ import annotations
@@ -20,10 +22,6 @@ from types import SimpleNamespace
 import zlib
 
 
-SCRATCH = Path.home() / "Documents/ChatGPT/Scratch"
-LOCK = SCRATCH / "Temp" / "GPU_LOCK"
-EXPERIMENT = SCRATCH / "Experiments" / "gpu-utilization-148334" / "nvcomp"
-DEFAULT_DEFLATE = EXPERIMENT.parent / "compression-repro" / "deps"
 SIZES = (64 << 10, 256 << 10, 1 << 20, 4 << 20, 16 << 20)
 _DLL_HANDLES: list[object] = []
 
@@ -80,7 +78,7 @@ def prepare(source: Path, output: Path, scan_mib: int = 256) -> dict:
     return manifest
 
 
-def GpuLock(path: Path = LOCK):
+def GpuLock(path: Path):
     """Compatibility entry point for the shared GPU reservation policy."""
     return gpu_reservation(path, task_name="qualify_nvcomp_nrrd")
 
@@ -219,12 +217,13 @@ def frame_raw_deflate(raw_deflate: bytes, payload: bytes) -> bytes:
 
 
 def benchmark(manifest: Path, output: Path, deps: Path, runtime: Path,
-              deflate_deps: Path, device: int, repeats: int, heatsoak_seconds: float) -> dict:
+              deflate_deps: Path, device: int, repeats: int, heatsoak_seconds: float,
+              *, gpu_lock: Path) -> dict:
     data = json.loads(manifest.read_text(encoding="utf-8"))
     samples = [(entry["name"], Path(entry["path"]).read_bytes()) for entry in data["samples"]]
     if any(len(raw) < max(SIZES) for _, raw in samples):
         raise ValueError("Every selected real sample must contain at least 16 MiB")
-    with GpuLock():
+    with GpuLock(gpu_lock):
         # Nothing above this point imports a CUDA binding or creates a context.
         nvcomp = load_nvcomp(deps, runtime)
         deflate = load_deflate(deflate_deps)
@@ -367,7 +366,7 @@ def benchmark(manifest: Path, output: Path, deps: Path, runtime: Path,
 
 def benchmark_batched(manifest: Path, output: Path, deps: Path, runtime: Path,
                       deflate_deps: Path, device: int, repeats: int,
-                      heatsoak_seconds: float) -> dict:
+                      heatsoak_seconds: float, *, gpu_lock: Path) -> dict:
     """Compare 256-way 64-KiB RAW Deflate with one 16-MiB Gzip member."""
     data = json.loads(manifest.read_text(encoding="utf-8"))
     size = 16 << 20
@@ -375,7 +374,7 @@ def benchmark_batched(manifest: Path, output: Path, deps: Path, runtime: Path,
                for entry in data["samples"]]
     if any(len(raw) != size for _, raw in samples):
         raise ValueError("The batched comparison requires 16 MiB per sample")
-    with GpuLock():
+    with GpuLock(gpu_lock):
         nvcomp = load_nvcomp(deps, runtime)
         deflate = load_deflate(deflate_deps)
         heatsoak(device, heatsoak_seconds)
@@ -502,33 +501,42 @@ def np_frombuffer(payload: bytes):
     return np.frombuffer(payload, dtype=np.uint8)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepare", type=Path, metavar="SOURCE_NRRD")
     parser.add_argument("--benchmark", type=Path, metavar="SAMPLES_JSON")
     parser.add_argument("--benchmark-batched", type=Path, metavar="SAMPLES_JSON")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scan-mib", type=int, default=256)
-    parser.add_argument("--deps", type=Path, default=EXPERIMENT / "deps")
-    parser.add_argument("--runtime", type=Path, default=EXPERIMENT / "runtime")
-    parser.add_argument("--deflate-deps", type=Path, default=DEFAULT_DEFLATE)
+    benchmark_only = "; required by --benchmark and --benchmark-batched"
+    parser.add_argument("--deps", type=Path, help="Task-scoped nvCOMP wheel target" + benchmark_only)
+    parser.add_argument("--runtime", type=Path, help="Task-scoped CUDA runtime wheel target" + benchmark_only)
+    parser.add_argument("--deflate-deps", type=Path, help="Task-scoped python-deflate target" + benchmark_only)
+    parser.add_argument("--gpu-lock", type=Path, help="Shared GPU reservation file" + benchmark_only)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--heatsoak-seconds", type=float, default=30.0)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if sum(map(bool, (args.prepare, args.benchmark, args.benchmark_batched))) != 1:
         parser.error("Select exactly one of --prepare, --benchmark, or --benchmark-batched")
     if args.repeats < 1 or args.heatsoak_seconds < 0:
         parser.error("--repeats must be positive and --heatsoak-seconds nonnegative")
+    if not args.prepare:
+        missing = [flag for flag, value in (("--deps", args.deps), ("--runtime", args.runtime),
+                                            ("--deflate-deps", args.deflate_deps),
+                                            ("--gpu-lock", args.gpu_lock)) if value is None]
+        if missing:
+            parser.error("Benchmark modes require " + ", ".join(missing))
     if args.prepare:
         result = prepare(args.prepare, args.output, args.scan_mib)
     elif args.benchmark_batched:
         result = benchmark_batched(args.benchmark_batched, args.output, args.deps, args.runtime,
                                    args.deflate_deps, args.device, args.repeats,
-                                   args.heatsoak_seconds)
+                                   args.heatsoak_seconds, gpu_lock=args.gpu_lock)
     else:
         result = benchmark(args.benchmark, args.output, args.deps, args.runtime,
-                           args.deflate_deps, args.device, args.repeats, args.heatsoak_seconds)
+                           args.deflate_deps, args.device, args.repeats, args.heatsoak_seconds,
+                           gpu_lock=args.gpu_lock)
     print(json.dumps(result, indent=2))
 
 

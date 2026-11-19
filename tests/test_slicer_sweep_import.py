@@ -1,6 +1,7 @@
 """Cutoff families may span files, nodes and display names in Slicer."""
 import ast
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,12 +16,13 @@ def load_functions():
         "_update_groups", "_xta_review_members", "_xta_grid_index", "_xta_review_node_ids",
         "_segment_ids", "_find_mask_id", "_xta_commit_binary_updates", "_xta_load_review", "_xta_child",
         "_xta_display_payload", "_xta_review_group_selection", "_xta_requested_review_cutoffs",
-        "_xta_cutoff_label",
+        "_xta_cutoff_label", "_xta_sweep_review_location", "_xta_sweep_grid_folder",
+        "_xta_sweep_review_relative", "_xta_sweep_header_grid_ids",
     }
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
     module = ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names],
                         type_ignores=[])
-    namespace = {"defaultdict": defaultdict, "json": json, "Path": Path,
+    namespace = {"defaultdict": defaultdict, "json": json, "Path": Path, "os": os,
                  "_xta_tag": lambda seg, key: seg.tags.get(key)}
     exec(compile(module, str(SOURCE), "exec"), namespace)
     return namespace

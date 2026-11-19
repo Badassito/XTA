@@ -1,10 +1,14 @@
 """Marker edits on a cutoff review change only the masks in the chosen edit scope.
 
 Nested cutoff masks connect more widely at lower cutoffs: an island seeded while
-reviewing 0.70 can be bridged to far larger regions at 0.50. These tests compile
-the real Slicer profile functions with stand-ins for the scene and workers.
+reviewing 0.70 can be bridged to far larger regions at 0.50. Per-cutoff segments
+have "Displayed cutoff" (default), "Displayed and stricter" and "All visible
+cutoffs"; a store-backed review has "All cutoffs" (default) and "Displayed and
+stricter", and each kind remembers its own scope. These tests compile the real
+Slicer profile functions with stand-ins for the scene and workers.
 """
 import ast
+import functools
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,8 +21,10 @@ FUNCTIONS = {
     "_remove_marked_regions", "_xta_segment_review_identity", "_xta_edit_scope_includes",
     "_xta_cutoff_label", "_xta_current_edit_scope", "SelectEditScope", "_xta_edit_scope_button_text",
     "_xta_surfaces_button_text", "_xta_refresh_review_actions", "ExportDisplayedXTAEdits",
+    "_xta_edit_scope_for", "_xta_display_store_backed", "_xta_new_review_edit_scope",
 }
-CONSTANTS = {"_XTA_EDIT_SCOPE_LABELS", "_XTA_EDIT_SCOPE_BUTTONS", "_xta_edit_scope"}
+CONSTANTS = {"_XTA_EDIT_SCOPE_LABELS", "_XTA_STORE_EDIT_SCOPE_LABELS", "_XTA_EDIT_SCOPE_BUTTONS",
+             "_xta_edit_scope", "_xta_store_edit_scope"}
 
 
 class Segment:
@@ -54,11 +60,22 @@ def review_node(name, cutoff, *, sweep="sweep-one", grid="low_quality/demo", vie
                        for view in views})
 
 
-def load(nodes, display=None):
+@functools.lru_cache(maxsize=1)
+def profile_body():
+    """The selected functions and scope constants, in file order (as Slicer executes them); parsed once, since
+    compile() leaves the tree unchanged."""
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
-    body = [node for node in tree.body
-            if (isinstance(node, ast.FunctionDef) and node.name in FUNCTIONS)
-            or (isinstance(node, ast.Assign) and any(getattr(t, "id", None) in CONSTANTS for t in node.targets))]
+    return tuple(node for node in tree.body
+                 if (isinstance(node, ast.FunctionDef) and node.name in FUNCTIONS)
+                 or (isinstance(node, ast.Assign) and any(getattr(t, "id", None) in CONSTANTS for t in node.targets)))
+
+
+def reexecute(namespace):
+    """exec(open(path).read()) again in Slicer: the same globals, so the remembered scopes are kept."""
+    exec(compile(ast.Module(body=list(profile_body()), type_ignores=[]), str(SOURCE), "exec"), namespace)
+
+
+def load(nodes, display=None):
     record = SimpleNamespace(jobs=[], committed={}, statuses=[], exports=[])
 
     def run_jobs(worker, jobs, name):
@@ -78,12 +95,14 @@ def load(nodes, display=None):
         "_line_segments_in_segmentation_coordinates": lambda node, lines: lines,
         "_closed_curves_in_segmentation_coordinates": lambda node, curves: curves,
         "_snapshot_segment_labelmap": lambda node, sid: (node.GetID(), sid),
+        # Every in-scope mask is a marker candidate here; the probe has its own tests.
+        "_marker_candidate_segment_ids": lambda node, segment_ids, *markers: list(segment_ids),
         "_compute_remove_islands_job": object(), "_run_parallel_jobs": run_jobs,
         "_xta_commit_binary_updates": lambda results: record.committed.update(results),
         "slicer": SimpleNamespace(util=SimpleNamespace(showStatusMessage=lambda *a: record.statuses.append(a[0]))),
         "ExportXTAEdits": lambda *args, **kwargs: record.exports.append((args, kwargs)) or "exported",
     }
-    exec(compile(ast.Module(body=body, type_ignores=[]), str(SOURCE), "exec"), namespace)
+    reexecute(namespace)
     return namespace, record
 
 
@@ -95,6 +114,13 @@ def display(selected=70, scope="displayed", loaded=(50, 70, 80), enabled=True):
     return state
 
 
+def store_display(selected=70, scope="all"):
+    """The display of a store-backed review (its XTAStoreReview attached)."""
+    state = display(selected, scope)
+    state.store_review = SimpleNamespace(store=object())
+    return state
+
+
 def scene():
     ordinary = Node("manual", {"manual-1": Segment({}), "manual-2": Segment({})})
     return [review_node("cut50", 50), review_node("cut70", 70), review_node("cut80", 80), ordinary]
@@ -102,6 +128,13 @@ def scene():
 
 def edited(record):
     return {(job["node_id"], job["segment_id"]) for job in record.jobs}
+
+
+def scope_action(namespace):
+    action = SimpleNamespace(text=None)
+    action.setText = lambda text: setattr(action, "text", text)
+    namespace["_edit_scope_action"] = action
+    return action
 
 
 ORDINARY = {("manual", "manual-1"), ("manual", "manual-2")}
@@ -130,9 +163,12 @@ def test_default_scope_is_the_displayed_cutoff():
 
 def test_review_masks_without_an_active_cutoff_fail_closed_unless_scope_is_all():
     namespace, record = load(scene(), None)
-    with pytest.raises(RuntimeError, match="active 2D cutoff"):
-        namespace["_remove_marked_regions"]()
-    assert not record.jobs and not record.committed
+    assert namespace["_xta_edit_scope"] == "displayed"
+    for scope in ("displayed", "stricter"):
+        namespace["_xta_edit_scope"] = scope
+        with pytest.raises(RuntimeError, match="active 2D cutoff"):
+            namespace["_remove_marked_regions"]()
+        assert not record.jobs and not record.committed
     namespace["_xta_edit_scope"] = "all"
     namespace["_remove_marked_regions"]()
     assert len(record.jobs) == 8
@@ -162,7 +198,7 @@ def test_masks_of_another_review_are_not_scoped_by_this_cutoff():
 @pytest.mark.parametrize("scope,identity,expected", [
     ("displayed", ("s", "g", 70), True), ("displayed", ("s", "g", 80), False), ("displayed", ("s", "g", 50), False),
     ("stricter", ("s", "g", 70), True), ("stricter", ("s", "g", 80), True), ("stricter", ("s", "g", 50), False),
-    ("all", ("s", "g", 50), True), ("displayed", None, True), ("stricter", None, True)])
+    ("all", ("s", "g", 50), True), ("all", None, True), ("displayed", None, True), ("stricter", None, True)])
 def test_edit_scope_rule(scope, identity, expected):
     namespace, _ = load([], None)
     assert namespace["_xta_edit_scope_includes"](scope, identity, ("s", "g"), 70) is expected
@@ -182,13 +218,12 @@ def test_select_edit_scope_offers_current_first_persists_on_the_review_and_relab
     namespace, record = load([], state)
     prompts = []
     namespace["_choose_item"] = lambda title, prompt, names: prompts.append(names) or names[1]
-    action = SimpleNamespace(text=None)
-    action.setText = lambda text: setattr(action, "text", text)
-    namespace["_edit_scope_action"] = action
+    action = scope_action(namespace)
     assert namespace["SelectEditScope"]() == "stricter"
     assert prompts == [["Displayed cutoff", "Displayed and stricter", "All visible cutoffs"]]
     assert state.edit_scope == "stricter" and namespace["_xta_edit_scope"] == "stricter"
     assert action.text == "Scope: Displayed+Stricter"
+    assert record.statuses[-1] == "Edit scope: Displayed and stricter."
     namespace["_choose_item"] = lambda *args: None
     assert namespace["SelectEditScope"]() is None and state.edit_scope == "stricter"
     with pytest.raises(ValueError):
@@ -215,8 +250,164 @@ def test_disabled_review_display_has_no_displayed_cutoff_for_edits_or_export():
     assert record.exports == []
     included = namespace["_xta_edit_scope_includes"]
     identity = ("sweep-one", "low_quality/demo", 70)
-    # With no displayed cutoff the scoped modes fail closed; only All cutoffs proceeds.
+    # With no displayed cutoff the scoped modes fail closed; only All visible cutoffs proceeds.
     for scope in ("displayed", "stricter"):
         with pytest.raises(RuntimeError, match="without an active 2D cutoff"):
             included(scope, identity, ("sweep-one", "low_quality/demo"), None)
     assert included("all", identity, ("sweep-one", "low_quality/demo"), None)
+
+
+# --------------------------------------------------------------------------------------------
+# Per-cutoff segments and store-backed reviews remember separate scopes
+
+def test_each_review_kind_starts_with_its_own_default_scope():
+    namespace, _ = load([], None)
+    new = namespace["_xta_new_review_edit_scope"]
+    assert (namespace["_xta_edit_scope"], namespace["_xta_store_edit_scope"]) == ("displayed", "all")
+    assert new(store=False) == "displayed" and new(store=True) == "all"
+    # The open review lends its scope only to a new display of its own kind (Importer adding cutoffs, a restored
+    # review); the other kind starts with its own remembered scope.
+    namespace["_xta_active_review"] = store_display(70, "stricter")
+    assert new(store=True) == "stricter" and new(store=False) == "displayed"
+    namespace["_xta_active_review"] = display(70, "all")
+    assert new(store=False) == "all" and new(store=True) == "all"
+    namespace["_xta_store_edit_scope"] = "stricter"
+    assert new(store=True) == "stricter"
+
+
+@pytest.mark.parametrize("kind,scope,button,current", [
+    ("legacy", "displayed", "Scope: Displayed", "displayed"),
+    ("legacy", "stricter", "Scope: Displayed+Stricter", "stricter"),
+    ("legacy", "all", "Scope: All Cutoffs", "all"),
+    ("legacy", "nearby", "Scope: Displayed", "displayed"),
+    ("store", "all", "Scope: All Cutoffs", "all"),
+    ("store", "stricter", "Scope: Displayed+Stricter", "stricter"),
+    ("store", "displayed", "Scope: Displayed+Stricter", "stricter"),  # saved "displayed" acts as "stricter"
+    ("store", "nearby", "Scope: All Cutoffs", "all")])
+def test_toolbar_label_follows_the_open_review_kind(kind, scope, button, current):
+    namespace, _ = load([], (store_display if kind == "store" else display)(70, scope))
+    assert namespace["_xta_edit_scope_button_text"]() == button
+    assert namespace["_xta_current_edit_scope"]() == current
+
+
+def test_a_display_kept_from_an_earlier_version_is_classified_by_its_review_or_sources():
+    namespace, _ = load([], None)
+    store_backed = namespace["_xta_display_store_backed"]
+    assert not store_backed(None) and not store_backed(display()) and store_backed(store_display())
+    restored = display(70, "displayed")
+    restored.store_backed = True  # XTASweepDisplay.store_backed before its view-only review is attached
+    assert store_backed(restored)
+    namespace["_xta_active_review"] = restored
+    assert namespace["_xta_edit_scope_button_text"]() == "Scope: Displayed+Stricter"
+
+
+def test_a_store_backed_review_offers_two_scopes_and_refuses_displayed():
+    state = store_display(70, "all")
+    namespace, record = load([], state)
+    prompts = []
+    namespace["_choose_item"] = lambda title, prompt, names: prompts.append(names) or names[1]
+    action = scope_action(namespace)
+    assert namespace["SelectEditScope"]() == "stricter"
+    assert prompts == [["All cutoffs", "Displayed and stricter"]]
+    assert state.edit_scope == "stricter" and namespace["_xta_store_edit_scope"] == "stricter"
+    assert namespace["_xta_edit_scope"] == "displayed"  # the per-cutoff scope is not touched
+    assert action.text == "Scope: Displayed+Stricter"
+    assert record.statuses[-1] == "Edit scope: Displayed and stricter."
+    statuses = list(record.statuses)
+    for refused in ("displayed", "nearby"):
+        with pytest.raises(ValueError, match='no "displayed" edit scope' if refused == "displayed" else "one of"):
+            namespace["SelectEditScope"](refused)
+    assert state.edit_scope == "stricter" and record.statuses == statuses  # nothing changed
+    assert (namespace["_xta_edit_scope"], namespace["_xta_store_edit_scope"]) == ("displayed", "stricter")
+    assert namespace["SelectEditScope"]("all") == "all" and record.statuses[-1] == "Edit scope: All cutoffs."
+    # A review saved with "displayed" offers its "stricter" first.
+    state.edit_scope = "displayed"
+    prompts.clear()
+    namespace["_choose_item"] = lambda title, prompt, names: prompts.append(names) or None
+    assert namespace["SelectEditScope"]() is None
+    assert prompts == [["Displayed and stricter", "All cutoffs"]]
+
+
+def test_a_choice_on_one_review_kind_never_widens_the_other():
+    namespace, _ = load([], None)
+    select, new = namespace["SelectEditScope"], namespace["_xta_new_review_edit_scope"]
+    # Per-cutoff "displayed", then a store-backed review widened to "all", then per-cutoff segments again.
+    legacy = display(70, new(store=False))
+    namespace["_xta_active_review"] = legacy
+    assert select("displayed") == "displayed"
+    store = store_display(70, new(store=True))
+    assert store.edit_scope == "all"
+    namespace["_xta_active_review"] = store
+    select("stricter")
+    select("all")
+    namespace["_xta_active_review"] = None  # the scene was closed
+    assert namespace["_xta_current_edit_scope"]() == "displayed" and new(store=False) == "displayed"
+    namespace["_xta_active_review"] = display(70, new(store=False))
+    assert namespace["_xta_edit_scope_button_text"]() == "Scope: Displayed"
+    # The reverse: a store-backed "stricter" survives per-cutoff choices.
+    namespace["_xta_active_review"] = store
+    select("stricter")
+    namespace["_xta_active_review"] = display(70, new(store=False))
+    select("all")
+    namespace["_xta_active_review"] = None
+    assert new(store=True) == "stricter" and new(store=False) == "all"
+
+
+def test_with_no_review_open_the_choice_is_the_per_cutoff_scope_only():
+    namespace, record = load([], None)
+    prompts = []
+    namespace["_choose_item"] = lambda title, prompt, names: prompts.append(names) or names[2]
+    action = scope_action(namespace)
+    assert namespace["SelectEditScope"]() == "all"
+    assert prompts == [["Displayed cutoff", "Displayed and stricter", "All visible cutoffs"]]
+    assert action.text == "Scope: All Cutoffs" and record.statuses[-1] == "Edit scope: All visible cutoffs."
+    # The store-backed review keeps its own remembered scope: the default, then an earlier explicit choice.
+    for store in ("all", "stricter"):
+        namespace["_xta_store_edit_scope"] = store
+        for scope in ("stricter", "displayed", "all"):
+            namespace["SelectEditScope"](scope)
+            assert (namespace["_xta_edit_scope"], namespace["_xta_store_edit_scope"]) == (scope, store)
+            assert namespace["_xta_new_review_edit_scope"](store=True) == store
+            assert namespace["_xta_new_review_edit_scope"](store=False) == scope
+
+
+def test_remembered_scopes_set_at_the_console_are_read_as_their_kind_has_them():
+    """A remembered scope assigned without re-executing the file: a store-backed "displayed" acts as "stricter",
+    an unknown value as the kind's default, and the toolbar label and chooser never fail."""
+    namespace, _ = load([], None)
+    action = scope_action(namespace)
+    namespace["_xta_edit_scope"], namespace["_xta_store_edit_scope"] = "nearby", "displayed"
+    new = namespace["_xta_new_review_edit_scope"]
+    assert new(store=False) == "displayed" and new(store=True) == "stricter"
+    assert namespace["_xta_current_edit_scope"]() == "displayed"
+    namespace["_xta_refresh_review_actions"]()
+    assert action.text == "Scope: Displayed"
+    prompts = []
+    namespace["_choose_item"] = lambda title, prompt, names: prompts.append(names) or None
+    assert namespace["SelectEditScope"]() is None
+    assert prompts == [["Displayed cutoff", "Displayed and stricter", "All visible cutoffs"]]
+    namespace["_xta_store_edit_scope"] = "nearby"
+    assert new(store=True) == "all"
+
+
+def test_reexecution_keeps_each_kind_s_scope_and_the_toolbar_label():
+    namespace, _ = load([], None)
+    select = namespace["SelectEditScope"]
+    namespace["_xta_active_review"] = store_display(70, "all")
+    select("stricter")
+    kept = display(70, "displayed")
+    namespace["_xta_active_review"] = kept  # a per-cutoff review open while the file is executed again
+    reexecute(namespace)
+    assert (namespace["_xta_edit_scope"], namespace["_xta_store_edit_scope"]) == ("displayed", "stricter")
+    assert namespace["_xta_active_review"] is kept and kept.edit_scope == "displayed"
+    assert namespace["_xta_edit_scope_button_text"]() == "Scope: Displayed"
+    namespace["_xta_active_review"] = store_display(70, "displayed")  # kept from an earlier version
+    reexecute(namespace)
+    assert namespace["_xta_edit_scope_button_text"]() == "Scope: Displayed+Stricter"
+    # Values an earlier version may have kept: a store-backed "displayed" acts as "stricter", others default.
+    for kept_scopes, expected in ((("all", "displayed"), ("all", "stricter")),
+                                  (("nearby", "nearby"), ("displayed", "all")),
+                                  ((None, None), ("displayed", "all"))):
+        namespace["_xta_edit_scope"], namespace["_xta_store_edit_scope"] = kept_scopes
+        reexecute(namespace)
+        assert (namespace["_xta_edit_scope"], namespace["_xta_store_edit_scope"]) == expected

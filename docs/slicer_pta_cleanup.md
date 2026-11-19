@@ -35,21 +35,82 @@ existing startup script before choosing to replace it permanently.
 ### Multi-cutoff review
 
 Load the matching intensity in Slicer. In a fresh scene click **Importer** and
-select the sweep's `review/manifest.json`. Importer offers grouped review grids
-only, smallest low-quality grid first. When the sweep has a low-quality tier,
-its native grid is reference-only: it binds exported edits to the native branch
-NRRDs and is never loaded. Importer then asks which cutoffs to load as editable
-masks, with the review default first, or all of them. Click **Importer** again
-later to add cutoffs; loaded cutoffs stay. Alternatively, load grouped
-`.seg.nrrd` files through **Add Data** and click **Importer**; each group holds
-one cutoff. Importer recognizes the published segment IDs, completes each
-loaded cutoff, creates the normal smoothed surfaces from complete branch masks,
-and installs one slice overlay. Source colors and logical IDs are preserved.
-Use the matching LQ intensity or confirm **Align Native Intensity** when pairing
-a full-size intensity stack with an LQ grid. Programmatic entry supports
-`ImportXTASegments(manifest_path, grid_id="low_quality/half",
-volume_node=intensity_node, cutoff_cents=[50, 70])` with an actual grid ID from
-the package; `cutoff_cents="all"` loads every cutoff.
+select the sweep's `review/manifest.json`. Each grouped grid folder, such as
+`review/low_quality/<bin>/`, also holds a byte-identical copy of that
+`manifest.json` beside its group files, coverage labelmaps and color table.
+Choosing that copy in Importer opens the same grid. Dropping the whole folder
+into Slicer instead loads its group files as
+[per-cutoff segments](#per-cutoff-segments); then click **Importer**. If Add
+Data offers `manifest.json` as some other data type, leave it unchecked:
+Importer reads it. While the folder is still inside its review, the copy
+resolves to `review/manifest.json`, so the sweep receipt check, other grids and
+export are unchanged. A folder copied elsewhere on its own still loads,
+displays and edits, but **Export XTA Edits** then stops with a message: export
+binds each cutoff to its scalar branch manifests in the complete sweep output.
+Every grid numbers its group files from `group_0001`, so with several
+low-quality grids a folder copied on its own is identified by the grid ID in
+its group file headers, even when it was renamed. Reviews published before this
+copy existed work from `review/manifest.json`; copying that file into the grid
+folder by hand has the same effect.
+
+Importer offers grouped review grids only, smallest low-quality grid first.
+When the sweep has a low-quality tier, its native grid is reference-only: it
+binds exported edits to the native branch NRRDs and is never loaded. Use the
+matching LQ intensity or confirm **Align Native Intensity** when pairing a
+full-size intensity stack with an LQ grid.
+
+**Store-backed review.** By default Importer opens the grid store-backed: every
+cutoff is held in one in-memory store and stays editable. After the grid,
+Importer asks which cutoff to display, listing the review default first, then
+the other cutoffs, then **Per-cutoff segments (legacy)…**. If the grid already
+has an edit log, it then asks **Resume N edits (last …)** (the default) or
+**Start fresh (archive the log)**; see
+[Edit log and reopening](#edit-log-and-reopening). Then it aligns the
+intensity if needed, reads every group file of the grid into the store (a
+progress dialog names the cutoff being read; **Cancel** stops), writes the
+working segments at the displayed cutoff, replays the log and installs the
+slice overlay. A cancel or failure at any step removes what the
+import created and reopens the previous review display. Running **Importer**
+again on an open store-backed review does nothing; on a view-only one it
+rebuilds the store.
+
+Two working segmentations hold the displayed cutoff. **XTA Review Layers** has
+one segment per logical layer except the Global, named without its cutoff
+suffix and kept in one color, its lowest cutoff's (the published colors can
+differ per cutoff). **XTA Review Global** holds the Global. **2D Cutoff**
+rewrites both in place at the chosen cutoff. The 3D view shows only the
+displayed cutoff's Global, and the 3D button reads **3D: Global Only**. The
+layers stay 2D: surfaces that Segment Editor's **Show 3D** adds to XTA Review
+Layers are removed at the review's next write.
+
+**Fallback to per-cutoff segments.** Importer keeps the earlier per-cutoff
+loading when you choose **Per-cutoff segments (legacy)…**. It also uses it on
+its own for a review packaged from independent scalar runs (their cutoff masks
+need not nest), a native-resolution review grid, a manifest the store cannot
+use, and a store that would not fit in memory; the status bar says which. A
+damaged review does not fall back: when a group file is missing or unreadable,
+or its voxels disagree with the manifest, the store-backed import stops with an
+error naming the file and removes what it created. To open such a review
+anyway, choose **Per-cutoff segments (legacy)…**; that path loads only the
+cutoffs you pick and does not check voxel counts against the manifest.
+Before reading any mask, Importer estimates the store-backed review's memory
+from the manifest: the layer arrays (one byte per voxel of each layer's box,
+two or more bytes for a layer whose cutoff masks do not nest), two bytes per
+grid voxel for the store's maps, the working labelmaps, the 2D display fields
+and cache, decode buffers and up to 2 GiB of undo history. When that exceeds the
+physical memory available, it opens per-cutoff segments instead. The status
+message after a store-backed import gives the store size and the estimate. A
+scene with per-cutoff segments loaded keeps that path, and one scene cannot
+hold both kinds.
+
+Programmatic entry supports `ImportXTASegments(manifest_path,
+grid_id="low_quality/half", volume_node=intensity_node, cutoff_cents=70)` with
+an actual grid ID from the package: it opens the grid store-backed and displays
+0.70. A list such as `cutoff_cents=[50, 70]`, `cutoff_cents="all"` or
+`review_mode="legacy"` loads per-cutoff segments instead; `review_mode="store"`
+raises instead of falling back. `edit_log="resume"` or `edit_log="fresh"`
+answers the edit-log question. Without a main window Importer displays the
+review default and resumes an existing log.
 
 **2D Cutoff** selects the confidence cutoff shown over the intensity, or
 restores the original segment display. Its colors encode how many direct
@@ -57,51 +118,234 @@ prediction layers at that cutoff cover the pixel. The count starts at one,
 including a single weakly supported location. Foreground supplied only by an
 accepted interpolation or extrapolation, and remaining Global-only foreground,
 have separate colors. Global and generated masks do not add direct votes.
-A cutoff that is not loaded is shown from its published direct-count labelmap,
-read-only and without those accents. Switching the displayed cutoff does not
-change segment eyes. By default the 3D view shows only the displayed cutoff's
-surfaces; **3D: Show All Cutoffs** shows every loaded cutoff, and the button
-then offers **3D: Show Displayed Only**.
+Switching the displayed cutoff does not change segment eyes.
 
 The working label values remain the actual direct-layer counts. Colors group
 counts into 1, 2–3, 4–7, 8–15 and 16+. The display refreshes from source-mask
-edits, while ordinary slice navigation reads the existing label volume.
-Managed snips update the bounding region containing the old and new support.
+edits, while ordinary slice navigation reads the existing label volume. Toolbar
+edits update only the voxels of the segments they changed; the previous
+contribution of each changed segment is kept even when it is not in the cache.
 `XTA_SWEEP_DISPLAY_CACHE_MIB` controls the optional packed contribution cache
-(256 MiB by default). With less cache, the controller can recompute the affected
-region from current sources. The array sizes depend on the selected grid and
-maximum possible layer counts. An explicit `ImportXTASegments(...,
+(256 MiB by default). Other source changes missing from the cache recompute the
+affected region from current sources. The array sizes depend on the selected
+grid and maximum possible layer counts. An explicit `ImportXTASegments(...,
 max_working_mib=...)` or `XTA_SWEEP_DISPLAY_MAX_WORKING_MIB` sets a working
 memory limit for that workstation.
 
-Place normal **F**, **L** or **C/CC** markers over the desired structure and
-use **Remove Islands** or **Remove Slices** once. Each visible source segment in
-the edit scope receives the operation on its own complete mask and geometry.
-The scope button next to **2D Cutoff** names the current scope:
-**Scope: Displayed** (default) edits only masks at the displayed cutoff,
+### Editing a store-backed review
+
+Place normal **F**, **L** or **C/CC** markers over the structure and use
+**Remove Islands** or **Remove Slices** once. A marker must touch a visible
+layer at the displayed cutoff: a marker on voxels that only hidden layers or
+the Global show there changes nothing, and the status message names those
+layers. With **Scope: All Cutoffs** (the default) one click edits every cutoff
+of the visible layers:
+
+- At the displayed cutoff each visible layer loses the 6-connected islands the
+  marker touches, as on per-cutoff segments.
+- At stricter cutoffs it loses the same voxels.
+- At looser cutoffs, where the marked island usually joins larger regions, the
+  click removes only the looser growth of the removed island. A priority flood
+  over the union of the visible layers, ordered by the strictest cutoff that
+  still shows each voxel, splits that region between the removed island and
+  the foreground kept at the displayed cutoff (the union basin). Kept and
+  painted voxels win ties. This removes less than a click at that cutoff would,
+  which takes the whole island holding the marker there; display that cutoff
+  and click again to remove more.
+
+**Scope: Displayed+Stricter** removes the displayed islands at the displayed
+and stricter cutoffs only. A store-backed review has no **Displayed** scope
+(per-cutoff segments keep it): a scene saved with it opens as
+Displayed+Stricter, and `SelectEditScope("displayed")` refuses and changes
+nothing (see Per-cutoff segments below for how the two kinds keep their
+scopes). **Remove Slices** follows the same
+rules on the XY, YZ and XZ planes through each seed; at looser cutoffs its
+flood stays in each plane. Hidden layers never change. A click does not edit
+the Global directly: where the union of the additive layers loses voxels, the
+Global loses them too and is marked stale until **Update Global**.
+
+Each click writes one status-bar line: the voxels removed at the displayed
+cutoff, with their share of the visible layers there; the voxels removed at
+looser and at stricter cutoffs; the number of layers changed; and whether the
+Global is stale. The Python console log adds the counts per layer and cutoff.
+When a flag fires, a non-modal **click report** window lists the flagged
+layers. A layer is flagged when it lost a quarter or more of its voxels, or
+more than 100,000 voxels, at the displayed cutoff, or a quarter or more at a
+looser cutoff. The click is flagged when it removed 0.2% or more of the
+visible layers' voxels at the displayed cutoff. The window blocks nothing;
+**Undo** reverts the click.
+
+Large clicks ask first. When the islands found at the displayed cutoff,
+counted once across layers, pass 500,000 voxels, the click asks **Cancel
+(change nothing)**, the default, or **Remove them**. When the looser growth
+would remove more than 500,000 voxels beyond those, it asks **Displayed and
+stricter cutoffs only** (the default; the Displayed+Stricter result), **Remove
+at every cutoff** or **Cancel (change nothing)**. Esc cancels. Without a main
+window the defaults apply.
+
+Segment Editor paint and erase on the working segmentations are synced into
+the store about 250 ms after each stroke, and before every store action. Each
+sync is one undo entry for every layer it changed. Erase removes voxels at
+every cutoff; paint adds them at the displayed cutoff and every looser one.
+Painting a layer does not add to the Global until **Update Global**; an erase
+follows the click rule above. The Global itself is painted and erased like a
+layer. While the review is open, Segment Editor's **Modify other segments** is
+set to **Allow overlap**, and a change is turned back while the editor shows a
+working segmentation: overwriting would erase the other layers at every
+cutoff. The editor's own undo is off while it shows a working
+segmentation. Both settings return when the review closes.
+
+A working labelmap that was resampled or moved off the review lattice cannot
+be synced: it is rewritten from the store with a warning, and the stroke is
+lost. Voxels painted outside the review grid are dropped. A segment added to a
+working segmentation is not part of the store, so it is not synced, undone or
+exported. A deleted working segment comes back at the review's next write.
+Painting a layer at a cutoff where the review has no row for it is allowed,
+but exporting that cutoff then stops until those voxels are erased or the paint
+is undone. When a sync fails, the status bar says why, and a prompt offers
+**Keep them** (the default; sync again at the next action) or **Discard the
+unsynced edits** of the layers concerned.
+
+**Undo** and **Redo**, on the toolbar after Remove Markers, and Ctrl+Z /
+Ctrl+Y undo and redo the newest store edit at every cutoff it changed: a
+click, a Segment Editor sync or an update. A pending stroke is synced first, so
+Undo right after a stroke reverts it. A new edit clears Redo. The keys belong
+to the review while an editable store-backed review is open; while the Segment
+Editor shows another segmentation they are its own again. The history keeps up
+to 2 GiB of compressed changes; past that a new edit drops the oldest steps.
+Undo and Redo apply only to a store-backed review.
+
+On a store-backed review **Update Global**, **Update Nonglobal** and **Update
+Both** run at every cutoff, each as one undo entry (Update Both included), with
+the per-cutoff rules. Update Global keeps the largest 6-connected island of the
+union of all additive layers at each cutoff, hidden ones included. Update
+Nonglobal clips each additive layer to its cutoff's Global, skipping cutoffs
+whose Global is empty. Other segmentations in the scene are updated as before
+in the same click.
+
+### Edit log and reopening
+
+Every store edit, undo and redo is appended to an edit log and written to disk
+at once, so a crash loses nothing. The log lives beside the sweep folder that
+holds `review/`: for `sample_sweep/review/manifest.json` it is
+`sample_sweep.cutoff_edits/<token>/edits.xtalog`, where `<token>` is the first
+12 hexadecimal digits of the SHA-256 of the grid ID. A grid folder opened on
+its own uses `<folder>.cutoff_edits/` beside it. The review tree is never
+written. Move the `.cutoff_edits` folder with the sweep folder; a rebuild
+refuses when the review moved and its log did not.
+
+**Resume** rebuilds the store from the review and replays the log, undo and
+redo history included. **Start fresh** renames the log to
+`edits.archived-<UTC time>.xtalog` beside it and opens the review as
+published. A damaged last record is cut off with a warning. A log that is
+damaged or does not match the review cannot be replayed; Importer offers to
+archive it and start fresh. A log held by another Slicer session offers **Open
+view-only**, which replays its edits but cannot edit or export. When the log
+cannot be written, Importer offers to edit without it. When writing stops
+later, the review keeps working and its status messages say **EDIT LOG
+STOPPED**: later edits are not saved.
+
+Reopening a saved scene restores the working segmentations view-only. A prompt
+then offers **Rebuild the store and replay N logged edits** or **View only for
+now**; **Importer** also rebuilds it later. Segment Editor edits on a view-only
+review are not saved in the store or the log, and the status bar warns once.
+When the saved working segments differ from the rebuilt store, the rebuild asks
+whether to keep those edits as one Segment Editor edit (the default; Undo
+discards them), discard them, or stay view-only. Closing the scene or deleting
+a working segmentation frees the store; the log stays. Run **Importer** to
+reopen the review; it first offers to remove working segmentations left
+without their display. Executing the script again keeps an open store-backed
+review. Importer ignores a copy of a working segmentation, and Remove Islands
+and Remove Slices refuse while a copy is visible.
+
+### Export from a cutoff review
+
+For native transfer work on an LQ grid, run **Export XTA Edits**. Run
+**Update Both** first only when each cutoff's Global should be rebuilt from its
+layers with the largest-island rule (see **Stale Global** below). The output
+includes a sweep index and independently bound per-cutoff
+child edit bundles in the `xta-slicer-edits-v1` format. Use the chosen child
+with the corresponding original LQ and FQ manifests. Keep the original branch
+data and sweep review manifest available for export and transfer.
+
+On a store-backed review the toolbar button exports the cutoff the working
+segments hold, straight from the store, also with **Original segment display**
+selected. `ExportXTAEdits(review_manifest)` in the console exports every
+cutoff, and `cutoff_cents=[...]` a subset. Before writing anything, export
+checks that the grid is unit LPS and that no exported layer holds voxels at a
+cutoff where the review has no row for it. On per-cutoff segments the toolbar
+button exports the displayed cutoff, which must be loaded, and
+`ExportXTAEdits(review_manifest)` exports every loaded cutoff.
+
+**Stale Global.** A click or an erase that removes voxels from the additive
+layers' union leaves the Global stale. Update Global keeps only the largest
+6-connected island of that union, while the published Global can keep every
+island, so updating can remove a large share of it. When the Global is stale
+and Update Global would change it at an exported cutoff, export asks **Update
+Global first?** It lists, for each such cutoff, the voxels Update Global would
+remove and add there and their share of that cutoff's current Global, from a
+dry run on the store. **Export as is (the stale Global)** is the default.
+**Update Global first, then export** runs Update Global, not Update Nonglobal,
+at every cutoff as one undo entry, then exports. Esc exports nothing. Without
+a main window a stale export stops; pass `if_stale="update"` or
+`if_stale="warn"` (export as is) to `ExportXTAEdits`.
+
+### Per-cutoff segments
+
+Importer uses this earlier path in the cases listed above. It asks which
+cutoffs to load as editable masks, with the review default first, or all of
+them. Click **Importer** again later to add cutoffs; loaded cutoffs stay.
+Alternatively, load grouped `.seg.nrrd` files through **Add Data** and click
+**Importer**; each group normally holds one cutoff (groups in some early sweep
+reviews mix cutoffs, and Importer handles both). Importer recognizes the published
+segment IDs, completes each loaded cutoff, creates the normal smoothed surfaces
+from complete branch masks, and installs one slice overlay. Source colors and
+logical IDs are preserved. A cutoff that is not loaded is shown from its
+published direct-count labelmap, read-only and without the generated-only and
+Global-only accents. By default the 3D view shows only the displayed cutoff's
+surfaces; **3D: Show All Cutoffs** shows every loaded cutoff, and the button
+then offers **3D: Show Displayed Only**.
+
+Markers work as above, but each visible source segment in the edit scope
+receives the operation on its own complete mask and geometry, a visible Global
+included. The scope button next to **2D Cutoff** names the current scope:
+**Scope: Displayed** (the default) edits only masks at the displayed cutoff,
 **Scope: Displayed+Stricter** also edits higher cutoffs, and **Scope: All
-Cutoffs** edits every visible cutoff. Nested masks connect more widely at lower
-cutoffs, so the island holding a marker can be far larger there. Ordinary
-segments ignore the scope. The status message reports the scope and how many
-visible masks it left unchanged. Changed data refresh the 2D display and
-existing closed surfaces. **Update Global** rebuilds
-each cutoff from that cutoff's additive layers, preserving the existing
+Cutoffs** edits every visible loaded cutoff, each with its own connectivity.
+Nested masks connect more widely at lower cutoffs, so the island holding a
+marker can be far larger there. Ordinary segments ignore the scope. The status
+message reports the scope and how many visible masks it left unchanged. Only
+masks that a marker actually reaches are
+copied and searched, and only segments whose voxels changed are written back:
+Slicer regenerates the closed surfaces of those segments (a segment emptied
+by the edit gets an empty surface), and the 2D display updates their voxels.
+**Update Global** rebuilds
+each loaded cutoff from that cutoff's additive layers, preserving the existing
 largest-island rule. **Update Nonglobal** clips those same layers to their own
 nonempty Global. **Update Both** runs the two operations in that order. As in
 a normal scene, hidden contributors participate in recomposition, so a
-Global-only deletion can be restored from retained source masks.
+Global-only deletion can be restored from retained source masks. Both read the
+loaded labelmaps in place and write back only a Global or layer whose voxels
+change; the status message reports how many changed. The resulting masks are
+the same as before.
 
-For native transfer work on an LQ grid, run **Update Both** and **Export XTA
-Edits**. The toolbar button exports the displayed cutoff, which must be loaded;
-`ExportXTAEdits(review_manifest)` in the console exports every loaded cutoff.
-The output includes a sweep index and independently bound per-cutoff child
-edit bundles. Use the chosen child with the corresponding original LQ
-and FQ manifests. Keep the original branch data and sweep review manifest
-available for export and transfer.
+Per-cutoff segments and store-backed reviews remember separate scopes for the
+Slicer session, and each review saves its scope with the scene. A choice never
+changes the other kind's scope, so per-cutoff segments keep Displayed, or your
+last per-cutoff choice, after a store-backed review used All Cutoffs. With no
+review open, the button shows and sets the per-cutoff scope only. A new
+store-backed review opens at the last scope chosen for a store-backed review
+(All Cutoffs in a new session); change it with the button once the review is
+open.
 
-The My Tools panel uses two rows of eight buttons. One **Show All / Hide All** button toggles
-every segmentation node. Its label names the next action. When the scene is
-entirely shown or entirely hidden, the button follows the scene instead.
+### Other toolbar actions
+
+The My Tools panel uses two rows of nine buttons. The first runs from
+**Importer** to **Remove Slices**; the second starts with **Remove Markers**,
+**Undo** and **Redo** and ends with **2D Cutoff**, the scope button and the 3D
+button. One **Show All / Hide All** button toggles every segmentation node. Its
+label names the next action. When the scene is entirely shown or entirely
+hidden, the button follows the scene instead.
 
 **Highlight** draws a red silhouette outline of a surface model in every 3D
 view. With one model, it uses that model; with several, it asks which one;
@@ -115,7 +359,9 @@ asks for a parent folder. Each export writes a new `SlicerBuild_<timestamp>`
 folder with one PNG per state, `timeline.json` and a lossless 3840 x 2160,
 30 fps FFV1/MKV. FFmpeg must be on `PATH` or set in Screen Capture > Advanced.
 It renders privately from the first 3D view's camera; scene visibility and the
-camera are not changed. For other settings, call it from the console, for
+camera are not changed. On a store-backed review it renders the cutoff the
+working segments hold; it adds surfaces to XTA Review Layers only while it
+prepares the video. For other settings, call it from the console, for
 example `BuildVideo(make_mp4=True, fps=60)`.
 
 **Remove

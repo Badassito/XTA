@@ -29,8 +29,8 @@ def main():
     p.add_argument("--input", type=Path, required=True)
     p.add_argument("--retained-crop", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--ffmpeg", type=Path, default=Path.home() / "Documents/ChatGPT/Scratch/Environment/tools/ffmpeg.exe")
-    p.add_argument("--ffprobe", type=Path, default=Path.home() / "Documents/ChatGPT/Scratch/Environment/tools/ffprobe.exe")
+    p.add_argument("--ffmpeg", type=Path, default=Path("ffmpeg"), help="ffmpeg executable (default: ffmpeg on PATH)")
+    p.add_argument("--ffprobe", type=Path, default=Path("ffprobe"), help="ffprobe executable (default: ffprobe on PATH)")
     args = p.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     probe_command = [str(args.ffprobe),"-v","error","-select_streams","v:0","-show_entries",

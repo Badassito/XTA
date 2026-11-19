@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Run a small real CUDA policy pipeline and decode its independent NRRDs.
 
-Requires a local compatible segmentation model and pynrrd for header parsing.
+Requires a local compatible segmentation model. Layers are decoded on their reference
+grid through the offset-aware reconciliation reader (cropped or full stored layout).
 This checks orchestration and publication using synthetic input, not model accuracy.
 All generated inputs, caches, logs and outputs stay beneath --output.
 """
@@ -9,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-import gzip
 import json
 import os
 from pathlib import Path
@@ -21,44 +21,29 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
-def verify_outputs(output: Path) -> dict:
-    import nrrd
-    import numpy as np
-    from tools.check_tta_augmentation_run import check
+def verify_published_layers(manifest: Path) -> dict:
+    """Check component/final union semantics of one layer manifest on its reference grid.
 
-    checked = check(output)
-    assert json.loads((output / 'manifest.json').read_text())['status'] == 'complete'
-    manifest = next((output / 'nrrd').glob('*_nrrd_manifest.json'))
-    layers = json.loads(manifest.read_text())['layers']
-    decoded = {}
-    for layer in layers:
-        path = manifest.parent / layer['filename']
-        header = nrrd.read_header(str(path))
-        raw = path.read_bytes()
-        boundary = re.search(b'\r?\n\r?\n', raw)
-        assert boundary and header['encoding'] == 'gzip' and header['type'] == 'unsigned char'
-        # The production writer uses concatenated gzip members; decode every member.
-        values = np.frombuffer(gzip.decompress(raw[boundary.end():]), dtype=np.uint8)
-        values = values.reshape(tuple(header['sizes']), order='F')
-        assert np.all((values == 0) | (values == 1))
-        decoded[layer['filename']] = (values.astype(bool), header)
-    final_layers = [layer for layer in layers if layer['source'] == 'global' and layer['mask_kind'] == 'union']
+    The offset-aware reconciliation reader decodes every layer (cropped segment
+    bounding box or full raster) onto the manifest's common, validated geometry,
+    so the verdict and counts are identical for both stored layouts.
+    """
+    import numpy as np
+    from tools.nrrd_reference_grid import open_manifest_layers
+
+    with open_manifest_layers(manifest) as collection:
+        shape = collection.shape_tyx
+        # read_slab decodes every concatenated gzip member and rejects non-binary data.
+        decoded = [(layer.metadata, layer.read_slab(0, shape[0]) != 0) for layer in collection]
+    layers = [layer for layer, _data in decoded]
+    final_layers = [index for index, layer in enumerate(layers)
+                    if layer['source'] == 'global' and layer['mask_kind'] == 'union']
     assert len(final_layers) == 1
-    final, final_header = decoded[final_layers[0]['filename']]
-    inverse_directions = np.linalg.inv(np.asarray(final_header['space directions']))
-    origin = np.asarray(final_header['space origin'])
+    final = decoded[final_layers[0]][1]
     union, base, augmented = (np.zeros(final.shape, dtype=bool) for _ in range(3))
     groups = defaultdict(dict)
     rows = []
-    for layer in layers:
-        data, header = decoded[layer['filename']]
-        indices = np.column_stack(np.nonzero(data))
-        target = (np.asarray(header['space origin']) + indices @ np.asarray(header['space directions']) - origin) @ inverse_directions
-        rounded = np.rint(target).astype(np.int64)
-        assert np.allclose(rounded, target, atol=1e-6)
-        assert np.all(rounded >= 0) and np.all(rounded < np.asarray(final.shape))
-        native = np.zeros(final.shape, dtype=bool)
-        native[tuple(rounded.T)] = True
+    for layer, native in decoded:
         match = re.search(r'__policy_(\d+)$', layer['view_name'])
         policy_pass = int(match.group(1)) if match else 0
         if layer['recomposition_op'] == 'union':
@@ -77,10 +62,19 @@ def verify_outputs(output: Path) -> dict:
                      'mask_kind': layer['mask_kind'], 'policy_pass': policy_pass,
                      'foreground': int(native.sum())})
     assert np.array_equal(union, final), 'Saved component OR differs from the final union'
-    return {'checker': checked, 'final_shape_x_y_t': list(final.shape),
+    return {'final_shape_x_y_t': list(reversed(final.shape)),
             'final_foreground': int(final.sum()), 'component_union_equals_final': True,
             'augmented_voxels_outside_base': int(np.count_nonzero(augmented & ~base)),
             'fullframe_pass_foreground': dict(groups), 'layers': rows}
+
+
+def verify_outputs(output: Path) -> dict:
+    from tools.check_tta_augmentation_run import check
+
+    checked = check(output)
+    assert json.loads((output / 'manifest.json').read_text())['status'] == 'complete'
+    manifest = next((output / 'nrrd').glob('*_nrrd_manifest.json'))
+    return {'checker': checked, **verify_published_layers(manifest)}
 
 
 def main() -> int:

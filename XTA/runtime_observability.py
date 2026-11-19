@@ -840,6 +840,8 @@ class RuntimeSystemSampler:
             sample_started_ns = time.monotonic_ns()
             nvml = _load_nvidia_ml_py()
             if not self._nvml_ready:
+                if self.stop_event.is_set():  # close() may already have run; do not reopen NVML
+                    return
                 nvml.nvmlInit()
                 self._nvml_ready = True
             util = []
@@ -925,10 +927,29 @@ class RuntimeSystemSampler:
         self.thread = threading.Thread(target=self._run, name='runtime-telemetry', daemon=True)
         self.thread.start()
 
+    def _forget_after_fork_in_child(self) -> None:
+        """Leave the parent's sampling session alone in a forked child.
+
+        The child shares the parent's NVML file descriptors and RM client, and
+        the sampling thread does not exist there. Shutting NVML down in the
+        child frees that client under the still-running parent, whose GPU
+        samples then stop; every PTA render worker did so at once at each
+        pool exit, while its CUDA teardown ran (job 169102).
+        """
+        self._nvml_ready = False
+        self.thread = None
+        self.stop_event = threading.Event()
+        self.stop_event.set()
+
     def close(self) -> None:
         self.stop_event.set()
         if self.thread is not None:
             self.thread.join(timeout=min(2.0, self.interval))
+            if self.thread.is_alive():
+                # Still inside a sample (possibly an NVML call stuck in the
+                # driver): shutting NVML down under it is unsafe; process exit
+                # releases the session instead.
+                return
         if self._nvml_ready:
             try:
                 _load_nvidia_ml_py().nvmlShutdown()

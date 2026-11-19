@@ -275,6 +275,10 @@ def export_compact_evidence(run_manifest, compact_manifest, output, *, memory_mi
                     write_seg_nrrd(destination, shape_tyx=target_shape, read_slab=layer.read_slab,
                                    geometry=geometry, segment_name=metadata.get("segment_name", layer.layer_id), memory_mib=memory_mib)
                     metadata["stored_shape_tyx"] = list(target_shape)
+                    # The rewritten file stores the complete grid; cropped-layout rows say so.
+                    if "stored_offset_tyx" in metadata or "stored_layout" in metadata:
+                        metadata["stored_offset_tyx"] = [0, 0, 0]
+                        metadata["stored_layout"] = "full_reference"
                 if metadata.get("mask_kind") == "yolo":
                     key = (metadata["model_name"], metadata["layer_key"])
                     identity = hashlib.sha256((key[0]+"\0"+key[1]).encode()).hexdigest()

@@ -93,6 +93,7 @@ def _merge_rank_crop(plane, mask, top, left, level, check_previous):
 @contextmanager
 def _rank_input(cutoffs, shape, directory, read_mask_plane, read_mask_crops, budget):
     """Construct one sparse-file rank backing and certify adjacent mask inclusion."""
+    from .sweep_view_decode import store_rank_region
     backing = tempfile.TemporaryFile(dir=directory)
     try:
         ranks = None
@@ -103,8 +104,42 @@ def _rank_input(cutoffs, shape, directory, read_mask_plane, read_mask_crops, bud
         breaks = set()
         for z in range(shape[0]):
             top, bottom, left, right = native_hw[0], 0, native_hw[1], 0
+            frames = ([read_mask_crops(cent, z) for cent in cutoffs] if read_mask_crops is not None
+                      else [None]*len(cutoffs))
+            if any(getattr(crops, "wants_rank_plane", False) for crops in frames):
+                # Native journal frames merge every level in one nogil call. A
+                # level's gap test depends only on earlier frames and on itself,
+                # so all tests are known before the frame starts.
+                if plane is None:
+                    plane = np.zeros(native_hw, np.uint8)
+                merged = frames[0].merge_rank_frame(frames, plane, [
+                    level > 1 and level-1 not in breaks for level in range(1, len(cutoffs)+1)
+                ]) if hasattr(frames[0], "merge_rank_frame") else None
+                if merged is not None:
+                    populated, gaps, (y0, y1, x0, x1) = merged
+                    for level, cent in enumerate(cutoffs, 1):
+                        if gaps[level-1]:
+                            breaks.add(level-1)
+                        if populated[level-1]:
+                            present.add(cent)
+                    if any(populated):
+                        top, bottom, left, right = y0, y1, x0, x1
             for level, cent in enumerate(cutoffs, 1):
-                for y0, y1, x0, x1, raw in _crops(cent,z,native_hw,read_mask_plane,read_mask_crops):
+                crops = (frames[level-1] if read_mask_crops is not None
+                         else _crops(cent,z,native_hw,read_mask_plane,None))
+                if getattr(crops, "wants_rank_plane", False):
+                    # A native frame the fused call declined merges this level's
+                    # rows in one nogil call per payload, exactly as the per-crop
+                    # loop below would; any row it declines is still yielded to it.
+                    populated, gap, (y0, y1, x0, x1) = crops.merge_rank_level(
+                        plane, level, level > 1 and level-1 not in breaks)
+                    if gap:
+                        breaks.add(level-1)
+                    if populated:
+                        present.add(cent)
+                        top, bottom = min(top,y0), max(bottom,y1)
+                        left, right = min(left,x0), max(right,x1)
+                for y0, y1, x0, x1, raw in crops:
                     y0, y1, x0, x1 = map(operator.index, (y0,y1,x0,x1))
                     mask = np.asarray(raw)
                     if not (0 <= y0 <= y1 <= native_hw[0] and 0 <= x0 <= x1 <= native_hw[1]
@@ -131,9 +166,8 @@ def _rank_input(cutoffs, shape, directory, read_mask_plane, read_mask_crops, bud
                     ranks = _map_native_ranks(backing, shape, budget)
                 boxes[z] = (top,bottom,left,right)
                 budget.add_native_crop(z, shape, top, bottom, left, right)
-                region = (slice(top,bottom),slice(left,right))
-                ranks[z][region] = plane[region]
-                plane[region] = 0
+                # ranks[z][region] = plane[region]; plane[region] = 0, in one nogil call.
+                store_rank_region(np.asarray(ranks[z]), plane, top, bottom, left, right)
         del plane
         yield ranks, boxes, present, sorted(breaks)
     finally:

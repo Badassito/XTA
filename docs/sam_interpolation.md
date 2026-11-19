@@ -1178,7 +1178,9 @@ a diagnostic comparison of the original proposal set and records that status;
 it does not certify a complete run under changed upstream inputs.
 
 `tools/diagnose_sam_interpolation.py` provides a bounded real-data comparison
-entrypoint. Run `--help` for its staged commands. It limits case search to five
+entrypoint. Run `--help` for its staged commands. Stages that reserve the GPU
+require `--gpu-lock`; `--ffmpeg` and `--ffprobe` default to the executables on
+`PATH`. It limits case search to five
 tries and preserves detector inputs, case identities, timing, raw/selected
 support, and reviewable overlays in a persistent output directory. Scientific
 comparisons and qualification receipts belong in task Scratch, not in the

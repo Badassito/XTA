@@ -15,14 +15,17 @@ test oracles, model bundles, retained evidence, or specific hardware.
 | `export_observed_score.py` | Export one retained model/layer's numeric score on the source or portable compact grid as an ordinary scalar NRRD |
 | `xta_auto.py` | Assist the native cleanup workflow |
 | `run_transport.py` | Pack, verify, and recover stopped-run evidence |
-| `prepare_pta_input.py` | Validate and publish a PTA input pair from authoritative edited shape or strict native recovery |
+| `prepare_pta_input.py` | Validate and publish a PTA input pair from authoritative edited shape, continuous-field reconstruction or strict native recovery |
+| `verify_pta_staged_pair.py` | Check a staged PTA video/mask copy against its `preparation.json` by content hash, mode and output stem |
 | `prebuild_yolo_label_cache.py` | Build `yolo train`'s label cache for a generated dataset on a process pool; `--self-test` checks byte identity with the installed Ultralytics |
-| `slicer/xta_slicerrc.py` | Slicer toolbar and edit/export workflow |
+| `slicer/xta_slicerrc.py` | Slicer toolbar and edit/export workflow; cutoff reviews open store-backed, so one marker edits every cutoff, with Undo/Redo and an edit log |
 | `slicer/xta_upscale_preview.py` | Native/LQ alignment and preview support |
 | `xta_cut_axial_pair.py` | Crop a Slicer NPZ edit bundle and its grayscale MKV at a marker, or cut a single XTA NRRD and MKV |
 
 See [Slicer cleanup](../docs/slicer_pta_cleanup.md) and
 [run transport](../docs/run_transport.md) for workflows and required inputs.
+A store-backed cutoff review writes its edit log beside the sweep folder, in
+`<sweep folder>.cutoff_edits/`; move that folder together with the sweep.
 Mixed-confidence native transfer is described in
 [native union recovery](../docs/native_union_recovery.md).
 
@@ -42,7 +45,10 @@ grids and spatial geometry. The review records other differing configuration
 keys, so runs with different processing options remain identifiable. Legacy
 runs missing the required recorded identities cannot be packed by this tool.
 
-Open `STUDY/review/manifest.json` with the XTA Slicer importer. Each ordinary
+Open `STUDY/review/manifest.json` with the XTA Slicer importer. It opens as
+per-cutoff segments, not store-backed: masks from independent runs need not
+nest across cutoffs. A marker edit there changes only the displayed cutoff by
+default (**Scope: Displayed**). Each ordinary
 grouped segmentation retains an individual binary mask and original color for
 each contributing source layer and cutoff. A separate count overlay on each
 grid includes only the direct prediction layers for its cutoff. Existing
@@ -83,9 +89,10 @@ Bundle input defaults to a physical crop. The bundle supplies both grid sizes.
 The new output directory contains the narrower MKV, the cropped low-quality
 Global in `preview/<video-stem>.nrrd`, every named cropped layer in `edits/`
 and the cut geometry in `cut.json`. The marker plane cuts every row and frame.
-For a native-resolution training mask, use the updated `prepare_pta_input.py`
-with `--mode edited_shape --bundle-dir M3_30_cut/edits --source-video
-M3_30_cut/M3_30_5_2_2026.mkv` in the normal preparation command. The derived
+For a native-resolution training mask, run the `prepare_pta_input.py` command
+from [edited-shape reconstruction](../docs/edited_shape_reconstruction.md) with
+`--bundle-dir M3_30_cut/edits --source-video M3_30_cut/M3_30_5_2_2026.mkv`,
+plus its `--output-dir`, `--output-stem` and a new `--log-dir`. The derived
 bundle records both original grids so reconstruction samples the same positions
 in the retained region. Strict native prediction recovery requires the original bundle.
 
@@ -100,6 +107,9 @@ copying the source, include `xta_cut_edits.py`, `xta_cut_nrrd.py`,
 For manual edits that define the desired shape and separation, use
 [edited-shape reconstruction](../docs/edited_shape_reconstruction.md). It does
 not restore original native prediction components that disagree with the edit.
+[Continuous-field reconstruction](../docs/continuous_field_reconstruction.md)
+builds a smoother label from the same edited Global; keep its
+`continuous_field_reconstruction/` folder beside `prepare_pta_input.py`.
 
 ## Maintenance and release tools
 

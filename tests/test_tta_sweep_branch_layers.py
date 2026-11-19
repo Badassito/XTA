@@ -130,7 +130,10 @@ def test_explicit_empty_ref_has_stock_geometry_and_global_identity(tmp_path, sca
         assert record['native']['suffix'] == 'Global_final_output'
         assert record['native']['empty_segment'] is True
         assert record['native']['output_shape_tyx'] == [3, 5, 7]
-        assert record['native']['stored_shape_tyx'] == [3, 5, 7]
+        # Cropped default: an empty checkpoint stores one zero voxel at the grid origin.
+        assert record['native']['stored_shape_tyx'] == [1, 1, 1]
+        assert record['native']['stored_offset_tyx'] == [0, 0, 0]
+        assert record['low_quality']['0p5']['stored_shape_tyx'] == [1, 1, 1]
         assert record['native']['recomposition_op'] == 'select'
         assert record['low_quality']['0p5']['empty_segment'] is True
         assert record['low_quality']['0p5']['output_shape_tyx'] == [2, 3, 4]

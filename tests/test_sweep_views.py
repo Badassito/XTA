@@ -83,6 +83,26 @@ def test_padding_or_max_contributions_and_real_statistics(family):
         assert len(list(reader.iter_crops(0)))==2
 
 
+@pytest.mark.parametrize('route',['python','native'])
+def test_resuming_a_frame_after_close_fails_instead_of_dropping_padding(family,monkeypatch,route):
+    if route=='python':
+        monkeypatch.setenv('XTA_YOLO_SWEEP_NATIVE_DECODE','python')
+    shape=(2,8,10);w=writer(shape,padding=1)
+    for cent in w.cutoffs:
+        for z in range(2):
+            w.put(cent,z,np.ones((2,2),np.uint8),np.full((2,2),150,np.uint8),bbox=(1,3,1,3),
+                  prediction_count=1,frames_with_predictions=1)
+        w.put(cent,0,np.ones((2,2),np.uint8),np.full((2,2),230,np.uint8),
+            bbox=(2,4,2,4),is_padding=True,padding_ordinal=0,prediction_count=999)
+    seal(shape,[w.finish()])
+    reader=views.open_view('detector','transverse__tta_a0',50)
+    crops=reader.iter_crops(0)
+    next(crops)  # the range row's crop; the padding row's crop is still pending
+    reader.close()
+    with pytest.raises(RuntimeError,match='closed'):
+        list(crops)
+
+
 @pytest.mark.parametrize('score_lane',[False,True])
 def test_completed_empty_and_present_zero_score_lane_are_distinct(family,score_lane):
     shape=(2,9,11);w=writer(shape)
@@ -307,6 +327,9 @@ def test_opt_in_frame_integrity_remains_available(family,monkeypatch):
 
 
 def test_mask_only_reader_skips_score_bytes_and_inflation(family,monkeypatch):
+    # Counts Python zlib calls, so pin the Python route; the native route's
+    # mask-only reads are covered in test_sweep_view_native_decode.py.
+    monkeypatch.setenv('XTA_YOLO_SWEEP_NATIVE_DECODE','python')
     w=writer((1,4,5))
     for c in w.cutoffs:w.put(c,0,np.ones((2,3),np.uint8),np.full((2,3),200,np.uint8),bbox=(1,3,1,4))
     receipt=w.finish();seal((1,4,5),[receipt])

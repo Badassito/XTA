@@ -25,7 +25,8 @@ def api():
     for node in tree.body:
         if isinstance(node, ast.Import) and any((a.asname or "").startswith("_xta_display_") for a in node.names):
             selected.append(node)
-        elif isinstance(node, ast.FunctionDef) and (node.name.startswith("_xta_display_") or node.name == "_xta_sweep_json"):
+        elif isinstance(node, ast.FunctionDef) and (node.name.startswith("_xta_display_") or node.name in (
+                "_xta_sweep_json", "_xta_sweep_grid_folder", "_xta_sweep_review_relative")):
             selected.append(node)
         elif isinstance(node, ast.ClassDef) and node.name == "XTASweepDisplay":
             selected.append(node)

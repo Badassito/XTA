@@ -83,13 +83,17 @@ class OutputLoad:
     def run(self, index):
         self.thread_index.index = index
         while not self.stop.is_set():
+            # Deliberately the full-raster layout: it is the historical writer load,
+            # and close() verifies decoded payloads against full-grid fixture hashes.
             if self.mirrors:
                 outputs.write_layer_nrrd_with_low_quality_mirrors(self.ref, self.ref.shape,
                     self.root / f'load-{index}.seg.nrrd',
-                    [(self.mirror_shape, self.root / f'load-{index}-mirror.seg.nrrd')], z_shards=1)
+                    [(self.mirror_shape, self.root / f'load-{index}-mirror.seg.nrrd')], z_shards=1,
+                    layout=outputs.NRRD_LAYER_LAYOUT_FULL)
             else:
                 outputs.write_single_layer_nrrd_from_ref(self.ref, self.ref.shape,
-                    self.root / f'load-{index}.seg.nrrd', z_shards=1)
+                    self.root / f'load-{index}.seg.nrrd', z_shards=1,
+                    layout=outputs.NRRD_LAYER_LAYOUT_FULL)
             self.counts[index] += 1
 
     def start(self):

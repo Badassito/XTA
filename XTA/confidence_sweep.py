@@ -394,15 +394,21 @@ def _run_child(command, env, *, started=None):
             tree = _PosixProcessTree(process)
         if started is not None:
             started(process.pid)
+        launched = time.monotonic()
         while True:
             try:
                 returncode = process.wait(timeout=.25)
                 break
             except subprocess.TimeoutExpired:
                 continue
+        exited = time.monotonic()
         if not _wait_tree(tree,_CHILD_SETTLE_SECONDS):
             _stop_child(process,tree)
             raise RuntimeError('Scalar cutoff exited with live descendants; refusing completion')
+        # Compare with the child's own "End-to-end pipeline walltime" line: the
+        # difference is interpreter/resource teardown after its pipeline ended.
+        print(f'Scalar cutoff process {process.pid} lived {exited - launched:.1f}s; '
+              f'descendants settled {time.monotonic() - exited:.1f}s after exit.', flush=True)
         return returncode
     except BaseException:
         if process is not None:
@@ -907,6 +913,16 @@ def _release_owned_lock(path, sweep_id):
     path.unlink()
 
 
+def _work_storage(work_parent):
+    """Record whether --temp keeps the transient sweep files in memory (manifest ``work_storage``)."""
+    from .runtime import path_is_memory_backed
+    try:
+        memory_backed = bool(path_is_memory_backed(work_parent))
+    except Exception:
+        memory_backed = None
+    return {'root': str(work_parent), 'memory_backed': memory_backed}
+
+
 def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
                          temp_root=None, min_conf=0.0):
     """Run independent scalar branches and atomically publish one family receipt.
@@ -949,6 +965,9 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
             raise FileExistsError(f'Confidence sweep output is already reserved; use a fresh output directory: {occupied[0]}')
         work_parent = Path(temp_root).expanduser().resolve() if temp_root is not None else Path(tempfile.gettempdir()).resolve()
         _check_work_destination(work_parent,root,'--temp',reserved_outputs)
+        work_storage = _work_storage(work_parent)
+        print(f"Confidence sweep workspace: {work_parent} "
+              f"({'memory-backed' if work_storage['memory_backed'] else 'disk-backed'}).", flush=True)
         if capture_root is not None:
             _check_work_destination(capture_root,root,'--capture_component_replay',reserved_outputs)
         work_parent.mkdir(parents=True, exist_ok=True)
@@ -962,7 +981,7 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
             'branch_policy': ('independent_scalar_suffix_with_native_fanout' if fanout_enabled
                               else 'independent_scalar_full_pipeline'),
             'mode_arguments': [str(value) for value in mode_arguments],
-            'work_directory': str(work),
+            'work_directory': str(work), 'work_storage': work_storage,
             'forward_cache': {'requested_budget_gib': float(cache_gib),
                 'budget_gib': float(cache_gib) if len(cents)>1 else 0.,
                 'lifetime': 'family_owned_transient'},
@@ -1049,9 +1068,12 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
                 row['status'] = 'failed'
                 raise subprocess.CalledProcessError(returncode, command)
             receipt_path = branch['output'] / 'manifest.json'
+            validation_started = time.monotonic()
             receipt_versions[receipt_path] = _file_identity(receipt_path)
             receipt, identity, digest = _receipt(receipt_path,
                 sweep_id=sweep_id, cent=cent, min_conf=min_conf)
+            print(f'Validated cutoff {cent / 100:.2f} receipt in {time.monotonic() - validation_started:.1f}s.',
+                  flush=True)
             if reference is not None and identity != reference:
                 raise ValueError('Input/model/configuration identity changed between confidence cutoffs')
             reference = identity

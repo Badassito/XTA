@@ -5,7 +5,6 @@ The original predates manual cleanup. Overlap-region metrics reduce unrelated
 object removals but do not constitute exact per-object source correspondence.
 """
 import argparse
-import gzip
 import hashlib
 import json
 from pathlib import Path
@@ -15,25 +14,24 @@ import cv2
 import numpy as np
 from scipy import ndimage as ndi
 
+if __package__:
+    from .nrrd_reference_grid import inspect_reference_raster, read_reference_planes
+else:
+    from nrrd_reference_grid import inspect_reference_raster, read_reference_planes
+
 
 def plane(path, t):
-    fields = {}
-    with path.open('rb') as f:
-        for line in iter(f.readline, b''):
-            if not line.strip():
-                break
-            text = line.decode().strip()
-            if ':' in text:
-                k, v = text.split(':', 1)
-                fields[k] = v.strip()
-        shape = tuple(map(int, fields['sizes'].split()[::-1]))
-        if fields['encoding'] != 'gzip' or fields['type'] != 'unsigned char':
-            raise ValueError('Expected gzip uint8 NRRD')
-        count = shape[1] * shape[2]
-        with gzip.GzipFile(fileobj=f) as payload:
-            payload.seek(t * count)
-            data = payload.read(count)
-    return np.frombuffer(data, np.uint8).reshape(shape[1:]) > 0, shape, hashlib.sha256(data).hexdigest()
+    """Return reference plane ``t`` as bool, the reference (t,Y,X) shape and the plane's SHA-256.
+
+    A cropped (segment bounding box) layer is expanded onto its reference grid, so the
+    plane, shape and hash equal those of the same layer's full raster.
+    """
+    raster = inspect_reference_raster(path)
+    if raster.encoding not in ('gzip', 'gz') or raster.stored_shape is None or len(raster.stored_shape) != 3:
+        raise ValueError('Expected gzip uint8 NRRD')
+    planes, shape = read_reference_planes(raster, t, t + 1)
+    data = memoryview(np.ascontiguousarray(planes[0])).cast('B')
+    return planes[0] > 0, shape, hashlib.sha256(data).hexdigest()
 
 
 def metrics(a, b):

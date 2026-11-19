@@ -13,6 +13,7 @@ def main():
     p.add_argument("--output",type=Path,required=True)
     p.add_argument("--seconds",type=float,default=180)
     p.add_argument("--device",type=int,default=0)
+    p.add_argument("--gpu-lock",type=Path,required=True,help="Shared GPU reservation file")
     args=p.parse_args()
     args.output.mkdir(parents=True,exist_ok=True)
     spec=importlib.util.spec_from_file_location("diagnostic",Path(__file__).parent/"diagnose_sam_interpolation.py")
@@ -20,7 +21,7 @@ def main():
     spec.loader.exec_module(diagnostic)
     stop=threading.Event()
     counts={"cpu_matmuls":0,"gpu_matmuls":0}
-    with diagnostic.gpu_lock(Path.home() / "Documents/ChatGPT/Scratch/Temp/GPU_LOCK","sam_improvements_heatsoak"),diagnostic.resource_monitor(args.output/"resources.json",args.device):
+    with diagnostic.gpu_lock(args.gpu_lock,"sam_improvements_heatsoak"),diagnostic.resource_monitor(args.output/"resources.json",args.device):
         os.environ["OPENBLAS_NUM_THREADS"]="8"
         os.environ["MKL_NUM_THREADS"]="8"
         os.environ["OMP_NUM_THREADS"]="8"

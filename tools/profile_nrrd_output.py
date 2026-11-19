@@ -3,13 +3,16 @@
 The default invocation writes a plan only. ``--execute`` creates one production
 CVOL fixture, writes it through NrrdLayerSink in each mode, and verifies every
 decoded NRRD against the fixture's SHA-256. No GPU code is used.
+
+The sink publishes the production stored layout (the cropped segment bounding
+box); the plan and each run record it, and verification hashes every file's
+reference-grid reconstruction, so the fixture hash applies to either layout.
 """
 from __future__ import annotations
 
 import argparse
 from collections import defaultdict
 from contextlib import contextmanager
-import gzip
 import hashlib
 import importlib.util
 import json
@@ -25,6 +28,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from XTA import interpolation, outputs, runtime, nrrd_compression
+from tools.nrrd_reference_grid import inspect_reference_raster, reference_payload_sha256
 
 
 class OutputLoadFixture:
@@ -110,6 +114,7 @@ def plan(*, output_dir: Path, deps_dir: Path, shape: tuple[int, int, int],
         'total_jobs': int(jobs * len(modes)), 'sink_workers': int(sink_workers),
         'gzip_workers': int(gzip_workers), 'fill_workers': int(fill_workers),
         'codec': 'libdeflate', 'gpu_used': False,
+        'nrrd_layer_layout': outputs.NRRD_LAYER_LAYOUT_CROPPED,
         'mirror_scale': mirror_scale,
         'fixture_cvol': str(fixture_cvol.resolve()) if fixture_cvol else None,
         'measurement': 'submission through all NrrdLayerSink jobs complete; exact decode outside timing',
@@ -228,14 +233,16 @@ class TimedExecutor:
 
 
 def _decoded_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open('rb') as stream:
-        while stream.readline().strip():
-            pass
-        with gzip.GzipFile(fileobj=stream) as decoded:
-            while block := decoded.read(8 * 1024**2):
-                digest.update(block)
-    return digest.hexdigest()
+    """SHA-256 of the layer's reference-grid bytes; cropped and full layouts agree."""
+    return reference_payload_sha256(path)
+
+
+def _decoded_proof_key(path: Path, encoded: str) -> str:
+    """Equal encoded payloads share a decode only when they also share a placement."""
+    raster = inspect_reference_raster(path)
+    if not raster.cropped:
+        return encoded
+    return f'{encoded}@{raster.offset_tyx}{raster.stored_shape}{raster.reference_shape}'
 
 
 def _gzip_payload_sha256(path: Path) -> str:
@@ -255,10 +262,11 @@ def _verify_nrrd_files(paths: list[Path], verified_payloads: dict[str, str]) -> 
     actual_decodes = 0
     for path in paths:
         encoded = _gzip_payload_sha256(path)
-        decoded = verified_payloads.get(encoded)
+        proof_key = _decoded_proof_key(path, encoded)
+        decoded = verified_payloads.get(proof_key)
         if decoded is None:
             decoded = _decoded_sha256(path)
-            verified_payloads[encoded] = decoded
+            verified_payloads[proof_key] = decoded
             actual_decodes += 1
         encoded_hashes[path.name] = encoded
         decoded_hashes[path.name] = decoded
@@ -331,7 +339,8 @@ def _run_mode(*, mode: str, root: Path, evidence_root: Path,
               load: OutputLoadFixture | ExistingCvolFixture, jobs: int,
               sink_workers: int, deflate_module: object,
               mirror_spec=None, expected_mirror: str | None = None,
-              verified_payloads: dict[str, str] | None = None) -> dict:
+              verified_payloads: dict[str, str] | None = None,
+              layer_layout: str = outputs.NRRD_LAYER_LAYOUT_CROPPED) -> dict:
     enabled = mode != 'off'
     timings = ThreadTimings()
     environment = {
@@ -389,7 +398,8 @@ def _run_mode(*, mode: str, root: Path, evidence_root: Path,
             sink = outputs.NrrdLayerSink(nrrd_dir=root / f'nrrd-{mode}', stem='load',
                 output_shape_tyx=load.ref.shape, max_workers=sink_workers,
                 low_quality_specs=[mirror_spec] if mirror_spec else None,
-                low_quality_root=root / f'low_quality-{mode}' if mirror_spec else None)
+                low_quality_root=root / f'low_quality-{mode}' if mirror_spec else None,
+                layer_layout=layer_layout)
             started = time.perf_counter()
             try:
                 for index in range(jobs):
@@ -423,6 +433,7 @@ def _run_mode(*, mode: str, root: Path, evidence_root: Path,
             'mode': mode, 'jobs': jobs, 'wall_seconds': wall,
             'logical_mib_per_second': logical_bytes / (1024**2 * wall),
             'codec': codec[0], 'all_exact': exact,
+            'nrrd_layer_layout': getattr(sink, 'layer_layout', None),
             'fixture_sha256': load.expected, 'output_sha256': hashes,
             'output_encoded_sha256': encoded_hashes,
             'mirror_sha256': mirror_hashes,

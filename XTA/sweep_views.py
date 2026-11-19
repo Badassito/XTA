@@ -12,6 +12,7 @@ from collections import OrderedDict, deque
 import hashlib
 import json
 import math
+import mmap
 import os
 from pathlib import Path
 import re
@@ -818,6 +819,182 @@ def view_family_status(model_name,view_name,cutoff,*,native_shape=None,identity=
     return None if meta is None else meta['status']
 
 
+class _PositionalPayload:
+    """Slice-only positional reads of a payload that cannot be memory-mapped.
+
+    Used by the Python reader when a filesystem refuses shared mappings; each
+    slice is one positional read, so no stream position is shared.
+    """
+    __slots__ = ('_path', '_size')
+
+    def __init__(self, path, size):
+        self._path, self._size = path, int(size)
+
+    def __len__(self):
+        return self._size
+
+    def __getitem__(self, part):
+        start, stop, step = part.indices(self._size)
+        if step != 1:
+            raise ValueError('Positional payload reads are contiguous')
+        count = max(0, stop-start)
+        with open(self._path, 'rb') as stream:
+            if hasattr(os, 'pread'):
+                return os.pread(stream.fileno(), count, start)
+            stream.seek(start)
+            return stream.read(count)
+
+
+class _PayloadMapping:
+    """A read-only mapping of one acknowledged payload file.
+
+    Readers slice it positionally, so no stream position or lock is shared
+    between frames or held across yields. Each array slice keeps the mapping
+    exported, so ``close`` can never unmap bytes that a decode still reads; it
+    then leaves the unmap to the last reference. A filesystem that refuses a
+    shared mapping gets positional reads (Python reader only).
+    """
+    __slots__ = ('array', '_mapping')
+
+    def __init__(self, path):
+        with open(path, 'rb') as stream:
+            size = os.fstat(stream.fileno()).st_size
+            # An empty file cannot be mapped; reading it fails exactly as a stream does.
+            try:
+                self._mapping = mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) if size else None
+            except (OSError, ValueError):
+                self._mapping = None
+                self.array = _PositionalPayload(path, size)
+                return
+        self.array = np.frombuffer(self._mapping, np.uint8) if size else np.empty(0, np.uint8)
+
+    def close(self):
+        self.array = None
+        mapping, self._mapping = self._mapping, None
+        if mapping is not None:
+            try:
+                mapping.close()
+            except BufferError:
+                pass  # a decode still holds a slice; the mapping closes with it
+
+
+class _MaskFrameCrops:
+    """Lazy ``iter_mask_crops`` result: five-tuples, plus a fused native rank merge.
+
+    Iterating it behaves exactly like the generator it replaces. A projection
+    rank input may instead call ``merge_rank_level`` first: rows the native
+    route accepts are merged into the plane in one nogil call each and only
+    the remaining rows (decoded by the Python reader) are then yielded.
+    """
+    __slots__ = ('_reader', '_z', '_pending', '_iterator')
+
+    def __init__(self, reader, z):
+        self._reader, self._z = reader, z
+        self._pending = None
+        self._iterator = None
+
+    def _rows(self):
+        if self._pending is None:
+            self._pending = [(row, path) for row, path in self._reader._rows(self._z) if row['state'] != 1]
+        return self._pending
+
+    @property
+    def wants_rank_plane(self):
+        """True when ``merge_rank_level`` can take at least one row of this frame."""
+        reader = self._reader
+        return (self._iterator is None and reader._decoder is not None
+                and any(not reader._verification[path] for _row, path in self._rows()))
+
+    def merge_rank_level(self, plane, level, check_previous):
+        """Merge native rows like per-crop ``_merge_rank_crop``; return (populated, gap, box).
+
+        ``box`` is (top, bottom, left, right) over populated strips. Rows of
+        one payload merge in one nogil call; rows the native route declines
+        stay in this iterator for the caller's own loop.
+        """
+        if self._iterator is not None:
+            raise RuntimeError('Native rank merge must precede crop iteration')
+        reader = self._reader
+        height, width = reader.shape[1:]
+        populated = gap = False
+        top, bottom, left, right = height, 0, width, 0
+        groups = {}
+        for row, path in self._rows():
+            groups.setdefault(path, []).append(row)
+        remaining = []
+        for path, rows in groups.items():
+            # Within one level the merge order of rows cannot change any result.
+            result = reader._merge_rows(path, [(row, level, check_previous) for row in rows], plane)
+            if result is None:
+                remaining.extend((row, path) for row in rows)
+                continue
+            outcome, (row_top, row_bottom, row_left, row_right) = result
+            reader._count_read(int(outcome[:, 2].sum()))
+            gap = gap or bool(outcome[:, 1].any())
+            if outcome[:, 0].any():
+                populated = True
+                top, bottom = min(top, row_top), max(bottom, row_bottom)
+                left, right = min(left, row_left), max(right, row_right)
+        self._pending = remaining
+        return populated, gap, (top, bottom, left, right)
+
+    def merge_rank_frame(self, frames, plane, checks):
+        """Merge every level of one frame in a single nogil call, or return None.
+
+        ``frames[i]`` is level ``i+1``'s ``iter_mask_crops`` result and
+        ``checks[i]`` its previous-level gap test; levels merge in order, as
+        the per-level loop does. Applies only when every row is native and in
+        one payload (a frame's real rows of all cutoffs share their task range);
+        otherwise nothing is touched and the caller merges level by level.
+        Returns (populated by level, gap by level, box over populated strips).
+        """
+        entries, owners, path = [], [], None
+        for level, (frame, check) in enumerate(zip(frames, checks), 1):
+            if type(frame) is not _MaskFrameCrops or frame._iterator is not None:
+                return None
+            reader = frame._reader
+            if reader._decoder is None:
+                return None
+            for row, row_path in frame._rows():
+                if reader._verification[row_path] or (path is not None and row_path != path):
+                    return None
+                path = row_path
+                entries.append((row, level, check))
+                owners.append(reader)
+        if not entries:
+            return None
+        result = owners[0]._merge_rows(path, entries, plane)
+        if result is None:
+            return None
+        outcome, box = result
+        populated, gaps = [False]*len(frames), [False]*len(frames)
+        for (_row, level, _check), owner, (row_populated, row_gap, read) in zip(entries, owners, outcome.tolist()):
+            owner._count_read(read)
+            populated[level-1] = populated[level-1] or bool(row_populated)
+            gaps[level-1] = gaps[level-1] or bool(row_gap)
+        for frame in frames:
+            frame._pending = []
+        return populated, gaps, box
+
+    def _generate(self):
+        reader = self._reader
+        for row, path in self._rows():
+            for y0, y1, x0, x1, mask, _ in reader._row_crops(row, path, False):
+                yield y0, y1, x0, x1, mask
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._iterator is None:
+            self._iterator = self._generate()
+        return next(self._iterator)
+
+    def close(self):
+        if self._iterator is not None:
+            self._iterator.close()
+
+
 class NativeViewReader:
     def __init__(self, root, meta, cutoff):
         self.root, self.metadata, self.cutoff = root, meta, cutoff
@@ -826,8 +1003,9 @@ class NativeViewReader:
         self.frames_with_predictions = int(meta['frames_with_predictions'][str(cutoff)])
         self.has_foreground = bool(meta['has_foreground'][str(cutoff)])
         self._closed, self._ranges = False, []
-        self._read_lock=threading.RLock()
-        self._streams=OrderedDict()
+        # Guards only the mapping cache and metrics; never held across a decode or yield.
+        self._state_lock=threading.Lock()
+        self._payloads=OrderedDict()
         self._padding={}
         self._verification={}
         self.io_metrics=dict(payload_open_calls=0,payload_read_bytes=0)
@@ -842,92 +1020,200 @@ class NativeViewReader:
                 self._padding.setdefault(int(row['frame']),[]).append((row,path))
         self._starts = [m['frame_start'] for m,_,_ in self._ranges]
         self.has_score_lane = any(np.any(rows['score']) for _,rows,_ in self._ranges)
+        # Integrity mode stays on the Python reader, which owns crc/sha checks.
+        self._decoder=None
+        if not all(self._verification.values()):
+            from .sweep_view_decode import native_view_decoder
+            self._decoder=native_view_decoder()[0]
 
     def _rows(self, z):
         if self._closed:
             raise RuntimeError('Native view reader is closed')
         if not 0 <= int(z) < self.shape[0]:
             raise IndexError('Native view frame is out of range')
+        selected = []
         pos = bisect_right(self._starts, int(z))-1
         if pos >= 0:
             meta, rows, path = self._ranges[pos]
             local = int(z)-meta['frame_start']
             if local < meta['frame_count']:
-                yield rows[local], path
-        yield from self._padding.get(int(z),())
+                selected.append((rows[local], path))
+        # Snapshot padding rows now: close() clears them, and a suspended
+        # iterator resumed after close must fail on its next read, not end early.
+        selected.extend(self._padding.get(int(z),()))
+        yield from selected
 
-    def _stream(self,path):
-        stream=self._streams.pop(path,None)
-        if stream is None:
-            stream=path.open('rb')
-            self.io_metrics['payload_open_calls']+=1
-        self._streams[path]=stream
-        while len(self._streams)>2:
-            _,old=self._streams.popitem(last=False)
+    def _payload(self,path):
+        """Return the mapped payload array; at most two mappings stay cached."""
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError('Native view reader is closed')
+            entry=self._payloads.pop(path,None)
+            if entry is None:
+                entry=_PayloadMapping(path)
+                self.io_metrics['payload_open_calls']+=1
+            self._payloads[path]=entry
+            evicted=[]
+            while len(self._payloads)>2:
+                evicted.append(self._payloads.popitem(last=False)[1])
+            array=entry.array
+        for old in evicted:
             old.close()
-        return stream
+        return array
+
+    def _count_read(self,nbytes):
+        with self._state_lock:
+            self.io_metrics['payload_read_bytes']+=nbytes
+
+    def _row_values(self,row):
+        """The kernels' row parameters (sweep_view_decode.ROW_PARAMETERS)."""
+        return (int(row['offset']),int(row['length']),int(row['chunks']),int(row['y0']),
+                int(row['y1']),int(row['x0']),int(row['x1']),self.shape[1],self.shape[2],
+                int(row['score']),_CHUNK_BYTES)
+
+    def _row_params(self,row):
+        return np.array(self._row_values(row),np.int64)
+
+    def _native_payload(self,path):
+        """The mapped payload for the native route, or None to use the Python reader."""
+        if self._decoder is None or self._verification[path]:
+            return None
+        try:
+            payload=self._payload(path)
+        except OSError:
+            return None  # the Python reader reports the failure exactly
+        return payload if isinstance(payload,np.ndarray) else None
+
+    def _decode_row(self,row,path,include_scores):
+        """Decode one row in a single nogil call; None means use the Python reader."""
+        payload=self._native_payload(path)
+        if payload is None:
+            return None
+        status,bounds,starts,masks,scores,read=self._decoder.decode_row(
+            payload,self._row_params(row),include_scores)
+        if status:
+            return None
+        self._count_read(int(read))
+        masks.setflags(write=False)
+        with_scores=bool(include_scores and row['score'])
+        if with_scores:
+            scores.setflags(write=False)
+        crops=[]
+        for start,(y0,y1,x0,x1) in zip(starts.tolist(),bounds.tolist()):
+            part=slice(start,start+(y1-y0)*(x1-x0))
+            mask=masks[part].reshape(y1-y0,x1-x0)
+            crops.append((y0,y1,x0,x1,mask,scores[part].reshape(mask.shape) if with_scores else None))
+        return crops
+
+    def _merge_rows(self,path,entries,plane):
+        """Merge (row, level, check) entries of one payload in one nogil call.
+
+        Returns (outcome rows (populated, gap, read bytes), box) or None when
+        declined, in which case the plane is unchanged.
+        """
+        payload=self._native_payload(path)
+        if payload is None or type(plane) is not np.ndarray or plane.dtype!=np.uint8 \
+                or plane.ndim!=2 or not plane.flags.c_contiguous or not plane.flags.writeable:
+            return None
+        table=np.array([(*self._row_values(row),int(level),int(bool(check))) for row,level,check in entries],np.int64)
+        status,outcome,top,bottom,left,right=self._decoder.merge_rank_rows(payload,table,plane)
+        if status:
+            return None
+        return outcome,(int(top),int(bottom),int(left),int(right))
+
+    def _python_row_crops(self,row,path,include_scores):
+        """Specification reader for one row: positional slices of the mapped payload.
+
+        Reads, checks, messages and partial yields are those of the original
+        seek/read stream reader, including reads that run past the row.
+        """
+        try:
+            payload=None
+            position=int(row['offset'])
+            consumed = 0
+            verify=self._verification[path]
+            frame_digest=hashlib.sha256() if verify else None
+            for _ in range(int(row['chunks'])):
+                if payload is None:
+                    payload=self._payload(path)
+                header = payload[position:position+_CHUNK.size]
+                position += len(header)
+                if len(header) != _CHUNK.size:
+                    raise SweepViewIntegrityError('Truncated native crop header')
+                y0,y1,x0,x1,ml,sl,mc,sc,mraw,sraw = _CHUNK.unpack(header)
+                area = (y1-y0)*(x1-x0)
+                if not (int(row['y0']) <= y0 < y1 <= int(row['y1']) <= self.shape[1] and int(row['x0']) <= x0 < x1 <= int(row['x1']) <= self.shape[2]) or area > _CHUNK_BYTES or mraw != (area+7)//8 or sraw != (area if row['score'] else 0):
+                    raise SweepViewIntegrityError('Native crop exceeds bounded geometry')
+                if ml > mraw+1024 or sl > sraw+1024 or bool(sl)!=bool(row['score']) or ml+sl+_CHUNK.size > int(row['length'])-consumed:
+                    raise SweepViewIntegrityError('Native crop encoded lengths are invalid')
+                mb=payload[position:position+ml]
+                position += len(mb)
+                if include_scores or verify:
+                    sb=payload[position:position+sl]
+                    position += len(sb)
+                else:
+                    position += sl
+                    sb=None
+                self._count_read(_CHUNK.size+len(mb)+(0 if sb is None else len(sb)))
+                if len(mb)!=ml or (sb is not None and len(sb)!=sl):
+                    raise SweepViewIntegrityError('Native crop bytes changed')
+                if verify:
+                    prefix=struct.pack('<8I',y0,y1,x0,x1,ml,sl,mraw,sraw)
+                    checksum=zlib.crc32(prefix)
+                    if zlib.crc32(mb,checksum)!=mc or zlib.crc32(sb,checksum)!=sc:
+                        raise SweepViewIntegrityError('Native crop bytes changed')
+                    frame_digest.update(header);frame_digest.update(mb);frame_digest.update(sb)
+                def inflate(raw, expected):
+                    decoder=zlib.decompressobj(); value=decoder.decompress(raw,expected+1)
+                    if len(value)!=expected or not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
+                        raise SweepViewIntegrityError('Native crop compression is malformed')
+                    return value
+                mask=np.unpackbits(np.frombuffer(inflate(mb,mraw),np.uint8),bitorder='little',count=area).reshape(y1-y0,x1-x0)
+                score=None if not include_scores or not row['score'] else np.frombuffer(inflate(sb,sraw),np.uint8).reshape(mask.shape)
+                mask.setflags(write=False)
+                consumed += _CHUNK.size+ml+sl
+                # No mapping slice or array is held across the yield, so a
+                # suspended iterator never keeps a closed reader's payload
+                # mapped (Windows could not then delete the file).
+                header=mb=sb=payload=None
+                yield y0,y1,x0,x1,mask,score
+            if consumed != int(row['length']):
+                raise SweepViewIntegrityError('Native frame has unindexed payload bytes')
+            if verify and frame_digest.digest()!=row['sha256'].tobytes():
+                raise SweepViewIntegrityError('Native frame checksum differs from its acknowledged index')
+        except (OSError, zlib.error, ValueError, struct.error) as exc:
+            raise SweepViewIntegrityError('Cannot read acknowledged native crop') from exc
+
+    def _row_crops(self,row,path,include_scores):
+        """One row's crops: the native decode, else the Python reader (exact errors)."""
+        crops=self._decode_row(row,path,include_scores)
+        return self._python_row_crops(row,path,include_scores) if crops is None else crops
 
     def _iter_crops(self,z,include_scores):
         for row, path in self._rows(z):
             if row['state'] == 1:
                 continue
-            try:
-                with self._read_lock:
-                    stream=self._stream(path)
-                    stream.seek(int(row['offset']))
-                    consumed = 0
-                    verify=self._verification[path]
-                    frame_digest=hashlib.sha256() if verify else None
-                    for _ in range(int(row['chunks'])):
-                        header = stream.read(_CHUNK.size)
-                        if len(header) != _CHUNK.size:
-                            raise SweepViewIntegrityError('Truncated native crop header')
-                        y0,y1,x0,x1,ml,sl,mc,sc,mraw,sraw = _CHUNK.unpack(header)
-                        area = (y1-y0)*(x1-x0)
-                        if not (int(row['y0']) <= y0 < y1 <= int(row['y1']) <= self.shape[1] and int(row['x0']) <= x0 < x1 <= int(row['x1']) <= self.shape[2]) or area > _CHUNK_BYTES or mraw != (area+7)//8 or sraw != (area if row['score'] else 0):
-                            raise SweepViewIntegrityError('Native crop exceeds bounded geometry')
-                        if ml > mraw+1024 or sl > sraw+1024 or bool(sl)!=bool(row['score']) or ml+sl+_CHUNK.size > int(row['length'])-consumed:
-                            raise SweepViewIntegrityError('Native crop encoded lengths are invalid')
-                        mb=stream.read(ml)
-                        if include_scores or verify:
-                            sb=stream.read(sl)
-                        else:
-                            stream.seek(sl,1)
-                            sb=None
-                        self.io_metrics['payload_read_bytes']+=_CHUNK.size+len(mb)+(0 if sb is None else len(sb))
-                        if len(mb)!=ml or (sb is not None and len(sb)!=sl):
-                            raise SweepViewIntegrityError('Native crop bytes changed')
-                        if verify:
-                            prefix=struct.pack('<8I',y0,y1,x0,x1,ml,sl,mraw,sraw)
-                            checksum=zlib.crc32(prefix)
-                            if zlib.crc32(mb,checksum)!=mc or zlib.crc32(sb,checksum)!=sc:
-                                raise SweepViewIntegrityError('Native crop bytes changed')
-                            frame_digest.update(header);frame_digest.update(mb);frame_digest.update(sb)
-                        def inflate(raw, expected):
-                            decoder=zlib.decompressobj(); value=decoder.decompress(raw,expected+1)
-                            if len(value)!=expected or not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
-                                raise SweepViewIntegrityError('Native crop compression is malformed')
-                            return value
-                        mask=np.unpackbits(np.frombuffer(inflate(mb,mraw),np.uint8),bitorder='little',count=area).reshape(y1-y0,x1-x0)
-                        score=None if not include_scores or not row['score'] else np.frombuffer(inflate(sb,sraw),np.uint8).reshape(mask.shape)
-                        mask.setflags(write=False)
-                        consumed += _CHUNK.size+ml+sl
-                        yield y0,y1,x0,x1,mask,score
-                    if consumed != int(row['length']):
-                        raise SweepViewIntegrityError('Native frame has unindexed payload bytes')
-                    if verify and frame_digest.digest()!=row['sha256'].tobytes():
-                        raise SweepViewIntegrityError('Native frame checksum differs from its acknowledged index')
-            except (OSError, zlib.error, ValueError, struct.error) as exc:
-                raise SweepViewIntegrityError('Cannot read acknowledged native crop') from exc
+            yield from self._row_crops(row,path,include_scores)
 
     def iter_crops(self,z):
         """Yield bounded six-tuples (y0,y1,x0,x1,mask,score|None)."""
         yield from self._iter_crops(z,True)
 
     def iter_mask_crops(self,z):
-        """Yield five-tuples, skipping compressed score I/O in normal mode."""
-        for y0,y1,x0,x1,mask,_ in self._iter_crops(z,False):
-            yield y0,y1,x0,x1,mask
+        """Iterate five-tuples, skipping compressed score I/O in normal mode.
+
+        The lazy iterator also offers the projection rank input a fused
+        native merge (``_MaskFrameCrops.merge_rank_level``).
+        """
+        return _MaskFrameCrops(self,z)
+
+    def read_frame_crops(self,z,include_scores=True):
+        """Return all of frame z's six-tuples (score None when not requested) at once.
+
+        Each native row is one nogil decode call; integrity errors are raised
+        before any crop is returned.
+        """
+        return list(self._iter_crops(z,bool(include_scores)))
 
     def read_mask_plane(self, z):
         output=np.zeros(self.shape[1:],np.uint8)
@@ -945,12 +1231,13 @@ class NativeViewReader:
         return output
 
     def close(self):
-        with self._read_lock:
+        with self._state_lock:
             self._closed=True
-            for stream in self._streams.values():stream.close()
-            self._streams.clear()
+            payloads=list(self._payloads.values())
+            self._payloads.clear()
             self._ranges.clear()
             self._padding.clear()
+        for payload in payloads:payload.close()
 
     def __enter__(self):
         return self

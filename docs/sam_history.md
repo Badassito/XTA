@@ -206,7 +206,10 @@ The additional improvement tools keep research separate from production:
 | `audit_sam_context.py` | Audit original observation masks without labels to identify artificial diagnostic ROI-boundary censoring |
 | `qualify_sam_tiled_integration.py` | Exercise the actual assembly/runtime seam on a bounded native-source fixture; its canvas is explicitly distinct from ordinary CLI processing-cube preparation |
 
-Run each tool's `--help` for its input/output contract. Nearest-anchor SAM fusion
+Run each tool's `--help` for its input/output contract. Tools and stages that
+reserve the GPU take the shared reservation file from `--gpu-lock`, which has no
+default; video decoding uses `ffmpeg`/`ffprobe` from `PATH` unless `--ffmpeg` and
+`--ffprobe` name the executables. Nearest-anchor SAM fusion
 and subpixel SDF transport remain research variants after their separate
 development and held-out comparisons. They do not change production fusion,
 the backend selector, stock defaults, or tile gate. Their measured tradeoffs
@@ -267,10 +270,12 @@ The experiment runner has separate endpoint and SAM stages:
 ```text
 python tools/compare_sam_crop_strategies.py endpoints --images SOURCE.u8.dat \
   --shape T H W --frame-start FIRST_FRAME --frames ANCHOR_A ANCHOR_B \
-  --detector DETECTOR.pt --imgsz 3072 --conf 0.15 --output ENDPOINT_DIRECTORY
+  --detector DETECTOR.pt --imgsz 3072 --conf 0.15 --output ENDPOINT_DIRECTORY \
+  --gpu-lock GPU_LOCK_FILE
 
 python tools/compare_sam_crop_strategies.py run --plan STRATEGY_PLAN.json \
-  --model SAM_BUNDLE --repeats 2 --cache-mib 512 --output EXPERIMENT_DIRECTORY
+  --model SAM_BUNDLE --repeats 2 --cache-mib 512 --output EXPERIMENT_DIRECTORY \
+  --gpu-lock GPU_LOCK_FILE
 ```
 
 The runner validates the frozen plans and seed geometry before model work and

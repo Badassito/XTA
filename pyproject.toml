@@ -27,6 +27,7 @@ acceleration = ["deflate>=0.9.0", "isal"]
 pta = ["pynrrd", "albumentations"]
 cleanup = ["scikit-image"]
 lta = ["pynrrd"]
+registration = ["SimpleITK", "pynrrd"]
 
 [project.scripts]
 xta = "XTA.cli:run"
@@ -45,9 +46,10 @@ version = {attr = "XTA.__version__"}
 "share/xta" = [
   "README.md",
   "ARCHITECTURE.md",
-  "Opus-5.5_v26.0.0_SLURM.py",
+  "Opus-5.5_v26.0.1_SLURM.py",
 ]
 "share/xta/docs" = ["docs/*.md"]
 "share/xta/tools/slicer" = ["tools/slicer/*.py"]
 "share/xta/tools/cpu_backend_benchmarks" = ["tools/cpu_backend_benchmarks/*.py"]
+"share/xta/tools/continuous_field_reconstruction" = ["tools/continuous_field_reconstruction/*.py"]
 "share/xta/tools" = ["tools/*.py", "tools/*.md"]

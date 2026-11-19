@@ -170,7 +170,8 @@ class _StorageFileLock:
                 pass
 
 
-def _record_publication_stages(view, metrics, confidence_thread_seconds, layers_seconds):
+def _record_publication_stages(view, metrics, confidence_thread_seconds, layers_seconds,
+                               confidence_process_seconds=0.0):
     """Telemetry: where one sibling publication spent its time."""
     try:
         from .runtime import runtime_telemetry
@@ -179,11 +180,61 @@ def _record_publication_stages(view, metrics, confidence_thread_seconds, layers_
         for stage, seconds in (("rank_input", metrics.get("rank_input_seconds", 0.0)),
                                ("projection", metrics.get("projection_seconds", 0.0)),
                                ("confidence_thread", confidence_thread_seconds),
+                               ("confidence_process", confidence_process_seconds),
                                ("layers_barrier", layers_seconds)):
             telemetry.add(f"sweep.publication.stage.{stage}_seconds", float(seconds))
             telemetry.add(f"sweep.publication.stage.{family}.{stage}_seconds", float(seconds))
     except Exception:
         pass
+
+
+def _record_evidence_fallback():
+    """Telemetry: one sibling layer written on a producer thread after the worker pool broke."""
+    try:
+        from .runtime import runtime_telemetry
+        runtime_telemetry().add("sweep.publication.evidence_process.thread_fallback_layers", 1)
+    except Exception:
+        pass
+
+
+# ``publish_view_family`` default: the caller did not declare its native crops
+# to be the sealed journal view, so evidence is read through those crops.
+_NO_NATIVE_JOURNAL = object()
+
+
+def _record_evidence_process(outcome, queue_seconds):
+    """Telemetry: one evidence worker job (its CPU is outside the producer's own counters)."""
+    try:
+        from .runtime import runtime_telemetry
+        telemetry = runtime_telemetry()
+        telemetry.add("sweep.publication.evidence_process.jobs", 1)
+        telemetry.add("sweep.publication.evidence_process.wall_seconds", float(outcome.wall_seconds))
+        telemetry.add("sweep.publication.evidence_process.cpu_seconds", float(outcome.cpu_seconds))
+        telemetry.add("sweep.publication.evidence_process.queue_seconds", float(queue_seconds))
+    except Exception:
+        pass
+
+
+def _start_worker_pool(purpose, start, description):
+    """Start one producer worker pool, or return None so that work stays on threads.
+
+    The thread path writes the same bytes, so a pool that cannot start (process,
+    descriptor or memory limits on the node) degrades the run instead of failing it.
+    """
+    try:
+        pool = start()
+    except Exception as error:
+        print(f"Warning: sweep {purpose} worker pool could not start "
+              f"({type(error).__name__}: {error}); using producer threads.", flush=True)
+        try:
+            from .runtime import runtime_telemetry
+            runtime_telemetry().gauge(f"sweep.publication.worker_pool_start_failed.{purpose.replace(' ', '_')}",
+                                      f"{type(error).__name__}: {error}"[:200])
+        except Exception:
+            pass
+        return None
+    print(f"Sweep {purpose}: {description}.", flush=True)
+    return pool
 
 
 def _retire_store(path, expected, parent, cutoff):
@@ -193,7 +244,18 @@ def _retire_store(path, expected, parent, cutoff):
             or _store_identity(path) != expected):
         return 0
     for name in _CVOL_FILES:
-        (path / name).unlink()
+        try:
+            (path / name).unlink()
+        except PermissionError:
+            if os.name != "nt":
+                raise
+            # Windows cannot delete a mapped file. A reader's frame can outlive
+            # its read inside an exception traceback cycle (numba raises and
+            # catches while it compiles a kernel lazily on a writer thread), so
+            # collect such cycles once before failing.
+            import gc
+            gc.collect()
+            (path / name).unlink()
     path.rmdir()
     return sum(identity[2] for identity in expected.values())
 
@@ -232,6 +294,8 @@ class ViewMajorPublication:
         self._lock = threading.Lock()
         self._executor = None
         self._confidence_pool = None
+        self._evidence_processes = None
+        self._nrrd_processes = None
         self._layers = None
         self._confidence = {}
         self._floor_views = set()
@@ -327,6 +391,29 @@ class ViewMajorPublication:
             thread_name_prefix="sweep-confidence")
         siblings = {}
         try:
+            producing = os.environ.get("XTA_YOLO_SWEEP_NATIVE_ROLE") == "produce"
+            if producing:
+                # Sibling layer files leave this process's GIL: each write holds it
+                # for 0.1-1.0 s of glue around its nogil kernels. The sinks keep
+                # every name, row and record; workers return the plans they wrote.
+                from .sweep_nrrd_processes import (SweepNrrdProcessPool, nrrd_codec_identity,
+                                                   sweep_nrrd_process_count)
+                nrrd_processes = sweep_nrrd_process_count(self.publishers, siblings_count)
+                try:
+                    codec = nrrd_codec_identity()
+                except Exception as error:
+                    codec, codec_error = None, f"{type(error).__name__}: {error}"
+                else:
+                    codec_error = "a hardware or substituted codec" if codec is None else None
+                # A codec a worker cannot reproduce (hardware sessions) keeps threads.
+                if not nrrd_processes:
+                    print("Sweep NRRD files: producer threads (XTA_YOLO_SWEEP_NRRD_PROCESSES=0).", flush=True)
+                elif codec is None:
+                    print(f"Sweep NRRD files: producer threads ({codec_error}).", flush=True)
+                else:
+                    self._nrrd_processes = _start_worker_pool(
+                        "NRRD files", lambda: SweepNrrdProcessPool(nrrd_processes),
+                        f"{nrrd_processes} worker processes, codec {codec[0]} level {codec[1]}")
             for cent in self.cutoffs[1:]:
                 root = self._branch_dir(cent)
                 uid = branch_run_id(self.sweep_id, cent)
@@ -334,7 +421,8 @@ class ViewMajorPublication:
                     nrrd_dir=root/"nrrd", stem=self.scalar_sink.stem, run_id=uid,
                     output_shape_tyx=self.shape, max_workers=fanout,
                     low_quality_specs=self.scalar_sink.low_quality_specs,
-                    low_quality_root=root/"low_quality", executor=self._executor)
+                    low_quality_root=root/"low_quality", executor=self._executor,
+                    layer_file_processes=self._nrrd_processes)
                 floors = {backend: max(cent/100., float(floor))
                           for backend, floor in floor_by_backend.items()}
                 self._confidence[cent] = SweepObservedConfidenceWriter(
@@ -342,10 +430,29 @@ class ViewMajorPublication:
                     run_id=uid, task=task, min_conf=min_conf, confidence_floor_by_backend=floors)
             self._layers = TtaSweepBranchLayers(siblings, primary_cutoff=self.current,
                                                  max_pending_layers=len(siblings))
+            # Sibling evidence is GIL-bound beside NRRD encoding and projection
+            # in this process; worker processes reopen the sealed native journal
+            # instead. Only the inference-owning producer has that journal, and
+            # the writers above already compiled the kernels the workers load.
+            if producing:
+                from .sweep_evidence_processes import (SweepEvidenceProcessPool,
+                                                       sweep_evidence_process_count)
+                processes = sweep_evidence_process_count(self.publishers, siblings_count)
+                if processes:
+                    self._evidence_processes = _start_worker_pool(
+                        "confidence evidence", lambda: SweepEvidenceProcessPool(processes),
+                        f"{processes} worker processes")
+                else:
+                    print("Sweep confidence evidence: producer threads "
+                          "(XTA_YOLO_SWEEP_EVIDENCE_PROCESSES=0).", flush=True)
         except BaseException:
             self._executor.shutdown(wait=True)
             if self._confidence_pool is not None:
                 self._confidence_pool.shutdown(wait=True)
+            if self._evidence_processes is not None:
+                self._evidence_processes.close()
+            if self._nrrd_processes is not None:
+                self._nrrd_processes.close()
             raise
 
     def _key(self, view):
@@ -389,10 +496,16 @@ class ViewMajorPublication:
     def publish_view_family(self, view, *, native_shape, read_mask_plane, read_score_plane,
                             counts_by_cutoff, primary_already_published=True,
                             read_mask_crops=None, read_native_crops=None,
-                            retain_empty_orthogonal=False):
+                            retain_empty_orthogonal=False,
+                            native_journal_identity=_NO_NATIVE_JOURNAL):
         """Return sibling refs after durable publication, or None for pre-write fallback.
 
-        Safe to call concurrently for different views.
+        Safe to call concurrently for different views. Pass
+        ``native_journal_identity`` (the identity, possibly None, that the
+        caller's ``read_native_crops`` readers were opened with) only when those
+        crops are exactly this view's sealed native journal: evidence worker
+        processes then reopen the journal themselves instead of calling
+        ``read_native_crops``. Without it, evidence always reads the given crops.
         """
         if not primary_already_published:
             raise ValueError("The primary scalar owner must retain its own publication")
@@ -416,14 +529,15 @@ class ViewMajorPublication:
             return self._publish_unlocked(view, key, siblings, counts, allowance,
                 native_shape=native_shape, read_mask_plane=read_mask_plane,
                 read_score_plane=read_score_plane, read_mask_crops=read_mask_crops,
-                read_native_crops=read_native_crops, retain_empty_orthogonal=retain_empty_orthogonal)
+                read_native_crops=read_native_crops, retain_empty_orthogonal=retain_empty_orthogonal,
+                native_journal_identity=native_journal_identity)
         finally:
             with self._lock:
                 self._inflight_views.discard(key)
 
     def _publish_unlocked(self, view, key, siblings, counts, allowance, *, native_shape,
                           read_mask_plane, read_score_plane, read_mask_crops, read_native_crops,
-                          retain_empty_orthogonal):
+                          retain_empty_orthogonal, native_journal_identity):
         from .assembly import project_sweep_view
         from .geometry import view_output_token
         from .sweep_backprojection import SweepProjectionUnsupported
@@ -477,6 +591,17 @@ class ViewMajorPublication:
         # different products) on its own native reader; projection has finished
         # with them. A receipt still waits for its cutoff's durable evidence.
         confidence_seconds = []
+        process_seconds = []
+        pool = self._evidence_processes
+        journal = None
+        if (pool is not None and not pool.broken and read_native_crops is not None
+                and native_journal_identity is not _NO_NATIVE_JOURNAL):
+            # The caller declared its crop readers to be this sealed journal
+            # view; a worker reopens it by identity instead of borrowing the
+            # producer's GIL. A broken pool sends every view to producer threads.
+            from .sweep_evidence_processes import resolve_native_journal_view
+            journal = resolve_native_journal_view(self.model_name, view.name, native_shape,
+                                                  siblings, native_journal_identity)
 
         def publish_confidence(cent):
             started = time.perf_counter()
@@ -489,7 +614,44 @@ class ViewMajorPublication:
             finally:
                 confidence_seconds.append(time.perf_counter() - started)
 
-        evidence = {cent: self._confidence_pool.submit(publish_confidence, cent) for cent in siblings}
+        def record_process(outcome, queue_seconds):
+            process_seconds.append(outcome.wall_seconds)
+            _record_evidence_process(outcome, queue_seconds)
+
+        def retry_on_thread(cent):
+            # Every worker has exited (the pool joined them): no process still
+            # holds this layer's files, and the thread writes identical bytes.
+            future = self._confidence_pool.submit(publish_confidence, cent)
+            _record_evidence_fallback()
+            return future
+
+        def start_confidence(cent):
+            from concurrent.futures.process import BrokenProcessPool
+            from .sweep_evidence_processes import FailedEvidence, ProcessEvidence, ThreadEvidence
+            try:
+                if journal is None:
+                    return ThreadEvidence(self._confidence_pool.submit(publish_confidence, cent))
+                writer = self._confidence[cent]
+                request = writer.begin_view(view, self.model_name, native_shape=native_shape)
+            except Exception as error:
+                return FailedEvidence(error)
+            try:
+                submitted = time.time()
+                future = pool.submit(journal, cent, request)
+            except BaseException as error:
+                writer.abandon_view(request)
+                if not isinstance(error, Exception):
+                    raise
+                if isinstance(error, BrokenProcessPool):
+                    try:
+                        return ThreadEvidence(retry_on_thread(cent))
+                    except Exception as failure:
+                        return FailedEvidence(failure)
+                return FailedEvidence(error)
+            return ProcessEvidence(writer, request, future, pool=pool, submitted_wall=submitted,
+                                   on_outcome=record_process, retry=partial(retry_on_thread, cent))
+
+        evidence = {}
         published = {}
 
         def completed(cent, _, records):
@@ -500,12 +662,20 @@ class ViewMajorPublication:
             published[cent] = records
         layers_started = time.perf_counter()
         try:
+            for cent in siblings:
+                evidence[cent] = start_confidence(cent)
+            layers_started = time.perf_counter()
             self._layers.publish_view(key,refs,view_token=view_output_token(view),completed=completed)
         finally:
-            # Never leave evidence writers running past this view's outcome.
-            futures_wait(tuple(evidence.values()))
+            # Never leave evidence writers running past this view's outcome;
+            # worker layers are adopted (or their reservations released) here.
+            futures_wait(tuple(task.future for task in evidence.values() if task.future is not None))
+            for task in evidence.values():
+                task.settle()
+            # Layers of a broken worker pool are re-written on producer threads.
+            futures_wait(tuple(task.retry for task in evidence.values() if task.retry is not None))
             _record_publication_stages(view, metrics, sum(confidence_seconds),
-                                       time.perf_counter() - layers_started)
+                                       time.perf_counter() - layers_started, sum(process_seconds))
         for cent in siblings:
             evidence[cent].result()  # durable evidence precedes every receipt
         for cent in siblings:
@@ -542,6 +712,13 @@ class ViewMajorPublication:
                 self._adopted_files[ref.path] = receipt["ref"]["files"]
             return ref,count
 
+    def cancel(self, reason=None):
+        """Run-failure teardown: never start queued evidence or NRRD jobs (close joins the workers)."""
+        if self._evidence_processes is not None:
+            self._evidence_processes.cancel()
+        if self._nrrd_processes is not None:
+            self._nrrd_processes.cancel()
+
     def close(self):
         with self._lock:
             if self._closed:
@@ -555,6 +732,11 @@ class ViewMajorPublication:
                     self._executor.shutdown(wait=True)
                 if self._confidence_pool is not None:
                     self._confidence_pool.shutdown(wait=True)
+                if self._evidence_processes is not None:
+                    self._evidence_processes.close()
+                # Every sibling sink drained above; no layer job is still queued.
+                if self._nrrd_processes is not None:
+                    self._nrrd_processes.close()
                 if self.progress is not None and self.current == self.cutoffs[0]:
                     self.scalar_sink.set_layer_publication_observer(None)
                 # Resource teardown joins the scalar sink, union workers and all

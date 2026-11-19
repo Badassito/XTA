@@ -1,6 +1,7 @@
 """Explicit per-cutoff observed-confidence publication for shared view inference."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 import threading
@@ -386,6 +387,49 @@ class _MaskedCropFrameEncoder:
                                              compression_seconds=time.perf_counter() - started)
 
 
+@dataclass(frozen=True)
+class SweepEvidenceRequest:
+    """Picklable inputs of one reserved sibling evidence layer (no reader, no lock).
+
+    ``SweepObservedConfidenceWriter.begin_view`` creates it; the layer is then
+    written by ``write_sweep_view_evidence`` in a writer thread or an evidence
+    worker process, and adopted with ``complete_view`` (or released with
+    ``abandon_view``).
+    """
+    output_dir: str
+    identity: str
+    model_name: str
+    layer_key: str
+    native_shape: tuple
+    source_shape: tuple
+    provenance: dict
+
+    @property
+    def token(self):
+        return (self.model_name, self.layer_key)
+
+    @property
+    def path(self):
+        return Path(self.output_dir) / self.identity
+
+
+def write_sweep_view_evidence(request, read_native_crops, *, metrics=None):
+    """Encode one reserved layer from its native crops and return its evidence reference.
+
+    The bytes depend only on the request and the crops, so a thread of the
+    producer and an evidence worker process write identical files.
+    """
+    reader = _MaskedCropFrameEncoder(request.native_shape, read_native_crops)
+    try:
+        return write_block_confidence_evidence(request.path, request.native_shape, reader,
+            layer_key=request.layer_key, model_name=request.model_name,
+            provenance=request.provenance, coordinate_space='native_view_processing',
+            source_shape_tyx=request.source_shape, metrics=metrics)
+    finally:
+        # The encoder's frame plane is this call's only dense workspace.
+        reader = None
+
+
 class SweepObservedConfidenceWriter:
     """Retain each branch's numeric observations without the scalar singleton.
 
@@ -393,6 +437,8 @@ class SweepObservedConfidenceWriter:
     return uint8 native-view planes after the ordinary scalar cleanup. ``None``
     denotes a declared empty plane. This writer is for deferred native evidence;
     confidence-reconciliation source projection keeps the existing scalar path.
+    A layer can also be written elsewhere (an evidence worker process): reserve
+    it with ``begin_view``, then ``complete_view`` or ``abandon_view``.
     """
 
     def __init__(self, output_dir, *, cutoff_hundredths, source_shape_tyx, run_id,
@@ -432,11 +478,13 @@ class SweepObservedConfidenceWriter:
         _write_json_atomic(self.manifest_path, dict(schema=SCHEMA, run_id=self.run_id,
             purpose='observed_prediction_confidence', observed_confidence=self.contract, layers=layers))
 
-    def publish_view(self, view, model_name, *, native_shape, read_scores=None, read_mask=None,
-                     layer_key=None, source='fullframe', stage='pre_interpolation',
-                     tile_config_id='', tile_acceptance='', read_native_crops=None,
-                     metrics=None):
-        """Write one layer; ``metrics`` (optional dict) receives the writer's phase timings."""
+    def begin_view(self, view, model_name, *, native_shape, layer_key=None, source='fullframe',
+                   stage='pre_interpolation', tile_config_id='', tile_acceptance=''):
+        """Reserve one layer and return its picklable ``SweepEvidenceRequest``.
+
+        The layer stays pending (``finish`` refuses) until ``complete_view`` or
+        ``abandon_view``; a second reservation of the same layer is rejected.
+        """
         from .cuda_d1 import _nrrd_layer_key
 
         shape = checked_shape(native_shape)
@@ -449,31 +497,62 @@ class SweepObservedConfidenceWriter:
             if token in self._references or token in self._pending:
                 raise RuntimeError(f'Duplicate sweep confidence layer {token!r}')
             self._pending.add(token)
-        reader = None
         try:
-            crops = (read_native_crops if read_native_crops is not None
-                     else _MaskedScorePlanes(shape, read_mask, read_scores).iter_crops)
-            reader = _MaskedCropFrameEncoder(shape, crops)
             provenance = dict(view=_json_value(view), processing_shape_tyx=list(shape),
                 source=source, mask_kind='yolo', stage=stage,
                 tile_config_id=tile_config_id, tile_acceptance=tile_acceptance,
                 confidence_scope='surviving observed prediction support before interpolation',
                 observed_confidence=self.contract, run_id=self.run_id,
                 confidence_sweep=dict(cutoff_hundredths=self.cutoff))
-            reference = write_block_confidence_evidence(self.output / identity, shape, reader,
-                layer_key=key, model_name=str(model_name), provenance=provenance,
-                coordinate_space='native_view_processing', source_shape_tyx=self.source_shape,
-                metrics=metrics)
-            with self._lock:
-                updated = {**self._references, token: reference}
-                self._publish_catalogue(updated)
-                self._references = updated
-            return reference
-        finally:
-            # The encoder's frame plane is this call's only dense workspace.
-            reader = crops = None
+            return SweepEvidenceRequest(output_dir=str(self.output), identity=identity,
+                model_name=token[0], layer_key=key, native_shape=shape,
+                source_shape=self.source_shape, provenance=provenance)
+        except BaseException:
             with self._lock:
                 self._pending.remove(token)
+            raise
+
+    def complete_view(self, request, reference):
+        """Adopt a durable layer written for ``request`` into this cutoff's catalogue."""
+        with self._lock:
+            if request.token not in self._pending:
+                raise RuntimeError(f'Sweep confidence layer was not reserved: {request.token!r}')
+            try:
+                if (Path(reference.path) != request.path
+                        or (reference.model_name, reference.layer_key) != request.token
+                        or reference.storage_shape != tuple(request.native_shape)):
+                    raise RuntimeError(f'Sweep confidence layer differs from its reservation: '
+                                       f'{request.token!r}')
+                updated = {**self._references, request.token: reference}
+                self._publish_catalogue(updated)
+                self._references = updated
+            finally:
+                self._pending.remove(request.token)
+        return reference
+
+    def abandon_view(self, request):
+        """Release a reservation whose layer was not written (or failed)."""
+        with self._lock:
+            self._pending.discard(request.token)
+
+    def publish_view(self, view, model_name, *, native_shape, read_scores=None, read_mask=None,
+                     layer_key=None, source='fullframe', stage='pre_interpolation',
+                     tile_config_id='', tile_acceptance='', read_native_crops=None,
+                     metrics=None):
+        """Write one layer; ``metrics`` (optional dict) receives the writer's phase timings."""
+        request = self.begin_view(view, model_name, native_shape=native_shape, layer_key=layer_key,
+            source=source, stage=stage, tile_config_id=tile_config_id,
+            tile_acceptance=tile_acceptance)
+        try:
+            crops = (read_native_crops if read_native_crops is not None
+                     else _MaskedScorePlanes(request.native_shape, read_mask, read_scores).iter_crops)
+            reference = write_sweep_view_evidence(request, crops, metrics=metrics)
+        except BaseException:
+            self.abandon_view(request)
+            raise
+        finally:
+            crops = None
+        return self.complete_view(request, reference)
 
     def finish(self):
         """Publish an empty catalogue too when no observed view was requested."""

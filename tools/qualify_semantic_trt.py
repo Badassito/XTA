@@ -4,14 +4,13 @@ Modes are legacy CPU cleanup, GPU cleanup, and GPU cleanup plus the TensorRT
 ring. Direct-source timings include preprocess, inference, semantic decoding,
 warp, and union. Raw AutoBackend forward timings are a separate calibration.
 Optional full TTA runs measure pipeline wall time and compare published PNGs.
-All evidence is written below sibling Scratch/Experiments/v24-semantic-ring.
+All evidence is written to a new --output directory below sibling Scratch.
 The local 4090 mobile eGPU verifies CUDA behavior; its throughput is not an
 estimate of H100 performance.
 """
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import faulthandler
 import json
 import math
@@ -30,8 +29,6 @@ if str(ROOT) not in sys.path:
 from tools.gpu_reservation import GpuReservation
 
 SCRATCH = ROOT.parent / 'Scratch'
-DEFAULT_INPUT = SCRATCH / 'Experiments' / 'v24-semantic' / 'input.mkv'
-DEFAULT_OUTPUT_PARENT = SCRATCH / 'Experiments' / 'v24-semantic-ring'
 LOCK = SCRATCH / 'Temp' / 'GPU_LOCK'
 MODES = (
     ('legacy', '0', '0'),
@@ -629,9 +626,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--engine', type=_case_spec, action='append', default=[],
                         help='Repeat SIZE:BATCH:PATH, e.g. 512:2:C:\\models\\semantic.engine')
-    parser.add_argument('--input', type=Path, default=DEFAULT_INPUT if DEFAULT_INPUT.is_file() else None,
+    parser.add_argument('--input', type=Path,
                         help='Representative video; omit for deterministic synthetic frames')
-    parser.add_argument('--output', type=Path, default=None)
+    parser.add_argument('--output', type=Path, help='New evidence directory below sibling Scratch (required)')
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--frames', type=int, default=16)
     parser.add_argument('--conf', type=float, default=0.25)
@@ -671,9 +668,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error('Full TTA pipeline comparison requires --input; or pass --skip-pipeline')
     if args.pipeline_mode and 'legacy' not in args.pipeline_mode and not args.skip_pipeline:
         parser.error('Pipeline comparison must include --pipeline-mode legacy')
-    output = (args.output or DEFAULT_OUTPUT_PARENT / datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')).resolve()
-    if not output.is_relative_to(DEFAULT_OUTPUT_PARENT.resolve()) or output.exists():
-        parser.error(f'Use a new --output beneath {DEFAULT_OUTPUT_PARENT}')
+    if args.output is None:
+        parser.error('--output is required: a new evidence directory below sibling Scratch')
+    output = args.output.resolve()
+    scratch = SCRATCH.resolve()
+    if output == scratch or not output.is_relative_to(scratch) or output.exists():
+        parser.error(f'Use a new --output beneath {SCRATCH}')
     if any(int(case['batch']) > int(args.frames) for case in args.engine):
         parser.error('--frames must be at least as large as every requested batch')
     output.mkdir(parents=True)

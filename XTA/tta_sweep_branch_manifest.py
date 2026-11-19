@@ -64,6 +64,14 @@ def _check_file(path, identity):
         raise ValueError(f'Prepublished NRRD payload changed after publication: {path}')
 
 
+def _check_layout(row, sink):
+    # A run never mixes layouts: rows carry the cropped placement keys exactly when the
+    # adopting sink writes cropped layers (NrrdLayerSink.layer_layout; historical sinks are full).
+    cropped=getattr(sink,'layer_layout','full')=='cropped'
+    if ('stored_offset_tyx' in row)!=cropped or ('stored_layout' in row)!=cropped:
+        raise ValueError('Prepublished layer stored layout differs from the scalar sink layer layout')
+
+
 def _check_row(row, ref, *, output_shape, native, native_row, provenance):
     if not isinstance(row,dict):
         raise ValueError('Prepublished layer manifest row must be an object')
@@ -74,6 +82,21 @@ def _check_row(row, ref, *, output_shape, native, native_row, provenance):
     stored=_shape(row.get('stored_shape_tyx'),'Published stored grid')
     if any(actual>bound for actual,bound in zip(stored,output_shape)):
         raise ValueError('Prepublished layer stored crop exceeds its output grid')
+    # Cropped-layout rows place their stored box; rows without these keys store the full grid.
+    offset=row.get('stored_offset_tyx')
+    if 'stored_offset_tyx' in row:
+        if (not isinstance(offset,(list,tuple)) or len(offset)!=3
+                or any(type(item) is not int or item<0 for item in offset)):
+            raise ValueError('Prepublished layer stored offset requires three nonnegative integers')
+        if any(start+size>bound for start,size,bound in zip(offset,stored,output_shape)):
+            raise ValueError('Prepublished layer stored crop exceeds its output grid')
+    if 'stored_layout' in row:
+        layout=row.get('stored_layout')
+        if layout not in ('segment_bounding_box','full_reference'):
+            raise ValueError('Prepublished layer has an unsupported stored layout')
+        if layout=='full_reference' and (stored!=tuple(output_shape)
+                or (offset is not None and tuple(offset)!=(0,0,0))):
+            raise ValueError('Prepublished full_reference layer stored grid is not its complete output grid')
     if type(row.get('empty_segment')) is not bool:
         raise ValueError('Prepublished layer lacks its completed empty-mask decision')
     if row.get('exported_axes') != '(X, Y, t)':
@@ -139,6 +162,7 @@ def _validated_record(sink, ref, record, *, basename_for_suffix, provenance_for_
     shards=row.get('z_shards')
     if type(shards) is not int or shards<1 or row.get('z_shards_policy')!='execution_time':
         raise ValueError('Prepublished layer lacks completed execution-time writer metadata')
+    _check_layout(row,sink)
     _check_row(row,ref,output_shape=sink.output_shape,native=True,native_row=row,
                provenance=provenance_for_directory(ref,relative_to=sink.nrrd_dir))
     mirrors=value.get('low_quality')
@@ -157,6 +181,9 @@ def _validated_record(sink, ref, record, *, basename_for_suffix, provenance_for_
         _plain_token(token,'Published downbin token')
         spec=specs[token]
         shape=_shape(list(spec.output_shape_t_y_x),'Scalar mirror grid')
+        if not isinstance(mirror,dict):
+            raise ValueError('Prepublished layer manifest row must be an object')
+        _check_layout(mirror,sink)
         _check_row(mirror,ref,output_shape=shape,native=False,native_row=row,
             provenance=provenance_for_directory(ref,relative_to=sink._lq_nrrd_dir(spec)))
         for field,expected in (('downbin_token',token),('downbin_value',str(spec.raw_value)),

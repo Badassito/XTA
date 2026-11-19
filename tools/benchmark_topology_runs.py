@@ -6,7 +6,6 @@ from pathlib import Path
 import statistics
 import sys
 import time
-import gzip
 from unittest import mock
 import numpy as np
 
@@ -14,6 +13,39 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from XTA import topology
 from XTA.topology import _compiled_adjacent_gid_pair_codes
 from XTA.topology_runs import run_adjacent_pair_codes
+
+
+def real_slice_pairs(path):
+    """Return ``(name, labels_a, labels_b)`` adjacent real slice pairs of a saved binary NRRD.
+
+    A cropped layer is expanded onto its reference grid, so its pairs (names, windows
+    and labels) equal those of the same layer's full raster.
+    """
+    import cv2
+    from tools.nrrd_reference_grid import inspect_reference_raster, read_reference_volume
+    raster = inspect_reference_raster(path)
+    if raster.encoding not in ('gzip', 'gz'):
+        raise ValueError('Benchmark accepts attached gzip uint8 NRRDs')
+    volume = read_reference_volume(raster)
+    if volume.ndim != 3:
+        raise ValueError('Expected a 3D binary NRRD')
+    active = np.flatnonzero(np.any(volume != 0, axis=(1, 2)))
+    selected = np.unique(np.linspace(1, max(1, len(active)-1), 12).astype(int))
+    pairs = []
+    for j in selected:
+        z = int(active[j])
+        a = cv2.connectedComponents((volume[z-1] != 0).astype(np.uint8), connectivity=8)[1]
+        b = cv2.connectedComponents((volume[z] != 0).astype(np.uint8), connectivity=8)[1]
+        # Match the production adjacent-pair overlap window, including its
+        # one-pixel neighborhood halo. This is still an LQ qualification.
+        ax, ay, aw, ah = cv2.boundingRect((a != 0).astype(np.uint8))
+        bx, by, bw, bh = cv2.boundingRect((b != 0).astype(np.uint8))
+        y0, y1 = max(0, max(ay, by)-1), min(a.shape[0], min(ay+ah, by+bh)+1)
+        x0, x1 = max(0, max(ax, bx)-1), min(a.shape[1], min(ax+aw, bx+bw)+1)
+        if y0 >= y1 or x0 >= x1:
+            continue
+        pairs.append((f'real_z{z}', a[y0:y1, x0:x1], b[y0:y1, x0:x1]))
+    return pairs
 
 
 def main():
@@ -35,38 +67,7 @@ def main():
     a = rng.integers(0, 100, (n, n), dtype=np.uint16)
     cases.append(('fragmented', a, np.roll(a, 1, axis=1)))
     if args.nrrd:
-        import cv2
-        with args.nrrd.open('rb') as stream:
-            header = {}
-            while line := stream.readline():
-                if line in (b'\n', b'\r\n'):
-                    break
-                if b':' in line and not line.startswith(b'#'):
-                    key, value = line.decode('ascii').strip().split(':', 1)
-                    header[key] = value.strip()
-            if header.get('encoding') != 'gzip' or header.get('type') not in ('unsigned char', 'uint8', 'uchar'):
-                raise ValueError('Benchmark accepts attached gzip uint8 NRRDs')
-            shape = tuple(reversed(tuple(map(int, header['sizes'].split()))))
-            with gzip.GzipFile(fileobj=stream) as decoded:
-                volume = np.frombuffer(decoded.read(), np.uint8).reshape(shape)
-        if volume.ndim != 3:
-            raise ValueError('Expected a 3D binary NRRD')
-        active = np.flatnonzero(np.any(volume != 0, axis=(1, 2)))
-        selected = np.unique(np.linspace(1, max(1, len(active)-1), 12).astype(int))
-        for j in selected:
-            z = int(active[j])
-            a = cv2.connectedComponents((volume[z-1] != 0).astype(np.uint8), connectivity=8)[1]
-            b = cv2.connectedComponents((volume[z] != 0).astype(np.uint8), connectivity=8)[1]
-            # Match the production adjacent-pair overlap window, including its
-            # one-pixel neighborhood halo. This is still an LQ qualification.
-            ax, ay, aw, ah = cv2.boundingRect((a != 0).astype(np.uint8))
-            bx, by, bw, bh = cv2.boundingRect((b != 0).astype(np.uint8))
-            y0, y1 = max(0, max(ay, by)-1), min(a.shape[0], min(ay+ah, by+bh)+1)
-            x0, x1 = max(0, max(ax, bx)-1), min(a.shape[1], min(ax+aw, bx+bw)+1)
-            if y0 >= y1 or x0 >= x1:
-                continue
-            a, b = a[y0:y1, x0:x1], b[y0:y1, x0:x1]
-            cases.append((f'real_z{z}', a, b))
+        cases.extend(real_slice_pairs(args.nrrd))
     offsets = tuple((dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1))
     report = []
     for name, a, b in cases:

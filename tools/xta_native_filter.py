@@ -145,42 +145,120 @@ def ijk_to_ras(fields):
     return matrix
 
 
-def validate_xta_geometry(fields):
+def reference_ijk_to_ras(fields, offset_tyx=(0, 0, 0)):
+    """IJK->RAS of the reference grid; a cropped layer's origin is its first stored voxel."""
+    matrix = ijk_to_ras(fields)
+    offset_xyz = np.asarray(tuple(reversed([int(v) for v in offset_tyx])), dtype=float)
+    matrix[:3, 3] -= matrix[:3, :3] @ offset_xyz
+    return matrix
+
+
+def validate_xta_geometry(fields, offset_tyx=(0, 0, 0)):
     # XTA's published preview/native coordinates each use their own unit lattice.
     # A generic world-space resampler would incorrectly assume they have equal FOV.
-    matrix = ijk_to_ras(fields)
+    matrix = reference_ijk_to_ras(fields, offset_tyx)
     expected = np.diag([-1., -1., 1., 1.])
     if not np.allclose(matrix, expected, rtol=0, atol=1e-7):
         raise ValueError('Expected the original XTA unit-LPS output lattice; geometry was changed.')
+    return matrix
+
+
+def stored_crop(fields, stored_shape, reference_shape=None):
+    """Return ``(reference_shape_tyx, offset_tyx)`` for an XTA layer's stored raster.
+
+    Cropped XTA layers store only their segment box, placed by Slicer's
+    ``Segmentation_ReferenceImageExtentOffset`` (x y t) inside the reference extent
+    ``Segmentation_ReferenceImageExtent``; full layers store the reference grid itself.
+    """
+    stored_shape = tuple(stored_shape)
+    raw_offset = fields.get('Segmentation_ReferenceImageExtentOffset')
+    offset = (0, 0, 0)
+    if raw_offset is not None:
+        parts = raw_offset.split()
+        if len(parts) != 3 or any(re.fullmatch(r'[0-9]+', p) is None for p in parts):
+            raise ValueError(f'Invalid Segmentation_ReferenceImageExtentOffset: {raw_offset!r}')
+        offset = tuple(int(v) for v in reversed(parts))
+    declared = None
+    raw_extent = fields.get('Segmentation_ReferenceImageExtent')
+    if raw_extent is not None:
+        parts = raw_extent.split()
+        if len(parts) != 6 or any(re.fullmatch(r'-?[0-9]+', p) is None for p in parts):
+            raise ValueError(f'Invalid Segmentation_ReferenceImageExtent: {raw_extent!r}')
+        values = [int(v) for v in parts]
+        if values[0::2] != [0, 0, 0]:
+            raise ValueError(f'XTA reference extents start at voxel zero: {raw_extent!r}')
+        declared = shape3([values[5] + 1, values[3] + 1, values[1] + 1])
+    if reference_shape is not None:
+        reference = shape3(reference_shape)
+        if declared is not None and declared != reference:
+            raise ValueError(f'NRRD/manifest shape mismatch: reference {declared} != {reference}')
+    elif declared is not None:
+        reference = declared
+    elif raw_offset is None:
+        reference = stored_shape
+    else:
+        raise ValueError('A cropped XTA layer needs its reference extent or manifest shape.')
+    if raw_offset is None and stored_shape != reference:
+        raise ValueError(f'NRRD/manifest shape mismatch: {stored_shape} != {reference}')
+    if any(o + s > n for o, s, n in zip(offset, stored_shape, reference)):
+        raise ValueError(f'Stored crop {stored_shape} at {offset} lies outside reference {reference}.')
+    return reference, offset
 
 
 class Nrrd:
+    """One original XTA binary layer, always presented on its reference grid.
+
+    ``shape`` is the reference (t,Y,X) grid and ``slabs``/``array`` return reference
+    planes; a cropped file's ``stored_shape``/``offset_tyx`` place its stored box.
+    """
     def __init__(self, path, shape=None):
         self.path = Path(path)
-        self.header, self.offset, self.shape = read_header(self.path)
-        validate_xta_geometry(self.header)
-        if shape is not None and tuple(shape) != self.shape:
-            raise ValueError(f'NRRD/manifest shape mismatch: {self.path}: {self.shape} != {shape}')
+        self.header, self.offset, self.stored_shape = read_header(self.path)
+        try:
+            self.shape, self.offset_tyx = stored_crop(self.header, self.stored_shape, shape)
+        except ValueError as exc:
+            if 'shape mismatch' in str(exc):
+                raise ValueError(f'NRRD/manifest shape mismatch: {self.path}: '
+                                 f'{self.stored_shape} != {shape}') from exc
+            raise ValueError(f'{exc} ({self.path})') from exc
+        self.ijk_to_ras = validate_xta_geometry(self.header, self.offset_tyx)
+
+    def _read_exact(self, f, need):
+        data = bytearray(need)
+        view = memoryview(data)
+        pos = 0
+        while pos < need:
+            n = f.readinto(view[pos:])
+            if not n:
+                raise ValueError(f'Truncated NRRD payload: {self.path}')
+            pos += n
+        return data
 
     def slabs(self, depth):
         plane = self.shape[1] * self.shape[2]
+        stored_t, stored_y, stored_x = self.stored_shape
+        dz, dy, dx = self.offset_tyx
+        cropped = self.stored_shape != self.shape
         with open(self.path, 'rb') as raw:
             raw.seek(self.offset)
             with context_payload(raw, self.header['encoding']) as f:
                 for z in range(0, self.shape[0], depth):
                     count = min(depth, self.shape[0] - z)
-                    need = count * plane
-                    data = bytearray(need)
-                    view = memoryview(data)
-                    pos = 0
-                    while pos < need:
-                        n = f.readinto(view[pos:])
-                        if not n:
-                            raise ValueError(f'Truncated NRRD payload: {self.path}')
-                        pos += n
-                    a = np.frombuffer(data, dtype=np.uint8).reshape(count, *self.shape[1:])
-                    if a.max(initial=0) > 1:
-                        raise ValueError(f'Nonbinary original XTA data: {self.path}')
+                    if not cropped:
+                        data = self._read_exact(f, count * plane)
+                        a = np.frombuffer(data, dtype=np.uint8).reshape(count, *self.shape[1:])
+                        if a.max(initial=0) > 1:
+                            raise ValueError(f'Nonbinary original XTA data: {self.path}')
+                        yield z, a
+                        continue
+                    a = np.zeros((count, *self.shape[1:]), np.uint8)
+                    lo, hi = max(z, dz), min(z + count, dz + stored_t)
+                    if hi > lo:
+                        data = self._read_exact(f, (hi - lo) * stored_y * stored_x)
+                        box = np.frombuffer(data, dtype=np.uint8).reshape(hi - lo, stored_y, stored_x)
+                        if box.max(initial=0) > 1:
+                            raise ValueError(f'Nonbinary original XTA data: {self.path}')
+                        a[lo - z:hi - z, dy:dy + stored_y, dx:dx + stored_x] = box
                     yield z, a
                 if f.read(1):
                     raise ValueError(f'Extra bytes after NRRD payload: {self.path}')
@@ -498,7 +576,10 @@ def load_edit(bundle_dir, entry, original):
                 raise ValueError('Invalid empty-snapshot metadata.')
             return out
         extent = np.asarray(f['extent_xyz'], dtype=np.int64)
-        transform = np.linalg.solve(ijk_to_ras(original.header), f['ijk_to_ras'])
+        reference = getattr(original, 'ijk_to_ras', None)
+        if reference is None:
+            reference = ijk_to_ras(original.header)
+        transform = np.linalg.solve(reference, f['ijk_to_ras'])
         if not np.allclose(transform[:3, :3], np.eye(3), rtol=0, atol=1e-5):
             raise ValueError(f'Edited lattice was resampled/rotated: {entry["name"]}')
         if not np.allclose(transform[3], [0, 0, 0, 1], rtol=0, atol=1e-7):

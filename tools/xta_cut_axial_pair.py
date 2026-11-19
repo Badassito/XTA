@@ -57,15 +57,21 @@ def _file_state(path):
 
 def nrrd_cut(info, requested_grid, native, low, first_native, first_preview):
     shape = (info.width, info.height, info.frames)
+    # A cropped segmentation names its full grid; its stored box sits at its origin.
+    reference = getattr(info, "reference_xyz", None)
     grids = {"native": (native, first_native), "preview": (low, first_preview)}
     grid = requested_grid
     if grid is None:
         grid = next((name for name, (size, _) in grids.items()
-                     if shape == size and info.origin_xyz == (0, 0, 0)), None)
+                     if (reference == size if reference is not None
+                         else shape == size and info.origin_xyz == (0, 0, 0))), None)
         if grid is None:
-            raise ValueError(f"NRRD XYZ {shape} at origin {info.origin_xyz} is not a full native "
+            described = f"reference XYZ {reference}" if reference is not None else f"XYZ {shape}"
+            raise ValueError(f"NRRD {described} at origin {info.origin_xyz} is not a full native "
                              f"{native} or preview {low} grid. For a known crop, specify --nrrd-grid.")
     size, first_removed = grids[grid]
+    if reference is not None and reference != size:
+        raise ValueError(f"NRRD reference XYZ {reference} differs from the {grid} grid {size}.")
     if any(start < 0 or start + length > bound for start, length, bound
            in zip(info.origin_xyz, shape, size)):
         raise ValueError(f"NRRD at {info.origin_xyz} with XYZ {shape} extends outside the {grid} grid {size}.")
@@ -122,10 +128,14 @@ def run(args):
     if args.nrrd is not None:
         label = probe_nrrd(args.nrrd)
         grid, first_nrrd = nrrd_cut(label, args.nrrd_grid, native, low, first_native, first_preview)
-        if mode == "crop" and first_nrrd == 0:
+        cropped_segmentation = label.reference_xyz is not None
+        # A cropped segmentation beyond the plane is written as Slicer's empty one-voxel image.
+        if mode == "crop" and first_nrrd == 0 and not cropped_segmentation:
             raise ValueError("This NRRD lies entirely beyond the plane. Use zero mode for an empty mask.")
         plan.update(nrrd_source=str(args.nrrd.resolve()), nrrd_grid=grid,
                     nrrd_origin_xyz=label.origin_xyz, first_removed_nrrd_i=first_nrrd)
+        if cropped_segmentation:
+            plan["nrrd_reference_xyz"] = label.reference_xyz
         print(f"NRRD uses the {grid} grid at {label.origin_xyz}; "
               f"retain its first {first_nrrd} of {label.width} columns.", flush=True)
     if args.edits:
@@ -154,7 +164,10 @@ def run(args):
                                                bundle, first_preview, first_native, args.ras)
         else:
             print(f"Writing NRRD ({mode})...", flush=True)
-            plan["nrrd_output"] = write_nrrd(args.nrrd, staged / args.nrrd.name, label, first_nrrd, mode)
+            reference_cut = {} if label.reference_xyz is None else {
+                "reference_first_removed": first_native if grid == "native" else first_preview}
+            plan["nrrd_output"] = write_nrrd(args.nrrd, staged / args.nrrd.name, label, first_nrrd, mode,
+                                             **reference_cut)
         print("Encoding lossless MKV...", flush=True)
         plan["mkv_output"] = write_video(args.mkv, staged / args.mkv.name, video, first_native, mode)
         for path, state in before.items():
@@ -175,7 +188,8 @@ def main(argv=None):
     label.add_argument("--nrrd", type=Path, help="Scalar XTA NRRD on the native or preview grid")
     parser.add_argument("--nrrd-grid", choices=("preview", "native"),
                         help="Parent grid of a cropped NRRD, e.g. preview for Global_union.seg.nrrd. "
-                             "A full raster with zero origin is recognized automatically.")
+                             "A full raster with zero origin, or a cropped layer that records its "
+                             "Segmentation_ReferenceImageExtent, is recognized automatically.")
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--preview-manifest", type=Path, help="Original low-quality *_nrrd_manifest.json")
     source.add_argument("--preview-scale", type=Fraction, help="XTA fractional downbin used, e.g. 0.2")

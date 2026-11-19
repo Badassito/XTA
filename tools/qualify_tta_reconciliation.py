@@ -7,12 +7,10 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
-import gzip
 import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 import time
@@ -118,21 +116,35 @@ def invocation(root, output, name):
     return argv
 
 
-def decode_nrrd(path):
-    import nrrd
+def decode_nrrd(path, reference_shape_tyx=None):
+    """Decode one layer onto its reference grid; cropped and full layouts agree."""
     import numpy as np
-    header = nrrd.read_header(str(path))
-    raw = path.read_bytes()
-    boundary = re.search(b'\r?\n\r?\n', raw)
-    if not boundary or header['encoding'] != 'gzip' or header['type'] != 'unsigned char':
+    from tools.nrrd_reference_grid import inspect_reference_raster, read_reference_volume
+    raster = inspect_reference_raster(path, reference_shape_tyx=reference_shape_tyx)
+    if raster.encoding not in ('gzip', 'gz') or raster.stored_shape is None or len(raster.stored_shape) != 3:
         raise ValueError(f'Unsupported qualification NRRD: {path}')
-    values = np.frombuffer(gzip.decompress(raw[boundary.end():]), dtype=np.uint8)
-    xyz = values.reshape(tuple(header['sizes']), order='F')
-    if not np.all((xyz == 0) | (xyz == 1)):
+    values = read_reference_volume(raster)
+    if not np.all((values == 0) | (values == 1)):
         raise AssertionError('NRRD values are not binary')
-    if not np.allclose(header['space directions'], np.eye(3)) or not np.allclose(header['space origin'], 0):
+    directions, origin = raster.directions_xyz(), raster.reference_origin_xyz()
+    if directions is None or origin is None or not np.allclose(directions, np.eye(3)) or not np.allclose(origin, 0):
         raise AssertionError('Qualification fixture must retain its common source grid')
-    return np.ascontiguousarray(xyz.transpose(2, 1, 0))
+    return values
+
+
+def decode_manifest_layers(manifest):
+    """Return ``(row, reference-grid mask)`` for every published layer in manifest order.
+
+    Reads through the offset-aware reconciliation reader, so verdicts and hashes are
+    identical for cropped (segment bounding box) and full-raster layer files.
+    """
+    import numpy as np
+    from tools.nrrd_reference_grid import open_manifest_layers
+    with open_manifest_layers(manifest) as collection:
+        geometry = collection.geometry
+        if not np.allclose(geometry.directions_xyz, np.eye(3)) or not np.allclose(geometry.origin_xyz, 0):
+            raise AssertionError('Qualification fixture must retain its common source grid')
+        return [(layer.metadata, layer.read_slab(0, collection.shape_tyx[0])) for layer in collection]
 
 
 def inspect_case(output, name):
@@ -142,10 +154,10 @@ def inspect_case(output, name):
     if run['status'] != 'complete':
         raise AssertionError('Pipeline did not publish a complete run manifest')
     manifest = next((output / 'nrrd').glob('*_nrrd_manifest.json'))
-    layers = json.loads(manifest.read_text())['layers']
+    decoded = decode_manifest_layers(manifest)
+    layers = [layer for layer, _values in decoded]
     components, final = {}, None
-    for layer in layers:
-        values = decode_nrrd(manifest.parent / layer['filename'])
+    for layer, values in decoded:
         if layer['source'] == 'global' and layer['stage'] == 'final_output_after_all_postprocessing':
             final = values
         elif layer.get('layer_role', 'additive_component') == 'additive_component' and layer['recomposition_op'] == 'union':
@@ -233,13 +245,11 @@ def verify_bridge_evidence(output):
     import numpy as np
     from XTA.confidence_evidence import ConfidenceEvidenceRef
     manifest = next((output / 'nrrd').glob('*_nrrd_manifest.json'))
-    layers = json.loads(manifest.read_text())['layers']
     predictions = bridges = None
     bridge_count = 0
-    for layer in layers:
+    for layer, mask in decode_manifest_layers(manifest):
         if layer.get('layer_role', 'additive_component') != 'additive_component' or layer['recomposition_op'] != 'union':
             continue
-        mask = decode_nrrd(manifest.parent / layer['filename'])
         if predictions is None:
             predictions, bridges = np.zeros_like(mask), np.zeros_like(mask)
         if layer['mask_kind'] == 'bridge':

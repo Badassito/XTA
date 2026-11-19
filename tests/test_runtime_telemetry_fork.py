@@ -1,12 +1,14 @@
-"""Telemetry must not hang a forked worker's exit (job 166951: PTA GPU owners)."""
+"""Telemetry must not hang or disturb a forked worker's exit (jobs 166951 and 169102: PTA GPU owners)."""
 import json
 import multiprocessing
 from multiprocessing.util import Finalize
 import os
 import threading
+import types
 
 import pytest
 
+from XTA import runtime
 from XTA import runtime_observability as observer
 
 
@@ -111,3 +113,103 @@ def test_fork_pool_exits_while_parent_writer_is_alive(telemetry_env):
         assert record['gauges']['telemetry.forked_from_pid'] == os.getpid()
         assert 'parent.work' not in record['counters']
     assert _last_record(telemetry.path)['counters']['parent.work'] == 1
+
+
+def _recording_nvml(monkeypatch, path):
+    """A stand-in NVML module whose shutdown appends the calling PID to PATH."""
+    def shutdown():
+        with open(path, 'a', encoding='utf-8') as handle:
+            handle.write(f'{os.getpid()}\n')
+    monkeypatch.setattr(observer, '_load_nvidia_ml_py', lambda: types.SimpleNamespace(nvmlShutdown=shutdown))
+
+
+def _shutdown_pids(path):
+    return [int(line) for line in path.read_text(encoding='utf-8').split()] if path.exists() else []
+
+
+def test_forked_child_leaves_the_parents_nvml_session_alone(monkeypatch, telemetry_env):
+    # Job 169102: every forked PTA render worker shut down the NVML session it
+    # inherited from the parent's sampler, at once, at each pool exit.
+    shutdowns = telemetry_env / 'nvml-shutdowns'
+    _recording_nvml(monkeypatch, shutdowns)
+    sampler = observer.RuntimeSystemSampler(observer.RuntimeTelemetry())
+    sampler._nvml_ready = True
+    monkeypatch.setattr(runtime, '_RUNTIME_SYSTEM_SAMPLER', sampler)
+
+    runtime._reset_runtime_observability_after_fork()  # what os.register_at_fork runs in a child
+    sampler.close()
+    assert _shutdown_pids(shutdowns) == []
+    assert sampler.stop_event.is_set() and sampler.thread is None
+
+    parent = observer.RuntimeSystemSampler(observer.RuntimeTelemetry())
+    parent._nvml_ready = True
+    parent.close()  # the owner still ends its own session
+    assert _shutdown_pids(shutdowns) == [os.getpid()]
+
+
+def _observability_initializer(finalized_path):
+    # Same exit path as pta_workers._render_worker_initializer, plus a marker
+    # (priority 9, so after it) proving the exit finalizers really ran.
+    Finalize(None, runtime.shutdown_runtime_observability, exitpriority=10)
+
+    def mark():
+        with open(finalized_path, 'a', encoding='utf-8') as handle:
+            handle.write(f'{os.getpid()}\n')
+    Finalize(None, mark, exitpriority=9)
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork'), reason='requires fork()')
+def test_fork_pool_exit_does_not_shut_down_the_parents_nvml(monkeypatch, telemetry_env):
+    shutdowns = telemetry_env / 'nvml-shutdowns'
+    _recording_nvml(monkeypatch, shutdowns)
+    sampler = observer.RuntimeSystemSampler(observer.RuntimeTelemetry())
+    sampler._nvml_ready = True
+    monkeypatch.setattr(runtime, '_RUNTIME_SYSTEM_SAMPLER', sampler)
+    monkeypatch.setattr(runtime, '_RUNTIME_TELEMETRY', None)
+    monkeypatch.setattr(runtime, '_RUNTIME_STDIO_CAPTURE', None)
+    monkeypatch.setattr(runtime, '_RUNTIME_OBSERVABILITY_SHUTDOWN', False)
+
+    finalized = telemetry_env / 'finalized'
+    pool = multiprocessing.get_context('fork').Pool(2, initializer=_observability_initializer,
+                                                     initargs=(str(finalized),))
+    try:
+        child_pids = set(pool.map(_child_pid, range(4)))
+        pool.close()
+        assert _run_bounded(pool.join, 30.0), 'forked workers hung at exit'
+    finally:
+        pool.terminate()
+    assert child_pids <= set(_shutdown_pids(finalized)), 'the workers did not run their exit finalizers'
+    assert _shutdown_pids(shutdowns) == [], 'a forked worker shut down the parent NVML session'
+    assert sampler._nvml_ready is True  # the parent's own session is untouched
+
+
+def _child_pid(_):
+    return os.getpid()
+
+
+def test_close_leaves_nvml_to_process_exit_while_a_sample_is_still_running(monkeypatch, telemetry_env):
+    # A sample stuck in the driver must not have NVML shut down under it, and a
+    # sample that starts after close() must not open a new NVML session.
+    shutdowns = telemetry_env / 'nvml-shutdowns'
+    inits = []
+    _recording_nvml(monkeypatch, shutdowns)
+    fake = observer._load_nvidia_ml_py()
+    fake.nvmlInit = lambda: inits.append(os.getpid())
+    monkeypatch.setattr(observer, '_load_nvidia_ml_py', lambda: fake)
+    monkeypatch.setenv('YOLO_TTA_TELEMETRY_SAMPLE_SECONDS', '1')
+    sampler = observer.RuntimeSystemSampler(observer.RuntimeTelemetry())
+    sampler._nvml_ready = True
+    release = threading.Event()
+    sampler.thread = threading.Thread(target=release.wait, daemon=True)
+    sampler.thread.start()
+    try:
+        sampler.close()
+        assert _shutdown_pids(shutdowns) == []
+    finally:
+        release.set()
+        sampler.thread.join()
+
+    late = observer.RuntimeSystemSampler(observer.RuntimeTelemetry())
+    late.stop_event.set()
+    late._sample_gpu()
+    assert inits == [] and late._nvml_ready is False

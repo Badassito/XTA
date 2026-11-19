@@ -1,7 +1,9 @@
 """Preparation publishes verified pairs and retains failed native evidence."""
 from __future__ import annotations
 
+from contextlib import redirect_stderr
 import gzip
+import io
 import json
 import os
 from pathlib import Path
@@ -380,6 +382,69 @@ class PreparationTests(unittest.TestCase):
         self.assertIsNone(options.source_video)
         self.assertEqual(options.intensity_mode,'symlink')
         self.assertEqual(options.mode,'upscale')
+
+    def test_explicit_paths_need_no_root_or_training_root(self):
+        # Neither root has a site default; explicit paths prepare and validate without them.
+        output=self.root/'labels'/'sample'
+        with patch.object(prep,'probe_source',return_value={'shape_tyx':[2,2,2],'frame_count_method':'synthetic'}):
+            prep.main([self.stem,'--bundle-dir',str(self.bundle),'--source-video',str(self.video),
+                       '--output-dir',str(output),'--intensity-mode','copy',
+                       '--log-dir',str(self.root/'explicit-log'),'--scratch-root',str(self.root/'scratch')])
+        self.assertTrue((output/'preparation.json').is_file())
+        request=prep.read_json(self.root/'explicit-log'/'request.json')['arguments']
+        self.assertIsNone(request['root'])
+        self.assertIsNone(request['training_root'])
+        prep.main([self.stem,'--validate-only','--skip-source-probe','--bundle-dir',str(self.bundle),
+                   '--log-dir',str(self.root/'validate-log')])
+        self.assertEqual(prep.read_json(self.root/'validate-log'/'complete.json')['status'],'validated_only')
+        # An empty root, such as an unset shell variable, counts as absent and is not needed here.
+        prep.main([self.stem,'--validate-only','--skip-source-probe','--bundle-dir',str(self.bundle),
+                   '--root','','--training-root','','--log-dir',str(self.root/'empty-root-log')])
+        self.assertEqual(prep.read_json(self.root/'empty-root-log'/'complete.json')['status'],'validated_only')
+
+    def test_legacy_layout_requires_its_roots_and_an_explicit_volume_stem(self):
+        bundle=('--bundle-dir',str(self.bundle))
+        video=('--source-video',str(self.video))
+        output=('--output-dir',str(self.root/'labels'/'sample'))
+        # Each refusal names the missing or empty option and the explicit path that would replace it.
+        root='error: root is required without --source-video, except with --validate-only --skip-source-probe'
+        no_bundle='error: training-root is required without --bundle-dir (the bundle is then'
+        cases=(([self.stem,*bundle,*output],root),
+               ([self.stem,'--validate-only',*bundle],root),
+               ([self.stem,'--root','',*bundle,*output],'error: root is empty; it is required without --source-video'),
+               ([self.stem,*video,*output],no_bundle),
+               ([self.stem,'--validate-only',*video,*output],no_bundle),
+               ([self.stem,'--validate-only',*video],no_bundle),
+               ([self.stem,*bundle,*video],
+                'error: training-root is required without --output-dir when preparing (the output is then'),
+               ([self.stem,*video],'error: training-root is required without --bundle-dir and --output-dir when preparing'),
+               ([self.stem,'--training-root','',*video,*output],
+                'error: training-root is empty; it is required without --bundle-dir (the bundle is then'),
+               (['--root',str(self.video.parent),'--training-root',str(self.root/'training')],
+                'at least one volume stem'))
+        for index,(args,message) in enumerate(cases):
+            log=self.root/f'refused-log-{index}'
+            with self.subTest(args=args):
+                stderr=io.StringIO()
+                with redirect_stderr(stderr),self.assertRaises(SystemExit):
+                    prep.main([*args,'--log-dir',str(log)])
+                self.assertIn(message,stderr.getvalue())
+                self.assertFalse(log.exists())
+
+    def test_existing_log_dir_is_refused_before_any_work(self):
+        # Every run needs a new log directory, including the preparation after --validate-only.
+        log=self.root/'reused-log'
+        options=[self.stem,'--bundle-dir',str(self.bundle),'--source-video',str(self.video),
+                 '--output-dir',str(self.root/'labels'/'sample'),'--log-dir',str(log)]
+        with patch.object(prep,'probe_source',return_value={'shape_tyx':[2,2,2],'frame_count_method':'synthetic'}):
+            prep.main([*options,'--validate-only'])
+            before=sorted(path.name for path in log.iterdir())
+            stderr=io.StringIO()
+            with redirect_stderr(stderr),self.assertRaises(SystemExit):
+                prep.main(options)
+        self.assertIn('error: log-dir must name a new directory',stderr.getvalue())
+        self.assertEqual(sorted(path.name for path in log.iterdir()),before)
+        self.assertFalse((self.root/'labels').exists())
 
     def test_union_options_are_paired_and_native_only(self):
         for args in (['--native-union-receipt',str(self.union)],

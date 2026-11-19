@@ -63,6 +63,9 @@ nears its quota or the queue reaches its safety cap:
 | `XTA_YOLO_SWEEP_RANK_GPU_WAIT_SECONDS` | 60 | how long a busy GPU is retried for azimuthal views before the CPU route; after one full-length timeout later views wait at most 2 s until a slot is admitted again |
 | `XTA_YOLO_SWEEP_RANK_GPU_RADIAL_WAIT_SECONDS` | 15 | the same for radial views, whose bounded CPU route is short |
 | `XTA_YOLO_SWEEP_RANK_GPU_TILTED` | 0 | 1 lets tilted views wait for the GPU; by default they use the GPU only when a slot is free, since their row-bounded CPU route is cheap |
+| `XTA_YOLO_SWEEP_EVIDENCE_PROCESSES` | visible CPUs / 8, at least 4, at most the evidence layers publications can queue | worker processes that write sibling confidence evidence; 0 keeps it on producer threads |
+| `XTA_YOLO_SWEEP_NRRD_PROCESSES` | visible CPUs / 6, at least 4, at most the sibling layers publications can queue | worker processes that write sibling native and preview `.seg.nrrd` files; 0 keeps them on producer threads |
+| `XTA_YOLO_SWEEP_NATIVE_DECODE` | native when qualified | `python` decodes sibling journal rows with Python's zlib instead of the nogil kernels |
 
 The ordinary shared slice (`YOLO_TTA_GPU_PROJECTION_OVERLAP_GIB`) is 4 GiB, or
 6 GiB in a sweep producer so the largest sibling projections fit inside the
@@ -84,11 +87,47 @@ per-family `sweep.publication.<family>_seconds`, per-stage
 `sweep.publication.stage[.<family>].{rank_input,projection,confidence_thread,layers_barrier}_seconds`,
 `sweep.publication.scheduler_wait_seconds` and `sweep.rank_gpu.*` admission counters.
 
-Intermediate sweep files (native journal, projected stores, rank backing) are
-written once and deleted. On a node with ample memory, `--temp` on a RAM-backed
-filesystem such as `/dev/shm` avoids their disk writeback; the family workspace
-holds roughly the source volume plus the projected stores (tens of GB at
-1929x3064x3023).
+Sibling confidence evidence and journal decoding run outside the producer's
+Python interpreter lock. Each sibling's journal rows are decoded by nogil
+kernels that call the native zlib (`Native view journal decode:` in the log
+names the backend; when the library does not qualify the Python route is used
+and the bytes are identical). Evidence layers are written by spawn-started
+worker processes that reopen the sealed journal view; the schedule passes the
+identity its readers were opened with (`native_journal_identity`), and a
+caller that supplies other crops keeps evidence on producer threads. If a
+worker dies, the pool joins every worker, the affected layers are rewritten on
+producer threads (identical bytes) and later views use threads. Telemetry adds
+`sweep.publication.evidence_process.{jobs,cpu_seconds,wall_seconds,queue_seconds,thread_fallback_layers}`,
+the `broken` gauge and `stage.confidence_process_seconds`; the process CPU
+gauge of the producer does not include its workers.
+
+Sibling layer files are written the same way. The producer's sinks keep every
+layer name, colour, manifest row and publication record; NRRD worker processes
+write the native and preview files and return the plans they wrote, so the
+files and rows equal the thread path byte for byte. Layers a worker cannot
+reproduce (live arrays, z-sharded layers, a hardware or substituted codec) stay
+on producer threads, as does everything after a worker dies (the pool joins its
+workers and rewrites the affected layers on threads). `YOLO_TTA_NRRD_GZIP_WORKERS`
+is the producer-wide member-compression budget: each NRRD worker uses
+`max(2, budget / XTA_YOLO_SWEEP_NRRD_PROCESSES)` threads (budget = the setting,
+else half the CPUs), and the producer keeps the full value for the layers it
+still writes. Workers write their own per-process telemetry files, so sum
+`nrrd.*` counters across those files; the producer adds
+`sweep.publication.nrrd_process.{jobs,wall_seconds,cpu_seconds,queue_seconds,thread_fallback_layers}`.
+The log states which path each pool took (`Sweep NRRD files: ...`,
+`Sweep confidence evidence: ...`); a pool that cannot start (process or
+descriptor limits) prints a warning and the run continues on threads.
+
+Intermediate sweep files (native journal, projected stores, decoded source,
+rank backing and each cutoff's scratch) are written once, shared between the
+family's processes and deleted. On a node with ample memory, `--temp` on a
+RAM-backed filesystem such as `/dev/shm` avoids their disk writeback; the family
+workspace holds roughly the source volume plus the projected stores and the
+native journal (tens of GB at 1929x3064x3023). tmpfs pages count against the
+job's memory limit and cannot be reclaimed, so choose it only when that much
+memory is spare; if a job is killed, the workspace stays until `/dev/shm` is
+cleared. `manifest.json` records the workspace and whether it is memory-backed
+in `work_storage`.
 
 After the producer, the later cutoffs finish their independent final union,
 reconciliation, Global, other requested outputs and receipts. When the producer
@@ -142,13 +181,15 @@ integer cutoff in hundredths. The top-level `manifest.json` gives the status,
 branch paths and forward-cache statistics. A successful NRRD review has
 `review/manifest.json`, stock grouped `.seg.nrrd` files and per-cutoff direct
 coverage labelmaps. Each requested preview tier is a grouped review grid:
-each `.seg.nrrd` group holds one cutoff, so Slicer can load a subset of
-cutoffs. When a preview tier exists, the native grid is reference-only. The
-review lists its per-cutoff source manifests and segment identities for edit
-export, but never reads or re-encodes the native masks; they stay in the
-branch NRRDs. Without a preview tier, native is the grouped review grid. Keep
+each `.seg.nrrd` group holds one cutoff, so Slicer's per-cutoff loading can
+choose a subset of cutoffs. When a preview tier exists, the native grid is
+reference-only. The review lists its per-cutoff source manifests and segment
+identities for edit export, but never reads or re-encodes the native masks;
+they stay in the branch NRRDs. Without a preview tier, native is the grouped review grid. Keep
 the review and its corresponding branch directories together for edit export
-and native handoff.
+and native handoff. A store-backed Slicer review writes its edit log beside
+the sweep folder, in `<sweep folder>.cutoff_edits/`; keep that folder with the
+sweep.
 
 When a scalar cutoff exits normally and records omitted SAM work, XTA retains
 its outputs and continues through the remaining cutoffs. The family finishes
@@ -171,6 +212,8 @@ Here `run_A` and `run_B` are existing scalar output directories beneath
 destination name. Cutoffs are packaged concurrently (`--workers`, default one
 per cutoff, at most 8 and at most the CPU count, each with its own
 `--memory-mib`). The source runs and the review form one movable study tree.
+Slicer opens such a review as per-cutoff segments, because masks from
+independent runs need not nest across cutoffs.
 
 Sweeps retain observed numeric evidence. For a single scalar run request
 `--save confidence` to keep it independently of reconciliation. The manifest
@@ -195,37 +238,60 @@ bundle can supply the input manifest for an export at its own resolution.
    in the [Slicer cleanup guide](slicer_pta_cleanup.md). Use **Importer** with
    the sweep's `review/manifest.json`. Importer offers only grouped grids,
    with the smallest LQ tier first; a reference-only native grid is never
-   loaded. It then asks which cutoffs to load as editable masks, with the
-   review default first. Run Importer again to add cutoffs. In the Slicer
-   Python console the equivalent entry point is
-   `ImportXTASegments(source_manifest=r"/path/to/sample_sweep/review/manifest.json", cutoff_cents=[70])`
-   (`cutoff_cents="all"` loads every cutoff). Memory for the live count and
-   display arrays scales with the chosen grid, in addition to Slicer's masks
-   and surface meshes for the loaded cutoffs.
+   loaded. By default it opens the grid **store-backed**: every cutoff is read
+   into one in-memory store and stays editable. Importer asks which cutoff to
+   display, with the review default first, and, when the grid has an edit log,
+   whether to resume it or start fresh. In the Slicer Python console the
+   equivalent entry point is
+   `ImportXTASegments(source_manifest=r"/path/to/sample_sweep/review/manifest.json", cutoff_cents=70)`.
+   Importer loads per-cutoff segments instead when you choose
+   **Per-cutoff segments (legacy)…** or pass a list of cutoffs or
+   `cutoff_cents="all"`, and on its own for reviews packaged from independent
+   scalar runs, native-resolution grids and stores that would not fit in
+   memory. It estimates that memory from the manifest before reading any mask.
 2. Scroll over the intensity in any slice view. The 2D coverage colors count
    visible direct prediction layers at the displayed cutoff. One, 2–3, 4–7,
    8–15 and 16+ contributions have distinct colors. Generated-only and
    Global-only support get separate accents where there are no direct votes.
    Correlated views can contribute. Use **2D Cutoff** to change the displayed
-   operating point. A cutoff that is not loaded shows its published direct
-   counts read-only, without the generated-only and Global-only accents.
+   operating point; a store-backed review rewrites its working segments at
+   that cutoff. With per-cutoff segments, a cutoff that is not loaded shows
+   its published direct counts read-only, without the generated-only and
+   Global-only accents.
 3. Place F points, L lines or C/CC curves and use **Remove Islands** or
-   **Remove Slices**. Each mask uses its own connectivity at its own cutoff.
-   By default (**Scope: Displayed**) one click changes only the masks at the
-   displayed cutoff, as when one cutoff was reviewed at a time. The scope
-   button also offers *Displayed and stricter* and *All visible cutoffs*.
-   Lower cutoffs can join a marked island to much larger regions, so a wider
-   scope can remove far more at those cutoffs. Ordinary segments are not
-   affected by the scope. The displayed counts follow the edits.
-4. The 3D view shows the displayed cutoff's complete segments with their
-   native colors and smoothed surfaces. **3D: Show All Cutoffs** shows every
-   loaded cutoff. A coverage image is a display layer; the complete binary
-   geometry supplies the 3D surface and the training mask. Global update
-   actions use the contributors belonging to the corresponding loaded cutoff.
+   **Remove Slices**. On a store-backed review one click edits every cutoff
+   with **Scope: All Cutoffs**, the default: the marked islands go at the
+   displayed and stricter cutoffs, and at looser cutoffs only the looser
+   growth that belongs to them (the union basin). **Scope:
+   Displayed+Stricter** leaves looser cutoffs unchanged. Each click reports
+   what it removed at each cutoff, flags layers that lost much, and asks first
+   above 500,000 voxels. Segment Editor erase applies at every cutoff and
+   paint at the displayed and looser cutoffs. **Undo** and **Redo** (Ctrl+Z /
+   Ctrl+Y) revert any of these, and an edit log beside the sweep folder keeps
+   them across a crash or a reopen. With per-cutoff segments each mask uses
+   its own connectivity at its own cutoff. By default (**Scope: Displayed**)
+   one click changes only the masks at the displayed cutoff, as when one
+   cutoff was reviewed at a time; the scope button also offers *Displayed and
+   stricter* and *All visible cutoffs*. Lower cutoffs can join a marked island
+   to much larger regions, so a wider scope can remove far more at those
+   cutoffs. The two kinds remember separate scopes, and a choice on one never
+   carries over to the other; with no review open, the button sets the
+   per-cutoff scope. Ordinary segments are not affected by the scope. The displayed counts follow the edits.
+4. A store-backed review shows only the displayed cutoff's Global in 3D.
+   Per-cutoff segments show the displayed cutoff's complete segments with
+   their native colors and smoothed surfaces; **3D: Show All Cutoffs** shows
+   every loaded cutoff. A coverage image is a display layer; the complete
+   binary geometry supplies the 3D surface and the training mask. Global
+   update actions run at every cutoff of a store-backed review, as one undo
+   entry, and otherwise use the contributors belonging to each loaded cutoff.
 
 Use **Export XTA Edits** to preserve branch identities and edited masks for
 native processing. The toolbar button exports the displayed cutoff; in the
-console `ExportXTAEdits(review_manifest)` exports every loaded cutoff and
-`cutoff_cents=[...]` a subset. Keep each LQ/native pair with the intensity and
-run that produced it. A 2D coverage count alone cannot recover the contributing
-masks.
+console `ExportXTAEdits(review_manifest)` exports every cutoff of a
+store-backed review, or every loaded cutoff of per-cutoff segments, and
+`cutoff_cents=[...]` a subset. When a store-backed review's Global is stale,
+export first shows how much Update Global would change it at each exported
+cutoff, because Update Global keeps only the largest 6-connected island;
+**Export as is** is the default. Keep each LQ/native pair with the intensity
+and run that produced it. A 2D coverage count alone cannot recover the
+contributing masks.

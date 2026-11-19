@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Verify a single F2 native-to-preview downbin and edited preview subset."""
 import argparse
-import gzip
 import hashlib
 import json
 import math
@@ -9,6 +8,11 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+if __package__:
+    from .nrrd_reference_grid import read_reference_planes
+else:
+    from nrrd_reference_grid import read_reference_planes
 
 
 def digest(path):
@@ -20,21 +24,11 @@ def digest(path):
 
 
 def read_planes(path, start, stop):
-    with path.open('rb') as f:
-        fields = {}
-        for raw in iter(f.readline, b''):
-            if not raw.strip():
-                break
-            line = raw.decode().strip()
-            if ':' in line:
-                k, v = line.split(':', 1)
-                fields[k] = v.strip()
-        shape = tuple(map(int, fields['sizes'].split()[::-1]))
-        count = shape[1] * shape[2]
-        with gzip.GzipFile(fileobj=f) as payload:
-            payload.seek(start * count)
-            data = payload.read((stop - start) * count)
-    return np.frombuffer(data, np.uint8).reshape(stop - start, *shape[1:]), shape
+    """Return reference slices ``[start, stop)`` and the reference (t,Y,X) shape.
+
+    Cropped (segment bounding box) layers are expanded onto their reference grid.
+    """
+    return read_reference_planes(path, start, stop)
 
 
 def comparison(original, candidate):

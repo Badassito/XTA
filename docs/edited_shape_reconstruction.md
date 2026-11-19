@@ -4,7 +4,9 @@ Use `tools/prepare_pta_input.py --mode edited_shape --mask-source global` when t
 corrected edited Global defines the desired shape. This reconstructs a smooth
 mask at the original input dimensions. Original full-resolution predictions
 are not consulted or unioned back into the result, so deleted native components
-cannot return through an ambiguous component match.
+cannot return through an ambiguous component match. For a smoother label
+without the edited-center and background-cell guarantees below, see
+[continuous-field reconstruction](continuous_field_reconstruction.md).
 
 The implementation computes a signed Euclidean distance field on the edited
 preview, with axis distances measured in native voxel units. It linearly samples
@@ -52,23 +54,40 @@ Input and output identities, helper hashes, written-mask audits, and the explici
 `edited_preview_global` authority are recorded in `preparation.json`.
 `--intensity-mode copy` retains the verified independent video-copy workflow.
 
-For the separate training directories, `tools/prepper.sh` uses
-`images/<dataset>/<video>.mkv`, `filtered/<generation>/<dataset>/`, and
-`labels/<generation>/<dataset>/`. It defaults to generation `v1.1`, dataset
-`F3_20_2_3_2026`, and video `F3_20_2_3_2026_S1S0.mkv`. The source identity stem
-remains `F3_20_2_3_2026_S1S0_8bit_Y`, while `--output-stem F3_20_2_3_2026`
-names the label. `--intensity-mode reference` leaves the video in `images/`
-and publishes only the NRRD and `preparation.json` under `labels/`; the receipt
-records and validates the original video reference. With `--smoke --smoke-script
-/path/to/pta_launcher.py`, the video and prepared NRRD are copied into
-`/tmp/pta-smoke` with matching basenames, and PTA uses that directory as input.
-The copies remain there between runs; no job ID is added to the directory name.
+For separate training directories, such as `images/DATASET/VIDEO.mkv`,
+`filtered/GENERATION/DATASET/` and `labels/GENERATION/DATASET/`, pass each path
+explicitly:
 
-Keep `prepper.sh`, `prepare_pta_input.py`, and `xta_edited_shape.py` together when
-copying them to the cluster. Submit `sbatch prepper.sh --validate-only` to check
-the bundle and video dimensions, then `sbatch prepper.sh` to prepare the label.
-The cluster root defaults to `/project/community/sanghyus`; `ROOT`,
-`TRAINING_ROOT`, and the path variables documented in the script can override it.
+```text
+python tools/prepare_pta_input.py SOURCE_STEM --mode edited_shape \
+    --mask-source global --bundle-dir BUNDLE_DIR --source-video SOURCE_VIDEO \
+    --output-dir OUTPUT_DIR --output-stem OUTPUT_STEM --intensity-mode reference \
+    --log-dir LOG_DIR
+```
+
+`SOURCE_STEM` is the source identity stem the bundle was exported under (for
+example `DATASET_S1S0_8bit_Y`), and `--output-stem` names the label.
+`--intensity-mode reference` leaves the video where it is and publishes only the
+NRRD and `preparation.json` in `OUTPUT_DIR`; the receipt records and validates
+the original video reference. Add `--validate-only` first to check the bundle
+and video dimensions without writing a label. `--log-dir` must name a new
+directory on every run, for example `LOG_DIR/validate` for the validation and
+`LOG_DIR/prepare` for the preparation. With `--smoke --smoke-script
+/path/to/pta_launcher.py`, the video and prepared NRRD are copied with matching
+basenames into a new `pta-smoke-*` directory under `--scratch-root` (default
+`$SLURM_TMPDIR`, else the system temporary directory), and PTA uses that
+directory as input. Each run gets its own directory; it is removed after a
+passing smoke and kept for diagnosis when the smoke fails.
+
+`--root` and `--training-root` have no defaults and are needed only for the
+legacy layout. Without `--source-video` the video is `ROOT/STEM.mkv`; without
+`--bundle-dir` or `--output-dir` the bundle and output are
+`TRAINING_ROOT/GENERATION/STEM_Filtered` and `STEM_Input`.
+
+Keep `prepare_pta_input.py` and `xta_edited_shape.py` together when copying them
+to a cluster, plus the `continuous_field_reconstruction/` folder for
+`--mode continuous_field`. Cluster job scripts are site-specific and stay
+outside this repository; they call the command above with their own paths.
 NumPy, SciPy, and ffprobe are required; ISA-L is optional.
 
 This reconstruction is separate from PTA preprocessing. Passing

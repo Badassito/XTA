@@ -318,6 +318,7 @@ class SweepViewSchedule:
                 read_score_plane=lambda c,z: readers[c].read_score_plane(z),
                 read_mask_crops=lambda c,z: readers[c].iter_mask_crops(z),
                 read_native_crops=lambda c,z: readers[c].iter_crops(z),
+                native_journal_identity=self.identities.get(str(view.name)),
                 counts_by_cutoff={int(c): int(n) for c,n in decision['prediction_counts'].items()},
                 retain_empty_orthogonal=retain_empty_orthogonal,
                 primary_already_published=True)

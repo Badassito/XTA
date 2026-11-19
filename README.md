@@ -17,6 +17,14 @@ python -m XTA --mode lta --help
 The versioned launcher and the installed `xta` command use the same dispatcher.
 Runtime dependencies and optional backends are declared in [pyproject.toml](pyproject.toml).
 
+## Paired-volume registration
+
+Run `python -m XTA register --help` to fit a mapping, reslice every frame of a
+grayscale stack, or transfer annotations. Mapping packets carry the source
+identities, both coordinate directions and acquisition coverage. The
+[registration guide](docs/registration.md) shows how to produce image/label
+pairs for PTA and transfer scalar NRRD labelmaps.
+
 ## TTA confidence sweeps
 
 Use `--conf 0.50:0.10:1.00` for six operating points or
@@ -29,6 +37,15 @@ With `--save nrrd low_quality:0.20`, the sweep also publishes a Slicer review:
 complete editable segments for smoothed 3D surfaces and one coverage-colored
 overlay over intensity in the slice views. One marker action applies to the
 usual visible masks across cutoffs. See the [confidence sweep guide](docs/confidence_sweeps.md).
+
+TTA layer `.seg.nrrd` files store only each layer's segment bounding box, placed
+in the full output grid with Slicer's `Segmentation_ReferenceImageExtentOffset`
+and `Segmentation_ReferenceImageExtent`. Slicer loads and edits them exactly as
+full-grid files, and the XTA readers (`reconciliation_io.read_layer_manifest`,
+`tools/xta_native_filter.py`, `tools/nrrd_reference_grid.py`, the cut tools and
+PTA mask import) reconstruct the full grid. Manifest rows record
+`stored_offset_tyx`, `stored_shape_tyx` and `stored_layout`; an empty layer is
+one zero voxel.
 
 ## PTA label geometry
 

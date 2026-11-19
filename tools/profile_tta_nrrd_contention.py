@@ -7,13 +7,15 @@ invocation writes only a plan; ``--execute`` is required for the large fixture.
 
 Install python-deflate into a task-scoped ``--deps-dir`` under the task's Scratch root
 before execution. Outputs and the temporary 256x2048x2048 logical fixture stay
-inside that output root. Every completed NRRD's decoded SHA-256 is verified.
+inside that output root. Every completed NRRD's decoded SHA-256 is verified on
+its reference grid, so sink layers in the production cropped (segment bounding box)
+layout verify against the same fixture hash as a full raster would.
+The background ``OutputLoad`` writers deliberately use the full-raster layout.
 """
 from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack
-import gzip
 import hashlib
 import importlib.util
 import json
@@ -29,17 +31,12 @@ from XTA import outputs, runtime
 from tools.benchmark_radial_host_contention import OutputLoad
 from tools.profile_tta_dispatch import TimedRLock, load_trace_specs, run_replay
 from tools.profile_tta_scheduler_lines import SchedulerLineGapProfiler, production_codes
+from tools.nrrd_reference_grid import reference_payload_sha256
 
 
 def _decoded_nrrd_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open('rb') as stream:
-        while stream.readline().strip():
-            pass
-        with gzip.GzipFile(fileobj=stream) as decoded:
-            while block := decoded.read(8 * 1024**2):
-                digest.update(block)
-    return digest.hexdigest()
+    """SHA-256 of the layer's reference-grid bytes; cropped and full layouts agree."""
+    return reference_payload_sha256(path)
 
 
 def _check_task_scoped_dependency(deps_dir: Path, root: Path) -> None:
@@ -77,6 +74,7 @@ def plan(*, trace: Path, output_root: Path, deps_dir: Path,
         'load_workers': load_workers, 'sink_jobs': sink_jobs,
         'gzip_workers': 64, 'fill_workers': 32, 'sink_workers': 12,
         'codec': 'libdeflate', 'mirrors': False,
+        'nrrd_layer_layout': outputs.NRRD_LAYER_LAYOUT_CROPPED,
         'line_window_seconds': line_window_seconds,
         'pre_replay_warmup_seconds': pre_replay_warmup_seconds,
         'real_task_trace': bool(real_task_trace),

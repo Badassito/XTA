@@ -40,15 +40,15 @@ def reference(root, name='view', *, empty=False, known_extent=False, mirror=True
         segment_extent_ijk=extent,segment_extent_shape_tyx=shape if known_extent else (0,0,0))
 
 
-def sink(root, *, run_id='branch-run', low=True):
+def sink(root, *, run_id='branch-run', low=True, layout='cropped'):
     spec=outputs.LowQualityDownbinSpec('0.5','0p5_4x4x4',.5,(4,4,4))
     return outputs.NrrdLayerSink(nrrd_dir=root/'nrrd',stem='case',output_shape_tyx=(4,8,8),max_workers=1,
         low_quality_specs=(spec,) if low else (),low_quality_root=root/'low_quality' if low else None,
-        run_id=run_id)
+        run_id=run_id,layer_layout=layout)
 
 
-def published(root, ref, suffix='view_fullframe_yolo', *, low=True):
-    source=sink(root,low=low)
+def published(root, ref, suffix='view_fullframe_yolo', *, low=True, layout='cropped'):
+    source=sink(root,low=low,layout=layout)
     try:
         path=source.submit_layer(ref,suffix)
         record=source.wait_published_layer(ref,suffix,output_path=path)
@@ -217,3 +217,73 @@ def test_adoption_allows_unrelated_pending_fallback_layer(tmp_path,monkeypatch):
     finally:
         released.set()
         target.shutdown()
+
+
+@pytest.mark.parametrize('layout',['full','cropped'])
+def test_rows_with_and_without_stored_placement_adopt(tmp_path,layout):
+    ref=reference(tmp_path/'source',known_extent=True)
+    root=tmp_path/'branch'
+    path,record,native,_=published(root,ref,layout=layout)
+    rows=[record['native'],*record['low_quality'].values()]
+    assert all(('stored_offset_tyx' in row)==(layout=='cropped') for row in rows)
+    if layout=='cropped':
+        assert record['native']['stored_offset_tyx']==[1,2,3] and record['native']['stored_shape_tyx']==[2,4,4]
+    target=sink(root,layout=layout)
+    try:
+        assert target.adopt_published_layer(ref,record)==path
+        target.wait()
+        assert json.loads(target.write_manifest().read_text())==native
+    finally:target.shutdown()
+
+
+def _just_outside(row,grid):
+    return [bound-size+1 for size,bound in zip(row['stored_shape_tyx'],grid)]
+
+
+@pytest.mark.parametrize('mutation',[
+    'offset_outside','mirror_offset_outside','offset_negative','offset_bool','offset_length',
+    'offset_null','layout_unknown','full_reference_box','full_reference_offset',
+    'layout_key_missing','mirror_placement_keys_missing'])
+def test_cropped_row_placement_is_validated_before_adoption(tmp_path,mutation):
+    ref=reference(tmp_path/'source',known_extent=True)
+    root=tmp_path/'branch'
+    _,record,_,_=published(root,ref)
+    value=copy.deepcopy(record)
+    row=value['native']
+    mirror=next(iter(value['low_quality'].values()))
+    if mutation=='offset_outside':row['stored_offset_tyx']=_just_outside(row,(4,8,8))
+    elif mutation=='mirror_offset_outside':mirror['stored_offset_tyx']=_just_outside(mirror,(4,4,4))
+    elif mutation=='offset_negative':row['stored_offset_tyx']=[-1,2,3]
+    elif mutation=='offset_bool':row['stored_offset_tyx']=[True,2,3]
+    elif mutation=='offset_length':row['stored_offset_tyx']=[1,2]
+    elif mutation=='offset_null':row['stored_offset_tyx']=None
+    elif mutation=='layout_unknown':row['stored_layout']='bounding'
+    elif mutation=='full_reference_box':row['stored_layout']='full_reference'
+    elif mutation=='full_reference_offset':
+        row.update(stored_layout='full_reference',stored_shape_tyx=[4,8,8],stored_offset_tyx=[0,0,0])
+        mirror.update(stored_layout='full_reference',stored_shape_tyx=[4,4,4],stored_offset_tyx=[0,1,0])
+    elif mutation=='layout_key_missing':row.pop('stored_layout')
+    elif mutation=='mirror_placement_keys_missing':
+        mirror.pop('stored_offset_tyx');mirror.pop('stored_layout')
+    target=sink(root)
+    try:
+        with pytest.raises(ValueError,match='stored'):target.adopt_published_layer(ref,value)
+        assert target.layer_count()==0 and target.low_quality_layer_count()==0
+        assert target.progress_counts()==(0,0) and target._physical_names=={}
+    finally:target.shutdown()
+
+
+@pytest.mark.parametrize('branch_layout,parent_layout',[('cropped','full'),('full','cropped')])
+def test_publication_layout_must_match_the_adopting_sink(tmp_path,branch_layout,parent_layout):
+    # One run never mixes layouts, even when a branch and its parent sink disagree.
+    ref=reference(tmp_path/'source',known_extent=True)
+    root=tmp_path/'branch'
+    _,record,_,_=published(root,ref,layout=branch_layout)
+    target=sink(root,layout=parent_layout)
+    try:
+        assert target.layer_layout==parent_layout
+        with pytest.raises(ValueError,match='differs from the scalar sink layer layout'):
+            target.adopt_published_layer(ref,record)
+        assert target.layer_count()==0 and target.low_quality_layer_count()==0
+        assert target.progress_counts()==(0,0) and target._physical_names=={}
+    finally:target.shutdown()

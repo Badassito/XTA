@@ -197,7 +197,7 @@ def infer(args):
     diagnostic=helper()
     assemblies={}
     receipts=[]
-    with diagnostic.gpu_lock(Path.home() / "Documents/ChatGPT/Scratch/Temp/GPU_LOCK","outer_crop_frozen_research_models"),diagnostic.resource_monitor(runroot/"resources.json",0):
+    with diagnostic.gpu_lock(args.gpu_lock,"outer_crop_frozen_research_models"),diagnostic.resource_monitor(runroot/"resources.json",0):
         with SamInterpolationTracker(model_path=args.model,device_ids=(0,),artifact_root=runroot/"temporary",
             source_cache_ref=cache,feature_cache_bytes=512*1024**2,profile="egpu") as runtime:
             started=time.perf_counter()
@@ -264,7 +264,10 @@ def main():
     p.add_argument("--variant",choices=("B0","B1","C2","A2"))
     p.add_argument("--model",type=Path)
     p.add_argument("--crop-mode",choices=("whole","tiled"),default="tiled")
+    p.add_argument("--gpu-lock",type=Path,help="Shared GPU reservation file; required by the infer stage")
     args=p.parse_args()
+    if args.stage=="infer" and args.gpu_lock is None:
+        p.error("--gpu-lock is required for the infer stage")
     prepare(args) if args.stage=="prepare" else infer(args)
 
 if __name__=="__main__":

@@ -27,6 +27,7 @@ def build_argparser(*, dispatch_only: bool = False) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=SCRIPT_BASENAME,
         usage=f"{SCRIPT_BASENAME} --mode {{tta,pta,lta}} ...",
+        epilog="For paired-volume registration and reslicing, use 'xta register --help'.",
         description=(
             "Mode-aware launcher for volume test-time, pretraining, and label-time "
             "augmentation. Select a mode, then supply only that mode's flags. Use "
@@ -185,6 +186,11 @@ def run(argv: Sequence[str] | None = None) -> None:
     """
 
     arguments = [str(value) for value in (sys.argv[1:] if argv is None else argv)]
+    if arguments[:1] == ["register"]:
+        from .registration.cli import main as run_registration
+
+        run_registration(arguments[1:])
+        return
 
     # Top-level discovery must not import OpenCV, SciPy, model runtimes, or any
     # mode implementation. Once a mode is present, its own --help remains authoritative.

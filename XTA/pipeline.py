@@ -1183,6 +1183,12 @@ def _main_impl() -> None:
             f'[affinity] Parent CPU affinity restored to all {len(_allowed_main_cpus)} '
             'allocated logical CPU(s) immediately after inference drain.'
         )
+        if os.environ.get('XTA_YOLO_SWEEP_NATIVE_ROLE') == 'produce':
+            # Sweep evidence and NRRD workers spawned under the startup mask; widen them too.
+            from .sweep_evidence_processes import widen_evidence_worker_affinity
+            widened = widen_evidence_worker_affinity(_allowed_main_cpus)
+            if widened:
+                print(f'[affinity] Sweep worker processes widened ({widened} thread(s)).')
 
     if gpu_worker_process_active:
         print(
@@ -2745,6 +2751,11 @@ def _main_impl() -> None:
         if any(is_azimuthal_view(candidate) for candidate in views):
             from .projection_coverage_cpu import warm_angular_key_kernels
             kernel_warmups.append(('angular_keys', warm_angular_key_kernels))
+        if os.environ.get('XTA_YOLO_SWEEP_NATIVE_ROLE') == 'produce':
+            # Sibling journal rows are decoded by publisher threads under load;
+            # load and probe the row kernels here so the first open_view does not.
+            from .sweep_view_decode import warm_native_view_decode_kernels
+            kernel_warmups.append(('native_view_decode', warm_native_view_decode_kernels))
     else:
         runtime_telemetry().gauge('sweep.prepublished_consumer.skipped_kernel_warmups', True)
         print('Using prepublished views; final output kernels initialize on demand.', flush=True)

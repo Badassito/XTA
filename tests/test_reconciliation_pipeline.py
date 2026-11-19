@@ -19,8 +19,8 @@ def _available(name):
         return False
 
 
-@pytest.mark.skipif(not all(_available(name) for name in ('openvino', 'cv2', 'nrrd')),
-                    reason='Real CLI qualification requires OpenVINO, OpenCV and pynrrd')
+@pytest.mark.skipif(not all(_available(name) for name in ('openvino', 'cv2')),
+                    reason='Real CLI qualification requires OpenVINO and OpenCV')
 def test_real_cpu_reconciliation_preserves_inputs_and_consumes_retained_scores(tmp_path):
     fixture_code = (
         'from pathlib import Path; import sys; '
@@ -84,8 +84,8 @@ def test_real_cpu_reconciliation_preserves_inputs_and_consumes_retained_scores(t
     assert not list((unionless / 'verify_native').rglob('native.u8.dat'))
 
 
-@pytest.mark.skipif(not all(_available(name) for name in ('openvino', 'cv2', 'nrrd')),
-                    reason='Real CLI qualification requires OpenVINO, OpenCV and pynrrd')
+@pytest.mark.skipif(not all(_available(name) for name in ('openvino', 'cv2')),
+                    reason='Real CLI qualification requires OpenVINO and OpenCV')
 def test_real_cpu_interpolation_preserves_bridge_provenance_and_unknown_confidence(tmp_path):
     fixture_code = (
         'from pathlib import Path; import sys; '

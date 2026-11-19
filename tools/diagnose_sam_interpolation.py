@@ -83,6 +83,10 @@ def resource_monitor(output,device=0):
         write_json(output,record)
 
 
+# Stages that reserve the GPU; --gpu-lock has no default and is required here.
+GPU_LOCK_STAGES = frozenset({"prepare", "raw", "sam", "integrated", "cache", "locked"})
+
+
 def gpu_lock(path, task):
     return gpu_reservation(path, task_name=task)
 
@@ -936,9 +940,10 @@ def main():
     parser.add_argument("--input", type=Path)
     parser.add_argument("--detector", type=Path)
     parser.add_argument("--sam-model", type=Path)
-    parser.add_argument("--ffmpeg", type=Path, default=Path.home() / "Documents/ChatGPT/Scratch/Environment/tools/ffmpeg.exe")
-    parser.add_argument("--ffprobe", type=Path, default=Path.home() / "Documents/ChatGPT/Scratch/Environment/tools/ffprobe.exe")
-    parser.add_argument("--gpu-lock", type=Path, default=Path.home() / "Documents/ChatGPT/Scratch/Temp/GPU_LOCK")
+    parser.add_argument("--ffmpeg", type=Path, default=Path("ffmpeg"), help="ffmpeg executable (default: ffmpeg on PATH)")
+    parser.add_argument("--ffprobe", type=Path, default=Path("ffprobe"), help="ffprobe executable (default: ffprobe on PATH)")
+    parser.add_argument("--gpu-lock", type=Path,
+                        help="Shared GPU reservation file; required by the " + ", ".join(sorted(GPU_LOCK_STAGES)) + " stages")
     parser.add_argument("--start", type=int, default=10)
     parser.add_argument("--stop", type=int, default=27)
     parser.add_argument("--anchor-start", type=int, default=12)
@@ -965,6 +970,8 @@ def main():
     if command and args.stage not in {"locked","integrated"}:
         parser.error(f"unrecognized arguments: {' '.join(command)}")
     command = command[1:] if command[:1] == ["--"] else command
+    if args.stage in GPU_LOCK_STAGES and args.gpu_lock is None:
+        parser.error(f"--gpu-lock is required for the {args.stage} stage")
     if args.stage == "prepare":
         prepare(args)
     elif args.stage == "replan":
