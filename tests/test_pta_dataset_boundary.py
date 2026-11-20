@@ -184,7 +184,7 @@ class PtaDatasetBoundaryTests(unittest.TestCase):
                     self.assertEqual([cand.source_order for cand in versions if cand.augmentation_index],
                                      list(range(4)) if ratio == 2 else [0, 1])
 
-    def test_background_retention_and_post_flip_withholding_are_deterministic(self) -> None:
+    def test_background_retention_is_deterministic(self) -> None:
         warnings = RecordingWarnings()
         candidates = [
             _candidate(index, foreground=index < 2)
@@ -204,29 +204,6 @@ class PtaDatasetBoundaryTests(unittest.TestCase):
         self.assertEqual(stats.background_retained, 2)
         self.assertEqual(stats.dropped, 2)
         self.assertEqual(warnings.entries, [])
-
-        withheld = pta_dataset.withhold_background_overage_after_flips(
-            candidates,
-            flips_by_subset={"all": 1},
-            background_percent=0.5,
-            labels_available=True,
-            background_stats=stats,
-            warnings=warnings,
-        )
-        self.assertEqual(withheld, 1)
-        self.assertFalse(candidates[4].keep)
-        self.assertTrue(candidates[5].keep)
-        self.assertEqual(stats.background_retained, 1)
-        self.assertEqual(stats.dropped, 3)
-        self.assertEqual(
-            warnings.entries,
-            [
-                (
-                    "background_cap_withheld_after_foreground_flips",
-                    "all: flips=1, realized_foreground=1, withheld_backgrounds=1",
-                )
-            ],
-        )
 
     def test_split_and_global_volume_assignment_goldens(self) -> None:
         warnings = RecordingWarnings()

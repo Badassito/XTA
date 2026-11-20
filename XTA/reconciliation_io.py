@@ -231,11 +231,14 @@ class FileLayer:
                 self._payload = reader(fileobj=self._source, mode="rb")
             else:
                 self._payload = self._source
-        except OSError as exc:
+        except BaseException as exc:
+            # Close on every failure: a leaked handle blocks deletion on Windows.
             if self._source is not None:
                 self._source.close()
             self._source = None
-            raise OSError(f"Cannot open reconciliation layer {self.path}: {exc}") from exc
+            if isinstance(exc, OSError):
+                raise OSError(f"Cannot open reconciliation layer {self.path}: {exc}") from exc
+            raise
         self._position = 0
         self._eof_validated = False
         self._owner._open_count += 1

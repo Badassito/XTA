@@ -7,10 +7,13 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 import cv2
 import numpy as np
 
+from XTA.polygon_keyholes import splice_holes
+from XTA.registration import labels as registration_labels
 from XTA.registration.packet import RegistrationPacket
 from XTA.registration.pairs import export_image_label_pairs
 
@@ -214,17 +217,68 @@ class RegistrationPairsTests(unittest.TestCase):
         expected[:, -1] = False
         np.testing.assert_array_equal(image, np.where(expected, self.frames[1], 0))
 
-    def test_unobserved_hole_that_yolo_would_fill_is_rejected(self):
+    def label_raster(self, path):
+        height, width = self.frames.shape[1:]
+        raster = np.zeros((height, width), np.uint8)
+        for line in path.read_text().splitlines():
+            xy = np.asarray(line.split()[1:], float).reshape(-1, 2) * [width, height]
+            cv2.fillPoly(raster, [np.rint(xy).astype(np.int32)], 1)
+        return raster.astype(bool)
+
+    def test_unobserved_hole_stays_open_through_a_keyhole_bridge(self):
+        packet = packet_fixture()
+        field = np.ones(self.frames.shape[1:], bool)
+        field[5:7, 5:7] = False
+        packet.masks["moving"] = field
+        (self.labels / "source_0002.txt").write_text("0 0.1 0.1 0.8 0.1 0.8 0.8 0.1 0.8\n")
+        output = self.root / "hole"
+        summary = export_image_label_pairs(
+            packet, self.video, self.labels, output, registered_metadata=self.metadata(packet)
+        )
+        self.assertEqual(summary["image_label_pairs"], 1)
+        self.assertEqual(summary["yolo_false_positive_pixels"], 0)
+        raster = self.label_raster(output / "registered_0002.txt")
+        self.assertTrue(raster.any())
+        self.assertFalse(raster[5:7, 5:7].any())
+
+    def test_hole_behind_an_unobserved_slot_bridges_through_observed_pixels(self):
+        packet = packet_fixture()
+        field = np.ones(self.frames.shape[1:], bool)
+        field[2, 2:8] = False
+        field[4, 6] = False
+        packet.masks["moving"] = field
+        (self.labels / "source_0002.txt").write_text(
+            "0 0.05 0.05 0.95 0.05 0.95 0.95 0.05 0.95\n"
+        )
+        clipped = np.zeros(field.shape, np.uint8)
+        cv2.fillPoly(clipped, [np.array([[1, 1], [13, 1], [13, 11], [1, 11]], np.int32)], 1)
+        clipped &= field
+        contours, hierarchy = cv2.findContours(clipped, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        (outer,) = [c for c, row in zip(contours, hierarchy[0]) if row[3] < 0]
+        holes = [c.reshape(-1, 2) for c, row in zip(contours, hierarchy[0]) if row[3] >= 0]
+        one_pass = np.zeros_like(clipped)
+        cv2.fillPoly(one_pass, [splice_holes(outer, holes).astype(np.int32)], 1)
+        self.assertTrue((one_pass.astype(bool) & ~field).any())
+        output = self.root / "shadowed"
+        export_image_label_pairs(
+            packet, self.video, self.labels, output, registered_metadata=self.metadata(packet)
+        )
+        raster = self.label_raster(output / "registered_0002.txt")
+        self.assertTrue(raster.any())
+        self.assertFalse((raster & ~field).any())
+
+    def test_polygon_covering_an_unobserved_hole_is_still_refused(self):
         packet = packet_fixture()
         field = np.ones(self.frames.shape[1:], bool)
         field[5:7, 5:7] = False
         packet.masks["moving"] = field
         (self.labels / "source_0002.txt").write_text("0 0.1 0.1 0.8 0.1 0.8 0.8 0.1 0.8\n")
         output = self.root / "unsafe_hole"
-        with self.assertRaisesRegex(ValueError, "unobserved hole"):
-            export_image_label_pairs(
-                packet, self.video, self.labels, output, registered_metadata=self.metadata(packet)
-            )
+        with mock.patch.object(registration_labels, "splice_holes", lambda outer, holes, **_: outer):
+            with self.assertRaisesRegex(ValueError, "unobserved hole"):
+                export_image_label_pairs(
+                    packet, self.video, self.labels, output, registered_metadata=self.metadata(packet)
+                )
         self.assertFalse(output.exists())
 
     def test_movie_identity_or_export_geometry_mismatch_leaves_output_absent(self):

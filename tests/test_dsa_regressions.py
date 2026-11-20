@@ -143,6 +143,16 @@ class DsaNativeSourceContractTests(unittest.TestCase):
         self.assertIn('pthread_rwlock_wrlock(&fork_gate)', self.source)
         self.assertIn('pthread_rwlock_rdlock(&fork_gate)', self.source)
 
+    def test_module_init_failure_releases_lock_and_error_type(self) -> None:
+        init = self.source[self.source.index('PyInit__dsa_copy(void)'):]
+        failure = init[init.index('fail:'):]
+        self.assertIn('PyThread_free_lock(native_lock)', failure)
+        self.assertIn('Py_CLEAR(DsaCopyError)', failure)
+        self.assertIn('Py_XDECREF(module)', failure)
+        self.assertLess(init.index('Py_INCREF(DsaCopyError)'), init.index('PyModule_AddObject('))
+        string_constant = init[init.index('PyModule_AddStringConstant('):init.index('return module;')]
+        self.assertIn('goto fail', string_constant)
+
     def test_setup_uses_the_owned_optional_source(self) -> None:
         setup_source = (ROOT / 'setup.py').read_text(encoding='utf-8')
         self.assertIn('XTA_BUILD_INTEL', setup_source)

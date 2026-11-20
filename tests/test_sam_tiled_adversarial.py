@@ -10,8 +10,8 @@ import pytest
 
 from XTA.config import activate_sam_crop_mode, resolve_sam_crop_mode
 from XTA.sam_crop_tiling import tile_grid
-from XTA.sam_evidence import SamEvidenceWriter, iter_selected_planes
-from XTA.sam_policy import measure_family_agreement, replay_sam_proposals, select_sam_proposals
+from XTA.sam_evidence import SamEvidenceWriter, iter_selected_native_crops, iter_selected_planes
+from XTA.sam_policy import measure_family_agreement, select_sam_proposals
 
 
 SHAPE = (48, 1512)
@@ -196,15 +196,13 @@ def test_tiled_replay_uses_saved_mode_and_exact_core_masks_regardless_of_env(tmp
     monkeypatch.setenv('YOLO_TTA_SAM_CROP_MODE', 'whole')
     online = select_sam_proposals(bundle)
     monkeypatch.setenv('YOLO_TTA_SAM_CROP_MODE', 'invalid')
-    replay = replay_sam_proposals(bundle, tmp_path / 'replay')
+    replay = select_sam_proposals(bundle)
     assert replay['selected_run_ids'] == online['selected_run_ids']
     assert replay['policy_hash'] == online['policy_hash']
     assert replay['resolved_policy']['version'] == 5
-    with np.load(tmp_path / 'replay' / 'selected_planes.npz') as archive:
-        row = next(row for row in replay['replay_outputs']['packed_plane_index']
-                   if row['direction'] == 'forward' and row['native_frame'] == 1)
-        mask = np.unpackbits(archive[row['key']], bitorder='little', count=np.prod(SHAPE)).reshape(SHAPE)
-        assert np.array_equal(mask, body)
+    mask = next(mask for _, _, native_frame, _, mask in iter_selected_native_crops(bundle, replay, direction='forward')
+                if native_frame == 1)
+    assert mask.shape == SHAPE and np.array_equal(mask, body)
     assert bundle.evidence_fingerprint == original
     bundle.assert_unchanged()
 

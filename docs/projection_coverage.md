@@ -20,52 +20,52 @@ device execution and complete source qualification belong in separate receipts.
 | --- | --- | --- |
 | Cartesian: Transverse, Sagittal, Coronal | Canonical categorical restoration; matching bounded D1 native-coverage pull for eligible layouts | CUDA requires its own eligible layout and device checks |
 | Tilted Cartesian | Shared view union followed by canonical destination pull | Shared CPU pool; exact CUDA gather after device admission |
-| Upright Azimuthal, full-mask output | Shared view union and canonical destination pull | Shared CPU pool or admitted exact native CUDA gather |
+| Upright Azimuthal, full-mask output | Shared view union and canonical destination pull | Packed parents: shared CPU pool or admitted exact native CUDA gather; dense Transverse parents: existing eligible CUDA; dense Sagittal/Coronal parents: orientation-aware CPU projection |
 | Upright Azimuthal, coverage | Declared reconstruction-plan angular/column pull | Existing eligible Transverse CUDA; native destination gather also supports all bases |
 | Tilted Azimuthal | Shared view union and bounded canonical destination pull; unsafe scatter refused | Shared CPU pool; exact CUDA gather after device admission |
 | Radial and tilted Radial | Bounded native shell pull | Eligible parent CUDA or separate native owner |
 | Spherical and rotated Spherical | Bounded destination-native QSC pull | CUDA requires its own eligible layout and device checks |
 
-Immediate D1 point scatter is no longer used for Tilted Cartesian, full-mask
-Azimuthal, or Tilted Azimuthal, including hybrid detector runs. Their masks pass
-through a bounded shared view union and the canonical projector. Cartesian D1
-native coverage and the separate Radial native owner remain available.
-The legacy D1 worker also rejects stale non-Cartesian requests before allocating
-CUDA state, so a later routing mistake cannot silently reactivate point scatter.
+Tilted Cartesian, full-mask Azimuthal and Tilted Azimuthal (including hybrid
+detector runs) do not use immediate D1 point scatter. Their masks pass through
+a bounded shared view union and the canonical projector. Cartesian D1 native
+coverage and the separate Radial native owner remain available. The D1 worker
+compiles only the Cartesian coverage kernel and rejects stale non-Cartesian
+requests before allocating CUDA state.
 
-This route change can add host shared-union and storage overhead to workloads
-that previously used non-Cartesian D1. It does not disable all GPU projection:
-eligible Cartesian, upright Azimuthal, Radial, and Spherical projectors
-retain their separate device paths. The new native gather also handles upright
-Sagittal and Coronal plans. SAM and detector model
-inference on GPU is unchanged. Full-cluster wall-time improvement remains
-unmeasured; local CPU projection trials have a separate scope.
-The old Tilted Azimuthal CUDA plan encodes unsafe scatter geometry and remains
-disabled. The separate native CUDA gather evaluates the destination cells with
-the same prepared geometry and contributor rules as CPU projection. It does not
-reactivate D1 scatter. Inference retains device priority; an existing CPU
-projection can hand off its unfinished suffix when a device becomes available.
-Native gather uses the same bounded source-retirement admission as Spherical
-projection. An idle device can be borrowed when no inference task is admissible;
-under a live backlog, pressure or starvation age grants a bounded turn and then
-returns the device to inference. The global inference-active flag alone does not
-block a native gather. Admission reasons and current device leases are recorded.
-Local numerical and performance checks do not establish full-cluster wall time.
+The shared union can add host and storage overhead compared with D1 point
+scatter. It does not disable GPU projection: eligible Cartesian, upright
+Azimuthal, Radial, and Spherical projectors keep their separate device paths,
+and the native gather also handles upright Sagittal and Coronal packed parents
+and confidence-sweep siblings. SAM and detector model inference still run on
+the GPU. Tilted Azimuthal has no CUDA scatter plan. The native CUDA gather
+evaluates the destination cells with the same prepared geometry and contributor
+rules as CPU projection. It does not reactivate D1 scatter. Inference retains
+device priority; an existing CPU projection can hand off its unfinished suffix
+when a device becomes available. Native gather uses the same bounded
+source-retirement admission as Spherical projection. An idle device can be
+borrowed when no inference task is admissible; under a live backlog, pressure or
+starvation age grants a bounded turn and then returns the device to inference.
+The global inference-active flag alone does not block a native gather. Admission
+reasons and current device leases are recorded. Local numerical checks and CPU
+projection trials do not establish full-cluster wall time.
 
 ### Projection beside inference
 
-A Spherical or Native source projection no longer needs a drained GPU when it
-fits a reserved per-GPU slice. (Main-process Radial retirement keeps the
-exclusive turn; owner-routed Radial projection already runs in the workers.) While inference is queued or
-running, the projection first asks for a shared lease: inference keeps
-dispatching on that GPU, and the projection may own at most the slice.
-Inference-side sizing that grows to fill free memory or falls back when refused
-(streamed Azimuthal prerender, hole fill, device union) subtracts the slice from
-the free-memory reading, so those decisions never size into the same bytes.
-One-time fixed admissions (resident source, Azimuthal texture, D1 bitset) keep
-their existing headroom, which is larger than the slice, so their outcomes are
-unchanged; a shared lease is granted only when the slice plus a margin is free. At most one shared projection runs per GPU, and never on a GPU with an
-exclusive stage, model residency (persistent SAM) or terminal asset retirement.
+A Spherical or native source projection does not need a drained GPU when it
+fits a reserved per-GPU slice. Main-process Radial retirement keeps the
+exclusive turn; owner-routed Radial projection runs in the workers. While
+inference is queued or running, the projection first asks for a shared lease:
+inference keeps dispatching on that GPU, and the projection may own at most the
+slice. Inference-side sizing that grows to fill free memory or falls back when
+refused (streamed Azimuthal prerender, hole fill, device union) subtracts the
+slice from the free-memory reading, so those decisions never size into the same
+bytes. One-time fixed admissions (resident source, Azimuthal texture, D1 bitset)
+keep their existing headroom, which is larger than the slice, so the slice does
+not change their outcomes; a shared lease is granted only when the slice plus a
+margin is free. At most one shared projection runs per GPU, and never on a GPU
+with an exclusive stage, model residency (persistent SAM) or terminal asset
+retirement.
 
 Spherical projection shrinks its output block depth to fit the slice. A native
 gather whose fixed source and scratch exceed the slice declines the shared
@@ -79,7 +79,7 @@ snapshot's `overlap_leases` show the split; overlap lease trace events carry
 | Variable | Default | Effect |
 |---|---|---|
 | `YOLO_TTA_GPU_PROJECTION_OVERLAP` | `1` | `0` restores the exclusive-only path and unchanged inference sizing |
-| `YOLO_TTA_GPU_PROJECTION_OVERLAP_GIB` | `4` | Per-GPU slice owned by one shared projection |
+| `YOLO_TTA_GPU_PROJECTION_OVERLAP_GIB` | `4` (`6` in a confidence-sweep producer) | Per-GPU slice owned by one shared projection. The producer is the lowest-cutoff fan-out child; see [confidence sweeps](confidence_sweeps.md). An explicit value always wins |
 | `YOLO_TTA_GPU_PROJECTION_OVERLAP_MARGIN_GIB` | `1` | Live free memory required beyond the slice before sharing |
 
 ### Spherical pacing
@@ -110,14 +110,14 @@ positive native interpolation tap with numerical margin.
 
 The direct sampler's positive-weight fringe clamps preserve diameter/stack
 endpoints through admitted model padding. Existing guards still require a
-qualifying unrotated pass, source axes within 4096, linear source sampling,
-matching endpoint radius and supported raster pitch. Tilted, nearest-source,
-excessively coarse and explicit user spacing requests keep their established
-behavior. Coarsened views retain native pull projection, never D1 point scatter.
-This certifies the interpolation basis, not a nonzero gray8 result or nearest
-categorical-label coverage.
+qualifying unrotated pass, source axes within 4096, matching endpoint
+radius and supported raster pitch. Tilted, excessively coarse and explicit
+user spacing requests keep their established behavior. Coarsened views retain
+native pull projection, never D1 point scatter. This certifies the
+interpolation basis, not a nonzero gray8 result or nearest categorical-label
+coverage.
 
-For F3 working shape 2911/3064/3022 and imgsz2048, upright Transverse angles
+For F3 working shape 2911/3064/3022 and imgsz 2048, upright Transverse angles
 fall from 4,747 to 3,557; Sagittal and Coronal each fall from 4,573 to 3,284.
 Total native frames decrease 13,893 to 10,125 (27.12%). Radial patching and its
 current certified radius spacing are unchanged. These are planning counts;
@@ -238,8 +238,9 @@ large mappings alive until inference-wide garbage collection.
 `YOLO_TTA_PACKED_PARENT=0` disables this continuation for comparisons.
 `YOLO_TTA_PACKED_PARENT_MIN_MIB` defaults to 64 to avoid encoding tiny inputs.
 `YOLO_TTA_PACKED_PARENT_RAM_RESERVE_MIB` defaults to 1024 and guards memfd growth.
-Interpolation/extrapolation, tiled parents, retained debug workspaces, an already
-published layer, and explicit NumPy projection retain their established paths.
+Interpolation/extrapolation, tiled parents, an already published layer, and
+explicit NumPy projection retain their established paths, as do runs without
+NRRD component layers (`--save nrrd`) or reconciliation.
 Packing changes storage, not view resolution or the destination coverage rules.
 
 Terminal source packing uses a native, GIL-free cropped row-bit encoder for
@@ -360,13 +361,13 @@ encoding workers start. No new codec or worker pool is introduced.
 
 Masking runs as one compiled, GIL-free numba call (`zero_unmasked_scores_flat`
 or `zero_unmasked_scores_boxes` in `confidence_capture_cpu.py`), branch-free and
-without scratch. The earlier loop made about 12,000 numpy calls per large
-view, and each one had to win the GIL back from the main process's other
-threads. On the cluster that cost 26-72 s per view (locally, 1.25 s became
-310 s with six busy Python threads, against 0.27 s for the compiled call). Every
-argument signature is compiled at startup, when the terminal capture queue is
-configured (`confidence.terminal_score_only.kernel_warmup`, about 1 s), because
-an in-process compile under the same contention can take minutes.
+without scratch. A per-box numpy loop would make about 12,000 calls per large
+view, each re-acquiring the GIL from the main process's other threads; on the
+cluster that cost 26-72 s per view (locally, 1.25 s became 310 s with six busy
+Python threads, against 0.27 s for the compiled call). Every argument signature
+is compiled at startup, when the terminal capture queue is configured
+(`confidence.terminal_score_only.kernel_warmup`, about 1 s), because an
+in-process compile under the same contention can take minutes.
 `YOLO_TTA_TERMINAL_SCORE_PREPARE_THREADS` (default 1) splits the work across
 threads, one piece each. Each extra thread must win the GIL to start and
 finish, so it helps only when the main process is otherwise idle. Results are

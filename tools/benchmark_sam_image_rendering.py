@@ -82,7 +82,7 @@ def main():
             source_shape=list(source.shape),source_bytes=int(source.nbytes),heatsoak_seconds=heat,
             cpu_heatsoak_workers=4,frames_per_cohort=args.frames,repeats=args.repeats,
             timing_includes='fresh CUDA renderer, source upload, crop renders/D2H, stream-safe retirement',
-            limitation='Synthetic local4090mobile/Oculink component sanity. No model, parent concurrency, H100, or downstream mask quality.',rows=rows)
+            limitation='Synthetic local 4090 mobile/OCuLink component sanity. No model, parent concurrency, H100, or downstream mask quality.',rows=rows)
         def save():
             (output/'benchmark.json').write_text(json.dumps(report,indent=2)+'\n',encoding='utf-8')
         for (family, tilted), view in selected.items():

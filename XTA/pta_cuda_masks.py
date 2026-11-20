@@ -18,11 +18,13 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Mapping, Optional, Tuple
 
 import numpy as np
 
 from . import geometry as shared_geometry
+from .env_flags import env_flag
 
 
 _GIB = 1024 ** 3
@@ -202,6 +204,19 @@ def _cpr_intensity_warp(native, forward, height, width, *, torch):
     return total.round().clamp_(0, 255).to(torch.uint8).contiguous()
 
 
+# Keys are tile configs x devices, so nothing is evicted: a cached tensor is never
+# freed while another stream may still read it, and the blocking upload completes
+# before first use.
+@lru_cache(maxsize=None)
+def _cpr_tile_resize_indices(torch, side, target_h, target_w, device):
+    """Device copies of OpenCV's INTER_NEAREST resize lattice used by resize_centered."""
+    from .pta_classification import _resize_tile_indices
+
+    xs, ys = _resize_tile_indices(int(side), int(target_h), int(target_w))
+    return (torch.as_tensor(np.asarray(xs, dtype=np.int64), device=device),
+            torch.as_tensor(np.asarray(ys, dtype=np.int64), device=device))
+
+
 def _cpr_item_from_native(native, plan, item_key, *, torch, categorical, affine_cache=None):
     """Preserve native quantization -> affine -> padded crop -> output resize."""
     tile = None if str(item_key) == "full" else next(
@@ -232,8 +247,7 @@ def _cpr_item_from_native(native, plan, item_key, *, torch, categorical, affine_
     if tuple(cropped.shape) == (target_h, target_w):
         return cropped.contiguous()
     if categorical:
-        ys = torch.arange(target_h, device=cropped.device, dtype=torch.int64) * side // target_h
-        xs = torch.arange(target_w, device=cropped.device, dtype=torch.int64) * side // target_w
+        xs, ys = _cpr_tile_resize_indices(torch, side, target_h, target_w, cropped.device)
         return cropped[ys[:, None], xs[None, :]].contiguous()
     from torch.nn import functional as F
     return F.interpolate(cropped.to(torch.float32)[None, None], size=(target_h, target_w),
@@ -514,9 +528,7 @@ def render_gpu_categorical_item(
     return is None only for an unsupported plan or a prelaunch memory rejection.
     Any error once a family kernel starts propagates to the render task.
     """
-    if os.environ.get("YOLO_TTA_PTA_GPU_CATEGORICAL", "1").strip().lower() in {
-        "0", "false", "no", "off", "disabled",
-    }:
+    if not env_flag("YOLO_TTA_PTA_GPU_CATEGORICAL", True):
         return None
     physical = getattr(plan, "view", None)
     view = physical if getattr(physical, "family", None) == "cpr" else getattr(physical, "shared_view", None)

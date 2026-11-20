@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -153,9 +152,9 @@ class PtaVoidFillTests(unittest.TestCase):
             ordering.append("resize")
             return volume, mask, mask.shape
 
-        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
-            os.environ, {"YOLO_TTA_VOIDFILL_CONNECTIVITY": "6"}
-        ), mock.patch.object(pta, "apply_gaussian_smoothing", side_effect=smooth), mock.patch.object(
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            pta, "apply_gaussian_smoothing", side_effect=smooth
+        ), mock.patch.object(
             pta, "resize_to_approximately_cube", side_effect=resize
         ):
             prep, _ = self.prepare(source, Path(directory), ["gaussian_smoothing:1"])

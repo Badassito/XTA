@@ -269,7 +269,7 @@ def sdf(args):
         stats = interpolate_view_volume_pass_inplace(
             observations, case_dir / "sdf_work", "diagnostic", args.distance,
             args.search_angle, args.walk_back, args.candidates, args.min_radius,
-            keep_temp=False, prefer_memory=True, reserve_bytes=0, workers=args.workers)
+            prefer_memory=True, reserve_bytes=0, workers=args.workers)
         merged = original.copy()
         merged[:,y0:y1,x0:x1] = observations
         np.save(case_dir / "sdf_selected.npy", merged)

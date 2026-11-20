@@ -21,8 +21,7 @@ def ring_volume():
 
 
 @pytest.mark.parametrize('backend', ['opencv', 'scipy'])
-def test_component_order_and_confidence_retirement(monkeypatch, backend):
-    monkeypatch.setenv('YOLO_TTA_CLEANUP_BACKEND', backend)
+def test_component_order_and_confidence_retirement(backend):
     mask = ring_volume()
     scores = np.full(mask.shape, 17, np.uint8)
     scores[0, 2, 3] = 200  # One high score retains the whole component.
@@ -32,19 +31,18 @@ def test_component_order_and_confidence_retirement(monkeypatch, backend):
     expected[0] = mask[0]
     expected_scores = scores.copy()
     expected_scores[expected == 0] = 0
-    cleanup.fused_slice_cleanup_inplace(mask, scores, min_conf=.5, min_radius=2, workers=2)
+    cleanup.fused_slice_cleanup_inplace(mask, scores, min_conf=.5, min_radius=2, workers=2, backend=backend)
     np.testing.assert_array_equal(mask, expected)
     np.testing.assert_array_equal(scores, expected_scores)
     # Hole filling adds support but never invents confidence evidence.
-    cleanup.fill_view_volume_holes_2d_inplace(mask, workers=2)
+    cleanup.fill_view_volume_holes_2d_inplace(mask, workers=2, backend=backend)
     assert mask[0, 8, 10] == 1
     assert scores[0, 8, 10] == 0
 
 
 @pytest.mark.parametrize('backend', ['opencv', 'scipy'])
 @pytest.mark.parametrize('metadata', ['missing', 'wrong_length', 'wrong_shape', 'invalid_bbox', 'valid'])
-def test_metadata_fallback_matches_authoritative_topology(monkeypatch, backend, metadata):
-    monkeypatch.setenv('YOLO_TTA_CLEANUP_BACKEND', backend)
+def test_metadata_fallback_matches_authoritative_topology(backend, metadata):
     mask = ring_volume()
     expected = np.stack([ndimage.binary_fill_holes(plane) for plane in mask]).astype(np.uint8)
     kwargs = {}
@@ -57,15 +55,18 @@ def test_metadata_fallback_matches_authoritative_topology(monkeypatch, backend, 
         kwargs['known_slice_bboxes'] = [0, 0, 0, 0]
     elif metadata == 'invalid_bbox':
         kwargs['known_slice_bboxes'][0] = [-8, 90, 0, 0]
-    cleanup.fill_view_volume_holes_2d_inplace(mask, workers=2, **kwargs)
+    cleanup.fill_view_volume_holes_2d_inplace(mask, workers=2, backend=backend, **kwargs)
     np.testing.assert_array_equal(mask, expected)
 
 
-def test_backend_selection_invalid_value_falls_back_to_opencv(monkeypatch):
-    monkeypatch.setenv('YOLO_TTA_CLEANUP_BACKEND', ' unknown ')
-    assert cleanup.cleanup_backend() == 'opencv'
-    monkeypatch.setenv('YOLO_TTA_CLEANUP_BACKEND', ' SciPy ')
-    assert cleanup.cleanup_backend() == 'scipy'
+def test_backend_names_normalize_and_unknown_values_are_rejected():
+    assert cleanup.DEFAULT_CLEANUP_BACKEND == 'opencv'
+    assert cleanup._normalize_cleanup_backend(' SciPy ') == 'scipy'
+    assert cleanup._normalize_cleanup_backend('OPENCV') == 'opencv'
+    with pytest.raises(ValueError, match='unknown prediction cleanup backend'):
+        cleanup._normalize_cleanup_backend(' unknown ')
+    with pytest.raises(ValueError, match='unknown prediction cleanup backend'):
+        cleanup.fused_slice_cleanup_inplace(ring_volume(), None, min_radius=2, backend='skimage')
 
 
 @pytest.mark.parametrize('backend', ['opencv', 'scipy'])
@@ -110,22 +111,21 @@ def test_parallel_filter_failure_reaches_caller_without_committing_slices(worker
     mask = np.repeat(ring_volume()[:1], 3, axis=0)
     scores = np.full(mask.shape, 255, np.uint8)
     original = mask.copy()
-    with mock.patch.object(cleanup, 'cleanup_backend', return_value='opencv'), mock.patch.object(
+    with mock.patch.object(
             cleanup, '_filter_connected_components_by_min_radius_opencv',
             side_effect=RuntimeError('worker cleanup failed')):
         with pytest.raises(RuntimeError, match='worker cleanup failed'):
-            cleanup.fused_slice_cleanup_inplace(mask, scores, min_radius=2, workers=workers)
+            cleanup.fused_slice_cleanup_inplace(mask, scores, min_radius=2, workers=workers, backend='opencv')
     np.testing.assert_array_equal(mask, original)
     assert np.all(scores == 255)
 
 
 @pytest.mark.parametrize('backend', ['opencv', 'scipy'])
-def test_completed_view_radius_filter_precedes_hole_fill(monkeypatch, backend):
-    monkeypatch.setenv('YOLO_TTA_CLEANUP_BACKEND', backend)
+def test_completed_view_radius_filter_precedes_hole_fill(backend):
     mask = np.zeros((1, 11, 13), np.uint8)
     mask[:, 2:9, 2:11] = 1
     mask[:, 3:8, 3:10] = 0
     view = ViewInfo('transverse', 1, 11, 13, 'pad')
     with mock.patch.object(cleanup, 'yolo_hole_fill_enabled', return_value=True):
-        cleanup.cleanup_view_volume_after_prediction_inplace(mask, None, view, 0, 2)
+        cleanup.cleanup_view_volume_after_prediction_inplace(mask, None, view, 0, 2, backend=backend)
     assert not np.any(mask)  # Filling first would keep the solid component.

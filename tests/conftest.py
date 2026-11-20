@@ -13,6 +13,18 @@ import pytest
 _DEPENDENCY_MODULES = ('cv2', 'scipy', 'scipy.ndimage', 'tifffile', 'tqdm', 'numba')
 _REPO_SETTINGS = Path(__file__).resolve().parents[1] / 'Ultralytics' / 'settings.json'
 
+# On Windows, importing Ultralytics replaces cv2.imread/imwrite/imshow for the
+# whole process, and its imread returns grayscale as (H, W, 1). Linux runs never
+# see that patch. Capture OpenCV's own functions before any test can import
+# Ultralytics, and restore them after each test so decode shapes do not depend
+# on whether an earlier test happened to load a YOLO model.
+try:
+    import cv2 as _cv2
+except ImportError:  # OpenCV is optional for some test environments.
+    _cv2 = None
+_OPENCV_IO = ({name: getattr(_cv2, name) for name in ('imread', 'imwrite', 'imshow')}
+              if _cv2 is not None else {})
+
 
 def _is_smoke_stub(module):
     kind = type(module)
@@ -37,6 +49,9 @@ def _guard_process_wide_test_state():
                 if name in sys.modules}
     initial_tf32 = _tf32_flags_if_loaded()
     yield
+    for name, function in _OPENCV_IO.items():
+        if getattr(_cv2, name) is not function:
+            setattr(_cv2, name, function)
     assert settings_existed or not _REPO_SETTINGS.exists(), (
         f'Ultralytics settings appeared in the repository during this test: {_REPO_SETTINGS}; '
         'create YOLO_CONFIG_DIR before importing Ultralytics in child processes'
@@ -51,6 +66,20 @@ def _guard_process_wide_test_state():
             assert not _is_smoke_stub(getattr(deps, name, None)), f'XTA._deps.{name} retained a stub'
     if initial_tf32 is not None:
         assert _tf32_flags_if_loaded() == initial_tf32, 'Torch TF32 flags changed during a test'
+
+
+def _reset_cgroup_layout_cache_if_loaded():
+    reset = getattr(sys.modules.get('XTA.workspace'), '_reset_cgroup_layout_cache', None)
+    if callable(reset):
+        reset()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_cgroup_layout_cache():
+    """Each test resolves its own (usually fake) cgroup membership and mounts."""
+    _reset_cgroup_layout_cache_if_loaded()
+    yield
+    _reset_cgroup_layout_cache_if_loaded()
 
 
 def pytest_configure(config):

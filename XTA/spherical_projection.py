@@ -12,7 +12,6 @@ from concurrent.futures import CancelledError, ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
 import math
 import operator
-import os
 import threading
 import time
 from pathlib import Path
@@ -23,6 +22,7 @@ import numpy as np
 from .spherical_projection_bounds import spherical_output_bounds
 from .spherical_projection_cuda import SphericalCudaProjectionUnsafeFailure
 from .cylindrical_cuda_projection import RadialEncodedBlock, RadialEncodedSlice, _MAX_ENCODED_SLICES
+from .env_flags import env_flag
 from .runtime import allocate_workspace_array, close_memmap_array_without_flush, runtime_telemetry
 from .workspace import _cpu_count
 
@@ -47,9 +47,7 @@ class SphericalCpuEncodedBlock(RadialEncodedBlock):
 
 
 def spherical_cuda_backproject_enabled():
-    return os.environ.get('YOLO_TTA_GPU_SPHERICAL_BACKPROJECT', '1').strip().lower() not in (
-        '0', 'false', 'no', 'off',
-    )
+    return env_flag('YOLO_TTA_GPU_SPHERICAL_BACKPROJECT', True)
 
 
 def _close_spherical_cuda_resources(projector, lease, *, timings=None):

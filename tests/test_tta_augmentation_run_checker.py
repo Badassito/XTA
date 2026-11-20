@@ -92,6 +92,14 @@ def test_partially_missing_policy_pass_fails(tmp_path):
         check(tmp_path)
 
 
+def test_coverage_none_with_support_records_fails(tmp_path):
+    manifest, layers = _fixture(tmp_path)
+    manifest['coverage_records'] = [{'view': 'transverse__tta_a0', 'path': 'support_000.npz'}]
+    _write(tmp_path, manifest, layers)
+    with pytest.raises(AssertionError, match='coverage is none but the manifest lists inverse-support records'):
+        check(tmp_path)
+
+
 def test_legacy_manifest_requires_rerun(tmp_path):
     manifest, layers = _fixture(tmp_path)
     del manifest['planned_output_groups']

@@ -37,19 +37,8 @@ from .lta_outputs import (
 _DEFAULT_RESERVE_BYTES = 16 * 1024**3
 _HOLE_FILL_ALGORITHM = "enclosed_2d_background_components"
 _HOLE_FILL_BACKGROUND_CONNECTIVITY = 4
-
-
-def _resolved_void_fill_connectivity() -> int:
-    raw = os.environ.get("YOLO_TTA_VOIDFILL_CONNECTIVITY", "").strip()
-    connectivity = 6
-    if raw:
-        try:
-            connectivity = int(raw)
-        except Exception:
-            connectivity = 6
-    if connectivity not in (6, 18, 26):
-        raise ValueError("3D void fill connectivity must be one of 6, 18, or 26")
-    return connectivity
+# 6-connected background is the topological dual of the 26-connected foreground.
+_VOID_FILL_BACKGROUND_CONNECTIVITY = 6
 
 
 @dataclass(frozen=True)
@@ -122,33 +111,6 @@ class LtaFilledMask:
         if mask.ndim != 2 or tuple(int(value) for value in mask.shape) != self.receipt.shape_hw:
             raise ValueError("filled mask shape does not match its receipt")
         object.__setattr__(self, "mask", mask)
-
-
-@dataclass(frozen=True)
-class LtaFilledMaskBatch:
-    """A stable object-order dogfood batch and per-mask provenance."""
-
-    masks: tuple[np.ndarray, ...] = field(repr=False, compare=False)
-    receipts: tuple[LtaMaskHoleFillReceipt, ...]
-
-    def __post_init__(self) -> None:
-        masks = tuple(
-            np.ascontiguousarray(np.asarray(mask), dtype=np.bool_).copy()
-            for mask in self.masks
-        )
-        receipts = tuple(self.receipts)
-        if not masks:
-            raise ValueError("a filled dogfood batch requires at least one mask")
-        if len(masks) != len(receipts):
-            raise ValueError("filled dogfood masks and receipts must have equal length")
-        for mask, receipt in zip(masks, receipts):
-            if mask.ndim != 2 or tuple(int(value) for value in mask.shape) != receipt.shape_hw:
-                raise ValueError("filled dogfood mask shape does not match its receipt")
-        object.__setattr__(self, "masks", masks)
-        object.__setattr__(self, "receipts", receipts)
-
-    def manifest_records(self) -> tuple[dict[str, object], ...]:
-        return tuple(receipt.manifest_record() for receipt in self.receipts)
 
 
 @dataclass(frozen=True)
@@ -243,48 +205,6 @@ def _fill_mask_with_receipt(
         algorithm=(_HOLE_FILL_ALGORITHM if enabled else 'disabled'),
     )
     return LtaFilledMask(mask=filled, receipt=receipt)
-
-
-def fill_prediction_mask_holes_2d(
-    mask: object,
-    *,
-    context: Optional[Mapping[str, object]] = None,
-    operation: Optional[Callable[[np.ndarray], object]] = None,
-) -> LtaFilledMask:
-    """Fill one SAM prediction before storage, tracklets, or relay planning."""
-
-    return _fill_mask_with_receipt(
-        mask,
-        provenance_kind="sam_prediction",
-        context=context,
-        operation=operation,
-    )
-
-
-def fill_dogfood_seed_masks_holes_2d(
-    masks: Sequence[object],
-    *,
-    provenance_kind: str = "temporal_dogfood",
-    context: Optional[Mapping[str, object]] = None,
-    operation: Optional[Callable[[np.ndarray], object]] = None,
-) -> LtaFilledMaskBatch:
-    """Fill every object mask immediately before a dogfood SAM injection."""
-
-    fill = _default_binary_hole_fill if operation is None else operation
-    filled = tuple(
-        _fill_mask_with_receipt(
-            mask,
-            provenance_kind=provenance_kind,
-            mask_index=index,
-            context=context,
-            operation=fill,
-        )
-        for index, mask in enumerate(tuple(masks))
-    )
-    return LtaFilledMaskBatch(
-        masks=tuple(item.mask for item in filled),
-        receipts=tuple(item.receipt for item in filled),
-    )
 
 
 def fill_merged_seed_mask_holes_2d(
@@ -527,7 +447,6 @@ def finalize_lta_native_union(
     temp_dir: Path,
     protected_foreground_layers: Sequence[LtaLayerRecord] = (),
     postprocessing: object | None = None,
-    keep_temp: bool = False,
     prefer_memory: bool = True,
     reserve_bytes: int = _DEFAULT_RESERVE_BYTES,
     workers: int = 1,
@@ -675,19 +594,17 @@ def finalize_lta_native_union(
         if resolved.enable_3d_void_fill:
             void_dir = scratch / "final_global_void_fill"
             void_dir.mkdir(parents=True, exist_ok=True)
-            void_connectivity = _resolved_void_fill_connectivity()
             ops.fill_3d_voids(
                 active_volume,
                 void_dir / "final_union",
-                keep_temp=bool(keep_temp),
                 prefer_memory=bool(prefer_memory),
                 reserve_bytes=int(reserve_bytes),
-                connectivity=void_connectivity,
+                connectivity=_VOID_FILL_BACKGROUND_CONNECTIVITY,
             )
             post_stats["execution_order"].append("3d_void_fill")  # type: ignore[union-attr]
             post_stats["void_fill"] = {
                 "enabled": True,
-                "background_connectivity": void_connectivity,
+                "background_connectivity": _VOID_FILL_BACKGROUND_CONNECTIVITY,
             }
             checkpoint("after_3d_void_fill")
 
@@ -697,7 +614,6 @@ def finalize_lta_native_union(
                 float(resolved.gaussian_sigma),
                 int(resolved.gaussian_passes),
                 scratch,
-                keep_temp=bool(keep_temp),
                 prefer_memory=bool(prefer_memory),
                 reserve_bytes=int(reserve_bytes),
                 workers=max(1, int(workers)),
@@ -713,14 +629,12 @@ def finalize_lta_native_union(
                 active_volume,
                 int(resolved.keep_objects),
                 scratch,
-                keep_temp=bool(keep_temp),
             )
             if gpu_result is None:
                 keep_stats = ops.apply_cpu_keep_objects(
                     active_volume,
                     int(resolved.keep_objects),
                     scratch,
-                    keep_temp=bool(keep_temp),
                     prefer_memory=bool(prefer_memory),
                     reserve_bytes=int(reserve_bytes),
                     workers=max(1, int(workers)),
@@ -998,7 +912,6 @@ def write_lta_postprocessing_checkpoint(
 __all__ = (
     "LtaCompletedViewFillReceipt",
     "LtaFilledMask",
-    "LtaFilledMaskBatch",
     "LtaFinalNrrdArtifact",
     "LtaFinalizationOperations",
     "LtaFinalizationResult",
@@ -1006,9 +919,7 @@ __all__ = (
     "LtaResolvedPostprocessing",
     "fill_binary_mask_holes_2d",
     "fill_completed_view_holes_2d_inplace",
-    "fill_dogfood_seed_masks_holes_2d",
     "fill_merged_seed_mask_holes_2d",
-    "fill_prediction_mask_holes_2d",
     "finalize_lta_native_union",
     "write_global_final_output_nrrd",
     "write_lta_postprocessing_checkpoint",

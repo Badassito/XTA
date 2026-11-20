@@ -690,7 +690,6 @@ class LtaProductionExecutionTests(unittest.TestCase):
             output_root=root / "output",
             temp_root=root / "output" / "temp" / "run",
             device_ids=devices,
-            sam_execution="video",
             conf=0.15,
             save_tokens=("summary", "voxel_volume"),
             command=("xta", "--mode", "lta"),

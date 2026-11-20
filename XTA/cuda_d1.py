@@ -35,7 +35,6 @@ from .publication_memory import publication_ram_headroom
 
 from .geometry import (
     ViewInfo,
-    is_azimuthal_view,
     is_radial_view,
     is_spherical_view,
     physical_view_name,
@@ -44,10 +43,6 @@ from .geometry import (
 
 # Explicit lower-layer dependencies keep imports one-way.
 from .config import GIB
-from .experimental_features import (
-    d1_owner_group_size_limit,
-    d1_owner_groups_requested,
-)
 from .workspace import (
     _env_flag,
     _env_float,
@@ -72,7 +67,6 @@ from .interpolation import (
     _encode_bool_mask_slice_payload,
     _nrrd_empty_segment_extent,
     _write_raw_bbox_payload_store,
-    write_raw_bbox_mask_store,
 )
 
 def d1_owner_pipeline_enabled() -> bool:
@@ -260,64 +254,6 @@ class D1PartialBitsetArtifact:
         return artifact
 
 
-def d1_reduce_word_arrays(
-    partials: Sequence[object], *, destination: Optional[object] = None,
-) -> object:
-    """Deterministically tree-reduce equal-length uint32 arrays with bitwise OR.
-
-    This is intentionally array-module agnostic.  NumPy exercises the complete reduction
-    contract in CPU-only tests; CuPy arrays use the same pairwise ordering on HGX.  Inputs
-    other than an explicitly supplied destination are never mutated.
-    """
-    if not partials:
-        raise ValueError('D1 partial reduction requires at least one input')
-    arrays = list(partials)
-    first_shape = tuple(int(value) for value in getattr(arrays[0], 'shape', ()))
-    if len(first_shape) != 1:
-        raise ValueError(f'D1 partial arrays must be one-dimensional, got {first_shape}')
-    for index, array in enumerate(arrays):
-        shape = tuple(int(value) for value in getattr(array, 'shape', ()))
-        if shape != first_shape:
-            raise ValueError(
-                f'D1 partial {index} shape {shape} != first partial {first_shape}'
-            )
-        if np.dtype(getattr(array, 'dtype', None)) != np.dtype(np.uint32):
-            raise TypeError(
-                f'D1 partial {index} dtype {getattr(array, "dtype", None)} is not uint32'
-            )
-    if destination is None:
-        work = []
-        for array in arrays:
-            copy_method = getattr(array, 'copy', None)
-            if not callable(copy_method):
-                raise TypeError('D1 partial array does not provide copy()')
-            work.append(copy_method())
-    else:
-        if tuple(int(value) for value in getattr(destination, 'shape', ())) != first_shape:
-            raise ValueError('D1 reduction destination shape does not match its inputs')
-        if np.dtype(getattr(destination, 'dtype', None)) != np.dtype(np.uint32):
-            raise TypeError('D1 reduction destination dtype is not uint32')
-        destination[...] = arrays[0]
-        work = [destination]
-        for array in arrays[1:]:
-            copy_method = getattr(array, 'copy', None)
-            if not callable(copy_method):
-                raise TypeError('D1 partial array does not provide copy()')
-            work.append(copy_method())
-    while len(work) > 1:
-        next_level: List[object] = []
-        for index in range(0, len(work), 2):
-            left = work[index]
-            if index + 1 >= len(work):
-                next_level.append(left)
-                continue
-            right = work[index + 1]
-            # ``|=`` is supported by both NumPy and CuPy and keeps the left allocation.
-            left |= right
-            next_level.append(left)
-        work = next_level
-    return work[0]
-
 _D1_BACKPROJECT_KERNELS: Optional[object] = None
 
 _D1_BACKPROJECT_KERNELS_FAILED = False
@@ -325,7 +261,7 @@ _D1_BACKPROJECT_KERNELS_FAILED = False
 _D1_BACKPROJECT_KERNELS_ERROR: Optional[str] = None
 
 def _d1_backproject_kernels() -> object:
-    """Compile the source-geometry bitset backprojection kernel once per worker."""
+    """Compile the Cartesian categorical coverage bitset kernel once per worker."""
     global _D1_BACKPROJECT_KERNELS, _D1_BACKPROJECT_KERNELS_FAILED
     global _D1_BACKPROJECT_KERNELS_ERROR
     if _D1_BACKPROJECT_KERNELS is not None:
@@ -339,21 +275,6 @@ def _d1_backproject_kernels() -> object:
     # expose libnvrtc without the host libc/C++ include tree, so including stdint.h or
     # math.h can fail even though this kernel needs only CUDA intrinsics and primitive types.
     source = r'''
-    __device__ __forceinline__ int d1_round_index(float value, int count) {
-      int idx = __float2int_rn(value);
-      if (idx < 0) return 0;
-      if (idx >= count) return count - 1;
-      return idx;
-    }
-    __device__ __forceinline__ float d1_scale_center(
-        float value, int in_count, int out_count) {
-      if (in_count <= 1 || out_count <= 1) return 0.0f;
-      return (value + 0.5f) * ((float)out_count / (float)in_count) - 0.5f;
-    }
-    __device__ __forceinline__ bool d1_inside(float value, int count) {
-      return value >= 0.0f && value <= (float)(count - 1);
-    }
-
     __device__ __forceinline__ void d1_warp_aggregated_atomic_or(
         unsigned int* output_bits, unsigned long long word, unsigned int bit,
         unsigned int* warp_bits) {
@@ -380,90 +301,6 @@ def _d1_backproject_kernels() -> object:
       // available.  Those devices retain the correct per-pixel atomic implementation.
       atomicOr(output_bits + word, bit);
     #endif
-    }
-
-    extern "C" __global__ void d1_backproject_bboxes_to_bits(
-        const unsigned char* mask,
-        int proc_h, int proc_w, int slice_start,
-        const int* bbox_specs, int bbox_count,
-        int view_slices, int view_h, int view_w,
-        int logical_t, int logical_h, int logical_w,
-        int out_t, int out_h, int out_w,
-        int family_id, int base_id, int direction_id,
-        float tan_tilt, int stack_len,
-        float center_x, float center_y, float roi_radius,
-        const float* angle_cos, const float* angle_sin,
-        unsigned int* output_bits) {
-      __shared__ unsigned int warp_bits[256];
-      int bbox_index = (int)blockIdx.y;
-      if (bbox_index < 0 || bbox_index >= bbox_count) return;
-      const int* bbox = bbox_specs + 5 * bbox_index;
-      int local_slice = bbox[0];
-      int bbox_y0 = bbox[1];
-      int bbox_x0 = bbox[2];
-      int bbox_h = bbox[3];
-      int bbox_w = bbox[4];
-      unsigned int q = blockDim.x * blockIdx.x + threadIdx.x;
-      unsigned int total = (unsigned int)bbox_h * (unsigned int)bbox_w;
-      if (q >= total) return;
-
-      unsigned int bbox_row = q / (unsigned int)bbox_w;
-      int py_i = bbox_y0 + (int)bbox_row;
-      int px_i = bbox_x0 + (int)(q - bbox_row * (unsigned int)bbox_w);
-      if (py_i < 0 || py_i >= proc_h || px_i < 0 || px_i >= proc_w) return;
-      unsigned long long mask_index =
-          ((unsigned long long)local_slice * (unsigned long long)proc_h
-           + (unsigned long long)py_i) * (unsigned long long)proc_w
-          + (unsigned long long)px_i;
-      if (mask[mask_index] == 0) return;
-
-      int slice_index = slice_start + local_slice;
-      if (slice_index < 0 || slice_index >= view_slices) return;
-
-      float native_x = d1_scale_center((float)px_i, proc_w, view_w);
-      float native_y = d1_scale_center((float)py_i, proc_h, view_h);
-      float plane_x = native_x;
-      float plane_y = native_y;
-      float stack = (float)slice_index;
-
-      if (family_id == 2) {
-        // Azimuthal mask axes are (stack row, diameter sample); slice_index is azimuth.
-        float line = view_w > 1
-            ? -roi_radius + (2.0f * roi_radius) * (native_x / (float)(view_w - 1))
-            : -roi_radius;
-        plane_x = center_x + line * angle_cos[slice_index];
-        plane_y = center_y + line * angle_sin[slice_index];
-        stack = d1_scale_center(native_y, view_h, stack_len);
-      }
-
-      if (family_id == 1 || (family_id == 2 && tan_tilt != 0.0f)) {
-        float axis = direction_id == 0
-            ? plane_y - center_y
-            : plane_x - center_x;
-        stack += tan_tilt * axis;
-      }
-
-      float wt, wy, wx;
-      if (base_id == 0) {
-        wt = stack; wy = plane_y; wx = plane_x;
-      } else if (base_id == 1) {
-        wt = plane_y; wy = stack; wx = plane_x;
-      } else {
-        wt = plane_y; wy = plane_x; wx = stack;
-      }
-      if (!d1_inside(wt, logical_t)
-          || !d1_inside(wy, logical_h)
-          || !d1_inside(wx, logical_w)) return;
-
-      int oz = d1_round_index(d1_scale_center(wt, logical_t, out_t), out_t);
-      int oy = d1_round_index(d1_scale_center(wy, logical_h, out_h), out_h);
-      int ox = d1_round_index(d1_scale_center(wx, logical_w, out_w), out_w);
-      unsigned long long linear =
-          ((unsigned long long)oz * (unsigned long long)out_h + (unsigned long long)oy)
-          * (unsigned long long)out_w + (unsigned long long)ox;
-      unsigned long long word = linear >> 5;
-      unsigned int bit = 1u << (unsigned int)(linear & 31ull);
-      d1_warp_aggregated_atomic_or(output_bits, word, bit, warp_bits);
     }
 
     extern "C" __global__ void d1_orthogonal_coverage_to_bits(
@@ -508,7 +345,7 @@ def _d1_backproject_kernels() -> object:
         module = cp.RawModule(
             code=source,
             options=('--std=c++14',),
-            name_expressions=('d1_backproject_bboxes_to_bits', 'd1_orthogonal_coverage_to_bits'),
+            name_expressions=('d1_orthogonal_coverage_to_bits',),
         )
         compile_fn = getattr(module, 'compile', None)
         if callable(compile_fn):
@@ -516,7 +353,6 @@ def _d1_backproject_kernels() -> object:
         _D1_BACKPROJECT_KERNELS = argparse.Namespace(
             cp=cp,
             module=module,
-            d1_backproject_bboxes_to_bits=module.get_function('d1_backproject_bboxes_to_bits'),
             d1_orthogonal_coverage_to_bits=module.get_function('d1_orthogonal_coverage_to_bits'),
         )
         _D1_BACKPROJECT_KERNELS_ERROR = None
@@ -575,8 +411,6 @@ class _D1WorkerViewState:
     output_shape: Tuple[int, int, int]
     bitset: object
     coverage: np.ndarray
-    angle_cos: object
-    angle_sin: object
     store_dir: Path
     created_at: float
     view_shadow_writer: Optional[IncrementalRawBBoxMaskStoreWriter] = None
@@ -699,18 +533,6 @@ def _d1_require_cartesian_native_coverage(view: ViewInfo) -> None:
         raise ValueError(f'D1 does not support base view {physical_view_name(view)!r}')
 
 
-def _d1_view_family_ids(view: ViewInfo) -> Tuple[int, int, int, float, int, float, float]:
-    """Return Cartesian metadata; oblique point-scatter dispatch is forbidden."""
-    _d1_require_cartesian_native_coverage(view)
-    base = physical_view_name(view)
-    base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
-    if str(base) not in base_ids:
-        raise ValueError(f'D1 does not support base view {base!r}')
-    return (
-        0, int(base_ids[str(base)]), 0, 0.0, int(view.num_slices),
-        float((int(view.src_w) - 1) * 0.5), float((int(view.src_h) - 1) * 0.5),
-    )
-
 def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionAccumulator') -> _D1WorkerViewState:
     global _D1_PIPELINE_ANNOUNCED
     view = task.get('view')
@@ -827,20 +649,6 @@ def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionA
             bitset = torch.zeros(
                 (int(word_count),), dtype=torch.int32, device=accumulator.device,
             )
-        if is_azimuthal_view(view):
-            radians = np.deg2rad(
-                np.ascontiguousarray(np.asarray(view.azimuths_deg, dtype=np.float32)).astype(np.float64)
-            ).astype(np.float32)
-            if int(radians.size) != int(view.num_slices):
-                raise RuntimeError(
-                    f'D1 Azimuthal angle table has {int(radians.size)} entries for '
-                    f'{int(view.num_slices)} slices'
-                )
-            angle_cos = kernels.cp.asarray(np.ascontiguousarray(np.cos(radians), dtype=np.float32))
-            angle_sin = kernels.cp.asarray(np.ascontiguousarray(np.sin(radians), dtype=np.float32))
-        else:
-            angle_cos = kernels.cp.asarray(np.ones((1,), dtype=np.float32))
-            angle_sin = kernels.cp.asarray(np.zeros((1,), dtype=np.float32))
         shadow_writer: Optional[IncrementalRawBBoxMaskStoreWriter] = None
         if shadow_store_dir is not None and shadow_shape is not None:
             shadow_writer = IncrementalRawBBoxMaskStoreWriter(
@@ -862,8 +670,6 @@ def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionA
             output_shape=output_shape,
             bitset=bitset,
             coverage=np.zeros((int(view.num_slices),), dtype=bool),
-            angle_cos=angle_cos,
-            angle_sin=angle_sin,
             store_dir=store_dir,
             created_at=time.perf_counter(),
             view_shadow_writer=shadow_writer,
@@ -884,7 +690,7 @@ def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionA
         if not _D1_PIPELINE_ANNOUNCED:
             _D1_PIPELINE_ANNOUNCED = True
             print(
-                'v16.1.3 D1 owner-GPU pipeline active: each worker keeps one '
+                'D1 owner-GPU pipeline active: each worker keeps one '
                 'source-geometry uint32 bitset, backprojects every completed inference '
                 'lease immediately, and publishes one sparse cvol after view completion.'
             )
@@ -1345,8 +1151,6 @@ def _d1_release_group_partial(lease_token: str) -> bool:
             return False
         _D1_WORKER_VIEW_STATES.pop(match_key, None)
     _d1_close_state_bitset(match_state)
-    match_state.angle_cos = None
-    match_state.angle_sin = None
     fallback_path = str(match_state.host_fallback_path or '')
     match_state.host_fallback_path = ''
     if fallback_path:
@@ -1394,8 +1198,8 @@ def _validate_d1_group_artifacts(
     # Coalescing must yield one complete view-depth interval.  This catches gaps and
     # duplicate ownership before any destructive reduction begins.
     if normalized != ((0, int(first.output_shape[0])),):
-        # D1 view depth can differ from output/source depth for orthogonal and azimuthal
-        # geometry.  Artifacts therefore cover view slices, whose maximum is encoded by
+        # D1 view depth can differ from output/source depth for orthogonal geometry.
+        # Artifacts therefore cover view slices, whose maximum is encoded by
         # their collectively contiguous range rather than output_shape[0].
         if not normalized or normalized[0][0] != 0 or len(normalized) != 1:
             raise ValueError(f'D1 group slice coverage is not contiguous: {flattened}')
@@ -1597,16 +1401,15 @@ def _d1_reduce_group_partials(
 _D1_BACKPROJECT_THREADS = 256
 
 
-def _d1_prepare_bbox_launch_plan(
+def _d1_pack_bbox_specs(
     slice_any: np.ndarray,
     slice_bboxes: np.ndarray,
     mask_shape: Tuple[int, int, int],
-) -> Tuple[np.ndarray, List[Tuple[int, int, int]], int]:
-    """Pack nonempty bboxes and group them into a small number of 2D CUDA launches.
+) -> Tuple[np.ndarray, int]:
+    """Pack clamped nonempty slice bboxes in ascending local-slice order.
 
-    Grid Y selects a bbox and grid X scans its flattened pixels. Power-of-two block-count
-    buckets keep each launch below 2x rounded work while collapsing similarly sized slices
-    into one kernel. Each returned group is ``(grid_x_blocks, first_spec, spec_count)``.
+    Rows are ``(local_slice, y0, x0, height, width)``. Returns
+    ``(specs, scanned_bbox_pixels)``.
     """
 
     any_flags = np.asarray(slice_any, dtype=bool)
@@ -1618,9 +1421,8 @@ def _d1_prepare_bbox_launch_plan(
     if len(mask_shape) != 3 or any(int(value) <= 0 for value in mask_shape):
         raise ValueError(f'D1 bbox launch received invalid mask shape {mask_shape}')
 
-    rows: List[Tuple[int, int, int, int, int, int]] = []
+    rows: List[Tuple[int, int, int, int, int]] = []
     scanned_bbox_pixels = 0
-    max_linear_pixels = int(np.iinfo(np.int32).max)
     for local_slice in np.flatnonzero(any_flags):
         local_i = int(local_slice)
         y0, y1, x0, x1 = (int(value) for value in bboxes[local_i])
@@ -1636,34 +1438,11 @@ def _d1_prepare_bbox_launch_plan(
                 f'D1 metadata marks local slice {local_i} nonempty but gives '
                 f'empty bbox {(y0, y1, x0, x1)}'
             )
-        if bbox_pixels > max_linear_pixels:
-            raise RuntimeError(
-                f'D1 bbox for local slice {local_i} contains {bbox_pixels} pixels; '
-                f'the batched 32-bit launch limit is {max_linear_pixels}'
-            )
-        block_count = (
-            int(bbox_pixels) + int(_D1_BACKPROJECT_THREADS) - 1
-        ) // int(_D1_BACKPROJECT_THREADS)
-        bucket_blocks = 1 << (int(block_count) - 1).bit_length()
-        rows.append((
-            int(bucket_blocks), local_i, int(y0), int(x0), int(bbox_h), int(bbox_w),
-        ))
+        rows.append((local_i, int(y0), int(x0), int(bbox_h), int(bbox_w)))
         scanned_bbox_pixels += int(bbox_pixels)
 
-    rows.sort(key=lambda row: (int(row[0]), int(row[1])))
-    specs = np.ascontiguousarray(
-        np.asarray([row[1:] for row in rows], dtype=np.int32).reshape(-1, 5),
-    )
-    launch_groups: List[Tuple[int, int, int]] = []
-    first = 0
-    while first < len(rows):
-        bucket_blocks = int(rows[first][0])
-        stop = int(first + 1)
-        while stop < len(rows) and int(rows[stop][0]) == bucket_blocks:
-            stop += 1
-        launch_groups.append((bucket_blocks, int(first), int(stop - first)))
-        first = int(stop)
-    return specs, launch_groups, int(scanned_bbox_pixels)
+    specs = np.ascontiguousarray(np.asarray(rows, dtype=np.int32).reshape(-1, 5))
+    return specs, int(scanned_bbox_pixels)
 
 
 def _d1_confidence_support_metadata(accumulator, shape):
@@ -1749,7 +1528,7 @@ def _d1_confidence_task_spec(task: Mapping[str, object], accumulator: object):
     metadata, support_metrics = _d1_confidence_support_metadata(accumulator, shape)
     if isinstance(metadata, dict):
         # Reuse the same small readback for binary backprojection later in this callback.
-        specs, _, _ = _d1_prepare_bbox_launch_plan(metadata['slice_any'], metadata['slice_bboxes'], shape)
+        specs, _ = _d1_pack_bbox_specs(metadata['slice_any'], metadata['slice_bboxes'], shape)
         accumulator._d1_confidence_slice_metadata = metadata
         boxes = {int(z): (int(y), int(y+h), int(x), int(x+w)) for z,y,x,h,w in specs}
     else:
@@ -2003,9 +1782,6 @@ def _d1_consume_device_union(
 
     kernels = _d1_backproject_kernels()
     cp = kernels.cp
-    family_id, base_id, direction_id, tan_tilt, stack_len, center_x, center_y = (
-        _d1_view_family_ids(view)
-    )
     mask_shape = tuple(int(v) for v in accumulator.union_dev.shape)
     if mask_shape[0] != count:
         raise RuntimeError(
@@ -2031,48 +1807,31 @@ def _d1_consume_device_union(
     stream = cp.cuda.get_current_stream()
     mask_cp = cp.asarray(accumulator.union_dev)
     bitset_cp = cp.asarray(state.bitset)
-    bbox_specs_host, bbox_launch_groups, scanned_bbox_pixels = (
-        _d1_prepare_bbox_launch_plan(slice_any, slice_bboxes, mask_shape)
-    )
+    bbox_specs_host, scanned_bbox_pixels = _d1_pack_bbox_specs(slice_any, slice_bboxes, mask_shape)
     nonempty_slices = int(bbox_specs_host.shape[0])
-    if family_id == 0:
-        from .d1_orthogonal_coverage import build_orthogonal_coverage_plan, coverage_launch_groups, ORTHOGONAL_COVERAGE_CONTRACT
-        state.projection_kind = ORTHOGONAL_COVERAGE_CONTRACT
-        cache = getattr(state, 'orthogonal_coverage_cache', None)
-        full_shape = (int(view.num_slices), *mask_shape[1:])
-        if cache is None:
-            plan = build_orthogonal_coverage_plan(view, full_shape, state.output_shape)
-            device_ranges = tuple(cp.asarray(value) for pair in plan.source_ranges_tyx for value in pair)
-            cache = (plan, device_ranges)
-            state.orthogonal_coverage_cache = cache
-        plan, device_ranges = cache
-        if plan.processing_shape_tyx != full_shape or plan.source_shape_tyx != tuple(state.output_shape):
-            raise RuntimeError('D1 orthogonal categorical projection geometry changed within a view')
-        groups = coverage_launch_groups(plan, bbox_specs_host, s0)
-        for cells, specs in groups:
-            kernels.d1_orthogonal_coverage_to_bits(
-                ((int(cells) + _D1_BACKPROJECT_THREADS - 1) // _D1_BACKPROJECT_THREADS, len(specs)),
-                (_D1_BACKPROJECT_THREADS,),
-                (mask_cp, np.int32(mask_shape[1]), np.int32(mask_shape[2]), cp.asarray(specs),
-                 np.int32(len(specs)), *tuple(np.int32(value) for value in state.output_shape),
-                 np.int32(plan.input_axes_tyx.index(0)), np.int32(plan.input_axes_tyx.index(1)),
-                 np.int32(plan.input_axes_tyx.index(2)), *device_ranges, bitset_cp), stream=stream)
-        launch_count = len(groups)
-        runtime_telemetry().add('d1.orthogonal_categorical_coverage_launches', launch_count)
-    else:
-        bbox_specs_cp = cp.asarray(bbox_specs_host)
-        for grid_x_blocks, first_spec, spec_count in bbox_launch_groups:
-            group_specs_cp = bbox_specs_cp[int(first_spec):int(first_spec) + int(spec_count)]
-            kernels.d1_backproject_bboxes_to_bits(
-                (int(grid_x_blocks), int(spec_count)), (_D1_BACKPROJECT_THREADS,),
-                (mask_cp, np.int32(mask_shape[1]), np.int32(mask_shape[2]), np.int32(s0),
-                 group_specs_cp, np.int32(spec_count), np.int32(view.num_slices),
-                 np.int32(view.src_h), np.int32(view.src_w), np.int32(view.full_t),
-                 np.int32(view.full_h), np.int32(view.full_w), *tuple(np.int32(value) for value in state.output_shape),
-                 np.int32(family_id), np.int32(base_id), np.int32(direction_id), np.float32(tan_tilt),
-                 np.int32(stack_len), np.float32(center_x), np.float32(center_y), np.float32(view.roi_radius),
-                 state.angle_cos, state.angle_sin, bitset_cp), stream=stream)
-        launch_count = len(bbox_launch_groups)
+    from .d1_orthogonal_coverage import build_orthogonal_coverage_plan, coverage_launch_groups, ORTHOGONAL_COVERAGE_CONTRACT
+    state.projection_kind = ORTHOGONAL_COVERAGE_CONTRACT
+    cache = getattr(state, 'orthogonal_coverage_cache', None)
+    full_shape = (int(view.num_slices), *mask_shape[1:])
+    if cache is None:
+        plan = build_orthogonal_coverage_plan(view, full_shape, state.output_shape)
+        device_ranges = tuple(cp.asarray(value) for pair in plan.source_ranges_tyx for value in pair)
+        cache = (plan, device_ranges)
+        state.orthogonal_coverage_cache = cache
+    plan, device_ranges = cache
+    if plan.processing_shape_tyx != full_shape or plan.source_shape_tyx != tuple(state.output_shape):
+        raise RuntimeError('D1 orthogonal categorical projection geometry changed within a view')
+    groups = coverage_launch_groups(plan, bbox_specs_host, s0)
+    for cells, specs in groups:
+        kernels.d1_orthogonal_coverage_to_bits(
+            ((int(cells) + _D1_BACKPROJECT_THREADS - 1) // _D1_BACKPROJECT_THREADS, len(specs)),
+            (_D1_BACKPROJECT_THREADS,),
+            (mask_cp, np.int32(mask_shape[1]), np.int32(mask_shape[2]), cp.asarray(specs),
+             np.int32(len(specs)), *tuple(np.int32(value) for value in state.output_shape),
+             np.int32(plan.input_axes_tyx.index(0)), np.int32(plan.input_axes_tyx.index(1)),
+             np.int32(plan.input_axes_tyx.index(2)), *device_ranges, bitset_cp), stream=stream)
+    launch_count = len(groups)
+    runtime_telemetry().add('d1.orthogonal_categorical_coverage_launches', launch_count)
     # The Torch-owned task mask is retired below and completion may copy the bitset through a
     # Torch stream. Keep this cross-framework lifetime/order barrier until those operations are
     # joined by explicit CUDA events and allocator record-stream ownership.
@@ -2377,9 +2136,6 @@ def _memmap_backing_path(arr: object) -> Optional[Path]:
         pass
     return None
 
-def temp_binary_archive_enabled() -> bool:
-    return _env_flag('YOLO_TTA_ARCHIVE_TEMP_BINARY_VOLUMES', True)
-
 def tile_intermediate_accumulators_prefer_memory() -> bool:
     """Keep tile staging/consolidation canvases in process-reopenable RAM by default."""
     return _env_flag('YOLO_TTA_TILE_ACCUMULATORS_IN_RAM', True)
@@ -2429,45 +2185,18 @@ def _retire_temporary_binary_volume(volume: object, raw_path: Optional[Path], *,
         except Exception:
             pass
 
-def archive_or_delete_binary_volume_storage(
-    volume: Optional[np.ndarray],
-    *,
-    keep_temp: bool,
-    workers: int,
-    desc: str,
-    raw_bbox_dir: Optional[Path] = None,
-) -> None:
-    """Close a temporary binary volume and replace kept raw uint8 memmaps with cvol."""
+def retire_temporary_binary_volume_storage(volume: Optional[np.ndarray]) -> None:
+    """Close a temporary binary volume and delete its raw scratch backing."""
     if volume is None:
         return
+    _retire_temporary_binary_volume(volume, _memmap_backing_path(volume), delete_raw=True)
 
-    raw_path = _memmap_backing_path(volume)
-    if bool(keep_temp) and bool(temp_binary_archive_enabled()) and raw_path is not None:
-        archive_dir = Path(raw_bbox_dir) if raw_bbox_dir is not None else raw_path.with_name(raw_path.name + '.cvol')
-        try:
-            write_raw_bbox_mask_store(
-                np.asarray(volume),
-                archive_dir,
-                format_name=CVOL_FORMAT,
-                desc=f'{desc} archive',
-                workers=int(workers),
-                extra_meta={'archived_from_raw_path': str(raw_path)},
-            )
-        except Exception as exc:
-            print(f'Warning: failed to archive {desc} as raw bbox cvol ({exc}); keeping raw volume {raw_path}')
-        else:
-            _retire_temporary_binary_volume(volume, raw_path, delete_raw=True)
-            return
-
-    _retire_temporary_binary_volume(volume, raw_path, delete_raw=not bool(keep_temp))
-
-def close_raw_store_or_memmap_volume(volume: object, *, keep_temp: bool = True) -> None:
+def close_raw_store_or_memmap_volume(volume: object) -> None:
     if volume is None:
         return
     if isinstance(volume, RawBBoxMaskStore):
         volume.close()
-        if not bool(keep_temp):
-            volume.unlink()
+        volume.unlink()
         return
     close_memmap_array(volume)
 

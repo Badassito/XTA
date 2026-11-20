@@ -18,7 +18,8 @@ from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 import numpy as np
 
 
-GAUSSIAN_BOUNDARY_MODE = "constant"
+GAUSSIAN_BOUNDARY_MODE = "nearest"
+# Passed as ``cval``; the nearest (replicate-edge) boundary ignores it.
 GAUSSIAN_BOUNDARY_VALUE = 0.0
 GAUSSIAN_TRUNCATE = 4.0
 GAUSSIAN_BINARY_THRESHOLD = 0.5
@@ -73,7 +74,13 @@ def binary_gaussian_pass_gpu(
     import cupy as cp  # type: ignore
     from cupyx.scipy import ndimage as cpx_ndi  # type: ignore
 
-    requested_bytes = max(1, int(os.environ.get("YOLO_TTA_GAUSSIAN_GPU_CHUNK_MIB", "256"))) * 1024 * 1024
+    # Empty or invalid text uses the default, like the other integer env settings.
+    chunk_mib_text = os.environ.get("YOLO_TTA_GAUSSIAN_GPU_CHUNK_MIB", "").strip()
+    try:
+        chunk_mib = int(chunk_mib_text) if chunk_mib_text else 256
+    except ValueError:
+        chunk_mib = 256
+    requested_bytes = max(1, chunk_mib) * 1024 * 1024
     halo = int(math.ceil(GAUSSIAN_TRUNCATE * sigma_f))
 
     def admit_device(device_id: int) -> Dict[str, int]:
@@ -147,9 +154,11 @@ def binary_gaussian_pass(
     """Apply one canonical Gaussian pass to a binary 3-D volume.
 
     The source is converted to float32, filtered isotropically with a
-    constant-zero boundary and a four-sigma kernel truncation, then thresholded
-    at 0.5.  The returned/destination volume is uint8 binary data and is suitable
-    as the source of the next pass.
+    replicate-edge (nearest) boundary and a four-sigma kernel truncation, then
+    thresholded at 0.5.  Structures crossing a volume face are therefore not
+    eroded there; a feature lying only in a face slice is extended outward by the
+    replication.  The returned/destination volume is uint8 binary data and is
+    suitable as the source of the next pass.
 
     ``float_workspace`` and ``slice_runner`` let TTA retain its bounded-memory,
     parallel copy/commit orchestration.  ``array_module`` lets its chunked CUDA

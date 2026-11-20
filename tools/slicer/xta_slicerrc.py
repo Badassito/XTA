@@ -15,6 +15,17 @@ from contextlib import nullcontext
 import logging
 import os
 from collections import defaultdict
+from datetime import datetime, timezone
+import hashlib
+import json
+import math
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+from typing import Optional
 
 import numpy as np
 import qt
@@ -2188,7 +2199,7 @@ def _xta_load_review(manifest_path, grid_id, intensity, existing, max_working_mi
 
     After the location, family receipt and grid checks, a review without loaded per-cutoff
     segments opens store-backed (_xta_import_store_review) unless review_mode is "legacy",
-    the user picks "Per-cutoff segments (legacy)" or the review needs today's path
+    the user picks "Per-cutoff segments (legacy)" or the review needs the per-cutoff path
     (independent_scalar, native-resolution grid, a store that does not fit in memory).
     """
     global _xta_active_review
@@ -2568,7 +2579,7 @@ def ImportXTASegments(source_manifest=None, grid_id=None, volume_node=None, *, m
 
     A review opens store-backed by default: one prompt picks the cutoff to display
     (every cutoff stays editable) or "Per-cutoff segments (legacy)". review_mode:
-    None (that prompt; today's path automatically for independent_scalar reviews,
+    None (that prompt; the per-cutoff path automatically for independent_scalar reviews,
     native-resolution grids and stores that do not fit in memory), "store" or
     "legacy". Store-backed, cutoff_cents is the displayed cutoff (one integer cent;
     None asks, or takes the review default without a main window), and edit_log
@@ -2928,17 +2939,18 @@ def UpdateBoth():
 # ── Cross-cutoff review store ────────────────────────────────────────
 #
 # Store-backed cutoff editing for a review grid (the cross-cutoff edits SPEC v3.1 and the user decisions of
-# 2026-11-17; docs/slicer_pta_cleanup.md is to describe the store-backed review). Each logical layer is one array on
-# its box of the review grid (zyx): a uint8 level map when its cutoff masks nest (mask_k = level > k), otherwise bit
-# planes (mask_k = bit k). Remove Islands / Remove Slices edit every cutoff in one click (the union basin), Segment
-# Editor erase and paint sync into the store, Update Global / Nonglobal run at every cutoff, and one cutoff exports
-# as today's xta-slicer-edits-v1 bundle. Clicks, syncs and updates share one undo stack.
+# 2026-11-17; docs/slicer_pta_cleanup.md, "Editing a store-backed review", describes the workflow). Each logical
+# layer is one array on its box of the review grid (zyx): a uint8 level map when its cutoff masks nest
+# (mask_k = level > k), otherwise bit planes (mask_k = bit k). Remove Islands / Remove Slices edit every cutoff in
+# one click (the union basin), Segment Editor erase and paint sync into the store, Update Global / Nonglobal run at
+# every cutoff, and one cutoff exports as an xta-slicer-edits-v1 bundle. Clicks, syncs and updates share one undo
+# stack.
 #
 # Pure NumPy, SciPy and SimpleITK: no qt, slicer or vtk here (vtk / vtkITK only lazily, for Update Global ties).
 # SciPy and SimpleITK load on first use; call _xta_store_preload() when a review is loaded. Markers reuse
-# today's line walk, closed-curve candidates and seed-run helpers below; export reuses today's _xta_sweep_*
-# review helpers. The store has no locks: run each operation on the main thread, one at a time. Uses the
-# file's numpy import (np).
+# the per-cutoff line walk, closed-curve candidates and seed-run helpers below; export reuses the per-cutoff
+# _xta_sweep_* review helpers. The store has no locks: run each operation on the main thread, one at a time. Uses
+# the file's numpy import (np).
 #
 # Every store operation (click, sync, update, undo, redo) is all or nothing: one that raises is rolled back before
 # the exception propagates. If the rollback fails as well, the store is marked diverged (store.diverged), its edit
@@ -3273,7 +3285,7 @@ def _xta_store_ravel(zyx, shape):
 
 
 def _xta_store_tight_box(mask):
-    """(lo, hi) of the foreground of a 3D mask, or None (row reductions, as today's _xta_crop_mask)."""
+    """(lo, hi) of the foreground of a 3D mask, or None (row reductions, as _xta_crop_mask)."""
     if mask.size == 0:
         return None
     z = np.flatnonzero(mask.reshape(mask.shape[0], -1).any(axis=1))
@@ -3463,7 +3475,7 @@ def _xta_store_merge_masks(boxes):
 
 # ---- Markers
 def _xta_store_ras_to_ijk(image_to_world, points_segmentation_ras):
-    """Today's _ras_points_to_continuous_ijk(image, points) with the 4x4 image-to-world matrix passed in (same
+    """As _ras_points_to_continuous_ijk(image, points), with the 4x4 image-to-world matrix passed in (same
     arithmetic): segmentation RAS points -> continuous IJK."""
     if image_to_world is None or not len(points_segmentation_ras):
         return np.empty((0, 3), dtype=np.float64)
@@ -3486,8 +3498,8 @@ class XTACutoffMarkers:
     """Marker voxels rasterised once on the review grid (zyx, unique, raster order, inside the grid).
 
     voxels is M (every point, walk and curve-interior candidate). The parts are kept for Remove Slices, whose
-    planes depend on the exact seeds: there each layer's seeds follow today's per-mask rule (curve interiors reduced
-    to one seed per run of that layer's foreground on each scanline)."""
+    planes depend on the exact seeds: there each layer's seeds follow the per-cutoff per-mask rule (curve
+    interiors reduced to one seed per run of that layer's foreground on each scanline)."""
 
     shape: tuple
     voxels: np.ndarray
@@ -3497,7 +3509,7 @@ class XTACutoffMarkers:
     candidates: int = 0  # voxels produced before the grid filter (with repeats)
     point_voxels: np.ndarray = None  # zyx, unique, inside the grid
     walk_voxels: np.ndarray = None  # zyx, unique: line walks and curve boundary walks
-    interior: list = None  # [(IJK candidates inside the grid, u axis)] per scanline, as today
+    interior: list = None  # [(IJK candidates inside the grid, u axis)] per scanline, as the per-cutoff path
 
 
 def _xta_store_rasterise_markers(
@@ -3511,13 +3523,13 @@ def _xta_store_rasterise_markers(
     lines_ras=(),
     curves_ras=(),
 ):
-    """Today's markup rasterisation on the review grid (SPEC v3 "Markers"), with today's own line walk, curve
-    candidates and duplicate-point removal.
+    """The per-cutoff markup rasterisation on the review grid (SPEC v3 "Markers"), with the same line walk,
+    curve candidates and duplicate-point removal.
 
     *_ijk: continuous IJK = (i, j, k) = (x, y, z) voxel coordinates; *_ras: segmentation RAS, converted
-    with the 4x4 image_to_world matrix exactly as today. Points: rint. Lines: today's voxel walk clipped
-    to the review grid. Closed curves (>= 3 distinct points): the boundary walks of every edge plus every
-    interior candidate on the curve's best-fit plane, with no run reduction. Returns Markers.
+    with the 4x4 image_to_world matrix exactly as the per-cutoff path. Points: rint. Lines: the per-cutoff
+    voxel walk clipped to the review grid. Closed curves (>= 3 distinct points): the boundary walks of every
+    edge plus every interior candidate on the curve's best-fit plane, with no run reduction. Returns Markers.
     """
     z, y, x = (int(v) for v in shape)
     extent = (0, x - 1, 0, y - 1, 0, z - 1)
@@ -3574,8 +3586,8 @@ def _xta_store_rasterise_markers(
 
 
 def _xta_store_slice_seeds(layer, k0, markers, S):
-    """Today's per-mask seeds on one layer's displayed mask (Remove Slices): points and walks on the foreground,
-    curve interiors one seed per foreground run on each scanline. S: M on the layer's displayed mask."""
+    """The per-cutoff per-mask seeds on one layer's displayed mask (Remove Slices): points and walks on the
+    foreground, curve interiors one seed per foreground run on each scanline. S: M on the layer's displayed mask."""
     if not isinstance(markers, XTACutoffMarkers) or markers.interior is None or not markers.interior:
         return S
 
@@ -5656,8 +5668,8 @@ def _xta_store_plane_box(shape, ax, c):
 
 
 def _xta_store_cross_sections(box, S, slab):
-    """{(ax, c): (lo, hi, mask)} removed through each of the seeds' planes (global boxes one voxel thick): today's
-    cross sections of each seed's 6-connected island, grouped per plane (box: the seeded islands)."""
+    """{(ax, c): (lo, hi, mask)} removed through each of the seeds' planes (global boxes one voxel thick): the
+    per-cutoff cross sections of each seed's 6-connected island, grouped per plane (box: the seeded islands)."""
     out = {}
     mask = box.mask
     loc = S - box.lo
@@ -5754,7 +5766,7 @@ def _xta_store_remove_slices(
     confirm_huge_looser=None,
     workers=None,
 ):
-    """SPEC v3 Remove Slices: step 1 on the markers' lattice planes (today's cross sections),
+    """SPEC v3 Remove Slices: step 1 on the markers' lattice planes (the per-cutoff cross sections),
     step 2 as a 2D 4-connected flood in each plane with the same priorities, step 3 as for Remove Islands."""
     T = thresholds or XTACutoffThresholds()
     _xta_store_check_args(store, k0, scope)
@@ -6160,7 +6172,7 @@ def _xta_store_raster_first_tie_breaker(mask, labels, tied):
 
 
 def _xta_store_vtk_island_math_tie_breaker(mask, labels=None, tied=None):
-    """vtkITKIslandMath's largest island, exactly as today's _keep_largest_island (needs Slicer's vtkITK).
+    """vtkITKIslandMath's largest island, exactly as _keep_largest_island (needs Slicer's vtkITK).
 
     vtkImageCast to unsigned int, vtkITKIslandMath(FullyConnected=False, MinimumSize=0), then the
     smallest nonzero label value (label 1 is the largest; ties keep ITK's order).
@@ -6706,7 +6718,7 @@ def _xta_store_update_nonglobal(store, cutoffs=None, *, count_removed=True, _bui
 
 
 def _xta_store_update_both(store, cutoffs=None, *, tie_breaker="auto", count_removed=True):
-    """Update Global, then Update Nonglobal, at the same cutoffs (today's UpdateBoth)."""
+    """Update Global, then Update Nonglobal, at the same cutoffs (as UpdateBoth)."""
     gu = _xta_store_update_global(store, cutoffs, tie_breaker=tie_breaker)
     nu = _xta_store_update_nonglobal(store, cutoffs, count_removed=count_removed)
     return gu, nu
@@ -6754,9 +6766,9 @@ def _xta_store_slicer_node_name(group_path):
 
 
 def _xta_store_export_lattice(affine):
-    """(zyx integer offset, None) when the review grid's IJK-to-RAS is today's export reference diag(-1, -1, 1, 1)
-    up to an integer translation, else (None, today's refusal). Today's _xta_sweep_snapshot checks the same on each
-    nonempty segment's labelmap geometry (unit LPS, integer offset)."""
+    """(zyx integer offset, None) when the review grid's IJK-to-RAS is the export reference diag(-1, -1, 1, 1)
+    up to an integer translation, else (None, the per-cutoff export's refusal). _xta_sweep_snapshot checks the
+    same on each nonempty segment's labelmap geometry (unit LPS, integer offset)."""
     matrix = np.asarray(affine, np.float64)
     if not np.isfinite(matrix).all():
         return None, "Sweep edit has a nonfinite image geometry."
@@ -6773,16 +6785,16 @@ def _xta_store_export_lattice(affine):
 
 @_xta_store_dataclass
 class XTACutoffReviewExport:
-    """A validated review (today's _xta_sweep_review) bound to one low-quality grid of the store."""
+    """A validated review (_xta_sweep_review) bound to one low-quality grid of the store."""
 
     manifest_path: _XTAStorePath
     grid_id: str
     review: dict
     cutoffs: list  # cutoff cents, index k
     node_names: dict  # review segment id -> Slicer node name
-    offset_zyx: np.ndarray = None  # the grid's integer offset in today's export frame (zero for published reviews)
-    geometry_error: str = None  # today's refusal for a rotated, resampled or off-lattice grid (raised by the
-    # first nonempty mask, as today's export does)
+    offset_zyx: np.ndarray = None  # the grid's integer offset in the export frame (zero for published reviews)
+    geometry_error: str = None  # the per-cutoff export's refusal for a rotated, resampled or off-lattice grid
+    # (raised by the first nonempty mask, as the per-cutoff export does)
 
     @classmethod
     def open(cls, manifest_path, grid_id=None, *, node_names=None):
@@ -6831,7 +6843,7 @@ def _xta_store_check_binding(store, rx):
 
 
 def _xta_store_mask_and_extent(layer, k, rx):
-    """Today's _xta_sweep_snapshot output for one stored mask: tight uint8 mask, extent_xyz, matrix."""
+    """_xta_sweep_snapshot output for one stored mask: tight uint8 mask, extent_xyz, matrix."""
     m = layer.mask(k)
     box = _xta_store_tight_box(m)
     if box is None:
@@ -6858,7 +6870,7 @@ def _xta_store_mask_and_extent(layer, k, rx):
 def _xta_store_export_cut_bundle(store, rx, k, cut_dir, *, created_utc=None):
     """Write cutoff index k's xta-slicer-edits-v1 bundle into the new directory cut_dir.
 
-    Returns today's sweep_edits.json 'cuts' row (directory relative to cut_dir's export root).
+    Returns the sweep_edits.json 'cuts' row (directory relative to cut_dir's export root).
     """
     _xta_store_check_binding(store, rx)
     review, grid_id = rx.review, rx.grid_id
@@ -6984,16 +6996,16 @@ def _xta_store_rollback_update(store, rec):
 def _xta_store_export_cutoffs(
     store, rx, cutoffs, output_dir, *, if_stale="warn", tie_breaker="auto", stale_cutoffs=None
 ):
-    """Export the given cutoff indices as today's ExportXTASweepEdits does (new output directory).
+    """Export the given cutoff indices as ExportXTASweepEdits does (new output directory).
 
     A Remove Islands click or a sync leaves the Global stale (SPEC v3 step 3: the Global only follows the
-    additive union until Update Global). Today's Remove Islands edits the visible Global directly, and the
-    usual flow runs Update Global before export, so a bundle written from a stale store carries a Global
-    that neither today's flow nor a post-update store export would. if_stale chooses what to do when the
+    additive union until Update Global). The per-cutoff Remove Islands edits the visible Global directly, and
+    the usual flow runs Update Global before export, so a bundle written from a stale store carries a Global
+    that neither the per-cutoff flow nor a post-update store export would. if_stale chooses what to do when the
     store's stale flag is set:
       "warn"   (default) a dry run of Update Global at the exported cutoffs; if it would change the Global
                at any of them, export anyway, list them in report.stale_cutoffs and report.warnings and
-               emit a XTACutoffGlobalStaleWarning. The bundle itself is unchanged (today's format has no field).
+               emit a XTACutoffGlobalStaleWarning. The bundle itself is unchanged (the format has no field).
       "refuse" the same dry run; raise XTACutoffGlobalStaleError before anything is written if it would change the
                Global at an exported cutoff.
       "update" run Update Global at every cutoff first (clears the flag; one undo entry, in
@@ -7258,7 +7270,7 @@ _XTA_STORE_DISPLAY_CACHE_BYTES = 256 * 1024**2
 
 class XTACutoffReviewError(ValueError):
     """The store cannot be built from this review: its manifest and group files disagree, a file is damaged, or the
-    review has a layout the store does not support (the Importer then keeps today's per-cutoff path)."""
+    review has a layout the store does not support (the Importer then keeps the per-cutoff path)."""
 
 
 class XTACutoffBuildCancelled(RuntimeError):
@@ -7284,7 +7296,7 @@ def _xta_store_extent_box(extent, shape, what):
 
 
 def _xta_store_row_is_suffix_global(row):
-    """Whether a review row is the suffix-Global_final_output layer (the Global today's export picks by suffix)."""
+    """Whether a review row is the suffix-Global_final_output layer (the Global the export picks by suffix)."""
     name = str(row.get("source_filename") or row.get("segment_name") or "")
     for ext in (".seg.nrrd", ".seg.nhdr", ".nrrd", ".nhdr"):
         if name.lower().endswith(ext):
@@ -7347,7 +7359,7 @@ def _xta_store_review_plan(manifest_path, grid_id=None):
 
     manifest_path: review/manifest.json, or a grouped grid folder's copy (inside its review it resolves to the review;
     a folder moved on its own is detached and reads only its own files, by name). grid_id: the grid; optional when
-    the opened folder or the review has one grouped grid. Checks, besides today's _xta_display_grid and
+    the opened folder or the review has one grouped grid. Checks, besides _xta_display_grid and
     _xta_grid_index: the cutoffs agree with cutoffs_cent; role, layer_role, recomposition_op, segment_name,
     model_name and layer_key are the same at every cutoff of a logical layer; direct and generated layers are
     additive by the Importer's tag rule; exactly one logical layer is role global and it is the
@@ -9691,7 +9703,7 @@ def _xta_review_store_key(plan):
 
 
 def _xta_review_store_unsupported(manifest, grid_id):
-    """Why a review grid keeps today's per-cutoff segments (None when it can open store-backed)."""
+    """Why a review grid keeps per-cutoff segments (None when it can open store-backed)."""
     if manifest.get("source_mode") == "independent_scalar":
         return ("This review packages independently generated runs whose cutoff masks need not nest; "
                 "it opens as per-cutoff segments.")
@@ -9743,7 +9755,7 @@ def _xta_import_store_review(manifest_path, manifest, grid_id, intensity, workin
     if cutoff_cents is not None and (isinstance(cutoff_cents, bool) or not isinstance(cutoff_cents, int)):
         if review_mode == "store":
             raise RuntimeError("A store-backed review displays one cutoff: pass one integer cent as cutoff_cents.")
-        return "legacy", None  # several cutoffs or "all": today's per-cutoff segments
+        return "legacy", None  # several cutoffs or "all": per-cutoff segments
     reason = _xta_review_store_unsupported(manifest, grid_id)
     if reason is not None:
         if review_mode == "store":
@@ -10468,7 +10480,7 @@ def _xta_adopt_kept_store_review():
 # edits -> the store operation at the displayed cutoff -> rewrite only store.last_changed_boxes of the working
 # segments in place when an entry was pushed (or undo / redo returned True) -> update the 2D overlay -> report.
 #   Remove Islands / Remove Slices: _remove_marked_regions runs the store branch first (eyes of every working
-#     segment into store.set_visible_many, markers rasterised once with the review affine), then today's jobs for
+#     segment into store.set_visible_many, markers rasterised once with the review affine), then per-cutoff jobs for
 #     ordinary nodes in the same click. Huge-click prompts are modal (_choose_item); without a main window they
 #     take their defaults (huge displayed: Cancel; huge looser: Displayed and stricter only). Each click writes
 #     one status-bar line and a console log; a non-modal report window lists flagged layers.
@@ -10481,7 +10493,7 @@ def _xta_adopt_kept_store_review():
 #     the Segment Editor shows another segmentation, whose own Ctrl+Z / Ctrl+Y then work as usual).
 #   Update Global / Nonglobal / Both: every cutoff, one undo entry each (Both too), ties through vtkITKIslandMath.
 #   Export: the toolbar exports the displayed cutoff from the store, ExportXTAEdits(review) every cutoff, in
-#     today's xta-slicer-edits-v1 format; a stale Global asks "Update Global first?" with what the update would
+#     the xta-slicer-edits-v1 format; a stale Global asks "Update Global first?" with what the update would
 #     change at each exported cutoff (default _XTA_STORE_STALE_EXPORT_DEFAULT; Esc exports nothing; without a
 #     main window a stale export stops).
 # After an operation that raised, a store marked diverged blocks further edits until Importer rebuilds it from
@@ -10797,7 +10809,7 @@ def _xta_review_read_eyes(review):
 
 def _xta_review_markers(review, action, points_world, lines_world, curves_world):
     """The markers rasterised once on the review grid with the review affine (through the layers node's parent
-    transform). Today's line walk can refuse a line; the click then changes nothing and says so."""
+    transform). The per-cutoff line walk can refuse a line; the click then changes nothing and says so."""
     node = review.layers_node
     points = _points_in_segmentation_coordinates(node, points_world)
     lines = _line_segments_in_segmentation_coordinates(node, lines_world)
@@ -10844,8 +10856,8 @@ def _xta_review_ask_huge_looser(review, action, interactive):
 
 
 def _xta_review_remove_marked(review, remove_slices, points_world, lines_world, curves_world, scope):
-    """The store branch of Remove Islands / Remove Slices (before today's jobs for ordinary nodes): returns the
-    report's status line."""
+    """The store branch of Remove Islands / Remove Slices (before the per-cutoff jobs for ordinary nodes):
+    returns the report's status line."""
     action = "Remove Slices" if remove_slices else "Remove Islands"
     review.require(action)
     interactive = slicer.util.mainWindow() is not None
@@ -11202,7 +11214,7 @@ def _xta_review_stale_export_choice(review, preview, stale_ks, interactive):
 
 def _xta_review_export_check_rows(review, rx, ks):
     """Refuse before writing anything when a layer holds voxels at an exported cutoff where the review has no row
-    for it (painted at a looser displayed cutoff): today's bundle format has no identity for it there."""
+    for it (painted at a looser displayed cutoff): the xta-slicer-edits-v1 format has no identity for it there."""
     store = review.store
     by_cut = rx.review["grids"][rx.grid_id]["by_cut"]
     problems = []
@@ -11216,12 +11228,13 @@ def _xta_review_export_check_rows(review, rx, ks):
     if problems:
         raise RuntimeError("Export XTA Edits: these layers hold voxels at a cutoff where the review has no row for "
                            "them (they were painted at a looser displayed cutoff), so that cutoff cannot be "
-                           "exported in today's bundle format: " + "; ".join(problems) + ". Erase those voxels "
-                           "at that cutoff, or undo the paint, and export again; nothing was exported.")
+                           "exported in the xta-slicer-edits-v1 bundle format: " + "; ".join(problems)
+                           + ". Erase those voxels at that cutoff, or undo the paint, and export again; "
+                           "nothing was exported.")
 
 
 def _xta_review_export(review, ks, output_dir=None, if_stale=None):
-    """Export cutoff indices ks of a store-backed review as today's xta-slicer-edits-v1 bundles (one per cutoff,
+    """Export cutoff indices ks of a store-backed review as xta-slicer-edits-v1 bundles (one per cutoff,
     a new output directory). if_stale: None asks when the Global is stale and Update Global would change it at an
     exported cutoff (without a main window: stops), or "update" / "warn" / "refuse" (the store export's
     policies). Returns the output directory, or None when cancelled."""
@@ -11242,7 +11255,7 @@ def _xta_review_export(review, ks, output_dir=None, if_stale=None):
             raise RuntimeError(f"{action}: the review's cutoffs changed since the store was built; run Importer.")
         if rx.geometry_error is not None:
             raise RuntimeError(f"{action}: {rx.geometry_error} Edit bundles need the preview grid unit LPS on its "
-                               "own lattice, as today's export does; nothing was exported.")
+                               "own lattice, as the per-cutoff export does; nothing was exported.")
         _xta_review_export_check_rows(review, rx, ks)
         policy, stale_ks, preview = if_stale or "warn", None, None
         if store.global_stale and if_stale != "update":
@@ -12514,7 +12527,7 @@ def _remove_marked_regions(remove_slices=False):
         raise RuntimeError("No visible segments were found.")
     store_text = None
     if store_nodes_seen:
-        # The store branch runs before today's jobs, on the main thread without processing events (the jobs
+        # The store branch runs before the per-cutoff jobs, on the main thread without processing events (the jobs
         # process events while they run).
         store_text = _xta_review_remove_marked(store_review, remove_slices, points_world, line_segments_world,
                                                closed_curves_world, scope)
@@ -12706,33 +12719,11 @@ def ToggleAll():
 
 # ── XTA native-resolution edit export ─────────────────────────────────
 
-"""Read-only Slicer snapshot exporter for xta_native_filter.py.
-
-Run this file in Slicer's Python console, then call ExportXTAEdits(), or use the
-bundled slicerrc.py's toolbar button. Original preview NRRDs are never modified.
-Only current LOW-RESOLUTION segment labelmaps are copied, one at a time.
-"""
-from pathlib import Path
-import hashlib
-import json
-import os
-import shutil
-import tempfile
-from datetime import datetime, timezone
-
-import numpy as np
-import qt
-import slicer
-import vtk
-from vtk.util import numpy_support
-
-
-def _xta_digest(path):
-    h = hashlib.sha256()
-    with open(path, 'rb') as f:
-        for b in iter(lambda: f.read(4 * 1024**2), b''):
-            h.update(b)
-    return h.hexdigest()
+# Read-only Slicer snapshot exporter for xta_native_filter.py.
+#
+# Call ExportXTAEdits() or use the Export XTA Edits toolbar button. Original
+# preview NRRDs are never modified. Only current LOW-RESOLUTION segment
+# labelmaps are copied, one at a time.
 
 
 def _xta_source_name(path):
@@ -12761,20 +12752,6 @@ def _xta_child(root, filename):
     if not resolved.is_relative_to(root):
         raise RuntimeError(f'Manifest filename escapes its directory: {filename}')
     return resolved
-
-
-from pathlib import Path
-import hashlib
-import json
-import os
-import shutil
-import tempfile
-from datetime import datetime, timezone
-import numpy as np
-import qt
-import slicer
-import vtk
-from vtk.util import numpy_support
 
 
 def _xta_sweep_digest(path):
@@ -13399,7 +13376,7 @@ def ExportXTAEdits(source_manifest=None, output_dir=None, *, cutoff_cents=None, 
         raise RuntimeError('cutoff_cents and if_stale apply only to a cutoff review manifest.')
     if manifest.get('layout') != 'one_single_layer_nrrd_per_component' or manifest.get('quality') != 'low_quality':
         raise RuntimeError('Select low_quality/<bin>/nrrd/<stem>_nrrd_manifest.json, not the full-quality manifest.')
-    manifest_hash = _xta_digest(source_manifest)
+    manifest_hash = _xta_sweep_digest(source_manifest)
     name_map = {}
     for entry in manifest['layers']:
         source_path = _xta_child(source_manifest.parent, entry['filename'])
@@ -13485,14 +13462,14 @@ def ExportXTAEdits(source_manifest=None, output_dir=None, *, cutoff_cents=None, 
             np.savez_compressed(snapshot_path, mask=mask, extent_xyz=extent, ijk_to_ras=matrix)
             source_path = _xta_child(source_manifest.parent, entry['filename'])
             bundle['segments'].append({'name': name, 'file': snapshot_name,
-                                       'sha256': _xta_digest(snapshot_path),
+                                       'sha256': _xta_sweep_digest(snapshot_path),
                                        'foreground_voxels': int(np.count_nonzero(mask)),
                                        'source_filename': entry['filename'],
-                                       'source_sha256': _xta_digest(source_path),
+                                       'source_sha256': _xta_sweep_digest(source_path),
                                        'recomposition_op': entry.get('recomposition_op'),
                                        'node_name': node.GetName(), 'segment_id': sid})
             del mask, image
-        if _xta_digest(source_manifest) != manifest_hash:
+        if _xta_sweep_digest(source_manifest) != manifest_hash:
             raise RuntimeError('The source manifest changed during export.')
         shutil.copyfile(source_manifest, stage / 'source_manifest.json')
         with open(stage / 'edits.json', 'w', encoding='utf-8') as f:
@@ -13509,20 +13486,11 @@ def ExportXTAEdits(source_manifest=None, output_dir=None, *, cutoff_cents=None, 
 
 # ── Native intensity alignment ───────────────────────────────────────
 
-"""Full-resolution intensity over XTA preview segmentations, without resampling.
-
-Only the selected intensity node receives a reversible, owned linear transform.
-Segmentation geometry, voxels, markers, and Export XTA Edits remain unchanged.
-The preview coordinate frame is NOT a calibrated millimetre frame.
-"""
-from pathlib import Path
-import hashlib
-import json
-
-import numpy as np
-import qt
-import slicer
-import vtk
+# Full-resolution intensity over XTA preview segmentations, without resampling.
+#
+# Only the selected intensity node receives a reversible, owned linear transform.
+# Segmentation geometry, voxels, markers, and Export XTA Edits remain unchanged.
+# The preview coordinate frame is NOT a calibrated millimetre frame.
 
 _XTA_INTENSITY_ALIGNMENT = 'SlicerRC.XTANativeIntensityAlignment.v1'
 _XTA_ALIGNMENT_OWNER = 'SlicerRC.XTAAlignedVolumeID'
@@ -14061,32 +14029,21 @@ def Highlight(model_node=None):
 
 # ── Cumulative build video ────────────────────────────────────────────
 
-"""Cumulative segment-reveal video export (Build Video button).
-
-Default: 3840 x 2160, 30 fps, RGB-lossless FFV1/MKV plus lossless PNG states.
-Run Importer first so the view segments are organized. FFmpeg must be on PATH
-or configured in Slicer's Screen Capture module; nothing is installed.
-
-A private VTK renderer uses copies of the segment surfaces, world transforms,
-colors, opacity, lights, and the first 3D view's camera. Your existing
-visibility and camera are NOT changed. This is a clean surface rendering, not
-a recording of the UI: slice planes, volumes, markups, rulers, orientation
-labels, clipping and custom render passes are not copied. Missing closed
-surfaces are generated with the segmentation's existing conversion parameters.
-
-The output contains one PNG per cumulative state, NOT 30 separately rendered
-PNGs per second. FFmpeg holds each state for an exact integer number of frames.
-"""
-from datetime import datetime
-import json
-import math
-import os
-from pathlib import Path
-import re
-import shutil
-import subprocess
-import time
-from typing import Optional
+# Cumulative segment-reveal video export (Build Video button).
+#
+# Default: 3840 x 2160, 30 fps, RGB-lossless FFV1/MKV plus lossless PNG states.
+# Run Importer first so the view segments are organized. FFmpeg must be on PATH
+# or configured in Slicer's Screen Capture module; nothing is installed.
+#
+# A private VTK renderer uses copies of the segment surfaces, world transforms,
+# colors, opacity, lights, and the first 3D view's camera. Your existing
+# visibility and camera are NOT changed. This is a clean surface rendering, not
+# a recording of the UI: slice planes, volumes, markups, rulers, orientation
+# labels, clipping and custom render passes are not copied. Missing closed
+# surfaces are generated with the segmentation's existing conversion parameters.
+#
+# The output contains one PNG per cumulative state, NOT 30 separately rendered
+# PNGs per second. FFmpeg holds each state for an exact integer number of frames.
 
 _VIDEO_BASE_ORDER = ("Transverse", "Sagittal", "Coronal")
 

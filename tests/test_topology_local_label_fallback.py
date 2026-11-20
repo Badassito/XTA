@@ -2,7 +2,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import io
-import os
 import pickle
 from pathlib import Path
 from unittest import mock
@@ -11,6 +10,13 @@ import numpy as np
 import pytest
 
 from XTA import topology
+
+
+def local_label_dtype_arm(uint16_first):
+    """Default uint16-first labeling, or the explicit uint32 reference arm."""
+    if uint16_first:
+        return contextlib.nullcontext()
+    return mock.patch.object(topology, '_local_label_store_dtype', lambda compact_relabel: np.dtype(np.uint32))
 
 
 def crowded_volume():
@@ -40,24 +46,24 @@ def close_store(store, paths):
 
 @pytest.mark.parametrize('sparse', (False, True))
 @pytest.mark.parametrize('workers', (1, 3))
-def test_real_overflow_restarts_with_identical_ids_luts_areas_and_foreground_to_explicit_env_zero(tmp_path, sparse, workers):
+def test_real_overflow_restarts_with_identical_ids_luts_areas_and_foreground_to_explicit_uint32(tmp_path, sparse, workers):
     source = crowded_volume()
     original = source.copy()
     snapshots = []
-    for enabled in ('1', '0'):
+    for uint16_first in (True, False):
         stats = {'caller_sentinel': 'preserved'}
-        with mock.patch.dict(os.environ, {'YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16': enabled}), \
+        with local_label_dtype_arm(uint16_first), \
                 mock.patch.object(topology, 'gpu_slice_labeling_enabled', return_value=False), \
                 mock.patch.object(topology, 'should_use_in_memory_workspace', return_value=True), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             store, count, paths = topology.label_foreground_volume_streaming(source,
-                tmp_path/f'{enabled}-{sparse}-{workers}', reserve_bytes=0, workers=workers,
+                tmp_path/f'{uint16_first}-{sparse}-{workers}', reserve_bytes=0, workers=workers,
                 compact_relabel=False, sparse_local_labels=sparse, component_stats_out=stats)
         try:
             assert store.dtype == np.dtype(np.uint32)
             assert stats['caller_sentinel'] == 'preserved'
             assert stats['label_store_dtype'] == 'uint32'
-            if enabled == '1':
+            if uint16_first:
                 assert stats['local_label_dtype_fallback']['overflowing_slice'] in (1, 2)
                 assert stats['local_label_dtype_fallback']['overflowing_slice_components'] == 65536
             else:
@@ -90,8 +96,7 @@ def test_simulated_gpu_capacity_signal_discards_all_partial_labels_and_resets_me
         assert stores[0].nbytes == 0 and stores[0]._pending is None
         return False, None  # Continue with the real CPU labeler for the wide pass.
     stats = {}
-    with mock.patch.dict(os.environ, {'YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16': '1'}), \
-            mock.patch.object(topology, 'gpu_slice_labeling_enabled', return_value=True), \
+    with mock.patch.object(topology, 'gpu_slice_labeling_enabled', return_value=True), \
             mock.patch.object(topology, '_try_label_slices_stage_a_gpu', side_effect=gpu_stage), \
             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         store, count, paths = topology.label_foreground_volume_streaming(source, tmp_path/'gpu-route',
@@ -108,7 +113,7 @@ def test_simulated_gpu_capacity_signal_discards_all_partial_labels_and_resets_me
         close_store(store, paths)
 
 
-def test_simultaneous_small_and_overflowing_calls_keep_their_own_dtype_without_mutating_environment(tmp_path):
+def test_simultaneous_small_and_overflowing_calls_keep_their_own_dtype_without_mutating_shared_policy(tmp_path):
     tiny = np.zeros((1, 8, 8), np.uint8)
     tiny[0, 3, 4] = 1
     def run(name, source):
@@ -120,8 +125,7 @@ def test_simultaneous_small_and_overflowing_calls_keep_their_own_dtype_without_m
             return store.dtype, count, stats.get('local_label_dtype_fallback')
         finally:
             close_store(store, paths)
-    with mock.patch.dict(os.environ, {'YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16': '1'}), \
-            mock.patch.object(topology, 'gpu_slice_labeling_enabled', return_value=False), \
+    with mock.patch.object(topology, 'gpu_slice_labeling_enabled', return_value=False), \
             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
             ThreadPoolExecutor(max_workers=2) as pool:
         wide = pool.submit(run, 'wide', crowded_volume())
@@ -129,7 +133,7 @@ def test_simultaneous_small_and_overflowing_calls_keep_their_own_dtype_without_m
         assert narrow.result() == (np.dtype(np.uint16), 1, None)
         dtype, count, receipt = wide.result()
         assert dtype == np.dtype(np.uint32) and count == 65536 and receipt is not None
-        assert os.environ['YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16'] == '1'
+        assert topology._local_label_store_dtype(False) == np.dtype(np.uint16)
 
 
 def test_compiled_sparse_projection_lookup_keeps_label_ids_above_uint16(tmp_path):
@@ -157,12 +161,12 @@ def test_final_keep_largest_after_automatic_promotion_is_exactly_the_explicit_wi
     from XTA.finalization import apply_keep_largest_objects_inplace
     original = crowded_volume()
     outputs, receipts = [], []
-    for enabled in ('1', '0'):
+    for uint16_first in (True, False):
         source = original.copy()
-        with mock.patch.dict(os.environ, {'YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16': enabled}), \
+        with local_label_dtype_arm(uint16_first), \
                 mock.patch.object(topology, 'gpu_slice_labeling_enabled', return_value=False), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            receipt = apply_keep_largest_objects_inplace(source, 1, tmp_path/enabled,
+            receipt = apply_keep_largest_objects_inplace(source, 1, tmp_path/str(uint16_first),
                 prefer_memory=True, reserve_bytes=0, workers=2)
         outputs.append(source)
         receipts.append(receipt)
@@ -177,7 +181,7 @@ def test_final_keep_largest_after_automatic_promotion_is_exactly_the_explicit_wi
 
 def test_reused_stats_dict_removes_an_old_capacity_receipt_after_normal_success(tmp_path):
     stats = {'local_label_dtype_fallback': {'stale': True}}
-    with mock.patch.dict(os.environ, {'YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16': '0'}), \
+    with mock.patch.object(topology, '_local_label_store_dtype', lambda compact_relabel: np.dtype(np.uint32)), \
             mock.patch.object(topology, 'gpu_slice_labeling_enabled', return_value=False), \
             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         store, _, paths = topology.label_foreground_volume_streaming(np.ones((1, 2, 2), np.uint8),
@@ -191,8 +195,7 @@ def test_reused_stats_dict_removes_an_old_capacity_receipt_after_normal_success(
 def test_malformed_capacity_signals_never_start_a_wide_retry(tmp_path, count, z):
     source = np.ones((1, 2, 2), np.uint8)
     error = topology._LocalLabelCapacityError(count, np.dtype(np.uint16), z=z)
-    with mock.patch.dict(os.environ, {'YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16': '1'}), \
-            mock.patch.object(topology, '_label_foreground_volume_streaming_impl', side_effect=error) as impl:
+    with mock.patch.object(topology, '_label_foreground_volume_streaming_impl', side_effect=error) as impl:
         with pytest.raises(topology._LocalLabelCapacityError):
             topology.label_foreground_volume_streaming(source, tmp_path/'bad-signal', compact_relabel=False)
     assert impl.call_count == 1

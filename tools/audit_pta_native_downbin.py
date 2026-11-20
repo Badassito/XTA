@@ -89,7 +89,7 @@ def main():
               'original_low_hash_matches_edited_receipt_source': original_low_hash == global_entry['source_sha256'],
               'native_downbin_vs_original_low': comparison(actual_low[0], reconstructed),
               'original_low_vs_edited_global': comparison(actual_low[0], edited),
-              'method': 'XY OpenCV INTER_AREA of uint8 binary255 threshold>0, OR all contributing native T slices; same current production CPU downbin contract.',
+              'method': 'XY OpenCV INTER_AREA of uint8 binary 255 threshold>0, OR all contributing native T slices; same current production CPU downbin contract.',
               'limitation': 'One preview plane only. Original native and original low masks predate manual deletions. Exact agreement at this plane establishes this bounded downbin correspondence, not the full source run identity.'}
     (a.audit / 'f2_native_downbin_t228_evidence.json').write_text(json.dumps(result, indent=2) + '\n')
     cv2.imwrite(str(a.audit / 'f2_original_low_t228.png'), actual_low[0] * 255)

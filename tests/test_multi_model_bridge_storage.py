@@ -90,7 +90,7 @@ class MultiModelBridgeStorageTests(unittest.TestCase):
                               interpolate=2, interpolation_walk_back=1,
                               interpolation_candidates=1, interpolate_passes=1,
                               interpolate_min_radius=0, interpolation_search_angle=0,
-                              keep_temp=True, slice_workers=1, interpolation_task_workers=1,
+                              slice_workers=1, interpolation_task_workers=1,
                               nrrd_layers_enabled=not delta_only)
                 if tile:
                     result = assembly.finalize_consolidated_tile_volume_for_parent(

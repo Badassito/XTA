@@ -67,7 +67,7 @@ def prepare(root, view, context, submitter=None):
         union_path=root / 'union.dat', confmap_path=None, temp_dir=root,
         dense_tiling_active=False, min_conf=0, min_radius=0, interpolate=2,
         interpolation_walk_back=1, interpolation_candidates=1, interpolate_passes=1,
-        interpolate_min_radius=0, interpolation_search_angle=0, keep_temp=False,
+        interpolate_min_radius=0, interpolation_search_angle=0,
         slice_workers=1, interpolation_task_workers=1, nrrd_layers_enabled=True,
         precleaned_slice_cleanup=True, hole_fill_done_on_device=True,
         preinterpolation_layer_already_published=True, interpolation_backend='sam',
@@ -329,10 +329,10 @@ def owned_task(root, view, context, submitter, admission):
         dense_tiling_active=False, min_conf=0, min_radius=0, interpolation_distance=2,
         interpolation_walk_back=1, interpolation_candidates=1, interpolation_passes=1,
         interpolation_min_radius=0, interpolation_search_angle=0,
-        keep_temp_artifacts=False, slice_workers=1, interpolation_task_workers=1,
+        slice_workers=1, interpolation_task_workers=1,
         component_layers_needed=True, precleaned_slice_cleanup=True,
         hole_fill_done_on_device=True, slice_meta=None, fuse_azimuthal_component_layers=lambda:False,
-        component_ref_dense_retirement_active=True, preinterpolation_layer_already_published=False,
+        preinterpolation_layer_already_published=False,
         parent_mask_ready_callback=None, submit_component_projection=lambda *_a, **_kw:None,
         materialize_workspace=lambda *_a, **_kw:None, prepare=assembly.prepare_view_volume_after_fullframe,
         interpolation_backend='sam', sam_context=context, extrapolation_distance=2,
@@ -388,8 +388,8 @@ def test_actual_dense_retirement_readmits_staged_parent_while_publication_is_blo
             assert prepared.final_view_volume_mm is not None
             assert not second.interpolation_entered.is_set()
             assert not stage.pump()[0]
-            assert not leases.retire_dense_for_publication(prepared, enabled=True,
-                tiled=False, keep_temp=False, retired_callback=lambda *args:credits.append(args))
+            assert not leases.retire_dense_for_publication(prepared,
+                tiled=False, retired_callback=lambda *args:credits.append(args))
             gc.collect()
             assert prepared.native_support_mm is prepared.final_view_volume_mm is None
             assert len(credits) == 1
@@ -433,12 +433,12 @@ def test_dense_alias_and_confidence_credit_fence_early_retirement(tmp_path):
         _dense_input_nbytes=dense.nbytes)
     credits = []
     del dense
-    assert not leases.retire_dense_for_publication(prepared, enabled=True, tiled=False,
-        keep_temp=False, retired_callback=lambda *args:credits.append(args))
+    assert not leases.retire_dense_for_publication(prepared, tiled=False,
+        retired_callback=lambda *args:credits.append(args))
     assert prepared.final_view_volume_mm is not None and not credits
     assert leases.retire_input_bytes(key, lease, 60, token='confidence')
-    assert not leases.retire_dense_for_publication(prepared, enabled=True, tiled=False,
-        keep_temp=False, retired_callback=lambda *args:credits.append(args))
+    assert not leases.retire_dense_for_publication(prepared, tiled=False,
+        retired_callback=lambda *args:credits.append(args))
     gc.collect()
     assert prepared.native_support_mm is prepared.final_view_volume_mm is None
     assert not credits and original_ref() is not None
@@ -448,11 +448,11 @@ def test_dense_alias_and_confidence_credit_fence_early_retirement(tmp_path):
     assert len(credits) == 1 and original_ref() is None
     assert leases.settle_publication_retirement(*credits[0])
     assert not leases.settle_publication_retirement(*credits[0])
-    assert not leases.retire_dense_for_publication(prepared, enabled=True, tiled=False,
-        keep_temp=False, retired_callback=lambda *args:pytest.fail('duplicate credit'))
+    assert not leases.retire_dense_for_publication(prepared, tiled=False,
+        retired_callback=lambda *args:pytest.fail('duplicate credit'))
 
 
-@pytest.mark.parametrize('reason', ['disabled', 'tiles', 'debug', 'support', 'live_ref',
+@pytest.mark.parametrize('reason', ['tiles', 'support', 'live_ref',
                                    'unproven_child', 'source_contains_dense', 'missing_input_owner'])
 def test_early_retirement_preserves_every_other_dense_consumer(tmp_path, reason):
     from concurrent.futures import Future
@@ -479,8 +479,7 @@ def test_early_retirement_preserves_every_other_dense_consumer(tmp_path, reason)
         future._xta_dense_independent_publication_paths = (tmp_path,)
     elif reason == 'missing_input_owner':
         del prepared._dense_input_owner_ref
-    assert not leases.retire_dense_for_publication(prepared,
-        enabled=reason != 'disabled', tiled=reason == 'tiles', keep_temp=reason == 'debug',
+    assert not leases.retire_dense_for_publication(prepared, tiled=reason == 'tiles',
         retired_callback=lambda *args:pytest.fail('unsafe credit'))
     assert prepared.native_support_mm is prepared.final_view_volume_mm is dense
     assert leases.leases[key] is lease and key in leases.postprocess_views

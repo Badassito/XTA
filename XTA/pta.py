@@ -99,12 +99,13 @@ except Exception as exc:  # pragma: no cover
 from . import geometry as shared_geometry
 from .geometry import _affine2x3_to_3x3 as affine2x3_to_3x3
 from . import media as shared_media
-from .config import SCRIPT_BASENAME, SCRIPT_VERSION, ChannelFormat as CanonicalChannelFormat
+from .config import SCRIPT_BASENAME, SCRIPT_VERSION, ChannelFormat, resolve_channel_format
+from .env_flags import env_flag
 from .runtime import runtime_telemetry, runtime_telemetry_phase, runtime_trace_event
 from .gaussian import binary_gaussian_pass
 from .topology import fill_3d_voids_inplace_streaming
 from .unification.manifest import write_json_manifest
-from .unification.contracts import RasterPlan, ChannelLayout
+from .unification.contracts import RasterPlan
 from .pta_planning import (
     make_channel_tag,
     adapt_shared_view,
@@ -181,12 +182,10 @@ from .pta_dataset import (
     split_round_half_toward_train,
     stable_digest_rank,
     select_fraction_candidates,
-    withhold_background_overage_after_flips,
 )
 from .pta_publication import (
     MASK_POLYGON_FAST_FOREGROUND_MIN_PIXELS,
     OUTPUT_IMAGE_FORMATS,
-    PtaDatasetImageSink,
     _CREATED_OUTPUT_DIRS,
     _CREATED_OUTPUT_DIRS_LOCK,
     _validate_nonempty_regular_file,
@@ -198,7 +197,6 @@ from .pta_publication import (
     mask_to_yolo_lines,
     output_image_suffix,
     parse_output_image_format,
-    publish_pta_candidate_image_batch,
     verify_published_image_tree,
     write_image,
     write_image_gray,
@@ -210,16 +208,12 @@ from .pta_binary import candidate_binary_output_path, write_candidate_binary_vid
 from .pta_classification import classify_semantic_plan_frame
 from .pta_rendering import (
     DEFAULT_CHANNEL_VARIANT,
-    AZIMUTHAL_LANCZOS_A,
     AffineSpec,
-    ChannelFormat,
     ChannelVariant,
-    AzimuthalSampler,
     RenderFrameSource,
     RenderPlan,
     RenderTileItem,
     TileConfig,
-    TiltPlan,
     ViewInfo,
     edge_clamped_view_index,
     encoded_channel_source_positions,
@@ -227,21 +221,13 @@ from .pta_rendering import (
     get_native_view_frame,
     get_native_view_image,
     get_native_view_mask,
-    get_azimuthal_sampler,
-    get_tilt_plan,
-    lanczos_kernel,
-    lanczos_offsets,
-    normalize_lanczos_weight_rows,
-    azimuthal_extract_lanczos,
     render_channel_formatted_images,
     render_full_and_optional_canvas,
     render_image_full_and_optional_canvas,
     render_plan_frame_mask_source,
     render_plan_frame_source,
     render_shared_tile_images,
-    render_tilted_on_grid,
     resize_centered,
-    tilt_plan_key,
     warp_image,
     warp_mask_only,
     warp_pair,
@@ -264,7 +250,6 @@ from .pta_workers import (
     execute_gpu_frame_batch_task,
     execute_gpu_render_task,
     execute_render_task,
-    gpu_fork_render_backend_available,
     make_volume_allocator,
     projection_phase_summary,
     resolve_render_backend,
@@ -275,8 +260,7 @@ from .pta_scheduler import (
     resolve_gpu_worker_layout,
     resolve_pta_pipeline_depth,
 )
-from .unification.channels import expand_channel_variants as expand_v18_channel_variants
-from .workspace import azimuthal_source_mode as _azimuthal_source_mode
+from .unification.channels import channel_layout_from_format, expand_channel_variants as expand_v18_channel_variants
 from .workspace import _cgroup_memory_headroom_bytes, _read_meminfo_bytes
 from .unification.runtime import compile_physical_views
 from .unification.tta_manifest import (
@@ -343,7 +327,7 @@ def probe_gpu_offline_runtime(
     """Fail before output cleanup when the requested CUDA runtime is unusable.
 
     The probe runs out-of-process so the parent remains CUDA-uninitialized and
-    can safely fork one persistent rank per GPU afterwards.
+    can safely start (fork, where available) one persistent rank per GPU afterwards.
     """
     selected_ids = tuple(dict.fromkeys(int(value) for value in selected_device_ids))
     statements = [
@@ -671,15 +655,12 @@ def natural_index_key(path: Path) -> Tuple[str, int, str]:
 # ---------------------------------------------------------------------------
 
 
-_CUSTOM_CHANNEL_FORMAT_RE = re.compile(r"^C([1-9]\d*)S([1-9]\d*)$", re.IGNORECASE)
-
-
 def resolve_channel_formats(values: Sequence[str] | str | None) -> List[ChannelFormat]:
     """Validate and canonicalize ``--channel_format`` values.
 
     Gray/grey and RGB may be mixed freely with custom formats.  When multiple
     custom C...S... values are supplied, their C value must match while S may
-    vary, e.g. C5S1 C5S2.
+    vary, e.g. C5S1 C5S2.  Each token uses the canonical TTA channel grammar.
     """
     tokens = parse_token_list(values or ["gray"])
     if not tokens:
@@ -688,58 +669,25 @@ def resolve_channel_formats(values: Sequence[str] | str | None) -> List[ChannelF
     seen: set[str] = set()
     custom_channel_count: Optional[int] = None
     for raw in tokens:
-        normalized = str(raw).strip()
-        lowered = normalized.lower()
-        if lowered in {"gray", "grey"}:
-            fmt = ChannelFormat("gray", "gray", 1, 1)
-        elif lowered == "rgb":
-            fmt = ChannelFormat("RGB", "rgb", 3, 1)
-        else:
-            match = _CUSTOM_CHANNEL_FORMAT_RE.fullmatch(normalized)
-            if match is None:
-                raise ValueError(
-                    f"Unsupported --channel_format value {raw!r}; use gray/grey, RGB, or C{{odd}}S{{stride>=1}}"
-                )
-            channel_count = int(match.group(1))
-            stride = int(match.group(2))
-            if channel_count % 2 == 0:
-                raise ValueError(
-                    f"--channel_format {raw!r} is invalid: C must be odd, got C={channel_count}"
-                )
-            if stride < 1:
-                raise ValueError(
-                    f"--channel_format {raw!r} is invalid: S must be an integer >= 1, got S={stride}"
-                )
+        fmt = resolve_channel_format(str(raw).strip())
+        if fmt.kind == "custom":
             if custom_channel_count is None:
-                custom_channel_count = channel_count
-            elif channel_count != custom_channel_count:
+                custom_channel_count = int(fmt.channel_count)
+            elif int(fmt.channel_count) != custom_channel_count:
                 raise ValueError(
                     "All custom --channel_format values must use the same C value; "
-                    f"got C={custom_channel_count} and C={channel_count}"
+                    f"got C={custom_channel_count} and C={fmt.channel_count}"
                 )
-            fmt = ChannelFormat(f"C{channel_count}S{stride}", "custom", channel_count, stride)
         if fmt.token not in seen:
             formats.append(fmt)
             seen.add(fmt.token)
     return formats
 
 
-def expand_channel_variants(formats: Sequence[ChannelFormat | CanonicalChannelFormat]) -> List[ChannelVariant]:
+def expand_channel_variants(formats: Sequence[ChannelFormat]) -> List[ChannelVariant]:
     variants: List[ChannelVariant] = []
     for fmt in formats:
-        if isinstance(fmt, CanonicalChannelFormat):
-            offsets = tuple(fmt.offsets)
-        elif fmt.kind == "gray":
-            offsets = (0,)
-        elif fmt.kind == "rgb":
-            offsets = (0, 0, 0)
-        else:
-            radius = int(fmt.channel_count) // 2
-            offsets = tuple(position * int(fmt.stride) for position in range(-radius, radius + 1))
-        layout = ChannelLayout(
-            token=fmt.token, kind=fmt.kind, channel_count=fmt.channel_count,
-            stride=fmt.stride, offsets=offsets,
-        )
+        layout = channel_layout_from_format(fmt)
         for shared_variant in expand_v18_channel_variants("pta", layout):
             variants.append(ChannelVariant(
                 str(shared_variant.layout.token),
@@ -1128,10 +1076,10 @@ def apply_gaussian_smoothing(
         before_count = int(np.count_nonzero(before))
         print(f"Gaussian smoothing pass {pass_idx}/{pass_count}: sigma={sigma_f:g} voxels")
         # The shared primitive uses isotropic voxel
-        # sigma, constant-zero boundary, truncate=4, and threshold after every
+        # sigma, replicate-edge boundary, truncate=4, and threshold after every
         # pass so the following pass starts from the previous binary result.
         accelerator: Dict[str, object] = {}
-        gpu_enabled = os.environ.get("YOLO_TTA_GAUSSIAN_SMOOTHING_GPU", "1").strip().lower() not in {"0", "false", "no", "off"}
+        gpu_enabled = env_flag("YOLO_TTA_GAUSSIAN_SMOOTHING_GPU", True)
         if device_ids and gpu_enabled and mask_u8.size >= _GAUSSIAN_GPU_MIN_VOXELS:
             from .pta_preprocessing import run_gpu_preprocessing
             try:
@@ -1217,16 +1165,6 @@ def resize_to_approximately_cube(
     )
     warnings.add("cubic_resize_applied", f"{source_shape} -> {target}; smaller axes are within 5% of longest axis")
     return resized_volume, resized_mask, target
-
-
-# ---------------------------------------------------------------------------
-# Geometry: views, azimuthal sampling, affine transforms, tilted sampling
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# YOLO polygon export
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -1377,11 +1315,6 @@ def write_overlays_global(*, volume: np.ndarray, mask: np.ndarray, plans: Sequen
             for fut in as_completed(futures):
                 fut.result()
                 pbar.update(1)
-
-
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -1672,7 +1605,7 @@ def write_v18_pta_manifest(
     binary_publication: Sequence[Mapping[str, object]] = (),
     categorical_dispatch_counts: Optional[Mapping[str, int]] = None,
 ) -> Path:
-    """Write the mandatory v18 reproducibility and geometry manifest."""
+    """Write the mandatory PTA reproducibility and geometry manifest (schema pta-tta.v21.manifest.1)."""
 
     config = getattr(args, "_v18_config", None)
     if config is None:
@@ -1806,7 +1739,7 @@ def write_v18_pta_manifest(
                 "gaussian_smoothing": bool(config.preprocessing.gaussian_smoothing_enabled),
                 "sigma": float(config.preprocessing.gaussian_sigma),
                 "passes": int(config.preprocessing.gaussian_passes),
-                "boundary": "constant_zero",
+                "boundary": "replicate_edge",
                 "truncate": 4.0,
                 "threshold_each_pass": 0.5,
             },
@@ -2559,23 +2492,14 @@ def prepare_loaded_source(
     void_fill_stats: Optional[Dict[str, object]] = None
     if bool(getattr(args, "enable_3d_void_fill", False)):
         if label_enabled and not native_only:
-            connectivity_text = os.environ.get("YOLO_TTA_VOIDFILL_CONNECTIVITY", "").strip()
-            try:
-                connectivity = int(connectivity_text) if connectivity_text else 6
-            except ValueError:
-                connectivity = 6  # Match the shared helper's legacy invalid-text fallback.
+            connectivity = 6  # Background dual of the 26-connected foreground.
             if _void_fill_proven_noop(hole_fill_2d_stats, mask):
                 # Proven no-op: the final YZ hole-fill pass leaves every background
                 # voxel 4-connected in its (T, Y) plane to the plane edge, which lies
                 # on a volume face. Void fill treats face-touching background as
                 # exterior at connectivity 6/18/26, so it cannot add voxels.
-                # To restore the fill, remove this branch so the original GPU/CPU
-                # dispatch below runs again; its CPU invocation is:
-                # fill_3d_voids_inplace_streaming(
-                #     mask, out_dir/".v18_work"/src.stem/"void_fill", connectivity=connectivity,
-                # )
-                if connectivity not in (6, 18, 26):
-                    raise ValueError("3D void fill connectivity must be one of 6, 18, or 26")
+                # To restore the fill, delete this branch so the GPU/CPU dispatch
+                # in the else branch runs.
                 runtime_telemetry().add('pta.prepare.void_fill.skipped_proven_noop')
                 print(f"{src.stem}: 3D void fill skipped; the complete 2D hole fill proves it adds no voxels", flush=True)
                 void_fill_stats = {"background_connectivity": connectivity, "added_voxels": 0,
@@ -2953,16 +2877,15 @@ def _source_frames_for_processed_transverse(prep: PreparedVolume, frame_idx: int
     processed_t = int(prep.processing_shape[0])
     if source_t <= 0 or processed_t <= 0:
         return range(0)
-    if source_t <= 1 or processed_t <= 1:
+    if source_t <= 1:
         center = 0.0
     else:
-        # scipy.ndimage.zoom(grid_mode=False) maps the first/last output
-        # centers to the first/last input centers.
-        center = float(frame_idx) * float(source_t - 1) / float(processed_t - 1)
-    # Cubic resize uses linear z interpolation.  Gaussian support is normally
-    # truncated at four sigma; multiplying by passes is intentionally
-    # conservative and can retain a few extra backgrounds but cannot discard
-    # a foreground that the dense transformed mask would create.
+        center = min(max((float(frame_idx) + 0.5) * float(source_t) / float(processed_t) - 0.5, 0.0),
+                     float(source_t - 1))
+    # The categorical cube uses center-aligned nearest; radius 0.5 covers its index.
+    # Gaussian support is normally truncated at four sigma; multiplying by passes is
+    # intentionally conservative and can retain a few extra backgrounds but cannot
+    # discard a foreground that the dense transformed mask would create.
     smooth_halo = 0
     for stats in prep.smoothing_stats:
         smooth_halo += int(math.ceil(4.0 * max(0.0, float(stats.get("sigma", 0.0)))))
@@ -3254,8 +3177,7 @@ def classify_original_foregrounds_for_volume(
     execution_counts: Dict[str, Counter[str]] = defaultdict(Counter)
     semantic_fast_enabled = bool(
         prep.semantic_foreground
-        and os.environ.get("YOLO_TTA_PTA_SEMANTIC_CLASSIFICATION", "1").strip().lower()
-        not in {"0", "false", "no", "off", "disabled"}
+        and env_flag("YOLO_TTA_PTA_SEMANTIC_CLASSIFICATION", True)
     )
 
     geometry_jobs: List[Tuple[int, int]] = []
@@ -4155,7 +4077,7 @@ def write_pta_summary(
     specs: Sequence[VolumeInputSpec],
     volume_records: Sequence[VolumeSummaryRecord],
     tile_configs: Sequence[TileConfig],
-    channel_formats: Sequence[ChannelFormat | CanonicalChannelFormat],
+    channel_formats: Sequence[ChannelFormat],
     channel_variants: Sequence[ChannelVariant],
     requested_output_format: str,
     background_stats: BackgroundFilterStats,
@@ -4642,14 +4564,7 @@ def main(
         warnings=warnings,
         device_ids=getattr(args, "device_ids", None),
     )
-    tile_configs = [
-        TileConfig(
-            int(tile.tile_size),
-            int(tile.tile_stride),
-            str(tile.config_id),
-        )
-        for tile in v18_config.tiles
-    ]
+    tile_configs = list(v18_config.tiles)
     augmentation_definition = inspect_augmentation_definition(args.augmentation) if args.augmentation else None
     augmentation = (
         load_offline_augmentation_definition(args.augmentation)
@@ -4674,12 +4589,6 @@ def main(
             )
         if render_backend != "process" or str(args.worker_backend) == "thread":
             raise ValueError("GPU offline augmentation requires the persistent process backend")
-        if not gpu_fork_render_backend_available():
-            raise RuntimeError(
-                "PTA build_gpu_augmentation offline execution currently retains its fork-only "
-                "worker constraint and is unavailable on this host; CPU/no-augmentation process "
-                "rendering uses spawn"
-            )
         gpu_runtime_probe = probe_gpu_offline_runtime(
             require_nvjpeg=str(args.jpeg_encode_backend) == "nvjpeg",
             selected_device_ids=topology.cuda_device_ids,
@@ -4875,13 +4784,12 @@ def main(
     order_counter = 0
     total_written = 0
     total_flip_dropped = 0
-
-    total_background_withheld = 0
     if pending_specs:
         # v18 (U-25): install run-constant parent/thread state, then create the
         # one persistent pool before any volume is resident.  Normal process
-        # children receive a serialized static contract through spawn; the
-        # external GPU policy is the documented fork-inheritance exception.
+        # children receive a serialized static contract through spawn; external
+        # GPU policy owners fork where available and otherwise spawn with the
+        # policy reloaded by content hash.
         set_worker_static_context(
             out_dir=out_dir,
             split_active=bool(split_active),
@@ -5294,7 +5202,7 @@ def main(
         @runtime_telemetry_phase('pta.plan.volume')
         def _plan_volume(spec_index: int) -> Dict[str, object]:
             runtime_trace_event('pta.volume_plan_start', stem=pending_specs[spec_index].stem)
-            rendering_active = any(progress.pending_a or progress.pending_b for progress in progress_by_gen.values())
+            rendering_active = any(progress.pending_a for progress in progress_by_gen.values())
             phase_workers = planning_workers if rendering_active else cpu_budget.bootstrap_workers
             phase_cpus = planning_cpu_order if rendering_active else cpu_budget.bootstrap_cpu_order
             with _planning_phase_affinity(phase_cpus if bool(args.topology_aware) else ()):
@@ -5383,13 +5291,9 @@ def main(
                 runtime_trace_event('pta.render_submitted', stem=prep.src.stem,
                                     tasks=len(tasks), candidates=len(retained))
 
-        def _submit_phase_b(state: Dict[str, object]) -> int:
-            """C3: no second render phase; any rare offline flip overage is trimmed."""
-            return 0
-
         @runtime_telemetry_phase('pta.publish.volume_finalize')
-        def _finalize_volume(state: Dict[str, object], withheld: int) -> None:
-            nonlocal total_written, total_flip_dropped, total_background_withheld
+        def _finalize_volume(state: Dict[str, object]) -> None:
+            nonlocal total_written, total_flip_dropped
             prep: PreparedVolume = state["prep"]  # type: ignore[assignment]
             spec: VolumeInputSpec = state["spec"]  # type: ignore[assignment]
             physical: List[OutputCandidate] = state["physical"]  # type: ignore[assignment]
@@ -5403,8 +5307,6 @@ def main(
             flip_dropped = sum(int(x) for x in flips_by_subset.values())
             if flip_dropped:
                 print(f"{prep.src.stem}: dropped {flip_dropped} presumed-foreground augmented copy/copies that rendered background")
-            if withheld:
-                print(f"{spec.stem}: withheld {withheld} background(s) pre-render to honor the realized --background_percent cap after flips")
             # Offline foreground flips are rare.  C3 deliberately favors one
             # source render over a second background phase; trim only the
             # deterministic overage after observing those flips.
@@ -5427,7 +5329,7 @@ def main(
                 print(f"{spec.stem}: trimmed {trimmed} written background(s) to honor the realized --background_percent cap after flips")
             written_effective = int(progress.written) - int(trimmed)
             # Recompute retention-derived stats after flip drops and the
-            # realized-cap withhold so the summary reflects the final file set.
+            # realized-cap trim so the summary reflects the final file set.
             vol_augmentation_stats = finalize_augmentation_stats(
                 state["augmentation_stats"],  # type: ignore[arg-type]
                 physical,
@@ -5446,7 +5348,6 @@ def main(
                     vol_augmentation_stats, progress.foreground_counts, fraction=float(state["fraction"]))
             total_written += int(written_effective)
             total_flip_dropped += int(flip_dropped)
-            total_background_withheld += int(withheld)
 
             if bool(getattr(args, "save_binary", False)) and bool(prep.label_enabled):
                 binary_publication.extend(write_candidate_binary_videos(
@@ -5511,7 +5412,7 @@ def main(
 
             print(
                 f"{spec.stem}: volume complete; processed={written_effective}, "
-                f"flip_dropped={flip_dropped}, background_withheld={withheld}, "
+                f"flip_dropped={flip_dropped}, "
                 f"background_trimmed={trimmed}"
             )
 
@@ -5534,9 +5435,7 @@ def main(
                     # Free workers can start the next volume while this one drains.
                     _submit_phase_a(states[spec_index + 1])
                 drain_render_results(render_pool, progress_by_gen, until=lambda p=progress: p.pending_a == 0)
-                withheld = _submit_phase_b(state)
-                drain_render_results(render_pool, progress_by_gen, until=lambda p=progress: p.pending_b == 0)
-                _finalize_volume(state, withheld)
+                _finalize_volume(state)
                 del states[spec_index]
                 if not pipeline_enabled and spec_index + 1 < len(pending_specs):
                     states[spec_index + 1] = _plan_volume(spec_index + 1)
@@ -5712,8 +5611,7 @@ def main(
     print(f"Output directory: {out_dir}")
     print(
         f"Candidate versions processed this run: {total_written} "
-        f"(flip-dropped augmented copies: {total_flip_dropped}, "
-        f"backgrounds withheld pre-render: {total_background_withheld})"
+        f"(flip-dropped augmented copies: {total_flip_dropped})"
     )
     print(
         "PTA publication tokens: "

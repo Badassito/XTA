@@ -8,30 +8,24 @@ from __future__ import annotations
 from collections.abc import Mapping
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-import hashlib
-import json
-import os
 import time
-from pathlib import Path
 from types import MappingProxyType
-import uuid
 
 import numpy as np
 from scipy import ndimage
 
 from ._deps import _numba
+from .file_hashing import source_sha256
+from .sam_cyclic import IMPLEMENTATION_SHA256 as _CYCLIC_IMPLEMENTATION_SHA256
 from .sam_evidence import (SamEvidenceBundle, TILE_EVIDENCE_SCHEMA, _freeze, _plain, _group_shape,
-                           fingerprint, iter_selected_planes, iter_selected_native_crops, evidence_frame_geometry)
+                           fingerprint, evidence_frame_geometry)
 from .sam_filtering import (IMPLEMENTATION_SHA256 as FILTER_IMPLEMENTATION_SHA256,
-    assert_filter_implementation_unchanged, build_mask_filter, _component_inscribed_radii)
+    build_mask_filter, _component_inscribed_radii)
 from .sam_mask_reader import (IMPLEMENTATION_SHA256 as READER_IMPLEMENTATION_SHA256,
     SamMaskReader, effective_candidate_mask, effective_raw_mask, measure_effective_raw_mask)
 
 PROPOSAL_API_VERSION = 1
-_POLICY_SOURCE_PATH = Path(__file__).resolve()
-_POLICY_IMPLEMENTATION_SHA256 = hashlib.sha256(_POLICY_SOURCE_PATH.read_bytes()).hexdigest()
-_CYCLIC_SOURCE_PATH = Path(__file__).with_name("sam_cyclic.py")
-_CYCLIC_IMPLEMENTATION_SHA256 = hashlib.sha256(_CYCLIC_SOURCE_PATH.read_bytes()).hexdigest()
+_POLICY_IMPLEMENTATION_SHA256 = source_sha256(__file__)
 STOCK_SAM_POLICY = dict(name="sam_conservative_v2", kind="conservative", version=2,
                         strict_containment=True, min_endpoint_recall=.5,
                         max_endpoint_excess=.5, require_local_topology=True,
@@ -79,19 +73,7 @@ class SamRegenerationRequired(RuntimeError):
     """Planning or upstream tile-admission inputs changed since generation."""
 
 
-def _policy_source_sha256():
-    return hashlib.sha256(_POLICY_SOURCE_PATH.read_bytes()).hexdigest()
-
-
-def _assert_policy_source_unchanged():
-    if _policy_source_sha256() != _POLICY_IMPLEMENTATION_SHA256:
-        raise RuntimeError("SAM proposal policy implementation changed after loading")
-    assert_filter_implementation_unchanged()
-    if hashlib.sha256(_CYCLIC_SOURCE_PATH.read_bytes()).hexdigest()!=_CYCLIC_IMPLEMENTATION_SHA256:
-        raise RuntimeError("SAM cyclic quality implementation changed after loading")
-
-
-def resolve_sam_bridge_policy(source_policy=None, *, overrides=None, generation_mode=None, environ=None):
+def resolve_sam_bridge_policy(source_policy=None, *, overrides=None, generation_mode=None):
     source_policy = source_policy or {}
     if generation_mode not in {None,"whole","tiled"}:
         raise ValueError("SAM proposal generation mode must be whole or tiled")
@@ -132,19 +114,6 @@ def resolve_sam_bridge_policy(source_policy=None, *, overrides=None, generation_
         raise ValueError("SAM bridge policy version must be a supported integer") from error
     if isinstance(value, bool) or (isinstance(value, (float, np.floating)) and value != result["version"]):
         raise ValueError("SAM bridge policy version must be a supported integer")
-    # The launch switch is a convenience override for inherited conservative
-    # containment only. Explicit settings, including a saved resolved policy,
-    # are authoritative and independent of the current process environment.
-    explicit_containment = ((isinstance(declared, Mapping) and 'strict_containment' in declared)
-                            or (overrides is not None and 'strict_containment' in overrides))
-    if result['kind'] == 'conservative' and not explicit_containment:
-        from .config import resolve_sam_tight_crop_guard
-        requested_guard = resolve_sam_tight_crop_guard(environ)
-        if requested_guard is not None:
-            result['strict_containment'] = requested_guard
-        if requested_guard is False:
-            result['guarded_rescue'] = False
-            result['name'] = f"{result['name']}_tight_crop_guard_off"
     unknown = set(result) - (set(STOCK_SAM_POLICY) | set(RESCUE_SETTINGS))
     if unknown:
         raise ValueError(f"Unknown SAM bridge policy fields: {sorted(unknown)}")
@@ -1745,7 +1714,6 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
     ``proposal_api_version=1`` and receives read-only descriptors/measurements and
     bounded lazy masks. It may waive quality decisions, never validity checks.
     """
-    _assert_policy_source_unchanged()
     if not bundle.manifest["complete"]:
         raise ValueError("SAM evidence publication is incomplete; regeneration is required before selection")
     source_policy = policy or {}
@@ -2056,7 +2024,6 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
         from .sam_resources import validate_live_sam_resource_profile
         if validate_live_sam_resource_profile(resource_profile)!=selection_resources["live_profile"]:
             raise RuntimeError("SAM live resource assignment changed during selection")
-    _assert_policy_source_unchanged()
     result=dict(schema="xta.sam_selection/1", proposal_api_version=PROPOSAL_API_VERSION,
                 evidence_fingerprint=bundle.evidence_fingerprint, policy_name=resolved["name"], policy_hash=policy_hash,
                 policy_implementation_sha256=implementation_sha256,
@@ -2099,56 +2066,3 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
     if tiled_contract is not None:
         result.update(generation_mode="tiled",tiled_quality_contract=tiled_contract)
     return result
-
-
-def replay_sam_proposals(bundle, output, *, policy=None, upstream_fingerprints=None, frozen_evidence=False):
-    """Write a fresh fixed-evidence selection receipt and packed directional masks.
-
-    These NPZ diagnostics are grouped by pass, bounded crop planes, and direction.
-    The integrated pipeline projects selected planes into its binary NRRD slots.
-    """
-    if not isinstance(bundle, SamEvidenceBundle):
-        bundle = SamEvidenceBundle.open(bundle)
-    output = Path(output).resolve()
-    if output.exists():
-        raise FileExistsError("SAM replay destination must be fresh")
-    receipt = select_sam_proposals(bundle, policy, upstream_fingerprints=upstream_fingerprints,
-                                   frozen_evidence=frozen_evidence)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    staging = output.parent / ("." + output.name + ".stage-" + uuid.uuid4().hex)
-    staging.mkdir()
-    try:
-        # One streaming ZIP payload avoids one permanent file per group or run.
-        import zipfile
-        import io
-        index = []
-        geometry=evidence_frame_geometry(bundle)
-        with zipfile.ZipFile(staging / "selected_planes.npz", "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            passes = sorted(set(int(run["pass_index"]) for run in bundle.runs.values()))
-            for pass_index in passes:
-                for direction in ("forward", "backward"):
-                    for group_id, stored_frame, frame, folded_bbox, plane in iter_selected_native_crops(bundle, receipt, direction=direction, pass_index=pass_index):
-                        name = f"mask_{len(index):08d}.npy"
-                        buffer = io.BytesIO()
-                        np.save(buffer, np.packbits(plane.reshape(-1), bitorder="little"), allow_pickle=False)
-                        archive.writestr(name, buffer.getvalue())
-                        index.append(dict(key=name[:-4], group_id=group_id, native_frame=frame, pass_index=pass_index,
-                            direction=direction, shape=list(plane.shape), context_bbox_yx=list(folded_bbox),
-                            stored_unfolded_frame=stored_frame,
-                            stored_unfolded_bbox_yx=list(bundle.groups[group_id]["context_bbox_yx"]),
-                            stored_frame_address=_plain(geometry["groups"][group_id]["addresses"][stored_frame])
-                                if geometry["groups"][group_id]["addresses"] is not None else None,
-                            foreground=int(np.count_nonzero(plane))))
-        receipt["replay_outputs"] = dict(selected_planes="selected_planes.npz", packed_plane_index=index,
-            source_bundle_fingerprint=bundle.evidence_fingerprint, diagnostic_coordinate_space="view_native_crop",
-            stored_coordinate_space="unfolded_view_crop",native_shape_tyx=_plain(geometry["native_shape_tyx"]),
-            frame_addressing=_plain(geometry["addressing"]))
-        bundle.assert_unchanged()
-        _assert_policy_source_unchanged()
-        (staging / "selection.json").write_text(json.dumps(receipt, sort_keys=True, indent=2, allow_nan=False), encoding="utf-8")
-        os.replace(staging, output)
-    except BaseException:
-        import shutil
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
-    return receipt

@@ -1007,8 +1007,8 @@ def test_unmaterialized_streaming_source_never_claims_gpu_for_decode_or_xy_chang
         context.close();lazy.close();decoded._mmap.close()
 
 
-def test_unmaterialized_streaming_gpu_refusal_preserves_endpoint_grid_and_corner_frames(tmp_path):
-    from XTA.media import LazyProcessingCube,_linear_source_index
+def test_unmaterialized_streaming_cube_cpu_reference_uses_the_center_aligned_grid(tmp_path):
+    from XTA.media import LazyProcessingCube
     import XTA.runtime as runtime
     decoded=np.memmap(tmp_path/'decoded.dat',mode='w+',dtype=np.uint8,shape=(3,4,5))
     decoded[0]=0;decoded[1]=84;decoded[2]=240;decoded.flush()
@@ -1021,20 +1021,19 @@ def test_unmaterialized_streaming_gpu_refusal_preserves_endpoint_grid_and_corner
     planned=demand(lazy.shape,{frame:(0,0,4,5)for frame in (0,1,6)})
     telemetry=SimpleNamespace(add=mock.Mock(),gauge=mock.Mock())
     try:
+        # Streaming cubes share the GPU virtual native-T grid, so admission now
+        # proceeds past the old streaming refusal to device availability.
         with mock.patch('XTA.sam_resources.validate_live_sam_resource_profile',
-                return_value={'base_other_non_cpu_allowance_bytes':2**30,'lease_id':'endpoint-grid'}), \
+                return_value={'base_other_non_cpu_allowance_bytes':2**30,'lease_id':'center-grid'}), \
                 mock.patch.object(runtime,'runtime_telemetry',return_value=telemetry), \
-                mock.patch('XTA.backprojection._try_acquire_specific_main_process_gpu_stage',
-                    side_effect=AssertionError('claimed GPU with another temporal grid')):
+                mock.patch('torch.cuda.is_available',return_value=False):
             assert try_gpu_crop_renderer(context,view,lazy.shape,planned) is None
             reference=context.image_provider(view,lazy.shape,planned)
-        telemetry.gauge.assert_any_call('sam.gpu_images.last_cpu_reason',
-            'streamed_endpoint_processing_cube_not_materialized')
-        endpoint=_linear_source_index(1,7,3)
-        center=(1+.5)*(3/7)-.5
-        assert abs(endpoint-center)>.15  # A coordinate change, not a gray8 tie.
+        telemetry.gauge.assert_any_call('sam.gpu_images.last_cpu_reason','cuda_unavailable')
+        # Center positions 0, 1/7 and 2 (clamped) of the 3 -> 7 grid; the old
+        # endpoint grid gave 28 for frame 1.
         np.testing.assert_array_equal(crop_from(reference,0,(0,0,4,5)),0)
-        np.testing.assert_array_equal(crop_from(reference,1,(0,0,4,5)),28)
+        np.testing.assert_array_equal(crop_from(reference,1,(0,0,4,5)),12)
         np.testing.assert_array_equal(crop_from(reference,6,(0,0,4,5)),240)
         assert live_image_sampling(reference)['backend']=='cpu'
         assert not lazy.materialized

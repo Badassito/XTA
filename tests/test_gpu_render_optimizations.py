@@ -5,7 +5,6 @@ from collections import OrderedDict
 import inspect
 import os
 import threading
-from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -37,7 +36,6 @@ def make_job(name: str, angle_deg: float, matrix: np.ndarray) -> AugJob:
     return AugJob(
         aug_id=f'a{angle_deg:g}',
         angle_deg=float(angle_deg),
-        meta_path=Path(f'{name}.json'),
         aff=affine,
     )
 
@@ -127,11 +125,6 @@ class FusedRendererOptimizationTests(unittest.TestCase):
                 cuda_backend,
                 '_fused_preflight_family',
                 side_effect=lambda view: view.preflight_family,
-            ),
-            mock.patch.object(
-                cuda_backend,
-                'fused_renderer_preflight_enabled',
-                return_value=True,
             ),
         ):
             engine.run_startup_fused_preflight(specs, out_size=8, fp16=True)
@@ -244,6 +237,23 @@ class FusedRendererOptimizationTests(unittest.TestCase):
         )
         self.assertIn('np.int32(0)', tta_tilted_launch)
         self.assertIn('np.int32(1)', pta_tilted_launch)
+
+    def test_tilted_azimuthal_texture_sampler_shears_each_tilt_axis_tap(self) -> None:
+        kernel_source = inspect.getsource(cuda_backend._fused_direct_render_kernels)
+        sampler = kernel_source.split('float azimuthal_texture_sample(', 1)[1].split(
+            'float azimuthal_texture_direct_value(', 1)[0]
+        upright, tilted = sampler.split('if (tan_tilt == 0.0f) {', 1)[1].split(
+            'bool vertical = direction_id == 0;', 1)
+        # Upright sampling keeps its single continuous-coordinate fetch.
+        self.assertIn('base_id, px, py, stack);', upright)
+        self.assertNotIn('tap_stack', upright)
+        # Tilted sampling shears the stack at each integer tilt-axis tap, with per-tap
+        # validity, instead of one fetch at the sheared continuous coordinate.
+        self.assertIn('for (int tap = 0; tap < 2; ++tap)', tilted)
+        self.assertIn('__fmul_rn(tan_tilt, (float)tilt_tap - tilt_center)', tilted)
+        self.assertIn('if (tap_stack < 0.0f || tap_stack > (float)(stack_len - 1)) continue;', tilted)
+        self.assertIn('vertical ? px : (float)tilt_tap, vertical ? (float)tilt_tap : py, tap_stack', tilted)
+        self.assertNotIn('stack = __fadd_rn(stack, __fmul_rn(tan_tilt, axis));', sampler)
 
     def test_pta_array_volume_upload_is_resident_and_reused(self) -> None:
         copies: list[tuple[int, int]] = []
@@ -388,7 +398,6 @@ class FusedRendererOptimizationTests(unittest.TestCase):
                         shared_job=SimpleNamespace(M_out_to_src=self.identity)),),
                 )
                 with (mock.patch.object(pta_workers, "_require_pta_canonical_plan"),
-                      mock.patch.object(pta_workers, "_azimuthal_source_mode", return_value="texture_linear"),
                       mock.patch("builtins.print") as render_messages):
                     for item in ("full", "tile", "full"):
                         result = pta_workers._gpu_projected_item_image(
@@ -882,21 +891,21 @@ class D1BackprojectionOptimizationTests(unittest.TestCase):
     def test_d1_kernel_warp_aggregates_output_word_atomics(self) -> None:
         source = inspect.getsource(cuda_d1._d1_backproject_kernels)
         self.assertIn('__match_any_sync', source)
-        self.assertIn('d1_warp_aggregated_atomic_or(output_bits, word, bit, warp_bits)', source)
+        self.assertIn('d1_warp_aggregated_atomic_or(output_bits, linear >> 5,', source)
 
-    def test_bbox_launch_plan_batches_similar_slices_and_buckets_large_ones(self) -> None:
+    def test_bbox_specs_pack_nonempty_slices_in_slice_order(self) -> None:
         slice_any = np.asarray((True, True, True, False), dtype=bool)
         slice_bboxes = np.asarray(
             (
-                (0, 1, 0, 100),
-                (0, 1, 0, 200),
                 (0, 1, 0, 300),
+                (0, 1, 0, 100),
+                (0, 9, 0, 200),
                 (0, 0, 0, 0),
             ),
             dtype=np.int64,
         )
 
-        specs, groups, scanned = cuda_d1._d1_prepare_bbox_launch_plan(
+        specs, scanned = cuda_d1._d1_pack_bbox_specs(
             slice_any,
             slice_bboxes,
             (4, 2, 400),
@@ -906,19 +915,28 @@ class D1BackprojectionOptimizationTests(unittest.TestCase):
             specs,
             np.asarray(
                 (
-                    (0, 0, 0, 1, 100),
-                    (1, 0, 0, 1, 200),
-                    (2, 0, 0, 1, 300),
+                    (0, 0, 0, 1, 300),
+                    (1, 0, 0, 1, 100),
+                    (2, 0, 0, 2, 200),
                 ),
                 dtype=np.int32,
             ),
         )
-        self.assertEqual(groups, [(1, 0, 2), (2, 2, 1)])
-        self.assertEqual(scanned, 600)
+        self.assertEqual(specs.dtype, np.int32)
+        self.assertTrue(specs.flags.c_contiguous)
+        self.assertEqual(scanned, 800)
 
-    def test_bbox_launch_plan_rejects_nonempty_slice_with_empty_clamped_bbox(self) -> None:
+    def test_bbox_specs_pack_no_rows_for_an_empty_task(self) -> None:
+        specs, scanned = cuda_d1._d1_pack_bbox_specs(
+            np.zeros((2,), dtype=bool), np.zeros((2, 4), dtype=np.int64), (2, 4, 4),
+        )
+        self.assertEqual(specs.shape, (0, 5))
+        self.assertEqual(specs.dtype, np.int32)
+        self.assertEqual(scanned, 0)
+
+    def test_bbox_specs_reject_nonempty_slice_with_empty_clamped_bbox(self) -> None:
         with self.assertRaisesRegex(RuntimeError, 'nonempty.*empty bbox'):
-            cuda_d1._d1_prepare_bbox_launch_plan(
+            cuda_d1._d1_pack_bbox_specs(
                 np.asarray((True,), dtype=bool),
                 np.asarray(((5, 8, 2, 2),), dtype=np.int64),
                 (1, 4, 4),

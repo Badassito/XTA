@@ -14,12 +14,7 @@ from XTA import pta
 from XTA import pta_publication
 from XTA import pta_rendering
 from XTA.pta_config import parse_pta_args
-from XTA.unification.contracts import (
-    DataRole,
-    FrameAddress,
-    PipelineMode,
-    RenderItem,
-)
+from XTA.unification.contracts import PipelineMode
 from XTA.unification.sampling import (
     build_forward_raster_plan,
     forward_sampling_policy,
@@ -714,7 +709,7 @@ class CrossModeGeometryMatrixTests(unittest.TestCase):
             )
             np.testing.assert_array_equal(tile_stack[:, :, 0], expected_mirrored_tile)
 
-    def test_pta_dataset_sink_receives_the_exact_canonical_frame_and_item(self) -> None:
+    def test_pta_dataset_image_is_written_from_the_exact_rendered_frame(self) -> None:
         view = self._compile_view(
             "cartesian", ("--enable_cartesian", "transverse")
         )
@@ -754,37 +749,32 @@ class CrossModeGeometryMatrixTests(unittest.TestCase):
                 channel_offsets=(0,),
             )
             with mock.patch.object(pta_publication, "write_image") as writer:
-                batch = pta.publish_pta_candidate_image_batch(
+                outcome = pta.write_selected_candidate_version(
                     cand=candidate,
                     image=image,
-                    img_path=root / "sample.png",
-                    canonical_plan=plan.canonical_plan,
+                    mask=np.zeros_like(image),
+                    out_dir=root,
+                    split_active=False,
+                    image_format="png",
                     png_compression=1,
                     jpeg_quality=95,
+                    warnings=pta.WarningLog(),
+                    augmentation=None,
+                    save_labels=False,
                 )
+            expected_path = pta_publication.candidate_output_paths(
+                root, candidate, split_active=False, image_format="png",
+            )[0]
 
-        self.assertIs(batch.frames[0], image)
-        self.assertIs(batch.items[0].frame, batch.frames[0])
-        self.assertIs(batch.model_payload()[1], batch.frames)
-        self.assertIs(writer.call_args.args[1], batch.frames[0])
-        self.assertIs(batch.raster_plan, plan.canonical_plan)
-        self.assertIsNotNone(batch.items[0].request)
-        request = batch.items[0].request
-        assert request is not None
-        expected_request = RenderItem(
-            plan=plan.canonical_plan,
-            data_role=DataRole.INTENSITY,
-            frame_address=FrameAddress(1),
-            metadata={
-                "physical_view_id": candidate.physical_view_id,
-                "presentation_variant_id": candidate.presentation_variant_id,
-                "geometry_item_id": candidate.geometry_item_id,
-                "augmentation_index": 0,
-                "augmentation_tag": None,
-            },
+        self.assertEqual(outcome, "written")
+        self.assertEqual(writer.call_count, 1)
+        # The worker-rendered frame reaches the encoder without a copy.
+        self.assertIs(writer.call_args.args[1], image)
+        self.assertEqual(writer.call_args.args[0], expected_path)
+        self.assertEqual(writer.call_args.args[2], 1)
+        self.assertEqual(
+            writer.call_args.kwargs, {"channel_kind": "gray", "jpeg_quality": 95}
         )
-        self.assertEqual(request.item_id, expected_request.item_id)
-        self.assertEqual(request.plan.digest, plan.canonical_plan.digest)
 
 
 if __name__ == "__main__":

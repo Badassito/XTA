@@ -2,13 +2,12 @@
 
 This module is deliberately independent of :mod:`XTA.pta`.  Every class
 serialized in a render-phase payload and every CPU rendering primitive used by
-spawned workers has a canonical owner here.
+spawned workers has a canonical owner here, except ``TileConfig``, which
+:mod:`XTA.unification.tiles` owns and this module re-exports.
 """
 
 from __future__ import annotations
 
-import math
-import threading
 from bisect import bisect_left
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,26 +24,7 @@ from . import geometry as shared_geometry
 from .pta_cpr import CprGeometry, render_cpr_frame
 from .unification.contracts import RasterPlan
 from .unification.sampling import forward_sampling_policy, require_forward_sampling
-
-
-AZIMUTHAL_LANCZOS_A = 3
-
-
-@dataclass(frozen=True)
-class TileConfig:
-    tile_size: int
-    tile_stride: int
-    config_id: str
-
-
-@dataclass(frozen=True)
-class ChannelFormat:
-    """One user-requested output channel format before direction expansion."""
-
-    token: str
-    kind: str  # gray, rgb, custom
-    channel_count: int
-    stride: int
+from .unification.tiles import TileConfig
 
 
 @dataclass(frozen=True)
@@ -83,7 +63,9 @@ DEFAULT_CHANNEL_VARIANT = ChannelVariant(
 class ViewInfo:
     name: str
     display_name: str
-    family: str  # transverse, sagittal, coronal, azimuthal, tilted_transverse
+    # adapt_shared_view() token (transverse, sagittal, coronal, azimuthal,
+    # tilted_transverse for any Tilted base, radial, spherical), or "cpr".
+    family: str
     num_slices: int
     src_h: int
     src_w: int
@@ -98,7 +80,7 @@ class ViewInfo:
     roi_radius: float = 0.0
     tilt_angle_deg: float = 0.0
     tilt_direction: str = ""
-    # Canonical v18 physical view.  Legacy-compatible scalar fields above are
+    # Canonical shared physical view.  Legacy-compatible scalar fields above are
     # presentation/planner adapters only; all built-in pixels come from this
     # shared TTA geometry object when present.
     shared_view: Optional[shared_geometry.ViewInfo] = None
@@ -126,241 +108,15 @@ class AffineSpec:
     native_output: bool = False
 
 
-@dataclass(frozen=True)
-class AzimuthalSampler:
-    angle_deg: float
-    diameter: int
-    lanczos_a: int
-    x_idx: np.ndarray
-    y_idx: np.ndarray
-    x_w: np.ndarray
-    y_w: np.ndarray
-    nn_x: np.ndarray
-    nn_y: np.ndarray
-
-
-_AZIMUTHAL_CACHE: Dict[Tuple[int, int, int, float, int], AzimuthalSampler] = {}
-_AZIMUTHAL_CACHE_LOCK = threading.Lock()
-
-
-def lanczos_offsets(a: int) -> np.ndarray:
-    """Offsets for a floor-centered 2a-tap Lanczos kernel.
-
-    For azimuthal reslicing this returns six taps for Lanczos-3:
-    [-2, -1, 0, 1, 2, 3].
-    """
-    radius = max(1, int(a))
-    return np.arange(-(radius - 1), radius + 1, dtype=np.int32)
-
-
-def lanczos_kernel(x: np.ndarray, a: int = AZIMUTHAL_LANCZOS_A) -> np.ndarray:
-    x = np.asarray(x, dtype=np.float32)
-    out = np.sinc(x) * np.sinc(x / float(a))
-    out[np.abs(x) >= float(a)] = 0.0
-    return out.astype(np.float32, copy=False)
-
-
-def normalize_lanczos_weight_rows(weights: np.ndarray, *, axis_name: str) -> np.ndarray:
-    """Normalize valid Lanczos taps so a constant field has exactly unit gain."""
-    values64 = np.asarray(weights, dtype=np.float64)
-    sums = np.sum(values64, axis=1, keepdims=True, dtype=np.float64)
-    invalid = ~np.isfinite(sums) | (np.abs(sums) <= 1e-12)
-    if np.any(invalid):
-        rows = np.flatnonzero(invalid[:, 0])[:12].tolist()
-        raise RuntimeError(f"Invalid azimuthal Lanczos {axis_name}-weight sums at sample rows {rows}")
-    return np.ascontiguousarray((values64 / sums).astype(np.float32))
-
-
-def get_azimuthal_sampler(view: ViewInfo, angle_deg: float) -> AzimuthalSampler:
-    lanczos_a = int(AZIMUTHAL_LANCZOS_A)
-    key = (int(view.full_w), int(view.full_h), int(view.diameter), round(float(angle_deg), 6), lanczos_a)
-    with _AZIMUTHAL_CACHE_LOCK:
-        cached = _AZIMUTHAL_CACHE.get(key)
-    if cached is not None:
-        return cached
-    diameter = int(view.diameter)
-    coords = np.linspace(-float(view.roi_radius), float(view.roi_radius), diameter, dtype=np.float32)
-    theta = math.radians(float(angle_deg))
-    xs = np.asarray(float(view.center_x) + coords * math.cos(theta), dtype=np.float32)
-    ys = np.asarray(float(view.center_y) + coords * math.sin(theta), dtype=np.float32)
-    offsets = lanczos_offsets(lanczos_a)
-    x0 = np.floor(xs).astype(np.int32)
-    y0 = np.floor(ys).astype(np.int32)
-    x_idx_raw = x0[:, None] + offsets[None, :]
-    y_idx_raw = y0[:, None] + offsets[None, :]
-    x_w = lanczos_kernel(xs[:, None] - x_idx_raw, a=lanczos_a)
-    y_w = lanczos_kernel(ys[:, None] - y_idx_raw, a=lanczos_a)
-    x_valid = (x_idx_raw >= 0) & (x_idx_raw < int(view.full_w))
-    y_valid = (y_idx_raw >= 0) & (y_idx_raw < int(view.full_h))
-    x_w *= x_valid.astype(np.float32)
-    y_w *= y_valid.astype(np.float32)
-    # The finite Lanczos tap sum varies with subpixel phase, and validity
-    # clipping changes it further at the ROI boundary.  Normalize after
-    # clipping to prevent azimuthal brightness gain/loss and endpoint ringing
-    # from shifting the DC level.
-    x_w = normalize_lanczos_weight_rows(x_w, axis_name="x")
-    y_w = normalize_lanczos_weight_rows(y_w, axis_name="y")
-    sampler = AzimuthalSampler(
-        float(angle_deg), diameter, lanczos_a,
-        np.clip(x_idx_raw, 0, int(view.full_w) - 1).astype(np.int32),
-        np.clip(y_idx_raw, 0, int(view.full_h) - 1).astype(np.int32),
-        x_w.astype(np.float32), y_w.astype(np.float32),
-        np.clip(np.rint(xs).astype(np.int32), 0, int(view.full_w) - 1),
-        np.clip(np.rint(ys).astype(np.int32), 0, int(view.full_h) - 1),
-    )
-    with _AZIMUTHAL_CACHE_LOCK:
-        existing = _AZIMUTHAL_CACHE.get(key)
-        if existing is not None:
-            return existing
-        _AZIMUTHAL_CACHE[key] = sampler
-        return sampler
-
-
-def azimuthal_extract_lanczos(volume: np.ndarray, sampler: AzimuthalSampler, *, binary_mask: bool = False) -> np.ndarray:
-    if binary_mask:
-        # Categorical masks must not receive an oscillatory reconstruction
-        # kernel.  The precomputed nearest coordinates preserve labels and are
-        # substantially faster than Lanczos plus thresholding.
-        sampled = np.asarray(volume)[:, sampler.nn_y, sampler.nn_x]
-        return np.ascontiguousarray((sampled > 0).astype(np.uint8))
-    t_dim = int(volume.shape[0])
-    out_f = np.empty((t_dim, int(sampler.diameter)), dtype=np.float32)
-    x_w = np.asarray(sampler.x_w, dtype=np.float32)[None, :, :]
-    y_w = np.asarray(sampler.y_w, dtype=np.float32)
-    kernel_taps = max(1, int(sampler.x_idx.shape[1]))
-    bytes_per_frame = max(1, int(sampler.diameter) * kernel_taps * np.dtype(np.float32).itemsize)
-    block_frames = max(1, min(256, (256 * 1024 * 1024) // bytes_per_frame))
-    for start in range(0, t_dim, block_frames):
-        stop = min(t_dim, start + block_frames)
-        block = np.asarray(volume[start:stop])
-        acc = np.zeros((stop - start, sampler.diameter), dtype=np.float32)
-        for yi in range(sampler.y_idx.shape[1]):
-            samples = block[:, sampler.y_idx[:, yi][:, None], sampler.x_idx].astype(np.float32, copy=False)
-            row = np.sum(samples * x_w, axis=2)
-            acc += row * y_w[:, yi][None, :]
-        out_f[start:stop] = acc
-    return np.ascontiguousarray(np.clip(np.rint(out_f), 0.0, 255.0).astype(np.uint8))
-
-
 def get_native_view_image(volume: np.ndarray, view: ViewInfo, idx: int) -> np.ndarray:
-    i = int(idx)
+    """Native CPR cross-section; every other family renders through ``shared_view``."""
     if view.family == "cpr" and view.cpr_geometry is not None:
-        return render_cpr_frame(volume, view.cpr_geometry, i)
-    if view.family == "transverse":
-        return np.asarray(volume[i])
-    if view.family == "sagittal":
-        return np.ascontiguousarray(volume[:, i, :])
-    if view.family == "coronal":
-        return np.ascontiguousarray(volume[:, :, i])
-    if view.family == "azimuthal":
-        sampler = get_azimuthal_sampler(view, float(view.azimuths_deg[i]))
-        return azimuthal_extract_lanczos(volume, sampler, binary_mask=False)
-    raise ValueError(f"Native image frame for {view.family} requires a dedicated renderer")
+        return render_cpr_frame(volume, view.cpr_geometry, int(idx))
+    raise ValueError(f"Native image frame for {view.family} requires a canonical shared view")
 
 
 def get_native_view_frame(volume: np.ndarray, mask: np.ndarray, view: ViewInfo, idx: int) -> Tuple[np.ndarray, np.ndarray]:
-    i = int(idx)
-    image = get_native_view_image(volume, view, i)
-    if view.family == "cpr" and view.cpr_geometry is not None:
-        return image, render_cpr_frame(mask, view.cpr_geometry, i, categorical=True)
-    if view.family == "transverse":
-        return image, np.asarray(mask[i])
-    if view.family == "sagittal":
-        return image, np.ascontiguousarray(mask[:, i, :])
-    if view.family == "coronal":
-        return image, np.ascontiguousarray(mask[:, :, i])
-    if view.family == "azimuthal":
-        sampler = get_azimuthal_sampler(view, float(view.azimuths_deg[i]))
-        return image, azimuthal_extract_lanczos(mask, sampler, binary_mask=True)
-    raise ValueError(f"Native frame for {view.family} requires a dedicated renderer")
-
-
-@dataclass(frozen=True)
-class TiltPlan:
-    x_idx: np.ndarray
-    y_idx: np.ndarray
-    valid_xy: np.ndarray
-    axis_offset: np.ndarray
-
-
-_TILT_PLAN_CACHE: Dict[Tuple[str, int, int, int, int, Tuple[float, ...]], TiltPlan] = {}
-_TILT_PLAN_CACHE_LOCK = threading.Lock()
-
-
-def tilt_plan_key(view: ViewInfo, M_grid_to_src: np.ndarray, grid_h: int, grid_w: int) -> Tuple[str, int, int, int, int, Tuple[float, ...]]:
-    mat = tuple(round(float(x), 6) for x in np.asarray(M_grid_to_src, dtype=np.float32).reshape(-1).tolist())
-    # The expensive XY grid does not depend on tilt magnitude or sign; those
-    # enter only through tan(angle) in render_tilted_on_grid().  Keying on the
-    # view name retained one ~117 MiB plan per angle at 3072^2.
-    return (
-        str(view.tilt_direction),
-        int(view.full_w),
-        int(view.full_h),
-        int(grid_h),
-        int(grid_w),
-        mat,
-    )
-
-
-def get_tilt_plan(view: ViewInfo, M_grid_to_src: np.ndarray, grid_h: int, grid_w: int) -> TiltPlan:
-    key = tilt_plan_key(view, M_grid_to_src, grid_h, grid_w)
-    # A plan can exceed 100 MiB.  Build it under a cache-miss lock so dozens of
-    # frame threads cannot allocate the same coordinate grids simultaneously.
-    with _TILT_PLAN_CACHE_LOCK:
-        cached = _TILT_PLAN_CACHE.get(key)
-        if cached is not None:
-            return cached
-        yy, xx = np.indices((int(grid_h), int(grid_w)), dtype=np.float32)
-        M = np.asarray(M_grid_to_src, dtype=np.float32)
-        src_x = M[0, 0] * xx + M[0, 1] * yy + M[0, 2]
-        src_y = M[1, 0] * xx + M[1, 1] * yy + M[1, 2]
-        x_nn = np.rint(src_x).astype(np.int32)
-        y_nn = np.rint(src_y).astype(np.int32)
-        valid = (x_nn >= 0) & (x_nn < int(view.full_w)) & (y_nn >= 0) & (y_nn < int(view.full_h))
-        if view.tilt_direction == "vertical":
-            axis_offset = src_y - float((view.full_h - 1) / 2.0)
-        elif view.tilt_direction == "horizontal":
-            axis_offset = src_x - float((view.full_w - 1) / 2.0)
-        else:
-            raise ValueError(f"Unsupported tilt direction: {view.tilt_direction}")
-        plan = TiltPlan(
-            np.clip(x_nn, 0, int(view.full_w) - 1).astype(np.int32),
-            np.clip(y_nn, 0, int(view.full_h) - 1).astype(np.int32),
-            valid.astype(bool),
-            np.asarray(axis_offset, dtype=np.float32),
-        )
-        _TILT_PLAN_CACHE[key] = plan
-        return plan
-
-
-def render_tilted_on_grid(volume: np.ndarray, view: ViewInfo, frame_idx: int, M_grid_to_src: np.ndarray, grid_h: int, grid_w: int, *, binary_mask: bool, block_rows: int = 256) -> np.ndarray:
-    plan = get_tilt_plan(view, M_grid_to_src, int(grid_h), int(grid_w))
-    tan_alpha = float(math.tan(math.radians(float(view.tilt_angle_deg))))
-    t_dim = int(volume.shape[0])
-    out = np.zeros((int(grid_h), int(grid_w)), dtype=np.uint8)
-    frame_center = float(frame_idx)
-    for y0 in range(0, int(grid_h), int(block_rows)):
-        y1 = min(int(grid_h), y0 + int(block_rows))
-        valid_xy = plan.valid_xy[y0:y1]
-        if not np.any(valid_xy):
-            continue
-        t_src = frame_center + tan_alpha * plan.axis_offset[y0:y1]
-        valid = valid_xy & (t_src >= 0.0) & (t_src <= float(t_dim - 1))
-        if not np.any(valid):
-            continue
-        t0 = np.floor(t_src).astype(np.int32)
-        t1 = np.clip(t0 + 1, 0, t_dim - 1).astype(np.int32)
-        t0 = np.clip(t0, 0, t_dim - 1).astype(np.int32)
-        alpha = (t_src - t0).astype(np.float32)
-        ys = plan.y_idx[y0:y1]
-        xs = plan.x_idx[y0:y1]
-        f0 = volume[t0, ys, xs].astype(np.float32)
-        f1 = volume[t1, ys, xs].astype(np.float32)
-        blend = ((1.0 - alpha) * f0) + (alpha * f1)
-        block = out[y0:y1]
-        vals = (blend >= 0.5).astype(np.uint8) if binary_mask else np.clip(np.rint(blend), 0.0, 255.0).astype(np.uint8)
-        block[valid] = vals[valid]
-    return out
+    return get_native_view_image(volume, view, int(idx)), get_native_view_mask(mask, view, int(idx))
 
 
 def warp_pair(native_img: np.ndarray, native_mask: np.ndarray, M: np.ndarray, out_w: int, out_h: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -383,20 +139,6 @@ def warp_image(native_img: np.ndarray, M: np.ndarray, out_w: int, out_h: int) ->
     return np.ascontiguousarray(image, dtype=np.uint8)
 
 
-def _shared_aug_job_for_affine(
-    view: ViewInfo,
-    aff: AffineSpec,
-) -> shared_geometry.AugJob:
-    if view.shared_view is None or aff.shared_affine is None:
-        raise ValueError("shared affine rendering requires a canonical v18 view and affine")
-    return shared_geometry.AugJob(
-        aug_id="a0",
-        angle_deg=float(aff.angle_deg),
-        meta_path=Path(f"{view.name}_a0.meta.json"),
-        aff=aff.shared_affine,
-    )
-
-
 def _shared_render_full_intensity(
     volume: np.ndarray,
     view: ViewInfo,
@@ -406,7 +148,7 @@ def _shared_render_full_intensity(
     mirror_azimuthal_u: bool = False,
 ) -> np.ndarray:
     if view.shared_view is None:
-        raise ValueError("shared intensity rendering requires a canonical v18 view")
+        raise ValueError("shared intensity rendering requires view.shared_view")
     return np.ascontiguousarray(
         shared_geometry.render_intensity_frame_on_grid(
             volume,
@@ -431,7 +173,7 @@ def _shared_render_canvas_intensity(
     mirror_azimuthal_u: bool = False,
 ) -> np.ndarray:
     if view.shared_view is None or aff.shared_affine is None:
-        raise ValueError("shared canvas rendering requires a canonical v18 view and affine")
+        raise ValueError("shared canvas rendering requires view.shared_view and an affine")
     if shared_geometry.is_tilted_view(view.shared_view):
         return np.ascontiguousarray(
             shared_geometry.render_tilted_canvas_frame(
@@ -463,7 +205,7 @@ def _shared_render_full_mask(
     mirror_azimuthal_u: bool = False,
 ) -> np.ndarray:
     if view.shared_view is None:
-        raise ValueError("shared categorical rendering requires a canonical v18 view")
+        raise ValueError("shared categorical rendering requires view.shared_view")
     return np.ascontiguousarray(
         shared_geometry.render_categorical_frame_on_grid(
             mask,
@@ -486,7 +228,7 @@ def _shared_render_canvas_mask(
     aff: AffineSpec,
 ) -> np.ndarray:
     if view.shared_view is None or aff.shared_affine is None:
-        raise ValueError("shared categorical canvas requires a canonical v18 view and affine")
+        raise ValueError("shared categorical canvas requires view.shared_view and an affine")
     if shared_geometry.is_tilted_view(view.shared_view):
         rendered = shared_geometry._render_tilted_array_on_grid(
             mask,
@@ -531,19 +273,6 @@ def render_image_full_and_optional_canvas(
         and int(aff.out_h) == int(aff.canvas_h)
         and np.array_equal(aff.M_out_to_src, aff.M_canvas_to_src)
     )
-    if view.family == "tilted_transverse":
-        image_full = render_tilted_on_grid(
-            volume, view, int(idx), aff.M_out_to_src, aff.out_h, aff.out_w, binary_mask=False,
-        )
-        if shared_full_canvas:
-            return image_full, image_full
-        if need_canvas:
-            image_canvas = render_tilted_on_grid(
-                volume, view, int(idx), aff.M_canvas_to_src, aff.canvas_h, aff.canvas_w, binary_mask=False,
-            )
-            return image_full, image_canvas
-        return image_full, None
-
     native_image = get_native_view_image(volume, view, int(idx))
     image_full = warp_image(native_image, aff.M_src_to_out, aff.out_w, aff.out_h)
     if shared_full_canvas:
@@ -571,18 +300,6 @@ def render_full_and_optional_canvas(volume: np.ndarray, mask: np.ndarray, view: 
         and int(aff.out_h) == int(aff.canvas_h)
         and np.array_equal(aff.M_out_to_src, aff.M_canvas_to_src)
     )
-    if view.family == "tilted_transverse":
-        img_full = render_tilted_on_grid(volume, view, idx, aff.M_out_to_src, aff.out_h, aff.out_w, binary_mask=False)
-        mask_full = render_tilted_on_grid(mask, view, idx, aff.M_out_to_src, aff.out_h, aff.out_w, binary_mask=True)
-        img_canvas: Optional[np.ndarray] = None
-        mask_canvas: Optional[np.ndarray] = None
-        if shared_full_canvas:
-            img_canvas, mask_canvas = img_full, mask_full
-        elif need_canvas:
-            img_canvas = render_tilted_on_grid(volume, view, idx, aff.M_canvas_to_src, aff.canvas_h, aff.canvas_w, binary_mask=False)
-            mask_canvas = render_tilted_on_grid(mask, view, idx, aff.M_canvas_to_src, aff.canvas_h, aff.canvas_w, binary_mask=True)
-        return img_full, mask_full, img_canvas, mask_canvas
-
     img_native, mask_native = get_native_view_frame(volume, mask, view, idx)
     img_full, mask_full = warp_pair(img_native, mask_native, aff.M_src_to_out, aff.out_w, aff.out_h)
     img_canvas = mask_canvas = None
@@ -977,19 +694,10 @@ def render_plan_frame_source(*, volume: np.ndarray, mask: np.ndarray, plan: Rend
 
 
 def get_native_view_mask(mask: np.ndarray, view: ViewInfo, idx: int) -> np.ndarray:
-    i = int(idx)
+    """Native CPR categorical cross-section; every other family renders through ``shared_view``."""
     if view.family == "cpr" and view.cpr_geometry is not None:
-        return render_cpr_frame(mask, view.cpr_geometry, i, categorical=True)
-    if view.family == "transverse":
-        return np.asarray(mask[i])
-    if view.family == "sagittal":
-        return np.ascontiguousarray(mask[:, i, :])
-    if view.family == "coronal":
-        return np.ascontiguousarray(mask[:, :, i])
-    if view.family == "azimuthal":
-        sampler = get_azimuthal_sampler(view, float(view.azimuths_deg[i]))
-        return azimuthal_extract_lanczos(mask, sampler, binary_mask=True)
-    raise ValueError(f"Native mask frame for {view.family} requires a dedicated renderer")
+        return render_cpr_frame(mask, view.cpr_geometry, int(idx), categorical=True)
+    raise ValueError(f"Native mask frame for {view.family} requires a canonical shared view")
 
 
 def warp_mask_only(native_mask: np.ndarray, M: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
@@ -1026,13 +734,6 @@ def render_plan_frame_mask_source(*, mask: np.ndarray, plan: RenderPlan, idx: in
         and int(aff.out_h) == int(aff.canvas_h)
         and np.array_equal(aff.M_out_to_src, aff.M_canvas_to_src)
     )
-    if view.family == "tilted_transverse":
-        mask_full = render_tilted_on_grid(mask, view, int(idx), aff.M_out_to_src, aff.out_h, aff.out_w, binary_mask=True)
-        if shared_full_canvas:
-            return mask_full, mask_full
-        if need_canvas:
-            return mask_full, render_tilted_on_grid(mask, view, int(idx), aff.M_canvas_to_src, aff.canvas_h, aff.canvas_w, binary_mask=True)
-        return mask_full, None
     native = get_native_view_mask(mask, view, int(idx))
     mask_full = warp_mask_only(native, aff.M_src_to_out, aff.out_w, aff.out_h)
     if shared_full_canvas:
@@ -1044,7 +745,6 @@ def render_plan_frame_mask_source(*, mask: np.ndarray, plan: RenderPlan, idx: in
 
 __all__ = [
     "AffineSpec",
-    "ChannelFormat",
     "ChannelVariant",
     "DEFAULT_CHANNEL_VARIANT",
     "RenderFrameSource",

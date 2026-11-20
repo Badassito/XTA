@@ -17,7 +17,6 @@ def case(tmp_path, monkeypatch):
     coordinator.configure_workers([0, 2])
     coordinator.set_inference_asset_retirement_pending(True)
     monkeypatch.setattr(backprojection, 'gpu_worker_aux_interpolation_pool', lambda: None)
-    monkeypatch.setattr(backprojection, 'v1613_d1_backprojection_overlap_enabled', lambda: True)
     torch = SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 3, mem_get_info=mock.Mock()),
                             device=lambda value: value)
     state, aux, notifications = _ready_state(), _AuxPool(), []
@@ -44,7 +43,7 @@ def test_partial_ready_device_can_boot_and_keep_residency_across_other_ack(case)
     before_counts = (c.state.gpu_worker_results_collected, dict(c.state.gpu_worker_compute_completed_by_id))
     c.scheduler.process_one_worker_result(_ack(0, c.commands[0]))
     assert c.state.gpu_inference_asset_release_pending_by_worker == {2: c.commands[2]['task_id']}
-    assert len(c.notifications) == 1 and c.notifications[0].authenticated
+    assert len(c.notifications) == 1 and type(c.notifications[0]) is backprojection.GpuInferenceAssetsRetired
     with pytest.raises(FrozenInstanceError):
         c.notifications[0].device_index = 2
     assert c.coordinator.try_acquire_specific_stage(c.torch, 2, 'TTA persistent SAM interpolation predictor') is None
@@ -74,14 +73,15 @@ def test_partial_ready_device_can_boot_and_keep_residency_across_other_ack(case)
     c.announce.assert_called_once()
 
 
-def test_duplicate_ack_notifies_once_and_changed_frozen_proof_is_rejected(case):
+def test_duplicate_ack_notifies_once_and_conflicting_proof_is_rejected(case):
     c = case
     message = _ack(0, c.commands[0])
     c.scheduler.process_one_worker_result(message)
     c.scheduler.process_one_worker_result(message)
     assert len(c.notifications) == 1
-    with pytest.raises(RuntimeError, match='authenticated'):
-        c.coordinator.mark_inference_assets_retired(replace(c.notifications[0], device_index=2))
+    c.coordinator.mark_inference_assets_retired(replace(c.notifications[0]))
+    with pytest.raises(RuntimeError, match='Conflicting'):
+        c.coordinator.mark_inference_assets_retired(replace(c.notifications[0], control_task_id=-999))
     assert c.coordinator.snapshot()['retired_inference_devices'] == [0]
 
 
@@ -132,7 +132,7 @@ def test_mark_requires_global_drain_and_retains_existing_stage_tokens():
     coordinator = backprojection._MainProcessGpuStageCoordinator()
     coordinator.configure_workers([0, 2])
     assert coordinator.begin_inference(2)
-    proof = backprojection._make_gpu_inference_assets_retired_proof(0, -1, coordinator.current_epoch())
+    proof = backprojection.GpuInferenceAssetsRetired(0, -1, coordinator.current_epoch())
     coordinator.set_inference_asset_retirement_pending(True)
     with pytest.raises(RuntimeError, match='sealed global'):
         coordinator.mark_inference_assets_retired(proof)
@@ -158,14 +158,21 @@ def test_inference_queue_window_remains_available_before_retirement():
     assert coordinator.snapshot()['inference_inflight'] == {0: 2}
 
 
-def test_proof_subclass_cannot_claim_its_own_authentication():
+def test_proof_subclass_is_rejected():
     class Untrusted(backprojection.GpuInferenceAssetsRetired):
-        @property
-        def authenticated(self):
-            return True
+        pass
     coordinator = backprojection._MainProcessGpuStageCoordinator()
     coordinator.configure_workers([0])
     coordinator.set_inference_asset_retirement_pending(True)
-    with pytest.raises(RuntimeError, match='authenticated'):
+    with pytest.raises(RuntimeError, match='GpuInferenceAssetsRetired proof'):
         coordinator.mark_inference_assets_retired(Untrusted(0, -1, coordinator.current_epoch()))
     assert not coordinator.snapshot()['retired_inference_devices']
+
+
+@pytest.mark.parametrize('identity', [(-1, -1, 0), (True, -1, 0), (0, 0, 0), (0, -1, -1), (0, -1, 1.0)])
+def test_every_proof_construction_validates_its_identity(identity):
+    with pytest.raises(RuntimeError, match='Invalid GPU asset-retirement identity'):
+        backprojection.GpuInferenceAssetsRetired(*identity)
+    valid = backprojection.GpuInferenceAssetsRetired(0, -1, 0)
+    with pytest.raises(RuntimeError, match='Invalid GPU asset-retirement identity'):
+        replace(valid, **dict(zip(('device_index', 'control_task_id', 'coordinator_epoch'), identity)))

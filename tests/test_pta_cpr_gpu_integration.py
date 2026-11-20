@@ -273,6 +273,31 @@ def test_nearest_affine_dispatch_ties_and_random_properties_match_opencv():
         assert len(cache) <= 4
 
 
+@pytest.mark.parametrize("imgsz,tile,stride", [(640, 576, 512), (640, 288, 256), (640, 448, 384), (18, 14, 4)])
+def test_categorical_tile_resize_matches_cpu_publisher_on_cpu(tmp_path, imgsz, tile, stride):
+    torch = pytest.importorskip("torch")
+    from XTA.pta_rendering import extract_padded_tile, resize_centered, warp_mask_only
+
+    plan = real_plan(tmp_path, side=imgsz, tile_config=pta.TileConfig(tile, stride, f"t{tile}s{stride}"))
+    geometry = plan.view.cpr_geometry
+    native = np.ascontiguousarray(
+        np.random.default_rng(9).random((geometry.height, geometry.width)) < .5, dtype=np.uint8)
+    aff = plan.aff
+    canvas = warp_mask_only(native, aff.M_src_to_canvas, aff.canvas_w, aff.canvas_h)
+    resized = 0
+    for item in plan.tile_layout:
+        expected = resize_centered(extract_padded_tile(canvas, item.x, item.y, tile),
+                                   item.out_w, item.out_h, cv2.INTER_NEAREST)
+        actual = masks._cpr_item_from_native(torch.from_numpy(native), plan, item.tile_tag,
+                                             torch=torch, categorical=True)
+        np.testing.assert_array_equal(actual.numpy(), expected)
+        resized += int((item.out_h, item.out_w) != (tile, tile))
+    assert resized > 0
+    xs, ys = masks._cpr_tile_resize_indices(torch, tile, imgsz, imgsz, torch.device("cpu"))
+    assert xs.dtype == torch.int64 and ys.dtype == torch.int64
+    assert masks._cpr_tile_resize_indices(torch, tile, imgsz, imgsz, torch.device("cpu"))[0] is xs
+
+
 def test_joined_generation_change_releases_strong_geometry_keys(tmp_path):
     plan, _source, _mask, runtime, _owner = fixture(tmp_path)
     geometry = plan.view.cpr_geometry
@@ -354,14 +379,15 @@ def real_cuda_runtime(monkeypatch):
     torch.cuda.synchronize()
 
 
-def real_plan(tmp_path, *, channel="gray", side=32, tiles=True):
+def real_plan(tmp_path, *, channel="gray", side=32, tiles=True, tile_config=None):
     geometry = build_cpr_geometry(np.array([[4, 14.5, 17.5], [40, 28.5, 30.5]]),
                                   (48, 48, 48), raster_size=side)
     view = pta.ViewInfo("cpr", "CPR", "cpr", geometry.num_slices, side, side, "clamp",
                         48, 48, 48, cpr_geometry=geometry)
     variant = pta.expand_channel_variants(pta.resolve_channel_formats(channel))[0]
+    tile_config = pta.TileConfig(20, 17, "t20s17") if tile_config is None else tile_config
     return pta.build_plans_for_views(
-        views=[view], out_dir=tmp_path, stem="tube", tile_configs=([pta.TileConfig(20, 17, "t20s17")] if tiles else []),
+        views=[view], out_dir=tmp_path, stem="tube", tile_configs=([tile_config] if tiles else []),
         save_overlay=False, imgsz=side, label_enabled=True, channel_variants=(variant,),
         publish_images=False, publish_labels=False,
     )[0]
@@ -370,9 +396,11 @@ def real_plan(tmp_path, *, channel="gray", side=32, tiles=True):
 @REAL_CUDA
 @pytest.mark.parametrize("channel", ["gray", "rgb", "C3S1"])
 @pytest.mark.parametrize("native_t", [False, True])
-def test_real_cuda_threaded_full_tile_coverage_matches_cpu(tmp_path, real_cuda_runtime, channel, native_t):
+@pytest.mark.parametrize("side,tile_config", [(32, None), (18, pta.TileConfig(14, 4, "t14s4"))])
+def test_real_cuda_threaded_full_tile_coverage_matches_cpu(tmp_path, real_cuda_runtime, channel, native_t,
+                                                            side, tile_config):
     runtime = real_cuda_runtime
-    plan = real_plan(tmp_path, channel=channel)
+    plan = real_plan(tmp_path, channel=channel, side=side, tile_config=tile_config)
     rng = np.random.default_rng(812)
     native = rng.integers(0, 256, (24 if native_t else 48, 48, 48), dtype=np.uint8)
     source = (pta.shared_media.resize_volume_to_processing_cube_gray8(
@@ -492,9 +520,10 @@ def test_real_cuda_delayed_consumer_survives_native_lru_eviction_and_allocator_c
 
 
 @REAL_CUDA
-@pytest.mark.parametrize("side,save_images", [(32, True), (32, False), (2048, True)])
+@pytest.mark.parametrize("side,save_images,single_call",
+                         [(32, True, False), (32, False, False), (2048, True, False), (32, True, True)])
 def test_real_cuda_controller_publishes_jpeg_labels_and_semantics_without_cpu_reslices(
-        tmp_path, real_cuda_runtime, monkeypatch, side, save_images):
+        tmp_path, real_cuda_runtime, monkeypatch, side, save_images, single_call):
     runtime = real_cuda_runtime
     torch = runtime["torch"]
     plan = real_plan(tmp_path, side=side, tiles=False)
@@ -510,19 +539,25 @@ def test_real_cuda_controller_publishes_jpeg_labels_and_semantics_without_cpu_re
     class IdentityPolicy:
         supports_cuda_sources = True
         supports_cuda_masks = True
-        mask_independent_geometry = True
+        # A single-call policy warps coverage as extra_masks instead of a replay.
+        mask_independent_geometry = not single_call
+        supports_extra_masks = single_call
         calls = 0
 
-        def apply_batch_many(self, *, images, masks, seeds, output_size):
+        def apply_batch_many(self, *, images, masks, seeds, output_size, extra_masks=None):
             self.calls += 1
             assert all(image.is_cuda for image in images)
             assert all(mask.is_cuda for mask in masks)
-            result_images, result_masks = [], []
-            for image, mask, item_seeds in zip(images, masks, seeds):
+            result_images, result_masks, result_extras = [], [], []
+            for index, (image, mask, item_seeds) in enumerate(zip(images, masks, seeds)):
                 for _seed in item_seeds:
                     result_images.append(image[None] if image.ndim == 2 else image.permute(2, 0, 1))
                     result_masks.append(mask)
-            return torch.stack(result_images), torch.stack(result_masks)
+                    if extra_masks is not None:
+                        result_extras.append(extra_masks[index])
+            if extra_masks is None:
+                return torch.stack(result_images), torch.stack(result_masks)
+            return torch.stack(result_images), torch.stack(result_masks), torch.stack(result_extras)
 
     policy = IdentityPolicy()
     runtime.update(policy=policy, encoder=None, nvimgcodec=None, nvjpeg_code_streams=None,
@@ -541,7 +576,7 @@ def test_real_cuda_controller_publishes_jpeg_labels_and_semantics_without_cpu_re
           mock.patch.object(workers, "render_plan_frame_mask_source", side_effect=AssertionError("CPU mask reslice")),
           mock.patch.object(workers, "_render_semantic_coverage_item", side_effect=AssertionError("CPU coverage reslice"))):
         result = workers.execute_gpu_frame_batch_task(source, mask, [plan], task, coverage)
-    assert result[0] == 2 and policy.calls >= 2
+    assert result[0] == 2 and (policy.calls == 1 if single_call else policy.calls >= 2)
     assert result[2]["pta_cuda_cpr_projection_active"] == 1
     assert result[2]["pta_cuda_categorical_items"] >= 1
     assert "pta_cpu_categorical_items" not in result[2]

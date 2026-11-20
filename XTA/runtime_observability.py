@@ -150,7 +150,7 @@ class RuntimeTelemetry:
         else:
             base = os.environ.get('SLURM_JOB_ID') or str(os.getpid())
             self.path = Path(tempfile.gettempdir()) / (
-                f'gpt6-astra-ultra-v{SCRIPT_VERSION_COMPACT}-'
+                f'xta-v{SCRIPT_VERSION_COMPACT}-'
                 f'telemetry-{base}-{os.getpid()}.jsonl'
             )
         _LIVE_TELEMETRY.add(self)

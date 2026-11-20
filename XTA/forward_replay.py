@@ -105,8 +105,7 @@ def bind_worker_replay_source(source, task, render_path):
         job = task.get("job")
         if not is_dataclass(job) or not is_dataclass(task.get("view")):
             return
-        # Metadata files live in scalar-specific directories. Their paths do not render pixels.
-        rendering["job"] = {k:v for k,v in asdict(job).items() if k != "meta_path"}
+        rendering["job"] = asdict(job)
         rendering["backend"] = (type(source).__module__, type(source).__name__, str(render_path),
                                  str(getattr(engine, "_mode", "")))
         rendering["source"] = stamp
@@ -116,18 +115,6 @@ def bind_worker_replay_source(source, task, render_path):
         source._xta_forward_identity = _digest(rendering)
     except (TypeError, ValueError, AttributeError):
         return
-
-
-def bind_main_replay_source(ref, stamp, view, job, out_size):
-    """The in-process scalar scheduler has the same fixed geometric jobs as its workers."""
-    if not stamp:
-        return
-    bind_worker_replay_source(ref, dict(sweep_source_stamp=stamp, view=view, job=job,
-        job_id=ref.job_id, kind=ref.kind, out_size=out_size, channel_format=ref.channel_format,
-        slice_start=0, slice_count=view.num_slices), "main_cpu_renderer")
-    identity = getattr(ref, "_xta_forward_identity", None)
-    if identity is not None and ref.source is not None:
-        ref.source._xta_forward_identity = identity
 
 
 def _db(root):

@@ -54,7 +54,7 @@ def test_explicit_legacy_versions_keep_all_family_requirements(version):
     {'version': 6, 'allow_paired_seed_tracks': 1}, {'version': 6, 'kind': 'permissive'}])
 def test_branch_modes_cannot_waive_other_guards_or_reinterpret_legacy_receipts(settings):
     with pytest.raises(ValueError):
-        resolve_sam_bridge_policy({'sam_bridge_policy': settings}, environ={})
+        resolve_sam_bridge_policy({'sam_bridge_policy': settings})
 
 
 def test_parent_can_qualify_one_daughter_without_every_terminal_passing():
@@ -98,10 +98,9 @@ def test_explicit_branch_policy_rejects_run_only_custom_hooks():
     assert legacy['branch_aware_selection'] is False
 
 
-def test_replay_variants_keep_legacy_reference_and_make_anchor_ablation_explicit(monkeypatch):
+def test_replay_variants_keep_legacy_reference_and_make_anchor_ablation_explicit():
     from tools.replay_sam_branch_policies import variant_policy
-    monkeypatch.setenv('YOLO_TTA_SAM_TIGHT_CROP_GUARD', 'invalid-for-unpinned-caller')
-    old = resolve_sam_bridge_policy({'sam_bridge_policy': {'version': 2}}, environ={})
+    old = resolve_sam_bridge_policy({'sam_bridge_policy': {'version': 2}})
     legacy = variant_policy('legacy', generation_mode='whole', max_group_bytes=123456, original=old)
     assert legacy['version'] == 2 and legacy['branch_aware_selection'] is False
     anchor = variant_policy('anchor_context', generation_mode='whole', max_group_bytes=123456)
@@ -120,8 +119,8 @@ def test_branch_helper_identity_changes_policy_hash_without_changing_selected_pi
     group, masks, raw = _single_edge()
     bundle = _bundle(tmp_path, group, masks, [(_run('F'), raw)])
     original = select_sam_proposals(bundle, _policy())
-    # Substitute only the exported semantic identity; helper numerics and their
-    # file-integrity guards stay intact, isolating the public hash dependency.
+    # Substitute only the exported semantic identity; helper numerics stay
+    # intact, isolating the public hash dependency.
     surrogate = types.ModuleType(sam_branch_selection.__name__)
     surrogate.__dict__.update(sam_branch_selection.__dict__)
     surrogate.IMPLEMENTATION_SHA256 = 'different-qualified-helper-identity'
@@ -132,10 +131,45 @@ def test_branch_helper_identity_changes_policy_hash_without_changing_selected_pi
     assert changed['policy_hash'] != original['policy_hash']
 
 
-def test_default_only_legacy_contract_fallback_records_actual_quality_version(tmp_path, monkeypatch):
+def test_v26_0_1_branch_recipe_stays_readable_with_tracked_attachment_semantics(tmp_path):
+    from copy import deepcopy
+    from XTA import sam_branch_selection
+    from XTA.sam_evidence import fingerprint
+    from XTA.sam_mask_reader import effective_candidate_mask
+    from XTA.sam_policy import select_sam_proposals
+    from tests.test_sam_branch_selection_adversarial import _single_edge, _bundle, _run, _policy
+    previous = 'b7131c1e76e3a557354a8f7c3181233d669ad203751936d0a518174e94b27ce1'  # v24.1.1-v26.0.1
+    assert sam_branch_selection._QUALIFIED_PACKED_OWNER_IMPLEMENTATIONS[previous] == 'tracked_known'
+    assert previous != sam_branch_selection.IMPLEMENTATION_SHA256
+    group, masks, raw = _single_edge()
+    bundle = _bundle(tmp_path, group, masks, [(_run('F'), raw)])
+    receipt = select_sam_proposals(bundle, _policy())
+
+    def stamped(identity, *, drop_tracked=False):
+        historical = deepcopy(receipt)
+        recipe = historical['branch_selection']
+        recipe['implementation_sha256'] = identity
+        if drop_tracked:
+            for record in recipe['edges'].values():
+                record.pop('tracked_known_support', None)
+        recipe['sha256'] = fingerprint({key: value for key, value in recipe.items() if key != 'sha256'})
+        return historical
+    historical = stamped(previous)
+    assert sam_branch_selection.validate_branch_selection(historical, bundle,
+        mask_filter_sha256=historical['mask_filter']['sha256']) is not None
+    assert (effective_candidate_mask(bundle, 'F', 2, historical)
+            == effective_candidate_mask(bundle, 'F', 2, receipt)).all()
+    with pytest.raises(ValueError, match='tracked observed-attachment proof'):
+        sam_branch_selection.validate_branch_selection(stamped(previous, drop_tracked=True), bundle,
+            mask_filter_sha256=historical['mask_filter']['sha256'])
+    with pytest.raises(ValueError, match='implementation, evidence or radius filter differs'):
+        sam_branch_selection.validate_branch_selection(stamped('0' * 64), bundle,
+            mask_filter_sha256=historical['mask_filter']['sha256'])
+
+
+def test_default_only_legacy_contract_fallback_records_actual_quality_version(tmp_path):
     from XTA.sam_policy import select_sam_proposals
     from tests.test_sam_tight_crop_guard import _growing_bundle
-    monkeypatch.delenv('YOLO_TTA_SAM_TIGHT_CROP_GUARD', raising=False)
     bundle = _growing_bundle(tmp_path)
     receipt = select_sam_proposals(bundle)
     assert receipt['resolved_policy']['version'] == 4
@@ -169,8 +203,8 @@ def test_historical_radius_receipt_flag_does_not_claim_modern_edge_geometry(tmp_
 @pytest.mark.parametrize('mode,version', [('whole', 2), ('tiled', 3), ('whole', 4), ('tiled', 5),
     ('whole', 6), ('tiled', 7)])
 def test_numeric_string_versions_keep_their_original_version_defaults(mode, version):
-    string = resolve_sam_bridge_policy({'sam_bridge_policy': {'version': str(version)}}, generation_mode=mode, environ={})
-    numeric = resolve_sam_bridge_policy({'sam_bridge_policy': {'version': version}}, generation_mode=mode, environ={})
+    string = resolve_sam_bridge_policy({'sam_bridge_policy': {'version': str(version)}}, generation_mode=mode)
+    numeric = resolve_sam_bridge_policy({'sam_bridge_policy': {'version': version}}, generation_mode=mode)
     assert string == numeric
     assert isinstance(string['version'], int)
 

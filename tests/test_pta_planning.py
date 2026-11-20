@@ -144,3 +144,28 @@ def test_cpr_geometry_passes_through_without_canonical_builtin_plan(tmp_path):
     assert plan.canonical_plan is None
     assert all(tile.canonical_plan is None and tile.shared_job is None for tile in plan.tile_layout)
     assert tuple(planning.render_plan_frame_indices(plan)) == tuple(range(geometry.num_slices))
+
+
+def test_native_cpu_rendering_serves_only_cpr_views():
+    geometry = build_cpr_geometry(np.array([[1, 2, 3], [4, 2, 3]]), (6, 5, 7), raster_size=9)
+    cpr = _view(name="cpr_000", display_name="cpr_000", family="cpr",
+                num_slices=geometry.num_slices, src_h=geometry.width,
+                src_w=geometry.width, cpr_geometry=geometry)
+    volume = np.arange(6 * 5 * 7, dtype=np.uint8).reshape(6, 5, 7)
+    mask = (volume % 3 == 0).astype(np.uint8)
+    image, labels = rendering.get_native_view_frame(volume, mask, cpr, 1)
+    np.testing.assert_array_equal(image, rendering.get_native_view_image(volume, cpr, 1))
+    np.testing.assert_array_equal(labels, rendering.get_native_view_mask(mask, cpr, 1))
+
+    # Built-in families render only through ``shared_view``; a view without
+    # one fails with a typed error instead of reaching a retired CPU renderer.
+    aff = planning.build_affine(7, 5, 0.0, "clamp", 0)
+    for family in ("transverse", "azimuthal", "tilted_transverse"):
+        legacy = _view(family=family, azimuths_deg=(0.0,) * 6, tilt_direction="vertical")
+        for render in (
+            lambda: rendering.get_native_view_frame(volume, mask, legacy, 0),
+            lambda: rendering.render_image_full_and_optional_canvas(volume, legacy, 0, aff, True),
+            lambda: rendering.render_full_and_optional_canvas(volume, mask, legacy, 0, aff, True),
+        ):
+            with pytest.raises(ValueError, match="requires a canonical shared view"):
+                render()

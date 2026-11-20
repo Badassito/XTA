@@ -145,29 +145,6 @@ def test_corrupted_closure_and_unbounded_address_records_are_explicit():
     assert "cyclic_frame_address_record_limit" in plan.reasons
 
 
-def test_cyclic_source_change_after_import_is_rejected_at_plan_boundaries(tmp_path,monkeypatch):
-    # Per-address helpers are I/O free (GIL convoy fix); the source identity is
-    # enforced where cyclic plans, evidence, selections and publications begin/end.
-    from XTA import sam_cyclic
-    original=sam_cyclic._SOURCE_PATH
-    changed=tmp_path/"changed_cyclic.py"
-    changed.write_bytes(original.read_bytes()+b"\n# changed after import\n")
-    monkeypatch.setattr(sam_cyclic,"_SOURCE_PATH",changed)
-    assert address_for_unfolded_index(8,8)["cycle_index"]==1
-    with pytest.raises(ValueError,match="schema"):
-        validate_cyclic_frame_addressing({})
-    with pytest.raises(RuntimeError,match="changed after loading"):
-        sam_cyclic.assert_cyclic_implementation_unchanged()
-    with pytest.raises(RuntimeError,match="changed after loading"):
-        build_cyclic_frame_addressing((8,15,27),2)
-    with pytest.raises(RuntimeError,match="changed after loading"):
-        CyclicObservationVolume(_source(),2)
-    with pytest.raises(RuntimeError,match="changed after loading"):
-        sam_cyclic.ExtrapolationCyclicObservationVolume(_source(),2)
-    with pytest.raises(RuntimeError,match="changed after loading"):
-        _plan(_source(),wrap_axis=True)
-
-
 def test_same_name_shape_changed_sampler_cannot_reuse_a_prepared_detector_snapshot(tmp_path):
     from XTA.geometry import ViewInfo
     view=ViewInfo(name="azimuthal_transverse",physical_view_name="azimuthal_transverse",

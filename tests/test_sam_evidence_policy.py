@@ -7,9 +7,9 @@ import sys
 import numpy as np
 import pytest
 
-from XTA.sam_evidence import SamEvidenceBundle, SamEvidenceWriter, export_sam_evidence, iter_selected_planes
-from XTA.sam_policy import (SamRegenerationRequired, measure_family_agreement,
-                            select_sam_proposals, replay_sam_proposals)
+from XTA.sam_evidence import (SamEvidenceBundle, SamEvidenceWriter, export_sam_evidence, iter_selected_planes,
+                              iter_selected_native_crops)
+from XTA.sam_policy import SamRegenerationRequired, measure_family_agreement, select_sam_proposals
 from XTA.sam_filtering import effective_candidate_mask, effective_raw_mask
 from XTA.reconciliation_policy import validate_policy
 
@@ -130,16 +130,15 @@ def test_portable_roundtrip_and_identical_replay_no_model_import(tmp_path):
     shutil.rmtree(bundle.directory)
     reopened = SamEvidenceBundle.open(exported)
     before = set(sys.modules)
-    offline = replay_sam_proposals(reopened, tmp_path / "replay",
+    offline = select_sam_proposals(reopened,
         upstream_fingerprints={"detector_inputs": "same", "parent_bridge": "gateA"})
     assert offline["selected_run_ids"] == online["selected_run_ids"]
     assert offline["policy_hash"] == online["policy_hash"]
     assert not any("sam3" in name or "ultralytics" in name for name in set(sys.modules) - before)
     assert offline["dependencies"]["current_snapshot_verified"]
     assert not online["dependencies"]["fresh_pipeline_equivalent"]
-    packed = np.load(tmp_path / "replay" / "selected_planes.npz")
-    row = next(v for v in offline["replay_outputs"]["packed_plane_index"] if v["direction"] == "forward" and v["native_frame"] == 1)
-    plane = np.unpackbits(packed[row["key"]], bitorder="little", count=12*16).reshape(12, 16)
+    plane = next(mask for _, _, native_frame, _, mask in iter_selected_native_crops(reopened, offline, direction="forward")
+                 if native_frame == 1)
     assert np.array_equal(plane, raw[1])
 
 
@@ -162,24 +161,14 @@ def test_empty_saved_snapshot_cannot_claim_fresh_pipeline_equivalence(tmp_path):
     assert not receipt["dependencies"]["fresh_pipeline_equivalent"]
 
 
-def test_loaded_policy_source_mutation_cannot_mislabel_old_code_with_new_hash(tmp_path, monkeypatch):
-    import XTA.sam_policy as module
+def test_selection_records_the_loaded_cyclic_identity(tmp_path):
+    from XTA import sam_cyclic, sam_policy
+    assert sam_policy._CYCLIC_IMPLEMENTATION_SHA256 == sam_cyclic.IMPLEMENTATION_SHA256
     group, masks, raw = fixture_group()
     bundle = build_bundle(tmp_path, [(fixture_run("F", group), raw)], group=group, masks=masks)
-    monkeypatch.setattr(module, "_policy_source_sha256", lambda: "changed_source")
-    with pytest.raises(RuntimeError, match="implementation changed after loading"):
-        select_sam_proposals(bundle)
-
-
-def test_policy_source_mutation_during_callback_stops_before_selection_publication(tmp_path, monkeypatch):
-    import XTA.sam_policy as module
-    group, masks, raw = fixture_group()
-    bundle = build_bundle(tmp_path, [(fixture_run("F", group), raw)], group=group, masks=masks)
-    def callback(context):
-        monkeypatch.setattr(module, "_policy_source_sha256", lambda: "changed_during_selection")
-        return ["F"]
-    with pytest.raises(RuntimeError, match="implementation changed after loading"):
-        select_sam_proposals(bundle, {"proposal_api_version": 1, "select_proposals": callback})
+    receipt = select_sam_proposals(bundle)
+    assert receipt["cyclic_quality_implementation_sha256"] == sam_cyclic.IMPLEMENTATION_SHA256
+    assert receipt["policy_implementation_sha256"] == sam_policy._POLICY_IMPLEMENTATION_SHA256
 
 
 def test_corruption_and_readonly_masks(tmp_path):
@@ -205,10 +194,6 @@ def test_incomplete_publication_cannot_be_replayed_as_successfully_empty(tmp_pat
         bundle = writer.commit(complete=False)
     with pytest.raises(ValueError, match="publication is incomplete"):
         select_sam_proposals(bundle, {"sam_bridge_policy": "permissive"})
-    assert not (tmp_path / "never_publish").exists()
-    with pytest.raises(ValueError, match="publication is incomplete"):
-        replay_sam_proposals(bundle, tmp_path / "never_publish")
-    assert not (tmp_path / "never_publish").exists()
 
 
 def test_incomplete_and_terminal_reinjection_unwaivable(tmp_path):

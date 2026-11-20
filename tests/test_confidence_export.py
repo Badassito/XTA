@@ -23,13 +23,14 @@ def brute_pool(native, mask, target_shape):
     target_t, target_h, target_w = target_shape
     area = source_h >= target_h and source_w >= target_w
     result = np.zeros(target_shape, np.uint8)
+    # Growing axes take the source cell containing the output cell center.
     for z in range(target_t):
-        zs = range(math.floor(z*source_t/target_t), math.ceil((z+1)*source_t/target_t)) if source_t >= target_t else (round(z*(source_t-1)/(target_t-1)),)
+        zs = range(math.floor(z*source_t/target_t), math.ceil((z+1)*source_t/target_t)) if source_t >= target_t else (((2*z+1)*source_t)//(2*target_t),)
         for y in range(target_h):
-            y0 = math.floor(y*source_h/target_h)
+            y0 = math.floor(y*source_h/target_h) if area else ((2*y+1)*source_h)//(2*target_h)
             y1 = math.ceil((y+1)*source_h/target_h) if area else y0+1
             for x in range(target_w):
-                x0 = math.floor(x*source_w/target_w)
+                x0 = math.floor(x*source_w/target_w) if area else ((2*x+1)*source_w)//(2*target_w)
                 x1 = math.ceil((x+1)*source_w/target_w) if area else x0+1
                 if mask[z,y,x]:
                     result[z,y,x] = max(int(native[k,y0:y1,x0:x1].max()) for k in zs)
@@ -54,7 +55,8 @@ class Crops:
                 yield y0,y1,x0,x1,self.values[z,y0:y1,x0:x1]
 
 
-@pytest.mark.parametrize("source_shape,target_shape", [((5,9,13),(3,5,7)), ((2,3,11),(4,4,4)), ((1,8,8),(4,4,4))])
+@pytest.mark.parametrize("source_shape,target_shape", [((5,9,13),(3,5,7)), ((2,3,11),(4,4,4)), ((1,8,8),(4,4,4)),
+                                                       ((3,4,5),(10,6,8))])
 def test_pooling_matches_independent_global_footprints_for_crops_and_blocks(source_shape,target_shape):
     values = np.random.default_rng(42).integers(0,201,source_shape,dtype=np.uint8)
     mask = np.ones(target_shape,np.uint8)

@@ -46,7 +46,7 @@ version = {attr = "XTA.__version__"}
 "share/xta" = [
   "README.md",
   "ARCHITECTURE.md",
-  "Opus-5.5_v26.0.1_SLURM.py",
+  "Opus-5.5_v26.0.2_SLURM.py",
 ]
 "share/xta/docs" = ["docs/*.md"]
 "share/xta/tools/slicer" = ["tools/slicer/*.py"]

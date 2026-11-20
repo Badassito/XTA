@@ -13,12 +13,11 @@ import numpy as np
 from XTA.geometry import expand_views_into_tta_variants, get_view_infos
 from XTA.lta_rendering import (
     LtaPhysicalViewCacheRef,
-    build_lta_rendered_view,
-    implicit_rgb,
     render_native_tile_window,
     union_tile_chunk_into_view,
 )
 from XTA.runtime import close_memmap_array
+from tests.reference_backends.lta_rendering import build_lta_rendered_view, implicit_rgb
 
 
 class LtaRenderingTests(unittest.TestCase):
@@ -303,7 +302,6 @@ class LtaRenderingTests(unittest.TestCase):
             rendered = build_lta_rendered_view(
                 volume,
                 runtime,
-                temp_dir=Path(temp_dir),
                 output_size=4,
             )
             frame = rendered.render_frame_rgb(1)

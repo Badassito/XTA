@@ -24,21 +24,17 @@ from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple, cas
 
 import numpy as np
 
-from .experimental_features import (
-    d1_owner_group_size_limit as configured_d1_owner_group_size_limit,
-    d1_owner_groups_requested as configured_d1_owner_groups_requested,
-)
+from .env_flags import env_flag
 from .geometry import ViewInfo
 from .cylindrical_owner import is_radial_owner_task
 from .runtime import _MemfdTransferBatch, runtime_trace_event
 from .scheduler_diagnostics import scheduler_operation, scheduler_step
-from .backprojection import GpuInferenceAssetsRetired, _make_gpu_inference_assets_retired_proof
+from .backprojection import GpuInferenceAssetsRetired
 
 
 def _spherical_pacing_enabled() -> bool:
     """YOLO_TTA_SPHERICAL_PACING=0 restores largest-remaining-first exactly."""
-    return os.environ.get('YOLO_TTA_SPHERICAL_PACING', '1').strip().lower() not in (
-        '0', 'false', 'no', 'off')
+    return env_flag('YOLO_TTA_SPHERICAL_PACING', True)
 
 
 _SELECTION_KEY_UNSET = object()
@@ -229,10 +225,8 @@ class TtaSchedulerInputs:
     interpolation_distance: int
     min_conf: float
     min_radius: float
-    keep_temp_artifacts: bool
     dense_tiling_active: bool
     nrrd_layers_needed: bool
-    direct_union_sparse_retirement_active: bool
     direct_union_inference_view_limit: int
     direct_union_inference_byte_limit: int
     direct_union_total_dense_byte_limit: int
@@ -248,6 +242,8 @@ class TtaSchedulerInputs:
     hybrid_deferred_result_mode: str
     request_baseline_workspaces: Optional[Callable[[Dict[str, object]], bool]] = None
     drain_baseline_workspaces: Optional[Callable[[], None]] = None
+    d1_owner_groups_requested: bool = False
+    d1_owner_group_size_limit: int = 8
 
 
 @dataclass(frozen=True)
@@ -663,7 +659,7 @@ class TtaScheduler:
         return int(main_bytes + compact_padding_bytes + grouped_result_bytes) * int(policy_factor)
 
     def tile_dense_result_task_admissible(self, task: Dict[str, object]) -> bool:
-        if bool(self.inputs.keep_temp_artifacts) or str(task.get('kind', '')) != 'tile':
+        if str(task.get('kind', '')) != 'tile':
             return True
         task_id = int(task.get('task_id', -1))
         if task_id in self.state.gpu_worker_tile_dense_result_reservations:
@@ -702,7 +698,7 @@ class TtaScheduler:
         return 1 if self.tile_parent_mask_ready_for_task(task) else 2
 
     def reserve_tile_dense_result_task(self, task: Dict[str, object]) -> bool:
-        if bool(self.inputs.keep_temp_artifacts) or str(task.get('kind', '')) != 'tile':
+        if str(task.get('kind', '')) != 'tile':
             return False
         task_id = int(task.get('task_id', -1))
         if task_id < 0 or task_id in self.state.gpu_worker_tile_dense_result_reservations:
@@ -735,7 +731,7 @@ class TtaScheduler:
         the parent mapping until sparse retirement also prevents asynchronous D2H publication
         from outliving its backing object.
         """
-        if (bool(self.inputs.keep_temp_artifacts) or str(task.get('kind', '')) != 'tile'
+        if (str(task.get('kind', '')) != 'tile'
                 or bool(task.get('augmentation_pass_tasks'))):
             # Policy siblings use independent file backings under one N-way byte reservation.
             return
@@ -894,7 +890,7 @@ class TtaScheduler:
                     cleanup_paths.add(Path(backing))
                 is_memfd = self.operations._memfd_owner_key_from_array(mm) is not None
                 unlink_path = (
-                    Path(backing) if not is_memfd and not bool(self.inputs.keep_temp_artifacts)
+                    Path(backing) if not is_memfd
                     and backing is not None and Path(backing).suffix.lower() == '.dat'
                     and self.operations._path_is_relative_to(Path(backing), self.inputs.gpu_worker_result_dir)
                     else None
@@ -910,21 +906,20 @@ class TtaScheduler:
                     pass
             mm = None
             workspaces = None
-        if not bool(self.inputs.keep_temp_artifacts):
-            # Also remove a fallback pathname that may have been created before a memfd
-            # handoff or survived a worker-side error. The guard keeps cleanup confined to
-            # this run's non-resumable GPU result directory.
-            for cleanup_path in cleanup_paths:
-                try:
-                    if cleanup_path.resolve(strict=False) in retired_backings:
-                        continue
-                    if (
-                        (cleanup_path.suffix.lower() == '.dat' or cleanup_path.name.endswith('.dat.seam'))
-                        and self.operations._path_is_relative_to(cleanup_path, self.inputs.gpu_worker_result_dir)
-                    ):
-                        cleanup_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
+        # Also remove a fallback pathname that may have been created before a memfd
+        # handoff or survived a worker-side error. The guard keeps cleanup confined to
+        # this run's non-resumable GPU result directory.
+        for cleanup_path in cleanup_paths:
+            try:
+                if cleanup_path.resolve(strict=False) in retired_backings:
+                    continue
+                if (
+                    (cleanup_path.suffix.lower() == '.dat' or cleanup_path.name.endswith('.dat.seam'))
+                    and self.operations._path_is_relative_to(cleanup_path, self.inputs.gpu_worker_result_dir)
+                ):
+                    cleanup_path.unlink(missing_ok=True)
+            except Exception:
+                pass
         if isinstance(task_obj, dict):
             if task_obj.get('result_mask_fallback_path') is not None:
                 task_obj['result_mask_path'] = task_obj.get('result_mask_fallback_path')
@@ -1562,20 +1557,19 @@ class TtaScheduler:
         return self.gpu_worker_fullframe_parent_key(task)
 
     def d1_owner_groups_requested(self) -> bool:
-        """Keep the experiment dark unless its gate is explicitly nonzero."""
+        """Keep the experiment dark unless the run-start snapshot requested it."""
         return bool(
             self.inputs.v1613_d1_owner_active
             and int(self.inputs.gpu_device_count) > 1
-            and configured_d1_owner_groups_requested(
-                read_int=self.operations._env_int,
-            )
+            and self.inputs.d1_owner_groups_requested
         )
 
     def d1_owner_group_size_limit(self) -> int:
-        return configured_d1_owner_group_size_limit(
-            device_count=int(self.inputs.gpu_device_count),
-            read_int=self.operations._env_int,
-        )
+        return int(max(1, min(
+            8,
+            int(self.inputs.d1_owner_group_size_limit),
+            max(1, int(self.inputs.gpu_device_count)),
+        )))
 
     def d1_owner_group_mode_active(self) -> bool:
         """Return whether the requested gate can form a real multi-worker group."""
@@ -2033,7 +2027,7 @@ class TtaScheduler:
             remaining = int(self.state.fullframe_remaining.get(parent_key, 2 ** 31 - 1)) if parent_key is not None else 2 ** 31 - 1
             # Preserve the lease most likely to unlock parent postprocessing. In
             # particular, splitting preferred_parent here would turn its sole
-            # pending lease into two and make _pop_gpu_worker_pending_task_id skip it.
+            # pending lease into two and make pop_gpu_worker_pending_task_id skip it.
             eligible.append((
                 1 if parent_key == preferred_parent else 0,
                 1 if parent_key is not None and int(parent_pending_counts.get(parent_key, 0)) == 1 else 0,
@@ -2183,8 +2177,7 @@ class TtaScheduler:
     def _commit_cpu_input_capacity(self, task: Dict[str, object]) -> bool:
         yield_capacity = getattr(self.cpu_input_prefetch, 'try_yield_capacity', None)
         parent = self.direct_union_task_key(task)
-        if (not self.inputs.direct_union_sparse_retirement_active
-                or not callable(yield_capacity) or parent is None
+        if (not callable(yield_capacity) or parent is None
                 or parent in self.state.direct_union_inference_views):
             return True
         _count, inference, postprocess = self._direct_union_admission_totals(include_cpu_input=False)
@@ -2212,7 +2205,7 @@ class TtaScheduler:
             self.direct_union_task_key(task) if precomputed_key is _SELECTION_KEY_UNSET
             else cast(_SelectionParentKey, precomputed_key)
         )
-        if key is None or not self.inputs.direct_union_sparse_retirement_active:
+        if key is None:
             return True
         members = self._direct_union_admission_tasks(task)
         active_members = 0
@@ -2424,13 +2417,13 @@ class TtaScheduler:
                 and str(getattr(task.get('view'), 'family', '')) == 'spherical')
 
     def _spherical_pacing_rank(self, task: Dict[str, object], parent: Optional[Tuple[str, str]],
-                               pace_due: bool) -> int:
+                               pace_due: bool, pacing_on: Optional[bool] = None) -> int:
         """0: finish a paced Spherical parent; 1: open one when due; 2: otherwise.
 
         A paced parent must finish promptly or its remaining leases fall back to
         largest-first and land at the end anyway.
         """
-        if not _spherical_pacing_enabled():
+        if not (_spherical_pacing_enabled() if pacing_on is None else pacing_on):
             return 2
         if parent is not None and parent in self.state.spherical_paced_parents:
             return 0
@@ -2656,6 +2649,8 @@ class TtaScheduler:
                 parent_i = parents[task_id_i]
                 parent_seconds[parent_i] = float(parent_seconds.get(parent_i, 0.0)) + seconds(task_i)
             pace_spherical = self._spherical_pacing_due(pending_ids)
+            # Read the switch once per selection, not once per candidate in the key.
+            pacing_on = _spherical_pacing_enabled()
             selected_id = min(
                 selected_pool,
                 key=lambda pair: (
@@ -2666,7 +2661,7 @@ class TtaScheduler:
                     0 if direct_parents[int(pair[1])] in self.state.direct_union_inference_views else 1,
                     (0 if self.cpu_input_prefetch is None or self.cpu_input_prefetch.ready(tasks[int(pair[1])]) else 1),
                     self._spherical_pacing_rank(tasks[int(pair[1])], parents[int(pair[1])],
-                                                pace_spherical),
+                                                pace_spherical, pacing_on),
                     -float(parent_seconds.get(parents[int(pair[1])], 0.0)),
                     -float(seconds(tasks[int(pair[1])])),
                     int(pair[0]),
@@ -2728,8 +2723,7 @@ class TtaScheduler:
             # supplies demand before the coordinator drains one worker queue.
             retained = sum(int(value) for value in self.state.direct_union_postprocess_bytes.values())
             limit = int(self.inputs.direct_union_total_dense_byte_limit)
-            active = bool(self.inputs.direct_union_sparse_retirement_active
-                          and retained > 0 and limit > 0
+            active = bool(retained > 0 and limit > 0
                           and (retained * 8 > limit * 5 if self.state.spherical_retirement_pressure_active
                                else retained * 4 >= limit * 3))
             self.state.spherical_retirement_pressure_active = active
@@ -2898,7 +2892,7 @@ class TtaScheduler:
             self._telemetry_add('inference.asset_release.safe_refusals', 1)
             print(f'GPU worker {worker} retained inference assets: {record["error"]}; continuing with existing memory admission.')
         elif state.gpu_inference_asset_release_epoch is not None:
-            proof = _make_gpu_inference_assets_retired_proof(worker, task_id, state.gpu_inference_asset_release_epoch)
+            proof = GpuInferenceAssetsRetired(worker, task_id, state.gpu_inference_asset_release_epoch)
             state.gpu_inference_asset_release_proofs_by_worker[worker] = proof
             callback = self._result_callbacks().gpu_inference_assets_retired
             if callback is not None:

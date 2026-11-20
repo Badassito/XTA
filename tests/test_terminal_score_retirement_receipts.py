@@ -111,8 +111,8 @@ def test_real_owner_death_receipts_and_publication_settle_in_every_order(
     was_enabled = gc.isenabled()
     gc.disable()
     try:
-        assert not ledger.retire_dense_for_publication(prepared, enabled=True,
-            tiled=False, keep_temp=False, retired_callback=publication_retired)
+        assert not ledger.retire_dense_for_publication(prepared,
+            tiled=False, retired_callback=publication_retired)
         assert KEY in ledger.retired_for_publication
         owners[0] = None
         assert refs[0]() is None and refs[1]() is not None

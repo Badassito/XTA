@@ -183,7 +183,7 @@ def test_assembly_shares_one_inventory_and_clears_on_success_or_error(tmp_path, 
     monkeypatch.setattr(assembly, 'cleanup_view_volume_after_prediction_inplace', lambda *a, **k: None)
     kwargs = dict(model_name='detector', view=view, temp_dir=tmp_path, interpolate=3,
         interpolation_walk_back=0, interpolation_candidates=1, interpolate_passes=1,
-        interpolate_min_radius=0., interpolation_search_angle=0., keep_temp=True,
+        interpolate_min_radius=0., interpolation_search_angle=0.,
         slice_workers=1, interpolation_task_workers=1, interpolation_backend='sam',
         sam_context=context, extrapolation_distance=2, extrapolation_min_radius=0.)
     def run():
@@ -220,7 +220,7 @@ def test_assembly_does_not_retain_inventory_when_extrapolation_disabled(tmp_path
     monkeypatch.setattr(assembly, 'cleanup_view_volume_after_prediction_inplace', lambda *a, **k: None)
     kwargs = dict(model_name='detector', view=view, temp_dir=tmp_path, interpolate=3,
         interpolation_walk_back=0, interpolation_candidates=1, interpolate_passes=1,
-        interpolate_min_radius=0., interpolation_search_angle=0., keep_temp=True,
+        interpolate_min_radius=0., interpolation_search_angle=0.,
         slice_workers=1, interpolation_task_workers=1, interpolation_backend='sam', sam_context=context)
     if source == 'fullframe':
         assembly.prepare_view_volume_after_fullframe(**kwargs,

@@ -225,7 +225,6 @@ def finalize_tta_selected_run_and_publish(
     *,
     temp_dir: Path,
     out_dir: Path,
-    keep_temp_artifacts: bool,
     manifest_path: Path,
     manifest: Mapping[str, object],
     artifact_identities: Mapping[str, object],
@@ -234,8 +233,7 @@ def finalize_tta_selected_run_and_publish(
 ) -> Path:
     """Finish selected-run cleanup before publishing the settled run manifest."""
 
-    if not bool(keep_temp_artifacts):
-        cleanup_scratch(temp_dir=temp_dir, out_dir=out_dir)
+    cleanup_scratch(temp_dir=temp_dir, out_dir=out_dir)
     return publish_manifest(
         path=manifest_path,
         manifest=manifest,

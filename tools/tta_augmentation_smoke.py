@@ -183,12 +183,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     A=torch.tensor(policy._forward_matrix(params,args.imgsz,args.imgsz),device=device,dtype=torch.float32)
                     B=torch.linalg.inv(A)
                     y=(replay_one.inverse_grid+1)*((args.imgsz-1)/2)
-                    x=y@B[:2,:2].T+B[:2,2]
-                    if params['elastic']:
+                    if params['elastic'] and adapter.displacement_space=='raster':
+                        # Raster-pixel residual of y + d(y) = A x, the solver's tolerance space;
+                        # mapping it through inv(A) would scale it by up to 1/smin(A).
                         d=policy._elastic_displacement(seed,args.imgsz,args.imgsz)
                         delta,_,_=_bilinear_displacement(d,y)
-                        x=x+delta
-                    residual=(x-target).abs().amax(-1)[replay_one.valid]
+                        difference=y+delta-(target@A[:2,:2].T+A[:2,2])
+                    else:
+                        x=y@B[:2,:2].T+B[:2,2]
+                        if params['elastic']:
+                            d=policy._elastic_displacement(seed,args.imgsz,args.imgsz)
+                            delta,_,_=_bilinear_displacement(d,y)
+                            x=x+delta
+                        difference=x-target
+                    residual=difference.abs().amax(-1)[replay_one.valid]
                     worst=float(residual.max().item()) if residual.numel() else None
                     residuals.append(worst)
                     if worst is not None and worst > .06:

@@ -2,25 +2,23 @@
 
 from __future__ import annotations
 
-from typing import Tuple
-
-from XTA.config import ChannelFormat, resolve_channel_format
+from typing import TYPE_CHECKING, Tuple
 
 from .contracts import ChannelLayout, ChannelVariant, PipelineMode
 
+if TYPE_CHECKING:
+    from XTA.config import ChannelFormat
 
-def resolve_channel_layout(value: str | ChannelFormat | None) -> ChannelLayout:
-    """Resolve exactly one value using the existing TTA ``ChannelFormat`` parser."""
 
-    if isinstance(value, (list, tuple, set, frozenset, dict)):
-        raise ValueError("--channel_format accepts exactly one value in the unified interface")
-    resolved = resolve_channel_format(value)
+def channel_layout_from_format(fmt: "ChannelFormat") -> ChannelLayout:
+    """Copy one already-resolved ``config.ChannelFormat`` into the validated contract layout."""
+
     return ChannelLayout(
-        token=resolved.token,
-        kind=resolved.kind,
-        channel_count=resolved.channel_count,
-        stride=resolved.stride,
-        offsets=tuple(resolved.offsets),
+        token=fmt.token,
+        kind=fmt.kind,
+        channel_count=fmt.channel_count,
+        stride=fmt.stride,
+        offsets=tuple(fmt.offsets),
     )
 
 
@@ -49,17 +47,7 @@ def expand_channel_variants(
     )
 
 
-def resolve_channel_variants(
-    mode: PipelineMode | str,
-    value: str | ChannelFormat | None,
-) -> Tuple[ChannelVariant, ...]:
-    """Resolve one public value and perform mode-owned direction expansion."""
-
-    return expand_channel_variants(mode, resolve_channel_layout(value))
-
-
 __all__ = (
+    "channel_layout_from_format",
     "expand_channel_variants",
-    "resolve_channel_layout",
-    "resolve_channel_variants",
 )

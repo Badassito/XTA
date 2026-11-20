@@ -53,6 +53,7 @@ from .nrrd_compression import (
 )
 
 from ._deps import _numba, cv2, tifffile, tqdm
+from .polygon_keyholes import holes_by_parent, splice_holes
 
 from .config import (
     ChannelFormat,
@@ -87,7 +88,9 @@ from .workspace import (
     available_anon_work_bytes,
 )
 from .media import (
-    _linear_source_index,
+    _center_aligned_nearest_source_index,
+    _center_aligned_nearest_source_indices,
+    _center_aligned_source_position,
     _memory_backed_encoded_chunk_path,
     _memory_backed_encoded_chunk_size,
     _open_memory_backed_encoded_chunk,
@@ -97,6 +100,7 @@ from .media import (
     ffmpeg_ffv1_gray_writer,
     ffmpeg_ffv1_rgb_writer,
     ffmpeg_rawvideo_writer,
+    resize_binary_plane_to_output_xy,
 )
 from .geometry import (
     ChannelFormattedFrameRenderer,
@@ -283,7 +287,7 @@ def _run_sharded_ffv1_encode(
  memfd. On the first shard failure all registered encoders are terminated and every worker
  is reaped. The only filesystem write is the ordered concat stream into a same-filesystem
  atomic publication stage, so the previous destination remains untouched on failure.
- ``scratch_dir`` remains in the public call contract but is no longer used for encoded shards."""
+ ``scratch_dir`` is accepted for caller compatibility and ignored; encoded shards never touch the filesystem."""
     _ = scratch_dir
     total = int(total_frames)
     segments = int(ffv1_segment_count(total))
@@ -517,19 +521,28 @@ def write_overlay_video(
     )
 
 def mask_to_yolo_polygons(mask01: np.ndarray) -> List[List[Tuple[float, float]]]:
-    """Convert a binary mask (H,W) to a list of external polygons with normalized coords."""
+    """Convert a binary mask (H,W) to normalized polygons, one per outer contour.
+
+    Enclosed holes join their outer polygon through zero-width keyhole bridges;
+    an island inside a hole is its own polygon.
+    """
     h, w = mask01.shape
     m = (mask01.astype(np.uint8) * 255)
-    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, hierarchy = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    children = holes_by_parent(hierarchy)
 
     polys: List[List[Tuple[float, float]]] = []
-    for cnt in contours:
+    for index, cnt in enumerate(contours):
+        if hierarchy is not None and hierarchy[0, index, 3] >= 0:
+            continue
         if cnt is None or len(cnt) < 3:
             continue
         approx = cv2.approxPolyDP(cnt, epsilon=1.0, closed=True)
         if approx is None or len(approx) < 3:
             continue
-        pts = approx.reshape(-1, 2)
+        holes = [cv2.approxPolyDP(contours[child], epsilon=1.0, closed=True).reshape(-1, 2)
+                 for child in children.get(index, ())]
+        pts = splice_holes(approx.reshape(-1, 2), [ring for ring in holes if len(ring) >= 3])
         polys.append([(float(x) / float(w), float(y) / float(h)) for (x, y) in pts])
     return polys
 
@@ -991,10 +1004,10 @@ def _slicer_segment_extent_for_output(
 
     x_lo, x_hi = _axis(x0, x1, in_w, out_w)
     y_lo, y_hi = _axis(y0, y1, in_h, out_h)
-    # The payload restore is endpoint-aligned nearest-neighbour when temporal
-    # upscaling and interval-OR when downscaling. A ratio-only extent transform
-    # understates support (for example, source 1 in 3 -> 100 maps to 25..74,
-    # not 33..66), and Slicer may discard payload outside Segment0_Extent.
+    # The payload restore is center-aligned nearest-neighbour when temporal
+    # upscaling and interval-OR when downscaling. Exact inversion keeps the
+    # extent equal to the restored support, and Slicer may discard payload
+    # outside Segment0_Extent.
     exact_t = _nrrd_output_z_extent_for_source_extent(
         int(in_t), int(out_t), int(t0), int(t1),
     )
@@ -1011,10 +1024,9 @@ def _nrrd_output_z_extent_for_source_extent(
 ) -> Optional[Tuple[int, int]]:
     """Invert the exact payload restore map for a non-empty source-z interval.
 
- Temporal upscaling is endpoint-aligned nearest-neighbour, while downscaling ORs a
- floor/ceil coverage range. Ratio-only extent scaling is not equivalent (3 -> 100 with
- source z=1 is the canonical counterexample), so extent metadata uses the same mapping
- as the payload writer."""
+ Temporal upscaling is center-aligned nearest-neighbour, while downscaling ORs a
+ floor/ceil coverage range. Extent metadata uses the same mapping as the payload
+ writer instead of a ratio-only scaling."""
     in_t_i = max(1, int(in_t))
     out_t_i = max(1, int(out_t))
     source_lo = max(0, min(int(source_z0), in_t_i - 1))
@@ -1871,8 +1883,8 @@ def nrrd_layer_output_suffix(
 ) -> str:
     """Return the single-layer NRRD filename suffix for one component layer.
 
- The decomposition is now one single-layer NRRD per component layer, named
- ``{Filestem}_{suffix}.seg.nrrd`` with the model name dropped (a model-ensemble holdover)."""
+ Each component layer is written as one single-layer NRRD named
+ ``{Filestem}_{suffix}.seg.nrrd``; the suffix carries no model name."""
     source_l = str(source).strip().lower()
     mask_kind_l = str(mask_kind).strip().lower()
     stage_l = str(stage).strip().lower()
@@ -2396,15 +2408,6 @@ def nrrd_gpu_mirror_tee_enabled() -> bool:
     """Derive low-quality NRRD mirror volumes on the GPU."""
     return _env_flag('YOLO_TTA_NRRD_GPU_MIRROR_TEE', True)
 
-def nrrd_parallel_mirror_encode_enabled() -> bool:
-    """Gzip-encode a layer's low-quality mirror files concurrently.
-
- The mirrors of one layer were encoded one after another at the tail of the layer task;
- they are independent files with separate handles and payload writers sharing
- the thread-safe member pool and zero-member cache, so they encode side by side.
- YOLO_TTA_NRRD_PARALLEL_MIRROR_ENCODE=0 restores serial encodes."""
-    return _env_flag('YOLO_TTA_NRRD_PARALLEL_MIRROR_ENCODE', True)
-
 class _GpuMirrorTee:
     """Derive downbinned mirror volumes on an exclusively leased CUDA device."""
 
@@ -2637,8 +2640,8 @@ def write_layer_nrrd_with_low_quality_mirrors(
         segment_extent_source='composed_full_output_extent_for_low_quality_mirror',
     )
     pinned_mirror_plans: Dict[str, NrrdRasterPlan] = dict(mirror_raster_plans or {})
-    # this function itself is the queued sink task, so this is execution-time—not
-    # submission-time—resolution. Reuse the result for tee scheduling and the full writer.
+    # This function is itself the queued sink task, so z-shard resolution happens at
+    # execution time, not submission time. Reuse the result for tee scheduling and the full writer.
     if z_shards is None or int(z_shards) <= 0:
         resolved_z_shards = _nrrd_layer_zshard_count(ref, int(out_t))
     else:
@@ -2691,11 +2694,12 @@ def write_layer_nrrd_with_low_quality_mirrors(
                 _NRRD_SPARSE_MIRROR_TEE_ANNOUNCED = True
                 print(
                     'Crop-aware low-quality NRRD mirror tee active; '
-                    'native/restored cvol layers no longer make a second dense store pass.'
+                    'native/restored cvol layers fill their mirrors in the same pass '
+                    '(no second dense store pass).'
                 )
 
-    # already supplies z-band concurrency. Avoid nesting another up-to-16-way CPU pool
-    # inside every shard; the unsharded path retains the original slice fan-out.
+    # Z-sharding already supplies z-band concurrency. Avoid nesting another up-to-16-way CPU
+    # pool inside every shard; the unsharded path keeps the full slice fan-out.
     tee_workers = 1 if int(resolved_z_shards) > 1 else max(1, min(int(nrrd_fill_workers()), 16))
 
     def _tee(z0: int, block: np.ndarray) -> None:
@@ -2907,7 +2911,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
     # side instead of one after another at the tail of the layer task. Every task runs to
     # completion (a failing mirror re-encodes from the store, matching the serial per-mirror
     # fallback) and the first error is re-raised after all mirrors settle.
-    if len(mirror_jobs) > 1 and nrrd_parallel_mirror_encode_enabled():
+    if len(mirror_jobs) > 1:
         pool_size = min(4, len(mirror_jobs))
         mirror_pool = _acquire_parallel_pool(int(pool_size))
         first_error: Optional[BaseException] = None
@@ -3708,10 +3712,6 @@ def _drop_nrrd_raw_store_chunks_ram_cache(src: object) -> None:
     src._ram_cache_ref_held = False
     _release_raw_store_chunks_ram_cache(src.chunks_path)
 
-def nrrd_parallel_extent_scan_enabled() -> bool:
-    """Parallelize exact per-slice SegmentN_Extent reductions."""
-    return _env_flag('YOLO_TTA_NRRD_PARALLEL_EXTENT_SCAN', True)
-
 def _compute_segment_extent_zyx_serial(src: np.ndarray) -> Tuple[int, int, int, int, int, int]:
     """Return the exact Slicer segment extent through the serial fallback scan."""
     t_dim, h_dim, w_dim = (int(src.shape[0]), int(src.shape[1]), int(src.shape[2]))
@@ -3753,11 +3753,7 @@ def compute_segment_extent_zyx(
     t_dim, h_dim, w_dim = (int(src.shape[0]), int(src.shape[1]), int(src.shape[2]))
     requested_workers = max(1, int(_cpu_count() if workers is None else workers))
     scan_workers = choose_slice_parallel_workers(int(requested_workers), int(t_dim))
-    if (
-        not nrrd_parallel_extent_scan_enabled()
-        or int(t_dim) <= 1
-        or int(scan_workers) <= 1
-    ):
+    if int(t_dim) <= 1 or int(scan_workers) <= 1:
         return _compute_segment_extent_zyx_serial(src)
 
     # [min_y, max_y, min_x, max_x] for each t slice. Empty slices retain the
@@ -3818,20 +3814,10 @@ def _restore_source_indices_for_output_z(in_t: int, out_t: int, out_z: int) -> L
         src_stop = int(np.clip(max(src_start + 1, src_stop), 1, in_t_i))
         return [int(v) for v in range(src_start, src_stop)]
 
-    src_z = _linear_source_index(out_z_i, out_t_i, in_t_i)
-    return [int(np.clip(int(round(src_z)), 0, in_t_i - 1))]
+    return [_center_aligned_nearest_source_index(out_z_i, out_t_i, in_t_i)]
 
 def _resize_binary_mask_frame_to_output_shape(frame: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
-    frame_u8 = (np.asarray(frame, dtype=np.uint8) > 0).astype(np.uint8, copy=False)
-    if int(frame_u8.shape[0]) == int(out_h) and int(frame_u8.shape[1]) == int(out_w):
-        return np.ascontiguousarray(frame_u8)
-    interp = cv2.INTER_AREA if (int(frame_u8.shape[0]) >= int(out_h) and int(frame_u8.shape[1]) >= int(out_w)) else cv2.INTER_NEAREST
-    scaled = cv2.resize(
-        np.ascontiguousarray(frame_u8 * np.uint8(255)),
-        (int(out_w), int(out_h)),
-        interpolation=int(interp),
-    )
-    return (scaled > 0).astype(np.uint8, copy=False)
+    return resize_binary_plane_to_output_xy(frame, int(out_h), int(out_w))
 
 @lru_cache(maxsize=32)
 def _nrrd_sparse_resize_axis_map(
@@ -3841,9 +3827,10 @@ def _nrrd_sparse_resize_axis_map(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Cached global-coordinate source support for every output coordinate.
 
- The returned inclusive-start/exclusive-stop arrays reproduce OpenCV nearest-neighbor
- sampling or the positive-support footprint of INTER_AREA. Keeping this map global is
- what lets resize a bbox independently without shifting its phase to the crop origin."""
+ The returned inclusive-start/exclusive-stop arrays hold the center-aligned nearest
+ table shared with the dense restore, or the positive-support footprint of INTER_AREA.
+ Keeping this map global is what lets resize a bbox independently without shifting
+ its phase to the crop origin."""
     in_n = max(1, int(in_count))
     out_n = max(1, int(out_count))
     coords = np.arange(int(out_n), dtype=np.int64)
@@ -3854,7 +3841,7 @@ def _nrrd_sparse_resize_axis_map(
             // np.int64(out_n)
         )
     else:
-        starts = (coords * np.int64(in_n)) // np.int64(out_n)
+        starts = _center_aligned_nearest_source_indices(int(in_n), int(out_n)).astype(np.int64)
         stops = starts + np.int64(1)
     starts.setflags(write=False)
     stops.setflags(write=False)
@@ -3895,6 +3882,92 @@ def _numba_nrrd_continuous_integral_at(
     value += float(crop[int(iy_cell), int(ix_cell)]) * fy * fx
     return float(value)
 
+@_numba.njit(cache=True, nogil=True, inline='always')  # type: ignore[misc]
+def _numba_opencv_area_axis_tab(
+    out_i: int,
+    in_n: int,
+    out_n: int,
+) -> Tuple[float, float, float, int, int]:  # pragma: no cover - compiled implementation
+    """cv::computeResizeAreaTab bounds ``(fs1, fs2, cellWidth, s1, s2)`` of one output pixel."""
+    scale = 1.0 / (float(out_n) / float(in_n))
+    fs1 = float(out_i) * scale
+    fs2 = fs1 + scale
+    cell = min(scale, float(in_n) - fs1)
+    s2 = min(int(math.floor(fs2)), int(in_n) - 1)
+    s1 = min(int(math.ceil(fs1)), s2)
+    return fs1, fs2, cell, s1, s2
+
+@_numba.njit(cache=True, nogil=True, inline='always')  # type: ignore[misc]
+def _numba_opencv_area_axis_span(
+    out_i: int,
+    in_n: int,
+    out_n: int,
+) -> Tuple[float, float, float]:  # pragma: no cover - compiled implementation
+    """Global source interval ``[lo, hi)`` and cellWidth of one INTER_AREA output pixel.
+
+ Mirrors cv::computeResizeAreaTab: a leading or trailing fractional source pixel counts
+ only when its sliver exceeds 1e-3 px, and weights are normalized by cellWidth."""
+    fs1, fs2, cell, s1, s2 = _numba_opencv_area_axis_tab(out_i, in_n, out_n)
+    lo = fs1 if float(s1) - fs1 > 1e-3 else float(s1)
+    hi = float(s2)
+    if fs2 - float(s2) > 1e-3:
+        hi += min(fs2 - float(s2), 1.0, cell)
+    return lo, hi, cell
+
+@_numba.njit(cache=True, nogil=True, inline='always')  # type: ignore[misc]
+def _numba_opencv_area_axis_alpha(
+    source_i: int,
+    fs1: float,
+    fs2: float,
+    cell: float,
+    s1: int,
+    s2: int,
+) -> np.float32:  # pragma: no cover - compiled implementation
+    """computeResizeAreaTab's float32 alpha of source pixel ``source_i`` in ``[s1-1, s2]``; 0 if no tap."""
+    if source_i == s1 - 1:
+        if float(s1) - fs1 > 1e-3:
+            return np.float32((float(s1) - fs1) / cell)
+        return np.float32(0.0)
+    if source_i == s2:
+        if fs2 - float(s2) > 1e-3:
+            return np.float32(min(fs2 - float(s2), 1.0, cell) / cell)
+        return np.float32(0.0)
+    return np.float32(1.0 / cell)
+
+@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+def _numba_opencv_area_binary_value(
+    crop: np.ndarray,
+    in_h: int,
+    in_w: int,
+    out_h: int,
+    out_w: int,
+    source_y0: int,
+    source_x0: int,
+    out_y: int,
+    out_x: int,
+) -> float:  # pragma: no cover - compiled implementation
+    """cv2's float32 INTER_AREA value of one output pixel of the 255-scaled binary frame.
+
+ Replays cv::resize's taps in OpenCV's order and float32 precision: each source row is
+ reduced along X, then rows accumulate along Y. Source pixels outside the crop are zero
+ and would only add exact zeros, so they are skipped."""
+    fy1, fy2, cell_y, y1, y2 = _numba_opencv_area_axis_tab(out_y, in_h, out_h)
+    fx1, fx2, cell_x, x1, x2 = _numba_opencv_area_axis_tab(out_x, in_w, out_w)
+    total = np.float32(0.0)
+    for sy in range(max(y1 - 1, source_y0), min(y2 + 1, source_y0 + crop.shape[0])):
+        beta = _numba_opencv_area_axis_alpha(sy, fy1, fy2, cell_y, y1, y2)
+        if beta == np.float32(0.0):
+            continue
+        row = sy - source_y0
+        buf = np.float32(0.0)
+        for sx in range(max(x1 - 1, source_x0), min(x2 + 1, source_x0 + crop.shape[1])):
+            if crop[row, sx - source_x0] == 0:
+                continue
+            alpha = _numba_opencv_area_axis_alpha(sx, fx1, fx2, cell_x, x1, x2)
+            buf = np.float32(buf + np.float32(np.float32(255.0) * alpha))
+        total = np.float32(total + np.float32(beta * buf))
+    return float(total)
+
 @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
 def _numba_nrrd_area_crop_resize_kernel(
     integral: np.ndarray,
@@ -3911,32 +3984,41 @@ def _numba_nrrd_area_crop_resize_kernel(
     out_x0: int,
     restored: np.ndarray,
 ) -> None:  # pragma: no cover - compiled implementation
-    threshold = (
-        (float(in_h) / float(out_h)) * (float(in_w) / float(out_w)) / 510.0
-    )
+    # Column spans are row-invariant; compute them once instead of once per pixel.
+    width = int(restored.shape[1])
+    sx0s = np.empty(width, dtype=np.float64)
+    sx1s = np.empty(width, dtype=np.float64)
+    cells_x = np.empty(width, dtype=np.float64)
+    for local_x in range(width):
+        lo_x, hi_x, cell_x = _numba_opencv_area_axis_span(int(out_x0 + local_x), in_w, out_w)
+        sx0s[local_x] = max(lo_x, float(source_x0)) - float(source_x0)
+        sx1s[local_x] = max(sx0s[local_x], min(hi_x, float(source_x1)) - float(source_x0))
+        cells_x[local_x] = cell_x
     for local_y in range(int(restored.shape[0])):
         out_y = int(out_y0 + local_y)
-        sy0 = max(
-            float(out_y) * float(in_h) / float(out_h), float(source_y0),
-        ) - float(source_y0)
-        sy1 = min(
-            float(out_y + 1) * float(in_h) / float(out_h), float(source_y1),
-        ) - float(source_y0)
-        for local_x in range(int(restored.shape[1])):
+        lo_y, hi_y, cell_y = _numba_opencv_area_axis_span(out_y, in_h, out_h)
+        sy0 = max(lo_y, float(source_y0)) - float(source_y0)
+        sy1 = max(sy0, min(hi_y, float(source_y1)) - float(source_y0))
+        for local_x in range(width):
             out_x = int(out_x0 + local_x)
-            sx0 = max(
-                float(out_x) * float(in_w) / float(out_w), float(source_x0),
-            ) - float(source_x0)
-            sx1 = min(
-                float(out_x + 1) * float(in_w) / float(out_w), float(source_x1),
-            ) - float(source_x0)
+            sx0 = sx0s[local_x]
+            sx1 = sx1s[local_x]
+            cell_x = cells_x[local_x]
             weighted = _numba_nrrd_continuous_integral_at(integral, crop, sy1, sx1)
             weighted -= _numba_nrrd_continuous_integral_at(integral, crop, sy0, sx1)
             weighted -= _numba_nrrd_continuous_integral_at(integral, crop, sy1, sx0)
             weighted += _numba_nrrd_continuous_integral_at(integral, crop, sy0, sx0)
-            restored[int(local_y), int(local_x)] = np.uint8(
-                1 if float(weighted) >= float(threshold) else 0
-            )
+            # cv2 rounds the 255-scaled float32 value half-to-even, so a tie stays 0. Near
+            # the threshold the float64 integral cannot tell which side cv2's float32 sum
+            # lands on (exact ties occur, e.g. 1020 -> 1019), so replay that sum there.
+            threshold = cell_y * cell_x / 510.0
+            if abs(float(weighted) - threshold) > 1e-4 * threshold:
+                inside = float(weighted) > threshold
+            else:
+                inside = _numba_opencv_area_binary_value(
+                    crop, in_h, in_w, out_h, out_w, source_y0, source_x0, out_y, out_x,
+                ) > 0.5
+            restored[int(local_y), int(local_x)] = np.uint8(1 if inside else 0)
 
 
 def _resize_sparse_binary_crop_to_output_region(
@@ -4002,7 +4084,8 @@ def _resize_sparse_binary_crop_to_output_region(
         # Reproduce INTER_AREA's global phase and uint8 rounding threshold without padding
         # a full source plane. cv2.integral is a compiled, GIL-releasing prefix pass over
         # the bbox; evaluating its continuous piecewise-constant integral accounts for
-        # fractional first/last source pixels (a plain any would over-include tiny slivers).
+        # fractional first/last source pixels, and like cv::computeResizeAreaTab the
+        # kernel drops edge slivers of at most 1e-3 source px.
         integral = cv2.integral(crop_u8, sdepth=cv2.CV_32S)
         restored = np.empty(
             (int(out_y1 - out_y0), int(out_x1 - out_x0)), dtype=np.uint8,
@@ -4064,9 +4147,8 @@ def _nrrd_layer_zero_skip_window(
  The t-axis window inverts the ACTUAL restore mappings rather than reusing the header's
  outward display scaling: for in_t >= out_t each output z reads sources
  [floor(z*in/out), ceil((z+1)*in/out)) — the floor/ceil bounds below are exact for that;
- for in_t < out_t each output z reads round(z*(in-1)/(out-1)) (endpoint-aligned
- _linear_source_index, whose slope exceeds out/in — the display scaling would UNDERSHOOT
- it), so the window inverts that line at t0-0.5 / t1+0.5. One slice of padding per side
+ for in_t < out_t each output z reads one center-aligned nearest source, inverted
+ exactly by _nrrd_output_z_extent_for_source_extent. One slice of padding per side
  absorbs any residual rounding-rule differences; skipping must never reclassify a
  foreground slice as zero."""
     extent = _coerce_segment_extent(getattr(ref, 'segment_extent_ijk', None))
@@ -4083,14 +4165,12 @@ def _nrrd_layer_zero_skip_window(
         # Downscale/identity restore: output z draws sources [floor(z*in/out), ceil((z+1)*in/out)).
         lo_f = int(math.floor(float(t0) * float(out_t) / float(in_t)))
         hi_f = int(math.ceil(float(t1 + 1) * float(out_t) / float(in_t))) - 1
-    elif in_t == 1:
-        # Degenerate upscale: every output z draws slice 0, which the extent says is nonzero.
-        lo_f, hi_f = 0, out_t - 1
     else:
-        # Upscale restore: output z draws round(z * (in-1)/(out-1)).
-        slope = float(out_t - 1) / float(in_t - 1)
-        lo_f = int(math.floor((float(t0) - 0.5) * slope))
-        hi_f = int(math.ceil((float(t1) + 0.5) * slope))
+        # Upscale restore: output z draws one center-aligned nearest source.
+        exact = _nrrd_output_z_extent_for_source_extent(int(in_t), int(out_t), int(t0), int(t1))
+        if exact is None:
+            return None
+        lo_f, hi_f = (int(exact[0]), int(exact[1]))
     lo = max(0, int(lo_f) - 1)
     hi = min(int(out_t), int(hi_f) + 2)
     if hi <= lo:
@@ -4515,7 +4595,7 @@ def _try_gpu_downbin_volume_on_device(
     out_t, out_h, out_w = (int(out_mm.shape[0]), int(out_mm.shape[1]), int(out_mm.shape[2]))
     chunk = int(low_quality_gpu_downbin_chunk_slices())
     src_per_chunk = int(math.ceil(float(in_t) / float(max(1, out_t)) * float(chunk))) + 2
-    fp_bytes = 4 if mode == 'gray' else 2
+    fp_bytes = 2
     need = (
         src_per_chunk * in_h * in_w * (1 + fp_bytes)
         + (chunk + 2) * out_h * out_w * (fp_bytes + 1)
@@ -4537,27 +4617,7 @@ def _try_gpu_downbin_volume_on_device(
                     blk = pooled = out_chunk = window = None
                     rows = []
                     o1 = min(out_t, int(o0) + chunk)
-                    if mode == 'gray':
-                        src_pos = [
-                            _linear_source_index(int(oz), int(out_t), int(in_t))
-                            for oz in range(o0, o1)
-                        ]
-                        z0s = [int(math.floor(p)) for p in src_pos]
-                        z1s = [min(in_t - 1, int(z) + 1) for z in z0s]
-                        lo, hi = min(z0s), max(z1s) + 1
-                        blk = torch.from_numpy(np.ascontiguousarray(src_vol[lo:hi])).to(device)
-                        pooled = F.adaptive_avg_pool2d(
-                            blk.to(torch.float32).unsqueeze(1), (int(out_h), int(out_w)),
-                        ).squeeze(1)
-                        for i in range(int(o1 - o0)):
-                            alpha = float(src_pos[i] - float(z0s[i]))
-                            f0 = pooled[int(z0s[i] - lo)]
-                            if z1s[i] == z0s[i] or alpha <= 1e-7:
-                                rows.append(f0)
-                            else:
-                                rows.append(torch.lerp(f0, pooled[int(z1s[i] - lo)], alpha))
-                        out_chunk = torch.stack(rows).round_().clamp_(0, 255).to(torch.uint8)
-                    elif mode == 'mask':
+                    if mode == 'mask':
                         starts: List[int] = []
                         stops: List[int] = []
                         for oz in range(o0, o1):
@@ -4632,7 +4692,8 @@ def resize_gray_volume_to_shape(
     xy_interp = cv2.INTER_AREA if (out_h <= in_h and out_w <= in_w) else cv2.INTER_LINEAR
 
     def _render_target_slice(out_z: int) -> None:
-        src_z = _linear_source_index(int(out_z), int(out_t), int(in_t))
+        # Center-aligned T matches the cube and the low-quality mask's box center.
+        src_z = _center_aligned_source_position(int(out_z), int(out_t), int(in_t))
         z0 = int(math.floor(src_z))
         z1 = min(in_t - 1, z0 + 1)
         alpha = float(src_z - float(z0))
@@ -4689,22 +4750,7 @@ def resize_binary_mask_volume_to_shape(
     chunk_size = choose_parallel_chunk_size(out_t, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
 
     def _resize_mask_xy(frame: np.ndarray) -> np.ndarray:
-        frame_u8 = (np.asarray(frame, dtype=np.uint8) > 0).astype(np.uint8, copy=False)
-        if int(frame_u8.shape[0]) == int(out_h) and int(frame_u8.shape[1]) == int(out_w):
-            return np.ascontiguousarray(frame_u8)
-        if int(out_h) <= int(frame_u8.shape[0]) and int(out_w) <= int(frame_u8.shape[1]):
-            scaled = cv2.resize(
-                np.ascontiguousarray(frame_u8 * np.uint8(255)),
-                (int(out_w), int(out_h)),
-                interpolation=cv2.INTER_AREA,
-            )
-            return (scaled > 0).astype(np.uint8, copy=False)
-        scaled = cv2.resize(
-            np.ascontiguousarray(frame_u8),
-            (int(out_w), int(out_h)),
-            interpolation=cv2.INTER_NEAREST,
-        )
-        return (scaled > 0).astype(np.uint8, copy=False)
+        return resize_binary_plane_to_output_xy(frame, int(out_h), int(out_w))
 
     def _restore_slice(out_z: int) -> None:
         src_start = int(math.floor(float(out_z) * float(in_t) / float(out_t)))
@@ -5378,7 +5424,7 @@ def write_summary_file(
     lines.append('Workspace policy: in-memory first with disk fallback when the working set exceeds available RAM/swap')
     lines.append(f'3D void fill: {"enabled" if bool(enable_3d_void_fill) else "disabled"}; when enabled, it is applied once after the final global union')
     if bool(enable_3d_void_fill):
-        lines.append('3D void fill background connectivity: default 6-connected; override with YOLO_TTA_VOIDFILL_CONNECTIVITY=18 or 26 if needed')
+        lines.append('3D void fill background connectivity: 6-connected (topological dual of the 26-connected foreground)')
     lines.append(f'Augmentation workers: {int(augmentation_workers)}')
     lines.append(f'Slice-parallel postprocess workers: {int(slice_postprocess_workers)}')
     lines.append(f'Interpolation workers: {int(interpolation_workers)}')

@@ -310,6 +310,51 @@ class ExternalAugmentationExampleTests(unittest.TestCase):
             "adjacent magnitude profiles unexpectedly produced identical seeded batches",
         )
 
+    @unittest.skipUnless(
+        os.environ.get("XTA_RUN_EXTERNAL_AUGMENTATION_CUDA", "").strip() == "1",
+        "set XTA_RUN_EXTERNAL_AUGMENTATION_CUDA=1 on a CUDA PyTorch host",
+    )
+    def test_gpu_profiles_warp_extra_masks_with_the_mask_geometry_on_cuda(self) -> None:
+        import torch
+        self.assertTrue(torch.cuda.is_available(), "CUDA example gate requires torch.cuda")
+
+        rng = np.random.default_rng(2207)
+        images = [rng.integers(0, 256, (48, 56), dtype=np.uint8) for _ in range(2)]
+        masks = [rng.choice(np.array([0, 255], dtype=np.uint8), (48, 56)) for _ in range(2)]
+        coverage = [rng.choice(np.array([0, 1], dtype=np.uint8), (48, 56)) for _ in range(2)]
+        with mock.patch.dict(os.environ, {"PTA_GPU_TORCH_COMPILE": "0"}):
+            for profile, path in (*GPU_PROFILES, ("sweep", EXAMPLES / "GPU_sweep.py")):
+                with self.subTest(profile=profile):
+                    module = importlib.import_module(
+                        f"XTA.examples.external_augmentations.{path.stem}"
+                    )
+                    policy = module.build_gpu_augmentation(device="cuda:0", batch_size=6)
+                    elastic = next(seed for seed in range(1000)
+                                   if policy._sample_parameters(seed, 40, 44)["elastic"])
+                    device_inputs = (
+                        [torch.from_numpy(image).to(policy.device) for image in images],
+                        [torch.from_numpy(mask).to(policy.device) for mask in masks],
+                        [torch.from_numpy(mask).to(policy.device) for mask in coverage],
+                    )
+                    for host_images, host_masks, host_coverage in ((images, masks, coverage), device_inputs):
+                        for seeds, size in (([[None, 23, elastic], [None, 37, 41]], (40, 44)),
+                                            ([[None], [None]], (32, 36))):
+                            kwargs = dict(images=host_images, seeds=seeds, output_size=size)
+                            plain_images, plain_masks = policy.apply_batch_many(masks=host_masks, **kwargs)
+                            _images, coverage_masks = policy.apply_batch_many(masks=host_coverage, **kwargs)
+                            result = policy.apply_batch_many(masks=host_masks, extra_masks=host_coverage, **kwargs)
+                            self.assertEqual(len(result), 3)
+                            self.assertTrue(torch.equal(result[0], plain_images))
+                            self.assertTrue(torch.equal(result[1], plain_masks))
+                            self.assertTrue(torch.equal(result[2], coverage_masks))
+                    with self.assertRaisesRegex(ValueError, "same source device"):
+                        policy.apply_batch_many(images=device_inputs[0], masks=device_inputs[1],
+                                                extra_masks=coverage, seeds=[[7], [9]], output_size=(40, 44))
+                    with self.assertRaisesRegex(ValueError, "cannot mix"):
+                        policy.apply_batch_many(images=device_inputs[0], masks=device_inputs[1],
+                                                extra_masks=[device_inputs[2][0], coverage[1]],
+                                                seeds=[[7], [9]], output_size=(40, 44))
+
 
 class GPUAugmentationGaussianMathTests(unittest.TestCase):
     """Check GPU policy math on CPU without constructing a CUDA policy."""
@@ -537,8 +582,14 @@ class ExternalAugmentationIntensityMathTests(unittest.TestCase):
                 np.testing.assert_array_equal(source, before)
 
     def test_cpu_elastic_has_expected_rms_and_replay_contract(self):
+        sweep = [importlib.import_module(f'XTA.examples.external_augmentations.{backend}_sweep')
+                 for backend in ('CPU', 'GPU')]
+        for cpu, gpu in (*((cpu, gpu) for _profile, cpu, gpu in self.modules), sweep):
+            # Elastic displacement is added in the augmented raster: x = inv(A)(y + d(y)).
+            self.assertEqual(cpu.CPUAugmentation.tta_replay_contract, 'opencv-affine-elastic-v2')
+            self.assertEqual(gpu.GPUAugmentation.tta_replay_contract, 'torch-affine-elastic-v2')
+            self.assertIs(gpu.GPUAugmentation.supports_extra_masks, True)
         for (profile, cpu, _), fraction in zip(self.modules, (.005, .01, .015, .02)):
-            self.assertEqual(cpu.CPUAugmentation.tta_replay_contract, 'opencv-affine-elastic-v1')
             for height, width in ((1, 19), (27, 31), (128, 192), (512, 768)):
                 with self.subTest(profile=profile, shape=(height, width)):
                     field = cpu.CPUAugmentation._elastic_displacement(2718, height, width)

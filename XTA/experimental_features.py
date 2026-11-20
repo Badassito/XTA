@@ -1,15 +1,17 @@
 """Dependency-light configuration for opt-in experimental execution paths.
 
-This module deliberately depends only on the standard library so runtime telemetry,
-schedulers, and CUDA implementations can share one environment contract without
-importing accelerator frameworks or higher pipeline layers.
+This module deliberately depends only on the standard library (through the shared
+env_flags parsers) so runtime telemetry, schedulers, and CUDA implementations can
+share one environment contract without importing accelerator frameworks or higher
+pipeline layers.
 """
 
 from __future__ import annotations
 
-import os
 from dataclasses import asdict, dataclass
-from typing import Callable, Dict, Mapping, Optional
+from typing import Dict, Mapping, Optional
+
+from .env_flags import env_flag as _env_flag, env_float as _env_float, env_int as _env_int
 
 
 GIB = 1024 ** 3
@@ -30,63 +32,12 @@ EXPERIMENTAL_FEATURE_ENV_NAMES = (
     GPU_TAIL_BLOCK_SLICES_ENV,
 )
 
-_FALSE_VALUES = frozenset(("", "0", "false", "no", "off", "disabled"))
-
-
-def _env_flag(
-    name: str,
-    default: bool = False,
-    *,
-    environ: Optional[Mapping[str, str]] = None,
-) -> bool:
-    source = os.environ if environ is None else environ
-    raw = source.get(name)
-    if raw is None:
-        return bool(default)
-    return str(raw).strip().lower() not in _FALSE_VALUES
-
-
-def _env_int(
-    name: str,
-    default: int,
-    *,
-    environ: Optional[Mapping[str, str]] = None,
-) -> int:
-    source = os.environ if environ is None else environ
-    raw = str(source.get(name, "")).strip()
-    if not raw:
-        return int(default)
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return int(default)
-
-
-def _env_float(
-    name: str,
-    default: float,
-    *,
-    environ: Optional[Mapping[str, str]] = None,
-) -> float:
-    source = os.environ if environ is None else environ
-    raw = str(source.get(name, "")).strip()
-    if not raw:
-        return float(default)
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return float(default)
-
-
 def d1_owner_groups_requested(
     *,
     environ: Optional[Mapping[str, str]] = None,
-    read_int: Optional[Callable[[str, int], int]] = None,
 ) -> bool:
     """Return whether multi-device D1 ownership was explicitly requested."""
 
-    if read_int is not None:
-        return bool(int(read_int(D1_OWNER_GROUPS_ENV, 0)) != 0)
     return _env_flag(D1_OWNER_GROUPS_ENV, False, environ=environ)
 
 
@@ -94,15 +45,10 @@ def d1_owner_group_size_limit(
     *,
     device_count: Optional[int] = None,
     environ: Optional[Mapping[str, str]] = None,
-    read_int: Optional[Callable[[str, int], int]] = None,
 ) -> int:
     """Return the configured D1 participant ceiling, clamped to available devices."""
 
-    configured = (
-        int(read_int(D1_OWNER_GROUP_SIZE_ENV, 8))
-        if read_int is not None
-        else _env_int(D1_OWNER_GROUP_SIZE_ENV, 8, environ=environ)
-    )
+    configured = _env_int(D1_OWNER_GROUP_SIZE_ENV, 8, environ=environ)
     limit = max(1, min(8, int(configured)))
     if device_count is not None:
         limit = min(limit, max(1, int(device_count)))

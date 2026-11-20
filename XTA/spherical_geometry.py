@@ -6,7 +6,6 @@ origins remain fixed across each trajectory's channels and interpolation.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
 import operator
 from typing import TYPE_CHECKING, Sequence
@@ -17,17 +16,6 @@ from .qsc import QSC_FACE_NAMES, qsc_inverse
 
 if TYPE_CHECKING:
     from .geometry import ViewInfo
-
-
-@dataclass(frozen=True)
-class SphericalSurface:
-    """A unit QSC surface with a separate world pose; ellipsoid adapters fit here."""
-    center_xyz: tuple[float, float, float]
-    rotation_xyz: tuple[float, ...]
-
-    def points(self, directions, radius):
-        rotation = np.asarray(self.rotation_xyz, np.float64).reshape(3, 3)
-        return np.asarray(self.center_xyz, np.float64) + float(radius) * (np.asarray(directions) @ rotation.T)
 
 
 def _validate_radius_bounds(minimum, maximum):

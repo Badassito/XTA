@@ -28,7 +28,7 @@ MODULES = (
     "pta_geometry_integration", "pta_spawn_scheduler", "pta_worker_boundary",
     "radial_batch_padding", "radial_strided_sampling", "render_batch_image_tee",
     "shared_gaussian", "tile_config_regressions", "tta_output_ownership",
-    "tta_pipeline_refactor", "tta_scheduler_boundary",
+    "tta_scheduler_boundary",
     "worker_raster_plan_provenance", "spherical_pressure", "publication_memory",
     "radial_retirement_admission", "runtime_task_trace", "spherical_host_admission",
     "spherical_locality", "tta_gpu_asset_release", "tta_policy_shared_union",

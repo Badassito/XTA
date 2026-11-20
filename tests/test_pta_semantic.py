@@ -304,6 +304,17 @@ class PtaSemanticTests(unittest.TestCase):
             type("Policy", (), {"mask_independent_geometry": True})(), coverage,
         )
         pta_workers._require_gpu_semantic_coverage_contract(object(), None)
+        # Coverage warped in the same apply_batch_many call needs no replay contract.
+        pta_workers._require_gpu_semantic_coverage_contract(
+            type("Policy", (), {"supports_extra_masks": True, "apply_batch_many": lambda self, **kw: None})(),
+            coverage,
+        )
+        # The apply_batch single-source fallback can only replay, so reject early.
+        with self.assertRaisesRegex(RuntimeError, "supports_extra_masks = True"):
+            pta_workers._require_gpu_semantic_coverage_contract(
+                type("Policy", (), {"supports_extra_masks": True, "apply_batch": lambda self, **kw: None})(),
+                coverage,
+            )
 
     def test_thin_semantic_foreground_is_kept_with_empty_polygon_label(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

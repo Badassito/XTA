@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 
-from XTA import geometry, inference, media, runtime, workspace
+from XTA import geometry, inference, runtime, workspace
 
 
 class EnvironmentCleanupTests(unittest.TestCase):
@@ -82,22 +82,9 @@ class EnvironmentCleanupTests(unittest.TestCase):
             self.assertEqual(inference.gpu_union_retirement_lane_count(), 3)
 
     def test_consolidated_streaming_defaults_preserve_unset_behavior(self) -> None:
-        names = (
-            'YOLO_TTA_GPU_INPUT_STAGING_AHEAD_SOURCES',
-            'YOLO_TTA_STREAMING_SOURCE_WARMUP_SOURCES',
-            'YOLO_TTA_STREAMING_SOURCE_PREFETCH_FRAMES',
-            'YOLO_TTA_STREAMING_SOURCE_WORKERS',
-        )
-        with (
-            mock.patch.dict(os.environ, {}, clear=False),
-            mock.patch.object(geometry, '_cpu_count', return_value=16),
-        ):
-            for name in names:
-                os.environ.pop(name, None)
-            self.assertEqual(geometry.gpu_input_staging_ahead_sources(4), 4)
-            self.assertEqual(geometry.queued_streaming_source_cpu_warmup_slots(20), 8)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('YOLO_TTA_STREAMING_SOURCE_PREFETCH_FRAMES', None)
             self.assertEqual(geometry.streaming_prediction_source_prefetch_frames(64), 2048)
-            self.assertEqual(geometry.streaming_prediction_source_workers(4, 100), 16)
 
     def test_zero_staging_batches_disables_eager_cuda_staging(self) -> None:
         cfg = SimpleNamespace(device='cuda:0')
@@ -125,9 +112,6 @@ class EnvironmentCleanupTests(unittest.TestCase):
             ),
         ):
             self.assertEqual(workspace.available_anon_work_bytes(), 80)
-
-        self.assertEqual(media.processing_volume_mode(), 'cube')
-        self.assertEqual(media._cube_t_axis_resize_backend(), 'slab')
 
 if __name__ == '__main__':
     unittest.main()

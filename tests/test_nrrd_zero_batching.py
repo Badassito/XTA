@@ -255,7 +255,8 @@ class NrrdZeroBatchingTests(unittest.TestCase):
             layer = FileLayer('test', {}, array.shape, target, header, array.shape,
                              (0, 0, 0), payload_offset, 'gzip', False)
             layer._owner = SimpleNamespace(_closed=False, _open_count=0, max_open=1,
-                                           _chunk_bytes=128, _budget_bytes=1024*1024)
+                                           _chunk_bytes=128, _budget_bytes=1024*1024,
+                                           _fast_gzip_reader=None)
             try:
                 np.testing.assert_array_equal(layer.read_slab(0, 3), array)
             finally:

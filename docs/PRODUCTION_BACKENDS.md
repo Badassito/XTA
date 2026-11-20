@@ -44,6 +44,8 @@ with distinct layout or conversion contracts remain supported.
 | Spherical CPU pull | Required prepared Numba FP64 kernel, including confidence and preflight reads | Independent vectorized oracle in `tests/reference_backends/spherical.py` |
 | Radial CPU pull | Factored Numba projection; bounded compiled direct pull when the ownership plan is too large | Independent vectorized oracle in `tests/reference_backends/radial.py` |
 | Interpolation candidates | Required Numba scan; workspace grows only after overflow, up to the scanned-window bound | Historical Python planner in `tests/reference_backends/interpolation.py` |
+| D1 orthogonal categorical coverage | Bbox-bounded CUDA pull kernel or compiled crop restore over `d1_orthogonal_coverage` address tables | Bounded CPU oracle in `tests/reference_backends/d1_orthogonal_coverage.py` |
+| LTA rendering | Shared native-frame cache and tile-window rendering | Full-frame CPU render/restore reference in `tests/reference_backends/lta_rendering.py` |
 | Compact relabel, keep-object LUTs, sparse scatter and packed publication | Required compiled kernels | Differential tests preserve independent dense/array references |
 | CPU slice labeling and layout-specific operations | OpenCV CCL or vectorized native-array work | These remain supported native CPU algorithms, not interpreted voxel-loop fallbacks |
 
@@ -59,20 +61,34 @@ unpublished label workspace is discarded after its workers settle and the pass
 automatically restarts with `uint32`; memory/disk admission is recomputed.
 Counts, areas, root lookup tables and adjacent-slice connectivity are rebuilt
 from the original mask. This promotion never reuses narrowed partial labels or
-changes a shared environment setting. Set
-`YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16=0` to select `uint32` immediately;
-manual reruns are no longer required for valid slice-local overflow. Compact
-global labels already use `uint32`. Only a verified capacity signal triggers
-promotion; unrelated failures retain their established backend error contracts.
+changes a shared environment setting. Valid slice-local overflow needs no manual
+rerun. Compact global labels already use `uint32`. Only a verified capacity
+signal triggers promotion; unrelated failures retain their established backend
+error contracts.
 
-The `YOLO_TTA_TOPOLOGY_COMPILED_KERNELS`,
-`YOLO_TTA_INTERPOLATION_COMPILED_KERNELS`, and
-`YOLO_TTA_CPU_SPHERICAL_COMPILED` opt-outs are retired. The compiled Spherical CPU
-path is independent of approximate GPU geometry preferences. Compact-relabel
-thread-pool tuning (`YOLO_TTA_INTERPOLATION_COMPACT_WORKERS` and
+The `YOLO_TTA_TOPOLOGY_COMPILED_KERNELS`, `YOLO_TTA_INTERPOLATION_COMPILED_KERNELS`,
+`YOLO_TTA_CPU_SPHERICAL_COMPILED`, `YOLO_TTA_NRRD_PARALLEL_MIRROR_ENCODE`,
+`YOLO_TTA_NRRD_PARALLEL_EXTENT_SCAN`, `YOLO_TTA_TOPOLOGY_SPARSE_CPU_LABELING`,
+`YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16`, and
+`YOLO_TTA_INTERPOLATION_CACHE_BRIDGE_SECTIONS` opt-outs are retired. The
+compiled Spherical CPU path is independent of approximate GPU geometry
+preferences. Compact-relabel thread-pool tuning
+(`YOLO_TTA_INTERPOLATION_COMPACT_WORKERS` and
 `YOLO_TTA_INTERPOLATION_COMPACT_RELABEL_ROWS`) is also retired with that duplicate
 implementation. Native NumPy/OpenCV paths required for aliasing, dtype conversion,
 explicit CPU inference, or different algorithms retain their separate contracts.
+
+`YOLO_TTA_V1613_D1_OWNER_PIPELINE` is retired; `YOLO_TTA_V1613_FAST_BUNDLE=0` is
+the single D1 backout. Unlike the retired switch, which turned off only the D1
+pipeline, it turns off the whole fast bundle. A TTA run with
+`--enable_2D_hole_fill yolo` that should match the retired switch's D1-off masks
+needs `YOLO_TTA_PROTO_HOLE_TREATMENT=close` and `YOLO_TTA_PROTO_HOLE_RADIUS=2`
+to restore the bundle's default resident-proto closing. That recipe is necessary
+but not sufficient for exact parity. The retired switch's D1-off runs also let
+a completed dense view borrow an idle worker GPU for backprojection while other
+devices still inferred; no current mode does that. `YOLO_TTA_V1613_FAST_BUNDLE=0`
+also lowers the default GPU union retirement lanes from 3 to 2
+(`YOLO_TTA_GPU_UNION_RETIREMENT_LANES=3` restores them).
 
 ## Reproducible CPU comparisons
 
@@ -125,9 +141,11 @@ Each one matches the previous result byte for byte.
   read through libc with the GIL held. A file class whose read takes longer than
   `YOLO_TTA_RAM_PROBE_GIL_HOLD_LIMIT_MS` (default: the switch interval) switches
   permanently to normal reads. `YOLO_TTA_RAM_PROBE_GIL_READS=counters` never
-  holds the GIL for lock-prone files; `=0` disables GIL-held reads.
-- SAM cyclic and filter source checks run at plan, writer and selection
-  boundaries instead of on every address or mask call.
+  holds the GIL for lock-prone files; `=0` disables GIL-held reads. The process
+  cgroup membership and cgroupfs mount check are resolved once per process;
+  limits and usage are read on every probe.
+- SAM cyclic, filter, reader, branch and policy modules hash their own source
+  once at import; no address, mask or selection call re-reads a source file.
 
 The pipeline compiles these kernels serially at startup, before inference
 threads start, and records each as `gil_kernels.warmup.<name>`. A first compile

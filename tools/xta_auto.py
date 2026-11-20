@@ -153,7 +153,9 @@ def resolve_conflicts(labels, roots, mixed, support, keep, removed, *, depth, ar
     """Zero only accepted deletions in disk-backed labels; other components untouched.
 
     Oversize boxes are not tiled independently: that would change topology and EDT.
-    They remain unmodified and are recorded, allowing an unattended conservative run.
+    They remain unmodified and are recorded as unresolved; under --conflicts auto
+    any unresolved component stops publication (needs_review, exit 2), and only
+    --conflicts keep publishes a conservative candidate.
     """
     records = []
     resolved = np.zeros(len(roots), bool)

@@ -149,7 +149,7 @@ def test_interrupted_reader_returns_locally_acquired_archive_lock(tmp_path, monk
     original_writer_lock = artifacts._writer_lock
 
     @contextmanager
-    def interrupted(_path):
+    def interrupted(_path, **_kwargs):
         raise KeyboardInterrupt('interrupted before OS lock')
         yield
 

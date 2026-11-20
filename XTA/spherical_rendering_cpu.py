@@ -1,15 +1,14 @@
 """SAM-only native Spherical intensity crops, with no auxiliary CPU pool."""
 from __future__ import annotations
 
-import hashlib
 import operator
-from pathlib import Path
 import math
 
 import numpy as np
 from ._deps import _numba
+from .file_hashing import source_sha256
 
-IMPLEMENTATION_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+IMPLEMENTATION_SHA256 = source_sha256(__file__)
 
 
 def _render_spherical_gray8(source, face, intervals, origin_u, origin_v, rotation, radius,

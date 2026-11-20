@@ -165,10 +165,10 @@ class StopAtClassification(Exception):
     pass
 
 
-@pytest.mark.parametrize('gpu_active,pending_a,pending_b,expected_pool', [
-    (True, 0, 0, True), (True, 1, 0, True), (True, 0, 1, True), (False, 0, 0, False), (False, 1, 0, False),
+@pytest.mark.parametrize('gpu_active,pending_a,expected_pool', [
+    (True, 0, True), (True, 1, True), (False, 0, False), (False, 1, False),
 ])
-def test_real_parent_planner_uses_gpu_pool_even_while_a_volume_renders(gpu_active, pending_a, pending_b, expected_pool):
+def test_real_parent_planner_uses_gpu_pool_even_while_a_volume_renders(gpu_active, pending_a, expected_pool):
     # A pipelined volume queues behind the rendering one instead of using CPU.
     source = (Path(pta.__file__)).read_text(encoding='utf-8')
     node = next(n for n in ast.walk(ast.parse(source))
@@ -191,7 +191,7 @@ def test_real_parent_planner_uses_gpu_pool_even_while_a_volume_renders(gpu_activ
         effective_pipeline_depth=2, dataset_publication_selected=True, fraction=1.,
         enumerate_candidates_for_volume=lambda *a,**kw:[], background_filter_requested=False,
         classify_original_foregrounds_for_volume=classify, augmentation=None, gpu_offline_active=gpu_active,
-        render_pool=pool, states={}, progress_by_gen={0:SimpleNamespace(pending_a=pending_a,pending_b=pending_b)},
+        render_pool=pool, states={}, progress_by_gen={0:SimpleNamespace(pending_a=pending_a)},
         resolve_volume_options=pta.resolve_volume_options)
     exec(compile(ast.fix_missing_locations(module),'<actual PTA classification dispatch>','exec'),namespace)
     with pytest.raises(StopAtClassification):

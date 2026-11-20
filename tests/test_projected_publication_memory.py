@@ -39,7 +39,7 @@ def _view():
 
 def _specs(root, tasks, **overrides):
     options = dict(temp_dir=root, source_shape=(5, 7, 9), retire_dense=True,
-        component_layers=True, tiled=False, keep_temp=False, interpolate=0,
+        component_layers=True, tiled=False, interpolate=0,
         interpolation_passes=1, extrapolate=0)
     options.update(overrides)
     return memory.terminal_parent_output_specs(tasks, **options)
@@ -54,7 +54,7 @@ def test_parent_specs_deduplicate_chunks_and_use_actual_materializer_identity(tm
     assert len(specs) == 1
     assert specs[0] == dict(key=('model', view.name), path=str(path.absolute()), shape=(5, 7, 9))
     assert key in str(path)
-    for change in ({'tiled': True}, {'keep_temp': True}, {'interpolate': 1},
+    for change in ({'tiled': True}, {'interpolate': 1},
                    {'extrapolate': 1}, {'component_layers': False}):
         assert not _specs(tmp_path, [task], **change)
     assert not _specs(tmp_path, [dict(task, result_mode='file')])
@@ -89,7 +89,7 @@ def test_parent_and_radial_layers_share_one_future_payload_budget(tmp_path, monk
         model_name='model', view=SimpleNamespace(name='radial'),
         d1_store_dir=tmp_path / 'radial.cvol', d1_output_shape=shape)
     spec = dict(key=('model', 'tilted'), path=str(tmp_path / 'tilted.cvol'), shape=shape)
-    plan = memory.plan_native_publication_memory([radial], keep_temp=False,
+    plan = memory.plan_native_publication_memory([radial],
         worker_count=0, publication_pending=0, unpack_bytes=0,
         projected_parent_outputs=[spec])
     assert len(fake_memfd_planner) == expected_grants
@@ -111,7 +111,7 @@ def test_parent_and_radial_layers_share_one_future_payload_budget(tmp_path, monk
 def test_parent_only_plan_can_admit_without_any_radial_tasks(tmp_path, monkeypatch, fake_memfd_planner):
     monkeypatch.setattr(memory, 'publication_ram_headroom', lambda: 100 * GIB)
     spec = dict(key=('model', 'tilted'), path=str(tmp_path / 'tilted.cvol'), shape=(5, 7, 9))
-    plan = memory.plan_native_publication_memory([], keep_temp=False,
+    plan = memory.plan_native_publication_memory([],
         worker_count=0, publication_pending=0, unpack_bytes=0,
         projected_parent_outputs=[spec])
     assert len(plan['parent_outputs']) == len(fake_memfd_planner) == 1
@@ -131,7 +131,7 @@ def test_160591_budget_funds_all_heavy_parent_outputs_before_radial(tmp_path, mo
     parents = [dict(key=('model', f'parent-{index}'),
         path=str(tmp_path / f'parent-{index}.cvol'), shape=shape) for index in range(27)]
     base = memory.retained_payload_plan([shape], available, 0, 0, 0)['reserve_bytes']
-    plan = memory.plan_native_publication_memory(radial, keep_temp=False,
+    plan = memory.plan_native_publication_memory(radial,
         worker_count=0, publication_pending=0, unpack_bytes=0,
         output_reserve_bytes=reserve - base, projected_parent_outputs=parents)
     one = shape[0] * shape[1] * ((shape[2] + 7) // 8)

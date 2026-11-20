@@ -251,15 +251,42 @@ def resize_crop_frame(frame, *, side=DYNAMIC_MODEL_SIDE):
     return cv2.resize(array, (side, side), interpolation=cv2.INTER_AREA)
 
 
-def resize_crop_mask(mask, *, side=DYNAMIC_MODEL_SIDE, restore=False):
+def resize_crop_mask_with_receipt(mask, *, side=DYNAMIC_MODEL_SIDE, restore=False):
+    """Resize a crop mask and return ``(mask, rescued_component_count)``.
+
+    Restores use a linear >=128 threshold.  Seed downsampling keeps the
+    area-majority threshold, but an area-downsampled seed component never
+    vanishes: a component with no majority pixel keeps its partial-coverage
+    footprint instead.
+    """
     import cv2
     binary = np.asarray(mask, dtype=np.bool_)
     if binary.shape == (side, side):
-        return np.ascontiguousarray(binary)
-    method = cv2.INTER_LINEAR if restore else cv2.INTER_AREA
-    return cv2.resize(binary.astype(np.uint8) * 255, (side, side), interpolation=method) >= 128
+        return np.ascontiguousarray(binary), 0
+    source = binary.astype(np.uint8) * 255
+    level = cv2.resize(source, (side, side), interpolation=cv2.INTER_LINEAR if restore else cv2.INTER_AREA)
+    output = level >= 128
+    if restore:
+        return output, 0
+    footprint = level > 0
+    count, labels = cv2.connectedComponents(footprint.view(np.uint8), connectivity=8)
+    if count <= 1:
+        return output, 0
+    represented = np.zeros(count, dtype=np.bool_)
+    represented[labels[output]] = True
+    represented[0] = True
+    missing = ~represented
+    rescued = int(np.count_nonzero(missing))
+    if rescued:
+        output |= missing[labels]
+    return output, rescued
+
+
+def resize_crop_mask(mask, *, side=DYNAMIC_MODEL_SIDE, restore=False):
+    return resize_crop_mask_with_receipt(mask, side=side, restore=restore)[0]
 
 
 __all__ = ("DYNAMIC_CROP_POLICY", "DYNAMIC_MODEL_SIDE", "DynamicCropSettings", "NativeMask",
            "DynamicObject", "DynamicCrop", "plan_dynamic_crops", "touches_interior_guard",
-           "split_dynamic_object", "split_depth_budget_reached", "resize_crop_frame", "resize_crop_mask")
+           "split_dynamic_object", "split_depth_budget_reached", "resize_crop_frame", "resize_crop_mask",
+           "resize_crop_mask_with_receipt")

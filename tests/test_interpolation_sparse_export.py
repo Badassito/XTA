@@ -207,7 +207,7 @@ class InterpolationSparseExportTests(unittest.TestCase):
                         mask_mm=mask, work_dir=root/'work', pass_tag='pass1', max_slice_distance=2,
                         search_angle_deg=15, interpolation_walk_back=walk_count,
                         interpolation_candidates=candidate_count, interpolate_min_radius=0,
-                        keep_temp=False, workers=2, bridge_component_dir=root/'components',
+                        workers=2, bridge_component_dir=root/'components',
                     )
                 entries = stats['bridge_component_deltas']
                 self.assertEqual(len(entries), total)

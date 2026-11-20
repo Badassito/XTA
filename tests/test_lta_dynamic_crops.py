@@ -13,7 +13,8 @@ import numpy as np
 
 from XTA.lta_dynamic_crops import (DynamicCropSettings, DynamicObject, NativeMask,
                                   plan_dynamic_crops, split_dynamic_object,
-                                  touches_interior_guard, resize_crop_mask)
+                                  touches_interior_guard, resize_crop_mask,
+                                  resize_crop_mask_with_receipt)
 from XTA.lta_dynamic_execution import (DynamicViewCompletion, DynamicTask, drive_dynamic_workers,
                                       followup_dynamic_tasks, plan_initial_dynamic_tasks)
 from XTA.lta_propagation import LtaMaskSeed, read_seed_artifact
@@ -163,6 +164,47 @@ class DynamicCropTests(unittest.TestCase):
         intersection = int(np.count_nonzero(original & restored))
         union = int(np.count_nonzero(original | restored))
         self.assertGreater(intersection / union, 0.99)
+
+    def test_area_downsampling_keeps_every_thin_seed_component(self):
+        import cv2
+
+        def plain(mask, side=1008, method=cv2.INTER_AREA):
+            return cv2.resize(mask.astype(np.uint8) * 255, (side, side), interpolation=method) >= 128
+
+        for side in (1092, 1176, 1512, 2016, 2520, 3024):
+            length = int(side * 0.9)
+            start = (side - length) // 2
+            steps = np.arange(length)
+            for width in (1, 2):
+                for offset in range(12):
+                    horizontal = np.zeros((side, side), dtype=bool)
+                    horizontal[side // 2 + offset:side // 2 + offset + width, start:start + length] = True
+                    diagonal = np.zeros((side, side), dtype=bool)
+                    for column in range(width):
+                        diagonal[start + steps, start + steps + offset + column] = True
+                    for mask in (horizontal, diagonal):
+                        with self.subTest(side=side, width=width, offset=offset):
+                            self.assertTrue(resize_crop_mask(mask).any())
+        rectangle = np.zeros((1764, 1764), dtype=bool)
+        rectangle[350:850, 500:950] = True
+        model, rescued = resize_crop_mask_with_receipt(rectangle)
+        self.assertEqual(rescued, 0)
+        np.testing.assert_array_equal(model, plain(rectangle))
+        irregular = np.zeros((1764, 1764), dtype=bool)
+        irregular[1200:1350, 1300:1420] = np.eye(150, 120, dtype=bool)
+        irregular[1230:1310, 1320:1400] = True
+        np.testing.assert_array_equal(resize_crop_mask(irregular), plain(irregular))
+        # A detached single native pixel has no area-majority model pixel;
+        # it keeps its partial-coverage footprint without touching the rest.
+        islanded = rectangle.copy()
+        islanded[1500, 1500] = True
+        model, rescued = resize_crop_mask_with_receipt(islanded)
+        self.assertEqual(rescued, 1)
+        self.assertTrue(model[1500 * 1008 // 1764, 1500 * 1008 // 1764])
+        np.testing.assert_array_equal(model & ~plain(islanded), model & ~plain(rectangle))
+        self.assertEqual(int(np.count_nonzero(model & ~plain(islanded))), 1)
+        np.testing.assert_array_equal(resize_crop_mask(model, side=1764, restore=True),
+                                      plain(model, 1764, cv2.INTER_LINEAR))
 
     def test_dynamic_config_is_opt_in_and_rejects_invalid_geometry_settings(self):
         from XTA.lta_config import parse_lta_args
@@ -317,23 +359,92 @@ class DynamicCropTests(unittest.TestCase):
                               for lineage, mask in expected.items()}
             restored = np.logical_or.reduce(tuple(restored_masks.values()))
             self.assertEqual(union.shape, (3, 1764, 1764))
+            # The hard-positive prompt frame publishes the native seeds only.
+            np.testing.assert_array_equal(union[0], np.logical_or.reduce(tuple(seed.mask for seed in seeds)))
             np.testing.assert_array_equal(union[1], restored)
             dogfood = read_seed_artifact(manifest["dogfood_seed_artifacts"][0]["path"])
             self.assertEqual(len(dogfood), 2)
             for seed in dogfood:
                 np.testing.assert_array_equal(seed.mask, restored_masks[seed.lineage])
             self.assertEqual(manifest["crop_transform"]["prediction_and_dogfood_coordinates"], "native_crop")
-            # A subpixel seed cannot be certified as a successful empty run
-            # when area downsampling removes all of its model-space support.
+            self.assertEqual(manifest["crop_transform"]["prompt_frame_publication"], "native_seed")
+            self.assertEqual(manifest["crop_transform"]["seed_components_rescued"], 0)
+            # A subpixel seed keeps model-space support instead of failing the
+            # task, and its prompt frame publishes exactly the native pixel.
             tiny = obj(frame=0, top=800, left=800, mask=np.ones((1, 1), dtype=bool))
-            tiny_artifact = write_seed_artifact(root / "tiny-seed.npz", (tiny.in_crop(tile, object_id=0),))
+            tiny_seed = tiny.in_crop(tile, object_id=0)
+            tiny_artifact = write_seed_artifact(root / "tiny-seed.npz", (tiny_seed,))
             tiny_payload = {**payload, "seed_artifact_path": str(tiny_artifact.path),
                 "seed_artifact_sha256": tiny_artifact.sha256, "output_dir": str(root / "tiny-output")}
-            with mock.patch("XTA.lta_propagation.run_mask_injected_session") as tracker:
-                with self.assertRaisesRegex(ValueError, "seed mask must contain foreground"):
-                    execute_worker_task(context, "propagation_window", tiny_payload)
-            tracker.assert_not_called()
-            self.assertFalse((root / "tiny-output" / "manifest.json").exists())
+            def propagate_tiny(_a, _b, *, request, prediction_callback, **_kwargs):
+                (seed,) = request.seeds
+                self.assertEqual(seed.mask.shape, (1008, 1008))
+                self.assertTrue(seed.mask.any())
+                prediction_callback(LtaObjectPrediction(seed.lineage, SamFramePrediction(
+                    request.session.sequence_id, request.session.session_index, request.prompt_frame,
+                    seed.object_id, 1.0, seed.mask, 1.0), 0, seed.provenance))
+                return LtaPropagationResult(request, (), (), {"model_visited_frame_ranges": [[0, 3]]}, 0)
+            with mock.patch("XTA.lta_propagation.run_mask_injected_session", side_effect=propagate_tiny):
+                tiny_result = execute_worker_task(context, "propagation_window", tiny_payload)
+            tiny_manifest = json.loads(Path(tiny_result["artifact_path"]).read_text())
+            self.assertEqual(tiny_manifest["crop_transform"]["seed_components_rescued"], 1)
+            self.assertEqual(tiny_manifest["dogfood_seed_artifacts"], [])
+            np.testing.assert_array_equal(read_union_array(tiny_manifest["union"])[0], tiny_seed.mask)
+
+    def test_worker_scaled_prompt_frame_fills_native_seed_and_drops_empty_restored_dogfood(self):
+        from XTA.lta_postprocessing import fill_binary_mask_holes_2d
+        from XTA.lta_propagation import LtaObjectPrediction, LtaPropagationResult, write_seed_artifact
+        from XTA.lta_sam import SamFramePrediction
+        from XTA.lta_union_artifacts import read_union_array
+        from XTA.lta_worker_adapter import execute_worker_task
+        side = 1092
+        vanishing = None
+        for row in range(500, 524):
+            candidate = np.zeros((1008, 1008), dtype=bool)
+            candidate[row, 501] = True
+            if not resize_crop_mask(candidate, side=side, restore=True).any():
+                vanishing = candidate
+                break
+        self.assertIsNotNone(vanishing)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            path = root / "view.raw"
+            with path.open("wb") as handle:
+                handle.truncate(3 * side * side)
+            cache = reference_existing_physical_view_cache(path, shape=(3, side, side),
+                        physical_view_id="transverse", source_identity="fixture")
+            tile = TilePlan(0, 0, side, side, side)
+            ring = np.ones((60, 60), dtype=bool)
+            ring[10:50, 10:50] = False
+            seed = obj(frame=0, top=400, left=400, mask=ring).in_crop(tile, object_id=0)
+            artifact = write_seed_artifact(root / "seed.npz", (seed,))
+            window = WindowPlan("center", 0, 0, 3, 0, "both", "authoritative")
+            payload = {"work_id": "scaled-ring", "chain_work_id": "scaled-ring", "sequence_id": "fixture",
+                       "cache_ref": cache.payload(), "tile_index": 0, "tile_config_id": "dynamic",
+                       "tile": asdict(tile), "neighbors": [], "windows": [asdict(window)],
+                       "window": asdict(window), "seed_artifact_path": str(artifact.path),
+                       "seed_artifact_sha256": artifact.sha256, "conf": 0.15,
+                       "empty_frame_limit": 30, "crop_model_side": 1008,
+                       "output_frame_start": 0, "output_frame_stop": 3,
+                       "output_dir": str(root / "output")}
+            context = SimpleNamespace(predictor=object(), profile={"name": "fixture"},
+                                      sam_runtime={"version": "controlled"}, constrained_batches=None,
+                                      enable_2D_hole_fill=True)
+            def propagate(_a, _b, *, request, prediction_callback, **_kwargs):
+                (model_seed,) = request.seeds
+                prediction_callback(LtaObjectPrediction(model_seed.lineage, SamFramePrediction(
+                    request.session.sequence_id, request.session.session_index, request.prompt_frame,
+                    model_seed.object_id, 1.0, model_seed.mask, 1.0), 0, model_seed.provenance))
+                boundary = replace(model_seed, frame_index=2, mask=vanishing)
+                return LtaPropagationResult(request, (), (boundary,), {"model_visited_frame_ranges": [[0, 3]]}, 0)
+            with mock.patch("XTA.lta_propagation.run_mask_injected_session", side_effect=propagate):
+                result = execute_worker_task(context, "propagation_window", payload)
+            manifest = json.loads(Path(result["artifact_path"]).read_text())
+            union = read_union_array(manifest["union"])
+            np.testing.assert_array_equal(union[0], fill_binary_mask_holes_2d(seed.mask))
+            self.assertFalse(union[1:].any())
+            self.assertEqual(manifest["dogfood_seed_artifacts"], [])
+            self.assertEqual(manifest["crop_transform"]["dogfood_dropped_empty_after_restore"], 1)
 
 
 if __name__ == "__main__":

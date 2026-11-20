@@ -51,11 +51,17 @@ def _bf16_union(proto, coefficients, boxes, confidences, count,
         x2 = tl.load(boxes + d * 4 + 2, d < n, 0.0)
         y2 = tl.load(boxes + d * 4 + 3, d < n, 0.0)
         score = tl.load(confidences + d, d < n, 0.0)
-        # Match the FP32 kernel's rejection predicate, including NaN boxes.
-        rejected = ((x[None, :].to(tl.float32) < x1[:, None]) |
-                    (x[None, :].to(tl.float32) >= x2[:, None]) |
-                    (y[None, :].to(tl.float32) < y1[:, None]) |
-                    (y[None, :].to(tl.float32) >= y2[:, None]))
+        # Match the FP32 kernel's rejection predicate (proto_cell_rejected), including
+        # NaN boxes: a cell whose centre c+0.5 is outside [lo, hi) is rejected unless it
+        # holds a non-empty box's centre (c <= centre < c+1, i.e. floorf(centre) == c).
+        xf = x[None, :].to(tl.float32)
+        yf = y[None, :].to(tl.float32)
+        x_centre = 0.5 * (x1[:, None] + x2[:, None])
+        y_centre = 0.5 * (y1[:, None] + y2[:, None])
+        rejected = ((((xf + 0.5) < x1[:, None]) | ((xf + 0.5) >= x2[:, None])) &
+                    ~((x2[:, None] > x1[:, None]) & (xf <= x_centre) & (x_centre < xf + 1.0)))
+        rejected = rejected | ((((yf + 0.5) < y1[:, None]) | ((yf + 0.5) >= y2[:, None])) &
+                               ~((y2[:, None] > y1[:, None]) & (yf <= y_centre) & (y_centre < yf + 1.0)))
         inside = (~rejected) & (d[:, None] < n) & (pixel[None, :] < PH * PW)
         # fmaxf ignores a NaN candidate. Zero-positive confidence is evaluated
         # for every cropped detection, independent of which logit wins the max.

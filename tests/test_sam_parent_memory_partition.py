@@ -50,7 +50,7 @@ def actual_partition(monkeypatch):
     namespace.update(scheduler=scheduler,GIB=GIB,replace=replace,_env_flag=runtime._env_flag,
         interpolation_settings=SimpleNamespace(sam_enabled=True),sam_parent_staging=object(),
         policy_settings=SimpleNamespace(enabled=False),bounded_policy_parent_keys=set(),
-        dense_tiling_active=False,keep_temp_artifacts=False,gpu_worker_process_active=True,
+        dense_tiling_active=False,gpu_worker_process_active=True,
         cpu_worker_process_active=False,channel_format=SimpleNamespace(kind='gray'),
         args=SimpleNamespace(gpu_batch=1),memfd_workspace_enabled=lambda:True,
         available_anon_work_bytes=lambda:1400*GIB,
@@ -83,7 +83,7 @@ def test_actual_pipeline_uses_exact_mask_and_confidence_bytes(monkeypatch,confid
 
 
 @pytest.mark.parametrize('reason',[
-    'non_sam','cpu_detector','no_gpu','policy','policy_parent','tiles','retained','dense_override','transient_override',
+    'non_sam','cpu_detector','no_gpu','policy','policy_parent','tiles','dense_override','transient_override',
     'empty_inventory','unknown_shape','tile_task','dense_owner','inference_owner','postprocess_owner',
     'runtime_started','source_started','live_transient','funded_startup','startup_hold','startup_credit','image_hold'])
 def test_unsupported_or_already_owned_run_keeps_original_partition(monkeypatch,reason):
@@ -94,7 +94,6 @@ def test_unsupported_or_already_owned_run_keeps_original_partition(monkeypatch,r
     elif reason=='policy': ns['policy_settings'].enabled=True
     elif reason=='policy_parent': ns['bounded_policy_parent_keys'].add('parent')
     elif reason=='tiles': ns['dense_tiling_active']=True
-    elif reason=='retained': ns['keep_temp_artifacts']=True
     elif reason.endswith('_override'):
         monkeypatch.setenv('YOLO_TTA_DIRECT_UNION_TOTAL_GIB' if reason=='dense_override'
             else 'YOLO_TTA_PARENT_TRANSIENT_GIB','454')

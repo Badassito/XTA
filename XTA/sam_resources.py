@@ -14,26 +14,23 @@ import hashlib
 import json
 import os
 import operator
-from pathlib import Path
 import re
 import threading
 import time
 from types import MappingProxyType
 import uuid
 
+from .file_hashing import source_sha256
+
 GIB = 1024**3
 SCHEMA = 'xta.sam_live_resources/1'
-IMPLEMENTATION_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+IMPLEMENTATION_SHA256 = source_sha256(__file__)
 MAX_PRODUCTION_EXTRA_BYTES = 16*GIB
 MIN_PRODUCTION_EXTRA_BYTES = 512*1024**2
 _LIVE_PROFILES = {}
 _LIVE_LOCK = threading.RLock()
 _LIVE_TRACKER_ADMISSIONS = {}
 _LIVE_RETRY_CHILD_REQUESTS = {}
-_TRACKER_ADMISSION_SEAL = object()
-_MASK_PACKING_SEAL = object()
-_RETRY_CHILD_SEAL = object()
-_PARENT_IMAGE_FUNDING_SEAL = object()
 MAX_TRACKER_LOOKAHEAD_BYTES = GIB
 MAX_IMAGE_STAGING_BYTES = 16*GIB
 
@@ -128,11 +125,6 @@ class _ParentImageFunding:
     lease: object = field(repr=False)
     lease_id: str
     charged_bytes: int
-    _seal: object = field(repr=False, compare=False)
-
-    def __post_init__(self):
-        if self._seal is not _PARENT_IMAGE_FUNDING_SEAL:
-            raise TypeError('SAM image funding must be minted by live image admission')
 
 
 def _parent_funded_image_bytes(pool, staging):
@@ -142,7 +134,6 @@ def _parent_funded_image_bytes(pool, staging):
     total = 0
     for identity, funding in getattr(staging, '_sam_parent_funded_images', {}).items():
         if (type(funding) is not _ParentImageFunding
-                or funding._seal is not _PARENT_IMAGE_FUNDING_SEAL
                 or funding.parent_pool is not pool or funding.staging_pool is not staging
                 or funding.lease_id != identity or funding.charged_bytes <= 0
                 or funding.lease.lease_id != identity or funding.lease.pool is not staging
@@ -162,8 +153,7 @@ def _charge_parent_funded_image(lease):
     staging = lease.pool
     pool = staging._sam_parent_pool
     _parent_funded_image_bytes(pool, staging)
-    funding = _ParentImageFunding(pool, staging, lease, lease.lease_id,
-        lease.charged_bytes, _PARENT_IMAGE_FUNDING_SEAL)
+    funding = _ParentImageFunding(pool, staging, lease, lease.lease_id, lease.charged_bytes)
     registry = getattr(staging, '_sam_parent_funded_images', None)
     if registry is None:
         registry = staging._sam_parent_funded_images = {}
@@ -370,9 +360,7 @@ class SamTrackerScopeAdmission:
     preparation permission immediately; already accepted work keeps its bytes.
     """
 
-    def __init__(self, profile, limits, *, _seal=None, _identity=None):
-        if _seal is not _TRACKER_ADMISSION_SEAL:
-            raise TypeError('SAM tracker admission must be minted from a live parent profile')
+    def __init__(self, profile, limits, *, _identity=None):
         self._profile = profile
         self._limits = MappingProxyType(dict(limits))
         self._identity = _identity or uuid.uuid4().hex
@@ -479,7 +467,7 @@ class SamTrackerScopeAdmission:
             self._validate_producer()
             if not self._scope_active:
                 raise RuntimeError('SAM mask packing requires an active tracker scope')
-            packing = SamMaskPackingAdmission(self, _seal=_MASK_PACKING_SEAL)
+            packing = SamMaskPackingAdmission(self)
             self._packing_admissions.add(packing)
             return packing
 
@@ -557,9 +545,7 @@ class SamMaskPackingAdmission:
     Futures are retained through publication and joined before scope refund.
     """
 
-    def __init__(self, scope, *, _seal=None):
-        if _seal is not _MASK_PACKING_SEAL:
-            raise TypeError('SAM mask packing must be minted from a live tracker scope')
+    def __init__(self, scope):
         self._scope = scope
         self._closed = False
         self._futures = set()
@@ -569,7 +555,8 @@ class SamMaskPackingAdmission:
     def validate(self):
         with self._scope._lock:
             self._scope._validate_producer()
-            if self._closed or not self._scope._scope_active:
+            # Only admissions minted by admit_mask_packing are joined before scope refund.
+            if self._closed or not self._scope._scope_active or self not in self._scope._packing_admissions:
                 raise RuntimeError('SAM mask packing admission has expired')
         return self
 
@@ -807,8 +794,7 @@ def admit_sam_tracker_scope(profile, cpu_wave_admission, *, max_seed_pixels, max
             raw_consumer_margin_is_not_prepared_bank_credit=True)
         if fresh_bank_limit is not None:
             limits['retry_fresh_bank_limit_bytes'] = fresh_bank_limit
-        admission = SamTrackerScopeAdmission(profile, limits, _seal=_TRACKER_ADMISSION_SEAL,
-                                             _identity=identity)
+        admission = SamTrackerScopeAdmission(profile, limits, _identity=identity)
         with _LIVE_LOCK:
             _LIVE_TRACKER_ADMISSIONS[admission._identity] = admission
         return admission
@@ -1044,9 +1030,7 @@ def validate_live_sam_resource_profile(profile, *, require_extra=False):
 class _RetryChildResources:
     """One fresh retry-group grant; its issued callback already retains the parent."""
 
-    def __init__(self, parent, scope_id, expected, *, _seal=None):
-        if _seal is not _RETRY_CHILD_SEAL:
-            raise TypeError('SAM retry child resources require an original-owner factory')
+    def __init__(self, parent, scope_id, expected):
         self._parent, self._pool = parent, parent._lease.pool
         self._scope_id, self._identity = str(scope_id), uuid.uuid4().hex
         self._expected = MappingProxyType(dict(expected))
@@ -1247,7 +1231,7 @@ def prepare_retry_child_resources(parent_profile, child_scope_id):
         parent_profile._validate_owner()
         if parent_profile._lease.borrowed_parent_lease is not None:
             raise RuntimeError('SAM retry child factories cannot create nested child grants')
-        request = _RetryChildResources(parent_profile, child_scope_id, expected, _seal=_RETRY_CHILD_SEAL)
+        request = _RetryChildResources(parent_profile, child_scope_id, expected)
         parent_profile._lease.scope_holds += 1
         try:
             with _LIVE_LOCK:

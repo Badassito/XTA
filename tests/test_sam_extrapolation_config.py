@@ -7,7 +7,7 @@ import pytest
 
 from XTA import cli
 from XTA.config import (build_argparser, resolve_backend_devices, resolve_backend_models,
-    resolve_interpolation_settings, resolve_sam_crop_mode, resolve_sam_tight_crop_guard)
+    resolve_interpolation_settings, resolve_sam_crop_mode)
 
 
 def _resolve(*extra, models=('gpu:detector.engine', 'sam:bundle'), devices=('0',)):
@@ -68,20 +68,12 @@ def test_cpu_detector_needs_explicit_sam_pool_for_extrapolation():
     assert settings.backend == 'sdf' and settings.sam_enabled
 
 
-def test_extrapolation_only_ignores_unused_interpolation_guard(monkeypatch):
-    monkeypatch.setenv('YOLO_TTA_SAM_TIGHT_CROP_GUARD', 'unused-invalid')
-    with mock.patch('XTA.config.resolve_sam_tight_crop_guard', side_effect=AssertionError('unused guard read')):
-        _, settings = _resolve('--interpolation_distance', '0', '--extrapolation_distance', '4')
-    assert settings.sam_enabled and settings.sam_tight_crop_guard is None
-
-
-def test_disabled_sam_work_ignores_unused_crop_and_guard_environments(monkeypatch):
+def test_disabled_sam_work_ignores_unused_crop_environment(monkeypatch):
     monkeypatch.setenv('YOLO_TTA_SAM_CROP_MODE', 'unused-invalid')
-    monkeypatch.setenv('YOLO_TTA_SAM_TIGHT_CROP_GUARD', 'unused-invalid')
     _, settings = _resolve('--interpolation_distance', '0', '--extrapolation_distance', '0',
         models=('cpu:detector.xml',), devices=('cpu',))
     assert not settings.sam_enabled
-    assert settings.sam_crop_mode is None and settings.sam_tight_crop_guard is None
+    assert settings.sam_crop_mode is None
 
 
 def test_real_cli_rejects_missing_extrapolation_bundle_before_runtime():
@@ -92,17 +84,16 @@ def test_real_cli_rejects_missing_extrapolation_bundle_before_runtime():
         runtime.assert_not_called()
 
 
-def test_real_cli_pins_shared_crop_and_skips_unused_guard_for_extrapolation(monkeypatch):
+def test_real_cli_pins_shared_crop_for_extrapolation(monkeypatch):
     monkeypatch.setenv('YOLO_TTA_SAM_CROP_MODE', 'tiled')
-    monkeypatch.setenv('YOLO_TTA_SAM_TIGHT_CROP_GUARD', 'unused-invalid')
     observed = []
     def runtime():
         monkeypatch.setenv('YOLO_TTA_SAM_CROP_MODE', 'whole')
-        observed.extend([resolve_sam_crop_mode(), resolve_sam_tight_crop_guard()])
+        observed.append(resolve_sam_crop_mode())
     with mock.patch('XTA.tta_mode.run', side_effect=runtime):
         cli._run_tta(['--input', 'source.mkv', '--device', '0', '--model', 'gpu:detector.engine', 'sam:bundle',
             '--interpolation_distance', '0', '--extrapolation_distance', '2'])
-    assert observed == ['tiled', None]
+    assert observed == ['tiled']
 
 
 @pytest.mark.parametrize('updates', [dict(extrapolation_distance=True), dict(extrapolation_distance=1.5),

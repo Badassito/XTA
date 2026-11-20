@@ -2,17 +2,22 @@
 
 The signed Euclidean distance field is measured in native voxel units. Linear
 interpolation samples that field at native voxel centers and its zero contour
-defines an inward-smoothed subset of the nearest-cell edited foreground. Edited
-background cells remain entirely background. A one-cell background border
-supplies the boundary condition at the edge of the preview. This reconstructs
-edited shape without recovering detail absent from the preview.
+defines an inward-smoothed subset of the nearest-cell edited foreground. Each
+edited foreground cell also keeps the native voxel nearest its center, which is
+the voxel the writer audits; the receipt counts voxels kept only by this rule as
+reconstruction.retained_center_voxels. Edited background cells remain entirely
+background. A one-cell background border supplies the boundary condition at the
+edge of the preview. This reconstructs edited shape without recovering detail
+absent from the preview.
 
 The distance field is preview-sized; native floats exist only in bounded output
 blocks. scipy's EDT workspace is also preview-sized. Linear distance interpolation
 can split very thin shapes. The writer checks every edited voxel center and the
 6-connected foreground-component count against the actual written native grid.
-It refuses publication if either changes. The background-cell restriction prevents
-connections across edited background; no arbitrary subvoxel topology is promised.
+It refuses publication if either changes; with centers retained, numerical
+refusals come only from component-count changes. The background-cell restriction
+prevents connections across edited background; no arbitrary subvoxel topology is
+promised.
 """
 from __future__ import annotations
 
@@ -33,8 +38,8 @@ except ImportError:
     _IGzipFile = None
 
 
-VERSION = '1.0.0'
-ALGORITHM = 'edited-binary-signed-distance-inward-cell-centers/2'
+VERSION = '1.1.0'
+ALGORITHM = 'edited-binary-signed-distance-inward-cell-centers/3'
 POLICY = ALGORITHM
 MIB = 1024 ** 2
 
@@ -115,7 +120,7 @@ def block_plan(full_shape, block_mib=64, workers=1):
             'aggregate_native_buffer_budget_mib': block_mib}
 
 
-def _blocks(field, preview, full, block_mib, workers):
+def _blocks(field, preview, full, block_mib, workers, stats=None):
     # Bound the aggregate float/binary result buffers across workers. One row is
     # the unavoidable minimum; no full native float volume is ever allocated.
     rows = block_plan(full, block_mib, workers)['row_block_height']
@@ -123,6 +128,15 @@ def _blocks(field, preview, full, block_mib, workers):
     matrix = np.diag(scale)
     offset = .5 * scale + .5  # cell centers plus the padded input border
     source_x = _cell_indices(preview.shape[2], full[2])
+    # Native voxels nearest each preview center: exactly the voxels the writer
+    # audit samples. Interpolation can leave one negative at a convex corner or
+    # isolated cell on low-ratio grids, and at every outward corner at exactly
+    # 2x; an edited foreground cell keeps that one voxel.
+    centers = []
+    for low_n, full_n in zip(preview.shape, full):
+        mark = np.zeros(full_n, bool)
+        mark[_cell_indices(full_n, low_n)] = True
+        centers.append(mark)
 
     def work(item):
         t, y, n = item
@@ -132,10 +146,10 @@ def _blocks(field, preview, full, block_mib, workers):
         foreground_rows = np.flatnonzero(np.any(trusted, axis=1))
         output = np.zeros((n, full[2]), np.uint8)
         if not foreground_rows.size:
-            return t, y, output
+            return t, y, output, 0
         # Keep the original affine origin exactly. Cropping leading rows/columns
         # would reassociate floating-point coordinate arithmetic at zero ties.
-        # Trailing background needs no interpolation because POLICY/2 excludes it.
+        # Trailing background needs no interpolation because the policy excludes it.
         height = int(foreground_rows[-1]) + 1
         width = int(np.flatnonzero(np.any(trusted, axis=0))[-1]) + 1
         start = np.array([t, y, 0], np.float64)
@@ -143,14 +157,29 @@ def _blocks(field, preview, full, block_mib, workers):
             field, matrix, offset=offset + scale * start,
             output_shape=(1, height, width), output=np.float32,
             order=1, mode='constant', cval=-float(max(full)), prefilter=False)
-        output[:height, :width] = (values[0] > 0) & trusted[:height, :width]
+        positive = values[0] > 0
+        output[:height, :width] = positive & trusted[:height, :width]
+        retained = 0
+        if centers[0][t]:
+            kept = (trusted[:height, :width] & ~positive
+                    & centers[1][y:y + height, None] & centers[2][None, :width])
+            retained = int(np.count_nonzero(kept))
+            if retained:
+                output[:height, :width] |= kept
+        return t, y, output, retained
+
+    def emit(result):
+        # Accumulate in the consuming thread; public slabs keep (t, y, rows).
+        t, y, output, retained = result
+        if stats is not None:
+            stats['retained_center_voxels'] += retained
         return t, y, output
 
     tasks = ((t, y, min(rows, full[1] - y))
              for t in range(full[0]) for y in range(0, full[1], rows))
     if workers == 1:
         for task in tasks:
-            yield work(task)
+            yield emit(work(task))
         return
     # Executor.map eagerly submits all tasks on older Python versions. Keep a
     # bounded ordered queue instead so completed native blocks cannot accumulate.
@@ -161,7 +190,7 @@ def _blocks(field, preview, full, block_mib, workers):
             if task is not None:
                 pending.append(executor.submit(work, task))
         while pending:
-            result = pending.pop(0).result()
+            result = emit(pending.pop(0).result())
             task = next(tasks, None)
             if task is not None:
                 pending.append(executor.submit(work, task))
@@ -355,6 +384,7 @@ def write_edited_shape(path, preview, full_shape, block_mib=64, workers=1):
               'kinds: domain domain domain\nencoding: gzip\nspace origin: (0,0,0)\n\n')
     temporary = None
     count = 0
+    stats = {'retained_center_voxels': 0}
     payload_hash = hashlib.sha256()
     try:
         with tempfile.NamedTemporaryFile(mode='wb', prefix=path.name + '.', suffix='.tmp',
@@ -362,7 +392,7 @@ def write_edited_shape(path, preview, full_shape, block_mib=64, workers=1):
             temporary = Path(raw.name)
             raw.write(header.encode('ascii'))
             with codec(filename='', fileobj=raw, mode='wb', compresslevel=1, mtime=0) as z:
-                for _, _, block in _blocks(_signed_distance_field(a, full), a, full, block_mib, workers):
+                for _, _, block in _blocks(_signed_distance_field(a, full), a, full, block_mib, workers, stats):
                     data = memoryview(np.ascontiguousarray(block)).cast('B')
                     z.write(data)
                     payload_hash.update(data)
@@ -382,8 +412,10 @@ def write_edited_shape(path, preview, full_shape, block_mib=64, workers=1):
                 'gzip_backend': 'isal' if codec is _IGzipFile else 'stdlib',
                 'execution': block_plan(full, block_mib, workers),
                 'center_roundtrip': audit,
+                'retained_center_voxels': stats['retained_center_voxels'],
                 'separation_audit': topology,
-                'smoothing': 'inward only; edited background cells remain background',
+                'smoothing': ('inward only; edited background cells remain background; '
+                              'each edited foreground cell keeps its nearest native center'),
                 'topology_scope': 'background cells, voxel centers and foreground 6-components audited; arbitrary subvoxel topology is not guaranteed',
             },
         }

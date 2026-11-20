@@ -232,9 +232,9 @@ def test_real_confidence_reader_is_compiled_bounded_and_returns_owned_planes(tmp
     else:
         # Minimum compiled admission, as well as the public reader's existing
         # envelope, must fit. No source/output bytes are charged to plan credit.
-        estimate = fast.estimate_native_pull_plan_bytes(view,source.shape,shape)
+        base_bytes = fast._preflight(view,source.shape,shape)[2]['initialization_peak_bytes']
         budget = max(descriptor.fixed_bytes+descriptor.bytes_per_point,
-            math.prod(shape[1:])+256*1024+estimate['base_bytes']+(192 if family!='tilted' else 0))
+            math.prod(shape[1:])+256*1024+base_bytes+(192 if family!='tilted' else 0))
     first = 3*math.prod(shape[1:])
     expected = reference(source,view,shape,first,math.prod(shape[1:]),numeric=True).reshape(shape[1:])
     with score_projection_reader(source,view,shape,tmp_path,memory_bytes=budget) as read:

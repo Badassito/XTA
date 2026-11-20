@@ -103,7 +103,6 @@ def _run_tta(arguments: Sequence[str]) -> None:
         resolve_backend_models,
         resolve_interpolation_settings,
         activate_sam_crop_mode,
-        activate_sam_tight_crop_guard,
         activate_sam_adaptive_crop,
     )
     from .tta_augmentation_config import resolve_tta_augmentation
@@ -142,7 +141,6 @@ def _run_tta(arguments: Sequence[str]) -> None:
         mode_arguments=mode_arguments,
     ):
         with (activate_sam_crop_mode(interpolation.sam_crop_mode),
-              activate_sam_tight_crop_guard(interpolation.sam_tight_crop_guard),
               activate_sam_adaptive_crop(interpolation.sam_adaptive_crop)):
             with _mode_sys_argv(mode_arguments):
                 run_tta()

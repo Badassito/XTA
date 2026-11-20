@@ -978,7 +978,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
         self.assertEqual(len(stats), 2)
         for kwargs in kwargs_seen:
             self.assertEqual(kwargs["sigma"], 1.25)
-            self.assertEqual(kwargs["mode"], "constant")
+            self.assertEqual(kwargs["mode"], "nearest")
             self.assertEqual(kwargs["cval"], 0.0)
             self.assertEqual(kwargs["truncate"], 4.0)
 

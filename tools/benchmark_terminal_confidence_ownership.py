@@ -146,7 +146,7 @@ def fixture(shape, pattern, parent, seed):
         if pattern in ('dense', 'noisy'):
             mask[z] = 255
         elif pattern == 'compact':
-            # About19.4% of each active plane; retain the full2048-square source.
+            # About 19.4% of each active plane; retain the full 2048-square source.
             y0,x0 = int(shape[1]*.2),int(shape[2]*.2)
             y1,x1 = min(shape[1],y0+max(1,int(shape[1]*.44))),min(shape[2],x0+max(1,int(shape[2]*.44)))
             mask[z,y0:y1,x0:x1] = 173
@@ -358,7 +358,7 @@ def run_arm(args, output, arm, pattern, shape, baseline, *, warmup=False, gated=
             packed_completed_resident_bytes=sum(p['pack']['resident_bytes'] for p in observed.parents),
             source_only_capacity_proxy_seconds=observed.admission_capacity_seconds,
             admission_scope='Not net admission: source-only byte proxy excludes packed retained output and independent workspace promises. Actual scheduler admission is separately qualified.',
-            byte_scope='Unique source roots exact; queue promises and actual stage bytes sampled. Frame buffers bounded by funded plan; RSS sampled20ms includes allocator retention. Disk page cache is not exact resident accounting.',
+            byte_scope='Unique source roots exact; queue promises and actual stage bytes sampled. Frame buffers bounded by funded plan; RSS sampled every 20 ms includes allocator retention. Disk page cache is not exact resident accounting.',
             peak_sampled_rss_bytes=max((s['rss_bytes'] for s in observed.samples),default=None),
             independent_decoded_oracles_passed=True, gated_ownership_proof=gated,
             local_only=True, warmup=warmup)

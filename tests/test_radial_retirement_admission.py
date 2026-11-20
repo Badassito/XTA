@@ -18,12 +18,9 @@ class RadialSchedulerRetirementAdmissionTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        for patch in (
-            mock.patch.object(bp, 'v1613_d1_backprojection_overlap_enabled', return_value=True),
-            mock.patch.object(bp, 'gpu_worker_aux_interpolation_pool', return_value=None),
-        ):
-            patch.start()
-            self.addCleanup(patch.stop)
+        aux = mock.patch.object(bp, 'gpu_worker_aux_interpolation_pool', return_value=None)
+        aux.start()
+        self.addCleanup(aux.stop)
         self.coordinator = bp._MainProcessGpuStageCoordinator()
         self.coordinator.configure_workers([0, 1, 2, 3])
         self.torch = SimpleNamespace(cuda=SimpleNamespace(
@@ -83,13 +80,9 @@ class RadialSchedulerRetirementAdmissionTests(unittest.TestCase):
         self.assertFalse(snapshot['pending_inference_backlog'])
         self.assertTrue(snapshot['inference_priority_active'])
         self.assertFalse(snapshot['inference_inflight'])
-        for fallback_overlap in (False, True):
-            with self.subTest(fallback_overlap=fallback_overlap), mock.patch.object(
-                bp, 'v1613_d1_backprojection_overlap_enabled', return_value=fallback_overlap,
-            ):
-                lease = self.acquire(0)
-                self.assertIsNotNone(lease)
-                lease.release()
+        lease = self.acquire(0)
+        self.assertIsNotNone(lease)
+        lease.release()
 
     def test_cluster_shaped_57_parent_255_gib_backlog_opens_idle_projection(self):
         gib = 1024 ** 3

@@ -53,8 +53,7 @@ def _run(mask, tmp_path, *, connectivity=6, block=2, devices=(0, 1), disk=False)
         mask != 0, structure=ndimage.generate_binary_structure(3, {6: 1, 18: 2, 26: 3}[connectivity]),
     )
     actual = mask.copy()
-    with mock.patch.dict('os.environ', {'YOLO_TTA_VOIDFILL_CONNECTIVITY': str(connectivity)}), \
-         mock.patch.object(gpu, '_try_import_cupy_ndimage', return_value=_fake_cupy(mask.shape, block)), \
+    with mock.patch.object(gpu, '_try_import_cupy_ndimage', return_value=_fake_cupy(mask.shape, block)), \
          mock.patch.object(topology, 'should_use_in_memory_workspace', return_value=not disk):
         stats = topology.fill_3d_voids_inplace_streaming(
             actual, tmp_path / 'void', connectivity=connectivity, gpu_device_ids=devices,
@@ -137,15 +136,33 @@ def test_partial_gpu_labels_are_discarded_on_label_failure(tmp_path):
     np.testing.assert_array_equal(mask, ndimage.binary_fill_holes(original))
 
 
+def test_default_background_connectivity_fills_closed_diagonal_shell(tmp_path):
+    # A 1-voxel octahedral shell is closed for the 26-connected foreground; only
+    # its 6-connected background dual keeps the 129-voxel interior enclosed.
+    taxicab = np.sum(np.abs(np.indices((15, 15, 15)) - 7), axis=0)
+    mask = (taxicab == 5).astype(np.uint8)
+    interior = int(np.count_nonzero(taxicab < 5))
+    assert interior == 129
+    filled = mask.copy()
+    stats = topology.fill_3d_voids_inplace_streaming(filled, tmp_path / 'default')
+    assert stats['backend'] == 'cpu'
+    np.testing.assert_array_equal(filled != 0, taxicab <= 5)
+
+    leaky = mask.copy()
+    topology.fill_3d_voids_inplace_streaming(leaky, tmp_path / 'explicit', connectivity=18)
+    np.testing.assert_array_equal(leaky, mask)
+
+
 def test_no_device_and_invalid_connectivity_do_not_enter_gpu(tmp_path):
     mask = np.ones((3, 3, 3), np.uint8)
     with mock.patch.object(gpu, 'prepare_gpu_void_fill') as prepare:
         stats = topology.fill_3d_voids_inplace_streaming(mask, tmp_path / 'void')
         assert stats['backend'] == 'cpu'
         prepare.assert_not_called()
-        with mock.patch.dict('os.environ', {'YOLO_TTA_VOIDFILL_CONNECTIVITY': '7'}):
-            with pytest.raises(ValueError, match='6, 18, or 26'):
-                topology.fill_3d_voids_inplace_streaming(mask, tmp_path / 'void', gpu_device_ids=(0,))
+        with pytest.raises(ValueError, match='6, 18, or 26'):
+            topology.fill_3d_voids_inplace_streaming(
+                mask, tmp_path / 'void', connectivity=7, gpu_device_ids=(0,),
+            )
         prepare.assert_not_called()
 
 
@@ -156,8 +173,9 @@ def test_real_gpu_connectivity(tmp_path, connectivity):
     expected = ndimage.binary_fill_holes(
         mask, structure=ndimage.generate_binary_structure(3, {6: 1, 18: 2, 26: 3}[connectivity]),
     )
-    with mock.patch.dict('os.environ', {'YOLO_TTA_VOIDFILL_CONNECTIVITY': str(connectivity)}):
-        stats = topology.fill_3d_voids_inplace_streaming(mask, tmp_path / 'void', gpu_device_ids=(0,))
+    stats = topology.fill_3d_voids_inplace_streaming(
+        mask, tmp_path / 'void', connectivity=connectivity, gpu_device_ids=(0,),
+    )
     assert stats['backend'] == 'cuda', stats
     assert stats['chunks'] >= 3
     np.testing.assert_array_equal(mask, expected)

@@ -166,7 +166,7 @@ def main():
                      physical.num_slices - args.lease_frames)
         if offset < 0:
             raise ValueError('View has fewer frames than the requested fixed lease')
-        job = geometry.build_aug_job_for_variant(view, args.imgsz, args.output_dir)
+        job = geometry.build_aug_job_for_variant(view, args.imgsz)
         native_h, native_w = geometry.view_processing_plane_shape(view, args.imgsz)
         matrix = geometry.output_to_view_processing_affine(view, job.aff.M_out_to_src, args.imgsz)
         for mode in ('generic', 'native', 'native', 'generic'):

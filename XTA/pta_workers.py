@@ -1,7 +1,8 @@
 """Persistent PTA render-worker process state, tasks, and pool ownership.
 
 Normal CPU process workers use spawn plus named shared-memory payloads.  The
-external GPU augmentation path retains its documented fork-only exception.
+external GPU augmentation path prefers fork for its CUDA owners where the host
+supports it and otherwise spawns them with the policy reloaded by content hash.
 This module is the canonical multiprocessing owner and never imports
 :mod:`XTA.pta`.
 """
@@ -16,6 +17,7 @@ import pickle
 import queue
 import threading
 import time
+import traceback
 from collections import Counter, defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
@@ -36,6 +38,7 @@ except Exception as exc:  # pragma: no cover
     raise RuntimeError("tqdm is required: pip install tqdm") from exc
 
 from . import geometry as shared_geometry
+from .env_flags import env_flag
 from .runtime import runtime_telemetry, runtime_telemetry_phase, runtime_trace_event, shutdown_runtime_observability
 from .pta_augmentation import (
     LoadedAugmentation,
@@ -43,6 +46,7 @@ from .pta_augmentation import (
     OfflineAugmentation,
     inspect_augmentation_definition,
     load_augmentation_definition,
+    load_gpu_augmentation_definition,
 )
 from .pta_dataset import OutputCandidate
 from .pta_binary import candidate_binary_output_path, publish_binary_mask_payloads
@@ -86,8 +90,6 @@ from .pta_scheduler import (
     should_flush_ready_gpu_work as _should_flush_ready_gpu_work,
     split_work_batch as _split_gpu_work_batch,
 )
-from .unification.contracts import RasterPlan
-from .workspace import azimuthal_source_mode as _azimuthal_source_mode
 
 
 class _StemmedSource(Protocol):
@@ -280,19 +282,21 @@ def ensure_shared_uint8(arr: np.ndarray, block: Optional[SharedBlock], allocator
 
 _WORKER_STATIC: Dict[str, object] = {}
 
-# CUDA state is deliberately child-local.  The GPU-policy exception forks the
-# persistent pool before source decode or any CUDA context exists; each owner
-# then builds its runtime in the initializer while the parent prepares.
+# CUDA state is deliberately child-local.  The GPU-policy pool starts (fork where
+# available, otherwise spawn) before source decode or any CUDA context exists;
+# each owner then builds its runtime in the initializer while the parent prepares.
 _WORKER_GPU_DEVICE_ID: Optional[int] = None
 _WORKER_GPU_RUNTIME: Optional[Dict[str, object]] = None
 _WORKER_GPU_RUNTIME_ERROR: Optional[Exception] = None
 _WORKER_GPU_CODEC_WARNING_EMITTED = False
 _WORKER_GPU_BATCH_CAP_WARNING_EMITTED = False
+# Formatted traceback of a failed spawned-worker static install; every task raises it.
+_WORKER_INITIALIZER_ERROR: Optional[str] = None
 
 
 def _owner_option_enabled(name: str) -> bool:
     """Default-on GPU-owner start-up overlap; 0 restores first-task behavior."""
-    return os.environ.get(name, "1").strip().lower() not in {"0", "false", "no", "off", "disabled"}
+    return env_flag(name, True)
 
 
 _THREAD_AFFINITY_LOCK = threading.Lock()
@@ -307,11 +311,20 @@ def _render_worker_initializer(
 ) -> None:
     global _WORKER_GPU_DEVICE_ID, _WORKER_GPU_RUNTIME, _WORKER_GPU_RUNTIME_ERROR
     global _WORKER_GPU_CODEC_WARNING_EMITTED, _WORKER_GPU_BATCH_CAP_WARNING_EMITTED
+    global _WORKER_INITIALIZER_ERROR
     # Pool exit skips atexit; sample after the GPU publication finalizer (15).
     from multiprocessing.util import Finalize
     Finalize(None, shutdown_runtime_observability, exitpriority=10)
+    _WORKER_INITIALIZER_ERROR = None
     if worker_static_payload is not None:
-        _initialize_spawned_worker_static_context(worker_static_payload)
+        try:
+            _initialize_spawned_worker_static_context(worker_static_payload)
+        except Exception:
+            # Pool respawns a worker whose initializer raises, without end, while
+            # the parent waits for results.  The worker stays up and every task
+            # raises this error, so the run fails through the result path.
+            _WORKER_INITIALIZER_ERROR = traceback.format_exc()
+            return
     if _WORKER_GPU_RUNTIME is not None:
         _join_intensity_prestage(_WORKER_GPU_RUNTIME)
     if _WORKER_GPU_RUNTIME is not None and _WORKER_GPU_RUNTIME.get("categorical_volume_owner") is not None:
@@ -428,35 +441,35 @@ def set_worker_static_context(
 
 
 def _spawn_worker_static_payload() -> Dict[str, object]:
-    """Return a picklable worker contract for the normal spawn process path.
+    """Return a picklable worker contract for the spawn process path.
 
-    Loaded Albumentations pipelines contain thread locals, closures, and
-    imported module objects, so they must never be pickled.  A spawned child
-    instead receives the already-validated definition identity and reloads it
-    from the authoritative file.  The content digest is checked before import
-    so a policy changed between parent preflight and pool startup is rejected.
+    Loaded Albumentations pipelines and GPU policy factories contain thread
+    locals, closures, and imported module objects, so they must never be
+    pickled.  A spawned child instead receives the already-validated
+    definition identity (CPU or GPU) and reloads it from the authoritative
+    file.  The content digest is checked before import so a policy changed
+    between parent preflight and pool startup is rejected.  GPU owners also
+    receive the selected CUDA device ids.
     """
 
     if not _WORKER_STATIC:
         raise RuntimeError("PTA render worker static context has not been initialized")
     augmentation = _WORKER_STATIC.get("augmentation")
-    if isinstance(augmentation, LoadedGpuAugmentation):
-        raise RuntimeError(
-            "GPU offline augmentation retains its explicit fork-only worker path; "
-            "it cannot be serialized into the normal spawn worker contract"
-        )
     augmentation_definition: Optional[Dict[str, str]] = None
-    if isinstance(augmentation, LoadedAugmentation):
+    gpu_ids: Tuple[int, ...] = ()
+    if isinstance(augmentation, (LoadedAugmentation, LoadedGpuAugmentation)):
         augmentation_definition = {
-            "kind": "cpu",
+            "kind": "gpu" if isinstance(augmentation, LoadedGpuAugmentation) else "cpu",
             "path": str(augmentation.path),
             "content_sha256": str(augmentation.content_sha256),
             "export_name": str(augmentation.export_name),
         }
+        if isinstance(augmentation, LoadedGpuAugmentation):
+            gpu_ids = tuple(int(x) for x in _WORKER_STATIC.get("gpu_device_ids", ()))  # type: ignore[union-attr]
     elif augmentation is not None:
         raise TypeError(
-            "Normal PTA process workers support no augmentation or a LoadedAugmentation; "
-            f"got {type(augmentation).__name__}"
+            "PTA process workers support no augmentation, a LoadedAugmentation, or a "
+            f"LoadedGpuAugmentation; got {type(augmentation).__name__}"
         )
     return {
         "schema": "pta.v18.spawn-worker-static/1",
@@ -469,7 +482,7 @@ def _spawn_worker_static_payload() -> Dict[str, object]:
         "tiff_encode_backend": str(_WORKER_STATIC.get("tiff_encode_backend", "auto")),
         "gpu_batch_size": int(_WORKER_STATIC["gpu_batch_size"]),
         "gpu_render_threads": int(_WORKER_STATIC.get("gpu_render_threads", 1)),
-        "gpu_device_ids": (),
+        "gpu_device_ids": gpu_ids,
         "augmentation_definition": augmentation_definition,
         "save_images": bool(_WORKER_STATIC.get("save_images", True)),
         "save_labels": bool(_WORKER_STATIC.get("save_labels", True)),
@@ -487,30 +500,41 @@ def _initialize_spawned_worker_static_context(payload: Mapping[str, object]) -> 
             f"{payload.get('schema')!r}"
         )
     augmentation: Optional[OfflineAugmentation] = None
+    gpu_device_ids = tuple(int(x) for x in payload.get("gpu_device_ids", ()))  # type: ignore[union-attr]
     definition_payload = payload.get("augmentation_definition")
     if definition_payload is not None:
         if not isinstance(definition_payload, Mapping):
             raise TypeError("PTA spawn augmentation definition must be a mapping")
-        if str(definition_payload.get("kind", "")) != "cpu":
-            raise RuntimeError("Only CPU augmentation definitions are valid in PTA spawn workers")
+        kind = str(definition_payload.get("kind", ""))
+        if kind not in {"cpu", "gpu"}:
+            raise RuntimeError(f"Unsupported PTA spawn augmentation definition kind: {kind!r}")
+        label = kind.upper()
         path = Path(str(definition_payload["path"])).expanduser().resolve()
         expected_sha256 = str(definition_payload["content_sha256"])
         expected_export = str(definition_payload["export_name"])
         inspected = inspect_augmentation_definition(str(path))
         if inspected.content_sha256 != expected_sha256 or inspected.export_name != expected_export:
             raise RuntimeError(
-                "PTA CPU augmentation policy changed after parent preflight; refusing to "
+                f"PTA {label} augmentation policy changed after parent preflight; refusing to "
                 f"import it in a spawned worker: {path}"
             )
-        augmentation = load_augmentation_definition(str(path))
+        if kind == "gpu":
+            augmentation = load_gpu_augmentation_definition(str(path))
+        else:
+            augmentation = load_augmentation_definition(str(path))
         if (
             augmentation.content_sha256 != expected_sha256
             or augmentation.export_name != expected_export
         ):
             raise RuntimeError(
-                "PTA CPU augmentation identity changed while loading it in a spawned worker: "
+                f"PTA {label} augmentation identity changed while loading it in a spawned worker: "
                 f"{path}"
             )
+        if kind == "gpu":
+            if not isinstance(augmentation, LoadedGpuAugmentation):
+                raise TypeError(f"PTA spawn GPU definition did not load a GPU policy: {path}")
+            if not gpu_device_ids:
+                raise RuntimeError("PTA spawn GPU augmentation contract has no CUDA device ids")
 
     _WORKER_STATIC.clear()
     _WORKER_STATIC.update({
@@ -523,7 +547,7 @@ def _initialize_spawned_worker_static_context(payload: Mapping[str, object]) -> 
         "tiff_encode_backend": str(payload.get("tiff_encode_backend", "auto")),
         "gpu_batch_size": int(payload["gpu_batch_size"]),
         "gpu_render_threads": max(1, int(payload.get("gpu_render_threads", 1))),
-        "gpu_device_ids": (),
+        "gpu_device_ids": gpu_device_ids,
         "augmentation": augmentation,
         "save_images": bool(payload.get("save_images", True)),
         "save_labels": bool(payload.get("save_labels", True)),
@@ -764,13 +788,19 @@ def _render_semantic_coverage_item(
 
 
 def _require_gpu_semantic_coverage_contract(policy: object, coverage: Optional[np.ndarray]) -> None:
-    if coverage is not None and getattr(policy, "mask_independent_geometry", False) is not True:
-        raise RuntimeError(
-            "Forced partial semantic masks with GPU augmentation require a policy that "
-            "declares mask_independent_geometry = True. The GPU policy API accepts one "
-            "mask per call, so annotation coverage can be replayed safely only when "
-            "spatial transforms do not depend on mask contents."
-        )
+    if coverage is None or getattr(policy, "mask_independent_geometry", False) is True:
+        return
+    # The apply_batch single-source fallback can only replay, so extra masks need apply_batch_many.
+    if (getattr(policy, "supports_extra_masks", False) is True
+            and callable(getattr(policy, "apply_batch_many", None))):
+        return
+    raise RuntimeError(
+        "Forced partial semantic masks with GPU augmentation require a policy that "
+        "declares mask_independent_geometry = True, or supports_extra_masks = True with "
+        "apply_batch_many(..., extra_masks=...). Annotation coverage is either replayed, "
+        "which is safe only when spatial transforms do not depend on mask contents, or "
+        "warped in the same apply_batch_many call as the foreground mask."
+    )
 
 
 def _derive_gpu_item_source(
@@ -1083,7 +1113,7 @@ def _render_uses_cuda_intensity(runtime: Mapping[str, object], plans: Sequence[R
         elif shared_geometry.is_radial_view(view):
             family = "radial"
         elif shared_geometry.is_azimuthal_view(view):
-            family = "azimuthal" if _azimuthal_source_mode() == "texture_linear" else None
+            family = "azimuthal"
         elif shared_geometry.is_tilted_view(view):
             family = "tilted"
         elif shared_geometry.physical_view_name(view) in {"transverse", "sagittal", "coronal"}:
@@ -1356,8 +1386,7 @@ def _write_gpu_image_batch(
                     def publish_encoded_and_metadata():
                         overlap = bool(
                             semantic_indices_ready and deferred_semantic_payloads
-                            and os.environ.get('PTA_SEMANTIC_PNG_OVERLAP', '1').strip().lower()
-                            not in {'0', 'false', 'off', 'no'}
+                            and env_flag('PTA_SEMANTIC_PNG_OVERLAP', True)
                         )
                         semantic_futures = []
                         semantic_completed: List[Optional[float]] = []
@@ -1811,9 +1840,7 @@ def _cpr_projection_fallback(runtime, reason):
 
 def _gpu_projected_cpr_item_image(runtime, volume, plan, frame_idx, item_key):
     """Reuse the ordinary resident source and bounded native-plane cache."""
-    if os.environ.get("YOLO_TTA_PTA_GPU_CPR_RENDER", "1").strip().lower() in {
-        "0", "false", "no", "off", "disabled",
-    }:
+    if not env_flag("YOLO_TTA_PTA_GPU_CPR_RENDER", True):
         _cpr_projection_fallback(runtime, "disabled by YOLO_TTA_PTA_GPU_CPR_RENDER")
         return None
     if "cpr" in runtime.get("cuda_projection_disabled_families", set()):
@@ -1955,11 +1982,7 @@ def _gpu_projected_item_image(
             else "YOLO_TTA_PTA_GPU_CARTESIAN_RENDER"
         )
     )
-    if os.environ.get(gate_name, "1").strip().lower() in {
-        "0", "false", "no", "off", "disabled",
-    }:
-        return None
-    if azimuthal_view and _azimuthal_source_mode() != "texture_linear":
+    if not env_flag(gate_name, True):
         return None
     family_key = (
         "spherical" if spherical_view else "radial" if radial_view else (
@@ -2157,48 +2180,6 @@ def _gpu_projected_item_image(
                     f"({type(exc).__name__}: {exc}); using CPU projection for this worker."
                 )
         return None
-
-
-@runtime_telemetry_phase('pta.render.source')
-def _render_gpu_frame_items(
-    volume: np.ndarray,
-    mask: np.ndarray,
-    plans: Sequence[RenderPlan],
-    frame_task: FrameRenderTask,
-    semantic_coverage: Optional[np.ndarray] = None,
-) -> Tuple[_GpuItemWork, ...]:
-    """Render one frame's source items without touching CUDA state."""
-
-    plan = plans[int(frame_task.plan_idx)]
-    source = render_plan_frame_source(
-        volume=volume,
-        mask=mask,
-        plan=plan,
-        idx=int(frame_task.frame_idx),
-        need_canvas=any(item_key != "full" for item_key, _ in frame_task.items),
-    )
-    rendered: List[_GpuItemWork] = []
-    for item_key, candidates in frame_task.items:
-        item_image, item_mask, output_size = _derive_gpu_item_source(
-            source,
-            plan,
-            str(item_key),
-        )
-        rendered.append(
-            _GpuItemWork(
-                candidates=tuple(candidates),
-                image=item_image,
-                mask=item_mask,
-                output_size=tuple(int(x) for x in output_size),
-                channel_kind=str(candidates[0].channel_kind),
-                context=f"{plan.tag}/{item_key}/frame={int(frame_task.frame_idx) + 1:04d}",
-                channel_count=int(plan.channel_variant.channel_count),
-                semantic_coverage=_render_semantic_coverage_item(
-                    semantic_coverage, plan, int(frame_task.frame_idx), str(item_key), gpu_source=True,
-                ),
-            )
-        )
-    return tuple(rendered)
 
 
 @runtime_telemetry_phase('pta.render.source_group')
@@ -2837,6 +2818,7 @@ def execute_gpu_frame_batch_task(
     if semantic_coverage is not None:
         _require_gpu_semantic_coverage_contract(policy, semantic_coverage)
     apply_batch_many = getattr(policy, "apply_batch_many", None)
+    extra_masks_capable = getattr(policy, "supports_extra_masks", False) is True
     if not callable(apply_batch_many):
         written = 0
         flips_by_subset: Dict[str, int] = {}
@@ -2937,6 +2919,7 @@ def execute_gpu_frame_batch_task(
                 admission = publication.reserve(batch_bytes) if publication is not None else nullcontext()
                 with admission as reservation:
                     result = semantic_coverage_masks = _coverage_images = coverage_batch = None
+                    coverage_warped = False
                     try:
                         with (resources.measure('policy_call_wall') if resources is not None else nullcontext()):
                             _wait_for_gpu_work_ready(runtime, batch)
@@ -2944,6 +2927,18 @@ def execute_gpu_frame_batch_task(
                                 runtime, batch, include_coverage=bool(_WORKER_STATIC.get("save_semantic", False)),
                                 known_support=source_occupancy,
                             )
+                            if bool(_WORKER_STATIC.get("save_semantic", False)) and any(
+                                item.semantic_coverage is not None for item in batch
+                            ):
+                                coverage_batch = tuple(replace(
+                                    item,
+                                    mask=(item.semantic_coverage if item.semantic_coverage is not None
+                                          else (
+                                              runtime["torch"].ones_like(item.mask)
+                                              if bool(getattr(item.mask, "is_cuda", False))
+                                              else np.ones_like(item.mask, dtype=np.uint8)
+                                          )),
+                                ) for item in batch)
                             if _gpu_identity_fast_path_eligible(batch, seeds):
                                 result = _apply_gpu_identity_batch_many(runtime, batch)
                             else:
@@ -2962,6 +2957,13 @@ def execute_gpu_frame_batch_task(
                                     )
                                     if isinstance(runtime, dict):
                                         runtime["cuda_source_policy_fallback_announced"] = True
+                                extra_policy_masks = {}
+                                if coverage_batch is not None and extra_masks_capable:
+                                    # One call warps coverage with the images' sampled geometry.
+                                    extra_policy_masks["extra_masks"] = _gpu_policy_source_masks(
+                                        policy, coverage_batch, cuda_images=zero_copy_cuda_sources,
+                                    )
+                                    coverage_warped = True
                                 result = apply_batch_many(
                                     images=policy_images,
                                     masks=_gpu_policy_source_masks(
@@ -2969,20 +2971,9 @@ def execute_gpu_frame_batch_task(
                                     ),
                                     seeds=seeds,
                                     output_size=batch[0].output_size,
+                                    **extra_policy_masks,
                                 )
-                            semantic_coverage_masks = None
-                            if bool(_WORKER_STATIC.get("save_semantic", False)) and any(
-                                item.semantic_coverage is not None for item in batch
-                            ):
-                                coverage_batch = tuple(replace(
-                                    item,
-                                    mask=(item.semantic_coverage if item.semantic_coverage is not None
-                                          else (
-                                              runtime["torch"].ones_like(item.mask)
-                                              if bool(getattr(item.mask, "is_cuda", False))
-                                              else np.ones_like(item.mask, dtype=np.uint8)
-                                          )),
-                                ) for item in batch)
+                            if coverage_batch is not None and not coverage_warped:
                                 if _gpu_identity_fast_path_eligible(batch, seeds):
                                     _coverage_images, semantic_coverage_masks = _apply_gpu_identity_batch_many(
                                         runtime, coverage_batch,
@@ -3026,6 +3017,14 @@ def execute_gpu_frame_batch_task(
                             f"GPU multi-source policy failed for {len(batch)} item(s) "
                             f"({contexts}): {type(exc).__name__}: {exc}"
                         ) from exc
+                    if coverage_warped:
+                        if not isinstance(result, (tuple, list)) or len(result) != 3:
+                            raise TypeError(
+                                "GPU policy declaring supports_extra_masks must return "
+                                "(images_nchw, masks_nhw, extra_masks_nhw) when extra_masks is given"
+                            )
+                        semantic_coverage_masks = result[2]
+                        result = (result[0], result[1])
                     if not isinstance(result, (tuple, list)) or len(result) != 2:
                         raise TypeError("GPU policy apply_batch_many() must return (images_nchw, masks_nhw)")
                     publish_kwargs = dict(
@@ -3447,10 +3446,10 @@ def execute_gpu_render_task(
 def execute_render_task(volume: np.ndarray, mask: np.ndarray, plans: Sequence[RenderPlan], task: object, semantic_coverage: Optional[np.ndarray] = None) -> Tuple[int, Dict[str, int], Dict[str, int], Dict[str, List[str]], DeferredForegroundCounts]:
     """Execute one source-frame task.
 
-    Runs inside a persistent spawned process worker (normal), the explicit
-    fork-only GPU-policy worker, or a thread; run-constant state comes from
-    _WORKER_STATIC.  Returns the written count, flip-dropped counts keyed by
-    split subset (for the realized-cap withhold), and the worker-local warning
+    Runs inside a persistent spawned process worker (normal), a GPU-policy
+    owner (forked where available, else spawned), or a thread; run-constant
+    state comes from _WORKER_STATIC.  Returns the written count, flip-dropped
+    counts keyed by split subset (for the realized-cap trim), and the worker-local warning
     payload for the parent to merge.
     """
     static = _WORKER_STATIC
@@ -3471,7 +3470,6 @@ def execute_render_task(volume: np.ndarray, mask: np.ndarray, plans: Sequence[Re
         candidates: Sequence[OutputCandidate],
         item_image: np.ndarray,
         item_mask: np.ndarray,
-        canonical_plan: Optional[RasterPlan],
         item_coverage: Optional[np.ndarray],
     ) -> None:
         nonlocal written
@@ -3496,7 +3494,6 @@ def execute_render_task(volume: np.ndarray, mask: np.ndarray, plans: Sequence[Re
                 save_binary=bool(static.get("save_binary", False)),
                 save_semantic=bool(static.get("save_semantic", False)),
                 semantic_coverage=item_coverage,
-                canonical_plan=canonical_plan,
             )
             if outcome == "written":
                 written += 1
@@ -3533,7 +3530,7 @@ def execute_render_task(volume: np.ndarray, mask: np.ndarray, plans: Sequence[Re
             item_coverage = _render_semantic_coverage_item(
                 semantic_coverage, plan, int(task.frame_idx), str(item_key),
             ) if bool(static.get("save_semantic", False)) else None
-            _write_versions(candidates, item_image, item_mask, item_plan, item_coverage)
+            _write_versions(candidates, item_image, item_mask, item_coverage)
     else:
         raise RuntimeError(f"Unknown render task type: {type(task).__name__}")
 
@@ -3544,7 +3541,7 @@ def execute_render_task(volume: np.ndarray, mask: np.ndarray, plans: Sequence[Re
 
 # Worker-side caches for the process backend: per-phase metadata and
 # per-generation volume/mask attachments.  A worker can legitimately hold two
-# generations at once (volume k phase B interleaves with volume k+1 phase A),
+# generations at once (pipelined volume k drains while volume k+1 renders),
 # so eviction keeps the newest two.
 _WORKER_PAYLOAD_CACHE: Dict[str, Dict[str, object]] = {}
 _WORKER_GEN_CACHE: Dict[int, Dict[str, object]] = {}
@@ -3554,9 +3551,7 @@ _WORKER_NATIVE_INTENSITY_BY_POINTER: Dict[int, Tuple[np.ndarray, int]] = {}
 
 def _native_intensity_payload(prep: PreparedRenderVolume) -> Dict[str, object]:
     """Keep logical CPU fallback while optionally uploading the smaller native T."""
-    if os.environ.get('YOLO_TTA_PTA_GPU_NATIVE_T', '0').strip().lower() in {
-        '', '0', 'false', 'off', 'no', 'disabled',
-    }:
+    if not env_flag('YOLO_TTA_PTA_GPU_NATIVE_T', False):
         return {}
     native = getattr(prep.src, 'volume', None)
     block = getattr(prep.src, 'volume_block', None)
@@ -3655,8 +3650,17 @@ def _execute_traced_render_task(payload, task, volume, mask, semantic_coverage):
     return result
 
 
+def _raise_if_worker_initializer_failed() -> None:
+    if _WORKER_INITIALIZER_ERROR is not None:
+        raise RuntimeError(
+            f"PTA render worker initializer failed in process {os.getpid()}:\n"
+            f"{_WORKER_INITIALIZER_ERROR}"
+        )
+
+
 def _render_task_entry(job: Tuple[str, int, object]) -> Tuple[int, Dict[str, int], Dict[str, int], Dict[str, List[str]], DeferredForegroundCounts]:
     """Process-pool entry: resolve shared-memory payload + volume, run the task."""
+    _raise_if_worker_initializer_failed()
     payload_name, payload_nbytes, task = (str(job[0]), int(job[1]), job[2])
     payload = _worker_load_payload(payload_name, payload_nbytes)
     _prepare_gpu_payload_task(payload)
@@ -3667,6 +3671,7 @@ def _render_task_entry(job: Tuple[str, int, object]) -> Tuple[int, Dict[str, int
 def _classification_task_entry(job: Tuple[str, int, object]):
     from .pta_gpu_classification import classify_task
 
+    _raise_if_worker_initializer_failed()
     payload_name, payload_nbytes, task = str(job[0]), int(job[1]), job[2]
     payload = _worker_load_payload(payload_name, payload_nbytes)
     _prepare_gpu_payload_task(payload, wait_prestage=False)
@@ -3719,7 +3724,7 @@ def resolve_render_backend(requested: str) -> str:
 
 
 def gpu_fork_render_backend_available() -> bool:
-    """Whether the explicit PTA GPU-policy fork exception can be created."""
+    """Whether PTA GPU-policy owners can use the preferred fork start method."""
 
     if not hasattr(os, "fork"):
         return False
@@ -3742,12 +3747,11 @@ class RenderPhaseHandle:
 
 @dataclass
 class VolumeRenderProgress:
-    """Parent-side accounting for one volume across both render phases."""
+    """Parent-side accounting for one volume's single render phase."""
     stem: str
     warnings: WarningLog
     pbar: Optional[tqdm] = None
     pending_a: int = 0
-    pending_b: int = 0
     written: int = 0
     flips_by_subset: Dict[str, int] = field(default_factory=dict)
     foreground_counts: DeferredForegroundCounts = field(default_factory=DeferredForegroundCounts)
@@ -3758,8 +3762,10 @@ class PersistentRenderPool:
 
     Normal process rendering uses module-importable ``spawn`` workers, matching
     TTA's process-safety convention and avoiding inherited runtime/thread state.
-    The active external GPU augmentation path is the sole fork-only exception.
-    Volumes reach either process path through named shared-memory blocks;
+    The active external GPU augmentation path prefers ``fork`` for its CUDA
+    owners where the host supports it and otherwise uses ``spawn``, reloading
+    the policy by content hash.  Volumes reach either process path through
+    named shared-memory blocks;
     phase metadata travels the same way; bounded tasks arrive individually.
     The thread backend keeps one
     ThreadPoolExecutor and shares parent arrays directly.  Results arrive on a
@@ -3786,12 +3792,7 @@ class PersistentRenderPool:
         if self.backend == "process":
             gpu_ids = tuple(int(x) for x in gpu_device_ids)
             gpu_sets = tuple(tuple(int(cpu) for cpu in cpus) for cpus in gpu_cpu_sets)
-            if gpu_ids:
-                if not gpu_fork_render_backend_available():
-                    raise RuntimeError(
-                        "PTA GPU offline augmentation currently requires a fork-capable host; "
-                        "normal CPU process rendering uses spawn"
-                    )
+            if gpu_ids and gpu_fork_render_backend_available():
                 process_ctx = multiprocessing.get_context("fork")
                 worker_static_payload: Optional[Mapping[str, object]] = None
                 self.start_method = "fork"
@@ -3982,10 +3983,7 @@ def drain_render_results(pool: PersistentRenderPool, progress_by_gen: Mapping[in
             progress.flips_by_subset[str(subset_key)] = int(progress.flips_by_subset.get(str(subset_key), 0)) + int(count)
             task_flips += int(count)
         _merge_worker_warning_payload(progress.warnings, warn_counts, warn_examples)
-        if phase == "A":
-            progress.pending_a -= 1
-        else:
-            progress.pending_b -= 1
+        progress.pending_a -= 1
         if progress.pbar is not None:
             progress.pbar.update(int(written) + task_flips)
 

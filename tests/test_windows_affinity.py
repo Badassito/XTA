@@ -132,6 +132,38 @@ class WindowsAffinityContractTests(unittest.TestCase):
         windows.assert_called_once_with([2])
 
 
+class CpuAffinityAvailabilityTests(unittest.TestCase):
+    def setUp(self):
+        runtime.cpu_affinity_unavailable_reason.cache_clear()
+
+    def tearDown(self):
+        runtime.cpu_affinity_unavailable_reason.cache_clear()
+
+    def test_posix_hosts_always_apply_flat_masks(self):
+        with mock.patch.object(runtime, 'os', SimpleNamespace(name='posix')), \
+                mock.patch.object(runtime, '_WindowsAffinityApi') as windows_api:
+            self.assertIsNone(runtime.cpu_affinity_unavailable_reason())
+        windows_api.assert_not_called()
+
+    def test_windows_multi_group_host_runs_unpinned(self):
+        def api_with_groups(count):
+            return SimpleNamespace(kernel=SimpleNamespace(GetActiveProcessorGroupCount=lambda: count))
+
+        with mock.patch.object(runtime, 'os', SimpleNamespace(name='nt')), \
+                mock.patch.object(runtime, '_WindowsAffinityApi', return_value=api_with_groups(2)):
+            reason = runtime.cpu_affinity_unavailable_reason()
+        self.assertIn('2 active processor groups', reason)
+        runtime.cpu_affinity_unavailable_reason.cache_clear()
+        with mock.patch.object(runtime, 'os', SimpleNamespace(name='nt')), \
+                mock.patch.object(runtime, '_WindowsAffinityApi', return_value=api_with_groups(1)):
+            self.assertIsNone(runtime.cpu_affinity_unavailable_reason())
+
+    def test_unavailable_affinity_disables_feeder_reservations(self):
+        with mock.patch.object(runtime, 'cpu_affinity_unavailable_reason', return_value='x'), \
+                mock.patch.object(runtime, 'gpu_feeder_reserved_physical_cores', return_value=4):
+            self.assertEqual(runtime.plan_gpu_feeder_core_reservations(['0', '1']), [[], []])
+
+
 @unittest.skipUnless(os.name == 'nt', 'Native Windows affinity smoke')
 class WindowsAffinityNativeTests(unittest.TestCase):
     def test_temporary_subprocess_restricts_widens_and_restores_all_threads(self):

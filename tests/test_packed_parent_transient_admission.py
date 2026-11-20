@@ -114,7 +114,7 @@ def test_opted_in_reservation_requires_actual_valid_shape_accounting(production,
                native_shape=native, source_shape=output, cleanup_is_simple=True)
 
 
-@pytest.mark.parametrize('change', ['tiles', 'debug', 'prepublished', 'no_layers', 'no_retirement',
+@pytest.mark.parametrize('change', ['tiles', 'prepublished', 'no_layers',
     'no_callback', 'interpolation', 'extrapolation', 'numpy_backend', 'disabled', 'below_threshold',
     'complex_cleanup'])
 def test_actual_submission_exclusions_never_reduce_the_reservation(production, monkeypatch, change):
@@ -124,8 +124,8 @@ def test_actual_submission_exclusions_never_reduce_the_reservation(production, m
     namespace = dict(math=math, view=view(), processing_bytes=math.prod(native),
         source_bytes=math.prod(output), capture_shape=native,
         input_T=output[0], input_H=output[1], input_W=output[2],
-        capture_workspace_bytes=0, component_ref_dense_retirement_active=True,
-        component_layers_needed=True, dense_tiling_active=False, keep_temp_artifacts=False,
+        capture_workspace_bytes=0,
+        component_layers_needed=True, dense_tiling_active=False,
         preinterpolation_layer_already_published=False, key=key,
         direct_union_backing_leases={key: object()}, confmap_mm=object(),
         parent_slice_postprocess_workers=1, angle_variant_streaming_cleanup_active=True,
@@ -135,10 +135,8 @@ def test_actual_submission_exclusions_never_reduce_the_reservation(production, m
         _parent_prepare_transient_bytes=helper,
         _view_uses_interpolation=lambda view, distance: distance > 0)
     if change == 'tiles': namespace['dense_tiling_active'] = True
-    if change == 'debug': namespace['keep_temp_artifacts'] = True
     if change == 'prepublished': namespace['preinterpolation_layer_already_published'] = True
     if change == 'no_layers': namespace['component_layers_needed'] = False
-    if change == 'no_retirement': namespace['component_ref_dense_retirement_active'] = False
     if change == 'no_callback': namespace['direct_union_backing_leases'] = {}
     if change == 'interpolation': namespace['args'].interpolation_distance = 1
     if change == 'extrapolation':
@@ -160,8 +158,8 @@ def test_actual_submission_reduces_only_the_shared_predicate_terminal_path(produ
     key = ('model', 'view')
     namespace = dict(math=math, view=view(), processing_bytes=math.prod(native), source_bytes=math.prod(output),
         capture_shape=native, input_T=output[0], input_H=output[1], input_W=output[2],
-        capture_workspace_bytes=117, component_ref_dense_retirement_active=True, component_layers_needed=True,
-        dense_tiling_active=False, keep_temp_artifacts=False, preinterpolation_layer_already_published=False,
+        capture_workspace_bytes=117, component_layers_needed=True,
+        dense_tiling_active=False, preinterpolation_layer_already_published=False,
         key=key, direct_union_backing_leases={key: object()}, confmap_mm=object(),
         parent_slice_postprocess_workers=1, angle_variant_streaming_cleanup_active=True,
         interpolation_settings=SimpleNamespace(extrapolation_enabled=False, extrapolation_distance=0),

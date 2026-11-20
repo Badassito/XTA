@@ -13,6 +13,8 @@ from typing import (
 )
 import numpy as np
 
+from .env_flags import env_flag as _env_flag, env_float as _env_float, env_int as _env_int
+
 # RAM headroom probe reads (/proc/meminfo, /proc/self/{cgroup,mountinfo} and
 # each cgroup level's limit/usage/memory.stat). Path.read_text releases the GIL
 # around open/fstat/read/close; in the busy main process (hundreds of threads,
@@ -22,7 +24,9 @@ import numpy as np
 # libc with the GIL held (_gil_holding_text_reader): same text and errors, no
 # convoy. Every probe stays fresh: it starts after its caller's call, which
 # memfd_ram_headroom's "block sample before headroom" rule and every admission
-# check rely on. No value is cached.
+# check rely on, so limits, usage and memory.stat are read on every probe. Only
+# the process cgroup membership and the cgroupfs mount verification are resolved
+# once per process (and again after fork); unreadable files are not cached.
 #
 # Kernel-side waits. /proc/meminfo and the cgroup page-counter files only load
 # counters. Three files can wait on kernel locks: /proc/self/cgroup
@@ -56,6 +60,11 @@ _GIL_HOLD_LIMIT_SECONDS = 0.005
 _GIL_HELD_READ_CALLS: Dict[str, int] = {}
 _GIL_HELD_READ_MAX_SECONDS: Dict[str, float] = {}
 _GIL_HELD_DEMOTED: Dict[str, float] = {}
+# (pid, entries, unresolved_scope); entries are (is_v2, base, limit_name,
+# usage_name, leaf) tuples parsed from /proc/self/cgroup.
+_CGROUP_LAYOUT: Optional[tuple] = None
+# (pid, base_posix, is_v2) -> canonical cgroupfs mount verified.
+_CGROUP_MOUNT_VERIFIED: Dict[tuple, bool] = {}
 
 
 def _probe_read_class(posix: str) -> Optional[str]:
@@ -189,28 +198,19 @@ def _cgroup_canonical_mount_verified(mountinfo: str, base: Path, *, v2: bool) ->
             filesystem[0] == 'cgroup' and 'memory' in filesystem[2].split(','))
 
 
-def _cgroup_memory_budget(*, verify_enforcement: bool = True) -> tuple[Optional[int], Optional[int]]:
-    """Return (tightest headroom, verified enforcing cap) for this process.
+def _cgroup_layout() -> tuple:
+    """Return (memory cgroup entries, unresolved scope) for this process.
 
-    All finite ancestors bound headroom. The second value additionally requires
-    a verified canonical mount and hierarchical accounting, so callers can use
-    it to prove that a separate allocation cap is already enforced. Unknown
-    scope never supplies that proof. Unreadable usage under a known finite cap
-    grants zero headroom, rather than treating missing usage as zero bytes.
-    Headroom-only callers skip mount discovery and never receive a cap proof.
+    Parsed once per process and again after fork (PID change). A read failure
+    propagates and is not cached.
     """
-    try:
-        cgroup_text = _probe_read_text(Path('/proc/self/cgroup'))
-    except Exception:
-        return None, None
-    mountinfo = ''
-    if verify_enforcement:
-        try:
-            mountinfo = _probe_read_text(Path('/proc/self/mountinfo'))
-        except Exception:
-            pass
-    headroom: Optional[int] = None
-    enforcing_cap: Optional[int] = None
+    global _CGROUP_LAYOUT
+    pid = os.getpid()
+    layout = _CGROUP_LAYOUT
+    if layout is not None and layout[0] == pid:
+        return layout[1], layout[2]
+    cgroup_text = _probe_read_text(Path('/proc/self/cgroup'))
+    entries = []
     unresolved_scope = False
     for line in cgroup_text.splitlines():
         parts = line.split(':', 2)
@@ -233,8 +233,52 @@ def _cgroup_memory_budget(*, verify_enforcement: bool = True) -> tuple[Optional[
                 or any(part in ('.', '..') for part in cg_path.split('/'))):
             unresolved_scope = True
             continue
-        verified = verify_enforcement and _cgroup_canonical_mount_verified(mountinfo, base, v2=is_v2)
-        node = base / cg_path.lstrip('/')
+        entries.append((is_v2, base, limit_name, usage_name, base / cg_path.lstrip('/')))
+    _CGROUP_LAYOUT = (pid, tuple(entries), unresolved_scope)
+    return _CGROUP_LAYOUT[1], unresolved_scope
+
+
+def _cgroup_mount_verified_cached(base: Path, is_v2: bool) -> bool:
+    """Verify the canonical cgroupfs mount once per process; failures are not cached."""
+    key = (os.getpid(), base.as_posix(), bool(is_v2))
+    verified = _CGROUP_MOUNT_VERIFIED.get(key)
+    if verified is None:
+        try:
+            mountinfo = _probe_read_text(Path('/proc/self/mountinfo'))
+        except Exception:
+            return False
+        verified = _cgroup_canonical_mount_verified(mountinfo, base, v2=is_v2)
+        _CGROUP_MOUNT_VERIFIED[key] = verified
+    return verified
+
+
+def _reset_cgroup_layout_cache() -> None:
+    """Forget the cached cgroup membership and mount verification (test hook)."""
+    global _CGROUP_LAYOUT
+    _CGROUP_LAYOUT = None
+    _CGROUP_MOUNT_VERIFIED.clear()
+
+
+def _cgroup_memory_budget(*, verify_enforcement: bool = True) -> tuple[Optional[int], Optional[int]]:
+    """Return (tightest headroom, verified enforcing cap) for this process.
+
+    All finite ancestors bound headroom. The second value additionally requires
+    a verified canonical mount and hierarchical accounting, so callers can use
+    it to prove that a separate allocation cap is already enforced. Unknown
+    scope never supplies that proof. Unreadable usage under a known finite cap
+    grants zero headroom, rather than treating missing usage as zero bytes.
+    Headroom-only callers skip mount discovery and never receive a cap proof.
+    Limits, usage and memory.stat are read on every call; only the membership
+    and mount verification are resolved once per process.
+    """
+    try:
+        entries, unresolved_scope = _cgroup_layout()
+    except Exception:
+        return None, None
+    headroom: Optional[int] = None
+    enforcing_cap: Optional[int] = None
+    for is_v2, base, limit_name, usage_name, node in entries:
+        verified = verify_enforcement and _cgroup_mount_verified_cached(base, is_v2)
         while node == base or base in node.parents:
             try:
                 raw_limit = _probe_read_text(node / limit_name).strip()
@@ -327,11 +371,12 @@ def _probe_mounts_kernel_backed(mountinfo: str) -> bool:
 def _gil_holding_text_reader(libc=None):
     """Return a Linux reader for small /proc and cgroupfs files that keeps the GIL.
 
-    _probe_read_text uses it only for _gil_held_read_allowed files. These
-    pseudo-files are generated in memory and never wait on storage, so
-    the reader calls libc through ctypes.PyDLL (which does not release the
-    GIL). The text and errors match Path.read_text: locale encoding with strict
-    decoding, universal newlines, and the errno-specific OSError subclass. It is
+    _probe_read_text uses it only for files whose _probe_read_class is still in
+    _GIL_HELD_CLASSES. These pseudo-files are generated in memory and never
+    wait on storage, so the reader calls libc through ctypes.PyDLL (which does
+    not release the GIL). The text and errors match Path.read_text: locale
+    encoding with strict decoding, universal newlines, and the errno-specific
+    OSError subclass. It is
     reentrant (one buffer per call), so any thread may use it. Returns None (use
     Path.read_text) when unavailable or disabled by YOLO_TTA_RAM_PROBE_GIL_READS=0
     or when /proc or /sys carries a non-kernel (e.g. lxcfs/FUSE) mount. ``libc``
@@ -411,30 +456,6 @@ def _resolve_gil_holding_reader():
     return reader
 
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return bool(default)
-    return str(raw).strip().lower() not in ("", "0", "false", "no", "off")
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name, '').strip()
-    if not raw:
-        return float(default)
-    try:
-        return float(raw)
-    except Exception:
-        return float(default)
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name, '').strip()
-    if not raw:
-        return int(default)
-    try:
-        return int(raw)
-    except Exception:
-        return int(default)
-
 _V1613_FAST_BUNDLE_ACTIVE = False
 
 _V1613_D1_PIPELINE_ACTIVE = False
@@ -468,21 +489,9 @@ def v1613_fast_bundle_active() -> bool:
     """True after ``main`` proves the current command satisfies the fast-path contract."""
     return bool(_V1613_FAST_BUNDLE_ACTIVE)
 
-def v1613_d1_owner_requested() -> bool:
-    """Whether an eligible run should use the D1 owner pipeline."""
-    return _env_flag('YOLO_TTA_V1613_D1_OWNER_PIPELINE', True)
-
 def v1613_d1_pipeline_active() -> bool:
     """Project, infer, treat 2D topology, and backproject inside each eligible GPU lease."""
     return bool(_V1613_FAST_BUNDLE_ACTIVE and _V1613_D1_PIPELINE_ACTIVE)
-
-def v1613_d1_backprojection_overlap_enabled() -> bool:
-    """Allow fallback completed-view backprojection to borrow an idle worker GPU."""
-    return bool(
-        v1613_fast_bundle_active()
-        and not v1613_d1_pipeline_active()
-        and _env_flag('YOLO_TTA_V1613_D1_BACKPROJECT_OVERLAP', True)
-    )
 
 def proto_hole_treatment_mode() -> str:
     """Resident-proto topology treatment: ``off`` or bounded binary ``closing``."""
@@ -502,25 +511,6 @@ def proto_hole_treatment_radius() -> int:
         return 0
     default = 2 if v1613_fast_bundle_active() else 0
     return max(0, min(8, _env_int('YOLO_TTA_PROTO_HOLE_RADIUS', default)))
-
-def azimuthal_source_mode() -> str:
-    """Source sampling used by resident Azimuthal kernels.
-
-    ``texture_linear`` (default, v16.1.8) samples through the hardware-linear 3D texture:
-    measured as fast as the pointer path on the standard command while interpolating all
-    three spatial axes. ``nearest_xy_linear_t`` reads the canonical resident uint8 tensor
-    directly, avoiding the second full-volume CUDA texture allocation, at the cost of
-    nearest-neighbor in-plane (and sagittal/coronal stack-axis) sampling.
-    """
-    default = 'texture_linear'
-    raw = os.environ.get('YOLO_TTA_AZIMUTHAL_SOURCE_MODE', default).strip().lower().replace('-', '_')
-    aliases = {
-        'texture': 'texture_linear', 'texture_linear': 'texture_linear',
-        'hardware_linear': 'texture_linear', 'trilinear': 'texture_linear',
-        'pointer': 'nearest_xy_linear_t', 'canonical': 'nearest_xy_linear_t',
-        'nearest_xy': 'nearest_xy_linear_t', 'nearest_xy_linear_t': 'nearest_xy_linear_t',
-    }
-    return aliases.get(raw, default)
 
 _TILTED_IDENTITY_M = np.asarray([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
 

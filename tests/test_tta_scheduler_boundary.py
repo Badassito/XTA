@@ -68,10 +68,8 @@ def _inputs(temp_dir: Path, **overrides: object) -> TtaSchedulerInputs:
         interpolation_distance=0,
         min_conf=0.0,
         min_radius=0.0,
-        keep_temp_artifacts=False,
         dense_tiling_active=False,
         nrrd_layers_needed=False,
-        direct_union_sparse_retirement_active=True,
         direct_union_inference_view_limit=2,
         direct_union_inference_byte_limit=1 << 30,
         direct_union_total_dense_byte_limit=1 << 31,
@@ -175,6 +173,29 @@ def _bind_callbacks(
 
 
 class TtaSchedulerBoundaryTests(unittest.TestCase):
+    def test_d1_owner_gate_follows_the_logged_experimental_snapshot(self) -> None:
+        # The scheduler gate and the resolved-gates log share one snapshot, so
+        # a word-spelled request cannot be logged as requested yet stay inactive.
+        from XTA.experimental_features import experimental_features_snapshot
+        for raw, expected in (
+            ('1', True), ('2', True), ('true', True), ('on', True), ('yes', True),
+            ('0', False), ('00', False), ('-0', False), ('false', False),
+            ('disabled', False), ('', False),
+        ):
+            with self.subTest(raw=raw):
+                snapshot = experimental_features_snapshot(
+                    environ={'YOLO_TTA_D1_OWNER_GROUPS': raw}, device_count=4,
+                )
+                self.assertIs(snapshot.d1_owner_groups_requested, expected)
+                with tempfile.TemporaryDirectory() as directory:
+                    scheduler = _scheduler(Path(directory), input_overrides={
+                        'v1613_d1_owner_active': True, 'gpu_device_count': 4,
+                        'd1_owner_groups_requested': snapshot.d1_owner_groups_requested,
+                        'd1_owner_group_size_limit': snapshot.d1_owner_group_size_limit,
+                    })
+                    self.assertIs(scheduler.d1_owner_group_mode_active(), expected)
+                    self.assertEqual(scheduler.d1_owner_group_size_limit(), 4)
+
     def test_native_radial_contract_stays_single_owner_with_group_gate_enabled(self):
         from XTA.cylindrical_owner import RADIAL_OWNER_CONTRACT
         state=_state()
@@ -182,9 +203,8 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
         for task in tasks:task['projection_contract']=RADIAL_OWNER_CONTRACT
         with tempfile.TemporaryDirectory() as directory:
             scheduler=_scheduler(Path(directory),state=state,
-                input_overrides={'v1613_d1_owner_active':True,'gpu_device_count':4},
-                operation_overrides={'_env_int':lambda name,default:
-                    1 if name=='YOLO_TTA_D1_OWNER_GROUPS' else 4 if name=='YOLO_TTA_D1_OWNER_GROUP_SIZE' else default})
+                input_overrides={'v1613_d1_owner_active':True,'gpu_device_count':4,
+                                 'd1_owner_groups_requested':True,'d1_owner_group_size_limit':4})
             self.assertIsNone(scheduler.ensure_d1_parent_group(tasks[0],(0,1,2,3)))
             self.assertTrue(scheduler.claim_d1_owner(tasks[0],2))
             self.assertEqual(scheduler.d1_feasible_workers(tasks[1],(0,1,2,3)),[2])
@@ -235,13 +255,9 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
             scheduler = _scheduler(
                 Path(temp_dir),
                 state=state,
-                input_overrides={"v1613_d1_owner_active": True, "gpu_device_count": 4},
-                operation_overrides={
-                    "_env_int": lambda name, default: (
-                        1 if name == "YOLO_TTA_D1_OWNER_GROUPS" else
-                        4 if name == "YOLO_TTA_D1_OWNER_GROUP_SIZE" else
-                        int(default)
-                    ),
+                input_overrides={
+                    "v1613_d1_owner_active": True, "gpu_device_count": 4,
+                    "d1_owner_groups_requested": True, "d1_owner_group_size_limit": 4,
                 },
             )
             group = scheduler.ensure_d1_parent_group(tasks[0], (0, 1, 2, 3))
@@ -294,13 +310,9 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             scheduler = _scheduler(
                 Path(temp_dir), state=state,
-                input_overrides={"v1613_d1_owner_active": True, "gpu_device_count": 4},
-                operation_overrides={
-                    "_env_int": lambda name, default: (
-                        1 if name == "YOLO_TTA_D1_OWNER_GROUPS" else
-                        2 if name == "YOLO_TTA_D1_OWNER_GROUP_SIZE" else
-                        int(default)
-                    ),
+                input_overrides={
+                    "v1613_d1_owner_active": True, "gpu_device_count": 4,
+                    "d1_owner_groups_requested": True, "d1_owner_group_size_limit": 2,
                 },
             )
 
@@ -341,13 +353,9 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
             scheduler = _scheduler(
                 Path(temp_dir),
                 state=state,
-                input_overrides={"v1613_d1_owner_active": True, "gpu_device_count": 8},
-                operation_overrides={
-                    "_env_int": lambda name, default: (
-                        1 if name == "YOLO_TTA_D1_OWNER_GROUPS" else
-                        8 if name == "YOLO_TTA_D1_OWNER_GROUP_SIZE" else
-                        int(default)
-                    ),
+                input_overrides={
+                    "v1613_d1_owner_active": True, "gpu_device_count": 8,
+                    "d1_owner_groups_requested": True, "d1_owner_group_size_limit": 8,
                 },
             )
             group = scheduler.ensure_d1_parent_group(tasks[0], (2, 4, 6))
@@ -362,13 +370,9 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
             scheduler_one = _scheduler(
                 Path(temp_dir),
                 state=state_one,
-                input_overrides={"v1613_d1_owner_active": True, "gpu_device_count": 4},
-                operation_overrides={
-                    "_env_int": lambda name, default: (
-                        1 if name == "YOLO_TTA_D1_OWNER_GROUPS" else
-                        1 if name == "YOLO_TTA_D1_OWNER_GROUP_SIZE" else
-                        int(default)
-                    ),
+                input_overrides={
+                    "v1613_d1_owner_active": True, "gpu_device_count": 4,
+                    "d1_owner_groups_requested": True, "d1_owner_group_size_limit": 1,
                 },
             )
             self.assertIsNone(
@@ -394,12 +398,7 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
                         Path(temp_dir), state=state,
                         input_overrides={
                             "v1613_d1_owner_active": True, "gpu_device_count": 4,
-                        },
-                        operation_overrides={
-                            "_env_int": lambda name, default: (
-                                1 if name == "YOLO_TTA_D1_OWNER_GROUPS" else
-                                int(default)
-                            ),
+                            "d1_owner_groups_requested": True,
                         },
                     )
                     self.assertIsNone(
@@ -416,13 +415,9 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             scheduler = _scheduler(
                 Path(temp_dir), state=state,
-                input_overrides={"v1613_d1_owner_active": True, "gpu_device_count": 4},
-                operation_overrides={
-                    "_env_int": lambda name, default: (
-                        1 if name == "YOLO_TTA_D1_OWNER_GROUPS" else
-                        2 if name == "YOLO_TTA_D1_OWNER_GROUP_SIZE" else
-                        int(default)
-                    ),
+                input_overrides={
+                    "v1613_d1_owner_active": True, "gpu_device_count": 4,
+                    "d1_owner_groups_requested": True, "d1_owner_group_size_limit": 2,
                 },
             )
             group = scheduler.ensure_d1_parent_group(tasks[0], (0, 1, 2, 3))
@@ -447,13 +442,9 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             scheduler = _scheduler(
                 Path(temp_dir), state=state,
-                input_overrides={"v1613_d1_owner_active": True, "gpu_device_count": 4},
-                operation_overrides={
-                    "_env_int": lambda name, default: (
-                        1 if name == "YOLO_TTA_D1_OWNER_GROUPS" else
-                        4 if name == "YOLO_TTA_D1_OWNER_GROUP_SIZE" else
-                        int(default)
-                    ),
+                input_overrides={
+                    "v1613_d1_owner_active": True, "gpu_device_count": 4,
+                    "d1_owner_groups_requested": True, "d1_owner_group_size_limit": 4,
                 },
             )
             # First refill has only one idle slot, so it crosses the dispatch boundary with
@@ -514,8 +505,6 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
 
                 def env_int(name: str, default: int) -> int:
                     return {
-                        "YOLO_TTA_D1_OWNER_GROUPS": 1,
-                        "YOLO_TTA_D1_OWNER_GROUP_SIZE": group_size,
                         "YOLO_TTA_GPU_WORKER_DISPATCH_WINDOW_PER_GPU": 1,
                     }.get(name, int(default))
 
@@ -526,6 +515,8 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
                         input_overrides={
                             "v1613_d1_owner_active": True,
                             "gpu_device_count": 4,
+                            "d1_owner_groups_requested": True,
+                            "d1_owner_group_size_limit": group_size,
                         },
                         operation_overrides={"_env_int": env_int},
                     )
@@ -597,8 +588,6 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
 
                 def env_int(name: str, default: int) -> int:
                     return {
-                        "YOLO_TTA_D1_OWNER_GROUPS": 1,
-                        "YOLO_TTA_D1_OWNER_GROUP_SIZE": group_size,
                         "YOLO_TTA_GPU_WORKER_DISPATCH_WINDOW_PER_GPU": 1,
                     }.get(name, int(default))
 
@@ -626,6 +615,8 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
                         input_overrides={
                             "v1613_d1_owner_active": True,
                             "gpu_device_count": 4,
+                            "d1_owner_groups_requested": True,
+                            "d1_owner_group_size_limit": group_size,
                         },
                         operation_overrides={"_env_int": env_int},
                     )
@@ -794,12 +785,6 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
         state.gpu_worker_dispatched_by_id.update({0: 0, 1: 0})
         state.gpu_worker_compute_completed_by_id.update({0: 0, 1: 0})
 
-        def env_int(name: str, default: int) -> int:
-            return {
-                "YOLO_TTA_D1_OWNER_GROUPS": 1,
-                "YOLO_TTA_D1_OWNER_GROUP_SIZE": 2,
-            }.get(name, int(default))
-
         with tempfile.TemporaryDirectory() as temp_dir:
             scheduler = _scheduler(
                 Path(temp_dir),
@@ -807,8 +792,9 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
                 input_overrides={
                     "v1613_d1_owner_active": True,
                     "gpu_device_count": 2,
+                    "d1_owner_groups_requested": True,
+                    "d1_owner_group_size_limit": 2,
                 },
-                operation_overrides={"_env_int": env_int},
             )
             group = scheduler.ensure_d1_parent_group(tasks[0], (0, 1))
             assert group is not None

@@ -205,8 +205,8 @@ def main():
               'quality': quality(cp, compiled)}
     report['heatsoak_seconds'] = heatsoak(args.heat_seconds, 0)
     report['benchmark'] = benchmark(cp, compiled, args.repeats)
-    report['limits'] = ('Kernel timing uses production working dimensions but only128 native T slices to fit the local GPU. '
-                       '17-to25 quality fixtures preserve a production-like T ratio. No model inference or accuracy claim.')
+    report['limits'] = ('Kernel timing uses production working dimensions but only 128 native T slices to fit the local GPU. '
+                       '17-to-25 quality fixtures preserve a production-like T ratio. No model inference or accuracy claim.')
     args.output.write_text(json.dumps(report, indent=2)+'\n', encoding='utf-8')
     for row in report['benchmark']:
         print(json.dumps({k:v for k,v in row.items() if k!='samples_ms'}), flush=True)

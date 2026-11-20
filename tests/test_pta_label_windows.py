@@ -10,7 +10,8 @@ import cv2
 import numpy as np
 import pytest
 
-from XTA import pta_workers as workers
+from XTA import polygon_keyholes, pta_workers as workers
+from XTA.polygon_keyholes import holes_by_parent, splice_holes
 from XTA.pta_dataset import OutputCandidate
 from XTA.pta_publication import (
     _yolo_coordinate_text, candidate_output_paths, mask_to_yolo_lines, yolo_label_window,
@@ -19,18 +20,17 @@ from tests.test_pta_gpu_publication import FakeTensor, FakeTorch
 
 
 def reference_lines(mask01, *, warnings, context):
-    """The full-frame, per-vertex exporter before label windows (v25.0.3)."""
+    """The full-frame, per-vertex exporter before label windows (v25.0.3), with keyhole holes."""
     m = np.asarray(mask01, dtype=np.uint8)
     if not m.size:
         return []
     h, w = m.shape
     contours, hierarchy = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-    if hierarchy is not None:
-        if np.any(hierarchy[0][:, 3] >= 0):
-            warnings.add("holes_discarded_during_polygon_export", context)
+    children = holes_by_parent(hierarchy)
+    discarded = False
     lines = []
     hierarchy_arr = [None] * len(contours) if hierarchy is None else list(hierarchy[0])
-    for cnt, hrow in zip(contours, hierarchy_arr):
+    for index, (cnt, hrow) in enumerate(zip(contours, hierarchy_arr)):
         if hrow is not None and int(hrow[3]) >= 0:
             continue
         if cnt is None or len(cnt) < 3:
@@ -43,6 +43,9 @@ def reference_lines(mask01, *, warnings, context):
         if pts.shape[0] < 3:
             warnings.add("degenerate_export_polygon", context)
             continue
+        holes = [cv2.approxPolyDP(contours[child], 1.0, True).reshape(-1, 2) for child in children.get(index, ())]
+        discarded |= any(len(hole) < 3 for hole in holes)
+        pts = splice_holes(pts, [hole for hole in holes if len(hole) >= 3])
         coords = []
         for x, y in pts:
             xn = min(1.0, max(0.0, float(x) / float(max(1, w))))
@@ -50,6 +53,8 @@ def reference_lines(mask01, *, warnings, context):
             coords.append(f"{xn:.6f}")
             coords.append(f"{yn:.6f}")
         lines.append("0 " + " ".join(coords))
+    if discarded:
+        warnings.add("holes_discarded_during_polygon_export", context)
     return lines
 
 
@@ -157,6 +162,19 @@ def test_full_frame_and_windowed_exports_match_reference_on_adversarial_masks():
         assert export(mask_to_yolo_lines, mask.T) == export(reference_lines, mask.T), index
         edge += bool(mask.size and (mask[0].any() or mask[-1].any() or mask[:, 0].any() or mask[:, -1].any()))
     assert edge > 500
+
+
+def test_windowed_hole_splices_match_full_frame_on_the_kd_tree_branch(monkeypatch):
+    monkeypatch.setattr(polygon_keyholes, '_BRUTE_FORCE_PAIRS', 0)
+    grid = np.zeros((1024, 1024), np.uint8)
+    grid[3:1021, 5:1019] = 1
+    for y in range(9, 1012, 16):
+        for x in range(9, 1012, 16):
+            grid[y:y + 4, x:x + 4] = 0
+    for index, mask in enumerate(adversarial_masks(300) + [grid]):
+        expected = export(reference_lines, mask)
+        assert export(mask_to_yolo_lines, mask) == expected, index
+        assert windowed(mask) == expected, index
 
 
 @pytest.mark.parametrize('shape', [(3072, 3072), (2048, 3072), (3061, 17)])

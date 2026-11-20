@@ -47,17 +47,21 @@ def test_cpu_translation_restores_content_and_marks_cropped_pixels_unknown():
     assert adapter._replay(13, 24, 24) is replay
 
 
+@pytest.mark.parametrize('space', ['source', 'raster'])
 @pytest.mark.parametrize('reflection', [False, True])
-def test_cpu_elastic_inverse_matches_known_constant_displacement(reflection):
+def test_cpu_elastic_inverse_matches_known_constant_displacement(reflection, space):
     h, w = 20, 24
     forward = np.eye(3)
     if reflection:
         forward[0, 0], forward[0, 2] = -1., w - 1
     field = np.zeros((h, w, 2), np.float32)
     field[..., 0], field[..., 1] = 2., 3.
-    grid, valid = inverse_policy_grid_cpu(forward, field, h, w)
+    grid, valid = inverse_policy_grid_cpu(forward, field, h, w, displacement_space=space)
     yy, xx = np.mgrid[:h, :w]
-    expected = np.stack((w - 1 - (xx - 2) if reflection else xx - 2, yy - 3), axis=-1)
+    if space == 'source':  # x = inv(A)y + d  ->  y = A(x - d)
+        expected = np.stack((w - 1 - (xx - 2) if reflection else xx - 2, yy - 3), axis=-1)
+    else:  # x = inv(A)(y + d)  ->  y = Ax - d
+        expected = np.stack(((w - 1 - xx if reflection else xx) - 2, yy - 3), axis=-1)
     np.testing.assert_allclose(grid[valid], expected[valid], atol=1e-5)
     assert 0 < valid.sum() < h * w
 
@@ -70,12 +74,59 @@ def test_cpu_elastic_folds_are_unknown():
     assert not valid[:, 1:-1].any()
 
 
-@pytest.mark.parametrize('profile', ['light', 'baseline', 'heavy', 'superheavy'])
-def test_cpu_adapter_preserves_shipped_policy_pixels(profile):
+def _cpu_policy_module(profile):
     path = Path(__file__).resolve().parents[1] / 'XTA/examples/external_augmentations' / f'CPU_{profile}.py'
     spec = importlib.util.spec_from_file_location(f'test_cpu_policy_{profile}', path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def _affine_pull(inverse, height, width):
+    yy, xx = np.mgrid[:height, :width].astype(np.float32)
+    return np.stack(((inverse[0, 0] * xx + inverse[0, 1] * yy + inverse[0, 2]).astype(np.float32),
+                     (inverse[1, 0] * xx + inverse[1, 1] * yy + inverse[1, 2]).astype(np.float32)), axis=-1)
+
+
+def _orientation(pull, inverse):
+    """Forward-difference Jacobian determinant of a pull map, signed against inv(A)."""
+    pull = np.asarray(pull, np.float64)
+    along_x, along_y = pull[:-1, 1:] - pull[:-1, :-1], pull[1:, :-1] - pull[:-1, :-1]
+    det = along_x[..., 0] * along_y[..., 1] - along_y[..., 0] * along_x[..., 1]
+    return det * np.linalg.det(inverse[:2, :2])
+
+
+def _covered_interior(forward, field, height, width, space, step=0.25):
+    """Source pixels that provably have a positive-orientation in-frame preimage."""
+    from XTA.tta_augmentation_cpu import _bilinear_displacement
+    inverse = np.linalg.inv(forward)
+    gy, gx = np.meshgrid(np.arange(0, height - 1 + 1e-9, step), np.arange(0, width - 1 + 1e-9, step),
+                         indexing='ij')
+    lattice = np.stack((gx, gy), axis=-1)
+    delta, dx, dy = _bilinear_displacement(field, lattice)
+    if space == 'raster':
+        pulled = (lattice + delta) @ inverse[:2, :2].T + inverse[:2, 2]
+        det = (1 + dx[..., 0]) * (1 + dy[..., 1]) - dy[..., 0] * dx[..., 1]
+    else:
+        pulled = lattice @ inverse[:2, :2].T + inverse[:2, 2] + delta
+        det = ((inverse[0, 0] + dx[..., 0]) * (inverse[1, 1] + dy[..., 1])
+               - (inverse[0, 1] + dy[..., 0]) * (inverse[1, 0] + dx[..., 1])) * np.sign(np.linalg.det(inverse[:2, :2]))
+    pixels = np.rint(pulled[det > 1e-3]).astype(np.int64)
+    keep = (pixels[:, 0] >= 0) & (pixels[:, 0] < width) & (pixels[:, 1] >= 0) & (pixels[:, 1] < height)
+    hit = np.zeros((height, width), bool)
+    hit[pixels[keep, 1], pixels[keep, 0]] = True
+    interior = hit.copy()
+    interior[1:] &= hit[:-1]
+    interior[:-1] &= hit[1:]
+    interior[:, 1:] &= hit[:, :-1]
+    interior[:, :-1] &= hit[:, 1:]
+    interior[[0, -1], :] = interior[:, [0, -1]] = False
+    return interior
+
+
+@pytest.mark.parametrize('profile', ['light', 'baseline', 'heavy', 'superheavy'])
+def test_cpu_adapter_preserves_shipped_policy_pixels(profile):
+    module = _cpu_policy_module(profile)
     policy = module.build_augmentation()
     adapter = CpuPolicyAdapter(policy)
     image = np.random.default_rng(11).integers(0, 256, (33, 35, 3), dtype=np.uint8)
@@ -86,9 +137,69 @@ def test_cpu_adapter_preserves_shipped_policy_pixels(profile):
         np.testing.assert_array_equal(output[0], expected)
 
 
+def test_cpu_shipped_elastic_replay_does_not_fold():
+    # Seeds feed _sample_parameters directly, so they survive policy byte edits.
+    policy = _cpu_policy_module('superheavy').build_augmentation()
+    adapter = CpuPolicyAdapter(policy)
+    assert adapter.displacement_space == 'raster'
+    h = w = 128
+    for seed in (17, 19, 22, 28, 30, 46, 53, 56):
+        params = policy._sample_parameters(seed, h, w)
+        assert params['elastic'], seed
+        inverse = np.linalg.inv(np.asarray(policy._forward_matrix(params, h, w), np.float64))
+        source_space = _affine_pull(inverse, h, w) + policy._elastic_displacement(seed, h, w)
+        assert _orientation(source_space, inverse).min() < 0, seed  # x = inv(A)y + d(y) folds here
+        assert _orientation(adapter._replay(seed, h, w).forward_grid, inverse).min() > 0, seed
+
+
+def test_cpu_superheavy_replay_has_no_interior_holes():
+    policy = _cpu_policy_module('superheavy').build_augmentation()
+    adapter = CpuPolicyAdapter(policy)
+    h = w = 128
+    for seed in (19, 22, 30, 46, 53, 56):
+        params = policy._sample_parameters(seed, h, w)
+        forward = np.asarray(policy._forward_matrix(params, h, w), np.float64)
+        field = policy._elastic_displacement(seed, h, w)
+        # The source-space solver near cusps loses supported pixels between fold sheets.
+        _grid, source_valid = inverse_policy_grid_cpu(forward, field, h, w, displacement_space='source')
+        assert (_covered_interior(forward, field, h, w, 'source') & ~source_valid).any(), seed
+        covered = _covered_interior(forward, field, h, w, 'raster')
+        assert covered.sum() > h * w // 10, seed
+        assert not (covered & ~adapter._replay(seed, h, w).valid).any(), seed
+
+
+def test_cpu_source_contract_copy_replays_original_equation():
+    module = _cpu_policy_module('superheavy')
+    policy = module.build_augmentation()
+    policy.tta_replay_contract = 'opencv-affine-elastic-v1'
+    adapter = CpuPolicyAdapter(policy)
+    assert adapter.displacement_space == 'source'
+    h = w = 64
+    seed = 22
+    params = policy._sample_parameters(seed, h, w)
+    assert params['elastic']
+    forward = np.asarray(policy._forward_matrix(params, h, w), np.float64)
+    inverse = np.linalg.inv(forward)
+    field = policy._elastic_displacement(seed, h, w)
+    replay = adapter._replay(seed, h, w)
+    np.testing.assert_array_equal(replay.forward_grid, _affine_pull(inverse, h, w) + field)
+    expected_grid, expected_valid = inverse_policy_grid_cpu(forward, field, h, w, displacement_space='source')
+    np.testing.assert_array_equal(replay.inverse_grid, expected_grid)
+    np.testing.assert_array_equal(replay.valid, expected_valid)
+    shipped = CpuPolicyAdapter(module.build_augmentation())._replay(seed, h, w)
+    np.testing.assert_allclose(shipped.forward_grid, _affine_pull(inverse, h, w) + field @ inverse[:2, :2].T,
+                               atol=1e-4)
+
+
 def test_cpu_policy_requires_explicit_inverse_contract():
     with pytest.raises(TypeError, match='supported inverse contract'):
         CpuPolicyAdapter(lambda **kwargs: kwargs)
+    policy = TranslationPolicy()
+    policy.tta_replay_contract = 'opencv-affine-elastic-v3'
+    with pytest.raises(TypeError, match='supported inverse contract'):
+        CpuPolicyAdapter(policy)
+    with pytest.raises(ValueError, match='displacement_space'):
+        inverse_policy_grid_cpu(np.eye(3), None, 4, 4, displacement_space='output')
 
 
 def test_cpu_policy_startup_does_not_import_torch_or_albumentations():

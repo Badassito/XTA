@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import gc
-import math
 import os
 import sys
 import tempfile
@@ -94,26 +94,6 @@ class _NumpyNdimage:
             outside[y, x] = True
             stack.extend(((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)))
         return ~outside
-
-    @staticmethod
-    def distance_transform_edt(
-        value: object,
-        return_indices: bool = False,
-        float64_distances: bool = True,
-    ) -> np.ndarray:
-        if return_indices:
-            raise AssertionError('fixture does not request EDT indices')
-        mask = np.asarray(value, dtype=bool)
-        background = np.argwhere(~mask)
-        dtype = np.float64 if bool(float64_distances) else np.float32
-        out = np.zeros(mask.shape, dtype=dtype)
-        if int(background.size) <= 0:
-            out[mask] = np.inf
-            return out
-        for y, x in np.argwhere(mask):
-            delta = background.astype(np.float64) - np.asarray((y, x), dtype=np.float64)
-            out[int(y), int(x)] = math.sqrt(float(np.min(np.sum(delta * delta, axis=1))))
-        return out
 
 
 class _NumpyDeviceRuntime:
@@ -229,20 +209,6 @@ class _DeferredNumpyRuntime(_NumpyDeviceRuntime):
             return list(self.completions)
 
 
-class _EdtFailingNdimage(_NumpyNdimage):
-    @staticmethod
-    def distance_transform_edt(
-        value: object,
-        return_indices: bool = False,
-        float64_distances: bool = True,
-    ) -> np.ndarray:
-        raise RuntimeError('injected EDT failure')
-
-
-class _EdtFailingRuntime(_NumpyDeviceRuntime):
-    ndi = _EdtFailingNdimage()
-
-
 def _plan(
     sdf: np.ndarray,
     *,
@@ -275,25 +241,14 @@ def _plan(
 
 
 class CudaInterpolationConfigurationTests(unittest.TestCase):
-    def test_radius_offload_is_opt_in_while_cuda_rendering_remains_opt_out(self) -> None:
+    def test_cuda_rendering_remains_opt_out(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertTrue(cuda_interpolation.gpu_interpolation_enabled())
-            self.assertFalse(cuda_interpolation.gpu_interpolation_radius_enabled())
             self.assertTrue(
                 cuda_interpolation.gpu_interpolation_render_autotune_enabled()
             )
             self.assertEqual(cuda_interpolation.gpu_interpolation_stream_count(), 4)
-
-        with mock.patch.dict(
-            os.environ,
-            {
-                'YOLO_TTA_GPU_INTERPOLATION': '1',
-                'YOLO_TTA_GPU_INTERPOLATION_RADIUS': '1',
-            },
-            clear=True,
-        ):
-            self.assertTrue(cuda_interpolation.gpu_interpolation_enabled())
-            self.assertTrue(cuda_interpolation.gpu_interpolation_radius_enabled())
+        self.assertFalse(hasattr(cuda_interpolation, 'gpu_interpolation_radius_enabled'))
 
         with mock.patch.dict(
             os.environ,
@@ -304,14 +259,10 @@ class CudaInterpolationConfigurationTests(unittest.TestCase):
 
         with mock.patch.dict(
             os.environ,
-            {
-                'YOLO_TTA_GPU_INTERPOLATION': '0',
-                'YOLO_TTA_GPU_INTERPOLATION_RADIUS': '1',
-            },
+            {'YOLO_TTA_GPU_INTERPOLATION': '0'},
             clear=True,
         ):
             self.assertFalse(cuda_interpolation.gpu_interpolation_enabled())
-            self.assertTrue(cuda_interpolation.gpu_interpolation_radius_enabled())
 
         with mock.patch.dict(
             os.environ,
@@ -396,103 +347,13 @@ class CudaInterpolationRendererContractTests(unittest.TestCase):
         class _FakeRenderer:
             reserve_bytes = 1024 ** 3
             runtime = _FakeRuntime()
-            radius_failed_reason = None
 
             def __init__(self, device_index: int) -> None:
                 events.append(f'construct:{int(device_index)}')
 
             @staticmethod
-            def preflight(*, check_radius: bool = True) -> None:
-                events.append(f'preflight:{bool(check_radius)}')
-
-        fake_torch = mock.Mock(cuda=_FakeCuda())
-        for check_radius in (False, True):
-            with self.subTest(check_radius=check_radius):
-                events.clear()
-                with (
-                    mock.patch.dict(
-                        os.environ,
-                        {
-                            'YOLO_TTA_GPU_INTERPOLATION': '1',
-                            'YOLO_TTA_GPU_INTERPOLATION_CREATE_CONTEXT': '0',
-                            'YOLO_TTA_GPU_INTERPOLATION_RADIUS': (
-                                '1' if check_radius else '0'
-                            ),
-                        },
-                        clear=True,
-                    ),
-                    mock.patch.dict(sys.modules, {'torch': fake_torch}),
-                    mock.patch.object(
-                        cuda_interpolation, 'CudaInterpolationRenderer', _FakeRenderer,
-                    ),
-                ):
-                    renderer, status = (
-                        cuda_interpolation.create_cuda_interpolation_renderer(
-                            process_worker=True,
-                        )
-                    )
-
-                self.assertIsInstance(renderer, _FakeRenderer)
-                self.assertEqual(status, 'cuda:2 CuPy/CuPyX')
-                self.assertEqual(
-                    events,
-                    [
-                        'synchronize:2', 'empty_cache', 'construct:2', 'mem_info',
-                        f'preflight:{check_radius}',
-                    ],
-                )
-
-    def test_factory_keeps_rendering_when_only_radius_preflight_fails(self) -> None:
-        events: list[str] = []
-
-        class _FakeCuda:
-            @staticmethod
-            def is_available() -> bool:
-                return True
-
-            @staticmethod
-            def is_initialized() -> bool:
-                return True
-
-            @staticmethod
-            def current_device() -> int:
-                return 0
-
-            @staticmethod
-            def synchronize(_device: int) -> None:
-                return None
-
-            @staticmethod
-            def empty_cache() -> None:
-                return None
-
-        class _FakeRuntime:
-            @staticmethod
-            def mem_info() -> tuple[int, int]:
-                return 4 * 1024 ** 3, 8 * 1024 ** 3
-
-        class _SplitPreflightRenderer:
-            reserve_bytes = 1024 ** 3
-            runtime = _FakeRuntime()
-            visible_device_token = None
-
-            def __init__(self, device_index: int) -> None:
-                self.device_index = int(device_index)
-                self.radius_failed_reason: str | None = None
-
-            def preflight(self, *, check_radius: bool = True) -> None:
-                events.append(f'preflight:{bool(check_radius)}')
-                if bool(check_radius):
-                    raise RuntimeError('injected EDT failure')
-
-            def disable_radius(self, exc: BaseException) -> bool:
-                events.append('disable-radius')
-                self.radius_failed_reason = f'{type(exc).__name__}: {exc}'
-                return True
-
-            @staticmethod
-            def close() -> None:
-                events.append('close')
+            def preflight() -> None:
+                events.append('preflight')
 
         fake_torch = mock.Mock(cuda=_FakeCuda())
         with (
@@ -501,73 +362,55 @@ class CudaInterpolationRendererContractTests(unittest.TestCase):
                 {
                     'YOLO_TTA_GPU_INTERPOLATION': '1',
                     'YOLO_TTA_GPU_INTERPOLATION_CREATE_CONTEXT': '0',
-                    'YOLO_TTA_GPU_INTERPOLATION_RADIUS': '1',
                 },
                 clear=True,
             ),
             mock.patch.dict(sys.modules, {'torch': fake_torch}),
             mock.patch.object(
-                cuda_interpolation,
-                'CudaInterpolationRenderer',
-                _SplitPreflightRenderer,
+                cuda_interpolation, 'CudaInterpolationRenderer', _FakeRenderer,
             ),
         ):
             renderer, status = cuda_interpolation.create_cuda_interpolation_renderer(
                 process_worker=True,
             )
 
-        self.assertIsInstance(renderer, _SplitPreflightRenderer)
-        self.assertEqual(
-            status,
-            'cuda:0 CuPy/CuPyX; radius unavailable '
-            '(RuntimeError: injected EDT failure)',
-        )
+        self.assertIsInstance(renderer, _FakeRenderer)
+        self.assertEqual(status, 'cuda:2 CuPy/CuPyX')
         self.assertEqual(
             events,
-            ['preflight:True', 'disable-radius', 'preflight:False'],
+            ['synchronize:2', 'empty_cache', 'construct:2', 'mem_info', 'preflight'],
         )
 
-    def test_preflight_skips_edt_when_cuda_radius_is_disabled(self) -> None:
-        renderer = CudaInterpolationRenderer(
-            runtime=_EdtFailingRuntime(), cache_bytes=0, reserve_bytes=0,
-        )
+    def test_uncached_render_matches_expected_morphology(self) -> None:
+        # Bridge SDFs are measured to the pixel interface (+/-0.5 on edge pixels).
+        sdf = np.full((5, 5), -0.5, dtype=np.float32)
+        sdf[1:4, 1:4] = np.float32(0.5)
+        sdf[2, 2] = np.float32(-0.5)  # enclosed 4-connected hole
+        for fill_holes, expected_voxels in ((True, 9), (False, 8)):
+            with self.subTest(fill_section_holes=fill_holes):
+                plan = dataclasses.replace(_plan(sdf), fill_section_holes=fill_holes)
+                runtime = _NumpyDeviceRuntime()
+                renderer = CudaInterpolationRenderer(
+                    runtime=runtime, cache_bytes=4 * 1024 ** 2, reserve_bytes=0,
+                )
+                destination = np.zeros((7, 7), dtype=np.uint8)
+                result = renderer.render_slice(destination, [(plan, 1, 1)])
 
-        renderer.preflight(check_radius=False)
-        self.assertTrue(renderer.available)
-        with self.assertRaisesRegex(RuntimeError, 'injected EDT failure'):
-            renderer.preflight(check_radius=True)
-
-    def test_uncached_radius_scan_and_render_match_expected_morphology(self) -> None:
-        sdf = np.full((5, 5), -1.0, dtype=np.float32)
-        sdf[1:4, 1:4] = np.float32(1.0)
-        sdf[2, 2] = np.float32(-1.0)  # filled as an enclosed 4-connected hole
-        plan = _plan(sdf)
-        runtime = _NumpyDeviceRuntime()
-        renderer = CudaInterpolationRenderer(
-            runtime=runtime, cache_bytes=4 * 1024 ** 2, reserve_bytes=0,
-        )
-
-        radius = renderer.estimate_min_radius(
-            plan, reject_at_or_below=0.5, cache_sections=False,
-        )
-        self.assertEqual(radius, 1.0)
-        destination = np.zeros((7, 7), dtype=np.uint8)
-        result = renderer.render_slice(destination, [(plan, 1, 1)])
-
-        expected = np.zeros_like(destination)
-        expected[2:5, 2:5] = np.uint8(1)
-        np.testing.assert_array_equal(destination, expected)
-        self.assertEqual(result.added_voxels, 9)
-        self.assertEqual(result.rendered_sections, 1)
-        self.assertEqual(result.bbox, (1, 1, 6, 6))
-        telemetry = renderer.telemetry()
-        self.assertEqual(int(telemetry['estimated_plans']), 1)
-        self.assertEqual(int(telemetry['estimated_sections']), 1)
-        self.assertEqual(int(telemetry['rendered_slices']), 1)
-        self.assertGreater(int(telemetry['host_to_device_bytes']), 0)
-        self.assertGreater(int(telemetry['device_to_host_bytes']), 0)
-        renderer.close()
-        self.assertTrue(runtime.freed)
+                expected = np.zeros_like(destination)
+                expected[2:5, 2:5] = np.uint8(1)
+                if not fill_holes:
+                    expected[3, 3] = np.uint8(0)
+                np.testing.assert_array_equal(destination, expected)
+                self.assertEqual(result.added_voxels, expected_voxels)
+                self.assertEqual(result.rendered_sections, 1)
+                self.assertEqual(result.bbox, (1, 1, 6, 6))
+                telemetry = renderer.telemetry()
+                self.assertEqual(int(telemetry['rendered_slices']), 1)
+                self.assertNotIn('estimated_plans', telemetry)
+                self.assertGreater(int(telemetry['host_to_device_bytes']), 0)
+                self.assertGreater(int(telemetry['device_to_host_bytes']), 0)
+                renderer.close()
+                self.assertTrue(runtime.freed)
 
     def test_center_component_tie_uses_row_major_nearest_pixel(self) -> None:
         sdf = np.full((5, 5), -1.0, dtype=np.float32)
@@ -718,7 +561,9 @@ class CudaInterpolationRendererContractTests(unittest.TestCase):
         active = 0
         peak = 0
 
-        def _concurrent_keep(section: object, stream: object = None) -> object:
+        def _concurrent_keep(
+            section: object, stream: object = None, fill_holes: bool = True,
+        ) -> object:
             nonlocal active, peak
             with guard:
                 active += 1
@@ -728,7 +573,7 @@ class CudaInterpolationRendererContractTests(unittest.TestCase):
             try:
                 if not two_active.wait(timeout=5.0):
                     raise AssertionError('uncached CUDA morphology remained lock-serialized')
-                return original_keep(section, stream=stream)
+                return original_keep(section, stream=stream, fill_holes=fill_holes)
             finally:
                 with guard:
                     active -= 1
@@ -770,15 +615,19 @@ class CudaInterpolationRendererContractTests(unittest.TestCase):
         renderer = CudaInterpolationRenderer(
             runtime=runtime, cache_bytes=1024, reserve_bytes=0, stream_count=2,
         )
-        cached_device_section = np.ones((3, 3), dtype=bool)
-        cached_ref = weakref.ref(cached_device_section)
+        # Admission preflight builds the shared 8-connected structure without a
+        # stream, so the only completion queued below is the render's own event.
+        renderer.preflight()
+        cached_device_sdf0 = np.ones((3, 3), dtype=np.float32)
+        cached_device_sdf1 = np.ones((3, 3), dtype=np.float32)
+        cached_ref = weakref.ref(cached_device_sdf0)
         renderer._cache_put(
-            ('section', id(plan.cached_sections), 1),
-            cached_device_section,
-            int(cached_device_section.nbytes),
-            (plan.cached_sections,),
+            ('sdf', id(plan.sdf0), id(plan.sdf1)),
+            (cached_device_sdf0, cached_device_sdf1),
+            int(cached_device_sdf0.nbytes + cached_device_sdf1.nbytes),
+            (plan.sdf0, plan.sdf1),
         )
-        del cached_device_section
+        del cached_device_sdf0, cached_device_sdf1
 
         destination = np.zeros((7, 7), dtype=np.uint8)
         errors: list[BaseException] = []
@@ -841,28 +690,6 @@ class CudaInterpolationRendererContractTests(unittest.TestCase):
         self.assertRegex(str(errors[0]), 'injected asynchronous D2H failure')
         np.testing.assert_array_equal(destination, before)
 
-    def test_radius_failure_does_not_disable_gpu_rendering(self) -> None:
-        section = np.ones((3, 3), dtype=bool)
-        plan = _plan(
-            np.ones((3, 3), dtype=np.float32),
-            cached_sections=[None, section, None],
-        )
-        renderer = CudaInterpolationRenderer(
-            runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
-        )
-
-        self.assertTrue(renderer.disable_radius(RuntimeError('injected radius failure')))
-        self.assertFalse(renderer.radius_available)
-        self.assertTrue(renderer.available)
-
-        destination = np.zeros((7, 7), dtype=np.uint8)
-        result = renderer.render_slice(destination, [(plan, 1, 1)])
-        self.assertEqual(result.added_voxels, 9)
-        self.assertEqual(int(np.count_nonzero(destination)), 9)
-        telemetry = renderer.telemetry()
-        self.assertIsNone(telemetry['failed_reason'])
-        self.assertIn('injected radius failure', str(telemetry['radius_failed_reason']))
-
     def test_cache_validates_host_owner_identity_for_id_derived_keys(self) -> None:
         renderer = CudaInterpolationRenderer(
             runtime=_NumpyDeviceRuntime(), cache_bytes=1024, reserve_bytes=0,
@@ -874,97 +701,25 @@ class CudaInterpolationRendererContractTests(unittest.TestCase):
         self.assertIsNone(renderer._cache_get(key, second_owners))
         self.assertEqual(int(renderer.telemetry()['cache_live_bytes']), 0)
 
-    def test_section_scan_obeys_cache_budget_before_plan_completion(self) -> None:
-        plan = _plan(np.ones((5, 5), dtype=np.float32), steps=8)
-        renderer = CudaInterpolationRenderer(
-            runtime=_NumpyDeviceRuntime(), cache_bytes=60, reserve_bytes=0,
-        )
-        renderer.estimate_min_radius(plan, cache_sections=True)
-        telemetry = renderer.telemetry()
-        self.assertLessEqual(int(telemetry['cache_peak_bytes']), 60)
-        self.assertLessEqual(int(telemetry['cache_live_bytes']), 60)
-        self.assertEqual(sum(section is not None for section in plan.cached_sections), 7)
-
-    def test_radius_planners_execute_on_independent_stream_leases(self) -> None:
+    def test_sdf_cache_obeys_budget_across_uncached_plans(self) -> None:
+        # Each plan uploads one 5x5 float32 SDF pair (200 bytes); 500 bytes hold two.
         plans = [
-            _plan(np.ones((5, 5), dtype=np.float32), steps=2),
-            _plan(np.ones((5, 5), dtype=np.float32), steps=2),
+            _plan(np.ones((5, 5), dtype=np.float32), source_anchor=(4, x), target_anchor=(4, x))
+            for x in (2, 8, 14, 20)
         ]
         renderer = CudaInterpolationRenderer(
-            runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
-            stream_count=2,
+            runtime=_NumpyDeviceRuntime(), cache_bytes=500, reserve_bytes=0,
         )
-        original_section_radius = renderer._section_radius
-        guard = threading.Lock()
-        two_active = threading.Event()
-        active = 0
-        peak = 0
-
-        def _concurrent_radius(section: object) -> float:
-            nonlocal active, peak
-            with guard:
-                active += 1
-                peak = max(int(peak), int(active))
-                if active >= 2:
-                    two_active.set()
-            try:
-                if not two_active.wait(timeout=5.0):
-                    raise AssertionError('CUDA radius evaluation remained renderer-serialized')
-                return original_section_radius(section)
-            finally:
-                with guard:
-                    active -= 1
-
-        results: list[float] = []
-        errors: list[BaseException] = []
-
-        def _estimate(index: int) -> None:
-            try:
-                results.append(renderer.estimate_min_radius(plans[int(index)]))
-            except BaseException as exc:  # pragma: no cover - assertion reports detail
-                errors.append(exc)
-
-        with mock.patch.object(renderer, '_section_radius', side_effect=_concurrent_radius):
-            threads = [
-                threading.Thread(target=_estimate, args=(index,)) for index in range(2)
-            ]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=5.0)
-
-        self.assertTrue(all(not thread.is_alive() for thread in threads))
-        self.assertEqual(errors, [])
-        self.assertEqual(len(results), 2)
-        self.assertEqual(peak, 2)
-        self.assertEqual(int(renderer.telemetry()['stream_peak']), 2)
-
-    def test_device_only_section_cache_avoids_d2h_and_recomputes_after_eviction(self) -> None:
-        plan = _plan(np.ones((5, 5), dtype=np.float32), steps=8)
-        renderer = CudaInterpolationRenderer(
-            runtime=_NumpyDeviceRuntime(), cache_bytes=60, reserve_bytes=0,
-        )
-        renderer.estimate_min_radius(
-            plan,
-            cache_sections=True,
-            cache_host_sections=False,
-        )
-        after_scan = renderer.telemetry()
-        self.assertEqual(int(after_scan['device_to_host_bytes']), 0)
-        self.assertTrue(all(section is None for section in plan.cached_sections))
-        self.assertLessEqual(int(after_scan['cache_peak_bytes']), 60)
-
-        # Step 1 was evicted by the later sections. Rendering must reconstruct it
-        # from the SDFs without relying on a host section cache.
-        destination = np.zeros((9, 9), dtype=np.uint8)
-        result = renderer.render_slice(destination, [(plan, 1, 1)])
-        self.assertEqual(result.added_voxels, 25)
-        self.assertEqual(int(np.count_nonzero(destination)), 25)
-        after_render = renderer.telemetry()
-        self.assertGreater(
-            int(after_render['cache_misses']), int(after_scan['cache_misses']),
-        )
-        self.assertGreater(int(after_render['device_to_host_bytes']), 0)
+        destination = np.zeros((9, 23), dtype=np.uint8)
+        result = renderer.render_slice(destination, [(plan, 1, 1) for plan in plans])
+        telemetry = renderer.telemetry()
+        self.assertEqual(result.added_voxels, 100)
+        self.assertEqual(int(np.count_nonzero(destination)), 100)
+        self.assertLessEqual(int(telemetry['cache_peak_bytes']), 500)
+        self.assertLessEqual(int(telemetry['cache_live_bytes']), 500)
+        self.assertEqual(int(telemetry['cache_evictions']), 2)
+        renderer.release_plans(plans)
+        self.assertEqual(int(renderer.telemetry()['cache_live_bytes']), 0)
 
     @unittest.skipUnless(
         os.environ.get('XTA_TEST_CUDA', '').strip() == '1',
@@ -974,28 +729,29 @@ class CudaInterpolationRendererContractTests(unittest.TestCase):
         sdf = np.full((7, 7), -2.0, dtype=np.float32)
         sdf[1:6, 1:6] = np.float32(2.0)
         sdf[3, 3] = np.float32(-2.0)
-        gpu_plan = _plan(sdf, steps=3)
-        oracle_plan = _plan(sdf, steps=3)
         gpu = CudaInterpolationRenderer(cache_bytes=32 * 1024 ** 2, reserve_bytes=0)
         oracle = CudaInterpolationRenderer(
             runtime=_NumpyDeviceRuntime(), cache_bytes=32 * 1024 ** 2, reserve_bytes=0,
         )
         try:
             gpu.preflight()
-            gpu_radius = gpu.estimate_min_radius(
-                gpu_plan, reject_at_or_below=0.5, cache_sections=True,
-            )
-            oracle_radius = oracle.estimate_min_radius(
-                oracle_plan, reject_at_or_below=0.5, cache_sections=True,
-            )
-            self.assertAlmostEqual(gpu_radius, oracle_radius, places=5)
-            gpu_destination = np.zeros((11, 11), dtype=np.uint8)
-            oracle_destination = np.zeros_like(gpu_destination)
-            gpu.render_slice(gpu_destination, [(gpu_plan, 1, 1), (gpu_plan, 2, 1)])
-            oracle.render_slice(
-                oracle_destination, [(oracle_plan, 1, 1), (oracle_plan, 2, 1)],
-            )
-            np.testing.assert_array_equal(gpu_destination, oracle_destination)
+            for fill_holes in (True, False):
+                with self.subTest(fill_section_holes=fill_holes):
+                    gpu_plan = dataclasses.replace(
+                        _plan(sdf, steps=3), fill_section_holes=fill_holes,
+                    )
+                    oracle_plan = dataclasses.replace(
+                        _plan(sdf, steps=3), fill_section_holes=fill_holes,
+                    )
+                    gpu_destination = np.zeros((11, 11), dtype=np.uint8)
+                    oracle_destination = np.zeros_like(gpu_destination)
+                    gpu.render_slice(
+                        gpu_destination, [(gpu_plan, 1, 1), (gpu_plan, 2, 1)],
+                    )
+                    oracle.render_slice(
+                        oracle_destination, [(oracle_plan, 1, 1), (oracle_plan, 2, 1)],
+                    )
+                    np.testing.assert_array_equal(gpu_destination, oracle_destination)
         finally:
             gpu.close()
             oracle.close()
@@ -1068,7 +824,6 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
         required: bool = False,
         steps: int = 2,
         interpolate_min_radius: float = 0.0,
-        radius_enabled: bool | None = None,
         render_autotune: bool | None = False,
         exercise_radius_routing: bool = False,
         seed_count: int = 1,
@@ -1135,12 +890,7 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
         env = {
             'YOLO_TTA_GPU_INTERPOLATION': '1',
             'YOLO_TTA_GPU_INTERPOLATION_REQUIRED': '1' if required else '0',
-            'YOLO_TTA_INTERPOLATION_CACHE_BRIDGE_SECTIONS': '1',
         }
-        if radius_enabled is not None:
-            env['YOLO_TTA_GPU_INTERPOLATION_RADIUS'] = (
-                '1' if bool(radius_enabled) else '0'
-            )
         if render_autotune is not None:
             env['YOLO_TTA_GPU_INTERPOLATION_RENDER_AUTOTUNE'] = (
                 '1' if bool(render_autotune) else '0'
@@ -1385,11 +1135,6 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
                 side_effect=self._accept_radius_on_cpu,
             ) as cpu_estimate,
             mock.patch.object(
-                renderer,
-                'estimate_min_radius',
-                wraps=renderer.estimate_min_radius,
-            ) as gpu_estimate,
-            mock.patch.object(
                 interpolation,
                 'time',
                 self._clock(0.0, 1.0, 2.0, 3.0, 3.5, 4.0),
@@ -1398,22 +1143,23 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
             mask, stats = self._run_pass(
                 renderer,
                 interpolate_min_radius=0.5,
-                radius_enabled=None,
                 render_autotune=None,
                 exercise_radius_routing=True,
             )
 
         self.assertEqual(cpu_estimate.call_count, 1)
-        gpu_estimate.assert_not_called()
         self.assertEqual(int(np.count_nonzero(mask[1])), 9)
         self.assertEqual(stats['interpolation_render_backend'], 'cuda_cupy_crop_bounded')
         self.assertEqual(stats['interpolation_radius_backend'], 'cpu_numpy_numba')
         self.assertTrue(stats['gpu_interpolation_active'])
         self.assertTrue(stats['gpu_interpolation_render_autotune_enabled'])
         self.assertTrue(stats['gpu_interpolation_render_selected'])
-        self.assertFalse(stats['gpu_interpolation_radius_enabled'])
-        self.assertFalse(stats['gpu_interpolation_radius_active'])
-        self.assertEqual(int(stats['gpu_interpolation_estimated_plans']), 0)
+        for retired_key in (
+            'gpu_interpolation_radius_enabled',
+            'gpu_interpolation_radius_active',
+            'gpu_interpolation_estimated_plans',
+        ):
+            self.assertNotIn(retired_key, stats)
         self.assertEqual(int(stats['gpu_interpolation_rendered_sections']), 1)
 
     def test_required_mode_allows_the_intentional_default_cpu_radius(self) -> None:
@@ -1429,14 +1175,12 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
                 renderer,
                 required=True,
                 interpolate_min_radius=0.5,
-                radius_enabled=None,
                 exercise_radius_routing=True,
             )
 
         self.assertEqual(cpu_estimate.call_count, 1)
         self.assertEqual(int(np.count_nonzero(mask[1])), 9)
         self.assertTrue(stats['gpu_interpolation_required'])
-        self.assertFalse(stats['gpu_interpolation_radius_enabled'])
         self.assertEqual(stats['interpolation_radius_backend'], 'cpu_numpy_numba')
         self.assertEqual(int(stats['gpu_interpolation_rendered_sections']), 1)
 
@@ -1468,147 +1212,25 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
         self.assertEqual(int(stats['gpu_interpolation_batches']), 2)
         self.assertEqual(float(stats['planner_cpu_render_wall_seconds']), 0.0)
 
-    def test_radius_env_override_restores_cuda_radius_evaluation(self) -> None:
+    def test_required_mode_skips_radius_evaluation_when_filter_is_inactive(self) -> None:
         renderer = CudaInterpolationRenderer(
             runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
         )
         with mock.patch.object(
             interpolation,
             '_estimate_linear_slice_bridge_min_radius_from_plan',
-            side_effect=self._accept_radius_on_cpu,
+            side_effect=AssertionError('zero threshold evaluated a bridge radius'),
         ) as cpu_estimate:
             mask, stats = self._run_pass(
                 renderer,
-                interpolate_min_radius=0.5,
-                radius_enabled=True,
+                required=True,
+                interpolate_min_radius=0.0,
                 exercise_radius_routing=True,
             )
 
         cpu_estimate.assert_not_called()
         self.assertEqual(int(np.count_nonzero(mask[1])), 9)
-        self.assertEqual(stats['interpolation_radius_backend'], 'cuda_cupy')
-        self.assertTrue(stats['gpu_interpolation_radius_enabled'])
-        self.assertTrue(stats['gpu_interpolation_radius_active'])
-        self.assertEqual(int(stats['gpu_interpolation_estimated_plans']), 1)
-        self.assertGreater(int(stats['gpu_interpolation_estimated_sections']), 0)
-        self.assertEqual(int(stats['gpu_interpolation_radius_fallback_plans']), 0)
-
-    def test_radius_failure_falls_back_to_cpu_without_disabling_gpu_render(self) -> None:
-        renderer = CudaInterpolationRenderer(
-            runtime=_NumpyDeviceRuntime(), cache_bytes=1024, reserve_bytes=0,
-        )
-
-        def _fail_after_caching_stale_section(
-            plan: interpolation.SliceBridgeRenderPlan,
-            **_kwargs: object,
-        ) -> float:
-            stale_section = np.zeros(plan.sdf0.shape, dtype=bool)
-            renderer._cache_put(
-                ('section', id(plan.cached_sections), 1),
-                stale_section,
-                int(stale_section.nbytes),
-                (plan.cached_sections,),
-            )
-            raise RuntimeError('injected device radius failure')
-
-        with (
-            mock.patch.object(
-                renderer,
-                'estimate_min_radius',
-                side_effect=_fail_after_caching_stale_section,
-            ),
-            mock.patch.object(
-                interpolation,
-                '_estimate_linear_slice_bridge_min_radius_from_plan',
-                side_effect=self._accept_radius_on_cpu,
-            ) as cpu_estimate,
-        ):
-            mask, stats = self._run_pass(
-                renderer,
-                interpolate_min_radius=0.5,
-                radius_enabled=True,
-                exercise_radius_routing=True,
-            )
-
-        self.assertEqual(cpu_estimate.call_count, 1)
-        # The stale all-false device section must be discarded before the CPU retry
-        # publishes its authoritative all-true host section for GPU painting.
-        self.assertEqual(int(np.count_nonzero(mask[1])), 9)
-        self.assertEqual(stats['interpolation_render_backend'], 'cuda_cupy_crop_bounded')
-        self.assertEqual(stats['interpolation_radius_backend'], 'cuda_cupy+cpu_fallback')
-        self.assertTrue(stats['gpu_interpolation_active'])
-        self.assertFalse(stats['gpu_interpolation_radius_active'])
-        self.assertEqual(int(stats['gpu_interpolation_radius_fallback_plans']), 1)
-        self.assertIn(
-            'injected device radius failure',
-            str(stats['gpu_interpolation_radius_fallback_reason']),
-        )
-        self.assertEqual(int(stats['gpu_interpolation_rendered_sections']), 1)
-        self.assertIsNone(stats['gpu_interpolation_fallback_reason'])
-
-    def test_required_mode_makes_opted_in_cuda_radius_failure_fatal(self) -> None:
-        renderer = CudaInterpolationRenderer(
-            runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
-        )
-        with (
-            mock.patch.object(
-                renderer,
-                'estimate_min_radius',
-                side_effect=RuntimeError('injected required radius failure'),
-            ),
-            self.assertRaisesRegex(
-                RuntimeError, 'required CUDA interpolation radius evaluation failed',
-            ),
-        ):
-            self._run_pass(
-                renderer,
-                required=True,
-                interpolate_min_radius=0.5,
-                radius_enabled=True,
-                exercise_radius_routing=True,
-            )
-
-    def test_required_mode_rejects_radius_disabled_during_preflight(self) -> None:
-        renderer = CudaInterpolationRenderer(
-            runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
-        )
-        renderer.disable_radius(RuntimeError('injected radius preflight failure'))
-
-        with self.assertRaisesRegex(
-            RuntimeError, 'CUDA radius evaluation is unavailable',
-        ):
-            self._run_pass(
-                renderer,
-                required=True,
-                interpolate_min_radius=0.5,
-                radius_enabled=True,
-                exercise_radius_routing=True,
-            )
-
-    def test_required_mode_ignores_disabled_radius_when_filter_is_inactive(self) -> None:
-        renderer = CudaInterpolationRenderer(
-            runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
-        )
-        renderer.disable_radius(RuntimeError('injected unused radius failure'))
-
-        with mock.patch.object(
-            renderer,
-            'estimate_min_radius',
-            wraps=renderer.estimate_min_radius,
-        ) as gpu_estimate:
-            mask, stats = self._run_pass(
-                renderer,
-                required=True,
-                interpolate_min_radius=0.0,
-                radius_enabled=True,
-                exercise_radius_routing=True,
-            )
-
-        gpu_estimate.assert_not_called()
-        self.assertEqual(int(np.count_nonzero(mask[1])), 9)
         self.assertTrue(stats['gpu_interpolation_required'])
-        self.assertTrue(stats['gpu_interpolation_radius_enabled'])
-        self.assertFalse(stats['gpu_interpolation_radius_active'])
         self.assertEqual(stats['interpolation_radius_backend'], 'disabled')
         self.assertEqual(stats['interpolation_render_backend'], 'cuda_cupy_crop_bounded')
         self.assertTrue(stats['gpu_interpolation_render_selected'])
@@ -1634,7 +1256,6 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
 
             def telemetry(self) -> dict[str, object]:
                 return {
-                    'estimated_plans': 0,
                     'rendered_slices': 0,
                     'failed_reason': self.reason,
                 }

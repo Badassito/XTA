@@ -13,19 +13,18 @@ from tools.cpu_backend_benchmarks import interpolation as benchmark
 
 
 def test_benchmark_cases_use_equal_nonempty_compiled_and_python_candidates() -> None:
-    with mock.patch.dict(os.environ, {'YOLO_TTA_INTERPOLATION_COMPILED_KERNELS': '0'}):
-        cases = benchmark.make_cases('smoke')
-        assert {case.metadata['fragmented'] for case in cases} == {False, True}
-        for case in cases:
-            reference, compiled = case.reference(), case.compiled()
-            assert reference.dtype == compiled.dtype == np.int64
-            assert reference.ndim == compiled.ndim == 2
-            assert reference.shape[1] == compiled.shape[1] == 9
-            assert reference.shape[0] > 0
-            np.testing.assert_array_equal(compiled, reference)
-        with mock.patch.object(interpolation, '_find_slice_projection_candidates_numba', return_value=None):
-            with pytest.raises(RuntimeError, match='refusing to time the Python fallback'):
-                cases[0].compiled()
+    cases = benchmark.make_cases('smoke')
+    assert {case.metadata['fragmented'] for case in cases} == {False, True}
+    for case in cases:
+        reference, compiled = case.reference(), case.compiled()
+        assert reference.dtype == compiled.dtype == np.int64
+        assert reference.ndim == compiled.ndim == 2
+        assert reference.shape[1] == compiled.shape[1] == 9
+        assert reference.shape[0] > 0
+        np.testing.assert_array_equal(compiled, reference)
+    with mock.patch.object(interpolation, '_find_slice_projection_candidates_numba', return_value=None):
+        with pytest.raises(RuntimeError, match='refusing to time the Python fallback'):
+            cases[0].compiled()
 
 
 def test_compiled_workspace_growth_preserves_all_fragmented_candidates() -> None:

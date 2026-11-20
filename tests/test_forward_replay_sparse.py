@@ -21,6 +21,19 @@ def fixture(dtype='float32', proto_dtype=None, *, batch=2, anchors=512):
     return head, proto
 
 
+def decoder_crop_cells(xx, yy, x1, y1, x2, y2):
+    """Proto cells the mask decoders read for one box (XTA.inference crop rule).
+
+    A cell is read when its centre c+.5 lies in the half-open box, plus the cell holding a
+    non-empty box's centre. Both stay inside the packer's [floor(lo)-1, ceil(hi)+1) halo,
+    so persisted candidate-box packets remain decodable under this rule.
+    """
+    half = np.float32(.5)
+    in_x = ((xx + half >= x1) & (xx + half < x2)) | ((x2 > x1) & (xx == np.floor(half * (x1 + x2))))
+    in_y = ((yy + half >= y1) & (yy + half < y2)) | ((y2 > y1) & (yy == np.floor(half * (y1 + y2))))
+    return in_x & in_y
+
+
 def nbytes(packet):
     return sum(int(a.numel()) * a.element_size() if hasattr(a, 'numel') else a.nbytes for a in packet)
 
@@ -52,7 +65,7 @@ def check_packet(head, proto, floor=20, support='candidate_boxes'):
         yy, xx = np.indices(p.shape[-2:], dtype=np.float32)
         for bi, ai in zip(b, a):
             cx, cy, w, height = h[bi, :4, ai].astype(np.float32)
-            inside = (xx >= cx - .5*w) & (xx < cx + .5*w) & (yy >= cy - .5*height) & (yy < cy + .5*height)
+            inside = decoder_crop_cells(xx, yy, cx - .5*w, cy - .5*height, cx + .5*w, cy + .5*height)
             np.testing.assert_array_equal(rp[bi, :, inside], p[bi, :, inside])
     return packet
 
@@ -66,6 +79,23 @@ def test_sparse_values_order_global_crop_dtype_and_strides(head_dtype, proto_dty
         torch = pytest.importorskip('torch')
         head, proto = torch.from_numpy(head), torch.from_numpy(proto)
     check_packet(head, proto, floor)
+
+
+@pytest.mark.parametrize('container', ['numpy', 'torch'])
+def test_sub_cell_boxes_retain_the_decoder_centre_cell(container):
+    head, proto = fixture()
+    head[:, :4, 7] = np.array([17.8, 15.8, .5, .4], dtype=np.float32)  # Neither box holds a cell centre.
+    head[:, :4, 29] = np.array([26.0, 23.0, .9, .9], dtype=np.float32)
+    yy, xx = np.indices(proto.shape[-2:], dtype=np.float32)
+    for cx, cy, w, h in head[0, :4, [7, 29]]:
+        x1, y1, x2, y2 = cx - np.float32(.5) * w, cy - np.float32(.5) * h, cx + np.float32(.5) * w, cy + np.float32(.5) * h
+        assert np.count_nonzero(decoder_crop_cells(xx, yy, x1, y1, x2, y2)) == 1
+        assert not np.any((xx + np.float32(.5) >= x1) & (xx + np.float32(.5) < x2)
+                          & (yy + np.float32(.5) >= y1) & (yy + np.float32(.5) < y2))
+    if container == 'torch':
+        torch = pytest.importorskip('torch')
+        head, proto = torch.from_numpy(head), torch.from_numpy(proto)
+    check_packet(head, proto)
 
 
 def test_empty_packet_omits_head_and_prototype_payload():
@@ -200,7 +230,7 @@ def test_noninteger_global_prototype_scaling_preserves_all_crop_reads(container,
         for a in np.flatnonzero(head[b,4]>=.2):
             cx,cy,w,h=head[b,:4,a]
             sx=np.float32(proto.shape[3]/image_hw[1]);sy=np.float32(proto.shape[2]/image_hw[0])
-            inside=(xx>=(cx-np.float32(.5)*w)*sx)&(xx<(cx+np.float32(.5)*w)*sx)&(yy>=(cy-np.float32(.5)*h)*sy)&(yy<(cy+np.float32(.5)*h)*sy)
+            inside=decoder_crop_cells(xx,yy,(cx-np.float32(.5)*w)*sx,(cy-np.float32(.5)*h)*sy,(cx+np.float32(.5)*w)*sx,(cy+np.float32(.5)*h)*sy)
             np.testing.assert_array_equal(rp[b,:,inside],proto[b,:,inside])
 
 

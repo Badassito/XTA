@@ -56,9 +56,11 @@ def sample_inputs(batch_size, shape=(32, 48), channels=1):
 def test_explicit_seed_outputs_and_original_order_match_legacy(profile, batch_size, channels):
     policy, module = cpu_policy(profile, batch_size=batch_size)
     kwargs = sample_inputs(batch_size, channels=channels)
+    # The batched source-grid einsum is checked separately: it can round 1 ulp away from
+    # the per-matrix form, and the noise eligibility test round(255 * v) > 0 is
+    # discontinuous, so a 1-ulp coordinate change can legitimately change pixels.
     with (mock.patch.object(torch.Tensor, 'pin_memory', lambda self, *a, **kw: self),
           mock.patch.object(module, '_inverse_affine_batch', side_effect=legacy_inverse),
-          mock.patch.object(torch, 'einsum', side_effect=legacy_grid),
           mock.patch.object(module.F, 'grid_sample', side_effect=materialized_grid_sample)):
         expected_images, expected_masks = policy.apply_batch_many(**kwargs)
     with mock.patch.object(torch.Tensor, 'pin_memory', lambda self, *a, **kw: self):
@@ -69,6 +71,17 @@ def test_explicit_seed_outputs_and_original_order_match_legacy(profile, batch_si
         expected = source[None] if source.ndim == 2 else source.transpose(2, 0, 1)
         np.testing.assert_array_equal(images[source_index * 5].numpy(), expected)
         np.testing.assert_array_equal(masks[source_index * 5].numpy(), kwargs['masks'][source_index])
+
+
+def test_batched_source_grid_matches_per_matrix_einsum_to_rounding(profile):
+    policy, module = cpu_policy(profile, batch_size=15)
+    matrices = [[[1.1, .2, -3.], [-.15, .95, 2.5], [0., 0., 1.]],
+                [[.8, -.3, 7.], [.25, 1.2, -4.], [0., 0., 1.]],
+                [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]]
+    inverse = module._inverse_affine_batch(matrices, torch.device('cpu'))
+    pixels = policy._pixel_grid(32, 48)
+    batched = torch.einsum('nij,hwj->nhwi', inverse, pixels)
+    torch.testing.assert_close(batched, legacy_grid('nij,hwj->nhwi', inverse, pixels), rtol=1e-6, atol=1e-5)
 
 
 @pytest.mark.parametrize('channels', [1, 3])

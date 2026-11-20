@@ -1,4 +1,4 @@
-"""Tilted Azimuthal shares exclusive bounded retirement with Radial/Spherical."""
+"""Tilted Azimuthal (native destination pull) shares exclusive bounded retirement with Radial/Spherical."""
 from __future__ import annotations
 
 from itertools import permutations
@@ -41,7 +41,7 @@ class TiltedAzimuthalRetirementAdmissionTests(unittest.TestCase):
 
     def test_idle_tilted_projection_never_steals_busy_worker(self):
         coordinator = self.coordinator(backlog=False, pressure=True, queued=2)
-        purpose = 'Tilted Azimuthal source projection parent'
+        purpose = bp._native_pull_cuda_stage_purpose(SimpleNamespace(name='tilted_azimuthal_parent'))
         self.assertIsNone(self.acquire(coordinator, purpose))
         coordinator.finish_inference(0)
         self.assertIsNone(self.acquire(coordinator, purpose, 0))
@@ -62,7 +62,7 @@ class TiltedAzimuthalRetirementAdmissionTests(unittest.TestCase):
             self.assertIsNone(self.acquire(coordinator, purpose, 0))
 
     def test_all_three_families_share_fifo_and_one_two_turn_burst(self):
-        for families in permutations(('Tilted Azimuthal', 'Radial', 'Spherical')):
+        for families in permutations(('Native', 'Radial', 'Spherical')):
             with self.subTest(order=families), mock.patch.object(bp.time, 'monotonic', return_value=10.):
                 coordinator = self.coordinator(backlog=True, pressure=True, queued=2)
                 names = [f'{family} source projection {index}' for index, family in enumerate(families)]
@@ -90,7 +90,7 @@ class TiltedAzimuthalRetirementAdmissionTests(unittest.TestCase):
     def test_tilted_reader_ages_then_hands_off_to_radial_below_pressure(self):
         with mock.patch.object(bp.time, 'monotonic', return_value=10.) as clock:
             coordinator = self.coordinator(backlog=True, pressure=False, queued=2)
-            names = ['Tilted Azimuthal source projection aged', 'Radial source projection aged',
+            names = ['Native source projection aged', 'Radial source projection aged',
                      'Spherical source projection aged']
             for name in names:
                 self.assertIsNone(self.acquire(coordinator, name))
@@ -111,11 +111,18 @@ class TiltedAzimuthalRetirementAdmissionTests(unittest.TestCase):
             self.assertIsNone(self.acquire(coordinator, names[2]))
             self.assertTrue(coordinator.begin_inference(0))
 
-    def test_classifier_requires_the_exact_tilted_projection_prefix(self):
-        classifier = bp._MainProcessGpuStageCoordinator._is_spherical_retirement
-        self.assertTrue(classifier('Tilted Azimuthal source projection parent'))
-        for purpose in ('Tilted Azimuthal source projections parent', 'Tilted Azimuthal inference parent',
-                        'Azimuthal source projection parent', 'NRRD Tilted Azimuthal output'):
+    def test_classifier_requires_exact_source_projection_prefixes(self):
+        classifier = bp._MainProcessGpuStageCoordinator._is_source_projection_retirement
+        for purpose in ('Native source projection parent', 'Radial source projection parent',
+                        'Spherical source projection parent'):
+            with self.subTest(purpose=purpose):
+                self.assertTrue(classifier(purpose))
+        # 'Tilted Azimuthal source projection' is a retired family label: Tilted
+        # Azimuthal now projects through native destination pull.
+        for purpose in ('Tilted Azimuthal source projection parent', 'Native source projections parent',
+                        'Native inference parent', 'Azimuthal source projection parent',
+                        'NRRD Tilted Azimuthal output', 'SAM image preparation',
+                        'v streaming Azimuthal backprojection'):
             with self.subTest(purpose=purpose):
                 self.assertFalse(classifier(purpose))
 

@@ -36,7 +36,6 @@ from ._deps import _numba, cv2, ndi, tqdm
 from .cuda_interpolation import (
     CudaInterpolationRenderer,
     create_cuda_interpolation_renderer,
-    gpu_interpolation_radius_enabled,
     gpu_interpolation_render_autotune_enabled,
     gpu_interpolation_required,
 )
@@ -68,7 +67,6 @@ from .runtime import (
 
 # Explicit lower-layer dependencies keep imports one-way.
 from .workspace import (
-    _env_flag,
     _env_int,
 )
 from .geometry import (
@@ -89,21 +87,49 @@ if TYPE_CHECKING:
         _restore_source_indices_for_output_z,
     )
 
-def _keep_center_component_2d(mask2d: np.ndarray) -> np.ndarray:
-    # Keep an 8-connected foreground component and fill its enclosed holes using
-    # 4-connected background. The compiled path combines both flood fills.
+def _keep_center_component_2d(mask2d: np.ndarray, fill_holes: bool = True) -> np.ndarray:
+    # Keep an 8-connected foreground component and, when requested, fill its enclosed
+    # holes using 4-connected background. The compiled path combines both flood fills.
     mask2d = np.asarray(mask2d, dtype=bool)
     if not mask2d.any():
         return mask2d
     # Fused keep-center + hole fill in one nogil kernel on the small canvas.
-    return _numba_keep_center_fill_kernel(np.ascontiguousarray(mask2d))
+    return _numba_keep_center_fill_kernel(np.ascontiguousarray(mask2d), bool(fill_holes))
 
-def _signed_distance_2d(mask2d: np.ndarray) -> np.ndarray:
-    # Float32 Euclidean distances are positive inside the mask and negative outside.
+def _mask_has_enclosed_hole_2d(mask2d: np.ndarray) -> bool:
+    # Valid for a mask holding one 8-connected component, such as an endpoint crop:
+    # the keep step then retains the whole component, so filling adds only holes.
+    mask_b = np.ascontiguousarray(np.asarray(mask2d, dtype=bool))
+    if not mask_b.any():
+        return False
+    return bool(np.any(_numba_keep_center_fill_kernel(mask_b, True) & ~mask_b))
+
+def _projection_cone_sdf_2d(mask2d: np.ndarray) -> np.ndarray:
+    # Centre-to-centre signed distance: positive inside, negative outside. The
+    # projection cone admits values >= -tan(angle) * step, a digital disk dilation of
+    # the source pixel centres. sam_bridge_planning._cone_candidates computes the same
+    # field, so both backends share one --interpolation_search_angle cone; do not
+    # centre it on the pixel interface like the bridge SDFs below.
     mask_u8 = np.ascontiguousarray(np.asarray(mask2d, dtype=np.uint8))
     inside = cv2.distanceTransform(mask_u8, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
     outside = cv2.distanceTransform(np.uint8(1) - mask_u8, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
     return np.asarray(inside - outside, dtype=np.float32)
+
+# Bridge-plan SDFs are measured to the half-pixel boundary. Add this to an inside
+# value to recover the centre-to-background EDT radius used by --interpolation_min_radius.
+SDF_EDT_RADIUS_OFFSET = 0.5
+
+def _bridge_interface_sdf_2d(mask2d: np.ndarray) -> np.ndarray:
+    # Signed distance to the half-pixel boundary: |phi| = 0.5 on edge pixels, so a
+    # linear blend of two endpoint fields moves the boundary linearly between them.
+    mask_b = np.ascontiguousarray(np.asarray(mask2d, dtype=bool))
+    mask_u8 = mask_b.view(np.uint8)
+    inside = cv2.distanceTransform(mask_u8, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    outside = cv2.distanceTransform(np.uint8(1) - mask_u8, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    return np.where(
+        mask_b, inside - np.float32(SDF_EDT_RADIUS_OFFSET),
+        np.float32(SDF_EDT_RADIUS_OFFSET) - outside,
+    ).astype(np.float32, copy=False)
 
 INTERPOLATION_LOCAL_SDF_PAD = 2
 
@@ -389,7 +415,7 @@ class SliceComponentTableCache:
         cropped = CroppedProjectionSDF(
             origin_y=int(crop_y0),
             origin_x=int(crop_x0),
-            sdf=np.ascontiguousarray(_signed_distance_2d(source_crop)),
+            sdf=np.ascontiguousarray(_projection_cone_sdf_2d(source_crop)),
         )
         with self._sdf_lock:
             self._projection_sdf_computations += 1
@@ -886,10 +912,11 @@ def _numba_dilated_overlap_count_kernel(
     return count
 
 @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-def _numba_keep_center_fill_kernel(mask: np.ndarray) -> np.ndarray:
-    # keep-center-component (8-connected) + enclosed-hole fill (4-connected background),
-    # fused: result = NOT(border-4-connected component of NOT kept). Matches
-    # _keep_center_component_2d + _fill_holes_2d_opencv semantics exactly.
+def _numba_keep_center_fill_kernel(mask: np.ndarray, fill_holes: bool) -> np.ndarray:
+    # keep-center-component (8-connected) + optional enclosed-hole fill (4-connected
+    # background), fused: result = NOT(border-4-connected component of NOT kept).
+    # Matches _keep_center_component_2d + _fill_holes_2d_opencv_u8_inplace semantics
+    # exactly. Without fill_holes the result is the kept component alone.
     h = mask.shape[0]
     w = mask.shape[1]
     out = np.zeros((h, w), dtype=np.bool_)
@@ -946,6 +973,12 @@ def _numba_keep_center_fill_kernel(mask: np.ndarray) -> np.ndarray:
                     stack[sp, 0] = ny
                     stack[sp, 1] = nx
                     sp += 1
+
+    if not fill_holes:
+        for y in range(h):
+            for x in range(w):
+                out[y, x] = state[y, x] == 1
+        return out
 
     # 4-connected flood of NOT-kept from every border pixel -> outside background.
     sp = 0
@@ -1466,12 +1499,6 @@ def _collect_walkback_source_points(
 
     return out
 
-def interpolation_cache_bridge_sections_enabled() -> bool:
-    """Reuse accepted min-radius scan sections during painting.
-
- ``YOLO_TTA_INTERPOLATION_CACHE_BRIDGE_SECTIONS=0`` restores recomputation."""
-    return _env_flag('YOLO_TTA_INTERPOLATION_CACHE_BRIDGE_SECTIONS', True)
-
 def interpolation_plan_batch_budget_bytes() -> int:
     """Maximum charged bytes retained in the accepted-plan render batch.
 
@@ -1505,6 +1532,9 @@ class SliceBridgeRenderPlan:
     # Candidate indices follow nearest-first projection-search ordering.
     interpolation_walk_back_index: int = 1
     interpolation_candidate_index: int = 1
+    # False when either endpoint cross-section has an enclosed hole; sections then
+    # keep their blend holes instead of being filled.
+    fill_section_holes: bool = True
     # Radius checking can retain post-component-filter sections by step index so
     # painting does not repeat SDF lerp, thresholding, and component cleanup.
     cached_sections: List[Optional[np.ndarray]] = field(default_factory=list, compare=False, repr=False)
@@ -1516,8 +1546,6 @@ class SliceSeedBridgePlanResult:
     default_bridges: int = 0
     walk_back_bridges: int = 0
     skipped_by_min_radius: int = 0
-    gpu_radius_attempts: int = 0
-    gpu_radius_cpu_fallbacks: int = 0
     plans: List[SliceBridgeRenderPlan] = field(default_factory=list)
 
 
@@ -1566,8 +1594,9 @@ def _build_slice_endpoint_seeds(
 ) -> Tuple[List[SliceEndpointSeed], int]:
     """Build interpolation endpoint seeds with the per-slice component scan.
 
-    Each 2D connected component is evaluated independently for overlap continuation
-    into the previous and next slice. Components without continuation become endpoint
+    Each 2D connected component is evaluated independently for 26-connected
+    continuation (the labeler's 3x3 cross-slice adjacency) into the previous and
+    next slice. Components without continuation become endpoint
     seeds in that direction. Azimuthal interpolation treats frame 0 and the final frame
     as adjacent, with the horizontal axis mirrored across the seam.
     """
@@ -1669,6 +1698,12 @@ def _build_linear_slice_bridge_plan(
         ox = int(bbox[1]) - int(anchor[1]) + half_x
         canvas[oy:oy + mask.shape[0], ox:ox + mask.shape[1]] = mask
         local_masks.append(canvas)
+    # Each endpoint crop is one tight 8-connected component, and every background
+    # pixel on its crop border touches the zero canvas margin, so the crop has an
+    # enclosed hole exactly when its canvas does. Testing the crop is cheaper.
+    fill_section_holes = not any(
+        _mask_has_enclosed_hole_2d(mask) for _bbox, mask, _anchor in endpoints
+    )
 
     return SliceBridgeRenderPlan(
         source_label=int(source_label),
@@ -1680,8 +1715,9 @@ def _build_linear_slice_bridge_plan(
         steps=int(steps),
         sign=int(sign),
         num_slices=int(num_slices),
-        sdf0=np.ascontiguousarray(_signed_distance_2d(local_masks[0])),
-        sdf1=np.ascontiguousarray(_signed_distance_2d(local_masks[1])),
+        sdf0=np.ascontiguousarray(_bridge_interface_sdf_2d(local_masks[0])),
+        sdf1=np.ascontiguousarray(_bridge_interface_sdf_2d(local_masks[1])),
+        fill_section_holes=bool(fill_section_holes),
     )
 
 def _estimate_linear_slice_bridge_min_radius_from_plan(
@@ -1698,22 +1734,29 @@ def _estimate_linear_slice_bridge_min_radius_from_plan(
     witness = 0.0
     if threshold > 0.0 and plan.sdf0.shape == plan.sdf1.shape and plan.sdf0.size:
         cy, cx = plan.sdf0.shape[0] // 2, plan.sdf0.shape[1] // 2
-        witness = min(float(plan.sdf0[cy, cx]), float(plan.sdf1[cy, cx]))
-    # The disk common to both centered endpoint masks stays positive throughout
-    # SDF interpolation. It contains the retained center component's anchor and
-    # cannot be removed by cleanup, so its radius certifies every section.
+        witness = (
+            min(float(plan.sdf0[cy, cx]), float(plan.sdf1[cy, cx]))
+            + SDF_EDT_RADIUS_OFFSET
+        )
+    # Pixel centres within the witness radius of the shared anchor are inside both
+    # endpoints, so they stay positive in every blend. That disk contains the retained
+    # center component's anchor, holds no background pixel, and cannot be removed by
+    # cleanup, so its radius certifies every section.
     # Leave a float32 EDT rounding margin; uncertain cases need the full scan.
     margin = max(
         1e-6,
         4.0 * np.finfo(np.float32).eps * max(abs(witness), abs(threshold), 1.0),
     )
+    fill_holes = bool(plan.fill_section_holes)
     if threshold > 0.0 and np.isfinite(witness) and witness > threshold + margin:
         if bool(cache_sections):
             plan.cached_sections[:] = [None] * (int(plan.steps) + 1)
             for idx in range(1, int(plan.steps)):
                 alpha = float(idx) / float(plan.steps)
                 section = ((1.0 - alpha) * plan.sdf0 + alpha * plan.sdf1) >= 0.0
-                plan.cached_sections[idx] = _keep_center_component_2d(section)
+                plan.cached_sections[idx] = _keep_center_component_2d(
+                    section, fill_holes=fill_holes,
+                )
         return witness
 
     source_local = np.asarray(plan.sdf0 >= 0.0, dtype=bool)
@@ -1721,7 +1764,10 @@ def _estimate_linear_slice_bridge_min_radius_from_plan(
     if not np.any(source_local) or not np.any(target_local):
         return 0.0
 
-    min_radius = float(min(float(np.max(plan.sdf0)), float(np.max(plan.sdf1))))
+    min_radius = (
+        float(min(float(np.max(plan.sdf0)), float(np.max(plan.sdf1))))
+        + SDF_EDT_RADIUS_OFFSET
+    )
     if threshold > 0.0 and min_radius <= threshold:
         return float(min_radius)
     section_cache = plan.cached_sections
@@ -1732,7 +1778,7 @@ def _estimate_linear_slice_bridge_min_radius_from_plan(
         section = ((1.0 - alpha) * plan.sdf0 + alpha * plan.sdf1) >= 0.0
         if not np.any(section):
             return 0.0
-        section = _keep_center_component_2d(section)
+        section = _keep_center_component_2d(section, fill_holes=fill_holes)
         if bool(cache_sections):
             # The painter only reads this array (wrap handling creates a reversed view),
             # so retaining the exact estimator result is bit-for-bit equivalent.
@@ -1762,7 +1808,7 @@ def _paint_linear_slice_bridge_plan_onto_slice(
         section = ((1.0 - alpha) * plan.sdf0 + alpha * plan.sdf1) >= 0.0
         if not np.any(section):
             return 0
-        section = _keep_center_component_2d(section)
+        section = _keep_center_component_2d(section, fill_holes=bool(plan.fill_section_holes))
     center_y = (1.0 - alpha) * float(plan.source_anchor[0]) + alpha * float(plan.target_anchor[0])
     center_x = (1.0 - alpha) * float(plan.source_anchor[1]) + alpha * float(plan.target_anchor[1])
     # the morph runs in source-side "unrolled" coordinates. Intermediate
@@ -1794,8 +1840,6 @@ def _plan_slice_seed_bridges(
     component_cache: Optional[SliceComponentTableCache] = None,
     slice_luts: Optional['SliceLocalLabelLUTs'] = None,
     gpu_renderer: Optional[CudaInterpolationRenderer] = None,
-    gpu_radius_enabled: bool = False,
-    gpu_required: bool = False,
 ) -> SliceSeedBridgePlanResult:
     result = SliceSeedBridgePlanResult()
 
@@ -1845,42 +1889,11 @@ def _plan_slice_seed_bridges(
                 continue
 
             if float(interpolate_min_radius) > 0.0:
-                bridge_radius: Optional[float] = None
-                gpu_radius_requested = bool(
-                    gpu_radius_enabled and gpu_renderer is not None
+                bridge_radius = _estimate_linear_slice_bridge_min_radius_from_plan(
+                    plan,
+                    reject_at_or_below=float(interpolate_min_radius),
+                    cache_sections=True,
                 )
-                if (
-                    bool(gpu_radius_requested)
-                    and gpu_renderer is not None
-                    and gpu_renderer.radius_available
-                ):
-                    try:
-                        result.gpu_radius_attempts += 1
-                        bridge_radius = gpu_renderer.estimate_min_radius(
-                            plan,
-                            reject_at_or_below=float(interpolate_min_radius),
-                            cache_sections=bool(interpolation_cache_bridge_sections_enabled()),
-                            cache_host_sections=False,
-                        )
-                    except Exception as exc:
-                        first_failure = gpu_renderer.disable_radius(exc)
-                        if bool(gpu_required):
-                            raise RuntimeError(
-                                'required CUDA interpolation radius evaluation failed'
-                            ) from exc
-                        if first_failure:
-                            print(
-                                f'Warning: CUDA interpolation radius evaluation failed ({exc}); '
-                                'using the CPU bridge evaluator while retaining GPU painting.'
-                            )
-                if bridge_radius is None:
-                    if bool(gpu_radius_requested):
-                        result.gpu_radius_cpu_fallbacks += 1
-                    bridge_radius = _estimate_linear_slice_bridge_min_radius_from_plan(
-                        plan,
-                        reject_at_or_below=float(interpolate_min_radius),
-                        cache_sections=bool(interpolation_cache_bridge_sections_enabled()),
-                    )
                 if bridge_radius <= float(interpolate_min_radius):
                     result.skipped_by_min_radius += 1
                     if gpu_renderer is not None:
@@ -1934,7 +1947,6 @@ def interpolate_view_volume_pass_inplace(
     interpolation_walk_back: int,
     interpolation_candidates: int,
     interpolate_min_radius: float,
-    keep_temp: bool = False,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
@@ -2000,8 +2012,6 @@ def interpolate_view_volume_pass_inplace(
     ]
 
     def _discard_failed_component_outputs() -> None:
-        if bool(keep_temp):
-            return
         for membership_path in component_membership_paths:
             try:
                 membership_path.unlink(missing_ok=True)
@@ -2096,24 +2106,22 @@ def interpolate_view_volume_pass_inplace(
             sparse_local_labels=True,
         )
     except BaseException:
-        if not bool(keep_temp):
-            for suffix in ('.fg_labels.u16.dat', '.fg_labels.u32.dat'):
-                try:
-                    label_work_prefix.with_suffix(suffix).unlink(missing_ok=True)
-                except Exception:
-                    pass
+        for suffix in ('.fg_labels.u16.dat', '.fg_labels.u32.dat'):
+            try:
+                label_work_prefix.with_suffix(suffix).unlink(missing_ok=True)
+            except Exception:
+                pass
         _discard_failed_component_outputs()
         raise
     slice_luts: Optional[SliceLocalLabelLUTs] = label_stats.get('slice_local_luts')  # type: ignore[assignment]
 
     if int(num_objects) <= 1:
         del labels_mm
-        if not keep_temp:
-            for p in label_paths:
-                try:
-                    p.unlink(missing_ok=True)
-                except Exception:
-                    pass
+        for p in label_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
         return {
             'num_objects': int(num_objects),
             'num_endpoints': 0,
@@ -2134,12 +2142,11 @@ def interpolate_view_volume_pass_inplace(
         # Defensive: a local-id raster without LUTs would be misread downstream. This can
         # only happen through an unexpected labeler edit; fail loudly rather than corrupt.
         close_memmap_array(labels_mm)
-        if not bool(keep_temp):
-            for p in label_paths:
-                try:
-                    p.unlink(missing_ok=True)
-                except Exception:
-                    pass
+        for p in label_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
         _discard_failed_component_outputs()
         raise RuntimeError(f'interpolation pass {pass_tag}: local-id label store without slice LUTs')
 
@@ -2155,22 +2162,20 @@ def interpolate_view_volume_pass_inplace(
     except BaseException:
         component_cache.clear()
         close_memmap_array(labels_mm)
-        if not bool(keep_temp):
-            for p in label_paths:
-                try:
-                    p.unlink(missing_ok=True)
-                except Exception:
-                    pass
+        for p in label_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
         _discard_failed_component_outputs()
         raise
     if not seeds:
         del labels_mm
-        if not keep_temp:
-            for p in label_paths:
-                try:
-                    p.unlink(missing_ok=True)
-                except Exception:
-                    pass
+        for p in label_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
         return {
             'num_objects': int(num_objects),
             'num_endpoints': int(num_endpoints),
@@ -2217,33 +2222,28 @@ def interpolate_view_volume_pass_inplace(
     except BaseException:
         close_memmap_array(
             pending_membership_mm,
-            unlink_path=(membership_path if pending_membership_mm is not None
-                         and not keep_temp else None),
+            unlink_path=(membership_path if pending_membership_mm is not None else None),
         )
         pending_membership_mm = None
         for membership_mm, membership_path in zip(
             component_membership_mms, component_membership_paths,
         ):
-            close_memmap_array(
-                membership_mm,
-                unlink_path=(membership_path if not keep_temp else None),
-            )
+            close_memmap_array(membership_mm, unlink_path=membership_path)
         component_membership_mms.clear()
         close_memmap_array(bridge_mm)
         bridge_mm = None
         component_cache.clear()
         close_memmap_array(labels_mm)
-        if not bool(keep_temp):
-            for p in label_paths:
-                try:
-                    p.unlink(missing_ok=True)
-                except Exception:
-                    pass
-            if bridge_path is not None:
-                try:
-                    bridge_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
+        for p in label_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+        if bridge_path is not None:
+            try:
+                bridge_path.unlink(missing_ok=True)
+            except Exception:
+                pass
         _discard_failed_component_outputs()
         raise
     component_added_by_slice: Dict[Tuple[int, int], np.ndarray] = {
@@ -2256,8 +2256,6 @@ def interpolate_view_volume_pass_inplace(
     default_bridges = 0
     walk_back_bridges = 0
     skipped_by_min_radius = 0
-    gpu_radius_attempts = 0
-    gpu_radius_cpu_fallbacks = 0
     added_voxels = 0
     bridge_delta_written = False
     # interpolation already visits every bridge-delta crop while it is hot.
@@ -2279,13 +2277,6 @@ def interpolate_view_volume_pass_inplace(
     gpu_renderer_status = 'not attempted'
     gpu_renderer_telemetry: Dict[str, object] = {}
     gpu_required = bool(gpu_interpolation_required())
-    gpu_radius_configured = bool(gpu_interpolation_radius_enabled())
-    # A zero threshold never evaluates bridge radii.  Keep an explicitly enabled
-    # CUDA radius capability visible in telemetry, but do not make an unused EDT
-    # capability a REQUIRED-mode admission condition for this pass.
-    gpu_radius_requested = bool(
-        gpu_radius_configured and float(interpolate_min_radius) > 0.0
-    )
     gpu_render_autotune = bool(
         gpu_interpolation_render_autotune_enabled() and not bool(gpu_required)
     )
@@ -2316,24 +2307,11 @@ def interpolate_view_volume_pass_inplace(
             gpu_render_selected = False
         elif not bool(gpu_render_autotune):
             gpu_render_selected = True
-        if (
-            gpu_renderer is not None
-            and bool(gpu_required)
-            and bool(gpu_radius_requested)
-            and not bool(gpu_renderer.radius_available)
-        ):
-            raise RuntimeError(
-                'YOLO_TTA_GPU_INTERPOLATION_REQUIRED=1 and '
-                'YOLO_TTA_GPU_INTERPOLATION_RADIUS=1, but CUDA radius evaluation '
-                f'is unavailable: {gpu_renderer.radius_failed_reason}'
-            )
         if gpu_renderer is not None:
-            if bool(gpu_radius_requested):
-                radius_backend = 'CUDA (experimental)'
-            elif float(interpolate_min_radius) <= 0.0:
+            if float(interpolate_min_radius) <= 0.0:
                 radius_backend = 'unused (minimum-radius filter disabled)'
             else:
-                radius_backend = 'parallel CPU (default)'
+                radius_backend = 'parallel CPU'
             painting_backend = (
                 'GPU/CPU first-batch autotune'
                 if bool(gpu_render_autotune) else 'required/forced GPU'
@@ -2341,8 +2319,7 @@ def interpolate_view_volume_pass_inplace(
             print(
                 f'CUDA bridge interpolation active on {gpu_renderer_status}: '
                 f'min-radius evaluator={radius_backend}; bridge painting={painting_backend}. '
-                'YOLO_TTA_GPU_INTERPOLATION=0 disables painting; '
-                'YOLO_TTA_GPU_INTERPOLATION_RADIUS=1 restores the v17.1.1 radius experiment.'
+                'YOLO_TTA_GPU_INTERPOLATION=0 disables painting.'
             )
         # Endpoint discovery returns label-major order. Planning is independent per seed
         # and the renderer only ORs sections, so consume the same seeds slice-major to
@@ -2611,8 +2588,6 @@ def interpolate_view_volume_pass_inplace(
                 component_cache=component_cache,
                 slice_luts=slice_luts,
                 gpu_renderer=gpu_renderer,
-                gpu_radius_enabled=bool(gpu_radius_requested),
-                gpu_required=bool(gpu_required),
             )
 
         # A completed future owns its plan arrays until the consumer accepts it.
@@ -2636,8 +2611,6 @@ def interpolate_view_volume_pass_inplace(
             default_bridges += int(seed_result.default_bridges)
             walk_back_bridges += int(seed_result.walk_back_bridges)
             skipped_by_min_radius += int(seed_result.skipped_by_min_radius)
-            gpu_radius_attempts += int(seed_result.gpu_radius_attempts)
-            gpu_radius_cpu_fallbacks += int(seed_result.gpu_radius_cpu_fallbacks)
             if seed_result.plans:
                 seed_plans = seed_result.plans
                 seed_result.plans = []
@@ -2693,10 +2666,6 @@ def interpolate_view_volume_pass_inplace(
             f'{float(planner_wall_seconds):.3f}s; GPU render wall='
             f'{float(gpu_render_wall_seconds):.3f}s; CPU render wall='
             f'{float(cpu_render_wall_seconds):.3f}s; render choice={render_choice}; '
-            f'CUDA radius lock-wait='
-            f'{float(live_gpu_telemetry.get("radius_lock_wait_seconds", 0.0)):.3f}s; '
-            f'CUDA radius execution='
-            f'{float(live_gpu_telemetry.get("radius_execution_seconds", 0.0)):.3f}s; '
             f'CUDA render execution='
             f'{float(live_gpu_telemetry.get("render_execution_seconds", 0.0)):.3f}s; '
             f'CUDA render streams='
@@ -2836,7 +2805,7 @@ def interpolate_view_volume_pass_inplace(
             # pathname deletion to the reader close below.
             close_memmap_array(
                 membership_mm,
-                unlink_path=(membership_path if pass_failed and not keep_temp else None),
+                unlink_path=(membership_path if pass_failed else None),
             )
         component_membership_mms.clear()
         try:
@@ -2844,27 +2813,26 @@ def interpolate_view_volume_pass_inplace(
         except Exception:
             pass
         del labels_mm
-        if not keep_temp:
-            for p in label_paths:
+        for p in label_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+        if bridge_path is not None:
+            try:
+                bridge_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        if bool(pass_failed):
+            for membership_path in component_membership_paths:
                 try:
-                    p.unlink(missing_ok=True)
+                    membership_path.unlink(missing_ok=True)
                 except Exception:
                     pass
-            if bridge_path is not None:
-                try:
-                    bridge_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-            if bool(pass_failed):
-                for membership_path in component_membership_paths:
-                    try:
-                        membership_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                if component_membership_paths:
-                    defer_retired_memmap_directory_cleanup(component_membership_paths[0].parent)
-                for _walk_back_index, _candidate_index, component_path in component_specs:
-                    shutil.rmtree(component_path, ignore_errors=True)
+            if component_membership_paths:
+                defer_retired_memmap_directory_cleanup(component_membership_paths[0].parent)
+            for _walk_back_index, _candidate_index, component_path in component_specs:
+                shutil.rmtree(component_path, ignore_errors=True)
 
     component_added_counts = {
         key: int(np.sum(counts, dtype=np.int64))
@@ -2920,43 +2888,28 @@ def interpolate_view_volume_pass_inplace(
                 },
             )
     except BaseException:
-        if not bool(keep_temp):
-            for _walk_back_index, _candidate_index, component_path in component_specs:
-                shutil.rmtree(component_path, ignore_errors=True)
+        for _walk_back_index, _candidate_index, component_path in component_specs:
+            shutil.rmtree(component_path, ignore_errors=True)
         raise
     finally:
         for membership_reader, membership_path in zip(
             membership_readers, component_membership_paths,
         ):
-            close_memmap_array(
-                membership_reader,
-                unlink_path=(membership_path if not keep_temp else None),
-            )
-        if not bool(keep_temp):
-            for membership_path in component_membership_paths:
-                try:
-                    membership_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-            if component_membership_paths:
-                try:
-                    component_membership_paths[0].parent.rmdir()
-                except OSError:
-                    defer_retired_memmap_directory_cleanup(component_membership_paths[0].parent)
+            close_memmap_array(membership_reader, unlink_path=membership_path)
+        for membership_path in component_membership_paths:
+            try:
+                membership_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        if component_membership_paths:
+            try:
+                component_membership_paths[0].parent.rmdir()
+            except OSError:
+                defer_retired_memmap_directory_cleanup(component_membership_paths[0].parent)
 
-    gpu_radius_active = bool(
-        int(gpu_renderer_telemetry.get('estimated_plans', 0)) > 0
+    interpolation_radius_backend = (
+        'disabled' if float(interpolate_min_radius) <= 0.0 else 'cpu_numpy_numba'
     )
-    if float(interpolate_min_radius) <= 0.0:
-        interpolation_radius_backend = 'disabled'
-    elif bool(gpu_radius_requested):
-        interpolation_radius_backend = (
-            'cuda_cupy+cpu_fallback'
-            if int(gpu_radius_cpu_fallbacks) > 0
-            else ('cuda_cupy' if int(gpu_radius_attempts) > 0 else 'cpu_numpy_numba')
-        )
-    else:
-        interpolation_radius_backend = 'cpu_numpy_numba'
     gpu_render_active = bool(
         int(gpu_renderer_telemetry.get('rendered_slices', 0)) > 0
     )
@@ -3014,10 +2967,7 @@ def interpolate_view_volume_pass_inplace(
         'gpu_interpolation_visible_device_token': (
             gpu_renderer_telemetry.get('visible_device_token')
         ),
-        'gpu_interpolation_active': bool(
-            int(gpu_renderer_telemetry.get('estimated_plans', 0)) > 0
-            or int(gpu_renderer_telemetry.get('rendered_slices', 0)) > 0
-        ),
+        'gpu_interpolation_active': bool(gpu_render_active),
         'gpu_interpolation_required': bool(gpu_required),
         'gpu_interpolation_render_autotune_enabled': bool(gpu_render_autotune),
         'gpu_interpolation_render_selected': (
@@ -3029,13 +2979,6 @@ def interpolate_view_volume_pass_inplace(
         'gpu_interpolation_render_probe_cpu_seconds': float(
             gpu_render_probe_cpu_seconds
         ),
-        'gpu_interpolation_radius_enabled': bool(gpu_radius_configured),
-        'gpu_interpolation_radius_active': bool(gpu_radius_active),
-        'gpu_interpolation_radius_attempts': int(gpu_radius_attempts),
-        'gpu_interpolation_radius_fallback_plans': int(gpu_radius_cpu_fallbacks),
-        'gpu_interpolation_radius_fallback_reason': (
-            gpu_renderer_telemetry.get('radius_failed_reason')
-        ),
         'gpu_interpolation_batches': int(gpu_render_batches),
         'gpu_interpolation_fallback_batches': int(gpu_render_fallback_batches),
         'gpu_interpolation_stream_leases': int(
@@ -3046,12 +2989,6 @@ def interpolate_view_volume_pass_inplace(
         ),
         'gpu_interpolation_max_streams': int(
             gpu_renderer_telemetry.get('max_streams', 0)
-        ),
-        'gpu_interpolation_estimated_plans': int(
-            gpu_renderer_telemetry.get('estimated_plans', 0)
-        ),
-        'gpu_interpolation_estimated_sections': int(
-            gpu_renderer_telemetry.get('estimated_sections', 0)
         ),
         'gpu_interpolation_rendered_slices': int(
             gpu_renderer_telemetry.get('rendered_slices', 0)
@@ -3102,12 +3039,6 @@ def interpolate_view_volume_pass_inplace(
             gpu_renderer_telemetry.get('render_patch_pixels', 0)
         ),
         'gpu_interpolation_fallback_reason': gpu_renderer_telemetry.get('failed_reason'),
-        'gpu_interpolation_radius_lock_wait_seconds': float(
-            gpu_renderer_telemetry.get('radius_lock_wait_seconds', 0.0)
-        ),
-        'gpu_interpolation_radius_execution_seconds': float(
-            gpu_renderer_telemetry.get('radius_execution_seconds', 0.0)
-        ),
         'gpu_interpolation_render_lock_wait_seconds': float(
             gpu_renderer_telemetry.get('render_lock_wait_seconds', 0.0)
         ),

@@ -90,15 +90,6 @@ class SharedPolicyUnionSchedulerTests(unittest.TestCase):
         self.assertEqual(scheduler.direct_union_task_bytes(task), 4 * PARENT_BYTES)
         self.assertEqual(sum(self.state.direct_union_inference_bytes.values()), 4 * PARENT_BYTES)
 
-    def test_keep_temp_still_binds_every_policy_parent_independently(self):
-        scheduler = self.scheduler(keep_temp_artifacts=True, direct_union_sparse_retirement_active=False)
-        task = shared_group(0)
-        scheduler.activate_direct_union_task(task)
-        members = (task, *task['augmentation_pass_tasks'])
-        paths = {member['result_mask_path'] for member in members}
-        self.assertEqual(len(paths), 4)
-        self.assertEqual(len(self.state.direct_union_admission_group_by_parent), 4)
-
     def test_cpu_and_gpu_can_claim_disjoint_policy_leases_of_one_parent_group(self):
         scheduler = self.scheduler()
         first, second = shared_group(0), shared_group(0, slice_start=2)

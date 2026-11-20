@@ -101,9 +101,9 @@ class SphericalMathPreflightCudaTests(unittest.TestCase):
         visits = []
         def recorded_prepare(*args):
             pull = prepare(*args)
-            def recorded(*pull_args):
+            def recorded(*pull_args, **pull_kwargs):
                 visits.append(int(pull_args[7]) - int(pull_args[6]))
-                return pull(*pull_args)
+                return pull(*pull_args, **pull_kwargs)
             return recorded
         with mock.patch.dict(os.environ, {'YOLO_TTA_SPHERICAL_FULL_MATH_PREFLIGHT': '0'}), \
                 mock.patch.object(cpu, 'prepare_spherical_chunk_numba', side_effect=recorded_prepare):

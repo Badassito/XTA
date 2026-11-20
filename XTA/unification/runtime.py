@@ -1,4 +1,4 @@
-"""Runtime bridge from v18 mode configuration to canonical TTA geometry.
+"""Runtime bridge from unified mode configuration to canonical TTA geometry.
 
 This module is intentionally not imported by :mod:`XTA.unification`'s
 dependency-light public surface.  It owns the one heavy physical-view compiler

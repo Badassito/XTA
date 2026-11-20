@@ -145,7 +145,7 @@ def main():
         bytes=source_stat.st_size, mtime_ns=source_stat.st_mtime_ns, sha256=source_hash,
         metadata=info), source_native_shape_tyx=list(shape),
         target_processing_shape_tyx=[2911, 3064, 3022],
-        geometry_limit='Native full F3 geometry; no production T interpolation to2911. Not a replay of a recorded detector job.',
+        geometry_limit='Native full F3 geometry; no production T interpolation to 2911. Not a replay of a recorded detector job.',
         sample_shape_tyx=[FRAMES, SIZE, SIZE], samples=[], cpu_only=True,
         sampling_policy='coverage',
         disjoint_windows_are_separate_files=True,
@@ -170,7 +170,7 @@ def main():
 
         for name, physical_view, fraction, frames in specs:
             view = geometry.expand_views_into_tta_variants((physical_view,), (0.,))[0]
-            job = geometry.build_aug_job_for_variant(view, SIZE, destination)
+            job = geometry.build_aug_job_for_variant(view, SIZE)
             path = destination/(name+'.npy')
             target = np.lib.format.open_memmap(path, mode='w+', dtype=np.uint8, shape=(FRAMES, SIZE, SIZE))
             timings = dict(render_seconds=0., write_seconds=0., histogram_seconds=0., flush_seconds=0.)
@@ -249,7 +249,7 @@ def main():
         report['status'] = 'complete'
         report['total_sample_bytes'] = sum(entry['bytes'] for entry in report['samples'])
         report['limitations'] = ['Local CPU render costs include the native map/page locality.',
-            'Native source T differs from the2911 working cube; no T-resize or GPU/SDK execution.',
+            'Native source T differs from the 2911 working cube; no T-resize or GPU/SDK execution.',
             'Zero intensity fraction is an air/padding bias indicator, not a segmentation result.']
     finally:
         # Only this invocation's UUID-named native file can be removed, and only

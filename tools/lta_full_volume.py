@@ -1280,7 +1280,6 @@ def build_plan(
             for path in (
                 Path(__file__).resolve(),
                 ROOT / "XTA" / "lta_experimental.py",
-                ROOT / "XTA" / "lta_tile_tracking.py",
                 ROOT / "XTA" / "lta_tiles.py",
                 TOOLS / "lta_gpu_smoke.py",
                 ROOT / "XTA" / "lta_sam.py",
@@ -1337,13 +1336,6 @@ def build_plan(
         "known_background_policy": (
             "empty exemplar labels are validation evidence only and never force output zero"
         ),
-        "spatial_relay_adapter": {
-            "module": "XTA.lta_tile_tracking",
-            "topology": "symmetric_eight_neighbor",
-            "outbound_seed": "last_active_overlap_frame_forward",
-            "inbound_seed": "first_active_overlap_frame_backward",
-            "execution_connected": False,
-        },
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     payload["plan_sha256"] = hashlib.sha256(canonical).hexdigest()

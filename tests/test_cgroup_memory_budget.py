@@ -256,3 +256,61 @@ def test_headroom_only_probe_preserves_value_without_mount_discovery(monkeypatch
     assert workspace._cgroup_memory_budget(verify_enforcement=False) == (100, None)
     assert workspace._cgroup_memory_headroom_bytes() == 100
     assert '/proc/self/mountinfo' not in reads
+
+
+def counted_reads(monkeypatch):
+    read = Path.read_text
+    reads = []
+
+    def counted_read(path, *args, **kwargs):
+        reads.append(path.as_posix())
+        return read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'read_text', counted_read)
+    return reads
+
+
+@pytest.mark.parametrize('v2', [True, False])
+def test_membership_and_mount_resolve_once_while_limits_and_usage_stay_fresh(monkeypatch, v2):
+    files, base = proc_files(monkeypatch, v2=v2)
+    finite(files, base, '/job/step', 400, 50, v2=v2)
+    reads = counted_reads(monkeypatch)
+    limit_name, usage_name = ('memory.max', 'memory.current') if v2 else (
+        'memory.limit_in_bytes', 'memory.usage_in_bytes')
+    assert workspace._cgroup_memory_budget() == (350, 400)
+    finite(files, base, '/job/step', 500, 50, v2=v2)
+    assert workspace._cgroup_memory_budget() == (450, 500)
+    finite(files, base, '/job/step', 500, 480, v2=v2)
+    assert workspace._cgroup_memory_budget() == (20, 500)
+    assert reads.count('/proc/self/cgroup') == 1
+    assert reads.count('/proc/self/mountinfo') == 1
+    assert reads.count(base + '/job/step/' + limit_name) == 3
+    assert reads.count(base + '/job/step/' + usage_name) == 3
+
+
+def test_new_process_resolves_its_own_membership(monkeypatch):
+    files, base = proc_files(monkeypatch)
+    finite(files, base, '/job/step', 400, 50)
+    finite(files, base, '/other', 300, 250)
+    reads = counted_reads(monkeypatch)
+    assert workspace._cgroup_memory_budget() == (350, 400)
+    files['/proc/self/cgroup'] = '0::/other\n'
+    assert workspace._cgroup_memory_budget() == (350, 400)  # same process: membership is cached
+    child_pid = workspace.os.getpid() + 1
+    monkeypatch.setattr(workspace.os, 'getpid', lambda: child_pid)
+    assert workspace._cgroup_memory_budget() == (50, 300)
+    assert reads.count('/proc/self/cgroup') == 2
+    assert reads.count('/proc/self/mountinfo') == 2
+
+
+def test_unreadable_membership_and_mounts_are_never_cached(monkeypatch):
+    files, base = proc_files(monkeypatch)
+    finite(files, base, '/job/step', 400, 50)
+    membership = files.pop('/proc/self/cgroup')
+    mounts = files.pop('/proc/self/mountinfo')
+    assert workspace._cgroup_memory_budget() == (None, None)
+    assert workspace._cgroup_memory_budget() == (None, None)
+    files['/proc/self/cgroup'] = membership
+    assert workspace._cgroup_memory_budget() == (350, None)
+    files['/proc/self/mountinfo'] = mounts
+    assert workspace._cgroup_memory_budget() == (350, 400)

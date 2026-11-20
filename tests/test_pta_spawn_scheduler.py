@@ -9,6 +9,7 @@ import pickle
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -35,6 +36,7 @@ from XTA import pta
 from XTA import pta_scheduler
 from XTA import pta_publication
 from XTA import pta_workers
+from XTA.pta_config import parse_pta_args
 
 
 class PtaSpawnSchedulerTests(unittest.TestCase):
@@ -66,6 +68,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
         out_dir: Path,
         *,
         augmentation: pta.OfflineAugmentation | None = None,
+        gpu_device_ids: tuple[int, ...] = (),
     ) -> None:
         pta_workers.set_worker_static_context(
             out_dir=out_dir,
@@ -76,7 +79,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             jpeg_encode_backend="opencv",
             gpu_batch_size=2,
             gpu_render_threads=1,
-            gpu_device_ids=(),
+            gpu_device_ids=gpu_device_ids,
             augmentation=augmentation,
             save_images=False,
             save_labels=False,
@@ -258,7 +261,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 "tile_configs": (),
                 "channel_formats": (
                     pta.ChannelFormat(
-                        token="gray", kind="gray", channel_count=1, stride=1,
+                        token="gray", kind="gray", channel_count=1, stride=1, offsets=(0,),
                     ),
                 ),
                 "channel_variants": (),
@@ -1593,35 +1596,16 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             volume[...] = np.arange(8, dtype=np.uint8).reshape(2, 2, 2)
             mask[...] = 0
 
-            view = pta.ViewInfo(
-                name="transverse",
-                display_name="Transverse",
-                family="transverse",
-                num_slices=2,
-                src_h=2,
-                src_w=2,
-                pad_mode="clamp",
-                full_t=2,
-                full_h=2,
-                full_w=2,
+            config = parse_pta_args(
+                ["--input", "dataset", "--imgsz", "2", "--enable_cartesian", "transverse"]
             )
-            identity = np.asarray(
-                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32
+            views, _compiled = pta.compile_v18_pta_views(
+                t_dim=2, h=2, w=2, config=config, azimuthal_native_raster=0,
             )
-            affine = pta.AffineSpec(
-                angle_deg=0.0,
-                src_w=2,
-                src_h=2,
-                canvas_w=2,
-                canvas_h=2,
-                out_w=2,
-                out_h=2,
-                pad_off_x=0.0,
-                pad_off_y=0.0,
-                M_src_to_canvas=identity,
-                M_canvas_to_src=identity,
-                M_src_to_out=identity,
-                M_out_to_src=identity,
+            view = views[0]
+            affine = pta.build_affine(
+                view.src_w, view.src_h, 0.0, view.pad_mode, 2,
+                shared_view=view.shared_view,
             )
             plan = pta.build_render_plan(
                 view=view,
@@ -1720,23 +1704,133 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 volume_block.release()
                 mask_block.release()
 
-    @unittest.skipIf(pta_workers.gpu_fork_render_backend_available(), "host supports the GPU fork exception")
-    def test_gpu_policy_process_path_remains_explicitly_fork_only(self) -> None:
+    def _install_gpu_policy_static(self, temp_dir: str) -> tuple[Path, "pta.LoadedGpuAugmentation"]:
+        policy_path = (Path(temp_dir) / "gpu_policy.py").resolve()
+        policy_path.write_text(_TORCH_FREE_GPU_POLICY_SOURCE, encoding="utf-8")
+        loaded = pta_workers.load_gpu_augmentation_definition(str(policy_path))
+        self._install_static(Path(temp_dir) / "output", augmentation=loaded, gpu_device_ids=(0,))
+        return policy_path, loaded
+
+    def test_gpu_policy_spawn_contract_reloads_definition_by_hash(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            gpu = pta.LoadedGpuAugmentation(
-                path=Path(temp_dir) / "gpu_policy.py",
-                content_sha256="b" * 64,
-                export_name="build_gpu_augmentation",
-                runtime_name="test",
-                policy_builder=lambda **_: object(),
-            )
-            self._install_static(Path(temp_dir) / "output", augmentation=gpu)
-            with self.assertRaisesRegex(RuntimeError, "fork-capable host"):
-                pta_workers.PersistentRenderPool(
-                    backend="process",
-                    workers=1,
-                    gpu_device_ids=(0,),
-                )
+            policy_path, loaded = self._install_gpu_policy_static(temp_dir)
+            payload = pta_workers._spawn_worker_static_payload()
+            pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+            self.assertEqual(payload["augmentation_definition"]["kind"], "gpu")
+            self.assertEqual(payload["augmentation_definition"]["path"], str(policy_path))
+            self.assertEqual(payload["gpu_device_ids"], (0,))
+
+            pta_workers._WORKER_STATIC.clear()
+            pta_workers._initialize_spawned_worker_static_context(payload)
+            reloaded = pta_workers._WORKER_STATIC["augmentation"]
+            self.assertIsInstance(reloaded, pta.LoadedGpuAugmentation)
+            self.assertIsNot(reloaded, loaded)
+            self.assertEqual(reloaded.content_sha256, loaded.content_sha256)
+            self.assertEqual(pta_workers._WORKER_STATIC["gpu_device_ids"], (0,))
+
+            without_devices = dict(payload, gpu_device_ids=())
+            with self.assertRaisesRegex(RuntimeError, "no CUDA device ids"):
+                pta_workers._initialize_spawned_worker_static_context(without_devices)
+
+    def test_gpu_policy_spawn_contract_rejects_policy_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            policy_path, _loaded = self._install_gpu_policy_static(temp_dir)
+            payload = pta_workers._spawn_worker_static_payload()
+            policy_path.write_text(_TORCH_FREE_GPU_POLICY_SOURCE + "# edited\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "changed after parent preflight"):
+                pta_workers._initialize_spawned_worker_static_context(payload)
+
+    def test_gpu_policy_pool_spawns_owners_without_fork(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _policy_path, loaded = self._install_gpu_policy_static(temp_dir)
+            pool = None
+            with (
+                mock.patch.object(pta_workers, "gpu_fork_render_backend_available", return_value=False),
+                mock.patch.dict(os.environ, {
+                    "YOLO_TTA_PTA_GPU_OWNER_PREWARM": "0", "YOLO_TTA_TELEMETRY": "0",
+                }),
+            ):
+                try:
+                    pool = pta_workers.PersistentRenderPool(
+                        backend="process", workers=1, gpu_device_ids=(0,),
+                    )
+                    self.assertEqual(pool.start_method, "spawn")
+                    probe = pool._pool.apply(_spawned_gpu_owner_static_probe)
+                finally:
+                    if pool is not None:
+                        pool.close()
+        self.assertEqual(probe, ("LoadedGpuAugmentation", loaded.content_sha256, (0,), 0))
+
+    def test_spawn_initializer_failure_fails_tasks_instead_of_respawning(self) -> None:
+        for kind in ("cpu", "gpu"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temp_dir:
+                gpu_device_ids: tuple[int, ...] = ()
+                if kind == "gpu":
+                    policy_path, _loaded = self._install_gpu_policy_static(temp_dir)
+                    gpu_device_ids = (0,)
+                else:
+                    policy_path = (Path(temp_dir) / "policy.py").resolve()
+                    policy_path.write_text("def build_augmentation():\n    return None\n", encoding="utf-8")
+                    self._install_static(Path(temp_dir) / "output", augmentation=pta.LoadedAugmentation(
+                        path=policy_path,
+                        content_sha256=pta.hashlib.sha256(policy_path.read_bytes()).hexdigest(),
+                        export_name="build_augmentation",
+                        albumentations_version="test",
+                        pipeline_builder=lambda: object(),
+                    ))
+                # The policy changes after parent preflight, so the spawned initializer raises.
+                policy_path.write_text(policy_path.read_text(encoding="utf-8") + "# edited\n", encoding="utf-8")
+                progress = pta_workers.VolumeRenderProgress(
+                    stem="edited", warnings=pta_workers.WarningLog(), pending_a=1)
+                # A respawning pool never answers; the deadline turns a hang into a failure.
+                deadline = time.monotonic() + 120.0
+                pool = None
+                with (
+                    mock.patch.object(pta_workers, "gpu_fork_render_backend_available", return_value=False),
+                    mock.patch.dict(os.environ, {
+                        "YOLO_TTA_PTA_GPU_OWNER_PREWARM": "0", "YOLO_TTA_TELEMETRY": "0",
+                    }),
+                ):
+                    try:
+                        pool = pta_workers.PersistentRenderPool(
+                            backend="process", workers=1, gpu_device_ids=gpu_device_ids,
+                        )
+                        self.assertEqual(pool.start_method, "spawn")
+                        pool.submit_phase(
+                            pta_workers.RenderPhaseHandle("unused", 1, None, [0], None), meta=(0, "A"))
+                        with self.assertRaisesRegex(RuntimeError, "Render task failed for edited") as raised:
+                            pta_workers.drain_render_results(
+                                pool, {0: progress}, until=lambda: time.monotonic() > deadline)
+                        cause = str(raised.exception.__cause__)
+                        self.assertIn("PTA render worker initializer failed", cause)
+                        self.assertIn(f"PTA {kind.upper()} augmentation policy changed after parent preflight", cause)
+                        classification = pool._pool.apply_async(
+                            pta_workers._classification_task_entry, (("unused", 1, 0),))
+                        with self.assertRaisesRegex(RuntimeError, "changed after parent preflight"):
+                            classification.get(timeout=max(1.0, deadline - time.monotonic()))
+                    finally:
+                        if pool is not None:
+                            pool.close(terminate=True)
+
+
+_TORCH_FREE_GPU_POLICY_SOURCE = (
+    "class _Policy:\n"
+    "    def apply_batch(self, image, mask, seeds, output_size):\n"
+    "        return image, mask\n"
+    "\n"
+    "def build_gpu_augmentation(device, batch_size):\n"
+    "    return _Policy()\n"
+)
+
+
+def _spawned_gpu_owner_static_probe() -> tuple[str, str, tuple[int, ...], object]:
+    augmentation = pta_workers._WORKER_STATIC.get("augmentation")
+    return (
+        type(augmentation).__name__,
+        str(getattr(augmentation, "content_sha256", "")),
+        tuple(pta_workers._WORKER_STATIC.get("gpu_device_ids", ())),
+        pta_workers._WORKER_GPU_DEVICE_ID,
+    )
 
 
 if __name__ == "__main__":

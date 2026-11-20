@@ -249,11 +249,6 @@ class PublicationMemoryPlanTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'group requires 108.0 GiB.*107.0 GiB'):
                     memory.native_fullframe_dense_reserve(tasks, total_dense_limit=107*GIB)
 
-    def test_policy_marker_cannot_claim_a_bound_without_retirement(self):
-        with self.assertRaisesRegex(RuntimeError, 'File-mode.*5832.0 GiB'):
-            memory.native_fullframe_dense_reserve(self.policy_tasks(groups=54),
-                total_dense_limit=256*GIB, bounded_retirement=False)
-
     def test_partial_policy_group_admission_is_rejected(self):
         tasks = self.policy_tasks(shape=(2, 3, 7))
         tasks[0]['augmentation_pass_tasks'][0].pop('bounded_parent_admission')
@@ -499,7 +494,7 @@ class PublicationMemoryPlanTests(unittest.TestCase):
                     mock.patch.object(memory, 'workspace_anon_cap_bytes', return_value=0), \
                     mock.patch.dict(os.environ, {'YOLO_TTA_MEMFD_WORKSPACES':'1','YOLO_TTA_PUBLICATION_RAM':'1',
                                                 'YOLO_TTA_PACKED_OWNER_PUBLICATION':'1','YOLO_TTA_PUBLICATION_RAM_GIB':'0'}):
-                memory.plan_native_publication_memory(tasks, keep_temp=False, worker_count=1,
+                memory.plan_native_publication_memory(tasks, worker_count=1,
                                                       publication_pending=1, unpack_bytes=1024)
             program = '''
 import json,sys
@@ -547,7 +542,7 @@ for task,a in zip(json.loads(sys.argv[1]), _cache_export_volumes()):
                 mock.patch.object(memory, '_register_memfd_owner'), \
                 mock.patch.dict(os.environ, {'YOLO_TTA_PUBLICATION_RAM':'1',
                                             'YOLO_TTA_PACKED_OWNER_PUBLICATION':'1','YOLO_TTA_PUBLICATION_RAM_GIB':'0'}):
-            plan = memory.plan_native_publication_memory(tasks, keep_temp=False, worker_count=1,
+            plan = memory.plan_native_publication_memory(tasks, worker_count=1,
                                                         publication_pending=1, unpack_bytes=1024)
         self.assertEqual(create.call_count, 8)
         self.assertEqual(sum('d1_memory_payload_path' in t for t in tasks), 8)
@@ -602,12 +597,6 @@ for task,a in zip(json.loads(sys.argv[1]), _cache_export_volumes()):
                 mock.patch.object(memory.os, 'name', 'nt'), \
                 mock.patch.dict(sys.modules, {'psutil': None}):
             self.assertEqual(memory.publication_ram_headroom(), 0)
-
-    def test_retained_scratch_never_uses_ephemeral_parent_descriptors(self):
-        with mock.patch.object(memory.os, 'memfd_create', create=True) as create:
-            self.assertIsNone(memory.plan_native_publication_memory([], keep_temp=True,
-                              worker_count=4, publication_pending=12, unpack_bytes=256*1024**2))
-            create.assert_not_called()
 
     def test_private_payload_spill_preserves_bytes_and_releases_original_backing(self):
         volume = np.random.default_rng(13).integers(0, 2, (5, 17, 43), dtype=np.uint8)
@@ -666,7 +655,7 @@ for task,a in zip(json.loads(sys.argv[1]), _cache_export_volumes()):
                     mock.patch.object(memory, 'workspace_anon_cap_bytes', return_value=0), \
                     mock.patch.dict(os.environ, {'YOLO_TTA_MEMFD_WORKSPACES':'1', 'YOLO_TTA_PUBLICATION_RAM':'1',
                                                 'YOLO_TTA_PACKED_OWNER_PUBLICATION':'1', 'YOLO_TTA_PUBLICATION_RAM_GIB':'0'}):
-                memory.plan_native_publication_memory([task], keep_temp=False, worker_count=1,
+                memory.plan_native_publication_memory([task], worker_count=1,
                                                       publication_pending=1, unpack_bytes=1024)
             program = '''
 import sys,json,numpy as np

@@ -423,11 +423,6 @@ def reuse_source_bridge_survival(refs, output, state, source_report, *, writers_
         # The final audit uses 256 MiB; topology assessment depends on that budget.
         if float(state['memory_mib']) != 256 and any(audit.get('group_connections') for audit in audits):
             return None
-        if any(audit.get('group_connections') for audit in audits):
-            from .sam_mask_reader import _assert_source_unchanged
-            from .sam_branch_selection import _assert_unchanged
-            _assert_source_unchanged()
-            _assert_unchanged()
         with runtime_telemetry().span('tta.survival.validate_fingerprint'):
             signature = _survival_reuse_fingerprint(refs, output)
         if signature is None or signature != state['fingerprint']:

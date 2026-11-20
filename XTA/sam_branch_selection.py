@@ -11,19 +11,18 @@ from collections.abc import Mapping
 import base64
 import hashlib
 import json
-from pathlib import Path
 from types import MappingProxyType
 import zlib
 
 import numpy as np
 from scipy import ndimage
 
+from .file_hashing import source_sha256
 from .sam_evidence import _freeze, _plain, fingerprint
 
 
 SCHEMA = 'xta.sam_branch_selection/1'
-_SOURCE_PATH = Path(__file__).resolve()
-IMPLEMENTATION_SHA256 = hashlib.sha256(_SOURCE_PATH.read_bytes()).hexdigest()
+IMPLEMENTATION_SHA256 = source_sha256(__file__)
 _MAX_EDGE_RECORDS = 100_000
 _MAX_RUN_RECORDS = 200_000
 _MAX_RECIPE_BYTES = 64*1024**2
@@ -40,6 +39,9 @@ _QUALIFIED_PACKED_OWNER_IMPLEMENTATIONS = {
     '254fbb676b0585baf9f0dfc9a680884a70270c3987177cafd4aa2fc511dabe42': 'tracked_known',
     # v25.1.0 before receipt-presence hardening; packed geometry is unchanged.
     '9473abe3904f033d5ea1597122494685e535aefd5f03fc04f409c0513a6caf7b': 'tracked_known',
+    # v24.1.1 through v26.0.1 source; only the mid-run source re-read was removed
+    # and source hashing became line-ending stable after it.
+    'b7131c1e76e3a557354a8f7c3181233d669ad203751936d0a518174e94b27ce1': 'tracked_known',
 }
 
 
@@ -65,11 +67,6 @@ def _positive_label_membership(labels, selected):
 
 def _readonly(mask):
     return np.frombuffer(np.ascontiguousarray(mask, dtype=bool).tobytes(), dtype=bool).reshape(mask.shape)
-
-
-def _assert_unchanged():
-    if hashlib.sha256(_SOURCE_PATH.read_bytes()).hexdigest() != IMPLEMENTATION_SHA256:
-        raise RuntimeError('SAM branch-selection implementation changed during selection/replay')
 
 
 def _source_filter(value):
@@ -419,7 +416,6 @@ def build_connected_edge_selection(bundle, mask_filter, group_id, eligible_by_ed
     interior: neither owner is required here to reach the opposite endpoint.
     The policy supplies eligible owners after its own seed/quality predicates.
     """
-    _assert_unchanged()
     from .sam_filtering import _spec
     spec = _spec(_source_filter(mask_filter))
     filter_identity = None if spec is None else spec['sha256']
@@ -663,7 +659,6 @@ def branch_selection_required(value):
 
 def validate_branch_selection(value, bundle, *, mask_filter_sha256=None):
     """Validate bounded, complete owner recipes without decoding a mask."""
-    _assert_unchanged()
     recipe = branch_selection_from_value(value)
     required = branch_selection_required(value)
     if recipe is None:

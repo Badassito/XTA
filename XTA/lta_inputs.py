@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass
-from enum import Enum, IntEnum
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Sequence, Tuple
 
@@ -62,15 +62,6 @@ class AnnotationState(str, Enum):
     FOREGROUND = "foreground"
     KNOWN_BACKGROUND = "known_background"
     UNKNOWN = "unknown"
-
-
-class ExemplarPreferenceTier(IntEnum):
-    """Preference order for choosing a positive prompt for a target session."""
-
-    SAME_TARGET_SESSION = 0
-    SAME_TARGET_VOLUME = 1
-    OTHER_TARGET_VOLUME = 2
-    EXTERNAL_EXEMPLAR = 3
 
 
 @dataclass(frozen=True)
@@ -217,14 +208,6 @@ class PositiveExemplar:
     @property
     def target_preference_capable(self) -> bool:
         return self.source_role is SourceRole.TARGET
-
-
-@dataclass(frozen=True)
-class RankedExemplar:
-    exemplar: PositiveExemplar
-    preference_tier: ExemplarPreferenceTier
-    preference_reason: str
-    deterministic_tie_break: str
 
 
 @dataclass(frozen=True)
@@ -1061,66 +1044,6 @@ def _build_positive_pool(
     return tuple(deduplicated)
 
 
-def rank_positive_exemplars_for_session(
-    positive_pool: Sequence[PositiveExemplar],
-    *,
-    target_volume_id: str,
-    directly_addressable_exemplar_ids: Sequence[str] = (),
-    seed: int | str = 0,
-) -> Tuple[RankedExemplar, ...]:
-    """Rank positives deterministically for one target session.
-
-    Same-session target polygons precede other polygons from the same target
-    volume, then other target inputs, then external exemplar roots.
-    """
-
-    directly_addressable = frozenset(
-        str(value) for value in directly_addressable_exemplar_ids
-    )
-    ranked = []
-    for exemplar in positive_pool:
-        if (
-            exemplar.source_role is SourceRole.TARGET
-            and exemplar.volume_id == target_volume_id
-            and exemplar.exemplar_id in directly_addressable
-        ):
-            tier = ExemplarPreferenceTier.SAME_TARGET_SESSION
-            reason = "geometry adapter marked this target polygon directly addressable"
-        elif (
-            exemplar.source_role is SourceRole.TARGET
-            and exemplar.volume_id == target_volume_id
-        ):
-            tier = ExemplarPreferenceTier.SAME_TARGET_VOLUME
-            reason = "target polygon belongs to the same target volume"
-        elif exemplar.source_role is SourceRole.TARGET:
-            tier = ExemplarPreferenceTier.OTHER_TARGET_VOLUME
-            reason = "polygon comes from another target input volume"
-        else:
-            tier = ExemplarPreferenceTier.EXTERNAL_EXEMPLAR
-            reason = "polygon comes from an external exemplar root"
-        tie_break = hashlib.sha256(
-            f"{seed}\0{target_volume_id}\0{exemplar.exemplar_id}".encode("utf-8")
-        ).hexdigest()
-        ranked.append(
-            RankedExemplar(
-                exemplar=exemplar,
-                preference_tier=tier,
-                preference_reason=reason,
-                deterministic_tie_break=tie_break,
-            )
-        )
-    return tuple(
-        sorted(
-            ranked,
-            key=lambda item: (
-                int(item.preference_tier),
-                item.deterministic_tie_break,
-                _candidate_sort_key(item.exemplar),
-            ),
-        )
-    )
-
-
 def discover_lta_inputs(
     input_arg: str | os.PathLike[str],
     exemplar_roots: Sequence[str | os.PathLike[str]] = (),
@@ -1275,7 +1198,6 @@ def revalidate_lta_input_identities(discovery: LtaInputDiscovery) -> None:
 
 __all__ = (
     "AnnotationState",
-    "ExemplarPreferenceTier",
     "FrameAnnotation",
     "IMAGE_EXTENSIONS",
     "ImageProbe",
@@ -1287,7 +1209,6 @@ __all__ = (
     "LtaVolumeSpec",
     "NoPositiveExemplarError",
     "PositiveExemplar",
-    "RankedExemplar",
     "SourceRole",
     "VIDEO_EXTENSIONS",
     "VideoProbe",
@@ -1297,7 +1218,6 @@ __all__ = (
     "discover_lta_inputs",
     "parse_yolo_segmentation_label",
     "probe_video_with_ffprobe",
-    "rank_positive_exemplars_for_session",
     "revalidate_lta_input_identities",
     "split_indexed_stem",
 )

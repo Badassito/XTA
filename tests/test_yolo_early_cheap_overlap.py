@@ -55,9 +55,8 @@ def _fixture(*, ready_ids=(0, 3, 6), curved_count=6, group_mode=False):
             out_size=8, processing_shape=(curved_count * 8, 8, 8), gpu_eligible=True)
         state.gpu_worker_pending_task_ids.append(task_id)
     scheduler = _scheduler(Path('.'), state=state,
-        input_overrides=dict(v1613_d1_owner_active=True, gpu_device_count=4),
-        operation_overrides=dict(_env_int=lambda name, default:
-            int(group_mode) if name == 'YOLO_TTA_D1_OWNER_GROUPS' else default))
+        input_overrides=dict(v1613_d1_owner_active=True, gpu_device_count=4,
+                             d1_owner_groups_requested=bool(group_mode)))
     scheduler.cpu_input_prefetch = _PreparedInputs(ready_ids)
     state.gpu_worker_next_dynamic_task_id = 106
     _bind_callbacks(scheduler)

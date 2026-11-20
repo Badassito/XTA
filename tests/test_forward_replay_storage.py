@@ -1,7 +1,6 @@
 """Replay identity, disk admission, packet integrity and worker aggregation regressions."""
 import multiprocessing as mp
 import os
-from pathlib import Path
 import sqlite3
 from types import SimpleNamespace
 
@@ -95,22 +94,22 @@ def test_opt_in_crc_and_truncation_fall_back(store_env, monkeypatch):
     assert replay.replay_cache_summary(root)["by_backend"]["test"]["invalid_packet"]==2
 
 
-def test_logical_keys_ignore_cut_output_paths_keep_geometry_and_renderer(store_env):
+def test_logical_keys_keep_geometry_and_renderer(store_env):
     root,model=store_env
     cache=_cache(root,model)
     view=ViewInfo("Transverse",5,10,12,"clamp")
     aff=build_affine(view.name,12,10,12,0.0,"clamp")
-    def key(folder, start=0, render="cpu", native_shape=None):
-        job=AugJob("a0",0.,Path(folder)/"other.json",aff)
+    def key(start=0, render="cpu", native_shape=None):
+        job=AugJob("a0",0.,aff)
         task=dict(sweep_source_stamp=["video",42],job=job,view=view,slice_start=start,
                   native_resize={"shape":native_shape,"dtype":"uint8"} if native_shape else None)
         source=SimpleNamespace()
         replay.bind_worker_replay_source(source,task,render)
         return cache.input_key(np.empty((1,1,12,12),np.uint8),source=source,batch_index=0)
-    assert key("cut50")==key("cut80")
-    assert key("cut50")!=key("cut80",start=1)
-    assert key("cut50")!=key("cut80",render="gpu")
-    assert key("cut50",native_shape=(2,5,5))!=key("cut80",native_shape=(3,5,5))
+    assert key()==key()
+    assert key()!=key(start=1)
+    assert key()!=key(render="gpu")
+    assert key(native_shape=(2,5,5))!=key(native_shape=(3,5,5))
 
 
 def test_multiple_workers_share_admission_and_flush_statistics(store_env):

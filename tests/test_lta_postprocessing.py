@@ -1,19 +1,18 @@
 from __future__ import annotations
 
 import gzip
-import os
 import tempfile
 import unittest
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
 
 import numpy as np
 
 
-from XTA.lta_outputs import LtaLayerRecord, compose_terminal_union
+from XTA.lta_outputs import LtaLayerRecord
 from XTA import lta_postprocessing as subject
+from tests.reference_backends.lta_composition import compose_terminal_union
 
 
 def _reference_fill_4_connected(mask: np.ndarray) -> np.ndarray:
@@ -134,37 +133,6 @@ class LtaMaskHoleFillTests(unittest.TestCase):
                 operation=lambda value: np.zeros_like(value),
             )
 
-    def test_prediction_and_dogfood_helpers_keep_object_order_and_provenance(self) -> None:
-        donut = np.ones((5, 5), dtype=bool)
-        donut[2, 2] = False
-        point = np.zeros((5, 5), dtype=bool)
-        point[0, 0] = True
-        donut_before = donut.copy()
-
-        prediction = subject.fill_prediction_mask_holes_2d(
-            donut,
-            context={"frame_index": 11, "object_id": 4},
-            operation=_reference_fill_4_connected,
-        )
-        dogfood = subject.fill_dogfood_seed_masks_holes_2d(
-            (donut, point),
-            context={"source_frame": 11, "direction": "forward"},
-            operation=_reference_fill_4_connected,
-        )
-
-        np.testing.assert_array_equal(donut, donut_before)
-        self.assertTrue(bool(prediction.mask[2, 2]))
-        self.assertEqual(prediction.receipt.provenance_kind, "sam_prediction")
-        self.assertEqual(prediction.receipt.added_pixels, 1)
-        self.assertEqual(prediction.receipt.context["object_id"], 4)
-        self.assertEqual([item.mask_index for item in dogfood.receipts], [0, 1])
-        self.assertEqual(
-            [item.provenance_kind for item in dogfood.receipts],
-            ["temporal_dogfood", "temporal_dogfood"],
-        )
-        self.assertTrue(bool(dogfood.masks[0][2, 2]))
-        np.testing.assert_array_equal(dogfood.masks[1], point)
-
     def test_merged_spatial_seed_is_filled_after_union(self) -> None:
         merged = np.ones((5, 5), dtype=bool)
         merged[2, 2] = False
@@ -254,10 +222,7 @@ class LtaNativeFinalizationTests(unittest.TestCase):
         source[0, 1, 3] = 1
         events: list[str] = []
         closed: list[object] = []
-        with tempfile.TemporaryDirectory() as folder, mock.patch.dict(
-            os.environ,
-            {"YOLO_TTA_VOIDFILL_CONNECTIVITY": "18"},
-        ):
+        with tempfile.TemporaryDirectory() as folder:
             result = subject.finalize_lta_native_union(
                 (LtaLayerRecord("prediction", "union", "sam", source),),
                 workspace_path=Path(folder) / "union.u8.dat",
@@ -283,7 +248,7 @@ class LtaNativeFinalizationTests(unittest.TestCase):
             self.assertEqual(result.postprocessing["keep_objects"]["backend"], "cpu")
             self.assertEqual(
                 result.postprocessing["void_fill"]["background_connectivity"],
-                18,
+                6,
             )
             self.assertEqual(result.terminal_union_foreground_voxels, 4)
             result.close()

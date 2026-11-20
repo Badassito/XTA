@@ -114,7 +114,7 @@ def main() -> None:
 
         gpu_started = time.perf_counter()
         gpu_result = try_apply_keep_largest_objects_multi_gpu(
-            gpu_input, int(args.keep), root / "gpu", keep_temp=True,
+            gpu_input, int(args.keep), root / "gpu",
         )
         gpu_seconds = max(0.0, time.perf_counter() - gpu_started)
         if gpu_result is None:
@@ -122,7 +122,7 @@ def main() -> None:
 
         cpu_started = time.perf_counter()
         cpu_stats = apply_keep_largest_objects_inplace(
-            cpu_input, int(args.keep), root / "cpu", keep_temp=True,
+            cpu_input, int(args.keep), root / "cpu",
             prefer_memory=True, workers=max(1, os.cpu_count() or 1),
         )
         cpu_seconds = max(0.0, time.perf_counter() - cpu_started)

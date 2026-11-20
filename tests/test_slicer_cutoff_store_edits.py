@@ -31,7 +31,7 @@ from XTA.sweep_publication import publish_sweep_review
 
 # Today's entry points the store-backed review changes, compiled besides the fixture's functions.
 ENTRY_POINTS = ("UpdateGlobal", "UpdateNonGlobal", "UpdateBoth", "ExportDisplayedXTAEdits", "ExportXTAEdits",
-                "_xta_digest", "_xta_child", "_xta_source_name")
+                "_xta_child", "_xta_source_name")
 
 
 class Signal:

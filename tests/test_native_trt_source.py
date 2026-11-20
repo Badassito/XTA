@@ -36,7 +36,7 @@ def make_source(engine, physical, *, tiled=False, channels='gray', fp16=False,
                 batch_size=1, num_frames=None, angle=0., size=16):
     view = geometry.expand_views_into_tta_variants((physical,), (angle,))[0]
     job = (SimpleNamespace(M_out_to_src=np.asarray(((.83, .11, 2.), (-.07, .91, -1.)), np.float32))
-           if tiled else geometry.build_aug_job_for_variant(view, size, Path('unused')))
+           if tiled else geometry.build_aug_job_for_variant(view, size))
     cls = cb.GpuTileRenderedYoloSource if tiled else cb.GpuRenderedYoloSource
     with (mock.patch.object(cb, 'ensure_ultralytics_accepts_in_memory_volume_source'),
           mock.patch.dict('sys.modules', {'ultralytics.data.loaders': None})):
@@ -95,8 +95,8 @@ class NativeTrtSourceContracts(unittest.TestCase):
         self.assertIs(receipt['native_trt_ring_requested'], True)
         self.assertEqual(receipt['native_trt_ring_mode'], 'radial')
         for collection, names in (
-                ('spherical_sources', ('geometry', 'cylindrical_geometry', 'spherical_sampling',
-                                       'azimuthal_coverage', 'unification.runtime')),
+                ('modules', ('geometry', 'cylindrical_geometry', 'spherical_sampling',
+                             'azimuthal_coverage', 'unification.runtime')),
                 ('modules', ('reconciliation_runtime', 'sam_planning_outcomes',
                              'sam_observation_masks', 'sam_interpolation_contracts'))):
             for name in names:
@@ -105,6 +105,8 @@ class NativeTrtSourceContracts(unittest.TestCase):
                     self.assertEqual(entry['sha256'], hashlib.sha256(Path(entry['path']).read_bytes()).hexdigest())
                     self.assertEqual(entry['loaded_in_parent'], 'XTA.' + name in loaded_before)
                     self.assertEqual('XTA.' + name in sys.modules, 'XTA.' + name in loaded_before)
+        self.assertFalse([name for name in receipt['modules']
+                          if name.startswith('tilted_azimuthal_projection')])
         self.assertFalse(any(name.split('.')[0] in ('torch', 'cupy', 'sam3', 'sam2')
                              for name in set(sys.modules) - loaded_before))
 

@@ -244,7 +244,7 @@ def test_lta_runtime_stays_explicitly_transverse_only(backend, changes):
                           tta_angle_deg=changes.get('tta_angle_deg', 0.), runtime_view=runtime,
                           frame_height=1764, frame_width=1764,
                           tile_grids=(() if backend == 'dynamic' else (SimpleNamespace(tile_size=1008),)))
-    plan = SimpleNamespace(bundle=SimpleNamespace(model_version='sam3.1'), sam_execution='video',
+    plan = SimpleNamespace(bundle=SimpleNamespace(model_version='sam3.1'),
                            discovery=SimpleNamespace(target_volumes=(object(),)),
                            volumes=(SimpleNamespace(runtime_views=(view,)),), crop_backend=backend)
     with pytest.raises(ValueError, match='Transverse|transverse'):

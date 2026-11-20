@@ -5,9 +5,8 @@ segments onto their original full-quality (FQ) components. The original native
 voxels supply the detail. It publishes one cleaned native Global NRRD for PTA;
 it does not upscale the edited Global or regenerate the 300+ native layers.
 
-This is a development integration of the PTA_ENHANCEMENT draft. Validate the
-first matched real dataset before accepting automatic decisions as training
-ground truth. It is included in the v24.2.0 development source.
+Validate the first matched real dataset before accepting automatic decisions as
+training ground truth.
 
 ## Keep from the TTA run
 
@@ -435,7 +434,8 @@ mask and Slicer's copy may need about two bytes per native voxel in additional
 RAM. It preserves the original LQ segments. It cannot recover native detail and
 may change thin structures. Hide the original for visual comparison, then remove
 the comparison segmentation before Export XTA Edits, which expects only the
-original manifest's working segments. Live Slicer execution still needs checking.
+original manifest's working segments. `xta_upscale_preview.py` has not been
+checked in a live Slicer session.
 
 ## The extended workflow
 
@@ -493,8 +493,12 @@ and `needs_review`, without publishing a PTA label. With auto mode:
   Watershed proposes a cut within the original foreground. Evidence checks
   reject cuts that lose too much retained evidence or remove too little rejected
   evidence. No foreground is added.
-- Unresolved or oversized components are preserved and reported. A deliberately
-  empty edited Global produces an empty native label.
+- If any mixed component stays unresolved (for example no separable core, a cut
+  that fails the evidence checks, or a padded box above
+  `--auto-max-roi-voxels`), processing stops. `report.json` and
+  `components.tsv` record it, review previews remain for inspection, no PTA
+  label is published, and the exit code is 2 with `needs_review`. A
+  deliberately empty edited Global produces an empty native label.
 - The filtered layers are unioned at native resolution. The largest six-connected
   union component is retained by default, matching the toolbar's single-object
   workflow. `--keep-objects N` can retain multiple native fragments of that
@@ -512,11 +516,13 @@ intensity-guided adjudication. Tiny structures merged by downsampling can remain
 ambiguous; inspect the report instead of treating successful execution as proof
 that every manual deletion was reproduced.
 
-`complete`, `completed_with_heuristics`, and
-`completed_with_unresolved_components` are distinct completion states. All return
-exit code 0; only the first needs no heuristic cuts and has no mixed components
-under these rules. `review_previews/` contains diagnostic overlays, which should
-not be added to the working segmentation or its Global union.
+`complete` and `completed_with_heuristics` are the completion states of the
+default and auto policies; only `complete` needs no heuristic cuts.
+`--conflicts keep` instead preserves unresolved mixed components and publishes a
+conservative candidate with status `completed_with_unresolved_components`. All
+three exit 0; see [native union recovery](native_union_recovery.md).
+`review_previews/` contains diagnostic overlays, which should not be added to
+the working segmentation or its Global union.
 
 Current original inputs must be XTA inline raw/gzip, full-raster 3D uint8 binary
 NRRDs with unchanged unit-LPS geometry. Cropped **edited** snapshots are supported.
@@ -548,16 +554,19 @@ python -m XTA --mode pta --input /work/M1_pta_input \
 Add the desired tilted/spherical views or augmentation policy using the existing
 PTA flags. PTA preprocessing stays off unless explicitly requested. To fill
 enclosed native 3D cavities, add `--preprocessing 3d_void_fill`. It fills only
-background disconnected from the volume boundary (6-connected by default),
-before cube resizing or physical views. It can be combined with
-`gaussian_smoothing[:STANDARD_DEVIATION][:SMOOTHING_PASSES]`; void filling always
-runs first, regardless of token order. Each operation may appear once. These
-3D operations require a fully labeled contiguous volume; `--force` permits
-partial volumes, while encoded frame gaps and unlabeled volumes remain excluded.
-Forced partial semantic exports retain unknown pixels as class 255.
+background disconnected from the volume boundary (6-connected, the dual of the
+26-connected foreground), before cube resizing or physical views. It can be
+combined with `gaussian_smoothing[:STANDARD_DEVIATION][:SMOOTHING_PASSES]`; void
+filling always runs first, regardless of token order. Each operation may appear
+once. These 3D operations require a fully labeled contiguous volume; `--force`
+permits partial volumes, while encoded frame gaps and unlabeled volumes remain
+excluded. Forced partial semantic exports retain unknown pixels as class 255.
 
-YOLO polygon labels already omit enclosed 2D hole contours after rendering and
-augmentation. Binary and semantic outputs retain the actual rendered mask,
+YOLO polygon labels keep enclosed 2D holes after rendering and augmentation
+through zero-width bridges to the outer ring. A bridge that crosses another hole
+or a concave notch fills a 1-px line; holes below the 1-px polygon tolerance
+stay filled and are counted as `holes_discarded_during_polygon_export`.
+Binary and semantic outputs retain the actual rendered mask,
 including holes that remain after the selected native preprocessing. Void fill
 statistics and voxel counts are recorded in the PTA manifest and requested
 summary. Its workspace uses about four bytes per native voxel plus component
@@ -567,8 +576,11 @@ PTA now uses the selected CUDA devices for large-mask void filling and Gaussian
 smoothing. Preprocessing runs in a separate spawned process so the parent stays
 safe for its existing render-worker lifecycle. Void filling labels bounded slabs
 on multiple GPUs, reconciles their boundaries, then applies the result on the CPU.
-Gaussian smoothing uses bounded 3D tiles with full filter halos. Constant-zero
-boundaries, per-pass thresholding at 0.5, and preprocessing order are unchanged.
+Gaussian smoothing uses bounded 3D tiles with full filter halos.
+Replicate-edge (nearest) boundaries, per-pass thresholding at 0.5, and
+preprocessing order are shared with TTA. Structures crossing a volume face are
+not eroded there; a feature lying only in a face slice is extended outward and
+may survive a pass that would remove it in the interior.
 Floating-point rounding can affect Gaussian voxels very near the threshold.
 
 No new CLI flags are needed. The initial volume, or each volume with
@@ -690,10 +702,12 @@ upload bytes and saved GPU bytes. The geometry request record's
 `native_t_fusion: false` means intermediate virtual-gray8 rounding is preserved;
 it does not disable native-depth residency.
 
-Each forked GPU owner builds its CUDA runtime (policy, render engine and
+Each GPU owner builds its CUDA runtime (policy, render engine and
 nvImageCodec encoder) in the pool initializer, while the parent loads and
-prepares the volume; the parent forks the owners before any CUDA use, and this
-assumes the Default GPU compute mode. A failed warm-up is
+prepares the volume; the parent starts the owners before any CUDA use, and this
+assumes the Default GPU compute mode. Owners are forked where the host supports
+fork; elsewhere (e.g. Windows) they are spawned and reload the policy file after
+checking its content hash. A failed warm-up is
 logged and the owner's first task then behaves as the lazy build did: it builds
 the runtime itself and raises any failure. With native-depth
 residency, an owner starts its first render task's intensity upload in the

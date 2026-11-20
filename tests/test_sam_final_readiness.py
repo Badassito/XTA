@@ -85,8 +85,8 @@ def test_sixty_real_parents_drain_after_legacy_projection_consumer_recovers(tmp_
                     continue
                 prepared = future.result()
                 if not settle_prepared_view_components(prepared):
-                    leases.retire_dense_for_publication(prepared, enabled=True, tiled=False,
-                        keep_temp=False, retired_callback=lambda *args:retired_events.put(args))
+                    leases.retire_dense_for_publication(prepared, tiled=False,
+                        retired_callback=lambda *args:retired_events.put(args))
                     continue
                 expected = [('bridge', 'forward'), ('bridge', 'backward'),
                             ('extrapolation', 'forward'), ('extrapolation', 'backward')]
@@ -124,8 +124,8 @@ def test_sixty_real_parents_drain_after_legacy_projection_consumer_recovers(tmp_
             for future in pending:
                 prepared = future.result()
                 assert not settle_prepared_view_components(prepared)
-                leases.retire_dense_for_publication(prepared, enabled=True, tiled=False,
-                    keep_temp=False, retired_callback=lambda *args:retired_events.put(args))
+                leases.retire_dense_for_publication(prepared, tiled=False,
+                    retired_callback=lambda *args:retired_events.put(args))
             while True:
                 try:
                     key, lease = retired_events.get_nowait()

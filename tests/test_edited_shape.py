@@ -34,8 +34,8 @@ def read_nrrd(path, full):
     return b''.join(header).decode('ascii'), np.frombuffer(data, np.uint8).reshape(full)
 
 
-def dense_policy2_reference(preview, full, block_mib=64, workers=1):
-    """Original dense interpolation, before skipping trusted background."""
+def dense_policy2_reference(preview, full, block_mib=64, workers=1, retain_centers=True):
+    """Dense interpolation without skipping trusted background, plus retained centers."""
     field = shape.signed_distance_field(preview, full)
     rows = max(1, min(full[1], int(block_mib * shape.MIB // (full[2] * 10 * workers))))
     scale = np.asarray(preview.shape, np.float64) / np.asarray(full, np.float64)
@@ -53,7 +53,21 @@ def dense_policy2_reference(preview, full, block_mib=64, workers=1):
             source_y = shape._cell_indices(preview.shape[1], full[1], y, y+n)
             trusted = preview[source_t][np.ix_(source_y, x_indices)]
             result[t, y:y+n] = (values[0] > 0) & trusted.astype(bool)
-    return result
+    return result | retained_centers(preview, full) if retain_centers else result
+
+
+# Two face-adjacent cells; at 1.5x/1.33x no native path joins their centers.
+THIN_SPLIT_CASE = np.zeros((2, 3, 2), np.uint8)
+THIN_SPLIT_CASE[1, 1, :] = 1
+THIN_SPLIT_FULL = (3, 4, 3)
+
+
+def retained_centers(preview, full):
+    """Native voxels the audit samples, set wherever the edited cell is foreground."""
+    centers = np.zeros(full, np.uint8)
+    nearest = [shape._cell_indices(n, l) for l, n in zip(preview.shape, full)]
+    centers[np.ix_(*nearest)] = preview != 0
+    return centers
 
 
 class EditedShapeTests(unittest.TestCase):
@@ -280,6 +294,7 @@ class EditedShapeTests(unittest.TestCase):
         self.assertEqual(topology['source_foreground_components'], 1)
         self.assertEqual(topology['output_foreground_components'], 1)
         self.assertEqual(topology['foreground_voxels_in_edited_background_cells'], 0)
+        self.assertEqual(meta['reconstruction']['retained_center_voxels'], 0)
         indices = [np.floor((np.arange(l)+.5)*n/l).astype(int) for l, n in zip(a.shape, full)]
         np.testing.assert_array_equal(b[np.ix_(*indices)], a)
 
@@ -384,12 +399,77 @@ class EditedShapeTests(unittest.TestCase):
                 shape.write_edited_shape(path, a, (15, 15, 15))
         self.assertFalse(path.exists())
 
-    def test_insufficient_native_grid_for_thin_object_refuses_publication(self):
+    def test_isolated_cell_retains_its_audited_center_on_coarse_grids(self):
+        # Interpolation alone is negative at every native center of an isolated
+        # cell for 3 -> 4 and at the sampled center for an exact 2x ratio.
         a = np.zeros((3, 3, 3), np.uint8)
         a[1, 1, 1] = 1
+        for full in ((4, 4, 4), (6, 6, 6)):
+            with self.subTest(full=full):
+                path = self.root / f'speck-{full[0]}.nrrd'
+                meta = shape.write_edited_shape(path, a, full)
+                _, b = read_nrrd(path, full)
+                np.testing.assert_array_equal(b, retained_centers(a, full))
+                self.assertEqual(meta['foreground_voxels'], 1)
+                self.assertEqual(meta['reconstruction']['retained_center_voxels'], 1)
+                self.assertEqual(meta['reconstruction']['separation_audit']['output_foreground_components'], 1)
+
+    def test_exact_2x_convex_corners_and_coarse_axis_rod_publish(self):
+        cube = np.zeros((8, 8, 8), np.uint8)
+        cube[2:6, 2:6, 2:6] = 1
+        z, y, x = np.indices((12, 12, 12))
+        ball = (((z - 5.5) ** 2 + (y - 5.5) ** 2 + (x - 5.5) ** 2) <= 16).astype(np.uint8)
+        rod = np.zeros((8, 12, 12), np.uint8)
+        rod[2:6, 6, 6] = 1
+        for name, a, full in (('cube', cube, (16, 16, 16)), ('ball', ball, (24, 24, 24)),
+                              ('rod', rod, (64, 24, 24))):
+            with self.subTest(name):
+                meta = shape.write_edited_shape(self.root / (name + '.nrrd'), a, full)
+                audit = meta['reconstruction']['center_roundtrip']
+                self.assertEqual((audit['false_positive_voxels'], audit['false_negative_voxels']), (0, 0))
+                forced = retained_centers(a, full) & ~dense_policy2_reference(a, full, retain_centers=False)
+                self.assertGreater(int(forced.sum()), 0)
+                self.assertEqual(meta['reconstruction']['retained_center_voxels'], int(forced.sum()))
+
+    def test_retained_center_count_is_identical_across_threads_and_blocks(self):
+        rng = np.random.default_rng(2024)
+        for case in range(20):
+            low = tuple(int(n) for n in rng.integers(3, 7, size=3))
+            full = tuple(int(n * r) for n, r in zip(low, rng.choice((1.33, 2, 2.5), size=3)))
+            full = tuple(max(l, n) for l, n in zip(low, full))
+            a = (rng.random(low) < rng.uniform(.2, .8)).astype(np.uint8)
+            forced = int((retained_centers(a, full)
+                          & ~dense_policy2_reference(a, full, retain_centers=False)).sum())
+            for workers, budget in ((1, 64), (4, .001)):
+                with self.subTest(case=case, low=low, full=full, workers=workers):
+                    path = self.root / f'count-{case}-{workers}.nrrd'
+                    try:
+                        meta = shape.write_edited_shape(path, a, full, block_mib=budget, workers=workers)
+                    except ValueError as error:
+                        self.assertIn('component count changed', str(error))
+                        continue
+                    self.assertEqual(meta['reconstruction']['retained_center_voxels'], forced)
+
+    def test_retained_centers_change_only_previously_refused_voxels(self):
+        rng = np.random.default_rng(311)
+        for case in range(60):
+            low = tuple(int(n) for n in rng.integers(3, 7, size=3))
+            full = tuple(int(n * r) for n, r in zip(low, rng.choice((1.33, 2, 2.5, 3, 4), size=3)))
+            full = tuple(max(l, n) for l, n in zip(low, full))
+            a = (rng.random(low) < rng.uniform(.05, .9)).astype(np.uint8)
+            with self.subTest(case=case, low=low, full=full):
+                actual = render(a, full)
+                centers = retained_centers(a, full).astype(bool)
+                interpolated = dense_policy2_reference(a, full, retain_centers=False) & ~centers
+                # Only audited centers of edited foreground cells may differ.
+                np.testing.assert_array_equal(actual.astype(bool) & ~centers, interpolated.astype(bool))
+                self.assertTrue(actual[centers].all())
+
+    def test_insufficient_native_grid_for_thin_connection_refuses_publication(self):
+        a = THIN_SPLIT_CASE.copy()
         path = self.root / 'undersampled.nrrd'
-        with self.assertRaisesRegex(ValueError, 'center roundtrip failed'):
-            shape.write_edited_shape(path, a, (4, 4, 4))
+        with self.assertRaisesRegex(ValueError, 'component count changed'):
+            shape.write_edited_shape(path, a, THIN_SPLIT_FULL)
         self.assertFalse(path.exists())
         self.assertEqual(list(self.root.iterdir()), [])
 

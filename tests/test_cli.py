@@ -87,7 +87,8 @@ class CliTests(unittest.TestCase):
         completed = self.run_python(str(LAUNCHER), "--mode", "lta", "--help")
         self.assertEqual(completed.returncode, 0, completed.stdout)
         self.assertIn("label-time augmentation", completed.stdout)
-        self.assertIn("--sam_execution {video}", completed.stdout)
+        self.assertIn("--lta_crop_backend", completed.stdout)
+        self.assertNotIn("--sam_execution", completed.stdout)
         self.assertNotIn("--prompt", completed.stdout)
 
     def test_run_forwards_only_mode_local_arguments(self) -> None:

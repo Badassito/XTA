@@ -43,7 +43,6 @@ def producer_environment(monkeypatch, tmp_path):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
     monkeypatch.setenv("YOLO_TTA_NRRD_GPU_MIRROR_TEE", "0")
     monkeypatch.setenv("YOLO_TTA_LOW_QUALITY_GPU_DOWNBIN", "0")
-    monkeypatch.setenv("YOLO_TTA_SWEEP_CUDA_PROJECTION", "0")
     monkeypatch.setenv("XTA_YOLO_SWEEP_WORK_DIR", str(tmp_path / "journal-work"))
     monkeypatch.setenv("XTA_YOLO_SWEEP_ID", "family-one")
     monkeypatch.setenv("XTA_YOLO_SWEEP_NATIVE_ROLE", "produce")

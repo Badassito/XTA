@@ -9,11 +9,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from XTA.sam_evidence import (SamEvidenceWriter, export_sam_evidence,
+from XTA.sam_evidence import (SamEvidenceWriter, export_sam_evidence, iter_selected_native_crops,
                               iter_selected_planes, load_sam_online_selection)
 from XTA.sam_filtering import effective_raw_mask, filter_sam_components
 from XTA.sam_interpolation import selected_sam_plane
-from XTA.sam_policy import replay_sam_proposals, select_sam_proposals
+from XTA.sam_policy import select_sam_proposals
 from XTA.sam_replay import replay_sam_directional_nrrds
 
 
@@ -251,13 +251,12 @@ def test_online_packed_and_directional_nrrd_replay_never_restore_removed_noise(t
     receipt = select_sam_proposals(bundle)
     assert receipt['selected_run_ids'] == ['F', 'R']
     assert np.array_equal(selected_sam_plane(bundle, receipt, 2, SHAPE), _body())
-    packed = replay_sam_proposals(bundle, tmp_path / 'packed')
-    assert packed['mask_filter'] == receipt['mask_filter']
-    with np.load(tmp_path / 'packed' / 'selected_planes.npz') as archive:
-        for record in packed['replay_outputs']['packed_plane_index']:
-            plane = np.unpackbits(archive[record['key']], bitorder='little', count=np.prod(SHAPE)).reshape(SHAPE)
-            expected = _body() if record['native_frame'] in (1, 2, 3) else np.zeros(SHAPE, dtype=bool)
-            assert np.array_equal(plane, expected)
+    crops = [row for direction in ('forward', 'backward')
+             for row in iter_selected_native_crops(bundle, receipt, direction=direction)]
+    assert crops
+    for _, _, native_frame, _, plane in crops:
+        expected = _body() if native_frame in (1, 2, 3) else np.zeros(SHAPE, dtype=bool)
+        assert plane.shape == SHAPE and np.array_equal(plane, expected)
     exported = replay_sam_directional_nrrds(bundle, tmp_path / 'nrrd', memory_mib=1)
     for layer in exported['layers']:
         output = _read_nrrd(tmp_path / 'nrrd' / layer['path'])
@@ -274,7 +273,7 @@ def test_radius_override_replays_original_evidence_without_mutation(tmp_path):
     original = bundle.evidence_fingerprint
     first = select_sam_proposals(bundle)
     assert _planes(bundle, first)[2][45, 61]
-    second = replay_sam_proposals(bundle, tmp_path / 'stricter', policy={
+    second = select_sam_proposals(bundle, policy={
         'sam_bridge_policy': {'component_min_radius': 3.},
     })
     assert second['selected_run_ids'] == ['F']
@@ -294,19 +293,6 @@ def test_legacy_receipt_uses_original_unfiltered_owned_candidates(tmp_path):
     legacy = {'selected_run_ids': ['F']}
     assert _planes(bundle, legacy)[2][45, 60]
     assert not _planes(bundle, select_sam_proposals(bundle))[2][45, 60]
-
-
-def test_effective_helper_rejects_stale_loaded_filter_implementation(tmp_path, monkeypatch):
-    from XTA import sam_filtering
-
-    raw = _raw()
-    bundle = _bundle(tmp_path, [('F', raw, 'forward')])
-    receipt = select_sam_proposals(bundle)
-    modified = tmp_path / 'changed_filter.py'
-    modified.write_bytes(sam_filtering._SOURCE_PATH.read_bytes() + b'\n# changed implementation\n')
-    monkeypatch.setattr(sam_filtering, '_SOURCE_PATH', modified)
-    with pytest.raises(RuntimeError, match='implementation changed after loading'):
-        effective_raw_mask(bundle, 'F', 2, receipt)
 
 
 def _resign_filter(spec):

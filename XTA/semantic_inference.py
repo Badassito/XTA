@@ -68,8 +68,23 @@ def semantic_foreground_probability_numpy(
         if channels == 1:
             result[index] = 1.0 / (1.0 + np.exp(-np.clip(frame[0], -80.0, 80.0)))
         else:
-            difference = np.clip(frame[0] - frame[1], -80.0, 80.0)
-            result[index] = 1.0 / (1.0 + np.exp(difference))
+            background, foreground = frame[0], frame[1]
+            with np.errstate(invalid='ignore'):
+                raw_difference = background - foreground
+            probability = 1.0 / (1.0 + np.exp(np.clip(raw_difference, -80.0, 80.0)))
+            if not np.isfinite(raw_difference).all():
+                # Match torch softmax and semantic_cuda: NaN (never foreground, even at
+                # conf 0) if either logit is NaN or +Inf, or both are -Inf. cv2.resize
+                # spreads non-finite cells differently (Inf becomes NaN; border taps
+                # differ), so resized -Inf logits here, resized +/-Inf logits in the
+                # 1-channel branch, and edge-adjacent cells can still differ.
+                undefined = (
+                    np.isnan(background) | np.isnan(foreground)
+                    | (background == np.inf) | (foreground == np.inf)
+                    | ((background == -np.inf) & (foreground == -np.inf))
+                )
+                probability = np.where(undefined, np.float32(np.nan), probability)
+            result[index] = probability
     return result
 
 

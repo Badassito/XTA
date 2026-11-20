@@ -48,7 +48,7 @@ class ViewPrepareFailureOwnershipTests(unittest.TestCase):
                     union_path=self.root / 'original.dat', confmap_path=None, temp_dir=self.root,
                     dense_tiling_active=False, min_conf=0, min_radius=0, interpolate=3,
                     interpolation_walk_back=1, interpolation_candidates=2, interpolate_passes=1,
-                    interpolate_min_radius=0, interpolation_search_angle=0, keep_temp=False,
+                    interpolate_min_radius=0, interpolation_search_angle=0,
                     slice_workers=1, interpolation_task_workers=1, nrrd_layers_enabled=True,
                     precleaned_slice_cleanup=True, hole_fill_done_on_device=True,
                     preinterpolation_layer_already_published=True)
@@ -164,7 +164,7 @@ class ViewPrepareFailureOwnershipTests(unittest.TestCase):
             finally:
                 exit_closed.append(local._mmap.closed)
 
-        result = SimpleNamespace(live_array=local)
+        result = SimpleNamespace(live_array=local, native_support_mm=local, final_view_volume_mm=None)
         prepare = mock.Mock(return_value=result)
         if fail:
             prepare.side_effect = RuntimeError('component queue refused submission')
@@ -178,11 +178,10 @@ class ViewPrepareFailureOwnershipTests(unittest.TestCase):
             interpolation_distance=3, interpolation_walk_back=1,
             interpolation_candidates=2, interpolation_passes=1,
             interpolation_min_radius=0, interpolation_search_angle=0,
-            keep_temp_artifacts=True, slice_workers=1, interpolation_task_workers=1,
+            slice_workers=1, interpolation_task_workers=1,
             component_layers_needed=True, precleaned_slice_cleanup=True,
             hole_fill_done_on_device=True, slice_meta=None,
             fuse_azimuthal_component_layers=lambda: False,
-            component_ref_dense_retirement_active=True,
             preinterpolation_layer_already_published=True,
             parent_mask_ready_callback=None,
             submit_component_projection=mock.Mock(),

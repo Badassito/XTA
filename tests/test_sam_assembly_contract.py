@@ -73,7 +73,7 @@ def _prepare(tmp_path, observations, context, *, distance=5, backend='sam', call
             temp_dir=tmp_path, dense_tiling_active=True, min_conf=0., min_radius=0.,
             interpolate=distance, interpolation_walk_back=0, interpolation_candidates=2,
             interpolate_passes=3, interpolate_min_radius=0., interpolation_search_angle=-6.,
-            keep_temp=True, slice_workers=1, interpolation_task_workers=1,
+            slice_workers=1, interpolation_task_workers=1,
             nrrd_layers_enabled=True, interpolation_backend=backend, sam_context=context,
             parent_mask_ready_callback=callback,
         )
@@ -161,7 +161,7 @@ def test_bridge_rescued_detector_component_reaches_consolidated_sam_with_gate_li
                 destination_mm=destination, destination_lock=threading.Lock(),
                 temp_dir=tmp_path / 'tile', interpolate=5, interpolation_walk_back=0,
                 interpolation_candidates=2, interpolate_passes=3,
-                interpolate_min_radius=0., interpolation_search_angle=0., keep_temp=True,
+                interpolate_min_radius=0., interpolation_search_angle=0.,
                 slice_workers=1, interpolation_task_workers=1, nrrd_layers_enabled=True,
                 tile_parent_bridge_accumulator_mm=category, config_id='s4_st2',
                 interpolation_backend='sam', sam_context=context, sam_upstream_lineage=lineage,

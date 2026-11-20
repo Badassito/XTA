@@ -23,13 +23,14 @@ import weakref
 from typing import Mapping
 
 import numpy as np
+from .file_hashing import source_sha256
 from .runtime import runtime_telemetry, sam_sessions_per_gpu
 
 
 _UNSETTLED_SAM_CONTEXTS = {}
 _UNSETTLED_SAM_LOCK = threading.Lock()
 SAM_YOLO_GRAY_IMAGE_CONTRACT = 'xta.sam_canonical_yolo_gray8/1'
-_GRAY_CONSUMER_IMPLEMENTATION_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+_GRAY_CONSUMER_IMPLEMENTATION_SHA256 = source_sha256(__file__)
 
 
 class SamConcurrentStartupResourceError(RuntimeError):
@@ -2079,7 +2080,7 @@ class SamInterpolationContext:
         from .geometry import physical_view_name
         from .sam_canvas_rendering import (render_canonical_crop, cartesian_source_view,
                                            prepare_cartesian_native_crop)
-        from .media import (_linear_source_index, _resize_gray_slice_nearest_or_linear,
+        from .media import (_center_aligned_source_position, _resize_gray_slice_nearest_or_linear,
                             wait_for_volume_ready, wait_for_volume_slice_ready)
         source = self.source_volume
         frames = None
@@ -2169,7 +2170,8 @@ class SamInterpolationContext:
                 render_budget = max(1, _env_int('YOLO_TTA_SAM_RENDER_MAX_BYTES', 256*1024**2))
                 if 3*out_h*out_w > render_budget:
                     raise RuntimeError('SAM exact XY resize exceeds the bounded rendering memory budget')
-                z = _linear_source_index(index, out_t, in_t)
+                # Streaming T-only and XY-resizing cubes share the center-aligned T grid.
+                z = _center_aligned_source_position(index, out_t, in_t)
                 z0, z1 = int(np.floor(z)), min(in_t-1, int(np.floor(z))+1)
                 alpha = z-z0
                 wait_for_volume_slice_ready(decoded, z0)

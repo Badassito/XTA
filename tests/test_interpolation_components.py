@@ -342,7 +342,6 @@ class InterpolationComponentDecompositionTests(unittest.TestCase):
                     interpolation_walk_back=2,
                     interpolation_candidates=2,
                     interpolate_min_radius=0.0,
-                    keep_temp=False,
                     prefer_memory=True,
                     workers=1,
                     bridge_component_dir=root / 'components1',
@@ -357,7 +356,6 @@ class InterpolationComponentDecompositionTests(unittest.TestCase):
                     interpolation_walk_back=2,
                     interpolation_candidates=2,
                     interpolate_min_radius=0.0,
-                    keep_temp=False,
                     prefer_memory=True,
                     workers=1,
                     bridge_component_dir=root / 'components2',
@@ -436,7 +434,6 @@ class InterpolationComponentDecompositionTests(unittest.TestCase):
                         interpolation_walk_back=2,
                         interpolation_candidates=2,
                         interpolate_min_radius=0.0,
-                        keep_temp=False,
                         prefer_memory=True,
                         workers=1,
                         bridge_component_dir=component_dir,
@@ -520,7 +517,6 @@ class InterpolationComponentDecompositionTests(unittest.TestCase):
                         interpolation_walk_back=13,
                         interpolation_candidates=5,
                         interpolate_min_radius=0.0,
-                        keep_temp=False,
                         prefer_memory=True,
                         workers=1,
                         bridge_component_dir=component_dir,
@@ -605,7 +601,6 @@ class InterpolationComponentDecompositionTests(unittest.TestCase):
                     description='empty combination',
                     temp_dir=root,
                     workers=1,
-                    keep_temp=False,
                 )
 
         self.assertEqual(ref.path, store_path)

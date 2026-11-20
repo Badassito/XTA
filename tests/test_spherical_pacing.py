@@ -107,3 +107,14 @@ def test_switch_restores_largest_first_exactly(monkeypatch, value):
     monkeypatch.setenv('YOLO_TTA_SPHERICAL_PACING', '0')
     assert drain(build()) == paced_off
     assert build()._spherical_pacing_due([]) is False
+
+
+def test_pacing_switch_is_read_per_selection_not_per_candidate(monkeypatch):
+    from XTA import tta_scheduler
+    monkeypatch.delenv('YOLO_TTA_SPHERICAL_PACING', raising=False)
+    scheduler = build()
+    with mock.patch.object(tta_scheduler, '_spherical_pacing_enabled',
+                           wraps=tta_scheduler._spherical_pacing_enabled) as enabled:
+        order = drain(scheduler)
+    # due check + ranking + opened-parent check: at most three reads per pick.
+    assert enabled.call_count <= 3 * len(order)

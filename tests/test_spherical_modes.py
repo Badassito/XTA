@@ -15,10 +15,10 @@ import numpy as np
 from XTA import geometry, pta, pta_rendering, pta_workers
 from XTA.lta_config import parse_lta_args
 from XTA.lta_execution import _require_supported_runtime
-from XTA.lta_rendering import build_lta_rendered_view
 from XTA.lta_runtime import build_lta_run_plan
 from XTA.pta_config import parse_pta_args
 from XTA.pta_runtime import build_runtime_options
+from tests.reference_backends.lta_rendering import build_lta_rendered_view
 from tests import test_lta_runtime as lta_test_fixtures
 
 
@@ -184,9 +184,8 @@ class SphericalModeIntegrationTests(unittest.TestCase):
         physical = views[0].shared_view
         runtime = geometry.expand_views_into_tta_variants((physical,), (0.0,))[0]
         volume = np.arange(11 * 13 * 15, dtype=np.uint16).reshape(11, 13, 15).astype(np.uint8)
-        with tempfile.TemporaryDirectory() as temporary:
-            rendered = build_lta_rendered_view(volume, runtime, temp_dir=Path(temporary), output_size=8)
-            rgb = rendered.render_frame_rgb(0)
+        rendered = build_lta_rendered_view(volume, runtime, output_size=8)
+        rgb = rendered.render_frame_rgb(0)
         self.assertIn("spherical_shell", rendered.raster_plan.metadata)
         self.assertEqual(rgb.shape, (8, 8, 3))
         np.testing.assert_array_equal(rgb[:, :, 0], geometry.get_view_frame_by_index(volume, physical, 0))

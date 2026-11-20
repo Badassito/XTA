@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import gc
 import math
-import os
 import threading
 import time
 import weakref
@@ -194,6 +193,38 @@ def _adjacent_xy_offsets_for_3d_connectivity(connectivity: int) -> Tuple[Tuple[i
     if connectivity_i == 26:
         return tuple((dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1))
     raise ValueError('3D connectivity must be one of 6, 18, or 26')
+
+def _cross_slice_dilation_kernel(connectivity: int) -> np.ndarray:
+    """Return the 3x3 uint8 dilation kernel of one 3D connectivity's XY offsets."""
+    kernel = np.zeros((3, 3), dtype=np.uint8)
+    for dy, dx in _adjacent_xy_offsets_for_3d_connectivity(int(connectivity)):
+        kernel[1 + int(dy), 1 + int(dx)] = 1
+    return kernel
+
+# The streaming labeler joins adjacent slices with 26-connectivity; endpoint
+# continuation uses the same cross-slice neighbourhood.
+_LABEL_CROSS_SLICE_KERNEL = _cross_slice_dilation_kernel(26)
+
+def _mask_touches_label_across_slices(
+    mask_crop: np.ndarray,
+    same_window: np.ndarray,
+    oy: int,
+    ox: int,
+) -> bool:
+    """Whether ``mask_crop`` placed at ``(oy, ox)`` touches ``same_window`` across slices.
+
+    ``same_window`` is the adjacent slice's same-object mask; contact uses
+    ``_LABEL_CROSS_SLICE_KERNEL``. Direct overlap is tested first; only a miss pays
+    for one dilation of the placed mask.
+    """
+    h, w = int(mask_crop.shape[0]), int(mask_crop.shape[1])
+    oy_i, ox_i = int(oy), int(ox)
+    if np.any(mask_crop & same_window[oy_i:oy_i + h, ox_i:ox_i + w]):
+        return True
+    placed = np.zeros(same_window.shape, dtype=np.uint8)
+    placed[oy_i:oy_i + h, ox_i:ox_i + w] = mask_crop
+    dilated = cv2.dilate(placed, _LABEL_CROSS_SLICE_KERNEL)
+    return bool(np.any(same_window & (dilated > 0)))
 
 def _slice_connectivity_for_3d_connectivity(connectivity: int) -> int:
     connectivity_i = int(connectivity)
@@ -538,21 +569,18 @@ def _apply_void_fill_slab(mask, labels, lookup):
 def fill_3d_voids_inplace_streaming(
     mask_mm: np.ndarray,
     work_prefix: Path,
-    keep_temp: bool = False,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
     connectivity: int = 6,
     gpu_device_ids: Sequence[int] = (),
 ) -> Dict[str, object]:
-    """Fill enclosed 3D background components with configurable 6, 18, or 26 connectivity.
-    
+    """Fill enclosed 3D background components.
+
+    Callers use the default 6-connected background, the topological dual of the
+    26-connected foreground. 18 and 26 are accepted for explicit callers, but
+    exterior background then leaks through closed diagonal walls.
+
     The label workspace prefers anonymous memory and falls back to a memmap when admission requires it."""
-    env_conn = os.environ.get('YOLO_TTA_VOIDFILL_CONNECTIVITY', '').strip()
-    if env_conn:
-        try:
-            connectivity = int(env_conn)
-        except Exception:
-            pass
     connectivity = int(connectivity)
     if connectivity not in (6, 18, 26):
         raise ValueError('3D void fill connectivity must be one of 6, 18, or 26')
@@ -605,7 +633,7 @@ def fill_3d_voids_inplace_streaming(
                 return gpu_stats
             finally:
                 del bg_gid_store
-                if bg_gid_path is not None and not keep_temp:
+                if bg_gid_path is not None:
                     bg_gid_path.unlink(missing_ok=True)
 
     uf = _UnionFind()
@@ -643,7 +671,7 @@ def fill_3d_voids_inplace_streaming(
             mask_mm[z, enclosed] = np.uint8(1)
 
     del bg_gid_store
-    if bg_gid_path is not None and not keep_temp:
+    if bg_gid_path is not None:
         try:
             bg_gid_path.unlink(missing_ok=True)
         except Exception:
@@ -809,11 +837,10 @@ class SparseSliceLabelStore:
             if item is None:
                 continue
             lo, hi = int(self.offsets[int(z)]), int(self.offsets[int(z) + 1])
-            # v17.0.4: release each source crop as soon as it has been copied.  ``flat`` is
-            # a lazily-faulted anonymous mapping, so destination pages become resident while
-            # the corresponding pending crop is dropped instead of retaining both complete
-            # arenas through the entire pack.  The old implementation held roughly 2P live
-            # bytes at the end of this loop for a packed payload of P bytes.
+            # Release each source crop as soon as it has been copied. ``flat`` is a
+            # lazily-faulted anonymous mapping, so destination pages become resident while
+            # the matching pending crop is dropped; peak live bytes stay near P for a packed
+            # payload of P bytes instead of 2P.
             crop = item[4]
             pending[int(z)] = None
             self.flat[lo:hi] = crop.reshape(-1)
@@ -926,18 +953,12 @@ class SparseSliceLabelStore:
             dense = dense.copy()
         return dense
 
-def interpolation_local_label_uint16_enabled() -> bool:
+def _local_label_store_dtype(compact_relabel: bool) -> np.dtype:
     """Use uint16 for stores that contain only slice-local ids.
 
  Compact relabeling still requires uint32 because canonical/global component ids
- can exceed 65535. Slice-local overflow restarts the complete pass with uint32.
- Set YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16=0 to select uint32 immediately."""
-    return _env_flag('YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16', True)
-
-def _local_label_store_dtype(compact_relabel: bool) -> np.dtype:
-    if not bool(compact_relabel) and interpolation_local_label_uint16_enabled():
-        return np.dtype(np.uint16)
-    return np.dtype(np.uint32)
+ can exceed 65535. Slice-local overflow restarts the complete pass with uint32."""
+    return np.dtype(np.uint32) if bool(compact_relabel) else np.dtype(np.uint16)
 
 class _LocalLabelCapacityError(RuntimeError):
     """Signal local-label dtype exhaustion so the caller can retry with a wider or CPU path."""
@@ -1116,7 +1137,7 @@ def scan_binary_volume_slice_metadata(
         int(z_dim),
         _scan_z,
         max_workers=int(scan_workers),
-        desc='v16.1.7 topology slice-metadata scan',
+        desc='topology slice-metadata scan',
         show_progress=False,
         target_chunks_per_worker=2,
     )
@@ -1127,10 +1148,6 @@ def scan_binary_volume_slice_metadata(
         source=str(source),
         exact=True,
     )
-
-def topology_sparse_cpu_labeling_enabled() -> bool:
-    """Prefer crop-bounded CPU CCL over a dense parent-process CUDA first use."""
-    return _env_flag('YOLO_TTA_TOPOLOGY_SPARSE_CPU_LABELING', True)
 
 def topology_sparse_cpu_max_coverage() -> float:
     """Maximum bbox coverage at which crop-bounded CPU labeling is selected."""
@@ -1458,7 +1475,7 @@ def _try_label_slices_stage_a_gpu(
             print(
                 f'GPU per-slice labeling active on '
                 f'{", ".join(f"cuda:{idx}" for idx in device_indices)} '
-                f'(v16.0.2 slab-aligned D3/D7, block={int(block)}, blocks={len(block_assignments)}, device-pairs={pairs_on_device}; '
+                f'(slab-aligned, block={int(block)}, blocks={len(block_assignments)}, device-pairs={pairs_on_device}; '
                 'YOLO_TTA_GPU_SLICE_LABELING=0 disables, '
                 'YOLO_TTA_GPU_SLICE_LABELING_DEVICES=1 forces one device).'
             )
@@ -2106,7 +2123,6 @@ def _label_foreground_volume_streaming_impl(
     sparse_cpu_threshold = float(topology_sparse_cpu_max_coverage())
     if (
         bool(prefer_crop_bounded_cpu_labeling)
-        and bool(topology_sparse_cpu_labeling_enabled())
         and known_slice_any is not None
         and known_slice_bboxes is not None
     ):
@@ -2121,19 +2137,19 @@ def _label_foreground_volume_streaming_impl(
                 min(int(label_workers), max(1, int(_cpu_count()))), int(z_dim),
             )
             print(
-                'v16.1.7 crop-bounded CPU slice labeling selected: '
+                'Crop-bounded CPU slice labeling selected: '
                 f'nonempty_z={int(support_nonempty)}/{int(z_dim)}, '
                 f'bbox_coverage={100.0 * float(support_bbox_fraction):.2f}% '
                 f'({int(support_bbox_pixels) / GIB:.2f} GiPixels), '
                 f'workers={int(label_workers)}. Parent CUDA/CuPy startup and the '
                 f'{array_nbytes((int(z_dim), int(h), int(w)), np.uint8) / GIB:.2f} GiB '
                 'dense H2D scan are bypassed. '
-                'YOLO_TTA_TOPOLOGY_SPARSE_CPU_LABELING=0 restores GPU labeling.',
+                'YOLO_TTA_TOPOLOGY_SPARSE_CPU_MAX_COVERAGE sets the selection threshold.',
                 flush=True,
             )
         else:
             print(
-                'v16.1.7 crop-bounded CPU slice labeling not selected: '
+                'Crop-bounded CPU slice labeling not selected: '
                 f'bbox_coverage={100.0 * float(support_bbox_fraction):.2f}% exceeds '
                 f'{100.0 * float(sparse_cpu_threshold):.2f}%; retaining the GPU path.',
                 flush=True,
@@ -2255,7 +2271,7 @@ def _label_foreground_volume_streaming_impl(
         'YOLO_TTA_TOPOLOGY_UNION_BATCH_CODES', 1_048_576,
     ))
     print(
-        '3D topology local-union plan (v16.1.3): '
+        '3D topology local-union plan: '
         f'{len(slab_ranges)} slab(s) x {int(topology_slab_slices())} slices, '
         f'{int(slab_worker_count)} concurrent worker(s), '
         'compiled_nogil=True.'
@@ -2494,7 +2510,7 @@ def _label_foreground_volume_streaming_impl(
         'topology_total': float(topology_total_seconds),
     }
     print(
-        'v16.0.2 topology slabs: '
+        'Topology slabs: '
         f'{len(slab_ranges)} slab(s) x {int(topology_slab_slices())} slices, '
         f'{int(slab_worker_count)} concurrent local union worker(s), '
         f'{int(total_components)} slice component(s) -> {int(slab_component_count)} slab component(s); '
@@ -2515,9 +2531,9 @@ def _label_foreground_volume_streaming_impl(
     # per-slice local->compact LUTs live in one concatenated table (slice z's
     # local id v maps through lut_flat[lut_offsets[z] + v]), and the relabel touches only each
     # slice's recorded foreground bbox — labels outside it are guaranteed zero.
-    # the same table is now ALSO exported through component_stats_out
-    # ('slice_local_luts') so callers can consume per-slice local ids directly and skip the
-    # full-volume relabel pass entirely.
+    # The same table is also exported through component_stats_out ('slice_local_luts')
+    # so callers can consume per-slice local ids directly and skip the full-volume
+    # relabel pass.
     lut_started = time.perf_counter()
     lut_sizes = component_counts.astype(np.int64, copy=False) + 1
     lut_offsets = np.zeros((int(z_dim),), dtype=np.int64)
@@ -2600,9 +2616,9 @@ def build_slice_endpoint_seeds_from_label_volume(
 
  This avoids per-object 3D voxel skeletonization on large relabeled volumes, which can become
  prohibitively slow when an object's bounding box spans a large fraction of the volume. Endpoints
- are identified from connected components in each slice that do not continue into the previous or
- next slice of the same relabeled object. When wrap_axis is true, slice 0 and the
- final slice are also considered adjacent for Azimuthal interpolation.
+ are 2D connected components with no pixel of the same 3D object in the 3x3 XY neighbourhood of
+ the previous/next slice, matching the labeler's 26-connectivity. When wrap_axis is true, slice 0
+ and the final slice are also considered adjacent for Azimuthal interpolation.
 
  When a component cache is supplied, the scan reuses cached per-slice component tables and tests
  continuation only inside each component's crop. This makes endpoint discovery and later seed
@@ -2636,6 +2652,7 @@ def build_slice_endpoint_seeds_from_label_volume(
             if (z_i + 1) < z_dim:
                 next_z = int(z_i + 1)
 
+        slice_h = int(table.shape[0])
         slice_w = int(table.shape[1])
 
         def _record_continues_in_neighbor(
@@ -2644,39 +2661,41 @@ def build_slice_endpoint_seeds_from_label_volume(
             *,
             mirrored: bool,
         ) -> bool:
-            """Test exact adjacent-slice footprint overlap in one bbox read.
+            """Test 26-connected continuation into the adjacent slice in one window read.
 
-            The previous implementation compared a component against every same-label
-            component in the adjacent slice.  A tiled label fragmented into K components
-            therefore paid O(K²) Python calls per slice.  Direct overlap has a simpler
-            equivalent definition: at any pixel in this component, the adjacent canonical
-            label equals ``record.label``.  Reading only this component's bbox preserves that
-            definition, including local-label LUTs and azimuthal wrap mirroring, without building
-            or scanning the neighbor's component list.
+            Continuation uses the labeler's 3x3 cross-slice adjacency: some pixel of this
+            component has a pixel of ``record.label`` in its 3x3 XY neighbourhood on the
+            adjacent slice. One read of the bbox grown by one pixel answers it, through
+            local-label LUTs and azimuthal wrap mirroring, without building or scanning
+            the neighbour's component list.
             """
             if neighbor_z is None:
                 return False
             y0, x0, y1, x1 = (int(v) for v in record.bbox)
-            read_x0, read_x1 = int(x0), int(x1)
+            wy0, wy1 = max(0, y0 - 1), min(slice_h, y1 + 1)
+            wx0, wx1 = max(0, x0 - 1), min(slice_w, x1 + 1)
+            read_x0, read_x1 = int(wx0), int(wx1)
             if bool(mirrored):
-                read_x0, read_x1 = int(slice_w - x1), int(slice_w - x0)
+                read_x0, read_x1 = int(slice_w - wx1), int(slice_w - wx0)
 
             labels_store = component_cache.labels_real
             if isinstance(labels_store, SparseSliceLabelStore):
                 neighbor = labels_store.read_window(
-                    int(neighbor_z), int(y0), int(y1), int(read_x0), int(read_x1),
+                    int(neighbor_z), int(wy0), int(wy1), int(read_x0), int(read_x1),
                 )
             else:
                 neighbor = np.asarray(
                     labels_store[
-                        int(neighbor_z), int(y0):int(y1), int(read_x0):int(read_x1)
+                        int(neighbor_z), int(wy0):int(wy1), int(read_x0):int(read_x1)
                     ]
                 )
             if bool(mirrored):
                 neighbor = neighbor[:, ::-1]
             if component_cache.slice_luts is not None:
                 neighbor = component_cache.slice_luts.lut_for(int(neighbor_z))[neighbor]
-            return bool(np.any(record.mask_crop & (neighbor == int(record.label))))
+            return _mask_touches_label_across_slices(
+                record.mask_crop, neighbor == int(record.label), y0 - wy0, x0 - wx0,
+            )
 
         seeds_local: List[SliceEndpointSeed] = []
         for record in table.components:
@@ -2760,10 +2779,16 @@ def build_slice_endpoint_seeds_from_label_volume(
                     * (int(xs.max()) - int(xs.min()) + 1),
                 )
 
-                # endpoint continuation is defined by direct footprint overlap in
-                # the adjacent slice; do not dilate/skeletonize the component for endpoint discovery.
-                has_prev = bool(prev_same is not None and np.any(comp & prev_same))
-                has_next = bool(next_same is not None and np.any(comp & next_same))
+                # Continuation uses the labeler's 26-connected cross-slice adjacency
+                # (see _LABEL_CROSS_SLICE_KERNEL).
+                has_prev = bool(
+                    prev_same is not None
+                    and _mask_touches_label_across_slices(comp, prev_same, 0, 0)
+                )
+                has_next = bool(
+                    next_same is not None
+                    and _mask_touches_label_across_slices(comp, next_same, 0, 0)
+                )
 
                 if not has_prev:
                     seeds_local.append(SliceEndpointSeed(

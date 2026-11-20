@@ -11,9 +11,12 @@ crop that parent and do not recenter it.
 python -m XTA --mode pta --input DATASET --enable_cpr --imgsz 2048 --save images labels
 ```
 
-CPR runs after native-mask preprocessing and cubic resizing. The centerline is
-resampled at approximately one processing voxel along the curve, and the parent
-plane samples one processing voxel per pixel in both directions. For CPR,
+CPR runs after native-mask preprocessing and cubic resizing. The refined
+centerline seeds form a polyline that is smoothed with a Gaussian of half the
+median seed spacing (endpoints fixed) and resampled at approximately one
+processing voxel of smoothed arc length, so planes turn gradually instead of at
+seed vertices; seeds already at most one voxel apart are used unsmoothed. The
+parent plane samples one processing voxel per pixel in both directions. For CPR,
 `--imgsz 2048` directly samples a 2048-by-2048 patch centered on the centerline;
 there is no oversized full-volume parent to downsample. Samples outside the
 processing volume are zero. The patch is allowed to omit distant parts of the
@@ -32,6 +35,9 @@ Coarse centerline seeds are refined against bounded perpendicular planes from
 the original processing mask so block pooling does not shift a thin tube away
 from the parent image center. Temporary geometry planes fill enclosed holes for
 centering; the original mask and rendered categorical holes are preserved.
+Branch ends are trimmed to the first and last seeds whose perpendicular plane
+meets foreground, seeds closer than one voxel are merged, and seeds that would
+turn the centerline by more than 90 degrees are dropped.
 One plane is rendered at a time, without allocating a dense straightened volume.
 
 Centerline extraction remains a CPU preparation step after requested 3D void

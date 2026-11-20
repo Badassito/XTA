@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import operator
-from typing import Iterable
 
 from .lta_sam import LTA_SESSION_FRAMES
 
@@ -138,51 +137,6 @@ class WindowPlan:
         return self.frame_stop - self.frame_start
 
 
-def plan_anchor_domains(
-    anchor_frames: Iterable[int],
-    *,
-    frame_start: int,
-    frame_stop: int,
-) -> tuple[AnchorDomain, ...]:
-    """Partition a selected interval into deterministic nearest-anchor domains."""
-
-    start = _integer(frame_start, name="frame_start")
-    stop = _integer(frame_stop, name="frame_stop")
-    if start < 0 or stop <= start:
-        raise ValueError("frame range must be nonempty and non-negative")
-
-    frames_list: list[int] = []
-    for raw in anchor_frames:
-        frames_list.append(_integer(raw, name="anchor_frame"))
-    frames = tuple(sorted(set(frames_list)))
-    if not frames:
-        return ()
-    if frames[0] < start or frames[-1] >= stop:
-        raise ValueError("all anchors must lie inside the selected frame range")
-
-    domains = tuple(
-        AnchorDomain(
-            anchor_frame=anchor,
-            frame_start=(
-                start
-                if index == 0
-                else (frames[index - 1] + anchor) // 2 + 1
-            ),
-            frame_stop=(
-                stop
-                if index + 1 == len(frames)
-                else (anchor + frames[index + 1]) // 2 + 1
-            ),
-        )
-        for index, anchor in enumerate(frames)
-    )
-    if domains[0].frame_start != start or domains[-1].frame_stop != stop:
-        raise RuntimeError("nearest-anchor domains did not cover the selected range")
-    if any(left.frame_stop != right.frame_start for left, right in zip(domains, domains[1:])):
-        raise RuntimeError("nearest-anchor domains contain a gap or overlap")
-    return domains
-
-
 def owned_frame_range(window: WindowPlan) -> tuple[int, int]:
     """Return the half-open output range after removing dogfood context."""
 
@@ -287,82 +241,9 @@ def plan_domain_windows(domain: AnchorDomain) -> tuple[WindowPlan, ...]:
     return windows
 
 
-def plan_directional_windows(
-    *,
-    frame_start: int,
-    frame_stop: int,
-    prompt_frame: int,
-    direction: str,
-) -> tuple[WindowPlan, ...]:
-    """Plan a relay-seeded directional chain to one selected-range edge."""
-
-    start = _integer(frame_start, name="frame_start")
-    stop = _integer(frame_stop, name="frame_stop")
-    prompt = _integer(prompt_frame, name="prompt_frame")
-    resolved_direction = str(direction).strip().lower()
-    if start < 0 or stop <= start or not start <= prompt < stop:
-        raise ValueError("relay prompt and range are inconsistent")
-    if resolved_direction not in {"forward", "backward"}:
-        raise ValueError("relay direction must be forward or backward")
-
-    windows: list[WindowPlan] = []
-    if resolved_direction == "forward":
-        boundary = prompt
-        ordinal = 0
-        while True:
-            window_stop = min(stop, boundary + LTA_SESSION_FRAMES)
-            windows.append(
-                WindowPlan(
-                    branch="forward",
-                    ordinal=ordinal,
-                    frame_start=boundary,
-                    frame_stop=window_stop,
-                    prompt_frame=boundary,
-                    direction="forward",
-                    seed_kind="spatial_relay" if ordinal == 0 else "dogfood",
-                )
-            )
-            if window_stop >= stop:
-                break
-            boundary = window_stop - 1
-            ordinal += 1
-    else:
-        boundary = prompt
-        ordinal = 0
-        while True:
-            window_start = max(start, boundary - (LTA_SESSION_FRAMES - 1))
-            windows.append(
-                WindowPlan(
-                    branch="backward",
-                    ordinal=ordinal,
-                    frame_start=window_start,
-                    frame_stop=boundary + 1,
-                    prompt_frame=boundary,
-                    direction="backward",
-                    seed_kind="spatial_relay" if ordinal == 0 else "dogfood",
-                )
-            )
-            if window_start <= start:
-                break
-            boundary = window_start
-            ordinal += 1
-
-    owned = [frame for window in windows for frame in range(*owned_frame_range(window))]
-    expected = (
-        list(range(prompt, stop))
-        if resolved_direction == "forward"
-        else list(range(start, prompt + 1))
-    )
-    if sorted(owned) != expected or len(owned) != len(set(owned)):
-        raise RuntimeError("directional relay windows do not own their range exactly once")
-    return tuple(windows)
-
-
 __all__ = (
     "AnchorDomain",
     "WindowPlan",
     "owned_frame_range",
-    "plan_anchor_domains",
     "plan_domain_windows",
-    "plan_directional_windows",
 )

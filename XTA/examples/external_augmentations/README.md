@@ -22,6 +22,11 @@ python -m XTA --mode pta --input INPUT_DIRECTORY --output OUTPUT_DIRECTORY --aug
 python -m XTA --mode tta --input INPUT_VIDEO --model gpu:MODEL.engine --augmentation gpu:XTA/examples/external_augmentations/GPU_baseline.py --augmentation_ratio 4
 ```
 
+TTA also accepts `--augmentation_coverage packed` to write bit-packed
+inverse-validity sidecars under `OUTPUT/augmentation_support/`; by default only
+the policy snapshots and recipes are kept there, plus `parent_memory_plan.json`
+when full-frame policy parents use bounded admission.
+
 ## Sweep profiles
 
 `CPU_sweep.py` and `GPU_sweep.py` choose a strength independently for each
@@ -76,6 +81,19 @@ smoothing and resizing. Smoothing sigma is 8% of the shorter dimension. The
 coarse noise grid has a shorter edge of at most 128 pixels, and the final RMS
 scales with the shorter image dimension. Single-row/column inputs have zero
 elastic displacement.
+
+The displacement is added in the augmented raster before the affine pull,
+x = A⁻¹(y + d(y)), so the RMS values above are in output pixels and zoom or
+shear cannot amplify elastic strain into folds. About 0.1% of superheavy fields
+still fold on their own; TTA marks those pixels unknown. The policies declare
+this equation as `tta_replay_contract = "opencv-affine-elastic-v2"` (CPU) and
+`"torch-affine-elastic-v2"` (GPU). Copies of older policies that declare
+`opencv-affine-elastic-v1`, or older GPU policies without the attribute, still
+replay with their original equation x = A⁻¹y + d(y).
+
+PTA augmentation seeds and tags and TTA policy seeds hash the policy file's
+bytes, so any byte edit to a policy file redraws every augmented copy, not only
+the draws whose math changed.
 
 ## Bit-depth frequencies and mapping
 
@@ -134,6 +152,16 @@ TorchInductor fusion enabled and explicitly disables CUDA graph capture so that
 augmentation can overlap PTA rendering and JPEG publication on other streams.
 Custom policies used with asynchronous PTA must also avoid CUDA stream capture;
 publication can synchronize or download tensors while the next policy call runs.
+
+For forced partial semantic labels, PTA warps annotation coverage with the
+foreground mask. A GPU policy that declares `supports_extra_masks = True`
+accepts `apply_batch_many(..., extra_masks=None)`: one mask per source mask,
+with the shape and device of `masks`. It warps them with the same sampled
+geometry and returns them as a third `(N, H, W)` uint8 tensor only when given,
+so PTA makes one policy call per batch. A policy without it must declare
+`mask_independent_geometry = True`, and PTA replays the call for coverage. The
+bundled GPU policies declare both.
+
 Numerical tests run on CPU; actual CUDA policy execution is enabled with:
 
 ```text

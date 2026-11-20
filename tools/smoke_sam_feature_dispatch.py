@@ -115,7 +115,7 @@ def prepare(args):
             expected_frames=list(run.expected_frames), context_bbox_yx=list(group.context_bbox_yx),
             seed_pixels_sha256=pixel_hash(baseline[seed_frame, y0:y1, x0:x1]))
     if sorted(len(row['expected_frames']) for row in bindings.values()) != [31, 32]:
-        raise AssertionError('Complete original-seeded sessions must be precisely31 and32 frames')
+        raise AssertionError('Complete original-seeded sessions must be precisely 31 and 32 frames')
     model = resolve_local_sam_bundle(args.model)
     images_bytes = sum((box[2]-box[0])*(box[3]-box[1]) for box in prepared.frame_crop_bounds.values())
     protocol = dict(schema='xta.sam_feature_dispatch_functional_smoke/1', functional_smoke=True,
@@ -131,8 +131,8 @@ def prepare(args):
         cases_metadata_path=str(cases_path), cases_metadata_sha256=shared.sha(cases_path),
         baseline_path=str(baseline_path.resolve()), baseline_sha256=shared.sha(baseline_path),
         canonical_transform=transform,
-        baseline_recipe='Historical selected original post-interpolation masksf4..18 embedded native, '
-            'then existing canonical categorical nearest/threshold render to2048²; seedsf18/f17 frozen independently',
+        baseline_recipe='Historical selected original post-interpolation masks f4..18 embedded native, '
+            'then existing canonical categorical nearest/threshold render to 2048²; seeds f18/f17 frozen independently',
         scope='feature-dispatch/fixed-original-baseline', terminal_frame=18, direction=1,
         distance=30, walk_back=1, min_radius=3., adaptive_crop=False, crop_mode='whole',
         exact_original_run_bindings=bindings, image_cache_cap_bytes=images_bytes + 1,

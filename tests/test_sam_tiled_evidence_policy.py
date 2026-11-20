@@ -100,7 +100,7 @@ def test_attempted_tile_suffix_missing_is_not_successful_empty_evidence(tmp_path
 
 def test_tiled_version2_policy_is_rejected_and_replay_uses_saved_mode(tmp_path,monkeypatch):
     bundle,_=tiled_bundle(tmp_path)
-    monkeypatch.setenv("XTA_SAM_INTERPOLATION_CROP_MODE","whole")
+    monkeypatch.setenv("YOLO_TTA_SAM_CROP_MODE","whole")
     assert select_sam_proposals(bundle)["resolved_policy"]["version"]==5
     with pytest.raises(ValueError,match="incompatible"):
         select_sam_proposals(bundle,{"sam_bridge_policy":{"version":2}})

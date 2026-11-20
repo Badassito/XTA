@@ -12,15 +12,15 @@ from XTA.geometry import (
 
 
 @pytest.mark.parametrize('angle', [0., 30., -15.5])
-def test_policy_tile_plan_uses_explicit_angle_and_preserves_output_identity(angle, tmp_path):
+def test_policy_tile_plan_uses_explicit_angle_and_preserves_output_identity(angle):
     physical = _build_cartesian_view('transverse', 4, 64, 64)
     variants = expand_views_into_policy_variants(
         expand_views_into_tta_variants([physical], [angle]), 3)
     reference_tiles = None
     plan_ids = set()
     for view in variants:
-        job = build_aug_job_for_variant(view, 128, tmp_path)
-        tiles = build_dense_tile_jobs_for_aug(view, job, TileConfig(32, 32, 'cfg1'), 128, tmp_path)
+        job = build_aug_job_for_variant(view, 128)
+        tiles = build_dense_tile_jobs_for_aug(view, job, TileConfig(32, 32, 'cfg1'), 128)
         assert tiles
         if reference_tiles is None:
             reference_tiles = tiles

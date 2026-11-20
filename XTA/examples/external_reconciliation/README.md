@@ -293,6 +293,7 @@ Confidence publication identifies native retention or source projection in the
 log. Long block writes and the final pending-evidence drain report progress every
 30 seconds, so remaining confidence work is visible after mask inference ends.
 
-The first integration is TTA. The supplied Slicer startup script is unchanged;
-its existing surgical-edit operations remain available while this policy
-interface is validated for later frontend integration.
+The first integration is TTA. The Slicer startup script
+(`tools/slicer/xta_slicerrc.py`) does not apply reconciliation policies; its
+surgical-edit operations work independently while this policy interface is
+validated for later frontend integration.

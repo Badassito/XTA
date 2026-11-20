@@ -260,6 +260,10 @@ class RunContextManifestTests(unittest.TestCase):
             ]
         )
         self.assertEqual(
+            payload["forward_sampling"]["pta_forward_backends_qualified"],
+            ["cpu", "cuda"],
+        )
+        self.assertEqual(
             decoded["forward_sampling"]["image_capture"],
             "canonical_render_batch_tee",
         )

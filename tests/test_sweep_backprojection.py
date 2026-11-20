@@ -129,8 +129,7 @@ def test_undefined_or_failed_view_never_publishes_partial_paths(tmp_path):
     assert list((tmp_path/"group").iterdir()) == []
 
 
-def test_reduced_cartesian_ref_retains_original_terminal_source_restore(tmp_path,monkeypatch):
-    monkeypatch.setenv("YOLO_TTA_DELAYED_NATIVE_EXPANSION","1")
+def test_reduced_cartesian_ref_retains_original_terminal_source_restore(tmp_path):
     v = geometry.ViewInfo("sagittal",7,5,9,"clamp",full_t=5,full_h=7,full_w=9)
     shape = (7,3,4)
     target = (5,7,9)
@@ -163,7 +162,7 @@ def test_d1_empty_slot_uses_original_source_grid_without_projection(tmp_path, na
 
 @pytest.mark.parametrize("name", ("transverse","sagittal","coronal"))
 def test_nonempty_d1_source_grid_equals_independent_d1_reference(tmp_path, name):
-    from XTA.d1_orthogonal_coverage import execute_orthogonal_coverage_reference
+    from tests.reference_backends.d1_orthogonal_coverage import execute_orthogonal_coverage_reference
     target = (5,7,9)
     depth = {"transverse":11,"sagittal":7,"coronal":9}[name]
     # Includes a temporal contraction (sagittal and coronal rows are time),

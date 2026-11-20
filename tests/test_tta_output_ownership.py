@@ -7,7 +7,6 @@ from unittest import mock
 from XTA import pipeline
 from XTA.tta_outputs import (
     TtaOutputArtifacts,
-    TtaOutputInputs,
     TtaOutputOperations,
 )
 
@@ -36,15 +35,10 @@ def _operations(events: list[str], *, fail_on_close: int = 0) -> TtaOutputOperat
 
     return TtaOutputOperations(
         close_memmap_array=close,
-        close_raw_store_or_memmap_volume=lambda value, *, keep_temp: events.append(
-            f"raw:{_name(value)}:{bool(keep_temp)}"
+        close_raw_store_or_memmap_volume=lambda value: events.append(f"raw:{_name(value)}"),
+        retire_temporary_binary_volume_storage=lambda value: events.append(
+            f"retire:{_name(value)}"
         ),
-        archive_or_delete_binary_volume_storage=(
-            lambda value, *, keep_temp, workers, desc: events.append(
-                f"archive:{_name(value)}:{bool(keep_temp)}:{int(workers)}:{desc}"
-            )
-        ),
-        unload_yolo_model=lambda value: events.append(f"unload:{_name(value)}"),
         trim_cuda_memory=lambda: events.append("trim"),
         collect_garbage=lambda: events.append("gc"),
     )
@@ -79,7 +73,6 @@ def _artifacts(*, same_mask: bool = False, same_source: bool = False) -> TtaOutp
         baseline_confmap_by_model_view={
             ("model", "view"): _Artifact("baseline_conf")
         },
-        yolo_models=(("empty", None), ("model", _Artifact("yolo"))),
         volume_rgb=input_volume if same_source else _Artifact("processing"),
         input_volume_rgb=input_volume,
     )
@@ -89,13 +82,7 @@ class TtaOutputOwnershipTests(unittest.TestCase):
     def test_owner_preserves_exact_teardown_order_and_clear_semantics(self) -> None:
         events: list[str] = []
         artifacts = _artifacts()
-        result = artifacts.close(
-            inputs=TtaOutputInputs(
-                keep_temp_artifacts=False,
-                tile_slice_workers=7,
-            ),
-            operations=_operations(events),
-        )
+        result = artifacts.close(operations=_operations(events))
 
         self.assertEqual(events, [
             "close:final_mask",
@@ -104,14 +91,13 @@ class TtaOutputOwnershipTests(unittest.TestCase):
             "close:azimuthal",
             "close:tilted",
             "close:view",
-            "raw:parent_mask:False",
-            "raw:parent_bridge:False",
-            "archive:tile_union:False:7:remaining consolidated tile accumulator",
-            "archive:tile_mask:False:7:remaining parent-mask tile category accumulator",
-            "archive:tile_bridge:False:7:remaining parent-bridge tile category accumulator",
+            "raw:parent_mask",
+            "raw:parent_bridge",
+            "retire:tile_union",
+            "retire:tile_mask",
+            "retire:tile_bridge",
             "close:baseline_union",
             "close:baseline_conf",
-            "unload:yolo",
             "close:processing",
             "close:input",
             "trim",
@@ -120,7 +106,6 @@ class TtaOutputOwnershipTests(unittest.TestCase):
         self.assertTrue(artifacts.closed)
         self.assertEqual(result.close_memmap_calls, 10)
         self.assertEqual(result.retired_tile_accumulators, 3)
-        self.assertEqual(result.unloaded_models, 1)
         self.assertTrue(result.processing_volume_was_distinct)
         self.assertEqual(artifacts.native_view_support_by_model, {"model": {}})
         self.assertEqual(artifacts.azimuthal_native_output_by_model, {"model": {}})
@@ -141,10 +126,7 @@ class TtaOutputOwnershipTests(unittest.TestCase):
     def test_identical_final_and_source_arrays_close_once_per_owned_handle(self) -> None:
         events: list[str] = []
         artifacts = _artifacts(same_mask=True, same_source=True)
-        result = artifacts.close(
-            inputs=TtaOutputInputs(True, 1),
-            operations=_operations(events),
-        )
+        result = artifacts.close(operations=_operations(events))
 
         self.assertEqual(events.count("close:final_union"), 1)
         self.assertEqual(events.count("close:input"), 1)
@@ -156,18 +138,12 @@ class TtaOutputOwnershipTests(unittest.TestCase):
         events: list[str] = []
         artifacts = _artifacts()
         with self.assertRaisesRegex(RuntimeError, "injected close failure"):
-            artifacts.close(
-                inputs=TtaOutputInputs(False, 1),
-                operations=_operations(events, fail_on_close=2),
-            )
+            artifacts.close(operations=_operations(events, fail_on_close=2))
 
         self.assertEqual(events, ["close:final_mask", "close:final_union"])
         self.assertFalse(artifacts.closed)
         with self.assertRaisesRegex(RuntimeError, "already entered teardown"):
-            artifacts.close(
-                inputs=TtaOutputInputs(False, 1),
-                operations=_operations(events),
-            )
+            artifacts.close(operations=_operations(events))
         self.assertEqual(events, ["close:final_mask", "close:final_union"])
 
     def test_pipeline_facade_injects_current_operations_then_finalizes(self) -> None:
@@ -177,24 +153,20 @@ class TtaOutputOwnershipTests(unittest.TestCase):
             mock.patch.object(pipeline, "close_memmap_array") as close,
             mock.patch.object(pipeline, "close_raw_store_or_memmap_volume") as close_raw,
             mock.patch.object(
-                pipeline, "archive_or_delete_binary_volume_storage"
-            ) as archive,
-            mock.patch.object(pipeline, "unload_yolo_model") as unload,
+                pipeline, "retire_temporary_binary_volume_storage"
+            ) as retire,
             mock.patch.object(pipeline, "trim_cuda_memory") as trim,
             mock.patch.object(pipeline.gc, "collect") as collect,
         ):
             result = pipeline._close_tta_output_artifacts(
                 artifacts,
-                keep_temp_artifacts=False,
-                tile_slice_workers=3,
                 after_close=after_close,
             )
 
         self.assertTrue(result.close_memmap_calls > 0)
         self.assertTrue(close.called)
         self.assertTrue(close_raw.called)
-        self.assertTrue(archive.called)
-        unload.assert_called_once()
+        self.assertTrue(retire.called)
         trim.assert_called_once()
         collect.assert_called_once()
         after_close.assert_called_once_with()
@@ -210,8 +182,6 @@ class TtaOutputOwnershipTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "locked output artifact"):
                 pipeline._close_tta_output_artifacts(
                     artifacts,
-                    keep_temp_artifacts=False,
-                    tile_slice_workers=1,
                     after_close=publish_complete,
                 )
 

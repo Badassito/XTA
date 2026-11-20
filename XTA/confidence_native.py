@@ -319,8 +319,7 @@ def source_reader(reference,workspace=None,*,memory_mib=512,max_staging_mib=3276
     if not isinstance(view_record,dict):
         raise ValueError('Native confidence lacks its full view geometry')
     from .geometry import ViewInfo
-    from .confidence_projection import (score_projection_reader, score_projection_workspace,
-                                       score_projection_staging_shape)
+    from .confidence_projection import score_projection_reader, score_projection_workspace
     from .runtime import (close_memmap_array_without_flush,
                           defer_retired_memmap_directory_cleanup,
                           wait_for_retired_memmap_unlinks)
@@ -348,9 +347,7 @@ def source_reader(reference,workspace=None,*,memory_mib=512,max_staging_mib=3276
     if decode_bytes>memory_bytes:
         raise MemoryError(f'Native confidence decoding needs up to {decode_bytes} '
                           f'workspace bytes; limit is {memory_bytes}')
-    staging_shape=score_projection_staging_shape(native,view,source)
-    extra=math.prod(staging_shape) if staging_shape is not None else 0
-    need=math.prod(native)+extra
+    need=math.prod(native)
     if need>disk_bytes:
         raise MemoryError(f'Native confidence conversion needs up to {need} staging bytes; limit is {disk_bytes}')
     work=Path(workspace).resolve()
@@ -360,7 +357,6 @@ def source_reader(reference,workspace=None,*,memory_mib=512,max_staging_mib=3276
     temporary_context=tempfile.TemporaryDirectory(prefix='confidence-source-',dir=work)
     directory=Path(temporary_context.name).resolve()
     path=directory/'native.u8.dat'
-    projection_path=directory/'projection'/'confidence_projection.u8.dat'
     values=read_slice=projected=target=crop=reader=None
     try:
         if not directory.is_relative_to(work):
@@ -392,8 +388,6 @@ def source_reader(reference,workspace=None,*,memory_mib=512,max_staging_mib=3276
         values=None
         cleanup_error=None
         try:
-            wait_for_retired_memmap_unlinks(path=projection_path,
-                                             timeout_s=.2 if active_error is not None else 5)
             wait_for_retired_memmap_unlinks(path=path,
                                              timeout_s=.2 if active_error is not None else 5)
         except TimeoutError as exc:

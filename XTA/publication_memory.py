@@ -68,7 +68,7 @@ def policy_cpu_worker_buffer_plan(*, worker_count, cache_mib, batch_size, out_si
 
 def native_fullframe_dense_reserve(tasks, *, total_dense_limit, min_conf=0.,
                                    dense_tiling=False, nrrd_layers=False,
-                                   bounded_retirement=True, retain_confidence=False):
+                                   retain_confidence=False):
     """Charge admitted native parents separately from packed D1 publication grants.
 
     Policy groups share the retirement window only when every parent is
@@ -86,7 +86,7 @@ def native_fullframe_dense_reserve(tasks, *, total_dense_limit, min_conf=0.,
         siblings = grouped_task.get('augmentation_pass_tasks') or ()
         has_policy_groups = has_policy_groups or bool(siblings)
         members = (grouped_task, *siblings)
-        if bounded_retirement and any(task.get('bounded_parent_admission', False) for task in members):
+        if any(task.get('bounded_parent_admission', False) for task in members):
             if not all(task.get('bounded_parent_admission', False)
                        and task.get('kind') == 'fullframe' for task in members):
                 raise ValueError('Native policy memory plan requires admission for every sibling parent')
@@ -101,7 +101,7 @@ def native_fullframe_dense_reserve(tasks, *, total_dense_limit, min_conf=0.,
             shape = tuple(int(v) for v in task['processing_shape'])
             if len(shape) != 3 or min(shape) <= 0:
                 raise ValueError('Native parent memory plan requires a positive 3D processing shape')
-            bounded_policy = bool(mode in ('file', 'direct_union') and bounded_retirement
+            bounded_policy = bool(mode in ('file', 'direct_union')
                                   and task.get('bounded_parent_admission', False))
             entry = (mode, math.prod(shape) * count, bounded_policy)
             if bounded_policy and key in group:
@@ -131,8 +131,8 @@ def native_fullframe_dense_reserve(tasks, *, total_dense_limit, min_conf=0.,
     unbounded = sum(size for mode, size, bounded in parents.values() if mode == 'file' and not bounded)
     if unbounded > int(total_dense_limit) and len(parents) > 1:
         advice = (
-            'External-policy passes require bounded parent retirement to share a memory window. '
-            'Run without retained temporary artifacts, reduce --augmentation_ratio or selected '
+            'External-policy passes require bounded parent retirement to share a memory window; '
+            'reduce --augmentation_ratio or selected '
             'views/angles, or increase YOLO_TTA_DIRECT_UNION_TOTAL_GIB only with sufficient '
             'real memory headroom. '
             if has_policy_groups else
@@ -148,8 +148,6 @@ def native_fullframe_dense_reserve(tasks, *, total_dense_limit, min_conf=0.,
     oversized_shared = max((size for mode, size, bounded in parents.values()
                             if mode != 'file' and not bounded), default=0)
     admitted = min(sum(shared), max(int(total_dense_limit), oversized_shared))
-    if not bounded_retirement:
-        admitted = sum(shared)
     return int(unbounded + admitted)
 
 
@@ -300,7 +298,7 @@ def publication_output_reserve(sink, window_bytes, member_bytes):
 
 
 def terminal_parent_output_specs(tasks, *, temp_dir, source_shape, retire_dense,
-        component_layers, tiled, keep_temp, interpolate, interpolation_passes, extrapolate):
+        component_layers, tiled, interpolate, interpolation_passes, extrapolate):
     """Describe only terminal parents that execute the packed native route."""
     from .assembly import _terminal_packed_layer_destination
     from .packed_tilted_projection import terminal_native_source_packing_eligible
@@ -320,7 +318,7 @@ def terminal_parent_output_specs(tasks, *, temp_dir, source_shape, retire_dense,
             view = member['view']
             if not terminal_native_source_packing_eligible(view, native_bytes=math.prod(shape),
                     retire_dense=retire_dense, component_layers=component_layers, tiled=tiled,
-                    keep_temp=keep_temp, prepublished=False, interpolate=interpolate,
+                    prepublished=False, interpolate=interpolate,
                     interpolation_passes=interpolation_passes, extrapolate=extrapolate):
                 continue
             key = (str(member['model_name']), str(view.name))
@@ -333,11 +331,11 @@ def terminal_parent_output_specs(tasks, *, temp_dir, source_shape, retire_dense,
     return list(by_key.values())
 
 
-def plan_native_publication_memory(tasks, *, keep_temp, worker_count, publication_pending, unpack_bytes,
+def plan_native_publication_memory(tasks, *, worker_count, publication_pending, unpack_bytes,
                                    output_reserve_bytes=0, native_dense_reserve_bytes=0, worker_buffer_reserve_bytes=0,
                                    projected_parent_outputs=()):
     """Create parent-owned empty memfds; immutable task grants bound their growth."""
-    if (keep_temp or not memfd_workspace_enabled() or scratch_dir_is_memory_backed()
+    if (not memfd_workspace_enabled() or scratch_dir_is_memory_backed()
             or not _env_flag('YOLO_TTA_PUBLICATION_RAM', True)
             or not _env_flag('YOLO_TTA_PACKED_OWNER_PUBLICATION', True)):
         return None

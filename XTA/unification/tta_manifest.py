@@ -417,6 +417,25 @@ def _channel_record(channel_format: Any) -> dict[str, Any]:
     }
 
 
+def _pta_forward_backends_qualified() -> list[str]:
+    """Backends the shared forward-sampling policy registers for every PTA data role."""
+
+    from .contracts import DataRole
+    from .sampling import forward_sampling_policy
+
+    policy = forward_sampling_policy()
+    roles = (DataRole.INTENSITY, DataRole.CATEGORICAL_GROUND_TRUTH)
+    names = dict.fromkeys(item.backend for item in policy.backend_implementations)
+    return [
+        name for name in names
+        if all(
+            any(item.backend == name and role in item.roles
+                for item in policy.backend_implementations)
+            for role in roles
+        )
+    ]
+
+
 def build_tta_run_manifest(
     *,
     launch_context: UnifiedLaunchContext,
@@ -592,7 +611,7 @@ def build_tta_run_manifest(
         "forward_sampling": {
             "policy_contract": "ForwardSamplingPolicy",
             "same_backend_builtin_geometry_shared_with_pta": True,
-            "pta_forward_backends_qualified": ["cpu"],
+            "pta_forward_backends_qualified": _pta_forward_backends_qualified(),
             "prediction_interpolation_is_separate": True,
             **dict(forward_sampling),
         },

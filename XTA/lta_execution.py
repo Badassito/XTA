@@ -354,11 +354,6 @@ def _windows_payload(windows: Sequence[object]) -> list[dict[str, object]]:
 def _require_supported_runtime(plan: LtaRunPlan) -> tuple[object, object, LtaRuntimeViewPlan]:
     if plan.bundle.model_version != "sam3.1":
         raise ValueError("production mask-injected LTA requires SAM 3.1")
-    if plan.sam_execution != "video":
-        raise ValueError(
-            "production LTA uses authoritative mask-injected video propagation; "
-            "--sam_execution image is not supported"
-        )
     if len(plan.discovery.target_volumes) != 1 or len(plan.volumes) != 1:
         raise ValueError("production LTA currently requires exactly one target volume")
     source = plan.discovery.target_volumes[0]

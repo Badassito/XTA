@@ -59,7 +59,7 @@ def test_promotion_does_not_open_inference_or_auxiliary_dispatch(admission):
 @pytest.mark.parametrize('purpose', [
     'Spherical source projection scope',
     'Radial source projection scope',
-    'Tilted Azimuthal source projection scope',
+    'Native source projection scope',
 ])
 def test_idle_borrowing_retains_resident_aux_exclusion(admission, purpose):
     coordinator, pool, _torch = admission

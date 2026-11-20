@@ -70,28 +70,27 @@ def score_projection_workspace(native_shape, view, output_shape, memory_bytes):
 
 def _bounded_restore_slice(source, shape, z, chunk):
     """Categorical source restoration without a horizontal plane or axis cache."""
-    from .media import _linear_source_index
+    from .outputs import _restore_source_indices_for_output_z
     result = np.zeros(shape[1:], np.uint8)
     flat = result.reshape(-1)
     ih, iw = source.shape[1:]
     oh, ow = shape[1:]
     area = ih >= oh and iw >= ow
-    # Consume the Z footprint a single index at a time. The legacy helper's
-    # upsampling nearest rule is retained; a shrinking footprint is a range.
-    if source.shape[0] >= shape[0]:
-        first = max(0, min(source.shape[0]-1, math.floor(float(z) * float(source.shape[0]) / float(shape[0]))))
-        stop = min(source.shape[0], max(first+1, math.ceil(float(z+1) * float(source.shape[0]) / float(shape[0]))))
-        indices = range(first, stop)
-    else:
-        nearest = int(round(_linear_source_index(z, shape[0], source.shape[0])))
-        indices = (max(0, min(source.shape[0]-1, nearest)),)
+    # Consume the Z footprint a single index at a time with the shared restore
+    # map: center-aligned nearest when growing, a footprint range when shrinking.
+    indices = _restore_source_indices_for_output_z(int(source.shape[0]), int(shape[0]), int(z))
     for first in range(0, flat.size, chunk):
         stop = min(flat.size, first + chunk)
         positions = np.arange(first, stop, dtype=np.int64)
         yy, xx = positions // ow, positions % ow
-        ys, xs = yy * ih // oh, xx * iw // ow
-        ye = ((yy+1) * ih + oh-1) // oh if area else ys+1
-        xe = ((xx+1) * iw + ow-1) // ow if area else xs+1
+        if area:
+            ys, xs = yy * ih // oh, xx * iw // ow
+            ye, xe = ((yy+1) * ih + oh-1) // oh, ((xx+1) * iw + ow-1) // ow
+        else:
+            # media._center_aligned_nearest_source_indices, evaluated per chunk so
+            # no output-sized axis table is allocated.
+            ys, xs = (2*yy+1) * ih // (2*oh), (2*xx+1) * iw // (2*ow)
+            ye, xe = ys+1, xs+1
         target = flat[first:stop]
         for index in indices:
             for dy in range(int(np.max(ye-ys))):
@@ -101,13 +100,6 @@ def _bounded_restore_slice(source, shape, z, chunk):
                     valid = (y < ye) & (x < xe)
                     target[valid] = np.maximum(target[valid], source[index, y[valid], x[valid]])
     return result
-
-
-def score_projection_staging_shape(native_shape, view, shape):
-    """Exact additional mmap shape for explicit projection, or no extra map."""
-    # Tilted/Azimuthal scores now gather directly on a bounded native output
-    # strip. There is no reduced sheared staging grid or second restoration.
-    return None
 
 
 def _destination_score_reader(source, view, shape, chunk):
@@ -210,46 +202,40 @@ def _native_score_projection_reader(source, view, shape, workspace=None):
 
 
 @contextmanager
-def _bounded_score_projection_reader(source, view, shape, temporary, workspace):
+def _bounded_score_projection_reader(source, view, shape, workspace):
     from .geometry import physical_view_name
     backend, chunk = workspace.backend, workspace.chunk_points
-    try:
-        if backend in ('azimuthal', 'tilted', 'tilted_azimuthal'):
-            with _native_score_projection_reader(source, view, shape, workspace) as read:
-                yield read
-        elif backend in ('radial', 'spherical'):
-            if backend == 'radial':
-                from .cylindrical_geometry import global_radii
-                from .cylindrical_projection import _pull_radial_chunk_compiled
-                radii = np.asarray(global_radii(view), dtype=np.float64)
-                def pull(z, first, stop):
-                    return _pull_radial_chunk_compiled(source, view, radii, shape, z, first, stop, scalar_max=True)
-            else:
-                from .spherical_projection import _validate_spherical_projection
-                from .spherical_projection_cpu import prepare_spherical_chunk_numba
-                radii, rotation, _, _ = _validate_spherical_projection(source, view, shape, None)
-                compiled_pull = prepare_spherical_chunk_numba(source, view, radii, rotation, shape)
-                def pull(z, first, stop):
-                    return compiled_pull(source, view, radii, rotation, shape, z, first, stop, scalar_max=True)
-            def read(z):
-                result = np.zeros(shape[1:], np.uint8)
-                flat = result.reshape(-1)
-                for first in range(0, flat.size, chunk):
-                    stop = min(flat.size, first+chunk)
-                    flat[first:stop] = pull(z, first, stop)
-                return result
+    if backend in ('azimuthal', 'tilted', 'tilted_azimuthal'):
+        with _native_score_projection_reader(source, view, shape, workspace) as read:
             yield read
+    elif backend in ('radial', 'spherical'):
+        if backend == 'radial':
+            from .cylindrical_geometry import global_radii
+            from .cylindrical_projection import _pull_radial_chunk_compiled
+            radii = np.asarray(global_radii(view), dtype=np.float64)
+            def pull(z, first, stop):
+                return _pull_radial_chunk_compiled(source, view, radii, shape, z, first, stop, scalar_max=True)
         else:
-            base = physical_view_name(view)
-            if base not in ('transverse', 'sagittal', 'coronal'):
-                raise ValueError(f'Confidence projection does not support view {view.name!r}')
-            axes = {'transverse': (0, 1, 2), 'sagittal': (1, 0, 2), 'coronal': (1, 2, 0)}[base]
-            yield lambda z: _bounded_restore_slice(source.transpose(axes), shape, z, chunk)
-    finally:
-        try:
-            temporary.unlink(missing_ok=True)
-        except PermissionError:
-            pass
+            from .spherical_projection import _validate_spherical_projection
+            from .spherical_projection_cpu import prepare_spherical_chunk_numba
+            radii, rotation, _, _ = _validate_spherical_projection(source, view, shape, None)
+            compiled_pull = prepare_spherical_chunk_numba(source, view, radii, rotation, shape)
+            def pull(z, first, stop):
+                return compiled_pull(source, view, radii, rotation, shape, z, first, stop, scalar_max=True)
+        def read(z):
+            result = np.zeros(shape[1:], np.uint8)
+            flat = result.reshape(-1)
+            for first in range(0, flat.size, chunk):
+                stop = min(flat.size, first+chunk)
+                flat[first:stop] = pull(z, first, stop)
+            return result
+        yield read
+    else:
+        base = physical_view_name(view)
+        if base not in ('transverse', 'sagittal', 'coronal'):
+            raise ValueError(f'Confidence projection does not support view {view.name!r}')
+        axes = {'transverse': (0, 1, 2), 'sagittal': (1, 0, 2), 'coronal': (1, 2, 0)}[base]
+        yield lambda z: _bounded_restore_slice(source.transpose(axes), shape, z, chunk)
 
 
 def resize_score_plane_max(plane, output_hw):
@@ -303,7 +289,6 @@ def _score_boxes(source):
 def score_projection_reader(source, view, output_shape, work_dir, *, memory_bytes=None):
     """Yield source-aligned scores, with optional explicit strip-workspace admission."""
     from .geometry import is_tilted_view, physical_view_name
-    from .runtime import close_memmap_array_without_flush
     source = np.asarray(source)
     if source.dtype != np.uint8 or source.ndim != 3:
         raise ValueError('Confidence projection requires a three-dimensional uint8 score map')
@@ -313,9 +298,8 @@ def score_projection_reader(source, view, output_shape, work_dir, *, memory_byte
     workspace = None if memory_bytes is None else score_projection_workspace(source.shape, view, shape, memory_bytes)
     work = Path(work_dir)
     work.mkdir(parents=True, exist_ok=True)
-    temporary = work / 'confidence_projection.u8.dat'
     if workspace is not None:
-        with _bounded_score_projection_reader(source, view, shape, temporary, workspace) as read:
+        with _bounded_score_projection_reader(source, view, shape, workspace) as read:
             yield read
         return
     projected = None
@@ -402,13 +386,7 @@ def score_projection_reader(source, view, output_shape, work_dir, *, memory_byte
                 raise ValueError(f'Confidence projection does not support view {view.name!r}')
             yield lambda z: read_score_slice_in_output_shape(projected, shape, z)
     finally:
-        if projected is not None and not np.shares_memory(projected, source):
-            close_memmap_array_without_flush(projected, unlink_path=temporary)
-        projected = None  # Do not let a retained reader pin scratch after exit.
-        try:
-            temporary.unlink(missing_ok=True)
-        except PermissionError:
-            pass
+        projected = None  # Do not let a retained reader pin the source after exit.
 
 
 __all__ = ['score_projection_reader', 'read_score_slice_in_output_shape', 'resize_score_plane_max']

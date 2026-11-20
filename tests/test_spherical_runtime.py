@@ -125,7 +125,7 @@ class SphericalSchedulerContracts(unittest.TestCase):
     def test_d1_and_worker_guards_reject_spherical_before_device_access(self):
         view = compiled_views()[0]
         with self.assertRaisesRegex(ValueError, 'Spherical QSC'):
-            cuda_d1._d1_view_family_ids(view)
+            cuda_d1._d1_require_cartesian_native_coverage(view)
         with self.assertRaisesRegex(ValueError, 'Spherical QSC'):
             cuda_d1._d1_get_or_create_state({'view': view}, None)
         for worker in (workers.run_prediction_volume_in_worker, workers.run_prediction_volume_in_openvino_worker):
@@ -196,7 +196,7 @@ class SphericalCudaBatchCpuTests(unittest.TestCase):
               mock.patch.object(torch.cuda, 'Event', return_value=SimpleNamespace(record=lambda stream: None))):
             for angle in (0., 90.):
                 view = geometry.expand_views_into_tta_variants((physical,), (angle,))[0]
-                job = geometry.build_aug_job_for_variant(view, 8, Path('unused'))
+                job = geometry.build_aug_job_for_variant(view, 8)
                 batch, _ = engine.render_fullframe_batch(view, job, (0,), 8, False, channel_format=fmt)
                 for channel, index in enumerate((0, 0, 1)):
                     native = render_shell_frame(volume, view, index)

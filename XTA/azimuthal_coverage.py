@@ -62,7 +62,6 @@ def optimize_azimuthal_view(view: 'ViewInfo', *, augmentation_angles: Sequence[f
         is_azimuthal_view,
         is_tilted_azimuthal_view,
     )
-    from .workspace import azimuthal_source_mode
 
     def fallback(reason: str) -> 'ViewInfo':
         return replace(view, sampling_reason=reason)
@@ -73,8 +72,6 @@ def optimize_azimuthal_view(view: 'ViewInfo', *, augmentation_angles: Sequence[f
         return fallback('The Azimuthal coverage certificate requires an Azimuthal view')
     if is_tilted_azimuthal_view(view):
         return fallback('Tilted Azimuthal sampling is outside the upright coverage certificate')
-    if azimuthal_source_mode() != 'texture_linear':
-        return fallback('Nearest-source Azimuthal sampling is outside the linear coverage certificate')
     source_shape = (int(view.full_t), int(view.full_h), int(view.full_w))
     if min(source_shape) <= 0 or max(source_shape) > AZIMUTHAL_COVERAGE_MAX_AXIS:
         return fallback('The Azimuthal source axes are outside the certified 1..4096 range')

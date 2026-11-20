@@ -56,6 +56,8 @@ def check(root: Path, *, require_nrrd: bool = True) -> dict:
         assert row['source_render_replays']==0, f'geometry was replayed: {row}'
         assert row['model_batches']==row['rendered_batches']*ratio, f'bad inference count: {row}'
     coverage=manifest['coverage_records']
+    if manifest['coverage']=='none':
+        assert not coverage, 'coverage is none but the manifest lists inverse-support records'
     if manifest['coverage']=='packed':
         assert len(coverage)==len(execution)*(ratio-1), 'missing per-task/pass support'
         import numpy as np

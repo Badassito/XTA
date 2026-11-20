@@ -6,7 +6,8 @@ import pytest
 
 from XTA.geometry import ViewInfo
 from XTA.lta_rendering import LtaPhysicalViewCacheRef, render_native_tile_window
-from XTA.media import LazyProcessingCube, resize_volume_to_processing_cube_gray8
+from XTA.media import (LazyProcessingCube, resize_volume_to_processing_cube_gray8,
+    resize_volume_to_processing_cube_gray8_streaming, wait_for_volume_ready)
 from XTA.runtime import close_memmap_array
 from XTA.sam_integration import SamInterpolationContext
 
@@ -58,12 +59,15 @@ def test_compact_demand_pixels_match_full_canonical_cache(tmp_path, native_shape
     ((4, 8, 8), (6, 8, 8), False),
     ((4, 7, 9), (6, 8, 8), False),
     ((4, 7, 9), (6, 8, 8), True),
+    ((4, 8, 8), (6, 8, 8), True),
 ])
 def test_lazy_cube_planned_pixels_match_production_without_materializing_cube(
         tmp_path, input_shape, output_shape, streaming):
     source = np.random.default_rng(8).integers(0, 256, input_shape, dtype=np.uint8)
-    expected_map = resize_volume_to_processing_cube_gray8(source, output_shape,
-        tmp_path/'expected.dat', prefer_memory=False, workers=1)
+    resize = (resize_volume_to_processing_cube_gray8_streaming if streaming
+              else resize_volume_to_processing_cube_gray8)
+    expected_map = resize(source, output_shape, tmp_path/'expected.dat', prefer_memory=False, workers=1)
+    wait_for_volume_ready(expected_map)
     expected = np.array(expected_map, copy=True)
     close_memmap_array(expected_map)
     del expected_map
@@ -79,8 +83,8 @@ def test_lazy_cube_planned_pixels_match_production_without_materializing_cube(
     for frame in (0, 2, 5):
         image = render_native_tile_window(reference, frame_start=frame, frame_stop=frame+1,
             tile_xyxy=(bbox[1], bbox[0], bbox[3], bbox[2]))[0]
-        # Streaming resize uses the endpoint-aligned general XY path even for
-        # T-only changes. These fixtures change XY when streaming is selected.
+        # Streaming cubes keep their producer's center-aligned two-tap rounding
+        # even for T-only changes, where the eager path uses the OpenCV slab.
         np.testing.assert_array_equal(np.array(image)[:, :, 0],
             expected[frame, bbox[0]:bbox[2], bbox[1]:bbox[3]])
     context.close()

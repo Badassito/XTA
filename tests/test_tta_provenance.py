@@ -50,3 +50,61 @@ def test_execution_receipt_tracks_sam_construction_without_importing_it(tmp_path
     for name in names[:2]:
         assert after[name] == before[name]
     assert all(f'XTA.{name}' not in sys.modules for name in names)
+
+
+def _fixture_package(tmp_path, monkeypatch, files):
+    for relative, data in files.items():
+        path = tmp_path.joinpath(*relative.split('/'))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    monkeypatch.setattr(tta_provenance, '__file__', str(tmp_path / 'tta_provenance.py'))
+
+
+def test_execution_receipt_fingerprints_every_package_source_automatically(tmp_path, monkeypatch):
+    _fixture_package(tmp_path, monkeypatch, {'alpha.py': b'A = 1\n', 'nested/__init__.py': b'',
+                                             'nested/beta.py': b'B = 2\r\n'})
+    before = tta_provenance._execution_runtime_provenance()
+    assert {'alpha', 'nested.__init__', 'nested.beta'} <= set(before['modules'])
+    assert before['modules']['nested.beta']['sha256'] == hashlib.sha256(b'B = 2\r\n').hexdigest()
+    assert before['package_python_sources']['file_count'] == 3
+    (tmp_path / 'nested' / 'gamma.py').write_bytes(b'G = 3\n')
+    after = tta_provenance._execution_runtime_provenance()
+    assert after['modules']['nested.gamma']['sha256'] == hashlib.sha256(b'G = 3\n').hexdigest()
+    assert after['package_python_sources']['file_count'] == 4
+    assert after['package_python_sources']['sha256'] != before['package_python_sources']['sha256']
+    assert 'spherical_sources' not in after
+
+
+def test_execution_receipt_aggregate_equals_lta_package_fingerprint(tmp_path, monkeypatch):
+    from XTA.lta_telemetry import lta_source_fingerprint
+    _fixture_package(tmp_path, monkeypatch, {'alpha.py': b'A = 1\n', 'nested/__init__.py': b'',
+                                             'nested/beta.py': b'B = 2\r\n'})
+    receipt = tta_provenance._execution_runtime_provenance()['package_python_sources']
+    expected = lta_source_fingerprint(package_root=tmp_path)
+    assert receipt == {'scope': expected['scope'], 'sha256': expected['sha256'], 'file_count': len(expected['files'])}
+
+
+def test_unreadable_package_source_is_recorded_without_failing_the_receipt(tmp_path, monkeypatch):
+    _fixture_package(tmp_path, monkeypatch, {'alpha.py': b'A = 1\n', 'broken.py': b'B = 2\n'})
+    original = tta_provenance.sha256_file
+
+    def sha256_file(path):
+        if path.name == 'broken.py':
+            raise PermissionError(path)
+        return original(path)
+    monkeypatch.setattr(tta_provenance, 'sha256_file', sha256_file)
+    receipt = tta_provenance._execution_runtime_provenance()
+    assert receipt['modules']['broken']['sha256'] is None
+    assert receipt['modules']['broken']['read_error'] == 'PermissionError'
+    assert receipt['modules']['alpha']['sha256'] == hashlib.sha256(b'A = 1\n').hexdigest()
+    assert receipt['package_python_sources']['sha256'] is None
+    assert receipt['package_python_sources']['file_count'] == 2
+
+
+def test_package_initializers_report_their_package_load_state(tmp_path, monkeypatch):
+    (tmp_path / 'nested').mkdir()
+    (tmp_path / '__init__.py').write_bytes(b'')
+    (tmp_path / 'nested' / '__init__.py').write_bytes(b'')
+    monkeypatch.setitem(sys.modules, 'XTA.nested', object())
+    assert _source_record(tmp_path, '__init__')['loaded_in_parent'] is ('XTA' in sys.modules)
+    assert _source_record(tmp_path, 'nested.__init__')['loaded_in_parent'] is True

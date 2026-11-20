@@ -22,7 +22,6 @@ from dataclasses import (
     dataclass,
     replace as dataclasses_replace,
 )
-from pathlib import Path
 from typing import (
     Callable,
     Dict,
@@ -55,7 +54,6 @@ from .config import (
 # Explicit lower-layer dependencies keep imports one-way.
 from .workspace import (
     _TILTED_IDENTITY_M,
-    _cpu_count,
     _env_flag,
     _env_float,
     _env_int,
@@ -63,13 +61,7 @@ from .workspace import (
 )
 from .runtime import (
     _sanitize_filesystem_token,
-    allocate_workspace_array,
-    choose_parallel_chunk_size,
     choose_slice_parallel_workers,
-    close_memmap_array,
-    close_memmap_array_without_flush,
-    parallel_for_indices,
-    parallel_for_indices_chunked,
 )
 from .media import (
     wait_for_volume_ready,
@@ -91,13 +83,12 @@ from .unification.sampling import (
     build_forward_raster_plan,
     require_forward_sampling,
 )
-from .unification.tiles import resolve_tile_groups
+from .unification.tiles import TileConfig, resolve_tile_groups
 
 
 if TYPE_CHECKING:
     from .inference import (
         canonical_single_device,
-        inference_batch_size,
     )
     from .cuda_backend import (
         GpuRenderedYoloSource,
@@ -125,7 +116,6 @@ class AffineSpec:
 class AugJob:
     aug_id: str
     angle_deg: float
-    meta_path: Path
     aff: AffineSpec
 
 def _expanded_pad_size(w: int, h: int, angle_deg: float) -> int:
@@ -1581,65 +1571,9 @@ def _cupy_external_stream(cp: object, torch_stream: object) -> object:
                 continue
     return cp.cuda.ExternalStream(int(getattr(torch_stream, 'cuda_stream')))
 
-def write_aug_job_meta(
-    job: AugJob,
-    view: ViewInfo,
-    channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
-) -> None:
-    from .unification.tta_manifest import radial_view_manifest_record, spherical_view_manifest_record
-    fmt = resolve_channel_format(channel_format)
-    job.meta_path.parent.mkdir(parents=True, exist_ok=True)
-    job.meta_path.write_text(
-        json.dumps(
-            {
-                'view': view.name,
-                'physical_view': physical_view_name(view),
-                'family': view.family,
-                'num_slices': int(view.num_slices),
-                'full_t': int(view.full_t),
-                'angle_deg': float(job.angle_deg),
-                'src_w': view.src_w,
-                'src_h': view.src_h,
-                'tilt_angle_deg': float(view.tilt_angle_deg),
-                'tilt_direction': str(view.tilt_direction),
-                'tilt_base_view': str(view.tilt_base_view),
-                'horizontal_axis': str(view.horizontal_axis),
-                'vertical_axis': str(view.vertical_axis),
-                'stack_axis': str(view.stack_axis),
-                'azimuthal_base_view': str(view.azimuthal_base_view),
-                'azimuthal_tilted_source': bool(view.azimuthal_tilted_source),
-                'azimuthal_source_view_name': str(view.azimuthal_source_view_name),
-                'azimuthal_request_token': str(view.azimuthal_request_token),
-                'radial_shell': radial_view_manifest_record(view),
-                'spherical_shell': spherical_view_manifest_record(view),
-                'tilt_frame_start': int(view.tilt_frame_start),
-                'tilt_frame_stop': int(view.tilt_frame_stop),
-                'out_size': int(job.aff.out_size),
-                'pad_mode': view.pad_mode,
-                'canvas_w': int(job.aff.canvas_w),
-                'canvas_h': int(job.aff.canvas_h),
-                'pad_size': int(job.aff.pad_size),
-                'pad_off_x': float(job.aff.pad_off_x),
-                'pad_off_y': float(job.aff.pad_off_y),
-                'M_out_to_src': job.aff.M_out_to_src.tolist(),
-                'M_src_to_out': job.aff.M_src_to_out.tolist(),
-                'channel_format': fmt.token,
-                'model_input_channels': int(fmt.channel_count),
-                'channel_stride': int(fmt.stride),
-                'channel_offsets': [int(v) for v in fmt.offsets],
-                'channel_boundary_policy': ('spherical_radius_edge_clamp_qsc_face_patch'
-                    if is_spherical_view(view) else 'radial_radius_edge_clamp_periodic_arc'
-                    if is_radial_view(view) else 'azimuthal_wrap_mirror_u_cartesian_edge_clamp'),
-                'prediction_slice_policy': 'center_N_only',
-            },
-            indent=2,
-        )
-    )
-
 def build_aug_job_for_variant(
     view: ViewInfo,
     out_size: int,
-    temp_dir: Path,
 ) -> AugJob:
     """Build the augmentation job owned by one TTA view variant."""
     if not is_tta_view_variant(view):
@@ -1656,7 +1590,6 @@ def build_aug_job_for_variant(
             f'TTA variant {view.name!r} has aug_id={aug_id!r}, expected {expected_aug_id!r} '
             f'for angle {angle:g}'
         )
-    aug_dir = temp_dir / 'aug' / view.name
     aff = build_affine(
         view=view.name,
         src_w=view.src_w,
@@ -1668,7 +1601,6 @@ def build_aug_job_for_variant(
     return AugJob(
         aug_id=aug_id,
         angle_deg=angle,
-        meta_path=aug_dir / f'{view.name}_{aug_id}.meta.json',
         aff=aff,
     )
 
@@ -1698,24 +1630,11 @@ def iter_aug_jobs_round_robin(
         if not emitted:
             break
 
-@dataclass(frozen=True)
-class TileConfig:
-    tile_size: int
-    tile_stride: int
-    config_id: str
-
 def resolve_tile_configs(
     values: Sequence[str] | str | None,
 ) -> List[TileConfig]:
     """Resolve structured ``TILE_SIZE:TILE_STRIDE`` groups."""
-    return [
-        TileConfig(
-            tile_size=int(group.tile_size),
-            tile_stride=int(group.tile_stride),
-            config_id=str(group.config_id),
-        )
-        for group in resolve_tile_groups(values)
-    ]
+    return list(resolve_tile_groups(values))
 
 @dataclass(frozen=True)
 class DenseTileJob:
@@ -1728,7 +1647,6 @@ class DenseTileJob:
     tile_size: int
     tile_stride: int
     out_size: int
-    meta_path: Path
     M_out_to_src: np.ndarray
     M_src_to_out: np.ndarray
     # the tile's fixed footprint in the parent processing grid, as (py0, py1, px0, px1),
@@ -2097,47 +2015,6 @@ class ChannelFormattedFrameRenderer:
                 local_planes[source] = plane
             ordered_planes.append(plane)
         return np.ascontiguousarray(np.stack(ordered_planes, axis=2), dtype=np.uint8)
-
-@dataclass
-class PredictionVolumeRef:
-    """One active YOLO input job.
-    
-    ``array`` holds a dense materialized volume; ``source`` holds the default bounded streaming renderer."""
-
-    array: Optional[np.ndarray]
-    path: Optional[Path]
-    name: str
-    view_name: str
-    job_id: str
-    kind: str = 'fullframe'
-    source: Optional[object] = None
-    channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT
-    view: Optional[ViewInfo] = None
-    render_batch_sink: Optional[RenderBatchSink] = None
-    raster_plan: Optional[RasterPlan] = None
-    owns_materialized_path: bool = False
-
-def close_prediction_volume_ref(ref: Optional[PredictionVolumeRef], *, keep_temp: bool = False) -> None:
-    """Release one prediction source and remove any fallback backing file."""
-    if ref is None:
-        return
-
-    close_fn = getattr(getattr(ref, 'source', None), 'close', None)
-    if callable(close_fn):
-        try:
-            close_fn()
-        except Exception as exc:
-            print(f'Warning: failed to close streaming prediction source {ref.name} ({exc})')
-    ref.source = None
-
-    arr = getattr(ref, 'array', None)
-    path = getattr(ref, 'path', None)
-    if arr is not None:
-        if bool(keep_temp) or not bool(ref.owns_materialized_path) or path is None:
-            close_memmap_array(arr)
-        else:
-            close_memmap_array_without_flush(arr, unlink_path=Path(path))
-        ref.array = None
 
 class ChannelFormattedYoloBatch(list):
     """Image-list marker that preserves the requested H×W×C channel order."""
@@ -2602,15 +2479,12 @@ class GpuPrefetchedYoloBatch(list):
         *,
         gpu_tensor: object,
         ready_event: Optional[object] = None,
-        source_label: str = '',
         cpu_tensor_ref: Optional[object] = None,
     ) -> None:
         super().__init__(frames)
         self._tta_gpu_tensor = gpu_tensor
         self._tta_gpu_ready_event = ready_event
-        self._tta_source_label = str(source_label)
         self._tta_cpu_tensor_ref = cpu_tensor_ref
-        self._tta_normalized = True
 
     def wait_ready(self) -> object:
         tensor = self._tta_gpu_tensor
@@ -2905,7 +2779,6 @@ class GpuPrefetchingYoloSource:
             cpu_frames,
             gpu_tensor=gpu_tensor,
             ready_event=ready_event,
-            source_label=self.source_label,
             cpu_tensor_ref=cpu_tensor_ref,
         )
         # This batch's VRAM is now visible to mem_get_info; stop double-counting it in
@@ -3127,121 +3000,15 @@ def maybe_wrap_source_with_gpu_input_staging(source: object, cfg: 'PredictConfig
         _release_gpu_staging_reservation(canonical_single_device(str(cfg.device)), int(staging_reservation))
         raise
 
-def gpu_input_staging_ahead_sources(default_queue_slots: int) -> int:
-    """Resolve how many queued prediction sources may pre-stage CUDA batches.
-    
-    This source count is independent of the per-source batch queue and is still bounded by VRAM admission."""
-    raw = os.environ.get('YOLO_TTA_GPU_INPUT_STAGING_AHEAD_SOURCES', '').strip()
-    if raw:
-        try:
-            return max(0, int(raw))
-        except Exception:
-            return 0
-    default_ahead = max(1, _cpu_count())
-    return max(0, min(max(1, int(default_queue_slots)), int(default_ahead)))
-
-def _prediction_ref_has_gpu_input_staging(ref: PredictionVolumeRef) -> bool:
-    return isinstance(getattr(ref, 'source', None), GpuPrefetchingYoloSource)
-
-def maybe_eager_stage_prediction_ref_on_gpu(prediction_ref: PredictionVolumeRef, cfg: 'PredictConfig') -> PredictionVolumeRef:
-    """Wrap and start one queued prediction source's CUDA input staging queue.
-
- The ordinary predict path also wraps sources, but only after they become the
- active source. Eager staging lets queued sources render and copy their first
- batches into VRAM while the GPU is still inferencing the previous source."""
-    if _prediction_ref_has_gpu_input_staging(prediction_ref):
-        source = prediction_ref.source
-    else:
-        source = getattr(prediction_ref, 'source', None)
-        if source is None:
-            if prediction_ref.array is None:
-                return prediction_ref
-            source = make_in_memory_yolo_source(
-                prediction_ref.array,
-                prediction_ref.name,
-                batch_size=max(1, int(cfg.batch)),
-                max_frames=None,
-                channel_format=resolve_channel_format(prediction_ref.channel_format),
-                view=prediction_ref.view,
-                logical_num_frames=(
-                    int(prediction_ref.view.num_slices)
-                    if prediction_ref.view is not None else None
-                ),
-                render_batch_sink=prediction_ref.render_batch_sink,
-                raster_plan=prediction_ref.raster_plan,
-            )
-        wrapped = maybe_wrap_source_with_gpu_input_staging(source, cfg, prediction_ref.name)
-        prediction_ref.source = wrapped
-        source = wrapped
-    start_fn = getattr(source, 'start', None)
-    if callable(start_fn):
-        try:
-            start_fn()
-        except Exception as exc:
-            print(f'Warning: eager CUDA input staging could not start for {prediction_ref.name} ({exc}); source will stage on demand.')
-    return prediction_ref
-
-def streaming_prediction_sources_enabled() -> bool:
-    """Return True when YOLO input slices should be rendered lazily instead of prebuilt."""
-    return _env_flag('YOLO_TTA_STREAMING_PREDICTION_SOURCES', True)
-
-def streaming_prediction_source_autostart_enabled() -> bool:
-    """Return whether each new streaming source starts prefetch immediately."""
-    return _env_flag('YOLO_TTA_STREAMING_SOURCE_AUTOSTART', False)
-
-def queued_streaming_source_cpu_warmup_slots(default_queue_slots: int) -> int:
-    """Resolve how many ready queued streaming sources may pre-render on CPU.
-
- This keeps source creation unbounded without allowing every future tile/view to enqueue
- a full prefetch window at once. The active source can still use the full shared render pool;
- a bounded number of upcoming sources are kept warm to overlap CPU rendering with inference."""
-    raw = os.environ.get('YOLO_TTA_STREAMING_SOURCE_WARMUP_SOURCES', '').strip()
-    if raw:
-        try:
-            return max(0, int(raw))
-        except Exception:
-            return 0
-    default_slots = max(2, min(8, _cpu_count()))
-    return max(0, min(max(1, int(default_queue_slots)), int(default_slots)))
-
 def streaming_prediction_source_prefetch_frames(batch_size: int) -> int:
     explicit = _env_int('YOLO_TTA_STREAMING_SOURCE_PREFETCH_FRAMES', 0)
     if explicit > 0:
         return max(1, int(explicit))
     return max(1, min(2048, max(int(batch_size), int(batch_size) * 32)))
 
-def streaming_prediction_source_workers(default_workers: int, num_frames: int) -> int:
-    """Resolve the render-worker budget for one streaming source, capped by its frame count."""
-    default_resolved = max(1, int(default_workers), int(_cpu_count()))
-    requested = _env_int('YOLO_TTA_STREAMING_SOURCE_WORKERS', int(default_resolved))
-    return choose_slice_parallel_workers(max(1, int(requested)), max(1, int(num_frames)))
-
-def shared_streaming_render_pool_enabled() -> bool:
-    """Return True when all streaming YOLO sources should share one CPU render pool."""
-    return _env_flag('YOLO_TTA_SHARED_STREAMING_RENDER_POOL', True)
-
 def resolve_prediction_render_workers(default_workers: int, max_frames: int) -> int:
     requested = _env_int('YOLO_TTA_PREDICTION_RENDER_WORKERS', int(default_workers))
     return choose_slice_parallel_workers(max(1, int(requested)), max(1, int(max_frames)))
-
-def resolve_prediction_source_queue_slots(total_tasks: int, *, streaming_sources: bool = True) -> int:
-    """Resolve how many future prediction sources may be constructed.
-    
-    Streaming refs default to all tasks; dense materialization uses a CPU-scaled cap unless explicitly overridden."""
-    total = max(1, int(total_tasks))
-    raw = os.environ.get('YOLO_TTA_PREDICTION_VOLUME_QUEUE_SLOTS', '').strip()
-    if raw:
-        try:
-            requested = int(raw)
-        except Exception:
-            requested = 0
-        if int(requested) <= 0:
-            return int(total)
-        return max(1, min(int(total), int(requested)))
-    if bool(streaming_sources):
-        return int(total)
-    default_slots = max(8, min(int(total), max(1, int(_cpu_count()))))
-    return int(default_slots)
 
 def ensure_ultralytics_accepts_in_memory_volume_source() -> None:
     """Register the in-memory volume loader with Ultralytics' source checker."""
@@ -3256,82 +3023,30 @@ def ensure_ultralytics_accepts_in_memory_volume_source() -> None:
     except Exception as exc:  # pragma: no cover - ultralytics is imported lazily on SLURM
         raise RuntimeError(f'Unable to import ultralytics.data.build for in-memory prediction source registration: {exc}') from exc
 
+    unsupported = ('Unsupported Ultralytics in-memory source API: '
+                   'ultralytics.data.build.check_source must use its LOADERS tuple')
     loaders = getattr(ultralytics_build, 'LOADERS', None)
     check_source = getattr(ultralytics_build, 'check_source', None)
-    if (not isinstance(loaders, tuple) or not callable(check_source)
-            or 'LOADERS' not in getattr(getattr(check_source, '__code__', None), 'co_names', ())
-            or getattr(check_source, '__globals__', {}).get('LOADERS') is not loaders):
-        raise RuntimeError(
-            'Unsupported Ultralytics in-memory source API: '
-            'ultralytics.data.build.check_source must use its LOADERS tuple'
-        )
-    loaders_tuple = loaders
-    additions: List[object] = []
-    for loader_cls in (
+    if not isinstance(loaders, tuple) or not callable(check_source):
+        raise RuntimeError(unsupported)
+    additions = tuple(loader_cls for loader_cls in (
         InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource,
         GpuRenderedYoloSource, GpuTileRenderedYoloSource,
-    ):
-        if loader_cls not in loaders_tuple:
-            additions.append(loader_cls)
-    if additions:
-        setattr(ultralytics_build, 'LOADERS', loaders_tuple + tuple(additions))
-
-def make_in_memory_yolo_source(
-    volume_gray: np.ndarray,
-    name: str,
-    *,
-    batch_size: int = 1,
-    max_frames: Optional[int] = None,
-    channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
-    view: Optional[ViewInfo] = None,
-    slice_offset: int = 0,
-    logical_num_frames: Optional[int] = None,
-    render_batch_sink: Optional[RenderBatchSink] = None,
-    raster_plan: Optional[RasterPlan] = None,
-) -> InMemoryYoloVolumeSource:
-    ensure_ultralytics_accepts_in_memory_volume_source()
-    return InMemoryYoloVolumeSource(
-        volume_gray,
-        name=name,
-        batch_size=max(1, int(batch_size)),
-        max_frames=max_frames,
-        channel_format=resolve_channel_format(channel_format),
-        view=view,
-        slice_offset=int(slice_offset),
-        logical_num_frames=logical_num_frames,
-        render_batch_sink=render_batch_sink,
-        raster_plan=raster_plan,
-    )
-
-def make_prediction_ref_yolo_source(
-    prediction_volume: PredictionVolumeRef,
-    *,
-    batch_size: int = 1,
-    max_frames: Optional[int] = None,
-) -> object:
-    ensure_ultralytics_accepts_in_memory_volume_source()
-    source = getattr(prediction_volume, 'source', None)
-    if source is not None:
-        return source
-    if prediction_volume.array is None:
-        raise ValueError(f'Prediction input {prediction_volume.name} has neither source nor array')
-    result = make_in_memory_yolo_source(
-        prediction_volume.array,
-        prediction_volume.name,
-        batch_size=max(1, int(batch_size)),
-        max_frames=max_frames,
-        channel_format=resolve_channel_format(prediction_volume.channel_format),
-        view=prediction_volume.view,
-        logical_num_frames=(
-            int(prediction_volume.view.num_slices)
-            if prediction_volume.view is not None else max_frames
-        ),
-        render_batch_sink=prediction_volume.render_batch_sink,
-        raster_plan=prediction_volume.raster_plan,
-    )
-    if getattr(prediction_volume, "_xta_forward_identity", None):
-        result._xta_forward_identity = prediction_volume._xta_forward_identity
-    return result
+    ) if loader_cls not in loaders)
+    if not additions:
+        return
+    setattr(ultralytics_build, 'LOADERS', loaders + additions)
+    # Prove the behavior once, when registering: check_source must classify a
+    # registered loader as in-memory. This accepts wrapped or delegating
+    # implementations; flags are (source, webcam, screenshot, from_img,
+    # in_memory, tensor). The probe instance is never initialized or used.
+    try:
+        flags = check_source(object.__new__(InMemoryYoloVolumeSource))
+    except Exception:
+        flags = None
+    if not (isinstance(flags, tuple) and len(flags) > 4 and flags[4] is True):
+        setattr(ultralytics_build, 'LOADERS', loaders)
+        raise RuntimeError(unsupported)
 
 def _center_preserving_scale_matrix(src_w: int, src_h: int, out_w: int, out_h: int) -> np.ndarray:
     cx_src = (int(src_w) - 1) / 2.0
@@ -3371,11 +3086,7 @@ def build_dense_tile_jobs_for_aug(
     aug_job: AugJob,
     tile_cfg: TileConfig,
     out_size: int,
-    temp_dir: Path,
 ) -> List[DenseTileJob]:
-    # one consolidated diagnostic sidecar per (view, configuration) instead of one
-    # indented JSON file per tile. See write_dense_tile_job_meta.
-    tile_meta_path = temp_dir / 'tiles' / view.name / tile_cfg.config_id / 'tiles.jsonl'
     xs = dense_tile_positions(int(aug_job.aff.canvas_w), int(tile_cfg.tile_size), int(tile_cfg.tile_stride))
     ys = dense_tile_positions(int(aug_job.aff.canvas_h), int(tile_cfg.tile_size), int(tile_cfg.tile_stride))
 
@@ -3421,7 +3132,6 @@ def build_dense_tile_jobs_for_aug(
             tile_size=int(tile_cfg.tile_size),
             tile_stride=int(tile_cfg.tile_stride),
             out_size=int(out_size),
-            meta_path=tile_meta_path,
             M_out_to_src=M_out_to_src_stack[i][:2, :3].astype(np.float32),
             M_src_to_out=M_src_to_out_stack[i][:2, :3].astype(np.float32),
         )
@@ -3439,64 +3149,6 @@ def build_dense_tile_jobs_for_aug(
             resolved.append(dataclasses_replace(job, parent_crop=window, M_out_to_crop=M_out_to_crop))
         jobs = resolved
     return jobs
-
-_TILE_META_STREAM_LOCK = threading.Lock()
-
-_TILE_META_STREAM_WRITTEN: Dict[str, set[str]] = {}
-
-def write_dense_tile_job_meta(
-    job: DenseTileJob,
-    channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
-) -> None:
-    """Append one unique tile record to the per-view/configuration JSONL sidecar.
-    
-    A process-local lock and tile-id set make repeated call sites idempotent."""
-    fmt = resolve_channel_format(channel_format)
-    path = Path(job.meta_path)
-    key = str(path)
-    record = json.dumps(
-        {
-            'view': job.view,
-            'physical_view': str(job.view).split('__tta_', 1)[0],
-            'aug_id': job.aug_id,
-            'config_id': job.config_id,
-            'tile_id': job.tile_id,
-            'tile_x': int(job.tile_x),
-            'tile_y': int(job.tile_y),
-            'tile_size': int(job.tile_size),
-            'tile_stride': int(job.tile_stride),
-            'out_size': int(job.out_size),
-            'M_out_to_src': job.M_out_to_src.tolist(),
-            'M_src_to_out': job.M_src_to_out.tolist(),
-            'channel_format': fmt.token,
-            'model_input_channels': int(fmt.channel_count),
-            'channel_stride': int(fmt.stride),
-            'channel_offsets': [int(v) for v in fmt.offsets],
-            'channel_boundary_policy': 'azimuthal_wrap_mirror_u_cartesian_edge_clamp',
-            'prediction_slice_policy': 'center_N_only',
-        },
-        separators=(',', ':'),
-    )
-    with _TILE_META_STREAM_LOCK:
-        written = _TILE_META_STREAM_WRITTEN.get(key)
-        if written is None:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            # Drop any stream left behind by an earlier run so the sidecar describes this one.
-            try:
-                path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            written = set()
-            _TILE_META_STREAM_WRITTEN[key] = written
-        tile_key = str(job.tile_id)
-        if tile_key in written:
-            return
-        written.add(tile_key)
-        try:
-            with path.open('a', encoding='utf-8') as handle:
-                handle.write(record + '\n')
-        except Exception as exc:
-            print(f'Warning: could not append tile metadata for {job.tile_id} to {path} ({exc})')
 
 @dataclass(frozen=True)
 class TiltedRenderPlan:
@@ -4226,34 +3878,6 @@ def render_dense_tile_frame_for_job(
     )
 
 
-def render_categorical_fullframe_for_job(
-    mask_u8: np.ndarray,
-    view: ViewInfo,
-    job: AugJob,
-    frame_idx: int,
-    view_frames: Optional[np.ndarray] = None,
-    *,
-    mirror_azimuthal_u: bool = False,
-) -> np.ndarray:
-    """Render one full-frame categorical ground-truth raster for an ``AugJob``.
-
-    Physical extraction and affine stage order mirror the intensity renderer,
-    while every in-plane affine operation is nearest-neighbor and the returned
-    raster is canonical uint8 ``0/1``.
-    """
-    return render_categorical_frame_on_grid(
-        mask_u8,
-        view,
-        int(frame_idx),
-        M_src_to_out=job.aff.M_src_to_out,
-        M_out_to_src=job.aff.M_out_to_src,
-        output_height=int(job.aff.out_size),
-        output_width=int(job.aff.out_size),
-        view_frames=view_frames,
-        mirror_azimuthal_u=bool(mirror_azimuthal_u),
-    )
-
-
 def render_categorical_dense_tile_for_job(
     mask_u8: np.ndarray,
     view: ViewInfo,
@@ -4422,255 +4046,6 @@ def build_dense_tile_raster_plan(
             **projection_sampling_record(view),
         },
     )
-
-def _materialize_prediction_volume_from_renderer(
-    *,
-    num_slices: int,
-    out_size: int,
-    out_path: Path,
-    desc: str,
-    renderer: Callable[[int], np.ndarray],
-    workers: int = 1,
-    show_progress: bool = True,
-    view_name: str = '',
-    job_id: str = '',
-    kind: str = 'fullframe',
-    channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
-    view: Optional[ViewInfo] = None,
-    render_batch_sink: Optional[RenderBatchSink] = None,
-    raster_plan: RasterPlan,
-) -> PredictionVolumeRef:
-    """Return a streaming render-backed prediction source by default.
-    
-    Disabling streaming materializes the complete model-sized volume in a workspace array."""
-    # Local import keeps the package dependency graph acyclic.
-    from .inference import inference_batch_size
-
-    fmt = resolve_channel_format(channel_format)
-    stream_name = str(desc).replace('Materializing in-memory ', 'Streaming render-backed ')
-    if streaming_prediction_sources_enabled():
-        stream_workers = streaming_prediction_source_workers(max(1, int(workers)), max(1, int(num_slices)))
-        stream_prefetch = streaming_prediction_source_prefetch_frames(inference_batch_size())
-        if bool(show_progress):
-            print(
-                f'{stream_name}: streaming source active '
-                f'(frames={int(num_slices)}, out_size={int(out_size)}, '
-                f'workers={stream_workers}, prefetch_frames={stream_prefetch}, '
-                f'autostart={bool(streaming_prediction_source_autostart_enabled())})'
-            )
-        source = StreamingYoloVolumeSource(
-            renderer,
-            num_frames=int(num_slices),
-            name=stream_name,
-            batch_size=inference_batch_size(),
-            out_size=int(out_size),
-            render_workers=stream_workers,
-            prefetch_frames=stream_prefetch,
-            autostart=streaming_prediction_source_autostart_enabled(),
-            channel_format=fmt,
-            view=view,
-            render_batch_sink=render_batch_sink,
-            raster_plan=raster_plan,
-        )
-        return PredictionVolumeRef(
-            array=None,
-            path=None,
-            name=stream_name,
-            view_name=str(view_name),
-            job_id=str(job_id),
-            kind=str(kind),
-            source=source,
-            channel_format=fmt,
-            view=view,
-            render_batch_sink=render_batch_sink,
-            raster_plan=raster_plan,
-        )
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    materialized_slices = int(num_slices) + azimuthal_batch_padding_count(
-        view, int(num_slices), inference_batch_size(), slice_offset=0,
-    )
-    prediction_shape = (
-        (int(materialized_slices), int(out_size), int(out_size))
-        if int(fmt.channel_count) == 1
-        else (int(materialized_slices), int(out_size), int(out_size), int(fmt.channel_count))
-    )
-    pred_volume = allocate_workspace_array(
-        shape=prediction_shape,
-        dtype=np.uint8,
-        path=out_path,
-        desc=desc,
-        prefer_memory=True,
-        reserve_bytes=32 * GIB,
-        initialize_zero=False,
-    )
-    worker_count = choose_slice_parallel_workers(int(workers), int(materialized_slices))
-    chunk_size = choose_parallel_chunk_size(int(materialized_slices), worker_count, target_chunks_per_worker=2, min_chunk_size=1)
-
-    def _render(idx: int) -> None:
-        frame = np.asarray(renderer(int(idx)), dtype=np.uint8)
-        if int(fmt.channel_count) == 1 and frame.ndim == 3:
-            frame = frame[:, :, 0]
-        pred_volume[int(idx)] = np.ascontiguousarray(frame, dtype=np.uint8)
-
-    parallel_for_indices_chunked(
-        int(materialized_slices),
-        _render,
-        max_workers=worker_count,
-        desc=desc,
-        show_progress=bool(show_progress),
-        chunk_size=chunk_size,
-    )
-    return PredictionVolumeRef(
-        array=pred_volume,
-        path=out_path if isinstance(pred_volume, np.memmap) else None,
-        name=str(desc),
-        view_name=str(view_name),
-        job_id=str(job_id),
-        kind=str(kind),
-        channel_format=fmt,
-        view=view,
-        render_batch_sink=render_batch_sink,
-        raster_plan=raster_plan,
-        owns_materialized_path=isinstance(pred_volume, np.memmap),
-    )
-
-def materialize_fullframe_prediction_volume_for_job(
-    volume_rgb: np.ndarray,
-    view: ViewInfo,
-    job: AugJob,
-    *,
-    out_path: Path,
-    view_frames: Optional[np.ndarray] = None,
-    workers: int = 1,
-    show_progress: bool = True,
-    channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
-    render_batch_sink: Optional[RenderBatchSink] = None,
-) -> PredictionVolumeRef:
-    """Create the model-sized full-frame prediction volume for one view/angle in RAM."""
-    # Refresh reusable scratch metadata so changing --channel_format cannot
-    # leave a gray-era sidecar attached to a multichannel prediction source.
-    write_aug_job_meta(job, view, channel_format)
-
-    fmt = resolve_channel_format(channel_format)
-    raster_plan = build_fullframe_raster_plan(view, job, fmt)
-    renderer = make_fullframe_channel_renderer(
-        volume_rgb,
-        view,
-        job,
-        channel_format=fmt,
-        view_frames=view_frames,
-    )
-
-    return _materialize_prediction_volume_from_renderer(
-        num_slices=int(view.num_slices),
-        out_size=int(job.aff.out_size),
-        out_path=out_path,
-        desc=f'Materializing in-memory full-frame prediction volume {view.name}/{job.aug_id}',
-        renderer=renderer,
-        workers=max(1, int(workers)),
-        show_progress=bool(show_progress),
-        view_name=str(view.name),
-        job_id=str(job.aug_id),
-        kind='fullframe',
-        channel_format=fmt,
-        view=view,
-        render_batch_sink=render_batch_sink,
-        raster_plan=raster_plan,
-    )
-
-def materialize_dense_tile_prediction_volume_for_job(
-    volume_rgb: np.ndarray,
-    view: ViewInfo,
-    tile_job: DenseTileJob,
-    *,
-    out_path: Path,
-    view_frames: Optional[np.ndarray] = None,
-    workers: int = 1,
-    show_progress: bool = True,
-    channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
-    render_batch_sink: Optional[RenderBatchSink] = None,
-) -> PredictionVolumeRef:
-    """Create one tile prediction range as an in-memory YOLO volume."""
-    write_dense_tile_job_meta(tile_job, channel_format)
-
-    fmt = resolve_channel_format(channel_format)
-    raster_plan = build_dense_tile_raster_plan(view, tile_job, fmt)
-    renderer = make_dense_tile_channel_renderer(
-        volume_rgb,
-        view,
-        tile_job,
-        channel_format=fmt,
-        view_frames=view_frames,
-    )
-
-    return _materialize_prediction_volume_from_renderer(
-        num_slices=int(view.num_slices),
-        out_size=int(tile_job.out_size),
-        out_path=out_path,
-        desc=f'Materializing in-memory tile prediction volume {view.name}/{tile_job.tile_id}',
-        renderer=renderer,
-        workers=max(1, int(workers)),
-        show_progress=bool(show_progress),
-        view_name=str(view.name),
-        job_id=str(tile_job.tile_id),
-        kind='tile',
-        channel_format=fmt,
-        view=view,
-        render_batch_sink=render_batch_sink,
-        raster_plan=raster_plan,
-    )
-
-def should_cache_view_frames(view: ViewInfo, dense_tiling_active: bool) -> bool:
-    """Return whether an opt-in Azimuthal tile-frame cache should be prebuilt.
-
-    Streaming remains the default to avoid a full-view time-to-first-prediction barrier.
-    """
-    return bool(_env_flag('YOLO_TTA_PREBUILD_VIEW_FRAME_CACHES', False)) and bool(dense_tiling_active) and view.family == 'azimuthal'
-
-def build_view_frame_cache(
-    volume_rgb: np.ndarray,
-    view: ViewInfo,
-    out_path: Path,
-    desc: str,
-    *,
-    prefer_memory: bool = True,
-    reserve_bytes: int = 64 * GIB,
-    workers: int = 1,
-) -> np.ndarray:
-    """Materialize native single-channel frames for a view into a reusable cache volume.
-
- This is used primarily for the azimuthal view when tiling is enabled so later tile video
- generation no longer recomputes the same azimuthal slices for every tile location."""
-    cache_mm = allocate_workspace_array(
-        shape=(int(view.num_slices), int(view.src_h), int(view.src_w)),
-        dtype=np.uint8,
-        path=out_path,
-        desc=desc,
-        prefer_memory=bool(prefer_memory),
-        reserve_bytes=int(reserve_bytes),
-        initialize_zero=False,
-    )
-
-    worker_count = choose_slice_parallel_workers(int(workers), int(view.num_slices))
-    print(
-        f"Preparing reusable native single-channel frame cache for view '{view.name}' over {int(view.num_slices)} slice(s) "
-        f"with {int(worker_count)} worker thread(s)"
-    )
-
-    def _build(idx: int) -> None:
-        cache_mm[int(idx), :, :] = np.ascontiguousarray(
-            get_view_frame_by_index(volume_rgb, view, int(idx), view_frames=None)
-        )
-
-    parallel_for_indices(
-        int(view.num_slices),
-        _build,
-        max_workers=worker_count,
-        desc=f'Caching {view.name} native frames',
-        show_progress=False,
-    )
-    return cache_mm
 
 @dataclass(frozen=True)
 class _CoronalBlockCacheEntry:

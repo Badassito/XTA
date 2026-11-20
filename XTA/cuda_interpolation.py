@@ -3,7 +3,8 @@
 The production interpolation planner deliberately remains host-side: it owns sparse
 label stores and Python component records that are cheap to traverse on the CPU.  This
 module accelerates the dense work inside each accepted bridge plan (SDF blending,
-component filtering, hole filling, radius estimation and crop-bounded painting).
+component filtering, hole filling and crop-bounded painting). Bridge radius admission
+stays on the parallel CPU evaluator.
 
 No CUDA package is imported at module-import time.  A renderer is admitted only inside
 an already-warm CUDA worker by default, which avoids creating one CUDA context per
@@ -37,19 +38,6 @@ def gpu_interpolation_enabled() -> bool:
     return _env_flag("YOLO_TTA_GPU_INTERPOLATION", True)
 
 
-def gpu_interpolation_radius_enabled() -> bool:
-    """Whether the fine-grained min-radius scan should run on CUDA.
-
-    The v17.1.1 implementation serialized every planner thread through one CUDA
-    renderer and was substantially slower than the parallel CPU evaluator on a
-    production four-GPU workload. The renderer now gives opted-in planners bounded
-    independent streams, but the per-plan path remains an explicit experiment until
-    that change has production profiling. Painting stays enabled by the master switch.
-    """
-
-    return _env_flag("YOLO_TTA_GPU_INTERPOLATION_RADIUS", False)
-
-
 def gpu_interpolation_render_autotune_enabled() -> bool:
     """Probe one representative batch and retain GPU painting only when faster."""
 
@@ -75,7 +63,7 @@ def gpu_interpolation_main_process_enabled() -> bool:
 
 
 def gpu_interpolation_cache_bytes() -> int:
-    """Maximum live device bytes retained for plan SDFs and accepted sections."""
+    """Maximum live device bytes retained for plan SDFs."""
 
     return max(0, _env_int("YOLO_TTA_GPU_INTERPOLATION_CACHE_MIB", 1024)) * MIB
 
@@ -188,11 +176,6 @@ def _slice_job_placement(
 def _scalar_int(value: object) -> int:
     item = getattr(value, "item", None)
     return int(item() if callable(item) else value)
-
-
-def _scalar_float(value: object) -> float:
-    item = getattr(value, "item", None)
-    return float(item() if callable(item) else value)
 
 
 class _CupyInterpolationRuntime:
@@ -343,10 +326,7 @@ class CudaInterpolationRenderer:
             Tuple[int, Tuple[int, ...], Tuple[int, ...]], Tuple[threading.Lock, int]
         ] = {}
         self._failed_reason: Optional[str] = None
-        self._radius_failed_reason: Optional[str] = None
         self._metrics: Dict[str, object] = {
-            "estimated_plans": 0,
-            "estimated_sections": 0,
             "rendered_slices": 0,
             "rendered_sections": 0,
             "host_to_device_bytes": 0,
@@ -363,8 +343,6 @@ class CudaInterpolationRenderer:
             "cache_peak_bytes": 0,
             "render_crop_pixels": 0,
             "render_patch_pixels": 0,
-            "radius_lock_wait_seconds": 0.0,
-            "radius_execution_seconds": 0.0,
             "render_lock_wait_seconds": 0.0,
             "render_execution_seconds": 0.0,
             "stream_leases": 0,
@@ -380,14 +358,6 @@ class CudaInterpolationRenderer:
     @property
     def failed_reason(self) -> Optional[str]:
         return self._failed_reason
-
-    @property
-    def radius_available(self) -> bool:
-        return self._failed_reason is None and self._radius_failed_reason is None
-
-    @property
-    def radius_failed_reason(self) -> Optional[str]:
-        return self._radius_failed_reason
 
     @contextmanager
     def _lease_stream(self) -> Iterator[object]:
@@ -567,29 +537,9 @@ class CudaInterpolationRenderer:
                 self._clear_cache()
             return bool(first)
 
-    def disable_radius(self, exc: BaseException) -> bool:
-        """Disable only CUDA radius evaluation while preserving GPU painting."""
-
-        reason = f"{type(exc).__name__}: {exc}"
-        with self._lock:
-            first = self._radius_failed_reason is None
-            if first:
-                self._radius_failed_reason = reason
-                # A failed scan may have left valid but incomplete plan entries.  The
-                # CPU retry becomes authoritative, so force painting to reload those
-                # exact host sections instead of reusing a partial device cache.
-                self._cache_generation += 1
-                self._clear_cache()
-            return bool(first)
-
     def _ensure_available(self) -> None:
         if self._failed_reason is not None:
             raise GpuInterpolationUnavailable(self._failed_reason)
-
-    def _ensure_radius_available(self) -> None:
-        self._ensure_available()
-        if self._radius_failed_reason is not None:
-            raise GpuInterpolationUnavailable(self._radius_failed_reason)
 
     def _cache_get(
         self,
@@ -725,7 +675,7 @@ class CudaInterpolationRenderer:
         return self.xp.add(left, right) >= np.float32(0.0)
 
     def _keep_center_component_and_fill(
-        self, section: object, stream: object = None,
+        self, section: object, stream: object = None, fill_holes: bool = True,
     ) -> Optional[object]:
         with self._lock:
             if self._structure8 is None:
@@ -757,25 +707,10 @@ class CudaInterpolationRenderer:
                 nearest = _scalar_int(indices[_scalar_int(self.xp.argmin(d2))])
                 keep_label = _scalar_int(labels.reshape(-1)[int(nearest)])
             kept = labels == int(keep_label)
-        return self.ndi.binary_fill_holes(kept)
+        return self.ndi.binary_fill_holes(kept) if bool(fill_holes) else kept
 
-    def _distance_transform(self, section: object) -> object:
-        try:
-            return self.ndi.distance_transform_edt(
-                section, return_indices=False, float64_distances=False,
-            )
-        except TypeError:
-            # CuPy versions predating the float32 extension still provide the exact EDT.
-            return self.ndi.distance_transform_edt(section, return_indices=False)
-
-    def _section_radius(self, section: object) -> float:
-        if bool(_scalar_int(self.xp.all(section))):
-            return float(max(int(section.shape[0]), int(section.shape[1])))
-        distances = self._distance_transform(section)
-        return _scalar_float(self.xp.max(distances))
-
-    def preflight(self, *, check_radius: bool = True) -> None:
-        """Exercise requested CuPyX primitives before any host canvas can change."""
+    def preflight(self) -> None:
+        """Exercise the CuPyX render primitives before any host canvas can change."""
 
         with self._lock, self.runtime.activate():
             self._ensure_available()
@@ -786,10 +721,9 @@ class CudaInterpolationRenderer:
             kept = self._keep_center_component_and_fill(device_probe)
             if kept is None:
                 raise RuntimeError("CUDA interpolation preflight produced an empty component")
-            radius = self._section_radius(kept) if bool(check_radius) else 1.0
             host = self.runtime.to_host(kept)
             self._metrics["device_to_host_bytes"] += int(host.nbytes)
-            if host.shape != probe.shape or not bool(host[2, 2]) or radius <= 0.0:
+            if host.shape != probe.shape or not bool(host[2, 2]):
                 raise RuntimeError("CUDA interpolation preflight failed its morphology check")
             self._clear_cache()
             for key in self._metrics:
@@ -797,116 +731,15 @@ class CudaInterpolationRenderer:
                     0.0 if str(key).endswith("_seconds") else 0
                 )
 
-    def estimate_min_radius(
-        self,
-        plan: object,
-        *,
-        reject_at_or_below: float = 0.0,
-        cache_sections: bool = False,
-        cache_host_sections: bool = True,
-    ) -> float:
-        """GPU equivalent of the CPU accepted-bridge radius scan.
-
-        Production keeps accepted sections in the bounded device cache without copying
-        every bool canvas over PCIe.  Tests and compatibility callers can also request
-        host copies; CPU recovery can always reconstruct a missing section from the SDFs.
-        """
-
-        queued_at = time.perf_counter()
-        acquired_at: Optional[float] = None
-        try:
-            sdf0_host = np.asarray(getattr(plan, "sdf0"), dtype=np.float32)
-            sdf1_host = np.asarray(getattr(plan, "sdf1"), dtype=np.float32)
-            if not bool(np.any(sdf0_host >= 0.0)) or not bool(np.any(sdf1_host >= 0.0)):
-                return 0.0
-            min_radius = float(min(float(np.max(sdf0_host)), float(np.max(sdf1_host))))
-            threshold = float(reject_at_or_below)
-            if threshold > 0.0 and min_radius <= threshold:
-                return float(min_radius)
-
-            section_cache = getattr(plan, "cached_sections")
-            if bool(cache_sections):
-                section_cache[:] = [None] * (int(getattr(plan, "steps")) + 1)
-
-            with self._lease_stream() as stream:
-                with self._lock:
-                    acquired_at = time.perf_counter()
-                    self._metrics["radius_lock_wait_seconds"] = float(
-                        self._metrics["radius_lock_wait_seconds"]
-                    ) + max(0.0, acquired_at - queued_at)
-                    self._ensure_radius_available()
-                # Shared renderer metadata/cache mutations lock themselves. H2D staging,
-                # CuPyX execution, scalar completion reads, and D2H waits are stream-local.
-                sdf0, sdf1 = self._device_sdfs(plan, stream=stream)
-                with self._lock:
-                    self._metrics["estimated_plans"] = int(
-                        self._metrics["estimated_plans"]
-                    ) + 1
-                for idx in range(1, int(getattr(plan, "steps"))):
-                    alpha = float(idx) / float(getattr(plan, "steps"))
-                    section = self._blend_section(sdf0, sdf1, alpha)
-                    section = self._keep_center_component_and_fill(
-                        section, stream=stream,
-                    )
-                    if section is None:
-                        return 0.0
-                    if bool(cache_sections):
-                        if bool(cache_host_sections):
-                            pending_host_section = self._to_host_async(section, stream)
-                            host_completion = self._record_completion(stream)
-                            self._wait_completion(host_completion)
-                            host_section = np.ascontiguousarray(
-                                pending_host_section, dtype=bool,
-                            )
-                            with self._lock:
-                                self._metrics["device_to_host_bytes"] = int(
-                                    self._metrics["device_to_host_bytes"]
-                                ) + int(host_section.nbytes)
-                            section_cache[int(idx)] = host_section
-                        # Insert as the scan proceeds so the LRU budget also bounds a
-                        # long plan; the planner releases all entries if it rejects it.
-                        with self._lock:
-                            self._cache_put(
-                                ("section", id(section_cache), int(idx)),
-                                section,
-                                int(getattr(section, "nbytes")),
-                                (section_cache,),
-                                stream=stream,
-                            )
-                    min_radius = min(
-                        float(min_radius), float(self._section_radius(section)),
-                    )
-                    with self._lock:
-                        self._metrics["estimated_sections"] = int(
-                            self._metrics["estimated_sections"]
-                        ) + 1
-                    if threshold > 0.0 and min_radius <= threshold:
-                        return float(min_radius)
-
-                return float(min_radius)
-        finally:
-            if acquired_at is not None:
-                with self._lock:
-                    self._metrics["radius_execution_seconds"] = float(
-                        self._metrics["radius_execution_seconds"]
-                    ) + max(0.0, time.perf_counter() - acquired_at)
-
     def _device_section(
         self, plan: object, step_idx: int, stream: object = None,
     ) -> Optional[object]:
         section_cache = getattr(plan, "cached_sections")
         if int(step_idx) < len(section_cache):
-            key = ("section", id(section_cache), int(step_idx))
-            with self._lock:
-                cached_device = self._cache_get(
-                    key, (section_cache,), stream=stream,
-                )
-                cached_host = section_cache[int(step_idx)]
-            if cached_device is not None:
-                return cached_device
+            cached_host = section_cache[int(step_idx)]
             if cached_host is not None:
-                # CPU-radius mode retains the exact accepted section on the host.
-                # A plan-step is painted once, so putting this one-shot upload into
+                # The CPU radius evaluator retains the exact accepted section on the
+                # host. A plan-step is painted once, so putting this one-shot upload into
                 # the device LRU only evicts reusable SDF entries before later jobs.
                 host_section = np.asarray(cached_host, dtype=bool)
                 section = self._device_array(host_section)
@@ -919,7 +752,9 @@ class CudaInterpolationRenderer:
         sdf0, sdf1 = self._device_sdfs(plan, stream=stream)
         alpha = float(step_idx) / float(getattr(plan, "steps"))
         section = self._keep_center_component_and_fill(
-            self._blend_section(sdf0, sdf1, alpha), stream=stream,
+            self._blend_section(sdf0, sdf1, alpha),
+            stream=stream,
+            fill_holes=bool(getattr(plan, "fill_section_holes")),
         )
         self._retain_for_stream_lease(section)
         return section
@@ -1003,8 +838,8 @@ class CudaInterpolationRenderer:
                     value = self.xp.asarray(int(paint_value), dtype=current.dtype)
                     missing = patch & ((self.xp.bitwise_and(current, value)) == 0)
                     # Queue reductions and fetch all tiny scalars together after every
-                    # section has been painted. v17.1.1 called .item() twice per job,
-                    # forcing thousands of device synchronizations in a typical slice.
+                    # section has been painted; a per-job .item() would force one device
+                    # synchronization per job (thousands per typical slice).
                     nonempty_flags_device.append(self.xp.any(patch))
                     added_counts_device.append(self.xp.count_nonzero(missing))
                     patch_pixels += int(patch.size)
@@ -1107,17 +942,11 @@ class CudaInterpolationRenderer:
         """Release device cache entries owned by a completed host plan batch."""
 
         sdf_ids = set()
-        section_ids = set()
         for plan in plans:
             sdf_ids.add((id(getattr(plan, "sdf0")), id(getattr(plan, "sdf1"))))
-            section_ids.add(id(getattr(plan, "cached_sections")))
         with self._lock:
             for key in list(self._cache):
-                remove = (
-                    key[0] == "sdf" and (int(key[1]), int(key[2])) in sdf_ids
-                ) or (
-                    key[0] == "section" and int(key[1]) in section_ids
-                )
+                remove = key[0] == "sdf" and (int(key[1]), int(key[2])) in sdf_ids
                 if not remove:
                     continue
                 entry = self._cache.pop(key)
@@ -1135,7 +964,6 @@ class CudaInterpolationRenderer:
                 "cache_live_bytes": int(self._cache_live_bytes),
                 "max_streams": int(self.max_streams),
                 "failed_reason": self._failed_reason,
-                "radius_failed_reason": self._radius_failed_reason,
             })
             return result
 
@@ -1204,23 +1032,11 @@ def create_cuda_interpolation_renderer(
                 f"only {int(free_bytes) / MIB:.0f} MiB VRAM free; "
                 f"{int(renderer.reserve_bytes) / MIB:.0f} MiB is reserved"
             )
-        radius_requested = bool(gpu_interpolation_radius_enabled())
-        try:
-            renderer.preflight(check_radius=bool(radius_requested))
-        except Exception as exc:
-            if not bool(radius_requested):
-                raise
-            renderer.disable_radius(exc)
-            # EDT/radius support is an optional capability. Re-run the render
-            # morphology preflight so a radius-only failure cannot prevent the
-            # default GPU painting path from being admitted.
-            renderer.preflight(check_radius=False)
+        renderer.preflight()
         status = f"cuda:{int(device_index)} CuPy/CuPyX"
         visible_token = getattr(renderer, "visible_device_token", None)
         if visible_token is not None:
             status += f" [CUDA_VISIBLE_DEVICES={visible_token}]"
-        if renderer.radius_failed_reason:
-            status += f"; radius unavailable ({renderer.radius_failed_reason})"
         return renderer, status
     except Exception as exc:
         if renderer is not None:
@@ -1239,7 +1055,6 @@ __all__ = (
     "gpu_interpolation_create_context_enabled",
     "gpu_interpolation_enabled",
     "gpu_interpolation_main_process_enabled",
-    "gpu_interpolation_radius_enabled",
     "gpu_interpolation_render_autotune_enabled",
     "gpu_interpolation_required",
     "gpu_interpolation_stream_count",

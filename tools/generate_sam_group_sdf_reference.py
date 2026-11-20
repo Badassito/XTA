@@ -45,7 +45,7 @@ def reconstruct_group_observations(bundle,group):
 def generate(evidence,output,*,max_group_voxels=8_000_000,workers=1,max_distance=15,search_angle=30.,walk_back=0):
     for key in ("YOLO_TTA_GPU_INTERPOLATION","YOLO_TTA_GPU_SLICE_LABELING",
         "YOLO_TTA_GPU_SLICE_LABELING_PAIRS","YOLO_TTA_GPU_SLICE_LABELING_IN_CHILDREN",
-        "YOLO_TTA_GPU_INTERPOLATION_RADIUS","YOLO_TTA_GPU_INTERPOLATION_REQUIRED",
+        "YOLO_TTA_GPU_INTERPOLATION_REQUIRED",
         "YOLO_TTA_TELEMETRY_SYSTEM_SAMPLER"):
         os.environ[key] = "0"
     os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
@@ -78,7 +78,7 @@ def generate(evidence,output,*,max_group_voxels=8_000_000,workers=1,max_distance
             threshold = float(group["interpolation_min_radius"])
             with mock.patch.object(interpolation,"create_cuda_interpolation_renderer",return_value=(None,"forced CPU group reference")):
                 statistics = interpolation.interpolate_view_volume_pass_inplace(prediction,destination/"work","group_reference",
-                    max_distance,search_angle,walk_back,1,threshold,keep_temp=False,prefer_memory=True,reserve_bytes=0,workers=workers)
+                    max_distance,search_angle,walk_back,1,threshold,prefer_memory=True,reserve_bytes=0,workers=workers)
             if np.any((original!=0)&(prediction==0)):
                 raise ValueError("SDF removed a retained original observation")
             if any("cuda" in str(statistics.get(key,"")).lower() for key in ("interpolation_render_backend","interpolation_radius_backend")):

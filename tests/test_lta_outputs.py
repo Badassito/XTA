@@ -15,9 +15,9 @@ from XTA.lta_outputs import (
     LtaCheckpointArtifact,
     LtaLayerRecord,
     LtaPublicationReceipt,
-    compose_terminal_union,
     write_complete_lta_manifest,
 )
+from tests.reference_backends.lta_composition import compose_terminal_union
 
 
 class LtaOutputTests(unittest.TestCase):

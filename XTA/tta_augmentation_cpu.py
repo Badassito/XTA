@@ -10,6 +10,9 @@ import numpy as np
 
 from .tta_augmentation_config import TtaAugmentationSettings
 
+# Replay contract -> space in which the policy adds its elastic displacement d(y).
+_REPLAY_CONTRACTS = {'opencv-affine-elastic-v1': 'source', 'opencv-affine-elastic-v2': 'raster'}
+
 
 def _bilinear_displacement(field: np.ndarray, xy: np.ndarray):
     h, w = field.shape[:2]
@@ -26,13 +29,18 @@ def _bilinear_displacement(field: np.ndarray, xy: np.ndarray):
 
 
 def inverse_policy_grid_cpu(forward: np.ndarray, displacement: np.ndarray | None,
-                            height: int, width: int, *, iterations: int = 16,
-                            tolerance: float = 0.05, strip_rows: int = 128):
-    """Solve x = inv(A)y + d(y); reject folds, cropped pixels and failed solves.
+                            height: int, width: int, *, displacement_space: str = 'raster',
+                            iterations: int = 16, tolerance: float = 0.05, strip_rows: int = 128):
+    """Find the augmented position y of each source pixel x; reject folds, cropped pixels and failed solves.
 
-    Coordinates are pixel centers in the augmented raster. The Jacobian uses
-    exact bilinear displacement derivatives, including reflected affine maps.
+    displacement_space='raster' inverts x = inv(A)(y + d(y)) by solving
+    y + d(y) = A x, so the residual and tolerance are in augmented-raster
+    pixels. 'source' inverts x = inv(A)y + d(y) with a source-pixel residual.
+    Coordinates are pixel centers. The Jacobian uses exact bilinear
+    displacement derivatives, including reflected affine maps.
     """
+    if displacement_space not in ('source', 'raster'):
+        raise ValueError("displacement_space must be 'source' or 'raster'")
     forward = np.asarray(forward, dtype=np.float64)
     if forward.shape != (3, 3) or not np.isfinite(forward).all():
         raise ValueError('CPU policy forward matrix must be finite 3x3')
@@ -45,18 +53,22 @@ def inverse_policy_grid_cpu(forward: np.ndarray, displacement: np.ndarray | None
         if displacement.shape != (h, w, 2) or not np.isfinite(displacement).all():
             raise ValueError('CPU displacement must be finite HxWx2')
     output, validity = np.empty((h, w, 2), np.float32), np.empty((h, w), bool)
-    det_base = np.linalg.det(inverse[:2, :2])
+    raster = displacement_space == 'raster'
+    # Elastic residual: linear @ y + offset + d(y) - goal.
+    linear, offset = (np.eye(2), np.zeros(2)) if raster else (inverse[:2, :2], inverse[:2, 2])
+    det_base = np.linalg.det(linear)
     for row in range(0, h, max(1, strip_rows)):
         yy, xx = np.mgrid[row:min(h, row + strip_rows), 0:w]
         target = np.stack((xx, yy), axis=-1).astype(np.float64)
         current = target @ forward[:2, :2].T + forward[:2, 2]
+        goal = current.copy() if raster else target
         orientation_ok = np.ones(xx.shape, bool)
         if displacement is not None:
             for _ in range(iterations):
                 delta, dx, dy = _bilinear_displacement(displacement, current)
-                residual = current @ inverse[:2, :2].T + inverse[:2, 2] + delta - target
-                a, b = inverse[0, 0] + dx[..., 0], inverse[0, 1] + dy[..., 0]
-                c, d = inverse[1, 0] + dx[..., 1], inverse[1, 1] + dy[..., 1]
+                residual = current @ linear.T + offset + delta - goal
+                a, b = linear[0, 0] + dx[..., 0], linear[0, 1] + dy[..., 0]
+                c, d = linear[1, 0] + dx[..., 1], linear[1, 1] + dy[..., 1]
                 det = a * d - b * c
                 denominator = np.where(np.abs(det) > 1e-7, det, 1.)
                 step = np.stack(((d * residual[..., 0] - b * residual[..., 1]) / denominator,
@@ -64,9 +76,9 @@ def inverse_policy_grid_cpu(forward: np.ndarray, displacement: np.ndarray | None
                 current = np.nan_to_num(current - np.clip(step, -32., 32.),
                                         nan=-1e6, posinf=1e6, neginf=-1e6)
             delta, dx, dy = _bilinear_displacement(displacement, current)
-            residual = current @ inverse[:2, :2].T + inverse[:2, 2] + delta - target
-            det = ((inverse[0, 0] + dx[..., 0]) * (inverse[1, 1] + dy[..., 1])
-                   - (inverse[0, 1] + dy[..., 0]) * (inverse[1, 0] + dx[..., 1]))
+            residual = current @ linear.T + offset + delta - goal
+            det = ((linear[0, 0] + dx[..., 0]) * (linear[1, 1] + dy[..., 1])
+                   - (linear[0, 1] + dy[..., 0]) * (linear[1, 0] + dx[..., 1]))
             orientation_ok = (det * det_base > 0) & (np.abs(det) > 1e-7)
         else:
             residual = current @ inverse[:2, :2].T + inverse[:2, 2] - target
@@ -114,8 +126,9 @@ class CpuPolicyAdapter:
         self._cache: OrderedDict[tuple[int, int, int], CpuSpatialReplay] = OrderedDict()
         self._cache_size = 0
         self.custom = callable(getattr(policy, 'apply_tta_batch', None))
+        self.displacement_space = _REPLAY_CONTRACTS.get(getattr(policy, 'tta_replay_contract', ''))
         required = ('_sample_parameters', '_forward_matrix', '_elastic_displacement', '_apply_intensity_noise')
-        if not self.custom and (getattr(policy, 'tta_replay_contract', '') != 'opencv-affine-elastic-v1'
+        if not self.custom and (self.displacement_space is None
                                 or any(not callable(getattr(policy, name, None)) for name in required)):
             raise TypeError('CPU policy has no supported inverse contract. Use a shipped CPU_*.py profile '
                             'or implement apply_tta_batch(images=..., seeds=...) returning uint8 NHWC images, '
@@ -130,12 +143,17 @@ class CpuPolicyAdapter:
         params = self.policy._sample_parameters(int(seed), height, width)
         forward = np.asarray(self.policy._forward_matrix(params, height, width), dtype=np.float64)
         displacement = self.policy._elastic_displacement(int(seed), height, width) if params['elastic'] else None
-        inverse_grid, valid = inverse_policy_grid_cpu(forward, displacement, height, width)
+        inverse_grid, valid = inverse_policy_grid_cpu(forward, displacement, height, width,
+                                                      displacement_space=self.displacement_space)
         inv = np.linalg.inv(forward)
         yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
         source = np.stack(((inv[0, 0] * xx + inv[0, 1] * yy + inv[0, 2]).astype(np.float32),
                            (inv[1, 0] * xx + inv[1, 1] * yy + inv[1, 2]).astype(np.float32)), axis=-1)
-        if displacement is not None:
+        if displacement is not None and self.displacement_space == 'raster':
+            # The shipped presets' exact expression keeps replay pixels bit-equal.
+            source[..., 0] += (inv[0, 0] * displacement[..., 0] + inv[0, 1] * displacement[..., 1]).astype(np.float32)
+            source[..., 1] += (inv[1, 0] * displacement[..., 0] + inv[1, 1] * displacement[..., 1]).astype(np.float32)
+        elif displacement is not None:
             source += displacement
         replay = CpuSpatialReplay(source, inverse_grid, valid, params)
         while self._cache and self._cache_size + replay.nbytes > self.cache_bytes:

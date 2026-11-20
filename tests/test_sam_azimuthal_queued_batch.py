@@ -170,3 +170,31 @@ def test_larger_admitted_gpu_workspace_only_changes_the_device_cap():
     assert larger['device_cap_bytes'] >= legacy['device_cap_bytes']
     assert larger['host_cap_bytes'] == legacy['host_cap_bytes'] == 256*1024**2
     assert legacy == batch.batch_workspace_ledger(**common, device_scratch_bytes=None)
+
+
+@pytest.mark.parametrize('output_shape_yx', [(7, 9), (1024, 1024), (1100, 1100)])
+def test_planned_host_charge_covers_one_extra_staged_result(output_shape_yx):
+    """The depth host charges cover the depth + 1 results referenced at the peak.
+
+    render_compatible_chunks keeps the newest staged chunk plus ``depth`` chunks
+    awaiting the sink. The depth > 1 receipt sums the first ``depth`` plans; the
+    depth = 1 fallback is bounded by the largest plan.
+    """
+    height, width = output_shape_yx
+
+    def host_bytes(size):
+        return batch.batch_workspace_ledger(
+            batch_size=size, native_shape_yx=(41, 53), logical_t=7, roi_shape_yx=(20, 30),
+            output_shape_yx=output_shape_yx, selected_rows=40, scalar_row_block=16,
+            scratch_bytes=1 << 40, retained_cache_bytes=0)['host_bytes']
+
+    for count in range(2, 70):
+        sizes = batch.chunk_sizes(count)
+        result_bytes = [size*height*width for size in sizes]  # one (size, H, W) uint8 result
+        charges = [host_bytes(size) for size in sizes]
+        for depth in range(1, 6):
+            live = min(depth+1, len(sizes))
+            peak = max(sum(result_bytes[i:i+live]) for i in range(len(sizes)-live+1))
+            assert peak <= sum(charges[:depth]), (count, depth)
+        two = min(2, len(sizes))
+        assert max(sum(result_bytes[i:i+two]) for i in range(len(sizes)-two+1)) <= max(charges)

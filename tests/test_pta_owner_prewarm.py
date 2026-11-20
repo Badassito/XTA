@@ -186,9 +186,9 @@ def _warmup_state_probe():
 
 @pytest.mark.parametrize('method', ['fork', 'spawn'])
 def test_pool_initializer_failure_reaches_tasks_without_respawning(monkeypatch, tmp_path, method):
-    # Production GPU owners fork; spawn exercises the same initializer contract on Windows.
+    # GPU owners fork where the host supports it and spawn elsewhere (e.g. Windows).
     if method == 'fork' and not pta_workers.gpu_fork_render_backend_available():
-        pytest.skip('fork-only GPU pool')
+        pytest.skip('host has no fork start method')
     monkeypatch.setenv('YOLO_TTA_TELEMETRY', '0')
     monkeypatch.setattr(pta_workers, '_WORKER_STATIC', {})
     pta_workers.set_worker_static_context(
@@ -499,13 +499,11 @@ def _cpr_plan(tmp_path):
 
 
 @pytest.mark.parametrize('setting', [None, 'SPHERICAL', 'RADIAL', 'AZIMUTHAL', 'TILTED', 'CARTESIAN', 'CPR',
-                                     'source_mode', 'disabled'])
+                                     'disabled'])
 def test_static_gate_matches_render_path_calls(tmp_path, monkeypatch, telemetry, setting):
     from tools.qualify_pta_gpu_masks import build_cases
 
-    if setting == 'source_mode':
-        monkeypatch.setenv('YOLO_TTA_AZIMUTHAL_SOURCE_MODE', 'nearest_xy_linear_t')
-    elif setting is not None and setting != 'disabled':
+    if setting is not None and setting != 'disabled':
         monkeypatch.setenv(f'YOLO_TTA_PTA_GPU_{setting}_RENDER', '0')
     cases = [(family, plan, frame) for family, plan, frame, item in build_cases(tmp_path, 24, 32, 16)
              if item == 'full']

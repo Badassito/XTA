@@ -238,12 +238,21 @@ class D1ConfidenceCudaTests(unittest.TestCase):
                             torch.where(proto[0] > 0, head[4, 0].float(), 0.),
                             torch.where(proto[1] > 0, head[4, 1].float(), 0.))
                         self.assertTrue(torch.equal(scored.conf_proto, raw_scores))
+                        # Closing writes its own planes; max_logit stays the raw union.
+                        raw_logit = torch.maximum(proto[0], proto[1]).float()
+                        self.assertTrue(torch.equal(scored.max_logit, raw_logit))
                         if np.array_equal(matrix, matrices[0]):
                             import torch.nn.functional as F
-                            expected = (F.interpolate(raw_scores[None, None], size=(64, 64),
-                                                      mode='nearest')[0, 0] * 255).round().to(torch.uint8)
+                            raw_union = (F.interpolate(raw_logit[None, None], size=(64, 64), mode='bilinear',
+                                                       align_corners=False)[0, 0] > 0).float()
+                            expected = (inference._upsample_proto_confidence(
+                                raw_scores, raw_union, (64, 64)) * 255).round().to(torch.uint8)
                             expected[scored.native_union == 0] = 0
                             self.assertTrue(torch.equal(scored.native_conf, expected))
+                            if policy == 'legacy_proto':
+                                closing_only = (scored.native_union != 0) & (raw_union == 0)
+                                self.assertTrue(bool(closing_only.any()))
+                                self.assertTrue(bool((scored.native_conf[closing_only] == 0).all()))
 
 
 if __name__ == '__main__':

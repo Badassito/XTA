@@ -99,6 +99,7 @@ def test_sparse_packet_actual_direct_torch_decode_matches_independent_dense(
     monkeypatch, head_name, proto_name, floor, scenario,
 ):
     torch = pytest.importorskip('torch')
+    cuda_was_initialized = torch.cuda.is_initialized()
     codec = pytest.importorskip('XTA.forward_replay_sparse')
     image, head, proto = raw_fixture(torch, getattr(torch, head_name), getattr(torch, proto_name), scenario)
     class Backend:
@@ -141,11 +142,14 @@ def test_sparse_packet_actual_direct_torch_decode_matches_independent_dense(
         # slightly below FP32(.2). Conservative packet admission must retain it.
         assert float(head[0, 4, 2]) < float(torch.tensor(.2, dtype=torch.float32))
         assert active.cache.restored[0][0, 4, 2] == head[0, 4, 2]
-    assert not torch.cuda.is_initialized()
+    # CPU-tensor decode must not initialize CUDA. An earlier in-process CUDA
+    # test may already have done so; only a new initialization is a failure.
+    assert cuda_was_initialized or not torch.cuda.is_initialized()
 
 @pytest.mark.parametrize('route', ['gpu-segmentation-direct', 'gpu-segmentation-trt-ring'])
 def test_sparse_disk_packet_route_restores_actual_direct_decode(monkeypatch, tmp_path, route):
     torch = pytest.importorskip('torch')
+    cuda_was_initialized = torch.cuda.is_initialized()
     pytest.importorskip('XTA.forward_replay_sparse')
     model = tmp_path / 'qualified.pt'
     model.write_bytes(b'sparse raw forward identity fixture')
@@ -186,4 +190,6 @@ def test_sparse_disk_packet_route_restores_actual_direct_decode(monkeypatch, tmp
     assert summary['entries'] == 1
     assert summary['by_backend'][route]['sparse_instance_stored'] == 1
     assert summary['by_backend'][route]['hit'] == 2
-    assert not torch.cuda.is_initialized()
+    # CPU-tensor decode must not initialize CUDA. An earlier in-process CUDA
+    # test may already have done so; only a new initialization is a failure.
+    assert cuda_was_initialized or not torch.cuda.is_initialized()

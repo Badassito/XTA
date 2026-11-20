@@ -10,14 +10,15 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from pathlib import Path
 import threading
 import time
 
 import numpy as np
 
+from .file_hashing import source_sha256
+
 CANONICAL_CROP_RENDER_CONTRACT = 'xta.sam_global_canonical_warp_crop/1'
-IMPLEMENTATION_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+IMPLEMENTATION_SHA256 = source_sha256(__file__)
 CANONICAL_PHASE_SELF_CHECK_CONTRACT = 'xta.sam_canonical_phase_self_check/1'
 NATIVE_SHELL_CROP_CONTRACT = 'xta.sam_native_shell_demand_crop/1'
 NATIVE_TILTED_CROP_CONTRACT = 'xta.sam_native_tilted_demand_crop/1'

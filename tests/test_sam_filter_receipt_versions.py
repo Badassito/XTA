@@ -47,7 +47,9 @@ def _legacy_spec(bundle):
 @pytest.mark.parametrize('implementation', [filtering._QUALIFIED_LEGACY_IMPLEMENTATION,
                                            filtering._QUALIFIED_PREVIOUS_IMPLEMENTATION,
                                            filtering._QUALIFIED_RADIUS_ONLY_IMPLEMENTATION,
-                                           filtering._QUALIFIED_PRE_BOOLEAN_IMPLEMENTATION])
+                                           filtering._QUALIFIED_PRE_BOOLEAN_IMPLEMENTATION,
+                                           filtering._QUALIFIED_V25_SOURCE_GUARD_IMPLEMENTATION,
+                                           filtering._QUALIFIED_V26_SOURCE_GUARD_IMPLEMENTATION])
 def test_qualified_legacy_filter_has_exact_current_pixels(implementation):
     bundle = _Bundle()
     current = filtering.effective_candidate_mask(bundle, "r", 0, filtering.build_mask_filter(bundle))
@@ -70,6 +72,16 @@ def test_old_compatibility_rejects_changed_numerical_function(monkeypatch):
     monkeypatch.setattr(filtering, "filter_sam_components", changed_filter)
     with pytest.raises(ValueError, match="implementation differs"):
         filtering.effective_candidate_mask(bundle, "r", 0, spec)
+
+
+def test_numerical_pin_is_read_once_per_process(monkeypatch):
+    assert filtering._compatible_filter_implementation(filtering._QUALIFIED_V26_SOURCE_GUARD_IMPLEMENTATION)
+
+    def unavailable(*args, **kwargs):
+        raise AssertionError("numerical helper source was re-read")
+    monkeypatch.setattr(filtering.inspect, "getsource", unavailable)
+    assert filtering._compatible_filter_implementation(filtering._QUALIFIED_V26_SOURCE_GUARD_IMPLEMENTATION)
+    assert filtering._compatible_filter_implementation(filtering._QUALIFIED_LEGACY_IMPLEMENTATION)
 
 
 def test_unknown_implementation_is_not_accepted_as_compatible():

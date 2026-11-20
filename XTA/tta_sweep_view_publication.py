@@ -9,6 +9,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from collections import Counter
 from dataclasses import asdict, fields
+import errno
 from functools import partial
 import hashlib
 import json
@@ -96,36 +97,98 @@ def _load_ref(record, work):
     return NrrdLayerRef(path=path, **values)
 
 
+_STORAGE_THREAD_LOCKS = {}
+_STORAGE_THREAD_LOCKS_GUARD = threading.Lock()
+# Filesystems that cannot lock at all (fixed per mount, so every child agrees).
+_OS_LOCK_UNSUPPORTED = frozenset({errno.ENOSYS, errno.EOPNOTSUPP, getattr(errno, "ENOTSUP", errno.EOPNOTSUPP)})
+# Another owner holds the lock; ENOLCK (lock records exhausted) is transient too.
+_OS_LOCK_BUSY = frozenset({errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK, errno.ENOLCK,
+                           getattr(errno, "EDEADLOCK", errno.EDEADLK)})
+
+
+def _reset_storage_thread_locks():
+    global _STORAGE_THREAD_LOCKS, _STORAGE_THREAD_LOCKS_GUARD
+    # A parent thread may have held one at fork; the child must not inherit it.
+    _STORAGE_THREAD_LOCKS, _STORAGE_THREAD_LOCKS_GUARD = {}, threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_storage_thread_locks)
+
+
 class _StorageFileLock:
     """Serialize read-modify-write of fanout_storage.json across scalar child processes.
 
     Concurrent later-cut children retire their own projected stores and update
-    the shared family counters. An exclusive companion lock file works on every
-    filesystem the sweep supports, including Windows and NFS without flock. The
-    critical section only reads and writes one small JSON file, so a lock older
-    than ``stale_seconds`` belongs to a killed owner; recovery starts well
-    before a waiter's ``timeout``. These counters are diagnostics; outputs never
-    depend on them.
+    the shared family counters. The kernel lock on the persistent ``.flock``
+    companion (flock, or msvcrt on Windows) is released when its owner exits,
+    so a slow live owner is never preempted and a killed one never blocks.
+    Threads of one process take a per-path thread lock first, because NFS
+    emulates flock with per-process POSIX locks. Only a filesystem that cannot lock
+    at all uses the exclusive-create ``.lock`` lease, which treats a lease
+    older than ``stale_seconds`` as a killed owner's. These counters are
+    diagnostics; outputs never depend on them.
     """
 
     def __init__(self, path, *, timeout=600.0, stale_seconds=60.0):
+        self.os_lock_path = Path(str(path) + ".flock")
         self.path = Path(str(path) + ".lock")
         self.timeout = float(timeout)
         self.stale_seconds = min(float(stale_seconds), self.timeout / 4)
         self._fd = None
+        self._mode = None
+        with _STORAGE_THREAD_LOCKS_GUARD:
+            self._thread_lock = _STORAGE_THREAD_LOCKS.setdefault(str(self.os_lock_path), threading.Lock())
 
     def __enter__(self):
-        import time
         deadline = time.monotonic() + self.timeout
         delay = 0.005
 
-        def backoff():
+        def backoff(waited):
             nonlocal delay
             if time.monotonic() > deadline:
-                raise TimeoutError(f"Timed out waiting for sweep storage lock {self.path}")
+                raise TimeoutError(f"Timed out waiting for sweep storage lock {waited}")
             time.sleep(delay)
             delay = min(0.1, delay * 2)
 
+        if not self._thread_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            raise TimeoutError("Timed out waiting for another thread of this process to release the "
+                               f"sweep storage lock on {self.path.with_suffix('')}")
+        try:
+            if not self._os_lock(backoff):
+                self._lease(backoff)
+        except BaseException:
+            self._thread_lock.release()
+            raise
+        return self
+
+    def _os_lock(self, backoff):
+        """Take the kernel lock; False when this filesystem cannot lock."""
+        fd = os.open(self.os_lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o644)
+        try:
+            while True:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as error:
+                    if error.errno in _OS_LOCK_UNSUPPORTED:
+                        return False
+                    if error.errno not in _OS_LOCK_BUSY:
+                        raise
+                    backoff(self.os_lock_path)
+                    continue
+                self._fd, self._mode, fd = fd, "os", None
+                return True
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def _lease(self, backoff):
         while True:
             try:
                 fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
@@ -137,15 +200,15 @@ class _StorageFileLock:
                 try:
                     age = time.time() - self.path.stat().st_mtime
                 except (FileNotFoundError, PermissionError):
-                    backoff()
+                    backoff(self.path)
                     continue
                 if age > self.stale_seconds:
                     try:
-                        self.path.unlink()
-                    except (FileNotFoundError, PermissionError):
-                        pass  # gone already, or a live owner holds it open on Windows
-                    continue
-                backoff()
+                        self.path.unlink(missing_ok=True)
+                        continue  # a killed owner's lease, or another waiter removed it
+                    except PermissionError:
+                        pass  # a live owner holds it open on Windows: wait, never spin
+                backoff(self.path)
                 continue
             try:
                 os.write(fd, str(os.getpid()).encode("ascii") + b"\n")
@@ -156,18 +219,30 @@ class _StorageFileLock:
                 except OSError:
                     pass
                 raise
-            self._fd = fd
-            return self
+            self._fd, self._mode = fd, "lease"
+            return
 
     def __exit__(self, *_):
+        fd, mode, self._fd, self._mode = self._fd, self._mode, None, None
         try:
-            os.close(self._fd)
+            if mode == "os":
+                # Never unlink the kernel-locked file: a waiter may hold it open.
+                if os.name == "nt":
+                    import msvcrt
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
-            self._fd = None
             try:
-                self.path.unlink()
-            except FileNotFoundError:
-                pass
+                os.close(fd)
+            finally:
+                try:
+                    if mode == "lease":
+                        self.path.unlink(missing_ok=True)
+                finally:
+                    self._thread_lock.release()
 
 
 def _record_publication_stages(view, metrics, confidence_thread_seconds, layers_seconds,

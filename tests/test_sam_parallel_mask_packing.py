@@ -352,6 +352,16 @@ def test_live_owner_permission_cannot_be_replayed_on_worker(tmp_path):
     writer.abort()
 
 
+def test_unregistered_packing_admission_cannot_lend_scope_credit():
+    with admitted() as (_, _, scope, permit):
+        assert permit.validate() is permit
+        unregistered = resources.SamMaskPackingAdmission(scope)
+        with pytest.raises(RuntimeError, match='expired'):
+            unregistered.validate()
+        with pytest.raises(RuntimeError, match='expired'):
+            unregistered.scratch_bytes(1024)
+
+
 def test_staged_read_records_wait_for_pending_encoder(tmp_path, monkeypatch):
     original = evidence._encode_mask
     release, waiting = threading.Event(), threading.Event()

@@ -186,29 +186,6 @@ def _plane_shape(integers):
                                                else (int(ot), int(oh)))
 
 
-def estimate_native_pull_plan_bytes(view, source_shape, output_shape):
-    """Conservatively preflight initializer and optional packed-plane ownership.
-
-    Python frame records and temporary lookup ramps are included in the
-    initializer peak. No axis table, destination plane or source mask is
-    allocated by this estimator; returned plans retain only numeric geometry.
-    """
-    from .geometry import azimuthal_base_view_name, is_azimuthal_view
-    source_shape, output_shape, estimates = _preflight(view, source_shape, output_shape)
-    base_bytes = estimates['initialization_peak_bytes']
-    if not is_azimuthal_view(view):
-        return dict(base_bytes=base_bytes, cached_plane_bytes=0, build_temporary_bytes=0,
-                    total_peak_bytes=base_bytes, **estimates)
-    key_bytes = 4 if source_shape[0] * source_shape[2] < np.iinfo(np.uint32).max else 8
-    base = azimuthal_base_view_name(view)
-    axes = {'transverse': (1, 2), 'sagittal': (0, 2), 'coronal': (0, 1)}[base]
-    plane_bytes = output_shape[axes[0]] * output_shape[axes[1]] * key_bytes
-    return dict(base_bytes=base_bytes, cached_plane_bytes=plane_bytes,
-                build_temporary_bytes=_POINT_BYTES,
-                total_peak_bytes=max(base_bytes, estimates['persistent_bytes_estimate'] + plane_bytes + _POINT_BYTES),
-                **estimates)
-
-
 # Actual peak bytes per point of the hybrid angular-key build below: float32
 # dy/dx (8 B) and the arctan2/degrees results (8 B). ROI-boundary points
 # re-measured by np.hypot are resolved in rounds of at most
@@ -874,39 +851,3 @@ def pull_native_encoded_flat_into(encoded, index, packed_input, plan, output_fla
         keys,cached,plan.invalid_key,plan.row_lookup)
     return dict(destination_voxels_visited=int(visited),contribution_addresses=int(addresses),
         indexed_input_byte_reads=int(reads),projected_contributions=int(positive))
-
-
-def warm_native_pull_kernels(*, include_strided=False):
-    """Explicitly separate fixed-signature JIT control from numeric workspace.
-
-    This uses only tiny synthetic arrays, no scientific source/geometry or
-    cached native plane. Production may pay cold JIT on its first pull;
-    workspace qualification can call this before tracing numeric allocations.
-    """
-    import time
-    started = time.perf_counter()
-    integer = _readonly(np.asarray((0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 1), np.int64))
-    coefficient = _readonly(np.asarray((0., 0., .5, 1., 0., 0., 0., 1., 0.,
-                                        1., 1., 1., .5, .5, .5), np.float64))
-    bbox = np.asarray((0, 0, 0, 2, 2, 2), np.int64)
-    row_lookup = _readonly(np.arange(2, dtype=np.int32))
-    key_mutable = np.zeros(4, np.uint32)
-    key_readonly = _readonly(key_mutable.copy())
-    output = np.empty(4, np.uint8)
-    for readonly in (False, True):
-        source = np.zeros((2, 2, 2), np.uint8)
-        source[0, 0, 0] = 17
-        if readonly:
-            source.setflags(write=False)
-        sources = (source, source[:, :, ::-1]) if include_strided else (source,)
-        for borrowed in sources:
-            _pull_tilted(borrowed, output, 0, integer, coefficient, bbox, False)
-            _pull_azimuthal(borrowed, output, 0, integer, coefficient, bbox, False,
-                            key_readonly, True, np.uint64(np.iinfo(np.uint32).max), row_lookup)
-            _pull_azimuthal(borrowed, output, 0, integer, coefficient, bbox, True,
-                            key_mutable, False, np.uint64(np.iinfo(np.uint32).max), row_lookup)
-    return dict(scope='fixed-shape CPU compiler-control warmup; no scientific input',
-                elapsed_seconds=time.perf_counter() - started,
-                tilted_signatures=len(_pull_tilted.nopython_signatures),
-                azimuthal_signatures=len(_pull_azimuthal.nopython_signatures),
-                include_strided=bool(include_strided))

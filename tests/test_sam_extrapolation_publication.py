@@ -234,7 +234,7 @@ def test_fullframe_extrapolation_uses_completed_local_baseline_and_excludes_tail
             temp_dir=tmp_path, dense_tiling_active=True, min_conf=0., min_radius=0.,
             interpolate=distance, interpolation_walk_back=0, interpolation_candidates=1,
             interpolate_passes=1, interpolate_min_radius=0., interpolation_search_angle=0.,
-            keep_temp=True, slice_workers=1, interpolation_task_workers=1,
+            slice_workers=1, interpolation_task_workers=1,
             interpolation_backend=backend, sam_context=context,
             extrapolation_distance=2, extrapolation_min_radius=0.)
     try:

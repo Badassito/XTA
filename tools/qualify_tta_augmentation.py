@@ -88,6 +88,7 @@ def main() -> int:
     parser.add_argument('--augmentation_ratio', type=int, default=3)
     parser.add_argument('--augmentation_profile', choices=('light', 'baseline', 'heavy', 'superheavy'), default='light')
     parser.add_argument('--augmentation_granularity', choices=('slice', 'slab', 'lease', 'view'), default='slice')
+    parser.add_argument('--augmentation_coverage', choices=('packed', 'none'), default='packed')
     parser.add_argument('--enable_spherical', nargs='+', default=[])
     parser.add_argument('--enable_tilted', nargs='+', default=[])
     parser.add_argument('--enable_radial', nargs='+', default=[])
@@ -133,7 +134,7 @@ def main() -> int:
             '--augmentation', str(ROOT / 'XTA/examples/external_augmentations' / f'GPU_{args.augmentation_profile}.py'),
             '--augmentation_ratio', str(args.augmentation_ratio),
             '--augmentation_granularity', args.augmentation_granularity,
-            '--augmentation_coverage', 'packed', '--save', 'nrrd', 'summary', 'voxel_volume']
+            '--augmentation_coverage', args.augmentation_coverage, '--save', 'nrrd', 'summary', 'voxel_volume']
     argv.extend(['--enable_azimuthal', *args.enable_azimuthal])
     if args.enable_tilted:
         argv.extend(['--enable_tilted', *args.enable_tilted])

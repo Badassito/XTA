@@ -102,9 +102,13 @@ xta register yolo --packet sample01_mapping.zip --labels earlier_labels --output
 Each supplied annotation is rasterized as a one-voxel-thick native slab.
 Nearest-neighbor 3D reslicing can distribute one slab across several target
 planes. The result includes partial YOLO polygons, exact cropped class masks
-and annotation coverage. Holes and thin components can be lost in the polygon
-representation. The transfer manifest quantifies that loss. Use the
-resliced-movie workflow above for ordinary whole-slice supervision.
+and annotation coverage. Thin components can be lost in the polygon
+representation. Enclosed holes are kept by bridging them into their outer
+polygon along foreground-only bridges (one-pass nearest-vertex bridges above 64
+holes per component). The transfer manifest quantifies residual loss.
+`xta register pairs` still refuses a plane when a bridge or an unencodable hole
+would cover an unobserved pixel. Use the resliced-movie workflow above for
+ordinary whole-slice supervision.
 
 ## Transfer a scalar NRRD labelmap
 
@@ -113,7 +117,13 @@ xta register nrrd --packet sample01_mapping.zip --input earlier_labels.nrrd --so
 ```
 
 The reference headers connect native movie indices to world coordinates.
-Source labelmaps can be cropped or reoriented when this geometry is available.
+Each reference must be a NRRD whose stored axes are that movie's column, row and
+frame in native order, such as XTA's own NRRD export of the movie. A resampled
+or reoriented copy is not a valid reference even when its header is correct.
+XTA warns when a reference's stored axes do not follow +X, +Y, +Z, still uses
+it, and records each reference's path, header and axis alignment in the
+provenance JSON. Source labelmaps can be cropped or reoriented when this
+geometry is available.
 For a full-sized label array already in the source movie's exact XYZ index
 order, use `--source-grid-aligned` in place of `--source-reference`. Without
 a target reference, output coordinates are scan-local, with packet spacing and

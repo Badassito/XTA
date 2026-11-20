@@ -201,7 +201,7 @@ class PtaWorkerBoundaryTests(unittest.TestCase):
                 "XTA.pta_rendering",
                 "XTA.pta_rendering",
                 "XTA.pta_rendering",
-                "XTA.pta_rendering",
+                "XTA.unification.tiles",
                 "XTA.pta_dataset",
                 "XTA.pta_workers",
                 "XTA.pta_workers",

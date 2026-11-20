@@ -1010,7 +1010,6 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
             env.pop('XTA_YOLO_SWEEP_OUTPUT_ROOT',None)
         env.pop('XTA_YOLO_SWEEP_NATIVE_ROLE',None)
         env['XTA_YOLO_SWEEP_FLOOR_HUNDREDTHS'] = str(min(cents))
-        env.pop('XTA_YOLO_SWEEP_FIXED_MIN_CONF', None)
         package_parent = str(Path(__file__).resolve().parents[1])
         env['PYTHONPATH'] = os.pathsep.join(filter(None, (package_parent, env.get('PYTHONPATH', ''))))
         if sys.version_info >= (3,11):

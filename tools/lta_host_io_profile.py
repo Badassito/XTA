@@ -212,7 +212,7 @@ def main():
     if live_bytes>24*2**30 or shutil.disk_usage(output).free<live_bytes+15*2**30:
         raise RuntimeError("host I/O test exceeds 24GiB logical live-storage cap or 15GiB free-space reserve")
     if psutil.virtual_memory().available<12*2**30:
-        raise RuntimeError("host I/O test requires at least12GiB currently available physical memory")
+        raise RuntimeError("host I/O test requires at least 12 GiB currently available physical memory")
     source_path=Path(source["union"]["path"])
     if worker._sha256_file(source_path)!=source["union"]["sha256"]:
         raise RuntimeError("retained source union changed")

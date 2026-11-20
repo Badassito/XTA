@@ -1,7 +1,6 @@
 """Independent overflow/topology regressions from the job150615 investigation."""
 from __future__ import annotations
 
-import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
@@ -46,8 +45,7 @@ def test_late_overflow_keeps_every_source_pixel_and_its_global_object(tmp_path, 
         attempts.append(dtype)
         return original_impl(*args, **kwargs)
 
-    with mock.patch.dict(os.environ, {'YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16': '1'}), \
-            mock.patch.object(topology, 'gpu_slice_labeling_enabled', return_value=False), \
+    with mock.patch.object(topology, 'gpu_slice_labeling_enabled', return_value=False), \
             mock.patch.object(topology, 'should_use_in_memory_workspace', return_value=True), \
             mock.patch.object(topology, 'numa_interleave_memory'), \
             mock.patch.object(topology, '_label_foreground_volume_streaming_impl',
@@ -86,8 +84,7 @@ def test_exact_uint16_capacity_remains_narrow_and_preserves_last_id(tmp_path):
     source[0, ::2, ::2] = 1
     source[0, 510, 510] = 0
     stats = {}
-    with mock.patch.dict(os.environ, {'YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16': '1'}), \
-            mock.patch.object(topology, 'gpu_slice_labeling_enabled', return_value=False), \
+    with mock.patch.object(topology, 'gpu_slice_labeling_enabled', return_value=False), \
             mock.patch.object(topology, 'should_use_in_memory_workspace', return_value=True):
         store, count, paths = topology.label_foreground_volume_streaming(
             source, tmp_path / 'capacity', prefer_memory=True, reserve_bytes=0,
@@ -112,13 +109,11 @@ def test_concurrent_overflow_does_not_change_another_call_dtype_or_environment(t
         )
         return result, stats
 
-    with mock.patch.dict(os.environ, {'YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16': '1'}), \
-            mock.patch.object(topology, 'gpu_slice_labeling_enabled', return_value=False), \
+    with mock.patch.object(topology, 'gpu_slice_labeling_enabled', return_value=False), \
             mock.patch.object(topology, 'should_use_in_memory_workspace', return_value=True), \
             mock.patch.object(topology, 'numa_interleave_memory'):
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(run, range(2)))
-        assert os.environ['YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16'] == '1'
         assert topology._local_label_store_dtype(False) == np.dtype(np.uint16)
     assert results[0][0][0].dtype == np.dtype(np.uint32)
     assert results[1][0][0].dtype == np.dtype(np.uint16)
@@ -131,8 +126,7 @@ def test_concurrent_overflow_does_not_change_another_call_dtype_or_environment(t
 @pytest.mark.parametrize('error', [RuntimeError('unrelated capacity word'),
                                   topology._LocalLabelCapacityError(2**32, np.uint32, z=0)])
 def test_unrelated_or_wide_failures_are_not_retried(tmp_path, error):
-    with mock.patch.dict(os.environ, {'YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16': '1'}), \
-            mock.patch.object(topology, '_label_foreground_volume_streaming_impl',
+    with mock.patch.object(topology, '_label_foreground_volume_streaming_impl',
                               side_effect=error) as impl:
         with pytest.raises(type(error)) as raised:
             topology.label_foreground_volume_streaming(
@@ -154,7 +148,7 @@ def _input_from_canonical(volume, base):
 @pytest.mark.parametrize('base', ['transverse', 'sagittal', 'coronal'])
 def test_orthogonal_footprints_restore_before_keep_one_without_fragmenting_tube(tmp_path, base):
     from XTA import media
-    from XTA.d1_orthogonal_coverage import execute_orthogonal_coverage_reference
+    from tests.reference_backends.d1_orthogonal_coverage import execute_orthogonal_coverage_reference
     from XTA.finalization import apply_keep_largest_objects_inplace
 
     canonical = np.zeros((17, 17, 17), dtype=np.uint8)
@@ -204,22 +198,22 @@ def test_orthogonal_footprints_restore_before_keep_one_without_fragmenting_tube(
 
 
 def test_actual_job_xy_ratio_uses_complete_global_footprints_with_confidence(tmp_path):
-    import cv2
     from XTA.confidence_projection import score_projection_reader
-    from XTA.d1_orthogonal_coverage import (
-        build_orthogonal_coverage_plan, execute_orthogonal_coverage_reference,
-    )
+    from XTA.d1_orthogonal_coverage import build_orthogonal_coverage_plan
+    from tests.reference_backends.d1_orthogonal_coverage import execute_orthogonal_coverage_reference
     source = np.zeros((1, 2048, 2048), np.uint8)
     source[0, 1234:1240, 1799:1805] = 1
     source[0, 1237, 1805:1810] = 1
     view = _orthogonal_view('transverse', source.shape)
     shape = (1, 3064, 3022)
     plan = build_orthogonal_coverage_plan(view, source.shape, shape)
+    centers = []
     for length, (starts, stops) in zip(shape[1:], plan.source_ranges_tyx[1:]):
-        expected_indices = np.arange(length, dtype=np.int64) * 2048 // length
+        expected_indices = (2 * np.arange(length, dtype=np.int64) + 1) * 2048 // (2 * length)
         np.testing.assert_array_equal(starts, expected_indices)
         np.testing.assert_array_equal(stops, expected_indices + 1)
-    expected = cv2.resize(source[0], (3022, 3064), interpolation=cv2.INTER_NEAREST)
+        centers.append(expected_indices)
+    expected = source[0][np.ix_(*centers)]
     actual = execute_orthogonal_coverage_reference(source, view, shape)
     np.testing.assert_array_equal(actual[0], expected)
     scores = np.where(source, np.uint8(173), np.uint8(0))
@@ -233,7 +227,7 @@ def test_actual_job_xy_ratio_uses_complete_global_footprints_with_confidence(tmp
 @pytest.mark.parametrize('base', ['transverse', 'sagittal', 'coronal'])
 def test_sparse_endpoint_and_temporal_union_addresses_match_score_projection(tmp_path, base):
     from XTA.confidence_projection import score_projection_reader
-    from XTA.d1_orthogonal_coverage import execute_orthogonal_coverage_reference
+    from tests.reference_backends.d1_orthogonal_coverage import execute_orthogonal_coverage_reference
     canonical = np.zeros((17, 17, 17), np.uint8)
     canonical[0, 2, 3] = 1
     canonical[-1, 14, 13] = 1
@@ -251,7 +245,7 @@ def test_sparse_endpoint_and_temporal_union_addresses_match_score_projection(tmp
 
 
 def test_projection_refuses_area_route_or_output_budget_before_output_allocation():
-    from XTA import d1_orthogonal_coverage as coverage
+    from tests.reference_backends import d1_orthogonal_coverage as coverage
     source = np.ones((3, 17, 19), np.uint8)
     view = _orthogonal_view('transverse', source.shape)
     with mock.patch.object(coverage.np, 'zeros', side_effect=AssertionError('output allocated')):
@@ -277,7 +271,7 @@ def test_projection_address_tables_cannot_be_reenabled_or_mutated():
 def test_no_cube_noncubic_coverage_matches_actual_ordinary_layer_projection(tmp_path, base):
     from XTA import assembly
     from XTA.outputs import _read_layer_slice_in_output_shape
-    from XTA.d1_orthogonal_coverage import execute_orthogonal_coverage_reference
+    from tests.reference_backends.d1_orthogonal_coverage import execute_orthogonal_coverage_reference
     native_shape = (31, 43, 67)
     view = _orthogonal_view(base, native_shape)
     source = (np.random.default_rng(7470).random((view.num_slices, 29, 29)) < .07).astype(np.uint8)

@@ -1,8 +1,9 @@
 """GPU policy replay and conservative inverse maps for TTA.
 
-The four shipped GPU_*.py files are deliberately unchanged. Their versioned
-fused-grid API supplies deterministic affine/elastic sampling and photometry.
-New policies may instead implement apply_tta_batch(images=..., seeds=...).
+The shipped GPU_*.py files name their elastic equation in tta_replay_contract;
+a fused-grid policy without that attribute replays the source-space equation.
+Their versioned fused-grid API supplies deterministic affine/elastic sampling
+and photometry. New policies may instead implement apply_tta_batch(images=..., seeds=...).
 Torch is imported only while executing numerical work, never for CLI discovery.
 """
 from __future__ import annotations
@@ -14,6 +15,9 @@ from typing import Any, Sequence
 import numpy as np
 
 from .tta_augmentation_config import TtaAugmentationSettings
+
+# Replay contract -> space in which the policy adds its elastic displacement d(y).
+_REPLAY_CONTRACTS = {'torch-affine-elastic-v1': 'source', 'torch-affine-elastic-v2': 'raster'}
 
 
 def _normalized_grid(xy: Any, height: int, width: int) -> Any:
@@ -48,10 +52,13 @@ def _bilinear_displacement(field: Any, xy: Any) -> tuple[Any, Any, Any]:
 
 
 def inverse_policy_grid(forward: Any, displacement: Any | None, height: int, width: int,
-                        *, iterations: int = 16, tolerance: float = 0.05,
-                        strip_rows: int = 128) -> tuple[Any, Any]:
-    """Invert x = inv(A) y + d(y), retaining only trustworthy observations.
+                        *, displacement_space: str = 'raster', iterations: int = 16,
+                        tolerance: float = 0.05, strip_rows: int = 128) -> tuple[Any, Any]:
+    """Invert the policy pull map, retaining only trustworthy observations.
 
+    displacement_space='raster' inverts x = inv(A)(y + d(y)) by solving
+    y + d(y) = A x, so the residual and tolerance are in augmented-raster
+    pixels. 'source' inverts x = inv(A) y + d(y) with a source-pixel residual.
     Newton iteration uses the exact bilinear Jacobian of d. A fixed iteration
     budget avoids a device synchronization per iteration. Unsupported/folded or
     unconverged pixels are unknown. This is not a claim of global invertibility
@@ -59,28 +66,39 @@ def inverse_policy_grid(forward: Any, displacement: Any | None, height: int, wid
     """
     import torch
     from .tta_augmentation_cuda import policy_grids_cuda
+    if displacement_space not in ('source', 'raster'):
+        raise ValueError("displacement_space must be 'source' or 'raster'")
     accelerated = policy_grids_cuda(forward, displacement, height, width,
-                                    iterations=iterations, tolerance=tolerance)
+                                    iterations=iterations, tolerance=tolerance,
+                                    displacement_space=displacement_space)
     if accelerated is not None:
         return accelerated[1:]
     h, w = int(height), int(width)
     inverse = torch.linalg.inv(forward.float())
     output = torch.empty((h, w, 2), device=forward.device, dtype=torch.float32)
     validity = torch.empty((h, w), device=forward.device, dtype=torch.bool)
-    det_base = inverse[0, 0] * inverse[1, 1] - inverse[0, 1] * inverse[1, 0]
+    raster = displacement_space == 'raster'
+    # Elastic residual: linear @ y + offset + d(y) - goal.
+    if raster:
+        linear = torch.eye(2, device=forward.device, dtype=torch.float32)
+        offset = torch.zeros(2, device=forward.device, dtype=torch.float32)
+    else:
+        linear, offset = inverse[:2, :2], inverse[:2, 2]
+    det_base = linear[0, 0] * linear[1, 1] - linear[0, 1] * linear[1, 0]
     for row in range(0, h, max(1, strip_rows)):
         yy, xx = torch.meshgrid(torch.arange(row, min(h, row + strip_rows), device=forward.device, dtype=torch.float32),
                                 torch.arange(w, device=forward.device, dtype=torch.float32), indexing='ij')
         target = torch.stack((xx, yy), dim=-1)
         current = target @ forward[:2, :2].float().T + forward[:2, 2].float()
+        goal = current.clone() if raster else target
         orientation_ok = torch.ones_like(xx, dtype=torch.bool)
         if displacement is not None:
             # Fixed-count iterations remain fully on the producing CUDA stream.
             for _ in range(int(iterations)):
                 delta, dx, dy = _bilinear_displacement(displacement, current)
-                residual = current @ inverse[:2, :2].T + inverse[:2, 2] + delta - target
-                a, b = inverse[0, 0] + dx[..., 0], inverse[0, 1] + dy[..., 0]
-                c, d = inverse[1, 0] + dx[..., 1], inverse[1, 1] + dy[..., 1]
+                residual = current @ linear.T + offset + delta - goal
+                a, b = linear[0, 0] + dx[..., 0], linear[0, 1] + dy[..., 0]
+                c, d = linear[1, 0] + dx[..., 1], linear[1, 1] + dy[..., 1]
                 det = a * d - b * c
                 denominator = torch.where(det.abs() > 1e-7, det, torch.ones_like(det))
                 step = torch.stack(((d * residual[..., 0] - b * residual[..., 1]) / denominator,
@@ -88,9 +106,9 @@ def inverse_policy_grid(forward: Any, displacement: Any | None, height: int, wid
                 current = current - step.clamp(-32., 32.)
                 current = torch.nan_to_num(current, nan=-1e6, posinf=1e6, neginf=-1e6)
             delta, dx, dy = _bilinear_displacement(displacement, current)
-            residual = current @ inverse[:2, :2].T + inverse[:2, 2] + delta - target
-            det = ((inverse[0, 0] + dx[..., 0]) * (inverse[1, 1] + dy[..., 1])
-                   - (inverse[0, 1] + dy[..., 0]) * (inverse[1, 0] + dx[..., 1]))
+            residual = current @ linear.T + offset + delta - goal
+            det = ((linear[0, 0] + dx[..., 0]) * (linear[1, 1] + dy[..., 1])
+                   - (linear[0, 1] + dy[..., 0]) * (linear[1, 0] + dx[..., 1]))
             orientation_ok = (det * det_base > 0) & (det.abs() > 1e-7)
         else:
             residual = current @ inverse[:2, :2].T + inverse[:2, 2] - target
@@ -167,10 +185,13 @@ class GpuPolicyAdapter:
         self._cache: OrderedDict[tuple[int, int, int], SpatialReplay] = OrderedDict()
         self._cache_size = 0
         self.custom = callable(getattr(policy, 'apply_tta_batch', None))
+        # Fused-grid policies that predate the attribute add d(y) in source pixels.
+        self.displacement_space = _REPLAY_CONTRACTS.get(
+            getattr(policy, 'tta_replay_contract', 'torch-affine-elastic-v1'))
         required = ('_sample_parameters', '_forward_matrix', '_elastic_displacement', '_pixel_grid', '_apply_intensity_noise')
-        if not self.custom and (runtime_name != 'torch-cuda-fused-grid-v1' or
+        if not self.custom and (runtime_name != 'torch-cuda-fused-grid-v1' or self.displacement_space is None or
                                 any(not callable(getattr(policy, name, None)) for name in required)):
-            raise TypeError('GPU policy has no supported inverse contract. Use an unchanged shipped GPU_*.py profile '
+            raise TypeError('GPU policy has no supported inverse contract. Use a shipped GPU_*.py profile '
                             'or implement apply_tta_batch(images=..., seeds=...) returning images, inverse_grid, valid.')
 
     def _replay(self, seed: int, height: int, width: int) -> SpatialReplay:
@@ -187,12 +208,21 @@ class GpuPolicyAdapter:
         if bool(params['elastic']):
             displacement = self.policy._elastic_displacement(int(seed), height, width)
         from .tta_augmentation_cuda import policy_grids_cuda
-        accelerated = policy_grids_cuda(forward, displacement, height, width, source=True)
+        space = self.displacement_space
+        accelerated = policy_grids_cuda(forward, displacement, height, width, source=True,
+                                        displacement_space=space)
         if accelerated is None:
-            source = torch.einsum('ij,hwj->hwi', torch.linalg.inv(forward), self.policy._pixel_grid(height, width))[..., :2]
-            if displacement is not None:
+            inverse_matrix = torch.linalg.inv(forward)
+            source = torch.einsum('ij,hwj->hwi', inverse_matrix, self.policy._pixel_grid(height, width))[..., :2]
+            if displacement is not None and space == 'raster':
+                linear = inverse_matrix[:2, :2]
+                source = source + torch.stack(
+                    (linear[0, 0] * displacement[0] + linear[0, 1] * displacement[1],
+                     linear[1, 0] * displacement[0] + linear[1, 1] * displacement[1]), dim=-1)
+            elif displacement is not None:
                 source = source + displacement.movedim(0, -1)
-            inverse, valid = inverse_policy_grid(forward, displacement, height, width)
+            inverse, valid = inverse_policy_grid(forward, displacement, height, width,
+                                                 displacement_space=space)
             forward_grid = _normalized_grid(source, height, width)
         else:
             forward_grid, inverse, valid = accelerated

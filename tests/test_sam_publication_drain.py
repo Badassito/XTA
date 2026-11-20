@@ -55,10 +55,9 @@ def _drain(parents, leases, budget):
     function = pipeline_drain(None, budget, scheduler,
                               sam_context=SimpleNamespace(_closed=False))
     namespace = function.__globals__
-    namespace.update(inference_worker_process_active=False,
+    namespace.update(
         view_processing_futures=parents, view_prepare_leases=leases,
-        component_ref_dense_retirement_active=True, tile_expected_by_parent={},
-        keep_temp_artifacts=False, _dispatch_inference_windows=lambda: None)
+        tile_expected_by_parent={}, _dispatch_inference_windows=lambda: None)
     namespace['_publish_parent_dense_retired'] = (
         lambda key, lease: namespace['parent_dense_retired_events'].put((key, lease)))
     return function
@@ -175,7 +174,7 @@ def _actual_outer_wait_loop(namespace):
     return namespace['_actual_wait_loop']
 
 
-def test_nonpush_heartbeat_admits_after_unwatched_projection_frees_capacity():
+def test_nonpush_poll_admits_after_unwatched_projection_frees_capacity():
     queue, release_hidden, hidden = _occupied_queue()
     release_projection = Event()
 
@@ -192,7 +191,6 @@ def test_nonpush_heartbeat_admits_after_unwatched_projection_frees_capacity():
     drain = _drain(parents, _lease_state(()), budget)
     namespace = drain.__globals__
     waits, iterations = [], []
-    heartbeat = .01
 
     class PublicationCompleted(Exception):
         pass
@@ -208,7 +206,7 @@ def test_nonpush_heartbeat_admits_after_unwatched_projection_frees_capacity():
 
     def observed_wait(futures, *, timeout, return_when):
         assert list(futures) == [child] and hidden not in futures and parent not in futures
-        assert timeout == heartbeat, 'unadmitted publication must not wait forever'
+        assert timeout == 0.1, 'unadmitted publication must not wait forever'
         assert return_when == FIRST_COMPLETED
         waits.append(timeout)
         if len(waits) == 1:
@@ -225,11 +223,10 @@ def test_nonpush_heartbeat_admits_after_unwatched_projection_frees_capacity():
         return observed
 
     namespace.update(_check_loop_limit=check_loop_limit, _test_drain=drive,
-        pending_prediction_volume_futures=[], sam_cpu_futures={'source': None, 'runtime': None},
-        prediction_accumulation_futures={}, pending_prediction_build_jobs=[],
-        _process_inference_outstanding=lambda: False, ready_fullframe=[], ready_tile_infer=[],
-        _pump_prediction_volume_build_queue=lambda: None,
-        scheduler_push_drain_heartbeat_seconds=lambda: heartbeat,
+        sam_cpu_futures={'source': None, 'runtime': None},
+        _process_inference_outstanding=lambda: False,
+        # Keeps any parent-staging wake wait short; the non-push poll is asserted above.
+        scheduler_push_drain_heartbeat_seconds=lambda: .01,
         _log_scheduler_wait_state=lambda: None,
         scheduler_state=SimpleNamespace(push_drain_active=False), wait=observed_wait)
     actual_loop = _actual_outer_wait_loop(namespace)

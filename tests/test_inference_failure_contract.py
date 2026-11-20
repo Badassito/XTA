@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import contextlib
-from concurrent.futures import Future, ThreadPoolExecutor
-import threading
 from types import SimpleNamespace
 from unittest import mock
 
@@ -24,7 +22,7 @@ def _result_source(view=None, batch_size=1):
     )
 
 
-def _run_prediction(*, asynchronous, results, source=None, workers=1, executor=None):
+def _run_prediction(*, results, source=None, workers=1):
     class Model:
         def predict(self, **_kwargs):
             return iter(results)
@@ -46,34 +44,24 @@ def _run_prediction(*, asynchronous, results, source=None, workers=1, executor=N
         stack.enter_context(mock.patch.object(inference, 'cpu_retina_masks_enabled', return_value=False))
         stack.enter_context(mock.patch.object(inference, '_direct_predict_applicable', return_value=False))
         stack.enter_context(mock.patch.object(inference, '_try_create_device_union_accumulator', return_value=None))
-        if asynchronous:
-            executor = executor or stack.enter_context(ThreadPoolExecutor(max_workers=workers))
-            handle = inference.predict_source_and_submit_accumulation(
-                Model(), source, postprocess_executor=executor, **kwargs)
-            return handle.wait(), union
         return inference.predict_source_and_accumulate(
             Model(), source, postprocess_workers=workers, **kwargs), union
 
 
-@pytest.mark.parametrize('asynchronous', [False, True])
 @pytest.mark.parametrize('workers', [1, 2])
-def test_truncated_result_stream_fails_before_a_successful_task(asynchronous, workers):
+def test_truncated_result_stream_fails_before_a_successful_task(workers):
     with pytest.raises(RuntimeError, match='1/3 logical frames'):
-        _run_prediction(asynchronous=asynchronous, workers=workers,
-                        results=[SimpleNamespace(masks=None)])
+        _run_prediction(workers=workers, results=[SimpleNamespace(masks=None)])
 
 
-@pytest.mark.parametrize('asynchronous', [False, True])
-def test_complete_empty_frames_are_valid(asynchronous):
-    stats, union = _run_prediction(
-        asynchronous=asynchronous, results=[SimpleNamespace(masks=None) for _ in range(3)])
+def test_complete_empty_frames_are_valid():
+    stats, union = _run_prediction(results=[SimpleNamespace(masks=None) for _ in range(3)])
     assert stats['prediction_count'] == 0
     assert stats['frames_with_predictions'] == 0
     assert not np.any(union)
 
 
-@pytest.mark.parametrize('asynchronous', [False, True])
-def test_duplicate_mapping_cannot_hide_a_missing_logical_frame(asynchronous):
+def test_duplicate_mapping_cannot_hide_a_missing_logical_frame():
     class DuplicateSource:
         azimuthal_padding_count = 0
 
@@ -83,64 +71,18 @@ def test_duplicate_mapping_cannot_hide_a_missing_logical_frame(asynchronous):
                 mirror_azimuthal_u=False)
 
     with pytest.raises(RuntimeError, match='duplicate logical frame 0'):
-        _run_prediction(asynchronous=asynchronous, source=DuplicateSource(),
+        _run_prediction(source=DuplicateSource(),
                         results=[SimpleNamespace(masks=None) for _ in range(3)])
 
 
-@pytest.mark.parametrize('asynchronous', [False, True])
-def test_missing_azimuthal_extension_fails_even_when_real_frames_are_complete(asynchronous):
+def test_missing_azimuthal_extension_fails_even_when_real_frames_are_complete():
     view = geometry.ViewInfo(
         name='azimuthal', num_slices=3, src_h=4, src_w=4, pad_mode='pad',
         family='azimuthal', azimuths_deg=(0., 60., 120.))
     source = _result_source(view=view, batch_size=4)
     with pytest.raises(RuntimeError, match='0/1 azimuthal padding frames'):
-        _run_prediction(asynchronous=asynchronous, source=source,
+        _run_prediction(source=source,
                         results=[SimpleNamespace(masks=None) for _ in range(3)])
-
-
-def test_async_stream_error_settles_submitted_writes_before_returning():
-    # Keep the caller's executor alive to prove the function itself settles work.
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        submitted = []
-        original_submit = executor.submit
-
-        def capture(*args, **kwargs):
-            future = original_submit(*args, **kwargs)
-            submitted.append(future)
-            return future
-
-        with mock.patch.object(executor, 'submit', side_effect=capture):
-            with pytest.raises(RuntimeError, match='incomplete prediction stream'):
-                _run_prediction(asynchronous=True, executor=executor,
-                                results=[SimpleNamespace(masks=None)])
-        assert submitted and all(future.done() for future in submitted)
-
-
-def test_async_accumulation_failure_cancels_other_pending_destination_writes():
-    failed = Future()
-    failed.set_exception(RuntimeError('injected accumulation failure'))
-    release = threading.Event()
-    started = threading.Event()
-    union = np.zeros((1, 4, 4), dtype=np.uint8)
-
-    def hold_worker():
-        started.set()
-        release.wait(timeout=5)
-
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        blocker = executor.submit(hold_worker)
-        assert started.wait(timeout=5)
-        pending_write = executor.submit(union.fill, 1)
-        handle = inference.PredictionAccumulationHandle(
-            'failed-task', [failed, pending_write], union, None)
-        try:
-            with pytest.raises(RuntimeError, match='injected accumulation failure'):
-                handle.wait()
-            assert pending_write.cancelled()
-            assert not np.any(union)
-        finally:
-            release.set()
-            blocker.result(timeout=5)
 
 
 def test_unrecoverable_gpu_mask_fallback_raises_instead_of_returning_empty_foreground():

@@ -65,11 +65,12 @@ class LoadedAugmentation:
 
 @dataclass
 class LoadedGpuAugmentation:
-    """Fork-inherited factory for the single-file CUDA policy API.
+    """Fork-inherited (where fork exists) or spawn-reloaded factory for the single-file CUDA policy API.
 
-    The parent imports the definition before the persistent pool is forked but
-    never constructs CUDA state.  Each child invokes the factory only after it
-    has been assigned exactly one CUDA-visible device.
+    The parent imports the definition before the persistent pool starts but
+    never constructs CUDA state; spawned owners reload it by content hash.
+    Each child invokes the factory only after it has been assigned exactly one
+    CUDA-visible device.
     """
 
     path: Path

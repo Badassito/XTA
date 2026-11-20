@@ -47,7 +47,7 @@ class ParentSliceMetadataValidationTests(unittest.TestCase):
                 union_path=root / 'union.dat', confmap_path=None, temp_dir=root,
                 dense_tiling_active=False, min_conf=0, min_radius=0, interpolate=0,
                 interpolation_walk_back=1, interpolation_candidates=1, interpolate_passes=1,
-                interpolate_min_radius=0, interpolation_search_angle=0, keep_temp=False,
+                interpolate_min_radius=0, interpolation_search_angle=0,
                 slice_workers=1, interpolation_task_workers=1, nrrd_layers_enabled=True,
                 precleaned_slice_cleanup=True, hole_fill_done_on_device=True,
                 slice_meta=self.holder(), retire_dense_after_prepare=True)

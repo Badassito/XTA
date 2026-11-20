@@ -1004,9 +1004,9 @@ static PyMethodDef vt_dsa_methods[] = {
     {"copy", (PyCFunction)vt_dsa_copy, METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("Submit a synchronous, hardware-only DSA MEMMOVE.")},
     {"drain", vt_dsa_drain, METH_NOARGS,
-     PyDoc_STR("Prove that no submitted descriptor can still write.")},
+     PyDoc_STR("drain() -> dict: wait for any in-flight synchronous copy, then report the drain proof it recorded when closing its idxd cdev.")},
     {"close", vt_dsa_close, METH_NOARGS,
-     PyDoc_STR("Settle process-local DSA state.")},
+     PyDoc_STR("close() -> None: raise unless the last copy's recorded drain proof holds; no persistent descriptors are held.")},
     {NULL, NULL, 0, NULL}
 };
 
@@ -1025,7 +1025,7 @@ static struct PyModuleDef vt_dsa_module = {
 PyMODINIT_FUNC
 PyInit__dsa_copy(void)
 {
-    PyObject *module;
+    PyObject *module = NULL;
     int atfork_status;
     if (!atfork_registered) {
         atfork_status = pthread_atfork(vt_atfork_prepare, vt_atfork_parent, vt_atfork_child);
@@ -1047,20 +1047,29 @@ PyInit__dsa_copy(void)
     native_pid = getpid();
     module = PyModule_Create(&vt_dsa_module);
     if (module == NULL) {
-        PyThread_free_lock(native_lock);
-        native_lock = NULL;
-        return NULL;
+        goto fail;
     }
     DsaCopyError = PyErr_NewException("XTA._dsa_copy.DsaCopyError", PyExc_RuntimeError, NULL);
-    if (DsaCopyError == NULL || PyModule_AddObject(module, "DsaCopyError", DsaCopyError) != 0) {
-        Py_XDECREF(DsaCopyError);
-        Py_DECREF(module);
-        return NULL;
+    if (DsaCopyError == NULL) {
+        goto fail;
     }
     Py_INCREF(DsaCopyError); /* retained for vt_raise_copy_error */
+    if (PyModule_AddObject(module, "DsaCopyError", DsaCopyError) != 0) {
+        Py_DECREF(DsaCopyError);
+        goto fail;
+    }
     if (PyModule_AddStringConstant(module, "interface", "idxd-cdev") != 0) {
-        Py_DECREF(module);
-        return NULL;
+        goto fail;
     }
     return module;
+
+fail:
+    Py_XDECREF(module);
+    Py_CLEAR(DsaCopyError);
+    if (native_lock != NULL) {
+        PyThread_free_lock(native_lock);
+        native_lock = NULL;
+    }
+    native_pid = 0;
+    return NULL;
 }

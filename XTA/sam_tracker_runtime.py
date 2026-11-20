@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
+from .env_flags import env_flag
 from .file_hashing import sha256_file as _sha256
 import numpy as np
 
@@ -164,8 +165,7 @@ def _sam_scheduler_sample():
 
 def _largest_view_first_enabled():
     """YOLO_TTA_SAM_LARGEST_VIEW_FIRST=0 restores plain scope round-robin."""
-    return os.environ.get('YOLO_TTA_SAM_LARGEST_VIEW_FIRST', '1').strip().lower() not in {
-        '0', 'false', 'no', 'off'}
+    return env_flag('YOLO_TTA_SAM_LARGEST_VIEW_FIRST', True)
 
 
 def _cache_work_volume(cache_ref):

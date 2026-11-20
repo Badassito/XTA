@@ -37,11 +37,11 @@ class ManualExecutor:
 
 
 class TinyTask:
-    def __init__(self, root, name, mask, confidence=None, *, keep_temp=False):
+    def __init__(self, root, name, mask, confidence=None):
         self.model_name='model';self.view=SimpleNamespace(name=name)
         self.union_mm=mask;self.confmap_mm=confidence
         self.union_path=root/(name+'.mask');self.confmap_path=root/(name+'.conf') if confidence is not None else None
-        self.d1_shadow_path=None;self.keep_temp_artifacts=keep_temp
+        self.d1_shadow_path=None
         self.close_dense=close_memmap_array_without_flush
         self.calls=0
 
@@ -64,12 +64,12 @@ def admit(leases,task,amount):
     return key
 
 
-def queue(tmp_path, *, cap=120, ready=lambda:False, bounded=(), keep_temp=False, leases=None):
+def queue(tmp_path, *, cap=120, ready=lambda:False, bounded=(), leases=None):
     check,prepare=ManualExecutor(),ManualExecutor()
     leases=leases or lease_state()
     result=staging.DeferredSamParentQueue(temp_dir=tmp_path/'temp',output_dir=tmp_path/'output',
         checkpoint_executor=check,prepare_executor=prepare,leases=leases,dense_limit=cap,
-        ready=ready,keep_temp=keep_temp,bounded_parent_keys=bounded)
+        ready=ready,bounded_parent_keys=bounded)
     return result,check,prepare,leases
 
 
@@ -218,7 +218,7 @@ def test_cancelled_queue_never_readmits_even_when_ready_changes(tmp_path):
     staged.close()
 
 
-def test_keep_temp_checkpoint_retires_mock_memfd_owner_before_credit(tmp_path,monkeypatch):
+def test_checkpoint_retires_mock_memfd_owner_before_credit(tmp_path,monkeypatch):
     from XTA import runtime
     source=tmp_path/'temporary-RAM-model.dat'
     mapping=np.memmap(source,mode='w+',dtype=np.uint8,shape=(3,4,5));mapping[:]=1;mapping.flush()
@@ -227,8 +227,8 @@ def test_keep_temp_checkpoint_retires_mock_memfd_owner_before_credit(tmp_path,mo
     mapping._workspace_memfd_owner_key=owner_key
     reference=weakref.ref(mapping._mmap)
     monkeypatch.setattr(staging,'path_is_memory_backed',lambda path:Path(path).resolve()==source.resolve())
-    staged,check,_prepare,leases=queue(tmp_path,keep_temp=True)
-    task=TinyTask(tmp_path,'v',mapping,keep_temp=True);task.union_path=source
+    staged,check,_prepare,leases=queue(tmp_path)
+    task=TinyTask(tmp_path,'v',mapping);task.union_path=source
     admit(leases,task,60);staged.defer(task,60);del mapping
     try:
         check.finish()
@@ -243,7 +243,7 @@ def test_keep_temp_checkpoint_retires_mock_memfd_owner_before_credit(tmp_path,mo
         raw=np.memmap(saved.path,mode='r',dtype=np.uint8,shape=(3,4,5))
         np.testing.assert_array_equal(raw,np.ones(raw.shape,np.uint8));raw._mmap.close();del raw
         staged.close();staged.finalize_cleanup()
-        assert saved.path.exists() # debug evidence is on disk, not retained RAM
+        assert not saved.path.exists()  # the disk checkpoint retires with staging cleanup
     finally:
         runtime._release_memfd_owner_key(owner_key)
 

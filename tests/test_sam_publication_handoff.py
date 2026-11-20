@@ -396,7 +396,6 @@ def test_failed_flush_retires_own_dense_aliases_with_failed_future_retained(
         return assembly.materialize_sam_directional_view_layer(entry, **kwargs)
 
     context, queue, pool, task = cases(directional=publish, max_pending=1)
-    task.component_ref_dense_retirement_active = False
     task.preinterpolation_layer_already_published = False
     task.extrapolation_distance = 0
     outside, owners, results, accepted = [], [], [], []

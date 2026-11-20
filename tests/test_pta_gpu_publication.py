@@ -652,6 +652,88 @@ class GpuPublicationTests(unittest.TestCase):
         self.assertEqual(published, [1, 2])
         self.assertTrue(all(reference() is None for reference in references))
 
+    def extra_mask_worker(self, policy, *, save_semantic=True):
+        """Run the real worker with coverage 7/8 and a policy declaring supports_extra_masks."""
+        fixture = self.worker_fixture(labels=False)
+        work_type = make_dataclass('CoverageWork',
+            ['candidates', 'image', 'mask', 'output_size', 'channel_kind', 'channel_count',
+             'context', 'semantic_coverage'])
+        work = tuple(work_type(**dict(vars(item), semantic_coverage=np.full((2, 3), 7 + index, np.uint8)))
+                     for index, item in enumerate(fixture.namespace['_render_gpu_item_group']()))
+        fixture.namespace.update(
+            _WORKER_STATIC=dict(gpu_batch_size=2, gpu_render_threads=1, save_semantic=save_semantic),
+            _gpu_memory_candidate_limit=lambda *args, **kwargs: 2,
+            _gpu_multi_source_work_batches=pta_scheduler.iter_compatible_work_batches,
+            _split_gpu_work_batch=pta_scheduler.split_work_batch,
+            _is_cuda_out_of_memory=pta_scheduler.is_cuda_out_of_memory,
+            _render_gpu_item_group=lambda *args: work,
+            _require_gpu_semantic_coverage_contract=lambda *args: None,
+            replace=replace,
+        )
+        published = []
+
+        def publish(**kwargs):
+            coverage = kwargs['semantic_coverage_masks']
+            published.append((tuple(candidate.augmentation_seed for candidate in kwargs['candidates']),
+                              None if coverage is None else coverage.array[:, 0, 0].tolist()))
+            return len(kwargs['candidates']), {}
+
+        self.runtime['policy'] = SimpleNamespace(supports_extra_masks=True, apply_batch_many=policy)
+        run = extract_worker_functions(fixture.namespace)
+        fixture.namespace['_publish_gpu_policy_batch'] = publish
+        plan = SimpleNamespace(view=SimpleNamespace(shared_view=None), tile_layout=())
+        task = SimpleNamespace(frames=(SimpleNamespace(plan_idx=0, frame_idx=0,
+            items=(('full', tuple(item.candidates[0] for item in work)),)),))
+        with mock.patch.object(publication, 'publication_resources', return_value=None):
+            result = run(None, None, (plan,), task)
+        return result, published
+
+    def extra_mask_policy(self, calls, references=None, *, fail_first=False):
+        def policy(**kwargs):
+            seeds = tuple(seed for seeds in kwargs['seeds'] for seed in seeds)
+            extras = kwargs.get('extra_masks')
+            calls.append((seeds, None if extras is None else tuple(int(mask[0, 0]) for mask in extras)))
+            if fail_first and len(calls) == 1:
+                raise RuntimeError('CUDA out of memory in the single policy call')
+            outputs = (FakeTensor(self.torch, np.ones((len(seeds), 1, 2, 3), np.uint8)),
+                       FakeTensor(self.torch, np.ones((len(seeds), 2, 3), np.uint8)))
+            if extras is not None:
+                outputs += (FakeTensor(self.torch, np.stack([np.asarray(mask) for mask in extras])),)
+            if references is not None:
+                references.extend(weakref.ref(output) for output in outputs)
+            return outputs
+        return policy
+
+    def test_worker_warps_semantic_coverage_in_the_same_policy_call(self):
+        calls, references = [], []
+        result, published = self.extra_mask_worker(self.extra_mask_policy(calls, references))
+        self.assertEqual(result[0], 2)
+        self.assertEqual(calls, [((1, 2), (7, 8))])
+        self.assertEqual(published, [((1, 2), [7, 8])])
+        self.assertTrue(all(reference() is None for reference in references))
+        calls.clear()
+        result, published = self.extra_mask_worker(self.extra_mask_policy(calls), save_semantic=False)
+        self.assertEqual(calls, [((1, 2), None)])
+        self.assertEqual(published, [((1, 2), None)])
+
+    def test_worker_splits_single_call_coverage_batch_after_oom(self):
+        calls, references, retries = [], [], []
+        self.torch.cuda.empty_cache = lambda: retries.append(1)
+        result, published = self.extra_mask_worker(self.extra_mask_policy(calls, references, fail_first=True))
+        self.assertEqual(result[0], 2)
+        self.assertEqual(calls, [((1, 2), (7, 8)), ((1,), (7,)), ((2,), (8,))])
+        self.assertEqual(retries, [1])
+        self.assertEqual(published, [((1,), [7]), ((2,), [8])])
+        self.assertTrue(all(reference() is None for reference in references))
+
+    def test_worker_rejects_two_outputs_from_an_extra_mask_policy(self):
+        def policy(**kwargs):
+            count = sum(len(seeds) for seeds in kwargs['seeds'])
+            return (FakeTensor(self.torch, np.ones((count, 1, 2, 3), np.uint8)),
+                    FakeTensor(self.torch, np.ones((count, 2, 3), np.uint8)))
+        with self.assertRaisesRegex(TypeError, 'supports_extra_masks must return'):
+            self.extra_mask_worker(policy)
+
     def test_single_source_worker_releases_device_outputs_before_next_chunk(self):
         fixture = self.worker_fixture(labels=False)
         candidates = tuple(item.candidates[0]

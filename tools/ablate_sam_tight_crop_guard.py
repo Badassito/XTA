@@ -144,7 +144,9 @@ def main():
     parser.add_argument('--max-rescue-plane-mib', type=int, default=128)
     parser.add_argument('--reader-cache-mib', type=int, default=32)
     parser.add_argument('--reuse-original-measurements', action='store_true',
-        help='Reuse matching original receipt intrinsic measurements; topology/contact decisions are recomputed')
+        help='Reuse matching original receipt intrinsic measurements; topology/contact decisions are recomputed. '
+             'The original must record the component-filter and reader implementation ids of this checkout; '
+             'receipts written by v26.0.1 or earlier never match, so replay those without this option')
     arguments = parser.parse_args()
     summary = run_ablation(**vars(arguments))
     print(json.dumps(summary, indent=2))

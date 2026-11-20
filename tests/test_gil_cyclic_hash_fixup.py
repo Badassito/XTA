@@ -1,10 +1,8 @@
-"""GIL-convoy fix follow-up: the per-mask SAM filter source hash inside reader transactions.
+"""SAM component filtering never re-reads its own source file.
 
-``filter_sam_components`` re-reads and SHA-256-hashes ``sam_filtering.py`` on every
-decoded mask. Its text is pinned by ``_QUALIFIED_NUMERICAL_SOURCE``, so the call line
-stays; instead the guard returns early only while ``measure_effective_raw_mask``
-filters for an active SamMaskReader transaction, whose root re-hashes the source on
-entry and on close. Everything else keeps the per-call check.
+The module identity is hashed once at import. Historical receipts stay bound to
+the numerical helpers through ``_QUALIFIED_NUMERICAL_SOURCE``, whose digest is
+also read once, at import. Effective masks equal the v25.0.2 filter.
 """
 from __future__ import annotations
 
@@ -12,7 +10,6 @@ import hashlib
 import importlib.util
 import subprocess
 import sys
-import threading
 from pathlib import Path
 
 import numpy as np
@@ -24,7 +21,6 @@ from tests.test_sam_cyclic_evidence_replay import bundle_at
 
 ROOT = Path(__file__).resolve().parents[1]
 REFERENCE_COMMIT = "5320fbef0655293a85719593f36fffc8a213cea6"  # v25.0.2
-CHANGED = "SAM component filter implementation changed after loading"
 
 
 @pytest.fixture
@@ -53,14 +49,18 @@ def _frames(bundle):
             for frame in sorted(run["raw_mask_keys"], key=int)]
 
 
-def _missing(monkeypatch, tmp_path):
-    monkeypatch.setattr(sam_filtering, "_SOURCE_PATH", tmp_path / "missing" / "sam_filtering.py")
+def _forbid_filter_source_reads(monkeypatch):
+    source = Path(sam_filtering.__file__).resolve()
+    reads = []
+    original = Path.read_bytes
 
-
-def _changed(monkeypatch, tmp_path):
-    changed = tmp_path / "changed_sam_filtering.py"
-    changed.write_bytes(Path(sam_filtering.__file__).read_bytes() + b"\n# changed\n")
-    monkeypatch.setattr(sam_filtering, "_SOURCE_PATH", changed)
+    def read_bytes(self):
+        if Path(self).resolve() == source:
+            reads.append(self)
+            raise AssertionError("SAM filter source was re-read")
+        return original(self)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    return reads
 
 
 # --- old vs new identity ---------------------------------------------------------------------
@@ -93,7 +93,11 @@ def test_effective_masks_match_v25_filter_on_bundle_and_reader(tmp_path, old_fil
 
 def test_filter_numerics_stay_pinned_and_previous_release_is_qualified():
     assert sam_filtering.IMPLEMENTATION_SHA256 != sam_filtering._QUALIFIED_V25_SOURCE_GUARD_IMPLEMENTATION
+    assert sam_filtering.IMPLEMENTATION_SHA256 != sam_filtering._QUALIFIED_V26_SOURCE_GUARD_IMPLEMENTATION
     assert sam_filtering._compatible_filter_implementation(sam_filtering._QUALIFIED_V25_SOURCE_GUARD_IMPLEMENTATION)
+    assert sam_filtering._compatible_filter_implementation(sam_filtering._QUALIFIED_V26_SOURCE_GUARD_IMPLEMENTATION)
+    assert (sam_filtering._numerical_source_sha256(sam_filtering._numerical_helpers())
+            == sam_filtering._QUALIFIED_NUMERICAL_SOURCE)
     assert sam_filtering._compatible_filter_implementation(sam_filtering.IMPLEMENTATION_SHA256)
     assert not sam_filtering._compatible_filter_implementation("0" * 64)
 
@@ -108,98 +112,31 @@ def test_unqualified_receipt_implementation_is_still_rejected(tmp_path):
         sam_filtering._spec(spec)
 
 
-# --- per-mask work inside a transaction does no source I/O ----------------------------------
+# --- per-mask work does no source I/O ----------------------------------------------------------
 
-def test_reader_transaction_masks_never_touch_the_filter_source(tmp_path, monkeypatch):
+def test_no_filter_path_reads_the_filter_source(tmp_path, monkeypatch):
     bundle = bundle_at(tmp_path)
     receipt = select_sam_proposals(bundle, policy={"sam_bridge_policy": "permissive"})
-    reader = bundle.reader().__enter__()
-    try:
-        with monkeypatch.context() as patch:
-            _missing(patch, tmp_path)
-            snapshot = reader.filter_snapshot(receipt)
-            for run_id, frame in _frames(bundle):
-                reader.measure_effective_raw_mask(run_id, frame, snapshot)
-                reader.effective_candidate_mask(run_id, frame, snapshot)
-            assert reader.stats["filter_computations"] == len(_frames(bundle))
-            # Outside the per-mask bracket the guard still hashes the file.
-            with pytest.raises(FileNotFoundError):
-                sam_filtering.assert_filter_implementation_unchanged()
-            with pytest.raises(FileNotFoundError):
-                sam_filtering.filter_sam_components(np.ones((3, 3), bool), 1.0)
-    finally:
-        reader.close()
-
-
-def test_fork_lanes_in_worker_threads_are_guarded_by_their_root(tmp_path, monkeypatch):
-    bundle = bundle_at(tmp_path)
-    receipt = select_sam_proposals(bundle, policy={"sam_bridge_policy": "permissive"})
-    errors = []
+    spec = sam_filtering.build_mask_filter(bundle, min_radius=1.0)
+    historical = dict(spec, implementation_sha256=sam_filtering._QUALIFIED_V26_SOURCE_GUARD_IMPLEMENTATION)
+    historical.pop("sha256")
+    historical["sha256"] = sam_filtering._fingerprint(historical)
+    frames = _frames(bundle)
+    reads = _forbid_filter_source_reads(monkeypatch)
+    for run_id, frame in frames:
+        sam_filtering.measure_effective_raw_mask(bundle, run_id, frame, spec)
+        sam_filtering.measure_effective_raw_mask(bundle, run_id, frame, historical)
+    sam_filtering.build_mask_filter(bundle, min_radius=1.0)
+    sam_filtering.filter_sam_components(np.ones((3, 3), bool), 1.0)
     with bundle.reader() as reader:
         snapshot = reader.filter_snapshot(receipt)
-        with monkeypatch.context() as patch:
-            _missing(patch, tmp_path)
-            lane = reader.fork(max_cache_bytes=1 << 20)
-
-            def work():
-                try:
-                    with lane:
-                        borrowed = lane.borrowed_filter_snapshot(snapshot)
-                        for run_id, frame in _frames(bundle):
-                            lane.measure_effective_raw_mask(run_id, frame, borrowed)
-                except BaseException as error:
-                    errors.append(error)
-            thread = threading.Thread(target=work)
-            thread.start()
-            thread.join()
-    assert errors == []
-
-
-def test_change_inside_a_transaction_is_rejected_on_close(tmp_path, monkeypatch):
-    bundle = bundle_at(tmp_path)
-    receipt = select_sam_proposals(bundle, policy={"sam_bridge_policy": "permissive"})
-    with pytest.raises(RuntimeError, match=CHANGED):
-        with bundle.reader() as reader:
-            snapshot = reader.filter_snapshot(receipt)
-            _changed(monkeypatch, tmp_path)
-            for run_id, frame in _frames(bundle):
-                reader.measure_effective_raw_mask(run_id, frame, snapshot)
-    # The next transaction is refused at entry.
-    with pytest.raises(RuntimeError, match=CHANGED):
-        bundle.reader().__enter__()
-
-
-def test_plain_bundle_and_closed_reader_keep_the_per_call_check(tmp_path, monkeypatch):
-    bundle = bundle_at(tmp_path)
-    spec = sam_filtering.build_mask_filter(bundle, min_radius=1.0)
-    run_id, frame = _frames(bundle)[0]
-    reader = bundle.reader()
-    with reader:
-        pass
-    _changed(monkeypatch, tmp_path)
-    with pytest.raises(RuntimeError, match=CHANGED):
-        sam_filtering.measure_effective_raw_mask(bundle, run_id, frame, spec)
-    assert not sam_filtering._source_checked_transaction(reader)
-    assert not sam_filtering._source_checked_transaction(bundle)
-    with pytest.raises(RuntimeError, match=CHANGED):
-        sam_filtering.filter_sam_components(np.ones((3, 3), bool), 1.0)
-
-
-def test_guard_flag_is_scoped_to_the_call_and_thread(tmp_path, monkeypatch):
-    seen = []
-
-    def probe(raw, threshold, *, enabled=True):
-        seen.append(getattr(sam_filtering._TRANSACTION_GUARDED, "active", False))
-        # Another thread is never exempt while this one is bracketed.
-        other = []
-        thread = threading.Thread(target=lambda: other.append(
-            getattr(sam_filtering._TRANSACTION_GUARDED, "active", False)))
-        thread.start()
-        thread.join()
-        seen.append(other[0])
-        raise ValueError("probe")
-    monkeypatch.setattr(sam_filtering, "filter_sam_components", probe)
-    with pytest.raises(ValueError, match="probe"):
-        sam_filtering._filter_in_checked_transaction(np.ones((2, 2), bool), 1.0, True)
-    assert seen == [True, False]
-    assert getattr(sam_filtering._TRANSACTION_GUARDED, "active", False) is False
+        for run_id, frame in frames:
+            reader.measure_effective_raw_mask(run_id, frame, snapshot)
+            reader.effective_candidate_mask(run_id, frame, snapshot)
+        assert reader.stats["filter_computations"] == len(frames)
+        lane = reader.fork(max_cache_bytes=1 << 20)
+        with lane:
+            borrowed = lane.borrowed_filter_snapshot(snapshot)
+            for run_id, frame in frames:
+                lane.measure_effective_raw_mask(run_id, frame, borrowed)
+    assert reads == []

@@ -1,6 +1,9 @@
 """Committed members of an unchanged archive are read without the writer lock."""
+import builtins
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+import errno
+import gc
 import hashlib
 import os
 import shutil
@@ -36,7 +39,7 @@ def lock_free(monkeypatch, request):
 
 def forbid_lock(monkeypatch):
     @contextmanager
-    def refuse(_path):
+    def refuse(_path, **_kwargs):
         raise AssertionError('reader took the writer lock')
         yield
     monkeypatch.setattr(artifacts, '_writer_lock', refuse)
@@ -94,8 +97,6 @@ def test_replaced_archive_path_is_not_served_from_an_old_descriptor(tmp_path, mo
     if lock_free == 'positional' and os.name == 'nt':
         # Windows cannot replace a file with an open descriptor; drop it first and
         # check identity validation through a fresh descriptor instead.
-        for fd in artifacts._THREAD_HANDLES.handles.values():
-            os.close(fd)
         artifacts._THREAD_HANDLES.handles.clear()
     os.replace(replacement, archive)
     # The old cached index/handle must not answer for the new file.
@@ -135,14 +136,129 @@ def test_thread_descriptors_close_when_the_thread_ends(tmp_path, lock_free):
 
     def worker():
         assert artifacts.read_member(artifacts.reference(archive, 'm')) == b'x'
-        seen.append(dict(artifacts._THREAD_HANDLES.handles))
+        seen.append([shared.fd for shared in artifacts._THREAD_HANDLES.handles.values()])
     for _ in range(3):
         thread = threading.Thread(target=worker)
         thread.start()
         thread.join()
     import gc
     gc.collect()
-    for handles in seen:
-        for fd in handles.values():
+    for descriptors in seen:
+        for fd in descriptors:
             with pytest.raises(OSError):
                 os.fstat(fd)  # closed with its thread
+
+
+def _positional_only(lock_free):
+    if lock_free != 'positional':
+        pytest.skip('only the cached-descriptor branch shares descriptors')
+
+
+def _cached_reader(tmp_path):
+    """An archive whose index is cached, plus a reader seeked into its first member."""
+    archive = tmp_path/'sam-artifacts.tar'
+    payload = os.urandom(100_000)
+    artifacts.append_members(archive, {'m1': payload, 'm2': b'second'})
+    assert artifacts.read_member(artifacts.reference(archive, 'm1')) == payload  # caches a descriptor
+    reader = artifacts.open_member(artifacts.reference(archive, 'm1'))
+    reader.seek(10)
+    return archive, payload, reader
+
+
+def test_evicted_descriptor_stays_open_for_a_live_reader(tmp_path, lock_free):
+    _positional_only(lock_free)
+    _archive, payload, reader = _cached_reader(tmp_path)
+    fd = reader._stream._shared.fd
+    artifacts._THREAD_HANDLES.handles.clear()
+    unrelated = os.open(tmp_path/'unrelated.bin', os.O_CREAT | os.O_RDWR | getattr(os, 'O_BINARY', 0))
+    try:
+        os.write(unrelated, b'u' * 64)
+        assert reader.read(32) == payload[10:42]
+        reader.close()
+        gc.collect()
+        with pytest.raises(OSError):
+            os.fstat(fd)  # the last holder closed it
+    finally:
+        os.close(unrelated)
+
+
+def test_identity_change_does_not_close_a_live_reader(tmp_path, monkeypatch, lock_free):
+    _positional_only(lock_free)
+    archive, payload, reader = _cached_reader(tmp_path)
+    real_stat, replaced = os.stat, []
+
+    class _OtherInode:
+        def __init__(self, info):
+            self._info = info
+
+        def __getattr__(self, name):
+            value = getattr(self._info, name)
+            return value + 1 if name == 'st_ino' else value
+
+    def stat_after_replace(path, *args, **kwargs):
+        info = real_stat(path, *args, **kwargs)
+        return _OtherInode(info) if replaced and str(path).endswith('sam-artifacts.tar') else info
+    monkeypatch.setattr(os, 'stat', stat_after_replace)
+    replaced.append(True)
+    # Same thread: the identity check evicts the cached descriptor the reader uses.
+    assert artifacts.member_exists(artifacts.reference(archive, 'm2'))
+    assert not artifacts._THREAD_HANDLES.handles  # the identity check evicted it
+    unrelated = os.open(tmp_path/'unrelated.bin', os.O_CREAT | os.O_RDWR | getattr(os, 'O_BINARY', 0))
+    try:
+        os.write(unrelated, b'u' * 64)
+        assert reader.read(32) == payload[10:42]
+    finally:
+        reader.close()
+        os.close(unrelated)
+
+
+def test_reader_outlives_its_opening_thread(tmp_path, lock_free):
+    _positional_only(lock_free)
+    archive = tmp_path/'sam-artifacts.tar'
+    payload = os.urandom(100_000)
+    artifacts.append_members(archive, {'m': payload})
+    opened = []
+    thread = threading.Thread(target=lambda: opened.append(artifacts.open_member(artifacts.reference(archive, 'm'))))
+    thread.start()
+    thread.join()
+    gc.collect()
+    with opened.pop() as reader:
+        assert isinstance(reader._stream, artifacts._PositionalStream)
+        assert reader.read() == payload
+
+
+def _refuse_lock_file(monkeypatch, code):
+    def unwritable_lock(file, mode='r', *args, **kwargs):
+        if mode == 'a+b' and str(file).endswith('.tar.lock'):
+            raise OSError(code, os.strerror(code), str(file))
+        return builtins.open(file, mode, *args, **kwargs)
+    monkeypatch.setattr(artifacts, 'open', unwritable_lock, raising=False)
+
+
+@pytest.mark.parametrize('code', [errno.EROFS, errno.EACCES])
+def test_cold_reader_without_a_writable_lock_reads_unlocked(tmp_path, monkeypatch, code):
+    archive = tmp_path/'sam-artifacts.tar'
+    artifacts.append_members(archive, {'scope/m': b'payload'})
+    monkeypatch.setattr(artifacts, '_ARCHIVE_INDEX_CACHE', {})
+    _refuse_lock_file(monkeypatch, code)
+    assert artifacts.read_member(artifacts.reference(archive, 'scope/m')) == b'payload'
+    monkeypatch.setattr(artifacts, '_ARCHIVE_INDEX_CACHE', {})
+    assert artifacts.list_members(archive) == ['scope/m']
+    assert artifacts.member_exists(artifacts.reference(archive, 'scope/m'))
+    assert not artifacts.member_exists(artifacts.reference(archive, 'scope/missing'))
+    with pytest.raises(OSError) as refused:
+        artifacts.append_members(archive, {'scope/n': b'x'})  # writers still need the lock
+    assert refused.value.errno == code
+
+
+def test_fallback_errors_are_not_chained_to_the_lock_error(tmp_path, monkeypatch):
+    archive = tmp_path/'sam-artifacts.tar'
+    artifacts.append_members(archive, {'scope/m': b'payload'})
+    monkeypatch.setattr(artifacts, '_ARCHIVE_INDEX_CACHE', {})
+    _refuse_lock_file(monkeypatch, errno.EROFS)
+    with pytest.raises(FileNotFoundError) as missing:
+        artifacts.read_member(artifacts.reference(archive, 'scope/missing'))
+    context = missing.value.__context__
+    while context is not None:
+        assert getattr(context, 'errno', None) != errno.EROFS
+        context = context.__context__

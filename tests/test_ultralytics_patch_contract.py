@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import io
 import os
 import queue
@@ -99,6 +100,23 @@ def test_source_registration_rejects_loaders_not_used_by_check_source() -> None:
     with _patch_ultralytics_modules(modules):
         with pytest.raises(RuntimeError, match='Unsupported Ultralytics in-memory source API'):
             geometry.ensure_ultralytics_accepts_in_memory_volume_source()
+        assert build.LOADERS == ()
+
+
+def test_source_registration_accepts_wrapped_check_source() -> None:
+    modules = _fake_ultralytics_modules()
+    build = modules['ultralytics.data.build']
+    build.LOADERS = ()
+
+    def inner(source):
+        return source, False, False, False, isinstance(source, build.LOADERS), False
+    build.check_source = functools.wraps(inner)(lambda source: inner(source))
+    with _patch_ultralytics_modules(modules):
+        geometry.ensure_ultralytics_accepts_in_memory_volume_source()
+        registered = build.LOADERS
+        assert geometry.InMemoryYoloVolumeSource in registered
+        geometry.ensure_ultralytics_accepts_in_memory_volume_source()
+        assert build.LOADERS is registered
 
 
 def test_worker_reports_required_retina_patch_failure_before_ready() -> None:

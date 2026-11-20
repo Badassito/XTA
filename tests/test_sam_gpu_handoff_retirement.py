@@ -23,18 +23,17 @@ def owned_pair(tmp_path, monkeypatch):
     engine = object.__new__(_GpuWorkerRenderEngine)
     engine.__dict__.update(old_engine.__dict__)
     del engine.clear_native_plane_cache
-    owners = [_Owner() for _ in range(9)]
+    owners = [_Owner() for _ in range(8)]
     references = [weakref.ref(owner) for owner in owners]
     engine._native_plane_cache = {'plane': owners[0]}
     engine._native_u8_plane_cache = {'plane': owners[1]}
     engine._spherical_direction_cache = {'directions': owners[2]}
-    engine._spherical_rotation_cache = {'rotation': owners[3]}
-    engine._tilted_plans = {'plan': owners[4]}
-    engine._fold_cache = {'fold': owners[5]}
-    engine._fused_azimuthal_taps = {'taps': owners[6]}
-    engine._standalone_render_meta = engine._standalone_render_meta_ref = owners[7]
+    engine._tilted_plans = {'plan': owners[3]}
+    engine._fold_cache = {'fold': owners[4]}
+    engine._fused_azimuthal_taps = {'taps': owners[5]}
+    engine._standalone_render_meta = engine._standalone_render_meta_ref = owners[6]
     monkeypatch.setattr(inference, '_AFFINE_GRID_CACHE', {
-        ('cuda:0', 'grid'): owners[8], ('cuda:1', 'grid'): _Owner()})
+        ('cuda:0', 'grid'): owners[7], ('cuda:1', 'grid'): _Owner()})
     source = _Owner()
     source_reference = weakref.ref(source)
     engine._volume_gpu = engine._volume_flat = engine._fused_volume_ref = source

@@ -29,7 +29,7 @@ def _prepare(tmp_path, *, backend='sdf', distance=0, passes=1, augmentation_pass
         dense_tiling_active=True, min_conf=0., min_radius=0.,
         interpolate=distance, interpolation_walk_back=0, interpolation_candidates=1,
         interpolate_passes=passes, interpolate_min_radius=0., interpolation_search_angle=0.,
-        keep_temp=True, slice_workers=1, interpolation_task_workers=1,
+        slice_workers=1, interpolation_task_workers=1,
         nrrd_layers_enabled=False, interpolation_backend=backend,
         precleaned_slice_cleanup=not cleanup, hole_fill_done_on_device=not cleanup,
         parent_mask_ready_callback=callback, extrapolation_distance=extrapolation,

@@ -7,12 +7,12 @@ inference on that slot waits for the post event before reusing output storage.
 
 from __future__ import annotations
 
-import os
 import threading
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
+from .env_flags import env_flag
 from .geometry import prediction_result_frame_spec
 
 
@@ -368,14 +368,8 @@ def release_semantic_trt_cache() -> int:
     return len(entries)
 
 
-def _enabled(name: str, default: bool = True) -> bool:
-    return str(os.environ.get(name, '1' if default else '0')).strip().lower() not in {
-        '0', 'false', 'no', 'off',
-    }
-
-
 def _decline(reason: str) -> None:
-    if _enabled('YOLO_TTA_SEMANTIC_TRT_TRACE', False):
+    if env_flag('YOLO_TTA_SEMANTIC_TRT_TRACE', False):
         print(f'Semantic TensorRT ring declined: {reason}', flush=True)
     return None
 
@@ -391,7 +385,7 @@ def try_semantic_trt_ring(
     Returns None only before source consumption, when generic inference may run.
     After consumption every error is fatal to this task; callers must not replay it.
     """
-    if not _enabled('YOLO_TTA_SEMANTIC_TRT_RING') or int(num_frames) <= 0:
+    if not env_flag('YOLO_TTA_SEMANTIC_TRT_RING', True) or int(num_frames) <= 0:
         return _decline('disabled or empty source')
     if getattr(source, 'azimuthal_padding_count', 0) or callable(
         getattr(source, 'restore_prediction', None)
@@ -460,7 +454,7 @@ def try_semantic_trt_ring(
         if executor is None:
             executor = SemanticTrtRingExecutor(
                 backend, engine, plan, slots=direct_slots,
-                capture_graphs=_enabled('YOLO_TTA_SEMANTIC_TRT_GRAPHS'),
+                capture_graphs=env_flag('YOLO_TTA_SEMANTIC_TRT_GRAPHS', True),
             )
             with _CACHE_LOCK:
                 _CACHE[id(backend)] = executor

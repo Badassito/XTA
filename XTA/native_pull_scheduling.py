@@ -333,12 +333,6 @@ def get_native_pull_scheduler():
         return _SCHEDULER
 
 
-def resize_native_pull_scheduler(workers: int):
-    scheduler = get_native_pull_scheduler()
-    if scheduler is not None:
-        scheduler.resize(workers)
-
-
 def shutdown_native_pull_scheduler(owner=None):
     scheduler = owner if owner is not None else get_native_pull_scheduler()
     if scheduler is not None:

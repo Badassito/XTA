@@ -62,7 +62,6 @@ def cpu_only(monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES","-1")
     monkeypatch.setenv("YOLO_TTA_NRRD_GPU_MIRROR_TEE","0")
     monkeypatch.setenv("YOLO_TTA_LOW_QUALITY_GPU_DOWNBIN","0")
-    monkeypatch.setenv("YOLO_TTA_SWEEP_CUDA_PROJECTION","0")
     from XTA import nrrd_compression
     monkeypatch.setattr(nrrd_compression,"_require_nrrd_member_codec",lambda **_:("zlib",1,gzip.compress))
 

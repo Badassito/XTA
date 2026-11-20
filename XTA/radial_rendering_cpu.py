@@ -1,15 +1,14 @@
 """SAM-only native Radial intensity crops with column-invariant arc geometry."""
 from __future__ import annotations
 
-import hashlib
 import math
 import operator
-from pathlib import Path
 
 import numpy as np
 from ._deps import _numba
+from .file_hashing import source_sha256
 
-IMPLEMENTATION_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+IMPLEMENTATION_SHA256 = source_sha256(__file__)
 
 
 @_numba.njit(cache=False, nogil=True, fastmath=False, inline='always')

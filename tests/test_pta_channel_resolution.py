@@ -33,9 +33,8 @@ def test_canonical_and_legacy_layouts_expand_to_identical_variants(token, expect
     canonical = resolve_channel_format(token)
     legacy = pta.resolve_channel_formats(token)
     # Resolution is complete before expansion. This catches accidental token
-    # round-trips through the shared channel parser for either input shape.
-    with mock.patch("XTA.unification.channels.resolve_channel_format",
-                    side_effect=AssertionError("reparse")):
+    # round-trips through the channel parser for either input shape.
+    with mock.patch("XTA.pta.resolve_channel_format", side_effect=AssertionError("reparse")):
         actual = pta.expand_channel_variants([canonical])
         assert pta.expand_channel_variants(legacy) == actual
     assert [(value.tag_token, value.reverse, value.offsets) for value in actual] == expected

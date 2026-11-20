@@ -1,17 +1,15 @@
 """Bounded transaction-local caches for immutable SAM proposal masks.
 
 The component-filter implementation remains unchanged. First reads retain its
-validation, source guards and exact measurements; repeat reads reuse immutable
-products. Payload and loaded-source identity are checked before and after each
-transaction. No cache survives its owning outer transaction or crosses evidence attempts.
+validation and exact measurements; repeat reads reuse immutable products.
+Payload identity is checked before and after each transaction. No cache
+survives its owning outer transaction or crosses evidence attempts.
 """
 from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Mapping
-import hashlib
 import json
-from pathlib import Path
 import struct
 import threading
 
@@ -21,9 +19,9 @@ from .sam_evidence import (SamEvidenceBundle, _decode_mask, _decode_raw_crop_bou
     native_output_shape_tyx, _freeze, _plain)
 from . import sam_filtering as _filtering
 from .artifact_archive import open_artifact
+from .file_hashing import source_sha256
 
-_SOURCE_PATH = Path(__file__).resolve()
-IMPLEMENTATION_SHA256 = hashlib.sha256(_SOURCE_PATH.read_bytes()).hexdigest()
+IMPLEMENTATION_SHA256 = source_sha256(__file__)
 DEFAULT_CACHE_BYTES = 32 * 1024**2
 
 
@@ -36,12 +34,6 @@ def _validate_tiled_filter(value, tiled=False):
         (isinstance(value.get("resolved_policy"),Mapping) and value["resolved_policy"].get("version")==3))
     if (tiled or declared) and (not isinstance(value,Mapping) or "mask_filter" not in value):
         raise ValueError("Tiled SAM quality-v3 support requires its retained component-filter specification")
-
-
-def _assert_source_unchanged():
-    if hashlib.sha256(_SOURCE_PATH.read_bytes()).hexdigest() != IMPLEMENTATION_SHA256:
-        raise RuntimeError("SAM mask-reader implementation changed after loading")
-    _filtering.assert_filter_implementation_unchanged()
 
 
 class _FilterSnapshot(Mapping):
@@ -143,7 +135,6 @@ class SamMaskReader:
             raise RuntimeError("SAM mask reader transactions cannot be reused or nested")
         parent = self._integrity_parent
         if parent is None:
-            _assert_source_unchanged()
             self.bundle.assert_unchanged()
             self._stats["integrity_checks"] += 1
         else:
@@ -172,7 +163,6 @@ class SamMaskReader:
                 if self._active:
                     if self._integrity_parent is None:
                         self.bundle.assert_unchanged()
-                        _assert_source_unchanged()
                         self._stats["integrity_checks"] += 1
                     else:
                         self._integrity_parent._require_active()

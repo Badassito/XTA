@@ -527,85 +527,6 @@ def finalize_background_filter_with_augmentations(
     return stats
 
 
-def withhold_background_overage_after_flips(
-    physical_candidates: Sequence[OutputCandidate],
-    *,
-    flips_by_subset: Mapping[str, int],
-    background_percent: float,
-    labels_available: bool,
-    background_stats: BackgroundFilterStats,
-    warnings: WarningSink,
-) -> int:
-    """Tighten each background cap before rendering after foreground flips."""
-    p = float(background_percent)
-    if p >= 1.0 or not labels_available:
-        return 0
-    if not any(int(value) > 0 for value in flips_by_subset.values()):
-        return 0
-    total_withheld = 0
-    subset_names = sorted(
-        {cand.split_subset or "all" for cand in physical_candidates},
-        key=lambda value: {"train": 0, "val": 1, "all": 2}.get(value, 3),
-    )
-    for subset_name in subset_names:
-        flips = int(flips_by_subset.get(subset_name, 0))
-        if flips <= 0:
-            continue
-        subset = [
-            cand for cand in physical_candidates
-            if (cand.split_subset or "all") == subset_name
-        ]
-        planned_foreground = sum(1 for cand in subset if cand.keep and cand.foreground)
-        realized_foreground = max(0, planned_foreground - flips)
-        allowed = background_limit_from_foreground(realized_foreground, p)
-        retained_original_background = sorted(
-            [
-                cand for cand in subset
-                if cand.keep and not cand.foreground and int(cand.augmentation_index) == 0
-            ],
-            key=candidate_background_rank,
-        )
-        grouped_by_source: Dict[str, List[OutputCandidate]] = defaultdict(list)
-        for cand in subset:
-            if cand.keep and not cand.foreground and int(cand.augmentation_index) > 0:
-                grouped_by_source[candidate_source_identity(cand)].append(cand)
-        breadth_ranked: List[Tuple[Tuple[int, bytes, int, int], OutputCandidate]] = []
-        for group in grouped_by_source.values():
-            group.sort(key=candidate_background_rank)
-            for position, cand in enumerate(group):
-                digest, src_order, order = candidate_background_rank(cand)
-                breadth_ranked.append(((int(position), digest, int(src_order), int(order)), cand))
-        breadth_ranked.sort(key=lambda pair: pair[0])
-        admission_order = [*retained_original_background, *[cand for _, cand in breadth_ranked]]
-        excess = max(0, len(admission_order) - int(allowed))
-        if excess <= 0:
-            continue
-        victims = admission_order[len(admission_order) - excess:]
-        withheld_original = 0
-        withheld_augmented = 0
-        for cand in victims:
-            cand.keep = False
-            if int(cand.augmentation_index) == 0:
-                withheld_original += 1
-            else:
-                withheld_augmented += 1
-        total_withheld += int(excess)
-        background_stats.background_retained -= int(excess)
-        background_stats.dropped += int(excess)
-        background_stats.original_background_dropped += int(withheld_original)
-        background_stats.augmented_background_dropped += int(withheld_augmented)
-        subset_stats = background_stats.subset_stats.get(subset_name)
-        if subset_stats is not None:
-            subset_stats["background_retained"] = int(subset_stats.get("background_retained", 0)) - int(excess)
-            subset_stats["original_background_retained"] = int(subset_stats.get("original_background_retained", 0)) - int(withheld_original)
-            subset_stats["augmented_background_retained"] = int(subset_stats.get("augmented_background_retained", 0)) - int(withheld_augmented)
-        warnings.add(
-            "background_cap_withheld_after_foreground_flips",
-            f"{subset_name}: flips={flips}, realized_foreground={realized_foreground}, withheld_backgrounds={excess}",
-        )
-    return total_withheld
-
-
 def finalize_augmentation_stats(
     stats: AugmentationStats,
     candidates: Sequence[OutputCandidate],
@@ -903,5 +824,4 @@ __all__ = [
     "select_fraction_candidates",
     "split_round_half_toward_train",
     "stable_digest_rank",
-    "withhold_background_overage_after_flips",
 ]

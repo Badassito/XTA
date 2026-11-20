@@ -92,6 +92,11 @@ contract violation: the Python manager raises without starting a CPU copy and
 quarantines strong references to both buffers. It also defers owned-file
 close/unlink until a later manager shutdown obtains an explicit drain proof, so
 an uncertain DMA target is never unmapped underneath the device.
+This project binding opens and closes its cdev inside each synchronous copy, so
+`drain()` and `close()` report the proof recorded by the last copy rather than
+touching hardware. A recorded `drained=false` is overwritten only by a later
+`copy()`, which the quarantined manager refuses, so the quarantine stays in
+place until process exit.
 
 The extension registers a `pthread_atfork` gate. Fork preparation waits until
 all capability probes and copies have closed their cdev descriptors, so a child

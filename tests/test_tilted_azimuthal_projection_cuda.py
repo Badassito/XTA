@@ -11,13 +11,6 @@ import pytest
 
 from XTA import backprojection as bp, geometry as g
 from XTA.projection_coverage import iter_destination_samples, nearest_plan_indices
-from XTA.tilted_azimuthal_projection import (
-    TiltedAzimuthalPlanUnavailable, build_tilted_azimuthal_plan,
-    tilted_azimuthal_cuda_capability,
-)
-from XTA.tilted_azimuthal_projection_cuda import (
-    TiltedAzimuthalCudaProjector, TiltedAzimuthalCudaProjectionUnavailable,
-)
 
 
 @pytest.fixture(autouse=True)
@@ -131,18 +124,6 @@ def test_zero_shear_agrees_with_upright_native_center_plane_and_stack_or(tmp_pat
         actual = bp.backproject_azimuthal_volume_to_volume(source, tilted, tmp_path/f'tilted-{index}.dat', 'tilted',
             out_shape_tyx=shape, reserve_bytes=0)
         np.testing.assert_array_equal(actual, expected)
-
-
-def test_legacy_cuda_is_typed_unavailable_before_geometry_gpu_lease_or_allocation():
-    source = np.ones((6, 5, 7), np.uint8)
-    view = tilted_views()[0]
-    assert not tilted_azimuthal_cuda_capability()[0]
-    with mock.patch.object(bp, 'build_dense_azimuthal_backprojection_map', side_effect=AssertionError('geometry allocation')):
-        with pytest.raises(TiltedAzimuthalPlanUnavailable, match='native destination'):
-            build_tilted_azimuthal_plan(source, view, (8, 11, 14))
-    with mock.patch.object(bp, '_try_acquire_main_process_gpu_stage', side_effect=AssertionError('lease acquired')):
-        with pytest.raises(TiltedAzimuthalCudaProjectionUnavailable, match='native destination'):
-            TiltedAzimuthalCudaProjector(source, object())
 
 
 @pytest.mark.parametrize('base', ['transverse', 'sagittal', 'coronal'])

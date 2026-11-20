@@ -1,5 +1,6 @@
 """Foreign D1 oblique tasks fail before device allocation or state mutation."""
 from dataclasses import replace
+import inspect
 from types import SimpleNamespace
 from unittest import mock
 
@@ -26,7 +27,7 @@ def test_legacy_oblique_state_rejected_before_any_cuda_probe(view,angle,delayed,
         with pytest.raises(ValueError,match='canonical native pull projectors'):
             cuda_d1._d1_get_or_create_state({'view':view,'result_mode':'d1_owner'},None)
         with pytest.raises(ValueError,match='canonical native pull projectors'):
-            cuda_d1._d1_view_family_ids(view)
+            cuda_d1._d1_require_cartesian_native_coverage(view)
     probe.assert_not_called()
     assert cuda_d1._D1_WORKER_VIEW_STATES==before
 
@@ -42,11 +43,16 @@ def test_consumer_cannot_bypass_family_guard_using_an_existing_state(view):
 
 
 @pytest.mark.parametrize('base',('transverse','sagittal','coronal'))
-def test_cartesian_metadata_still_uses_exact_native_coverage_family_zero(base):
+def test_cartesian_bases_pass_the_native_coverage_guard(base):
     view=geometry.get_view_infos(17,19,23,cartesian_views=(base,),azimuthal_views=())[0]
-    family,base_id,direction,shear,depth,_x,_y=cuda_d1._d1_view_family_ids(view)
-    assert family==0 and base_id==('transverse','sagittal','coronal').index(base)
-    assert direction==0 and shear==0. and depth==view.num_slices
+    assert cuda_d1._d1_require_cartesian_native_coverage(view) is None
+
+
+def test_kernel_module_carries_only_the_cartesian_coverage_kernel():
+    source=inspect.getsource(cuda_d1._d1_backproject_kernels)
+    assert 'd1_backproject_bboxes_to_bits' not in source
+    assert source.count('extern "C" __global__')==1
+    assert 'extern "C" __global__ void d1_orthogonal_coverage_to_bits(' in source
 
 
 def test_unknown_cartesian_base_rejected_before_device_access():

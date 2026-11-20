@@ -154,7 +154,7 @@ def main():
     stream = torch.cuda.current_stream()
     for ordinal, (physical, frame) in enumerate(chosen_views(logical_shape, size)):
         view = geometry.expand_views_into_tta_variants((physical,), (0.,))[0]
-        job = geometry.build_aug_job_for_variant(view, size, args.output_dir)
+        job = geometry.build_aug_job_for_variant(view, size)
         rendered, ready = renderer.render_fullframe_batch(view, job, (frame,), size,
                                                          True, channel_format=channel_format)
         stream.wait_event(ready)

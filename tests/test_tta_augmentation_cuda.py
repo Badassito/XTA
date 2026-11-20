@@ -37,8 +37,9 @@ def test_cuda_affine_matches_reference_and_packbits(shape, translation):
                                   np.packbits(valid.cpu().numpy(),axis=-1,bitorder='big'))
 
 
+@pytest.mark.parametrize('space',['source','raster'])
 @pytest.mark.parametrize('kind',['smooth','fold','singular','constant','nan'])
-def test_cuda_elastic_conservative_inverse_matches_reference(kind):
+def test_cuda_elastic_conservative_inverse_matches_reference(kind,space):
     h,w=47,53
     yy,xx=torch.meshgrid(torch.arange(h,device='cuda',dtype=torch.float32),
                          torch.arange(w,device='cuda',dtype=torch.float32),indexing='ij')
@@ -50,16 +51,20 @@ def test_cuda_elastic_conservative_inverse_matches_reference(kind):
         forward=torch.eye(3,device='cuda'); field=torch.stack((-xx,yy*0))
     if kind=='constant': field=torch.stack((xx*0+3,yy*0-1))
     if kind=='nan': field.fill_(float('nan'))
-    actual,valid=inverse_policy_grid(forward,field,h,w)
-    expected,support=reference(forward,field,h,w)
+    actual,valid=inverse_policy_grid(forward,field,h,w,displacement_space=space)
+    expected,support=reference(forward,field,h,w,displacement_space=space)
     assert torch.equal(valid,support)
     torch.testing.assert_close(actual,expected,atol=2e-6,rtol=0)
     if kind=='nan': assert not valid.any()
     if valid.any():
         xy=torch.stack(((actual[...,0]+1)*(w-1)/2,(actual[...,1]+1)*(h-1)/2),-1)
         delta,dx,dy=_bilinear_displacement(field,xy)
-        inverse=torch.linalg.inv(forward)
-        residual=xy@inverse[:2,:2].T+inverse[:2,2]+delta-torch.stack((xx,yy),-1)
+        target=torch.stack((xx,yy),-1)
+        if space=='source':  # source-pixel residual of x = inv(A)y + d(y)
+            inverse=torch.linalg.inv(forward)
+            residual=xy@inverse[:2,:2].T+inverse[:2,2]+delta-target
+        else:  # augmented-raster residual of x = inv(A)(y + d(y))
+            residual=xy+delta-(target@forward[:2,:2].T+forward[:2,2])
         assert residual[valid].abs().max() <= .0501
 
 

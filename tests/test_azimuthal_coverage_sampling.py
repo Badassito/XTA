@@ -1,9 +1,7 @@
 """Native intensity support and conservative Azimuthal planning admission."""
 from dataclasses import asdict, replace
 import math
-import os
 import unittest
-from unittest import mock
 
 import numpy as np
 
@@ -30,11 +28,6 @@ def native_view(shape=(17, 15, 13), base='transverse', *, raster=0):
 
 
 class AzimuthalCoverageSamplingTests(unittest.TestCase):
-    def setUp(self):
-        source_mode = mock.patch.dict(os.environ, {'YOLO_TTA_AZIMUTHAL_SOURCE_MODE': 'texture_linear'})
-        source_mode.start()
-        self.addCleanup(source_mode.stop)
-
     def assert_geometry_unchanged(self, before, after):
         expected, actual = asdict(before), asdict(after)
         actual['sampling_reason'] = expected['sampling_reason']
@@ -190,22 +183,6 @@ class AzimuthalCoverageSamplingTests(unittest.TestCase):
                     self.assertIn('1..4096', reduced.sampling_reason)
         self.assertEqual(optimize_azimuthal_view(native_view((4096, 4096, 4096))).sampling_policy,
                          'coverage')
-
-    def test_nearest_pointer_source_modes_retain_dense_geometry_and_user_setting(self):
-        original = native_view()
-        for mode in ('pointer', 'canonical', 'nearest_xy', 'nearest_xy_linear_t', 'nearest-xy-linear-t'):
-            with self.subTest(mode=mode), mock.patch.dict(os.environ, {'YOLO_TTA_AZIMUTHAL_SOURCE_MODE': mode}):
-                result = optimize_azimuthal_view(original)
-                self.assert_geometry_unchanged(original, result)
-                self.assertIn('Nearest-source', result.sampling_reason)
-                self.assertEqual(os.environ['YOLO_TTA_AZIMUTHAL_SOURCE_MODE'], mode)
-        for mode in ('texture', 'texture_linear', 'hardware_linear', 'hardware-linear', 'trilinear'):
-            with self.subTest(mode=mode), mock.patch.dict(os.environ, {'YOLO_TTA_AZIMUTHAL_SOURCE_MODE': mode}):
-                self.assertEqual(optimize_azimuthal_view(original).sampling_policy, 'coverage')
-                self.assertEqual(os.environ['YOLO_TTA_AZIMUTHAL_SOURCE_MODE'], mode)
-        with mock.patch.dict(os.environ):
-            os.environ.pop('YOLO_TTA_AZIMUTHAL_SOURCE_MODE')
-            self.assertEqual(optimize_azimuthal_view(original).sampling_policy, 'coverage')
 
     def test_reduced_sweep_retains_dense_pull_roi_and_seam_sampling(self):
         original = native_view((17, 15, 13))

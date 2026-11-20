@@ -1,8 +1,8 @@
 """PTA dataset and image publication primitives shared with render workers.
 
-The module owns filesystem publication, image encoding, and the canonical
-frame-carrying dataset sink.  It is independent of :mod:`XTA.pta` and accepts
-only the warning-sink protocol owned by :mod:`XTA.pta_dataset`.
+The module owns filesystem publication and image encoding.  It is independent
+of :mod:`XTA.pta` and accepts only the warning-sink protocol owned by
+:mod:`XTA.pta_dataset`.
 """
 
 from __future__ import annotations
@@ -35,9 +35,8 @@ from .pta_augmentation import (
 )
 from .pta_dataset import AUGMENTATION_TAG_LENGTH, OutputCandidate, WarningSink
 from .pta_binary import candidate_binary_output_path, write_binary_mask
-from .render_batch import RenderBatch as CanonicalRenderBatch, RenderBatchItem
+from .polygon_keyholes import holes_by_parent, splice_holes
 from .runtime import runtime_telemetry_phase
-from .unification.contracts import DataRole, FrameAddress, RasterPlan, RenderItem
 
 
 OUTPUT_IMAGE_FORMATS = {"png", "jpg", "jpeg", "tif", "tiff", "nvjpeg", "nvtiff"}
@@ -129,7 +128,10 @@ def yolo_label_window(bounds: Sequence[int], shape: Tuple[int, int]) -> Optional
 def mask_to_yolo_lines(mask01: np.ndarray, *, warnings: WarningSink, context: str, known_empty: bool = False,
                        frame_shape: Optional[Tuple[int, int]] = None,
                        origin: Tuple[int, int] = (0, 0)) -> List[str]:
-    """Export outer polygons; ``mask01`` may be a yolo_label_window crop at ``origin`` (x, y)."""
+    """Export one polygon per outer contour; enclosed holes join through zero-width keyhole bridges.
+
+    ``mask01`` may be a yolo_label_window crop at ``origin`` (x, y).
+    """
     if known_empty:
         return []
     m = np.asarray(mask01, dtype=np.uint8)
@@ -140,13 +142,11 @@ def mask_to_yolo_lines(mask01: np.ndarray, *, warnings: WarningSink, context: st
     if x0 < 0 or y0 < 0 or x0 + m.shape[1] > w or y0 + m.shape[0] > h:
         raise ValueError(f"Label crop {m.shape} at {(x0, y0)} lies outside frame {(h, w)}")
     contours, hierarchy = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE, offset=(x0, y0))
-    if hierarchy is not None:
-        hinfo = hierarchy[0]
-        if np.any(hinfo[:, 3] >= 0):
-            warnings.add("holes_discarded_during_polygon_export", context)
+    children = holes_by_parent(hierarchy)
+    holes_discarded = False
     lines: List[str] = []
     hierarchy_arr = [None] * len(contours) if hierarchy is None else list(hierarchy[0])
-    for cnt, hrow in zip(contours, hierarchy_arr):
+    for index, (cnt, hrow) in enumerate(zip(contours, hierarchy_arr)):
         if hrow is not None and int(hrow[3]) >= 0:
             continue
         if cnt is None or len(cnt) < 3:
@@ -159,10 +159,20 @@ def mask_to_yolo_lines(mask01: np.ndarray, *, warnings: WarningSink, context: st
         if pts.shape[0] < 3:
             warnings.add("degenerate_export_polygon", context)
             continue
+        holes = []
+        for child in children.get(index, ()):
+            ring = cv2.approxPolyDP(contours[child], epsilon=1.0, closed=True).reshape(-1, 2)
+            if len(ring) < 3:
+                holes_discarded = True
+            else:
+                holes.append(ring)
+        pts = splice_holes(pts, holes)
         # Contour points lie inside the frame, so cached per-axis text is exact.
         xs = _yolo_coordinate_text(w)
         text = xs[pts] if w == h else np.stack((xs[pts[:, 0]], _yolo_coordinate_text(h)[pts[:, 1]]), axis=1)
         lines.append("0 " + " ".join(text.ravel().tolist()))
+    if holes_discarded:
+        warnings.add("holes_discarded_during_polygon_export", context)
     return lines
 
 
@@ -743,79 +753,6 @@ def publish_semantic_mask_payloads(
         raise first_error
 
 
-@dataclass(frozen=True)
-class PtaDatasetImageSink:
-    """PTA image publication consumer for the canonical frame-carrying batch."""
-
-    png_compression: int
-    channel_kind: str
-    jpeg_quality: int
-
-    def __call__(self, batch: CanonicalRenderBatch) -> None:
-        for path_value, item in zip(batch.paths, batch.items):
-            if item.synthetic_padding or item.azimuthal_padding:
-                continue
-            write_image(
-                Path(path_value),
-                item.frame,
-                int(self.png_compression),
-                channel_kind=str(self.channel_kind),
-                jpeg_quality=int(self.jpeg_quality),
-            )
-
-
-def publish_pta_candidate_image_batch(
-    *,
-    cand: OutputCandidate,
-    image: np.ndarray,
-    img_path: Path,
-    canonical_plan: RasterPlan,
-    png_compression: int,
-    jpeg_quality: int,
-) -> CanonicalRenderBatch:
-    """Build once and deliver the exact dataset image frame to its sink."""
-
-    frame = np.ascontiguousarray(np.asarray(image), dtype=np.uint8)
-    request = RenderItem(
-        plan=canonical_plan,
-        data_role=DataRole.INTENSITY,
-        frame_address=FrameAddress(int(cand.frame_idx)),
-        metadata={
-            "physical_view_id": str(cand.physical_view_id),
-            "presentation_variant_id": str(cand.presentation_variant_id),
-            "geometry_item_id": str(cand.geometry_item_id),
-            "augmentation_index": int(cand.augmentation_index),
-            "augmentation_tag": cand.augmentation_tag,
-        },
-    )
-    frames = [frame]
-    batch = CanonicalRenderBatch(
-        paths=[str(img_path)],
-        frames=frames,
-        info=[
-            f"PTA dataset item {cand.volume_name}/{cand.output_tag}/"
-            f"frame={int(cand.frame_idx) + 1:04d}"
-        ],
-        items=(
-            RenderBatchItem(
-                result_index=int(cand.frame_idx),
-                center_index=int(cand.frame_idx),
-                synthetic_padding=False,
-                azimuthal_padding=False,
-                frame=frame,
-                request=request,
-            ),
-        ),
-        raster_plan=canonical_plan,
-    )
-    PtaDatasetImageSink(
-        png_compression=int(png_compression),
-        channel_kind=str(cand.channel_kind),
-        jpeg_quality=int(jpeg_quality),
-    )(batch)
-    return batch
-
-
 def write_selected_candidate_version(
     *,
     cand: OutputCandidate,
@@ -834,7 +771,6 @@ def write_selected_candidate_version(
     save_binary: bool = False,
     save_semantic: bool = False,
     semantic_coverage: Optional[np.ndarray] = None,
-    canonical_plan: Optional[RasterPlan] = None,
 ) -> str:
     """Render and write one retained candidate version.
 
@@ -910,23 +846,13 @@ def write_selected_candidate_version(
         )
         return "flip_dropped"
     if bool(save_images):
-        if canonical_plan is None:
-            write_image(
-                img_path,
-                image_out,
-                int(png_compression),
-                channel_kind=str(cand.channel_kind),
-                jpeg_quality=int(jpeg_quality),
-            )
-        else:
-            publish_pta_candidate_image_batch(
-                cand=cand,
-                image=image_out,
-                img_path=img_path,
-                canonical_plan=canonical_plan,
-                png_compression=int(png_compression),
-                jpeg_quality=int(jpeg_quality),
-            )
+        write_image(
+            img_path,
+            image_out,
+            int(png_compression),
+            channel_kind=str(cand.channel_kind),
+            jpeg_quality=int(jpeg_quality),
+        )
     if bool(save_labels) and label_lines is not None and lbl_path is not None:
         write_yolo_lines(label_lines, lbl_path)
     if bool(save_binary) and cand.label_enabled:
@@ -942,7 +868,6 @@ def write_selected_candidate_version(
 
 __all__ = [
     "OUTPUT_IMAGE_FORMATS",
-    "PtaDatasetImageSink",
     "candidate_output_paths",
     "candidate_semantic_output_path",
     "ensure_output_parent_once",
@@ -950,7 +875,6 @@ __all__ = [
     "mask_to_yolo_lines",
     "output_image_suffix",
     "parse_output_image_format",
-    "publish_pta_candidate_image_batch",
     "publish_semantic_mask_payloads",
     "semantic_png_backend",
     "verify_published_image_tree",

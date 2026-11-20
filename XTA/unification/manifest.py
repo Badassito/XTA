@@ -1,4 +1,4 @@
-"""Deterministic, atomic JSON support for v18 run manifests."""
+"""Deterministic, atomic JSON support for unified-launcher run manifests."""
 
 from __future__ import annotations
 

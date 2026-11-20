@@ -29,7 +29,7 @@ def terminal_capture_budget(*, parent_capacity, physical_headroom, parent_worker
         allowance_bytes=allowance)
 
 
-def retire_confidence_scores(scores, *, model_name, view_name, path, keep_temp,
+def retire_confidence_scores(scores, *, model_name, view_name, path,
                              retired_callback, carrier):
     """Return source credit only after the score backing's last actual owner."""
     from .runtime import close_memmap_array
@@ -43,8 +43,8 @@ def retire_confidence_scores(scores, *, model_name, view_name, path, keep_temp,
         finalizer.atexit = False
         owner = None
     try:
-        close_memmap_array(scores, unlink_path=path if path is not None and not keep_temp else None)
-        if path is not None and not keep_temp:
+        close_memmap_array(scores, unlink_path=path)
+        if path is not None:
             try:
                 path.unlink(missing_ok=True)
             except Exception:

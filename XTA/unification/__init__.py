@@ -1,10 +1,6 @@
 """Dependency-light public surface for the unified TTA/PTA/LTA contract layer."""
 
-from .channels import (
-    expand_channel_variants,
-    resolve_channel_layout,
-    resolve_channel_variants,
-)
+from .channels import channel_layout_from_format, expand_channel_variants
 from .contracts import (
     BackendSamplingImplementation,
     ChannelLayout,
@@ -28,7 +24,7 @@ from .sampling import (
     raster_plan_spawn_spec,
     require_forward_sampling,
 )
-from .tiles import ResolvedTileGroup, resolve_tile_groups
+from .tiles import TileConfig, resolve_tile_groups
 
 
 __all__ = (
@@ -45,6 +41,7 @@ __all__ = (
     "RenderItem",
     "ResolvedViewVariant",
     "TileLayout",
+    "channel_layout_from_format",
     "expand_channel_variants",
     "expand_view_variants",
     "build_forward_raster_plan",
@@ -53,9 +50,7 @@ __all__ = (
     "raster_plan_from_spawn_spec",
     "raster_plan_spawn_spec",
     "require_forward_sampling",
-    "ResolvedTileGroup",
+    "TileConfig",
     "resolve_tile_groups",
-    "resolve_channel_layout",
-    "resolve_channel_variants",
     "resolve_in_plane_variants",
 )

@@ -53,9 +53,9 @@ def parse_args(argv=None):
     if not args.output_dir.is_relative_to(ROOT.parent/'Scratch'):
         parser.error('Qualification artifacts must stay under sibling Scratch')
     if not 1<=args.max_families<=4 or not 1<=args.max_jobs<=32 or args.cache_mib<0:
-        parser.error('Bound this diagnostic to1–4families and1–32complete original jobs')
+        parser.error('Bound this diagnostic to 1–4 families and 1–32 complete original jobs')
     if args.execute and args.heatsoak_seconds<60:
-        parser.error('Real local timings require at least60seconds of model heatsoak')
+        parser.error('Real local timings require at least 60 seconds of model heatsoak')
     if (not math.isfinite(args.heatsoak_seconds) or args.heatsoak_seconds<0
             or not math.isfinite(args.gpu_lock_timeout) or args.gpu_lock_timeout<0):
         parser.error('Heatsoak and GPU reservation durations must be finite and nonnegative')

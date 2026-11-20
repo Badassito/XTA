@@ -8,7 +8,6 @@ combined by OR rather than silently choosing one copy.
 from __future__ import annotations
 
 import math
-import os
 from collections import OrderedDict, deque
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -22,6 +21,7 @@ import numpy as np
 from .geometry import ViewInfo
 from .cylindrical_cuda_projection import RadialCudaProjectionUnsafeFailure
 from ._deps import _numba
+from .env_flags import env_flag
 from .runtime import allocate_workspace_array, close_memmap_array_without_flush, runtime_telemetry
 from .workspace import _cpu_count
 
@@ -571,9 +571,7 @@ def _ordered_radial_blocks(project, depth, plane_bytes, workers, *, first_z=0,
 
 
 def radial_cuda_backproject_enabled():
-    return os.environ.get('YOLO_TTA_GPU_RADIAL_BACKPROJECT', '1').strip().lower() not in (
-        '0', 'false', 'no', 'off',
-    )
+    return env_flag('YOLO_TTA_GPU_RADIAL_BACKPROJECT', True)
 
 
 class _RadialCudaStage:

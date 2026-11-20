@@ -594,9 +594,7 @@ def _publish(bundle,receipt,destination,metadata,*,cancel_event=None,resource_pr
                     roots=index.roots_by_direction
                     active=(set(frame for frame,owners in index.owners_by_frame.items() if owners[0]),
                             set(frame for frame,owners in index.owners_by_frame.items() if owners[1]))
-                    uses_cyclic=bool(index.uses_cyclic)
                 else:
-                    uses_cyclic=False
                     identity=receipt['selection_identity']
                     policy_hash=receipt['policy_hash']
                     ids=tuple(tuple(rid for rid in receipt['selected_run_ids']
@@ -607,17 +605,12 @@ def _publish(bundle,receipt,destination,metadata,*,cancel_event=None,resource_pr
                     for direction,direction_ids in enumerate(ids):
                         for rid in direction_ids:
                             group=bundle.groups[bundle.runs[rid]['group_id']]
-                            uses_cyclic=uses_cyclic or bool(group.get('frame_addressing'))
                             for frame in receipt['selected_frames_by_run'][rid]:
                                 native=(int(group['frame_addresses'][str(frame)]['native_index'])
                                     if group.get('frame_addressing') else int(frame))
                                 if not 0<=native<shape[0]:
                                     raise ValueError('SAM extrapolation selected frame is outside its native canvas')
                                 active[direction].add(native)
-                if uses_cyclic:
-                    # Start boundary: per-crop cyclic folds perform no file I/O.
-                    from .sam_cyclic import assert_cyclic_implementation_unchanged
-                    assert_cyclic_implementation_unchanged()
                 for name,path in zip(names,paths):
                     store_dir=stages.enter_context(artifact_directory(path,temp_root=runtime_work_dir))
                     outputs.append(IncrementalRawBBoxMaskStoreWriter(shape=shape,store_dir=store_dir,
@@ -684,10 +677,6 @@ def _publish(bundle,receipt,destination,metadata,*,cancel_event=None,resource_pr
             _validate_receipt(bundle,receipt)
             if receipt['selection_identity']!=identity:
                 raise ValueError('SAM extrapolation selection changed during publication')
-            if uses_cyclic:
-                # Closing boundary for both indexed and unindexed folded owners.
-                from .sam_cyclic import assert_cyclic_implementation_unchanged
-                assert_cyclic_implementation_unchanged()
             for output in outputs:
                 cancelled()
                 records.append(output.finalize())

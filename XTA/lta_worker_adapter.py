@@ -577,8 +577,10 @@ def _execute_worker_task_impl(
     if crop_model_side is not None:
         if type(crop_model_side) is not int or crop_model_side != 1008:
             raise ValueError("crop_model_side must be the qualified 1008-pixel SAM side")
-        from .lta_dynamic_crops import resize_crop_mask
+        from .lta_dynamic_crops import resize_crop_mask, resize_crop_mask_with_receipt
     scaled_crop = crop_model_side is not None and source_tile.size != crop_model_side
+    seed_components_rescued = 0
+    dogfood_dropped_empty_after_restore = 0
     tile_index = int(payload["tile_index"])
     generation = int(payload.get("relay_generation", 0))
     relay_min_pixels = int(payload.get("relay_min_pixels", 16))
@@ -660,10 +662,17 @@ def _execute_worker_task_impl(
             # Partition on that geometry so optional filling cannot introduce
             # an overlap conflict after the planning-time check.
             with trace.phase("seed_partition", work_id=str(payload["work_id"]), window_index=window_index):
-                model_seeds = tuple(
-                    replace(seed, mask=resize_crop_mask(seed.mask, side=crop_model_side))
-                    for seed in seeds
-                ) if scaled_crop else seeds
+                model_seeds = seeds
+                if scaled_crop:
+                    model_seeds = []
+                    for seed in seeds:
+                        model_mask, rescued = resize_crop_mask_with_receipt(seed.mask, side=crop_model_side)
+                        seed_components_rescued += rescued
+                        model_seeds.append(replace(seed, mask=model_mask))
+                    model_seeds = tuple(model_seeds)
+                    # The hard-positive prompt frame publishes only the native
+                    # seed, never a resampled model-space copy of it.
+                    native_prompt_masks = {seed.lineage: seed.mask for seed in seeds}
                 seed_partitions = partition_mask_seed_sessions(
                     model_seeds,
                     mask_transform=(fill_binary_mask_holes_2d if getattr(context, 'enable_2D_hole_fill', False) else None),
@@ -687,8 +696,15 @@ def _execute_worker_task_impl(
             def reduce_prediction(item: Any) -> None:
                 prediction = item.prediction
                 if scaled_crop:
-                    prediction = replace(prediction, binary_mask=resize_crop_mask(
-                        prediction.binary_mask, side=source_tile.size, restore=True))
+                    if prediction.frame_index == window.prompt_frame:
+                        # Mirrors lta_propagation: the hard-positive frame
+                        # publishes only the (optionally hole-filled) seed.
+                        native = native_prompt_masks[item.lineage]
+                        if getattr(context, 'enable_2D_hole_fill', False):
+                            native = fill_binary_mask_holes_2d(native)
+                    else:
+                        native = resize_crop_mask(prediction.binary_mask, side=source_tile.size, restore=True)
+                    prediction = replace(prediction, binary_mask=native)
                     item = replace(item, prediction=prediction)
                 key = (
                     str(item.lineage.token),
@@ -803,8 +819,13 @@ def _execute_worker_task_impl(
                 _mark_completed_coverage(coverage, request=request, adapter_receipt=result.adapter_receipt)
                 for seed in result.dogfood_seeds:
                     if scaled_crop:
-                        seed = replace(seed, mask=resize_crop_mask(
-                            seed.mask, side=source_tile.size, restore=True),
+                        restored = resize_crop_mask(seed.mask, side=source_tile.size, restore=True)
+                        if not restored.any():
+                            # Like an empty boundary prediction, a boundary
+                            # that restores empty yields no dogfood seed.
+                            dogfood_dropped_empty_after_restore += 1
+                            continue
+                        seed = replace(seed, mask=restored,
                             source_receipt={**seed.source_receipt, "crop_transform": {
                                 "native_crop_xyxy": list(source_tile.xyxy),
                                 "model_shape_hw": [crop_model_side, crop_model_side],
@@ -923,8 +944,11 @@ def _execute_worker_task_impl(
             "native_crop_xyxy": list(source_tile.xyxy),
             "model_shape_hw": [crop_model_side, crop_model_side],
             "native_mask_shape_hw": [source_tile.size, source_tile.size],
-            "frame_resize": "area", "seed_resize": "area_threshold_128",
+            "frame_resize": "area", "seed_resize": "area_threshold_128_keep_components",
+            "seed_components_rescued": seed_components_rescued,
             "prediction_restore": "linear_threshold_128",
+            "prompt_frame_publication": "native_seed",
+            "dogfood_dropped_empty_after_restore": dogfood_dropped_empty_after_restore,
             "hole_fill_count_coordinates": "model",
             "prediction_and_dogfood_coordinates": "native_crop",
         }

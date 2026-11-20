@@ -53,7 +53,7 @@ def test_actual_pipeline_constructor_passes_limits_and_keeps_shared_executor(mon
         return owner
     monkeypatch.setattr(yolo_cpu_input, 'CpuInputPrefetch', construct)
     monkeypatch.setenv('YOLO_TTA_CPU_INPUT_BUILDERS', '20')
-    render_executor, volume_executor = object(), object()
+    render_executor = object()
     tracked, gauges = [], []
     notify = lambda: None
     source = object()
@@ -62,7 +62,7 @@ def test_actual_pipeline_constructor_passes_limits_and_keeps_shared_executor(mon
         scheduler=SimpleNamespace(notify_gpu_stage_admission_change=notify),
         gpu_worker_tasks_by_id={}, input_volume_rgb=source, volume_rgb=object(),
         native_resize_task_spec={}, prediction_render_executor=render_executor,
-        prediction_volume_executor=volume_executor, cpu_input_budget=64 * 1024**3,
+        cpu_input_budget=64 * 1024**3,
         gpu_device_count=4, args=SimpleNamespace(imgsz=2048),
         available_anon_work_bytes=lambda:64*1024**3,
         runtime_telemetry=lambda:SimpleNamespace(gauge=lambda *args:gauges.append(args)),

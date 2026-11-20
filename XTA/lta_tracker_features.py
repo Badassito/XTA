@@ -17,6 +17,8 @@ import operator
 import threading
 from typing import Any
 
+from .env_flags import env_flag
+
 
 TRACKER_FEATURE_POLICY = "sam3_1_visual_backbone_only_exact_bf16"
 TRACKER_FEATURE_AUDIT_KEY = "lta_tracker_feature_preparation"
@@ -28,8 +30,7 @@ _STAGING = threading.local()
 
 def async_frame_io_enabled() -> bool:
     """``YOLO_TTA_SAM_ASYNC_FRAME_IO=0`` restores the original synchronous per-frame transfers."""
-    import os
-    return os.environ.get("YOLO_TTA_SAM_ASYNC_FRAME_IO", "1").strip().lower() not in {"0", "false", "no", "off"}
+    return env_flag("YOLO_TTA_SAM_ASYNC_FRAME_IO", True)
 
 
 def _tensor_version(tensor: Any) -> int | None:

@@ -1,10 +1,10 @@
-"""GIL-convoy fix: cyclic source identity is checked at boundaries, not per address.
+"""GIL-convoy fix: the cyclic helpers never re-read their own source.
 
 The old helpers re-read and SHA-256-hashed ``sam_cyclic.py`` on every address,
 transform and validation call (about 1.3 M calls per Azimuthal view). These tests
-prove the per-call helpers now perform no file I/O, their results are identical
-to the v25.0.2 (5320fbe) implementation, and a changed source is still rejected at the
-plan/evidence/selection/publication boundaries with the same RuntimeError.
+prove the helpers, evidence, selection and publication paths perform no source
+file I/O and that their results are identical to the v25.0.2 (5320fbe) implementation.
+The module identity is hashed once, at import.
 """
 from __future__ import annotations
 
@@ -25,7 +25,6 @@ from XTA.sam_policy import select_sam_proposals
 from tests.test_sam_cyclic_evidence_replay import bundle_at
 
 ROOT = Path(__file__).resolve().parents[1]
-CHANGED = "changed after loading"
 _HELPERS = ("address_for_unfolded_index", "transform_crop_between_frame_addresses",
             "validate_cyclic_frame_addressing", "build_cyclic_frame_addressing", "mirror_bbox_yx",
             "CyclicFrameAddresses", "CyclicObservationVolume", "ExtrapolationCyclicObservationVolume")
@@ -85,25 +84,19 @@ def _swap_in_old(monkeypatch, old):
         monkeypatch.setattr(sam_cyclic, name, getattr(old, name))
 
 
-def _missing_source(monkeypatch, tmp_path):
-    """Any file access by a per-call helper now raises FileNotFoundError."""
-    monkeypatch.setattr(sam_cyclic, "_SOURCE_PATH", tmp_path / "does-not-exist" / "sam_cyclic.py")
+def _record_source_reads(monkeypatch):
+    """Record (and refuse) any read of ``sam_cyclic.py`` after import."""
+    source = Path(sam_cyclic.__file__).resolve()
+    reads = []
+    original = Path.read_bytes
 
-
-def _changed_source(monkeypatch, tmp_path):
-    changed = tmp_path / "changed_sam_cyclic.py"
-    changed.write_bytes(Path(sam_cyclic.__file__).read_bytes() + b"\n# changed after import\n")
-    monkeypatch.setattr(sam_cyclic, "_SOURCE_PATH", changed)
-
-
-def _count_checks(monkeypatch):
-    calls = []
-    original = sam_cyclic.assert_cyclic_implementation_unchanged
-    def counted():
-        calls.append(1)
-        return original()
-    monkeypatch.setattr(sam_cyclic, "assert_cyclic_implementation_unchanged", counted)
-    return calls
+    def read_bytes(self):
+        if Path(self).resolve() == source:
+            reads.append(self)
+            raise AssertionError("SAM cyclic source was re-read")
+        return original(self)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    return reads
 
 
 # --- old vs new identity of every per-call helper ------------------------------------------
@@ -304,9 +297,8 @@ def test_pair_contact_true_and_false_outcomes_match_head_helpers(tmp_path, monke
 
 def test_per_pair_and_per_frame_paths_never_touch_the_source_file(tmp_path, monkeypatch):
     bundle = bundle_at(tmp_path)
+    reads = _record_source_reads(monkeypatch)
     receipt = select_sam_proposals(bundle, policy={"sam_bridge_policy": "permissive"})
-    _missing_source(monkeypatch, tmp_path)
-    calls = _count_checks(monkeypatch)
     address = sam_cyclic.address_for_unfolded_index(9, 4)
     sam_cyclic.transform_crop_between_frame_addresses(np.ones((2, 3), bool), (0, 0, 2, 3), address,
                                                       sam_cyclic.address_for_unfolded_index(1, 4), 16)
@@ -323,105 +315,15 @@ def test_per_pair_and_per_frame_paths_never_touch_the_source_file(tmp_path, monk
             sam_policy._pair_contact(reader, group, ["forward"], group, ["forward"], 26, snapshot)
         for frame in range(4):
             sam_interpolation.selected_sam_plane(reader, receipt, frame, (12, 16),
-                                                 _records=(bundle.groups, bundle.runs), _cyclic_source_checked=True)
-    assert calls == []
-
-
-def test_publication_checks_once_per_direction_boundary_not_per_frame(tmp_path, monkeypatch):
-    bundle = bundle_at(tmp_path)
-    receipt = select_sam_proposals(bundle, policy={"sam_bridge_policy": "permissive"})
-    observed = np.zeros((4, 12, 16), np.uint8)
-    reference = [selected_native_plane(bundle, receipt, frame) for frame in range(4)]
-    calls = _count_checks(monkeypatch)
-    merged, components, added, _ = sam_interpolation._publish_directions(
-        bundle, receipt, observed, tmp_path / "outputs", {}, 1, tmp_path / "merged")
-    try:
-        # One forward cyclic direction: start + pre-finalize; the backward one is empty.
-        # The reader transaction and bundle open add none (opened before counting).
-        assert len(calls) == 2
-        assert added == sum(int(np.count_nonzero(plane)) for plane in reference)
-        for frame in range(4):
-            np.testing.assert_array_equal(np.asarray(merged[frame]) != 0, reference[frame] != 0)
-    finally:
-        if isinstance(merged, np.memmap):
-            merged._mmap.close()
-
-
-def test_publication_rejects_a_changed_source_at_its_boundaries(tmp_path, monkeypatch):
-    bundle = bundle_at(tmp_path)
-    receipt = select_sam_proposals(bundle, policy={"sam_bridge_policy": "permissive"})
-    _changed_source(monkeypatch, tmp_path)
-    with pytest.raises(RuntimeError, match=CHANGED):
-        sam_interpolation._publish_directions(bundle, receipt, np.zeros((4, 12, 16), np.uint8),
-                                              tmp_path / "outputs", {}, 1, tmp_path / "merged")
-    assert not list((tmp_path / "outputs").glob("*.cvol")) if (tmp_path / "outputs").exists() else True
-    with pytest.raises(RuntimeError, match=CHANGED):
-        sam_interpolation.selected_sam_plane(bundle, receipt, 0, (12, 16))
-
-
-def test_publication_detects_change_between_frames_before_finalize(tmp_path, monkeypatch):
-    bundle = bundle_at(tmp_path)
-    receipt = select_sam_proposals(bundle, policy={"sam_bridge_policy": "permissive"})
-    original = sam_interpolation.selected_sam_plane
-    def change_mid_publication(*args, **kwargs):
-        plane = original(*args, **kwargs)
-        _changed_source(monkeypatch, tmp_path)
-        return plane
-    monkeypatch.setattr(sam_interpolation, "selected_sam_plane", change_mid_publication)
-    finalized = []
-    from XTA import interpolation
-    real_finalize = interpolation.IncrementalRawBBoxMaskStoreWriter.finalize
-    def finalize(self, *args, **kwargs):
-        finalized.append(self)
-        return real_finalize(self, *args, **kwargs)
-    monkeypatch.setattr(interpolation.IncrementalRawBBoxMaskStoreWriter, "finalize", finalize)
-    with pytest.raises(RuntimeError, match=CHANGED):
-        sam_interpolation._publish_directions(bundle, receipt, np.zeros((4, 12, 16), np.uint8),
-                                              tmp_path / "outputs", {}, 1, tmp_path / "merged")
-    assert finalized == []
-
-
-def test_evidence_writer_and_open_are_boundaries(tmp_path, monkeypatch):
-    bundle = bundle_at(tmp_path / "a")
-    _changed_source(monkeypatch, tmp_path)
-    with pytest.raises(RuntimeError, match=CHANGED):
-        SamEvidenceBundle.open(bundle.directory)
-    with pytest.raises(RuntimeError, match=CHANGED):
-        bundle_at(tmp_path / "b")
-
-
-# --- extrapolation publication ----------------------------------------------------------------
-
-@pytest.mark.parametrize("indexed", [True, False])
-def test_extrapolation_publication_checks_start_and_end_only(tmp_path, monkeypatch, indexed):
-    from XTA import sam_extrapolation as core, sam_extrapolation_policy as policy
-    from XTA.sam_evidence import _plain
-    from tests.test_sam_extrapolation_publication_index import evidence, expected, pixels
-    volume, bundle, receipt = evidence(tmp_path)
-    assert any(group.get("frame_addressing") for group in bundle.groups.values())
-    reference = expected(bundle, receipt)
-    if not indexed:
-        def unavailable(*args, **kwargs):
-            raise policy._PublicationReuseLimit
-        monkeypatch.setattr(policy, "_publication_index", unavailable)
-    calls = _count_checks(monkeypatch)
-    components, added = core._publish(bundle, receipt, tmp_path / "published", _plain(bundle.scope))
-    for left, right in zip(pixels(components, volume.shape), reference):
-        np.testing.assert_array_equal(left, right)
-    assert len(calls) == 2
-
-
-@pytest.mark.parametrize("indexed", [True, False])
-def test_extrapolation_publication_rejects_changed_source(tmp_path, monkeypatch, indexed):
-    from XTA import sam_extrapolation as core, sam_extrapolation_policy as policy
-    from XTA.sam_evidence import _plain
-    from tests.test_sam_extrapolation_publication_index import evidence
-    _, bundle, receipt = evidence(tmp_path)
-    if not indexed:
-        def unavailable(*args, **kwargs):
-            raise policy._PublicationReuseLimit
-        monkeypatch.setattr(policy, "_publication_index", unavailable)
-    _changed_source(monkeypatch, tmp_path)
-    with pytest.raises(RuntimeError, match=CHANGED):
-        core._publish(bundle, receipt, tmp_path / "published", _plain(bundle.scope))
-    assert not (tmp_path / "published").exists() or not list((tmp_path / "published").rglob("*.cvol"))
+                                                 _records=(bundle.groups, bundle.runs))
+    list(iter_selected_native_crops(bundle, receipt))
+    selected_native_plane(bundle, receipt, 0)
+    sam_cyclic.build_cyclic_frame_addressing((4, 12, 16), 2)
+    sam_cyclic.ExtrapolationCyclicObservationVolume(np.zeros((4, 12, 16), np.uint8), 2)
+    SamEvidenceBundle.open(bundle.directory)
+    bundle_at(tmp_path / "written")
+    merged, _, _, _ = sam_interpolation._publish_directions(
+        bundle, receipt, np.zeros((4, 12, 16), np.uint8), tmp_path / "outputs", {}, 1, tmp_path / "merged")
+    if isinstance(merged, np.memmap):
+        merged._mmap.close()
+    assert reads == []

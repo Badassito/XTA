@@ -494,22 +494,6 @@ def test_final_plane_budget_cannot_be_bypassed_by_a_source_audit(monkeypatch):
         writers_settled=True, postprocessing_disabled=True) is None
 
 
-@pytest.mark.parametrize('guard', ['reader', 'branch', 'filter'])
-def test_changed_loaded_scientific_implementation_keeps_fresh_audit(tmp_path, monkeypatch, guard):
-    from XTA import sam_mask_reader, sam_branch_selection, sam_filtering
-    layer, final, report, state = reuse_fixture(tmp_path)
-    module, name = {'reader': (sam_mask_reader, '_assert_source_unchanged'),
-                    'branch': (sam_branch_selection, '_assert_unchanged'),
-                    'filter': (sam_filtering, 'assert_filter_implementation_unchanged')}[guard]
-    def changed():
-        raise RuntimeError('scientific implementation changed')
-    monkeypatch.setattr(module, name, changed)
-    assert reused(layer, final, report, state) is None
-    if guard != 'branch':
-        with pytest.raises(RuntimeError, match='scientific implementation changed'):
-            measure_bridge_output_survival([layer], final)
-
-
 @pytest.mark.parametrize('packed', [False, True])
 @pytest.mark.parametrize('archive', [False, True])
 def test_selected_cvol_and_archived_backings_support_exact_reuse(tmp_path, packed, archive):

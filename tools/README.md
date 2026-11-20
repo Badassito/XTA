@@ -131,8 +131,6 @@ the difference between source identity, packaging, and numerical qualification.
 - `benchmark_*` and `profile_*` scripts measure a specific path; retain their
   receipts and check that the requested backend actually ran. The maintained
   tilted projection benchmark is `benchmark_native_pull_projection.py`.
-  `benchmark_tilted_azimuthal_projection.py` reports retirement of its old
-  scatter backend rather than measuring current native destination pull.
 - `audit_*`, `analyze_*`, `inspect_*`, and `report_*` tools examine saved runs or
   dataset evidence. A historical filename does not make its assumptions valid
   for every dataset; read its help and input contract.

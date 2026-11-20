@@ -24,14 +24,20 @@ encoding the memory used for the next prediction. Filling therefore affects
 propagation, rather than only the final exported mask.
 The SAM opt-in uses the shared exact 2D implementation, including a CPU mask
 transfer from CUDA, because the SDK's size-limited fill occurs after memory
-encoding. With the flag off, no filling hook or transfer is installed. SDF
-interpolation and explicitly selected 3D postprocessing retain their own
-topology behavior; this flag controls the YOLO and SAM stages.
-YOLO polygon labels cannot encode enclosed hole contours; preserving holes in
-the working binary mask does not add hole contours to that output format.
+encoding. With the flag off, no filling hook or transfer is installed. This flag
+controls the YOLO and SAM stages; explicitly selected 3D postprocessing retains
+its own topology behavior. SDF interpolation fills enclosed holes in a bridge
+section only when neither endpoint cross-section has one, so it follows the
+holes those stages kept.
+TTA, LTA and PTA YOLO polygon labels encode enclosed holes through zero-width
+bridges to the outer ring, so a filled row keeps the hole open; an island inside
+a hole is its own row. A bridge that crosses another hole or a concave notch
+fills a 1-px line, and polyline overlays draw the bridge segment. Holes below
+the 1-px polygon tolerance stay filled; PTA counts them as
+`holes_discarded_during_polygon_export`.
 
 **LTA migration:** LTA previously filled propagation masks unconditionally.
-v25 preserves their holes by default. Add the bare flag to restore filling
+LTA preserves their holes by default. Add the bare flag to restore filling
 before subsequent SAM predictions.
 
 **PTA:** The flag enables this complete label-processing sequence:
@@ -77,7 +83,8 @@ within the tile, or omit it.
 The parent raster samples approximately one post-cubic-resize voxel per pixel
 in both plane directions. `--imgsz 2048` directly selects a centered 2048-square
 patch at that spacing. Successive cross sections are spaced approximately one
-voxel along the centerline. Patches may extend outside the source volume;
+voxel along the centerline, which is Gaussian-smoothed between its refined
+seeds so planes turn gradually. Patches may extend outside the source volume;
 those samples are zero for both intensity and labels. Intensity uses trilinear
 sampling and labels use nearest-neighbor sampling. Explicit tile-output resizing
 can change tile pixel spacing; parent patches retain the native sampling pitch.
@@ -93,10 +100,11 @@ and processing-grid spacing. See the [CPR user guide](pta_cpr.md),
 
 ## Slicer profile
 
-The My Tools panel now has two rows. Show All precedes Hide All. Remove Slices
-sits between Remove Islands and Remove Markers. It removes the selected
-island's XY, YZ and XZ cross sections through each marker seed, preserving
-unrelated islands and off-plane voxels. It supports the existing F points,
+The My Tools panel has two rows. One Show All / Hide All button toggles every
+segmentation node. Remove Slices ends the first row, after Remove Islands;
+Remove Markers starts the second. Remove Slices removes the selected island's
+XY, YZ and XZ cross sections through each marker seed, preserving unrelated
+islands and off-plane voxels. It supports the existing F points,
 L lines and C/CC closed curves and respects segment visibility and transforms.
 Large line/curve selections can cover enough planes to remove an entire small
 island; a single point selects just three planes. See the
@@ -110,7 +118,7 @@ detector tiles. Its default handoff requires at least 16 overlap pixels and
 tracker probability of at least 0.5, so thin or low-confidence crossings can
 fail. The optional dynamic backend also replans bounded crops between sealed
 windows; its escape patches do not recurse. See
-[tile tracking](../XTA/lta_tile_tracking.py),
+[relay episodes](../XTA/lta_relay_episodes.py),
 [production adapter](../XTA/lta_worker_adapter.py), and
 [dynamic crops](lta_dynamic_crops.md).
 

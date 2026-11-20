@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 
 from ..lta_inputs import split_indexed_stem
+from ..polygon_keyholes import holes_by_parent, splice_holes
 
 if TYPE_CHECKING:
     from .packet import RegistrationPacket
@@ -106,7 +107,9 @@ def _transformed_bounds(bounds, z, matrix, shape):
 
 
 def _polygon_rows(mask, origin_xy, shape_yx, class_id):
+    """Encode exact outer contours, with their holes bridged along foreground pixels."""
     contours, hierarchy = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    children = holes_by_parent(hierarchy)
     reconstructed = np.zeros_like(mask)
     lines = []
     holes = 0
@@ -119,7 +122,12 @@ def _polygon_rows(mask, origin_xy, shape_yx, class_id):
         if len(contour) < 3 or abs(cv2.contourArea(contour)) == 0:
             degenerate += 1
             continue
-        points = contour.reshape(-1, 2) + np.asarray(origin_xy)
+        rings = [
+            contours[child].reshape(-1, 2)
+            for child in children.get(index, ())
+            if len(contours[child]) >= 3 and cv2.contourArea(contours[child]) != 0
+        ]
+        points = splice_holes(contour.reshape(-1, 2), rings, foreground=mask) + np.asarray(origin_xy)
         normalized = points.astype(np.float64) / [width, height]
         line = str(class_id) + " " + " ".join(f"{value:.12f}" for value in normalized.ravel())
         lines.append(line)

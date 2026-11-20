@@ -26,6 +26,8 @@ import time
 from pathlib import Path
 from typing import Mapping, Optional
 
+from .env_flags import env_flag
+
 ENV_FLAG = 'YOLO_TTA_SAM_CHECKPOINT_DIGEST_PREFETCH'
 RECEIPT_SCHEMA = 'xta.sam_checkpoint_digest/1'
 _BLOCK_BYTES = 8 * 1024 * 1024
@@ -34,8 +36,7 @@ _IDENTITY_KEYS = ('path', 'device', 'inode', 'size_bytes', 'mtime_ns', 'ctime_ns
 
 
 def prefetch_enabled() -> bool:
-    raw = os.environ.get(ENV_FLAG)
-    return raw is not None and raw.strip().lower() not in ('', '0', 'false', 'no', 'off')
+    return env_flag(ENV_FLAG, False)
 
 
 def checkpoint_stat_identity(path) -> dict:

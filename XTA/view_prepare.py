@@ -295,7 +295,6 @@ class AdmittedViewPrepare:
     interpolation_passes: int
     interpolation_min_radius: float
     interpolation_search_angle: float
-    keep_temp_artifacts: bool
     slice_workers: int
     interpolation_task_workers: int
     component_layers_needed: bool
@@ -303,7 +302,6 @@ class AdmittedViewPrepare:
     hole_fill_done_on_device: bool
     slice_meta: Mapping[str, object] | None
     fuse_azimuthal_component_layers: Callable[[], bool]
-    component_ref_dense_retirement_active: bool
     preinterpolation_layer_already_published: bool
     parent_mask_ready_callback: Callable[..., object] | None
     submit_component_projection: Callable[..., object]
@@ -363,8 +361,7 @@ class AdmittedViewPrepare:
                 setattr(self, name, None)
                 path = getattr(self, path_name)
                 try:
-                    self.close_dense(value, unlink_path=(None if self.keep_temp_artifacts else
-                        scratch_unlink_path_for_memmap(value, path)))
+                    self.close_dense(value, unlink_path=scratch_unlink_path_for_memmap(value, path))
                 except BaseException as error:
                     self._cancelled_cleanup_error = error
                     raise
@@ -527,11 +524,10 @@ class AdmittedViewPrepare:
                               f'{self.model_name}/{self.view.name}'),
                         workers=int(self.slice_workers),
                     )
-                    if not self.keep_temp_artifacts:
-                        try:
-                            shutil.rmtree(self.d1_shadow_path, ignore_errors=True)
-                        except Exception:
-                            pass
+                    try:
+                        shutil.rmtree(self.d1_shadow_path, ignore_errors=True)
+                    except Exception:
+                        pass
                 # The prepare function owns confidence through capture only.
                 # Keeping a second task alias pinned its mmap until the much
                 # longer mask projection finished, even after capture retired it.
@@ -539,23 +535,20 @@ class AdmittedViewPrepare:
                 input_nbytes = int(np.asarray(local_union_mm).nbytes)
                 confidence_owner_ref = (None if self.confmap_mm is None else
                     weakref.ref(_array_lifetime_owner(self.confmap_mm)))
-                input_unlink_path = None
                 input_path_identity = None
-                if not self.keep_temp_artifacts:
-                    input_unlink_path = scratch_unlink_path_for_memmap(local_union_mm, self.union_path)
-                    if input_unlink_path is not None:
-                        try:
-                            identity = input_unlink_path.lstat()
-                            input_path_identity = (identity.st_dev, identity.st_ino)
-                        except OSError:
-                            input_unlink_path = None
+                input_unlink_path = scratch_unlink_path_for_memmap(local_union_mm, self.union_path)
+                if input_unlink_path is not None:
+                    try:
+                        identity = input_unlink_path.lstat()
+                        input_path_identity = (identity.st_dev, identity.st_ino)
+                    except OSError:
+                        input_unlink_path = None
                 # Mutable transport avoids a stale array in wrapper kwargs while
                 # terminal Tilted projection continues from immutable packed bits.
                 from .packed_tilted_projection import terminal_native_source_packing_eligible
                 transfer_packed_source = terminal_native_source_packing_eligible(self.view,
-                    native_bytes=input_nbytes, retire_dense=self.component_ref_dense_retirement_active,
+                    native_bytes=input_nbytes, retire_dense=True,
                     component_layers=self.component_layers_needed, tiled=self.dense_tiling_active,
-                    keep_temp=self.keep_temp_artifacts,
                     prepublished=self.preinterpolation_layer_already_published,
                     interpolate=self.interpolation_distance, interpolation_passes=self.interpolation_passes,
                     extrapolate=self.extrapolation_distance,
@@ -595,7 +588,6 @@ class AdmittedViewPrepare:
                     extrapolation_distance=int(self.extrapolation_distance),
                     extrapolation_walk_back=int(self.extrapolation_walk_back),
                     extrapolation_min_radius=float(self.extrapolation_min_radius),
-                    keep_temp=bool(self.keep_temp_artifacts),
                     slice_workers=int(self.slice_workers),
                     interpolation_task_workers=int(self.interpolation_task_workers),
                     nrrd_layers_enabled=bool(self.component_layers_needed),
@@ -608,15 +600,8 @@ class AdmittedViewPrepare:
                     parent_mask_ready_callback=(
                         self.parent_mask_ready_callback if self.dense_tiling_active else None
                     ),
-                    internal_final_layer_enabled=bool(
-                        self.component_ref_dense_retirement_active
-                        and not self.component_layers_needed
-                    ),
-                    retire_dense_after_prepare=bool(
-                        self.component_ref_dense_retirement_active
-                        and not self.dense_tiling_active
-                        and not self.keep_temp_artifacts
-                    ),
+                    internal_final_layer_enabled=bool(not self.component_layers_needed),
+                    retire_dense_after_prepare=bool(not self.dense_tiling_active),
                     preinterpolation_layer_already_published=bool(
                         self.preinterpolation_layer_already_published
                     ),
@@ -631,7 +616,7 @@ class AdmittedViewPrepare:
                 result._dense_input_owner_ref = input_owner_ref
                 result._dense_input_nbytes = input_nbytes
                 result._dense_confidence_owner_ref = confidence_owner_ref
-                if not self.keep_temp_artifacts and all(
+                if all(
                     volume is None or _array_lifetime_owner(volume) is not input_owner_ref()
                     for volume in (result.native_support_mm, result.final_view_volume_mm)
                 ):
@@ -651,10 +636,7 @@ class AdmittedViewPrepare:
             except BaseException as error:
                 # The original/local dense mapping belongs to this reservation.
                 # Immutable component and tile support stores have other owners.
-                unlink_path = (
-                    scratch_unlink_path_for_memmap(local_union_mm, self.union_path)
-                    if not self.keep_temp_artifacts else None
-                )
+                unlink_path = scratch_unlink_path_for_memmap(local_union_mm, self.union_path)
                 if local_union_mm is not None:
                     self.close_dense(local_union_mm, unlink_path=unlink_path)
                 clear_failure_frames = False
@@ -662,16 +644,16 @@ class AdmittedViewPrepare:
                     # The callee has not sealed/detached its packed continuation.
                     # The shared carrier still owns this exact original input.
                     transferred = union_owner.pop()
-                    self.close_dense(transferred, unlink_path=(None if self.keep_temp_artifacts else
-                        scratch_unlink_path_for_memmap(transferred, self.union_path)))
+                    self.close_dense(transferred, unlink_path=scratch_unlink_path_for_memmap(
+                        transferred, self.union_path))
                     transferred = None
                     clear_failure_frames = True
                 if confidence_carrier:
                     transferred_confidence = confidence_carrier.pop()
                     if transferred_confidence is not None:
                         self.close_dense(transferred_confidence,
-                            unlink_path=(None if self.keep_temp_artifacts else
-                                scratch_unlink_path_for_memmap(transferred_confidence, self.confmap_path)))
+                            unlink_path=scratch_unlink_path_for_memmap(
+                                transferred_confidence, self.confmap_path))
                         transferred_confidence = None
                         clear_failure_frames = True
                 if clear_failure_frames:
@@ -712,13 +694,12 @@ class ViewPrepareLeaseState:
         # probe revalidates their live basis after any reentrant retirement.
         return tuple(self.leases.values())
 
-    def retire_dense_for_publication(self, prepared, *, enabled: bool, tiled: bool,
-                                    keep_temp: bool, retired_callback,
+    def retire_dense_for_publication(self, prepared, *, tiled: bool, retired_callback,
                                     close_dense=close_memmap_array_without_flush) -> bool:
         """Detach dense inputs; return admission only after their last owner dies."""
         key = (str(prepared.model_name), str(prepared.view_name))
         input_owner_ref = getattr(prepared, '_dense_input_owner_ref', None)
-        if (not enabled or tiled or keep_temp or key in self.retired_for_publication
+        if (tiled or key in self.retired_for_publication
                 or input_owner_ref is None
                 or (not prepared.pending_component_layers
                     and not getattr(prepared, '_packed_native_source_retired', False))

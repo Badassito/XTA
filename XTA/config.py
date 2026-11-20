@@ -714,7 +714,6 @@ class InterpolationSettings:
     sam_devices: Tuple[str, ...] = ()
     sam_feature_cache_mib: int = 1024
     sam_crop_mode: Optional[str] = None
-    sam_tight_crop_guard: Optional[bool] = None
     sam_adaptive_crop: Optional[bool] = None
     extrapolation_distance: int = 0
     extrapolation_walk_back: int = 1
@@ -730,9 +729,6 @@ class InterpolationSettings:
 
 
 _SAM_CROP_MODE_SNAPSHOT = contextvars.ContextVar('tta_sam_crop_mode_snapshot', default=None)
-_SAM_TIGHT_CROP_GUARD_UNSET = object()
-_SAM_TIGHT_CROP_GUARD_SNAPSHOT = contextvars.ContextVar('tta_sam_tight_crop_guard_snapshot',
-    default=_SAM_TIGHT_CROP_GUARD_UNSET)
 _SAM_ADAPTIVE_CROP_UNSET = object()
 _SAM_ADAPTIVE_CROP_SNAPSHOT = contextvars.ContextVar('tta_sam_adaptive_crop_snapshot',
     default=_SAM_ADAPTIVE_CROP_UNSET)
@@ -760,34 +756,6 @@ def activate_sam_adaptive_crop(enabled: Optional[bool]):
         yield enabled
     finally:
         _SAM_ADAPTIVE_CROP_SNAPSHOT.reset(token)
-
-
-def resolve_sam_tight_crop_guard(environ=None) -> Optional[bool]:
-    """Resolve an explicit guard request; None inherits the versioned policy."""
-    snapshot = _SAM_TIGHT_CROP_GUARD_SNAPSHOT.get()
-    if snapshot is not _SAM_TIGHT_CROP_GUARD_UNSET and environ is None:
-        return snapshot
-    environment = os.environ if environ is None else environ
-    if 'YOLO_TTA_SAM_TIGHT_CROP_GUARD' not in environment:
-        return None
-    value = str(environment['YOLO_TTA_SAM_TIGHT_CROP_GUARD']).strip().lower()
-    if value in {'1', 'true', 'on'}:
-        return True
-    if value in {'0', 'false', 'off'}:
-        return False
-    raise ValueError('YOLO_TTA_SAM_TIGHT_CROP_GUARD must be 1/0, true/false, or on/off')
-
-
-@contextlib.contextmanager
-def activate_sam_tight_crop_guard(enabled: Optional[bool]):
-    """Pin one CLI launch's validated guard selection until context creation."""
-    if enabled is not None and not isinstance(enabled, bool):
-        raise ValueError('SAM tight crop guard snapshot must be a boolean or None')
-    token = _SAM_TIGHT_CROP_GUARD_SNAPSHOT.set(enabled)
-    try:
-        yield enabled
-    finally:
-        _SAM_TIGHT_CROP_GUARD_SNAPSHOT.reset(token)
 
 
 def resolve_sam_crop_mode(environ=None) -> str:
@@ -975,12 +943,10 @@ def resolve_interpolation_settings(
             '--sam_device GPU_INDEXES'
         )
     sam_crop_mode = resolve_sam_crop_mode()
-    sam_tight_crop_guard = resolve_sam_tight_crop_guard() if sam_interpolation_enabled else None
     return InterpolationSettings(
         backend=backend, enabled=distance > 0, sam_model=models.sam, sam_devices=tuple(sam_devices),
         sam_feature_cache_mib=sam_feature_cache_mib,
         sam_crop_mode=sam_crop_mode,
-        sam_tight_crop_guard=sam_tight_crop_guard,
         sam_adaptive_crop=resolve_sam_adaptive_crop(),
         **extrapolation,
     )
@@ -1559,7 +1525,7 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Minimum bridge radius. SDF rejects candidate connections at or below this value. SAM removes undersized slice components before quality checks and publication, including detached dots outside the write region; it does not reject a whole run solely for those removed components. 0 disables the radius check/filter")
     p.add_argument("--interpolation_search_angle", default=15.0,
                    type=_bounded_number(float, minimum=-90, maximum=90, exclusive=True),
-                   help="Projection growth angle in degrees. Must be greater than -90 and less than 90")
+                   help="Projection growth angle in degrees. Growth is tan(angle) x slice distance, measured between pixel centres. Must be greater than -90 and less than 90")
     p.add_argument('--extrapolation_distance', default=0, type=_bounded_number(int, minimum=0),
                    help='Maximum additional view-native slices/frames tracked with SAM beyond remaining post-interpolation terminals (cleaned detector terminals when interpolation is disabled). 0 disables extrapolation; raw SAM emptiness or this distance ends a tail')
     p.add_argument('--extrapolation_walk_back', default=1, type=_bounded_number(int, minimum=0),

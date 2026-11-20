@@ -60,7 +60,7 @@ class TopologyCropLabelingPolicyTests(unittest.TestCase):
             types.SimpleNamespace(shape=(3, 20)), self.present, self.boxes,
         ))
 
-    def assert_selection(self, expected, *, metadata=True, cpu_policy=True, **overrides):
+    def assert_selection(self, expected, *, metadata=True, **overrides):
         kwargs = dict(
             prefer_memory=True, reserve_bytes=0, workers=1, compact_relabel=False,
             sparse_local_labels=True, known_slice_any=self.present if metadata else None,
@@ -69,7 +69,6 @@ class TopologyCropLabelingPolicyTests(unittest.TestCase):
         kwargs.update(overrides)
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(topology, 'gpu_slice_labeling_enabled', return_value=True), \
-                mock.patch.object(topology, 'topology_sparse_cpu_labeling_enabled', return_value=cpu_policy), \
                 mock.patch.object(topology, 'topology_sparse_cpu_max_coverage', return_value=0.5), \
                 mock.patch.object(topology, 'should_use_in_memory_workspace', return_value=True), \
                 mock.patch.object(topology, 'numa_interleave_memory'), \
@@ -99,7 +98,6 @@ class TopologyCropLabelingPolicyTests(unittest.TestCase):
 
     def test_explicit_cpu_preference_remains_available_outside_sparse_interpolation(self):
         self.assert_selection(_GpuLabelingSelected, sparse_local_labels=False)
-        self.assert_selection(_GpuLabelingSelected, cpu_policy=False)
         self.assert_selection(
             _CpuLabelingSelected, sparse_local_labels=False, compact_relabel=True,
             prefer_crop_bounded_cpu_labeling=True,

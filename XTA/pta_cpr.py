@@ -21,6 +21,9 @@ from scipy import ndimage as ndi
 # In centerline refinement only plane sampling releases the GIL (labelling and
 # hole filling mostly hold it), so scaling stops near this many threads.
 _REFINE_MAX_THREADS = 8
+# Gaussian centerline sigma as a fraction of the median seed spacing: it spreads
+# each seed-vertex bend over about two seed spacings (curvature ripple below 1%).
+_CENTERLINE_SMOOTHING_SEED_FRACTION = 0.5
 
 
 @dataclass(frozen=True)
@@ -68,6 +71,7 @@ class CprGeometry:
             "patch_size": self.width,
             "patch_extent_processing_voxels": [self.height, self.width],
             "spacing_processing_voxels": [1.0, 1.0, float(np.mean(np.linalg.norm(np.diff(self.points_tyx, axis=0), axis=1)))],
+            "centerline_smoothing": "gaussian_half_median_seed_spacing",
             "plane_orientation": "perpendicular_to_centerline_tangent",
             "outside_source": "constant_zero",
             "intensity_sampling": "trilinear",
@@ -76,7 +80,16 @@ class CprGeometry:
 
 
 def resample_centerline(points_tyx: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Sample an ordered curve at approximately one voxel and transport its frame."""
+    """Sample an ordered curve at approximately one voxel and transport its frame.
+
+    The seed polyline is smoothed with a Gaussian of half the median seed
+    spacing, with both endpoints fixed by odd reflection, then resampled at one
+    voxel of smoothed arc length, so planes turn gradually instead of at seed
+    vertices. Each smoothed sample is a positive-weight average of polyline
+    samples within four sigma (reflected at the ends), so unlike a spline fit
+    to sparse seeds it cannot overshoot far from the polyline. Two seeds, or
+    seeds at most one voxel apart, are used unsmoothed.
+    """
     points = np.asarray(points_tyx, dtype=np.float64)
     if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
         raise ValueError("CPR centerline must contain finite ordered TYX points")
@@ -90,7 +103,20 @@ def resample_centerline(points_tyx: np.ndarray) -> tuple[np.ndarray, np.ndarray,
     # Equal spacing, including both endpoints, differs from one voxel by at
     # most half a voxel over the entire curve rather than shortening its end.
     positions = np.linspace(0.0, float(arc[-1]), max(2, int(round(float(arc[-1]))) + 1))
+    seed_count = len(points)
     points = np.column_stack([np.interp(positions, arc, points[:, axis]) for axis in range(3)])
+    count = len(points)
+    sigma = 0.0
+    if seed_count > 2 and count > 2:
+        sigma = _CENTERLINE_SMOOTHING_SEED_FRACTION * float(np.median(np.diff(arc))) / float(positions[1])
+    if sigma > 0.5:
+        pad = min(count - 1, int(math.ceil(4.0 * sigma)))
+        extended = np.concatenate((2.0 * points[0] - points[pad:0:-1], points,
+                                   2.0 * points[-1] - points[-2:-pad - 2:-1]))
+        points = ndi.gaussian_filter1d(extended, sigma, axis=0, mode="nearest", truncate=4.0)[pad:pad + count]
+        smooth_arc = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))]
+        positions = np.linspace(0.0, float(smooth_arc[-1]), max(2, int(round(float(smooth_arc[-1]))) + 1))
+        points = np.column_stack([np.interp(positions, smooth_arc, points[:, axis]) for axis in range(3)])
     tangents = np.gradient(points, axis=0)
     lengths = np.linalg.norm(tangents, axis=1)
     if np.any(lengths <= 1e-8):
@@ -225,16 +251,20 @@ def _filled_center(labels: np.ndarray, label: int) -> tuple[float, float]:
     return (int(rows.sum()) + count * y0) / count, (int(columns.sum()) + count * x0) / count
 
 
-def _refine_source_centerline(mask: np.ndarray, points_tyx: np.ndarray, radii: np.ndarray, factor: int) -> np.ndarray:
+def _refine_source_centerline(mask: np.ndarray, points_tyx: np.ndarray, radii: np.ndarray, factor: int,
+                              found: np.ndarray | None = None) -> np.ndarray:
     """Recover subvoxel cross-section centers after coarse block-max extraction.
 
     A coarse block center is only an extraction seed. Its perpendicular source
     plane supplies the actual foreground centroid; enclosed holes are filled in
     this temporary geometry-only plane, leaving all source labels untouched.
-    Each local plane has at most 257 by 257 samples.
+    Each local plane has at most 257 by 257 samples. When given, ``found`` is
+    set to whether each seed's plane met foreground in the final pass.
     """
     points = np.array(points_tyx, dtype=np.float64, copy=True)
     for _ in range(2):
+        if found is not None:
+            found[:] = False
         tangents = np.gradient(points, axis=0)
         for index, tangent in enumerate(tangents):
             length = float(np.linalg.norm(tangent))
@@ -259,12 +289,67 @@ def _refine_source_centerline(mask: np.ndarray, points_tyx: np.ndarray, radii: n
             labels, count = ndi.label(plane)
             if not count:
                 continue
+            if found is not None:
+                found[index] = True
             # A small coarse lift can land outside a thin tube. Select the
             # nearest connected cross-section rather than the largest neighbor.
             yy, xx = np.nonzero(labels)
             nearest = int(np.argmin((yy - half) ** 2 + (xx - half) ** 2))
             cy, cx = _filled_center(labels, int(labels[yy[nearest], xx[nearest]]))
             points[index] += normal * ((cx - half) * step) + binormal * ((cy - half) * step)
+    return points
+
+
+def _trim_and_prune_centerline(points_tyx: np.ndarray, found: np.ndarray) -> np.ndarray:
+    """Remove end hooks and hairpin reversals from refined centerline seeds.
+
+    Ends are trimmed to the first and last seeds whose plane met foreground;
+    unrefined end seeds stay at off-axis block centers. Seeds closer than one
+    voxel to the previous kept seed are merged, keeping the true last seed.
+    A vertex turning by more than 90 degrees is resolved by dropping a slid-back
+    end seed (the shorter end segment), or, when two consecutive vertices both
+    reverse, the one whose removal shortens the path most (the outlier), or
+    otherwise the reversing vertex itself. If less than one voxel of path
+    remains, as with a single found seed, the refined seeds are returned
+    unchanged.
+    """
+    refined = points = np.asarray(points_tyx, dtype=np.float64)
+    hits = np.flatnonzero(found)
+    if len(hits):
+        points = points[hits[0]:hits[-1] + 1]
+    kept = [0]
+    for index in range(1, len(points)):
+        if np.linalg.norm(points[index] - points[kept[-1]]) >= 1.0:
+            kept.append(index)
+    if kept[-1] != len(points) - 1:
+        if len(kept) > 1:
+            kept[-1] = len(points) - 1
+        else:
+            kept.append(len(points) - 1)
+    points = points[kept]
+    while len(points) >= 3:
+        diff = np.diff(points, axis=0)
+        seg = np.linalg.norm(diff, axis=1)
+        unit = diff / np.maximum(seg, 1e-12)[:, None]
+        reversing = np.sum(unit[1:] * unit[:-1], axis=1) < 0.0  # entry i is vertex i + 1
+        if not reversing.any():
+            break
+        vertex = int(np.argmax(reversing)) + 1
+        last = len(points) - 1
+        if vertex == last - 1 and seg[-1] < seg[-2]:
+            vertex = last
+        elif vertex == 1 and seg[0] < seg[1]:
+            vertex = 0
+        elif vertex + 1 < last and reversing[vertex]:
+            # Path shortening from dropping each of the two reversing vertices.
+            gains = [seg[candidate - 1] + seg[candidate]
+                     - np.linalg.norm(points[candidate + 1] - points[candidate - 1])
+                     for candidate in (vertex, vertex + 1)]
+            if gains[1] > gains[0]:
+                vertex += 1
+        points = np.delete(points, vertex, axis=0)
+    if np.linalg.norm(np.diff(points, axis=0), axis=1).sum() < 1.0:
+        return refined
     return points
 
 
@@ -284,7 +369,7 @@ def extract_cpr_geometries(
     results keep the serial order. Once ``cancel`` is set, extraction raises
     CprExtractionCancelled at its next block, component or branch.
     """
-    from .finalization import _v1401_embedded_centerline_arrays
+    from .finalization import _embedded_centerline_arrays
 
     workers = max(1, int(workers))
     coarse, factor = _block_max_mask(np.asarray(mask, dtype=np.uint8), max_dim, workers, cancel)
@@ -293,7 +378,9 @@ def extract_cpr_geometries(
 
     def refine(branch: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
         _raise_if_cancelled(cancel)
-        return _refine_source_centerline(mask, branch[0], branch[1], factor)
+        found = np.zeros(len(branch[0]), dtype=bool)
+        points = _refine_source_centerline(mask, branch[0], branch[1], factor, found)
+        return _trim_and_prune_centerline(points, found)
 
     refine_workers = min(workers, _REFINE_MAX_THREADS)
     with (ThreadPoolExecutor(max_workers=refine_workers, thread_name_prefix="pta-cpr-refine")
@@ -307,7 +394,7 @@ def extract_cpr_geometries(
                 continue
             origin = tuple((int(axis.start) - 2) * factor + (factor - 1) * 0.5 for axis in box)
             try:
-                arrays, _ = _v1401_embedded_centerline_arrays(
+                arrays, _ = _embedded_centerline_arrays(
                     component, spacing_tyx=(float(factor),) * 3,
                     origin_tyx=origin, target_points=5000,
                 )

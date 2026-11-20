@@ -1,7 +1,7 @@
 """The depth-2 memory guard does not count clean reclaimable file cache as used."""
 import pytest
 
-from XTA import pta
+from XTA import pta, workspace
 from XTA.pta_scheduler import resolve_pta_pipeline_depth
 from tests.test_cgroup_memory_budget import finite, proc_files
 
@@ -48,6 +48,7 @@ def test_unknown_sources_keep_previous_fallbacks(monkeypatch, capsys):
     files["/proc/meminfo"] = MEMINFO
     assert pta.available_memory_budget_bytes() == 5_000_000 * 1024
     files.pop("/proc/self/cgroup")
+    workspace._reset_cgroup_layout_cache()  # membership is resolved once per process
     assert pta.available_memory_budget_bytes() == 5_000_000 * 1024
 
 

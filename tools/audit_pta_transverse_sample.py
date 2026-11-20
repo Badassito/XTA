@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Compare a supplied unaugmented PTA transverse sample with its prepared mask."""
+"""Compare a supplied unaugmented PTA transverse sample with its prepared mask.
+
+Uses the center-aligned categorical cube mapping; samples generated before it
+(endpoint-aligned) do not reproduce exactly.
+"""
 import argparse
 import gzip
 import hashlib
@@ -15,6 +19,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from XTA import geometry
+from XTA.media import _center_aligned_nearest_source_index
 from XTA.pta_publication import mask_to_yolo_lines
 from audit_pta_preview_upscale import cubic_plane
 
@@ -54,7 +59,7 @@ def main():
     samples = json.loads((args.audit / "prepper_f2_sampled_geometry.json").read_text())
     full = tuple(samples["native_shape_tyx"])
     low = tuple(samples["preview_shape_tyx"])
-    t = round((args.frame - 1) * (full[0] - 1) / (args.processing_t - 1))
+    t = _center_aligned_nearest_source_index(args.frame - 1, args.processing_t, full[0])
     name = samples["stem"] + f"_Transverse_{args.frame:04d}"
     txt = args.sample_root / "labels" / (name + ".txt")
     image_path = args.sample_root / "images" / (name + ".jpg")
@@ -101,7 +106,7 @@ def main():
         cv2.drawContours(overlay, contours, -1, color, 1)
     cv2.imwrite(str(args.audit / (name + "_contrast_overlay.png")), overlay)
     result = {"sample": name, "processing_t": args.processing_t, "processing_frame_index": args.frame - 1,
-              "native_source_t": t, "native_t_mapping": "round(frame_index * (nativeT-1)/(processingT-1))",
+              "native_source_t": t, "native_t_mapping": "((2*frame_index+1)*nativeT)//(2*processingT)",
               "native_plane_sha256": hashlib.sha256(data).hexdigest(),
               "actual_native_matches_cubic_reconstruction": True,
               "source_shape_tyx": list(full), "image_shape_yx": list(image.shape),

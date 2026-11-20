@@ -413,18 +413,11 @@ def test_unproven_closure_keeps_void_fill_before_resize(tmp_path, field):
     assert prepared.void_fill_stats["foreground_before"] == 125
 
 
-@pytest.mark.parametrize("text,expected", [("", 6), ("18", 18), (" 26 ", 26), ("six", 6), ("4", None)])
-def test_skipped_void_fill_keeps_connectivity_parsing(tmp_path, monkeypatch, text, expected):
-    monkeypatch.setenv("YOLO_TTA_VOIDFILL_CONNECTIVITY", text)
+def test_skipped_void_fill_records_six_connected_background(tmp_path):
     mask = np.ones((5, 5, 5), np.uint8)
     mask[2, 2, 2] = 0
-    if expected is None:
-        for options in (["--enable_2D_hole_fill"], ["--preprocessing", "3d_void_fill"]):
-            with pytest.raises(ValueError, match="one of 6, 18, or 26"):
-                _prepare(_source(mask.copy()), tmp_path, *options)
-        return
     prepared, _ = _prepare(_source(mask), tmp_path, "--enable_2D_hole_fill")
-    assert prepared.void_fill_stats["background_connectivity"] == expected
+    assert prepared.void_fill_stats["background_connectivity"] == 6
     assert prepared.void_fill_stats["reason"] == "skipped_proven_noop_after_2d_hole_fill"
 
 
@@ -440,7 +433,6 @@ def _enclosed_background(mask, connectivity):
 
 
 def test_void_fill_after_complete_2d_closure_adds_no_voxels(tmp_path, monkeypatch):
-    monkeypatch.delenv("YOLO_TTA_VOIDFILL_CONNECTIVITY", raising=False)
     monkeypatch.setattr(pta_preprocessing, 'available_anon_work_bytes', lambda: 1 << 40)
     generator = np.random.default_rng(20261107)
     enclosed_before = dict.fromkeys((6, 18, 26), 0)
@@ -537,7 +529,6 @@ def test_pipeline_outputs_match_forced_void_fill(tmp_path, monkeypatch):
     import re
 
     monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '-1')
-    monkeypatch.delenv('YOLO_TTA_VOIDFILL_CONNECTIVITY', raising=False)
     monkeypatch.setattr(pta, 'discover_topology', lambda **kwargs: SimpleNamespace(
         cuda_device_ids=(), gpu_cpu_sets=(), worker_cpu_order=(),
         allowed_cpus=(0, 1, 2, 3), summary='CPU hole fill'))

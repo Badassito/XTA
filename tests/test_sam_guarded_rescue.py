@@ -292,16 +292,12 @@ def test_cyclic_aliases_of_same_original_seed_cannot_be_independent_rescue():
 
 
 def test_policy_packed_replay_records_folded_native_bbox_and_unfolded_address(tmp_path):
-    import io,zipfile
     from tests.test_sam_cyclic_evidence_replay import bundle_at
-    from XTA.sam_policy import replay_sam_proposals
+    from XTA.sam_evidence import evidence_frame_geometry, iter_selected_native_crops
     bundle=bundle_at(tmp_path)
-    receipt=replay_sam_proposals(bundle,tmp_path/"packed",policy={"sam_bridge_policy":"permissive"})
-    row=next(row for row in receipt["replay_outputs"]["packed_plane_index"] if row["stored_unfolded_frame"]==4)
-    assert row["native_frame"]==0 and row["context_bbox_yx"]==[2,7,10,15]
-    assert row["stored_unfolded_bbox_yx"]==[2,1,10,9]
-    assert row["stored_frame_address"]["mirror_u"] is True
-    with zipfile.ZipFile(tmp_path/"packed"/"selected_planes.npz") as archive:
-        packed=np.load(io.BytesIO(archive.read(row["key"]+".npy")),allow_pickle=False)
-    mask=np.unpackbits(packed,count=64,bitorder="little").reshape(8,8)
-    assert mask[3,6] and mask.sum()==1
+    receipt=_select_sam_proposals(bundle,policy={"sam_bridge_policy":"permissive"})
+    group_id,_,native_frame,bbox,mask=next(row for row in iter_selected_native_crops(bundle,receipt) if row[1]==4)
+    assert native_frame==0 and bbox==(2,7,10,15)
+    assert list(bundle.groups[group_id]["context_bbox_yx"])==[2,1,10,9]
+    assert evidence_frame_geometry(bundle)["groups"][group_id]["addresses"][4]["mirror_u"] is True
+    assert mask.shape==(8,8) and mask[3,6] and mask.sum()==1

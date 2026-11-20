@@ -82,7 +82,8 @@ def aligned_builder(original, mode):
                         borderMode=interpolation.cv2.BORDER_CONSTANT,
                         borderValue=-float(max(field.shape)))
                     section = shifted >= 0
-                plan.cached_sections[step] = interpolation._keep_center_component_2d(section)
+                plan.cached_sections[step] = interpolation._keep_center_component_2d(
+                    section, fill_holes=plan.fill_section_holes)
         return plan
 
     return build
@@ -108,7 +109,7 @@ def main():
                         help="Score saved generation identities without regenerating predictions")
     args = parser.parse_args()
     for key in ("YOLO_TTA_GPU_INTERPOLATION", "YOLO_TTA_GPU_SLICE_LABELING",
-                "YOLO_TTA_GPU_INTERPOLATION_RADIUS", "YOLO_TTA_GPU_INTERPOLATION_REQUIRED"):
+                "YOLO_TTA_GPU_INTERPOLATION_REQUIRED"):
         os.environ[key] = "0"
     os.environ["YOLO_TTA_TELEMETRY_SYSTEM_SAMPLER"] = "0"
     import numpy as np
@@ -124,7 +125,8 @@ def main():
     def cached_radius(plan, **kwargs):
         if len(plan.cached_sections) != plan.steps + 1:
             return original_radius(plan, **kwargs)
-        radius = min(float(plan.sdf0.max()), float(plan.sdf1.max()))
+        radius = (min(float(plan.sdf0.max()), float(plan.sdf1.max()))
+                  + interpolation.SDF_EDT_RADIUS_OFFSET)
         for section in plan.cached_sections[1:-1]:
             radius = min(radius, interpolation._component_max_radius(section))
         return radius
@@ -193,7 +195,7 @@ def main():
                 stats = interpolation.interpolate_view_volume_pass_inplace(
                     data, case_output / (mode + "_work"), "alignment", args.distance,
                     args.search_angle, args.walk_back, args.candidates, args.min_radius,
-                    keep_temp=False, prefer_memory=True, reserve_bytes=0, workers=args.workers)
+                    prefer_memory=True, reserve_bytes=0, workers=args.workers)
             result = observed.copy()
             result[:, y0:y1, x0:x1] = data
             np.save(case_output / (mode + ".npy"), result)

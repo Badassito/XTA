@@ -155,16 +155,16 @@ def test_actual_model_affine_inverse_then_project_matches_native_restored_raster
 
 @pytest.mark.parametrize('tile_size,stride', ((3, 1), (3, 3), (4, 2), (4, 4)))
 @pytest.mark.parametrize('angle', (0., 31., 120.))
-def test_actual_dense_ring_tiles_restore_full_parent_without_new_seam_holes(tmp_path, tile_size, stride, angle):
+def test_actual_dense_ring_tiles_restore_full_parent_without_new_seam_holes(tile_size, stride, angle):
     # The real Radial factory uses --imgsz as native intrinsic patch size. Tile
     # magnification changes only its model-to-parent footprint, not shell axes.
     view = views((7, 17, 19), 'transverse', patch=8)[0]
     view = geometry.expand_views_into_tta_variants((view,), (angle,))[0]
     aff = geometry.build_affine(view=view.name, src_w=8, src_h=8, out_size=8,
                                 angle_deg=angle, pad_mode=view.pad_mode)
-    aug = geometry.AugJob(aug_id='fixture', angle_deg=angle, aff=aff, meta_path=tmp_path/'aug.json')
+    aug = geometry.AugJob(aug_id='fixture', angle_deg=angle, aff=aff)
     config = geometry.TileConfig(config_id='fixture', tile_size=tile_size, tile_stride=stride)
-    jobs = geometry.build_dense_tile_jobs_for_aug(view, aug, config, 8, tmp_path)
+    jobs = geometry.build_dense_tile_jobs_for_aug(view, aug, config, 8)
     native = np.ones((8, 8), np.uint8)
     parent = np.zeros_like(native)
     for job in jobs:
@@ -178,16 +178,16 @@ def test_actual_dense_ring_tiles_restore_full_parent_without_new_seam_holes(tmp_
 
 
 @pytest.mark.parametrize('tile_size,stride', ((3, 1), (3, 3), (4, 2), (4, 4)))
-def test_unrotated_magnified_ring_tiles_preserve_a_real_one_pixel_gap(tmp_path, tile_size, stride):
+def test_unrotated_magnified_ring_tiles_preserve_a_real_one_pixel_gap(tile_size, stride):
     view = views((7, 17, 19), 'transverse', patch=8)[0]
     aff = geometry.build_affine(view=view.name, src_w=8, src_h=8, out_size=8,
                                 angle_deg=0., pad_mode=view.pad_mode)
-    aug = geometry.AugJob(aug_id='fixture', angle_deg=0., aff=aff, meta_path=tmp_path/'aug.json')
+    aug = geometry.AugJob(aug_id='fixture', angle_deg=0., aff=aff)
     config = geometry.TileConfig(config_id='fixture', tile_size=tile_size, tile_stride=stride)
     native = np.ones((8, 8), np.uint8)
     native[:, 4] = 0
     parent = np.zeros_like(native)
-    for job in geometry.build_dense_tile_jobs_for_aug(view, aug, config, 8, tmp_path):
+    for job in geometry.build_dense_tile_jobs_for_aug(view, aug, config, 8):
         model = cv2.warpAffine(native, job.M_src_to_out, (8, 8), flags=cv2.INTER_NEAREST)
         parent |= cv2.warpAffine(model, job.M_out_to_src, (8, 8), flags=cv2.INTER_NEAREST)
     np.testing.assert_array_equal(parent, native)

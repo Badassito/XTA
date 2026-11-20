@@ -187,7 +187,7 @@ def seam(args):
                 union_path=runroot / "original.uint8.dat", confmap_path=None, temp_dir=runroot / "temporary",
                 dense_tiling_active=True, min_conf=0., min_radius=0., interpolate=15,
                 interpolation_walk_back=0, interpolation_candidates=1, interpolate_passes=1,
-                interpolate_min_radius=3., interpolation_search_angle=30., keep_temp=True,
+                interpolate_min_radius=3., interpolation_search_angle=30.,
                 slice_workers=1, interpolation_task_workers=1, nrrd_layers_enabled=True,
                 interpolation_backend="sam", sam_context=context,
                 parent_mask_ready_callback=lambda *_: ready.append("immutable_parent_ready"))
@@ -229,24 +229,24 @@ def seam(args):
                     tile.tile_id, (y0,y1,x0,x1), tile_mm, None, path, None,
                     processing_shape=tuple(tile_mm.shape), threshold_plane_shape=shape[1:])
                 result = assembly.postprocess_tile_volume_after_inference(task, view=view,
-                    min_conf=0., min_radius=0., keep_temp=True, slice_workers=1)
+                    min_conf=0., min_radius=0., slice_workers=1)
                 first_gate = assembly.gate_tile_result_against_parent_mask(result,
                     parent_mask_support_mm=prepared.parent_mask_support_mm,
                     tile_accumulator_mm=total, tile_accumulator_locks=None,
-                    work_dir=runroot / "tile_gate", keep_temp=True, slice_workers=1,
+                    work_dir=runroot / "tile_gate", slice_workers=1,
                     tile_parent_mask_accumulator_mm=parent_category)
                 second = None
                 if first_gate.residual_result is not None and prepared.parent_bridge_support_mm is not None:
                     second = assembly.gate_tile_residual_against_parent_bridge(first_gate.residual_result,
                         parent_bridge_support_mm=prepared.parent_bridge_support_mm,
                         tile_accumulator_mm=total, tile_accumulator_locks=None,
-                        work_dir=runroot / "tile_gate", keep_temp=True, slice_workers=1,
+                        work_dir=runroot / "tile_gate", slice_workers=1,
                         tile_parent_bridge_accumulator_mm=bridge_category)
                 gate_records.append(dict(tile_id=tile.tile_id, crop_bbox_yx=tile.crop_bbox_yx,
                     source="Prescribed native crop of actual fullframe detector59/64 masks; no SAM seed handoff",
                     parent=first_gate.gate_stats, bridge=getattr(second,"gate_stats",None)))
                 if first_gate.residual_result is not None and prepared.parent_bridge_support_mm is None:
-                    assembly._delete_tile_result_storage(first_gate.residual_result, keep_temp=True)
+                    assembly._delete_tile_result_storage(first_gate.residual_result)
                 del task, tile_mm, result, first_gate, second
             report.update(gates=gate_records, bridge_rescued_native59_voxels=int(bridge_category[5].sum()),
                 direct_parent_native64_voxels=int(parent_category[10].sum()))
@@ -262,7 +262,7 @@ def seam(args):
                 destination_mm=prepared.final_view_volume_mm, destination_lock=threading.Lock(),
                 temp_dir=runroot / "temporary", interpolate=15, interpolation_walk_back=0,
                 interpolation_candidates=1, interpolate_passes=1, interpolate_min_radius=3.,
-                interpolation_search_angle=30., keep_temp=True, slice_workers=1,
+                interpolation_search_angle=30., slice_workers=1,
                 interpolation_task_workers=1, nrrd_layers_enabled=True,
                 tile_parent_mask_accumulator_mm=parent_category, tile_parent_bridge_accumulator_mm=bridge_category,
                 config_id="diagnostic_actual_fullframe_crops", interpolation_backend="sam",

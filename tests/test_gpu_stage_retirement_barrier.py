@@ -12,11 +12,9 @@ from XTA import backprojection, pipeline
 
 class GpuStageRetirementBarrierTests(unittest.TestCase):
     def setUp(self):
-        self.fallback = mock.patch.object(backprojection, 'v1613_d1_backprojection_overlap_enabled', return_value=True)
         self.aux = mock.patch.object(backprojection, 'gpu_worker_aux_interpolation_pool', return_value=None)
-        for patch in (self.fallback, self.aux):
-            patch.start()
-            self.addCleanup(patch.stop)
+        self.aux.start()
+        self.addCleanup(self.aux.stop)
         self.torch = types.SimpleNamespace(
             cuda=types.SimpleNamespace(device_count=mock.Mock(return_value=4),
                                        mem_get_info=mock.Mock(return_value=(1000, 2000))),
@@ -24,12 +22,6 @@ class GpuStageRetirementBarrierTests(unittest.TestCase):
         )
         self.coordinator = backprojection._MainProcessGpuStageCoordinator()
         self.coordinator.configure_workers([0, 2])
-
-    def test_non_d1_overlap_remains_available_before_the_retirement_boundary(self):
-        self.assertTrue(self.coordinator.snapshot()['inference_priority_active'])
-        lease = self.coordinator.try_acquire_specific_stage(self.torch, 0, 'Azimuthal backprojection')
-        self.assertIsNotNone(lease)
-        lease.release()
 
     def test_pending_retirement_blocks_selected_devices(self):
         self.coordinator.set_inference_asset_retirement_pending(True)
@@ -42,7 +34,10 @@ class GpuStageRetirementBarrierTests(unittest.TestCase):
         self.torch.cuda.mem_get_info.assert_not_called()
 
     def test_pending_flag_does_not_block_other_devices_or_revoke_existing_leases(self):
+        # Retirement follows the global inference drain, which ends inference priority.
+        self.coordinator.set_inference_priority_active(False)
         prior = self.coordinator.try_acquire_specific_stage(self.torch, 0, 'Azimuthal backprojection')
+        self.assertIsNotNone(prior)
         self.coordinator.set_inference_asset_retirement_pending(True)
         self.assertEqual(self.coordinator.snapshot()['stage_leases'], {0: 'Azimuthal backprojection'})
         unrelated = self.coordinator.try_acquire_specific_stage(self.torch, 1, 'NRRD output')

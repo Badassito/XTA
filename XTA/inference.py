@@ -13,11 +13,8 @@ import queue
 import threading
 from collections import OrderedDict
 from concurrent.futures import (
-    FIRST_COMPLETED,
     Future,
     ThreadPoolExecutor,
-    as_completed,
-    wait,
 )
 from dataclasses import (
     dataclass,
@@ -69,12 +66,10 @@ from .geometry import (
     BatchResultFrameSpec,
     GpuPrefetchingYoloSource,
     InMemoryYoloVolumeSource,
-    PredictionVolumeRef,
     StreamingYoloVolumeSource,
     ViewInfo,
     _cupy_external_stream,
     _source_prediction_channel_count,
-    make_prediction_ref_yolo_source,
     maybe_wrap_source_with_gpu_input_staging,
     mirror_azimuthal_u_output_to_native_affine,
     prediction_result_frame_spec,
@@ -401,9 +396,6 @@ def validate_yolo_model_input_channels(
             pass
     return int(actual)
 
-def offload_between_jobs_enabled() -> bool:
-    return _env_flag('YOLO_TTA_OFFLOAD_BETWEEN_JOBS', False)
-
 def trim_cuda_memory() -> None:
     try:
         import torch  # type: ignore
@@ -420,42 +412,6 @@ def trim_cuda_memory() -> None:
     except Exception:
         pass
 
-def offload_yolo_from_gpu(model: object) -> None:
-    modules: List[object] = []
-    direct_model = getattr(model, 'model', None)
-    if direct_model is not None:
-        modules.append(direct_model)
-
-    predictor = getattr(model, 'predictor', None)
-    predictor_model = getattr(predictor, 'model', None) if predictor is not None else None
-    if predictor_model is not None and predictor_model is not direct_model:
-        modules.append(predictor_model)
-
-    for module in modules:
-        try:
-            to_fn = getattr(module, 'to', None)
-            if callable(to_fn):
-                to_fn('cpu')
-        except Exception:
-            pass
-
-    try:
-        setattr(model, '_tta_predict_state', None)
-    except Exception:
-        pass
-
-    trim_cuda_memory()
-
-def unload_yolo_model(model: object) -> None:
-    offload_yolo_from_gpu(model)
-    predictor = getattr(model, 'predictor', None)
-    if predictor is not None:
-        try:
-            setattr(model, 'predictor', None)
-        except Exception:
-            pass
-    trim_cuda_memory()
-
 @dataclass
 class PredictConfig:
     imgsz: int
@@ -466,61 +422,6 @@ class PredictConfig:
     input_channels: int = 1
     channel_token: str = 'gray'
     task: str = 'segment'
-
-def async_predict_postprocess_enabled() -> bool:
-    """Return True when angle-variant prediction CPU tails may run behind the GPU."""
-    return _env_flag('YOLO_TTA_ASYNC_PREDICT_POSTPROCESS', True)
-
-def async_predict_join_workers(default_value: int) -> int:
-    return max(1, _env_int('YOLO_TTA_ASYNC_PREDICT_JOIN_WORKERS', max(1, int(default_value))))
-
-def async_predict_pending_frame_limit(num_frames: int) -> int:
-    """Optional cap for queued async result-worker futures per source.
-
- The default 0 means source-sized buffering: the GPU-facing iterator will not
- intentionally wait for CPU result workers while a prediction volume streams.
- Set YOLO_TTA_ASYNC_PREDICT_PENDING_FRAMES to a positive value to reduce
- transient CPU/GPU result memory at the cost of some continuity."""
-    requested = _env_int('YOLO_TTA_ASYNC_PREDICT_PENDING_FRAMES', 0)
-    if int(requested) <= 0:
-        return 0
-    return max(1, min(max(1, int(num_frames)), int(requested)))
-
-@dataclass
-class PredictionAccumulationHandle:
-    """Background CPU accumulation tail for one streamed prediction source."""
-    source_label: str
-    futures: List[Future]
-    view_union_mm: np.ndarray
-    view_confmap_mm: Optional[np.ndarray]
-    submitted_frames: int = 0
-    synthetic_discarded: int = 0
-    precompleted_prediction_count: int = 0
-    precompleted_frames_with_predictions: int = 0
-    pending_limit: int = 0
-    azimuthal_padding_processed: int = 0
-    azimuthal_padding_union_mm: Optional[np.ndarray] = None
-    azimuthal_padding_confmap_mm: Optional[np.ndarray] = None
-
-    def wait(self) -> Dict[str, int]:
-        prediction_count = int(self.precompleted_prediction_count)
-        frames_with_predictions = int(self.precompleted_frames_with_predictions)
-        try:
-            for fut in as_completed(list(self.futures)):
-                pred_inc, frame_inc = fut.result()
-                prediction_count += int(pred_inc)
-                frames_with_predictions += int(frame_inc)
-        except BaseException:
-            _settle_parallel_futures(self.futures)
-            raise
-        return {
-            'prediction_count': int(prediction_count),
-            'frames_with_predictions': int(frames_with_predictions),
-            'submitted_frames': int(self.submitted_frames),
-            'synthetic_discarded': int(self.synthetic_discarded),
-            'azimuthal_padding_processed': int(self.azimuthal_padding_processed),
-            'async_accumulation': 1,
-        }
 
 class _PredictionResultCoverage:
     """Require every logical frame before publishing a generic prediction task."""
@@ -1196,7 +1097,8 @@ def _build_gpu_flattened_payload_from_proto(pred: object, img: object, proto: ob
  foreground bridges that per-instance retina interpolation would leave empty, including away
  from box edges. Native-grid scaling can magnify these differences.
  Instance-level --min_conf (angle-variant fast path) and the optional per-pixel max-confidence
- plane are applied at proto resolution. Returns None on any unexpected condition so the
+ plane are applied at proto resolution; that plane is upsampled by _upsample_proto_confidence,
+ so bilinear mask boundaries keep a score. Returns None on any unexpected condition so the
  caller falls back to the unpatched Ultralytics path."""
     try:
         import torch  # type: ignore
@@ -1255,7 +1157,11 @@ def _build_gpu_flattened_payload_from_proto(pred: object, img: object, proto: ob
         coeffs = pred_t[:, 6:6 + c].to(torch.float32)
         logits = (coeffs @ proto_t.to(torch.float32).view(c, -1)).view(n, mh, mw)
 
-        # Box crop at proto scale (Ultralytics crop_mask semantics: r >= x1 and r < x2).
+        # Box crop at proto scale. Proto cell c spans [c, c+1) and is sampled at its centre
+        # c+0.5 by the align_corners=False upsample, so the crop tests that centre against
+        # the half-open box. The cell holding a non-empty box's centre is always kept, so a
+        # box narrower than one cell still contributes, as in the per-instance retina path.
+        # The resident NVRTC unions use the same predicate (proto_cell_accepted/_rejected).
         boxes = pred_t[:, :4].to(torch.float32)
         sx = float(mw) / float(img_w)
         sy = float(mh) / float(img_h)
@@ -1265,7 +1171,9 @@ def _build_gpu_flattened_payload_from_proto(pred: object, img: object, proto: ob
         y2 = (boxes[:, 3] * sy).view(-1, 1, 1)
         cols = torch.arange(mw, device=logits.device, dtype=torch.float32).view(1, 1, -1)
         rows = torch.arange(mh, device=logits.device, dtype=torch.float32).view(1, -1, 1)
-        inside = (cols >= x1) & (cols < x2) & (rows >= y1) & (rows < y2)
+        inside_x = ((cols + 0.5 >= x1) & (cols + 0.5 < x2)) | ((x2 > x1) & (cols == torch.floor(0.5 * (x1 + x2))))
+        inside_y = ((rows + 0.5 >= y1) & (rows + 0.5 < y2)) | ((y2 > y1) & (rows == torch.floor(0.5 * (y1 + y2))))
+        inside = inside_x & inside_y
 
         # Crop fill: a bounded "confident background" logit rather than -inf. An extreme fill
         # bleeds through the bilinear upsample and erodes up to a full proto cell of box
@@ -1285,9 +1193,7 @@ def _build_gpu_flattened_payload_from_proto(pred: object, img: object, proto: ob
         if confs_t is not None and gpu_flatten_conf_tracking_enabled():
             inst_proto = (logits > 0.0) & inside
             conf_plane = (confs_t.clamp(0.0, 1.0).view(-1, 1, 1) * inst_proto).amax(dim=0)
-            conf_gpu = F.interpolate(
-                conf_plane.reshape(1, 1, mh, mw), size=(img_h, img_w), mode='nearest',
-            ).reshape(img_h, img_w)
+            conf_gpu = _upsample_proto_confidence(conf_plane, union_gpu, (img_h, img_w))
 
         ready_event = None
         try:
@@ -3097,6 +3003,7 @@ class _ResidentGpuPipelineSlot:
         self.compact_confs = None
         self.max_logit = None
         self.proto_tmp = None
+        self.proto_dilated = None
         self.conf_proto = None
         self.native_union = None
         self.native_conf = None
@@ -3274,6 +3181,20 @@ def _resident_mask_kernels() -> Optional[object]:
         __device__ __forceinline__ float rd(const float* p, int i) { return p[i]; }
         __device__ __forceinline__ float rd(const half* p, int i) { return __half2float(p[i]); }
 
+        // Proto-scale box crop, shared with the Torch proto path: cell c is kept when its
+        // centre c+0.5 lies in [lo, hi), and the cell holding a non-empty box's centre is
+        // always kept so sub-cell boxes still contribute. Rejection and acceptance forms
+        // keep each kernel's historical result for NaN boxes (scalar/f32-tiled accept,
+        // f16-tiled rejects); the float equality keeps a NaN centre from matching cell 0.
+        __device__ __forceinline__ bool proto_cell_rejected(int c, float lo, float hi) {
+          float m = (float)c + 0.5f;
+          return (m < lo || m >= hi) && !(hi > lo && (float)c == floorf(0.5f * (lo + hi)));
+        }
+        __device__ __forceinline__ bool proto_cell_accepted(int c, float lo, float hi) {
+          float m = (float)c + 0.5f;
+          return (m >= lo && m < hi) || (hi > lo && (float)c == floorf(0.5f * (lo + hi)));
+        }
+
         template <typename H, typename P>
         __device__ void proto_union_body(
             const H* head, const P* proto, const int* indices, const int* count,
@@ -3297,7 +3218,7 @@ def _resident_mask_kernels() -> Optional[object]:
             float y1 = (cy - 0.5f * bh) * ((float)ph / (float)ih);
             float x2 = (cx + 0.5f * bw) * ((float)pw / (float)iw);
             float y2 = (cy + 0.5f * bh) * ((float)ph / (float)ih);
-            if ((float)x < x1 || (float)x >= x2 || (float)y < y1 || (float)y >= y2) continue;
+            if (proto_cell_rejected(x, x1, x2) || proto_cell_rejected(y, y1, y2)) continue;
             float logit = 0.0f;
             #pragma unroll 4
             for (int c = 0; c < masks; ++c) {
@@ -3390,11 +3311,9 @@ def _resident_mask_kernels() -> Optional[object]:
               float y1 = sh_meta[d * 5 + 1];
               float x2 = sh_meta[d * 5 + 2];
               float y2 = sh_meta[d * 5 + 3];
-              bool inside0 = valid0 && (float)ox0 >= x1 && (float)ox0 < x2 &&
-                             (float)oy >= y1 && (float)oy < y2;
-              bool inside1 = valid1 && (float)(ox0 + 1) >= x1 &&
-                             (float)(ox0 + 1) < x2 &&
-                             (float)oy >= y1 && (float)oy < y2;
+              bool row_in = proto_cell_accepted(oy, y1, y2);
+              bool inside0 = valid0 && row_in && proto_cell_accepted(ox0, x1, x2);
+              bool inside1 = valid1 && row_in && proto_cell_accepted(ox0 + 1, x1, x2);
               if (!inside0 && !inside1) continue;
               float logit0 = 0.0f;
               float logit1 = 0.0f;
@@ -3459,8 +3378,7 @@ def _resident_mask_kernels() -> Optional[object]:
             float x2 = packed_boxes[d * 4 + 2];
             float y2 = packed_boxes[d * 4 + 3];
             // Use the scalar rejection predicate even for nonfinite boxes.
-            if ((float)ox < x1 || (float)ox >= x2 ||
-                (float)oy < y1 || (float)oy >= y2) continue;
+            if (proto_cell_rejected(ox, x1, x2) || proto_cell_rejected(oy, y1, y2)) continue;
             if (!loaded) {
               #pragma unroll
               for (int c = 0; c < 32; ++c) {
@@ -3562,8 +3480,61 @@ def _resident_mask_kernels() -> Optional[object]:
           }
         }
 
+        // Confidence fallback for a bilinear mask pixel whose nearest proto score is zero:
+        // the maximum score over the bilinear taps with positive weight. raw_logit is the
+        // pre-closing plane; when given, only raw foreground takes the fallback, so proto
+        // topology closing cannot invent a score. nullptr means the mask plane is raw.
+        __device__ __forceinline__ float proto_tap_confidence(
+            const float* conf_proto, const float* raw_logit, int pw,
+            int y0, int x0, int y1, int x1, float fy, float fx) {
+          if (raw_logit != nullptr) {
+            float r00 = raw_logit[y0 * pw + x0];
+            float r01 = raw_logit[y0 * pw + x1];
+            float r10 = raw_logit[y1 * pw + x0];
+            float r11 = raw_logit[y1 * pw + x1];
+            float r0 = r00 + fx * (r01 - r00);
+            float r1 = r10 + fx * (r11 - r10);
+            if (!((r0 + fy * (r1 - r0)) > 0.0f)) return 0.0f;
+          }
+          float tap = conf_proto[y0 * pw + x0];
+          if (fx > 0.0f) tap = fmaxf(tap, conf_proto[y0 * pw + x1]);
+          if (fy > 0.0f) {
+            tap = fmaxf(tap, conf_proto[y1 * pw + x0]);
+            if (fx > 0.0f) tap = fmaxf(tap, conf_proto[y1 * pw + x1]);
+          }
+          return fminf(1.0f, fmaxf(0.0f, tap));
+        }
+
+        // Torch-free twin of _upsample_proto_confidence for float32 planes: nearest proto
+        // score by F.interpolate's rule, or, on union foreground where it is zero, the
+        // maximum over the positive-weight align_corners=False bilinear taps.
+        extern "C" __global__ void upsample_proto_confidence(
+            const float* conf_proto, const float* union_plane,
+            int ph, int pw, int oh, int ow, float* out_conf) {
+          int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+          int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
+          if (ox >= ow || oy >= oh) return;
+          float scale_y = (float)ph / (float)oh;
+          float scale_x = (float)pw / (float)ow;
+          int ny = min((int)floorf((float)oy * scale_y), ph - 1);
+          int nx = min((int)floorf((float)ox * scale_x), pw - 1);
+          int q = oy * ow + ox;
+          float cf = conf_proto[ny * pw + nx];
+          if (union_plane[q] > 0.0f && !(cf > 0.0f)) {
+            float sy = fmaxf(0.0f, ((float)oy + 0.5f) * scale_y - 0.5f);
+            float sx = fmaxf(0.0f, ((float)ox + 0.5f) * scale_x - 0.5f);
+            int y0 = min((int)floorf(sy), ph - 1);
+            int x0 = min((int)floorf(sx), pw - 1);
+            int y1 = (sy > (float)y0 && y0 < ph - 1) ? y0 + 1 : y0;
+            int x1 = (sx > (float)x0 && x0 < pw - 1) ? x0 + 1 : x0;
+            cf = fmaxf(fmaxf(conf_proto[y0 * pw + x0], conf_proto[y0 * pw + x1]),
+                       fmaxf(conf_proto[y1 * pw + x0], conf_proto[y1 * pw + x1]));
+          }
+          out_conf[q] = cf;
+        }
+
         extern "C" __global__ void upsample_quantize(
-            const float* max_logit, const float* conf_proto,
+            const float* max_logit, const float* conf_proto, const float* raw_logit,
             int ph, int pw, int oh, int ow, unsigned char* out_union,
             unsigned char* out_conf, int* out_bbox) {
           __shared__ unsigned int row_masks[8];
@@ -3595,6 +3566,9 @@ def _resident_mask_kernels() -> Optional[object]:
               int ny = min(ph - 1, oy * ph / oh);
               int nx = min(pw - 1, ox * pw / ow);
               float cf = fminf(1.0f, fmaxf(0.0f, conf_proto[ny * pw + nx]));
+              if (fg && !(cf > 0.0f)) {
+                cf = proto_tap_confidence(conf_proto, raw_logit, pw, y0, x0, y1, x1, fy, fx);
+              }
               out_conf[q] = fg ? (unsigned char)__float2uint_rn(cf * 255.0f) : 0;
             }
           }
@@ -3602,7 +3576,7 @@ def _resident_mask_kernels() -> Optional[object]:
         }
 
         extern "C" __global__ void upsample_quantize_affine(
-            const float* max_logit, const float* conf_proto,
+            const float* max_logit, const float* conf_proto, const float* raw_logit,
             int ph, int pw, int ih, int iw, int oh, int ow,
             float m00, float m01, float m02,
             float m10, float m11, float m12,
@@ -3648,10 +3622,14 @@ def _resident_mask_kernels() -> Optional[object]:
               fg = (v0 + fy * (v1 - v0)) > 0.0f ? 1 : 0;
               out_union[q] = fg;
               if (out_conf != nullptr) {
-                // Confidence remains nearest-proto sampled, as in the generic path.
+                // Nearest-proto confidence, with the bilinear-tap fallback on raw
+                // foreground pixels whose nearest score is zero (generic-path rule).
                 int ny = max(0, min(ph - 1, (int)floorf(iy * ((float)ph / (float)ih))));
                 int nx = max(0, min(pw - 1, (int)floorf(ix * ((float)pw / (float)iw))));
                 float cf = fminf(1.0f, fmaxf(0.0f, conf_proto[ny * pw + nx]));
+                if (fg && !(cf > 0.0f)) {
+                  cf = proto_tap_confidence(conf_proto, raw_logit, pw, y0, x0, y1, x1, fy, fx);
+                }
                 out_conf[q] = fg ? (unsigned char)__float2uint_rn(cf * 255.0f) : 0;
               }
             }
@@ -3664,7 +3642,7 @@ def _resident_mask_kernels() -> Optional[object]:
             'union_f32_f32', 'union_f32_f16', 'union_f16_f32', 'union_f16_f16',
             'union_f16_f16_tiled', 'union_f32_f32_tiled',
             'proto_threshold_signed', 'proto_dilate_signed', 'proto_erode_signed',
-            'upsample_quantize', 'upsample_quantize_affine',
+            'upsample_quantize', 'upsample_quantize_affine', 'upsample_proto_confidence',
         )
         module = cp.RawModule(code=src, options=('--std=c++11',), name_expressions=names)
         _RESIDENT_MASK_KERNELS = argparse.Namespace(
@@ -4089,6 +4067,55 @@ def _reduce_direct_prototypes(
         return None
 
 
+def _proto_bilinear_taps(torch, n_in, n_out, device):
+    """Return the align_corners=False bilinear source taps (i0, i1) for each output index.
+
+    i1 equals i0 wherever the second tap has zero weight, so a gather never reads a
+    proto cell that does not contribute to the interpolated value."""
+    scale = float(np.float32(n_in) / np.float32(n_out))  # float32 ratio, as in the kernels
+    source = ((torch.arange(n_out, dtype=torch.float32, device=device) + 0.5) * scale - 0.5).clamp_(min=0.0)
+    i0 = source.floor().to(torch.int64).clamp_(max=int(n_in) - 1)
+    i1 = torch.where((source > i0.to(torch.float32)) & (i0 < int(n_in) - 1), i0 + 1, i0)
+    return i0, i1
+
+
+def _upsample_proto_confidence(conf_proto, union, image_hw):
+    """Upsample a proto-resolution confidence plane beside its bilinear union mask.
+
+    Each pixel takes the nearest proto score (F.interpolate 'nearest'). Where the union is
+    foreground but that score is zero, it takes the maximum over the bilinear taps with
+    positive weight, so interpolated mask boundaries keep a real score instead of reading
+    as unknown. Nonzero nearest scores are unchanged. Float32 CUDA planes use the one-pass
+    NVRTC kernel upsample_proto_confidence; this Torch form is the CPU path and its reference.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    oh, ow = int(image_hw[0]), int(image_hw[1])
+    ph, pw = int(conf_proto.shape[-2]), int(conf_proto.shape[-1])
+    if conf_proto.is_cuda and conf_proto.dtype == torch.float32 and union.dtype == torch.float32:
+        kernels = _resident_mask_kernels()
+        if kernels is not None:
+            cp = kernels.cp
+            source, plane = conf_proto.contiguous(), union.contiguous()
+            out = torch.empty((oh, ow), dtype=torch.float32, device=conf_proto.device)
+            kernels.upsample_proto_confidence(
+                ((ow + 31) // 32, (oh + 7) // 8), (32, 8),
+                (cp.asarray(source), cp.asarray(plane), np.int32(ph), np.int32(pw),
+                 np.int32(oh), np.int32(ow), cp.asarray(out)),
+                stream=_cupy_external_stream(cp, torch.cuda.current_stream(conf_proto.device)),
+            )
+            return out
+    plane = conf_proto.reshape(ph, pw)
+    nearest = F.interpolate(plane[None, None], size=(oh, ow), mode='nearest')[0, 0]
+    y0, y1 = _proto_bilinear_taps(torch, ph, oh, plane.device)
+    x0, x1 = _proto_bilinear_taps(torch, pw, ow, plane.device)
+    rows0, rows1 = plane.index_select(0, y0), plane.index_select(0, y1)
+    taps = torch.maximum(torch.maximum(rows0.index_select(1, x0), rows0.index_select(1, x1)),
+                         torch.maximum(rows1.index_select(1, x0), rows1.index_select(1, x1)))
+    return torch.where((union.reshape(oh, ow) > 0) & ~(nearest > 0), taps, nearest)
+
+
 def _direct_payload_from_planes(max_logit, conf_proto, image_hw, *, count, count_device=None,
                                 kernel_name, min_conf_applied=False, refs=()):
     import torch
@@ -4097,7 +4124,7 @@ def _direct_payload_from_planes(max_logit, conf_proto, image_hw, *, count, count
     union = F.interpolate(max_logit[None, None], size=image_hw, mode='bilinear',
                           align_corners=False)[0, 0].gt(0).to(torch.float32)
     confidence = (None if conf_proto is None else
-                  F.interpolate(conf_proto[None, None], size=image_hw, mode='nearest')[0, 0])
+                  _upsample_proto_confidence(conf_proto, union, image_hw))
     event = torch.cuda.Event()
     event.record(torch.cuda.current_stream(max_logit.device))
     fastpath = angle_variant_gpu_fastpath()
@@ -4532,7 +4559,7 @@ def predict_source_and_accumulate(
         worker_count = max(1, min(int(postprocess_workers), int(num_frames)))
         pending_limit = cpu_mask_postprocess_pending_limit(worker_count, int(num_frames))
         stream_cleanup = bool(streaming_cleanup_enabled)
-        stream_backend = _prediction_cleanup.cleanup_backend() if stream_cleanup else ''
+        stream_backend = _prediction_cleanup.DEFAULT_CLEANUP_BACKEND if stream_cleanup else ''
         stream_structure2 = np.ones((3, 3), dtype=bool) if stream_cleanup else None
         stream_min_conf = float(streaming_cleanup_min_conf)
         stream_min_radius = float(streaming_cleanup_min_radius)
@@ -4991,375 +5018,6 @@ def predict_source_and_accumulate(
             except Exception:
                 pass
 
-def predict_source_and_submit_accumulation(
-    model,
-    source: object,
-    *,
-    source_label: str,
-    num_frames: int,
-    out_size: int,
-    cfg: PredictConfig,
-    view_union_mm: np.ndarray,
-    view_confmap_mm: Optional[np.ndarray],
-    M_out_to_native: np.ndarray,
-    native_h: int,
-    native_w: int,
-    postprocess_executor: ThreadPoolExecutor,
-    streaming_cleanup_enabled: bool = False,
-    streaming_cleanup_min_conf: float = 0.0,
-    streaming_cleanup_min_radius: float = 0.0,
-    slice_locks: Optional[Sequence[threading.Lock]] = None,
-    azimuthal_padding_union_mm: Optional[np.ndarray] = None,
-    azimuthal_padding_confmap_mm: Optional[np.ndarray] = None,
-) -> PredictionAccumulationHandle:
-    """Run YOLO streaming inference and enqueue result accumulation without draining it."""
-    # only compute the GPU flatten's max-conf plane when a confidence
-    # volume actually exists downstream.
-    # Local import keeps the package dependency graph acyclic.
-    from .cuda_backend import (
-        GpuRenderedYoloSource,
-        GpuTileRenderedYoloSource,
-    )
-
-    set_gpu_flatten_conf_tracking(view_confmap_mm is not None)
-    ensure_yolo_ready_for_predict(model, cfg)
-    source_channels = _source_prediction_channel_count(source, cfg)
-    if int(source_channels) != int(cfg.input_channels):
-        raise ValueError(
-            f'{source_label}: source yields C={int(source_channels)}, but '
-            f'--channel_format {cfg.channel_token} requires C={int(cfg.input_channels)}'
-        )
-    validate_yolo_model_input_channels(
-        model,
-        int(cfg.input_channels),
-        channel_token=str(cfg.channel_token),
-        context=f'prediction source {source_label}',
-    )
-    unwrapped_source = source
-    source = maybe_wrap_source_with_gpu_input_staging(source, cfg, source_label)
-    # the call above may create a GpuPrefetchingYoloSource that nothing
-    # else owns. If iteration is abandoned by an exception (model.predict setup, a
-    # mid-stream CUDA error, a postprocess future failure), its producer thread and
-    # VRAM-staged queue leaked for the life of the process. Close the wrapper created
-    # here on the way out; on success this is an idempotent no-op (the sentinel path in
-    # GpuPrefetchingYoloSource.__next__ already closed it).
-    owned_staging_wrapper = (
-        source
-        if (source is not unwrapped_source and isinstance(source, GpuPrefetchingYoloSource))
-        else None
-    )
-    try:
-        if isinstance(source, (
-            InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource,
-            GpuRenderedYoloSource, GpuTileRenderedYoloSource,
-        )):
-            require_channel_aware_yolo_preprocess_patch(str(cfg.channel_token))
-        use_custom_cpu_retina = False
-        semantic_task = str(cfg.task) == 'semantic'
-        if semantic_task:
-            pass
-        elif cpu_retina_masks_enabled():
-            use_custom_cpu_retina = bool(ensure_cpu_retina_mask_predictor_patch())
-            if not use_custom_cpu_retina:
-                print('Warning: CPU retina predictor patch unavailable; using Ultralytics native retina_masks=True for this source.')
-        else:
-            # GPU retina mode — reduce unions at proto resolution inside
-            # construct_result instead of materializing (n, imgsz, imgsz) retina stacks.
-            ensure_gpu_retina_proto_union_predictor_patch()
-
-        # same direct-loop preference as predict_source_and_accumulate.
-        results = None
-        if semantic_task:
-            predictor = _ensure_predictor_for_direct_predict(model, cfg)
-            if predictor is None:
-                raise RuntimeError(f'{source_label}: could not initialize semantic backend')
-            results = _semantic_predict_stream(predictor, source, cfg, source_label)
-        elif not use_custom_cpu_retina and _direct_predict_applicable(cfg):
-            predictor_direct = _ensure_predictor_for_direct_predict(model, cfg)
-            if predictor_direct is not None:
-                results = _direct_predict_stream(predictor_direct, source, cfg, source_label)
-        if results is None:
-            results = model.predict(
-                source=source,
-                task=str(cfg.task),
-                imgsz=cfg.imgsz,
-                conf=cfg.conf,
-                iou=1.0,
-                save=False,
-                stream=True,
-                retina_masks=not bool(use_custom_cpu_retina),
-                batch=max(1, int(cfg.batch)),
-                device=cfg.device,
-                quantize=cfg.quantize,
-                verbose=False,
-            )
-            validate_yolo_model_input_channels(
-                model,
-                int(cfg.input_channels),
-                channel_token=str(cfg.channel_token),
-                context=f'initialized prediction backend for {source_label}',
-            )
-            results = _stock_results_with_forward_replay(results, model, source, cfg)
-
-        stream_cleanup = bool(streaming_cleanup_enabled)
-        stream_backend = _prediction_cleanup.cleanup_backend() if stream_cleanup else ''
-        stream_structure2 = np.ones((3, 3), dtype=bool) if stream_cleanup else None
-        stream_min_conf = float(streaming_cleanup_min_conf)
-        stream_min_radius = float(streaming_cleanup_min_radius)
-        stream_min_conf_u8 = int(min_conf_to_u8_threshold(stream_min_conf)) if stream_min_conf > 0.0 else 0
-        semantic_gpu_path = _semantic_gpu_path_available(cfg, source, stream_min_radius)
-
-        source_padding_count = max(0, int(getattr(source, 'azimuthal_padding_count', 0) or 0))
-        result_coverage = _PredictionResultCoverage(source_label, num_frames, source_padding_count)
-        effective_slice_locks = slice_locks
-        if effective_slice_locks is None and source_padding_count > 0:
-            effective_slice_locks = [
-                threading.Lock() for _ in range(max(1, int(view_union_mm.shape[0])))
-            ]
-
-        def _process_prediction_unit(
-            spec: BatchResultFrameSpec,
-            masks_obj: Optional[object],
-            confs_arr: Optional[np.ndarray],
-        ) -> Tuple[int, int]:
-            target_union, target_conf, target_index, target_affine, count_stats = (
-                _prediction_accumulation_target(
-                    spec,
-                    view_union_mm=view_union_mm,
-                    view_confmap_mm=view_confmap_mm,
-                    azimuthal_padding_union_mm=azimuthal_padding_union_mm,
-                    azimuthal_padding_confmap_mm=azimuthal_padding_confmap_mm,
-                    M_out_to_native=M_out_to_native,
-                    native_w=int(native_w),
-                )
-            )
-            slice_lock = None
-            if effective_slice_locks is not None and len(effective_slice_locks) > 0:
-                lock_index = (
-                    int(spec.global_destination_index)
-                    if bool(spec.is_azimuthal_padding) else int(spec.task_index)
-                )
-                slice_lock = effective_slice_locks[lock_index % len(effective_slice_locks)]
-            if isinstance(masks_obj, GpuFlattenedRetinaPayload):
-                masks_obj.gpu_min_radius = float(stream_min_radius)
-                masks_obj.semantic_min_conf_u8 = (
-                    int(stream_min_conf_u8) if semantic_gpu_path and stream_cleanup else 0
-                )
-                masks_obj.run_gpu_cleanup = bool(
-                    angle_variant_gpu_fastpath() is not None
-                    and gpu_retina_cleanup_enabled()
-                    and float(stream_min_radius) > 0.0
-                )
-            with (slice_lock if slice_lock is not None else contextlib.nullcontext()):
-                pred_inc, frame_inc = _process_prediction_frame(
-                    idx=int(target_index),
-                    masks_np=masks_obj,
-                    confs_np=confs_arr,
-                    out_size=out_size,
-                    view_union_mm=target_union,
-                    view_confmap_mm=target_conf,
-                    M_out_to_native=target_affine,
-                    native_h=native_h,
-                    native_w=native_w,
-                    slice_lock=None,
-                )
-                # Keep union and streamed cleanup atomic for repeated wrapped destinations.
-                if stream_cleanup and not bool(getattr(masks_obj, 'cleanup_done_on_gpu', False)):
-                    cleaned_has_foreground = _prediction_cleanup._cleanup_prediction_slice_inplace(
-                        target_union,
-                        target_conf,
-                        int(target_index),
-                        min_conf=stream_min_conf,
-                        min_radius=stream_min_radius,
-                        backend=stream_backend,
-                        structure2=stream_structure2,
-                        min_conf_u8=stream_min_conf_u8,
-                    )
-                    frame_inc = 1 if bool(cleaned_has_foreground) else 0
-            if not count_stats:
-                return 0, 0
-            return int(pred_inc), int(frame_inc)
-
-        def _extract_and_process_result(spec: BatchResultFrameSpec, result_obj: object) -> Tuple[int, int]:
-            masks_np, confs_np = _extract_result_masks_and_confs(result_obj)
-            try:
-                del result_obj
-            except Exception:
-                pass
-            return _process_prediction_unit(spec, masks_np, confs_np)
-
-        futures: List[Future] = []
-        submitted_frames = 0
-        synthetic_discarded = 0
-        azimuthal_padding_processed = 0
-        precompleted_prediction_count = 0
-        precompleted_frames_with_predictions = 0
-        pending_limit = async_predict_pending_frame_limit(int(num_frames))
-
-        # eagerly reduce GPU stacks to 2 small planes on this thread and bound the queue
-        # so GPU-resident flattened frames stay capped (see predict_source_and_accumulate).
-        gpu_flatten_eager = bool(
-            not cpu_retina_masks_enabled() and gpu_retina_eager_flatten_enabled()
-        )
-        if gpu_flatten_eager:
-            gpu_cap = gpu_retina_flatten_pending_limit(max(1, int(getattr(postprocess_executor, '_max_workers', 1) or 1)))
-            pending_limit = max(1, min(int(pending_limit) if int(pending_limit) > 0 else gpu_cap, gpu_cap))
-
-        def _join_one_pending() -> None:
-            nonlocal futures, precompleted_prediction_count, precompleted_frames_with_predictions
-            if not futures:
-                return
-            done, remaining = wait(set(futures), return_when=FIRST_COMPLETED)
-            futures = list(remaining)
-            for fut_done in done:
-                pred_inc, frame_inc = fut_done.result()
-                precompleted_prediction_count += int(pred_inc)
-                precompleted_frames_with_predictions += int(frame_inc)
-
-        try:
-            for idx, r in enumerate(results):
-                spec = prediction_result_frame_spec(source, int(idx), num_frames=int(num_frames))
-                if spec is None:
-                    synthetic_discarded += 1
-                    continue
-                result_coverage.add(spec)
-                if spec.is_azimuthal_padding:
-                    azimuthal_padding_processed += 1
-                else:
-                    submitted_frames += 1
-                if gpu_flatten_eager:
-                    masks_np, confs_np = _extract_result_masks_and_confs(r)
-                    try:
-                        del r
-                    except Exception:
-                        pass
-                    futures.append(postprocess_executor.submit(_process_prediction_unit, spec, masks_np, confs_np))
-                else:
-                    futures.append(postprocess_executor.submit(_extract_and_process_result, spec, r))
-                while int(pending_limit) > 0 and len(futures) >= int(pending_limit):
-                    _join_one_pending()
-            result_coverage.validate()
-        except BaseException:
-            # The caller may close/release destination arrays immediately on error.
-            # Settle our writes before returning control, as the synchronous path does.
-            _settle_parallel_futures(futures)
-            raise
-
-        return PredictionAccumulationHandle(
-            source_label=str(source_label),
-            futures=futures,
-            view_union_mm=view_union_mm,
-            view_confmap_mm=view_confmap_mm,
-            submitted_frames=int(submitted_frames),
-            synthetic_discarded=int(synthetic_discarded),
-            precompleted_prediction_count=int(precompleted_prediction_count),
-            precompleted_frames_with_predictions=int(precompleted_frames_with_predictions),
-            pending_limit=int(pending_limit),
-            azimuthal_padding_processed=int(azimuthal_padding_processed),
-            azimuthal_padding_union_mm=azimuthal_padding_union_mm,
-            azimuthal_padding_confmap_mm=azimuthal_padding_confmap_mm,
-        )
-    finally:
-        if owned_staging_wrapper is not None:
-            try:
-                owned_staging_wrapper.close()
-            except Exception:
-                pass
-
-def predict_in_memory_volume_and_submit_accumulation(
-    model,
-    prediction_volume: PredictionVolumeRef,
-    *,
-    num_frames: int,
-    out_size: int,
-    cfg: PredictConfig,
-    view_union_mm: np.ndarray,
-    view_confmap_mm: Optional[np.ndarray],
-    M_out_to_native: np.ndarray,
-    native_h: int,
-    native_w: int,
-    postprocess_executor: ThreadPoolExecutor,
-    streaming_cleanup_enabled: bool = False,
-    streaming_cleanup_min_conf: float = 0.0,
-    streaming_cleanup_min_radius: float = 0.0,
-    slice_locks: Optional[Sequence[threading.Lock]] = None,
-    azimuthal_padding_union_mm: Optional[np.ndarray] = None,
-    azimuthal_padding_confmap_mm: Optional[np.ndarray] = None,
-) -> PredictionAccumulationHandle:
-    source = make_prediction_ref_yolo_source(
-        prediction_volume,
-        batch_size=max(1, int(cfg.batch)),
-        max_frames=int(num_frames),
-    )
-    return predict_source_and_submit_accumulation(
-        model,
-        source,
-        source_label=prediction_volume.name,
-        num_frames=int(num_frames),
-        out_size=int(out_size),
-        cfg=cfg,
-        view_union_mm=view_union_mm,
-        view_confmap_mm=view_confmap_mm,
-        M_out_to_native=M_out_to_native,
-        native_h=int(native_h),
-        native_w=int(native_w),
-        postprocess_executor=postprocess_executor,
-        streaming_cleanup_enabled=bool(streaming_cleanup_enabled),
-        streaming_cleanup_min_conf=float(streaming_cleanup_min_conf),
-        streaming_cleanup_min_radius=float(streaming_cleanup_min_radius),
-        slice_locks=slice_locks,
-        azimuthal_padding_union_mm=azimuthal_padding_union_mm,
-        azimuthal_padding_confmap_mm=azimuthal_padding_confmap_mm,
-    )
-
-def predict_in_memory_volume_and_accumulate(
-    model,
-    prediction_volume: PredictionVolumeRef,
-    *,
-    num_frames: int,
-    out_size: int,
-    cfg: PredictConfig,
-    view_union_mm: np.ndarray,
-    view_confmap_mm: Optional[np.ndarray],
-    M_out_to_native: np.ndarray,
-    native_h: int,
-    native_w: int,
-    postprocess_workers: int = 1,
-    streaming_cleanup_enabled: bool = False,
-    streaming_cleanup_min_conf: float = 0.0,
-    streaming_cleanup_min_radius: float = 0.0,
-    slice_locks: Optional[Sequence[threading.Lock]] = None,
-    azimuthal_padding_union_mm: Optional[np.ndarray] = None,
-    azimuthal_padding_confmap_mm: Optional[np.ndarray] = None,
-) -> Dict[str, int]:
-    source = make_prediction_ref_yolo_source(
-        prediction_volume,
-        batch_size=max(1, int(cfg.batch)),
-        max_frames=int(num_frames),
-    )
-    return predict_source_and_accumulate(
-        model,
-        source,
-        source_label=prediction_volume.name,
-        num_frames=int(num_frames),
-        out_size=int(out_size),
-        cfg=cfg,
-        view_union_mm=view_union_mm,
-        view_confmap_mm=view_confmap_mm,
-        M_out_to_native=M_out_to_native,
-        native_h=int(native_h),
-        native_w=int(native_w),
-        postprocess_workers=int(postprocess_workers),
-        streaming_cleanup_enabled=bool(streaming_cleanup_enabled),
-        streaming_cleanup_min_conf=float(streaming_cleanup_min_conf),
-        streaming_cleanup_min_radius=float(streaming_cleanup_min_radius),
-        slice_locks=slice_locks,
-        azimuthal_padding_union_mm=azimuthal_padding_union_mm,
-        azimuthal_padding_confmap_mm=azimuthal_padding_confmap_mm,
-    )
-
-_INFERENCE_BATCH_SIZE = 1
-
 _GPU_FLATTEN_TRACK_CONF = True
 
 def set_gpu_flatten_conf_tracking(enabled: bool) -> None:
@@ -5368,10 +5026,3 @@ def set_gpu_flatten_conf_tracking(enabled: bool) -> None:
 
 def gpu_flatten_conf_tracking_enabled() -> bool:
     return bool(_GPU_FLATTEN_TRACK_CONF)
-
-def set_inference_batch_size(batch_size: int) -> None:
-    global _INFERENCE_BATCH_SIZE
-    _INFERENCE_BATCH_SIZE = max(1, int(batch_size))
-
-def inference_batch_size() -> int:
-    return max(1, int(_INFERENCE_BATCH_SIZE))

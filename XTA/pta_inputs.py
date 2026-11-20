@@ -601,6 +601,18 @@ def nrrd_header_to_internal_permutation(header: Mapping[str, object]) -> Optiona
 
 
 
+def _force_fit_nearest_source_indices(source_count, target_count):
+    """Endpoint-aligned nearest map for --force geometry reconciliation (within 3 voxels).
+
+    This deliberately keeps ``round(i*(source-1)/(target-1))``: it pins both label
+    ends onto the image ends, unlike the center-aligned processing-cube resize."""
+    source_count, target_count = int(source_count), int(target_count)
+    if target_count <= 1 or source_count <= 1:
+        return np.zeros(target_count, dtype=np.intp)
+    positions = np.arange(target_count, dtype=np.float64) * (source_count - 1) / (target_count - 1)
+    return np.clip(np.rint(positions), 0, source_count - 1).astype(np.intp)
+
+
 def _nrrd_mask_source_planes(
     shape_tyx, expected_shape_tyx, nrrd_path, *, force=False,
     source_contiguous=True, source_plane_indices=None,
@@ -629,8 +641,7 @@ def _nrrd_mask_source_planes(
         )
     if source_t == target_t:
         return np.arange(target_t, dtype=np.intp)
-    from .media import _endpoint_aligned_nearest_source_indices
-    return _endpoint_aligned_nearest_source_indices(source_t, target_t)
+    return _force_fit_nearest_source_indices(source_t, target_t)
 
 
 
@@ -973,8 +984,7 @@ def _nrrd_mask_xy_indices(source_shape, target_shape):
     start) when few blocks cover a plane, or ('gather', np.ix_ index) otherwise."""
     if source_shape[1:] == target_shape[1:]:
         return None
-    from .media import _endpoint_aligned_nearest_source_indices
-    axes = [_endpoint_aligned_nearest_source_indices(source_size, target_size)
+    axes = [_force_fit_nearest_source_indices(source_size, target_size)
             for source_size, target_size in zip(source_shape[1:], target_shape[1:])]
     # A run continues while each target step advances the source by exactly one.
     breaks = [np.flatnonzero(np.diff(index) != 1) + 1 for index in axes]

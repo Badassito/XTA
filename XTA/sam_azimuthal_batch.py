@@ -6,14 +6,14 @@ No persistent data cache, source owner or publication point is added.
 """
 from dataclasses import asdict, dataclass
 from itertools import islice
-from pathlib import Path
-import hashlib
 import operator
 import time
 
 import numpy as np
 
-IMPLEMENTATION_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+from .file_hashing import source_sha256
+
+IMPLEMENTATION_SHA256 = source_sha256(__file__)
 
 
 class BatchDeclined(RuntimeError):
@@ -124,7 +124,7 @@ def retained_cache_snapshot(engine):
     from XTA.inference import _AFFINE_GRID_CACHE, _AFFINE_GRID_CACHE_LOCK
     torch, device = engine.torch, str(engine.device)
     opaque = ('_tilted_plans','_fused_azimuthal_taps','_spherical_direction_cache',
-        '_spherical_rotation_cache','_standalone_render_meta','_standalone_render_meta_ref',
+        '_standalone_render_meta','_standalone_render_meta_ref',
         '_azimuthal_texture_ref','_fused_volume_ref')
     for name in opaque:
         value = getattr(engine,name,None)
@@ -498,14 +498,19 @@ def chunk_sizes(count):
 
 def render_compatible_chunks(renderer, view, frames, inverse, *, output_origin_yx,
                              output_height, output_width, consume, pipeline_depth=2):
-    """Queue consecutive qualified 2-4 frame batches without a host sync between them.
+    """Queue consecutive qualified 2-4 frame batches; the host waits only for the oldest chunk's copy.
 
     Each chunk uses the unchanged project_native_batch/warp_native_batch operator,
     so pixels are identical to render_compatible_batch. Results copy
-    asynchronously into pinned host buffers; chunk k is copied into the caller's
-    sink while chunk k+1 renders. Planning happens before any sink write: an
-    ineligible first chunk declines, a later one ends the queue early (the
-    receipt reports how many frames completed, always >= 2).
+    asynchronously into pinned host buffers. After queuing a chunk's render and
+    copy, once more than the admitted depth (``pipeline_depth``, or 1 when that
+    many plans exceed host scratch) are queued, the host waits on the oldest
+    chunk's copy event (never the whole stream) and copies it into the caller's
+    sink while later chunks render. Up to depth + 1 results are referenced at
+    once; each plan's host charge (twice its result bytes) covers that. Planning
+    happens before any sink write: an ineligible first chunk declines, a later
+    one ends the queue early (the receipt reports how many frames completed,
+    always >= 2).
     """
     from XTA.sam_gpu_rendering import crop_inverse, SamGpuRenderingUnavailable
     if not callable(consume):
@@ -542,6 +547,11 @@ def render_compatible_chunks(renderer, view, frames, inverse, *, output_origin_y
             # Later chunks may grow per-angle/affine caches; charge that growth.
             retained += int(plan.cold_cache_growth_bound_bytes)
             position += size
+        # A plan charges 2*size*H*W host bytes for its size*H*W result, so these
+        # depth charges (or the largest one at depth 1) also cover the newest
+        # staged result, live beside depth results awaiting the sink. PyTorch's
+        # caching host allocator (power-of-two pinned blocks, kept across calls)
+        # is outside this ledger.
         host_peak = sum(plan.host_bytes for _position, _chunk, plan in plans[:max(1, int(pipeline_depth))])
         depth = max(1, int(pipeline_depth)) if host_peak <= int(renderer.scratch_bytes) else 1
         matrix = crop_inverse(inverse, output_origin_yx)

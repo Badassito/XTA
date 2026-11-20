@@ -65,21 +65,26 @@ def _remove_stage(path, parent, prefix):
 
 @lru_cache(maxsize=32)
 def _axis_footprints(source_count, target_count, area):
+    from .media import _center_aligned_nearest_source_indices
     coordinates = np.arange(target_count, dtype=np.int64)
-    first = coordinates * source_count // target_count
-    stop = ((coordinates + 1) * source_count + target_count - 1) // target_count if area else first + 1
+    if area:
+        first = coordinates * source_count // target_count
+        stop = ((coordinates + 1) * source_count + target_count - 1) // target_count
+    else:
+        first = _center_aligned_nearest_source_indices(source_count, target_count).astype(np.int64)
+        stop = first + 1
     first.flags.writeable = stop.flags.writeable = False
     return first, stop
 
 
 def source_frames(source_t, target_t, z):
     """Match categorical temporal restoration, including small-axis upsampling."""
+    from .media import _center_aligned_nearest_source_index
     if not 0 <= z < target_t:
         raise ValueError("Compact plane index is outside its grid")
     if source_t >= target_t:
         return range(z * source_t // target_t, ((z + 1) * source_t + target_t - 1) // target_t)
-    position = 0. if target_t <= 1 else z * (source_t - 1) / (target_t - 1)
-    return (int(round(position)),)
+    return (_center_aligned_nearest_source_index(z, target_t, source_t),)
 
 
 def max_crop_into(output, crop, *, source_hw):

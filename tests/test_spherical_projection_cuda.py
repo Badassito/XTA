@@ -110,7 +110,10 @@ class SphericalCudaProjectionTests(unittest.TestCase):
                     gpu_starts.append(first)
                     encoded(first,records,payload,**kwargs)
                 try:
-                    with mock.patch.object(bp,'_MAIN_PROCESS_GPU_STAGE_COORDINATOR',coordinator), \
+                    # This covers the exclusive retirement path. The shared overlap
+                    # lease (v25.0.3) would otherwise admit CUDA beside inference.
+                    with mock.patch.dict(os.environ,{'YOLO_TTA_GPU_PROJECTION_OVERLAP':'0'}), \
+                            mock.patch.object(bp,'_MAIN_PROCESS_GPU_STAGE_COORDINATOR',coordinator), \
                             mock.patch.object(sp,'_OUTPUT_BLOCK_BYTES',shape[1]*shape[2]), \
                             mock.patch.object(sp,'_CUDA_RECHECK_SLICES',1), \
                             mock.patch.object(writer,'consume',side_effect=cpu), \

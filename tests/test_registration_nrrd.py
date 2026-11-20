@@ -1,5 +1,8 @@
 """Scalar NRRD registration keeps category values, geometry and observation coverage."""
 
+import json
+import warnings
+
 import numpy as np
 import pytest
 
@@ -117,14 +120,18 @@ def test_cropped_reordered_labels_use_source_physical_geometry(tmp_path):
         "space directions": np.array([[0, 2, 0], [-3, 0, 0], [0, 0, 4.0]]),
     }
     output = tmp_path / "mapped.nrrd"
-    result = transfer_nrrd_labelmap(
-        pair,
-        original,
-        output,
-        source_reference=source_header,
-        target_reference=target_header,
-        block_rows=1,
-    )
+    with pytest.warns(UserWarning, match="target reference"):
+        result = transfer_nrrd_labelmap(
+            pair,
+            original,
+            output,
+            source_reference=source_header,
+            target_reference=target_header,
+            block_rows=1,
+        )
+    assert result["target_reference"]["axis_alignment"]["stored_axes_world"] == ["+Y", "-X", "+Z"]
+    assert result["source_reference"]["axis_alignment"]["canonical"]
+    assert result["source_reference"]["path"] is None
     actual, header = load(output)
     coverage, _ = load(result["coverage_output"])
     expected = np.zeros(shape, np.uint16)
@@ -158,6 +165,48 @@ def test_ras_label_coordinates_convert_to_lps_reference(tmp_path):
     write(original, labels, header=ras)
     result = transfer_nrrd_labelmap(pair, original, tmp_path / "mapped.nrrd", source_reference=lps)
     np.testing.assert_array_equal(load(result["output"])[0], labels)
+
+
+def test_reoriented_reference_warns_and_is_recorded(tmp_path):
+    shape = (6, 8, 8)
+    pair = packet(shape)
+    native = np.zeros(shape, np.uint8)
+    native[2, 1, 6] = 7
+    flipped = {
+        "dimension": 3,
+        "sizes": np.array(shape[::-1]),
+        "space": "left-posterior-superior",
+        "space directions": np.diag([-1.0, -1.0, 1.0]),
+        "space origin": [7.0, 7.0, 0.0],
+    }
+    original = tmp_path / "flipped_labels.nrrd"
+    write(original, native[:, ::-1, ::-1].copy(), header=flipped)
+    reference = tmp_path / "scan.nrrd"
+    write(reference, np.zeros(shape, np.uint8), header={
+        "space": "left-posterior-superior",
+        "space directions": np.eye(3),
+        "space origin": [0.0, 0.0, 0.0],
+    })
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        result = transfer_nrrd_labelmap(
+            pair, original, tmp_path / "native.nrrd", source_reference=reference
+        )
+    np.testing.assert_array_equal(load(result["output"])[0], native)
+    assert result["source_reference"]["path"] == str(reference.resolve())
+    assert result["source_reference"]["axis_alignment"]["canonical"]
+    assert result["target_reference"] is None
+    output = tmp_path / "misplaced.nrrd"
+    with pytest.warns(UserWarning, match="source reference stores its axes as -X, -Y, \\+Z"):
+        result = transfer_nrrd_labelmap(pair, original, output, source_reference=flipped)
+    assert output.exists() and output.with_name("misplaced_coverage.nrrd").exists()
+    sidecar = json.loads(output.with_suffix(".nrrd.registration.json").read_text(encoding="utf-8"))
+    assert sidecar["source_reference"]["axis_alignment"] == dict(
+        stored_axes_world=["-X", "-Y", "+Z"], oblique=False, canonical=False
+    )
+    assert sidecar["source_reference"]["header"]["space origin"] == [7.0, 7.0, 0.0]
+    # The flipped "reference" cancels the label flip, so label 7 lands mirrored.
+    assert load(output)[0][2, 6, 1] == 7
 
 
 def test_reverse_direction_and_negative_label_values(tmp_path):

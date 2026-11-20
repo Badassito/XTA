@@ -1,4 +1,3 @@
-from pathlib import Path
 import unittest
 from unittest import mock
 
@@ -211,7 +210,7 @@ class AzimuthalChannelSeamTests(unittest.TestCase):
             M_canvas_to_src=identity,
             M_src_to_canvas=identity,
         )
-        job = geometry.AugJob("a15", 15.0, Path("unused.json"), aff)
+        job = geometry.AugJob("a15", 15.0, aff)
 
         warped_inputs: list[np.ndarray] = []
 

@@ -44,10 +44,11 @@ def test_streaming_gray_matches_authoritative_output_resize(tmp_path, monkeypatc
 
 def test_production_slice_mapping_uses_source_frame_count():
     plan, windows = sampling_plan((1931,3064,3022), (388,612,604), [124,194])
-    assert plan[124][:2] == (618,619)
-    assert plan[124][2] == pytest.approx(154/387)
+    # Center-aligned: (z+0.5)*1931/388 - 0.5.
+    assert plan[124][:2] == (619,620)
+    assert plan[124][2] == pytest.approx(87/776)
     assert plan[194][:2] == (967,968)
-    assert plan[194][2] == pytest.approx(191/387)
+    assert plan[194][2] == pytest.approx(379/776)
     assert windows == {124:(617,623),194:(965,971)}
 
 

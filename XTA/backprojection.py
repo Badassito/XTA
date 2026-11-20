@@ -17,7 +17,7 @@ from concurrent.futures import (
     Future,
     ThreadPoolExecutor,
 )
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import (
     Callable,
@@ -78,7 +78,6 @@ from .workspace import (
     _env_int,
     proto_hole_treatment_mode,
     proto_hole_treatment_radius,
-    v1613_d1_backprojection_overlap_enabled,
 )
 from .inference import (
     ModelInputChannelMismatchError,
@@ -92,6 +91,7 @@ from .inference import (
     _split_segmentation_backend_outputs,
     _tiled_f16_proto_union_applicable,
     _tiled_f32_proto_union_applicable,
+    _upsample_proto_confidence,
     _warp_matrix_is_identity,
     resident_trt_cuda_graphs_enabled,
     resident_trt_native_warp_enabled,
@@ -525,31 +525,19 @@ class _MainProcessGpuResidencyLease:
             self._released = True
 
 
-_GPU_ASSET_RETIREMENT_PROOF_SEAL = object()
-
-
 @dataclass(frozen=True)
 class GpuInferenceAssetsRetired:
-    """A scheduler-authenticated release reply bound to one coordinator run."""
+    """A scheduler-issued release reply bound to one coordinator run."""
 
     device_index: int
     control_task_id: int
     coordinator_epoch: int
-    _seal: object = field(default=None, repr=False, compare=False)
 
-    @property
-    def authenticated(self) -> bool:
-        return self._seal == (_GPU_ASSET_RETIREMENT_PROOF_SEAL, self.device_index,
-                              self.control_task_id, self.coordinator_epoch)
-
-
-def _make_gpu_inference_assets_retired_proof(device_index, control_task_id, coordinator_epoch):
-    if (type(device_index) is not int or device_index < 0
-            or type(control_task_id) is not int or control_task_id >= 0
-            or type(coordinator_epoch) is not int or coordinator_epoch < 0):
-        raise RuntimeError('Invalid authenticated GPU asset-retirement identity')
-    return GpuInferenceAssetsRetired(device_index, control_task_id, coordinator_epoch,
-        (_GPU_ASSET_RETIREMENT_PROOF_SEAL, device_index, control_task_id, coordinator_epoch))
+    def __post_init__(self) -> None:
+        if (type(self.device_index) is not int or self.device_index < 0
+                or type(self.control_task_id) is not int or self.control_task_id >= 0
+                or type(self.coordinator_epoch) is not int or self.coordinator_epoch < 0):
+            raise RuntimeError('Invalid GPU asset-retirement identity')
 
 
 class _MainProcessGpuStageCoordinator:
@@ -731,7 +719,7 @@ class _MainProcessGpuStageCoordinator:
         projection so release can hand the drained worker to the next reader;
         that idle-GPU handoff must be claimed within two seconds.
         """
-        if not self._is_spherical_retirement(purpose):
+        if not self._is_source_projection_retirement(purpose):
             return
         with self._lock:
             if (not self._pending_inference_backlog
@@ -748,7 +736,7 @@ class _MainProcessGpuStageCoordinator:
             self._spherical_retirement_requests[str(purpose)] = (
                 now + 30.0, tuple(devices), previous[2] if previous is not None else now,
             )
-            if any(self._is_spherical_retirement(owner) for owner in self._stage_leases.values()):
+            if any(self._is_source_projection_retirement(owner) for owner in self._stage_leases.values()):
                 return
             if prior is None:
                 # The oldest demand with an eligible worker chooses the next
@@ -810,9 +798,9 @@ class _MainProcessGpuStageCoordinator:
     def set_inference_asset_retirement_pending(self, active: bool) -> None:
         """Fence new stages on selected GPUs until their terminal release ACKs.
 
-        This is independent of inference-priority/overlap policy. Existing stage
-        owners may finish; the flag prevents a new residency decision while the
-        workers are still releasing their allocations.
+        This is independent of inference priority. Existing stage owners may
+        finish; the flag prevents a new residency decision while the workers are
+        still releasing their allocations.
         """
         callback: Optional[Callable[[], None]] = None
         with self._lock:
@@ -830,39 +818,34 @@ class _MainProcessGpuStageCoordinator:
             return not (int(device_index) in self._retired_inference_devices
                         and str(purpose).strip().lower().startswith(('tta persistent sam ', 'sam ')))
         purpose_l = str(purpose).strip().lower()
-        # Completed spherical and radial parents hold native-memory credits until
-        # source projection finishes. When no central inference is admissible,
-        # let that retirement use an idle GPU even in a mixed D1 run. The acquire
-        # methods still fence queued/running inference and other device owners.
-        if self._is_spherical_retirement(purpose_l):
+        # Completed source-projection parents (Spherical, Radial, native pull)
+        # hold native-memory credits until source projection finishes. When no
+        # central inference is admissible, let that retirement use an idle GPU
+        # even in a mixed D1 run. The acquire methods still fence queued/running
+        # inference and other device owners.
+        if self._is_source_projection_retirement(purpose_l):
             if not self._pending_inference_backlog or int(device_index) not in self._worker_devices:
                 return False
             reserved = self._reserved_spherical_device_locked()
             return bool(reserved != int(device_index)
                         or self._next_spherical_request_locked(int(device_index)) != str(purpose)
-                        or any(self._is_spherical_retirement(owner) for owner in self._stage_leases.values()))
-        # In the non-D1 fast-bundle fallback, a completed view may borrow an idle
-        # worker GPU for backprojection while other devices still infer. Terminal
-        # asset retirement above takes precedence over that overlap permission.
-        if (
-            v1613_d1_backprojection_overlap_enabled()
-            and 'backprojection' in purpose_l
-            and not bool(self._pending_inference_backlog)
-        ):
-            return False
+                        or any(self._is_source_projection_retirement(owner) for owner in self._stage_leases.values()))
         return bool(
             self._inference_priority_active
             and int(device_index) in self._worker_devices
         )
 
     @staticmethod
-    def _is_spherical_retirement(purpose: str) -> bool:
-        # This queue originally served only Spherical. Keep its existing knobs
-        # and telemetry names, but apply the same exclusive, bounded handoff to
-        # Radial parents, which retain the same scheduler memory credits.
+    def _is_source_projection_retirement(purpose: str) -> bool:
+        # Purposes that may take the bounded source-projection retirement turn
+        # (exclusive FIFO handoff, the shared overlap slice, and lending from a
+        # resident owner): Spherical and Radial parents and native destination
+        # pull (Tilted, upright Azimuthal and Tilted Azimuthal). They hold
+        # scheduler memory credits until projection finishes. The queue's knobs,
+        # private state, helper and API method names, and snapshot keys keep
+        # their historical 'spherical_retirement' names.
         return str(purpose).strip().lower().startswith((
             'spherical source projection ', 'radial source projection ',
-            'tilted azimuthal source projection ',
             'native source projection ',
         ))
 
@@ -947,8 +930,8 @@ class _MainProcessGpuStageCoordinator:
             return self._epoch
 
     def mark_inference_assets_retired(self, proof: GpuInferenceAssetsRetired) -> None:
-        if type(proof) is not GpuInferenceAssetsRetired or not proof.authenticated:
-            raise RuntimeError('GPU asset retirement requires an authenticated scheduler proof')
+        if type(proof) is not GpuInferenceAssetsRetired:
+            raise RuntimeError('GPU asset retirement requires a scheduler GpuInferenceAssetsRetired proof')
         with self._lock:
             device = proof.device_index
             if proof.coordinator_epoch != self._epoch or device not in self._worker_devices:
@@ -987,7 +970,7 @@ class _MainProcessGpuStageCoordinator:
             if resident_token is not None:
                 if resident['token'] is not resident_token:
                     return False
-            elif not (resident['lendable'] and self._is_spherical_retirement(purpose)):
+            elif not (resident['lendable'] and self._is_source_projection_retirement(purpose)):
                 return False
         if (device in self._stage_leases or device in self._overlap_leases
                 or (device in self._provisional_stages
@@ -1025,7 +1008,7 @@ class _MainProcessGpuStageCoordinator:
                 try:
                     torch_mod.cuda.mem_get_info(torch_mod.device(f'cuda:{device}'))
                 except Exception:
-                    if self._is_spherical_retirement(purpose):
+                    if self._is_source_projection_retirement(purpose):
                         with self._lock:
                             if self._epoch == epoch:
                                 self._clear_failed_spherical_probe_locked()
@@ -1042,7 +1025,7 @@ class _MainProcessGpuStageCoordinator:
                     self._stage_claims[device] = (aux_pool, claim)
                     claim = None  # ownership passes to release_stage
                 self._provisional_stages.pop(device, None)
-                if self._is_spherical_retirement(purpose):
+                if self._is_source_projection_retirement(purpose):
                     self._record_spherical_acquisition_locked(device, purpose)
             try:
                 return _MainProcessGpuStageLease(self, device, str(purpose), token)
@@ -1141,7 +1124,7 @@ class _MainProcessGpuStageCoordinator:
         """
         purpose = str(purpose)
         budget = int(budget_bytes)
-        if budget <= 0 or not self._is_spherical_retirement(purpose):
+        if budget <= 0 or not self._is_source_projection_retirement(purpose):
             return None
         with self._lock:
             if (purpose in self._overlap_declined or self._inference_asset_retirement_pending
@@ -1296,7 +1279,7 @@ class _MainProcessGpuStageCoordinator:
             lease = self._claim_stage_device(idx, purpose, epoch)
             if lease is not None:
                 return lease
-        if not estimates and self._is_spherical_retirement(purpose):
+        if not estimates and self._is_source_projection_retirement(purpose):
             with self._lock:
                 if self._epoch == epoch:
                     self._clear_failed_spherical_probe_locked()
@@ -1312,14 +1295,14 @@ class _MainProcessGpuStageCoordinator:
                 self._stage_tokens.pop(int(device_index), None)
                 claim = self._stage_claims.pop(int(device_index), None)
                 reserved = self._reserved_spherical_device_locked()
-                if (self._is_spherical_retirement(current)
+                if (self._is_source_projection_retirement(current)
                         and reserved is None
                         and int(device_index) not in self._overlap_leases
                         and self._pending_inference_backlog
                         and not self._inference_asset_retirement_pending
                         and time.monotonic() >= self._spherical_retirement_retry_after
                         and _env_flag('YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT', True)
-                        and not any(self._is_spherical_retirement(owner) for owner in self._stage_leases.values())
+                        and not any(self._is_source_projection_retirement(owner) for owner in self._stage_leases.values())
                         and self._spherical_retirement_burst_counts.get(int(device_index), 0) < 2
                         and self._next_spherical_request_locked(int(device_index)) is not None):
                     # Keep one already-drained GPU for one additional live FIFO
@@ -2055,6 +2038,12 @@ class _ResidentTensorRTRingExecutor:
             torch.empty((ph, pw), dtype=torch.float32, device=device)
             if self.proto_hole_treatment_active else None
         )
+        # Closing dilates into its own plane so max_logit stays raw for the
+        # quantizer's raw-foreground confidence fallback.
+        slot.proto_dilated = (
+            torch.empty((ph, pw), dtype=torch.float32, device=device)
+            if self.proto_hole_treatment_active else None
+        )
         slot.conf_proto = (
             torch.empty((ph, pw), dtype=torch.float32, device=device) if self.compute_confidence else None
         )
@@ -2074,6 +2063,8 @@ class _ResidentTensorRTRingExecutor:
             refs['compact_confs'] = cp.asarray(slot.compact_confs)
         if slot.proto_tmp is not None:
             refs['proto_tmp'] = cp.asarray(slot.proto_tmp)
+        if slot.proto_dilated is not None:
+            refs['proto_dilated'] = cp.asarray(slot.proto_dilated)
         if slot.conf_proto is not None:
             refs['conf_proto'] = cp.asarray(slot.conf_proto)
         if slot.native_conf is not None:
@@ -2163,7 +2154,7 @@ class _ResidentTensorRTRingExecutor:
             # and TensorRT binding owners have separate dictionaries/attributes.
             slot._cupy_refs.clear()
             for name in ('compact_indices', 'compact_count', 'compact_coeff', 'compact_proto_boxes',
-                         'compact_confs', 'max_logit', 'proto_tmp', 'conf_proto',
+                         'compact_confs', 'max_logit', 'proto_tmp', 'proto_dilated', 'conf_proto',
                          'native_union', 'native_conf', 'native_bbox', 'native_mask_grid'):
                 setattr(slot, name, None)
             self._allocate_post_buffers(slot)
@@ -2364,16 +2355,18 @@ class _ResidentTensorRTRingExecutor:
             self.kernels.proto_dilate_signed(
                 ((pixels + 255) // 256,), (256,),
                 (refs['proto_tmp'], np.int32(ph), np.int32(pw),
-                 np.int32(self.proto_hole_radius), refs['max_logit']),
+                 np.int32(self.proto_hole_radius), refs['proto_dilated']),
                 stream=external,
             )
             self.kernels.proto_erode_signed(
                 ((pixels + 255) // 256,), (256,),
-                (refs['max_logit'], np.int32(ph), np.int32(pw),
+                (refs['proto_dilated'], np.int32(ph), np.int32(pw),
                  np.int32(self.proto_hole_radius), refs['proto_tmp']),
                 stream=external,
             )
         post_logit_arg = refs['proto_tmp'] if self.proto_hole_treatment_active else refs['max_logit']
+        # The raw plane limits the confidence fallback to pre-closing foreground.
+        raw_logit_arg = refs['max_logit'] if self.proto_hole_treatment_active else np.uintp(0)
         if slot.unit_descriptor is None:
             raise RuntimeError(f'resident ring slot {slot.slot_id} has no unit descriptor')
         quantize_block = (32, 8)
@@ -2382,12 +2375,13 @@ class _ResidentTensorRTRingExecutor:
             (int(self.native_h) + quantize_block[1] - 1) // quantize_block[1],
         )
         if slot.identity_native_warp:
-            # Preserve the original azimuthal/identity specialization byte-for-byte: proto
-            # bilinear upsample to out_size, threshold, and nearest confidence sampling.
+            # Preserve the original azimuthal/identity specialization: proto bilinear
+            # upsample to out_size, threshold, and nearest confidence sampling with the
+            # bilinear-tap fallback on raw foreground whose nearest score is zero.
             self.kernels.upsample_quantize(
                 quantize_grid, quantize_block,
                 (
-                    post_logit_arg, conf_proto_arg, np.int32(ph), np.int32(pw),
+                    post_logit_arg, conf_proto_arg, raw_logit_arg, np.int32(ph), np.int32(pw),
                     np.int32(self.out_size), np.int32(self.out_size), refs['native_union'],
                     refs.get('native_conf', np.uintp(0)), bbox_arg,
                 ),
@@ -2397,7 +2391,7 @@ class _ResidentTensorRTRingExecutor:
             self.kernels.upsample_quantize_affine(
                 quantize_grid, quantize_block,
                 (
-                    post_logit_arg, conf_proto_arg, np.int32(ph), np.int32(pw),
+                    post_logit_arg, conf_proto_arg, raw_logit_arg, np.int32(ph), np.int32(pw),
                     np.int32(self.out_size), np.int32(self.out_size),
                     np.int32(self.native_h), np.int32(self.native_w),
                     *slot.native_to_out,
@@ -2427,10 +2421,9 @@ class _ResidentTensorRTRingExecutor:
         ).reshape(int(self.out_size), int(self.out_size)) > 0.0).to(torch.float32)
         planes = [network_union]
         if self.compute_confidence:
-            planes.append(F.interpolate(
-                slot.conf_proto.reshape(1, 1, ph, pw),
-                size=(int(self.out_size), int(self.out_size)), mode='nearest',
-            ).reshape(int(self.out_size), int(self.out_size)))
+            # Native-mask runs never close, so network_union is the raw union.
+            planes.append(_upsample_proto_confidence(
+                slot.conf_proto, network_union, (int(self.out_size), int(self.out_size))))
         if slot.native_mask_grid is not None:
             warped = F.grid_sample(
                 torch.stack(planes, dim=0).unsqueeze(0), slot.native_mask_grid,
@@ -2444,7 +2437,7 @@ class _ResidentTensorRTRingExecutor:
         self.kernels.upsample_quantize(
             ((int(self.native_w) + 31) // 32, (int(self.native_h) + 7) // 8), (32, 8),
             (native_refs[0], native_refs[1] if self.compute_confidence else np.uintp(0),
-             np.int32(self.native_h), np.int32(self.native_w),
+             np.uintp(0), np.int32(self.native_h), np.int32(self.native_w),
              np.int32(self.native_h), np.int32(self.native_w), refs['native_union'],
              refs.get('native_conf', np.uintp(0)), bbox_arg), stream=external,
         )
@@ -2820,6 +2813,7 @@ class _ResidentTensorRTRingExecutor:
             slot.native_mask_grid = None
             slot.max_logit = None
             slot.proto_tmp = None
+            slot.proto_dilated = None
             slot.conf_proto = None
             slot.native_union = None
             slot.native_conf = None
@@ -4160,6 +4154,8 @@ def _azimuthal_backproject_gpu_streaming(
     known_slice_bboxes: Optional[np.ndarray] = None,
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
     sink_only: bool = False,
+    *,
+    identity_rows: bool = False,
 ) -> bool:
     """Run bounded Azimuthal backprojection under an inference-exclusive GPU lease."""
     try:
@@ -4193,6 +4189,7 @@ def _azimuthal_backproject_gpu_streaming(
             known_slice_bboxes=known_slice_bboxes,
             projection_block_callback=projection_block_callback,
             sink_only=bool(sink_only),
+            identity_rows=bool(identity_rows),
             torch=torch,
             dev=lease.torch_device(torch),
         )
@@ -4216,6 +4213,7 @@ def _azimuthal_backproject_gpu_streaming_on_device(
     *,
     torch: object,
     dev: object,
+    identity_rows: bool = False,
 ) -> bool:
     """Backproject a Azimuthal volume through a bounded streaming GPU working set."""
     n_az, work_t, u_len = (int(x) for x in azimuthal_mask_mm.shape)
@@ -4317,7 +4315,9 @@ def _azimuthal_backproject_gpu_streaming_on_device(
                 gathered = rows_dev.reshape(v_count, -1)[:, flat_src_t]
                 out_dev.zero_()
                 t_count = int(t1 - t0)
-                if int(work_t) == int(t_dim):
+                # The 1:1 shortcut is valid only when v_range_for_t(t) == (t, t+1);
+                # reduced grids never qualify even when their row count equals t_dim.
+                if identity_rows:
                     out_dev[:t_count].index_copy_(1, valid_pos_t, gathered[:t_count])
                 else:
                     pair_out: List[int] = []
@@ -5276,8 +5276,10 @@ def _backproject_tilted_azimuthal_volume_to_volume(
     """Compose angular gather and inverse shear into final native cells.
 
     The former rounded forward CUDA scatter is unavailable. The corrected
-    CPU operator never allocates a full tilted base stack and publishes bounded
-    native slices identically in dense and sink-only modes.
+    native destination-pull operator (CPU workers, with optional
+    NativePullCudaSession stage admission when GPU backprojection is enabled)
+    never allocates a full tilted base stack and publishes bounded native
+    slices identically in dense and sink-only modes.
     """
     if not is_tilted_azimuthal_view(azimuthal_view):
         raise ValueError(f'{desc}: expected a tilted Azimuthal view')
@@ -5466,6 +5468,7 @@ def backproject_azimuthal_volume_to_volume(
                     known_slice_bboxes=azimuthal_slice_bboxes,
                     projection_block_callback=projection_block_callback,
                     sink_only=bool(sink_only),
+                    identity_rows=bool(same_t_axis),
                 )
         except Exception as exc:
             # Some GPU blocks may already have been indexed. The CPU retry rewrites all

@@ -92,7 +92,7 @@ def _run_real_pipeline(output_path: Path) -> None:
                         dense_tiling_active=False, min_conf=0, min_radius=0,
                         interpolate=6, interpolation_walk_back=1, interpolation_candidates=1,
                         interpolate_passes=2, interpolate_min_radius=0, interpolation_search_angle=15,
-                        keep_temp=False, slice_workers=1, interpolation_task_workers=1,
+                        slice_workers=1, interpolation_task_workers=1,
                         nrrd_layers_enabled=True, precleaned_slice_cleanup=True,
                         hole_fill_done_on_device=True, slice_meta=slice_meta,
                         preinterpolation_layer_already_published=True)
@@ -158,9 +158,7 @@ class SparsePipelineIntegrationTests(unittest.TestCase):
             environment.update({
                 'CUDA_VISIBLE_DEVICES': '',
                 'YOLO_TTA_GPU_INTERPOLATION': '0',
-                'YOLO_TTA_GPU_INTERPOLATION_RADIUS': '0',
                 'YOLO_TTA_GPU_SLICE_LABELING': '0',
-                'YOLO_TTA_GPU_FINAL_FUSION': '0',
                 'YOLO_TTA_INTERPOLATION_PROCESS_BACKEND': '0',
                 'YOLO_TTA_DELAY_NATIVE_EXPANSION': '1',
                 'YOLO_TTA_TELEMETRY': '0',

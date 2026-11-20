@@ -117,3 +117,13 @@ def test_collapsed_foreground_depths_remain_an_error():
         pta.reassert_foreground_slice_anchors(
             processed, _anchors(source), source_shape=source.shape, patch_radius=2,
         )
+
+
+@pytest.mark.parametrize("source_t,processed_t", [(1930, 2919), (500, 2850), (1500, 2919), (7, 7)])
+def test_transverse_label_window_covers_the_center_aligned_cube_index(source_t, processed_t):
+    from XTA.media import _center_aligned_nearest_source_indices
+    prep = SimpleNamespace(source_shape=(source_t, 1, 1), processing_shape=(processed_t, 1, 1),
+                           smoothing_stats=[])
+    dense = _center_aligned_nearest_source_indices(source_t, processed_t)
+    for frame, native in enumerate(dense.tolist()):
+        assert native in pta._source_frames_for_processed_transverse(prep, frame), frame

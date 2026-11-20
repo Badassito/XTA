@@ -11,12 +11,18 @@ import re
 import socket
 import threading
 import time
-from typing import Iterator
+from typing import Iterator, Mapping
 
 from .file_hashing import sha256_file
 
 
 _SOURCE_FINGERPRINT_SCOPE = "xta.package_python_sources/1"
+
+
+def package_source_digest(files: Mapping[str, str]) -> str:
+    """Aggregate digest of package-relative Python source paths and their hashes."""
+    payload = {"scope": _SOURCE_FINGERPRINT_SCOPE, "files": dict(files)}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
 def lta_source_fingerprint(*, package_root: str | Path | None = None) -> dict[str, object]:
@@ -32,9 +38,7 @@ def lta_source_fingerprint(*, package_root: str | Path | None = None) -> dict[st
     root = Path(package_root).resolve() if package_root is not None else Path(__file__).resolve().parent
     files = {path.relative_to(root).as_posix(): sha256_file(path)
              for path in sorted(root.rglob('*.py')) if path.is_file()}
-    payload = {"scope": _SOURCE_FINGERPRINT_SCOPE, "files": files}
-    encoded = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()
-    return {"sha256": hashlib.sha256(encoded).hexdigest(), **payload}
+    return {"sha256": package_source_digest(files), "scope": _SOURCE_FINGERPRINT_SCOPE, "files": files}
 
 
 class LtaExecutionTrace:
@@ -122,4 +126,4 @@ class LtaExecutionTrace:
                 self._handle = None
 
 
-__all__ = ('LtaExecutionTrace', 'lta_source_fingerprint')
+__all__ = ('LtaExecutionTrace', 'lta_source_fingerprint', 'package_source_digest')

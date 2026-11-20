@@ -7,7 +7,6 @@ from dataclasses import replace
 import importlib.util
 import math
 import os
-from pathlib import Path
 import threading
 from types import SimpleNamespace
 import unittest
@@ -123,7 +122,7 @@ class RadialGpuRoutingContracts(unittest.TestCase):
         self.assertEqual(cuda_backend._fused_preflight_family(view), '')
         self.assertFalse(engine._try_fused_render_into_ring_slot(None, view, None, 0, 8))
         with self.assertRaisesRegex(ValueError, 'Radial shells'):
-            cuda_d1._d1_view_family_ids(view)
+            cuda_d1._d1_require_cartesian_native_coverage(view)
         with self.assertRaisesRegex(ValueError, 'Radial shell tasks'):
             workers.run_prediction_volume_in_worker(None, None, {
                 'view': view, 'job': None, 'kind': 'fullframe', 'result_mode': 'd1_owner',
@@ -350,7 +349,7 @@ class RadialCudaSmokeTests(unittest.TestCase):
                         np.testing.assert_array_equal(actual.cpu().numpy().astype(np.uint8), expected)
             view = selected[0]
             affine = geometry.build_affine(view.name, 8, 8, 8, 0.0, 'pad')
-            job = geometry.AugJob('a0', 0.0, Path('unused.json'), affine)
+            job = geometry.AugJob('a0', 0.0, affine)
             channel_format = resolve_channel_format('C3S1')
             batch, event = engine.render_fullframe_batch(view, job, [0, view.num_slices - 1],
                 out_size=8, fp16=False, channel_format=channel_format)

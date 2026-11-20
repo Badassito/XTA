@@ -3,7 +3,8 @@
 The caller must own Scratch/Temp/GPU_LOCK and heatsoak before benchmarking.
 Production dispatch is unchanged. Synthetic cases use an injective host-created
 key-to-slot mapping, so high 64-bit keys can be checked with bounded allocations.
-Production geometry cases compile the actual source with only the helper changed.
+Production geometry cases compile the actual source with only the helper changed
+and launch its Cartesian coverage kernel against the CPU coverage reference.
 """
 from __future__ import annotations
 
@@ -15,11 +16,18 @@ import os
 from pathlib import Path
 import re
 import statistics
+import sys
 import time
 
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from XTA.d1_orthogonal_coverage import (
+    build_orthogonal_coverage_plan, coverage_launch_groups, orthogonal_canonical_shape,
+)
+from XTA.geometry import ViewInfo
+from tests.reference_backends.d1_orthogonal_coverage import execute_orthogonal_coverage_reference
 
 
 def sources():
@@ -113,7 +121,7 @@ def compile_variants(cp, source_map, folder, cache):
             label = variant + '-' + kind
             (folder / (label + '.cu')).write_text(source, encoding='utf-8')
             before = set(cache.rglob('*.cubin'))
-            name = 'synthetic_d1' if kind == 'synthetic' else 'd1_backproject_bboxes_to_bits'
+            name = 'synthetic_d1' if kind == 'synthetic' else 'd1_orthogonal_coverage_to_bits'
             module = cp.RawModule(code=source, options=('--std=c++14',), name_expressions=(name,))
             fn = module.get_function(name)
             kernels[variant][kind] = fn
@@ -176,51 +184,44 @@ def synthetic_case(cp, stream, kernels, rng, name, keys, enabled, args, timing):
 def production_cases(cp, stream, kernels, rng, args):
     results = []
     depth, height, width = 8, args.geometry_size, args.geometry_size
-    angles = np.arange(depth, dtype=np.float32) * np.float32(np.pi / depth)
-    angle_cos, angle_sin = cp.asarray(np.cos(angles)), cp.asarray(np.sin(angles))
+    boxes = np.asarray([[i, 0, 0, height, width] for i in range(depth)], np.int32)
     for density in (0.02, 1.0):
         host_mask = (rng.random((depth, height, width)) < density).astype(np.uint8)
         mask = cp.asarray(host_mask)
-        boxes = cp.asarray(np.asarray([[i, 0, 0, height, width] for i in range(depth)], np.int32))
-        for family, base, tilt in ((0, 0, 0.0), (0, 1, 0.0), (0, 2, 0.0),
-                                   (1, 0, 0.577350269), (2, 0, 0.0), (2, 0, -0.577350269)):
-            # Cartesian views use consistent native and output orientation.
-            shape = ((depth, height, width) if base == 0 else
-                     ((height, depth, width) if base == 1 else (height, width, depth)))
-            # Azimuthal has azimuth slices and stack rows; its stack axis is H.
-            if family == 2:
-                shape = (height, height, width)
+        for base in ('transverse', 'sagittal', 'coronal'):
+            view = ViewInfo(name=base, physical_view_name=base, family='orthogonal',
+                            num_slices=depth, src_h=height, src_w=width, pad_mode='clamp')
+            # Identity Cartesian geometry: each output cell covers one mask pixel.
+            shape, _axes = orthogonal_canonical_shape(view, host_mask.shape)
+            plan = build_orthogonal_coverage_plan(view, host_mask.shape, shape)
+            ranges = tuple(cp.asarray(value) for pair in plan.source_ranges_tyx for value in pair)
+            axes = tuple(np.int32(plan.input_axes_tyx.index(axis)) for axis in range(3))
+            groups = tuple((int(cells), cp.asarray(specs), len(specs))
+                           for cells, specs in coverage_launch_groups(plan, boxes, 0))
             count = int(np.prod(shape))
             outputs = {variant: cp.zeros((count + 31) // 32, cp.uint32) for variant in kernels}
             runners = {}
             for variant in kernels:
                 fn, output = kernels[variant]['production'], outputs[variant]
-                call_args = (mask, np.int32(height), np.int32(width), np.int32(0),
-                             boxes, np.int32(depth), np.int32(depth), np.int32(height), np.int32(width),
-                             *(np.int32(x) for x in shape), *(np.int32(x) for x in shape),
-                             np.int32(family), np.int32(base), np.int32(0), np.float32(tilt),
-                             np.int32(shape[0]), np.float32((width-1)*0.5),
-                             np.float32((height-1)*0.5), np.float32((width-1)*0.5),
-                             angle_cos, angle_sin, output)
-                runners[variant] = lambda fn=fn, call_args=call_args: fn(
-                    ((height * width + 255) // 256, depth), (256,), call_args, stream=stream)
-                runners[variant]()
+
+                def runner(fn=fn, output=output):
+                    for cells, specs, spec_count in groups:
+                        fn(((cells + 255) // 256, spec_count), (256,),
+                           (mask, np.int32(height), np.int32(width), specs, np.int32(spec_count),
+                            *(np.int32(x) for x in shape), *axes, *ranges, output), stream=stream)
+                runners[variant] = runner
+                runner()
             stream.synchronize()
             baseline, redux = (cp.asnumpy(outputs[name]) for name in ('baseline', 'redux'))
             np.testing.assert_array_equal(redux, baseline)
-            cpu_exact = None
-            if family == 0:
-                order = (0, 1, 2) if base == 0 else ((1, 0, 2) if base == 1 else (1, 2, 0))
-                voxels = host_mask.transpose(order).reshape(-1)
-                indices = np.flatnonzero(voxels).astype(np.uint64)
-                expected = cpu_or((indices >> 5).astype(np.uint32),
-                                  np.left_shift(np.uint32(1), (indices & 31).astype(np.uint32)),
-                                  np.ones(len(indices), np.uint8), len(baseline))
-                np.testing.assert_array_equal(baseline, expected)
-                cpu_exact = True
-            row = {'family': family, 'base': base, 'tilt': tilt, 'density': density,
-                   'mask_shape': list(host_mask.shape), 'output_shape': list(shape),
-                   'exact_baseline': True, 'exact_cpu_or': cpu_exact,
+            actual = np.unpackbits(baseline.view(np.uint8), bitorder='little',
+                                   count=count).reshape(shape)
+            expected = execute_orthogonal_coverage_reference(
+                host_mask, view, shape, memory_mib=count / 1024**2 + 1)
+            np.testing.assert_array_equal(actual, expected)
+            row = {'base': base, 'density': density, 'mask_shape': list(host_mask.shape),
+                   'output_shape': list(shape), 'launch_groups': len(groups),
+                   'exact_baseline': True, 'exact_cpu_reference': True,
                    'nonzero_words': int(np.count_nonzero(baseline))}
             row.update(paired_timing(cp, stream, runners, args.rounds, args.iterations, args.graph_timing))
             results.append(row)

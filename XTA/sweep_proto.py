@@ -32,8 +32,9 @@ def consume_tiled_siblings(sink, result_index, head, proto, image, *, allow_tile
 
     The native union starts at -6, crops logits with the production boxes, and
     reduces maxima *before* bilinear expansion. Adding disjoint bins from high
-    to low reproduces each independent union. Observed confidence follows its
-    own maximum/nearest sampling rule. Only two prototype grids and the current
+    to low reproduces each independent union. Observed confidence takes the
+    proto maximum, sampled nearest with the bilinear-tap fallback on foreground
+    (_upsample_proto_confidence). Only two prototype grids and the current
     decoded mask/score pair are accumulated, independent of the cutoff count.
     """
     from . import inference

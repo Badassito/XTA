@@ -13,8 +13,8 @@ from pathlib import Path
 import pytest
 
 from XTA import workspace
-from tests.test_gil_ram_probe import (dict_reader, fresh_gil_read_state, old_available_anon_work_bytes,  # noqa: F401
-                                      random_tree)
+from tests.test_gil_ram_probe import (assert_membership_resolved_for_this_tree, dict_reader,  # noqa: F401
+                                      fresh_gil_read_state, old_available_anon_work_bytes, random_tree)
 
 CLASSES = {'/proc/meminfo': 'meminfo',
            '/sys/fs/cgroup/memory.max': 'cgroup_counter',
@@ -182,8 +182,8 @@ def test_full_probe_values_unchanged_under_random_demotions(monkeypatch, fresh_s
     rng = random.Random(77)
     clock = [0.0]
     monkeypatch.setattr(workspace, '_perf_counter', lambda: clock[0])
-    files = {}
-    base_held, base_released = dict_reader(files), dict_reader(files)
+    files, reads = {}, []
+    base_held, base_released = dict_reader(files, reads), dict_reader(files, reads)
 
     def held(path):
         if rng.random() < .02:
@@ -196,8 +196,12 @@ def test_full_probe_values_unchanged_under_random_demotions(monkeypatch, fresh_s
         files.clear()
         files.update(random_tree(rng))
         files['/proc/self/mountinfo'] = '29 1 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n'
+        workspace._reset_cgroup_layout_cache()
+        reads.clear()
         new = (workspace.available_anon_work_bytes(), workspace._cgroup_memory_budget())
+        assert_membership_resolved_for_this_tree(files, reads)
         with monkeypatch.context() as patched:
             patched.setattr(Path, 'read_text', old)
-            assert new == (old_available_anon_work_bytes(), workspace._cgroup_memory_budget())
+            workspace._reset_cgroup_layout_cache()  # the reference resolves membership itself
+            assert new ==(old_available_anon_work_bytes(), workspace._cgroup_memory_budget())
     assert workspace.ram_probe_gil_read_stats()['ram_probe_gil_held_demoted']

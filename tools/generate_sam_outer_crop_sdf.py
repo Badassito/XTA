@@ -109,7 +109,7 @@ def main():
     os.environ['CUDA_VISIBLE_DEVICES']='-1'
     for key in ('YOLO_TTA_GPU_INTERPOLATION','YOLO_TTA_GPU_SLICE_LABELING',
                 'YOLO_TTA_GPU_SLICE_LABELING_PAIRS','YOLO_TTA_GPU_SLICE_LABELING_IN_CHILDREN',
-                'YOLO_TTA_GPU_INTERPOLATION_RADIUS','YOLO_TTA_GPU_INTERPOLATION_REQUIRED'):
+                'YOLO_TTA_GPU_INTERPOLATION_REQUIRED'):
         os.environ[key]='0'
     os.environ['YOLO_TTA_TELEMETRY_SYSTEM_SAMPLER']='0'
     sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
@@ -147,7 +147,7 @@ def main():
         with mock.patch.object(interpolation,'create_cuda_interpolation_renderer',return_value=(None,'forced CPU-only reference')):
             stats=interpolation.interpolate_view_volume_pass_inplace(prediction,output/'work','sdf_reference',
                 settings['max_slice_distance'],settings['search_angle_deg'],settings['interpolation_walk_back'],
-                settings['interpolation_candidates'],settings['interpolate_min_radius'],keep_temp=False,
+                settings['interpolation_candidates'],settings['interpolate_min_radius'],
                 prefer_memory=True,reserve_bytes=0,workers=args.workers)
         elapsed=time.perf_counter()-started
         prediction.flush()

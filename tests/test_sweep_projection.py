@@ -86,18 +86,19 @@ def independent_upright_restore(source,shape):
     iz,iy,ix=source.shape;oz,oy,ox=shape
     result=np.zeros(shape,bool)
     area=iy>=oy and ix>=ox
+    # Growing axes take the source cell containing the output cell center.
     for z,y,x in np.ndindex(shape):
         zs=(range(z*iz//oz,min(iz,max(z*iz//oz+1,((z+1)*iz+oz-1)//oz))) if iz>=oz
-            else (min(iz-1,max(0,round(0. if iz<=1 or oz<=1 else z*(iz-1)/(oz-1)))),))
-        ys=(range(y*iy//oy,((y+1)*iy+oy-1)//oy) if area else (y*iy//oy,))
-        xs=(range(x*ix//ox,((x+1)*ix+ox-1)//ox) if area else (x*ix//ox,))
+            else (((2*z+1)*iz)//(2*oz),))
+        ys=(range(y*iy//oy,((y+1)*iy+oy-1)//oy) if area else (((2*y+1)*iy)//(2*oy),))
+        xs=(range(x*ix//ox,((x+1)*ix+ox-1)//ox) if area else (((2*x+1)*ix)//(2*ox),))
         result[z,y,x]=any(source[a,b,c] for a in zs for b in ys for c in xs)
     return result
 
 
 @pytest.mark.parametrize("base",("transverse","sagittal","coronal"))
-@pytest.mark.parametrize("shape",((7,8,9),(2,2,2),(7,2,9),(1,1,1)))
-def test_upright_reduced_axes_and_endpoint_z_rounding_have_independent_oracle(tmp_path,base,shape):
+@pytest.mark.parametrize("shape",((7,8,9),(2,2,2),(7,2,9),(1,1,1),(10,6,8)))
+def test_upright_reduced_axes_and_center_z_rounding_have_independent_oracle(tmp_path,base,shape):
     view=geometry.get_view_infos(5,7,9,cartesian_views=(base,))[0]
     source=np.random.default_rng(72).integers(0,7,(view.num_slices,3,3),dtype=np.uint8)
     orthogonal=source.transpose({"transverse":(0,1,2),"sagittal":(1,0,2),"coronal":(1,2,0)}[base])

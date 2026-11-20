@@ -96,7 +96,6 @@ class MultipleTileConfigurationTests(unittest.TestCase):
                     interpolate_passes=1,
                     interpolate_min_radius=0.0,
                     interpolation_search_angle=15.0,
-                    keep_temp=False,
                     slice_workers=1,
                     interpolation_task_workers=1,
                     nrrd_layers_enabled=True,

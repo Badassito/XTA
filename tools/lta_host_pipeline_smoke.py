@@ -214,7 +214,7 @@ def main():
     view=SimpleNamespace(volume_id='full-depth-system-fixture',physical_view_id='transverse',
                          runtime_view_id='transverse__tta_a0',frame_count=args.volume_depth,
                          frame_height=height,frame_width=width,tile_grids=(grid,))
-    report={'status':'running','fixture':'30real source frames, synthetic zero padding and mocked SAM; system validation only',
+    report={'status':'running','fixture':'30 real source frames, synthetic zero padding and mocked SAM; system validation only',
             'source_shape':shape,'active_frame_range':[args.active_start,stop],
             'source_logical_bytes':stat.st_size,'source_allocated_bytes':allocated_bytes(cache_path)}
     try:

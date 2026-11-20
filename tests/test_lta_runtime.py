@@ -26,7 +26,7 @@ from XTA.lta_runtime import (
 
 
 class LtaRuntimePlanningTests(unittest.TestCase):
-    def _config(self, root: Path, checkpoint: Path, *, execution: str = "video"):
+    def _config(self, root: Path, checkpoint: Path):
         return parse_lta_args(
             [
                 "--input",
@@ -41,8 +41,6 @@ class LtaRuntimePlanningTests(unittest.TestCase):
                 "transverse",
                 "--angle",
                 "0,120",
-                "--sam_execution",
-                execution,
             ]
         )
 

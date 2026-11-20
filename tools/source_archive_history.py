@@ -6,11 +6,9 @@ import os
 from pathlib import Path
 
 
+# Archive names keep their original pre-2026-10-05 labels: original v25.0.1
+# is the renamed release v24.0.1.
 _VERSIONS = {
-    'guarded_rescue': '25.0.0',
-    'job150615': '25.0.0',
-    'job150615_headroom': '25.0.0',
-    'projection_release': '25.0.0',
     'throughput': '25.0.1',
 }
 

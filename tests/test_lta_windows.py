@@ -7,34 +7,12 @@ from XTA.lta_windows import (
     AnchorDomain,
     WindowPlan,
     owned_frame_range,
-    plan_anchor_domains,
     plan_domain_windows,
-    plan_directional_windows,
 )
+from tests.reference_backends.lta_generation import plan_directional_windows
 
 
 class LtaWindowPlanningTests(unittest.TestCase):
-    def test_nearest_anchor_domains_cover_once_at_deterministic_midpoints(self) -> None:
-        domains = plan_anchor_domains(
-            (20, 10, 20),
-            frame_start=0,
-            frame_stop=31,
-        )
-
-        self.assertEqual(
-            domains,
-            (
-                AnchorDomain(anchor_frame=10, frame_start=0, frame_stop=16),
-                AnchorDomain(anchor_frame=20, frame_start=16, frame_stop=31),
-            ),
-        )
-        owned = [
-            frame
-            for domain in domains
-            for frame in range(domain.frame_start, domain.frame_stop)
-        ]
-        self.assertEqual(owned, list(range(31)))
-
     def test_short_domain_is_one_authoritative_window(self) -> None:
         domain = AnchorDomain(anchor_frame=12, frame_start=3, frame_stop=30)
 
@@ -140,8 +118,6 @@ class LtaWindowPlanningTests(unittest.TestCase):
         )
 
     def test_invalid_domains_and_window_contracts_fail_closed(self) -> None:
-        with self.assertRaisesRegex(ValueError, "inside"):
-            plan_anchor_domains((31,), frame_start=0, frame_stop=31)
         with self.assertRaisesRegex(ValueError, "inside"):
             AnchorDomain(anchor_frame=8, frame_start=0, frame_stop=8)
         with self.assertRaisesRegex(ValueError, "backward dogfood"):

@@ -1,4 +1,4 @@
-"""Canonical v18 forward-sampling policy, plan factory, and execution binding.
+"""Canonical forward-sampling policy, plan factory, and execution binding.
 
 The declarations in this module are consumed by production PTA and TTA render
 paths.  They describe source-to-raster sampling only; TTA prediction
@@ -37,7 +37,9 @@ def forward_sampling_policy() -> ForwardSamplingPolicy:
 
 @lru_cache(maxsize=2)
 def _forward_sampling_policy(spherical_fp32: bool) -> ForwardSamplingPolicy:
-    """Version 23 adds resident CUDA categorical sampling to the v21 policy."""
+    """Version 23 adds resident CUDA categorical sampling to the v21 policy;
+    version 24 additionally registers the opt-in spherical fp32 CUDA intensity
+    backend (YOLO_TTA_GPU_SPHERICAL_FP32, or YOLO_TTA_FAST_GEOMETRY)."""
 
     return ForwardSamplingPolicy(
         policy_id="xta.forward_sampling",

@@ -190,13 +190,14 @@ def make_cases():
     yy, xx = np.mgrid[:129, :131]
     masks = (((yy-62)**2 + (xx-56)**2 < 33**2),
              (((yy-66)/1.1)**2 + (xx-68)**2 < 28**2))
-    # Match XTA.interpolation._signed_distance_2d's actual OpenCV operation.
+    # Match XTA.interpolation._bridge_interface_sdf_2d's actual OpenCV operation.
     sdfs = []
     for mask in masks:
         mask_u8 = np.ascontiguousarray(mask, dtype=np.uint8)
         inside = cv2.distanceTransform(mask_u8, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
         outside = cv2.distanceTransform(np.uint8(1)-mask_u8, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-        sdfs.append(np.asarray(inside-outside, dtype=np.float32))
+        sdfs.append(np.where(mask, inside-np.float32(0.5),
+                             np.float32(0.5)-outside).astype(np.float32))
     for steps in (2, 3, 7, 17):
         for step in range(1, steps):
             yield 'realistic_edt_bridge', *sdfs, float(step)/float(steps)

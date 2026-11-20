@@ -1,9 +1,7 @@
 """Binary-authoritative SAM tail prefixes; no paired endpoint or tail cleanup."""
 from __future__ import annotations
 
-import hashlib
 import json
-from pathlib import Path
 from contextlib import nullcontext
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -11,12 +9,12 @@ from types import MappingProxyType
 
 import numpy as np
 
+from .file_hashing import source_sha256
 from .sam_evidence import SamEvidenceBundle, fingerprint, _plain
 from .sam_mask_reader import SamMaskReader
 
 SCHEMA = 'xta.sam_extrapolation_selection/1'
-_SOURCE = Path(__file__).resolve()
-IMPLEMENTATION_SHA256 = hashlib.sha256(_SOURCE.read_bytes()).hexdigest()
+IMPLEMENTATION_SHA256 = source_sha256(__file__)
 
 
 def _purpose(bundle):
@@ -149,7 +147,6 @@ class _PublicationIndex:
     selection_identity: str
     policy_hash: str
     charged_metadata_bytes: int
-    uses_cyclic: bool
 
 
 def _publication_index(reader,receipt,*,max_metadata_bytes):
@@ -185,7 +182,6 @@ def _publication_index(reader,receipt,*,max_metadata_bytes):
     roots=[set(),set()]
     crops={}
     target_addresses={}
-    uses_cyclic=False
     for rid in frozen['selected_run_ids']:
         run=reader.runs[rid]
         if run['direction'] not in ('forward','backward'):
@@ -210,7 +206,6 @@ def _publication_index(reader,receipt,*,max_metadata_bytes):
             mirror=False
             if group.get('frame_addressing'):
                 from .sam_cyclic import address_for_unfolded_index,mirror_bbox_yx
-                uses_cyclic=True
                 address=group['frame_addresses'][str(stored)]
                 native=int(address['native_index'])
                 if native not in target_addresses:
@@ -229,7 +224,7 @@ def _publication_index(reader,receipt,*,max_metadata_bytes):
     return _PublicationIndex(reader,MappingProxyType({frame:(tuple(values[0]),tuple(values[1]))
         for frame,values in sorted(owners.items())}),tuple(tuple(values) for values in run_ids),
         tuple(tuple(sorted(values)) for values in roots),frozen['selection_identity'],
-        frozen['policy_hash'],charge,uses_cyclic)
+        frozen['policy_hash'],charge)
 
 
 def _indexed_publication_crop(reader,owner):

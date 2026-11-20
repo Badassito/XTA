@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import threading
 import time
+import weakref
+from functools import lru_cache
 from pathlib import Path
 from typing import (
     Callable,
@@ -100,8 +102,7 @@ def _enlarge_decode_pipe(stream) -> int:
         import fcntl
         fd = stream.fileno()
         get_size = getattr(fcntl, 'F_GETPIPE_SZ', 1032)
-        if os.environ.get('YOLO_TTA_DECODE_PIPE_RESIZE', '1').strip().lower() not in {
-                '0', 'false', 'no', 'off'}:
+        if _env_flag('YOLO_TTA_DECODE_PIPE_RESIZE', True):
             try:
                 limit = int(Path('/proc/sys/fs/pipe-max-size').read_text().strip())
             except Exception:
@@ -367,7 +368,11 @@ def streaming_preprocess_enabled() -> bool:
     return _env_flag('YOLO_TTA_STREAMING_PREPROCESS', True)
 
 def register_volume_readiness(arr: object, readiness: VolumeReadiness) -> None:
-    _VOLUME_READINESS_BY_ARRAY_ID[id(arr)] = readiness
+    key = id(arr)
+    _VOLUME_READINESS_BY_ARRAY_ID[key] = readiness
+    # id() is unique only while arr lives: drop the entry with it so a later
+    # array at the same address never inherits this readiness.
+    weakref.finalize(arr, _VOLUME_READINESS_BY_ARRAY_ID.pop, key, None).atexit = False
 
 def volume_readiness(arr: object) -> Optional[VolumeReadiness]:
     return _VOLUME_READINESS_BY_ARRAY_ID.get(id(arr))
@@ -391,8 +396,7 @@ def wait_for_volume_ready(arr: object) -> None:
 
 def _tail_frame_count_enabled() -> bool:
     """YOLO_TTA_FRAME_COUNT_FULL_SCAN=1 always counts every packet."""
-    return os.environ.get('YOLO_TTA_FRAME_COUNT_FULL_SCAN', '0').strip().lower() not in {
-        '1', 'true', 'yes', 'on'}
+    return not _env_flag('YOLO_TTA_FRAME_COUNT_FULL_SCAN', False)
 
 
 def _tail_timestamp_frame_count(video_path: Path, stream: Mapping[str, object],
@@ -850,38 +854,92 @@ def compute_cube_resize_shape(
         max(w_i, lower_bound),
     )
 
-def processing_volume_mode() -> str:
-    """Return the canonical processing geometry."""
-    return 'cube'
-
 def should_resize_to_processing_cube(input_shape: Tuple[int, int, int], cube_shape: Tuple[int, int, int]) -> bool:
     return tuple(int(x) for x in input_shape) != tuple(int(x) for x in cube_shape)
 
-def _linear_source_index(out_idx: int, out_count: int, in_count: int) -> float:
-    if int(out_count) <= 1 or int(in_count) <= 1:
+def _center_aligned_source_position(out_idx: int, out_count: int, in_count: int) -> float:
+    """Clamped center-aligned (OpenCV half-pixel) source coordinate of one output index."""
+    if int(in_count) <= 1:
         return 0.0
-    return float(out_idx) * float(in_count - 1) / float(out_count - 1)
+    position = (float(out_idx) + 0.5) * float(in_count) / float(out_count) - 0.5
+    return min(max(position, 0.0), float(int(in_count) - 1))
 
-def _endpoint_aligned_nearest_source_indices(in_count: int, out_count: int) -> np.ndarray:
-    """Map output coordinates to nearest input coordinates with TTA endpoint alignment."""
+def _center_aligned_nearest_source_index(out_idx: int, out_count: int, in_count: int) -> int:
+    """Input pixel whose cell contains the output pixel center (exact integer ties)."""
+    return ((2 * int(out_idx) + 1) * int(in_count)) // (2 * int(out_count))
+
+@lru_cache(maxsize=64)
+def _center_aligned_nearest_source_indices(in_count: int, out_count: int) -> np.ndarray:
+    """Read-only center-aligned nearest table shared by every categorical resample."""
     in_count_i = int(in_count)
     out_count_i = int(out_count)
     if in_count_i <= 0 or out_count_i <= 0:
         raise ValueError(
-            "Endpoint-aligned categorical resize requires positive input and output axes; "
+            "Center-aligned nearest resampling requires positive input and output axes; "
             f"got input={in_count_i}, output={out_count_i}"
         )
-    return np.asarray(
-        [
-            int(np.clip(
-                int(round(_linear_source_index(out_idx, out_count_i, in_count_i))),
-                0,
-                in_count_i - 1,
-            ))
-            for out_idx in range(out_count_i)
-        ],
-        dtype=np.intp,
-    )
+    coords = np.arange(out_count_i, dtype=np.int64)
+    table = ((2 * coords + 1) * np.int64(in_count_i) // np.int64(2 * out_count_i)).astype(np.intp)
+    table.setflags(write=False)
+    return table
+
+_REMAP_TABLE_CAPACITY = 4
+_REMAP_TABLES: Dict[Tuple[int, int, int, int], np.ndarray] = {}
+_REMAP_TABLE_LOCK = threading.Lock()
+
+def _center_aligned_remap_table(in_h: int, in_w: int, out_h: int, out_w: int) -> np.ndarray:
+    """``CV_16SC2`` integer map for :func:`cv2.remap` built from the center tables.
+
+    Final fusion restores three reduced Cartesian plane shapes per output slice; a
+    smaller cache would rebuild a full-plane map (about 38 MB at 3072^2) per plane.
+    Slice-parallel restores call this from every worker at once, so each map is
+    built once under a lock instead of once per thread that misses the cache."""
+    key = (int(in_h), int(in_w), int(out_h), int(out_w))
+    table = _REMAP_TABLES.get(key)
+    if table is not None:
+        return table
+    with _REMAP_TABLE_LOCK:
+        table = _REMAP_TABLES.get(key)
+        if table is None:
+            table = np.empty((key[2], key[3], 2), dtype=np.int16)
+            table[:, :, 0] = _center_aligned_nearest_source_indices(key[1], key[3])[np.newaxis, :]
+            table[:, :, 1] = _center_aligned_nearest_source_indices(key[0], key[2])[:, np.newaxis]
+            table.setflags(write=False)
+            while len(_REMAP_TABLES) >= _REMAP_TABLE_CAPACITY:
+                del _REMAP_TABLES[next(iter(_REMAP_TABLES))]
+            _REMAP_TABLES[key] = table
+    return table
+
+def resize_binary_plane_to_output_xy(plane: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    """Restore one binary plane to ``(out_h, out_w)`` as a fresh uint8 0/1 array.
+
+    When neither axis grows the plane keeps the ``>0``-thresholded INTER_AREA footprint.
+    Otherwise every axis takes one center-aligned nearest sample from
+    :func:`_center_aligned_nearest_source_indices`, the same table the sparse, GPU,
+    D1 and confidence restores use."""
+    plane_u8 = (np.asarray(plane, dtype=np.uint8) > 0).astype(np.uint8, copy=False)
+    in_h, in_w = (int(plane_u8.shape[0]), int(plane_u8.shape[1]))
+    out_h_i, out_w_i = (int(out_h), int(out_w))
+    if (in_h, in_w) == (out_h_i, out_w_i):
+        return np.ascontiguousarray(plane_u8)
+    if in_h >= out_h_i and in_w >= out_w_i:
+        scaled = cv2.resize(
+            np.ascontiguousarray(plane_u8 * np.uint8(255)),
+            (out_w_i, out_h_i),
+            interpolation=cv2.INTER_AREA,
+        )
+        return (scaled > 0).astype(np.uint8, copy=False)
+    if max(in_h, in_w, out_h_i, out_w_i) < 32767:
+        # Integer maps make INTER_NEAREST an exact, GIL-free gather of the table.
+        return cv2.remap(
+            np.ascontiguousarray(plane_u8),
+            _center_aligned_remap_table(in_h, in_w, out_h_i, out_w_i),
+            None,
+            interpolation=cv2.INTER_NEAREST,
+        )
+    rows = _center_aligned_nearest_source_indices(in_h, out_h_i)
+    columns = _center_aligned_nearest_source_indices(in_w, out_w_i)
+    return np.ascontiguousarray(plane_u8.take(rows, axis=0).take(columns, axis=1))
 
 def _resize_gray_slice_nearest_or_linear(
     frame: np.ndarray,
@@ -898,17 +956,12 @@ def _resize_gray_slice_nearest_or_linear(
         interpolation=int(interpolation),
     )
 
-def _cube_t_axis_resize_backend() -> str:
-    """Backend used when cubic resizing only changes the slice axis.
-
- ``slab`` is used because the common 3072x3072x1930 -> approximately
- cubic case does not need XY resampling. It processes row slabs through
- OpenCV's native vertical resize and fans the slabs out across Python worker
- threads."""
-    return 'slab'
-
 def _cube_t_axis_slab_rows(in_w: int, workers: int) -> int:
-    """Choose a bounded row-slab height for T-axis-only cubic resizing."""
+    """Choose a bounded row-slab height for T-axis-only cubic resizing.
+
+ The common 3072x3072x1930 -> approximately cubic case does not need XY
+ resampling, so row slabs go through OpenCV's native vertical resize and fan
+ out across Python worker threads."""
     env_rows = _env_int('YOLO_TTA_CUBE_T_RESIZE_SLAB_ROWS', 0)
     if env_rows > 0:
         return max(1, int(env_rows))
@@ -1066,7 +1119,7 @@ def resize_volume_to_processing_cube_gray8(
     chunk_size = choose_parallel_chunk_size(out_t, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
 
     def _render_target_slice(out_z: int) -> None:
-        src_z = _linear_source_index(int(out_z), int(out_t), int(in_t))
+        src_z = _center_aligned_source_position(int(out_z), int(out_t), int(in_t))
         z0 = int(math.floor(src_z))
         z1 = min(in_t - 1, z0 + 1)
         alpha = float(src_z - float(z0))
@@ -1104,16 +1157,22 @@ def resize_categorical_volume_to_processing_cube_uint8(
     reserve_bytes: int = 32 * GIB,
     destination: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Resize a binary ``(t,Y,X)`` mask with endpoint-aligned nearest sampling.
+    """Resize a binary ``(t,Y,X)`` mask with center-aligned nearest sampling.
 
     This is the categorical counterpart to
-    :func:`resize_volume_to_processing_cube_gray8`.  It deliberately samples one
-    source voxel on every axis and binarizes the selected value, so categorical
-    ground truth never passes through an intensity interpolation kernel.  The
-    function is module-level and uses only spawn-safe, CPU-owned state.
+    :func:`resize_volume_to_processing_cube_gray8`.  Every axis uses the
+    center-aligned (``align_corners=False``) nearest table
+    ``((2*i+1)*in)//(2*out)``, the grid of the intensity cube's half-pixel
+    linear taps, so labels and image features stay registered.  It deliberately
+    samples one source voxel on every axis and binarizes the selected value, so
+    categorical ground truth never passes through an intensity interpolation
+    kernel.  The function is module-level and uses only spawn-safe, CPU-owned
+    state.
 
     Callers provide a canonical uint8 0/1 mask.  When the requested shape already
-    matches, that input object is returned without allocation or normalization.
+    matches, the input object is returned unchanged.  With ``destination``, the
+    input is copied unmodified into ``destination`` and ``destination`` is
+    returned.  Neither equal-shape case allocates or normalizes values.
     """
     mask_arr = np.asarray(mask_u8)
     if int(mask_arr.ndim) != 3:
@@ -1154,15 +1213,15 @@ def resize_categorical_volume_to_processing_cube_uint8(
         shape=(out_t, out_h, out_w),
         dtype=np.uint8,
         path=out_path,
-        desc='Categorical processing-cube volume (endpoint-aligned nearest)',
+        desc='Categorical processing-cube volume (center-aligned nearest)',
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
         initialize_zero=False,
     )
 
-    source_t = _endpoint_aligned_nearest_source_indices(in_t, out_t)
-    source_y = _endpoint_aligned_nearest_source_indices(in_h, out_h)
-    source_x = _endpoint_aligned_nearest_source_indices(in_w, out_w)
+    source_t = _center_aligned_nearest_source_indices(in_t, out_t)
+    source_y = _center_aligned_nearest_source_indices(in_h, out_h)
+    source_x = _center_aligned_nearest_source_indices(in_w, out_w)
     source_y_grid = source_y[:, np.newaxis]
     source_x_grid = source_x[np.newaxis, :]
 
@@ -1225,7 +1284,7 @@ def resize_volume_to_processing_cube_gray8_streaming(
     def _render_target_slice(out_z: int) -> None:
         if streaming_producers_aborted():
             raise RuntimeError('streaming cubic resize aborted by pipeline shutdown')
-        src_z = _linear_source_index(int(out_z), int(out_t), int(in_t))
+        src_z = _center_aligned_source_position(int(out_z), int(out_t), int(in_t))
         z0 = int(math.floor(src_z))
         z1 = min(in_t - 1, z0 + 1)
         alpha = float(src_z - float(z0))
@@ -1370,9 +1429,9 @@ class LazyProcessingCube:
                 # use the established exact slab/slice backend once.
                 wait_for_volume_ready(self.source)
                 if bool(self.streaming_backend):
-                    # Preserve the established streaming producer's interpolation
-                    # convention for runs that selected it at startup; only its launch
-                    # time changes. The owner waits here before publishing the sentinel.
+                    # The streaming producer shares the center-aligned grid; it is kept
+                    # for runs that selected it at startup so their uint8 rounding
+                    # identity is unchanged. The owner waits here before publishing.
                     built = resize_volume_to_processing_cube_gray8_streaming(
                         self.source,
                         self.shape,
@@ -1489,16 +1548,7 @@ def restore_mask_volume_to_original_shape(
     chunk_size = choose_parallel_chunk_size(out_t, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
 
     def _resize_mask_to_output_xy(frame: np.ndarray) -> np.ndarray:
-        frame_u8 = (np.asarray(frame, dtype=np.uint8) > 0).astype(np.uint8, copy=False)
-        if int(frame_u8.shape[0]) == int(out_h) and int(frame_u8.shape[1]) == int(out_w):
-            return np.ascontiguousarray(frame_u8)
-        interp = cv2.INTER_AREA if (int(frame_u8.shape[0]) >= int(out_h) and int(frame_u8.shape[1]) >= int(out_w)) else cv2.INTER_NEAREST
-        scaled = cv2.resize(
-            np.ascontiguousarray(frame_u8 * np.uint8(255)),
-            (int(out_w), int(out_h)),
-            interpolation=int(interp),
-        )
-        return (scaled > 0).astype(np.uint8, copy=False)
+        return resize_binary_plane_to_output_xy(frame, int(out_h), int(out_w))
 
     def _restore_slice(out_z: int) -> None:
         if int(in_t) >= int(out_t):
@@ -1512,8 +1562,7 @@ def restore_mask_volume_to_original_shape(
             out_mm[int(out_z), :, :] = restored
             return
 
-        src_z = _linear_source_index(int(out_z), int(out_t), int(in_t))
-        src_idx = int(np.clip(int(round(src_z)), 0, in_t - 1))
+        src_idx = _center_aligned_nearest_source_index(int(out_z), int(out_t), int(in_t))
         out_mm[int(out_z), :, :] = _resize_mask_to_output_xy(mask_u8[src_idx])
 
     parallel_for_indices_chunked(
@@ -1724,7 +1773,6 @@ def purge_temporary_mkv(
     video_path: Optional[Path],
     *,
     temp_dir: Path,
-    keep_temp: bool,
     reason: str = '',
 ) -> bool:
     """Delete one temporary MKV once its last pipeline consumer has finished.
@@ -1732,7 +1780,7 @@ def purge_temporary_mkv(
  The guard is intentionally narrow: only ``*.mkv`` files below the active scratch/temp
  directory are eligible. Final output MKVs live in the output directory and are never
  removed through this helper."""
-    if bool(keep_temp) or video_path is None:
+    if video_path is None:
         return False
 
     path = Path(video_path)
@@ -1752,16 +1800,14 @@ def purge_temporary_mkv(
         print(f'Warning: failed to purge temporary MKV {path} ({exc})')
         return False
 
-def purge_remaining_temporary_mkvs(temp_dir: Path, *, keep_temp: bool) -> int:
+def purge_remaining_temporary_mkvs(temp_dir: Path) -> int:
     """Best-effort final sweep for temporary MKVs that survived targeted lifecycle deletion."""
-    if bool(keep_temp):
-        return 0
     root = Path(temp_dir)
     if not root.exists():
         return 0
 
     purged = 0
     for path in list(root.rglob('*.mkv')):
-        if purge_temporary_mkv(path, temp_dir=root, keep_temp=False, reason='final scratch sweep'):
+        if purge_temporary_mkv(path, temp_dir=root, reason='final scratch sweep'):
             purged += 1
     return int(purged)

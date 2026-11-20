@@ -20,7 +20,7 @@ from .projection_coverage_cpu import _axis_bounds, _axis_value
 
 
 def terminal_native_source_packing_eligible(view, *, native_bytes, retire_dense,
-        component_layers, tiled, keep_temp, prepublished, interpolate,
+        component_layers, tiled, prepublished, interpolate,
         interpolation_passes, extrapolate, mask_callback_available=True,
         confidence_can_retire=True):
     """One admission/execution predicate for the terminal packed continuation."""
@@ -30,7 +30,7 @@ def terminal_native_source_packing_eligible(view, *, native_bytes, retire_dense,
     return bool(_env_flag('YOLO_TTA_PACKED_PARENT', True)
         and int(native_bytes) >= max(0, _env_int('YOLO_TTA_PACKED_PARENT_MIN_MIB', 64)) * 1024**2
         and os.environ.get('YOLO_TTA_NATIVE_PULL_BACKEND', 'compiled').strip().lower() == 'compiled'
-        and retire_dense and component_layers and not tiled and not keep_temp and not prepublished
+        and retire_dense and component_layers and not tiled and not prepublished
         and mask_callback_available and confidence_can_retire
         and (is_tilted_view(view) or is_azimuthal_view(view))
         and not (_view_uses_interpolation(view, int(interpolate)) and int(interpolation_passes) > 0)

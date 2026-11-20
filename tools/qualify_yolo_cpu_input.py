@@ -66,7 +66,7 @@ def main():
                 inverse=cv2.invertAffineTransform(matrix)
                 affine=AffineSpec(view.name,0,nw,nh,args.side,args.side,args.side,args.side,0,0,
                     inverse,matrix,inverse,matrix)
-                job=AugJob('a0',0,args.output_dir/'unused.json',affine)
+                job=AugJob('a0',0,affine)
                 render=NativeCartesianRenderer(volume,view,job)
                 started=time.perf_counter()
                 frames=np.stack([render(index) for index in range(args.frames)])

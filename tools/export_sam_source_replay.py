@@ -27,6 +27,7 @@ from XTA.geometry import ViewInfo
 from XTA.interpolation import IncrementalRawBBoxMaskStoreWriter, INTERNAL_PACKED_CVOL_FORMAT
 from XTA.sam_evidence import SamEvidenceBundle, iter_selected_native_crops, native_output_shape_tyx
 from XTA.artifact_archive import read_artifact
+from XTA.file_hashing import source_sha256
 
 
 def file_sha256(path):
@@ -192,7 +193,7 @@ def export_source_replay(evidence, selection_path, reference_run, output, *, dow
                            if run_manifest_path.is_file() else {})
     launcher = generation_manifest.get('launcher', {})
     policy_implementation = selection.get('policy_implementation_sha256')
-    current_policy_hash = file_sha256(Path(__file__).resolve().parents[1]/'XTA/sam_policy.py')
+    current_policy_hash = source_sha256(Path(__file__).resolve().parents[1]/'XTA/sam_policy.py')
     provenance = dict(status='fixed_proposal_source_replay',
         original_generation_run=Path(reference_run).name,
         original_generation_pipeline_version=launcher.get('pipeline_version', launcher.get('version')),

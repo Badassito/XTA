@@ -248,7 +248,7 @@ def _sam_directional_source_backing(
                 extent = tuple(stats['segment_extent_ijk'])
             return dict(path=path, shape=shape, storage_format=storage_format,
                 extent=extent, coordinate_space='orthogonal_processing')
-        # ponytail: Radial encoded pulls failed production-size parallel timing;
+        # Limitation: Radial encoded pulls failed production-size parallel timing;
         # tilted Spherical remains unqualified. Re-enable only after that validation.
         if view.family == 'spherical' and not view.spherical_tilted_source:
             from .spherical_projection import spherical_cuda_backproject_enabled
@@ -1208,7 +1208,7 @@ def _materialize_sparse_cartesian_component(
     component_store_path: Path, *, added_voxels: int, model_name: str, view: ViewInfo,
     source: str, pass_index: int, interpolation_walk_back_index: int,
     interpolation_candidate_index: int, tile_config_id: str, tile_acceptance: str,
-    stage: str, description: str, temp_dir: Path, keep_temp: bool,
+    stage: str, description: str, temp_dir: Path,
 ) -> NrrdLayerRef:
     """Publish one immutable component in orthogonal working geometry."""
     started = time.perf_counter()
@@ -1266,7 +1266,7 @@ def _materialize_sparse_cartesian_component(
             interpolation_candidate_index=int(interpolation_candidate_index),
             **{k: v for k, v in common.items() if k != 'view_name'},
         ))
-    if orientation != 'transverse' and not bool(keep_temp):
+    if orientation != 'transverse':
         # The transposed store is now complete and immutable. Transverse keeps its
         # original store alive for asynchronous NRRD writers and final fusion.
         shutil.rmtree(component_store_path, ignore_errors=True)
@@ -1288,7 +1288,7 @@ def _materialize_sparse_azimuthal_component(
     component_store_path: Path, *, added_voxels: int, model_name: str, view: ViewInfo,
     source: str, pass_index: int, interpolation_walk_back_index: int,
     interpolation_candidate_index: int, tile_config_id: str, tile_acceptance: str,
-    stage: str, description: str, temp_dir: Path, workers: int, keep_temp: bool,
+    stage: str, description: str, temp_dir: Path, workers: int,
 ) -> NrrdLayerRef:
     """Keep Azimuthal bridge deltas sparse through source-space publication."""
     from .sparse_projection import project_azimuthal_sparse_store
@@ -1323,9 +1323,8 @@ def _materialize_sparse_azimuthal_component(
             interpolation_candidate_index=int(interpolation_candidate_index),
             **{k: v for k, v in common.items() if k != 'view_name'},
         ))
-    if not bool(keep_temp):
-        # The replacement has closed and the sink owns its independent pathname.
-        shutil.rmtree(component_store_path, ignore_errors=True)
+    # The replacement has closed and the sink owns its independent pathname.
+    shutil.rmtree(component_store_path, ignore_errors=True)
     telemetry = runtime_telemetry()
     telemetry.add('projection.sparse_azimuthal_component.layers', 1)
     for field in ('input_payload_bytes', 'input_foreground_samples', 'projected_contributions',
@@ -1354,7 +1353,6 @@ def materialize_interpolation_component_nrrd_view_layer(
     description: str,
     temp_dir: Path,
     workers: int,
-    keep_temp: bool,
 ) -> NrrdLayerRef:
     """Project one sparse interpolation component and submit its deterministic NRRD.
 
@@ -1391,7 +1389,6 @@ def materialize_interpolation_component_nrrd_view_layer(
                 interpolation_candidate_index=int(interpolation_candidate_index),
                 tile_config_id=str(tile_config_id), tile_acceptance=str(tile_acceptance),
                 stage=str(stage), description=str(description), temp_dir=Path(temp_dir),
-                keep_temp=bool(keep_temp),
             )
 
     if str(view.family) == 'azimuthal' and str(source) == 'fullframe':
@@ -1402,7 +1399,7 @@ def materialize_interpolation_component_nrrd_view_layer(
             interpolation_candidate_index=int(interpolation_candidate_index),
             tile_config_id=str(tile_config_id), tile_acceptance=str(tile_acceptance),
             stage=str(stage), description=str(description), temp_dir=Path(temp_dir),
-            workers=int(workers), keep_temp=bool(keep_temp),
+            workers=int(workers),
         )
 
     component_store_path = Path(component_store_path)
@@ -1531,16 +1528,15 @@ def materialize_interpolation_component_nrrd_view_layer(
         return layer_ref
     finally:
         store.close()
-        close_memmap_array(decoded_mm, unlink_path=decode_path if not bool(keep_temp) else None)
-        if not bool(keep_temp):
-            try:
-                decode_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            # Nonempty inputs have been synchronously projected into the returned ref's own
-            # store, so their view-native cvol can be retired immediately. Empty cvols remain
-            # the returned ref backing until the NRRD sink finishes.
-            shutil.rmtree(component_store_path, ignore_errors=True)
+        close_memmap_array(decoded_mm, unlink_path=decode_path)
+        try:
+            decode_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        # Nonempty inputs have been synchronously projected into the returned ref's own
+        # store, so their view-native cvol can be retired immediately. Empty cvols remain
+        # the returned ref backing until the NRRD sink finishes.
+        shutil.rmtree(component_store_path, ignore_errors=True)
 
 def materialize_internal_final_view_layer(
     view_volume_mm: np.ndarray,
@@ -1588,7 +1584,6 @@ def materialize_nrrd_global_layer(
     workers: int = 1,
     known_has_foreground: Optional[bool] = None,
     volume_is_immutable: bool = False,
-    keep_temp: bool = False,
     layer_role: str = 'checkpoint',
     recomposition_op: str = 'select',
     low_quality_recomposition_op: str = 'select',
@@ -1618,13 +1613,8 @@ def materialize_nrrd_global_layer(
     # after it) skip the store entirely: the sink streams the live in-RAM volume in ONE
     # pass (segment extent computed on the sink worker), deleting the synchronous
     # encode-to-store pass on this thread AND the store read-back pass in the writer.
-    # keep_temp keeps the store path so temp archives still contain the layer.
     sink = nrrd_layer_sink()
-    if (
-        bool(volume_is_immutable)
-        and not bool(keep_temp)
-        and sink is not None
-    ):
+    if bool(volume_is_immutable) and sink is not None:
         source_arr = np.asarray(volume_mm, dtype=np.uint8)
         shape = tuple(int(x) for x in source_arr.shape)
         layer_ref = NrrdLayerRef(
@@ -1669,7 +1659,7 @@ def materialize_nrrd_global_layer(
         )
         print(
             f'NRRD layer {key}: streaming from the live volume '
-            '(v13.3.6 N3; store encode + read-back deleted).'
+            '(no store encode or read-back).'
         )
         return layer_ref
 
@@ -1848,7 +1838,6 @@ def prepare_view_volume_after_fullframe(
     interpolate_passes: int,
     interpolate_min_radius: float,
     interpolation_search_angle: float,
-    keep_temp: bool,
     slice_workers: int,
     interpolation_task_workers: int,
     nrrd_layers_enabled: bool = False,
@@ -1924,13 +1913,12 @@ def prepare_view_volume_after_fullframe(
     # Complete source-space component refs carry every addition directly
     # into final fusion; a second dense continuation would be created only to discard it.
     # Zero component axes may still produce default bridges, so retain their dense path.
-    # keep_temp retains its historical dense debug artifacts, and no-NRRD runs retain
-    # their private aggregate final-layer path. Tiles still need a mutable destination.
+    # No-NRRD runs retain their private aggregate final-layer path. Tiles still need a
+    # mutable destination.
     d1_component_refs_only = bool(
         d1_delta_only
         and not bool(dense_tiling_active)
         and bool(nrrd_layers_enabled)
-        and not bool(keep_temp)
         and (
             not _view_uses_interpolation(view, int(interpolate))
             or (int(interpolation_walk_back) > 0 and int(interpolation_candidates) > 0)
@@ -1949,7 +1937,7 @@ def prepare_view_volume_after_fullframe(
     from .packed_tilted_projection import terminal_native_source_packing_eligible
     terminal_packed = bool(union_owner is not None and terminal_native_source_packing_eligible(view,
         native_bytes=int(baseline_native_volume.nbytes), retire_dense=retire_dense_after_prepare,
-        component_layers=nrrd_layers_enabled, tiled=dense_tiling_active, keep_temp=keep_temp,
+        component_layers=nrrd_layers_enabled, tiled=dense_tiling_active,
         prepublished=preinterpolation_layer_already_published,
         interpolate=interpolate, interpolation_passes=interpolate_passes,
         extrapolate=extrapolation_distance, mask_callback_available=mask_retired_callback is not None,
@@ -1958,7 +1946,7 @@ def prepare_view_volume_after_fullframe(
     from .confidence_orchestration import (retire_confidence_scores, join_failed_capture,
                                           ConfidenceSourceRetirement)
     retire_confidence = ConfidenceSourceRetirement(partial(retire_confidence_scores, model_name=str(model_name),
-        view_name=str(view.name), path=confmap_path, keep_temp=keep_temp,
+        view_name=str(view.name), path=confmap_path,
         retired_callback=confidence_retired_callback, carrier=confidence_owner_carrier))
     confidence_future = None
     terminal_confidence_scores = None
@@ -2236,7 +2224,6 @@ def prepare_view_volume_after_fullframe(
                         interpolation_walk_back=int(interpolation_walk_back),
                         interpolation_candidates=int(interpolation_candidates),
                         interpolate_min_radius=float(effective_interpolate_min_radius),
-                        keep_temp=bool(keep_temp),
                         prefer_memory=True,
                         workers=int(interpolation_task_workers),
                         bridge_delta_path=pass_delta_path,
@@ -2284,15 +2271,14 @@ def prepare_view_volume_after_fullframe(
                             )
                         close_memmap_array(
                             bridge_delta_mm,
-                            unlink_path=(pass_delta_path if not bool(keep_temp)
-                                         and Path(delta_reported).absolute() == pass_delta_path.absolute()
+                            unlink_path=(pass_delta_path
+                                         if Path(delta_reported).absolute() == pass_delta_path.absolute()
                                          else None),
                         )
-                    if not bool(keep_temp):
-                        try:
-                            pass_delta_path.unlink(missing_ok=True)
-                        except Exception:
-                            pass
+                    try:
+                        pass_delta_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
                 if pass_component_dir is not None:
                     component_entries = [
@@ -2340,7 +2326,7 @@ def prepare_view_volume_after_fullframe(
                         candidate_index = int(component_entry['candidate_index'])
                         # Immutable component stores no longer depend on the mutable
                         # parent canvas. Only refs-only parents can detach publication;
-                        # tile support and retained debug canvases keep the synchronous path.
+                        # tile support and dense continuations keep the synchronous path.
                         materialize_component = (
                             submit_component_projection
                             if d1_component_refs_only and submit_component_projection is not None
@@ -2363,7 +2349,6 @@ def prepare_view_volume_after_fullframe(
                             ),
                             temp_dir=temp_dir,
                             workers=int(slice_workers),
-                            keep_temp=bool(keep_temp),
                         )
                         if isinstance(layer_ref, Future):
                             pending_component_layers.append(layer_ref)
@@ -2381,7 +2366,7 @@ def prepare_view_volume_after_fullframe(
             old_volume = baseline_native_volume
             existing_backing = _interpolation_array_backing_path(old_volume)
             if (existing_backing is None and bool(retire_dense_after_prepare)
-                    and not bool(dense_tiling_active) and not bool(keep_temp)):
+                    and not bool(dense_tiling_active)):
                 # The scheduler will consume the independent projected refs and retire
                 # this original canvas. A second multi-GiB native backing would be
                 # discarded immediately; keep the original owner alive until then.
@@ -2395,7 +2380,7 @@ def prepare_view_volume_after_fullframe(
                 )
             elif existing_backing is not None:
                 print(
-                    f'{model_name}/{view.name} non-interpolated native retention (v16.1.3): '
+                    f'{model_name}/{view.name} non-interpolated native retention: '
                     f'reusing {existing_backing}; no full-volume drain copy.'
                 )
             else:
@@ -2413,16 +2398,15 @@ def prepare_view_volume_after_fullframe(
                     old_backing = _interpolation_array_backing_path(old_volume)
                     close_memmap_array(
                         old_volume,
-                        unlink_path=(union_path if not keep_temp and union_path is not None
+                        unlink_path=(union_path if union_path is not None
                                      and old_backing is not None
                                      and Path(old_backing).absolute() == Path(union_path).absolute()
                                      else None),
                     )
-                    if not keep_temp:
-                        try:
-                            union_path.unlink(missing_ok=True)
-                        except Exception:
-                            pass
+                    try:
+                        union_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
         if bool(fused_azimuthal_components):
             # projection and positive-support restore distribute over binary OR, so the
@@ -2464,7 +2448,7 @@ def prepare_view_volume_after_fullframe(
             if layer_ref is not None:
                 nrrd_layers.append(layer_ref)
                 print(
-                    f'v13.3.18 (C12): {model_name}/{view.name} emitted one Azimuthal '
+                    f'{model_name}/{view.name} emitted one Azimuthal '
                     f'{"YOLO+bridge union" if has_fused_bridges else "YOLO"} layer for one '
                     f'projection pass ({int(fused_added_voxels)} bridge voxel(s)).'
                 )
@@ -2594,21 +2578,17 @@ def prepare_view_volume_after_fullframe(
             base_backing_path = _interpolation_array_backing_path(baseline_native_volume)
             close_memmap_array_without_flush(
                 baseline_native_volume,
-                unlink_path=(Path(union_path) if not bool(keep_temp) and union_path is not None
+                unlink_path=(Path(union_path) if union_path is not None
                              and base_backing_path is not None
                              and Path(base_backing_path).absolute() == Path(union_path).absolute()
                              else None),
             )
             original_backing_path = _interpolation_array_backing_path(union_mm)
-            if (not bool(keep_temp) and union_path is not None and original_backing_path is not None
+            if (union_path is not None and original_backing_path is not None
                     and not str(original_backing_path).startswith('/proc/')
                     and Path(original_backing_path).absolute() == Path(union_path).absolute()):
                 close_memmap_array_without_flush(union_mm, unlink_path=Path(union_path))
-            if (
-                not bool(keep_temp)
-                and union_path is not None
-                and not str(union_path).startswith('/proc/')
-            ):
+            if union_path is not None and not str(union_path).startswith('/proc/'):
                 try:
                     Path(union_path).unlink(missing_ok=True)
                 except Exception:
@@ -2630,9 +2610,9 @@ def prepare_view_volume_after_fullframe(
         returned_parent_mask_support = parent_mask_support_mm if bool(dense_tiling_active) else None
         returned_parent_bridge_support = parent_bridge_support_mm if bool(dense_tiling_active) else None
         if parent_mask_support_mm is not None and returned_parent_mask_support is None:
-            close_raw_store_or_memmap_volume(parent_mask_support_mm, keep_temp=bool(keep_temp))
+            close_raw_store_or_memmap_volume(parent_mask_support_mm)
         if parent_bridge_support_mm is not None and returned_parent_bridge_support is None:
-            close_raw_store_or_memmap_volume(parent_bridge_support_mm, keep_temp=bool(keep_temp))
+            close_raw_store_or_memmap_volume(parent_bridge_support_mm)
 
         return PreparedViewResult(
             model_name=str(model_name),
@@ -2863,7 +2843,6 @@ def gate_raw_bbox_tile_store_against_parent_mask(
     tile_accumulator_mm: np.ndarray,
     tile_accumulator_locks: Optional[Sequence[threading.Lock]],
     work_dir: Path,
-    keep_temp: bool,
     slice_workers: int,
     tile_parent_mask_accumulator_mm: Optional[np.ndarray] = None,
     tile_parent_mask_accumulator_locks: Optional[Sequence[threading.Lock]] = None,
@@ -2959,10 +2938,7 @@ def gate_raw_bbox_tile_store_against_parent_mask(
             },
         )
     finally:
-        if bool(keep_temp):
-            store.close()
-        else:
-            store.unlink()
+        store.unlink()
 
     totals = np.sum(per_slice, axis=0, dtype=np.int64)
     gate_stats = {
@@ -3011,7 +2987,6 @@ def gate_raw_bbox_tile_store_against_parent_bridge(
     parent_bridge_support_mm: object,
     tile_accumulator_mm: np.ndarray,
     tile_accumulator_locks: Optional[Sequence[threading.Lock]],
-    keep_temp: bool,
     slice_workers: int,
     tile_parent_bridge_accumulator_mm: Optional[np.ndarray] = None,
     tile_parent_bridge_accumulator_locks: Optional[Sequence[threading.Lock]] = None,
@@ -3085,10 +3060,7 @@ def gate_raw_bbox_tile_store_against_parent_bridge(
             target_chunks_per_worker=2,
         )
     finally:
-        if bool(keep_temp):
-            store.close()
-        else:
-            store.unlink()
+        store.unlink()
 
     totals = np.sum(per_slice, axis=0, dtype=np.int64)
     return TileGateResult(
@@ -3112,7 +3084,6 @@ def postprocess_tile_volume_after_inference(
     view: ViewInfo,
     min_conf: float,
     min_radius: float,
-    keep_temp: bool,
     slice_workers: int,
     sparse_retire_dir: Optional[Path] = None,
 ) -> Optional[TilePostprocessResult | DeferredTilePostprocessResult]:
@@ -3150,27 +3121,19 @@ def postprocess_tile_volume_after_inference(
         capture_tile_confidence(task, view=view,
             work_dir=Path(sparse_retire_dir) if sparse_retire_dir is not None else Path(task.tile_mask_path).parent)
     finally:
-        close_memmap_array(
-            task.tile_confmap_mm,
-            unlink_path=(task.tile_confmap_path if task.tile_confmap_path is not None
-                         and not keep_temp else None),
-        )
-        if task.tile_confmap_path is not None and not keep_temp:
+        close_memmap_array(task.tile_confmap_mm, unlink_path=task.tile_confmap_path)
+        if task.tile_confmap_path is not None:
             try:
                 task.tile_confmap_path.unlink(missing_ok=True)
             except Exception:
                 pass
 
     if not _volume_has_foreground(task.tile_mask_mm):
-        close_memmap_array(
-            task.tile_mask_mm,
-            unlink_path=task.tile_mask_path if not keep_temp else None,
-        )
-        if not keep_temp:
-            try:
-                task.tile_mask_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+        close_memmap_array(task.tile_mask_mm, unlink_path=task.tile_mask_path)
+        try:
+            task.tile_mask_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         return None
 
     dense_result = TilePostprocessResult(
@@ -3184,7 +3147,7 @@ def postprocess_tile_volume_after_inference(
         tile_mask_mm=task.tile_mask_mm,
         tile_mask_path=task.tile_mask_path,
     )
-    if sparse_retire_dir is not None and not bool(keep_temp):
+    if sparse_retire_dir is not None:
         # v16.4.3: the GPU-worker array-backed result is only a cleanup workspace. Convert the
         # cleaned crop immediately to CTILE and close/unlink the uint8 .dat before parent
         # interpolation or either component gate can delay its retirement.
@@ -3192,7 +3155,6 @@ def postprocess_tile_volume_after_inference(
             dense_result,
             Path(sparse_retire_dir),
             workers=int(slice_workers),
-            keep_original=False,
         )
     return dense_result
 
@@ -3201,7 +3163,6 @@ def spill_waiting_tile_result_to_raw_store(
     temp_dir: Path,
     *,
     workers: int = 1,
-    keep_original: bool = False,
 ) -> DeferredTilePostprocessResult:
     """Spill one crop-local tile or residual without expanding it to the parent canvas."""
     if result.tile_mask_mm is None:
@@ -3248,10 +3209,9 @@ def spill_waiting_tile_result_to_raw_store(
     tile_shape = tuple(int(x) for x in tile_arr.shape)
     close_memmap_array(
         result.tile_mask_mm,
-        unlink_path=(Path(result.tile_mask_path) if not bool(keep_original)
-                     and result.tile_mask_path is not None else None),
+        unlink_path=(Path(result.tile_mask_path) if result.tile_mask_path is not None else None),
     )
-    if not bool(keep_original) and result.tile_mask_path is not None:
+    if result.tile_mask_path is not None:
         try:
             Path(result.tile_mask_path).unlink(missing_ok=True)
         except Exception:
@@ -3313,12 +3273,8 @@ def defer_open_tile_result_store(result: TilePostprocessResult) -> DeferredTileP
 
 def _delete_tile_result_storage(
     result: TilePostprocessResult | DeferredTilePostprocessResult,
-    *,
-    keep_temp: bool,
 ) -> None:
     if isinstance(result, DeferredTilePostprocessResult):
-        if bool(keep_temp):
-            return
         path = Path(result.tile_mask_path)
         release_memfd_owners_under(path)
         try:
@@ -3330,12 +3286,9 @@ def _delete_tile_result_storage(
             pass
         return
     if result.tile_mask_store is not None:
-        if bool(keep_temp):
-            result.tile_mask_store.close()
-        else:
-            result.tile_mask_store.unlink()
+        result.tile_mask_store.unlink()
         return
-    if not bool(keep_temp) and result.tile_mask_path is not None:
+    if result.tile_mask_path is not None:
         try:
             Path(result.tile_mask_path).unlink(missing_ok=True)
         except Exception:
@@ -3348,7 +3301,6 @@ def gate_tile_result_against_parent_mask(
     tile_accumulator_mm: np.ndarray,
     tile_accumulator_locks: Optional[Sequence[threading.Lock]],
     work_dir: Path,
-    keep_temp: bool,
     slice_workers: int,
     tile_parent_mask_accumulator_mm: Optional[np.ndarray] = None,
     tile_parent_mask_accumulator_locks: Optional[Sequence[threading.Lock]] = None,
@@ -3371,7 +3323,6 @@ def gate_tile_result_against_parent_mask(
             tile_accumulator_mm=tile_accumulator_mm,
             tile_accumulator_locks=tile_accumulator_locks,
             work_dir=Path(work_dir),
-            keep_temp=bool(keep_temp),
             slice_workers=int(slice_workers),
             tile_parent_mask_accumulator_mm=tile_parent_mask_accumulator_mm,
             tile_parent_mask_accumulator_locks=tile_parent_mask_accumulator_locks,
@@ -3409,10 +3360,9 @@ def gate_tile_result_against_parent_mask(
     else:
         close_memmap_array(
             dense_tile,
-            unlink_path=(Path(result.tile_mask_path) if result.tile_mask_path is not None
-                         and not bool(keep_temp) else None),
+            unlink_path=(Path(result.tile_mask_path) if result.tile_mask_path is not None else None),
         )
-        if result.tile_mask_path is not None and not bool(keep_temp):
+        if result.tile_mask_path is not None:
             try:
                 Path(result.tile_mask_path).unlink(missing_ok=True)
             except Exception:
@@ -3437,7 +3387,6 @@ def gate_tile_residual_against_parent_bridge(
     tile_accumulator_mm: np.ndarray,
     tile_accumulator_locks: Optional[Sequence[threading.Lock]],
     work_dir: Path,
-    keep_temp: bool,
     slice_workers: int,
     tile_parent_bridge_accumulator_mm: Optional[np.ndarray] = None,
     tile_parent_bridge_accumulator_locks: Optional[Sequence[threading.Lock]] = None,
@@ -3458,7 +3407,6 @@ def gate_tile_residual_against_parent_bridge(
             parent_bridge_support_mm=parent_bridge_support_mm,
             tile_accumulator_mm=tile_accumulator_mm,
             tile_accumulator_locks=tile_accumulator_locks,
-            keep_temp=bool(keep_temp),
             slice_workers=int(slice_workers),
             tile_parent_bridge_accumulator_mm=tile_parent_bridge_accumulator_mm,
             tile_parent_bridge_accumulator_locks=tile_parent_bridge_accumulator_locks,
@@ -3491,10 +3439,9 @@ def gate_tile_residual_against_parent_bridge(
     finally:
         close_memmap_array(
             dense_tile,
-            unlink_path=(Path(result.tile_mask_path) if result.tile_mask_path is not None
-                         and not bool(keep_temp) else None),
+            unlink_path=(Path(result.tile_mask_path) if result.tile_mask_path is not None else None),
         )
-        if result.tile_mask_path is not None and not bool(keep_temp):
+        if result.tile_mask_path is not None:
             try:
                 Path(result.tile_mask_path).unlink(missing_ok=True)
             except Exception:
@@ -3514,7 +3461,6 @@ def finalize_consolidated_tile_volume_for_parent(
     interpolate_passes: int,
     interpolate_min_radius: float,
     interpolation_search_angle: float,
-    keep_temp: bool,
     slice_workers: int,
     interpolation_task_workers: int,
     nrrd_layers_enabled: bool = False,
@@ -3714,7 +3660,6 @@ def finalize_consolidated_tile_volume_for_parent(
                         interpolation_walk_back=int(interpolation_walk_back),
                         interpolation_candidates=int(interpolation_candidates),
                         interpolate_min_radius=float(effective_interpolate_min_radius),
-                        keep_temp=bool(keep_temp),
                         prefer_memory=True,
                         workers=int(interpolation_task_workers),
                         bridge_component_dir=pass_component_dir,
@@ -3778,7 +3723,6 @@ def finalize_consolidated_tile_volume_for_parent(
                             ),
                             temp_dir=temp_dir,
                             workers=int(slice_workers),
-                            keep_temp=bool(keep_temp),
                         )
                         nrrd_layers.append(layer_ref)
 
@@ -3894,7 +3838,6 @@ def _try_apply_gaussian_smoothing_gpu_chunked_inplace(
     temp_dir: Path,
     *,
     stats: Dict[str, object],
-    keep_temp: bool = False,
     workers: int = 1,
     nrrd_layers: Optional[List[NrrdLayerRef]] = None,
     nrrd_model_name: str = 'global',
@@ -3977,12 +3920,11 @@ def _try_apply_gaussian_smoothing_gpu_chunked_inplace(
                 except Exception:
                     pass
         finally:
-            close_memmap_array(source_mm, unlink_path=source_path if not bool(keep_temp) else None)
-            if not bool(keep_temp):
-                try:
-                    source_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
+            close_memmap_array(source_mm, unlink_path=source_path)
+            try:
+                source_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
         if nrrd_layers is not None:
             layer_ref = materialize_nrrd_global_layer(
@@ -4015,7 +3957,6 @@ def apply_gaussian_smoothing_inplace(
     passes: int,
     temp_dir: Path,
     *,
-    keep_temp: bool = False,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
@@ -4046,7 +3987,6 @@ def apply_gaussian_smoothing_inplace(
         passes_i,
         temp_dir,
         stats=stats,
-        keep_temp=bool(keep_temp),
         workers=int(workers),
         nrrd_layers=nrrd_layers,
         nrrd_model_name=str(nrrd_model_name),
@@ -4131,11 +4071,10 @@ def apply_gaussian_smoothing_inplace(
             stats['total_removed_voxels'] = int(stats.get('total_removed_voxels', 0)) + int(removed)
             stats['passes_completed'] = int(pass_idx)
     finally:
-        close_memmap_array(work_mm, unlink_path=work_path if not bool(keep_temp) else None)
-        if not bool(keep_temp):
-            try:
-                work_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+        close_memmap_array(work_mm, unlink_path=work_path)
+        try:
+            work_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     return stats

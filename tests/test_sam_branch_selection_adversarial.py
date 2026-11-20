@@ -15,9 +15,9 @@ import numpy as np
 import pytest
 from scipy import ndimage as ndi
 
-from XTA.sam_evidence import SamEvidenceWriter, iter_selected_planes
+from XTA.sam_evidence import SamEvidenceWriter, iter_selected_native_crops, iter_selected_planes
 from XTA.sam_mask_reader import effective_candidate_mask
-from XTA.sam_policy import replay_sam_proposals, resolve_sam_bridge_policy, select_sam_proposals
+from XTA.sam_policy import resolve_sam_bridge_policy, select_sam_proposals
 
 
 def _policy(*, expanded=False, tiled=False, **overrides):
@@ -606,7 +606,7 @@ def test_same_radius_cache_cannot_reuse_different_branch_write_domains(tmp_path)
     np.testing.assert_array_equal(second, raw[2])
 
 
-def test_branch_receipt_replay_reconstructs_same_selected_pixels(tmp_path, monkeypatch):
+def test_branch_receipt_replay_reconstructs_same_selected_pixels(tmp_path):
     group, masks, raw = _single_edge()
     raw[2][8:23, 8:23] = True
     raw[2][26, 36] = True
@@ -614,17 +614,13 @@ def test_branch_receipt_replay_reconstructs_same_selected_pixels(tmp_path, monke
         scope={"sam_crop_mode": "whole", "shape_tyx": [5, 32, 48]})
     online = select_sam_proposals(bundle, _policy(expanded=True))
     expected = _selected_union(bundle, online)
-    monkeypatch.setenv("YOLO_TTA_SAM_TIGHT_CROP_GUARD", "invalid-after-selection")
-    replay = replay_sam_proposals(bundle, tmp_path/"replay",
-        policy={"sam_bridge_policy": online["resolved_policy"]})
+    replay = select_sam_proposals(bundle, {"sam_bridge_policy": online["resolved_policy"]})
     assert replay["selected_run_ids"] == online["selected_run_ids"]
     assert replay["policy_hash"] == online["policy_hash"]
     assert replay["branch_selection"] == online["branch_selection"]
     actual = np.zeros_like(expected)
-    with np.load(tmp_path/"replay"/"selected_planes.npz", allow_pickle=False) as saved:
-        for row in replay["replay_outputs"]["packed_plane_index"]:
-            plane = np.unpackbits(saved[row["key"]], bitorder="little", count=int(np.prod(row["shape"])))
-            actual[row["native_frame"]] |= plane.reshape(row["shape"]).astype(bool)
+    for _, _, native_frame, (y0, x0, y1, x1), plane in iter_selected_native_crops(bundle, replay):
+        actual[native_frame, y0:y1, x0:x1] |= plane.astype(bool)
     np.testing.assert_array_equal(actual, expected)
 
 
@@ -644,7 +640,7 @@ def test_internal_context_truncation_requires_a_larger_crop_instead_of_complete_
 
 @pytest.mark.parametrize("mode,version", [("whole", 6), ("tiled", 7)])
 def test_promoted_defaults_preserve_raw_context_and_explicit_censorship(mode, version):
-    policy = resolve_sam_bridge_policy(generation_mode=mode, environ={})
+    policy = resolve_sam_bridge_policy(generation_mode=mode)
     assert policy["version"] == version and policy["branch_aware_selection"]
     assert policy["allow_paired_seed_tracks"]
     assert policy["min_endpoint_recall"] == 0.
@@ -656,8 +652,7 @@ def test_promoted_defaults_preserve_raw_context_and_explicit_censorship(mode, ve
 
 @pytest.mark.parametrize("mode,version", [("whole", "4"), ("tiled", "5")])
 def test_accepted_legacy_version_strings_keep_legacy_selection_semantics(mode, version):
-    policy = resolve_sam_bridge_policy({"sam_bridge_policy": {"version": version}},
-        generation_mode=mode, environ={})
+    policy = resolve_sam_bridge_policy({"sam_bridge_policy": {"version": version}}, generation_mode=mode)
     assert int(policy["version"]) == int(version)
     assert not policy["branch_aware_selection"] and not policy["allow_paired_seed_tracks"]
     assert policy["branch_write_domain"] == "edge_write"
@@ -666,12 +661,11 @@ def test_accepted_legacy_version_strings_keep_legacy_selection_semantics(mode, v
     assert policy["strict_containment"] and policy["guarded_rescue"]
 
 
-def test_historical_radius_receipt_flag_does_not_claim_branch_geometry(tmp_path, monkeypatch):
+def test_historical_radius_receipt_flag_does_not_claim_branch_geometry(tmp_path):
     from tests.test_sam_evidence_policy import build_bundle, fixture_group, fixture_run
     group, masks, raw = fixture_group()
     bundle = build_bundle(tmp_path, [(fixture_run("F", group), raw)], group=group, masks=masks,
         scope={"selection_receipt_required": True})
-    monkeypatch.delenv("YOLO_TTA_SAM_TIGHT_CROP_GUARD", raising=False)
     receipt = select_sam_proposals(bundle)
     assert receipt["resolved_policy"]["version"] == 4
     assert receipt["legacy_contract_fallback"]["status"] == "legacy_contract_fallback"

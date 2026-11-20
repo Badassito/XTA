@@ -29,7 +29,7 @@ def file_sha(path):
 
 def sdf_reference(args):
     for key in ("YOLO_TTA_GPU_INTERPOLATION", "YOLO_TTA_GPU_SLICE_LABELING",
-                "YOLO_TTA_GPU_INTERPOLATION_RADIUS", "YOLO_TTA_GPU_INTERPOLATION_REQUIRED"):
+                "YOLO_TTA_GPU_INTERPOLATION_REQUIRED"):
         os.environ[key] = "0"
     os.environ["YOLO_TTA_TELEMETRY_SYSTEM_SAMPLER"] = "0"
     os.environ["YOLO_TTA_INTERPOLATION_PLAN_BATCH_MIB"] = "128"
@@ -89,7 +89,7 @@ def sdf_reference(args):
             data, destination / (family["family_id"] + "_work"), "native_reference",
             result["parameters"]["distance"], result["parameters"]["search_angle"],
             result["parameters"]["walk_back"], 1, result["parameters"]["min_radius"],
-            keep_temp=False, prefer_memory=False, reserve_bytes=0, workers=args.workers)
+            prefer_memory=False, reserve_bytes=0, workers=args.workers)
         compute_seconds = time.perf_counter() - compute_started
         if not np.array_equal(data[[0, -1]], observed[[0, -1]]):
             raise ValueError("SDF repainted an original endpoint")

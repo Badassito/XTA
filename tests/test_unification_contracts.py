@@ -9,6 +9,7 @@ from pathlib import Path
 from types import ModuleType
 from unittest import mock
 
+from XTA.config import ChannelFormat, resolve_channel_format
 from XTA.unification import (
     BackendSamplingImplementation,
     ChannelVariant,
@@ -21,13 +22,13 @@ from XTA.unification import (
     RenderRequestBatch,
     RenderItem,
     TileLayout,
+    channel_layout_from_format,
+    expand_channel_variants,
     expand_view_variants,
     build_forward_raster_plan,
     forward_sampling_execution_record,
     forward_sampling_policy,
     require_forward_sampling,
-    resolve_channel_layout,
-    resolve_channel_variants,
     resolve_in_plane_variants,
 )
 
@@ -86,32 +87,35 @@ class UnificationContractTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stdout)
 
-    def test_channel_layout_uses_existing_tta_grammar(self) -> None:
-        layout = resolve_channel_layout("c5s2")
+    def test_channel_layout_from_format_copies_resolved_fields(self) -> None:
+        layout = channel_layout_from_format(resolve_channel_format("c5s2"))
         self.assertEqual(layout.token, "C5S2")
         self.assertEqual(layout.offsets, (-4, -2, 0, 2, 4))
-        with self.assertRaisesRegex(ValueError, "exactly one"):
-            resolve_channel_layout(["gray", "C5S1"])  # type: ignore[arg-type]
-        with self.assertRaises(ValueError):
-            resolve_channel_layout("C4S1")
+        # The copy keeps contract validation instead of trusting its input.
+        with self.assertRaisesRegex(ValueError, "odd"):
+            channel_layout_from_format(ChannelFormat("C4S1", "custom", 4, 1, (-2, -1, 1, 2)))
 
     def test_tta_emits_only_ascending_channel_order(self) -> None:
-        variants = resolve_channel_variants(PipelineMode.TTA, "C5S2")
+        layout = channel_layout_from_format(resolve_channel_format("C5S2"))
+        variants = expand_channel_variants(PipelineMode.TTA, layout)
         self.assertEqual(len(variants), 1)
         self.assertEqual(variants[0].direction, "ascending")
         self.assertEqual(variants[0].offsets, (-4, -2, 0, 2, 4))
 
-        lta_variants = resolve_channel_variants(PipelineMode.LTA, "C5S2")
+        lta_variants = expand_channel_variants(PipelineMode.LTA, layout)
         self.assertEqual(len(lta_variants), 1)
         self.assertEqual(lta_variants[0].direction, "ascending")
 
     def test_pta_adds_reversed_order_only_when_distinct(self) -> None:
-        variants = resolve_channel_variants("pta", "C5S2")
+        variants = expand_channel_variants(
+            "pta", channel_layout_from_format(resolve_channel_format("C5S2"))
+        )
         self.assertEqual([variant.direction for variant in variants], ["ascending", "reversed"])
         self.assertEqual(variants[1].offsets, (4, 2, 0, -2, -4))
         for symmetric in ("gray", "RGB", "C1S3"):
             with self.subTest(symmetric=symmetric):
-                self.assertEqual(len(resolve_channel_variants("pta", symmetric)), 1)
+                layout = channel_layout_from_format(resolve_channel_format(symmetric))
+                self.assertEqual(len(expand_channel_variants("pta", layout)), 1)
 
     def test_pta_internal_identity_is_not_a_physical_view(self) -> None:
         self.assertEqual(resolve_in_plane_variants("pta"), (InPlaneVariant(0.0),))
@@ -200,7 +204,7 @@ class UnificationContractTests(unittest.TestCase):
         self.assertEqual(len(record["selected_implementations"]), 2)
 
     def test_raster_plan_digest_is_canonical_and_sensitive(self) -> None:
-        layout = resolve_channel_layout("C3S1")
+        layout = channel_layout_from_format(resolve_channel_format("C3S1"))
         channel = ChannelVariant(layout=layout)
         common = dict(
             mode=PipelineMode.PTA,
@@ -219,7 +223,7 @@ class UnificationContractTests(unittest.TestCase):
             first.metadata["new"] = True  # type: ignore[index]
 
     def test_render_items_and_batches_have_stable_ids(self) -> None:
-        layout = resolve_channel_layout("gray")
+        layout = channel_layout_from_format(resolve_channel_format("gray"))
         plan = RasterPlan(
             mode="pta",
             physical_view_id="transverse",
@@ -240,6 +244,37 @@ class UnificationContractTests(unittest.TestCase):
         self.assertEqual(RenderRequestBatch("pta", ()).items, ())
         with self.assertRaisesRegex(ValueError, "does not match"):
             RenderRequestBatch("tta", (item_a,))
+
+    def test_render_item_identity_is_lazy_and_unchanged(self) -> None:
+        import dataclasses
+        from XTA.unification.contracts import _digest_record
+        plan = RasterPlan(
+            mode="pta",
+            physical_view_id="transverse",
+            in_plane_variant=InPlaneVariant(),
+            channel_variant=ChannelVariant(channel_layout_from_format(resolve_channel_format("gray"))),
+            sampling_policy=make_policy(),
+            output_shape=(32, 32),
+        )
+        metadata = {"source": {"index": 4, "tags": ["a", "b"]}, "weight": 0.5}
+        item = RenderItem(plan, "intensity", FrameAddress(3, mirror_u=True), metadata)
+        self.assertNotIn("item_id", item.__dict__)
+        self.assertNotIn("item_id", [entry.name for entry in dataclasses.fields(RenderItem)])
+        before_access = pickle.loads(pickle.dumps(item))
+        expected = _digest_record({"plan_digest": plan.digest, "data_role": "intensity",
+            "frame_address": {"index": 3, "mirror_u": True},
+            "metadata": {"source": {"index": 4, "tags": ["a", "b"]}, "weight": 0.5}})
+        self.assertEqual(item.item_id, expected)
+        self.assertIn("item_id", item.__dict__)
+        self.assertEqual(before_access.item_id, expected)
+        self.assertEqual(pickle.loads(pickle.dumps(item)).item_id, expected)
+        self.assertEqual(item, before_access)
+        with self.assertRaises(TypeError):
+            RenderItem(object(), "intensity", FrameAddress(3))
+        with self.assertRaises((TypeError, ValueError)):
+            RenderItem(plan, "intensity", FrameAddress(3), {1: "non-string key"})
+        with self.assertRaises(ValueError):
+            RenderItem(plan, "intensity", FrameAddress(3), {"value": float("nan")})
 
     def test_tile_and_frame_contract_validation(self) -> None:
         self.assertEqual(TileLayout(16, 8).layout_id, "tile_16_8")

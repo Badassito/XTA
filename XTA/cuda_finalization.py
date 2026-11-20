@@ -416,8 +416,6 @@ def try_apply_keep_largest_objects_multi_gpu(
     mask_mm: np.ndarray,
     keep_objects: int,
     temp_dir: Path,
-    *,
-    keep_temp: bool = False,
 ) -> Optional[GpuTailKeepResult]:
     """Try the resident multi-GPU keep path.
 
@@ -871,11 +869,10 @@ def try_apply_keep_largest_objects_multi_gpu(
         if candidate is not None:
             _close_array(candidate)
             candidate = None
-        if not bool(keep_temp):
-            try:
-                candidate_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+        try:
+            candidate_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         if required:
             raise RuntimeError("GPU-resident tail failed") from exc
         print(

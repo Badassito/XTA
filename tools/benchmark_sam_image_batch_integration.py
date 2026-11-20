@@ -110,7 +110,7 @@ def validate_run(config, manifest):
     if config.get('scratch_bytes') != 256*1024**2:
         raise QualificationFailure('Use the unchanged production 256 MiB scratch cap')
     if config.get('heatsoak_seconds', 0) < 45 or config.get('cycles', 0) < 3:
-        raise QualificationFailure('At least45 seconds heatsoak and3 paired cycles are required')
+        raise QualificationFailure('At least 45 seconds of heatsoak and 3 paired cycles are required')
 
 
 def validate_selected_chunks(chunks, enabled, expected):
@@ -120,8 +120,8 @@ def validate_selected_chunks(chunks, enabled, expected):
 
 
 def case_canvas_shape(view, profile):
-    # The small fixture includes537px-wide requests but its native U axis is
-    # only512px. Use the legitimate square processing canvas, not an out-of-
+    # The small fixture includes 537 px-wide requests but its native U axis is
+    # only 512 px. Use the legitimate square processing canvas, not an out-of-
     # bounds private-cache request or a benchmark-only clipped rectangle.
     side=max(int(view.src_h),int(view.src_w))
     return (int(view.num_slices),side,side) if profile=='small' else (

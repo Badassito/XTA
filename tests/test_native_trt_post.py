@@ -364,13 +364,32 @@ class NativeRingCudaPostTests(unittest.TestCase):
         expected = inference._torch_warp_planes_to_native([network], matrix, 8, 8, 8)[0].to(torch.uint8)
         fused = torch.empty_like(slot.native_union)
         self.kernels.upsample_quantize_affine(((1, 1)), (32, 8),
-            (self.kernels.cp.asarray(slot.max_logit), np.uintp(0), np.int32(2), np.int32(2),
+            (self.kernels.cp.asarray(slot.max_logit), np.uintp(0), np.uintp(0), np.int32(2), np.int32(2),
              np.int32(8), np.int32(8), np.int32(8), np.int32(8), *slot.native_to_out,
              self.kernels.cp.asarray(fused), np.uintp(0), np.uintp(0)),
             stream=inference._cupy_external_stream(self.kernels.cp, torch.cuda.current_stream()))
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(slot.native_union, expected))
         self.assertFalse(torch.equal(fused, expected), 'fixture must distinguish legacy fused ordering')
+
+    def test_confidence_kernel_matches_the_torch_reference_bitwise_at_dyadic_ratios(self):
+        torch = self.torch
+        generator = torch.Generator(device='cuda').manual_seed(20261119)
+        for n_in, n_out in ((16, 64), (160, 640)):
+            with self.subTest(n_in=n_in, n_out=n_out):
+                plane = torch.rand((n_in, n_in), generator=generator, device='cuda')
+                plane[plane < .5] = 0
+                union = (torch.rand((n_out, n_out), generator=generator, device='cuda') < .7).float()
+                kernel = inference._upsample_proto_confidence(plane, union, (n_out, n_out))
+                with mock.patch.object(inference, '_resident_mask_kernels', return_value=None):
+                    reference = inference._upsample_proto_confidence(plane, union, (n_out, n_out))
+                cpu = inference._upsample_proto_confidence(plane.cpu(), union.cpu(), (n_out, n_out))
+                torch.cuda.synchronize()
+                nearest = torch.nn.functional.interpolate(
+                    plane[None, None], size=(n_out, n_out), mode='nearest')[0, 0]
+                self.assertTrue(bool(((union > 0) & (nearest == 0) & (kernel > 0)).any()))
+                self.assertTrue(torch.equal(kernel.view(torch.int32), reference.view(torch.int32)))
+                self.assertTrue(torch.equal(kernel.cpu().view(torch.int32), cpu.view(torch.int32)))
 
     def test_native_post_graph_replays_new_outputs_and_survives_identical_destination(self):
         torch = self.torch
@@ -459,6 +478,7 @@ class NativeRingCudaPostTests(unittest.TestCase):
                     M_out_to_native=matrix, dynamic_unit_descriptors=False)
                 self.assertEqual(ex.proto_hole_treatment_active, policy == 'legacy_proto')
                 self.assertEqual(slot.proto_tmp is not None, policy == 'legacy_proto')
+                self.assertEqual(slot.proto_dilated is not None, policy == 'legacy_proto')
                 self.assertEqual(slot.compact_coeff is not None, policy == 'native_mask')
                 self.assertEqual(ex.dynamic_unit_descriptors, policy == 'legacy_proto')
                 if slot.post_graph is not None:
@@ -494,14 +514,17 @@ class NativeRingCudaPostTests(unittest.TestCase):
                 self.assertEqual(ex.proto_hole_radius, radius)
                 self.assertEqual(ex.proto_hole_treatment_active,
                                  policy == 'legacy_proto' and not track_conf and mode == 'close' and radius > 0)
+                self.assertEqual(slot.proto_dilated is not None, ex.proto_hole_treatment_active)
+                self.assertEqual('proto_dilated' in slot._cupy_refs, ex.proto_hole_treatment_active)
                 self.assertEqual(slot.native_conf is not None, track_conf)
                 self.assertEqual(slot.conf_proto is not None, track_conf)
                 self.assertEqual('native_conf' in slot._cupy_refs, track_conf)
                 self.assertEqual('conf_proto' in slot._cupy_refs, track_conf)
                 self.assertEqual(slot.compact_count.item(), expected_count)
                 if track_conf:
-                    # Foreground interpolation can reach a proto cell whose own
-                    # logit is negative; its nearest confidence remains zero.
+                    # Foreground interpolation can reach a proto cell whose own logit
+                    # is negative; it takes the positive-weight tap score, as in the
+                    # generic path.
                     with mock.patch.object(inference, 'gpu_flatten_conf_tracking_enabled', return_value=True):
                         reference = inference._build_direct_device_compacted_payload(
                             head, proto, torch.empty((1, 1, 32, 32), device='cuda'),

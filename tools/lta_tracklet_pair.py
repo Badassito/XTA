@@ -1294,8 +1294,8 @@ def main() -> None:
         "limitations": [
             "this calibration diagnostic executes one adjacent anchor pair on one tile",
             "residual split/merge findings are audit-only and do not force lineage edges",
-            "neighbor-session execution is not invoked here; reusable relay planning lives "
-            "in XTA.lta_tile_tracking",
+            "neighbor-session execution is not invoked here; production relays live in "
+            "XTA.lta_worker_adapter and XTA.lta_relay_episodes",
             "raw tracker object-score logits are not persisted; canonical sigmoid "
             "probabilities pass through exactly once",
             "an incomplete --resume reruns both tracker sessions",

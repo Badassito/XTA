@@ -513,9 +513,9 @@ def main():
     parser.add_argument('--reference-store', type=Path,
                         help='Optional previously projected CVOL for exact SAM voxel comparison')
     parser.add_argument('--timeout-seconds', type=float,
-                        help='Per-worker deadline; SAM replay defaults to300 seconds')
+                        help='Per-worker deadline; SAM replay defaults to 300 seconds')
     parser.add_argument('--stack-dump-seconds', type=float,
-                        help='Periodic worker thread stacks in its log; SAM replay defaults to30 seconds')
+                        help='Periodic worker thread stacks in its log; SAM replay defaults to 30 seconds')
     parser.add_argument('--worker-backend', choices=('legacy', 'sparse', 'legacy_cuda', 'sam_cpu'), help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.workers <= 0:

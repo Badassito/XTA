@@ -6,7 +6,6 @@ inference and completed-view assembly share the same component-filtering rules.
 from __future__ import annotations
 
 import math
-import os
 from typing import Optional, Sequence, Tuple
 
 import numpy as np
@@ -27,16 +26,18 @@ def min_conf_to_u8_threshold(min_conf: float) -> int:
     conf_clamped = min(1.0, max(0.0, float(min_conf)))
     return int(math.ceil(conf_clamped * float(CONF_U8_MAX) - 1e-9))
 
-def cleanup_backend() -> str:
-    """Return the per-slice cleanup backend.
+# OpenCV is the default because the hot operations used here release the GIL and scale
+# better under Python thread pools. 'scipy' keeps the older scipy.ndimage cleanup as a
+# differential reference for tests and strict regression comparison.
+DEFAULT_CLEANUP_BACKEND = 'opencv'
 
- OpenCV is the default because the hot operations used here release the GIL and scale better
- under Python thread pools. Set YOLO_TTA_CLEANUP_BACKEND=scipy to recover the older scipy.ndimage
- cleanup path for debugging or strict regression comparison."""
-    backend = os.environ.get('YOLO_TTA_CLEANUP_BACKEND', 'opencv').strip().lower()
-    if backend not in {'opencv', 'scipy'}:
-        backend = 'opencv'
-    return backend
+
+def _normalize_cleanup_backend(backend: str) -> str:
+    """Return the canonical per-slice cleanup backend name or raise ValueError."""
+    name = str(backend).strip().lower()
+    if name not in ('opencv', 'scipy'):
+        raise ValueError(f"unknown prediction cleanup backend {backend!r}; expected 'opencv' or 'scipy'")
+    return name
 
 def _cv2_connected_components(mask_u8: np.ndarray, connectivity: int = 8) -> Tuple[int, np.ndarray]:
     return cv2.connectedComponents(
@@ -58,28 +59,6 @@ def _enclosed_background(labels2d: np.ndarray, num_labels: int) -> np.ndarray:
 
 def _fill_holes_2d_scipy(mask_bool: np.ndarray) -> np.ndarray:
     return np.asarray(ndi.binary_fill_holes(np.asarray(mask_bool, dtype=bool)), dtype=bool)
-
-def _fill_holes_2d_opencv(mask_bool: np.ndarray) -> np.ndarray:
-    """Fill 2D holes using background connected components.
-
- This matches scipy.ndimage.binary_fill_holes' default 2D background connectivity (4-connected)
- while avoiding the slower Python-visible scipy path for thousands of large slices."""
-    mask_u8 = np.ascontiguousarray(np.asarray(mask_bool, dtype=np.uint8))
-    if mask_u8.size == 0 or not np.any(mask_u8):
-        return np.zeros(mask_u8.shape, dtype=bool)
-    if bool(np.all(mask_u8)):
-        return np.ones(mask_u8.shape, dtype=bool)
-
-    bg_u8 = (mask_u8 == 0).astype(np.uint8, copy=False)
-    num_labels, labels2d = _cv2_connected_components(bg_u8, connectivity=4)
-    if int(num_labels) <= 1:
-        return mask_u8.astype(bool, copy=False)
-
-    enclosed_bg = _enclosed_background(labels2d, num_labels)
-    if np.any(enclosed_bg):
-        mask_u8 = mask_u8.copy()
-        mask_u8[enclosed_bg] = np.uint8(1)
-    return mask_u8.astype(bool, copy=False)
 
 def _fill_holes_2d_opencv_u8_inplace(
     arr_u8: np.ndarray,
@@ -204,7 +183,7 @@ def _cleanup_prediction_slice_inplace(
     *,
     min_conf: float = 0.0,
     min_radius: float = 0.0,
-    backend: Optional[str] = None,
+    backend: str = DEFAULT_CLEANUP_BACKEND,
     structure2: Optional[np.ndarray] = None,
     min_conf_u8: Optional[int] = None,
 ) -> bool:
@@ -215,7 +194,7 @@ def _cleanup_prediction_slice_inplace(
         # slice bool-cast + unconditional write-back (a pure read+rewrite no-op at
         # min_conf 0 --min_radius 0) and report foreground from a read-only scan.
         return bool(np.any(np.asarray(mask_mm[idx_i])))
-    backend_norm = cleanup_backend() if backend is None else str(backend)
+    backend_norm = _normalize_cleanup_backend(backend)
     structure = np.ones((3, 3), dtype=bool) if structure2 is None else structure2
     min_conf_u8_i = (
         int(min_conf_to_u8_threshold(float(min_conf)))
@@ -277,6 +256,7 @@ def fused_slice_cleanup_inplace(
     min_radius: float = 0.0,
     workers: int = 1,
     desc: str = 'Fused slice cleanup',
+    backend: str = DEFAULT_CLEANUP_BACKEND,
 ) -> None:
     """Filter slices in chunks, using one distance transform per nonempty slice.
 
@@ -288,7 +268,7 @@ def fused_slice_cleanup_inplace(
     min_conf_u8 = int(min_conf_to_u8_threshold(float(min_conf))) if float(min_conf) > 0.0 else 0
     worker_count = choose_slice_parallel_workers(int(workers), num_slices)
     chunk_size = choose_parallel_chunk_size(num_slices, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
-    backend = cleanup_backend()
+    backend = _normalize_cleanup_backend(backend)
 
     def _process(i: int) -> None:
         _cleanup_prediction_slice_inplace(
@@ -317,6 +297,7 @@ def fill_view_volume_holes_2d_inplace(
     desc: str = '2D hole fill (per-view volume)',
     known_slice_any: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
+    backend: str = DEFAULT_CLEANUP_BACKEND,
 ) -> None:
     """Fill enclosed 2D background components in completed view slices.
 
@@ -328,7 +309,7 @@ def fill_view_volume_holes_2d_inplace(
     num_slices = int(mask_mm.shape[0])
     if num_slices <= 0:
         return
-    backend = cleanup_backend()
+    backend = _normalize_cleanup_backend(backend)
 
     metadata_ok = False
     any_arr: Optional[np.ndarray] = None
@@ -423,6 +404,7 @@ def cleanup_view_volume_after_prediction_inplace(
     known_slice_any: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
     threshold_plane_shape: Optional[Tuple[int, int]] = None,
+    backend: str = DEFAULT_CLEANUP_BACKEND,
 ) -> None:
     enable_hole_fill = yolo_hole_fill_enabled()
     if (not enable_hole_fill and (
@@ -459,6 +441,7 @@ def cleanup_view_volume_after_prediction_inplace(
             min_radius=float(native_min_radius),
             workers=int(workers),
             desc=f'Fused cleanup ({view.name})',
+            backend=backend,
         )
 
     # 2D hole filling is the FINAL per-view step, applied after
@@ -481,4 +464,5 @@ def cleanup_view_volume_after_prediction_inplace(
             desc=f'2D hole fill ({view.name})',
             known_slice_any=known_slice_any,
             known_slice_bboxes=known_slice_bboxes,
+            backend=backend,
         )

@@ -36,7 +36,6 @@ class ConfidenceEvidenceTests(unittest.TestCase):
         # pipeline test's final source dimensions.
         assembly.set_final_source_output_shape(None)
         disabled = mock.patch.dict('os.environ', {
-            'YOLO_TTA_GPU_AZIMUTHAL_BACKPROJECT': '0',
             'YOLO_TTA_GPU_RADIAL_BACKPROJECT': '0',
             'YOLO_TTA_GPU_SPHERICAL_BACKPROJECT': '0',
             'YOLO_TTA_GPU_TILTED_AZIMUTHAL_BACKPROJECT': '0',
@@ -149,16 +148,16 @@ class ConfidenceEvidenceTests(unittest.TestCase):
                         tile_confmap_path=work / f'tile{number}.score.dat',
                         threshold_plane_shape=shape[1:])
                     result = assembly.postprocess_tile_volume_after_inference(task, view=view,
-                        min_conf=0, min_radius=0, keep_temp=False, slice_workers=1,
+                        min_conf=0, min_radius=0, slice_workers=1,
                         sparse_retire_dir=work if sparse else None)
                     first = assembly.gate_tile_result_against_parent_mask(result,
                         parent_mask_support_mm=parent, tile_accumulator_mm=total,
-                        tile_accumulator_locks=None, work_dir=work, keep_temp=False,
+                        tile_accumulator_locks=None, work_dir=work,
                         slice_workers=1, tile_parent_mask_accumulator_mm=by_parent)
                     self.assertIsNotNone(first.residual_result)
                     assembly.gate_tile_residual_against_parent_bridge(first.residual_result,
                         parent_bridge_support_mm=bridge, tile_accumulator_mm=total,
-                        tile_accumulator_locks=None, work_dir=work, keep_temp=False,
+                        tile_accumulator_locks=None, work_dir=work,
                         slice_workers=1, tile_parent_bridge_accumulator_mm=by_bridge)
                 for category, mask in (('parent_mask', by_parent), ('parent_bridge', by_bridge)):
                     ref = capture_consolidated_tile_confidence(mask, view=view, model_name='m',

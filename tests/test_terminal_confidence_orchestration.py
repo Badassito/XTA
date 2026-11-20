@@ -186,7 +186,7 @@ def test_score_credit_waits_for_the_last_borrowed_view_with_gc_disabled(tmp_path
     gc.disable()
     try:
         retire_confidence_scores(scores, model_name='model', view_name='view', path=tmp_path/'score.dat',
-            keep_temp=False, retired_callback=lambda *v:events.append(v), carrier=carrier)
+            retired_callback=lambda *v:events.append(v), carrier=carrier)
         scores = None
         assert not carrier and not events and reference() is not None
         assert alias.sum() == 64*91

@@ -171,7 +171,6 @@ def test_real_cpu_openvino_raw_outputs_replay_without_another_output_copy(tmp_pa
 
 
 def test_annotated_source_uses_metadata_key_but_cpu_augmentation_hashes_pixels(tmp_path, monkeypatch):
-    from dataclasses import replace
     from XTA.forward_replay import bind_worker_replay_source, replay_for_model
     from XTA.geometry import AffineSpec, AugJob, ViewInfo
     from XTA.tta_augmentation_cpu_runtime import CpuPolicyBatchSource
@@ -184,7 +183,7 @@ def test_annotated_source_uses_metadata_key_but_cpu_augmentation_hashes_pixels(t
     source = SimpleNamespace()
     affine = np.eye(2, 3, dtype=np.float32)
     view = ViewInfo('transverse', 1, 8, 8, 'clamp', full_t=1, full_h=8, full_w=8)
-    job = AugJob('a0', 0., tmp_path / 'first_scalar' / 'a0.json', AffineSpec(
+    job = AugJob('a0', 0., AffineSpec(
         'transverse', 0., 8, 8, 8, 8, 8, 8, 0., 0., affine, affine, affine, affine,
     ))
     task = {'sweep_source_stamp': ['source', 123], 'kind': 'fullframe', 'job_id': 1,
@@ -194,11 +193,6 @@ def test_annotated_source_uses_metadata_key_but_cpu_augmentation_hashes_pixels(t
     logical = cache.input_key(pixels, source=source, batch_index=0)
     changed = pixels + np.float32(1)
     assert cache.input_key(changed, source=source, batch_index=0) == logical
-    relocated = SimpleNamespace()
-    bind_worker_replay_source(relocated, {
-        **task, 'job': replace(job, meta_path=tmp_path / 'next_scalar' / 'a0.json'),
-    }, 'openvino_cpu')
-    assert cache.input_key(pixels, source=relocated, batch_index=0) == logical
     augmented = CpuPolicyBatchSource([], [], None, [], None)
     assert cache.input_key(changed, source=augmented, batch_index=0) != cache.input_key(
         pixels, source=augmented, batch_index=0,

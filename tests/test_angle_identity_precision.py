@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import unittest
-from pathlib import Path
 
 from XTA import geometry as g
 from XTA.config import resolve_tilted_view_groups
@@ -48,7 +47,7 @@ class AngleIdentityPrecisionTests(unittest.TestCase):
         views = g.expand_views_into_tta_variants((physical,), angles)
         self.assertEqual(len({view.name for view in views}), 2)
         for view in views:
-            job = g.build_aug_job_for_variant(view, 8, Path("unused"))
+            job = g.build_aug_job_for_variant(view, 8)
             self.assertEqual(job.aug_id, InPlaneVariant(view.tta_angle_deg).variant_id)
             self.assertEqual(job.angle_deg, view.tta_angle_deg)
 

@@ -42,6 +42,10 @@ class CompactQSCGeometryTests(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec('torch') is not None, 'Torch is optional')
 class SphericalRotationReuseTests(unittest.TestCase):
+    def setUp(self):
+        spherical_cuda._validate_spherical_rotation.cache_clear()
+        self.addCleanup(spherical_cuda._validate_spherical_rotation.cache_clear)
+
     def test_validation_reuses_values_but_rejects_mutated_rotation(self):
         engine = resident_engine(np.zeros((9, 11, 13), np.uint8))
         view = spherical_view(rotation=rotation_xyz())
@@ -52,27 +56,32 @@ class SphericalRotationReuseTests(unittest.TestCase):
             spherical_cuda._render_contract(engine, view, 1)
             self.assertEqual(determinant.call_count, 1)
             view.spherical_rotation_xyz[0] *= 2
-            with self.assertRaisesRegex(ValueError, 'proper rigid rotation'):
-                spherical_cuda._render_contract(engine, view, 1)
-        self.assertEqual(len(engine._spherical_rotation_cache), 1)
+            for _attempt in range(2):
+                with self.assertRaisesRegex(ValueError, 'proper rigid rotation'):
+                    spherical_cuda._render_contract(engine, view, 1)
+        self.assertEqual(spherical_cuda._validate_spherical_rotation.cache_info().currsize, 1)
+        # Validation keeps no per-engine state for batch admission to inspect.
+        self.assertFalse(hasattr(engine, '_spherical_rotation_cache'))
 
     def test_invalid_values_never_enter_cache_and_validations_stay_bounded(self):
         engine = resident_engine(np.zeros((9, 11, 13), np.uint8))
         view = spherical_view()
         from XTA.spherical_geometry import cube_rotation
-        with mock.patch.object(spherical_cuda, '_ROTATION_CACHE_ENTRIES', 2):
-            for angle in (0., 20., 40., 60.):
-                view.spherical_rotation_xyz = cube_rotation('vertical', angle)
+        validate = spherical_cuda._validate_spherical_rotation
+        for angle in range(40):
+            view.spherical_rotation_xyz = cube_rotation('vertical', float(angle))
+            spherical_cuda._render_contract(engine, view, 0)
+        self.assertEqual(validate.cache_info().currsize, validate.cache_info().maxsize)
+        for rotation, message in (((1.,) * 8, 'nine finite'),
+                                  ((float('nan'),) * 9, 'nine finite'),
+                                  ((float('inf'),) * 9, 'nine finite'),
+                                  (tuple(np.diag((1., 1., -1.)).reshape(-1)), 'proper rigid')):
+            view.spherical_rotation_xyz = rotation
+            misses = validate.cache_info().misses
+            with self.subTest(rotation=rotation), self.assertRaisesRegex(ValueError, message):
                 spherical_cuda._render_contract(engine, view, 0)
-            self.assertEqual(len(engine._spherical_rotation_cache), 2)
-            for rotation in ((1.,) * 8, (float('nan'),) * 9, (float('inf'),) * 9,
-                             tuple(np.diag((1., 1., -1.)).reshape(-1))):
-                view.spherical_rotation_xyz = rotation
-                with self.subTest(rotation=rotation), self.assertRaises(ValueError):
-                    spherical_cuda._render_contract(engine, view, 0)
-            self.assertEqual(len(engine._spherical_rotation_cache), 2)
-        spherical_cuda.clear_spherical_render_cache(engine)
-        self.assertFalse(engine._spherical_rotation_cache)
+            self.assertEqual(validate.cache_info().misses, misses + 1)
+        self.assertEqual(validate.cache_info().currsize, validate.cache_info().maxsize)
 
     def test_cached_rotation_does_not_bypass_source_or_radius_validation(self):
         engine = resident_engine(np.zeros((9, 11, 13), np.uint8))

@@ -183,13 +183,13 @@ def build_field_reference(preview, native_shape_tyx, cache_dir, *,
                           memory_budget_mib=2048, progress=None):
     """Build and atomically publish one portable complete-object field cache.
 
-    ``preview`` is a3D ndarray containing binary0/1 values. It is never mutated.
+    ``preview`` is a 3D ndarray containing binary 0/1 values. It is never mutated.
     ``progress`` optionally receives dictionaries with stage/status metadata.
     Existing cache destinations are always rejected. Empty input produces an
     explicit constant-zero manifest, without undefined empty EDT arrays.
     """
     if not isinstance(preview, np.ndarray) or preview.ndim != 3:
-        raise ValueError("preview must be a3D binary numpy ndarray")
+        raise ValueError("preview must be a 3D binary numpy ndarray")
     low_shape = _shape3(preview.shape, "preview.shape")
     source_dtype = preview.dtype.str
     native_shape = _shape3(native_shape_tyx, "native_shape_tyx")
@@ -257,9 +257,9 @@ def build_field_reference(preview, native_shape_tyx, cache_dir, *,
             "shape_tyx": list(field_shape) if field_shape else [0, 0, 0],
             "padding_cells": PADDING_CELLS,
             "exterior_policy": "Zero geometric support outside original source and complete foreground; padding is not negative annotation authority.",
-            "coefficient_scope": "Complete foreground bbox plus3zero cells; no output-block-local field reconstruction.",
+            "coefficient_scope": "Complete foreground bbox plus 3 zero cells; no output-block-local field reconstruction.",
             "phi_definition": "EDT(mask)-0.5 inside;0.5-EDT(~mask) outside; PREVIEW index units.",
-            "cap_definition": "min(0.5,0.2*max(nearest_global_Lee_skeleton_EDT-0.5,0)); same6CC only; undefined0; nearest original foreground scalar extension.",
+            "cap_definition": "min(0.5,0.2*max(nearest_global_Lee_skeleton_EDT-0.5,0)); same 6CC only; undefined -> 0; nearest original foreground scalar extension.",
             "required_memory_estimate": estimate, "memory_budget_mib": float(memory_budget_mib),
             "required_temporary_disk_estimate_bytes": int(required_disk),
             "fields": {}, "builder_sha256": _digest(Path(__file__)),
@@ -304,7 +304,7 @@ def validate_field_reference(preview, native_shape_tyx, cache_dir):
     """
     from .policy import POLICY, ALGORITHM_VERSION, package_source_identity
     if not isinstance(preview, np.ndarray) or preview.ndim != 3 or preview.dtype.kind not in "buif":
-        raise ValueError("preview must be a3D real binary numpy ndarray")
+        raise ValueError("preview must be a 3D real binary numpy ndarray")
     low = _shape3(preview.shape, "preview.shape")
     native = _shape3(native_shape_tyx, "native_shape_tyx")
     path = Path(cache_dir).expanduser().resolve()
@@ -414,7 +414,7 @@ def _build_nonempty(preview, lo, hi, shape, stage, estimate, budget_bytes, notif
         "components6": component_count, "skeleton_voxels": skeleton_count,
         "components_without_skeleton_count": int(missing.size),
         "components_without_skeleton_examples": [int(v) for v in missing[:100]],
-        "skeleton_method": "Lee", "radius_validity": "Nearest GLOBAL skeleton must belong to same6CC; no farther same-component fallback.",
+        "skeleton_method": "Lee", "radius_validity": "Nearest GLOBAL skeleton must belong to same 6CC; no farther same-component fallback.",
     }
     del missing, has_skeleton
     notify("components", "completed", components6=component_count)

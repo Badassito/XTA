@@ -230,15 +230,14 @@ class CylindricalCudaDispatchTests(unittest.TestCase):
         self.assertIsNone(coordinator.try_acquire_stage(torch, 'Radial backprojection'))
         torch.cuda.mem_get_info.assert_not_called()
 
-    def test_radial_uses_inference_priority_even_with_legacy_backprojection_overlap(self):
-        with mock.patch.object(backprojection, 'v1613_d1_backprojection_overlap_enabled', return_value=True):
-            coordinator = backprojection._MainProcessGpuStageCoordinator()
-            coordinator.configure_workers([0, 1])
-            torch = types.SimpleNamespace(
-                cuda=types.SimpleNamespace(device_count=lambda: 2, mem_get_info=mock.Mock()),
-            )
-            self.assertIsNone(coordinator.try_acquire_stage(torch, 'Radial source projection layer'))
-            torch.cuda.mem_get_info.assert_not_called()
+    def test_radial_source_projection_uses_inference_priority(self):
+        coordinator = backprojection._MainProcessGpuStageCoordinator()
+        coordinator.configure_workers([0, 1])
+        torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(device_count=lambda: 2, mem_get_info=mock.Mock()),
+        )
+        self.assertIsNone(coordinator.try_acquire_stage(torch, 'Radial source projection layer'))
+        torch.cuda.mem_get_info.assert_not_called()
 
 
 if __name__ == '__main__':

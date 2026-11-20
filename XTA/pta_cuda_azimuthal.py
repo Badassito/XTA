@@ -82,13 +82,6 @@ __device__ __forceinline__ long long pta_tyx_offset(
         * (long long)x_len + (long long)x;
 }
 
-extern "C" __global__ void pta_azimuthal_offset_probe(
-    long long* result, int t, int y, int x, int y_len, int x_len)
-{
-    if (blockIdx.x == 0 && threadIdx.x == 0)
-        result[0] = pta_tyx_offset(t, y, x, y_len, x_len);
-}
-
 extern "C" __global__ void pta_azimuthal_categorical(
     const unsigned char* mask, const unsigned char* coverage,
     unsigned char* out_mask, unsigned char* out_coverage,

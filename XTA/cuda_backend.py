@@ -37,7 +37,6 @@ from .workspace import (
     _env_float,
     _env_int,
     _tilted_grid_is_identity,
-    azimuthal_source_mode,
 )
 from .runtime import (
     choose_slice_parallel_workers,
@@ -873,14 +872,36 @@ def _fused_direct_render_kernels() -> Optional[object]:
       px = clamped_px;
       py = clamped_py;
       float stack = azimuthal_row_to_stack(azimuthal_y, rows, stack_len);
-      if (tan_tilt != 0.0f) {
-        float axis = direction_id == 0 ? py - center_y : px - center_x;
-        stack = __fadd_rn(stack, __fmul_rn(tan_tilt, axis));
+      if (tan_tilt == 0.0f) {
+        if (stack < 0.0f || stack > (float)(stack_len - 1)) return 0.0f;
+        return output_border_weight * azimuthal_source_texture(
+            volume_tex, native_t, full_h, full_w, logical_t,
+            base_id, px, py, stack);
       }
-      if (stack < 0.0f || stack > (float)(stack_len - 1)) return 0.0f;
-      return output_border_weight * azimuthal_source_texture(
-          volume_tex, native_t, full_h, full_w, logical_t,
-          base_id, px, py, stack);
+      // Tilted: shear the stack at each integer tap of the tilt axis, as the CPU reference,
+      // the Torch startup-preflight reference and the linear pointer fallback do. The shear
+      // is constant along the other planar axis, so the hardware filter interpolates that
+      // axis and the stack; each tilt-axis tap keeps its own stack validity.
+      bool vertical = direction_id == 0;
+      float tilt_coord = vertical ? py : px;
+      float tilt_center = vertical ? center_y : center_x;
+      int tilt_size = vertical ? plane_h : plane_w;
+      int tilt_tap0 = floor_i(tilt_coord);
+      float tilt_frac = tilt_coord - (float)tilt_tap0;
+      float acc = 0.0f;
+      for (int tap = 0; tap < 2; ++tap) {
+        int tilt_tap = tilt_tap0 + tap;
+        float weight = tap ? tilt_frac : 1.0f - tilt_frac;
+        if (weight == 0.0f || tilt_tap >= tilt_size) continue;
+        float tap_stack = __fadd_rn(
+            stack, __fmul_rn(tan_tilt, (float)tilt_tap - tilt_center));
+        if (tap_stack < 0.0f || tap_stack > (float)(stack_len - 1)) continue;
+        float value = azimuthal_source_texture(
+            volume_tex, native_t, full_h, full_w, logical_t, base_id,
+            vertical ? px : (float)tilt_tap, vertical ? (float)tilt_tap : py, tap_stack);
+        acc = __fadd_rn(acc, __fmul_rn(weight, value));
+      }
+      return output_border_weight * acc;
     }
 
     __device__ __forceinline__ float azimuthal_texture_direct_value(
@@ -982,183 +1003,6 @@ def _fused_direct_render_kernels() -> Optional[object]:
           __fadd_rn(__fmul_rn(m10, (float)ox), __fmul_rn(m11, (float)oy)), m12);
       float value = azimuthal_texture_sample(
           volume_tex, native_t, full_h, full_w, logical_t,
-          rows, n_u, stack_len, base_id, direction_id,
-          tan_tilt, center_x, center_y, roi_radius,
-          angle_idx, azimuthal_y, azimuthal_x, angle_cos, angle_sin);
-      out[q] = clamp_f(value, 0.0f, 1.0f) * 255.0f;
-    }
-
-    // A3: canonical-pointer Azimuthal sampling. X/Y/stack are nearest-neighbor while
-    // the decoded native T axis remains linearly interpolated. This reads the same
-    // resident uint8 allocation used by Cartesian/Tilted renderers and avoids a second
-    // full-volume CUDA array/texture copy.
-    __device__ __forceinline__ float azimuthal_source_pointer(
-        const unsigned char* volume,
-        int native_t, int full_h, int full_w, int logical_t,
-        int base_id, float plane_x, float plane_y, float stack) {
-      float source_x, source_y, source_t;
-      if (base_id == 0) {
-        source_x = plane_x;
-        source_y = plane_y;
-        source_t = logical_to_native_coord(stack, native_t, logical_t);
-      } else if (base_id == 1) {
-        source_x = plane_x;
-        source_y = stack;
-        source_t = logical_to_native_coord(plane_y, native_t, logical_t);
-      } else {
-        source_x = stack;
-        source_y = plane_x;
-        source_t = logical_to_native_coord(plane_y, native_t, logical_t);
-      }
-      int x = __float2int_rn(source_x);
-      int y = __float2int_rn(source_y);
-      if (x < 0 || x >= full_w || y < 0 || y >= full_h) return 0.0f;
-      int t0 = clamp_i(floor_i(source_t), 0, native_t - 1);
-      int t1 = min(native_t - 1, t0 + 1);
-      float alpha = clamp_f(source_t - (float)t0, 0.0f, 1.0f);
-      long long plane_stride = (long long)full_h * (long long)full_w;
-      long long spatial = (long long)y * (long long)full_w + (long long)x;
-      float a = (float)volume[(long long)t0 * plane_stride + spatial];
-      float b = (float)volume[(long long)t1 * plane_stride + spatial];
-      return norm_u8(a + alpha * (b - a));
-    }
-
-    __device__ __forceinline__ float azimuthal_pointer_sample(
-        const unsigned char* volume,
-        int native_t, int full_h, int full_w, int logical_t,
-        int rows, int n_u, int stack_len, int base_id, int direction_id,
-        float tan_tilt, float center_x, float center_y, float roi_radius,
-        int angle_idx, float azimuthal_y, float azimuthal_x,
-        const float* angle_cos, const float* angle_sin) {
-      float clamped_azimuthal_x, clamped_azimuthal_y;
-      float border_x = zero_padded_linear_coord(azimuthal_x, n_u, &clamped_azimuthal_x);
-      float border_y = zero_padded_linear_coord(azimuthal_y, rows, &clamped_azimuthal_y);
-      float output_border_weight = border_x * border_y;
-      if (output_border_weight <= 0.0f) return 0.0f;
-      azimuthal_x = clamped_azimuthal_x;
-      azimuthal_y = clamped_azimuthal_y;
-      float line = n_u > 1
-          ? -roi_radius + (2.0f * roi_radius) * (azimuthal_x / (float)(n_u - 1))
-          : -roi_radius;
-      float px = center_x + line * angle_cos[angle_idx];
-      float py = center_y + line * angle_sin[angle_idx];
-      int plane_w = azimuthal_plane_width(base_id, full_h, full_w);
-      int plane_h = azimuthal_plane_height(base_id, full_h, logical_t);
-      float clamped_px, clamped_py;
-      if (!renormalized_linear_coord(px, plane_w, &clamped_px)
-          || !renormalized_linear_coord(py, plane_h, &clamped_py)) return 0.0f;
-      px = clamped_px;
-      py = clamped_py;
-      float stack_coord = azimuthal_row_to_stack(azimuthal_y, rows, stack_len);
-      if (tan_tilt != 0.0f) {
-        float axis = direction_id == 0 ? py - center_y : px - center_x;
-        stack_coord = __fadd_rn(stack_coord, __fmul_rn(tan_tilt, axis));
-      }
-      if (stack_coord < 0.0f || stack_coord > (float)(stack_len - 1)) return 0.0f;
-      return output_border_weight * azimuthal_source_pointer(
-          volume, native_t, full_h, full_w, logical_t,
-          base_id, px, py, stack_coord);
-    }
-
-    __device__ __forceinline__ float azimuthal_pointer_direct_value(
-        const unsigned char* volume,
-        int native_t, int full_h, int full_w, int logical_t,
-        int rows, int n_u, int stack_len, int base_id, int direction_id,
-        const int* render_meta, float tan_tilt,
-        float center_x, float center_y, float roi_radius,
-        float m00, float m01, float m02, float m10, float m11, float m12,
-        const float* angle_cos, const float* angle_sin, int oy, int ox) {
-      int angle_idx = render_meta[0];
-      float azimuthal_x = __fadd_rn(
-          __fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
-      float azimuthal_y = __fadd_rn(
-          __fadd_rn(__fmul_rn(m10, (float)ox), __fmul_rn(m11, (float)oy)), m12);
-      return azimuthal_pointer_sample(
-          volume, native_t, full_h, full_w, logical_t,
-          rows, n_u, stack_len, base_id, direction_id,
-          tan_tilt, center_x, center_y, roi_radius,
-          angle_idx, azimuthal_y, azimuthal_x, angle_cos, angle_sin);
-    }
-
-    extern "C" __global__ void azimuthal_pointer_direct_f32(
-        const unsigned char* volume,
-        int native_t, int full_h, int full_w, int logical_t,
-        int rows, int n_u, int stack_len, int base_id, int direction_id,
-        const int* render_meta, float tan_tilt,
-        float center_x, float center_y, float roi_radius,
-        int oh, int ow,
-        float m00, float m01, float m02, float m10, float m11, float m12,
-        const float* angle_cos, const float* angle_sin, float* out) {
-      int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
-      int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
-      if (ox >= ow || oy >= oh) return;
-      int q = oy * ow + ox;
-      out[q] = clamp_f(azimuthal_pointer_direct_value(
-          volume, native_t, full_h, full_w, logical_t,
-          rows, n_u, stack_len, base_id, direction_id, render_meta, tan_tilt,
-          center_x, center_y, roi_radius,
-          m00, m01, m02, m10, m11, m12, angle_cos, angle_sin, oy, ox), 0.0f, 1.0f);
-    }
-
-    extern "C" __global__ void azimuthal_pointer_direct_f16(
-        const unsigned char* volume,
-        int native_t, int full_h, int full_w, int logical_t,
-        int rows, int n_u, int stack_len, int base_id, int direction_id,
-        const int* render_meta, float tan_tilt,
-        float center_x, float center_y, float roi_radius,
-        int oh, int ow,
-        float m00, float m01, float m02, float m10, float m11, float m12,
-        const float* angle_cos, const float* angle_sin, __half* out) {
-      int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
-      int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
-      if (ox >= ow || oy >= oh) return;
-      int q = oy * ow + ox;
-      float value = clamp_f(azimuthal_pointer_direct_value(
-          volume, native_t, full_h, full_w, logical_t,
-          rows, n_u, stack_len, base_id, direction_id, render_meta, tan_tilt,
-          center_x, center_y, roi_radius,
-          m00, m01, m02, m10, m11, m12, angle_cos, angle_sin, oy, ox), 0.0f, 1.0f);
-      out[q] = __float2half_rn(value);
-    }
-
-    extern "C" __global__ void azimuthal_pointer_native_f32(
-        const unsigned char* volume,
-        int native_t, int full_h, int full_w, int logical_t,
-        int rows, int n_u, int stack_len, int base_id, int direction_id,
-        int angle_idx, float tan_tilt,
-        float center_x, float center_y, float roi_radius,
-        const float* angle_cos, const float* angle_sin, float* out) {
-      int u = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
-      int row = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
-      if (u >= n_u || row >= rows) return;
-      int q = row * n_u + u;
-      float value = azimuthal_pointer_sample(
-          volume, native_t, full_h, full_w, logical_t,
-          rows, n_u, stack_len, base_id, direction_id,
-          tan_tilt, center_x, center_y, roi_radius,
-          angle_idx, (float)row, (float)u, angle_cos, angle_sin);
-      out[q] = clamp_f(value, 0.0f, 1.0f) * 255.0f;
-    }
-
-    extern "C" __global__ void azimuthal_pointer_grid_f32(
-        const unsigned char* volume,
-        int native_t, int full_h, int full_w, int logical_t,
-        int rows, int n_u, int stack_len, int base_id, int direction_id,
-        int angle_idx, float tan_tilt,
-        float center_x, float center_y, float roi_radius,
-        int oh, int ow,
-        float m00, float m01, float m02, float m10, float m11, float m12,
-        const float* angle_cos, const float* angle_sin, float* out) {
-      int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
-      int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
-      if (ox >= ow || oy >= oh) return;
-      int q = oy * ow + ox;
-      float azimuthal_x = __fadd_rn(
-          __fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
-      float azimuthal_y = __fadd_rn(
-          __fadd_rn(__fmul_rn(m10, (float)ox), __fmul_rn(m11, (float)oy)), m12);
-      float value = azimuthal_pointer_sample(
-          volume, native_t, full_h, full_w, logical_t,
           rows, n_u, stack_len, base_id, direction_id,
           tan_tilt, center_x, center_y, roi_radius,
           angle_idx, azimuthal_y, azimuthal_x, angle_cos, angle_sin);
@@ -1322,8 +1166,6 @@ def _fused_direct_render_kernels() -> Optional[object]:
             'set_render_meta',
             'azimuthal_texture_direct_f32', 'azimuthal_texture_direct_f16',
             'azimuthal_texture_native_f32', 'azimuthal_texture_grid_f32',
-            'azimuthal_pointer_direct_f32', 'azimuthal_pointer_direct_f16',
-            'azimuthal_pointer_native_f32', 'azimuthal_pointer_grid_f32',
             'tilted_direct_f32', 'tilted_direct_f16',
         )
         module = cp.RawModule(code=src, options=('--std=c++14',))
@@ -1417,10 +1259,6 @@ def _wait_for_cube_ready_sentinel(
                 'file-backed fallback rendering...'
             )
         time.sleep(max(0.05, float(poll_seconds)))
-
-def fused_renderer_preflight_enabled() -> bool:
-    """Fail-fast worker probe for fused upright-Azimuthal, Tilted, and tilted-Azimuthal kernels."""
-    return _env_flag('YOLO_TTA_FUSED_RENDER_PREFLIGHT', True)
 
 def fused_renderer_fail_fast_enabled() -> bool:
     """Treat an enabled fused-render launch/probe failure as worker-fatal."""
@@ -1547,7 +1385,7 @@ def fused_renderer_effective_max_fraction_tolerance(
 ) -> Tuple[float, float]:
     """Return the effective high-error fraction limit and its automatic seam floor.
 
-    The one-pixel floor applies only to the default hardware-texture Azimuthal comparison. An
+    The one-pixel floor applies only to the hardware-texture Azimuthal comparison. An
     explicit ``YOLO_TTA_FUSED_PREFLIGHT_MAX_ABS_FRACTION`` remains authoritative, and the
     independent mean-error and 4/255 mismatch-fraction limits are never relaxed.
     """
@@ -1555,8 +1393,6 @@ def fused_renderer_effective_max_fraction_tolerance(
     if os.environ.get('YOLO_TTA_FUSED_PREFLIGHT_MAX_ABS_FRACTION', '').strip():
         return configured, 0.0
     if str(preflight_family) not in ('azimuthal', 'tilted_azimuthal'):
-        return configured, 0.0
-    if azimuthal_source_mode() != 'texture_linear':
         return configured, 0.0
     seam_floor = _single_pixel_closed_seam_fraction(int(height), int(width))
     return max(configured, float(seam_floor)), float(seam_floor)
@@ -1624,7 +1460,6 @@ class _GpuWorkerRenderEngine:
         self._fused_preflight_volume_key: Optional[Tuple[str, Tuple[int, int, int], int]] = None
         self._standalone_render_meta: Optional[object] = None
         self._standalone_render_meta_ref: Optional[object] = None
-        self._warned_fallback = False
         self._resident_runtime_disabled = False
         # Native planes reused within one angle-local tile source across batches and
         # contextual channel indices; no cross-tile canvas is retained.
@@ -1704,7 +1539,6 @@ class _GpuWorkerRenderEngine:
                     int(nbytes)
                     if (
                         bool(require_azimuthal_texture)
-                        and azimuthal_source_mode() == 'texture_linear'
                         and azimuthal_texture_source_copy_reserve_enabled()
                     )
                     else 0
@@ -1753,7 +1587,7 @@ class _GpuWorkerRenderEngine:
             return 'stream'
         if self._mode == 'resident':
             resize_note = (
-                f' (v13.3.9 E3: native t retained; renderers map {in_t}->{out_t} on device)'
+                f' (native t retained; renderers map {in_t}->{out_t} on device)'
                 if resize_active else ''
             )
             print(
@@ -1908,7 +1742,6 @@ class _GpuWorkerRenderEngine:
                     if (
                         bool(require_azimuthal_texture)
                         and not self._pta_native_t_exact
-                        and azimuthal_source_mode() == "texture_linear"
                         and azimuthal_texture_source_copy_reserve_enabled()
                     )
                     else 0
@@ -2101,7 +1934,7 @@ class _GpuWorkerRenderEngine:
             pass
 
     def _native_t_indices(self, logical_t: Optional[int] = None) -> Tuple[object, object, object]:
-        """Integer logical-t planes -> native two-tap indices/weights on device."""
+        """Integer logical-t planes -> native two-tap indices/weights on device (center-aligned, cv2 INTER_LINEAR convention)."""
         torch = self.torch
         native_t = int(self._volume_gpu.shape[0])
         if getattr(self, '_radial_source_t', None) is not None:
@@ -2124,7 +1957,7 @@ class _GpuWorkerRenderEngine:
         return mapped
 
     def _resample_native_t_axis(self, values: object) -> object:
-        """Map a native-t-leading tensor to logical t with endpoint-aligned u8 rounding."""
+        """Map a native-t-leading tensor to logical t: center-aligned (OpenCV half-pixel) two-tap lerp, then u8 rounding."""
         torch = self.torch
         native_t = int(values.shape[0])
         logical_t = int(self._logical_t)
@@ -2149,7 +1982,7 @@ class _GpuWorkerRenderEngine:
             if family_s == 'tilted_azimuthal':
                 gate = (
                     'YOLO_TTA_FUSED_AZIMUTHAL_RENDER=0 disables only the direct kernel; '
-                    'YOLO_TTA_GPU_TILTED_AZIMUTHAL_RENDER=0 restores the v16.0.2 CPU path'
+                    'YOLO_TTA_GPU_TILTED_AZIMUTHAL_RENDER=0 selects the CPU render path'
                 )
             elif family_s == 'azimuthal':
                 gate = 'YOLO_TTA_FUSED_AZIMUTHAL_RENDER=0'
@@ -2287,9 +2120,8 @@ class _GpuWorkerRenderEngine:
         if n_angles <= 0 or n_u <= 0:
             raise RuntimeError('fused Azimuthal texture geometry is empty')
         plane_h, plane_w = azimuthal_plane_shape(view)
-        source_mode = azimuthal_source_mode()
         key = (
-            AZIMUTHAL_FILTER_MODE, str(source_mode), int(plane_h), int(plane_w), int(n_u),
+            AZIMUTHAL_FILTER_MODE, int(plane_h), int(plane_w), int(n_u),
             round(float(view.center_x), 5), round(float(view.center_y), 5),
             round(float(view.roi_radius), 5), angles_np.tobytes(),
         )
@@ -2325,7 +2157,7 @@ class _GpuWorkerRenderEngine:
             print(
                 f'Azimuthal geometry cached on {self.device}: {n_angles} azimuths, '
                 f'{n_u} azimuthal samples, {int(plane_h)}x{int(plane_w)} projected plane; '
-                f'source_mode={source_mode}, angle_table={refs.nbytes / (1024 ** 2):.3f} MiB.'
+                f'angle_table={refs.nbytes / (1024 ** 2):.3f} MiB.'
             )
             return refs
 
@@ -2368,13 +2200,7 @@ class _GpuWorkerRenderEngine:
                     + str(_FUSED_DIRECT_RENDER_KERNELS_ERROR or 'no diagnostic')
                 )
             geometry = self._ensure_fused_azimuthal_taps(view, kernels)
-            source_mode = azimuthal_source_mode()
-            if source_mode == 'texture_linear':
-                source_arg = self._ensure_azimuthal_texture(kernels).texture
-                kernel_prefix = 'azimuthal_texture'
-            else:
-                source_arg = self._fused_cupy_volume(kernels)
-                kernel_prefix = 'azimuthal_pointer'
+            source_arg = self._ensure_azimuthal_texture(kernels).texture
             matrix = np.asarray(aff.M_out_to_src, dtype=np.float32).reshape(2, 3)
             if not bool(np.all(np.isfinite(matrix))):
                 raise RuntimeError('Azimuthal output-to-source affine is non-finite')
@@ -2405,11 +2231,10 @@ class _GpuWorkerRenderEngine:
                 (int(out_size) + render_block[0] - 1) // render_block[0],
                 (int(out_size) + render_block[1] - 1) // render_block[1],
             )
-            kernel = getattr(
-                kernels,
-                f'{kernel_prefix}_direct_f16'
+            kernel = (
+                kernels.azimuthal_texture_direct_f16
                 if slot.input.dtype == self.torch.float16
-                else f'{kernel_prefix}_direct_f32',
+                else kernels.azimuthal_texture_direct_f32
             )
             kernel(
                 render_grid, render_block,
@@ -2439,7 +2264,7 @@ class _GpuWorkerRenderEngine:
                 geometry_label = f'tilted {base}' if tilted_azimuthal else f'upright {base}'
                 print(
                     f'Fused {geometry_label} Azimuthal renderer active: output affine + azimuthal '
-                    f'mapping + source_mode={source_mode} -> TensorRT binding in one launch.'
+                    'mapping + texture sampling -> TensorRT binding in one launch.'
                 )
             return True
         except Exception as exc:
@@ -2763,7 +2588,6 @@ class _GpuWorkerRenderEngine:
             family_geometry = ()
         return (
             self._volume_key, str(view.name), family, int(out_size), str(slot.input.dtype),
-            azimuthal_source_mode() if family == 'azimuthal' else '',
             matrix_key, family_geometry,
         )
 
@@ -2853,33 +2677,6 @@ class _GpuWorkerRenderEngine:
                 )
             return
 
-        if (
-            bool(compare_reference)
-            and family == 'azimuthal'
-            and azimuthal_source_mode() != 'texture_linear'
-        ):
-            try:
-                fused = slot.input[0, 0].to(self.torch.float32)
-                if not bool(self.torch.isfinite(fused).all().item()):
-                    raise RuntimeError('pointer Azimuthal renderer produced non-finite pixels')
-                min_value = float(fused.min().item()) if int(fused.numel()) else 0.0
-                max_value = float(fused.max().item()) if int(fused.numel()) else 0.0
-                if min_value < -1e-6 or max_value > 1.0 + 1e-6:
-                    raise RuntimeError(
-                        f'pointer Azimuthal renderer escaped normalized range [{min_value},{max_value}]'
-                    )
-            except BaseException as exc:
-                raise _ResidentTensorRTRingFatalError(
-                    f'P4 fused {preflight_family or family} pointer validation failed'
-                ) from exc
-            compare_reference = False
-            self._fused_preflight_validated_families.add(str(preflight_family or family))
-            print(
-                f'P4 fused {preflight_family or family} pointer-mode launch validation passed; '
-                'reference-delta gating skipped because nearest-XY/linear-T is intentionally '
-                'output-changing.'
-            )
-
         if bool(compare_reference):
             try:
                 with self.torch.no_grad():
@@ -2952,7 +2749,7 @@ class _GpuWorkerRenderEngine:
         # Local import keeps the package dependency graph acyclic.
         from .backprojection import _ResidentTensorRTRingFatalError
 
-        if not fused_renderer_preflight_enabled() or not specs:
+        if not specs:
             return
         if self._mode != 'resident' or self._volume_key is None:
             return
@@ -3514,7 +3311,7 @@ class _GpuWorkerRenderEngine:
         return out
 
     def _render_azimuthal_native_texture(self, view: ViewInfo, frame_idx: int) -> object:
-        """Render one upright or tilted Azimuthal native plane from the selected source mode."""
+        """Render one upright or tilted Azimuthal native plane from the 3D source texture."""
         kernels = _fused_direct_render_kernels()
         if kernels is None:
             raise RuntimeError(
@@ -3522,13 +3319,8 @@ class _GpuWorkerRenderEngine:
                 + str(_FUSED_DIRECT_RENDER_KERNELS_ERROR or 'no diagnostic')
             )
         geometry = self._ensure_fused_azimuthal_taps(view, kernels)
-        source_mode = azimuthal_source_mode()
-        if source_mode == 'texture_linear':
-            source_arg = self._ensure_azimuthal_texture(kernels).texture
-            kernel = kernels.azimuthal_texture_native_f32
-        else:
-            source_arg = self._fused_cupy_volume(kernels)
-            kernel = kernels.azimuthal_pointer_native_f32
+        source_arg = self._ensure_azimuthal_texture(kernels).texture
+        kernel = kernels.azimuthal_texture_native_f32
         base = str(azimuthal_base_view_name(view))
         base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
         tilted = bool(is_tilted_azimuthal_view(view))
@@ -3569,8 +3361,7 @@ class _GpuWorkerRenderEngine:
         if announce_key not in self._fused_announced_families:
             self._fused_announced_families.add(announce_key)
             print(
-                f'Resident {"tilted-" if tilted else ""}Azimuthal native-plane kernel active: '
-                f'source_mode={source_mode}.'
+                f'Resident {"tilted-" if tilted else ""}Azimuthal native-plane texture kernel active.'
             )
         return out
 
@@ -3596,13 +3387,8 @@ class _GpuWorkerRenderEngine:
                 + str(_FUSED_DIRECT_RENDER_KERNELS_ERROR or 'no diagnostic')
             )
         geometry = self._ensure_fused_azimuthal_taps(view, kernels)
-        source_mode = azimuthal_source_mode()
-        if source_mode == 'texture_linear':
-            source_arg = self._ensure_azimuthal_texture(kernels).texture
-            kernel = kernels.azimuthal_texture_grid_f32
-        else:
-            source_arg = self._fused_cupy_volume(kernels)
-            kernel = kernels.azimuthal_pointer_grid_f32
+        source_arg = self._ensure_azimuthal_texture(kernels).texture
+        kernel = kernels.azimuthal_texture_grid_f32
         base = str(azimuthal_base_view_name(view))
         base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
         tilted = bool(is_tilted_azimuthal_view(view))
@@ -3653,7 +3439,7 @@ class _GpuWorkerRenderEngine:
             self._fused_announced_families.add(announce_key)
             print(
                 f'Direct {"tilted-" if tilted else ""}Azimuthal grid renderer active: '
-                f'output affine + azimuthal mapping + source_mode={source_mode} in one launch.'
+                'output affine + azimuthal mapping + texture sampling in one launch.'
             )
         return out
 
@@ -5021,7 +4807,6 @@ class GpuRenderedYoloSource:
             [self._fake_frame] * len(abs_indices),
             gpu_tensor=gpu_tensor,
             ready_event=ready_event,
-            source_label=self.name,
         )
         return paths, batch, info
 
@@ -5157,7 +4942,7 @@ class CpuPreparedYoloSource(GpuRenderedYoloSource):
         except Exception as exc:
             self._unsafe_copy(exc)
         return [f'{self.name}_{index:06d}'], GpuPrefetchedYoloBatch(
-            [self._fake_frame], gpu_tensor=tensor, ready_event=ready, source_label=self.name), ['CPU prepared input']
+            [self._fake_frame], gpu_tensor=tensor, ready_event=ready), ['CPU prepared input']
 
     def finish_cpu_copies(self):
         if self._copy_failed:
@@ -5370,7 +5155,7 @@ class GpuTileRenderedYoloSource:
         )
         batch = GpuPrefetchedYoloBatch(
             [self._fake_frame] * len(absolute_indices),
-            gpu_tensor=gpu_tensor, ready_event=ready_event, source_label=self.name,
+            gpu_tensor=gpu_tensor, ready_event=ready_event,
         )
         return paths, batch, info
 
@@ -5393,7 +5178,7 @@ def _init_worker_gpu_render_engine(device_str: str = 'cuda:0') -> Optional[_GpuW
         if not bool(torch.cuda.is_available()):
             return None
         _WORKER_GPU_RENDER_ENGINE = _GpuWorkerRenderEngine(str(device_str))
-        print('GPU render engine initialized (v13.3.0 R1/R21); volume residency resolves on the first task.')
+        print('GPU render engine initialized; volume residency resolves on the first task.')
     except Exception as exc:
         print(f'Warning: GPU render engine unavailable ({exc}); worker uses CPU rendering.')
         _WORKER_GPU_RENDER_ENGINE = None

@@ -16,6 +16,7 @@ import os
 import numpy as np
 
 from ._deps import _numba
+from .env_flags import env_flag
 from .geometry import physical_view_name, is_tilted_view
 from .projection_coverage_cpu import (
     _angular_keys, _geometry, _pull_azimuthal, _pull_tilted, NativePullPlanUnavailable,
@@ -33,8 +34,7 @@ _TILTED_BOUND_MARGIN = 1e-6
 
 def _tilted_row_spans_enabled():
     """Certified Tilted row spans; ``0`` restores the stack-only full-plane bounds."""
-    return os.environ.get("YOLO_TTA_SWEEP_TILTED_ROW_SPANS", "1").strip().lower() not in (
-        "0", "false", "no", "off")
+    return env_flag("YOLO_TTA_SWEEP_TILTED_ROW_SPANS", True)
 
 
 def _tilted_margin(tangent):

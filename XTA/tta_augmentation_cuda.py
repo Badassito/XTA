@@ -47,7 +47,8 @@ __device__ __forceinline__ float finite_coordinate(float value) {
 extern "C" __global__ void policy_grids(
         const float* forward, const float* inverse, const float* field,
         float* source_grid, float* inverse_grid, unsigned char* valid,
-        int h, int w, int elastic, int write_source, int iterations, float tolerance) {
+        int h, int w, int elastic, int write_source, int iterations, float tolerance,
+        int raster_elastic) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= h*w) return;
     float tx = (float)(i % w), ty = (float)(i / w);
@@ -55,19 +56,29 @@ extern "C" __global__ void policy_grids(
     const float bx = inverse[2], by = inverse[5];
     if (write_source) {
         float sx = a*tx+b*ty+bx, sy = c*tx+d*ty+by;
-        if (elastic) { sx += field[i]; sy += field[h*w+i]; }
+        if (elastic) {
+            float fx = field[i], fy = field[h*w+i];
+            if (raster_elastic) { sx += a*fx+b*fy; sy += c*fx+d*fy; }
+            else { sx += fx; sy += fy; }
+        }
         source_grid[i*2] = w > 1 ? sx*(2.f/(w-1))-1.f : 0.f;
         source_grid[i*2+1] = h > 1 ? sy*(2.f/(h-1))-1.f : 0.f;
     }
     float x = forward[0]*tx+forward[1]*ty+forward[2];
     float y = forward[3]*tx+forward[4]*ty+forward[5];
+    // Elastic residual N*(x,y) + o + d(x,y) - g: raster solves y + d(y) = A x in
+    // augmented-raster pixels (N = I, o = 0); source solves inv(A) y + d(y) = x.
+    const bool raster = elastic && raster_elastic;
+    const float na = raster ? 1.f : a, nb = raster ? 0.f : b, nc = raster ? 0.f : c, nd = raster ? 1.f : d;
+    const float nbx = raster ? 0.f : bx, nby = raster ? 0.f : by;
+    const float gx = raster ? x : tx, gy = raster ? y : ty;
     float rx, ry;
     bool orientation_ok = true;
     if (elastic) {
         for (int j = 0; j < iterations; ++j) {
             Bilinear s = displacement_at(field, x, y, h, w);
-            rx = a*x+b*y+bx+s.x-tx; ry = c*x+d*y+by+s.y-ty;
-            float ja=a+s.xx, jb=b+s.xy, jc=c+s.yx, jd=d+s.yy;
+            rx = na*x+nb*y+nbx+s.x-gx; ry = nc*x+nd*y+nby+s.y-gy;
+            float ja=na+s.xx, jb=nb+s.xy, jc=nc+s.yx, jd=nd+s.yy;
             float det=ja*jd-jb*jc;
             float denom = fabsf(det) > 1.e-7f ? det : 1.f;
             float dx=(jd*rx-jb*ry)/denom, dy=(-jc*rx+ja*ry)/denom;
@@ -77,9 +88,9 @@ extern "C" __global__ void policy_grids(
             x=finite_coordinate(x-dx); y=finite_coordinate(y-dy);
         }
         Bilinear s = displacement_at(field, x, y, h, w);
-        rx=a*x+b*y+bx+s.x-tx; ry=c*x+d*y+by+s.y-ty;
-        float det=(a+s.xx)*(d+s.yy)-(b+s.xy)*(c+s.yx);
-        orientation_ok=det*(a*d-b*c) > 0.f && fabsf(det) > 1.e-7f;
+        rx=na*x+nb*y+nbx+s.x-gx; ry=nc*x+nd*y+nby+s.y-gy;
+        float det=(na+s.xx)*(nd+s.yy)-(nb+s.xy)*(nc+s.yx);
+        orientation_ok=det*(na*nd-nb*nc) > 0.f && fabsf(det) > 1.e-7f;
     } else {
         rx=a*x+b*y+bx-tx; ry=c*x+d*y+by-ty;
     }
@@ -167,9 +178,14 @@ def require_policy_cuda(device: str) -> None:
 
 
 def policy_grids_cuda(forward: Any, displacement: Any | None, height: int, width: int,
-                      *, iterations: int = 16, tolerance: float = 0.05,
-                      source: bool = False) -> tuple[Any | None, Any, Any] | None:
-    """Return maps on the current Torch stream, or None without CUDA/CuPy."""
+                      *, iterations: int = 16, tolerance: float = 0.05, source: bool = False,
+                      displacement_space: str = 'raster') -> tuple[Any | None, Any, Any] | None:
+    """Return maps on the current Torch stream, or None without CUDA/CuPy.
+
+    displacement_space has the meaning documented by inverse_policy_grid.
+    """
+    if displacement_space not in ('source', 'raster'):
+        raise ValueError("displacement_space must be 'source' or 'raster'")
     if forward.device.type != 'cuda':
         return None
     kernels = _kernels(forward.device.index)
@@ -192,7 +208,8 @@ def policy_grids_cuda(forward: Any, displacement: Any | None, height: int, width
         kernel(((h*w+255)//256,), (256,),
                (*[_borrow(cp, t) for t in (forward,inverse,field,forward_grid,output,valid)],
                 np.int32(h), np.int32(w), np.int32(displacement is not None), np.int32(source),
-                np.int32(iterations), np.float32(tolerance)), stream=_cupy_external_stream(cp, stream))
+                np.int32(iterations), np.float32(tolerance), np.int32(displacement_space == 'raster')),
+               stream=_cupy_external_stream(cp, stream))
     for tensor in (forward,inverse,field):
         tensor.record_stream(stream)
     return forward_grid if source else None, output, valid

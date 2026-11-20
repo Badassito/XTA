@@ -92,7 +92,7 @@ def prepare(args):
         baseline_path=str(baseline_path.resolve()), baseline_sha256=shared.sha(baseline_path),
         working_shape_tyx=list(shape), canonical_transform=transform,
         baseline_recipe='Preserve exact historical selected f4..18 crop masks in native chart, then existing '
-            'render_categorical_frame_on_grid nearest/threshold transformation to2048-square; artificial bounded fixture',
+            'render_categorical_frame_on_grid nearest/threshold transformation to 2048-square; artificial bounded fixture',
         known_terminals=[[4, -1], [18, 1]], distance=4, walk_back=0, min_radius=3., adaptive_crop=False,
         mode_records=records, model_path=str(args.model.resolve()), checkpoint_path=str(model.checkpoint_path),
         checkpoint_sha256=shared.sha(model.checkpoint_path), model_version=model.model_version,

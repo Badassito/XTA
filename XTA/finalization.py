@@ -19,6 +19,7 @@ from dataclasses import (
     field,
     replace as dataclasses_replace,
 )
+from functools import lru_cache
 from pathlib import Path
 from typing import (
     Callable,
@@ -59,6 +60,7 @@ from .geometry import (
     coronal_block_cols,
     physical_view_name,
 )
+from .media import _center_aligned_nearest_source_indices, resize_binary_plane_to_output_xy
 from .interpolation import (
     CVOL_FORMAT,
     IncrementalRawBBoxMaskStoreWriter,
@@ -508,20 +510,65 @@ def fused_final_gpu_sparse_ratio() -> float:
 
 def _resize_union_plane_to_out_xy(plane: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
     """Restore one Cartesian binary plane to the requested output geometry."""
-    plane_u8 = (np.asarray(plane, dtype=np.uint8) > 0).astype(np.uint8, copy=False)
-    if int(plane_u8.shape[0]) == int(out_h) and int(plane_u8.shape[1]) == int(out_w):
-        return plane_u8
-    interp = (
-        cv2.INTER_AREA
-        if (int(plane_u8.shape[0]) >= int(out_h) and int(plane_u8.shape[1]) >= int(out_w))
-        else cv2.INTER_NEAREST
-    )
-    scaled = cv2.resize(
-        np.ascontiguousarray(plane_u8 * np.uint8(255)),
-        (int(out_w), int(out_h)),
-        interpolation=int(interp),
-    )
-    return (scaled > 0).astype(np.uint8, copy=False)
+    return resize_binary_plane_to_output_xy(plane, int(out_h), int(out_w))
+
+@lru_cache(maxsize=64)
+def _opencv_area_axis_taps(n_in: int, n_out: int) -> Tuple[np.ndarray, np.ndarray]:
+    """INTER_AREA source taps of one downscaled axis of ``_resize_union_plane_to_out_xy``.
+
+ Mirrors cv::computeResizeAreaTab: scale = 1/(n_out/n_in); a leading or trailing
+ fractional source pixel is used only when its sliver exceeds 1e-3 px; weights are
+ float32 overlap/cellWidth with cellWidth = min(scale, n_in - dx*scale). Returns
+ read-only tap-major ``(index int64, weight float32)`` arrays of shape ``(K, n_out)``
+ in OpenCV's per-output tap order, padded with zero-weight taps at index 0."""
+    n_in_i, n_out_i = int(n_in), int(n_out)
+    scale = 1.0 / (float(n_out_i) / float(n_in_i))
+    rows: List[List[Tuple[int, np.float32]]] = []
+    for dx in range(n_out_i):
+        fsx1 = float(dx) * scale
+        fsx2 = fsx1 + scale
+        cell = min(scale, float(n_in_i) - fsx1)
+        sx2 = min(int(math.floor(fsx2)), n_in_i - 1)
+        sx1 = min(int(math.ceil(fsx1)), sx2)
+        row: List[Tuple[int, np.float32]] = []
+        if float(sx1) - fsx1 > 1e-3:
+            row.append((sx1 - 1, np.float32((float(sx1) - fsx1) / cell)))
+        row.extend((sx, np.float32(1.0 / cell)) for sx in range(sx1, sx2))
+        if fsx2 - float(sx2) > 1e-3:
+            row.append((sx2, np.float32(min(fsx2 - float(sx2), 1.0, cell) / cell)))
+        rows.append(row)
+    taps = max(1, max(len(row) for row in rows))
+    index = np.zeros((taps, n_out_i), dtype=np.int64)
+    weight = np.zeros((taps, n_out_i), dtype=np.float32)
+    for dx, row in enumerate(rows):
+        for tap, (sx, alpha) in enumerate(row):
+            index[tap, dx] = int(sx)
+            weight[tap, dx] = alpha
+    index.setflags(write=False)
+    weight.setflags(write=False)
+    return index, weight
+
+def _torch_area_restore_binary(torch: object, src_u8: object, taps_y: Tuple[object, object], taps_x: Tuple[object, object]) -> object:
+    """Batched ``(B, H, W)`` twin of ``_resize_union_plane_to_out_xy`` for an INTER_AREA downscale.
+
+ ``taps_y``/``taps_x`` are ``_opencv_area_axis_taps`` tensors on ``src_u8``'s device.
+ Replays OpenCV's float32 arithmetic in its order: 255-scaled source rows are reduced
+ along X, then output rows accumulate along Y, every term a separate gather, multiply
+ and add (no matmul/TF32, no fused multiply-add). cv2 rounds to uint8 half-to-even, so
+ a pixel is set only when its value exceeds 0.5."""
+    index_y, weight_y = taps_y
+    index_x, weight_x = taps_x
+    src = (src_u8 != 0).to(torch.float32).mul_(255.0)
+    rows = None
+    for tap in range(int(index_x.shape[0])):
+        term = src.index_select(2, index_x[tap]).mul_(weight_x[tap])
+        rows = term if rows is None else rows.add_(term)
+    del src
+    values = None
+    for tap in range(int(index_y.shape[0])):
+        term = rows.index_select(1, index_y[tap]).mul_(weight_y[tap].view(1, -1, 1))
+        values = term if values is None else values.add_(term)
+    return (values > 0.5).to(torch.uint8)
 
 def collapse_tta_variant_volumes_to_physical_views(
     view_volumes_by_model: Dict[str, Dict[str, np.ndarray]],
@@ -630,10 +677,10 @@ def assemble_view_volumes_into_native_union(
  Already-backprojected Tilted/Azimuthal volumes arrive at the union's own (out) geometry and are
  merged slice-wise. Transverse, Sagittal, and Coronal retain their native working-geometry view
  stacks; restores each of them working->source with ONE resample
- while merging (union-biased: a source slice ORs every working slice it covers and XY planes
- are resized with the same >0-threshold INTER_AREA/NEAREST semantics as the former tail
- restore). When ``out_shape_tyx`` is None or equals the working geometry, the historical
- zero-resample axis-permutation merges are used."""
+ while merging (union-biased: a source slice ORs every working slice it covers, upsampled
+ axes take the center-aligned nearest slice/pixel, and shrinking XY planes keep the
+ >0-threshold INTER_AREA footprint). When ``out_shape_tyx`` is None or equals the working
+ geometry, the historical zero-resample axis-permutation merges are used."""
     out_t, out_h, out_w = (int(T), int(H), int(W)) if out_shape_tyx is None else (
         int(out_shape_tyx[0]), int(out_shape_tyx[1]), int(out_shape_tyx[2]))
     working_equals_out = (out_t, out_h, out_w) == (int(T), int(H), int(W))
@@ -641,19 +688,8 @@ def assemble_view_volumes_into_native_union(
     def _resize_plane_to_out_xy(plane: np.ndarray) -> np.ndarray:
         return _resize_union_plane_to_out_xy(plane, int(out_h), int(out_w))
 
-    def _source_plane_indices(plane_count: int, out_z: int) -> range:
-        count = max(1, int(plane_count))
-        if count >= int(out_t):
-            start = int(math.floor(float(out_z) * float(count) / float(out_t)))
-            stop = int(math.ceil(float(out_z + 1) * float(count) / float(out_t)))
-            start = int(np.clip(start, 0, count - 1))
-            stop = int(np.clip(max(start + 1, stop), 1, count))
-            return range(start, stop)
-        if int(out_t) <= 1 or count <= 1:
-            return range(0, 1)
-        src_idx = int(round(float(out_z) * float(count - 1) / float(out_t - 1)))
-        src_idx = int(np.clip(src_idx, 0, count - 1))
-        return range(src_idx, src_idx + 1)
+    def _source_plane_indices(plane_count: int, out_z: int) -> List[int]:
+        return _restore_source_indices_for_output_z(int(plane_count), int(out_t), int(out_z))
 
     def _or_restore_working_planes_into_union(
         get_working_plane: Callable[[int], np.ndarray],
@@ -1128,7 +1164,6 @@ def assemble_view_volumes_and_projected_layers_fused(
                 return False
             try:
                 import torch  # type: ignore
-                import torch.nn.functional as F  # type: ignore
                 if not bool(torch.cuda.is_available()):
                     return False
             except Exception:
@@ -1187,26 +1222,34 @@ def assemble_view_volumes_and_projected_layers_fused(
 
             batch_slices = int(fused_final_gpu_batch_slices())
             pipeline_slots = int(fused_final_gpu_pipeline_slots())
-            contributor_input_planes = 0
-            contributor_count = 0
+            contributor_shapes: List[Tuple[int, int]] = []
             if transverse is not None:
-                contributor_input_planes += int(transverse.shape[1]) * int(transverse.shape[2])
-                contributor_count += 1
+                contributor_shapes.append((int(transverse.shape[1]), int(transverse.shape[2])))
             if sagittal is not None:
-                contributor_input_planes += int(sagittal.shape[0]) * int(sagittal.shape[2])
-                contributor_count += 1
+                contributor_shapes.append((int(sagittal.shape[0]), int(sagittal.shape[2])))
             if coronal is not None:
-                contributor_input_planes += int(coronal.shape[2]) * int(coronal.shape[0])
-                contributor_count += 1
+                contributor_shapes.append((int(coronal.shape[2]), int(coronal.shape[0])))
             needs_native_contributor = bool(native_views or native_projected or cpu_restore_groups)
             if needs_native_contributor:
-                contributor_input_planes += int(out_h) * int(out_w)
-                contributor_count += 1
+                contributor_shapes.append((int(out_h), int(out_w)))
             for geometry in gpu_restore_groups:
-                contributor_input_planes += int(geometry[1]) * int(geometry[2])
-                contributor_count += 1
+                contributor_shapes.append((int(geometry[1]), int(geometry[2])))
+            contributor_count = len(contributor_shapes)
             if contributor_count <= 0:
                 return False
+            contributor_input_planes = sum(h * w for h, w in contributor_shapes)
+            area_contributors = [
+                (h, w) for h, w in contributor_shapes
+                if (h, w) != (int(out_h), int(out_w)) and h >= int(out_h) and w >= int(out_w)
+            ]
+            # _torch_area_restore_binary workspace per down-resized contributor: float32
+            # source, X-reduced rows plus one gathered term, values plus one gathered term.
+            # It is freed on the contributor's stream after each submission and reused by
+            # the next slot on that stream, so it is charged once per lane, not per slot.
+            area_workspace_plane = sum(
+                4 * (h * w + 2 * h * int(out_w) + 2 * int(out_h) * int(out_w))
+                for h, w in area_contributors
+            )
 
             reserve = int(max(0.0, _env_float(
                 'YOLO_TTA_FUSED_FINAL_GPU_RESERVE_GIB', 2.0,
@@ -1220,7 +1263,10 @@ def assemble_view_volumes_and_projected_layers_fused(
                 + max(1, int(contributor_count)) * 6 * int(out_plane)
                 + 3 * int(out_plane)
             )
-            estimate = int(pipeline_slots) * int(estimate_per_slot)
+            estimate = (
+                int(pipeline_slots) * int(estimate_per_slot)
+                + int(batch_slices) * int(area_workspace_plane)
+            )
             admitted: List[int] = []
             for device_idx in devices:
                 try:
@@ -1243,19 +1289,8 @@ def assemble_view_volumes_and_projected_layers_fused(
                 f'CPU_tiny_groups={len(cpu_restore_groups)}, lane_estimate={estimate / GIB:.2f} GiB.'
             )
 
-            def _indices(count: int, out_z: int) -> range:
-                count_i = max(1, int(count))
-                if count_i >= int(out_t):
-                    lo = int(math.floor(float(out_z) * float(count_i) / float(out_t)))
-                    hi = int(math.ceil(float(out_z + 1) * float(count_i) / float(out_t)))
-                    lo = int(np.clip(lo, 0, count_i - 1))
-                    hi = int(np.clip(max(lo + 1, hi), 1, count_i))
-                    return range(lo, hi)
-                if int(out_t) <= 1 or count_i <= 1:
-                    return range(0, 1)
-                src_i = int(round(float(out_z) * float(count_i - 1) / float(out_t - 1)))
-                src_i = int(np.clip(src_i, 0, count_i - 1))
-                return range(src_i, src_i + 1)
+            def _indices(count: int, out_z: int) -> List[int]:
+                return _restore_source_indices_for_output_z(int(count), int(out_t), int(out_z))
 
             def _lane(device_idx: int, z0_lane: int, z1_lane: int) -> None:
                 device = torch.device(f'cuda:{int(device_idx)}')
@@ -1281,8 +1316,32 @@ def assemble_view_volumes_and_projected_layers_fused(
                         host_shapes[('restore', geometry)] = (
                             int(batch_slices), int(geometry[1]), int(geometry[2]),
                         )
+                    # cv2 INTER_AREA taps, uploaded once per lane and down-resized (h, w).
+                    area_taps = {
+                        (h, w): tuple(
+                            tuple(
+                                torch.from_numpy(arr.copy()).to(device)
+                                for arr in _opencv_area_axis_taps(n_in, n_out)
+                            )
+                            for n_in, n_out in ((h, int(out_h)), (w, int(out_w)))
+                        )
+                        for h, w in set(area_contributors)
+                    }
 
                     pin_warning_printed = False
+                    nearest_index_tensors: Dict[Tuple[int, int], object] = {}
+
+                    def _nearest_index_tensor(in_count: int, out_count: int) -> object:
+                        # The CPU restore's center-aligned table, resident once per lane.
+                        key = (int(in_count), int(out_count))
+                        tensor = nearest_index_tensors.get(key)
+                        if tensor is None:
+                            table = np.array(
+                                _center_aligned_nearest_source_indices(*key), dtype=np.int64,
+                            )
+                            tensor = torch.from_numpy(table).to(device)
+                            nearest_index_tensors[key] = tensor
+                        return tensor
 
                     def _alloc_host(shape: Tuple[int, int, int]) -> object:
                         nonlocal pin_warning_printed
@@ -1432,21 +1491,21 @@ def assemble_view_volumes_and_projected_layers_fused(
                                 in_w = int(src_dev.shape[2])
                                 if (in_h, in_w) == (int(out_h), int(out_w)):
                                     restored = src_dev
+                                elif (in_h, in_w) in area_taps:
+                                    # Exact cv2 INTER_AREA rule of the CPU groups sharing
+                                    # this output. Its float temporaries stay on this stream.
+                                    taps_y, taps_x = area_taps[(in_h, in_w)]
+                                    restored = _torch_area_restore_binary(
+                                        torch, src_dev, taps_y, taps_x,
+                                    )
                                 else:
-                                    src_f = src_dev.to(torch.float32).unsqueeze(1)
-                                    if in_h >= int(out_h) and in_w >= int(out_w):
-                                        scaled = F.interpolate(
-                                            src_f, size=(int(out_h), int(out_w)), mode='area',
-                                        )
-                                        restored = (
-                                            scaled.squeeze(1) >= (1.0 / 510.0)
-                                        ).to(torch.uint8)
-                                    else:
-                                        scaled = F.interpolate(
-                                            src_f, size=(int(out_h), int(out_w)), mode='nearest',
-                                        )
-                                        restored = (scaled.squeeze(1) > 0).to(torch.uint8)
-                                    refs.extend([src_f, scaled])
+                                    gathered = src_dev.index_select(
+                                        1, _nearest_index_tensor(in_h, int(out_h)),
+                                    ).index_select(
+                                        2, _nearest_index_tensor(in_w, int(out_w)),
+                                    )
+                                    restored = (gathered > 0).to(torch.uint8)
+                                    refs.append(gathered)
                                 event = torch.cuda.Event(blocking=False, enable_timing=False)
                                 event.record(stream)
                                 contributor_outputs.append((restored, event))
@@ -1558,19 +1617,8 @@ def assemble_view_volumes_and_projected_layers_fused(
             else:
                 acc.fill(np.uint8(0))
 
-            def _indices(count: int) -> range:
-                count_i = max(1, int(count))
-                if count_i >= int(out_t):
-                    lo = int(math.floor(float(out_z) * float(count_i) / float(out_t)))
-                    hi = int(math.ceil(float(out_z + 1) * float(count_i) / float(out_t)))
-                    lo = int(np.clip(lo, 0, count_i - 1))
-                    hi = int(np.clip(max(lo + 1, hi), 1, count_i))
-                    return range(lo, hi)
-                if int(out_t) <= 1 or count_i <= 1:
-                    return range(0, 1)
-                src_i = int(round(float(out_z) * float(count_i - 1) / float(out_t - 1)))
-                src_i = int(np.clip(src_i, 0, count_i - 1))
-                return range(src_i, src_i + 1)
+            def _indices(count: int) -> List[int]:
+                return _restore_source_indices_for_output_z(int(count), int(out_t), int(out_z))
 
             if transverse is not None:
                 for v_idx in _indices(int(transverse.shape[0])):
@@ -1782,7 +1830,6 @@ def apply_keep_largest_objects_inplace(
     keep_objects: int,
     temp_dir: Path,
     *,
-    keep_temp: bool = False,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
@@ -1865,10 +1912,7 @@ def apply_keep_largest_objects_inplace(
             f'topology={float(topology_times.get("topology_total", 0.0)):.3f}s, '
             f'kept_voxels={kept_voxels}, total={total_seconds:.3f}s.'
         )
-        close_memmap_array(
-            labels_mm,
-            unlink_path=label_paths[0] if label_paths and not bool(keep_temp) else None,
-        )
+        close_memmap_array(labels_mm, unlink_path=label_paths[0] if label_paths else None)
         labels_mm = None
         return {
             'enabled': 1,
@@ -1961,10 +2005,7 @@ def apply_keep_largest_objects_inplace(
             )
     finally:
         apply_seconds = float(time.perf_counter() - apply_started)
-        close_memmap_array(
-            labels_mm,
-            unlink_path=label_paths[0] if label_paths and not bool(keep_temp) else None,
-        )
+        close_memmap_array(labels_mm, unlink_path=label_paths[0] if label_paths else None)
         labels_mm = None
 
     topology_times = dict(comp_stats.get('topology_phase_seconds', {}))
@@ -2013,7 +2054,6 @@ def assemble_final_union_after_view_union(
     *,
     out_shape_tyx: Optional[Tuple[int, int, int]] = None,
     enable_3d_void_fill: bool = False,
-    keep_temp: bool = False,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
@@ -2041,7 +2081,6 @@ def assemble_final_union_after_view_union(
         fill_3d_voids_inplace_streaming(
             final_union_mm,
             final_void_dir / 'final_union',
-            keep_temp=bool(keep_temp),
             prefer_memory=bool(prefer_memory),
             reserve_bytes=int(reserve_bytes),
         )
@@ -2050,7 +2089,7 @@ def assemble_final_union_after_view_union(
     return final_union_mm
 
 @dataclass(frozen=True)
-class V14CenterlineSamples:
+class CenterlineSamples:
     """Ordered embedded medial-ridge samples in source ``(t,Y,X)`` coordinates."""
 
     points_tyx: np.ndarray
@@ -2064,7 +2103,7 @@ class V14CenterlineSamples:
     details: Dict[str, object] = field(default_factory=dict, compare=False)
 
 @dataclass(frozen=True)
-class V14SectionEvidence:
+class SectionEvidence:
     sample_index: int
     branch_id: int
     arc_index: int
@@ -2075,7 +2114,7 @@ class V14SectionEvidence:
     event_id: int = -1
 
 @dataclass(frozen=True)
-class V14CenterlineEvent:
+class CenterlineEvent:
     event_id: int
     branch_id: int
     first_arc_index: int
@@ -2090,7 +2129,7 @@ class V14CenterlineEvent:
     def clean_flanks(self) -> bool:
         return bool(self.clean_left and self.clean_right)
 
-def _v1401_axis_plane(array: np.ndarray, axis: int, index: int) -> np.ndarray:
+def _axis_plane(array: np.ndarray, axis: int, index: int) -> np.ndarray:
     """Return a 2D view whose row/column coordinates map deterministically to TYX."""
     if int(axis) == 0:
         return np.asarray(array[int(index), :, :])
@@ -2100,7 +2139,7 @@ def _v1401_axis_plane(array: np.ndarray, axis: int, index: int) -> np.ndarray:
         return np.asarray(array[:, :, int(index)])
     raise ValueError(f'invalid embedded-centerline axis {axis}')
 
-def _v1401_axis_point_tyx(
+def _axis_point_tyx(
     axis: int,
     plane_index: int,
     row: int,
@@ -2121,7 +2160,7 @@ def _v1401_axis_point_tyx(
         for dim in range(3)
     ], dtype=np.float64)
 
-def _v1401_embedded_plane_ridges(
+def _embedded_plane_ridges(
     mask_2d: np.ndarray,
     distance_2d: np.ndarray,
     *,
@@ -2184,7 +2223,7 @@ def _v1401_embedded_plane_ridges(
         suppressed[row0:row1, col0:col1][ellipse] = np.uint8(1)
     return accepted, bool(candidate_pool_truncated), bool(peak_limit_reached)
 
-def _v1401_track_axis_ridges(
+def _track_axis_ridges(
     ridge_mask: np.ndarray,
     distance: np.ndarray,
     *,
@@ -2214,15 +2253,15 @@ def _v1401_track_axis_ridges(
     candidate_pool_truncated = False
     peak_limit_reached = False
     for plane_index in range(int(plane_count)):
-        support_plane = _v1401_axis_plane(support_mask, axis_i, int(plane_index))
+        support_plane = _axis_plane(support_mask, axis_i, int(plane_index))
         if not bool(np.any(support_plane)):
             continue
         nonempty_planes += 1
-        mask_plane = _v1401_axis_plane(ridge_mask, axis_i, int(plane_index))
+        mask_plane = _axis_plane(ridge_mask, axis_i, int(plane_index))
         if not bool(np.any(mask_plane)):
             continue
-        distance_plane = _v1401_axis_plane(distance, axis_i, int(plane_index))
-        ridges, plane_pool_truncated, plane_peak_limit = _v1401_embedded_plane_ridges(
+        distance_plane = _axis_plane(distance, axis_i, int(plane_index))
+        ridges, plane_pool_truncated, plane_peak_limit = _embedded_plane_ridges(
             mask_plane,
             distance_plane,
             spacing_rc=spacing_rc,
@@ -2236,7 +2275,7 @@ def _v1401_track_axis_ridges(
         peak_count += int(len(ridges))
         points = [
             (
-                _v1401_axis_point_tyx(
+                _axis_point_tyx(
                     axis_i, int(plane_index), int(row), int(col),
                     spacing_tyx, origin_tyx,
                 ),
@@ -2331,7 +2370,7 @@ def _v1401_track_axis_ridges(
         'max_peaks_per_plane': int(peaks_per_plane),
     }
 
-def _v1401_embedded_centerline_arrays(
+def _embedded_centerline_arrays(
     mask_tyx: np.ndarray,
     *,
     spacing_tyx: Tuple[float, float, float],
@@ -2422,7 +2461,7 @@ def _v1401_embedded_centerline_arrays(
     all_tracks: List[List[Tuple[np.ndarray, float]]] = []
     axis_stats: List[Dict[str, object]] = []
     for axis in range(3):
-        tracks, stats = _v1401_track_axis_ridges(
+        tracks, stats = _track_axis_ridges(
             ridge_mask,
             distance,
             support_mask=coarse,
@@ -2586,7 +2625,7 @@ def _v1401_embedded_centerline_arrays(
     }
     return arrays, details
 
-def _v1401_embedded_worker(
+def _embedded_worker(
     coarse_npy: str,
     spacing_tyx: Tuple[float, float, float],
     origin_tyx: Tuple[float, float, float],
@@ -2597,7 +2636,7 @@ def _v1401_embedded_worker(
     """Isolated bounded-memory worker for the default backend."""
     try:
         coarse = np.load(str(coarse_npy), mmap_mode='r')
-        arrays, details = _v1401_embedded_centerline_arrays(
+        arrays, details = _embedded_centerline_arrays(
             coarse,
             spacing_tyx=tuple(float(v) for v in spacing_tyx),
             origin_tyx=tuple(float(v) for v in origin_tyx),
@@ -2619,7 +2658,7 @@ def _v1401_embedded_worker(
         }, indent=2) + '\n')
         raise
 
-def _v14_build_coarse_centerline_raster(
+def _build_coarse_centerline_raster(
     mask_mm: np.ndarray,
     *,
     temp_dir: Path,
@@ -2650,7 +2689,7 @@ def _v14_build_coarse_centerline_raster(
     y_starts = np.arange(0, int(crop_shape[1]), int(factor), dtype=np.int64)
     x_starts = np.arange(0, int(crop_shape[2]), int(factor), dtype=np.int64)
     print(
-        f'v14 centerline pass {int(pass_index)}: block-max foreground crop '
+        f'Centerline pass {int(pass_index)}: block-max foreground crop '
         f'{crop_shape} -> {out_shape} (factor={int(factor)}, padded={padded_shape}).'
     )
     # Sequential T blocks keep reads ordered through the source memmap. NumPy's
@@ -2687,12 +2726,12 @@ def _v14_build_coarse_centerline_raster(
         'origin_tyx': [float(v) for v in origin_tyx],
     }
 
-def _v14_fallback_centerline_samples(
+def _fallback_centerline_samples(
     mask_mm: np.ndarray,
     *,
     extent_xyt: Sequence[int],
     max_samples: int = 512,
-) -> V14CenterlineSamples:
+) -> CenterlineSamples:
     """Last-resort marker-only ridge used when the selected backend fails.
 
  This is deliberately not authorized to remove voxels. It finds the deepest
@@ -2701,7 +2740,7 @@ def _v14_fallback_centerline_samples(
  can exercise the full plane/component machinery."""
     x0, x1, y0, y1, t0, t1 = (int(v) for v in extent_xyt)
     if x1 < x0 or y1 < y0 or t1 < t0:
-        return V14CenterlineSamples(
+        return CenterlineSamples(
             np.empty((0, 3), dtype=np.float64), np.empty((0, 3), dtype=np.float64),
             np.empty((0,), dtype=np.float64), np.empty((0,), dtype=np.int32),
             np.empty((0,), dtype=np.int32), 'geometric_marker_only', 0, False,
@@ -2747,7 +2786,7 @@ def _v14_fallback_centerline_samples(
         ))
         radii.append(float(max_val))
     if len(points) < 2:
-        return V14CenterlineSamples(
+        return CenterlineSamples(
             np.asarray(points, dtype=np.float64).reshape((-1, 3)),
             np.zeros((len(points), 3), dtype=np.float64), np.asarray(radii, dtype=np.float64),
             np.zeros((len(points),), dtype=np.int32), np.arange(len(points), dtype=np.int32),
@@ -2763,14 +2802,14 @@ def _v14_fallback_centerline_samples(
         norm = float(np.linalg.norm(delta))
         if norm > 0.0:
             tangents[idx] = delta / norm
-    return V14CenterlineSamples(
+    return CenterlineSamples(
         point_array, tangents, np.asarray(radii, dtype=np.float64),
         np.zeros((len(points),), dtype=np.int32), np.arange(len(points), dtype=np.int32),
         'geometric_marker_only', 0, False,
         {'stride': int(stride), 'sample_count': int(len(points))},
     )
 
-def _v14_run_isolated_process(
+def _run_isolated_process(
     process: mp.Process,
     *,
     timeout_seconds: float,
@@ -2809,7 +2848,7 @@ def _v14_run_isolated_process(
             except Exception:
                 pass
 
-def _v14_extract_centerline_samples(
+def _extract_centerline_samples(
     mask_mm: np.ndarray,
     *,
     temp_dir: Path,
@@ -2819,13 +2858,12 @@ def _v14_extract_centerline_samples(
     surface_points: int,
     timeout_seconds: float,
     workers: int,
-    keep_temp: bool,
-) -> V14CenterlineSamples:
+) -> CenterlineSamples:
     requested = str(backend).strip().lower()
     if requested != 'embedded':
         raise ValueError(f'unsupported centerline backend {backend!r}')
 
-    coarse_path, raster_info = _v14_build_coarse_centerline_raster(
+    coarse_path, raster_info = _build_coarse_centerline_raster(
         mask_mm,
         temp_dir=temp_dir,
         pass_index=int(pass_index),
@@ -2833,15 +2871,13 @@ def _v14_extract_centerline_samples(
         workers=int(workers),
     )
     if coarse_path is None:
-        return _v14_fallback_centerline_samples(
+        return _fallback_centerline_samples(
             mask_mm, extent_xyt=raster_info.get('extent_xyt', _nrrd_empty_segment_extent()),
         )
     work_dir = Path(coarse_path).parent
     errors: Dict[str, str] = {}
 
     def _cleanup_attempt(result_path: Path, status_path: Path) -> None:
-        if bool(keep_temp):
-            return
         for path in (result_path, status_path):
             try:
                 Path(path).unlink(missing_ok=True)
@@ -2854,7 +2890,7 @@ def _v14_extract_centerline_samples(
         *,
         backend_name: str,
         automatic_removal_allowed: Optional[bool],
-    ) -> V14CenterlineSamples:
+    ) -> CenterlineSamples:
         with np.load(result_path, allow_pickle=False) as data:
             points = np.asarray(data['points_tyx'], dtype=np.float64).copy()
             tangents = np.asarray(data['tangents_tyx'], dtype=np.float64).copy()
@@ -2899,7 +2935,7 @@ def _v14_extract_centerline_samples(
         if status_path.exists():
             details.update(json.loads(status_path.read_text()))
         details['contract_validated'] = True
-        return V14CenterlineSamples(
+        return CenterlineSamples(
             points, tangents, radii, branches, arcs, str(backend_name),
             int(endpoint_count), bool(allow_remove), details,
         )
@@ -2909,7 +2945,7 @@ def _v14_extract_centerline_samples(
         target: object,
         *,
         automatic_removal_allowed: Optional[bool],
-    ) -> Optional[V14CenterlineSamples]:
+    ) -> Optional[CenterlineSamples]:
         result_path = work_dir / f'{str(name)}_centerlines.npz'
         status_path = work_dir / f'{str(name)}_status.json'
         # A retained/reused scratch directory must never let a stale successful
@@ -2929,7 +2965,7 @@ def _v14_extract_centerline_samples(
             ),
             daemon=False,
         )
-        exit_code, process_error = _v14_run_isolated_process(
+        exit_code, process_error = _run_isolated_process(
             process, timeout_seconds=float(timeout_seconds),
         )
         error = str(process_error)
@@ -2937,7 +2973,7 @@ def _v14_extract_centerline_samples(
             error = f'isolated process exit code {exit_code}'
         if not error and not result_path.exists():
             error = 'isolated process produced no result file'
-        samples: Optional[V14CenterlineSamples] = None
+        samples: Optional[CenterlineSamples] = None
         if not error:
             try:
                 samples = _load_contract(
@@ -2959,15 +2995,14 @@ def _v14_extract_centerline_samples(
         return samples
 
     samples = _attempt_backend(
-        'embedded', _v1401_embedded_worker,
+        'embedded', _embedded_worker,
         automatic_removal_allowed=None,
     )
     if samples is not None:
         try:
-            samples = _v1401_refine_fullres_center_samples(mask_mm, samples)
+            samples = _refine_fullres_center_samples(mask_mm, samples)
         finally:
-            if not bool(keep_temp):
-                Path(coarse_path).unlink(missing_ok=True)
+            Path(coarse_path).unlink(missing_ok=True)
         print(
             f'Centerline pass {int(pass_index)}: embedded exact-EDT medial ridges, '
             f'samples={int(samples.points_tyx.shape[0])}, tracks='
@@ -2976,14 +3011,13 @@ def _v14_extract_centerline_samples(
         )
         return samples
 
-    if not bool(keep_temp):
-        Path(coarse_path).unlink(missing_ok=True)
+    Path(coarse_path).unlink(missing_ok=True)
     error = str(errors.get('embedded', 'unknown embedded-centerline failure'))
     print(
         f'Warning: embedded centerline failed ({error}); using the bounded '
         'marker-only fallback. Automatic removal remains disabled.'
     )
-    fallback = _v14_fallback_centerline_samples(
+    fallback = _fallback_centerline_samples(
         mask_mm, extent_xyt=raster_info.get('extent_xyt', _nrrd_empty_segment_extent()),
     )
     return dataclasses_replace(
@@ -2991,7 +3025,7 @@ def _v14_extract_centerline_samples(
         details={**dict(raster_info), **dict(fallback.details), 'error': str(error)},
     )
 
-def _v14_subsample_centerline_samples(samples: V14CenterlineSamples) -> V14CenterlineSamples:
+def _subsample_centerline_samples(samples: CenterlineSamples) -> CenterlineSamples:
     """Densify ordered cells so anomaly spans cover every crossed source slice.
 
  The historical name is retained to avoid disturbing callers. Radius-adaptive
@@ -3072,7 +3106,7 @@ def _v14_subsample_centerline_samples(samples: V14CenterlineSamples) -> V14Cente
             break
     if not points_out:
         return samples
-    return V14CenterlineSamples(
+    return CenterlineSamples(
         np.asarray(points_out, dtype=np.float64),
         np.asarray(tangents_out, dtype=np.float64),
         np.asarray(radii_out, dtype=np.float64),
@@ -3092,7 +3126,7 @@ def _v14_subsample_centerline_samples(samples: V14CenterlineSamples) -> V14Cente
         },
     )
 
-def _v14_round_and_sample_mask(
+def _round_and_sample_mask(
     mask_mm: np.ndarray,
     coords_tyx: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -3112,13 +3146,13 @@ def _v14_round_and_sample_mask(
         ) != 0
     return rounded, valid, values
 
-def _v14_snap_center_to_foreground(
+def _snap_center_to_foreground(
     mask_mm: np.ndarray,
     point_tyx: np.ndarray,
     radius: float,
 ) -> Optional[np.ndarray]:
     point = np.asarray(point_tyx, dtype=np.float64).reshape(3)
-    rounded, valid, values = _v14_round_and_sample_mask(mask_mm, point.reshape(1, 3))
+    rounded, valid, values = _round_and_sample_mask(mask_mm, point.reshape(1, 3))
     if bool(valid[0]) and bool(values[0]):
         return np.asarray(rounded[0], dtype=np.float64)
     # a block-max center can be several source voxels from the thin
@@ -3142,10 +3176,10 @@ def _v14_snap_center_to_foreground(
     distances = np.sum((global_coords - point.reshape(1, 3)) ** 2, axis=1)
     return global_coords[int(np.argmin(distances))]
 
-def _v1401_refine_fullres_center_samples(
+def _refine_fullres_center_samples(
     mask_mm: np.ndarray,
-    samples: V14CenterlineSamples,
-) -> V14CenterlineSamples:
+    samples: CenterlineSamples,
+) -> CenterlineSamples:
     """Snap coarse block centers to full-resolution foreground before detection.
 
  A bounded failed-center count is a deletion safety gate, not a fatal error:
@@ -3153,14 +3187,14 @@ def _v1401_refine_fullres_center_samples(
     count = int(samples.points_tyx.shape[0])
     if count <= 0:
         return samples
-    _rounded, valid, values = _v14_round_and_sample_mask(mask_mm, samples.points_tyx)
+    _rounded, valid, values = _round_and_sample_mask(mask_mm, samples.points_tyx)
     missing = np.flatnonzero(~(valid & values))
     points = np.asarray(samples.points_tyx, dtype=np.float64).copy()
     validation_cap = max(256, _env_int('YOLO_TTA_CENTERLINE_FULLRES_SNAP_CAP', 4096))
     failures = 0
     validated = min(int(missing.size), int(validation_cap))
     for sample_index in missing[:int(validated)]:
-        snapped = _v14_snap_center_to_foreground(
+        snapped = _snap_center_to_foreground(
             mask_mm,
             points[int(sample_index)],
             float(samples.radii[int(sample_index)]),
@@ -3189,7 +3223,7 @@ def _v1401_refine_fullres_center_samples(
         details=details,
     )
 
-def _v14_plane_basis(tangent_tyx: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+def _plane_basis(tangent_tyx: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     normal = np.asarray(tangent_tyx, dtype=np.float64).reshape(3)
     norm = float(np.linalg.norm(normal))
     if not np.isfinite(norm) or norm <= 1.0e-8:
@@ -3208,14 +3242,14 @@ def _v14_plane_basis(tangent_tyx: np.ndarray) -> Optional[Tuple[np.ndarray, np.n
     second /= second_norm
     return normal, first, second
 
-def _v14_unique_foreground_voxels(mask_mm: np.ndarray, coords_tyx: np.ndarray) -> np.ndarray:
-    rounded, valid, values = _v14_round_and_sample_mask(mask_mm, coords_tyx)
+def _unique_foreground_voxels(mask_mm: np.ndarray, coords_tyx: np.ndarray) -> np.ndarray:
+    rounded, valid, values = _round_and_sample_mask(mask_mm, coords_tyx)
     keep = valid & values
     if not np.any(keep):
         return np.empty((0, 3), dtype=np.int32)
     return np.unique(np.asarray(rounded[keep], dtype=np.int32), axis=0)
 
-def _v14_bound_evidence_voxels(voxels: np.ndarray) -> np.ndarray:
+def _bound_evidence_voxels(voxels: np.ndarray) -> np.ndarray:
     """Bound one audit payload without changing its anomaly classification."""
     array = np.asarray(voxels, dtype=np.int32).reshape((-1, 3))
     cap = max(128, _env_int('YOLO_TTA_CENTERLINE_MAX_EVIDENCE_VOXELS', 2048))
@@ -3224,14 +3258,14 @@ def _v14_bound_evidence_voxels(voxels: np.ndarray) -> np.ndarray:
     select = np.linspace(0, int(array.shape[0]) - 1, int(cap), dtype=np.int64)
     return np.asarray(array[select], dtype=np.int32)
 
-def _v14_sample_one_normal_section(
+def _sample_one_normal_section(
     mask_mm: np.ndarray,
-    samples: V14CenterlineSamples,
+    samples: CenterlineSamples,
     sample_index: int,
     radius_factor: float,
     plane_half_cap: int,
     capture_payload: bool = True,
-) -> Tuple[str, Optional[V14SectionEvidence]]:
+) -> Tuple[str, Optional[SectionEvidence]]:
     """Return ``(state, evidence)`` where state is anomaly, clean, or unknown.
 
  Unknown is deliberately distinct from a tested clean section: an invalid
@@ -3241,11 +3275,11 @@ def _v14_sample_one_normal_section(
     radius = float(samples.radii[idx])
     if not np.isfinite(radius) or radius < 0.5:
         return 'unknown', None
-    basis = _v14_plane_basis(samples.tangents_tyx[idx])
+    basis = _plane_basis(samples.tangents_tyx[idx])
     if basis is None:
         return 'unknown', None
     _normal, first, second = basis
-    center = _v14_snap_center_to_foreground(mask_mm, samples.points_tyx[idx], radius)
+    center = _snap_center_to_foreground(mask_mm, samples.points_tyx[idx], radius)
     if center is None:
         return 'unknown', None
     expanded_radius = float(radius_factor) * float(radius)
@@ -3262,7 +3296,7 @@ def _v14_sample_one_normal_section(
             + np.sin(angles).reshape(-1, 1) * second.reshape(1, 3)
         )
     )
-    ring_rounded, ring_valid, ring_values = _v14_round_and_sample_mask(mask_mm, ring_coords)
+    ring_rounded, ring_valid, ring_values = _round_and_sample_mask(mask_mm, ring_coords)
     hit_indices = np.flatnonzero(ring_valid & ring_values)
     ring_complete = bool(np.all(ring_valid))
     if int(hit_indices.size) <= 0:
@@ -3284,25 +3318,25 @@ def _v14_sample_one_normal_section(
     for hit_idx in path_hit_indices:
         endpoint = ring_coords[int(hit_idx)]
         line = center.reshape(1, 3) + alpha.reshape(-1, 1) * (endpoint - center).reshape(1, 3)
-        _rounded, valid, values = _v14_round_and_sample_mask(mask_mm, line)
+        _rounded, valid, values = _round_and_sample_mask(mask_mm, line)
         if bool(np.all(valid & values)):
             distances = alpha * expanded_radius
             outer = line[distances >= outer_threshold]
             if int(outer.shape[0]) > 0:
                 if not bool(capture_payload):
-                    return 'anomaly', V14SectionEvidence(
+                    return 'anomaly', SectionEvidence(
                         idx, int(samples.branch_ids[idx]), int(samples.arc_indices[idx]),
                         tuple(float(v) for v in center), float(radius),
                         np.empty((0, 3), dtype=np.int32), False,
                     )
                 evidence_coords.append(outer)
     if evidence_coords:
-        voxels = _v14_unique_foreground_voxels(mask_mm, np.concatenate(evidence_coords, axis=0))
+        voxels = _unique_foreground_voxels(mask_mm, np.concatenate(evidence_coords, axis=0))
         if int(voxels.shape[0]) > 0:
-            return 'anomaly', V14SectionEvidence(
+            return 'anomaly', SectionEvidence(
                 idx, int(samples.branch_ids[idx]), int(samples.arc_indices[idx]),
                 tuple(float(v) for v in center), float(radius),
-                _v14_bound_evidence_voxels(voxels), False,
+                _bound_evidence_voxels(voxels), False,
             )
 
     # Curved-path fallback: rasterize only the tangent-normal plane, label it in
@@ -3318,7 +3352,7 @@ def _v14_sample_one_normal_section(
         + uu[..., None] * first.reshape(1, 1, 3)
         + vv[..., None] * second.reshape(1, 1, 3)
     )
-    _plane_rounded, plane_valid, plane_values = _v14_round_and_sample_mask(
+    _plane_rounded, plane_valid, plane_values = _round_and_sample_mask(
         mask_mm, plane_coords.reshape((-1, 3)),
     )
     plane_complete = bool(np.all(plane_valid))
@@ -3343,7 +3377,7 @@ def _v14_sample_one_normal_section(
     if not np.any(center_component & annulus):
         return ('clean', None) if plane_complete else ('unknown', None)
     if not bool(capture_payload):
-        return 'anomaly', V14SectionEvidence(
+        return 'anomaly', SectionEvidence(
             idx, int(samples.branch_ids[idx]), int(samples.arc_indices[idx]),
             tuple(float(v) for v in center), float(radius),
             np.empty((0, 3), dtype=np.int32), True,
@@ -3360,37 +3394,37 @@ def _v14_sample_one_normal_section(
             int(evidence_coordinate_cap), dtype=np.int64,
         )
         evidence_plane_coords = evidence_plane_coords[select]
-    voxels = _v14_unique_foreground_voxels(mask_mm, evidence_plane_coords)
+    voxels = _unique_foreground_voxels(mask_mm, evidence_plane_coords)
     if int(voxels.shape[0]) <= 0:
         return 'unknown', None
-    return 'anomaly', V14SectionEvidence(
+    return 'anomaly', SectionEvidence(
         idx, int(samples.branch_ids[idx]), int(samples.arc_indices[idx]),
         tuple(float(v) for v in center), float(radius),
-        _v14_bound_evidence_voxels(voxels), True,
+        _bound_evidence_voxels(voxels), True,
     )
 
-def _v14_detect_normal_plane_evidence(
+def _detect_normal_plane_evidence(
     mask_mm: np.ndarray,
-    samples: V14CenterlineSamples,
+    samples: CenterlineSamples,
     *,
     radius_factor: float,
     workers: int,
     capture_payload: bool = True,
-) -> List[V14SectionEvidence]:
+) -> List[SectionEvidence]:
     count = int(samples.points_tyx.shape[0])
     if count <= 0:
         return []
     plane_cap = max(32, _env_int('YOLO_TTA_CENTERLINE_PLANE_HALF_CAP', 256))
     worker_count = max(1, min(8, choose_slice_parallel_workers(int(workers), int(count))))
 
-    def _sample(idx: int) -> Tuple[str, Optional[V14SectionEvidence]]:
-        return _v14_sample_one_normal_section(
+    def _sample(idx: int) -> Tuple[str, Optional[SectionEvidence]]:
+        return _sample_one_normal_section(
             mask_mm, samples, int(idx), float(radius_factor), int(plane_cap),
             capture_payload=bool(capture_payload),
         )
 
     print(
-        f'v14 centerline: {"testing" if bool(capture_payload) else "classifying"} '
+        f'Centerline: {"testing" if bool(capture_payload) else "classifying"} '
         f'{int(count)} tangent-normal 2D section(s) '
         f'with {int(worker_count)} worker(s), radius factor X={float(radius_factor):g}.'
     )
@@ -3416,14 +3450,14 @@ def _v14_detect_normal_plane_evidence(
     samples.details['unknown_section_sample_indices'] = unknown_indices
     return [item for state, item in results if str(state) == 'anomaly' and item is not None]
 
-def _v14_materialize_selected_section_evidence(
+def _materialize_selected_section_evidence(
     mask_mm: np.ndarray,
-    samples: V14CenterlineSamples,
-    selected_stubs: Sequence[V14SectionEvidence],
+    samples: CenterlineSamples,
+    selected_stubs: Sequence[SectionEvidence],
     *,
     radius_factor: float,
     workers: int,
-) -> Tuple[List[V14SectionEvidence], Dict[str, object]]:
+) -> Tuple[List[SectionEvidence], Dict[str, object]]:
     """Materialize bounded voxel payloads only for clean-flank anomaly samples."""
     requested = list(selected_stubs)
     sample_cap = max(
@@ -3446,14 +3480,14 @@ def _v14_materialize_selected_section_evidence(
     plane_cap = max(32, _env_int('YOLO_TTA_CENTERLINE_PLANE_HALF_CAP', 256))
     worker_count = max(1, min(8, choose_slice_parallel_workers(int(workers), len(requested))))
 
-    def _sample(stub: V14SectionEvidence) -> Tuple[str, Optional[V14SectionEvidence]]:
-        return _v14_sample_one_normal_section(
+    def _sample(stub: SectionEvidence) -> Tuple[str, Optional[SectionEvidence]]:
+        return _sample_one_normal_section(
             mask_mm, samples, int(stub.sample_index), float(radius_factor), int(plane_cap),
             capture_payload=True,
         )
 
     print(
-        f'v14 centerline: materializing bounded evidence for {len(requested)} '
+        f'Centerline: materializing bounded evidence for {len(requested)} '
         f'clean-flank section(s) with {int(worker_count)} worker(s).'
     )
     if int(worker_count) <= 1:
@@ -3469,7 +3503,7 @@ def _v14_materialize_selected_section_evidence(
         4096,
         _env_int('YOLO_TTA_CENTERLINE_MAX_ACTIONABLE_EVIDENCE_VOXELS', 1_000_000),
     )
-    materialized: List[V14SectionEvidence] = []
+    materialized: List[SectionEvidence] = []
     retained_voxels = 0
     voxel_cap_reached = False
     for stub, (state, item) in zip(requested, results):
@@ -3500,15 +3534,15 @@ def _v14_materialize_selected_section_evidence(
         'actionable_evidence_voxel_cap_reached': bool(voxel_cap_reached),
     }
 
-def _v14_cluster_centerline_events(
-    samples: V14CenterlineSamples,
-    evidence: Sequence[V14SectionEvidence],
+def _cluster_centerline_events(
+    samples: CenterlineSamples,
+    evidence: Sequence[SectionEvidence],
     *,
     minimum_samples: int = 3,
     close_gap: int = 2,
     clean_flank_samples: int = 3,
-) -> Tuple[List[V14CenterlineEvent], List[V14SectionEvidence]]:
-    evidence_by_sample: Dict[int, V14SectionEvidence] = {
+) -> Tuple[List[CenterlineEvent], List[SectionEvidence]]:
+    evidence_by_sample: Dict[int, SectionEvidence] = {
         int(item.sample_index): item for item in evidence
     }
     tested_raw = samples.details.get('tested_section_sample_indices')
@@ -3518,8 +3552,8 @@ def _v14_cluster_centerline_events(
         tested_samples = set(int(v) for v in evidence_by_sample)
     else:
         tested_samples = set(int(v) for v in tested_raw)
-    events: List[V14CenterlineEvent] = []
-    selected: List[V14SectionEvidence] = []
+    events: List[CenterlineEvent] = []
+    selected: List[SectionEvidence] = []
     next_event_id = 0
     for branch_id in np.unique(samples.branch_ids):
         branch_idx = np.flatnonzero(samples.branch_ids == int(branch_id))
@@ -3594,7 +3628,7 @@ def _v14_cluster_centerline_events(
                 for item in actual:
                     event_selected_indices.append(len(selected))
                     selected.append(dataclasses_replace(item, event_id=int(next_event_id)))
-            events.append(V14CenterlineEvent(
+            events.append(CenterlineEvent(
                 int(next_event_id), int(branch_id),
                 int(samples.arc_indices[int(order[run_start])]),
                 int(samples.arc_indices[int(order[run_stop - 1])]),
@@ -3605,9 +3639,9 @@ def _v14_cluster_centerline_events(
             next_event_id += 1
     return events, selected
 
-def _v14_dense_centerline_seeds_by_slice(
+def _dense_centerline_seeds_by_slice(
     mask_mm: np.ndarray,
-    samples: V14CenterlineSamples,
+    samples: CenterlineSamples,
 ) -> Dict[int, List[Tuple[int, int, float]]]:
     seeds: Dict[int, Dict[Tuple[int, int], float]] = {}
 
@@ -3680,7 +3714,7 @@ def _v14_dense_centerline_seeds_by_slice(
                 alpha = float(step) / float(max(1, steps))
                 point = point0 + alpha * delta
                 radius = (1.0 - alpha) * radius0 + alpha * radius1
-                snapped = _v14_snap_center_to_foreground(mask_mm, point, radius)
+                snapped = _snap_center_to_foreground(mask_mm, point, radius)
                 if snapped is None:
                     continue
                 _add_protection_seeds(snapped, float(radius))
@@ -3689,7 +3723,7 @@ def _v14_dense_centerline_seeds_by_slice(
         for t_idx, per_slice in seeds.items()
     }
 
-def _v14_watershed_candidate_basin(
+def _watershed_candidate_basin(
     component_u8: np.ndarray,
     good_seeds_yxr: Sequence[Tuple[int, int, float]],
     bad_seeds_yx: Sequence[Tuple[int, int]],
@@ -3744,7 +3778,7 @@ def _v14_watershed_candidate_basin(
         pass
     return fallback
 
-def _v14_submit_sparse_audit_layer(
+def _submit_sparse_audit_layer(
     *,
     store_dir: Path,
     store_stats: Dict[str, object],
@@ -3785,7 +3819,7 @@ def _v14_submit_sparse_audit_layer(
     )
     sink = nrrd_layer_sink()
     if sink is None:
-        raise RuntimeError('v14 centerline audit layer requested without an NRRD sink')
+        raise RuntimeError('Centerline audit layer requested without an NRRD sink')
     sink.submit_layer(
         ref,
         nrrd_layer_output_suffix(
@@ -3795,11 +3829,11 @@ def _v14_submit_sparse_audit_layer(
     )
     return ref
 
-def _v14_component_flank_is_clear(
+def _component_flank_is_clear(
     mask_mm: np.ndarray,
     component_crop: np.ndarray,
     bbox_yxyx: Tuple[int, int, int, int],
-    event: V14CenterlineEvent,
+    event: CenterlineEvent,
     temporal_context: int,
 ) -> bool:
     y0, y1, x0, x1 = (int(v) for v in bbox_yxyx)
@@ -3846,7 +3880,7 @@ def _v14_component_flank_is_clear(
             return False
     return True
 
-def _v14_apply_component_removal_plan(
+def _apply_component_removal_plan(
     mask_mm: np.ndarray,
     anchors_by_t: Dict[int, List[Tuple[int, int]]],
     *,
@@ -3888,16 +3922,16 @@ def _v14_apply_component_removal_plan(
     parallel_for_indices(
         int(slice_ids.size), _apply,
         max_workers=choose_slice_parallel_workers(int(workers), int(slice_ids.size)),
-        desc='v14 centerline: applying safe 2D component removals',
+        desc='Centerline: applying safe 2D component removals',
         show_progress=True,
     )
     return int(np.sum(removed_counts, dtype=np.int64))
 
-def _v14_plan_components_and_write_sparse_audits(
+def _plan_components_and_write_sparse_audits(
     mask_mm: np.ndarray,
-    samples: V14CenterlineSamples,
-    events: Sequence[V14CenterlineEvent],
-    evidence: Sequence[V14SectionEvidence],
+    samples: CenterlineSamples,
+    events: Sequence[CenterlineEvent],
+    evidence: Sequence[SectionEvidence],
     center_seeds_by_t: Dict[int, List[Tuple[int, int, float]]],
     *,
     temp_dir: Path,
@@ -3914,16 +3948,16 @@ def _v14_plan_components_and_write_sparse_audits(
     watershed_store_dir = pass_dir / 'watershed_candidates.cvol'
     removed_writer = IncrementalRawBBoxMaskStoreWriter(
         shape=shape, store_dir=removed_store_dir, format_name=CVOL_FORMAT,
-        desc=f'v14 pass {int(pass_index)} removed 2D components',
+        desc=f'Centerline pass {int(pass_index)} removed 2D components',
         extra_meta={'source': 'centerline_filter', 'pass_index': int(pass_index)},
     )
     watershed_writer = IncrementalRawBBoxMaskStoreWriter(
         shape=shape, store_dir=watershed_store_dir, format_name=CVOL_FORMAT,
-        desc=f'v14 pass {int(pass_index)} watershed candidates',
+        desc=f'Centerline pass {int(pass_index)} watershed candidates',
         extra_meta={'source': 'centerline_filter', 'pass_index': int(pass_index)},
     )
     event_by_id = {int(event.event_id): event for event in events}
-    evidence_by_t: Dict[int, List[Tuple[V14SectionEvidence, int, int]]] = {}
+    evidence_by_t: Dict[int, List[Tuple[SectionEvidence, int, int]]] = {}
     for item in evidence:
         for voxel in np.asarray(item.voxel_tyx, dtype=np.int32):
             t_idx, y_idx, x_idx = (int(v) for v in voxel)
@@ -3961,7 +3995,7 @@ def _v14_plan_components_and_write_sparse_audits(
                 count, labels, cc_stats, _centroids = cv2.connectedComponentsWithStats(
                     crop, connectivity=8, ltype=cv2.CV_32S,
                 )
-                bad_by_label: Dict[int, List[Tuple[V14SectionEvidence, int, int]]] = {}
+                bad_by_label: Dict[int, List[Tuple[SectionEvidence, int, int]]] = {}
                 for item, global_y, global_x in evidence_by_t[int(t_idx)]:
                     local_y = int(global_y) - int(y0)
                     local_x = int(global_x) - int(x0)
@@ -4023,7 +4057,7 @@ def _v14_plan_components_and_write_sparse_audits(
                             int(x0), int(x0) + int(width),
                         )
                         can_remove = all(
-                            _v14_component_flank_is_clear(
+                            _component_flank_is_clear(
                                 mask_mm, component, bbox, event, int(temporal_context),
                             )
                             for event in relevant_events
@@ -4049,7 +4083,7 @@ def _v14_plan_components_and_write_sparse_audits(
                                 dtype=np.uint8,
                             )
                         else:
-                            basin = _v14_watershed_candidate_basin(
+                            basin = _watershed_candidate_basin(
                                 np.ascontiguousarray(component, dtype=np.uint8),
                                 good_yxr, bad_yx,
                             )
@@ -4072,7 +4106,7 @@ def _v14_plan_components_and_write_sparse_audits(
         watershed_writer.discard()
         raise
 
-    removed_ref = _v14_submit_sparse_audit_layer(
+    removed_ref = _submit_sparse_audit_layer(
         store_dir=removed_store_dir, store_stats=removed_stats, shape_tyx=shape,
         model_name=str(model_name), mask_kind='removed_components',
         pass_index=int(pass_index),
@@ -4081,7 +4115,7 @@ def _v14_plan_components_and_write_sparse_audits(
             'clean-flank, evidence-coverage, and centerline-protection guards.'
         ),
     )
-    watershed_ref = _v14_submit_sparse_audit_layer(
+    watershed_ref = _submit_sparse_audit_layer(
         store_dir=watershed_store_dir, store_stats=watershed_stats, shape_tyx=shape,
         model_name=str(model_name), mask_kind='watershed_candidates',
         pass_index=int(pass_index),
@@ -4093,13 +4127,13 @@ def _v14_plan_components_and_write_sparse_audits(
         ),
     )
     nrrd_layer_refs.extend([removed_ref, watershed_ref])
-    applied_removed_voxels = _v14_apply_component_removal_plan(
+    applied_removed_voxels = _apply_component_removal_plan(
         mask_mm, anchors_by_t, workers=int(workers),
     )
     planned_removed_voxels = int(removed_stats.get('foreground_voxels', 0))
     if int(applied_removed_voxels) != int(planned_removed_voxels):
         raise RuntimeError(
-            f'v14 centerline removal audit mismatch: planned={planned_removed_voxels}, '
+            f'Centerline removal audit mismatch: planned={planned_removed_voxels}, '
             f'applied={applied_removed_voxels}'
         )
     return {
@@ -4118,7 +4152,7 @@ def _v14_plan_components_and_write_sparse_audits(
         ),
     }
 
-def apply_v14_centerline_filter_inplace(
+def apply_centerline_filter_inplace(
     final_union_mm: np.ndarray,
     *,
     model_name: str,
@@ -4132,7 +4166,6 @@ def apply_v14_centerline_filter_inplace(
     surface_points: int,
     timeout_seconds: float,
     workers: int,
-    keep_temp: bool,
     nrrd_layer_refs: List['NrrdLayerRef'],
 ) -> Dict[str, object]:
     """Iteratively filter the post-union volume and preserve every audit stage."""
@@ -4150,7 +4183,7 @@ def apply_v14_centerline_filter_inplace(
     if not bool(stats['enabled']):
         return stats
 
-    print('\n=== v14 centerline filter: immutable pass-0 checkpoint ===')
+    print('\n=== Centerline filter: immutable pass-0 checkpoint ===')
     pass0_ref = materialize_nrrd_global_layer(
         final_union_mm,
         model_name=str(model_name), source='centerline_filter', mask_kind='pass00_input',
@@ -4160,7 +4193,7 @@ def apply_v14_centerline_filter_inplace(
             'This is the exact pass-0 recovery checkpoint.'
         ),
         temp_dir=temp_dir, workers=int(workers), known_has_foreground=True,
-        volume_is_immutable=False, keep_temp=bool(keep_temp),
+        volume_is_immutable=False,
         layer_role='checkpoint', recomposition_op='select',
         low_quality_recomposition_op='select',
     )
@@ -4170,16 +4203,15 @@ def apply_v14_centerline_filter_inplace(
     pass_records: List[Dict[str, object]] = []
     stop_reason = 'pass_limit_exhausted'
     for pass_index in range(1, int(requested_passes) + 1):
-        print(f'\n=== v14 centerline filter pass {int(pass_index)}/{int(requested_passes)} ===')
+        print(f'\n=== Centerline filter pass {int(pass_index)}/{int(requested_passes)} ===')
         pass_started = time.monotonic()
-        samples = _v14_extract_centerline_samples(
+        samples = _extract_centerline_samples(
             final_union_mm,
             temp_dir=temp_dir, pass_index=int(pass_index), backend=str(backend),
             surface_max_dim=int(surface_max_dim), surface_points=int(surface_points),
             timeout_seconds=float(timeout_seconds), workers=int(workers),
-            keep_temp=bool(keep_temp),
         )
-        samples = _v14_subsample_centerline_samples(samples)
+        samples = _subsample_centerline_samples(samples)
         if int(samples.points_tyx.shape[0]) <= 0:
             pass_record = {
                 'pass_index': int(pass_index),
@@ -4209,12 +4241,12 @@ def apply_v14_centerline_filter_inplace(
                 if len(pass_records) > 1 else 'backend_unavailable_pass_through'
             )
             print(
-                f'v14 centerline pass {int(pass_index)}: backend={samples.backend}; '
+                f'Centerline pass {int(pass_index)}: backend={samples.backend}; '
                 'no centerline samples, preserving the current pre-pass checkpoint without '
                 'writing a duplicate result checkpoint.'
             )
             break
-        evidence = _v14_detect_normal_plane_evidence(
+        evidence = _detect_normal_plane_evidence(
             final_union_mm, samples,
             radius_factor=float(radius_factor), workers=int(workers),
             capture_payload=False,
@@ -4238,15 +4270,15 @@ def apply_v14_centerline_filter_inplace(
             samples = dataclasses_replace(samples, automatic_removal_allowed=False)
             samples.details['automatic_removal_allowed'] = False
             print(
-                f'Warning: v14 centerline pass {int(pass_index)} classified '
+                f'Warning: centerline pass {int(pass_index)} classified '
                 f'{100.0 * float(anomaly_fraction):.1f}% of tested sections as anomalous; '
                 'automatic removal is disabled for this pass, while clean-flank '
                 'watershed candidates remain available for audit.'
             )
-        events, selected_evidence = _v14_cluster_centerline_events(
+        events, selected_evidence = _cluster_centerline_events(
             samples, evidence, minimum_samples=3, close_gap=2, clean_flank_samples=3,
         )
-        selected_evidence, payload_stats = _v14_materialize_selected_section_evidence(
+        selected_evidence, payload_stats = _materialize_selected_section_evidence(
             final_union_mm, samples, selected_evidence,
             radius_factor=float(radius_factor), workers=int(workers),
         )
@@ -4281,11 +4313,11 @@ def apply_v14_centerline_filter_inplace(
             samples = dataclasses_replace(samples, automatic_removal_allowed=False)
             samples.details['automatic_removal_allowed'] = False
             print(
-                f'Warning: v14 centerline pass {int(pass_index)} reached the bounded '
+                f'Warning: centerline pass {int(pass_index)} reached the bounded '
                 'actionable-evidence budget; automatic removal is disabled for this pass.'
             )
-        center_seeds = _v14_dense_centerline_seeds_by_slice(final_union_mm, samples)
-        component_stats = _v14_plan_components_and_write_sparse_audits(
+        center_seeds = _dense_centerline_seeds_by_slice(final_union_mm, samples)
+        component_stats = _plan_components_and_write_sparse_audits(
             final_union_mm, samples, events, selected_evidence, center_seeds,
             temp_dir=temp_dir, model_name=str(model_name), pass_index=int(pass_index),
             temporal_context=int(temporal_context),
@@ -4297,12 +4329,12 @@ def apply_v14_centerline_filter_inplace(
             model_name=str(model_name), source='centerline_filter', mask_kind='result',
             pass_index=int(pass_index), stage='',
             description=(
-                f'Post-union result after v14 centerline filter pass {int(pass_index)}; '
+                f'Post-union result after centerline filter pass {int(pass_index)}; '
                 'watershed-candidate voxels remain present unless their complete 2D component '
                 'separately satisfied every automatic-removal guard.'
             ),
             temp_dir=temp_dir, workers=int(workers), known_has_foreground=True,
-            volume_is_immutable=False, keep_temp=bool(keep_temp),
+            volume_is_immutable=False,
             layer_role='checkpoint', recomposition_op='select',
             low_quality_recomposition_op='select',
         )
@@ -4333,7 +4365,7 @@ def apply_v14_centerline_filter_inplace(
             pass_record['backend_fallback_reason'] = str(samples.details.get('fallback_reason'))
         pass_records.append(pass_record)
         print(
-            f'v14 centerline pass {int(pass_index)}: backend={samples.backend}, '
+            f'Centerline pass {int(pass_index)}: backend={samples.backend}, '
             f'events={len(events)}, removed_components={int(component_stats["removed_components"])}, '
             f'removed_voxels={int(component_stats["removed_voxels"])}, '
             f'watershed_voxels={int(component_stats["watershed_voxels"])}.'

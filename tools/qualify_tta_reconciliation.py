@@ -102,8 +102,7 @@ def invocation(root, output, name):
     if hybrid:
         argv.extend(['--enable_tile', '32:32', '--augmentation_ratio', '3', '--augmentation',
             f'gpu:{ROOT / "XTA/examples/external_augmentations/GPU_light.py"}',
-            f'cpu:{ROOT / "XTA/examples/external_augmentations/CPU_light.py"}',
-            '--augmentation_coverage', 'packed'])
+            f'cpu:{ROOT / "XTA/examples/external_augmentations/CPU_light.py"}'])
     if name.startswith('gpu_native_views'):
         argv.extend(['--enable_azimuthal', 'transverse:30', '--enable_radial', 'transverse',
                      '--enable_spherical', 'transverse'])
@@ -230,6 +229,8 @@ def inspect_case(output, name):
         backends = sorted({entry['backend'] for entry in augmentation['execution_records']})
         if backends != ['cpu', 'gpu'] or not all(entry['pass_count'] == 3 for entry in augmentation['execution_records']):
             raise AssertionError(f'Hybrid three-pass augmentation did not execute both backends: {backends}')
+        if augmentation['coverage'] != 'none' or augmentation['coverage_records']:
+            raise AssertionError('Default augmentation coverage persisted inverse-support sidecars')
         if not any(layer['source'] == 'tile' for layer in layers):
             raise AssertionError('Hybrid fixture did not publish accepted tile predictions')
         receipt['augmentation_backends'] = backends

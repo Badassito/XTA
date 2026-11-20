@@ -6,16 +6,12 @@ backend availability or successful dispatch; each backend keeps its own guards.
 from __future__ import annotations
 
 import operator
-import os
+
+from .env_flags import env_flag as _flag
 
 
 SPHERICAL_FP32_MAX_AXIS = 4096
 SPHERICAL_FP32_BACKEND = 'cuda_spherical_fp32_virtual_gray8'
-
-
-def _flag(name, default=False):
-    value = os.environ.get(name)
-    return bool(default) if value is None else value.strip().lower() not in ('', '0', 'false', 'no', 'off')
 
 
 def fast_geometry_enabled():

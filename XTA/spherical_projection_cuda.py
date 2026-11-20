@@ -8,12 +8,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import operator
-import os
 import threading
 import time
 
 import numpy as np
 
+from .env_flags import env_flag
 from .qsc import QSC_FACE_BASES
 from .spherical_projection_bounds import spherical_output_bounds, SPHERICAL_RADIUS_ROUNDOFF_RELATIVE
 from .spherical_preflight import validate_spherical_preflight_plane
@@ -309,9 +309,7 @@ class SphericalCudaProjector:
                     point_z = (view.full_t - 1) / 2 + (radii[0] + radii[-1]) / 2 * normal_world[2]
                     face_z = int(np.clip(np.rint((point_z + .5) * shape[0] / view.full_t - .5), 0, shape[0] - 1))
                     self.preflight_planes = tuple(dict.fromkeys((shape[0] // 2, face_z)))
-                    full_math_preflight = os.environ.get('YOLO_TTA_SPHERICAL_FULL_MATH_PREFLIGHT', '0').strip().lower() in (
-                        '1', 'true', 'yes', 'on',
-                    )
+                    full_math_preflight = env_flag('YOLO_TTA_SPHERICAL_FULL_MATH_PREFLIGHT', False)
                     for checked_z in self.preflight_planes:
                         checked = self._run_block(checked_z, 1)
                         foreground_bounds = None

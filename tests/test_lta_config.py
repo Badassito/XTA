@@ -40,6 +40,11 @@ class LtaConfigTests(unittest.TestCase):
         help_text = " ".join(build_lta_argparser().format_help().split())
         self.assertIn("a complete NRRD checkpoint after each requested filter", help_text)
         self.assertIn("Filter checkpoints precede hard-positive restoration", help_text)
+        # Planning-only geometries parse but are not advertised.
+        for option in ("--enable_azimuthal", "--enable_radial", "--radial_min_radius",
+                       "--enable_spherical", "--spherical_min_radius", "--enable_tilted",
+                       "--sam_execution"):
+            self.assertNotIn(option, help_text)
 
     def test_complete_public_contract_is_resolved(self) -> None:
         config = parse_lta_args([
@@ -54,7 +59,6 @@ class LtaConfigTests(unittest.TestCase):
             "--enable_tilted", "coronal:15:horizontal",
             "--enable_tile", "512:256", "128:64",
             "--angle", "240,0",
-            "--sam_execution", "video",
             "--conf", "0.25",
             "--save", "nrrd", "images,labels", "overlay", "voxel_volume", "summary",
             "--postprocessing", "keep_objects:2", "3d_void_fill", "gaussian_smoothing::2",
@@ -71,7 +75,6 @@ class LtaConfigTests(unittest.TestCase):
         self.assertEqual(config.tilted_groups[0].views, ("coronal",))
         self.assertEqual(config.tiles[0].config_id, "s512_st256")
         self.assertEqual(config.angles, (240.0, 0.0))
-        self.assertEqual(config.args.sam_execution, "video")
         self.assertEqual(config.args.conf, 0.25)
         self.assertEqual(
             config.save.tokens,
@@ -88,7 +91,6 @@ class LtaConfigTests(unittest.TestCase):
         self.assertEqual(config.exemplar_dirs, ())
         self.assertEqual(config.args.exemplar_index_origin, 1)
         self.assertEqual(config.angles, (0.0,))
-        self.assertEqual(config.args.sam_execution, "video")
         self.assertEqual(config.args.conf, 0.15)
         self.assertEqual(config.save.tokens, ())
         self.assertEqual(config.postprocessing.keep_objects, 0)
@@ -155,6 +157,7 @@ class LtaConfigTests(unittest.TestCase):
             ("--multiplex_count", "16"),
             ("--max_num_objects", "128"),
             ("--jpeg_quality", "100"),
+            ("--sam_execution", "video"),
         )
         for option, value in unavailable:
             with self.subTest(option=option), contextlib.redirect_stderr(io.StringIO()):
@@ -172,10 +175,6 @@ class LtaConfigTests(unittest.TestCase):
             with self.subTest(option=option, value=value), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     parse_lta_args([*self.REQUIRED, option, value])
-
-        with contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit):
-                parse_lta_args([*self.REQUIRED, "--sam_execution", "image"])
 
 
 if __name__ == "__main__":

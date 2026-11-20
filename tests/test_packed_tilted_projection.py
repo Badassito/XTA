@@ -91,10 +91,10 @@ def _task(root, *, external_alias=False, fail_once=False):
         d1_shadow_path=None, union_path=path, confmap_path=None, temp_dir=root,
         dense_tiling_active=False, min_conf=0., min_radius=0., interpolation_distance=0,
         interpolation_walk_back=1, interpolation_candidates=1, interpolation_passes=1,
-        interpolation_min_radius=0., interpolation_search_angle=0., keep_temp_artifacts=False,
+        interpolation_min_radius=0., interpolation_search_angle=0.,
         slice_workers=2, interpolation_task_workers=1, component_layers_needed=True,
         precleaned_slice_cleanup=True, hole_fill_done_on_device=True, slice_meta=None,
-        fuse_azimuthal_component_layers=lambda: False, component_ref_dense_retirement_active=True,
+        fuse_azimuthal_component_layers=lambda: False,
         preinterpolation_layer_already_published=False, parent_mask_ready_callback=None,
         submit_component_projection=lambda *_a, **_k: None,
         materialize_workspace=materialize_raw_bbox_mask_store_workspace,
@@ -242,10 +242,10 @@ def test_encoded_projection_cancels_fair_gpu_request_when_cpu_job_settles(tmp_pa
     assert cancellations[-1] == (view.name, fail_output)
 
 
-@pytest.mark.parametrize('setting', ['flag', 'minimum', 'numpy', 'tile', 'keep', 'interpolation', 'extrapolation'])
+@pytest.mark.parametrize('setting', ['flag', 'minimum', 'numpy', 'tile', 'interpolation', 'extrapolation'])
 def test_packed_parent_optout_and_nonterminal_paths_remain_dense(monkeypatch, setting):
     kwargs = dict(native_bytes=128 * 1024**2, retire_dense=True, component_layers=True,
-        tiled=False, keep_temp=False, prepublished=False, interpolate=0,
+        tiled=False, prepublished=False, interpolate=0,
         interpolation_passes=1, extrapolate=0)
     monkeypatch.setenv('YOLO_TTA_PACKED_PARENT_MIN_MIB', '64')
     assert encoded.terminal_native_source_packing_eligible(_VIEWS[0], **kwargs)
@@ -257,8 +257,6 @@ def test_packed_parent_optout_and_nonterminal_paths_remain_dense(monkeypatch, se
         monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_BACKEND', 'numpy')
     elif setting == 'tile':
         kwargs['tiled'] = True
-    elif setting == 'keep':
-        kwargs['keep_temp'] = True
     elif setting == 'interpolation':
         kwargs['interpolate'] = 1
     else:
@@ -403,8 +401,8 @@ def test_publication_retirement_fences_mask_and_confidence_all_death_orders(tmp_
     lease = _DirectUnionBackingLease(key, 2 * expected.nbytes, phase='postprocess')
     state = ViewPrepareLeaseState({key: lease}, set(), {}, {key}, {key: lease.nbytes})
     notified = []
-    assert state.retire_dense_for_publication(result, enabled=True, tiled=False,
-        keep_temp=False, retired_callback=lambda *args: notified.append(args)) is False
+    assert state.retire_dense_for_publication(result, tiled=False,
+        retired_callback=lambda *args: notified.append(args)) is False
     assert key in state.retired_for_publication
     assert not state.complete(key, retain_for_dense_retirement=True)
     assert state.postprocess_bytes[key] == 2 * expected.nbytes

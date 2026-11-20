@@ -30,7 +30,7 @@ def add_deferred(stage, root, name, amount=1):
 
 def pipeline_drain(stage, budget, scheduler, *, sam_context=None):
     namespace = dict(vars(pipeline))
-    namespace.update(scheduler=scheduler, inference_worker_process_active=True,
+    namespace.update(scheduler=scheduler,
         detector_workspace_preparation=None,
         background_drain_budget=budget, sam_parent_staging=stage, sam_context=sam_context,
         _maybe_prepare_sam_runtime=lambda: None, _maybe_prepare_sam_cpu_source=lambda: None,
@@ -52,13 +52,13 @@ def pipeline_drain(stage, budget, scheduler, *, sam_context=None):
         _mark_view_variant_terminal _maybe_finalize_tile_parent
         _maybe_submit_tile_consolidations_for_parent _release_tile_dense_result_for_key
         _retire_parent_dense_view _submit_physical_view_union_reduction _submit_tile_bridge_gate
-        _submit_tile_parent_gate azimuthal_native_output_by_model component_ref_dense_retirement_active
-        interpolation_stats keep_temp_artifacts native_view_support_by_model nrrd_layer_refs
+        _submit_tile_parent_gate azimuthal_native_output_by_model
+        interpolation_stats native_view_support_by_model nrrd_layer_refs
         parent_bridge_ready parent_bridge_support_by_model parent_mask_support_by_model
         physical_view_dense_handoff_credit sam_gate_lineage_by_parent
-        physical_view_finalization_refs tile_accumulator_by_set tile_accumulator_paths
+        physical_view_finalization_refs tile_accumulator_by_set
         tile_consolidation_completed tile_expected_by_parent tile_parent_bridge_accumulator_by_set
-        tile_parent_mask_accumulator_by_set tile_slice_postprocess_workers tilted_native_output_by_model
+        tile_parent_mask_accumulator_by_set tilted_native_output_by_model
         view_infos_by_name view_prepare_leases view_volumes_by_model physical_view_union_completed
     '''.split())
     return _function(Path(pipeline.__file__).read_text(),
@@ -94,7 +94,6 @@ def test_slow_resume_sweep_returns_to_authentic_late_ack(
     assert c.notifications[-1].device_index != 2
     c.scheduler.drain_process_inference_results()
     assert c.notifications[-1].device_index == 2
-    assert c.notifications[-1].authenticated
     assert now[0] == pytest.approx(.05 * expected_probes)
     assert len(stage.deferred) == 64 and not leases.leases
     stage.deferred.clear()
@@ -250,7 +249,7 @@ def test_sam_completion_pass_stays_bounded_until_context_closes(
     stage.close()
 
 
-@pytest.mark.parametrize('wait_mode', ['future_free', 'nonpush_unrelated', 'nonpush_detector'])
+@pytest.mark.parametrize('wait_mode', ['future_free', 'nonpush_detector'])
 def test_locked_parent_drain_reaches_wakeable_wait_and_independent_completion(tmp_path, wait_mode):
     stage, _writer, prepare, leases = queue(tmp_path, ready=lambda: True)
     pool = _ByteAdmissionPool(1024, 'parent')
@@ -297,17 +296,15 @@ def test_locked_parent_drain_reaches_wakeable_wait_and_independent_completion(tm
         wait(futures, timeout=timeout, return_when=return_when)
         if len(waits) == 3:
             raise WaitsObserved
-    detector_active = wait_mode == 'nonpush_detector'
-    expected_timeout = .1 if detector_active else .002
+    expected_timeout = .1 if wait_mode == 'nonpush_detector' else .002
     namespace = drain.__globals__
-    namespace.update(inference_worker_process_active=detector_active,
-        fanout_consumers=deque(),
+    namespace.update(fanout_consumers=deque(),
         _test_drain=drain, _check_loop_limit=check_loop_limit,
-        pending_prediction_volume_futures=[] if wait_mode == 'future_free' else [unrelated],
+        # The drain skips this not-done cleanup, so it stays the sole outer waitable.
+        tile_cleanup_futures={} if wait_mode == 'future_free' else {
+            unrelated: ('model', 'unrelated', 'c', 't')},
         sam_cpu_futures={'source': None, 'runtime': None},
-        prediction_accumulation_futures={}, pending_prediction_build_jobs=[],
-        _process_inference_outstanding=lambda: False, ready_fullframe=[], ready_tile_infer=[],
-        _pump_prediction_volume_build_queue=lambda: None,
+        _process_inference_outstanding=lambda: False,
         scheduler_wake=Wake(), scheduler_push_drain_heartbeat_seconds=lambda: .002,
         _log_scheduler_wait_state=lambda: None,
         scheduler_state=SimpleNamespace(push_drain_active=wait_mode == 'future_free'),
@@ -370,13 +367,14 @@ def test_denied_probe_keeps_ready_prepared_parent_ahead_of_unrelated_wait(tmp_pa
     parents = {ready: ('model', 'ready'), unrelated: ('model', 'unrelated')}
     assert prepared_view_waitables(parents) == [unrelated]
     settled = []
-    drain.__globals__.update(inference_worker_process_active=False,
-        view_processing_futures=parents, component_ref_dense_retirement_active=False,
+    drain.__globals__.update(
+        view_processing_futures=parents,
         tile_expected_by_parent={}, sam_gate_lineage_by_parent={}, parent_bridge_ready=set(),
         interpolation_stats=[], nrrd_layer_refs=[],
         view_prepare_leases=SimpleNamespace(complete=lambda key, **_kw: settled.append(key) or True),
         view_infos_by_name={'ready': SimpleNamespace(family='cartesian')},
         _mark_view_variant_terminal=lambda *_args: None,
+        _retire_parent_dense_view=lambda *_args, **_kwargs: None,
         _maybe_submit_tile_consolidations_for_parent=lambda *_args: None)
     try:
         drain()

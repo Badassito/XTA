@@ -143,9 +143,8 @@ def variant_policy(name, *, generation_mode, max_group_bytes, original=None):
             settings['component_min_radius'] = 0.
         if name == 'anchor_context_censored':
             settings['branch_crop_boundary_policy'] = 'retain_censored'
-    # Freeze all quality settings so the current environment cannot change an arm.
-    return resolve_sam_bridge_policy({'sam_bridge_policy': settings}, generation_mode=generation_mode,
-        environ={})
+    # Freeze all quality settings explicitly so each arm is self-contained.
+    return resolve_sam_bridge_policy({'sam_bridge_policy': settings}, generation_mode=generation_mode)
 
 
 def run_replays(evidence, output, *, original_selection=None, variants=VARIANTS[:-1], max_group_mib=256,

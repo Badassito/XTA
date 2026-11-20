@@ -36,7 +36,10 @@ def scratch_root(source_root):
 
 
 SCRATCH = scratch_root(ROOT)
-POLICY_SHA = "1b2739997905c6ba2905c7e2613dd8c7c676dddfb16b6d518ef94286a481f4c8"
+# Pins the GPU_sweep.py bytes both arms must run: the preset with the elastic
+# folding fix. A baseline tree older than that fix needs --policy pointing at the
+# current XTA/examples/external_augmentations/GPU_sweep.py.
+POLICY_SHA = "eeaea265913ee036ae1b893618f540186d8400f9e34107f36760270d8b735f9d"
 
 
 def digest(path):

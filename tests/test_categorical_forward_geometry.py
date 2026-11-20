@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import unittest
-from pathlib import Path
 from unittest import mock
 
 import numpy as np
@@ -37,7 +36,6 @@ def _aug_job(view: geometry.ViewInfo, out_size: int, *, angle_deg: float = 0.0) 
     return geometry.AugJob(
         aug_id='test',
         angle_deg=float(angle_deg),
-        meta_path=Path('test.json'),
         aff=aff,
     )
 
@@ -53,7 +51,6 @@ def _tile_job(view: geometry.ViewInfo, out_size: int) -> geometry.DenseTileJob:
         tile_size=2,
         tile_stride=1,
         out_size=int(out_size),
-        meta_path=Path('tile.json'),
         M_out_to_src=IDENTITY_2X3.copy(),
         M_src_to_out=IDENTITY_2X3.copy(),
     )
@@ -179,8 +176,12 @@ class CategoricalForwardGeometryTests(unittest.TestCase):
             for view in positive_views:
                 with self.subTest(base=geometry.tilted_base_view_name(view)):
                     job = _aug_job(view, out_size=4)
-                    full = geometry.render_categorical_fullframe_for_job(
-                        self.mask, view, job, frame_idx=1,
+                    full = geometry.render_categorical_frame_on_grid(
+                        self.mask, view, 1,
+                        M_src_to_out=job.aff.M_src_to_out,
+                        M_out_to_src=job.aff.M_out_to_src,
+                        output_height=int(job.aff.out_size),
+                        output_width=int(job.aff.out_size),
                     )
                     tile = geometry.render_categorical_dense_tile_for_job(
                         self.mask, view, _tile_job(view, out_size=3), frame_idx=1,
@@ -332,8 +333,12 @@ class CategoricalForwardGeometryTests(unittest.TestCase):
             mock.patch.object(geometry.cv2, 'INTER_NEAREST', nearest, create=True),
             mock.patch.object(geometry.cv2, 'BORDER_CONSTANT', border_constant, create=True),
         ):
-            full = geometry.render_categorical_fullframe_for_job(
-                mask, view, job, frame_idx=0,
+            full = geometry.render_categorical_frame_on_grid(
+                mask, view, 0,
+                M_src_to_out=job.aff.M_src_to_out,
+                M_out_to_src=job.aff.M_out_to_src,
+                output_height=int(job.aff.out_size),
+                output_width=int(job.aff.out_size),
             )
             tile = geometry.render_categorical_dense_tile_for_job(
                 mask, view, tile_job, frame_idx=0,

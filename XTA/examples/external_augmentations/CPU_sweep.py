@@ -262,7 +262,7 @@ def _normalized_elastic_displacement_numpy(seed, height, width, rms_fraction):
 class CPUAugmentation:
     """Seedable OpenCV/NumPy implementation of the selected probability graph."""
 
-    tta_replay_contract = "opencv-affine-elastic-v1"
+    tta_replay_contract = "opencv-affine-elastic-v2"
 
     def __init__(self) -> None:
         self._seed = 1
@@ -449,9 +449,16 @@ class CPUAugmentation:
             + inverse[1, 2]
         ).astype(np.float32)
         if bool(params["elastic"]):
+            # x = inv(A)(y + d(y)): displace in the augmented raster so zoom/shear cannot amplify folding.
             displacement = self._elastic_displacement(self._seed, height, width)
-            source_x += displacement[:, :, 0]
-            source_y += displacement[:, :, 1]
+            source_x += (
+                inverse[0, 0] * displacement[:, :, 0]
+                + inverse[0, 1] * displacement[:, :, 1]
+            ).astype(np.float32)
+            source_y += (
+                inverse[1, 0] * displacement[:, :, 0]
+                + inverse[1, 1] * displacement[:, :, 1]
+            ).astype(np.float32)
 
         image_float = np.ascontiguousarray(
             image_array.astype(np.float32) / 255.0

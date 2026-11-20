@@ -42,7 +42,6 @@ class CanonicalRenderBatchImageTests(unittest.TestCase):
             aug_job = geometry.AugJob(
                 aug_id='a37',
                 angle_deg=37.0,
-                meta_path=root / 'a37.json',
                 aff=geometry.AffineSpec(
                     view=view.name,
                     angle_deg=37.0,
@@ -130,7 +129,6 @@ class CanonicalRenderBatchImageTests(unittest.TestCase):
                 tile_size=256,
                 tile_stride=128,
                 out_size=3,
-                meta_path=root / 'tiles.jsonl',
                 M_out_to_src=identity,
                 M_src_to_out=identity,
             )

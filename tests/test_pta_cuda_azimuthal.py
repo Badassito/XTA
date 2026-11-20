@@ -15,6 +15,17 @@ from XTA.pta_cuda_azimuthal import (
     render_azimuthal_categorical_pair,
 )
 
+# Test-only probe appended to the production unit so it calls the shipped
+# int64 offset helper rather than a copy of it.
+_OFFSET_PROBE_CUDA = _AZIMUTHAL_CATEGORICAL_CUDA + r'''
+extern "C" __global__ void pta_azimuthal_offset_probe(
+    long long* result, int t, int y, int x, int y_len, int x_len)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        result[0] = pta_tyx_offset(t, y, x, y_len, x_len);
+}
+'''
+
 
 class PTACudaAzimuthalLargeOffsetContractTests(unittest.TestCase):
     def test_opencv_float32_inverse_for_two_thirds_scale(self) -> None:
@@ -45,6 +56,13 @@ class PTACudaAzimuthalLargeOffsetContractTests(unittest.TestCase):
         self.assertEqual(_AZIMUTHAL_CATEGORICAL_CUDA.count('idx0 = pta_tyx_offset('), 3)
         self.assertEqual(_AZIMUTHAL_CATEGORICAL_CUDA.count('idx1 = pta_tyx_offset('), 3)
 
+    def test_production_source_carries_no_test_probe_kernel(self) -> None:
+        self.assertNotIn('pta_azimuthal_offset_probe', _AZIMUTHAL_CATEGORICAL_CUDA)
+        self.assertEqual(_AZIMUTHAL_CATEGORICAL_CUDA.count('extern "C" __global__'), 1)
+        self.assertIn('extern "C" __global__ void pta_azimuthal_categorical(',
+                      _AZIMUTHAL_CATEGORICAL_CUDA)
+        self.assertTrue(_OFFSET_PROBE_CUDA.startswith(_AZIMUTHAL_CATEGORICAL_CUDA))
+
 
 class PTACudaAzimuthalTests(unittest.TestCase):
     @classmethod
@@ -62,7 +80,7 @@ class PTACudaAzimuthalTests(unittest.TestCase):
         import cupy as cp
 
         kernel = cp.RawKernel(
-            _AZIMUTHAL_CATEGORICAL_CUDA,
+            _OFFSET_PROBE_CUDA,
             'pta_azimuthal_offset_probe',
             options=('--fmad=false',),
         )

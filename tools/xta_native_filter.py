@@ -1101,7 +1101,8 @@ def execute(args, output, scratch_root, report, global_edit, layers, le, fe,
             if args.conflicts == 'auto':
                 report['warnings'].append('Auto is a geometry/evidence heuristic, not a biological verdict. '
                                           'Radius uses native voxel indices, not calibrated physical units. '
-                                          'ROI-limit or unsuitable-core cases stay intact and are reported.')
+                                          'Every conflicting component was auto-cut; an ROI-limit or '
+                                          'unsuitable-core case would have stopped publication (needs_review).')
             report['warnings'].append('No exact low-resolution equality or biological correctness is implied. '
                                       'Native topology governs both Update steps; preview/native connectivity can differ.')
             report['warnings'].append('Components with no preview evidence are preserved until native Update Both '

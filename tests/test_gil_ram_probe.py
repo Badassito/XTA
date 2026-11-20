@@ -1,7 +1,7 @@
 """RAM headroom probe (#6 GIL sweep): fresh probes whose /proc and cgroupfs reads keep the GIL.
 
-Every probe is fresh (no cached value), so it starts after its caller's call; the
-GIL-holding reader returns the same text and errors as Path.read_text.
+Every probe is fresh (no cached usage or limit), so it starts after its caller's call;
+the GIL-holding reader returns the same text and errors as Path.read_text.
 """
 import os
 import random
@@ -128,6 +128,12 @@ def crt_reader():
     return reader
 
 
+def assert_membership_resolved_for_this_tree(files, reads):
+    """After a layout reset, membership is read once when present and retried while missing."""
+    count = reads.count('/proc/self/cgroup')
+    assert count >= 1 and ('/proc/self/cgroup' not in files or count == 1)
+
+
 def write_tree(root, files):
     for name, value in files.items():
         if isinstance(value, Exception):
@@ -139,30 +145,35 @@ def write_tree(root, files):
 
 def test_path_read_text_probe_matches_previous_formula_on_randomized_trees(monkeypatch):
     rng = random.Random(1234)
-    files = {}
-    fake_proc(monkeypatch, files)
+    files, reads = {}, []
+    fake_proc(monkeypatch, files, reads)
     for _ in range(400):
         files.clear()
         files.update(random_tree(rng))
+        workspace._reset_cgroup_layout_cache()
+        reads.clear()
         assert workspace.available_anon_work_bytes() == old_available_anon_work_bytes()
         info = workspace._read_meminfo_bytes()
         assert workspace.available_anon_work_bytes(meminfo=info) == old_available_anon_work_bytes(meminfo=info)
         if 'MemAvailable' in info or os.name != 'nt':
             assert publication_memory.publication_ram_headroom() == old_publication_ram_headroom()
+        assert_membership_resolved_for_this_tree(files, reads)
 
 
 def test_gil_reader_probe_matches_path_read_text_probe_on_randomized_trees(monkeypatch):
     """With the reader active (genuine Path.read_text), results equal the old Path.read_text probe."""
     rng = random.Random(4321)
     files = {}
-    reader_log = []
+    reader_log, released_log = [], []
     monkeypatch.setattr(workspace, '_GIL_READER', dict_reader(files, reader_log))
-    monkeypatch.setattr(workspace, '_gil_releasing_read_text', dict_reader(files))
+    monkeypatch.setattr(workspace, '_gil_releasing_read_text', dict_reader(files, released_log))
     old_reader = dict_reader(files)
     for _ in range(400):
         files.clear()
         files.update(random_tree(rng))
+        workspace._reset_cgroup_layout_cache()
         reader_log.clear()
+        released_log.clear()
         anon = workspace.available_anon_work_bytes()
         info = workspace._read_meminfo_bytes()
         anon_snapshot = workspace.available_anon_work_bytes(meminfo=info)
@@ -170,8 +181,10 @@ def test_gil_reader_probe_matches_path_read_text_probe_on_randomized_trees(monke
                     if 'MemAvailable' in info or os.name != 'nt' else None)
         budget = workspace._cgroup_memory_budget()
         assert reader_log  # the reader served this caller's own reads
+        assert_membership_resolved_for_this_tree(files, reader_log + released_log)
         with monkeypatch.context() as patched:
             patched.setattr(Path, 'read_text', old_reader)
+            workspace._reset_cgroup_layout_cache()  # the reference resolves membership itself
             assert anon == old_available_anon_work_bytes()
             assert anon_snapshot == old_available_anon_work_bytes(meminfo=info)
             if physical is not None:
@@ -184,9 +197,17 @@ def test_real_files_through_crt_reader_match_path_read_text(monkeypatch, tmp_pat
     reader = crt_reader()
     root = tmp_path.as_posix()
     rng = random.Random(99)
-    monkeypatch.setattr(workspace, '_GIL_READER', lambda path: reader(Path(root + path.as_posix())))
-    monkeypatch.setattr(workspace, '_gil_releasing_read_text',
-                        lambda path: Path(root + path.as_posix()).read_text())
+    reads = []
+
+    def held(path):
+        reads.append(path.as_posix())
+        return reader(Path(root + path.as_posix()))
+
+    def released(path):
+        reads.append(path.as_posix())
+        return Path(root + path.as_posix()).read_text()
+    monkeypatch.setattr(workspace, '_GIL_READER', held)
+    monkeypatch.setattr(workspace, '_gil_releasing_read_text', released)
     original = Path.read_text
 
     def rerooted(self, *args, **kwargs):
@@ -195,12 +216,16 @@ def test_real_files_through_crt_reader_match_path_read_text(monkeypatch, tmp_pat
         files = {name: value for name, value in random_tree(rng).items() if not isinstance(value, Exception)}
         root = (tmp_path / str(index)).as_posix()
         write_tree(root, files)
+        workspace._reset_cgroup_layout_cache()
+        reads.clear()
         new = (workspace.available_anon_work_bytes(), workspace._cgroup_memory_budget())
         info = workspace._read_meminfo_bytes()
         new_physical = publication_memory.publication_ram_headroom() if 'MemAvailable' in info else None
+        assert_membership_resolved_for_this_tree(files, reads)
         with monkeypatch.context() as patched:
             patched.setattr(Path, 'read_text', rerooted)
-            assert new == (old_available_anon_work_bytes(), workspace._cgroup_memory_budget())
+            workspace._reset_cgroup_layout_cache()  # the reference resolves membership itself
+            assert new ==(old_available_anon_work_bytes(), workspace._cgroup_memory_budget())
             if new_physical is not None:
                 assert new_physical == old_publication_ram_headroom()
 

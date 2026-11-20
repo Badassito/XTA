@@ -27,14 +27,13 @@ SOURCE_PATTERNS = (
     'XTA/geometry.py', 'XTA/backprojection.py', 'XTA/assembly.py', 'XTA/outputs.py',
     'XTA/interpolation.py', 'XTA/pipeline.py', 'XTA/cuda_d1.py', 'XTA/d1_*coverage*.py',
     'XTA/projection_coverage*.py', 'XTA/cylindrical*.py', 'XTA/spherical*.py',
-    'XTA/tilted_azimuthal*.py', 'XTA/unification/sampling.py',
+    'XTA/unification/sampling.py',
     'XTA/unification/contracts.py', 'XTA/unification/tta_manifest.py',
     'tests/reference_backends/*.py', 'tools/qualify_projection_coverage.py',
     'tools/qualify_release.py',
 )
 GPU_FLAGS = dict(YOLO_TTA_TEST_D1_ORTHOGONAL_CUDA='1',
-    XTA_TEST_TILTED_AZIMUTHAL_CUDA='1', XTA_RUN_CUDA_RADIAL_PROJECTION='1',
-    XTA_TEST_SPHERICAL_CUDA='1')
+    XTA_RUN_CUDA_RADIAL_PROJECTION='1', XTA_TEST_SPHERICAL_CUDA='1')
 
 
 def utc_now():

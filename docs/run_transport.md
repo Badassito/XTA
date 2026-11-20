@@ -1,15 +1,20 @@
 TTA retains SAM evidence during execution in `OUTPUT/sam-artifacts.tar`.
-`sam-artifacts.tar.lock` coordinates writers and reader snapshots; the companion
-lock must be writable. A committed member is read without that lock when the
+`sam-artifacts.tar.lock` coordinates writers and reader snapshots; writers need a
+writable companion lock, and a reader that cannot open it (read-only media)
+indexes the archive without it. A committed member is read without that lock when the
 archive's identity, size, mtime and ctime still match this process's cached index
 (appends only extend past the committed end, so committed bytes cannot change);
-on Linux each thread keeps one read-only descriptor and reads positionally. Unknown
+on Linux each thread keeps one read-only descriptor and reads positionally, and an
+open reader keeps that descriptor alive. Unknown
 members, full inventories and any changed archive keep the locked path, so missing
 or new members still wait for an in-progress append.
 `YOLO_TTA_ARCHIVE_LOCK_FREE_READS=0` restores locked reads. `artifact_archive.*`
 telemetry counts fast/locked reads and lock wait/hold time; SAM selection receipts
-record the process-wide deltas while each selection ran. Long interpolation and extrapolation
-scope paths are logical TAR/PAX members, addressed as
+record the process-wide deltas while each selection ran. A reader that proceeds
+without the companion lock still counts as a locked read and also adds to the
+telemetry-only counter `artifact_archive.unlocked_cold_reads`, which receipts do
+not record. Long interpolation and extrapolation scope paths are
+logical TAR/PAX members, addressed as
 `OUTPUT/sam-artifacts.tar#/sam_interpolation/.../evidence` or
 `OUTPUT/sam-artifacts.tar#/sam_extrapolation/.../evidence`.
 Evidence bundles, CVOL stores and JSON receipts commit as they become available.

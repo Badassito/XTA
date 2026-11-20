@@ -310,6 +310,9 @@ class GPUAugmentation:
     # Spatial samples depend on seed and image shape, never mask contents.
     mask_independent_geometry = True
     supports_cuda_masks = True
+    # apply_batch_many warps optional extra_masks with the images' sampled geometry.
+    supports_extra_masks = True
+    tta_replay_contract = "torch-affine-elastic-v2"
 
     def __init__(self, *, device: str, batch_size: int = 32) -> None:
         self.device = torch.device(str(device))
@@ -532,11 +535,14 @@ class GPUAugmentation:
         masks: Sequence[np.ndarray | torch.Tensor],
         seeds: Sequence[Sequence[Optional[int]]],
         output_size: Tuple[int, int],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        extra_masks: Optional[Sequence[np.ndarray | torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, ...]:
         """Upload several source ROIs once and emit one flat CUDA batch.
 
         Results are source-major and preserve the order of each nested seed
         sequence. A ``None`` seed identifies an unaugmented original.
+        ``extra_masks`` (one per source mask, on the masks' device) share the
+        masks' resize and nearest sampling grid and are returned third.
         """
         if not images or len(images) != len(masks) or len(images) != len(seeds):
             raise ValueError(
@@ -584,6 +590,22 @@ class GPUAugmentation:
             raise ValueError(
                 f"apply_batch_many image/mask shape mismatch for source shape={image_shape}"
             )
+        cuda_extra_inputs: List[bool] = []
+        if extra_masks is not None:
+            if len(extra_masks) != len(masks):
+                raise ValueError("apply_batch_many requires one extra mask per source mask")
+            cuda_extra_inputs = [
+                bool(torch.is_tensor(extra) and bool(getattr(extra, "is_cuda", False)))
+                for extra in extra_masks
+            ]
+            if any(cuda_extra_inputs) and not all(cuda_extra_inputs):
+                raise ValueError("apply_batch_many cannot mix NumPy and CUDA extra masks")
+            if all(cuda_extra_inputs) != all(cuda_mask_inputs):
+                raise ValueError("apply_batch_many requires masks and extra masks on the same source device")
+            if any(extra.ndim != 2 or tuple(extra.shape) != image_shape[:2] for extra in extra_masks):
+                raise ValueError(
+                    f"apply_batch_many image/extra mask shape mismatch for source shape={image_shape}"
+                )
         if all(cuda_image_inputs):
             for image in images:
                 if image.dtype != torch.uint8 or image.device != self.device:
@@ -629,6 +651,24 @@ class GPUAugmentation:
             mask_nhw = np.stack(mask_arrays, axis=0)
             mask_host = torch.from_numpy(np.ascontiguousarray(mask_nhw)).pin_memory()
             mask_tensor = mask_host.to(self.device, non_blocking=True).unsqueeze(1)
+        if extra_masks is not None:
+            if all(cuda_extra_inputs):
+                for extra in extra_masks:
+                    if extra.dtype != torch.uint8 or extra.device != self.device:
+                        raise ValueError(
+                            "CUDA policy extra masks must be uint8 tensors on "
+                            f"{self.device}; got dtype={extra.dtype}, device={extra.device}"
+                        )
+                extra_tensor = torch.stack(tuple(extra_masks), dim=0).unsqueeze(1)
+            else:
+                extra_nhw = np.stack(
+                    [np.ascontiguousarray((np.asarray(extra) > 0).astype(np.uint8)) for extra in extra_masks],
+                    axis=0,
+                )
+                extra_host = torch.from_numpy(np.ascontiguousarray(extra_nhw)).pin_memory()
+                extra_tensor = extra_host.to(self.device, non_blocking=True).unsqueeze(1)
+            # Channel 1 rides the mask's nearest resize and sampling grid.
+            mask_tensor = torch.cat((mask_tensor, extra_tensor), dim=1)
 
         image_float = image_tensor.to(torch.float32) / 255.0
         mask_float = mask_tensor.to(torch.float32)
@@ -661,7 +701,10 @@ class GPUAugmentation:
                 torch.round(image_batch * 255.0), 0.0, 255.0
             ).to(torch.uint8)
             masks_u8 = (mask_batch[:, 0] >= 0.5).to(torch.uint8)
-            return images_u8.contiguous(), masks_u8.contiguous()
+            if extra_masks is None:
+                return images_u8.contiguous(), masks_u8.contiguous()
+            extra_u8 = (mask_batch[:, 1] >= 0.5).to(torch.uint8)
+            return images_u8.contiguous(), masks_u8.contiguous(), extra_u8.contiguous()
         params_by_sample: List[Optional[Dict[str, object]]] = []
         forward_matrices: List[List[List[float]]] = []
         for seed in flat_seeds:
@@ -678,9 +721,11 @@ class GPUAugmentation:
         source = torch.einsum("nij,hwj->nhwi", inverse, pixel_grid)
         for index, (seed, params) in enumerate(zip(flat_seeds, params_by_sample)):
             if seed is not None and params is not None and bool(params["elastic"]):
+                # x = inv(A)(y + d(y)): displace in the augmented raster so zoom/shear cannot amplify folding.
                 displacement = self._elastic_displacement(int(seed), out_h, out_w)
-                source[index, :, :, 0] += displacement[0]
-                source[index, :, :, 1] += displacement[1]
+                linear = inverse[index, :2, :2]
+                source[index, :, :, 0] += linear[0, 0] * displacement[0] + linear[0, 1] * displacement[1]
+                source[index, :, :, 1] += linear[1, 0] * displacement[0] + linear[1, 1] * displacement[1]
 
         if out_w > 1:
             grid_x = source[:, :, :, 0] * (2.0 / float(out_w - 1)) - 1.0
@@ -709,7 +754,10 @@ class GPUAugmentation:
         warped_images = self._apply_intensity_noise(warped_images, flat_seeds, params_by_sample)
         images_u8 = torch.clamp(torch.round(warped_images * 255.0), 0.0, 255.0).to(torch.uint8)
         masks_u8 = (warped_masks[:, 0] >= 0.5).to(torch.uint8)
-        return images_u8.contiguous(), masks_u8.contiguous()
+        if extra_masks is None:
+            return images_u8.contiguous(), masks_u8.contiguous()
+        extra_u8 = (warped_masks[:, 1] >= 0.5).to(torch.uint8)
+        return images_u8.contiguous(), masks_u8.contiguous(), extra_u8.contiguous()
 
     @torch.inference_mode()
     def apply_batch(

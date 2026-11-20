@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import errno
 import hashlib
 import io
 import json
@@ -16,18 +17,22 @@ import threading
 import time
 import uuid
 
+from .env_flags import env_flag
 from .run_transport import _api_path, _canonical_path, _plain_ancestors, _safe_relative, _stamp
 
 SCHEMA = "xta.artifact-archive/1"
 _BLOCK = 512
 _CHUNK = 1024 * 1024
 _MAX_COMMIT = 64 * 1024**2
+# A reader may index without the companion lock when it cannot open it for these.
+_UNWRITABLE_LOCK_ERRNOS = frozenset({errno.EROFS, errno.EACCES, errno.EPERM})
 _LOCKS = {}
 _ARCHIVE_INDEX_CACHE = {}
 _APPEND_SNAPSHOTS = {}
 _GUARD = threading.Lock()
 _READERS_CHANGED = threading.Condition(_GUARD)
-# Reader handles: one read-only descriptor per (thread, archive), positional reads.
+# Reader handles: one shared read-only descriptor per (thread, archive), positional
+# reads; open streams keep it alive after eviction or thread exit.
 _THREAD_HANDLES = threading.local()
 _STATS_GUARD = threading.Lock()
 _STATS = dict(fast_reads=0, fast_misses=0, locked_reads=0, snapshot_reads=0,
@@ -68,34 +73,36 @@ def archive_read_stats():
 
 
 def _lock_free_reads_enabled():
-    return os.environ.get('YOLO_TTA_ARCHIVE_LOCK_FREE_READS', '1').strip().lower() not in {
-        '0', 'false', 'no', 'off'}
+    return env_flag('YOLO_TTA_ARCHIVE_LOCK_FREE_READS', True)
 
 
-class _ThreadHandles(dict):
-    """A thread's archive descriptors; closed when the thread's locals are released.
+class _SharedDescriptor:
+    """One cached read-only descriptor; closed once its thread cache and every stream drop it.
 
-    Measurement pools create short-lived threads per group, so descriptors must
-    not outlive their thread (that would leak one descriptor per thread).
+    Measurement pools create short-lived threads per group, so a thread's cache
+    dies with the thread (no descriptor leak); streams it opened keep their
+    descriptor until they close, even after eviction or thread exit.
     """
 
-    def close_all(self):
-        for fd in tuple(self.values()):
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        self.clear()
+    __slots__ = ("fd",)
+
+    def __init__(self, fd):
+        self.fd = fd
 
     def __del__(self):
-        self.close_all()
+        fd, self.fd = self.fd, -1
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
 
 
 class _PositionalStream:
     """Private cursor over a shared read-only descriptor (os.pread; no shared offset)."""
 
-    def __init__(self, fd):
-        self._fd, self._position, self.closed = fd, 0, False
+    def __init__(self, shared):
+        self._shared, self._position, self.closed = shared, 0, False
 
     def seek(self, offset, whence=os.SEEK_SET):
         if whence != os.SEEK_SET:
@@ -107,9 +114,12 @@ class _PositionalStream:
         return self._position
 
     def read(self, size):
+        shared = self._shared
+        if shared is None:
+            raise ValueError('I/O operation on a closed archive stream')
         chunks, remaining = [], int(size)
         while remaining > 0:
-            data = os.pread(self._fd, min(remaining, 64 * 1024**2), self._position)
+            data = os.pread(shared.fd, min(remaining, 64 * 1024**2), self._position)
             if not data:
                 break
             chunks.append(data)
@@ -118,7 +128,8 @@ class _PositionalStream:
         return b''.join(chunks)
 
     def close(self):
-        self.closed = True  # The descriptor stays owned by its thread cache.
+        # Drop this stream's reference; the descriptor closes after its last holder.
+        self._shared, self.closed = None, True
 
 
 def _fast_stream(path, cached_stamp):
@@ -126,44 +137,32 @@ def _fast_stream(path, cached_stamp):
     if hasattr(os, 'pread'):
         handles = getattr(_THREAD_HANDLES, 'handles', None)
         if handles is None:
-            handles = _THREAD_HANDLES.handles = _ThreadHandles()
+            handles = _THREAD_HANDLES.handles = {}
         key = str(path)
-        fd = handles.get(key)
-        if fd is None:
+        shared = handles.get(key)
+        if shared is None:
             try:
                 fd = os.open(_api_path(path), os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_BINARY', 0))
             except OSError:
                 return None
-            handles[key] = fd
+            shared = handles[key] = _SharedDescriptor(fd)
         try:
-            info = os.fstat(fd)
+            info = os.fstat(shared.fd)
             # The path must still name this same file: a replaced archive keeps
             # the old inode open here, so compare the path's identity too.
             current = os.stat(_api_path(path))
         except OSError:
             handles.pop(key, None)
-            try:
-                os.close(fd)
-            except OSError:
-                pass
             return None
         if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
             handles.pop(key, None)
-            try:
-                os.close(fd)
-            except OSError:
-                pass
             return None
         if not stat.S_ISREG(info.st_mode) or _stamp(info) != cached_stamp:
             if (info.st_dev, info.st_ino) != tuple(cached_stamp[:2]):
                 # A different file now: drop this descriptor (reopened next time).
                 handles.pop(key, None)
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
             return None
-        return _PositionalStream(fd)
+        return _PositionalStream(shared)
     try:
         stream = open(_api_path(path), "rb")
     except OSError:
@@ -236,42 +235,60 @@ def _lock_for(path):
 
 
 @contextmanager
-def _writer_lock(path):
+def _writer_lock(path, *, reader=False):
     lock_path = Path(str(path) + ".lock")
-    # ponytail: snapshots need this writable lock; add immutable reads for read-only media.
     _plain_ancestors(lock_path)
     if os.path.exists(_api_path(lock_path)) and not stat.S_ISREG(os.stat(_api_path(lock_path)).st_mode):
         raise ArchiveError("Artifact lock must be a regular file")
     requested = time.perf_counter()
     acquired_at = None
     try:
-        with _lock_for(path), open(_api_path(lock_path), "a+b") as handle:
-            if os.fstat(handle.fileno()).st_size == 0:
-                handle.write(b"\0")
-                handle.flush()
-            if os.name == "nt":
-                import msvcrt
-                while True:
-                    handle.seek(0)
-                    try:
-                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                        break
-                    except OSError as error:
-                        if error.errno not in (13, 36):
-                            raise
-                        time.sleep(.02)
-            else:
-                import fcntl
-                fcntl.flock(handle, fcntl.LOCK_EX)
-            acquired_at = time.perf_counter()
+        with _lock_for(path):
             try:
+                handle = open(_api_path(lock_path), "a+b")
+            except OSError as error:
+                # A reader that cannot open the companion lock (read-only media,
+                # another owner's permissions) indexes committed members without
+                # it; _scan ignores incomplete tails. Writers always need the lock.
+                if not reader or error.errno not in _UNWRITABLE_LOCK_ERRNOS:
+                    raise
+                handle = None
+            if handle is None:
+                # Outside the except clause: reader errors must not chain to the lock error.
+                try:
+                    from .runtime import runtime_telemetry
+                    runtime_telemetry().add('artifact_archive.unlocked_cold_reads', 1)
+                except Exception:
+                    pass  # Diagnostics never change archive reads.
                 yield
-            finally:
+                return
+            with handle:
+                if os.fstat(handle.fileno()).st_size == 0:
+                    handle.write(b"\0")
+                    handle.flush()
                 if os.name == "nt":
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    import msvcrt
+                    while True:
+                        handle.seek(0)
+                        try:
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                            break
+                        except OSError as error:
+                            if error.errno not in (13, 36):
+                                raise
+                            time.sleep(.02)
                 else:
-                    fcntl.flock(handle, fcntl.LOCK_UN)
+                    import fcntl
+                    fcntl.flock(handle, fcntl.LOCK_EX)
+                acquired_at = time.perf_counter()
+                try:
+                    yield
+                finally:
+                    if os.name == "nt":
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(handle, fcntl.LOCK_UN)
     finally:
         if acquired_at is not None:
             _count(writer_lock_acquisitions=1, writer_lock_wait_seconds=acquired_at-requested,
@@ -301,7 +318,7 @@ def _reader_lock(path, snapshot_result):
             _count(snapshot_reads=1, reader_lock_wait_seconds=time.perf_counter()-waited)
             yield result
             return
-        with _writer_lock(path):
+        with _writer_lock(path, reader=True):
             _count(locked_reads=1, reader_lock_wait_seconds=time.perf_counter()-waited)
             yield None
     finally:

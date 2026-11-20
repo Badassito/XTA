@@ -53,9 +53,22 @@ def test_mask_cast_and_layout_keep_exact_labels_warnings_and_source(mask, layout
     np.testing.assert_array_equal(source, before)
 
 
-def test_polygon_hole_export_keeps_coordinates_order_and_warning():
+def test_polygon_hole_export_splices_hole_ring():
+    # Outer vertex (2, 1), the hole ring from (5, 4) back to itself, then the outer again.
     assert export(masks()[3]) == (
-        ['0 0.125000 0.083333 0.125000 0.833333 0.812500 0.833333 0.812500 0.083333'],
+        ['0 0.125000 0.083333 0.312500 0.333333 0.562500 0.250000 0.625000 0.583333 '
+         '0.375000 0.666667 0.312500 0.333333 0.125000 0.083333 '
+         '0.125000 0.833333 0.812500 0.833333 0.812500 0.083333'],
+        [],
+    )
+
+
+def test_hole_below_polygon_tolerance_is_filled_with_warning():
+    mask = np.zeros((12, 12), np.uint8)
+    mask[2:9, 2:9] = 1
+    mask[5, 5] = 0
+    assert export(mask) == (
+        ['0 0.166667 0.166667 0.166667 0.666667 0.666667 0.666667 0.666667 0.166667'],
         [('holes_discarded_during_polygon_export', 'case')],
     )
 

@@ -39,7 +39,7 @@ CUDA_COVERAGE_ENVIRONMENT = {
 }
 REQUIRED_CUDA_TESTS = (
     ('tests.test_tta_augmentation_cuda',
-     'test_cuda_elastic_conservative_inverse_matches_reference', 5),
+     'test_cuda_elastic_conservative_inverse_matches_reference', 10),
     ('tests.test_tta_augmentation_cuda',
      'test_shipped_policy_cuda_source_inverse_and_channels', 4),
     ('tests.test_d1_orthogonal_oracle_cuda',

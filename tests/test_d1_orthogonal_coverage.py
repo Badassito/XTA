@@ -14,7 +14,8 @@ from XTA import cuda_d1, pipeline
 from XTA.geometry import ViewInfo
 from XTA.interpolation import RawBBoxMaskStore
 from XTA.d1_orthogonal_coverage import (build_orthogonal_coverage_plan,coverage_launch_groups,
-    execute_orthogonal_coverage_reference,ORTHOGONAL_COVERAGE_CONTRACT)
+    ORTHOGONAL_COVERAGE_CONTRACT)
+from tests.reference_backends.d1_orthogonal_coverage import execute_orthogonal_coverage_reference
 from tests.test_spherical_runtime import _assigned
 
 
@@ -52,12 +53,11 @@ def test_out_of_order_chunks_publish_only_after_all_required_input_and_match_cvo
     shape=(13,25,27)
     words=HostWords(np.zeros((int(np.prod(shape))+31)//32,np.uint32))
     state=cuda_d1._D1WorkerViewState(('fixture',base),view,shape,words,np.zeros(frames,bool),
-        np.zeros(1,np.float32),np.zeros(1,np.float32),tmp_path/'source.cvol',0.)
+        tmp_path/'source.cvol',0.)
     stream=SimpleNamespace(synchronize=mock.Mock())
     cp=SimpleNamespace(asarray=lambda value:np.asarray(value.array if isinstance(value,HostWords) else value),
         cuda=SimpleNamespace(get_current_stream=lambda:stream))
-    kernels=SimpleNamespace(cp=cp,d1_orthogonal_coverage_to_bits=cpu_launch,
-        d1_backproject_bboxes_to_bits=mock.Mock(side_effect=AssertionError('old point scatter selected')))
+    kernels=SimpleNamespace(cp=cp,d1_orthogonal_coverage_to_bits=cpu_launch)
     published=[]
     def publish(*,words,state):
         assert state.coverage.all()
@@ -91,6 +91,25 @@ def test_out_of_order_chunks_publish_only_after_all_required_input_and_match_cvo
         np.testing.assert_array_equal(actual,expected)
         assert store.meta['projection_payload_fusion']==ORTHOGONAL_COVERAGE_CONTRACT
     finally:store.close()
+
+
+def test_verify_ptx_d1_production_cases_drive_the_shipping_coverage_kernel():
+    from tools import verify_ptx_d1
+    _path,variants=verify_ptx_d1.sources()
+    for variant in ('baseline','redux'):
+        source=variants[variant]['production']
+        assert source.count('extern "C" __global__')==1
+        assert 'extern "C" __global__ void d1_orthogonal_coverage_to_bits(' in source
+    assert variants['baseline']['production']!=variants['redux']['production']
+    cp=SimpleNamespace(asarray=np.asarray,zeros=np.zeros,asnumpy=np.asarray,uint32=np.uint32)
+    stream=SimpleNamespace(synchronize=lambda:None)
+    kernels={variant:{'production':cpu_launch} for variant in ('baseline','redux')}
+    args=SimpleNamespace(geometry_size=9,rounds=1,iterations=1,graph_timing=False)
+    with mock.patch.object(verify_ptx_d1,'paired_timing',return_value={}):
+        rows=verify_ptx_d1.production_cases(cp,stream,kernels,np.random.default_rng(20260915),args)
+    assert [(row['base'],row['density']) for row in rows]==[
+        (base,density) for density in (0.02,1.0) for base in ('transverse','sagittal','coronal')]
+    assert all(row['exact_cpu_reference'] and row['nonzero_words']>0 for row in rows)
 
 
 @pytest.mark.parametrize('cpu',[False,True])

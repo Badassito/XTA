@@ -331,8 +331,8 @@ def main(argv=None):
         image_sha256=fixture["image_sha256"], observations_sha256=fixture["parent_observations_sha256"],
         helper_sha256=file_sha(__file__), cache_mib=512, worker_count=1,
         heatsoak=dict(path=str(args.heatsoak_receipt.resolve()), sha256=file_sha(args.heatsoak_receipt)),
-        protocol="ABBA fresh predictor/worker each trial; identical native pixels, observations, swept crops, quality and512MiBcache",
-        legacy_override="Child order only: stable parent-contiguous sorting inside CURRENT bounded16-parent cohorts",
+        protocol="ABBA fresh predictor/worker each trial; identical native pixels, observations, swept crops, quality and 512 MiB cache",
+        legacy_override="Child order only: stable parent-contiguous sorting inside CURRENT bounded 16-parent cohorts",
         accuracy_claim=False)
     try:
         for slot, schedule, repeat in TRIALS:

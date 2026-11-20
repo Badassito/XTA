@@ -11,11 +11,12 @@ import copy
 import hashlib
 import json
 import math
-from pathlib import Path
 import threading
 from typing import Callable, Mapping
 
 import numpy as np
+
+from .file_hashing import source_sha256
 
 SCHEMA = 'xta.sam_crop_retry/2'
 CONTACT_SCHEMA = 'xta.sam_raw_crop_contacts/1'
@@ -517,7 +518,7 @@ class SamCropRetryController:
                 attempts=copy.deepcopy(self._records), attempt_history=copy.deepcopy(self._history))
 
 
-IMPLEMENTATION_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+IMPLEMENTATION_SHA256 = source_sha256(__file__)
 
 __all__ = ['SamCropRetryPolicy', 'SamCropRetryDecision', 'SamCropRetryController', 'SamCropRetryAdmissionError',
            'raw_crop_boundary_contacts', 'merge_crop_contacts', 'raw_child_crop_boundary_contacts',

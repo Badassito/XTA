@@ -13,6 +13,7 @@ import os
 import threading
 import time
 
+from .env_flags import env_flag
 from .pta_batch_pipeline import OrderedBatchPipeline
 from .pta_publication import semantic_png_backend
 from .runtime import runtime_telemetry, runtime_telemetry_phase
@@ -324,7 +325,7 @@ class GpuPublicationTask:
 
 
 def publication_resources(runtime: dict, *, cpu_threads: int):
-    if os.environ.get('PTA_GPU_PUBLICATION_PIPELINE', '1').strip().lower() in {'0', 'false', 'off', 'no'}:
+    if not env_flag('PTA_GPU_PUBLICATION_PIPELINE', True):
         return None
     torch = runtime.get('torch')
     cuda = getattr(torch, 'cuda', None)

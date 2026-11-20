@@ -87,7 +87,10 @@ class StreamingPhysicalViewFinalizationTests(unittest.TestCase):
             and isinstance(node.func, ast.Name)
             and node.func.id == '_mark_view_variant_terminal'
         )
+        # Three inference/consolidation sites, plus the sweep fan-out consumer
+        # that adopts a projected view without inference (v26.0.0).
         self.assertEqual(terminal_publications, 4)
+        self.assertIn('_mark_view_variant_terminal(*key)', source)
 
     def test_orthogonal_variants_collapse_before_global_tail(self) -> None:
         physical = _physical_view()

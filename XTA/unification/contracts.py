@@ -553,7 +553,6 @@ class RenderItem:
     data_role: DataRole
     frame_address: FrameAddress
     metadata: Mapping[str, Any] = field(default_factory=dict)
-    item_id: str = field(init=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.plan, RasterPlan):
@@ -562,18 +561,21 @@ class RenderItem:
         if not isinstance(self.frame_address, FrameAddress):
             raise TypeError("frame_address must be a FrameAddress")
         metadata = _freeze_metadata(dict(self.metadata), path="render_item.metadata")
-        record = {
+        object.__setattr__(self, "data_role", role)
+        object.__setattr__(self, "metadata", metadata)
+
+    @cached_property
+    def item_id(self) -> str:
+        """Stable logical identity, computed only when a consumer asks for it."""
+        return _digest_record({
             "plan_digest": self.plan.digest,
-            "data_role": role.value,
+            "data_role": self.data_role.value,
             "frame_address": {
                 "index": self.frame_address.index,
                 "mirror_u": self.frame_address.mirror_u,
             },
-            "metadata": _thaw_metadata(metadata),
-        }
-        object.__setattr__(self, "data_role", role)
-        object.__setattr__(self, "metadata", metadata)
-        object.__setattr__(self, "item_id", _digest_record(record))
+            "metadata": _thaw_metadata(self.metadata),
+        })
 
 
 @dataclass(frozen=True)

@@ -7,9 +7,9 @@ from tools.source_archive_history import history_archive_path, require_history_a
 
 
 def test_canonical_path_does_not_depend_on_old_experiment_sibling_layout(tmp_path):
-    path = history_archive_path('job150615', history_root=tmp_path)
-    assert path == tmp_path / '2026-10-04-cleanup/release-validation-fixtures/job150615/XTA_v25.0.0_complete_source.zip'
-    assert history_archive_path('guarded_rescue', history_root=tmp_path).parent.name == 'guarded_rescue'
+    # Original label v25.0.1 (renamed release v24.0.1); the archive filename is retained.
+    path = history_archive_path('throughput', history_root=tmp_path)
+    assert path == tmp_path / '2026-10-04-cleanup/release-validation-fixtures/throughput/XTA_v25.0.1_complete_source.zip'
 
 
 def test_missing_archive_fails_closed_instead_of_reducing_test_coverage(tmp_path):
@@ -30,7 +30,7 @@ def test_exact_archive_is_read_without_mutation_and_bad_bytes_are_rejected(tmp_p
         require_history_archive('throughput', expected, history_root=tmp_path)
 
 
-@pytest.mark.parametrize('name', ['../throughput', 'unknown'])
+@pytest.mark.parametrize('name', ['../throughput', 'unknown', 'job150615'])
 def test_unknown_names_cannot_escape_fixture_inventory(tmp_path, name):
     with pytest.raises(ValueError, match='Unknown retained release fixture'):
         history_archive_path(name, history_root=tmp_path)

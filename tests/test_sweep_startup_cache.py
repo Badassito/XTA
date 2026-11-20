@@ -132,6 +132,18 @@ def test_frame_count_mode_has_its_own_probe_result(files, tmp_path, monkeypatch)
     assert probe.call_count == 2
 
 
+def test_frame_count_spellings_with_one_meaning_share_a_probe_result(files, tmp_path, monkeypatch):
+    source, model = files
+    monkeypatch.setenv("XTA_YOLO_SWEEP_WORK_DIR", str(tmp_path / "private_work"))
+    probe = mock.Mock(side_effect=[dict(num_frames=7), dict(num_frames=8)])
+    arguments = dict(input_path=source, capture_identities=lambda: capture(source, model),
+                     probe=probe, invalidate_manifest=lambda: None)
+    for value, frames in (("0", 7), ("disabled", 7), ("1", 8), ("true", 8)):
+        monkeypatch.setenv("YOLO_TTA_FRAME_COUNT_FULL_SCAN", value)
+        assert startup_io.capture_and_probe_tta_startup(**arguments)[1] == dict(num_frames=frames)
+    assert probe.call_count == 2
+
+
 def test_failed_probe_is_retried_without_cached_partial_metadata(files, tmp_path, monkeypatch):
     source, model = files
     monkeypatch.setenv("XTA_YOLO_SWEEP_WORK_DIR", str(tmp_path / "private_work"))

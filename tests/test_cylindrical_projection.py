@@ -217,7 +217,7 @@ class CylindricalProjectionTests(unittest.TestCase):
                 empty, added_voxels=0, model_name='model', view=view, source='fullframe',
                 pass_index=1, interpolation_walk_back_index=1, interpolation_candidate_index=1,
                 stage='interpolation', description='empty shell bridge', temp_dir=self.root,
-                workers=1, keep_temp=True,
+                workers=1,
             )
             self.assertEqual(ref.shape, (3, 7, 9))
             store = RawBBoxMaskStore.open(ref.path)

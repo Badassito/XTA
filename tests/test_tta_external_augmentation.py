@@ -115,6 +115,16 @@ def test_shared_cli_options_and_pta_fractional_ratio():
     assert action.type('1.5') == 1.5
 
 
+def test_inverse_support_sidecars_are_opt_in():
+    from XTA.config import build_argparser
+    parser = build_argparser()
+    action = next(a for a in parser._actions if '--augmentation_coverage' in a.option_strings)
+    assert action.default == 'none' and set(action.choices) == {'packed', 'none'}
+    assert TtaAugmentationSettings().coverage == 'none'
+    assert resolve().coverage == 'none'
+    assert resolve(augmentation_coverage='packed').coverage == 'packed'
+
+
 @pytest.mark.parametrize('scope', ['slice', 'slab', 'lease', 'view'])
 def test_seed_scope(scope):
     cfg = settings(granularity=scope, slab_slices=4)
@@ -134,7 +144,7 @@ def test_seed_scope(scope):
 
 
 @pytest.mark.parametrize('family', ['orthogonal', 'azimuthal', 'tilted', 'radial', 'spherical'])
-def test_variant_identity_and_interpolation(family, tmp_path):
+def test_variant_identity_and_interpolation(family):
     physical = ViewInfo(name='transverse', num_slices=7, src_h=32, src_w=32, pad_mode='clamp', family=family)
     angles = expand_views_into_tta_variants([physical], [0, 30])
     copies = expand_views_into_policy_variants(angles, 3)
@@ -143,12 +153,12 @@ def test_variant_identity_and_interpolation(family, tmp_path):
     for a in range(2):
         base = copies[a*3]
         assert base.name == angles[a].name and _view_uses_interpolation(base, 3)
-        original_aff = build_aug_job_for_variant(base, 32, tmp_path).aff
+        original_aff = build_aug_job_for_variant(base, 32).aff
         for v in copies[a*3+1:a*3+3]:
             assert v.physical_view_name == physical.name
             assert v.augmentation_base_view == base.name
             assert not _view_uses_interpolation(v, 99)
-            job = build_aug_job_for_variant(v, 32, tmp_path)
+            job = build_aug_job_for_variant(v, 32)
             np.testing.assert_array_equal(job.aff.M_out_to_src, original_aff.M_out_to_src)
             assert job.aug_id != base.tta_aug_id
 
@@ -195,17 +205,22 @@ def test_all_d4_inverse_maps(turns,flip):
     assert torch.equal(SpatialReplay(forward,inv,valid).restore_planes([warped])[0],image)
 
 
-def test_elastic_inverse_solves_composed_field():
+@pytest.mark.parametrize('space', ['source', 'raster'])
+def test_elastic_inverse_solves_composed_field(space):
     h,w=33,37
     yy,xx=torch.meshgrid(torch.arange(h).float(),torch.arange(w).float(),indexing='ij')
     d=torch.stack((2*torch.sin(yy/5),1.2*torch.sin(xx/8)))
     A=torch.tensor([[.95,-.18,3.],[.12,1.04,-2.],[0.,0.,1.]])
-    inverse,valid=inverse_policy_grid(A,d,h,w)
+    inverse,valid=inverse_policy_grid(A,d,h,w,displacement_space=space)
     y=torch.stack(((inverse[...,0]+1)*(w-1)/2,(inverse[...,1]+1)*(h-1)/2),-1)
     delta,_,_=_bilinear_displacement(d,y)
-    B=torch.linalg.inv(A)
-    x=y@B[:2,:2].T+B[:2,2]+delta
-    residual=(x-torch.stack((xx,yy),-1)).abs().amax(-1)
+    target=torch.stack((xx,yy),-1)
+    if space=='source':  # x = inv(A)y + d(y), residual in source pixels
+        B=torch.linalg.inv(A)
+        residual=y@B[:2,:2].T+B[:2,2]+delta-target
+    else:  # x = inv(A)(y + d(y)), residual in augmented-raster pixels
+        residual=y+delta-(target@A[:2,:2].T+A[:2,2])
+    residual=residual.abs().amax(-1)
     assert int(valid.sum()) > h*w*.65
     assert float(residual[valid].max()) < .051
 
@@ -238,6 +253,90 @@ def test_unchanged_policy_forward_equivalence_on_cpu(profile):
     assert int(delta.max()) <= 1
     assert float((delta!=0).float().mean()) < .01
     assert len(replays)==len(seeds)
+
+
+def _orientation(pull, inverse):
+    """Forward-difference Jacobian determinant of a pull map, signed against inv(A)."""
+    pull = pull.double()
+    along_x, along_y = pull[:-1, 1:] - pull[:-1, :-1], pull[1:, :-1] - pull[:-1, :-1]
+    det = along_x[..., 0] * along_y[..., 1] - along_y[..., 0] * along_x[..., 1]
+    return det * torch.linalg.det(inverse[:2, :2])
+
+
+def test_gpu_superheavy_elastic_replay_does_not_fold_on_cpu():
+    policy, module = cpu_policy('superheavy')
+    adapter = GpuPolicyAdapter(policy, module.PTA_GPU_RUNTIME, require_cuda=False)
+    assert adapter.displacement_space == 'raster'
+    h = w = 128
+    yy, xx = torch.meshgrid(torch.arange(h, dtype=torch.float64), torch.arange(w, dtype=torch.float64),
+                            indexing='ij')
+    # CPU Torch fields differ from CUDA ones; these seeds fold under x = inv(A)y + d(y) on CPU.
+    for seed in (19, 22, 62, 81):
+        params = policy._sample_parameters(seed, h, w)
+        assert params['elastic'], seed
+        inverse = torch.linalg.inv(torch.tensor(policy._forward_matrix(params, h, w), dtype=torch.float64))
+        field = policy._elastic_displacement(seed, h, w).double()
+        source_space = torch.stack((inverse[0, 0] * xx + inverse[0, 1] * yy + inverse[0, 2] + field[0],
+                                    inverse[1, 0] * xx + inverse[1, 1] * yy + inverse[1, 2] + field[1]), -1)
+        assert float(_orientation(source_space, inverse).min()) < 0, seed
+        pull = (adapter._replay(seed, h, w).forward_grid + 1) * ((w - 1) / 2)
+        assert float(_orientation(pull, inverse).min()) > 0, seed
+
+
+def test_gpu_replay_contract_selects_displacement_space():
+    policy, module = cpu_policy('superheavy')
+    seed, h, w = 22, 48, 48
+    assert policy._sample_parameters(seed, h, w)['elastic']
+    policy.tta_replay_contract = 'torch-affine-elastic-v1'
+    adapter = GpuPolicyAdapter(policy, module.PTA_GPU_RUNTIME, require_cuda=False)
+    assert adapter.displacement_space == 'source'
+    forward = torch.tensor(policy._forward_matrix(policy._sample_parameters(seed, h, w), h, w))
+    field = policy._elastic_displacement(seed, h, w)
+    pull = torch.einsum('ij,hwj->hwi', torch.linalg.inv(forward), policy._pixel_grid(h, w))[..., :2]
+    replay = adapter._replay(seed, h, w)
+    torch.testing.assert_close(replay.forward_grid, _normalized_grid(pull + field.movedim(0, -1), h, w),
+                               atol=1e-6, rtol=0)
+    expected_inverse, expected_valid = inverse_policy_grid(forward, field, h, w, displacement_space='source')
+    assert torch.equal(replay.valid, expected_valid) and torch.equal(replay.inverse_grid, expected_inverse)
+
+    class LegacyFusedGrid:
+        """A fused-grid policy that predates tta_replay_contract."""
+        _sample_parameters = _forward_matrix = _elastic_displacement = staticmethod(lambda *a: None)
+        _pixel_grid = _apply_intensity_noise = staticmethod(lambda *a: None)
+
+    legacy = LegacyFusedGrid()
+    assert GpuPolicyAdapter(legacy, 'torch-cuda-fused-grid-v1', require_cuda=False).displacement_space == 'source'
+    legacy.tta_replay_contract = 'torch-affine-elastic-v3'
+    with pytest.raises(TypeError, match='inverse contract'):
+        GpuPolicyAdapter(legacy, 'torch-cuda-fused-grid-v1', require_cuda=False)
+    with pytest.raises(ValueError, match='displacement_space'):
+        inverse_policy_grid(torch.eye(3), None, 4, 4, displacement_space='output')
+
+
+@pytest.mark.parametrize('profile', ['light', 'baseline', 'heavy', 'superheavy', 'sweep'])
+def test_gpu_policy_extra_masks_share_the_sampled_geometry(profile):
+    policy, _module = cpu_policy(profile, batch_size=6)
+    assert policy.supports_extra_masks is True
+    rng = np.random.default_rng(615)
+    images = [rng.integers(0, 256, (24, 32), dtype=np.uint8) for _ in range(2)]
+    masks = [rng.choice(np.array([0, 255], dtype=np.uint8), (24, 32)) for _ in range(2)]
+    coverage = [rng.choice(np.array([0, 1], dtype=np.uint8), (24, 32)) for _ in range(2)]
+    elastic = next(seed for seed in range(1000) if policy._sample_parameters(seed, 20, 28)['elastic'])
+    with patch.object(torch.Tensor, 'pin_memory', lambda self, *a, **kw: self):
+        for seeds, size in (([[None, 23, elastic], [None, 37, 41]], (20, 28)), ([[None], [None]], (16, 20))):
+            kwargs = dict(images=images, seeds=seeds, output_size=size)
+            plain_images, plain_masks = policy.apply_batch_many(masks=masks, **kwargs)
+            _coverage_images, coverage_masks = policy.apply_batch_many(masks=coverage, **kwargs)
+            result = policy.apply_batch_many(masks=masks, extra_masks=coverage, **kwargs)
+            assert len(result) == 3
+            assert torch.equal(result[0], plain_images) and torch.equal(result[1], plain_masks)
+            assert torch.equal(result[2], coverage_masks)
+        kwargs = dict(images=images, masks=masks, seeds=[[None], [7]], output_size=(24, 32))
+        with pytest.raises(ValueError, match='one extra mask per source mask'):
+            policy.apply_batch_many(extra_masks=coverage[:1], **kwargs)
+        with pytest.raises(ValueError, match='extra mask shape'):
+            policy.apply_batch_many(extra_masks=[mask[:, :-1] for mask in coverage], **kwargs)
+        assert len(policy.apply_batch(image=images[0], mask=masks[0], seeds=(None, 7), output_size=(24, 32))) == 2
 
 
 @pytest.mark.parametrize('profile', ['light', 'baseline', 'heavy', 'superheavy'])
@@ -469,6 +568,8 @@ def test_runtime_fanout_uses_one_render_and_independent_masks(tmp_path,family,co
     assert not aug2.any() and masks.any()
     aug1._mmap.close();aug2._mmap.close()
     assert len(result['augmentation_records'])==(2 if coverage=='packed' else 0)
+    if coverage=='none':
+        assert not (tmp_path/'support').exists()
     for record in result['augmentation_records']:
         with np.load(record['path'],allow_pickle=False) as packed:
             support=np.unpackbits(packed['validity_bits'],axis=-1,count=size,bitorder='big')

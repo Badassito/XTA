@@ -160,9 +160,8 @@ def test_actual_wait_logger_reports_credit_convoy_and_live_planes(capsys):
         direct_union_total_dense_byte_limit=256,
         direct_union_inference_views=set(), direct_union_postprocess_views=set(range(17)),
         gpu_worker_tile_dense_result_task_limit=4, gpu_worker_tile_dense_result_limit=100,
-        gpu_worker_tile_dense_result_reservations={}, ready_fullframe=[], ready_tile_infer=[])
-    for name in ('pending_prediction_volume_futures', 'pending_prediction_build_jobs',
-                 'prediction_accumulation_futures', 'physical_view_finalization_futures',
+        gpu_worker_tile_dense_result_reservations={})
+    for name in ('physical_view_finalization_futures',
                  'physical_view_union_futures', 'tile_cleanup_futures', 'tile_parent_gate_futures',
                  'tile_bridge_gate_futures', 'tile_consolidation_futures',
                  'tile_parent_finalization_futures'):

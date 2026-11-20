@@ -201,7 +201,7 @@ class DirectTiledCudaParityTests(unittest.TestCase):
         import torch
         if not torch.cuda.is_available():
             self.skipTest('CUDA unavailable')
-        for scenario in ('tiny_logits', 'canceling_logits', 'nonfinite_boxes', 'nonfinite_coeffs'):
+        for scenario in ('tiny_logits', 'canceling_logits', 'nonfinite_boxes', 'nonfinite_coeffs', 'sub_cell_boxes'):
             with self.subTest(scenario=scenario):
                 anchors, ph, pw = 11, 5, 66
                 head = torch.zeros((37, anchors), device='cuda', dtype=torch.float32)
@@ -229,7 +229,19 @@ class DirectTiledCudaParityTests(unittest.TestCase):
                     head[5, 4:6] = float('inf')
                     head[5, 6:8] = float('nan')
                     proto[0, :, 20:24] = float('nan')
-                self._assert_payload_parity(head, proto, (ph, pw), anchors - 2)
+                image_shape = (ph, pw)
+                if scenario == 'sub_cell_boxes':
+                    # Stride-4 boxes 1-3.9 px wide at fractional offsets: most hold no proto
+                    # cell centre, so only the box-centre cell keeps them.
+                    image_shape = (ph * 4, pw * 4)
+                    head[0] = torch.linspace(1.3, pw * 4 - 2.6, anchors, device='cuda')
+                    head[1] = torch.linspace(9.7, 10.9, anchors, device='cuda')
+                    head[2] = torch.linspace(1., 3.9, anchors, device='cuda')
+                    head[3] = torch.linspace(3.9, 1., anchors, device='cuda')
+                    head[2, 2] = -1
+                    head[3, 3] = 0
+                    head[5].fill_(1)
+                self._assert_payload_parity(head, proto, image_shape, anchors - 2)
 
 
 if __name__ == '__main__':

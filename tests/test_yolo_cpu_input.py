@@ -30,7 +30,7 @@ def task(axis='transverse', *, task_id=0, start=0, count=3, tilted=False, direct
         tilt_direction=direction if tilted else '', tilt_frame_stop=slices)
     matrix = np.asarray([[1,0,0],[0,1,0]], np.float32)
     affine = AffineSpec(view.name,0,nw,nh,12,12,12,12,0,0,matrix,matrix,matrix,matrix)
-    job = AugJob('a0',0,Path('unused.json'),affine)
+    job = AugJob('a0',0,affine)
     return dict(task_id=task_id, view=view, job=job, job_id='a0', model_name='model',
         kind='fullframe', prediction_batch=1, channel_format=DEFAULT_CHANNEL_FORMAT,
         slice_start=start, slice_count=count, out_size=12, result_mode='file',
@@ -379,16 +379,6 @@ class YoloCpuInputTests(unittest.TestCase):
         self.assertEqual(owner.bytes,charged)
         self.assertEqual(owner.reserved_bytes,20000)
         owner.shutdown()
-
-    def test_sparse_retirement_disabled_preserves_commit_acceptance(self):
-        scheduler=_scheduler(Path('.'),input_overrides=dict(direct_union_sparse_retirement_active=False))
-        descriptor=dict(task(),result_mode='direct_union')
-        owner=SimpleNamespace(try_yield_capacity=mock.Mock(side_effect=AssertionError('unexpected grant gate')),
-            reserved_bytes=20000)
-        scheduler.cpu_input_prefetch=owner
-        self.assertTrue(scheduler.direct_union_task_admissible(descriptor))
-        self.assertTrue(scheduler._commit_cpu_input_capacity(descriptor))
-        owner.try_yield_capacity.assert_not_called()
 
     def test_backlog_is_bounded_and_failed_preparation_falls_back(self):
         first=task(count=3)

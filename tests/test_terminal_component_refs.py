@@ -159,7 +159,7 @@ class TerminalReferenceTests(unittest.TestCase):
                         interpolate=interpolate, interpolation_walk_back=walk,
                         interpolation_candidates=candidates, interpolate_passes=passes,
                         interpolate_min_radius=0, interpolation_search_angle=0,
-                        keep_temp=False, slice_workers=1, interpolation_task_workers=1,
+                        slice_workers=1, interpolation_task_workers=1,
                         nrrd_layers_enabled=True, precleaned_slice_cleanup=True,
                         hole_fill_done_on_device=True, preinterpolation_layer_already_published=True)
             if defer_components:
@@ -187,16 +187,6 @@ class TerminalReferenceTests(unittest.TestCase):
                 self.assertFalse(seen.original_path_exists)
                 self.assertIs(seen.closed[-1], mutated)
 
-    def test_debug_retention_keeps_dense_additions_with_matching_components(self):
-        control, seen, initial, mutated = self.run_prepare(keep_temp=True)
-        self.assertEqual(len(seen.allocations), 1)
-        self.assertTrue(all(call['bridge_delta_path'] is not None for call in seen.calls))
-        np.testing.assert_array_equal(initial | control.final_view_volume_mm, mutated)
-        treatment, _, _, _ = self.run_prepare()
-        self.assertEqual(len(control.nrrd_layers), len(treatment.nrrd_layers))
-        for baseline, optimized in zip(control.nrrd_layers, treatment.nrrd_layers):
-            np.testing.assert_array_equal(baseline.live_array, optimized.live_array)
-
     def test_no_interpolation_returns_only_already_published_base_without_drain_copy(self):
         result, seen, _, _ = self.run_prepare(interpolate=0)
         self.assertIsNone(result.final_view_volume_mm)
@@ -219,10 +209,10 @@ class TerminalReferenceTests(unittest.TestCase):
         np.testing.assert_array_equal(initial, mutated)
         self.assertFalse(seen.allocations)
 
-    def test_unqualified_or_debug_modes_keep_dense_fallback(self):
+    def test_unqualified_modes_keep_dense_fallback(self):
         for overrides in (
             {'walk': 0}, {'candidates': 0}, {'nrrd_layers_enabled': False},
-            {'keep_temp': True}, {'dense_tiling_active': True},
+            {'dense_tiling_active': True},
         ):
             with self.subTest(overrides=overrides), self.assertRaises(DenseAllocationSelected):
                 self.run_prepare(stop_on_alloc=True, **overrides)
@@ -272,19 +262,18 @@ class TerminalReferenceTests(unittest.TestCase):
         self.assertEqual(seen.telemetry['projection.noninterpolated_drain_avoided_bytes'], original.nbytes)
         self.assertFalse(seen.closed)
 
-    def test_native_drain_is_preserved_without_retirement_or_for_debug_artifacts(self):
-        for retire, keep in ((False, False), (True, True)):
-            with self.subTest(retire=retire, keep=keep), mock.patch.object(
-                assembly, '_drain_volume_to_mmap', side_effect=lambda volume, *_args, **_kw: volume.copy(),
-            ) as drain:
-                result, seen, initial, original = self.run_prepare(
-                    interpolate=0, preinterpolation_layer_already_published=False,
-                    retire_dense_after_prepare=retire, keep_temp=keep,
-                )
-                drain.assert_called_once()
-                self.assertIsNot(result.final_view_volume_mm, original)
-                np.testing.assert_array_equal(result.final_view_volume_mm, initial)
-                self.assertNotIn('projection.noninterpolated_drain_avoided_bytes', seen.telemetry)
+    def test_native_drain_is_preserved_without_retirement(self):
+        with mock.patch.object(
+            assembly, '_drain_volume_to_mmap', side_effect=lambda volume, *_args, **_kw: volume.copy(),
+        ) as drain:
+            result, seen, initial, original = self.run_prepare(
+                interpolate=0, preinterpolation_layer_already_published=False,
+                retire_dense_after_prepare=False,
+            )
+        drain.assert_called_once()
+        self.assertIsNot(result.final_view_volume_mm, original)
+        np.testing.assert_array_equal(result.final_view_volume_mm, initial)
+        self.assertNotIn('projection.noninterpolated_drain_avoided_bytes', seen.telemetry)
 
     def test_existing_backing_is_not_counted_as_a_newly_avoided_copy(self):
         with mock.patch.object(assembly, '_interpolation_array_backing_path', return_value=Path('already_backed.dat')), \

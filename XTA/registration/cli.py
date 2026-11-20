@@ -132,7 +132,7 @@ def _build_parser():
     nrrd.add_argument(
         "--source-reference",
         type=Path,
-        help="NRRD describing the native source scan's physical frame",
+        help="NRRD of the native source scan, stored in the movie's column, row and frame order",
     )
     nrrd.add_argument(
         "--source-grid-aligned",
@@ -142,7 +142,7 @@ def _build_parser():
     nrrd.add_argument(
         "--target-reference",
         type=Path,
-        help="NRRD grid template for the target scan's world origin and directions",
+        help="NRRD of the native target scan, in the same storage order, for world origin and directions",
     )
     nrrd.add_argument(
         "--coverage-output",

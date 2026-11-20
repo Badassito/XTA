@@ -33,8 +33,11 @@ def add_tta_augmentation_arguments(parser: argparse.ArgumentParser) -> None:
                         help='Per-worker LRU budget for reusable spatial maps (0 disables caching).')
     parser.add_argument('--augmentation_seed', type=int, default=0,
                         help='Reproducible external-policy run seed, independent of GPU index.')
-    parser.add_argument('--augmentation_coverage', choices=('packed', 'none'), default='packed',
-                        help='Persist bit-packed inverse-validity sidecars in the output directory, or retain recipes only.')
+    parser.add_argument('--augmentation_coverage', choices=('packed', 'none'), default='none',
+                        help='packed writes bit-packed inverse-validity sidecars under OUTPUT/augmentation_support '
+                             'for coverage analysis; none writes no sidecars, and the folder keeps only the policy '
+                             'snapshots, policy.json and, when bounded policy parents exist, parent_memory_plan.json. '
+                             'TTA assembly and reconciliation do not read the sidecars.')
 
 
 @dataclass(frozen=True)
@@ -45,7 +48,7 @@ class TtaAugmentationSettings:
     granularity: str = 'slice'
     slab_slices: int = 32
     seed: int = 0
-    coverage: str = 'packed'
+    coverage: str = 'none'
     cache_mib: int = 512
     cpu_path: str = ''
     cpu_sha256: str = ''
@@ -135,7 +138,7 @@ def resolve_tta_augmentation(args: Any, *, gpu_devices: Any, cpu_enabled: bool) 
         ratio=int(ratio), path=path, content_sha256=digest,
         granularity=str(getattr(args, 'augmentation_granularity', 'slice')),
         slab_slices=slab, seed=int(getattr(args, 'augmentation_seed', 0)),
-        coverage=str(getattr(args, 'augmentation_coverage', 'packed')),
+        coverage=str(getattr(args, 'augmentation_coverage', 'none')),
         cache_mib=int(getattr(args, 'augmentation_cache_mib', 512)),
         cpu_path=str(cpu.path) if cpu else '', cpu_sha256=cpu.content_sha256 if cpu else '',
         cpu_export_name=cpu.export_name if cpu else 'build_augmentation',

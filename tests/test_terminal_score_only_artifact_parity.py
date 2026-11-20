@@ -253,7 +253,7 @@ def test_actual_terminal_view_metadata_and_manifest_parity(tmp_path, codec_backe
     monkeypatch.setenv('YOLO_TTA_PACKED_PARENT_MIN_MIB', '0')
     monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_BACKEND', 'compiled')
     assert terminal_native_source_packing_eligible(view, native_bytes=mask.nbytes,
-        retire_dense=True, component_layers=True, tiled=False, keep_temp=False,
+        retire_dense=True, component_layers=True, tiled=False,
         prepublished=False, interpolate=0, interpolation_passes=0, extrapolate=0)
     baseline = _capture(tmp_path / 'baseline', mask.copy(), scores.copy(), active, boxes, view=view)
     actual = _capture(tmp_path / 'score-only', mask, scores, active, boxes,

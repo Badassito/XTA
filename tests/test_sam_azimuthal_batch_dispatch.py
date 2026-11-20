@@ -128,15 +128,27 @@ def test_start_failure_keeps_caller_retirement_authority(monkeypatch):
 
 
 def test_sampling_and_execution_provenance_bind_helper_and_workspace(monkeypatch):
-    from XTA import pipeline
+    from pathlib import Path
+    from XTA import cuda_backend, pipeline, spherical_cuda
+    from XTA.file_hashing import sha256_file, source_sha256
     import torch
     source=np.zeros((7,11,13),np.uint8)
     view=views_for(source,7)[0]
     renderer=SamGpuCropRenderer(SimpleNamespace(),view,source,7,None,torch,2**20)
     identity=renderer.sampling_identity()
     assert identity['azimuthal_batch_sha256']==batch.IMPLEMENTATION_SHA256
+    assert identity['tta_renderer_sha256']==source_sha256(cuda_backend.__file__)
+    assert identity['spherical_renderer_sha256']==source_sha256(spherical_cuda.__file__)
     monkeypatch.setenv('YOLO_TTA_SAM_AZIMUTHAL_BATCH','0')
     assert renderer.sampling_identity()==identity
     provenance=pipeline._execution_runtime_provenance()
-    assert provenance['modules']['sam_azimuthal_batch']['sha256']==batch.IMPLEMENTATION_SHA256
+    # Run provenance records actual bytes; the module identity is line-ending stable.
+    path=Path(batch.__file__)
+    assert provenance['modules']['sam_azimuthal_batch']['sha256']==sha256_file(path)
+    assert batch.IMPLEMENTATION_SHA256==source_sha256(path)
     assert provenance['modules']['workspace']['sha256']
+    with monkeypatch.context() as patch:
+        def unreadable(self):
+            raise AssertionError('renderer source re-read per image request')
+        patch.setattr(Path,'read_bytes',unreadable)
+        assert renderer.sampling_identity()==identity

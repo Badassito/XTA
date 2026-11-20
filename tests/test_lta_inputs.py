@@ -496,53 +496,6 @@ class LtaInputDiscoveryTests(unittest.TestCase):
             self.assertEqual(discovery.target_volumes[0].positive_count, 2)
             self.assertEqual(len(discovery.positive_pool), 1)
 
-    def test_session_ranking_is_deterministic_and_exposes_preference_metadata(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            target = root / "target"
-            exemplar = root / "exemplar"
-            for name, payload in (
-                ("alpha_0000", b"alpha-0"),
-                ("alpha_0001", b"alpha-1"),
-                ("beta_0000", b"beta-0"),
-            ):
-                _write(target / f"{name}.png", payload)
-                _write(target / f"{name}.txt", POLYGON)
-            _write(exemplar / "external_0000.png", b"external")
-            _write(exemplar / "external_0000.txt", POLYGON)
-            discovery = lta_inputs.discover_lta_inputs(target, [exemplar])
-            alpha = next(volume for volume in discovery.target_volumes if volume.stem == "alpha")
-            direct_id = next(
-                item.exemplar_id
-                for item in discovery.positive_pool
-                if item.volume_id == alpha.volume_id and item.encoded_frame_index == 0
-            )
-
-            first = lta_inputs.rank_positive_exemplars_for_session(
-                discovery.positive_pool,
-                target_volume_id=alpha.volume_id,
-                directly_addressable_exemplar_ids=(direct_id,),
-                seed=17,
-            )
-            second = lta_inputs.rank_positive_exemplars_for_session(
-                discovery.positive_pool,
-                target_volume_id=alpha.volume_id,
-                directly_addressable_exemplar_ids=(direct_id,),
-                seed=17,
-            )
-
-            self.assertEqual(first, second)
-            self.assertEqual(
-                tuple(item.preference_tier for item in first),
-                (
-                    lta_inputs.ExemplarPreferenceTier.SAME_TARGET_SESSION,
-                    lta_inputs.ExemplarPreferenceTier.SAME_TARGET_VOLUME,
-                    lta_inputs.ExemplarPreferenceTier.OTHER_TARGET_VOLUME,
-                    lta_inputs.ExemplarPreferenceTier.EXTERNAL_EXEMPLAR,
-                ),
-            )
-            self.assertIn("directly addressable", first[0].preference_reason)
-
     def test_direct_media_file_does_not_absorb_unrelated_sibling_volumes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

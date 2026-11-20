@@ -148,7 +148,6 @@ class LtaRunPlan:
     output_root: Path
     temp_root: Path
     device_ids: Tuple[int, ...]
-    sam_execution: str
     conf: float
     save_tokens: Tuple[str, ...]
     command: Tuple[str, ...]
@@ -241,7 +240,7 @@ class LtaRunPlan:
                     for item in self.session_work
                 ],
             },
-            "sam_execution": self.sam_execution,
+            "sam_execution": "video",
             "workers_per_gpu": self.workers_per_gpu,
             "crop_backend": self.crop_backend,
             "enable_2D_hole_fill": bool(self.enable_2D_hole_fill),
@@ -545,7 +544,6 @@ def build_lta_run_plan(
         output_root=output_root,
         temp_root=temp_root,
         device_ids=tuple(int(value) for value in config.device_ids),
-        sam_execution=str(config.args.sam_execution),
         conf=float(config.args.conf),
         save_tokens=tuple(config.save.tokens),
         command=tuple(str(value) for value in argv),

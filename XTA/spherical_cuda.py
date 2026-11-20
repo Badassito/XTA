@@ -7,19 +7,19 @@ CuPy is imported and kernels are compiled only for an actual CUDA tensor.
 from __future__ import annotations
 
 from collections import OrderedDict
+from functools import lru_cache
 from types import SimpleNamespace
 import math
-import os
 import time
 
 import numpy as np
 
+from .env_flags import env_flag
 from .qsc import qsc_inverse
 from .geometry_quality import spherical_fp32_requested, spherical_fp32_shape_eligible
 
 
 _DIRECTION_CACHE_BYTES = 256 * 1024**2
-_ROTATION_CACHE_ENTRIES = 32
 _ROW_BLOCK = 64
 _KERNELS = None
 _KERNEL_ERROR = ''
@@ -33,9 +33,6 @@ def clear_spherical_render_cache(engine):
     if cache is not None:
         cache.clear()
     engine._spherical_direction_cache_bytes = 0
-    rotations = getattr(engine, '_spherical_rotation_cache', None)
-    if rotations is not None:
-        rotations.clear()
 
 
 def _direction_cache_stats(engine):
@@ -89,23 +86,15 @@ def cached_spherical_directions(engine, key):
     return directions, valid
 
 
-def _validate_spherical_rotation(engine, rotation):
-    """Validate each immutable rotation value once in a bounded engine cache."""
-    cache = getattr(engine, '_spherical_rotation_cache', None)
-    if cache is None:
-        cache = engine._spherical_rotation_cache = OrderedDict()
-    if rotation in cache:
-        cache.move_to_end(rotation)
-        return
+@lru_cache(maxsize=32)
+def _validate_spherical_rotation(rotation):
+    """Validate each float rotation tuple once; rejected values are never cached."""
     if len(rotation) != 9 or not np.isfinite(rotation).all():
         raise ValueError('Spherical cube rotation must contain nine finite values')
     matrix = np.asarray(rotation).reshape(3, 3)
     if (not np.allclose(matrix @ matrix.T, np.eye(3), rtol=0, atol=1e-10)
             or not math.isclose(float(np.linalg.det(matrix)), 1., abs_tol=1e-10)):
         raise ValueError('Spherical cube rotation must be a proper rigid rotation')
-    if len(cache) >= _ROTATION_CACHE_ENTRIES:
-        cache.popitem(last=False)
-    cache[rotation] = None
 
 
 def _render_contract(engine, view, index):
@@ -130,7 +119,7 @@ def _render_contract(engine, view, index):
     if min(rows, columns, intervals) <= 0 or face not in range(6):
         raise ValueError('Invalid spherical face or native raster dimensions')
     rotation = tuple(float(value) for value in view.spherical_rotation_xyz)
-    _validate_spherical_rotation(engine, rotation)
+    _validate_spherical_rotation(rotation)
     key = spherical_direction_key(view, volume.device)
     return radius, shape, key
 
@@ -481,7 +470,7 @@ def render_spherical_native_resident(engine, view, index):
     if not bool(getattr(volume, 'is_cuda', False)):
         engine._spherical_sampler_mode = 'reference_torch'
         return _render_spherical_native_torch(engine, view, index)
-    enabled = os.environ.get('YOLO_TTA_GPU_SPHERICAL_NATIVE_KERNEL', '1').strip().lower() not in ('', '0', 'false', 'off', 'no')
+    enabled = env_flag('YOLO_TTA_GPU_SPHERICAL_NATIVE_KERNEL', True)
     disabled = bool(getattr(engine, '_spherical_native_kernel_disabled', False))
     if (enabled and not disabled and spherical_fp32_requested()
             and not bool(getattr(engine, '_spherical_fp32_disabled', False))):

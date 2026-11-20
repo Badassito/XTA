@@ -12,13 +12,15 @@ Choose one interpolation backend for a run. `sam` uses the local mask-conditione
 to propose image-guided additions between detector observations. A rejected SAM
 proposal receives no SDF fallback. `both` is rejected during argument parsing.
 
-In v25, `--enable_2D_hole_fill sam` optionally fills SAM masks before recurrent
-memory encoding and publication. Without that stage selection, holes remain in
+`--enable_2D_hole_fill sam` optionally fills SAM masks before recurrent memory
+encoding and publication. Without that stage selection, holes remain in
 SAM masks. The SDK's area-limited output-only filling stays disabled; the opt-in
 uses the shared exact 2D fill at the memory boundary, including a CPU transfer
 when SAM runs on CUDA. `--enable_2D_hole_fill yolo` independently selects detector
-mask filling. These flags do not change SDF interpolation or explicitly selected
-3D postprocessing. See [v25 migration](topology_and_cpr.md).
+mask filling. These flags have no SDF interpolation stage and do not change
+explicitly selected 3D postprocessing. SDF interpolation fills enclosed holes in a
+bridge section only when neither endpoint cross-section has one, so bridges keep
+the holes their endpoints kept. See [topology options](topology_and_cpr.md).
 
 SAM extrapolation is independently enabled by `--extrapolation_distance` and
 can follow either interpolation backend. Source review and snapshot qualification
@@ -486,7 +488,11 @@ pixels; it is not an input-video pixel measurement after a changed canvas scale.
 | `--interpolation_candidates` | `1` | Consider up to the Nth nearest connection for an endpoint projection | Same candidate search budget; relevant observed family continuations also inform the bounded group |
 | `--interpolation_passes` | `1` | Later passes may use the previous interpolated result | Maximum distinct observed-anchor planning rounds; stop when exhausted and record skipped rounds |
 | `--interpolation_min_radius` | `3` | Reject a proposed bridge with radius at or below the threshold | Remove undersized 2D components from each full raw prediction before quality checks and publication; do not reject a whole run solely for those removed components; zero disables filtering |
-| `--interpolation_search_angle` | `15` | Projection growth/search angle, strictly between -90 and 90 degrees | Same geometric candidate search cone |
+| `--interpolation_search_angle` | `15` | Projection growth/search angle, strictly between -90 and 90 degrees; growth is measured between pixel centres | Same geometric candidate search cone |
+
+SDF bridge sections blend signed distances measured to the half-pixel boundary,
+so a section boundary moves linearly between its endpoints; radius checks keep
+centre-to-background EDT units.
 
 SAM never uses a generated bridge as a fresh observation or walk-back seed.
 An exhaustive first pass may consume all useful hypotheses. More requested
@@ -669,7 +675,8 @@ checksums, mask identities and ownership. Public NRRDs, telemetry and ordinary
 run manifests remain filesystem files.
 
 Evidence indexes retain canonical JSON and bounded authenticated reads. The
-index ceiling is 128 MiB; manifests and other receipt limits remain unchanged.
+index ceiling is `YOLO_TTA_SAM_EVIDENCE_INDEX_MAX_BYTES` (default 1 GiB, see the
+resource table); manifests and other receipt limits remain unchanged.
 Index writing streams already-normalized metadata, and reader freezing takes
 ownership of its freshly parsed tree. Closed writer metadata is handed off before
 reopening, avoiding overlapping full copies. The writer can also reuse one small
@@ -769,35 +776,27 @@ declared acceptance boundary. When strict containment is enabled, clipping it
 to a write region cannot hide that violation.
 Original detector observations and stored raw tracker masks remain immutable.
 
-### Tight-crop guard switch
+### Acceptance-corridor containment
 
-`YOLO_TTA_SAM_TIGHT_CROP_GUARD=0` disables an inherited conservative
-policy's acceptance-containment veto; `1` enables it. An unset value inherits the
-policy: off for the new v6/v7 defaults, on for explicit legacy v2-v5. Accepted values
-are `1`/`0`, `true`/`false`, and `on`/`off`, with case and surrounding whitespace
-ignored. Active SAM interpolation validates and pins the setting at launch;
-SDF interpolation and extrapolation alone ignore it.
+The v6/v7 defaults have containment off; explicit legacy v2-v5 policies have it
+on. To disable it on a legacy policy, set `strict_containment: False` and
+`guarded_rescue: False` in the policy file's `sam_bridge_policy`. The effective
+policy and its hash record the choice, and replaying a complete saved policy
+reproduces it.
 
-```powershell
-$env:YOLO_TTA_SAM_TIGHT_CROP_GUARD = '0'
-```
-
-This guard checks the fixed acceptance corridor inferred from the observations.
+Containment checks the fixed acceptance corridor inferred from the observations.
 A prediction that grows beyond that corridor and later shrinks can fail the
-entire run. Turning the guard off disables that quality veto for both whole
-predictions and retained tiled halos. It also disables guarded rescue, whose
-purpose is to reconsider containment failures. Endpoint agreement, topology,
-unintended-contact checks, component filtering, and evidence completeness still
-apply.
+entire run. Turning containment off disables that quality veto for both whole
+predictions and retained tiled halos. Guarded rescue, whose purpose is to
+reconsider containment failures, must be disabled with it. Endpoint agreement,
+topology, unintended-contact checks, component filtering, and evidence
+completeness still apply.
 
-The switch does not enlarge the tracker context or choose a write-domain policy.
+Containment does not enlarge the tracker context or choose a write-domain policy.
 Legacy policies remain clipped to their old branch write masks. The v6/v7
 defaults use the broader fixed context with the connected-path restrictions
 below. Both exclude original detector observations. Disabling containment on
 a legacy policy alone cannot recover growth beyond its old write masks.
-An explicitly configured `sam_bridge_policy.strict_containment` takes
-precedence. The effective policy and its hash record the choice; replaying a
-complete saved policy does not consult the ambient switch.
 
 ### Connected branch selection (whole v6 / tiled v7)
 

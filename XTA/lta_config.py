@@ -24,7 +24,7 @@ from .config import (
     resolve_tilted_view_groups,
     resolve_tta_angles,
 )
-from .unification.tiles import ResolvedTileGroup, resolve_tile_groups
+from .unification.tiles import TileConfig, resolve_tile_groups
 
 
 LTA_SAVE_OPTION_TOKENS: Tuple[str, ...] = (
@@ -57,7 +57,7 @@ class LtaConfig:
     cartesian_views: Tuple[str, ...]
     azimuthal_requests: Tuple[AzimuthalViewRequest, ...]
     tilted_groups: Tuple[TiltedViewGroup, ...]
-    tiles: Tuple[ResolvedTileGroup, ...]
+    tiles: Tuple[TileConfig, ...]
     angles: Tuple[float, ...]
     save: LtaSaveRequest
     postprocessing: PostprocessingRequest
@@ -190,44 +190,39 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
             "connected production path currently requires exactly transverse"
         ),
     )
+    # Planning-only geometries stay parseable for run planning and manifests,
+    # but are hidden from --help: execution rejects them before workers start.
     parser.add_argument(
         "--enable_azimuthal",
         nargs="+",
         default=None,
         metavar="VIEWS[:AZIMUTH_ANGLE]",
-        help="Planned structured Azimuthal view groups; production execution is not yet connected",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--enable_radial", nargs="+", default=None, metavar="VIEW",
-        help="Planned dense cylindrical-shell views with 1008-pixel patches; production execution is not yet connected",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--radial_min_radius", default=None, type=parse_radial_min_radius,
         metavar="RADIUS|auto",
-        help="Minimum shell radius; auto selects 1008/(4*pi), two wraps per patch",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--enable_spherical", nargs="+", default=None, metavar="VIEW",
-        help=(
-            "Planned dense QSC spherical-shell views with 1008-pixel patches; accepts "
-            "the six Radial view tokens. Upright aliases share one cube and tilted "
-            "aliases share each direction/angle rotation. Production execution is not yet connected"
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--spherical_min_radius", default=None, type=parse_spherical_min_radius,
         metavar="RADIUS|auto",
-        help=(
-            "Minimum spherical radius; auto independently selects 1008/(4*pi). "
-            "Dense shells end at (min(T,H,W)-1)/2 and exclude the central core"
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--enable_tilted",
         nargs="+",
         default=None,
         metavar="VIEW[:TILT_ANGLE[:TILT_DIRECTION]]",
-        help="Planned structured Tilted view groups; production execution is not yet connected",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--lta_crop_backend", "--crop_backend", dest="lta_crop_backend",
@@ -260,12 +255,6 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         help="TTA in-plane angles; comma-separated and whitespace-separated forms are accepted",
     )
 
-    parser.add_argument(
-        "--sam_execution",
-        default="video",
-        choices=("video",),
-        help="Authoritative mask-injected video tracking for the selected runtime view",
-    )
     parser.add_argument(
         "--conf",
         default=0.15,
@@ -347,9 +336,9 @@ def resolve_lta_config(args: argparse.Namespace) -> LtaConfig:
     )
     if not config.has_physical_views:
         raise ValueError(
-            "No LTA inference views are active. Enable at least one view with "
-            "--enable_cartesian, --enable_tilted, --enable_azimuthal, --enable_radial, or --enable_spherical; "
-            "--enable_tile does not create a parent view"
+            "No LTA inference views are active. Enable --enable_cartesian transverse "
+            "(the qualified production view); planning-only geometries are rejected at "
+            "execution, and --enable_tile does not create a parent view"
         )
     return config
 

@@ -241,10 +241,10 @@ def derive_a2_bundle(c2bundle, a2plan, proof, outdir, *, policy=None):
     if isinstance(policy.get("sam_bridge_policy"), dict):
         policy = {"sam_bridge_policy": {"version": legacy_version, **policy["sam_bridge_policy"]}}
     # Changed-A replay is a sealed historical protocol, so a new production
-    # default or process environment must not silently change its causal test.
-    resolved = resolve_sam_bridge_policy(policy, generation_mode=mode, environ={})
+    # default must not silently change its causal test.
+    resolved = resolve_sam_bridge_policy(policy, generation_mode=mode)
     stock = resolve_sam_bridge_policy({"sam_bridge_policy": {"version": legacy_version}},
-        generation_mode=mode, environ={})
+        generation_mode=mode)
     for field, value in stock.items():
         if field not in {"name", "max_group_bytes", "strict_family_agreement"}:
             if field not in resolved:

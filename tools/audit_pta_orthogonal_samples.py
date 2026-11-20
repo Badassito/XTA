@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Bounded follow-up comparisons for supplied sagittal and coronal PTA samples."""
+"""Bounded follow-up comparisons for supplied sagittal and coronal PTA samples.
+
+Uses the center-aligned categorical cube mapping; samples generated before it
+(endpoint-aligned) do not reproduce exactly.
+"""
 import argparse
 import gzip
 import json
@@ -20,8 +24,8 @@ def main():
     full = tuple(samples["native_shape_tyx"])
     processing = media.compute_cube_resize_shape(*full)
     specifications = [("sagittal", 326), ("coronal", 1498)]
-    source_y = media._endpoint_aligned_nearest_source_indices(full[1], processing[1])[325]
-    source_x = media._endpoint_aligned_nearest_source_indices(full[2], processing[2])[1497]
+    source_y = media._center_aligned_nearest_source_indices(full[1], processing[1])[325]
+    source_x = media._center_aligned_nearest_source_indices(full[2], processing[2])[1497]
     planes = {"sagittal": np.empty((full[0], full[2]), np.uint8),
               "coronal": np.empty((full[0], full[1]), np.uint8)}
     with (args.audit / "f2_prepared.nrrd").open("rb") as source:
@@ -32,11 +36,11 @@ def main():
                 plane = np.frombuffer(payload.read(full[1] * full[2]), np.uint8).reshape(full[1:])
                 planes["sagittal"][t] = plane[source_y]
                 planes["coronal"][t] = plane[:, source_x]
-    t_indices = media._endpoint_aligned_nearest_source_indices(full[0], processing[0])
+    t_indices = media._center_aligned_nearest_source_indices(full[0], processing[0])
     for family, frame in specifications:
         native_plane = planes[family]
         spatial_axis = 2 if family == "sagittal" else 1
-        spatial_indices = media._endpoint_aligned_nearest_source_indices(full[spatial_axis], processing[spatial_axis])
+        spatial_indices = media._center_aligned_nearest_source_indices(full[spatial_axis], processing[spatial_axis])
         processing_plane = native_plane[t_indices[:, None], spatial_indices[None, :]]
         name = samples["stem"] + f"_{family.title()}_{frame:04d}"
         actual_lines = (args.sample_root / "labels" / (name + ".txt")).read_text().splitlines()

@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / f"Opus-5.5_v{__version__}_SLURM.py"
 UNIFIED_MODULES = (
     "_prediction_cleanup",
+    "env_flags",
     "experimental_features",
     "gaussian",
     "nrrd_compression",
@@ -54,7 +55,6 @@ UNIFIED_MODULES = (
     "tta_mode",
     "tta_lifecycle",
     "tta_outputs",
-    "tta_prediction",
     "tta_prepare_planning",
     "tta_provenance",
     "tta_scheduler",

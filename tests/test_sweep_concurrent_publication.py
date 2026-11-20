@@ -7,6 +7,7 @@ entire view. These tests pin the concurrent contract.
 from __future__ import annotations
 
 from contextlib import nullcontext
+import errno
 import gzip
 import json
 import os
@@ -37,7 +38,6 @@ def cpu_only(monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
     monkeypatch.setenv("YOLO_TTA_NRRD_GPU_MIRROR_TEE", "0")
     monkeypatch.setenv("YOLO_TTA_LOW_QUALITY_GPU_DOWNBIN", "0")
-    monkeypatch.setenv("YOLO_TTA_SWEEP_CUDA_PROJECTION", "0")
     from XTA import nrrd_compression
     monkeypatch.setattr(nrrd_compression, "_require_nrrd_member_codec",
                         lambda **_: ("zlib", 1, gzip.compress))
@@ -284,7 +284,52 @@ def test_storage_counters_survive_concurrent_processes(tmp_path):
     assert not Path(str(target) + ".lock").exists()
 
 
-def test_stale_storage_lock_is_recovered(tmp_path):
+_HOLDER_SCRIPT = r"""
+import os, sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from XTA.tta_sweep_view_publication import _StorageFileLock
+with _StorageFileLock(Path(sys.argv[2])):
+    print("held", flush=True)
+    if sys.argv[3] == "die":
+        os._exit(0)  # killed owner: never releases
+    time.sleep(float(sys.argv[3]))
+"""
+
+
+def _start_holder(target, action):
+    holder = subprocess.Popen([sys.executable, "-c", _HOLDER_SCRIPT, str(REPO), str(target), action],
+                              stdout=subprocess.PIPE, text=True,
+                              env={**os.environ, "CUDA_VISIBLE_DEVICES": "-1"})
+    assert holder.stdout.readline().strip() == "held"
+    return holder
+
+
+def _refuse_os_locks(monkeypatch):
+    """A filesystem without kernel locks: only the exclusive-create lease remains."""
+    def unsupported(*_args):
+        raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS))
+    if os.name == "nt":
+        import msvcrt
+        monkeypatch.setattr(msvcrt, "locking", unsupported)
+    else:
+        import fcntl
+        monkeypatch.setattr(fcntl, "flock", unsupported)
+
+
+def test_leftover_lock_files_do_not_block(tmp_path):
+    target = tmp_path / "fanout_storage.json"
+    lease, kernel = Path(str(target) + ".lock"), Path(str(target) + ".flock")
+    lease.write_text("12345\n")
+    kernel.write_text("12345\n")
+    started = time.monotonic()
+    with _StorageFileLock(target, timeout=40):
+        assert time.monotonic() - started < 5
+    assert kernel.exists() and lease.exists()  # the kernel lock never unlinks or reads leases
+
+
+def test_lease_fallback_recovers_a_stale_lock(tmp_path, monkeypatch):
+    _refuse_os_locks(monkeypatch)
     target = tmp_path / "fanout_storage.json"
     stale = Path(str(target) + ".lock")
     stale.write_text("12345\n")
@@ -293,6 +338,79 @@ def test_stale_storage_lock_is_recovered(tmp_path):
     with _StorageFileLock(target, timeout=5):
         assert stale.exists()
     assert not stale.exists()
+
+
+def test_lease_fallback_waits_for_an_undeletable_live_lease(tmp_path, monkeypatch):
+    _refuse_os_locks(monkeypatch)
+    target = tmp_path / "fanout_storage.json"
+    held = Path(str(target) + ".lock")
+    held.write_text("12345\n")
+    old = time.time() - 3600
+    os.utime(held, (old, old))
+    attempts, real_unlink = [], Path.unlink
+
+    def live_owner_unlink(self, *args, **kwargs):
+        if self == held:
+            attempts.append(self)  # Windows: a live owner's open lease cannot be deleted
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(self))
+        return real_unlink(self, *args, **kwargs)
+    monkeypatch.setattr(Path, "unlink", live_owner_unlink)
+    outcome = []
+
+    def wait():
+        try:
+            with _StorageFileLock(target, timeout=0.5, stale_seconds=0.1):
+                outcome.append("acquired")
+        except TimeoutError as error:
+            outcome.append(str(error))
+    waiter = threading.Thread(target=wait, daemon=True)
+    waiter.start()
+    waiter.join(30)
+    assert outcome == [f"Timed out waiting for sweep storage lock {held}"]  # names the lease waited on
+    assert len(attempts) < 100  # backed off between attempts instead of spinning
+
+
+def test_live_holder_is_not_preempted(tmp_path):
+    target = tmp_path / "fanout_storage.json"
+    holder = _start_holder(target, "2.5")
+    try:
+        with pytest.raises(TimeoutError) as caught:
+            with _StorageFileLock(target, timeout=0.5, stale_seconds=0.1):
+                pass
+        assert str(caught.value).endswith(str(target) + ".flock")
+        assert holder.poll() is None
+    finally:
+        holder.communicate(timeout=60)
+    assert holder.returncode == 0
+    with _StorageFileLock(target, timeout=10):
+        pass
+
+
+def test_killed_holder_releases(tmp_path):
+    target = tmp_path / "fanout_storage.json"
+    holder = _start_holder(target, "die")
+    holder.communicate(timeout=60)
+    assert holder.returncode == 0
+    started = time.monotonic()
+    with _StorageFileLock(target, timeout=40, stale_seconds=30):
+        assert time.monotonic() - started < 5  # released by the kernel, not by staleness
+
+
+def test_storage_lock_serializes_threads(tmp_path):
+    target = tmp_path / "fanout_storage.json"
+
+    def bump():
+        for _ in range(50):
+            with _StorageFileLock(target):
+                data = json.loads(target.read_text()) if target.exists() else {"count": 0}
+                data["count"] += 1
+                target.write_text(json.dumps(data))
+    threads = [threading.Thread(target=bump) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(120)
+    assert json.loads(target.read_text())["count"] == 200
 
 
 # --- TtaSweepBranchLayers -------------------------------------------------

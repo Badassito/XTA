@@ -3,9 +3,9 @@
 
 The caller must own Scratch/Temp/GPU_LOCK (task name, PID, start time) throughout
 execution. This tool neither acquires nor releases that lock. It bypasses PTA's
-Linux fork frontend and invokes the real worker policy/publication boundaries,
-which permits local Windows qualification. All outputs remain in a fresh Scratch
-directory. Measurements cover synthetic augmentation, labels, encoding and file
+persistent render-pool frontend and invokes the real worker policy/publication
+boundaries in-process, which permits local Windows qualification. All outputs
+remain in a fresh Scratch directory. Measurements cover synthetic augmentation, labels, encoding and file
 publication, not cluster dataset throughput, volume decoding or source rendering.
 """
 

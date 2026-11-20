@@ -318,21 +318,12 @@ def measure_sam_final_connections(
 
 
 @dataclass(frozen=True)
-class TtaOutputInputs:
-    """Run-constant teardown policy."""
-
-    keep_temp_artifacts: bool
-    tile_slice_workers: int
-
-
-@dataclass(frozen=True)
 class TtaOutputOperations:
     """Injected teardown operations preserving pipeline monkeypatch seams."""
 
     close_memmap_array: Callable[[object], None]
     close_raw_store_or_memmap_volume: Callable[..., None]
-    archive_or_delete_binary_volume_storage: Callable[..., None]
-    unload_yolo_model: Callable[[object], None]
+    retire_temporary_binary_volume_storage: Callable[..., None]
     trim_cuda_memory: Callable[[], None]
     collect_garbage: Callable[[], object]
 
@@ -343,7 +334,6 @@ class TtaOutputResult:
 
     close_memmap_calls: int
     retired_tile_accumulators: int
-    unloaded_models: int
     processing_volume_was_distinct: bool
 
 
@@ -366,7 +356,6 @@ class TtaOutputArtifacts:
     baseline_confmap_by_model_view: Mapping[
         Tuple[str, str], Optional[np.ndarray]
     ]
-    yolo_models: Sequence[Tuple[str, Optional[object]]]
     volume_rgb: object
     input_volume_rgb: object
     _close_started: bool = field(default=False, init=False, repr=False)
@@ -379,7 +368,6 @@ class TtaOutputArtifacts:
     def close(
         self,
         *,
-        inputs: TtaOutputInputs,
         operations: TtaOutputOperations,
     ) -> TtaOutputResult:
         """Retire all transferred artifacts exactly once in publication-safe order."""
@@ -390,7 +378,6 @@ class TtaOutputArtifacts:
 
         close_memmap_calls = 0
         retired_tile_accumulators = 0
-        unloaded_models = 0
         processing_volume_was_distinct = bool(
             self.volume_rgb is not self.input_volume_rgb
         )
@@ -424,44 +411,23 @@ class TtaOutputArtifacts:
 
         for model_support in self.parent_mask_support_by_model.values():
             for support in model_support.values():
-                operations.close_raw_store_or_memmap_volume(
-                    support,
-                    keep_temp=bool(inputs.keep_temp_artifacts),
-                )
+                operations.close_raw_store_or_memmap_volume(support)
             model_support.clear()
         for model_support in self.parent_bridge_support_by_model.values():
             for support in model_support.values():
-                operations.close_raw_store_or_memmap_volume(
-                    support,
-                    keep_temp=bool(inputs.keep_temp_artifacts),
-                )
+                operations.close_raw_store_or_memmap_volume(support)
             model_support.clear()
 
         for accumulator in self.tile_accumulator_by_set.values():
-            operations.archive_or_delete_binary_volume_storage(
-                accumulator,
-                keep_temp=bool(inputs.keep_temp_artifacts),
-                workers=int(inputs.tile_slice_workers),
-                desc="remaining consolidated tile accumulator",
-            )
+            operations.retire_temporary_binary_volume_storage(accumulator)
             retired_tile_accumulators += 1
         self.tile_accumulator_by_set.clear()
         for accumulator in self.tile_parent_mask_accumulator_by_set.values():
-            operations.archive_or_delete_binary_volume_storage(
-                accumulator,
-                keep_temp=bool(inputs.keep_temp_artifacts),
-                workers=int(inputs.tile_slice_workers),
-                desc="remaining parent-mask tile category accumulator",
-            )
+            operations.retire_temporary_binary_volume_storage(accumulator)
             retired_tile_accumulators += 1
         self.tile_parent_mask_accumulator_by_set.clear()
         for accumulator in self.tile_parent_bridge_accumulator_by_set.values():
-            operations.archive_or_delete_binary_volume_storage(
-                accumulator,
-                keep_temp=bool(inputs.keep_temp_artifacts),
-                workers=int(inputs.tile_slice_workers),
-                desc="remaining parent-bridge tile category accumulator",
-            )
+            operations.retire_temporary_binary_volume_storage(accumulator)
             retired_tile_accumulators += 1
         self.tile_parent_bridge_accumulator_by_set.clear()
 
@@ -471,10 +437,6 @@ class TtaOutputArtifacts:
         for volume in self.baseline_confmap_by_model_view.values():
             operations.close_memmap_array(volume)
             close_memmap_calls += 1
-        for _model_name, model in self.yolo_models:
-            if model is not None:
-                operations.unload_yolo_model(model)
-                unloaded_models += 1
         if processing_volume_was_distinct:
             operations.close_memmap_array(self.volume_rgb)
             close_memmap_calls += 1
@@ -492,7 +454,6 @@ class TtaOutputArtifacts:
             self.baseline_confmap_by_model_view.clear()
         self.baseline_union_by_model_view = {}
         self.baseline_confmap_by_model_view = {}
-        self.yolo_models = ()
         self.volume_rgb = None
         self.input_volume_rgb = None
         operations.collect_garbage()
@@ -501,7 +462,6 @@ class TtaOutputArtifacts:
         return TtaOutputResult(
             close_memmap_calls=int(close_memmap_calls),
             retired_tile_accumulators=int(retired_tile_accumulators),
-            unloaded_models=int(unloaded_models),
             processing_volume_was_distinct=bool(processing_volume_was_distinct),
         )
 
@@ -510,7 +470,6 @@ __all__ = [
     "measure_bridge_output_survival",
     "measure_sam_final_connections",
     "TtaOutputArtifacts",
-    "TtaOutputInputs",
     "TtaOutputOperations",
     "TtaOutputResult",
 ]

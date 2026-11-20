@@ -8,20 +8,19 @@ and final-survival checks must all use these accessors with the same receipt.
 from __future__ import annotations
 
 from collections.abc import Mapping
+import functools
 import hashlib
 import inspect
 import json
-from pathlib import Path
-import threading
 
 import numpy as np
 from scipy import ndimage
 
 from ._deps import _numba
+from .file_hashing import source_sha256
 
 SCHEMA = "xta.sam_component_filter/1"
-_SOURCE_PATH = Path(__file__).resolve()
-IMPLEMENTATION_SHA256 = hashlib.sha256(_SOURCE_PATH.read_bytes()).hexdigest()
+IMPLEMENTATION_SHA256 = source_sha256(__file__)
 _MAX_COMPONENT_RECORDS = 128
 _QUALIFIED_LEGACY_IMPLEMENTATION = "bac0f301626e20500c3b8beab261b1f9ea64289de2af2add26b883507495a780"
 _QUALIFIED_PREVIOUS_IMPLEMENTATION = "96278bbc549acb81c54f1e6f8124faa1d091ffbca378e98cd73d09040f44368c"
@@ -29,40 +28,16 @@ _QUALIFIED_RADIUS_ONLY_IMPLEMENTATION = "c67e0fed11962aba7b106cb7dce3f60b5eb6ce4
 _QUALIFIED_PRE_BOOLEAN_IMPLEMENTATION = "dc97330222b3ca987787cff5451525d8917a43ece38058221d091c99a789c10b"
 # Module source from v24.1.3 through v25.0.2; only the source guard changed after it.
 _QUALIFIED_V25_SOURCE_GUARD_IMPLEMENTATION = "82daefcb1b6739044fbae4e4c23686b7dbf78496531ef498e70655e5337c1ea2"
-_QUALIFIED_NUMERICAL_SOURCE = "20944399631c47bbb1ecab1999ebf40ba7141ca7a60f36fa4750614ccfa86d84"
-# Set only while ``measure_effective_raw_mask`` filters for an active SamMaskReader
-# transaction. That transaction's root re-hashes this source on entry and on close
-# (sam_mask_reader._assert_source_unchanged), so the per-mask re-read is redundant.
-_TRANSACTION_GUARDED = threading.local()
-
-
-def assert_filter_implementation_unchanged():
-    if getattr(_TRANSACTION_GUARDED, "active", False):
-        return
-    if hashlib.sha256(_SOURCE_PATH.read_bytes()).hexdigest() != IMPLEMENTATION_SHA256:
-        raise RuntimeError("SAM component filter implementation changed after loading")
-
-
-def _source_checked_transaction(bundle):
-    """True for a reader inside a root transaction that checks this source on close."""
-    from .sam_mask_reader import SamMaskReader
-    reader = bundle
-    while isinstance(reader, SamMaskReader):
-        if not reader._active or reader._closed:
-            return False
-        if reader._integrity_parent is None:
-            return True
-        reader = reader._integrity_parent
-    return False
-
-
-def _filter_in_checked_transaction(raw, threshold, enabled):
-    previous = getattr(_TRANSACTION_GUARDED, "active", False)
-    _TRANSACTION_GUARDED.active = True
-    try:
-        return filter_sam_components(raw, threshold, enabled=enabled)
-    finally:
-        _TRANSACTION_GUARDED.active = previous
+# Module source from v25.0.3 through v26.0.1; only the mid-run source guards were
+# removed and source hashing became line-ending stable after it.
+_QUALIFIED_V26_SOURCE_GUARD_IMPLEMENTATION = "6dd89b0929e8d3407750654cdf9606d2dfd3fe1689c3549e0debd04a95152bdc"
+_QUALIFIED_IMPLEMENTATIONS = frozenset({_QUALIFIED_LEGACY_IMPLEMENTATION, _QUALIFIED_PREVIOUS_IMPLEMENTATION,
+    _QUALIFIED_RADIUS_ONLY_IMPLEMENTATION, _QUALIFIED_PRE_BOOLEAN_IMPLEMENTATION,
+    _QUALIFIED_V25_SOURCE_GUARD_IMPLEMENTATION, _QUALIFIED_V26_SOURCE_GUARD_IMPLEMENTATION})
+# Digest of the four numerical helpers. Re-pinned when only the mid-run source-guard
+# call left filter_sam_components; numerics unchanged (radius oracle tests, v25.0.2
+# equivalence test).
+_QUALIFIED_NUMERICAL_SOURCE = "c74233de594d1f68b125d79c67629e50603451dc2b5747e77114869094c0f00f"
 
 
 def _fingerprint(value):
@@ -75,7 +50,6 @@ def _readonly(mask):
 
 def build_mask_filter(bundle, *, enabled=True, min_radius=None):
     """Capture the fixed group thresholds in a portable, auditable filter spec."""
-    assert_filter_implementation_unchanged()
     if not isinstance(enabled, bool):
         raise ValueError("SAM component filter enabled must be boolean")
     if min_radius is not None and (isinstance(min_radius, bool) or not np.isfinite(float(min_radius)) or float(min_radius) < 0):
@@ -93,24 +67,32 @@ def build_mask_filter(bundle, *, enabled=True, min_radius=None):
     return spec
 
 
+def _numerical_helpers():
+    return (_readonly, _component_maxima, _component_inscribed_radii, filter_sam_components)
+
+
+@functools.lru_cache(maxsize=8)
+def _numerical_source_sha256(functions):
+    """Digest of the numerical helpers' text; None when their source is unavailable."""
+    try:
+        parts = [function.__name__ + "\n" +
+                 inspect.getsource(getattr(function, "py_func", function)).replace("\r\n", "\n").rstrip("\n") + "\n"
+                 for function in functions]
+    except (OSError, TypeError):
+        return None
+    return hashlib.sha256("".join(parts).encode("utf-8")).hexdigest()
+
+
 def _compatible_filter_implementation(identifier):
     """Accept the qualified v25 receipts only while their exact numerics remain."""
     if identifier == IMPLEMENTATION_SHA256:
         return True
-    if identifier not in (_QUALIFIED_LEGACY_IMPLEMENTATION, _QUALIFIED_PREVIOUS_IMPLEMENTATION,
-                          _QUALIFIED_RADIUS_ONLY_IMPLEMENTATION, _QUALIFIED_PRE_BOOLEAN_IMPLEMENTATION,
-                          _QUALIFIED_V25_SOURCE_GUARD_IMPLEMENTATION):
+    if not isinstance(identifier, str) or identifier not in _QUALIFIED_IMPLEMENTATIONS:
         return False
     # The bounded radius implementation preserves the original padded EDT and
     # complete-component decision. Bind historical receipts to every numerical
     # helper, including the compiled reduction's Python source.
-    try:
-        parts = [function.__name__ + "\n" +
-                 inspect.getsource(getattr(function, "py_func", function)).replace("\r\n", "\n").rstrip("\n") + "\n"
-                 for function in (_readonly, _component_maxima, _component_inscribed_radii, filter_sam_components)]
-    except (OSError, TypeError):
-        return False
-    return hashlib.sha256("".join(parts).encode("utf-8")).hexdigest() == _QUALIFIED_NUMERICAL_SOURCE
+    return _numerical_source_sha256(_numerical_helpers()) == _QUALIFIED_NUMERICAL_SOURCE
 
 
 def _spec(value):
@@ -211,7 +193,6 @@ def filter_sam_components(raw_mask, min_radius, *, enabled=True):
     including components outside all spatial contracts. It never erodes a
     surviving component or discards a thin spur attached to a substantial body.
     """
-    assert_filter_implementation_unchanged()
     raw = np.asarray(raw_mask)
     threshold = float(min_radius)
     if raw.ndim != 2 or (raw.dtype != np.bool_ and not np.isin(raw, (0, 1)).all()):
@@ -257,8 +238,6 @@ def measure_effective_raw_mask(bundle, run_id, frame, receipt_or_filter=None):
         if str(run["group_id"]) not in spec.get("thresholds_by_group", {}):
             raise ValueError("SAM component filter lacks the selected run's group threshold")
         threshold, enabled = float(spec["thresholds_by_group"][str(run["group_id"])]), spec["enabled"]
-    if _source_checked_transaction(bundle):
-        return _filter_in_checked_transaction(raw, threshold, enabled)
     return filter_sam_components(raw, threshold, enabled=enabled)
 
 
@@ -271,3 +250,6 @@ def effective_candidate_mask(bundle, run_id, frame, receipt_or_filter=None):
     _spec(receipt_or_filter)
     from .sam_mask_reader import effective_candidate_mask as central_candidate_mask
     return central_candidate_mask(bundle, run_id, frame, receipt_or_filter)
+
+
+_numerical_source_sha256(_numerical_helpers())  # read the helper text once, at import, from the source just loaded

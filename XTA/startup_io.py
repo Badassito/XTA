@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import json
-import os
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .env_flags import env_flag
 from .unification.tta_manifest import (
     _file_identity,
     _sweep_startup_cache_path,
@@ -28,8 +28,8 @@ def _probe_source(
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
     if cached is not None and cached.get("source") != dict(source_identity):
         raise RuntimeError(f"TTA source artifact changed within confidence sweep: {input_path}")
-    # This setting selects tail-timestamp discovery versus a complete packet scan.
-    mode = os.environ.get("YOLO_TTA_FRAME_COUNT_FULL_SCAN", "0").strip().lower()
+    # This setting selects tail-timestamp discovery ("0") versus a complete packet scan ("1").
+    mode = "1" if env_flag("YOLO_TTA_FRAME_COUNT_FULL_SCAN", False) else "0"
     probes = {} if cached is None else cached["probes"]
     if mode in probes:
         return dict(probes[mode])

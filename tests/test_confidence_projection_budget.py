@@ -14,6 +14,30 @@ from XTA.confidence_evidence import write_block_confidence_evidence
 from XTA.confidence_projection import score_projection_reader, score_projection_workspace
 
 
+def _warm_native_pull_kernels():
+    """Compile the fixed native-pull kernel signatures on tiny synthetic arrays only."""
+    from XTA import projection_coverage_cpu as fast
+    integer = fast._readonly(np.asarray((0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 1), np.int64))
+    coefficient = fast._readonly(np.asarray((0., 0., .5, 1., 0., 0., 0., 1., 0.,
+                                             1., 1., 1., .5, .5, .5), np.float64))
+    bbox = np.asarray((0, 0, 0, 2, 2, 2), np.int64)
+    row_lookup = fast._readonly(np.arange(2, dtype=np.int32))
+    key_mutable = np.zeros(4, np.uint32)
+    key_readonly = fast._readonly(key_mutable.copy())
+    output = np.empty(4, np.uint8)
+    invalid_key = np.uint64(np.iinfo(np.uint32).max)
+    for readonly in (False, True):
+        source = np.zeros((2, 2, 2), np.uint8)
+        source[0, 0, 0] = 17
+        if readonly:
+            source.setflags(write=False)
+        fast._pull_tilted(source, output, 0, integer, coefficient, bbox, False)
+        fast._pull_azimuthal(source, output, 0, integer, coefficient, bbox, False,
+                             key_readonly, True, invalid_key, row_lookup)
+        fast._pull_azimuthal(source, output, 0, integer, coefficient, bbox, True,
+                             key_mutable, False, invalid_key, row_lookup)
+
+
 @pytest.fixture
 def gc_disabled():
     was_enabled = gc.isenabled()
@@ -40,8 +64,7 @@ def test_real_conversion_cold_warm_and_distinct_geometries_fit_three_mib(tmp_pat
     # uint8 kernel signatures; every measured large geometry below stays cold.
     import os
     if os.environ.get('YOLO_TTA_NATIVE_PULL_BACKEND', 'compiled') == 'compiled':
-        from XTA.projection_coverage_cpu import warm_native_pull_kernels
-        warm_native_pull_kernels()
+        _warm_native_pull_kernels()
     cache = backprojection._DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE
     original = cache.copy()
     cache.clear()
@@ -227,9 +250,10 @@ def test_unknown_bbox_returns_none_without_allocating_a_plane(tmp_path):
 
 @pytest.mark.parametrize('transpose', [False, True], ids=['tall', 'wide'])
 def test_projected_unknown_bbox_returns_none_for_nonempty_native_evidence(tmp_path, transpose):
-    # Mixed resize axes select nearest XY samples. The only known sample is
-    # outside that footprint, so the projected plane must have no bbox.
-    values = np.array([0, 173], np.uint8).reshape(1, 1, 2)
+    # Mixed resize axes select the center-aligned nearest XY sample (index 1 of
+    # 2 -> 1). The only known sample is outside that footprint, so the
+    # projected plane must have no bbox.
+    values = np.array([173, 0], np.uint8).reshape(1, 1, 2)
     output = (1, 1048576, 1)
     if transpose:
         values = values.transpose(0, 2, 1).copy()

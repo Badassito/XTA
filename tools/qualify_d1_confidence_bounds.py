@@ -90,7 +90,7 @@ def main():
     if args.heat_seconds:
         print(f'Heatsoaking for {args.heat_seconds:g}s', flush=True)
         report['heat_seconds_actual'] = heatsoak(args.heat_seconds, 0)
-    job = geometry.build_aug_job_for_variant(view, args.imgsz, args.output_dir)
+    job = geometry.build_aug_job_for_variant(view, args.imgsz)
     native_h, native_w = geometry.view_processing_plane_shape(view, args.imgsz)
     matrix = geometry.output_to_view_processing_affine(view, job.aff.M_out_to_src, args.imgsz)
     target = np.zeros((args.lease_frames,native_h,native_w),np.uint8)

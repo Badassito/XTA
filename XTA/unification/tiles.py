@@ -1,4 +1,4 @@
-"""Dependency-light grouped tile grammar shared by v18 PTA and TTA."""
+"""Dependency-light grouped tile grammar shared by TTA, PTA and LTA."""
 
 from __future__ import annotations
 
@@ -8,7 +8,9 @@ from typing import Sequence, Tuple
 
 
 @dataclass(frozen=True)
-class ResolvedTileGroup:
+class TileConfig:
+    """One resolved TILE_SIZE:TILE_STRIDE group shared by TTA, PTA and LTA."""
+
     tile_size: int
     tile_stride: int
     config_id: str
@@ -28,10 +30,10 @@ def _group_values(values: Sequence[str] | str | None) -> list[str]:
 
 def resolve_tile_groups(
     values: Sequence[str] | str | None,
-) -> Tuple[ResolvedTileGroup, ...]:
+) -> Tuple[TileConfig, ...]:
     """Resolve strict ``TILE_SIZE:TILE_STRIDE`` groups once for both modes."""
 
-    groups: list[ResolvedTileGroup] = []
+    groups: list[TileConfig] = []
     seen: set[str] = set()
     for raw_group in _group_values(values):
         slots = [slot.strip() for slot in str(raw_group).split(":")]
@@ -63,8 +65,8 @@ def resolve_tile_groups(
                 f"--enable_tile contains duplicate group {tile_size}:{tile_stride}"
             )
         seen.add(config_id)
-        groups.append(ResolvedTileGroup(tile_size, tile_stride, config_id))
+        groups.append(TileConfig(tile_size, tile_stride, config_id))
     return tuple(groups)
 
 
-__all__ = ("ResolvedTileGroup", "resolve_tile_groups")
+__all__ = ("TileConfig", "resolve_tile_groups")

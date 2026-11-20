@@ -123,7 +123,7 @@ def admission(monkeypatch):
     engine._native_t_indices = lambda logical_t: (None, None, None)
     for name in ('_native_t_map_cache', '_native_plane_cache', '_native_u8_plane_cache',
                  '_fold_cache', '_tilted_plans', '_fused_azimuthal_taps',
-                 '_spherical_direction_cache', '_spherical_rotation_cache'):
+                 '_spherical_direction_cache'):
         setattr(engine, name, OrderedDict())
     engine._spherical_direction_cache_bytes = 0
     for name in ('_fused_disabled_families', '_fused_graph_rejected_keys',
@@ -131,7 +131,6 @@ def admission(monkeypatch):
         setattr(engine, name, set())
     monkeypatch.setattr(cuda_backend, 'gpu_worker_render_resident_enabled', lambda: True)
     monkeypatch.setattr(cuda_backend, 'gpu_render_reserve_bytes', lambda: 90)
-    monkeypatch.setattr(cuda_backend, 'azimuthal_source_mode', lambda: 'texture_linear')
     monkeypatch.setattr(cuda_backend, 'azimuthal_texture_source_copy_reserve_enabled', lambda: True)
     monkeypatch.setattr(cuda_backend, 'time', SimpleNamespace(monotonic=lambda: clock.now))
     return engine, allocator, clock, np.zeros((2, 2, 2), dtype=np.uint8)

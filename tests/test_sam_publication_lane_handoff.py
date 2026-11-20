@@ -158,8 +158,8 @@ def test_unadmitted_immutable_dependencies_allow_last_owner_dense_retirement(cas
         assert all(getattr(child, '_xta_dense_independent_publication_paths', ())
                    for child in prepared.pending_component_layers)
         assert not settle_prepared_view_components(prepared)
-        assert not dense.retire_dense_for_publication(prepared, enabled=True,
-            tiled=False, keep_temp=False, retired_callback=lambda *args: retired.append(args))
+        assert not dense.retire_dense_for_publication(prepared,
+            tiled=False, retired_callback=lambda *args: retired.append(args))
         gc.collect()
         assert prepared.native_support_mm is prepared.final_view_volume_mm is None
         assert int(alias[0, 3, 4]) == 1 and not retired

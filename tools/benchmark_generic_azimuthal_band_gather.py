@@ -407,7 +407,7 @@ def main():
                                           for p in identity_files},
         cases=[asdict(item) for item in selected], size=args.size, workers=args.workers,
         benchmark_patches_production_files=False, cpu_only=True, synthetic_only=True,
-        reachability='Upright sagittal/coronal sink; interpolation/tile/keep-temp can bypass terminal packing',
+        reachability='Upright sagittal/coronal sink; interpolation/tile can bypass terminal packing',
         result_limit='Local scaling sanity evidence, not target-machine throughput', mode='plan_only',
         primary_timing='Complete projection wall, including recording/hash sink',
         supplemental_timing='Wall minus callback time; hash sink is not a production encoder',

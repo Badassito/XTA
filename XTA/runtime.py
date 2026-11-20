@@ -493,6 +493,10 @@ def plan_gpu_feeder_core_reservations(
     reservations: List[List[List[int]]] = [[] for _ in range(n)]
     if n <= 0 or target <= 0:
         return [[] for _ in range(n)]
+    unavailable = cpu_affinity_unavailable_reason()
+    if unavailable is not None:
+        print(f'Warning: [affinity] {unavailable}; dedicated GPU feeder reservations are disabled.')
+        return [[] for _ in range(n)]
 
     try:
         allowed = {int(cpu) for cpu in os.sched_getaffinity(0)}
@@ -839,7 +843,8 @@ class _WindowsAffinityApi:
     """Small Win32 affinity adapter; constructed only on Windows.
 
     CPU IDs in this API are group-local. Refuse multi-group hosts rather than
-    interpreting XTA's flat CPU IDs as the wrong processor group's bit numbers.
+    interpreting XTA's flat CPU IDs as the wrong processor group's bit numbers;
+    such hosts run unpinned via cpu_affinity_unavailable_reason().
     """
     def __init__(self) -> None:
         import ctypes
@@ -898,6 +903,25 @@ class _WindowsAffinityApi:
                 raise self.ctypes.WinError(self.ctypes.get_last_error())
         finally:
             self.kernel.CloseHandle(handle)
+
+
+@functools.lru_cache(maxsize=1)
+def cpu_affinity_unavailable_reason() -> Optional[str]:
+    """Why flat XTA CPU masks cannot be applied on this host, else None.
+
+    Windows masks are processor-group-local; a host with more than one active
+    group (>64 logical CPUs or a forced split) runs unpinned instead of guessing.
+    POSIX hosts always return None.
+    """
+    if os.name != 'nt':
+        return None
+    try:
+        groups = int(_WindowsAffinityApi().kernel.GetActiveProcessorGroupCount())
+    except Exception as exc:
+        return f'Windows affinity API unavailable ({type(exc).__name__}: {exc})'
+    if groups != 1:
+        return f'Windows reports {groups} active processor groups; XTA CPU masks are single-group'
+    return None
 
 
 def _windows_setaffinity_all_threads(cpus: Sequence[int], *, _process=None, _api=None) -> bool:
@@ -1664,7 +1688,6 @@ def _allocate_memfd_workspace_array(
         mm._workspace_memfd_owner_key = str(proc_path)  # type: ignore[attr-defined]
         mm._workspace_memfd_path = str(proc_path)  # type: ignore[attr-defined]
         mm._workspace_memfd_owner_fd = int(fd)  # type: ignore[attr-defined]
-        mm._workspace_memfd_desc = str(desc)  # type: ignore[attr-defined]
         _register_memfd_owner(str(proc_path), int(fd), str(desc))
         if bool(initialize_zero) and int(nbytes) > 0:
             # A newly ftruncate'd memfd reads as zero.  Do not touch every page merely
@@ -2881,8 +2904,6 @@ _RUN_SCRATCH_CLEANUP_LOCK = threading.Lock()
 
 _RUN_SCRATCH_CLEANUP_PATH: Optional[Path] = None
 
-_RUN_SCRATCH_CLEANUP_KEEP = True
-
 _RUN_SCRATCH_CLEANUP_REGISTERED = False
 
 _RUN_TERMINATION_REQUESTED = threading.Event()
@@ -2901,7 +2922,7 @@ def _cleanup_registered_unique_run_scratch() -> None:
     global _RUN_SCRATCH_CLEANUP_PATH
     with _RUN_SCRATCH_CLEANUP_LOCK:
         path = _RUN_SCRATCH_CLEANUP_PATH
-        if path is None or bool(_RUN_SCRATCH_CLEANUP_KEEP):
+        if path is None:
             return
         owned_suffix = f'_{int(os.getpid())}_temp'
         if not str(Path(path).name).endswith(owned_suffix):
@@ -2956,21 +2977,20 @@ def _run_scratch_sigterm_handler(signum: int, _frame: object) -> None:
     _RUN_TERMINATION_REQUESTED.set()
     raise KeyboardInterrupt(f'received signal {int(signum)}')
 
-def register_unique_run_scratch_cleanup(path: Path, *, keep_temp: bool) -> None:
+def register_unique_run_scratch_cleanup(path: Path) -> None:
     """Register conservative atexit/SIGTERM cleanup for one PID-owned scratch tree."""
-    global _RUN_SCRATCH_CLEANUP_PATH, _RUN_SCRATCH_CLEANUP_KEEP, _RUN_SCRATCH_CLEANUP_REGISTERED
+    global _RUN_SCRATCH_CLEANUP_PATH, _RUN_SCRATCH_CLEANUP_REGISTERED
     global _RUN_TERMINATION_WATCHDOG_STARTED
     path_obj = Path(path)
     with _RUN_SCRATCH_CLEANUP_LOCK:
         _RUN_SCRATCH_CLEANUP_PATH = path_obj
-        _RUN_SCRATCH_CLEANUP_KEEP = bool(keep_temp)
         if not _RUN_SCRATCH_CLEANUP_REGISTERED:
             atexit.register(_cleanup_registered_unique_run_scratch)
             _RUN_SCRATCH_CLEANUP_REGISTERED = True
 
     # SLURM normally sends SIGTERM before a forced SIGKILL. Convert that catchable signal
     # into Python unwinding so executor/sink finalizers and the atexit scratch cleanup run.
-    if not bool(keep_temp) and str(path_obj.name).endswith(f'_{int(os.getpid())}_temp'):
+    if str(path_obj.name).endswith(f'_{int(os.getpid())}_temp'):
         try:
             if not _RUN_TERMINATION_WATCHDOG_STARTED:
                 watchdog = threading.Thread(
@@ -3720,7 +3740,7 @@ def reset_runtime_state_for_new_run() -> None:
     global _INTERPOLATION_PROCESS_EXECUTOR, _INTERPOLATION_PROCESS_MAX_WORKERS
     global _INTERPOLATION_PROCESS_WORKER, _GPU_WORKER_AUX_INTERPOLATION_POOL
     global _INTERPOLATION_PASS_ADMISSION
-    global _RUN_SCRATCH_CLEANUP_PATH, _RUN_SCRATCH_CLEANUP_KEEP
+    global _RUN_SCRATCH_CLEANUP_PATH
     global _SCRATCH_DIR_IS_MEMORY_BACKED
 
     executor = _INTERPOLATION_PROCESS_EXECUTOR
@@ -3745,7 +3765,6 @@ def reset_runtime_state_for_new_run() -> None:
     _cleanup_registered_unique_run_scratch()
     with _RUN_SCRATCH_CLEANUP_LOCK:
         _RUN_SCRATCH_CLEANUP_PATH = None
-        _RUN_SCRATCH_CLEANUP_KEEP = True
     _SCRATCH_DIR_IS_MEMORY_BACKED = False
     _RUN_TERMINATION_REQUESTED.clear()
     shutdown_parallel_pool_cache()
@@ -3838,7 +3857,6 @@ def _interpolation_process_entry(
     interpolation_walk_back: int,
     interpolation_candidates: int,
     interpolate_min_radius: float,
-    keep_temp: bool,
     reserve_bytes: int,
     workers: int,
     wrap_axis: bool,
@@ -3873,7 +3891,6 @@ def _interpolation_process_entry(
             interpolation_walk_back=int(interpolation_walk_back),
             interpolation_candidates=int(interpolation_candidates),
             interpolate_min_radius=float(interpolate_min_radius),
-            keep_temp=bool(keep_temp),
             prefer_memory=True,
             reserve_bytes=int(reserve_bytes),
             workers=int(workers),
@@ -3907,7 +3924,6 @@ def interpolate_view_volume_pass_maybe_process(
     interpolation_walk_back: int,
     interpolation_candidates: int,
     interpolate_min_radius: float,
-    keep_temp: bool = False,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
@@ -3942,7 +3958,6 @@ def interpolate_view_volume_pass_maybe_process(
             interpolation_walk_back=int(interpolation_walk_back),
             interpolation_candidates=int(interpolation_candidates),
             interpolate_min_radius=float(interpolate_min_radius),
-            keep_temp=bool(keep_temp),
             prefer_memory=bool(prefer_memory),
             reserve_bytes=int(reserve_bytes),
             workers=int(workers),
@@ -4009,24 +4024,23 @@ def interpolate_view_volume_pass_maybe_process(
             return
         worker_backing = Path(worker_path)
         retire_path = (
-            worker_backing if not bool(keep_temp) and worker_backing.exists()
+            worker_backing if worker_backing.exists()
             and _root_memmap_for_array(worker_mm) is not None
             and _memfd_owner_key_from_array(worker_mm) is None
             else None
         )
         close_memmap_array(worker_mm, unlink_path=retire_path)
-        if not bool(keep_temp):
+        try:
+            Path(worker_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        if staged_bridge_path is not None:
             try:
-                Path(worker_path).unlink(missing_ok=True)
+                Path(staged_bridge_path).unlink(missing_ok=True)
             except Exception:
                 pass
-            if staged_bridge_path is not None:
-                try:
-                    Path(staged_bridge_path).unlink(missing_ok=True)
-                except Exception:
-                    pass
-            if staged_component_dir is not None:
-                shutil.rmtree(staged_component_dir, ignore_errors=True)
+        if staged_component_dir is not None:
+            shutil.rmtree(staged_component_dir, ignore_errors=True)
 
     def _commit_speculative_worker_storage(stats: Dict[str, object]) -> np.ndarray:
         try:
@@ -4083,7 +4097,6 @@ def interpolate_view_volume_pass_maybe_process(
             interpolation_walk_back=int(interpolation_walk_back),
             interpolation_candidates=int(interpolation_candidates),
             interpolate_min_radius=float(interpolate_min_radius),
-            keep_temp=bool(keep_temp),
             prefer_memory=bool(prefer_memory),
             reserve_bytes=int(reserve_bytes),
             workers=int(workers),
@@ -4108,7 +4121,6 @@ def interpolate_view_volume_pass_maybe_process(
         interpolation_walk_back=int(interpolation_walk_back),
         interpolation_candidates=int(interpolation_candidates),
         interpolate_min_radius=float(interpolate_min_radius),
-        keep_temp=bool(keep_temp),
         reserve_bytes=int(reserve_bytes),
         workers=int(workers),
         wrap_axis=bool(wrap_axis),

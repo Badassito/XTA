@@ -18,7 +18,12 @@ batches. An 84-pixel origin snap is constrained by full seed containment. The
 maximum native side is the smaller of the configured scale times 1008, frame
 height, and frame width. A seed too large for the bound raises a planning error.
 Native crops are explicitly transformed to the tracker's 1008-square input,
-and predictions are restored to native coordinates.
+and predictions are restored to native coordinates. Seed downsampling keeps the
+area-majority threshold, but a seed component that would vanish keeps its
+partial-coverage footprint. The prompt frame publishes the native seed
+(hole-filled when enabled), not a resampled copy. A boundary prediction that
+restores empty yields no dogfood seed. Crop receipts count rescued components
+and dropped dogfood seeds.
 
 Crop windows follow support across the earlier fixed tile grid. An interior
 guard or a spatial split event can request one patch from the earliest event

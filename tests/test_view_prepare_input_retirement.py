@@ -21,7 +21,7 @@ def _result(task_view, volume):
     return PreparedViewResult('model', task_view.name, '0', 0., volume, volume, [])
 
 
-def _task(root, *, keep=False, restored=False):
+def _task(root, *, restored=False):
     root.mkdir(parents=True, exist_ok=True)
     expected = np.zeros((3, 4, 5), np.uint8)
     expected[0, 1, 2] = expected[2, 2, 3] = 1
@@ -46,10 +46,10 @@ def _task(root, *, keep=False, restored=False):
         d1_shadow_path=shadow, union_path=path, confmap_path=None, temp_dir=root,
         dense_tiling_active=False, min_conf=0, min_radius=0, interpolation_distance=0,
         interpolation_walk_back=1, interpolation_candidates=1, interpolation_passes=1,
-        interpolation_min_radius=0, interpolation_search_angle=0, keep_temp_artifacts=keep,
+        interpolation_min_radius=0, interpolation_search_angle=0,
         slice_workers=1, interpolation_task_workers=1, component_layers_needed=True,
         precleaned_slice_cleanup=True, hole_fill_done_on_device=True, slice_meta=None,
-        fuse_azimuthal_component_layers=lambda:False, component_ref_dense_retirement_active=True,
+        fuse_azimuthal_component_layers=lambda:False,
         preinterpolation_layer_already_published=False, parent_mask_ready_callback=None,
         submit_component_projection=lambda *_a,**_kw:None,
         materialize_workspace=materialize_raw_bbox_mask_store_workspace, prepare=prepare,
@@ -58,9 +58,8 @@ def _task(root, *, keep=False, restored=False):
 
 
 @pytest.mark.parametrize('restored', [False, True])
-@pytest.mark.parametrize('keep', [False, True])
-def test_rebound_success_retires_original_and_preserves_debug_input(tmp_path, restored, keep):
-    task, expected = _task(tmp_path, keep=keep, restored=restored)
+def test_rebound_success_retires_original(tmp_path, restored):
+    task, expected = _task(tmp_path, restored=restored)
     path = task.union_path
     with redirect_stdout(StringIO()):
         result = task()
@@ -72,7 +71,7 @@ def test_rebound_success_retires_original_and_preserves_debug_input(tmp_path, re
     gc.collect()
     assert mapping() is None
     runtime.wait_for_retired_memmap_unlinks(path=path)
-    assert path.exists() is keep
+    assert not path.exists()
     np.testing.assert_array_equal(result.final_view_volume_mm, expected)
 
 
@@ -195,9 +194,8 @@ def test_replacement_after_scheduling_is_preserved_by_deferred_retirement(tmp_pa
     np.testing.assert_array_equal(result.final_view_volume_mm, expected)
 
 
-@pytest.mark.parametrize('keep', [False, True])
-def test_prepare_failure_keeps_existing_alias_safe_cleanup_behavior(tmp_path, keep):
-    task, expected = _task(tmp_path, keep=keep)
+def test_prepare_failure_keeps_existing_alias_safe_cleanup_behavior(tmp_path):
+    task, expected = _task(tmp_path)
     path = task.union_path
     alias = task.union_mm[:]
 
@@ -213,7 +211,7 @@ def test_prepare_failure_keeps_existing_alias_safe_cleanup_behavior(tmp_path, ke
     caught = task = alias = None
     gc.collect()
     runtime.wait_for_retired_memmap_unlinks(path=path)
-    assert path.exists() is keep
+    assert not path.exists()
 
 
 def test_original_retirement_does_not_block_or_damage_pending_sam_publication(tmp_path):

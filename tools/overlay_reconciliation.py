@@ -22,7 +22,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from XTA.media import _linear_source_index
+from XTA.media import _center_aligned_source_position
 from XTA.reconciliation_io import _read_header, _vectors
 
 COLORS = {'retained': (45, 190, 135), 'rejected': (240, 85, 85)}
@@ -33,7 +33,7 @@ def sampling_plan(source_shape, target_shape, selected):
     target_t, _, _ = target_shape
     plan = []
     for z in range(target_t):
-        position = _linear_source_index(z, target_t, source_t)
+        position = _center_aligned_source_position(z, target_t, source_t)
         lo = int(math.floor(position))
         hi = min(source_t - 1, lo + 1)
         plan.append((lo, hi, position - lo))
@@ -288,7 +288,7 @@ def write_viewer(path, records):
 <label id="method_b_control">Right policy <select id="method_b"></select></label>
 <div class="grid" id="panels"><section><h2>Source</h2><canvas id="original"></canvas></section><section id="panel_a"><h2 id="title_a"></h2><canvas id="comparison_a"></canvas></section><section id="panel_b"><h2 id="title_b"></h2><canvas id="comparison_b"></canvas></section></div>
 <p class="note" id="position"></p>
-<p class="note">The grayscale background follows the pipeline's area resize and endpoint-aligned temporal interpolation. Compact masks pool several source frames. The optional footprint maximum shows that broader source support. No policy decisions or source masks were changed. Opacity 0 shows the source alone.</p>
+<p class="note">The grayscale background follows the pipeline's area resize and center-aligned temporal interpolation. Compact masks pool several source frames. The optional footprint maximum shows that broader source support. No policy decisions or source masks were changed. Opacity 0 shows the source alone.</p>
 <script>const records=PAYLOAD, byId=id=>document.getElementById(id), cache=new Map();
 function picture(url){if(!cache.has(url)){let im=new Image();im.src=url;cache.set(url,new Promise(resolve=>im.onload=()=>resolve(im)));}return cache.get(url);}
 records.forEach((r,i)=>{let o=document.createElement('option');o.value=i;o.textContent=r.dataset.slice(-6)+' · z='+r.z;byId('sample').append(o);});
@@ -387,7 +387,7 @@ def main():
             comparison_sha256=hashlib.sha256(args.comparison.read_bytes()).hexdigest(),
             tool_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             spatial_resize='OpenCV INTER_AREA on each uint8 source frame',
-            temporal_resize='endpoint-aligned float32 interpolation followed by rint and uint8',
+            temporal_resize='center-aligned float32 interpolation followed by rint and uint8',
             intensity_display='original uint8 range, no contrast window or normalization',
             slices=[{k:v for k,v in r.items() if k not in {'source','slab','layers'}} for r in records],
             elapsed_seconds=time.monotonic()-started)

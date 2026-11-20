@@ -144,6 +144,7 @@ def test_preparation_adds_cpr_views_and_manifests_after_cubic_resize(tmp_path):
     assert views
     manifest = pta._v18_view_manifest_record(views[0])["cpr_geometry"]
     assert manifest["plane_orientation"] == "perpendicular_to_centerline_tangent"
+    assert manifest["centerline_smoothing"] == "gaussian_half_median_seed_spacing"
     assert manifest["center_row"] == manifest["center_column"]
     assert manifest["spacing_processing_voxels"][:2] == [1.0, 1.0]
 
@@ -686,3 +687,126 @@ def test_preparation_times_cpr_extraction_with_the_worker_budget(tmp_path, monke
     assert spans.count("pta.prepare.cpr_extract") == 1
     assert budgets == [3]
     assert [view for view in prepared.views if view.family == "cpr"]
+
+
+def _rotation_stats(points, normals, binormals):
+    tangents = np.cross(np.asarray(normals, np.float64), np.asarray(binormals, np.float64))
+    angles = np.arccos(np.clip(np.sum(tangents[1:] * tangents[:-1], axis=1), -1.0, 1.0))
+    steps = np.linalg.norm(np.diff(np.asarray(points, np.float64), axis=0), axis=1)
+    return math.degrees(float(angles.max())), float((angles / steps).max())
+
+
+def _quarter_arc(spacing, noise=0.0):
+    theta = np.linspace(0.0, math.pi / 2, int(round(60 * math.pi / 2 / spacing)) + 1)
+    points = np.column_stack((60 * np.sin(theta), 60 * (1 - np.cos(theta)), np.zeros_like(theta))) + 100.0
+    if noise:
+        points = points + np.random.default_rng(3).normal(scale=noise, size=points.shape)
+    return points
+
+
+def test_seed_vertex_bends_are_spread_along_the_curve():
+    points, normals, binormals = resample_centerline(_quarter_arc(12.0))
+    rotation, curvature = _rotation_stats(points, normals, binormals)
+    assert rotation < 1.5          # the seed polyline turns 5.6 degrees in one step
+    assert 1.0 / curvature > 45.0  # true radius 60; the polyline folds at about 10 voxels
+    steps = np.linalg.norm(np.diff(points.astype(np.float64), axis=0), axis=1)
+    assert np.all((steps > 0.9) & (steps < 1.1))
+
+
+def test_noisy_seeds_stay_near_the_curve():
+    from scipy.spatial import cKDTree
+
+    points, normals, binormals = resample_centerline(_quarter_arc(12.0, noise=0.7))
+    distance = cKDTree(_quarter_arc(0.02)).query(points.astype(np.float64))[0]
+    assert distance[12:-12].max() < 1.0  # the ends keep their seeds' noise
+    assert _rotation_stats(points, normals, binormals)[0] < 2.5
+
+
+_NEAR_DUPLICATE_SEEDS = np.array([
+    [19.54, 17.58, 15.54], [22.69, 11.38, 17.63], [42.04, 15.3, 36.43], [44.64, 16.58, 39.34],
+    [46.81, 27.64, 43.07], [52.76, 30.57, 49.38], [58.63, 25.64, 57.56], [53.08, 28.98, 66.66],
+    [53.18, 28.99, 67.05], [54.82, 30.23, 69.98], [61.55, 33.09, 81.71]])
+_CROTCH_SEEDS = np.array([
+    [158.1, 38.0, 96.0], [146.0, 50.0, 95.5], [134.0, 62.0, 95.5], [122.0, 74.0, 95.5],
+    [108.8, 87.2, 95.5], [101.8, 100.0, 95.5], [117.5, 113.5, 95.5], [119.5, 115.6, 95.5],
+    [165.6, 161.9, 95.5]])
+
+
+@pytest.mark.parametrize("seeds", (_NEAR_DUPLICATE_SEEDS, _CROTCH_SEEDS),
+                         ids=("near_duplicate_seed", "crotch_and_long_gap"))
+def test_irregular_seeds_stay_on_their_polyline(seeds):
+    from scipy.spatial import cKDTree
+
+    points, normals, binormals = resample_centerline(seeds)
+    polyline = np.concatenate([np.linspace(a, b, 64) for a, b in zip(seeds[:-1], seeds[1:])])
+    seed_length = np.linalg.norm(np.diff(seeds, axis=0), axis=1).sum()
+    assert len(points) <= 1.02 * seed_length + 2
+    assert cKDTree(polyline).query(points.astype(np.float64))[0].max() < 5.0
+    assert _rotation_stats(points, normals, binormals)[0] < 10.0
+
+
+def test_trim_and_prune_removes_end_hooks_and_reversals():
+    from XTA.pta_cpr import _trim_and_prune_centerline as trim
+
+    line = np.column_stack((np.arange(0, 60, 10.0), np.zeros(6), np.zeros(6)))
+    found = np.array([False, True, True, False, True, False])
+    assert np.array_equal(trim(line, found), line[1:5])             # ends trimmed, interior gap kept
+    hook = np.vstack((line[:4], [[25.0, 1.0, 0.0]]))                 # end seed slid back along the tube
+    assert np.array_equal(trim(hook, np.ones(5, bool)), line[:4])
+    start = np.vstack(([[15.0, 1.0, 0.0]], line[1:]))                # start seed slid forward
+    assert np.array_equal(trim(start, np.ones(6, bool)), line[1:])
+    spike = np.vstack((line[:3], [[5.0, 3.0, 0.0]], line[3:]))       # interior seed slid back
+    assert np.array_equal(trim(spike, np.ones(7, bool)), line)
+    overshoot = np.vstack((line[:2], [[25.0, 3.0, 0.0]], line[2:]))  # interior seed overshot
+    assert np.array_equal(trim(overshoot, np.ones(7, bool)), line)
+    close = np.vstack((line[:3], [[20.4, 0.0, 0.0]], line[3:]))      # seed < 1 voxel from its predecessor
+    assert np.array_equal(trim(close, np.ones(7, bool)), line)
+    duplicate = np.vstack((line[:3], line[2:]))                      # exact duplicate seed
+    assert np.array_equal(trim(duplicate, np.ones(7, bool)), line)
+    assert len(trim(np.array([[0.0, 0, 0], [10, 0, 0], [0.5, 0, 0]]), np.ones(3, bool))) == 2
+    tiny = np.array([[0.0, 0, 0], [0.3, 0, 0], [0.6, 0, 0]])         # trimming would leave < 1 voxel
+    assert np.array_equal(trim(tiny, np.ones(3, bool)), tiny)
+    stub = np.array([[87.0, 7, 97], [84.1, 13.69, 102], [87, 7, 107]])  # only the middle seed met foreground
+    assert np.array_equal(trim(stub, np.array([False, True, False])), stub)
+
+
+def _distance_tube(path, radius, size):
+    from scipy.spatial import cKDTree
+
+    indices = np.indices((size,) * 3).reshape(3, -1).T
+    distance, _ = cKDTree(path).query(indices, distance_upper_bound=radius + 1)
+    return (distance.reshape((size,) * 3) <= radius).astype(np.uint8)
+
+
+def test_extracted_straight_tube_has_no_end_hooks():
+    axis = np.column_stack((np.linspace(5, 91, 400), np.full(400, 45.0), np.full(400, 48.0)))
+    geometries = extract_cpr_geometries(_distance_tube(axis, 4, 96), max_dim=16)
+    assert geometries
+    for geometry in geometries:
+        assert _rotation_stats(geometry.points_tyx, geometry.normals_tyx, geometry.binormals_tyx)[0] < 1.0
+        assert np.abs(geometry.points_tyx[:, 1:] - (45.0, 48.0)).max() < 1.5
+
+
+def test_extracted_quarter_torus_turns_gradually():
+    t, y, x = np.ogrid[:96, :96, :96]
+    rho = np.sqrt((t - 20.0) ** 2 + (y - 20.0) ** 2)
+    mask = (((rho - 35.0) ** 2 + (x - 48.0) ** 2 <= 49) & (t >= 20) & (y >= 20)).astype(np.uint8)
+    geometry = max(extract_cpr_geometries(mask, max_dim=16), key=lambda item: item.num_slices)
+    assert _rotation_stats(geometry.points_tyx, geometry.normals_tyx, geometry.binormals_tyx)[0] < 5.0
+
+
+def test_extracted_bifurcation_stays_inside_the_volume():
+    from scipy.spatial import cKDTree
+
+    trunk = np.column_stack((np.linspace(5, 50, 300), np.full(300, 48.0), np.full(300, 48.0)))
+    run = np.linspace(0, 45, 300)
+    arms = [np.column_stack((50 + run * 0.7, 48 + sign * run * 0.7, np.full(300, 48.0))) for sign in (-1, 1)]
+    path = np.concatenate([trunk] + arms)
+    geometries = extract_cpr_geometries(_distance_tube(path, 4, 96), max_dim=16)
+    assert geometries
+    for geometry in geometries:
+        points = geometry.points_tyx.astype(np.float64)
+        assert geometry.num_slices <= 140
+        assert np.all((points >= 0) & (points <= 95))
+        assert cKDTree(path).query(points)[0].max() < 8.0
+        assert _rotation_stats(geometry.points_tyx, geometry.normals_tyx, geometry.binormals_tyx)[0] < 15.0

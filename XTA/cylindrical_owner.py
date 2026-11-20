@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import math
 import hashlib
-import os
 from pathlib import Path
 import sys
 import threading
@@ -16,6 +15,7 @@ import time
 import numpy as np
 
 from ._deps import _numba
+from .env_flags import env_flag
 from .workspace import yolo_hole_fill_enabled
 from .cylindrical_cuda_projection import RadialCudaProjectionUnsafeFailure, _CROP_METADATA_DTYPE
 from .cylindrical_bitset_compaction import (
@@ -63,12 +63,12 @@ class DeviceOnlyRadialTarget:
 
 
 def radial_owner_enabled():
-    return os.environ.get('YOLO_TTA_RADIAL_OWNER', '1').strip().lower() not in ('', '0', 'false', 'off', 'no')
+    return env_flag('YOLO_TTA_RADIAL_OWNER', True)
 
 
 def radial_gpu_bitset_compaction_enabled():
     """Return exact packed crops from the native owner before host publication."""
-    return all(os.environ.get(name, '1').strip().lower() not in ('', '0', 'false', 'off', 'no')
+    return all(env_flag(name, True)
                for name in ('YOLO_TTA_RADIAL_GPU_BITSET_COMPACTION',
                             'YOLO_TTA_PACKED_OWNER_PUBLICATION'))
 

@@ -31,7 +31,7 @@ def _parameters(root: Path, view: ViewInfo, count: int) -> dict:
     return dict(added_voxels=count, model_name='test', view=view, source='fullframe',
                 pass_index=1, interpolation_walk_back_index=1, interpolation_candidate_index=1,
                 stage='bridge', description='sparse transpose test', temp_dir=root,
-                workers=1, keep_temp=True)
+                workers=1)
 
 
 def _read_ref(ref, output_shape):
@@ -124,7 +124,7 @@ class SparseComponentRetirementTests(unittest.TestCase):
                     np.testing.assert_array_equal(_read_nrrd(root / 'actual.nrrd'), _read_nrrd(root / 'reference.nrrd'))
                     np.testing.assert_array_equal(_read_nrrd(root / 'actual-lq.nrrd'), _read_nrrd(root / 'reference-lq.nrrd'))
 
-    def test_keep_temp_false_preserves_returned_backing_and_retires_transposed_source(self):
+    def test_preserves_returned_backing_and_retires_transposed_source(self):
         for orientation in ('transverse', 'sagittal', 'coronal'):
             with self.subTest(orientation=orientation), tempfile.TemporaryDirectory() as directory, \
                     contextlib.redirect_stdout(io.StringIO()):
@@ -133,9 +133,8 @@ class SparseComponentRetirementTests(unittest.TestCase):
                 data = np.ones((view.num_slices, 7, 9), dtype=np.uint8)
                 path = root / 'input.cvol'
                 write_raw_bbox_mask_store(data, path, format_name=CVOL_FORMAT, desc='input')
-                kwargs = _parameters(root, view, int(data.sum()))
-                kwargs['keep_temp'] = False
-                ref = assembly.materialize_interpolation_component_nrrd_view_layer(path, **kwargs)
+                ref = assembly.materialize_interpolation_component_nrrd_view_layer(
+                    path, **_parameters(root, view, int(data.sum())))
                 self.assertEqual(path.exists(), orientation == 'transverse')
                 self.assertTrue(ref.path.is_dir())
                 self.assertTrue(np.all(_read_ref(ref, ref.shape)))

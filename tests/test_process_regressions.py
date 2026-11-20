@@ -350,7 +350,6 @@ class ProcessRuntimeRegressionTests(unittest.TestCase):
                 1,
                 2,
                 0.0,
-                keep_temp=False,
                 workers=1,
             )
         return original, result, stats, work_dir
@@ -408,7 +407,6 @@ class ProcessRuntimeRegressionTests(unittest.TestCase):
                 1,
                 2,
                 0.0,
-                keep_temp=False,
                 workers=1,
             )
         try:
@@ -591,6 +589,21 @@ class PipelineLifecycleRegressionTests(unittest.TestCase):
         self.assertTrue(media.wait_for_streaming_producers(timeout=5.0))
         media.reset_streaming_state_for_new_run()
         self.assertFalse(media.streaming_producers_aborted())
+
+    def test_volume_readiness_does_not_outlive_its_array(self) -> None:
+        completed = media.VolumeReadiness(3)
+        completed.mark_all_ready()
+        array = np.zeros((3, 4, 4), dtype=np.uint8)
+        key = id(array)
+        media.register_volume_readiness(array, completed)
+        self.assertIs(media.volume_readiness(array), completed)
+        del array
+        gc.collect()
+        self.assertNotIn(key, media._VOLUME_READINESS_BY_ARRAY_ID)
+        # A later array (possibly at the same address) starts without readiness.
+        later = np.zeros((10, 4, 4), dtype=np.uint8)
+        self.assertIsNone(media.volume_readiness(later))
+        media.wait_for_volume_slice_ready(later, 5)
 
 
 if __name__ == '__main__':

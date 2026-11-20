@@ -29,7 +29,7 @@ class CompleteManifestBoundaryTests(unittest.TestCase):
               mock.patch.object(pipeline, 'write_json_manifest',
                                 side_effect=lambda path, value: events.append('write') or path)):
             pipeline._finalize_tta_selected_run_and_publish(temp_dir=Path('temp'), out_dir=Path('out'),
-                keep_temp_artifacts=False, manifest_path=Path('manifest.json'),
+                manifest_path=Path('manifest.json'),
                 manifest=manifest, artifact_identities={})
         self.assertEqual(events, ['cleanup', 'revalidate', 'write'])
 
@@ -45,7 +45,7 @@ class CompleteManifestBoundaryTests(unittest.TestCase):
                 mock.patch.object(pipeline, 'write_json_manifest') as write):
                 with self.assertRaisesRegex(RuntimeError, failure_at + ' failed'):
                     pipeline._finalize_tta_selected_run_and_publish(temp_dir=Path('temp'), out_dir=Path('out'),
-                        keep_temp_artifacts=False, manifest_path=Path('manifest.json'),
+                        manifest_path=Path('manifest.json'),
                         manifest=manifest, artifact_identities={})
                 write.assert_not_called()
                 if failure_at == 'cleanup':
@@ -83,8 +83,8 @@ class CompleteManifestBoundaryTests(unittest.TestCase):
                 namespace = dict(_close_tta_output_artifacts=retire,
                     _finalize_selected_run_after_output_close=lambda: events.append('finalized'),
                     _report_sam_requested_work_status=pipeline._report_sam_requested_work_status,
-                    runtime_telemetry=lambda: telemetry, output_artifacts=None, keep_temp_artifacts=False,
-                    tail_tile_slice_workers=1, sam_planning_omissions=omissions,
+                    runtime_telemetry=lambda: telemetry, output_artifacts=None,
+                    sam_planning_omissions=omissions,
                     time=SimpleNamespace(perf_counter=lambda: 1.), post_inference_tail_started=0.,
                     pipeline_wall_started=0., out_dir=Path('out'), temp_dir=Path('temp'),
                     final_paths={}, summary_path=None, run_manifest_path=None)
@@ -107,6 +107,24 @@ class CompleteManifestBoundaryTests(unittest.TestCase):
                 self.assertEqual('WARNING: Requested SAM work incomplete' in text.getvalue(),
                                  bool(omissions and not strict))
 
+    def test_require_complete_fails_only_for_explicit_true_spellings(self) -> None:
+        # The run fails late, so an unrecognized value keeps the recorded warning path.
+        omission = dict(unresolved_plan=True, unresolved_group_count=0,
+                        reasons=['observation_inventory_memory_limit'])
+        cases = (('1', True), ('true', True), (' ON ', True), ('yes', True),
+                 ('0', False), ('ture', False), ('disabled', False), ('warn', False), ('2', False))
+        for value, fails in cases:
+            with self.subTest(value=value), \
+                    mock.patch.object(pipeline, 'runtime_telemetry', return_value=mock.MagicMock()), \
+                    mock.patch.dict(pipeline.os.environ, {'YOLO_TTA_SAM_REQUIRE_COMPLETE': value}), \
+                    contextlib.redirect_stdout(io.StringIO()) as text:
+                if fails:
+                    with self.assertRaisesRegex(RuntimeError, 'Requested SAM work incomplete'):
+                        pipeline._report_sam_requested_work_status([omission])
+                else:
+                    pipeline._report_sam_requested_work_status([omission])
+                    self.assertIn('WARNING: Requested SAM work incomplete', text.getvalue())
+
     def test_tta_finalize_facade_preserves_private_callback_patch_seams(self) -> None:
         manifest_path = Path("manifest.json")
         manifest = {"status": "complete"}
@@ -122,7 +140,6 @@ class CompleteManifestBoundaryTests(unittest.TestCase):
             result = pipeline._finalize_tta_selected_run_and_publish(
                 temp_dir=Path("temp"),
                 out_dir=Path("output"),
-                keep_temp_artifacts=False,
                 manifest_path=manifest_path,
                 manifest=manifest,
                 artifact_identities=identities,
@@ -164,7 +181,6 @@ class CompleteManifestBoundaryTests(unittest.TestCase):
                     pipeline._finalize_tta_selected_run_and_publish(
                         temp_dir=scratch_dir,
                         out_dir=output_dir,
-                        keep_temp_artifacts=False,
                         manifest_path=manifest_path,
                         manifest={"status": "complete"},
                         artifact_identities=identities,
@@ -191,6 +207,7 @@ class CompleteManifestBoundaryTests(unittest.TestCase):
             return path
 
         with (
+            mock.patch.object(pipeline, "_cleanup_tta_selected_run_scratch"),
             mock.patch.object(
                 pipeline,
                 "assert_tta_artifacts_unchanged",
@@ -205,7 +222,6 @@ class CompleteManifestBoundaryTests(unittest.TestCase):
             result = pipeline._finalize_tta_selected_run_and_publish(
                 temp_dir=Path("unused"),
                 out_dir=Path("unused-output"),
-                keep_temp_artifacts=True,
                 manifest_path=manifest_path,
                 manifest=manifest,
                 artifact_identities=identities,
@@ -216,6 +232,7 @@ class CompleteManifestBoundaryTests(unittest.TestCase):
 
     def test_tta_late_identity_failure_prevents_atomic_complete_write(self) -> None:
         with (
+            mock.patch.object(pipeline, "_cleanup_tta_selected_run_scratch"),
             mock.patch.object(
                 pipeline,
                 "assert_tta_artifacts_unchanged",
@@ -227,7 +244,6 @@ class CompleteManifestBoundaryTests(unittest.TestCase):
                 pipeline._finalize_tta_selected_run_and_publish(
                     temp_dir=Path("unused"),
                     out_dir=Path("unused-output"),
-                    keep_temp_artifacts=True,
                     manifest_path=Path("manifest.json"),
                     manifest={"status": "complete"},
                     artifact_identities={"input": {}},

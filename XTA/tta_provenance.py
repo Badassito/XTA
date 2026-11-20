@@ -8,13 +8,15 @@ from typing import Dict
 
 from .cylindrical_owner import radial_runtime_provenance
 from .file_hashing import sha256_file
+from .lta_telemetry import _SOURCE_FINGERPRINT_SCOPE, package_source_digest
 from .workspace import _env_flag, _env_int
 
 
 def _source_record(package: Path, name: str) -> Dict[str, object]:
     """Fingerprint without importing optional runtimes; retain read failures."""
     path = package.joinpath(*name.split('.')).with_suffix('.py')
-    entry = {'path': str(path), 'loaded_in_parent': 'XTA.' + name in sys.modules}
+    module = 'XTA' if name == '__init__' else 'XTA.' + name.removesuffix('.__init__')
+    entry = {'path': str(path), 'loaded_in_parent': module in sys.modules}
     try:
         entry['sha256'] = sha256_file(path)
     except OSError as exc:
@@ -23,46 +25,26 @@ def _source_record(package: Path, name: str) -> Dict[str, object]:
 
 
 def _execution_runtime_provenance() -> Dict[str, object]:
-    """Include nonlinear geometry and scheduling sources in the run receipt."""
+    """Fingerprint every package Python source in the run receipt, without importing it.
+
+    A package version can describe several development snapshots, so each file's
+    actual bytes are recorded, plus the aggregate in the shared package source scope.
+    """
     from .geometry_quality import geometry_quality_request_record
     from .cuda_backend import native_trt_ring_enabled, native_trt_ring_mode
 
     result = radial_runtime_provenance()
-    sources = {}
     package = Path(__file__).resolve().parent
-    for name in ('geometry', 'cylindrical_geometry', 'spherical_sampling', 'azimuthal_coverage',
-                 'unification.runtime', 'qsc', 'spherical_geometry', 'spherical_cuda', 'spherical_sampling_cuda',
-                 'cuda_backend', 'runtime', 'startup_io', 'spherical_projection',
-                 'spherical_projection_bounds', 'spherical_projection_cuda',
-                 'spherical_preflight', 'spherical_projection_cpu', 'geometry_quality',
-                 'unification.sampling', 'cylindrical_cuda_projection',
-                 'tilted_azimuthal_projection', 'tilted_azimuthal_projection_cuda',
-                 'tta_scheduler', 'backprojection', 'd1_orthogonal_coverage',
-                 'projection_coverage', 'projection_coverage_cpu', 'azimuthal_trajectory_cpu',
-                 'sparse_projection', 'sparse_bounds_cpu', 'publication_memory',
-                 'native_pull_scheduling', 'native_pull_cuda', 'native_encoded_cuda', 'packed_tilted_projection',
-                 'packed_dense_source',
-                 'confidence_evidence', 'confidence_storage',
-                 'confidence_capture', 'confidence_capture_cpu', 'confidence_native_codec', 'confidence_orchestration',
-                 'confidence_publication', 'tta_prepare_planning', 'tta_provenance',
-                 'runtime_observability'):
-        sources[name] = _source_record(package, name)
-    result['spherical_sources'] = sources
-    # A package version can describe several development snapshots. Retain the
-    # actual SAM preparation/publication bytes for next-run timing attribution
-    # without importing optional model runtimes merely to fingerprint them.
-    for name in ('assembly', 'view_prepare', 'projection_queue', 'reconciliation_runtime', 'sam_integration',
-                 'sam_sparse_shell_projection', 'sam_bridge_planning',
-                 'sam_observation_masks', 'sam_interpolation_contracts',
-                 'sam_extrapolation_planning', 'sam_gpu_rendering', 'sam_azimuthal_batch', 'workspace', 'sam_retry_attempt_bounds',
-                 'sam_interpolation', 'sam_extrapolation', 'sam_extrapolation_policy', 'sam_retry_groups',
-                 'sam_tracker_runtime', 'sam_device_pool', 'sam_resources', 'sam_image_prefetch', 'sam_crop_retry',
-                 'lta_worker_adapter', 'lta_sam', 'sam_sdk_compat',
-                 'sam_parent_staging', 'tta_background', 'detector_workspaces', 'yolo_cpu_input', 'gray_cache', 'sam_yolo_capture', 'sam_view_geometry',
-                 'sam_policy', 'sam_mask_reader', 'sam_planning_outcomes',
-                 'sam_branch_selection', 'sam_evidence', 'sam_canvas_rendering', 'tta_outputs',
-                 'nrrd_compression', '_prediction_cleanup'):
-        result['modules'][name] = _source_record(package, name)
+    files = {}
+    for path in sorted(package.rglob('*.py')):
+        if path.is_file():
+            relative = path.relative_to(package).as_posix()
+            name = relative[:-3].replace('/', '.')
+            result['modules'][name] = entry = _source_record(package, name)
+            files[relative] = entry['sha256']
+    result['package_python_sources'] = dict(scope=_SOURCE_FINGERPRINT_SCOPE,
+        sha256=package_source_digest(files) if all(isinstance(value, str) for value in files.values()) else None,
+        file_count=len(files))
     result['geometry_quality_requests'] = geometry_quality_request_record()
     result['native_trt_ring_requested'] = native_trt_ring_enabled()
     result['native_trt_ring_mode'] = native_trt_ring_mode()

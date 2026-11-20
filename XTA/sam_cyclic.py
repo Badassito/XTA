@@ -8,31 +8,21 @@ support is folded back to the original view.
 from __future__ import annotations
 
 import operator
-import hashlib
 from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass
-from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
 import numpy as np
 
+from .file_hashing import source_sha256
+
 CYCLIC_FRAME_ADDRESSING_SCHEMA = "xta.sam_cyclic_view_frames/1"
 CYCLIC_EXTRAPOLATION_ADDRESSING_SCHEMA = "xta.sam_cyclic_extrapolation_frames/1"
-_SOURCE_PATH = Path(__file__).resolve()
-IMPLEMENTATION_SHA256 = hashlib.sha256(_SOURCE_PATH.read_bytes()).hexdigest()
-
-
-def assert_cyclic_implementation_unchanged():
-    """Boundary check: re-hash this module's source against its loaded identity.
-
-    Callers run it at well-defined boundaries (plan construction, evidence
-    open/commit, selection start/end, publication start/finalize, first/last
-    folded crop of a public traversal). Per-address helpers below never touch
-    the file system; a per-call hash convoyed the GIL in busy processes.
-    """
-    if hashlib.sha256(_SOURCE_PATH.read_bytes()).hexdigest() != IMPLEMENTATION_SHA256:
-        raise RuntimeError("SAM cyclic address implementation changed after loading")
+IMPLEMENTATION_SHA256 = source_sha256(__file__)
+# v25.0.3 through v26.0.1 source; only the boundary source guard was removed and
+# source hashing became line-ending stable after it. Saved evidence stays readable.
+QUALIFIED_IMPLEMENTATIONS = frozenset({"f65c83b547ec3b434eb0d25555685a022089984f9d7b76e5a79531d9c446f9bd"})
 
 
 @dataclass(frozen=True)
@@ -109,7 +99,6 @@ def transform_crop_between_frame_addresses(mask, bbox_yx, source_address, target
 
 
 def build_cyclic_frame_addressing(native_shape_tyx, alias_frames: int, *, period_degrees=180.0):
-    assert_cyclic_implementation_unchanged()
     shape = tuple(_integer(value, "native shape") for value in native_shape_tyx)
     aliases = _integer(alias_frames, "alias frame count")
     if len(shape) != 3 or any(value < 1 for value in shape) or not 0 <= aliases < shape[0]:
@@ -188,7 +177,6 @@ class CyclicObservationVolume:
 class ExtrapolationCyclicObservationVolume(CyclicObservationVolume):
     """Tail-scoped extra aliases preserve both inward seeds and full tail horizon."""
     def __init__(self,original,alias_frames,*,period_degrees=180.):
-        assert_cyclic_implementation_unchanged()
         shape=tuple(_integer(v,'native shape') for v in original.shape)
         aliases=_integer(alias_frames,'alias frame count')
         if len(shape)!=3 or any(v<1 for v in shape) or not 0<=aliases<=2*(shape[0]-1):
@@ -203,7 +191,7 @@ class ExtrapolationCyclicObservationVolume(CyclicObservationVolume):
                                                   CYCLIC_EXTRAPOLATION_ADDRESSING_SCHEMA)
 
 
-__all__ = ["CYCLIC_FRAME_ADDRESSING_SCHEMA", "IMPLEMENTATION_SHA256", "assert_cyclic_implementation_unchanged",
+__all__ = ["CYCLIC_FRAME_ADDRESSING_SCHEMA", "IMPLEMENTATION_SHA256", "QUALIFIED_IMPLEMENTATIONS",
            "CyclicFrameAddresses", "CyclicObservationVolume", "address_for_unfolded_index",
            "build_cyclic_frame_addressing", "validate_cyclic_frame_addressing", "mirror_bbox_yx",
            "transform_crop_between_frame_addresses"]

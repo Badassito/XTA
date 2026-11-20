@@ -18,10 +18,82 @@ from XTA.lta_execution import _PlannedChain
 from XTA.lta_propagation import LtaMaskSeed, partition_mask_seed_sessions, write_seed_artifact
 from XTA.lta_rendering import LtaPhysicalViewCacheRef
 from XTA.lta_runtime import LtaRuntimeViewPlan
+from XTA.lta_sam import LTA_SESSION_FRAMES
 from XTA.lta_scheduler import LtaSessionWork, LtaSpatialRelayKey, LtaViewAffinityScheduler, LtaViewKey
-from XTA.lta_windows import plan_directional_windows
+from XTA.lta_windows import WindowPlan, _integer, owned_frame_range
 from XTA.lta_workers import LtaWorkerPool
 from XTA.lta_window_execution import RelayContinuation, WindowExecution, drive_window_generations
+
+
+def plan_directional_windows(
+    *,
+    frame_start: int,
+    frame_stop: int,
+    prompt_frame: int,
+    direction: str,
+) -> tuple[WindowPlan, ...]:
+    """Plan a relay-seeded directional chain to one selected-range edge."""
+
+    start = _integer(frame_start, name="frame_start")
+    stop = _integer(frame_stop, name="frame_stop")
+    prompt = _integer(prompt_frame, name="prompt_frame")
+    resolved_direction = str(direction).strip().lower()
+    if start < 0 or stop <= start or not start <= prompt < stop:
+        raise ValueError("relay prompt and range are inconsistent")
+    if resolved_direction not in {"forward", "backward"}:
+        raise ValueError("relay direction must be forward or backward")
+
+    windows: list[WindowPlan] = []
+    if resolved_direction == "forward":
+        boundary = prompt
+        ordinal = 0
+        while True:
+            window_stop = min(stop, boundary + LTA_SESSION_FRAMES)
+            windows.append(
+                WindowPlan(
+                    branch="forward",
+                    ordinal=ordinal,
+                    frame_start=boundary,
+                    frame_stop=window_stop,
+                    prompt_frame=boundary,
+                    direction="forward",
+                    seed_kind="spatial_relay" if ordinal == 0 else "dogfood",
+                )
+            )
+            if window_stop >= stop:
+                break
+            boundary = window_stop - 1
+            ordinal += 1
+    else:
+        boundary = prompt
+        ordinal = 0
+        while True:
+            window_start = max(start, boundary - (LTA_SESSION_FRAMES - 1))
+            windows.append(
+                WindowPlan(
+                    branch="backward",
+                    ordinal=ordinal,
+                    frame_start=window_start,
+                    frame_stop=boundary + 1,
+                    prompt_frame=boundary,
+                    direction="backward",
+                    seed_kind="spatial_relay" if ordinal == 0 else "dogfood",
+                )
+            )
+            if window_start <= start:
+                break
+            boundary = window_start
+            ordinal += 1
+
+    owned = [frame for window in windows for frame in range(*owned_frame_range(window))]
+    expected = (
+        list(range(prompt, stop))
+        if resolved_direction == "forward"
+        else list(range(start, prompt + 1))
+    )
+    if sorted(owned) != expected or len(owned) != len(set(owned)):
+        raise RuntimeError("directional relay windows do not own their range exactly once")
+    return tuple(windows)
 
 
 @dataclass(frozen=True)

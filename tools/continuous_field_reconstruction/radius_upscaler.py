@@ -88,7 +88,7 @@ class FieldReference:
             'field_manifest':manifest, 'field_manifest_sha256':_sha(path),
             'cache_dir':str(self.cache_dir),
             'full_native_shape_tyx':list(self.native_shape_tyx),
-            'outside_compact_reference': 'Exact zero-support sign: complete original foreground plus3zero cells contains every4tap stencil that can touch foreground. This is not invalid-query fallback or negative annotation authority.',
+            'outside_compact_reference': 'Exact zero-support sign: complete original foreground plus 3 zero cells contains every 4-tap stencil that can touch foreground. This is not invalid-query fallback or negative annotation authority.',
             'scalar_background': 'Outside compact coefficient support, only sign is defined: scalar=-1 sentinel and evaluated_scalar=False. No global distance-field magnitude claim.',
             'sampling': '(global native center index+.5)*low/native-.5-global coefficient origin',
             'formula': 'L=linear(phi)-linear(cap);C=B3(phi)-B3(cap);W=B3(cap)/.5;Q=(1-W)L+WC>=0;prefilterFalse',
@@ -164,7 +164,7 @@ def _sample(ref, native_coords, evaluate_scalar):
             phi=np.asarray(ref.phi[crop]);cap=np.asarray(ref.cap[crop])
             if not np.isfinite(phi).all():raise ValueError('Nonfinite phi coefficient')
             # Dense diagnostic path is deliberately identical to the frozen sampler.
-            # Binary path may use exact constant-cap shortcuts on each4tap footprint.
+            # Binary path may use exact constant-cap shortcuts on each 4-tap footprint.
             if evaluate_scalar:
                 groups=[(np.ones(len(ix),bool),None)]
             else:

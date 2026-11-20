@@ -462,7 +462,7 @@ def test_view_major_producer_writes_sibling_files_in_workers_identically(tmp_pat
     monkeypatch.setattr(sweep_nrrd_processes, '_record_nrrd_process',
                         lambda name, value: recorded.append((name, value)))
     for name, value in (('XTA_YOLO_SWEEP_NATIVE_ROLE', 'produce'), (sweep_evidence_processes.PROCESSES_ENV, '0'),
-                        ('YOLO_TTA_LOW_QUALITY_GPU_DOWNBIN', '0'), ('YOLO_TTA_SWEEP_CUDA_PROJECTION', '0'),
+                        ('YOLO_TTA_LOW_QUALITY_GPU_DOWNBIN', '0'),
                         ('XTA_YOLO_SWEEP_PUBLISHERS', '2')):
         monkeypatch.setenv(name, value)
     shape, cuts = (5, 12, 12), (50, 70, 100)

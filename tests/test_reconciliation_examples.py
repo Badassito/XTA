@@ -41,7 +41,7 @@ def test_sam_presets_declare_quality_ablation_without_changing_source_union():
         assert policy['mode'] == 'union'
         assert policy['proposal_api_version'] == 1
         assert policy['select_proposals'] is None
-        bridge = resolve_sam_bridge_policy(policy, environ={})
+        bridge = resolve_sam_bridge_policy(policy)
         assert bridge['strict_family_agreement'] == (name == 'sam_strict')
         assert bridge['kind'] == ('permissive' if name == 'sam_raw_candidates' else 'conservative')
         assert bridge['strict_containment'] is False

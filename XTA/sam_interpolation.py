@@ -28,6 +28,7 @@ from typing import Any
 import numpy as np
 from .sam_resources import sam_worker_count
 from .artifact_archive import split_reference, read_member, artifact_directory
+from .env_flags import env_flag
 from .json_publication import write_json_atomic
 
 
@@ -563,17 +564,12 @@ def _tiled_tracker_requests(jobs, groups, observations, cancel_event, resource_p
         del seed
 
 
-_PREPARED_TRACKER_SOURCE_SEAL = object()
-
-
 class _PreparedTrackerSource:
     """Finite approved jobs; only the established seed builder runs off-thread."""
 
     def __init__(self, prepared, items, groups, observations, cancel_event, profile,
-                 admission, request_order, *, _seal):
-        if _seal is not _PREPARED_TRACKER_SOURCE_SEAL:
-            raise TypeError('SAM production sources must be minted from a prepared plan')
-        self._seal, self.admission, self.profile = _seal, admission, profile
+                 admission, request_order):
+        self.admission, self.profile = admission, profile
         self.items, self.groups, self.observations = tuple(items), groups, observations
         self.cancel_event, self.request_order = cancel_event, request_order
         self.tiled = prepared.crop_mode == 'tiled'
@@ -611,8 +607,7 @@ class _PreparedTrackerSource:
 
 def _is_prepared_tracker_source(source, admission):
     return (isinstance(source, _PreparedTrackerSource)
-        and source._seal is _PREPARED_TRACKER_SOURCE_SEAL and source.admission is admission
-        and source.profile is admission._profile)
+        and source.admission is admission and source.profile is admission._profile)
 
 
 def _prepared_tracker_source(prepared, items, groups, observations, cancel_event,
@@ -638,7 +633,7 @@ def _prepared_tracker_source(prepared, items, groups, observations, cancel_event
         raise SamInterpolationInfrastructureError('SAM producer source changed its sealed observation owners')
     admission._validate_producer()
     return _PreparedTrackerSource(prepared, items, groups, observations, cancel_event, resource_profile,
-        admission, request_order, _seal=_PREPARED_TRACKER_SOURCE_SEAL)
+        admission, request_order)
 
 
 def _tracker_request_stream(prepared, items, groups, observations, cancel_event, profile, admission):
@@ -1601,8 +1596,7 @@ def _publication_reader_allowance(bundle, resource_profile) -> int:
     masks and filter results only; published planes are identical at any size.
     Set YOLO_TTA_SAM_PUBLICATION_READER_LIVE_CREDIT=0 to keep the legacy size.
     """
-    if resource_profile is None or os.environ.get(
-            'YOLO_TTA_SAM_PUBLICATION_READER_LIVE_CREDIT', '1').strip().lower() in {'0', 'false', 'no', 'off'}:
+    if resource_profile is None or not env_flag('YOLO_TTA_SAM_PUBLICATION_READER_LIVE_CREDIT', True):
         return _PUBLICATION_READER_BYTES
     from .sam_evidence import SamEvidenceBundle
     if type(bundle) is not SamEvidenceBundle:
@@ -1677,8 +1671,7 @@ class _PublicationFrameLookup:
     def owner_frames(self, frame, direction):
         frame = int(frame)
         direction = None if direction is None else int(direction)
-        # Per-frame lookups perform no file I/O. Publication checks the cyclic
-        # helper source when each cyclic direction starts and before finalizing.
+        # Per-frame lookups perform no file I/O.
         for run_id, group, frames, sign, addresses, native_shape in self.owners:
             if direction is not None and sign != direction:
                 continue
@@ -1768,13 +1761,8 @@ def _unindexed_publication_owner_frames(bundle, receipt, frame, shape_yx, direct
 
 def selected_sam_plane(bundle: object, receipt: Mapping[str, object], frame: int,
                        shape_yx: tuple[int, int], *, direction: int | None = None,
-                       _records=None, _lookup=None, _cyclic_source_checked=False) -> np.ndarray:
-    """Rebuild a selected native plane from owners, preserving shared voxels.
-
-    A public call checks the cyclic helper source once before its first folded
-    crop. Publication passes ``_cyclic_source_checked`` because it checks at its
-    own direction boundaries instead of once per frame.
-    """
+                       _records=None, _lookup=None) -> np.ndarray:
+    """Rebuild a selected native plane from owners, preserving shared voxels."""
     from .sam_mask_reader import effective_candidate_mask
     groups, runs = ((_records_by_id(bundle.groups, "group_id"), _records_by_id(bundle.runs, "run_id"))
                     if _records is None else _records)
@@ -1792,10 +1780,6 @@ def selected_sam_plane(bundle: object, receipt: Mapping[str, object], frame: int
         bbox = tuple(map(int, group['context_bbox_yx']))
         if address is not None:
             from .sam_cyclic import address_for_unfolded_index, transform_crop_between_frame_addresses
-            if not _cyclic_source_checked:
-                from .sam_cyclic import assert_cyclic_implementation_unchanged
-                assert_cyclic_implementation_unchanged()
-                _cyclic_source_checked = True
             target = address_for_unfolded_index(int(frame), native_shape[0],
                 period_degrees=group['frame_addressing']['period_degrees'])
             crop, bbox = transform_crop_between_frame_addresses(crop, bbox, address, target, shape_yx[1])
@@ -1865,16 +1849,10 @@ def _publish_directions_with_reader(bundle: object, receipt: Mapping[str, object
             directional_run_ids = [str(identifier) for identifier in (selection_view or receipt).get("selected_run_ids", ())
                                    if runs[str(identifier)]["direction"] in (sign, direction)]
             active_frames_set = set()
-            cyclic_direction = False
             for identifier in directional_run_ids:
                 group = groups[str(runs[identifier]["group_id"])]
                 addresses = None
                 if group.get("frame_addressing"):
-                    if not cyclic_direction:
-                        # Direction-start boundary for every folded crop below.
-                        from .sam_cyclic import assert_cyclic_implementation_unchanged
-                        assert_cyclic_implementation_unchanged()
-                        cyclic_direction = True
                     addresses = _publication_frame_addresses(bundle, group)
                 branch = receipt.get('branch_selection')
                 if branch is not None:
@@ -1911,7 +1889,7 @@ def _publish_directions_with_reader(bundle: object, receipt: Mapping[str, object
                             writer.consume_empty_range(next_unwritten, frame - next_unwritten)
                         plane = selected_sam_plane(bundle, selection_view or receipt, frame, shape[1:],
                             direction=sign, _records=((bundle.groups, bundle.runs) if _lookup is not None else (groups, runs)),
-                            _lookup=_lookup, _cyclic_source_checked=cyclic_direction)
+                            _lookup=_lookup)
                         # The write contract is additive. Guard this invariant again
                         # at publication in case a corrupt/custom evidence writer errs.
                         if np.any(plane & (np.asarray(observations[frame]) != 0)):
@@ -1936,10 +1914,6 @@ def _publish_directions_with_reader(bundle: object, receipt: Mapping[str, object
                     if next_unwritten < shape[0]:
                         writer.consume_empty_range(next_unwritten, shape[0] - next_unwritten)
                     _check_cancelled(cancel_event)
-                    if cyclic_direction:
-                        # Closing boundary: no folded store finalizes after a change.
-                        from .sam_cyclic import assert_cyclic_implementation_unchanged
-                        assert_cyclic_implementation_unchanged()
                     store_meta = writer.finalize()
                     store_meta.update(sam_selection_identity=str(receipt.get('selection_identity', '')),
                         sam_selection_resources=_plain(receipt.get('selection_resources', {})))

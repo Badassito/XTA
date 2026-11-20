@@ -27,7 +27,7 @@ from .config import (
     parse_spherical_min_radius,
     resolve_tilted_view_groups,
 )
-from .unification.tiles import ResolvedTileGroup, resolve_tile_groups
+from .unification.tiles import TileConfig, resolve_tile_groups
 
 
 PTA_SAVE_OPTION_TOKENS: Tuple[str, ...] = (
@@ -63,7 +63,7 @@ class PreprocessingRequest:
     enable_2d_hole_fill: bool = False
 
 
-TileRequest = ResolvedTileGroup
+TileRequest = TileConfig
 
 
 @dataclass(frozen=True)

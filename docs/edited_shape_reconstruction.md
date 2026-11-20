@@ -13,14 +13,21 @@ preview, with axis distances measured in native voxel units. It linearly samples
 that field at native voxel centers using `(j + 0.5) * L / H - 0.5`. Foreground
 requires both a positive field and membership in an edited foreground cell.
 This second condition limits smoothing to the inside of the edited shape:
-no foreground may enter an edited background cell. A one-cell background border
-handles volume boundaries. No binary dilation, native-component watershed, or
-largest-object selection is applied.
+no foreground may enter an edited background cell. Each edited foreground cell
+also keeps the native voxel nearest its center, the voxel the audit samples.
+Linear interpolation alone can erase it at convex corners and isolated cells on
+low-ratio grids, and at every outward corner at exactly 2x.
+A one-cell background border handles volume boundaries. No binary dilation,
+native-component watershed, or largest-object selection is applied.
 
 The written NRRD is read back before publication. Validation checks its binary
 payload, count and hashes, every edited voxel center, exclusion of edited
 background cells, and equality of the edited/native six-connected foreground
-component counts. A failed check prevents publication. The background-cell
+component counts. A failed check prevents publication. The receipt key
+`reconstruction.retained_center_voxels` counts voxels kept only by the
+center rule above (0 means interpolation reproduced every center). The remaining
+numerical refusals come from thin connections whose component count changes;
+payload integrity checks still apply. The background-cell
 constraint prevents new foreground paths across edited background; together
 with retained centers and equal component counts, it preserves correspondence
 between foreground components without merging, splitting or dropping them.

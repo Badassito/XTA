@@ -101,8 +101,8 @@ must cover the full future parent-pool capacity plus outstanding staging debt
 and the requested grant. Emergency parent reservations and image staging remain
 mutually exclusive. If optional credit is unavailable, synchronous mandatory
 work uses the image budget already owned by its parent. Image credit cannot
-authorize an SDK wave. Initial interpolation and single-cohort extrapolation
-use lexical image leases. Cache funding survives cancellation, failed startup
+authorize an SDK wave. Single-cohort interpolation and extrapolation use
+lexical image leases. Cache funding survives cancellation, failed startup
 and unproven worker, mmap or file retirement until settlement. Different
 mandatory parents can reuse donor pixels through bounded pins, but cannot extend
 the donor cache's funded lifetime with a borrowed lease. Independently funded
@@ -258,8 +258,8 @@ capacity to the transient pool without increasing their combined ceiling. The
 dense floor retains the inference allowance, the original CPU-input cache budget
 and two allocations of the largest full parent in the actual task inventory, and is
 never below twice the inference allowance. Individual memory charges are unchanged.
-Policy groups, tiles, CPU/hybrid detectors, retained temporary output, explicit
-dense/transient overrides and existing resource owners keep the previous split.
+Policy groups, tiles, CPU/hybrid detectors, explicit dense/transient overrides
+and existing resource owners keep the previous split.
 `sam.parent_memory_partition` records the resolved split and its inputs. This can
 admit more parent preparation; it does not guarantee that every configured parent
 fits concurrently or that dense capacity cannot become the next constraint.
@@ -383,23 +383,25 @@ off.
 Resource-grant eligibility and per-session acceptance keep their physical-device
 policy. Separate authenticated `execution_slots` can increase concurrency only
 within the same owned CPU-wave bytes; uncredited legacy calls retain their old
-physical-device cap. When both view classes are ready, the scheduler gives curved
-scopes three submissions per cheap-view submission. Inside the chosen class,
-three of every four contested submissions go to the ready scope with the largest
-native view (T*Y*X of its image cache); the fourth keeps the round-robin pick, so
-no continuously ready scope starves. Large Azimuthal and Cartesian views carry
-the longest serial selection, publication and extrapolation chains, so starting
-their SAM work early keeps those chains from running after every GPU job is done.
-Equal sizes keep plain round robin. `YOLO_TTA_SAM_LARGEST_VIEW_FIRST=0` restores
-round robin inside each class. If only one class can run it proceeds immediately;
-unclassified callers retain ordinary round robin. Actual geometry family comes from the producer
-context, without changing scientific request metadata or run IDs. Dispatch fills idle
-physical GPUs before second slots, then uses advisory slot-local crop affinity.
-Slot index, PID and attempt are checked independently of scientific model identity.
-Evidence commits retain
-stable run IDs, lineage, selection, and directional pixels despite out-of-order
-worker completion. Packed bundle offsets, checksums, and timings can differ
-between fresh generation attempts.
+physical-device cap. When only curved and cheap scopes are ready and both classes
+are present, the scheduler gives curved scopes three submissions per cheap-view
+submission. Among the candidates (the chosen class, or every ready scope when one
+class is alone or an unclassified scope is ready), three of every four contested
+submissions go to the ready scope with the largest native view (T*Y*X of its
+image cache); the fourth keeps the round-robin pick, so no continuously ready
+scope starves. Large Azimuthal and Cartesian views carry the longest serial
+selection, publication and extrapolation chains, so starting their SAM work
+early keeps those chains from running after every GPU job is done. Equal sizes
+keep plain round robin. `YOLO_TTA_SAM_LARGEST_VIEW_FIRST=0` restores plain round
+robin. If only one class can run it proceeds immediately. A ready unclassified
+scope suspends the curved/cheap turn, but the largest-view rule still applies to
+it. Actual geometry family comes from the producer context, without changing
+scientific request metadata or run IDs. Dispatch fills idle physical GPUs before
+second slots, then uses advisory slot-local crop affinity. Slot index, PID and
+attempt are checked independently of scientific model identity. Evidence commits
+retain stable run IDs, lineage, selection, and directional pixels despite
+out-of-order worker completion. Packed bundle offsets, checksums, and timings
+can differ between fresh generation attempts.
 
 Group evidence is written as results arrive when its estimated contract/packing
 and tiled-assembly scratch fits beside the unchanged CPU inference wave in owned
@@ -563,7 +565,7 @@ are not selected as the parallel fallback. Chunks that do not shrink stay raw.
 Encoder resolution is cached per process, including unavailable optional imports;
 a bounded CPU roundtrip proves the selected encoder before use. Explicit `zlib`
 in the Python API retains the standard-library baseline. The root is fresh per run
-and retires with run-scratch cleanup under the existing keep-temp semantics.
+and retires with run-scratch cleanup.
 Opening an initialized store validates the header and identity without taking
 the schema-creation write lock. Actual packet publication remains transactional;
 parallel encoders do not hold that lock while compressing.
@@ -641,7 +643,7 @@ scratch. Results yield in original order. One owner remaps, copies
 and publishes the crops; cancellation joins outstanding jobs before releasing
 source ownership. Tight budgets use the serial CPU path.
 CPU Azimuthal and tilted-Azimuthal cohorts (for example after
-`streamed_endpoint_processing_cube_not_materialized`) without donor caches
+`unsupported_unmaterialized_source_xy_resize`) without donor caches
 prepare records on the same bounded pool. Each job runs the serial route's
 full native plane sampler and unchanged canonical remap (default remap budget)
 for exactly the rectangles the ordered plan leaves missing after earlier
@@ -754,9 +756,9 @@ trimming. Ordinary renderer retirement still releases the source, fences work,
 collects garbage and releases allocator caches; failure, cancellation and
 unproven retirement keep the full cleanup path.
 Ready materialized processing cubes, including streaming-preprocessing outputs,
-are used directly. Unmaterialized streaming cubes keep CPU preparation to retain
-their endpoint-aligned temporal grid; the GPU virtual native-T path is used only
-for the matching nonstreaming center-aligned recipe.
+are used directly. Streaming and eager cubes share the center-aligned temporal
+grid, so unmaterialized T-only cubes of either kind may use the GPU virtual
+native-T path; XY-resizing cubes keep CPU preparation.
 
 GPU-selected Radial cohorts upload only the conservative native-time slab needed
 by their frozen radius inventory and full native patch. Bounds include every

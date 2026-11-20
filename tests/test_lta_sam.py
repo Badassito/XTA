@@ -756,53 +756,6 @@ class LtaSamBoundaryTests(unittest.TestCase):
             )
         self.assertTrue(stream.closed)
 
-    def test_image_frame_uses_xywh_exemplar_and_shared_conf(self) -> None:
-        from XTA.lta_sam import SamPromptBox, run_image_frame
-
-        class FakeProcessor:
-            def __init__(self) -> None:
-                self.threshold = None
-                self.box = None
-
-            def set_confidence_threshold(self, value):
-                self.threshold = value
-
-            def set_image(self, image):
-                return {"image": image}
-
-            def add_geometric_prompt(self, *, box, label, state):
-                self.box = list(box)
-                self.asserted_label = label
-                return {
-                    **state,
-                    "scores": [0.6],
-                    "masks": np.asarray([[[[True]]]], dtype=bool),
-                }
-
-        processor = FakeProcessor()
-        prompt = SamPromptBox(
-            exemplar_id="positive",
-            frame_index=5,
-            xywh=(0.1, 0.2, 0.4, 0.6),
-        )
-
-        predictions = run_image_frame(
-            processor,
-            image=object(),
-            sequence_id="sagittal__tta_a0",
-            frame_index=5,
-            prompt=prompt,
-            conf=0.15,
-        )
-
-        self.assertEqual(processor.threshold, 0.15)
-        for actual, expected in zip(processor.box, [0.3, 0.5, 0.4, 0.6]):
-            self.assertAlmostEqual(actual, expected)
-        self.assertTrue(processor.asserted_label)
-        self.assertEqual(predictions[0].object_id, 0)
-        self.assertEqual(predictions[0].frame_index, 5)
-        self.assertEqual(tuple(predictions[0].binary_mask.shape), (1, 1))
-
     def test_video_output_rejects_multiplex_overflow(self) -> None:
         from XTA.lta_sam import normalize_video_frame_output
 

@@ -455,7 +455,7 @@ def predict_policy_source(model: Any, source: Any, *, task: dict[str, Any], cfg:
                             (batch_start + j, spec, seeds[j], replay[j])
                             for j, spec in enumerate(original_specs) if spec is not None
                         ])
-                batch = GpuPrefetchedYoloBatch(original_batch, gpu_tensor=active_tensor, source_label=str(sibling['view'].name))
+                batch = GpuPrefetchedYoloBatch(original_batch, gpu_tensor=active_tensor)
                 local_source = PolicyTensorBatchSource(batch=batch, paths=paths, info=info, specs=local_specs,
                                                        real_count=real_count, name=str(sibling['view'].name), replay=replay)
                 local_source._tta_announce_prediction = batch_start == 0

@@ -80,8 +80,8 @@ def main():
     rng = np.random.default_rng(160381)
     for model_side, restricted in ((256, False), (2048, True)):
         for base in ('transverse', 'sagittal', 'coronal'):
-            # The full-frame256 model fixture keeps all physical trajectory
-            # frames independent. The2048 fixture admits128independent frames,
+            # The full-frame 256 model fixture keeps all physical trajectory
+            # frames independent. The 2048 fixture admits 128 independent frames,
             # preserving production affine/coordinates on a central trajectory.
             view = next(v for v in geometry._build_tilted_view_infos(*work,
                 tilt_views=(base,), tilt_angles=(30.,), tilt_directions=('vertical',))

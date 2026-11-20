@@ -156,7 +156,7 @@ class PtaWorkerBudgetTests(unittest.TestCase):
         wrapper = extracted_function('_plan_volume', namespace)
         self.assertEqual(wrapper(0)['budget'], (0, 64))
         self.assertEqual(affinity.call_args.args[0], ALLOWED)
-        progress[0] = SimpleNamespace(pending_a=1, pending_b=0)
+        progress[0] = SimpleNamespace(pending_a=1)
         self.assertEqual(wrapper(1)['budget'], (1, 64))
         self.assertEqual(affinity.call_args.args[0], budget.planning_cpu_order)
         progress[0].pending_a = 0

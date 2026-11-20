@@ -82,7 +82,7 @@ any forced label resizing.
 
 ## Guides
 
-- [v25.0.0 options and migration](docs/topology_and_cpr.md)
+- [Topology options, 2D hole filling and centerline views](docs/topology_and_cpr.md)
 - [SAM interpolation and extrapolation](docs/sam_interpolation.md)
 - [Dynamic LTA crops](docs/lta_dynamic_crops.md)
 - [PTA centerline cross-sections](docs/pta_cpr.md)

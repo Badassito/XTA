@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from XTA import pta, pta_inputs
-from XTA.media import _endpoint_aligned_nearest_source_indices as nearest
+from XTA.pta_inputs import _force_fit_nearest_source_indices as nearest
 
 
 def gather_plane(source, target_yx):

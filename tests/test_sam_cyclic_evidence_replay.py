@@ -7,8 +7,9 @@ import pytest
 
 from XTA.sam_cyclic import build_cyclic_frame_addressing, address_for_unfolded_index
 from XTA.sam_evidence import (SamEvidenceWriter, SamEvidenceBundle, iter_selected_planes,
-    iter_selected_native_crops, native_output_shape_tyx, selected_native_plane, fingerprint)
-from XTA.sam_policy import select_sam_proposals, replay_sam_proposals
+    iter_selected_native_crops, native_output_shape_tyx, selected_native_plane, fingerprint,
+    evidence_frame_geometry)
+from XTA.sam_policy import select_sam_proposals
 from XTA.sam_replay import replay_sam_directional_nrrds
 
 
@@ -98,26 +99,22 @@ def test_native_replay_nrrds_fold_aliases_and_retain_projection_metadata(tmp_pat
 def test_packed_replay_index_uses_native_coordinates_and_saved_aliases(tmp_path,monkeypatch,period):
     bundle=bundle_at(tmp_path,period=period)
     monkeypatch.setenv('YOLO_TTA_SAM_CROP_MODE','tiled')
-    replay=replay_sam_proposals(bundle,tmp_path/'packed',policy={'sam_bridge_policy':'permissive'})
-    output=replay['replay_outputs']
-    assert output['diagnostic_coordinate_space']=='view_native_crop'
-    assert output['native_shape_tyx']==[4,12,16]
-    assert output['frame_addressing']['period_degrees']==period
+    replay=select_sam_proposals(bundle,policy={'sam_bridge_policy':'permissive'})
+    geometry=evidence_frame_geometry(bundle)
+    assert native_output_shape_tyx(bundle)==(4,12,16)
+    assert geometry['addressing']['period_degrees']==period
     assembled=np.zeros((4,12,16),np.uint8)
-    rows=output['packed_plane_index']
-    assert len({row['key'] for row in rows})==len(rows)
-    with np.load(tmp_path/'packed'/'selected_planes.npz') as packed:
-        for row in rows:
-            if row['direction']!='forward':
-                continue
-            mask=np.unpackbits(packed[row['key']],bitorder='little',
-                count=int(np.prod(row['shape']))).reshape(row['shape'])
-            y0,x0,y1,x1=row['context_bbox_yx']
-            assembled[row['native_frame'],y0:y1,x0:x1]|=mask
-    alias=next(row for row in rows if row['stored_unfolded_frame']==4)
-    assert alias['native_frame']==0
-    assert alias['stored_frame_address']==dict(address_for_unfolded_index(4,4,period_degrees=period))
-    assert alias['stored_unfolded_bbox_yx']==[2,1,10,9]
+    rows=[(direction,)+row for direction in ('forward','backward')
+          for row in iter_selected_native_crops(bundle,replay,direction=direction)]
+    assert len({row[:3] for row in rows})==len(rows)
+    for direction,group_id,stored_frame,native_frame,bbox,mask in rows:
+        if direction=='forward':
+            y0,x0,y1,x1=bbox
+            assembled[native_frame,y0:y1,x0:x1]|=mask
+    alias=next(row for row in rows if row[2]==4)
+    assert alias[3]==0
+    assert dict(geometry['groups'][alias[1]]['addresses'][4])==dict(address_for_unfolded_index(4,4,period_degrees=period))
+    assert list(bundle.groups[alias[1]]['context_bbox_yx'])==[2,1,10,9]
     expected=np.stack([selected_native_plane(bundle,replay,frame,direction='forward') for frame in range(4)])
     np.testing.assert_array_equal(assembled,expected)
     bundle.assert_unchanged()
@@ -171,33 +168,25 @@ def test_valid_bundle_checksums_cannot_hide_mask_frame_alias_corruption(tmp_path
         SamEvidenceBundle.open(bundle.directory)
 
 
-def test_cached_cyclic_geometry_checks_loaded_helper_source_at_boundaries(tmp_path,monkeypatch):
-    # The cached geometry accessor is I/O free (it sits on per-pair paths);
-    # opening, selecting, traversing and rebuilding planes are the boundaries.
-    from XTA import sam_cyclic
-    bundle = bundle_at(tmp_path)
-    receipt = select_sam_proposals(bundle,policy={'sam_bridge_policy':'permissive'})
-    changed = tmp_path/'changed_helper.py'
-    changed.write_bytes(sam_cyclic._SOURCE_PATH.read_bytes()+b'\n# changed after import\n')
-    monkeypatch.setattr(sam_cyclic,'_SOURCE_PATH',changed)
-    assert native_output_shape_tyx(bundle)==(4,12,16)
-    message = 'cyclic.*changed|Cyclic.*changed'
-    with pytest.raises(RuntimeError,match=message):
-        SamEvidenceBundle.open(bundle.directory)
-    with pytest.raises(RuntimeError,match=message):
-        list(iter_selected_planes(bundle,receipt))
-    with pytest.raises(RuntimeError,match=message):
-        list(iter_selected_native_crops(bundle,receipt))
-    with pytest.raises(RuntimeError,match=message):
-        selected_native_plane(bundle,receipt,0)
-    with pytest.raises(RuntimeError,match=message):
-        bundle_at(tmp_path/'fresh')
-
-
 def test_saved_helper_identity_cannot_silently_reinterpret_addresses(tmp_path):
     with pytest.raises(ValueError,match='implementation identity'):
         bundle_at(tmp_path,mapping_mutation=lambda scope,group:
             scope.update(cyclic_implementation_sha256='different-helper'))
+
+
+def test_qualified_previous_helper_identity_stays_readable(tmp_path):
+    from XTA import sam_cyclic
+    previous = 'f65c83b547ec3b434eb0d25555685a022089984f9d7b76e5a79531d9c446f9bd'  # v25.0.3-v26.0.1
+    assert previous in sam_cyclic.QUALIFIED_IMPLEMENTATIONS and previous != sam_cyclic.IMPLEMENTATION_SHA256
+    bundle = bundle_at(tmp_path/'previous',mapping_mutation=lambda scope,group:
+        scope.update(cyclic_implementation_sha256=previous))
+    reopened = SamEvidenceBundle.open(bundle.directory)
+    assert reopened.scope['cyclic_implementation_sha256'] == previous
+    receipt = select_sam_proposals(reopened,policy={'sam_bridge_policy':'permissive'})
+    assert receipt['selected_run_ids'] == ['forward']
+    with pytest.raises(ValueError,match='differs from saved evidence'):
+        bundle_at(tmp_path/'unknown',mapping_mutation=lambda scope,group:
+            scope.update(cyclic_implementation_sha256='0'*64))
 
 
 def test_effective_radius_filtering_is_applied_before_native_fold(tmp_path):

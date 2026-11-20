@@ -377,12 +377,19 @@ def test_capture_reaches_real_pipeline_gpu_task_inventory_without_sam(tmp_path, 
     monkeypatch.setenv('YOLO_TTA_GPU_WORKER_CPU', '1')
     monkeypatch.setattr(pipeline, '_pin_cuda_visible_device_token', lambda index: '-1')
     monkeypatch.setattr(pipeline, 'plan_gpu_feeder_core_reservations', lambda tokens: [[]])
+    affinity_calls = []
+    if mode == 'sdf_disabled':
+        # A host that cannot express flat CPU masks (multi-group Windows) runs unpinned: even a
+        # non-empty feeder plan must not reach the fail-fast parent mask.
+        monkeypatch.setattr(pipeline, 'cpu_affinity_unavailable_reason', lambda: 'test host cannot pin')
+        monkeypatch.setattr(pipeline, 'plan_gpu_feeder_core_reservations', lambda tokens: [[0]])
+        monkeypatch.setattr(pipeline, '_sched_setaffinity_all_threads',
+                            lambda cpus: affinity_calls.append(list(cpus)) or False)
     monkeypatch.setattr(pipeline, 'plan_gpu_worker_affinity', lambda *args, **kwargs: [None])
     monkeypatch.setattr(pipeline.mp, 'get_context', lambda kind: SimpleNamespace(
         Queue=queue.Queue, Process=lambda **kwargs: IdleWorker()))
     monkeypatch.setattr(pipeline, 'ffprobe_info', lambda path: dict(
         width=32, height=32, num_frames=16, fps=10.))
-    monkeypatch.setattr(pipeline, '_cube_t_axis_resize_backend', lambda: 'slab')
     cubes = []
     original_cube = pipeline.LazyProcessingCube
 
@@ -433,6 +440,7 @@ def test_capture_reaches_real_pipeline_gpu_task_inventory_without_sam(tmp_path, 
         with pytest.raises(StartupReached, match='real task inventory reached'):
             pipeline.main()
         assert reached
+        assert not affinity_calls
         gc.collect()
         pipeline._cleanup_tta_selected_run_scratch(temp_dir=tmp_path / 'original-output' / 'temp',
             out_dir=tmp_path / 'original-output')

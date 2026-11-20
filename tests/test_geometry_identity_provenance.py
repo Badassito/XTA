@@ -13,11 +13,11 @@ from XTA import geometry as g, pta, workers
 from XTA.config import resolve_azimuthal_view_requests, resolve_tilted_view_groups
 from XTA.lta_config import parse_lta_args
 from XTA.lta_inputs import LtaInputDiscovery, LtaVolumeSpec, SourceRole, VolumeClass
-from XTA.lta_rendering import build_lta_rendered_view
 from XTA.lta_runtime import build_lta_run_plan
 from XTA.unification.geometry_identity import physical_view_recipe
 from XTA.unification.runtime import compile_physical_views
 from XTA.unification.sampling import raster_plan_from_spawn_spec, raster_plan_spawn_spec
+from tests.reference_backends.lta_rendering import build_lta_rendered_view
 
 
 def _physical(*, shape=(16, 16, 16), sweep=None):
@@ -28,9 +28,9 @@ def _physical(*, shape=(16, 16, 16), sweep=None):
     ).views[0]
 
 
-def _item(physical, root):
+def _item(physical):
     view = g.expand_views_into_tta_variants((physical,), (0,))[0]
-    job = g.build_aug_job_for_variant(view, 16, root)
+    job = g.build_aug_job_for_variant(view, 16)
     return view, job, g.build_fullframe_raster_plan(view, job)
 
 
@@ -40,88 +40,80 @@ def _task(plan, view, job, *, kind="fullframe"):
 
 class GeometryIdentityProvenanceTests(unittest.TestCase):
     def test_public_sweep_changes_pixels_digest_and_worker_guard(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            items = [_item(_physical(sweep=step), root) for step in (30, 31)]
-            volume = np.random.default_rng(777).integers(0, 256, (16, 16, 16), dtype=np.uint8)
-            frames = [g.render_fullframe_frame_for_job(volume_rgb=volume, view=v, job=j, frame_idx=1)
-                      for v, j, plan in items]
-            self.assertGreater(np.count_nonzero(frames[0] != frames[1]), 0)
-            self.assertNotEqual(items[0][2].digest, items[1][2].digest)
-            for view, job, plan in items:
-                rebuilt = g.build_fullframe_raster_plan(view, job)
-                accepted = workers._canonical_raster_plan_for_task(_task(rebuilt, view, job))
-                self.assertEqual(accepted.digest, plan.digest)
-            with self.assertRaisesRegex(RuntimeError, "provenance does not match"):
-                workers._canonical_raster_plan_for_task(_task(items[0][2], items[1][0], items[1][1]))
+        items = [_item(_physical(sweep=step)) for step in (30, 31)]
+        volume = np.random.default_rng(777).integers(0, 256, (16, 16, 16), dtype=np.uint8)
+        frames = [g.render_fullframe_frame_for_job(volume_rgb=volume, view=v, job=j, frame_idx=1)
+                  for v, j, plan in items]
+        self.assertGreater(np.count_nonzero(frames[0] != frames[1]), 0)
+        self.assertNotEqual(items[0][2].digest, items[1][2].digest)
+        for view, job, plan in items:
+            rebuilt = g.build_fullframe_raster_plan(view, job)
+            accepted = workers._canonical_raster_plan_for_task(_task(rebuilt, view, job))
+            self.assertEqual(accepted.digest, plan.digest)
+        with self.assertRaisesRegex(RuntimeError, "provenance does not match"):
+            workers._canonical_raster_plan_for_task(_task(items[0][2], items[1][0], items[1][1]))
 
     def test_public_source_shape_and_actual_affine_are_bound(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            a = _item(_physical(), root)
-            b = _item(_physical(shape=(16, 20, 18)), root)
-            self.assertNotEqual(a[2].digest, b[2].digest)
-            with self.assertRaisesRegex(RuntimeError, "provenance does not match"):
-                workers._canonical_raster_plan_for_task(_task(a[2], b[0], b[1]))
-            forward = a[1].aff.M_src_to_out.copy()
-            forward[0, 2] += np.float32(1)
-            transform = np.eye(3, dtype=np.float64)
-            transform[:2] = forward
-            affine = dataclasses.replace(a[1].aff, M_src_to_out=forward,
-                                         M_out_to_src=np.linalg.inv(transform)[:2].astype(np.float32))
-            job = dataclasses.replace(a[1], aff=affine)
-            changed = g.build_fullframe_raster_plan(a[0], job)
-            self.assertNotEqual(a[2].digest, changed.digest)
-            volume = np.random.default_rng(8).integers(0, 256, (16, 16, 16), dtype=np.uint8)
-            before = g.render_fullframe_frame_for_job(volume_rgb=volume, view=a[0], job=a[1], frame_idx=1)
-            after = g.render_fullframe_frame_for_job(volume_rgb=volume, view=a[0], job=job, frame_idx=1)
-            self.assertGreater(np.count_nonzero(before != after), 0)
-            with self.assertRaisesRegex(RuntimeError, "provenance does not match"):
-                workers._canonical_raster_plan_for_task(_task(a[2], a[0], job))
+        a = _item(_physical())
+        b = _item(_physical(shape=(16, 20, 18)))
+        self.assertNotEqual(a[2].digest, b[2].digest)
+        with self.assertRaisesRegex(RuntimeError, "provenance does not match"):
+            workers._canonical_raster_plan_for_task(_task(a[2], b[0], b[1]))
+        forward = a[1].aff.M_src_to_out.copy()
+        forward[0, 2] += np.float32(1)
+        transform = np.eye(3, dtype=np.float64)
+        transform[:2] = forward
+        affine = dataclasses.replace(a[1].aff, M_src_to_out=forward,
+                                     M_out_to_src=np.linalg.inv(transform)[:2].astype(np.float32))
+        job = dataclasses.replace(a[1], aff=affine)
+        changed = g.build_fullframe_raster_plan(a[0], job)
+        self.assertNotEqual(a[2].digest, changed.digest)
+        volume = np.random.default_rng(8).integers(0, 256, (16, 16, 16), dtype=np.uint8)
+        before = g.render_fullframe_frame_for_job(volume_rgb=volume, view=a[0], job=a[1], frame_idx=1)
+        after = g.render_fullframe_frame_for_job(volume_rgb=volume, view=a[0], job=job, frame_idx=1)
+        self.assertGreater(np.count_nonzero(before != after), 0)
+        with self.assertRaisesRegex(RuntimeError, "provenance does not match"):
+            workers._canonical_raster_plan_for_task(_task(a[2], a[0], job))
 
     def test_dense_tile_binds_physical_sweep_and_actual_transform(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            tiles = []
-            for step in (30, 31):
-                view, job, plan = _item(_physical(sweep=step), root)
-                tile = g.build_dense_tile_jobs_for_aug(view, job, g.TileConfig(8, 8, "tiles8"), 8, root)[0]
-                plan = g.build_dense_tile_raster_plan(view, tile)
-                tiles.append((view, tile, plan))
-                accepted = workers._canonical_raster_plan_for_task(_task(plan, view, tile, kind="tile"))
-                self.assertEqual(accepted.digest, plan.digest)
-            self.assertNotEqual(tiles[0][2].digest, tiles[1][2].digest)
-            with self.assertRaisesRegex(RuntimeError, "provenance does not match"):
-                workers._canonical_raster_plan_for_task(_task(tiles[0][2], tiles[1][0], tiles[1][1], kind="tile"))
-            matrix = tiles[0][1].M_out_to_src.copy()
-            matrix[0, 2] += 1
-            changed = dataclasses.replace(tiles[0][1], M_out_to_src=matrix)
-            self.assertNotEqual(g.build_dense_tile_raster_plan(tiles[0][0], changed).digest, tiles[0][2].digest)
+        tiles = []
+        for step in (30, 31):
+            view, job, plan = _item(_physical(sweep=step))
+            tile = g.build_dense_tile_jobs_for_aug(view, job, g.TileConfig(8, 8, "tiles8"), 8)[0]
+            plan = g.build_dense_tile_raster_plan(view, tile)
+            tiles.append((view, tile, plan))
+            accepted = workers._canonical_raster_plan_for_task(_task(plan, view, tile, kind="tile"))
+            self.assertEqual(accepted.digest, plan.digest)
+        self.assertNotEqual(tiles[0][2].digest, tiles[1][2].digest)
+        with self.assertRaisesRegex(RuntimeError, "provenance does not match"):
+            workers._canonical_raster_plan_for_task(_task(tiles[0][2], tiles[1][0], tiles[1][1], kind="tile"))
+        matrix = tiles[0][1].M_out_to_src.copy()
+        matrix[0, 2] += 1
+        changed = dataclasses.replace(tiles[0][1], M_out_to_src=matrix)
+        self.assertNotEqual(g.build_dense_tile_raster_plan(tiles[0][0], changed).digest, tiles[0][2].digest)
 
     def test_plan_snapshots_mutable_matrices_and_ignores_presentation_fields(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            view, job, plan = _item(_physical(), Path(temporary))
-            old_record = plan.canonical_record()
-            job.aff.M_src_to_out[0, 2] += 1
-            self.assertEqual(plan.canonical_record(), old_record)
-            self.assertNotEqual(g.build_fullframe_raster_plan(view, job).digest, plan.digest)
-            cosmetic = dataclasses.replace(view, display_name="changed display", summary_family="changed summary",
-                                             azimuthal_request_token="different request spelling")
-            self.assertEqual(physical_view_recipe(view), physical_view_recipe(cosmetic))
-            self.assertEqual(g.build_fullframe_raster_plan(view, job).digest,
-                             g.build_fullframe_raster_plan(cosmetic, job).digest)
+        view, job, plan = _item(_physical())
+        old_record = plan.canonical_record()
+        job.aff.M_src_to_out[0, 2] += 1
+        self.assertEqual(plan.canonical_record(), old_record)
+        self.assertNotEqual(g.build_fullframe_raster_plan(view, job).digest, plan.digest)
+        cosmetic = dataclasses.replace(view, display_name="changed display", summary_family="changed summary",
+                                         azimuthal_request_token="different request spelling")
+        self.assertEqual(physical_view_recipe(view), physical_view_recipe(cosmetic))
+        self.assertEqual(g.build_fullframe_raster_plan(view, job).digest,
+                         g.build_fullframe_raster_plan(cosmetic, job).digest)
 
     def test_historical_incomplete_plan_keeps_hash_but_fails_new_task_guard(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            view, job, plan = _item(_physical(sweep=30), Path(temporary))
-            historical = dataclasses.replace(plan, metadata={key: value for key, value in plan.metadata.items()
-                                                            if key not in {"physical_geometry", "affine_geometry"}})
-            restored = raster_plan_from_spawn_spec(raster_plan_spawn_spec(historical))
-            self.assertEqual(restored.digest, historical.digest)
-            self.assertEqual(restored.canonical_record(), historical.canonical_record())
-            self.assertNotEqual(historical.digest, plan.digest)
-            with self.assertRaisesRegex(RuntimeError, "provenance does not match"):
-                workers._canonical_raster_plan_for_task(_task(historical, view, job))
+        view, job, plan = _item(_physical(sweep=30))
+        historical = dataclasses.replace(plan, metadata={key: value for key, value in plan.metadata.items()
+                                                        if key not in {"physical_geometry", "affine_geometry"}})
+        restored = raster_plan_from_spawn_spec(raster_plan_spawn_spec(historical))
+        self.assertEqual(restored.digest, historical.digest)
+        self.assertEqual(restored.canonical_record(), historical.canonical_record())
+        self.assertNotEqual(historical.digest, plan.digest)
+        with self.assertRaisesRegex(RuntimeError, "provenance does not match"):
+            workers._canonical_raster_plan_for_task(_task(historical, view, job))
 
     def test_historical_high_precision_record_retains_recorded_hash(self):
         fixture = Path(__file__).parent / "fixtures" / "legacy_high_precision_raster_plan.json"
@@ -131,14 +123,13 @@ class GeometryIdentityProvenanceTests(unittest.TestCase):
         self.assertEqual(restored.digest, "69bbc9538d720c46a63f29e1f8760cfccaae76cd47b9ffdaf263f3864a8e3fbd")
         self.assertEqual(restored.canonical_record(), spec["plan"])
         self.assertEqual(restored.in_plane_variant.variant_id, "a12p3457")
-        with tempfile.TemporaryDirectory() as temporary:
-            physical = _physical()
-            view = g.expand_views_into_tta_variants((physical,), (12.345671,))[0]
-            job = g.build_aug_job_for_variant(view, 16, Path(temporary))
-            current = g.build_fullframe_raster_plan(view, job)
-            self.assertNotEqual(current.digest, restored.digest)
-            with self.assertRaisesRegex(RuntimeError, "provenance does not match"):
-                workers._canonical_raster_plan_for_task(_task(restored, view, job))
+        physical = _physical()
+        view = g.expand_views_into_tta_variants((physical,), (12.345671,))[0]
+        job = g.build_aug_job_for_variant(view, 16)
+        current = g.build_fullframe_raster_plan(view, job)
+        self.assertNotEqual(current.digest, restored.digest)
+        with self.assertRaisesRegex(RuntimeError, "provenance does not match"):
+            workers._canonical_raster_plan_for_task(_task(restored, view, job))
         spec["plan"]["in_plane_variant"]["variant_id"] = "a12p3456"
         spec["plan_digest"] = hashlib.sha256(json.dumps(spec["plan"], sort_keys=True, separators=(",", ":"),
                                                         ensure_ascii=True, allow_nan=False).encode("utf-8")).hexdigest()
@@ -185,15 +176,14 @@ class GeometryIdentityProvenanceTests(unittest.TestCase):
             self.assertNotEqual(plans[0].tile_layout[0].canonical_plan.digest, plans[1].tile_layout[0].canonical_plan.digest)
 
     def test_lta_reference_builder_binds_recipe_and_actual_affine(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            volume = np.random.default_rng(7).integers(0, 256, (16, 16, 16), dtype=np.uint8)
-            rendered = []
-            for step in (30, 31):
-                view, job, plan = _item(_physical(sweep=step), Path(temporary))
-                rendered.append(build_lta_rendered_view(volume, view, temp_dir=Path(temporary), output_size=16))
-            self.assertNotEqual(rendered[0].raster_plan.digest, rendered[1].raster_plan.digest)
-            self.assertGreater(np.count_nonzero(rendered[0].render_frame_rgb(1) != rendered[1].render_frame_rgb(1)), 0)
-            self.assertIn("affine_geometry", rendered[0].raster_plan.metadata)
+        volume = np.random.default_rng(7).integers(0, 256, (16, 16, 16), dtype=np.uint8)
+        rendered = []
+        for step in (30, 31):
+            view, job, plan = _item(_physical(sweep=step))
+            rendered.append(build_lta_rendered_view(volume, view, output_size=16))
+        self.assertNotEqual(rendered[0].raster_plan.digest, rendered[1].raster_plan.digest)
+        self.assertGreater(np.count_nonzero(rendered[0].render_frame_rgb(1) != rendered[1].render_frame_rgb(1)), 0)
+        self.assertIn("affine_geometry", rendered[0].raster_plan.metadata)
 
     def test_lta_production_planner_binds_stock_compiled_sweep(self):
         with tempfile.TemporaryDirectory() as temporary:

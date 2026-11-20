@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import tempfile
 from typing import Any, Mapping
+import warnings
 
 import numpy as np
 
@@ -176,6 +177,28 @@ def _reference(value: Any, packet: RegistrationPacket, role: str) -> dict[str, A
     return header
 
 
+def _axis_alignment(header: Mapping[str, Any]) -> dict[str, Any]:
+    """Report the canonical world axis that each stored reference axis follows.
+
+    XTA's own NRRD exports store movie column, row and frame along +X, +Y and +Z.
+    Other orientations can be valid scanner geometry, but they are also what a
+    reoriented or resampled copy looks like, so callers warn rather than reject.
+    """
+    linear = _geometry(header)[0][:3, :3]
+    unit = linear / np.linalg.norm(linear, axis=0)
+    dominant = np.argmax(np.abs(unit), axis=0)
+    stored = [
+        ("+" if unit[world, axis] > 0 else "-") + "XYZ"[world]
+        for axis, world in enumerate(dominant)
+    ]
+    oblique = not np.allclose(np.abs(unit[dominant, np.arange(3)]), 1.0, atol=1e-6)
+    return dict(
+        stored_axes_world=stored,
+        oblique=bool(oblique),
+        canonical=bool(stored == ["+X", "+Y", "+Z"] and not oblique),
+    )
+
+
 def _json_value(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return _json_value(value.tolist())
@@ -330,7 +353,9 @@ def transfer_nrrd_labelmap(
     Alternatively, ``source_grid_aligned=True`` asserts that a full-sized input
     already uses the native scan's exact index axes. A target reference supplies
     the output world geometry. Without one the output records the packet's
-    spacing in an unnamed local coordinate system at origin zero.
+    spacing in an unnamed local coordinate system at origin zero. A reference
+    whose stored axes do not follow +X, +Y, +Z is still used, with a warning;
+    the provenance JSON records each reference's path, header and axis alignment.
 
     Input and output payloads are streamed. Compressed input uses a temporary
     disk-backed array because an arbitrary rotation requires random access.
@@ -385,6 +410,7 @@ def transfer_nrrd_labelmap(
             raise ValueError(
                 "An explicitly aligned source labelmap must cover the full packet source grid"
             )
+        source_template = None
         native_to_label = np.eye(4)
     else:
         if source_grid_aligned:
@@ -403,6 +429,29 @@ def transfer_nrrd_labelmap(
         _reference(target_reference, packet, target_role) if target_reference is not None else None
     )
     geometry = _output_header(packet, target_role, target_template)
+    references = {}
+    for name, value, template, role in (
+        ("source", source_reference, source_template, source_role),
+        ("target", target_reference, target_template, target_role),
+    ):
+        if template is None:
+            references[name] = None
+            continue
+        alignment = _axis_alignment(template)
+        references[name] = dict(
+            path=None if isinstance(value, Mapping) else str(Path(value).resolve()),
+            header=_json_value(template),
+            axis_alignment=alignment,
+        )
+        if not alignment["canonical"]:
+            warnings.warn(
+                f"The {name} reference stores its axes as {', '.join(alignment['stored_axes_world'])}"
+                f"{' (oblique)' if alignment['oblique'] else ''}, not XTA's +X, +Y, +Z export "
+                f"layout. It must store the {role} movie's column, row and frame in native order; "
+                "a reoriented or resampled copy gives misplaced labels.",
+                UserWarning,
+                stacklevel=2,
+            )
     target_to_source = np.linalg.inv(packet.matrix(direction))
     target_to_label = native_to_label @ target_to_source
     source_mask, target_mask = packet.mask(source_role), packet.mask(target_role)
@@ -503,6 +552,8 @@ def transfer_nrrd_labelmap(
             target_native_to_source_native_xyz=target_to_source.tolist(),
             output_geometry=_json_value(geometry),
             source_header=_json_value(header),
+            source_reference=references["source"],
+            target_reference=references["target"],
             output_geometry_mode=(
                 "Target reference world coordinates"
                 if target_template is not None

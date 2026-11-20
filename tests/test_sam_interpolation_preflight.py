@@ -52,7 +52,7 @@ def test_inherited_pretracker_topology_cap_can_use_live_extra_credit(tmp_path):
     plan=SimpleNamespace(groups=(group,),runs=(run,),needed_frames=frames,
         frame_crop_bounds={frame:group.context_bbox_yx for frame in frames},contract_lease_budget=None)
     required=branch_workspace_bytes(shape)
-    assert required>resolve_sam_bridge_policy(environ={})['max_group_bytes']
+    assert required>resolve_sam_bridge_policy()['max_group_bytes']
     with admit_sam_parent_resources(Pool(),GIB,'inherited-preflight',headroom_probe=lambda:64*GIB) as profile:
         assert profile.assigned_topology_bytes>required
         with mock.patch('XTA.sam_bridge_planning.plan_sam_bridges',return_value=plan):

@@ -44,7 +44,7 @@ class _OpenVinoRunnerProbe:
 
 class WorkerRasterPlanProvenanceTests(unittest.TestCase):
     @staticmethod
-    def _view_and_job(root: Path) -> tuple[geometry.ViewInfo, geometry.AugJob]:
+    def _view_and_job() -> tuple[geometry.ViewInfo, geometry.AugJob]:
         view = geometry.ViewInfo(
             name="transverse__tta_a0",
             num_slices=2,
@@ -61,7 +61,6 @@ class WorkerRasterPlanProvenanceTests(unittest.TestCase):
         job = geometry.AugJob(
             aug_id="a0",
             angle_deg=0.0,
-            meta_path=root / "a0.json",
             aff=geometry.AffineSpec(
                 view=view.name,
                 angle_deg=0.0,
@@ -88,7 +87,7 @@ class WorkerRasterPlanProvenanceTests(unittest.TestCase):
         *,
         with_image_sink: bool = True,
     ) -> tuple[dict[str, object], object]:
-        view, job = cls._view_and_job(root)
+        view, job = cls._view_and_job()
         plan = geometry.build_fullframe_raster_plan(view, job)
         task: dict[str, object] = {
             "task_id": 7,
@@ -168,51 +167,6 @@ class WorkerRasterPlanProvenanceTests(unittest.TestCase):
         policy_drift["sampling_policy_digest"] = "0" * 64
         with self.assertRaisesRegex(RuntimeError, "sampling-policy drift"):
             raster_plan_from_spawn_spec(policy_drift)
-
-    def test_eager_materialized_ref_retains_plan_and_request_provenance(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            view, job = self._view_and_job(root)
-            plan = geometry.build_fullframe_raster_plan(view, job)
-            capture = _BatchCapture()
-            ref = geometry.PredictionVolumeRef(
-                array=np.arange(8, dtype=np.uint8).reshape(2, 2, 2),
-                path=None,
-                name="eager-materialized",
-                view_name=view.name,
-                job_id=job.aug_id,
-                kind="fullframe",
-                channel_format="gray",  # type: ignore[arg-type]
-                view=view,
-                render_batch_sink=capture,
-                raster_plan=plan,
-            )
-            cfg = PredictConfig(
-                imgsz=2,
-                conf=0.25,
-                device="cuda:0",
-                quantize=None,
-                batch=2,
-                input_channels=1,
-                channel_token="gray",
-            )
-            with (
-                mock.patch.object(
-                    geometry,
-                    "ensure_ultralytics_accepts_in_memory_volume_source",
-                ),
-                mock.patch.object(
-                    geometry,
-                    "maybe_wrap_source_with_gpu_input_staging",
-                    side_effect=lambda source, _cfg, _label: source,
-                ),
-            ):
-                staged = geometry.maybe_eager_stage_prediction_ref_on_gpu(ref, cfg)
-                self.assertIs(staged, ref)
-                self.assertIsNotNone(ref.source)
-                next(ref.source)  # type: ignore[arg-type]
-
-        self._assert_bound_batch(self, capture, plan)
 
     def test_openvino_worker_cpu_source_reconstructs_and_binds_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -321,7 +275,6 @@ class WorkerRasterPlanProvenanceTests(unittest.TestCase):
                 tile_size=2,
                 tile_stride=1,
                 out_size=2,
-                meta_path=root / "tiles.jsonl",
                 M_out_to_src=IDENTITY.copy(),
                 M_src_to_out=IDENTITY.copy(),
                 parent_crop=(0, 2, 0, 2),

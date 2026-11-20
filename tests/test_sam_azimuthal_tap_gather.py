@@ -1,7 +1,6 @@
 """Gathered Azimuthal taps preserve full-slab Torch pixels and SAM quantization."""
 from collections import OrderedDict
 from dataclasses import replace
-import hashlib
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from XTA import cuda_backend, geometry
+from XTA.file_hashing import source_sha256
 from XTA.sam_gpu_rendering import SamGpuCropRenderer, crop_inverse
 
 
@@ -172,7 +172,7 @@ def test_cuda_native_and_real_sam_crop_route_match_full_slab_exactly():
                             comparisons += 1
                         identity = renderer.sampling_identity()
                         assert identity['azimuthal_projector'] == 'resident_torch_no_second_source_texture'
-                        assert identity['tta_renderer_sha256'] == hashlib.sha256(Path(cuda_backend.__file__).read_bytes()).hexdigest()
+                        assert identity['tta_renderer_sha256'] == source_sha256(cuda_backend.__file__)
                         assert engine._azimuthal_texture_admitted is False
             finally:
                 engine._stream.synchronize()

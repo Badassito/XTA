@@ -147,6 +147,8 @@ class TestAutoWorkflow(unittest.TestCase):
             self.assertEqual(report['status'],'completed_with_heuristics')
             self.assertEqual(report['auto_resolved_components'],1)
             self.assertEqual(report['unresolved_components'],0)
+            self.assertFalse(any('stay intact' in m for m in report['warnings']))
+            self.assertTrue(any('would have stopped publication' in m for m in report['warnings']))
             self.assertFalse(np.any(out & ~a))
             self.assertTrue(np.all(out[k]))
             self.assertFalse(np.any(out[r]))

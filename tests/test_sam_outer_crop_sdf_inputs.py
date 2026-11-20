@@ -72,7 +72,7 @@ def test_validated_hash_remains_the_generation_pin(tmp_path,monkeypatch):
     monkeypatch.setattr(generator.sys,'argv',['generate_sdf','--experiment',str(root),'--datasets','development'])
     for key in ('CUDA_VISIBLE_DEVICES','YOLO_TTA_GPU_INTERPOLATION','YOLO_TTA_GPU_SLICE_LABELING',
                 'YOLO_TTA_GPU_SLICE_LABELING_PAIRS','YOLO_TTA_GPU_SLICE_LABELING_IN_CHILDREN',
-                'YOLO_TTA_GPU_INTERPOLATION_RADIUS','YOLO_TTA_GPU_INTERPOLATION_REQUIRED','YOLO_TTA_TELEMETRY_SYSTEM_SAMPLER'):
+                'YOLO_TTA_GPU_INTERPOLATION_REQUIRED','YOLO_TTA_TELEMETRY_SYSTEM_SAMPLER'):
         monkeypatch.setenv(key,os.environ.get(key,''))
     original_open=np.lib.format.open_memmap
     def forbidden_allocation(*args,**kwargs):

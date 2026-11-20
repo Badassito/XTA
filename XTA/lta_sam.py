@@ -24,6 +24,7 @@ from collections.abc import Iterable, Mapping
 from typing import Callable, Optional, Tuple
 
 from . import sam_sdk_compat as _sam_sdk
+from .file_hashing import source_sha256
 from .sam_sdk_compat import (
     PINNED_SAM_COMMIT,
     PINNED_SAM_PACKAGE_FILE_COUNT,
@@ -46,8 +47,7 @@ _PREFERRED_CHECKPOINT_NAMES = (
     "sam3.pt",
 )
 _SAM_REMOVED_OBJECT_SCORE = -1e4
-_SAM_PREPARED_FRAME_SEAL = object()
-_SAM_INPUT_PREPARATION_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+_SAM_INPUT_PREPARATION_SHA256 = source_sha256(__file__)
 
 
 def cuda_capability_supports_fa3(major: int, minor: int = 0) -> bool:
@@ -550,7 +550,6 @@ class _PreparedSamVideoFrames:
     side: int
     mean: tuple
     std: tuple
-    seal: object = field(repr=False)
 
 
 def patch_sam_init_state_signature(predictor: object) -> Tuple[str, ...]:
@@ -600,7 +599,7 @@ def patch_sam_init_state_signature(predictor: object) -> Tuple[str, ...]:
         # Consume the extra owner before entering the SDK. The SDK state owns
         # its clip afterwards; error cleanup cannot leave a second clip owner.
         import torch
-        if (type(prepared) is not _PreparedSamVideoFrames or prepared.seal is not _SAM_PREPARED_FRAME_SEAL
+        if (type(prepared) is not _PreparedSamVideoFrames
                 or prepared.model is not model or prepared.resource() is not resource
                 or prepared.side != int(model.image_size) or prepared.mean != tuple(model.image_mean)
                 or prepared.std != tuple(model.image_std)):
@@ -722,7 +721,7 @@ def prepare_sam_video_frames(predictor, resource, *, torch_module=None, cuda_quo
                 for channel in range(3):
                     np.take(table[channel], pixels[:, :, channel], out=target[index, channel])
         resource._xta_prepared_video_frames = _PreparedSamVideoFrames(images, model, resource_ref,
-            height, width, side, mean, std, _SAM_PREPARED_FRAME_SEAL)
+            height, width, side, mean, std)
     return dict(policy="torch_separable_bicubic_u8_half_lut_v1" if cuda else "pillow_bicubic_preallocated_half_lut_v1",
         backend="cuda" if cuda else "cpu", prepared=True, frames=len(resource),
         image_size=side, original_shape=[height, width], image_mean=list(mean), image_std=list(std),
@@ -1184,55 +1183,6 @@ def run_video_session(
     return tuple(sorted(collected, key=lambda item: (item.frame_index, item.object_id)))
 
 
-def run_image_frame(
-    processor: object,
-    *,
-    image: object,
-    sequence_id: str,
-    frame_index: int,
-    prompt: SamPromptBox,
-    conf: object,
-) -> Tuple[SamFramePrediction, ...]:
-    """Run one official ``Sam3Processor``-compatible image call."""
-
-    if not isinstance(prompt, SamPromptBox):
-        raise TypeError("prompt must be a SamPromptBox")
-    confidence = resolve_confidence(conf)
-    set_image = getattr(processor, "set_image", None)
-    add_prompt = getattr(processor, "add_geometric_prompt", None)
-    set_threshold = getattr(processor, "set_confidence_threshold", None)
-    if not callable(set_image) or not callable(add_prompt):
-        raise TypeError("processor must expose set_image and add_geometric_prompt")
-    if callable(set_threshold):
-        set_threshold(confidence)
-    state = set_image(image)
-    x, y, width, height = prompt.xywh
-    cxcywh = [x + width * 0.5, y + height * 0.5, width, height]
-    state = add_prompt(box=cxcywh, label=True, state=state)
-    if not isinstance(state, Mapping):
-        raise RuntimeError("SAM image processor returned a non-mapping state")
-    scores = _sequence_values(state.get("scores"), name="scores")
-    masks = _sequence_values(state.get("masks"), name="masks")
-    if len(scores) != len(masks):
-        raise ValueError(
-            f"SAM image output lengths differ for scores and masks: {len(scores)}/{len(masks)}"
-        )
-    return tuple(
-        SamFramePrediction(
-            sequence_id=str(sequence_id),
-            session_index=int(frame_index),
-            frame_index=int(frame_index),
-            object_id=int(index),
-            initial_detection_score=float(score),
-            frame_tracker_score=None,
-            binary_mask=_normalize_binary_mask(
-                masks[index], name=f"image frame {frame_index} object {index}"
-            ),
-        )
-        for index, score in enumerate(scores)
-    )
-
-
 __all__ = (
     "LTA_CHANNEL_POLICY",
     "LTA_MAX_NUM_OBJECTS",
@@ -1264,7 +1214,6 @@ __all__ = (
     "resolve_sam_device_profile",
     "resolve_installed_sam_bpe",
     "revalidate_local_sam_bundle",
-    "run_image_frame",
     "run_video_session",
     "patch_sam_init_state_signature",
 )

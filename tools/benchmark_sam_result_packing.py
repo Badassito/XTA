@@ -1,7 +1,7 @@
 """CPU-only actual SAM evidence writer sanity with live packing admission.
 
 Use only in a coordinated CPU window. Retained SAM masks and one explicitly
-synthetic stress case are bounded below1GiB. No SDK/model or GPU is started.
+synthetic stress case are bounded below 1 GiB. No SDK/model or GPU is started.
 """
 from __future__ import annotations
 
@@ -76,7 +76,7 @@ def synthetic_case():
         seed_ids=['A'], held_out_ids=['B'], expected_frames=list(range(frames)),
         injected_frames=[0], complete=True, pass_index=1)
     return dict(name='structured-synthetic-2048', scope=dict(shape_tyx=[frames, side, side],
-        fixture='structured synthetic shifting binary contours and8pixel blocks'),
+        fixture='structured synthetic shifting binary contours and 8-pixel blocks'),
         group=group, masks=masks, run=run, raw=raw,
         provenance=dict(kind='structured_synthetic_not_model_output', seed=155423,
             source_shape=[frames, side, side]))
@@ -180,7 +180,7 @@ def main():
         (*case['masks'].values(), *case['raw'].values())}
     input_bytes = sum(value.nbytes for value in unique_arrays.values())
     if input_bytes >= GIB:
-        raise RuntimeError('Benchmark input exceeds its bounded1GiB corpus')
+        raise RuntimeError('Benchmark input exceeds its bounded 1 GiB corpus')
     for value in unique_arrays.values():
         value.setflags(write=False)
     print(json.dumps(dict(stage='input', source_bytes=input_bytes,

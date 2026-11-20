@@ -168,8 +168,27 @@ class RegistrationLabelTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(stats["holes_in_exact_mask"], 1)
         self.assertEqual(stats["omitted_degenerate_components"], 1)
-        self.assertEqual(stats["false_positive_pixels"], 4)
+        self.assertEqual(stats["false_positive_pixels"], 0)
         self.assertEqual(stats["false_negative_pixels"], 1)
+
+    def test_hole_bridges_avoid_a_shadowing_hole_and_a_concave_notch(self):
+        shadowed = np.zeros((64, 64), np.uint8)
+        shadowed[2:62, 2:62] = 1
+        shadowed[7:10, 7:57] = 0
+        shadowed[14:17, 30:33] = 0
+        rows, stats = _polygon_rows(shadowed, (5, 3), (80, 90), 0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(stats["holes_in_exact_mask"], 2)
+        self.assertEqual((stats["false_positive_pixels"], stats["false_negative_pixels"]), (0, 0))
+        notch = np.zeros((220, 90), np.uint8)
+        notch[2:218, 2:30] = 1
+        notch[2:218, 50:88] = 1
+        notch[200:218, 2:88] = 1
+        notch[96:104, 38:50] = 1
+        notch[98:102, 20:24] = 0
+        rows, stats = _polygon_rows(notch, (0, 0), notch.shape, 0)
+        self.assertEqual(stats["holes_in_exact_mask"], 1)
+        self.assertEqual(stats["false_positive_pixels"], 0)
 
     def test_bad_labels_and_unavailable_packet_leave_no_output(self):
         packet = make_packet((4, 8, 9), np.eye(4))

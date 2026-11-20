@@ -163,7 +163,7 @@ def test_nonzero_cleanup_disables_optional_native_decoding():
 def _worker_task(tmp_path, mode):
     matrix = np.eye(2, 3, dtype=np.float32)
     view = ViewInfo('transverse', 5, 8, 8, 'clamp', full_t=5, full_h=8, full_w=8)
-    job = AugJob('a0', 0., tmp_path / 'a0.json', AffineSpec(
+    job = AugJob('a0', 0., AffineSpec(
         'transverse', 0., 8, 8, 8, 8, 8, 8, 0., 0., matrix, matrix, matrix, matrix,
     ))
     source = tmp_path / 'source.dat'

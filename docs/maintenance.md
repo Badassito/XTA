@@ -28,9 +28,11 @@ source bundle cover its bytes. Verification also checks that files did not
 change during the check.
 
 LTA run telemetry separately records package Python sources under the explicit
-scope `xta.package_python_sources/1`. That fingerprint includes shared SAM and
-geometry modules and future Python modules automatically. It does not identify
-native binaries, dependencies, or model weights. Historical SAM receipt readers
+scope `xta.package_python_sources/1`. TTA execution provenance records the same
+scope per file (`modules`) and in aggregate (`package_python_sources`). That
+fingerprint includes shared SAM and geometry modules and future Python modules
+automatically. It does not identify native binaries, dependencies, or model
+weights. Historical SAM receipt readers
 also authenticate selected numerical helper implementations; those compatibility
 identities are separate from both packaging and the current-source inventory.
 
@@ -73,6 +75,26 @@ An uncommitted cleanup can retain the current source version while in
 development. Its changed bytes are not equivalent to the tagged release. Use
 `--snapshot` when explicitly creating a development bundle or running the
 qualification tool on that state; do not silently reuse a release identity.
+
+## Environment variables
+
+Existing environment variable names are frozen: `YOLO_TTA_*` (including
+`YOLO_TTA_PTA_*`), `PTA_*` and `XTA_YOLO_SWEEP_*`. External cluster job scripts
+export them, sweep NRRD workers replay per-job settings by the `YOLO_TTA_NRRD_`
+prefix (`_JOB_ENV_PREFIXES` in `XTA/sweep_nrrd_processes.py`), and tools capture
+run provenance by prefix. Do not rename them or add aliases.
+
+Give a new variable the `XTA_` prefix, and prefer an explicit CLI option or
+constructor parameter where one fits. A new variable read on a path that a
+prefix-based forwarder or environment capture covers must extend that matcher in
+the same change, or the forwarder or capture silently skips it. The matchers
+that skip `XTA_` names are `_JOB_ENV_PREFIXES` in `XTA/sweep_nrrd_processes.py`,
+`tools/capture_sam_planner_inputs.py`, `tools/benchmark_confidence_capture.py`,
+`tools/profile_tta_local_feed.py` and `tools/qualify_native_trt_pipeline.py`.
+
+Remove a temporary kill switch together with its documentation and tests once
+its reason is gone. Tests then pass explicit parameters instead of setting the
+variable.
 
 ## Packaging checks
 
@@ -122,6 +144,14 @@ and launcher must agree; verify the committed result with the checker without
 
 Authenticated historical SAM receipt readers and their source hashes are
 compatibility contracts. Refactor them only while preserving accepted historical
-fixtures and rejection of malformed or incompatible evidence. Likewise, keep
+fixtures and rejection of malformed or incompatible evidence. Module
+implementation hashes use the inventory's CRLF-to-LF canonical bytes, while
+run-provenance receipts record actual bytes, so the two may differ on a CRLF
+working tree. When only non-numerical source changes in a module whose saved
+hashes are read strictly (`sam_filtering`, `sam_branch_selection`, `sam_cyclic`),
+add its last released identity to that module's qualified set. Qualified SAM
+filter receipt ids are honoured only while `_QUALIFIED_NUMERICAL_SOURCE` matches
+the numerical helpers; re-pin it only for edits that the radius oracle and v25
+equivalence tests show leave numerics unchanged. Likewise, keep
 copyable augmentation policy examples self-contained unless deliberately changing
 that interface.

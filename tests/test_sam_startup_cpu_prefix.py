@@ -45,7 +45,7 @@ def start_blocked(boot):
 
 def prefix_task(boot, context, monkeypatch, *, family='orthogonal', distance=3,
                 extrapolation=1, multilabel=False):
-    task, _expected = _task(boot.root/'parent', keep=True)
+    task, _expected = _task(boot.root/'parent')
     task.union_mm[:] = 0
     task.union_mm[0, 1:3, 1:4] = task.union_mm[2, 1:3, 1:4] = 1
     if multilabel:
@@ -61,7 +61,6 @@ def prefix_task(boot, context, monkeypatch, *, family='orthogonal', distance=3,
     task.interpolation_distance = distance
     task.extrapolation_distance = extrapolation
     task.prepare = assembly.prepare_view_volume_after_fullframe
-    task.component_ref_dense_retirement_active = False
     warmed, projected = threading.Event(), threading.Event()
     owners, snapshots = [], []
     original = planning._observations
@@ -153,7 +152,6 @@ def test_startup_failure_retires_prefix_inventory_and_never_projects(boot, monke
     context, executor, startup, admitted = start_blocked(boot)
     try:
         task, _expected, warmed, projected, owners, _snapshots = prefix_task(boot, context, monkeypatch)
-        task.keep_temp_artifacts = False
         task.confmap_path = task.temp_dir/'scores.dat'
         task.confmap_mm = np.memmap(task.confmap_path, mode='w+', dtype=np.uint8,
                                   shape=task.union_mm.shape)

@@ -17,7 +17,6 @@ from XTA import interpolation
 CPU_ENV = {
     'YOLO_TTA_GPU_INTERPOLATION': '0',
     'YOLO_TTA_GPU_INTERPOLATION_REQUIRED': '0',
-    'YOLO_TTA_GPU_INTERPOLATION_RADIUS': '0',
     'YOLO_TTA_GPU_SLICE_LABELING': '0',
     'YOLO_TTA_TELEMETRY': '0',
     'YOLO_TTA_TELEMETRY_SYSTEM_SAMPLER': '0',
@@ -125,10 +124,11 @@ class BridgeGeometryTests(unittest.TestCase):
 
     @staticmethod
     def _exact_radius_and_sections(plan):
-        # Independent SciPy topology and EDT oracle for threshold admission.
+        # Independent SciPy topology and EDT oracle for threshold admission. Bridge
+        # SDFs are measured to the pixel interface; +0.5 restores EDT radius units.
         from scipy import ndimage
 
-        radius = min(float(plan.sdf0.max()), float(plan.sdf1.max()))
+        radius = min(float(plan.sdf0.max()), float(plan.sdf1.max())) + 0.5
         sections = []
         for step in range(1, plan.steps):
             alpha = step / plan.steps
@@ -140,7 +140,12 @@ class BridgeGeometryTests(unittest.TestCase):
                 coords = np.argwhere(labels)
                 nearest = coords[np.argmin(np.sum((coords - center) ** 2, axis=1))]
                 label = labels[tuple(nearest)]
-            kept = ndimage.binary_fill_holes(labels == label) if label else np.zeros_like(mask)
+            if label:
+                kept = labels == label
+                if plan.fill_section_holes:
+                    kept = ndimage.binary_fill_holes(kept)
+            else:
+                kept = np.zeros_like(mask)
             radius = min(radius, float(ndimage.distance_transform_edt(kept).max()))
             sections.append(kept)
         return radius, sections
@@ -236,9 +241,122 @@ class BridgeGeometryTests(unittest.TestCase):
         _ellipse(labels, 0, 12, 12, 6, 6, 1)
         _ellipse(labels, 4, 12, 12, 6, 6, 2)
         plan = interpolation._build_linear_slice_bridge_plan(labels, 1, 2, (0, 12, 6), (4, 12, 6))
-        self.assertLessEqual(plan.sdf0[plan.sdf0.shape[0] // 2, plan.sdf0.shape[1] // 2], 3.)
+        anchor_value = plan.sdf0[plan.sdf0.shape[0] // 2, plan.sdf0.shape[1] // 2]
+        self.assertLessEqual(anchor_value + interpolation.SDF_EDT_RADIUS_OFFSET, 3.)
         radius = interpolation._estimate_linear_slice_bridge_min_radius_from_plan(plan, reject_at_or_below=3.)
         self.assertGreater(radius, 3.)
+
+    def test_bridge_sdf_is_centred_on_pixel_interface(self):
+        mask = np.zeros((7, 12), bool)
+        mask[:, :4] = True
+        sdf = interpolation._bridge_interface_sdf_2d(mask)
+        self.assertEqual(sdf.dtype, np.float32)
+        np.testing.assert_allclose(
+            sdf[3], [3.5, 2.5, 1.5, 0.5, -0.5, -1.5, -2.5, -3.5, -4.5, -5.5, -6.5, -7.5],
+        )
+        disk = np.zeros((21, 23), bool)
+        yy, xx = np.ogrid[:21, :23]
+        disk[(yy - 10) ** 2 + (xx - 11) ** 2 <= 36] = True
+        np.testing.assert_array_equal(interpolation._bridge_interface_sdf_2d(disk) >= 0, disk)
+
+    def test_sdf_blend_moves_straight_edge_linearly(self):
+        # Exact interface x = 19.5 + alpha * k; centred blends add pixels in that order.
+        for k, steps, expected in ((2, 3, [1, 1]), (3, 4, [1, 2, 2]), (5, 6, [1, 2, 3, 3, 4])):
+            with self.subTest(k=k, steps=steps):
+                source = np.zeros((9, 48), bool)
+                target = np.zeros((9, 48), bool)
+                source[:, :20] = True
+                target[:, :20 + k] = True
+                sdf0 = interpolation._bridge_interface_sdf_2d(source)
+                sdf1 = interpolation._bridge_interface_sdf_2d(target)
+                added = []
+                for step in range(1, steps):
+                    alpha = step / steps
+                    row = ((1.0 - alpha) * sdf0 + alpha * sdf1)[4] >= 0.0
+                    added.append(int(np.count_nonzero(row)) - 20)
+                self.assertEqual(added, expected)
+                # At alpha = 0.5 the centred and centre-to-centre blends agree exactly.
+                half = (0.5 * sdf0 + 0.5 * sdf1) >= 0.0
+                legacy0 = interpolation._projection_cone_sdf_2d(source)
+                legacy1 = interpolation._projection_cone_sdf_2d(target)
+                np.testing.assert_array_equal(half, (0.5 * legacy0 + 0.5 * legacy1) >= 0.0)
+
+    def test_projection_cone_matches_sam_planner_cone(self):
+        # The SDF projection cone keeps the centre-to-centre field shared with the
+        # SAM planner, so both backends admit the same non-overlapping target.
+        from scipy import ndimage
+        from XTA.sam_bridge_planning import SamPlanningLimits, plan_sam_bridges
+
+        disk = np.zeros((19, 21), bool)
+        yy, xx = np.ogrid[:19, :21]
+        disk[(yy - 9) ** 2 + (xx - 10) ** 2 <= 25] = True
+        padded = np.pad(disk, 1)
+        reference = (ndimage.distance_transform_edt(padded) - ndimage.distance_transform_edt(~padded))[1:-1, 1:-1]
+        np.testing.assert_allclose(interpolation._projection_cone_sdf_2d(disk), reference, atol=1e-5)
+
+        for k in (2, 3, 4):
+            with self.subTest(slice_distance=k):
+                volume = np.zeros((k + 3, 41, 41), np.uint16)
+                volume[1, 16:25, 16:25] = 1
+                # Nearest target pixel is one pixel beyond the source edge; no overlap.
+                volume[1 + k, 19:22, 25:28] = 2
+                cache = interpolation.SliceComponentTableCache(volume)
+                try:
+                    found = interpolation._find_slice_projection_candidates_numba(
+                        labels_real=volume,
+                        seed=interpolation.SliceEndpointSeed(1, (1, 20, 20), 1),
+                        max_slice_distance=k, search_angle_deg=15.0, max_candidates=4,
+                        wrap_axis=False, component_cache=cache,
+                    )
+                finally:
+                    cache.clear()
+                sam_plan = plan_sam_bridges(
+                    volume != 0, interpolation_distance=k, interpolation_candidates=3,
+                    interpolation_walk_back=0, interpolation_min_radius=0,
+                    interpolation_search_angle=15,
+                    limits=SamPlanningLimits(context_margin_px=5, acceptance_margin_px=3, curvature_margin_px=3),
+                )
+                self.assertEqual(bool(found), k == 4)
+                self.assertEqual(bool(sam_plan.runs), k == 4)
+
+    def test_hollow_endpoints_keep_lumen_in_bridge(self):
+        labels = np.zeros((5, 41, 41), np.uint16)
+        yy, xx = np.ogrid[:41, :41]
+        d2 = (yy - 20) ** 2 + (xx - 20) ** 2
+        ring = (d2 <= 14 ** 2) & (d2 > 4 ** 2)
+        labels[0][ring] = 1
+        labels[4][ring] = 2
+        anchor = interpolation._component_centroid_anchor(ring)
+        self.assertTrue(ring[anchor])
+        for selected_cache in (None, interpolation.SliceComponentTableCache(labels)):
+            with self.subTest(cache=selected_cache is not None):
+                plan = interpolation._build_linear_slice_bridge_plan(
+                    labels, 1, 2, (0, *anchor), (4, *anchor), component_cache=selected_cache,
+                )
+                self.assertFalse(plan.fill_section_holes)
+                radius = interpolation._estimate_linear_slice_bridge_min_radius_from_plan(
+                    plan, reject_at_or_below=3.0, cache_sections=True,
+                )
+                self.assertGreater(radius, 3.0)
+                exact, sections = self._exact_radius_and_sections(plan)
+                self.assertAlmostEqual(
+                    interpolation._estimate_linear_slice_bridge_min_radius_from_plan(plan),
+                    exact, places=5,
+                )
+                painted = np.zeros_like(labels, dtype=np.uint8)
+                for step in range(1, plan.steps):
+                    np.testing.assert_array_equal(plan.cached_sections[step], sections[step - 1])
+                    interpolation._paint_linear_slice_bridge_plan_onto_slice(painted[step], plan, step)
+                np.testing.assert_array_equal(painted[1:4, 20, 20], 0)
+                np.testing.assert_array_equal(painted[1:4] != 0, np.broadcast_to(ring, (3, 41, 41)))
+                if selected_cache is not None:
+                    selected_cache.clear()
+
+        solid = np.zeros((5, 41, 41), np.uint16)
+        _ellipse(solid, 0, 20, 20, 9, 6, 1)
+        _ellipse(solid, 4, 21, 22, 8, 6, 2)
+        plan = interpolation._build_linear_slice_bridge_plan(solid, 1, 2, (0, 20, 20), (4, 21, 22))
+        self.assertTrue(plan.fill_section_holes)
 
     def test_full_pass_preserves_source_and_exact_decomposed_delta(self):
         tracks = np.zeros((17, 66, 100), np.uint8)

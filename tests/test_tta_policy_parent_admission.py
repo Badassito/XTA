@@ -289,7 +289,6 @@ class PolicyParentWorkspaceIntegrationTests(unittest.TestCase):
                 parent_transient_admission=SimpleNamespace(reserve=mock.Mock(), in_use=0),
                 angle_variant_streaming_cleanup_active=False,
                 angle_variant_gpu_fastpath_active=False,
-                component_ref_dense_retirement_active=True,
                 projected_parent_output_memory={},
                 parent_mask_retired_events=queue.SimpleQueue(), scheduler_state=state,
                 _publish_parent_mask_ready=mock.Mock(),
@@ -300,8 +299,7 @@ class PolicyParentWorkspaceIntegrationTests(unittest.TestCase):
                 sam_cpu_futures={'source':None,'runtime':None,'runtime_needed':False},
                 _sam_parents_ready=lambda:False,
                 sam_cpu_max_detector_parent=0,direct_union_total_dense_byte_limit=10000,
-                _dispatch_inference_windows=mock.Mock(),
-                keep_temp_artifacts=False)
+                _dispatch_inference_windows=mock.Mock())
             namespace['view_prepare_leases'] = pipeline.ViewPrepareLeaseState(
                 leases=state.direct_union_backing_leases,
                 inference_views=state.direct_union_inference_views,

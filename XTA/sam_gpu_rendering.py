@@ -1,12 +1,16 @@
 """Idle-GPU SAM image preparation through the existing TTA intensity renderer.
 
 Only demanded grayscale crops leave the device. One existing compute lease
-fences a transaction; source, projection and grid allocations retire before
-that lease is returned. CPU preparation remains the admission fallback.
+fences a transaction; projection and grid allocations retire before that lease
+is returned. The source retires too, except that a full-window source may stay
+parked on its GPU (stripped to source and T maps) for the next same-source
+lease where capped SAM sessions reserved room for it
+(YOLO_TTA_SAM_GPU_SOURCE_RESIDENT; see docs/sam_sdk.md). CPU preparation
+remains the admission fallback.
 """
 from __future__ import annotations
 
-import hashlib
+import functools
 from pathlib import Path
 import sys
 import threading
@@ -16,14 +20,23 @@ import weakref
 
 import numpy as np
 
+from .file_hashing import source_sha256
+
 
 SAM_GPU_IMAGE_CONTRACT = 'xta.sam_tta_cuda_gray8_crop/1'
-IMPLEMENTATION_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+IMPLEMENTATION_SHA256 = source_sha256(__file__)
 # Match the existing admission/drain turn, without charging source uploads to
 # render service: a large source must not force retirement after every frame.
 _IMAGE_COMPUTE_SERVICE_SECONDS = 30.0
 _LIVE_IMAGES = {}
 _LIVE_IMAGES_LOCK = threading.RLock()
+
+
+@functools.cache
+def _renderer_source_sha256():
+    """Source identities of the shared TTA/spherical CUDA renderers, read once per process."""
+    from . import cuda_backend, spherical_cuda
+    return source_sha256(cuda_backend.__file__), source_sha256(spherical_cuda.__file__)
 
 
 def _record_image_timings(**timings):
@@ -226,13 +239,13 @@ class SamGpuCropRenderer:
             str(self.source.dtype), self.logical_t, stamp, self.resident_t_window)
 
     def sampling_identity(self):
-        from . import cuda_backend, spherical_cuda
         from .sam_azimuthal_batch import IMPLEMENTATION_SHA256 as batch_sha256
         from .geometry_quality import geometry_quality_request_record
+        tta_sha256, spherical_sha256 = _renderer_source_sha256()
         return dict(contract=SAM_GPU_IMAGE_CONTRACT, backend='cuda',
             implementation_sha256=IMPLEMENTATION_SHA256,
-            tta_renderer_sha256=hashlib.sha256(Path(cuda_backend.__file__).read_bytes()).hexdigest(),
-            spherical_renderer_sha256=hashlib.sha256(Path(spherical_cuda.__file__).read_bytes()).hexdigest(),
+            tta_renderer_sha256=tta_sha256,
+            spherical_renderer_sha256=spherical_sha256,
             azimuthal_batch_sha256=batch_sha256,
             torch_version=str(self.torch.__version__), cuda_version=str(self.torch.version.cuda),
             geometry_quality=geometry_quality_request_record(),
@@ -921,11 +934,6 @@ def try_gpu_crop_renderer(context, view, shape, prepared_plan, *, opportunistic=
         if source.materialized:
             source = source._array
         else:
-            if source.streaming_backend:
-                # Streaming preprocessing uses endpoint-aligned T; the TTA
-                # virtual native-T renderer uses center-aligned coordinates.
-                # GPU rounding permission does not authorize another grid.
-                return decline('streamed_endpoint_processing_cube_not_materialized')
             if tuple(source.source.shape[1:]) != tuple(source.shape[1:]):
                 return decline('unsupported_unmaterialized_source_xy_resize')
             source = source.source

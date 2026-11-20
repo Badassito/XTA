@@ -19,9 +19,10 @@ def symbolic_expected(source,base,shape):
             frames=range(z*canonical[0]//shape[0],
                 ((z+1)*canonical[0]+shape[0]-1)//shape[0])
         else:
-            frames=(round(z*(canonical[0]-1)/(shape[0]-1)) if shape[0]>1 else 0,)
-        row=y*canonical[1]//shape[1]
-        column=x*canonical[2]//shape[2]
+            frames=(((2*z+1)*canonical[0])//(2*shape[0]),)
+        # Nearest source cell containing each output cell center.
+        row=((2*y+1)*canonical[1])//(2*shape[1])
+        column=((2*x+1)*canonical[2])//(2*shape[2])
         for frame in frames:
             original=[None,None,None]
             for axis,value in zip(axes,(frame,row,column)):original[axis]=value

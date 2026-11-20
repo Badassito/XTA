@@ -7,7 +7,6 @@ from dataclasses import replace
 import inspect
 import io
 import json
-import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -53,11 +52,6 @@ def _assigned(node, name, value=None):
 
 
 class ProjectionSamplingIntegrationTests(unittest.TestCase):
-    def setUp(self):
-        source_mode = mock.patch.dict(os.environ, {'YOLO_TTA_AZIMUTHAL_SOURCE_MODE': 'texture_linear'})
-        source_mode.start()
-        self.addCleanup(source_mode.stop)
-
     def test_shared_compiler_has_one_coverage_schedule_for_all_families(self):
         default = compiled(radial=('transverse',), spherical=('transverse',))
         self.assertNotIn('sampling_policy', inspect.signature(compile_physical_views).parameters)
@@ -239,7 +233,7 @@ class ProjectionSamplingIntegrationTests(unittest.TestCase):
         dense = compiled(azimuthal=('transverse:1',)).views[0]
         coverage = compiled().views[0]
         affine = g.build_affine(dense.name, dense.src_w, dense.src_h, 32, 0.0, dense.pad_mode)
-        job = g.AugJob('a0', 0.0, Path('unused.json'), affine)
+        job = g.AugJob('a0', 0.0, affine)
         dense_plan = g.build_fullframe_raster_plan(dense, job)
         coverage_plan = g.build_fullframe_raster_plan(coverage, job)
         old_metadata = {'runtime_view_id': dense.name, 'runtime_job_id': 'a0', 'runtime_kind': 'fullframe',
@@ -298,7 +292,7 @@ class ProjectionSamplingIntegrationTests(unittest.TestCase):
             view = compiled(shape=shape, size=size).views[0]
             self.assertTrue(view.sampling_certificate)
             variant = g.expand_views_into_tta_variants((view,), (0.0,))[0]
-            affine = g.build_aug_job_for_variant(variant, size, Path('unused')).aff
+            affine = g.build_aug_job_for_variant(variant, size).aff
             oy, ox = np.indices((size, size), dtype=np.float64)
             ax = affine.M_out_to_src[0, 0] * ox + affine.M_out_to_src[0, 1] * oy + affine.M_out_to_src[0, 2]
             ay = affine.M_out_to_src[1, 0] * ox + affine.M_out_to_src[1, 1] * oy + affine.M_out_to_src[1, 2]
@@ -336,9 +330,6 @@ class ProjectionSamplingIntegrationTests(unittest.TestCase):
 
 class ProjectionSamplingReplayTests(unittest.TestCase):
     def setUp(self):
-        source_mode = mock.patch.dict(os.environ, {'YOLO_TTA_AZIMUTHAL_SOURCE_MODE': 'texture_linear'})
-        source_mode.start()
-        self.addCleanup(source_mode.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)

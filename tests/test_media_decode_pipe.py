@@ -123,7 +123,8 @@ class DecodePipeTests(unittest.TestCase):
                     with self.assertRaisesRegex(OSError, 'injected pipe setup failure'):
                         media._spawn_decode_process(self._command('pass'))
                 self.assertEqual(len(handles), 2)
-                self.assertEqual(psutil.Process().num_handles(), before, 'pipe handle leaked')
+                # Other threads may close unrelated handles meanwhile; only an increase is a leak.
+                self.assertLessEqual(psutil.Process().num_handles(), before, 'pipe handle leaked')
 
     @unittest.skipUnless(os.name == 'nt', 'Windows handle ownership')
     def test_windows_create_pipe_failure_never_launches_a_child(self):

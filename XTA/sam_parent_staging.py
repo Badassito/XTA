@@ -20,6 +20,7 @@ import weakref
 
 import numpy as np
 
+from .env_flags import env_flag
 from .interpolation import _DirectUnionBackingLease, _ByteAdmissionPool
 from .runtime import (path_is_memory_backed, allocate_workspace_array,
                       _memfd_owner_key_from_array, _memfd_backing_path_from_array,
@@ -608,22 +609,21 @@ def checkpoint_parent(task, root, source_root, required_bytes, stop, *, owned_in
             codec_fallback_bytes=0 if compact_credit else
                 sum(value.nbytes for value in snapshots if value is not None and not value.reused))
     except BaseException:
-        _close_sources(task, preserve=bool(task.keep_temp_artifacts))
+        _close_sources(task)
         shutil.rmtree(owned)
         raise
 
 
 def _cheap_overflow_shares_turns():
     """YOLO_TTA_SAM_PARENT_CHEAP_OVERFLOW_LAST=1 restores queueing them last."""
-    return os.environ.get('YOLO_TTA_SAM_PARENT_CHEAP_OVERFLOW_LAST', '0').strip().lower() not in {
-        '1', 'true', 'yes', 'on'}
+    return not env_flag('YOLO_TTA_SAM_PARENT_CHEAP_OVERFLOW_LAST', False)
 
 
 class DeferredSamParentQueue:
     """Scheduler-thread queue with a bounded RAM backlog and no SAM waits."""
 
     def __init__(self, *, temp_dir, output_dir, checkpoint_executor, prepare_executor,
-                 leases, dense_limit, ready, keep_temp=False, bounded_parent_keys=(),
+                 leases, dense_limit, ready, bounded_parent_keys=(),
                  prepare_workers=None, prepare_view_families=()):
         self.root = select_checkpoint_root(temp_dir, output_dir)
         self.source_root = Path(temp_dir)
@@ -638,7 +638,6 @@ class DeferredSamParentQueue:
         self.leases = leases
         self._dense_limit = dense_limit
         self.ready = ready
-        self.keep_temp = bool(keep_temp)
         self.bounded_parent_keys = bounded_parent_keys
         if prepare_workers is not None and int(prepare_workers) < 1:
             raise ValueError('SAM parent preparation workers must be positive')
@@ -1455,9 +1454,9 @@ class DeferredSamParentQueue:
         if getattr(task, '_sam_checkpoint_prepare_started', False):
             # Preparation may publish/retain legitimate derived views. Preserve
             # the normal alias-aware close and its dense credit until retirement.
-            _close_prepared_sources(task, preserve=self.keep_temp)
+            _close_prepared_sources(task)
             return False
-        _close_sources(task, preserve=self.keep_temp)
+        _close_sources(task)
         return bool(self.leases.leases.get(key) is lease
                     and self.leases.complete(key, retain_for_dense_retirement=False))
 
@@ -1719,10 +1718,10 @@ class DeferredSamParentQueue:
             future.cancel()
         for future, (_key, task, _required) in self.checkpoint_futures.items():
             if future.cancel():
-                _close_sources(task, preserve=self.keep_temp)
+                _close_sources(task)
         for future, (_key, task, _lease) in self.restore_futures.items():
             if future.cancel():
-                _close_sources(task, preserve=self.keep_temp)
+                _close_sources(task)
 
     def cancel(self, reason='TTA parent staging cancelled'):
         self.abort()
@@ -1771,7 +1770,7 @@ class DeferredSamParentQueue:
         for future, (key, task, _required) in list(self.checkpoint_futures.items()):
             if not future.done():
                 raise RuntimeError('SAM checkpoint writer must settle before staging cleanup')
-            _close_sources(task, preserve=self.keep_temp)
+            _close_sources(task)
             self.leases.complete(key, retain_for_dense_retirement=False)
             self.release_ram_first(key)
         self.checkpoint_futures.clear()
@@ -1794,14 +1793,14 @@ class DeferredSamParentQueue:
         # lifetime. Other birth directories retire only after their actual maps.
         for directory, proof in tuple(self._detector_disk_workspaces.items()):
             if (directory not in self._detector_disk_retirements
-                    and (directory in self.transferred_roots or self.keep_temp)):
+                    and directory in self.transferred_roots):
                 self._detector_disk_workspaces.pop(directory)
                 self._detector_disk_owner_refs.pop(directory, None)
             elif directory not in self._detector_disk_retirements:
                 self.retire_detector_disk_workspace(proof)
         for settle in tuple(self._detector_disk_retirements.values()):
             settle()
-        if not self.keep_temp and self._checkpoint_root_exists():
+        if self._checkpoint_root_exists():
             for child in self.root.iterdir():
                 if child not in self.transferred_roots and child not in self._detector_disk_retirements:
                     self._checkpoint_root_exists()
@@ -1825,7 +1824,7 @@ class DeferredSamParentQueue:
             settle()
         if self._detector_disk_retirements:
             raise RuntimeError('SAM detector private disk owners remain unsettled')
-        if not self.keep_temp and self._checkpoint_root_exists():
+        if self._checkpoint_root_exists():
             shutil.rmtree(self.root)
 
 

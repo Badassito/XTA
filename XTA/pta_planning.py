@@ -261,7 +261,6 @@ def build_render_plan(
         shared_aug_job = shared_geometry.AugJob(
             aug_id="a0",
             angle_deg=0.0,
-            meta_path=out_dir / ".v18_geometry" / f"{stem}_{tag}.meta.json",
             aff=aff.shared_affine,
         )
     canonical_plan: Optional[RasterPlan] = None
@@ -296,13 +295,8 @@ def build_render_plan(
                 shared_geometry.build_dense_tile_jobs_for_aug(
                     view.shared_view,
                     shared_aug_job,
-                    shared_geometry.TileConfig(
-                        tile_size=int(cfg.tile_size),
-                        tile_stride=int(cfg.tile_stride),
-                        config_id=str(cfg.config_id),
-                    ),
+                    cfg,
                     out_size=int(out_side),
-                    temp_dir=out_dir / ".v18_geometry",
                 )
             )
         else:
